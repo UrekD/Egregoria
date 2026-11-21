@@ -1,8 +1,9 @@
-use prototypes::{GoodsCompanyID, Money};
+use prototypes::{GameTime, GoodsCompanyID, Money, Tick};
 use scenarios::builtin::{determinism, smoke};
 use scenarios::ScenarioCtx;
 use simulation::economy::Government;
 use simulation::map::BuildingKind;
+use simulation::world_command::WorldCommand;
 use simulation::SimulationOptions;
 
 #[test]
@@ -55,6 +56,7 @@ fn determinism_detects_a_difference_at_a_checkpoint() {
         terrain_size: 0,
         save_replay: false,
     });
+    let checkpoint_tick = ctx.sim.get_tick() + 10_000;
     let mut first = true;
 
     let error = ctx
@@ -63,7 +65,7 @@ fn determinism_detects_a_difference_at_a_checkpoint() {
             if first {
                 run.sim.write::<Government>().money += Money::new_bucks(1);
             }
-            run.run_ticks(10_000 - run.sim.get_tick());
+            run.run_ticks(10_000);
             run.sim.write::<Government>().money = money;
             run.run_ticks(1);
             first = false;
@@ -71,6 +73,42 @@ fn determinism_detects_a_difference_at_a_checkpoint() {
         })
         .unwrap_err();
 
-    assert!(error.contains("tick 10000"), "{error}");
+    assert!(
+        error.contains(&format!("tick {checkpoint_tick}")),
+        "{error}"
+    );
+    assert!(error.contains("government"), "{error}");
+}
+
+#[test]
+fn determinism_captures_checkpoint_when_game_clock_jumps() {
+    let mut ctx = ScenarioCtx::new(SimulationOptions {
+        terrain_size: 0,
+        save_replay: false,
+    });
+    let mut first = true;
+
+    let error = ctx
+        .verify_twice(|run| {
+            run.submit(&[WorldCommand::SetGameTime(GameTime::new(Tick(0)))]);
+            run.run_ticks(9_999);
+            assert_eq!(run.sim.get_tick(), 9_999);
+
+            let money = run.sim.read::<Government>().money;
+            if first {
+                run.sim.write::<Government>().money += Money::new_bucks(1);
+            }
+            run.submit(&[WorldCommand::SetGameTime(GameTime::new(Tick(10_000)))]);
+            run.run_ticks(1);
+            assert_eq!(run.sim.get_tick(), 10_001);
+
+            run.sim.write::<Government>().money = money;
+            run.run_ticks(1);
+            first = false;
+            Ok(())
+        })
+        .unwrap_err();
+
+    assert!(error.contains("tick 10001"), "{error}");
     assert!(error.contains("government"), "{error}");
 }

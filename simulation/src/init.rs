@@ -1,5 +1,6 @@
 use serde::de::DeserializeOwned;
 use serde::Serialize;
+use std::sync::Once;
 
 #[allow(unused_imports)]
 use common::saveload::{Bincode, Encoder, JSONPretty, JSON};
@@ -31,29 +32,34 @@ use crate::{
 };
 
 pub fn init() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(register_simulation);
+    static LOAD_PROTOTYPES: Once = Once::new();
+    LOAD_PROTOTYPES.call_once(|| {
+        // SAFETY: Initialization loads the registry once, before simulations use it.
+        unsafe { load_prototypes() };
+    });
+    register_simulation();
 }
 
-fn register_simulation() {
-    //crate::rerun::init_rerun();
+/// Load the full prototype registry.
+///
+/// # Safety
+/// No other thread may access the prototype registry while it is being replaced.
+pub(crate) unsafe fn load_prototypes() {
+    #[cfg(not(test))]
+    let base = "./";
+    #[cfg(test)]
+    let base = "../";
 
-    // # Safety
-    // This function is called only once, before any other function in this crate.
-    unsafe {
-        #[cfg(not(test))]
-        let base = "./";
-        #[cfg(test)]
-        let base = "../";
+    unsafe { prototypes::load_prototypes(base) }
+        .unwrap_or_else(|err| panic!("Error loading prototypes: {err}"));
+}
 
-        match prototypes::load_prototypes(base) {
-            Ok(_) => {}
-            Err(e) => {
-                panic!("Error loading prototypes: {}", e)
-            }
-        }
-    }
+pub(crate) fn register_simulation() {
+    static INIT: Once = Once::new();
+    INIT.call_once(register_systems_and_resources);
+}
 
+fn register_systems_and_resources() {
     register_system("electricity_flow_system", electricity_flow_system);
     register_system("dispatch_system", dispatch_system);
     register_system("update_decision_system", update_decision_system);

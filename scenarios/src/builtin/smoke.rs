@@ -1,7 +1,8 @@
 use crate::builders::{fill_houses, grid_city, place_company};
 use crate::ScenarioCtx;
 use geom::vec2;
-use simulation::SimulationOptions;
+use simulation::map_dynamic::BuildingInfos;
+use simulation::{SimulationOptions, SoulID};
 
 pub const OPTIONS: SimulationOptions = SimulationOptions {
     terrain_size: 10,
@@ -20,14 +21,22 @@ pub fn run_for(ctx: &mut ScenarioCtx, ticks: u64) -> Result<(), String> {
     if grid.roads.len() != 24 {
         return Err(format!("smoke built {} of 24 grid roads", grid.roads.len()));
     }
+    let mut companies = Vec::new();
     for (company, offset) in [
         ("bakery", vec2(80.0, -20.0)),
         ("supermarket", vec2(240.0, -50.0)),
     ] {
-        place_company(ctx, company, origin + offset)
+        let building = place_company(ctx, company, origin + offset)
             .ok_or_else(|| format!("smoke could not place {company}"))?;
+        companies.push((company, building));
     }
-    fill_houses(ctx, 48);
+    let houses = fill_houses(ctx, 48);
+    if houses.len() < 20 {
+        return Err(format!(
+            "smoke built {} houses, expected at least 20",
+            houses.len()
+        ));
+    }
 
     let setup_ticks = ctx.sim.get_tick() - start;
     let remaining = ticks.checked_sub(setup_ticks).ok_or_else(|| {
@@ -36,8 +45,24 @@ pub fn run_for(ctx: &mut ScenarioCtx, ticks: u64) -> Result<(), String> {
     ctx.run_ticks(remaining);
 
     let sample = ctx.sample("final");
-    if sample.humans == 0 {
-        return Err("smoke has no humans".to_string());
+    let world = ctx.sim.world();
+    let infos = ctx.sim.read::<BuildingInfos>();
+    let map = ctx.sim.map();
+    for house in houses {
+        if !matches!(infos.owner(house), Some(SoulID::Human(id)) if world.humans.contains_key(id)) {
+            return Err(format!("smoke house {house:?} has no live human owner"));
+        }
+    }
+    for (company, building) in companies {
+        if !map.buildings().contains_key(building) {
+            return Err(format!("smoke {company} building {building:?} is missing"));
+        }
+        if !matches!(infos.owner(building), Some(SoulID::GoodsCompany(id)) if world.companies.contains_key(id))
+        {
+            return Err(format!(
+                "smoke {company} building {building:?} has no live company owner"
+            ));
+        }
     }
     if sample.extra["employed"] == 0.0 {
         return Err("smoke has no employed humans".to_string());

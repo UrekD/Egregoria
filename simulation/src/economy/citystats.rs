@@ -1,5 +1,5 @@
 use prototypes::{Money, TICKS_PER_HOUR, TICKS_PER_MINUTE};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{Government, LEVEL_NAMES};
 use crate::map::BuildingKind;
@@ -31,7 +31,15 @@ pub struct CityStatsSample {
 #[derive(Default, Clone, Serialize, Deserialize)]
 struct CityStatsHistoryLevel {
     samples: [Option<CityStatsSample>; SAMPLES_PER_LEVEL],
+    #[serde(deserialize_with = "deserialize_history_cursor")]
     cursor: usize,
+}
+
+fn deserialize_history_cursor<'de, D>(deserializer: D) -> Result<usize, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(usize::deserialize(deserializer)?.min(SAMPLES_PER_LEVEL - 1))
 }
 
 #[derive(Default, Clone, Serialize, Deserialize)]
@@ -103,13 +111,37 @@ pub fn citystats_update(sim: &mut Simulation) {
 
 #[cfg(test)]
 mod tests {
-    use super::CityStats;
+    use super::{CityStats, CityStatsSample, SAMPLES_PER_LEVEL};
     use crate::economy::Government;
     use crate::map::BuildingKind;
     use crate::tests::TestCtx;
     use crate::world_command::WorldCommand;
+    use common::saveload::{Bincode, Encoder};
     use geom::{vec2, Vec2, OBB};
     use prototypes::{BuildingGen, GameTime, Tick, TICKS_PER_MINUTE};
+
+    #[test]
+    fn citystats_repairs_out_of_range_history_cursor() {
+        let mut stats = CityStats::default();
+        stats.history.levels[0].samples[0] = Some(CityStatsSample {
+            population: 1,
+            ..CityStatsSample::default()
+        });
+        stats.history.levels[0].cursor = SAMPLES_PER_LEVEL + 1;
+
+        let encoded = Bincode::encode(&stats).unwrap();
+        let mut restored: CityStats = Bincode::decode(&encoded).unwrap();
+        assert_eq!(restored.history.samples(0).count(), 1);
+        restored.history.record(
+            TICKS_PER_MINUTE,
+            CityStatsSample {
+                population: 2,
+                ..CityStatsSample::default()
+            },
+        );
+        let populations: Vec<_> = restored.history.samples(0).map(|s| s.population).collect();
+        assert_eq!(populations, [1, 2]);
+    }
 
     #[test]
     fn citystats_counts_new_resident_on_sampling_tick() {

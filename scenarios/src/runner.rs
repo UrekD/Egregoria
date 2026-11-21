@@ -25,6 +25,7 @@ pub struct ScenarioCtx {
     pub samples: Vec<MetricSample>,
     tick_times: Vec<Duration>,
     queued: Vec<WorldCommand>,
+    executed_ticks: u64,
     checkpoints: Option<Vec<Checkpoint>>,
 }
 
@@ -52,6 +53,7 @@ impl ScenarioCtx {
             samples: Vec::new(),
             tick_times: Vec::new(),
             queued: Vec::new(),
+            executed_ticks: 0,
             checkpoints: None,
         }
     }
@@ -66,11 +68,11 @@ impl ScenarioCtx {
             self.tick_times
                 .push(self.sim.tick(&mut self.sched, &self.queued));
             self.queued.clear();
+            self.executed_ticks += 1;
 
             if let Some(checkpoints) = &mut self.checkpoints {
-                let tick = self.sim.get_tick();
-                if tick % CHECKPOINT_INTERVAL == 0 {
-                    checkpoints.push((tick, self.sim.hashes()));
+                if self.executed_ticks % CHECKPOINT_INTERVAL == 0 {
+                    checkpoints.push((self.sim.get_tick(), self.sim.hashes()));
                 }
             }
         }

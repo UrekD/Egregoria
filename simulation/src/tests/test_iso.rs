@@ -1,4 +1,4 @@
-use super::{init_test_simulation as init, TestCtx};
+use super::{init_test_simulation, TestCtx};
 use crate::map::{LanePatternBuilder, Map, MapProject, ProjectKind, Tree};
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::WorldCommand;
@@ -241,7 +241,7 @@ fn quickcheck_map_ser() {
 
 #[test]
 fn paris_hashes_survive_serde() {
-    init();
+    init_test_simulation();
     let mut sim = Simulation::new_with_options(SimulationOptions {
         terrain_size: 50,
         save_replay: false,
@@ -288,7 +288,7 @@ fn resumed_trajectory_matches_continuous_run() {
 
 #[test]
 fn test_world_survives_serde() {
-    init();
+    init_test_simulation();
     //common::logger::MyLog::init();
 
     let replay: Replay = JSONPretty::decode(REPLAY).unwrap();

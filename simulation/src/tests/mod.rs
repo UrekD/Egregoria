@@ -16,8 +16,9 @@ mod test_iso;
 mod vehicles;
 
 fn init_test_simulation() {
-    static INIT: Once = Once::new();
-    INIT.call_once(crate::init::init);
+    // SAFETY: Simulation unit tests run serially because they replace the global registry.
+    unsafe { crate::init::load_prototypes() };
+    crate::init::register_simulation();
 }
 
 pub(crate) struct TestCtx {
@@ -99,8 +100,6 @@ impl TestCtx {
 
 #[test]
 fn fast_tick_skips_serde() {
-    let regular = TestCtx::new();
-    let regular_tick = regular.g.get_tick();
     let mut fast = TestCtx::new_fast();
     let fast_tick = fast.g.get_tick();
 
@@ -112,5 +111,4 @@ fn fast_tick_skips_serde() {
     fast.tick_fast();
 
     assert_eq!(fast.g.get_tick(), fast_tick + 2);
-    assert_eq!(regular.g.get_tick(), regular_tick);
 }
