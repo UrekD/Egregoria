@@ -16,8 +16,8 @@ use goryak::{
     padxy, primary, secondary_container, textc, titlec, HorizScrollSize,
 };
 use prototypes::{
-    prototypes_iter, BuildingPrototypeID, GoodsCompanyID, GoodsCompanyPrototype, Prototype,
-    RenderAsset,
+    prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyID, GoodsCompanyPrototype,
+    GrowableCompanyID, Prototype, RenderAsset,
 };
 use simulation::map::{BuildingKind, Zone};
 use simulation::world_command::WorldCommand;
@@ -40,6 +40,11 @@ pub fn special_building_properties(uiw: &UiWorld) {
             l.show(|| {
                 let tooltip_active = use_state(|| Option::<(GoodsCompanyID, Instant)>::None);
                 for descr in prototypes_iter::<GoodsCompanyPrototype>() {
+                    if try_prototype(GrowableCompanyID::from(descr.id))
+                        .is_some_and(|proto| proto.growable)
+                    {
+                        continue;
+                    }
                     let Some(tex_id) = icons.ids.get(&descr.parent().id) else {
                         continue;
                     };

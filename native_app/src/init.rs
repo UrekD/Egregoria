@@ -15,6 +15,7 @@ use crate::gui::windows::economy::EconomyState;
 use crate::gui::windows::load::LoadState;
 use crate::gui::windows::settings::{AutoSaveEvery, Settings, SettingsState};
 use crate::gui::zoneedit::ZoneEditState;
+use crate::gui::zoning::ZoningState;
 use crate::gui::{
     ErrorTooltip, ExitState, GuiState, InspectedBuilding, InspectedEntity, PotentialCommands,
     TimeAlways, Tool,
@@ -56,6 +57,7 @@ pub fn init() {
     register_resource_noserialize::<NetworkState>();
     register_resource_noserialize::<PotentialCommands>();
     register_resource_noserialize::<ZoneEditState>();
+    register_resource_noserialize::<ZoningState>();
     register_resource_noserialize::<TestFieldProperties>();
     register_resource_noserialize::<ReceivedCommands>();
     register_resource_noserialize::<RoadBuildResource>();

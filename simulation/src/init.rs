@@ -73,6 +73,13 @@ fn register_systems_and_resources() {
     register_system("routing_update_system", routing_update_system);
     register_system("itinerary_update", itinerary_update);
     register_system("market_update", market_update);
+    register_system("budget_update", crate::economy::budget_update);
+    register_system("demand_update", crate::economy::demand_update);
+    register_system_sim(
+        "residence_update",
+        crate::souls::residence::residence_update,
+    );
+    register_system_sim("growth_update", crate::souls::growth::growth_update);
     register_system("train_reservations_update", train_reservations_update);
     register_system("freight_station", freight_station_system);
     register_system("random_vehicles", random_vehicles_update);
@@ -99,13 +106,17 @@ fn register_systems_and_resources() {
     register_resource_default::<Map, Bincode>("map");
     register_resource_default::<TrainReservations, Bincode>("train_reservations");
     register_resource_default::<Government, Bincode>("government");
+    register_resource_default::<crate::map::ZoneGrid, Bincode>("zone_grid");
+    register_resource_default::<crate::souls::residence::Residences, Bincode>("residences");
+    register_resource_default::<crate::economy::ZoneDemand, Bincode>("zone_demand");
+    register_resource_default::<crate::economy::Budget, Bincode>("budget");
     register_resource_default::<ParkingManagement, Bincode>("pmanagement");
     register_resource_default::<BuildingInfos, Bincode>("binfos");
     register_resource::<GameTime, Bincode>("game_time", || GameTime::new(Tick(1)));
     register_resource::<TransportGrid, Bincode>("transport_grid", || TransportGrid::new(100));
     register_resource::<RandProvider, Bincode>("randprovider", || RandProvider::new(RNG_SEED));
     register_resource_default::<Dispatcher, Bincode>("dispatcher");
-    register_resource_default::<Replay, JSON>("replay");
+    register_resource_default::<Replay, crate::utils::replay::ReplayJson>("replay");
 }
 
 pub struct InitFunc {

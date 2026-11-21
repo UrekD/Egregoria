@@ -1,5 +1,7 @@
 require("items")
 require("companies")
+require("residences")
+require("growables")
 require("leisure")
 require("colors")
 require("roadvehicles")

@@ -292,21 +292,13 @@ impl Simulation {
 
     pub fn load_replay_from_disk(save_name: &str) -> Option<Replay> {
         let path = format!("{save_name}_replay");
-        let replay: Replay = match common::saveload::JSON::load(&path) {
-            Ok(replay) => replay,
+        match utils::replay::ReplayJson::load(&path) {
+            Ok(replay) => Some(replay),
             Err(error) => {
                 log::error!("Could not load replay {path}: {error}");
-                return None;
+                None
             }
-        };
-        if replay.version != VERSION {
-            log::error!(
-                "Replay {path} has version {:?}, expected {VERSION:?}",
-                replay.version
-            );
-            return None;
         }
-        Some(replay)
     }
 
     pub fn load_from_disk(save_name: &str) -> Option<Self> {
@@ -396,8 +388,10 @@ impl Serialize for Simulation {
         log::info!("took {}s to serialize resources", t.elapsed().as_secs_f32());
 
         let v = SimulationSer {
+            header: SaveHeader {
+                version: VERSION.to_owned(),
+            },
             world: &self.world,
-            version: VERSION.to_string(),
             res: m,
         }
         .serialize(serializer);
@@ -406,17 +400,37 @@ impl Serialize for Simulation {
     }
 }
 
+#[derive(Serialize, Deserialize)]
+struct SaveHeader {
+    #[serde(deserialize_with = "deserialize_save_version")]
+    version: String,
+}
+
+fn deserialize_save_version<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let version = String::deserialize(deserializer)?;
+    if version != VERSION {
+        return Err(serde::de::Error::custom(format!(
+            "Save has version {version:?}, expected {VERSION:?}"
+        )));
+    }
+    Ok(version)
+}
+
 #[derive(Serialize)]
 struct SimulationSer<'a> {
+    header: SaveHeader,
     world: &'a World,
-    version: String,
     res: FastMap<String, Vec<u8>>,
 }
 
 #[derive(Deserialize)]
 struct SimulationDeser {
+    // Bincode reads and validates the leading header before decoding World.
+    #[serde(rename = "header")]
+    _header: SaveHeader,
     world: World,
-    version: String,
     res: FastMap<String, Vec<u8>>,
 }
 
@@ -434,13 +448,6 @@ impl<'de> Deserialize<'de> for Simulation {
             "took {}s to deserialize base deser",
             t.elapsed().as_secs_f32()
         );
-
-        if simdeser.version != VERSION {
-            return Err(serde::de::Error::custom(format!(
-                "Save has version {:?}, expected {VERSION:?}",
-                simdeser.version
-            )));
-        }
 
         let mut sim = Self {
             world: World::default(),

@@ -18,9 +18,11 @@ use crate::gui::GuiState;
 use crate::uiworld::{SaveLoadState, UiWorld};
 
 pub mod chat;
+mod demand_bars;
 pub mod keybinds;
 mod menu;
 mod time_controls;
+mod toasts;
 pub mod toolbox;
 pub mod windows;
 
@@ -37,13 +39,23 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
         power_errors(uiworld, sim);
         new_toolbox(uiworld, sim);
         menu_bar(uiworld, sim);
+        demand_bars::render(uiworld, sim);
         chat::chat(uiworld, sim);
         new_inspector(uiworld, sim);
         uiworld.write::<GuiState>().windows.render(uiworld, sim);
         time_controls(uiworld, sim);
+        toasts::render(uiworld, sim);
         keybinds::keybind_modal(uiworld, sim)
     });
     //goryak::debug_layout();
+}
+
+#[test]
+#[ignore = "P1e UI behaviour"]
+fn p1e_scripted_screenshots_and_dump_state() {
+    // Zoning preview, signed demand and top-driver tooltip, budget tax sliders, stats,
+    // rejection toast, and a grown city after RunTicks(300000).
+    todo!();
 }
 
 fn auto_save(uiworld: &UiWorld) {

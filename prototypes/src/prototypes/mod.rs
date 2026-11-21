@@ -2,7 +2,9 @@
 crate::gen_prototypes!(
     mod item:          ItemID              = ItemPrototype,
     mod building:      BuildingPrototypeID = BuildingPrototype,
+    mod residence:     ResidencePrototypeID = ResidencePrototype => BuildingPrototypeID,
     mod goods_company: GoodsCompanyID      = GoodsCompanyPrototype => BuildingPrototypeID,
+    mod growable_company: GrowableCompanyID = GrowableCompanyPrototype => GoodsCompanyID,
     mod leisure:       LeisurePrototypeID  = LeisurePrototype => BuildingPrototypeID,
     mod solar:         SolarPanelID        = SolarPanelPrototype => GoodsCompanyID,
 

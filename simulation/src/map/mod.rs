@@ -40,6 +40,7 @@ pub mod terrain;
 mod traffic_control;
 mod traversable;
 mod turn_policy;
+pub mod zonegrid;
 
 // Use self or else it would be ambiguous with "pathfinding" crate
 pub use self::pathfinding::*;
@@ -52,6 +53,7 @@ pub use terrain::*;
 pub use traffic_control::*;
 pub use traversable::*;
 pub use turn_policy::*;
+pub use zonegrid::*;
 
 pub use ::pathfinding as pathfinding_crate;
 

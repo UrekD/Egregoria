@@ -1,8 +1,10 @@
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::WorldCommand;
 use crate::Simulation;
+use common::saveload::{Encoder, JSON};
 use prototypes::Tick;
 use serde::{Deserialize, Serialize};
+use std::io;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Replay {
@@ -27,6 +29,37 @@ impl Default for Replay {
 impl Replay {
     pub fn push(&mut self, tick: Tick, command: WorldCommand) {
         self.commands.push((tick, command));
+    }
+}
+
+pub(crate) struct ReplayJson;
+
+impl Encoder for ReplayJson {
+    const EXTENSION: &'static str = JSON::EXTENSION;
+
+    fn encode(replay: &impl Serialize) -> io::Result<Vec<u8>> {
+        JSON::encode(replay)
+    }
+
+    fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
+        #[derive(Deserialize)]
+        struct ReplayHeader {
+            #[serde(default)]
+            version: String,
+        }
+
+        // Decode only the version on the first pass, regardless of JSON field order.
+        let ReplayHeader { version } = JSON::decode(bytes)?;
+        if version != crate::VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Replay has version {version:?}, expected {:?}",
+                    crate::VERSION
+                ),
+            ));
+        }
+        JSON::decode(bytes)
     }
 }
 

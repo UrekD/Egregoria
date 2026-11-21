@@ -9,16 +9,17 @@ use prototypes::BuildingGen;
 use prototypes::GameTime;
 use WorldCommand::*;
 
-use crate::economy::Government;
+use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
-    Building, BuildingID, BuildingKind, Environment, IntersectionID, LaneID, LaneKind, LanePattern,
-    LanePatternBuilder, LightPolicy, LotID, Map, MapProject, ProjectFilter, ProjectKind, RoadID,
-    TerraformKind, TurnPolicy, Zone,
+    Building, BuildingID, BuildingKind, Density, Environment, IntersectionID, LaneID, LaneKind,
+    LanePattern, LanePatternBuilder, LightPolicy, LotID, Map, MapProject, ProjectFilter,
+    ProjectKind, RoadID, TerraformKind, TurnPolicy, Zone, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{BuildingInfos, ParkingManagement};
 use crate::multiplayer::chat::Message;
 use crate::multiplayer::MultiplayerState;
+use crate::souls::residence;
 use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::train::{spawn_train, RailWagonKind};
 use crate::transportation::{spawn_parked_vehicle_with_spot, unpark, VehicleKind};
@@ -98,6 +99,15 @@ pub enum WorldCommand {
         zone: Zone,
     },
     SetGameTime(GameTime),
+    ZonePaint {
+        area: OBB,
+        kind: Option<ZoneKind>,
+        density: Density,
+    },
+    SetTaxRate {
+        zone: ZoneKind,
+        rate_permille: u16,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -107,6 +117,7 @@ pub enum Rejection {
     InvalidBatchIndex,
     InvalidBuilding,
     InvalidZone,
+    InvalidTaxRate,
     InvalidTrain,
     CostOverflow,
     InsufficientFunds,
@@ -237,6 +248,8 @@ impl WorldCommand {
                 | MapUpdateIntersectionPolicy { .. }
                 | UpdateZone { .. }
                 | SetGameTime(_)
+                | ZonePaint { .. }
+                | SetTaxRate { .. }
         )
     }
 
@@ -283,6 +296,8 @@ impl WorldCommand {
             MapLoadTestField { .. } => "MapLoadTestField",
             UpdateZone { .. } => "UpdateZone",
             SetGameTime(_) => "SetGameTime",
+            ZonePaint { .. } => "ZonePaint",
+            SetTaxRate { .. } => "SetTaxRate",
         };
         sim.write::<CommandOutcomes>().last.push((kind, reason));
     }
@@ -365,6 +380,8 @@ impl WorldCommand {
                 }
                 true
             }
+            ZonePaint { .. } => return Err(Rejection::InvalidZone),
+            SetTaxRate { .. } => return Err(Rejection::InvalidTaxRate),
             _ => true,
         };
         if exists {
@@ -374,7 +391,7 @@ impl WorldCommand {
         }
     }
 
-    fn balance_after_cost(sim: &Simulation, cost: Option<Money>) -> Result<Money, Rejection> {
+    fn validate_cost(sim: &Simulation, cost: Option<Money>) -> Result<Money, Rejection> {
         let cost = cost.ok_or(Rejection::CostOverflow)?;
         let money = sim.read::<Government>().money;
         if cost > Money::ZERO && money < cost {
@@ -383,8 +400,26 @@ impl WorldCommand {
         money
             .inner()
             .checked_sub(cost.inner())
-            .map(Money::new_inner)
+            .map(|_| cost)
             .ok_or(Rejection::CostOverflow)
+    }
+
+    fn charge_construction(sim: &Simulation, cost: Money) {
+        if let Some(delta) = cost.inner().checked_neg() {
+            Budget::apply(
+                &sim.resources,
+                BudgetCategory::Construction,
+                Money::new_inner(delta),
+            );
+        } else {
+            // A refund of -i64::MIN fits when the balance is negative, but needs two Money deltas.
+            Budget::apply(&sim.resources, BudgetCategory::Construction, Money::MAX);
+            Budget::apply(
+                &sim.resources,
+                BudgetCategory::Construction,
+                Money::new_inner(1),
+            );
+        }
     }
 
     fn apply_connections(
@@ -428,8 +463,8 @@ impl WorldCommand {
                 continue;
             }
             let cost = Government::connection_cost(&projects[from], &projects[to], pat);
-            let balance = match Self::balance_after_cost(sim, cost) {
-                Ok(balance) => balance,
+            let cost = match Self::validate_cost(sim, cost) {
+                Ok(cost) => cost,
                 Err(reason) => {
                     self.reject(sim, reason);
                     continue;
@@ -447,7 +482,7 @@ impl WorldCommand {
                 });
                 junctions.insert(id);
             }
-            sim.write::<Government>().money = balance;
+            Self::charge_construction(sim, cost);
         }
         // Keep junction IDs alive until every link that names them has been processed.
         for junction in junctions {
@@ -459,7 +494,7 @@ impl WorldCommand {
 
     fn apply_one(&self, sim: &mut Simulation) -> Result<(), Rejection> {
         self.validate(&sim.map())?;
-        let balance = Self::balance_after_cost(sim, Government::checked_action_cost(self, sim))?;
+        let cost = Self::validate_cost(sim, Government::checked_action_cost(self, sim))?;
 
         match *self {
             MapRemoveIntersection(id) => sim.map_mut().remove_intersection(id),
@@ -474,6 +509,7 @@ impl WorldCommand {
                     .map_mut()
                     .remove_building(id)
                     .ok_or(Rejection::MutationFailed)?;
+                residence::on_building_removed(sim, id);
                 crate::souls::lifecycle::remove_building(sim, building, was_external_target);
             }
             MapBuildHouse(id) => {
@@ -482,6 +518,7 @@ impl WorldCommand {
                     .build_house(id)
                     .ok_or(Rejection::MutationFailed)?;
                 sim.write::<BuildingInfos>().insert(building);
+                residence::on_house_built(sim, building);
             }
             MapMakeConnection {
                 from,
@@ -517,6 +554,15 @@ impl WorldCommand {
                 sim.write::<BuildingInfos>().insert(id);
             }
             SetGameTime(gt) => *sim.write::<GameTime>() = gt,
+            ZonePaint {
+                area,
+                kind,
+                density,
+            } => sim.write::<ZoneGrid>().paint(area, kind, density),
+            SetTaxRate {
+                zone,
+                rate_permille,
+            } => sim.write::<Budget>().set_tax_rate(zone, rate_permille),
             AddTrain {
                 dist: _,
                 n_wagons: _,
@@ -597,7 +643,7 @@ impl WorldCommand {
                     .terraform(tick, kind, center, radius, amount, level, slope);
             }
         }
-        sim.write::<Government>().money = balance;
+        Self::charge_construction(sim, cost);
         Ok(())
     }
 }

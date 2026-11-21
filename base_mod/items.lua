@@ -105,4 +105,20 @@ data:extend {
         name = "polyester",
         label = "Polyester",
     },
+    {
+        type = "item",
+        name = "goods",
+        label = "Goods",
+    },
+    {
+        type = "item",
+        name = "retail-goods",
+        label = "Retail Goods",
+        optout_exttrade = true,
+    },
+    {
+        type = "item",
+        name = "services",
+        label = "Services",
+    },
 }

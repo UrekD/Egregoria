@@ -1,5 +1,6 @@
 use super::{init_test_simulation, TestCtx};
 use crate::map::{LanePatternBuilder, Map, MapProject, ProjectKind, Tree};
+use crate::utils::replay::ReplayJson;
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::WorldCommand;
 use crate::World;
@@ -240,6 +241,51 @@ fn quickcheck_map_ser() {
 }
 
 #[test]
+fn p1_spine_growth_resources_round_trip() {
+    use crate::economy::{Budget, BudgetCategory, ZoneDemand};
+    use crate::map::{Density, ZoneCell, ZoneGrid, ZoneKind};
+    use crate::souls::residence::{Residence, Residences};
+    use prototypes::{Money, ResidencePrototypeID};
+
+    let ctx = TestCtx::new_fast();
+    ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
+    let house = ctx.build_house_near(vec2(150.0, 125.0));
+    ctx.g.write::<ZoneGrid>().cells.insert(
+        (1, 2),
+        ZoneCell {
+            kind: ZoneKind::Residential,
+            density: Density::Low,
+        },
+    );
+    ctx.g.write::<Residences>().by_building.insert(
+        house,
+        Residence {
+            prototype: ResidencePrototypeID::new("residence-low-l1"),
+            density: Density::Low,
+            level: 1,
+            capacity: 2,
+        },
+    );
+    ctx.g
+        .write::<ZoneDemand>()
+        .values
+        .insert(ZoneKind::Residential, 40.0);
+    ctx.g
+        .write::<Budget>()
+        .record(BudgetCategory::TradeExport, Money::new_cents(1));
+
+    let encoded = Bincode::encode(&ctx.g).unwrap();
+    let decoded: Simulation = Bincode::decode(&encoded).unwrap();
+    let original = ctx.g.hashes();
+    let restored = decoded.hashes();
+
+    for name in ["zone_grid", "residences", "zone_demand", "budget"] {
+        let hash = original.get(name).expect(name);
+        assert_eq!(restored.get(name), Some(hash), "{name}");
+    }
+}
+
+#[test]
 fn paris_hashes_survive_serde() {
     init_test_simulation();
     let mut sim = Simulation::new_with_options(SimulationOptions {
@@ -291,7 +337,7 @@ fn test_world_survives_serde() {
     init_test_simulation();
     //common::logger::MyLog::init();
 
-    let replay: Replay = JSONPretty::decode(REPLAY).unwrap();
+    let replay: Replay = ReplayJson::decode(REPLAY).unwrap();
     let mut s = SeqSchedule::default();
 
     let mut check_size = 1024;

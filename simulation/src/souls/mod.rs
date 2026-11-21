@@ -10,8 +10,10 @@ pub mod desire;
 
 pub mod freight_station;
 pub mod goods_company;
+pub mod growth;
 pub mod human;
 pub mod lifecycle;
+pub mod residence;
 
 /// Adds souls to empty buildings
 pub(crate) fn add_souls_to_empty_buildings(sim: &mut Simulation) {

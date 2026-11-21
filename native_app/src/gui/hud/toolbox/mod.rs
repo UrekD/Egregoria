@@ -73,7 +73,7 @@ fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {
     match tool {
         Tool::Hand => return false,
         Tool::Bulldozer => return false,
-        Tool::LotBrush => return false,
+        Tool::LotBrush | Tool::Zoning => return false,
         Tool::RoadbuildStraight | Tool::RoadbuildCurved => {
             roadbuild::roadbuild_properties(uiw);
         }
@@ -98,7 +98,7 @@ fn tools_list(uiworld: &UiWorld) {
         ("toolbar_straight_road", Tool::RoadbuildStraight),
         ("toolbar_curved_road", Tool::RoadbuildCurved),
         ("toolbar_road_edit", Tool::RoadEditor),
-        ("toolbar_housetool", Tool::LotBrush),
+        ("toolbar_housetool", Tool::Zoning),
         ("toolbar_companies", Tool::SpecialBuilding),
         ("toolbar_bulldozer", Tool::Bulldozer),
         ("toolbar_train", Tool::Train),
@@ -119,7 +119,7 @@ fn tools_list(uiworld: &UiWorld) {
                 default_col,
                 hover_col,
                 primary(),
-                "",
+                if *tool == Tool::Zoning { "Zoning" } else { "" },
             )
             .clicked
             {

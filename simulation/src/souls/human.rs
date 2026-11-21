@@ -1,7 +1,7 @@
 use crate::economy::{Bought, Market};
 use crate::map::BuildingID;
 use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, Router};
-use crate::souls::desire::{BuyFood, Home, Work};
+use crate::souls::desire::{BuyFood, BuyGoods, Home, Work};
 use crate::transportation::Speed;
 use crate::transportation::{
     random_pedestrian_shirt_color, spawn_parked_vehicle, Location, Pedestrian, VehicleKind,
@@ -146,6 +146,7 @@ enum NextDesire<'a> {
     Home(&'a mut Home),
     Work(&'a mut Work),
     Food(&'a mut BuyFood),
+    Goods(&'a mut BuyGoods),
 }
 
 pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
@@ -170,6 +171,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             &mut h.bought,
             &mut h.decision,
             Some(&mut h.food),
+            &mut h.goods,
             Some(&mut h.home),
             h.work.as_mut(),
         )
@@ -190,6 +192,7 @@ pub fn update_decision(
     bought: &mut Bought,
     decision: &mut HumanDecision,
     food: Option<&mut BuyFood>,
+    goods: &mut BuyGoods,
     home: Option<&mut Home>,
     work: Option<&mut Work>,
 ) {
@@ -230,11 +233,14 @@ pub fn update_decision(
         let score = food.score(time, loc, bought);
         food.last_score = score;
 
-        #[allow(unused_assignments)]
         if score > max_score {
             max_score = score;
             decision_id = NextDesire::Food(food);
         }
+    }
+
+    if goods.score(time, me, loc, bought) > max_score {
+        decision_id = NextDesire::Goods(goods);
     }
 
     match decision_id {
@@ -242,6 +248,9 @@ pub fn update_decision(
         NextDesire::Work(work) => decision.kind = work.apply(loc, router),
         NextDesire::Food(food) => {
             decision.kind = food.apply(cbuf, binfos, time, me, trans, loc, bought)
+        }
+        NextDesire::Goods(goods) => {
+            decision.kind = goods.apply(cbuf, binfos, time, me, trans, loc, bought)
         }
         NextDesire::None => {}
     }
@@ -273,6 +282,7 @@ pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
         decision: HumanDecision::default(),
         home: Home::new(house),
         food: BuyFood::new(time),
+        goods: BuyGoods,
         bought: Bought::default(),
         router: Router::new(car),
         collider: None,

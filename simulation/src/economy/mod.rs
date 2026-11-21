@@ -16,14 +16,19 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
+pub mod balance;
+mod budget;
 mod citystats;
+mod demand;
 mod ecostats;
 mod government;
 mod market;
 
 use crate::map::Map;
 use crate::world::HumanID;
+pub use budget::*;
 pub use citystats::*;
+pub use demand::*;
 pub use ecostats::*;
 pub use government::*;
 pub use market::*;
@@ -46,11 +51,14 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
 
     let mut m = resources.write::<Market>();
     let job_opening = ItemID::new("job-opening");
-    let mut gvt = resources.write::<Government>();
     let tick = resources.read::<GameTime>().tick;
 
     if tick.0 % TICKS_PER_MINUTE == 0 {
-        gvt.money -= n_workers as i64 * WORKER_CONSUMPTION_PER_MINUTE;
+        Budget::apply(
+            resources,
+            BudgetCategory::CitizenUpkeepLegacy,
+            -(n_workers as i64 * WORKER_CONSUMPTION_PER_MINUTE),
+        );
     }
 
     let freights = &world.freight_stations;
@@ -79,7 +87,12 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
                 comp.workers.0.push(trade.buyer.0.try_into().unwrap())
             }
         }
-        gvt.money += trade.money_delta;
+        let category = if trade.money_delta < Money::ZERO {
+            BudgetCategory::TradeImport
+        } else {
+            BudgetCategory::TradeExport
+        };
+        Budget::apply(resources, category, trade.money_delta);
 
         if let SoulID::GoodsCompany(id) = trade.seller.0 {
             if trade.kind != job_opening {

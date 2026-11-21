@@ -1,7 +1,7 @@
 #![allow(clippy::type_complexity)]
 
 use crate::game_loop::Timings;
-use crate::gui::{GuiState, InspectedEntity};
+use crate::gui::{GuiState, InspectedEntity, Tool};
 use crate::uiworld::UiWorld;
 use simulation::map_dynamic::ParkingManagement;
 use simulation::transportation::TransportGrid;
@@ -101,6 +101,10 @@ fn debug(window: egui::Window<'_>, ui: &egui::Context, uiworld: &UiWorld, sim: &
             "Debug fog shader",
         );
         drop(objs);
+
+        if ui.small_button("Lot Brush").clicked() {
+            *uiworld.write::<Tool>() = Tool::LotBrush;
+        }
 
         let time = *sim.read::<GameTime>();
         let daysecleft = SECONDS_PER_DAY - sim.read::<GameTime>().daytime.daysec();

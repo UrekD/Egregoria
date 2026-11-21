@@ -1,3 +1,5 @@
+pub mod budget;
+pub mod citystats;
 pub mod economy;
 pub mod load;
 pub mod settings;
@@ -13,6 +15,8 @@ pub mod network;
 #[derive(Default)]
 pub struct GUIWindows {
     economy_open: bool,
+    budget_open: bool,
+    citystats_open: bool,
     settings_open: bool,
     load_open: bool,
     #[cfg(feature = "multiplayer")]
@@ -23,6 +27,14 @@ impl GUIWindows {
     pub fn menu(&mut self) {
         if button_primary("Economy").show().clicked {
             self.economy_open ^= true;
+        }
+
+        if button_primary("Budget").show().clicked {
+            self.budget_open ^= true;
+        }
+
+        if button_primary("City Stats").show().clicked {
+            self.citystats_open ^= true;
         }
 
         if button_primary("Settings").show().clicked {
@@ -50,6 +62,8 @@ impl GUIWindows {
         }
 
         economy::economy(uiworld, sim, &mut self.economy_open);
+        budget::budget(uiworld, sim, &mut self.budget_open);
+        citystats::citystats(uiworld, sim, &mut self.citystats_open);
         settings::settings(uiworld, sim, &mut self.settings_open);
         load::load(uiworld, sim, &mut self.load_open);
 

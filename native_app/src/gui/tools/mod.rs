@@ -8,3 +8,4 @@ pub mod selectable;
 pub mod specialbuilding;
 pub mod terraforming;
 pub mod zoneedit;
+pub mod zoning;

@@ -47,6 +47,7 @@ pub fn run_ui_systems(sim: &Simulation, uiworld: &UiWorld) {
     specialbuilding::specialbuilding(sim, uiworld);
     addtrain::addtrain(sim, uiworld);
     zoneedit::zoneedit(sim, uiworld);
+    zoning::zoning(sim, uiworld);
     terraforming::terraforming(sim, uiworld);
 
     // run last so other systems can have the chance to cancel select
@@ -128,6 +129,7 @@ pub enum Tool {
     SpecialBuilding,
     Train,
     Terraforming,
+    Zoning,
 }
 
 impl Tool {

@@ -12,8 +12,9 @@ use crate::souls::freight_station::FreightTrainState;
 use crate::souls::human::HumanDecisionKind;
 use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::{unpark, Location};
+use crate::utils::replay::ReplayJson;
 use crate::world_command::{CommandOutcomes, Rejection};
-use crate::{Simulation, SimulationSer, SoulID, WorldCommand, START_COMMANDS, VERSION};
+use crate::{SaveHeader, Simulation, SimulationSer, SoulID, WorldCommand, START_COMMANDS, VERSION};
 use common::saveload::{CompressedBincode, Encoder, JSON};
 use geom::{vec2, vec3, Polygon, OBB};
 use prototypes::{BuildingGen, GoodsCompanyID, ItemID, Money, RollingStockID};
@@ -532,6 +533,44 @@ fn save_fixture(name: &str) -> String {
 }
 
 #[test]
+fn p1_spine_save_rejects_wrong_version_before_world_decode() {
+    #[derive(serde::Serialize)]
+    struct HeaderOnly<'a> {
+        version: &'a str,
+    }
+
+    for version in ["0.0.0", VERSION] {
+        let encoded = CompressedBincode::encode(&HeaderOnly { version }).unwrap();
+        let error = CompressedBincode::decode::<Simulation>(&encoded)
+            .err()
+            .expect("save has no World payload")
+            .to_string();
+        assert_eq!(
+            error.contains("Save has version"),
+            version != VERSION,
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn p1_spine_replay_rejects_wrong_version_before_command_decode() {
+    for version in ["0.0.0", VERSION] {
+        let json = format!(
+            r#"{{"commands":[[1,"UnknownCommand"]],"enabled":true,"last_tick_recorded":1,"version":{version:?}}}"#
+        );
+        let error = ReplayJson::decode::<crate::Replay>(json.as_bytes())
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            error.contains("Replay has version"),
+            version != VERSION,
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn disk_load_rejects_wrong_version_missing_resources_and_bad_resource_bytes() {
     let test = TestCtx::new();
     for variant in ["current", "version", "patch", "missing", "corrupt"] {
@@ -553,8 +592,8 @@ fn disk_load_rejects_wrong_version_missing_resources_and_bad_resource_bytes() {
         let name = save_fixture(variant);
         CompressedBincode::save(
             &SimulationSer {
+                header: SaveHeader { version },
                 world: test.g.world(),
-                version,
                 res: resources,
             },
             &name,

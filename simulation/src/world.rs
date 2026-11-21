@@ -3,7 +3,7 @@ use crate::map_dynamic::{
     DispatchID, Dispatcher, Itinerary, ItineraryFollower, ItineraryLeader, ParkingManagement,
     Router,
 };
-use crate::souls::desire::{BuyFood, Home, Work};
+use crate::souls::desire::{BuyFood, BuyGoods, Home, Work};
 use crate::souls::freight_station::FreightStation;
 use crate::souls::goods_company::GoodsCompanyState;
 use crate::souls::human::{HumanDecision, PersonalInfo};
@@ -99,6 +99,7 @@ pub struct HumanEnt {
     pub decision: HumanDecision,
     pub home: Home,
     pub food: BuyFood,
+    pub goods: BuyGoods,
     pub bought: Bought,
     pub work: Option<Work>,
 
