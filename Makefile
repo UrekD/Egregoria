@@ -2,7 +2,7 @@ SYSROOT_LIB ?= $(HOME)/.local/egr-sysroot/usr/lib/x86_64-linux-gnu
 export PKG_CONFIG_PATH ?= $(SYSROOT_LIB)/pkgconfig
 export LIBRARY_PATH ?= $(SYSROOT_LIB)
 CARGO_TARGET_DIR ?= target
-SHOTS_DIR ?= /tmp/egr/shots/$(shell date +%Y%m%d-%H%M%S)
+SHOTS_DIR := /tmp/egr/shots/$(shell date +%Y%m%d-%H%M%S)
 
 .PHONY: check-sim check test test-sim scenarios determinism perf shots clippy-sim fmt-check
 
