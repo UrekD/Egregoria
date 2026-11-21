@@ -1,5 +1,5 @@
 use prototypes::{GoodsCompanyID, Money};
-use scenarios::builtin::smoke;
+use scenarios::builtin::{determinism, smoke};
 use scenarios::ScenarioCtx;
 use simulation::economy::Government;
 use simulation::map::BuildingKind;
@@ -42,6 +42,11 @@ fn smoke_is_deterministic() {
     .unwrap();
 
     assert_eq!(final_ticks, [5_000, 5_000]);
+}
+
+#[test]
+fn smoke_resumed_trajectory_matches_continuous_run() {
+    determinism::verify_resumed(2_000).unwrap();
 }
 
 #[test]

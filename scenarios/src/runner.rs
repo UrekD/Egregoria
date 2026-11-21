@@ -4,6 +4,9 @@ use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::WorldCommand;
 use simulation::{Simulation, SimulationOptions};
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::io::ErrorKind;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
 use std::time::Duration;
 
@@ -38,8 +41,12 @@ impl ScenarioCtx {
             simulation::init::init();
         });
 
+        Self::from_sim(Simulation::new_with_options(opts))
+    }
+
+    fn from_sim(sim: Simulation) -> Self {
         Self {
-            sim: Simulation::new_with_options(opts),
+            sim,
             sched: Simulation::schedule(),
             samples: Vec::new(),
             tick_times: Vec::new(),
@@ -110,25 +117,8 @@ impl ScenarioCtx {
         let first = self.record_checkpoints(&mut run)?;
         let second = Self::new(opts).record_checkpoints(&mut run)?;
 
-        for ((tick, hashes), (other_tick, other_hashes)) in first.iter().zip(&second) {
-            if tick != other_tick {
-                return Err(format!(
-                    "determinism checkpoint ticks differ ({tick} and {other_tick})"
-                ));
-            }
-            if hashes != other_hashes {
-                let changed: BTreeSet<_> = hashes
-                    .keys()
-                    .chain(other_hashes.keys())
-                    .filter(|key| hashes.get(*key) != other_hashes.get(*key))
-                    .map(String::as_str)
-                    .collect();
-                let changed: Vec<_> = changed.into_iter().collect();
-                return Err(format!(
-                    "determinism mismatch at tick {tick} ({})",
-                    changed.join(", ")
-                ));
-            }
+        for (first, second) in first.iter().zip(&second) {
+            compare_checkpoint(first, second)?;
         }
         if first.len() != second.len() {
             return Err(format!(
@@ -138,6 +128,52 @@ impl ScenarioCtx {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn verify_resumed(
+        &mut self,
+        ticks: u64,
+        run_for: impl Fn(&mut Self, u64) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let opts = *self.sim.read::<SimulationOptions>();
+        run_for(self, ticks)?;
+
+        let midpoint = ticks / 2;
+        let mut resumed = Self::new(opts);
+        run_for(&mut resumed, midpoint)?;
+        let mut resumed = resumed.resume()?;
+        resumed.run_ticks(ticks - midpoint);
+
+        compare_checkpoint(&self.checkpoint(), &resumed.checkpoint())
+    }
+
+    fn resume(self) -> Result<Self, String> {
+        // The public save API uses compressed Bincode under world/. Reserve a
+        // private directory so concurrent runs cannot overwrite each other's saves.
+        static NEXT_SAVE: AtomicUsize = AtomicUsize::new(0);
+        fs::create_dir_all("world").map_err(|err| format!("could not create world/: {err}"))?;
+        let (directory, path) = loop {
+            let id = NEXT_SAVE.fetch_add(1, Ordering::Relaxed);
+            let directory = format!("scenarios-resume-{}-{id}", std::process::id());
+            let path = format!("world/{directory}");
+            match fs::create_dir(&path) {
+                Ok(()) => break (directory, path),
+                Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(format!("could not create {path}: {err}")),
+            }
+        };
+
+        let name = format!("{directory}/midpoint");
+        self.sim.save_to_disk(&name);
+        let sim = Simulation::load_from_disk(&name);
+        fs::remove_dir_all(&path).map_err(|err| format!("could not remove {path}: {err}"))?;
+        let sim = sim
+            .ok_or_else(|| format!("could not round-trip save at tick {}", self.sim.get_tick()))?;
+        Ok(Self::from_sim(sim))
+    }
+
+    fn checkpoint(&self) -> Checkpoint {
+        (self.sim.get_tick(), self.sim.hashes())
     }
 
     fn record_checkpoints(
@@ -151,7 +187,31 @@ impl ScenarioCtx {
         let result = run(self);
         let mut checkpoints = self.checkpoints.take().unwrap();
         result?;
-        checkpoints.push((self.sim.get_tick(), self.sim.hashes()));
+        checkpoints.push(self.checkpoint());
         Ok(checkpoints)
     }
+}
+
+fn compare_checkpoint(first: &Checkpoint, second: &Checkpoint) -> Result<(), String> {
+    let (tick, hashes) = first;
+    let (other_tick, other_hashes) = second;
+    if tick != other_tick {
+        return Err(format!(
+            "determinism checkpoint ticks differ ({tick} and {other_tick})"
+        ));
+    }
+    if hashes != other_hashes {
+        let changed: BTreeSet<_> = hashes
+            .keys()
+            .chain(other_hashes.keys())
+            .filter(|key| hashes.get(*key) != other_hashes.get(*key))
+            .map(String::as_str)
+            .collect();
+        let changed: Vec<_> = changed.into_iter().collect();
+        return Err(format!(
+            "determinism mismatch at tick {tick} ({})",
+            changed.join(", ")
+        ));
+    }
+    Ok(())
 }
