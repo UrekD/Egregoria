@@ -1,5 +1,9 @@
+use crate::ScenarioCtx;
 use geom::{vec2, Polygon, Vec2, OBB};
-use prototypes::{try_prototype, BuildingGen, FreightStationPrototypeID, GoodsCompanyID, Size2D};
+use prototypes::{
+    try_prototype, BuildingGen, FreightStationPrototypeID, GoodsCompanyID, Money, Size2D,
+};
+use simulation::economy::Government;
 use simulation::map::{
     BuildingID, BuildingKind, Density, LanePatternBuilder, Map, ProjectFilter, ProjectKind, RoadID,
     Zone, ZoneKind,
@@ -169,6 +173,12 @@ pub fn place_freight_station(
     building
 }
 
+/// Add startup funds to a scenario fixture directly, outside the budget ledger.
+/// Construction still goes through the normal affordability checks and ledger.
+pub(crate) fn grant_money(ctx: &mut ScenarioCtx, amount: Money) {
+    ctx.sim.write::<Government>().money += amount;
+}
+
 /// Build at most `max` houses on existing lots in lot ID order, returning their building IDs.
 pub fn fill_houses(ctx: &mut dyn CommandSink, max: usize) -> Vec<BuildingID> {
     if max == 0 {
@@ -304,7 +314,7 @@ fn roadside_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{builtin::smoke, ScenarioCtx};
+    use crate::builtin::smoke;
 
     #[test]
     fn command_sink_applies_queued_roads_on_flush() {
