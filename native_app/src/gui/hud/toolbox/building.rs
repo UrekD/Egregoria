@@ -1,4 +1,3 @@
-use std::path::PathBuf;
 use std::time::Instant;
 
 use yakui::widgets::List;
@@ -39,12 +38,10 @@ pub fn special_building_properties(uiw: &UiWorld) {
             l.item_spacing = 10.0;
             l.show(|| {
                 let tooltip_active = use_state(|| Option::<(GoodsCompanyID, Instant)>::None);
-                for descr in prototypes_iter::<GoodsCompanyPrototype>() {
-                    if try_prototype(GrowableCompanyID::from(descr.id))
+                for descr in prototypes_iter::<GoodsCompanyPrototype>().filter(|company| {
+                    !try_prototype(GrowableCompanyID::from(company.id))
                         .is_some_and(|proto| proto.growable)
-                    {
-                        continue;
-                    }
+                }) {
                     let Some(tex_id) = icons.ids.get(&descr.parent().id) else {
                         continue;
                     };
@@ -277,17 +274,6 @@ pub fn do_icons(ctx: &mut Context, uiw: &UiWorld) {
         let RenderAsset::Mesh { ref path } = building.asset else {
             continue;
         };
-        let cache_path = PathBuf::from(format!(
-            "assets/generated/building_icons/{}.png",
-            building.id.hash()
-        ));
-        //if std::fs::metadata(&cache_path).is_ok() {
-        //    let t = TextureBuilder::from_path(&cache_path).build(&gfx.device, &gfx.queue);
-        //    let tex_id = yakui.add_texture(&t);
-        //    state.ids.insert(building.id, tex_id);
-        //    continue;
-        //}
-
         let Ok(mesh) = gfx.mesh(path.as_ref()) else {
             continue;
         };
@@ -314,8 +300,6 @@ pub fn do_icons(ctx: &mut Context, uiw: &UiWorld) {
         cam.update();
 
         mesh.render_to_texture(&cam, gfx, &t, &t_msaa);
-
-        t.save_to_file(&gfx.device, &gfx.queue, cache_path, 0);
 
         let tex_id = ctx.yakui.add_texture(&t);
 

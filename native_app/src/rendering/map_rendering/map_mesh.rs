@@ -1,3 +1,5 @@
+use crate::gui::zoning::zone_color;
+use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::MapRenderOptions;
 use common::FastMap;
 use engine::earcut::earcut;
@@ -7,11 +9,14 @@ use engine::{
     MeshVertex, MetallicRoughness, SpriteBatch, SpriteBatchBuilder, Tesselator,
 };
 use geom::{minmax, vec2, vec3, Color, LinearColor, PolyLine3, Polygon, Radians, Vec2, Vec3};
-use prototypes::{FreightStationPrototype, GoodsCompanyPrototype, RenderAsset};
+use prototypes::{
+    try_prototype, FreightStationPrototype, GoodsCompanyID, GoodsCompanyPrototype,
+    GrowableCompanyID, GrowableCompanyPrototype, RenderAsset,
+};
 use simulation::map::{
     Building, BuildingKind, CanonicalPosition, Environment, Intersection, LaneKind, Lanes, LotKind,
     Map, MapSubscriber, ProjectFilter, ProjectKind, PylonPosition, Road, Roads, SubscriberChunkID,
-    Turn, TurnKind, UpdateType, CROSSWALK_WIDTH, ROAD_Z_OFFSET,
+    Turn, TurnKind, UpdateType, ZoneGrid, ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET,
 };
 use simulation::Simulation;
 use std::ops::{Mul, Neg};
@@ -57,6 +62,44 @@ struct MapBuilders {
     mesh_lots: MeshBuilder<false>,
 }
 
+impl super::MapRenderer {
+    /// Reads the current zone grid so paint, regenerated lots and loads need no cache invalidation.
+    pub fn draw_zone_lots(
+        sim: &Simulation,
+        draw: &mut ImmediateDraw,
+        center: Vec2,
+        radius: f32,
+        show_unzoned: bool,
+    ) {
+        let zones = sim.read::<ZoneGrid>();
+        if !show_unzoned && zones.cells.is_empty() {
+            return;
+        }
+        let map = sim.map();
+        for project in map
+            .spatial_map()
+            .query_around(center, radius, ProjectFilter::LOT)
+        {
+            let ProjectKind::Lot(id) = project else {
+                continue;
+            };
+            let lot = &map.lots()[id];
+            let Some(color) = zones
+                .lot_zone(&lot.shape)
+                .map(|zone| zone_color(zone.kind).a(0.65))
+                .or_else(|| show_unzoned.then(|| simulation::colors().lot_unassigned_col.into()))
+            else {
+                continue;
+            };
+            draw.obb(lot.shape, lot.height + 0.32).color(color);
+        }
+    }
+}
+
+fn growable_company(id: GoodsCompanyID) -> Option<&'static GrowableCompanyPrototype> {
+    try_prototype(GrowableCompanyID::from(id)).filter(|proto| proto.growable)
+}
+
 impl MapMeshHandler {
     pub fn new(gfx: &mut GfxContext, sim: &Simulation) -> Self {
         let arrow_builder = SpriteBatchBuilder::from_path(gfx, "assets/sprites/arrow_one_way.png");
@@ -66,7 +109,7 @@ impl MapMeshHandler {
         let mut zonemeshes = FastMap::default();
 
         for descr in GoodsCompanyPrototype::iter() {
-            if descr.zone.is_some() {
+            if descr.zone.is_some() || growable_company(descr.id).is_some() {
                 continue;
             }
             let RenderAsset::Sprite { path } = &descr.asset else {
@@ -80,6 +123,7 @@ impl MapMeshHandler {
         }
 
         for (asset, bkind) in GoodsCompanyPrototype::iter()
+            .filter(|descr| growable_company(descr.id).is_none())
             .map(|descr| (&descr.asset, BuildingKind::GoodsCompany(descr.id)))
             .chain(
                 FreightStationPrototype::iter()
@@ -412,6 +456,13 @@ impl MapBuilders {
             if SubscriberChunkID::new(building.canonical_position()) != chunk {
                 continue;
             }
+            if let BuildingKind::GoodsCompany(id) = building.kind {
+                if let Some(proto) = growable_company(id) {
+                    let tint = zone_color(proto.zone_kind);
+                    self.building_box(building, tint, proto.level);
+                    continue;
+                }
+            }
             self.zone_mesh(building);
             self.houses_mesh(building);
 
@@ -443,14 +494,15 @@ impl MapBuilders {
                 .flat_map(|(face, _)| face)
                 .any(|point| point.z > building.height + 0.2)
             {
-                self.building_box(building);
+                self.building_box(building, LinearColor::new(0.55, 0.48, 0.40, 1.0), 1);
             }
         }
     }
 
-    fn building_box(&mut self, building: &Building) {
+    fn building_box(&mut self, building: &Building, tint: LinearColor, level: u8) {
         let [width, depth] = building.obb.axis().map(Vec2::mag);
-        let height = (width.min(depth) * 0.45).clamp(3.0, 18.0);
+        let height = (width.min(depth) * 0.45).clamp(3.0, 18.0)
+            * (1.0 + f32::from(level.saturating_sub(1)) * 0.45);
         let mut corners = building.obb.corners;
         if (corners[1] - corners[0])
             .z0()
@@ -479,12 +531,12 @@ impl MapBuilders {
                 }
             });
         };
-        push_face(roof, LinearColor::new(0.55, 0.48, 0.40, 1.0));
+        push_face(roof, tint);
         for i in 0..4 {
             let next = (i + 1) % 4;
             push_face(
                 [base[i], base[next], roof[next], roof[i]],
-                LinearColor::new(0.43, 0.36, 0.29, 1.0),
+                LinearColor::new(tint.r * 0.78, tint.g * 0.75, tint.b * 0.73, tint.a),
             );
         }
     }
@@ -579,7 +631,15 @@ impl MapBuilders {
     }
 
     fn houses_mesh(&mut self, building: &Building) {
+        let tint =
+            (building.kind == BuildingKind::House).then(|| zone_color(ZoneKind::Residential));
         for (face, col) in &building.mesh.faces {
+            let mut color: LinearColor = (*col).into();
+            if let Some(tint) = tint {
+                color.r = color.r * 0.65 + tint.r * 0.35;
+                color.g = color.g * 0.65 + tint.g * 0.35;
+                color.b = color.b * 0.65 + tint.b * 0.35;
+            }
             self.houses_mesh.extend_with(None, |vertices, add_index| {
                 let o = face[1];
                 let u = unwrap_ret!((face[0] - o).try_normalize());
@@ -603,7 +663,7 @@ impl MapBuilders {
                         position: p.into(),
                         normal: nor,
                         uv: [0.0; 2],
-                        color: col.into(),
+                        color: color.into(),
                         tangent: [0.0; 4],
                     })
                 }

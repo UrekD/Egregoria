@@ -73,7 +73,8 @@ fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {
     match tool {
         Tool::Hand => return false,
         Tool::Bulldozer => return false,
-        Tool::LotBrush | Tool::Zoning => return false,
+        Tool::LotBrush => return false,
+        Tool::Zoning => crate::gui::zoning::properties(uiw),
         Tool::RoadbuildStraight | Tool::RoadbuildCurved => {
             roadbuild::roadbuild_properties(uiw);
         }

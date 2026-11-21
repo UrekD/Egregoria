@@ -1,0 +1,10 @@
+[
+  {"Camera": {"x": 940.0, "y": 915.0, "z": 0.0, "yaw": -0.6, "pitch": 1.05, "dist": 650.0}},
+  {"Builder": "grid_city"},
+  {"SelectTool": "Zoning"},
+  {"RunTicks": 3000},
+  {"WaitFrames": 8},
+  {"Screenshot": "zoning"},
+  {"DumpState": "zoning"},
+  "Exit"
+]

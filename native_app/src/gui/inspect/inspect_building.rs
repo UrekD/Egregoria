@@ -1,11 +1,16 @@
 use goryak::{
     dragvalue, fixed_spacer, minrow, on_secondary_container, primary, textc, ProgressBar, Window,
 };
-use prototypes::{ItemID, Recipe};
+use prototypes::{
+    try_prototype, CompanyKind, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID,
+};
 use simulation::economy::Market;
-use simulation::map::{Building, BuildingID, BuildingKind, Zone, MAX_ZONE_AREA};
+use simulation::map::{
+    Building, BuildingID, BuildingKind, Density, ProjectFilter, Zone, MAX_ZONE_AREA,
+};
 use simulation::map_dynamic::{BuildingInfos, ElectricityFlow};
 use simulation::souls::freight_station::FreightTrainState;
+use simulation::souls::residence::Residences;
 use simulation::world_command::WorldCommand;
 use simulation::{Simulation, SoulID};
 use std::borrow::Cow;
@@ -14,6 +19,7 @@ use yakui::Vec2;
 
 use crate::gui::inspect::entity_link;
 use crate::gui::item_icon_yakui;
+use crate::gui::zoning::zone_name;
 use crate::uiworld::UiWorld;
 
 fn label(x: impl Into<Cow<'static, str>>) {
@@ -29,7 +35,7 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
 
     let title: &str = match building.kind {
         BuildingKind::House => "House",
-        BuildingKind::GoodsCompany(id) => &id.prototype().name,
+        BuildingKind::GoodsCompany(id) => &id.prototype().label,
         BuildingKind::RailFreightStation(id) => &id.prototype().name,
         BuildingKind::TrainStation => "Train Station",
         BuildingKind::ExternalTrading => "External Trading",
@@ -50,7 +56,21 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
 
         match building.kind {
             BuildingKind::House => render_house(uiworld, sim, building),
-            BuildingKind::GoodsCompany(_) => {
+            BuildingKind::GoodsCompany(id) => {
+                if let Some(proto) =
+                    try_prototype(GrowableCompanyID::from(id)).filter(|proto| proto.growable)
+                {
+                    label(format!(
+                        "{} · {} density · Level {}",
+                        zone_name(proto.zone_kind),
+                        density_name(proto.density),
+                        proto.level
+                    ));
+                    label(format!("Job capacity  {}", proto.n_workers));
+                    if proto.power_consumption.is_some() {
+                        need("Power", has_power(sim, building.id));
+                    }
+                }
                 render_goodscompany(uiworld, sim, building);
             }
             BuildingKind::RailFreightStation(_) => {
@@ -94,26 +114,101 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
 }
 
 fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
-    let binfos = sim.read::<BuildingInfos>();
-    let Some(info) = binfos.get(b.id) else {
-        return;
-    };
-    let Some(SoulID::Human(owner)) = info.owner else {
-        return;
-    };
-
-    minrow(5.0, || {
-        label("Owner");
-        entity_link(uiworld, sim, owner);
-    });
-
-    label("Currently in the house:");
-    for &soul in info.inside.iter() {
-        let SoulID::Human(soul) = soul else {
-            continue;
-        };
-        entity_link(uiworld, sim, soul);
+    let residences = sim.read::<Residences>();
+    let residence = residences.by_building.get(&b.id);
+    let prototype = residence.map_or_else(
+        || ResidencePrototypeID::new("residence-low-l1"),
+        |residence| residence.prototype,
+    );
+    let capacity = residence
+        .map(|home| home.capacity)
+        .or_else(|| try_prototype(prototype).map(|p| p.capacity));
+    let density = residence.map_or(Density::Low, |home| home.density);
+    let level = residence.map_or(1, |home| home.level);
+    let residents: Vec<_> = sim
+        .world()
+        .humans
+        .iter()
+        .filter(|(_, human)| human.home.house == b.id)
+        .collect();
+    let employed = residents
+        .iter()
+        .filter(|(_, human)| human.work.is_some())
+        .count();
+    label(format!(
+        "Residential · {} density · Level {level}",
+        density_name(density)
+    ));
+    if let Some(capacity) = capacity {
+        label(format!("Residents  {} / {capacity}", residents.len()));
     }
+    if !residents.is_empty() {
+        label(format!("Employment  {employed} / {}", residents.len()));
+    }
+
+    let map = sim.map();
+    let retail = map.spatial_map().query_around(b.obb.center(), 1500.0, ProjectFilter::BUILDING).any(|project| {
+        let Some(store) = project.as_building().and_then(|id| map.get(id)) else { return false };
+        matches!(store.kind, BuildingKind::GoodsCompany(id) if id.prototype().kind == CompanyKind::Store)
+            && store.obb.center().distance2(b.obb.center()) <= 1500.0 * 1500.0
+    });
+    need("Store within 1.5 km", retail);
+    if try_prototype(prototype).is_some_and(|p| p.power_consumption.is_some()) {
+        need("Power", has_power(sim, b.id));
+    }
+
+    let binfos = sim.read::<BuildingInfos>();
+    let info = binfos.get(b.id);
+    if !residents.is_empty() {
+        label("Households");
+    }
+    for &(id, _) in &residents {
+        minrow(5.0, || {
+            entity_link(uiworld, sim, id);
+            if info.is_some_and(|info| info.owner == Some(SoulID::Human(id))) {
+                label("Owner");
+            }
+            if info.is_some_and(|info| info.inside.contains(&SoulID::Human(id))) {
+                label("At home");
+            }
+        });
+    }
+    if let Some(info) = info {
+        for &soul in &info.inside {
+            if let SoulID::Human(id) = soul {
+                if residents.iter().all(|&(resident, _)| resident != id) {
+                    minrow(5.0, || {
+                        entity_link(uiworld, sim, id);
+                        label("Visiting");
+                    });
+                }
+            }
+        }
+    }
+}
+
+fn density_name(density: Density) -> &'static str {
+    match density {
+        Density::Low => "Low",
+        Density::High => "High",
+    }
+}
+
+fn need(name: &str, met: bool) {
+    let status = if met { "Met" } else { "Unmet" };
+    let color = if met {
+        on_secondary_container()
+    } else {
+        goryak::error()
+    };
+    textc(color, format!("{name}  {status}"));
+}
+
+fn has_power(sim: &Simulation, id: BuildingID) -> bool {
+    sim.map()
+        .electricity
+        .net_id(id)
+        .is_some_and(|net| !sim.read::<ElectricityFlow>().blackout(net))
 }
 
 fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {

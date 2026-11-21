@@ -51,11 +51,48 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
 }
 
 #[test]
-#[ignore = "P1e UI behaviour"]
 fn p1e_scripted_screenshots_and_dump_state() {
-    // Zoning preview, signed demand and top-driver tooltip, budget tax sliders, stats,
-    // rejection toast, and a grown city after RunTicks(300000).
-    todo!();
+    use common::saveload::{Encoder, JSON};
+    use std::path::Path;
+
+    let shots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/shots");
+    for name in [
+        "zoning",
+        "demand",
+        "budget",
+        "stats",
+        "rejection",
+        "grown-city",
+    ] {
+        let steps = std::fs::read(shots.join(format!("p1_{name}.json")))
+            .unwrap_or_else(|err| panic!("missing {name} screenshot script: {err}"));
+        let steps: Vec<ShotStep> = JSON::decode(&steps).unwrap();
+        assert!(steps
+            .iter()
+            .any(|s| matches!(s, ShotStep::Screenshot(label) if label == name)));
+        assert!(steps
+            .iter()
+            .any(|s| matches!(s, ShotStep::DumpState(label) if label == name)));
+        if name == "grown-city" {
+            assert!(steps
+                .iter()
+                .any(|s| matches!(s, ShotStep::RunTicks(300_000))));
+        }
+    }
+}
+
+#[cfg(test)]
+#[derive(serde::Deserialize)]
+enum ShotStep {
+    Camera(serde::de::IgnoredAny),
+    Builder(serde::de::IgnoredAny),
+    SelectTool(serde::de::IgnoredAny),
+    WaitFrames(serde::de::IgnoredAny),
+    OpenWindow(serde::de::IgnoredAny),
+    Screenshot(String),
+    DumpState(String),
+    RunTicks(u64),
+    Exit,
 }
 
 fn auto_save(uiworld: &UiWorld) {
