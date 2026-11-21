@@ -16,12 +16,14 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
 
+mod citystats;
 mod ecostats;
 mod government;
 mod market;
 
 use crate::map::Map;
 use crate::world::HumanID;
+pub use citystats::*;
 pub use ecostats::*;
 pub use government::*;
 pub use market::*;

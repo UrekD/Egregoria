@@ -5,7 +5,7 @@ use serde::Serialize;
 use common::saveload::{Bincode, Encoder, JSONPretty, JSON};
 use prototypes::{GameTime, Tick};
 
-use crate::economy::{market_update, EcoStats, Government, Market};
+use crate::economy::{citystats_update, market_update, CityStats, EcoStats, Government, Market};
 use crate::map::Map;
 use crate::map_dynamic::{
     dispatch_system, electricity_flow_system, itinerary_update, routing_changed_system,
@@ -68,6 +68,7 @@ pub fn init() {
     register_system("update_map", |_, res| res.write::<Map>().update());
 
     register_system_sim("add_souls_to_empty_buildings", add_souls_to_empty_buildings);
+    register_system_sim("citystats_update", citystats_update);
 
     register_resource_noserialize::<ParCommandBuffer<VehicleEnt>>();
     register_resource_noserialize::<ParCommandBuffer<TrainEnt>>();
@@ -80,6 +81,7 @@ pub fn init() {
     register_resource_default::<ElectricityFlow, Bincode>("electricity_flow");
     register_resource_default::<Market, Bincode>("market");
     register_resource_default::<EcoStats, Bincode>("ecostats");
+    register_resource_default::<CityStats, Bincode>("citystats");
     register_resource_default::<MultiplayerState, Bincode>("multiplayer_state");
     register_resource_default::<RandomVehicles, Bincode>("random_vehicles");
     register_resource_default::<Map, Bincode>("map");
