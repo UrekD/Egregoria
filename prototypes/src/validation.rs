@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use common::error::MultiError;
 
-use crate::{CompanyKind, GrowableCompanyID, Money, Prototypes};
+use crate::{CompanyKind, GrowableCompanyID, Money, Prototypes, ServiceKind};
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -47,6 +47,18 @@ pub(crate) fn validate(proto: &Prototypes) -> Result<(), MultiError<ValidationEr
             (service.kind != CompanyKind::Store, "kind", "must be a store"),
             (service.n_trucks != 0, "n_trucks", "must be zero"),
             (service.recipe.is_some(), "recipe", "must be omitted"),
+            (
+                service.service_kind == ServiceKind::WaterPump
+                    && service.water_production.unwrap_or_default() <= 0.0,
+                "water_production",
+                "must be positive for water pumps",
+            ),
+            (
+                service.service_kind == ServiceKind::SewageOutlet
+                    && service.sewage_capacity.unwrap_or_default() <= 0.0,
+                "sewage_capacity",
+                "must be positive for sewage outlets",
+            ),
         ] {
             if invalid {
                 errors.push(ValidationError::InvalidField(

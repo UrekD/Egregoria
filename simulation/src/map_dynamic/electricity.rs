@@ -11,6 +11,8 @@ use std::collections::BTreeMap;
 #[derive(Default, Serialize, Deserialize)]
 pub struct ElectricityFlow {
     flowmap: BTreeMap<ElectricityNetworkID, NetworkFlow>,
+    #[serde(skip)]
+    topology_generation: Option<u64>,
 }
 
 impl ElectricityFlow {
@@ -49,6 +51,7 @@ pub fn electricity_flow_system(world: &mut World, resources: &mut Resources) {
     let residences = resources.read::<Residences>();
     let mut flow = resources.write::<ElectricityFlow>();
 
+    flow.topology_generation = Some(map.electricity.generation);
     flow.flowmap.clear();
 
     for network in map.electricity.networks.values() {
@@ -97,6 +100,15 @@ pub fn electricity_flow_system(world: &mut World, resources: &mut Resources) {
             },
         );
     }
+}
+
+/// Refresh the snapshot for the utility pass if the network changed during this tick.
+pub(crate) fn refresh_electricity_flow_system(world: &mut World, resources: &mut Resources) {
+    let generation = resources.read::<Map>().electricity.generation;
+    if resources.read::<ElectricityFlow>().topology_generation == Some(generation) {
+        return;
+    }
+    electricity_flow_system(world, resources);
 }
 
 #[cfg(test)]

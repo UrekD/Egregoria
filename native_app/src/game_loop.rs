@@ -263,6 +263,7 @@ impl engine::framework::State for State {
 
         self.instanced_renderer
             .render(&self.sim.read().unwrap(), ctx);
+        gui::overlays::draw(&sim, &self.uiw);
 
         drop(sim);
         drop(camera);

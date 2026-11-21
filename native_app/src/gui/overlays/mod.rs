@@ -1,6 +1,7 @@
 use goryak::combo_box;
 use prototypes::ServiceKind;
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
+use simulation::Simulation;
 
 use crate::uiworld::UiWorld;
 
@@ -11,16 +12,30 @@ pub(crate) enum OverlayMode {
     Power,
     Water,
     Sewage,
-    Coverage(ServiceKind),
+    Coverage(#[serde(deserialize_with = "deserialize_coverage")] ServiceKind),
     Pollution,
     LandValue,
     Happiness,
 }
 
+fn deserialize_coverage<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<ServiceKind, D::Error> {
+    let kind = ServiceKind::deserialize(deserializer)?;
+    match kind {
+        ServiceKind::WaterPump | ServiceKind::SewageOutlet => Err(serde::de::Error::custom(
+            "utility services have no coverage overlay",
+        )),
+        _ => Ok(kind),
+    }
+}
+
+pub(crate) fn draw(_sim: &Simulation, _uiworld: &UiWorld) {}
+
 pub(crate) fn selector(uiworld: &UiWorld) {
     use OverlayMode::*;
 
-    const MODES: [(OverlayMode, &str); 15] = [
+    const MODES: [(OverlayMode, &str); 13] = [
         (Off, "Overlay off"),
         (Power, "Power"),
         (Water, "Water"),
@@ -31,11 +46,6 @@ pub(crate) fn selector(uiworld: &UiWorld) {
         (Coverage(ServiceKind::School), "School coverage"),
         (Coverage(ServiceKind::Garbage), "Garbage coverage"),
         (Coverage(ServiceKind::Park), "Park coverage"),
-        (Coverage(ServiceKind::WaterPump), "Water pump coverage"),
-        (
-            Coverage(ServiceKind::SewageOutlet),
-            "Sewage outlet coverage",
-        ),
         (Pollution, "Pollution"),
         (LandValue, "Land value"),
         (Happiness, "Happiness"),

@@ -55,10 +55,10 @@ impl Prototype for BuildingPrototype {
             price: get_lua(table, "price")?,
             power_consumption: get_lua(table, "power_consumption")?,
             power_production: get_lua(table, "power_production")?,
-            water_consumption: get_lua(table, "water_consumption")?,
-            water_production: get_lua(table, "water_production")?,
-            sewage_capacity: get_lua(table, "sewage_capacity")?,
-            pollution: get_lua(table, "pollution")?,
+            water_consumption: nonnegative_rate(table, "water_consumption")?,
+            water_production: nonnegative_rate(table, "water_production")?,
+            sewage_capacity: nonnegative_rate(table, "sewage_capacity")?,
+            pollution: nonnegative_rate(table, "pollution")?,
         })
     }
 
@@ -69,6 +69,19 @@ impl Prototype for BuildingPrototype {
     fn parent(&self) -> &Self::Parent {
         &NoParent
     }
+}
+
+fn nonnegative_rate(table: &Table, field: &'static str) -> mlua::Result<Option<f32>> {
+    let Some(value) = get_lua::<Option<f64>>(table, field)? else {
+        return Ok(None);
+    };
+    let rate = value as f32;
+    if value < 0.0 || !rate.is_finite() {
+        return Err(mlua::Error::external(format!(
+            "field {field}: must be finite and nonnegative"
+        )));
+    }
+    Ok(Some(rate))
 }
 
 impl Deref for BuildingPrototype {

@@ -130,6 +130,32 @@ impl Building {
             }
     }
 
+    pub(crate) fn door_position(obb: &OBB, gen: BuildingGen, env: &Environment) -> Vec3 {
+        let at = Self::origin(obb, env);
+        let (_, _, door_pos) = Self::geometry(obb, gen, at);
+        door_pos
+    }
+
+    fn origin(obb: &OBB, env: &Environment) -> Vec3 {
+        let center = obb.center();
+        center.z(env.height(center).unwrap_or(0.0))
+    }
+
+    fn geometry(obb: &OBB, gen: BuildingGen, at: Vec3) -> (ColoredMesh, Vec2, Vec3) {
+        let axis = (obb.corners[1] - obb.corners[0]).normalize();
+        let size = obb.corners[0].distance(obb.corners[1]);
+        let seed = || common::rand::rand2(at.x, at.y).to_bits() as u64;
+        let (mesh, door) = match gen {
+            BuildingGen::House => gen_exterior_house(size, seed()),
+            BuildingGen::Farm => gen_exterior_farm(size, seed()),
+            BuildingGen::CenteredDoor { vertical_factor } => {
+                (Default::default(), Vec2::y(-vertical_factor * 0.5 * size))
+            }
+            BuildingGen::NoWalkway { door_pos } => (Default::default(), door_pos),
+        };
+        (mesh, axis, door.rotated_by(axis).z0() + at + Vec3::z(0.1))
+    }
+
     pub fn make(
         buildings: &mut Buildings,
         spatial_map: &mut SpatialMap,
@@ -148,28 +174,14 @@ impl Building {
             return None;
         }
 
-        let at = obb.center().z(env.height(obb.center()).unwrap_or(0.0));
-        let axis = (obb.corners[1] - obb.corners[0]).normalize();
-        let size = obb.corners[0].distance(obb.corners[1]);
-
-        let r = common::rand::rand2(obb.center().x, obb.center().y).to_bits();
-
-        let (mut mesh, door_pos) = match gen {
-            BuildingGen::House => gen_exterior_house(size, r as u64),
-            BuildingGen::Farm => gen_exterior_farm(size, r as u64),
-            BuildingGen::CenteredDoor {
-                vertical_factor, ..
-            } => (Default::default(), Vec2::y(-vertical_factor * 0.5 * size)),
-            BuildingGen::NoWalkway { door_pos } => (Default::default(), door_pos),
-        };
+        let at = Self::origin(&obb, env);
+        let (mut mesh, axis, door_pos) = Self::geometry(&obb, gen, at);
 
         for (poly, _) in &mut mesh.faces {
             for v in poly {
                 *v = v.rotate_z(axis) + at;
             }
         }
-        let door_pos = door_pos.rotated_by(axis).z0() + at + Vec3::z(0.1);
-
         if let BuildingGen::House | BuildingGen::Farm | BuildingGen::CenteredDoor { .. } = gen {
             let bot = obb.segments()[0];
             let rpos = bot.project(door_pos.xy()).z(door_pos.z);

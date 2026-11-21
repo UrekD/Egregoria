@@ -1,16 +1,20 @@
 use super::TestCtx;
-use crate::economy::{Budget, BudgetCategory, Government};
+use crate::economy::{Budget, BudgetCategory, Government, Market};
 use crate::map::{BuildingID, BuildingKind, RoadID, Zone};
 use crate::map_dynamic::{
-    electricity_flow_system, utility_flow_update, CoverageGrid, ElectricityFlow, UtilityFlow,
+    electricity_flow_system, utility_flow_update, BuildingInfos, CoverageGrid, ElectricityFlow,
+    UtilityFlow,
 };
+use crate::souls::desire::{Work, WorkKind};
 use crate::souls::{goods_company::company_soul, human::spawn_human, residence};
 use crate::world::CompanyID;
 use crate::world_command::{CommandOutcomes, Rejection};
 use crate::{Simulation, SoulID, WorldCommand};
 use common::saveload::{Bincode, Encoder};
 use geom::{vec2, vec3, Polygon, Vec2, OBB};
-use prototypes::{Density, GameTime, GoodsCompanyID, Money, ServiceKind, Tick};
+use prototypes::{
+    Density, GameTime, GoodsCompanyID, ItemID, Money, ServiceKind, Tick, DELTA, TICKS_PER_HOUR,
+};
 
 const SPINE_RESOURCES: [&str; 5] = [
     "coverage_grid",
@@ -25,7 +29,7 @@ fn p2_spine_service_placement_requires_a_live_road() {
     let mut test = TestCtx::new_fast();
     let proto = GoodsCompanyID::new("school").prototype();
     let kind = BuildingKind::GoodsCompany(proto.id);
-    let position = OBB::new(vec2(200.0, 125.0), vec2(1.0, 0.0), 20.0, 20.0);
+    let position = OBB::new(vec2(200.0, 125.0), Vec2::Y, 20.0, 20.0);
     test.g.write::<Government>().money = Money::new_bucks(100_000);
     let before = test.g.read::<Government>().money;
     let spent = test.g.read::<Budget>().total(BudgetCategory::Construction);
@@ -35,8 +39,8 @@ fn p2_spine_service_placement_requires_a_live_road() {
     test.apply(&[WorldCommand::MapRemoveRoad(road)]);
     assert!(test.g.map().get(road).is_none());
 
-    let place = |connected_road| WorldCommand::MapBuildSpecialBuilding {
-        pos: position,
+    let place = |pos, connected_road| WorldCommand::MapBuildSpecialBuilding {
+        pos,
         kind,
         gen: proto.bgen,
         zone: None,
@@ -44,7 +48,7 @@ fn p2_spine_service_placement_requires_a_live_road() {
     };
     for invalid in [None, Some(road)] {
         test.g.write::<CommandOutcomes>().last.clear();
-        test.apply(&[place(invalid)]);
+        test.apply(&[place(position, invalid)]);
         assert_eq!(
             test.g.read::<CommandOutcomes>().last.as_slice(),
             &[("MapBuildSpecialBuilding", Rejection::MissingReference)]
@@ -60,7 +64,21 @@ fn p2_spine_service_placement_requires_a_live_road() {
     test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
     let live_road = test.g.map().roads().keys().next().unwrap();
     test.g.write::<CommandOutcomes>().last.clear();
-    test.apply(&[place(Some(live_road))]);
+    let distant = OBB::new(vec2(200.0, 400.0), Vec2::Y, 20.0, 20.0);
+    test.apply(&[place(distant, Some(live_road))]);
+    assert_eq!(
+        test.g.read::<CommandOutcomes>().last.as_slice(),
+        &[("MapBuildSpecialBuilding", Rejection::InvalidBuilding)]
+    );
+    assert!(test.g.map().buildings().values().all(|b| b.kind != kind));
+    assert_eq!(test.g.read::<Government>().money, before);
+    assert_eq!(
+        test.g.read::<Budget>().total(BudgetCategory::Construction),
+        spent
+    );
+
+    test.g.write::<CommandOutcomes>().last.clear();
+    test.apply(&[place(position, Some(live_road))]);
     assert!(test.g.read::<CommandOutcomes>().last.is_empty());
     assert!(test.g.read::<Government>().money < before);
     assert!(test.g.read::<Budget>().total(BudgetCategory::Construction) < spent);
@@ -85,25 +103,111 @@ fn p2_spine_resources_round_trip() {
 }
 
 #[test]
-fn p2_spine_previous_save_defaults_new_resources() {
+fn p2_spine_save_missing_a_required_resource_is_rejected() {
     let test = TestCtx::new_fast();
     let current = Bincode::encode(&test.g).unwrap();
-    let mut payload: crate::SimulationDeser = Bincode::decode(&current).unwrap();
     for name in SPINE_RESOURCES {
+        let mut payload: crate::SimulationDeser = Bincode::decode(&current).unwrap();
         assert!(
             payload.res.remove(name).is_some(),
             "missing {name} resource"
         );
+        let incomplete = Bincode::encode(&crate::SimulationSer {
+            header: payload._header,
+            world: &payload.world,
+            res: payload.res,
+        })
+        .unwrap();
+        let error = Bincode::decode::<Simulation>(&incomplete)
+            .err()
+            .unwrap_or_else(|| panic!("loaded a save missing {name}"));
+        assert!(error
+            .to_string()
+            .contains(&format!("Missing resource {name}")));
     }
-    let previous = Bincode::encode(&crate::SimulationSer {
-        header: payload._header,
-        world: &payload.world,
-        res: payload.res,
-    })
-    .unwrap();
+}
 
-    let restored: Simulation = Bincode::decode(&previous).expect("load pre-spine save");
-    assert_eq!(test.g.hashes(), restored.hashes());
+#[test]
+fn p2_spine_school_alone_does_not_advance_residence() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
+    let road = test.g.map().roads().keys().next().unwrap();
+    let house = test.build_house_near(vec2(150.0, 125.0));
+    let school = GoodsCompanyID::new("school").prototype();
+    let school_building = test
+        .g
+        .map_mut()
+        .build_special_building(
+            &OBB::new(vec2(200.0, 80.0), -Vec2::Y, 20.0, 20.0),
+            BuildingKind::GoodsCompany(school.id),
+            school.bgen,
+            None,
+            Some(road),
+        )
+        .unwrap();
+
+    for _ in 0..2 {
+        let resident = spawn_human(&mut test.g, house).unwrap();
+        test.g.world.humans[resident].work =
+            Some(Work::new(school_building, WorkKind::Worker, 0.0));
+    }
+    for hour in 1..=6 {
+        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
+        residence::residence_update(&mut test.g);
+    }
+    assert_eq!(
+        test.g.read::<residence::Residences>().by_building[&house].level,
+        1
+    );
+}
+
+#[test]
+fn p2_spine_power_cut_stops_batch_about_to_finish() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(400.0, 100.0, 0.0)]);
+    let road = test.g.map().roads().keys().next().unwrap();
+    let house = test.build_house_near(vec2(150.0, 125.0));
+    let (plant, generator) =
+        p2b_place_company(&mut test, "coal-power-plant", vec2(240.0, 70.0), road);
+    p2b_staff(&mut test, generator, house);
+
+    let proto = GoodsCompanyID::new("industrial-l1").prototype();
+    let factory = test
+        .g
+        .map_mut()
+        .build_special_building(
+            &OBB::new(vec2(320.0, 70.0), Vec2::X, 20.0, 20.0),
+            BuildingKind::GoodsCompany(proto.id),
+            proto.bgen,
+            None,
+            Some(road),
+        )
+        .unwrap();
+    test.g.write::<BuildingInfos>().insert(factory);
+    let soul = company_soul(&mut test.g, factory, proto.id).unwrap();
+    let SoulID::GoodsCompany(company) = soul else {
+        unreachable!()
+    };
+    p2b_staff(&mut test, company, house);
+    test.tick_fast();
+
+    let network = test.g.map().electricity.net_id(factory).unwrap();
+    assert!(!test.g.read::<ElectricityFlow>().blackout(network));
+    let recipe = proto.recipe.as_ref().unwrap();
+    let productivity = test.g.world.companies[company].raw_productivity(proto, None);
+    let progress = 1.0 - 0.5 * productivity * DELTA / recipe.duration.seconds() as f32;
+    assert!(progress < 1.0);
+    test.g.world.companies[company].comp.progress = progress;
+    let goods = ItemID::new("goods");
+    assert_eq!(test.g.read::<Market>().capital(soul, goods), 0);
+
+    test.g
+        .tick(&mut test.sched, &[WorldCommand::MapRemoveBuilding(plant)]);
+    assert!(test.g.map().get(plant).is_none());
+    let network = test.g.map().electricity.net_id(factory).unwrap();
+    assert!(test.g.read::<ElectricityFlow>().blackout(network));
+    assert_eq!(test.g.read::<Market>().capital(soul, goods), 0);
+    assert_eq!(test.g.world.companies[company].comp.progress, progress);
 }
 
 fn p2b_road_at(test: &TestCtx, position: Vec2) -> RoadID {
@@ -124,12 +228,21 @@ fn p2b_place_company(
 ) -> (BuildingID, CompanyID) {
     let proto = GoodsCompanyID::new(name).prototype();
     let kind = BuildingKind::GoodsCompany(proto.id);
+    let (position, direction) = if proto.id.is_service() {
+        let map = test.g.map();
+        let road = map.get(road).unwrap();
+        let nearest = road.points().project_2d(position).xy();
+        let outward = (position - nearest).normalize();
+        (nearest + outward * (road.width * 0.5 + 10.25), outward)
+    } else {
+        (position, Vec2::X)
+    };
     let zone = proto.zone.as_ref().map(|_| {
         let bounds = OBB::new(position, Vec2::X, 80.0, 80.0);
         Zone::new(Polygon::from(bounds.corners.as_slice()), Vec2::X)
     });
     test.apply(&[WorldCommand::MapBuildSpecialBuilding {
-        pos: OBB::new(position, Vec2::X, 20.0, 20.0),
+        pos: OBB::new(position, direction, 20.0, 20.0),
         kind,
         gen: proto.bgen,
         zone,
@@ -194,8 +307,15 @@ fn p2b_road_removal_splits_pipe_supply() {
     let (_, pump) = p2b_place_company(&mut test, "water-pump", vec2(140.0, 70.0), supply_road);
     let (_, outlet) = p2b_place_company(&mut test, "sewage-outlet", vec2(185.0, 70.0), supply_road);
     p2b_place_company(&mut test, "solar-panel", vec2(230.0, 70.0), supply_road);
+    let (_, plant) = p2b_place_company(
+        &mut test,
+        "coal-power-plant",
+        vec2(205.0, 125.0),
+        supply_road,
+    );
     p2b_staff(&mut test, pump, supplied);
     p2b_staff(&mut test, outlet, supplied);
+    p2b_staff(&mut test, plant, separated);
 
     *test.g.write::<GameTime>() = GameTime::new(Tick(2_998));
     test.tick_fast();

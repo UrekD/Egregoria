@@ -38,6 +38,7 @@ macro_rules! gen_prototypes {
                 pub(crate) $name: common::TransparentMap<$id, $t>,
             )+
             pub(crate) orderings: Orderings,
+            declared_types: std::collections::BTreeMap<String, &'static str>,
         }
 
         $(
@@ -103,6 +104,17 @@ macro_rules! gen_prototypes {
                             let proto: $t = $crate::Prototype::from_lua(&table).map_err(|e| {
                                   $crate::PrototypeLoadError::PrototypeLuaError(_type_str.to_string(), table.get::<_, String>("name").unwrap(), e)
                             })?;
+
+                            // Track Lua declarations, independent of inherited entries in storage.
+                            let kind = <$t as $crate::Prototype>::NAME;
+                            let previous = *self.declared_types.entry(proto.name.clone()).or_insert(kind);
+                            let service = <$crate::ServicePrototype as $crate::Prototype>::NAME;
+                            if previous != kind && (previous == service || kind == service) {
+                                return Err($crate::PrototypeLoadError::ConflictingServiceName(
+                                    proto.name.clone(),
+                                    if kind == service { previous } else { kind },
+                                ));
+                            }
 
                             <$t as $crate::ConcretePrototype>::insert_parents(&proto, self);
 

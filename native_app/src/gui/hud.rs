@@ -21,6 +21,7 @@ pub mod chat;
 mod demand_bars;
 pub mod keybinds;
 mod menu;
+mod problem_icons;
 mod time_controls;
 mod toasts;
 pub mod toolbox;
@@ -39,6 +40,7 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
 
     yakui::column(|| {
         power_errors(uiworld, sim);
+        problem_icons::render(uiworld, sim);
         new_toolbox(uiworld, sim);
         menu_bar(uiworld, sim);
         demand_bars::render(uiworld, sim);

@@ -105,21 +105,9 @@ fn test_base() {
 #[test]
 fn service_validation() {
     use crate::{validation, Prototypes};
-    use mlua::{Lua, Table};
 
-    let lua = Lua::new();
-    let table: Table = lua
-        .load(
-            r#"return {
-                type = "service", name = "test-service", label = "Test Service",
-                size = 20, bgen = "house", asset = "bakery.glb", price = 10,
-                kind = "store", n_trucks = 0, n_workers = 1,
-                service_kind = "health", radius_m = 3000, capacity = 10000,
-                upkeep_per_day = 0, pollution = 12.5
-            }"#,
-        )
-        .eval()
-        .unwrap();
+    let lua = mlua::Lua::new();
+    let table = service_table(&lua);
 
     for (field, invalid) in [
         ("radius_m", 0.0),
@@ -147,4 +135,107 @@ fn service_validation() {
     validation::validate(&registry).unwrap();
     let service = &registry.service[&ServiceID::new("test-service")];
     assert_eq!(service.pollution, Some(12.5));
+}
+
+fn service_table(lua: &mlua::Lua) -> mlua::Table<'_> {
+    lua.load(
+        r#"return {
+                type = "service", name = "test-service", label = "Test Service",
+                size = 20, bgen = "house", asset = "bakery.glb", price = 10,
+                kind = "store", n_trucks = 0, n_workers = 1,
+                service_kind = "health", radius_m = 3000, capacity = 10000,
+                upkeep_per_day = 0, pollution = 12.5
+            }"#,
+    )
+    .eval()
+    .unwrap()
+}
+
+fn prototype_result<'lua>(
+    tables: impl IntoIterator<Item = mlua::Table<'lua>>,
+) -> Result<(), String> {
+    let mut registry = crate::Prototypes::default();
+    for table in tables {
+        registry
+            .parse_prototype(table)
+            .map_err(|err| err.to_string())?;
+    }
+    crate::validation::validate(&registry).map_err(|err| err.to_string())
+}
+
+#[test]
+fn p2_spine_building_rates_are_finite_and_nonnegative() {
+    let lua = mlua::Lua::new();
+    for kind in ["building", "goods-company", "service"] {
+        for field in [
+            "water_consumption",
+            "water_production",
+            "sewage_capacity",
+            "pollution",
+        ] {
+            let table = service_table(&lua);
+            table.set("type", kind).unwrap();
+            for invalid in [-1.0, f64::NAN, f64::INFINITY] {
+                table.set(field, invalid).unwrap();
+                let error = prototype_result([table.clone()])
+                    .expect_err(&format!("{kind} accepted {field} = {invalid}"));
+                assert!(error.contains(field), "{error}");
+            }
+            table.set(field, 0.0).unwrap();
+            prototype_result([table]).unwrap();
+        }
+    }
+}
+
+#[test]
+fn p2_spine_utility_services_require_positive_rates() {
+    let lua = mlua::Lua::new();
+    for (kind, field) in [
+        ("water_pump", "water_production"),
+        ("sewage_outlet", "sewage_capacity"),
+    ] {
+        let table = service_table(&lua);
+        table.set("service_kind", kind).unwrap();
+        for invalid in [None, Some(0.0)] {
+            table.set(field, invalid).unwrap();
+            let error = prototype_result([table.clone()])
+                .expect_err(&format!("{kind} accepted {field} = {invalid:?}"));
+            assert!(error.contains(field), "{error}");
+        }
+        table.set(field, 1.0).unwrap();
+        prototype_result([table]).unwrap();
+    }
+}
+
+#[test]
+fn p2_spine_service_capacity_is_integral() {
+    let lua = mlua::Lua::new();
+    let table = service_table(&lua);
+    for invalid in [1.5, 10_000.5] {
+        table.set("capacity", invalid).unwrap();
+        let error =
+            prototype_result([table.clone()]).expect_err(&format!("accepted capacity {invalid}"));
+        assert!(error.contains("capacity"), "{error}");
+    }
+}
+
+#[test]
+fn p2_spine_service_name_cannot_collide_with_another_prototype_type() {
+    let lua = mlua::Lua::new();
+    for kind in ["goods-company", "solar-panel", "item"] {
+        let service = service_table(&lua);
+        let other = service_table(&lua);
+        other.set("type", kind).unwrap();
+        for tables in [
+            [service.clone(), other.clone()],
+            [other.clone(), service.clone()],
+        ] {
+            let error = prototype_result(tables)
+                .expect_err(&format!("accepted service name shared with {kind}"));
+            assert!(
+                error.contains("test-service") && error.contains(kind),
+                "{error}"
+            );
+        }
+    }
 }

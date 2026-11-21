@@ -581,12 +581,10 @@ impl SimulationDeser {
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let Some(data) = self.res.get(l.name) else {
-                    if l.optional_on_load {
-                        continue;
-                    }
-                    return Err(format!("Missing resource {}", l.name));
-                };
+                let data = self
+                    .res
+                    .get(l.name)
+                    .ok_or_else(|| format!("Missing resource {}", l.name))?;
                 (l.load)(&mut sim, data)
                     .map_err(|error| format!("Could not decode resource {}: {error}", l.name))?;
             }

@@ -73,6 +73,8 @@ pub enum PrototypeLoadError {
     LuaError(#[from] mlua::Error),
     #[error("lua error for {0} {1}: {2}")]
     PrototypeLuaError(String, String, mlua::Error),
+    #[error("service {0} shares its name with a {1} prototype")]
+    ConflictingServiceName(String, &'static str),
     #[error("multiple errors: {0}")]
     MultiError(MultiError<PrototypeLoadError>),
     #[error("validation errors: {0}")]

@@ -69,6 +69,7 @@ pub(crate) fn register_simulation() {
 }
 
 fn register_systems_and_resources() {
+    register_system("electricity_flow_system", electricity_flow_system);
     register_system("dispatch_system", dispatch_system);
     register_system("update_decision_system", update_decision_system);
     register_system("company_system", company_system);
@@ -88,7 +89,10 @@ fn register_systems_and_resources() {
         crate::souls::residence::residence_update,
     );
     register_system_sim("growth_update", crate::souls::growth::growth_update);
-    register_system("electricity_flow_system", electricity_flow_system);
+    register_system(
+        "refresh_electricity_flow_system",
+        crate::map_dynamic::refresh_electricity_flow_system,
+    );
     register_system_sim("utility_flow_update", utility_flow_update);
     register_system_sim("coverage_update", coverage_update);
     register_system_sim("env_update", env_update);
@@ -109,14 +113,14 @@ fn register_systems_and_resources() {
     register_resource_noserialize::<ParCommandBuffer<WagonEnt>>();
     register_resource_noserialize::<ParCommandBuffer<FreightStationEnt>>();
     register_resource_noserialize::<ParCommandBuffer<CompanyEnt>>();
-    register_resource_saveload::<SimulationOptions, Bincode>("simoptions", false);
+    register_resource_noinit::<SimulationOptions, Bincode>("simoptions");
 
     register_resource_default::<ElectricityFlow, Bincode>("electricity_flow");
-    register_resource_optional_on_load::<CoverageGrid, Bincode>("coverage_grid");
-    register_resource_optional_on_load::<UtilityFlow, Bincode>("utility_flow");
-    register_resource_optional_on_load::<EnvGrid, Bincode>("env_grid");
-    register_resource_optional_on_load::<Happiness, Bincode>("happiness");
-    register_resource_optional_on_load::<Fires, Bincode>("fires");
+    register_resource_default::<CoverageGrid, Bincode>("coverage_grid");
+    register_resource_default::<UtilityFlow, Bincode>("utility_flow");
+    register_resource_default::<EnvGrid, Bincode>("env_grid");
+    register_resource_default::<Happiness, Bincode>("happiness");
+    register_resource_default::<Fires, Bincode>("fires");
     register_resource_default::<Market, Bincode>("market");
     register_resource_default::<EcoStats, Bincode>("ecostats");
     register_resource_default::<CityStats, Bincode>("citystats");
@@ -161,7 +165,6 @@ fn register_transport_grid() {
         });
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "transport_grid",
-            optional_on_load: false,
             save: Box::new(|sim| {
                 let data = Bincode::encode(&*sim.read::<TransportGrid>()).unwrap();
                 let sorted: SavedTransportGrid = Bincode::decode(&data).unwrap();
@@ -181,7 +184,6 @@ pub struct InitFunc {
 
 pub(crate) struct SaveLoadFunc {
     pub name: &'static str,
-    pub optional_on_load: bool,
     pub save: Box<dyn Fn(&Simulation) -> Vec<u8> + 'static>,
     pub load: Box<dyn Fn(&mut Simulation, &[u8]) -> std::io::Result<()> + 'static>,
 }
@@ -240,17 +242,6 @@ fn register_resource_default<
     register_resource::<T, E>(name, T::default);
 }
 
-// Same-version saves from before this resource was registered keep its initialized default.
-fn register_resource_optional_on_load<
-    T: 'static + Send + Sync + Serialize + DeserializeOwned + Default,
-    E: Encoder,
->(
-    name: &'static str,
-) {
-    register_resource_noserialize::<T>();
-    register_resource_saveload::<T, E>(name, true);
-}
-
 fn register_resource<T: 'static + Send + Sync + Serialize + DeserializeOwned, E: Encoder>(
     name: &'static str,
     initializer: impl Fn() -> T + 'static,
@@ -259,18 +250,16 @@ fn register_resource<T: 'static + Send + Sync + Serialize + DeserializeOwned, E:
         INIT_FUNCS.push(InitFunc {
             f: Box::new(move |uiw| uiw.insert(initializer())),
         });
-        register_resource_saveload::<T, E>(name, false);
+        register_resource_noinit::<T, E>(name);
     }
 }
 
-fn register_resource_saveload<T: 'static + Send + Sync + Serialize + DeserializeOwned, E: Encoder>(
+fn register_resource_noinit<T: 'static + Send + Sync + Serialize + DeserializeOwned, E: Encoder>(
     name: &'static str,
-    optional_on_load: bool,
 ) {
     unsafe {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name,
-            optional_on_load,
             save: Box::new(move |uiworld| E::encode(&*uiworld.read::<T>()).unwrap()),
             load: Box::new(move |sim, data| {
                 sim.insert(E::decode::<T>(data)?);

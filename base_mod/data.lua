@@ -10,7 +10,7 @@ require("rollingstock")
 
 for _, prototype in ipairs(data) do
     local kind = prototype.type
-    if kind == "growable-company" or kind == "goods-company" or kind == "solar-panel" then
+    if kind == "goods-company" or kind == "solar-panel" then
         prototype.water_consumption = prototype.water_consumption or math.max(1, prototype.n_workers or 0)
     end
 end

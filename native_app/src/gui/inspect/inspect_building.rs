@@ -1,16 +1,14 @@
 use goryak::{
     dragvalue, fixed_spacer, minrow, on_secondary_container, primary, textc, ProgressBar, Window,
 };
-use prototypes::{
-    try_prototype, CompanyKind, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID,
-};
+use prototypes::{try_prototype, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID};
 use simulation::economy::Market;
 use simulation::map::{
     Building, BuildingID, BuildingKind, Density, ProjectFilter, Zone, MAX_ZONE_AREA,
 };
 use simulation::map_dynamic::{BuildingInfos, ElectricityFlow};
 use simulation::souls::freight_station::FreightTrainState;
-use simulation::souls::residence::Residences;
+use simulation::souls::residence::{is_retail_store, Residences};
 use simulation::transportation::Location;
 use simulation::world_command::WorldCommand;
 use simulation::{Simulation, SoulID};
@@ -154,11 +152,14 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     }
 
     let map = sim.map();
-    let retail = map.spatial_map().query_around(b.obb.center(), 1500.0, ProjectFilter::BUILDING).any(|project| {
-        let Some(store) = project.as_building().and_then(|id| map.get(id)) else { return false };
-        matches!(store.kind, BuildingKind::GoodsCompany(id) if !id.is_service() && id.prototype().kind == CompanyKind::Store)
-            && store.obb.center().distance2(b.obb.center()) <= 1500.0 * 1500.0
-    });
+    let retail = map
+        .spatial_map()
+        .query_around(b.door_pos.xy(), 1500.0, ProjectFilter::BUILDING)
+        .filter_map(|project| project.as_building().and_then(|id| map.get(id)))
+        .any(|store| {
+            is_retail_store(store.kind)
+                && store.door_pos.xy().distance2(b.door_pos.xy()) <= 1500.0 * 1500.0
+        });
     need("Store within 1.5 km", retail);
     if try_prototype(prototype).is_some_and(|p| p.power_consumption.is_some()) {
         need("Power", has_power(sim, b.id));

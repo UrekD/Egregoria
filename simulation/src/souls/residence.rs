@@ -1,10 +1,12 @@
-use crate::map::{BuildingID, Density};
+use crate::map::{BuildingID, BuildingKind, Density};
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::lifecycle;
 use crate::{Simulation, SoulID};
 use geom::Vec3;
 use ordered_float::OrderedFloat;
-use prototypes::{CompanyKind, ResidencePrototype, ResidencePrototypeID, TICKS_PER_HOUR};
+use prototypes::{
+    try_prototype, CompanyKind, ItemID, ResidencePrototype, ResidencePrototypeID, TICKS_PER_HOUR,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -127,6 +129,22 @@ pub(crate) fn evict_residents(sim: &mut Simulation, building: BuildingID, door: 
     }
 }
 
+pub fn is_retail_store(kind: BuildingKind) -> bool {
+    let Some(id) = kind.as_goods_company().filter(|id| !id.is_service()) else {
+        return false;
+    };
+    let retail_goods = ItemID::new("retail-goods");
+    try_prototype(id).is_some_and(|proto| {
+        proto.kind == CompanyKind::Store
+            && proto.recipe.as_ref().is_some_and(|recipe| {
+                recipe
+                    .production
+                    .iter()
+                    .any(|item| item.id == retail_goods && item.amount > 0)
+            })
+    })
+}
+
 pub fn residence_update(sim: &mut Simulation) {
     if sim.get_tick() % TICKS_PER_HOUR != 0 {
         return;
@@ -142,10 +160,8 @@ pub fn residence_update(sim: &mut Simulation) {
         let stores: Vec<_> = map
             .buildings()
             .values()
-            .filter_map(|building| {
-                let company = building.kind.as_goods_company()?.prototype();
-                (company.kind == CompanyKind::Store).then_some(building.door_pos.xy())
-            })
+            .filter(|building| is_retail_store(building.kind))
+            .map(|building| building.door_pos.xy())
             .collect();
         let Residences {
             by_building,

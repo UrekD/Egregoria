@@ -10,6 +10,7 @@ data:extend {
         growable = true,
         kind = "factory",
         n_workers = 12,
+        water_consumption = 12,
         recipe = {
             consumption = {},
             production = {{"goods", 4}},
@@ -33,6 +34,7 @@ data:extend {
         growable = true,
         kind = "store",
         n_workers = 8,
+        water_consumption = 8,
         recipe = {
             consumption = {{"goods", 2}},
             production = {{"retail-goods", 2}},
@@ -56,6 +58,7 @@ data:extend {
         growable = true,
         kind = "factory",
         n_workers = 6,
+        water_consumption = 6,
         recipe = {
             consumption = {},
             production = {{"services", 4}},
@@ -79,6 +82,7 @@ data:extend {
         growable = true,
         kind = "factory",
         n_workers = 24,
+        water_consumption = 24,
         recipe = {
             consumption = {},
             production = {{"goods", 8}},
@@ -102,6 +106,7 @@ data:extend {
         growable = true,
         kind = "store",
         n_workers = 16,
+        water_consumption = 16,
         recipe = {
             consumption = {{"goods", 4}},
             production = {{"retail-goods", 4}},
@@ -125,6 +130,7 @@ data:extend {
         growable = true,
         kind = "factory",
         n_workers = 12,
+        water_consumption = 12,
         recipe = {
             consumption = {},
             production = {{"services", 8}},

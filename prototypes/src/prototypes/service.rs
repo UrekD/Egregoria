@@ -61,12 +61,16 @@ impl Prototype for ServicePrototype {
 
     fn from_lua(table: &Table) -> mlua::Result<Self> {
         let base = GoodsCompanyPrototype::from_lua(table)?;
+        let capacity = get_lua::<f64>(table, "capacity")?;
+        if capacity.fract() != 0.0 {
+            return Err(mlua::Error::external("field capacity: must be an integer"));
+        }
         Ok(Self {
             id: Self::ID::new(&base.name),
             base,
             service_kind: get_lua(table, "service_kind")?,
             radius_m: get_lua(table, "radius_m")?,
-            capacity: get_lua(table, "capacity")?,
+            capacity: capacity as u32,
             upkeep_per_day: get_lua(table, "upkeep_per_day")?,
         })
     }

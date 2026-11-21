@@ -52,6 +52,7 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
                         BudgetCategory::SpecialBuildingUpkeep,
                         "Special building upkeep",
                     ),
+                    (BudgetCategory::ServiceUpkeep, "Service upkeep"),
                 ] {
                     let amount = ledger
                         .and_then(|entries| entries.get(&category))

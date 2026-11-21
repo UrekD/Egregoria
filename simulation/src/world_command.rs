@@ -394,8 +394,16 @@ impl WorldCommand {
                         if id.is_growable() {
                             return Err(Rejection::InvalidBuilding);
                         }
-                        if id.is_service() && connected_road.is_none() {
-                            return Err(Rejection::MissingReference);
+                        if id.is_service() {
+                            let road = connected_road
+                                .and_then(|road| map.get(road))
+                                .ok_or(Rejection::MissingReference)?;
+                            let door = Building::door_position(pos, *gen, &map.environment);
+                            let snap_distance = proto.size.diag() * 0.5 + road.width * 0.5;
+                            let nearest = road.points().project(door);
+                            if !door.is_close(nearest, snap_distance) {
+                                return Err(Rejection::InvalidBuilding);
+                            }
                         }
                         proto.zone.is_some()
                     }

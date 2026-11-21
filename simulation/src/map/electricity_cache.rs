@@ -51,6 +51,7 @@ pub struct ElectricityNetwork {
 /// It maintains a mapping from network objects to network ids that are connected to each other
 #[derive(Debug, Default, Eq, PartialEq, Clone)]
 pub struct ElectricityCache {
+    pub(crate) generation: u64,
     pub(crate) networks: BTreeMap<ElectricityNetworkID, ElectricityNetwork>,
 
     /// The network that each intersection is connected to
@@ -88,6 +89,7 @@ impl ElectricityCache {
 
         self.networks.insert(network_id, network);
         self.ids.insert(object_id, network_id);
+        self.generation = self.generation.wrapping_add(1);
     }
 
     /// Remove a network object.
@@ -109,6 +111,7 @@ impl ElectricityCache {
         let network_id = self.ids.remove(&object_id).unwrap();
         let network = self.networks.remove(&network_id).unwrap();
         self.graph.remove(&object_id);
+        self.generation = self.generation.wrapping_add(1);
 
         debug_assert!(network.objects.len() == 1, "{:?}", object_id);
     }
@@ -127,6 +130,7 @@ impl ElectricityCache {
 
         self.graph.get_mut(src).unwrap().push(*dst);
         self.graph.get_mut(dst).unwrap().push(*src);
+        self.generation = self.generation.wrapping_add(1);
 
         let Some(src) = self.ids.get(src) else {
             log::error!("electricity add_edge src {:?} not found", src);
@@ -161,6 +165,7 @@ impl ElectricityCache {
         // Even though we use retain for removal which ends up as O(degree²) the degree is never big
         self.graph.get_mut(src).unwrap().retain(|v| v != dst);
         self.graph.get_mut(dst).unwrap().retain(|v| v != src);
+        self.generation = self.generation.wrapping_add(1);
 
         let Some(src_net) = self.ids.get(src) else {
             log::error!("electricity remove_edge src {:?} not found", src);
@@ -414,6 +419,8 @@ pub fn check_electricity_coherency(map: &Map) {
     for v in e_from_map.graph.values_mut() {
         v.sort();
     }
+    // A rebuilt cache has the same graph and its own mutation history.
+    e_from_map.generation = e.generation;
     assert_eq!(e, e_from_map);
 }
 

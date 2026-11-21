@@ -632,13 +632,14 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "P2e overlays"]
     fn p2e_set_overlay_step_decodes() {
         let step = JSON::decode::<Step>(br#"{"SetOverlay":{"Coverage":"Fire"}}"#).unwrap();
         assert!(matches!(
             step,
             Step::SetOverlay(OverlayMode::Coverage(prototypes::ServiceKind::Fire))
         ));
+        assert!(JSON::decode::<Step>(br#"{"SetOverlay":{"Coverage":"WaterPump"}}"#).is_err());
+        assert!(JSON::decode::<Step>(br#"{"SetOverlay":{"Coverage":"SewageOutlet"}}"#).is_err());
     }
 
     #[test]
