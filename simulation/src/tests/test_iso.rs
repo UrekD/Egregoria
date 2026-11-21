@@ -1,4 +1,4 @@
-use crate::init::init;
+use super::init_test_simulation as init;
 use crate::map::{LanePatternBuilder, Map, MapProject, ProjectKind};
 use crate::utils::scheduler::SeqSchedule;
 use crate::World;

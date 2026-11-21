@@ -4,14 +4,20 @@
 use crate::map::{BuildingID, LanePatternBuilder, ProjectFilter};
 use crate::map_dynamic::BuildingInfos;
 use crate::utils::scheduler::SeqSchedule;
-use crate::world_command::{WorldCommand, WorldCommands};
+use crate::world_command::WorldCommand;
 use crate::{Simulation, SimulationOptions};
 use common::logger::MyLog;
 use common::saveload::Encoder;
 use geom::{Vec2, Vec3};
+use std::sync::Once;
 
 mod test_iso;
 mod vehicles;
+
+fn init_test_simulation() {
+    static INIT: Once = Once::new();
+    INIT.call_once(crate::init::init);
+}
 
 pub(crate) struct TestCtx {
     pub g: Simulation,
@@ -20,8 +26,9 @@ pub(crate) struct TestCtx {
 
 impl TestCtx {
     pub(crate) fn new() -> Self {
-        MyLog::init();
-        crate::init::init();
+        static INIT_LOGGER: Once = Once::new();
+        INIT_LOGGER.call_once(MyLog::init);
+        init_test_simulation();
 
         let g = Simulation::new_with_options(SimulationOptions {
             terrain_size: 1,
@@ -30,6 +37,10 @@ impl TestCtx {
         let sched = Simulation::schedule();
 
         Self { g, sched }
+    }
+
+    pub(crate) fn new_fast() -> Self {
+        Self::new()
     }
 
     pub(crate) fn build_roads(&self, v: &[Vec3]) {
@@ -62,9 +73,12 @@ impl TestCtx {
         }
     }
 
+    pub(crate) fn tick_fast(&mut self) {
+        self.g.tick(&mut self.sched, &[]);
+    }
+
     pub(crate) fn tick(&mut self) {
-        self.g
-            .tick(&mut self.sched, WorldCommands::default().as_ref());
+        self.tick_fast();
 
         let serialized = common::saveload::Bincode::encode(&self.g).unwrap();
         let deserialized: Simulation = common::saveload::Bincode::decode(&serialized).unwrap();
@@ -80,4 +94,22 @@ impl TestCtx {
             );
         }
     }
+}
+
+#[test]
+fn fast_tick_skips_serde() {
+    let regular = TestCtx::new();
+    let regular_tick = regular.g.get_tick();
+    let mut fast = TestCtx::new_fast();
+    let fast_tick = fast.g.get_tick();
+
+    // A tick can run without this resource, but serializing the simulation requires it.
+    let (_, resources) = fast.g.world_res();
+    assert!(resources.remove::<SimulationOptions>().is_some());
+
+    fast.tick_fast();
+    fast.tick_fast();
+
+    assert_eq!(fast.g.get_tick(), fast_tick + 2);
+    assert_eq!(regular.g.get_tick(), regular_tick);
 }
