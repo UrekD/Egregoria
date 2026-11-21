@@ -93,7 +93,7 @@ fn bar(value: f32, color: Color) {
 }
 
 /// ZoneDemand stores the smoothed score. Read live inputs for the current strongest contribution.
-fn top_driver(sim: &Simulation, zone: ZoneKind) -> Option<(&'static str, f32)> {
+pub(crate) fn top_driver(sim: &Simulation, zone: ZoneKind) -> Option<(&'static str, f32)> {
     let world = sim.world();
     let population = world.humans.len();
     let tax = sim.read::<Budget>().tax_rate(zone);

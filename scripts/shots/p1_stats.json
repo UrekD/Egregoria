@@ -4,6 +4,7 @@
   {"Builder": "place_company"},
   {"Builder": "fill_houses"},
   {"RunTicks": 18000},
+  {"OpenWindow": "City Stats"},
   {"WaitFrames": 8},
   {"Screenshot": "stats"},
   {"DumpState": "stats"},

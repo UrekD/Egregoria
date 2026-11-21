@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -7,17 +7,18 @@ use std::sync::{mpsc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use common::saveload::{self, Encoder, JSONPretty, JSON};
-use engine::Context;
-use geom::{vec2, vec3, Radians};
+use engine::{Context, Key, MouseButton};
+use geom::{vec2, vec3, Radians, Vec2};
 use scenarios::builders::{self, CommandSink};
 use serde::{Deserialize, Serialize};
-use simulation::economy::CityStats;
+use simulation::economy::{Budget, CityStats, Government, ZoneDemand};
+use simulation::map::{ZoneGrid, ZoneKind};
 use simulation::utils::scheduler::SeqSchedule;
-use simulation::world_command::WorldCommand;
+use simulation::world_command::{CommandOutcomes, WorldCommand, WorldCommands};
 use simulation::Simulation;
 
-use crate::gui::{GuiState, Tool};
-use crate::uiworld::UiWorld;
+use crate::gui::{top_demand_driver, zoning::ZONES, GuiState, Tool};
+use crate::uiworld::{ReceivedCommands, UiWorld};
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
 static STARTUP: Mutex<Option<Automation>> = Mutex::new(None);
@@ -33,6 +34,17 @@ struct Arguments {
 enum Step {
     WaitFrames(u64),
     RunTicks(u64),
+    Commands(Vec<WorldCommand>),
+    Pointer {
+        action: PointerAction,
+        #[serde(flatten)]
+        position: PointerPosition,
+    },
+    Key {
+        key: ScriptKey,
+        down: bool,
+    },
+    EmptyTreasury,
     Camera {
         x: f32,
         y: f32,
@@ -50,6 +62,32 @@ enum Step {
 }
 
 #[derive(Deserialize)]
+enum PointerAction {
+    Move,
+    Down,
+    Up,
+    Click,
+    Drag { to: PointerPosition },
+}
+
+#[derive(Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum PointerPosition {
+    World { world_pos: [f32; 3] },
+    Screen { screen_pos: [f32; 2] },
+}
+
+#[derive(Deserialize)]
+enum ScriptKey {
+    Escape,
+}
+
+enum PointerEvent {
+    Move(Vec2),
+    Button { down: bool },
+}
+
+#[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum Builder {
     GridCity,
@@ -59,13 +97,14 @@ enum Builder {
 
 #[derive(Clone, Copy)]
 enum Wait {
-    Map { submitted_at: u64 },
+    Map { tick: u64, settle_frames: u64 },
     Frames { start: u64, count: u64 },
     Screenshot,
 }
 
 pub(crate) struct Automation {
     steps: VecDeque<Step>,
+    pointer_events: VecDeque<PointerEvent>,
     step_number: usize,
     dir: PathBuf,
     exit_after_script: bool,
@@ -108,6 +147,7 @@ pub(crate) fn configure() -> Result<(), String> {
     let dir = configure_save_dir(&dir, true)?;
     *STARTUP.lock().unwrap() = Some(Automation {
         steps,
+        pointer_events: VecDeque::new(),
         step_number: 0,
         dir,
         exit_after_script: args.exit_after_script,
@@ -216,15 +256,16 @@ impl Automation {
         schedule: &mut SeqSchedule,
         rebuilt_version: Option<u64>,
     ) -> Result<bool, String> {
+        *uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
         match self.wait {
-            Some(Wait::Map { submitted_at }) => {
-                let tick = sim.read().unwrap().get_tick();
-                if tick > submitted_at && rebuilt_version == Some(tick) {
-                    self.wait = Some(Wait::Frames {
-                        start: ctx.gfx.tick,
-                        count: 2,
-                    });
-                }
+            Some(Wait::Map { tick, .. }) if rebuilt_version != Some(tick) => {
+                return Ok(true);
+            }
+            Some(Wait::Map { settle_frames, .. }) if settle_frames > 0 => {
+                self.wait = Some(Wait::Frames {
+                    start: ctx.gfx.tick,
+                    count: settle_frames,
+                });
                 return Ok(true);
             }
             Some(Wait::Frames { start, count }) if ctx.gfx.tick - start < count => {
@@ -237,6 +278,18 @@ impl Automation {
             _ => {}
         }
         self.wait = None;
+
+        let pending = std::mem::take(&mut *uiw.commands());
+        if !pending.is_empty() {
+            self.apply_commands(uiw, &mut sim.write().unwrap(), schedule, pending);
+            return Ok(true);
+        }
+
+        // Each event gets its own update and layout pass before the next event.
+        if let Some(event) = self.pointer_events.pop_front() {
+            event.send(ctx);
+            return Ok(true);
+        }
 
         let Some(step) = self.steps.pop_front() else {
             if self.exit_after_script {
@@ -254,24 +307,67 @@ impl Automation {
             }
             Step::RunTicks(count) if count > 0 => {
                 let mut sim = sim.write().unwrap();
-                let submitted_at = sim.get_tick();
                 for _ in 0..count {
                     sim.tick(schedule, []);
                 }
-                self.wait = Some(Wait::Map { submitted_at });
+                self.wait = Some(Wait::Map {
+                    tick: sim.get_tick(),
+                    settle_frames: 2,
+                });
             }
             Step::RunTicks(_) => {}
+            Step::Commands(commands) if !commands.is_empty() => {
+                let mut batch = WorldCommands::default();
+                batch.extend(commands);
+                self.apply_commands(uiw, &mut sim.write().unwrap(), schedule, batch);
+            }
+            Step::Commands(_) => {}
+            Step::Pointer { action, position } => {
+                let start = position.to_screen(uiw)?;
+                match action {
+                    PointerAction::Move => {}
+                    PointerAction::Down => {
+                        self.pointer_events
+                            .push_back(PointerEvent::Button { down: true });
+                    }
+                    PointerAction::Up => {
+                        self.pointer_events
+                            .push_back(PointerEvent::Button { down: false });
+                    }
+                    PointerAction::Click => self.pointer_events.extend([
+                        PointerEvent::Button { down: true },
+                        PointerEvent::Button { down: false },
+                    ]),
+                    PointerAction::Drag { to } => self.pointer_events.extend([
+                        PointerEvent::Button { down: true },
+                        PointerEvent::Move(to.to_screen(uiw)?),
+                        PointerEvent::Button { down: false },
+                    ]),
+                }
+                PointerEvent::Move(start).send(ctx);
+            }
+            Step::Key { key, down } => key.send(ctx, down),
+            Step::EmptyTreasury => {
+                // Set up the rejection fixture before submitting the real construction command.
+                sim.write().unwrap().write::<Government>().money = prototypes::Money::ZERO;
+            }
             Step::Builder(builder) => {
                 let mut sim = sim.write().unwrap();
+                let start_tick = sim.get_tick();
                 let mut sink = LiveCommandSink {
                     sim: &mut sim,
                     schedule,
                     queued: Vec::new(),
-                    submitted_at: None,
                 };
                 builder.build(&mut sink)?;
-                let submitted_at = sink.submitted_at.ok_or("builder submitted no commands")?;
-                self.wait = Some(Wait::Map { submitted_at });
+                let tick = sim.get_tick();
+                if start_tick == tick {
+                    return Err("builder submitted no commands".into());
+                }
+                self.wait = Some(Wait::Map {
+                    tick,
+                    settle_frames: 2,
+                });
             }
             Step::Camera {
                 x,
@@ -325,6 +421,26 @@ impl Automation {
         Ok(true)
     }
 
+    fn apply_commands(
+        &mut self,
+        uiw: &UiWorld,
+        sim: &mut Simulation,
+        schedule: &mut SeqSchedule,
+        commands: WorldCommands,
+    ) {
+        if commands.iter().all(WorldCommand::is_instant) {
+            sim.apply_commands(commands.as_ref());
+        } else {
+            sim.tick(schedule, commands.as_ref());
+        }
+        *uiw.write::<ReceivedCommands>() = ReceivedCommands::new(commands);
+        // The next step can run as soon as this batch has been rendered.
+        self.wait = Some(Wait::Map {
+            tick: sim.get_tick(),
+            settle_frames: 0,
+        });
+    }
+
     fn output_path(&self, name: &str, extension: &str) -> Result<PathBuf, String> {
         if name.is_empty()
             || !name
@@ -343,6 +459,11 @@ impl Automation {
             active_tool: Tool,
             open_windows: Vec<&'static str>,
             city_stats: &'a CityStats,
+            zone_cells: usize,
+            zone_demand: &'a ZoneDemand,
+            demand_drivers: BTreeMap<ZoneKind, (&'static str, f32)>,
+            tax_rates: [u16; 4],
+            rejections: Vec<(&'static str, String)>,
         }
 
         let open_windows = uiw
@@ -351,11 +472,27 @@ impl Automation {
             .window_states()
             .filter_map(|(name, open)| (*open).then_some(name))
             .collect();
+        let demand = sim.read::<ZoneDemand>();
+        let budget = sim.read::<Budget>();
         let state = Snapshot {
             tick: sim.get_tick(),
             active_tool: *uiw.read::<Tool>(),
             open_windows,
             city_stats: &sim.read::<CityStats>(),
+            zone_cells: sim.read::<ZoneGrid>().cells.len(),
+            zone_demand: &demand,
+            demand_drivers: demand
+                .values
+                .keys()
+                .filter_map(|&zone| top_demand_driver(sim, zone).map(|driver| (zone, driver)))
+                .collect(),
+            tax_rates: ZONES.map(|zone| budget.tax_rate(zone)),
+            rejections: sim
+                .read::<CommandOutcomes>()
+                .last
+                .iter()
+                .map(|(command, reason)| (*command, format!("{reason:?}")))
+                .collect(),
         };
         let write = || -> io::Result<()> {
             let mut file = BufWriter::new(File::create(path)?);
@@ -363,6 +500,72 @@ impl Automation {
             file.flush()
         };
         write().map_err(|e| format!("writing state {}: {e}", path.display()))
+    }
+}
+
+impl PointerPosition {
+    fn to_screen(self, uiw: &UiWorld) -> Result<Vec2, String> {
+        let screen = match self {
+            Self::World {
+                world_pos: [x, y, z],
+            } => {
+                let (screen, depth) = uiw.camera().project(vec3(x, y, z));
+                if !depth.is_finite() || depth <= 0.0 {
+                    return Err("world pointer must project in front of the camera".into());
+                }
+                screen
+            }
+            Self::Screen { screen_pos: [x, y] } => vec2(x, y),
+        };
+        if screen.is_finite() {
+            Ok(screen)
+        } else {
+            Err("pointer position must project to finite screen coordinates".into())
+        }
+    }
+}
+
+impl PointerEvent {
+    fn send(self, ctx: &mut Context) {
+        use yakui::event::Event;
+
+        match self {
+            Self::Move(pos) => {
+                ctx.input.mouse.screen_delta += pos - ctx.input.mouse.screen;
+                ctx.input.mouse.screen = pos;
+                ctx.yakui
+                    .yakui
+                    .handle_event(Event::CursorMoved(Some(yakui::Vec2::new(pos.x, pos.y))));
+            }
+            Self::Button { down } => {
+                let captured = ctx.yakui.yakui.handle_event(Event::MouseButtonChanged {
+                    button: yakui::input::MouseButton::One,
+                    down,
+                });
+                if down && !captured {
+                    ctx.input.mouse.pressed.insert(MouseButton::Left);
+                } else if !down {
+                    ctx.input.mouse.pressed.remove(&MouseButton::Left);
+                }
+            }
+        }
+    }
+}
+
+impl ScriptKey {
+    fn send(self, ctx: &mut Context, down: bool) {
+        let (key, code) = match self {
+            Self::Escape => (Key::Escape, yakui::input::KeyCode::Escape),
+        };
+        let captured = ctx
+            .yakui
+            .yakui
+            .handle_event(yakui::event::Event::KeyChanged { key: code, down });
+        if down && !captured {
+            ctx.input.keyboard.pressed.insert(key);
+        } else if !down {
+            ctx.input.keyboard.pressed.remove(&key);
+        }
     }
 }
 
@@ -395,7 +598,6 @@ struct LiveCommandSink<'a> {
     sim: &'a mut Simulation,
     schedule: &'a mut SeqSchedule,
     queued: Vec<WorldCommand>,
-    submitted_at: Option<u64>,
 }
 
 impl CommandSink for LiveCommandSink<'_> {
@@ -404,10 +606,7 @@ impl CommandSink for LiveCommandSink<'_> {
     }
 
     fn submit(&mut self, commands: &[WorldCommand]) {
-        if !commands.is_empty() {
-            self.submitted_at = Some(self.sim.get_tick());
-            self.queued.extend_from_slice(commands);
-        }
+        self.queued.extend_from_slice(commands);
     }
 
     fn has_pending_commands(&self) -> bool {
@@ -417,5 +616,71 @@ impl CommandSink for LiveCommandSink<'_> {
     fn flush(&mut self) {
         self.sim.tick(self.schedule, &self.queued);
         self.queued.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p1e_auto_steps_decode() {
+        for (name, json) in [
+            (
+                "commands",
+                r#"{"Commands":[{"SetTaxRate":{"zone":"Residential","rate_permille":150}}]}"#,
+            ),
+            (
+                "world pointer",
+                r#"{"Pointer":{"action":"Click","world_pos":[1020,900,0]}}"#,
+            ),
+            (
+                "screen drag",
+                r#"{"Pointer":{"action":{"Drag":{"to":{"screen_pos":[804,276]}}},"screen_pos":[737,276]}}"#,
+            ),
+            ("key", r#"{"Key":{"key":"Escape","down":true}}"#),
+        ] {
+            assert!(JSON::decode::<Step>(json.as_bytes()).is_ok(), "{name}");
+        }
+        for json in [
+            r#"{"Pointer":{"action":"Move"}}"#,
+            r#"{"Pointer":{"action":"Move","world_pos":[1,2,3],"screen_pos":[4,5]}}"#,
+        ] {
+            assert!(JSON::decode::<Step>(json.as_bytes()).is_err(), "{json}");
+        }
+    }
+
+    #[test]
+    fn p1e_auto_windows_are_registered() {
+        let mut gui = GuiState::default();
+        let names: Vec<_> = gui.windows.window_states().map(|(name, _)| name).collect();
+        assert!(names.contains(&"Budget"));
+        assert!(names.contains(&"City Stats"));
+    }
+
+    #[test]
+    fn p1e_scripted_screenshots_and_dump_state() {
+        let shots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/shots");
+        for name in [
+            "zoning",
+            "demand",
+            "budget",
+            "stats",
+            "rejection",
+            "grown-city",
+        ] {
+            let steps = fs::read(shots.join(format!("p1_{name}.json"))).unwrap();
+            let steps: Vec<Step> =
+                JSON::decode(&steps).unwrap_or_else(|err| panic!("{name}: {err}"));
+            assert!(steps
+                .iter()
+                .any(|s| matches!(s, Step::Screenshot(label) if label == name)));
+            assert!(steps
+                .iter()
+                .any(|s| matches!(s, Step::DumpState(label) if label == name)));
+            if name == "grown-city" {
+                assert!(steps.iter().any(|s| matches!(s, Step::RunTicks(300_000))));
+            }
+        }
     }
 }

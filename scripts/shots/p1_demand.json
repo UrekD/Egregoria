@@ -4,6 +4,7 @@
   {"Builder": "place_company"},
   {"Builder": "fill_houses"},
   {"RunTicks": 3000},
+  {"Pointer": {"action": "Move", "screen_pos": [49, 73]}},
   {"WaitFrames": 8},
   {"Screenshot": "demand"},
   {"DumpState": "demand"},

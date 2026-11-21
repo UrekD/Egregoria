@@ -111,6 +111,7 @@ pub struct Simulation {
 }
 
 const RNG_SEED: u64 = 123;
+const INITIAL_TICK: u64 = 1;
 const VERSION: &str = include_str!("../../VERSION");
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -147,7 +148,17 @@ impl Simulation {
         })
     }
 
+    /// Creates a simulation and loader for a replay from the current version.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the replay version differs from the simulation version.
     pub fn from_replay(replay: Replay) -> (Simulation, SimulationReplayLoader) {
+        assert!(
+            replay.version == VERSION,
+            "Replay has version {:?}, expected {VERSION:?}",
+            replay.version
+        );
         let mut sim = Simulation {
             world: Default::default(),
             resources: Default::default(),

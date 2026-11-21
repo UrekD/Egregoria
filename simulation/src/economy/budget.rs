@@ -1,12 +1,12 @@
+pub use crate::economy::balance::DEFAULT_TAX_RATE_PERMILLE;
 use crate::economy::Government;
 use crate::map::{BuildingKind, Map, ZoneKind};
 use crate::souls::residence::Residences;
-use crate::{utils::resources::Resources, World};
-use prototypes::{try_prototype, GrowableCompanyID, Money, HOURS_PER_DAY, TICKS_PER_HOUR};
+use crate::{utils::resources::Resources, World, INITIAL_TICK};
+use prototypes::{try_prototype, GrowableCompanyID, Money, Tick, HOURS_PER_DAY, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-pub const DEFAULT_TAX_RATE_PERMILLE: u16 = 90;
 pub const MAX_TAX_RATE_PERMILLE: u16 = 290;
 pub const TICKS_PER_BUDGET_DAY: u64 = TICKS_PER_HOUR * HOURS_PER_DAY as u64;
 
@@ -26,7 +26,9 @@ pub enum BudgetCategory {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Budget {
-    day: u64,
+    // Offsets changes to the game clock so accrual follows actual simulation ticks.
+    clock_offset: i128,
+    last_accrued_hour: u64,
     // Cumulative turnover can exceed the range of the treasury balance.
     days: BTreeMap<u64, BTreeMap<BudgetCategory, i128>>,
     tax_rates: BTreeMap<ZoneKind, u16>,
@@ -35,12 +37,11 @@ pub struct Budget {
 }
 
 impl Budget {
-    /// Record a signed change in the current day's ledger, with income positive.
-    pub fn record(&mut self, category: BudgetCategory, delta: Money) {
+    fn record(&mut self, day: u64, category: BudgetCategory, delta: Money) {
         if delta != Money::ZERO {
             *self
                 .days
-                .entry(self.day)
+                .entry(day)
                 .or_default()
                 .entry(category)
                 .or_default() += i128::from(delta.inner());
@@ -73,26 +74,44 @@ impl Budget {
         }
     }
 
+    pub(crate) fn shift_clock(&mut self, previous: Tick, next: Tick) {
+        self.clock_offset += i128::from(previous.0) - i128::from(next.0);
+    }
+
+    fn elapsed_ticks(&self, tick: Tick) -> u64 {
+        let elapsed = i128::from(tick.0) - i128::from(INITIAL_TICK) + self.clock_offset;
+        elapsed.clamp(0, i128::from(u64::MAX)) as u64
+    }
+
+    /// Entry point for treasury transactions. Posts the signed change to both the
+    /// treasury and the current day's budget ledger, with income positive.
     pub(crate) fn apply(resources: &Resources, category: BudgetCategory, delta: Money) {
         if delta != Money::ZERO {
-            let tick = resources.tick().0;
+            let tick = resources.tick();
             let mut government = resources.write::<Government>();
             let mut budget = resources.write::<Self>();
-            budget.day = budget_day(tick);
-            budget.post(&mut government, category, delta);
+            let day = budget_day(budget.elapsed_ticks(tick));
+            budget.post(&mut government, day, category, delta);
         }
     }
 
-    fn post(&mut self, government: &mut Government, category: BudgetCategory, delta: Money) {
+    fn post(
+        &mut self,
+        government: &mut Government,
+        day: u64,
+        category: BudgetCategory,
+        delta: Money,
+    ) {
         let opening = government.money.inner();
         let closing = opening.saturating_add(delta.inner());
         government.money = Money::new_inner(closing);
-        self.record(category, Money::new_inner(closing - opening));
+        self.record(day, category, Money::new_inner(closing - opening));
     }
 
     fn accrue_hour(
         &mut self,
         government: &mut Government,
+        day: u64,
         category: BudgetCategory,
         daily_numerator: i128,
         daily_divisor: i128,
@@ -102,7 +121,7 @@ impl Budget {
         let numerator = daily_numerator + *remainder;
         *remainder = numerator % hourly_divisor;
         let delta = (numerator / hourly_divisor).clamp(i128::from(i64::MIN), i128::from(i64::MAX));
-        self.post(government, category, Money::new_inner(delta as i64));
+        self.post(government, day, category, Money::new_inner(delta as i64));
     }
 }
 
@@ -112,10 +131,14 @@ fn budget_day(tick: u64) -> u64 {
 }
 
 pub fn budget_update(world: &mut World, resources: &mut Resources) {
-    let tick = resources.tick().0;
-    if tick == 0 || tick % TICKS_PER_HOUR != 0 {
-        return;
-    }
+    let hour = {
+        let budget = resources.read::<Budget>();
+        let hour = budget.elapsed_ticks(resources.tick()) / TICKS_PER_HOUR;
+        if hour <= budget.last_accrued_hour {
+            return;
+        }
+        hour
+    };
 
     profiling::scope!("economy::budget_update");
     let map = resources.read::<Map>();
@@ -164,11 +187,12 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
 
     let mut government = resources.write::<Government>();
     let mut budget = resources.write::<Budget>();
-    budget.day = budget_day(tick);
+    let day = budget_day(hour * TICKS_PER_HOUR);
     for (zone, levels) in taxable_levels {
         let rate = i128::from(budget.tax_rate(zone));
         budget.accrue_hour(
             &mut government,
+            day,
             BudgetCategory::Tax(zone),
             levels * rate * i128::from(TAX_BASE_PER_LEVEL_DAY.inner()),
             1000,
@@ -176,32 +200,121 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
     }
     budget.accrue_hour(
         &mut government,
+        day,
         BudgetCategory::RoadUpkeep,
         -i128::from(road_upkeep.inner()),
         1,
     );
     budget.accrue_hour(
         &mut government,
+        day,
         BudgetCategory::SpecialBuildingUpkeep,
         -special_building_value,
         SPECIAL_BUILDING_UPKEEP_DIVISOR,
     );
+    budget.last_accrued_hour = hour;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::economy::Workers;
     use crate::map::Density;
     use crate::souls::desire::{Work, WorkKind};
-    use crate::souls::goods_company::GoodsCompanyState;
+    use crate::souls::goods_company::company_soul;
+    use crate::souls::growth::on_growable_placed;
     use crate::souls::human::spawn_human;
     use crate::souls::residence::Residence;
     use crate::tests::TestCtx;
-    use crate::world::CompanyEnt;
+    use crate::utils::scheduler::{RunnableFn, SeqSchedule};
     use crate::world_command::{CommandOutcomes, Rejection, WorldCommand};
-    use geom::{vec2, vec3, Transform, Vec2, OBB};
-    use prototypes::{BuildingGen, GameTime, GoodsCompanyID, ResidencePrototypeID, Tick};
+    use crate::{Simulation, SoulID};
+    use common::saveload::{Bincode, Encoder};
+    use geom::{vec2, vec3, Vec2, OBB};
+    use prototypes::{BuildingGen, GameTime, GoodsCompanyID, ResidencePrototypeID};
+
+    fn advance_budget_ticks(sim: &mut Simulation, ticks: u64) {
+        let mut schedule = SeqSchedule::default();
+        schedule.add_system(Box::new(RunnableFn {
+            name: "budget_update",
+            f: |sim: &mut Simulation| {
+                let (world, resources) = sim.world_res();
+                budget_update(world, resources);
+            },
+        }));
+        for _ in 0..ticks {
+            sim.tick(&mut schedule, &[]);
+        }
+    }
+
+    #[test]
+    fn hourly_budget_ignores_clock_jumps() {
+        let mut sim = TestCtx::new_fast().g;
+        let category = BudgetCategory::SpecialBuildingUpkeep;
+        let warp = |sim: &mut Simulation, tick| {
+            sim.apply_commands([&WorldCommand::SetGameTime(GameTime::new(Tick(tick)))]);
+        };
+
+        warp(&mut sim, 0);
+        advance_budget_ticks(&mut sim, TICKS_PER_HOUR);
+        let first_hour = sim.read::<Budget>().total(category);
+        assert!(first_hour < 0);
+        let money_after_first_hour = sim.read::<Government>().money;
+
+        warp(&mut sim, TICKS_PER_HOUR - 1);
+        advance_budget_ticks(&mut sim, 1);
+        assert_eq!(sim.read::<Budget>().total(category), first_hour);
+        assert_eq!(sim.read::<Government>().money, money_after_first_hour);
+
+        warp(&mut sim, 20 * TICKS_PER_BUDGET_DAY - 1);
+        advance_budget_ticks(&mut sim, 1);
+        assert_eq!(sim.read::<Budget>().total(category), first_hour);
+        assert_eq!(sim.read::<Government>().money, money_after_first_hour);
+
+        advance_budget_ticks(&mut sim, TICKS_PER_HOUR - 3);
+        assert_eq!(sim.read::<Budget>().total(category), first_hour);
+        advance_budget_ticks(&mut sim, 1);
+        let expected = -i128::from(Money::new_bucks(5).inner()) * 2 / 24;
+        let budget = sim.read::<Budget>();
+        assert_eq!(budget.total(category), expected);
+        assert_eq!(budget.days().len(), 1);
+        let ledger_sum: i128 = budget.days()[&0].values().sum();
+        assert_eq!(
+            i128::from(sim.read::<Government>().money.inner()),
+            i128::from(Government::default().money.inner()) + ledger_sum
+        );
+    }
+
+    #[test]
+    fn hourly_budget_survives_mid_hour_save_across_day_boundary() {
+        let mut continuous = TestCtx::new_fast().g;
+        let category = BudgetCategory::SpecialBuildingUpkeep;
+        continuous.apply_commands([&WorldCommand::SetGameTime(GameTime::new(Tick(123)))]);
+        advance_budget_ticks(&mut continuous, TICKS_PER_HOUR + 456);
+        assert_ne!(continuous.read::<Budget>().hourly_remainders[&category], 0);
+        let encoded = Bincode::encode(&continuous).unwrap();
+        let mut resumed: Simulation = Bincode::decode(&encoded).unwrap();
+
+        let remaining = TICKS_PER_BUDGET_DAY - TICKS_PER_HOUR - 456;
+        for sim in [&mut continuous, &mut resumed] {
+            advance_budget_ticks(sim, remaining - 1);
+            let expected = -i128::from(Money::new_bucks(5).inner()) * 23 / 24;
+            assert_eq!(sim.read::<Budget>().total(category), expected);
+            advance_budget_ticks(sim, TICKS_PER_HOUR + 1);
+            assert_eq!(
+                sim.read::<Budget>().days()[&0][&category],
+                -i128::from(Money::new_bucks(5).inner())
+            );
+            assert!(sim.read::<Budget>().days()[&1][&category] < 0);
+        }
+        assert_eq!(
+            continuous.read::<Budget>().days(),
+            resumed.read::<Budget>().days()
+        );
+        assert_eq!(
+            continuous.read::<Government>().money,
+            resumed.read::<Government>().money
+        );
+    }
 
     #[test]
     fn p1d_set_tax_rate_bounds() {
@@ -286,11 +399,11 @@ mod tests {
         let (world, resources) = ctx.g.world_res();
         let post_construction = opening + Money::new_bucks(-1000);
         assert_eq!(resources.read::<Government>().money, post_construction);
-        *resources.write::<GameTime>() = GameTime::new(Tick(TICKS_PER_HOUR - 1));
+        *resources.write::<GameTime>() = GameTime::new(Tick(INITIAL_TICK + TICKS_PER_HOUR - 1));
         budget_update(world, resources);
         assert_eq!(resources.read::<Government>().money, post_construction);
 
-        *resources.write::<GameTime>() = GameTime::new(Tick(TICKS_PER_HOUR));
+        *resources.write::<GameTime>() = GameTime::new(Tick(INITIAL_TICK + TICKS_PER_HOUR));
         budget_update(world, resources);
         let tax = Money::new_bucks(36).inner();
         let road_upkeep = Money::from_float_bucks(lane_metres * 5.0 / 1000.0).inner();
@@ -301,7 +414,8 @@ mod tests {
             post_construction + Money::new_inner(tax / 24 - road_upkeep / 24 - station_upkeep / 24),
         );
         for hour in 2..=24 {
-            *resources.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
+            *resources.write::<GameTime>() =
+                GameTime::new(Tick(INITIAL_TICK + hour * TICKS_PER_HOUR));
             budget_update(world, resources);
         }
         assert_eq!(
@@ -325,7 +439,8 @@ mod tests {
         );
         drop(day_zero);
 
-        *resources.write::<GameTime>() = GameTime::new(Tick(TICKS_PER_BUDGET_DAY + 1));
+        *resources.write::<GameTime>() =
+            GameTime::new(Tick(INITIAL_TICK + TICKS_PER_BUDGET_DAY + 1));
         Budget::apply(
             resources,
             BudgetCategory::TradeImport,
@@ -351,60 +466,39 @@ mod tests {
     fn p1d_growable_company_tax_by_zone() {
         let mut ctx = TestCtx::new_fast();
         ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
-        for (i, (name, zone, rate_permille)) in [
+        let house = ctx.build_house_near(vec2(150.0, 125.0));
+        ctx.g
+            .write::<Residences>()
+            .by_building
+            .get_mut(&house)
+            .unwrap()
+            .capacity = 3;
+        for (name, zone, rate_permille) in [
             ("commercial-l1", ZoneKind::Commercial, 120),
             ("industrial-l1", ZoneKind::Industrial, 240),
             ("office-l1", ZoneKind::Office, 180),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        ] {
             let proto = GoodsCompanyID::new(name);
-            let house = ctx.build_house_near(vec2(145.0 + i as f32 * 45.0, 125.0));
-            let pos = vec2(130.0 + i as f32 * 30.0, 175.0);
-            ctx.g.apply_commands([
-                &WorldCommand::MapBuildSpecialBuilding {
-                    pos: OBB::new(pos, Vec2::X, 20.0, 20.0),
-                    kind: BuildingKind::GoodsCompany(proto),
-                    gen: proto.prototype().bgen,
-                    zone: None,
-                    connected_road: None,
-                },
-                &WorldCommand::SetTaxRate {
-                    zone,
-                    rate_permille,
-                },
-            ]);
-            assert!(ctx.g.read::<CommandOutcomes>().last.is_empty());
-            let building = ctx
-                .g
-                .map()
-                .buildings()
-                .values()
-                .find(|building| building.kind == BuildingKind::GoodsCompany(proto))
-                .unwrap()
-                .id;
+            let lot = ctx.g.map().lots().keys().next().unwrap();
+            let kind = BuildingKind::GoodsCompany(proto);
+            let building = ctx.g.map_mut().place_growable(lot, kind).unwrap();
+            on_growable_placed(&ctx.g, building, kind);
+            let Some(SoulID::GoodsCompany(company)) = company_soul(&mut ctx.g, building, proto)
+            else {
+                panic!("company soul missing for {name}");
+            };
+            ctx.g.apply_commands([&WorldCommand::SetTaxRate {
+                zone,
+                rate_permille,
+            }]);
             let worker = spawn_human(&mut ctx.g, house).unwrap();
             let world = ctx.g.world_mut_unchecked();
             world.humans[worker].work = Some(Work::new(building, WorkKind::Worker, 0.0));
-            world.insert(CompanyEnt {
-                trans: Transform::new(pos.z0()),
-                comp: GoodsCompanyState {
-                    proto,
-                    building,
-                    max_workers: proto.prototype().n_workers,
-                    progress: 0.0,
-                    driver: None,
-                    trucks: Vec::new(),
-                },
-                workers: Workers(vec![worker]),
-                sold: Default::default(),
-                bought: Default::default(),
-            });
+            world.companies[company].workers.0.push(worker);
         }
 
         let (world, resources) = ctx.g.world_res();
-        *resources.write::<GameTime>() = GameTime::new(Tick(TICKS_PER_HOUR));
+        *resources.write::<GameTime>() = GameTime::new(Tick(INITIAL_TICK + TICKS_PER_HOUR));
         budget_update(world, resources);
         let budget = resources.read::<Budget>();
         for (zone, hourly_cents) in [

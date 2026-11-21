@@ -5,8 +5,15 @@ use std::fs::File;
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str =
-    "Usage: scenarios <smoke|determinism|perf|budget_day|growth_basic|all> [--json out.json] [--twice]";
+fn usage() -> String {
+    let names = SCENARIOS
+        .iter()
+        .map(|(scenario, _)| scenario.name)
+        .chain(std::iter::once("all"))
+        .collect::<Vec<_>>()
+        .join("|");
+    format!("Usage: scenarios <{names}> [--json out.json] [--twice]")
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -23,13 +30,13 @@ fn run() -> Result<(), String> {
     let name = args
         .next()
         .and_then(|arg| arg.into_string().ok())
-        .ok_or(USAGE)?;
+        .ok_or_else(usage)?;
     if name == "--help" || name == "-h" {
-        println!("{USAGE}");
+        println!("{}", usage());
         return Ok(());
     }
     if name != "all" && !SCENARIOS.iter().any(|(scenario, _)| scenario.name == name) {
-        return Err(format!("unknown scenario {name:?}\n{USAGE}"));
+        return Err(format!("unknown scenario {name:?}\n{}", usage()));
     }
 
     let mut json = None;
@@ -42,7 +49,7 @@ fn run() -> Result<(), String> {
                 // Prototype initialization changes the process working directory.
                 json = Some(std::path::absolute(Path::new(&path)).map_err(|err| err.to_string())?);
             }
-            _ => return Err(format!("unexpected argument {arg:?}\n{USAGE}")),
+            _ => return Err(format!("unexpected argument {arg:?}\n{}", usage())),
         }
     }
 

@@ -34,7 +34,7 @@ use crate::world::{CompanyEnt, FreightStationEnt, HumanEnt, TrainEnt, VehicleEnt
 use crate::World;
 use crate::{
     add_souls_to_empty_buildings, utils, ParCommandBuffer, RandProvider, Replay, RunnableSystem,
-    Simulation, SimulationOptions, RNG_SEED,
+    Simulation, SimulationOptions, INITIAL_TICK, RNG_SEED,
 };
 
 pub fn init() {
@@ -118,7 +118,7 @@ fn register_systems_and_resources() {
     register_resource_default::<crate::economy::Budget, Bincode>("budget");
     register_resource_default::<ParkingManagement, Bincode>("pmanagement");
     register_resource_default::<BuildingInfos, Bincode>("binfos");
-    register_resource::<GameTime, Bincode>("game_time", || GameTime::new(Tick(1)));
+    register_resource::<GameTime, Bincode>("game_time", || GameTime::new(Tick(INITIAL_TICK)));
     register_transport_grid();
     register_resource::<RandProvider, Bincode>("randprovider", || RandProvider::new(RNG_SEED));
     register_resource_default::<Dispatcher, Bincode>("dispatcher");

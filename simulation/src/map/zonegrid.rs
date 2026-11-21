@@ -18,6 +18,8 @@ pub struct ZoneCell {
 #[derive(Default, Serialize, Deserialize)]
 pub struct ZoneGrid {
     pub cells: BTreeMap<(i32, i32), ZoneCell>,
+    /// Changes once for each paint or unzone that changes the grid.
+    pub generation: u64,
 }
 
 impl ZoneGrid {
@@ -35,11 +37,18 @@ impl ZoneGrid {
             return;
         }
 
+        let mut changed = false;
         for key in cells {
-            match kind {
-                Some(kind) => self.cells.insert(key, ZoneCell { kind, density }),
-                None => self.cells.remove(&key),
+            changed |= match kind {
+                Some(kind) => {
+                    let cell = ZoneCell { kind, density };
+                    self.cells.insert(key, cell) != Some(cell)
+                }
+                None => self.cells.remove(&key).is_some(),
             };
+        }
+        if changed {
+            self.generation = self.generation.wrapping_add(1);
         }
     }
 
@@ -79,11 +88,21 @@ impl ZoneGrid {
 }
 
 fn paint_cells(area: &OBB) -> Option<impl Iterator<Item = (i32, i32)> + '_> {
+    let [a, b] = area.axis();
+    let axis_lengths = a.mag() * b.mag();
+    // Allow rounding in rotated rectangles stored as world-space f32 coordinates.
+    let corner_scale = area.corners.iter().fold(1.0_f32, |scale, corner| {
+        scale.max(corner.x.abs()).max(corner.y.abs())
+    });
+    let corner_tolerance = 4.0 * f32::EPSILON * corner_scale;
+    let valid_rectangle = axis_lengths > 0.0
+        && a.dot(b).abs() <= 0.001 * axis_lengths
+        && (area.corners[2] - area.corners[0]).is_close(a + b, corner_tolerance);
     let valid_size = area.segments().iter().all(|side| {
         let length_squared = (side.dst - side.src).mag2();
         length_squared <= MAX_PAINT_SIDE * MAX_PAINT_SIDE
     });
-    valid_size.then(|| cells_under(area).take(MAX_PAINT_CELLS + 1))
+    (valid_rectangle && valid_size).then(|| cells_under(area).take(MAX_PAINT_CELLS + 1))
 }
 
 fn cells_under(area: &OBB) -> impl Iterator<Item = (i32, i32)> + '_ {
@@ -126,6 +145,19 @@ mod tests {
 
         let rejected = vec![("ZonePaint", Rejection::InvalidZone)];
         for area in [
+            OBB::new_corners([
+                vec2(8.0, 8.0),
+                vec2(40.0, 8.0),
+                vec2(56.0, 40.0),
+                vec2(24.0, 40.0),
+            ]),
+            OBB::new(vec2(12.0, 12.0), Vec2::X, 0.0, 8.0),
+            OBB::new_corners([
+                vec2(8.0, 8.0),
+                vec2(40.0, 8.0),
+                vec2(44.0, 40.0),
+                vec2(8.0, 40.0),
+            ]),
             OBB::new(vec2(f32::NAN, 252.0), Vec2::X, 8.0, 8.0),
             OBB::new(Vec2::splat(252.0), Vec2::X, f32::MAX, f32::MAX),
             OBB::new(Vec2::splat(252.0), Vec2::X, 401.0, 8.0),
@@ -235,5 +267,25 @@ mod tests {
 
         let misses_centres = OBB::new(vec2(-8.0, 4.0), Vec2::X, 7.0, 8.0);
         assert_eq!(grid.lot_zone(&misses_centres), None);
+    }
+
+    #[test]
+    fn generation_changes_only_on_effective_paints() {
+        let mut grid = ZoneGrid::default();
+        let area = OBB::new(vec2(16.0, 16.0), Vec2::X, 16.0, 16.0);
+        let zone = Some(ZoneKind::Residential);
+        for (kind, density, generation) in [
+            (None, Density::Low, 0),
+            (zone, Density::Low, 1),
+            (zone, Density::Low, 1),
+            (zone, Density::High, 2),
+            (Some(ZoneKind::Commercial), Density::High, 3),
+            (None, Density::Low, 4),
+            (None, Density::High, 4),
+        ] {
+            grid.paint(area, kind, density);
+            assert_eq!(grid.generation, generation);
+        }
+        assert!(grid.cells.is_empty());
     }
 }

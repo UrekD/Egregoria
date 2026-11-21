@@ -4,7 +4,12 @@
   {"Builder": "place_company"},
   {"Builder": "fill_houses"},
   {"RunTicks": 3000},
+  {"OpenWindow": "Budget"},
   {"WaitFrames": 8},
+  {"DumpState": "tax-before-drag"},
+  {"Pointer": {"action": {"Drag": {"to": {"screen_pos": [804, 276]}}}, "screen_pos": [737, 276]}},
+  {"DumpState": "tax-after-drag"},
+  {"RunTicks": 18000},
   {"Screenshot": "budget"},
   {"DumpState": "budget"},
   "Exit"

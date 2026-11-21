@@ -17,7 +17,7 @@ use crate::world_command::{CommandOutcomes, Rejection};
 use crate::{SaveHeader, Simulation, SimulationSer, SoulID, WorldCommand, START_COMMANDS, VERSION};
 use common::saveload::{CompressedBincode, Encoder, JSON};
 use geom::{vec2, vec3, Polygon, OBB};
-use prototypes::{BuildingGen, GoodsCompanyID, ItemID, Money, RollingStockID};
+use prototypes::{GoodsCompanyID, ItemID, Money, RollingStockID};
 
 fn street(test: &TestCtx) {
     test.build_roads(&[

@@ -127,7 +127,21 @@ mod tests {
 
     fn company(test: &mut TestCtx, x: f32, name: &str) -> (BuildingID, CompanyID) {
         let proto = GoodsCompanyID::new(name).prototype();
-        let building = place(test, x, BuildingKind::GoodsCompany(proto.id), proto.bgen);
+        let road = test.g.map().roads().keys().last().unwrap();
+        let kind = BuildingKind::GoodsCompany(proto.id);
+        // The routing fixtures need the store and nearby house at fixed positions.
+        let building = test
+            .g
+            .map_mut()
+            .build_special_building(
+                &OBB::new(vec2(x, 145.0), Vec2::X, 20.0, 20.0),
+                kind,
+                proto.bgen,
+                None,
+                Some(road),
+            )
+            .expect("test company placed");
+        crate::souls::growth::on_growable_placed(&test.g, building, kind);
         test.tick_fast();
         let Some(SoulID::GoodsCompany(id)) = test.g.read::<BuildingInfos>().owner(building) else {
             panic!("company soul missing for {name}");
@@ -304,5 +318,53 @@ mod tests {
                 "{name} is a growable"
             );
         }
+    }
+
+    #[test]
+    fn special_building_command_rejects_growables() {
+        use crate::economy::{Budget, Government};
+        use crate::world_command::{CommandOutcomes, Rejection};
+
+        let mut test = city_street();
+        let buildings = test.g.map().buildings().len();
+        let opening = test.g.read::<Government>().money;
+        let ledger = test.g.read::<Budget>().days().clone();
+        for name in ["industrial-l1", "commercial-l1", "office-l1"] {
+            let proto = GoodsCompanyID::new(name).prototype();
+            test.g
+                .apply_commands([&WorldCommand::MapBuildSpecialBuilding {
+                    pos: OBB::new(vec2(160.0, 145.0), Vec2::X, 20.0, 20.0),
+                    kind: BuildingKind::GoodsCompany(proto.id),
+                    gen: proto.bgen,
+                    zone: None,
+                    connected_road: None,
+                }]);
+            assert_eq!(
+                test.g.read::<CommandOutcomes>().last,
+                [("MapBuildSpecialBuilding", Rejection::InvalidBuilding)],
+                "{name}"
+            );
+        }
+        assert_eq!(test.g.map().buildings().len(), buildings);
+        assert_eq!(test.g.read::<Government>().money, opening);
+        assert_eq!(*test.g.read::<Budget>().days(), ledger);
+    }
+
+    #[test]
+    fn assigning_work_consumes_pending_hire() {
+        let mut test = city_street();
+        let house = test.build_house_near(vec2(155.0, 122.0));
+        let human = crate::souls::human::spawn_human(&mut test.g, house).unwrap();
+        let (building, _) = company(&mut test, 230.0, "commercial-l1");
+        test.tick_fast();
+        let jobs = ItemID::new("job-opening");
+        let resident = test.g.get(human).unwrap();
+        assert!(resident.work.is_none());
+        assert_eq!(resident.bought.0[&jobs].len(), 1);
+
+        test.tick_fast();
+        let resident = test.g.get(human).unwrap();
+        assert_eq!(resident.work.as_ref().unwrap().workplace, building);
+        assert!(resident.bought.0.get(&jobs).is_none_or(Vec::is_empty));
     }
 }

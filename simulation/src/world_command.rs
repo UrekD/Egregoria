@@ -349,10 +349,13 @@ impl WorldCommand {
                     return Err(Rejection::InvalidBuilding);
                 }
                 let zoneable = match *kind {
-                    BuildingKind::GoodsCompany(id) => try_prototype(id)
-                        .ok_or(Rejection::MissingReference)?
-                        .zone
-                        .is_some(),
+                    BuildingKind::GoodsCompany(id) => {
+                        let proto = try_prototype(id).ok_or(Rejection::MissingReference)?;
+                        if id.is_growable() {
+                            return Err(Rejection::InvalidBuilding);
+                        }
+                        proto.zone.is_some()
+                    }
                     BuildingKind::RailFreightStation(id) => {
                         try_prototype(id).ok_or(Rejection::MissingReference)?;
                         false
@@ -563,7 +566,11 @@ impl WorldCommand {
                     .ok_or(Rejection::MutationFailed)?;
                 sim.write::<BuildingInfos>().insert(id);
             }
-            SetGameTime(gt) => *sim.write::<GameTime>() = gt,
+            SetGameTime(gt) => {
+                let mut time = sim.write::<GameTime>();
+                sim.write::<Budget>().shift_clock(time.tick, gt.tick);
+                *time = gt;
+            }
             ZonePaint {
                 area,
                 kind,

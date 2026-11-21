@@ -167,6 +167,13 @@ mod tests {
         crate::utils::scheduler::drain_commands(sim);
     }
 
+    fn place_store(sim: &Simulation, lot: LotID) -> BuildingID {
+        let kind = BuildingKind::GoodsCompany(prototypes::GoodsCompanyID::new("commercial-l1"));
+        let building = sim.map_mut().place_growable(lot, kind).unwrap();
+        on_growable_placed(sim, building, kind);
+        building
+    }
+
     #[test]
     fn p1b_growth_and_residence_lifecycle() {
         let mut test = street();
@@ -230,24 +237,7 @@ mod tests {
             add_souls_to_empty_buildings(&mut test.g);
         }
         let lot = test.g.map().lots().keys().next().unwrap();
-        let shape = test.g.map().get(lot).unwrap().shape;
-        let store = prototypes::GoodsCompanyID::new("commercial-l1");
-        test.apply(&[WorldCommand::MapBuildSpecialBuilding {
-            pos: shape,
-            kind: BuildingKind::GoodsCompany(store),
-            gen: store.prototype().bgen,
-            zone: None,
-            connected_road: None,
-        }]);
-        let store = test
-            .g
-            .map()
-            .buildings()
-            .iter()
-            .find_map(|(id, building)| {
-                (building.kind == BuildingKind::GoodsCompany(store)).then_some(id)
-            })
-            .unwrap();
+        let store = place_store(&test.g, lot);
 
         for human in test.g.world_mut_unchecked().humans.values_mut() {
             human.work = Some(Work::new(store, WorkKind::Worker, 0.0));
@@ -283,15 +273,7 @@ mod tests {
         add_souls_to_empty_buildings(&mut test.g);
         residential_demand(&test.g, 0.0);
         let lot = test.g.map().lots().keys().next().unwrap();
-        let shape = test.g.map().get(lot).unwrap().shape;
-        let store = prototypes::GoodsCompanyID::new("commercial-l1");
-        test.apply(&[WorldCommand::MapBuildSpecialBuilding {
-            pos: shape,
-            kind: BuildingKind::GoodsCompany(store),
-            gen: store.prototype().bgen,
-            zone: None,
-            connected_road: None,
-        }]);
+        place_store(&test.g, lot);
         add_souls_to_empty_buildings(&mut test.g);
         let company = test.g.world().companies.keys().next().unwrap();
         let workplace = test.g.get(company).unwrap().comp.building;

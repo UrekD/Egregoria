@@ -182,6 +182,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
     let market: &Market = &res.read();
     let map: &Map = &res.read();
     let elec_flow: &ElectricityFlow = &res.read();
+    let job_opening = ItemID::new("job-opening");
     let retail_goods = ItemID::new("retail-goods");
 
     world.companies.iter_mut().for_each(|(me, c)| {
@@ -308,6 +309,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                         return;
                     };
                     w.work = Some(Work::new(b, kind, offset));
+                    w.bought.0.remove(&job_opening);
                 });
             }
         }

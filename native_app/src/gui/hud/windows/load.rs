@@ -130,6 +130,8 @@ impl super::GUIWindows {
     pub(crate) fn window_states(&mut self) -> impl Iterator<Item = (&'static str, &mut bool)> {
         [
             ("Economy", &mut self.economy_open),
+            ("Budget", &mut self.budget_open),
+            ("City Stats", &mut self.citystats_open),
             ("Settings", &mut self.settings_open),
             ("Load", &mut self.load_open),
             #[cfg(feature = "multiplayer")]

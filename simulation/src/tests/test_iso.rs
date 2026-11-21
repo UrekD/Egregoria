@@ -1,12 +1,11 @@
 use super::{init_test_simulation, TestCtx};
 use crate::map::{LaneKind, LanePatternBuilder, Map, MapProject, ProjectKind, Tree};
 use crate::transportation::{TransportGrid, TransportState};
-use crate::utils::replay::ReplayJson;
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::WorldCommand;
 use crate::World;
 use crate::{Replay, Simulation, SimulationOptions};
-use common::saveload::{Bincode, Encoder, JSONPretty};
+use common::saveload::{Bincode, Encoder, JSONPretty, JSON};
 use geom::{vec2, vec3};
 use quickcheck::{Arbitrary, Gen, TestResult};
 
@@ -244,20 +243,18 @@ fn quickcheck_map_ser() {
 #[test]
 fn p1_spine_growth_resources_round_trip() {
     use crate::economy::{Budget, BudgetCategory, ZoneDemand};
-    use crate::map::{Density, ZoneCell, ZoneGrid, ZoneKind};
+    use crate::map::{Density, ZoneGrid, ZoneKind};
     use crate::souls::residence::{Residence, Residences};
     use prototypes::{Money, ResidencePrototypeID};
 
     let ctx = TestCtx::new_fast();
     ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
     let house = ctx.build_house_near(vec2(150.0, 125.0));
-    ctx.g.write::<ZoneGrid>().cells.insert(
-        (1, 2),
-        ZoneCell {
-            kind: ZoneKind::Residential,
-            density: Density::Low,
-        },
-    );
+    let area = ctx.g.map().get(house).unwrap().obb;
+    ctx.g
+        .write::<ZoneGrid>()
+        .paint(area, Some(ZoneKind::Residential), Density::Low);
+    assert_eq!(ctx.g.read::<ZoneGrid>().generation, 1);
     ctx.g.write::<Residences>().by_building.insert(
         house,
         Residence {
@@ -271,9 +268,11 @@ fn p1_spine_growth_resources_round_trip() {
         .write::<ZoneDemand>()
         .values
         .insert(ZoneKind::Residential, 40.0);
-    ctx.g
-        .write::<Budget>()
-        .record(BudgetCategory::TradeExport, Money::new_cents(1));
+    Budget::apply(
+        &ctx.g.resources,
+        BudgetCategory::TradeExport,
+        Money::new_cents(1),
+    );
 
     let encoded = Bincode::encode(&ctx.g).unwrap();
     let decoded: Simulation = Bincode::decode(&encoded).unwrap();
@@ -417,11 +416,28 @@ fn transport_grid_hash_survives_save_with_sparse_cells() {
 }
 
 #[test]
+#[should_panic(expected = "Replay has version \"0.7.0\"")]
+fn public_replay_playback_rejects_version_0_7_0() {
+    init_test_simulation();
+    let replay: Replay = JSON::decode(
+        br#"{
+        "commands": [[1, {"SetTaxRate": {"zone": "Residential", "rate_permille": 290}}]],
+        "enabled": true,
+        "last_tick_recorded": 1,
+        "version": "0.7.0"
+    }"#,
+    )
+    .unwrap();
+    let _ = Simulation::from_replay(replay);
+}
+
+#[test]
 fn test_world_survives_serde() {
     init_test_simulation();
     //common::logger::MyLog::init();
 
-    let replay: Replay = ReplayJson::decode(REPLAY).unwrap();
+    let mut replay: Replay = JSON::decode(REPLAY).unwrap();
+    replay.version = crate::VERSION.to_owned();
     let mut s = SeqSchedule::default();
 
     let mut check_size = 1024;
