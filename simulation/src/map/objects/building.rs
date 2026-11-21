@@ -44,7 +44,7 @@ pub struct StraightRoadGen {
 }
 
 pub const MAX_ZONE_AREA: f32 = 50000.0; // in m²
-const MAX_ZONE_PERIMETER: f32 = 3000.0;
+pub const MAX_ZONE_PERIMETER: f32 = 3000.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
@@ -63,16 +63,35 @@ impl Zone {
         Self {
             area: p.area(),
             poly: p,
-            filldir,
+            filldir: Self::normalize_fill_direction(filldir).unwrap_or(filldir),
         }
+    }
+
+    pub fn unit_fill_direction(&self) -> Option<Vec2> {
+        Self::normalize_fill_direction(self.filldir)
+    }
+
+    fn normalize_fill_direction(dir: Vec2) -> Option<Vec2> {
+        let scale = dir.x.abs().max(dir.y.abs());
+        if !dir.is_finite() || scale < f32::MIN_POSITIVE {
+            return None;
+        }
+        // Scale first so squaring a large or small component stays representable.
+        // Divide component-wise because Vec2 division multiplies by the reciprocal.
+        Some(Vec2::new(dir.x / scale, dir.y / scale).normalize())
+    }
+
+    pub(crate) fn normalized(mut self) -> Option<Self> {
+        self.area = self.validated_area()?;
+        self.filldir = self.unit_fill_direction()?;
+        Some(self)
     }
 
     pub(crate) fn validated_area(&self) -> Option<f32> {
         let area = self.poly.area();
         let perimeter = self.poly.perimeter();
         (self.poly.len() >= 3
-            && self.filldir.is_finite()
-            && self.filldir.mag2() > 0.0
+            && self.unit_fill_direction().is_some()
             && self.poly.iter().all(|point| point.is_finite())
             && area > 0.0
             && area <= MAX_ZONE_AREA

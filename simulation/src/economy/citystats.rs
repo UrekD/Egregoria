@@ -114,6 +114,7 @@ mod tests {
     use super::{CityStats, CityStatsSample, SAMPLES_PER_LEVEL};
     use crate::economy::Government;
     use crate::map::BuildingKind;
+    use crate::map_dynamic::BuildingInfos;
     use crate::tests::TestCtx;
     use crate::world_command::WorldCommand;
     use common::saveload::{Bincode, Encoder};
@@ -146,16 +147,22 @@ mod tests {
     #[test]
     fn citystats_counts_new_resident_on_sampling_tick() {
         let mut ctx = TestCtx::new();
-        ctx.apply(&[
-            WorldCommand::SetGameTime(GameTime::new(Tick(TICKS_PER_MINUTE - 1))),
-            WorldCommand::MapBuildSpecialBuilding {
-                pos: OBB::new(vec2(128.0, 128.0), Vec2::X, 12.0, 12.0),
-                kind: BuildingKind::House,
-                gen: BuildingGen::House,
-                zone: None,
-                connected_road: None,
-            },
-        ]);
+        ctx.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(
+            TICKS_PER_MINUTE - 1,
+        )))]);
+        // This fixture needs an isolated house so its resident has no parking.
+        let house = ctx
+            .g
+            .map_mut()
+            .build_special_building(
+                &OBB::new(vec2(128.0, 128.0), Vec2::X, 12.0, 12.0),
+                BuildingKind::House,
+                BuildingGen::House,
+                None,
+                None,
+            )
+            .unwrap();
+        ctx.g.write::<BuildingInfos>().insert(house);
 
         for _ in 0..TICKS_PER_MINUTE {
             ctx.tick();

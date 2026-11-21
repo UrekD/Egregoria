@@ -26,7 +26,7 @@ pub fn inspect_vehicle(uiworld: &UiWorld, sim: &Simulation, id: VehicleID) -> bo
         }
 
         match v.vehicle.state {
-            VehicleState::Parked(_) => {
+            VehicleState::Parked(_) | VehicleState::ParkedAtDepot => {
                 textc(on_secondary_container(), "Parked");
             }
             VehicleState::Driving => {
@@ -37,6 +37,9 @@ pub fn inspect_vehicle(uiworld: &UiWorld, sim: &Simulation, id: VehicleID) -> bo
             }
             VehicleState::Panicking(_) => {
                 textc(on_secondary_container(), "Panicking");
+            }
+            VehicleState::ReturningToDepot { .. } => {
+                textc(on_secondary_container(), "Returning to depot");
             }
             VehicleState::RoadToPark(_, _, _) => {
                 textc(on_secondary_container(), "Parking");

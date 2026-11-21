@@ -1041,10 +1041,11 @@ impl GfxContext {
         drop(mapped);
         buffer.unmap();
 
-        if bgra {
-            for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.chunks_exact_mut(4) {
+            if bgra {
                 pixel.swap(0, 2);
             }
+            pixel[3] = 255;
         }
         let write_png = || -> image::ImageResult<()> {
             use image::ImageEncoder;

@@ -145,27 +145,33 @@ impl ScenarioCtx {
     }
 
     fn resume(self) -> Result<Self, String> {
-        // The public save API uses compressed Bincode under world/. Reserve a
-        // private directory so concurrent runs cannot overwrite each other's saves.
+        // Reserve a private directory so concurrent runs cannot share a midpoint save.
         static NEXT_SAVE: AtomicUsize = AtomicUsize::new(0);
-        fs::create_dir_all("world").map_err(|err| format!("could not create world/: {err}"))?;
+        let save_dir = simulation::save_dir();
+        fs::create_dir_all(save_dir)
+            .map_err(|err| format!("could not create {}: {err}", save_dir.display()))?;
         let (directory, path) = loop {
             let id = NEXT_SAVE.fetch_add(1, Ordering::Relaxed);
             let directory = format!("scenarios-resume-{}-{id}", std::process::id());
-            let path = format!("world/{directory}");
+            let path = save_dir.join(&directory);
             match fs::create_dir(&path) {
                 Ok(()) => break (directory, path),
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => continue,
-                Err(err) => return Err(format!("could not create {path}: {err}")),
+                Err(err) => return Err(format!("could not create {}: {err}", path.display())),
             }
         };
 
         let name = format!("{directory}/midpoint");
         self.sim.save_to_disk(&name);
         let sim = Simulation::load_from_disk(&name);
-        fs::remove_dir_all(&path).map_err(|err| format!("could not remove {path}: {err}"))?;
-        let sim = sim
-            .ok_or_else(|| format!("could not round-trip save at tick {}", self.sim.get_tick()))?;
+        fs::remove_dir_all(&path)
+            .map_err(|err| format!("could not remove {}: {err}", path.display()))?;
+        let sim = sim.map_err(|err| {
+            format!(
+                "could not round-trip save at tick {}: {err}",
+                self.sim.get_tick()
+            )
+        })?;
         Ok(Self::from_sim(sim))
     }
 

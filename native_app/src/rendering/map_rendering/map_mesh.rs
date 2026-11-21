@@ -510,23 +510,26 @@ impl MapBuilders {
         hull.simplify();
         hull.scale_from(hull.barycenter(), 1.8);
 
-        let principal_axis = building.obb.axis()[0].normalize().rotated_by(bzone.filldir);
+        let Some(filldir) = bzone.unit_fill_direction() else {
+            return;
+        };
+        let principal_axis = building.obb.axis()[0].normalize().rotated_by(filldir);
 
-        let Some((mut min, mut max)) =
-            minmax(zone.iter().map(|x| x.rotated_by(principal_axis.flipy())))
+        let Some((min, max)) = minmax(zone.iter().map(|x| x.rotated_by(principal_axis.flipy())))
         else {
             return;
         };
-        min = min.rotated_by(principal_axis);
-        max = max.rotated_by(principal_axis);
-
+        let extent = max - min;
+        if !extent.is_finite() {
+            return;
+        }
+        let min = min.rotated_by(principal_axis);
         let secondary_axis = -principal_axis.perpendicular();
 
-        let principal_dist = (max - min).dot(principal_axis).abs();
-        let secondary_dist = (max - min).dot(secondary_axis).abs();
-
-        for principal_offset in (0..=(principal_dist as i32)).step_by(4) {
-            for secondary_offset in (0..=(secondary_dist as i32)).step_by(4) {
+        // No valid zone can span more than half its perimeter in any direction.
+        let limit = simulation::map::MAX_ZONE_PERIMETER * 0.5;
+        for principal_offset in (0..=extent.x.min(limit) as i32).step_by(4) {
+            for secondary_offset in (0..=extent.y.min(limit) as i32).step_by(4) {
                 let mut pos = min
                     + principal_axis * principal_offset as f32
                     + secondary_axis * secondary_offset as f32;

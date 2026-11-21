@@ -1,6 +1,5 @@
 use crate::map::electricity_cache::ElectricityCache;
 use crate::map::height_override::find_overrides;
-use crate::map::serializing::SerializedMap;
 use crate::map::{
     Building, BuildingID, BuildingKind, Environment, Intersection, IntersectionID, Lane, LaneID,
     LaneKind, LanePattern, Lot, LotID, LotKind, MapSubscriber, MapSubscribers, ParkingSpotID,
@@ -12,7 +11,8 @@ use geom::{PolyLine3, Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use prototypes::{BuildingGen, Tick};
 use serde::{Deserialize, Serialize};
-use slotmapd::HopSlotMap;
+use slotmapd::{HopSlotMap, Key};
+use std::collections::BTreeMap;
 
 pub type Roads = HopSlotMap<RoadID, Road>;
 pub type Lanes = HopSlotMap<LaneID, Lane>;
@@ -24,6 +24,26 @@ pub type Lots = HopSlotMap<LotID, Lot>;
 pub struct MapProject {
     pub pos: Vec3,
     pub kind: ProjectKind,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct ConnectionEndpoint {
+    pub pos: Vec3,
+    kind: ProjectKind,
+    split_point: Option<(Vec3, usize)>,
+}
+
+pub(crate) struct RoadSplit {
+    pub original: RoadID,
+    pub junction: IntersectionID,
+    roads: [RoadID; 2],
+}
+
+pub(crate) struct ConnectedRoad {
+    pub src: IntersectionID,
+    pub dst: IntersectionID,
+    pub road: RoadID,
+    pub splits: [Option<RoadSplit>; 2],
 }
 
 pub struct Map {
@@ -41,8 +61,6 @@ pub struct Map {
     pub subscribers: MapSubscribers,
     pub(crate) override_subscriber: MapSubscriber,
 }
-
-defer_serialize!(Map, SerializedMap);
 
 impl Default for Map {
     fn default() -> Self {
@@ -147,18 +165,88 @@ impl Map {
         Some(b)
     }
 
-    pub(crate) fn can_connect(
+    pub(crate) fn resolve_connection_endpoint(
         &self,
-        from: MapProject,
-        to: MapProject,
+        project: MapProject,
+    ) -> Option<ConnectionEndpoint> {
+        let mut split_point = None;
+        let pos = match project.kind {
+            ProjectKind::Ground => project.pos,
+            ProjectKind::Intersection(id) => self.get(id)?.pos,
+            ProjectKind::Road(id) => {
+                if !project.pos.is_finite() {
+                    return None;
+                }
+                let (point, segment) = self.road_split_point(id, project.pos)?;
+                split_point = Some((point, segment));
+                point - Vec3::z(ROAD_Z_OFFSET)
+            }
+            ProjectKind::Building(_) | ProjectKind::Lot(_) => return None,
+        };
+        pos.is_finite().then_some(ConnectionEndpoint {
+            pos,
+            kind: project.kind,
+            split_point,
+        })
+    }
+
+    pub(crate) fn reproject_split_endpoint(
+        &self,
+        original: RoadID,
+        pos: Vec3,
+        splits: &BTreeMap<RoadID, RoadSplit>,
+    ) -> Option<ConnectionEndpoint> {
+        if !pos.is_finite() {
+            return None;
+        }
+        let mut best = None;
+        let mut remaining = vec![original];
+        let mut consider = |endpoint: ConnectionEndpoint| {
+            let surface = endpoint.pos + Vec3::z(ROAD_Z_OFFSET);
+            let id = match endpoint.kind {
+                ProjectKind::Intersection(id) => id.data(),
+                ProjectKind::Road(id) => id.data(),
+                _ => unreachable!(),
+            };
+            let key = (OrderedFloat(surface.distance2(pos)), id, endpoint.kind);
+            if best.as_ref().is_none_or(|&(previous, _)| key < previous) {
+                best = Some((key, endpoint));
+            }
+        };
+        while let Some(id) = remaining.pop() {
+            if let Some(split) = splits.get(&id) {
+                remaining.extend(split.roads);
+                if let Some(junction) = self.get(split.junction) {
+                    if junction.pos.xy().distance(pos.xy()) <= junction.radius {
+                        if let Some(endpoint) = self.resolve_connection_endpoint(MapProject {
+                            pos,
+                            kind: ProjectKind::Intersection(split.junction),
+                        }) {
+                            consider(endpoint);
+                        }
+                    }
+                }
+            } else if let Some(road) = self.get(id) {
+                if let Some(endpoint) = self.resolve_connection_endpoint(MapProject {
+                    pos,
+                    kind: ProjectKind::Road(id),
+                }) {
+                    if endpoint.pos.xy().distance(pos.xy()) <= road.width * 0.5 {
+                        consider(endpoint);
+                    }
+                }
+            }
+        }
+        best.map(|(_, endpoint)| endpoint)
+    }
+
+    pub(crate) fn can_connect(
+        from: ConnectionEndpoint,
+        to: ConnectionEndpoint,
         interpoint: Option<Vec2>,
         pattern: &LanePattern,
     ) -> bool {
-        if !from.pos.is_finite()
-            || !to.pos.is_finite()
-            || interpoint.is_some_and(|point| !point.is_finite())
-            || pattern.lanes().next().is_none()
-        {
+        if interpoint.is_some_and(|point| !point.is_finite()) || pattern.lanes().next().is_none() {
             return false;
         }
         for lanes in [&pattern.lanes_forward, &pattern.lanes_backward] {
@@ -171,23 +259,11 @@ impl Map {
                 return false;
             }
         }
-        // Each split removes its source road. Both endpoints must still be resolvable
-        // after resolving the first one.
+        // Each split removes its source road, so the endpoints cannot name the same road.
         if from.kind == to.kind && from.kind != ProjectKind::Ground {
             return false;
         }
-        let endpoint = |project: MapProject| match project.kind {
-            ProjectKind::Ground => Some(project.pos),
-            ProjectKind::Intersection(id) => self.get(id).map(|inter| inter.pos),
-            ProjectKind::Road(id) => self
-                .road_split_point(id, project.pos)
-                .map(|(point, _)| point - Vec3::z(ROAD_Z_OFFSET)),
-            ProjectKind::Building(_) | ProjectKind::Lot(_) => None,
-        };
-        let Some((src, dst)) = endpoint(from).zip(endpoint(to)) else {
-            return false;
-        };
-        let distance = src.xy().distance(dst.xy());
+        let distance = from.pos.xy().distance(to.pos.xy());
         distance.is_finite() && distance >= 1.0
     }
 
@@ -215,50 +291,69 @@ impl Map {
         interpoint: Option<Vec2>,
         pattern: &LanePattern,
     ) -> Option<(IntersectionID, RoadID)> {
-        let (from_id, to_id, road) = self.connect_projects(from, to, interpoint, pattern)?;
-        self.merge_shallow_junction(from_id);
-        self.merge_shallow_junction(to_id);
+        let from = self.resolve_connection_endpoint(from)?;
+        let to = self.resolve_connection_endpoint(to)?;
+        if !Self::can_connect(from, to, interpoint, pattern) {
+            return None;
+        }
+        Some(self.make_resolved_connection(from, to, interpoint, pattern))
+    }
+
+    pub(crate) fn make_resolved_connection(
+        &mut self,
+        from: ConnectionEndpoint,
+        to: ConnectionEndpoint,
+        interpoint: Option<Vec2>,
+        pattern: &LanePattern,
+    ) -> (IntersectionID, RoadID) {
+        let connected = self.connect_projects(from, to, interpoint, pattern);
+        self.merge_shallow_junction(connected.src);
+        self.merge_shallow_junction(connected.dst);
         self.check_invariants();
-        Some((to_id, road))
+        (connected.dst, connected.road)
     }
 
     pub(crate) fn connect_projects(
         &mut self,
-        from: MapProject,
-        to: MapProject,
+        from: ConnectionEndpoint,
+        to: ConnectionEndpoint,
         interpoint: Option<Vec2>,
         pattern: &LanePattern,
-    ) -> Option<(IntersectionID, IntersectionID, RoadID)> {
-        if !self.can_connect(from, to, interpoint, pattern) {
-            return None;
-        }
-        info!("make_connection {:?} {:?} {:?}", from, to, interpoint);
-
+    ) -> ConnectedRoad {
         let connection_segment = match interpoint {
             Some(x) => RoadSegmentKind::from_elbow(from.pos.xy(), to.pos.xy(), x),
             None => RoadSegmentKind::Straight,
         };
 
-        let mut mk_inter = |proj: MapProject| {
-            Some(match proj.kind {
-                ProjectKind::Ground => self.add_intersection(proj.pos),
-                ProjectKind::Intersection(id) => id,
-                ProjectKind::Road(id) => self.split_road(id, proj.pos)?,
-                ProjectKind::Building(_) | ProjectKind::Lot(_) => unreachable!(),
-            })
+        let mut mk_inter = |endpoint: ConnectionEndpoint| match endpoint.kind {
+            ProjectKind::Ground => (self.add_intersection(endpoint.pos), None),
+            ProjectKind::Intersection(id) => (id, None),
+            ProjectKind::Road(id) => {
+                let (point, segment) = endpoint.split_point.expect("resolved road split point");
+                let split = self
+                    .split_road(id, point, segment)
+                    .expect("validated road split");
+                (split.junction, Some(split))
+            }
+            ProjectKind::Building(_) | ProjectKind::Lot(_) => unreachable!(),
         };
 
-        let from_id = mk_inter(from).expect("validated connection start");
-        let to_id = mk_inter(to).expect("validated connection end");
-        let r = self
-            .connect(from_id, to_id, pattern, connection_segment)
+        let (src, from_split) = mk_inter(from);
+        let (dst, to_split) = mk_inter(to);
+        let road = self
+            .connect(src, dst, pattern, connection_segment)
             .expect("validated connection intersections");
 
-        self.invalidate(from_id);
-        self.invalidate(to_id);
+        self.invalidate(src);
+        self.invalidate(dst);
 
-        info!("connected {:?} {:?}: {:?}", from_id, to_id, r);
-        Some((from_id, to_id, r))
+        info!("connected {:?} {:?}: {:?}", src, dst, road);
+        ConnectedRoad {
+            src,
+            dst,
+            road,
+            splits: [from_split, to_split],
+        }
     }
 
     pub(crate) fn merge_shallow_junction(&mut self, id: IntersectionID) {
@@ -275,17 +370,13 @@ impl Map {
         }
     }
 
-    pub fn update_zone(&mut self, id: BuildingID, f: impl FnOnce(&mut Zone)) {
-        let Some(b) = self.buildings.get_mut(id) else {
-            return;
-        };
+    pub fn update_zone(&mut self, id: BuildingID, zone: Zone) -> Option<()> {
+        let zone = zone.normalized()?;
+        let b = self.buildings.get_mut(id)?;
+        *b.zone.as_mut()? = zone;
         self.subscribers.dispatch(UpdateType::Building, b);
 
-        let Some(ref mut z) = b.zone else {
-            return;
-        };
-        f(z);
-
+        let z = b.zone.as_ref().unwrap();
         self.environment.remove_trees_near(&z.poly, |tree_chunk| {
             self.subscribers
                 .dispatch_chunk(UpdateType::Terrain, tree_chunk)
@@ -300,7 +391,8 @@ impl Map {
 
         self.clean_lots_inner(toclean);
 
-        self.check_invariants()
+        self.check_invariants();
+        Some(())
     }
 
     pub fn build_special_building(
@@ -311,6 +403,10 @@ impl Map {
         zone: Option<Zone>,
         connected_road: Option<RoadID>,
     ) -> Option<BuildingID> {
+        let zone = match zone {
+            Some(zone) => Some(zone.normalized()?),
+            None => None,
+        };
         if self.building_overlaps(*obb) {
             log::warn!("did not build {:?}: building overlaps", kind);
             return None;
@@ -542,14 +638,14 @@ impl Map {
     }
 
     #[allow(clippy::collapsible_else_if)]
-    pub(crate) fn split_road(
+    fn split_road(
         &mut self,
         split_road_id: RoadID,
         pos: Vec3,
-    ) -> Option<IntersectionID> {
+        segment: usize,
+    ) -> Option<RoadSplit> {
         info!("split_road {:?} {:?}", split_road_id, pos);
 
-        let (pos, segment) = self.road_split_point(split_road_id, pos)?;
         let pat = self.roads.get(split_road_id)?.pattern(&self.lanes);
         let r = self.remove_raw_road(split_road_id)?;
         self.subscribers.dispatch(UpdateType::Road, &r);
@@ -588,6 +684,7 @@ impl Map {
             self.parking.clean_reuse()
         );
 
+        let roads = [r1, r2];
         let r1 = self.roads.get(r1)?;
         let r2 = self.roads.get(r2)?;
 
@@ -640,7 +737,11 @@ impl Map {
             self.electricity.add_edge(b.id, road_id);
         }
 
-        Some(id)
+        Some(RoadSplit {
+            original: split_road_id,
+            junction: id,
+            roads,
+        })
     }
 
     pub(crate) fn merge_road(&mut self, road1: RoadID, road2: RoadID) -> Option<RoadID> {

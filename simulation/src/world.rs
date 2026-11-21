@@ -71,7 +71,9 @@ impl SimDrop for VehicleEnt {
             res.write::<TransportGrid>().remove_maintain(collider.0);
         }
 
-        if let VehicleState::Parked(resa) | VehicleState::RoadToPark(_, _, resa) =
+        if let VehicleState::Parked(resa)
+        | VehicleState::RoadToPark(_, _, resa)
+        | VehicleState::ReturningToDepot { spot: resa, .. } =
             std::mem::replace(&mut self.vehicle.state, VehicleState::Driving)
         {
             res.write::<ParkingManagement>().free(resa);

@@ -12,7 +12,7 @@ use crate::map_dynamic::{BuildingInfos, ElectricityFlow};
 use crate::souls::desire::WorkKind;
 use crate::transportation::{spawn_parked_vehicle, VehicleKind};
 use crate::utils::resources::Resources;
-use crate::world::{CompanyEnt, HumanEnt, HumanID, VehicleID};
+use crate::world::{CompanyEnt, HumanID, VehicleID};
 use crate::{ParCommandBuffer, SoulID, VehicleEnt};
 use crate::{Simulation, World};
 
@@ -174,7 +174,6 @@ pub fn company_soul(
 pub fn company_system(world: &mut World, res: &mut Resources) {
     profiling::scope!("souls::company_system");
     let cbuf: &ParCommandBuffer<CompanyEnt> = &res.read();
-    let cbuf_human: &ParCommandBuffer<HumanEnt> = &res.read();
     let binfos: &BuildingInfos = &res.read();
     let market: &Market = &res.read();
     let map: &Map = &res.read();
@@ -226,6 +225,49 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             }
         }
 
+        for &worker in &c.workers.0 {
+            let Some(human) = world.humans.get_mut(worker) else {
+                continue;
+            };
+            if human.work.is_none() {
+                let offset = common::rand::randu(common::hash_u64(worker) as u32);
+                human.work = Some(Work::new(c.comp.building, WorkKind::Worker, offset));
+            }
+        }
+        if c.comp.driver.is_none() && proto.kind == CompanyKind::Factory {
+            let truck = c
+                .comp
+                .trucks
+                .iter()
+                .copied()
+                .filter(|&id| world.vehicles.contains_key(id))
+                .min();
+            let driver = c
+                .workers
+                .0
+                .iter()
+                .copied()
+                .filter(|&id| {
+                    world
+                        .humans
+                        .get(id)
+                        .and_then(|human| human.work.as_ref())
+                        .is_some_and(|work| {
+                            work.workplace == c.comp.building
+                                && matches!(work.kind, WorkKind::Worker)
+                        })
+                })
+                .min();
+            if let Some((truck, driver)) = truck.zip(driver) {
+                let work = world.humans.get_mut(driver).unwrap().work.as_mut().unwrap();
+                work.kind = WorkKind::Driver {
+                    truck,
+                    deliver_order: None,
+                };
+                c.comp.driver = Some(driver);
+            }
+        }
+
         (|| {
             let Some(driver) = c.comp.driver else {
                 return;
@@ -233,13 +275,18 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             let Some(w) = world.humans.get(driver).and_then(|h| h.work.as_ref()) else {
                 return;
             };
-            if !matches!(
-                w.kind,
-                WorkKind::Driver {
-                    deliver_order: None,
-                    ..
-                }
-            ) {
+            let WorkKind::Driver {
+                truck,
+                deliver_order: None,
+            } = w.kind
+            else {
+                return;
+            };
+            if !world
+                .vehicles
+                .get(truck)
+                .is_some_and(|vehicle| vehicle.vehicle.state.is_parked())
+            {
                 return;
             }
             let Some(trade) = c.sold.0.pop() else {
@@ -262,36 +309,5 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                 *deliver_order = Some(owner_build)
             });
         })();
-
-        for &worker in c.workers.0.iter() {
-            let Some(w) = world.humans.get(worker) else {
-                continue;
-            };
-
-            if w.work.is_none() {
-                let mut kind = WorkKind::Worker;
-
-                if let Some(truck) = c.comp.trucks.first() {
-                    if proto.kind == CompanyKind::Factory && c.comp.driver.is_none() {
-                        kind = WorkKind::Driver {
-                            deliver_order: None,
-                            truck: *truck,
-                        };
-
-                        c.comp.driver = Some(worker);
-                    }
-                }
-
-                let offset = common::rand::randu(common::hash_u64(worker) as u32);
-
-                let b = c.comp.building;
-                cbuf_human.exec_ent(worker, move |sim| {
-                    let Some(w) = sim.world.humans.get_mut(worker) else {
-                        return;
-                    };
-                    w.work = Some(Work::new(b, kind, offset));
-                });
-            }
-        }
     });
 }

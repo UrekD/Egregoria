@@ -1,12 +1,12 @@
 use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::{Itinerary, ParkingManagement, ParkingReserveError, SpotReservation};
 use crate::transportation::TransportGrid;
-use crate::transportation::{put_pedestrian_in_transport_grid, unpark, Location, VehicleState};
+use crate::transportation::{put_pedestrian_in_transport_grid, unpark, Location};
 use crate::utils::resources::Resources;
 use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
 use crate::{ParCommandBuffer, World};
 use egui_inspect::Inspect;
-use geom::{Spline3, Transform, Vec3};
+use geom::{Transform, Vec3};
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
 
@@ -152,7 +152,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                     .vehicles
                     .get(vehicle)
                     .map(|x| &x.vehicle)
-                    .map(|x| matches!(x.state, VehicleState::Parked(_)))
+                    .map(|x| x.state.is_parked())
                     .unwrap_or(true),
                 RoutingStep::Unpark(_) => true,
                 RoutingStep::GetInVehicle(_) => true,
@@ -203,13 +203,13 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                 }
                 RoutingStep::Park(vehicle, ref mut spot) => {
                     if let Some(spot_resa) = spot.take() {
-                        if !spot_resa.exists(&map.parking) {
+                        let Some(spot) = spot_resa.get(&map.parking) else {
                             h.router.reset_dest();
                             return;
-                        }
+                        };
 
                         if let Some(vehicle) = world.vehicles.get_mut(vehicle) {
-                            park(map, vehicle, spot_resa)
+                            vehicle.begin_parking(spot.trans, spot_resa);
                         }
                     }
                 }
@@ -269,27 +269,6 @@ fn walk_outside(body: HumanID, pos: Vec3, cbuf: &ParCommandBuffer<HumanEnt>, loc
         h.trans.pos = pos;
         h.collider = Some(coll);
     });
-}
-
-fn park(map: &Map, vehicle: &mut VehicleEnt, spot_resa: SpotReservation) {
-    let trans = vehicle.trans;
-    let spot = match spot_resa.get(&map.parking) {
-        Some(x) => x,
-        None => {
-            log::warn!("Couldn't park at {:?} because it doesn't exist", spot_resa);
-            return;
-        }
-    };
-
-    let s = Spline3 {
-        from: trans.pos,
-        to: spot.trans.pos,
-        from_derivative: trans.dir * 2.0,
-        to_derivative: spot.trans.dir * 2.0,
-    };
-
-    vehicle.vehicle.state = VehicleState::RoadToPark(s, 0.0, spot_resa);
-    vehicle.speed.0 = 0.0;
 }
 
 impl Router {

@@ -171,8 +171,14 @@ fn prepare_save_dir(path: &Path, fresh: bool) -> io::Result<PathBuf> {
         }
     }
     fs::create_dir_all(&dir)?;
-    if fresh && fs::read_dir(&dir)?.next().is_some() {
-        return Err(io::Error::other("script output directory must be empty"));
+    if fresh {
+        if fs::read_dir(&dir)?.next().transpose()?.is_some() {
+            return Err(io::Error::other("script output directory must be empty"));
+        }
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(".egregoria-run"))?;
     }
     Ok(dir)
 }

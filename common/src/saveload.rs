@@ -18,6 +18,68 @@ pub fn save_dir() -> &'static Path {
     SAVE_DIR.get().map_or(Path::new("world"), PathBuf::as_path)
 }
 
+/// Move a world and its companion files aside without replacing any existing backup.
+pub fn backup_save_files(name: &str, version: Option<&str>) -> Result<Vec<PathBuf>> {
+    backup_save_files_in(save_dir(), name, version)
+}
+
+fn backup_save_files_in(dir: &Path, name: &str, version: Option<&str>) -> Result<Vec<PathBuf>> {
+    let version = version
+        .map(str::trim)
+        .filter(|version| {
+            !version.is_empty()
+                && version.len() <= 64
+                && version
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b))
+        })
+        .unwrap_or("unknown");
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let Some(name) = filename
+            .to_str()
+            .filter(|file| file.starts_with(name) && !file.ends_with(".bak"))
+        else {
+            continue;
+        };
+        let kind = entry.file_type()?;
+        if kind.is_file() || kind.is_symlink() {
+            files.push((name.to_owned(), entry.path()));
+        }
+    }
+    // Move the replay and companion files before the main save. A failed backup
+    // can then be retried at startup while the refused save is still in place.
+    let compressed = format!("{name}.{}", CompressedBincode::EXTENSION);
+    let legacy = format!("{name}.{}", Bincode::EXTENSION);
+    files.sort_by(|(a, _), (b, _)| {
+        (a == &compressed, a == &legacy, a).cmp(&(b == &compressed, b == &legacy, b))
+    });
+    let mut backups = Vec::with_capacity(files.len());
+    for (name, source) in files {
+        for suffix in 0.. {
+            let filename = if suffix == 0 {
+                format!("{name}.{version}.bak")
+            } else {
+                format!("{name}.{version}.{suffix}.bak")
+            };
+            let target = dir.join(filename);
+            // A same-directory hard link claims the destination atomically, unlike rename.
+            match std::fs::hard_link(&source, &target) {
+                Ok(()) => {
+                    std::fs::remove_file(&source)?;
+                    backups.push(target);
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(backups)
+}
+
 pub fn walkdir(dir: &Path) -> impl Iterator<Item = PathBuf> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(dir).expect("dir not found") {
@@ -222,5 +284,55 @@ mod tests {
         CompressedBincode::save_silent(&43, "world").unwrap();
         assert_eq!(CompressedBincode::load::<i32>("world").unwrap(), 43);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    #[test]
+    fn backup_preserves_save_family_and_existing_backups() {
+        let dir = std::env::temp_dir().join(format!(
+            "egr-save-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        for (name, bytes) in [
+            ("world.bc", "legacy"),
+            ("world.zip", "current"),
+            ("world_replay.json", "replay"),
+            ("world.zip.0.6.1.bak", "earlier backup"),
+            ("settings.json", "settings"),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+
+        let backups = backup_save_files_in(&dir, "world", Some("0.6.1")).unwrap();
+        assert_eq!(backups.len(), 3);
+        for (name, bytes) in [
+            ("world.bc.0.6.1.bak", "legacy"),
+            ("world.zip.0.6.1.1.bak", "current"),
+            ("world_replay.json.0.6.1.bak", "replay"),
+            ("world.zip.0.6.1.bak", "earlier backup"),
+            ("settings.json", "settings"),
+        ] {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), bytes);
+        }
+        for name in ["world.bc", "world.zip", "world_replay.json"] {
+            assert!(!dir.join(name).exists());
+        }
+
+        std::fs::write(dir.join("world.zip"), "unreadable").unwrap();
+        backup_save_files_in(&dir, "world", None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("world.zip.unknown.bak")).unwrap(),
+            "unreadable"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

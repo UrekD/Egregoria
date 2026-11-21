@@ -1,5 +1,4 @@
 use common::logger::MyLog;
-use common::unwrap_or;
 use networking::{Frame, Server, ServerConfiguration, ServerPollResult};
 use simulation::world_command::WorldCommands;
 use simulation::Simulation;
@@ -36,10 +35,19 @@ fn main() {
 
     log::info!("starting server with version: {}", VERSION);
 
-    let mut w = unwrap_or!(Simulation::load_from_disk("world"), {
-        log::info!("savegame not found defaulting to empty");
-        Simulation::new(true)
-    });
+    let mut w = match Simulation::load_or_new("world") {
+        Ok((sim, message)) => {
+            if let Some(message) = message {
+                eprintln!("{message}");
+            }
+            sim
+        }
+        Err(error) => {
+            log::error!("{error}");
+            eprintln!("{error}");
+            std::process::exit(1);
+        }
+    };
 
     let mut sched = Simulation::schedule();
 

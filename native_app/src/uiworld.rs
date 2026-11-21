@@ -15,6 +15,7 @@ pub struct UiWorld {
 
 #[derive(Default)]
 pub struct SaveLoadState {
+    pub startup_message: Option<String>,
     pub please_load: Option<SimulationReplayLoader>,
     pub please_load_sim: Option<Simulation>,
     pub render_reset: bool,

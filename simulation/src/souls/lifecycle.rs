@@ -1,14 +1,21 @@
 use geom::Vec3;
-use prototypes::ItemID;
+use prototypes::{GameTime, ItemID};
+use std::collections::BTreeSet;
 
 use crate::economy::Market;
-use crate::map::{Building, BuildingID, BuildingKind, Map};
-use crate::map_dynamic::{BuildingInfos, DispatchID, Dispatcher, Itinerary, ParkingManagement};
+use crate::map::{Building, BuildingID, BuildingKind, Map, PathKind};
+use crate::map_dynamic::{
+    BuildingInfos, DispatchID, Dispatcher, Itinerary, ParkingManagement, SpotReservation,
+    OBJECTIVE_OK_DIST,
+};
 use crate::souls::desire::WorkKind;
 use crate::souls::freight_station::FreightTrainState;
 use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::train::{cancel_train_route, TrainReservations};
-use crate::transportation::{put_pedestrian_in_transport_grid, Location, TransportGrid};
+use crate::transportation::{
+    put_pedestrian_in_transport_grid, spawn_parked_vehicle_with_spot, spawn_truck_at_depot,
+    Location, TransportGrid, VehicleKind, VehicleState,
+};
 use crate::utils::resources::Resources;
 use crate::{
     CompanyEnt, CompanyID, FreightStationEnt, HumanEnt, HumanID, ParCommandBuffer, Simulation,
@@ -92,15 +99,12 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
         .clear_steps(&mut sim.write::<ParkingManagement>());
     clear_soul_references(sim, SoulID::Human(id));
 
-    let (world, resources) = sim.world_res();
     if let Some(WorkKind::Driver { truck, .. }) = human.work.as_ref().map(|work| work.kind) {
-        resources
-            .write::<Dispatcher>()
+        sim.write::<Dispatcher>()
             .free(DispatchID::SmallTruck(truck));
-        if let Some(vehicle) = world.vehicles.get_mut(truck) {
-            vehicle.it = Itinerary::NONE;
-        }
+        return_truck_to_depot(sim, truck);
     }
+    let (world, resources) = sim.world_res();
     let map = resources.read::<Map>();
     let mut market = resources.write::<Market>();
     let job = ItemID::new("job-opening");
@@ -230,6 +234,8 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) {
 
 fn clear_building_references(sim: &mut Simulation, id: BuildingID, door: Option<Vec3>) {
     let (world, resources) = sim.world_res();
+    let mut returning_trucks = BTreeSet::new();
+    let mut idle_drivers = BTreeSet::new();
     for (human_id, human) in world.humans.iter_mut() {
         let mut cancel =
             human.router.references_building(id) || human.decision.kind.references_building(id);
@@ -255,9 +261,9 @@ fn clear_building_references(sim: &mut Simulation, id: BuildingID, door: Option<
                     resources
                         .write::<Dispatcher>()
                         .free(DispatchID::SmallTruck(*truck));
-                    if let Some(vehicle) = world.vehicles.get_mut(*truck) {
-                        vehicle.it = Itinerary::NONE;
-                    }
+                    returning_trucks.insert(*truck);
+                    idle_drivers.insert(human_id);
+                    work.kind = WorkKind::Worker;
                     cancel = true;
                 }
             }
@@ -269,13 +275,132 @@ fn clear_building_references(sim: &mut Simulation, id: BuildingID, door: Option<
         }
         if cancel {
             if let Location::Vehicle(vehicle) = human.location {
-                if let Some(vehicle) = world.vehicles.get_mut(vehicle) {
-                    vehicle.it = Itinerary::NONE;
+                if let Some(body) = world.vehicles.get_mut(vehicle) {
+                    if matches!(body.vehicle.kind, VehicleKind::Truck) {
+                        returning_trucks.insert(vehicle);
+                    } else {
+                        body.it = Itinerary::NONE;
+                    }
                 }
             }
             cancel_trip(human, resources);
         }
     }
+    for company in world.companies.values_mut() {
+        if company
+            .comp
+            .driver
+            .is_some_and(|driver| idle_drivers.contains(&driver))
+        {
+            company.comp.driver = None;
+        }
+    }
+    for truck in returning_trucks {
+        return_truck_to_depot(sim, truck);
+    }
+}
+
+fn truck_company(sim: &Simulation, truck: VehicleID) -> Option<CompanyID> {
+    sim.world
+        .companies
+        .iter()
+        .find_map(|(id, company)| company.comp.trucks.contains(&truck).then_some(id))
+}
+
+fn return_truck_to_depot(sim: &mut Simulation, truck: VehicleID) {
+    let Some(vehicle) = sim.get(truck) else {
+        return;
+    };
+    if !matches!(
+        vehicle.vehicle.state,
+        VehicleState::Driving | VehicleState::Panicking(_)
+    ) {
+        return;
+    }
+    let Some(company) = truck_company(sim, truck) else {
+        return;
+    };
+    let map = sim.map();
+    let building = sim.get(company).unwrap().comp.building;
+    let Some(depot) = map.get(building) else {
+        return; // Removing the company also removes its fleet.
+    };
+    let door = depot.door_pos;
+    let spot = sim.write::<ParkingManagement>().reserve_near(door, &map);
+    let Ok(spot) = spot else {
+        drop(map);
+        let replacement = spawn_truck_at_depot(sim, door);
+        replace_truck(sim, company, truck, replacement);
+        return;
+    };
+    let tick = sim.read::<GameTime>().tick;
+    let route = spot.park_pos(&map).and_then(|target| {
+        Itinerary::route(tick, vehicle.trans.pos, target, &map, PathKind::Vehicle)
+    });
+    drop(map);
+    if let Some(route) = route {
+        let vehicle = sim.world.vehicles.get_mut(truck).unwrap();
+        vehicle.it = route;
+        vehicle.vehicle.state = VehicleState::ReturningToDepot {
+            spot,
+            stopped_ticks: 0,
+        };
+    } else {
+        respawn_truck_at_depot(sim, truck, spot);
+    }
+}
+
+pub(crate) fn finish_truck_return(sim: &mut Simulation, truck: VehicleID) {
+    let Some(vehicle) = sim.world.vehicles.get_mut(truck) else {
+        return;
+    };
+    let state = std::mem::replace(&mut vehicle.vehicle.state, VehicleState::Driving);
+    let VehicleState::ReturningToDepot { spot, .. } = state else {
+        vehicle.vehicle.state = state;
+        return;
+    };
+
+    let map = sim.resources.read::<Map>();
+    let Some(parking) = spot.get(&map.parking) else {
+        drop(map);
+        sim.write::<ParkingManagement>().free(spot);
+        return_truck_to_depot(sim, truck);
+        return;
+    };
+    let arrived = vehicle.it.has_ended(0.0)
+        && spot
+            .park_pos(&map)
+            .is_some_and(|pos| pos.distance(vehicle.trans.pos) <= 2.0 * OBJECTIVE_OK_DIST);
+    if arrived {
+        vehicle.it = Itinerary::NONE;
+        vehicle.begin_parking(parking.trans, spot);
+    } else {
+        drop(map);
+        respawn_truck_at_depot(sim, truck, spot);
+    }
+}
+
+fn respawn_truck_at_depot(sim: &mut Simulation, truck: VehicleID, spot: SpotReservation) {
+    let Some(company) = truck_company(sim, truck) else {
+        sim.write::<ParkingManagement>().free(spot);
+        sim.read::<ParCommandBuffer<VehicleEnt>>().kill(truck);
+        return;
+    };
+    let replacement = spawn_parked_vehicle_with_spot(sim, VehicleKind::Truck, spot)
+        .expect("reserved depot parking spot");
+    replace_truck(sim, company, truck, replacement);
+}
+
+fn replace_truck(sim: &mut Simulation, company: CompanyID, old: VehicleID, new: VehicleID) {
+    let company = sim.world.companies.get_mut(company).unwrap();
+    let truck = company
+        .comp
+        .trucks
+        .iter_mut()
+        .find(|truck| **truck == old)
+        .unwrap();
+    *truck = new;
+    sim.read::<ParCommandBuffer<VehicleEnt>>().kill(old);
 }
 
 fn move_outside(human: &mut HumanEnt, pos: Vec3, resources: &Resources) {

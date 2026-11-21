@@ -1,7 +1,8 @@
 use super::TestCtx;
 use crate::economy::{Government, Market, Trade, TradeTarget};
 use crate::map::{
-    BuildingID, BuildingKind, LaneKind, LanePatternBuilder, MapProject, ProjectKind, Zone,
+    BuildingID, BuildingKind, LaneKind, LanePatternBuilder, MapProject, PathKind, ProjectKind,
+    TerraformKind, Zone,
 };
 use crate::map_dynamic::{
     BuildingInfos, Destination, DispatchID, DispatchKind, DispatchQueryTarget, Dispatcher,
@@ -11,9 +12,11 @@ use crate::souls::desire::{Work, WorkKind};
 use crate::souls::freight_station::FreightTrainState;
 use crate::souls::human::HumanDecisionKind;
 use crate::transportation::testing_vehicles::RandomVehicles;
-use crate::transportation::{unpark, Location};
+use crate::transportation::{spawn_parked_vehicle, unpark, Location, VehicleKind, VehicleState};
 use crate::world_command::{CommandOutcomes, Rejection};
-use crate::{Simulation, SimulationSer, SoulID, WorldCommand, START_COMMANDS, VERSION};
+use crate::{
+    SaveLoadError, Simulation, SimulationSer, SoulID, WorldCommand, START_COMMANDS, VERSION,
+};
 use common::saveload::{CompressedBincode, Encoder, JSON};
 use geom::{vec2, vec3, Polygon, OBB};
 use prototypes::{BuildingGen, GoodsCompanyID, ItemID, Money, RollingStockID};
@@ -301,6 +304,411 @@ fn batch_charges_successful_links_only_and_is_deterministic_for_equal_costs() {
     }
 }
 
+fn stale_connection_uses_the_canonical_endpoints(batch: bool) {
+    let mut test = TestCtx::new();
+    test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
+    let from = {
+        let map = test.g.map();
+        let intersection = map
+            .intersections()
+            .values()
+            .find(|i| i.pos.x == 100.0)
+            .unwrap();
+        MapProject {
+            pos: intersection.pos,
+            kind: ProjectKind::Intersection(intersection.id),
+        }
+    };
+    let to = MapProject::ground(vec3(100.0, 300.0, 0.0));
+    let pat = LanePatternBuilder::default().build();
+    let elbow = Some(vec2(175.0, 200.0));
+    let command = |from| {
+        if batch {
+            WorldCommand::MapMakeMultipleConnections(
+                vec![from, to],
+                vec![(0, 1, elbow, pat.clone())],
+            )
+        } else {
+            WorldCommand::MapMakeConnection {
+                from,
+                to,
+                inter: elbow,
+                pat: pat.clone(),
+            }
+        }
+    };
+    let baseline = common::saveload::Bincode::encode(&test.g).unwrap();
+    test.apply(&[command(from)]);
+    let expected = test.g.hashes();
+    test.g = common::saveload::Bincode::decode(&baseline).unwrap();
+    let stale = MapProject {
+        pos: vec3(900.0, 800.0, 50.0),
+        ..from
+    };
+    test.apply(&[command(stale)]);
+    assert_eq!(test.g.hashes(), expected);
+}
+
+#[test]
+fn stale_single_connection_uses_the_canonical_endpoints() {
+    stale_connection_uses_the_canonical_endpoints(false);
+}
+
+#[test]
+fn stale_batch_connection_uses_the_canonical_endpoints() {
+    stale_connection_uses_the_canonical_endpoints(true);
+}
+
+#[test]
+fn split_batch_keeps_links_on_the_original_road_at_a_grade_separated_crossing() {
+    let mut test = TestCtx::new();
+    let pat = LanePatternBuilder::default().build();
+    let ground = |x, y, z| MapProject::ground(vec3(x, y, z));
+    let (road, elevated) = {
+        let mut map = test.g.map_mut();
+        let (_, road) = map
+            .make_connection(
+                ground(80.0, 100.0, 0.0),
+                ground(350.0, 100.0, 0.0),
+                None,
+                &pat,
+            )
+            .unwrap();
+        let (elevated, _) = map
+            .make_connection(
+                ground(240.0, 40.0, 40.0),
+                ground(240.0, 100.0, 40.0),
+                None,
+                &pat,
+            )
+            .unwrap();
+        (road, elevated)
+    };
+    let on_road = |x| MapProject {
+        pos: vec3(x, 100.0, crate::map::ROAD_Z_OFFSET),
+        kind: ProjectKind::Road(road),
+    };
+    test.apply(&[WorldCommand::MapMakeMultipleConnections(
+        vec![
+            on_road(150.0),
+            ground(150.0, 200.0, 0.0),
+            on_road(240.0),
+            ground(240.0, 200.0, 0.0),
+        ],
+        vec![(0, 1, None, pat.clone()), (2, 3, None, pat)],
+    )]);
+
+    assert!(test.g.read::<CommandOutcomes>().last.is_empty());
+    let map = test.g.map();
+    assert_eq!(map.get(elevated).unwrap().roads.len(), 1);
+    assert!(map
+        .intersections()
+        .values()
+        .any(|i| { i.pos.distance(vec3(240.0, 100.0, 0.0)) < 0.01 && i.roads.len() == 3 }));
+}
+
+#[test]
+fn zone_fill_direction_is_normalized_when_stored() {
+    let mut test = TestCtx::new();
+    let proto = GoodsCompanyID::new("cereal-farm").prototype();
+    let build = |filldir| WorldCommand::MapBuildSpecialBuilding {
+        pos: OBB::new(vec2(204.0, 204.0), vec2(1.0, 0.0), 4.0, 4.0),
+        kind: BuildingKind::GoodsCompany(proto.id),
+        gen: proto.bgen,
+        zone: Some(Zone {
+            poly: Polygon(vec![
+                vec2(200.0, 200.0),
+                vec2(212.0, 200.0),
+                vec2(212.0, 212.0),
+                vec2(200.0, 212.0),
+            ]),
+            area: 1.0,
+            filldir,
+        }),
+        connected_road: None,
+    };
+    for direction in [geom::Vec2::ZERO, vec2(f32::INFINITY, 1.0)] {
+        test.apply(&[build(direction)]);
+        assert_eq!(
+            test.g.read::<CommandOutcomes>().last,
+            [("MapBuildSpecialBuilding", Rejection::InvalidZone)]
+        );
+    }
+    test.apply(&[build(vec2(3.0e30, 4.0e30))]);
+    let map = test.g.map();
+    let zone = map
+        .buildings()
+        .values()
+        .find_map(|b| b.zone.as_ref())
+        .unwrap();
+    assert!(zone.filldir.distance(vec2(0.6, 0.8)) < 0.001);
+}
+
+fn staffed_factory(
+    test: &mut TestCtx,
+) -> (
+    crate::CompanyID,
+    crate::HumanID,
+    crate::HumanID,
+    crate::VehicleID,
+    BuildingID,
+) {
+    street(test);
+    let house = test.build_house_near(vec2(150.0, 125.0));
+    let customer = test.build_house_near(vec2(250.0, 125.0));
+    let factory = factory(test);
+    run_systems(test);
+    let Some(SoulID::GoodsCompany(company)) = test.g.read::<BuildingInfos>().owner(factory) else {
+        panic!("factory has no company");
+    };
+    let driver = resident(test, house);
+    let worker = resident(test, customer);
+    let truck = test.g.get(company).unwrap().comp.trucks[0];
+    let world = test.g.world_mut_unchecked();
+    let entity = world.companies.get_mut(company).unwrap();
+    entity.comp.driver = Some(driver);
+    entity.workers.0 = vec![worker, driver];
+    world.humans.get_mut(driver).unwrap().work = Some(Work::new(
+        factory,
+        WorkKind::Driver {
+            truck,
+            deliver_order: None,
+        },
+        0.0,
+    ));
+    world.humans.get_mut(worker).unwrap().work = Some(Work::new(factory, WorkKind::Worker, 0.0));
+    (company, driver, worker, truck, customer)
+}
+
+#[test]
+fn deleted_active_truck_is_replaced_for_pending_deliveries() {
+    let mut test = TestCtx::new();
+    let (company, driver, worker, truck, customer) = staffed_factory(&mut test);
+    let door = test.g.get(company).unwrap().trans.pos;
+    let replacement = spawn_parked_vehicle(&mut test.g, VehicleKind::Truck, door).unwrap();
+    let company_has_two_trucks = test
+        .g
+        .world_mut_unchecked()
+        .companies
+        .get_mut(company)
+        .unwrap();
+    company_has_two_trucks.comp.trucks = vec![truck, replacement];
+
+    let station = {
+        let map = test.g.map();
+        map.buildings()
+            .values()
+            .find(|b| matches!(b.kind, BuildingKind::RailFreightStation(_)))
+            .unwrap()
+            .id
+    };
+    let Some(SoulID::FreightStation(station_soul)) = test.g.read::<BuildingInfos>().owner(station)
+    else {
+        panic!("expected a freight station");
+    };
+    let buyer = resident(&test, customer);
+    let entity = test
+        .g
+        .world_mut_unchecked()
+        .companies
+        .get_mut(company)
+        .unwrap();
+    for buyer in [SoulID::Human(buyer), SoulID::FreightStation(station_soul)] {
+        entity.sold.0.push(Trade {
+            buyer: TradeTarget(buyer),
+            seller: TradeTarget(SoulID::GoodsCompany(company)),
+            qty: 1,
+            kind: ItemID::new("bread"),
+            money_delta: Money::ZERO,
+        });
+    }
+    test.g
+        .read::<crate::ParCommandBuffer<crate::VehicleEnt>>()
+        .kill(truck);
+    for _ in 0..5 {
+        test.tick_fast();
+    }
+    assert_eq!(
+        test.g.get(company).unwrap().comp.driver,
+        Some(driver.min(worker))
+    );
+    let driver = driver.min(worker);
+    let human = test.g.world_mut_unchecked().humans.get_mut(driver).unwrap();
+    assert!(matches!(human.work.as_ref().unwrap().kind,
+        WorkKind::Driver { truck, deliver_order: Some(target) } if truck == replacement && target == station));
+    // Exercise delivery completion after the replacement driver reaches the target.
+    human.decision.kind = HumanDecisionKind::DeliverAtBuilding(station);
+    human.decision.wait = 0;
+    test.tick_fast();
+    assert_eq!(test.g.get(station_soul).unwrap().f.waiting_cargo, 1);
+    let work = test.g.get(driver).unwrap().work.as_ref().unwrap();
+    assert!(matches!(work.kind,
+        WorkKind::Driver { truck, deliver_order: Some(target) } if truck == replacement && target == customer));
+}
+
+#[test]
+fn removing_a_driver_mid_drive_clears_the_truck_from_the_lane() {
+    let mut test = TestCtx::new();
+    let (company, driver, worker, truck, _) = staffed_factory(&mut test);
+    let (start, direction, destination) = {
+        let map = test.g.map();
+        let VehicleState::Parked(spot) = &test.g.get(truck).unwrap().vehicle.state else {
+            panic!("expected a parked truck");
+        };
+        let depot = spot.park_pos(&map).unwrap();
+        let lane = map
+            .get(map.nearest_lane(depot, LaneKind::Driving, None).unwrap())
+            .unwrap();
+        let (start, direction) = lane.points.point_dir_along(10.0);
+        (
+            start,
+            direction,
+            lane.points.point_along(lane.points.length() * 0.75),
+        )
+    };
+    let vehicle = test
+        .g
+        .world_mut_unchecked()
+        .vehicles
+        .get_mut(truck)
+        .unwrap();
+    vehicle.trans.pos = start;
+    vehicle.trans.dir = direction;
+    vehicle.it = Itinerary::simple(vec![destination]);
+    unpark(&mut test.g, truck);
+    for _ in 0..50 {
+        test.tick_fast();
+    }
+    let vehicle = test.g.get(truck).unwrap();
+    assert!(vehicle.speed.0 > 0.0 && vehicle.collider.is_some());
+
+    crate::souls::lifecycle::despawn_human(&mut test.g, driver);
+    for _ in 0..7000 {
+        test.tick_fast();
+        if test
+            .g
+            .get(truck)
+            .is_none_or(|vehicle| vehicle.vehicle.state.is_parked())
+        {
+            break;
+        }
+    }
+
+    let company = test.g.get(company).unwrap();
+    assert_eq!(company.comp.driver, Some(worker));
+    assert!(!company.comp.trucks.is_empty());
+    for &id in &company.comp.trucks {
+        let vehicle = test.g.get(id).unwrap();
+        assert!(
+            matches!(vehicle.vehicle.state, VehicleState::Parked(_)),
+            "truck {id:?} at {:?}, speed {}, state {:?}, destination {:?}, next {:?}",
+            vehicle.trans.pos,
+            vehicle.speed.0,
+            vehicle.vehicle.state,
+            vehicle.it.end_pos(),
+            vehicle.it.get_point()
+        );
+        assert!(vehicle.collider.is_none());
+    }
+}
+
+#[test]
+fn a_truck_without_a_return_route_is_replaced_at_its_depot() {
+    let mut test = TestCtx::new();
+    let (company, driver, worker, truck, _) = staffed_factory(&mut test);
+    unpark(&mut test.g, truck);
+    let roads: Vec<_> = test
+        .g
+        .map()
+        .roads()
+        .values()
+        .filter(|r| r.points.first().x < 400.0)
+        .map(|r| WorldCommand::MapRemoveRoad(r.id))
+        .collect();
+    test.apply(&roads);
+
+    crate::souls::lifecycle::despawn_human(&mut test.g, driver);
+    for _ in 0..5 {
+        test.tick_fast();
+    }
+
+    assert!(test.g.get(truck).is_none());
+    let company = test.g.get(company).unwrap();
+    let [replacement] = company.comp.trucks.as_slice() else {
+        panic!("expected one replacement truck");
+    };
+    let vehicle = test.g.get(*replacement).unwrap();
+    assert!(matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot));
+    assert!(vehicle.collider.is_none());
+    assert_eq!(
+        vehicle.trans.pos,
+        test.g.map().get(company.comp.building).unwrap().door_pos
+    );
+    assert_eq!(company.comp.driver, Some(worker));
+}
+
+#[test]
+fn validating_commands_records_only_accepted_indices() {
+    let mut test = TestCtx::new();
+    let before = test.g.hashes();
+    let terraform = |radius, amount| WorldCommand::Terraform {
+        kind: TerraformKind::Elevation,
+        center: vec2(100.0, 100.0),
+        radius,
+        amount,
+        level: 0.0,
+        slope: None,
+    };
+    let company = GoodsCompanyID::new("cereal-farm").prototype();
+    let building = |kind, gen| WorldCommand::MapBuildSpecialBuilding {
+        pos: OBB::new(vec2(50.0, 50.0), geom::Vec2::X, 10.0, 10.0),
+        kind,
+        gen,
+        zone: None,
+        connected_road: None,
+    };
+
+    test.g.apply_commands(&[
+        terraform(f32::NAN, 100.0),
+        terraform(100.0, f32::INFINITY),
+        terraform(1.0e8, 100.0),
+        terraform(100.0, 1.0e8),
+        WorldCommand::SpawnRandomCars { n_cars: 0 },
+        WorldCommand::SpawnRandomCars { n_cars: 1_001 },
+        building(BuildingKind::GoodsCompany(company.id), company.bgen),
+        building(BuildingKind::House, BuildingGen::House),
+        building(
+            BuildingKind::ExternalTrading,
+            BuildingGen::NoWalkway {
+                door_pos: geom::Vec2::ZERO,
+            },
+        ),
+        building(BuildingKind::TrainStation, BuildingGen::House),
+    ]);
+
+    let outcomes = test.g.read::<CommandOutcomes>();
+    assert_eq!(outcomes.accepted, [4]);
+    assert_eq!(
+        outcomes
+            .last
+            .iter()
+            .map(|&(_, reason)| reason)
+            .collect::<Vec<_>>(),
+        [
+            Rejection::InvalidTerraform,
+            Rejection::InvalidTerraform,
+            Rejection::InvalidTerraform,
+            Rejection::InvalidTerraform,
+            Rejection::TooManyRandomCars,
+            Rejection::InvalidZone,
+            Rejection::InvalidBuilding,
+            Rejection::InvalidBuilding,
+            Rejection::InvalidBuilding,
+        ]
+    );
+    assert_eq!(test.g.hashes(), before);
+}
+
 #[test]
 fn out_of_range_batch_index_rejects_the_batch() {
     let mut test = TestCtx::new();
@@ -527,6 +935,24 @@ fn startup_money_matches_the_price_of_start_commands() {
     );
 }
 
+#[test]
+fn startup_freight_station_and_external_trading_are_connected_both_ways() {
+    let test = TestCtx::new();
+    let map = test.g.map();
+    let station = map
+        .buildings()
+        .values()
+        .find(|b| matches!(b.kind, BuildingKind::RailFreightStation(_)))
+        .unwrap();
+    let external = map.get(map.external_train_stations[0]).unwrap();
+    let depot = station.obb.center().z0();
+    let outside = external.obb.center().z0();
+    let tick = test.g.read::<prototypes::GameTime>().tick;
+    for (start, end) in [(depot, outside), (outside, depot)] {
+        assert!(Itinerary::route(tick, start, end, &map, PathKind::Rail).is_some());
+    }
+}
+
 fn save_fixture(name: &str) -> String {
     format!("p0e-lifecycle-{}-{name}", std::process::id())
 }
@@ -562,7 +988,20 @@ fn disk_load_rejects_wrong_version_missing_resources_and_bad_resource_bytes() {
         .unwrap();
         let loaded = Simulation::load_from_disk(&name);
         std::fs::remove_file(CompressedBincode::filename(&name)).unwrap();
-        assert_eq!(loaded.is_some(), variant == "current", "{variant}");
+        match (variant, loaded) {
+            ("current", Ok(_)) => {}
+            ("version" | "patch", Err(SaveLoadError::Incompatible { version })) => {
+                assert_ne!(version, VERSION);
+            }
+            ("missing" | "corrupt", Err(SaveLoadError::Corrupt { version, .. })) => {
+                assert_eq!(version.as_deref(), Some(VERSION));
+            }
+            (variant, result) => panic!("unexpected result for {variant}: {:?}", result.err()),
+        }
+        assert!(matches!(
+            Simulation::load_from_disk(&name),
+            Err(SaveLoadError::NotFound)
+        ));
     }
 }
 
