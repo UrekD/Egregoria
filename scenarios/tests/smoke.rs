@@ -26,6 +26,36 @@ fn perf_10k_cli_is_opt_in() {
 }
 
 #[test]
+fn perf_10k_cli_rejects_option_like_json_paths() {
+    let scenarios = env!("CARGO_BIN_EXE_scenarios");
+    // The trailing argument keeps the benchmark from running if parsing regresses.
+    let output = Command::new(scenarios)
+        .args(["perf_10k", "--json", "--gate", "--help"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("--json requires an output path"), "{error}");
+}
+
+#[test]
+fn perf_10k_cli_rejects_twice_with_gate() {
+    let scenarios = env!("CARGO_BIN_EXE_scenarios");
+    for (first, second) in [("--twice", "--gate"), ("--gate", "--twice")] {
+        let output = Command::new(scenarios)
+            .args(["perf_10k", first, second, "--help"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains("--twice cannot be used with --gate"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
 fn smoke_builds_a_working_city() {
     let mut ctx = ScenarioCtx::new(smoke::OPTIONS);
     let start_tick = ctx.sim.get_tick();

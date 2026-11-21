@@ -1,4 +1,4 @@
-use crate::builders::{fill_houses, grant_money, place_company, seed_households};
+use crate::builders::{fill_houses, grant_money, place_company, seed_households, CommandSink};
 use crate::ScenarioCtx;
 use geom::vec2;
 use prototypes::{try_prototype, GoodsCompanyID, Money};
@@ -11,7 +11,6 @@ pub const OPTIONS: SimulationOptions = SimulationOptions {
     save_replay: false,
 };
 
-pub const MEDIAN_TICKS_PER_SEC: &str = "median_ticks_per_sec";
 pub const MIN_TICKS_PER_SEC: f64 = 150.0;
 
 pub struct PerfOptions {
@@ -44,15 +43,27 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
     ctx.submit(&[WorldCommand::MapLoadParis]);
     ctx.run_ticks(1);
 
-    let company_count = match options.minimum_employment_percent {
+    let mut company_count = match options.minimum_employment_percent {
         Some(percent) => setup_employers(ctx, options.houses, percent)?,
         None => setup_bakeries(ctx)?,
     };
     setup_houses(ctx, options.houses)?;
     if let Some(setup) = options.setup_services_and_transit {
         setup(ctx)?;
+        if ctx.has_pending_commands() {
+            ctx.flush();
+        }
+        company_count = ctx.sim.world().companies.len();
     }
+    let job_capacity: usize = ctx
+        .sim
+        .world()
+        .companies
+        .values()
+        .map(|company| company.comp.max_workers as usize)
+        .sum();
 
+    // perf_10k measures the 08:08–08:42 morning commute ramp in game time.
     for (label, ticks) in [("setup", 0), ("warmup", 2_000), ("measured", 10_000)] {
         ctx.run_ticks(ticks);
         let houses = ctx
@@ -82,11 +93,11 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
                     sample.humans
                 ));
             }
-            let minimum_employed = (sample.humans.max(options.houses) * percent).div_ceil(100);
+            let minimum_employed = (houses * percent).div_ceil(100);
             let employed = sample.extra["employed"] as usize;
-            if employed < minimum_employed {
+            if !(minimum_employed..=job_capacity).contains(&employed) {
                 return Err(format!(
-                    "{label} had {employed} employed residents, expected at least {minimum_employed}"
+                    "{label} had {employed} employed residents, expected {minimum_employed} to {job_capacity}"
                 ));
             }
         } else if sample.humans != options.houses {
@@ -125,7 +136,9 @@ fn setup_employers(ctx: &mut ScenarioCtx, houses: usize, percent: usize) -> Resu
     let proto = try_prototype(GoodsCompanyID::new(EMPLOYER))
         .filter(|proto| proto.n_workers > 0)
         .ok_or_else(|| format!("missing employer with jobs: {EMPLOYER}"))?;
-    let jobs = (houses * percent).div_ceil(100);
+    let minimum_jobs = (houses * percent).div_ceil(100);
+    // Allow 10% headroom before rounding up to whole companies.
+    let jobs = minimum_jobs + minimum_jobs.div_ceil(10);
     let company_count = jobs.div_ceil(proto.n_workers as usize);
     grant_money(ctx, proto.price * company_count as i64);
 
@@ -169,7 +182,48 @@ fn setup_houses(ctx: &mut ScenarioCtx, house_count: usize) -> Result<(), String>
 mod tests {
     use super::*;
     use crate::{builders::grid_city, builtin::smoke};
+    use prototypes::{GameTime, Tick};
     use simulation::{economy::Government, map::BuildingKind};
+
+    #[test]
+    fn perf_setup_employers_builds_jobs_above_the_minimum() {
+        let mut ctx = ScenarioCtx::new(smoke::OPTIONS);
+        grid_city(&mut ctx, vec2(700.0, 700.0), 3, 3, 160.0);
+
+        setup_employers(&mut ctx, 20, 50).unwrap();
+
+        let job_capacity: u32 = ctx
+            .sim
+            .world()
+            .companies
+            .values()
+            .map(|company| company.comp.max_workers)
+            .sum();
+        assert!(job_capacity >= 11, "built {job_capacity} jobs");
+    }
+
+    #[test]
+    fn perf_setup_sample_includes_hook_changes() {
+        let mut ctx = ScenarioCtx::new(OPTIONS);
+        let options = PerfOptions {
+            houses: 1,
+            minimum_employment_percent: Some(50),
+            setup_services_and_transit: Some(|ctx| {
+                let near = vec2(11_450.0, 7_450.0);
+                place_company(ctx, "clothes-store", near).ok_or("could not add a store")?;
+                let tick = Tick(ctx.sim.get_tick() + 100);
+                ctx.submit(&[WorldCommand::SetGameTime(GameTime::new(tick))]);
+                Ok(())
+            }),
+        };
+
+        run_with_options(&mut ctx, options).unwrap();
+
+        let setup = &ctx.samples[0];
+        let warmup = &ctx.samples[1];
+        assert_eq!(setup.companies, 2);
+        assert_eq!(warmup.tick - setup.tick, 2_000);
+    }
 
     #[test]
     fn perf_setup_houses_funds_and_seeds_the_requested_workload() {

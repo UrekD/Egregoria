@@ -1,4 +1,5 @@
 use scenarios::builtin::{growth_basic, perf, PERF_10K, SCENARIOS};
+use scenarios::runner::{MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::ScenarioCtx;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -12,7 +13,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--twice] [--gate (perf_10k only)]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--twice | --gate (perf_10k only)]")
 }
 
 fn main() -> ExitCode {
@@ -52,11 +53,17 @@ fn run() -> Result<(), String> {
             Some("--twice") if !twice => twice = true,
             Some("--gate") if !gate => gate = true,
             Some("--json") if json.is_none() => {
-                let path = args.next().ok_or("--json requires an output path")?;
+                let path = args
+                    .next()
+                    .filter(|path| !path.as_encoded_bytes().starts_with(b"--"))
+                    .ok_or("--json requires an output path")?;
                 // Prototype initialization changes the process working directory.
                 json = Some(std::path::absolute(Path::new(&path)).map_err(|err| err.to_string())?);
             }
             _ => return Err(format!("unexpected argument {arg:?}\n{}", usage())),
+        }
+        if twice && gate {
+            return Err("--twice cannot be used with --gate".to_string());
         }
     }
     if gate && name != PERF_10K.0.name {
@@ -86,8 +93,17 @@ fn run() -> Result<(), String> {
         }
         for sample in &ctx.samples {
             let employed = sample.extra.get("employed").copied().unwrap_or_default();
+            let timing = match (
+                sample.extra.get(MEDIAN_TICKS_PER_SEC),
+                sample.extra.get(P99_MS_PER_TICK),
+            ) {
+                (Some(median), Some(p99)) => {
+                    format!(" median ticks/s={median:.2} p99={p99:.2}ms/tick")
+                }
+                _ => String::new(),
+            };
             println!(
-                "{} [{}] tick={} humans={} employed={employed:.0} vehicles={} companies={} trains={} money_cents={} ticks/s={:.2}",
+                "{} [{}] tick={} humans={} employed={employed:.0} vehicles={} companies={} trains={} money_cents={} ticks/s={:.2}{timing}",
                 scenario.name, sample.label, sample.tick, sample.humans, sample.vehicles,
                 sample.companies, sample.trains, sample.money_cents, sample.ticks_per_sec,
             );
@@ -105,7 +121,7 @@ fn run() -> Result<(), String> {
         let median = results[PERF_10K.0.name]
             .iter()
             .find(|sample| sample.label == "measured")
-            .and_then(|sample| sample.extra.get(perf::MEDIAN_TICKS_PER_SEC))
+            .and_then(|sample| sample.extra.get(MEDIAN_TICKS_PER_SEC))
             .ok_or("perf_10k: missing measured median throughput")?;
         if *median < perf::MIN_TICKS_PER_SEC {
             return Err(format!(

@@ -1,5 +1,4 @@
 use crate::builders::CommandSink;
-use crate::builtin::perf::MEDIAN_TICKS_PER_SEC;
 use crate::MetricSample;
 use simulation::economy::Government;
 use simulation::utils::scheduler::SeqSchedule;
@@ -11,6 +10,10 @@ use std::io::ErrorKind;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
 use std::time::Duration;
+
+pub const MEDIAN_TICKS_PER_SEC: &str = "median_ticks_per_sec";
+pub const P99_MS_PER_TICK: &str = "p99_ms_per_tick";
+const P95_MS_PER_TICK: &str = "p95_ms_per_tick";
 
 const CHECKPOINT_INTERVAL: u64 = 10_000;
 type Checkpoint = (u64, BTreeMap<String, u64>);
@@ -114,8 +117,8 @@ impl ScenarioCtx {
             };
             extra.extend([
                 (MEDIAN_TICKS_PER_SEC.to_string(), median_ticks_per_sec),
-                ("p95_ms_per_tick".to_string(), percentile_ms(95)),
-                ("p99_ms_per_tick".to_string(), percentile_ms(99)),
+                (P95_MS_PER_TICK.to_string(), percentile_ms(95)),
+                (P99_MS_PER_TICK.to_string(), percentile_ms(99)),
             ]);
         }
         self.sample_with_extra(label, extra)
