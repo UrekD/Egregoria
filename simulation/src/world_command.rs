@@ -380,7 +380,12 @@ impl WorldCommand {
                 }
                 true
             }
-            ZonePaint { .. } => return Err(Rejection::InvalidZone),
+            ZonePaint { area, .. } => {
+                if !ZoneGrid::valid_paint(area, map.environment.bounds()) {
+                    return Err(Rejection::InvalidZone);
+                }
+                true
+            }
             SetTaxRate { .. } => return Err(Rejection::InvalidTaxRate),
             _ => true,
         };
