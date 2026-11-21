@@ -32,7 +32,7 @@ pub use demand::*;
 pub use ecostats::*;
 pub use government::*;
 pub use market::*;
-use prototypes::{GameTime, ItemID, Money, TICKS_PER_MINUTE};
+use prototypes::{GameTime, ItemID, Money};
 
 const WORKER_CONSUMPTION_PER_MINUTE: Money = Money::new_cents(10);
 
@@ -47,19 +47,9 @@ pub struct Workers(pub Vec<HumanID>);
 
 pub fn market_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("economy::market_update");
-    let n_workers = world.humans.len();
-
     let mut m = resources.write::<Market>();
     let job_opening = ItemID::new("job-opening");
     let tick = resources.read::<GameTime>().tick;
-
-    if tick.0 % TICKS_PER_MINUTE == 0 {
-        Budget::apply(
-            resources,
-            BudgetCategory::CitizenUpkeepLegacy,
-            -(n_workers as i64 * WORKER_CONSUMPTION_PER_MINUTE),
-        );
-    }
 
     let freights = &world.freight_stations;
 

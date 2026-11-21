@@ -386,7 +386,12 @@ impl WorldCommand {
                 }
                 true
             }
-            SetTaxRate { .. } => return Err(Rejection::InvalidTaxRate),
+            SetTaxRate { rate_permille, .. } => {
+                if *rate_permille > crate::economy::MAX_TAX_RATE_PERMILLE {
+                    return Err(Rejection::InvalidTaxRate);
+                }
+                true
+            }
             _ => true,
         };
         if exists {

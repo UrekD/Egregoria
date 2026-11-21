@@ -62,10 +62,17 @@ impl Government {
                     }
                     Some(Money::new_inner(price))
                 }
-                BuildingKind::RailFreightStation(id) => Some(try_prototype(id)?.price),
-                BuildingKind::TrainStation => Self::checked_bucks(1000),
-                _ => Some(Money::ZERO),
+                _ => Self::special_building_price(*kind),
             },
+            _ => Some(Money::ZERO),
+        }
+    }
+
+    pub(crate) fn special_building_price(kind: BuildingKind) -> Option<Money> {
+        match kind {
+            BuildingKind::GoodsCompany(id) => Some(try_prototype(id)?.price),
+            BuildingKind::RailFreightStation(id) => Some(try_prototype(id)?.price),
+            BuildingKind::TrainStation => Some(Money::new_bucks(1000)),
             _ => Some(Money::ZERO),
         }
     }

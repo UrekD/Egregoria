@@ -30,26 +30,22 @@ fn smoke_builds_a_working_city() {
 }
 
 #[test]
-fn smoke_money_matches_p0_at_50k_ticks() {
+fn smoke_money_reconciles_with_ledger() {
     let mut ctx = ScenarioCtx::new(smoke::OPTIONS);
     let start_tick = ctx.sim.get_tick();
     smoke::run(&mut ctx).unwrap();
 
     assert_eq!(ctx.sim.get_tick() - start_tick, 50_000);
-    // Baseline from `cargo run --release -p scenarios -- smoke` on P0.
     let final_money = ctx.sim.read::<Government>().money;
-    assert_eq!(final_money.cents(), 13_872_484);
-
     let budget = ctx.sim.read::<Budget>();
-    let construction = budget.total(BudgetCategory::Construction);
-    let upkeep = budget.total(BudgetCategory::CitizenUpkeepLegacy);
-    assert!(construction < 0 && upkeep < 0);
+    assert!(budget.total(BudgetCategory::Construction) < 0);
+    let ledger: i128 = budget
+        .days()
+        .values()
+        .flat_map(|day| day.values())
+        .sum();
     assert_eq!(
-        i128::from(Government::default().money.inner())
-            + construction
-            + upkeep
-            + budget.total(BudgetCategory::TradeImport)
-            + budget.total(BudgetCategory::TradeExport),
+        i128::from(Government::default().money.inner()) + ledger,
         i128::from(final_money.inner())
     );
 }

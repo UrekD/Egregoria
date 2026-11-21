@@ -146,18 +146,6 @@ fn company_rates(world: &World) -> (f64, f64, f64) {
     (goods_need, goods_supply, retail_supply)
 }
 
-// P1d supplies the inherent Budget getter. The spine only has default tax rates.
-#[allow(dead_code)]
-trait BudgetTaxRate {
-    fn tax_rate(&self, zone: ZoneKind) -> u16;
-}
-
-impl BudgetTaxRate for Budget {
-    fn tax_rate(&self, _: ZoneKind) -> u16 {
-        DEFAULT_TAX_RATE_PERMILLE
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

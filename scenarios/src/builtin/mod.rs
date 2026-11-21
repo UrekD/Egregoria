@@ -6,6 +6,7 @@ use crate::Scenario;
 use simulation::SimulationOptions;
 
 pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
+    { #[path = "budget_day.rs"] mod budget_day; budget_day::SCENARIO },
     (
         Scenario {
             name: "smoke",
