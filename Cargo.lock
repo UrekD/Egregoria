@@ -2559,6 +2559,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "scenarios"
+version = "0.1.0"
+dependencies = [
+ "geom",
+ "prototypes",
+ "serde",
+ "serde_json",
+ "simulation",
+]
+
+[[package]]
 name = "scoped-tls"
 version = "1.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -13,6 +13,7 @@ members = [
     "native_app",
     "networking",
     "prototypes",
+    "scenarios",
 ]
 
 resolver = "2"
