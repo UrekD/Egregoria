@@ -1,11 +1,12 @@
-use scenarios::builtin::SCENARIOS;
+use scenarios::builtin::{growth_basic, SCENARIOS};
 use scenarios::ScenarioCtx;
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::path::Path;
 use std::process::ExitCode;
 
-const USAGE: &str = "Usage: scenarios <smoke|determinism|perf|all> [--json out.json] [--twice]";
+const USAGE: &str =
+    "Usage: scenarios <smoke|determinism|perf|budget_day|growth_basic|all> [--json out.json] [--twice]";
 
 fn main() -> ExitCode {
     match run() {
@@ -51,7 +52,9 @@ fn run() -> Result<(), String> {
             continue;
         }
         let mut ctx = ScenarioCtx::new(*options);
-        let result = if twice && scenario.name != "determinism" {
+        let result = if twice && scenario.name == growth_basic::SCENARIO.0.name {
+            growth_basic::verify_twice(&mut ctx)
+        } else if twice && scenario.name != "determinism" {
             ctx.verify_twice(scenario.run)
         } else {
             (scenario.run)(&mut ctx)

@@ -1,4 +1,5 @@
 pub mod determinism;
+pub mod growth_basic;
 pub mod perf;
 pub mod smoke;
 
@@ -7,6 +8,7 @@ use simulation::SimulationOptions;
 
 pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     { #[path = "budget_day.rs"] mod budget_day; budget_day::SCENARIO },
+    growth_basic::SCENARIO,
     (
         Scenario {
             name: "smoke",

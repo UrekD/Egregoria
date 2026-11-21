@@ -112,13 +112,12 @@ pub fn citystats_update(sim: &mut Simulation) {
 #[cfg(test)]
 mod tests {
     use super::{CityStats, CityStatsSample, SAMPLES_PER_LEVEL};
-    use crate::economy::Government;
-    use crate::map::BuildingKind;
+    use crate::economy::{balance::DEMAND_INTERVAL_TICKS, Government};
     use crate::tests::TestCtx;
     use crate::world_command::WorldCommand;
     use common::saveload::{Bincode, Encoder};
-    use geom::{vec2, Vec2, OBB};
-    use prototypes::{BuildingGen, GameTime, Tick, TICKS_PER_MINUTE};
+    use geom::vec3;
+    use prototypes::{GameTime, Tick, TICKS_PER_MINUTE};
 
     #[test]
     fn citystats_repairs_out_of_range_history_cursor() {
@@ -146,29 +145,29 @@ mod tests {
     #[test]
     fn citystats_counts_new_resident_on_sampling_tick() {
         let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
+        let lot = ctx.g.map().lots().keys().next().unwrap();
         ctx.apply(&[
-            WorldCommand::SetGameTime(GameTime::new(Tick(TICKS_PER_MINUTE - 1))),
-            WorldCommand::MapBuildSpecialBuilding {
-                pos: OBB::new(vec2(128.0, 128.0), Vec2::X, 12.0, 12.0),
-                kind: BuildingKind::House,
-                gen: BuildingGen::House,
-                zone: None,
-                connected_road: None,
-            },
+            WorldCommand::SetGameTime(GameTime::new(Tick(DEMAND_INTERVAL_TICKS - 1))),
+            WorldCommand::MapBuildHouse(lot),
         ]);
-
-        for _ in 0..TICKS_PER_MINUTE {
-            ctx.tick();
+        assert!(ctx.g.world().humans.is_empty());
+        ctx.tick();
+        {
+            let world = ctx.g.world();
+            let stats = ctx.g.read::<CityStats>();
+            assert_eq!(world.humans.len(), 1);
+            assert_eq!(stats.population, 1);
+            assert_eq!(stats.residences, 1);
+            assert_eq!(stats.employed, 0);
+            assert_eq!(stats.companies, 0);
+            assert_eq!(stats.vehicles as usize, world.vehicles.len());
+            assert_eq!(stats.money, ctx.g.read::<Government>().money);
         }
-
+        ctx.tick();
+        assert_eq!(ctx.g.world().humans.len(), 2);
         let stats = ctx.g.read::<CityStats>();
         assert_eq!(stats.population, 1);
-        assert_eq!(stats.residences, 1);
-        assert_eq!(stats.employed, 0);
-        assert_eq!(stats.companies, 0);
-        assert_eq!(stats.vehicles, 0);
-        assert_eq!(stats.money, ctx.g.read::<Government>().money);
-
         let mut samples = stats.history.samples(0);
         let sample = samples.next().unwrap();
         assert_eq!(sample.population, 1);

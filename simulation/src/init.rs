@@ -1,9 +1,15 @@
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
+use std::marker::PhantomData;
 use std::sync::Once;
 
 #[allow(unused_imports)]
 use common::saveload::{Bincode, Encoder, JSONPretty, JSON};
+use flat_spatial::cell::{CellObject, GridCell};
+use flat_spatial::grid::GridObjects;
+use flat_spatial::storage::CellIdx;
+use geom::Vec2;
 use prototypes::{GameTime, Tick};
 
 use crate::economy::{citystats_update, market_update, CityStats, EcoStats, Government, Market};
@@ -22,7 +28,7 @@ use crate::transportation::testing_vehicles::{random_vehicles_update, RandomVehi
 use crate::transportation::train::{
     locomotive_system, train_reservations_update, TrainReservations,
 };
-use crate::transportation::{transport_grid_synchronize, TransportGrid};
+use crate::transportation::{transport_grid_synchronize, TransportGrid, TransportState};
 use crate::utils::resources::Resources;
 use crate::world::{CompanyEnt, FreightStationEnt, HumanEnt, TrainEnt, VehicleEnt, WagonEnt};
 use crate::World;
@@ -113,10 +119,46 @@ fn register_systems_and_resources() {
     register_resource_default::<ParkingManagement, Bincode>("pmanagement");
     register_resource_default::<BuildingInfos, Bincode>("binfos");
     register_resource::<GameTime, Bincode>("game_time", || GameTime::new(Tick(1)));
-    register_resource::<TransportGrid, Bincode>("transport_grid", || TransportGrid::new(100));
+    register_transport_grid();
     register_resource::<RandProvider, Bincode>("randprovider", || RandProvider::new(RNG_SEED));
     register_resource_default::<Dispatcher, Bincode>("dispatcher");
     register_resource_default::<Replay, crate::utils::replay::ReplayJson>("replay");
+}
+
+// Match flat_spatial::Grid's Bincode layout while ordering the storage cells by
+// coordinate. Cell contents and the slot map keep their original order and handles.
+#[derive(Serialize, Deserialize)]
+struct SavedTransportGrid {
+    storage: SavedTransportCells,
+    objects: GridObjects<TransportState, Vec2>,
+    to_relocate: Vec<CellObject<Vec2>>,
+    _phantom: PhantomData<Vec2>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SavedTransportCells {
+    cell_size: i32,
+    cells: BTreeMap<CellIdx, GridCell<Vec2>>,
+}
+
+fn register_transport_grid() {
+    unsafe {
+        INIT_FUNCS.push(InitFunc {
+            f: Box::new(|sim| sim.insert(TransportGrid::new(100))),
+        });
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "transport_grid",
+            save: Box::new(|sim| {
+                let data = Bincode::encode(&*sim.read::<TransportGrid>()).unwrap();
+                let sorted: SavedTransportGrid = Bincode::decode(&data).unwrap();
+                Bincode::encode(&sorted).unwrap()
+            }),
+            load: Box::new(|sim, data| {
+                sim.insert(Bincode::decode::<TransportGrid>(data)?);
+                Ok(())
+            }),
+        });
+    }
 }
 
 pub struct InitFunc {

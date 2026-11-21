@@ -1,4 +1,4 @@
-use crate::builders::{fill_houses, grid_city, place_company};
+use crate::builders::{fill_houses, grid_city, place_company, seed_households};
 use crate::ScenarioCtx;
 use geom::vec2;
 use simulation::map_dynamic::BuildingInfos;
@@ -37,6 +37,7 @@ pub fn run_for(ctx: &mut ScenarioCtx, ticks: u64) -> Result<(), String> {
             houses.len()
         ));
     }
+    seed_households(&mut ctx.sim, &houses)?;
 
     let setup_ticks = ctx.sim.get_tick() - start;
     let remaining = ticks.checked_sub(setup_ticks).ok_or_else(|| {

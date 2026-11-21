@@ -1,4 +1,4 @@
-use crate::builders::{fill_houses, place_company};
+use crate::builders::{fill_houses, place_company, seed_households};
 use crate::ScenarioCtx;
 use geom::vec2;
 use simulation::world_command::WorldCommand;
@@ -26,7 +26,8 @@ pub fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
             }
         }
     }
-    fill_houses(ctx, 5_000);
+    let houses = fill_houses(ctx, 5_000);
+    seed_households(&mut ctx.sim, &houses)?;
     ctx.sample("setup");
 
     ctx.run_ticks(2_000);

@@ -138,13 +138,13 @@ impl ScenarioCtx {
         let midpoint = ticks / 2;
         let mut resumed = Self::new(opts);
         run_for(&mut resumed, midpoint)?;
-        let mut resumed = resumed.resume()?;
+        resumed.reload()?;
         resumed.run_ticks(ticks - midpoint);
 
         compare_checkpoint(&self.checkpoint(), &resumed.checkpoint())
     }
 
-    fn resume(self) -> Result<Self, String> {
+    pub(crate) fn reload(&mut self) -> Result<(), String> {
         // The public save API uses compressed Bincode under world/. Reserve a
         // private directory so concurrent runs cannot overwrite each other's saves.
         static NEXT_SAVE: AtomicUsize = AtomicUsize::new(0);
@@ -166,7 +166,10 @@ impl ScenarioCtx {
         fs::remove_dir_all(&path).map_err(|err| format!("could not remove {path}: {err}"))?;
         let sim = sim
             .ok_or_else(|| format!("could not round-trip save at tick {}", self.sim.get_tick()))?;
-        Ok(Self::from_sim(sim))
+        compare_checkpoint(&self.checkpoint(), &(sim.get_tick(), sim.hashes()))?;
+        self.sim = sim;
+        self.sched = Simulation::schedule();
+        Ok(())
     }
 
     fn checkpoint(&self) -> Checkpoint {

@@ -1,8 +1,10 @@
 use geom::{vec2, Polygon, Vec2, OBB};
-use prototypes::{try_prototype, GoodsCompanyID, Size2D};
+use prototypes::{try_prototype, BuildingGen, FreightStationPrototypeID, GoodsCompanyID, Size2D};
 use simulation::map::{
-    BuildingID, BuildingKind, LanePatternBuilder, Map, ProjectFilter, ProjectKind, RoadID, Zone,
+    BuildingID, BuildingKind, Density, LanePatternBuilder, Map, ProjectFilter, ProjectKind, RoadID,
+    Zone, ZoneKind,
 };
+use simulation::souls::human::spawn_human;
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 use std::collections::BTreeSet;
@@ -110,6 +112,63 @@ pub fn grid_city(
     GridCity { roads }
 }
 
+/// Paint one zoning rectangle per block in a grid laid out by `grid_city`.
+pub fn paint_zone_blocks(
+    ctx: &mut dyn CommandSink,
+    origin: Vec2,
+    spacing: f32,
+    blocks: impl IntoIterator<Item = (u32, u32, ZoneKind, Density)>,
+) {
+    let commands: Vec<_> = blocks
+        .into_iter()
+        .map(|(x, y, kind, density)| WorldCommand::ZonePaint {
+            area: OBB::new(
+                origin + vec2(x as f32 + 0.5, y as f32 + 0.5) * spacing,
+                Vec2::X,
+                spacing,
+                spacing,
+            ),
+            kind: Some(kind),
+            density,
+        })
+        .collect();
+    if !commands.is_empty() {
+        ctx.submit(&commands);
+        ctx.flush();
+    }
+}
+
+/// Place a freight station with a footprint sized to the available block.
+pub fn place_freight_station(
+    ctx: &mut dyn CommandSink,
+    near: Vec2,
+    size: Size2D,
+) -> Option<BuildingID> {
+    let proto = try_prototype(FreightStationPrototypeID::new("freight-station"))?;
+    if ctx.has_pending_commands() {
+        ctx.flush();
+    }
+    let (road, obb) = roadside_site(&ctx.sim().map(), near, size)?;
+    let kind = BuildingKind::RailFreightStation(proto.id);
+    ctx.submit(&[WorldCommand::MapBuildSpecialBuilding {
+        pos: obb,
+        kind,
+        gen: BuildingGen::NoWalkway {
+            door_pos: Vec2::ZERO,
+        },
+        zone: None,
+        connected_road: Some(road),
+    }]);
+    ctx.flush();
+    let map = ctx.sim().map();
+    let building = map
+        .spatial_map()
+        .query(obb.center(), ProjectFilter::BUILDING)
+        .filter_map(|p| p.as_building())
+        .find(|&id| map.buildings()[id].kind == kind);
+    building
+}
+
 /// Build at most `max` houses on existing lots in lot ID order, returning their building IDs.
 pub fn fill_houses(ctx: &mut dyn CommandSink, max: usize) -> Vec<BuildingID> {
     if max == 0 {
@@ -148,6 +207,14 @@ pub fn fill_houses(ctx: &mut dyn CommandSink, max: usize) -> Vec<BuildingID> {
     houses
 }
 
+/// Populate the prebuilt P0 fixtures with one starting household per house.
+pub(crate) fn seed_households(sim: &mut Simulation, houses: &[BuildingID]) -> Result<(), String> {
+    for &house in houses {
+        spawn_human(sim, house).ok_or_else(|| format!("could not seed a resident in {house:?}"))?;
+    }
+    Ok(())
+}
+
 /// Place a company at a clear, sidewalk-connected site near `near`.
 pub fn place_company(
     ctx: &mut dyn CommandSink,
@@ -162,7 +229,7 @@ pub fn place_company(
     if ctx.has_pending_commands() {
         ctx.flush();
     }
-    let (road, obb) = company_site(&ctx.sim().map(), near, proto.size)?;
+    let (road, obb) = roadside_site(&ctx.sim().map(), near, proto.size)?;
     let kind = BuildingKind::GoodsCompany(proto.id);
     ctx.submit(&[WorldCommand::MapBuildSpecialBuilding {
         pos: obb,
@@ -185,7 +252,7 @@ pub fn place_company(
     id
 }
 
-fn company_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
+fn roadside_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
     let mut best: Option<(f32, RoadID, OBB)> = None;
     let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
     for project in map

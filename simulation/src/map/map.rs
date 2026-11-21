@@ -1002,7 +1002,8 @@ impl Map {
                 .flat_map(|road| road.lanes_iter())
                 .filter(|&(_, x)| x == kind)
                 .map(|(id, _)| &self.lanes[id])
-                .min_by_key(|lane| OrderedFloat(lane.points.project_dist2(p)))
+                // Rebuilding the spatial index on load can reorder equidistant roads.
+                .min_by_key(|lane| (OrderedFloat(lane.points.project_dist2(p)), lane.id))
         };
 
         if let Some(cutoff) = cutoff {
@@ -1020,7 +1021,7 @@ impl Map {
         self.lanes
             .iter()
             .filter(|(_, x)| x.kind == kind)
-            .min_by_key(|(_, lane)| OrderedFloat(lane.points.project_dist2(p)))
+            .min_by_key(|(id, lane)| (OrderedFloat(lane.points.project_dist2(p)), *id))
             .map(|(id, _)| id)
     }
 

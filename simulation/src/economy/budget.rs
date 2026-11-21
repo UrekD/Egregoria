@@ -351,7 +351,6 @@ mod tests {
     fn p1d_growable_company_tax_by_zone() {
         let mut ctx = TestCtx::new_fast();
         ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
-        let house = ctx.build_house_near(vec2(150.0, 125.0));
         for (i, (name, zone, rate_permille)) in [
             ("commercial-l1", ZoneKind::Commercial, 120),
             ("industrial-l1", ZoneKind::Industrial, 240),
@@ -361,6 +360,7 @@ mod tests {
         .enumerate()
         {
             let proto = GoodsCompanyID::new(name);
+            let house = ctx.build_house_near(vec2(145.0 + i as f32 * 45.0, 125.0));
             let pos = vec2(130.0 + i as f32 * 30.0, 175.0);
             ctx.g.apply_commands([
                 &WorldCommand::MapBuildSpecialBuilding {

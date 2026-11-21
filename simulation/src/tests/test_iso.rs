@@ -1,5 +1,6 @@
 use super::{init_test_simulation, TestCtx};
-use crate::map::{LanePatternBuilder, Map, MapProject, ProjectKind, Tree};
+use crate::map::{LaneKind, LanePatternBuilder, Map, MapProject, ProjectKind, Tree};
+use crate::transportation::{TransportGrid, TransportState};
 use crate::utils::replay::ReplayJson;
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::WorldCommand;
@@ -316,20 +317,103 @@ fn resumed_trajectory_matches_continuous_run() {
         ctx.build_house_near(vec2(200.0, 150.0));
     }
 
-    for _ in 0..2000 {
-        continuous.tick_fast();
-    }
     for _ in 0..1000 {
+        continuous.tick_fast();
         resumed.tick_fast();
     }
-    assert_eq!(resumed.g.world().humans.len(), 1);
+    assert_eq!(resumed.g.world().humans.len(), 2);
+    assert_eq!(continuous.g.hashes(), resumed.g.hashes());
     let encoded = Bincode::encode(&resumed.g).unwrap();
     resumed.g = Bincode::decode(&encoded).unwrap();
+    assert_eq!(continuous.g.hashes(), resumed.g.hashes());
     for _ in 0..1000 {
+        continuous.tick_fast();
         resumed.tick_fast();
     }
 
     assert_eq!(continuous.g.hashes(), resumed.g.hashes());
+}
+
+#[test]
+fn equidistant_lanes_match_after_spatial_index_rebuild() {
+    let mut map = Map::empty();
+    let pattern = LanePatternBuilder::new()
+        .one_way(true)
+        .parking(false)
+        .sidewalks(false)
+        .build();
+    let mut road_at = |y| {
+        map.make_connection(
+            MapProject::ground(vec3(100.0, y, 0.0)),
+            MapProject::ground(vec3(300.0, y, 0.0)),
+            None,
+            &pattern,
+        )
+        .unwrap()
+        .1
+    };
+    // Removing the first road swaps the last entry forward in the spatial cell.
+    let temporary = road_at(127.0);
+    road_at(116.0);
+    road_at(138.0);
+    map.remove_road(temporary).unwrap();
+
+    let encoded = Bincode::encode(&map).unwrap();
+    let decoded: Map = Bincode::decode(&encoded).unwrap();
+    let mut lanes = map
+        .lanes()
+        .values()
+        .filter(|lane| lane.kind == LaneKind::Driving);
+    let first = lanes.next().unwrap();
+    let second = lanes.next().unwrap();
+    let reference = vec3(200.0, 127.0, 0.0);
+    let a = first.points.project(reference);
+    let b = second.points.project(reference);
+    let pos = (a + b) * 0.5;
+    assert_eq!(
+        first.points.project_dist2(pos),
+        second.points.project_dist2(pos)
+    );
+    let live = map
+        .nearest_lane(pos, LaneKind::Driving, Some(45.0))
+        .unwrap();
+    let restored = decoded
+        .nearest_lane(pos, LaneKind::Driving, Some(45.0))
+        .unwrap();
+    assert_eq!(live, restored, "lane selection at equal distances");
+}
+
+#[test]
+fn transport_grid_hash_survives_save_with_sparse_cells() {
+    let ctx = TestCtx::new_fast();
+    let remaining = {
+        let mut grid = ctx.g.write::<TransportGrid>();
+        let handles = (0..64)
+            .map(|i| grid.insert(vec2(125.0 * i as f32, 128.0), TransportState::default()))
+            .collect::<Vec<_>>();
+        for &handle in &handles[10..] {
+            grid.remove_maintain(handle);
+        }
+        grid.maintain_deterministic();
+        handles[0]
+    };
+
+    let encoded = Bincode::encode(&ctx.g).unwrap();
+    let restored: Simulation = Bincode::decode(&encoded).unwrap();
+    assert_eq!(
+        ctx.g.hashes()["transport_grid"],
+        restored.hashes()["transport_grid"]
+    );
+    for sim in [&ctx.g, &restored] {
+        let mut grid = sim.write::<TransportGrid>();
+        grid.set_position(remaining, vec2(1_000.0, 256.0));
+        grid.maintain_deterministic();
+        grid.insert(vec2(1_000.0, 256.0), TransportState::default());
+    }
+    assert_eq!(
+        ctx.g.hashes()["transport_grid"],
+        restored.hashes()["transport_grid"]
+    );
 }
 
 #[test]
