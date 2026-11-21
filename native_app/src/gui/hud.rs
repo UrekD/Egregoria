@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use goryak::{image_button, minrow, on_secondary_container, textc};
+use goryak::{button_primary, error, image_button, minrow, on_secondary_container, textc, Window};
 use ordered_float::OrderedFloat;
 use prototypes::ItemID;
 use yakui::{reflow, Alignment, Color, Dim2, Pivot, Vec2};
@@ -47,9 +47,33 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
         uiworld.write::<GuiState>().windows.render(uiworld, sim);
         time_controls(uiworld, sim);
         toasts::render(uiworld, sim);
-        keybinds::keybind_modal(uiworld, sim)
+        keybinds::keybind_modal(uiworld, sim);
+        startup_save_message(uiworld);
     });
     //goryak::debug_layout();
+}
+
+fn startup_save_message(uiworld: &UiWorld) {
+    let mut state = uiworld.write::<SaveLoadState>();
+    let Some(message) = state.startup_message.as_ref() else {
+        return;
+    };
+    let mut opened = true;
+    let mut dismissed = false;
+    Window {
+        title: "Save could not be loaded".into(),
+        pad: yakui::widgets::Pad::all(10.0),
+        radius: 10.0,
+        opened: &mut opened,
+        child_spacing: 10.0,
+    }
+    .show(|| {
+        textc(error(), message.clone());
+        dismissed = button_primary("Dismiss").show().clicked;
+    });
+    if dismissed || !opened {
+        state.startup_message = None;
+    }
 }
 
 fn auto_save(uiworld: &UiWorld) {

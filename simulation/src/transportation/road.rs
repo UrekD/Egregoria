@@ -54,7 +54,7 @@ pub fn vehicle_decision(
     let mut desired_dir = Vec3::ZERO;
     if matches!(
         vehicle.state,
-        VehicleState::Driving | VehicleState::Panicking(_)
+        VehicleState::Driving | VehicleState::Panicking(_) | VehicleState::ReturningToDepot { .. }
     ) {
         let danger_length =
             (self_obj.speed.powi(2) / (2.0 * vehicle.kind.deceleration())).min(100.0);
@@ -80,13 +80,35 @@ pub fn vehicle_decision(
 
 pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources) {
     profiling::scope!("transportation::vehicle_state_update_system");
-    let ra = &*resources.read();
-    let rb = &*resources.read();
+    let buffer = &*resources.read::<ParCommandBuffer<VehicleEnt>>();
+    let map = &*resources.read::<Map>();
 
     world.vehicles.iter_mut().for_each(|(ent, v)| {
+        if let VehicleState::ReturningToDepot {
+            spot,
+            stopped_ticks,
+        } = &mut v.vehicle.state
+        {
+            const MAX_STOPPED_TICKS: u16 = 1_000;
+            *stopped_ticks = if v.speed.0.abs() < 0.2 {
+                stopped_ticks.saturating_add(1)
+            } else {
+                0
+            };
+            if !spot.exists(&map.parking)
+                || v.it.is_wait_for_reroute().is_some()
+                || v.it.has_ended(0.0)
+                || *stopped_ticks >= MAX_STOPPED_TICKS
+            {
+                buffer.exec_ent(ent, move |sim| {
+                    crate::souls::lifecycle::finish_truck_return(sim, ent);
+                });
+            }
+            return;
+        }
         vehicle_state_update(
-            ra,
-            rb,
+            buffer,
+            map,
             ent,
             &mut v.vehicle,
             &mut v.trans,
@@ -220,7 +242,7 @@ pub fn calc_decision<'a>(
         }
     } else if speed.abs() < 0.2 && front_dist < 1.5 {
         let me_u64: u64 = me.data().as_ffi();
-        if me_u64 == flag {
+        if me_u64 == flag && matches!(vehicle.state, VehicleState::Driving) {
             vehicle.state = VehicleState::Panicking(time.instant());
             log::info!("gridlock!")
         }

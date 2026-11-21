@@ -17,6 +17,20 @@ The game is still in early development, but you can already play it and give som
 By being open source, the hope is to get more people involved in the development of the game.  
 Mod support is wanted but the design has not been found yet.
 
+## Fork development progress (placeholder visuals)
+
+This fork is working toward Cities: Skylines-style core gameplay (zoning, demand, growth, budget, services, transit) with placeholder visuals first; models and art come after the gameplay has been playtested.
+
+### Milestone P0 — verification foundation
+
+Headless scenario runner, determinism and save/resume checks, lifecycle cleanup, validated commands and scripted screenshots (Xvfb + software Vulkan).
+
+| Overview | Economy window |
+|---|---|
+| ![P0 smoke overview](docs/screenshots/p0-smoke-overview.png) | ![P0 smoke economy](docs/screenshots/p0-smoke-economy.png) |
+
+Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
+
 ## How to play
 
 A small tutorial is available on the [github wiki]((https://github.com/Uriopass/Egregoria/wiki/Introduction-Guide)) to get you started.

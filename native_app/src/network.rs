@@ -1,10 +1,10 @@
 pub use self::inner::*;
 use crate::game_loop::{State, Timings};
 use crate::gui::windows::settings::Settings;
-use crate::uiworld::{ReceivedCommands, SaveLoadState};
+use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
 use common::timestep::Timestep;
 use simulation::utils::scheduler::SeqSchedule;
-use simulation::world_command::{WorldCommand, WorldCommands};
+use simulation::world_command::{CommandOutcomes, WorldCommand, WorldCommands};
 use simulation::Simulation;
 
 impl Default for NetworkState {
@@ -50,6 +50,7 @@ fn handle_singleplayer(state: &mut State) {
 
     if has_commands && commands.iter().all(WorldCommand::is_instant) {
         sim.apply_commands(commands.as_ref());
+        publish_accepted_commands(&state.uiw, &sim, &commands);
         commands = WorldCommands::default();
         has_commands = false;
     }
@@ -70,10 +71,23 @@ fn handle_singleplayer(state: &mut State) {
     }
 
     if commands_once.is_none() {
-        *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::new(commands);
+        if has_commands {
+            publish_accepted_commands(&state.uiw, &sim, &commands);
+        }
     } else {
         *state.uiw.write::<WorldCommands>() = commands;
     }
+}
+
+fn publish_accepted_commands(uiw: &UiWorld, sim: &Simulation, commands: &WorldCommands) {
+    let mut accepted = WorldCommands::default();
+    accepted.extend(
+        sim.read::<CommandOutcomes>()
+            .accepted
+            .iter()
+            .map(|&index| commands.as_ref()[index].clone()),
+    );
+    *uiw.write::<ReceivedCommands>() = ReceivedCommands::new(accepted);
 }
 
 fn handle_replay(

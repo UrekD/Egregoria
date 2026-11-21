@@ -1,6 +1,7 @@
-use crate::map::{LanePattern, MapProject, MAX_ZONE_AREA};
+use crate::map::{LanePattern, MAX_ZONE_AREA};
 use crate::world_command::WorldCommand;
 use crate::{BuildingKind, Simulation};
+use geom::Vec3;
 use prototypes::{try_prototype, Money};
 use serde::{Deserialize, Serialize};
 
@@ -31,7 +32,10 @@ impl Government {
                 Self::checked_bucks(count.checked_mul(100)?.checked_add(1000)?)
             }
             WorldCommand::MapMakeConnection { from, to, pat, .. } => {
-                Self::connection_cost(from, to, pat)
+                let map = sim.map();
+                let from = map.resolve_connection_endpoint(*from)?;
+                let to = map.resolve_connection_endpoint(*to)?;
+                Self::connection_cost(from.pos, to.pos, pat)
             }
             WorldCommand::UpdateZone { building, zone } => {
                 let m = sim.map();
@@ -43,9 +47,11 @@ impl Government {
                 Self::zone_cost(description.price_per_area, new_area - old_area)
             }
             WorldCommand::MapMakeMultipleConnections(projects, links) => {
+                let map = sim.map();
                 let total = links.iter().try_fold(0i64, |total, (from, to, _, pat)| {
-                    let cost =
-                        Self::connection_cost(projects.get(*from)?, projects.get(*to)?, pat)?;
+                    let from = map.resolve_connection_endpoint(*projects.get(*from)?)?;
+                    let to = map.resolve_connection_endpoint(*projects.get(*to)?)?;
+                    let cost = Self::connection_cost(from.pos, to.pos, pat)?;
                     total.checked_add(cost.inner())
                 })?;
                 Some(Money::new_inner(total))
@@ -54,10 +60,10 @@ impl Government {
                 BuildingKind::GoodsCompany(id) => {
                     let proto = try_prototype(id)?;
                     let mut price = proto.price.inner();
-                    if let Some((description, zone)) = proto.zone.as_ref().zip(zone.as_ref()) {
+                    if let Some(description) = &proto.zone {
+                        let area = zone.as_ref()?.validated_area()?;
                         price = price.checked_add(
-                            Self::zone_cost(description.price_per_area, zone.validated_area()?)?
-                                .inner(),
+                            Self::zone_cost(description.price_per_area, area)?.inner(),
                         )?;
                     }
                     Some(Money::new_inner(price))
@@ -77,12 +83,8 @@ impl Government {
         }
     }
 
-    pub(crate) fn connection_cost(
-        p1: &MapProject,
-        p2: &MapProject,
-        pat: &LanePattern,
-    ) -> Option<Money> {
-        let dist = p1.pos.distance(p2.pos);
+    pub(crate) fn connection_cost(p1: Vec3, p2: Vec3, pat: &LanePattern) -> Option<Money> {
+        let dist = p1.distance(p2);
         let lanes = i64::try_from(
             pat.lanes_forward
                 .len()

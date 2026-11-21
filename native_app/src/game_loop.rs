@@ -53,13 +53,24 @@ impl engine::framework::State for State {
         log::info!("loaded egui_render");
 
         let automation = Automation::take_startup();
-        let sim = if automation.is_some() {
-            Simulation::new_with_options(scenarios::builtin::smoke::OPTIONS)
+        let (sim, startup_message) = if automation.is_some() {
+            (
+                Simulation::new_with_options(scenarios::builtin::smoke::OPTIONS),
+                None,
+            )
         } else {
-            Simulation::load_from_disk("world").unwrap_or_else(|| Simulation::new(true))
+            match Simulation::load_or_new("world") {
+                Ok(world) => world,
+                Err(error) => {
+                    log::error!("{error}");
+                    eprintln!("{error}");
+                    std::process::exit(1);
+                }
+            }
         };
         let game_schedule = Simulation::schedule();
         let mut uiworld = UiWorld::init();
+        uiworld.write::<SaveLoadState>().startup_message = startup_message;
         if automation.is_some() {
             crate::init::configure_script_settings(&uiworld);
         }

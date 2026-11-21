@@ -19,6 +19,17 @@ pub enum VehicleState {
     /// Panicked when it notices it's in a gridlock
     Panicking(GameInstant),
     RoadToPark(Spline3, f32, SpotReservation),
+    ReturningToDepot {
+        spot: SpotReservation,
+        stopped_ticks: u16,
+    },
+    ParkedAtDepot,
+}
+
+impl VehicleState {
+    pub fn is_parked(&self) -> bool {
+        matches!(self, Self::Parked(_) | Self::ParkedAtDepot)
+    }
 }
 
 debug_inspect_impl!(VehicleState);
@@ -104,17 +115,32 @@ impl VehicleKind {
     }
 }
 
+impl VehicleEnt {
+    pub(crate) fn begin_parking(&mut self, trans: Transform, spot: SpotReservation) {
+        let spline = Spline3 {
+            from: self.trans.pos,
+            to: trans.pos,
+            from_derivative: self.trans.dir * 2.0,
+            to_derivative: trans.dir * 2.0,
+        };
+        self.vehicle.state = VehicleState::RoadToPark(spline, 0.0, spot);
+        self.speed.0 = 0.0;
+    }
+}
+
 pub fn unpark(sim: &mut Simulation, vehicle: VehicleID) {
     let v = unwrap_ret!(sim.world.vehicles.get_mut(vehicle));
     let w = v.vehicle.kind.width();
     let trans = v.trans;
 
-    if let VehicleState::Parked(spot) =
-        std::mem::replace(&mut v.vehicle.state, VehicleState::Driving)
-    {
-        sim.write::<ParkingManagement>().free(spot);
-    } else {
-        log::warn!("Trying to unpark {:?} that wasn't parked", vehicle);
+    match std::mem::replace(&mut v.vehicle.state, VehicleState::Driving) {
+        VehicleState::Parked(spot) => sim.write::<ParkingManagement>().free(spot),
+        VehicleState::ParkedAtDepot => {}
+        state => {
+            v.vehicle.state = state;
+            log::warn!("Trying to unpark {:?} that wasn't parked", vehicle);
+            return;
+        }
     }
 
     let coll = put_vehicle_in_transport_grid(sim, w, trans);
@@ -154,6 +180,16 @@ pub fn spawn_parked_vehicle_with_spot(
     let vehicle = Vehicle::new(kind, spot_id, tint, &mut sim.write::<RandProvider>());
 
     Some(make_vehicle_entity(sim, pos, vehicle, it, false))
+}
+
+pub(crate) fn spawn_truck_at_depot(sim: &mut Simulation, door: Vec3) -> VehicleID {
+    let vehicle = Vehicle::with_state(
+        VehicleKind::Truck,
+        VehicleState::ParkedAtDepot,
+        Color::WHITE,
+        &mut sim.write::<RandProvider>(),
+    );
+    make_vehicle_entity(sim, Transform::new(door), vehicle, Itinerary::NONE, false)
 }
 
 pub fn make_vehicle_entity(
@@ -211,11 +247,20 @@ impl Vehicle {
         tint: Color,
         rng: &mut RandProvider,
     ) -> Vehicle {
+        Self::with_state(kind, VehicleState::Parked(spot), tint, rng)
+    }
+
+    fn with_state(
+        kind: VehicleKind,
+        state: VehicleState,
+        tint: Color,
+        rng: &mut RandProvider,
+    ) -> Self {
         Self {
             ang_velocity: 0.0,
             wait_time: 0.0,
             max_speed_multiplier: 0.95 + 0.1 * rng.next_f32(),
-            state: VehicleState::Parked(spot),
+            state,
             kind,
             tint,
             flag: 0,

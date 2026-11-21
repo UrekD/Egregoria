@@ -113,6 +113,7 @@ pub fn citystats_update(sim: &mut Simulation) {
 mod tests {
     use super::{CityStats, CityStatsSample, SAMPLES_PER_LEVEL};
     use crate::economy::{balance::DEMAND_INTERVAL_TICKS, Government};
+    use crate::map::{LanePatternBuilder, MapProject};
     use crate::tests::TestCtx;
     use crate::world_command::WorldCommand;
     use common::saveload::{Bincode, Encoder};
@@ -168,6 +169,41 @@ mod tests {
         assert_eq!(ctx.g.world().humans.len(), 2);
         let stats = ctx.g.read::<CityStats>();
         assert_eq!(stats.population, 1);
+        let mut samples = stats.history.samples(0);
+        let sample = samples.next().unwrap();
+        assert_eq!(sample.population, 1);
+        assert_eq!(sample.money, stats.money);
+        assert!(samples.next().is_none());
+    }
+
+    #[test]
+    fn citystats_counts_new_resident_without_parking() {
+        let mut ctx = TestCtx::new();
+        ctx.g
+            .map_mut()
+            .make_connection(
+                MapProject::ground(vec3(100.0, 100.0, 0.0)),
+                MapProject::ground(vec3(300.0, 100.0, 0.0)),
+                None,
+                &LanePatternBuilder::default().parking(false).build(),
+            )
+            .unwrap();
+        let lot = ctx.g.map().lots().keys().next().unwrap();
+        ctx.apply(&[
+            WorldCommand::SetGameTime(GameTime::new(Tick(DEMAND_INTERVAL_TICKS - 1))),
+            WorldCommand::MapBuildHouse(lot),
+        ]);
+        assert!(ctx.g.world().humans.is_empty());
+        ctx.tick();
+
+        let stats = ctx.g.read::<CityStats>();
+        assert_eq!(stats.population, 1);
+        assert_eq!(stats.residences, 1);
+        assert_eq!(stats.employed, 0);
+        assert_eq!(stats.companies, 0);
+        assert_eq!(stats.vehicles, 0);
+        assert_eq!(stats.money, ctx.g.read::<Government>().money);
+
         let mut samples = stats.history.samples(0);
         let sample = samples.next().unwrap();
         assert_eq!(sample.population, 1);

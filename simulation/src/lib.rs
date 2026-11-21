@@ -10,7 +10,7 @@ use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
 use crate::world_command::WorldCommand::Init;
 use crate::world_command::{CommandOutcomes, WorldCommand};
-use common::saveload::Encoder;
+use common::saveload::{self, Bincode, CompressedBincode, Encoder};
 use common::FastMap;
 use derive_more::{From, TryInto};
 use geom::Vec3;
@@ -20,6 +20,8 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
+use std::io;
+use std::path::Path;
 use std::ptr::addr_of;
 use std::time::{Duration, Instant};
 use utils::rand_provider::RandProvider;
@@ -52,6 +54,7 @@ pub mod utils;
 mod world;
 pub mod world_command;
 
+pub use common::saveload::save_dir;
 pub use world::*;
 
 pub use utils::par_command_buffer::ParCommandBuffer;
@@ -275,10 +278,15 @@ impl Simulation {
             utils::scheduler::drain_commands(self);
             return;
         }
-        self.write::<CommandOutcomes>().last.clear();
-        for command in commands {
+        *self.write::<CommandOutcomes>() = CommandOutcomes::default();
+        for (index, command) in commands.enumerate() {
+            let before = self.read::<CommandOutcomes>().last.len();
             command.apply_in_batch(self);
             utils::scheduler::drain_commands(self);
+            let mut outcomes = self.write::<CommandOutcomes>();
+            if outcomes.last.len() == before {
+                outcomes.accepted.push(index);
+            }
         }
     }
 
@@ -312,19 +320,73 @@ impl Simulation {
         }
     }
 
-    pub fn load_from_disk(save_name: &str) -> Option<Self> {
-        let sim: Simulation = match common::saveload::CompressedBincode::load(save_name) {
-            Ok(sim) => sim,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
-            Err(error) => {
-                log::error!("Could not load simulation {save_name}: {error}");
-                return None;
-            }
+    pub fn load_from_disk(save_name: &str) -> Result<Self, SaveLoadError> {
+        let corrupt_header = |error: io::Error| SaveLoadError::Corrupt {
+            version: None,
+            reason: error.to_string(),
         };
-        if sim.resources.try_read::<Map>().ok()?.environment.size().0 == 0 {
-            return None;
+        let bytes =
+            match read_save(&CompressedBincode::filename(save_name)).map_err(SaveLoadError::Io)? {
+                Some(bytes) => CompressedBincode::decompress(&bytes).map_err(corrupt_header)?,
+                None => read_save(&Bincode::filename(save_name))
+                    .map_err(SaveLoadError::Io)?
+                    .ok_or(SaveLoadError::NotFound)?,
+            };
+
+        // Decode only the prefix so an old World layout cannot hide an incompatible version.
+        let SaveHeader { version } = Bincode::decode_prefix(&bytes).map_err(corrupt_header)?;
+        if version != VERSION {
+            return Err(SaveLoadError::Incompatible { version });
         }
-        Some(sim)
+
+        let data: SimulationDeser =
+            Bincode::decode(&bytes).map_err(|error| SaveLoadError::Corrupt {
+                version: Some(version.clone()),
+                reason: error.to_string(),
+            })?;
+        let sim = data.into_sim().map_err(|reason| SaveLoadError::Corrupt {
+            version: Some(version.clone()),
+            reason,
+        })?;
+        if sim
+            .resources
+            .try_read::<Map>()
+            .ok()
+            .is_none_or(|map| map.environment.size().0 == 0)
+        {
+            return Err(SaveLoadError::Corrupt {
+                version: Some(version),
+                reason: "the map has no terrain".into(),
+            });
+        }
+        log::info!("successfully loaded simulation {save_name}");
+        Ok(sim)
+    }
+
+    /// Load the world, or back up a refused save before creating its replacement.
+    /// The optional message describes the recovery for the caller to display.
+    pub fn load_or_new(save_name: &str) -> Result<(Self, Option<String>), String> {
+        let error = match Self::load_from_disk(save_name) {
+            Ok(sim) => return Ok((sim, None)),
+            Err(SaveLoadError::NotFound) => return Ok((Self::new(true), None)),
+            Err(error @ SaveLoadError::Io(_)) => return Err(error.to_string()),
+            Err(error) => error,
+        };
+        let version = match &error {
+            SaveLoadError::Incompatible { version } => Some(version.as_str()),
+            SaveLoadError::Corrupt { version, .. } => version.as_deref(),
+            _ => unreachable!(),
+        };
+        let backups = saveload::backup_save_files(save_name, version).map_err(|backup_error| {
+            format!("{error}. Could not back up the save: {backup_error}")
+        })?;
+        let message = format!(
+            "{error}. Moved {} save file(s) to .bak files in {} and started a new world.",
+            backups.len(),
+            saveload::save_dir().display()
+        );
+        log::error!("{message}");
+        Ok((Self::new(true), Some(message)))
     }
 
     pub fn save_to_disk(&self, save_name: &str) {
@@ -413,20 +475,65 @@ impl Serialize for Simulation {
 
 #[derive(Serialize, Deserialize)]
 struct SaveHeader {
-    #[serde(deserialize_with = "deserialize_save_version")]
     version: String,
 }
 
-fn deserialize_save_version<'de, D: Deserializer<'de>>(
+fn deserialize_save_header<'de, D: Deserializer<'de>>(
     deserializer: D,
-) -> Result<String, D::Error> {
-    let version = String::deserialize(deserializer)?;
+) -> Result<SaveHeader, D::Error> {
+    let header = SaveHeader::deserialize(deserializer)?;
+    let version = &header.version;
     if version != VERSION {
         return Err(serde::de::Error::custom(format!(
             "Save has version {version:?}, expected {VERSION:?}"
         )));
     }
-    Ok(version)
+    Ok(header)
+}
+
+#[derive(Debug)]
+pub enum SaveLoadError {
+    NotFound,
+    Incompatible {
+        version: String,
+    },
+    Corrupt {
+        version: Option<String>,
+        reason: String,
+    },
+    Io(io::Error),
+}
+
+impl Display for SaveLoadError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => f.write_str("Save not found"),
+            Self::Incompatible { version } => {
+                write!(
+                    f,
+                    "Save version {:?} is incompatible with {:?}",
+                    version.trim(),
+                    VERSION.trim()
+                )
+            }
+            Self::Corrupt { reason, .. } => write!(f, "Save is corrupt ({reason})"),
+            Self::Io(error) => write!(f, "Could not read save ({error})"),
+        }
+    }
+}
+
+impl std::error::Error for SaveLoadError {}
+
+fn read_save(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => match path.symlink_metadata() {
+            Ok(_) => Ok(Some(Vec::new())), // A dangling save symlink still needs backing up.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        },
+        Err(error) => Err(error),
+    }
 }
 
 #[derive(Serialize)]
@@ -439,7 +546,7 @@ struct SimulationSer<'a> {
 #[derive(Deserialize)]
 struct SimulationDeser {
     // Bincode reads and validates the leading header before decoding World.
-    #[serde(rename = "header")]
+    #[serde(rename = "header", deserialize_with = "deserialize_save_header")]
     _header: SaveHeader,
     world: World,
     res: FastMap<String, Vec<u8>>,
@@ -450,17 +557,16 @@ impl<'de> Deserialize<'de> for Simulation {
     where
         D: Deserializer<'de>,
     {
-        log::info!("deserializing sim state");
+        SimulationDeser::deserialize(deserializer)?
+            .into_sim()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+impl SimulationDeser {
+    fn into_sim(self) -> Result<Simulation, String> {
         let t = Instant::now();
-
-        let simdeser = <SimulationDeser as Deserialize>::deserialize(deserializer)?;
-
-        log::info!(
-            "took {}s to deserialize base deser",
-            t.elapsed().as_secs_f32()
-        );
-
-        let mut sim = Self {
+        let mut sim = Simulation {
             world: World::default(),
             resources: Resources::default(),
         };
@@ -471,19 +577,16 @@ impl<'de> Deserialize<'de> for Simulation {
             }
         }
 
-        sim.world = simdeser.world;
+        sim.world = self.world;
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let data = simdeser.res.get(l.name).ok_or_else(|| {
-                    serde::de::Error::custom(format!("Missing resource {}", l.name))
-                })?;
-                (l.load)(&mut sim, data).map_err(|error| {
-                    serde::de::Error::custom(format!(
-                        "Could not decode resource {}: {error}",
-                        l.name
-                    ))
-                })?;
+                let data = self
+                    .res
+                    .get(l.name)
+                    .ok_or_else(|| format!("Missing resource {}", l.name))?;
+                (l.load)(&mut sim, data)
+                    .map_err(|error| format!("Could not decode resource {}: {error}", l.name))?;
             }
         }
 

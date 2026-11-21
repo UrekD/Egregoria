@@ -73,6 +73,8 @@ fn message(reason: Rejection) -> &'static str {
         Rejection::InvalidBuilding => "Building cannot be placed here",
         Rejection::InvalidZone => "Zoning area is outside the map or too large",
         Rejection::InvalidTaxRate => "Tax rate is outside the allowed range",
+        Rejection::InvalidTerraform => "Terrain edit is outside the allowed range",
+        Rejection::TooManyRandomCars => "A command can spawn at most 1,000 random cars",
         Rejection::InvalidTrain => "Train cannot be placed here",
         Rejection::CostOverflow => "Construction cost is too large",
         Rejection::InsufficientFunds => "Not enough money",

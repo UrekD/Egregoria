@@ -230,7 +230,9 @@ mod tests {
     use crate::{Simulation, SoulID};
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Vec2, OBB};
-    use prototypes::{BuildingGen, GameTime, GoodsCompanyID, ResidencePrototypeID};
+    use prototypes::{
+        BuildingGen, FreightStationPrototypeID, GameTime, GoodsCompanyID, ResidencePrototypeID,
+    };
 
     fn advance_budget_ticks(sim: &mut Simulation, ticks: u64) {
         let mut schedule = SeqSchedule::default();
@@ -375,11 +377,16 @@ mod tests {
             },
         );
         let opening = ctx.g.read::<Government>().money;
+        let site = vec2(150.0, 175.0);
+        let kind =
+            BuildingKind::RailFreightStation(FreightStationPrototypeID::new("freight-station"));
         ctx.g
             .apply_commands([&WorldCommand::MapBuildSpecialBuilding {
-                pos: OBB::new(vec2(150.0, 175.0), Vec2::X, 10.0, 10.0),
-                kind: BuildingKind::TrainStation,
-                gen: BuildingGen::House,
+                pos: OBB::new(site, Vec2::X, 10.0, 10.0),
+                kind,
+                gen: BuildingGen::NoWalkway {
+                    door_pos: Vec2::ZERO,
+                },
                 zone: None,
                 connected_road: None,
             }]);
@@ -388,7 +395,7 @@ mod tests {
             .map()
             .buildings()
             .values()
-            .find(|building| building.kind == BuildingKind::TrainStation)
+            .find(|building| building.kind == kind && building.obb.center() == site)
             .unwrap()
             .id;
         let employed = spawn_human(&mut ctx.g, house).unwrap();
@@ -407,7 +414,7 @@ mod tests {
         budget_update(world, resources);
         let tax = Money::new_bucks(36).inner();
         let road_upkeep = Money::from_float_bucks(lane_metres * 5.0 / 1000.0).inner();
-        // The starting freight station and the train station each cost $1,000.
+        // Both freight stations cost $1,000 each.
         let station_upkeep = Money::new_bucks(10).inner();
         assert_eq!(
             resources.read::<Government>().money,

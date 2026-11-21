@@ -18,6 +18,68 @@ pub fn save_dir() -> &'static Path {
     SAVE_DIR.get().map_or(Path::new("world"), PathBuf::as_path)
 }
 
+/// Move a world and its replay aside without replacing any existing backup.
+pub fn backup_save_files(name: &str, version: Option<&str>) -> Result<Vec<PathBuf>> {
+    backup_save_files_in(save_dir(), name, version)
+}
+
+fn backup_save_files_in(dir: &Path, name: &str, version: Option<&str>) -> Result<Vec<PathBuf>> {
+    let version = version
+        .map(str::trim)
+        .filter(|version| {
+            !version.is_empty()
+                && version.len() <= 64
+                && version
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b))
+        })
+        .unwrap_or("unknown");
+    // Move the replay and legacy save before the compressed save so a failed
+    // backup can be retried at startup while the refused save is still in place.
+    let save_files = [
+        format!("{name}_replay.{}", JSONPretty::EXTENSION),
+        format!("{name}_replay.{}", CompressedBincode::EXTENSION),
+        format!("{name}.{}", Bincode::EXTENSION),
+        format!("{name}.{}", CompressedBincode::EXTENSION),
+    ];
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let Some(index) = save_files.iter().position(|name| filename == name.as_str()) else {
+            continue;
+        };
+        let kind = entry.file_type()?;
+        if kind.is_file() || kind.is_symlink() {
+            files.push((index, entry.path()));
+        }
+    }
+    files.sort_by_key(|(index, _)| *index);
+    let mut backups = Vec::with_capacity(files.len());
+    for (index, source) in files {
+        let name = &save_files[index];
+        for suffix in 0.. {
+            let filename = if suffix == 0 {
+                format!("{name}.{version}.bak")
+            } else {
+                format!("{name}.{version}.{suffix}.bak")
+            };
+            let target = dir.join(filename);
+            // A same-directory hard link claims the destination atomically, unlike rename.
+            match std::fs::hard_link(&source, &target) {
+                Ok(()) => {
+                    std::fs::remove_file(&source)?;
+                    backups.push(target);
+                    break;
+                }
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    Ok(backups)
+}
+
 pub fn walkdir(dir: &Path) -> impl Iterator<Item = PathBuf> {
     let mut paths = Vec::new();
     for entry in std::fs::read_dir(dir).expect("dir not found") {
@@ -99,6 +161,17 @@ pub trait Encoder {
 pub struct Bincode;
 
 use ::bincode::{DefaultOptions, Options};
+
+impl Bincode {
+    /// Decode a leading value from a slice, leaving subsequent fields unread.
+    pub fn decode_prefix<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
+        DefaultOptions::new()
+            .allow_trailing_bytes()
+            .deserialize(bytes)
+            .map_err(|error| io::Error::new(ErrorKind::Other, error))
+    }
+}
+
 impl Encoder for Bincode {
     const EXTENSION: &'static str = "bc";
 
@@ -131,6 +204,14 @@ impl Encoder for Bincode {
 
 pub struct CompressedBincode;
 
+impl CompressedBincode {
+    /// Decompress a payload so callers can inspect its Bincode prefix before decoding it.
+    pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
+        miniz_oxide::inflate::decompress_to_vec_zlib(bytes)
+            .map_err(|_| std::io::Error::new(ErrorKind::Other, "could not decode zipped file"))
+    }
+}
+
 impl Encoder for CompressedBincode {
     const EXTENSION: &'static str = "zip";
 
@@ -141,9 +222,7 @@ impl Encoder for CompressedBincode {
     }
 
     fn decode<T: DeserializeOwned>(x: &[u8]) -> Result<T> {
-        let v = &miniz_oxide::inflate::decompress_to_vec_zlib(x)
-            .map_err(|_| std::io::Error::new(ErrorKind::Other, "could not decode zipped file"))?;
-        Bincode::decode(v)
+        Bincode::decode(&Self::decompress(x)?)
     }
 }
 
@@ -222,5 +301,67 @@ mod tests {
         CompressedBincode::save_silent(&43, "world").unwrap();
         assert_eq!(CompressedBincode::load::<i32>("world").unwrap(), 43);
         std::fs::remove_dir_all(root).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod backup_tests {
+    use super::*;
+
+    #[test]
+    fn backup_preserves_save_family_and_existing_backups() {
+        let dir = std::env::temp_dir().join(format!(
+            "egr-save-backup-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        for (name, bytes) in [
+            ("world.bc", "legacy"),
+            ("world.zip", "current"),
+            ("world_replay.json", "replay"),
+            ("world_replay.zip", "compressed replay"),
+            ("world.zip.0.6.1.bak", "earlier backup"),
+            ("settings.json", "settings"),
+            ("world2.zip", "other world"),
+            ("world-notes.txt", "notes"),
+        ] {
+            std::fs::write(dir.join(name), bytes).unwrap();
+        }
+
+        let backups = backup_save_files_in(&dir, "world", Some("0.6.1")).unwrap();
+        for (name, bytes) in [("world2.zip", "other world"), ("world-notes.txt", "notes")] {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), bytes);
+        }
+        assert_eq!(backups.len(), 4);
+        for (name, bytes) in [
+            ("world.bc.0.6.1.bak", "legacy"),
+            ("world.zip.0.6.1.1.bak", "current"),
+            ("world_replay.json.0.6.1.bak", "replay"),
+            ("world_replay.zip.0.6.1.bak", "compressed replay"),
+            ("world.zip.0.6.1.bak", "earlier backup"),
+            ("settings.json", "settings"),
+        ] {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), bytes);
+        }
+        for name in [
+            "world.bc",
+            "world.zip",
+            "world_replay.json",
+            "world_replay.zip",
+        ] {
+            assert!(!dir.join(name).exists());
+        }
+
+        std::fs::write(dir.join("world.zip"), "unreadable").unwrap();
+        backup_save_files_in(&dir, "world", None).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.join("world.zip.unknown.bak")).unwrap(),
+            "unreadable"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

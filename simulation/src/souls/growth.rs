@@ -636,9 +636,18 @@ mod tests {
             test.g = Bincode::decode(&encoded).unwrap();
             let road = {
                 let mut map = test.g.map_mut();
-                let junction = map
-                    .split_road(origin.parent, vec3(285.0, 100.0, 0.0))
+                let (_, spur) = map
+                    .make_connection(
+                        MapProject {
+                            pos: vec3(285.0, 100.0, 0.0),
+                            kind: crate::map::ProjectKind::Road(origin.parent),
+                        },
+                        MapProject::ground(vec3(285.0, 40.0, 0.0)),
+                        None,
+                        &LanePatternBuilder::default().sidewalks(false).build(),
+                    )
                     .unwrap();
+                let junction = map.remove_road(spur).unwrap().src;
                 if merge {
                     let roads = &map.get(junction).unwrap().roads;
                     let (a, b) = (roads[0], roads[1]);

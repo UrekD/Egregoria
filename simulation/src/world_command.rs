@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::time::Instant;
 
 use prototypes::{try_prototype, Money, RollingStockID};
@@ -13,8 +13,8 @@ use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
     Building, BuildingID, BuildingKind, Density, Environment, IntersectionID, LaneID, LaneKind,
-    LanePattern, LanePatternBuilder, LightPolicy, LotID, Map, MapProject, ProjectFilter,
-    ProjectKind, RoadID, TerraformKind, TurnPolicy, Zone, ZoneGrid, ZoneKind,
+    LanePattern, LanePatternBuilder, LightPolicy, LotID, Map, MapProject, ProjectKind, RoadID,
+    TerraformKind, TurnPolicy, Zone, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{BuildingInfos, ParkingManagement};
 use crate::multiplayer::chat::Message;
@@ -119,6 +119,8 @@ pub enum Rejection {
     InvalidZone,
     InvalidTaxRate,
     InvalidTrain,
+    InvalidTerraform,
+    TooManyRandomCars,
     CostOverflow,
     InsufficientFunds,
     MutationFailed,
@@ -128,6 +130,8 @@ pub enum Rejection {
 pub struct CommandOutcomes {
     /// Rejections from the most recent nonempty batch, in command order.
     pub last: Vec<(&'static str, Rejection)>,
+    /// Input indices of commands that completed without any rejection.
+    pub accepted: Vec<usize>,
 }
 
 impl AsRef<[WorldCommand]> for WorldCommands {
@@ -269,6 +273,12 @@ impl WorldCommand {
             MapMakeMultipleConnections(projects, links) => {
                 self.apply_connections(sim, projects, links)
             }
+            MapMakeConnection {
+                from,
+                to,
+                inter,
+                pat,
+            } => Self::apply_connection(sim, *from, *to, *inter, pat),
             _ => self.apply_one(sim),
         };
         if let Err(reason) = result {
@@ -312,16 +322,34 @@ impl WorldCommand {
             MapBuildHouse(id) => map
                 .get(*id)
                 .is_some_and(|lot| map.get(lot.parent).is_some()),
-            MapMakeConnection {
-                from,
-                to,
-                inter,
-                pat,
+            Terraform {
+                center,
+                radius,
+                amount,
+                level,
+                slope,
+                ..
             } => {
-                if !map.can_connect(*from, *to, *inter, pat) {
-                    return Err(Rejection::InvalidConnection);
+                const MAX_RADIUS: f32 = 2_000.0;
+                const MAX_AMOUNT: f32 = 2_000.0;
+                if !center.is_finite()
+                    || !((0.0..=MAX_RADIUS).contains(radius) && *radius > 0.0)
+                    || !(-MAX_AMOUNT..=MAX_AMOUNT).contains(amount)
+                    || !level.is_finite()
+                    || slope.is_some_and(|(start, end)| {
+                        let length = start.xy().distance2(end.xy());
+                        !start.is_finite()
+                            || !end.is_finite()
+                            || !length.is_finite()
+                            || length == 0.0
+                    })
+                {
+                    return Err(Rejection::InvalidTerraform);
                 }
                 true
+            }
+            SpawnRandomCars { n_cars } if *n_cars > 1_000 => {
+                return Err(Rejection::TooManyRandomCars)
             }
             SpawnTrain { wagons, lane, dist } => {
                 let lane = map.get(*lane).ok_or(Rejection::MissingReference)?;
@@ -360,11 +388,16 @@ impl WorldCommand {
                         try_prototype(id).ok_or(Rejection::MissingReference)?;
                         false
                     }
-                    _ => false,
+                    BuildingKind::House
+                    | BuildingKind::ExternalTrading
+                    | BuildingKind::TrainStation => {
+                        return Err(Rejection::InvalidBuilding);
+                    }
                 };
-                if zone
-                    .as_ref()
-                    .is_some_and(|zone| !zoneable || zone.validated_area().is_none())
+                if zoneable != zone.is_some()
+                    || zone
+                        .as_ref()
+                        .is_some_and(|zone| zone.validated_area().is_none())
                 {
                     return Err(Rejection::InvalidZone);
                 }
@@ -404,7 +437,7 @@ impl WorldCommand {
         }
     }
 
-    fn validate_cost(sim: &Simulation, cost: Option<Money>) -> Result<Money, Rejection> {
+    fn affordable_cost(sim: &Simulation, cost: Option<Money>) -> Result<Money, Rejection> {
         let cost = cost.ok_or(Rejection::CostOverflow)?;
         let money = sim.read::<Government>().money;
         if cost > Money::ZERO && money < cost {
@@ -435,6 +468,30 @@ impl WorldCommand {
         }
     }
 
+    fn apply_connection(
+        sim: &Simulation,
+        from: MapProject,
+        to: MapProject,
+        inter: Option<Vec2>,
+        pattern: &LanePattern,
+    ) -> Result<(), Rejection> {
+        let mut map = sim.map_mut();
+        let from = map
+            .resolve_connection_endpoint(from)
+            .ok_or(Rejection::InvalidConnection)?;
+        let to = map
+            .resolve_connection_endpoint(to)
+            .ok_or(Rejection::InvalidConnection)?;
+        if !Map::can_connect(from, to, inter, pattern) {
+            return Err(Rejection::InvalidConnection);
+        }
+        let cost =
+            Self::affordable_cost(sim, Government::connection_cost(from.pos, to.pos, pattern))?;
+        map.make_resolved_connection(from, to, inter, pattern);
+        Self::charge_construction(sim, cost);
+        Ok(())
+    }
+
     fn apply_connections(
         &self,
         sim: &mut Simulation,
@@ -451,46 +508,48 @@ impl WorldCommand {
         let mut map = sim.map_mut();
         let mut endpoints: Vec<_> = projects
             .iter()
-            .map(|&project| {
-                (project.pos.is_finite() && project.kind.check_valid(&map)).then_some(project)
-            })
+            .map(|&project| project.kind.check_valid(&map).then_some(project))
             .collect();
         let mut junctions = BTreeSet::new();
+        let mut splits = BTreeMap::new();
         for &(from, to, interpoint, ref pat) in links {
             let resolve = |index: usize| {
-                let project: MapProject = endpoints[index]?;
-                if matches!(project.kind, ProjectKind::Road(_)) && !project.kind.check_valid(&map) {
-                    // A previous link may have split this endpoint's original road.
-                    let current =
-                        map.project(project.pos, 0.0, ProjectFilter::INTER | ProjectFilter::ROAD);
-                    return (!current.is_ground()).then_some(current);
+                let project = endpoints[index]?;
+                if let ProjectKind::Road(id) = project.kind {
+                    if splits.contains_key(&id) {
+                        return map.reproject_split_endpoint(id, project.pos, &splits);
+                    }
                 }
-                Some(project)
+                map.resolve_connection_endpoint(project)
             };
             let Some((fromproj, toproj)) = resolve(from).zip(resolve(to)) else {
                 self.reject(sim, Rejection::MissingReference);
                 continue;
             };
-            if !map.can_connect(fromproj, toproj, interpoint, pat) {
+            if !Map::can_connect(fromproj, toproj, interpoint, pat) {
                 self.reject(sim, Rejection::InvalidConnection);
                 continue;
             }
-            let cost = Government::connection_cost(&projects[from], &projects[to], pat);
-            let cost = match Self::validate_cost(sim, cost) {
+            let cost = match Self::affordable_cost(
+                sim,
+                Government::connection_cost(fromproj.pos, toproj.pos, pat),
+            ) {
                 Ok(cost) => cost,
                 Err(reason) => {
                     self.reject(sim, reason);
                     continue;
                 }
             };
-            let Some((src, dst, _)) = map.connect_projects(fromproj, toproj, interpoint, pat)
-            else {
-                self.reject(sim, Rejection::MutationFailed);
-                continue;
-            };
-            for (index, id) in [(from, src), (to, dst)] {
+            let connected = map.connect_projects(fromproj, toproj, interpoint, pat);
+            for split in connected.splits.into_iter().flatten() {
+                splits.insert(split.original, split);
+            }
+            for (index, id, pos) in [
+                (from, connected.src, fromproj.pos),
+                (to, connected.dst, toproj.pos),
+            ] {
                 endpoints[index] = Some(MapProject {
-                    pos: projects[index].pos,
+                    pos,
                     kind: ProjectKind::Intersection(id),
                 });
                 junctions.insert(id);
@@ -507,7 +566,7 @@ impl WorldCommand {
 
     fn apply_one(&self, sim: &mut Simulation) -> Result<(), Rejection> {
         self.validate(&sim.map())?;
-        let cost = Self::validate_cost(sim, Government::checked_action_cost(self, sim))?;
+        let cost = Self::affordable_cost(sim, Government::checked_action_cost(self, sim))?;
 
         match *self {
             MapRemoveIntersection(id) => sim.map_mut().remove_intersection(id),
@@ -533,17 +592,7 @@ impl WorldCommand {
                 sim.write::<BuildingInfos>().insert(building);
                 residence::on_house_built(sim, building);
             }
-            MapMakeConnection {
-                from,
-                to,
-                inter,
-                ref pat,
-            } => {
-                sim.map_mut()
-                    .make_connection(from, to, inter, pat)
-                    .ok_or(Rejection::MutationFailed)?;
-            }
-            MapMakeMultipleConnections(..) => unreachable!(),
+            MapMakeConnection { .. } | MapMakeMultipleConnections(..) => unreachable!(),
             MapUpdateIntersectionPolicy {
                 inter: id,
                 turn: tp,
@@ -559,10 +608,9 @@ impl WorldCommand {
                 ref zone,
                 connected_road,
             } => {
-                let zone = zone.clone().map(|zone| Zone::new(zone.poly, zone.filldir));
                 let id = sim
                     .write::<Map>()
-                    .build_special_building(&obb, kind, gen, zone, connected_road)
+                    .build_special_building(&obb, kind, gen, zone.clone(), connected_road)
                     .ok_or(Rejection::MutationFailed)?;
                 sim.write::<BuildingInfos>().insert(id);
             }
@@ -614,11 +662,9 @@ impl WorldCommand {
                     .insert::<SimulationOptions>(SimulationOptions::clone(opts));
             }
             UpdateZone { building, ref zone } => {
-                let mut map = sim.map_mut();
-
-                map.update_zone(building, |z| {
-                    *z = Zone::new(zone.poly.clone(), zone.filldir)
-                });
+                sim.map_mut()
+                    .update_zone(building, zone.clone())
+                    .ok_or(Rejection::MutationFailed)?;
             }
             SpawnRandomCars { n_cars } => {
                 for _ in 0..n_cars {

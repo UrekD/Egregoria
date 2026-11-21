@@ -1,7 +1,7 @@
 use crate::economy::{Bought, Market};
 use crate::map::BuildingID;
 use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, Router};
-use crate::souls::desire::{BuyFood, BuyGoods, Home, Work};
+use crate::souls::desire::{BuyFood, BuyGoods, Home, Work, WorkKind};
 use crate::souls::residence::Residences;
 use crate::transportation::Speed;
 use crate::transportation::{
@@ -104,12 +104,13 @@ impl HumanDecisionKind {
         binfos: &BuildingInfos,
         map: &Map,
         cbuf_freight: &ParCommandBuffer<FreightStationEnt>,
+        work: Option<&mut Work>,
     ) -> bool {
         match *self {
             HumanDecisionKind::GoTo(dest) => router.go_to(dest),
             HumanDecisionKind::MultiStack(ref mut decisions) => {
                 if let Some(d) = decisions.last_mut() {
-                    if d.update(router, binfos, map, cbuf_freight) {
+                    if d.update(router, binfos, map, cbuf_freight, work) {
                         decisions.pop();
                     }
                     false
@@ -122,6 +123,13 @@ impl HumanDecisionKind {
                 true
             }
             HumanDecisionKind::DeliverAtBuilding(bid) => {
+                if let Some(WorkKind::Driver { deliver_order, .. }) =
+                    work.map(|work| &mut work.kind)
+                {
+                    if *deliver_order == Some(bid) {
+                        *deliver_order = None;
+                    }
+                }
                 let Some(b) = map.buildings().get(bid) else {
                     return true;
                 };
@@ -196,7 +204,7 @@ pub fn update_decision(
     food: Option<&mut BuyFood>,
     goods: &mut BuyGoods,
     home: Option<&mut Home>,
-    work: Option<&mut Work>,
+    mut work: Option<&mut Work>,
 ) {
     if decision.wait != 0 {
         decision.wait -= 1;
@@ -204,7 +212,10 @@ pub fn update_decision(
     }
     let pos = trans.pos;
     decision.wait = (30.0 + common::rand::rand2(pos.x, pos.y) * 50.0) as u8;
-    if !decision.kind.update(router, binfos, map, cbuf_freight) {
+    if !decision
+        .kind
+        .update(router, binfos, map, cbuf_freight, work.as_deref_mut())
+    {
         return;
     }
 
