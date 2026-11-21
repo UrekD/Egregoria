@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_SLOT_ID_LEN: usize = 32;
 const REPLAY_SUFFIX: &str = "_replay";
+const AUTOSAVE_PREFIX: &str = "autosave_";
 
-/// A save slot's filename stem. The city's display name is stored separately.
+/// A save slot's lowercase filename stem. The city's display name is stored separately.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SlotId(String);
 
@@ -24,7 +25,7 @@ impl fmt::Display for SlotIdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "slot id must have 1 to {MAX_SLOT_ID_LEN} ASCII letters, digits, underscores, or hyphens and cannot end in {REPLAY_SUFFIX}"
+            "slot id must be an unreserved name with 1 to {MAX_SLOT_ID_LEN} ASCII letters, digits, underscores, or hyphens"
         )
     }
 }
@@ -32,39 +33,50 @@ impl fmt::Display for SlotIdError {
 impl std::error::Error for SlotIdError {}
 
 impl SlotId {
-    /// Validate the stem syntax. Use `slot_paths` to check a specific save root.
+    /// Validate a user stem and normalize its case. Use `slot_paths` to check a save root.
     pub fn new(name: &str) -> Result<Self, SlotIdError> {
-        if name.is_empty()
-            || name.len() > MAX_SLOT_ID_LEN
-            || !name.chars().all(is_slot_char)
-            || name.ends_with(REPLAY_SUFFIX)
+        if name.is_empty() || name.len() > MAX_SLOT_ID_LEN || !name.chars().all(is_slot_char) {
+            return Err(SlotIdError);
+        }
+        let name = name.to_ascii_lowercase();
+        if name.ends_with(REPLAY_SUFFIX)
+            || name.starts_with(AUTOSAVE_PREFIX)
+            || matches!(
+                name.as_str(),
+                "settings" | "bindings" | "lot_brush" | "netinfo" | "camera3d" | "camera"
+            )
+            || is_device_stem(&name)
         {
             return Err(SlotIdError);
         }
-        Ok(Self(name.to_owned()))
+        Ok(Self(name))
     }
 
-    /// Generate a valid stem distinct from every stem in `existing`.
+    /// Generate a valid user stem distinct from every stem in `existing`.
     pub fn from_display_name(name: &str, existing: &[SlotId]) -> Self {
         let mut base = name
             .split(|ch| !is_slot_char(ch))
             .filter(|part| !part.is_empty())
             .collect::<Vec<_>>()
             .join("_");
+        base.make_ascii_lowercase();
         if base.is_empty() {
             base.push_str("city");
         }
+        if base.starts_with(AUTOSAVE_PREFIX) {
+            base.insert_str(0, "city_");
+        }
         base.truncate(MAX_SLOT_ID_LEN);
 
-        if !base.ends_with(REPLAY_SUFFIX) && !existing.iter().any(|id| id.as_str() == base) {
-            return Self(base);
+        let available = |name: &str| Self::new(name).ok().filter(|id| !existing.contains(id));
+        if let Some(id) = available(&base) {
+            return id;
         }
         for number in 2usize.. {
             let suffix = format!("_{number}");
             let prefix_len = base.len().min(MAX_SLOT_ID_LEN - suffix.len());
-            let candidate = format!("{}{suffix}", &base[..prefix_len]);
-            if !existing.iter().any(|id| id.as_str() == candidate) {
-                return Self(candidate);
+            if let Some(id) = available(&format!("{}{suffix}", &base[..prefix_len])) {
+                return id;
             }
         }
         unreachable!()
@@ -74,8 +86,21 @@ impl SlotId {
         Self("world".to_owned())
     }
 
+    /// Construct a reserved slot for the autosave rotation.
+    pub fn autosave(n: u8) -> Self {
+        Self(format!("{AUTOSAVE_PREFIX}{n}"))
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    fn from_disk(stem: &str) -> Result<Self, SlotIdError> {
+        if let Some(number) = stem.strip_prefix(AUTOSAVE_PREFIX) {
+            let id = Self::autosave(number.parse().map_err(|_| SlotIdError)?);
+            return (id.as_str() == stem).then_some(id).ok_or(SlotIdError);
+        }
+        Self::new(stem)
     }
 }
 
@@ -89,6 +114,36 @@ fn is_slot_char(ch: char) -> bool {
     ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'
 }
 
+fn is_device_stem(stem: &str) -> bool {
+    matches!(stem, "con" | "prn" | "aux" | "nul")
+        || matches!(
+            stem.as_bytes(),
+            [b'c', b'o', b'm', b'1'..=b'9'] | [b'l', b'p', b't', b'1'..=b'9']
+        )
+}
+
+/// Identifies one snapshot publication independently of its game tick or file timestamps.
+///
+/// The simulation save wrapper should put a fresh random revision in its versioned header
+/// and store the same value in the replay JSON's top-level revision and in `SlotMeta`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct SnapshotRevision(u128);
+
+impl SnapshotRevision {
+    pub const fn new(revision: u128) -> Self {
+        Self(revision)
+    }
+
+    pub const fn get(self) -> u128 {
+        self.0
+    }
+
+    pub fn matches_sidecar(self, revision: Option<u128>) -> bool {
+        revision == Some(self.get())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SlotMeta {
     pub display_name: String,
@@ -96,12 +151,16 @@ pub struct SlotMeta {
     pub population: u32,
     pub money_cents: i64,
     pub saved_at_unix: u64,
+    #[serde(default)]
+    pub revision: Option<u128>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SnapshotKind {
     Zip,
     Bc,
+    /// A ZIP path exists but is a symlink or another nonregular entry.
+    Obstructed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -111,6 +170,8 @@ pub struct SlotEntry {
     pub snapshot: SnapshotKind,
     pub replay_available: bool,
     pub modified_unix: u64,
+    /// Existing members retain their exact spelling. Absent members use canonical paths.
+    pub paths: SlotPaths,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -121,34 +182,115 @@ pub struct SlotPaths {
     pub meta: PathBuf,
 }
 
-impl SlotPaths {
-    fn new(root: &Path, id: &SlotId) -> Self {
-        Self {
-            zip: root.join(format!("{id}.{}", CompressedBincode::EXTENSION)),
-            bc: root.join(format!("{id}.{}", Bincode::EXTENSION)),
-            replay: root.join(format!("{id}{REPLAY_SUFFIX}.{}", JSON::EXTENSION)),
-            meta: root.join(format!("{id}.meta.{}", JSON::EXTENSION)),
+// Ordering keeps the ZIP in place until any BC and sidecars have been removed.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum MemberKind {
+    Replay,
+    Meta,
+    Bc,
+    Zip,
+    StandaloneJson,
+}
+
+impl MemberKind {
+    fn split_name(name: &str) -> Option<(&str, Self)> {
+        [
+            (".meta.json", Self::Meta),
+            ("_replay.json", Self::Replay),
+            (".zip", Self::Zip),
+            (".bc", Self::Bc),
+            (".json", Self::StandaloneJson),
+        ]
+        .into_iter()
+        .find_map(|(suffix, kind)| name.strip_suffix(suffix).map(|stem| (stem, kind)))
+    }
+}
+
+struct Member {
+    kind: MemberKind,
+    path: PathBuf,
+    metadata: Metadata,
+    canonical: bool,
+}
+
+#[derive(Default)]
+struct SlotFamily {
+    reserved: bool,
+    members: Vec<Member>,
+}
+
+impl SlotFamily {
+    fn member(&self, kind: MemberKind) -> Option<&Member> {
+        self.members.iter().find(|member| member.kind == kind)
+    }
+
+    fn paths(&self, root: &Path, id: &SlotId) -> SlotPaths {
+        let resolve = |kind, name: String| {
+            self.member(kind)
+                .map_or_else(|| root.join(name), |member| member.path.clone())
+        };
+        SlotPaths {
+            zip: resolve(
+                MemberKind::Zip,
+                format!("{id}.{}", CompressedBincode::EXTENSION),
+            ),
+            bc: resolve(MemberKind::Bc, format!("{id}.{}", Bincode::EXTENSION)),
+            replay: resolve(
+                MemberKind::Replay,
+                format!("{id}{REPLAY_SUFFIX}.{}", JSON::EXTENSION),
+            ),
+            meta: resolve(MemberKind::Meta, format!("{id}.meta.{}", JSON::EXTENSION)),
         }
     }
+
+    fn require_unreserved(&self, id: &SlotId) -> io::Result<()> {
+        if self.reserved {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("slot id {id} is reserved by an existing JSON file"),
+            ));
+        }
+        Ok(())
+    }
 }
 
-/// Build paths under `root`, rejecting stems already used by standalone JSON files.
+/// Resolve paths under `root`, rejecting stems already used by standalone JSON files.
 pub fn slot_paths(root: &Path, id: &SlotId) -> io::Result<SlotPaths> {
-    if is_reserved(root, id)? {
-        return Err(io::Error::new(
-            ErrorKind::InvalidInput,
-            format!("slot id {id} is reserved by an existing JSON file"),
-        ));
-    }
-    Ok(SlotPaths::new(root, id))
+    let family = read_families(root, Some(id))?
+        .remove(id)
+        .unwrap_or_default();
+    family.require_unreserved(id)?;
+    Ok(family.paths(root, id))
 }
 
-fn is_reserved(root: &Path, id: &SlotId) -> io::Result<bool> {
-    match fs::symlink_metadata(root.join(format!("{id}.{}", JSON::EXTENSION))) {
-        Ok(metadata) => Ok(metadata.is_file() || metadata.is_symlink()),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error),
+/// Delete every spelling of the slot's replay, metadata, legacy BC and ZIP files.
+/// Missing files are accepted so a partially completed deletion can be retried.
+/// A standalone JSON reservation prevents deletion, as it does for `slot_paths`.
+pub fn delete_slot(root: &Path, id: &SlotId) -> io::Result<()> {
+    let family = read_families(root, Some(id))?
+        .remove(id)
+        .unwrap_or_default();
+    family.require_unreserved(id)?;
+    for member in family.members {
+        #[cfg(windows)]
+        let result = {
+            use std::os::windows::fs::FileTypeExt;
+            if member.metadata.file_type().is_symlink_dir() {
+                fs::remove_dir(member.path)
+            } else {
+                fs::remove_file(member.path)
+            }
+        };
+        #[cfg(not(windows))]
+        let result = fs::remove_file(member.path);
+
+        match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
     }
+    Ok(())
 }
 
 /// Replace the metadata sidecar. Write it after committing the snapshot.
@@ -160,87 +302,261 @@ pub fn write_slot_meta(root: &Path, id: &SlotId, meta: &SlotMeta) -> Result<(), 
 
 /// Read the sidecar directly. Use `list_slots` to get metadata checked against the snapshot.
 pub fn read_slot_meta(root: &Path, id: &SlotId) -> io::Result<SlotMeta> {
-    let file = File::open(slot_paths(root, id)?.meta)?;
+    let file = open_regular(&slot_paths(root, id)?.meta)?;
     JSON::decode_reader(BufReader::new(file))
 }
 
-/// List snapshot slots in descending saved/modified time, then ascending slot ID.
-/// A root that has yet to be created contains no slots.
+/// List slots by descending saved/modified time, then ascending slot ID.
+/// A missing root contains no slots. Sidecar freshness uses snapshot mtime.
 pub fn list_slots(root: &Path) -> io::Result<Vec<SlotEntry>> {
-    let dir = match fs::read_dir(root) {
-        Ok(dir) => dir,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error),
-    };
+    list_slots_with_revisions(root, |_, _| None)
+}
 
-    let mut snapshots = BTreeMap::new();
-    for entry in dir {
-        let path = entry?.path();
-        let kind = match path.extension().and_then(|ext| ext.to_str()) {
-            Some(CompressedBincode::EXTENSION) => SnapshotKind::Zip,
-            Some(Bincode::EXTENSION) => SnapshotKind::Bc,
-            _ => continue,
-        };
-        let Some(stem) = path.file_stem().and_then(|stem| stem.to_str()) else {
+/// List slots with revisions read by the caller from the selected snapshot's header.
+///
+/// Use the supplied path as-is for I/O. Obstructed snapshots are never passed to the
+/// callback. Return `None` for legacy snapshots or when no revision could be read.
+pub fn list_slots_with_revisions(
+    root: &Path,
+    mut snapshot_revision: impl FnMut(&Path, SnapshotKind) -> Option<SnapshotRevision>,
+) -> io::Result<Vec<SlotEntry>> {
+    let families = read_families(root, None)?;
+    let mut slots = Vec::with_capacity(families.len());
+    for (id, family) in families {
+        if family.reserved {
             continue;
-        };
-        let Ok(id) = SlotId::new(stem) else {
-            continue;
-        };
-        let Some(metadata) = file_metadata(&path)? else {
-            continue;
-        };
-        if kind == SnapshotKind::Zip {
-            snapshots.insert(id, (kind, metadata));
+        }
+        let paths = family.paths(root, &id);
+        let (snapshot, member) = if let Some(zip) = family.member(MemberKind::Zip) {
+            let kind = if zip.metadata.is_file() {
+                SnapshotKind::Zip
+            } else {
+                SnapshotKind::Obstructed
+            };
+            (kind, zip)
+        } else if let Some(bc) = family
+            .member(MemberKind::Bc)
+            .filter(|member| member.metadata.is_file())
+        {
+            (SnapshotKind::Bc, bc)
         } else {
-            snapshots.entry(id).or_insert((kind, metadata));
-        }
-    }
-
-    let mut slots = Vec::with_capacity(snapshots.len());
-    for (id, (snapshot, metadata)) in snapshots {
-        if is_reserved(root, &id)? {
             continue;
-        }
-        let paths = SlotPaths::new(root, &id);
-        let modified = metadata.modified()?;
+        };
+
+        let Ok(modified) = report_entry_error(member.metadata.modified(), &member.path) else {
+            continue;
+        };
+        let (meta, replay_available) = if snapshot == SnapshotKind::Obstructed {
+            (None, false)
+        } else {
+            let revision = snapshot_revision(&member.path, snapshot);
+            let meta = fresh_slot_meta(&paths.meta, modified, revision);
+            let replay_available = available_replay(&paths.replay, revision);
+            (meta, replay_available)
+        };
         slots.push(SlotEntry {
             id,
-            meta: fresh_slot_meta(&paths.meta, modified),
+            meta,
             snapshot,
-            replay_available: file_metadata(&paths.replay)?.is_some(),
+            replay_available,
             modified_unix: modified
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            paths,
         });
     }
-    slots.sort_by(|a, b| {
-        let saved_at = |entry: &SlotEntry| {
-            entry
-                .meta
-                .as_ref()
-                .map_or(entry.modified_unix, |meta| meta.saved_at_unix)
-        };
-        saved_at(b).cmp(&saved_at(a)).then_with(|| a.id.cmp(&b.id))
-    });
+
+    let saved_at = |entry: &SlotEntry| {
+        entry
+            .meta
+            .as_ref()
+            .map_or(entry.modified_unix, |meta| meta.saved_at_unix)
+    };
+    slots.sort_by(|a, b| saved_at(b).cmp(&saved_at(a)).then_with(|| a.id.cmp(&b.id)));
     Ok(slots)
 }
 
-fn file_metadata(path: &Path) -> io::Result<Option<Metadata>> {
-    match fs::metadata(path) {
-        Ok(metadata) if metadata.is_file() => Ok(Some(metadata)),
-        Ok(_) => Ok(None),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+fn read_families(root: &Path, only: Option<&SlotId>) -> io::Result<BTreeMap<SlotId, SlotFamily>> {
+    let mut families = BTreeMap::<_, SlotFamily>::new();
+    let dir = match fs::read_dir(root) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(families),
+        Err(error) => return Err(error),
+    };
+
+    for entry in dir {
+        let entry = match report_entry_error(entry, root) {
+            Ok(entry) => entry,
+            Err(error) if only.is_some() => return Err(error),
+            Err(_) => continue,
+        };
+        let filename = entry.file_name();
+        let Some(name) = filename.to_str() else {
+            continue;
+        };
+        let lowercase = name.to_ascii_lowercase();
+        let Some((stem, kind)) = MemberKind::split_name(&lowercase) else {
+            continue;
+        };
+        let Ok(id) = SlotId::from_disk(stem) else {
+            continue;
+        };
+        if only.is_some_and(|only| only != &id) {
+            continue;
+        }
+        let path = entry.path();
+        let metadata = match report_entry_error(path.symlink_metadata(), &path) {
+            Ok(metadata) => metadata,
+            Err(error) if only.is_some() && error.kind() != ErrorKind::NotFound => {
+                return Err(error)
+            }
+            Err(_) => continue,
+        };
+        let family = families.entry(id).or_default();
+        if kind == MemberKind::StandaloneJson {
+            family.reserved |= metadata.is_file() || metadata.is_symlink();
+        } else {
+            family.members.push(Member {
+                kind,
+                path,
+                metadata,
+                canonical: name == lowercase,
+            });
+        }
     }
+    for family in families.values_mut() {
+        // Prefer regular sidecars and BC files. A canonical ZIP takes precedence even
+        // when obstructed, matching the loader's behavior at that path.
+        family.members.sort_by(|a, b| {
+            let priority = |member: &Member| {
+                (
+                    member.kind,
+                    member.kind != MemberKind::Zip && !member.metadata.is_file(),
+                    !member.canonical,
+                )
+            };
+            priority(a)
+                .cmp(&priority(b))
+                .then_with(|| a.path.cmp(&b.path))
+        });
+    }
+    Ok(families)
 }
 
-fn fresh_slot_meta(path: &Path, snapshot_modified: SystemTime) -> Option<SlotMeta> {
-    file_metadata(path).ok()??;
-    let file = File::open(path).ok()?;
-    if file.metadata().ok()?.modified().ok()? < snapshot_modified {
+fn report_entry_error<T>(result: io::Result<T>, path: &Path) -> io::Result<T> {
+    result.inspect_err(|error| {
+        if error.kind() != ErrorKind::NotFound {
+            log::warn!(
+                "could not inspect save slot path {}: {error}",
+                path.display()
+            );
+        }
+    })
+}
+
+fn fresh_slot_meta(
+    path: &Path,
+    snapshot_modified: SystemTime,
+    revision: Option<SnapshotRevision>,
+) -> Option<SlotMeta> {
+    let file = open_regular(path).ok()?;
+    let modified = report_entry_error(file.metadata().and_then(|m| m.modified()), path).ok()?;
+    if modified < snapshot_modified {
         return None;
     }
-    JSON::decode_reader(BufReader::new(file)).ok()
+    let meta: SlotMeta = JSON::decode_reader(BufReader::new(file)).ok()?;
+    revision
+        .is_none_or(|revision| revision.matches_sidecar(meta.revision))
+        .then_some(meta)
+}
+
+fn available_replay(path: &Path, revision: Option<SnapshotRevision>) -> bool {
+    #[derive(Deserialize)]
+    struct ReplayRevision {
+        #[serde(default)]
+        revision: Option<u128>,
+    }
+
+    let Some(revision) = revision else {
+        return report_entry_error(path.symlink_metadata(), path).is_ok_and(|meta| meta.is_file());
+    };
+    open_regular(path)
+        .and_then(|file| JSON::decode_reader::<ReplayRevision>(BufReader::new(file)))
+        .is_ok_and(|sidecar| revision.matches_sidecar(sidecar.revision))
+}
+
+fn open_regular(path: &Path) -> io::Result<File> {
+    let require_regular = |metadata: Metadata| {
+        if metadata.is_file() {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "slot sidecar must be a regular file",
+            ))
+        }
+    };
+    require_regular(report_entry_error(path.symlink_metadata(), path)?)?;
+    let mut options = File::options();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(unix_sidecar_flags()?);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(path)?;
+    require_regular(report_entry_error(file.metadata(), path)?)?;
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn unix_sidecar_flags() -> io::Result<i32> {
+    // O_NOFOLLOW handles a replaced symlink; O_NONBLOCK lets us reject a replaced FIFO.
+    // The standard library accepts the platform flags but does not export them.
+    if cfg!(any(target_os = "linux", target_os = "android")) {
+        let no_follow = if cfg!(any(
+            target_arch = "aarch64",
+            target_arch = "arm",
+            target_arch = "m68k",
+            target_arch = "powerpc",
+            target_arch = "powerpc64"
+        )) {
+            0x8000
+        } else {
+            0x20000
+        };
+        let nonblock = if cfg!(any(
+            target_arch = "mips",
+            target_arch = "mips64",
+            target_arch = "mips32r6",
+            target_arch = "mips64r6"
+        )) {
+            0x80
+        } else if cfg!(any(target_arch = "sparc", target_arch = "sparc64")) {
+            0x4000
+        } else {
+            0x800
+        };
+        Ok(no_follow | nonblock)
+    } else if cfg!(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    )) {
+        Ok(0x100 | 0x4)
+    } else {
+        Err(io::Error::new(
+            ErrorKind::Unsupported,
+            "platform sidecar open flags are unavailable",
+        ))
+    }
 }

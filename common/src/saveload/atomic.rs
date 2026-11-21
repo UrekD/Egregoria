@@ -3,6 +3,16 @@ use std::fs::{self, File};
 use std::io::{self, ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, SystemTime};
+
+const MAX_STAGING_ATTEMPTS: usize = 1024;
+static NEXT_NONCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Durability {
+    RenameOnly,
+    Durable,
+}
 
 /// A failure during an atomic replacement, with the phase in which it occurred.
 #[derive(Debug)]
@@ -34,62 +44,172 @@ impl std::error::Error for AtomicWriteError {
 
 /// Write and sync a new file beside the destination before atomically replacing it.
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<(), AtomicWriteError> {
-    write_staged(path, |file| file.write_all(bytes))
+    write_staged(path, Durability::Durable, |file| file.write_all(bytes))
 }
 
 pub(super) fn write_staged(
     path: &Path,
+    durability: Durability,
     write: impl FnOnce(&mut File) -> io::Result<()>,
 ) -> Result<(), AtomicWriteError> {
-    static NEXT_NONCE: AtomicU64 = AtomicU64::new(0);
+    let parent = parent_directory(path);
+    let durable = durability == Durability::Durable;
+    if durable {
+        create_durable_directory(parent)
+    } else {
+        fs::create_dir_all(parent)
+    }
+    .map_err(AtomicWriteError::PreCommit)?;
 
-    let parent = path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-        .unwrap_or_else(|| Path::new("."));
     let (staging, mut file) =
         create_staging_file(path, &NEXT_NONCE).map_err(AtomicWriteError::PreCommit)?;
-    let prepared = write(&mut file).and_then(|()| file.sync_all());
+    let prepared = (|| {
+        write(&mut file)?;
+        #[cfg(unix)]
+        set_staging_permissions(path, &file)?;
+        if durable {
+            file.sync_all()?;
+        }
+        Ok(())
+    })();
     drop(file);
 
-    let result = prepared
-        .map_err(AtomicWriteError::PreCommit)
-        .and_then(|()| commit(&staging, path, parent));
-    if matches!(result, Err(AtomicWriteError::PreCommit(_))) {
+    let result = prepared.and_then(|()| replace_file(&staging, path, durability));
+    if let Err(error) = result {
         let _ = fs::remove_file(staging);
+        return Err(AtomicWriteError::PreCommit(error));
     }
-    result
+
+    if durable {
+        sync_directory(parent).map_err(AtomicWriteError::PostCommitDurability)?;
+    }
+    Ok(())
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
+}
+
+fn create_durable_directory(path: &Path) -> io::Result<()> {
+    let parent = parent_directory(path);
+    match fs::metadata(path) {
+        Ok(metadata) if metadata.is_dir() => return Ok(()),
+        Ok(_) => {
+            return Err(io::Error::new(
+                ErrorKind::NotADirectory,
+                "save parent is not a directory",
+            ))
+        }
+        Err(error) if error.kind() == ErrorKind::NotFound && parent != path => {}
+        Err(error) => return Err(error),
+    }
+
+    create_durable_directory(parent)?;
+    match fs::create_dir(path) {
+        Ok(()) => sync_directory(parent),
+        Err(error) if error.kind() == ErrorKind::AlreadyExists && path.is_dir() => {
+            sync_directory(parent)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 fn create_staging_file(path: &Path, next_nonce: &AtomicU64) -> io::Result<(PathBuf, File)> {
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    create_unique_file(path, next_nonce, &options)
+}
+
+fn create_unique_file(
+    path: &Path,
+    next_nonce: &AtomicU64,
+    options: &fs::OpenOptions,
+) -> io::Result<(PathBuf, File)> {
     let name = path
         .file_name()
         .ok_or_else(|| io::Error::new(ErrorKind::InvalidInput, "destination needs a file name"))?;
     let pid = std::process::id();
-    loop {
+    for _ in 0..MAX_STAGING_ATTEMPTS {
         let nonce = next_nonce.fetch_add(1, Ordering::Relaxed);
         let mut filename = name.to_os_string();
         filename.push(format!(".{pid}.{nonce}.tmp"));
         let staging = path.with_file_name(filename);
-        match File::options().write(true).create_new(true).open(&staging) {
+        match options.open(&staging) {
             Ok(file) => return Ok((staging, file)),
             Err(error) if error.kind() == ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
     }
+    Err(io::Error::new(
+        ErrorKind::AlreadyExists,
+        "staging name retries exhausted",
+    ))
+}
+
+#[cfg(unix)]
+fn set_staging_permissions(path: &Path, file: &File) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let permissions = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata.permissions(),
+        Ok(_) => default_file_permissions(path)?,
+        Err(error) if error.kind() == ErrorKind::NotFound => default_file_permissions(path)?,
+        Err(error) => return Err(error),
+    };
+    file.set_permissions(fs::Permissions::from_mode(permissions.mode() & 0o7777))
+}
+
+#[cfg(unix)]
+fn default_file_permissions(path: &Path) -> io::Result<fs::Permissions> {
+    // The mode of an empty sibling captures the effective creation mask without
+    // changing the process-wide umask or making any staged data accessible.
+    let mut options = File::options();
+    options.write(true).create_new(true);
+    let (probe, file) = create_unique_file(path, &NEXT_NONCE, &options)?;
+    let metadata = file.metadata();
+    drop(file);
+    fs::remove_file(probe)?;
+    Ok(metadata?.permissions())
 }
 
 #[cfg(not(windows))]
-fn commit(staging: &Path, path: &Path, parent: &Path) -> Result<(), AtomicWriteError> {
-    fs::rename(staging, path).map_err(AtomicWriteError::PreCommit)?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
-        .map_err(AtomicWriteError::PostCommitDurability)
+fn sync_directory(path: &Path) -> io::Result<()> {
+    const EINVAL: i32 = 22;
+    match File::open(path).and_then(|directory| directory.sync_all()) {
+        Err(error)
+            if error.kind() == ErrorKind::Unsupported || error.raw_os_error() == Some(EINVAL) =>
+        {
+            Ok(())
+        }
+        result => result,
+    }
 }
 
 #[cfg(windows)]
-fn commit(staging: &Path, path: &Path, parent: &Path) -> Result<(), AtomicWriteError> {
+fn sync_directory(_path: &Path) -> io::Result<()> {
+    // Windows uses write-through replacement below. Directory fsync is unsupported.
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn replace_file(staging: &Path, path: &Path, _durability: Durability) -> io::Result<()> {
+    fs::rename(staging, path)
+}
+
+#[cfg(windows)]
+fn replace_file(staging: &Path, path: &Path, durability: Durability) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+
+    if durability == Durability::RenameOnly {
+        return fs::rename(staging, path);
+    }
 
     #[link(name = "kernel32")]
     extern "system" {
@@ -99,11 +219,12 @@ fn commit(staging: &Path, path: &Path, parent: &Path) -> Result<(), AtomicWriteE
     const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
     const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
-    // Canonicalizing the parent supplies the extended-length path prefix and
-    // lets the rename replace a destination symlink without resolving it.
-    let parent = parent.canonicalize().map_err(AtomicWriteError::PreCommit)?;
+    // Canonicalizing the parent supplies an extended-length path prefix while
+    // leaving a destination symlink unresolved.
+    let parent = parent_directory(path);
+    let canonical_parent = parent.canonicalize().unwrap_or_else(|_| parent.to_owned());
     let wide_path = |file: &Path| {
-        parent
+        canonical_parent
             .join(file.file_name().unwrap())
             .as_os_str()
             .encode_wide()
@@ -112,8 +233,7 @@ fn commit(staging: &Path, path: &Path, parent: &Path) -> Result<(), AtomicWriteE
     };
     let staging = wide_path(staging);
     let target = wide_path(path);
-    // Windows requests durability through the rename flags. The arguments
-    // are live NUL-terminated UTF-16 strings for the duration of the call.
+    // Both arguments are live NUL-terminated UTF-16 strings.
     let moved = unsafe {
         MoveFileExW(
             staging.as_ptr(),
@@ -122,15 +242,122 @@ fn commit(staging: &Path, path: &Path, parent: &Path) -> Result<(), AtomicWriteE
         )
     };
     if moved == 0 {
-        return Err(AtomicWriteError::PreCommit(io::Error::last_os_error()));
+        return Err(io::Error::last_os_error());
     }
     Ok(())
+}
+
+/// Remove regular staging files directly under `root` older than `older_than`.
+/// Call at startup or use an age safely above the lifetime of an in-progress write.
+pub fn sweep_stale_tmp(root: &Path, older_than: Duration) -> io::Result<usize> {
+    let dir = match fs::read_dir(root) {
+        Ok(dir) => dir,
+        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in dir {
+        let entry = entry?;
+        if !is_staging_name(entry.file_name().as_encoded_bytes()) {
+            continue;
+        }
+        let path = entry.path();
+        let result: io::Result<()> = (|| {
+            let metadata = path.symlink_metadata()?;
+            if metadata.is_file()
+                && now
+                    .duration_since(metadata.modified()?)
+                    .is_ok_and(|age| age > older_than)
+            {
+                fs::remove_file(path)?;
+                removed += 1;
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(removed)
+}
+
+fn is_staging_name(name: &[u8]) -> bool {
+    let Some(stem) = name.strip_suffix(b".tmp") else {
+        return false;
+    };
+    let mut parts = stem.rsplitn(3, |&b| b == b'.');
+    let (Some(nonce), Some(pid), Some(target)) = (parts.next(), parts.next(), parts.next()) else {
+        return false;
+    };
+    !target.is_empty()
+        && pid.iter().all(u8::is_ascii_digit)
+        && nonce.iter().all(u8::is_ascii_digit)
+        && std::str::from_utf8(pid).is_ok_and(|pid| pid.parse::<u32>().is_ok())
+        && std::str::from_utf8(nonce).is_ok_and(|nonce| nonce.parse::<u64>().is_ok())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::saveload::slot_tests::TestRoot;
+    use std::time::Duration;
+
+    #[test]
+    fn slot_staging_exhausts_a_bounded_collision_budget() {
+        let root = TestRoot::new();
+        let path = root.file("world.zip", b"old", 100);
+        for nonce in 0..1024 {
+            fs::create_dir(path.with_extension(format!("zip.{}.{nonce}.tmp", std::process::id())))
+                .unwrap();
+        }
+        let next = AtomicU64::new(0);
+        assert_eq!(
+            create_staging_file(&path, &next).unwrap_err().kind(),
+            ErrorKind::AlreadyExists
+        );
+        assert_eq!(next.load(Ordering::Relaxed), 1024);
+        assert_eq!(fs::read(path).unwrap(), b"old");
+    }
+
+    #[test]
+    fn slot_sweep_removes_only_old_staging_files() {
+        let root = TestRoot::new();
+        let old = root.file("world.zip.42.11.tmp", b"staged", 100);
+        let fresh = root.file("world.zip.42.12.tmp", b"staged", 100);
+        let unrelated = root.file("world.zip.unrelated.tmp", b"keep", 100);
+        let directory = old.with_file_name("world.zip.42.13.tmp");
+        fs::create_dir(&directory).unwrap();
+        File::options()
+            .write(true)
+            .open(&fresh)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now())
+            .unwrap();
+
+        assert_eq!(
+            sweep_stale_tmp(old.parent().unwrap(), Duration::from_secs(3600)).unwrap(),
+            1
+        );
+        assert!(!old.exists());
+        assert!(fresh.exists());
+        assert!(unrelated.exists());
+        assert!(directory.exists());
+    }
+
+    #[test]
+    fn slot_atomic_write_creates_nested_parents() {
+        let root = TestRoot::new();
+        let sibling = root.file("sibling", b"fixture", 100);
+        let path = sibling
+            .with_file_name("save-root")
+            .join("nested")
+            .join("world.zip");
+        write_atomic(&path, b"snapshot").unwrap();
+        assert_eq!(fs::read(path).unwrap(), b"snapshot");
+    }
 
     #[test]
     fn slot_staging_skips_a_directory_collision() {
@@ -140,6 +367,11 @@ mod tests {
         fs::create_dir(&collision).unwrap();
 
         let (staging, mut file) = create_staging_file(&path, &AtomicU64::new(0)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(file.metadata().unwrap().permissions().mode() & 0o7177, 0);
+        }
         file.write_all(b"new").unwrap();
         assert_ne!(staging, collision);
         assert!(collision.is_dir());

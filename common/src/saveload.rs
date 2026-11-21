@@ -10,11 +10,12 @@ use std::sync::OnceLock;
 mod atomic;
 mod slots;
 
-use atomic::write_staged;
-pub use atomic::{write_atomic, AtomicWriteError};
+pub use atomic::{sweep_stale_tmp, write_atomic, AtomicWriteError};
+use atomic::{write_staged, Durability};
 pub use slots::{
-    list_slots, read_slot_meta, slot_paths, write_slot_meta, SlotEntry, SlotId, SlotIdError,
-    SlotMeta, SlotPaths, SnapshotKind,
+    delete_slot, list_slots, list_slots_with_revisions, read_slot_meta, slot_paths,
+    write_slot_meta, SlotEntry, SlotId, SlotIdError, SlotMeta, SlotPaths, SnapshotKind,
+    SnapshotRevision,
 };
 
 static SAVE_DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -143,19 +144,14 @@ pub trait Encoder {
     }
 
     fn save_silent(x: &impl Serialize, name: &str) -> Option<()> {
-        Self::save_atomic(x, name)
+        save_encoded::<Self>(x, name, Durability::RenameOnly)
             .map_err(|error| log::error!("failed saving {}: {}", name, error))
             .ok()
     }
 
-    /// Encode and atomically replace the file for this encoder and name.
+    /// Encode, atomically replace, and sync the file for this encoder and name.
     fn save_atomic(x: &impl Serialize, name: &str) -> std::result::Result<(), AtomicWriteError> {
-        std::fs::create_dir_all(save_dir()).map_err(AtomicWriteError::PreCommit)?;
-        write_staged(&Self::filename(name), |file| {
-            let mut writer = BufWriter::new(file);
-            Self::encode_writer(x, &mut writer)?;
-            writer.flush()
-        })
+        save_encoded::<Self>(x, name, Durability::Durable)
     }
 
     fn load<T: DeserializeOwned>(name: &str) -> Result<T> {
@@ -171,6 +167,18 @@ pub trait Encoder {
                 x
             })
     }
+}
+
+fn save_encoded<E: Encoder + ?Sized>(
+    x: &impl Serialize,
+    name: &str,
+    durability: Durability,
+) -> std::result::Result<(), AtomicWriteError> {
+    write_staged(&E::filename(name), durability, |file| {
+        let mut writer = BufWriter::new(file);
+        E::encode_writer(x, &mut writer)?;
+        writer.flush()
+    })
 }
 
 pub struct Bincode;
@@ -312,6 +320,27 @@ mod tests {
             assert_eq!(JSON::filename(name), root.join(format!("{name}.json")));
             JSONPretty::save_silent(&42, name).unwrap();
             assert_eq!(JSON::load::<i32>(name).unwrap(), 42);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let settings = JSON::filename("settings");
+            let default_mode = File::create(root.join("mode-check"))
+                .unwrap()
+                .metadata()
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(
+                std::fs::metadata(&settings).unwrap().permissions().mode(),
+                default_mode
+            );
+            std::fs::set_permissions(&settings, std::fs::Permissions::from_mode(0o600)).unwrap();
+            JSON::save_silent(&43, "settings").unwrap();
+            assert_eq!(
+                std::fs::metadata(settings).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
         CompressedBincode::save_silent(&43, "world").unwrap();
         assert_eq!(CompressedBincode::load::<i32>("world").unwrap(), 43);

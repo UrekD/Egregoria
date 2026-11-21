@@ -32,7 +32,11 @@ impl TestRoot {
 
 impl Drop for TestRoot {
     fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).unwrap();
+        if let Err(error) = fs::remove_dir_all(&self.0) {
+            if !std::thread::panicking() {
+                panic!("could not remove test root: {error}");
+            }
+        }
     }
 }
 
@@ -43,6 +47,7 @@ fn meta(saved_at_unix: u64) -> SlotMeta {
         population: 45,
         money_cents: -678,
         saved_at_unix,
+        revision: None,
     }
 }
 
@@ -59,12 +64,13 @@ fn slot_id_validation_and_uniquification() {
         "world.tmp",
         "world.bak",
         "foo_replay",
+        "foo_RePlAy",
         &"a".repeat(33),
     ] {
         assert!(SlotId::new(invalid).is_err(), "accepted {invalid:?}");
     }
     assert!(SlotId::new(&"a".repeat(32)).is_ok());
-    assert_eq!(SlotId::new("A-z_09").unwrap().as_str(), "A-z_09");
+    assert_eq!(SlotId::new("A-z_09").unwrap().as_str(), "a-z_09");
     assert_eq!(SlotId::legacy().as_str(), "world");
 
     let existing = [
@@ -73,7 +79,7 @@ fn slot_id_validation_and_uniquification() {
     ];
     assert_eq!(
         SlotId::from_display_name("  Harbor / City! ", &existing).as_str(),
-        "Harbor_City_3"
+        "harbor_city_3"
     );
     let long = "a".repeat(50);
     let full_length = SlotId::from_display_name(&long, &[]);
@@ -83,6 +89,204 @@ fn slot_id_validation_and_uniquification() {
         let id = SlotId::from_display_name(display_name, &[]);
         assert_eq!(SlotId::new(id.as_str()).unwrap(), id);
     }
+}
+
+#[test]
+fn slot_reserved_stems_are_disambiguated() {
+    for name in ["CoN", "PrN", "AUX", "NUL", "COM1", "lPt9"] {
+        assert!(SlotId::new(name).is_err(), "accepted {name}");
+        assert_eq!(
+            SlotId::from_display_name(name, &[]).as_str(),
+            format!("{}_2", name.to_ascii_lowercase())
+        );
+    }
+    for name in [
+        "Settings",
+        "Bindings",
+        "lot_brush",
+        "netinfo",
+        "camera3D",
+        "camera",
+        "world_replay",
+        "AutoSave_0",
+        "AutoSave_legacy",
+    ] {
+        assert!(SlotId::new(name).is_err(), "accepted {name}");
+        let id = SlotId::from_display_name(name, &[]);
+        assert_eq!(SlotId::new(id.as_str()).unwrap(), id);
+    }
+    assert!(SlotId::new("COM0").is_ok());
+    assert!(SlotId::new("LPT10").is_ok());
+}
+
+#[test]
+fn slot_case_variants_share_identity_and_keep_their_paths() {
+    let root = TestRoot::new();
+    let zip = root.file("Harbor.ZIP", b"snapshot", 100);
+    let bc = root.file("harbor.bc", b"legacy", 200);
+    let replay = root.file("HARBOR_REPLAY.JSON", b"{}", 150);
+    let sidecar = root.file("Harbor.meta.Json", &JSON::encode(&meta(160)).unwrap(), 150);
+    root.file("Custom.json", b"{}", 100);
+    root.file("custom.zip", b"reserved", 100);
+
+    let id = SlotId::new("HARBOR").unwrap();
+    let entries = list_slots(&root.0).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].id.as_str(), "harbor");
+    assert_eq!(entries[0].snapshot, SnapshotKind::Zip);
+    assert!(entries[0].replay_available);
+    assert_eq!(entries[0].meta, Some(meta(160)));
+    assert_eq!(
+        entries[0].paths,
+        SlotPaths {
+            zip,
+            bc,
+            replay,
+            meta: sidecar
+        }
+    );
+    assert_eq!(slot_paths(&root.0, &id).unwrap(), entries[0].paths);
+    assert_eq!(read_slot_meta(&root.0, &id).unwrap(), meta(160));
+}
+
+#[test]
+fn slot_listing_reports_zip_directory_as_obstructed() {
+    let root = TestRoot::new();
+    root.file("Harbor.bc", b"legacy", 100);
+    fs::create_dir(root.0.join("harbor.zip")).unwrap();
+    let entries = list_slots(&root.0).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].snapshot, SnapshotKind::Obstructed);
+}
+
+#[cfg(unix)]
+#[test]
+fn slot_discovery_ignores_symlinked_members() {
+    use std::os::unix::fs::symlink;
+
+    let root = TestRoot::new();
+    let outside = TestRoot::new();
+    let private = outside.file("private.json", &JSON::encode(&meta(500)).unwrap(), 200);
+    root.file("harbor.zip", b"snapshot", 100);
+    symlink(&private, root.0.join("harbor.meta.json")).unwrap();
+    symlink(&private, root.0.join("harbor_replay.json")).unwrap();
+    symlink(&private, root.0.join("linked.bc")).unwrap();
+    symlink("missing", root.0.join("dangling.zip")).unwrap();
+    symlink("loop.zip", root.0.join("loop.zip")).unwrap();
+    root.file("dangling.bc", b"legacy", 100);
+
+    let entries = list_slots(&root.0).unwrap();
+    assert_eq!(entries.len(), 3);
+    let harbor = entries
+        .iter()
+        .find(|entry| entry.id.as_str() == "harbor")
+        .unwrap();
+    assert!(!harbor.replay_available);
+    assert_eq!(harbor.meta, None);
+    assert!(read_slot_meta(&root.0, &harbor.id).is_err());
+    for entry in entries.iter().filter(|entry| entry.id != harbor.id) {
+        assert_eq!(entry.snapshot, SnapshotKind::Obstructed);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn slot_discovery_ignores_fifo_sidecars() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    extern "C" {
+        fn mkfifo(path: *const std::ffi::c_char, mode: u32) -> std::ffi::c_int;
+    }
+
+    let root = TestRoot::new();
+    root.file("harbor.zip", b"snapshot", 100);
+    for suffix in [".meta.json", "_replay.json"] {
+        let path = root.0.join(format!("harbor{suffix}"));
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        // mkfifo receives a live, NUL-terminated path.
+        assert_eq!(unsafe { mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let entries = list_slots(&root.0).unwrap();
+    assert_eq!(entries.len(), 1);
+    assert!(!entries[0].replay_available);
+    assert_eq!(entries[0].meta, None);
+    assert!(read_slot_meta(&root.0, &entries[0].id).is_err());
+}
+
+#[test]
+fn slot_delete_removes_autosave_family_and_case_variants() {
+    let root = TestRoot::new();
+    let autosave = SlotId::autosave(2);
+    assert_eq!(autosave.as_str(), "autosave_2");
+    for name in [
+        "AutoSave_2.ZIP",
+        "autosave_2.bc",
+        "AUTOSAVE_2_REPLAY.JSON",
+        "AutoSave_2.meta.json",
+    ] {
+        root.file(name, b"fixture", 100);
+    }
+    let backup = root.file("autosave_2.zip.backup.bak", b"backup", 100);
+    let other = root.file("autosave_20.bc", b"other", 100);
+    let canonical = root.0.join("autosave_2.zip");
+    let distinct_zip_alias = !canonical.exists();
+    if distinct_zip_alias {
+        root.file("autosave_2.zip", b"canonical", 200);
+    }
+    let entries = list_slots(&root.0).unwrap();
+    let entry = entries.iter().find(|entry| entry.id == autosave).unwrap();
+    if distinct_zip_alias {
+        assert_eq!(entry.paths.zip, canonical);
+        assert_eq!(entry.modified_unix, 200);
+    }
+    delete_slot(&root.0, &autosave).unwrap();
+    delete_slot(&root.0, &autosave).unwrap();
+    let mut files: Vec<_> = fs::read_dir(&root.0)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect();
+    files.sort();
+    assert_eq!(files, [backup, other]);
+}
+
+#[test]
+fn slot_revision_binds_sidecars_to_the_selected_snapshot() {
+    let root = TestRoot::new();
+    let zip = root.file("Harbor.ZIP", b"snapshot", 100);
+    let id = SlotId::new("harbor").unwrap();
+    let revision = SnapshotRevision::new(u128::MAX);
+    let list = |revision| {
+        list_slots_with_revisions(&root.0, |path, kind| {
+            assert_eq!(path, zip);
+            assert_eq!(kind, SnapshotKind::Zip);
+            revision
+        })
+        .unwrap()
+        .pop()
+        .unwrap()
+    };
+
+    root.file("harbor.meta.json", br#"{"display_name":"Harbor City","game_tick":123,"population":45,"money_cents":-678,"saved_at_unix":200}"#, 200);
+    assert_eq!(read_slot_meta(&root.0, &id).unwrap().revision, None);
+    assert_eq!(list(None).meta, Some(meta(200)));
+    assert_eq!(list(Some(revision)).meta, None);
+
+    let sidecar = SlotMeta {
+        revision: Some(revision.get()),
+        ..meta(200)
+    };
+    write_slot_meta(&root.0, &id, &sidecar).unwrap();
+    root.file("harbor_replay.json", br#"{"revision":1,"replay":[]}"#, 200);
+    assert_eq!(list(Some(revision)).meta, Some(sidecar));
+    assert!(!list(Some(revision)).replay_available);
+    assert_eq!(list(Some(SnapshotRevision::new(1))).meta, None);
+    root.file(
+        "harbor_replay.json",
+        format!(r#"{{"revision":{},"replay":[]}}"#, revision.get()).as_bytes(),
+        200,
+    );
+    assert!(list(Some(revision)).replay_available);
 }
 
 #[test]
@@ -116,7 +320,6 @@ fn slot_listing_groups_exact_families_and_falls_back_to_snapshot_time() {
     ] {
         root.file(name, b"fixture", modified);
     }
-    fs::create_dir(root.0.join("directory.zip")).unwrap();
     root.file("harbor.meta.json", &JSON::encode(&meta(600)).unwrap(), 150);
     let stale = root.file("stale.meta.json", &JSON::encode(&meta(999)).unwrap(), 400);
     File::options()
@@ -169,8 +372,8 @@ fn slot_paths_respect_configuration_stems_and_metadata_round_trips() {
     );
     write_slot_meta(&root.0, &id, &meta(200)).unwrap();
     assert_eq!(read_slot_meta(&root.0, &id).unwrap(), meta(200));
-    root.file("settings.json", b"{}", 100);
-    let id = SlotId::new("settings").unwrap();
+    root.file("Custom.JSON", b"{}", 100);
+    let id = SlotId::new("custom").unwrap();
     assert_eq!(
         slot_paths(&root.0, &id).unwrap_err().kind(),
         ErrorKind::InvalidInput
@@ -185,7 +388,7 @@ fn slot_paths_respect_configuration_stems_and_metadata_round_trips() {
 fn slot_atomic_write_keeps_old_bytes_on_staging_failure() {
     let root = TestRoot::new();
     let path = root.file("world.zip", b"old", 100);
-    let result = write_staged(&path, |file| {
+    let result = write_staged(&path, Durability::Durable, |file| {
         file.write_all(b"partial")?;
         Err(io::Error::other("injected write failure"))
     });
@@ -214,7 +417,7 @@ fn slot_atomic_writers_stage_separately() {
             let ready = ready.clone();
             let path = &path;
             let worker = scope.spawn(move || {
-                write_staged(path, |file| {
+                write_staged(path, Durability::Durable, |file| {
                     file.write_all(bytes)?;
                     ready.send(()).map_err(io::Error::other)?;
                     wait.recv().map_err(io::Error::other)
