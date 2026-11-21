@@ -8,8 +8,8 @@ use crate::map_dynamic::{Itinerary, ItineraryLeader};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
-use crate::world_command::WorldCommand;
 use crate::world_command::WorldCommand::Init;
+use crate::world_command::{CommandOutcomes, WorldCommand};
 use common::saveload::Encoder;
 use common::FastMap;
 use derive_more::{From, TryInto};
@@ -188,14 +188,10 @@ impl Simulation {
             }
         }
 
-        Init(Box::new(opts)).apply(&mut sim);
-
         let start_commands: Vec<(u32, WorldCommand)> =
             common::saveload::JSON::decode(START_COMMANDS.as_bytes()).unwrap();
-
-        for (_, command) in start_commands {
-            command.apply(&mut sim);
-        }
+        let init = Init(Box::new(opts));
+        sim.apply_commands(std::iter::once(&init).chain(start_commands.iter().map(|(_, cmd)| cmd)));
 
         sim
     }
@@ -245,9 +241,7 @@ impl Simulation {
         // so that instant commands work on single player but the game is still deterministic
         {
             profiling::scope!("applying commands");
-            for command in commands {
-                command.apply(self);
-            }
+            self.apply_commands(commands);
         }
 
         {
@@ -261,6 +255,20 @@ impl Simulation {
             self.resources.read::<GameTime>().tick;
 
         t.elapsed()
+    }
+
+    /// Applies a command batch without advancing the simulation clock.
+    pub fn apply_commands<'a>(&mut self, commands: impl IntoIterator<Item = &'a WorldCommand>) {
+        let mut commands = commands.into_iter().peekable();
+        if commands.peek().is_none() {
+            utils::scheduler::drain_commands(self);
+            return;
+        }
+        self.write::<CommandOutcomes>().last.clear();
+        for command in commands {
+            command.apply_in_batch(self);
+            utils::scheduler::drain_commands(self);
+        }
     }
 
     pub fn get_tick(&self) -> u64 {
@@ -284,12 +292,32 @@ impl Simulation {
 
     pub fn load_replay_from_disk(save_name: &str) -> Option<Replay> {
         let path = format!("{save_name}_replay");
-        let replay: Replay = common::saveload::JSON::load(&path).ok()?;
+        let replay: Replay = match common::saveload::JSON::load(&path) {
+            Ok(replay) => replay,
+            Err(error) => {
+                log::error!("Could not load replay {path}: {error}");
+                return None;
+            }
+        };
+        if replay.version != VERSION {
+            log::error!(
+                "Replay {path} has version {:?}, expected {VERSION:?}",
+                replay.version
+            );
+            return None;
+        }
         Some(replay)
     }
 
     pub fn load_from_disk(save_name: &str) -> Option<Self> {
-        let sim: Simulation = common::saveload::CompressedBincode::load(save_name).ok()?;
+        let sim: Simulation = match common::saveload::CompressedBincode::load(save_name) {
+            Ok(sim) => sim,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(error) => {
+                log::error!("Could not load simulation {save_name}: {error}");
+                return None;
+            }
+        };
         if sim.resources.try_read::<Map>().ok()?.environment.size().0 == 0 {
             return None;
         }
@@ -400,24 +428,18 @@ impl<'de> Deserialize<'de> for Simulation {
         log::info!("deserializing sim state");
         let t = Instant::now();
 
-        let mut simdeser = <SimulationDeser as Deserialize>::deserialize(deserializer)?;
+        let simdeser = <SimulationDeser as Deserialize>::deserialize(deserializer)?;
 
         log::info!(
             "took {}s to deserialize base deser",
             t.elapsed().as_secs_f32()
         );
 
-        let cur_version_parts = VERSION.split('.').collect::<Vec<_>>();
-        let deser_parts = simdeser.version.split('.').collect::<Vec<_>>();
-
-        if cur_version_parts[0] != deser_parts[0]
-            || (cur_version_parts[0] == "0" && cur_version_parts[1] != deser_parts[1])
-        {
-            log::warn!(
-                "incompatible version, save might be corrupted! save is: {} - game is: {}",
-                simdeser.version,
-                VERSION
-            );
+        if simdeser.version != VERSION {
+            return Err(serde::de::Error::custom(format!(
+                "Save has version {:?}, expected {VERSION:?}",
+                simdeser.version
+            )));
         }
 
         let mut sim = Self {
@@ -435,9 +457,15 @@ impl<'de> Deserialize<'de> for Simulation {
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
-                if let Some(data) = simdeser.res.remove(l.name) {
-                    (l.load)(&mut sim, data);
-                }
+                let data = simdeser.res.get(l.name).ok_or_else(|| {
+                    serde::de::Error::custom(format!("Missing resource {}", l.name))
+                })?;
+                (l.load)(&mut sim, data).map_err(|error| {
+                    serde::de::Error::custom(format!(
+                        "Could not decode resource {}: {error}",
+                        l.name
+                    ))
+                })?;
             }
         }
 
@@ -450,440 +478,36 @@ impl<'de> Deserialize<'de> for Simulation {
     }
 }
 
+// The rail links share junctions by project index so they can be built before merging.
 const START_COMMANDS: &str = r#"
 [
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            4343.2334,
-            6262.846,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "to": {
-          "pos": [
-            4222.163,
-            6318.7007,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "inter": null,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": []
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapBuildSpecialBuilding": {
-        "pos": {
-          "corners": [
-            5010057980197058898,
-            5010739497017993874,
-            5009490559183158337,
-            5008809038067256064
-          ]
-        },
-        "kind": {"RailFreightStation": 9010703082962909221},
-        "gen": {"NoWalkway": {
-          "door_pos": 0
-        }},
-        "zone": null
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            2024.0668,
-            147.33333,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 2,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            2831.1282,
-            2172.9182,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "inter": 4972985476040057325,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ]
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            2831.1282,
-            2172.9182,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 5,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            4098.609,
-            4876.7466,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "inter": 5005986054842354977,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ]
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            4098.609,
-            4876.7466,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 6,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            4180.8335,
-            5765.297,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "inter": 5008381821963615703,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ]
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            4180.8335,
-            5765.297,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 7,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            4312.9233,
-            5982.129,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "inter": 5009042048632353377,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": []
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            4312.9233,
-            5982.129,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 8,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            4418.4004,
-            6150.2427,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "inter": 5010742073997638941,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": []
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            4418.4004,
-            6150.2427,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 9,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            4343.2334,
-            6262.846,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 3,
-              "version": 1
-            }
-          }
-        },
-        "inter": 5010861869225921041,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": []
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            4222.163,
-            6318.7007,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 4,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            4080.5332,
-            6242.0093,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "inter": 5008055507530249597,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": []
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            4080.5332,
-            6242.0093,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 10,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            4134.9575,
-            5988.7896,
-            0.0
-          ],
-          "kind": "Ground"
-        },
-        "inter": 5007338222221478024,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": []
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "MapMakeConnection": {
-        "from": {
-          "pos": [
-            4134.9575,
-            5988.7896,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 11,
-              "version": 1
-            }
-          }
-        },
-        "to": {
-          "pos": [
-            4180.8335,
-            5765.297,
-            0.0
-          ],
-          "kind": {
-            "Intersection": {
-              "idx": 7,
-              "version": 1
-            }
-          }
-        },
-        "inter": 5008608536108168175,
-        "pat": {
-          "lanes_forward": [
-            [
-              "Rail",
-              9.0
-            ]
-          ],
-          "lanes_backward": []
-        }
-      }
-    }
-  ],
-  [
-    0,
-    {
-      "AddTrain": {
-        "dist": 150.0,
-        "n_wagons": 7,
-        "lane": {
-          "idx": 3,
-          "version": 1
-        }
-      }
-    }
-  ]
+  [0, {"MapMakeMultipleConnections": [
+    [
+      {"pos": [4343.2334, 6262.846, 0.0], "kind": "Ground"},
+      {"pos": [4222.163, 6318.7007, 0.0], "kind": "Ground"},
+      {"pos": [2024.0668, 147.33333, 0.0], "kind": {"Intersection": {"idx": 2, "version": 1}}},
+      {"pos": [2831.1282, 2172.9182, 0.0], "kind": "Ground"},
+      {"pos": [4098.609, 4876.7466, 0.0], "kind": "Ground"},
+      {"pos": [4180.8335, 5765.297, 0.0], "kind": "Ground"},
+      {"pos": [4312.9233, 5982.129, 0.0], "kind": "Ground"},
+      {"pos": [4418.4004, 6150.2427, 0.0], "kind": "Ground"},
+      {"pos": [4080.5332, 6242.0093, 0.0], "kind": "Ground"},
+      {"pos": [4134.9575, 5988.7896, 0.0], "kind": "Ground"}
+    ],
+    [
+      [0, 1, null, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": []}],
+      [2, 3, 4972985476040057325, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": [["Rail", 9.0]]}],
+      [3, 4, 5005986054842354977, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": [["Rail", 9.0]]}],
+      [4, 5, 5008381821963615703, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": [["Rail", 9.0]]}],
+      [5, 6, 5009042048632353377, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": []}],
+      [6, 7, 5010742073997638941, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": []}],
+      [7, 0, 5010861869225921041, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": []}],
+      [1, 8, 5008055507530249597, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": []}],
+      [8, 9, 5007338222221478024, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": []}],
+      [9, 5, 5008608536108168175, {"lanes_forward": [["Rail", 9.0]], "lanes_backward": []}]
+    ]
+  ]}],
+  [0, {"MapBuildSpecialBuilding": {"pos": {"corners": [5010057980197058898, 5010739497017993874, 5009490559183158337, 5008809038067256064]}, "kind": {"RailFreightStation": 9010703082962909221}, "gen": {"NoWalkway": {"door_pos": 0}}, "zone": null}}],
+  [0, {"AddTrain": {"dist": 150.0, "n_wagons": 7, "lane": {"idx": 3, "version": 1}}}]
 ]
 "#;

@@ -227,6 +227,19 @@ pub fn traverse_forward<'a>(
         .take_while(move |(_, acc, _, acc_l)| *acc < dist || *acc_l <= until_length)
 }
 
+pub(crate) fn cancel_train_route(
+    id: TrainID,
+    train: &mut TrainEnt,
+    reservations: &mut TrainReservations,
+) {
+    train.it = Itinerary::NONE;
+    for intersection in train.res.upcoming_inters.drain(..) {
+        if reservations.reservations.get(&intersection) == Some(&id) {
+            reservations.reservations.remove(&intersection);
+        }
+    }
+}
+
 pub fn train_reservations_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("transportation::train_reservations_update");
     let map = &*resources.read::<Map>();

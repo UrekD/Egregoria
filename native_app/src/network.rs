@@ -49,9 +49,7 @@ fn handle_singleplayer(state: &mut State) {
     let mut has_commands = !commands.is_empty();
 
     if has_commands && commands.iter().all(WorldCommand::is_instant) {
-        for v in commands.iter() {
-            v.apply(&mut sim);
-        }
+        sim.apply_commands(commands.as_ref());
         commands = WorldCommands::default();
         has_commands = false;
     }

@@ -1,7 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::time::Instant;
 
-use prototypes::RollingStockID;
+use prototypes::{try_prototype, Money, RollingStockID};
 use serde::{Deserialize, Serialize};
 
 use geom::{vec3, Vec2, Vec3, OBB};
@@ -12,8 +12,9 @@ use WorldCommand::*;
 use crate::economy::Government;
 use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
-    BuildingID, BuildingKind, Environment, IntersectionID, LaneID, LanePattern, LanePatternBuilder,
-    LightPolicy, LotID, Map, MapProject, ProjectKind, RoadID, TerraformKind, TurnPolicy, Zone,
+    Building, BuildingID, BuildingKind, Environment, IntersectionID, LaneID, LaneKind, LanePattern,
+    LanePatternBuilder, LightPolicy, LotID, Map, MapProject, ProjectFilter, ProjectKind, RoadID,
+    TerraformKind, TurnPolicy, Zone,
 };
 use crate::map_dynamic::{BuildingInfos, ParkingManagement};
 use crate::multiplayer::chat::Message;
@@ -97,6 +98,25 @@ pub enum WorldCommand {
         zone: Zone,
     },
     SetGameTime(GameTime),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rejection {
+    MissingReference,
+    InvalidConnection,
+    InvalidBatchIndex,
+    InvalidBuilding,
+    InvalidZone,
+    InvalidTrain,
+    CostOverflow,
+    InsufficientFunds,
+    MutationFailed,
+}
+
+#[derive(Default)]
+pub struct CommandOutcomes {
+    /// Rejections from the most recent nonempty batch, in command order.
+    pub last: Vec<(&'static str, Rejection)>,
 }
 
 impl AsRef<[WorldCommand]> for WorldCommands {
@@ -221,25 +241,247 @@ impl WorldCommand {
     }
 
     pub fn apply(&self, sim: &mut Simulation) {
-        let cost = Government::action_cost(self, sim);
-        sim.write::<Government>().money -= cost;
+        sim.apply_commands(std::iter::once(self));
+    }
 
-        let mut rep = sim.resources.write::<Replay>();
-        if rep.enabled {
-            let tick = sim.read::<GameTime>().tick;
-            rep.push(tick, self.clone());
+    pub(crate) fn apply_in_batch(&self, sim: &mut Simulation) {
+        {
+            let mut replay = sim.write::<Replay>();
+            if replay.enabled {
+                replay.push(sim.read::<GameTime>().tick, self.clone());
+            }
         }
-        drop(rep);
+
+        let result = match self {
+            MapMakeMultipleConnections(projects, links) => {
+                self.apply_connections(sim, projects, links)
+            }
+            _ => self.apply_one(sim),
+        };
+        if let Err(reason) = result {
+            self.reject(sim, reason);
+        }
+    }
+
+    fn reject(&self, sim: &Simulation, reason: Rejection) {
+        let kind = match self {
+            Init(_) => "Init",
+            MapRemoveIntersection(_) => "MapRemoveIntersection",
+            MapRemoveRoad(_) => "MapRemoveRoad",
+            MapRemoveBuilding(_) => "MapRemoveBuilding",
+            MapBuildHouse(_) => "MapBuildHouse",
+            Terraform { .. } => "Terraform",
+            SendMessage { .. } => "SendMessage",
+            SpawnRandomCars { .. } => "SpawnRandomCars",
+            AddTrain { .. } => "AddTrain",
+            SpawnTrain { .. } => "SpawnTrain",
+            MapMakeConnection { .. } => "MapMakeConnection",
+            MapMakeMultipleConnections(..) => "MapMakeMultipleConnections",
+            MapUpdateIntersectionPolicy { .. } => "MapUpdateIntersectionPolicy",
+            MapBuildSpecialBuilding { .. } => "MapBuildSpecialBuilding",
+            MapLoadParis => "MapLoadParis",
+            MapLoadTestField { .. } => "MapLoadTestField",
+            UpdateZone { .. } => "UpdateZone",
+            SetGameTime(_) => "SetGameTime",
+        };
+        sim.write::<CommandOutcomes>().last.push((kind, reason));
+    }
+
+    fn validate(&self, map: &Map) -> Result<(), Rejection> {
+        let exists = match self {
+            MapRemoveIntersection(id) | MapUpdateIntersectionPolicy { inter: id, .. } => {
+                map.get(*id).is_some()
+            }
+            MapRemoveRoad(id) => map.get(*id).is_some(),
+            MapRemoveBuilding(id) => map.get(*id).is_some(),
+            MapBuildHouse(id) => map
+                .get(*id)
+                .is_some_and(|lot| map.get(lot.parent).is_some()),
+            MapMakeConnection {
+                from,
+                to,
+                inter,
+                pat,
+            } => {
+                if !map.can_connect(*from, *to, *inter, pat) {
+                    return Err(Rejection::InvalidConnection);
+                }
+                true
+            }
+            SpawnTrain { wagons, lane, dist } => {
+                let lane = map.get(*lane).ok_or(Rejection::MissingReference)?;
+                if lane.kind != LaneKind::Rail
+                    || !dist.is_finite()
+                    || !(0.0..=lane.points.length()).contains(dist)
+                    || wagons.is_empty()
+                    || wagons
+                        .iter()
+                        .try_fold(0u32, |mass, &id| mass.checked_add(try_prototype(id)?.mass))
+                        .is_none_or(|mass| mass == 0)
+                {
+                    return Err(Rejection::InvalidTrain);
+                }
+                true
+            }
+            MapBuildSpecialBuilding {
+                pos,
+                kind,
+                gen,
+                zone,
+                connected_road,
+            } => {
+                if !Building::valid_footprint(pos, *gen) {
+                    return Err(Rejection::InvalidBuilding);
+                }
+                let zoneable = match *kind {
+                    BuildingKind::GoodsCompany(id) => try_prototype(id)
+                        .ok_or(Rejection::MissingReference)?
+                        .zone
+                        .is_some(),
+                    BuildingKind::RailFreightStation(id) => {
+                        try_prototype(id).ok_or(Rejection::MissingReference)?;
+                        false
+                    }
+                    _ => false,
+                };
+                if zone
+                    .as_ref()
+                    .is_some_and(|zone| !zoneable || zone.validated_area().is_none())
+                {
+                    return Err(Rejection::InvalidZone);
+                }
+                connected_road.is_none_or(|id| map.get(id).is_some())
+            }
+            UpdateZone { building, zone } => {
+                let b = map.get(*building).ok_or(Rejection::MissingReference)?;
+                if b.zone.is_none()
+                    || b.kind
+                        .as_goods_company()
+                        .and_then(try_prototype)
+                        .is_none_or(|proto| proto.zone.is_none())
+                    || zone.validated_area().is_none()
+                {
+                    return Err(Rejection::InvalidZone);
+                }
+                true
+            }
+            _ => true,
+        };
+        if exists {
+            Ok(())
+        } else {
+            Err(Rejection::MissingReference)
+        }
+    }
+
+    fn balance_after_cost(sim: &Simulation, cost: Option<Money>) -> Result<Money, Rejection> {
+        let cost = cost.ok_or(Rejection::CostOverflow)?;
+        let money = sim.read::<Government>().money;
+        if cost > Money::ZERO && money < cost {
+            return Err(Rejection::InsufficientFunds);
+        }
+        money
+            .inner()
+            .checked_sub(cost.inner())
+            .map(Money::new_inner)
+            .ok_or(Rejection::CostOverflow)
+    }
+
+    fn apply_connections(
+        &self,
+        sim: &mut Simulation,
+        projects: &[MapProject],
+        links: &[(usize, usize, Option<Vec2>, LanePattern)],
+    ) -> Result<(), Rejection> {
+        if links
+            .iter()
+            .any(|&(from, to, _, _)| from >= projects.len() || to >= projects.len())
+        {
+            return Err(Rejection::InvalidBatchIndex);
+        }
+
+        let mut map = sim.map_mut();
+        let mut endpoints: Vec<_> = projects
+            .iter()
+            .map(|&project| {
+                (project.pos.is_finite() && project.kind.check_valid(&map)).then_some(project)
+            })
+            .collect();
+        let mut junctions = BTreeSet::new();
+        for &(from, to, interpoint, ref pat) in links {
+            let resolve = |index: usize| {
+                let project: MapProject = endpoints[index]?;
+                if matches!(project.kind, ProjectKind::Road(_)) && !project.kind.check_valid(&map) {
+                    // A previous link may have split this endpoint's original road.
+                    let current =
+                        map.project(project.pos, 0.0, ProjectFilter::INTER | ProjectFilter::ROAD);
+                    return (!current.is_ground()).then_some(current);
+                }
+                Some(project)
+            };
+            let Some((fromproj, toproj)) = resolve(from).zip(resolve(to)) else {
+                self.reject(sim, Rejection::MissingReference);
+                continue;
+            };
+            if !map.can_connect(fromproj, toproj, interpoint, pat) {
+                self.reject(sim, Rejection::InvalidConnection);
+                continue;
+            }
+            let cost = Government::connection_cost(&projects[from], &projects[to], pat);
+            let balance = match Self::balance_after_cost(sim, cost) {
+                Ok(balance) => balance,
+                Err(reason) => {
+                    self.reject(sim, reason);
+                    continue;
+                }
+            };
+            let Some((src, dst, _)) = map.connect_projects(fromproj, toproj, interpoint, pat)
+            else {
+                self.reject(sim, Rejection::MutationFailed);
+                continue;
+            };
+            for (index, id) in [(from, src), (to, dst)] {
+                endpoints[index] = Some(MapProject {
+                    pos: projects[index].pos,
+                    kind: ProjectKind::Intersection(id),
+                });
+                junctions.insert(id);
+            }
+            sim.write::<Government>().money = balance;
+        }
+        // Keep junction IDs alive until every link that names them has been processed.
+        for junction in junctions {
+            map.merge_shallow_junction(junction);
+        }
+        map.check_invariants();
+        Ok(())
+    }
+
+    fn apply_one(&self, sim: &mut Simulation) -> Result<(), Rejection> {
+        self.validate(&sim.map())?;
+        let balance = Self::balance_after_cost(sim, Government::checked_action_cost(self, sim))?;
 
         match *self {
             MapRemoveIntersection(id) => sim.map_mut().remove_intersection(id),
-            MapRemoveRoad(id) => drop(sim.map_mut().remove_road(id)),
-            MapRemoveBuilding(id) => drop(sim.map_mut().remove_building(id)),
+            MapRemoveRoad(id) => {
+                sim.map_mut()
+                    .remove_road(id)
+                    .ok_or(Rejection::MutationFailed)?;
+            }
+            MapRemoveBuilding(id) => {
+                let was_external_target = sim.map().external_train_stations.first() == Some(&id);
+                let building = sim
+                    .map_mut()
+                    .remove_building(id)
+                    .ok_or(Rejection::MutationFailed)?;
+                crate::souls::lifecycle::remove_building(sim, building, was_external_target);
+            }
             MapBuildHouse(id) => {
-                if let Some(build) = sim.map_mut().build_house(id) {
-                    let mut infos = sim.write::<BuildingInfos>();
-                    infos.insert(build);
-                }
+                let building = sim
+                    .map_mut()
+                    .build_house(id)
+                    .ok_or(Rejection::MutationFailed)?;
+                sim.write::<BuildingInfos>().insert(building);
             }
             MapMakeConnection {
                 from,
@@ -247,32 +489,11 @@ impl WorldCommand {
                 inter,
                 ref pat,
             } => {
-                sim.write::<Map>().make_connection(from, to, inter, pat);
+                sim.map_mut()
+                    .make_connection(from, to, inter, pat)
+                    .ok_or(Rejection::MutationFailed)?;
             }
-            MapMakeMultipleConnections(ref projects, ref links) => {
-                let mut map = sim.map_mut();
-                let mut inters = BTreeMap::new();
-                for (from, to, interpoint, pat) in links {
-                    let mut fromproj = projects[*from];
-                    let mut toproj = projects[*to];
-
-                    if let Some(i) = inters.get(from) {
-                        fromproj.kind = ProjectKind::Intersection(*i);
-                    }
-                    if let Some(i) = inters.get(to) {
-                        toproj.kind = ProjectKind::Intersection(*i);
-                    }
-
-                    if let Some((_, r)) = map.make_connection(fromproj, toproj, *interpoint, pat) {
-                        if fromproj.kind.is_ground() {
-                            inters.insert(*from, map.roads[r].src);
-                        }
-                        if toproj.kind.is_ground() {
-                            inters.insert(*to, map.roads[r].dst);
-                        }
-                    }
-                }
-            }
+            MapMakeMultipleConnections(..) => unreachable!(),
             MapUpdateIntersectionPolicy {
                 inter: id,
                 turn: tp,
@@ -288,15 +509,12 @@ impl WorldCommand {
                 ref zone,
                 connected_road,
             } => {
-                if let Some(id) = sim.write::<Map>().build_special_building(
-                    &obb,
-                    kind,
-                    gen,
-                    zone.clone(),
-                    connected_road,
-                ) {
-                    sim.write::<BuildingInfos>().insert(id);
-                }
+                let zone = zone.clone().map(|zone| Zone::new(zone.poly, zone.filldir));
+                let id = sim
+                    .write::<Map>()
+                    .build_special_building(&obb, kind, gen, zone, connected_road)
+                    .ok_or(Rejection::MutationFailed)?;
+                sim.write::<BuildingInfos>().insert(id);
             }
             SetGameTime(gt) => *sim.write::<GameTime>() = gt,
             AddTrain {
@@ -309,7 +527,8 @@ impl WorldCommand {
                 lane,
                 dist,
             } => {
-                spawn_train(sim, wagons, RailWagonKind::Freight, lane, dist);
+                spawn_train(sim, wagons, RailWagonKind::Freight, lane, dist)
+                    .ok_or(Rejection::MutationFailed)?;
             }
 
             MapLoadParis => load_parismap(&mut sim.map_mut()),
@@ -334,7 +553,9 @@ impl WorldCommand {
             UpdateZone { building, ref zone } => {
                 let mut map = sim.map_mut();
 
-                map.update_zone(building, move |z| *z = zone.clone());
+                map.update_zone(building, |z| {
+                    *z = Zone::new(zone.poly.clone(), zone.filldir)
+                });
             }
             SpawnRandomCars { n_cars } => {
                 for _ in 0..n_cars {
@@ -376,6 +597,8 @@ impl WorldCommand {
                     .terraform(tick, kind, center, radius, amount, level, slope);
             }
         }
+        sim.write::<Government>().money = balance;
+        Ok(())
     }
 }
 
@@ -400,19 +623,19 @@ fn generate_terrain(sim: &mut Simulation, size: u16) {
         &pat,
     );
 
-    if sim
-        .map_mut()
-        .build_special_building(
-            &obb,
-            BuildingKind::ExternalTrading,
-            BuildingGen::NoWalkway {
-                door_pos: Vec2::ZERO,
-            },
-            None,
-            None,
-        )
-        .is_none()
-    {
+    let external_trading = sim.map_mut().build_special_building(
+        &obb,
+        BuildingKind::ExternalTrading,
+        BuildingGen::NoWalkway {
+            door_pos: Vec2::ZERO,
+        },
+        None,
+        None,
+    );
+
+    if let Some(id) = external_trading {
+        sim.write::<BuildingInfos>().insert(id);
+    } else {
         log::error!("failed to build external trading");
     }
 }

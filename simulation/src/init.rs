@@ -31,6 +31,11 @@ use crate::{
 };
 
 pub fn init() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(register_simulation);
+}
+
+fn register_simulation() {
     //crate::rerun::init_rerun();
 
     // # Safety
@@ -70,6 +75,7 @@ pub fn init() {
     register_system_sim("add_souls_to_empty_buildings", add_souls_to_empty_buildings);
     register_system_sim("citystats_update", citystats_update);
 
+    register_resource_noserialize::<crate::world_command::CommandOutcomes>();
     register_resource_noserialize::<ParCommandBuffer<VehicleEnt>>();
     register_resource_noserialize::<ParCommandBuffer<TrainEnt>>();
     register_resource_noserialize::<ParCommandBuffer<HumanEnt>>();
@@ -103,7 +109,7 @@ pub struct InitFunc {
 pub(crate) struct SaveLoadFunc {
     pub name: &'static str,
     pub save: Box<dyn Fn(&Simulation) -> Vec<u8> + 'static>,
-    pub load: Box<dyn Fn(&mut Simulation, Vec<u8>) + 'static>,
+    pub load: Box<dyn Fn(&mut Simulation, &[u8]) -> std::io::Result<()> + 'static>,
 }
 
 pub(crate) struct GSystem {
@@ -179,13 +185,9 @@ fn register_resource_noinit<T: 'static + Send + Sync + Serialize + DeserializeOw
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name,
             save: Box::new(move |uiworld| E::encode(&*uiworld.read::<T>()).unwrap()),
-            load: Box::new(move |uiworld, data| match E::decode::<T>(&data) {
-                Ok(res) => {
-                    uiworld.insert(res);
-                }
-                Err(e) => {
-                    log::error!("Error loading resource {}: {}", name, e);
-                }
+            load: Box::new(move |sim, data| {
+                sim.insert(E::decode::<T>(data)?);
+                Ok(())
             }),
         });
     }

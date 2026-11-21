@@ -208,10 +208,10 @@ impl DispatchOne {
     }
 
     pub fn unregister(&mut self, id: DispatchID) {
+        self.reserved_by.remove(&id);
         let Some(pos) = self.positions.remove(&id) else {
             return;
         };
-        self.reserved_by.remove(&id);
         self.lanes.get_mut(&pos.lane).unwrap().retain(|e| *e != id);
     }
 

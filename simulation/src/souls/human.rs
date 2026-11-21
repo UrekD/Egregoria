@@ -80,6 +80,22 @@ impl Default for HumanDecisionKind {
 }
 
 impl HumanDecisionKind {
+    pub(crate) fn references_building(&self, building: BuildingID) -> bool {
+        match self {
+            Self::GoTo(Destination::Building(id)) | Self::DeliverAtBuilding(id) => *id == building,
+            Self::MultiStack(steps) => steps.iter().any(|step| step.references_building(building)),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn references_vehicle(&self, vehicle: VehicleID) -> bool {
+        match self {
+            Self::SetVehicle(Some(id)) => *id == vehicle,
+            Self::MultiStack(steps) => steps.iter().any(|step| step.references_vehicle(vehicle)),
+            _ => false,
+        }
+    }
+
     pub fn update(
         &mut self,
         router: &mut Router,

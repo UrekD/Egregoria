@@ -8,7 +8,7 @@ use crate::map::{
     SubscriberChunkID, TerraformKind, UpdateType, Zone, ROAD_Z_OFFSET,
 };
 use geom::OBB;
-use geom::{Vec2, Vec3};
+use geom::{PolyLine3, Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use prototypes::{BuildingGen, Tick};
 use serde::{Deserialize, Serialize};
@@ -147,6 +147,67 @@ impl Map {
         Some(b)
     }
 
+    pub(crate) fn can_connect(
+        &self,
+        from: MapProject,
+        to: MapProject,
+        interpoint: Option<Vec2>,
+        pattern: &LanePattern,
+    ) -> bool {
+        if !from.pos.is_finite()
+            || !to.pos.is_finite()
+            || interpoint.is_some_and(|point| !point.is_finite())
+            || pattern.lanes().next().is_none()
+        {
+            return false;
+        }
+        for lanes in [&pattern.lanes_forward, &pattern.lanes_backward] {
+            if lanes
+                .iter()
+                .any(|&(_, speed)| !speed.is_finite() || speed <= 0.0)
+                || (lanes.iter().any(|&(kind, _)| kind == LaneKind::Parking)
+                    && !lanes.iter().any(|&(kind, _)| kind == LaneKind::Driving))
+            {
+                return false;
+            }
+        }
+        // Each split removes its source road. Both endpoints must still be resolvable
+        // after resolving the first one.
+        if from.kind == to.kind && from.kind != ProjectKind::Ground {
+            return false;
+        }
+        let endpoint = |project: MapProject| match project.kind {
+            ProjectKind::Ground => Some(project.pos),
+            ProjectKind::Intersection(id) => self.get(id).map(|inter| inter.pos),
+            ProjectKind::Road(id) => self
+                .road_split_point(id, project.pos)
+                .map(|(point, _)| point - Vec3::z(ROAD_Z_OFFSET)),
+            ProjectKind::Building(_) | ProjectKind::Lot(_) => None,
+        };
+        let Some((src, dst)) = endpoint(from).zip(endpoint(to)) else {
+            return false;
+        };
+        let distance = src.xy().distance(dst.xy());
+        distance.is_finite() && distance >= 1.0
+    }
+
+    fn road_split_point(&self, id: RoadID, pos: Vec3) -> Option<(Vec3, usize)> {
+        let road = self.get(id)?;
+        if !self.intersections.contains_key(road.src)
+            || !self.intersections.contains_key(road.dst)
+            || road
+                .connected_buildings
+                .iter()
+                .any(|b| !self.buildings.contains_key(*b))
+        {
+            return None;
+        }
+        let (pos, segment) = road.points.project_segment(pos);
+        (pos.xy().distance(road.points.first().xy()) >= 1.0
+            && pos.xy().distance(road.points.last().xy()) >= 1.0)
+            .then_some((pos, segment))
+    }
+
     pub fn make_connection(
         &mut self,
         from: MapProject,
@@ -154,10 +215,21 @@ impl Map {
         interpoint: Option<Vec2>,
         pattern: &LanePattern,
     ) -> Option<(IntersectionID, RoadID)> {
-        if !from.kind.check_valid(self)
-            || !to.kind.check_valid(self)
-            || from.pos.distance(to.pos) < 1.0
-        {
+        let (from_id, to_id, road) = self.connect_projects(from, to, interpoint, pattern)?;
+        self.merge_shallow_junction(from_id);
+        self.merge_shallow_junction(to_id);
+        self.check_invariants();
+        Some((to_id, road))
+    }
+
+    pub(crate) fn connect_projects(
+        &mut self,
+        from: MapProject,
+        to: MapProject,
+        interpoint: Option<Vec2>,
+        pattern: &LanePattern,
+    ) -> Option<(IntersectionID, IntersectionID, RoadID)> {
+        if !self.can_connect(from, to, interpoint, pattern) {
             return None;
         }
         info!("make_connection {:?} {:?} {:?}", from, to, interpoint);
@@ -176,42 +248,31 @@ impl Map {
             })
         };
 
-        let from_id = mk_inter(from)?;
-        let Some(to_id) = mk_inter(to) else {
-            self.invalidate(from_id);
-            self.check_invariants();
-            return None;
-        };
-
-        let Some(r) = self.connect(from_id, to_id, pattern, connection_segment) else {
-            self.invalidate(from_id);
-            self.invalidate(to_id);
-            self.check_invariants();
-            return None;
-        };
+        let from_id = mk_inter(from).expect("validated connection start");
+        let to_id = mk_inter(to).expect("validated connection end");
+        let r = self
+            .connect(from_id, to_id, pattern, connection_segment)
+            .expect("validated connection intersections");
 
         self.invalidate(from_id);
         self.invalidate(to_id);
 
-        let mut maybe_merge = |inter_id| {
-            let inter = &self.intersections[inter_id];
-            if let [r1_id, r2_id] = *inter.roads {
-                let r1 = &self.roads[r1_id];
-                let r2 = &self.roads[r2_id];
-                // only merge if angle is shallow
-                if r1.dir_from(inter_id).dot(r2.dir_from(inter_id)) < -0.9 {
-                    self.merge_road(r1_id, r2_id);
-                }
-            }
-        };
-        maybe_merge(from_id);
-        maybe_merge(to_id);
-
         info!("connected {:?} {:?}: {:?}", from_id, to_id, r);
+        Some((from_id, to_id, r))
+    }
 
-        self.check_invariants();
-
-        Some((to_id, r))
+    pub(crate) fn merge_shallow_junction(&mut self, id: IntersectionID) {
+        let Some(intersection) = self.intersections.get(id) else {
+            return;
+        };
+        if let [first, second] = *intersection.roads {
+            let angle = self.roads[first]
+                .dir_from(id)
+                .dot(self.roads[second].dir_from(id));
+            if angle < -0.9 {
+                self.merge_road(first, second);
+            }
+        }
     }
 
     pub fn update_zone(&mut self, id: BuildingID, f: impl FnOnce(&mut Zone)) {
@@ -262,14 +323,6 @@ impl Map {
             zone
         );
 
-        self.clean_lots_inner(self.spatial_map.query(obb, ProjectFilter::LOT).collect());
-
-        self.environment
-            .remove_trees_near(obb.expand(10.0), |tree_chunk| {
-                self.subscribers
-                    .dispatch_chunk(UpdateType::Terrain, tree_chunk)
-            });
-
         let Some(id) = Building::make(
             &mut self.buildings,
             &mut self.spatial_map,
@@ -286,6 +339,14 @@ impl Map {
             return None;
         };
 
+        self.clean_lots_inner(self.spatial_map.query(obb, ProjectFilter::LOT).collect());
+
+        self.environment
+            .remove_trees_near(obb.expand(10.0), |tree_chunk| {
+                self.subscribers
+                    .dispatch_chunk(UpdateType::Terrain, tree_chunk)
+            });
+
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
 
@@ -300,11 +361,8 @@ impl Map {
     pub fn build_house(&mut self, lot_id: LotID) -> Option<BuildingID> {
         info!("build house on {:?}", lot_id);
 
-        let lot = self.lots.remove(lot_id)?;
-        self.subscribers.dispatch(UpdateType::Road, &lot);
-        self.spatial_map.remove(lot.id);
-
-        let Some(id) = Building::make(
+        let lot = self.lots.get(lot_id)?;
+        let id = Building::make(
             &mut self.buildings,
             &mut self.spatial_map,
             &mut self.electricity,
@@ -315,11 +373,11 @@ impl Map {
             BuildingGen::House,
             None,
             Some(lot.parent),
-        ) else {
-            self.check_invariants();
-            return None;
-        };
+        )?;
 
+        let lot = self.lots.remove(lot_id).expect("house lot still exists");
+        self.subscribers.dispatch(UpdateType::Road, &lot);
+        self.spatial_map.remove(lot_id);
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
         self.electricity.add_object(id);
@@ -491,11 +549,7 @@ impl Map {
     ) -> Option<IntersectionID> {
         info!("split_road {:?} {:?}", split_road_id, pos);
 
-        if !self.roads.contains_key(split_road_id) {
-            log::error!("splitting non-existing road {:?}", split_road_id);
-            return None;
-        }
-
+        let (pos, segment) = self.road_split_point(split_road_id, pos)?;
         let pat = self.roads.get(split_road_id)?.pattern(&self.lanes);
         let r = self.remove_raw_road(split_road_id)?;
         self.subscribers.dispatch(UpdateType::Road, &r);
@@ -506,8 +560,21 @@ impl Map {
 
         let id = self.add_intersection(pos - Vec3::z(ROAD_Z_OFFSET));
 
-        let dist_along = r.points.length_at_proj(pos);
-        let (before, after) = r.points.split(dist_along);
+        let mut before: Vec<_> = r
+            .points
+            .iter()
+            .copied()
+            .take(segment)
+            .chain([pos])
+            .collect();
+        let mut after: Vec<_> = [pos]
+            .into_iter()
+            .chain(r.points.iter().copied().skip(segment))
+            .collect();
+        before.dedup();
+        after.dedup();
+        let before = PolyLine3::new(before);
+        let after = PolyLine3::new(after);
 
         let r1 = self.connect(r.src, id, &pat, RoadSegmentKind::Arbitrary(before))?;
         let r2 = self.connect(id, r.dst, &pat, RoadSegmentKind::Arbitrary(after))?;

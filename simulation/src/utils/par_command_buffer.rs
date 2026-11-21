@@ -1,10 +1,9 @@
-use crate::utils::resources::Resources;
 use crate::world::Entity;
 use crate::Simulation;
 use std::sync::Mutex;
 
 pub trait SimDrop: Entity {
-    fn sim_drop(self, id: Self::ID, res: &mut Resources);
+    fn sim_drop(self, id: Self::ID, sim: &mut Simulation);
 }
 
 type ExecType = Box<dyn for<'a> FnOnce(&'a mut Simulation) + Send>;
@@ -47,7 +46,8 @@ impl<E: SimDrop> ParCommandBuffer<E> {
         })
     }
 
-    pub fn apply(sim: &mut Simulation) {
+    /// Applies queued deletions and callbacks. Returns whether any work was queued.
+    pub fn apply(sim: &mut Simulation) -> bool {
         profiling::scope!("par_command_buffer::apply");
         let mut deleted: Vec<E::ID> = std::mem::take(
             &mut *sim
@@ -57,6 +57,7 @@ impl<E: SimDrop> ParCommandBuffer<E> {
                 .unwrap(),
         );
 
+        let had_kills = !deleted.is_empty();
         deleted.sort_unstable();
 
         for entity in deleted {
@@ -64,7 +65,7 @@ impl<E: SimDrop> ParCommandBuffer<E> {
                 continue;
             };
 
-            E::sim_drop(v, entity, &mut sim.resources);
+            E::sim_drop(v, entity, sim);
         }
 
         let mut exec_ent = std::mem::take(
@@ -75,10 +76,12 @@ impl<E: SimDrop> ParCommandBuffer<E> {
                 .unwrap(),
         );
 
+        let had_callbacks = !exec_ent.is_empty();
         exec_ent.sort_unstable_by_key(|(id, _)| *id);
 
         for (_, exec) in exec_ent {
             exec(sim);
         }
+        had_kills || had_callbacks
     }
 }

@@ -317,6 +317,43 @@ impl Router {
         }
     }
 
+    pub(crate) fn references_building(&self, building: BuildingID) -> bool {
+        self.target_dest == Some(Destination::Building(building))
+            || self.cur_dest == Some(Destination::Building(building))
+            || self.steps.iter().chain(self.cur_step.iter()).any(|step| {
+                matches!(step, RoutingStep::GetInBuilding(id) | RoutingStep::GetOutBuilding(id) if *id == building)
+            })
+    }
+
+    pub(crate) fn forget_vehicle(&mut self, id: VehicleID) -> bool {
+        if self.personal_car == Some(id) {
+            self.personal_car = None;
+        }
+        let selected = self.vehicle == Some(id);
+        if selected {
+            self.vehicle = self.personal_car;
+        }
+        selected
+            || self
+                .steps
+                .iter()
+                .chain(self.cur_step.iter())
+                .any(|step| match *step {
+                    RoutingStep::DriveTo(vehicle, _)
+                    | RoutingStep::Park(vehicle, _)
+                    | RoutingStep::Unpark(vehicle)
+                    | RoutingStep::GetInVehicle(vehicle)
+                    | RoutingStep::GetOutVehicle(vehicle) => vehicle == id,
+                    _ => false,
+                })
+    }
+
+    pub(crate) fn cancel_route(&mut self, parking: &mut ParkingManagement) {
+        self.clear_steps(parking);
+        self.cur_dest = None;
+        self.target_dest = None;
+    }
+
     pub fn reset_dest(&mut self) {
         self.cur_dest = None;
     }
@@ -345,6 +382,12 @@ impl Router {
             steps.push(RoutingStep::GetOutBuilding(*cur_build));
         }
 
+        if let Location::Vehicle(current) = *loc {
+            if self.vehicle != Some(current) {
+                steps.push(RoutingStep::GetOutVehicle(current));
+            }
+        }
+
         if let Some(car) = self.vehicle {
             let spot_resa = parking
                 .reserve_near(obj, map)
@@ -357,7 +400,7 @@ impl Router {
                 }
             };
 
-            if !matches!(loc, Location::Vehicle(_)) {
+            if *loc != Location::Vehicle(car) {
                 if let Some(pos) = cars.get(car).map(|x| x.trans.pos) {
                     steps.push(RoutingStep::WalkTo(pos));
                     steps.push(RoutingStep::GetInVehicle(car));

@@ -11,6 +11,7 @@ use common::saveload::Encoder;
 use geom::{Vec2, Vec3};
 use std::sync::Once;
 
+mod lifecycle;
 mod test_iso;
 mod vehicles;
 

@@ -90,6 +90,12 @@ pub struct Trade {
     pub money_delta: Money, // money delta from the govt point of view, positive means we gained money
 }
 
+impl Trade {
+    pub(crate) fn involves(&self, soul: SoulID) -> bool {
+        self.buyer.0 == soul || self.seller.0 == soul
+    }
+}
+
 pub fn find_trade_place(target: TradeTarget, binfos: &BuildingInfos) -> Option<BuildingID> {
     binfos.building_owned_by(target.0)
 }
@@ -141,6 +147,8 @@ impl Market {
 
     /// An agent was removed from the world, we need to clean after him
     pub fn remove(&mut self, soul: SoulID) {
+        self.all_trades.retain(|trade| !trade.involves(soul));
+        self.potential.retain(|(trade, _)| !trade.involves(soul));
         for market in self.markets.values_mut() {
             market.sell_orders.remove(&soul);
             market.buy_orders.remove(&soul);

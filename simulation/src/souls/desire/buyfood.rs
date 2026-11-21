@@ -37,6 +37,18 @@ impl BuyFood {
         }
     }
 
+    pub(crate) fn forget_building(&mut self, building: BuildingID) {
+        if matches!(self.state, BuyFoodState::BoughtAt(id) if id == building) {
+            self.state = BuyFoodState::Empty;
+        }
+    }
+
+    pub(crate) fn cancel_purchase(&mut self) {
+        if matches!(self.state, BuyFoodState::WaitingForTrade) {
+            self.state = BuyFoodState::Empty;
+        }
+    }
+
     pub fn score(&self, time: &GameTime, loc: &Location, bought: &Bought) -> f32 {
         if matches!(self.state, BuyFoodState::WaitingForTrade)
             && bought

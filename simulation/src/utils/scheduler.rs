@@ -43,12 +43,7 @@ impl SeqSchedule {
 
             sys.run(sim);
 
-            ParCommandBuffer::<VehicleEnt>::apply(sim);
-            ParCommandBuffer::<HumanEnt>::apply(sim);
-            ParCommandBuffer::<TrainEnt>::apply(sim);
-            ParCommandBuffer::<WagonEnt>::apply(sim);
-            ParCommandBuffer::<FreightStationEnt>::apply(sim);
-            ParCommandBuffer::<CompanyEnt>::apply(sim);
+            drain_commands(sim);
 
             let elapsed = start.elapsed();
 
@@ -65,4 +60,15 @@ impl SeqSchedule {
         times.sort_unstable_by_key(|(_, t)| OrderedFloat(-*t));
         times
     }
+}
+
+pub(crate) fn drain_commands(sim: &mut Simulation) {
+    // Each buffer must run on every pass, including those after a cascade.
+    while ParCommandBuffer::<VehicleEnt>::apply(sim)
+        | ParCommandBuffer::<HumanEnt>::apply(sim)
+        | ParCommandBuffer::<TrainEnt>::apply(sim)
+        | ParCommandBuffer::<WagonEnt>::apply(sim)
+        | ParCommandBuffer::<FreightStationEnt>::apply(sim)
+        | ParCommandBuffer::<CompanyEnt>::apply(sim)
+    {}
 }

@@ -4,11 +4,24 @@ use crate::Simulation;
 use prototypes::Tick;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Replay {
+    #[serde(default)]
+    pub version: String,
     pub enabled: bool,
     commands: Vec<(Tick, WorldCommand)>,
     pub last_tick_recorded: Tick,
+}
+
+impl Default for Replay {
+    fn default() -> Self {
+        Self {
+            version: crate::VERSION.to_owned(),
+            enabled: false,
+            commands: Vec::new(),
+            last_tick_recorded: Tick::default(),
+        }
+    }
 }
 
 impl Replay {

@@ -21,6 +21,29 @@ impl BuildingInfos {
         self.assignment.insert(building, BuildingInfo::default());
     }
 
+    pub fn remove(&mut self, building: BuildingID) -> Option<BuildingInfo> {
+        let info = self.assignment.remove(building)?;
+        if let Some(owner) = info.owner {
+            if self.owners.get(&owner) == Some(&building) {
+                self.owners.remove(&owner);
+            }
+        }
+        Some(info)
+    }
+
+    pub(crate) fn remove_soul(&mut self, soul: SoulID) {
+        if let Some(building) = self.owners.remove(&soul) {
+            if let Some(info) = self.get_mut(building) {
+                if info.owner == Some(soul) {
+                    info.owner = None;
+                }
+            }
+        }
+        for (_, info) in self.assignment.iter_mut() {
+            info.inside.retain(|&occupant| occupant != soul);
+        }
+    }
+
     pub fn get(&self, building: BuildingID) -> Option<&BuildingInfo> {
         self.assignment.get(building)
     }

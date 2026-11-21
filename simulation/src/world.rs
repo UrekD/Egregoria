@@ -1,4 +1,4 @@
-use crate::economy::{Bought, Market, Sold, Workers};
+use crate::economy::{Bought, Sold, Workers};
 use crate::map_dynamic::{
     DispatchID, Dispatcher, Itinerary, ItineraryFollower, ItineraryLeader, ParkingManagement,
     Router,
@@ -7,13 +7,13 @@ use crate::souls::desire::{BuyFood, Home, Work};
 use crate::souls::freight_station::FreightStation;
 use crate::souls::goods_company::GoodsCompanyState;
 use crate::souls::human::{HumanDecision, PersonalInfo};
+use crate::souls::lifecycle;
 use crate::transportation::train::{Locomotive, LocomotiveReservation, RailWagon};
 use crate::transportation::{
     Location, Pedestrian, Speed, TransportGrid, Transporter, Vehicle, VehicleKind, VehicleState,
 };
 use crate::utils::par_command_buffer::SimDrop;
-use crate::utils::resources::Resources;
-use crate::{impl_entity, impl_trans, SoulID};
+use crate::{impl_entity, impl_trans, Simulation};
 use common::iter::chain;
 use derive_more::{From, TryInto};
 use geom::{Transform, Vec2, Vec3};
@@ -65,7 +65,8 @@ pub struct VehicleEnt {
 }
 
 impl SimDrop for VehicleEnt {
-    fn sim_drop(mut self, id: VehicleID, res: &mut Resources) {
+    fn sim_drop(mut self, id: VehicleID, sim: &mut Simulation) {
+        let res = &sim.resources;
         if let Some(collider) = self.collider {
             res.write::<TransportGrid>().remove_maintain(collider.0);
         }
@@ -78,8 +79,9 @@ impl SimDrop for VehicleEnt {
 
         if matches!(self.vehicle.kind, VehicleKind::Truck) {
             res.write::<Dispatcher>()
-                .unregister(DispatchID::SmallTruck(id))
+                .unregister(DispatchID::SmallTruck(id));
         }
+        lifecycle::vehicle_dropped(sim, id, self.trans.pos);
     }
 }
 
@@ -104,15 +106,11 @@ pub struct HumanEnt {
 }
 
 impl SimDrop for HumanEnt {
-    fn sim_drop(mut self, id: HumanID, res: &mut Resources) {
+    fn sim_drop(mut self, id: HumanID, sim: &mut Simulation) {
         if let Some(collider) = self.collider {
-            res.write::<TransportGrid>().remove_maintain(collider.0);
+            sim.write::<TransportGrid>().remove_maintain(collider.0);
         }
-
-        res.write::<Market>().remove(SoulID::Human(id));
-
-        self.router
-            .clear_steps(&mut res.write::<ParkingManagement>())
+        lifecycle::human_dropped(sim, id, &mut self);
     }
 }
 
@@ -128,9 +126,8 @@ pub struct TrainEnt {
 }
 
 impl SimDrop for TrainEnt {
-    fn sim_drop(self, id: TrainID, res: &mut Resources) {
-        res.write::<Dispatcher>()
-            .unregister(DispatchID::FreightTrain(id));
+    fn sim_drop(self, id: TrainID, sim: &mut Simulation) {
+        lifecycle::train_dropped(sim, id);
     }
 }
 
@@ -143,7 +140,7 @@ pub struct WagonEnt {
 }
 
 impl SimDrop for WagonEnt {
-    fn sim_drop(self, _: WagonID, _: &mut Resources) {}
+    fn sim_drop(self, _: WagonID, _: &mut Simulation) {}
 }
 
 #[derive(Inspect, Serialize, Deserialize)]
@@ -153,14 +150,8 @@ pub struct FreightStationEnt {
 }
 
 impl SimDrop for FreightStationEnt {
-    fn sim_drop(self, id: FreightStationID, res: &mut Resources) {
-        res.write::<Market>().remove(SoulID::FreightStation(id));
-
-        let mut d = res.write::<Dispatcher>();
-        for (id, _) in self.f.trains {
-            d.free(id);
-        }
-        drop(d);
+    fn sim_drop(self, id: FreightStationID, sim: &mut Simulation) {
+        lifecycle::freight_station_dropped(sim, id, self);
     }
 }
 
@@ -174,8 +165,8 @@ pub struct CompanyEnt {
 }
 
 impl SimDrop for CompanyEnt {
-    fn sim_drop(self, id: CompanyID, res: &mut Resources) {
-        res.write::<Market>().remove(SoulID::GoodsCompany(id));
+    fn sim_drop(self, id: CompanyID, sim: &mut Simulation) {
+        lifecycle::company_dropped(sim, id, self);
     }
 }
 

@@ -106,8 +106,15 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
                 }
                 FreightTrainState::Loading => {
                     if itin.has_ended(time.timestamp) {
-                        let ext = *map.external_train_stations.first().unwrap();
-                        let bpos = map.buildings[ext].obb.center().z(0.0);
+                        let Some(building) = map
+                            .external_train_stations
+                            .first()
+                            .and_then(|&id| map.get(id))
+                        else {
+                            *itin = Itinerary::wait_until(time.timestamp + 10.0);
+                            continue;
+                        };
+                        let bpos = building.obb.center().z(0.0);
 
                         *itin = if let Some(r) =
                             Itinerary::route(tick, train.trans.pos, bpos, &map, PathKind::Rail)
@@ -133,7 +140,8 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
         }
 
         // If enough goods are waiting, query for a train to take them to the external trading station
-        if station.trains.len() >= MAX_TRAINS_PER_STATION {
+        if station.trains.len() >= MAX_TRAINS_PER_STATION || map.external_train_stations.is_empty()
+        {
             continue;
         }
         if station.waiting_cargo + station.wanted_cargo < 10 {
@@ -152,10 +160,13 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
 
         let train = world.trains.get_mut(trainid).unwrap();
 
-        train.it = unwrap_or!(
-            Itinerary::route(tick, train.trans.pos, destination, &map, PathKind::Rail,),
-            continue
-        );
+        let Some(route) =
+            Itinerary::route(tick, train.trans.pos, destination, &map, PathKind::Rail)
+        else {
+            dispatch.free(trainid);
+            continue;
+        };
+        train.it = route;
 
         station.trains.push((trainid, FreightTrainState::Arriving));
     }

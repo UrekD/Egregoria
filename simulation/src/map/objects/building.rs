@@ -44,6 +44,7 @@ pub struct StraightRoadGen {
 }
 
 pub const MAX_ZONE_AREA: f32 = 50000.0; // in m²
+const MAX_ZONE_PERIMETER: f32 = 3000.0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
@@ -65,6 +66,19 @@ impl Zone {
             filldir,
         }
     }
+
+    pub(crate) fn validated_area(&self) -> Option<f32> {
+        let area = self.poly.area();
+        let perimeter = self.poly.perimeter();
+        (self.poly.len() >= 3
+            && self.filldir.is_finite()
+            && self.filldir.mag2() > 0.0
+            && self.poly.iter().all(|point| point.is_finite())
+            && area > 0.0
+            && area <= MAX_ZONE_AREA
+            && perimeter <= MAX_ZONE_PERIMETER)
+            .then_some(area)
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +94,23 @@ pub struct Building {
 }
 
 impl Building {
+    pub fn is_orphaned(&self) -> bool {
+        self.connected_road.is_none()
+    }
+
+    pub(crate) fn valid_footprint(obb: &OBB, gen: BuildingGen) -> bool {
+        obb.corners.iter().all(|corner| corner.is_finite())
+            && obb
+                .axis()
+                .iter()
+                .all(|axis| axis.mag2() > 0.0 && axis.mag2().is_finite())
+            && match gen {
+                BuildingGen::CenteredDoor { vertical_factor } => vertical_factor.is_finite(),
+                BuildingGen::NoWalkway { door_pos } => door_pos.is_finite(),
+                BuildingGen::House | BuildingGen::Farm => true,
+            }
+    }
+
     pub fn make(
         buildings: &mut Buildings,
         spatial_map: &mut SpatialMap,
@@ -90,8 +121,14 @@ impl Building {
         kind: BuildingKind,
         gen: BuildingGen,
         zone: Option<Zone>,
-        mut connected_road: Option<RoadID>,
+        connected_road: Option<RoadID>,
     ) -> Option<BuildingID> {
+        if !Self::valid_footprint(&obb, gen)
+            || connected_road.is_some_and(|road| !roads.contains_key(road))
+        {
+            return None;
+        }
+
         let at = obb.center().z(env.height(obb.center()).unwrap_or(0.0));
         let axis = (obb.corners[1] - obb.corners[0]).normalize();
         let size = obb.corners[0].distance(obb.corners[1]);
@@ -134,11 +171,7 @@ impl Building {
             if let Some(r) = connected_road {
                 electricity.add_edge(id, r);
 
-                if let Some(r) = roads.get_mut(r) {
-                    r.connected_buildings.push(id);
-                } else {
-                    connected_road = None;
-                }
+                roads[r].connected_buildings.push(id);
             }
 
             Self {
