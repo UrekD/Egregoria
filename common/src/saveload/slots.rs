@@ -266,11 +266,23 @@ pub fn slot_paths(root: &Path, id: &SlotId) -> io::Result<SlotPaths> {
 /// Delete every spelling of the slot's replay, metadata, legacy BC and ZIP files.
 /// Missing files are accepted so a partially completed deletion can be retried.
 /// A standalone JSON reservation prevents deletion, as it does for `slot_paths`.
+/// A directory at any spelling of the ZIP path returns `ErrorKind::IsADirectory`
+/// before any member of the slot is removed.
 pub fn delete_slot(root: &Path, id: &SlotId) -> io::Result<()> {
     let family = read_families(root, Some(id))?
         .remove(id)
         .unwrap_or_default();
     family.require_unreserved(id)?;
+    if let Some(zip) = family
+        .members
+        .iter()
+        .find(|member| member.kind == MemberKind::Zip && member.metadata.is_dir())
+    {
+        return Err(io::Error::new(
+            ErrorKind::IsADirectory,
+            format!("slot ZIP path {} is a directory", zip.path.display()),
+        ));
+    }
     for member in family.members {
         #[cfg(windows)]
         let result = {
@@ -313,6 +325,10 @@ pub fn list_slots(root: &Path) -> io::Result<Vec<SlotEntry>> {
 }
 
 /// List slots with revisions read by the caller from the selected snapshot's header.
+///
+/// A known snapshot revision determines metadata freshness. Without a revision,
+/// metadata must be at least as recent as the snapshot. Ordering uses fresh
+/// metadata's `saved_at_unix` or falls back to the snapshot's modification time.
 ///
 /// Use the supplied path as-is for I/O. Obstructed snapshots are never passed to the
 /// callback. Return `None` for legacy snapshots or when no revision could be read.
@@ -461,9 +477,11 @@ fn fresh_slot_meta(
     revision: Option<SnapshotRevision>,
 ) -> Option<SlotMeta> {
     let file = open_regular(path).ok()?;
-    let modified = report_entry_error(file.metadata().and_then(|m| m.modified()), path).ok()?;
-    if modified < snapshot_modified {
-        return None;
+    if revision.is_none() {
+        let modified = report_entry_error(file.metadata().and_then(|m| m.modified()), path).ok()?;
+        if modified < snapshot_modified {
+            return None;
+        }
     }
     let meta: SlotMeta = JSON::decode_reader(BufReader::new(file)).ok()?;
     revision

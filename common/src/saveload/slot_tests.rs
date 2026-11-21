@@ -251,6 +251,28 @@ fn slot_delete_removes_autosave_family_and_case_variants() {
 }
 
 #[test]
+fn slot_delete_rejects_zip_directory_before_removing_family() {
+    let root = TestRoot::new();
+    let id = SlotId::new("harbor").unwrap();
+    let members = ["harbor.bc", "harbor.meta.json", "harbor_replay.json"]
+        .map(|name| root.file(name, b"keep", 100));
+    let zip = root.0.join("Harbor.ZIP");
+    fs::create_dir(&zip).unwrap();
+    let zip_alias =
+        (!root.0.join("harbor.zip").exists()).then(|| root.file("harbor.zip", b"snapshot", 200));
+
+    let error = delete_slot(&root.0, &id).unwrap_err();
+    for member in members {
+        assert_eq!(fs::read(member).unwrap(), b"keep");
+    }
+    assert_eq!(error.kind(), ErrorKind::IsADirectory);
+    assert!(zip.is_dir());
+    if let Some(zip_alias) = zip_alias {
+        assert_eq!(fs::read(zip_alias).unwrap(), b"snapshot");
+    }
+}
+
+#[test]
 fn slot_revision_binds_sidecars_to_the_selected_snapshot() {
     let root = TestRoot::new();
     let zip = root.file("Harbor.ZIP", b"snapshot", 100);
@@ -287,6 +309,43 @@ fn slot_revision_binds_sidecars_to_the_selected_snapshot() {
         200,
     );
     assert!(list(Some(revision)).replay_available);
+}
+
+#[test]
+fn slot_revision_takes_precedence_over_meta_mtime_in_ordering() {
+    let root = TestRoot::new();
+    let revision = SnapshotRevision::new(42);
+    for (id, snapshot_mtime, meta_mtime, saved_at, meta_revision) in [
+        ("harbor", 100, 90, 500, 42),
+        ("market", 300, 400, 900, 43),
+        ("park", 200, 150, 600, 43),
+    ] {
+        root.file(&format!("{id}.zip"), b"snapshot", snapshot_mtime);
+        let sidecar = SlotMeta {
+            revision: Some(meta_revision),
+            ..meta(saved_at)
+        };
+        root.file(
+            &format!("{id}.meta.json"),
+            &JSON::encode(&sidecar).unwrap(),
+            meta_mtime,
+        );
+    }
+
+    let entries = list_slots_with_revisions(&root.0, |_, _| Some(revision)).unwrap();
+    let order: Vec<_> = entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.id.as_str(),
+                entry.meta.as_ref().map(|meta| meta.saved_at_unix),
+            )
+        })
+        .collect();
+    assert_eq!(
+        order,
+        [("harbor", Some(500)), ("market", None), ("park", None)]
+    );
 }
 
 #[test]

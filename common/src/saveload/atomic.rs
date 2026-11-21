@@ -249,6 +249,7 @@ fn replace_file(staging: &Path, path: &Path, durability: Durability) -> io::Resu
 
 /// Remove regular staging files directly under `root` older than `older_than`.
 /// Call at startup or use an age safely above the lifetime of an in-progress write.
+/// Entry errors are skipped and logged. Entries that disappear are skipped quietly.
 pub fn sweep_stale_tmp(root: &Path, older_than: Duration) -> io::Result<usize> {
     let dir = match fs::read_dir(root) {
         Ok(dir) => dir,
@@ -258,7 +259,17 @@ pub fn sweep_stale_tmp(root: &Path, older_than: Duration) -> io::Result<usize> {
     let now = SystemTime::now();
     let mut removed = 0;
     for entry in dir {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                log::warn!(
+                    "could not read staging file entry under {}: {error}",
+                    root.display()
+                );
+                continue;
+            }
+        };
         if !is_staging_name(entry.file_name().as_encoded_bytes()) {
             continue;
         }
@@ -270,7 +281,7 @@ pub fn sweep_stale_tmp(root: &Path, older_than: Duration) -> io::Result<usize> {
                     .duration_since(metadata.modified()?)
                     .is_ok_and(|age| age > older_than)
             {
-                fs::remove_file(path)?;
+                fs::remove_file(&path)?;
                 removed += 1;
             }
             Ok(())
@@ -278,7 +289,7 @@ pub fn sweep_stale_tmp(root: &Path, older_than: Duration) -> io::Result<usize> {
         match result {
             Ok(()) => {}
             Err(error) if error.kind() == ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => log::warn!("could not sweep staging file {}: {error}", path.display()),
         }
     }
     Ok(removed)
@@ -345,6 +356,34 @@ mod tests {
         assert!(fresh.exists());
         assert!(unrelated.exists());
         assert!(directory.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn slot_sweep_skips_entry_removal_errors() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = TestRoot::new();
+        let stale = root.file("world.zip.42.11.tmp", b"staged", 100);
+        let probe = root.file("probe", b"", 100);
+        let dir = stale.parent().unwrap();
+        let permissions = fs::metadata(dir).unwrap().permissions();
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let probe_result = fs::remove_file(probe);
+        let sweep_result = sweep_stale_tmp(dir, Duration::ZERO);
+        fs::set_permissions(dir, permissions).unwrap();
+
+        // A privileged process can unlink files even without directory write permission.
+        if probe_result.is_ok() {
+            return;
+        }
+        assert_eq!(
+            probe_result.unwrap_err().kind(),
+            ErrorKind::PermissionDenied
+        );
+        assert_eq!(sweep_result.unwrap(), 0);
+        assert!(stale.is_file());
+        assert_eq!(sweep_stale_tmp(dir, Duration::ZERO).unwrap(), 1);
     }
 
     #[test]
