@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec2};
 use prototypes::{
-    CompanyKind, GoodsCompanyID, GoodsCompanyPrototype, ItemID, Power, Recipe, DELTA,
+    try_prototype, CompanyKind, GoodsCompanyID, GoodsCompanyPrototype, ItemID, Power, Recipe, DELTA,
 };
 
 use crate::economy::{find_trade_place, Market};
@@ -118,9 +118,8 @@ pub fn company_soul(
     let height = b.height;
     drop(map);
 
-    let ckind = proto.kind;
     let mut trucks = vec![];
-    if ckind == CompanyKind::Factory {
+    if proto.kind == CompanyKind::Factory && !proto.id.is_growable() {
         for _ in 0..proto.n_trucks {
             trucks.extend(spawn_parked_vehicle(sim, VehicleKind::Truck, door_pos))
         }
@@ -171,6 +170,10 @@ pub fn company_soul(
     Some(soul)
 }
 
+pub fn is_special_building_company(proto: GoodsCompanyID) -> bool {
+    try_prototype(proto).is_some() && !proto.is_growable()
+}
+
 pub fn company_system(world: &mut World, res: &mut Resources) {
     profiling::scope!("souls::company_system");
     let cbuf: &ParCommandBuffer<CompanyEnt> = &res.read();
@@ -179,6 +182,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
     let market: &Market = &res.read();
     let map: &Map = &res.read();
     let elec_flow: &ElectricityFlow = &res.read();
+    let retail_goods = ItemID::new("retail-goods");
 
     world.companies.iter_mut().for_each(|(me, c)| {
         let soul = SoulID::GoodsCompany(me);
@@ -188,6 +192,20 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
         });
 
         let proto = c.comp.proto.prototype();
+
+        // The market posts completed matches to Sold. Only truck deliveries stay queued.
+        let instant_sales = proto.id.is_growable() || proto.kind == CompanyKind::Store;
+        c.sold.0.retain(|trade| {
+            if !instant_sales && trade.kind != retail_goods {
+                return true;
+            }
+            if let SoulID::FreightStation(id) = trade.buyer.0 {
+                if let Some(station) = world.freight_stations.get_mut(id) {
+                    station.f.waiting_cargo = station.f.waiting_cargo.saturating_add(1);
+                }
+            }
+            false
+        });
 
         if let Some(recipe) = &proto.recipe {
             if recipe_should_produce(recipe, soul, market) {

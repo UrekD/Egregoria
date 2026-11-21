@@ -1,5 +1,6 @@
 use crate::map::electricity_cache::ElectricityCache;
 use crate::map::height_override::find_overrides;
+use crate::map::procgen::gen_exterior_house;
 use crate::map::serializing::SerializedMap;
 use crate::map::{
     Building, BuildingID, BuildingKind, Environment, Intersection, IntersectionID, Lane, LaneID,
@@ -10,9 +11,10 @@ use crate::map::{
 use geom::OBB;
 use geom::{PolyLine3, Vec2, Vec3};
 use ordered_float::OrderedFloat;
-use prototypes::{BuildingGen, Tick};
+use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
+use std::collections::BTreeMap;
 
 pub type Roads = HopSlotMap<RoadID, Road>;
 pub type Lanes = HopSlotMap<LaneID, Lane>;
@@ -26,6 +28,12 @@ pub struct MapProject {
     pub kind: ProjectKind,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct LotOrigin {
+    pub parent_road: RoadID,
+    pub shape: OBB,
+}
+
 pub struct Map {
     pub(crate) roads: Roads,
     pub(crate) lanes: Lanes,
@@ -34,6 +42,7 @@ pub struct Map {
     pub(crate) lots: Lots,
     pub(crate) spatial_map: SpatialMap,
     pub(crate) external_train_stations: Vec<BuildingID>,
+    pub(crate) lot_origins: BTreeMap<BuildingID, LotOrigin>,
 
     pub electricity: ElectricityCache,
     pub environment: Environment,
@@ -42,7 +51,30 @@ pub struct Map {
     pub(crate) override_subscriber: MapSubscriber,
 }
 
-defer_serialize!(Map, SerializedMap);
+#[derive(Serialize, Deserialize)]
+struct MapWithLotOrigins {
+    map: SerializedMap,
+    lot_origins: BTreeMap<BuildingID, LotOrigin>,
+}
+
+impl From<&Map> for MapWithLotOrigins {
+    fn from(map: &Map) -> Self {
+        Self {
+            map: map.into(),
+            lot_origins: map.lot_origins.clone(),
+        }
+    }
+}
+
+impl From<MapWithLotOrigins> for Map {
+    fn from(saved: MapWithLotOrigins) -> Self {
+        let mut map: Self = saved.map.into();
+        map.lot_origins = saved.lot_origins;
+        map
+    }
+}
+
+defer_serialize!(Map, MapWithLotOrigins);
 
 impl Default for Map {
     fn default() -> Self {
@@ -64,6 +96,7 @@ impl Map {
             environment: Environment::default(),
             spatial_map: SpatialMap::default(),
             external_train_stations: Default::default(),
+            lot_origins: BTreeMap::new(),
             electricity: Default::default(),
             override_subscriber: subscribers.subscribe(UpdateType::Road | UpdateType::Building),
             subscribers,
@@ -142,6 +175,9 @@ impl Map {
         self.electricity.remove_object(b.id);
         self.spatial_map.remove(b.id);
 
+        if let Some(origin) = self.lot_origins.remove(&b.id) {
+            Lot::try_restore(self, origin);
+        }
         self.check_invariants();
 
         Some(b)
@@ -360,7 +396,65 @@ impl Map {
 
     pub fn build_house(&mut self, lot_id: LotID) -> Option<BuildingID> {
         info!("build house on {:?}", lot_id);
+        self.build_on_lot(lot_id, BuildingKind::House, BuildingGen::House)
+    }
 
+    pub fn place_growable(&mut self, lot_id: LotID, kind: BuildingKind) -> Option<BuildingID> {
+        let lot = self.lots.get(lot_id)?;
+        if !self.roads.contains_key(lot.parent)
+            || self
+                .spatial_map
+                .query(lot.shape, ProjectFilter::ALL)
+                .any(|object| object != ProjectKind::Lot(lot_id))
+        {
+            return None;
+        }
+        let gen = match kind {
+            BuildingKind::House => BuildingGen::House,
+            BuildingKind::GoodsCompany(company) => {
+                let proto = prototypes::try_prototype(GrowableCompanyID::from(company))?;
+                if !proto.growable {
+                    return None;
+                }
+                proto.base.bgen
+            }
+            _ => return None,
+        };
+        self.build_on_lot(lot_id, kind, gen)
+    }
+
+    pub fn lot_origin(&self, building: BuildingID) -> Option<&LotOrigin> {
+        self.lot_origins.get(&building)
+    }
+
+    pub(crate) fn regenerate_house_mesh(&mut self, id: BuildingID, level: u8) {
+        let building = &mut self.buildings[id];
+        let center = building.obb.center();
+        let edge = building.obb.corners[1] - building.obb.corners[0];
+        let seed = common::rand::rand2(center.x, center.y).to_bits();
+        let (mut mesh, _) = gen_exterior_house(edge.mag(), u64::from(seed));
+        let axis = edge.normalize();
+        let height_scale = 1.25_f32.powi(i32::from(level) - 1);
+        for (face, _) in &mut mesh.faces {
+            for vertex in face {
+                vertex.z *= height_scale;
+                *vertex = vertex.rotate_z(axis) + center.z(building.height);
+            }
+        }
+        // The last face is the existing walkway to the road-facing edge.
+        if let Some(walkway) = building.mesh.faces.pop() {
+            mesh.faces.push(walkway);
+        }
+        building.mesh = mesh;
+        self.subscribers.dispatch(UpdateType::Building, building);
+    }
+
+    fn build_on_lot(
+        &mut self,
+        lot_id: LotID,
+        kind: BuildingKind,
+        gen: BuildingGen,
+    ) -> Option<BuildingID> {
         let lot = self.lots.get(lot_id)?;
         let id = Building::make(
             &mut self.buildings,
@@ -369,19 +463,24 @@ impl Map {
             &mut self.roads,
             &self.environment,
             lot.shape,
-            BuildingKind::House,
-            BuildingGen::House,
+            kind,
+            gen,
             None,
             Some(lot.parent),
         )?;
 
-        let lot = self.lots.remove(lot_id).expect("house lot still exists");
+        let lot = self.lots.remove(lot_id).expect("building lot still exists");
+        self.lot_origins.insert(
+            id,
+            LotOrigin {
+                parent_road: lot.parent,
+                shape: lot.shape,
+            },
+        );
         self.subscribers.dispatch(UpdateType::Road, &lot);
         self.spatial_map.remove(lot_id);
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
-        self.electricity.add_object(id);
-
         self.check_invariants();
         Some(id)
     }

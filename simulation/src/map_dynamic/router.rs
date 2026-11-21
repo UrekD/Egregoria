@@ -1,5 +1,8 @@
 use crate::map::{BuildingID, Map, PathKind};
-use crate::map_dynamic::{Itinerary, ParkingManagement, ParkingReserveError, SpotReservation};
+use crate::map_dynamic::{
+    Itinerary, ParkingManagement, ParkingReserveError, SpotReservation, NEAR_PARKING_RADIUS,
+};
+use crate::souls::desire::WorkKind;
 use crate::transportation::TransportGrid;
 use crate::transportation::{put_pedestrian_in_transport_grid, unpark, Location, VehicleState};
 use crate::utils::resources::Resources;
@@ -56,53 +59,68 @@ pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
     profiling::scope!("map_dynamic::routing_changed_system");
     let map: &Map = &resources.read();
     let parking: &mut ParkingManagement = &mut resources.write();
+    let cbuf_human = resources.read::<ParCommandBuffer<HumanEnt>>();
+    let cbuf_vehicle = resources.read::<ParCommandBuffer<VehicleEnt>>();
 
-    world.humans.values_mut().for_each(|h| {
+    world.humans.iter_mut().for_each(|(id, h)| {
         let router = &mut h.router;
-        let loc = &h.location;
         if router.cur_dest == router.target_dest {
             return;
         }
         let dest = unwrap_ret!(router.target_dest);
 
         router.clear_steps(parking);
-        match dest {
-            Destination::Outside(pos) => {
-                router.steps = match router.steps_to(pos, parking, map, loc, &world.vehicles) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        router.last_error = Some(e);
-                        return;
-                    }
-                };
-            }
+        let (pos, building) = match dest {
+            Destination::Outside(pos) => (pos, None),
             Destination::Building(build) => {
-                if let Location::Building(cur_build) = loc {
-                    if *cur_build == build {
-                        router.cur_dest = router.target_dest;
-                        return;
-                    }
+                if h.location == Location::Building(build) {
+                    router.cur_dest = router.target_dest;
+                    router.last_error = None;
+                    return;
                 }
 
-                let bobj = match map.buildings.get(build) {
-                    Some(x) => x,
-                    None => {
-                        router.cur_dest = router.target_dest;
-                        return;
-                    }
+                let Some(building) = map.get(build) else {
+                    router.cur_dest = router.target_dest;
+                    return;
                 };
-                let door_pos = bobj.door_pos;
-                router.steps = match router.steps_to(door_pos, parking, map, loc, &world.vehicles) {
-                    Ok(x) => x,
-                    Err(e) => {
-                        router.last_error = Some(e);
-                        return;
+                (building.door_pos, Some(build))
+            }
+        };
+
+        let mut route = router.steps_to(pos, parking, map, &h.location, &world.vehicles);
+        if matches!(route, Err(RouterError::ReservingParkingSpot(_))) {
+            if let Some(car) = router
+                .personal_car
+                .filter(|car| router.vehicle == Some(*car))
+            {
+                let truck = h.work.as_ref().is_some_and(
+                    |work| matches!(work.kind, WorkKind::Driver { truck, .. } if truck == car),
+                );
+                if !truck {
+                    router.forget_vehicle(car);
+                    if h.location == Location::Vehicle(car) {
+                        let exit_pos = world.vehicles.get(car).map_or(h.trans.pos, |v| v.trans.pos);
+                        walk_outside(id, exit_pos, &cbuf_human, &mut h.location);
+                        h.it = Itinerary::NONE;
                     }
-                };
-                router.steps.push(RoutingStep::GetInBuilding(build));
+                    cbuf_vehicle.kill(car);
+                    route = router.steps_to(pos, parking, map, &h.location, &world.vehicles);
+                }
             }
         }
 
+        router.steps = match route {
+            Ok(steps) => steps,
+            Err(error) => {
+                router.last_error = Some(error);
+                return;
+            }
+        };
+        if let Some(building) = building {
+            router.steps.push(RoutingStep::GetInBuilding(building));
+        }
+
+        router.last_error = None;
         router.cur_dest = router.target_dest;
 
         router.steps.reverse();
@@ -390,7 +408,8 @@ impl Router {
 
         if let Some(car) = self.vehicle {
             let spot_resa = parking
-                .reserve_near(obj, map)
+                .reserve_near_radius(obj, map, NEAR_PARKING_RADIUS)
+                .or_else(|_| parking.reserve_near_radius(obj, map, 4.0 * NEAR_PARKING_RADIUS))
                 .map_err(RouterError::ReservingParkingSpot)?;
             let parking_pos = match spot_resa.park_pos(map) {
                 Some(x) => x,

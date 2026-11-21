@@ -6,6 +6,7 @@ use crate::map::{Building, BuildingID, BuildingKind, Map};
 use crate::map_dynamic::{BuildingInfos, DispatchID, Dispatcher, Itinerary, ParkingManagement};
 use crate::souls::desire::WorkKind;
 use crate::souls::freight_station::FreightTrainState;
+use crate::souls::residence;
 use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::train::{cancel_train_route, TrainReservations};
 use crate::transportation::{put_pedestrian_in_transport_grid, Location, TransportGrid};
@@ -27,19 +28,11 @@ pub fn despawn_company(sim: &mut Simulation, id: CompanyID) {
 
 pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_external_target: bool) {
     let id = building.id;
+    if building.kind == BuildingKind::House {
+        residence::evict_residents(sim, id, building.door_pos);
+    }
     sim.write::<BuildingInfos>().remove(id);
     match building.kind {
-        BuildingKind::House => {
-            let residents: Vec<_> = sim
-                .world
-                .humans
-                .iter()
-                .filter_map(|(human, body)| (body.home.house == id).then_some(human))
-                .collect();
-            for resident in residents {
-                despawn_human(sim, resident);
-            }
-        }
         BuildingKind::GoodsCompany(_) => {
             let companies: Vec<_> = sim
                 .world
@@ -110,12 +103,14 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
         }
         let worker_count = entity.workers.0.len();
         entity.workers.0.retain(|&worker| worker != id);
-        if entity.workers.0.len() < worker_count {
-            if let Some(building) = map.get(entity.comp.building) {
-                let soul = SoulID::GoodsCompany(company);
-                market.produce(soul, job, 1);
-                market.sell_all(soul, building.door_pos.xy(), job, 0);
-            }
+        if entity.workers.0.len() == worker_count {
+            continue;
+        }
+
+        if let Some(building) = map.get(entity.comp.building) {
+            let soul = SoulID::GoodsCompany(company);
+            market.produce(soul, job, 1);
+            market.sell_all(soul, building.door_pos.xy(), job, 0);
         }
     }
 }
@@ -228,7 +223,7 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) {
     }
 }
 
-fn clear_building_references(sim: &mut Simulation, id: BuildingID, door: Option<Vec3>) {
+pub(crate) fn clear_building_references(sim: &mut Simulation, id: BuildingID, door: Option<Vec3>) {
     let (world, resources) = sim.world_res();
     for (human_id, human) in world.humans.iter_mut() {
         let mut cancel =
@@ -274,6 +269,11 @@ fn clear_building_references(sim: &mut Simulation, id: BuildingID, door: Option<
                 }
             }
             cancel_trip(human, resources);
+        }
+    }
+    if door.is_some() {
+        if let Some(info) = resources.write::<BuildingInfos>().get_mut(id) {
+            info.inside.clear();
         }
     }
 }

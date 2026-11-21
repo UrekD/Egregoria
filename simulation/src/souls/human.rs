@@ -2,6 +2,7 @@ use crate::economy::{Bought, Market};
 use crate::map::BuildingID;
 use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, Router};
 use crate::souls::desire::{BuyFood, BuyGoods, Home, Work};
+use crate::souls::residence::Residences;
 use crate::transportation::Speed;
 use crate::transportation::{
     random_pedestrian_shirt_color, spawn_parked_vehicle, Location, Pedestrian, VehicleKind,
@@ -16,6 +17,7 @@ use geom::Transform;
 use lazy_static::lazy_static;
 use prototypes::{GameTime, ItemID};
 use serde::{Deserialize, Serialize};
+use slotmapd::Key;
 
 #[derive(Inspect, Serialize, Deserialize, Default)]
 pub struct HumanDecision {
@@ -259,22 +261,31 @@ pub fn update_decision(
 pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
     profiling::scope!("spawn_human");
     let map = sim.map();
-    let housepos = map.buildings().get(house)?.door_pos;
+    let housepos = map
+        .get(house)
+        .filter(|house| !house.is_orphaned())?
+        .door_pos;
     drop(map);
-
+    {
+        let infos = sim.read::<BuildingInfos>();
+        let residences = sim.read::<Residences>();
+        let residence = residences.by_building.get(&house)?;
+        if residences.is_abandoned(house)
+            || infos.get(house)?.residents.len() >= residence.capacity as usize
+        {
+            return None;
+        }
+    }
     let _color = random_pedestrian_shirt_color(&mut sim.write::<RandProvider>());
 
-    let hpos = sim.map().buildings().get(house)?.door_pos;
     let p = Pedestrian::new(&mut sim.write::<RandProvider>());
 
     let time = sim.read::<GameTime>().instant();
 
-    let car = spawn_parked_vehicle(sim, VehicleKind::Car, housepos);
-
     let personal_info = Box::new(PersonalInfo::new(&mut sim.write::<RandProvider>()));
 
     let id = sim.world.insert(HumanEnt {
-        trans: Transform::new(hpos),
+        trans: Transform::new(housepos),
         location: Location::Building(house),
         pedestrian: p,
         it: Itinerary::NONE,
@@ -284,18 +295,25 @@ pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
         food: BuyFood::new(time),
         goods: BuyGoods,
         bought: Bought::default(),
-        router: Router::new(car),
+        router: Router::new(None),
         collider: None,
         work: None,
         personal_info,
     });
 
+    let key = id.data().as_ffi();
+    if common::rand::randu(key as u32 ^ (key >> 32) as u32) < 0.7 {
+        let car = spawn_parked_vehicle(sim, VehicleKind::Car, housepos);
+        sim.world.humans[id].router = Router::new(car);
+    }
+
     let soul = SoulID::Human(id);
     let mut m = sim.write::<Market>();
     m.buy(soul, housepos.xy(), ItemID::new("job-opening"), 1);
 
-    sim.write::<BuildingInfos>().get_in(house, soul);
-    sim.write::<BuildingInfos>().set_owner(house, soul);
+    let mut infos = sim.write::<BuildingInfos>();
+    infos.get_in(house, soul);
+    infos.add_resident(house, soul);
 
     Some(id)
 }

@@ -349,6 +349,8 @@ impl Market {
 }
 
 fn calculate_prices(price_multiplier: f32) -> BTreeMap<ItemID, Money> {
+    use std::collections::BTreeSet;
+
     let mut item_graph: BTreeMap<ItemID, Vec<GoodsCompanyID>> = BTreeMap::new();
     for company in GoodsCompanyPrototype::iter() {
         let Some(ref recipe) = company.recipe else {
@@ -359,27 +361,45 @@ fn calculate_prices(price_multiplier: f32) -> BTreeMap<ItemID, Money> {
         }
     }
 
-    let mut prices = BTreeMap::new();
     fn calculate_price_inner(
         item_graph: &BTreeMap<ItemID, Vec<GoodsCompanyID>>,
         id: ItemID,
-        prices: &mut BTreeMap<ItemID, Money>,
+        cached_prices: &mut BTreeMap<ItemID, Money>,
+        visiting: &mut BTreeSet<ItemID>,
+        path_dependent: &mut bool,
         price_multiplier: f32,
-    ) {
-        if prices.contains_key(&id) {
-            return;
+    ) -> Option<Money> {
+        if let Some(&price) = cached_prices.get(&id) {
+            return Some(price);
+        }
+        let Some(companies) = item_graph.get(&id) else {
+            return Some(Money::ZERO);
+        };
+        if !visiting.insert(id) {
+            *path_dependent = true;
+            return None;
         }
 
+        let mut encountered_cycle = false;
         let mut minprice = None;
-        for &comp in item_graph.get(&id).unwrap_or(&vec![]) {
+        'company: for &comp in companies {
             let company = &comp.prototype();
             let mut price_consumption = Money::ZERO;
             let Some(ref recipe) = company.recipe else {
                 continue;
             };
             for recipe_item in &recipe.consumption {
-                calculate_price_inner(item_graph, recipe_item.id, prices, price_multiplier);
-                price_consumption += prices[&recipe_item.id] * recipe_item.amount as i64;
+                let Some(price) = calculate_price_inner(
+                    item_graph,
+                    recipe_item.id,
+                    cached_prices,
+                    visiting,
+                    &mut encountered_cycle,
+                    price_multiplier,
+                ) else {
+                    continue 'company;
+                };
+                price_consumption += price * recipe_item.amount as i64;
             }
             let qty = recipe
                 .production
@@ -398,11 +418,29 @@ fn calculate_prices(price_multiplier: f32) -> BTreeMap<ItemID, Money> {
             minprice = minprice.map(|x: Money| x.min(newprice)).or(Some(newprice));
         }
 
-        prices.insert(id, minprice.unwrap_or(Money::ZERO));
+        visiting.remove(&id);
+        if encountered_cycle {
+            // Another root may make a different subset of these recipes usable.
+            *path_dependent = true;
+        } else if let Some(price) = minprice {
+            cached_prices.insert(id, price);
+        }
+        minprice
     }
 
+    let mut prices = BTreeMap::new();
+    let mut cached_prices = BTreeMap::new();
+    let mut visiting = BTreeSet::new();
     for item in ItemPrototype::iter() {
-        calculate_price_inner(&item_graph, item.id, &mut prices, price_multiplier);
+        let price = calculate_price_inner(
+            &item_graph,
+            item.id,
+            &mut cached_prices,
+            &mut visiting,
+            &mut false,
+            price_multiplier,
+        );
+        prices.insert(item.id, price.unwrap_or(Money::ZERO));
     }
 
     prices
@@ -544,5 +582,39 @@ mod tests {
             prices[&wheat],
             (price_cereal * 2 + 5 * WORKER_CONSUMPTION_PER_MINUTE * 10) / 2
         );
+    }
+
+    #[test]
+    fn p1c_price_graph_cycles() {
+        test_prototypes(
+            r#"
+            local function item(name)
+                return { type = "item", name = name, label = name }
+            end
+            local function company(name, output, inputs)
+                return {
+                    type = "goods-company", name = name, label = name,
+                    kind = "factory", bgen = "farm", n_trucks = 1, n_workers = 1,
+                    size = 1, asset = "no.jpg", price = 0,
+                    recipe = {
+                        production = {{output, 1}}, consumption = inputs,
+                        duration = "1m", storage_multiplier = 1,
+                    },
+                }
+            end
+            data:extend {
+                item("a"), item("b"), item("closed"),
+                company("make-a", "a", {}),
+                company("recycle-a", "a", {{"b", 1}}),
+                company("make-b", "b", {{"a", 1}}),
+                company("self-cycle", "closed", {{"closed", 1}}),
+            }
+            "#,
+        );
+
+        let prices = super::calculate_prices(1.0);
+        assert_eq!(prices[&ItemID::new("a")], WORKER_CONSUMPTION_PER_MINUTE);
+        assert_eq!(prices[&ItemID::new("b")], WORKER_CONSUMPTION_PER_MINUTE * 2);
+        assert_eq!(prices[&ItemID::new("closed")], prototypes::Money::ZERO);
     }
 }

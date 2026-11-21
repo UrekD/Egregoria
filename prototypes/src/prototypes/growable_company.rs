@@ -1,4 +1,7 @@
-use crate::{get_lua, Density, GoodsCompanyPrototype, GrowableCompanyID, Prototype};
+use crate::{
+    get_lua, try_prototype, Density, GoodsCompanyID, GoodsCompanyPrototype, GrowableCompanyID,
+    Prototype,
+};
 use mlua::{FromLua, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
@@ -33,6 +36,12 @@ pub struct GrowableCompanyPrototype {
     pub level: u8,
     pub lot_size_min: f32,
     pub growable: bool,
+}
+
+impl GoodsCompanyID {
+    pub fn is_growable(self) -> bool {
+        try_prototype(GrowableCompanyID::from(self)).is_some_and(|proto| proto.growable)
+    }
 }
 
 impl Prototype for GrowableCompanyPrototype {

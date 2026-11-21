@@ -1,7 +1,8 @@
-use crate::map::{Map, ProjectFilter, ProjectKind, RoadID, UpdateType};
+use crate::map::{LotOrigin, Map, ProjectFilter, ProjectKind, RoadID, UpdateType};
 use geom::Vec2;
 use geom::OBB;
 use geom::{Circle, Vec3};
+use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
 use std::collections::BTreeSet;
@@ -26,6 +27,45 @@ pub struct Lot {
 }
 
 impl Lot {
+    pub(crate) fn try_restore(map: &mut Map, origin: LotOrigin) -> Option<LotID> {
+        const FRONTAGE_RADIUS: f32 = 15.0;
+
+        let shape = origin.shape;
+        if map
+            .spatial_map
+            .query(shape, ProjectFilter::ALL)
+            .next()
+            .is_some()
+        {
+            return None;
+        }
+
+        let front = (shape.corners[0] + shape.corners[1]) * 0.5;
+        let (road, projected, _) = map
+            .spatial_map
+            .query_around(front, FRONTAGE_RADIUS, ProjectFilter::ROAD)
+            .filter_map(|object| {
+                let ProjectKind::Road(id) = object else {
+                    return None;
+                };
+                let projected = map.roads.get(id)?.points.project_2d(front);
+                let dist = projected.xy().distance2(front);
+                (dist <= FRONTAGE_RADIUS.powi(2)).then_some((id, projected, OrderedFloat(dist)))
+            })
+            .min_by_key(|&(id, _, distance)| (distance, id))?;
+
+        let depth = shape.corners[3] - shape.corners[0];
+        let id = Self::try_make(
+            map,
+            road,
+            front.z(projected.z),
+            depth.normalize(),
+            depth.mag(),
+        )?;
+        map.subscribers.dispatch(UpdateType::Road, &map.lots[id]);
+        Some(id)
+    }
+
     pub fn try_make(
         map: &mut Map,
         parent: RoadID,

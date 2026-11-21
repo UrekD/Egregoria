@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use common::error::MultiError;
 
-use crate::{CompanyKind, Prototypes};
+use crate::{CompanyKind, GrowableCompanyID, Prototypes};
 
 #[derive(Debug, Error)]
 pub enum ValidationError {
@@ -29,6 +29,10 @@ pub(crate) fn validate(proto: &Prototypes) -> Result<(), MultiError<ValidationEr
 
         if comp.n_trucks == 0
             && comp.kind == CompanyKind::Factory
+            && !proto
+                .growable_company
+                .get(&GrowableCompanyID::from(comp.id))
+                .is_some_and(|growable| growable.growable)
             && comp
                 .recipe
                 .as_ref()

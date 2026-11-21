@@ -5,6 +5,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::option::Option::None;
 
+pub(crate) const NEAR_PARKING_RADIUS: f32 = 100.0;
+
 #[derive(Debug, Serialize, Deserialize)]
 #[repr(transparent)]
 pub struct SpotReservation(ParkingSpotID);
@@ -60,24 +62,53 @@ impl ParkingManagement {
         near: Vec3,
         map: &Map,
     ) -> Result<SpotReservation, ParkingReserveError> {
+        self.reserve_near_inner(near, map, None, 7)
+    }
+
+    pub fn reserve_near_radius(
+        &mut self,
+        near: Vec3,
+        map: &Map,
+        radius: f32,
+    ) -> Result<SpotReservation, ParkingReserveError> {
+        self.reserve_near_inner(near, map, Some(radius), usize::MAX)
+    }
+
+    fn reserve_near_inner(
+        &mut self,
+        near: Vec3,
+        map: &Map,
+        radius: Option<f32>,
+        depth: usize,
+    ) -> Result<SpotReservation, ParkingReserveError> {
         use ParkingReserveError as E;
         let lane = map
-            .nearest_lane(near, LaneKind::Driving, None)
+            .nearest_lane(near, LaneKind::Driving, radius)
             .ok_or(E::FindingNearestLane)?;
         let lane = map.lanes().get(lane).ok_or(E::FetchingLaneData)?;
 
-        let depth = 7;
-
         let idget = |l: &Lane| l.id;
+        let max_dist2 = radius.map(|radius| radius * radius);
 
         let mut potential = BTreeSet::new();
         potential.insert(AccessCmp(lane, idget));
         let mut next = BTreeSet::new();
+        let mut visited = BTreeSet::new();
         let intersections = map.intersections();
         let roads = map.roads();
         for _ in 0..depth {
+            if potential.is_empty() {
+                break;
+            }
             for lane in potential.iter() {
                 let lane = lane.0;
+                if !visited.insert(lane.id)
+                    || max_dist2.is_some_and(|max| {
+                        lane.points.project_2d(near.xy()).xy().distance2(near.xy()) > max
+                    })
+                {
+                    continue;
+                }
 
                 let inter_dst = unwrap_or!(intersections.get(lane.dst), continue);
                 let inter_src = unwrap_or!(intersections.get(lane.src), continue);
@@ -99,13 +130,19 @@ impl ParkingManagement {
 
                 if let Some(p_iter) = map.parking.closest_spots(plane, near) {
                     for spot in p_iter {
-                        if self.reserved_spots.insert(spot) {
+                        if max_dist2.is_none_or(|max| {
+                            map.parking
+                                .get(spot)
+                                .is_some_and(|data| data.trans.pos.xy().distance2(near.xy()) <= max)
+                        }) && self.reserved_spots.insert(spot)
+                        {
                             return Ok(SpotReservation(spot));
                         }
                     }
                 }
             }
             std::mem::swap(&mut potential, &mut next);
+            next.clear();
         }
         Err(E::NoSpotFoundAfterSearch)
     }

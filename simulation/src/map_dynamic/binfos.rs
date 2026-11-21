@@ -2,18 +2,20 @@ use crate::map::BuildingID;
 use crate::SoulID;
 use serde::{Deserialize, Serialize};
 use slotmapd::SecondaryMap;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct BuildingInfo {
     pub owner: Option<SoulID>,
     pub inside: Vec<SoulID>,
+    pub residents: BTreeSet<SoulID>,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct BuildingInfos {
     assignment: SecondaryMap<BuildingID, BuildingInfo>,
     owners: BTreeMap<SoulID, BuildingID>,
+    residences: BTreeMap<SoulID, BuildingID>,
 }
 
 impl BuildingInfos {
@@ -28,10 +30,14 @@ impl BuildingInfos {
                 self.owners.remove(&owner);
             }
         }
+        for resident in &info.residents {
+            self.residences.remove(resident);
+        }
         Some(info)
     }
 
     pub(crate) fn remove_soul(&mut self, soul: SoulID) {
+        self.remove_resident(soul);
         if let Some(building) = self.owners.remove(&soul) {
             if let Some(info) = self.get_mut(building) {
                 if info.owner == Some(soul) {
@@ -53,12 +59,53 @@ impl BuildingInfos {
     }
 
     pub fn building_owned_by(&self, soul: SoulID) -> Option<BuildingID> {
-        self.owners.get(&soul).copied()
+        match soul {
+            SoulID::Human(_) => self.residence_of(soul),
+            _ => self.owners.get(&soul).copied(),
+        }
+    }
+
+    pub fn residence_of(&self, soul: SoulID) -> Option<BuildingID> {
+        self.residences.get(&soul).copied()
+    }
+
+    pub(crate) fn add_resident(&mut self, building: BuildingID, soul: SoulID) {
+        if self.get(building).is_none() || self.residence_of(soul) == Some(building) {
+            return;
+        }
+        self.remove_resident(soul);
+        self.residences.insert(soul, building);
+        let info = self.get_mut(building).expect("registered residence");
+        info.residents.insert(soul);
+        if info.owner.is_none() {
+            self.set_owner(building, soul);
+        }
+    }
+
+    pub(crate) fn remove_resident(&mut self, soul: SoulID) {
+        let Some(building) = self.residences.remove(&soul) else {
+            return;
+        };
+        let Some(info) = self.get_mut(building) else {
+            return;
+        };
+        info.residents.remove(&soul);
+        if info.owner == Some(soul) {
+            info.owner = None;
+            let successor = info.residents.first().copied();
+            self.owners.remove(&soul);
+            if let Some(successor) = successor {
+                self.set_owner(building, successor);
+            }
+        }
     }
 
     pub fn set_owner(&mut self, building: BuildingID, soul: SoulID) {
-        if let Some(x) = self.get_mut(building) {
-            x.owner = Some(soul)
+        let Some(info) = self.get_mut(building) else {
+            return;
+        };
+        if let Some(previous) = info.owner.replace(soul) {
+            self.owners.remove(&previous);
         }
         self.owners.insert(soul, building);
     }
