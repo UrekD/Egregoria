@@ -582,22 +582,33 @@ fn p2c_place_polluter(test: &mut TestCtx, center: geom::Vec2) -> crate::map::Bui
         "#,
     );
 
-    let company = GoodsCompanyID::new("coal-power-plant");
-    let kind = BuildingKind::GoodsCompany(company);
-    test.apply(&[WorldCommand::MapBuildSpecialBuilding {
-        pos: OBB::new(center, geom::Vec2::X, 20.0, 20.0),
-        kind,
-        gen: company.prototype().bgen,
-        zone: None,
-        connected_road: None,
-    }]);
-    test.g
-        .map()
-        .buildings()
-        .values()
-        .find(|building| building.kind == kind)
-        .expect("place polluter")
-        .id
+    let road_center = center + vec2(0.0, 40.0);
+    test.build_roads(&[
+        (road_center - vec2(100.0, 0.0)).z(0.0),
+        (road_center + vec2(100.0, 0.0)).z(0.0),
+    ]);
+    let road = p2b_road_at(test, road_center);
+    let (building, company) = p2b_place_company(test, "coal-power-plant", center, road);
+    let house = test.build_house_near(road_center + vec2(0.0, 25.0));
+    residence::register(
+        &test.g,
+        house,
+        residence::prototype(Density::High, 3).unwrap(),
+    );
+
+    let worker_count = test.g.world.companies[company].comp.max_workers;
+    for _ in 0..worker_count {
+        spawn_human(&mut test.g, house).expect("house a polluter worker");
+    }
+    // Fill the job openings before the first environment update. Full staffing
+    // gives this unzoned plant raw productivity of 1.0 and its full pollution rate.
+    let (world, resources) = test.g.world_res();
+    crate::economy::market_update(world, resources);
+    assert_eq!(
+        world.companies[company].workers.0.len(),
+        worker_count as usize
+    );
+    building
 }
 
 fn p2c_update_at(sim: &mut Simulation, tick: u64) {
