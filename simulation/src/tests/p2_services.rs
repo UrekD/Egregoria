@@ -460,11 +460,6 @@ fn p2b_utility_supply_is_equal_after_reload() {
         test.g.hashes()["utility_flow"]
     );
     assert_eq!(restored.hashes()["utility_flow"], saved_hash);
-
-    let empty_spine_snapshot: UtilityFlow = Bincode::decode(&[0, 0]).unwrap();
-    assert!(!empty_spine_snapshot.has_water(house));
-    assert!(!empty_spine_snapshot.has_sewage(house));
-    assert!(empty_spine_snapshot.networks().next().is_none());
 }
 
 #[test]
@@ -570,26 +565,6 @@ fn p2c_environment_survives_save_load() {
 
     p2c_update_at(&mut test.g, 6000);
     p2c_update_at(&mut restored, 6000);
-    assert_eq!(test.g.hashes()["env_grid"], restored.hashes()["env_grid"]);
-}
-
-#[test]
-fn p2c_loads_empty_spine_environment() {
-    let test = TestCtx::new_fast();
-    let mut payload: crate::SimulationDeser =
-        Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
-    let empty_spine_grid = std::collections::BTreeMap::<(i32, i32), (f32, f32)>::new();
-    payload.res.insert(
-        "env_grid".to_owned(),
-        Bincode::encode(&empty_spine_grid).unwrap(),
-    );
-    let save = Bincode::encode(&crate::SimulationSer {
-        header: payload._header,
-        world: &payload.world,
-        res: payload.res,
-    })
-    .unwrap();
-    let restored: Simulation = Bincode::decode(&save).expect("load save from the P2 spine");
     assert_eq!(test.g.hashes()["env_grid"], restored.hashes()["env_grid"]);
 }
 

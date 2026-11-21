@@ -14,6 +14,7 @@ use std::sync::Once;
 mod lifecycle;
 mod p1_fix2;
 mod p2_services;
+mod p2abc_fix;
 mod test_iso;
 mod vehicles;
 

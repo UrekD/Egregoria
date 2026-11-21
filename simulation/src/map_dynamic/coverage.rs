@@ -70,7 +70,8 @@ struct Provider {
 struct Receiver {
     building: BuildingID,
     position: RoadPosition,
-    people: usize,
+    people: f32,
+    unserved: f32,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -88,26 +89,39 @@ impl Direction {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum NodeId {
-    Intersection(IntersectionID),
-    Road(RoadID, Direction),
-}
-
 struct CoverageRoad<'a> {
     road: &'a Road,
     directions: [bool; 2],
     receivers: Vec<Receiver>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum NodeId {
+    Intersection(IntersectionID),
+    Road(RoadID, Direction),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct Candidate {
+    distance: OrderedFloat<f32>,
+    building: BuildingID,
+    road: RoadID,
+    receiver: usize,
+}
+
 fn road_directions(map: &Map, road: &Road, walking: bool) -> [bool; 2] {
     if walking {
-        return [road.has_sidewalks(); 2];
+        let has_sidewalk = road
+            .lanes_iter()
+            .any(|(id, kind)| kind == LaneKind::Walking && map.lanes().contains_key(id));
+        return [has_sidewalk; 2];
     }
     let mut directions = [false; 2];
     for (id, kind) in road.lanes_iter() {
         if kind == LaneKind::Driving {
-            let lane = &map.lanes()[id];
+            let Some(lane) = map.lanes().get(id) else {
+                continue;
+            };
             let direction = if lane.src == road.src {
                 Direction::Forward
             } else {
@@ -121,7 +135,8 @@ fn road_directions(map: &Map, road: &Road, walking: bool) -> [bool; 2] {
 
 pub fn coverage_update(sim: &mut Simulation) {
     let offset = sim.get_tick() % 6000;
-    if offset % 600 != 0 {
+    // Keep coverage off the utility, environment and hourly refresh ticks.
+    if offset % 600 != 300 {
         return;
     }
     let Some(&kind) = COVERAGE_KINDS.get((offset / 600) as usize) else {
@@ -192,11 +207,12 @@ fn recompute(sim: &Simulation, kind: ServiceKind) -> BTreeMap<BuildingID, f32> {
                         sim.get(company)?.workers.0.len()
                     }
                     _ => return None,
-                };
-                (people > 0).then(|| Receiver {
+                } as f32;
+                (people > 0.0).then(|| Receiver {
                     building: id,
                     position: RoadPosition::at_door(road, building.door_pos),
                     people,
+                    unserved: people,
                 })
             })
             .collect();
@@ -210,121 +226,163 @@ fn recompute(sim: &Simulation, kind: ServiceKind) -> BTreeMap<BuildingID, f32> {
         );
     }
 
-    for provider in providers {
-        let Some(origin) = roads.get(provider.road) else {
-            continue;
-        };
-        let source = RoadPosition::at_door(origin.road, provider.door);
-        let arrivals = road_arrivals(&map, &roads, &provider, source);
-        let mut candidates = Vec::new();
-        for (id, [forward, backward]) in arrivals {
-            let road = &roads[id];
-            let length = road.road.length();
-            for receiver in &road.receivers {
-                let along = receiver.position.along;
-                let mut distance = (forward + along).min(backward + (length - along));
-                // A receiver on the starting road may be reached before the first junction.
-                if id == provider.road {
-                    let delta = along - source.along;
-                    if (road.directions[0] && delta >= 0.0) || (road.directions[1] && delta <= 0.0)
-                    {
-                        distance = distance.min(source.offset + delta.abs());
-                    }
-                }
-                distance += receiver.position.offset;
-                if distance < provider.radius {
-                    candidates.push(Reverse((
-                        OrderedFloat(distance),
-                        receiver.building,
-                        receiver.people,
-                    )));
-                }
-            }
-        }
-
-        let mut remaining = provider.capacity;
-        // Heapify once and only order as many receivers as the provider can serve.
-        let mut candidates = BinaryHeap::from(candidates);
-        while remaining > 0.0 {
-            let Some(Reverse((OrderedFloat(distance), id, people))) = candidates.pop() else {
-                break;
-            };
-            let people = people as f32;
-            let served = remaining.min(people);
-            remaining -= served;
-            let value = 100.0 * (1.0 - distance / provider.radius) * (served / people);
-            let previous = coverage.entry(id).or_insert(0.0_f32);
-            *previous = previous.max(value);
-        }
+    let mut search = RoadSearch::default();
+    for (index, provider) in providers.into_iter().enumerate() {
+        search.serve(&map, &mut roads, &provider, index + 1, &mut coverage);
     }
     coverage
 }
 
-fn road_arrivals(
-    map: &Map,
-    roads: &SecondaryMap<RoadID, CoverageRoad<'_>>,
-    provider: &Provider,
-    source: RoadPosition,
-) -> SecondaryMap<RoadID, [f32; 2]> {
-    let origin = &roads[provider.road];
-    let mut queue = BinaryHeap::new();
-    let [forward, backward] = origin.directions;
-    if forward {
-        let distance = source.offset + (origin.road.length() - source.along);
-        queue.push(Reverse((
-            OrderedFloat(distance),
-            NodeId::Intersection(origin.road.dst),
-        )));
-    }
-    if backward {
-        let distance = source.offset + source.along;
-        queue.push(Reverse((
-            OrderedFloat(distance),
-            NodeId::Intersection(origin.road.src),
-        )));
-    }
-    let mut visited = SecondaryMap::new();
-    let mut arrivals = SecondaryMap::new();
-    arrivals.insert(provider.road, [f32::INFINITY; 2]);
-    while let Some(Reverse((OrderedFloat(distance), node))) = queue.pop() {
-        if distance >= provider.radius {
-            break;
+#[derive(Default)]
+struct RoadSearch {
+    queue: BinaryHeap<Reverse<(OrderedFloat<f32>, NodeId)>>,
+    junction_distances: SecondaryMap<IntersectionID, (usize, f32)>,
+    candidates: BinaryHeap<Reverse<Candidate>>,
+}
+
+impl RoadSearch {
+    fn serve(
+        &mut self,
+        map: &Map,
+        roads: &mut SecondaryMap<RoadID, CoverageRoad<'_>>,
+        provider: &Provider,
+        pass: usize,
+        coverage: &mut BTreeMap<BuildingID, f32>,
+    ) {
+        let Some(origin) = roads.get(provider.road) else {
+            return;
+        };
+        self.queue.clear();
+        self.candidates.clear();
+
+        let source = RoadPosition::at_door(origin.road, provider.door);
+        let [forward, backward] = origin.directions;
+        for (index, receiver) in origin.receivers.iter().enumerate() {
+            let delta = receiver.position.along - source.along;
+            if (forward && delta >= 0.0) || (backward && delta <= 0.0) {
+                self.add_candidate(
+                    provider.road,
+                    index,
+                    receiver,
+                    source.offset + delta.abs(),
+                    provider.radius,
+                );
+            }
         }
-        match node {
-            NodeId::Intersection(id) => {
-                if visited.insert(id, ()).is_some() {
+        if forward {
+            let distance = source.offset + (origin.road.length() - source.along);
+            self.enqueue(origin.road.dst, distance, provider.radius, pass);
+        }
+        if backward {
+            let distance = source.offset + source.along;
+            self.enqueue(origin.road.src, distance, provider.radius, pass);
+        }
+
+        let mut remaining = provider.capacity;
+        while remaining > 0.0 {
+            if let Some(&Reverse(candidate)) = self.candidates.peek() {
+                // Finish all graph nodes at this distance before breaking receiver ties by ID.
+                if self
+                    .queue
+                    .peek()
+                    .is_none_or(|Reverse((distance, _))| *distance > candidate.distance)
+                {
+                    self.candidates.pop();
+                    let receiver = &mut roads[candidate.road].receivers[candidate.receiver];
+                    // A receiver can be reached from both ends of its road.
+                    let served = remaining.min(receiver.unserved);
+                    if served > 0.0 {
+                        remaining -= served;
+                        receiver.unserved -= served;
+                        let falloff = 1.0 - candidate.distance.0 / provider.radius;
+                        let value = 100.0 * falloff * (served / receiver.people);
+                        let previous = coverage.entry(candidate.building).or_insert(0.0_f32);
+                        *previous = previous.max(value);
+                    }
                     continue;
                 }
-                for &id_road in &map.intersections()[id].roads {
-                    let Some(road) = roads.get(id_road) else {
+            }
+
+            let Some(Reverse((OrderedFloat(distance), node))) = self.queue.pop() else {
+                break;
+            };
+            match node {
+                NodeId::Intersection(id) => {
+                    if distance > self.junction_distances[id].1 {
                         continue;
-                    };
-                    let direction = if road.road.src == id {
-                        Direction::Forward
-                    } else {
-                        Direction::Backward
-                    };
-                    if road.directions[direction as usize] {
-                        queue.push(Reverse((
-                            OrderedFloat(distance),
-                            NodeId::Road(id_road, direction),
-                        )));
+                    }
+                    for &road_id in &map.intersections()[id].roads {
+                        let Some(road) = roads.get(road_id) else {
+                            continue;
+                        };
+                        let direction = if road.road.src == id {
+                            Direction::Forward
+                        } else {
+                            Direction::Backward
+                        };
+                        if road.directions[direction as usize] {
+                            self.queue.push(Reverse((
+                                OrderedFloat(distance),
+                                NodeId::Road(road_id, direction),
+                            )));
+                        }
                     }
                 }
-            }
-            NodeId::Road(id, direction) => {
-                let distances = arrivals.entry(id).unwrap().or_insert([f32::INFINITY; 2]);
-                distances[direction as usize] = distance;
-                let road = roads[id].road;
-                // Entering a road is free. Its far intersection costs its full centerline length.
-                queue.push(Reverse((
-                    OrderedFloat(distance + road.length()),
-                    NodeId::Intersection(direction.exit(road)),
-                )));
+                NodeId::Road(id, direction) => {
+                    let road = &roads[id];
+                    let length = road.road.length();
+                    for (index, receiver) in road.receivers.iter().enumerate() {
+                        let along = match direction {
+                            Direction::Forward => receiver.position.along,
+                            Direction::Backward => length - receiver.position.along,
+                        };
+                        self.add_candidate(id, index, receiver, distance + along, provider.radius);
+                    }
+                    self.enqueue(
+                        direction.exit(road.road),
+                        distance + length,
+                        provider.radius,
+                        pass,
+                    );
+                }
             }
         }
     }
-    arrivals
+
+    fn add_candidate(
+        &mut self,
+        road: RoadID,
+        index: usize,
+        receiver: &Receiver,
+        road_distance: f32,
+        radius: f32,
+    ) {
+        let distance = road_distance + receiver.position.offset;
+        if distance < radius && receiver.unserved > 0.0 {
+            self.candidates.push(Reverse(Candidate {
+                distance: OrderedFloat(distance),
+                building: receiver.building,
+                road,
+                receiver: index,
+            }));
+        }
+    }
+
+    fn enqueue(&mut self, id: IntersectionID, distance: f32, radius: f32, pass: usize) {
+        if distance >= radius {
+            return;
+        }
+        let best = self
+            .junction_distances
+            .entry(id)
+            .unwrap()
+            .or_insert((0, f32::INFINITY));
+        if best.0 != pass || distance < best.1 {
+            *best = (pass, distance);
+            self.queue
+                .push(Reverse((OrderedFloat(distance), NodeId::Intersection(id))));
+        }
+    }
 }
 
 #[cfg(test)]

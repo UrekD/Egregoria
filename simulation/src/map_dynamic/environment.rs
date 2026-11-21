@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
 use geom::{vec2, Vec2};
-use prototypes::ServiceKind;
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use prototypes::{try_prototype, ServiceKind};
+use serde::{Deserialize, Serialize};
 
 use crate::map::{BuildingID, BuildingKind};
-use crate::map_dynamic::{CoverageGrid, UtilityFlow};
+use crate::map_dynamic::{BuildingInfos, CoverageGrid, UtilityFlow};
 use crate::souls::residence::Residences;
-use crate::Simulation;
+use crate::{Simulation, SoulID};
 
 const UPDATE_INTERVAL: u64 = 3_000;
 const POLLUTION_RADIUS: f32 = 160.0;
@@ -17,7 +17,7 @@ const BASE_LAND_VALUE: f32 = 20.0 + 10.0;
 const FULL_COVERAGE_BONUS: f32 = 15.0;
 const UTILITIES_BONUS: f32 = 10.0;
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct EnvGrid {
     pub cells: BTreeMap<(i32, i32), EnvCell>,
     by_building: BTreeMap<BuildingID, u8>,
@@ -67,36 +67,6 @@ pub struct EnvCell {
     pub pollution: f32,
 }
 
-#[derive(Serialize, Deserialize)]
-enum SavedEnvGrid<Cells, LandValues> {
-    // The spine stub serialized an empty map. Its Bincode length of zero
-    // is also the discriminant of this variant.
-    EmptySpine,
-    Snapshot {
-        cells: Cells,
-        by_building: LandValues,
-    },
-}
-
-impl Serialize for EnvGrid {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        SavedEnvGrid::Snapshot {
-            cells: &self.cells,
-            by_building: &self.by_building,
-        }
-        .serialize(serializer)
-    }
-}
-
-impl<'de> Deserialize<'de> for EnvGrid {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        match SavedEnvGrid::deserialize(deserializer)? {
-            SavedEnvGrid::EmptySpine => Ok(Self::default()),
-            SavedEnvGrid::Snapshot { cells, by_building } => Ok(Self { cells, by_building }),
-        }
-    }
-}
-
 pub fn env_update(sim: &mut Simulation) {
     if sim.get_tick() % UPDATE_INTERVAL != 0 {
         return;
@@ -104,6 +74,7 @@ pub fn env_update(sim: &mut Simulation) {
     profiling::scope!("map_dynamic::env_update");
 
     let map = sim.map();
+    let infos = sim.read::<BuildingInfos>();
     let residences = sim.read::<Residences>();
     let coverage = sim.read::<CoverageGrid>();
     let utilities = sim.read::<UtilityFlow>();
@@ -115,8 +86,22 @@ pub fn env_update(sim: &mut Simulation) {
             BuildingKind::House => residences
                 .by_building
                 .get(&building.id)
-                .and_then(|home| home.prototype.prototype().pollution),
-            BuildingKind::GoodsCompany(company) => company.prototype().pollution,
+                .and_then(|home| try_prototype(home.prototype))
+                .and_then(|proto| proto.pollution),
+            BuildingKind::GoodsCompany(company) => {
+                let Some(proto) = try_prototype(company) else {
+                    continue;
+                };
+                let Some(strength) = proto.pollution else {
+                    continue;
+                };
+                let Some(SoulID::GoodsCompany(owner)) = infos.owner(building.id) else {
+                    continue;
+                };
+                sim.world.companies.get(owner).map(|company| {
+                    strength * company.raw_productivity(proto, building.zone.as_ref())
+                })
+            }
             _ => None,
         };
         if let Some(strength) = pollution.filter(|strength| strength.is_finite() && *strength > 0.0)

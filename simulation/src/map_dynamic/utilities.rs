@@ -3,17 +3,17 @@ use std::collections::BTreeMap;
 use prototypes::{try_prototype, ServiceID, ServiceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID};
+use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID, MAX_ZONE_AREA};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
 
 use super::{BuildingInfos, ElectricityFlow};
 
 const UTILITY_INTERVAL_TICKS: u64 = 3_000;
+const RELATIVE_RATE_EPSILON: f64 = 1e-6;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct UtilityFlow {
-    // The spine saved two empty collections, which decode as two empty maps.
     by_building: BTreeMap<BuildingID, ElectricityNetworkID>,
     by_network: BTreeMap<ElectricityNetworkID, UtilityTotals>,
 }
@@ -50,12 +50,21 @@ pub struct UtilityTotals {
 
 impl UtilityTotals {
     fn has_water(&self) -> bool {
-        self.water_production > 0.0 && self.water_production >= self.water_demand
+        meets_demand(self.water_production, self.water_demand)
     }
 
     fn has_sewage(&self) -> bool {
-        self.sewage_capacity > 0.0 && self.sewage_capacity >= self.sewage_demand
+        meets_demand(self.sewage_capacity, self.sewage_demand)
     }
+}
+
+fn meets_demand(supply: f64, demand: f64) -> bool {
+    supply > 0.0 && demand - supply <= demand * RELATIVE_RATE_EPSILON
+}
+
+fn valid_rate(rate: Option<f32>) -> f64 {
+    rate.filter(|rate| rate.is_finite() && *rate >= 0.0)
+        .map_or(0.0, f64::from)
 }
 
 pub fn utility_flow_update(sim: &mut Simulation) {
@@ -87,14 +96,14 @@ pub fn utility_flow_update(sim: &mut Simulation) {
                         .get(&id)
                         .and_then(|residence| try_prototype(residence.prototype));
                     if let Some(proto) = prototype {
-                        totals.water_demand += f64::from(proto.water_consumption.unwrap_or(0.0));
+                        totals.water_demand += valid_rate(proto.water_consumption);
                     }
                 }
                 BuildingKind::GoodsCompany(company) => {
                     let Some(proto) = try_prototype(company) else {
                         continue;
                     };
-                    totals.water_demand += f64::from(proto.water_consumption.unwrap_or(0.0));
+                    totals.water_demand += valid_rate(proto.water_consumption);
 
                     let Some(service) = try_prototype(ServiceID::from(company)) else {
                         continue;
@@ -112,8 +121,15 @@ pub fn utility_flow_update(sim: &mut Simulation) {
                         continue;
                     };
                     if let Some(company) = sim.world.companies.get(owner) {
-                        let productivity = company.raw_productivity(proto, building.zone.as_ref());
-                        *total += f64::from(rate.unwrap_or(0.0)) * f64::from(productivity);
+                        let staffing = company.workers.0.len() as f64 / f64::from(proto.n_workers);
+                        let zone_factor = building
+                            .zone
+                            .as_ref()
+                            .map_or(1.0, |zone| f64::from(zone.area) / f64::from(MAX_ZONE_AREA));
+                        let effective_rate = valid_rate(rate) * staffing * zone_factor;
+                        if effective_rate.is_finite() && effective_rate >= 0.0 {
+                            *total += effective_rate;
+                        }
                     }
                 }
                 _ => {}

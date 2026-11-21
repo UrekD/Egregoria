@@ -76,6 +76,11 @@ impl SerializedMap {
                     ));
                 }
             }
+            for (lane, _) in road.lanes_iter() {
+                if !self.lanes.contains_key(lane) {
+                    return Err(format!("road {id:?} has an invalid lane {lane:?}"));
+                }
+            }
             for &building in &road.connected_buildings {
                 if self
                     .buildings
