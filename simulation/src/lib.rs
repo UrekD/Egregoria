@@ -278,7 +278,7 @@ impl Simulation {
             utils::scheduler::drain_commands(self);
             return;
         }
-        *self.write::<CommandOutcomes>() = CommandOutcomes::default();
+        self.write::<CommandOutcomes>().begin_batch();
         for (index, command) in commands.enumerate() {
             let before = self.read::<CommandOutcomes>().last.len();
             command.apply_in_batch(self);

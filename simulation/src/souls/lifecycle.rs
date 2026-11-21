@@ -90,6 +90,18 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
     human
         .router
         .clear_steps(&mut sim.write::<ParkingManagement>());
+    if let Some(trades) = human.bought.0.remove(&ItemID::new("retail-goods")) {
+        let map = sim.map();
+        let infos = sim.read::<BuildingInfos>();
+        let mut market = sim.write::<Market>();
+        for trade in trades {
+            let seller_pos = infos
+                .building_owned_by(trade.seller.0)
+                .and_then(|building| map.get(building))
+                .map(|store| store.door_pos.xy());
+            market.cancel_retail_purchase(trade, seller_pos);
+        }
+    }
     clear_soul_references(sim, SoulID::Human(id));
 
     if let Some(WorkKind::Driver { truck, .. }) = human.work.as_ref().map(|work| work.kind) {
@@ -206,13 +218,23 @@ pub(crate) fn train_dropped(sim: &mut Simulation, id: TrainID) {
 
 fn clear_soul_references(sim: &mut Simulation, soul: SoulID) {
     let (world, resources) = sim.world_res();
-    resources.write::<Market>().remove(soul);
+    let mut market = resources.write::<Market>();
+    market.remove(soul);
     resources.write::<BuildingInfos>().remove_soul(soul);
     let bread = ItemID::new("bread");
+    let retail = ItemID::new("retail-goods");
     for human in world.humans.values_mut() {
         human.bought.0.retain(|&item, trades| {
             let count = trades.len();
-            trades.retain(|trade| !trade.involves(soul));
+            trades.retain(|trade| {
+                if !trade.involves(soul) {
+                    return true;
+                }
+                if item == retail {
+                    market.cancel_retail_purchase(*trade, None);
+                }
+                false
+            });
             if item == bread && count != 0 && trades.is_empty() {
                 human.food.cancel_purchase();
             }

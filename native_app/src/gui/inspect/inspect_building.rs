@@ -11,6 +11,7 @@ use simulation::map::{
 use simulation::map_dynamic::{BuildingInfos, ElectricityFlow};
 use simulation::souls::freight_station::FreightTrainState;
 use simulation::souls::residence::Residences;
+use simulation::transportation::Location;
 use simulation::world_command::WorldCommand;
 use simulation::{Simulation, SoulID};
 use std::borrow::Cow;
@@ -127,11 +128,15 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         .or_else(|| try_prototype(prototype).map(|p| p.capacity));
     let density = residence.map_or(Density::Low, |home| home.density);
     let level = residence.map_or(1, |home| home.level);
-    let residents: Vec<_> = sim
-        .world()
-        .humans
-        .iter()
-        .filter(|(_, human)| human.home.house == b.id)
+    let binfos = sim.read::<BuildingInfos>();
+    let info = binfos.get(b.id);
+    let residents: Vec<_> = info
+        .into_iter()
+        .flat_map(|info| &info.residents)
+        .filter_map(|&soul| {
+            let SoulID::Human(id) = soul else { return None };
+            Some((id, sim.get(id)?))
+        })
         .collect();
     let employed = residents
         .iter()
@@ -159,18 +164,16 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         need("Power", has_power(sim, b.id));
     }
 
-    let binfos = sim.read::<BuildingInfos>();
-    let info = binfos.get(b.id);
     if !residents.is_empty() {
         label("Households");
     }
-    for &(id, _) in &residents {
+    for &(id, human) in &residents {
         minrow(5.0, || {
             entity_link(uiworld, sim, id);
             if info.is_some_and(|info| info.owner == Some(SoulID::Human(id))) {
                 label("Owner");
             }
-            if info.is_some_and(|info| info.inside.contains(&SoulID::Human(id))) {
+            if human.location == Location::Building(b.id) {
                 label("At home");
             }
         });
@@ -178,7 +181,11 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     if let Some(info) = info {
         for &soul in &info.inside {
             if let SoulID::Human(id) = soul {
-                if residents.iter().all(|&(resident, _)| resident != id) {
+                if !info.residents.contains(&soul)
+                    && sim
+                        .get(id)
+                        .is_some_and(|human| human.location == Location::Building(b.id))
+                {
                     minrow(5.0, || {
                         entity_link(uiworld, sim, id);
                         label("Visiting");

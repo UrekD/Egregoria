@@ -45,6 +45,24 @@ fn run_systems(test: &mut TestCtx) {
     }
 }
 
+#[test]
+fn p1bce_identical_rejections_have_distinct_batch_sequences() {
+    let mut test = TestCtx::new();
+    let invalid = WorldCommand::MapBuildHouse(crate::map::LotID::default());
+    test.g.apply_commands([&invalid]);
+    let outcomes = test.g.read::<CommandOutcomes>();
+    assert!(!outcomes.last.is_empty());
+    let first = outcomes.sequence;
+    let rejections = outcomes.last.clone();
+    drop(outcomes);
+    test.g.apply_commands([]);
+    assert_eq!(test.g.read::<CommandOutcomes>().sequence, first);
+    test.g.apply_commands([&invalid]);
+    let outcomes = test.g.read::<CommandOutcomes>();
+    assert!(outcomes.sequence > first);
+    assert_eq!(outcomes.last, rejections);
+}
+
 fn assert_no_market_refs(sim: &Simulation, soul: SoulID) {
     for (_, market) in sim.read::<Market>().iter() {
         assert!(market.buy_order(soul).is_none());
@@ -59,6 +77,7 @@ fn removing_a_house_drains_the_resident_and_driving_car() {
     street(&test);
     let house = test.build_house_near(vec2(150.0, 125.0));
     let neighbor = test.build_house_near(vec2(250.0, 125.0));
+    test.set_residential_demand(40.0);
     run_systems(&mut test);
 
     let human = resident(&test, house);
@@ -125,6 +144,7 @@ fn removing_a_company_frees_trucks_and_workers_and_discards_pending_trades() {
     let house = test.build_house_near(vec2(150.0, 125.0));
     let other_house = test.build_house_near(vec2(250.0, 125.0));
     let building = factory(&mut test);
+    test.set_residential_demand(40.0);
     run_systems(&mut test);
 
     let Some(SoulID::GoodsCompany(company)) = test.g.read::<BuildingInfos>().owner(building) else {
@@ -468,6 +488,7 @@ fn staffed_factory(
     let house = test.build_house_near(vec2(150.0, 125.0));
     let customer = test.build_house_near(vec2(250.0, 125.0));
     let factory = factory(test);
+    test.set_residential_demand(40.0);
     run_systems(test);
     let Some(SoulID::GoodsCompany(company)) = test.g.read::<BuildingInfos>().owner(factory) else {
         panic!("factory has no company");
@@ -789,6 +810,7 @@ fn removing_a_road_orphans_the_house_without_despawning_the_resident() {
     let mut test = TestCtx::new();
     street(&test);
     let house = test.build_house_near(vec2(150.0, 125.0));
+    test.set_residential_demand(40.0);
     run_systems(&mut test);
     let human = resident(&test, house);
     let road = test.g.map().get(house).unwrap().connected_road.unwrap();

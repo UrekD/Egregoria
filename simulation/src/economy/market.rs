@@ -199,7 +199,16 @@ impl Market {
     /// A trade can only be completed if the seller has enough capital.
     /// Please do not keep the trades around much, it needs to be destroyed by the next time you call this function.
     pub fn make_trades(&mut self, find_external: impl Fn(Vec2) -> Option<SoulID>) -> &[Trade] {
+        self.make_trades_filtered(find_external, |_, _| true)
+    }
+
+    pub(super) fn make_trades_filtered(
+        &mut self,
+        find_external: impl Fn(Vec2) -> Option<SoulID>,
+        mut can_pick_up: impl FnMut(SoulID, SoulID) -> bool,
+    ) -> &[Trade] {
         self.all_trades.clear();
+        let retail = ItemID::new("retail-goods");
 
         for (&kind, market) in &mut self.markets {
             // Naive O(n²) alg
@@ -222,6 +231,9 @@ impl Market {
                     }
                     let qty_buy = border.qty as i32;
                     if qty_buy > qty_sell {
+                        continue;
+                    }
+                    if kind == retail && !can_pick_up(buyer, seller) {
                         continue;
                     }
                     let score = sorder.pos.distance2(border.pos);
@@ -255,12 +267,8 @@ impl Market {
                         return None;
                     }
 
-                    let cap_buyer = capital.entry(trade.buyer.0).or_default();
-                    let border = buy_orders.entry(trade.buyer.0);
-
-                    match border {
-                        Entry::Vacant(_) => return None,
-                        Entry::Occupied(o) => o.remove(),
+                    let Entry::Occupied(border) = buy_orders.entry(trade.buyer.0) else {
+                        return None;
                     };
 
                     let sorderent = sell_orders.entry(trade.seller.0);
@@ -276,6 +284,7 @@ impl Market {
                         return None;
                     }
 
+                    border.remove();
                     sorder.qty -= trade.qty as u32;
 
                     if sorder.qty == 0 {
@@ -283,24 +292,20 @@ impl Market {
                     }
 
                     // Safety: buyer cannot be the same as seller
-                    *cap_buyer += trade.qty;
-                    *capital.get_mut(&trade.seller.0).unwrap() -= trade.qty;
+                    *cap_seller -= trade.qty;
+                    *capital.entry(trade.buyer.0).or_default() += trade.qty;
 
                     Some(trade)
                 }));
 
             // External trading
             if !*optout_exttrade {
-                // All buyers can fullfil since they can buy externally
-                let btaken = std::mem::take(buy_orders);
-                self.all_trades.reserve(btaken.len());
-                for (buyer, order) in btaken {
+                buy_orders.retain(|&buyer, order| {
+                    let Some(ext @ SoulID::FreightStation(_)) = find_external(order.pos) else {
+                        return true;
+                    };
                     let qty_buy = order.qty as i32;
                     *capital.entry(buyer).or_default() += qty_buy;
-
-                    let Some(ext) = find_external(order.pos) else {
-                        continue;
-                    };
 
                     self.all_trades.push(Trade {
                         buyer: TradeTarget(buyer),
@@ -309,7 +314,8 @@ impl Market {
                         kind,
                         money_delta: -(*ext_value * qty_buy as i64), // we buy from external so we pay
                     });
-                }
+                    false
+                });
 
                 // Seller surplus goes to external trading
                 for (&seller, order) in sell_orders.iter_mut() {
@@ -317,17 +323,15 @@ impl Market {
                     if qty_sell <= 0 {
                         continue;
                     }
-                    let cap = capital.entry(seller).or_default();
-                    if *cap < qty_sell {
+                    if capital.get(&seller).copied().unwrap_or_default() < qty_sell {
                         log::warn!("{:?} is selling more than it has: {:?}", &seller, qty_sell);
                         continue;
                     }
-                    *cap -= qty_sell;
-                    order.qty -= qty_sell as u32;
-
-                    let Some(ext) = find_external(order.pos) else {
+                    let Some(ext @ SoulID::FreightStation(_)) = find_external(order.pos) else {
                         continue;
                     };
+                    *capital.get_mut(&seller).unwrap() -= qty_sell;
+                    order.qty -= qty_sell as u32;
 
                     self.all_trades.push(Trade {
                         buyer: TradeTarget(ext),
@@ -341,6 +345,25 @@ impl Market {
         }
 
         &self.all_trades
+    }
+
+    /// Reverses the stock transfer for a local pickup that was never collected.
+    /// Stock from a removed seller is discarded along with its other inventory.
+    pub(crate) fn cancel_retail_purchase(&mut self, trade: Trade, seller_pos: Option<Vec2>) {
+        debug_assert_eq!(trade.money_delta, Money::ZERO);
+        self.produce(trade.buyer.0, trade.kind, -trade.qty);
+        if let Some(pos) = seller_pos {
+            self.produce(trade.seller.0, trade.kind, trade.qty);
+            let orders = &mut self.m(trade.kind).sell_orders;
+            orders
+                .entry(trade.seller.0)
+                .or_insert(SellOrder {
+                    pos,
+                    qty: 0,
+                    stock: 0,
+                })
+                .qty += trade.qty as u32;
+        }
     }
 
     pub fn inner(&self) -> &BTreeMap<ItemID, SingleMarket> {

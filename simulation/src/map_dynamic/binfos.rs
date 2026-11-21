@@ -1,4 +1,5 @@
-use crate::map::BuildingID;
+use crate::map::{BuildingID, BuildingKind, Map};
+use crate::souls::residence::Residences;
 use crate::SoulID;
 use serde::{Deserialize, Serialize};
 use slotmapd::SecondaryMap;
@@ -16,15 +17,27 @@ pub struct BuildingInfos {
     assignment: SecondaryMap<BuildingID, BuildingInfo>,
     owners: BTreeMap<SoulID, BuildingID>,
     residences: BTreeMap<SoulID, BuildingID>,
+    #[serde(skip)]
+    vacancies: Option<Vacancies>,
+    #[serde(skip)]
+    vacancy_changes: BTreeSet<BuildingID>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Vacancies {
+    homes: BTreeSet<BuildingID>,
+    unowned: BTreeSet<BuildingID>,
 }
 
 impl BuildingInfos {
     pub fn insert(&mut self, building: BuildingID) {
         self.assignment.insert(building, BuildingInfo::default());
+        self.mark_vacancy_changed(building);
     }
 
     pub fn remove(&mut self, building: BuildingID) -> Option<BuildingInfo> {
         let info = self.assignment.remove(building)?;
+        self.mark_vacancy_changed(building);
         if let Some(owner) = info.owner {
             if self.owners.get(&owner) == Some(&building) {
                 self.owners.remove(&owner);
@@ -44,6 +57,7 @@ impl BuildingInfos {
                     info.owner = None;
                 }
             }
+            self.mark_vacancy_changed(building);
         }
         for (_, info) in self.assignment.iter_mut() {
             info.inside.retain(|&occupant| occupant != soul);
@@ -80,6 +94,7 @@ impl BuildingInfos {
         if info.owner.is_none() {
             self.set_owner(building, soul);
         }
+        self.mark_vacancy_changed(building);
     }
 
     pub(crate) fn remove_resident(&mut self, soul: SoulID) {
@@ -98,6 +113,7 @@ impl BuildingInfos {
                 self.set_owner(building, successor);
             }
         }
+        self.mark_vacancy_changed(building);
     }
 
     pub fn set_owner(&mut self, building: BuildingID, soul: SoulID) {
@@ -108,6 +124,66 @@ impl BuildingInfos {
             self.owners.remove(&previous);
         }
         self.owners.insert(soul, building);
+        self.mark_vacancy_changed(building);
+    }
+
+    pub(crate) fn mark_vacancy_changed(&mut self, building: BuildingID) {
+        self.vacancy_changes.insert(building);
+    }
+
+    pub(crate) fn vacant_buildings(
+        &mut self,
+        map: &Map,
+        residences: &Residences,
+        immigrating: bool,
+    ) -> Vec<(BuildingKind, BuildingID)> {
+        let vacancies = self.vacancies.get_or_insert_with(|| {
+            // Rebuild the derived index from loaded building and residence state.
+            self.vacancy_changes.extend(self.assignment.keys());
+            Vacancies::default()
+        });
+        for id in std::mem::take(&mut self.vacancy_changes) {
+            vacancies.homes.remove(&id);
+            vacancies.unowned.remove(&id);
+            let Some((building, info)) = map.get(id).zip(self.assignment.get(id)) else {
+                continue;
+            };
+            match building.kind {
+                BuildingKind::House
+                    if !residences.is_abandoned(id)
+                        && residences
+                            .by_building
+                            .get(&id)
+                            .is_some_and(|home| info.residents.len() < home.capacity as usize) =>
+                {
+                    vacancies.homes.insert(id);
+                }
+                BuildingKind::GoodsCompany(_) | BuildingKind::RailFreightStation(_)
+                    if info.owner.is_none() =>
+                {
+                    vacancies.unowned.insert(id);
+                }
+                _ => {}
+            }
+        }
+
+        let homes = immigrating
+            .then_some(&vacancies.homes)
+            .into_iter()
+            .flatten();
+        let mut buildings: Vec<_> = vacancies
+            .unowned
+            .iter()
+            .chain(homes)
+            .filter_map(|&id| {
+                let building = map.get(id)?;
+                // A house can lose or regain its road without changing its vacancy.
+                (building.kind != BuildingKind::House || !building.is_orphaned())
+                    .then_some((building.kind, id))
+            })
+            .collect();
+        buildings.sort_unstable_by_key(|&(_, id)| id);
+        buildings
     }
 
     pub fn owner(&self, building: BuildingID) -> Option<SoulID> {

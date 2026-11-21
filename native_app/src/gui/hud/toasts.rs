@@ -1,4 +1,3 @@
-use crate::uiworld::UiWorld;
 use goryak::{
     blur_bg, error, mincolumn, on_secondary_container, padxy, secondary_container, textc,
 };
@@ -13,18 +12,17 @@ type Outcome = (&'static str, Rejection);
 
 #[derive(Default)]
 struct ToastState {
-    last: Vec<Outcome>,
+    sequence: u64,
     started: Option<Instant>,
 }
 
-pub fn render(uiworld: &UiWorld, sim: &Simulation) {
+pub fn render(sim: &Simulation) {
     let state = use_state(ToastState::default);
     let outcomes = sim.read::<CommandOutcomes>();
     let mut state = state.borrow_mut();
-    let received = uiworld.received_commands();
-    if state.last != outcomes.last || received.iter().next().is_some() {
-        state.last.clone_from(&outcomes.last);
-        state.started = (!state.last.is_empty()).then(Instant::now);
+    if state.sequence != outcomes.sequence {
+        state.sequence = outcomes.sequence;
+        state.started = (!outcomes.last.is_empty()).then(Instant::now);
     }
 
     if !state.started.is_some_and(|at| at.elapsed() < LIFETIME) {
@@ -40,8 +38,8 @@ pub fn render(uiworld: &UiWorld, sim: &Simulation) {
                 padxy(12.0, 8.0, || {
                     mincolumn(4.0, || {
                         textc(error(), "Command rejected");
-                        let mut unique = Vec::new();
-                        for &outcome in &state.last {
+                        let mut unique = Vec::<Outcome>::new();
+                        for &outcome in &outcomes.last {
                             if !unique.contains(&outcome) {
                                 unique.push(outcome);
                             }

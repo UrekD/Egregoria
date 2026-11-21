@@ -68,12 +68,14 @@ impl TestCtx {
         let b = self.g.map_mut().build_house(lot).unwrap();
         self.g.write::<BuildingInfos>().insert(b);
         crate::souls::residence::on_house_built(&self.g, b);
+        b
+    }
+
+    pub(crate) fn set_residential_demand(&self, demand: f32) {
         self.g
             .write::<crate::economy::ZoneDemand>()
             .values
-            .entry(crate::map::ZoneKind::Residential)
-            .or_insert(40.0);
-        b
+            .insert(crate::map::ZoneKind::Residential, demand);
     }
 
     pub(crate) fn apply(&mut self, commands: &[WorldCommand]) {

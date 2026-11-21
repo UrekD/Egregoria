@@ -62,6 +62,7 @@ pub(crate) fn register(sim: &Simulation, building: BuildingID, proto: &Residence
     sim.write::<Residences>()
         .by_building
         .insert(building, proto.into());
+    sim.write::<BuildingInfos>().mark_vacancy_changed(building);
 }
 
 pub fn on_building_removed(sim: &mut Simulation, building: BuildingID) {
@@ -170,7 +171,9 @@ pub fn residence_update(sim: &mut Simulation) {
                 matches!(soul, SoulID::Human(human) if sim.get(human).is_some_and(|h| h.work.is_some()))
             }).count();
             let capacity = residence.capacity as usize;
-            let poor = occupied * 5 < capacity && (occupied == 0 || employed * 10 < occupied * 3);
+            let poor = map.lot_origin(id).is_some()
+                && occupied * 5 < capacity
+                && (occupied == 0 || employed * 10 < occupied * 3);
             checks.poor = if poor { checks.poor + 1 } else { 0 };
             if building.is_orphaned() || checks.poor >= 24 {
                 checks.abandoned_hours = Some(0);
@@ -201,6 +204,7 @@ pub fn residence_update(sim: &mut Simulation) {
 
     // All newly abandoned residences are marked before looking for vacancies.
     for (building, door) in abandon {
+        sim.write::<BuildingInfos>().mark_vacancy_changed(building);
         evict_residents(sim, building, door);
         lifecycle::clear_building_references(sim, building, Some(door));
     }
@@ -209,7 +213,9 @@ pub fn residence_update(sim: &mut Simulation) {
     }
     if !upgrades.is_empty() {
         let mut map = sim.map_mut();
+        let mut infos = sim.write::<BuildingInfos>();
         for (id, level) in upgrades {
+            infos.mark_vacancy_changed(id);
             map.regenerate_house_mesh(id, level);
         }
     }

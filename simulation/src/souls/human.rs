@@ -167,7 +167,9 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
     let rd = &*resources.read();
     let re = &*resources.read();
 
+    let vehicles = &world.vehicles;
     world.humans.iter_mut().for_each(|(ent, h)| {
+        BuyGoods::update_pickup(h, rc, re, vehicles, resources);
         update_decision(
             ra,
             rb,
@@ -263,7 +265,7 @@ pub fn update_decision(
             decision.kind = food.apply(cbuf, binfos, time, me, trans, loc, bought)
         }
         NextDesire::Goods(goods) => {
-            decision.kind = goods.apply(cbuf, binfos, time, me, trans, loc, bought)
+            decision.kind = goods.apply(cbuf, binfos, time, me, trans, router, bought)
         }
         NextDesire::None => {}
     }
@@ -304,7 +306,7 @@ pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
         decision: HumanDecision::default(),
         home: Home::new(house),
         food: BuyFood::new(time),
-        goods: BuyGoods,
+        goods: BuyGoods::default(),
         bought: Bought::default(),
         router: Router::new(None),
         collider: None,

@@ -1,28 +1,83 @@
-use crate::economy::{find_trade_place, Bought, Market};
-use crate::map_dynamic::{BuildingInfos, Destination};
-use crate::souls::human::HumanDecisionKind;
+use crate::economy::{find_trade_place, Bought, Market, TradeTarget};
+use crate::map::{BuildingID, Map};
+use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, ParkingManagement, Router};
+use crate::souls::human::{HumanDecision, HumanDecisionKind};
 use crate::transportation::Location;
-use crate::{HumanEnt, HumanID, ParCommandBuffer, SoulID};
+use crate::utils::resources::Resources;
+use crate::{HumanEnt, HumanID, ParCommandBuffer, SoulID, VehicleEnt, VehicleID};
 use geom::Transform;
 use prototypes::{GameTime, ItemID, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
+use slotmapd::HopSlotMap;
 
 const PURCHASE_INTERVAL: u64 = 6 * TICKS_PER_HOUR;
+const PICKUP_LIMIT: u64 = 2 * TICKS_PER_HOUR;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BuyGoods {
     last_order_period: Option<u64>,
+    pickup: Option<Pickup>,
 }
 
-// The spawn hook uses the original unit struct's value syntax.
-#[allow(non_upper_case_globals)]
-pub const BuyGoods: BuyGoods = BuyGoods {
-    last_order_period: None,
-};
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct Pickup {
+    store: BuildingID,
+    seller: TradeTarget,
+    started: u64,
+    vehicle: Option<VehicleID>,
+}
 
 debug_inspect_impl!(BuyGoods);
 
 impl BuyGoods {
+    pub(crate) fn update_pickup(
+        human: &mut HumanEnt,
+        time: &GameTime,
+        map: &Map,
+        vehicles: &HopSlotMap<VehicleID, VehicleEnt>,
+        resources: &Resources,
+    ) {
+        let Some(pickup) = human.goods.pickup else {
+            return;
+        };
+        let item = ItemID::new("retail-goods");
+        let trade = human.bought.0.get_mut(&item).and_then(|trades| {
+            let index = trades
+                .iter()
+                .rposition(|trade| trade.seller == pickup.seller)?;
+            Some((trades, index))
+        });
+        let store = map.get(pickup.store);
+        let arrived = human.location == Location::Building(pickup.store);
+        if trade.is_some()
+            && !arrived
+            && store.is_some_and(|store| !store.is_orphaned())
+            && human.router.last_error.is_none()
+            && time.tick.0.saturating_sub(pickup.started) < PICKUP_LIMIT
+        {
+            return;
+        }
+
+        if let Some((trades, index)) = trade {
+            let trade = trades.remove(index);
+            let mut market = resources.write::<Market>();
+            if arrived {
+                market.produce(trade.buyer.0, item, -trade.qty);
+            } else {
+                market.cancel_retail_purchase(trade, store.map(|store| store.door_pos.xy()));
+            }
+        }
+        human.goods.pickup = None;
+        human
+            .router
+            .cancel_route(&mut resources.write::<ParkingManagement>());
+        human
+            .router
+            .use_vehicle(pickup.vehicle.filter(|&car| vehicles.contains_key(car)));
+        human.it = Itinerary::NONE;
+        human.decision = HumanDecision::default();
+    }
+
     fn next_order_period(&self, time: &GameTime, id: HumanID) -> Option<u64> {
         let offset = common::hash_u64(id) % PURCHASE_INTERVAL;
         let period = time.tick.0.checked_sub(offset)? / PURCHASE_INTERVAL;
@@ -52,23 +107,28 @@ impl BuyGoods {
         time: &GameTime,
         id: HumanID,
         trans: &Transform,
-        loc: &Location,
+        router: &mut Router,
         bought: &mut Bought,
     ) -> HumanDecisionKind {
         let item = ItemID::new("retail-goods");
         let buyer = SoulID::Human(id);
 
-        // Keep the match in Bought until collection so seller removal can cancel it.
         if let Some(trades) = bought.0.get_mut(&item) {
-            if let Some(trade) = trades.last() {
+            if let Some(&trade) = trades.last() {
                 if let Some(store) = find_trade_place(trade.seller, binfos) {
-                    if *loc != Location::Building(store) {
-                        return HumanDecisionKind::GoTo(Destination::Building(store));
-                    }
+                    self.pickup = Some(Pickup {
+                        store,
+                        seller: trade.seller,
+                        started: time.tick.0,
+                        vehicle: router.selected_vehicle(),
+                    });
+                    router.use_vehicle(None);
+                    router.last_error = None;
+                    return HumanDecisionKind::GoTo(Destination::Building(store));
                 }
-                let qty = trades.pop().unwrap().qty;
+                trades.pop();
                 cbuf.exec_on(id, move |market: &mut Market| {
-                    market.produce(buyer, item, -qty);
+                    market.cancel_retail_purchase(trade, None);
                 });
                 return HumanDecisionKind::Yield;
             }
@@ -77,11 +137,6 @@ impl BuyGoods {
         if let Some(period) = self.next_order_period(time, id) {
             let pos = trans.pos.xy();
             cbuf.exec_on(id, move |market: &mut Market| {
-                // A removed seller's match may have been dropped while its capital was credited.
-                let uncollected = market.capital(buyer, item);
-                if uncollected > 0 {
-                    market.produce(buyer, item, -uncollected);
-                }
                 market.buy(buyer, pos, item, 1);
             });
             self.last_order_period = Some(period);
@@ -93,7 +148,7 @@ impl BuyGoods {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{BuildingID, BuildingKind};
+    use crate::map::{BuildingID, BuildingKind, ProjectFilter, ProjectKind, RoadID};
     use crate::souls::goods_company::is_special_building_company;
     use crate::tests::TestCtx;
     use crate::{CompanyID, FreightStationID, WorldCommand};
@@ -126,8 +181,17 @@ mod tests {
     }
 
     fn company(test: &mut TestCtx, x: f32, name: &str) -> (BuildingID, CompanyID) {
-        let proto = GoodsCompanyID::new(name).prototype();
         let road = test.g.map().roads().keys().last().unwrap();
+        company_on_road(test, x, name, road)
+    }
+
+    fn company_on_road(
+        test: &mut TestCtx,
+        x: f32,
+        name: &str,
+        road: RoadID,
+    ) -> (BuildingID, CompanyID) {
+        let proto = GoodsCompanyID::new(name).prototype();
         let kind = BuildingKind::GoodsCompany(proto.id);
         // The routing fixtures need the store and nearby house at fixed positions.
         let building = test
@@ -208,6 +272,7 @@ mod tests {
         let mut test = city_street();
         let (store_building, store) = company(&mut test, 190.0, "commercial-l1");
         let house = test.build_house_near(vec2(155.0, 122.0));
+        test.set_residential_demand(40.0);
         test.tick_fast();
         let Some(SoulID::Human(human)) = test.g.read::<BuildingInfos>().owner(house) else {
             panic!("resident missing");
@@ -219,9 +284,7 @@ mod tests {
         assert!(retail.prototype().optout_exttrade);
         finish_batch(&mut test, store);
         assert!(test.g.read::<Market>().capital(store_soul, retail) > 0);
-        test.g.world_mut_unchecked().humans[human]
-            .router
-            .use_vehicle(None);
+        let car = test.g.get(human).unwrap().router.personal_car.unwrap();
 
         let period = 6 * TICKS_PER_HOUR;
         let offset = common::hash_u64(human) % period;
@@ -242,12 +305,19 @@ mod tests {
 
         for _ in 0..5_000 {
             test.tick_fast();
+            assert_ne!(test.g.get(human).unwrap().location, Location::Vehicle(car));
             if test.g.read::<Market>().capital(buyer, retail) == 0 {
                 break;
             }
         }
         let resident = test.g.get(human).unwrap();
         assert_eq!(resident.location, Location::Building(store_building));
+        assert_eq!(resident.router.personal_car, Some(car));
+        assert_eq!(resident.router.selected_vehicle(), Some(car));
+        let infos = test.g.read::<BuildingInfos>();
+        assert!(!infos.get(house).unwrap().inside.contains(&buyer));
+        assert!(infos.get(store_building).unwrap().inside.contains(&buyer));
+        drop(infos);
         assert_eq!(
             test.g.read::<Market>().capital(buyer, retail),
             0,
@@ -271,6 +341,158 @@ mod tests {
             test.g.read::<Market>().capital(buyer, retail),
             0,
             "one purchase per period"
+        );
+    }
+
+    #[test]
+    fn p1bce_disconnected_retail_pickup_refunds_stock() {
+        let mut test = city_street();
+        let house = test.build_house_near(vec2(155.0, 122.0));
+        let human = crate::souls::human::spawn_human(&mut test.g, house).unwrap();
+        test.build_roads(&[vec3(400.0, 100.0, 0.0), vec3(500.0, 200.0, 0.0)]);
+        test.build_roads(&[vec3(500.0, 200.0, 0.0), vec3(800.0, 200.0, 0.0)]);
+        let road_at = |x, y| {
+            let ProjectKind::Road(id) = test
+                .g
+                .map()
+                .project(vec3(x, y, 0.0), 2.0, ProjectFilter::ROAD)
+                .kind
+            else {
+                panic!("no road at ({x}, {y})");
+            };
+            id
+        };
+        let connector = road_at(450.0, 150.0);
+        let frontage = road_at(650.0, 200.0);
+        let (store, company) = company_on_road(&mut test, 650.0, "commercial-l1", frontage);
+        let buyer = SoulID::Human(human);
+        let seller = SoulID::GoodsCompany(company);
+        let retail = ItemID::new("retail-goods");
+        let house_door = test.g.map().get(house).unwrap().door_pos;
+        let store_door = test.g.map().get(store).unwrap().door_pos;
+        {
+            let mut market = test.g.write::<Market>();
+            market.produce(seller, retail, 1);
+            market.sell(seller, store_door.xy(), retail, 1, 0);
+            market.sell(seller, store_door.xy(), ItemID::new("job-opening"), 0, 0);
+            market.buy(buyer, house_door.xy(), retail, 1);
+        }
+        test.tick_fast();
+        assert_eq!(test.g.read::<Market>().capital(buyer, retail), 1);
+        test.apply(&[WorldCommand::MapRemoveRoad(connector)]);
+        assert!(!test.g.map().get(store).unwrap().is_orphaned());
+        for _ in 0..100 {
+            test.tick_fast();
+        }
+        assert!(test.g.get(human).unwrap().router.references_building(store));
+        test.g.write::<GameTime>().tick.0 += 2 * TICKS_PER_HOUR;
+        for _ in 0..200 {
+            test.tick_fast();
+        }
+        let market = test.g.read::<Market>();
+        assert_eq!(
+            market.capital(buyer, retail),
+            0,
+            "timed-out pickup refunded"
+        );
+        assert_eq!(market.capital(seller, retail), 1);
+        let order = market.inner()[&retail].sell_order(seller).unwrap();
+        assert_eq!(order.qty, 1);
+        assert!(test
+            .g
+            .get(human)
+            .unwrap()
+            .bought
+            .0
+            .get(&retail)
+            .is_none_or(Vec::is_empty));
+        assert!(!test.g.get(human).unwrap().router.references_building(store));
+        drop(market);
+
+        // A new order must remain open when its only seller is on the disconnected road.
+        test.g
+            .write::<Market>()
+            .buy(buyer, house_door.xy(), retail, 1);
+        test.tick_fast();
+        let market = test.g.read::<Market>();
+        assert_eq!(market.capital(buyer, retail), 0);
+        assert!(market.inner()[&retail].buy_order(buyer).is_some());
+    }
+
+    #[test]
+    fn p1bce_external_orders_wait_for_freight_and_reconcile() {
+        use crate::economy::{Budget, BudgetCategory, Government};
+
+        let mut test = city_street();
+        let starter_stations: Vec<_> = test
+            .g
+            .map()
+            .buildings()
+            .iter()
+            .filter_map(|(id, building)| {
+                matches!(building.kind, BuildingKind::RailFreightStation(_)).then_some(id)
+            })
+            .collect();
+        for station in starter_stations {
+            test.apply(&[WorldCommand::MapRemoveBuilding(station)]);
+        }
+        let (_, store) = company(&mut test, 160.0, "commercial-l1");
+        let (_, office) = company(&mut test, 230.0, "office-l1");
+        let goods = ItemID::new("goods");
+        let services = ItemID::new("services");
+        let importer = SoulID::GoodsCompany(store);
+        let exporter = SoulID::GoodsCompany(office);
+        let pos = vec2(160.0, 145.0);
+        let opening = test.g.read::<Government>().money;
+        let construction = test.g.read::<Budget>().total(BudgetCategory::Construction);
+        let (import_cost, export_income) = {
+            let mut market = test.g.write::<Market>();
+            market.buy(importer, pos, goods, 2);
+            market.produce(exporter, services, 4);
+            market.sell(exporter, pos, services, 4, 1);
+            (
+                -market.m(goods).ext_value * 2,
+                market.m(services).ext_value * 3,
+            )
+        };
+        let (world, resources) = test.g.world_res();
+        assert!(world.freight_stations.is_empty());
+        crate::economy::market_update(world, resources);
+        {
+            let market = test.g.read::<Market>();
+            assert_eq!(market.capital(importer, goods), 0);
+            assert_eq!(market.capital(exporter, services), 4);
+            assert_eq!(market.inner()[&goods].buy_order(importer).unwrap().qty, 2);
+            assert_eq!(
+                market.inner()[&services].sell_order(exporter).unwrap().qty,
+                4
+            );
+        }
+        assert_eq!(test.g.read::<Government>().money, opening);
+        freight_station(&mut test);
+        let (world, resources) = test.g.world_res();
+        crate::economy::market_update(world, resources);
+        let market = test.g.read::<Market>();
+        assert_eq!(market.capital(importer, goods), 2);
+        assert_eq!(market.capital(exporter, services), 1);
+        assert!(market.inner()[&goods].buy_order(importer).is_none());
+        assert_eq!(
+            market.inner()[&services].sell_order(exporter).unwrap().qty,
+            1
+        );
+        let budget = test.g.read::<Budget>();
+        let construction_delta = budget.total(BudgetCategory::Construction) - construction;
+        assert_eq!(
+            i128::from(test.g.read::<Government>().money.inner()),
+            i128::from((opening + import_cost + export_income).inner()) + construction_delta,
+        );
+        assert_eq!(
+            budget.total(BudgetCategory::TradeImport),
+            i128::from(import_cost.inner())
+        );
+        assert_eq!(
+            budget.total(BudgetCategory::TradeExport),
+            i128::from(export_income.inner())
         );
     }
 

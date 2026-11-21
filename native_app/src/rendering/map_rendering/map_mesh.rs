@@ -87,7 +87,7 @@ impl super::MapRenderer {
             let Some(color) = zones
                 .lot_zone(&lot.shape)
                 .map(|zone| zone_color(zone.kind).a(0.65))
-                .or_else(|| show_unzoned.then(|| simulation::colors().lot_unassigned_col.into()))
+                .or_else(|| show_unzoned.then(|| LinearColor::gray(0.38).a(0.65)))
             else {
                 continue;
             };
@@ -886,7 +886,7 @@ impl MapBuilders {
         for lot in chunk_lots {
             let lot = &lots[lot];
             let col = match lot.kind {
-                LotKind::Unassigned => simulation::colors().lot_unassigned_col,
+                LotKind::Unassigned => Color::gray(0.65),
                 LotKind::Residential => simulation::colors().lot_residential_col,
             };
             tess_lots.set_color(col);

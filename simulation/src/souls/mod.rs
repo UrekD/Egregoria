@@ -23,37 +23,17 @@ pub mod residence;
 pub(crate) fn add_souls_to_empty_buildings(sim: &mut Simulation) {
     profiling::scope!("souls::add_souls_to_empty_buildings");
     let map = sim.map();
-    let infos = sim.read::<BuildingInfos>();
+    let mut infos = sim.write::<BuildingInfos>();
     let residences = sim.read::<Residences>();
     let immigrating = sim
         .read::<ZoneDemand>()
         .values
         .get(&ZoneKind::Residential)
         .is_some_and(|&demand| demand > 0.0);
-    let mut empty_buildings = Vec::with_capacity(16);
-
-    for (id, building) in map.buildings() {
-        let info = unwrap_cont!(infos.get(id));
-        let available = match building.kind {
-            BuildingKind::House => {
-                immigrating
-                    && !building.is_orphaned()
-                    && !residences.is_abandoned(id)
-                    && residences
-                        .by_building
-                        .get(&id)
-                        .is_some_and(|home| info.residents.len() < home.capacity as usize)
-            }
-            _ => info.owner.is_none(),
-        };
-        if available {
-            empty_buildings.push((building.kind, id));
-        }
-    }
+    let empty_buildings = infos.vacant_buildings(&map, &residences, immigrating);
     drop(infos);
     drop(map);
     drop(residences);
-    empty_buildings.sort_unstable_by_key(|&(_, id)| id);
 
     let mut n_souls_added = 0;
 

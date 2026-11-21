@@ -1,17 +1,30 @@
 use crate::economy::ZoneDemand;
-use crate::map::{BuildingID, BuildingKind, LotID, ZoneCell, ZoneGrid, ZoneKind};
+use crate::map::{
+    BuildingID, BuildingKind, LotID, Map, ProjectFilter, ZoneCell, ZoneGrid, ZoneKind,
+};
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{lifecycle, residence};
 use crate::Simulation;
+use geom::Vec2;
 use ordered_float::OrderedFloat;
 use prototypes::GrowableCompanyPrototype;
+use std::collections::BTreeMap;
 
 const GROWTH_INTERVAL: u64 = 3_000;
+
+#[derive(Default)]
+struct GrowthCache {
+    zone_generation: u64,
+    zones: BTreeMap<LotID, Option<ZoneCell>>,
+    buildings: Vec<(BuildingID, Vec2)>,
+    distances: BTreeMap<LotID, OrderedFloat<f32>>,
+}
 
 pub fn growth_update(sim: &mut Simulation) {
     if sim.get_tick() % GROWTH_INTERVAL != 0 {
         return;
     }
+    profiling::scope!("souls::growth_pass");
 
     let mut orphaned = {
         let map = sim.map();
@@ -31,11 +44,27 @@ pub fn growth_update(sim: &mut Simulation) {
     }
 
     let zoned_lots = {
-        let map = sim.map();
-        let zones = sim.read::<ZoneGrid>();
+        let (_, resources) = sim.world_res();
+        resources.write_or_default::<GrowthCache>();
+        let map = resources.read::<Map>();
+        let zones = resources.read::<ZoneGrid>();
+        let mut cache = resources.write::<GrowthCache>();
+        if cache.zone_generation != zones.generation {
+            cache.zone_generation = zones.generation;
+            cache.zones.clear();
+        }
+        // A lot's shape is immutable for its ID, even when frontage changes.
+        cache.zones.retain(|&id, _| map.get(id).is_some());
+        cache.distances.retain(|&id, _| map.get(id).is_some());
         map.lots()
             .iter()
-            .filter_map(|(id, lot)| Some((id, zones.lot_zone(&lot.shape)?)))
+            .filter_map(|(id, lot)| {
+                cache
+                    .zones
+                    .entry(id)
+                    .or_insert_with(|| zones.lot_zone(&lot.shape))
+                    .map(|zone| (id, zone))
+            })
             .collect()
     };
     grow_zoned_lots(sim, zoned_lots);
@@ -43,8 +72,18 @@ pub fn growth_update(sim: &mut Simulation) {
 
 fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: Vec<(LotID, ZoneCell)>) {
     let mut candidates = {
-        let map = sim.map();
-        let demand = sim.read::<ZoneDemand>();
+        let (_, resources) = sim.world_res();
+        resources.write_or_default::<GrowthCache>();
+        let map = resources.read::<Map>();
+        let demand = resources.read::<ZoneDemand>();
+        let mut cache = resources.write::<GrowthCache>();
+        let building_centers = || map.buildings().iter().map(|(id, b)| (id, b.obb.center()));
+        if !building_centers().eq(cache.buildings.iter().copied()) {
+            cache.buildings.clear();
+            cache.buildings.extend(building_centers());
+            cache.distances.clear();
+        }
+        let mut off_center_buildings = None;
         let mut candidates = Vec::new();
         for (id, cell) in zoned_lots {
             let value = demand.values.get(&cell.kind).copied().unwrap_or_default();
@@ -80,12 +119,23 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: Vec<(LotID, ZoneCell)>) {
                 continue;
             }
             let center = lot.shape.center();
-            let distance = map
-                .buildings()
-                .values()
-                .map(|building| OrderedFloat(building.obb.center().distance2(center)))
-                .min()
-                .unwrap_or(OrderedFloat(f32::INFINITY));
+            let distance = *cache.distances.entry(id).or_insert_with(|| {
+                let off_center = off_center_buildings.get_or_insert_with(|| {
+                    // A zoned building is indexed by its zone polygon, which can omit its center.
+                    map.buildings()
+                        .values()
+                        .filter_map(|building| {
+                            let center = building.obb.center();
+                            building
+                                .zone
+                                .as_ref()
+                                .filter(|zone| !zone.poly.contains(center))?;
+                            Some(center)
+                        })
+                        .collect::<Vec<_>>()
+                });
+                nearest_building_distance(&map, center, off_center)
+            });
             let quota = ((value / 20.0).ceil() as u8).min(4);
             candidates.push((cell.kind, distance, id, kind, home, quota));
         }
@@ -112,6 +162,38 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: Vec<(LotID, ZoneCell)>) {
             remaining -= 1;
         }
     }
+}
+
+fn nearest_building_distance(
+    map: &Map,
+    center: Vec2,
+    off_center_buildings: &[Vec2],
+) -> OrderedFloat<f32> {
+    let mut nearest = off_center_buildings
+        .iter()
+        .map(|building| OrderedFloat(building.distance2(center)))
+        .min()
+        .unwrap_or(OrderedFloat(f32::INFINITY));
+    if !map.buildings().is_empty() {
+        let mut radius = 32.0_f32;
+        loop {
+            // Footprints can intersect the radius before their centers are inside it.
+            if let Some(distance) = map
+                .spatial_map()
+                .query_around(center, radius, ProjectFilter::BUILDING)
+                .filter_map(|object| map.get(object.as_building()?))
+                .map(|building| OrderedFloat(building.obb.center().distance2(center)))
+                .min()
+            {
+                nearest = nearest.min(distance);
+            }
+            if nearest.0 <= radius * radius {
+                break;
+            }
+            radius *= 2.0;
+        }
+    }
+    nearest
 }
 
 /// Registers simulation state after successful map placement.
@@ -172,6 +254,96 @@ mod tests {
         let building = sim.map_mut().place_growable(lot, kind).unwrap();
         on_growable_placed(sim, building, kind);
         building
+    }
+
+    #[test]
+    fn p1bce_grows_high_density_company_zones() {
+        for zone in [ZoneKind::Commercial, ZoneKind::Industrial, ZoneKind::Office] {
+            let mut test = street();
+            test.apply(&[WorldCommand::ZonePaint {
+                area: OBB::new(vec2(250.0, 100.0), geom::Vec2::X, 320.0, 140.0),
+                kind: Some(zone),
+                density: Density::High,
+            }]);
+            test.g.write::<ZoneDemand>().values.insert(zone, 40.0);
+            test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;
+            growth_update(&mut test.g);
+            let map = test.g.map();
+            assert!(
+                map.buildings().values().any(|building| {
+                    let Some(company) = building.kind.as_goods_company() else {
+                        return false;
+                    };
+                    let proto = prototypes::GrowableCompanyID::from(company).prototype();
+                    proto.density == Density::High && proto.zone_kind == zone && proto.level == 1
+                }),
+                "high-density {zone:?} lot did not grow"
+            );
+        }
+    }
+
+    #[test]
+    fn p1bce_player_house_survives_low_occupancy() {
+        let mut test = street();
+        let house = test.build_house_near(vec2(175.0, 125.0));
+        assert!(test.g.map().lot_origin(house).is_none());
+        test.g.write::<GameTime>().tick.0 = 0;
+        for _ in 0..36 {
+            hourly_check(&mut test.g);
+        }
+        assert!(test.g.map().get(house).is_some());
+        assert!(!test.g.read::<residence::Residences>().is_abandoned(house));
+    }
+
+    #[test]
+    fn p1bce_unavailable_parking_keeps_car_if_parked() {
+        let mut test = street();
+        let house = test.build_house_near(vec2(175.0, 125.0));
+        let human = crate::souls::human::spawn_human(&mut test.g, house).unwrap();
+        let car = test.g.get(human).unwrap().router.personal_car.unwrap();
+        let destination = test.g.map().get(house).unwrap().door_pos;
+        let spots = fill_parking(&test.g, destination, 400.0);
+        test.g.world_mut_unchecked().humans[human]
+            .router
+            .target_dest = Some(Destination::Outside(destination));
+        let (world, resources) = test.g.world_res();
+        crate::map_dynamic::routing_changed_system(world, resources);
+        crate::utils::scheduler::drain_commands(&mut test.g);
+        let router = &test.g.get(human).unwrap().router;
+        assert!(router.last_error.is_none());
+        assert_eq!(router.personal_car, Some(car));
+        assert!(test.g.get(car).is_some());
+        for spot in spots {
+            test.g.write::<ParkingManagement>().free(spot);
+        }
+    }
+
+    #[test]
+    fn p1bce_work_truck_uses_legacy_parking_search() {
+        let mut test = street();
+        let house = test.build_house_near(vec2(175.0, 125.0));
+        let human = crate::souls::human::spawn_human(&mut test.g, house).unwrap();
+        let house_door = test.g.map().get(house).unwrap().door_pos;
+        let truck = crate::transportation::spawn_parked_vehicle(
+            &mut test.g,
+            crate::transportation::VehicleKind::Truck,
+            house_door,
+        )
+        .unwrap();
+        let resident = &mut test.g.world_mut_unchecked().humans[human];
+        resident.work = Some(Work::new(
+            house,
+            WorkKind::Driver {
+                truck,
+                deliver_order: None,
+            },
+            0.0,
+        ));
+        resident.router.use_vehicle(Some(truck));
+        resident.router.target_dest = Some(Destination::Outside(vec3(175.0, 600.0, 0.0)));
+        let (world, resources) = test.g.world_res();
+        crate::map_dynamic::routing_changed_system(world, resources);
+        assert!(test.g.get(human).unwrap().router.last_error.is_none());
     }
 
     #[test]

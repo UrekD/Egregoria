@@ -24,7 +24,9 @@ mod ecostats;
 mod government;
 mod market;
 
-use crate::map::Map;
+use crate::map::{BuildingKind, LaneID, LaneKind, Map, TraverseDirection};
+use crate::map_dynamic::BuildingInfos;
+use crate::transportation::Location;
 use crate::world::HumanID;
 pub use budget::*;
 pub use citystats::*;
@@ -54,17 +56,47 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
     let freights = &world.freight_stations;
 
     let map = resources.read::<Map>();
-    let trades = m.make_trades(|pos| {
-        freights
-            .iter()
-            .min_by_key(|(_, b)| {
-                let Some(b) = map.buildings.get(b.f.building) else {
-                    return OrderedFloat(f32::INFINITY);
+    let infos = resources.read::<BuildingInfos>();
+    let mut buyer_lanes = BTreeMap::new();
+    let mut seller_lanes = BTreeMap::new();
+    let mut components = BTreeMap::new();
+    let trades = m.make_trades_filtered(
+        |pos| {
+            freights
+                .iter()
+                .filter_map(|(id, freight)| {
+                    let building = map.get(freight.f.building)?;
+                    (matches!(building.kind, BuildingKind::RailFreightStation(_))
+                        && infos.owner(building.id) == Some(SoulID::FreightStation(id)))
+                    .then_some((OrderedFloat(building.door_pos.xy().distance2(pos)), id))
+                })
+                .min()
+                .map(|(_, id)| SoulID::FreightStation(id))
+        },
+        |buyer, seller| {
+            let SoulID::Human(buyer) = buyer else {
+                return true;
+            };
+            let buyer_lane = *buyer_lanes.entry(buyer).or_insert_with(|| {
+                let human = world.humans.get(buyer)?;
+                let pos = match human.location {
+                    Location::Outside => human.trans.pos,
+                    Location::Building(id) => map.get(id)?.door_pos,
+                    Location::Vehicle(id) => world.vehicles.get(id)?.trans.pos,
                 };
-                OrderedFloat(b.door_pos.xy().distance2(pos))
+                map.nearest_lane(pos, LaneKind::Walking, None)
+            });
+            let seller_lane = *seller_lanes.entry(seller).or_insert_with(|| {
+                let store = map.get(infos.building_owned_by(seller)?)?;
+                store.connected_road?;
+                map.nearest_lane(store.door_pos, LaneKind::Walking, None)
+            });
+            buyer_lane.zip(seller_lane).is_some_and(|(buyer, seller)| {
+                walking_component(&map, &mut components, buyer)
+                    == walking_component(&map, &mut components, seller)
             })
-            .map(|(id, _)| SoulID::FreightStation(id))
-    });
+        },
+    );
 
     resources.write::<EcoStats>().advance(tick.0, trades);
 
@@ -104,4 +136,37 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
             SoulID::FreightStation(_) => {}
         }
     }
+}
+
+/// Labels walking lanes connected by sidewalk corners and crossings, once per match pass.
+fn walking_component(
+    map: &Map,
+    components: &mut BTreeMap<LaneID, LaneID>,
+    start: LaneID,
+) -> LaneID {
+    if let Some(&component) = components.get(&start) {
+        return component;
+    }
+    let mut pending = vec![start];
+    components.insert(start, start);
+    while let Some(id) = pending.pop() {
+        let lane = &map.lanes()[id];
+        for intersection in [lane.src, lane.dst] {
+            for (turn, direction) in map.intersections()[intersection].turns_from(id) {
+                let adjacent = match direction {
+                    TraverseDirection::Forward => turn.dst,
+                    TraverseDirection::Backward => turn.src,
+                };
+                if map.lanes()[adjacent].kind == LaneKind::Walking {
+                    if let std::collections::btree_map::Entry::Vacant(entry) =
+                        components.entry(adjacent)
+                    {
+                        entry.insert(start);
+                        pending.push(adjacent);
+                    }
+                }
+            }
+        }
+    }
+    start
 }

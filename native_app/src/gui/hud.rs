@@ -46,7 +46,7 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
         new_inspector(uiworld, sim);
         uiworld.write::<GuiState>().windows.render(uiworld, sim);
         time_controls(uiworld, sim);
-        toasts::render(uiworld, sim);
+        toasts::render(sim);
         keybinds::keybind_modal(uiworld, sim);
         startup_save_message(uiworld);
     });

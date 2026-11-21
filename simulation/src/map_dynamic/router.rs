@@ -1,13 +1,14 @@
 use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::{
-    Itinerary, ParkingManagement, ParkingReserveError, SpotReservation, NEAR_PARKING_RADIUS,
+    BuildingInfos, Itinerary, ParkingManagement, ParkingReserveError, SpotReservation,
+    NEAR_PARKING_RADIUS,
 };
 use crate::souls::desire::WorkKind;
 use crate::transportation::TransportGrid;
 use crate::transportation::{put_pedestrian_in_transport_grid, unpark, Location};
 use crate::utils::resources::Resources;
 use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
-use crate::{ParCommandBuffer, World};
+use crate::{ParCommandBuffer, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
 use serde::{Deserialize, Serialize};
@@ -97,14 +98,16 @@ pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
                     |work| matches!(work.kind, WorkKind::Driver { truck, .. } if truck == car),
                 );
                 if !truck {
-                    router.forget_vehicle(car);
                     if h.location == Location::Vehicle(car) {
+                        router.forget_vehicle(car);
                         let exit_pos = world.vehicles.get(car).map_or(h.trans.pos, |v| v.trans.pos);
                         walk_outside(id, exit_pos, &cbuf_human, &mut h.location);
                         h.it = Itinerary::NONE;
+                        cbuf_vehicle.kill(car);
                     }
-                    cbuf_vehicle.kill(car);
+                    let vehicle = router.vehicle.take();
                     route = router.steps_to(pos, parking, map, &h.location, &world.vehicles);
+                    router.vehicle = vehicle;
                 }
             }
         }
@@ -257,6 +260,9 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                         return;
                     }
                     h.location = Location::Building(build);
+                    resources
+                        .write::<BuildingInfos>()
+                        .get_in(build, SoulID::Human(body));
                     walk_inside(body, h, cbuf_human);
                 }
                 RoutingStep::GetOutBuilding(build) => {
@@ -265,6 +271,9 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                         .get(build)
                         .map(|x| x.door_pos)
                         .unwrap_or(pos);
+                    resources
+                        .write::<BuildingInfos>()
+                        .get_out(build, SoulID::Human(body));
                     walk_outside(body, wpos, cbuf_human, &mut h.location);
                 }
             }
@@ -304,6 +313,10 @@ impl Router {
 
     pub fn use_vehicle(&mut self, v: Option<VehicleID>) {
         self.vehicle = v;
+    }
+
+    pub(crate) fn selected_vehicle(&self) -> Option<VehicleID> {
+        self.vehicle
     }
 
     pub(crate) fn clear_steps(&mut self, parking: &mut ParkingManagement) {
@@ -349,6 +362,7 @@ impl Router {
         self.clear_steps(parking);
         self.cur_dest = None;
         self.target_dest = None;
+        self.last_error = None;
     }
 
     pub fn reset_dest(&mut self) {
@@ -386,10 +400,14 @@ impl Router {
         }
 
         if let Some(car) = self.vehicle {
-            let spot_resa = parking
-                .reserve_near_radius(obj, map, NEAR_PARKING_RADIUS)
-                .or_else(|_| parking.reserve_near_radius(obj, map, 4.0 * NEAR_PARKING_RADIUS))
-                .map_err(RouterError::ReservingParkingSpot)?;
+            let spot_resa = if self.personal_car == Some(car) {
+                parking
+                    .reserve_near_radius(obj, map, NEAR_PARKING_RADIUS)
+                    .or_else(|_| parking.reserve_near_radius(obj, map, 4.0 * NEAR_PARKING_RADIUS))
+            } else {
+                parking.reserve_near(obj, map)
+            }
+            .map_err(RouterError::ReservingParkingSpot)?;
             let parking_pos = match spot_resa.park_pos(map) {
                 Some(x) => x,
                 None => {

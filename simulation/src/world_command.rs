@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use prototypes::{try_prototype, Money, RollingStockID};
@@ -128,10 +129,21 @@ pub enum Rejection {
 
 #[derive(Default)]
 pub struct CommandOutcomes {
+    /// Process-wide sequence of the most recent nonempty batch, including across world loads.
+    pub sequence: u64,
     /// Rejections from the most recent nonempty batch, in command order.
     pub last: Vec<(&'static str, Rejection)>,
     /// Input indices of commands that completed without any rejection.
     pub accepted: Vec<usize>,
+}
+
+impl CommandOutcomes {
+    pub(crate) fn begin_batch(&mut self) {
+        static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        self.sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.last.clear();
+        self.accepted.clear();
+    }
 }
 
 impl AsRef<[WorldCommand]> for WorldCommands {

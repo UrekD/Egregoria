@@ -469,6 +469,7 @@ impl Map {
     pub fn build_house(&mut self, lot_id: LotID) -> Option<BuildingID> {
         info!("build house on {:?}", lot_id);
         self.build_on_lot(lot_id, BuildingKind::House, BuildingGen::House)
+            .map(|(id, _)| id)
     }
 
     pub fn place_growable(&mut self, lot_id: LotID, kind: BuildingKind) -> Option<BuildingID> {
@@ -492,7 +493,9 @@ impl Map {
             }
             _ => return None,
         };
-        self.build_on_lot(lot_id, kind, gen)
+        let (id, origin) = self.build_on_lot(lot_id, kind, gen)?;
+        self.lot_origins.insert(id, origin);
+        Some(id)
     }
 
     pub fn lot_origin(&self, building: BuildingID) -> Option<&LotOrigin> {
@@ -526,7 +529,7 @@ impl Map {
         lot_id: LotID,
         kind: BuildingKind,
         gen: BuildingGen,
-    ) -> Option<BuildingID> {
+    ) -> Option<(BuildingID, LotOrigin)> {
         let lot = self.lots.get(lot_id)?;
         let id = Building::make(
             &mut self.buildings,
@@ -542,19 +545,18 @@ impl Map {
         )?;
 
         let lot = self.lots.remove(lot_id).expect("building lot still exists");
-        self.lot_origins.insert(
-            id,
-            LotOrigin {
-                parent_road: lot.parent,
-                shape: lot.shape,
-            },
-        );
         self.subscribers.dispatch(UpdateType::Road, &lot);
         self.spatial_map.remove(lot_id);
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
         self.check_invariants();
-        Some(id)
+        Some((
+            id,
+            LotOrigin {
+                parent_road: lot.parent,
+                shape: lot.shape,
+            },
+        ))
     }
 
     pub fn remove_road(&mut self, road_id: RoadID) -> Option<Road> {

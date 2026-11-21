@@ -314,6 +314,7 @@ fn resumed_trajectory_matches_continuous_run() {
             .insert(tree_pos, Tree::new(tree_pos));
         ctx.build_roads(&[vec3(64.0, 128.0, 0.0), vec3(448.0, 128.0, 0.0)]);
         ctx.build_house_near(vec2(200.0, 150.0));
+        ctx.set_residential_demand(40.0);
     }
 
     for _ in 0..1000 {
