@@ -31,6 +31,7 @@ pub struct MapProject {
 pub struct LotOrigin {
     pub parent_road: RoadID,
     pub shape: OBB,
+    growable: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -62,6 +63,7 @@ pub struct Map {
     pub(crate) spatial_map: SpatialMap,
     pub(crate) external_train_stations: Vec<BuildingID>,
     pub(crate) lot_origins: BTreeMap<BuildingID, LotOrigin>,
+    pub(crate) walking_topology_generation: u64,
 
     pub electricity: ElectricityCache,
     pub environment: Environment,
@@ -91,6 +93,7 @@ impl Map {
             spatial_map: SpatialMap::default(),
             external_train_stations: Default::default(),
             lot_origins: BTreeMap::new(),
+            walking_topology_generation: 0,
             electricity: Default::default(),
             override_subscriber: subscribers.subscribe(UpdateType::Road | UpdateType::Building),
             subscribers,
@@ -468,8 +471,7 @@ impl Map {
 
     pub fn build_house(&mut self, lot_id: LotID) -> Option<BuildingID> {
         info!("build house on {:?}", lot_id);
-        self.build_on_lot(lot_id, BuildingKind::House, BuildingGen::House)
-            .map(|(id, _)| id)
+        self.build_on_lot(lot_id, BuildingKind::House, BuildingGen::House, false)
     }
 
     pub fn place_growable(&mut self, lot_id: LotID, kind: BuildingKind) -> Option<BuildingID> {
@@ -493,13 +495,14 @@ impl Map {
             }
             _ => return None,
         };
-        let (id, origin) = self.build_on_lot(lot_id, kind, gen)?;
-        self.lot_origins.insert(id, origin);
-        Some(id)
+        self.build_on_lot(lot_id, kind, gen, true)
     }
 
+    /// Returns the lot origin of a growable. Player builds record an origin for demolition too.
     pub fn lot_origin(&self, building: BuildingID) -> Option<&LotOrigin> {
-        self.lot_origins.get(&building)
+        self.lot_origins
+            .get(&building)
+            .filter(|origin| origin.growable)
     }
 
     pub(crate) fn regenerate_house_mesh(&mut self, id: BuildingID, level: u8) {
@@ -529,7 +532,8 @@ impl Map {
         lot_id: LotID,
         kind: BuildingKind,
         gen: BuildingGen,
-    ) -> Option<(BuildingID, LotOrigin)> {
+        growable: bool,
+    ) -> Option<BuildingID> {
         let lot = self.lots.get(lot_id)?;
         let id = Building::make(
             &mut self.buildings,
@@ -549,14 +553,16 @@ impl Map {
         self.spatial_map.remove(lot_id);
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
-        self.check_invariants();
-        Some((
+        self.lot_origins.insert(
             id,
             LotOrigin {
                 parent_road: lot.parent,
                 shape: lot.shape,
+                growable,
             },
-        ))
+        );
+        self.check_invariants();
+        Some(id)
     }
 
     pub fn remove_road(&mut self, road_id: RoadID) -> Option<Road> {
@@ -656,6 +662,7 @@ impl Map {
         info!("invalidate {:?}", id);
 
         let inter = unwrap_ret!(self.intersections.get_mut(id));
+        self.walking_topology_generation += 1;
         self.subscribers.dispatch(UpdateType::Road, inter);
 
         if inter.roads.is_empty() {
@@ -696,6 +703,7 @@ impl Map {
     /// and potentially empty intersections.
     fn remove_raw_road(&mut self, road_id: RoadID) -> Option<Road> {
         let road = self.roads.remove(road_id)?;
+        self.walking_topology_generation += 1;
 
         self.spatial_map.remove(road_id);
         self.electricity.remove_object(road_id);
@@ -948,6 +956,7 @@ impl Map {
             &mut self.parking,
             &mut self.spatial_map,
         );
+        self.walking_topology_generation += 1;
 
         self.electricity.add_object(rid);
         self.electricity.add_edge(src_id, rid);

@@ -1,7 +1,7 @@
 use crate::builders::{grid_city, paint_zone_blocks, place_company, place_freight_station};
 use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, Vec2, OBB};
-use prototypes::{GrowableCompanyID, GrowableCompanyPrototype, ItemID, ResidencePrototype, Size2D};
+use prototypes::{GrowableCompanyID, GrowableCompanyPrototype, ResidencePrototype, Size2D};
 use simulation::economy::EcoStats;
 use simulation::map::{Density, ProjectFilter, ProjectKind, ZoneGrid, ZoneKind};
 use simulation::souls::residence::Residences;
@@ -186,17 +186,8 @@ fn check_growth(ctx: &mut ScenarioCtx) -> Result<(), String> {
         })
         .map(|company| company.comp.max_workers)
         .sum();
-    // The longest history level spans the whole scenario. Citizens are the buyers
-    // of retail-goods, which are local-only and unused as a recipe input.
-    let retail_purchases = ctx
-        .sim
-        .read::<EcoStats>()
-        .internal_trade
-        .iter_histories(3)
-        .find(|(id, _)| *id == ItemID::new("retail-goods"))
-        .map_or(0, |(_, history)| {
-            history.past_ring_items.iter().sum::<i64>()
-        });
+    // The longest history window spans the whole scenario.
+    let retail_purchases = ctx.sim.read::<EcoStats>().retail_fulfilled();
     let unemployment = 100.0 * unemployed as f64 / population.max(1) as f64;
     let summary = format!(
         "capacity={capacity} pop={population} jobs={jobs} unemployment={unemployment:.2}% level_ups={leveled_up} retail_purchases={retail_purchases}"

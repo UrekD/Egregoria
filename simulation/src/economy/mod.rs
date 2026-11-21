@@ -47,8 +47,28 @@ pub struct Bought(pub BTreeMap<ItemID, Vec<Trade>>);
 #[derive(Inspect, Debug, Default, Serialize, Deserialize)]
 pub struct Workers(pub Vec<HumanID>);
 
+#[derive(Default)]
+struct WalkingComponents {
+    generation: u64,
+    labels: BTreeMap<LaneID, LaneID>,
+}
+
+impl EcoStats {
+    /// Returns the retail units collected by residents in the longest history window.
+    pub fn retail_fulfilled(&self) -> i64 {
+        let retail = ItemID::new("retail-goods");
+        self.internal_trade
+            .iter_histories(LEVEL_FREQS.len() - 1)
+            .find(|(id, _)| *id == retail)
+            .map_or(0, |(_, history)| history.past_ring_items.iter().sum())
+    }
+}
+
 pub fn market_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("economy::market_update");
+    if !resources.contains::<WalkingComponents>() {
+        resources.insert(WalkingComponents::default());
+    }
     let mut m = resources.write::<Market>();
     let job_opening = ItemID::new("job-opening");
     let tick = resources.read::<GameTime>().tick;
@@ -57,9 +77,13 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
 
     let map = resources.read::<Map>();
     let infos = resources.read::<BuildingInfos>();
+    let mut components = resources.write::<WalkingComponents>();
+    if components.generation != map.walking_topology_generation {
+        components.labels.clear();
+        components.generation = map.walking_topology_generation;
+    }
     let mut buyer_lanes = BTreeMap::new();
     let mut seller_lanes = BTreeMap::new();
-    let mut components = BTreeMap::new();
     let trades = m.make_trades_filtered(
         |pos| {
             freights
@@ -77,28 +101,47 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
             let SoulID::Human(buyer) = buyer else {
                 return true;
             };
-            let buyer_lane = *buyer_lanes.entry(buyer).or_insert_with(|| {
+            let buyer_route = *buyer_lanes.entry(buyer).or_insert_with(|| {
                 let human = world.humans.get(buyer)?;
                 let pos = match human.location {
                     Location::Outside => human.trans.pos,
                     Location::Building(id) => map.get(id)?.door_pos,
                     Location::Vehicle(id) => world.vehicles.get(id)?.trans.pos,
                 };
-                map.nearest_lane(pos, LaneKind::Walking, None)
+                let lane = map.nearest_lane(pos, LaneKind::Walking, None)?;
+                Some((lane, human.goods.excluded_seller()))
             });
+            let Some((buyer_lane, excluded_seller)) = buyer_route else {
+                return false;
+            };
+            if excluded_seller == Some(seller) {
+                return false;
+            }
             let seller_lane = *seller_lanes.entry(seller).or_insert_with(|| {
                 let store = map.get(infos.building_owned_by(seller)?)?;
-                store.connected_road?;
-                map.nearest_lane(store.door_pos, LaneKind::Walking, None)
+                let road = map.get(store.connected_road?)?;
+                road.lanes_iter()
+                    .filter(|&(_, kind)| kind == LaneKind::Walking)
+                    .map(|(id, _)| id)
+                    .min_by_key(|&id| {
+                        let distance = map.lanes()[id].points.project_dist2(store.door_pos);
+                        (OrderedFloat(distance), id)
+                    })
             });
-            buyer_lane.zip(seller_lane).is_some_and(|(buyer, seller)| {
-                walking_component(&map, &mut components, buyer)
-                    == walking_component(&map, &mut components, seller)
+            seller_lane.is_some_and(|seller_lane| {
+                walking_component(&map, &mut components.labels, buyer_lane)
+                    == walking_component(&map, &mut components.labels, seller_lane)
             })
         },
     );
 
-    resources.write::<EcoStats>().advance(tick.0, trades);
+    let retail = ItemID::new("retail-goods");
+    let completed: Vec<_> = trades
+        .iter()
+        .copied()
+        .filter(|trade| trade.kind != retail || !matches!(trade.buyer.0, SoulID::Human(_)))
+        .collect();
+    resources.write::<EcoStats>().advance(tick.0, &completed);
 
     for &trade in trades.iter() {
         log::debug!("A trade was made! {:?}", trade);
@@ -138,7 +181,7 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
     }
 }
 
-/// Labels walking lanes connected by sidewalk corners and crossings, once per match pass.
+/// Labels walking lanes connected by sidewalk corners and crossings for the current topology.
 fn walking_component(
     map: &Map,
     components: &mut BTreeMap<LaneID, LaneID>,

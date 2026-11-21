@@ -886,7 +886,7 @@ impl MapBuilders {
         for lot in chunk_lots {
             let lot = &lots[lot];
             let col = match lot.kind {
-                LotKind::Unassigned => Color::gray(0.65),
+                LotKind::Unassigned => simulation::colors().lot_unassigned_col,
                 LotKind::Residential => simulation::colors().lot_residential_col,
             };
             tess_lots.set_color(col);

@@ -1,22 +1,24 @@
-use crate::economy::{find_trade_place, Bought, Market, TradeTarget};
+use crate::economy::{find_trade_place, Bought, EcoStats, Market, TradeTarget};
 use crate::map::{BuildingID, Map};
 use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, ParkingManagement, Router};
 use crate::souls::human::{HumanDecision, HumanDecisionKind};
 use crate::transportation::Location;
 use crate::utils::resources::Resources;
 use crate::{HumanEnt, HumanID, ParCommandBuffer, SoulID, VehicleEnt, VehicleID};
-use geom::Transform;
+use geom::{Transform, Vec3};
 use prototypes::{GameTime, ItemID, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
 
 const PURCHASE_INTERVAL: u64 = 6 * TICKS_PER_HOUR;
-const PICKUP_LIMIT: u64 = 2 * TICKS_PER_HOUR;
+const PICKUP_STALL_TICKS: u64 = TICKS_PER_HOUR;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BuyGoods {
     last_order_period: Option<u64>,
     pickup: Option<Pickup>,
+    tick: u64,
+    timed_out_seller: Option<TimedOutSeller>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -24,7 +26,15 @@ struct Pickup {
     store: BuildingID,
     seller: TradeTarget,
     started: u64,
+    last_position: Vec3,
+    last_progress_tick: Option<u64>,
     vehicle: Option<VehicleID>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct TimedOutSeller {
+    seller: SoulID,
+    skipped_order: bool,
 }
 
 debug_inspect_impl!(BuyGoods);
@@ -32,14 +42,23 @@ debug_inspect_impl!(BuyGoods);
 impl BuyGoods {
     pub(crate) fn update_pickup(
         human: &mut HumanEnt,
-        time: &GameTime,
+        _: &GameTime,
         map: &Map,
         vehicles: &HopSlotMap<VehicleID, VehicleEnt>,
         resources: &Resources,
     ) {
-        let Some(pickup) = human.goods.pickup else {
+        // Count simulation steps even when SetGameTime moves the calendar clock.
+        human.goods.tick += 1;
+        let Some(pickup) = &mut human.goods.pickup else {
             return;
         };
+        if human.trans.pos != pickup.last_position {
+            pickup.last_position = human.trans.pos;
+            pickup.last_progress_tick = Some(human.goods.tick);
+        }
+        let last_progress = pickup.last_progress_tick.unwrap_or(pickup.started);
+        let stalled = human.goods.tick - last_progress >= PICKUP_STALL_TICKS;
+        let pickup = *pickup;
         let item = ItemID::new("retail-goods");
         let trade = human.bought.0.get_mut(&item).and_then(|trades| {
             let index = trades
@@ -47,13 +66,18 @@ impl BuyGoods {
                 .rposition(|trade| trade.seller == pickup.seller)?;
             Some((trades, index))
         });
-        let store = map.get(pickup.store);
-        let arrived = human.location == Location::Building(pickup.store);
+        let store = map.get(pickup.store).filter(|_| {
+            resources
+                .read::<BuildingInfos>()
+                .building_owned_by(pickup.seller.0)
+                == Some(pickup.store)
+        });
+        let arrived = store.is_some() && human.location == Location::Building(pickup.store);
         if trade.is_some()
             && !arrived
             && store.is_some_and(|store| !store.is_orphaned())
             && human.router.last_error.is_none()
-            && time.tick.0.saturating_sub(pickup.started) < PICKUP_LIMIT
+            && !stalled
         {
             return;
         }
@@ -63,8 +87,18 @@ impl BuyGoods {
             let mut market = resources.write::<Market>();
             if arrived {
                 market.produce(trade.buyer.0, item, -trade.qty);
+                resources
+                    .write::<EcoStats>()
+                    .internal_trade
+                    .handle_trade(&trade);
             } else {
                 market.cancel_retail_purchase(trade, store.map(|store| store.door_pos.xy()));
+                if stalled {
+                    human.goods.timed_out_seller = Some(TimedOutSeller {
+                        seller: pickup.seller.0,
+                        skipped_order: false,
+                    });
+                }
             }
         }
         human.goods.pickup = None;
@@ -76,6 +110,10 @@ impl BuyGoods {
             .use_vehicle(pickup.vehicle.filter(|&car| vehicles.contains_key(car)));
         human.it = Itinerary::NONE;
         human.decision = HumanDecision::default();
+    }
+
+    pub(crate) fn excluded_seller(&self) -> Option<SoulID> {
+        self.timed_out_seller.as_ref().map(|retry| retry.seller)
     }
 
     fn next_order_period(&self, time: &GameTime, id: HumanID) -> Option<u64> {
@@ -110,16 +148,24 @@ impl BuyGoods {
         router: &mut Router,
         bought: &mut Bought,
     ) -> HumanDecisionKind {
+        if let Some(pickup) = &self.pickup {
+            router.use_vehicle(None);
+            return HumanDecisionKind::GoTo(Destination::Building(pickup.store));
+        }
+
         let item = ItemID::new("retail-goods");
         let buyer = SoulID::Human(id);
 
         if let Some(trades) = bought.0.get_mut(&item) {
             if let Some(&trade) = trades.last() {
                 if let Some(store) = find_trade_place(trade.seller, binfos) {
+                    self.timed_out_seller = None;
                     self.pickup = Some(Pickup {
                         store,
                         seller: trade.seller,
-                        started: time.tick.0,
+                        started: self.tick,
+                        last_position: trans.pos,
+                        last_progress_tick: None,
                         vehicle: router.selected_vehicle(),
                     });
                     router.use_vehicle(None);
@@ -135,6 +181,14 @@ impl BuyGoods {
         }
 
         if let Some(period) = self.next_order_period(time, id) {
+            if let Some(retry) = &mut self.timed_out_seller {
+                // Give alternatives one order period, then let a sole seller retry.
+                if retry.skipped_order {
+                    self.timed_out_seller = None;
+                } else {
+                    retry.skipped_order = true;
+                }
+            }
             let pos = trans.pos.xy();
             cbuf.exec_on(id, move |market: &mut Market| {
                 market.buy(buyer, pos, item, 1);
@@ -181,7 +235,14 @@ mod tests {
     }
 
     fn company(test: &mut TestCtx, x: f32, name: &str) -> (BuildingID, CompanyID) {
-        let road = test.g.map().roads().keys().last().unwrap();
+        let ProjectKind::Road(road) = test
+            .g
+            .map()
+            .project(vec3(x, 100.0, 0.0), 2.0, ProjectFilter::ROAD)
+            .kind
+        else {
+            panic!("missing company frontage on the fixture street");
+        };
         company_on_road(test, x, name, road)
     }
 
@@ -385,9 +446,11 @@ mod tests {
             test.tick_fast();
         }
         assert!(test.g.get(human).unwrap().router.references_building(store));
-        test.g.write::<GameTime>().tick.0 += 2 * TICKS_PER_HOUR;
-        for _ in 0..200 {
+        for _ in 0..TICKS_PER_HOUR + 5_000 {
             test.tick_fast();
+            if test.g.read::<Market>().capital(buyer, retail) == 0 {
+                break;
+            }
         }
         let market = test.g.read::<Market>();
         assert_eq!(

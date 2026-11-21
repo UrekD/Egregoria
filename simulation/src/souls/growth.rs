@@ -11,6 +11,7 @@ use prototypes::GrowableCompanyPrototype;
 use std::collections::BTreeMap;
 
 const GROWTH_INTERVAL: u64 = 3_000;
+const MAX_BUILDING_SEARCH_RADIUS: f32 = 2_048.0;
 
 #[derive(Default)]
 struct GrowthCache {
@@ -174,26 +175,34 @@ fn nearest_building_distance(
         .map(|building| OrderedFloat(building.distance2(center)))
         .min()
         .unwrap_or(OrderedFloat(f32::INFINITY));
-    if !map.buildings().is_empty() {
-        let mut radius = 32.0_f32;
-        loop {
-            // Footprints can intersect the radius before their centers are inside it.
-            if let Some(distance) = map
-                .spatial_map()
-                .query_around(center, radius, ProjectFilter::BUILDING)
-                .filter_map(|object| map.get(object.as_building()?))
-                .map(|building| OrderedFloat(building.obb.center().distance2(center)))
-                .min()
-            {
-                nearest = nearest.min(distance);
-            }
-            if nearest.0 <= radius * radius {
-                break;
-            }
-            radius *= 2.0;
-        }
+    if map.buildings().is_empty() {
+        return nearest;
     }
-    nearest
+    let mut radius = 32.0_f32;
+    while radius <= MAX_BUILDING_SEARCH_RADIUS {
+        // Footprints can intersect the radius before their centers are inside it.
+        if let Some(distance) = map
+            .spatial_map()
+            .query_around(center, radius, ProjectFilter::BUILDING)
+            .filter_map(|object| map.get(object.as_building()?))
+            .map(|building| OrderedFloat(building.obb.center().distance2(center)))
+            .min()
+        {
+            nearest = nearest.min(distance);
+        }
+        if nearest.0 <= radius * radius {
+            return nearest;
+        }
+        radius *= 2.0;
+    }
+
+    // An expanding grid query visits empty cells too. A single scan keeps the
+    // exact ordering without making the search cost depend on map distances.
+    map.buildings()
+        .values()
+        .map(|building| OrderedFloat(building.obb.center().distance2(center)))
+        .min()
+        .unwrap_or(nearest)
 }
 
 /// Registers simulation state after successful map placement.
