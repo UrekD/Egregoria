@@ -387,6 +387,10 @@ impl From<&Environment> for SerializedEnvironment {
 
         for cell_id in keys {
             let chunk = &tree_cells[&cell_id];
+            // Removing trees can leave an empty cell that loading never recreates.
+            if chunk.objs.is_empty() {
+                continue;
+            }
             let mut smoltrees = Vec::with_capacity(chunk.objs.len());
             for (_, tree_pos) in chunk.objs.iter() {
                 let smol = encode_pos(*tree_pos, cell_id);

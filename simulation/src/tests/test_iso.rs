@@ -1,10 +1,11 @@
-use super::init_test_simulation as init;
-use crate::map::{LanePatternBuilder, Map, MapProject, ProjectKind};
+use super::{init_test_simulation as init, TestCtx};
+use crate::map::{LanePatternBuilder, Map, MapProject, ProjectKind, Tree};
 use crate::utils::scheduler::SeqSchedule;
+use crate::world_command::WorldCommand;
 use crate::World;
-use crate::{Replay, Simulation};
+use crate::{Replay, Simulation, SimulationOptions};
 use common::saveload::{Bincode, Encoder, JSONPretty};
-use geom::vec3;
+use geom::{vec2, vec3};
 use quickcheck::{Arbitrary, Gen, TestResult};
 
 static REPLAY: &[u8] = include_bytes!("world_replay.json");
@@ -236,6 +237,53 @@ fn quickcheck_map_ser() {
             }
         }) as fn(_) -> TestResult,
     );
+}
+
+#[test]
+fn paris_hashes_survive_serde() {
+    init();
+    let mut sim = Simulation::new_with_options(SimulationOptions {
+        terrain_size: 50,
+        save_replay: false,
+    });
+    WorldCommand::MapLoadParis.apply(&mut sim);
+
+    let encoded = Bincode::encode(&sim).unwrap();
+    let decoded: Simulation = Bincode::decode(&encoded).unwrap();
+
+    assert_eq!(sim.hashes(), decoded.hashes());
+}
+
+#[test]
+fn resumed_trajectory_matches_continuous_run() {
+    let mut continuous = TestCtx::new_fast();
+    let mut resumed = TestCtx::new_fast();
+    for ctx in [&continuous, &resumed] {
+        // Put a tree in the road's path so the fixture exercises tree removal.
+        let tree_pos = vec2(256.0, 128.0);
+        ctx.g
+            .map_mut()
+            .environment
+            .trees
+            .insert(tree_pos, Tree::new(tree_pos));
+        ctx.build_roads(&[vec3(64.0, 128.0, 0.0), vec3(448.0, 128.0, 0.0)]);
+        ctx.build_house_near(vec2(200.0, 150.0));
+    }
+
+    for _ in 0..2000 {
+        continuous.tick_fast();
+    }
+    for _ in 0..1000 {
+        resumed.tick_fast();
+    }
+    assert_eq!(resumed.g.world().humans.len(), 1);
+    let encoded = Bincode::encode(&resumed.g).unwrap();
+    resumed.g = Bincode::decode(&encoded).unwrap();
+    for _ in 0..1000 {
+        resumed.tick_fast();
+    }
+
+    assert_eq!(continuous.g.hashes(), resumed.g.hashes());
 }
 
 #[test]
