@@ -1,4 +1,5 @@
 use crate::builders::CommandSink;
+use crate::builtin::perf::MEDIAN_TICKS_PER_SEC;
 use crate::MetricSample;
 use simulation::economy::Government;
 use simulation::utils::scheduler::SeqSchedule;
@@ -80,6 +81,47 @@ impl ScenarioCtx {
 
     /// Capture current world counts and tick throughput since the previous sample.
     pub fn sample(&mut self, label: &str) -> MetricSample {
+        self.sample_with_extra(label, BTreeMap::new())
+    }
+
+    pub(crate) fn sample_perf(&mut self, label: &str, houses: usize) -> MetricSample {
+        let active_vehicles = self
+            .sim
+            .world()
+            .vehicles
+            .values()
+            .filter(|vehicle| !vehicle.vehicle.state.is_parked())
+            .count();
+        let mut extra = BTreeMap::from([
+            ("houses".to_string(), houses as f64),
+            ("active_vehicles".to_string(), active_vehicles as f64),
+        ]);
+        if !self.tick_times.is_empty() {
+            let times = &mut self.tick_times;
+            times.sort_unstable();
+            let n = times.len();
+            let median_seconds =
+                (times[(n - 1) / 2].as_secs_f64() + times[n / 2].as_secs_f64()) / 2.0;
+            let median_ticks_per_sec = if median_seconds > 0.0 {
+                median_seconds.recip()
+            } else {
+                0.0
+            };
+            // Use the nearest rank for tail latencies.
+            let percentile_ms = |percent: usize| {
+                let rank = (n * percent).div_ceil(100);
+                times[rank - 1].as_secs_f64() * 1_000.0
+            };
+            extra.extend([
+                (MEDIAN_TICKS_PER_SEC.to_string(), median_ticks_per_sec),
+                ("p95_ms_per_tick".to_string(), percentile_ms(95)),
+                ("p99_ms_per_tick".to_string(), percentile_ms(99)),
+            ]);
+        }
+        self.sample_with_extra(label, extra)
+    }
+
+    fn sample_with_extra(&mut self, label: &str, mut extra: BTreeMap<String, f64>) -> MetricSample {
         let elapsed: f64 = self.tick_times.iter().map(Duration::as_secs_f64).sum();
         let ticks_per_sec = if elapsed > 0.0 {
             self.tick_times.len() as f64 / elapsed
@@ -90,6 +132,7 @@ impl ScenarioCtx {
 
         let world = self.sim.world();
         let employed = world.humans.values().filter(|h| h.work.is_some()).count();
+        extra.insert("employed".to_string(), employed as f64);
         let sample = MetricSample {
             tick: self.sim.get_tick(),
             label: label.to_string(),
@@ -99,7 +142,7 @@ impl ScenarioCtx {
             trains: world.trains.len(),
             money_cents: self.sim.read::<Government>().money.cents(),
             ticks_per_sec,
-            extra: BTreeMap::from([("employed".to_string(), employed as f64)]),
+            extra,
         };
         self.samples.push(sample.clone());
         sample

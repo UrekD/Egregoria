@@ -5,6 +5,25 @@ use simulation::economy::{Budget, BudgetCategory, Government};
 use simulation::map::BuildingKind;
 use simulation::world_command::WorldCommand;
 use simulation::SimulationOptions;
+use std::process::Command;
+
+#[test]
+fn perf_10k_cli_is_opt_in() {
+    let scenarios = env!("CARGO_BIN_EXE_scenarios");
+    let help = Command::new(scenarios).arg("--help").output().unwrap();
+    assert!(help.status.success());
+    let usage = String::from_utf8(help.stdout).unwrap();
+    assert!(usage.contains("perf_10k"), "{usage}");
+    assert!(usage.contains("--gate"), "{usage}");
+
+    let output = Command::new(scenarios)
+        .args(["all", "--gate"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("--gate requires perf_10k"), "{error}");
+}
 
 #[test]
 fn smoke_builds_a_working_city() {

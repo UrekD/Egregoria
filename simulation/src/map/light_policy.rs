@@ -13,6 +13,15 @@ pub enum LightPolicy {
 }
 
 impl LightPolicy {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::NoLights => "No lights",
+            Self::StopSigns => "Stop signs",
+            Self::Lights => "Lights",
+            Self::Auto => "Auto",
+        }
+    }
+
     pub fn apply(self, inter: &Intersection, lanes: &mut Lanes, roads: &Roads) {
         let in_road_lanes: Vec<Vec<LaneID>> = inter
             .roads
@@ -103,8 +112,12 @@ impl LightPolicy {
 }
 
 impl Inspect<LightPolicy> for LightPolicy {
-    fn render(_: &LightPolicy, _: &'static str, _: &mut Ui, _: &InspectArgs) {
-        unimplemented!()
+    fn render(data: &LightPolicy, label: &'static str, ui: &mut Ui, _: &InspectArgs) {
+        if label.is_empty() {
+            ui.label(data.label());
+        } else {
+            ui.label(format!("{label}: {}", data.label()));
+        }
     }
 
     fn render_mut(
@@ -113,36 +126,49 @@ impl Inspect<LightPolicy> for LightPolicy {
         ui: &mut Ui,
         _: &InspectArgs,
     ) -> bool {
-        let p = data;
-        let mut id = match p {
-            LightPolicy::NoLights => 0,
-            LightPolicy::StopSigns => 1,
-            LightPolicy::Lights => 2,
-            LightPolicy::Auto => 3,
-        };
-
-        let tostr = |x: LightPolicy| match x {
-            LightPolicy::NoLights => "No lights",
-            LightPolicy::StopSigns => "Stop signs",
-            LightPolicy::Lights => "Lights",
-            LightPolicy::Auto => "Auto",
-        };
-
-        let get = |i| match i {
-            0 => LightPolicy::NoLights,
-            1 => LightPolicy::StopSigns,
-            2 => LightPolicy::Lights,
-            3 => LightPolicy::Auto,
-            _ => unreachable!(),
-        };
-
+        let policies = [Self::NoLights, Self::StopSigns, Self::Lights, Self::Auto];
+        let mut index = policies.iter().position(|policy| policy == data).unwrap();
         let changed = egui::ComboBox::from_label(label)
-            .show_index(ui, &mut id, 4, |i| tostr(get(i)).to_string())
+            .show_index(ui, &mut index, policies.len(), |i| policies[i].label())
             .changed();
         if changed {
-            *p = get(id);
+            *data = policies[index];
         }
 
         changed
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn light_policy_read_only_inspector_renders_every_policy() {
+        let policies = [
+            LightPolicy::NoLights,
+            LightPolicy::StopSigns,
+            LightPolicy::Lights,
+            LightPolicy::Auto,
+        ];
+        let before = policies;
+        let output = egui::Context::default().run(egui::RawInput::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                for policy in &policies {
+                    LightPolicy::render(policy, "", ui, &InspectArgs::default());
+                }
+            });
+        });
+
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(labels, ["No lights", "Stop signs", "Lights", "Auto"]);
+        assert_eq!(policies, before);
     }
 }

@@ -26,6 +26,10 @@ determinism:
 perf:
 	cargo run --locked -p scenarios --release -- perf --json "$(CARGO_TARGET_DIR)/perf.json"
 
+.PHONY: perf-10k
+perf-10k:
+	cargo run --locked -p scenarios --release -- perf_10k --json "$(CARGO_TARGET_DIR)/perf_10k.json"
+
 shots:
 	cargo build --locked -p native_app --release
 	@mkdir -p /tmp/egr/shots && \

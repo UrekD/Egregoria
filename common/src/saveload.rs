@@ -7,7 +7,20 @@ use std::io::{BufReader, BufWriter, ErrorKind, Read, Result, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+mod atomic;
+mod slots;
+
+use atomic::write_staged;
+pub use atomic::{write_atomic, AtomicWriteError};
+pub use slots::{
+    list_slots, read_slot_meta, slot_paths, write_slot_meta, SlotEntry, SlotId, SlotIdError,
+    SlotMeta, SlotPaths, SnapshotKind,
+};
+
 static SAVE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+#[cfg(test)]
+mod slot_tests;
 
 /// Override the root for saves and persisted settings before the first use.
 pub fn set_save_dir(path: PathBuf) -> std::result::Result<(), PathBuf> {
@@ -130,17 +143,19 @@ pub trait Encoder {
     }
 
     fn save_silent(x: &impl Serialize, name: &str) -> Option<()> {
-        let path = Self::filename(name);
-        std::fs::create_dir_all(save_dir())
-            .and_then(|()| File::create(&path))
-            .and_then(|file| {
-                let mut w = BufWriter::new(file);
-                Self::encode_writer(x, &mut w)?;
-                w.flush()
-            })
-            .map_err(|e| log::error!("failed serializing: {}", e))
-            .ok()?;
-        Some(())
+        Self::save_atomic(x, name)
+            .map_err(|error| log::error!("failed saving {}: {}", name, error))
+            .ok()
+    }
+
+    /// Encode and atomically replace the file for this encoder and name.
+    fn save_atomic(x: &impl Serialize, name: &str) -> std::result::Result<(), AtomicWriteError> {
+        std::fs::create_dir_all(save_dir()).map_err(AtomicWriteError::PreCommit)?;
+        write_staged(&Self::filename(name), |file| {
+            let mut writer = BufWriter::new(file);
+            Self::encode_writer(x, &mut writer)?;
+            writer.flush()
+        })
     }
 
     fn load<T: DeserializeOwned>(name: &str) -> Result<T> {

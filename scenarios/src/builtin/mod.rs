@@ -6,6 +6,14 @@ pub mod smoke;
 use crate::Scenario;
 use simulation::SimulationOptions;
 
+pub const PERF_10K: (Scenario, SimulationOptions) = (
+    Scenario {
+        name: "perf_10k",
+        run: perf::run_10k,
+    },
+    perf::OPTIONS,
+);
+
 pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     { #[path = "budget_day.rs"] mod budget_day; budget_day::SCENARIO },
     growth_basic::SCENARIO,
