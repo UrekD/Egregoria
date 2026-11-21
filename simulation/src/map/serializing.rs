@@ -1,3 +1,4 @@
+use geom::Vec2;
 use serde::{Deserialize, Serialize};
 
 use crate::map::{
@@ -42,6 +43,8 @@ impl<'de> Deserialize<'de> for Map {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         let map = SerializedMap::deserialize(deserializer)?;
         map.validate_references()
+            .map_err(serde::de::Error::custom)?;
+        map.validate_spatial_geometry()
             .map_err(serde::de::Error::custom)?;
         Ok(map.into_map())
     }
@@ -96,6 +99,50 @@ impl SerializedMap {
         Ok(())
     }
 
+    fn validate_spatial_geometry(&self) -> Result<(), String> {
+        for (id, road) in self.roads.iter() {
+            if !road.width.is_finite() || road.width < 0.0 {
+                return Err(format!("road {id:?} has an invalid width"));
+            }
+            let radius = Vec2::splat(road.width * 0.5);
+            if road.points.len() < 2
+                || !road.points.length().is_finite()
+                || road.points.iter().any(|point| {
+                    !point.is_finite()
+                        || !(point.xy() - radius).is_finite()
+                        || !(point.xy() + radius).is_finite()
+                })
+            {
+                return Err(format!("road {id:?} has an invalid polyline"));
+            }
+        }
+        for (id, intersection) in self.intersections.iter() {
+            let bounds = intersection.bcircle();
+            let radius = Vec2::splat(bounds.radius);
+            if bounds.radius < 0.0
+                || !(bounds.center - radius).is_finite()
+                || !(bounds.center + radius).is_finite()
+            {
+                return Err(format!("intersection {id:?} has invalid spatial bounds"));
+            }
+        }
+        for (id, building) in self.buildings.iter() {
+            let points = match &building.zone {
+                Some(zone) => zone.poly.as_slice(),
+                None => &building.obb.corners,
+            };
+            if points.iter().any(|point| !point.is_finite()) {
+                return Err(format!("building {id:?} has invalid spatial bounds"));
+            }
+        }
+        for (id, lot) in self.lots.iter() {
+            if lot.shape.corners.iter().any(|point| !point.is_finite()) {
+                return Err(format!("lot {id:?} has invalid spatial bounds"));
+            }
+        }
+        Ok(())
+    }
+
     fn into_map(self) -> Map {
         let spatial_map = mk_spatial_map(&self);
         let mut m = Map {
@@ -135,12 +182,11 @@ fn mk_spatial_map(m: &SerializedMap) -> SpatialMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{LanePatternBuilder, MapProject};
+    use crate::map::{LanePatternBuilder, MapProject, RoadID};
     use common::saveload::{Bincode, Encoder};
-    use geom::vec3;
+    use geom::{vec3, PolyLine3, Vec3};
 
-    #[test]
-    fn corrupt_serialized_map_references_are_rejected() {
+    fn serialized_map_with_road() -> (SerializedMap, RoadID) {
         let mut map = Map::empty();
         let (_, road) = map
             .make_connection(
@@ -151,9 +197,34 @@ mod tests {
             )
             .unwrap();
 
-        let mut serialized = SerializedMap::from(&map);
-        serialized.intersections.remove(map.get(road).unwrap().src);
+        (SerializedMap::from(&map), road)
+    }
+
+    #[test]
+    fn corrupt_serialized_map_references_are_rejected() {
+        let (mut serialized, road) = serialized_map_with_road();
+        serialized.intersections.remove(serialized.roads[road].src);
         let bytes = Bincode::encode(&serialized).unwrap();
         assert!(Bincode::decode::<Map>(&bytes).is_err());
+    }
+
+    #[test]
+    fn invalid_serialized_road_polylines_are_rejected() {
+        let (mut serialized, road) = serialized_map_with_road();
+        for points in [
+            &[][..],
+            &[Vec3::ZERO],
+            &[Vec3::ZERO, vec3(1.0, 0.0, f32::NAN)],
+        ] {
+            // Encode the fields directly because PolyLine3::new requires at least one point.
+            let polyline = Bincode::encode(&(points, 0.0_f32)).unwrap();
+            serialized.roads[road].points = Bincode::decode::<PolyLine3>(&polyline).unwrap();
+
+            let bytes = Bincode::encode(&serialized).unwrap();
+            let error = Bincode::decode::<Map>(&bytes)
+                .err()
+                .expect("invalid polyline");
+            assert!(error.to_string().contains("polyline"), "{error}");
+        }
     }
 }

@@ -18,7 +18,7 @@ pub fn save_dir() -> &'static Path {
     SAVE_DIR.get().map_or(Path::new("world"), PathBuf::as_path)
 }
 
-/// Move a world and its companion files aside without replacing any existing backup.
+/// Move a world and its replay aside without replacing any existing backup.
 pub fn backup_save_files(name: &str, version: Option<&str>) -> Result<Vec<PathBuf>> {
     backup_save_files_in(save_dir(), name, version)
 }
@@ -34,30 +34,30 @@ fn backup_save_files_in(dir: &Path, name: &str, version: Option<&str>) -> Result
                     .all(|b| b.is_ascii_alphanumeric() || b".-+_".contains(&b))
         })
         .unwrap_or("unknown");
+    // Move the replay and legacy save before the compressed save so a failed
+    // backup can be retried at startup while the refused save is still in place.
+    let save_files = [
+        format!("{name}_replay.{}", JSONPretty::EXTENSION),
+        format!("{name}_replay.{}", CompressedBincode::EXTENSION),
+        format!("{name}.{}", Bincode::EXTENSION),
+        format!("{name}.{}", CompressedBincode::EXTENSION),
+    ];
     let mut files = Vec::new();
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
         let filename = entry.file_name();
-        let Some(name) = filename
-            .to_str()
-            .filter(|file| file.starts_with(name) && !file.ends_with(".bak"))
-        else {
+        let Some(index) = save_files.iter().position(|name| filename == name.as_str()) else {
             continue;
         };
         let kind = entry.file_type()?;
         if kind.is_file() || kind.is_symlink() {
-            files.push((name.to_owned(), entry.path()));
+            files.push((index, entry.path()));
         }
     }
-    // Move the replay and companion files before the main save. A failed backup
-    // can then be retried at startup while the refused save is still in place.
-    let compressed = format!("{name}.{}", CompressedBincode::EXTENSION);
-    let legacy = format!("{name}.{}", Bincode::EXTENSION);
-    files.sort_by(|(a, _), (b, _)| {
-        (a == &compressed, a == &legacy, a).cmp(&(b == &compressed, b == &legacy, b))
-    });
+    files.sort_by_key(|(index, _)| *index);
     let mut backups = Vec::with_capacity(files.len());
-    for (name, source) in files {
+    for (index, source) in files {
+        let name = &save_files[index];
         for suffix in 0.. {
             let filename = if suffix == 0 {
                 format!("{name}.{version}.bak")
@@ -306,24 +306,36 @@ mod backup_tests {
             ("world.bc", "legacy"),
             ("world.zip", "current"),
             ("world_replay.json", "replay"),
+            ("world_replay.zip", "compressed replay"),
             ("world.zip.0.6.1.bak", "earlier backup"),
             ("settings.json", "settings"),
+            ("world2.zip", "other world"),
+            ("world-notes.txt", "notes"),
         ] {
             std::fs::write(dir.join(name), bytes).unwrap();
         }
 
         let backups = backup_save_files_in(&dir, "world", Some("0.6.1")).unwrap();
-        assert_eq!(backups.len(), 3);
+        for (name, bytes) in [("world2.zip", "other world"), ("world-notes.txt", "notes")] {
+            assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), bytes);
+        }
+        assert_eq!(backups.len(), 4);
         for (name, bytes) in [
             ("world.bc.0.6.1.bak", "legacy"),
             ("world.zip.0.6.1.1.bak", "current"),
             ("world_replay.json.0.6.1.bak", "replay"),
+            ("world_replay.zip.0.6.1.bak", "compressed replay"),
             ("world.zip.0.6.1.bak", "earlier backup"),
             ("settings.json", "settings"),
         ] {
             assert_eq!(std::fs::read_to_string(dir.join(name)).unwrap(), bytes);
         }
-        for name in ["world.bc", "world.zip", "world_replay.json"] {
+        for name in [
+            "world.bc",
+            "world.zip",
+            "world_replay.json",
+            "world_replay.zip",
+        ] {
             assert!(!dir.join(name).exists());
         }
 
