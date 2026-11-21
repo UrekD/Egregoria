@@ -477,7 +477,7 @@ mod tests {
 
         let b = m
             .build_special_building(
-                &OBB::ZERO,
+                &OBB::new(Vec2::new(0.5, 30.0), Vec2::X, 10.0, 10.0),
                 BuildingKind::ExternalTrading,
                 BuildingGen::NoWalkway {
                     door_pos: Vec2::ZERO,
