@@ -382,6 +382,9 @@ impl WorldCommand {
                         if id.is_growable() {
                             return Err(Rejection::InvalidBuilding);
                         }
+                        if id.is_service() && connected_road.is_none() {
+                            return Err(Rejection::MissingReference);
+                        }
                         proto.zone.is_some()
                     }
                     BuildingKind::RailFreightStation(id) => {

@@ -10,9 +10,11 @@ use crate::Simulation;
 #[macro_use]
 pub mod desire;
 
+pub mod events;
 pub mod freight_station;
 pub mod goods_company;
 pub mod growth;
+pub mod happiness;
 pub mod human;
 pub mod lifecycle;
 pub mod residence;

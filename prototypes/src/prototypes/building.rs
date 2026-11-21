@@ -33,6 +33,10 @@ pub struct BuildingPrototype {
     pub price: Money,
     pub power_consumption: Option<Power>,
     pub power_production: Option<Power>,
+    pub water_consumption: Option<f32>,
+    pub water_production: Option<f32>,
+    pub sewage_capacity: Option<f32>,
+    pub pollution: Option<f32>,
 }
 
 impl Prototype for BuildingPrototype {
@@ -51,6 +55,10 @@ impl Prototype for BuildingPrototype {
             price: get_lua(table, "price")?,
             power_consumption: get_lua(table, "power_consumption")?,
             power_production: get_lua(table, "power_production")?,
+            water_consumption: get_lua(table, "water_consumption")?,
+            water_production: get_lua(table, "water_production")?,
+            sewage_capacity: get_lua(table, "sewage_capacity")?,
+            pollution: get_lua(table, "pollution")?,
         })
     }
 

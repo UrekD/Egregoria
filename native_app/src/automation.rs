@@ -17,7 +17,7 @@ use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::{CommandOutcomes, WorldCommand, WorldCommands};
 use simulation::Simulation;
 
-use crate::gui::{top_demand_driver, zoning::ZONES, GuiState, Tool};
+use crate::gui::{overlays::OverlayMode, top_demand_driver, zoning::ZONES, GuiState, Tool};
 use crate::uiworld::{ReceivedCommands, UiWorld};
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
@@ -55,6 +55,7 @@ enum Step {
     },
     Builder(Builder),
     SelectTool(Tool),
+    SetOverlay(OverlayMode),
     OpenWindow(String),
     Screenshot(String),
     DumpState(String),
@@ -403,6 +404,7 @@ impl Automation {
                 orbit.camera.dist = dist;
             }
             Step::SelectTool(tool) => *uiw.write::<Tool>() = tool,
+            Step::SetOverlay(mode) => *uiw.write::<OverlayMode>() = mode,
             Step::OpenWindow(name) => {
                 let mut gui = uiw.write::<GuiState>();
                 let (_, open) = gui
@@ -628,6 +630,16 @@ impl CommandSink for LiveCommandSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "P2e overlays"]
+    fn p2e_set_overlay_step_decodes() {
+        let step = JSON::decode::<Step>(br#"{"SetOverlay":{"Coverage":"Fire"}}"#).unwrap();
+        assert!(matches!(
+            step,
+            Step::SetOverlay(OverlayMode::Coverage(prototypes::ServiceKind::Fire))
+        ));
+    }
 
     #[test]
     fn p1e_auto_steps_decode() {

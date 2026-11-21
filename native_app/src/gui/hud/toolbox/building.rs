@@ -12,11 +12,11 @@ use engine::{Context, TextureBuilder};
 use geom::{Camera, Degrees, Polygon, Vec3};
 use goryak::{
     blur_bg, fixed_spacer, image_button, is_hovered, mincolumn, minrow, on_secondary_container,
-    padxy, primary, secondary_container, textc, titlec, HorizScrollSize,
+    padxy, primary, secondary_container, selectable_label_primary, textc, titlec, HorizScrollSize,
 };
 use prototypes::{
-    prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyID, GoodsCompanyPrototype,
-    GrowableCompanyID, Prototype, RenderAsset,
+    prototypes_iter, BuildingPrototypeID, GoodsCompanyID, GoodsCompanyPrototype, Prototype,
+    RenderAsset,
 };
 use simulation::map::{BuildingKind, Zone};
 use simulation::world_command::WorldCommand;
@@ -25,7 +25,32 @@ use crate::gui::item_icon_yakui;
 use crate::gui::specialbuilding::{SpecialBuildKind, SpecialBuildingResource};
 use crate::uiworld::UiWorld;
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum BuildingTab {
+    #[default]
+    Companies,
+    Services,
+}
+
 pub fn special_building_properties(uiw: &UiWorld) {
+    let mut tab = uiw.write::<BuildingTab>();
+    mincolumn(5.0, || {
+        minrow(5.0, || {
+            for (choice, label) in [
+                (BuildingTab::Companies, "Companies"),
+                (BuildingTab::Services, "Services"),
+            ] {
+                if selectable_label_primary(*tab == choice, label).clicked && *tab != choice {
+                    *tab = choice;
+                    uiw.write::<SpecialBuildingResource>().opt = None;
+                }
+            }
+        });
+        building_choices(uiw, *tab);
+    });
+}
+
+fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
     let mut state = uiw.write::<SpecialBuildingResource>();
     let icons = uiw.read::<BuildingIcons>();
 
@@ -39,8 +64,8 @@ pub fn special_building_properties(uiw: &UiWorld) {
             l.show(|| {
                 let tooltip_active = use_state(|| Option::<(GoodsCompanyID, Instant)>::None);
                 for descr in prototypes_iter::<GoodsCompanyPrototype>().filter(|company| {
-                    !try_prototype(GrowableCompanyID::from(company.id))
-                        .is_some_and(|proto| proto.growable)
+                    !company.id.is_growable()
+                        && company.id.is_service() == (tab == BuildingTab::Services)
                 }) {
                     let Some(tex_id) = icons.ids.get(&descr.parent().id) else {
                         continue;

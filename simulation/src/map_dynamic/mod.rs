@@ -1,13 +1,19 @@
 mod binfos;
+mod coverage;
 mod dispatch;
 mod electricity;
+mod environment;
 mod itinerary;
 mod parking;
 mod router;
+mod utilities;
 
 pub use binfos::*;
+pub use coverage::*;
 pub use dispatch::*;
 pub use electricity::*;
+pub use environment::*;
 pub use itinerary::*;
 pub use parking::*;
 pub use router::*;
+pub use utilities::*;

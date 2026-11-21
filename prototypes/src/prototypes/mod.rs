@@ -7,6 +7,7 @@ crate::gen_prototypes!(
     mod growable_company: GrowableCompanyID = GrowableCompanyPrototype => GoodsCompanyID,
     mod leisure:       LeisurePrototypeID  = LeisurePrototype => BuildingPrototypeID,
     mod solar:         SolarPanelID        = SolarPanelPrototype => GoodsCompanyID,
+    mod service:       ServiceID           = ServicePrototype => GoodsCompanyID,
 
     mod vehicle:       VehiclePrototypeID = VehiclePrototype,
     mod road_vehicle:  RoadVehicleID      = RoadVehiclePrototype => VehiclePrototypeID,

@@ -22,6 +22,7 @@ pub enum BudgetCategory {
     Tax(ZoneKind),
     RoadUpkeep,
     SpecialBuildingUpkeep,
+    ServiceUpkeep,
 }
 
 #[derive(Default, Serialize, Deserialize)]

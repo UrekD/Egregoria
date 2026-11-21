@@ -7,6 +7,7 @@ local function residence(density, level, capacity, power, lot_size_min)
         level = level,
         capacity = capacity,
         power_consumption = power,
+        water_consumption = capacity,
         lot_size_min = lot_size_min,
         bgen = "house",
         size = 20,

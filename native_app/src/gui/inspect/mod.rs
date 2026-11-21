@@ -13,6 +13,7 @@ use slotmapd::Key;
 
 mod inspect_building;
 mod inspect_human;
+mod inspect_needs;
 mod inspect_train;
 mod inspect_vehicle;
 

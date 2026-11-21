@@ -17,7 +17,7 @@ use std::borrow::Cow;
 use yakui::widgets::Pad;
 use yakui::Vec2;
 
-use crate::gui::inspect::entity_link;
+use crate::gui::inspect::{entity_link, inspect_needs};
 use crate::gui::item_icon_yakui;
 use crate::gui::zoning::zone_name;
 use crate::uiworld::UiWorld;
@@ -79,6 +79,8 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
             BuildingKind::TrainStation => {}
             BuildingKind::ExternalTrading => {}
         };
+
+        inspect_needs::render(sim, id);
 
         if let Some(ref zone) = building.zone {
             let mut cpy = zone.filldir;
@@ -149,7 +151,7 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     let map = sim.map();
     let retail = map.spatial_map().query_around(b.obb.center(), 1500.0, ProjectFilter::BUILDING).any(|project| {
         let Some(store) = project.as_building().and_then(|id| map.get(id)) else { return false };
-        matches!(store.kind, BuildingKind::GoodsCompany(id) if id.prototype().kind == CompanyKind::Store)
+        matches!(store.kind, BuildingKind::GoodsCompany(id) if !id.is_service() && id.prototype().kind == CompanyKind::Store)
             && store.obb.center().distance2(b.obb.center()) <= 1500.0 * 1500.0
     });
     need("Store within 1.5 km", retail);

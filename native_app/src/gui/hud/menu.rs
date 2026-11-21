@@ -36,6 +36,7 @@ pub fn menu_bar(uiworld: &UiWorld, sim: &Simulation) {
                                     on_primary_container(),
                                     format!("Money: {}", sim.read::<Government>().money),
                                 );
+                                crate::gui::overlays::selector(uiworld);
                             });
                         });
                     });

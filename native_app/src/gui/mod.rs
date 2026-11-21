@@ -10,6 +10,7 @@ use std::time::Instant;
 pub mod follow;
 mod hud;
 pub mod inspect;
+pub(crate) mod overlays;
 mod textures;
 mod tools;
 

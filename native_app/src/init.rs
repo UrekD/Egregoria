@@ -6,11 +6,12 @@ use crate::gui::chat::GUIChatState;
 use crate::gui::follow::FollowEntity;
 use crate::gui::keybinds::KeybindState;
 use crate::gui::lotbrush::LotBrushResource;
+use crate::gui::overlays::OverlayMode;
 use crate::gui::roadbuild::RoadBuildResource;
 use crate::gui::roadeditor::RoadEditorResource;
 use crate::gui::specialbuilding::SpecialBuildingResource;
 use crate::gui::terraforming::TerraformingResource;
-use crate::gui::toolbox::building::BuildingIcons;
+use crate::gui::toolbox::building::{BuildingIcons, BuildingTab};
 use crate::gui::windows::economy::EconomyState;
 use crate::gui::windows::load::LoadState;
 use crate::gui::windows::settings::{AutoSaveEvery, Settings, SettingsState};
@@ -54,6 +55,7 @@ pub fn init() {
     register_resource_noserialize::<InputMap>();
     register_resource_noserialize::<InspectedEntity>();
     register_resource_noserialize::<InspectedBuilding>();
+    register_resource_noserialize::<OverlayMode>();
     register_resource_noserialize::<NetworkState>();
     register_resource_noserialize::<PotentialCommands>();
     register_resource_noserialize::<ZoneEditState>();
@@ -72,6 +74,7 @@ pub fn init() {
     register_resource_noserialize::<EconomyState>();
     register_resource_noserialize::<SettingsState>();
     register_resource_noserialize::<BuildingIcons>();
+    register_resource_noserialize::<BuildingTab>();
     register_resource_noserialize::<KeybindState>();
 }
 

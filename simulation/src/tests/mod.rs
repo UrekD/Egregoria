@@ -12,6 +12,7 @@ use geom::{Vec2, Vec3};
 use std::sync::Once;
 
 mod lifecycle;
+mod p2_services;
 mod test_iso;
 mod vehicles;
 
