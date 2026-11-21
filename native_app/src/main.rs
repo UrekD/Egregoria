@@ -13,6 +13,7 @@ extern crate inline_tweak;
 mod uiworld;
 
 mod audio;
+mod automation;
 mod debug_gui;
 mod game_loop;
 mod gui;
@@ -26,6 +27,9 @@ fn main() {
     profiling::tracy_client::Client::start();
     profiling::register_thread!("Main Thread");
 
+    if let Err(error) = automation::configure() {
+        automation::fail(&error);
+    }
     engine::framework::init();
     init::init();
 

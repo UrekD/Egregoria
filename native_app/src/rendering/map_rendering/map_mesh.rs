@@ -25,6 +25,8 @@ pub struct MapMeshHandler {
     cache: FastMap<SubscriberChunkID, CachedObj>,
     road_sub: MapSubscriber,
     building_sub: MapSubscriber,
+    map_version: Option<u64>,
+    rebuilt_version: Option<u64>,
 }
 
 #[derive(Default)]
@@ -175,7 +177,18 @@ impl MapMeshHandler {
             cache: Default::default(),
             road_sub: sim.map().subscribe(UpdateType::Road),
             building_sub: sim.map().subscribe(UpdateType::Building),
+            map_version: None,
+            rebuilt_version: None,
         }
+    }
+
+    /// Tag this frame's map snapshot for the automation barrier.
+    pub fn set_map_version(&mut self, tick: u64) {
+        self.map_version = Some(tick);
+    }
+
+    pub fn rebuilt_version(&self) -> Option<u64> {
+        self.rebuilt_version
     }
 
     pub fn latest_mesh(
@@ -258,6 +271,7 @@ impl MapMeshHandler {
                 self.cache.remove(&chunk);
             }
         }
+        self.rebuilt_version = self.map_version.take();
 
         profiling::scope!("prepare map mesh");
         for v in self.cache.values() {
@@ -413,9 +427,7 @@ impl MapBuilders {
                     LinearColor::WHITE,
                     (w, h),
                 );
-            }
-
-            if let Some(x) = self.buildmeshes.get_mut(&building.kind) {
+            } else if let Some(x) = self.buildmeshes.get_mut(&building.kind) {
                 let pos = building.obb.center().z(building.height);
                 let dir = building.obb.axis()[0].normalize().z0();
 
@@ -424,7 +436,56 @@ impl MapBuilders {
                     dir,
                     tint: LinearColor::WHITE,
                 });
+            } else if !building
+                .mesh
+                .faces
+                .iter()
+                .flat_map(|(face, _)| face)
+                .any(|point| point.z > building.height + 0.2)
+            {
+                self.building_box(building);
             }
+        }
+    }
+
+    fn building_box(&mut self, building: &Building) {
+        let [width, depth] = building.obb.axis().map(Vec2::mag);
+        let height = (width.min(depth) * 0.45).clamp(3.0, 18.0);
+        let mut corners = building.obb.corners;
+        if (corners[1] - corners[0])
+            .z0()
+            .cross((corners[2] - corners[0]).z0())
+            .z
+            < 0.0
+        {
+            corners.reverse();
+        }
+        let base = corners.map(|p| p.z(building.height));
+        let roof = corners.map(|p| p.z(building.height + height));
+        let mut push_face = |face: [Vec3; 4], color: LinearColor| {
+            let Some(normal) = (face[1] - face[0]).cross(face[2] - face[0]).try_normalize() else {
+                return;
+            };
+            self.houses_mesh.extend_with(None, |vertices, add_index| {
+                vertices.extend(face.map(|position| MeshVertex {
+                    position: position.into(),
+                    normal,
+                    uv: [0.0; 2],
+                    color: color.into(),
+                    tangent: [0.0; 4],
+                }));
+                for index in [0, 1, 2, 0, 2, 3] {
+                    add_index(index);
+                }
+            });
+        };
+        push_face(roof, LinearColor::new(0.55, 0.48, 0.40, 1.0));
+        for i in 0..4 {
+            let next = (i + 1) % 4;
+            push_face(
+                [base[i], base[next], roof[next], roof[i]],
+                LinearColor::new(0.43, 0.36, 0.29, 1.0),
+            );
         }
     }
 

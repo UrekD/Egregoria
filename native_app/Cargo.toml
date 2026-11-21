@@ -7,6 +7,7 @@ edition = "2021"
 [dependencies]
 bytemuck      = "1.7.2"
 simulation    = { path = "../simulation" }
+scenarios     = { path = "../scenarios" }
 geom          = { path = "../geom" }
 engine        = { path = "../engine", features = ["yakui"] }
 common        = { path = "../common" }

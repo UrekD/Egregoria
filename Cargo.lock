@@ -1874,6 +1874,7 @@ dependencies = [
  "profiling",
  "prototypes",
  "rayon",
+ "scenarios",
  "serde",
  "simulation",
  "slotmapd",

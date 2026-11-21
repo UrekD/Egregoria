@@ -1,5 +1,6 @@
 #![allow(unused)]
 use crate::uiworld::{SaveLoadState, UiWorld};
+use common::saveload::{Encoder, JSON};
 use egui::{Color32, DroppedFile, Widget};
 use goryak::{
     button_primary, error, minrow, on_primary, on_secondary_container, primary, textc, ProgressBar,
@@ -22,7 +23,7 @@ impl Default for LoadState {
         Self {
             curpath: None,
             load_fail: String::new(),
-            has_save: std::fs::metadata("world/world_replay.json").is_ok(),
+            has_save: JSON::filename("world_replay").is_file(),
         }
     }
 }
@@ -39,13 +40,14 @@ pub fn load(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
     }
     .show(|| {
         let mut state = uiw.write::<LoadState>();
+        let replay_path = JSON::filename("world_replay");
 
         if button_primary("New Game").show().clicked {
             uiw.write::<SaveLoadState>().please_load_sim = Some(Simulation::new(true));
         }
 
         if state.has_save {
-            if button_primary("Load world/world_replay.json")
+            if button_primary(format!("Load {}", replay_path.display()))
                 .show()
                 .clicked
             {
@@ -65,7 +67,7 @@ pub fn load(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
         } else {
             textc(
                 on_secondary_container(),
-                "No replay found in world/world_replay.json",
+                format!("No replay found in {}", replay_path.display()),
             );
         }
 
@@ -122,4 +124,17 @@ pub fn load(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
             textc(error(), state.load_fail.clone());
         }
     });
+}
+
+impl super::GUIWindows {
+    pub(crate) fn window_states(&mut self) -> impl Iterator<Item = (&'static str, &mut bool)> {
+        [
+            ("Economy", &mut self.economy_open),
+            ("Settings", &mut self.settings_open),
+            ("Load", &mut self.load_open),
+            #[cfg(feature = "multiplayer")]
+            ("Network", &mut self.network_open),
+        ]
+        .into_iter()
+    }
 }

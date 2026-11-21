@@ -1,11 +1,24 @@
-use crate::ScenarioCtx;
 use geom::{vec2, Polygon, Vec2, OBB};
 use prototypes::{try_prototype, GoodsCompanyID, Size2D};
 use simulation::map::{
     BuildingID, BuildingKind, LanePatternBuilder, Map, ProjectFilter, ProjectKind, RoadID, Zone,
 };
 use simulation::world_command::WorldCommand;
+use simulation::Simulation;
 use std::collections::BTreeSet;
+
+pub trait CommandSink {
+    fn sim(&self) -> &Simulation;
+
+    /// Queue commands for the next simulation tick.
+    fn submit(&mut self, commands: &[WorldCommand]);
+
+    /// Whether commands have been queued but have yet to be applied.
+    fn has_pending_commands(&self) -> bool;
+
+    /// Advance at least one tick and return after applying all queued commands.
+    fn flush(&mut self);
+}
 
 #[derive(Debug, Default)]
 pub struct GridCity {
@@ -13,17 +26,25 @@ pub struct GridCity {
 }
 
 /// Construct a grid with `nx` by `ny` junction positions, starting at `origin`.
-pub fn grid_city(ctx: &mut ScenarioCtx, origin: Vec2, nx: u32, ny: u32, spacing: f32) -> GridCity {
+pub fn grid_city(
+    ctx: &mut dyn CommandSink,
+    origin: Vec2,
+    nx: u32,
+    ny: u32,
+    spacing: f32,
+) -> GridCity {
     if nx == 0 || ny == 0 || !origin.is_finite() || !spacing.is_finite() || spacing < 1.0 {
         return GridCity::default();
     }
 
-    ctx.flush_commands();
-    let before: BTreeSet<_> = ctx.sim.map().roads().keys().collect();
+    if ctx.has_pending_commands() {
+        ctx.flush();
+    }
+    let before: BTreeSet<_> = ctx.sim().map().roads().keys().collect();
     let pattern = LanePatternBuilder::new().build();
     let mut connect = |x, y, next_x, next_y| {
         let (from, to) = {
-            let map = ctx.sim.map();
+            let map = ctx.sim().map();
             let project = |x, y| {
                 let xy = origin + vec2(x as f32, y as f32) * spacing;
                 let z = map.environment.height(xy).unwrap_or_default();
@@ -51,7 +72,7 @@ pub fn grid_city(ctx: &mut ScenarioCtx, origin: Vec2, nx: u32, ny: u32, spacing:
             inter: None,
             pat: pattern.clone(),
         }]);
-        ctx.run_ticks(1);
+        ctx.flush();
     };
 
     // Close each block before extending the next so the map keeps its junctions.
@@ -79,7 +100,7 @@ pub fn grid_city(ctx: &mut ScenarioCtx, origin: Vec2, nx: u32, ny: u32, spacing:
     }
 
     let mut roads: Vec<_> = ctx
-        .sim
+        .sim()
         .map()
         .roads()
         .keys()
@@ -90,14 +111,16 @@ pub fn grid_city(ctx: &mut ScenarioCtx, origin: Vec2, nx: u32, ny: u32, spacing:
 }
 
 /// Build at most `max` houses on existing lots in lot ID order, returning their building IDs.
-pub fn fill_houses(ctx: &mut ScenarioCtx, max: usize) -> Vec<BuildingID> {
+pub fn fill_houses(ctx: &mut dyn CommandSink, max: usize) -> Vec<BuildingID> {
     if max == 0 {
         return Vec::new();
     }
 
-    ctx.flush_commands();
+    if ctx.has_pending_commands() {
+        ctx.flush();
+    }
     let (mut lots, before) = {
-        let map = ctx.sim.map();
+        let map = ctx.sim().map();
         let lots: Vec<_> = map.lots().keys().collect();
         let buildings: BTreeSet<_> = map.buildings().keys().collect();
         (lots, buildings)
@@ -110,10 +133,10 @@ pub fn fill_houses(ctx: &mut ScenarioCtx, max: usize) -> Vec<BuildingID> {
 
     let commands: Vec<_> = lots.into_iter().map(WorldCommand::MapBuildHouse).collect();
     ctx.submit(&commands);
-    ctx.run_ticks(1);
+    ctx.flush();
 
     let mut houses: Vec<_> = ctx
-        .sim
+        .sim()
         .map()
         .buildings()
         .iter()
@@ -126,14 +149,20 @@ pub fn fill_houses(ctx: &mut ScenarioCtx, max: usize) -> Vec<BuildingID> {
 }
 
 /// Place a company at a clear, sidewalk-connected site near `near`.
-pub fn place_company(ctx: &mut ScenarioCtx, proto_name: &str, near: Vec2) -> Option<BuildingID> {
+pub fn place_company(
+    ctx: &mut dyn CommandSink,
+    proto_name: &str,
+    near: Vec2,
+) -> Option<BuildingID> {
     let proto = try_prototype(GoodsCompanyID::new(proto_name))?;
     if !near.is_finite() {
         return None;
     }
 
-    ctx.flush_commands();
-    let (road, obb) = company_site(&ctx.sim.map(), near, proto.size)?;
+    if ctx.has_pending_commands() {
+        ctx.flush();
+    }
+    let (road, obb) = company_site(&ctx.sim().map(), near, proto.size)?;
     let kind = BuildingKind::GoodsCompany(proto.id);
     ctx.submit(&[WorldCommand::MapBuildSpecialBuilding {
         pos: obb,
@@ -145,9 +174,9 @@ pub fn place_company(ctx: &mut ScenarioCtx, proto_name: &str, near: Vec2) -> Opt
             .map(|_| Zone::new(Polygon::from(obb.corners.as_slice()), Vec2::X)),
         connected_road: Some(road),
     }]);
-    ctx.run_ticks(1);
+    ctx.flush();
 
-    let map = ctx.sim.map();
+    let map = ctx.sim().map();
     let id = map
         .spatial_map()
         .query(obb.center(), ProjectFilter::BUILDING)
@@ -203,4 +232,43 @@ fn company_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
         }
     }
     best.map(|(_, id, obb)| (id, obb))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{builtin::smoke, ScenarioCtx};
+
+    #[test]
+    fn command_sink_applies_queued_roads_on_flush() {
+        let mut ctx = ScenarioCtx::new(smoke::OPTIONS);
+        let sink: &mut dyn CommandSink = &mut ctx;
+        let start = sink.sim().get_tick();
+        let roads = sink.sim().map().roads().len();
+        let map = sink.sim().map();
+        let project = |x, y| {
+            let pos = vec2(x, y);
+            let z = map.environment.height(pos).unwrap();
+            map.project(pos.z(z), 0.0, ProjectFilter::INTER | ProjectFilter::ROAD)
+        };
+        let (from, to) = (project(700.0, 700.0), project(860.0, 700.0));
+        drop(map);
+
+        sink.submit(&[WorldCommand::MapMakeConnection {
+            from,
+            to,
+            inter: None,
+            pat: LanePatternBuilder::new().build(),
+        }]);
+        assert_eq!(sink.sim().get_tick(), start);
+        assert_eq!(sink.sim().map().roads().len(), roads);
+
+        sink.flush();
+        assert_eq!(sink.sim().get_tick(), start + 1);
+        assert_eq!(sink.sim().map().roads().len(), roads + 1);
+
+        let grid = grid_city(sink, vec2(700.0, 700.0), 2, 2, 160.0);
+        assert_eq!(grid.roads.len(), 3);
+        assert_eq!(sink.sim().get_tick(), start + 4);
+    }
 }

@@ -1,3 +1,4 @@
+use crate::builders::CommandSink;
 use crate::MetricSample;
 use simulation::economy::Government;
 use simulation::utils::scheduler::SeqSchedule;
@@ -72,12 +73,6 @@ impl ScenarioCtx {
                     checkpoints.push((tick, self.sim.hashes()));
                 }
             }
-        }
-    }
-
-    pub(crate) fn flush_commands(&mut self) {
-        if !self.queued.is_empty() {
-            self.run_ticks(1);
         }
     }
 
@@ -214,4 +209,22 @@ fn compare_checkpoint(first: &Checkpoint, second: &Checkpoint) -> Result<(), Str
         ));
     }
     Ok(())
+}
+
+impl CommandSink for ScenarioCtx {
+    fn sim(&self) -> &Simulation {
+        &self.sim
+    }
+
+    fn submit(&mut self, commands: &[WorldCommand]) {
+        ScenarioCtx::submit(self, commands);
+    }
+
+    fn has_pending_commands(&self) -> bool {
+        !self.queued.is_empty()
+    }
+
+    fn flush(&mut self) {
+        self.run_ticks(1);
+    }
 }

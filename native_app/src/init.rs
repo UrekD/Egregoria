@@ -13,7 +13,7 @@ use crate::gui::terraforming::TerraformingResource;
 use crate::gui::toolbox::building::BuildingIcons;
 use crate::gui::windows::economy::EconomyState;
 use crate::gui::windows::load::LoadState;
-use crate::gui::windows::settings::{Settings, SettingsState};
+use crate::gui::windows::settings::{AutoSaveEvery, Settings, SettingsState};
 use crate::gui::zoneedit::ZoneEditState;
 use crate::gui::{
     ErrorTooltip, ExitState, GuiState, InspectedBuilding, InspectedEntity, PotentialCommands,
@@ -71,6 +71,12 @@ pub fn init() {
     register_resource_noserialize::<SettingsState>();
     register_resource_noserialize::<BuildingIcons>();
     register_resource_noserialize::<KeybindState>();
+}
+
+pub(crate) fn configure_script_settings(uiw: &UiWorld) {
+    let mut settings = uiw.write::<Settings>();
+    settings.time_warp = 0;
+    settings.auto_save_every = AutoSaveEvery::Never;
 }
 
 pub struct InitFunc {

@@ -1,4 +1,5 @@
 use rayon::ThreadPoolBuilder;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -122,6 +123,10 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                         last_update = Instant::now();
                         ctx.delta = d.as_secs_f32();
                         state.update(&mut ctx);
+                        if ctx.exit_requested {
+                            target.exit();
+                            return;
+                        }
 
                         let (mut enc, view) = ctx.gfx.start_frame(&sco);
                         (ctx.times.render_time, ctx.times.gui_time) = ctx
@@ -137,6 +142,10 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                             });
 
                         ctx.gfx.finish_frame(enc);
+                        if let Some(path) = ctx.screenshot_request.take() {
+                            ctx.screenshot_result =
+                                Some(ctx.gfx.capture_screenshot(&sco.texture, &path));
+                        }
                         let (icon, changed) = get_cursor_icon();
                         if changed {
                             ctx.gfx.window.set_cursor_icon(icon);
@@ -251,6 +260,9 @@ pub struct Context {
     pub keybind_mode: bool,
     pub times: EngineTimes,
     pub egui: EguiWrapper,
+    screenshot_request: Option<PathBuf>,
+    screenshot_result: Option<Result<(), String>>,
+    exit_requested: bool,
     #[cfg(feature = "yakui")]
     pub yakui: crate::yakui::YakuiWrapper,
 }
@@ -269,9 +281,30 @@ impl Context {
             keybind_mode: false,
             times: EngineTimes::default(),
             egui,
+            screenshot_request: None,
+            screenshot_result: None,
+            exit_requested: false,
             #[cfg(feature = "yakui")]
             yakui: crate::yakui::YakuiWrapper::new(&gfx, &gfx.window),
             gfx,
         }
+    }
+
+    /// Capture the next rendered frame after its UI pass.
+    pub fn request_screenshot(&mut self, path: PathBuf) -> Result<(), String> {
+        if self.screenshot_request.is_some() || self.screenshot_result.is_some() {
+            return Err("a screenshot is already pending".into());
+        }
+        self.screenshot_request = Some(path);
+        Ok(())
+    }
+
+    /// Take the result once readback and PNG writing have finished.
+    pub fn take_screenshot_result(&mut self) -> Option<Result<(), String>> {
+        self.screenshot_result.take()
+    }
+
+    pub fn request_exit(&mut self) {
+        self.exit_requested = true;
     }
 }

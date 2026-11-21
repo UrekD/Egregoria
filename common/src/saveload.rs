@@ -3,10 +3,19 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use std::fs::File;
 use std::io;
-use std::io::{BufReader, BufWriter, ErrorKind, Read, Write};
+use std::io::{BufReader, BufWriter, ErrorKind, Read, Result, Write};
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
-fn create_file(path: &str) -> Option<File> {
-    File::create(path).map_err(|e| log::error!("{}", e)).ok()
+static SAVE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Override the root for saves and persisted settings before the first use.
+pub fn set_save_dir(path: PathBuf) -> std::result::Result<(), PathBuf> {
+    SAVE_DIR.set(path)
+}
+
+pub fn save_dir() -> &'static Path {
+    SAVE_DIR.get().map_or(Path::new("world"), PathBuf::as_path)
 }
 
 pub fn walkdir(dir: &Path) -> impl Iterator<Item = PathBuf> {
@@ -25,9 +34,6 @@ pub fn walkdir(dir: &Path) -> impl Iterator<Item = PathBuf> {
     paths.into_iter()
 }
 
-fn open_file(path: &str) -> Result<File> {
-    File::open(path)
-}
 pub trait Encoder {
     const EXTENSION: &'static str;
 
@@ -46,12 +52,12 @@ pub trait Encoder {
         Self::decode(&buf)
     }
 
-    fn filename(name: &str) -> String {
-        format!("world/{}.{}", name, Self::EXTENSION)
+    fn filename(name: &str) -> PathBuf {
+        save_dir().join(format!("{}.{}", name, Self::EXTENSION))
     }
 
     fn load_reader(name: &str) -> Result<BufReader<File>> {
-        let file = open_file(&Self::filename(name))?;
+        let file = File::open(Self::filename(name))?;
         Ok(BufReader::new(file))
     }
 
@@ -62,13 +68,14 @@ pub trait Encoder {
     }
 
     fn save_silent(x: &impl Serialize, name: &str) -> Option<()> {
-        let _ = std::fs::create_dir("world");
-
-        let file = create_file(&Self::filename(name))?;
-
-        let w = BufWriter::new(file);
-
-        Self::encode_writer(x, w)
+        let path = Self::filename(name);
+        std::fs::create_dir_all(save_dir())
+            .and_then(|()| File::create(&path))
+            .and_then(|file| {
+                let mut w = BufWriter::new(file);
+                Self::encode_writer(x, &mut w)?;
+                w.flush()
+            })
             .map_err(|e| log::error!("failed serializing: {}", e))
             .ok()?;
         Some(())
@@ -92,9 +99,6 @@ pub trait Encoder {
 pub struct Bincode;
 
 use ::bincode::{DefaultOptions, Options};
-use std::io::Result;
-use std::path::{Path, PathBuf};
-
 impl Encoder for Bincode {
     const EXTENSION: &'static str = "bc";
 
@@ -192,4 +196,31 @@ pub fn load_raw(p: impl AsRef<Path>) -> Result<Vec<u8>> {
 
 pub fn load_string(p: impl AsRef<Path>) -> Result<String> {
     std::fs::read_to_string(p)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn save_dir_routes_world_settings_and_replay() {
+        let root = std::env::temp_dir().join(format!(
+            "egr-save-dir-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        set_save_dir(root.clone()).unwrap();
+
+        for name in ["settings", "world_replay"] {
+            assert_eq!(JSON::filename(name), root.join(format!("{name}.json")));
+            JSONPretty::save_silent(&42, name).unwrap();
+            assert_eq!(JSON::load::<i32>(name).unwrap(), 42);
+        }
+        CompressedBincode::save_silent(&43, "world").unwrap();
+        assert_eq!(CompressedBincode::load::<i32>("world").unwrap(), 43);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

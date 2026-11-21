@@ -10,6 +10,7 @@ use geom::{vec2, vec3, Camera, LinearColor};
 use simulation::Simulation;
 
 use crate::audio::GameAudio;
+use crate::automation::Automation;
 use crate::debug_gui::debug_window::DebugObjs;
 use crate::debug_gui::render_oldgui;
 use crate::gui;
@@ -37,6 +38,7 @@ pub struct State {
     instanced_renderer: InstancedRender,
     map_renderer: MapRenderer,
     immediate_renderer: MeshBuilder<true>,
+    automation: Option<Automation>,
 
     all_audio: GameAudio,
 }
@@ -50,10 +52,17 @@ impl engine::framework::State for State {
 
         log::info!("loaded egui_render");
 
-        let sim: Simulation =
-            Simulation::load_from_disk("world").unwrap_or_else(|| Simulation::new(true));
+        let automation = Automation::take_startup();
+        let sim = if automation.is_some() {
+            Simulation::new_with_options(scenarios::builtin::smoke::OPTIONS)
+        } else {
+            Simulation::load_from_disk("world").unwrap_or_else(|| Simulation::new(true))
+        };
         let game_schedule = Simulation::schedule();
         let mut uiworld = UiWorld::init();
+        if automation.is_some() {
+            crate::init::configure_script_settings(&uiworld);
+        }
 
         let mut bindings = uiworld.write::<Bindings>();
         let default_bindings = Bindings::default();
@@ -89,6 +98,7 @@ impl engine::framework::State for State {
             all_audio: GameAudio::new(&mut ctx.audio),
             sim: Arc::new(RwLock::new(sim)),
             immediate_renderer: MeshBuilder::new(ctx.gfx.tess_material),
+            automation,
         };
         me.sim.write().unwrap().map().dispatch_all();
         me
@@ -119,7 +129,25 @@ impl engine::framework::State for State {
         }
         drop(slstate);
 
-        crate::network::sim_update(self);
+        let scripted = self.automation.is_some();
+        if let Some(automation) = &mut self.automation {
+            match automation.step(
+                ctx,
+                &self.uiw,
+                &self.sim,
+                &mut self.game_schedule,
+                self.map_renderer.meshb.rebuilt_version(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.automation = None;
+                    return;
+                }
+                Err(error) => crate::automation::fail(&error),
+            }
+        } else {
+            crate::network::sim_update(self);
+        }
 
         if std::mem::take(&mut self.uiw.write::<SaveLoadState>().render_reset) {
             self.reset(ctx);
@@ -172,7 +200,9 @@ impl engine::framework::State for State {
             .contains(&InputAction::HideInterface);
 
         manage_settings(ctx, &self.uiw.read::<Settings>());
-        self.manage_io(ctx);
+        if !scripted {
+            self.manage_io(ctx);
+        }
 
         self.map_renderer.update(&self.sim.read().unwrap(), ctx);
 
@@ -185,8 +215,13 @@ impl engine::framework::State for State {
         self.all_audio
             .update(&self.sim.read().unwrap(), &self.uiw, &mut ctx.audio);
 
-        FollowEntity::update_camera(self);
+        if !scripted {
+            FollowEntity::update_camera(self);
+        }
         self.uiw.camera_mut().update(ctx);
+        if scripted {
+            *self.uiw.write::<Camera>() = self.uiw.read::<OrbitCamera>().camera;
+        }
         self.manage_gfx_params(ctx);
     }
 
@@ -199,6 +234,10 @@ impl engine::framework::State for State {
 
         let time: GameTime = *self.sim.read().unwrap().read::<GameTime>();
 
+        if self.automation.is_some() {
+            // Scripted map changes are applied through ticks, so the tick identifies the snapshot.
+            self.map_renderer.meshb.set_map_version(sim.get_tick());
+        }
         self.map_renderer.render(
             &sim.map(),
             time.seconds,
@@ -232,6 +271,9 @@ impl engine::framework::State for State {
     }
 
     fn exit(&mut self) -> bool {
+        if self.automation.is_some() {
+            crate::automation::fail("window closed before the script finished");
+        }
         if self.uiw.read::<GuiState>().last_save.elapsed() < Duration::from_secs(30) {
             return true;
         }

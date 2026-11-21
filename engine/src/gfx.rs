@@ -314,7 +314,9 @@ impl GfxContext {
         let win_scale_factor = window.scale_factor();
 
         let sc_desc = SurfaceConfiguration {
-            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            usage: TextureUsages::RENDER_ATTACHMENT
+                | TextureUsages::TEXTURE_BINDING
+                | (capabilities.usages & TextureUsages::COPY_SRC),
             format,
             width: win_width,
             height: win_height,
@@ -972,6 +974,92 @@ impl GfxContext {
                 .check_shader_updates(&self.defines, &self.device);
         }
         self.tick += 1;
+    }
+
+    /// Read the submitted frame, including UI, while the surface texture is still acquired.
+    pub(crate) fn capture_screenshot(
+        &self,
+        texture: &wgpu::Texture,
+        path: &Path,
+    ) -> Result<(), String> {
+        use std::io::{BufWriter, Write};
+
+        if !texture.usage().contains(TextureUsages::COPY_SRC) {
+            return Err("the surface does not support screenshot readback".into());
+        }
+        let bgra = match texture.format() {
+            TextureFormat::Bgra8Unorm | TextureFormat::Bgra8UnormSrgb => true,
+            TextureFormat::Rgba8Unorm | TextureFormat::Rgba8UnormSrgb => false,
+            format => return Err(format!("unsupported screenshot format {format:?}")),
+        };
+
+        let size = texture.size();
+        let row_bytes = 4 * size.width;
+        let alignment = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+        let stride = row_bytes.div_ceil(alignment) * alignment;
+        let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("screenshot readback"),
+            size: u64::from(stride) * u64::from(size.height),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("copy screenshot"),
+            });
+        encoder.copy_texture_to_buffer(
+            texture.as_image_copy(),
+            wgpu::ImageCopyBuffer {
+                buffer: &buffer,
+                layout: ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: None,
+                },
+            },
+            size,
+        );
+        self.queue.submit([encoder.finish()]);
+
+        let slice = buffer.slice(..);
+        let (send, received) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |result| {
+            let _ = send.send(result);
+        });
+        self.device.poll(wgpu::Maintain::Wait);
+        received
+            .try_recv()
+            .map_err(|e| format!("screenshot readback did not complete: {e}"))?
+            .map_err(|e| format!("could not map screenshot buffer: {e}"))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity(row_bytes as usize * size.height as usize);
+        for row in mapped.chunks_exact(stride as usize) {
+            pixels.extend_from_slice(&row[..row_bytes as usize]);
+        }
+        drop(mapped);
+        buffer.unmap();
+
+        if bgra {
+            for pixel in pixels.chunks_exact_mut(4) {
+                pixel.swap(0, 2);
+            }
+        }
+        let write_png = || -> image::ImageResult<()> {
+            use image::ImageEncoder;
+
+            let mut file = BufWriter::new(std::fs::File::create(path)?);
+            image::codecs::png::PngEncoder::new(&mut file).write_image(
+                &pixels,
+                size.width,
+                size.height,
+                image::ExtendedColorType::Rgba8,
+            )?;
+            file.flush()?;
+            Ok(())
+        };
+        write_png().map_err(|e| format!("writing screenshot {}: {e}", path.display()))
     }
 
     pub fn create_textures(device: &Device, desc: &SurfaceConfiguration, samples: u32) -> FBOs {
