@@ -176,7 +176,7 @@ fn elapsed_tick(sim: &mut Simulation) -> u64 {
 }
 
 fn install_loop(sim: &mut Simulation) -> Result<LineID, String> {
-    // Serve the residential and employment blocks in both directions on a short loop.
+    // Serve the residential and employment blocks on a short one-way loop.
     let legs = [
         ((1, 1), (2, 1)),
         ((3, 1), (4, 1)),

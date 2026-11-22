@@ -24,9 +24,13 @@ const BOARDING_DISTANCE: f32 = 8.0;
 const ARRIVAL_SPEED: f32 = 0.5;
 const BUS_SPEED: f32 = 8.0;
 
-pub(super) fn travel_ticks(distance: f32) -> u64 {
+fn travel_ticks(distance: f32) -> u64 {
     // DELTA is the physics step in real seconds. Dwell uses game seconds.
     ((distance / (BUS_SPEED * DELTA)).ceil() as u64).max(1)
+}
+
+pub(super) fn direct_travel_ticks(from: Vec3, to: Vec3) -> u64 {
+    travel_ticks(from.distance(to)).saturating_add(50)
 }
 
 pub(super) fn route_ticks(map: &Map, it: &Itinerary, position: Vec3, to: Berth) -> u64 {
@@ -71,7 +75,7 @@ pub(super) fn begin_leg(
         Itinerary::route_to_lane(now, vehicle.trans.pos, map, berth.lane, berth.offset)
     };
     let expected = it.as_ref().map_or_else(
-        || expected_ticks(transit, run, vehicle.trans.pos, berth.pos),
+        || nominal_leg_ticks(transit, run, vehicle.trans.pos, berth.pos),
         |it| route_ticks(map, it, vehicle.trans.pos, berth),
     );
     install_leg(
@@ -85,16 +89,16 @@ pub(super) fn begin_leg(
     );
 }
 
-fn expected_ticks(transit: &Transit, run: &BusRun, position: Vec3, berth: Vec3) -> u64 {
+fn nominal_leg_ticks(transit: &Transit, run: &BusRun, position: Vec3, berth: Vec3) -> u64 {
     let len = transit.lines[run.line].stops.len();
     let previous = (run.next_stop_idx + len - 1) % len;
     transit
         .leg_times
         .get(&run.line)
-        .and_then(|times| times.get(previous))
+        .and_then(|times| times.nominal.get(previous))
         .copied()
         .unwrap_or(0)
-        .max(travel_ticks(position.distance(berth)).saturating_add(50))
+        .max(direct_travel_ticks(position, berth))
 }
 
 fn install_leg(
@@ -171,11 +175,11 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
                 if let Some(expected) = transit
                     .leg_times
                     .get_mut(&line_id)
-                    .and_then(|times| times.get_mut(previous))
+                    .and_then(|times| times.learned.get_mut(previous))
                 {
                     // Smooth travel observations from completed legs. The skip
-                    // watchdog still uses the itinerary's nominal travel time.
-                    *expected = (7 * *expected + actual).div_ceil(8);
+                    // watchdog uses nominal travel times.
+                    *expected = (7 * u128::from(*expected) + u128::from(actual)).div_ceil(8) as u64;
                 }
             }
             let run = transit.runs.get_mut(&bus).unwrap();
@@ -188,7 +192,7 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
                 .get(&bus)
                 .filter(|leg| leg.expected_ticks > 0)
                 .map_or_else(
-                    || expected_ticks(&transit, run, vehicle.trans.pos, stop.berth),
+                    || nominal_leg_ticks(&transit, run, vehicle.trans.pos, stop.berth),
                     |leg| leg.expected_ticks,
                 );
             if now.0.saturating_sub(run.leg_started.0) <= expected.saturating_mul(3) {
@@ -520,16 +524,15 @@ fn alight_passenger(
 mod tests {
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3};
-    use prototypes::{Money, TICKS_PER_HOUR};
+    use prototypes::{GameTime, Money, TICKS_PER_HOUR};
 
     use super::*;
     use crate::economy::{Budget, BudgetCategory, TICKS_PER_BUDGET_DAY};
-    use crate::map::LaneKind;
+    use crate::map::{LaneKind, LanePatternBuilder, ProjectFilter};
     use crate::tests::TestCtx;
-    use crate::world_command::WorldCommand;
+    use crate::world_command::{CommandOutcomes, WorldCommand};
 
-    #[test]
-    fn p3_int_scheduled_bus_upkeep_survives_save_load() {
+    fn loop_fixture() -> (TestCtx, LineID) {
         let mut ctx = TestCtx::new_fast();
         ctx.build_roads(&[
             vec3(100.0, 100.0, 0.0),
@@ -558,6 +561,97 @@ mod tests {
         assert_eq!(stops.len(), 2);
         ctx.apply(&[WorldCommand::TransitCreateLine { stops }]);
         let line = ctx.g.read::<Transit>().lines.keys().next().unwrap();
+        (ctx, line)
+    }
+
+    #[test]
+    fn p3_fix2_unrelated_road_edit_preserves_learned_leg_times() {
+        let (mut ctx, line) = loop_fixture();
+        let (learned, nominal) = {
+            let mut transit = ctx.g.write::<Transit>();
+            let times = transit.leg_times.get_mut(&line).unwrap();
+            for time in &mut times.learned {
+                *time *= 2;
+            }
+            (times.learned.clone(), times.nominal.clone())
+        };
+        ctx.g = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+        assert_eq!(ctx.g.read::<Transit>().leg_times[&line].nominal, nominal);
+
+        let (from, to) = {
+            let map = ctx.g.map();
+            (
+                map.project(vec3(500.0, 100.0, 0.0), 0.0, ProjectFilter::ALL),
+                map.project(vec3(680.0, 100.0, 0.0), 0.0, ProjectFilter::ALL),
+            )
+        };
+        ctx.apply(&[WorldCommand::MapMakeConnection {
+            from,
+            to,
+            inter: None,
+            pat: LanePatternBuilder::default().build(),
+        }]);
+
+        assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
+        let transit = ctx.g.read::<Transit>();
+        assert_eq!(transit.directed_leg_times(line).unwrap().0, learned);
+    }
+
+    #[test]
+    fn p3_fix2_legacy_leg_times_keep_their_estimates_and_scale_when_nominal_times_change() {
+        let bytes = Bincode::encode(&vec![150_u64, 401]).unwrap();
+        let mut times: super::super::LineTimes = Bincode::decode(&bytes).unwrap();
+        times.refresh(vec![100, 200]);
+        assert_eq!(times.learned, [150, 401]);
+        times.refresh(vec![120, 200]);
+        assert_eq!(times.learned, [180, 401]);
+    }
+
+    #[test]
+    fn p3_fix2_watchdog_skips_an_unroutable_leg_using_nominal_time() {
+        let (mut ctx, line) = loop_fixture();
+        ctx.build_roads(&[vec3(500.0, 100.0, 0.0), vec3(680.0, 100.0, 0.0)]);
+        let pos = vec3(590.0, 100.0, 0.0);
+        let bus = spawn_driving_vehicle(
+            &mut ctx.g,
+            VehicleKind::Bus,
+            Transform { pos, dir: Vec3::X },
+        )
+        .unwrap();
+        let (world, resources) = ctx.g.world_res();
+        let map = resources.read::<Map>();
+        {
+            let mut transit = resources.write::<Transit>();
+            transit.lines[line].target_vehicles = 1;
+            transit
+                .leg_times
+                .get_mut(&line)
+                .unwrap()
+                .learned
+                .fill(TICKS_PER_HOUR);
+            transit.runs.insert(
+                bus,
+                BusRun {
+                    line,
+                    next_stop_idx: 0,
+                    dwell_until: None,
+                    leg_started: Tick(0),
+                    failures: 0,
+                },
+            );
+            let vehicle = &mut world.vehicles[bus];
+            begin_leg(&mut transit, &map, bus, vehicle, Tick(0), None);
+            assert!(vehicle.it.is_wait_for_reroute().is_some());
+        }
+        drop(map);
+        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + TICKS_PER_HOUR);
+        transit_dispatch_update(world, resources);
+        assert_eq!(resources.read::<Transit>().runs[&bus].failures, 1);
+    }
+
+    #[test]
+    fn p3_int_scheduled_bus_upkeep_survives_save_load() {
+        let (mut ctx, line) = loop_fixture();
         ctx.apply(&[WorldCommand::TransitSetVehicles { line, n: 1 }]);
 
         // Save with a fractional hourly upkeep remainder still outstanding.

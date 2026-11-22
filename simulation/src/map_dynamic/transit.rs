@@ -91,6 +91,71 @@ struct Leg {
     skipped: BTreeSet<StopID>,
 }
 
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(from = "Vec<u64>", into = "Vec<u64>")]
+struct LineTimes {
+    learned: Vec<u64>,
+    nominal: Vec<u64>,
+}
+
+impl LineTimes {
+    fn new(nominal: Vec<u64>) -> Self {
+        Self {
+            learned: nominal.clone(),
+            nominal,
+        }
+    }
+
+    fn refresh(&mut self, nominal: Vec<u64>) {
+        if self.learned.len() != nominal.len() {
+            self.learned.clone_from(&nominal);
+        } else {
+            for ((learned, &old), &new) in self.learned.iter_mut().zip(&self.nominal).zip(&nominal)
+            {
+                if old > 0 && old != new {
+                    let old = u128::from(old);
+                    let scaled = (u128::from(*learned) * u128::from(new) + old / 2) / old;
+                    *learned = u64::try_from(scaled.max(1)).unwrap_or(u64::MAX);
+                }
+            }
+        }
+        self.nominal = nominal;
+    }
+}
+
+// Older saves hold only positive learned times. Zero tags vectors that carry
+// the learned times followed by their nominal baselines.
+const LINE_TIMES_WITH_NOMINAL: u64 = 0;
+
+impl From<Vec<u64>> for LineTimes {
+    fn from(mut ticks: Vec<u64>) -> Self {
+        let nominal = if ticks.first() == Some(&LINE_TIMES_WITH_NOMINAL) {
+            let nominal = ticks.split_off(ticks.len().div_ceil(2));
+            ticks.remove(0);
+            nominal
+        } else {
+            Vec::new()
+        };
+        Self {
+            learned: ticks,
+            nominal,
+        }
+    }
+}
+
+impl From<LineTimes> for Vec<u64> {
+    fn from(times: LineTimes) -> Self {
+        if times.nominal.is_empty() {
+            return times.learned;
+        }
+        let mut ticks = Vec::with_capacity(1 + times.learned.len() + times.nominal.len());
+        ticks.push(LINE_TIMES_WITH_NOMINAL);
+        ticks.extend(times.learned);
+        ticks.extend(times.nominal);
+        ticks
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 struct TripExclusions {
     destination: Destination,
@@ -117,7 +182,7 @@ pub struct Transit {
     pub revision: u64,
     // Lane IDs are a cache of the geometry anchors and are rebuilt on map edits.
     berths: BTreeMap<StopID, Berth>,
-    leg_times: BTreeMap<LineID, Vec<u64>>,
+    leg_times: BTreeMap<LineID, LineTimes>,
     legs: BTreeMap<VehicleID, Leg>,
     trip_exclusions: BTreeMap<HumanID, TripExclusions>,
     suspensions: VecDeque<LineSuspension>,
@@ -151,6 +216,7 @@ impl Transit {
         let times = self
             .leg_times
             .get(&line)
+            .map(|times| times.learned.as_slice())
             .filter(|times| times.len() == count)?;
         Some((times, service::DWELL_TICKS))
     }
@@ -269,7 +335,7 @@ fn prepare_command(sim: &Simulation, command: &WorldCommand) -> Result<Prepared,
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             Prepared::Line(
-                line_times(&map, elapsed_ticks(&sim.resources), &berths)
+                line_times(&map, &berths)
                     .collect::<Option<Vec<_>>>()
                     .ok_or(Rejection::InvalidConnection)?,
             )
@@ -352,17 +418,14 @@ fn resolve_stop(map: &Map, pos: Vec3, dir: Vec2) -> Option<(Vec3, Berth)> {
         .map(|(_, resolved)| resolved)
 }
 
-fn line_times<'a>(
-    map: &'a Map,
-    now: Tick,
-    berths: &'a [Berth],
-) -> impl Iterator<Item = Option<u64>> + 'a {
+fn line_times<'a>(map: &'a Map, berths: &'a [Berth]) -> impl Iterator<Item = Option<u64>> + 'a {
     berths
         .iter()
         .zip(berths.iter().cycle().skip(1))
         .map(move |(from, to)| {
+            // Use the same route-selection seed whenever estimating a leg.
             let it =
-                Itinerary::route_between_lanes(now, map, from.lane_offset(), to.lane_offset())?;
+                Itinerary::route_between_lanes(Tick(0), map, from.lane_offset(), to.lane_offset())?;
             Some(service::route_ticks(map, &it, from.pos, *to))
         })
 }
@@ -412,13 +475,17 @@ pub fn apply(sim: &mut Simulation, command: &WorldCommand) -> Result<(), Rejecti
                 ),
                 suspended: false,
             });
-            transit.leg_times.insert(id, times);
+            transit.leg_times.insert(id, LineTimes::new(times));
         }
         (TransitEditLine { line, stops }, Prepared::Line(times)) => {
             let map = resources.read::<Map>();
+            if transit.lines[*line].stops == *stops {
+                transit.leg_times.entry(*line).or_default().refresh(times);
+            } else {
+                transit.leg_times.insert(*line, LineTimes::new(times));
+            }
             let removed = replace_stops(world, &map, &mut transit, *line, stops.clone(), now);
             transit.lines[*line].suspended = false;
-            transit.leg_times.insert(*line, times);
             for (id, human) in world.humans.iter_mut() {
                 if matches!(human.router.cur_step(), Some(RoutingStep::WaitAtStop { line: waiting, .. }) if waiting == line)
                     && removed
@@ -530,7 +597,7 @@ fn remove_stops(
             remove_line(world, resources, map, transit, line);
         } else {
             replace_stops(world, map, transit, line, kept, now);
-            refresh_line_times(map, transit, line, now);
+            refresh_line_times(map, transit, line);
         }
     }
 
@@ -575,19 +642,19 @@ fn remove_line(
     }
 }
 
-fn refresh_line_times(map: &Map, transit: &mut Transit, line: LineID, now: Tick) {
+fn refresh_line_times(map: &Map, transit: &mut Transit, line: LineID) {
     let berths: Vec<_> = transit.lines[line]
         .stops
         .iter()
         .filter_map(|&stop| transit.berth(map, stop))
         .collect();
-    let times = line_times(map, now, &berths)
+    let nominal = line_times(map, &berths)
         .zip(berths.iter().zip(berths.iter().cycle().skip(1)))
         .map(|(time, (from, to))| {
-            time.unwrap_or_else(|| service::travel_ticks(from.pos.distance(to.pos)))
+            time.unwrap_or_else(|| service::direct_travel_ticks(from.pos, to.pos))
         })
         .collect();
-    transit.leg_times.insert(line, times);
+    transit.leg_times.entry(line).or_default().refresh(nominal);
 }
 
 /// Returns whether transit took over cancellation. An onboard rider keeps the
@@ -724,10 +791,17 @@ fn revalidate_stops(world: &mut World, resources: &Resources, topology_edited: b
     if !moved.is_empty() || !removed.is_empty() {
         transit.revision += 1;
     }
-    if topology_edited || !moved.is_empty() || !removed.is_empty() {
-        let lines: Vec<_> = transit.lines.keys().collect();
+    if topology_edited || !moved.is_empty() {
+        let lines: Vec<_> = transit
+            .lines
+            .iter()
+            .filter(|(_, line)| {
+                topology_edited || line.stops.iter().any(|stop| moved.contains(stop))
+            })
+            .map(|(id, _)| id)
+            .collect();
         for line in lines {
-            refresh_line_times(&map, &mut transit, line, now);
+            refresh_line_times(&map, &mut transit, line);
         }
     }
 

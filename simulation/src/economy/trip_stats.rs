@@ -61,10 +61,17 @@ pub struct TripStats {
     pub walk: TripModeStats,
     pub car: TripModeStats,
     pub transit: TripModeStats,
-    /// Stop waits that exceeded the transit timeout.
-    pub timeouts: u64,
-    /// Passengers who abandoned transit after an expired wait.
+    // Preserve the field position in saves written with two counters.
+    #[serde(rename = "timeouts", deserialize_with = "discard_legacy_timeouts")]
+    legacy_timeouts: u64,
+    /// Stop waits that expired and forced the passenger to give up on transit for this trip.
     pub give_ups: u64,
+}
+
+fn discard_legacy_timeouts<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    u64::deserialize(deserializer).map(|_| 0)
 }
 
 pub(crate) fn on_start(router: &mut Router) {
@@ -99,9 +106,7 @@ pub(crate) fn on_cancel(router: &mut Router) {
 /// Record a wait that expired and forced the passenger to give up on transit.
 /// The original trip clock remains active while a fallback route is attempted.
 pub fn on_wait_timeout(resources: &Resources) {
-    let mut stats = resources.write::<TripStats>();
-    stats.timeouts += 1;
-    stats.give_ups += 1;
+    resources.write::<TripStats>().give_ups += 1;
 }
 
 #[cfg(test)]
@@ -180,6 +185,19 @@ mod tests {
             (stats.transit.completed, stats.transit.duration_ticks),
             (1, 18_100)
         );
-        assert_eq!((stats.timeouts, stats.give_ups), (1, 1));
+        assert_eq!(stats.give_ups, 1);
+        let (walk, car, transit, legacy_timeouts, give_ups): (
+            TripModeStats,
+            TripModeStats,
+            TripModeStats,
+            u64,
+            u64,
+        ) = Bincode::decode(&Bincode::encode(&*stats).unwrap()).unwrap();
+        assert_eq!((legacy_timeouts, give_ups), (0, 1));
+
+        let old_bytes = Bincode::encode(&(walk, car, transit, 7_u64, 7_u64)).unwrap();
+        let old_stats: TripStats = Bincode::decode(&old_bytes).unwrap();
+        assert_eq!(old_stats.give_ups, 7);
+        assert_eq!(old_stats.legacy_timeouts, 0);
     }
 }
