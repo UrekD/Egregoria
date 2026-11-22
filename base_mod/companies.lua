@@ -11,7 +11,7 @@ data:extend {
         kind = "store",
         recipe = {
             consumption = {{"flour", 1}},
-            production = {{"bread", 1}},
+            production = {{"groceries", 3}},
             duration = "100s",
             storage_multiplier = 5,
         },
@@ -128,9 +128,9 @@ data:extend {
         kind = "store",
         recipe = {
             consumption = {{"meat", 1}, {"vegetable", 1}, {"cereal", 1}},
-            production = {},
-            duration = "100s",
-            storage_multiplier = 5,
+            production = {{"retail-goods", 4}, {"shop-delivery", 4}},
+            duration = "360s",
+            storage_multiplier = 12,
         },
         n_workers = 10,
         size = 80.0,

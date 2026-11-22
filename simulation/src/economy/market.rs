@@ -1,20 +1,23 @@
+use std::cmp::Reverse;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
-use geom::Vec2;
+use geom::{Vec2, Vec3};
 use prototypes::{
     prototypes_iter, try_prototype, GoodsCompanyID, GoodsCompanyPrototype, ItemPrototype, Money,
     Power, ServiceID, ServiceKind,
 };
 
+use crate::economy::balance::{shelf_delivery_item, shelf_delivery_units};
+use crate::economy::{walking_component, WalkingComponents};
 use crate::economy::{ItemID, WORKER_CONSUMPTION_PER_MINUTE};
-use crate::map::BuildingID;
+use crate::map::{Building, BuildingID, LaneID, LaneKind, Map};
 use crate::map_dynamic::{BuildingInfos, ElectricityFlow, UtilityFlow};
 use crate::souls::desire::WorkKind;
-use crate::souls::household::{household_items, BasketId};
+use crate::souls::household::{household_items, BasketId, BASKET_TRAVEL_LIMIT};
 use crate::utils::resources::Resources;
 use crate::{HumanID, SoulID, World};
 
@@ -30,6 +33,85 @@ pub struct SellOrder {
 pub struct BuyOrder {
     pub pos: Vec2,
     pub qty: u32,
+}
+
+#[derive(Default)]
+struct ShelfIndex {
+    // Keep premises indexed even when their shelves sell out.
+    cells: BTreeMap<(i32, i32), BTreeSet<(SoulID, ItemID)>>,
+    positions: BTreeMap<(SoulID, ItemID), (i32, i32)>,
+}
+
+impl ShelfIndex {
+    fn cell(pos: Vec2) -> (i32, i32) {
+        const CELL_SIZE: f32 = 256.0;
+        (
+            (pos.x / CELL_SIZE).floor() as i32,
+            (pos.y / CELL_SIZE).floor() as i32,
+        )
+    }
+
+    fn insert(&mut self, seller: SoulID, item: ItemID, pos: Vec2) {
+        let cell = Self::cell(pos);
+        if self.positions.get(&(seller, item)) != Some(&cell) {
+            self.remove(seller, item);
+            self.cells.entry(cell).or_default().insert((seller, item));
+            self.positions.insert((seller, item), cell);
+        }
+    }
+
+    fn remove(&mut self, seller: SoulID, item: ItemID) {
+        if let Some(cell) = self.positions.remove(&(seller, item)) {
+            if let Entry::Occupied(mut entries) = self.cells.entry(cell) {
+                entries.get_mut().remove(&(seller, item));
+                if entries.get().is_empty() {
+                    entries.remove();
+                }
+            }
+        }
+    }
+
+    fn nearby(&self, origin: Vec2, radius: f32) -> BTreeSet<SoulID> {
+        let extent = Vec2::splat(radius);
+        let (min_x, min_y) = Self::cell(origin - extent);
+        let (max_x, max_y) = Self::cell(origin + extent);
+        let mut sellers = BTreeSet::new();
+        for x in min_x..=max_x {
+            for (_, entries) in self.cells.range((x, min_y)..=(x, max_y)) {
+                sellers.extend(entries.iter().map(|&(seller, _)| seller));
+            }
+        }
+        sellers
+    }
+}
+
+impl WalkingComponents {
+    fn lane_component(&mut self, map: &Map, lane: LaneID) -> LaneID {
+        if self.generation != map.walking_topology_generation {
+            self.labels.clear();
+            self.generation = map.walking_topology_generation;
+        }
+        walking_component(map, &mut self.labels, lane)
+    }
+
+    pub(crate) fn component_at(&mut self, map: &Map, pos: Vec3) -> Option<LaneID> {
+        let lane = map.nearest_lane(pos, LaneKind::Walking, None)?;
+        Some(self.lane_component(map, lane))
+    }
+
+    pub(crate) fn reaches_building(
+        &mut self,
+        map: &Map,
+        origin: LaneID,
+        target: &Building,
+    ) -> bool {
+        let Some(road) = target.connected_road.and_then(|road| map.get(road)) else {
+            return false;
+        };
+        road.lanes_iter().any(|(lane, kind)| {
+            kind == LaneKind::Walking && self.lane_component(map, lane) == origin
+        }) && self.component_at(map, target.door_pos) == Some(origin)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -76,6 +158,18 @@ pub struct Market {
     markets: BTreeMap<ItemID, SingleMarket>,
     #[serde(default)]
     household_losses: BTreeMap<ItemID, u64>,
+    seller_losses: BTreeMap<ItemID, u64>,
+    basket_failures: BTreeMap<BasketFailure, u64>,
+    shelf_refills: BTreeSet<SoulID>,
+    reserved_stock: BTreeMap<(SoulID, ItemID), u32>,
+    #[serde(skip)]
+    shelves: Option<ShelfIndex>,
+    #[serde(skip)]
+    reservation_tick: u64,
+    #[serde(skip)]
+    reserved_this_tick: BTreeSet<SoulID>,
+    #[serde(skip)]
+    human_buyers: Option<BTreeMap<SoulID, BTreeSet<HumanID>>>,
     // reuse the trade vec to avoid allocations
     #[serde(skip)]
     all_trades: Vec<Trade>,
@@ -116,10 +210,21 @@ impl HiringPriority {
     }
 }
 
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
 pub(crate) struct BasketRequest {
     pub staples: u32,
     pub goods: u32,
     pub fallback: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum BasketFailure {
+    NoStockInRange,
+    NoWalkingRoute,
+    Expired,
+    RouteInterrupted,
+    SellerRemoved,
+    ShopperRemoved,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -129,7 +234,6 @@ pub(crate) struct BasketReservation {
     pub seller: SoulID,
     pub building: BuildingID,
     pub expires: u64,
-    pub due: u64,
     pub lines: Vec<(ItemID, u32)>,
     shelf_pos: Vec2,
 }
@@ -166,6 +270,14 @@ impl Default for Market {
                 .map(|v| (v.id, SingleMarket::new(prices[&v.id], v.optout_exttrade)))
                 .collect(),
             household_losses: Default::default(),
+            seller_losses: Default::default(),
+            basket_failures: Default::default(),
+            shelf_refills: Default::default(),
+            reserved_stock: Default::default(),
+            shelves: None,
+            reservation_tick: 0,
+            reserved_this_tick: Default::default(),
+            human_buyers: None,
             all_trades: Default::default(),
             potential: Default::default(),
         }
@@ -186,6 +298,11 @@ impl Market {
     /// Beware that you need capital to sell anything, using produce.
     pub fn sell(&mut self, soul: SoulID, near: Vec2, kind: ItemID, qty: u32, stock: u32) {
         log::debug!("{:?} sell {:?} {:?} near {:?}", soul, qty, kind, near);
+        if household_items().contains(&kind) {
+            if let Some(shelves) = &mut self.shelves {
+                shelves.insert(soul, kind, near);
+            }
+        }
         self.m(kind).sell_orders.insert(
             soul,
             SellOrder {
@@ -197,11 +314,108 @@ impl Market {
     }
 
     pub fn sell_all(&mut self, soul: SoulID, near: Vec2, kind: ItemID, stock: u32) {
-        let c = self.capital(soul, kind);
-        if c <= 0 {
+        let capital = self.capital(soul, kind);
+        if capital <= 0 {
             return;
         }
-        self.sell(soul, near, kind, c as u32, stock);
+        let delivery = shelf_delivery_item();
+        let [_, retail] = household_items();
+        let qty = if kind == delivery {
+            self.unpack_delivery(soul, near, capital, stock)
+        } else if kind == retail
+            && stock > 0
+            && self
+                .markets
+                .get(&delivery)
+                .is_some_and(|market| market.capital(soul).is_some())
+        {
+            // Keep real retail in the recipe for residential access. The
+            // recipe's last slot is headroom for the delivery and refunds.
+            let advertised = self.markets[&retail]
+                .sell_order(soul)
+                .map_or(0, |order| order.qty);
+            let limit = self
+                .shelf_room(soul, retail, stock as i32, 0)
+                .max(advertised as i32);
+            self.produce(soul, kind, -(capital - limit).max(0))
+        } else {
+            capital
+        };
+        if qty > 0 {
+            self.sell(soul, near, kind, qty as u32, stock);
+        } else {
+            self.m(kind).sell_orders.remove(&soul);
+        }
+    }
+
+    fn shelf_room(&self, seller: SoulID, item: ItemID, capacity: i32, stock: i32) -> i32 {
+        let reserved = self
+            .reserved_stock
+            .get(&(seller, item))
+            .copied()
+            .unwrap_or(0) as i32;
+        (capacity - reserved - stock).max(0)
+    }
+
+    /// Open only enough wholesale packages to fill free shelf space. Closed
+    /// packages remain in the stockroom and pause the recipe when it fills.
+    fn unpack_delivery(
+        &mut self,
+        seller: SoulID,
+        pos: Vec2,
+        mut packages: i32,
+        capacity: u32,
+    ) -> i32 {
+        let [groceries, retail] = household_items();
+        let [staples_per_package, goods_per_package] = shelf_delivery_units(1);
+        let left = packages;
+        for (item, per_package) in [
+            (groceries, staples_per_package),
+            (retail, goods_per_package),
+        ] {
+            let limit = capacity as i32 * per_package;
+            let stock = self.capital(seller, item);
+            let opened = packages.min(self.shelf_room(seller, item, limit, stock) / per_package);
+            if opened > 0 {
+                packages -= opened;
+                let qty = self.produce(seller, item, opened * per_package);
+                self.sell(seller, pos, item, qty as u32, limit as u32);
+            }
+        }
+        self.produce(seller, shelf_delivery_item(), packages - left)
+    }
+
+    fn refill_shelves(&mut self) {
+        let delivery = shelf_delivery_item();
+        for seller in std::mem::take(&mut self.shelf_refills) {
+            let Some(order) = self
+                .markets
+                .get(&delivery)
+                .and_then(|market| market.sell_order(seller))
+            else {
+                continue;
+            };
+            self.sell_all(seller, order.pos, delivery, order.stock);
+        }
+    }
+
+    pub(crate) fn index_human_buyers(&mut self, world: &crate::World) {
+        self.human_buyers.get_or_insert_with(|| {
+            let mut by_seller = BTreeMap::<_, BTreeSet<_>>::new();
+            for (buyer, human) in world.humans.iter() {
+                for trade in human.bought.0.values().flatten() {
+                    by_seller.entry(trade.seller.0).or_default().insert(buyer);
+                }
+            }
+            by_seller
+        });
+    }
+
+    pub(crate) fn take_human_buyers(&mut self, seller: SoulID) -> BTreeSet<HumanID> {
+        self.human_buyers
+            .as_mut()
+            .and_then(|buyers| buyers.remove(&seller))
+            .unwrap_or_default()
     }
 
     /// An agent was removed from the world, we need to clean after him
@@ -222,6 +436,15 @@ impl Market {
     }
 
     pub(crate) fn remove_account(&mut self, soul: SoulID) {
+        if let Some(shelves) = &mut self.shelves {
+            for item in household_items() {
+                shelves.remove(soul, item);
+            }
+        }
+        for item in household_items() {
+            self.reserved_stock.remove(&(soul, item));
+        }
+        self.shelf_refills.remove(&soul);
         for market in self.markets.values_mut() {
             market.sell_orders.remove(&soul);
             market.buy_orders.remove(&soul);
@@ -401,11 +624,15 @@ impl Market {
         mut can_pick_up: impl FnMut(SoulID, SoulID) -> bool,
         job_priorities: &BTreeMap<SoulID, (bool, HiringPriority)>,
     ) -> &[Trade] {
+        self.refill_shelves();
         self.all_trades.clear();
         let local = household_items();
         let job = ItemID::new("job-opening");
 
         for (&kind, market) in &mut self.markets {
+            if market.optout_exttrade && market.buy_orders.is_empty() {
+                continue;
+            }
             // Naive O(n²) alg
             // We don't immediatly apply the trades, because we want to find the nearest-positioned trades
             for (&seller, sorder) in &market.sell_orders {
@@ -460,7 +687,6 @@ impl Market {
                     trade.seller,
                     trade.buyer,
                     trade.kind,
-                    0_u64,
                 )
             });
             let SingleMarket {
@@ -556,64 +782,116 @@ impl Market {
             }
         }
 
+        for trade in &self.all_trades {
+            if local.contains(&trade.kind) {
+                self.shelf_refills.insert(trade.seller.0);
+            }
+            if let (Some(by_seller), SoulID::Human(buyer)) = (&mut self.human_buyers, trade.buyer.0)
+            {
+                by_seller.entry(trade.seller.0).or_default().insert(buyer);
+            }
+        }
         &self.all_trades
     }
 
-    /// Picks one reachable shelf and removes its accepted lines in one market operation.
-    /// A useful basket is preferred to a tiny partial fill. Distance and IDs break ties
-    /// within each group. There is no buyer market credit until or after collection.
+    /// Reserves a basket from one shelf. Rank useful food and total quantity
+    /// before distance, and perform the route preflight in that order.
     pub(crate) fn reserve_basket(
         &mut self,
         shopper: HumanID,
         origin: Vec2,
+        radius: f32,
         request: BasketRequest,
         now: u64,
-        mut reachable: impl FnMut(SoulID) -> Option<(BuildingID, Vec2)>,
-    ) -> Option<BasketReservation> {
+        mut reachable: impl FnMut(SoulID) -> Option<BuildingID>,
+    ) -> Result<BasketReservation, BasketFailure> {
         let [groceries, retail] = household_items();
-        let staples = self.markets.get(&groceries)?;
-        let goods = self.markets.get(&retail)?;
-        let id = BasketId(common::hash_u64((shopper, now)));
-        let buyer = SoulID::Human(shopper);
-        let available = |market: &SingleMarket, seller| {
-            market.sell_order(seller).map_or(0, |order| {
-                order
-                    .qty
-                    .min(market.capital(seller).unwrap_or(0).max(0) as u32)
+        let shelves = self.shelves.get_or_insert_with(|| {
+            let mut shelves = ShelfIndex::default();
+            for item in [groceries, retail] {
+                if let Some(market) = self.markets.get(&item) {
+                    for (&seller, order) in &market.sell_orders {
+                        shelves.insert(seller, item, order.pos);
+                    }
+                }
+            }
+            shelves
+        });
+        if now != self.reservation_tick {
+            self.reservation_tick = now;
+            self.reserved_this_tick.clear();
+        }
+        let available = |item, seller| {
+            self.markets.get(&item).and_then(|market| {
+                let order = market.sell_order(seller)?;
+                let capital = market.capital(seller)?.max(0) as u32;
+                Some((order.pos, order.qty.min(capital), order.stock > 0))
             })
         };
-        let mut best: Option<(_, BuildingID, Vec2, u32, u32)> = None;
-        for &seller in staples.sell_orders.keys().chain(
-            goods
-                .sell_orders
-                .keys()
-                .filter(|seller| !staples.sell_orders.contains_key(seller)),
-        ) {
-            let food = available(staples, seller).min(request.staples);
-            let goods_target = request.fallback.saturating_sub(food).max(request.goods);
-            let other = available(goods, seller).min(goods_target);
-            if food + other == 0 || seller == buyer {
+        let mut candidates = Vec::new();
+        for seller in shelves.nearby(origin, radius) {
+            if seller == SoulID::Human(shopper) || self.reserved_this_tick.contains(&seller) {
                 continue;
             }
-            let Some((building, pos)) = reachable(seller) else {
-                continue;
-            };
-            let item = if food > 0 { groceries } else { retail };
-            let key = (
-                food + other < 4,
-                OrderedFloat(origin.distance2(pos)),
-                seller,
-                buyer,
-                item,
-                id,
+            let staple = available(groceries, seller);
+            let other = available(retail, seller);
+            let (staples_in_stock, goods_in_stock) = (
+                staple.map_or(0, |(_, qty, _)| qty),
+                other.map_or(0, |(_, qty, _)| qty),
             );
-            if best.as_ref().is_none_or(|(best_key, ..)| key < *best_key) {
-                best = Some((key, building, pos, food, other));
+            let total_stock = staples_in_stock + goods_in_stock;
+            let replenished_shelf =
+                staple.is_some_and(|line| line.2) || other.is_some_and(|line| line.2);
+            let basket_limit = if replenished_shelf {
+                total_stock - total_stock / 4
+            } else {
+                total_stock
+            };
+            let reserve_for_goods =
+                u32::from(request.goods > 0 && goods_in_stock > 0 && basket_limit >= 2);
+            let food = staples_in_stock
+                .min(request.staples)
+                .min(basket_limit - reserve_for_goods);
+            let goods_target = request.fallback.saturating_sub(food).max(request.goods);
+            let goods = goods_in_stock.min(goods_target).min(basket_limit - food);
+            if food + goods == 0 {
+                continue;
+            }
+            let pos = if food > 0 {
+                staple.unwrap().0
+            } else {
+                other.unwrap().0
+            };
+            let distance = OrderedFloat(origin.distance2(pos));
+            if distance.0 <= radius.powi(2) {
+                candidates.push((
+                    Reverse(food),
+                    Reverse(food + goods),
+                    distance,
+                    seller,
+                    pos,
+                    food,
+                    goods,
+                ));
             }
         }
+        if candidates.is_empty() {
+            return Err(BasketFailure::NoStockInRange);
+        }
+        candidates.sort_unstable_by_key(|&(food, units, distance, seller, ..)| {
+            (food, units, distance, seller)
+        });
+        let Some((seller, building, shelf_pos, food, goods)) =
+            candidates
+                .into_iter()
+                .find_map(|(_, _, _, seller, pos, food, goods)| {
+                    Some((seller, reachable(seller)?, pos, food, goods))
+                })
+        else {
+            return Err(BasketFailure::NoWalkingRoute);
+        };
 
-        let ((_, _, seller, _, _, _), building, shelf_pos, food, other) = best?;
-        let lines: Vec<_> = [(groceries, food), (retail, other)]
+        let lines: Vec<_> = [(groceries, food), (retail, goods)]
             .into_iter()
             .filter(|&(_, units)| units > 0)
             .collect();
@@ -625,36 +903,61 @@ impl Market {
             if order.qty == 0 {
                 market.sell_orders.remove(&seller);
             }
+            *self.reserved_stock.entry((seller, item)).or_default() += units;
         }
-        Some(BasketReservation {
-            id,
+        // Allow one basket per seller per tick. Rounded whole units set aside
+        // a quarter of a replenished shelf for later decisions.
+        self.reserved_this_tick.insert(seller);
+        Ok(BasketReservation {
+            id: BasketId(common::hash_u64((shopper, now))),
             shopper,
             seller,
             building,
-            expires: now + 2 * prototypes::TICKS_PER_HOUR,
-            due: now,
+            expires: now + BASKET_TRAVEL_LIMIT,
             lines,
             shelf_pos,
         })
     }
 
-    pub(crate) fn release_basket(&mut self, basket: BasketReservation, refund: bool) {
-        if refund {
-            for (item, units) in basket.lines {
-                self.produce(basket.seller, item, units as i32);
-                self.m(item)
-                    .sell_orders
-                    .entry(basket.seller)
-                    .or_insert(SellOrder {
-                        pos: basket.shelf_pos,
-                        qty: 0,
-                        stock: 0,
-                    })
-                    .qty += units;
+    pub(crate) fn finish_basket(&mut self, basket: &BasketReservation) {
+        for &(item, units) in &basket.lines {
+            if let Entry::Occupied(mut reserved) = self.reserved_stock.entry((basket.seller, item))
+            {
+                *reserved.get_mut() -= units;
+                if *reserved.get() == 0 {
+                    reserved.remove();
+                }
             }
-        } else {
-            self.record_household_losses(basket.lines);
         }
+        self.shelf_refills.insert(basket.seller);
+    }
+
+    pub(crate) fn release_basket(&mut self, basket: BasketReservation, refund: bool) {
+        self.finish_basket(&basket);
+        for (item, units) in basket.lines {
+            if refund {
+                self.produce(basket.seller, item, units as i32);
+                let (qty, stock) = self
+                    .m(item)
+                    .sell_order(basket.seller)
+                    .map_or((0, 0), |order| (order.qty, order.stock));
+                self.sell(basket.seller, basket.shelf_pos, item, qty + units, stock);
+            } else {
+                *self.seller_losses.entry(item).or_default() += u64::from(units);
+            }
+        }
+    }
+
+    pub fn seller_losses(&self) -> &BTreeMap<ItemID, u64> {
+        &self.seller_losses
+    }
+
+    pub fn basket_failures(&self) -> &BTreeMap<BasketFailure, u64> {
+        &self.basket_failures
+    }
+
+    pub(crate) fn record_basket_failure(&mut self, reason: BasketFailure) {
+        *self.basket_failures.entry(reason).or_default() += 1;
     }
 
     pub(crate) fn record_household_losses(
@@ -677,15 +980,17 @@ impl Market {
         self.produce(trade.buyer.0, trade.kind, -trade.qty);
         if let Some(pos) = seller_pos {
             self.produce(trade.seller.0, trade.kind, trade.qty);
-            let orders = &mut self.m(trade.kind).sell_orders;
-            orders
-                .entry(trade.seller.0)
-                .or_insert(SellOrder {
-                    pos,
-                    qty: 0,
-                    stock: 0,
-                })
-                .qty += trade.qty as u32;
+            let (qty, stock) = self
+                .m(trade.kind)
+                .sell_order(trade.seller.0)
+                .map_or((0, 0), |order| (order.qty, order.stock));
+            self.sell(
+                trade.seller.0,
+                pos,
+                trade.kind,
+                qty + trade.qty as u32,
+                stock,
+            );
         }
     }
 

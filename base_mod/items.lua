@@ -124,6 +124,12 @@ data:extend {
     },
     {
         type = "item",
+        name = "shop-delivery",
+        label = "Shop Delivery",
+        optout_exttrade = true,
+    },
+    {
+        type = "item",
         name = "services",
         label = "Services",
     },

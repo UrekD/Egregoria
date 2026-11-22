@@ -24,9 +24,10 @@ pub(super) const SCENARIO: (Scenario, SimulationOptions) = (
 );
 
 fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
-    if let Some(root) = std::env::var_os("EGREGORIA_ECONOMY_SHOWCASE_ROOT") {
+    let showcase = std::env::var_os("EGREGORIA_ECONOMY_SHOWCASE_ROOT");
+    if let Some(root) = &showcase {
         let slot = SlotId::new("showcase_city").map_err(|error| error.to_string())?;
-        ctx.sim = Simulation::load_from_slot(std::path::Path::new(&root), &slot)
+        ctx.sim = Simulation::load_from_slot(std::path::Path::new(root), &slot)
             .map_err(|error| error.to_string())?;
     } else {
         build_fixture(ctx)?;
@@ -40,6 +41,15 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
     let first_day = now.div_ceil(TICKS_PER_BUDGET_DAY);
     ctx.sample("warmup");
+
+    let mut total_resident_days = 0.0;
+    let mut total_outings = 0;
+    let mut total_units = 0;
+    let mut total_groceries = 0;
+    let mut total_due = 0;
+    let mut total_filled = 0;
+    let mut total_food_stockout = 0.0;
+    let failures_before = ctx.sim.read::<Market>().basket_failures().clone();
 
     for day in first_day..first_day + 2 {
         let mut resident_hours = 0;
@@ -64,9 +74,9 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 .map_or(0, |stats| stats.completed)
         };
         let units: u64 = data.units_fulfilled_by_sku.values().sum();
-        let bread = data
+        let groceries = data
             .units_fulfilled_by_sku
-            .get(&ItemID::new("bread"))
+            .get(&ItemID::new("groceries"))
             .copied()
             .unwrap_or(0);
         let stockouts = |name| {
@@ -76,28 +86,64 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
                     ticks as f64 / TICKS_PER_HOUR as f64 / residents
                 })
         };
+        let food_stockout = stockouts("effective-food");
+        let due = data.baskets_due.unwrap_or(0);
+        let filled = data.baskets_filled.unwrap_or(0);
+        let outings = trips(TripPurpose::Shopping);
+        total_resident_days += residents;
+        total_outings += outings;
+        total_units += units;
+        total_groceries += groceries;
+        total_due += due;
+        total_filled += filled;
+        total_food_stockout += food_stockout * residents;
         println!(
             "economy_loop day {day} ({residents:.2} resident-days, {employed:.2} employed-days): \
-             {:.3} shopping trips/resident-day, {:.3} units/resident-day, {bread} bread units, \
+             {:.3} shopping trips/resident-day, {:.3} units/resident-day, {groceries} grocery units, \
              {} park visits, {} work arrivals ({:.3}/employed-day), \
-             {:.3} effective food and {:.3} retail stockout hours/resident-day, \
-             {} / {} baskets filled; units by SKU {:?}; trips by purpose {:?}",
-            trips(TripPurpose::Shopping) as f64 / residents,
+             {food_stockout:.3} effective food, {:.3} groceries and {:.3} retail stockout hours/resident-day, \
+             {filled} / {due} baskets filled; units by SKU {:?}; trips by purpose {:?}",
+            outings as f64 / residents,
             units as f64 / residents,
             trips(TripPurpose::Leisure),
             trips(TripPurpose::Work),
             trips(TripPurpose::Work) as f64 / employed,
             stockouts("groceries"),
             stockouts("retail-goods"),
-            data.baskets_filled.unwrap_or(0),
-            data.baskets_due.unwrap_or(0),
             data.units_fulfilled_by_sku,
             data.trips_by_purpose,
         );
-        println!(
-            "economy_loop cumulative pantry losses {:?}",
-            ctx.sim.read::<Market>().household_losses()
-        );
+    }
+
+    let market = ctx.sim.read::<Market>();
+    let failures: Vec<_> = market
+        .basket_failures()
+        .iter()
+        .filter_map(|(reason, count)| {
+            let delta = count - failures_before.get(reason).copied().unwrap_or(0);
+            (delta > 0).then_some((reason, delta))
+        })
+        .collect();
+    let food_stockout = total_food_stockout / total_resident_days;
+    let outings = total_outings as f64 / total_resident_days;
+    let units = total_units as f64 / total_resident_days;
+    println!(
+        "economy_loop two-day totals: {total_filled}/{total_due} baskets filled, \
+         {food_stockout:.3} food stockout hours/resident-day, {outings:.3} outings/resident-day, \
+         {units:.3} units/resident-day, {total_groceries} grocery units; failed attempts {failures:?}; \
+         cumulative household losses {:?}, seller write-offs {:?}",
+        market.household_losses(),
+        market.seller_losses(),
+    );
+    if showcase.is_some()
+        && (total_due == 0
+            || total_filled as f64 / (total_due as f64) < 0.8
+            || food_stockout > 1.5
+            || !(0.5..=1.2).contains(&outings)
+            || !(2.9..=4.0).contains(&units)
+            || total_groceries == 0)
+    {
+        return Err("Showcase City missed one or more household economy targets".into());
     }
     Ok(())
 }

@@ -1,11 +1,12 @@
 use crate::economy::{on_arrival, on_cancel, on_start, TripMode, TripProgress, TripPurpose};
-use crate::map::{Building, BuildingID, LaneID, LaneKind, Map, PathKind, TraverseDirection};
+use crate::map::{BuildingID, Map, PathKind, Pathfinder, TraverseDirection};
 use crate::map_dynamic::transit::{elapsed_ticks, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
     BuildingInfos, Itinerary, LineID, ParkingManagement, ParkingReserveError, SpotReservation,
     StopID, Transit, NEAR_PARKING_RADIUS,
 };
 use crate::souls::desire::WorkKind;
+use crate::souls::human::HumanDecisionKind;
 use crate::transportation::TransportGrid;
 use crate::transportation::{put_pedestrian_in_transport_grid, unpark, Location, VehicleKind};
 use crate::utils::resources::Resources;
@@ -13,10 +14,9 @@ use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
 use crate::{ParCommandBuffer, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
-use prototypes::Tick;
+use prototypes::{Tick, TICKS_PER_REALTIME_SECOND};
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
-use std::collections::{btree_map::Entry, BTreeMap};
 
 #[path = "transit_path.rs"]
 mod transit_path;
@@ -166,7 +166,12 @@ fn routing_changed(
                 .is_some_and(|work| matches!(work.kind, WorkKind::Driver { .. }))
         {
             let car = router.vehicle.and_then(|id| world.vehicles.get(id));
-            if car.is_none_or(|vehicle| matches!(vehicle.vehicle.kind, VehicleKind::Car)) {
+            let recovering_car = matches!(h.decision.kind, HumanDecisionKind::DepositAtHome)
+                && car
+                    .is_some_and(|car| car.trans.pos.distance2(pos) > NEAR_PARKING_RADIUS.powi(2));
+            if !recovering_car
+                && car.is_none_or(|vehicle| matches!(vehicle.vehicle.kind, VehicleKind::Car))
+            {
                 let now = elapsed_ticks(resources);
                 let paths =
                     transit_paths.get_or_insert_with(|| TransitPaths::new(&transit, now, &headway));
@@ -473,6 +478,8 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                 RoutingStep::WaitAtStop { ref mut since, .. } => *since = WAIT_NOT_STARTED,
                 RoutingStep::RideTransit { .. } => {}
             }
+        } else if matches!(h.router.cur_dest, Some(Destination::Outside(_))) {
+            on_arrival(&mut h.router, resources);
         }
     })
 }
@@ -494,58 +501,46 @@ fn walk_outside(body: HumanID, pos: Vec3, cbuf: &ParCommandBuffer<HumanEnt>, loc
     });
 }
 
-/// Per-pass cache for destinations that require a connected walking route.
-#[derive(Default)]
-pub(crate) struct WalkingReach {
-    labels: BTreeMap<LaneID, LaneID>,
-}
+pub(crate) type WalkingReach = crate::economy::WalkingComponents;
 
-impl WalkingReach {
-    pub(crate) fn component_at(&mut self, map: &Map, position: Vec3) -> Option<LaneID> {
-        let start = map.nearest_lane(position, LaneKind::Walking, None)?;
-        Some(self.lane_component(map, start))
+/// Reject trips which cannot finish inside a household action's travel budget.
+pub(crate) fn walk_fits(map: &Map, start: Vec3, end: Vec3, speed: f32, travel_ticks: u64) -> bool {
+    let max_distance = speed * travel_ticks as f32 / TICKS_PER_REALTIME_SECOND as f32;
+    if start.distance2(end) > max_distance.powi(2) {
+        return false;
     }
-
-    pub(crate) fn reaches_building(
-        &mut self,
-        map: &Map,
-        origin: LaneID,
-        target: &Building,
-    ) -> bool {
-        let Some(road) = target.connected_road.and_then(|road| map.get(road)) else {
-            return false;
-        };
-        // A closer sidewalk on a different road does not connect this building.
-        road.lanes_iter().any(|(lane, kind)| {
-            kind == LaneKind::Walking && self.lane_component(map, lane) == origin
-        }) && self.component_at(map, target.door_pos) == Some(origin)
+    let Some(route) = Itinerary::route(Tick(0), start, end, map, PathKind::Pedestrian) else {
+        return false;
+    };
+    let mut pos = start;
+    let mut distance = 0.0;
+    for &point in route.local_path().iter().rev() {
+        distance += pos.distance(point);
+        pos = point;
     }
-
-    fn lane_component(&mut self, map: &Map, start: LaneID) -> LaneID {
-        if let Some(&component) = self.labels.get(&start) {
-            return component;
-        }
-        self.labels.insert(start, start);
-        let mut pending = vec![start];
-        while let Some(id) = pending.pop() {
-            let lane = &map.lanes()[id];
-            for junction in [lane.src, lane.dst] {
-                for (turn, direction) in map.intersections()[junction].turns_from(id) {
-                    let adjacent = match direction {
-                        TraverseDirection::Forward => turn.dst,
-                        TraverseDirection::Backward => turn.src,
-                    };
-                    if map.lanes()[adjacent].kind == LaneKind::Walking {
-                        if let Entry::Vacant(entry) = self.labels.entry(adjacent) {
-                            entry.insert(start);
-                            pending.push(adjacent);
-                        }
-                    }
-                }
+    if let Some(route) = route.get_route() {
+        for (index, step) in route.reversed_route.iter().enumerate().rev() {
+            if index == 0 {
+                let Some(points) =
+                    PathKind::Pedestrian.local_route(map, step.destination_lane(), pos, end)
+                else {
+                    return false;
+                };
+                distance += pos.distance(points.first()) + points.length();
+            } else {
+                let Some(points) = step.raw_points(map) else {
+                    return false;
+                };
+                let (first, last) = match step.dir {
+                    TraverseDirection::Forward => (points.first(), points.last()),
+                    TraverseDirection::Backward => (points.last(), points.first()),
+                };
+                distance += pos.distance(first) + points.length();
+                pos = last;
             }
         }
-        start
     }
+    distance <= max_distance
 }
 
 impl Router {
@@ -738,16 +733,15 @@ impl Router {
     }
 
     pub(crate) fn go_to_for(&mut self, dest: Destination, purpose: TripPurpose) -> bool {
-        if let Some(router_dest) = self.cur_dest {
-            if router_dest == dest {
-                return self.steps.is_empty() && self.cur_step.is_none();
-            }
+        if self.target_dest == Some(dest) {
+            return self.cur_dest == Some(dest) && self.steps.is_empty() && self.cur_step.is_none();
         }
-        if self.target_dest != Some(dest) {
-            self.target_dest = Some(dest);
-            self.trip_purpose = purpose;
-            on_start(self);
+        if self.cur_dest == Some(dest) {
+            self.cur_dest = None;
         }
+        self.target_dest = Some(dest);
+        self.trip_purpose = purpose;
+        on_start(self);
         false
     }
 
@@ -827,6 +821,21 @@ mod tests {
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Color};
     use prototypes::Money;
+
+    #[test]
+    fn e1_fix_replacing_a_pending_destination_resets_trip_purpose() {
+        let mut router = Router::new(None);
+        let first = Destination::Outside(vec3(10.0, 10.0, 0.0));
+        let second = Destination::Outside(vec3(20.0, 20.0, 0.0));
+        router.set_test_route(first, vec![RoutingStep::WalkTo(vec3(10.0, 10.0, 0.0))]);
+        router.go_to_for(second, TripPurpose::Shopping);
+        router.trip_start = Some(Tick(15));
+        router.go_to(first);
+        assert_eq!(router.target_dest, Some(first));
+        assert_eq!(router.trip_purpose, TripPurpose::Other);
+        assert!(router.trip_start.is_none());
+        assert!(router.cur_dest.is_none());
+    }
 
     struct RouteFixture {
         ctx: TestCtx,

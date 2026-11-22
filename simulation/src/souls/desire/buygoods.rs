@@ -42,7 +42,7 @@ debug_inspect_impl!(BuyGoods);
 impl BuyGoods {
     pub(crate) fn basket_score(stock: &crate::souls::household::HouseholdStock) -> f32 {
         let [groceries, retail] = crate::souls::household::household_items();
-        if stock.units(retail) == 0 && stock.units(groceries) <= 2 && stock.needs.goods < 0.4 {
+        if stock.units(retail) == 0 && stock.units(groceries) <= 3 {
             0.58
         } else {
             0.0
@@ -57,11 +57,11 @@ impl BuyGoods {
         vehicles: &HopSlotMap<VehicleID, VehicleEnt>,
         resources: &Resources,
     ) {
-        // Count simulation steps even when SetGameTime moves the calendar clock.
-        human.goods.tick += 1;
         let Some(pickup) = human.goods.pickup else {
             return;
         };
+        // Count simulation steps while en route, independent of calendar edits.
+        human.goods.tick += 1;
         Self::poll_pickup(human, map, vehicles, resources, pickup);
     }
 

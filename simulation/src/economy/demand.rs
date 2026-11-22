@@ -1,8 +1,9 @@
 use crate::economy::balance::{
-    periodic_tick, DEFAULT_TAX_RATE_PERMILLE, DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS,
-    DEMAND_OFFSET_TICKS, FOOD_UNIT_TICKS, GOODS_UNIT_TICKS, I_BASE, I_BOOTSTRAP_COMPANIES, K_GOODS,
-    K_HAPPY, K_JOBS, K_RET, K_TAX, K_UNEMP, K_VAC, MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS,
-    RETAIL_PER_CAPITA_PER_HOUR, R_BASE, R_BOOTSTRAP_POPULATION,
+    periodic_tick, shelf_delivery_item, shelf_delivery_units, DEFAULT_TAX_RATE_PERMILLE,
+    DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS, DEMAND_OFFSET_TICKS, FOOD_UNIT_TICKS,
+    GOODS_UNIT_TICKS, I_BASE, I_BOOTSTRAP_COMPANIES, K_GOODS, K_HAPPY, K_JOBS, K_RET, K_TAX,
+    K_UNEMP, K_VAC, MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, RETAIL_PER_CAPITA_PER_HOUR, R_BASE,
+    R_BOOTSTRAP_POPULATION, SHELF_TARGET_UTILIZATION,
 };
 use crate::economy::{Budget, Market};
 use crate::map::{BuildingID, ZoneKind};
@@ -104,8 +105,16 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     let occupants = &mut demand.occupants;
     occupants.clear();
     let mut unemployed = 0;
+    let mut unmet = [0_u64; 2];
+    let now = budget.elapsed_ticks(resources.tick());
     for human in world.humans.values() {
         *occupants.entry(human.home.house).or_insert(0u32) += 1;
+        for (total, request) in unmet
+            .iter_mut()
+            .zip(human.household.unmet_shelf_demand(now))
+        {
+            *total += u64::from(request);
+        }
         let pending_hire = human
             .bought
             .0
@@ -158,7 +167,7 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
         (
             ZoneKind::Commercial,
             DemandDrivers {
-                shortfall: K_RET * rates.retail_shortfall(population),
+                shortfall: K_RET * rates.retail_shortfall(population, unmet),
                 ..Default::default()
             },
         ),
@@ -213,15 +222,29 @@ struct CompanyRates {
 }
 
 impl CompanyRates {
-    fn retail_shortfall(&self, population: usize) -> f32 {
+    fn retail_shortfall(&self, population: usize, unmet: [u64; 2]) -> f32 {
         let residents = population as f64;
-        if !self.grocery_producers {
+        if !self.grocery_producers && unmet == [0, 0] {
             return shortfall_norm(residents * RETAIL_PER_CAPITA_PER_HOUR, self.retail_supply);
         }
         let staple_rate = TICKS_PER_HOUR as f64 / FOOD_UNIT_TICKS as f64;
         let goods_rate = TICKS_PER_HOUR as f64 / GOODS_UNIT_TICKS as f64;
-        let staples = shortfall_norm(residents * staple_rate, self.groceries_supply);
-        let goods = shortfall_norm(residents * goods_rate, self.retail_supply);
+        // Count live unmet lines by SKU. They can reveal empty or unevenly
+        // distributed shelves even when nominal staffed production is high.
+        let shortage = |rate, supply, missing| {
+            let hourly_need: f64 = residents * rate;
+            let nominal = shortfall_norm(hourly_need, supply);
+            if missing == 0 {
+                nominal
+            } else {
+                nominal.max(shortfall_norm(
+                    hourly_need,
+                    hourly_need - missing as f64 / 4.0,
+                ))
+            }
+        };
+        let staples = shortage(staple_rate, self.groceries_supply, unmet[0]);
+        let goods = shortage(goods_rate, self.retail_supply, unmet[1]);
         (staples * staple_rate as f32 + goods * goods_rate as f32)
             / (staple_rate + goods_rate) as f32
     }
@@ -256,10 +279,20 @@ fn company_rates(world: &World) -> CompanyRates {
         // The company system advances recipe progress by DELTA per simulation tick.
         let full_batches = TICKS_PER_HOUR as f64 * DELTA_F64 / duration;
         let staffed_batches = full_batches * f64::from(company.raw_productivity(proto, None));
-        let grocery_output = amount(&recipe.production, groceries);
+        let delivery = amount(&recipe.production, shelf_delivery_item()) as i32;
+        let [staples, _] = shelf_delivery_units(delivery);
+        let grocery_output = amount(&recipe.production, groceries) + f64::from(staples);
         rates.grocery_producers |= grocery_output > 0.0;
-        rates.groceries_supply += grocery_output * staffed_batches;
-        rates.retail_supply += amount(&recipe.production, retail_goods) * staffed_batches;
+        rates.groceries_supply += (amount(&recipe.production, groceries)
+            + f64::from(staples) * SHELF_TARGET_UTILIZATION)
+            * staffed_batches;
+        let retail_output = amount(&recipe.production, retail_goods);
+        let retail_utilization = if delivery > 0 {
+            SHELF_TARGET_UTILIZATION
+        } else {
+            1.0
+        };
+        rates.retail_supply += retail_output * retail_utilization * staffed_batches;
         match growable.map(|proto| proto.zone_kind) {
             Some(ZoneKind::Commercial) => {
                 rates.goods_need += amount(&recipe.consumption, goods) * full_batches;

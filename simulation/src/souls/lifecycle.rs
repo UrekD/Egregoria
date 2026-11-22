@@ -4,7 +4,7 @@ use itertools::Itertools;
 use prototypes::{GameTime, ItemID};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::economy::{Market, Trade};
+use crate::economy::{BasketFailure, Market, Trade};
 use crate::map::{Building, BuildingID, BuildingKind, Map, PathKind};
 use crate::map_dynamic::{
     BuildingInfos, Destination, DispatchID, Dispatcher, Itinerary, ParkingManagement,
@@ -12,7 +12,7 @@ use crate::map_dynamic::{
 };
 use crate::souls::desire::WorkKind;
 use crate::souls::freight_station::FreightTrainState;
-use crate::souls::household::cancel_visit;
+use crate::souls::household::{cancel_visit, HouseholdClaims};
 use crate::souls::human::HumanDecisionKind;
 use crate::souls::residence;
 use crate::transportation::testing_vehicles::RandomVehicles;
@@ -103,11 +103,11 @@ pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_exte
 
 pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut HumanEnt) {
     let (_, resources) = sim.world_res();
-    if let Some(basket) = human.household.reservation.as_ref() {
-        let refund =
-            resources.read::<BuildingInfos>().owner(basket.building) == Some(basket.seller);
-        human.household.cancel(resources, refund);
-    }
+    human
+        .household
+        .cancel(resources, BasketFailure::ShopperRemoved);
+    human.household.discard_order(resources);
+    cancel_visit(id, human, resources);
     sim.write::<Market>().record_household_losses(
         std::mem::take(&mut human.household.on_hand)
             .into_iter()
@@ -242,7 +242,7 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
             || lost_truck
             || human.decision.kind.references_vehicle(id)
         {
-            cancel_trip(human, resources, &mut parking);
+            cancel_trip(human_id, human, resources, &mut parking);
         }
     };
 
@@ -416,23 +416,30 @@ fn human_trade_participants<'a>(trades: impl Iterator<Item = &'a Trade>) -> BTre
 
 fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<CompanyID>> {
     let (world, resources) = sim.world_res();
-    if !matches!(soul, SoulID::Human(_)) {
-        let mut parking = resources.write::<ParkingManagement>();
-        for human in world.humans.values_mut() {
-            if human
-                .household
-                .reservation
-                .as_ref()
-                .is_some_and(|basket| basket.seller == soul)
-            {
-                // The seller account is about to disappear. Record the write-off.
-                human.household.cancel(resources, false);
-                human.router.walk_only_pickup = false;
-                cancel_trip(human, resources, &mut parking);
+    let seller = !matches!(soul, SoulID::Human(_));
+    if seller {
+        HouseholdClaims::ensure(world, resources);
+        let shoppers = resources.write::<HouseholdClaims>().baskets.remove(&soul);
+        if let Some(shoppers) = shoppers {
+            let mut parking = resources.write::<ParkingManagement>();
+            for id in shoppers {
+                if let Some(human) = world.humans.get_mut(id) {
+                    human
+                        .household
+                        .cancel(resources, BasketFailure::SellerRemoved);
+                    human.router.walk_only_pickup = false;
+                    cancel_trip(id, human, resources, &mut parking);
+                }
             }
         }
     }
     let mut market = resources.write::<Market>();
+    let legacy_buyers = if seller {
+        market.index_human_buyers(world);
+        market.take_human_buyers(soul)
+    } else {
+        BTreeSet::new()
+    };
     let mut infos = resources.write::<BuildingInfos>();
     let departure = match (soul, &mut world.departing) {
         (SoulID::Human(id), Some(batch)) => batch.pending.remove(&id).inspect(|_| {
@@ -489,8 +496,16 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<Compa
         }
         return Some(entry.employers);
     }
-    for human in world.humans.values_mut() {
-        remove_human_trades(human);
+    if seller {
+        for buyer in legacy_buyers {
+            if let Some(human) = world.humans.get_mut(buyer) {
+                remove_human_trades(human);
+            }
+        }
+    } else {
+        for human in world.humans.values_mut() {
+            remove_human_trades(human);
+        }
     }
     for company in world.companies.values_mut() {
         remove_company_trades(company);
@@ -624,7 +639,9 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
             .as_ref()
             .is_some_and(|basket| buildings.contains_key(&basket.building));
         if seller_removed {
-            human.household.cancel(resources, false);
+            human
+                .household
+                .cancel(resources, BasketFailure::SellerRemoved);
             human.router.walk_only_pickup = false;
         }
         let mut cancel = door.is_some() || seller_removed;
@@ -682,7 +699,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
                     }
                 }
             }
-            cancel_trip(human, resources, &mut parking);
+            cancel_trip(human_id, human, resources, &mut parking);
         }
     }
     drop(parking);
@@ -824,11 +841,18 @@ fn move_outside(human: &mut HumanEnt, pos: Vec3, resources: &Resources) {
     human.speed.0 = 0.0;
 }
 
-fn cancel_trip(human: &mut HumanEnt, resources: &Resources, parking: &mut ParkingManagement) {
-    cancel_visit(human);
-    if human.household.cancel(resources, true) {
-        human.router.walk_only_pickup = false;
-    }
+fn cancel_trip(
+    id: HumanID,
+    human: &mut HumanEnt,
+    resources: &Resources,
+    parking: &mut ParkingManagement,
+) {
+    cancel_visit(id, human, resources);
+    human
+        .household
+        .cancel(resources, BasketFailure::RouteInterrupted);
+    human.household.homebound_until = None;
+    human.router.walk_only_pickup = false;
     if crate::map_dynamic::transit::on_route_cancelled(human, resources) {
         return;
     }

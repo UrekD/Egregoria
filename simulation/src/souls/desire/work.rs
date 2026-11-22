@@ -5,7 +5,7 @@ use crate::souls::human::HumanDecisionKind;
 use crate::transportation::Location;
 use crate::world::VehicleID;
 use egui_inspect::Inspect;
-use prototypes::{GameTime, RecTimeInterval, MINUTES_PER_HOUR};
+use prototypes::{DayTime, GameTime, RecTimeInterval, MINUTES_PER_HOUR, SECONDS_PER_MINUTE};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -70,17 +70,26 @@ impl Work {
         }
     }
 
+    pub(crate) fn shift_ending(&self, time: &GameTime, minutes: i32) -> bool {
+        let later = DayTime::new(
+            time.daytime
+                .gamesec()
+                .saturating_add(minutes * SECONDS_PER_MINUTE),
+        );
+        self.work_inter.is_active(&time.daytime) && !self.work_inter.is_active(&later)
+    }
+
     pub(crate) fn shift_score(
         &self,
         time: &GameTime,
         loc: &Location,
-        attended: Option<i32>,
+        attended: Option<(BuildingID, i32)>,
     ) -> f32 {
         if self.work_inter.dist_start(&time.daytime) != 0 {
             return 0.0;
         }
         let at_work = *loc == Location::Building(self.workplace);
-        if at_work || attended.is_none_or(|day| day < time.daytime.day) {
+        if at_work || attended != Some((self.workplace, time.daytime.day)) {
             1.0
         } else {
             0.0

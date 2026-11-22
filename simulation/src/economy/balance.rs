@@ -68,4 +68,15 @@ pub const RETAIL_PER_CAPITA_PER_HOUR: f64 = 1.0 / 6.0;
 pub(crate) const FOOD_UNIT_TICKS: u64 = 8 * prototypes::TICKS_PER_HOUR;
 pub(crate) const GOODS_UNIT_TICKS: u64 = 24 * prototypes::TICKS_PER_HOUR;
 pub(crate) const BASKET_FOOD_TARGET: u32 = 4;
-pub(crate) const BASKET_GOODS_TARGET: u32 = 1;
+pub(crate) const BASKET_GOODS_TARGET: u32 = 2;
+
+/// Leave spare throughput for the evening peak and for uneven retailer coverage.
+pub(crate) const SHELF_TARGET_UTILIZATION: f64 = 0.70;
+
+pub(crate) fn shelf_delivery_item() -> prototypes::ItemID {
+    prototypes::ItemID::new("shop-delivery")
+}
+
+pub(crate) fn shelf_delivery_units(batches: i32) -> [i32; 2] {
+    [3 * batches, batches]
+}

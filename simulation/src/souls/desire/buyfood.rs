@@ -42,8 +42,13 @@ impl BuyFood {
 
     pub(crate) fn score(&mut self, stock: &HouseholdStock) -> f32 {
         let [groceries, retail] = household_items();
-        let supply = stock.units(groceries) + stock.units(retail);
-        self.last_score = if supply <= 1 && stock.needs.food < 0.85 {
+        let staples = stock.units(groceries);
+        let supply = if staples > 0 {
+            staples
+        } else {
+            stock.units(retail)
+        };
+        self.last_score = if supply <= 1 {
             0.55 + (1.0 - stock.needs.food) * 0.20
         } else {
             0.0
