@@ -24,8 +24,8 @@ use crate::gui::{
     overlays::OverlayMode, toolbox::building::BuildingTab, top_demand_driver, zoning::ZONES,
     GuiState, InspectedBuilding, Tool,
 };
-use crate::session::{self, SessionScreen};
-use crate::uiworld::{ReceivedCommands, UiWorld};
+use crate::session::{self, SessionScreen, SlotCompatibility};
+use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
 static STARTUP: Mutex<Option<Automation>> = Mutex::new(None);
@@ -66,6 +66,7 @@ enum Step {
     SetOverlay(OverlayMode),
     SetSession(SessionScreen),
     OpenWindow(String),
+    LoadSlot(String),
     Assert(Assertion),
     Screenshot(String),
     DumpState(String),
@@ -135,6 +136,7 @@ enum Builder {
 enum Wait {
     Map { tick: u64, settle_frames: u64 },
     Frames { start: u64, count: u64 },
+    LoadSlot,
     Screenshot,
 }
 
@@ -340,6 +342,14 @@ impl Automation {
             Some(Wait::Frames { start, count }) if ctx.gfx.tick - start < count => {
                 return Ok(true);
             }
+            // The game loop resumes automation after the session's world job finishes.
+            Some(Wait::LoadSlot) if !session::playing(uiw) => {
+                return Err(uiw
+                    .read::<SaveLoadState>()
+                    .world_error
+                    .clone()
+                    .unwrap_or_else(|| "loading the save slot did not enter Playing".into()));
+            }
             Some(Wait::Screenshot) => match ctx.take_screenshot_result() {
                 Some(result) => result?,
                 None => return Ok(true),
@@ -520,6 +530,27 @@ impl Automation {
                     .find(|(candidate, _)| *candidate == name)
                     .ok_or_else(|| format!("unknown window {name:?}"))?;
                 *open = true;
+            }
+            Step::LoadSlot(id) => {
+                // Scripts may enter the Load screen without a departure confirmation.
+                if !session::set_screen(uiw, SessionScreen::LoadGame) {
+                    return Err("loading a save slot is unavailable during multiplayer".into());
+                }
+                let (entry, compatibility) = session::discover_slots(saveload::save_dir())
+                    .map_err(|error| format!("could not list saves: {error}"))?
+                    .into_iter()
+                    .find(|(entry, _)| entry.id.as_str() == id)
+                    .ok_or_else(|| format!("save slot {id:?} was not found"))?;
+                match compatibility {
+                    SlotCompatibility::Compatible => session::load_slot(uiw, entry),
+                    SlotCompatibility::Incompatible => {
+                        return Err(format!("save slot {id:?} has an incompatible version"));
+                    }
+                    SlotCompatibility::Unreadable => {
+                        return Err(format!("save slot {id:?} has an unreadable snapshot"));
+                    }
+                }
+                self.wait = Some(Wait::LoadSlot);
             }
             Step::Assert(assertion) => assertion.check(uiw, &sim.read().unwrap(), self)?,
             Step::Screenshot(name) => {
@@ -884,6 +915,15 @@ mod tests {
             Step::SetOverlay(OverlayMode::Traffic)
         ));
         assert_eq!(SessionScreen::default(), SessionScreen::Playing);
+    }
+
+    #[test]
+    fn demo_load_slot_step_decodes() {
+        let json = br#"{"LoadSlot":"showcase_city"}"#;
+        assert!(matches!(
+            JSON::decode::<Step>(json).unwrap(),
+            Step::LoadSlot(id) if id == "showcase_city"
+        ));
     }
 
     #[test]

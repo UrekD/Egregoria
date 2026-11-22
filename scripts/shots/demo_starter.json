@@ -5,7 +5,7 @@
   {"OpenWindow": "Load"},
   {"WaitFrames": 8},
   {"Screenshot": "demo-load-slots"},
-  {"Pointer": {"action": "Click", "screen_pos": [580, 374]}},
+  {"LoadSlot": "starter_town"},
   {"WaitFrames": 6},
   {"Assert": {"BuildingCount": {"prototype": "park", "count": 0}}},
   {"Assert": {"BuildingCount": {"prototype": "coal-power-plant", "count": 1}}},

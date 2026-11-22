@@ -2,7 +2,7 @@
   {"SetSession": "MainMenu"},
   {"OpenWindow": "Load"},
   {"WaitFrames": 8},
-  {"Pointer": {"action": "Click", "screen_pos": [580, 303]}},
+  {"LoadSlot": "showcase_city"},
   {"WaitFrames": 6},
   {"Assert": {"BuildingCount": {"prototype": "park", "count": 2}}},
   {"Camera": {"x": 3570, "y": 5930, "z": 0, "yaw": -0.91, "pitch": 1.16, "dist": 1100}},
