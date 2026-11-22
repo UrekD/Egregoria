@@ -1,7 +1,7 @@
 use crate::gui::zoning::{density_name, zone_cell_color, zone_color, zone_name, ZoningPreview};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::MapRenderOptions;
-use common::FastMap;
+use common::{ChunkID_32, FastMap, FastSet};
 use engine::earcut::earcut;
 use engine::MeshBuilder;
 use engine::{
@@ -12,6 +12,7 @@ use geom::{
     minmax, vec2, vec3, Circle, Color, Intersect, LinearColor, PolyLine3, Polygon, Radians, Shape,
     Vec2, Vec3, AABB, OBB,
 };
+use itertools::{EitherOrBoth, Itertools};
 use prototypes::{
     try_prototype, FreightStationPrototype, GoodsCompanyID, GoodsCompanyPrototype,
     GrowableCompanyID, GrowableCompanyPrototype, RenderAsset,
@@ -25,8 +26,10 @@ use simulation::map::{
 use simulation::souls::growth::{check_growable_lot, GrowableLotError};
 use simulation::Simulation;
 use std::cell::RefCell;
-use std::ops::{Mul, Neg};
+use std::collections::hash_map::Entry;
+use std::ops::{Mul, Neg, Range};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// This is the main struct that handles the map rendering.
 /// It is responsible for generating the meshes and sprites for the map
@@ -70,9 +73,12 @@ struct MapBuilders {
 }
 
 const ZONING_OVERVIEW_DISTANCE: f32 = 900.0;
-const ZONING_CAMERA_BUCKET: f32 = 256.0;
 const ZONING_FILL_LIFT: f32 = 0.20;
+const ZONING_REBUILD_BUDGET: Duration = Duration::from_millis(2);
+// Leave time for the last small chunk's tessellation and buffer uploads.
+const ZONING_CHUNK_HEADROOM: Duration = Duration::from_millis(1);
 
+type ZoningChunk = ChunkID_32;
 type ZonedLot = (ZoneCell, Result<(), GrowableLotError>);
 
 #[derive(PartialEq)]
@@ -83,10 +89,14 @@ struct ZoningPreviewMesh {
 
 #[derive(PartialEq)]
 struct ZoningPreviewFill {
-    area: AABB,
-    pitch: f32,
-    inset: f32,
+    tiles: Vec<AABB>,
     color: [f32; 4],
+}
+
+#[derive(Default)]
+struct PreviewLots {
+    outlines: Vec<LotOutline>,
+    replaced: FastSet<LotID>,
 }
 
 #[derive(PartialEq)]
@@ -99,31 +109,56 @@ struct LotOutline {
 struct ZoningFrame {
     world: u64,
     grid: Arc<ZoneGrid>,
-    key: ZoningMeshKey,
+    view: ZoningView,
     preview: ZoningPreviewMesh,
+    replaced_lots: FastSet<LotID>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+enum ZoningMode {
+    Overview,
+    Coarse,
+    Detail,
+}
+
+impl ZoningMode {
+    fn new(distance: f32, detail: bool) -> Self {
+        if distance >= ZONING_OVERVIEW_DISTANCE {
+            Self::Overview
+        } else if detail {
+            Self::Detail
+        } else {
+            Self::Coarse
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
-struct ZoningMeshKey {
+struct ZoningView {
+    center: ZoningChunk,
     bounds: AABB,
-    overview: bool,
-    detail: bool,
+    mode: ZoningMode,
 }
 
-impl ZoningMeshKey {
-    fn new(center: Vec2, distance: f32, detail: bool) -> Self {
-        // Pad the view to bucket boundaries so small pans and zooms reuse the same mesh.
+impl ZoningView {
+    fn new(center: Vec2, distance: f32, map_bounds: AABB, mode: ZoningMode) -> Self {
         let radius = Vec2::splat(distance * 1.5);
+        let size = ZoningChunk::SIZE_F32;
         let bounds = AABB::new_ll_ur(
-            ((center - radius) / ZONING_CAMERA_BUCKET).floor() * ZONING_CAMERA_BUCKET,
-            ((center + radius) / ZONING_CAMERA_BUCKET).ceil() * ZONING_CAMERA_BUCKET,
-        );
-        let overview = distance >= ZONING_OVERVIEW_DISTANCE;
+            ((center - radius) / size).floor() * size,
+            ((center + radius) / size).ceil() * size,
+        )
+        .intersection(map_bounds);
         Self {
+            center: ZoningChunk::new(center),
             bounds,
-            overview,
-            detail: detail && !overview,
+            mode,
         }
+    }
+
+    fn chunks(self) -> impl Iterator<Item = ZoningChunk> {
+        zoning_tiles(self.bounds, ZoningChunk::SIZE_F32)
+            .map(|(x, y)| ZoningChunk::new_i16(x as i16, y as i16))
     }
 }
 
@@ -133,12 +168,76 @@ thread_local! {
     static ZONING_FRAME: RefCell<Option<ZoningFrame>> = const { RefCell::new(None) };
 }
 
+#[derive(Default)]
+struct ZoningChunkState {
+    cells: usize,
+    grid_revision: u64,
+    lot_revision: u64,
+}
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+struct ZoningChunkRevision {
+    grid: u64,
+    lots: u64,
+    map: u64,
+}
+
+struct ZoningChunkMesh {
+    revision: ZoningChunkRevision,
+    fill: Option<Arc<Mesh>>,
+    lots: Option<Arc<Mesh>>,
+    lot_ranges: Vec<(LotID, Range<u32>)>,
+}
+
+impl ZoningChunkMesh {
+    fn visible_lots(&self, replaced: &FastSet<LotID>) -> Option<Arc<Mesh>> {
+        let mesh = self.lots.as_ref()?;
+        if replaced.is_empty() {
+            return Some(mesh.clone());
+        }
+        let mut excluded = self
+            .lot_ranges
+            .iter()
+            .filter(|(id, _)| replaced.contains(id))
+            .map(|(_, range)| range.clone())
+            .peekable();
+        if excluded.peek().is_none() {
+            return Some(mesh.clone());
+        }
+
+        // Restrict the cached index ranges while retaining the same GPU buffers.
+        let mut mesh = (**mesh).clone();
+        let (material, all) = mesh.lods[0].primitives[0].clone();
+        mesh.lods[0].primitives = zoning_visible_ranges(all, excluded)
+            .map(|range| (material, range))
+            .collect();
+        (!mesh.lods[0].primitives.is_empty()).then(|| Arc::new(mesh))
+    }
+}
+
+fn zoning_visible_ranges(
+    all: Range<u32>,
+    excluded: impl Iterator<Item = Range<u32>>,
+) -> impl Iterator<Item = Range<u32>> {
+    let mut start = all.start;
+    excluded
+        .chain(std::iter::once(all.end..all.end))
+        .filter_map(move |range| {
+            let visible = start..range.start;
+            start = range.end;
+            (!visible.is_empty()).then_some(visible)
+        })
+}
+
 struct ZoningMeshes {
     updates: MapSubscriber,
-    world_revision: Option<(u64, u64)>,
-    key: Option<ZoningMeshKey>,
-    lots: FastMap<LotID, Option<ZonedLot>>,
-    committed: Option<Arc<Mesh>>,
+    world: Option<u64>,
+    grid: Option<Arc<ZoneGrid>>,
+    chunk_states: FastMap<ZoningChunk, ZoningChunkState>,
+    map_revision: u64,
+    view: Option<ZoningView>,
+    visible: Vec<ZoningChunk>,
+    chunks: FastMap<(ZoningChunk, ZoningMode), ZoningChunkMesh>,
     preview: Option<Arc<Mesh>>,
     preview_key: Option<ZoningPreviewMesh>,
     builder: MeshBuilder<false>,
@@ -150,60 +249,121 @@ impl ZoningMeshes {
             return;
         };
         profiling::scope!("zoning_overlay");
-        let revision = (frame.world, frame.grid.generation);
         let cleared = self.updates.take_cleared();
         let updated = self.updates.take_updated_chunks().next().is_some();
-        if self.world_revision != Some(revision) || cleared || updated {
-            self.world_revision = Some(revision);
-            self.key = None;
+        if self.world != Some(frame.world) || cleared {
+            self.world = Some(frame.world);
+            self.grid = None;
+            self.chunk_states.clear();
+            self.chunks.clear();
             self.preview_key = None;
-            self.lots.clear();
+        }
+        if updated {
+            // Subscriber locations are canonical positions. Long roads and building zones can
+            // affect clipping or eligibility well beyond their subscriber chunk.
+            self.map_revision = self.map_revision.wrapping_add(1);
+            self.preview_key = None;
         }
 
-        if self.key != Some(frame.key) {
-            profiling::scope!("build zoning mesh");
-            self.builder.clear();
-            build_painted_cells(map, &frame.grid, frame.key, &mut self.builder);
-            if !frame.key.overview && !frame.grid.cells.is_empty() {
-                let mut tess = self.builder.mk_tess();
-                for project in map
-                    .spatial_map()
-                    .query(frame.key.bounds, ProjectFilter::LOT)
-                {
-                    let ProjectKind::Lot(id) = project else {
-                        continue;
-                    };
-                    let lot = &map.lots()[id];
-                    let zoned = *self.lots.entry(id).or_insert_with(|| {
-                        frame
-                            .grid
-                            .lot_zone(&lot.shape)
-                            .map(|zone| (zone, check_growable_lot(map, lot, zone).map(|_| ())))
-                    });
-                    if let Some((width, color)) = lot_outline(zoned, false) {
-                        draw_lot_outline(
-                            &map.environment,
-                            &mut tess,
-                            lot.shape.corners,
-                            width,
-                            color.into(),
-                        );
-                    }
-                }
+        let grid_changed = !self
+            .grid
+            .as_ref()
+            .is_some_and(|grid| Arc::ptr_eq(grid, &frame.grid));
+        if grid_changed {
+            update_zone_chunks(
+                map,
+                &mut self.chunk_states,
+                self.grid.as_deref(),
+                &frame.grid,
+            );
+            self.grid = Some(frame.grid.clone());
+        }
+
+        if self.view != Some(frame.view)
+            || (grid_changed && frame.view.mode == ZoningMode::Overview)
+        {
+            self.visible.clear();
+            if frame.view.mode == ZoningMode::Overview {
+                self.visible
+                    .extend(self.chunk_states.iter().filter_map(|(&chunk, state)| {
+                        (state.cells != 0
+                            && frame.view.bounds.intersection(chunk.bbox()).area() > 0.0)
+                            .then_some(chunk)
+                    }));
+            } else {
+                self.visible.extend(frame.view.chunks());
             }
-            self.committed = build_zoning_mesh(&mut self.builder, ctx.gfx);
-            self.key = Some(frame.key);
+            self.visible.sort_unstable_by_key(|chunk| {
+                let dx = i32::from(chunk.0) - i32::from(frame.view.center.0);
+                let dy = i32::from(chunk.1) - i32::from(frame.view.center.1);
+                dx * dx + dy * dy
+            });
+            self.view = Some(frame.view);
         }
 
-        let preview = frame.preview;
+        self.draw_chunks(map, &frame, ctx);
+        self.draw_preview(map, frame.preview, ctx);
+    }
+
+    fn draw_chunks(&mut self, map: &Map, frame: &ZoningFrame, ctx: &mut FrameContext<'_>) {
+        if frame.grid.cells.is_empty() {
+            return;
+        }
+        profiling::scope!("zoning chunks");
+        let rebuild_until = Instant::now() + ZONING_REBUILD_BUDGET - ZONING_CHUNK_HEADROOM;
+        let mode = frame.view.mode;
+        let mut lots = Vec::new();
+        for &chunk in &self.visible {
+            let state = self.chunk_states.get(&chunk);
+            let has_cells = state.is_some_and(|state| state.cells != 0);
+            if mode == ZoningMode::Overview && !has_cells {
+                continue;
+            }
+            let revision = ZoningChunkRevision {
+                grid: state.map_or(0, |state| state.grid_revision),
+                lots: if mode == ZoningMode::Overview {
+                    0
+                } else {
+                    state.map_or(0, |state| state.lot_revision)
+                },
+                map: self.map_revision,
+            };
+            let key = (chunk, mode);
+            let cached = match self.chunks.entry(key) {
+                Entry::Occupied(entry) if entry.get().revision == revision => entry.into_mut(),
+                entry if Instant::now() < rebuild_until => {
+                    let rebuilt = build_zoning_chunk(
+                        &mut self.builder,
+                        map,
+                        frame,
+                        chunk,
+                        revision,
+                        has_cells,
+                        ctx.gfx,
+                    );
+                    entry.insert_entry(rebuilt).into_mut()
+                }
+                _ => continue,
+            };
+            if let Some(fill) = &cached.fill {
+                ctx.draw(fill.clone());
+            }
+            lots.extend(cached.visible_lots(&frame.replaced_lots));
+        }
+        // A lot outline can extend into its neighbors' fills. Draw all marks last.
+        if !lots.is_empty() {
+            ctx.draw(lots);
+        }
+    }
+
+    fn draw_preview(&mut self, map: &Map, preview: ZoningPreviewMesh, ctx: &mut FrameContext<'_>) {
         if self.preview_key.as_ref() != Some(&preview) {
             self.builder.clear();
             if let Some(fill) = &preview.fill {
-                for (x, y) in zoning_tiles(fill.area, fill.pitch) {
-                    let tile = tile_bounds(x, y, fill.pitch).intersection(fill.area);
+                for &tile in &fill.tiles {
                     add_zoning_tile(
                         map,
-                        inset_tile(tile, fill.inset),
+                        tile,
                         fill.color,
                         ZONING_FILL_LIFT + 0.04,
                         &mut self.builder,
@@ -220,12 +380,8 @@ impl ZoningMeshes {
                     mark.color,
                 );
             }
-            self.preview = build_zoning_mesh(&mut self.builder, ctx.gfx);
+            self.preview = build_zoning_mesh(&mut self.builder, ctx.gfx).map(Arc::new);
             self.preview_key = Some(preview);
-        }
-
-        if let Some(mesh) = &self.committed {
-            ctx.draw(mesh.clone());
         }
         if let Some(mesh) = &self.preview {
             ctx.draw(mesh.clone());
@@ -233,10 +389,136 @@ impl ZoningMeshes {
     }
 }
 
-fn build_zoning_mesh(builder: &mut MeshBuilder<false>, gfx: &GfxContext) -> Option<Arc<Mesh>> {
+fn update_zone_chunks(
+    map: &Map,
+    chunks: &mut FastMap<ZoningChunk, ZoningChunkState>,
+    previous: Option<&ZoneGrid>,
+    grid: &ZoneGrid,
+) {
+    let Some(previous) = previous else {
+        for &(x, y) in grid.cells.keys() {
+            let chunk = ZoningChunk::new(zone_cell_center(x, y));
+            chunks.entry(chunk).or_default().cells += 1;
+        }
+        return;
+    };
+
+    // The simulation exposes a global generation. Diff its sorted cells to recover exact
+    // chunk revisions, including unzones and paints received while the tool was closed.
+    let mut changed: FastMap<ZoningChunk, Vec<Vec2>> = FastMap::default();
+    for change in previous
+        .cells
+        .iter()
+        .merge_join_by(&grid.cells, |a, b| a.0.cmp(b.0))
+    {
+        let ((x, y), delta) = match change {
+            EitherOrBoth::Left((&key, _)) => (key, -1),
+            EitherOrBoth::Right((&key, _)) => (key, 1),
+            EitherOrBoth::Both((&key, old), (_, new)) if old != new => (key, 0),
+            EitherOrBoth::Both(_, _) => continue,
+        };
+        let center = zone_cell_center(x, y);
+        let chunk = ZoningChunk::new(center);
+        let state = chunks.entry(chunk).or_default();
+        state.cells = state
+            .cells
+            .checked_add_signed(delta)
+            .expect("zone chunk cell count");
+        state.grid_revision = grid.generation;
+        changed.entry(chunk).or_default().push(center);
+    }
+
+    // A lot is drawn in its center chunk, but its vote can use cells across the boundary.
+    for (chunk, cells) in changed {
+        for id in map
+            .spatial_map()
+            .query(chunk.bbox(), ProjectFilter::LOT)
+            .filter_map(ProjectKind::to_lot)
+        {
+            let lot = &map.lots()[id];
+            let owner = ZoningChunk::new(lot.shape.center());
+            if owner != chunk && cells.iter().any(|&cell| lot.shape.contains(cell)) {
+                chunks.entry(owner).or_default().lot_revision = grid.generation;
+            }
+        }
+    }
+}
+
+fn zone_cell_center(x: i32, y: i32) -> Vec2 {
+    (vec2(x as f32, y as f32) + Vec2::splat(0.5)) * ZONE_CELL_SIZE
+}
+
+fn build_zoning_chunk(
+    builder: &mut MeshBuilder<false>,
+    map: &Map,
+    frame: &ZoningFrame,
+    chunk: ZoningChunk,
+    revision: ZoningChunkRevision,
+    has_cells: bool,
+    gfx: &GfxContext,
+) -> ZoningChunkMesh {
+    profiling::scope!("build zoning chunk");
+    builder.clear();
+    let mode = frame.view.mode;
+    if has_cells {
+        build_painted_cells(map, &frame.grid, chunk, mode, builder);
+    }
+
+    let mut lot_ranges = Vec::new();
+    if mode != ZoningMode::Overview {
+        let mut tess = builder.mk_tess();
+        for id in map
+            .spatial_map()
+            .query(chunk.bbox(), ProjectFilter::LOT)
+            .filter_map(ProjectKind::to_lot)
+        {
+            let lot = &map.lots()[id];
+            if ZoningChunk::new(lot.shape.center()) != chunk {
+                continue;
+            }
+            let zoned = frame
+                .grid
+                .lot_zone(&lot.shape)
+                .map(|zone| (zone, check_growable_lot(map, lot, zone).map(|_| ())));
+            if let Some((width, color)) = lot_outline(zoned, false) {
+                let start = tess.indices.len() as u32;
+                draw_lot_outline(
+                    &map.environment,
+                    &mut tess,
+                    lot.shape.corners,
+                    width,
+                    color.into(),
+                );
+                let end = tess.indices.len() as u32;
+                if start < end {
+                    lot_ranges.push((id, start..end));
+                }
+            }
+        }
+    }
+    // Both layers share one upload and retain their original blending order.
+    let (fill, lots) = match (build_zoning_mesh(builder, gfx), lot_ranges.first()) {
+        (Some(mut mesh), Some((_, indices))) if indices.start > 0 => {
+            let mut fill = mesh.clone();
+            fill.lods[0].primitives[0].1.end = indices.start;
+            mesh.lods[0].primitives[0].1.start = indices.start;
+            (Some(Arc::new(fill)), Some(Arc::new(mesh)))
+        }
+        (mesh, Some(_)) => (None, mesh.map(Arc::new)),
+        (mesh, None) => (mesh.map(Arc::new), None),
+    };
+    ZoningChunkMesh {
+        revision,
+        fill,
+        lots,
+        lot_ranges,
+    }
+}
+
+fn build_zoning_mesh(builder: &mut MeshBuilder<false>, gfx: &GfxContext) -> Option<Mesh> {
     let mut mesh = builder.build(gfx)?;
     mesh.skip_depth = true;
-    Some(Arc::new(mesh))
+    Some(mesh)
 }
 
 impl super::MapRenderer {
@@ -258,16 +540,20 @@ impl super::MapRenderer {
             held,
         } = stroke;
         profiling::scope!("zoning_preview");
-        let key = ZoningMeshKey::new(center, distance, pitch == ZONE_CELL_SIZE);
+        let mode = ZoningMode::new(distance, pitch == ZONE_CELL_SIZE);
+        let overview = mode == ZoningMode::Overview;
+        let view = ZoningView::new(center, distance, map.environment.bounds(), mode);
         let replacement = kind.map(|kind| ZoneCell { kind, density });
-        let fill = areas.last().map(|area| ZoningPreviewFill {
-            area: area.bbox(),
-            pitch: if key.overview { ZONE_CELL_SIZE } else { pitch },
-            inset: if key.overview {
-                0.0
-            } else {
-                density_inset(density)
-            },
+        let fill = (!areas.is_empty()).then(|| ZoningPreviewFill {
+            tiles: preview_tiles(
+                areas,
+                if overview { ZONE_CELL_SIZE } else { pitch },
+                if overview {
+                    0.0
+                } else {
+                    density_inset(density)
+                },
+            ),
             color: kind
                 .map_or(LinearColor::new(0.96, 0.28, 0.28, 1.0), |kind| {
                     zone_cell_color(kind, density)
@@ -275,8 +561,8 @@ impl super::MapRenderer {
                 .a(if held { 0.66 } else { 0.50 })
                 .into(),
         });
-        let (outlines, warning) = pointer.map_or_else(
-            || (Vec::new(), None),
+        let (lots, warning) = pointer.map_or_else(
+            || (PreviewLots::default(), None),
             |pointer| {
                 preview_lots(
                     map,
@@ -285,16 +571,19 @@ impl super::MapRenderer {
                     replacement,
                     pointer,
                     hover_radius,
-                    key.overview,
+                    overview,
                 )
             },
         );
-        let preview = ZoningPreviewMesh { fill, outlines };
         ZONING_FRAME.replace(Some(ZoningFrame {
             world,
             grid,
-            key,
-            preview,
+            view,
+            preview: ZoningPreviewMesh {
+                fill,
+                outlines: lots.outlines,
+            },
+            replaced_lots: lots.replaced,
         }));
         warning
     }
@@ -333,7 +622,7 @@ fn preview_lots(
     pointer: Vec2,
     hover_radius: f32,
     overview: bool,
-) -> (Vec<LotOutline>, Option<String>) {
+) -> (PreviewLots, Option<String>) {
     let hover = Circle::new(pointer, hover_radius);
     let affected = paints.iter().map(Shape::bbox).reduce(AABB::union);
     let pointer_bounds = if overview {
@@ -348,7 +637,7 @@ fn preview_lots(
         }
         _ => false,
     });
-    let mut outlines = Vec::new();
+    let mut marks = PreviewLots::default();
     let mut hovered = None;
     let mut blocked = None;
     let mut frontage = false;
@@ -384,8 +673,11 @@ fn preview_lots(
             hovered = zoned.filter(|(_, status)| status.is_err());
         }
         if !overview && (zone != before || zone.is_none()) {
+            if before.is_some() {
+                marks.replaced.insert(id);
+            }
             if let Some((width, color)) = lot_outline(zoned, near_brush) {
-                outlines.push(LotOutline {
+                marks.outlines.push(LotOutline {
                     corners: lot.shape.corners,
                     width,
                     color: color.into(),
@@ -406,7 +698,7 @@ fn preview_lots(
             "Zones need road frontage to grow".into()
         })
     });
-    (outlines, warning)
+    (marks, warning)
 }
 
 fn lot_warning((zone, status): ZonedLot) -> String {
@@ -490,34 +782,48 @@ fn uniform_block(zones: &ZoneGrid, x: i32, y: i32, zone: ZoneCell) -> bool {
         .all(|key| zones.cells.get(key) == Some(&zone))
 }
 
+fn preview_tiles(paints: &[OBB], pitch: f32, inset: f32) -> Vec<AABB> {
+    let mut tiles = std::collections::BTreeMap::new();
+    for area in paints.iter().map(Shape::bbox) {
+        for (x, y) in zoning_tiles(area, pitch) {
+            let part = tile_bounds(x, y, pitch).intersection(area);
+            // All editor stamps use the same storage-aligned map clip. A tile shared
+            // by two stamps has identical bounds and should be drawn only once.
+            tiles.entry((x, y)).or_insert(part);
+        }
+    }
+    tiles
+        .into_values()
+        .map(|tile| inset_tile(tile, inset))
+        .collect()
+}
+
 fn build_painted_cells(
     map: &Map,
     grid: &ZoneGrid,
-    key: ZoningMeshKey,
+    chunk: ZoningChunk,
+    mode: ZoningMode,
     mesh: &mut MeshBuilder<false>,
 ) {
-    let min = (key.bounds.ll / ZONE_CELL_SIZE).floor();
-    let max = (key.bounds.ur / ZONE_CELL_SIZE).ceil();
-    for (&(x, y), &zone) in grid
-        .cells
-        .range((min.x as i32, i32::MIN)..(max.x as i32, i32::MIN))
-    {
-        if !(min.y as i32..max.y as i32).contains(&y) {
-            continue;
+    let min = chunk.corner() / ZONE_CELL_SIZE;
+    let side = (ZoningChunk::SIZE_F32 / ZONE_CELL_SIZE) as i32;
+    let (min_x, min_y) = (min.x as i32, min.y as i32);
+    for x in min_x..min_x + side {
+        for (&(x, y), &zone) in grid.cells.range((x, min_y)..(x, min_y + side)) {
+            let color = zone_cell_color(zone.kind, zone.density).a(0.88);
+            let tile = painted_tile(grid, mode, x, y, zone);
+            add_zoning_tile(map, tile, color.into(), ZONING_FILL_LIFT, mesh);
         }
-        let color = zone_cell_color(zone.kind, zone.density).a(0.88);
-        let tile = painted_tile(grid, key, x, y, zone);
-        add_zoning_tile(map, tile, color.into(), ZONING_FILL_LIFT, mesh);
     }
 }
 
-fn painted_tile(grid: &ZoneGrid, key: ZoningMeshKey, x: i32, y: i32, zone: ZoneCell) -> AABB {
+fn painted_tile(grid: &ZoneGrid, mode: ZoningMode, x: i32, y: i32, zone: ZoneCell) -> AABB {
     let tile = tile_bounds(x, y, ZONE_CELL_SIZE);
     let inset = density_inset(zone.density);
-    if key.overview {
+    if mode == ZoningMode::Overview {
         // Shared XY boundaries are sampled at exactly the same positions in overview.
         tile
-    } else if !key.detail && uniform_block(grid, x & !1, y & !1, zone) {
+    } else if mode == ZoningMode::Coarse && uniform_block(grid, x & !1, y & !1, zone) {
         // Keep the terrain samples at 8 m pitch even inside a visually solid 16 m tile.
         let block = inset_tile(
             tile_bounds(x.div_euclid(2), y.div_euclid(2), 2.0 * ZONE_CELL_SIZE),
@@ -589,6 +895,132 @@ mod zoning_tests {
     use super::*;
 
     #[test]
+    fn u1_zoning_pan_reuses_an_overlapping_chunk() {
+        let map = AABB::new_ll_ur(Vec2::ZERO, Vec2::splat(2048.0));
+        let first = ZoningView::new(Vec2::splat(128.0), 300.0, map, ZoningMode::Coarse);
+        let panned = ZoningView::new(vec2(256.0, 128.0), 300.0, map, ZoningMode::Coarse);
+        assert!(first.bounds != panned.bounds);
+        let keys = |view: ZoningView| {
+            view.chunks()
+                .map(|chunk| (chunk, view.mode))
+                .collect::<FastSet<_>>()
+        };
+        let (first, panned) = (keys(first), keys(panned));
+        assert!(first.intersection(&panned).count() > 0);
+        assert!(panned.difference(&first).count() > 0);
+    }
+
+    #[test]
+    fn u1_zoning_preview_covers_interpolated_stamps_without_filling_the_gap() {
+        let paints = [
+            OBB::new(vec2(24.0, 24.0), Vec2::X, 16.0, 16.0),
+            OBB::new(vec2(40.0, 24.0), Vec2::X, 16.0, 16.0),
+            OBB::new(vec2(40.0, 40.0), Vec2::X, 16.0, 16.0),
+        ];
+        super::super::MapRenderer::queue_zoning_overlay(
+            &Map::default(),
+            Arc::new(ZoneGrid::default()),
+            1,
+            Vec2::ZERO,
+            300.0,
+            ZoningPreview {
+                areas: &paints,
+                pointer: None,
+                hover_radius: 32.0,
+                pitch: 16.0,
+                kind: Some(ZoneKind::Residential),
+                density: Density::Low,
+                held: true,
+            },
+        );
+        let fill = ZONING_FRAME.take().unwrap().preview.fill.unwrap();
+        let covers = |point| fill.tiles.iter().any(|tile| tile.contains(point));
+        assert!(covers(vec2(24.0, 24.0)), "first stamp is visible");
+        assert!(covers(vec2(40.0, 24.0)));
+        assert!(covers(vec2(40.0, 40.0)));
+        assert!(!covers(vec2(24.0, 40.0)));
+        assert_eq!(preview_tiles(&[paints[0], paints[0]], 16.0, 1.2).len(), 1);
+    }
+
+    #[test]
+    fn u1_zoning_paint_revises_only_changed_chunks() {
+        let map = Map::default();
+        let mut grid = ZoneGrid::default();
+        let left = OBB::new(vec2(-4.0, 4.0), Vec2::X, 8.0, 8.0);
+        let right = OBB::new(vec2(4.0, 4.0), Vec2::X, 8.0, 8.0);
+        let left_chunk = ZoningChunk::new(left.center());
+        let right_chunk = ZoningChunk::new(right.center());
+        grid.paint(left, Some(ZoneKind::Office), Density::Low);
+        grid.paint(right, Some(ZoneKind::Office), Density::Low);
+        let mut chunks = FastMap::default();
+        update_zone_chunks(&map, &mut chunks, None, &grid);
+
+        let previous = grid.clone();
+        grid.paint(left, Some(ZoneKind::Office), Density::High);
+        grid.paint(right, Some(ZoneKind::Office), Density::Low);
+        update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
+        assert_eq!(chunks[&left_chunk].grid_revision, grid.generation);
+        assert_eq!(chunks[&left_chunk].cells, 1);
+        assert_eq!(chunks[&right_chunk].grid_revision, 0);
+
+        let previous = grid.clone();
+        grid.paint(left, None, Density::Low);
+        update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
+        assert_eq!(chunks[&left_chunk].grid_revision, grid.generation);
+        assert_eq!(chunks[&left_chunk].cells, 0);
+        assert_eq!(chunks[&right_chunk].grid_revision, 0);
+    }
+
+    #[test]
+    fn u1_zoning_prospective_marks_exclude_committed_lot_indices() {
+        assert_eq!(
+            zoning_visible_ranges(0..60, [12..24, 24..36, 48..60].into_iter()).collect::<Vec<_>>(),
+            [0..12, 36..48]
+        );
+        assert_eq!(zoning_visible_ranges(0..24, [0..24].into_iter()).count(), 0);
+    }
+
+    #[test]
+    fn u1_zoning_cross_chunk_lot_and_erase_preview() {
+        use simulation::map::{Lot, RoadID};
+
+        let mut map = Map::default();
+        map.environment = Environment::new(1, 1);
+        let at = vec2(59.0, 52.0);
+        let height = map.environment.height(at).unwrap();
+        let id = Lot::try_make(&mut map, RoadID::default(), at.z(height), Vec2::X, 20.0).unwrap();
+        let lot = &map.lots()[id];
+        let owner = ZoningChunk::new(lot.shape.center());
+        let area = OBB::new(vec2(60.0, 52.0), Vec2::X, 8.0, 8.0);
+        let painted = ZoningChunk::new(area.center());
+        assert_ne!(painted, owner);
+
+        let mut grid = ZoneGrid::default();
+        grid.paint(lot.shape, Some(ZoneKind::Commercial), Density::High);
+        let (preview, _) = preview_lots(
+            &map,
+            &grid,
+            &[lot.shape],
+            None,
+            lot.shape.center(),
+            20.0,
+            false,
+        );
+        assert!(preview.replaced.contains(&id));
+        assert_eq!(preview.outlines.len(), 1);
+        assert_eq!(preview.outlines[0].width, 0.3);
+
+        let mut chunks = FastMap::default();
+        update_zone_chunks(&map, &mut chunks, None, &grid);
+        let previous = grid.clone();
+        grid.paint(area, None, Density::Low);
+        update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
+        assert_eq!(chunks[&painted].grid_revision, grid.generation);
+        assert_eq!(chunks[&owner].lot_revision, grid.generation);
+        assert_eq!(chunks[&owner].grid_revision, 0);
+    }
+
+    #[test]
     fn u1_zoning_outlines_distinguish_blocked_lots_from_hover_halos() {
         let zone = ZoneCell {
             kind: ZoneKind::Industrial,
@@ -622,10 +1054,9 @@ mod zoning_tests {
             Some(zone.kind),
             zone.density,
         );
-        let center = Vec2::ZERO;
-        let coarse = ZoningMeshKey::new(center, 300.0, false);
-        let detail = ZoningMeshKey::new(center, 300.0, true);
-        let overview = ZoningMeshKey::new(center, 900.0, true);
+        let coarse = ZoningMode::Coarse;
+        let detail = ZoningMode::Detail;
+        let overview = ZoningMode::Overview;
         for key in [coarse, overview] {
             assert_eq!(
                 painted_tile(&grid, key, 0, 0, zone).ur.x,
@@ -772,10 +1203,13 @@ impl MapMeshHandler {
                 updates: sim
                     .map()
                     .subscribe(UpdateType::Road | UpdateType::Building | UpdateType::Terrain),
-                world_revision: None,
-                key: None,
-                lots: Default::default(),
-                committed: None,
+                world: None,
+                grid: None,
+                chunk_states: Default::default(),
+                map_revision: 0,
+                view: None,
+                visible: Vec::new(),
+                chunks: Default::default(),
                 preview: None,
                 preview_key: None,
                 builder: MeshBuilder::new(gfx.tess_material),

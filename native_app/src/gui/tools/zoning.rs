@@ -490,7 +490,10 @@ mod tests {
             let [low, medium, high] =
                 DENSITIES.map(|density| oklab(zone_cell_color(kind, density)));
             for (lighter, deeper) in [(low, medium), (medium, high)] {
-                assert!(lighter.distance(deeper) >= 0.10, "{kind:?} densities");
+                assert!(
+                    lighter.distance(deeper) >= 0.10,
+                    "{kind:?} adjacent densities need an OKLab distance of at least 0.10"
+                );
             }
             for (density, color) in DENSITIES.into_iter().zip([low, medium, high]) {
                 assert!(

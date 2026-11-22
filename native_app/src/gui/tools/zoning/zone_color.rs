@@ -10,6 +10,8 @@ pub fn zone_color(kind: ZoneKind) -> LinearColor {
     }
 }
 
+/// Each density ramp decreases in OKLab lightness. Adjacent swatches are at least
+/// 0.10 apart in Euclidean OKLab distance.
 pub fn zone_cell_color(kind: ZoneKind, density: Density) -> LinearColor {
     let [r, g, b] = match (kind, density) {
         (ZoneKind::Residential, Density::Low) => [0.327, 0.726, 0.392],
