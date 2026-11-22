@@ -7,7 +7,7 @@
   {"Builder": "fill_houses"},
   {"Assert": "NoRejections"},
   {"DumpState": "fill-houses-placement"},
-  {"RunTicks": 3000},
+  {"RunTicks": 3002},
   {"SetOverlay": "Power"},
   {"Screenshot": "power-blackout"},
   {"SetOverlay": "Water"},

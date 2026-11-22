@@ -1,10 +1,11 @@
-use crate::gui::{ErrorTooltip, PotentialCommands, Tool};
+use crate::gui::{ErrorTooltip, PendingPlacement, PlacementPreview, PotentialCommands, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use crate::uiworld::UiWorld;
 use engine::AudioKind;
 use geom::{Degrees, Intersect, OBB};
-use prototypes::{RenderAsset, Size2D};
+use prototypes::{GoodsCompanyID, RenderAsset, Size2D};
+use simulation::economy::progression::{can_build, BuildCapability};
 use simulation::map::special_placement::{snap_special_building, PlacementError};
 use simulation::map::{ProjectFilter, RoadID};
 use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand};
@@ -17,6 +18,7 @@ pub struct SpecialBuildArgs {
 }
 
 pub struct SpecialBuildKind {
+    pub company: Option<GoodsCompanyID>,
     pub make: Box<dyn Fn(&SpecialBuildArgs) -> Vec<WorldCommand> + Send + Sync + 'static>,
     pub size: Size2D,
     pub asset: RenderAsset,
@@ -29,6 +31,7 @@ pub struct SpecialBuildingResource {
     pub last_obb: Option<OBB>,
     pub rotation: Degrees,
     pending_batch_seq: u64,
+    frame: u64,
 }
 
 /// SpecialBuilding tool
@@ -37,31 +40,51 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
     profiling::scope!("gui::specialbuilding");
     let mut state = uiworld.write::<SpecialBuildingResource>();
     let tool = *uiworld.read::<Tool>();
-    let inp = uiworld.read::<InputMap>();
-    let mut draw = uiworld.write::<ImmediateDraw>();
-    let mut sound = uiworld.write::<ImmediateSound>();
-
-    let map = sim.map();
-    let commands = &mut *uiworld.commands();
-    let batch_seq = sim.read::<CommandOutcomes>().batch_seq();
-
-    if let Some(last) = state.last_obb {
-        let resolved = if crate::network::is_singleplayer(uiworld) {
-            batch_seq != state.pending_batch_seq
-        } else {
-            uiworld.received_commands().iter().any(|cmd| {
-                matches!(cmd, WorldCommand::MapBuildSpecialBuilding { pos, .. } if pos.corners == last.corners)
-            })
-        };
-        if resolved {
-            state.last_obb = None;
-        }
-    }
-
-    if !matches!(tool, Tool::SpecialBuilding) {
+    let mut preview = uiworld.write::<PlacementPreview>();
+    if tool != Tool::SpecialBuilding {
         state.opt = None;
+        state.last_obb = None;
+        *preview = PlacementPreview::default();
         return;
     }
+
+    state.frame = state.frame.wrapping_add(1);
+    preview.ghost = None;
+    uiworld.write::<PotentialCommands>().0.clear();
+    let batch_seq = sim.read::<CommandOutcomes>().batch_seq();
+    if let Some(pending) = &preview.pending {
+        let echoed = uiworld
+            .received_commands()
+            .iter()
+            .any(|command| pending.matches(command));
+        let local = crate::network::is_singleplayer(uiworld);
+        if !echoed && (!local || batch_seq == state.pending_batch_seq) {
+            return;
+        }
+        // Singleplayer publishes only accepted commands. Multiplayer echoes attempted
+        // commands, so also check that the exact placement exists in the applied world.
+        let accepted = echoed
+            && (local
+                || sim.map().buildings().values().any(|building| {
+                    building.kind == pending.kind
+                        && building.obb.corners == pending.obb.corners
+                        && building.connected_road == pending.road
+                }));
+        preview.pending = None;
+        state.last_obb = None;
+        if accepted {
+            state.opt = None;
+        }
+    }
+    preview.company = state.opt.as_ref().and_then(|kind| kind.company);
+
+    let inp = uiworld.read::<InputMap>();
+    if goryak::pointer_over_ui(inp.screen.x, inp.screen.y) || engine::pointer_over_egui(inp.screen)
+    {
+        return;
+    }
+    let map = sim.map();
+    let mut draw = uiworld.write::<ImmediateDraw>();
 
     if inp.act.contains(&InputAction::Rotate) {
         state.rotation += Degrees(inp.wheel);
@@ -69,6 +92,7 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
     }
 
     let SpecialBuildKind {
+        company,
         size,
         ref asset,
         ref make,
@@ -103,7 +127,15 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
         }
     };
 
-    let (obb, height, cmds, using_fallback) = if road_snap {
+    if let Some(lock) = company.and_then(|id| can_build(sim, BuildCapability::Prototype(id)).err())
+    {
+        draw(hover_obb, mpos.z, true);
+        *uiworld.write::<ErrorTooltip>() =
+            ErrorTooltip::new(format!("Unlocks at {} citizens", lock.population));
+        return;
+    }
+
+    let (obb, height, cmds, road, using_fallback) = if road_snap {
         let build_commands = |args: &simulation::map::special_placement::SpecialBuildArgs| {
             let cmds = make(&SpecialBuildArgs {
                 obb: args.obb,
@@ -115,7 +147,13 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
             Ok(cmds)
         };
         match snap_special_building(&map, mpos, size, build_commands) {
-            Ok((snap, cmds)) => (snap.obb, snap.height, cmds, snap.using_fallback),
+            Ok((snap, cmds)) => (
+                snap.obb,
+                snap.height,
+                cmds,
+                Some(snap.connected_road),
+                snap.using_fallback,
+            ),
             Err(failure) => {
                 let message = match failure.error {
                     PlacementError::NoRoad => Cow::Borrowed("No road nearby"),
@@ -153,7 +191,7 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
             obb: hover_obb,
             connected_road: None,
         });
-        (hover_obb, mpos.z, cmds, false)
+        (hover_obb, mpos.z, cmds, None, false)
     };
 
     if (!road_snap
@@ -174,17 +212,171 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
     }
 
     draw(obb, height, false);
+    preview.ghost = road.map(|road| (obb, road));
     if using_fallback {
         *uiworld.write::<ErrorTooltip>() =
             ErrorTooltip::new("Placement uses a nearby road because the closest road is blocked");
     }
 
-    if inp.act.contains(&InputAction::Select) {
-        commands.extend(cmds);
-        sound.play("road_lay", AudioKind::Ui);
+    if inp.just_act.contains(&InputAction::Select) {
+        if let Some(WorldCommand::MapBuildSpecialBuilding { kind, .. }) = cmds.last() {
+            preview.pending = Some(PendingPlacement {
+                kind: *kind,
+                obb,
+                road,
+                frame: state.frame,
+            });
+        }
+        uiworld.commands().extend(cmds);
+        uiworld
+            .write::<ImmediateSound>()
+            .play("road_lay", AudioKind::Ui);
         state.last_obb = Some(obb);
         state.pending_batch_seq = batch_seq;
     } else if let Some(last) = cmds.last() {
         uiworld.write::<PotentialCommands>().set(last.clone());
+    }
+}
+
+impl PendingPlacement {
+    fn matches(&self, command: &WorldCommand) -> bool {
+        matches!(command, WorldCommand::MapBuildSpecialBuilding { kind, pos, connected_road, .. }
+            if *kind == self.kind && pos.corners == self.obb.corners && *connected_road == self.road)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use geom::{vec2, vec3, Camera};
+    use scenarios::{builders::grid_city, ScenarioCtx};
+    use simulation::economy::Government;
+    use simulation::map::BuildingKind;
+    use simulation::world_command::WorldCommands;
+    use simulation::{SimulationOptions, SlotId};
+
+    use super::*;
+    use crate::gui::overlays::{effective_overlay, OverlayMode};
+    use crate::rendering::OrbitCamera;
+    use crate::session::{self, WorldReplacement};
+    use crate::uiworld::ReceivedCommands;
+
+    #[test]
+    fn u3_placement_restores_manual_mode_across_gestures_and_worlds() {
+        let options = SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        };
+        let mut fixture = ScenarioCtx::new(options);
+        grid_city(&mut fixture, vec2(700.0, 700.0), 2, 2, 160.0);
+        crate::init::init();
+        let mut uiw = UiWorld::with_defaults();
+        let camera = Camera::new(vec3(770.0, 700.0, 0.0), 1024.0, 768.0);
+        uiw.insert(camera);
+        uiw.insert(OrbitCamera::from_camera(camera));
+
+        let company = GoodsCompanyID::new("school");
+        let prototype = company.prototype();
+        let kind = BuildingKind::GoodsCompany(company);
+        let make = move |args: &SpecialBuildArgs| {
+            vec![WorldCommand::MapBuildSpecialBuilding {
+                kind,
+                pos: args.obb,
+                gen: prototype.bgen,
+                zone: None,
+                connected_road: args.connected_road,
+            }]
+        };
+        let arm = || {
+            *uiw.write::<Tool>() = Tool::SpecialBuilding;
+            uiw.write::<SpecialBuildingResource>().opt = Some(SpecialBuildKind {
+                company: Some(company),
+                make: Box::new(make),
+                size: prototype.size,
+                asset: prototype.asset.clone(),
+                road_snap: true,
+            });
+        };
+        let manual = OverlayMode::Transit;
+        *uiw.write::<OverlayMode>() = manual;
+        let effective = || {
+            effective_overlay(
+                *uiw.read::<OverlayMode>(),
+                *uiw.read::<Tool>(),
+                &uiw.read::<PlacementPreview>(),
+            )
+        };
+        let auto = OverlayMode::Coverage(prototypes::ServiceKind::School);
+
+        arm();
+        uiw.write::<InputMap>().unprojected = Some(vec3(770.0, 688.0, 0.0));
+        specialbuilding(&fixture.sim, &uiw);
+        assert_eq!(effective(), auto);
+        let ghost = uiw
+            .read::<PlacementPreview>()
+            .ghost
+            .expect("valid school ghost");
+        uiw.write::<InputMap>().just_act.insert(InputAction::Select);
+        specialbuilding(&fixture.sim, &uiw);
+        uiw.write::<InputMap>().just_act.clear();
+        assert_eq!(
+            uiw.read::<PlacementPreview>()
+                .pending
+                .as_ref()
+                .unwrap()
+                .obb
+                .corners,
+            ghost.0.corners
+        );
+        let batch = std::mem::take(&mut *uiw.commands());
+        assert_eq!(batch.as_ref().len(), 1);
+
+        let money = fixture.sim.read::<Government>().money;
+        fixture.sim.write::<Government>().money = prototypes::Money::ZERO;
+        fixture.sim.apply_commands(batch.iter());
+        assert!(fixture.sim.read::<CommandOutcomes>().accepted.is_empty());
+        specialbuilding(&fixture.sim, &uiw);
+        assert!(uiw.read::<PlacementPreview>().pending.is_none());
+        assert_eq!(effective(), auto);
+
+        fixture.sim.write::<Government>().money = money;
+        uiw.write::<InputMap>().just_act.insert(InputAction::Select);
+        specialbuilding(&fixture.sim, &uiw);
+        uiw.write::<InputMap>().just_act.clear();
+        let batch = std::mem::take(&mut *uiw.commands());
+        fixture.sim.apply_commands(batch.iter());
+        assert_eq!(fixture.sim.read::<CommandOutcomes>().accepted, [0]);
+        *uiw.write::<ReceivedCommands>() =
+            ReceivedCommands::new(WorldCommands::from(batch.as_ref().to_vec()));
+        specialbuilding(&fixture.sim, &uiw);
+        assert_eq!(effective(), manual);
+        assert!(uiw.read::<PlacementPreview>().ghost.is_none());
+
+        arm();
+        specialbuilding(&fixture.sim, &uiw);
+        session::close_modal(&uiw);
+        assert_eq!(effective(), manual);
+        specialbuilding(&fixture.sim, &uiw);
+
+        arm();
+        specialbuilding(&fixture.sim, &uiw);
+        *uiw.write::<Tool>() = Tool::RoadbuildStraight;
+        specialbuilding(&fixture.sim, &uiw);
+        assert_eq!(effective(), manual);
+        assert!(uiw.read::<SpecialBuildingResource>().opt.is_none());
+
+        arm();
+        specialbuilding(&fixture.sim, &uiw);
+        let next = ScenarioCtx::new(options).sim;
+        session::apply_world_replacement(
+            &uiw,
+            &mut fixture.sim,
+            &mut Simulation::schedule(),
+            WorldReplacement::Snapshot(next, SlotId::new("u3-overlay-test").unwrap()),
+            |_| {},
+        );
+        assert_eq!(effective(), manual);
+        assert!(uiw.read::<PlacementPreview>().company.is_none());
+        assert!(uiw.read::<SpecialBuildingResource>().opt.is_none());
     }
 }

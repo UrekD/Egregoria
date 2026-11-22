@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use prototypes::{try_prototype, ServiceID, ServiceKind, Tick};
+use prototypes::{try_prototype, Power, ServiceID, ServiceKind, Tick};
 use serde::{Deserialize, Serialize};
 
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
@@ -44,6 +44,17 @@ pub enum UtilityNetworkState {
     Ok,
 }
 
+impl UtilityNetworkState {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Updating => "Updating",
+            Self::Disconnected => "Disconnected",
+            Self::Shortage => "Shortage",
+            Self::Ok => "OK",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct UtilityNetworkReadout {
     pub network: Option<ElectricityNetworkID>,
@@ -54,12 +65,72 @@ pub struct UtilityNetworkReadout {
     pub utility_totals: Option<UtilityTotals>,
 }
 
-pub fn utility_network_at_road(_sim: &Simulation, _road: RoadID) -> Option<UtilityNetworkReadout> {
-    None
+/// A missing road has no readout. A live road outside the utility graph is disconnected.
+pub fn utility_network_at_road(sim: &Simulation, road: RoadID) -> Option<UtilityNetworkReadout> {
+    let map = sim.map();
+    map.get(road)?;
+    Some(utility_network_readout(
+        &map,
+        &sim.read::<ElectricityFlow>(),
+        &sim.read::<UtilityFlow>(),
+        map.electricity.net_id(road),
+    ))
+}
+
+/// Read current topology and only report totals belonging to its completed snapshot.
+pub fn utility_network_readout(
+    map: &Map,
+    power: &ElectricityFlow,
+    flow: &UtilityFlow,
+    network: Option<ElectricityNetworkID>,
+) -> UtilityNetworkReadout {
+    use UtilityNetworkState::{Disconnected, Ok, Shortage, Updating};
+
+    let totals = network
+        .filter(|_| flow.topology_generation == Some(map.electricity.generation()))
+        .and_then(|id| flow.by_network.get(&id).map(|totals| (id, *totals)));
+    let Some((id, utility_totals)) = totals else {
+        let state = if network.is_some() {
+            Updating
+        } else {
+            Disconnected
+        };
+        return UtilityNetworkReadout {
+            network,
+            electricity: state,
+            water: state,
+            sewage: state,
+            power_totals: None,
+            utility_totals: None,
+        };
+    };
+
+    let power_totals = power.network_stats(id);
+    let state = |available| if available { Ok } else { Shortage };
+    UtilityNetworkReadout {
+        network,
+        electricity: state(!power_totals.blackout && power_totals.produced_power > Power::ZERO),
+        water: state(utility_totals.has_water()),
+        sewage: state(utility_totals.has_sewage()),
+        power_totals: Some(power_totals),
+        utility_totals: Some(utility_totals),
+    }
+}
+
+pub fn city_field_tick(sim: &Simulation) -> u64 {
+    periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()))
 }
 
 impl UtilityFlow {
     pub(crate) const UPDATE_OFFSET: u64 = 1;
+
+    pub fn topology_revision(map: &Map) -> u64 {
+        map.electricity.generation()
+    }
+
+    pub fn sampled_topology(&self) -> Option<u64> {
+        self.topology_generation
+    }
 
     pub(crate) const fn due(tick: u64) -> bool {
         tick >= CITY_UPDATE_INTERVAL_TICKS
@@ -172,7 +243,7 @@ fn valid_rate(rate: Option<f32>) -> f64 {
 }
 
 pub fn utility_flow_update(sim: &mut Simulation) {
-    let tick = periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()));
+    let tick = city_field_tick(sim);
     if !UtilityFlow::due(tick) {
         return;
     }
@@ -258,5 +329,103 @@ pub fn utility_flow_update(sim: &mut Simulation) {
             totals.sewage_demand = totals.water_demand;
         }
         flow.by_network.insert(network.id, totals);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use geom::{vec2, vec3, Vec2, OBB};
+
+    use super::*;
+    use crate::map_dynamic::electricity_flow_system;
+    use crate::tests::TestCtx;
+    use prototypes::{BuildingGen, GameTime};
+
+    #[test]
+    fn u3_utility_readout_updates_across_connect_and_sever() {
+        use UtilityNetworkState::*;
+
+        let mut test = TestCtx::new();
+        let a_end = vec3(440.0, 100.0, 0.0);
+        let b_end = vec3(440.0, 300.0, 0.0);
+        let initial: Vec<_> = test.g.map().roads().keys().collect();
+        test.build_roads(&[vec3(80.0, 100.0, 0.0), a_end]);
+        test.build_roads(&[vec3(80.0, 300.0, 0.0), b_end]);
+        let roads: Vec<_> = test.g.map().roads().keys().collect();
+        let new: Vec<_> = roads
+            .iter()
+            .copied()
+            .filter(|id| !initial.contains(id))
+            .collect();
+        let [a, b] = new[..] else {
+            panic!("two isolated roads expected")
+        };
+        let house = test
+            .g
+            .map_mut()
+            .build_special_building(
+                &OBB::new(vec2(140.0, 125.0), Vec2::X, 20.0, 20.0),
+                BuildingKind::House,
+                BuildingGen::House,
+                None,
+                Some(a),
+            )
+            .unwrap();
+        test.g.write::<BuildingInfos>().insert(house);
+        crate::souls::residence::on_house_built(&test.g, house);
+
+        let read = |sim: &Simulation, road| utility_network_at_road(sim, road).expect("live road");
+        assert_eq!(read(&test.g, a).water, Updating);
+        assert_eq!(utility_network_at_road(&test.g, RoadID::default()), None);
+
+        let refresh = |sim: &mut Simulation, tick| {
+            sim.write::<GameTime>().tick = Tick(tick);
+            let (world, resources) = sim.world_res();
+            electricity_flow_system(world, resources);
+            utility_flow_update(sim);
+        };
+        refresh(&mut test.g, 3001);
+        assert_ne!(read(&test.g, a).network, read(&test.g, b).network);
+        assert_eq!(read(&test.g, a).electricity, Shortage);
+        assert_eq!(read(&test.g, a).water, Shortage);
+        assert_eq!(read(&test.g, b).electricity, Shortage);
+        assert!(read(&test.g, a).utility_totals.unwrap().water_demand > 0.0);
+        assert_eq!(read(&test.g, b).utility_totals.unwrap().water_demand, 0.0);
+
+        // Seed the latest supply totals so this fixture can isolate topology behavior.
+        let a_net = read(&test.g, a).network.unwrap();
+        {
+            let mut flow = test.g.write::<UtilityFlow>();
+            let totals = flow.by_network.get_mut(&a_net).unwrap();
+            totals.water_production = totals.water_demand;
+            totals.sewage_capacity = 500.0;
+        }
+        assert_eq!(read(&test.g, a).water, Ok);
+        assert_eq!(read(&test.g, a).sewage, Ok);
+        assert_eq!(read(&test.g, b).water, Shortage);
+
+        test.build_roads(&[a_end, b_end]);
+        let bridge = test
+            .g
+            .map()
+            .roads()
+            .keys()
+            .find(|road| !roads.contains(road))
+            .unwrap();
+        assert_eq!(read(&test.g, a).network, read(&test.g, b).network);
+        assert_eq!(read(&test.g, a).water, Updating);
+        assert_eq!(read(&test.g, b).utility_totals, None);
+        refresh(&mut test.g, 6001);
+        assert_eq!(read(&test.g, a), read(&test.g, b));
+
+        test.g.map_mut().remove_road(bridge).unwrap();
+        assert_eq!(read(&test.g, a).water, Updating);
+        assert_eq!(read(&test.g, b).water, Updating);
+        refresh(&mut test.g, 9001);
+        assert_ne!(read(&test.g, a).network, read(&test.g, b).network);
+        assert_eq!(read(&test.g, b).utility_totals.unwrap().water_demand, 0.0);
+
+        test.g.map_mut().electricity.remove_object(b);
+        assert_eq!(read(&test.g, b).water, Disconnected);
     }
 }

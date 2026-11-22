@@ -1,21 +1,18 @@
-use std::time::Instant;
+use std::fmt::Write;
 
 use yakui::widgets::List;
-use yakui::{
-    reflow, use_state, Alignment, Color, CrossAxisAlignment, Dim2, MainAxisAlignment, MainAxisSize,
-    Pivot, TextureId, Vec2,
-};
+use yakui::{Color, CrossAxisAlignment, MainAxisAlignment, MainAxisSize, TextureId, Vec2};
 
 use common::FastMap;
 use engine::wgpu::TextureFormat;
 use engine::{Context, TextureBuilder};
-use geom::{Camera, Degrees, LinearColor, Polygon, Radians, Vec3};
+use geom::{Camera, Degrees, Polygon, Vec3};
 use goryak::{
-    blur_bg, fixed_spacer, image_button, is_hovered, mincolumn, minrow, on_secondary_container,
-    padxy, primary, secondary_container, selectable_label_primary, textc, titlec, HorizScrollSize,
+    image_button, mincolumn, minrow, on_secondary_container, padxy, primary,
+    selectable_label_primary, textc, HorizScrollSize,
 };
 use prototypes::{
-    prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyID, GoodsCompanyPrototype,
+    prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyPrototype,
     Prototype, RenderAsset, ServiceID, ServiceKind,
 };
 use simulation::economy::progression::{can_build, BuildCapability};
@@ -24,10 +21,7 @@ use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 
 use crate::gui::specialbuilding::{SpecialBuildKind, SpecialBuildingResource};
-use crate::gui::{
-    item_icon_yakui, ErrorTooltip, InspectedBuilding, InspectedEntity, PotentialCommands, Tool,
-};
-use crate::rendering::immediate::{ImmediateDraw, OrderKind};
+use crate::gui::{InspectedBuilding, InspectedEntity, PlacementPreview};
 use crate::uiworld::UiWorld;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
@@ -51,6 +45,7 @@ pub fn special_building_properties(uiw: &UiWorld, sim: &Simulation) {
                 if selectable_label_primary(*tab == choice, label).clicked && *tab != choice {
                     *tab = choice;
                     uiw.write::<SpecialBuildingResource>().opt = None;
+                    *uiw.write::<PlacementPreview>() = PlacementPreview::default();
                 }
             }
         });
@@ -70,8 +65,6 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
             l.main_axis_size = MainAxisSize::Min;
             l.item_spacing = 10.0;
             l.show(|| {
-                let selected = use_state(|| None::<GoodsCompanyID>);
-                let tooltip_active = use_state(|| Option::<(GoodsCompanyID, Instant)>::None);
                 for descr in prototypes_iter::<GoodsCompanyPrototype>().filter(|company| {
                     !company.id.is_growable()
                         && company.id.is_service() == (tab == BuildingTab::Services)
@@ -83,12 +76,11 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
                     let service = try_prototype(ServiceID::from(descr.id));
                     let lock = can_build(sim, BuildCapability::Prototype(descr.id)).err();
                     mincolumn(3.0, || {
+                        let selected =
+                            state.opt.as_ref().and_then(|kind| kind.company) == Some(descr.id);
                         let default_col = if lock.is_some() {
                             Color::rgb(140, 140, 140).with_alpha(0.65)
-                        } else if service.is_some()
-                            && *selected.borrow() == Some(descr.id)
-                            && state.opt.is_some()
-                        {
+                        } else if selected {
                             primary()
                         } else {
                             Color::WHITE
@@ -105,127 +97,18 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
                             default_col,
                             hover_col,
                             active_col,
-                            lock.map_or_else(String::new, |lock| {
-                                format!("Unlocks at {} citizens", lock.population)
-                            }),
+                            match (lock, service.map(|service| service.service_kind)) {
+                                (Some(lock), _) => {
+                                    format!("Unlocks at {} citizens", lock.population).into()
+                                }
+                                (
+                                    None,
+                                    Some(ServiceKind::WaterPump | ServiceKind::SewageOutlet),
+                                ) => crate::gui::overlays::UTILITY_EXPLANATION.into(),
+                                (None, Some(_)) => std::borrow::Cow::Borrowed(""),
+                                (None, None) => company_tooltip(descr).into(),
+                            },
                         );
-
-                        let hover_enabled = service.is_none() && lock.is_none();
-                        if hover_enabled && resp.hovering {
-                            tooltip_active.set(Some((descr.id, Instant::now())));
-                        }
-
-                        if hover_enabled
-                            && tooltip_active
-                                .borrow()
-                                .map(|(id, last)| {
-                                    id == descr.id && last.elapsed().as_secs_f32() < 0.2
-                                })
-                                .unwrap_or(false)
-                        {
-                            reflow(
-                                Alignment::TOP_CENTER,
-                                Pivot::BOTTOM_CENTER,
-                                Dim2::pixels(0.0, -20.0),
-                                || {
-                                    let hov_resp = is_hovered(|| {
-                                        blur_bg(
-                                            secondary_container().with_alpha(0.5),
-                                            10.0,
-                                            || {
-                                                padxy(10.0, 10.0, || {
-                                                    mincolumn(3.0, || {
-                                                        titlec(
-                                                            on_secondary_container(),
-                                                            &descr.label,
-                                                        );
-                                                        textc(
-                                                            on_secondary_container(),
-                                                            format!("workers: {}", descr.n_workers),
-                                                        );
-
-                                                        if let Some(ref recipe) = descr.recipe {
-                                                            fixed_spacer((0.0, 10.0));
-                                                            if !recipe.consumption.is_empty() {
-                                                                textc(
-                                                                    on_secondary_container(),
-                                                                    "consumption:",
-                                                                );
-                                                                for item in &recipe.consumption {
-                                                                    item_icon_yakui(
-                                                                        uiw,
-                                                                        item.id,
-                                                                        item.amount,
-                                                                    );
-                                                                }
-                                                                fixed_spacer((0.0, 10.0));
-                                                            }
-                                                            if !recipe.production.is_empty() {
-                                                                textc(
-                                                                    on_secondary_container(),
-                                                                    "production:",
-                                                                );
-                                                                for item in &recipe.production {
-                                                                    item_icon_yakui(
-                                                                        uiw,
-                                                                        item.id,
-                                                                        item.amount,
-                                                                    );
-                                                                }
-                                                                fixed_spacer((0.0, 10.0));
-                                                            }
-                                                            textc(
-                                                                on_secondary_container(),
-                                                                format!(
-                                                                    "time: {}",
-                                                                    recipe.duration
-                                                                ),
-                                                            );
-                                                            textc(
-                                                                on_secondary_container(),
-                                                                format!(
-                                                                    "storage multiplier: {}",
-                                                                    recipe.storage_multiplier
-                                                                ),
-                                                            );
-                                                        }
-
-                                                        if let Some(p) = descr.power_consumption {
-                                                            fixed_spacer((0.0, 10.0));
-                                                            textc(
-                                                                on_secondary_container(),
-                                                                format!("Power: {}", p),
-                                                            );
-                                                        }
-                                                        if let Some(p) = descr.power_production {
-                                                            fixed_spacer((0.0, 10.0));
-                                                            let output = if descr.zone.is_some() {
-                                                                format!(
-                                                                    "{} W/m²",
-                                                                    p.watts() as f64
-                                                                        / f64::from(MAX_ZONE_AREA)
-                                                                )
-                                                            } else {
-                                                                p.to_string()
-                                                            };
-                                                            textc(
-                                                                on_secondary_container(),
-                                                                format!(
-                                                                    "Power production: {output}"
-                                                                ),
-                                                            );
-                                                        }
-                                                    });
-                                                });
-                                            },
-                                        );
-                                    });
-                                    if hov_resp.hovered {
-                                        tooltip_active.set(Some((descr.id, Instant::now())));
-                                    }
-                                },
-                            );
-                        }
 
                         if let Some(service) = service {
                             textc(on_secondary_container(), &descr.label);
@@ -280,13 +163,20 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
                         if lock.is_some() && service.is_none() {
                             textc(on_secondary_container().with_alpha(0.65), &descr.label);
                         }
-
                         if resp.clicked && lock.is_none() {
-                            selected.set(Some(descr.id));
+                            *uiw.write::<PlacementPreview>() = PlacementPreview {
+                                company: (!selected).then_some(descr.id),
+                                ..PlacementPreview::default()
+                            };
+                            if selected {
+                                state.opt = None;
+                                return;
+                            }
                             let bkind = BuildingKind::GoodsCompany(descr.id);
                             let bgen = descr.bgen;
                             let has_zone = descr.zone.is_some();
                             state.opt = Some(SpecialBuildKind {
+                                company: Some(descr.id),
                                 road_snap: true,
                                 make: Box::new(move |args| {
                                     vec![WorldCommand::MapBuildSpecialBuilding {
@@ -362,53 +252,38 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
      */
 }
 
-/// Draw the radius around the same snapped footprint used by the placement tool.
-pub(crate) fn draw_service_radius(sim: &Simulation, uiw: &UiWorld, draw: &mut ImmediateDraw) {
-    if *uiw.read::<Tool>() != Tool::SpecialBuilding || uiw.read::<ErrorTooltip>().msg.is_some() {
-        return;
+fn company_tooltip(company: &GoodsCompanyPrototype) -> String {
+    let mut text = format!("{}\n{} workers", company.label, company.n_workers);
+    if let Some(recipe) = &company.recipe {
+        for (heading, items) in [
+            ("Consumes", &recipe.consumption),
+            ("Produces", &recipe.production),
+        ] {
+            if !items.is_empty() {
+                let _ = write!(text, "\n{heading}");
+                for item in items {
+                    let _ = write!(text, "\n  {} × {}", item.amount, item.id.prototype().label);
+                }
+            }
+        }
+        let _ = write!(
+            text,
+            "\nProduction time {}\nStorage multiplier {}",
+            recipe.duration, recipe.storage_multiplier
+        );
     }
-    let potential = uiw.read::<PotentialCommands>();
-    let Some(WorldCommand::MapBuildSpecialBuilding {
-        pos,
-        kind: BuildingKind::GoodsCompany(id),
-        ..
-    }) = potential.0.last()
-    else {
-        return;
-    };
-    let Some(service) = try_prototype(ServiceID::from(*id)) else {
-        return;
-    };
-    if matches!(
-        service.service_kind,
-        ServiceKind::WaterPump | ServiceKind::SewageOutlet
-    ) {
-        return;
+    if let Some(power) = company.power_consumption {
+        let _ = write!(text, "\nPower demand {power}");
     }
-    let center = pos.center();
-
-    // The cost tooltip can retain its command while the pointer is over UI.
-    // Only draw the radius when the placement tool drew a preview this frame.
-    if !draw.orders.iter().any(|order| match &order.kind {
-        OrderKind::Mesh { pos, .. } => pos.xy() == center,
-        OrderKind::TexturedOBB { obb, .. } => obb.center() == center,
-        _ => false,
-    }) {
-        return;
+    if let Some(power) = company.power_production {
+        if company.zone.is_some() {
+            let density = power.watts() as f64 / f64::from(MAX_ZONE_AREA);
+            let _ = write!(text, "\nPower production {density:.2} W/m²");
+        } else {
+            let _ = write!(text, "\nPower production {power}");
+        }
     }
-
-    let map = sim.map();
-    let radius = service.radius_m;
-    const SEGMENTS: usize = 128;
-    let points = (0..SEGMENTS)
-        .map(|i| {
-            let angle = Radians(i as f32 * std::f32::consts::TAU / SEGMENTS as f32);
-            let xy = center + angle.vec2() * radius;
-            xy.z(map.environment.height(xy).unwrap_or_default().max(0.0) + 0.4)
-        })
-        .collect::<Vec<_>>();
-    draw.polyline(points, 5.0, true)
-        .color(LinearColor::new(0.14, 0.85, 0.92, 0.90));
+    text
 }
 
 #[derive(Default)]
@@ -473,5 +348,55 @@ pub fn do_icons(ctx: &mut Context, uiw: &UiWorld) {
         let tex_id = ctx.yakui.add_texture(&t);
 
         state.ids.insert(building.id, tex_id);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use scenarios::ScenarioCtx;
+    use simulation::SimulationOptions;
+    use yakui::event::Event;
+    use yakui::{offset, Rect, Yakui};
+
+    use super::*;
+
+    #[test]
+    fn u3_company_tooltip_fits_a_1024_by_768_viewport_at_double_scale() {
+        let _fixture = ScenarioCtx::new(SimulationOptions::LEGACY);
+        let label = prototypes_iter::<GoodsCompanyPrototype>()
+            .filter(|company| !company.id.is_growable() && !company.id.is_service())
+            .map(company_tooltip)
+            .max_by_key(|text| text.lines().count())
+            .unwrap();
+        let mut ui = Yakui::new();
+        let size = Vec2::new(1024.0, 768.0);
+        ui.set_surface_size(size);
+        ui.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, size));
+        ui.set_scale_factor(2.0);
+
+        let frame = |ui: &mut Yakui| {
+            ui.start();
+            let mut button = None;
+            offset(Vec2::new(446.0, 348.0), || {
+                button = Some(goryak::tooltip(label.clone(), || yakui::button("Company")).id);
+            });
+            goryak::render_tooltip();
+            ui.finish();
+            ui.paint();
+            ui.layout_dom().get(button.unwrap()).unwrap().rect
+        };
+        let card = frame(&mut ui);
+        let cursor = (card.pos() + card.size() * 0.5) * 2.0;
+        ui.handle_event(Event::CursorMoved(Some(cursor)));
+        frame(&mut ui);
+
+        let dom = ui.dom();
+        let layer = *dom.get(dom.root()).unwrap().children.last().unwrap();
+        let tooltip = dom.get(layer).unwrap().children[0];
+        let layout = ui.layout_dom();
+        let rect = layout.get(tooltip).unwrap().rect;
+        assert!(rect.size().x > 0.0 && rect.size().y > 0.0);
+        assert!(layout.viewport().contains_point(rect.pos()));
+        assert!(layout.viewport().contains_point(rect.pos() + rect.size()));
     }
 }

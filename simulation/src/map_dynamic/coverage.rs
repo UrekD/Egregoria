@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
-use geom::Vec3;
+use geom::{Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use prototypes::{try_prototype, ServiceID, ServiceKind};
 use serde::{Deserialize, Serialize};
@@ -32,6 +32,38 @@ impl CoverageGrid {
     pub fn revision(&self, kind: ServiceKind) -> u64 {
         self.revisions.get(&kind).copied().unwrap_or_default()
     }
+}
+
+#[derive(Clone, Copy)]
+pub struct ServiceReachSource {
+    pub building: BuildingID,
+    pub center: Vec2,
+    pub radius_m: f32,
+    pub effective_capacity: f32,
+}
+
+/// Service providers on the map, including inactive facilities for display.
+pub fn service_reach_sources(sim: &Simulation, kind: ServiceKind) -> Vec<ServiceReachSource> {
+    let active: BTreeMap<_, _> = active_providers(sim, kind)
+        .into_iter()
+        .map(|provider| (provider.building, provider.capacity))
+        .collect();
+    let map = sim.map();
+    let mut sources: Vec<_> = map
+        .buildings()
+        .values()
+        .filter_map(|building| {
+            let service = try_prototype(ServiceID::from(building.kind.as_goods_company()?))?;
+            (service.service_kind == kind).then(|| ServiceReachSource {
+                building: building.id,
+                center: building.obb.center(),
+                radius_m: service.radius_m,
+                effective_capacity: active.get(&building.id).copied().unwrap_or(0.0),
+            })
+        })
+        .collect();
+    sources.sort_unstable_by_key(|source| source.building);
+    sources
 }
 
 const COVERAGE_KINDS: [ServiceKind; 6] = [

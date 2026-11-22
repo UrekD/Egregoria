@@ -1,6 +1,7 @@
 mod ground;
 mod legend;
 pub(crate) use ground::prepare_ground;
+pub(crate) use legend::UTILITY_EXPLANATION;
 mod traffic;
 mod transit;
 pub(crate) mod view;
@@ -9,19 +10,18 @@ use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use common::{ChunkID_256, FastMap};
-use geom::{vec2, InfiniteFrustrum, Intersect3, Shape, Vec2, AABB, AABB3, OBB};
+use geom::{InfiniteFrustrum, Intersect3, Shape, AABB, AABB3, OBB};
 use goryak::{combo_box, tooltip};
-use prototypes::{try_prototype, ServiceID, ServiceKind, TICKS_PER_HOUR};
+use prototypes::{try_prototype, GoodsCompanyID, Power, ServiceID, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer};
-use simulation::map::{Building, BuildingID, BuildingKind, Map, MapSubscriber, UpdateType};
+use simulation::map::{Building, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
-    CoverageGrid, ElectricityFlow, EnvGrid, Transit, UtilityFlow, UtilityStatus,
+    city_field_tick, service_reach_sources, utility_network_readout, CoverageGrid, ElectricityFlow,
+    Transit, UtilityFlow, UtilityNetworkReadout, UtilityNetworkState,
 };
-use simulation::souls::happiness::Happiness;
-use simulation::souls::residence::{self, Residences};
+use simulation::souls::residence;
 use simulation::Simulation;
 
-use crate::gui::hud::toolbox::building::draw_service_radius;
 use crate::gui::{PlacementPreview, Tool};
 use crate::rendering::immediate::ImmediateDraw;
 
@@ -44,10 +44,36 @@ pub(crate) enum OverlayMode {
 
 pub(crate) fn effective_overlay(
     manual: OverlayMode,
-    _tool: Tool,
-    _preview: &PlacementPreview,
+    tool: Tool,
+    preview: &PlacementPreview,
 ) -> OverlayMode {
+    if tool == Tool::SpecialBuilding {
+        if let Some(mode) = preview.company.and_then(placement_overlay) {
+            return mode;
+        }
+    }
     manual
+}
+
+fn placement_overlay(company: GoodsCompanyID) -> Option<OverlayMode> {
+    if let Some(service) = try_prototype(ServiceID::from(company)) {
+        return Some(match service.service_kind {
+            ServiceKind::WaterPump => OverlayMode::Water,
+            ServiceKind::SewageOutlet => OverlayMode::Sewage,
+            kind => OverlayMode::Coverage(kind),
+        });
+    }
+    let prototype = try_prototype(company)?;
+    if prototype
+        .power_production
+        .is_some_and(|power| power > Power::ZERO)
+    {
+        Some(OverlayMode::Power)
+    } else if prototype.pollution.is_some_and(|pollution| pollution > 0.0) {
+        Some(OverlayMode::Pollution)
+    } else {
+        None
+    }
 }
 
 fn current_overlay(manual: OverlayMode, uiworld: &UiWorld) -> OverlayMode {
@@ -147,34 +173,64 @@ thread_local! {
 pub(crate) fn reset_world_cache() {
     CACHE.with_borrow_mut(|cache| *cache = OverlayCache::default());
     view::reset_world_cache();
+    ground::reset_world_cache();
 }
 
 #[cfg(test)]
 pub(crate) fn world_cache_is_clear() -> bool {
     CACHE.with_borrow(|cache| cache.changes.is_none() && cache.tiles.chunks.is_empty())
         && view::world_cache_is_clear()
+        && ground::world_cache_is_clear()
 }
 
 const FOOTPRINT_PADDING: f32 = 6.0;
 
 impl OverlayMode {
-    fn data_version(self, sim: &Simulation, map: &Map, tick: u64) -> u64 {
+    fn data_version(self, sim: &Simulation, map: &Map, _tick: u64) -> u64 {
         match self {
             Self::Off | Self::Traffic => 0,
-            Self::Power => power_version(map, &sim.read::<ElectricityFlow>()),
+            Self::Power => power_version(
+                map,
+                &sim.read::<ElectricityFlow>(),
+                &sim.read::<UtilityFlow>(),
+            ),
             Self::Transit => transit::invalidation_key(&sim.read::<Transit>()),
             Self::Coverage(kind) => sim.read::<CoverageGrid>().revision(kind),
-            Self::Water | Self::Sewage | Self::Pollution | Self::LandValue => tick / 3000,
-            Self::Happiness => tick / TICKS_PER_HOUR,
+            Self::Water | Self::Sewage => city_field_tick(sim).saturating_sub(1) / 3000,
+            Self::Pollution | Self::LandValue => environment_version(sim),
+            Self::Happiness => city_field_tick(sim).saturating_sub(3) / TICKS_PER_HOUR,
         }
     }
 }
 
-fn power_version(map: &Map, flow: &ElectricityFlow) -> u64 {
+impl OverlayMode {
+    fn is_utility(self) -> bool {
+        matches!(self, Self::Power | Self::Water | Self::Sewage)
+    }
+
+    fn utility_state(self, readout: &UtilityNetworkReadout) -> UtilityNetworkState {
+        match self {
+            Self::Power => readout.electricity,
+            Self::Water => readout.water,
+            Self::Sewage => readout.sewage,
+            _ => unreachable!(),
+        }
+    }
+}
+
+fn environment_version(sim: &Simulation) -> u64 {
+    city_field_tick(sim).saturating_sub(2) / 3000
+}
+
+fn power_version(map: &Map, power: &ElectricityFlow, flow: &UtilityFlow) -> u64 {
     let mut hash = DefaultHasher::new();
+    UtilityFlow::topology_revision(map).hash(&mut hash);
+    flow.sampled_topology().hash(&mut hash);
     for network in map.electricity.networks() {
+        let totals = power.network_stats(network.id);
         network.id.hash(&mut hash);
-        flow.blackout(network.id).hash(&mut hash);
+        totals.blackout.hash(&mut hash);
+        (totals.produced_power > Power::ZERO).hash(&mut hash);
     }
     hash.finish()
 }
@@ -182,7 +238,6 @@ fn power_version(map: &Map, flow: &ElectricityFlow) -> u64 {
 pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
     let mode = current_overlay(*uiworld.read::<OverlayMode>(), uiworld);
     let mut draw = uiworld.write::<ImmediateDraw>();
-    draw_service_radius(sim, uiworld, &mut draw);
 
     CACHE.with_borrow_mut(|cache| {
         if mode == OverlayMode::Off {
@@ -269,118 +324,108 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
         return;
     };
 
-    if mode == OverlayMode::Pollution {
-        let env = sim.read::<EnvGrid>();
-        let size = EnvGrid::CELL_SIZE;
-        for (&(x, y), cell) in &env.cells {
-            let center = vec2(x as f32 + 0.5, y as f32 + 0.5) * size;
-            if let Some(z) = map.environment.height(center) {
-                tiles.push(
-                    OBB::new(center, Vec2::X, size, size),
-                    z + 0.2,
-                    scale.color(cell.pollution),
-                );
-            }
-        }
-        return;
-    }
-
     if let OverlayMode::Coverage(kind) = mode {
         let coverage = sim.read::<CoverageGrid>();
-        for building in map.buildings().values() {
-            let service = building
-                .kind
-                .as_goods_company()
-                .and_then(|id| try_prototype(ServiceID::from(id)));
-            let z = building.height + 0.35;
-            if service.is_some_and(|proto| proto.service_kind == kind) {
-                tiles.push_outline(
-                    building.obb.expand(2.0 * FOOTPRINT_PADDING),
-                    z,
-                    legend::COVERAGE_PROVIDER_COLOR,
-                );
-            } else if is_coverage_receiver(building.kind) {
-                tiles.push(
-                    building.obb.expand(FOOTPRINT_PADDING),
-                    z,
-                    scale.color(coverage.coverage(building.id, kind)),
-                );
-            }
+        for source in service_reach_sources(sim, kind) {
+            let building = &map.buildings()[source.building];
+            let color = if source.effective_capacity > 0.0 {
+                legend::COVERAGE_PROVIDER_COLOR
+            } else {
+                legend::INACTIVE_PROVIDER_COLOR
+            };
+            tiles.push_outline(
+                building.obb.expand(2.0 * FOOTPRINT_PADDING),
+                building.height + 0.35,
+                color,
+            );
         }
-        return;
+        for building in map
+            .buildings()
+            .values()
+            .filter(|b| is_coverage_receiver(b.kind))
+        {
+            tiles.push(
+                building.obb.expand(FOOTPRINT_PADDING),
+                building.height + 0.35,
+                scale.color(coverage.coverage(building.id, kind)),
+            );
+        }
     }
 
-    let mut buildings = |value: &dyn Fn(&Building) -> Option<f32>| {
-        for building in map.buildings().values() {
-            if let Some(value) = value(building) {
-                // Keep a visible border around asset meshes and procedural boxes.
-                let footprint = match building.kind {
-                    BuildingKind::GoodsCompany(company)
-                        if company.is_growable()
-                            || try_prototype(company).is_none_or(|proto| {
-                                proto.asset.is_mesh() || proto.zone.is_some()
-                            }) =>
-                    {
-                        building.obb.expand(FOOTPRINT_PADDING)
-                    }
-                    _ => building.obb,
-                };
-                tiles.push(footprint, building.height + 0.35, scale.color(value));
-            }
-        }
-    };
+    if mode.is_utility() {
+        collect_utility_markers(sim, map, mode, tiles);
+    }
+}
 
-    match mode {
-        OverlayMode::Power => {
-            let flow = sim.read::<ElectricityFlow>();
-            buildings(&|b| {
-                matches!(b.kind, BuildingKind::House | BuildingKind::GoodsCompany(_))
-                    .then(|| f32::from(power_available(map, &flow, b.id)))
-            });
+fn collect_utility_markers(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut TileIndex) {
+    let power = sim.read::<ElectricityFlow>();
+    let flow = sim.read::<UtilityFlow>();
+    let mut states = FastMap::default();
+    for building in map.buildings().values() {
+        let company = building.kind.as_goods_company().and_then(try_prototype);
+        let service = company.and_then(|proto| try_prototype(ServiceID::from(proto.id)));
+        let provider = match mode {
+            OverlayMode::Power => company
+                .and_then(|proto| proto.power_production)
+                .is_some_and(|supply| supply > Power::ZERO),
+            OverlayMode::Water => service.is_some_and(|p| p.service_kind == ServiceKind::WaterPump),
+            OverlayMode::Sewage => {
+                service.is_some_and(|p| p.service_kind == ServiceKind::SewageOutlet)
+            }
+            _ => unreachable!(),
+        };
+        let consumer = if mode == OverlayMode::Power {
+            matches!(
+                building.kind,
+                BuildingKind::House | BuildingKind::GoodsCompany(_)
+            )
+        } else {
+            match building.kind {
+                BuildingKind::House => residence::uses_water(sim, building.id),
+                _ => company
+                    .and_then(|p| p.water_consumption)
+                    .is_some_and(|rate| rate > 0.0),
+            }
+        };
+        if !provider && !consumer {
+            continue;
         }
-        OverlayMode::Water | OverlayMode::Sewage => {
-            let flow = sim.read::<UtilityFlow>();
-            let residences = sim.read::<Residences>();
-            buildings(&|b| {
-                if b.kind == BuildingKind::House && !residence::uses_water(sim, b.id) {
-                    return None;
-                }
-                let status = flow.status(map, &residences, b.id)?;
-                let relevant = if mode == OverlayMode::Water {
-                    status.water
-                } else {
-                    status.sewage
-                };
-                Some(f32::from(relevant == UtilityStatus::Served))
-            });
+        let network = map
+            .electricity
+            .net_id(building.id)
+            .filter(|_| !building.is_orphaned());
+        let state = *states.entry(network).or_insert_with(|| {
+            mode.utility_state(&utility_network_readout(map, &power, &flow, network))
+        });
+        let color = legend::utility_color(state);
+        let footprint = marker_footprint(building);
+        tiles.push(footprint, building.height + 0.35, color);
+        if provider {
+            tiles.push_outline(
+                footprint.expand(FOOTPRINT_PADDING),
+                building.height + 0.35,
+                legend::COVERAGE_PROVIDER_COLOR,
+            );
         }
-        OverlayMode::LandValue => {
-            let env = sim.read::<EnvGrid>();
-            buildings(&|b| is_coverage_receiver(b.kind).then(|| f32::from(env.land_value(b.id))));
+    }
+}
+
+fn marker_footprint(building: &Building) -> OBB {
+    match building.kind {
+        BuildingKind::GoodsCompany(company)
+            if company.is_growable()
+                || try_prototype(company)
+                    .is_none_or(|proto| proto.asset.is_mesh() || proto.zone.is_some()) =>
+        {
+            building.obb.expand(FOOTPRINT_PADDING)
         }
-        OverlayMode::Happiness => {
-            let happiness = sim.read::<Happiness>();
-            buildings(&|b| happiness.by_building.get(&b.id).copied().map(f32::from));
-        }
-        OverlayMode::Coverage(_)
-        | OverlayMode::Pollution
-        | OverlayMode::Off
-        | OverlayMode::Transit
-        | OverlayMode::Traffic => {}
+        _ => building.obb,
     }
 }
 
 pub(crate) fn is_coverage_receiver(kind: BuildingKind) -> bool {
     matches!(kind, BuildingKind::House)
         || kind.as_goods_company().is_some_and(|id| id.is_growable())
-}
-
-pub(crate) fn power_available(map: &Map, flow: &ElectricityFlow, building: BuildingID) -> bool {
-    map.get(building).is_some_and(|b| !b.is_orphaned())
-        && map
-            .electricity
-            .net_id(building)
-            .is_some_and(|network| !flow.blackout(network))
 }
 
 pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
@@ -420,7 +465,7 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
         *manual = modes[selected].0;
     }
     let mode = current_overlay(*manual, uiworld);
-    let empty = CACHE.with_borrow(|cache| cache.mode == mode && cache.tiles.chunks.is_empty());
+    let empty = ground::is_empty(mode);
     match mode {
         Transit => {
             let empty = uiworld.read::<ImmediateDraw>().persistent_orders.is_empty();
@@ -440,6 +485,41 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geom::{vec2, Vec2};
+
+    #[test]
+    fn u3_placement_overlay_and_manual_restore() {
+        use prototypes::GoodsCompanyID;
+        use scenarios::ScenarioCtx;
+        use simulation::SimulationOptions;
+
+        let _test = ScenarioCtx::new(SimulationOptions::LEGACY);
+        let manual = OverlayMode::Transit;
+        let mut preview = PlacementPreview::default();
+        for (prototype, expected) in [
+            ("coal-power-plant", OverlayMode::Power),
+            ("flour-factory", OverlayMode::Pollution),
+            ("school", OverlayMode::Coverage(ServiceKind::School)),
+            ("clinic", OverlayMode::Coverage(ServiceKind::Health)),
+            ("police-station", OverlayMode::Coverage(ServiceKind::Police)),
+            ("fire-station", OverlayMode::Coverage(ServiceKind::Fire)),
+            ("park", OverlayMode::Coverage(ServiceKind::Park)),
+            ("water-pump", OverlayMode::Water),
+            ("sewage-outlet", OverlayMode::Sewage),
+        ] {
+            preview.company = Some(GoodsCompanyID::new(prototype));
+            assert_eq!(
+                effective_overlay(manual, Tool::SpecialBuilding, &preview),
+                expected,
+                "{prototype}"
+            );
+            assert_eq!(effective_overlay(manual, Tool::Hand, &preview), manual);
+        }
+        assert_eq!(
+            effective_overlay(manual, Tool::SpecialBuilding, &PlacementPreview::default()),
+            manual
+        );
+    }
 
     #[test]
     fn coverage_overlay_uses_high_opacity_for_uncovered_receivers() {
@@ -508,7 +588,7 @@ mod tests {
             .chunks
             .values()
             .flatten()
-            .filter(|tile| tile.color == legend::COVERAGE_PROVIDER_COLOR)
+            .filter(|tile| tile.color == legend::INACTIVE_PROVIDER_COLOR)
             .collect();
         assert_eq!(outlines.len(), 4);
         assert!(outlines
