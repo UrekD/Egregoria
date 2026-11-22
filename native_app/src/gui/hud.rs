@@ -8,7 +8,7 @@ use yakui::{reflow, Alignment, Color, Dim2, Pivot, Vec2};
 use simulation::map_dynamic::ElectricityFlow;
 use simulation::Simulation;
 
-use crate::gui::hud::menu::menu_bar;
+use crate::gui::hud::menu::{menu_bar, render_departure};
 use crate::gui::hud::time_controls::time_controls;
 use crate::gui::hud::toolbox::new_toolbox;
 use crate::gui::inspect::new_inspector;
@@ -38,12 +38,16 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
         return;
     }
     if !session::playing(uiworld) {
-        uiworld.write::<GuiState>().windows.render_session(uiworld, sim);
+        let mut gui = uiworld.write::<GuiState>();
+        let show_unfinished_ui = gui.show_unfinished_ui;
+        gui.windows.render_session(uiworld, sim, show_unfinished_ui);
+        drop(gui);
         keybinds::keybind_modal(uiworld, sim);
         startup_save_message(uiworld);
         return;
     }
     if !session::world_interaction(uiworld) {
+        render_departure(uiworld);
         return;
     }
     if session::can_save(uiworld) {
@@ -64,12 +68,17 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
         new_toolbox(uiworld, sim);
         menu_bar(uiworld, sim);
         if !session::world_interaction(uiworld) {
+            render_departure(uiworld);
             return;
         }
         demand_bars::render(uiworld, sim);
         chat::chat(uiworld, sim);
         new_inspector(uiworld, sim);
-        uiworld.write::<GuiState>().windows.render(uiworld, sim);
+        {
+            let mut gui = uiworld.write::<GuiState>();
+            let show_unfinished_ui = gui.show_unfinished_ui;
+            gui.windows.render(uiworld, sim, show_unfinished_ui);
+        }
         time_controls(uiworld, sim);
         yakui::column(|| toasts::render(sim, uiworld));
         keybinds::keybind_modal(uiworld, sim);

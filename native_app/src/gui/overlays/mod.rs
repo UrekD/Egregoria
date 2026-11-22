@@ -1,4 +1,5 @@
 mod legend;
+mod traffic;
 mod transit;
 pub(crate) mod view;
 
@@ -215,6 +216,7 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
                 if rebuild {
                     draw.clear_persistent();
                 }
+                traffic::draw(sim, &map, uiworld, &mut draw, rebuild);
                 return;
             }
             _ => {}
@@ -338,7 +340,7 @@ pub(crate) fn power_available(map: &Map, flow: &ElectricityFlow, building: Build
             .is_some_and(|network| !flow.blackout(network))
 }
 
-pub(crate) fn selector(uiworld: &UiWorld) {
+pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
     use OverlayMode::*;
 
     const MODES: [(OverlayMode, &str); 15] = [
@@ -359,13 +361,18 @@ pub(crate) fn selector(uiworld: &UiWorld) {
         (Traffic, "Traffic"),
     ];
 
+    // Traffic is the last entry until its renderer and legend land.
+    let show_traffic = traffic::AVAILABLE || show_unfinished_ui;
+    let count = MODES.len() - usize::from(!show_traffic);
+    let modes = &MODES[..count];
+    let labels = MODES.map(|(_, label)| label);
     let mut mode = uiworld.write::<OverlayMode>();
-    let mut selected = MODES
+    let mut selected = modes
         .iter()
         .position(|(option, _)| *option == *mode)
         .unwrap_or(0);
-    if combo_box(&mut selected, &MODES.map(|(_, label)| label), 200.0) {
-        *mode = MODES[selected].0;
+    if combo_box(&mut selected, &labels[..count], 170.0) {
+        *mode = modes[selected].0;
     }
     let empty = CACHE.with_borrow(|cache| cache.mode == *mode && cache.tiles.chunks.is_empty());
     match *mode {
@@ -373,7 +380,8 @@ pub(crate) fn selector(uiworld: &UiWorld) {
             let empty = uiworld.read::<ImmediateDraw>().persistent_orders.is_empty();
             transit::legend(empty);
         }
-        _ => legend::render(*mode, MODES[selected].1, empty),
+        Traffic if !show_traffic => {}
+        _ => legend::render(*mode, labels[selected], empty, uiworld),
     }
 }
 

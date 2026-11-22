@@ -76,22 +76,25 @@ pub fn debug_window(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
     }
 
     let mut opened = uiworld.read::<GuiState>().debug_window;
-    debug(
-        egui::Window::new("Debug").open(&mut opened),
-        ui,
-        uiworld,
-        sim,
-    );
+    let mut window = egui::Window::new("Debug").open(&mut opened);
+    if crate::session::world_interaction(uiworld) {
+        window = window.vscroll(true).max_height(ui.screen_rect().height() * 0.8);
+    }
+    debug(window, ui, uiworld, sim);
     uiworld.write::<GuiState>().debug_window = opened;
 }
 
 /// debug window for various debug options
 fn debug(window: egui::Window<'_>, ui: &egui::Context, uiworld: &UiWorld, sim: &Simulation) {
     window.show(ui, |ui| {
-        crate::gui::windows::load::debug_replay(ui, uiworld);
         if !crate::session::world_interaction(uiworld) {
             return;
         }
+        crate::gui::windows::load::debug_replay(ui, uiworld);
+        ui.checkbox(
+            &mut uiworld.write::<GuiState>().show_unfinished_ui,
+            "Show unfinished UI",
+        );
         let mut objs = uiworld.write::<DebugObjs>();
         for (val, name, _) in &mut objs.0 {
             ui.checkbox(val, *name);

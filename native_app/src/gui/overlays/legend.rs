@@ -5,6 +5,7 @@ use goryak::{
 use yakui::{colored_box_container, reflow, Alignment, Color, Dim2, Pivot, Vec4};
 
 use super::OverlayMode;
+use crate::uiworld::UiWorld;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(super) struct Scale {
@@ -57,7 +58,11 @@ impl OverlayMode {
     }
 }
 
-pub(super) fn render(mode: OverlayMode, label: &str, empty: bool) {
+pub(super) fn render(mode: OverlayMode, label: &str, empty: bool, uiw: &UiWorld) {
+    if mode == OverlayMode::Traffic {
+        super::traffic::legend(uiw);
+        return;
+    }
     if mode == OverlayMode::Off {
         return;
     }

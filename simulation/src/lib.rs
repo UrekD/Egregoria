@@ -175,19 +175,22 @@ impl SimulationOptions {
         starting_money_bucks: 150_000,
     };
 
-    fn valid_for_bootstrap(self) -> bool {
-        let options = NewGameOptions {
+    fn new_game_options(self) -> NewGameOptions {
+        NewGameOptions {
             preset: self.preset,
             seed: self.seed,
             terrain_chunks: self.terrain_size,
             starting_money_bucks: self.starting_money_bucks,
-        };
+        }
+    }
+
+    fn valid_for_bootstrap(self) -> bool {
         // Legacy scenarios and tests can start with a small or empty map.
-        options.is_valid()
-            || (options.terrain_chunks < NewGameOptions::MIN_TERRAIN_CHUNKS
-                && options.preset == Self::LEGACY.preset
-                && options.seed == Self::LEGACY.seed
-                && options.starting_money_bucks == Self::LEGACY.starting_money_bucks)
+        self.new_game_options().is_valid()
+            || (self.terrain_size < NewGameOptions::MIN_TERRAIN_CHUNKS
+                && self.preset == Self::LEGACY.preset
+                && self.seed == Self::LEGACY.seed
+                && self.starting_money_bucks == Self::LEGACY.starting_money_bucks)
     }
 }
 
@@ -220,7 +223,7 @@ impl Simulation {
     ///
     /// # Panics
     ///
-    /// Panics if the replay version differs from the simulation version.
+    /// Panics if the replay version or its bootstrap data is invalid.
     pub fn from_replay(replay: Replay) -> (Simulation, SimulationReplayLoader) {
         Self::try_from_replay(replay).unwrap_or_else(|error| panic!("{error}"))
     }
@@ -233,6 +236,7 @@ impl Simulation {
             ));
         }
         let options = replay.bootstrap_options()?;
+        let bootstrap_end = replay.bootstrap_end()?;
         let mut sim = Simulation {
             world: Default::default(),
             resources: Default::default(),
@@ -249,17 +253,12 @@ impl Simulation {
         WorldCommand::bootstrap(&mut sim, options).map_err(|reason| {
             io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {reason:?}"))
         })?;
-        let pastt = Tick(sim.get_tick());
-        Ok((
-            sim,
-            SimulationReplayLoader {
-                replay,
-                pastt,
-                idx: 1,
-                speed: 1,
-                advance_n_ticks: 0,
-            },
-        ))
+        sim.apply_commands(replay.commands(1..bootstrap_end));
+        if replay.has_timeline() {
+            sim.record_constructor_end();
+        }
+        let loader = SimulationReplayLoader::new(replay, Tick(sim.get_tick()), bootstrap_end);
+        Ok((sim, loader))
     }
 
     pub fn new_with_options(opts: SimulationOptions) -> Simulation {
@@ -281,8 +280,14 @@ impl Simulation {
             common::saveload::JSON::decode(START_COMMANDS.as_bytes()).unwrap();
         WorldCommand::bootstrap(&mut sim, opts).expect("invalid simulation bootstrap options");
         sim.apply_commands(start_commands.iter().map(|(_, cmd)| cmd));
+        sim.record_constructor_end();
 
         sim
+    }
+
+    fn record_constructor_end(&self) {
+        self.write::<Replay>()
+            .record_constructor_end(Tick(self.get_tick()));
     }
 
     pub fn world_res(&mut self) -> (&mut World, &mut Resources) {
@@ -330,7 +335,7 @@ impl Simulation {
         // so that instant commands work on single player but the game is still deterministic
         {
             profiling::scope!("applying commands");
-            self.apply_commands(commands);
+            self.apply_command_batch(commands, true);
         }
 
         {
@@ -340,20 +345,28 @@ impl Simulation {
 
         game_schedule.execute(self);
 
-        self.resources.write::<Replay>().last_tick_recorded =
-            self.resources.read::<GameTime>().tick;
+        self.write::<Replay>().record_step(Tick(self.get_tick()));
 
         t.elapsed()
     }
 
     /// Applies a command batch without advancing the simulation clock.
     pub fn apply_commands<'a>(&mut self, commands: impl IntoIterator<Item = &'a WorldCommand>) {
+        self.apply_command_batch(commands, false);
+    }
+
+    fn apply_command_batch<'a>(
+        &mut self,
+        commands: impl IntoIterator<Item = &'a WorldCommand>,
+        steps_systems: bool,
+    ) {
         let mut commands = commands.into_iter().peekable();
         if commands.peek().is_none() {
             utils::scheduler::drain_commands(self);
             return;
         }
         let topology_generation = self.map().walking_topology_generation;
+        let recording_start = self.read::<Replay>().command_count();
         self.write::<CommandOutcomes>().begin_batch();
         for (index, command) in commands.enumerate() {
             let before = self.read::<CommandOutcomes>().last.len();
@@ -367,6 +380,8 @@ impl Simulation {
         if self.map().walking_topology_generation != topology_generation {
             transit::on_topology_changed(self);
         }
+        self.write::<Replay>()
+            .record_batch(recording_start, steps_systems, Tick(self.get_tick()));
     }
 
     pub fn get_tick(&self) -> u64 {
@@ -469,11 +484,17 @@ impl Simulation {
     }
 
     pub fn save_to_disk(&self, save_name: &str) {
-        common::saveload::CompressedBincode::save(&self, save_name);
+        self.save_snapshot_and_replay(save_name);
+    }
+
+    /// Saves through the usual snapshot and replay paths and reports snapshot success.
+    pub fn save_snapshot_and_replay(&self, save_name: &str) -> bool {
+        let snapshot_saved = common::saveload::CompressedBincode::save(&self, save_name).is_some();
         let rep = self.resources.read::<Replay>();
         if rep.enabled {
             common::saveload::JSONPretty::save(&*rep, &format!("{save_name}_replay"));
         }
+        snapshot_saved
     }
 
     pub fn pos<E: WorldTransform>(&self, id: E) -> Option<Vec3> {

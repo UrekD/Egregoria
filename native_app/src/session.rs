@@ -4,6 +4,7 @@ use std::time::Instant;
 use common::saveload::SlotId;
 use serde::Deserialize;
 use simulation::utils::scheduler::SeqSchedule;
+use simulation::world_command::CommandOutcomes;
 use simulation::{Simulation, SimulationReplayLoader};
 
 use crate::gui::{ExitState, GuiState};
@@ -34,10 +35,43 @@ pub struct SessionState {
     pub active_slot: Option<SlotId>,
     pub generation: u64,
     pub(crate) interaction_blocked: bool,
+    pub(crate) departure: Option<PendingDeparture>,
 }
 
-#[derive(Default)]
-pub struct NotificationCenter;
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CityProgress {
+    tick: u64,
+    batch_seq: u64,
+}
+
+impl CityProgress {
+    pub(crate) fn capture(sim: &Simulation) -> Self {
+        Self {
+            tick: sim.get_tick(),
+            batch_seq: sim.read::<CommandOutcomes>().batch_seq(),
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum Departure {
+    Screen(SessionScreen),
+    Exit,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DeparturePhase {
+    Confirm,
+    SaveRequested,
+    Saving,
+    SaveFailed,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct PendingDeparture {
+    pub destination: Departure,
+    pub phase: DeparturePhase,
+}
 
 pub type WorldResetHook = fn(&UiWorld, u64);
 
@@ -54,9 +88,13 @@ pub fn playing(uiw: &UiWorld) -> bool {
     *uiw.read::<SessionScreen>() == SessionScreen::Playing
 }
 
+pub(crate) fn view_input(uiw: &UiWorld) -> bool {
+    playing(uiw) && !uiw.read::<SessionState>().interaction_blocked
+}
+
 pub fn world_interaction(uiw: &UiWorld) -> bool {
-    playing(uiw)
-        && !uiw.read::<SessionState>().interaction_blocked
+    view_input(uiw)
+        && uiw.read::<SessionState>().departure.is_none()
         && uiw.read::<SaveLoadState>().replay.is_none()
 }
 
@@ -66,6 +104,40 @@ pub fn can_save(uiw: &UiWorld) -> bool {
         && uiw.read::<SessionState>().active_slot.is_some()
 }
 
+pub(crate) fn request_departure(uiw: &UiWorld, sim: &Simulation, destination: Departure) {
+    if !world_interaction(uiw) {
+        return;
+    }
+    if matches!(destination, Departure::Screen(_)) && !crate::network::is_singleplayer(uiw) {
+        return;
+    }
+    if can_save(uiw)
+        && uiw.read::<SaveLoadState>().saved_progress != Some(CityProgress::capture(sim))
+    {
+        uiw.write::<SessionState>().departure = Some(PendingDeparture {
+            destination,
+            phase: DeparturePhase::Confirm,
+        });
+    } else {
+        finish_departure(uiw, destination);
+    }
+}
+
+pub(crate) fn finish_departure(uiw: &UiWorld, destination: Departure) {
+    match destination {
+        Departure::Screen(screen) => {
+            set_screen(uiw, screen);
+        }
+        Departure::Exit => std::process::exit(0),
+    }
+}
+
+pub(crate) fn end_replay(uiw: &UiWorld) {
+    uiw.write::<SaveLoadState>().replay = None;
+    uiw.write::<SessionState>().interaction_blocked = true;
+    uiw.write::<InputMap>().reset_world_input();
+}
+
 pub fn set_screen(uiw: &UiWorld, screen: SessionScreen) -> bool {
     if screen != SessionScreen::Playing && !crate::network::is_singleplayer(uiw) {
         return false;
@@ -73,7 +145,9 @@ pub fn set_screen(uiw: &UiWorld, screen: SessionScreen) -> bool {
     let mut current = uiw.write::<SessionScreen>();
     if *current != screen {
         *current = screen;
-        uiw.write::<SessionState>().interaction_blocked = true;
+        let mut session = uiw.write::<SessionState>();
+        session.interaction_blocked = true;
+        session.departure = None;
         uiw.write::<InputMap>().reset_world_input();
         *uiw.commands() = Default::default();
         *uiw.write::<ReceivedCommands>() = Default::default();
@@ -119,13 +193,17 @@ pub fn apply_world_replacement(
         session.generation += 1;
         session.active_slot = slot;
         session.interaction_blocked = true;
+        session.departure = None;
         session.generation
     };
 
     // The save worker checks this flag under the read lock before using the world.
     let old_io = std::mem::take(&mut *uiw.write::<SaveLoadState>());
     old_io.saving_status.store(false, Ordering::SeqCst);
-    uiw.write::<SaveLoadState>().replay = replay;
+    let mut io = uiw.write::<SaveLoadState>();
+    io.replay = replay;
+    io.saved_progress = Some(CityProgress::capture(sim));
+    drop(io);
     uiw.write::<GuiState>().last_save = Instant::now();
     uiw.write::<InputMap>().reset_world_input();
     uiw.camera_mut().reset_for_world(&sim.map());
@@ -140,3 +218,44 @@ pub fn apply_world_replacement(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+#[test]
+fn p4_departure_detects_paused_edits_since_the_snapshot() {
+    use simulation::world_command::WorldCommand;
+    use simulation::SimulationOptions;
+
+    crate::init::init();
+    let mut sim = Simulation::new_with_options(SimulationOptions {
+        terrain_size: 0,
+        save_replay: false,
+        ..SimulationOptions::LEGACY
+    });
+    let uiw = UiWorld::with_defaults();
+    uiw.write::<SessionState>().active_slot = Some(SlotId::legacy());
+    let saved_progress = CityProgress::capture(&sim);
+    uiw.write::<SaveLoadState>().saved_progress = Some(saved_progress);
+    let destination = Departure::Screen(SessionScreen::LoadGame);
+
+    sim.apply_commands([&WorldCommand::SetTaxRate {
+        zone: simulation::map::ZoneKind::Residential,
+        rate_permille: 125,
+    }]);
+    assert_eq!(sim.get_tick(), saved_progress.tick);
+    request_departure(&uiw, &sim, destination);
+    assert!(playing(&uiw));
+    assert!(view_input(&uiw));
+    assert!(!world_interaction(&uiw));
+    assert!(matches!(
+        uiw.read::<SessionState>().departure,
+        Some(PendingDeparture {
+            phase: DeparturePhase::Confirm,
+            ..
+        })
+    ));
+
+    uiw.write::<SessionState>().departure = None;
+    uiw.write::<SaveLoadState>().saved_progress = Some(CityProgress::capture(&sim));
+    request_departure(&uiw, &sim, destination);
+    assert_eq!(*uiw.read::<SessionScreen>(), SessionScreen::LoadGame);
+}

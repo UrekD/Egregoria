@@ -12,6 +12,7 @@ use crate::uiworld::UiWorld;
 /// Root GUI entrypoint
 pub fn render_oldgui(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::render");
+    crate::gui::windows::load::replay_controls(ui, uiworld);
     if uiworld.read::<GuiState>().hidden {
         return;
     }

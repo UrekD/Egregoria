@@ -6,6 +6,7 @@ use crate::gui::chat::GUIChatState;
 use crate::gui::follow::FollowEntity;
 use crate::gui::keybinds::KeybindState;
 use crate::gui::lotbrush::LotBrushResource;
+use crate::gui::notifications::NotificationCenter;
 use crate::gui::overlays::{self, OverlayMode};
 use crate::gui::roadbuild::RoadBuildResource;
 use crate::gui::roadeditor::RoadEditorResource;
@@ -26,7 +27,7 @@ use crate::gui::{
 use crate::inputmap::{Bindings, InputMap};
 use crate::network::NetworkState;
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
-use crate::session::{NotificationCenter, SessionScreen, SessionState, WorldResetHook, WorldResetHooks};
+use crate::session::{SessionScreen, SessionState, WorldResetHook, WorldResetHooks};
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
 use common::saveload::Encoder;
 use serde::de::DeserializeOwned;
@@ -89,7 +90,8 @@ fn register_ui_resources() {
     register_resource_noserialize::<BuildingIcons>();
     register_resource_noserialize::<BuildingTab>();
     register_resource_noserialize::<KeybindState>();
-    register_world_resource::<NotificationCenter>();
+    register_resource_noserialize::<NotificationCenter>();
+    register_world_reset(|uiw, _| uiw.write::<NotificationCenter>().clear());
     register_world_resource::<TransitTools>();
     register_world_resource::<PanelState>();
     register_world_reset(|uiw, _| uiw.write::<DebugState>().connectivity = Default::default());

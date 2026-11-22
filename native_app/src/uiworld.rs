@@ -1,12 +1,13 @@
 use crate::gui::TimeAlways;
 use crate::init::{INIT_FUNCS, SAVELOAD_FUNCS};
-use crate::session::WorldReplacement;
+use crate::session::{CityProgress, WorldReplacement};
 use simulation::utils::resources::{RefMutSingle, RefSingle, ResourcesSingleThread};
 use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::SimulationReplayLoader;
 use std::any::Any;
 use std::ptr::addr_of;
 use std::sync::atomic::AtomicBool;
+use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 #[derive(Default)]
@@ -21,6 +22,8 @@ pub struct SaveLoadState {
     pub replay: Option<SimulationReplayLoader>,
     pub please_save: bool,
     pub saving_status: Arc<AtomicBool>,
+    pub(crate) saved_progress: Option<CityProgress>,
+    pub(crate) save_result: Option<Receiver<Option<CityProgress>>>,
 }
 
 #[allow(dead_code)]

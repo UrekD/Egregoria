@@ -8,30 +8,48 @@ pub struct LoadState {
     error: Option<String>,
 }
 
-pub(crate) fn debug_replay(ui: &mut egui::Ui, uiw: &UiWorld) {
+pub(crate) fn replay_controls(ctx: &egui::Context, uiw: &UiWorld) {
     let mut io = uiw.write::<SaveLoadState>();
-    if let Some(replay) = &mut io.replay {
-        let tick = replay.pastt.0;
-        let last_tick = replay.replay.last_tick_recorded.0;
-        ui.label(format!("Replay tick {tick} / {last_tick}"));
-        ui.horizontal(|ui| {
+    let Some(replay) = &mut io.replay else {
+        return;
+    };
+    let mut end = false;
+    egui::TopBottomPanel::bottom("replay_controls").show(ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let progress = if let Some((step, total)) = replay.step_progress() {
+                format!("Replay {step} / {total} steps")
+            } else {
+                let tick = replay.pastt.0;
+                let last_tick = replay.replay.last_tick_recorded.0;
+                format!("Replay tick {tick} / {last_tick}")
+            };
+            ui.label(progress);
             for (label, speed) in [("Pause", 0), ("Play", 1), ("Fast", 100), ("Max", 10_000)] {
-                if ui.button(label).clicked() {
+                if ui.selectable_label(replay.speed == speed, label).clicked() {
                     replay.speed = speed;
                 }
             }
-        });
-        ui.horizontal(|ui| {
+            ui.separator();
             for ticks in [1, 10, 100, 1000] {
                 if ui.button(format!("+{ticks}")).clicked() {
                     replay.speed = 0;
                     replay.advance_n_ticks = ticks;
                 }
             }
+            ui.separator();
+            end = ui.button("End replay").clicked();
         });
+    });
+    drop(io);
+    if end {
+        session::end_replay(uiw);
+    }
+}
+
+pub(crate) fn debug_replay(ui: &mut egui::Ui, uiw: &UiWorld) {
+    if uiw.read::<SaveLoadState>().replay.is_some() {
         return;
     }
-    drop(io);
 
     let mut state = uiw.write::<LoadState>();
     if ui

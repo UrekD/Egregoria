@@ -10,6 +10,7 @@ use std::time::Instant;
 pub mod follow;
 mod hud;
 pub mod inspect;
+pub(crate) mod notifications;
 pub(crate) mod overlays;
 mod textures;
 mod tools;
@@ -20,6 +21,7 @@ pub use tools::*;
 
 pub struct GuiState {
     pub debug_window: bool,
+    pub show_unfinished_ui: bool,
     pub windows: GUIWindows,
     pub last_save: Instant,
     pub depause_warp: u32,
@@ -30,6 +32,7 @@ impl Default for GuiState {
     fn default() -> Self {
         Self {
             debug_window: false,
+            show_unfinished_ui: false,
             windows: Default::default(),
             last_save: Instant::now(),
             depause_warp: 1,

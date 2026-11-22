@@ -1,3 +1,4 @@
+mod advisor;
 pub mod budget;
 pub mod citystats;
 pub mod economy;
@@ -6,7 +7,7 @@ pub mod settings;
 pub(crate) mod transit_lines;
 
 use crate::inputmap::{InputAction, InputMap};
-use crate::session::{self, SessionScreen};
+use crate::session::{self, Departure, SessionScreen};
 use crate::uiworld::UiWorld;
 use goryak::{button_primary, Window};
 use yakui::widgets::Pad;
@@ -32,7 +33,7 @@ pub struct GUIWindows {
 }
 
 impl GUIWindows {
-    pub fn menu(&mut self, uiw: &UiWorld) {
+    pub fn menu(&mut self, uiw: &UiWorld, sim: &Simulation) {
         if button_primary("Economy").show().clicked {
             self.economy_open ^= true;
         }
@@ -53,8 +54,13 @@ impl GUIWindows {
             self.settings_open ^= true;
         }
 
-        if crate::network::is_singleplayer(uiw) && button_primary("Load").show().clicked {
-            session::set_screen(uiw, SessionScreen::LoadGame);
+        if crate::network::is_singleplayer(uiw) {
+            if button_primary("Load").show().clicked {
+                session::request_departure(uiw, sim, Departure::Screen(SessionScreen::LoadGame));
+            }
+            if button_primary("Back").show().clicked {
+                session::request_departure(uiw, sim, Departure::Screen(SessionScreen::MainMenu));
+            }
         }
 
         #[cfg(feature = "multiplayer")]
@@ -63,7 +69,7 @@ impl GUIWindows {
         }
     }
 
-    pub fn render(&mut self, uiworld: &UiWorld, sim: &Simulation) {
+    pub fn render(&mut self, uiworld: &UiWorld, sim: &Simulation, show_unfinished_ui: bool) {
         profiling::scope!("windows::render");
         if uiworld
             .write::<InputMap>()
@@ -78,23 +84,27 @@ impl GUIWindows {
         citystats::citystats(uiworld, sim, &mut self.citystats_open);
         transit_lines::transit_lines(uiworld, &mut self.transit_lines_open);
         settings::settings(uiworld, sim, &mut self.settings_open);
-        stub_window("Save As", &mut self.save_as_open);
-        stub_window("Advisor", &mut self.advisor_open);
+        if show_unfinished_ui {
+            stub_window("Save As", &mut self.save_as_open);
+        }
+        if show_unfinished_ui || advisor::AVAILABLE {
+            advisor::render(uiworld, sim, &mut self.advisor_open);
+        }
 
         #[cfg(feature = "multiplayer")]
         network::network(uiworld, sim, &mut self.network_open);
     }
 
-    pub fn additional_menu(&mut self, savable: bool) {
-        if savable && button_primary("Save As").show().clicked {
+    pub fn additional_menu(&mut self, savable: bool, show_unfinished_ui: bool) {
+        if savable && show_unfinished_ui && button_primary("Save As").show().clicked {
             self.save_as_open ^= true;
         }
-        if button_primary("Advisor").show().clicked {
+        if (show_unfinished_ui || advisor::AVAILABLE) && button_primary("Advisor").show().clicked {
             self.advisor_open ^= true;
         }
     }
 
-    pub fn render_session(&mut self, uiw: &UiWorld, sim: &Simulation) {
+    pub fn render_session(&mut self, uiw: &UiWorld, sim: &Simulation, show_unfinished_ui: bool) {
         let screen = *uiw.read::<SessionScreen>();
         let (title, opened) = match screen {
             SessionScreen::MainMenu => ("Egregoria", &mut self.main_menu_open),
@@ -112,7 +122,7 @@ impl GUIWindows {
         }
         .show(|| {
             if screen == SessionScreen::MainMenu {
-                super::menu::main_menu(uiw, &mut self.settings_open);
+                super::menu::main_menu(uiw, &mut self.settings_open, show_unfinished_ui);
             } else if button_primary("Back").show().clicked {
                 session::set_screen(uiw, SessionScreen::MainMenu);
             }

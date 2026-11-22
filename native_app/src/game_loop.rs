@@ -1,5 +1,6 @@
 use std::ptr::addr_of;
 use std::sync::atomic::Ordering;
+use std::sync::mpsc::{self, TryRecvError};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
@@ -7,7 +8,7 @@ use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use common::history::History;
 use common::saveload::SlotId;
 use engine::{Context, FrameContext, MeshBuilder};
-use geom::{vec2, vec3, Camera, LinearColor};
+use geom::{vec2, vec3, Camera, LinearColor, AABB};
 use simulation::Simulation;
 
 use crate::audio::GameAudio;
@@ -24,7 +25,9 @@ use crate::gui::UiTextures;
 use crate::gui::{render_newgui, ExitState, GuiState, TimeAlways, Tool};
 use crate::inputmap::{Bindings, InputAction, InputMap};
 use crate::rendering::{InstancedRender, MapRenderOptions, MapRenderer, OrbitCamera};
-use crate::session::{self, SessionScreen, SessionState, WorldReplacement};
+use crate::session::{
+    self, CityProgress, DeparturePhase, SessionScreen, SessionState, WorldReplacement,
+};
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
 use prototypes::GameTime;
 use simulation::utils::scheduler::SeqSchedule;
@@ -72,7 +75,11 @@ impl engine::framework::State for State {
         };
         let game_schedule = Simulation::schedule();
         let mut uiworld = UiWorld::init();
-        uiworld.write::<SaveLoadState>().startup_message = startup_message;
+        {
+            let mut io = uiworld.write::<SaveLoadState>();
+            io.startup_message = startup_message;
+            io.saved_progress = Some(CityProgress::capture(&sim));
+        }
         uiworld.write::<SessionState>().active_slot = Some(SlotId::legacy());
         if automation.is_some() {
             crate::init::configure_script_settings(&uiworld);
@@ -171,13 +178,18 @@ impl engine::framework::State for State {
             &mut self.uiw.write::<InputMap>(),
             &ctx.input,
         );
-        if world_interaction {
+        let view_input = session::view_input(&self.uiw);
+        if view_input {
+            // Replay controls can keep keyboard focus, but have no text inputs.
+            let replaying = self.uiw.read::<SaveLoadState>().replay.is_some();
             self.uiw.write::<InputMap>().prepare_frame(
                 &ctx.input,
-                !ctx.egui.last_kb_captured,
+                !ctx.egui.last_kb_captured || replaying,
                 !ctx.egui.last_mouse_captured,
             );
-            gui::run_ui_systems(&self.sim.read().unwrap(), &self.uiw);
+            if world_interaction {
+                gui::run_ui_systems(&self.sim.read().unwrap(), &self.uiw);
+            }
         }
 
         self.uiw.write::<Timings>().all.add_value(ctx.delta);
@@ -190,7 +202,7 @@ impl engine::framework::State for State {
             .contains(&InputAction::HideInterface);
 
         manage_settings(ctx, &self.uiw.read::<Settings>());
-        if !scripted && world_interaction {
+        if !scripted && view_input {
             self.manage_io(ctx);
         }
 
@@ -269,6 +281,9 @@ impl engine::framework::State for State {
         if self.automation.is_some() {
             crate::automation::fail("window closed before the script finished");
         }
+        if self.uiw.read::<SessionState>().departure.is_some() {
+            return false;
+        }
         if !session::can_save(&self.uiw)
             || self.uiw.read::<GuiState>().last_save.elapsed() < Duration::from_secs(30)
         {
@@ -309,7 +324,11 @@ impl State {
             return true;
         }
 
+        self.poll_save();
         self.start_save();
+        if self.uiw.read::<SessionState>().departure.is_some() {
+            return true;
+        }
         if self.advance_replay() {
             return true;
         }
@@ -359,25 +378,69 @@ impl State {
         if !session::can_save(&self.uiw) {
             return;
         }
+        let mut session = self.uiw.write::<SessionState>();
+        let departure_save = session
+            .departure
+            .as_ref()
+            .is_some_and(|departure| departure.phase == DeparturePhase::SaveRequested);
         let mut io = self.uiw.write::<SaveLoadState>();
-        if !io.please_save || io.saving_status.load(Ordering::SeqCst) {
+        if !(io.please_save || departure_save) || io.save_result.is_some() {
             return;
         }
-        let Some(slot) = self.uiw.read::<SessionState>().active_slot.clone() else {
+        let Some(slot) = session.active_slot.clone() else {
             return;
         };
+        if departure_save {
+            session.departure.as_mut().unwrap().phase = DeparturePhase::Saving;
+        }
         io.please_save = false;
+        let (sender, receiver) = mpsc::channel();
+        io.save_result = Some(receiver);
         let sim = self.sim.clone();
         let status = io.saving_status.clone();
         status.store(true, Ordering::SeqCst);
         std::thread::spawn(move || {
             profiling::scope!("game_loop::update::save");
             let sim = sim.read().unwrap();
-            if status.load(Ordering::SeqCst) {
-                sim.save_to_disk(slot.as_str());
-                status.store(false, Ordering::SeqCst);
-            }
+            let saved = (status.load(Ordering::SeqCst)
+                && sim.save_snapshot_and_replay(slot.as_str()))
+            .then(|| CityProgress::capture(&sim));
+            status.store(false, Ordering::SeqCst);
+            let _ = sender.send(saved);
         });
+    }
+
+    fn poll_save(&self) {
+        let mut io = self.uiw.write::<SaveLoadState>();
+        let Some(result) = &io.save_result else {
+            return;
+        };
+        let saved = match result.try_recv() {
+            Ok(saved) => saved,
+            Err(TryRecvError::Empty) => return,
+            Err(TryRecvError::Disconnected) => None,
+        };
+        io.save_result = None;
+        if let Some(progress) = saved {
+            io.saved_progress = Some(progress);
+        }
+        drop(io);
+
+        let mut session = self.uiw.write::<SessionState>();
+        let Some(departure) = session.departure.as_mut() else {
+            return;
+        };
+        if departure.phase != DeparturePhase::Saving {
+            return;
+        }
+        if saved.is_some() {
+            let destination = departure.destination;
+            drop(session);
+            self.uiw.write::<GuiState>().last_save = Instant::now();
+            session::finish_departure(&self.uiw, destination);
+        } else {
+            departure.phase = DeparturePhase::SaveFailed;
+        }
     }
 
     fn advance_replay(&mut self) -> bool {
@@ -392,9 +455,8 @@ impl State {
         *self.uiw.write::<ReceivedCommands>() = Default::default();
         let mut sim = self.sim.write().unwrap();
         if replay.advance_tick(&mut sim, &mut self.game_schedule) {
-            io.replay = None;
-            self.uiw.write::<SessionState>().interaction_blocked = true;
-            self.uiw.write::<InputMap>().reset_world_input();
+            drop(io);
+            session::end_replay(&self.uiw);
             log::info!("finished loading replay");
         }
         true
@@ -450,7 +512,7 @@ impl State {
             ctx.delta,
             &self.uiw.read::<InputMap>(),
             &self.uiw.read::<Settings>(),
-            map.environment.bounds().expand(-3000.0),
+            camera_movement_bounds(map.environment.bounds()),
             |p| map.environment.height(p),
         );
         *self.uiw.write::<Camera>() = self.uiw.read::<OrbitCamera>().camera;
@@ -517,6 +579,41 @@ impl State {
             x.skip_depth = true;
             ctx.draw(x)
         }
+    }
+}
+
+fn camera_movement_bounds(bounds: AABB) -> AABB {
+    const INSET: f32 = 3000.0;
+    let inset_x = if bounds.w() >= 2.0 * INSET {
+        INSET
+    } else {
+        0.0
+    };
+    let inset_y = if bounds.h() >= 2.0 * INSET {
+        INSET
+    } else {
+        0.0
+    };
+    let inset = vec2(inset_x, inset_y);
+    AABB::new_ll_ur(bounds.ll + inset, bounds.ur - inset)
+}
+
+#[cfg(test)]
+#[test]
+fn p4_camera_bounds_allow_clamping_on_small_maps() {
+    for (width, height) in [
+        (0.0, 0.0),
+        (512.0, 512.0),
+        (512.0, 8192.0),
+        (8192.0, 8192.0),
+    ] {
+        let world = AABB::new_ll_ur(vec2(0.0, 0.0), vec2(width, height));
+        let bounds = camera_movement_bounds(world);
+        let clamped = vec2(
+            (-100.0_f32).clamp(bounds.ll.x, bounds.ur.x),
+            (height + 100.0_f32).clamp(bounds.ll.y, bounds.ur.y),
+        );
+        assert!(world.contains(clamped));
     }
 }
 
