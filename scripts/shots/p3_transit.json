@@ -3,10 +3,10 @@
   {"Builder": "grid_city"},
   {"Builder": "place_company"},
   {"BuildSpecialBuildings": [
-    {"pos": {"corners": [4944336665485008896, 4938531244090351616, 4938531244087648256, 4944336665482305536]}, "kind": {"GoodsCompany": 17699481749046210215}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1100, 700]},
+    {"pos": {"corners": [4912406847814524928, 4912406847817228288, 4900796005027913728, 4900796005025210368]}, "kind": {"GoodsCompany": 17699481749046210215}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [700, 780]},
     {"pos": {"corners": [4936508142695587840, 4940730267346247680, 4940730267348213760, 4936508142697553920]}, "kind": {"GoodsCompany": 7759206203148193615}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": {"poly": [4936508142695587840, 4940730267346247680, 4940730267348213760, 4936508142697553920], "area": 14400.0, "filldir": 4575657221408423936}, "road_at": [1100, 700]},
     {"pos": {"corners": [4930737905672675328, 4929330530789122048, 4929330530788794368, 4930737905672347648]}, "kind": {"GoodsCompany": 1075791784279675837}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [940, 700]},
-    {"pos": {"corners": [4941803390696259584, 4941803390695931904, 4942507078137708544, 4942507078138036224]}, "kind": {"GoodsCompany": 9333688838218784667}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1180, 780]},
+    {"pos": {"corners": [4922997343813132288, 4921589968929579008, 4921589968929251328, 4922997343812804608]}, "kind": {"GoodsCompany": 9333688838218784667}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [830, 700]},
     {"pos": {"corners": [4941064518884687872, 4941064518885015552, 4940360831443238912, 4940360831442911232]}, "kind": {"GoodsCompany": 11895989582669773744}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1180, 940]},
     {"pos": {"corners": [4941803390700797952, 4941803390700634112, 4942507078142410752, 4942507078142574592]}, "kind": {"GoodsCompany": 4761500172902867360}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1180, 1100]},
     {"pos": {"corners": [4938267361306529792, 4938971048748306432, 4938971048748470272, 4938267361306693632]}, "kind": {"GoodsCompany": 14211706759220955472}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1100, 1180]},

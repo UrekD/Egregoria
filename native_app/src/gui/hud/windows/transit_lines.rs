@@ -131,7 +131,7 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>) -> bool 
             .iter()
             .map(|stop| (stop.data().as_ffi() as u32).to_string())
             .collect::<Vec<_>>()
-            .join(" → ");
+            .join(" > ");
         textc(color, stops);
     }
 
