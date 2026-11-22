@@ -2,8 +2,8 @@
 use crate::economy::{Budget, BudgetCategory, Government};
 use crate::init::INIT_FUNCS;
 use crate::map::{
-    BuildingID, BuildingKind, Density, IntersectionID, LaneKind, LanePattern, Lot, LotID, Map,
-    RoadID, RoadSegmentKind, RoundaboutPolicy, ROAD_Z_OFFSET,
+    BuildingID, BuildingKind, Density, IntersectionID, LaneKind, LanePattern, LightPolicy, Lot,
+    LotID, Map, RoadID, RoadSegmentKind, RoundaboutPolicy, ROAD_Z_OFFSET,
 };
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{growth, residence};
@@ -26,6 +26,7 @@ pub struct ImportedJunction {
     pub id: usize,
     pub position: Vec2,
     pub roundabout_radius: Option<f32>,
+    pub light_policy: LightPolicy,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -245,8 +246,10 @@ fn import_network(map: &mut Map, city: &ImportedCity) -> Result<ImportedNetwork,
     let mut junctions = BTreeMap::new();
     for (&key, &(position, _, _)) in &used {
         let id = map.add_intersection(position);
+        let junction = &mut map.intersections[id];
+        junction.light_policy = supplied[&key].light_policy;
         if let Some(radius) = supplied[&key].roundabout_radius {
-            map.intersections[id].turn_policy.roundabout = Some(RoundaboutPolicy { radius });
+            junction.turn_policy.roundabout = Some(RoundaboutPolicy { radius });
         }
         junctions.insert(key, id);
     }
@@ -377,6 +380,7 @@ mod tests {
                         id,
                         position,
                         roundabout_radius: None,
+                        light_policy: LightPolicy::Auto,
                     })
                     .collect(),
                 links: vec![ImportedLink {
@@ -501,6 +505,7 @@ mod tests {
                     id,
                     position: vec2(x, y),
                     roundabout_radius: None,
+                    light_policy: LightPolicy::Auto,
                 })
                 .collect(),
             links: [(0, 1), (0, 2), (1, 3), (0, 4), (0, 5), (1, 6), (1, 7)]
@@ -563,6 +568,7 @@ mod tests {
                     id,
                     position: vec2(x, 400.0),
                     roundabout_radius: None,
+                    light_policy: LightPolicy::Auto,
                 })
                 .collect(),
             links: (0..2)

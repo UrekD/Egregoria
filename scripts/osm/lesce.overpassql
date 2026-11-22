@@ -5,6 +5,7 @@
   way["landuse"];
   way["natural"="wood"];
   way["railway"];
+  node["highway"="traffic_signals"];
   nwr["amenity"~"^(school|kindergarten|fire_station|police|hospital|clinic|doctors|pharmacy|townhall|post_office)$"];
   nwr["railway"~"^(station|halt)$"];
   relation["building"]["type"="multipolygon"];

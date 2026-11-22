@@ -5,8 +5,9 @@ use geom::{vec2, Vec2, OBB};
 use prototypes::{BuildingGen, FreightStationPrototypeID, RollingStockID, Tick};
 use simulation::map::import::{ImportedJunction, ImportedLink, ImportedNetwork};
 use simulation::map::{
-    BuildingID, BuildingKind, LaneID, LaneKind, LanePattern, LanePatternBuilder, Map, PathKind,
-    Pathfinder, ProjectFilter, ProjectKind, RoadID, Traversable, TraverseDirection, TraverseKind,
+    BuildingID, BuildingKind, LaneID, LaneKind, LanePattern, LanePatternBuilder, LightPolicy, Map,
+    PathKind, Pathfinder, ProjectFilter, ProjectKind, RoadID, Traversable, TraverseDirection,
+    TraverseKind,
 };
 use simulation::map_dynamic::{BuildingInfos, Itinerary};
 use simulation::world_command::{CommandOutcomes, WorldCommand};
@@ -69,7 +70,7 @@ pub(super) fn add_lesce_infrastructure(
         .try_normalize()
         .ok_or("invalid mainline clip direction")?;
     let rail_end = south + direction * 390.0;
-    let rail_end_id = add_junction(city, rail_end);
+    let rail_end_id = add_junction(city, rail_end, true);
     let external_rail = add_link(
         city,
         south_stub.junction,
@@ -147,7 +148,7 @@ pub(super) fn add_lesce_infrastructure(
     }
 
     let siding_end = vec2(3652.0, 4709.0);
-    let siding_end_id = add_junction(city, siding_end);
+    let siding_end_id = add_junction(city, siding_end, true);
     let freight_rail = add_link(
         city,
         siding_switch,
@@ -165,7 +166,7 @@ pub(super) fn add_lesce_infrastructure(
 
     let from = point(city, road_branch);
     let end = vec2(2130.0, 4150.0);
-    let end_id = add_junction(city, end);
+    let end_id = add_junction(city, end, false);
     let utility_road = add_link(
         city,
         road_branch,
@@ -186,13 +187,19 @@ pub(super) fn add_lesce_infrastructure(
     })
 }
 
-fn add_junction(city: &mut NormalizedCity, position: Vec2) -> usize {
+fn add_junction(city: &mut NormalizedCity, position: Vec2, rail: bool) -> usize {
     let id = city.city.junctions.len();
     city.city.junctions.push(ImportedJunction {
         id,
         position,
         roundabout_radius: None,
+        light_policy: if rail {
+            LightPolicy::Auto
+        } else {
+            LightPolicy::NoLights
+        },
     });
+    city.junction_sources.push("synthetic".into());
     id
 }
 
@@ -241,7 +248,7 @@ fn split_near(city: &mut NormalizedCity, source: u64, target: Vec2) -> Result<us
         return Ok(link.to);
     }
     let mut tail = link.clone();
-    let junction = add_junction(city, position);
+    let junction = add_junction(city, position, city.classes[index].rail());
     tail.points.drain(..offset);
     tail.from = junction;
     let first = &mut city.city.links[index];

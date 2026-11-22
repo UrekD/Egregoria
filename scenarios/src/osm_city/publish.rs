@@ -1,7 +1,8 @@
 use super::{check, lesce, normalize, read_overpass, source, ImportReport, Source, LESCE_BOUNDS};
 use crate::{ensure_repo_root_cwd, ScenarioCtx};
 use simulation::economy::{Budget, BudgetCategory, Government};
-use simulation::map::ZoneGrid;
+use simulation::map::import::ImportedNetwork;
+use simulation::map::{Intersection, LightPolicy, Map, ZoneGrid};
 use simulation::{SavePhase, Simulation, SlotCamera, SlotId, SnapshotRevision};
 use std::collections::BTreeMap;
 use std::fs::{self, File};
@@ -74,11 +75,13 @@ pub fn generate_with_options(
         route_checks: BTreeMap::new(),
         flat_crossings: std::mem::take(&mut city.flat_crossings),
         short_lanes: Vec::new(),
+        junction_policies: Vec::new(),
         policies: vec![
             "Road boundary stubs are cosmetic. External trade is rail only.",
             "Turn restrictions and lane-specific turn markings are not imported.",
             "Rail uses one game lane per direction. Bridges and tunnels remain flat and unconnected at crossings.",
             "The passenger station is a static marker using a generic building mesh.",
+            "Junctions use priority signage without lights or all-way stops. Traffic lights are placed only where OSM maps highway=traffic_signals at the junction or on an approach.",
         ],
         opening_budget_cents: 0,
         opening: None,
@@ -96,6 +99,7 @@ pub fn generate_with_options(
         .iter()
         .map(|&(index, length)| (city.city.links[index].source_way_ids.clone(), length))
         .collect();
+    report.junction_policies = junction_policy_changes(&sim.map(), &city, &network);
     let mut ctx = ScenarioCtx::from_sim(sim);
     let facilities = lesce::place_facilities(&mut ctx, &city, &network, &layout, &mut report)?;
     lesce::check_routes(&ctx.sim, &city, &network, &layout, &facilities, &mut report)?;
@@ -166,6 +170,47 @@ pub fn generate_with_options(
         lock.prune_legacy(&root)?;
     }
     Ok(report)
+}
+
+/// Junctions whose effective control differs from what `LightPolicy::Auto` would apply.
+fn junction_policy_changes(
+    map: &Map,
+    city: &super::NormalizedCity,
+    network: &ImportedNetwork,
+) -> Vec<(String, String)> {
+    let mut auto = map.lanes().clone();
+    let describe = |junction: &Intersection, lanes: &simulation::map::Lanes| {
+        let controls: Vec<_> = junction
+            .roads
+            .iter()
+            .flat_map(|&road| map.roads()[road].incoming_lanes_to(junction.id).iter())
+            .filter(|(_, kind)| kind.needs_light())
+            .map(|&(lane, _)| lanes[lane].control)
+            .collect();
+        if controls.iter().any(|control| control.is_light()) {
+            "traffic lights"
+        } else if controls.iter().any(|control| control.is_stop_sign()) {
+            "all-way stop signs"
+        } else {
+            "priority (no lights)"
+        }
+    };
+    let mut changes = Vec::new();
+    for (&index, &id) in &network.junctions {
+        let junction = &map.intersections()[id];
+        if junction.light_policy == LightPolicy::Auto {
+            continue;
+        }
+        LightPolicy::Auto.apply(junction, &mut auto, map.roads());
+        let (before, after) = (describe(junction, &auto), describe(junction, map.lanes()));
+        if before != after {
+            changes.push((
+                city.junction_sources[index].clone(),
+                format!("{before} -> {after}"),
+            ));
+        }
+    }
+    changes
 }
 
 fn commit_snapshot(
@@ -642,5 +687,35 @@ mod tests {
         lock.prune_legacy(&root.path).unwrap();
         #[cfg(unix)]
         assert!(!root.path.join(LEGACY_LOCK).exists());
+    }
+
+    #[test]
+    fn osm_report_lists_junction_policies_that_differ_from_auto() {
+        ensure_repo_root_cwd();
+        simulation::init::init();
+        let city = normalize(
+            read_overpass(
+                include_bytes!("../../tests/fixtures/osm-junction-control.json").as_slice(),
+            )
+            .unwrap(),
+            LESCE_BOUNDS,
+        )
+        .unwrap();
+        let (sim, network) = Simulation::from_imported_city(&city.city, &lesce::OPTIONS).unwrap();
+        let changes = junction_policy_changes(&sim.map(), &city, &network);
+        // The signalled crossroads keeps its lights, so only the other two are listed.
+        assert_eq!(
+            changes,
+            [
+                (
+                    "node/5006".to_owned(),
+                    "traffic lights -> priority (no lights)".to_owned()
+                ),
+                (
+                    "node/5011".to_owned(),
+                    "all-way stop signs -> priority (no lights)".to_owned()
+                ),
+            ]
+        );
     }
 }

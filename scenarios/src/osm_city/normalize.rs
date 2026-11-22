@@ -4,7 +4,7 @@ use super::ImportError;
 use geom::{vec2, Vec2, AABB};
 use serde::Serialize;
 use simulation::map::import::{BoundaryStub, ImportedCity, ImportedJunction, ImportedLink};
-use simulation::map::{Density, LaneKind, LanePattern, LanePatternBuilder, ZoneKind};
+use simulation::map::{Density, LaneKind, LanePattern, LanePatternBuilder, LightPolicy, ZoneKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 const METRES_NORTH: f64 = 111_158.360;
@@ -12,6 +12,8 @@ const LESCE_LATITUDE: f64 = 46.3605;
 const LESCE_METRES_EAST: f64 = 76_958.685;
 const MIN_LINK_LENGTH: f32 = 10.0;
 const MAX_LINKS: usize = 6000;
+/// Mapped signals usually sit on the approaches, a few metres before the junction node.
+const SIGNAL_RADIUS: f32 = 25.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct GeoBounds {
@@ -118,6 +120,8 @@ pub struct Site {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NormalizedCity {
     pub city: ImportedCity,
+    /// OSM origin of each junction, indexed by junction id.
+    pub junction_sources: Vec<String>,
     pub classes: Vec<LinkClass>,
     pub features: Vec<Feature>,
     pub forests: Vec<Forest>,
@@ -176,6 +180,7 @@ pub fn normalize(
 
     let mut normalized = NormalizedCity {
         city: ImportedCity::default(),
+        junction_sources: Vec::new(),
         classes: Vec::new(),
         features: Vec::new(),
         forests: Vec::new(),
@@ -311,12 +316,35 @@ pub fn normalize(
         .values()
         .map(|(v, radius)| (v.key, *radius))
         .collect();
+    let signalled = signalled_junctions(
+        &extract.elements,
+        bounds,
+        &anchors,
+        &raw_edges,
+        &mut normalized.skipped,
+    );
     normalized.city.junctions = anchors
         .iter()
         .map(|(&key, &position)| ImportedJunction {
             id: keys[&key],
             position,
             roundabout_radius: radii.get(&key).copied(),
+            light_policy: if signalled.contains(&key) {
+                LightPolicy::Lights
+            } else if matches!(key, Anchor::Node(true, _)) {
+                LightPolicy::Auto
+            } else {
+                // Priority signage: through traffic is not held by lights or all-way stops.
+                LightPolicy::NoLights
+            },
+        })
+        .collect();
+    normalized.junction_sources = anchors
+        .keys()
+        .map(|key| match *key {
+            Anchor::Node(_, id) => format!("node/{id}"),
+            Anchor::Roundabout(id) => format!("node/{id} roundabout"),
+            Anchor::Cut(way, ..) => format!("way/{way} boundary"),
         })
         .collect();
 
@@ -348,6 +376,57 @@ pub fn normalize(
     }
     collect_features(&extract.elements, bounds, &mut normalized)?;
     Ok(normalized)
+}
+
+/// Road junctions with mapped traffic signals at the node or on an approach.
+fn signalled_junctions(
+    elements: &[Element],
+    bounds: GeoBounds,
+    anchors: &BTreeMap<Anchor, Vec2>,
+    edges: &[Edge],
+    skipped: &mut Vec<(String, String)>,
+) -> BTreeSet<Anchor> {
+    let mut degree = BTreeMap::<Anchor, usize>::new();
+    for edge in edges {
+        if !edge.class.rail() && edge.class != LinkClass::Foot {
+            for vertex in [edge.vertices[0], *edge.vertices.last().unwrap()] {
+                *degree.entry(vertex.key).or_default() += 1;
+            }
+        }
+    }
+    // Pedestrian-only signals do not control the junction.
+    let mut signals: Vec<_> = elements
+        .iter()
+        .filter(|element| {
+            element.kind == ElementKind::Node
+                && element.tag("highway") == "traffic_signals"
+                && matches!(element.tag("traffic_signals"), "" | "signal")
+        })
+        .collect();
+    signals.sort_by_key(|element| element.id);
+    let mut signalled = BTreeSet::new();
+    for element in signals {
+        let Some(point) = element.point().map(|point| bounds.point(point)) else {
+            continue;
+        };
+        let nearest = anchors
+            .iter()
+            .filter(|(key, _)| degree.get(key).is_some_and(|&n| n >= 3))
+            .map(|(key, position)| (position.distance(point), *key))
+            .filter(|&(distance, _)| distance <= SIGNAL_RADIUS)
+            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        match nearest {
+            Some((_, key)) => {
+                signalled.insert(key);
+            }
+            None if bounds.contains(point) => skipped.push((
+                element.label(),
+                "traffic signal not at a road junction".into(),
+            )),
+            None => {}
+        }
+    }
+    signalled
 }
 
 fn make_way(element: &Element, bounds: GeoBounds) -> Option<Way<'_>> {

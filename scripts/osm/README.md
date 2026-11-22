@@ -1,7 +1,7 @@
 # Lesce OSM import
 
 Run `make osm-lesce` to build the FreeBuild slot. Make stores the bounded extract
-in `EGR_OSM_CACHE/lesce-20261122-wood.overpass.json` (default `target/osm-cache`).
+in `EGR_OSM_CACHE/lesce-20261122-signals.overpass.json` (default `target/osm-cache`).
 The Overpass query pins the historical data date because the scenario uses
 specific Lesce road and railway anchors. The public endpoint must support
 attic data. To reuse an existing extract, set `EGR_OSM_INPUT=/path/to/extract.json`.

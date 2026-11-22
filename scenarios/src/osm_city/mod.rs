@@ -33,6 +33,8 @@ pub struct ImportReport {
     pub route_checks: BTreeMap<String, bool>,
     pub flat_crossings: Vec<(String, String)>,
     pub short_lanes: Vec<(Vec<u64>, f32)>,
+    /// Junctions whose control differs from the engine's automatic policy, as (source, change).
+    pub junction_policies: Vec<(String, String)>,
     pub policies: Vec<&'static str>,
     pub opening_budget_cents: i64,
     pub opening: Option<CitySample>,

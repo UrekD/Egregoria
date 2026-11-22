@@ -1,0 +1,14 @@
+{
+  "osm3s":{"timestamp_osm_base":"2020-01-01T00:00:00Z"},
+  "elements":[
+    {"type":"way","id":501,"nodes":[5001,5101,5002,5003],"geometry":[{"lat":46.35,"lon":14.14},{"lat":46.35,"lon":14.1421},{"lat":46.35,"lon":14.142},{"lat":46.35,"lon":14.144}],"tags":{"highway":"secondary"}},
+    {"type":"way","id":502,"nodes":[5004,5002,5005],"geometry":[{"lat":46.349,"lon":14.142},{"lat":46.35,"lon":14.142},{"lat":46.351,"lon":14.142}],"tags":{"highway":"residential"}},
+    {"type":"way","id":503,"nodes":[5003,5102,5006,5007],"geometry":[{"lat":46.35,"lon":14.144},{"lat":46.35,"lon":14.1459},{"lat":46.35,"lon":14.146},{"lat":46.35,"lon":14.148}],"tags":{"highway":"secondary"}},
+    {"type":"way","id":504,"nodes":[5008,5006,5009],"geometry":[{"lat":46.349,"lon":14.146},{"lat":46.35,"lon":14.146},{"lat":46.351,"lon":14.146}],"tags":{"highway":"residential"}},
+    {"type":"way","id":505,"nodes":[5010,5011,5012],"geometry":[{"lat":46.353,"lon":14.14},{"lat":46.353,"lon":14.142},{"lat":46.353,"lon":14.144}],"tags":{"highway":"tertiary"}},
+    {"type":"way","id":506,"nodes":[5011,5013],"geometry":[{"lat":46.353,"lon":14.142},{"lat":46.354,"lon":14.142}],"tags":{"highway":"residential"}},
+    {"type":"node","id":5101,"lat":46.35,"lon":14.1421,"tags":{"highway":"traffic_signals"}},
+    {"type":"node","id":5102,"lat":46.35,"lon":14.1459,"tags":{"highway":"traffic_signals","traffic_signals":"crossing"}},
+    {"type":"node","id":5103,"lat":46.3515,"lon":14.144,"tags":{"highway":"traffic_signals"}}
+  ]
+}

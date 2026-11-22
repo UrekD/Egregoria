@@ -45,7 +45,7 @@ osm-lesce:
 	if [ "$${EGR_OSM_INPUT+x}" ]; then \
 		input="$$EGR_OSM_INPUT"; \
 	else \
-		input="$$EGR_OSM_CACHE/lesce-20261122-wood.overpass.json"; \
+		input="$$EGR_OSM_CACHE/lesce-20261122-signals.overpass.json"; \
 		scripts/osm/fetch.sh "$$input"; \
 	fi; \
 	cargo run --locked --release -p scenarios -- osm-city --input "$$input" --save-root "$$EGR_OSM_SAVE_ROOT" $$EGR_OSM_FLAGS

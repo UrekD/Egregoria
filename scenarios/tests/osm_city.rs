@@ -355,3 +355,55 @@ fn osm_does_not_infer_homes_from_buildings_tagged_as_accessories() {
         ["way/101"]
     );
 }
+
+#[test]
+fn osm_junctions_default_to_priority_and_keep_mapped_signals() {
+    use simulation::map::TrafficControl;
+    use simulation::{MapPreset, NewGameOptions, Simulation};
+
+    scenarios::ensure_repo_root_cwd();
+    simulation::init::init();
+    let input = include_bytes!("fixtures/osm-junction-control.json");
+    let normalized = normalize(read_overpass(input.as_slice()).unwrap(), LESCE_BOUNDS).unwrap();
+    let options = NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: 16,
+        ..Default::default()
+    };
+    let (sim, network) = Simulation::from_imported_city(&normalized.city, &options).unwrap();
+    let map = sim.map();
+    let controls = |lat, lon| {
+        let at = LESCE_BOUNDS.project(lat, lon);
+        let junction = normalized
+            .city
+            .junctions
+            .iter()
+            .find(|junction| junction.position.distance(at) < 1.0)
+            .unwrap();
+        let id = network.junctions[&junction.id];
+        let controls: Vec<TrafficControl> = map.intersections()[id]
+            .roads
+            .iter()
+            .flat_map(|&road| map.roads()[road].incoming_lanes_to(id).iter())
+            .filter(|(_, kind)| *kind == LaneKind::Driving)
+            .map(|&(lane, _)| map.lanes()[lane].control)
+            .collect();
+        assert!(controls.len() >= 3, "{lat},{lon}: {controls:?}");
+        controls
+    };
+    // Mapped signals on an approach a few metres from the junction node.
+    assert!(controls(46.35, 14.142).iter().all(TrafficControl::is_light));
+    // A pedestrian-only signal leaves the crossroads under priority rules.
+    assert!(controls(46.35, 14.146)
+        .iter()
+        .all(TrafficControl::is_always));
+    // A tee on an arterial has no all-way stop.
+    assert!(controls(46.353, 14.142)
+        .iter()
+        .all(TrafficControl::is_always));
+    // Signals away from any road junction are reported, not guessed.
+    assert!(normalized
+        .skipped
+        .iter()
+        .any(|(id, reason)| id == "node/5103" && reason.contains("traffic signal")));
+}
