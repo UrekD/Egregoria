@@ -1,5 +1,5 @@
 use geom::{vec2, Intersect, Vec2, AABB};
-use goryak::{padxy, round_rect, secondary_container};
+use goryak::{minrow, padxy, round_rect, secondary_container};
 use ordered_float::OrderedFloat;
 use simulation::map::{BuildingKind, ProjectFilter};
 use simulation::map_dynamic::{ElectricityFlow, UtilityFlow, UtilityStatus};
@@ -11,32 +11,66 @@ use simulation::Simulation;
 use yakui::{reflow, Alignment, Color, Dim2, Pivot};
 
 use crate::gui::overlays::view;
+use crate::gui::textures::UiTextures;
 use crate::uiworld::UiWorld;
 
 const COMPACT_BADGE_DEPTH: f32 = 550.0;
+const BLACKOUT_ICON_SIZE: f32 = 14.0;
+const BADGE_TEXT_SIZE: f32 = 11.0;
+const BADGE_ROW_SPACING: f32 = 3.0;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BadgeKind {
+    Fire,
+    Blackout,
+    Disconnected,
+    NoWater,
+    NoSewage,
+}
+
+impl BadgeKind {
+    fn appearance(self) -> (&'static str, &'static str, Color) {
+        match self {
+            Self::Fire => ("Fire", "F", Color::rgb(255, 153, 96)),
+            Self::Blackout => ("", "", Color::WHITE),
+            Self::Disconnected => ("Disconnected", "D", Color::rgb(210, 195, 255)),
+            Self::NoWater => ("No water", "W", Color::rgb(135, 216, 255)),
+            Self::NoSewage => ("No sewage", "S", Color::rgb(255, 212, 132)),
+        }
+    }
+}
 
 struct Badge {
     point: Vec2,
     depth: f32,
-    label: &'static str,
-    short: &'static str,
-    color: Color,
-    count: usize,
+    kind: BadgeKind,
 }
 
 impl Badge {
-    fn bounds(&self, point: Vec2) -> AABB {
-        // Reserve room for a count even before another warning joins the badge.
-        let half_width = if self.depth < COMPACT_BADGE_DEPTH {
-            5.0 + self.label.len() as f32 * 3.5
+    fn footprint(&self, count_digits: usize) -> AABB {
+        // Reserve room for the count before clustering so the placed badge can grow in place.
+        let glyph_width = 7.0;
+        let width = if self.kind == BadgeKind::Blackout {
+            BLACKOUT_ICON_SIZE + BADGE_ROW_SPACING + glyph_width * (1 + count_digits) as f32
         } else {
-            23.0
+            let (label, short, _) = self.kind.appearance();
+            let single = if self.depth < COMPACT_BADGE_DEPTH {
+                label
+            } else {
+                short
+            };
+            glyph_width * single.len().max(short.len() + 2 + count_digits) as f32
         };
-        AABB::new_ll_ur(
-            point - vec2(half_width, 17.0),
-            point + vec2(half_width, 1.0),
-        )
+        let half_width = 5.0 + width * 0.5;
+        AABB::new_ll_ur(vec2(-half_width, -19.0), vec2(half_width, 1.0))
     }
+}
+
+struct PlacedBadge {
+    badge: Badge,
+    point: Vec2,
+    bounds: AABB,
+    count: usize,
 }
 
 pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
@@ -49,8 +83,8 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
     let Some(bounds) = view::bounds(&camera, &map) else {
         return;
     };
+    let screen = AABB::new_ll_ur(Vec2::ZERO, vec2(camera.viewport_w, camera.viewport_h));
     let mut visible = Vec::new();
-    let mut power_icons = Vec::new();
 
     for id in map
         .spatial_map()
@@ -61,101 +95,53 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
             continue;
         };
         let center = building.obb.center();
-        let bob = (uiworld.time_always() + center.mag() * 0.05).cos();
+        let (point, depth) = camera.project(center.z(building.height + 27.0));
+        if !depth.is_finite() || depth <= 0.0 || !point.is_finite() || !screen.contains(point) {
+            continue;
+        }
+
+        if fires.by_building.contains_key(&id) {
+            visible.push(Badge {
+                point,
+                depth,
+                kind: BadgeKind::Fire,
+            });
+        }
         if map
             .electricity
             .net_id(id)
             .is_some_and(|net| power.blackout(net))
         {
-            // The main HUD draws blackout icons at this height and scale.
-            let (point, depth) = camera.project(center.z(building.height + 20.0 + bob));
-            if depth.is_finite() && depth > 0.0 && point.is_finite() {
-                let extent = Vec2::splat(5_000.0 / depth + 2.0);
-                power_icons.push(AABB::new_ll_ur(point - extent, point + extent));
-            }
-        }
-        let (point, depth) = camera.project(center.z(building.height + 27.0));
-        if !depth.is_finite()
-            || depth <= 0.0
-            || !point.is_finite()
-            || !(0.0..camera.viewport_w).contains(&point.x)
-            || !(0.0..camera.viewport_h).contains(&point.y)
-        {
-            continue;
+            visible.push(Badge {
+                point,
+                depth,
+                kind: BadgeKind::Blackout,
+            });
         }
 
-        let (label, short, color) = if fires.by_building.contains_key(&id) {
-            ("Fire", "F", Color::rgb(255, 153, 96))
-        } else {
-            if building.kind == BuildingKind::House && !residence::uses_water(sim, id) {
-                continue;
-            }
-            let Some(status) = utilities.status(&map, &residences, id) else {
-                continue;
-            };
-            match (status.water, status.sewage) {
-                (UtilityStatus::Disconnected, _) => {
-                    ("Disconnected", "D", Color::rgb(210, 195, 255))
-                }
-                (UtilityStatus::Shortage, _) => ("No water", "W", Color::rgb(135, 216, 255)),
-                (_, UtilityStatus::Shortage) => ("No sewage", "S", Color::rgb(255, 212, 132)),
-                _ => continue,
-            }
+        if building.kind == BuildingKind::House && !residence::uses_water(sim, id) {
+            continue;
+        }
+        let Some(status) = utilities.status(&map, &residences, id) else {
+            continue;
         };
-        visible.push(Badge {
-            point,
-            depth,
-            label,
-            short,
-            color,
-            count: 1,
-        });
+        let kind = match (status.water, status.sewage) {
+            (UtilityStatus::Disconnected, _) => BadgeKind::Disconnected,
+            (UtilityStatus::Shortage, _) => BadgeKind::NoWater,
+            (_, UtilityStatus::Shortage) => BadgeKind::NoSewage,
+            _ => continue,
+        };
+        visible.push(Badge { point, depth, kind });
     }
 
-    // Keep fires and the nearest utility issues when the view is crowded.
-    const MAX_BADGES: usize = 256;
-    let priority = |badge: &Badge| (badge.short != "F", OrderedFloat(badge.depth));
-    if visible.len() > MAX_BADGES {
-        visible.select_nth_unstable_by_key(MAX_BADGES, priority);
-        visible.truncate(MAX_BADGES);
-    }
-    visible.sort_unstable_by_key(priority);
-
-    let screen = AABB::new_ll_ur(Vec2::ZERO, vec2(camera.viewport_w, camera.viewport_h));
-    let mut placed: Vec<(Badge, Vec2, AABB)> = Vec::new();
-    for badge in visible {
-        let nearby = placed.iter_mut().find(|(anchor, _, _)| {
-            badge.depth >= COMPACT_BADGE_DEPTH
-                && anchor.depth >= COMPACT_BADGE_DEPTH
-                && badge
-                    .bounds(badge.point)
-                    .intersects(&anchor.bounds(anchor.point))
-        });
-        if let Some((anchor, _, _)) = nearby {
-            anchor.count += 1;
-            continue;
-        }
-        for offset in [
-            vec2(0.0, 0.0),
-            vec2(0.0, -18.0),
-            vec2(-28.0, -18.0),
-            vec2(28.0, -18.0),
-            vec2(0.0, -36.0),
-            vec2(0.0, 24.0),
-        ] {
-            let point = badge.point + offset;
-            let bounds = badge.bounds(point);
-            if screen.contains(bounds.ll)
-                && screen.contains(bounds.ur)
-                && !placed.iter().any(|(_, _, other)| bounds.intersects(other))
-                && !power_icons.iter().any(|icon| bounds.intersects(icon))
-            {
-                placed.push((badge, point, bounds));
-                break;
-            }
-        }
-    }
-    for (badge, point, _) in placed {
+    let no_power_img = uiworld.read::<UiTextures>().get("no_power");
+    for PlacedBadge {
+        badge,
+        point,
+        count,
+        ..
+    } in place_badges(visible, screen)
+    {
         reflow(
             Alignment::TOP_LEFT,
             Pivot::BOTTOM_CENTER,
@@ -163,20 +149,181 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
             || {
                 round_rect(5.0, secondary_container().with_alpha(0.93), || {
                     padxy(4.0, 1.0, || {
-                        let label = if badge.depth < COMPACT_BADGE_DEPTH {
-                            badge.label
+                        if badge.kind == BadgeKind::Blackout {
+                            minrow(BADGE_ROW_SPACING, || {
+                                let size = yakui::Vec2::splat(BLACKOUT_ICON_SIZE);
+                                let mut image = yakui::widgets::Image::new(no_power_img, size);
+                                image.color = Color::WHITE.with_alpha(0.7);
+                                image.show();
+                                if count > 1 {
+                                    yakui::widgets::Text::new(
+                                        BADGE_TEXT_SIZE,
+                                        format!("+{}", count - 1),
+                                    )
+                                    .show();
+                                }
+                            });
                         } else {
-                            badge.short
-                        };
-                        let mut text = yakui::widgets::Text::new(11.0, label);
-                        if badge.count > 1 {
-                            text.text = format!("{} +{}", badge.short, badge.count - 1).into();
+                            let (label, short, color) = badge.kind.appearance();
+                            let mut text = if count > 1 {
+                                yakui::widgets::Text::new(
+                                    BADGE_TEXT_SIZE,
+                                    format!("{} +{}", short, count - 1),
+                                )
+                            } else {
+                                let label = if badge.depth < COMPACT_BADGE_DEPTH {
+                                    label
+                                } else {
+                                    short
+                                };
+                                yakui::widgets::Text::new(BADGE_TEXT_SIZE, label)
+                            };
+                            text.style.color = color;
+                            text.show();
                         }
-                        text.style.color = badge.color;
-                        text.show();
                     });
                 });
             },
         );
+    }
+}
+
+fn place_badges(mut visible: Vec<Badge>, screen: AABB) -> Vec<PlacedBadge> {
+    visible.sort_by_key(|badge| (badge.kind != BadgeKind::Fire, OrderedFloat(badge.depth)));
+
+    let count_digits = visible.len().max(1).ilog10() as usize + 1;
+    let mut placed: Vec<PlacedBadge> = Vec::new();
+    for badge in visible {
+        let footprint = badge.footprint(count_digits);
+        let center = screen.center() - footprint.center();
+        let point = badge
+            .point
+            .max((screen.ll - footprint.ll).min(center))
+            .min((screen.ur - footprint.ur).max(center));
+
+        if badge.depth >= COMPACT_BADGE_DEPTH {
+            let bounds = footprint.offset(point);
+            if let Some(anchor) = placed.iter_mut().find(|anchor| {
+                anchor.badge.kind == badge.kind
+                    && anchor.badge.depth >= COMPACT_BADGE_DEPTH
+                    && bounds.intersects(&anchor.bounds)
+            }) {
+                anchor.count += 1;
+                continue;
+            }
+        }
+
+        let free = [
+            vec2(0.0, 0.0),
+            vec2(0.0, -22.0),
+            vec2(-28.0, -22.0),
+            vec2(28.0, -22.0),
+            vec2(0.0, -44.0),
+            vec2(0.0, 24.0),
+        ]
+        .into_iter()
+        .find_map(|offset| {
+            let point = point + offset;
+            let bounds = footprint.offset(point);
+            (screen.contains(bounds.ll)
+                && screen.contains(bounds.ur)
+                && !placed
+                    .iter()
+                    .any(|anchor| bounds.intersects(&anchor.bounds)))
+            .then_some((point, bounds))
+        });
+
+        let (point, bounds) = match free {
+            Some(position) => position,
+            None => {
+                if let Some(anchor) = placed.iter_mut().min_by_key(|anchor| {
+                    (
+                        anchor.badge.kind != badge.kind,
+                        anchor.badge.kind == BadgeKind::Fire,
+                        OrderedFloat(point.distance2(anchor.point)),
+                    )
+                }) {
+                    anchor.count += 1;
+                    continue;
+                }
+                // Even a viewport smaller than the first badge gets a cluster anchor.
+                (point, footprint.offset(point))
+            }
+        };
+        placed.push(PlacedBadge {
+            badge,
+            point,
+            bounds,
+            count: 1,
+        });
+    }
+    placed
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fires_take_priority_and_collisions_cluster() {
+        let point = vec2(80.0, 25.0);
+        let screen = AABB::new_ll_ur(Vec2::ZERO, vec2(160.0, 60.0));
+        let mut visible = vec![
+            Badge {
+                point,
+                depth: 100.0,
+                kind: BadgeKind::NoWater,
+            },
+            Badge {
+                point,
+                depth: 100.0,
+                kind: BadgeKind::Blackout,
+            },
+        ];
+        visible.extend((0..3).map(|_| Badge {
+            point,
+            depth: 200.0,
+            kind: BadgeKind::Fire,
+        }));
+
+        let placed = place_badges(visible, screen);
+        assert_eq!(placed[0].point, point);
+        assert_eq!(placed.len(), 2);
+        assert!(placed
+            .iter()
+            .all(|anchor| anchor.badge.kind == BadgeKind::Fire));
+        assert_eq!(placed.iter().map(|anchor| anchor.count).sum::<usize>(), 5);
+        assert!(!placed[0].bounds.intersects(&placed[1].bounds));
+    }
+
+    #[test]
+    fn compact_blackouts_cluster_and_leave_room_for_utility_badges() {
+        let screen = AABB::new_ll_ur(Vec2::ZERO, vec2(160.0, 90.0));
+        let placed = place_badges(
+            vec![
+                Badge {
+                    point: vec2(80.0, 45.0),
+                    depth: 1200.0,
+                    kind: BadgeKind::Blackout,
+                },
+                Badge {
+                    point: vec2(80.0, 45.0),
+                    depth: 1200.0,
+                    kind: BadgeKind::Blackout,
+                },
+                Badge {
+                    point: vec2(110.0, 45.0),
+                    depth: 1300.0,
+                    kind: BadgeKind::NoWater,
+                },
+            ],
+            screen,
+        );
+
+        assert_eq!(placed.len(), 2);
+        assert_eq!(placed[0].badge.kind, BadgeKind::Blackout);
+        assert_eq!(placed[0].count, 2);
+        assert_eq!(placed[1].badge.kind, BadgeKind::NoWater);
+        assert!(!placed[0].bounds.intersects(&placed[1].bounds));
     }
 }
