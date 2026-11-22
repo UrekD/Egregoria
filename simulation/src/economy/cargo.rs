@@ -3581,18 +3581,18 @@ mod lifecycle_tests {
         let SoulID::GoodsCompany(id) = depot.soul else {
             unreachable!()
         };
-        let activity = |f: &Fixture| f.ctx.g.read::<CargoBook>().warehouse_activity(id);
+        let activity = |f: &Fixture, id| f.ctx.g.read::<CargoBook>().warehouse_activity(id);
         f.update(FREIGHT_MATCH_INTERVAL);
-        assert_eq!(activity(&f), Some(WarehouseActivity::NoWorkers));
+        assert_eq!(activity(&f, id), Some(WarehouseActivity::NoWorkers));
 
         warehouse_driver(&mut f, depot);
         f.update(2 * FREIGHT_MATCH_INTERVAL);
-        assert_eq!(activity(&f), Some(WarehouseActivity::WaitingForSupply));
+        assert_eq!(activity(&f, id), Some(WarehouseActivity::WaitingForSupply));
 
         let target = plant_target(&f);
         f.seed(100, target);
         f.update(3 * FREIGHT_MATCH_INTERVAL);
-        assert_eq!(activity(&f), Some(WarehouseActivity::Moving));
+        assert_eq!(activity(&f, id), Some(WarehouseActivity::Moving));
 
         let mut f = Fixture::new();
         let depot = warehouse(&mut f, "small-depot");
@@ -3607,7 +3607,10 @@ mod lifecycle_tests {
             .write::<Market>()
             .produce(depot.soul, Fixture::coal(), 48);
         f.update(FREIGHT_MATCH_INTERVAL);
-        assert_eq!(activity(&f), Some(WarehouseActivity::NothingBelowWatermark));
+        assert_eq!(
+            activity(&f, id),
+            Some(WarehouseActivity::NothingBelowWatermark)
+        );
 
         f.ctx
             .g
@@ -3617,6 +3620,6 @@ mod lifecycle_tests {
             .apply(&[WorldCommand::MapRemoveBuilding(f.source.building)]);
         f.ctx.tick_fast();
         f.update(2 * FREIGHT_MATCH_INTERVAL);
-        assert_eq!(activity(&f), Some(WarehouseActivity::NoSupplierInReach));
+        assert_eq!(activity(&f, id), Some(WarehouseActivity::NoSupplierInReach));
     }
 }

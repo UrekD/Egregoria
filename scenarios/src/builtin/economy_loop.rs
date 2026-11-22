@@ -1,5 +1,5 @@
 use geom::vec2;
-use prototypes::{GoodsCompanyID, ItemID, RecTimeInterval, TICKS_PER_HOUR};
+use prototypes::{GameTime, GoodsCompanyID, ItemID, RecTimeInterval, TICKS_PER_HOUR};
 use simulation::economy::cargo::CargoBook;
 use simulation::economy::{DailyEconomyMetrics, Market, TripPurpose, TICKS_PER_BUDGET_DAY};
 use simulation::map::Density::{High, Low};
@@ -35,7 +35,6 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     if std::env::var_os("EGREGORIA_ECONOMY_WAREHOUSE").is_some() {
         return compare_warehouse(ctx);
     }
-    let growable_freight = std::env::var_os("EGREGORIA_ECONOMY_GROWABLE_FREIGHT").is_some();
     let showcase = std::env::var_os("EGREGORIA_ECONOMY_SHOWCASE_ROOT");
     let demo_slot =
         std::env::var("EGREGORIA_ECONOMY_DEMO_SLOT").unwrap_or_else(|_| "showcase_city".into());
@@ -43,9 +42,9 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         let slot = SlotId::new(&demo_slot).map_err(|error| error.to_string())?;
         ctx.sim = Simulation::load_from_slot(std::path::Path::new(root), &slot)
             .map_err(|error| error.to_string())?;
-        if growable_freight {
-            enable_growable_freight(&mut ctx.sim);
-        }
+        // Slots saved before zoned trucks became the default still run the
+        // instantaneous zoned lane.
+        enable_growable_freight(&mut ctx.sim);
         if demo_slot == "starter_town" {
             // The opening town's first 46 workers fill closer jobs. Grow the
             // neighbourhood by the mine to exercise a staffed freight route.
@@ -60,9 +59,6 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
             ctx.run_ticks(TICKS_PER_BUDGET_DAY);
         }
     } else {
-        if growable_freight {
-            enable_growable_freight(&mut ctx.sim);
-        }
         build_fixture(ctx)?;
         ctx.run_ticks(2 * TICKS_PER_BUDGET_DAY);
     }
@@ -284,6 +280,8 @@ fn build_fixture(ctx: &mut ScenarioCtx) -> Result<(), String> {
 }
 
 fn compare_warehouse(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    let mut zoned = ScenarioCtx::new(SCENARIO.1);
+    zoned_depot(&mut zoned)?;
     let mut direct = ScenarioCtx::new(SCENARIO.1);
     let direct = coal_supply_shock(&mut direct, false)?;
     let buffered = coal_supply_shock(ctx, true)?;
@@ -304,6 +302,62 @@ fn compare_warehouse(ctx: &mut ScenarioCtx) -> Result<(), String> {
         return Err("Depot must restock from the mine and shorten the shortage".into());
     }
     ctx.sample("warehouse_recovery");
+    Ok(())
+}
+
+/// A player places a depot beside the zoned industry and stores of a running,
+/// fully employed city during work hours. Its first driver comes from the
+/// hourly staffing pass. Staged goods give it something to move, because this
+/// city's stores take all the zoned output directly.
+fn zoned_depot(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    let origin = vec2(704.0, 704.0);
+    build_fixture(ctx)?;
+    ctx.run_ticks(2 * TICKS_PER_BUDGET_DAY);
+    while ctx.sim.read::<GameTime>().daytime.hour != 9 {
+        ctx.run_ticks(TICKS_PER_HOUR / 60);
+    }
+    // Below the grid's south edge, between the commercial and industrial columns.
+    let depot = place_company(ctx, "small-depot", origin + vec2(400.0, -45.0))
+        .ok_or("could not place the zoned depot")?;
+    let soul = ctx
+        .sim
+        .read::<BuildingInfos>()
+        .owner(depot)
+        .ok_or("missing depot owner")?;
+    let SoulID::GoodsCompany(company) = soul else {
+        return Err("depot is not a company".into());
+    };
+    let goods = ItemID::new("goods");
+    ctx.sim.write::<Market>().produce(soul, goods, 48);
+    let (mut hired, mut first_truck) = (None, None);
+    for minute in 1..=3 * 60 {
+        ctx.run_ticks(TICKS_PER_HOUR / 60);
+        let book = ctx.sim.read::<CargoBook>();
+        if hired.is_none() && !ctx.sim.world().companies[company].workers.0.is_empty() {
+            hired = Some(minute);
+        }
+        if first_truck.is_none() && book.outgoing_loads(depot).next().is_some() {
+            first_truck = Some(minute);
+        }
+        if minute % 30 == 0 {
+            println!(
+                "economy_loop zoned depot after {minute} min: {} workers, {:?}, {} goods on hand",
+                ctx.sim.world().companies[company].workers.0.len(),
+                book.warehouse_activity(company),
+                ctx.sim.read::<Market>().capital(soul, goods),
+            );
+        }
+    }
+    println!(
+        "economy_loop zoned depot: first driver hired after {hired:?} min, first truck out \
+         after {first_truck:?} min"
+    );
+    ctx.sample("zoned_depot");
+    // The hourly pass hires within the hour. A driver without a car then walks
+    // across town, so the truck leaves later.
+    if hired.is_none_or(|minute| minute > 61) || first_truck.is_none() {
+        return Err("The zoned depot must hire within the hour and then run a truck".into());
+    }
     Ok(())
 }
 

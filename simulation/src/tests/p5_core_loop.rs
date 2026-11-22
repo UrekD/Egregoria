@@ -1042,3 +1042,42 @@ fn p5_core_loop_utility_objective_measures_the_day() {
         );
     }
 }
+
+#[test]
+fn whfix_a_new_depot_hires_its_first_driver_from_a_fully_employed_city() {
+    use crate::souls::desire::WorkKind;
+
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let road = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 250.0)
+        .unwrap()
+        .0;
+    let home = test.build_house_near(vec2(120.0, 275.0));
+    test.g
+        .write::<residence::Residences>()
+        .by_building
+        .get_mut(&home)
+        .unwrap()
+        .capacity = 12;
+    let (_, donor) = place_company(&mut test, "commercial-l1", vec2(90.0, 225.0), road);
+    for _ in 0..12 {
+        spawn_human(&mut test.g, home).unwrap();
+    }
+    hire(&mut test.g);
+    assert_eq!(test.g.world().companies[donor].workers.0.len(), 12);
+
+    // No one is looking for work, so only the hourly staffing pass can seat a driver.
+    let (_, depot) = place_company(&mut test, "small-depot", vec2(355.0, 225.0), road);
+    test.g.write::<GameTime>().tick.0 = INITIAL_TICK + TICKS_PER_HOUR + 1;
+    hire(&mut test.g);
+    let workers = &test.g.world().companies[depot].workers.0;
+    assert_eq!(workers.len(), 1, "the depot's first driver");
+    let work = test.g.world().humans[workers[0]].work.as_ref().unwrap();
+    assert!(matches!(work.kind, WorkKind::Driver { .. }));
+    assert_eq!(test.g.world().companies[donor].workers.0.len(), 11);
+}

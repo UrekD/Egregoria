@@ -4,7 +4,7 @@ use goryak::{
 };
 use prototypes::try_prototype;
 use simulation::economy::{
-    cargo::{stored_items, CargoBook, TruckLoad, WarehousePolicy},
+    cargo::{stored_items, CargoBook, TruckLoad, WarehouseActivity, WarehousePolicy},
     Market,
 };
 use simulation::map::{BuildingID, BuildingKind, Map};
@@ -83,6 +83,25 @@ pub(crate) fn section(uiw: &UiWorld, sim: &Simulation, building: BuildingID) {
                     }
                 ),
             );
+            if let Some(activity) = book.warehouse_activity(company) {
+                textc(
+                    on_secondary_container(),
+                    match activity {
+                        WarehouseActivity::Moving => "Trucks on the road",
+                        WarehouseActivity::Queued => "Cargo waits for a driver at the dock",
+                        WarehouseActivity::NoWorkers => "Idle · no workers to drive the trucks",
+                        WarehouseActivity::NoSupplierInReach => {
+                            "Idle · no supplier of its items in reach by road"
+                        }
+                        WarehouseActivity::WaitingForSupply => {
+                            "Restocking · suppliers in reach have nothing to spare yet"
+                        }
+                        WarehouseActivity::NothingBelowWatermark => {
+                            "Idle · stock is above the restock level and nothing nearby is short"
+                        }
+                    },
+                );
+            }
             let policy = book.warehouse_policy(company, storage);
             minrow(4.0, || {
                 for (choice, label) in [

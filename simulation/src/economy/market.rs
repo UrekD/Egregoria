@@ -191,6 +191,9 @@ pub(super) enum HiringPriority {
     Water,
     Sewage,
     Civic,
+    /// A warehouse seats its first driver like a civic service, so a new
+    /// depot runs trucks in a fully employed city.
+    Freight,
     Support,
     Standard,
 }
@@ -211,6 +214,7 @@ impl HiringPriority {
                 ServiceKind::Fire | ServiceKind::Health | ServiceKind::School | ServiceKind::Police,
             ) => Self::Civic,
             Some(_) => Self::Support,
+            None if id.prototype().storage.is_some() => Self::Freight,
             None if id == GoodsCompanyID::new("coal-mine") => Self::Support,
             None => Self::Standard,
         }
@@ -737,7 +741,7 @@ impl Market {
                 HiringPriority::Power | HiringPriority::Water | HiringPriority::Sewage => {
                     vacancies.push((priority, id));
                 }
-                HiringPriority::Civic if company.workers.0.is_empty() => {
+                HiringPriority::Civic | HiringPriority::Freight if company.workers.0.is_empty() => {
                     vacancies.push((priority, id));
                 }
                 _ => {}
@@ -771,7 +775,7 @@ impl Market {
                 .min(order.qty as usize);
 
             let rate = Self::utility_rate(company, building, priority);
-            let capacity = if priority == HiringPriority::Civic {
+            let capacity = if matches!(priority, HiringPriority::Civic | HiringPriority::Freight) {
                 open = open.min(1);
                 None
             } else {
