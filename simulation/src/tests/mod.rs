@@ -15,6 +15,7 @@ mod lifecycle;
 mod p1_fix2;
 mod p2_services;
 mod p2abc_fix;
+mod p3a_transit;
 mod p3_spine;
 mod test_iso;
 mod vehicles;

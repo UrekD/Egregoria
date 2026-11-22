@@ -454,14 +454,8 @@ fn p3_spine_validates_live_directed_loop_before_apply() {
         Err(Rejection::InvalidConnection)
     );
 
-    ctx.g.write::<crate::Replay>().enabled = true;
-    let before = ctx.g.hashes();
     command.apply(&mut ctx.g);
-    assert_eq!(
-        ctx.g.read::<CommandOutcomes>().last,
-        [("TransitEditLine", Rejection::TransitNotImplemented)]
-    );
-    assert_eq!(ctx.g.hashes(), before);
+    assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
 
     let (road, disconnected) = {
         let map = ctx.g.map();
@@ -558,7 +552,6 @@ fn p3_spine_resume_with_occupied_bus_and_waiting_queue() {
 }
 
 #[test]
-#[ignore = "P3a must implement stops, dispatch, dwell, boarding, and detach"]
 fn p3a_bus_loop_serves_both_stops_and_dwells() {
     let (mut ctx, line) = loop_fixture();
     ctx.apply(&[WorldCommand::TransitSetVehicles { line, n: 1 }]);
@@ -605,7 +598,7 @@ fn p3d_active_transit_tick_cost_stays_within_ten_percent() {
     );
 }
 
-fn loop_fixture() -> (TestCtx, LineID) {
+pub(super) fn loop_fixture() -> (TestCtx, LineID) {
     let mut ctx = TestCtx::new();
     ctx.build_roads(&[
         Vec3::new(100.0, 100.0, 0.0),
