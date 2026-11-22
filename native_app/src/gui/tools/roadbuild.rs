@@ -4,7 +4,8 @@ use geom::{PolyLine3, Vec2, Vec3};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use simulation::map::{
-    LanePatternBuilder, Map, MapProject, ProjectFilter, ProjectKind, PylonPosition, RoadSegmentKind,
+    LanePatternBuilder, Map, MapProject, PointGenerateError, ProjectFilter, ProjectKind,
+    PylonPosition, RoadSegmentKind, ROAD_Z_OFFSET,
 };
 use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::Simulation;
@@ -57,25 +58,18 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
     let mut interpolation_points: Vec<Vec3> = Vec::new();
     let nosnapping = inp.act.contains(&InputAction::NoSnapping);
 
-    let mouse_height = |h: Vec3| match (state.height_reference, state.build_state) {
-        (HeightReference::Start, Start(id) | StartCurved(id) | CurvedConnection(id, _)) => {
-            h.xy().z(id.pos.z + state.height_offset)
-        }
-        (HeightReference::Ground | HeightReference::Start, _) => {
-            h.xy().z(h.z + state.height_offset)
-        }
-        (HeightReference::MaxIncline | HeightReference::MaxDecline, _) => h, // work in progress
-    };
-
     // Prepare mousepos depending on snap to grid or snap to angle
     let mousepos = match state.snapping {
-        Snapping::None => mouse_height(unproj),
-        Snapping::SnapToGrid => mouse_height(unproj.xy().snap(grid_size, grid_size).z(unproj.z)),
+        Snapping::None => state.mouse_height(map, unproj),
+        Snapping::SnapToGrid => {
+            state.mouse_height(map, unproj.xy().snap(grid_size, grid_size).z(unproj.z))
+        }
         Snapping::SnapToAngle => {
             interpolation_points = state
                 .possible_interpolations(map, unproj)
                 .unwrap_or_default();
-            mouse_height(
+            state.mouse_height(
+                map,
                 interpolation_points
                     .iter()
                     .filter_map(|&point| {
@@ -266,27 +260,16 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
     let mut points = None;
 
     if let Some((src, dst, inter, pat)) = build_args {
-        potential_command.set(WorldCommand::MapMakeConnection {
-            from: src,
-            to: dst,
-            inter,
-            pat,
-        });
-
-        let connection_segment = match inter {
-            Some(x) => RoadSegmentKind::from_elbow(src.pos.xy(), dst.pos.xy(), x),
-            None => RoadSegmentKind::Straight,
-        };
-
-        let (p, err) = simulation::map::Road::generate_points(
-            src.pos,
-            dst.pos,
-            connection_segment,
-            is_rail,
-            &map.environment,
-        );
-        points = Some(p);
-        if err.is_some() {
+        if let Some((p, err)) = connection_preview(map, src, dst, inter, is_rail) {
+            potential_command.set(WorldCommand::MapMakeConnection {
+                from: src,
+                to: dst,
+                inter,
+                pat,
+            });
+            points = Some(p);
+            is_valid &= err.is_none();
+        } else {
             is_valid = false;
         }
     }
@@ -366,6 +349,21 @@ pub struct RoadBuildResource {
 }
 
 impl RoadBuildResource {
+    fn mouse_height(&self, map: &Map, h: Vec3) -> Vec3 {
+        match (self.height_reference, self.build_state) {
+            (
+                HeightReference::Start,
+                Start(start) | StartCurved(start) | CurvedConnection(start, _) | Curved(_, start),
+            ) => {
+                let start_height =
+                    connection_endpoint_position(map, start).map_or(start.pos.z, |p| p.z);
+                h.xy().z(start_height + self.height_offset)
+            }
+            (HeightReference::Ground | HeightReference::Start, _) => h.up(self.height_offset),
+            (HeightReference::MaxIncline | HeightReference::MaxDecline, _) => h, // work in progress
+        }
+    }
+
     pub(crate) fn cancel_placement(&mut self) -> bool {
         if matches!(self.build_state, Hover) {
             return false;
@@ -392,6 +390,49 @@ pub enum HeightReference {
     Start,
     MaxIncline,
     MaxDecline,
+}
+
+fn connection_endpoint_position(map: &Map, project: MapProject) -> Option<Vec3> {
+    // Match the coordinate conversion in Map::resolve_connection_endpoint.
+    let pos = match project.kind {
+        Ground => project.pos,
+        Intersection(id) => map.get(id)?.pos,
+        Road(id) if project.pos.is_finite() => {
+            let points = map.get(id)?.points();
+            let point = points.project(project.pos);
+            if point.xy().distance(points.first().xy()) < 1.0
+                || point.xy().distance(points.last().xy()) < 1.0
+            {
+                return None;
+            }
+            point - Vec3::z(ROAD_Z_OFFSET)
+        }
+        _ => return None,
+    };
+    pos.is_finite().then_some(pos)
+}
+
+fn connection_preview(
+    map: &Map,
+    src: MapProject,
+    dst: MapProject,
+    inter: Option<Vec2>,
+    is_rail: bool,
+) -> Option<(PolyLine3, Option<PointGenerateError>)> {
+    let src = connection_endpoint_position(map, src)?;
+    let dst = connection_endpoint_position(map, dst)?;
+    let segment = match inter {
+        Some(x) => RoadSegmentKind::from_elbow(src.xy(), dst.xy(), x),
+        None => RoadSegmentKind::Straight,
+    };
+
+    Some(simulation::map::Road::generate_points(
+        src,
+        dst,
+        segment,
+        is_rail,
+        &map.environment,
+    ))
 }
 
 fn check_angle(map: &Map, from: MapProject, to: Vec2, is_rail: bool) -> bool {
@@ -681,5 +722,68 @@ impl RoadBuildResource {
 
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geom::{vec2, vec3};
+    use simulation::map::Environment;
+
+    #[test]
+    fn curved_start_reference_uses_the_selected_start_height() {
+        let start = MapProject::ground(vec3(40.0, 80.0, 20.0));
+        let state = RoadBuildResource {
+            build_state: Curved(vec2(80.0, 140.0), start),
+            height_reference: HeightReference::Start,
+            height_offset: 5.0,
+            ..Default::default()
+        };
+
+        assert_eq!(
+            state.mouse_height(&Map::empty(), vec3(140.0, 160.0, 2.0)),
+            vec3(140.0, 160.0, 25.0)
+        );
+    }
+
+    #[test]
+    fn curved_road_preview_matches_the_applied_endpoints() {
+        let mut map = Map::empty();
+        map.environment = Environment::new(1, 1);
+        map.environment
+            .terrain_apply(map.environment.bounds(), |_| 0.0);
+        let pattern = LanePatternBuilder::default().build();
+        let ground = MapProject::ground;
+        map.make_connection(
+            ground(vec3(40.0, 80.0, 20.0)),
+            ground(vec3(140.0, 80.0, 24.0)),
+            None,
+            &pattern,
+        )
+        .unwrap();
+        let (intersection, _) = map
+            .make_connection(
+                ground(vec3(270.0, 200.0, 24.0)),
+                ground(vec3(170.0, 200.0, 24.0)),
+                None,
+                &pattern,
+            )
+            .unwrap();
+        let from = map.project(vec3(90.0, 80.0, 21.0), 0.0, ProjectFilter::ROAD);
+        assert!(matches!(from.kind, Road(_)));
+        let to = MapProject {
+            pos: vec3(170.0, 200.0, 25.0),
+            kind: Intersection(intersection),
+        };
+        let elbow = Some(vec2(110.0, 155.0));
+        let (preview, _) = connection_preview(&map, from, to, elbow, false).unwrap();
+        let (_, road) = map.make_connection(from, to, elbow, &pattern).unwrap();
+        let applied = map.get(road).unwrap().points();
+
+        assert_eq!(
+            (preview.first(), preview.last()),
+            (applied.first(), applied.last())
+        );
     }
 }

@@ -337,8 +337,13 @@ impl Road {
             points.push(pos.z(h));
         }
 
+        let last = contour.len() - 1;
+        // Allow for rounding when endpoint heights round-trip through ROAD_Z_OFFSET.
+        let elevated_span = !height_error
+            && start_height - contour[0] > 0.001
+            && end_height - contour[last] > 0.001;
         contour[0] = start_height;
-        *contour.last_mut().unwrap() = end_height;
+        contour[last] = end_height;
 
         // Then find out which points are airborn (according to maxslope)
         // To do that, we do two passes (one forward, one backward) to find the airborn points
@@ -437,6 +442,18 @@ impl Road {
         //    }
         //    std::mem::swap(&mut smoothed, &mut contour);
         //}
+
+        if elevated_span {
+            // Interior samples are spaced one meter apart along the path.
+            // Keep the span above the deck grade even where both terrain passes reached the ground.
+            let length = p.length();
+            let rise = end_height - start_height;
+            for (i, height) in contour[..last].iter_mut().enumerate().skip(1) {
+                let deck_height = start_height + rise * (i as f32 / length);
+                *height = height.max(deck_height);
+            }
+            slope_was_too_steep |= rise.abs() > maxslope * length;
+        }
 
         for (h, v) in contour.into_iter().zip(points.iter_mut()) {
             v.z = h + ROAD_Z_OFFSET;
