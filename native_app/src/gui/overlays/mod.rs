@@ -8,7 +8,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 
 use common::{ChunkID_256, FastMap};
 use geom::{vec2, InfiniteFrustrum, Intersect3, Shape, Vec2, AABB, AABB3, OBB};
-use goryak::combo_box;
+use goryak::{combo_box, tooltip};
 use prototypes::{try_prototype, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer};
 use simulation::map::{Building, BuildingID, BuildingKind, Map, MapSubscriber, UpdateType};
@@ -371,7 +371,9 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
         .iter()
         .position(|(option, _)| *option == *mode)
         .unwrap_or(0);
-    if combo_box(&mut selected, &labels[..count], 170.0) {
+    if tooltip(labels[selected], || {
+        combo_box(&mut selected, &labels[..count], 170.0)
+    }) {
         *mode = modes[selected].0;
     }
     let empty = CACHE.with_borrow(|cache| cache.mode == *mode && cache.tiles.chunks.is_empty());

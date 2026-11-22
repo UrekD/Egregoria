@@ -131,7 +131,9 @@ pub(super) fn render_departure(uiw: &UiWorld) {
 
 fn save_window(gui: &mut GuiState, uiw: &UiWorld, sim: &Simulation) {
     if !session::can_save(uiw) {
-        if session::world_interaction(uiw) && button_secondary("Exit").show().clicked {
+        if session::world_interaction(uiw)
+            && tooltip("Exit the game", || button_secondary("Exit").show()).clicked
+        {
             session::request_departure(uiw, sim, Departure::Exit);
         }
         return;
@@ -139,7 +141,7 @@ fn save_window(gui: &mut GuiState, uiw: &UiWorld, sim: &Simulation) {
     let mut slstate = uiw.write::<SaveLoadState>();
     if slstate.saving_status.load(Ordering::SeqCst) {
         textc(on_secondary_container(), "Saving...");
-    } else if button_primary("Save").show().clicked {
+    } else if tooltip("Save the current city", || button_primary("Save").show()).clicked {
         slstate.please_save = true;
         gui.last_save = Instant::now();
         uiw.save_to_disk();
@@ -198,7 +200,11 @@ fn save_window(gui: &mut GuiState, uiw: &UiWorld, sim: &Simulation) {
     match *estate {
         ExitState::NoExit => {}
         ExitState::ExitAsk => {
-            if button_secondary("Save and exit").show().clicked {
+            if tooltip("Save the city and exit the game", || {
+                button_secondary("Save and exit").show()
+            })
+            .clicked
+            {
                 if let ExitState::ExitAsk = *estate {
                     slstate.please_save = true;
                     *estate = ExitState::Saving;
@@ -211,7 +217,7 @@ fn save_window(gui: &mut GuiState, uiw: &UiWorld, sim: &Simulation) {
     }
     drop(estate);
     drop(slstate);
-    if no_exit && button_secondary("Exit").show().clicked {
+    if no_exit && tooltip("Exit the game", || button_secondary("Exit").show()).clicked {
         session::request_departure(uiw, sim, Departure::Exit);
     }
 }

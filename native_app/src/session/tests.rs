@@ -135,7 +135,7 @@ fn p4_world_replacement_clears_world_identity_and_requires_fresh_input() {
     replay.push(
         prototypes::Tick(sim.get_tick()),
         WorldCommand::Init(Box::new(SimulationOptions {
-            terrain_size: 0,
+            terrain_size: simulation::NewGameOptions::MIN_TERRAIN_CHUNKS,
             ..SimulationOptions::LEGACY
         })),
     );
