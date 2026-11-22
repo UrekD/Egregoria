@@ -43,6 +43,7 @@ extern crate egui_inspect;
 #[macro_use]
 extern crate log as extern_log;
 
+pub mod diagnostics;
 pub mod economy;
 pub mod init;
 pub mod map;

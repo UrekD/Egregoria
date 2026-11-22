@@ -1,14 +1,14 @@
 use goryak::{
-    dragvalue, fixed_spacer, minrow, on_secondary_container, primary, textc, ProgressBar, Window,
+    dragvalue, error, fixed_spacer, mincolumn, minrow, on_secondary_container, primary, textc,
+    ProgressBar, VertScrollSize, Window,
 };
 use prototypes::{try_prototype, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID};
+use simulation::diagnostics::{building_diagnostics, BuildingBlocker, RecipeBlocker};
 use simulation::economy::Market;
-use simulation::map::{
-    Building, BuildingID, BuildingKind, Density, ProjectFilter, Zone, MAX_ZONE_AREA,
-};
-use simulation::map_dynamic::{BuildingInfos, ElectricityFlow};
+use simulation::map::{Building, BuildingID, BuildingKind, Density, Zone, MAX_ZONE_AREA};
+use simulation::map_dynamic::{BuildingInfos, ElectricityFlow, UtilityStatus};
 use simulation::souls::freight_station::FreightTrainState;
-use simulation::souls::residence::{is_retail_store, Residences};
+use simulation::souls::residence::Residences;
 use simulation::transportation::Location;
 use simulation::world_command::WorldCommand;
 use simulation::{Simulation, SoulID};
@@ -31,6 +31,9 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
     let Some(building) = map.buildings().get(id) else {
         return false;
     };
+    let Some(diagnostics) = building_diagnostics(sim, id) else {
+        return false;
+    };
 
     let title: &str = match building.kind {
         BuildingKind::House => "House",
@@ -49,66 +52,68 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
         child_spacing: 5.0,
     }
     .show(|| {
-        if cfg!(debug_assertions) {
-            label(format!("{:?}", building.id));
-        }
+        VertScrollSize::Fixed(610.0).show(|| {
+            mincolumn(5.0, || {
+                if cfg!(debug_assertions) {
+                    label(format!("{:?}", building.id));
+                }
 
-        match building.kind {
-            BuildingKind::House => render_house(uiworld, sim, building),
-            BuildingKind::GoodsCompany(id) => {
-                if let Some(proto) =
-                    try_prototype(GrowableCompanyID::from(id)).filter(|proto| proto.growable)
-                {
-                    label(format!(
-                        "{} · {} density · Level {}",
-                        zone_name(proto.zone_kind),
-                        density_name(proto.density),
-                        proto.level
-                    ));
-                    label(format!("Job capacity  {}", proto.n_workers));
-                    if proto.power_consumption.is_some() {
-                        need("Power", has_power(sim, building.id));
+                render_why(&diagnostics.blockers);
+                match building.kind {
+                    BuildingKind::House => render_house(uiworld, sim, building),
+                    BuildingKind::GoodsCompany(id) => {
+                        if let Some(proto) = try_prototype(GrowableCompanyID::from(id))
+                            .filter(|proto| proto.growable)
+                        {
+                            label(format!(
+                                "{} · {} density · Level {}",
+                                zone_name(proto.zone_kind),
+                                density_name(proto.density),
+                                proto.level
+                            ));
+                            label(format!("Job capacity  {}", proto.n_workers));
+                        }
+                        render_goodscompany(uiworld, sim, building);
                     }
+                    BuildingKind::RailFreightStation(_) => {
+                        render_freightstation(uiworld, sim, building);
+                    }
+                    BuildingKind::TrainStation => {}
+                    BuildingKind::ExternalTrading => {}
+                };
+
+                inspect_needs::render(sim, id, &diagnostics);
+
+                if let Some(ref zone) = building.zone {
+                    let mut cpy = zone.filldir;
+                    minrow(5.0, || {
+                        let mut ang = cpy.angle_cossin().to_degrees();
+
+                        if dragvalue().min(-180.0).max(180.0).show(&mut ang.0) {
+                            cpy = ang.to_radians().vec2();
+                            uiworld.commands().push(WorldCommand::UpdateZone {
+                                building: id,
+                                zone: Zone {
+                                    filldir: cpy,
+                                    ..zone.clone()
+                                },
+                            })
+                        }
+
+                        label("Fill angle");
+                    });
+
+                    ProgressBar {
+                        value: zone.area / MAX_ZONE_AREA,
+                        size: Vec2::new(200.0, 25.0),
+                        color: primary().adjust(0.7),
+                    }
+                    .show_children(|| {
+                        label(format!("area: {}/{}", zone.area, MAX_ZONE_AREA));
+                    });
                 }
-                render_goodscompany(uiworld, sim, building);
-            }
-            BuildingKind::RailFreightStation(_) => {
-                render_freightstation(uiworld, sim, building);
-            }
-            BuildingKind::TrainStation => {}
-            BuildingKind::ExternalTrading => {}
-        };
-
-        inspect_needs::render(sim, id);
-
-        if let Some(ref zone) = building.zone {
-            let mut cpy = zone.filldir;
-            minrow(5.0, || {
-                let mut ang = cpy.angle_cossin().to_degrees();
-
-                if dragvalue().min(-180.0).max(180.0).show(&mut ang.0) {
-                    cpy = ang.to_radians().vec2();
-                    uiworld.commands().push(WorldCommand::UpdateZone {
-                        building: id,
-                        zone: Zone {
-                            filldir: cpy,
-                            ..zone.clone()
-                        },
-                    })
-                }
-
-                label("Fill angle");
             });
-
-            ProgressBar {
-                value: zone.area / MAX_ZONE_AREA,
-                size: Vec2::new(200.0, 25.0),
-                color: primary().adjust(0.7),
-            }
-            .show_children(|| {
-                label(format!("area: {}/{}", zone.area, MAX_ZONE_AREA));
-            });
-        }
+        });
     });
 
     is_open
@@ -151,20 +156,6 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         label(format!("Employment  {employed} / {}", residents.len()));
     }
 
-    let map = sim.map();
-    let retail = map
-        .spatial_map()
-        .query_around(b.door_pos.xy(), 1500.0, ProjectFilter::BUILDING)
-        .filter_map(|project| project.as_building().and_then(|id| map.get(id)))
-        .any(|store| {
-            is_retail_store(store.kind)
-                && store.door_pos.xy().distance2(b.door_pos.xy()) <= 1500.0 * 1500.0
-        });
-    need("Store within 1.5 km", retail);
-    if try_prototype(prototype).is_some_and(|p| p.power_consumption.is_some()) {
-        need("Power", has_power(sim, b.id));
-    }
-
     if !residents.is_empty() {
         label("Households");
     }
@@ -204,21 +195,54 @@ fn density_name(density: Density) -> &'static str {
     }
 }
 
-fn need(name: &str, met: bool) {
-    let status = if met { "Met" } else { "Unmet" };
-    let color = if met {
-        on_secondary_container()
-    } else {
-        goryak::error()
-    };
-    textc(color, format!("{name}  {status}"));
+fn render_why(blockers: &[BuildingBlocker]) {
+    fixed_spacer((0.0, 5.0));
+    label("Why");
+    if blockers.is_empty() {
+        label("No current blockers");
+    }
+    for &blocker in blockers {
+        let description = match blocker {
+            BuildingBlocker::RoadDisconnected => "Disconnected from the road".into(),
+            BuildingBlocker::MissingOwner => "No active owner".into(),
+            BuildingBlocker::Power(status) => inspect_needs::power_detail(status).into(),
+            BuildingBlocker::Water(status) => format!("Water · {}", utility_blocker(status)),
+            BuildingBlocker::Sewage(status) => format!("Sewage · {}", utility_blocker(status)),
+            BuildingBlocker::NoRetailAccess => "No nearby retailer".into(),
+            BuildingBlocker::Abandoned => "Residence abandoned".into(),
+            BuildingBlocker::OnFire => "Building on fire".into(),
+            BuildingBlocker::NoWorkers => "No workers assigned".into(),
+            BuildingBlocker::Recipe(RecipeBlocker::Empty) => {
+                "Recipe has no inputs or outputs".into()
+            }
+            BuildingBlocker::Recipe(RecipeBlocker::MissingInput {
+                item,
+                stock,
+                required,
+            }) => {
+                format!(
+                    "Needs {} · {stock} / {required} in stock",
+                    item.prototype().label
+                )
+            }
+            BuildingBlocker::Recipe(RecipeBlocker::OutputFull { item, stock, limit }) => {
+                format!(
+                    "{} storage full · {stock} / {limit}",
+                    item.prototype().label
+                )
+            }
+        };
+        textc(error(), description);
+    }
 }
 
-fn has_power(sim: &Simulation, id: BuildingID) -> bool {
-    sim.map()
-        .electricity
-        .net_id(id)
-        .is_some_and(|net| !sim.read::<ElectricityFlow>().blackout(net))
+fn utility_blocker(status: UtilityStatus) -> &'static str {
+    match status {
+        UtilityStatus::Served => "Available",
+        UtilityStatus::Shortage => "Network shortage",
+        UtilityStatus::Disconnected => "Disconnected",
+        UtilityStatus::Unknown => "Awaiting network refresh",
+    }
 }
 
 fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {

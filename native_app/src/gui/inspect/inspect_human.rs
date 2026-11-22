@@ -1,10 +1,11 @@
-use goryak::{dragvalue, fixed_spacer, minrow, on_secondary_container, textc, Window};
+use goryak::{dragvalue, error, fixed_spacer, minrow, on_secondary_container, textc, Window};
 use prototypes::ItemID;
 use std::borrow::Cow;
 use yakui::widgets::Pad;
 
+use simulation::diagnostics::{citizen_diagnostics, CitizenBlocker, CitizenIntention};
 use simulation::economy::Market;
-use simulation::map_dynamic::Destination;
+use simulation::map_dynamic::{Destination, ParkingReserveError, RouterError};
 use simulation::souls::desire::WorkKind;
 use simulation::transportation::Location;
 use simulation::{HumanID, Simulation};
@@ -16,6 +17,9 @@ use crate::uiworld::UiWorld;
 /// Inspect a specific building, showing useful information about it
 pub fn inspect_human(uiworld: &UiWorld, sim: &Simulation, id: HumanID) -> bool {
     let Some(human) = sim.get(id) else {
+        return false;
+    };
+    let Some(diagnostics) = citizen_diagnostics(sim, id) else {
         return false;
     };
 
@@ -56,19 +60,32 @@ pub fn inspect_human(uiworld: &UiWorld, sim: &Simulation, id: HumanID) -> bool {
             }
         }
 
-        if let Some(ref dest) = human.router.target_dest {
-            match dest {
-                Destination::Outside(pos) => {
-                    label(format!("Going to {}", pos));
-                }
-                Destination::Building(b) => {
-                    minrow(5.0, || {
-                        label("Going to building");
-                        building_link(uiworld, sim, *b);
-                    });
-                }
+        fixed_spacer((0.0, 5.0));
+        label("Why");
+        label(match diagnostics.intention {
+            CitizenIntention::Idle => "Idle",
+            CitizenIntention::Travel => "Traveling",
+            CitizenIntention::GoHome => "Going home",
+            CitizenIntention::GoToWork => "Going to work",
+            CitizenIntention::PickUpGoods => "Picking up retail goods",
+            CitizenIntention::ChangeVehicle => "Changing vehicle",
+            CitizenIntention::Deliver => "Making a delivery",
+        });
+        match diagnostics.destination {
+            Some(Destination::Outside(pos)) => label(format!("Destination · {pos}")),
+            Some(Destination::Building(building)) if sim.map().get(building).is_some() => {
+                minrow(5.0, || {
+                    label("Destination");
+                    building_link(uiworld, sim, building);
+                });
             }
+            Some(Destination::Building(_)) => label("Destination removed"),
+            None => {}
         }
+        if let Some(blocker) = diagnostics.blocker {
+            textc(error(), blocker_description(blocker));
+        }
+        fixed_spacer((0.0, 5.0));
 
         minrow(5.0, || {
             label("House is");
@@ -129,4 +146,21 @@ pub fn inspect_human(uiworld: &UiWorld, sim: &Simulation, id: HumanID) -> bool {
         follow_button(uiworld, id);
     });
     is_open
+}
+
+fn blocker_description(blocker: CitizenBlocker) -> &'static str {
+    match blocker {
+        CitizenBlocker::DestinationRemoved => "The route's destination was removed",
+        CitizenBlocker::DestinationDisconnected => "The destination has no road connection",
+        CitizenBlocker::PickupTimedOut => "The last retail pickup timed out",
+        CitizenBlocker::Route(RouterError::LocatingVehicle) => "Could not locate the vehicle",
+        CitizenBlocker::Route(RouterError::TranslatingParkingSpotToDrivePos) => {
+            "Could not route to the parking spot"
+        }
+        CitizenBlocker::Route(RouterError::ReservingParkingSpot(reason)) => match reason {
+            ParkingReserveError::FindingNearestLane => "Could not find a lane near the destination",
+            ParkingReserveError::FetchingLaneData => "The parking lane is unavailable",
+            ParkingReserveError::NoSpotFoundAfterSearch => "Could not find a parking spot",
+        },
+    }
 }

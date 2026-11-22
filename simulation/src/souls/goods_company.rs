@@ -17,6 +17,7 @@ use crate::{ParCommandBuffer, SoulID, VehicleEnt};
 use crate::{Simulation, World};
 
 use super::desire::Work;
+use super::residence::{power_status, PowerStatus};
 
 pub fn recipe_init(recipe: &Recipe, soul: SoulID, near: Vec2, market: &mut Market) {
     for item in &recipe.consumption {
@@ -28,17 +29,50 @@ pub fn recipe_init(recipe: &Recipe, soul: SoulID, near: Vec2, market: &mut Marke
 }
 
 pub fn recipe_should_produce(recipe: &Recipe, soul: SoulID, market: &Market) -> bool {
-    // Has enough resources
-    recipe.consumption
-            .iter()
-            .all(move |item| market.capital(soul, item.id) >= item.amount)
-            &&
-            // Has enough storage
-            recipe.production.iter().all(move |item| {
-                market.capital(soul, item.id) < item.amount * (recipe.storage_multiplier + 1)
-            })
-        // has something to do
-    && (!recipe.consumption.is_empty() || !recipe.production.is_empty())
+    recipe_blockers(recipe, soul, market).next().is_none()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RecipeBlocker {
+    MissingInput {
+        item: ItemID,
+        stock: i32,
+        required: i32,
+    },
+    OutputFull {
+        item: ItemID,
+        stock: i32,
+        limit: i32,
+    },
+    Empty,
+}
+
+pub fn recipe_blockers<'a>(
+    recipe: &'a Recipe,
+    soul: SoulID,
+    market: &'a Market,
+) -> impl Iterator<Item = RecipeBlocker> + 'a {
+    let inputs = recipe.consumption.iter().filter_map(move |item| {
+        let stock = market.capital(soul, item.id);
+        (stock < item.amount).then_some(RecipeBlocker::MissingInput {
+            item: item.id,
+            stock,
+            required: item.amount,
+        })
+    });
+    let outputs = recipe.production.iter().filter_map(move |item| {
+        let stock = market.capital(soul, item.id);
+        let limit = item.amount * (recipe.storage_multiplier + 1);
+        (stock >= limit).then_some(RecipeBlocker::OutputFull {
+            item: item.id,
+            stock,
+            limit,
+        })
+    });
+    inputs.chain(outputs).chain(
+        (recipe.consumption.is_empty() && recipe.production.is_empty())
+            .then_some(RecipeBlocker::Empty),
+    )
 }
 
 pub fn recipe_act(recipe: &Recipe, soul: SoulID, near: Vec2, market: &mut Market) {
@@ -92,12 +126,10 @@ impl CompanyEnt {
     ) -> f32 {
         let p = self.raw_productivity(proto, zone);
 
-        if proto.power_consumption > Some(Power::ZERO) {
-            if let Some(net_id) = map.electricity.net_id(self.comp.building) {
-                if elec_flow.blackout(net_id) {
-                    return 0.0;
-                }
-            }
+        if proto.power_consumption > Some(Power::ZERO)
+            && power_status(map, elec_flow, self.comp.building) == PowerStatus::Blackout
+        {
+            return 0.0;
         }
 
         p
