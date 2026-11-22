@@ -1151,6 +1151,7 @@ fn replay_load_rejects_missing_or_mismatched_version() {
 
 #[test]
 fn pf_d_abandonment_batch_cleans_departing_workers_and_trade_references() {
+    use crate::map_dynamic::{ParkingManagement, RoutingStep};
     use crate::souls::{human::spawn_human, residence};
     use prototypes::{GameTime, Tick, TICKS_PER_HOUR};
 
@@ -1170,7 +1171,43 @@ fn pf_d_abandonment_batch_cleans_departing_workers_and_trade_references() {
     }
     let third = test.build_house_near(vec2(275.0, 225.0));
     let survivor = spawn_human(&mut test.g, third).unwrap();
-    spawn_human(&mut test.g, third).unwrap();
+    let passenger = spawn_human(&mut test.g, third).unwrap();
+    let cars: Vec<_> = departing
+        .iter()
+        .map(|&id| {
+            let human = test.g.get(id).unwrap();
+            if let Some(car) = human.router.personal_car {
+                return car;
+            }
+            let pos = human.trans.pos;
+            let car = spawn_parked_vehicle(&mut test.g, VehicleKind::Car, pos).unwrap();
+            let router = &mut test.g.world.humans[id].router;
+            router.personal_car = Some(car);
+            router.use_vehicle(Some(car));
+            car
+        })
+        .collect();
+    let car_position = test.g.get(cars[0]).unwrap().trans.pos;
+    test.g.world.humans[passenger].location = Location::Vehicle(cars[0]);
+    for &id in &departing {
+        test.g
+            .write::<BuildingInfos>()
+            .get_in(third, SoulID::Human(id));
+    }
+    let route_spot = test
+        .g
+        .write::<ParkingManagement>()
+        .reserve_near(car_position, &test.g.map())
+        .unwrap();
+    let saved_spot = Bincode::encode(&route_spot).unwrap();
+    let destination = Destination::Outside(car_position);
+    test.g.world.humans[survivor].router.set_test_route(
+        destination,
+        vec![
+            RoutingStep::WalkTo(car_position),
+            RoutingStep::Park(cars[1], Some(route_spot)),
+        ],
+    );
     let building = factory(&mut test);
     let proto = GoodsCompanyID::new("flour-factory");
     let Some(SoulID::GoodsCompany(company)) =
@@ -1208,7 +1245,23 @@ fn pf_d_abandonment_batch_cleans_departing_workers_and_trade_references() {
     for id in departing {
         assert!(test.g.get(id).is_none());
         assert_no_market_refs(&test.g, SoulID::Human(id));
+        assert!(!test
+            .g
+            .read::<BuildingInfos>()
+            .get(third)
+            .unwrap()
+            .inside
+            .contains(&SoulID::Human(id)));
     }
+    assert!(cars.into_iter().all(|car| test.g.get(car).is_none()));
+    let passenger = test.g.get(passenger).unwrap();
+    assert_eq!(passenger.location, Location::Outside);
+    assert_eq!(passenger.trans.pos, car_position);
+    assert!(test.g.get(survivor).unwrap().router.target_dest.is_none());
+    assert!(test
+        .g
+        .read::<ParkingManagement>()
+        .is_free(Bincode::decode(&saved_spot).unwrap()));
     let trades = &test.g.get(survivor).unwrap().bought.0[&bread];
     assert_eq!(trades.len(), 1);
     assert_eq!(trades[0].seller, TradeTarget(SoulID::GoodsCompany(company)));

@@ -73,7 +73,7 @@ impl Default for TransportState {
 
 type SpatialGrid = flat_spatial::Grid<TransportState, Vec2>;
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct TransportGrid {
     grid: SpatialGrid,
@@ -90,7 +90,6 @@ fn positions_may_be_pending() -> bool {
     true
 }
 
-#[derive(Clone)]
 struct ActiveColliders<I> {
     refresh: bool,
     entries: Vec<(I, Transporter)>,
@@ -119,6 +118,17 @@ impl Deref for TransportGrid {
 
     fn deref(&self) -> &Self::Target {
         &self.grid
+    }
+}
+
+impl Clone for TransportGrid {
+    fn clone(&self) -> Self {
+        Self {
+            grid: self.grid.clone(),
+            humans: ActiveColliders::default(),
+            vehicles: ActiveColliders::default(),
+            pending_positions: self.pending_positions,
+        }
     }
 }
 
@@ -177,6 +187,50 @@ impl TransportGrid {
         self.pending_positions = false;
         self.grid.maintain_deterministic();
     }
+
+    fn synchronize_owners(&mut self, world: &World) {
+        let Self {
+            grid,
+            humans,
+            vehicles,
+            pending_positions,
+        } = self;
+        vehicles.refresh_from(
+            world
+                .vehicles
+                .iter()
+                .filter_map(|(id, v)| Some((id, v.collider?))),
+        );
+        humans.refresh_from(
+            world
+                .humans
+                .iter()
+                .filter_map(|(id, h)| Some((id, h.collider?))),
+        );
+
+        // Cell maintenance sorts relocations by handle independently of the owner index.
+        vehicles.entries.retain(|&(id, coll)| {
+            let Some(v) = world.vehicles.get(id).filter(|v| v.collider == Some(coll)) else {
+                return false;
+            };
+            synchronize_collider(
+                grid,
+                coll,
+                &v.trans,
+                &v.speed,
+                Some(v.vehicle.flag),
+                *pending_positions,
+            );
+            true
+        });
+        humans.entries.retain(|&(id, coll)| {
+            let Some(h) = world.humans.get(id).filter(|h| h.collider == Some(coll)) else {
+                return false;
+            };
+            synchronize_collider(grid, coll, &h.trans, &h.speed, None, *pending_positions);
+            true
+        });
+    }
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -196,48 +250,18 @@ pub fn transport_grid_synchronize(world: &mut World, resources: &mut Resources) 
     profiling::scope!("physics::transport_grid_synchronize");
     let mut transport_grid = resources.write::<TransportGrid>();
 
-    let TransportGrid {
-        grid,
-        humans,
-        vehicles,
-        pending_positions,
-    } = &mut *transport_grid;
-    vehicles.refresh_from(
-        world
-            .vehicles
-            .iter()
-            .filter_map(|(id, v)| Some((id, v.collider?))),
-    );
-    humans.refresh_from(
-        world
-            .humans
-            .iter()
-            .filter_map(|(id, h)| Some((id, h.collider?))),
-    );
-
-    // Cell maintenance sorts relocations by handle and preserves the remaining
-    // cell visitation order independently of the owner index.
-    vehicles.entries.retain(|&(id, coll)| {
-        let Some(v) = world.vehicles.get(id).filter(|v| v.collider == Some(coll)) else {
-            return false;
-        };
-        synchronize_collider(
-            grid,
-            coll,
-            &v.trans,
-            &v.speed,
-            Some(v.vehicle.flag),
-            *pending_positions,
-        );
-        true
-    });
-    humans.entries.retain(|&(id, coll)| {
-        let Some(h) = world.humans.get(id).filter(|h| h.collider == Some(coll)) else {
-            return false;
-        };
-        synchronize_collider(grid, coll, &h.trans, &h.speed, None, *pending_positions);
-        true
-    });
+    let freshly_indexed = transport_grid.humans.refresh && transport_grid.vehicles.refresh;
+    transport_grid.synchronize_owners(world);
+    // Replacing a world can reassign existing handles without an insert. After
+    // pruning, every unaccounted handle may have an owner in the new world.
+    if !freshly_indexed
+        && transport_grid.humans.entries.len() + transport_grid.vehicles.entries.len()
+            != transport_grid.len()
+    {
+        transport_grid.humans.refresh = true;
+        transport_grid.vehicles.refresh = true;
+        transport_grid.synchronize_owners(world);
+    }
 
     transport_grid.maintain_deterministic();
 }

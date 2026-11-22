@@ -1,5 +1,5 @@
 use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
@@ -147,8 +147,22 @@ impl Market {
 
     /// An agent was removed from the world, we need to clean after him
     pub fn remove(&mut self, soul: SoulID) {
-        self.all_trades.retain(|trade| !trade.involves(soul));
-        self.potential.retain(|(trade, _)| !trade.involves(soul));
+        self.retain_cached_trades(|trade| !trade.involves(soul));
+        self.remove_account(soul);
+    }
+
+    pub(crate) fn remove_cached_trades(&mut self, souls: &BTreeSet<SoulID>) {
+        self.retain_cached_trades(|trade| {
+            !souls.contains(&trade.buyer.0) && !souls.contains(&trade.seller.0)
+        });
+    }
+
+    fn retain_cached_trades(&mut self, retain: impl Fn(&Trade) -> bool) {
+        self.all_trades.retain(&retain);
+        self.potential.retain(|(trade, _)| retain(trade));
+    }
+
+    pub(crate) fn remove_account(&mut self, soul: SoulID) {
         for market in self.markets.values_mut() {
             market.sell_orders.remove(&soul);
             market.buy_orders.remove(&soul);

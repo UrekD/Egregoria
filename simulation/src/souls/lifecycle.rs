@@ -1,4 +1,5 @@
 use geom::Vec3;
+use itertools::Itertools;
 use prototypes::{GameTime, ItemID};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -104,6 +105,13 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
         }
     }
     let employers = clear_soul_references(sim, SoulID::Human(id));
+    if let (Some(_), Some(car), Some(batch)) = (
+        &employers,
+        human.router.personal_car,
+        &mut sim.world.departing,
+    ) {
+        batch.removed_cars.insert(car);
+    }
 
     if let Some(WorkKind::Driver { truck, .. }) = human.work.as_ref().map(|work| work.kind) {
         sim.write::<Dispatcher>()
@@ -172,8 +180,22 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
     detach_transit_vehicle(sim, id, position);
     let (world, resources) = sim.world_res();
     resources.write::<RandomVehicles>().vehicles.remove(&id);
-    let mut former_drivers = Vec::new();
-    for (human_id, human) in world.humans.iter_mut() {
+    let indexed = world.departing.as_mut().and_then(|batch| {
+        if !batch.removed_cars.contains(&id) {
+            return None;
+        }
+        let references = batch.vehicle_references.get_or_insert_with(|| {
+            VehicleDepartureReferences::new(&batch.removed_cars, &world.humans, &world.companies)
+        });
+        references
+            .by_vehicle
+            .remove(&id)
+            .map(|entry| (entry, &references.active_routes))
+    });
+
+    let mut parking = resources.write::<ParkingManagement>();
+    let mut former_drivers = BTreeSet::new();
+    let mut clear_human = |human_id, human: &mut HumanEnt| {
         let riding = human.location == Location::Vehicle(id);
         if riding {
             move_outside(human, position, resources);
@@ -181,7 +203,7 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
         let mut lost_truck = false;
         if let Some(work) = &mut human.work {
             if matches!(work.kind, WorkKind::Driver { truck, .. } if truck == id) {
-                former_drivers.push(human_id);
+                former_drivers.insert(human_id);
                 work.kind = WorkKind::Worker;
                 lost_truck = true;
             }
@@ -192,10 +214,27 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
             || lost_truck
             || human.decision.kind.references_vehicle(id)
         {
-            cancel_trip(human, resources);
+            cancel_trip(human, resources, &mut parking);
+        }
+    };
+
+    if let Some((references, active_routes)) = &indexed {
+        for &(_, human_id) in references
+            .humans
+            .iter()
+            .merge_by(active_routes.iter(), |a, b| a.0 < b.0)
+        {
+            if let Some(human) = world.humans.get_mut(human_id) {
+                clear_human(human_id, human);
+            }
+        }
+    } else {
+        for (human_id, human) in world.humans.iter_mut() {
+            clear_human(human_id, human);
         }
     }
-    for company in world.companies.values_mut() {
+
+    let clear_company = |company: &mut CompanyEnt| {
         company.comp.trucks.retain(|&truck| truck != id);
         if company
             .comp
@@ -203,6 +242,17 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
             .is_some_and(|driver| former_drivers.contains(&driver))
         {
             company.comp.driver = None;
+        }
+    };
+    if let Some((references, _)) = indexed {
+        for company in references.companies {
+            if let Some(company) = world.companies.get_mut(company) {
+                clear_company(company);
+            }
+        }
+    } else {
+        for company in world.companies.values_mut() {
+            clear_company(company);
         }
     }
 }
@@ -230,13 +280,100 @@ pub(crate) fn train_dropped(sim: &mut Simulation, id: TrainID) {
 }
 
 #[derive(Default)]
-pub(crate) struct DepartureReferences(BTreeMap<HumanID, Departure>);
+pub(crate) struct DepartureReferences {
+    pending: BTreeMap<HumanID, Departure>,
+    removed_souls: BTreeSet<SoulID>,
+    removed_cars: BTreeSet<VehicleID>,
+    vehicle_references: Option<VehicleDepartureReferences>,
+}
 
 #[derive(Default)]
 struct Departure {
     human_buyers: Vec<HumanID>,
     company_traders: Vec<CompanyID>,
     employers: Vec<CompanyID>,
+}
+
+struct VehicleDepartureReferences {
+    by_vehicle: BTreeMap<VehicleID, VehicleReferences>,
+    active_routes: Vec<(usize, HumanID)>,
+}
+
+#[derive(Default)]
+struct VehicleReferences {
+    humans: Vec<(usize, HumanID)>,
+    companies: Vec<CompanyID>,
+}
+
+impl VehicleDepartureReferences {
+    fn new(
+        vehicles: &BTreeSet<VehicleID>,
+        humans: &slotmapd::HopSlotMap<HumanID, HumanEnt>,
+        companies: &slotmapd::HopSlotMap<CompanyID, CompanyEnt>,
+    ) -> Self {
+        let mut references: BTreeMap<_, VehicleReferences> = vehicles
+            .iter()
+            .map(|&id| (id, VehicleReferences::default()))
+            .collect();
+        let mut active_routes = Vec::new();
+        for (order, (id, human)) in humans.iter().enumerate() {
+            if human.router.target_dest.is_some() || human.router.cur_step().is_some() {
+                // An active route can still contain steps for an earlier vehicle
+                // even after the selected vehicle changes.
+                active_routes.push((order, id));
+                continue;
+            }
+            let mut mentioned = BTreeSet::new();
+            mentioned.extend(human.router.personal_car);
+            mentioned.extend(human.router.selected_vehicle());
+            if let Location::Vehicle(vehicle) = human.location {
+                mentioned.insert(vehicle);
+            }
+            mentioned.extend(driver_truck(human));
+            decision_vehicles(&human.decision.kind, &mut mentioned);
+            for vehicle in mentioned {
+                if let Some(refs) = references.get_mut(&vehicle) {
+                    refs.humans.push((order, id));
+                }
+            }
+        }
+        for (id, company) in companies.iter() {
+            let mut mentioned: BTreeSet<_> = company.comp.trucks.iter().copied().collect();
+            if let Some(driver) = company.comp.driver.and_then(|driver| humans.get(driver)) {
+                mentioned.extend(driver_truck(driver));
+            }
+            for vehicle in mentioned {
+                if let Some(refs) = references.get_mut(&vehicle) {
+                    refs.companies.push(id);
+                }
+            }
+        }
+        Self {
+            by_vehicle: references,
+            active_routes,
+        }
+    }
+}
+
+fn driver_truck(human: &HumanEnt) -> Option<VehicleID> {
+    match human.work.as_ref()?.kind {
+        WorkKind::Driver { truck, .. } => Some(truck),
+        WorkKind::Worker => None,
+    }
+}
+
+fn decision_vehicles(decision: &HumanDecisionKind, vehicles: &mut BTreeSet<VehicleID>) {
+    match decision {
+        HumanDecisionKind::SetVehicle(Some(id)) => {
+            vehicles.insert(*id);
+        }
+        HumanDecisionKind::MultiStack(steps) => {
+            for step in steps {
+                decision_vehicles(step, vehicles);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn human_trade_participants<'a>(trades: impl Iterator<Item = &'a Trade>) -> BTreeSet<HumanID> {
@@ -252,8 +389,23 @@ fn human_trade_participants<'a>(trades: impl Iterator<Item = &'a Trade>) -> BTre
 fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<CompanyID>> {
     let (world, resources) = sim.world_res();
     let mut market = resources.write::<Market>();
-    market.remove(soul);
-    resources.write::<BuildingInfos>().remove_soul(soul);
+    let mut infos = resources.write::<BuildingInfos>();
+    let departure = match (soul, &mut world.departing) {
+        (SoulID::Human(id), Some(batch)) => batch.pending.remove(&id).inspect(|_| {
+            batch.removed_souls.insert(soul);
+        }),
+        _ => None,
+    };
+    if departure.is_some() {
+        // Keep account and ownership changes in drop order. Only the shared
+        // trade buffers and building occupancy lists can wait for the batch.
+        market.remove_account(soul);
+        infos.remove_soul_affiliations(soul);
+    } else {
+        market.remove(soul);
+        infos.remove_soul(soul);
+    }
+    drop(infos);
     let bread = ItemID::new("bread");
     let retail = ItemID::new("retail-goods");
     let mut remove_human_trades = |human: &mut HumanEnt| {
@@ -280,20 +432,18 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<Compa
             trades.retain(|trade| !trade.involves(soul));
         }
     };
-    if let (SoulID::Human(id), Some(batch)) = (soul, &mut world.departing) {
-        if let Some(entry) = batch.0.remove(&id) {
-            for buyer in entry.human_buyers {
-                if let Some(human) = world.humans.get_mut(buyer) {
-                    remove_human_trades(human);
-                }
+    if let Some(entry) = departure {
+        for buyer in entry.human_buyers {
+            if let Some(human) = world.humans.get_mut(buyer) {
+                remove_human_trades(human);
             }
-            for company in entry.company_traders {
-                if let Some(company) = world.companies.get_mut(company) {
-                    remove_company_trades(company);
-                }
-            }
-            return Some(entry.employers);
         }
+        for company in entry.company_traders {
+            if let Some(company) = world.companies.get_mut(company) {
+                remove_company_trades(company);
+            }
+        }
+        return Some(entry.employers);
     }
     for human in world.humans.values_mut() {
         remove_human_trades(human);
@@ -354,12 +504,37 @@ pub(crate) fn clear_abandoned_home_references(sim: &mut Simulation, homes: &[(Bu
             }
         }
     }
-    world.departing = Some(DepartureReferences(departing));
+    debug_assert!(world.departing.is_none());
+    world.departing = Some(DepartureReferences {
+        pending: departing,
+        ..DepartureReferences::default()
+    });
     resources
         .read::<ParCommandBuffer<HumanEnt>>()
-        .exec_ent(HumanID::default(), |sim| {
-            sim.world.departing = None;
-        });
+        .exec_ent(HumanID::default(), finish_human_departures);
+}
+
+fn finish_human_departures(sim: &mut Simulation) {
+    let (world, resources) = sim.world_res();
+    let mut batch = world.departing.take().expect("active departure batch");
+    if !batch.removed_souls.is_empty() {
+        resources
+            .write::<Market>()
+            .remove_cached_trades(&batch.removed_souls);
+        resources
+            .write::<BuildingInfos>()
+            .remove_soul_occupancy(&batch.removed_souls);
+    }
+    batch.pending.clear();
+    batch.removed_souls.clear();
+    if batch.removed_cars.len() > 1 {
+        world.departing = Some(batch);
+        resources
+            .read::<ParCommandBuffer<VehicleEnt>>()
+            .exec_ent(VehicleID::default(), |sim| {
+                sim.world.departing = None;
+            });
+    }
 }
 
 fn decision_references_buildings(
@@ -378,6 +553,7 @@ fn decision_references_buildings(
 
 fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Option<Vec3>>) {
     let (world, resources) = sim.world_res();
+    let mut parking = resources.write::<ParkingManagement>();
     let mut returning_trucks = BTreeSet::new();
     let mut idle_drivers = BTreeSet::new();
     let single = buildings
@@ -448,9 +624,10 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
                     }
                 }
             }
-            cancel_trip(human, resources);
+            cancel_trip(human, resources, &mut parking);
         }
     }
+    drop(parking);
     {
         let mut infos = resources.write::<BuildingInfos>();
         for (&id, door) in buildings {
@@ -589,13 +766,11 @@ fn move_outside(human: &mut HumanEnt, pos: Vec3, resources: &Resources) {
     human.speed.0 = 0.0;
 }
 
-fn cancel_trip(human: &mut HumanEnt, resources: &Resources) {
+fn cancel_trip(human: &mut HumanEnt, resources: &Resources, parking: &mut ParkingManagement) {
     if crate::map_dynamic::transit::on_route_cancelled(human, resources) {
         return;
     }
-    human
-        .router
-        .cancel_route(&mut resources.write::<ParkingManagement>());
+    human.router.cancel_route(parking);
     human.it = Itinerary::NONE;
     human.decision = Default::default();
 }
