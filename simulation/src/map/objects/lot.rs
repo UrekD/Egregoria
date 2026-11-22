@@ -1,7 +1,7 @@
 use crate::map::{LotOrigin, Map, ProjectFilter, ProjectKind, RoadID, UpdateType};
 use geom::Vec2;
 use geom::OBB;
-use geom::{Circle, Vec3};
+use geom::Vec3;
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
@@ -80,8 +80,12 @@ impl Lot {
 
         let shape = OBB::new(at.xy() + axis * size * 0.5, axis, size, size);
 
-        let proj = map.project(shape.center().z0(), size * 0.5 - 0.5, ProjectFilter::ALL);
-        if !matches!(proj.kind, ProjectKind::Ground) {
+        if map
+            .spatial_map
+            .query(shape, ProjectFilter::ALL)
+            .next()
+            .is_some()
+        {
             return None;
         }
 
@@ -157,9 +161,14 @@ impl Lot {
             .query(r.boldline(), ProjectFilter::LOT)
             .collect();
 
-        let mut rp = |p: Circle| to_remove.extend(map.spatial_map.query(p, ProjectFilter::LOT));
-        rp(unwrap_ret!(map.intersections.get(r.src)).bcircle());
-        rp(unwrap_ret!(map.intersections.get(r.dst)).bcircle());
+        // Connecting a road can widen its junctions before the lane update. Use
+        // their new bounds both to clear old lots and to place the new ones.
+        for id in [r.src, r.dst] {
+            let junction = unwrap_cont!(map.intersections.get_mut(id));
+            junction.update_interface_radius(&mut map.roads);
+            map.spatial_map.update(junction);
+            to_remove.extend(map.spatial_map.query(junction.bcircle(), ProjectFilter::LOT));
+        }
 
         for lot in to_remove {
             if let ProjectKind::Lot(lot) = lot {

@@ -2,7 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use prototypes::{DayTime, GameTime, ItemID, Money, Tick};
 use simulation::diagnostics::elapsed_tick;
-use simulation::economy::progression::{milestone_reward, ProgressionState};
+use simulation::economy::progression::{milestone_population, milestone_reward, ProgressionState};
 use simulation::economy::{
     balance::{DEMAND_INTERVAL_TICKS, MIN_DEMAND_POPULATION},
     Budget, BudgetCategory, Government, ZoneDemand,
@@ -594,9 +594,14 @@ fn command_label(command: &str) -> &'static str {
     }
 }
 
-fn command_message(command: &str, reason: Rejection) -> &'static str {
+fn command_message(command: &str, reason: Rejection) -> std::borrow::Cow<'static, str> {
     use Rejection::*;
-    match (command, reason) {
+    if let Locked { milestone } = reason {
+        if let Some(population) = milestone_population(milestone) {
+            return format!("Unlocks at {population} citizens").into();
+        }
+    }
+    let message = match (command, reason) {
         ("TransitAddStop", MissingReference | InvalidConnection) => {
             "Choose a driving lane beside a sidewalk and away from junctions"
         }
@@ -618,12 +623,10 @@ fn command_message(command: &str, reason: Rejection) -> &'static str {
         (_, TransitNotImplemented) => "Transit editing is unavailable",
         (_, UnexpectedInit) => "Init is available only when creating a world",
         (_, InvalidInitOptions) => "Invalid world options",
-        (_, Locked { milestone: 1 }) => "Unlocks at 100 citizens",
-        (_, Locked { milestone: 2 }) => "Unlocks at 250 citizens",
-        (_, Locked { milestone: 3 }) => "Unlocks at 500 citizens",
         (_, Locked { .. }) => "Locked by city progression",
         (_, InvalidWarehouse) => "Choose an active warehouse",
-    }
+    };
+    message.into()
 }
 
 #[cfg(test)]

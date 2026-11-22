@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use prototypes::{
     prototypes_iter, try_prototype, Density, GoodsCompanyID, GoodsCompanyPrototype, Money, Tick,
+    TICKS_PER_HOUR,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,14 +14,16 @@ use crate::map_dynamic::{ElectricityFlow, UtilityFlow, UtilityStatus};
 use crate::souls::residence::Residences;
 use crate::Simulation;
 
-const MILESTONES: [(u32, Money, &[&str]); 3] = [
-    (
-        100,
-        Money::new_bucks(10_000),
-        &["Bus service", "Medium density"],
-    ),
-    (250, Money::new_bucks(20_000), &["High density"]),
-    (500, Money::new_bucks(30_000), &[]),
+const MILESTONES: [(u32, Money); 3] = [
+    (100, Money::new_bucks(10_000)),
+    (250, Money::new_bucks(20_000)),
+    (500, Money::new_bucks(30_000)),
+];
+
+const CAPABILITY_TIERS: [(BuildCapability, u8, &str); 3] = [
+    (BuildCapability::BusService, 1, "Bus service"),
+    (BuildCapability::ZoneDensity(Density::Medium), 1, "Medium density"),
+    (BuildCapability::ZoneDensity(Density::High), 2, "High density"),
 ];
 
 // Roads, low-density zoning, and the rail freight connector are ungated
@@ -124,24 +127,22 @@ pub fn progression_status(sim: &Simulation) -> ProgressionStatus {
         };
     }
 
-    let next =
-        MILESTONES
-            .get(usize::from(state.highest_milestone))
-            .map(|&(required, _, unlocks)| {
-                let milestone = state.highest_milestone + 1;
-                let mut names = unlocks
-                    .iter()
-                    .map(|name| (*name).to_owned())
-                    .collect::<Vec<_>>();
-                names.extend(
-                    prototypes_iter::<GoodsCompanyPrototype>()
-                        .filter(|proto| {
-                            !proto.id.is_growable() && prototype_milestone(proto.id) == milestone
-                        })
-                        .map(|proto| proto.label.clone()),
-                );
-                (milestone, required, names)
-            });
+    let milestone = state.highest_milestone.saturating_add(1);
+    let next = milestone_population(milestone).map(|required| {
+        let mut names: Vec<_> = CAPABILITY_TIERS
+            .iter()
+            .filter(|&&(_, tier, _)| tier == milestone)
+            .map(|&(_, _, name)| name.to_owned())
+            .collect();
+        names.extend(
+            prototypes_iter::<GoodsCompanyPrototype>()
+                .filter(|proto| {
+                    !proto.id.is_growable() && prototype_milestone(proto.id) == milestone
+                })
+                .map(|proto| proto.label.clone()),
+        );
+        (milestone, required, names)
+    });
     let metrics = sim.read::<DailyEconomyMetrics>();
     let last_day = state
         .last_processed_day
@@ -150,7 +151,9 @@ pub fn progression_status(sim: &Simulation) -> ProgressionStatus {
         .map(|id| {
             let progress = if state.claimed.contains(&id) {
                 ObjectiveProgress::Claimed
-            } else if last_day.and_then(|day| objective_target(id, day)).is_some() {
+            } else if id == ObjectiveId::PositiveBalance
+                || last_day.and_then(|day| objective_target(id, day)).is_some()
+            {
                 ObjectiveProgress::InProgress {
                     completed: state.streaks.get(&id).copied().unwrap_or(0),
                     required: objective_days(id),
@@ -174,9 +177,14 @@ fn population(sim: &Simulation) -> u32 {
     sim.world().humans.len() as u32
 }
 
+pub fn milestone_population(milestone: u8) -> Option<u32> {
+    let index = usize::from(milestone.checked_sub(1)?);
+    MILESTONES.get(index).map(|&(population, _)| population)
+}
+
 pub fn milestone_reward(milestone: u8) -> Option<Money> {
     let index = usize::from(milestone.checked_sub(1)?);
-    MILESTONES.get(index).map(|&(_, reward, _)| reward)
+    MILESTONES.get(index).map(|&(_, reward)| reward)
 }
 
 fn prototype_milestone(id: GoodsCompanyID) -> u8 {
@@ -204,15 +212,16 @@ pub fn can_build(sim: &Simulation, cap: BuildCapability) -> Result<(), LockedUnt
     }
     let milestone = match cap {
         BuildCapability::Prototype(id) => prototype_milestone(id),
-        BuildCapability::BusService | BuildCapability::ZoneDensity(Density::Medium) => 1,
-        BuildCapability::ZoneDensity(Density::High) => 2,
-        BuildCapability::ZoneDensity(Density::Low) => 0,
+        _ => CAPABILITY_TIERS
+            .iter()
+            .find(|&&(capability, _, _)| capability == cap)
+            .map_or(0, |&(_, milestone, _)| milestone),
     };
     if milestone <= state.highest_milestone {
         return Ok(());
     }
 
-    let (population_required, _, _) = MILESTONES[usize::from(milestone - 1)];
+    let population_required = milestone_population(milestone).expect("valid milestone");
     if population(sim) >= population_required {
         Ok(())
     } else {
@@ -237,7 +246,7 @@ pub fn progression_update(sim: &mut Simulation) {
     }
 
     let population = population(sim);
-    for (index, &(required, reward, _)) in MILESTONES
+    for (index, &(required, reward)) in MILESTONES
         .iter()
         .enumerate()
         .skip(usize::from(highest_milestone))
@@ -252,14 +261,11 @@ pub fn progression_update(sim: &mut Simulation) {
 
     let elapsed = sim.read::<Budget>().elapsed_ticks(Tick(sim.get_tick()));
     let closed_days = elapsed / TICKS_PER_BUDGET_DAY;
+    // Each midpoint represents one elapsed budget hour. The closing tick only evaluates the day.
+    if elapsed % TICKS_PER_HOUR == TICKS_PER_HOUR / 2 {
+        sample_daily_utilities(sim, closed_days);
+    }
     let first = last_processed_day.map_or(0, |day| day + 1);
-    if first >= closed_days {
-        return;
-    }
-
-    if elapsed % TICKS_PER_BUDGET_DAY == 0 {
-        sample_daily_utilities(sim, closed_days - 1);
-    }
     for day in first..closed_days {
         let claimed = evaluate_objectives(sim, day, elapsed);
         let (_, resources) = sim.world_res();
@@ -331,16 +337,12 @@ fn objective_target(id: ObjectiveId, day: &EconomyDayMetrics) -> Option<bool> {
 }
 
 fn sample_daily_utilities(sim: &Simulation, day: u64) {
-    let mut metrics = sim.write::<DailyEconomyMetrics>();
-    if metrics.days.get(&day).is_some_and(|day| {
-        day.utility_served_demand.is_some() && day.utility_total_demand.is_some()
-    }) {
-        return;
-    }
     if let Some(fraction) = utility_served_fraction(sim) {
+        let mut metrics = sim.write::<DailyEconomyMetrics>();
         let sample = metrics.days.entry(day).or_default();
-        sample.utility_served_demand = Some(fraction);
-        sample.utility_total_demand = Some(1.0);
+        // Sum each hour's least-served fraction, with one equal weight per measured hour.
+        *sample.utility_served_demand.get_or_insert(0.0) += fraction;
+        *sample.utility_total_demand.get_or_insert(0.0) += 1.0;
     }
 }
 
@@ -486,7 +488,10 @@ mod tests {
         assert_eq!(
             progression_status(&sim).objectives,
             [
-                (ObjectiveId::PositiveBalance, ObjectiveProgress::Unavailable),
+                (
+                    ObjectiveId::PositiveBalance,
+                    ObjectiveProgress::InProgress { completed: 0, required: 2 },
+                ),
                 (ObjectiveId::StockedShops, ObjectiveProgress::Unavailable),
             ]
         );

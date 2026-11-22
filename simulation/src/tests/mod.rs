@@ -18,6 +18,7 @@ mod p2abc_fix;
 mod p3a_transit;
 mod p3_spine;
 mod p5_bridge;
+mod p5_core_loop;
 mod p5_placement;
 mod test_iso;
 mod vehicles;

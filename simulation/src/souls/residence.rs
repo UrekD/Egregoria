@@ -17,6 +17,8 @@ use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 const UPGRADE_CHECKS: u8 = 6;
+const UPGRADE_COVERAGE: f32 = 30.0;
+const UPGRADE_LAND_VALUE: f32 = 50.0;
 const UNSERVED_CHECKS: u8 = 12;
 pub(crate) const UPDATE_OFFSET: u64 = TICKS_PER_HOUR - 2;
 
@@ -360,15 +362,41 @@ impl Progression<'_> {
         capacity: usize,
     ) -> impl Iterator<Item = Requirement> {
         let id = building.id;
+        let coverage = |name, kind| {
+            Requirement::minimum(name, self.coverage.coverage(id, kind), UPGRADE_COVERAGE)
+        };
+        let school = coverage("School coverage", ServiceKind::School);
+        let health = coverage("Health coverage", ServiceKind::Health);
+        let land_value = Requirement::minimum(
+            "Land value",
+            f32::from(self.environment.land_value(id)),
+            UPGRADE_LAND_VALUE,
+        );
+        let amenities = if next_level >= 3 {
+            [Some(school), Some(health), Some(land_value)]
+        } else {
+            let park = coverage("Park coverage", ServiceKind::Park);
+            // Show the closest option and its actual score alongside the list of alternatives.
+            let closest = [health, park, land_value].into_iter().fold(school, |best, option| {
+                if option.value / option.threshold > best.value / best.threshold {
+                    option
+                } else {
+                    best
+                }
+            });
+            [
+                Some(Requirement::available(
+                    "Level 2 needs 30% school, health or park coverage, or 50 land value",
+                    closest.met,
+                )),
+                Some(closest),
+                None,
+            ]
+        };
         [
             Requirement::available("Power", has_power(self.map, self.electricity, id)),
             Requirement::available("Water", self.utilities.has_water(id)),
             Requirement::available("Sewage", self.utilities.has_sewage(id)),
-            Requirement::minimum(
-                "School coverage",
-                self.coverage.coverage(id, ServiceKind::School),
-                30.0,
-            ),
             Requirement::percent("Occupancy", occupied, capacity, 80),
             Requirement::percent("Employment", employed, occupied, 70),
             Requirement::available(
@@ -377,25 +405,7 @@ impl Progression<'_> {
             ),
         ]
         .into_iter()
-        .chain(
-            (next_level >= 3)
-                .then(|| {
-                    [
-                        Requirement::minimum(
-                            "Health coverage",
-                            self.coverage.coverage(id, ServiceKind::Health),
-                            30.0,
-                        ),
-                        Requirement::minimum(
-                            "Land value",
-                            f32::from(self.environment.land_value(id)),
-                            50.0,
-                        ),
-                    ]
-                })
-                .into_iter()
-                .flatten(),
-        )
+        .chain(amenities.into_iter().flatten())
     }
 }
 

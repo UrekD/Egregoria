@@ -77,8 +77,8 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
     let job_opening = ItemID::new("job-opening");
     let tick = resources.read::<GameTime>().tick;
 
+    let job_priorities = m.prepare_job_matches(world, resources, job_opening);
     let freights = &world.freight_stations;
-
     let map = resources.read::<Map>();
     let infos = resources.read::<BuildingInfos>();
     let mut components = resources.write::<WalkingComponents>();
@@ -139,6 +139,7 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
                     == walking_component(&map, &mut components.labels, seller_lane)
             })
         },
+        &job_priorities,
     ).to_vec();
     drop((m, map, infos, components));
 

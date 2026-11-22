@@ -5,14 +5,18 @@ use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 
 use geom::Vec2;
-use prototypes::{prototypes_iter, GoodsCompanyID, GoodsCompanyPrototype, ItemPrototype, Money};
+use prototypes::{
+    prototypes_iter, try_prototype, GoodsCompanyID, GoodsCompanyPrototype, ItemPrototype, Money,
+    Power, ServiceID, ServiceKind,
+};
 
 use crate::economy::{ItemID, WORKER_CONSUMPTION_PER_MINUTE};
 use crate::map::BuildingID;
-use crate::map_dynamic::BuildingInfos;
+use crate::map_dynamic::{BuildingInfos, ElectricityFlow, UtilityFlow};
+use crate::souls::desire::WorkKind;
 use crate::souls::household::{household_items, BasketId};
-use crate::HumanID;
-use crate::SoulID;
+use crate::utils::resources::Resources;
+use crate::{HumanID, SoulID, World};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SellOrder {
@@ -77,7 +81,39 @@ pub struct Market {
     all_trades: Vec<Trade>,
     // reuse the potential vec to avoid allocations
     #[serde(skip)]
-    potential: Vec<(Trade, f32)>,
+    potential: Vec<(Trade, f32, (bool, HiringPriority))>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub(super) enum HiringPriority {
+    Power,
+    Water,
+    Sewage,
+    Civic,
+    Support,
+    Standard,
+}
+
+impl HiringPriority {
+    fn for_company(id: GoodsCompanyID) -> Self {
+        if id
+            .prototype()
+            .power_production
+            .is_some_and(|power| power > Power::ZERO)
+        {
+            return Self::Power;
+        }
+        match try_prototype(ServiceID::from(id)).map(|service| service.service_kind) {
+            Some(ServiceKind::WaterPump) => Self::Water,
+            Some(ServiceKind::SewageOutlet) => Self::Sewage,
+            Some(
+                ServiceKind::Fire | ServiceKind::Health | ServiceKind::School | ServiceKind::Police,
+            ) => Self::Civic,
+            Some(_) => Self::Support,
+            None if id == GoodsCompanyID::new("coal-mine") => Self::Support,
+            None => Self::Standard,
+        }
+    }
 }
 
 pub(crate) struct BasketRequest {
@@ -182,7 +218,7 @@ impl Market {
 
     fn retain_cached_trades(&mut self, retain: impl Fn(&Trade) -> bool) {
         self.all_trades.retain(&retain);
-        self.potential.retain(|(trade, _)| retain(trade));
+        self.potential.retain(|(trade, _, _)| retain(trade));
     }
 
     pub(crate) fn remove_account(&mut self, soul: SoulID) {
@@ -231,21 +267,143 @@ impl Market {
         *v
     }
 
+    /// Draw workers from ordinary employers when new applicants cannot start a priority
+    /// workplace or cover a utility shortage. Existing drivers keep their assignments.
+    pub(super) fn prepare_job_matches(
+        &mut self,
+        world: &mut World,
+        resources: &Resources,
+        job: ItemID,
+    ) -> BTreeMap<SoulID, (bool, HiringPriority)> {
+        let mut priorities = BTreeMap::new();
+        let Some(market) = self.markets.get_mut(&job) else {
+            return priorities;
+        };
+        // Keep a stale job application from hiring someone already at work.
+        market.buy_orders.retain(|buyer, _| {
+            matches!(*buyer, SoulID::Human(id) if world.humans.get(id).is_some_and(|human| human.work.is_none()))
+        });
+        let map = resources.read::<crate::map::Map>();
+        let electricity = resources.read::<ElectricityFlow>();
+        let utilities = resources.read::<UtilityFlow>();
+        let mut urgent_vacancies = 0;
+        for (&seller, order) in &market.sell_orders {
+            let SoulID::GoodsCompany(id) = seller else {
+                continue;
+            };
+            let Some(company) = world.companies.get(id) else {
+                continue;
+            };
+            let priority = HiringPriority::for_company(company.comp.proto);
+            if priority != HiringPriority::Standard
+                && map.get(company.comp.building).is_some()
+                && market.capital(seller).is_some_and(|capital| capital >= order.qty as i32)
+            {
+                let shortfall = map.electricity.net_id(company.comp.building).is_some_and(
+                    |network| match priority {
+                        HiringPriority::Power => electricity.blackout(network),
+                        HiringPriority::Water | HiringPriority::Sewage => utilities
+                            .networks()
+                            .find(|&(id, _)| id == network)
+                            .is_some_and(|(_, totals)| match priority {
+                                HiringPriority::Water => !totals.has_water(),
+                                _ => !totals.has_sewage(),
+                            }),
+                        _ => false,
+                    },
+                );
+                let urgent = company.workers.0.is_empty() || shortfall;
+                if urgent {
+                    urgent_vacancies += order.qty as usize;
+                }
+                priorities.insert(seller, (!urgent, priority));
+            }
+        }
+        let mut applicants = market.buy_orders.len();
+        if urgent_vacancies <= applicants {
+            return priorities;
+        }
+
+        for (id, company) in world.companies.iter_mut() {
+            if applicants >= urgent_vacancies {
+                break;
+            }
+            if company.workers.0.is_empty()
+                || HiringPriority::for_company(company.comp.proto) != HiringPriority::Standard
+            {
+                continue;
+            }
+            let workplace = company.comp.building;
+            let Some(building) = map.get(workplace) else {
+                continue;
+            };
+            let before = applicants;
+            let driver = company.comp.driver;
+            company.workers.0.retain(|&worker| {
+                if applicants >= urgent_vacancies || driver == Some(worker) {
+                    return true;
+                }
+                let Some(human) = world.humans.get_mut(worker) else {
+                    return true;
+                };
+                let buyer = SoulID::Human(worker);
+                if market.buy_orders.contains_key(&buyer)
+                    || human.work.as_ref().is_some_and(|work| {
+                        work.workplace != workplace || !matches!(work.kind, WorkKind::Worker)
+                    })
+                {
+                    return true;
+                }
+                human.work = None;
+                human.bought.0.remove(&job);
+                if let Some(capital) = market.capital.get_mut(&buyer) {
+                    *capital = capital.saturating_sub(1).max(0);
+                }
+                market.buy_orders.insert(
+                    buyer,
+                    BuyOrder {
+                        pos: human.trans.pos.xy(),
+                        qty: 1,
+                    },
+                );
+                applicants += 1;
+                false
+            });
+            let released = applicants - before;
+            if released > 0 {
+                let seller = SoulID::GoodsCompany(id);
+                let capital = market.capital.entry(seller).or_default();
+                *capital += released as i32;
+                market.sell_orders.insert(
+                    seller,
+                    SellOrder {
+                        pos: building.door_pos.xy(),
+                        qty: *capital as u32,
+                        stock: 0,
+                    },
+                );
+            }
+        }
+        priorities
+    }
+
     /// Returns a list of buy and sell orders matched together.
     /// A trade updates the buy and sell orders from the market, and the capital of the buyers and sellers.
     /// A trade can only be completed if the seller has enough capital.
     /// Please do not keep the trades around much, it needs to be destroyed by the next time you call this function.
     pub fn make_trades(&mut self, find_external: impl Fn(Vec2) -> Option<SoulID>) -> &[Trade] {
-        self.make_trades_filtered(find_external, |_, _| true)
+        self.make_trades_filtered(find_external, |_, _| true, &BTreeMap::new())
     }
 
     pub(super) fn make_trades_filtered(
         &mut self,
         find_external: impl Fn(Vec2) -> Option<SoulID>,
         mut can_pick_up: impl FnMut(SoulID, SoulID) -> bool,
+        job_priorities: &BTreeMap<SoulID, (bool, HiringPriority)>,
     ) -> &[Trade] {
         self.all_trades.clear();
         let local = household_items();
+        let job = ItemID::new("job-opening");
 
         for (&kind, market) in &mut self.markets {
             // Naive O(n²) alg
@@ -257,6 +415,14 @@ impl Market {
                 if qty_sell > capital_sell {
                     continue;
                 }
+                let priority = if kind == job {
+                    job_priorities
+                        .get(&seller)
+                        .copied()
+                        .unwrap_or((true, HiringPriority::Standard))
+                } else {
+                    (true, HiringPriority::Standard)
+                };
                 for (&buyer, &border) in &market.buy_orders {
                     if seller == buyer {
                         log::warn!(
@@ -283,11 +449,13 @@ impl Market {
                             money_delta: Money::ZERO,
                         },
                         score,
+                        priority,
                     ))
                 }
             }
-            self.potential.sort_unstable_by_key(|(trade, distance)| {
+            self.potential.sort_unstable_by_key(|(trade, distance, priority)| {
                 (
+                    *priority,
                     OrderedFloat(*distance),
                     trade.seller,
                     trade.buyer,
@@ -305,7 +473,7 @@ impl Market {
             } = market;
 
             self.all_trades
-                .extend(self.potential.drain(..).filter_map(|(trade, _)| {
+                .extend(self.potential.drain(..).filter_map(|(trade, _, _)| {
                     let cap_seller = capital.entry(trade.seller.0).or_default();
                     if *cap_seller < trade.qty {
                         return None;

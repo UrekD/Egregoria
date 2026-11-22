@@ -532,8 +532,9 @@ impl Map {
         if !self.roads.contains_key(lot.parent)
             || self
                 .spatial_map
-                .query(lot.shape, ProjectFilter::ALL)
-                .any(|object| object != ProjectKind::Lot(lot_id))
+                .query(lot.shape, ProjectFilter::ALL - ProjectFilter::LOT)
+                .next()
+                .is_some()
         {
             return None;
         }
@@ -548,7 +549,11 @@ impl Map {
             }
             _ => return None,
         };
-        self.build_on_lot(lot_id, kind, gen, true)
+        let shape = lot.shape;
+        let id = self.build_on_lot(lot_id, kind, gen, true)?;
+        // Older maps can contain overlapping lots. Consume those replaced by this footprint.
+        self.clean_lots_inner(self.spatial_map.query(shape, ProjectFilter::LOT).collect());
+        Some(id)
     }
 
     /// Returns the lot origin of a growable. Player builds record an origin for demolition too.
