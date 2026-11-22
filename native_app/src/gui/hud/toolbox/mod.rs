@@ -1,12 +1,12 @@
 use yakui::widgets::{Button, List, Pad};
 use yakui::{
-    colored_box_container, column, image, opaque, reflow, spacer, Alignment, Color,
+    colored_box_container, column, expanded, image, opaque, reflow, spacer, Alignment, Color,
     CrossAxisAlignment, Dim2, MainAxisAlignment, MainAxisSize, Pivot, Vec2,
 };
 
 use goryak::{
     blur_bg, button_primary, checkbox_value, constrained_viewport, fixed_spacer, icon_button,
-    image_button, monospace, on_primary, on_secondary_container, outline, padxy, primary,
+    image_button, minrow, monospace, on_primary, on_secondary_container, outline, padxy, primary,
     primary_container, round_rect, secondary_container, tooltip,
 };
 use simulation::Simulation;
@@ -46,18 +46,17 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
                             });
                         }
                         blur_bg(secondary_container().with_alpha(0.3), 0.0, || {
-                            padxy(0.0, 10.0, || {
-                                let mut l = List::row();
-                                l.main_axis_alignment = MainAxisAlignment::Center;
-                                l.item_spacing = 10.0;
-                                l.show(|| {
-                                    tools_list(uiworld);
-                                    reflow(
-                                        Alignment::CENTER_RIGHT,
-                                        Pivot::CENTER_RIGHT,
-                                        Dim2::pixels(-12.0, 0.0),
-                                        || transit::buttons(uiworld),
-                                    );
+                            padxy(12.0, 10.0, || {
+                                let mut toolbar = List::row();
+                                toolbar.cross_axis_alignment = CrossAxisAlignment::Center;
+                                toolbar.show(|| {
+                                    spacer(1);
+                                    minrow(10.0, || tools_list(uiworld));
+                                    expanded(|| {
+                                        let mut right = List::row();
+                                        right.main_axis_alignment = MainAxisAlignment::End;
+                                        right.show(|| transit::buttons(uiworld));
+                                    });
                                 });
                             });
                         });

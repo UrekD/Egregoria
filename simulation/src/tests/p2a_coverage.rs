@@ -1,11 +1,11 @@
-use super::{active_providers, coverage_update, recompute, CoverageGrid, COVERAGE_KINDS};
+use super::{active_providers, coverage_update, recompute, CoverageGrid};
 use crate::map::{BuildingID, BuildingKind, LanePatternBuilder, ProjectFilter, RoadID};
 use crate::map_dynamic::{electricity_flow_system, BuildingInfos, ElectricityFlow};
 use crate::souls::goods_company::company_soul;
 use crate::souls::residence::on_house_built;
 use crate::tests::TestCtx;
 use crate::world::HumanID;
-use crate::{Simulation, SoulID};
+use crate::{SaveHeader, SaveLoadError, Simulation, SoulID};
 use common::saveload::{Bincode, Encoder};
 use geom::{vec2, Vec2, OBB};
 use prototypes::{BuildingGen, GameTime, GoodsCompanyID, ServiceKind, Tick};
@@ -164,24 +164,41 @@ fn p2a_coverage_starts_promptly_for_an_additional_provider() {
 }
 
 #[test]
-fn p2a_coverage_loads_the_legacy_grid_format() {
+fn p2a_coverage_rejects_grid_without_started_providers() {
     use std::collections::BTreeMap;
 
     #[derive(serde::Serialize)]
-    struct LegacyGrid {
+    struct IncompleteGrid {
         by_kind: BTreeMap<ServiceKind, BTreeMap<BuildingID, f32>>,
     }
 
-    let by_kind = COVERAGE_KINDS
-        .into_iter()
-        .chain([ServiceKind::WaterPump, ServiceKind::SewageOutlet])
-        .map(|kind| (kind, [(BuildingID::null(), 42.0)].into()))
-        .collect();
-    let legacy = LegacyGrid { by_kind };
-    let old = Bincode::encode(&legacy).unwrap();
-    let grid: CoverageGrid = Bincode::decode(&old).unwrap();
-    assert_eq!(grid.by_kind, legacy.by_kind);
-    assert_eq!(Bincode::encode(&grid).unwrap(), old);
+    let incomplete = IncompleteGrid {
+        by_kind: [(ServiceKind::School, [(BuildingID::null(), 42.0)].into())].into(),
+    };
+    let bytes = Bincode::encode(&incomplete).unwrap();
+    assert!(
+        Bincode::decode::<CoverageGrid>(&bytes).is_err(),
+        "coverage without the started-provider record decoded successfully"
+    );
+}
+
+#[test]
+fn p2a_coverage_rejects_saves_without_the_current_version() {
+    let version = "0.8.6";
+    let bytes = Bincode::encode(&SaveHeader {
+        version: version.into(),
+    })
+    .unwrap();
+    let result = Simulation::decode_snapshot(&bytes);
+    assert!(
+        matches!(&result, Err(SaveLoadError::Incompatible { version: actual }) if actual == version),
+        "expected an incompatible version, got {:?}",
+        result.err()
+    );
+    assert!(matches!(
+        Simulation::decode_snapshot(&[]),
+        Err(SaveLoadError::Corrupt { version: None, .. })
+    ));
 }
 
 #[test]

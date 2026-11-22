@@ -1,13 +1,10 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
-use std::fmt;
 
 use geom::Vec3;
 use ordered_float::OrderedFloat;
 use prototypes::{try_prototype, ServiceID, ServiceKind};
-use serde::de::{MapAccess, Visitor};
-use serde::ser::{SerializeMap, SerializeStruct};
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Serialize};
 use slotmapd::SecondaryMap;
 
 use crate::map::{BuildingID, BuildingKind, IntersectionID, LaneKind, Map, Road, RoadID};
@@ -15,10 +12,11 @@ use crate::{Simulation, SoulID};
 
 use super::{BuildingInfos, ElectricityFlow};
 
-#[derive(Default)]
+#[derive(Default, Serialize, Deserialize)]
 pub struct CoverageGrid {
     pub by_kind: BTreeMap<ServiceKind, BTreeMap<BuildingID, f32>>,
     started_providers: BTreeSet<BuildingID>,
+    #[serde(skip)]
     revisions: BTreeMap<ServiceKind, u64>,
 }
 
@@ -33,95 +31,6 @@ impl CoverageGrid {
 
     pub fn revision(&self, kind: ServiceKind) -> u64 {
         self.revisions.get(&kind).copied().unwrap_or_default()
-    }
-}
-
-// Keep the existing service kind discriminants in the Bincode map. The extra
-// record is written only for cities that have started at least one provider.
-#[derive(Serialize, Deserialize)]
-enum SnapshotKey {
-    Health,
-    Fire,
-    Police,
-    School,
-    Garbage,
-    Park,
-    WaterPump,
-    SewageOutlet,
-    StartedProviders,
-}
-
-impl Serialize for CoverageGrid {
-    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        struct Records<'a>(&'a CoverageGrid);
-
-        impl Serialize for Records<'_> {
-            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-                let has_providers = !self.0.started_providers.is_empty();
-                let mut map = serializer
-                    .serialize_map(Some(self.0.by_kind.len() + usize::from(has_providers)))?;
-                for (kind, coverage) in &self.0.by_kind {
-                    map.serialize_entry(kind, coverage)?;
-                }
-                if has_providers {
-                    map.serialize_entry(&SnapshotKey::StartedProviders, &self.0.started_providers)?;
-                }
-                map.end()
-            }
-        }
-
-        let mut state = serializer.serialize_struct("CoverageGrid", 1)?;
-        state.serialize_field("by_kind", &Records(self))?;
-        state.end()
-    }
-}
-
-impl<'de> Deserialize<'de> for CoverageGrid {
-    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        #[derive(Deserialize)]
-        struct SavedGrid {
-            #[serde(deserialize_with = "read_records")]
-            by_kind: CoverageGrid,
-        }
-
-        fn read_records<'de, D: Deserializer<'de>>(
-            deserializer: D,
-        ) -> Result<CoverageGrid, D::Error> {
-            struct Records;
-            impl<'de> Visitor<'de> for Records {
-                type Value = CoverageGrid;
-
-                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                    formatter.write_str("coverage snapshots")
-                }
-
-                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                    let mut grid = CoverageGrid::default();
-                    while let Some(key) = map.next_key()? {
-                        let kind = match key {
-                            SnapshotKey::Health => ServiceKind::Health,
-                            SnapshotKey::Fire => ServiceKind::Fire,
-                            SnapshotKey::Police => ServiceKind::Police,
-                            SnapshotKey::School => ServiceKind::School,
-                            SnapshotKey::Garbage => ServiceKind::Garbage,
-                            SnapshotKey::Park => ServiceKind::Park,
-                            SnapshotKey::WaterPump => ServiceKind::WaterPump,
-                            SnapshotKey::SewageOutlet => ServiceKind::SewageOutlet,
-                            SnapshotKey::StartedProviders => {
-                                grid.started_providers = map.next_value()?;
-                                continue;
-                            }
-                        };
-                        grid.by_kind.insert(kind, map.next_value()?);
-                    }
-                    Ok(grid)
-                }
-            }
-
-            deserializer.deserialize_map(Records)
-        }
-
-        Ok(SavedGrid::deserialize(deserializer)?.by_kind)
     }
 }
 
