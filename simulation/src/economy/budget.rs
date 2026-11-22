@@ -147,6 +147,44 @@ fn budget_day(tick: u64) -> u64 {
     tick.saturating_sub(1) / TICKS_PER_BUDGET_DAY
 }
 
+/// Called after transit dispatch, with all runs for the elapsed hour in place.
+pub fn accrue_transit_upkeep(world: &World, resources: &Resources) {
+    use crate::economy::TransitStats;
+    use crate::map_dynamic::Transit;
+    use crate::transportation::VehicleKind;
+
+    const BUS_UPKEEP_PER_DAY: Money = Money::new_bucks(25);
+
+    let hour = resources.read::<Budget>().elapsed_ticks(resources.tick()) / TICKS_PER_HOUR;
+    {
+        let mut stats = resources.write::<TransitStats>();
+        if hour <= stats.last_upkeep_hour {
+            return;
+        }
+        stats.last_upkeep_hour = hour;
+    }
+
+    let running = resources
+        .read::<Transit>()
+        .runs
+        .keys()
+        .filter(|&&id| {
+            world
+                .vehicles
+                .get(id)
+                .is_some_and(|vehicle| matches!(vehicle.vehicle.kind, VehicleKind::Bus))
+        })
+        .count();
+    if running > 0 {
+        let delta = resources.write::<Budget>().hourly_delta(
+            BudgetCategory::TransitUpkeep,
+            -(running as i128) * i128::from(BUS_UPKEEP_PER_DAY.inner()),
+            1,
+        );
+        Budget::apply(resources, BudgetCategory::TransitUpkeep, delta);
+    }
+}
+
 pub fn budget_update(world: &mut World, resources: &mut Resources) {
     let hour = {
         let budget = resources.read::<Budget>();

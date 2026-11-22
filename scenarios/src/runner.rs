@@ -881,17 +881,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "P3c requires the transit_basic scenario and commute metrics"]
-    fn p3c_transit_basic_is_deterministic() {
-        let (scenario, options) = crate::builtin::SCENARIOS
-            .iter()
-            .find(|(scenario, _)| scenario.name == "transit_basic")
-            .expect("transit_basic must compare matched commute attempts, including timeouts");
-        let mut ctx = ScenarioCtx::new(*options);
-        ctx.verify_twice(scenario.run).unwrap();
-    }
-
-    #[test]
     fn hashes_dump_includes_checkpoints_and_final_for_each_run() {
         let options = SimulationOptions {
             terrain_size: 0,

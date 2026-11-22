@@ -5,6 +5,7 @@ pub mod perf;
 pub mod services_basic;
 pub mod services_neglect;
 pub mod smoke;
+mod transit_basic;
 
 use crate::builders::{grid_city, place_company, place_grid_power_plant, place_service_sites};
 use crate::{Scenario, ScenarioCtx};
@@ -30,6 +31,7 @@ pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     growth_basic::SCENARIO,
     services_basic::SCENARIO,
     services_neglect::SCENARIO,
+    transit_basic::SCENARIO,
     (
         Scenario {
             name: "smoke",
