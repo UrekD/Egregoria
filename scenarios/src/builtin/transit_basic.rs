@@ -10,7 +10,7 @@ use simulation::map::{BuildingID, LaneKind};
 use simulation::map_dynamic::{Destination, LineID, RoutingStep, Transit};
 use simulation::souls::desire::WorkKind;
 use simulation::transportation::Location;
-use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand};
+use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::{HumanID, Simulation, SimulationOptions};
 
 use crate::{Scenario, ScenarioCtx};
@@ -30,17 +30,14 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     compare_branches(ctx).map(|_| ())
 }
 
-fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Option<Simulation>, String> {
+fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Simulation, String> {
     (super::growth_basic::SCENARIO.0.run)(ctx)?;
     let start_tick = ctx.sim.get_tick();
     let start = elapsed_tick(&mut ctx.sim);
     let mut with_line = Commutes::new(&ctx.sim);
     let mut without_line = with_line.clone();
     let snapshot = fork(&ctx.sim)?;
-    let Some(line) = install_loop(&mut ctx.sim)? else {
-        println!("transit_basic: skipped because the transit command handlers are still stubs");
-        return Ok(None);
-    };
+    let line = install_loop(&mut ctx.sim)?;
 
     let mut control = ScenarioCtx::new(SCENARIO.1);
     control.sim = snapshot;
@@ -102,7 +99,10 @@ fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Option<Simulation>, String>
             start_tick + resume_tick
         ));
     }
-    println!("transit_basic: {summary}");
+    println!(
+        "transit_basic: {summary} resumed from tick {}",
+        start_tick + resume_tick
+    );
     ctx.sample("with_transit");
     ctx.samples.last_mut().unwrap().extra.extend([
         ("bus_trips".into(), transit.bus as f64),
@@ -121,7 +121,7 @@ fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Option<Simulation>, String>
         ("give_ups".into(), transit.give_ups as f64),
         ("wait_attempts".into(), wait_attempts as f64),
     ]);
-    Ok(Some(control.sim))
+    Ok(control.sim)
 }
 
 fn elapsed_tick(sim: &mut Simulation) -> u64 {
@@ -129,7 +129,7 @@ fn elapsed_tick(sim: &mut Simulation) -> u64 {
     simulation::map_dynamic::transit::elapsed_ticks(resources).0
 }
 
-fn install_loop(sim: &mut Simulation) -> Result<Option<LineID>, String> {
+fn install_loop(sim: &mut Simulation) -> Result<LineID, String> {
     // Clockwise service around the residential and employment blocks of growth_basic.
     let legs = [
         ((1, 1), (2, 1)),
@@ -171,12 +171,7 @@ fn install_loop(sim: &mut Simulation) -> Result<Option<LineID>, String> {
     let mut stops = Vec::with_capacity(commands.len());
     for command in commands {
         sim.apply_commands([&command]);
-        let outcomes = sim.read::<CommandOutcomes>();
-        match outcomes.last.as_slice() {
-            [] => {}
-            [(_, Rejection::TransitNotImplemented)] => return Ok(None),
-            failures => return Err(format!("stop command rejected: {failures:?}")),
-        }
+        check_commands(sim)?;
         let stop = sim
             .read::<Transit>()
             .stops
@@ -204,7 +199,7 @@ fn install_loop(sim: &mut Simulation) -> Result<Option<LineID>, String> {
         },
     ]);
     check_commands(sim)?;
-    Ok(Some(line))
+    Ok(line)
 }
 
 fn check_commands(sim: &Simulation) -> Result<(), String> {
@@ -388,12 +383,11 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "requires P3a dispatch and boarding plus P3b transit mode choice and metrics wiring"]
     fn p3c_transit_basic_is_deterministic() {
         let mut ctx = ScenarioCtx::new(SCENARIO.1);
         let mut first = None;
         ctx.verify_twice(|ctx| {
-            let control = compare_branches(ctx)?.ok_or("transit comparison was skipped")?;
+            let control = compare_branches(ctx)?;
             let hashes = control.hashes();
             if let Some(first) = &first {
                 assert_eq!(first, &hashes, "no-line branch diverged");

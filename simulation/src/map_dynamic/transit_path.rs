@@ -17,6 +17,8 @@ const CAR_SPEED: f64 = 10.0;
 const BUS_SPEED: f64 = 8.0;
 const PARKING_SECONDS: f64 = 120.0;
 const VALUE_OF_TIME_PER_GAME_HOUR: Money = Money::new_bucks(20);
+// Nominal headway assumes even bus spacing. Allow for bunching and traffic delays.
+pub(super) const HEADWAY_MULTIPLIER: u64 = 5;
 
 pub(super) struct TransitPaths<'a> {
     lines: Vec<(&'a TransitLine, u64)>,

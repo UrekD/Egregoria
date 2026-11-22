@@ -6,8 +6,7 @@ use prototypes::{Tick, DELTA, TICKS_PER_HOUR, TICKS_PER_SECOND};
 use super::{
     detach_for_replan, elapsed_ticks, walkable_egress, Berth, BusRun, Transit, TransitStop,
 };
-use crate::economy::Budget;
-use crate::economy::{transit_stats, BudgetCategory, TransitStats, TripStats};
+use crate::economy::{on_wait_timeout, transit_stats, TripMode};
 use crate::map::Map;
 use crate::map_dynamic::{Itinerary, LineID, Router, RoutingStep, StopID};
 use crate::transportation::{
@@ -409,8 +408,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
                 (!timed_out).then_some(line),
             );
             if timed_out {
-                let mut stats = resources.write::<TripStats>();
-                stats.give_ups = stats.give_ups.saturating_add(1);
+                on_wait_timeout(resources);
             }
             continue;
         };
@@ -451,7 +449,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         let queue = queues.get_mut(&(at.line, at.stop)).unwrap();
         let mut remaining = at.remaining;
         while remaining < CAPACITY {
-            let Some((_, id)) = queue.pop_front() else {
+            let Some((since, id)) = queue.pop_front() else {
                 break;
             };
             let human = &mut world.humans[id];
@@ -466,8 +464,13 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
                 continue;
             }
             remaining += 1;
-            Budget::apply(resources, BudgetCategory::TransitFares, line.fare);
-            transit_stats::on_board(&mut resources.write::<TransitStats>(), at.line);
+            human.router.trip_mode = TripMode::Transit;
+            transit_stats::on_board_with_fare(
+                resources,
+                at.line,
+                line.fare,
+                now.0.saturating_sub(since.0),
+            );
         }
     }
 }
@@ -496,5 +499,76 @@ fn alight_passenger(
         detach_for_replan(transit, id, human, walk_pos, resources, Some(at.line));
     } else {
         at.remaining += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use common::saveload::{Bincode, Encoder};
+    use geom::{vec2, vec3};
+    use prototypes::Money;
+
+    use super::*;
+    use crate::economy::{Budget, BudgetCategory, TICKS_PER_BUDGET_DAY};
+    use crate::map::LaneKind;
+    use crate::tests::TestCtx;
+    use crate::world_command::WorldCommand;
+
+    #[test]
+    fn p3_int_scheduled_bus_upkeep_survives_save_load() {
+        let mut ctx = TestCtx::new_fast();
+        ctx.build_roads(&[
+            vec3(100.0, 100.0, 0.0),
+            vec3(300.0, 100.0, 0.0),
+            vec3(300.0, 300.0, 0.0),
+            vec3(100.0, 300.0, 0.0),
+            vec3(100.0, 100.0, 0.0),
+        ]);
+        let stops = {
+            let map = ctx.g.map();
+            let lane = map
+                .lanes()
+                .values()
+                .find(|lane| {
+                    lane.kind == LaneKind::Driving
+                        && lane.points.middle().xy().is_close(vec2(200.0, 100.0), 20.0)
+                })
+                .unwrap();
+            [0.3, 0.7].map(|fraction| {
+                let (pos, dir) = lane.points.point_dir_along(lane.points.length() * fraction);
+                WorldCommand::TransitAddStop { pos, dir: dir.xy() }
+            })
+        };
+        ctx.apply(&stops);
+        let stops: Vec<_> = ctx.g.read::<Transit>().stops.keys().collect();
+        assert_eq!(stops.len(), 2);
+        ctx.apply(&[WorldCommand::TransitCreateLine { stops }]);
+        let line = ctx.g.read::<Transit>().lines.keys().next().unwrap();
+        ctx.apply(&[WorldCommand::TransitSetVehicles { line, n: 1 }]);
+
+        // Save with a fractional hourly upkeep remainder still outstanding.
+        let before_save = 11 * TICKS_PER_HOUR;
+        for _ in 0..before_save {
+            ctx.tick_fast();
+        }
+        let mut loaded: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+        let mut schedule = Simulation::schedule();
+        for _ in before_save..TICKS_PER_BUDGET_DAY {
+            ctx.tick_fast();
+            loaded.tick(&mut schedule, &[]);
+        }
+
+        for sim in [&ctx.g, &loaded] {
+            let transit = sim.read::<Transit>();
+            assert_eq!(transit.runs.len(), 1);
+            assert!(!transit.lines[line].suspended);
+            assert_eq!(
+                sim.read::<Budget>().days()[&0]
+                    .get(&BudgetCategory::TransitUpkeep)
+                    .copied(),
+                Some(-i128::from(Money::new_bucks(25).inner()))
+            );
+        }
+        assert_eq!(ctx.g.hashes(), loaded.hashes());
     }
 }

@@ -92,6 +92,9 @@ fn register_systems_and_resources() {
     register_system("itinerary_update", itinerary_update);
     register_system("market_update", market_update);
     register_system("budget_update", crate::economy::budget_update);
+    register_system("accrue_transit_upkeep", |world, resources| {
+        crate::economy::accrue_transit_upkeep(world, resources);
+    });
     register_system("demand_update", crate::economy::demand_update);
     register_system_sim(
         "residence_update",

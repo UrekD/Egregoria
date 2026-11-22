@@ -1,4 +1,4 @@
-use crate::economy::{on_arrival, on_cancel, on_start};
+use crate::economy::{on_arrival, on_cancel, on_start, TripMode};
 use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::transit::{elapsed_ticks, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
@@ -19,7 +19,7 @@ use slotmapd::HopSlotMap;
 
 #[path = "transit_path.rs"]
 mod transit_path;
-use transit_path::{legacy_cost, TransitPaths};
+use transit_path::{legacy_cost, TransitPaths, HEADWAY_MULTIPLIER};
 
 const PERSONAL_CAR_ACCESS_RADIUS: f32 = 300.0;
 
@@ -33,6 +33,8 @@ pub struct Router {
     pub personal_car: Option<VehicleID>,
     pub last_error: Option<RouterError>,
     pub trip_start: Option<Tick>,
+    #[inspect(skip)]
+    pub(crate) trip_mode: TripMode,
     pub(crate) walk_only_pickup: bool,
     replan_at_alight: bool,
 }
@@ -79,7 +81,11 @@ pub enum RoutingStep {
 debug_inspect_impl!(RoutingStep);
 
 pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
-    routing_changed(world, resources, Transit::headway);
+    routing_changed(world, resources, |transit, line| {
+        transit
+            .headway(line)
+            .map(|ticks| ticks.saturating_mul(HEADWAY_MULTIPLIER))
+    });
 }
 
 fn routing_changed(
@@ -164,6 +170,20 @@ fn routing_changed(
                         car_pos.distance2(origin) <= PERSONAL_CAR_ACCESS_RADIUS.powi(2)
                     });
                     use_selected_vehicle = nearby_car.is_some();
+                    let allows_line = |line| transit.allows_line_for_trip(id, router, line);
+                    let restricted;
+                    let paths = if transit.lines.keys().any(|line| !allows_line(line)) {
+                        restricted = TransitPaths::new(&transit, |transit, line| {
+                            if allows_line(line) {
+                                headway(transit, line)
+                            } else {
+                                None
+                            }
+                        });
+                        &restricted
+                    } else {
+                        paths
+                    };
                     transit_steps = paths.winning_steps(
                         origin,
                         pos,
@@ -320,7 +340,12 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                 RoutingStep::DriveTo(vehicle, obj) => {
                     let route = Itinerary::wait_for_reroute(PathKind::Vehicle, obj);
                     if let Some(x) = world.vehicles.get_mut(vehicle) {
-                        x.it = route
+                        x.it = route;
+                        if h.location == Location::Vehicle(vehicle)
+                            && h.router.trip_mode == TripMode::Walk
+                        {
+                            h.router.trip_mode = TripMode::Car;
+                        }
                     }
                 }
                 RoutingStep::Park(vehicle, ref mut spot) => {
@@ -366,7 +391,6 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                         .get_in(build, SoulID::Human(body));
                     walk_inside(body, h, cbuf_human);
                     on_arrival(&mut h.router, resources);
-                    h.router.trip_start = None;
                 }
                 RoutingStep::GetOutBuilding(build) => {
                     let wpos = map
@@ -414,6 +438,7 @@ impl Router {
             cur_dest: None,
             last_error: None,
             trip_start: None,
+            trip_mode: TripMode::Walk,
             walk_only_pickup: false,
             replan_at_alight: false,
         }
@@ -570,7 +595,6 @@ impl Router {
             return;
         }
         on_cancel(self);
-        self.trip_start = None;
         self.clear_steps(parking);
         self.cur_dest = None;
         self.target_dest = None;
@@ -590,7 +614,6 @@ impl Router {
             }
         }
         if self.target_dest != Some(dest) {
-            self.trip_start = None;
             self.target_dest = Some(dest);
             on_start(self);
         }

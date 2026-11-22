@@ -29,16 +29,11 @@ pub struct TripStats {
 
 pub(crate) fn on_start(router: &mut Router) {
     router.trip_start = None;
+    router.trip_mode = TripMode::Walk;
 }
 
 pub(crate) fn on_arrival(router: &mut Router, resources: &Resources) {
-    // The spine's arrival hook only exposes the selected vehicle. A router
-    // that tracks the mode actually used can pass it to on_arrival_by_mode.
-    let mode = if router.selected_vehicle().is_some() {
-        TripMode::Car
-    } else {
-        TripMode::Walk
-    };
+    let mode = std::mem::take(&mut router.trip_mode);
     on_arrival_by_mode(router, resources, mode);
 }
 
@@ -59,6 +54,7 @@ pub fn on_arrival_by_mode(router: &mut Router, resources: &Resources, mode: Trip
 
 pub(crate) fn on_cancel(router: &mut Router) {
     router.trip_start = None;
+    router.trip_mode = TripMode::Walk;
 }
 
 /// Record a wait that expired and forced the passenger to give up on transit.
