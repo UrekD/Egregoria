@@ -18,6 +18,11 @@ use crate::inputmap::{Bindings, InputAction, InputCombinations, InputMap};
 use crate::network::NetworkState;
 use crate::uiworld::UiWorld;
 
+/// Padding around the clock and the speed row.
+const PANEL_PAD: f32 = 10.0;
+/// Fits the seven speed buttons, MAX included, with a gap between each.
+const PANEL_WIDTH: f32 = 260.0;
+
 const SPEEDS: [(u32, &str, Option<&str>, InputAction); 7] = [
     (0, "Pause", Some("pause"), InputAction::PausePlay),
     (1, "1×", Some("play"), InputAction::Speed1),
@@ -167,9 +172,9 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
                 l.show(|| {
                     opaque(|| {
                         blur_bg(secondary_container().with_alpha(0.5), 10.0, || {
-                            padxy(10.0, 5.0, || {
+                            padxy(PANEL_PAD, 5.0, || {
                                 constrained(
-                                    Constraints::loose(Vec2::new(220.0, f32::INFINITY)),
+                                    Constraints::loose(Vec2::new(PANEL_WIDTH, f32::INFINITY)),
                                     || {
                                         let mut l = List::column();
                                         l.cross_axis_alignment = CrossAxisAlignment::Stretch;
@@ -257,6 +262,77 @@ mod tests {
         assert_eq!(achieved_readout(50, Some(48.0)), None);
         assert_eq!(achieved_readout(MAX_WARP, None), None);
         assert_eq!(achieved_readout(0, Some(0.0)), None);
+    }
+
+    #[test]
+    fn uxfix_speed_row_with_max_keeps_its_padding_and_gaps() {
+        use simulation::Simulation;
+        use yakui::font::{Font, FontSettings, Fonts};
+        use yakui::widgets::{ButtonWidget, OpaqueWidget};
+        use yakui::{Rect, WidgetId, Yakui};
+
+        fn rects<T: yakui::widget::Widget>(ui: &Yakui, id: WidgetId, out: &mut Vec<Rect>) {
+            let node = ui.dom().get(id).unwrap();
+            if node.widget.is::<T>() {
+                out.push(ui.layout_dom().get(id).unwrap().rect);
+            }
+            for &child in &node.children {
+                rects::<T>(ui, child, out);
+            }
+        }
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let sim = Simulation::new(false);
+        let uiworld = UiWorld::with_defaults();
+        for (width, height) in [(1024.0, 768.0), (1280.0, 720.0)] {
+            let mut ui = Yakui::new();
+            let fonts = ui.dom().get_global_or_init(Fonts::default);
+            for (name, bytes) in [
+                (
+                    "icons",
+                    include_bytes!("../../../../assets/font_awesome_solid_900.otf").as_slice(),
+                ),
+                (
+                    "monospace",
+                    include_bytes!("../../../../assets/SpaceMono-Regular.ttf").as_slice(),
+                ),
+            ] {
+                fonts.add(
+                    Font::from_bytes(bytes, FontSettings::default()).unwrap(),
+                    Some(name),
+                );
+            }
+            let viewport = Vec2::new(width, height);
+            ui.set_surface_size(viewport);
+            ui.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, viewport));
+            ui.start();
+            time_controls(&uiworld, &sim);
+            ui.finish();
+
+            let mut panels = Vec::new();
+            rects::<OpaqueWidget>(&ui, ui.dom().root(), &mut panels);
+            let [panel] = panels.as_slice() else {
+                panic!("expected one clock panel, got {panels:?}");
+            };
+            assert!(panel.max().x <= width);
+            let mut buttons = Vec::new();
+            rects::<ButtonWidget>(&ui, ui.dom().root(), &mut buttons);
+            assert_eq!(buttons.len(), SPEEDS.len());
+            buttons.sort_by(|a, b| a.pos().x.total_cmp(&b.pos().x));
+            for pair in buttons.windows(2) {
+                assert!(
+                    pair[1].pos().x - pair[0].max().x >= 2.0,
+                    "speed buttons touch at {width}: {pair:?}"
+                );
+            }
+            let left = buttons[0].pos().x - panel.pos().x;
+            let right = panel.max().x - buttons[SPEEDS.len() - 1].max().x;
+            assert!(
+                right >= PANEL_PAD - 0.5 && (left - right).abs() < 1.0,
+                "MAX crowds the panel edge at {width}: {left} left, {right} right"
+            );
+        }
     }
 
     #[test]
