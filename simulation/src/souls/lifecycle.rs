@@ -1,18 +1,18 @@
-use crate::economy::cargo::{cancel_removed, CargoBook, CargoRemoval, LoadId};
+use crate::economy::cargo::{cancel_removed, stored_items, CargoBook, CargoRemoval, LoadId};
 use geom::Vec3;
 use itertools::Itertools;
-use prototypes::{GameTime, ItemID};
+use prototypes::{GameTime, GoodsCompanyID, ItemID};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::economy::{BasketFailure, Market, Trade};
 use crate::map::{Building, BuildingID, BuildingKind, Map, PathKind};
 use crate::map_dynamic::{
     BuildingInfos, Destination, DispatchID, Dispatcher, Itinerary, ParkingManagement,
-    SpotReservation, OBJECTIVE_OK_DIST,
+    SpotReservation, NEAR_PARKING_RADIUS, OBJECTIVE_OK_DIST,
 };
 use crate::souls::desire::WorkKind;
 use crate::souls::freight_station::FreightTrainState;
-use crate::souls::household::{cancel_visit, HouseholdClaims};
+use crate::souls::household::{cancel_visit, household_items, HouseholdClaims};
 use crate::souls::human::HumanDecisionKind;
 use crate::souls::residence;
 use crate::transportation::testing_vehicles::RandomVehicles;
@@ -189,16 +189,7 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
 pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: CompanyEnt) {
     cancel_removed(sim, CargoRemoval::Soul(SoulID::GoodsCompany(id)));
     sim.write::<CargoBook>().forget_company(id);
-    if let Some(storage) = &company.comp.proto.prototype().storage {
-        let soul = SoulID::GoodsCompany(id);
-        let mut market = sim.write::<Market>();
-        for &item in &storage.accepted_items {
-            let stock = market.capital(soul, item).max(0) as u32;
-            if stock > 0 {
-                market.record_freight_loss(item, stock);
-            }
-        }
-    }
+    write_off_physical_stock(sim, SoulID::GoodsCompany(id), company.comp.proto);
     sim.read::<ParCommandBuffer<VehicleEnt>>()
         .kill_all(&company.comp.trucks);
     // A hire can be matched before the company's update assigns the workplace.
@@ -226,6 +217,35 @@ pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: Comp
     }
     clear_soul_references(sim, SoulID::GoodsCompany(id));
     clear_building_references(sim, company.comp.building, None);
+}
+
+/// Physical stock leaves with its company. Record it once in the itemized
+/// write-off ledger before the market account goes. Household shelves and shop
+/// deliveries are written off when the account itself is removed.
+fn write_off_physical_stock(sim: &mut Simulation, soul: SoulID, proto: GoodsCompanyID) {
+    let proto = proto.prototype();
+    let mut items: BTreeSet<ItemID> = proto.storage.as_ref().map(stored_items).unwrap_or_default();
+    if let Some(recipe) = &proto.recipe {
+        items.extend(
+            recipe
+                .consumption
+                .iter()
+                .chain(&recipe.production)
+                .map(|item| item.id),
+        );
+    }
+    let delivery = crate::economy::balance::shelf_delivery_item();
+    let mut market = sim.write::<Market>();
+    for item in items {
+        if household_items().contains(&item) || item == delivery {
+            continue;
+        }
+        let stock = market.capital(soul, item);
+        if stock > 0 {
+            market.record_freight_loss(item, stock as u32);
+            market.produce(soul, item, -stock);
+        }
+    }
 }
 
 pub(crate) fn freight_station_dropped(
@@ -787,29 +807,65 @@ pub(crate) fn abort_freight_trip(
     if sim.read::<CargoBook>().manifest_for(truck).is_some() {
         return;
     }
-    let (world, resources) = sim.world_res();
-    if let Some(human) = world.humans.get_mut(driver) {
-        let riding = human.location == Location::Vehicle(truck);
-        if riding {
-            let pos = world
-                .vehicles
-                .get(truck)
-                .map_or(human.trans.pos, |v| v.trans.pos);
-            move_outside(human, pos, resources);
-        }
-        if riding || human.decision.kind.references_load(token) {
-            if human.router.selected_vehicle() == Some(truck) {
-                human.router.use_vehicle(human.router.personal_car);
-            }
-            cancel_trip(
-                driver,
-                human,
-                resources,
-                &mut resources.write::<ParkingManagement>(),
-            );
-        }
+    stop_freight_driver(sim, driver, truck, |human| {
+        human.decision.kind.references_load(token)
+    });
+    recall_truck(sim, truck, used_truck);
+}
+
+/// Frees a driver whose empty return leg kept failing and brings the truck
+/// back to its depot. A truck parked away from the depot is replaced there.
+pub(crate) fn recover_empty_truck(sim: &mut Simulation, driver: HumanID, truck: VehicleID) {
+    if sim.read::<CargoBook>().manifest_for(truck).is_some() {
+        return;
     }
-    if used_truck
+    stop_freight_driver(sim, driver, truck, |_| true);
+    let depot = truck_company(sim, truck).and_then(|company| {
+        sim.map()
+            .get(sim.get(company)?.comp.building)
+            .map(|b| b.door_pos)
+    });
+    let away = sim.get(truck).is_some_and(|vehicle| {
+        depot.is_none_or(|door| vehicle.trans.pos.distance(door) > NEAR_PARKING_RADIUS)
+    });
+    recall_truck(sim, truck, away);
+}
+
+fn stop_freight_driver(
+    sim: &mut Simulation,
+    driver: HumanID,
+    truck: VehicleID,
+    on_trip: impl Fn(&HumanEnt) -> bool,
+) {
+    let (world, resources) = sim.world_res();
+    let Some(human) = world.humans.get_mut(driver) else {
+        return;
+    };
+    let riding = human.location == Location::Vehicle(truck);
+    if riding {
+        let pos = world
+            .vehicles
+            .get(truck)
+            .map_or(human.trans.pos, |v| v.trans.pos);
+        move_outside(human, pos, resources);
+    }
+    if riding || on_trip(human) {
+        if human.router.selected_vehicle() == Some(truck) {
+            human.router.use_vehicle(human.router.personal_car);
+        }
+        cancel_trip(
+            driver,
+            human,
+            resources,
+            &mut resources.write::<ParkingManagement>(),
+        );
+    }
+}
+
+/// Returns a truck to its depot. A truck that is parked or parking away from
+/// the depot is replaced by a new one there.
+fn recall_truck(sim: &mut Simulation, truck: VehicleID, away: bool) {
+    if away
         && sim.get(truck).is_some_and(|vehicle| {
             matches!(
                 vehicle.vehicle.state,

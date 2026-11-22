@@ -317,26 +317,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             }
         }
         if proto.storage.is_some() {
-            let mut workers: Vec<_> = c.workers.0.iter().copied().filter(|&worker| {
-                world.humans.get(worker).and_then(|human| human.work.as_ref())
-                    .is_some_and(|work| work.workplace == c.comp.building && matches!(work.kind, WorkKind::Worker))
-            }).collect();
-            let mut trucks: Vec<_> = c.comp.trucks.iter().copied().filter(|&truck| {
-                world.vehicles.contains_key(truck) && !c.workers.0.iter().any(|&worker| {
-                    world.humans.get(worker).and_then(|human| human.work.as_ref())
-                        .is_some_and(|work| work.workplace == c.comp.building
-                            && matches!(work.kind, WorkKind::Driver { truck: assigned, .. } if assigned == truck))
-                })
-            }).collect();
-            workers.sort_unstable();
-            trucks.sort_unstable();
-            for (worker, truck) in workers.into_iter().zip(trucks) {
-                world.humans[worker].work.as_mut().unwrap().kind = WorkKind::Driver {
-                    truck,
-                    deliver_order: None,
-                    load: None,
-                };
-            }
+            assign_warehouse_drivers(c, &mut world.humans, &world.vehicles);
             return;
         }
         if c.comp.driver.is_some_and(|driver| {
@@ -413,4 +394,51 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             }
         }
     });
+}
+
+/// Pairs idle warehouse staff with trucks that have no driver, both in ID order.
+fn assign_warehouse_drivers(
+    company: &CompanyEnt,
+    humans: &mut slotmapd::HopSlotMap<HumanID, crate::HumanEnt>,
+    vehicles: &slotmapd::HopSlotMap<VehicleID, VehicleEnt>,
+) {
+    let building = company.comp.building;
+    let work_at = |worker: HumanID| {
+        humans
+            .get(worker)
+            .and_then(|human| human.work.as_ref())
+            .filter(|work| work.workplace == building)
+    };
+    let mut idle: Vec<_> = company
+        .workers
+        .0
+        .iter()
+        .copied()
+        .filter(|&worker| work_at(worker).is_some_and(|work| matches!(work.kind, WorkKind::Worker)))
+        .collect();
+    let driven: Vec<_> = company
+        .workers
+        .0
+        .iter()
+        .filter_map(|&worker| match work_at(worker)?.kind {
+            WorkKind::Driver { truck, .. } => Some(truck),
+            WorkKind::Worker => None,
+        })
+        .collect();
+    let mut trucks: Vec<_> = company
+        .comp
+        .trucks
+        .iter()
+        .copied()
+        .filter(|&truck| vehicles.contains_key(truck) && !driven.contains(&truck))
+        .collect();
+    idle.sort_unstable();
+    trucks.sort_unstable();
+    for (worker, truck) in idle.into_iter().zip(trucks) {
+        humans[worker].work.as_mut().unwrap().kind = WorkKind::Driver {
+            truck,
+            deliver_order: None,
+            load: None,
+        };
+    }
 }

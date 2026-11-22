@@ -4,11 +4,14 @@
 //! | --- | --- | --- |
 //! | Virtual local (including growables with road freight disabled) | Market match | Neither |
 //! | Virtual station import/export | Market match | Import debit + wanted units / export credit + waiting units |
+//! | Producer export without a dispatchable truck or road route | Direct export at match, after local recipes keep one truckload | Export credit + waiting units |
 //! | Physical company → company | Source debited at reservation, destination credited at verified unload | Neither |
 //! | Physical company → station | Source debited at reservation, station receives at verified unload | Export credit + waiting units at unload |
 //!
 //! Blocked routes release their stock first. A live station can then handle a
 //! separate virtual trade. Cancellation never posts an import or export.
+//! An outbound leg that keeps failing in the router suspends its route until the
+//! cooldown ends or the road network changes, so the stock can take another lane.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -19,10 +22,12 @@ use prototypes::{
 };
 use serde::{Deserialize, Serialize};
 
-use super::{Budget, BudgetCategory, EcoStats, Market, Trade, TradeTarget, TICKS_PER_BUDGET_DAY};
-use crate::map::{BuildingID, LaneKind, Map, PathKind};
+use super::{
+    Budget, BudgetCategory, EcoStats, FreightDay, Market, Trade, TradeTarget, TICKS_PER_BUDGET_DAY,
+};
+use crate::map::{BuildingID, LaneID, LaneKind, Map, PathKind, RoadID};
 use crate::map_dynamic::transit::elapsed_ticks;
-use crate::map_dynamic::{BuildingInfos, Destination, Itinerary};
+use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, ParkingManagement};
 use crate::souls::desire::WorkKind;
 use crate::souls::household::household_items;
 use crate::transportation::{Location, VehicleKind};
@@ -37,6 +42,12 @@ const DELIVERY_LEAD: u64 = TICKS_PER_HOUR;
 const BETWEEN_DRIVER_SHIFTS: u64 = 14 * TICKS_PER_HOUR;
 const DELIVERY_EXPIRY: u64 = 6 * TICKS_PER_HOUR;
 const FREIGHT_PACE_METERS_PER_SECOND: f32 = 8.0;
+// Router errors such as a full car park clear on their own. Give up on a leg
+// only after it has failed continuously for this long.
+const ROUTING_RETRY_WINDOW: u64 = 10 * TICKS_PER_MINUTE;
+// A route whose outbound leg gave up is skipped by matching for this long.
+const FAILED_ROUTE_COOLDOWN: u64 = 2 * TICKS_PER_HOUR;
+const FREIGHT_DAYS_KEPT: u64 = 8;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ShipmentId(pub u64);
@@ -92,6 +103,7 @@ pub struct TruckLoad {
     departed_at: u64,
     due_at: u64,
     used_truck: bool,
+    routing_error_since: Option<u64>,
 }
 
 impl TruckLoad {
@@ -102,6 +114,27 @@ impl TruckLoad {
     pub fn destination(&self) -> BuildingID {
         self.destination.building
     }
+
+    fn units(&self) -> u32 {
+        self.items.iter().map(|line| line.units).sum()
+    }
+}
+
+/// An empty truck driving back to its depot after a verified unload.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct EmptyReturn {
+    driver: HumanID,
+    depot: Endpoint,
+    started_at: u64,
+    routing_error_since: Option<u64>,
+}
+
+/// A route whose outbound leg failed in the router until the retry window ran out.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+struct SuspendedRoute {
+    until: u64,
+    topology: u64,
+    roads: [Option<RoadID>; 2],
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -112,6 +145,9 @@ pub struct CargoBook {
     policies: BTreeMap<CompanyID, WarehousePolicy>,
     restocking: BTreeSet<CompanyID>,
     pub(crate) growable_freight: bool,
+    returning: BTreeMap<VehicleID, EmptyReturn>,
+    suspended: BTreeMap<(Endpoint, Endpoint), SuspendedRoute>,
+    days: BTreeMap<u64, FreightDay>,
     #[serde(skip)]
     routes: RouteCache,
 }
@@ -124,6 +160,32 @@ pub struct Stock {
 
 type StockKey = (Endpoint, ItemID);
 
+/// Why an unload was refused. The load is then cancelled with this reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeliveryRejection {
+    /// The token was already settled or cancelled.
+    UnknownLoad,
+    /// The driver, truck or destination differ from the manifest.
+    WrongTrip,
+    /// The driver never rode the loaded truck.
+    TruckNotUsed,
+    Expired,
+    /// The source or destination was removed or changed owner.
+    EndpointGone,
+    DriverNotAtDestination,
+    /// The driver no longer holds this load for the source company.
+    AssignmentChanged,
+    TruckNotParked,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Release {
+    /// A missed delivery: removal, route failure, expiry or a refused unload.
+    Cancelled,
+    /// A player policy change recalled the stock.
+    Withdrawn,
+}
+
 impl CargoBook {
     fn next_token(&mut self) -> u64 {
         let id = self.next_id;
@@ -133,6 +195,19 @@ impl CargoBook {
 
     pub fn manifest_for(&self, vehicle: VehicleID) -> Option<&TruckLoad> {
         self.loads.values().find(|load| load.vehicle == vehicle)
+    }
+
+    /// Delivery outcomes and per-recipient receipts for an elapsed budget day.
+    pub fn freight_day(&self, elapsed_day: u64) -> Option<&FreightDay> {
+        self.days.get(&elapsed_day)
+    }
+
+    fn day_mut(&mut self, now: u64) -> &mut FreightDay {
+        let day = now / TICKS_PER_BUDGET_DAY;
+        if !self.days.contains_key(&day) {
+            self.days.retain(|&kept, _| kept + FREIGHT_DAYS_KEPT > day);
+        }
+        self.days.entry(day).or_default()
     }
 
     pub fn stock_for(&self, building: BuildingID) -> BTreeMap<ItemID, Stock> {
@@ -171,6 +246,36 @@ impl CargoBook {
             .unwrap_or(storage.default_policy)
     }
 
+    /// Units of shared warehouse space in use: on hand, queued or driving in,
+    /// and outbound stock that returns if its trip is cancelled.
+    pub fn warehouse_committed(
+        &self,
+        market: &Market,
+        owner: SoulID,
+        building: BuildingID,
+        storage: &WarehouseSpec,
+    ) -> u32 {
+        let on_hand: u32 = stored_items(storage)
+            .into_iter()
+            .map(|item| market.capital(owner, item).max(0) as u32)
+            .sum();
+        let incoming: u32 = self
+            .stock_for(building)
+            .values()
+            .map(|stock| stock.incoming + stock.reserved)
+            .sum();
+        let returnable: u32 = self.outgoing_loads(building).map(TruckLoad::units).sum();
+        on_hand + incoming + returnable
+    }
+
+    /// Whether the warehouse is below its low watermark and refilling to high.
+    pub fn is_restocking(&self, company: CompanyID) -> bool {
+        self.restocking.contains(&company)
+    }
+
+    /// Stores a warehouse policy. Queued exports return to the shelf and are
+    /// matched again under the new policy. Reserve locally also recalls
+    /// exports that are already on the road. Neither counts as a missed delivery.
     pub(crate) fn set_warehouse_policy(
         sim: &mut Simulation,
         company: CompanyID,
@@ -178,8 +283,7 @@ impl CargoBook {
     ) {
         let (world, resources) = sim.world_res();
         let mut book = resources.write::<CargoBook>();
-        book.policies.insert(company, policy);
-        if policy != WarehousePolicy::ReserveLocally {
+        if book.policies.insert(company, policy) == Some(policy) {
             return;
         }
         let exports = |source: Endpoint, dest: Endpoint| {
@@ -196,9 +300,17 @@ impl CargoBook {
         let loads = book
             .loads
             .iter()
+            .filter(|_| policy == WarehousePolicy::ReserveLocally)
             .filter_map(|(&id, load)| exports(load.source, load.destination).then_some(id))
             .collect();
-        release(&mut book, world, resources, shipments, loads);
+        release(
+            &mut book,
+            world,
+            resources,
+            shipments,
+            loads,
+            Release::Withdrawn,
+        );
     }
 
     pub(crate) fn forget_company(&mut self, company: CompanyID) {
@@ -238,6 +350,32 @@ impl CargoBook {
         market.produce(shipment.source.soul, item, -(units as i32));
         self.shipments.insert(id, shipment);
     }
+
+    /// A road route that matching may use: both ends reach the same driving
+    /// component from their parking, and the route is not suspended.
+    fn physical_route(&mut self, map: &Map, from: Endpoint, to: Endpoint, now: u64) -> bool {
+        let suspended = self.suspended.get(&(from, to)).is_some_and(|route| {
+            now < route.until
+                && route.topology == map.walking_topology_generation
+                && route.roads == connected_roads(map, from, to)
+        });
+        !suspended && self.routes.reaches(map, from.building, to.building)
+    }
+
+    fn suspend_route(&mut self, map: &Map, from: Endpoint, to: Endpoint, now: u64) {
+        self.suspended.insert(
+            (from, to),
+            SuspendedRoute {
+                until: now + FAILED_ROUTE_COOLDOWN,
+                topology: map.walking_topology_generation,
+                roads: connected_roads(map, from, to),
+            },
+        );
+    }
+}
+
+fn connected_roads(map: &Map, from: Endpoint, to: Endpoint) -> [Option<RoadID>; 2] {
+    [from, to].map(|end| map.get(end.building).and_then(|b| b.connected_road))
 }
 
 #[derive(Clone, Copy)]
@@ -284,15 +422,90 @@ pub(crate) fn uses_road_freight(
         && !household_items().contains(&item)
 }
 
+/// Where a truck parks to serve a building, and the driving component it joins.
+#[derive(Clone, Copy)]
+struct ParkingAccess {
+    component: LaneID,
+    drive_pos: geom::Vec3,
+}
+
+/// Road reachability for freight, derived from the map and rebuilt when the
+/// lane topology changes. Reachability compares strongly connected driving
+/// components, so it never runs a route search. Driven lengths, which only
+/// warehouses compare, take one search per ordered pair.
 #[derive(Default)]
 struct RouteCache {
     revision: (u64, u64),
-    by_building: BTreeMap<(BuildingID, BuildingID), Option<[OrderedFloat<f32>; 2]>>,
+    components: Option<BTreeMap<LaneID, LaneID>>,
+    // Keyed by the building's road connection, which can change without a
+    // lane topology change.
+    access: BTreeMap<BuildingID, (Option<RoadID>, Option<ParkingAccess>)>,
+    distances: BTreeMap<(BuildingID, BuildingID), Option<OrderedFloat<f32>>>,
+    searches: u64,
 }
 
 impl RouteCache {
+    fn refresh(&mut self, map: &Map) {
+        let revision = (map.identity(), map.walking_topology_generation);
+        if self.revision != revision {
+            *self = Self {
+                revision,
+                searches: self.searches,
+                ..Self::default()
+            };
+        }
+    }
+
+    fn forget(&mut self, building: BuildingID) {
+        self.access.remove(&building);
+        self.distances
+            .retain(|&(from, to), _| from != building && to != building);
+    }
+
+    /// Mirrors the truck router: park near the door on a driving lane that is
+    /// connected both ways with the building's own road.
+    fn access(&mut self, map: &Map, id: BuildingID) -> Option<ParkingAccess> {
+        self.refresh(map);
+        let Some(building) = map.get(id) else {
+            self.forget(id);
+            return None;
+        };
+        let road = building.connected_road;
+        if let Some(&(cached_road, access)) = self.access.get(&id) {
+            if cached_road == road {
+                return access;
+            }
+            self.forget(id);
+        }
+        let components = self
+            .components
+            .get_or_insert_with(|| driving_components(map));
+        let access = (|| {
+            let connected = map.get(road?)?;
+            let spot = ParkingManagement::default()
+                .reserve_near(building.door_pos, map)
+                .ok()?;
+            let drive_pos = spot.park_pos(map)?;
+            let lane = map.nearest_lane(drive_pos, LaneKind::Driving, None)?;
+            let component = *components.get(&lane)?;
+            connected
+                .lanes_iter()
+                .any(|(lane, _)| components.get(&lane) == Some(&component))
+                .then_some(ParkingAccess {
+                    component,
+                    drive_pos,
+                })
+        })();
+        self.access.insert(id, (road, access));
+        access
+    }
+
     fn reaches(&mut self, map: &Map, from: BuildingID, to: BuildingID) -> bool {
-        self.distance(map, from, to).is_some()
+        from != to
+            && self
+                .access(map, from)
+                .zip(self.access(map, to))
+                .is_some_and(|(from, to)| from.component == to.component)
     }
 
     fn distance(
@@ -301,30 +514,97 @@ impl RouteCache {
         from: BuildingID,
         to: BuildingID,
     ) -> Option<OrderedFloat<f32>> {
-        let revision = (map.identity(), map.walking_topology_generation);
-        if self.revision != revision {
-            self.revision = revision;
-            self.by_building.clear();
-        }
-        let key = (from.min(to), from.max(to));
-        let (a, b) = map.get(key.0).zip(map.get(key.1))?;
-        // Building connections can change independently of the lane graph.
-        if ![a, b].into_iter().all(|building| {
-            building
-                .connected_road
-                .and_then(|road| map.get(road))
-                .is_some_and(|road| road.lanes_iter().any(|(_, kind)| kind == LaneKind::Driving))
-        }) {
+        if !self.reaches(map, from, to) {
             return None;
         }
-        let distance = self.by_building.entry(key).or_insert_with(|| {
-            Some([
-                vehicle_distance(map, a.door_pos, b.door_pos)?,
-                vehicle_distance(map, b.door_pos, a.door_pos)?,
-            ])
-        });
-        distance.map(|distance| distance[usize::from(from != key.0)])
+        if let Some(&distance) = self.distances.get(&(from, to)) {
+            return distance;
+        }
+        let (start, end) = (self.access[&from].1?, self.access[&to].1?);
+        self.searches += 1;
+        let distance = vehicle_distance(map, start.drive_pos, end.drive_pos);
+        self.distances.insert((from, to), distance);
+        distance
     }
+}
+
+/// Labels each driving or bus lane with the smallest lane of its strongly
+/// connected component. Iterative Kosaraju, in lane order for determinism.
+fn driving_components(map: &Map) -> BTreeMap<LaneID, LaneID> {
+    let drivable = |kind| matches!(kind, LaneKind::Driving | LaneKind::Bus);
+    let lanes: Vec<LaneID> = map
+        .lanes()
+        .iter()
+        .filter(|(_, lane)| drivable(lane.kind))
+        .map(|(id, _)| id)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let index: BTreeMap<_, _> = lanes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
+    let mut forward = vec![Vec::new(); lanes.len()];
+    let mut reverse = vec![Vec::new(); lanes.len()];
+    for (src, &lane) in lanes.iter().enumerate() {
+        let Some(intersection) = map.intersections().get(map.lanes()[lane].dst) else {
+            continue;
+        };
+        for (turn, _) in intersection.turns_from(lane) {
+            if let Some(&dst) = index.get(&turn.dst) {
+                forward[src].push(dst);
+                reverse[dst].push(src);
+            }
+        }
+    }
+
+    let mut visited = vec![false; lanes.len()];
+    let mut finished = Vec::with_capacity(lanes.len());
+    for root in 0..lanes.len() {
+        if visited[root] {
+            continue;
+        }
+        visited[root] = true;
+        let mut stack = vec![(root, 0)];
+        while let Some(top) = stack.last_mut() {
+            let node = top.0;
+            if let Some(&next) = forward[node].get(top.1) {
+                top.1 += 1;
+                if !visited[next] {
+                    visited[next] = true;
+                    stack.push((next, 0));
+                }
+            } else {
+                stack.pop();
+                finished.push(node);
+            }
+        }
+    }
+
+    let mut label = vec![usize::MAX; lanes.len()];
+    for &root in finished.iter().rev() {
+        if label[root] != usize::MAX {
+            continue;
+        }
+        let mut members = vec![root];
+        label[root] = root;
+        let mut pending = vec![root];
+        while let Some(node) = pending.pop() {
+            for &prev in &reverse[node] {
+                if label[prev] == usize::MAX {
+                    label[prev] = root;
+                    members.push(prev);
+                    pending.push(prev);
+                }
+            }
+        }
+        let smallest = *members.iter().min().unwrap();
+        for member in members {
+            label[member] = smallest;
+        }
+    }
+    lanes
+        .iter()
+        .enumerate()
+        .map(|(i, &lane)| (lane, lanes[label[i]]))
+        .collect()
 }
 
 fn vehicle_distance(map: &Map, start: geom::Vec3, end: geom::Vec3) -> Option<OrderedFloat<f32>> {
@@ -424,13 +704,14 @@ fn assigned_drivers(
     company: CompanyID,
 ) -> impl Iterator<Item = (HumanID, VehicleID)> + '_ {
     let entity = &world.companies[company];
-    let warehouse = entity.comp.proto.prototype().storage.is_some();
-    entity
-        .comp
-        .driver
+    // A warehouse runs one driver per truck from its staff. Producers have one driver.
+    let drivers = if entity.comp.proto.prototype().storage.is_some() {
+        entity.workers.0.as_slice()
+    } else {
+        entity.comp.driver.as_slice()
+    };
+    drivers
         .iter()
-        .filter(move |_| !warehouse)
-        .chain(entity.workers.0.iter().filter(move |_| warehouse))
         .filter_map(move |&driver| Some((driver, driver_truck(world, source, company, driver)?)))
 }
 
@@ -440,6 +721,14 @@ fn assigned_driver(
     company: CompanyID,
 ) -> Option<(HumanID, VehicleID)> {
     assigned_drivers(world, source, company).next()
+}
+
+fn has_fleet(world: &World, company: CompanyID) -> bool {
+    world.companies[company]
+        .comp
+        .trucks
+        .iter()
+        .any(|&truck| world.vehicles.contains_key(truck))
 }
 
 fn owns_assignment(
@@ -455,17 +744,33 @@ fn owns_assignment(
     })
 }
 
+/// Physical items a warehouse can hold, without duplicates. Household items
+/// never travel by road freight.
+pub fn stored_items(spec: &WarehouseSpec) -> BTreeSet<ItemID> {
+    spec.accepted_items
+        .iter()
+        .copied()
+        .filter(|item| !household_items().contains(item))
+        .collect()
+}
+
 struct Warehouse {
     id: CompanyID,
     endpoint: Endpoint,
     spec: &'static WarehouseSpec,
+    items: BTreeSet<ItemID>,
     policy: WarehousePolicy,
+    dispatch: DispatchPolicy,
+    staffed: bool,
     on_hand: u32,
+    /// On-hand plus incoming units, in total and per item.
     staged: u32,
+    staged_items: BTreeMap<ItemID, u32>,
+    /// Staged units plus outbound units that may return after a cancellation.
     committed: u32,
 }
 
-fn route_distance(map: &Map, from: Endpoint, to: Endpoint) -> (OrderedFloat<f32>, Endpoint) {
+fn straight_distance(map: &Map, from: Endpoint, to: Endpoint) -> (OrderedFloat<f32>, Endpoint) {
     (
         OrderedFloat(
             map.buildings()[from.building]
@@ -500,6 +805,24 @@ impl Matching<'_> {
         *self.queued.entry((destination, quantity.item)).or_default() += quantity.units;
     }
 
+    fn incoming(&self, key: StockKey) -> u32 {
+        self.queued.get(&key).copied().unwrap_or(0)
+            + self.in_transit.get(&key).copied().unwrap_or(0)
+    }
+
+    /// The recipe cannot run even after the stock already on its way arrives.
+    fn short(&self, input: Input, item: ItemID) -> bool {
+        on_hand(self.market, input.destination, item) + self.incoming((input.destination, item))
+            < input.amount
+    }
+
+    fn deficit(&self, policy: DispatchPolicy, input: Input, item: ItemID) -> u32 {
+        let stock = on_hand(self.market, input.destination, item);
+        input
+            .target(policy)
+            .saturating_sub(stock.saturating_add(self.incoming((input.destination, item))))
+    }
+
     fn reserve_for_input(
         &mut self,
         policy: DispatchPolicy,
@@ -511,10 +834,7 @@ impl Matching<'_> {
         let key = (input.destination, item);
         let pending = self.queued.get(&key).copied().unwrap_or(0);
         let stock = on_hand(self.market, input.destination, item);
-        let incoming = pending + self.in_transit.get(&key).copied().unwrap_or(0);
-        let deficit = input
-            .target(policy)
-            .saturating_sub(stock.saturating_add(incoming));
+        let deficit = self.deficit(policy, input, item);
         // Allow smaller orders when some stock is queued or the recipe cannot run.
         if pending == 0 && deficit < policy.minimum && stock >= input.amount {
             return 0;
@@ -526,99 +846,17 @@ impl Matching<'_> {
         units
     }
 
-    fn warehouse_output(
-        &mut self,
-        world: &World,
-        warehouse: &mut Warehouse,
-        inputs: &BTreeMap<ItemID, Vec<Input>>,
-        staffed_producers: &BTreeMap<ItemID, Vec<Endpoint>>,
-        stations: &[Endpoint],
-    ) {
-        let source = warehouse.endpoint;
-        let Some(policy) =
-            DispatchPolicy::for_prototype(world.companies[warehouse.id].comp.proto.prototype())
-        else {
-            return;
-        };
-        if assigned_driver(world, source, warehouse.id).is_none() {
-            return;
-        }
-        for &item in &warehouse.spec.accepted_items {
-            let stock = on_hand(self.market, source, item);
-            let mut available = stock;
-            if available == 0 {
-                continue;
-            }
-            let mut candidates = inputs.get(&item).cloned().unwrap_or_default();
-            candidates.sort_unstable_by_key(|input| {
-                (
-                    on_hand(self.market, input.destination, item) >= input.amount,
-                    route_distance(self.map, source, input.destination),
-                )
-            });
-            let mut local = false;
-            for input in candidates {
-                let dest = input.destination;
-                let Some(warehouse_distance) = self.road_distance(source, dest) else {
-                    continue;
-                };
-                local = true;
-                let short = on_hand(self.market, dest, item) < input.amount;
-                let faster_direct = !short
-                    && staffed_producers
-                        .get(&item)
-                        .into_iter()
-                        .flatten()
-                        .any(|&producer| {
-                            self.road_distance(producer, dest)
-                                .is_some_and(|distance| distance <= warehouse_distance)
-                        });
-                if faster_direct {
-                    continue;
-                }
-                available -= self.reserve_for_input(policy, source, input, item, available);
-                if available == 0 {
-                    break;
-                }
-            }
+    fn route(&mut self, from: Endpoint, to: Endpoint) -> bool {
+        self.book.physical_route(self.map, from, to, self.now)
+    }
 
-            // Balanced can release inventory once its local route disappears. Explicit
-            // surplus staging keeps a full local buffer while forwarding excess.
-            let export_floor = match warehouse.policy {
-                WarehousePolicy::ReserveLocally => None,
-                WarehousePolicy::Balanced if !local => Some(warehouse.spec.low_water_units),
-                _ => Some(warehouse.spec.high_water_units),
-            };
-            if let Some(floor) =
-                export_floor.filter(|_| available > 0 && !item.prototype().optout_exttrade)
-            {
-                let units = available
-                    .min(
-                        warehouse
-                            .on_hand
-                            .saturating_sub(stock - available)
-                            .saturating_sub(floor),
-                    )
-                    .min(policy.capacity);
-                if let Some(station) = (units > 0)
-                    .then(|| self.nearest_station(source, stations))
-                    .flatten()
-                {
-                    // Keep at most one unsent export batch per item.
-                    if !self.book.shipments.values().any(|s| {
-                        s.source == source && s.destination == station && s.quantity.item == item
-                    }) {
-                        self.queue(source, station, ItemQuantity { item, units });
-                        available -= units;
-                    }
-                }
-            }
-            if available < stock {
-                warehouse.staged -= stock - available;
-                warehouse.on_hand -= stock - available;
-                self.outbound.insert((source, item));
-            }
+    fn road_distance(&mut self, from: Endpoint, to: Endpoint) -> Option<OrderedFloat<f32>> {
+        if !self.route(from, to) {
+            return None;
         }
+        self.book
+            .routes
+            .distance(self.map, from.building, to.building)
     }
 
     fn nearest_station(&mut self, from: Endpoint, stations: &[Endpoint]) -> Option<Endpoint> {
@@ -633,6 +871,124 @@ impl Matching<'_> {
             .map(|(_, station)| station)
     }
 
+    /// A staffed producer at least as close as the warehouse already holds
+    /// enough stock to cover the recipe's reorder.
+    fn direct_supply_covers(
+        &mut self,
+        producers: &[Endpoint],
+        policy: DispatchPolicy,
+        input: Input,
+        item: ItemID,
+        warehouse_distance: OrderedFloat<f32>,
+    ) -> bool {
+        let destination = input.destination;
+        if on_hand(self.market, destination, item) < input.amount {
+            return false;
+        }
+        let deficit = self.deficit(policy, input, item).max(1);
+        producers.iter().any(|&producer| {
+            on_hand(self.market, producer, item) >= deficit
+                && self
+                    .road_distance(producer, destination)
+                    .is_some_and(|distance| distance <= warehouse_distance)
+        })
+    }
+
+    fn warehouse_output(
+        &mut self,
+        warehouse: &mut Warehouse,
+        inputs: &BTreeMap<ItemID, Vec<Input>>,
+        staffed_producers: &BTreeMap<ItemID, Vec<Endpoint>>,
+        stations: &[Endpoint],
+    ) {
+        if !warehouse.staffed {
+            return;
+        }
+        let source = warehouse.endpoint;
+        let policy = warehouse.dispatch;
+        let before: BTreeMap<_, _> = warehouse
+            .items
+            .iter()
+            .map(|&item| (item, on_hand(self.market, source, item)))
+            .filter(|&(_, units)| units > 0)
+            .collect();
+        let mut stock = before.clone();
+
+        // Local recipes claim stock for every item before anything is exported.
+        let mut used_locally = BTreeSet::new();
+        for (&item, available) in &mut stock {
+            let mut candidates = inputs.get(&item).cloned().unwrap_or_default();
+            candidates.sort_unstable_by_key(|input| {
+                (
+                    on_hand(self.market, input.destination, item) >= input.amount,
+                    straight_distance(self.map, source, input.destination),
+                )
+            });
+            for input in candidates {
+                let Some(distance) = self.road_distance(source, input.destination) else {
+                    continue;
+                };
+                used_locally.insert(item);
+                if *available == 0 {
+                    break;
+                }
+                let producers = staffed_producers.get(&item).map_or(&[][..], Vec::as_slice);
+                if self.direct_supply_covers(producers, policy, input, item, distance) {
+                    continue;
+                }
+                *available -= self.reserve_for_input(policy, source, input, item, *available);
+            }
+        }
+
+        // The watermarks apply to the shared space. Items no reachable recipe
+        // uses are surplus down to the low watermark and leave first. Items
+        // local recipes use leave only from above the high watermark.
+        if warehouse.policy != WarehousePolicy::ReserveLocally {
+            let held: u32 = stock.values().sum();
+            let mut above_low = held.saturating_sub(warehouse.spec.low_water_units);
+            let mut above_high = held.saturating_sub(warehouse.spec.high_water_units);
+            let station = (above_low > 0)
+                .then(|| self.nearest_station(source, stations))
+                .flatten();
+            for local in [false, true] {
+                let Some(station) = station else {
+                    break;
+                };
+                for (&item, available) in &mut stock {
+                    if used_locally.contains(&item) != local || item.prototype().optout_exttrade {
+                        continue;
+                    }
+                    let budget = if local { above_high } else { above_low };
+                    let units = (*available).min(budget).min(policy.capacity);
+                    // Keep at most one unsent export batch per item.
+                    if units == 0
+                        || self.book.shipments.values().any(|s| {
+                            s.source == source
+                                && s.destination == station
+                                && s.quantity.item == item
+                        })
+                    {
+                        continue;
+                    }
+                    self.queue(source, station, ItemQuantity { item, units });
+                    *available -= units;
+                    above_low -= units;
+                    above_high = above_high.saturating_sub(units);
+                }
+            }
+        }
+
+        for (item, units) in before {
+            let sent = units - stock[&item];
+            if sent > 0 {
+                warehouse.on_hand -= sent;
+                warehouse.staged -= sent;
+                *warehouse.staged_items.entry(item).or_default() -= sent;
+                self.outbound.insert((source, item));
+            }
+        }
+    }
+
     fn warehouse_input(
         &mut self,
         source: Endpoint,
@@ -642,15 +998,18 @@ impl Matching<'_> {
         stations: &[Endpoint],
         mut available: u32,
     ) -> u32 {
+        // An unstaffed warehouse could not pass the stock on.
         let mut candidates: Vec<_> = warehouses
             .iter_mut()
             .filter(|warehouse| {
-                warehouse.spec.accepted_items.contains(&item)
+                warehouse.staffed
+                    && warehouse.items.contains(&item)
                     && !self.outbound.contains(&(warehouse.endpoint, item))
             })
             .collect();
-        candidates
-            .sort_unstable_by_key(|warehouse| route_distance(self.map, source, warehouse.endpoint));
+        candidates.sort_unstable_by_key(|warehouse| {
+            straight_distance(self.map, source, warehouse.endpoint)
+        });
         for warehouse in candidates {
             let dest = warehouse.endpoint;
             let room = warehouse
@@ -660,44 +1019,57 @@ impl Matching<'_> {
             if room == 0 {
                 continue;
             }
-            let replenishing = self.book.restocking.contains(&warehouse.id)
-                && inputs.iter().any(|input| {
-                    let consumer = input.destination;
-                    self.road_distance(dest, consumer).is_some_and(|local| {
-                        on_hand(self.market, consumer, item) < input.amount
-                            || self
-                                .road_distance(source, consumer)
-                                .is_none_or(|direct| local < direct)
-                    })
-                });
+            let Some(inbound) = self.road_distance(source, dest) else {
+                continue;
+            };
+            // The warehouse helps a reachable recipe that is short or closer to it.
+            let mut serves_local = false;
+            for &input in inputs {
+                let consumer = input.destination;
+                let Some(local) = self.road_distance(dest, consumer) else {
+                    continue;
+                };
+                if self.short(input, item)
+                    || self
+                        .road_distance(source, consumer)
+                        .is_none_or(|direct| local < direct)
+                {
+                    serves_local = true;
+                    break;
+                }
+            }
             let surplus = warehouse.policy == WarehousePolicy::ExportSurplus
                 && !item.prototype().optout_exttrade
-                && warehouse.staged >= warehouse.spec.high_water_units
                 && self.nearest_station(dest, stations).is_some_and(|station| {
                     let direct = self
                         .road_distance(source, station)
                         .unwrap_or(OrderedFloat(f32::INFINITY));
-                    self.road_distance(dest, station)
-                        .is_some_and(|local| local < direct)
+                    inbound < direct
                         && self
-                            .road_distance(source, dest)
-                            .is_some_and(|inbound| inbound < direct)
+                            .road_distance(dest, station)
+                            .is_some_and(|onward| onward < direct)
                 });
-            let target = if surplus {
+            let missing = warehouse.staged_items.get(&item).copied().unwrap_or(0) == 0;
+            let limit = if surplus {
                 warehouse.spec.capacity_units
-            } else if replenishing {
+            } else if serves_local && self.book.restocking.contains(&warehouse.id) {
                 warehouse.spec.high_water_units
+            } else if serves_local && missing {
+                // Space above the watermark still takes one load of a locally
+                // used item the warehouse holds none of.
+                warehouse.staged + warehouse.dispatch.capacity
             } else {
                 continue;
             };
             let units = available
-                .min(target.saturating_sub(warehouse.staged))
+                .min(limit.saturating_sub(warehouse.staged))
                 .min(room);
-            if units == 0 || self.road_distance(source, dest).is_none() {
+            if units == 0 {
                 continue;
             }
             self.queue(source, dest, ItemQuantity { item, units });
             warehouse.staged += units;
+            *warehouse.staged_items.entry(item).or_default() += units;
             warehouse.committed += units;
             available -= units;
             if warehouse.staged >= warehouse.spec.high_water_units {
@@ -708,15 +1080,6 @@ impl Matching<'_> {
             }
         }
         available
-    }
-
-    fn road_distance(&mut self, from: Endpoint, to: Endpoint) -> Option<OrderedFloat<f32>> {
-        if from == to {
-            return None;
-        }
-        self.book
-            .routes
-            .distance(self.map, from.building, to.building)
     }
 }
 
@@ -751,14 +1114,16 @@ fn match_shipments(
         .companies
         .iter()
         .filter_map(|(id, company)| {
-            let spec = company.comp.proto.prototype().storage.as_ref()?;
+            let proto = company.comp.proto.prototype();
+            let spec = proto.storage.as_ref()?;
+            let dispatch = DispatchPolicy::for_prototype(proto)?;
             let endpoint = Endpoint {
                 soul: SoulID::GoodsCompany(id),
                 building: company.comp.building,
             };
             endpoint
                 .live(world, map, infos)
-                .then_some((id, endpoint, spec))
+                .then_some((id, endpoint, spec, dispatch))
         })
         .collect();
     if sources.is_empty() && warehouse_sites.is_empty() {
@@ -771,7 +1136,7 @@ fn match_shipments(
         .chain(
             warehouse_sites
                 .iter()
-                .flat_map(|(_, _, spec)| spec.accepted_items.iter().copied()),
+                .flat_map(|(_, _, spec, _)| stored_items(spec)),
         )
         .collect();
     let mut inputs = BTreeMap::<_, Vec<Input>>::new();
@@ -825,14 +1190,6 @@ fn match_shipments(
     let mut warehouses = Vec::with_capacity(warehouse_sites.len());
     if !warehouse_sites.is_empty() {
         let mut staffed_producers = BTreeMap::<_, Vec<_>>::new();
-        let mut returnable = BTreeMap::<_, u32>::new();
-        for shipment in matching.book.shipments.values() {
-            *returnable.entry(shipment.source).or_default() += shipment.quantity.units;
-        }
-        for load in matching.book.loads.values() {
-            *returnable.entry(load.source).or_default() +=
-                load.items.iter().map(|line| line.units).sum::<u32>();
-        }
         for &(id, source, _, recipe) in &sources {
             if assigned_driver(world, source, id).is_some() {
                 for item in &recipe.production {
@@ -840,41 +1197,40 @@ fn match_shipments(
                 }
             }
         }
-        for (id, endpoint, spec) in warehouse_sites {
-            let on_hand = spec
-                .accepted_items
-                .iter()
-                .map(|&item| on_hand(matching.market, endpoint, item))
-                .sum::<u32>();
-            let incoming = spec
-                .accepted_items
-                .iter()
-                .map(|&item| {
-                    let key = (endpoint, item);
-                    matching.queued.get(&key).copied().unwrap_or(0)
-                        + matching.in_transit.get(&key).copied().unwrap_or(0)
-                })
-                .sum::<u32>();
+        for (id, endpoint, spec, dispatch) in warehouse_sites {
+            let items = stored_items(spec);
+            let mut on_hand_total = 0;
+            let mut staged_items = BTreeMap::new();
+            for &item in &items {
+                let held = on_hand(matching.market, endpoint, item);
+                on_hand_total += held;
+                staged_items.insert(item, held + matching.incoming((endpoint, item)));
+            }
+            let staged = staged_items.values().sum();
+            let committed = matching.book.warehouse_committed(
+                matching.market,
+                endpoint.soul,
+                endpoint.building,
+                spec,
+            );
             let mut warehouse = Warehouse {
                 id,
                 endpoint,
                 spec,
+                items,
                 policy: matching.book.warehouse_policy(id, spec),
-                on_hand,
-                staged: on_hand + incoming,
-                // Outbound stock can still be returned after a cancellation.
-                committed: on_hand + incoming + returnable.get(&endpoint).copied().unwrap_or(0),
+                dispatch,
+                staffed: assigned_driver(world, endpoint, id).is_some(),
+                on_hand: on_hand_total,
+                staged,
+                staged_items,
+                committed,
             };
             if !released_sources.contains(&endpoint) {
-                matching.warehouse_output(
-                    world,
-                    &mut warehouse,
-                    &inputs,
-                    &staffed_producers,
-                    &stations,
-                );
+                matching.warehouse_output(&mut warehouse, &inputs, &staffed_producers, &stations);
             }
-            if warehouse.staged < spec.low_water_units {
+            // A zero low watermark restocks once the warehouse is empty.
+            if warehouse.staged < spec.low_water_units.max(1) {
                 matching.book.restocking.insert(id);
             } else if warehouse.staged >= spec.high_water_units {
                 matching.book.restocking.remove(&id);
@@ -885,7 +1241,8 @@ fn match_shipments(
 
     for (id, source, policy, recipe) in sources {
         let has_driver = assigned_driver(world, source, id).is_some();
-        let distance = |dest| route_distance(map, source, dest);
+        let has_fleet = has_fleet(world, id);
+        let distance = |dest| straight_distance(map, source, dest);
         for output in &recipe.production {
             let item = output.id;
             if household_items().contains(&item) {
@@ -897,28 +1254,33 @@ fn match_shipments(
             if available == 0 {
                 continue;
             }
+            let mut candidates = inputs.get(&item).cloned().unwrap_or_default();
+            candidates.sort_unstable_by_key(|input| {
+                (
+                    on_hand(matching.market, input.destination, item) >= input.amount,
+                    distance(input.destination),
+                )
+            });
             let mut local = false;
-            if has_driver {
-                let mut candidates = inputs.get(&item).cloned().unwrap_or_default();
-                candidates.sort_unstable_by_key(|input| distance(input.destination));
-                for input in candidates {
-                    let dest = input.destination;
-                    if source == dest
-                        || !matching
-                            .book
-                            .routes
-                            .reaches(map, source.building, dest.building)
-                    {
-                        continue;
-                    }
-                    local = true;
-                    available -= matching.reserve_for_input(policy, source, input, item, available);
-                    if available == 0 {
-                        break;
-                    }
+            for input in candidates {
+                if !matching.route(source, input.destination) {
+                    continue;
+                }
+                local = true;
+                if !has_driver {
+                    break;
+                }
+                available -= matching.reserve_for_input(policy, source, input, item, available);
+                if available == 0 {
+                    break;
                 }
             }
 
+            // Keep one truckload on hand for the next local reorder. A firm
+            // without a truck cannot deliver it, so its stock may leave by rail.
+            if local && has_fleet {
+                available = available.saturating_sub(policy.capacity);
+            }
             if has_driver
                 && available > 0
                 && !warehouses.is_empty()
@@ -933,28 +1295,20 @@ fn match_shipments(
                     available,
                 );
             }
-
-            // Give reachable local recipes first claim. Keep stock at the depot
-            // for their next reorder before offering surplus to a station.
-            let available = available.saturating_sub(if local { policy.capacity } else { 0 });
-            let Some(station) = stations
-                .iter()
-                .copied()
-                .min_by_key(|&station| distance(station))
-                .filter(|_| available > 0)
-            else {
-                continue;
-            };
-            if item.prototype().optout_exttrade {
+            if available == 0 || item.prototype().optout_exttrade {
                 continue;
             }
-            if has_driver
-                && !world.companies[id].comp.proto.is_growable()
-                && matching
-                    .book
-                    .routes
-                    .reaches(map, source.building, station.building)
-            {
+
+            let physical_station = (has_driver && !world.companies[id].comp.proto.is_growable())
+                .then(|| {
+                    stations
+                        .iter()
+                        .copied()
+                        .filter(|&station| matching.route(source, station))
+                        .min_by_key(|&station| distance(station))
+                })
+                .flatten();
+            if let Some(station) = physical_station {
                 let pending: u32 = matching
                     .book
                     .shipments
@@ -968,7 +1322,12 @@ fn match_shipments(
                 if units != 0 {
                     matching.queue(source, station, ItemQuantity { item, units });
                 }
-            } else if available >= policy.minimum {
+            } else if let Some(station) = stations
+                .iter()
+                .copied()
+                .min_by_key(|&station| distance(station))
+                .filter(|_| available >= policy.minimum)
+            {
                 let trade =
                     matching
                         .market
@@ -990,8 +1349,11 @@ fn dispatch(
     now: u64,
     released_sources: &BTreeSet<Endpoint>,
 ) {
+    let market = resources.read::<Market>();
+    let time = resources.read::<prototypes::GameTime>();
     // Warehouses may dispatch more than one truck. An earlier ineligible route does not
-    // hold a later ready route, and shipment IDs break all FIFO ties.
+    // hold a later ready route. A destination that cannot run its recipe goes
+    // first, then the oldest shipment, and shipment IDs break all ties.
     let mut routes = BTreeMap::<_, Vec<_>>::new();
     for (&id, shipment) in &book.shipments {
         routes
@@ -999,12 +1361,20 @@ fn dispatch(
             .or_default()
             .push(id);
     }
-    let mut routes: Vec<_> = routes.into_iter().collect();
-    routes.sort_unstable_by_key(|(_, ids)| ids[0]);
-    let market = resources.read::<Market>();
-    let time = resources.read::<prototypes::GameTime>();
+    let mut routes: Vec<_> = routes
+        .into_iter()
+        .map(|((source, destination), ids)| {
+            let stocked_out = ids.iter().any(|id| {
+                let item = book.shipments[id].quantity.item;
+                destination_input(world, destination, item)
+                    .is_some_and(|input| on_hand(&market, destination, item) < input.amount)
+            });
+            ((!stocked_out, ids[0]), source, destination, ids)
+        })
+        .collect();
+    routes.sort_unstable_by_key(|&(order, ..)| order);
     let mut in_transit = book.in_transit();
-    for ((source, destination), ids) in routes {
+    for (_, source, destination, ids) in routes {
         if released_sources.contains(&source) {
             continue;
         }
@@ -1104,6 +1474,7 @@ fn dispatch(
             // Allow for loading, parking and delays in addition to travel.
             let due_after = (DELIVERY_LEAD + nominal_travel).min(DELIVERY_EXPIRY);
             let load = LoadId(book.next_token());
+            book.returning.remove(&truck);
             book.loads.insert(
                 load,
                 TruckLoad {
@@ -1118,6 +1489,7 @@ fn dispatch(
                     departed_at: now,
                     due_at: now + due_after,
                     used_truck: false,
+                    routing_error_since: None,
                 },
             );
             let human = &mut world.humans[driver];
@@ -1138,19 +1510,35 @@ fn destination_input(world: &World, destination: Endpoint, item: ItemID) -> Opti
     let SoulID::GoodsCompany(id) = destination.soul else {
         return None;
     };
-    let recipe = world.companies[id].comp.proto.prototype().recipe.as_ref()?;
+    let recipe = world
+        .companies
+        .get(id)?
+        .comp
+        .proto
+        .prototype()
+        .recipe
+        .as_ref()?;
     let input = recipe.consumption.iter().find(|input| input.id == item)?;
     Some(Input::new(destination, input.amount, recipe))
 }
 
 /// Records the station side of a virtual match. The ordinary market still
 /// owns its budget, stock and trade history.
-pub fn settle_physical_match(world: &mut World, _resources: &Resources, trade: Trade) -> bool {
+pub fn settle_physical_match(world: &mut World, resources: &Resources, trade: Trade) -> bool {
     if matches!(
         trade.buyer.0,
         SoulID::GoodsCompany(_) | SoulID::FreightStation(_)
     ) {
         record_rail_handoff(world, trade);
+    }
+    // A station import fills a recipe that local freight left short.
+    if let (SoulID::GoodsCompany(_), SoulID::FreightStation(_)) = (trade.buyer.0, trade.seller.0) {
+        let now = elapsed_ticks(resources).0;
+        resources
+            .write::<CargoBook>()
+            .day_mut(now)
+            .receipt_mut(trade.buyer.0, trade.kind)
+            .station_units += trade.qty.max(0) as u64;
     }
     false
 }
@@ -1176,6 +1564,66 @@ fn post_freight_trade(world: &mut World, resources: &Resources, trade: Trade) {
     resources.write::<EcoStats>().record_trade(&trade);
 }
 
+/// Every binding a verified unload requires, checked in order.
+#[allow(clippy::too_many_arguments)]
+fn check_unload(
+    world: &World,
+    resources: &Resources,
+    manifest: &TruckLoad,
+    load: LoadId,
+    driver: HumanID,
+    truck: VehicleID,
+    at: BuildingID,
+    now: u64,
+) -> Result<(), DeliveryRejection> {
+    use DeliveryRejection::*;
+
+    let map = resources.read::<Map>();
+    let infos = resources.read::<BuildingInfos>();
+    let same_trip =
+        manifest.driver == driver && manifest.vehicle == truck && manifest.destination() == at;
+    let ends_live =
+        manifest.source.live(world, &map, &infos) && manifest.destination.live(world, &map, &infos);
+    let human = world.humans.get(driver);
+    let driver_inside = human.is_some_and(|human| {
+        human.location == Location::Building(at) && human.router.selected_vehicle() == Some(truck)
+    });
+    let holds_load = human
+        .and_then(|human| human.work.as_ref())
+        .is_some_and(|work| {
+            work.workplace == manifest.source.building
+                && matches!(work.kind, WorkKind::Driver {
+                    truck: assigned,
+                    load: Some(token),
+                    deliver_order: Some(dest),
+                } if assigned == truck && token == load && dest == at)
+        })
+        && matches!(manifest.source.soul, SoulID::GoodsCompany(id)
+            if owns_assignment(world, manifest.source, id, driver, truck));
+    let truck_parked = world
+        .vehicles
+        .get(truck)
+        .is_some_and(|entity| entity.vehicle.state.is_parked());
+
+    if !same_trip {
+        Err(WrongTrip)
+    } else if !manifest.used_truck {
+        Err(TruckNotUsed)
+    } else if now >= manifest.departed_at + DELIVERY_EXPIRY {
+        Err(Expired)
+    } else if !ends_live {
+        Err(EndpointGone)
+    } else if !driver_inside {
+        Err(DriverNotAtDestination)
+    } else if !holds_load {
+        Err(AssignmentChanged)
+    } else if !truck_parked {
+        Err(TruckNotParked)
+    } else {
+        Ok(())
+    }
+}
+
 /// Unload after the assigned driver rode the assigned truck to the live recipient.
 pub fn complete_delivery(
     sim: &mut Simulation,
@@ -1183,42 +1631,38 @@ pub fn complete_delivery(
     driver: HumanID,
     truck: VehicleID,
     at: BuildingID,
-) -> bool {
+) -> Result<(), DeliveryRejection> {
     let (world, resources) = sim.world_res();
     let mut book = resources.write::<CargoBook>();
-    let Some(manifest) = book.loads.get(&load) else {
-        return false;
-    };
     let now = elapsed_ticks(resources).0;
-    if manifest.driver != driver || manifest.vehicle != truck || manifest.destination() != at
-        || !manifest.used_truck || now >= manifest.departed_at + DELIVERY_EXPIRY
-        || !manifest.destination.live(world, &resources.read::<Map>(), &resources.read::<BuildingInfos>())
-        || !manifest.source.live(world, &resources.read::<Map>(), &resources.read::<BuildingInfos>())
-        || !world.humans.get(driver).is_some_and(|human| {
-            human.location == Location::Building(at)
-                && human.router.selected_vehicle() == Some(truck)
-                && human.work.as_ref().is_some_and(|work| {
-                    work.workplace == manifest.source.building && matches!(work.kind,
-                        WorkKind::Driver { truck: assigned, load: Some(token), deliver_order: Some(dest) }
-                        if assigned == truck && token == load && dest == at)
-                })
-        })
-        || !world.vehicles.get(truck).is_some_and(|entity| entity.vehicle.state.is_parked())
-        || !matches!(manifest.source.soul, SoulID::GoodsCompany(id)
-            if owns_assignment(world, manifest.source, id, driver, truck))
-    {
-        return false;
-    }
+    let manifest = book
+        .loads
+        .get(&load)
+        .ok_or(DeliveryRejection::UnknownLoad)?;
+    check_unload(world, resources, manifest, load, driver, truck, at, now)?;
 
     let manifest = book.loads.remove(&load).unwrap();
     clear_assignment(world, &manifest, load);
+    book.returning.insert(
+        truck,
+        EmptyReturn {
+            driver,
+            depot: manifest.source,
+            started_at: now,
+            routing_error_since: None,
+        },
+    );
     let mut market = resources.write::<Market>();
-    let units = manifest.items.iter().map(|line| line.units).sum();
-    for ItemQuantity { item, units } in manifest.items {
+    let units = manifest.units();
+    let late = now > manifest.due_at;
+    for &ItemQuantity { item, units } in &manifest.items {
         let trade = if matches!(manifest.destination.soul, SoulID::FreightStation(_)) {
             market.freight_export(manifest.source.soul, manifest.destination.soul, item, units)
         } else {
             market.receive_freight(manifest.destination.soul, item, units);
+            book.day_mut(now)
+                .receipt_mut(manifest.destination.soul, item)
+                .road_units += u64::from(units);
             Trade {
                 buyer: TradeTarget(manifest.destination.soul),
                 seller: TradeTarget(manifest.source.soul),
@@ -1229,8 +1673,38 @@ pub fn complete_delivery(
         };
         post_freight_trade(world, resources, trade);
     }
-    super::record_freight_outcome(resources, now, units, now > manifest.due_at);
-    true
+    book.day_mut(now).record_delivery(units, late);
+    super::record_freight_outcome(resources, now, units, late);
+    Ok(())
+}
+
+/// Settles a load at its destination. A refused unload cancels the load: its
+/// stock returns to the source, the truck goes back to its depot and the
+/// reason is logged and counted.
+pub(crate) fn deliver_load(
+    sim: &mut Simulation,
+    load: LoadId,
+    driver: HumanID,
+    truck: VehicleID,
+    at: BuildingID,
+) {
+    let reason = match complete_delivery(sim, load, driver, truck, at) {
+        Ok(()) | Err(DeliveryRejection::UnknownLoad) => return,
+        Err(reason) => reason,
+    };
+    log::warn!("freight load {load:?} refused at {at:?}: {reason:?}");
+    let (world, resources) = sim.world_res();
+    let mut book = resources.write::<CargoBook>();
+    let now = elapsed_ticks(resources).0;
+    book.day_mut(now).refused_unloads += 1;
+    release(
+        &mut book,
+        world,
+        resources,
+        Vec::new(),
+        vec![load],
+        Release::Cancelled,
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -1245,23 +1719,27 @@ pub(crate) fn cancel_removed(sim: &mut Simulation, removal: CargoRemoval) {
     let (world, resources) = sim.world_res();
     let mut book = resources.write::<CargoBook>();
     if let CargoRemoval::Building(building) = removal {
-        book.routes
-            .by_building
-            .retain(|&(a, b), _| a != building && b != building);
+        book.routes.forget(building);
     }
     let endpoint = |end: Endpoint| match removal {
         CargoRemoval::Building(id) => end.building == id,
         CargoRemoval::Soul(id) => end.soul == id,
         _ => false,
     };
-    let shipments = book.shipments.iter()
+    let shipments = book
+        .shipments
+        .iter()
         .filter_map(|(&id, s)| {
             let source_affected = match s.source.soul {
-                SoulID::GoodsCompany(company) => world.companies.get(company).is_some_and(|entity| {
-                    entity.comp.proto.prototype().storage.is_none()
-                        && (matches!(removal, CargoRemoval::Driver(driver) if entity.comp.driver == Some(driver))
-                            || matches!(removal, CargoRemoval::Truck(truck) if entity.comp.trucks.contains(&truck)))
-                }),
+                SoulID::GoodsCompany(company) => {
+                    world.companies.get(company).is_some_and(|entity| {
+                        entity.comp.proto.prototype().storage.is_none()
+                            && (matches!(removal, CargoRemoval::Driver(driver)
+                                if entity.comp.driver == Some(driver))
+                                || matches!(removal, CargoRemoval::Truck(truck)
+                                if entity.comp.trucks.contains(&truck)))
+                    })
+                }
                 _ => false,
             };
             (source_affected || endpoint(s.source) || endpoint(s.destination)).then_some(id)
@@ -1278,7 +1756,14 @@ pub(crate) fn cancel_removed(sim: &mut Simulation, removal: CargoRemoval) {
             .then_some(id)
         })
         .collect();
-    release(&mut book, world, resources, shipments, loads);
+    release(
+        &mut book,
+        world,
+        resources,
+        shipments,
+        loads,
+        Release::Cancelled,
+    );
 }
 
 fn clear_assignment(world: &mut World, manifest: &TruckLoad, token: LoadId) {
@@ -1308,6 +1793,7 @@ fn release(
     resources: &Resources,
     shipments: Vec<ShipmentId>,
     loads: Vec<LoadId>,
+    reason: Release,
 ) {
     if shipments.is_empty() && loads.is_empty() {
         return;
@@ -1339,12 +1825,64 @@ fn release(
             .exec_ent(driver, move |sim| {
                 crate::souls::lifecycle::abort_freight_trip(sim, driver, truck, id, used_truck);
             });
-        super::record_freight_outcome(
-            resources,
-            now,
-            load.items.iter().map(|line| line.units).sum(),
-            true,
-        );
+        let day = book.day_mut(now);
+        match reason {
+            Release::Cancelled => day.record_cancellation(load.units()),
+            Release::Withdrawn => day.withdrawn_loads += 1,
+        }
+    }
+}
+
+/// A route error, or a failed reroute of the driver or of the truck they ride.
+fn routing_failed(human: &HumanEnt, vehicle: &crate::VehicleEnt, truck: VehicleID) -> bool {
+    let rerouting = |it: &Itinerary| it.is_wait_for_reroute().is_some_and(|wait| wait > 0);
+    human.router.last_error.is_some()
+        || rerouting(&human.it)
+        || (human.location == Location::Vehicle(truck) && rerouting(&vehicle.it))
+}
+
+/// Follows empty trucks home. A return leg that keeps failing, or outlasts a
+/// delivery window, gives the truck back to its depot and frees the driver.
+fn track_returns(book: &mut CargoBook, world: &World, resources: &Resources, now: u64) {
+    let mut stranded = Vec::new();
+    book.returning.retain(|&truck, trip| {
+        let (Some(human), Some(vehicle)) =
+            (world.humans.get(trip.driver), world.vehicles.get(truck))
+        else {
+            return false;
+        };
+        let still_assigned = human.work.as_ref().is_some_and(|work| {
+            work.workplace == trip.depot.building
+                && matches!(work.kind, WorkKind::Driver { truck: assigned, load: None, .. }
+                    if assigned == truck)
+        });
+        let home = human.location == Location::Building(trip.depot.building)
+            && vehicle.vehicle.state.is_parked();
+        if !still_assigned || home {
+            return false;
+        }
+        let homebound =
+            human.router.target_dest == Some(Destination::Building(trip.depot.building));
+        if homebound && routing_failed(human, vehicle, truck) {
+            trip.routing_error_since.get_or_insert(now);
+        } else {
+            trip.routing_error_since = None;
+        }
+        let gave_up = trip
+            .routing_error_since
+            .is_some_and(|since| now >= since + ROUTING_RETRY_WINDOW);
+        if gave_up || now >= trip.started_at + DELIVERY_EXPIRY {
+            stranded.push((trip.driver, truck));
+            return false;
+        }
+        true
+    });
+    let commands = resources.read::<ParCommandBuffer<HumanEnt>>();
+    for (driver, truck) in stranded {
+        log::warn!("empty freight truck {truck:?} could not return to its depot; recalling it");
+        commands.exec_ent(driver, move |sim| {
+            crate::souls::lifecycle::recover_empty_truck(sim, driver, truck);
+        });
     }
 }
 
@@ -1353,7 +1891,8 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
     let now = elapsed_ticks(resources).0;
     let mut book = resources.write::<CargoBook>();
     let match_due = now % FREIGHT_MATCH_INTERVAL == 0;
-    if !match_due && book.loads.is_empty() && book.shipments.is_empty() {
+    if !match_due && book.loads.is_empty() && book.shipments.is_empty() && book.returning.is_empty()
+    {
         return;
     }
     let map = resources.read::<Map>();
@@ -1367,7 +1906,7 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
     };
     let check_queued =
         match_due || book.routes.revision != (map.identity(), map.walking_topology_generation);
-    let shipments: Vec<_> = book
+    let mut shipments: BTreeSet<_> = book
         .shipments
         .iter()
         .filter(|_| check_queued)
@@ -1379,6 +1918,7 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
             .then_some(id)
         })
         .collect();
+    let mut failed_routes = BTreeSet::new();
     let loads: Vec<_> = book
         .loads
         .iter_mut()
@@ -1392,40 +1932,63 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
             load.used_truck |= human.location == Location::Vehicle(load.vehicle);
             let outbound =
                 human.router.target_dest == Some(Destination::Building(load.destination()));
-            let road_failed = outbound
-                && (human.router.last_error.is_some()
-                    || human.it.is_wait_for_reroute().is_some_and(|wait| wait > 0)
-                    || (human.location == Location::Vehicle(load.vehicle)
-                        && vehicle
-                            .it
-                            .is_wait_for_reroute()
-                            .is_some_and(|wait| wait > 0)));
+            if outbound && routing_failed(human, vehicle, load.vehicle) {
+                let since = *load.routing_error_since.get_or_insert(now);
+                if now >= since + ROUTING_RETRY_WINDOW {
+                    failed_routes.insert((load.source, load.destination));
+                    return Some(id);
+                }
+            } else {
+                load.routing_error_since = None;
+            }
+            let holds_load = human.work.as_ref().is_some_and(|work| {
+                matches!(work.kind, WorkKind::Driver {
+                    load: Some(token),
+                    deliver_order: Some(dest),
+                    ..
+                } if token == id && dest == load.destination())
+            });
+            let assigned = matches!(load.source.soul, SoulID::GoodsCompany(company)
+                if owns_assignment(world, load.source, company, load.driver, load.vehicle));
             (now >= load.departed_at + DELIVERY_EXPIRY
-                || road_failed
                 || !valid(&mut book.routes, load.source, load.destination)
-                || !matches!(load.source.soul, SoulID::GoodsCompany(company)
-                if owns_assignment(world, load.source, company, load.driver, load.vehicle))
-                || !human.work.as_ref().is_some_and(|work| {
-                    matches!(work.kind,
-                WorkKind::Driver { load: Some(token), deliver_order: Some(dest), .. }
-                if token == id && dest == load.destination())
-                }))
-            .then_some(id)
+                || !assigned
+                || !holds_load)
+                .then_some(id)
         })
         .collect();
+    // Stock queued on a route that gave up is released with it, and the route
+    // waits out its cooldown so the next match can choose another lane.
+    for &(source, destination) in &failed_routes {
+        log::warn!("freight route {source:?} -> {destination:?} kept failing; suspending it");
+        book.suspend_route(&map, source, destination, now);
+        shipments.extend(book.shipments.iter().filter_map(|(&id, shipment)| {
+            (shipment.source == source && shipment.destination == destination).then_some(id)
+        }));
+    }
     let released_sources = shipments
         .iter()
         .map(|id| book.shipments[id].source)
         .chain(loads.iter().map(|id| book.loads[id].source))
         .collect();
-    release(book, world, resources, shipments, loads);
+    release(
+        book,
+        world,
+        resources,
+        shipments.into_iter().collect(),
+        loads,
+        Release::Cancelled,
+    );
+    track_returns(book, world, resources, now);
     if match_due {
+        book.suspended.retain(|_, route| now < route.until);
         match_shipments(book, world, resources, &map, &infos, now, &released_sources);
         if !book.shipments.is_empty() {
             dispatch(book, world, resources, &map, now, &released_sources);
         }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1449,8 +2012,9 @@ mod tests {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
-    use crate::economy::DailyEconomyMetrics;
+    use crate::economy::{DailyEconomyMetrics, FreightReceipt};
     use crate::map::BuildingKind;
+    use crate::map_dynamic::RouterError;
     use crate::souls::desire::Work;
     use crate::souls::goods_company::company_soul;
     use crate::souls::human::spawn_human;
@@ -1629,8 +2193,17 @@ mod lifecycle_tests {
     }
 
     fn place_warehouse(f: &mut Fixture, spec: &GoodsCompanyPrototype, center: Vec2) -> Endpoint {
-        let proto = spec.id;
         let road = f.ctx.g.map().buildings()[f.destination.building].connected_road;
+        place_warehouse_on(f, spec, center, road)
+    }
+
+    fn place_warehouse_on(
+        f: &mut Fixture,
+        spec: &GoodsCompanyPrototype,
+        center: Vec2,
+        road: Option<crate::map::RoadID>,
+    ) -> Endpoint {
+        let proto = spec.id;
         let building = f
             .ctx
             .g
@@ -1691,8 +2264,8 @@ mod lifecycle_tests {
         };
         human.location = Location::Building(at);
         human.router.use_vehicle(Some(truck));
-        assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, at));
-        assert!(!complete_delivery(&mut f.ctx.g, token, driver, truck, at));
+        assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, at).is_ok());
+        assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, at).is_err());
         f.ctx.g.world_mut_unchecked().humans[driver].location = Location::Building(origin);
     }
 
@@ -1974,13 +2547,7 @@ mod lifecycle_tests {
             fixture.ctx.g.read::<CargoBook>().stock_for(destination)[&Fixture::coal()].incoming,
             25
         );
-        assert!(!complete_delivery(
-            &mut fixture.ctx.g,
-            load,
-            driver,
-            truck,
-            destination
-        ));
+        assert!(complete_delivery(&mut fixture.ctx.g, load, driver, truck, destination).is_err());
 
         for _ in 0..5_000 {
             fixture.ctx.tick_fast();
@@ -2011,13 +2578,7 @@ mod lifecycle_tests {
         assert_eq!(fixture.manifest_units(), 0);
         assert_eq!(fixture.reserved(), 9);
         assert_eq!(fixture.ctx.g.hashes(), resumed.hashes());
-        assert!(!complete_delivery(
-            &mut fixture.ctx.g,
-            load,
-            driver,
-            truck,
-            destination
-        ));
+        assert!(complete_delivery(&mut fixture.ctx.g, load, driver, truck, destination).is_err());
         let metrics = fixture.ctx.g.read::<DailyEconomyMetrics>();
         assert_eq!(metrics.days[&0].loads, Some(1));
         assert_eq!(metrics.days[&0].load_units, Some(16));
@@ -2135,9 +2696,12 @@ mod lifecycle_tests {
     }
 
     fn station(f: &mut Fixture, connected: bool) -> Endpoint {
-        let road = f.ctx.g.map().buildings()[f.destination.building].connected_road;
+        let road = road_along(f, None, Some(500.0));
+        station_at(f, vec2(370.0, 467.0), Some(road).filter(|_| connected))
+    }
+
+    fn station_at(f: &mut Fixture, position: Vec2, road: Option<crate::map::RoadID>) -> Endpoint {
         let proto = prototypes::FreightStationPrototypeID::new("freight-station");
-        let position = vec2(370.0, 467.0);
         let building = f
             .ctx
             .g
@@ -2149,7 +2713,7 @@ mod lifecycle_tests {
                     vertical_factor: 1.0,
                 },
                 None,
-                road.filter(|_| connected),
+                road,
             )
             .unwrap();
         f.ctx.g.write::<BuildingInfos>().insert(building);
@@ -2226,23 +2790,20 @@ mod lifecycle_tests {
                 let human = &mut f.ctx.g.world_mut_unchecked().humans[driver];
                 human.location = Location::Building(at);
                 human.router.use_vehicle(Some(truck));
-                assert!(!complete_delivery(
-                    &mut f.ctx.g,
-                    token,
-                    driver,
-                    VehicleID::default(),
-                    at
-                ));
+                assert!(
+                    complete_delivery(&mut f.ctx.g, token, driver, VehicleID::default(), at)
+                        .is_err()
+                );
                 f.ctx
                     .g
                     .write::<BuildingInfos>()
                     .set_owner(at, f.destination.soul);
-                assert!(!complete_delivery(&mut f.ctx.g, token, driver, truck, at));
+                assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, at).is_err());
                 f.ctx
                     .g
                     .write::<BuildingInfos>()
                     .set_owner(at, terminal.soul);
-                assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, at));
+                assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, at).is_ok());
                 assert_eq!(f.ctx.g.get(station).unwrap().f.waiting_cargo, 16);
                 let expected = f
                     .ctx
@@ -2251,7 +2812,7 @@ mod lifecycle_tests {
                     .freight_export(f.source.soul, terminal.soul, Fixture::coal(), 16)
                     .money_delta;
                 assert_eq!(export(&f) - before, i128::from(expected.0));
-                assert!(!complete_delivery(&mut f.ctx.g, token, driver, truck, at));
+                assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, at).is_err());
                 assert_eq!(f.ctx.g.get(station).unwrap().f.waiting_cargo, 16);
             }
         }
@@ -2294,5 +2855,552 @@ mod lifecycle_tests {
         );
         assert_eq!(load.destination(), f.destination.building);
         assert_eq!(book.stock_for(terminal.building)[&flour].incoming, 16);
+    }
+
+    fn road_along(f: &Fixture, x: Option<f32>, y: Option<f32>) -> crate::map::RoadID {
+        let map = f.ctx.g.map();
+        map.roads()
+            .iter()
+            .find(|(_, road)| {
+                let (a, b) = (road.points().first(), road.points().last());
+                x.is_none_or(|x| a.x == x && b.x == x) && y.is_none_or(|y| a.y == y && b.y == y)
+            })
+            .unwrap()
+            .0
+    }
+
+    fn incoming(f: &Fixture, building: BuildingID, item: ItemID) -> u32 {
+        f.ctx
+            .g
+            .read::<CargoBook>()
+            .stock_for(building)
+            .get(&item)
+            .map_or(0, |stock| stock.incoming)
+    }
+
+    fn mine_policy() -> DispatchPolicy {
+        DispatchPolicy::for_prototype(GoodsCompanyID::new("coal-mine").prototype()).unwrap()
+    }
+
+    fn plant_target(f: &Fixture) -> i32 {
+        destination_input(f.ctx.g.world(), f.destination, Fixture::coal())
+            .unwrap()
+            .target(mine_policy()) as i32
+    }
+
+    fn set_router(f: &mut Fixture, vehicle: VehicleID, to: BuildingID, error: Option<RouterError>) {
+        let human = &mut f.ctx.g.world_mut_unchecked().humans[f.driver];
+        human.router.use_vehicle(Some(vehicle));
+        human.router.go_to(Destination::Building(to));
+        human.router.last_error = error;
+    }
+
+    fn drain_commands(f: &mut Fixture) {
+        ParCommandBuffer::<HumanEnt>::apply(&mut f.ctx.g);
+        ParCommandBuffer::<VehicleEnt>::apply(&mut f.ctx.g);
+    }
+
+    #[test]
+    fn e2fix_failed_empty_return_releases_the_driver_and_keeps_the_truck_usable() {
+        use crate::souls::human::HumanDecisionKind;
+
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let (driver, truck) = (f.driver, f.truck);
+        let (source, destination) = (f.source.building, f.destination.building);
+        let token = f.token();
+        f.ctx
+            .g
+            .write::<CargoBook>()
+            .loads
+            .get_mut(&token)
+            .unwrap()
+            .used_truck = true;
+        {
+            let human = &mut f.ctx.g.world_mut_unchecked().humans[driver];
+            human.location = Location::Building(destination);
+            human.router.use_vehicle(Some(truck));
+        }
+        assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, destination).is_ok());
+
+        // The empty leg back to the depot cannot be planned.
+        let personal = f.ctx.g.world().humans[driver].router.personal_car;
+        f.ctx.g.world_mut_unchecked().humans[driver].decision.kind =
+            HumanDecisionKind::MultiStack(vec![
+                HumanDecisionKind::SetVehicle(personal),
+                HumanDecisionKind::GoTo(Destination::Building(source)),
+            ]);
+        set_router(&mut f, truck, source, Some(RouterError::LocatingVehicle));
+        let failed = 2 * FREIGHT_MATCH_INTERVAL;
+        f.update(failed);
+        f.update(failed + 30 * TICKS_PER_MINUTE);
+        drain_commands(&mut f);
+        let human = &f.ctx.g.world().humans[driver];
+        assert!(
+            !matches!(human.decision.kind, HumanDecisionKind::MultiStack(_)),
+            "the stranded return is abandoned"
+        );
+        assert_ne!(human.router.selected_vehicle(), Some(truck));
+        assert!(human.router.target_dest.is_none());
+
+        // Once the driver is back at the depot, the fleet takes the next batch.
+        f.ctx.g.world_mut_unchecked().humans[driver].location = Location::Building(source);
+        let delivered = f.hand(f.destination);
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(f.destination.soul, Fixture::coal(), -delivered);
+        f.seed(16, 0);
+        f.update(failed + 31 * TICKS_PER_MINUTE);
+        let book = f.ctx.g.read::<CargoBook>();
+        assert_eq!(book.loads.len(), 1);
+        assert!(book.loads.values().all(|load| load.source() == source));
+    }
+
+    #[test]
+    fn e2fix_outbound_router_errors_retry_before_cancelling_then_use_the_station() {
+        use crate::map_dynamic::ParkingReserveError;
+
+        let mut f = Fixture::new();
+        let terminal = station(&mut f, false);
+        let SoulID::FreightStation(station) = terminal.soul else {
+            unreachable!()
+        };
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(f.manifest_units(), 16);
+        let (truck, destination) = (f.truck, f.destination.building);
+        let full = Some(RouterError::ReservingParkingSpot(
+            ParkingReserveError::NoSpotFoundAfterSearch,
+        ));
+        let start = FREIGHT_MATCH_INTERVAL + 1;
+        set_router(&mut f, truck, destination, full);
+        f.update(start);
+        f.update(start + TICKS_PER_MINUTE);
+        assert_eq!(f.manifest_units(), 16, "a full car park is retried");
+        set_router(&mut f, truck, destination, None);
+        f.update(start + 2 * TICKS_PER_MINUTE);
+        set_router(&mut f, truck, destination, full);
+        f.update(start + 3 * TICKS_PER_MINUTE);
+        f.update(start + 6 * TICKS_PER_MINUTE);
+        assert_eq!(
+            f.manifest_units(),
+            16,
+            "a cleared error restarts the window"
+        );
+        f.update(start + 30 * TICKS_PER_MINUTE);
+        assert_eq!((f.manifest_units(), f.hand(f.source)), (0, 16));
+
+        // The failing route is not reserved again. The batch uses the station.
+        set_router(&mut f, truck, destination, None);
+        f.update(FREIGHT_MATCH_INTERVAL + 31 * TICKS_PER_MINUTE);
+        assert_eq!(
+            (f.manifest_units(), f.reserved(), f.hand(f.source)),
+            (0, 0, 0)
+        );
+        assert_eq!(f.ctx.g.get(station).unwrap().f.waiting_cargo, 16);
+    }
+
+    #[test]
+    fn e2fix_demolition_writes_off_on_hand_queued_and_loaded_freight_once() {
+        for destination_first in [true, false] {
+            let mut f = Fixture::new();
+            f.seed(100, 1);
+            f.update(FREIGHT_MATCH_INTERVAL);
+            assert_eq!(f.manifest_units(), 16);
+            assert!(f.reserved() > 0 && f.hand(f.source) > 0);
+            let (mut first, mut second) = (f.destination.building, f.source.building);
+            if !destination_first {
+                std::mem::swap(&mut first, &mut second);
+            }
+            for building in [first, second] {
+                f.ctx.apply(&[WorldCommand::MapRemoveBuilding(building)]);
+                f.ctx.tick_fast();
+            }
+            f.ctx.tick_fast();
+            let losses = f
+                .ctx
+                .g
+                .read::<Market>()
+                .seller_losses()
+                .get(&Fixture::coal())
+                .copied();
+            assert_eq!(losses, Some(101), "destination first: {destination_first}");
+        }
+    }
+
+    #[test]
+    fn e2fix_exports_skip_a_closer_station_without_road_access() {
+        let mut f = Fixture::new();
+        f.ctx
+            .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+        let far = station(&mut f, true);
+        let near = station_at(&mut f, vec2(330.0, 200.0), None);
+        let SoulID::FreightStation(near_id) = near.soul else {
+            unreachable!()
+        };
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(f.source.soul, Fixture::coal(), 16);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(f.ctx.g.get(near_id).unwrap().f.waiting_cargo, 0);
+        let book = f.ctx.g.read::<CargoBook>();
+        assert_eq!(
+            book.manifest_for(f.truck).map(TruckLoad::destination),
+            Some(far.building)
+        );
+    }
+
+    #[test]
+    fn e2fix_dispatch_serves_a_stocked_out_destination_before_an_older_route() {
+        let mut f = Fixture::with_companies("flour-factory", "bakery");
+        let terminal = station(&mut f, true);
+        let flour = ItemID::new("flour");
+        {
+            let mut market = f.ctx.g.write::<Market>();
+            market.produce(f.source.soul, flour, 32);
+            let mut book = f.ctx.g.write::<CargoBook>();
+            for (destination, reserved_at) in [(terminal, 0), (f.destination, 1)] {
+                book.reserve(
+                    &mut market,
+                    Shipment {
+                        source: f.source,
+                        destination,
+                        quantity: ItemQuantity {
+                            item: flour,
+                            units: 16,
+                        },
+                        reserved_at,
+                    },
+                );
+            }
+        }
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let book = f.ctx.g.read::<CargoBook>();
+        assert_eq!(
+            book.manifest_for(f.truck).map(TruckLoad::destination),
+            Some(f.destination.building)
+        );
+    }
+
+    #[test]
+    fn e2fix_cancelled_loads_are_not_counted_as_delivered_volume() {
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        f.update(FREIGHT_MATCH_INTERVAL + DELIVERY_EXPIRY);
+        assert_eq!((f.manifest_units(), f.hand(f.source)), (0, 16));
+        let metrics = f.ctx.g.read::<DailyEconomyMetrics>();
+        let day = metrics.days.get(&0);
+        assert_eq!(day.and_then(|day| day.loads).unwrap_or(0), 0);
+        assert_eq!(day.and_then(|day| day.load_units).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn e2fix_route_cache_follows_a_changed_building_road_connection() {
+        let mut f = Fixture::new();
+        f.ctx
+            .build_roads(&[vec3(700.0, 100.0, 0.0), vec3(900.0, 100.0, 0.0)]);
+        let isolated = road_along(&f, None, Some(100.0));
+        let isolated = if f.ctx.g.map().roads()[isolated].points().first().x >= 700.0 {
+            isolated
+        } else {
+            let map = f.ctx.g.map();
+            map.roads()
+                .iter()
+                .find(|(_, road)| road.points().first().x >= 700.0)
+                .unwrap()
+                .0
+        };
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(f.manifest_units(), 16);
+        f.ctx.g.map_mut().buildings[f.destination.building].connected_road = Some(isolated);
+        f.update(FREIGHT_MATCH_INTERVAL + 1);
+        assert_eq!((f.manifest_units(), f.hand(f.source)), (0, 16));
+    }
+
+    #[test]
+    fn e2fix_balanced_depot_exports_unused_stock_before_locally_demanded_stock() {
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        warehouse_driver(&mut f, depot);
+        let terminal = station(&mut f, true);
+        let target = plant_target(&f);
+        f.seed(0, target);
+        let flour = ItemID::new("flour");
+        {
+            let mut market = f.ctx.g.write::<Market>();
+            market.produce(depot.soul, Fixture::coal(), 40);
+            market.produce(depot.soul, flour, 20);
+        }
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(incoming(&f, terminal.building, Fixture::coal()), 0);
+        assert_eq!(incoming(&f, terminal.building, flour), 16);
+    }
+
+    #[test]
+    fn e2fix_depot_supplies_a_consumer_when_the_closer_producer_is_empty() {
+        let mut f = Fixture::new();
+        let north = f.ctx.g.map().buildings()[f.source.building].connected_road;
+        let depot = place_warehouse_on(
+            &mut f,
+            GoodsCompanyID::new("small-depot").prototype(),
+            vec2(310.0, 142.0),
+            north,
+        );
+        warehouse_driver(&mut f, depot);
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(depot.soul, Fixture::coal(), 48);
+        let amount = destination_input(f.ctx.g.world(), f.destination, Fixture::coal())
+            .unwrap()
+            .amount;
+        f.seed(0, amount as i32);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert!(incoming(&f, f.destination.building, Fixture::coal()) > 0);
+    }
+
+    #[test]
+    fn e2fix_only_staffed_depots_take_producer_stock() {
+        let mut f = Fixture::new();
+        let idle = warehouse(&mut f, "small-depot");
+        let staffed = place_warehouse(
+            &mut f,
+            GoodsCompanyID::new("small-depot").prototype(),
+            vec2(150.0, 450.0),
+        );
+        warehouse_driver(&mut f, staffed);
+        let target = plant_target(&f);
+        f.seed(100, target);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert!(f
+            .ctx
+            .g
+            .read::<CargoBook>()
+            .stock_for(idle.building)
+            .is_empty());
+        assert!(incoming(&f, staffed.building, Fixture::coal()) > 0);
+    }
+
+    #[test]
+    fn e2fix_policy_withdrawal_is_not_a_late_delivery() {
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        let (_, truck) = warehouse_driver(&mut f, depot);
+        station(&mut f, true);
+        f.ctx
+            .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(depot.soul, Fixture::coal(), 64);
+        f.ctx.apply(&[WorldCommand::SetWarehousePolicy {
+            building: depot.building,
+            policy: WarehousePolicy::ExportSurplus,
+        }]);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert!(f.ctx.g.read::<CargoBook>().manifest_for(truck).is_some());
+        f.ctx.apply(&[WorldCommand::SetWarehousePolicy {
+            building: depot.building,
+            policy: WarehousePolicy::ReserveLocally,
+        }]);
+        assert!(f.ctx.g.read::<CargoBook>().manifest_for(truck).is_none());
+        let metrics = f.ctx.g.read::<DailyEconomyMetrics>();
+        let day = metrics.days.get(&0);
+        assert_eq!(day.and_then(|day| day.loads).unwrap_or(0), 0);
+        assert_eq!(day.and_then(|day| day.late_loads).unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn e2fix_a_full_depot_still_takes_a_missing_locally_used_item() {
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        warehouse_driver(&mut f, depot);
+        f.ctx.apply(&[WorldCommand::SetWarehousePolicy {
+            building: depot.building,
+            policy: WarehousePolicy::ReserveLocally,
+        }]);
+        f.seed(200, 0);
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(depot.soul, ItemID::new("goods"), 48);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(incoming(&f, depot.building, Fixture::coal()), 16);
+    }
+
+    #[test]
+    fn e2fix_an_empty_export_depot_stages_a_terminal_only_route() {
+        let mut f = Fixture::new();
+        let west = road_along(&f, Some(100.0), None);
+        f.ctx
+            .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+        station(&mut f, true);
+        let depot = place_warehouse_on(
+            &mut f,
+            GoodsCompanyID::new("small-depot").prototype(),
+            vec2(142.0, 315.0),
+            Some(west),
+        );
+        warehouse_driver(&mut f, depot);
+        f.ctx.apply(&[WorldCommand::SetWarehousePolicy {
+            building: depot.building,
+            policy: WarehousePolicy::ExportSurplus,
+        }]);
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(f.source.soul, Fixture::coal(), 32);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(incoming(&f, depot.building, Fixture::coal()), 32);
+    }
+
+    #[test]
+    fn e2fix_warehouse_policy_latch_and_loads_survive_a_save() {
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        warehouse_driver(&mut f, depot);
+        station(&mut f, true);
+        f.ctx.apply(&[WorldCommand::SetWarehousePolicy {
+            building: depot.building,
+            policy: WarehousePolicy::ExportSurplus,
+        }]);
+        let target = plant_target(&f);
+        f.seed(40, target);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let resumed: Simulation = Bincode::decode(&Bincode::encode(&f.ctx.g).unwrap()).unwrap();
+        assert_eq!(f.ctx.g.hashes(), resumed.hashes());
+        let (book, saved) = (f.ctx.g.read::<CargoBook>(), resumed.read::<CargoBook>());
+        let SoulID::GoodsCompany(company) = depot.soul else {
+            unreachable!()
+        };
+        assert!(book.restocking.contains(&company));
+        assert_eq!(book.policies[&company], WarehousePolicy::ExportSurplus);
+        assert!(!book.loads.is_empty());
+        assert_eq!(book.policies, saved.policies);
+        assert_eq!(book.restocking, saved.restocking);
+        assert!(book.loads.keys().eq(saved.loads.keys()));
+        assert!(book.shipments.keys().eq(saved.shipments.keys()));
+    }
+
+    #[test]
+    fn e2fix_a_refused_unload_cancels_the_load_with_its_reason() {
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let (driver, truck, destination) = (f.driver, f.truck, f.destination.building);
+        let token = f.token();
+        f.ctx
+            .g
+            .write::<CargoBook>()
+            .loads
+            .get_mut(&token)
+            .unwrap()
+            .used_truck = true;
+        // The driver is still at the depot, so the unload is refused.
+        assert_eq!(
+            complete_delivery(&mut f.ctx.g, token, driver, truck, destination),
+            Err(DeliveryRejection::DriverNotAtDestination)
+        );
+        assert_eq!(f.manifest_units(), 16);
+        deliver_load(&mut f.ctx.g, token, driver, truck, destination);
+        assert_eq!(
+            (f.manifest_units(), f.hand(f.source), f.hand(f.destination)),
+            (0, 16, 1)
+        );
+        assert_eq!(
+            complete_delivery(&mut f.ctx.g, token, driver, truck, destination),
+            Err(DeliveryRejection::UnknownLoad)
+        );
+        let book = f.ctx.g.read::<CargoBook>();
+        let day = book.freight_day(0).unwrap();
+        assert_eq!(
+            (
+                day.refused_unloads,
+                day.cancelled_loads,
+                day.delivered_loads
+            ),
+            (1, 1, 0)
+        );
+    }
+
+    #[test]
+    fn e2fix_reachability_runs_no_route_search_and_tracks_topology() {
+        let mut f = Fixture::new();
+        f.seed(100, 1);
+        let target = plant_target(&f);
+        for step in 1..=4 {
+            f.update(step * FREIGHT_MATCH_INTERVAL);
+        }
+        assert!(f.reserved() > 0 && f.reserved() < target as u32);
+        assert_eq!(f.ctx.g.read::<CargoBook>().routes.searches, 0);
+
+        // A road edit relabels the components on the next check.
+        let road = f.ctx.g.map().buildings()[f.destination.building]
+            .connected_road
+            .unwrap();
+        f.ctx.apply(&[WorldCommand::MapRemoveRoad(road)]);
+        f.update(5 * FREIGHT_MATCH_INTERVAL + 1);
+        assert_eq!((f.manifest_units(), f.reserved()), (0, 0));
+        assert_eq!(f.ctx.g.read::<CargoBook>().routes.searches, 0);
+    }
+
+    #[test]
+    fn e2fix_receipts_separate_truck_unloads_from_station_imports() {
+        let mut f = Fixture::new();
+        f.seed(16, 0);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let (driver, truck, at) = (f.driver, f.truck, f.destination.building);
+        unload_fixture(&mut f, driver, truck, at);
+        let terminal = station(&mut f, false);
+        let import = Trade {
+            buyer: TradeTarget(f.destination.soul),
+            seller: TradeTarget(terminal.soul),
+            kind: Fixture::coal(),
+            qty: 3,
+            money_delta: Money::new_bucks(-3),
+        };
+        let (world, resources) = f.ctx.g.world_res();
+        assert!(!settle_physical_match(world, resources, import));
+        let book = f.ctx.g.read::<CargoBook>();
+        let day = book.freight_day(0).unwrap();
+        assert_eq!(
+            day.receipt(f.destination.soul, Fixture::coal()),
+            FreightReceipt {
+                road_units: 16,
+                station_units: 3
+            }
+        );
+        assert_eq!((day.delivered_loads, day.delivered_units), (1, 16));
+    }
+
+    #[test]
+    fn e2fix_a_real_empty_return_finishes_without_recovery() {
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let token = f.token();
+        for _ in 0..20_000 {
+            f.ctx.tick_fast();
+            if !f.ctx.g.read::<CargoBook>().loads.contains_key(&token) {
+                break;
+            }
+        }
+        assert_eq!(f.hand(f.destination), 17);
+        assert!(f.ctx.g.read::<CargoBook>().returning.contains_key(&f.truck));
+        for _ in 0..20_000 {
+            f.ctx.tick_fast();
+            if f.ctx.g.read::<CargoBook>().returning.is_empty() {
+                break;
+            }
+        }
+        assert!(f.ctx.g.read::<CargoBook>().returning.is_empty());
+        let human = &f.ctx.g.world().humans[f.driver];
+        assert_eq!(human.location, Location::Building(f.source.building));
+        assert!(f.ctx.g.get(f.truck).unwrap().vehicle.state.is_parked());
     }
 }

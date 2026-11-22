@@ -1,4 +1,4 @@
-use crate::economy::cargo::{complete_delivery, LoadId};
+use crate::economy::cargo::{deliver_load, LoadId};
 use crate::economy::{BasketFailure, Bought, Market, TripPurpose};
 use crate::map::BuildingID;
 use crate::map_dynamic::transit::elapsed_ticks;
@@ -138,7 +138,6 @@ impl HumanDecisionKind {
         cbuf_freight: &ParCommandBuffer<FreightStationEnt>,
         cbuf: &ParCommandBuffer<HumanEnt>,
         driver: HumanID,
-        location: &Location,
         home: BuildingID,
         work: Option<&mut Work>,
     ) -> bool {
@@ -156,7 +155,6 @@ impl HumanDecisionKind {
                         cbuf_freight,
                         cbuf,
                         driver,
-                        location,
                         home,
                         work,
                     ) {
@@ -172,17 +170,13 @@ impl HumanDecisionKind {
                 true
             }
             HumanDecisionKind::DeliverLoad { destination, load } => {
-                if let Some(WorkKind::Driver {
-                    truck,
-                    load: Some(assigned),
-                    ..
-                }) = work.as_deref().map(|work| work.kind)
+                // The unload validates the whole trip. A refusal cancels the
+                // load with its reason instead of retrying the drive.
+                if let Some(WorkKind::Driver { truck, .. }) = work.as_deref().map(|work| work.kind)
                 {
-                    if load == assigned && *location == Location::Building(destination) {
-                        cbuf.exec_ent(driver, move |sim| {
-                            complete_delivery(sim, load, driver, truck, destination);
-                        });
-                    }
+                    cbuf.exec_ent(driver, move |sim| {
+                        deliver_load(sim, load, driver, truck, destination);
+                    });
                 }
                 true
             }
@@ -527,7 +521,6 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             freight,
             cbuf,
             id,
-            &h.location,
             h.home.house,
             h.work.as_mut(),
         ) {

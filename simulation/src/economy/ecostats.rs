@@ -128,8 +128,8 @@ impl EcoStats {
     }
 }
 
-/// Record each dispatched load on the day it finishes or is cancelled. A
-/// cancellation is a missed delivery, even when its stock can be recovered.
+/// Record each delivered load on the day it is unloaded. Cancelled loads are
+/// kept out of these totals and counted in the cargo book's freight day.
 pub(crate) fn record_freight_outcome(resources: &Resources, elapsed: u64, units: u32, late: bool) {
     let mut metrics = resources.write::<DailyEconomyMetrics>();
     let day = metrics
@@ -139,6 +139,55 @@ pub(crate) fn record_freight_outcome(resources: &Resources, elapsed: u64, units:
     *day.loads.get_or_insert(0) += 1;
     *day.load_units.get_or_insert(0) += u64::from(units);
     *day.late_loads.get_or_insert(0) += u64::from(late);
+}
+
+/// Units a recipe received on one day, by lane.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreightReceipt {
+    /// Verified truck unloads.
+    pub road_units: u64,
+    /// Virtual station imports that filled a buy order freight left open.
+    pub station_units: u64,
+}
+
+/// Road freight outcomes for one elapsed budget day.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FreightDay {
+    pub delivered_loads: u64,
+    pub delivered_units: u64,
+    pub late_loads: u64,
+    /// Loads that never arrived: removals, route failures, expiry and refused unloads.
+    pub cancelled_loads: u64,
+    pub cancelled_units: u64,
+    /// Unloads refused at the destination. These are also cancelled loads.
+    pub refused_unloads: u64,
+    /// Loads a warehouse policy change recalled. These are not missed deliveries.
+    pub withdrawn_loads: u64,
+    receipts: BTreeMap<(SoulID, ItemID), FreightReceipt>,
+}
+
+impl FreightDay {
+    pub fn receipt(&self, recipient: SoulID, item: ItemID) -> FreightReceipt {
+        self.receipts
+            .get(&(recipient, item))
+            .copied()
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn receipt_mut(&mut self, recipient: SoulID, item: ItemID) -> &mut FreightReceipt {
+        self.receipts.entry((recipient, item)).or_default()
+    }
+
+    pub(crate) fn record_delivery(&mut self, units: u32, late: bool) {
+        self.delivered_loads += 1;
+        self.delivered_units += u64::from(units);
+        self.late_loads += u64::from(late);
+    }
+
+    pub(crate) fn record_cancellation(&mut self, units: u32) {
+        self.cancelled_loads += 1;
+        self.cancelled_units += u64::from(units);
+    }
 }
 
 pub(crate) fn record_coal_stockout(resources: &Resources, item: ItemID) {

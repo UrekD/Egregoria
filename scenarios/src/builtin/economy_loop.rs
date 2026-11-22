@@ -1,5 +1,6 @@
 use geom::vec2;
-use prototypes::{ItemID, RecTimeInterval, TICKS_PER_HOUR};
+use prototypes::{GoodsCompanyID, ItemID, RecTimeInterval, TICKS_PER_HOUR};
+use simulation::economy::cargo::CargoBook;
 use simulation::economy::{DailyEconomyMetrics, Market, TripPurpose, TICKS_PER_BUDGET_DAY};
 use simulation::map::Density::{High, Low};
 use simulation::map::ZoneKind::{Commercial, Industrial, Office, Residential};
@@ -54,6 +55,9 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 100.0,
                 [(2, 1, Residential, High), (2, 2, Residential, High)],
             );
+            // Measure once the new residents staff the mine and its trucks run,
+            // as the built fixture does after its two warm-up days.
+            ctx.run_ticks(TICKS_PER_BUDGET_DAY);
         }
     } else {
         if growable_freight {
@@ -81,7 +85,12 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mut total_loads = 0;
     let mut total_load_units = 0;
     let mut total_late = 0;
+    let mut total_cancelled = 0;
     let mut total_coal_stockout = 0;
+    let mut total_coal_road = 0;
+    let mut total_coal_station = 0;
+    let coal = ItemID::new("coal");
+    let plant = GoodsCompanyID::new("coal-power-plant");
     let failures_before = ctx.sim.read::<Market>().basket_failures().clone();
 
     for day in first_day..first_day + 2 {
@@ -104,18 +113,31 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         let loads = data.loads.unwrap_or(0);
         let load_units = data.load_units.unwrap_or(0);
         let late = data.late_loads.unwrap_or(0);
-        let coal_stockout = data
-            .stockout_ticks_by_sku
-            .get(&ItemID::new("coal"))
-            .copied()
-            .unwrap_or(0);
+        let coal_stockout = data.stockout_ticks_by_sku.get(&coal).copied().unwrap_or(0);
+        // Separate the plant's coal by lane: verified truck unloads, and
+        // station imports that filled an order freight left open.
+        let (mut cancelled, mut coal_road, mut coal_station) = (0, 0, 0);
+        if let Some(freight) = ctx.sim.read::<CargoBook>().freight_day(day) {
+            cancelled = freight.cancelled_loads;
+            for (id, company) in &ctx.sim.world().companies {
+                if company.comp.proto == plant {
+                    let receipt = freight.receipt(SoulID::GoodsCompany(id), coal);
+                    coal_road += receipt.road_units;
+                    coal_station += receipt.station_units;
+                }
+            }
+        }
         total_loads += loads;
         total_load_units += load_units;
         total_late += late;
+        total_cancelled += cancelled;
         total_coal_stockout += coal_stockout;
+        total_coal_road += coal_road;
+        total_coal_station += coal_station;
         println!(
-            "economy_loop freight day {day}: {loads} loads, {load_units} units, {late} late or cancelled; \
-             {coal_stockout} coal plant input stockout ticks",
+            "economy_loop freight day {day}: {loads} deliveries, {load_units} units, {late} late, \
+             {cancelled} cancelled; plant received {coal_road} coal by road and {coal_station} \
+             from stations, {coal_stockout} coal plant input stockout ticks",
         );
         let trips = |purpose| {
             data.trips_by_purpose
@@ -185,13 +207,24 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         market.seller_losses(),
     );
     let mean_load = total_load_units as f64 / total_loads.max(1) as f64;
-    let on_time = total_loads.saturating_sub(total_late) as f64 / total_loads.max(1) as f64;
+    // A cancelled load is a missed delivery.
+    let on_time = total_loads.saturating_sub(total_late) as f64
+        / (total_loads + total_cancelled).max(1) as f64;
+    let station_share =
+        total_coal_station as f64 / (total_coal_road + total_coal_station).max(1) as f64;
     println!(
-        "economy_loop freight totals: {total_loads} loads, {mean_load:.2} units/load, \
-         {:.1}% on time, {total_coal_stockout} coal plant input stockout ticks",
+        "economy_loop freight totals: {total_loads} deliveries, {mean_load:.2} units/load, \
+         {:.1}% on time, {total_cancelled} cancelled; plant received {total_coal_road} coal by road \
+         and {total_coal_station} from stations ({:.1}% station share), \
+         {total_coal_stockout} coal plant input stockout ticks",
         100.0 * on_time,
+        100.0 * station_share,
     );
-    if total_loads == 0 || mean_load < 8.0 || on_time < 0.9 || total_coal_stockout != 0 {
+    if total_loads == 0
+        || mean_load < 8.0
+        || on_time < 0.9
+        || !plant_supplied_by_road(total_coal_road, total_coal_station, total_coal_stockout)
+    {
         return Err("City missed one or more road freight targets".into());
     }
     if showcase.is_some()
@@ -206,6 +239,12 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         return Err("Showcase City missed one or more household economy targets".into());
     }
     Ok(())
+}
+
+/// The coal plant runs on trucked coal. A live station fills any order the
+/// trucks leave open, so station imports count as masked stockouts.
+fn plant_supplied_by_road(road_units: u64, station_units: u64, stockout_ticks: u64) -> bool {
+    road_units > 0 && station_units == 0 && stockout_ticks == 0
 }
 
 fn build_fixture(ctx: &mut ScenarioCtx) -> Result<(), String> {
@@ -246,19 +285,39 @@ fn build_fixture(ctx: &mut ScenarioCtx) -> Result<(), String> {
 
 fn compare_warehouse(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mut direct = ScenarioCtx::new(SCENARIO.1);
-    let (direct_ticks, direct_units) = coal_supply_shock(&mut direct, false)?;
-    let (buffer_ticks, buffer_units) = coal_supply_shock(ctx, true)?;
+    let direct = coal_supply_shock(&mut direct, false)?;
+    let buffered = coal_supply_shock(ctx, true)?;
     println!(
-        "economy_loop warehouse: direct {direct_ticks} stockout ticks for {direct_units} units;          with depot {buffer_ticks} stockout ticks for {buffer_units} units"
+        "economy_loop warehouse: after the mine's output is cut, the plant waits {} ticks and \
+         receives {} coal directly; with the depot it waits {} ticks and receives {} coal \
+         ({} coal staged at the depot before the cut)",
+        direct.stockout_ticks,
+        direct.units,
+        buffered.stockout_ticks,
+        buffered.units,
+        buffered.staged,
     );
-    if buffer_ticks >= direct_ticks || buffer_units != direct_units || buffer_units != 16 {
-        return Err("Depot must shorten the shortage while delivering the same batch".into());
+    if buffered.staged == 0
+        || buffered.units == 0
+        || buffered.stockout_ticks >= direct.stockout_ticks
+    {
+        return Err("Depot must restock from the mine and shorten the shortage".into());
     }
     ctx.sample("warehouse_recovery");
     Ok(())
 }
 
-fn coal_supply_shock(ctx: &mut ScenarioCtx, buffered: bool) -> Result<(u64, i32), String> {
+struct Recovery {
+    staged: i32,
+    stockout_ticks: u64,
+    units: i32,
+}
+
+/// The mine runs with a staffed truck while the plant is stocked. A depot
+/// near the plant restocks from it through normal matching. Then the mine's
+/// stock is lost and the plant runs dry, and the plant's wait for coal is
+/// measured with and without the buffer.
+fn coal_supply_shock(ctx: &mut ScenarioCtx, buffered: bool) -> Result<Recovery, String> {
     let stations: Vec<_> = ctx
         .sim
         .map()
@@ -275,75 +334,93 @@ fn coal_supply_shock(ctx: &mut ScenarioCtx, buffered: bool) -> Result<(u64, i32)
     let origin = vec2(704.0, 704.0);
     grid_city(ctx, origin, 5, 2, 200.0);
     let mine = place_company(ctx, "coal-mine", origin + vec2(100.0, 25.0))
-        .ok_or("could not place the direct coal source")?;
+        .ok_or("could not place the coal mine")?;
     let plant = place_company(ctx, "coal-power-plant", origin + vec2(700.0, -100.0))
         .ok_or("could not place the coal consumer")?;
-    let house = *fill_houses(ctx, 1)
-        .first()
-        .ok_or("could not place the driver's home")?;
-    let dispatch = if buffered {
-        place_company(ctx, "small-depot", origin + vec2(680.0, 24.0))
-            .ok_or("could not place the local depot")?
-    } else {
-        mine
+    let houses = fill_houses(ctx, 2);
+    let [mine_home, depot_home] = houses[..] else {
+        return Err("could not place the drivers' homes".into());
     };
-    let owner = |building| {
-        ctx.sim
-            .read::<BuildingInfos>()
+    let depot = if buffered {
+        Some(
+            place_company(ctx, "small-depot", WAREHOUSE_SITE + origin)
+                .ok_or("could not place the local depot")?,
+        )
+    } else {
+        None
+    };
+    let owner = |sim: &Simulation, building| {
+        sim.read::<BuildingInfos>()
             .owner(building)
             .ok_or("missing company owner")
     };
-    let source = owner(dispatch)?;
-    let consumer = owner(plant)?;
+    let (mine_soul, consumer) = (owner(&ctx.sim, mine)?, owner(&ctx.sim, plant)?);
     let coal = ItemID::new("coal");
+    {
+        let mut market = ctx.sim.write::<Market>();
+        market.produce(mine_soul, coal, 80);
+        // Above the plant's reorder level, so the mine's surplus can be staged.
+        market.produce(consumer, coal, 100);
+    }
+    staff_dispatch(&mut ctx.sim, mine_home, mine, mine_soul)?;
+    if let Some(depot) = depot {
+        let soul = owner(&ctx.sim, depot)?;
+        staff_dispatch(&mut ctx.sim, depot_home, depot, soul)?;
+    }
+    ctx.run_ticks(3 * TICKS_PER_HOUR);
 
-    // Start each recovery with the same stock and the driver at the dispatch
-    // site. The buffer leg uses coal delivered before the shortage window.
-    ctx.sim.write::<Market>().produce(source, coal, 48);
-    staff_dispatch(&mut ctx.sim, house, dispatch, source)?;
+    let staged = match depot {
+        Some(depot) => ctx
+            .sim
+            .read::<Market>()
+            .capital(owner(&ctx.sim, depot)?, coal),
+        None => 0,
+    };
+    {
+        let mut market = ctx.sim.write::<Market>();
+        let mine_stock = market.capital(mine_soul, coal);
+        market.produce(mine_soul, coal, -mine_stock);
+        let plant_stock = market.capital(consumer, coal);
+        market.produce(consumer, coal, -plant_stock);
+    }
 
-    let snapshot = buffered
-        .then(|| std::env::var_os("EGREGORIA_WAREHOUSE_CAPTURE"))
-        .flatten();
+    let snapshot = depot.and_then(|_| std::env::var_os("EGREGORIA_WAREHOUSE_CAPTURE"));
     let mut captured = false;
-    for ticks in 1..=TICKS_PER_HOUR {
+    let mut stockout_ticks = 0;
+    for _ in 0..2 * TICKS_PER_HOUR {
         ctx.run_ticks(1);
-        if !captured {
-            if let Some(root) = &snapshot {
-                let book = ctx.sim.read::<simulation::economy::cargo::CargoBook>();
-                if book.outgoing_loads(dispatch).next().is_some() {
-                    drop(book);
-                    let slot =
-                        SlotId::new("warehouse_capture").map_err(|error| error.to_string())?;
-                    let revision = SnapshotRevision::new(u128::from(ctx.sim.get_tick()));
-                    ctx.sim
-                        .encode_slot(revision)
-                        .and_then(|save| {
-                            save.with_display_name("Warehouse capture".into())
-                                .publish(std::path::Path::new(root), &slot)
-                        })
-                        .map_err(|error| error.to_string())?;
-                    let map = ctx.sim.map();
-                    let center = map.buildings()[dispatch].obb.center();
-                    println!("warehouse_capture site at {}, {}", center.x, center.y);
-                    captured = true;
-                }
+        if let (Some(root), Some(depot), false) = (&snapshot, depot, captured) {
+            let book = ctx.sim.read::<CargoBook>();
+            if book.outgoing_loads(depot).next().is_some() {
+                drop(book);
+                let slot = SlotId::new("warehouse_capture").map_err(|error| error.to_string())?;
+                let revision = SnapshotRevision::new(u128::from(ctx.sim.get_tick()));
+                ctx.sim
+                    .encode_slot(revision)
+                    .and_then(|save| {
+                        save.with_display_name("Warehouse capture".into())
+                            .publish(std::path::Path::new(root), &slot)
+                    })
+                    .map_err(|error| error.to_string())?;
+                let map = ctx.sim.map();
+                let center = map.buildings()[depot].obb.center();
+                println!("warehouse_capture site at {}, {}", center.x, center.y);
+                captured = true;
             }
         }
-        let units = ctx.sim.read::<Market>().capital(consumer, coal);
-        if units > 0 {
-            return Ok((ticks - 1, units));
+        if ctx.sim.read::<Market>().capital(consumer, coal) <= 0 {
+            stockout_ticks += 1;
         }
     }
-    Err(format!(
-        "coal did not arrive via {} within one hour",
-        if buffered {
-            "the depot"
-        } else {
-            "the direct route"
-        }
-    ))
+    Ok(Recovery {
+        staged,
+        stockout_ticks,
+        units: ctx.sim.read::<Market>().capital(consumer, coal),
+    })
 }
+
+// Upstream of the plant on the same streets, so the depot's route to it is short.
+const WAREHOUSE_SITE: geom::Vec2 = vec2(680.0, 24.0);
 
 fn staff_dispatch(
     sim: &mut Simulation,
@@ -380,4 +457,21 @@ fn staff_dispatch(
     infos.get_out(house, SoulID::Human(driver));
     infos.get_in(building, SoulID::Human(driver));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::plant_supplied_by_road;
+
+    #[test]
+    fn station_imports_cannot_pass_the_coal_freight_gate() {
+        assert!(!plant_supplied_by_road(0, 0, 0), "no physical delivery");
+        assert!(!plant_supplied_by_road(0, 20, 0), "station supply only");
+        assert!(
+            !plant_supplied_by_road(40, 2, 0),
+            "a station import masked a stockout"
+        );
+        assert!(!plant_supplied_by_road(40, 0, 1), "the plant stalled");
+        assert!(plant_supplied_by_road(40, 0, 0));
+    }
 }

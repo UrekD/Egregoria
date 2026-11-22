@@ -4,7 +4,7 @@ use goryak::{
 };
 use prototypes::try_prototype;
 use simulation::economy::{
-    cargo::{CargoBook, TruckLoad, WarehousePolicy},
+    cargo::{stored_items, CargoBook, TruckLoad, WarehousePolicy},
     Market,
 };
 use simulation::map::{BuildingID, BuildingKind, Map};
@@ -36,7 +36,7 @@ pub(crate) fn section(uiw: &UiWorld, sim: &Simulation, building: BuildingID) {
     }
     let storage = proto.prototype().storage.as_ref();
     if let Some(storage) = storage {
-        for &item in &storage.accepted_items {
+        for item in stored_items(storage) {
             stock.entry(item).or_default();
         }
     }
@@ -55,19 +55,8 @@ pub(crate) fn section(uiw: &UiWorld, sim: &Simulation, building: BuildingID) {
             },
         );
         if let Some(storage) = storage {
-            let stored: u32 = stock
-                .iter()
-                .map(|(&item, status)| {
-                    market.capital(owner, item).max(0) as u32 + status.incoming + status.reserved
-                })
-                .sum();
-            let returnable: u32 = book
-                .outgoing_loads(building)
-                .flat_map(|load| &load.items)
-                .map(|line| line.units)
-                .sum();
             let capacity = storage.capacity_units;
-            let occupied = stored + returnable;
+            let occupied = book.warehouse_committed(&market, owner, building, storage);
             let size = Vec2::new(240.0, 22.0);
             ProgressBar {
                 value: (occupied as f32 / capacity as f32).min(1.0),
@@ -80,11 +69,18 @@ pub(crate) fn section(uiw: &UiWorld, sim: &Simulation, building: BuildingID) {
                     format!("{occupied} / {capacity} units committed"),
                 );
             });
+            // The watermarks apply to the space all items share.
             textc(
                 on_secondary_container(),
                 format!(
-                    "Restock below {} · target {} units",
-                    storage.low_water_units, storage.high_water_units
+                    "Shared space · restock below {} · fill to {} units · {}",
+                    storage.low_water_units,
+                    storage.high_water_units,
+                    if book.is_restocking(company) {
+                        "restocking"
+                    } else {
+                        "holding"
+                    }
                 ),
             );
             let policy = book.warehouse_policy(company, storage);
@@ -103,6 +99,18 @@ pub(crate) fn section(uiw: &UiWorld, sim: &Simulation, building: BuildingID) {
                     }
                 }
             });
+            textc(
+                on_secondary_container(),
+                match policy {
+                    WarehousePolicy::Balanced => {
+                        "Exports unused items above the restock level and others above the fill level"
+                    }
+                    WarehousePolicy::ReserveLocally => "Keeps all stock for local recipes",
+                    WarehousePolicy::ExportSurplus => {
+                        "Exports like Balanced and stocks up for a closer freight station"
+                    }
+                },
+            );
         }
         for (item, stock) in stock {
             let name = try_prototype(item).map_or("Unknown item", |item| &item.label);

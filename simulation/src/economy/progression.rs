@@ -570,8 +570,20 @@ mod tests {
     #[test]
     fn e3_commands_enforce_named_capabilities_only_in_guided_mode() {
         drop(TestCtx::new());
-        let depot = "small-depot";
-        assert_eq!(BuildCapability::prototype_from_name(depot), None);
+        // Names a table may list before their prototypes ship resolve to nothing.
+        for name in ["future-depot", "regional-freight-hub", ""] {
+            assert_eq!(BuildCapability::prototype_from_name(name), None, "{name}");
+        }
+        let id = GoodsCompanyID::new("small-depot");
+        let warehouse = GoodsCompanyID::new("large-warehouse");
+        assert_eq!(
+            BuildCapability::prototype_from_name("small-depot"),
+            Some(BuildCapability::Prototype(id))
+        );
+        assert_eq!(
+            BuildCapability::prototype_from_name("large-warehouse"),
+            Some(BuildCapability::Prototype(warehouse))
+        );
         let empty = Simulation::new_game(&NewGameOptions {
             progression: ProgressionMode::Guided,
             terrain_chunks: 16,
@@ -581,26 +593,6 @@ mod tests {
         assert_eq!(
             progression_status(&empty).next.unwrap().2,
             ["Bus service", "Medium density"]
-        );
-
-        // Add only one future warehouse to the regular fixture registry.
-        prototypes::test_prototypes(
-            r#"
-            package.path = "../base_mod/?.lua"
-            require("data")
-            data:extend {
-                type = "goods-company", name = "small-depot", label = "Small depot",
-                bgen = {kind = "centered_door", vertical_factor = 1.0},
-                kind = "store", n_workers = 0, size = 10, asset = "bakery.glb", price = 1000
-            }
-        "#,
-        );
-        let capability = BuildCapability::prototype_from_name(depot).unwrap();
-        let id = GoodsCompanyID::new(depot);
-        assert_eq!(capability, BuildCapability::Prototype(id));
-        assert_eq!(
-            BuildCapability::prototype_from_name("large-warehouse"),
-            None
         );
 
         let mut sim = Simulation::new_game(&NewGameOptions {
@@ -646,8 +638,9 @@ mod tests {
         };
         sim.apply_commands(&stops);
         assert_eq!(sim.read::<CommandOutcomes>().accepted.len(), 2);
+        let size = id.prototype().size;
         let depot = WorldCommand::MapBuildSpecialBuilding {
-            pos: OBB::new(vec2(520.0, 490.0), Vec2::X, 10.0, 10.0),
+            pos: OBB::new(vec2(520.0, 470.0), Vec2::X, size.w, size.h),
             kind: BuildingKind::GoodsCompany(id),
             gen: id.prototype().bgen,
             zone: None,
@@ -693,13 +686,30 @@ mod tests {
                 Ok(())
             );
         }
-        sim.write::<ProgressionState>().highest_milestone = 1;
-        assert!(progression_status(&sim)
-            .next
-            .unwrap()
-            .2
-            .iter()
-            .any(|label| label == "Small depot"));
+        // Each real warehouse opens at its own milestone.
+        for (highest, depot_lock, warehouse_lock, next) in [
+            (0, Some(2), Some(3), None),
+            (1, Some(2), Some(3), Some("Small depot")),
+            (2, None, Some(3), Some("Large warehouse")),
+            (3, None, None, None),
+        ] {
+            sim.write::<ProgressionState>().highest_milestone = highest;
+            let lock = |proto: GoodsCompanyID| {
+                can_build(&sim, BuildCapability::Prototype(proto))
+                    .err()
+                    .map(|locked| locked.milestone)
+            };
+            assert_eq!(lock(id), depot_lock, "milestone {highest}");
+            assert_eq!(lock(warehouse), warehouse_lock, "milestone {highest}");
+            if let Some(label) = next {
+                assert!(progression_status(&sim)
+                    .next
+                    .unwrap()
+                    .2
+                    .iter()
+                    .any(|name| name == label));
+            }
+        }
 
         sim.write::<ProgressionState>().mode = ProgressionMode::FreeBuild;
         sim.apply_commands(&commands);

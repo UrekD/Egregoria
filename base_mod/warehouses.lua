@@ -14,8 +14,8 @@ local function warehouse(name, label, size, capacity, low, high, trucks, workers
         dispatch_min_units = 8,
         storage = {
             capacity_units = capacity,
-            accepted_items = {"goods", "retail-goods", "groceries", "coal", "flour", "cereal",
-                              "meat", "vegetable"},
+            -- Physical freight only. Household shelves restock through the retail lane.
+            accepted_items = {"goods", "coal", "flour", "cereal", "meat", "vegetable"},
             low_water_units = low,
             high_water_units = high,
             default_policy = "balanced",
