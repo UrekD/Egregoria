@@ -3,22 +3,29 @@ use crate::economy::progression::{
     progression_status, progression_update, ObjectiveId, ObjectiveProgress, ProgressionMode,
     ProgressionState,
 };
-use crate::economy::{market_update, Budget, BudgetCategory, DailyEconomyMetrics};
+use crate::economy::{
+    demand_update, market_update, Budget, BudgetCategory, DailyEconomyMetrics, Market, TripPurpose,
+    TICKS_PER_BUDGET_DAY,
+};
 use crate::map::{
-    BuildingID, BuildingKind, Density, LanePatternBuilder, Lot, ProjectFilter, RoadID, ZoneKind,
+    BuildingID, BuildingKind, Density, LanePatternBuilder, Lot, LotID, ProjectFilter, RoadID,
+    ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{
-    electricity_flow_system, env_update, utility_flow_update, CoverageGrid, EnvGrid, UtilityFlow,
+    electricity_flow_system, env_update, utility_flow_update, CoverageGrid, Destination, EnvGrid,
+    RoutingStep, UtilityFlow,
 };
 use crate::souls::{
     goods_company::{company_soul, company_system},
-    human::spawn_human,
+    growth::growth_update,
+    human::{spawn_human, HumanDecisionKind},
     residence,
 };
 use crate::world::CompanyID;
 use crate::{NewGameOptions, Simulation, SoulID, WorldCommand, INITIAL_TICK};
-use geom::{vec2, vec3, Polygon, Vec2, OBB};
-use prototypes::{GameTime, GoodsCompanyID, Money, ServiceKind, TICKS_PER_HOUR};
+use common::saveload::{Bincode, Encoder};
+use geom::{vec2, vec3, Intersect, Polygon, Vec2, OBB};
+use prototypes::{GameTime, GoodsCompanyID, ItemID, Money, ServiceKind, TICKS_PER_HOUR};
 
 #[test]
 fn p5_core_loop_starter_residential_lots_are_all_buildable() {
@@ -98,15 +105,76 @@ fn p5_core_loop_starter_residential_lots_are_all_buildable() {
 
 #[test]
 fn p5_core_loop_growable_consumes_overlapping_legacy_lots() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(440.0, 100.0, 0.0)]);
+    let lot = test.g.map().lots().values().next().unwrap().clone();
+    let overlaps = prepare_legacy_growth(&mut test.g, &lot);
+    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    for sim in [&mut test.g, &mut resumed] {
+        growth_update(sim);
+        assert!(
+            sim.map().get(lot.id).is_none(),
+            "growth must build over legacy neighbours"
+        );
+        assert!(overlaps.iter().all(|&id| sim.map().get(id).is_none()));
+    }
+    assert_eq!(test.g.hashes(), resumed.hashes());
+}
+
+fn prepare_legacy_growth(sim: &mut Simulation, lot: &Lot) -> [LotID; 3] {
+    let overlaps = {
+        let mut map = sim.map_mut();
+        let overlaps = [0; 3].map(|_| map.lots.insert_with_key(|id| Lot { id, ..lot.clone() }));
+        // Loading indexes these IDs in slot order.
+        for id in overlaps.into_iter().rev() {
+            let legacy_lot = map.lots[id].clone();
+            map.spatial_map.insert(&legacy_lot);
+        }
+        overlaps
+    };
+    sim.write::<ZoneGrid>()
+        .paint(lot.shape, Some(ZoneKind::Residential), Density::Low);
+    sim.write::<GameTime>().tick.0 = 2_999;
+    let (world, resources) = sim.world_res();
+    demand_update(world, resources);
+    sim.write::<GameTime>().tick.0 = 3_000;
+    overlaps
+}
+
+#[test]
+fn p5_core_loop_clear_road_corner_keeps_frontage() {
     let test = TestCtx::new_fast();
     test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(440.0, 100.0, 0.0)]);
     let mut map = test.g.map_mut();
-    let lot = map.lots().values().next().unwrap().clone();
-    let legacy = map.lots.insert_with_key(|id| Lot { id, ..lot.clone() });
-    let legacy_lot = map.lots[legacy].clone();
-    map.spatial_map.insert(&legacy_lot);
-    assert!(map.place_growable(lot.id, BuildingKind::House).is_some());
-    assert!(map.get(lot.id).is_none() && map.get(legacy).is_none());
+    let parent = map
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 100.0)
+        .unwrap()
+        .0;
+    let at = vec2(150.0, 160.0);
+    let shape = OBB::new(at + Vec2::X * 10.0, Vec2::X, 20.0, 20.0);
+    let pat = LanePatternBuilder::new().sidewalks(false).parking(false);
+    let offset = Vec2::splat(pat.width() * 0.4);
+    let src = vec2(170.0, 170.0) + offset;
+    let dst = src + Vec2::X * 100.0;
+    let project = |p: Vec2| {
+        map.project(
+            p.z(map.environment.height(p).unwrap()),
+            0.0,
+            ProjectFilter::ALL,
+        )
+    };
+    let (src, dst) = (project(src), project(dst));
+    let corner_road = map.make_connection(src, dst, None, &pat.build()).unwrap().1;
+    let line = map.get(corner_road).unwrap().boldline();
+    assert!(line.intersects(&shape));
+    assert!(!line.intersects(&Polygon::from(shape.corners.as_slice())));
+    let at = at.z(map.environment.height(at).unwrap());
+    let lot = Lot::try_make(&mut map, parent, at, Vec2::X, 20.0)
+        .expect("clear corner frontage should be generated");
+    Lot::remove_intersecting_lots(&mut map, corner_road);
+    assert!(map.place_growable(lot, BuildingKind::House).is_some());
 }
 
 #[test]
@@ -212,8 +280,8 @@ fn place_company(
     (building, company)
 }
 
-fn hire(test: &mut TestCtx) {
-    let (world, res) = test.g.world_res();
+fn hire(sim: &mut Simulation) {
+    let (world, res) = sim.world_res();
     market_update(world, res);
     company_system(world, res);
     electricity_flow_system(world, res);
@@ -255,40 +323,201 @@ fn p5_core_loop_late_utilities_and_services_hire_when_shops_are_staffed() {
             spawn_human(&mut test.g, house).unwrap();
         }
     }
-    hire(&mut test);
+    hire(&mut test.g);
     assert!(shops
         .into_iter()
         .all(|id| test.g.world().companies[id].workers.0.len() == 12));
 
     let (_, plant) = place_company(&mut test, "coal-power-plant", vec2(170.0, 135.0), road);
-    let (_, pump) = place_company(&mut test, "water-pump", vec2(285.0, 225.0), road);
+    let (pump_building, pump) = place_company(&mut test, "water-pump", vec2(285.0, 225.0), road);
     let (_, outlet) = place_company(&mut test, "sewage-outlet", vec2(320.0, 225.0), road);
     let (_, school) = place_company(&mut test, "school", vec2(355.0, 225.0), road);
     let (_, clinic) = place_company(&mut test, "clinic", vec2(390.0, 225.0), road);
-    hire(&mut test);
-    for (id, workers) in [(plant, 10), (pump, 4), (outlet, 4)] {
+    hire(&mut test.g);
+    assert!(shops
+        .into_iter()
+        .all(|id| test.g.world().companies[id].workers.0.len() == 12));
+
+    for hour in 1..=8 {
+        update_utilities(&mut test, hour * TICKS_PER_HOUR);
+        test.g.write::<GameTime>().tick.0 += 1;
+        let before = shops.map(|id| test.g.world().companies[id].workers.0.len());
+        hire(&mut test.g);
+        let after = shops.map(|id| test.g.world().companies[id].workers.0.len());
+        for (before, after) in before.into_iter().zip(after) {
+            assert!(after >= 6 && before - after <= 1);
+        }
+        test.g.write::<GameTime>().tick.0 += 1;
+        hire(&mut test.g);
         assert_eq!(
-            test.g.world().companies[id].workers.0.len(),
-            workers,
-            "{}",
-            test.g.world().companies[id].comp.proto.prototype().name
+            after,
+            shops.map(|id| test.g.world().companies[id].workers.0.len())
         );
     }
-    assert!(
-        test.g.world().companies[school].workers.0.len()
-            + test.g.world().companies[clinic].workers.0.len()
-            > 0
-    );
-
-    for hour in 1..=12 {
-        update_utilities(&mut test, hour * TICKS_PER_HOUR - 3_000);
-        assert!(houses
-            .iter()
-            .all(|&house| test.g.read::<UtilityFlow>().has_water(house)));
-        test.g.write::<GameTime>().tick.0 = hour * TICKS_PER_HOUR - 2;
-        residence::residence_update(&mut test.g);
+    for id in [plant, pump, outlet, school, clinic] {
+        assert_eq!(test.g.world().companies[id].workers.0.len(), 1);
     }
-    assert!(test.g.world().humans.len() > 0);
+    assert!(houses.iter().all(|&house| {
+        let utilities = test.g.read::<UtilityFlow>();
+        utilities.has_water(house) && utilities.has_sewage(house)
+    }));
+
+    test.g
+        .write::<residence::Residences>()
+        .by_building
+        .get_mut(&houses[0])
+        .unwrap()
+        .capacity += 2;
+    let worker = spawn_human(&mut test.g, houses[0]).unwrap();
+    hire(&mut test.g);
+    assert!(shops
+        .into_iter()
+        .any(|id| test.g.world().companies[id].workers.0.contains(&worker)));
+
+    // Ordinary hiring can fill spare vacancies. A later daily review can return
+    // a surplus utility worker when the network has enough reserve capacity.
+    let extra = spawn_human(&mut test.g, houses[0]).unwrap();
+    let pump_door = test.g.map().get(pump_building).unwrap().door_pos.xy();
+    test.g.write::<Market>().buy(
+        SoulID::Human(extra),
+        pump_door,
+        ItemID::new("job-opening"),
+        1,
+    );
+    hire(&mut test.g);
+    assert_eq!(test.g.world().companies[pump].workers.0.len(), 2);
+    update_utilities(&mut test, TICKS_PER_BUDGET_DAY - TICKS_PER_HOUR);
+    test.g.write::<GameTime>().tick.0 += 1;
+    hire(&mut test.g);
+    assert_eq!(test.g.world().companies[pump].workers.0.len(), 2);
+    update_utilities(&mut test, TICKS_PER_BUDGET_DAY);
+    test.g.write::<GameTime>().tick.0 += 1;
+    hire(&mut test.g);
+    assert_eq!(test.g.world().companies[pump].workers.0.len(), 1);
+}
+
+#[test]
+fn p5_core_loop_priority_hires_unemployed_before_crossing_donor_floor() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let road = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 250.0)
+        .unwrap()
+        .0;
+    let house = test.build_house_near(vec2(120.0, 285.0));
+    let (_, shop) = place_company(&mut test, "commercial-l1", vec2(90.0, 225.0), road);
+    test.g
+        .write::<residence::Residences>()
+        .by_building
+        .get_mut(&house)
+        .unwrap()
+        .capacity = 7;
+    for _ in 0..6 {
+        spawn_human(&mut test.g, house).unwrap();
+    }
+    hire(&mut test.g);
+    let (_, school) = place_company(&mut test, "school", vec2(355.0, 225.0), road);
+    test.g.write::<GameTime>().tick.0 = INITIAL_TICK + TICKS_PER_HOUR + 1;
+    hire(&mut test.g);
+    assert_eq!(test.g.world().companies[shop].workers.0.len(), 6);
+    assert!(test.g.world().companies[school].workers.0.is_empty());
+
+    let applicant = spawn_human(&mut test.g, house).unwrap();
+    test.g.write::<GameTime>().tick.0 += TICKS_PER_HOUR;
+    hire(&mut test.g);
+    assert_eq!(test.g.world().companies[shop].workers.0.len(), 6);
+    assert_eq!(test.g.world().companies[school].workers.0, [applicant]);
+}
+
+#[test]
+fn p5_core_loop_priority_transfer_retargets_work_and_preserves_shopping() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let road = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 250.0)
+        .unwrap()
+        .0;
+    let home = test.build_house_near(vec2(120.0, 275.0));
+    test.g
+        .write::<residence::Residences>()
+        .by_building
+        .get_mut(&home)
+        .unwrap()
+        .capacity = 12;
+    let shops = [
+        place_company(&mut test, "commercial-l1", vec2(90.0, 225.0), road),
+        place_company(&mut test, "commercial-l1", vec2(450.0, 225.0), road),
+    ];
+    for _ in 0..12 {
+        spawn_human(&mut test.g, home).unwrap();
+    }
+    hire(&mut test.g);
+    // A full donor roster ensures an actual hourly transfer.
+    let (shop, donor) = shops[0];
+    assert_eq!(test.g.world().companies[donor].workers.0.len(), 12);
+    let (school, recipient) = place_company(&mut test, "school", vec2(355.0, 225.0), road);
+    let old_dest = Destination::Building(shop);
+    for &worker in &test.g.world.companies[donor].workers.0 {
+        let human = &mut test.g.world.humans[worker];
+        human.decision.kind = HumanDecisionKind::GoTo(old_dest);
+        human
+            .router
+            .set_test_route(old_dest, vec![RoutingStep::WalkTo(human.trans.pos)]);
+        human.router.trip_purpose = TripPurpose::Work;
+        human.household.attended_shift = Some((shop, 0));
+    }
+
+    let lot = test.g.map().lots().values().next().unwrap().clone();
+    let overlaps = prepare_legacy_growth(&mut test.g, &lot);
+    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    for sim in [&mut test.g, &mut resumed] {
+        growth_update(sim);
+        assert!(sim.map().get(lot.id).is_none());
+        assert!(overlaps.iter().all(|&id| sim.map().get(id).is_none()));
+        sim.write::<GameTime>().tick.0 = INITIAL_TICK + TICKS_PER_HOUR + 1;
+        hire(sim);
+        let workers = &sim.world().companies[recipient].workers.0;
+        assert_eq!(workers.len(), 1);
+        let human = &sim.world().humans[workers[0]];
+        assert_eq!(
+            human.router.target_dest,
+            Some(Destination::Building(school))
+        );
+        assert!(
+            matches!(human.decision.kind, HumanDecisionKind::GoTo(Destination::Building(id)) if id == school)
+        );
+        assert_eq!(human.household.attended_shift, None);
+    }
+    assert_eq!(test.g.hashes(), resumed.hashes());
+
+    let (clinic, recipient) = place_company(&mut test, "clinic", vec2(390.0, 285.0), road);
+    for &worker in &test.g.world.companies[donor].workers.0 {
+        let human = &mut test.g.world.humans[worker];
+        human.decision.kind = HumanDecisionKind::DepositAtHome;
+        human.router.set_test_route(
+            Destination::Building(home),
+            vec![RoutingStep::WalkTo(human.trans.pos)],
+        );
+        human.router.trip_purpose = TripPurpose::Shopping;
+    }
+    test.g.write::<GameTime>().tick.0 += TICKS_PER_HOUR;
+    hire(&mut test.g);
+    let worker = test.g.world().companies[recipient].workers.0[0];
+    let human = &test.g.world().humans[worker];
+    assert_eq!(human.work.as_ref().unwrap().workplace, clinic);
+    assert_eq!(human.router.target_dest, Some(Destination::Building(home)));
+    assert!(matches!(
+        human.decision.kind,
+        HumanDecisionKind::DepositAtHome
+    ));
 }
 
 #[test]

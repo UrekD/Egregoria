@@ -1,8 +1,7 @@
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::{Budget, ZoneDemand};
 use crate::map::{
-    Building, BuildingID, BuildingKind, Lot, LotID, Map, ProjectFilter, ProjectKind, ZoneCell,
-    ZoneGrid, ZoneKind,
+    Building, BuildingID, BuildingKind, Lot, LotID, Map, ProjectFilter, ZoneCell, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{lifecycle, residence};
@@ -223,10 +222,7 @@ pub fn check_growable_lot(
     }
     let (kind, home, generator) = growable_that_fits(lot, cell)?;
     if !Building::valid_footprint(&lot.shape, generator)
-        || map
-            .spatial_map()
-            .query(lot.shape, ProjectFilter::ALL)
-            .any(|object| object != ProjectKind::Lot(lot.id))
+        || Lot::footprint_obstructed(map, lot.shape, false)
     {
         return Err(GrowableLotError::Obstructed);
     }

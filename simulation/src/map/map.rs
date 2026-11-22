@@ -532,12 +532,7 @@ impl Map {
 
     pub fn place_growable(&mut self, lot_id: LotID, kind: BuildingKind) -> Option<BuildingID> {
         let lot = self.lots.get(lot_id)?;
-        if !self.roads.contains_key(lot.parent)
-            || self
-                .spatial_map
-                .query(lot.shape, ProjectFilter::ALL - ProjectFilter::LOT)
-                .next()
-                .is_some()
+        if !self.roads.contains_key(lot.parent) || Lot::footprint_obstructed(self, lot.shape, false)
         {
             return None;
         }
@@ -638,7 +633,9 @@ impl Map {
         self.subscribers.subscribe(filter)
     }
 
-    fn clean_lots_inner(&mut self, to_clean: Vec<ProjectKind>) {
+    fn clean_lots_inner(&mut self, mut to_clean: Vec<ProjectKind>) {
+        // Slot reuse depends on removal order, but the spatial index is rebuilt on load.
+        to_clean.sort_unstable();
         for id in to_clean {
             if let ProjectKind::Lot(id) = id {
                 self.spatial_map.remove(id);

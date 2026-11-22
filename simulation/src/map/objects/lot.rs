@@ -1,7 +1,5 @@
 use crate::map::{LotOrigin, Map, ProjectFilter, ProjectKind, RoadID, UpdateType};
-use geom::Vec2;
-use geom::OBB;
-use geom::Vec3;
+use geom::{Intersect, Polygon, Shape, Vec2, Vec3, OBB};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
@@ -27,16 +25,24 @@ pub struct Lot {
 }
 
 impl Lot {
+    pub(crate) fn footprint_obstructed(map: &Map, shape: OBB, include_lots: bool) -> bool {
+        let mut filter = ProjectFilter::INTER | ProjectFilter::BUILDING;
+        if include_lots {
+            filter = filter | ProjectFilter::LOT;
+        }
+        map.spatial_map.query(shape, filter).next().is_some()
+            || map
+                .spatial_map
+                .query(Polygon::from(shape.corners.as_slice()), ProjectFilter::ROAD)
+                .next()
+                .is_some()
+    }
+
     pub(crate) fn try_restore(map: &mut Map, origin: LotOrigin) -> Option<LotID> {
         const FRONTAGE_RADIUS: f32 = 15.0;
 
         let shape = origin.shape;
-        if map
-            .spatial_map
-            .query(shape, ProjectFilter::ALL)
-            .next()
-            .is_some()
-        {
+        if Self::footprint_obstructed(map, shape, true) {
             return None;
         }
 
@@ -80,12 +86,7 @@ impl Lot {
 
         let shape = OBB::new(at.xy() + axis * size * 0.5, axis, size, size);
 
-        if map
-            .spatial_map
-            .query(shape, ProjectFilter::ALL)
-            .next()
-            .is_some()
-        {
+        if Self::footprint_obstructed(map, shape, true) {
             return None;
         }
 
@@ -156,9 +157,17 @@ impl Lot {
 
     pub fn remove_intersecting_lots(map: &mut Map, road: RoadID) {
         let r = unwrap_retlog!(map.roads.get(road), "{:?} does not exist", road);
+        let road_shape = r.boldline();
         let mut to_remove: BTreeSet<_> = map
             .spatial_map
-            .query(r.boldline(), ProjectFilter::LOT)
+            .query(road_shape.bbox(), ProjectFilter::LOT)
+            .filter_map(|object| {
+                let id = object.to_lot()?;
+                let shape = &map.lots[id].shape;
+                road_shape
+                    .intersects(&Polygon::from(shape.corners.as_slice()))
+                    .then_some(object)
+            })
             .collect();
 
         // Connecting a road can widen its junctions before the lane update. Use
@@ -167,7 +176,10 @@ impl Lot {
             let junction = unwrap_cont!(map.intersections.get_mut(id));
             junction.update_interface_radius(&mut map.roads);
             map.spatial_map.update(junction);
-            to_remove.extend(map.spatial_map.query(junction.bcircle(), ProjectFilter::LOT));
+            to_remove.extend(
+                map.spatial_map
+                    .query(junction.bcircle(), ProjectFilter::LOT),
+            );
         }
 
         for lot in to_remove {
