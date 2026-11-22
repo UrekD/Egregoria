@@ -13,7 +13,7 @@
   }}]},
   {"Assert": "NoRejections"},
   {"Camera": {"x": 3235, "y": 5450, "z": 0, "yaw": -0.91, "pitch": 1.16, "dist": 500}},
-  {"SelectTool": "SpecialBuilding"},
+  {"SelectTool": "industry"},
   {"WaitFrames": 4},
   {"Pointer": {"action": "Click", "screen_pos": [156, 573]}},
   {"Pointer": {"action": "Move", "world_pos": [3220, 5405, 0]}},

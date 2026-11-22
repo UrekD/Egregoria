@@ -8,11 +8,10 @@ use engine::wgpu::TextureFormat;
 use engine::{Context, TextureBuilder};
 use geom::{Camera, Degrees, Polygon, Vec3};
 use goryak::{
-    image_button, mincolumn, minrow, on_secondary_container, padxy, primary,
-    selectable_label_primary, textc, HorizScrollSize,
+    image_button, mincolumn, minrow, on_secondary_container, padxy, primary, textc, HorizScrollSize,
 };
 use prototypes::{
-    prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyPrototype,
+    prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyPrototype, Power,
     Prototype, RenderAsset, ServiceID, ServiceKind,
 };
 use simulation::economy::progression::{can_build, BuildCapability};
@@ -24,33 +23,43 @@ use crate::gui::specialbuilding::{SpecialBuildKind, SpecialBuildingResource};
 use crate::gui::{InspectedBuilding, InspectedEntity, PlacementPreview};
 use crate::uiworld::UiWorld;
 
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
+/// Which hand-placed buildings the shelf lists; each is its own toolbar category.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum BuildingTab {
-    #[default]
-    Companies,
+    Utilities,
     Services,
+    #[default]
+    Industry,
+}
+
+impl BuildingTab {
+    /// The shelf a hand-placed company belongs to. Growables are never hand-placed.
+    pub(crate) fn of(company: &GoodsCompanyPrototype) -> Option<Self> {
+        if company.id.is_growable() {
+            return None;
+        }
+        Some(match try_prototype(ServiceID::from(company.id)) {
+            Some(service)
+                if matches!(
+                    service.service_kind,
+                    ServiceKind::WaterPump | ServiceKind::SewageOutlet
+                ) =>
+            {
+                Self::Utilities
+            }
+            Some(_) => Self::Services,
+            None if company.power_production.is_some() => Self::Utilities,
+            None => Self::Industry,
+        })
+    }
 }
 
 pub fn special_building_properties(uiw: &UiWorld, sim: &Simulation) {
     // Inspector windows are drawn over the shelf and can intercept card clicks.
     uiw.write::<InspectedBuilding>().e = None;
     uiw.write::<InspectedEntity>().e = None;
-    let mut tab = uiw.write::<BuildingTab>();
-    mincolumn(5.0, || {
-        minrow(5.0, || {
-            for (choice, label) in [
-                (BuildingTab::Companies, "Companies"),
-                (BuildingTab::Services, "Services"),
-            ] {
-                if selectable_label_primary(*tab == choice, label).clicked && *tab != choice {
-                    *tab = choice;
-                    uiw.write::<SpecialBuildingResource>().opt = None;
-                    *uiw.write::<PlacementPreview>() = PlacementPreview::default();
-                }
-            }
-        });
-        minrow(0.0, || building_choices(uiw, sim, *tab));
-    });
+    let tab = *uiw.read::<BuildingTab>();
+    minrow(0.0, || building_choices(uiw, sim, tab));
 }
 
 fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
@@ -65,10 +74,9 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
             l.main_axis_size = MainAxisSize::Min;
             l.item_spacing = 10.0;
             l.show(|| {
-                for descr in prototypes_iter::<GoodsCompanyPrototype>().filter(|company| {
-                    !company.id.is_growable()
-                        && company.id.is_service() == (tab == BuildingTab::Services)
-                }) {
+                for descr in prototypes_iter::<GoodsCompanyPrototype>()
+                    .filter(|company| BuildingTab::of(company) == Some(tab))
+                {
                     let Some(tex_id) = icons.ids.get(&descr.parent().id) else {
                         continue;
                     };
@@ -160,8 +168,21 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
                             );
                         }
 
-                        if lock.is_some() && service.is_none() {
-                            textc(on_secondary_container().with_alpha(0.65), &descr.label);
+                        if service.is_none() {
+                            let color = if lock.is_some() {
+                                on_secondary_container().with_alpha(0.65)
+                            } else {
+                                on_secondary_container()
+                            };
+                            // Power plants sit beside the pumps, so they get the same caption.
+                            match descr.power_production {
+                                Some(power) if tab == BuildingTab::Utilities => {
+                                    textc(color, &descr.label);
+                                    textc(color, power_production_text(descr, power));
+                                }
+                                _ if lock.is_some() => textc(color, &descr.label),
+                                _ => {}
+                            }
                         }
                         if resp.clicked && lock.is_none() {
                             *uiw.write::<PlacementPreview>() = PlacementPreview {
@@ -276,14 +297,19 @@ fn company_tooltip(company: &GoodsCompanyPrototype) -> String {
         let _ = write!(text, "\nPower demand {power}");
     }
     if let Some(power) = company.power_production {
-        if company.zone.is_some() {
-            let density = power.watts() as f64 / f64::from(MAX_ZONE_AREA);
-            let _ = write!(text, "\nPower production {density:.2} W/m²");
-        } else {
-            let _ = write!(text, "\nPower production {power}");
-        }
+        let _ = write!(text, "\n{}", power_production_text(company, power));
     }
     text
+}
+
+/// Zoned plants produce per square metre of their zone.
+fn power_production_text(company: &GoodsCompanyPrototype, power: Power) -> String {
+    if company.zone.is_some() {
+        let density = power.watts() as f64 / f64::from(MAX_ZONE_AREA);
+        format!("Power production {density:.2} W/m²")
+    } else {
+        format!("Power production {power}")
+    }
 }
 
 #[derive(Default)]
@@ -398,5 +424,127 @@ mod tests {
         assert!(rect.size().x > 0.0 && rect.size().y > 0.0);
         assert!(layout.viewport().contains_point(rect.pos()));
         assert!(layout.viewport().contains_point(rect.pos() + rect.size()));
+    }
+}
+
+#[cfg(test)]
+mod toolbar1_tests {
+    use simulation::economy::progression::{ProgressionMode, ProgressionState};
+    use yakui::event::Event;
+    use yakui::input::MouseButton;
+    use yakui::{Rect, WidgetId, Yakui};
+
+    use super::*;
+    use goryak::ImageButtonWidget;
+    use prototypes::GoodsCompanyID;
+
+    fn card_rects(ui: &Yakui, id: WidgetId, rects: &mut Vec<Rect>) {
+        let node = ui.dom().get(id).unwrap();
+        if node.widget.is::<ImageButtonWidget>() {
+            rects.push(ui.layout_dom().get(id).unwrap().rect);
+        }
+        for &child in &node.children {
+            card_rects(ui, child, rects);
+        }
+    }
+
+    #[test]
+    fn toolbar1_each_company_has_one_category() {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let tab = |name: &str| BuildingTab::of(GoodsCompanyID::new(name).prototype());
+        for name in [
+            "water-pump",
+            "sewage-outlet",
+            "solar-panel",
+            "coal-power-plant",
+        ] {
+            assert_eq!(tab(name), Some(BuildingTab::Utilities), "{name}");
+        }
+        for name in [
+            "school",
+            "clinic",
+            "fire-station",
+            "police-station",
+            "garbage-depot",
+            "park",
+        ] {
+            assert_eq!(tab(name), Some(BuildingTab::Services), "{name}");
+        }
+        for name in ["bakery", "flour-factory", "small-depot", "large-warehouse"] {
+            assert_eq!(tab(name), Some(BuildingTab::Industry), "{name}");
+        }
+        for company in prototypes_iter::<GoodsCompanyPrototype>() {
+            assert_eq!(BuildingTab::of(company).is_none(), company.id.is_growable());
+        }
+    }
+
+    #[test]
+    fn toolbar1_guided_locked_cards_stay_locked_in_every_category() {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let sim = Simulation::new(false);
+        sim.write::<ProgressionState>().mode = ProgressionMode::Guided;
+        let uiw = UiWorld::with_defaults();
+        for (i, building) in prototypes::BuildingPrototype::iter().enumerate() {
+            uiw.write::<BuildingIcons>()
+                .ids
+                .insert(building.id, TextureId::User(i as u64));
+        }
+
+        let viewport = Vec2::new(8000.0, 800.0);
+        let mut ui = Yakui::new();
+        ui.set_surface_size(viewport);
+        ui.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, viewport));
+        let frame = |ui: &mut Yakui| {
+            ui.start();
+            special_building_properties(&uiw, &sim);
+            ui.finish();
+            let mut rects = Vec::new();
+            card_rects(ui, ui.dom().root(), &mut rects);
+            rects
+        };
+
+        let (mut locked, mut unlocked) = (0, 0);
+        for tab in [
+            BuildingTab::Utilities,
+            BuildingTab::Services,
+            BuildingTab::Industry,
+        ] {
+            *uiw.write::<BuildingTab>() = tab;
+            let cards: Vec<_> = prototypes_iter::<GoodsCompanyPrototype>()
+                .filter(|company| BuildingTab::of(company) == Some(tab))
+                .collect();
+            for (i, company) in cards.iter().enumerate() {
+                uiw.write::<SpecialBuildingResource>().opt = None;
+                let rects = frame(&mut ui);
+                assert_eq!(rects.len(), cards.len(), "{tab:?}");
+                let center = rects[i].pos() + rects[i].size() * 0.5;
+                ui.handle_event(Event::CursorMoved(Some(center)));
+                for down in [true, false] {
+                    ui.handle_event(Event::MouseButtonChanged {
+                        button: MouseButton::One,
+                        down,
+                    });
+                }
+                frame(&mut ui);
+                let armed = uiw
+                    .read::<SpecialBuildingResource>()
+                    .opt
+                    .as_ref()
+                    .and_then(|kind| kind.company);
+                if can_build(&sim, BuildCapability::Prototype(company.id)).is_err() {
+                    assert_eq!(armed, None, "{} is locked", company.name);
+                    locked += 1;
+                } else {
+                    assert_eq!(armed, Some(company.id), "{}", company.name);
+                    unlocked += 1;
+                }
+            }
+        }
+        assert!(
+            locked > 0 && unlocked > 0,
+            "{locked} locked, {unlocked} unlocked"
+        );
     }
 }

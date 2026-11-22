@@ -7,7 +7,7 @@
   {"WaitFrames": 2},
   {"Screenshot": "overview"},
   {"DumpState": "overview"},
-  {"SelectTool": "RoadbuildStraight"},
+  {"SelectTool": "roads/straight"},
   {"WaitFrames": 2},
   {"Screenshot": "toolbar"},
   {"DumpState": "toolbar"},

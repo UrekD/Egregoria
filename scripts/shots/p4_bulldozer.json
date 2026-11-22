@@ -1,7 +1,7 @@
 [
   {"Camera": {"x": 990, "y": 905, "z": 0, "yaw": -0.6, "pitch": 1.05, "dist": 730}},
   {"Builder": "grid_city"},
-  {"SelectTool": "Bulldozer"},
+  {"SelectTool": "bulldoze"},
   {"WaitFrames": 3},
   {"Screenshot": "before"},
   {"DumpState": "before"},

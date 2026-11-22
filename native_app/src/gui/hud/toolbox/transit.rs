@@ -1,7 +1,4 @@
-use goryak::{
-    button_primary, button_secondary, minrow, on_secondary_container, padxy, textc, tooltip,
-};
-use simulation::economy::progression::{can_build, BuildCapability};
+use goryak::{button_secondary, minrow, on_secondary_container, padxy, textc, tooltip};
 use simulation::Simulation;
 
 use crate::gui::{GuiState, Tool};
@@ -18,6 +15,14 @@ pub(crate) struct TransitTools {
     remove_stops: bool,
 }
 
+impl TransitTools {
+    /// Drop the line draft and go back to adding stops.
+    pub(super) fn reset(&mut self) {
+        self.line.cancel();
+        self.remove_stops = false;
+    }
+}
+
 pub(super) fn update_lines(uiworld: &UiWorld, sim: &Simulation) {
     if let Some(line) = uiworld
         .read::<GuiState>()
@@ -27,33 +32,6 @@ pub(super) fn update_lines(uiworld: &UiWorld, sim: &Simulation) {
         uiworld.write::<TransitTools>().line.begin_edit(line);
         *uiworld.write::<Tool>() = Tool::TransitLine;
     }
-}
-
-pub(super) fn buttons(uiworld: &UiWorld, sim: &Simulation) {
-    minrow(6.0, || {
-        let current = *uiworld.read::<Tool>();
-        for choice in [Tool::TransitStop, Tool::TransitLine] {
-            if choice == Tool::TransitLine {
-                if let Err(lock) = can_build(sim, BuildCapability::BusService) {
-                    tooltip(format!("Unlocks at {} citizens", lock.population), || {
-                        let mut button = button_secondary("Bus line");
-                        button.style.fill = button.style.fill.with_alpha(0.45);
-                        button.style.text.color = button.style.text.color.with_alpha(0.55);
-                        button.hover_style = button.style.clone();
-                        button.down_style = button.style.clone();
-                        button.show();
-                    });
-                    continue;
-                }
-            }
-            if tool_button(current, choice) {
-                let mut state = uiworld.write::<TransitTools>();
-                state.line.cancel();
-                state.remove_stops = false;
-                *uiworld.write::<Tool>() = choice;
-            }
-        }
-    });
 }
 
 pub(super) fn properties(uiworld: &UiWorld, tool: Tool) {
@@ -119,18 +97,6 @@ pub(super) fn update_tool(uiworld: &UiWorld, sim: &Simulation) {
         Tool::TransitLine => transit_line::update(sim, uiworld, &mut state.line),
         _ => {}
     }
-}
-
-fn tool_button(tool: Tool, choice: Tool) -> bool {
-    let label = super::tool_label(choice);
-    tooltip(label, || {
-        if tool == choice {
-            button_primary(label).show()
-        } else {
-            button_secondary(label).show()
-        }
-    })
-    .clicked
 }
 
 #[cfg(test)]

@@ -4,12 +4,13 @@ use yakui::{
     Pivot, Vec2,
 };
 
-use goryak::{image_button, mincolumn, minrow, padxy, primary};
+use goryak::{image_button, mincolumn, minrow, padxy, primary, primary_image_button};
 use simulation::map::LanePatternBuilder;
 
-use crate::gui::hud::toolbox::updown_value;
+use crate::gui::hud::toolbox::{select_mode, updown_value};
 use crate::gui::roadbuild::{HeightReference, RoadBuildResource, Snapping};
 use crate::gui::textures::UiTextures;
+use crate::gui::{Tool, ToolMode};
 use crate::uiworld::UiWorld;
 
 pub fn roadbuild_properties(uiw: &UiWorld) {
@@ -24,6 +25,26 @@ pub fn roadbuild_properties(uiw: &UiWorld) {
             let c = primary().lerp(&Color::WHITE, 0.3);
             let active = (c, c.with_alpha(0.7));
             let default = (Color::WHITE.with_alpha(0.3), Color::WHITE.with_alpha(0.5));
+
+            // Straight and curved are modes of the one Roads tool.
+            mincolumn(4.0, || {
+                let tool = *uiw.read::<Tool>();
+                for (mode, icon) in [
+                    (ToolMode::RoadStraight, "toolbar_straight_road"),
+                    (ToolMode::RoadCurved, "toolbar_curved_road"),
+                ] {
+                    if primary_image_button(
+                        uiw.read::<UiTextures>().get(icon),
+                        Vec2::new(30.0, 30.0),
+                        tool == mode.tool(),
+                        mode.label(),
+                    )
+                    .clicked
+                    {
+                        select_mode(uiw, mode);
+                    }
+                }
+            });
 
             mincolumn(4.0, || {
                 minrow(2.0, || {

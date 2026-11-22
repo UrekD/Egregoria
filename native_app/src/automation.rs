@@ -23,8 +23,8 @@ use simulation::{AnyEntity, HumanID, Simulation};
 
 use crate::gui::follow::{follow_pos, FollowEntity};
 use crate::gui::{
-    overlays::OverlayMode, toolbox::building::BuildingTab, top_demand_driver, zoning::ZONES,
-    GuiState, InspectedBuilding, InspectedEntity, Tool,
+    overlays::OverlayMode, toolbox, toolbox::building::BuildingTab, top_demand_driver,
+    zoning::ZONES, GuiState, InspectedBuilding, InspectedEntity, Tool, ToolSelection,
 };
 use crate::session::{self, SessionScreen, SlotCompatibility};
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
@@ -75,7 +75,8 @@ enum Step {
         ticks: u64,
         until: Option<FollowedLocation>,
     },
-    SelectTool(Tool),
+    /// `"hand"`, a toolbar category (`"zoning"`) or a mode (`"roads/curved"`).
+    SelectTool(ToolSelection),
     SetOverlay(OverlayMode),
     SetSession(SessionScreen),
     OpenWindow(String),
@@ -592,7 +593,9 @@ impl Automation {
                     settle_frames: 2,
                 });
             }
-            Step::SelectTool(tool) => *uiw.write::<Tool>() = tool,
+            Step::SelectTool(selection) => {
+                toolbox::select_tool(uiw, &sim.read().unwrap(), selection);
+            }
             Step::SetOverlay(mode) => *uiw.write::<OverlayMode>() = mode,
             Step::SetSession(screen) => {
                 if !session::set_screen(uiw, screen) {
@@ -1117,6 +1120,35 @@ mod tests {
         let names: Vec<_> = gui.windows.window_states().map(|(name, _)| name).collect();
         assert!(names.contains(&"Budget"));
         assert!(names.contains(&"City Stats"));
+    }
+
+    #[test]
+    fn toolbar1_select_tool_steps_use_toolbar_names() {
+        assert!(matches!(
+            JSON::decode::<Step>(br#"{"SelectTool":"roads/curved"}"#).unwrap(),
+            Step::SelectTool(ToolSelection::Mode(crate::gui::ToolMode::RoadCurved))
+        ));
+        assert!(matches!(
+            JSON::decode::<Step>(br#"{"SelectTool":"transport"}"#).unwrap(),
+            Step::SelectTool(ToolSelection::Category(crate::gui::ToolCategory::Transport))
+        ));
+        assert!(JSON::decode::<Step>(br#"{"SelectTool":"RoadbuildStraight"}"#).is_err());
+    }
+
+    #[test]
+    fn toolbar1_every_shot_script_decodes() {
+        let shots = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/shots");
+        let mut scripts = 0;
+        for entry in fs::read_dir(shots).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().is_some_and(|ext| ext == "json") {
+                let bytes = fs::read(&path).unwrap();
+                JSON::decode::<Vec<Step>>(&bytes)
+                    .unwrap_or_else(|err| panic!("{}: {err}", path.display()));
+                scripts += 1;
+            }
+        }
+        assert!(scripts > 10);
     }
 
     #[test]

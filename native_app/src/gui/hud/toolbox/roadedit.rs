@@ -3,7 +3,7 @@ use yakui::{
     column, image, reflow, Alignment, CrossAxisAlignment, Dim2, MainAxisAlignment, Pivot, Vec2,
 };
 
-use goryak::{padxy, primary_image_button};
+use goryak::{on_secondary_container, padxy, primary_image_button, textc};
 use simulation::map::LightPolicy;
 
 use crate::gui::hud::toolbox;
@@ -15,6 +15,12 @@ use crate::uiworld::UiWorld;
 pub fn roadedit_properties(uiw: &UiWorld) {
     let state = &mut *uiw.write::<RoadEditorResource>();
     let Some(ref mut v) = state.inspect else {
+        padxy(12.0, 8.0, || {
+            textc(
+                on_secondary_container(),
+                "Click an intersection to edit its lights, turns and roundabout.",
+            );
+        });
         return;
     };
 
