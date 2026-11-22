@@ -23,6 +23,8 @@ mod demand;
 mod ecostats;
 mod government;
 mod market;
+pub mod transit_stats;
+mod trip_stats;
 
 use crate::map::{BuildingKind, LaneID, LaneKind, Map, TraverseDirection};
 use crate::map_dynamic::BuildingInfos;
@@ -34,6 +36,8 @@ pub use demand::*;
 pub use ecostats::*;
 pub use government::*;
 pub use market::*;
+pub use transit_stats::TransitStats;
+pub use trip_stats::*;
 use prototypes::{GameTime, ItemID, Money};
 
 const WORKER_CONSUMPTION_PER_MINUTE: Money = Money::new_cents(10);
@@ -106,7 +110,9 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
                 let pos = match human.location {
                     Location::Outside => human.trans.pos,
                     Location::Building(id) => map.get(id)?.door_pos,
-                    Location::Vehicle(id) => world.vehicles.get(id)?.trans.pos,
+                    Location::Vehicle(id) | Location::Transit(id) => {
+                        world.vehicles.get(id)?.trans.pos
+                    }
                 };
                 let lane = map.nearest_lane(pos, LaneKind::Walking, None)?;
                 Some((lane, human.goods.excluded_seller()))

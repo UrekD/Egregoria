@@ -12,12 +12,18 @@ use flat_spatial::storage::CellIdx;
 use geom::Vec2;
 use prototypes::{GameTime, Tick};
 
-use crate::economy::{citystats_update, market_update, CityStats, EcoStats, Government, Market};
+use crate::economy::{
+    citystats_update, market_update, CityStats, EcoStats, Government, Market, TransitStats,
+    TripStats,
+};
 use crate::map::Map;
+use crate::map_dynamic::transit::{
+    transit_board_update, transit_dispatch_update, transit_stop_update,
+};
 use crate::map_dynamic::{
     coverage_update, dispatch_system, electricity_flow_system, env_update, itinerary_update,
     routing_changed_system, routing_update_system, utility_flow_update, BuildingInfos,
-    CoverageGrid, Dispatcher, ElectricityFlow, EnvGrid, ParkingManagement, UtilityFlow,
+    CoverageGrid, Dispatcher, ElectricityFlow, EnvGrid, ParkingManagement, Transit, UtilityFlow,
 };
 use crate::multiplayer::MultiplayerState;
 use crate::souls::events::{events_update, Fires};
@@ -78,6 +84,9 @@ fn register_systems_and_resources() {
     register_system("locomotive_system", locomotive_system);
     register_system("vehicle_decision_system", vehicle_decision_system);
     register_system("vehicle_state_update_system", vehicle_state_update_system);
+    register_system("transit_stop_update", transit_stop_update);
+    register_system("transit_dispatch_update", transit_dispatch_update);
+    register_system("transit_board_update", transit_board_update);
     register_system("routing_changed_system", routing_changed_system);
     register_system("routing_update_system", routing_update_system);
     register_system("itinerary_update", itinerary_update);
@@ -140,6 +149,9 @@ fn register_systems_and_resources() {
     register_resource::<RandProvider, Bincode>("randprovider", || RandProvider::new(RNG_SEED));
     register_resource_default::<Dispatcher, Bincode>("dispatcher");
     register_resource_default::<Replay, crate::utils::replay::ReplayJson>("replay");
+    register_resource_default::<Transit, Bincode>("transit");
+    register_resource_default::<TripStats, Bincode>("trip_stats");
+    register_resource_default::<TransitStats, Bincode>("transit_stats");
 }
 
 // Match flat_spatial::Grid's Bincode layout while ordering the storage cells by

@@ -4,7 +4,7 @@
 
 use crate::init::{GSYSTEMS, INIT_FUNCS, SAVELOAD_FUNCS};
 use crate::map::{BuildingKind, Map};
-use crate::map_dynamic::{Itinerary, ItineraryLeader};
+use crate::map_dynamic::{transit, Itinerary, ItineraryLeader};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
@@ -278,6 +278,7 @@ impl Simulation {
             utils::scheduler::drain_commands(self);
             return;
         }
+        let topology_generation = self.map().walking_topology_generation;
         self.write::<CommandOutcomes>().begin_batch();
         for (index, command) in commands.enumerate() {
             let before = self.read::<CommandOutcomes>().last.len();
@@ -287,6 +288,9 @@ impl Simulation {
             if outcomes.last.len() == before {
                 outcomes.accepted.push(index);
             }
+        }
+        if self.map().walking_topology_generation != topology_generation {
+            transit::on_topology_changed(self);
         }
     }
 

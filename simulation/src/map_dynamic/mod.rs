@@ -6,6 +6,7 @@ mod environment;
 mod itinerary;
 mod parking;
 mod router;
+pub mod transit;
 mod utilities;
 
 pub use binfos::*;
@@ -16,4 +17,5 @@ pub use environment::*;
 pub use itinerary::*;
 pub use parking::*;
 pub use router::*;
+pub use transit::{BusRun, LineID, StopID, Transit, TransitLine, TransitStop};
 pub use utilities::*;

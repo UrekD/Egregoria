@@ -24,6 +24,7 @@ pub enum Location {
     Outside,
     Vehicle(VehicleID),
     Building(BuildingID),
+    Transit(VehicleID),
 }
 debug_inspect_impl!(Location);
 

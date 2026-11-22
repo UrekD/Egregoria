@@ -83,7 +83,7 @@ impl InspectRenderer {
 
         if let AnyEntity::VehicleID(id) = entity {
             for (hid, h) in sim.world().humans.iter() {
-                if h.location == Location::Vehicle(id)
+                if matches!(h.location, Location::Vehicle(v) | Location::Transit(v) if v == id)
                     && ui
                         .small_button(&*format!("debug_inspect inside vehicle: {hid:?}"))
                         .clicked()

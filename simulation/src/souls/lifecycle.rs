@@ -158,6 +158,7 @@ pub(crate) fn freight_station_dropped(
 }
 
 pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec3) {
+    detach_transit_vehicle(sim, id, position);
     let (world, resources) = sim.world_res();
     resources.write::<RandomVehicles>().vehicles.remove(&id);
     let mut former_drivers = Vec::new();
@@ -492,4 +493,8 @@ fn cancel_trip(human: &mut HumanEnt, resources: &Resources) {
         .cancel_route(&mut resources.write::<ParkingManagement>());
     human.it = Itinerary::NONE;
     human.decision = Default::default();
+}
+
+fn detach_transit_vehicle(sim: &mut Simulation, id: VehicleID, position: Vec3) {
+    crate::map_dynamic::transit::on_vehicle_dropped(sim, id, position);
 }

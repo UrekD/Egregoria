@@ -1,7 +1,7 @@
 use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::{
-    BuildingInfos, Itinerary, ParkingManagement, ParkingReserveError, SpotReservation,
-    NEAR_PARKING_RADIUS,
+    BuildingInfos, Itinerary, LineID, ParkingManagement, ParkingReserveError, SpotReservation,
+    StopID, NEAR_PARKING_RADIUS,
 };
 use crate::souls::desire::WorkKind;
 use crate::transportation::TransportGrid;
@@ -11,6 +11,7 @@ use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
 use crate::{ParCommandBuffer, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
+use prototypes::Tick;
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
 
@@ -23,6 +24,7 @@ pub struct Router {
     vehicle: Option<VehicleID>,
     pub personal_car: Option<VehicleID>,
     pub last_error: Option<RouterError>,
+    pub trip_start: Option<Tick>,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -52,6 +54,15 @@ pub enum RoutingStep {
     GetOutVehicle(VehicleID),
     GetInBuilding(BuildingID),
     GetOutBuilding(BuildingID),
+    WaitAtStop {
+        stop: StopID,
+        line: LineID,
+        since: Tick,
+    },
+    RideTransit {
+        line: LineID,
+        alight: StopID,
+    },
 }
 
 debug_inspect_impl!(RoutingStep);
@@ -65,7 +76,7 @@ pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
 
     world.humans.iter_mut().for_each(|(id, h)| {
         let router = &mut h.router;
-        if router.cur_dest == router.target_dest {
+        if router.cur_dest == router.target_dest || matches!(h.location, Location::Transit(_)) {
             return;
         }
         let dest = unwrap_ret!(router.target_dest);
@@ -146,7 +157,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
 
         let pos = match h.location {
             Location::Outside => trans.pos,
-            Location::Vehicle(id) => world
+            Location::Vehicle(id) | Location::Transit(id) => world
                 .vehicles
                 .get(id)
                 .map(|x| x.trans.pos)
@@ -180,6 +191,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                 RoutingStep::GetOutVehicle(_) => true,
                 RoutingStep::GetInBuilding(_) => true,
                 RoutingStep::GetOutBuilding(_) => true,
+                RoutingStep::WaitAtStop { .. } | RoutingStep::RideTransit { .. } => false,
             };
         }
         let mut next_step_ready = true;
@@ -202,6 +214,8 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                     .map(|b| b.door_pos.is_close(pos, 3.0))
                     .unwrap_or(true),
                 RoutingStep::GetOutBuilding(_) => true,
+                RoutingStep::WaitAtStop { .. } => true,
+                RoutingStep::RideTransit { .. } => false,
             };
         }
 
@@ -276,6 +290,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                         .get_out(build, SoulID::Human(body));
                     walk_outside(body, wpos, cbuf_human, &mut h.location);
                 }
+                RoutingStep::WaitAtStop { .. } | RoutingStep::RideTransit { .. } => {}
             }
         }
     })
@@ -308,7 +323,21 @@ impl Router {
             vehicle: personal_car,
             cur_dest: None,
             last_error: None,
+            trip_start: None,
         }
+    }
+
+    pub fn cur_step(&self) -> Option<&RoutingStep> {
+        self.cur_step.as_ref()
+    }
+
+    pub fn references_stop(&self, stop: StopID) -> bool {
+        self.steps.iter().chain(self.cur_step()).any(|step| match *step {
+            RoutingStep::WaitAtStop { stop: id, .. } | RoutingStep::RideTransit { alight: id, .. } => {
+                id == stop
+            }
+            _ => false,
+        })
     }
 
     pub fn use_vehicle(&mut self, v: Option<VehicleID>) {
@@ -359,7 +388,14 @@ impl Router {
     }
 
     pub(crate) fn cancel_route(&mut self, parking: &mut ParkingManagement) {
+        // Alighting ends the current ride even if its destination was cancelled.
+        let onboard_step = if matches!(self.cur_step, Some(RoutingStep::RideTransit { .. })) {
+            self.cur_step.take()
+        } else {
+            None
+        };
         self.clear_steps(parking);
+        self.cur_step = onboard_step;
         self.cur_dest = None;
         self.target_dest = None;
         self.last_error = None;

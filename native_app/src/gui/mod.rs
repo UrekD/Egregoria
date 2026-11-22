@@ -131,6 +131,8 @@ pub enum Tool {
     Train,
     Terraforming,
     Zoning,
+    TransitStop,
+    TransitLine,
 }
 
 impl Tool {

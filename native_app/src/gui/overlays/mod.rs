@@ -10,7 +10,9 @@ use goryak::combo_box;
 use prototypes::{try_prototype, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer};
 use simulation::map::{Building, BuildingID, BuildingKind, Map, MapSubscriber, UpdateType};
-use simulation::map_dynamic::{CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow, UtilityStatus};
+use simulation::map_dynamic::{
+    CoverageGrid, ElectricityFlow, EnvGrid, Transit, UtilityFlow, UtilityStatus,
+};
 use simulation::souls::happiness::Happiness;
 use simulation::souls::residence::Residences;
 use simulation::Simulation;
@@ -31,6 +33,7 @@ pub(crate) enum OverlayMode {
     Pollution,
     LandValue,
     Happiness,
+    Transit,
 }
 
 fn deserialize_coverage<'de, D: Deserializer<'de>>(
@@ -107,7 +110,7 @@ const FOOTPRINT_PADDING: f32 = 6.0;
 impl OverlayMode {
     fn data_version(self, tick: u64) -> u64 {
         match self {
-            Self::Off | Self::Power => 0,
+            Self::Off | Self::Power | Self::Transit => 0,
             // Coverage passes occur at tick % 6000 == 300 + 600 * kind_index.
             Self::Coverage(kind) => tick / 6000 + u64::from(tick % 6000 >= coverage_offset(kind)),
             Self::Water | Self::Sewage | Self::Pollution | Self::LandValue => tick / 3000,
@@ -171,10 +174,10 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
         let map_changed = changes.take_updated_chunks().next().is_some() || cleared || new_map;
 
         let tick = sim.get_tick();
-        let data_version = if mode == OverlayMode::Power {
-            power_version(&map, &sim.read::<ElectricityFlow>())
-        } else {
-            mode.data_version(tick)
+        let data_version = match mode {
+            OverlayMode::Power => power_version(&map, &sim.read::<ElectricityFlow>()),
+            OverlayMode::Transit => sim.read::<Transit>().revision,
+            _ => mode.data_version(tick),
         };
         let rebuild = mode != cache.mode
             || map_changed
@@ -283,7 +286,7 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
             let happiness = sim.read::<Happiness>();
             buildings(&|b| happiness.by_building.get(&b.id).copied().map(f32::from));
         }
-        OverlayMode::Pollution | OverlayMode::Off => {}
+        OverlayMode::Pollution | OverlayMode::Off | OverlayMode::Transit => {}
     }
 }
 
@@ -303,7 +306,7 @@ pub(crate) fn power_available(map: &Map, flow: &ElectricityFlow, building: Build
 pub(crate) fn selector(uiworld: &UiWorld) {
     use OverlayMode::*;
 
-    const MODES: [(OverlayMode, &str); 13] = [
+    const MODES: [(OverlayMode, &str); 14] = [
         (Off, "Overlay off"),
         (Power, "Power"),
         (Water, "Water"),
@@ -317,6 +320,7 @@ pub(crate) fn selector(uiworld: &UiWorld) {
         (Pollution, "Pollution"),
         (LandValue, "Land value"),
         (Happiness, "Happiness"),
+        (Transit, "Transit"),
     ];
 
     let mut mode = uiworld.write::<OverlayMode>();

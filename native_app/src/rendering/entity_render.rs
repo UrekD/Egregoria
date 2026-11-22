@@ -1,7 +1,9 @@
 use common::FastMap;
+use engine::meshload::load_scaled_mesh;
 use engine::{FrameContext, GfxContext, InstancedMeshBuilder, MeshInstance, SpriteBatchBuilder};
 use geom::{LinearColor, Vec3, V3};
 use prototypes::{RenderAsset, RollingStockID, RollingStockPrototype};
+use simulation::map_dynamic::Transit;
 use simulation::transportation::{Location, VehicleKind};
 use simulation::Simulation;
 
@@ -14,6 +16,7 @@ pub struct InstancedRender {
     // pub wagons_passenger: InstancedMeshBuilder<true>,
     // pub wagons_freight: InstancedMeshBuilder<true>,
     pub trucks: InstancedMeshBuilder<true>,
+    pub buses: InstancedMeshBuilder<true>,
     pub pedestrians: InstancedMeshBuilder<true>,
 }
 
@@ -54,6 +57,9 @@ impl InstancedRender {
             // wagons_freight: InstancedMeshBuilder::new_ref(&gfx.mesh("wagon_freight.glb".as_ref()).unwrap()),
             // wagons_passenger: InstancedMeshBuilder::new_ref(&gfx.mesh("wagon.glb".as_ref()).unwrap()),
             trucks: InstancedMeshBuilder::new_ref(&gfx.mesh("truck.glb".as_ref()).unwrap()),
+            buses: InstancedMeshBuilder::new(
+                load_scaled_mesh(gfx, "truck.glb".as_ref(), 1.5).unwrap(),
+            ),
             pedestrians: InstancedMeshBuilder::new_ref(
                 &gfx.mesh("pedestrian.glb".as_ref()).unwrap(),
             ),
@@ -64,8 +70,10 @@ impl InstancedRender {
         profiling::scope!("entity_render::render");
         self.cars.instances.clear();
         self.trucks.instances.clear();
+        self.buses.instances.clear();
         self.pedestrians.instances.clear();
-        for v in sim.world().vehicles.values() {
+        let transit = sim.read::<Transit>();
+        for (id, v) in sim.world().vehicles.iter() {
             let trans = &v.trans;
             let instance = MeshInstance {
                 pos: trans.pos,
@@ -76,7 +84,14 @@ impl InstancedRender {
             match v.vehicle.kind {
                 VehicleKind::Car => self.cars.instances.push(instance),
                 VehicleKind::Truck => self.trucks.instances.push(instance),
-                _ => {}
+                VehicleKind::Bus => {
+                    let tint = transit
+                        .runs
+                        .get(&id)
+                        .and_then(|run| transit.lines.get(run.line))
+                        .map_or(instance.tint, |line| line.color.into());
+                    self.buses.instances.push(MeshInstance { tint, ..instance });
+                }
             }
         }
 
@@ -134,6 +149,9 @@ impl InstancedRender {
             fctx.objs.push(Box::new(x));
         }
         if let Some(x) = self.trucks.build(fctx.gfx) {
+            fctx.objs.push(Box::new(x));
+        }
+        if let Some(x) = self.buses.build(fctx.gfx) {
             fctx.objs.push(Box::new(x));
         }
         if let Some(x) = self.pedestrians.build(fctx.gfx) {

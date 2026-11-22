@@ -5,7 +5,7 @@ use crate::world::{VehicleEnt, VehicleID};
 use crate::Simulation;
 use egui_inspect::Inspect;
 use geom::Transform;
-use geom::{Color, Spline3, Vec3};
+use geom::{Color, Spline3, Vec2, Vec3};
 use prototypes::GameInstant;
 use serde::{Deserialize, Serialize};
 
@@ -180,6 +180,36 @@ pub fn spawn_parked_vehicle_with_spot(
     let vehicle = Vehicle::new(kind, spot_id, tint, &mut sim.write::<RandProvider>());
 
     Some(make_vehicle_entity(sim, pos, vehicle, it, false))
+}
+
+pub fn spawn_driving_vehicle(
+    sim: &mut Simulation,
+    kind: VehicleKind,
+    trans: Transform,
+) -> Option<VehicleID> {
+    if !trans.pos.is_finite() || !trans.dir.is_finite() || trans.dir.xy() == Vec2::ZERO {
+        return None;
+    }
+
+    let blocked = sim.world.vehicles.values().any(|other| {
+        let clearance = (kind.width() + other.vehicle.kind.width()) * 0.5;
+        other.collider.is_some()
+            && (trans.pos.z - other.trans.pos.z).abs() <= 5.0
+            && trans.pos.xy().is_close(other.trans.pos.xy(), clearance)
+    });
+    if blocked {
+        return None;
+    }
+
+    let mut rng = sim.write::<RandProvider>();
+    let tint = match kind {
+        VehicleKind::Car => get_random_car_color(&mut rng),
+        VehicleKind::Truck | VehicleKind::Bus => Color::WHITE,
+    };
+    let vehicle = Vehicle::with_state(kind, VehicleState::Driving, tint, &mut rng);
+    drop(rng);
+
+    Some(make_vehicle_entity(sim, trans, vehicle, Itinerary::NONE, true))
 }
 
 pub(crate) fn spawn_truck_at_depot(sim: &mut Simulation, door: Vec3) -> VehicleID {

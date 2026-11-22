@@ -3,6 +3,7 @@ pub mod citystats;
 pub mod economy;
 pub mod load;
 pub mod settings;
+mod transit_lines;
 
 use crate::inputmap::{InputAction, InputMap};
 use crate::uiworld::UiWorld;
@@ -19,6 +20,7 @@ pub struct GUIWindows {
     citystats_open: bool,
     settings_open: bool,
     load_open: bool,
+    transit_lines_open: bool,
     #[cfg(feature = "multiplayer")]
     network_open: bool,
 }
@@ -35,6 +37,10 @@ impl GUIWindows {
 
         if button_primary("City Stats").show().clicked {
             self.citystats_open ^= true;
+        }
+
+        if button_primary("Transit").show().clicked {
+            self.transit_lines_open ^= true;
         }
 
         if button_primary("Settings").show().clicked {
@@ -64,6 +70,7 @@ impl GUIWindows {
         economy::economy(uiworld, sim, &mut self.economy_open);
         budget::budget(uiworld, sim, &mut self.budget_open);
         citystats::citystats(uiworld, sim, &mut self.citystats_open);
+        transit_lines::transit_lines(&mut self.transit_lines_open);
         settings::settings(uiworld, sim, &mut self.settings_open);
         load::load(uiworld, sim, &mut self.load_open);
 

@@ -386,6 +386,12 @@ impl ScenarioCtx {
     }
 
     pub(crate) fn reload(&mut self) -> Result<(), String> {
+        self.sim = self.round_tripped()?;
+        self.sched = Simulation::schedule();
+        Ok(())
+    }
+
+    fn round_tripped(&self) -> Result<Simulation, String> {
         // Reserve a private directory so concurrent runs cannot share a midpoint save.
         static NEXT_SAVE: AtomicUsize = AtomicUsize::new(0);
         let save_dir = simulation::save_dir();
@@ -414,9 +420,7 @@ impl ScenarioCtx {
             )
         })?;
         compare_checkpoint(&checkpoint(&self.sim, true), &checkpoint(&sim, true))?;
-        self.sim = sim;
-        self.sched = Simulation::schedule();
-        Ok(())
+        Ok(sim)
     }
 
     fn record_checkpoints(
@@ -558,6 +562,15 @@ fn write_routing_step(hash: &mut impl Hasher, step: Option<&RoutingStep>) {
         Some(RoutingStep::GetOutVehicle(id)) => write_tagged_id(hash, 6, entity_ffi(*id)),
         Some(RoutingStep::GetInBuilding(id)) => write_tagged_id(hash, 7, slot_ffi(id)),
         Some(RoutingStep::GetOutBuilding(id)) => write_tagged_id(hash, 8, slot_ffi(id)),
+        Some(RoutingStep::WaitAtStop { stop, line, since }) => {
+            write_tagged_id(hash, 9, slot_ffi(stop));
+            write_u64_le(hash, slot_ffi(line));
+            write_u64_le(hash, since.0);
+        }
+        Some(RoutingStep::RideTransit { line, alight }) => {
+            write_tagged_id(hash, 10, slot_ffi(line));
+            write_u64_le(hash, slot_ffi(alight));
+        }
     }
 }
 
@@ -602,6 +615,7 @@ fn gameplay_projection(sim: &Simulation) -> u64 {
             Location::Outside => hash.write_u8(0),
             Location::Vehicle(id) => write_tagged_id(&mut hash, 1, entity_ffi(id)),
             Location::Building(id) => write_tagged_id(&mut hash, 2, slot_ffi(&id)),
+            Location::Transit(id) => write_tagged_id(&mut hash, 3, entity_ffi(id)),
         }
 
         let router: RouterView = serde_view(&human.router);
@@ -712,7 +726,97 @@ impl CommandSink for ScenarioCtx {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use geom::Color;
     use serde_json::{json, Value};
+    use simulation::map::LaneKind;
+    use simulation::map_dynamic::{Transit, TransitLine, TransitStop};
+
+    #[test]
+    #[ignore = "P3b regression gate for changes to the trip planner"]
+    fn p3b_no_transit_matches_frozen_projections() {
+        let baseline: BTreeMap<String, Vec<ProjectionCheckpoint>> =
+            serde_json::from_str(include_str!("../baselines/p2_projection.json")).unwrap();
+        for (scenario, options) in crate::builtin::SCENARIOS {
+            let Some(checkpoints) = baseline.get(scenario.name) else {
+                continue;
+            };
+            let mut ctx = ScenarioCtx::new(*options);
+            ctx.run_with_checkpoints(scenario.name, None, Some(checkpoints), scenario.run)
+                .unwrap();
+            if scenario.name == "growth_basic" {
+                check_zero_fleet_projection(ctx);
+            }
+        }
+    }
+
+    fn check_zero_fleet_projection(legacy: ScenarioCtx) {
+        let fleetless = legacy.round_tripped().unwrap();
+        let mut legacy = ScenarioCtx::from_sim(legacy.round_tripped().unwrap());
+        {
+            let map = fleetless.map();
+            let mut transit = fleetless.write::<Transit>();
+            let (lane, sidewalk) = map
+                .lanes()
+                .values()
+                .filter(|lane| lane.kind == LaneKind::Driving && lane.points.length() >= 60.0)
+                .find_map(|lane| {
+                    map.lanes()
+                        .values()
+                        .filter(|walk| walk.kind == LaneKind::Walking && walk.parent == lane.parent)
+                        .min_by(|a, b| {
+                            let middle = lane.points.middle();
+                            a.points.middle().distance2(middle)
+                                .total_cmp(&b.points.middle().distance2(middle))
+                        })
+                        .map(|walk| (lane, walk))
+                })
+                .expect("growth_basic must have a road with a sidewalk");
+            let stops = [0.3, 0.7]
+                .map(|fraction| {
+                    let (pos, dir) = lane.points.point_dir_along(lane.points.length() * fraction);
+                    let walk_pos = sidewalk.points.project(pos);
+                    transit.stops.insert_with_key(|id| TransitStop {
+                        id,
+                        pos,
+                        dir: dir.xy(),
+                        walk_pos,
+                        berth: pos,
+                    })
+                })
+                .to_vec();
+            // Set up the line directly so the two branches start with identical treasuries.
+            transit.lines.insert_with_key(|id| TransitLine {
+                id,
+                stops,
+                target_vehicles: 0,
+                fare: prototypes::Money::ZERO,
+                color: Color::WHITE,
+                suspended: false,
+            });
+        }
+
+        let mut fleetless = ScenarioCtx::from_sim(fleetless);
+        for _ in 0..3 {
+            legacy.run_ticks(CHECKPOINT_INTERVAL);
+            fleetless.run_ticks(CHECKPOINT_INTERVAL);
+            assert!(fleetless.sim.read::<Transit>().runs.is_empty());
+            assert_eq!(
+                gameplay_projection(&legacy.sim),
+                gameplay_projection(&fleetless.sim),
+            );
+        }
+    }
+
+    #[test]
+    #[ignore = "P3c requires the transit_basic scenario and commute metrics"]
+    fn p3c_transit_basic_is_deterministic() {
+        let (scenario, options) = crate::builtin::SCENARIOS
+            .iter()
+            .find(|(scenario, _)| scenario.name == "transit_basic")
+            .expect("transit_basic must compare matched commute attempts, including timeouts");
+        let mut ctx = ScenarioCtx::new(*options);
+        ctx.verify_twice(scenario.run).unwrap();
+    }
 
     #[test]
     fn hashes_dump_includes_checkpoints_and_final_for_each_run() {

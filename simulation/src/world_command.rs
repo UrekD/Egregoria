@@ -17,7 +17,7 @@ use crate::map::{
     LanePattern, LanePatternBuilder, LightPolicy, LotID, Map, MapProject, ProjectKind, RoadID,
     TerraformKind, TurnPolicy, Zone, ZoneGrid, ZoneKind,
 };
-use crate::map_dynamic::{BuildingInfos, ParkingManagement};
+use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
 use crate::multiplayer::MultiplayerState;
 use crate::souls::residence;
@@ -109,6 +109,31 @@ pub enum WorldCommand {
         zone: ZoneKind,
         rate_permille: u16,
     },
+    TransitAddStop {
+        pos: Vec3,
+        dir: Vec2,
+    },
+    TransitRemoveStop {
+        stop: StopID,
+    },
+    TransitCreateLine {
+        stops: Vec<StopID>,
+    },
+    TransitEditLine {
+        line: LineID,
+        stops: Vec<StopID>,
+    },
+    TransitRemoveLine {
+        line: LineID,
+    },
+    TransitSetVehicles {
+        line: LineID,
+        n: u8,
+    },
+    TransitSetFare {
+        line: LineID,
+        fare: Money,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,6 +150,7 @@ pub enum Rejection {
     CostOverflow,
     InsufficientFunds,
     MutationFailed,
+    TransitNotImplemented,
 }
 
 #[derive(Default)]
@@ -266,6 +292,13 @@ impl WorldCommand {
                 | SetGameTime(_)
                 | ZonePaint { .. }
                 | SetTaxRate { .. }
+                | TransitAddStop { .. }
+                | TransitRemoveStop { .. }
+                | TransitCreateLine { .. }
+                | TransitEditLine { .. }
+                | TransitRemoveLine { .. }
+                | TransitSetVehicles { .. }
+                | TransitSetFare { .. }
         )
     }
 
@@ -274,6 +307,11 @@ impl WorldCommand {
     }
 
     pub(crate) fn apply_in_batch(&self, sim: &mut Simulation) {
+        if let Err(reason) = transit::validate(self) {
+            self.reject(sim, reason);
+            return;
+        }
+
         {
             let mut replay = sim.write::<Replay>();
             if replay.enabled {
@@ -320,6 +358,13 @@ impl WorldCommand {
             SetGameTime(_) => "SetGameTime",
             ZonePaint { .. } => "ZonePaint",
             SetTaxRate { .. } => "SetTaxRate",
+            TransitAddStop { .. } => "TransitAddStop",
+            TransitRemoveStop { .. } => "TransitRemoveStop",
+            TransitCreateLine { .. } => "TransitCreateLine",
+            TransitEditLine { .. } => "TransitEditLine",
+            TransitRemoveLine { .. } => "TransitRemoveLine",
+            TransitSetVehicles { .. } => "TransitSetVehicles",
+            TransitSetFare { .. } => "TransitSetFare",
         };
         sim.write::<CommandOutcomes>().last.push((kind, reason));
     }
@@ -651,6 +696,13 @@ impl WorldCommand {
                 zone,
                 rate_permille,
             } => sim.write::<Budget>().set_tax_rate(zone, rate_permille),
+            TransitAddStop { .. }
+            | TransitRemoveStop { .. }
+            | TransitCreateLine { .. }
+            | TransitEditLine { .. }
+            | TransitRemoveLine { .. }
+            | TransitSetVehicles { .. }
+            | TransitSetFare { .. } => return Err(Rejection::TransitNotImplemented),
             AddTrain {
                 dist: _,
                 n_wagons: _,

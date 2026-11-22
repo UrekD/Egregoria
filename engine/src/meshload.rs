@@ -318,6 +318,23 @@ pub fn load_mesh_with_properties(
     asset_name: &Path,
     force_base_model: bool,
 ) -> Result<(Mesh, CPUMesh), LoadMeshError> {
+    load_mesh_impl(gfx, asset_name, force_base_model, 1.0)
+}
+
+pub fn load_scaled_mesh(
+    gfx: &mut GfxContext,
+    asset_name: &Path,
+    scale: f32,
+) -> Result<Mesh, LoadMeshError> {
+    load_mesh_impl(gfx, asset_name, false, scale).map(|(mesh, _)| mesh)
+}
+
+fn load_mesh_impl(
+    gfx: &mut GfxContext,
+    asset_name: &Path,
+    force_base_model: bool,
+    scale: f32,
+) -> Result<(Mesh, CPUMesh), LoadMeshError> {
     let mut path = PathBuf::new();
     path.push("assets/models_opt/");
     path.push(asset_name);
@@ -373,7 +390,7 @@ pub fn load_mesh_with_properties(
             let read_indices: Vec<u32> = unwrap_cont!(reader.read_indices()).into_u32().collect();
             let raw = positions.zip(normals).zip(uv).map(|((p, n), uv)| {
                 let pos = transform_mat * p.w(1.0);
-                let pos = pos.xyz() / pos.w;
+                let pos = (pos.xyz() / pos.w) * scale;
                 (pos, rot_qat * n, uv)
             });
 
@@ -392,8 +409,8 @@ pub fn load_mesh_with_properties(
                 }
             });
             meshb.set_bounds(AABB3 {
-                ll: bbox.min.into(),
-                ur: bbox.max.into(),
+                ll: Vec3::from(bbox.min) * scale,
+                ur: Vec3::from(bbox.max) * scale,
             });
         }
     }

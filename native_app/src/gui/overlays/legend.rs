@@ -33,7 +33,7 @@ impl OverlayMode {
         use OverlayMode::*;
 
         let labels = match self {
-            Off => return None,
+            Off | Transit => return None,
             Power => ["Blackout / disconnected", "Powered"],
             Water => ["No water", "Supplied"],
             Sewage => ["No sewage service", "Served"],
@@ -58,9 +58,10 @@ impl OverlayMode {
 }
 
 pub(super) fn render(mode: OverlayMode, label: &str, empty: bool) {
-    let Some(scale) = mode.scale() else {
+    if mode == OverlayMode::Off {
         return;
-    };
+    }
+    let scale = mode.scale();
     reflow(
         Alignment::TOP_LEFT,
         Pivot::TOP_LEFT,
@@ -70,6 +71,10 @@ pub(super) fn render(mode: OverlayMode, label: &str, empty: bool) {
                 padxy(10.0, 6.0, || {
                     mincolumn(4.0, || {
                         textc(on_secondary_container(), label.to_owned());
+                        let Some(scale) = scale else {
+                            textc(on_secondary_container(), "No transit routes to display");
+                            return;
+                        };
                         if scale.maximum == 1.0 {
                             minrow(12.0, || {
                                 for (value, label) in

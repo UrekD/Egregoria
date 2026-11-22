@@ -250,6 +250,7 @@ fn message(reason: Rejection) -> &'static str {
         Rejection::CostOverflow => "Construction cost is too large",
         Rejection::InsufficientFunds => "Not enough money",
         Rejection::MutationFailed => "The map change could not be applied",
+        Rejection::TransitNotImplemented => "Transit editing is unavailable",
     }
 }
 

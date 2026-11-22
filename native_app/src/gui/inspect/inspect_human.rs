@@ -45,6 +45,9 @@ pub fn inspect_human(uiworld: &UiWorld, sim: &Simulation, id: HumanID) -> bool {
             Location::Vehicle(_) => {
                 label("In a vehicle");
             }
+            Location::Transit(_) => {
+                label("On a bus");
+            }
             Location::Building(x) => {
                 minrow(5.0, || {
                     label("In a building:");
