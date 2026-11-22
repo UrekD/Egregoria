@@ -81,7 +81,7 @@ pub fn generate_with_options(
             "Turn restrictions and lane-specific turn markings are not imported.",
             "Rail uses one game lane per direction. Bridges and tunnels remain flat and unconnected at crossings.",
             "The passenger station is a static marker using a generic building mesh.",
-            "Junctions use priority signage without lights or all-way stops. Traffic lights are placed only where OSM maps highway=traffic_signals at the junction or on an approach.",
+            "Junctions use priority signage without all-way stops, and roundabouts yield on entry. Traffic lights are placed where OSM maps highway=traffic_signals at the junction or on an approach, and at crossroads where streets cross an arterial.",
         ],
         opening_budget_cents: 0,
         opening: None,
@@ -141,6 +141,13 @@ pub fn generate_with_options(
                 map.intersections()
                     .values()
                     .filter(|j| j.is_roundabout())
+                    .count(),
+            ),
+            (
+                "signalised_junctions".into(),
+                map.intersections()
+                    .values()
+                    .filter(|j| j.light_policy == LightPolicy::Lights)
                     .count(),
             ),
             ("lots".into(), map.lots().len()),
@@ -204,10 +211,8 @@ fn junction_policy_changes(
         LightPolicy::Auto.apply(junction, &mut auto, map.roads());
         let (before, after) = (describe(junction, &auto), describe(junction, map.lanes()));
         if before != after {
-            changes.push((
-                city.junction_sources[index].clone(),
-                format!("{before} -> {after}"),
-            ));
+            let (source, reason) = &city.junction_sources[index];
+            changes.push((source.clone(), format!("{before} -> {after}: {reason}")));
         }
     }
     changes
@@ -703,19 +708,24 @@ mod tests {
         .unwrap();
         let (sim, network) = Simulation::from_imported_city(&city.city, &lesce::OPTIONS).unwrap();
         let changes = junction_policy_changes(&sim.map(), &city, &network);
-        // The signalled crossroads keeps its lights, so only the other two are listed.
+        // Both signalled crossroads keep the lights Auto gives them, so they are not listed.
+        let expected = [
+            (
+                "node/5006",
+                "traffic lights -> priority (no lights): priority signage",
+            ),
+            (
+                "node/5011",
+                "all-way stop signs -> priority (no lights): priority signage",
+            ),
+            (
+                "node/5030 roundabout",
+                "traffic lights -> priority (no lights): roundabout",
+            ),
+        ];
         assert_eq!(
             changes,
-            [
-                (
-                    "node/5006".to_owned(),
-                    "traffic lights -> priority (no lights)".to_owned()
-                ),
-                (
-                    "node/5011".to_owned(),
-                    "all-way stop signs -> priority (no lights)".to_owned()
-                ),
-            ]
+            expected.map(|(source, change)| (source.to_owned(), change.to_owned()))
         );
     }
 }

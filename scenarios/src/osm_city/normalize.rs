@@ -120,8 +120,8 @@ pub struct Site {
 #[derive(Clone, Debug, PartialEq)]
 pub struct NormalizedCity {
     pub city: ImportedCity,
-    /// OSM origin of each junction, indexed by junction id.
-    pub junction_sources: Vec<String>,
+    /// OSM origin of each junction and the reason for its traffic control, indexed by junction id.
+    pub junction_sources: Vec<(String, &'static str)>,
     pub classes: Vec<LinkClass>,
     pub features: Vec<Feature>,
     pub forests: Vec<Forest>,
@@ -316,35 +316,47 @@ pub fn normalize(
         .values()
         .map(|(v, radius)| (v.key, *radius))
         .collect();
+    let mut legs = BTreeMap::<Anchor, Vec<LinkClass>>::new();
+    for edge in raw_edges
+        .iter()
+        .filter(|edge| !edge.class.rail() && edge.class != LinkClass::Foot)
+    {
+        for vertex in [edge.vertices[0], *edge.vertices.last().unwrap()] {
+            legs.entry(vertex.key).or_default().push(edge.class);
+        }
+    }
     let signalled = signalled_junctions(
         &extract.elements,
         bounds,
         &anchors,
-        &raw_edges,
+        &legs,
         &mut normalized.skipped,
     );
+    let mut controls = Vec::with_capacity(anchors.len());
     normalized.city.junctions = anchors
         .iter()
-        .map(|(&key, &position)| ImportedJunction {
-            id: keys[&key],
-            position,
-            roundabout_radius: radii.get(&key).copied(),
-            light_policy: if signalled.contains(&key) {
-                LightPolicy::Lights
-            } else if matches!(key, Anchor::Node(true, _)) {
-                LightPolicy::Auto
-            } else {
-                // Priority signage: through traffic is not held by lights or all-way stops.
-                LightPolicy::NoLights
-            },
+        .map(|(&key, &position)| {
+            let legs = legs.get(&key).map_or(&[][..], Vec::as_slice);
+            let (light_policy, reason) = junction_control(key, signalled.contains(&key), legs);
+            controls.push(reason);
+            ImportedJunction {
+                id: keys[&key],
+                position,
+                roundabout_radius: radii.get(&key).copied(),
+                light_policy,
+            }
         })
         .collect();
     normalized.junction_sources = anchors
         .keys()
-        .map(|key| match *key {
-            Anchor::Node(_, id) => format!("node/{id}"),
-            Anchor::Roundabout(id) => format!("node/{id} roundabout"),
-            Anchor::Cut(way, ..) => format!("way/{way} boundary"),
+        .zip(controls)
+        .map(|(key, reason)| {
+            let source = match *key {
+                Anchor::Node(_, id) => format!("node/{id}"),
+                Anchor::Roundabout(id) => format!("node/{id} roundabout"),
+                Anchor::Cut(way, ..) => format!("way/{way} boundary"),
+            };
+            (source, reason)
         })
         .collect();
 
@@ -378,22 +390,39 @@ pub fn normalize(
     Ok(normalized)
 }
 
+/// Traffic control for a junction with the given road legs, and the reason for the report.
+/// Junctions default to priority signage. Vehicles do not accept gaps in a busy through
+/// stream, so streets crossing an arterial are signalled. Roundabouts yield on entry.
+fn junction_control(
+    key: Anchor,
+    signalled: bool,
+    legs: &[LinkClass],
+) -> (LightPolicy, &'static str) {
+    let arterials = legs
+        .iter()
+        .filter(|&&class| class == LinkClass::Arterial)
+        .count();
+    if signalled {
+        (LightPolicy::Lights, "mapped traffic signals")
+    } else if matches!(key, Anchor::Node(true, _)) {
+        (LightPolicy::Auto, "rail")
+    } else if matches!(key, Anchor::Roundabout(_)) {
+        (LightPolicy::NoLights, "roundabout")
+    } else if legs.len() >= 4 && arterials >= 2 && legs.contains(&LinkClass::Street) {
+        (LightPolicy::Lights, "arterial crossroads")
+    } else {
+        (LightPolicy::NoLights, "priority signage")
+    }
+}
+
 /// Road junctions with mapped traffic signals at the node or on an approach.
 fn signalled_junctions(
     elements: &[Element],
     bounds: GeoBounds,
     anchors: &BTreeMap<Anchor, Vec2>,
-    edges: &[Edge],
+    legs: &BTreeMap<Anchor, Vec<LinkClass>>,
     skipped: &mut Vec<(String, String)>,
 ) -> BTreeSet<Anchor> {
-    let mut degree = BTreeMap::<Anchor, usize>::new();
-    for edge in edges {
-        if !edge.class.rail() && edge.class != LinkClass::Foot {
-            for vertex in [edge.vertices[0], *edge.vertices.last().unwrap()] {
-                *degree.entry(vertex.key).or_default() += 1;
-            }
-        }
-    }
     // Pedestrian-only signals do not control the junction.
     let mut signals: Vec<_> = elements
         .iter()
@@ -411,7 +440,7 @@ fn signalled_junctions(
         };
         let nearest = anchors
             .iter()
-            .filter(|(key, _)| degree.get(key).is_some_and(|&n| n >= 3))
+            .filter(|(key, _)| legs.get(key).is_some_and(|legs| legs.len() >= 3))
             .map(|(key, position)| (position.distance(point), *key))
             .filter(|&(distance, _)| distance <= SIGNAL_RADIUS)
             .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));

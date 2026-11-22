@@ -401,6 +401,25 @@ fn osm_junctions_default_to_priority_and_keep_mapped_signals() {
     assert!(controls(46.353, 14.142)
         .iter()
         .all(TrafficControl::is_always));
+    // Streets crossing an arterial cannot find gaps in its traffic without signals.
+    assert!(controls(46.356, 14.142)
+        .iter()
+        .all(TrafficControl::is_light));
+    // Roundabouts yield on entry, even where arterials meet.
+    let roundabout = normalized
+        .city
+        .junctions
+        .iter()
+        .find(|junction| junction.roundabout_radius.is_some())
+        .unwrap();
+    let roundabout = network.junctions[&roundabout.id];
+    assert_eq!(map.intersections()[roundabout].roads.len(), 4);
+    assert!(map.intersections()[roundabout]
+        .roads
+        .iter()
+        .flat_map(|&road| map.roads()[road].incoming_lanes_to(roundabout).iter())
+        .filter(|(_, kind)| *kind == LaneKind::Driving)
+        .all(|&(lane, _)| map.lanes()[lane].control.is_always()));
     // Signals away from any road junction are reported, not guessed.
     assert!(normalized
         .skipped

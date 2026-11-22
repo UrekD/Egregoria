@@ -199,7 +199,10 @@ fn add_junction(city: &mut NormalizedCity, position: Vec2, rail: bool) -> usize 
             LightPolicy::NoLights
         },
     });
-    city.junction_sources.push("synthetic".into());
+    city.junction_sources.push((
+        "synthetic".into(),
+        if rail { "rail" } else { "priority signage" },
+    ));
     id
 }
 
