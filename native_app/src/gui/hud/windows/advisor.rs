@@ -9,6 +9,7 @@ use geom::Vec3;
 use goryak::{
     mincolumn, minrow, on_secondary_container, outline, primary_link, textc, VertScrollSize, Window,
 };
+use simulation::economy::progression::progression_status;
 use simulation::map::{BuildingID, Map};
 use simulation::map_dynamic::Transit;
 use simulation::Simulation;
@@ -27,6 +28,20 @@ pub(super) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
         child_spacing: 6.0,
     }
     .show(|| {
+        let status = progression_status(sim);
+        if let Some((milestone, needed, unlocks)) = status.next {
+            textc(
+                on_secondary_container(),
+                format!(
+                    "Next goal · Milestone {milestone} ({} / {needed} citizens)",
+                    status.population
+                ),
+            );
+            for unlock in unlocks {
+                textc(on_secondary_container(), format!("Unlocks {unlock}"));
+            }
+        }
+
         publish(uiw);
         let center = uiw.read::<NotificationCenter>();
         let alerts = uiw.read::<ToastState>();

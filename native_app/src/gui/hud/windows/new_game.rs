@@ -88,6 +88,18 @@ pub(super) fn render(uiw: &UiWorld) {
         }
     });
 
+    textc(on_secondary_container(), "City mode");
+    minrow(8.0, || {
+        for (mode, label) in [
+            (ProgressionMode::Guided, "Guided"),
+            (ProgressionMode::FreeBuild, "Free build"),
+        ] {
+            if selectable_label_primary(form.progression == mode, label).clicked {
+                form.progression = mode;
+            }
+        }
+    });
+
     textc(on_secondary_container(), "Seed (0 uses legacy generation)");
     minrow(8.0, || {
         text_edit(230.0, &mut form.seed, "Seed");

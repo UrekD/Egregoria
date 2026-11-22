@@ -18,6 +18,7 @@ use prototypes::{
     prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyID, GoodsCompanyPrototype,
     Prototype, RenderAsset, ServiceID, ServiceKind,
 };
+use simulation::economy::progression::{can_build, BuildCapability};
 use simulation::map::{BuildingKind, Zone, MAX_ZONE_AREA};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
@@ -36,7 +37,7 @@ pub(crate) enum BuildingTab {
     Services,
 }
 
-pub fn special_building_properties(uiw: &UiWorld) {
+pub fn special_building_properties(uiw: &UiWorld, sim: &Simulation) {
     // Inspector windows are drawn over the shelf and can intercept card clicks.
     uiw.write::<InspectedBuilding>().e = None;
     uiw.write::<InspectedEntity>().e = None;
@@ -53,11 +54,11 @@ pub fn special_building_properties(uiw: &UiWorld) {
                 }
             }
         });
-        minrow(0.0, || building_choices(uiw, *tab));
+        minrow(0.0, || building_choices(uiw, sim, *tab));
     });
 }
 
-fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
+fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
     let mut state = uiw.write::<SpecialBuildingResource>();
     let icons = uiw.read::<BuildingIcons>();
 
@@ -80,8 +81,11 @@ fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
                     };
 
                     let service = try_prototype(ServiceID::from(descr.id));
+                    let lock = can_build(sim, BuildCapability::Prototype(descr.id)).err();
                     mincolumn(3.0, || {
-                        let default_col = if service.is_some()
+                        let default_col = if lock.is_some() {
+                            Color::rgb(140, 140, 140).with_alpha(0.65)
+                        } else if service.is_some()
                             && *selected.borrow() == Some(descr.id)
                             && state.opt.is_some()
                         {
@@ -89,8 +93,11 @@ fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
                         } else {
                             Color::WHITE
                         };
-                        let hover_col = primary();
-                        let active_col = default_col.with_alpha(0.5);
+                        let (hover_col, active_col) = if lock.is_some() {
+                            (default_col, default_col)
+                        } else {
+                            (primary(), default_col.with_alpha(0.5))
+                        };
 
                         let resp = image_button(
                             *tex_id,
@@ -98,10 +105,12 @@ fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
                             default_col,
                             hover_col,
                             active_col,
-                            "",
+                            lock.map_or_else(String::new, |lock| {
+                                format!("Unlocks at {} citizens", lock.population)
+                            }),
                         );
 
-                        let hover_enabled = service.is_none();
+                        let hover_enabled = service.is_none() && lock.is_none();
                         if hover_enabled && resp.hovering {
                             tooltip_active.set(Some((descr.id, Instant::now())));
                         }
@@ -268,7 +277,11 @@ fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
                             );
                         }
 
-                        if resp.clicked {
+                        if lock.is_some() && service.is_none() {
+                            textc(on_secondary_container().with_alpha(0.65), &descr.label);
+                        }
+
+                        if resp.clicked && lock.is_none() {
                             selected.set(Some(descr.id));
                             let bkind = BuildingKind::GoodsCompany(descr.id);
                             let bgen = descr.bgen;

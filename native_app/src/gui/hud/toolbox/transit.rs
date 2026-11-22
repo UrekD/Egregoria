@@ -1,6 +1,7 @@
 use goryak::{
     button_primary, button_secondary, minrow, on_secondary_container, padxy, textc, tooltip,
 };
+use simulation::economy::progression::{can_build, BuildCapability};
 use simulation::Simulation;
 
 use crate::gui::{GuiState, Tool};
@@ -28,10 +29,23 @@ pub(super) fn update_lines(uiworld: &UiWorld, sim: &Simulation) {
     }
 }
 
-pub(super) fn buttons(uiworld: &UiWorld) {
+pub(super) fn buttons(uiworld: &UiWorld, sim: &Simulation) {
     minrow(6.0, || {
         let current = *uiworld.read::<Tool>();
         for choice in [Tool::TransitStop, Tool::TransitLine] {
+            if choice == Tool::TransitLine {
+                if let Err(lock) = can_build(sim, BuildCapability::BusService) {
+                    tooltip(format!("Unlocks at {} citizens", lock.population), || {
+                        let mut button = button_secondary("Bus line");
+                        button.style.fill = button.style.fill.with_alpha(0.45);
+                        button.style.text.color = button.style.text.color.with_alpha(0.55);
+                        button.hover_style = button.style.clone();
+                        button.down_style = button.style.clone();
+                        button.show();
+                    });
+                    continue;
+                }
+            }
             if tool_button(current, choice) {
                 let mut state = uiworld.write::<TransitTools>();
                 state.line.cancel();

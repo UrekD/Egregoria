@@ -55,7 +55,7 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
                                     expanded(|| {
                                         let mut right = List::row();
                                         right.main_axis_alignment = MainAxisAlignment::End;
-                                        right.show(|| transit::buttons(uiworld));
+                                        right.show(|| transit::buttons(uiworld, sim));
                                     });
                                 });
                             });
@@ -68,7 +68,7 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
     transit::update_tool(uiworld, sim);
 }
 
-fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {
+fn tool_properties(uiw: &UiWorld, sim: &Simulation) -> bool {
     let tool = *uiw.read::<Tool>();
 
     match tool {
@@ -100,7 +100,7 @@ fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {
             roadedit::roadedit_properties(uiw);
         }
         Tool::SpecialBuilding => {
-            building::special_building_properties(uiw);
+            building::special_building_properties(uiw, sim);
         }
         Tool::Train => {
             train::train_properties(uiw);

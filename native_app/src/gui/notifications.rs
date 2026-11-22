@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use prototypes::{DayTime, GameTime, ItemID, Money, Tick};
 use simulation::diagnostics::elapsed_tick;
+use simulation::economy::progression::{milestone_reward, ProgressionState};
 use simulation::economy::{
     balance::{DEMAND_INTERVAL_TICKS, MIN_DEMAND_POPULATION},
     Budget, BudgetCategory, Government, ZoneDemand,
@@ -20,6 +21,7 @@ const UNEMPLOYMENT_PERCENT: usize = 25;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) enum NotificationKind {
+    MilestoneReached,
     CommandRejected,
     NegativeBudget,
     BudgetDeficit,
@@ -36,6 +38,7 @@ pub(crate) enum NotificationKind {
 impl NotificationKind {
     pub(crate) fn label(self) -> &'static str {
         match self {
+            Self::MilestoneReached => "Milestone reached",
             Self::CommandRejected => "Command rejected",
             Self::NegativeBudget => "Negative treasury",
             Self::BudgetDeficit => "Operating deficit",
@@ -52,7 +55,7 @@ impl NotificationKind {
 
     pub(crate) fn severity(self) -> Severity {
         match self {
-            Self::StalledDemand => Severity::Info,
+            Self::MilestoneReached | Self::StalledDemand => Severity::Info,
             Self::BudgetDeficit | Self::SuspendedLine | Self::HighUnemployment => Severity::Warning,
             _ => Severity::Error,
         }
@@ -178,6 +181,7 @@ pub(super) struct NotificationSampler {
     pending: VecDeque<Notification>,
     last_batch_seq: Option<u64>,
     fire_cursor: Option<u64>,
+    last_milestone: Option<u8>,
     last_sampled_tick: Option<Tick>,
     active: BTreeMap<AlertKey, ActiveAlert>,
     operating_balance: Option<i128>,
@@ -194,6 +198,21 @@ impl NotificationSampler {
         };
         self.observe_rejections(sim, now);
         self.observe_fires(sim, now);
+        let milestone = sim.read::<ProgressionState>().highest_milestone;
+        if let Some(previous) = self.last_milestone.replace(milestone) {
+            for reached in previous.saturating_add(1)..=milestone {
+                if let Some(grant) = milestone_reward(reached) {
+                    self.emit(
+                        NotificationKind::MilestoneReached,
+                        now.elapsed,
+                        now.calendar.daytime,
+                        None,
+                        AlertTarget::CityWide,
+                        format!("Milestone {reached} reached · {grant} awarded"),
+                    );
+                }
+            }
+        }
         if self
             .last_sampled_tick
             .is_none_or(|previous| tick.0.saturating_sub(previous.0) >= SAMPLE_INTERVAL)
@@ -232,6 +251,7 @@ impl NotificationSampler {
         self.pending.is_empty()
             && self.last_batch_seq.is_none()
             && self.fire_cursor.is_none()
+            && self.last_milestone.is_none()
             && self.last_sampled_tick.is_none()
             && self.active.is_empty()
             && self.operating_balance.is_none()
