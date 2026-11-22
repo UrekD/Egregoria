@@ -105,6 +105,13 @@ impl BuyGoods {
         if let Some((trades, index)) = trade {
             let trade = trades.remove(index);
             let mut market = resources.write::<Market>();
+            if let SoulID::Human(buyer) = trade.buyer.0 {
+                if !human.bought.0.values().flatten().any(|order| {
+                    order.seller == trade.seller && order.kind != ItemID::new("job-opening")
+                }) {
+                    market.forget_human_buyer(trade.seller.0, buyer);
+                }
+            }
             if arrived {
                 market.produce(trade.buyer.0, item, -trade.qty);
                 resources

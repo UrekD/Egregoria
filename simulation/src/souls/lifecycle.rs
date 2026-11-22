@@ -110,11 +110,17 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
         .cancel(resources, BasketFailure::ShopperRemoved);
     human.household.discard_order(resources);
     cancel_visit(id, human, resources);
-    sim.write::<Market>().record_household_losses(
-        std::mem::take(&mut human.household.on_hand)
-            .into_iter()
-            .chain(std::mem::take(&mut human.household.carried)),
-    );
+    {
+        let mut market = sim.write::<Market>();
+        market.record_household_losses(
+            std::mem::take(&mut human.household.on_hand)
+                .into_iter()
+                .chain(std::mem::take(&mut human.household.carried)),
+        );
+        for trade in human.bought.0.values().flatten() {
+            market.forget_human_buyer(trade.seller.0, id);
+        }
+    }
     if let Some(car) = human.router.personal_car {
         sim.read::<ParCommandBuffer<VehicleEnt>>().kill(car);
     }
@@ -185,6 +191,29 @@ pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: Comp
     sim.write::<CargoBook>().policies.remove(&id);
     sim.read::<ParCommandBuffer<VehicleEnt>>()
         .kill_all(&company.comp.trucks);
+    // A hire can be matched before the company's update assigns the workplace.
+    // Its worker roster already contains these residents.
+    {
+        let (world, resources) = sim.world_res();
+        let mut market = resources.write::<Market>();
+        let job = ItemID::new("job-opening");
+        let seller = SoulID::GoodsCompany(id);
+        for &worker in &company.workers.0 {
+            let Some(human) = world.humans.get_mut(worker) else {
+                continue;
+            };
+            let Some(orders) = human.bought.0.get_mut(&job) else {
+                continue;
+            };
+            orders.retain(|trade| trade.seller.0 != seller);
+            if orders.is_empty() {
+                human.bought.0.remove(&job);
+                if human.work.is_none() {
+                    market.buy(SoulID::Human(worker), human.trans.pos.xy(), job, 1);
+                }
+            }
+        }
+    }
     clear_soul_references(sim, SoulID::GoodsCompany(id));
     clear_building_references(sim, company.comp.building, None);
 }

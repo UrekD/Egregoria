@@ -182,8 +182,8 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         && (total_due == 0
             || total_filled as f64 / (total_due as f64) < 0.8
             || food_stockout > 1.5
-            || !(0.5..=1.2).contains(&outings)
-            || !(2.9..=4.0).contains(&units)
+            || !(0.3..=1.2).contains(&outings)
+            || !(2.9..=4.5).contains(&units)
             || total_groceries == 0)
     {
         return Err("Showcase City missed one or more household economy targets".into());

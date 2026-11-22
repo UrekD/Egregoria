@@ -2,8 +2,8 @@ use crate::economy::balance::{
     periodic_tick, shelf_delivery_item, shelf_delivery_units, DEFAULT_TAX_RATE_PERMILLE,
     DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS, DEMAND_OFFSET_TICKS, FOOD_UNIT_TICKS,
     GOODS_UNIT_TICKS, I_BASE, I_BOOTSTRAP_COMPANIES, K_GOODS, K_HAPPY, K_JOBS, K_RET, K_TAX,
-    K_UNEMP, K_VAC, MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, RETAIL_PER_CAPITA_PER_HOUR, R_BASE,
-    R_BOOTSTRAP_POPULATION, SHELF_TARGET_UTILIZATION,
+    K_UNEMP, K_VAC, MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, R_BASE, R_BOOTSTRAP_POPULATION,
+    SHELF_TARGET_UTILIZATION,
 };
 use crate::economy::{Budget, Market};
 use crate::map::{BuildingID, ZoneKind};
@@ -217,16 +217,12 @@ struct CompanyRates {
     goods_supply: f64,
     retail_supply: f64,
     groceries_supply: f64,
-    grocery_producers: bool,
     industrial_growables: usize,
 }
 
 impl CompanyRates {
     fn retail_shortfall(&self, population: usize, unmet: [u64; 2]) -> f32 {
         let residents = population as f64;
-        if !self.grocery_producers && unmet == [0, 0] {
-            return shortfall_norm(residents * RETAIL_PER_CAPITA_PER_HOUR, self.retail_supply);
-        }
         let staple_rate = TICKS_PER_HOUR as f64 / FOOD_UNIT_TICKS as f64;
         let goods_rate = TICKS_PER_HOUR as f64 / GOODS_UNIT_TICKS as f64;
         // Count live unmet lines by SKU. They can reveal empty or unevenly
@@ -245,8 +241,7 @@ impl CompanyRates {
         };
         let staples = shortage(staple_rate, self.groceries_supply, unmet[0]);
         let goods = shortage(goods_rate, self.retail_supply, unmet[1]);
-        (staples * staple_rate as f32 + goods * goods_rate as f32)
-            / (staple_rate + goods_rate) as f32
+        staples.max(goods)
     }
 }
 
@@ -281,8 +276,6 @@ fn company_rates(world: &World) -> CompanyRates {
         let staffed_batches = full_batches * f64::from(company.raw_productivity(proto, None));
         let delivery = amount(&recipe.production, shelf_delivery_item()) as i32;
         let [staples, _] = shelf_delivery_units(delivery);
-        let grocery_output = amount(&recipe.production, groceries) + f64::from(staples);
-        rates.grocery_producers |= grocery_output > 0.0;
         rates.groceries_supply += (amount(&recipe.production, groceries)
             + f64::from(staples) * SHELF_TARGET_UTILIZATION)
             * staffed_batches;
@@ -536,5 +529,24 @@ mod tests {
         }
 
         assert_eq!(trajectory(), trajectory());
+    }
+
+    #[test]
+    fn e1_fix2_commercial_demand_uses_the_largest_sku_shortfall() {
+        for (groceries_supply, retail_supply) in [(30.0, 0.0), (0.0, 30.0)] {
+            let rates = super::CompanyRates {
+                groceries_supply,
+                retail_supply,
+                ..Default::default()
+            };
+            assert_eq!(rates.retail_shortfall(100, [0, 0]), 100.0);
+        }
+        let rates = super::CompanyRates {
+            groceries_supply: 30.0,
+            retail_supply: 30.0,
+            ..Default::default()
+        };
+        assert!(rates.retail_shortfall(100, [0, 0]) < 0.0);
+        assert!(rates.retail_shortfall(100, [0, 1]) > 0.0);
     }
 }

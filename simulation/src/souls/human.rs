@@ -3,7 +3,7 @@ use crate::economy::{BasketFailure, Bought, Market, TripPurpose};
 use crate::map::BuildingID;
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{
-    walk_fits, BuildingInfos, Destination, ElectricityFlow, Itinerary, ParkingManagement, Router,
+    BuildingInfos, Destination, ElectricityFlow, Itinerary, ParkingManagement, Router,
     WalkingReach, NEAR_PARKING_RADIUS,
 };
 use crate::souls::desire::{
@@ -213,7 +213,8 @@ impl HumanDecisionKind {
             HumanDecisionKind::PickupBasket(_)
             | HumanDecisionKind::DepositAtHome
             | HumanDecisionKind::VisitLeisure(_) => {
-                unreachable!("household actions are handled by the resident scheduler")
+                debug_assert!(false, "household actions require the resident scheduler");
+                true
             }
         }
     }
@@ -362,20 +363,30 @@ impl HumanEnt {
                     self.household.deposit(now, resources);
                     return true;
                 }
-                if matches!(self.location, Location::Transit(_) | Location::Vehicle(_))
-                    && self.router.target_dest == Some(dest)
-                {
-                    return false;
-                }
                 if let Some(until) = self.household.homebound_until {
-                    let stalled = self.it.is_wait_for_reroute().is_some()
-                        && now + HOMEBOUND_TRAVEL_LIMIT - until >= 5 * TICKS_PER_MINUTE;
+                    let started = until.saturating_sub(HOMEBOUND_TRAVEL_LIMIT);
+                    let waiting_for_route = match self.location {
+                        Location::Vehicle(car) => vehicles
+                            .get(car)
+                            .is_none_or(|car| car.it.is_wait_for_reroute().is_some()),
+                        Location::Transit(_) => false,
+                        _ => self.it.is_wait_for_reroute().is_some(),
+                    };
+                    let stalled =
+                        waiting_for_route && now.saturating_sub(started) >= 5 * TICKS_PER_MINUTE;
                     if now >= until
                         || stalled
                         || self.router.last_error.is_some()
                         || self.router.target_dest != Some(dest)
                     {
-                        self.stop_route(resources);
+                        if matches!(self.location, Location::Transit(_)) {
+                            self.router.cancel_at_alight();
+                        } else {
+                            self.stop_route(resources);
+                            if let Location::Vehicle(car) = self.location {
+                                Router::exit_aborted_vehicle(self, car, vehicles, map, resources);
+                            }
+                        }
                         self.router.walk_only_pickup = false;
                         self.household.homebound_until = None;
                         self.household.next_deposit =
@@ -426,7 +437,16 @@ impl HumanEnt {
                 if !arrived {
                     return false;
                 }
-                let until = *self.household.leisure_until.get_or_insert(now + PARK_DWELL);
+                let until = if let Some(until) = self.household.leisure_until {
+                    until
+                } else {
+                    let mut claims = resources.write::<HouseholdClaims>();
+                    claims.remove_park_claim(park, id, &self.household);
+                    let until = now + PARK_DWELL;
+                    self.household.leisure_until = Some(until);
+                    claims.add_park_claim(park, id, &self.household);
+                    until
+                };
                 if now < until {
                     return false;
                 }
@@ -465,6 +485,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
         map,
         infos,
         electricity: &resources.read::<ElectricityFlow>(),
+        walk_distances: Default::default(),
     };
 
     for (id, h) in world.humans.iter_mut() {
@@ -516,6 +537,10 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             h.household.deposit(now, resources);
         }
         let carrying = !h.household.carried.is_empty();
+        if carrying && now >= h.household.next_deposit {
+            h.decision.kind = HumanDecisionKind::DepositAtHome;
+            continue;
+        }
 
         let home_score = h.home.score(h.household.needs.rest);
         h.home.last_score = home_score;
@@ -584,11 +609,6 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             }
         }
 
-        if carrying && now >= h.household.next_deposit {
-            h.decision.kind = HumanDecisionKind::DepositAtHome;
-            continue;
-        }
-
         // Explicit legacy single-item orders can still finish through the old
         // pickup interface. The household scorer only places basket orders.
         if h.bought
@@ -629,8 +649,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             h.household.next_leisure =
                 now + 3 * TICKS_PER_HOUR + common::hash_u64(id) % (30 * TICKS_PER_MINUTE);
             let park = parks.claim(
-                &mut resources.write::<HouseholdClaims>(),
-                id,
+                &resources.read::<HouseholdClaims>(),
                 &mut walking,
                 origin,
                 h.pedestrian.walking_speed,
@@ -639,6 +658,9 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             if let Some(park) = park {
                 h.household.leisure_visit = Some(park);
                 h.household.leisure_started = now;
+                resources
+                    .write::<HouseholdClaims>()
+                    .add_park_claim(park, id, &h.household);
                 h.start_walk(park, TripPurpose::Leisure, resources);
                 h.decision.kind = HumanDecisionKind::VisitLeisure(park);
                 continue;
@@ -673,7 +695,6 @@ fn start_basket(
         walk_radius
     };
     let mut component = None;
-    let excluded = h.household.excluded_seller(now);
     let map = parks.map;
     let basket = resources.write::<Market>().reserve_basket(
         shopper,
@@ -682,9 +703,6 @@ fn start_basket(
         request,
         now,
         |seller| {
-            if excluded == Some(seller) {
-                return None;
-            }
             let store = map.get(parks.infos.building_owned_by(seller)?)?;
             if store.is_orphaned() {
                 return None;
@@ -692,13 +710,7 @@ fn start_basket(
             if h.location != Location::Building(store.id) {
                 let start = *component.get_or_insert_with(|| walking.component_at(map, origin));
                 if !start.is_some_and(|start| walking.reaches_building(map, start, store))
-                    || !walk_fits(
-                        map,
-                        origin,
-                        store.door_pos,
-                        h.pedestrian.walking_speed,
-                        travel_budget,
-                    )
+                    || !parks.walk_fits(origin, store, h.pedestrian.walking_speed, travel_budget)
                 {
                     return None;
                 }
@@ -706,8 +718,8 @@ fn start_basket(
             Some(store.id)
         },
     );
-    let basket = match basket {
-        Ok(basket) => basket,
+    let (basket, missing) = match basket {
+        Ok(selection) => selection,
         Err(reason) => {
             if reason == BasketFailure::NoStockInRange {
                 h.household
@@ -721,6 +733,7 @@ fn start_basket(
     if !h.household.reserve(basket, resources) {
         return false;
     }
+    h.household.note_shelf_shortfall(now, missing);
     h.start_walk(store, TripPurpose::Shopping, resources);
     h.decision.kind = HumanDecisionKind::PickupBasket(id);
     // A resident may already be inside the selected store.

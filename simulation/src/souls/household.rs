@@ -81,7 +81,7 @@ pub(crate) fn household_items() -> [ItemID; 2] {
 #[derive(Default)]
 pub(crate) struct HouseholdClaims {
     pub(crate) baskets: BTreeMap<SoulID, BTreeSet<HumanID>>,
-    pub(crate) parks: BTreeMap<BuildingID, BTreeSet<HumanID>>,
+    pub(crate) parks: BTreeMap<BuildingID, BTreeSet<(bool, u64, HumanID)>>,
 }
 
 impl HouseholdClaims {
@@ -92,14 +92,30 @@ impl HouseholdClaims {
                 claims.baskets.entry(basket.seller).or_default().insert(id);
             }
             if let Some(park) = human.household.leisure_visit {
-                claims.parks.entry(park).or_default().insert(id);
+                claims.add_park_claim(park, id, &human.household);
             }
         }
         claims
     }
+
+    pub(crate) fn add_park_claim(&mut self, park: BuildingID, id: HumanID, stock: &HouseholdStock) {
+        self.parks
+            .entry(park)
+            .or_default()
+            .insert(stock.park_claim(id));
+    }
+
+    pub(crate) fn remove_park_claim(
+        &mut self,
+        park: BuildingID,
+        id: HumanID,
+        stock: &HouseholdStock,
+    ) {
+        remove_claim(&mut self.parks, park, stock.park_claim(id));
+    }
 }
 
-fn remove_claim<K: Copy + Ord>(claims: &mut BTreeMap<K, BTreeSet<HumanID>>, key: K, id: HumanID) {
+fn remove_claim<K: Ord, V: Ord>(claims: &mut BTreeMap<K, BTreeSet<V>>, key: K, id: V) {
     if let std::collections::btree_map::Entry::Occupied(mut claim) = claims.entry(key) {
         claim.get_mut().remove(&id);
         if claim.get().is_empty() {
@@ -109,6 +125,14 @@ fn remove_claim<K: Copy + Ord>(claims: &mut BTreeMap<K, BTreeSet<HumanID>>, key:
 }
 
 impl HouseholdStock {
+    fn park_claim(&self, id: HumanID) -> (bool, u64, HumanID) {
+        // A visitor already dwelling keeps precedence over someone en route.
+        match self.leisure_until {
+            Some(until) => (false, until, id),
+            None => (true, self.leisure_started, id),
+        }
+    }
+
     pub(crate) fn initialize(&mut self, id: HumanID, now: u64) {
         self.phase = common::hash_u64(id);
         self.next_shop = now + self.phase % (12 * TICKS_PER_HOUR);
@@ -138,6 +162,7 @@ impl HouseholdStock {
             staples,
             goods: BASKET_GOODS_TARGET.saturating_sub(self.units(retail)),
             fallback: (staples + BASKET_GOODS_TARGET).saturating_sub(self.units(retail)),
+            excluded_seller: self.excluded_seller(now),
         }
     }
 
@@ -146,22 +171,20 @@ impl HouseholdStock {
             Self::release(basket, resources, false);
             return false;
         }
-        if let Ok(mut claims) = resources.try_write::<HouseholdClaims>() {
-            claims
-                .baskets
-                .entry(basket.seller)
-                .or_default()
-                .insert(basket.shopper);
-        }
+        resources
+            .write::<HouseholdClaims>()
+            .baskets
+            .entry(basket.seller)
+            .or_default()
+            .insert(basket.shopper);
         self.basket = Some(basket.id);
         self.reservation = Some(Box::new(basket));
         true
     }
 
     fn clear_basket_claim(basket: &BasketReservation, resources: &Resources) {
-        if let Ok(mut claims) = resources.try_write::<HouseholdClaims>() {
-            remove_claim(&mut claims.baskets, basket.seller, basket.shopper);
-        }
+        let mut claims = resources.write::<HouseholdClaims>();
+        remove_claim(&mut claims.baskets, basket.seller, basket.shopper);
     }
 
     pub(crate) fn collect(&mut self, id: BasketId, now: u64, resources: &Resources) {
@@ -184,13 +207,6 @@ impl HouseholdStock {
         let staples = delivered(groceries);
         let goods = delivered(retail);
         let request = self.place_order(now);
-        self.note_shelf_shortfall(
-            now,
-            [
-                request.staples.saturating_sub(staples),
-                request.goods.saturating_sub(goods),
-            ],
-        );
         // A short fill can be retried before its next meal runs out.
         let food = staples + goods.saturating_sub(request.goods);
         self.next_shop = now + (2 + 3 * u64::from(food).min(4)) * TICKS_PER_HOUR;
@@ -247,7 +263,7 @@ impl HouseholdStock {
         resources.write::<Market>().release_basket(basket, refund);
     }
 
-    pub(crate) fn excluded_seller(&self, now: u64) -> Option<SoulID> {
+    fn excluded_seller(&self, now: u64) -> Option<SoulID> {
         self.excluded_seller
             .filter(|&(_, until)| now < until)
             .map(|(seller, _)| seller)
@@ -255,9 +271,23 @@ impl HouseholdStock {
 
     pub(crate) fn shop_failed(&mut self, now: u64, reason: BasketFailure, resources: &Resources) {
         resources.write::<Market>().record_basket_failure(reason);
-        let retry = SHOP_RETRY << self.shop_failures.min(3);
-        self.shop_failures = self.shop_failures.saturating_add(1);
-        self.next_shop = now + retry + self.phase % (30 * TICKS_PER_MINUTE);
+        match reason {
+            BasketFailure::Throttled => {
+                self.next_shop = now + TICKS_PER_MINUTE / 4 + self.phase % (TICKS_PER_MINUTE / 2);
+            }
+            BasketFailure::SellerRemoved => {
+                self.next_shop = now + 5 * TICKS_PER_MINUTE + self.phase % (5 * TICKS_PER_MINUTE);
+            }
+            BasketFailure::SellerExcluded => {
+                self.next_shop = now + SHOP_RETRY + self.phase % SHOP_RETRY;
+            }
+            BasketFailure::ShopperRemoved => {}
+            _ => {
+                let retry = SHOP_RETRY << self.shop_failures.min(3);
+                self.shop_failures = self.shop_failures.saturating_add(1);
+                self.next_shop = now + retry + self.phase % SHOP_RETRY;
+            }
+        }
         self.expire_order(now, resources);
     }
 
@@ -407,9 +437,9 @@ pub fn household_update(world: &mut World, resources: &mut Resources) {
 
 pub(crate) fn cancel_visit(id: HumanID, human: &mut HumanEnt, resources: &Resources) {
     if let Some(park) = human.household.leisure_visit.take() {
-        if let Ok(mut claims) = resources.try_write::<HouseholdClaims>() {
-            remove_claim(&mut claims.parks, park, id);
-        }
+        resources
+            .write::<HouseholdClaims>()
+            .remove_park_claim(park, id, &human.household);
         human.household.leisure_until = None;
         human.router.walk_only_pickup = false;
     }
@@ -568,7 +598,7 @@ mod tests {
         let request = h.household.place_order(due);
         let retail = ItemID::new("retail-goods");
         let pos = vec2(230.0, 145.0);
-        let basket = {
+        let (basket, _) = {
             let mut market = resources.write::<Market>();
             market.produce(seller, retail, 5);
             market.sell_all(seller, pos, retail, 0);
@@ -617,6 +647,119 @@ mod tests {
         recipe_act(recipe, seller, pos, &mut market);
         assert!(market.capital(seller, groceries) > 0);
         assert_eq!(market.capital(seller, retail), retail_limit);
+        assert_eq!(
+            market.seller_losses().get(&retail),
+            Some(&(retail_batch.amount as u64))
+        );
+    }
+
+    #[test]
+    fn e1_fix2_bakery_counts_reserved_stock_until_pickup_or_refund() {
+        use crate::economy::BasketRequest;
+        use crate::souls::goods_company::{recipe_act, recipe_should_produce};
+
+        let (mut test, shopper, _) = street();
+        let (store, seller) = business(&mut test, 230.0, "bakery");
+        let pos = test.g.map().get(store).unwrap().door_pos.xy();
+        let recipe = GoodsCompanyID::new("bakery")
+            .prototype()
+            .recipe
+            .as_ref()
+            .unwrap();
+        let groceries = ItemID::new("groceries");
+        let flour = ItemID::new("flour");
+        let batch = recipe.production[0].amount;
+        let allowance = batch * recipe.storage_multiplier;
+        let capacity = allowance + batch;
+        let mut market = test.g.write::<Market>();
+        market.produce(seller, groceries, allowance);
+        market.produce(seller, flour, 2);
+        market.sell_all(seller, pos, groceries, allowance as u32);
+        let (basket, _) = market
+            .reserve_basket(
+                shopper,
+                pos,
+                100.0,
+                BasketRequest {
+                    staples: batch as u32,
+                    ..Default::default()
+                },
+                1,
+                |_| Some(store),
+            )
+            .unwrap();
+
+        assert!(recipe_should_produce(recipe, seller, &market));
+        recipe_act(recipe, seller, pos, &mut market);
+        assert!(!recipe_should_produce(recipe, seller, &market));
+        assert_eq!(
+            market.m(groceries).sell_order(seller).unwrap().qty,
+            allowance as u32
+        );
+        market.release_basket(basket, true);
+        assert_eq!(
+            market.m(groceries).sell_order(seller).unwrap().qty,
+            capacity as u32
+        );
+        assert!(!recipe_should_produce(recipe, seller, &market));
+    }
+
+    #[test]
+    fn e1_fix2_synchronized_shoppers_retry_without_reporting_stockout() {
+        let (mut test, first, home) = street();
+        let second = spawn_human(&mut test.g, home).unwrap();
+        let (_, seller) = business(&mut test, 230.0, "commercial-l1");
+        shelf(&test, seller, ItemID::new("groceries"), 20);
+        for id in [first, second] {
+            due(&mut test, id);
+            test.g.world_mut_unchecked().humans[id]
+                .household
+                .last_update = Some(1);
+        }
+        test.tick_fast();
+        let stock = &test.g.get(second).unwrap().household;
+        assert!(test.g.get(first).unwrap().household.reservation.is_some());
+        assert!(stock.reservation.is_none());
+        assert_eq!(stock.shop_failures, 0);
+        assert_eq!(stock.unmet_shelf_demand(1), [0, 0]);
+        assert!(stock.next_shop < super::SHOP_RETRY);
+        assert_eq!(
+            test.g.read::<Market>().basket_failures()[&super::BasketFailure::Throttled],
+            1,
+        );
+        for _ in 0..2 * prototypes::TICKS_PER_MINUTE {
+            test.tick_fast();
+        }
+        assert!(test.g.get(second).unwrap().household.reservation.is_some());
+    }
+
+    #[test]
+    fn e1_fix2_removing_a_pending_employer_reopens_the_job_search() {
+        let (mut test, human, _) = street();
+        let (_, seller) = business(&mut test, 230.0, "commercial-l1");
+        let SoulID::GoodsCompany(company) = seller else {
+            unreachable!();
+        };
+        test.g.write::<Market>().index_human_buyers(test.g.world());
+        test.tick_fast();
+        let jobs = ItemID::new("job-opening");
+        assert_eq!(
+            test.g.get(human).unwrap().bought.0[&jobs][0].seller.0,
+            seller
+        );
+        let mut restored: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+
+        for sim in [&mut test.g, &mut restored] {
+            lifecycle::despawn_company(sim, company);
+            crate::utils::scheduler::drain_commands(sim);
+            assert!(!sim.get(human).unwrap().bought.0.contains_key(&jobs));
+            assert!(sim
+                .write::<Market>()
+                .m(jobs)
+                .buy_order(SoulID::Human(human))
+                .is_some());
+        }
+        assert!(test.g.is_equal(&restored));
     }
 
     #[test]
@@ -698,6 +841,57 @@ mod tests {
     }
 
     #[test]
+    fn e1_fix2_stalled_car_deposit_yields_with_stock_still_carried() {
+        use crate::map::{LaneKind, PathKind};
+        use crate::map_dynamic::{Destination, Itinerary, RoutingStep};
+        use crate::souls::human::HumanDecisionKind;
+
+        let (mut test, id, home) = street();
+        test.build_roads(&[vec3(100.0, 500.0, 0.0), vec3(420.0, 500.0, 0.0)]);
+        let car_pos = {
+            let map = test.g.map();
+            let pos = vec3(200.0, 500.0, 0.0);
+            map.get(map.nearest_lane(pos, LaneKind::Driving, None).unwrap())
+                .unwrap()
+                .points
+                .project_segment(pos)
+                .0
+        };
+        let home_pos = test.g.map().get(home).unwrap().door_pos;
+        let car = test.g.get(id).unwrap().router.personal_car.unwrap();
+        crate::transportation::unpark(&mut test.g, car);
+        let world = test.g.world_mut_unchecked();
+        let human = &mut world.humans[id];
+        let groceries = ItemID::new("groceries");
+        human.location = Location::Vehicle(car);
+        human.router.set_test_route(
+            Destination::Building(home),
+            vec![RoutingStep::DriveTo(car, home_pos)],
+        );
+        human.household.carried.insert(groceries, 3);
+        human.household.homebound_until = Some(super::HOMEBOUND_TRAVEL_LIMIT);
+        human.decision.kind = HumanDecisionKind::DepositAtHome;
+        human.decision.wait = 0;
+        world.vehicles[car].trans.pos = car_pos;
+        world.vehicles[car].it = Itinerary::wait_for_reroute(PathKind::Vehicle, home_pos);
+        for _ in 0..4 * prototypes::TICKS_PER_MINUTE {
+            test.tick_fast();
+        }
+        assert!(test.g.get(car).unwrap().it.is_wait_for_reroute().is_some());
+        for _ in 0..6 * prototypes::TICKS_PER_MINUTE {
+            test.tick_fast();
+        }
+        let human = test.g.get(id).unwrap();
+        assert!(!matches!(
+            human.decision.kind,
+            HumanDecisionKind::DepositAtHome
+        ));
+        assert_eq!(human.location, Location::Outside);
+        assert_ne!(human.router.target_dest, Some(Destination::Building(home)));
+        assert_eq!(human.household.carried.get(&groceries), Some(&3));
+    }
+
+    #[test]
     fn e1_fix_second_basket_refunds_without_overwriting_the_live_reservation() {
         let (mut test, id, _) = street();
         let (first, seller) = business(&mut test, 230.0, "commercial-l1");
@@ -710,7 +904,7 @@ mod tests {
         let stock = &mut world.humans[id].household;
         let request = stock.place_order(0);
         let pos = vec2(230.0, 145.0);
-        let first_basket = resources
+        let (first_basket, _) = resources
             .write::<Market>()
             .reserve_basket(id, pos, 600.0, request, 0, |candidate| {
                 (candidate == seller).then_some(first)
@@ -718,7 +912,7 @@ mod tests {
             .unwrap();
         let first_id = first_basket.id;
         assert!(stock.reserve(first_basket, resources));
-        let second_basket = resources
+        let (second_basket, _) = resources
             .write::<Market>()
             .reserve_basket(id, pos, 600.0, request, 1, |candidate| {
                 (candidate == other).then_some(second)

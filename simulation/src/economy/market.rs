@@ -253,6 +253,7 @@ pub(crate) struct BasketRequest {
     pub staples: u32,
     pub goods: u32,
     pub fallback: u32,
+    pub excluded_seller: Option<SoulID>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -263,6 +264,8 @@ pub enum BasketFailure {
     RouteInterrupted,
     SellerRemoved,
     ShopperRemoved,
+    Throttled,
+    SellerExcluded,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -352,38 +355,75 @@ impl Market {
     }
 
     pub fn sell_all(&mut self, soul: SoulID, near: Vec2, kind: ItemID, stock: u32) {
-        let capital = self.capital(soul, kind);
+        let capital = self.markets[&kind].capital(soul).unwrap_or(0);
         if capital <= 0 {
             return;
         }
         let delivery = shelf_delivery_item();
-        let [_, retail] = household_items();
+        let [groceries, retail] = household_items();
+        let mut stock = stock;
         let qty = if kind == delivery {
             self.unpack_delivery(soul, near, capital, stock)
-        } else if kind == retail
-            && stock > 0
-            && self
-                .markets
-                .get(&delivery)
-                .is_some_and(|market| market.capital(soul).is_some())
-        {
-            // Keep real retail in the recipe for residential access. The
-            // recipe's last slot is headroom for the delivery and refunds.
-            let advertised = self.markets[&retail]
+        } else if kind == retail && stock > 0 && self.has_delivery_stockroom(soul) {
+            // Both direct output and opened packages use the same shelf allowance.
+            stock = self.shelf_allowance(soul, retail, stock);
+            let advertised = self.markets[&kind]
                 .sell_order(soul)
                 .map_or(0, |order| order.qty);
             let limit = self
                 .shelf_room(soul, retail, stock as i32, 0)
                 .max(advertised as i32);
-            self.produce(soul, kind, -(capital - limit).max(0))
+            self.discard_shelf_overflow(soul, kind, capital, limit)
+        } else if kind == groceries && stock > 0 && !self.has_delivery_stockroom(soul) {
+            // Direct output is advertised in full after each batch. A batch
+            // can overshoot its limit when shoppers reserve part of a batch.
+            // Keep the same one-batch headroom as the recipe's output gate.
+            let advertised = self.markets[&kind]
+                .sell_order(soul)
+                .map_or(0, |order| order.qty) as i32;
+            let batch = capital - advertised;
+            if batch > 0 && self.reserved_stock.contains_key(&(soul, kind)) {
+                let limit = self.shelf_room(soul, kind, stock as i32 + batch, 0);
+                self.discard_shelf_overflow(soul, kind, capital, limit.max(advertised))
+            } else {
+                capital
+            }
         } else {
             capital
         };
-        if qty > 0 {
+        if qty > 0 || (stock > 0 && household_items().contains(&kind)) {
             self.sell(soul, near, kind, qty as u32, stock);
         } else {
             self.m(kind).sell_orders.remove(&soul);
         }
+    }
+
+    fn has_delivery_stockroom(&self, seller: SoulID) -> bool {
+        self.markets
+            .get(&shelf_delivery_item())
+            .is_some_and(|market| market.capital(seller).is_some())
+    }
+
+    fn shelf_allowance(&self, seller: SoulID, item: ItemID, default: u32) -> u32 {
+        self.markets[&item]
+            .sell_order(seller)
+            .filter(|order| order.stock > 0)
+            .map_or(default, |order| order.stock)
+    }
+
+    fn discard_shelf_overflow(
+        &mut self,
+        seller: SoulID,
+        item: ItemID,
+        stock: i32,
+        limit: i32,
+    ) -> i32 {
+        let excess = (stock - limit).max(0);
+        if excess > 0 {
+            *self.seller_losses.entry(item).or_default() += excess as u64;
+            return self.produce(seller, item, -excess);
+        }
+        stock
     }
 
     fn shelf_room(&self, seller: SoulID, item: ItemID, capacity: i32, stock: i32) -> i32 {
@@ -411,8 +451,8 @@ impl Market {
             (groceries, staples_per_package),
             (retail, goods_per_package),
         ] {
-            let limit = capacity as i32 * per_package;
-            let stock = self.capital(seller, item);
+            let limit = self.shelf_allowance(seller, item, capacity * per_package as u32) as i32;
+            let stock = self.markets[&item].capital(seller).unwrap_or(0);
             let opened = packages.min(self.shelf_room(seller, item, limit, stock) / per_package);
             if opened > 0 {
                 packages -= opened;
@@ -440,8 +480,15 @@ impl Market {
     pub(crate) fn index_human_buyers(&mut self, world: &crate::World) {
         self.human_buyers.get_or_insert_with(|| {
             let mut by_seller = BTreeMap::<_, BTreeSet<_>>::new();
+            let jobs = ItemID::new("job-opening");
             for (buyer, human) in world.humans.iter() {
-                for trade in human.bought.0.values().flatten() {
+                for trade in human
+                    .bought
+                    .0
+                    .iter()
+                    .filter(|(&item, _)| item != jobs)
+                    .flat_map(|(_, trades)| trades)
+                {
                     by_seller.entry(trade.seller.0).or_default().insert(buyer);
                 }
             }
@@ -454,6 +501,17 @@ impl Market {
             .as_mut()
             .and_then(|buyers| buyers.remove(&seller))
             .unwrap_or_default()
+    }
+
+    pub(crate) fn forget_human_buyer(&mut self, seller: SoulID, buyer: HumanID) {
+        if let Some(index) = &mut self.human_buyers {
+            if let Entry::Occupied(mut buyers) = index.entry(seller) {
+                buyers.get_mut().remove(&buyer);
+                if buyers.get().is_empty() {
+                    buyers.remove();
+                }
+            }
+        }
     }
 
     /// An agent was removed from the world, we need to clean after him
@@ -474,6 +532,9 @@ impl Market {
     }
 
     pub(crate) fn remove_account(&mut self, soul: SoulID) {
+        if let Some(buyers) = &mut self.human_buyers {
+            buyers.remove(&soul);
+        }
         if let Some(shelves) = &mut self.shelves {
             for item in household_items() {
                 shelves.remove(soul, item);
@@ -483,10 +544,19 @@ impl Market {
             self.reserved_stock.remove(&(soul, item));
         }
         self.shelf_refills.remove(&soul);
-        for market in self.markets.values_mut() {
+        let household = household_items();
+        let delivery = shelf_delivery_item();
+        for (&item, market) in &mut self.markets {
             market.sell_orders.remove(&soul);
             market.buy_orders.remove(&soul);
-            market.capital.remove(&soul);
+            if let Some(stock) = market.capital.remove(&soul) {
+                if stock > 0
+                    && !matches!(soul, SoulID::Human(_))
+                    && (household.contains(&item) || item == delivery)
+                {
+                    *self.seller_losses.entry(item).or_default() += stock as u64;
+                }
+            }
         }
     }
 
@@ -501,16 +571,28 @@ impl Market {
     }
 
     pub fn buy_until(&mut self, soul: SoulID, near: Vec2, kind: ItemID, qty: u32) {
-        let c = self.capital(soul, kind);
+        let c = self.markets[&kind].capital(soul).unwrap_or(0);
         if c >= qty as i32 {
             return;
         }
         self.buy(soul, near, kind, qty - c as u32);
     }
 
-    /// Get the capital that this agent owns
+    /// Stock owned by the agent. Direct grocery producers still hold basket
+    /// reservations on their premises, so they occupy recipe output storage.
     pub fn capital(&self, soul: SoulID, kind: ItemID) -> i32 {
-        self.markets.get(&kind).unwrap().capital(soul).unwrap_or(0)
+        let market = &self.markets[&kind];
+        let capital = market.capital(soul).unwrap_or(0);
+        if kind == household_items()[0] {
+            if let Some(&reserved) = self.reserved_stock.get(&(soul, kind)) {
+                if market.sell_order(soul).is_some_and(|order| order.stock > 0)
+                    && !self.has_delivery_stockroom(soul)
+                {
+                    return capital + reserved as i32;
+                }
+            }
+        }
+        capital
     }
 
     /// Registers a soul to the market, not obligatory
@@ -1071,7 +1153,7 @@ impl Market {
                     border.remove();
                     sorder.qty -= trade.qty as u32;
 
-                    if sorder.qty == 0 {
+                    if sorder.qty == 0 && !(local.contains(&kind) && sorder.stock > 0) {
                         sorderocc.remove();
                     }
 
@@ -1132,9 +1214,12 @@ impl Market {
             if local.contains(&trade.kind) {
                 self.shelf_refills.insert(trade.seller.0);
             }
-            if let (Some(by_seller), SoulID::Human(buyer)) = (&mut self.human_buyers, trade.buyer.0)
-            {
-                by_seller.entry(trade.seller.0).or_default().insert(buyer);
+            if trade.kind != job {
+                if let (Some(by_seller), SoulID::Human(buyer)) =
+                    (&mut self.human_buyers, trade.buyer.0)
+                {
+                    by_seller.entry(trade.seller.0).or_default().insert(buyer);
+                }
             }
         }
         &self.all_trades
@@ -1150,7 +1235,17 @@ impl Market {
         request: BasketRequest,
         now: u64,
         mut reachable: impl FnMut(SoulID) -> Option<BuildingID>,
-    ) -> Result<BasketReservation, BasketFailure> {
+    ) -> Result<(BasketReservation, [u32; 2]), BasketFailure> {
+        struct Candidate {
+            throttled: bool,
+            seller: SoulID,
+            pos: Vec2,
+            distance: OrderedFloat<f32>,
+            food: u32,
+            goods: u32,
+            missing: [u32; 2],
+        }
+
         let [groceries, retail] = household_items();
         let shelves = self.shelves.get_or_insert_with(|| {
             let mut shelves = ShelfIndex::default();
@@ -1175,8 +1270,9 @@ impl Market {
             })
         };
         let mut candidates = Vec::new();
+        let mut excluded = false;
         for seller in shelves.nearby(origin, radius) {
-            if seller == SoulID::Human(shopper) || self.reserved_this_tick.contains(&seller) {
+            if seller == SoulID::Human(shopper) {
                 continue;
             }
             let staple = available(groceries, seller);
@@ -1210,34 +1306,52 @@ impl Market {
             };
             let distance = OrderedFloat(origin.distance2(pos));
             if distance.0 <= radius.powi(2) {
-                candidates.push((
-                    Reverse(food),
-                    Reverse(food + goods),
-                    distance,
+                if request.excluded_seller == Some(seller) {
+                    excluded = true;
+                    continue;
+                }
+                candidates.push(Candidate {
+                    throttled: self.reserved_this_tick.contains(&seller),
                     seller,
                     pos,
+                    distance,
                     food,
                     goods,
-                ));
+                    missing: [
+                        request.staples.saturating_sub(staples_in_stock),
+                        request.goods.saturating_sub(goods_in_stock),
+                    ],
+                });
             }
         }
         if candidates.is_empty() {
-            return Err(BasketFailure::NoStockInRange);
+            return Err(if excluded {
+                BasketFailure::SellerExcluded
+            } else {
+                BasketFailure::NoStockInRange
+            });
         }
-        candidates.sort_unstable_by_key(|&(food, units, distance, seller, ..)| {
-            (food, units, distance, seller)
+        candidates.sort_unstable_by_key(|candidate| {
+            (
+                candidate.throttled,
+                Reverse(candidate.food),
+                Reverse(candidate.food + candidate.goods),
+                candidate.distance,
+                candidate.seller,
+            )
         });
-        let Some((seller, building, shelf_pos, food, goods)) =
-            candidates
-                .into_iter()
-                .find_map(|(_, _, _, seller, pos, food, goods)| {
-                    Some((seller, reachable(seller)?, pos, food, goods))
-                })
-        else {
+        let Some((candidate, building)) = candidates.into_iter().find_map(|candidate| {
+            let building = reachable(candidate.seller)?;
+            Some((candidate, building))
+        }) else {
             return Err(BasketFailure::NoWalkingRoute);
         };
+        if candidate.throttled {
+            return Err(BasketFailure::Throttled);
+        }
 
-        let lines: Vec<_> = [(groceries, food), (retail, goods)]
+        let seller = candidate.seller;
+        let lines: Vec<_> = [(groceries, candidate.food), (retail, candidate.goods)]
             .into_iter()
             .filter(|&(_, units)| units > 0)
             .collect();
@@ -1246,7 +1360,7 @@ impl Market {
             *market.capital.get_mut(&seller).unwrap() -= units as i32;
             let order = market.sell_orders.get_mut(&seller).unwrap();
             order.qty -= units;
-            if order.qty == 0 {
+            if order.qty == 0 && order.stock == 0 {
                 market.sell_orders.remove(&seller);
             }
             *self.reserved_stock.entry((seller, item)).or_default() += units;
@@ -1254,15 +1368,18 @@ impl Market {
         // Allow one basket per seller per tick. Rounded whole units set aside
         // a quarter of a replenished shelf for later decisions.
         self.reserved_this_tick.insert(seller);
-        Ok(BasketReservation {
-            id: BasketId(common::hash_u64((shopper, now))),
-            shopper,
-            seller,
-            building,
-            expires: now + BASKET_TRAVEL_LIMIT,
-            lines,
-            shelf_pos,
-        })
+        Ok((
+            BasketReservation {
+                id: BasketId(common::hash_u64((shopper, now))),
+                shopper,
+                seller,
+                building,
+                expires: now + BASKET_TRAVEL_LIMIT,
+                lines,
+                shelf_pos: candidate.pos,
+            },
+            candidate.missing,
+        ))
     }
 
     pub(crate) fn finish_basket(&mut self, basket: &BasketReservation) {

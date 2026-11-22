@@ -14,7 +14,7 @@ use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
 use crate::{ParCommandBuffer, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
-use prototypes::{Tick, TICKS_PER_REALTIME_SECOND};
+use prototypes::Tick;
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
 
@@ -425,7 +425,16 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                     }
                 }
                 RoutingStep::Unpark(vehicle) => {
-                    cbuf_vehicle.exec_ent(vehicle, move |sim| unpark(sim, vehicle));
+                    cbuf_vehicle.exec_ent(vehicle, move |sim| {
+                        if sim
+                            .world
+                            .vehicles
+                            .get(vehicle)
+                            .is_some_and(|car| car.vehicle.state.is_parked())
+                        {
+                            unpark(sim, vehicle);
+                        }
+                    });
                 }
                 RoutingStep::GetInVehicle(vehicle) => {
                     if !world.vehicles.contains_key(vehicle) {
@@ -503,15 +512,8 @@ fn walk_outside(body: HumanID, pos: Vec3, cbuf: &ParCommandBuffer<HumanEnt>, loc
 
 pub(crate) type WalkingReach = crate::economy::WalkingComponents;
 
-/// Reject trips which cannot finish inside a household action's travel budget.
-pub(crate) fn walk_fits(map: &Map, start: Vec3, end: Vec3, speed: f32, travel_ticks: u64) -> bool {
-    let max_distance = speed * travel_ticks as f32 / TICKS_PER_REALTIME_SECOND as f32;
-    if start.distance2(end) > max_distance.powi(2) {
-        return false;
-    }
-    let Some(route) = Itinerary::route(Tick(0), start, end, map, PathKind::Pedestrian) else {
-        return false;
-    };
+pub(crate) fn walking_route_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
+    let route = Itinerary::route(Tick(0), start, end, map, PathKind::Pedestrian)?;
     let mut pos = start;
     let mut distance = 0.0;
     for &point in route.local_path().iter().rev() {
@@ -521,16 +523,11 @@ pub(crate) fn walk_fits(map: &Map, start: Vec3, end: Vec3, speed: f32, travel_ti
     if let Some(route) = route.get_route() {
         for (index, step) in route.reversed_route.iter().enumerate().rev() {
             if index == 0 {
-                let Some(points) =
-                    PathKind::Pedestrian.local_route(map, step.destination_lane(), pos, end)
-                else {
-                    return false;
-                };
+                let points =
+                    PathKind::Pedestrian.local_route(map, step.destination_lane(), pos, end)?;
                 distance += pos.distance(points.first()) + points.length();
             } else {
-                let Some(points) = step.raw_points(map) else {
-                    return false;
-                };
+                let points = step.raw_points(map)?;
                 let (first, last) = match step.dir {
                     TraverseDirection::Forward => (points.first(), points.last()),
                     TraverseDirection::Backward => (points.last(), points.first()),
@@ -540,7 +537,7 @@ pub(crate) fn walk_fits(map: &Map, start: Vec3, end: Vec3, speed: f32, travel_ti
             }
         }
     }
-    distance <= max_distance
+    Some(distance)
 }
 
 impl Router {
@@ -623,6 +620,40 @@ impl Router {
         human.router.cur_step = None;
         human.router.defer_replan();
         Self::restore_walking(human, pos, resources);
+    }
+
+    pub(crate) fn cancel_at_alight(&mut self) {
+        on_cancel(self);
+        self.target_dest = None;
+        self.defer_replan();
+    }
+
+    pub(crate) fn exit_aborted_vehicle(
+        human: &mut HumanEnt,
+        id: VehicleID,
+        vehicles: &HopSlotMap<VehicleID, VehicleEnt>,
+        map: &Map,
+        resources: &Resources,
+    ) {
+        let pos = vehicles.get(id).map_or(human.trans.pos, |car| {
+            car.trans.pos + car.trans.dir.cross(Vec3::Z) * 2.0
+        });
+        let exit = map
+            .nearest_lane(
+                pos,
+                crate::map::LaneKind::Walking,
+                Some(NEAR_PARKING_RADIUS),
+            )
+            .and_then(|lane| map.get(lane))
+            .map_or(pos, |lane| lane.points.project_segment(pos).0);
+        resources
+            .read::<ParCommandBuffer<VehicleEnt>>()
+            .exec_ent(id, move |sim| {
+                if let Some(vehicle) = sim.world.vehicles.get_mut(id) {
+                    vehicle.it = Itinerary::NONE;
+                }
+            });
+        Self::restore_walking(human, exit, resources);
     }
 
     pub(crate) fn defer_replan(&mut self) {
