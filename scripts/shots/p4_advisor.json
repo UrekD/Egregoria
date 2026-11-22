@@ -10,7 +10,7 @@
   {"Commands": [{"MapRemoveBuilding": {"idx": 999999, "version": 1}}]},
   {"Screenshot": "advisor-rejections"},
   {"DumpState": "advisor-rejections"},
-  {"Pointer": {"action": "Click", "screen_pos": [525, 409]}},
+  {"Pointer": {"action": "Click", "screen_pos": [525, 445]}},
   {"WaitFrames": 3},
   {"Assert": "HouseInspector"},
   {"Screenshot": "advisor-building-why"},
