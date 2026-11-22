@@ -6,7 +6,7 @@ use simulation::map::ZoneKind::{Commercial, Industrial, Office, Residential};
 use simulation::{Simulation, SimulationOptions, SlotId};
 
 use crate::builders::{
-    grid_city, paint_zone_blocks, place_freight_station, place_grid_power_plant,
+    grid_city, paint_zone_blocks, place_company, place_freight_station, place_grid_power_plant,
     place_service_sites, UTILITY_SITES,
 };
 use crate::{Scenario, ScenarioCtx};
@@ -25,10 +25,22 @@ pub(super) const SCENARIO: (Scenario, SimulationOptions) = (
 
 fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let showcase = std::env::var_os("EGREGORIA_ECONOMY_SHOWCASE_ROOT");
+    let demo_slot =
+        std::env::var("EGREGORIA_ECONOMY_DEMO_SLOT").unwrap_or_else(|_| "showcase_city".into());
     if let Some(root) = &showcase {
-        let slot = SlotId::new("showcase_city").map_err(|error| error.to_string())?;
+        let slot = SlotId::new(&demo_slot).map_err(|error| error.to_string())?;
         ctx.sim = Simulation::load_from_slot(std::path::Path::new(root), &slot)
             .map_err(|error| error.to_string())?;
+        if demo_slot == "starter_town" {
+            // The opening town's first 46 workers fill closer jobs. Grow the
+            // neighbourhood by the mine to exercise a staffed freight route.
+            paint_zone_blocks(
+                ctx,
+                vec2(3630.0, 6120.0),
+                100.0,
+                [(2, 1, Residential, High), (2, 2, Residential, High)],
+            );
+        }
     } else {
         build_fixture(ctx)?;
         ctx.run_ticks(2 * TICKS_PER_BUDGET_DAY);
@@ -49,6 +61,10 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mut total_due = 0;
     let mut total_filled = 0;
     let mut total_food_stockout = 0.0;
+    let mut total_loads = 0;
+    let mut total_load_units = 0;
+    let mut total_late = 0;
+    let mut total_coal_stockout = 0;
     let failures_before = ctx.sim.read::<Market>().basket_failures().clone();
 
     for day in first_day..first_day + 2 {
@@ -68,6 +84,22 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         let data = metrics
             .closed_day(day, (day + 1) * TICKS_PER_BUDGET_DAY)
             .ok_or_else(|| format!("no measurements for economy day {day}"))?;
+        let loads = data.loads.unwrap_or(0);
+        let load_units = data.load_units.unwrap_or(0);
+        let late = data.late_loads.unwrap_or(0);
+        let coal_stockout = data
+            .stockout_ticks_by_sku
+            .get(&ItemID::new("coal"))
+            .copied()
+            .unwrap_or(0);
+        total_loads += loads;
+        total_load_units += load_units;
+        total_late += late;
+        total_coal_stockout += coal_stockout;
+        println!(
+            "economy_loop freight day {day}: {loads} loads, {load_units} units, {late} late or cancelled; \
+             {coal_stockout} coal plant input stockout ticks",
+        );
         let trips = |purpose| {
             data.trips_by_purpose
                 .get(&purpose)
@@ -135,7 +167,18 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         market.household_losses(),
         market.seller_losses(),
     );
+    let mean_load = total_load_units as f64 / total_loads.max(1) as f64;
+    let on_time = total_loads.saturating_sub(total_late) as f64 / total_loads.max(1) as f64;
+    println!(
+        "economy_loop freight totals: {total_loads} loads, {mean_load:.2} units/load, \
+         {:.1}% on time, {total_coal_stockout} coal plant input stockout ticks",
+        100.0 * on_time,
+    );
+    if total_loads == 0 || mean_load < 8.0 || on_time < 0.9 || total_coal_stockout != 0 {
+        return Err("City missed one or more road freight targets".into());
+    }
     if showcase.is_some()
+        && demo_slot == "showcase_city"
         && (total_due == 0
             || total_filled as f64 / (total_due as f64) < 0.8
             || food_stockout > 1.5
@@ -159,6 +202,8 @@ fn build_fixture(ctx: &mut ScenarioCtx) -> Result<(), String> {
     )
     .ok_or("could not place the economy loop freight station")?;
     place_grid_power_plant(ctx, origin)?;
+    place_company(ctx, "coal-mine", origin + vec2(275.0, 330.0))
+        .ok_or("could not place the economy loop coal mine")?;
     place_service_sites(ctx, origin, UTILITY_SITES)?;
 
     paint_zone_blocks(

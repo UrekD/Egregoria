@@ -48,7 +48,7 @@ impl Work {
             WorkKind::Driver {
                 deliver_order,
                 truck,
-                ..
+                load,
             } => {
                 if &Location::Building(self.workplace) != loc {
                     MultiStack(vec![
@@ -59,7 +59,10 @@ impl Work {
                     MultiStack(vec![
                         SetVehicle(router.personal_car),
                         GoTo(Destination::Building(self.workplace)),
-                        DeliverAtBuilding(b),
+                        load.map_or(DeliverAtBuilding(b), |load| DeliverLoad {
+                            destination: b,
+                            load,
+                        }),
                         GoTo(Destination::Building(b)),
                         SetVehicle(Some(truck)),
                     ])

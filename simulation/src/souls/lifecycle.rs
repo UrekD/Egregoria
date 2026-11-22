@@ -1,4 +1,4 @@
-use crate::economy::cargo::CargoBook;
+use crate::economy::cargo::{cancel_removed, CargoBook, CargoRemoval, LoadId};
 use geom::Vec3;
 use itertools::Itertools;
 use prototypes::{GameTime, ItemID};
@@ -39,6 +39,7 @@ pub fn despawn_company(sim: &mut Simulation, id: CompanyID) {
 
 pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_external_target: bool) {
     let id = building.id;
+    cancel_removed(sim, CargoRemoval::Building(id));
     if building.kind == BuildingKind::House {
         let (world, resources) = sim.world_res();
         let infos = resources.read::<BuildingInfos>();
@@ -102,6 +103,7 @@ pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_exte
 }
 
 pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut HumanEnt) {
+    cancel_removed(sim, CargoRemoval::Driver(id));
     let (_, resources) = sim.world_res();
     human
         .household
@@ -179,6 +181,7 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
 }
 
 pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: CompanyEnt) {
+    cancel_removed(sim, CargoRemoval::Soul(SoulID::GoodsCompany(id)));
     sim.write::<CargoBook>().policies.remove(&id);
     sim.read::<ParCommandBuffer<VehicleEnt>>()
         .kill_all(&company.comp.trucks);
@@ -191,6 +194,7 @@ pub(crate) fn freight_station_dropped(
     id: crate::FreightStationID,
     station: FreightStationEnt,
 ) {
+    cancel_removed(sim, CargoRemoval::Soul(SoulID::FreightStation(id)));
     clear_soul_references(sim, SoulID::FreightStation(id));
     clear_building_references(sim, station.f.building, None);
     let (world, resources) = sim.world_res();
@@ -205,6 +209,7 @@ pub(crate) fn freight_station_dropped(
 }
 
 pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec3) {
+    cancel_removed(sim, CargoRemoval::Truck(id));
     detach_transit_vehicle(sim, id, position);
     let (world, resources) = sim.world_res();
     resources.write::<RandomVehicles>().vehicles.remove(&id);
@@ -731,6 +736,59 @@ fn truck_company(sim: &Simulation, truck: VehicleID) -> Option<CompanyID> {
         .companies
         .iter()
         .find_map(|(id, company)| company.comp.trucks.contains(&truck).then_some(id))
+}
+
+pub(crate) fn abort_freight_trip(
+    sim: &mut Simulation,
+    driver: HumanID,
+    truck: VehicleID,
+    token: LoadId,
+    used_truck: bool,
+) {
+    if sim.read::<CargoBook>().manifest_for(truck).is_some() {
+        return;
+    }
+    let (world, resources) = sim.world_res();
+    if let Some(human) = world.humans.get_mut(driver) {
+        let riding = human.location == Location::Vehicle(truck);
+        if riding {
+            let pos = world
+                .vehicles
+                .get(truck)
+                .map_or(human.trans.pos, |v| v.trans.pos);
+            move_outside(human, pos, resources);
+        }
+        if riding || human.decision.kind.references_load(token) {
+            if human.router.selected_vehicle() == Some(truck) {
+                human.router.use_vehicle(human.router.personal_car);
+            }
+            cancel_trip(
+                driver,
+                human,
+                resources,
+                &mut resources.write::<ParkingManagement>(),
+            );
+        }
+    }
+    if used_truck
+        && sim.get(truck).is_some_and(|vehicle| {
+            matches!(
+                vehicle.vehicle.state,
+                VehicleState::Parked(_) | VehicleState::RoadToPark(..)
+            )
+        })
+    {
+        if let Some(company) = truck_company(sim, truck) {
+            let depot = sim.get(company).unwrap().comp.building;
+            let door = sim.map().get(depot).map(|building| building.door_pos);
+            if let Some(door) = door {
+                let replacement = spawn_truck_at_depot(sim, door);
+                replace_truck(sim, company, truck, replacement);
+                return;
+            }
+        }
+    }
+    return_truck_to_depot(sim, truck);
 }
 
 fn return_truck_to_depot(sim: &mut Simulation, truck: VehicleID) {

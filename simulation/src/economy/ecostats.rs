@@ -5,7 +5,8 @@ use serde_big_array::BigArray;
 
 use prototypes::{prototypes_iter, ItemPrototype, Money};
 
-use crate::economy::{ItemID, Trade};
+use crate::economy::{DailyEconomyMetrics, ItemID, Trade, TICKS_PER_BUDGET_DAY};
+use crate::utils::resources::Resources;
 use crate::SoulID;
 
 pub const HISTORY_SIZE: usize = 128;
@@ -112,17 +113,44 @@ impl EcoStats {
         self.internal_trade.advance(tick);
 
         for trade in trades {
-            if matches!(trade.buyer.0, SoulID::FreightStation(_)) {
-                self.exports.handle_trade(trade);
-                continue;
-            }
-            if matches!(trade.seller.0, SoulID::FreightStation(_)) {
-                self.imports.handle_trade(trade);
-                continue;
-            }
+            self.record_trade(trade);
+        }
+    }
+
+    pub(crate) fn record_trade(&mut self, trade: &Trade) {
+        if matches!(trade.buyer.0, SoulID::FreightStation(_)) {
+            self.exports.handle_trade(trade);
+        } else if matches!(trade.seller.0, SoulID::FreightStation(_)) {
+            self.imports.handle_trade(trade);
+        } else {
             self.internal_trade.handle_trade(trade);
         }
     }
+}
+
+/// Record each dispatched load on the day it finishes or is cancelled. A
+/// cancellation is a missed delivery, even when its stock can be recovered.
+pub(crate) fn record_freight_outcome(resources: &Resources, elapsed: u64, units: u32, late: bool) {
+    let mut metrics = resources.write::<DailyEconomyMetrics>();
+    let day = metrics
+        .days
+        .entry(elapsed / TICKS_PER_BUDGET_DAY)
+        .or_default();
+    *day.loads.get_or_insert(0) += 1;
+    *day.load_units.get_or_insert(0) += u64::from(units);
+    *day.late_loads.get_or_insert(0) += u64::from(late);
+}
+
+pub(crate) fn record_coal_stockout(resources: &Resources, item: ItemID) {
+    let day = crate::map_dynamic::transit::elapsed_ticks(resources).0 / TICKS_PER_BUDGET_DAY;
+    let mut metrics = resources.write::<DailyEconomyMetrics>();
+    *metrics
+        .days
+        .entry(day)
+        .or_default()
+        .stockout_ticks_by_sku
+        .entry(item)
+        .or_default() += 1;
 }
 
 #[cfg(test)]

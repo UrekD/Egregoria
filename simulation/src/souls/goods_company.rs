@@ -6,7 +6,7 @@ use prototypes::{
     try_prototype, CompanyKind, GoodsCompanyID, GoodsCompanyPrototype, ItemID, Power, Recipe, DELTA,
 };
 
-use crate::economy::{find_trade_place, Market};
+use crate::economy::{cargo::uses_road_freight, find_trade_place, record_coal_stockout, Market};
 use crate::map::{Building, BuildingID, Map, Zone, MAX_ZONE_AREA};
 use crate::map_dynamic::{BuildingInfos, ElectricityFlow};
 use crate::souls::desire::WorkKind;
@@ -76,18 +76,30 @@ pub fn recipe_blockers<'a>(
 }
 
 pub fn recipe_act(recipe: &Recipe, soul: SoulID, near: Vec2, market: &mut Market) {
+    run_recipe(recipe, soul, near, market, |_| false);
+}
+
+fn run_recipe(
+    recipe: &Recipe,
+    soul: SoulID,
+    near: Vec2,
+    market: &mut Market,
+    road_freight: impl Fn(ItemID) -> bool,
+) {
     for item in &recipe.consumption {
         market.produce(soul, item.id, -item.amount);
         market.buy_until(soul, near, item.id, item.amount as u32);
     }
     for item in &recipe.production {
         market.produce(soul, item.id, item.amount);
-        market.sell_all(
-            soul,
-            near,
-            item.id,
-            (item.amount * recipe.storage_multiplier) as u32,
-        );
+        if !road_freight(item.id) {
+            market.sell_all(
+                soul,
+                near,
+                item.id,
+                (item.amount * recipe.storage_multiplier) as u32,
+            );
+        }
     }
 }
 
@@ -209,12 +221,12 @@ pub fn is_special_building_company(proto: GoodsCompanyID) -> bool {
 pub fn company_system(world: &mut World, res: &mut Resources) {
     profiling::scope!("souls::company_system");
     let cbuf: &ParCommandBuffer<CompanyEnt> = &res.read();
-    let binfos: &BuildingInfos = &res.read();
     let market: &Market = &res.read();
     let map: &Map = &res.read();
     let elec_flow: &ElectricityFlow = &res.read();
     let job_opening = ItemID::new("job-opening");
-    let retail_goods = ItemID::new("retail-goods");
+    let coal_plant = GoodsCompanyID::new("coal-power-plant");
+    let coal = ItemID::new("coal");
 
     world.companies.iter_mut().for_each(|(me, c)| {
         let soul = SoulID::GoodsCompany(me);
@@ -225,25 +237,22 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
 
         let proto = c.comp.proto.prototype();
 
-        // The market posts completed matches to Sold. Only truck deliveries stay queued.
-        let instant_sales = proto.id.is_growable() || proto.kind == CompanyKind::Store;
-        c.sold.0.retain(|trade| {
-            if !instant_sales && trade.kind != retail_goods {
-                return true;
-            }
-            if let SoulID::FreightStation(id) = trade.buyer.0 {
-                if let Some(station) = world.freight_stations.get_mut(id) {
-                    station.f.waiting_cargo = station.f.waiting_cargo.saturating_add(1);
-                }
-            }
-            false
-        });
+        // Keep already-settled legacy dispatches from a pre-batching snapshot.
+        // New physical matches live in CargoBook. Virtual matches finish at the market.
+        c.sold
+            .0
+            .retain(|trade| uses_road_freight(proto, trade.kind));
+        for trades in c.bought.0.values_mut() {
+            trades.clear();
+        }
 
         if let Some(recipe) = &proto.recipe {
             if recipe_should_produce(recipe, soul, market) {
                 let productivity = c.productivity(proto, b.zone.as_ref(), map, elec_flow);
 
                 c.comp.progress += productivity * DELTA / recipe.duration.seconds() as f32;
+            } else if proto.id == coal_plant && market.capital(soul, coal) == 0 {
+                record_coal_stockout(res, coal);
             }
 
             if c.comp.progress >= 1.0 {
@@ -252,27 +261,13 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                 let bpos = b.door_pos;
 
                 cbuf.exec_on(me, move |market| {
-                    let recipe = kind.prototype().recipe.as_ref().unwrap();
-                    recipe_act(recipe, soul, bpos.xy(), market);
+                    let proto = kind.prototype();
+                    let recipe = proto.recipe.as_ref().unwrap();
+                    run_recipe(recipe, soul, bpos.xy(), market, |item| {
+                        uses_road_freight(proto, item)
+                    });
                 });
                 return;
-            }
-        }
-
-        for (_, trades) in c.bought.0.iter_mut() {
-            for trade in trades.drain(..) {
-                if let Some(owner_build) = find_trade_place(trade.seller, binfos) {
-                    cbuf.exec_ent(me, move |sim| {
-                        let (world, res) = sim.world_res();
-                        if let Some(SoulID::FreightStation(owner)) =
-                            res.read::<BuildingInfos>().owner(owner_build)
-                        {
-                            if let Some(f) = world.freight_stations.get_mut(owner) {
-                                f.f.wanted_cargo += 1;
-                            }
-                        }
-                    });
-                }
             }
         }
 
@@ -285,6 +280,20 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                 human.work = Some(Work::new(c.comp.building, WorkKind::Worker, offset));
                 human.bought.0.remove(&job_opening);
             }
+        }
+        if c.comp.driver.is_some_and(|driver| {
+            !c.workers.0.contains(&driver)
+                || !world
+                    .humans
+                    .get(driver)
+                    .and_then(|human| human.work.as_ref())
+                    .is_some_and(|work| {
+                        work.workplace == c.comp.building
+                            && matches!(work.kind, WorkKind::Driver { truck, .. }
+                            if c.comp.trucks.contains(&truck) && world.vehicles.contains_key(truck))
+                    })
+        }) {
+            c.comp.driver = None;
         }
         if c.comp.driver.is_none() && proto.kind == CompanyKind::Factory {
             let truck = c
@@ -321,47 +330,29 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             }
         }
 
-        (|| {
-            let Some(driver) = c.comp.driver else {
-                return;
-            };
-            let Some(w) = world.humans.get(driver).and_then(|h| h.work.as_ref()) else {
-                return;
-            };
-            let WorkKind::Driver {
+        if let Some(driver) = c.comp.driver.filter(|_| !c.sold.0.is_empty()) {
+            let Some(WorkKind::Driver {
                 truck,
-                deliver_order: None,
-                ..
-            } = w.kind
+                deliver_order,
+                load,
+            }) = world
+                .humans
+                .get_mut(driver)
+                .and_then(|human| human.work.as_mut())
+                .map(|work| &mut work.kind)
             else {
                 return;
             };
-            if !world
-                .vehicles
-                .get(truck)
-                .is_some_and(|vehicle| vehicle.vehicle.state.is_parked())
+            if deliver_order.is_none()
+                && load.is_none()
+                && world
+                    .vehicles
+                    .get(*truck)
+                    .is_some_and(|vehicle| vehicle.vehicle.state.is_parked())
             {
-                return;
+                let trade = c.sold.0.pop().unwrap();
+                *deliver_order = find_trade_place(trade.buyer, &res.read::<BuildingInfos>());
             }
-            let Some(trade) = c.sold.0.pop() else {
-                return;
-            };
-            let Some(owner_build) = find_trade_place(trade.buyer, binfos) else {
-                log::warn!("driver can't find the place to deliver for {:?}", &trade);
-                return;
-            };
-            cbuf.exec_ent(me, move |sim| {
-                let Some(h) = sim.world.humans.get_mut(driver) else {
-                    return;
-                };
-                let Some(w) = h.work.as_mut() else {
-                    return;
-                };
-                let WorkKind::Driver { deliver_order, .. } = &mut w.kind else {
-                    return;
-                };
-                *deliver_order = Some(owner_build)
-            });
-        })();
+        }
     });
 }

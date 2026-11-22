@@ -530,6 +530,41 @@ impl Market {
         *v
     }
 
+    pub(crate) fn hide_freight_stock(&mut self, source: SoulID, item: ItemID) {
+        self.m(item).sell_orders.remove(&source);
+    }
+
+    pub(crate) fn receive_freight(&mut self, destination: SoulID, item: ItemID, units: u32) {
+        self.produce(destination, item, units as i32);
+        if let Entry::Occupied(mut buyer) = self.m(item).buy_orders.entry(destination) {
+            let order = buyer.get_mut();
+            order.qty = order.qty.saturating_sub(units);
+            if order.qty == 0 {
+                buyer.remove();
+            }
+        }
+    }
+
+    pub(crate) fn freight_export(
+        &self,
+        source: SoulID,
+        station: SoulID,
+        item: ItemID,
+        units: u32,
+    ) -> Trade {
+        Trade {
+            buyer: TradeTarget(station),
+            seller: TradeTarget(source),
+            qty: units as i32,
+            kind: item,
+            money_delta: self.markets[&item].ext_value * i64::from(units),
+        }
+    }
+
+    pub(crate) fn record_freight_loss(&mut self, item: ItemID, units: u32) {
+        *self.seller_losses.entry(item).or_default() += u64::from(units);
+    }
+
     /// Match minimum staffing before the ordinary job market. Workers with a job
     /// can transfer only on the hourly staffing pass, after unemployed applicants.
     pub(super) fn prepare_job_matches(

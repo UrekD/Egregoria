@@ -1,4 +1,4 @@
-use crate::economy::cargo::{complete_delivery, settle_delivery, LoadId};
+use crate::economy::cargo::{complete_delivery, LoadId};
 use crate::economy::{BasketFailure, Bought, Market, TripPurpose};
 use crate::map::BuildingID;
 use crate::map_dynamic::transit::elapsed_ticks;
@@ -122,6 +122,14 @@ impl HumanDecisionKind {
         }
     }
 
+    pub(crate) fn references_load(&self, token: LoadId) -> bool {
+        match self {
+            Self::DeliverLoad { load, .. } => *load == token,
+            Self::MultiStack(steps) => steps.iter().any(|step| step.references_load(token)),
+            _ => false,
+        }
+    }
+
     pub fn update(
         &mut self,
         router: &mut Router,
@@ -132,7 +140,7 @@ impl HumanDecisionKind {
         driver: HumanID,
         location: &Location,
         home: BuildingID,
-        mut work: Option<&mut Work>,
+        work: Option<&mut Work>,
     ) -> bool {
         match *self {
             HumanDecisionKind::GoTo(dest) => {
@@ -163,20 +171,22 @@ impl HumanDecisionKind {
                 router.use_vehicle(id);
                 true
             }
-            HumanDecisionKind::DeliverAtBuilding(bid)
-            | HumanDecisionKind::DeliverLoad {
-                destination: bid, ..
-            } => {
-                if let (Self::DeliverLoad { load, .. }, Some(WorkKind::Driver { truck, .. })) =
-                    (&*self, work.as_deref().map(|work| work.kind))
+            HumanDecisionKind::DeliverLoad { destination, load } => {
+                if let Some(WorkKind::Driver {
+                    truck,
+                    load: Some(assigned),
+                    ..
+                }) = work.as_deref().map(|work| work.kind)
                 {
-                    if complete_delivery(*load, truck, bid) {
-                        return true;
+                    if load == assigned && *location == Location::Building(destination) {
+                        cbuf.exec_ent(driver, move |sim| {
+                            complete_delivery(sim, load, driver, truck, destination);
+                        });
                     }
                 }
-                if settle_delivery(cbuf, driver, location, bid, work.as_deref_mut()) {
-                    return true;
-                }
+                true
+            }
+            HumanDecisionKind::DeliverAtBuilding(bid) => {
                 if let Some(WorkKind::Driver { deliver_order, .. }) =
                     work.map(|work| &mut work.kind)
                 {
@@ -193,7 +203,7 @@ impl HumanDecisionKind {
                     };
                     cbuf_freight.exec_ent(fid, move |e| {
                         if let Some(f) = e.world.freight_stations.get_mut(fid) {
-                            f.f.waiting_cargo += 1;
+                            f.f.accept_export(1);
                         }
                     });
                 }

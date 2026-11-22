@@ -36,6 +36,16 @@ pub struct FreightStation {
     pub wanted_cargo: u32,
 }
 
+impl FreightStation {
+    pub(crate) fn accept_export(&mut self, units: u32) {
+        self.waiting_cargo = self.waiting_cargo.saturating_add(units);
+    }
+
+    pub(crate) fn request_import(&mut self, units: u32) {
+        self.wanted_cargo = self.wanted_cargo.saturating_add(units);
+    }
+}
+
 pub fn freight_station_soul(
     sim: &mut Simulation,
     building: BuildingID,
@@ -144,7 +154,7 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
         {
             continue;
         }
-        if station.waiting_cargo + station.wanted_cargo < 10 {
+        if station.waiting_cargo.saturating_add(station.wanted_cargo) < 10 {
             continue;
         }
 
