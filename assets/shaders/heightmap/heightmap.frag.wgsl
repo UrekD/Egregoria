@@ -12,6 +12,15 @@ struct ChunkData {
     resolution: u32,
 }
 
+struct GroundOverlay {
+    origin: vec2<f32>,
+    inv_extent: vec2<f32>,
+    preview_color: vec4<f32>,
+    preview_center: vec2<f32>,
+    preview_radius: f32,
+    enabled: u32,
+}
+
 @group(0) @binding(0) var<uniform> params: RenderParams;
 
 @group(1) @binding(4) var t_grass: texture_2d<f32>;
@@ -38,6 +47,26 @@ struct ChunkData {
 @group(2) @binding(15) var s_lightdata: sampler;
 @group(2) @binding(16) var t_lightdata2: texture_2d<u32>;
 @group(2) @binding(17) var s_lightdata2: sampler;
+
+@group(3) @binding(0) var t_overlay: texture_2d<f32>;
+@group(3) @binding(1) var s_overlay: sampler;
+@group(3) @binding(2) var<uniform> overlay: GroundOverlay;
+
+fn ground_overlay_at(world_xy: vec2<f32>) -> vec4<f32> {
+    var coverage = vec4(0.0);
+    if (overlay.enabled != 0u) {
+        let uv = (world_xy - overlay.origin) * overlay.inv_extent;
+        if (all(uv >= vec2(0.0)) && all(uv <= vec2(1.0))) {
+            coverage = textureSampleLevel(t_overlay, s_overlay, uv, 0.0);
+        }
+    }
+    if (overlay.preview_radius > 0.0) {
+        let d = distance(world_xy, overlay.preview_center) / overlay.preview_radius;
+        let preview = overlay.preview_color * (1.0 - smoothstep(0.8, 1.0, d));
+        coverage = preview + coverage * (1.0 - preview.a);
+    }
+    return coverage;
+}
 
 #ifdef TERRAIN_GRID
 fn grid(in_wpos: vec3<f32>, wpos_fwidth_x: f32) -> f32 {
@@ -180,6 +209,14 @@ fn frag(@builtin(position) position: vec4<f32>,
 
         c = mix(c, vec3(0.7, 0.4, 0.2), alpha * 0.15);
         c = mix(c, vec3(0.0, 0.0, 0.0), alpha4 + alpha5);
+    }
+
+    // The water mesh sits at -10 m. Terrain geometry bounds the preview on the map.
+    if ((overlay.enabled != 0u || overlay.preview_radius > 0.0) && in_wpos.z > -10.0) {
+        let coverage = ground_overlay_at(in_wpos.xy);
+        if (coverage.a > 0.0) {
+            c = coverage.rgb + c * (1.0 - coverage.a);
+        }
     }
 
     var fog = vec3(0.0);

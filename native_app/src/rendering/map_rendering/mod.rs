@@ -1,5 +1,6 @@
+use engine::heightmap::{GroundOverlayDisc, GroundOverlayImage};
 use engine::{Context, FrameContext, GfxContext, Water};
-use geom::{Camera, Circle, InfiniteFrustrum, Intersect3};
+use geom::{vec2, Camera, Circle, InfiniteFrustrum, Intersect3, LinearColor, AABB};
 use map_mesh::MapMeshHandler;
 use simulation::map::{Lane, LaneID, LaneKind, Map, ProjectFilter, ProjectKind, TrafficBehavior};
 use simulation::Simulation;
@@ -31,13 +32,17 @@ pub struct MapRenderOptions {
 impl MapRenderer {
     pub fn new(gfx: &mut GfxContext, sim: &Simulation) -> Self {
         defer!(log::info!("finished init of road render"));
-        MapRenderer {
+        let mut renderer = MapRenderer {
             meshb: MapMeshHandler::new(gfx, sim),
             trees: TreesRender::new(gfx, &sim.map()),
             terrain: TerrainRender::new(gfx, sim),
             water: Water::new(gfx, sim.map().environment.bounds()),
             lamps: LampsRender::new(&sim.map()),
+        };
+        if std::env::var_os("EGR_DEBUG_GROUND_OVERLAY").is_some() {
+            renderer.set_debug_ground_overlay(gfx, sim.map().environment.bounds());
         }
+        renderer
     }
 
     pub fn update(&mut self, sim: &Simulation, ctx: &mut Context) {
@@ -45,6 +50,74 @@ impl MapRenderer {
         let map = sim.map();
         self.lamps.update(&map, ctx);
         self.terrain.update(ctx, &map);
+    }
+
+    /// Submit the atlas from the pre-terrain preparation hook, or clear it with `None`.
+    /// Pass `mode_changed` for an immediate mode switch. Retry with the latest
+    /// image next frame if an ordinary refresh is throttled.
+    pub(crate) fn set_ground_overlay(
+        &mut self,
+        gfx: &mut GfxContext,
+        image: Option<GroundOverlayImage<'_>>,
+        mode_changed: bool,
+    ) -> bool {
+        self.terrain.set_ground_overlay(gfx, image, mode_changed)
+    }
+
+    pub(crate) fn set_overlay_preview(
+        &mut self,
+        gfx: &mut GfxContext,
+        preview: Option<GroundOverlayDisc>,
+    ) {
+        self.terrain.set_overlay_preview(gfx, preview);
+    }
+
+    fn set_debug_ground_overlay(&mut self, gfx: &mut GfxContext, bounds: AABB) {
+        let extent = bounds.ur - bounds.ll;
+        let pitch = 32.0;
+        let size = [
+            (extent.x / pitch).ceil() as u32,
+            (extent.y / pitch).ceil() as u32,
+        ];
+        if size.contains(&0) {
+            return;
+        }
+
+        let center = bounds.ll + extent * 0.5;
+        let radius = extent.x.min(extent.y) * 0.36;
+        let mut rgba = Vec::with_capacity((size[0] * size[1] * 4) as usize);
+        for y in 0..size[1] {
+            for x in 0..size[0] {
+                let pos = bounds.ll + (vec2(x as f32, y as f32) + vec2(0.5, 0.5)) * pitch;
+                let t = (pos.distance(center) / radius).min(1.0);
+                let alpha = 200.0 * (1.0 - t);
+                rgba.extend([
+                    alpha.round() as u8,
+                    (alpha * (0.08 + 0.38 * t)).round() as u8,
+                    (alpha * 0.035).round() as u8,
+                    alpha.round() as u8,
+                ]);
+            }
+        }
+        self.set_ground_overlay(
+            gfx,
+            Some(GroundOverlayImage {
+                origin: bounds.ll,
+                extent,
+                size,
+                rgba: &rgba,
+                revision: 0,
+            }),
+            true,
+        );
+        self.set_overlay_preview(
+            gfx,
+            Some(GroundOverlayDisc {
+                center: center + vec2(0.28, -0.10) * radius,
+                radius: radius * 0.35,
+                color: LinearColor::new(0.02, 0.60, 1.0, 0.75),
+            }),
+        );
     }
 
     pub fn render(
