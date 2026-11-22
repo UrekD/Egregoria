@@ -86,7 +86,7 @@ fn p5_core_loop_starter_residential_lots_are_all_buildable() {
             .map(|lot| lot.id)
             .collect()
     };
-    assert!(initial.len() >= 12, "only {} zoned lots", initial.len());
+    assert_eq!(initial.len(), 23, "zoned lots in the starter grid");
     let successes = initial
         .iter()
         .filter(|&&lot| {
@@ -287,9 +287,279 @@ fn hire(sim: &mut Simulation) {
     electricity_flow_system(world, res);
 }
 
-fn update_utilities(test: &mut TestCtx, elapsed: u64) {
-    test.g.write::<GameTime>().tick.0 = INITIAL_TICK + elapsed;
-    utility_flow_update(&mut test.g);
+fn update_utilities(sim: &mut Simulation, elapsed: u64) {
+    sim.write::<GameTime>().tick.0 = INITIAL_TICK + elapsed;
+    utility_flow_update(sim);
+}
+
+#[test]
+fn p5_core_loop_pipe_transfers_use_the_edited_network() {
+    let mut test = TestCtx::new_fast();
+    let join = [vec3(270.0, 100.0, 0.0), vec3(270.0, 320.0, 0.0)];
+    test.build_roads(&[vec3(80.0, 100.0, 0.0), join[0]]);
+    test.build_roads(&[join[1], vec3(480.0, 320.0, 0.0)]);
+    let road_at_y = |y| {
+        test.g
+            .map()
+            .roads()
+            .iter()
+            .find(|(_, road)| road.points().first().y == y)
+            .unwrap()
+            .0
+    };
+    let supply_road = road_at_y(100.0);
+    let demand_road = road_at_y(320.0);
+    let (pump_building, pump) =
+        place_company(&mut test, "water-pump", vec2(220.0, 75.0), supply_road);
+    let (shop_building, shop) =
+        place_company(&mut test, "commercial-l1", vec2(425.0, 345.0), demand_road);
+    let home = test.build_house_near(vec2(360.0, 345.0));
+    test.g
+        .write::<residence::Residences>()
+        .by_building
+        .get_mut(&home)
+        .unwrap()
+        .capacity = 14;
+    for _ in 0..12 {
+        spawn_human(&mut test.g, home).unwrap();
+    }
+    hire(&mut test.g);
+    assert_eq!(test.g.world().companies[shop].workers.0.len(), 12);
+    let (plant_building, plant) = place_company(
+        &mut test,
+        "coal-power-plant",
+        vec2(135.0, 135.0),
+        supply_road,
+    );
+    // One pump worker supplies 16 units. The plant needs 10 and the other road needs 10.
+    let lot = OBB::new(vec2(220.0, 75.0), Vec2::X, 40.0, 40.0);
+    test.g.map_mut().buildings[pump_building].zone = Some(crate::map::Zone::new(
+        Polygon::from(lot.corners.as_slice()),
+        Vec2::X,
+    ));
+    for building in [plant_building, pump_building] {
+        let applicant = spawn_human(&mut test.g, home).unwrap();
+        let door = test.g.map().get(building).unwrap().door_pos.xy();
+        test.g.write::<Market>().buy(
+            SoulID::Human(applicant),
+            door,
+            ItemID::new("job-opening"),
+            1,
+        );
+        hire(&mut test.g);
+    }
+    assert_eq!(test.g.world().companies[plant].workers.0.len(), 1);
+    assert_eq!(test.g.world().companies[pump].workers.0.len(), 1);
+
+    test.build_roads(&join);
+    let bridge = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().middle().x == join[0].x)
+        .unwrap()
+        .0;
+    let network = test.g.map().electricity.net_id(pump_building).unwrap();
+    assert_eq!(test.g.map().electricity.net_id(home), Some(network));
+    update_utilities(&mut test.g, TICKS_PER_HOUR);
+    let sample = || {
+        test.g
+            .read::<UtilityFlow>()
+            .networks()
+            .find(|&(id, _)| id == network)
+            .unwrap()
+            .1
+    };
+    assert!(sample().water_demand > 16.0);
+    assert!(!sample().has_water());
+    test.apply(&[WorldCommand::MapRemoveRoad(bridge)]);
+    assert_eq!(
+        test.g.map().electricity.net_id(pump_building),
+        Some(network)
+    );
+    assert_ne!(test.g.map().electricity.net_id(home), Some(network));
+
+    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    for sim in [&mut test.g, &mut resumed] {
+        sim.write::<GameTime>().tick.0 += 1;
+        hire(sim);
+        assert_eq!(
+            sim.world().companies[pump].workers.0.len(),
+            1,
+            "after split"
+        );
+        assert_eq!(sim.world().companies[shop].workers.0.len(), 12);
+    }
+    assert_eq!(test.g.hashes(), resumed.hashes());
+
+    test.build_roads(&join);
+    {
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+    }
+    // Save after a fresh sample and let the joined network's shortage trigger a transfer.
+    update_utilities(&mut test.g, 2 * TICKS_PER_HOUR);
+    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    for sim in [&mut test.g, &mut resumed] {
+        sim.write::<GameTime>().tick.0 += 1;
+        hire(sim);
+        assert_eq!(sim.world().companies[pump].workers.0.len(), 2);
+        assert_eq!(sim.world().companies[shop].workers.0.len(), 11);
+    }
+    assert_eq!(test.g.hashes(), resumed.hashes());
+
+    let bridge = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().middle().x == join[0].x)
+        .unwrap()
+        .0;
+    test.apply(&[WorldCommand::MapRemoveRoad(bridge)]);
+    update_utilities(&mut test.g, TICKS_PER_BUDGET_DAY);
+    assert!(test
+        .g
+        .read::<UtilityFlow>()
+        .networks()
+        .any(|(id, totals)| id == network && totals.water_demand < 16.0 / 1.25));
+    test.build_roads(&join);
+    assert_eq!(
+        test.g.map().electricity.net_id(shop_building),
+        Some(network)
+    );
+    test.g.write::<GameTime>().tick.0 += 1;
+    hire(&mut test.g);
+    assert_eq!(
+        test.g.world().companies[pump].workers.0.len(),
+        2,
+        "after join"
+    );
+    assert_eq!(test.g.world().companies[shop].workers.0.len(), 11);
+}
+
+#[test]
+fn p5_core_loop_purges_stale_job_orders_for_rostered_workers() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let road = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 250.0)
+        .unwrap()
+        .0;
+    let home = test.build_house_near(vec2(120.0, 285.0));
+    let (_, shop) = place_company(&mut test, "commercial-l1", vec2(90.0, 225.0), road);
+    let rostered = spawn_human(&mut test.g, home).unwrap();
+    hire(&mut test.g);
+    let pending = spawn_human(&mut test.g, home).unwrap();
+    let (world, resources) = test.g.world_res();
+    market_update(world, resources);
+    assert_eq!(
+        test.g.world().companies[shop].workers.0,
+        [rostered, pending]
+    );
+
+    let job = ItemID::new("job-opening");
+    let rostered_human = &mut test.g.world.humans[rostered];
+    rostered_human.work = None;
+    assert!(!rostered_human.bought.0.contains_key(&job));
+    assert!(test.g.world().humans[pending].bought.0.contains_key(&job));
+    let (school_building, school) = place_company(&mut test, "school", vec2(355.0, 225.0), road);
+    let door = test.g.map().get(school_building).unwrap().door_pos.xy();
+    for worker in [rostered, pending] {
+        test.g
+            .write::<Market>()
+            .buy(SoulID::Human(worker), door, job, 1);
+    }
+    hire(&mut test.g);
+    assert!(test.g.world().companies[school].workers.0.is_empty());
+    assert_eq!(
+        test.g.world().companies[shop].workers.0,
+        [rostered, pending]
+    );
+    let market = test.g.read::<Market>();
+    for worker in [rostered, pending] {
+        assert!(market.inner()[&job]
+            .buy_order(SoulID::Human(worker))
+            .is_none());
+    }
+}
+
+#[test]
+fn p5_core_loop_priority_prefers_nearer_workplaces_and_keeps_drivers() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let road = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 250.0)
+        .unwrap()
+        .0;
+    let factories = [
+        place_company(&mut test, "flour-factory", vec2(125.0, 220.0), road),
+        place_company(&mut test, "flour-factory", vec2(385.0, 220.0), road),
+    ];
+    let home = test.build_house_near(vec2(240.0, 285.0));
+    test.g
+        .write::<residence::Residences>()
+        .by_building
+        .get_mut(&home)
+        .unwrap()
+        .capacity = 21;
+    let job = ItemID::new("job-opening");
+    for (building, _) in factories {
+        let door = test.g.map().get(building).unwrap().door_pos.xy();
+        for _ in 0..10 {
+            let applicant = spawn_human(&mut test.g, home).unwrap();
+            test.g
+                .write::<Market>()
+                .buy(SoulID::Human(applicant), door, job, 1);
+        }
+    }
+    hire(&mut test.g);
+    let [(_, farther_factory), (_, nearer_factory)] = factories;
+    for (_, factory) in factories {
+        assert_eq!(test.g.world().companies[factory].workers.0.len(), 10);
+    }
+    let near_roster = &test.g.world().companies[nearer_factory].workers.0;
+    let driver = test.g.world().companies[nearer_factory]
+        .comp
+        .driver
+        .unwrap();
+    assert_eq!(near_roster[0], driver);
+
+    let (_, farther_school) = place_company(&mut test, "school", vec2(340.0, 225.0), road);
+    let (school_building, nearer_school) =
+        place_company(&mut test, "school", vec2(450.0, 225.0), road);
+    let applicant = spawn_human(&mut test.g, home).unwrap();
+    let door = test.g.map().get(school_building).unwrap().door_pos.xy();
+    test.g
+        .write::<Market>()
+        .buy(SoulID::Human(applicant), door, job, 1);
+    hire(&mut test.g);
+    assert_eq!(
+        test.g.world().companies[nearer_school].workers.0,
+        [applicant]
+    );
+    assert!(test.g.world().companies[farther_school]
+        .workers
+        .0
+        .is_empty());
+
+    test.g.write::<GameTime>().tick.0 = INITIAL_TICK + TICKS_PER_HOUR + 1;
+    hire(&mut test.g);
+    let companies = &test.g.world().companies;
+    assert_eq!(companies[farther_school].workers.0.len(), 1);
+    assert_eq!(companies[farther_factory].workers.0.len(), 10);
+    assert_eq!(companies[nearer_factory].workers.0.len(), 9);
+    assert_eq!(companies[nearer_factory].comp.driver, Some(driver));
+    assert!(companies[nearer_factory].workers.0.contains(&driver));
 }
 
 #[test]
@@ -339,7 +609,7 @@ fn p5_core_loop_late_utilities_and_services_hire_when_shops_are_staffed() {
         .all(|id| test.g.world().companies[id].workers.0.len() == 12));
 
     for hour in 1..=8 {
-        update_utilities(&mut test, hour * TICKS_PER_HOUR);
+        update_utilities(&mut test.g, hour * TICKS_PER_HOUR);
         test.g.write::<GameTime>().tick.0 += 1;
         let before = shops.map(|id| test.g.world().companies[id].workers.0.len());
         hire(&mut test.g);
@@ -386,11 +656,11 @@ fn p5_core_loop_late_utilities_and_services_hire_when_shops_are_staffed() {
     );
     hire(&mut test.g);
     assert_eq!(test.g.world().companies[pump].workers.0.len(), 2);
-    update_utilities(&mut test, TICKS_PER_BUDGET_DAY - TICKS_PER_HOUR);
+    update_utilities(&mut test.g, TICKS_PER_BUDGET_DAY - TICKS_PER_HOUR);
     test.g.write::<GameTime>().tick.0 += 1;
     hire(&mut test.g);
     assert_eq!(test.g.world().companies[pump].workers.0.len(), 2);
-    update_utilities(&mut test, TICKS_PER_BUDGET_DAY);
+    update_utilities(&mut test.g, TICKS_PER_BUDGET_DAY);
     test.g.write::<GameTime>().tick.0 += 1;
     hire(&mut test.g);
     assert_eq!(test.g.world().companies[pump].workers.0.len(), 1);
@@ -426,11 +696,24 @@ fn p5_core_loop_priority_hires_unemployed_before_crossing_donor_floor() {
     assert_eq!(test.g.world().companies[shop].workers.0.len(), 6);
     assert!(test.g.world().companies[school].workers.0.is_empty());
 
-    let applicant = spawn_human(&mut test.g, house).unwrap();
+    test.g
+        .write::<residence::Residences>()
+        .by_building
+        .get_mut(&house)
+        .unwrap()
+        .capacity += 1;
+    // Both applicants post from the same home, so the priority match has a distance tie.
+    let applicants = [
+        spawn_human(&mut test.g, house).unwrap(),
+        spawn_human(&mut test.g, house).unwrap(),
+    ];
     test.g.write::<GameTime>().tick.0 += TICKS_PER_HOUR;
     hire(&mut test.g);
-    assert_eq!(test.g.world().companies[shop].workers.0.len(), 6);
-    assert_eq!(test.g.world().companies[school].workers.0, [applicant]);
+    assert_eq!(test.g.world().companies[shop].workers.0.len(), 7);
+    assert_eq!(
+        test.g.world().companies[school].workers.0,
+        [*applicants.iter().min().unwrap()]
+    );
 }
 
 #[test]
@@ -554,25 +837,40 @@ fn p5_core_loop_utility_objective_measures_the_day() {
     test.g.world.companies[plant].workers.0.push(worker);
     test.g.world.companies[outlet].workers.0.push(worker);
 
+    let mut resumed: Option<Simulation> = None;
     for day in 0..2 {
-        let start = day * 24 * TICKS_PER_HOUR;
-        test.g.write::<GameTime>().tick.0 = INITIAL_TICK + start + 1;
-        let (_, res) = test.g.world_res();
-        Budget::apply(res, BudgetCategory::TradeExport, Money::new_bucks(1000));
+        let start = day * TICKS_PER_BUDGET_DAY;
+        for sim in std::iter::once(&mut test.g).chain(resumed.iter_mut()) {
+            sim.write::<GameTime>().tick.0 = INITIAL_TICK + start + 1;
+            let (_, res) = sim.world_res();
+            Budget::apply(res, BudgetCategory::TradeExport, Money::new_bucks(1000));
+        }
         for hour in 0..24 {
             let served = day == 0 || hour >= 2;
-            test.g.world.companies[pump].workers.0 = if served { vec![worker] } else { vec![] };
-            let (world, res) = test.g.world_res();
-            electricity_flow_system(world, res);
             let sample = start + hour * TICKS_PER_HOUR + TICKS_PER_HOUR / 2;
-            update_utilities(&mut test, sample);
-            assert_eq!(test.g.read::<UtilityFlow>().has_water(house), served);
-            progression_update(&mut test.g);
+            for sim in std::iter::once(&mut test.g).chain(resumed.iter_mut()) {
+                sim.world.companies[pump].workers.0 = if served { vec![worker] } else { vec![] };
+                let (world, res) = sim.world_res();
+                electricity_flow_system(world, res);
+                update_utilities(sim, sample);
+                assert_eq!(sim.read::<UtilityFlow>().has_water(house), served);
+                progression_update(sim);
+            }
+            if day == 0 && hour == 12 {
+                resumed = Some(Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap());
+            }
         }
         // The first day ends with an outage, the second with restored service.
-        test.g.world.companies[pump].workers.0 = if day == 0 { vec![] } else { vec![worker] };
-        update_utilities(&mut test, start + 24 * TICKS_PER_HOUR);
-        progression_update(&mut test.g);
+        for sim in std::iter::once(&mut test.g).chain(resumed.iter_mut()) {
+            sim.world.companies[pump].workers.0 = if day == 0 { vec![] } else { vec![worker] };
+            let close = start + TICKS_PER_BUDGET_DAY;
+            sim.write::<GameTime>().tick.0 = INITIAL_TICK + close;
+            let (world, res) = sim.world_res();
+            crate::economy::budget_update(world, res);
+            update_utilities(sim, close);
+            progression_update(sim);
+        }
+        assert_eq!(test.g.hashes(), resumed.as_ref().unwrap().hashes());
         let metrics = test.g.read::<DailyEconomyMetrics>();
         let sample = &metrics.days[&day];
         let ratio = sample.utility_served_demand.unwrap() / sample.utility_total_demand.unwrap();

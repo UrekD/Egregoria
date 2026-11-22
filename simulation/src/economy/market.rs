@@ -17,12 +17,13 @@ use crate::economy::{
     Budget, ItemID, TripPurpose, TICKS_PER_BUDGET_DAY, WORKER_CONSUMPTION_PER_MINUTE,
 };
 use crate::map::{
-    Building, BuildingID, ElectricityNetworkID, LaneID, LaneKind, Map, MAX_ZONE_AREA,
+    Building, BuildingID, BuildingKind, ElectricityNetworkID, LaneID, LaneKind, Map, MAX_ZONE_AREA,
 };
-use crate::map_dynamic::{BuildingInfos, Destination, ElectricityFlow, UtilityFlow, UtilityTotals};
+use crate::map_dynamic::{BuildingInfos, Destination, ElectricityFlow, UtilityTotals};
 use crate::souls::desire::WorkKind;
 use crate::souls::household::{household_items, BasketId, BASKET_TRAVEL_LIMIT};
 use crate::souls::human::HumanDecisionKind;
+use crate::souls::residence::Residences;
 use crate::utils::resources::Resources;
 use crate::world::{CompanyEnt, CompanyID};
 use crate::{HumanID, SoulID, World};
@@ -219,7 +220,7 @@ impl HiringPriority {
 struct NetworkStaffing {
     power_supply: f64,
     power_demand: f64,
-    pipes: Option<UtilityTotals>,
+    pipes: UtilityTotals,
 }
 
 impl NetworkStaffing {
@@ -228,13 +229,10 @@ impl NetworkStaffing {
         match priority {
             HiringPriority::Power => Some((self.power_supply, self.power_demand)),
             HiringPriority::Water if powered => {
-                let pipes = self.pipes?;
-                Some((pipes.water_production, pipes.water_demand))
+                Some((self.pipes.water_production, self.pipes.water_demand))
             }
-            HiringPriority::Sewage => {
-                let pipes = self.pipes?;
-                (powered && pipes.has_water())
-                    .then_some((pipes.sewage_capacity, pipes.water_demand))
+            HiringPriority::Sewage if powered && self.pipes.has_water() => {
+                Some((self.pipes.sewage_capacity, self.pipes.water_demand))
             }
             _ => None,
         }
@@ -243,8 +241,8 @@ impl NetworkStaffing {
     fn add_supply(&mut self, priority: HiringPriority, added: f64) {
         match priority {
             HiringPriority::Power => self.power_supply += added,
-            HiringPriority::Water => self.pipes.as_mut().unwrap().water_production += added,
-            HiringPriority::Sewage => self.pipes.as_mut().unwrap().sewage_capacity += added,
+            HiringPriority::Water => self.pipes.water_production += added,
+            HiringPriority::Sewage => self.pipes.sewage_capacity += added,
             _ => unreachable!(),
         }
     }
@@ -584,6 +582,19 @@ impl Market {
                     && human.bought.0.get(&job).is_none_or(Vec::is_empty)
             }))
         });
+        if !market.buy_orders.is_empty() {
+            // A roster can already contain an applicant before Work is assigned.
+            for &worker in world
+                .companies
+                .values()
+                .flat_map(|company| &company.workers.0)
+            {
+                market.buy_orders.remove(&SoulID::Human(worker));
+                if market.buy_orders.is_empty() {
+                    break;
+                }
+            }
+        }
         let phase = periodic_tick(&resources.read::<Budget>(), tick);
         // Water and sewage sample at phase 1. Evaluate transfers just after that sample.
         let hourly = phase >= TICKS_PER_HOUR && phase % TICKS_PER_HOUR == 2;
@@ -594,7 +605,7 @@ impl Market {
         let map = resources.read::<Map>();
         let infos = resources.read::<BuildingInfos>();
         let electricity = resources.read::<ElectricityFlow>();
-        let utilities = resources.read::<UtilityFlow>();
+        let residences = resources.read::<Residences>();
         let mut vacancies = Vec::new();
         for (&seller, order) in &market.sell_orders {
             let SoulID::GoodsCompany(id) = seller else {
@@ -624,15 +635,19 @@ impl Market {
                 _ => {}
             }
         }
-        vacancies.sort_unstable();
+        vacancies.sort_by_cached_key(|&(priority, id)| {
+            let pos = market.sell_orders[&SoulID::GoodsCompany(id)].pos;
+            let nearest = market
+                .buy_orders
+                .values()
+                .map(|order| OrderedFloat(pos.distance2(order.pos)))
+                .min();
+            (priority, nearest, id)
+        });
 
         let mut network_staffing = BTreeMap::new();
-        let mut utility_samples = None;
-        let mut load_staffing = |world: &World, network| {
-            let totals = utility_samples
-                .get_or_insert_with(|| utilities.networks().collect::<BTreeMap<_, _>>())
-                .get(&network);
-            Self::network_staffing(&map, world, &infos, &electricity, totals, network)
+        let load_staffing = |world: &World, network| {
+            Self::network_staffing(&map, world, &infos, &electricity, &residences, network)
         };
         let mut donors = None;
         let mut trades = Vec::new();
@@ -691,7 +706,7 @@ impl Market {
                         let donors = donors.get_or_insert_with(|| {
                             // Prefer the fullest rosters and preserve at least half of each
                             // employer's staffing capacity, including local delivery drivers.
-                            let mut donors: Vec<_> = world
+                            world
                                 .companies
                                 .iter()
                                 .filter_map(|(id, company)| {
@@ -699,22 +714,30 @@ impl Market {
                                         != HiringPriority::Standard
                                         || company.workers.0.len()
                                             <= (company.comp.max_workers as usize).div_ceil(2)
-                                        || map
-                                            .get(company.comp.building)
-                                            .is_none_or(Building::is_orphaned)
                                     {
                                         return None;
                                     }
+                                    let building = map
+                                        .get(company.comp.building)
+                                        .filter(|building| !building.is_orphaned())?;
                                     let worker = Self::transferable_worker(world, company)?;
-                                    Some((std::cmp::Reverse(company.workers.0.len()), id, worker))
+                                    Some((
+                                        Reverse(company.workers.0.len()),
+                                        id,
+                                        worker,
+                                        building.door_pos.xy(),
+                                    ))
                                 })
-                                .collect();
-                            donors.sort_unstable();
-                            donors.into_iter()
+                                .collect::<Vec<_>>()
                         });
-                        let Some((_, donor, worker)) = donors.next() else {
+                        let Some((index, _)) = donors.iter().enumerate().min_by_key(
+                            |&(_, &(staffing, id, _, door))| {
+                                (staffing, OrderedFloat(pos.distance2(door)), id)
+                            },
+                        ) else {
                             break;
                         };
+                        let (_, donor, worker, _) = donors.swap_remove(index);
                         Self::release_worker(market, world, &map, job, donor, worker, workplace);
                         SoulID::Human(worker)
                     }
@@ -888,38 +911,46 @@ impl Market {
         world: &World,
         infos: &BuildingInfos,
         electricity: &ElectricityFlow,
-        totals: Option<&UtilityTotals>,
+        residences: &Residences,
         network: ElectricityNetworkID,
     ) -> NetworkStaffing {
         let power = electricity.network_stats(network);
         let mut staffing = NetworkStaffing {
             power_supply: power.produced_power.watts() as f64,
             power_demand: power.consumed_power.watts() as f64,
-            pipes: totals.map(|totals| UtilityTotals {
-                water_demand: totals.water_demand,
-                ..UtilityTotals::default()
-            }),
+            pipes: UtilityTotals::default(),
         };
-        // Start with current rosters so new hires between utility samples
-        // still count toward supply.
-        if staffing.pipes.is_some() {
-            for &id in &map.electricity.networks[&network].buildings {
-                let building = &map.buildings()[id];
-                let Some(SoulID::GoodsCompany(owner)) = infos.owner(id) else {
-                    continue;
-                };
-                let Some(company) = world
-                    .companies
-                    .get(owner)
-                    .filter(|_| !building.is_orphaned())
-                else {
-                    continue;
-                };
-                let priority = HiringPriority::for_company(company.comp.proto);
-                if matches!(priority, HiringPriority::Water | HiringPriority::Sewage) {
-                    let rate = Self::utility_rate(company, building, priority);
-                    staffing.add_supply(priority, rate.max(0.0) * company.workers.0.len() as f64);
+        // Calculate pipe demand and supply from the same live network. A road edit
+        // can retain the network ID while changing which buildings it serves.
+        for &id in &map.electricity.networks[&network].buildings {
+            let building = &map.buildings()[id];
+            if building.is_orphaned() {
+                continue;
+            }
+            let demand = match building.kind {
+                BuildingKind::House => residences
+                    .by_building
+                    .get(&id)
+                    .and_then(|home| try_prototype(home.prototype))
+                    .and_then(|proto| proto.water_consumption),
+                BuildingKind::GoodsCompany(proto) => {
+                    try_prototype(proto).and_then(|proto| proto.water_consumption)
                 }
+                _ => None,
+            };
+            if let Some(demand) = demand.filter(|rate| rate.is_finite() && *rate >= 0.0) {
+                staffing.pipes.water_demand += f64::from(demand);
+            }
+            let Some(SoulID::GoodsCompany(owner)) = infos.owner(id) else {
+                continue;
+            };
+            let Some(company) = world.companies.get(owner) else {
+                continue;
+            };
+            let priority = HiringPriority::for_company(company.comp.proto);
+            if matches!(priority, HiringPriority::Water | HiringPriority::Sewage) {
+                let rate = Self::utility_rate(company, building, priority);
+                staffing.add_supply(priority, rate.max(0.0) * company.workers.0.len() as f64);
             }
         }
         staffing
