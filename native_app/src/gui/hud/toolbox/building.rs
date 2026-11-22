@@ -16,7 +16,7 @@ use goryak::{
 };
 use prototypes::{
     prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyID, GoodsCompanyPrototype,
-    Prototype, RenderAsset, ServiceID,
+    Prototype, RenderAsset, ServiceID, ServiceKind,
 };
 use simulation::map::{BuildingKind, Zone};
 use simulation::world_command::WorldCommand;
@@ -204,14 +204,32 @@ fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
 
                         if let Some(service) = service {
                             textc(on_secondary_container(), &descr.label);
-                            textc(
-                                on_secondary_container(),
-                                format!("{:.0} m radius", service.radius_m),
-                            );
-                            textc(
-                                on_secondary_container(),
-                                format!("{} capacity", service.capacity),
-                            );
+                            match service.service_kind {
+                                ServiceKind::WaterPump => textc(
+                                    on_secondary_container(),
+                                    format!(
+                                        "Network-wide · {:.0} production",
+                                        descr.water_production.unwrap_or_default()
+                                    ),
+                                ),
+                                ServiceKind::SewageOutlet => textc(
+                                    on_secondary_container(),
+                                    format!(
+                                        "Network-wide · {:.0} capacity",
+                                        descr.sewage_capacity.unwrap_or_default()
+                                    ),
+                                ),
+                                _ => {
+                                    textc(
+                                        on_secondary_container(),
+                                        format!("{:.0} m radius", service.radius_m),
+                                    );
+                                    textc(
+                                        on_secondary_container(),
+                                        format!("{} capacity", service.capacity),
+                                    );
+                                }
+                            }
                             textc(
                                 on_secondary_container(),
                                 format!("{} / day", service.upkeep_per_day),
@@ -316,6 +334,12 @@ pub(crate) fn draw_service_radius(sim: &Simulation, uiw: &UiWorld, draw: &mut Im
     let Some(service) = try_prototype(ServiceID::from(*id)) else {
         return;
     };
+    if matches!(
+        service.service_kind,
+        ServiceKind::WaterPump | ServiceKind::SewageOutlet
+    ) {
+        return;
+    }
     let center = pos.center();
 
     // The cost tooltip can retain its command while the pointer is over UI.

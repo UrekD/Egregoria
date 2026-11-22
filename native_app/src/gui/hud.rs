@@ -28,19 +28,24 @@ pub mod toolbox;
 pub mod windows;
 
 pub(crate) use demand_bars::top_driver as top_demand_driver;
+pub(crate) use toasts::ToastState;
 
 /// Root GUI entrypoint
 pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::render");
     auto_save(uiworld);
 
-    if uiworld.read::<GuiState>().hidden {
+    let hidden = uiworld.read::<GuiState>().hidden;
+    uiworld
+        .write::<ToastState>()
+        .observe(sim, !hidden, Instant::now());
+    if hidden {
         return;
     }
 
     yakui::column(|| {
-        power_errors(uiworld, sim);
-        problem_icons::render(uiworld, sim);
+        yakui::column(|| power_errors(uiworld, sim));
+        yakui::column(|| problem_icons::render(uiworld, sim));
         new_toolbox(uiworld, sim);
         menu_bar(uiworld, sim);
         demand_bars::render(uiworld, sim);
@@ -48,7 +53,7 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
         new_inspector(uiworld, sim);
         uiworld.write::<GuiState>().windows.render(uiworld, sim);
         time_controls(uiworld, sim);
-        toasts::render(sim);
+        yakui::column(|| toasts::render(sim, uiworld));
         keybinds::keybind_modal(uiworld, sim);
         startup_save_message(uiworld);
     });

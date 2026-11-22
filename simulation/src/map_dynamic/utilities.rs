@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use prototypes::{try_prototype, ServiceID, ServiceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID, MAX_ZONE_AREA};
+use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID, Map, MAX_ZONE_AREA};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
 
@@ -18,6 +18,21 @@ pub struct UtilityFlow {
     by_network: BTreeMap<ElectricityNetworkID, UtilityTotals>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UtilityStatus {
+    Served,
+    Shortage,
+    Disconnected,
+    Unknown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BuildingUtilityStatus {
+    pub water: UtilityStatus,
+    pub sewage: UtilityStatus,
+    pub totals: Option<UtilityTotals>,
+}
+
 impl UtilityFlow {
     pub fn has_water(&self, building: BuildingID) -> bool {
         self.totals_for(building)
@@ -27,6 +42,63 @@ impl UtilityFlow {
     pub fn has_sewage(&self, building: BuildingID) -> bool {
         self.totals_for(building)
             .is_some_and(UtilityTotals::has_sewage)
+    }
+
+    /// Returns the latest service status for a consumer. Live disconnection takes
+    /// precedence over the utility snapshot, which refreshes every 3,000 ticks.
+    pub fn status(
+        &self,
+        map: &Map,
+        residences: &Residences,
+        id: BuildingID,
+    ) -> Option<BuildingUtilityStatus> {
+        use UtilityStatus::*;
+
+        let building = map.get(id)?;
+        let consumption = match building.kind {
+            BuildingKind::House => residences
+                .by_building
+                .get(&id)
+                .and_then(|residence| try_prototype(residence.prototype))
+                .and_then(|proto| proto.water_consumption),
+            BuildingKind::GoodsCompany(company) => {
+                try_prototype(company).and_then(|proto| proto.water_consumption)
+            }
+            _ => None,
+        };
+        if valid_rate(consumption) == 0.0 {
+            return None;
+        }
+
+        let unavailable = |status| BuildingUtilityStatus {
+            water: status,
+            sewage: status,
+            totals: None,
+        };
+        let Some(network) = map
+            .electricity
+            .net_id(id)
+            .filter(|_| !building.is_orphaned())
+        else {
+            return Some(unavailable(Disconnected));
+        };
+        let Some(&totals) = self
+            .by_building
+            .get(&id)
+            .filter(|&&observed| observed == network)
+            .and_then(|observed| self.by_network.get(observed))
+        else {
+            return Some(unavailable(Unknown));
+        };
+        Some(BuildingUtilityStatus {
+            water: if totals.has_water() { Served } else { Shortage },
+            sewage: if totals.has_sewage() {
+                Served
+            } else {
+                Shortage
+            },
+            totals: Some(totals),
+        })
     }
 
     /// Totals from the latest utility pass, ordered by electricity network ID.
@@ -49,11 +121,11 @@ pub struct UtilityTotals {
 }
 
 impl UtilityTotals {
-    fn has_water(&self) -> bool {
+    pub fn has_water(&self) -> bool {
         meets_demand(self.water_production, self.water_demand)
     }
 
-    fn has_sewage(&self) -> bool {
+    pub fn has_sewage(&self) -> bool {
         meets_demand(self.sewage_capacity, self.sewage_demand)
     }
 }

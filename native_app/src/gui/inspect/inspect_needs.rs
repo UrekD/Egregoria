@@ -1,11 +1,12 @@
 use goryak::{error, fixed_spacer, on_secondary_container, textc};
 use prototypes::ServiceKind;
 use simulation::map::{BuildingID, BuildingKind};
-use simulation::map_dynamic::{CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow};
+use simulation::map_dynamic::{CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow, UtilityStatus};
 use simulation::souls::happiness::Happiness;
+use simulation::souls::residence::Residences;
 use simulation::Simulation;
 
-use crate::gui::overlays::{is_coverage_receiver, power_available, uses_water};
+use crate::gui::overlays::{is_coverage_receiver, power_available};
 
 pub(super) fn render(sim: &Simulation, building: BuildingID) {
     let list = needs(sim, building);
@@ -50,12 +51,14 @@ fn needs(sim: &Simulation, id: BuildingID) -> Vec<Need> {
         return Vec::new();
     };
     let receiver = is_coverage_receiver(building.kind);
-    if !receiver && !uses_water(building) {
+    let utilities = sim
+        .read::<UtilityFlow>()
+        .status(&map, &sim.read::<Residences>(), id);
+    if !receiver && utilities.is_none() {
         return Vec::new();
     }
 
     let power = sim.read::<ElectricityFlow>();
-    let utilities = sim.read::<UtilityFlow>();
     let network = map
         .electricity
         .net_id(id)
@@ -73,44 +76,46 @@ fn needs(sim: &Simulation, id: BuildingID) -> Vec<Need> {
         detail: power_detail.into(),
     });
 
-    let totals = network.and_then(|network| {
-        utilities
-            .networks()
-            .find_map(|(id, totals)| (id == network).then_some(totals))
-    });
-    for (label, met, capacity_demand) in [
-        (
-            "Water",
-            utilities.has_water(id),
-            totals.map(|t| (t.water_production, t.water_demand)),
-        ),
-        (
-            "Sewage",
-            utilities.has_sewage(id),
-            totals.map(|t| (t.sewage_capacity, t.sewage_demand)),
-        ),
-    ] {
-        let detail = match capacity_demand {
-            Some((capacity, demand)) => {
-                let reason = if met {
-                    "Available"
-                } else if capacity <= 0.0 {
+    if let Some(utilities) = utilities {
+        for (label, status, capacity_demand) in [
+            (
+                "Water",
+                utilities.water,
+                utilities
+                    .totals
+                    .map(|t| (t.water_production, t.water_demand)),
+            ),
+            (
+                "Sewage",
+                utilities.sewage,
+                utilities
+                    .totals
+                    .map(|t| (t.sewage_capacity, t.sewage_demand)),
+            ),
+        ] {
+            let reason = match status {
+                UtilityStatus::Served => "Available",
+                UtilityStatus::Shortage
+                    if capacity_demand.is_some_and(|(capacity, _)| capacity <= 0.0) =>
+                {
                     "No active supply"
-                } else if capacity < demand {
-                    "Network shortage"
-                } else {
-                    "Awaiting network refresh"
-                };
-                format!("{reason} ({capacity:.1} capacity / {demand:.1} demand)")
-            }
-            None if network.is_some() => "Awaiting network refresh".into(),
-            None => "No network connection".into(),
-        };
-        list.push(Need {
-            label,
-            met: Some(met),
-            detail,
-        });
+                }
+                UtilityStatus::Shortage => "Network shortage",
+                UtilityStatus::Disconnected => "Disconnected",
+                UtilityStatus::Unknown => "Awaiting network refresh",
+            };
+            let detail = capacity_demand.map_or_else(
+                || reason.into(),
+                |(capacity, demand)| {
+                    format!("{reason} ({capacity:.1} capacity / {demand:.1} demand)")
+                },
+            );
+            list.push(Need {
+                label,
+                met: Some(status == UtilityStatus::Served),
+                detail,
+            });
+        }
     }
 
     if receiver {
@@ -169,6 +174,28 @@ mod tests {
     use simulation::SimulationOptions;
 
     use super::*;
+
+    #[test]
+    fn p2e_fix_orphaned_house_reports_disconnection_immediately() {
+        use scenarios::builders::CommandSink;
+        use simulation::world_command::WorldCommand;
+
+        let mut test = TestCtx::new(SimulationOptions {
+            terrain_size: 1,
+            save_replay: false,
+        });
+        grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
+        let house = fill_houses(&mut test, 1)[0];
+        let road = test.sim.map().get(house).unwrap().connected_road.unwrap();
+        test.submit(&[WorldCommand::MapRemoveRoad(road)]);
+        test.flush();
+        let list = needs(&test.sim, house);
+        for label in ["Water", "Sewage"] {
+            let need = list.iter().find(|need| need.label == label).unwrap();
+            assert_eq!(need.met, Some(false));
+            assert_eq!(need.detail, "Disconnected");
+        }
+    }
 
     #[test]
     fn p2e_needs_read_live_residential_snapshots() {

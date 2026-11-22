@@ -10,14 +10,18 @@ use simulation::map_dynamic::UtilityFlow;
 use simulation::souls::events::Fires;
 use simulation::world_command::{CommandOutcomes, Rejection};
 use simulation::Simulation;
-use yakui::{reflow, use_state, Alignment, Dim2, Pivot};
+use yakui::{reflow, Alignment, Dim2, Pivot};
+
+use crate::uiworld::UiWorld;
 
 const LIFETIME: Duration = Duration::from_secs(5);
+const COLLAPSE_TICKS: u64 = 3 * TICKS_PER_HOUR;
 
 type Outcome = (&'static str, Rejection);
 
 #[derive(Default)]
-struct ToastState {
+pub(crate) struct ToastState {
+    visible: bool,
     sequence: u64,
     started: Option<Instant>,
     city: CityEvents,
@@ -67,86 +71,124 @@ impl CityEvents {
             return Some([0; 3]);
         }
         let same_city = self.map == map_id && self.tick.is_some_and(|last| tick >= last);
+        let utility_refresh = !same_city || self.tick.unwrap_or_default() / 3000 != tick / 3000;
         self.map = map_id;
         self.tick = Some(tick);
+        if !same_city {
+            self.fires.clear();
+            self.no_water.clear();
+        }
+        let shortages = if utility_refresh {
+            let no_water: BTreeSet<_> = sim
+                .read::<UtilityFlow>()
+                .networks()
+                .filter(|(_, totals)| totals.water_demand > 0.0 && !totals.has_water())
+                .map(|(network, _)| network)
+                .collect();
+            let started = no_water.difference(&self.no_water).count();
+            self.no_water = no_water;
+            started
+        } else {
+            0
+        };
 
         let fires = sim.read::<Fires>();
-        let no_water: BTreeSet<_> = sim
-            .read::<UtilityFlow>()
-            .networks()
-            .filter(|(_, totals)| totals.water_demand > totals.water_production)
-            .map(|(network, _)| network)
-            .collect();
-
         let started = fires
             .by_building
             .iter()
             .filter(|&(id, start)| self.fires.get(id) != Some(start) && map.get(*id).is_some())
             .count();
 
-        // The fire snapshot publishes ignition ticks. An extinguished building
-        // remains on the map, and early demolitions cannot hit the fire deadline.
-        let collapsed = self
-            .fires
-            .iter()
-            .filter(|&(&id, start)| {
-                !fires.by_building.contains_key(&id)
-                    && map.get(id).is_none()
-                    && tick.saturating_sub(start.0) >= 3 * TICKS_PER_HOUR
-            })
-            .count();
-        let shortages = no_water.difference(&self.no_water).count();
-
-        self.fires.clone_from(&fires.by_building);
-        self.fires.retain(|&id, _| map.get(id).is_some());
-        self.no_water = no_water;
+        // A fire can leave the snapshot before its building is removed.
+        // Keep its last observed start until the building actually disappears.
+        self.fires.extend(
+            fires
+                .by_building
+                .iter()
+                .filter(|(id, _)| map.get(**id).is_some())
+                .map(|(&id, &start)| (id, start)),
+        );
+        let mut collapsed = 0;
+        self.fires.retain(|&id, start| {
+            let exists = map.get(id).is_some();
+            if !exists && tick.saturating_sub(start.0) >= COLLAPSE_TICKS {
+                collapsed += 1;
+            }
+            exists
+        });
         same_city.then_some([started, collapsed, shortages])
     }
 }
 
-pub fn render(sim: &Simulation) {
-    let state = use_state(ToastState::default);
-    let outcomes = sim.read::<CommandOutcomes>();
-    let mut state = state.borrow_mut();
-    let now = Instant::now();
-    if state.sequence != outcomes.sequence {
-        state.sequence = outcomes.sequence;
-        state.started = (!outcomes.last.is_empty()).then_some(now);
-    }
-
-    state
-        .notices
-        .retain(|notice| now.duration_since(notice.at) < LIFETIME);
-    let counts = state.city.update(sim).unwrap_or_else(|| {
-        state.notices.clear();
-        [0; 3]
-    });
-    for (event, count) in [Event::Fire, Event::Collapse, Event::NoWater]
-        .into_iter()
-        .zip(counts)
-    {
-        if count == 0 {
-            continue;
+impl ToastState {
+    pub(super) fn observe(&mut self, sim: &Simulation, visible: bool, now: Instant) {
+        let outcomes = sim.read::<CommandOutcomes>();
+        let sequence = outcomes.sequence;
+        let counts = self.city.update(sim);
+        if !visible || !self.visible || counts.is_none() {
+            self.visible = visible;
+            self.sequence = sequence;
+            self.started = None;
+            self.notices.clear();
+            return;
         }
-        if let Some(notice) = state
+
+        if self
+            .started
+            .is_some_and(|at| now.duration_since(at) >= LIFETIME)
+        {
+            self.started = None;
+        }
+        if self.sequence != sequence {
+            self.sequence = sequence;
+            self.started = if outcomes.last.is_empty() {
+                None
+            } else {
+                self.started.or(Some(now))
+            };
+        }
+        self.notices
+            .retain(|notice| now.duration_since(notice.at) < LIFETIME);
+
+        let [fires, collapses, new_shortages] = counts.unwrap_or_default();
+        for (event, count) in [(Event::Fire, fires), (Event::Collapse, collapses)] {
+            if count == 0 {
+                continue;
+            }
+            if let Some(notice) = self.notices.iter_mut().find(|notice| notice.event == event) {
+                notice.count += count;
+            } else {
+                self.notices.push(Notice {
+                    event,
+                    count,
+                    at: now,
+                });
+            }
+        }
+
+        let count = self.city.no_water.len();
+        if count == 0 {
+            self.notices.retain(|notice| notice.event != Event::NoWater);
+        } else if let Some(notice) = self
             .notices
             .iter_mut()
-            .find(|notice| notice.event == event)
+            .find(|notice| notice.event == Event::NoWater)
         {
-            notice.count += count;
-            notice.at = now;
-        } else {
-            state.notices.push(Notice {
-                event,
+            notice.count = count;
+        } else if new_shortages > 0 {
+            self.notices.push(Notice {
+                event: Event::NoWater,
                 count,
                 at: now,
             });
         }
     }
+}
 
-    let rejected = state
-        .started
-        .is_some_and(|at| now.duration_since(at) < LIFETIME);
+pub(super) fn render(sim: &Simulation, uiworld: &UiWorld) {
+    let state = uiworld.read::<ToastState>();
+    let outcomes = sim.read::<CommandOutcomes>();
+    let rejected = state.started.is_some() && !outcomes.last.is_empty();
     if !rejected && state.notices.is_empty() {
         return;
     }
@@ -208,5 +250,37 @@ fn message(reason: Rejection) -> &'static str {
         Rejection::CostOverflow => "Construction cost is too large",
         Rejection::InsufficientFunds => "Not enough money",
         Rejection::MutationFailed => "The map change could not be applied",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geom::vec2;
+    use scenarios::{
+        builders::{fill_houses, grid_city},
+        ScenarioCtx,
+    };
+    use simulation::world_command::WorldCommand;
+    use simulation::SimulationOptions;
+
+    #[test]
+    fn p2e_fix_collapse_survives_fire_snapshot_removal() {
+        let mut test = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            save_replay: false,
+        });
+        grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
+        let house = fill_houses(&mut test, 1)[0];
+        let mut events = CityEvents::default();
+        test.sim.write::<Fires>().by_building.insert(house, Tick(0));
+        events.update(&test.sim);
+        test.sim.write::<Fires>().by_building.remove(&house);
+        test.sim.write::<prototypes::GameTime>().tick = Tick(3 * TICKS_PER_HOUR + 1);
+        events.update(&test.sim);
+        test.submit(&[WorldCommand::MapRemoveBuilding(house)]);
+        test.run_ticks(1);
+        assert!(test.sim.map().get(house).is_none());
+        assert_eq!(events.update(&test.sim).unwrap()[1], 1);
     }
 }
