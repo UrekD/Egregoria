@@ -1,7 +1,7 @@
 use crate::gui::inspect::{entity_link, follow_button};
 use crate::uiworld::UiWorld;
-use goryak::{minrow, on_secondary_container, textc, Window};
-use simulation::transportation::VehicleState;
+use goryak::{mincolumn, minrow, on_secondary_container, textc, VertScrollSize, Window};
+use simulation::transportation::{Location, VehicleKind, VehicleState};
 use simulation::{Simulation, VehicleID};
 use yakui::widgets::Pad;
 
@@ -46,12 +46,37 @@ pub fn inspect_vehicle(uiworld: &UiWorld, sim: &Simulation, id: VehicleID) -> bo
             }
         }
 
-        for (human_id, human) in &sim.world().humans {
-            if human.router.personal_car == Some(id) {
-                minrow(5.0, || {
-                    textc(on_secondary_container(), "Owned by");
-                    entity_link(uiworld, sim, human_id);
+        if matches!(v.vehicle.kind, VehicleKind::Bus) {
+            let passengers: Vec<_> = sim
+                .world()
+                .humans
+                .iter()
+                .filter_map(|(human_id, human)| {
+                    matches!(human.location, Location::Transit(bus) if bus == id)
+                        .then_some(human_id)
+                })
+                .collect();
+            textc(
+                on_secondary_container(),
+                format!("Passengers  {}", passengers.len()),
+            );
+            if !passengers.is_empty() {
+                VertScrollSize::Fixed(210.0).show(|| {
+                    mincolumn(4.0, || {
+                        for human_id in passengers {
+                            entity_link(uiworld, sim, human_id);
+                        }
+                    });
                 });
+            }
+        } else {
+            for (human_id, human) in &sim.world().humans {
+                if human.router.personal_car == Some(id) {
+                    minrow(5.0, || {
+                        textc(on_secondary_container(), "Owned by");
+                        entity_link(uiworld, sim, human_id);
+                    });
+                }
             }
         }
 

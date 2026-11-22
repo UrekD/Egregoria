@@ -21,6 +21,7 @@ pub mod roadbuild;
 pub mod roadedit;
 pub mod terraforming;
 pub mod train;
+mod transit;
 
 pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
     if uiworld
@@ -65,6 +66,7 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
             });
         });
     });
+    transit::render(uiworld, sim);
 }
 
 fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {

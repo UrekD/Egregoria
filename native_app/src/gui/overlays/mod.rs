@@ -1,4 +1,5 @@
 mod legend;
+mod transit;
 pub(crate) mod view;
 
 use std::cell::RefCell;
@@ -176,7 +177,7 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
         let tick = sim.get_tick();
         let data_version = match mode {
             OverlayMode::Power => power_version(&map, &sim.read::<ElectricityFlow>()),
-            OverlayMode::Transit => sim.read::<Transit>().revision,
+            OverlayMode::Transit => transit::invalidation_key(&sim.read::<Transit>()),
             _ => mode.data_version(tick),
         };
         let rebuild = mode != cache.mode
@@ -188,6 +189,14 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             cache.mode = mode;
             cache.data_version = data_version;
             collect_tiles(sim, &map, mode, &mut cache.tiles);
+        }
+
+        if mode == OverlayMode::Transit {
+            if rebuild {
+                draw.clear_persistent();
+                transit::draw(&map, &sim.read::<Transit>(), &mut draw);
+            }
+            return;
         }
 
         let camera = uiworld.camera().camera;
@@ -337,7 +346,13 @@ pub(crate) fn selector(uiworld: &UiWorld) {
         *mode = MODES[selected].0;
     }
     let empty = CACHE.with_borrow(|cache| cache.mode == *mode && cache.tiles.chunks.is_empty());
-    legend::render(*mode, MODES[selected].1, empty);
+    match *mode {
+        Transit => {
+            let empty = uiworld.read::<ImmediateDraw>().persistent_orders.is_empty();
+            transit::legend(empty);
+        }
+        _ => legend::render(*mode, MODES[selected].1, empty),
+    }
 }
 
 #[cfg(test)]

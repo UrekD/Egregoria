@@ -5,7 +5,7 @@ use goryak::{
     blur_bg, error, mincolumn, on_secondary_container, padxy, secondary_container, textc,
 };
 use simulation::map::ElectricityNetworkID;
-use simulation::map_dynamic::UtilityFlow;
+use simulation::map_dynamic::{LineID, Transit, UtilityFlow};
 use simulation::souls::events::{FireEventKind, Fires};
 use simulation::world_command::{CommandOutcomes, Rejection};
 use simulation::Simulation;
@@ -32,6 +32,7 @@ struct CityEvents {
     map: usize,
     fire_cursor: u64,
     no_water: BTreeSet<ElectricityNetworkID>,
+    suspended_lines: BTreeSet<LineID>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -39,6 +40,7 @@ enum Event {
     Fire,
     Collapse,
     NoWater,
+    TransitSuspended,
 }
 
 struct Notice {
@@ -56,12 +58,14 @@ impl Event {
             (Self::Collapse, _) => format!("{count} buildings collapsed after fires"),
             (Self::NoWater, 1) => "A network is short of water".into(),
             (Self::NoWater, _) => format!("{count} networks are short of water"),
+            (Self::TransitSuspended, 1) => "A transit line was suspended".into(),
+            (Self::TransitSuspended, _) => format!("{count} transit lines were suspended"),
         }
     }
 }
 
 impl CityEvents {
-    fn update(&mut self, sim: &Simulation) -> Option<[usize; 3]> {
+    fn update(&mut self, sim: &Simulation) -> Option<[usize; 4]> {
         let tick = sim.get_tick();
         let map = sim.map();
         let map_id = std::ptr::from_ref(&map.subscribers) as usize;
@@ -100,7 +104,16 @@ impl CityEvents {
             }
         }
         self.fire_cursor = latest;
-        same_city.then_some([started, collapsed, shortages])
+
+        let suspended_lines = sim
+            .read::<Transit>()
+            .lines
+            .iter()
+            .filter_map(|(id, line)| line.suspended.then_some(id))
+            .collect::<BTreeSet<_>>();
+        let suspended = suspended_lines.difference(&self.suspended_lines).count();
+        self.suspended_lines = suspended_lines;
+        same_city.then_some([started, collapsed, shortages, suspended])
     }
 }
 
@@ -134,8 +147,12 @@ impl ToastState {
         self.notices
             .retain(|notice| now.duration_since(notice.at) < LIFETIME);
 
-        let [fires, collapses, new_shortages] = counts.unwrap_or_default();
-        for (event, count) in [(Event::Fire, fires), (Event::Collapse, collapses)] {
+        let [fires, collapses, new_shortages, suspended] = counts.unwrap_or_default();
+        for (event, count) in [
+            (Event::Fire, fires),
+            (Event::Collapse, collapses),
+            (Event::TransitSuspended, suspended),
+        ] {
             if count == 0 {
                 continue;
             }
@@ -209,7 +226,7 @@ fn render_rejections(outcomes: &[Outcome]) {
     for (command, reason) in unique.iter().take(3) {
         textc(
             on_secondary_container(),
-            format!("{command}: {}", message(*reason)),
+            format!("{command}: {}", command_message(command, *reason)),
         );
     }
     if unique.len() > 3 {
@@ -217,6 +234,18 @@ fn render_rejections(outcomes: &[Outcome]) {
             on_secondary_container(),
             format!("{} more reasons", unique.len() - 3),
         );
+    }
+}
+
+fn command_message(command: &str, reason: Rejection) -> &'static str {
+    match (command, reason) {
+        ("TransitAddStop", Rejection::MissingReference | Rejection::InvalidConnection) => {
+            "Choose a driving lane beside a sidewalk and away from junctions"
+        }
+        ("TransitCreateLine" | "TransitEditLine", Rejection::InvalidConnection) => {
+            "The stops must form a drivable loop"
+        }
+        _ => message(reason),
     }
 }
 
@@ -293,7 +322,7 @@ mod tests {
         record(2, FireEventKind::Extinguished);
         record(3, FireEventKind::Ignited);
         record(4, FireEventKind::Collapsed);
-        assert_eq!(events.update(&test.sim), Some([1, 1, 0]));
-        assert_eq!(events.update(&test.sim), Some([0, 0, 0]));
+        assert_eq!(events.update(&test.sim), Some([1, 1, 0, 0]));
+        assert_eq!(events.update(&test.sim), Some([0, 0, 0, 0]));
     }
 }
