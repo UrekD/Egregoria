@@ -1148,3 +1148,73 @@ fn replay_load_rejects_missing_or_mismatched_version() {
         assert_eq!(loaded.is_some(), variant == "current", "{variant}");
     }
 }
+
+#[test]
+fn pf_d_abandonment_batch_cleans_departing_workers_and_trade_references() {
+    use crate::souls::{human::spawn_human, residence};
+    use prototypes::{GameTime, Tick, TICKS_PER_HOUR};
+
+    let mut test = TestCtx::new_fast();
+    street(&test);
+    let departing: Vec<_> = [vec2(150.0, 125.0), vec2(250.0, 125.0)]
+        .into_iter()
+        .map(|pos| {
+            let home = test.build_house_near(pos);
+            spawn_human(&mut test.g, home).unwrap()
+        })
+        .collect();
+    for hour in 1..12 {
+        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR - 2));
+        residence::residence_update(&mut test.g);
+        test.g.apply_commands([]);
+    }
+    let third = test.build_house_near(vec2(275.0, 225.0));
+    let survivor = spawn_human(&mut test.g, third).unwrap();
+    spawn_human(&mut test.g, third).unwrap();
+    let building = factory(&mut test);
+    let proto = GoodsCompanyID::new("flour-factory");
+    let Some(SoulID::GoodsCompany(company)) =
+        crate::souls::goods_company::company_soul(&mut test.g, building, proto)
+    else {
+        panic!("unable to create employer");
+    };
+    let bread = ItemID::new("bread");
+    let trade = |buyer, seller| Trade {
+        buyer: TradeTarget(buyer),
+        seller: TradeTarget(seller),
+        qty: 1,
+        kind: bread,
+        money_delta: Money::ZERO,
+    };
+    test.g.world.humans[survivor].bought.0.insert(
+        bread,
+        vec![
+            trade(SoulID::Human(survivor), SoulID::Human(departing[0])),
+            trade(SoulID::Human(survivor), SoulID::GoodsCompany(company)),
+        ],
+    );
+    let employer = &mut test.g.world.companies[company];
+    employer.workers.0.extend(departing.iter().copied());
+    employer.comp.driver = Some(departing[1]);
+    employer.sold.0.push(trade(
+        SoulID::Human(departing[1]),
+        SoulID::GoodsCompany(company),
+    ));
+
+    *test.g.write::<GameTime>() = GameTime::new(Tick(12 * TICKS_PER_HOUR - 2));
+    residence::residence_update(&mut test.g);
+    test.g.apply_commands([]);
+
+    for id in departing {
+        assert!(test.g.get(id).is_none());
+        assert_no_market_refs(&test.g, SoulID::Human(id));
+    }
+    let trades = &test.g.get(survivor).unwrap().bought.0[&bread];
+    assert_eq!(trades.len(), 1);
+    assert_eq!(trades[0].seller, TradeTarget(SoulID::GoodsCompany(company)));
+    let employer = test.g.get(company).unwrap();
+    assert!(employer.workers.0.is_empty());
+    assert_eq!(employer.comp.driver, None);
+    assert!(employer.sold.0.is_empty());
+    assert!(test.g.world.departing.is_none());
+}

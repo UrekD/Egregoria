@@ -655,6 +655,13 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
 
     world.query_it_trans_speed().for_each(
         |(it, trans, speed): (&mut Itinerary, &mut Transform, f32)| {
+            // A stationary entity with a route may still cross an itinerary
+            // boundary. Only the inert itinerary kinds can skip movement here.
+            if it.reversed_local_path.is_empty()
+                && matches!(it.kind, ItineraryKind::None | ItineraryKind::WaitUntil(_))
+            {
+                return;
+            }
             trans.pos = it.update_with_route(
                 trans.pos,
                 speed * DELTA,

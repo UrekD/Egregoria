@@ -40,6 +40,7 @@ struct TimedOutSeller {
 debug_inspect_impl!(BuyGoods);
 
 impl BuyGoods {
+    #[inline]
     pub(crate) fn update_pickup(
         human: &mut HumanEnt,
         _: &GameTime,
@@ -49,16 +50,26 @@ impl BuyGoods {
     ) {
         // Count simulation steps even when SetGameTime moves the calendar clock.
         human.goods.tick += 1;
-        let Some(pickup) = &mut human.goods.pickup else {
+        let Some(pickup) = human.goods.pickup else {
             return;
         };
+        Self::poll_pickup(human, map, vehicles, resources, pickup);
+    }
+
+    fn poll_pickup(
+        human: &mut HumanEnt,
+        map: &Map,
+        vehicles: &HopSlotMap<VehicleID, VehicleEnt>,
+        resources: &Resources,
+        mut pickup: Pickup,
+    ) {
         if human.trans.pos != pickup.last_position {
             pickup.last_position = human.trans.pos;
             pickup.last_progress_tick = Some(human.goods.tick);
+            human.goods.pickup = Some(pickup);
         }
         let last_progress = pickup.last_progress_tick.unwrap_or(pickup.started);
         let stalled = human.goods.tick - last_progress >= PICKUP_STALL_TICKS;
-        let pickup = *pickup;
         let item = ItemID::new("retail-goods");
         let trade = human.bought.0.get_mut(&item).and_then(|trades| {
             let index = trades

@@ -1,4 +1,5 @@
 use std::fmt::{Debug, Formatter};
+use std::ops::Deref;
 
 use flat_spatial::grid::GridHandle;
 use serde::{Deserialize, Serialize};
@@ -10,7 +11,7 @@ pub use vehicle::*;
 
 use crate::map::BuildingID;
 use crate::utils::resources::Resources;
-use crate::world::VehicleID;
+use crate::world::{HumanID, VehicleID};
 use crate::{Simulation, World};
 
 pub mod pedestrian;
@@ -70,9 +71,115 @@ impl Default for TransportState {
     }
 }
 
-pub type TransportGrid = flat_spatial::Grid<TransportState, Vec2>;
+type SpatialGrid = flat_spatial::Grid<TransportState, Vec2>;
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct TransportGrid {
+    grid: SpatialGrid,
+    #[serde(skip)]
+    humans: ActiveColliders<HumanID>,
+    #[serde(skip)]
+    vehicles: ActiveColliders<VehicleID>,
+    #[serde(skip, default = "positions_may_be_pending")]
+    pending_positions: bool,
+}
+
+fn positions_may_be_pending() -> bool {
+    // A snapshot can contain unflushed calls to Grid::set_position.
+    true
+}
+
+#[derive(Clone)]
+struct ActiveColliders<I> {
+    refresh: bool,
+    entries: Vec<(I, Transporter)>,
+}
+
+impl<I> Default for ActiveColliders<I> {
+    fn default() -> Self {
+        Self {
+            refresh: true,
+            entries: Vec::new(),
+        }
+    }
+}
+
+impl<I> ActiveColliders<I> {
+    fn refresh_from(&mut self, entries: impl Iterator<Item = (I, Transporter)>) {
+        if std::mem::take(&mut self.refresh) {
+            self.entries.clear();
+            self.entries.extend(entries);
+        }
+    }
+}
+
+impl Deref for TransportGrid {
+    type Target = SpatialGrid;
+
+    fn deref(&self) -> &Self::Target {
+        &self.grid
+    }
+}
+
+impl TransportGrid {
+    pub fn new(cell_size: i32) -> Self {
+        Self {
+            grid: SpatialGrid::new(cell_size),
+            humans: ActiveColliders::default(),
+            vehicles: ActiveColliders::default(),
+            pending_positions: false,
+        }
+    }
+
+    pub fn insert(&mut self, pos: Vec2, state: TransportState) -> GridHandle {
+        match state.group {
+            TransportationGroup::Pedestrians => self.humans.refresh = true,
+            TransportationGroup::Vehicles => self.vehicles.refresh = true,
+            TransportationGroup::Unknown => {
+                self.humans.refresh = true;
+                self.vehicles.refresh = true;
+            }
+        }
+        self.grid.insert(pos, state)
+    }
+
+    pub fn set_position(&mut self, handle: GridHandle, pos: Vec2) {
+        self.pending_positions = true;
+        self.grid.set_position(handle, pos);
+    }
+
+    pub fn get_mut(&mut self, handle: GridHandle) -> Option<(Vec2, &mut TransportState)> {
+        self.grid.get_mut(handle)
+    }
+
+    pub fn remove(&mut self, handle: GridHandle) -> Option<TransportState> {
+        self.grid.remove(handle)
+    }
+
+    pub fn remove_maintain(&mut self, handle: GridHandle) -> Option<TransportState> {
+        self.grid.remove_maintain(handle)
+    }
+
+    pub fn clear(&mut self) -> impl Iterator<Item = (Vec2, TransportState)> {
+        self.humans.refresh = true;
+        self.vehicles.refresh = true;
+        self.pending_positions = false;
+        self.grid.clear()
+    }
+
+    pub fn maintain(&mut self) {
+        self.pending_positions = false;
+        self.grid.maintain();
+    }
+
+    pub fn maintain_deterministic(&mut self) {
+        self.pending_positions = false;
+        self.grid.maintain_deterministic();
+    }
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Transporter(pub GridHandle);
 debug_inspect_impl!(Transporter);
 
@@ -89,18 +196,77 @@ pub fn transport_grid_synchronize(world: &mut World, resources: &mut Resources) 
     profiling::scope!("physics::transport_grid_synchronize");
     let mut transport_grid = resources.write::<TransportGrid>();
 
-    world.query_trans_speed_coll_vehicle().for_each(
-        |(trans, kin, coll, v): (&Transform, &Speed, Transporter, Option<&Vehicle>)| {
-            transport_grid.set_position(coll.0, trans.pos.xy());
-            let (_, po) = transport_grid.get_mut(coll.0).unwrap(); // Unwrap ok: handle is deleted only when entity is deleted too
-            po.dir = trans.dir.xy();
-            po.speed = kin.0;
-            po.height = trans.pos.z;
-            if let Some(v) = v {
-                po.flag = v.flag;
-            }
-        },
+    let TransportGrid {
+        grid,
+        humans,
+        vehicles,
+        pending_positions,
+    } = &mut *transport_grid;
+    vehicles.refresh_from(
+        world
+            .vehicles
+            .iter()
+            .filter_map(|(id, v)| Some((id, v.collider?))),
+    );
+    humans.refresh_from(
+        world
+            .humans
+            .iter()
+            .filter_map(|(id, h)| Some((id, h.collider?))),
     );
 
+    // Cell maintenance sorts relocations by handle and preserves the remaining
+    // cell visitation order independently of the owner index.
+    vehicles.entries.retain(|&(id, coll)| {
+        let Some(v) = world.vehicles.get(id).filter(|v| v.collider == Some(coll)) else {
+            return false;
+        };
+        synchronize_collider(
+            grid,
+            coll,
+            &v.trans,
+            &v.speed,
+            Some(v.vehicle.flag),
+            *pending_positions,
+        );
+        true
+    });
+    humans.entries.retain(|&(id, coll)| {
+        let Some(h) = world.humans.get(id).filter(|h| h.collider == Some(coll)) else {
+            return false;
+        };
+        synchronize_collider(grid, coll, &h.trans, &h.speed, None, *pending_positions);
+        true
+    });
+
     transport_grid.maintain_deterministic();
+}
+
+fn synchronize_collider(
+    grid: &mut SpatialGrid,
+    collider: Transporter,
+    trans: &Transform,
+    speed: &Speed,
+    flag: Option<u64>,
+    pending_positions: bool,
+) {
+    let (pos, state) = grid
+        .get_mut(collider.0)
+        .expect("collider missing from transport grid");
+    let same = |a: f32, b: f32| a.to_bits() == b.to_bits();
+    if !same(state.dir.x, trans.dir.x) || !same(state.dir.y, trans.dir.y) {
+        state.dir = trans.dir.xy();
+    }
+    if !same(state.speed, speed.0) {
+        state.speed = speed.0;
+    }
+    if !same(state.height, trans.pos.z) {
+        state.height = trans.pos.z;
+    }
+    if let Some(flag) = flag.filter(|&flag| flag != state.flag) {
+        state.flag = flag;
+    }
+    if pending_positions || !same(pos.x, trans.pos.x) || !same(pos.y, trans.pos.y) {
+        grid.set_position(collider.0, trans.pos.xy());
+    }
 }

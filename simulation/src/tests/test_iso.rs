@@ -499,3 +499,85 @@ fn test_world_survives_serde() {
         break;
     }
 }
+
+#[test]
+fn pf_d_market_cache_preserves_save_load_equality() {
+    let mut ctx = TestCtx::new_fast();
+    ctx.tick_fast();
+    let bytes = Bincode::encode(&ctx.g).unwrap();
+    let decoded: Simulation = Bincode::decode(&bytes).unwrap();
+    assert_eq!(ctx.g.hashes(), decoded.hashes());
+    assert!(ctx.g.is_equal(&decoded));
+}
+
+#[test]
+fn pf_d_transport_grid_preserves_legacy_update_and_neighbour_order() {
+    use crate::transportation::{spawn_driving_vehicle, transport_grid_synchronize, VehicleKind};
+    use geom::Transform;
+
+    fn legacy_synchronize(sim: &mut Simulation) {
+        let mut grid = sim.write::<TransportGrid>();
+        for (trans, speed, collider, vehicle) in sim.world.query_trans_speed_coll_vehicle() {
+            grid.set_position(collider.0, trans.pos.xy());
+            let (_, state) = grid.get_mut(collider.0).unwrap();
+            state.dir = trans.dir.xy();
+            state.speed = speed.0;
+            state.height = trans.pos.z;
+            if let Some(vehicle) = vehicle {
+                state.flag = vehicle.flag;
+            }
+        }
+        grid.maintain_deterministic();
+    }
+
+    let mut ctx = TestCtx::new_fast();
+    let vehicles: Vec<_> = [105.0, 120.0, 205.0, 220.0]
+        .into_iter()
+        .map(|x| {
+            spawn_driving_vehicle(
+                &mut ctx.g,
+                VehicleKind::Car,
+                Transform::new(vec3(x, 100.0, 0.0)),
+            )
+            .unwrap()
+        })
+        .collect();
+    let mut reference: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+    for step in 0..4 {
+        for sim in [&mut ctx.g, &mut reference] {
+            let first = &mut sim.world.vehicles[vehicles[0]];
+            first.trans.pos.x = 101.0 + 100.0 * step as f32;
+            first.trans.dir.y = -0.0;
+            first.speed.0 = -0.0;
+            let last = &mut sim.world.vehicles[vehicles[3]];
+            last.trans.pos.x = 107.0 + 100.0 * step as f32;
+            last.vehicle.flag = step;
+        }
+        transport_grid_synchronize(&mut ctx.g.world, &mut ctx.g.resources);
+        legacy_synchronize(&mut reference);
+        let neighbours = |sim: &Simulation| {
+            sim.read::<TransportGrid>()
+                .query_around(vec2(200.0, 100.0), 225.0)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(neighbours(&ctx.g), neighbours(&reference));
+        assert_eq!(
+            ctx.g.hashes()["transport_grid"],
+            reference.hashes()["transport_grid"]
+        );
+    }
+
+    let handle = ctx.g.get(vehicles[0]).unwrap().collider.unwrap().0;
+    ctx.g
+        .write::<TransportGrid>()
+        .set_position(handle, vec2(20.0, 20.0));
+    let saved = Bincode::encode(&ctx.g).unwrap();
+    ctx.g = Bincode::decode(&saved).unwrap();
+    reference = Bincode::decode(&saved).unwrap();
+    transport_grid_synchronize(&mut ctx.g.world, &mut ctx.g.resources);
+    legacy_synchronize(&mut reference);
+    assert_eq!(
+        ctx.g.hashes()["transport_grid"],
+        reference.hashes()["transport_grid"]
+    );
+}

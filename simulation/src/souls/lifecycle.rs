@@ -2,7 +2,7 @@ use geom::Vec3;
 use prototypes::{GameTime, ItemID};
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::economy::Market;
+use crate::economy::{Market, Trade};
 use crate::map::{Building, BuildingID, BuildingKind, Map, PathKind};
 use crate::map_dynamic::{
     BuildingInfos, Destination, DispatchID, Dispatcher, Itinerary, ParkingManagement,
@@ -103,7 +103,7 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
             market.cancel_retail_purchase(trade, seller_pos);
         }
     }
-    clear_soul_references(sim, SoulID::Human(id));
+    let employers = clear_soul_references(sim, SoulID::Human(id));
 
     if let Some(WorkKind::Driver { truck, .. }) = human.work.as_ref().map(|work| work.kind) {
         sim.write::<Dispatcher>()
@@ -114,20 +114,31 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
     let map = resources.read::<Map>();
     let mut market = resources.write::<Market>();
     let job = ItemID::new("job-opening");
-    for (company, entity) in world.companies.iter_mut() {
+    let mut remove_worker = |company, entity: &mut CompanyEnt| {
         if entity.comp.driver == Some(id) {
             entity.comp.driver = None;
         }
         let worker_count = entity.workers.0.len();
         entity.workers.0.retain(|&worker| worker != id);
         if entity.workers.0.len() == worker_count {
-            continue;
+            return;
         }
 
         if let Some(building) = map.get(entity.comp.building) {
             let soul = SoulID::GoodsCompany(company);
             market.produce(soul, job, 1);
             market.sell_all(soul, building.door_pos.xy(), job, 0);
+        }
+    };
+    if let Some(employers) = employers {
+        for company in employers {
+            if let Some(entity) = world.companies.get_mut(company) {
+                remove_worker(company, entity);
+            }
+        }
+    } else {
+        for (company, entity) in world.companies.iter_mut() {
+            remove_worker(company, entity);
         }
     }
 }
@@ -218,14 +229,34 @@ pub(crate) fn train_dropped(sim: &mut Simulation, id: TrainID) {
     }
 }
 
-fn clear_soul_references(sim: &mut Simulation, soul: SoulID) {
+#[derive(Default)]
+pub(crate) struct DepartureReferences(BTreeMap<HumanID, Departure>);
+
+#[derive(Default)]
+struct Departure {
+    human_buyers: Vec<HumanID>,
+    company_traders: Vec<CompanyID>,
+    employers: Vec<CompanyID>,
+}
+
+fn human_trade_participants<'a>(trades: impl Iterator<Item = &'a Trade>) -> BTreeSet<HumanID> {
+    trades
+        .flat_map(|trade| [trade.buyer.0, trade.seller.0])
+        .filter_map(|soul| match soul {
+            SoulID::Human(id) => Some(id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<CompanyID>> {
     let (world, resources) = sim.world_res();
     let mut market = resources.write::<Market>();
     market.remove(soul);
     resources.write::<BuildingInfos>().remove_soul(soul);
     let bread = ItemID::new("bread");
     let retail = ItemID::new("retail-goods");
-    for human in world.humans.values_mut() {
+    let mut remove_human_trades = |human: &mut HumanEnt| {
         human.bought.0.retain(|&item, trades| {
             let count = trades.len();
             trades.retain(|trade| {
@@ -242,13 +273,35 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) {
             }
             !trades.is_empty() || count == 0
         });
-    }
-    for company in world.companies.values_mut() {
+    };
+    let remove_company_trades = |company: &mut CompanyEnt| {
         company.sold.0.retain(|trade| !trade.involves(soul));
         for trades in company.bought.0.values_mut() {
             trades.retain(|trade| !trade.involves(soul));
         }
+    };
+    if let (SoulID::Human(id), Some(batch)) = (soul, &mut world.departing) {
+        if let Some(entry) = batch.0.remove(&id) {
+            for buyer in entry.human_buyers {
+                if let Some(human) = world.humans.get_mut(buyer) {
+                    remove_human_trades(human);
+                }
+            }
+            for company in entry.company_traders {
+                if let Some(company) = world.companies.get_mut(company) {
+                    remove_company_trades(company);
+                }
+            }
+            return Some(entry.employers);
+        }
     }
+    for human in world.humans.values_mut() {
+        remove_human_trades(human);
+    }
+    for company in world.companies.values_mut() {
+        remove_company_trades(company);
+    }
+    None
 }
 
 pub(crate) fn clear_building_references(sim: &mut Simulation, id: BuildingID, door: Option<Vec3>) {
@@ -258,6 +311,55 @@ pub(crate) fn clear_building_references(sim: &mut Simulation, id: BuildingID, do
 pub(crate) fn clear_abandoned_home_references(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
     let buildings = homes.iter().map(|&(id, door)| (id, Some(door))).collect();
     clear_references(sim, &buildings);
+
+    let (world, resources) = sim.world_res();
+    let infos = resources.read::<BuildingInfos>();
+    // Eviction has already removed or reassigned residence memberships. Only
+    // actual command-buffer deletions will consume entries from this index.
+    let mut departing: BTreeMap<_, Departure> = world
+        .humans
+        .iter()
+        .filter(|(id, human)| {
+            buildings.contains_key(&human.home.house)
+                && infos.residence_of(SoulID::Human(*id)).is_none()
+        })
+        .map(|(id, _)| (id, Departure::default()))
+        .collect();
+    if departing.len() < 2 {
+        return;
+    }
+    for (buyer, human) in world.humans.iter() {
+        for id in human_trade_participants(human.bought.0.values().flatten()) {
+            if let Some(entry) = departing.get_mut(&id) {
+                entry.human_buyers.push(buyer);
+            }
+        }
+    }
+    for (company, entity) in world.companies.iter() {
+        let trades = entity
+            .sold
+            .0
+            .iter()
+            .chain(entity.bought.0.values().flatten());
+        for id in human_trade_participants(trades) {
+            if let Some(entry) = departing.get_mut(&id) {
+                entry.company_traders.push(company);
+            }
+        }
+        let mut workers: BTreeSet<_> = entity.workers.0.iter().copied().collect();
+        workers.extend(entity.comp.driver);
+        for id in workers {
+            if let Some(entry) = departing.get_mut(&id) {
+                entry.employers.push(company);
+            }
+        }
+    }
+    world.departing = Some(DepartureReferences(departing));
+    resources
+        .read::<ParCommandBuffer<HumanEnt>>()
+        .exec_ent(HumanID::default(), |sim| {
+            sim.world.departing = None;
+        });
 }
 
 fn decision_references_buildings(

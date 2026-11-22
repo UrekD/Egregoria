@@ -370,3 +370,43 @@ fn p2abc_map_load_rejects_a_dangling_road_lane() {
         .expect("dangling lane ID");
     assert!(error.to_string().contains("invalid lane"), "{error}");
 }
+
+#[test]
+fn pf_d_hourly_consumers_follow_producers_after_calendar_jump() {
+    use crate::souls::happiness::Happiness;
+
+    let mut test = TestCtx::new_fast();
+    road(
+        &test,
+        vec2(80.0, 100.0),
+        vec2(420.0, 100.0),
+        LanePatternBuilder::new(),
+    );
+    let home = test.build_house_near(vec2(200.0, 125.0));
+    let residences_before = Bincode::encode(&*test.g.read::<Residences>()).unwrap();
+    let jump = prototypes::TICKS_PER_HOUR - 3;
+    test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(jump)))]);
+    for _ in 0..6 {
+        test.tick_fast();
+    }
+    assert_eq!(test.g.read::<EnvGrid>().land_value(home), 0);
+    assert_eq!(test.g.read::<UtilityFlow>().networks().count(), 0);
+    assert_eq!(
+        Bincode::encode(&*test.g.read::<Residences>()).unwrap(),
+        residences_before,
+        "residences must wait for the elapsed-time phase"
+    );
+    assert!(test.g.read::<Happiness>().by_building.is_empty());
+
+    test.g = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    for _ in 6..prototypes::TICKS_PER_HOUR + 2 {
+        test.tick_fast();
+    }
+    assert!(test.g.read::<EnvGrid>().land_value(home) > 0);
+    assert!(test.g.read::<UtilityFlow>().networks().next().is_some());
+    assert_ne!(
+        Bincode::encode(&*test.g.read::<Residences>()).unwrap(),
+        residences_before
+    );
+    assert!(test.g.read::<Happiness>().by_building.contains_key(&home));
+}

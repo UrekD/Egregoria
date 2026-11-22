@@ -82,8 +82,35 @@ pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources)
     profiling::scope!("transportation::vehicle_state_update_system");
     let buffer = &*resources.read::<ParCommandBuffer<VehicleEnt>>();
     let map = &*resources.read::<Map>();
+    let validation = &mut world.parking_validation;
+    let revision = (map.identity(), map.parking.revision());
+    let changed = validation.revision.replace(revision) != Some(revision);
+
+    let recently_parked = &mut validation.recently_parked;
+    if !changed {
+        for ent in recently_parked.drain(..) {
+            let Some(v) = world.vehicles.get_mut(ent) else {
+                continue;
+            };
+            if matches!(v.vehicle.state, VehicleState::Parked(_)) {
+                vehicle_state_update(
+                    buffer,
+                    map,
+                    ent,
+                    &mut v.vehicle,
+                    &mut v.trans,
+                    &mut v.speed,
+                    &mut v.collider,
+                );
+            }
+        }
+    }
+    recently_parked.clear();
 
     world.vehicles.iter_mut().for_each(|(ent, v)| {
+        if !changed && matches!(v.vehicle.state, VehicleState::Parked(_)) {
+            return;
+        }
         if let VehicleState::ReturningToDepot {
             spot,
             stopped_ticks,
@@ -106,6 +133,7 @@ pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources)
             }
             return;
         }
+        let was_parking = matches!(v.vehicle.state, VehicleState::RoadToPark(..));
         vehicle_state_update(
             buffer,
             map,
@@ -115,7 +143,16 @@ pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources)
             &mut v.speed,
             &mut v.collider,
         );
+        if was_parking && matches!(v.vehicle.state, VehicleState::Parked(_)) {
+            recently_parked.push(ent);
+        }
     });
+}
+
+#[derive(Default)]
+pub(crate) struct ParkingValidation {
+    revision: Option<(u64, u64)>,
+    recently_parked: Vec<VehicleID>,
 }
 
 /// Decides whether a vehicle should change states, from parked to unparking to driving etc

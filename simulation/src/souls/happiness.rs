@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 
-use prototypes::TICKS_PER_HOUR;
+use prototypes::{Tick, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
 
 use crate::economy::{
     balance::{
-        HAPPINESS_CLEAN_AIR, HAPPINESS_COMMUTE, HAPPINESS_COMMUTE_LIMIT_M, HAPPINESS_COVERAGE,
-        HAPPINESS_EMPLOYMENT, HAPPINESS_LAND_VALUE, HAPPINESS_POWER, HAPPINESS_RETAIL,
-        HAPPINESS_SEWAGE, HAPPINESS_TAX, HAPPINESS_WATER, NEUTRAL_HAPPINESS,
+        periodic_tick, HAPPINESS_CLEAN_AIR, HAPPINESS_COMMUTE, HAPPINESS_COMMUTE_LIMIT_M,
+        HAPPINESS_COVERAGE, HAPPINESS_EMPLOYMENT, HAPPINESS_LAND_VALUE, HAPPINESS_POWER,
+        HAPPINESS_RETAIL, HAPPINESS_SEWAGE, HAPPINESS_TAX, HAPPINESS_WATER, NEUTRAL_HAPPINESS,
     },
     Budget, MAX_TAX_RATE_PERMILLE,
 };
@@ -48,7 +48,8 @@ pub(crate) const fn due(tick: u64) -> bool {
 }
 
 pub fn happiness_update(sim: &mut Simulation) {
-    if !due(sim.get_tick()) {
+    // Follow the producer's elapsed-time phase even when the calendar changes.
+    if !due(periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()))) {
         return;
     }
     profiling::scope!("souls::happiness_update");

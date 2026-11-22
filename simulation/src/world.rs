@@ -181,6 +181,10 @@ pub struct World {
     pub wagons: HopSlotMap<WagonID, WagonEnt>,
     pub freight_stations: HopSlotMap<FreightStationID, FreightStationEnt>,
     pub companies: HopSlotMap<CompanyID, CompanyEnt>,
+    #[serde(skip)]
+    pub(crate) parking_validation: crate::transportation::road::ParkingValidation,
+    #[serde(skip)]
+    pub(crate) departing: Option<lifecycle::DepartureReferences>,
 }
 
 impl World {
