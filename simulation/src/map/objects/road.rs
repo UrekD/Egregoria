@@ -44,12 +44,38 @@ pub struct Road {
 
     pub connected_buildings: Vec<BuildingID>,
 
-    src_interface: f32,
+    src_interface: SourceInterface,
     dst_interface: f32,
 
     lanes_forward: Vec<(LaneID, LaneKind)>,
     lanes_backward: Vec<(LaneID, LaneKind)>,
 }
+
+/// Stores the elevated-span flag in the sign bit of the source interface distance.
+/// This keeps the positional Bincode layout of a road. Older saves stored
+/// nonnegative distances, which decode as terrain-following.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+struct SourceInterface(f32);
+
+impl SourceInterface {
+    fn new(distance: f32, elevated_span: bool) -> Self {
+        Self(if elevated_span { -distance } else { distance })
+    }
+
+    fn elevated_span(self) -> bool {
+        self.0.is_sign_negative()
+    }
+
+    fn distance(self) -> f32 {
+        self.0.abs()
+    }
+
+    fn set_distance(&mut self, distance: f32) {
+        self.0 = distance.copysign(self.0);
+    }
+}
+
 #[derive(Copy, Clone)]
 pub struct LanePair {
     pub incoming: Option<LaneID>,
@@ -82,19 +108,23 @@ impl Road {
         spatial: &mut SpatialMap,
     ) -> RoadID {
         let width = lane_pattern.width();
-        let (points, _err) = Self::generate_points(
+        let elevated_span = Self::is_elevated_span(src.pos, dst.pos, env);
+        let (points, error) = Self::generate_points_with_span(
             src.pos,
             dst.pos,
             segment,
             lane_pattern.lanes().any(|(a, _, _)| a.is_rail()),
             env,
+            elevated_span,
         );
+        let elevated_span =
+            elevated_span && !matches!(error, Some(PointGenerateError::OutsideOfMap));
 
         let id = roads.insert_with_key(|id| Self {
             id,
             src: src.id,
             dst: dst.id,
-            src_interface: 9.0,
+            src_interface: SourceInterface::new(9.0, elevated_span),
             dst_interface: 9.0,
             width,
             lanes_forward: vec![],
@@ -280,22 +310,44 @@ impl Road {
 
     fn update_interfaced_points(&mut self, env: &Environment) {
         let points = &self.points;
-        self.interfaced_points =
-            points.cut(self.interface_from(self.src), self.interface_from(self.dst));
+        let clipped = points.cut(self.interface_from(self.src), self.interface_from(self.dst));
 
-        let cpoints = &mut self.interfaced_points;
-        let z_beg = self.points.first().z - ROAD_Z_OFFSET;
-        let z_end = self.points.last().z - ROAD_Z_OFFSET;
+        if self.src_interface.elevated_span() {
+            // Cutting the original 3D deck interpolates its grade at both interfaces.
+            self.interfaced_points = clipped;
+            return;
+        }
 
-        let (p, _) = Self::heightfinder(
-            &PolyLine::new(cpoints.iter().map(|v| v.xy()).collect::<Vec<_>>()),
-            z_beg,
-            z_end,
+        // Keep the original terrain-following profile with the junction heights.
+        let (p, _) = Self::heightfinder_with_span(
+            &clipped.flatten(),
+            points.first().z - ROAD_Z_OFFSET,
+            points.last().z - ROAD_Z_OFFSET,
             MAX_SLOPE,
             env,
+            false,
         );
-
         self.interfaced_points = p;
+    }
+
+    fn is_elevated_span(from: Vec3, to: Vec3, env: &Environment) -> bool {
+        // Allow for rounding when an endpoint height round-trips through ROAD_Z_OFFSET.
+        [from, to].iter().all(|pos| {
+            env.height(pos.xy())
+                .is_some_and(|ground| pos.z - ground > 0.001)
+        })
+    }
+
+    pub fn heightfinder(
+        p: &PolyLine,
+        start_height: f32,
+        end_height: f32,
+        maxslope: f32,
+        env: &Environment,
+    ) -> (PolyLine3, Option<PointGenerateError>) {
+        let elevated_span =
+            Self::is_elevated_span(p.first().z(start_height), p.last().z(end_height), env);
+        Self::heightfinder_with_span(p, start_height, end_height, maxslope, env, elevated_span)
     }
 
     // Run an algorithm to find the height of the road at each point
@@ -309,12 +361,13 @@ impl Road {
     // - Then simplify the result to avoid too many points
     //
     // maxslope is the maximum meter of height difference per meter of distance (1.0 is a 45° slope)
-    pub fn heightfinder(
+    fn heightfinder_with_span(
         p: &PolyLine,
         start_height: f32,
         end_height: f32,
         maxslope: f32,
         env: &Environment,
+        elevated_span: bool,
     ) -> (PolyLine3, Option<PointGenerateError>) {
         // first calculate the contour
 
@@ -338,20 +391,54 @@ impl Road {
         }
 
         let last = contour.len() - 1;
-        // Allow for rounding when endpoint heights round-trip through ROAD_Z_OFFSET.
-        let elevated_span = !height_error
-            && start_height - contour[0] > 0.001
-            && end_height - contour[last] > 0.001;
+        let elevated_span = elevated_span && !height_error;
+        let length = p.length();
+        let rise = end_height - start_height;
+        // Interior samples are spaced one meter apart along the path.
+        let deck_height = |i: usize| start_height + rise * (i as f32 / length);
+        let clear_span = elevated_span
+            && contour[1..last]
+                .iter()
+                .enumerate()
+                .all(|(i, &height)| height <= deck_height(i + 1));
         contour[0] = start_height;
         contour[last] = end_height;
 
+        let mut slope_was_too_steep = !clear_span && Self::follow_terrain(&mut contour, maxslope);
+        if elevated_span {
+            for (i, height) in contour[..last].iter_mut().enumerate().skip(1) {
+                let grade = deck_height(i);
+                *height = if clear_span { grade } else { height.max(grade) };
+            }
+            slope_was_too_steep |= rise.abs() > maxslope * length;
+        }
+
+        for (h, v) in contour.into_iter().zip(points.iter_mut()) {
+            v.z = h + ROAD_Z_OFFSET;
+        }
+
+        let mut points = PolyLine3::new(points);
+        points.simplify(Degrees(1.0).into(), 1.0, 100.0);
+
+        if height_error {
+            return (points, Some(PointGenerateError::OutsideOfMap));
+        }
+
+        if slope_was_too_steep {
+            return (points, Some(PointGenerateError::TooSteep));
+        }
+
+        (points, None)
+    }
+
+    fn follow_terrain(contour: &mut [f32], maxslope: f32) -> bool {
         // Then find out which points are airborn (according to maxslope)
         // To do that, we do two passes (one forward, one backward) to find the airborn points
 
         let mut airborn = Vec::with_capacity(contour.len());
 
         let mut cur_height = contour[0];
-        for &h in &contour {
+        for &h in contour.iter() {
             let diff = cur_height - h;
 
             airborn.push(diff > maxslope);
@@ -443,35 +530,7 @@ impl Road {
         //    std::mem::swap(&mut smoothed, &mut contour);
         //}
 
-        if elevated_span {
-            // Interior samples are spaced one meter apart along the path.
-            // Keep the span above the deck grade even where both terrain passes reached the ground.
-            let length = p.length();
-            let rise = end_height - start_height;
-            for (i, height) in contour[..last].iter_mut().enumerate().skip(1) {
-                let deck_height = start_height + rise * (i as f32 / length);
-                *height = height.max(deck_height);
-            }
-            slope_was_too_steep |= rise.abs() > maxslope * length;
-        }
-
-        for (h, v) in contour.into_iter().zip(points.iter_mut()) {
-            v.z = h + ROAD_Z_OFFSET;
-        }
-
-        // Then simplify the result to avoid too many points
-        let mut points = PolyLine3::new(points);
-        points.simplify(Degrees(1.0).into(), 1.0, 100.0);
-
-        if height_error {
-            return (points, Some(PointGenerateError::OutsideOfMap));
-        }
-
-        if slope_was_too_steep {
-            return (points, Some(PointGenerateError::TooSteep));
-        }
-
-        (points, None)
+        slope_was_too_steep
     }
 
     pub fn generate_points(
@@ -481,10 +540,29 @@ impl Road {
         precise: bool,
         env: &Environment,
     ) -> (PolyLine3, Option<PointGenerateError>) {
+        let elevated_span = Self::is_elevated_span(from, to, env);
+        Self::generate_points_with_span(from, to, segment, precise, env, elevated_span)
+    }
+
+    fn generate_points_with_span(
+        from: Vec3,
+        to: Vec3,
+        segment: RoadSegmentKind,
+        precise: bool,
+        env: &Environment,
+        elevated_span: bool,
+    ) -> (PolyLine3, Option<PointGenerateError>) {
         let spline = match segment {
             RoadSegmentKind::Straight => {
                 let p = PolyLine::new(vec![from.xy(), to.xy()]);
-                return Self::heightfinder(&p, from.z, to.z, MAX_SLOPE, env);
+                return Self::heightfinder_with_span(
+                    &p,
+                    from.z,
+                    to.z,
+                    MAX_SLOPE,
+                    env,
+                    elevated_span,
+                );
             }
             RoadSegmentKind::Curved((from_derivative, to_derivative)) => Spline {
                 from: from.xy(),
@@ -514,7 +592,7 @@ impl Road {
         }
         p.push(to.xy());
 
-        Self::heightfinder(&p, from.z, to.z, MAX_SLOPE, env)
+        Self::heightfinder_with_span(&p, from.z, to.z, MAX_SLOPE, env, elevated_span)
     }
 
     pub fn interface_point(&self, id: IntersectionID) -> Vec3 {
@@ -548,9 +626,9 @@ impl Road {
 
     fn interfaces_from(&self, id: IntersectionID) -> (f32, f32) {
         if id == self.src {
-            (self.src_interface, self.dst_interface)
+            (self.src_interface.distance(), self.dst_interface)
         } else if id == self.dst {
-            (self.dst_interface, self.src_interface)
+            (self.dst_interface, self.src_interface.distance())
         } else {
             panic!("Asking interface from from an intersection not connected to the road");
         }
@@ -558,7 +636,7 @@ impl Road {
 
     pub fn set_interface(&mut self, id: IntersectionID, v: f32) {
         if id == self.src {
-            self.src_interface = v;
+            self.src_interface.set_distance(v);
         } else if id == self.dst {
             self.dst_interface = v;
         } else {
@@ -568,7 +646,8 @@ impl Road {
 
     pub fn max_interface(&mut self, id: IntersectionID, v: f32) {
         if id == self.src {
-            self.src_interface = self.src_interface.max(v);
+            self.src_interface
+                .set_distance(self.src_interface.distance().max(v));
         } else if id == self.dst {
             self.dst_interface = self.dst_interface.max(v);
         } else {
