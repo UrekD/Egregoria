@@ -1,0 +1,22 @@
+{
+  "osm3s":{"timestamp_osm_base":"2020-01-01T00:00:00Z"},
+  "elements":[
+    {"type":"way","id":10,"nodes":[1,2,3,4],"geometry":[{"lat":46.36,"lon":14.132},{"lat":46.36,"lon":14.155},{"lat":46.3601,"lon":14.156},{"lat":46.36,"lon":14.157}],"tags":{"highway":"residential"}},
+    {"type":"way","id":11,"nodes":[4,5],"geometry":[{"lat":46.36,"lon":14.157},{"lat":46.36,"lon":14.189}],"tags":{"highway":"secondary"}},
+    {"type":"way","id":12,"nodes":[4,6],"geometry":[{"lat":46.36,"lon":14.157},{"lat":46.3645,"lon":14.157}],"tags":{"highway":"motorway_link","oneway":"-1"}},
+    {"type":"way","id":13,"nodes":[7,4,8],"geometry":[{"lat":46.35,"lon":14.157},{"lat":46.36,"lon":14.157},{"lat":46.37,"lon":14.157}],"tags":{"railway":"rail","usage":"main"}},
+    {"type":"way","id":14,"nodes":[8,9],"geometry":[{"lat":46.37,"lon":14.157},{"lat":46.372,"lon":14.16}],"tags":{"railway":"rail","service":"spur"}},
+    {"type":"way","id":15,"nodes":[20,21,22,20],"geometry":[{"lat":46.365,"lon":14.157},{"lat":46.3653,"lon":14.157},{"lat":46.3652,"lon":14.1574},{"lat":46.365,"lon":14.157}],"tags":{"highway":"residential","junction":"roundabout"}},
+    {"type":"way","id":16,"nodes":[6,20],"geometry":[{"lat":46.3645,"lon":14.157},{"lat":46.365,"lon":14.157}],"tags":{"highway":"residential"}},
+    {"type":"way","id":17,"nodes":[21,23],"geometry":[{"lat":46.3653,"lon":14.157},{"lat":46.368,"lon":14.157}],"tags":{"highway":"residential"}},
+    {"type":"way","id":18,"nodes":[24,25],"geometry":[{"lat":46.36,"lon":14.1568},{"lat":46.36002,"lon":14.1568}],"tags":{"highway":"service"}},
+    {"type":"node","id":31,"lat":46.3605,"lon":14.155,"tags":{"amenity":"fire_station"}},
+    {"type":"way","id":32,"nodes":[33,34,35,36,33],"geometry":[{"lat":46.3604,"lon":14.1549},{"lat":46.3604,"lon":14.1551},{"lat":46.3606,"lon":14.1551},{"lat":46.3606,"lon":14.1549},{"lat":46.3604,"lon":14.1549}],"tags":{"amenity":"fire_station"}},
+    {"type":"way","id":19,"nodes":[40,41],"geometry":[{"lat":46.359,"lon":14.1565},{"lat":46.362,"lon":14.1565}],"tags":{"highway":"secondary","bridge":"yes","layer":"1"}},
+    {"type":"relation","id":50,"tags":{"type":"multipolygon","landuse":"residential"},"members":[
+      {"type":"way","ref":51,"role":"outer","geometry":[{"lat":46.357,"lon":14.152},{"lat":46.357,"lon":14.159},{"lat":46.361,"lon":14.159}]},
+      {"type":"way","ref":52,"role":"outer","geometry":[{"lat":46.357,"lon":14.152},{"lat":46.361,"lon":14.152},{"lat":46.361,"lon":14.159}]},
+      {"type":"way","ref":53,"role":"inner","geometry":[{"lat":46.358,"lon":14.154},{"lat":46.358,"lon":14.156},{"lat":46.359,"lon":14.156},{"lat":46.359,"lon":14.154},{"lat":46.358,"lon":14.154}]}
+    ]}
+  ]
+}

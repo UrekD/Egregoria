@@ -30,6 +30,7 @@ pub mod procgen {
 mod change_detection;
 mod electricity_cache;
 mod height_override;
+pub mod import;
 mod light_policy;
 #[allow(clippy::module_inception)]
 mod map;

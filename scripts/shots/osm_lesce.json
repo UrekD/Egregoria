@@ -1,0 +1,19 @@
+[
+  {"SetSession": "MainMenu"},
+  {"Screenshot": "osm-ready"},
+  {"WaitFrames": 24},
+  {"OpenWindow": "Load"},
+  {"LoadSlot": "lesce_osm"},
+  {"WaitFrames": 6},
+  {"Screenshot": "lesce-overview"},
+  {"SelectTool": "Zoning"},
+  {"WaitFrames": 4},
+  {"Screenshot": "lesce-zoning"},
+  {"SelectTool": "Hand"},
+  {"RunTicks": 36000},
+  {"SetOverlay": "Traffic"},
+  {"WaitFrames": 4},
+  {"Screenshot": "lesce-traffic"},
+  {"DumpState": "lesce-traffic-state"},
+  "Exit"
+]

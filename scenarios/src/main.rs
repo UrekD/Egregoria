@@ -24,7 +24,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]")
 }
 
 fn main() -> ExitCode {
@@ -58,6 +58,36 @@ fn run() -> Result<(), String> {
         .ok_or_else(usage)?;
     if name == "--help" || name == "-h" {
         println!("{}", usage());
+        return Ok(());
+    }
+    if name == "osm-city" {
+        let mut input = None;
+        let mut root = None;
+        let mut replace = false;
+        let mut check = false;
+        while let Some(arg) = args.next() {
+            match arg.to_str() {
+                Some("--input") if input.is_none() => {
+                    input = Some(path_arg(&mut args, "--input", "an Overpass JSON path")?)
+                }
+                Some("--save-root") if root.is_none() => {
+                    root = Some(path_arg(&mut args, "--save-root", "a directory")?)
+                }
+                Some("--replace") if !replace => replace = true,
+                Some("--check") if !check => check = true,
+                _ => return Err(format!("unexpected osm-city argument {arg:?}")),
+            }
+        }
+        let report = scenarios::osm_city::generate_with_options(
+            &input.ok_or("osm-city requires --input")?,
+            &root.ok_or("osm-city requires --save-root")?,
+            replace,
+            check,
+        )?;
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+        );
         return Ok(());
     }
     if name == "demo-cities" {

@@ -24,6 +24,41 @@ scenarios:
 demo-cities:
 	cargo run --locked --release -p scenarios -- demo-cities --save-root world
 
+export EGR_OSM_CACHE ?= target/osm-cache
+export EGR_OSM_SAVE_ROOT ?= world
+export EGR_OSM_FLAGS ?=
+ifneq ($(origin EGR_OSM_INPUT),undefined)
+export EGR_OSM_INPUT
+endif
+
+.PHONY: osm-lesce
+osm-lesce:
+	@set -efu; \
+	if [ "$${EGR_OSM_INPUT+x}" ]; then \
+		input="$$EGR_OSM_INPUT"; \
+	else \
+		input="$$EGR_OSM_CACHE/lesce.overpass.json"; \
+		scripts/osm/fetch.sh "$$input"; \
+	fi; \
+	cargo run --locked --release -p scenarios -- osm-city --input "$$input" --save-root "$$EGR_OSM_SAVE_ROOT" $$EGR_OSM_FLAGS
+
+# Native script mode requires a fresh save root. Stage the slot after its
+# first screenshot, once the native startup check has accepted that root.
+.PHONY: osm-lesce-shots
+osm-lesce-shots:
+	cargo build --locked --release -p native_app
+	@set -eu; \
+	shots_dir=$$(mktemp -d "$${TMPDIR:-/tmp}/egr-lesce-shots.XXXXXX"); \
+	timeout 900 xvfb-run -a -s "-screen 0 1600x900x24" env WGPU_BACKEND=vulkan \
+		VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json sh -eu -c '\
+			"$$1" --script scripts/shots/osm_lesce.json --exit-after-script --save-dir "$$2" & \
+			pid=$$!; trap "kill \$$pid 2>/dev/null || true" EXIT; \
+			while [ ! -s "$$2/osm-ready.png" ]; do kill -0 "$$pid"; sleep 0.1; done; \
+			cp "$$3/lesce_osm.zip" "$$3/lesce_osm.meta.json" "$$3/ATTRIBUTION-OSM.txt" "$$2/"; \
+			wait "$$pid"; rm "$$2/osm-ready.png"; trap - EXIT' \
+		sh "$(CARGO_TARGET_DIR)/release/native_app" "$$shots_dir" "$$EGR_OSM_SAVE_ROOT"; \
+	printf 'Screenshots in %s\n' "$$shots_dir"
+
 determinism:
 	cargo run --locked -p scenarios --release -- determinism --twice
 

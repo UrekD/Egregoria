@@ -715,6 +715,36 @@ impl Map {
         id
     }
 
+    pub(crate) fn finalize_import(&mut self, junctions: &[IntersectionID], roads: &[RoadID]) {
+        self.lane_topology_changed();
+        for &id in junctions {
+            let junction = &mut self.intersections[id];
+            junction.update_interface_radius(&mut self.roads);
+        }
+        for &id in roads {
+            let road = &mut self.roads[id];
+            // Imported junctions can be much closer than interactive ones.
+            // Keep a usable lane between their interfaces before building any turns.
+            let src = road.interface_from(road.src);
+            let dst = road.interface_from(road.dst);
+            let available = (road.length() - 10.0).max(0.0);
+            if src + dst > available {
+                let scale = available / (src + dst);
+                road.set_interface(road.src, src * scale);
+                road.set_interface(road.dst, dst * scale);
+            }
+            road.update_lanes(&mut self.lanes, &mut self.parking, &self.environment);
+            self.subscribers.dispatch(UpdateType::Road, road);
+        }
+        for &id in junctions {
+            let junction = &mut self.intersections[id];
+            junction.update_traffic_control(&mut self.lanes, &self.roads);
+            junction.update_turns(&self.lanes, &self.roads);
+            self.spatial_map.update(junction);
+            self.subscribers.dispatch(UpdateType::Road, junction);
+        }
+    }
+
     fn invalidate(&mut self, id: IntersectionID) {
         info!("invalidate {:?}", id);
 

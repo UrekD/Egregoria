@@ -155,7 +155,7 @@ impl ScenarioCtx {
         Self::from_sim(Simulation::new_with_options(opts))
     }
 
-    fn from_sim(sim: Simulation) -> Self {
+    pub(crate) fn from_sim(sim: Simulation) -> Self {
         Self {
             sim,
             sched: Simulation::schedule(),

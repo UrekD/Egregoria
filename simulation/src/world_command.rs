@@ -790,6 +790,14 @@ impl WorldCommand {
     }
 
     pub(crate) fn bootstrap(sim: &mut Simulation, options: SimulationOptions) -> Result<(), Rejection> {
+        Self::bootstrap_world(sim, options, true)
+    }
+
+    pub(crate) fn bootstrap_import(sim: &mut Simulation, options: SimulationOptions) -> Result<(), Rejection> {
+        Self::bootstrap_world(sim, options, false)
+    }
+
+    fn bootstrap_world(sim: &mut Simulation, options: SimulationOptions, legacy_external: bool) -> Result<(), Rejection> {
         let tick = sim.read::<GameTime>().tick;
         if tick.0 != crate::INITIAL_TICK || sim.resources.try_read::<SimulationOptions>().is_ok() {
             return Err(Rejection::UnexpectedInit);
@@ -811,6 +819,9 @@ impl WorldCommand {
         }
         if options.terrain_size > 0 {
             generate_terrain(sim, options);
+            if legacy_external {
+                build_starting_external_trading(sim);
+            }
         }
         sim.resources.insert(options);
         Ok(())
@@ -823,7 +834,9 @@ fn generate_terrain(sim: &mut Simulation, options: SimulationOptions) {
 
     sim.map_mut().environment = Environment::from_options(options);
     info!("took {}s", t.elapsed().as_secs_f32());
+}
 
+fn build_starting_external_trading(sim: &mut Simulation) {
     let c = vec3(3000.0 + 72.2 / 2.0, 200.0 / 2.0 + 1.0, 0.0);
     let obb = OBB::new(c.xy(), -Vec2::X, 72.2, 200.0);
 

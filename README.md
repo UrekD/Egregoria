@@ -72,6 +72,16 @@ Run `make demo-cities` from the repository root. The generator writes **Starter 
 
 For a separate save directory, run `cargo run --locked --release -p scenarios -- demo-cities --save-root <dir>` and launch with `cargo run --locked --release -p native_app -- --save-dir <dir>`. Camera position and time speed use the game's normal settings when you load. Press **Space** to pause if time is running, and pan toward the freight terminal near map coordinates `(4300, 6300)`. Both cities lie just west of it.
 
+### Try Lesce, Slovenia
+
+Run `make osm-lesce` and open **Lesce, Slovenia** from **Load**. The Free-build slot uses local OpenStreetMap road and rail geometry, zoning from mapped buildings and land use, and a starter set of houses. Its import report identifies synthetic utilities, freight, motorway turnarounds and supplemental zoning. Bridges and tunnels are rendered flat. Road boundary stubs are cosmetic, and outside trade uses freight rail.
+
+The default extract cache is `target/osm-cache/lesce.overpass.json`. Set `EGR_OSM_CACHE` to choose another cache directory or `EGR_OSM_INPUT` to use a local Overpass response without fetching. The fetch uses `curl` and `jq`, and the generator uses `sha256sum`. Set `EGR_OSM_SAVE_ROOT` to change the default `world/` save root. Use `EGR_OSM_FLAGS=--check` to run the one-game-day growth, utilities and freight checks before publication. Use `--replace` in `EGR_OSM_FLAGS` to explicitly replace an existing Lesce slot.
+
+On Linux, run `make osm-lesce-shots EGR_OSM_SAVE_ROOT=<dir>` to capture the opening camera, zoning and traffic under Xvfb. The generated slot, import report and attribution are local artifacts.
+
+Map data © OpenStreetMap contributors, available under the [Open Database License (ODbL)](https://www.openstreetmap.org/copyright).
+
 ## How to play
 
 A small tutorial is available on the [github wiki]((https://github.com/Uriopass/Egregoria/wiki/Introduction-Guide)) to get you started.
