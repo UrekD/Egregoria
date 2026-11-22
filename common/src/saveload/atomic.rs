@@ -203,12 +203,37 @@ fn replace_file(staging: &Path, path: &Path, _durability: Durability) -> io::Res
     fs::rename(staging, path)
 }
 
+#[cfg(any(windows, test))]
+fn retry_windows_replace(
+    mut replace: impl FnMut() -> io::Result<()>,
+    mut backoff: impl FnMut(Duration),
+) -> io::Result<()> {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+
+    for millis in [10, 20, 30, 40] {
+        match replace() {
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)
+                ) =>
+            {
+                backoff(Duration::from_millis(millis));
+            }
+            result => return result,
+        }
+    }
+    replace()
+}
+
 #[cfg(windows)]
 fn replace_file(staging: &Path, path: &Path, durability: Durability) -> io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
+    use std::thread::sleep;
 
     if durability == Durability::RenameOnly {
-        return fs::rename(staging, path);
+        return retry_windows_replace(|| fs::rename(staging, path), sleep);
     }
 
     #[link(name = "kernel32")]
@@ -233,18 +258,23 @@ fn replace_file(staging: &Path, path: &Path, durability: Durability) -> io::Resu
     };
     let staging = wide_path(staging);
     let target = wide_path(path);
-    // Both arguments are live NUL-terminated UTF-16 strings.
-    let moved = unsafe {
-        MoveFileExW(
-            staging.as_ptr(),
-            target.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if moved == 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(())
+    retry_windows_replace(
+        || {
+            // Both arguments are live NUL-terminated UTF-16 strings.
+            let moved = unsafe {
+                MoveFileExW(
+                    staging.as_ptr(),
+                    target.as_ptr(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+                )
+            };
+            if moved == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        },
+        sleep,
+    )
 }
 
 /// Remove regular staging files directly under `root` older than `older_than`.
@@ -315,6 +345,57 @@ mod tests {
     use super::*;
     use crate::saveload::slot_tests::TestRoot;
     use std::time::Duration;
+
+    #[test]
+    fn qf1_windows_replace_retries_transient_errors() {
+        for code in [5, 32] {
+            let mut attempts = 0;
+            let mut delays = Vec::new();
+            retry_windows_replace(
+                || {
+                    attempts += 1;
+                    if attempts <= 2 {
+                        Err(io::Error::from_raw_os_error(code))
+                    } else {
+                        Ok(())
+                    }
+                },
+                |delay| delays.push(delay),
+            )
+            .unwrap();
+            assert_eq!(attempts, 3);
+            assert_eq!(
+                delays,
+                [Duration::from_millis(10), Duration::from_millis(20)]
+            );
+        }
+    }
+
+    #[test]
+    fn qf1_windows_replace_returns_non_retryable_errors_immediately() {
+        let error = retry_windows_replace(
+            || Err(io::Error::from_raw_os_error(2)),
+            |_| panic!("unexpected retry"),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(2));
+    }
+
+    #[test]
+    fn qf1_windows_replace_gives_up_after_five_attempts() {
+        let mut attempts = 0;
+        let mut delays = 0;
+        let error = retry_windows_replace(
+            || {
+                attempts += 1;
+                Err(io::Error::from_raw_os_error(32))
+            },
+            |_| delays += 1,
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(32));
+        assert_eq!((attempts, delays), (5, 4));
+    }
 
     #[test]
     fn slot_staging_exhausts_a_bounded_collision_budget() {

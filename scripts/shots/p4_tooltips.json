@@ -4,7 +4,7 @@
   {"Pointer": {"action": "Move", "screen_pos": [381, 678]}},
   {"WaitFrames": 45},
   {"Screenshot": "toolbar-tooltip"},
-  {"Pointer": {"action": "Move", "screen_pos": [1104, 51]}},
+  {"Pointer": {"action": "Move", "screen_pos": [1052, 51]}},
   {"WaitFrames": 2},
   {"Screenshot": "time-control-tooltip"},
   {"Pointer": {"action": "Move", "screen_pos": [991, 24]}},

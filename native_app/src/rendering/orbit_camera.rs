@@ -1,6 +1,10 @@
 #![allow(clippy::redundant_closure_call)]
 
-use common::saveload::{Encoder, SlotCamera};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
+use std::time::{Duration, Instant};
+
+use common::saveload::{Encoder, JSONPretty, SlotCamera, JSON};
 use engine::{Context, Tesselator};
 use geom::{Camera, Plane, Radians, Vec2, Vec3, AABB};
 use simulation::map::pathfinding_crate::num_traits::Pow;
@@ -8,6 +12,109 @@ use simulation::map::{BuildingKind, Map};
 
 use crate::gui::windows::settings::Settings;
 use crate::inputmap::{InputAction, InputMap};
+
+const CAMERA_SAVE_INTERVAL: Duration = Duration::from_secs(2);
+const CAMERA_SETTLE_TIME: Duration = Duration::from_millis(250);
+static WARNED_CAMERA_SAVE: AtomicBool = AtomicBool::new(false);
+
+fn should_save_camera(
+    changed: bool,
+    in_flight: bool,
+    since_attempt: Option<Duration>,
+    settled: bool,
+) -> bool {
+    changed
+        && !in_flight
+        && (settled || since_attempt.is_none_or(|elapsed| elapsed >= CAMERA_SAVE_INTERVAL))
+}
+
+fn same_camera(a: &Camera, b: &Camera) -> bool {
+    a.pos == b.pos
+        && a.yaw == b.yaw
+        && a.pitch == b.pitch
+        && a.dist == b.dist
+        && a.fovy == b.fovy
+        && a.viewport_w == b.viewport_w
+        && a.viewport_h == b.viewport_h
+}
+
+fn save_camera_file(camera: &Camera) -> bool {
+    match JSONPretty::try_save(camera, "camera3D") {
+        Ok(()) => true,
+        Err(error) => {
+            if WARNED_CAMERA_SAVE.swap(true, Ordering::Relaxed) {
+                log::debug!("failed saving camera3D: {error}");
+            } else {
+                log::warn!("failed saving camera3D: {error}");
+            }
+            false
+        }
+    }
+}
+
+#[derive(Default)]
+struct CameraSave {
+    enabled: bool,
+    observed: Option<(Camera, Instant)>,
+    saved: Option<Camera>,
+    last_attempt: Option<Instant>,
+    in_flight: Option<(Camera, Receiver<bool>)>,
+}
+
+impl CameraSave {
+    fn update(&mut self, camera: Camera, now: Instant) {
+        if let Some((submitted, result)) = &self.in_flight {
+            match result.try_recv() {
+                Ok(success) => {
+                    if success {
+                        self.saved = Some(*submitted);
+                    }
+                    self.in_flight = None;
+                }
+                Err(TryRecvError::Disconnected) => self.in_flight = None,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        let changed_at = match self.observed {
+            Some((previous, at)) if same_camera(&camera, &previous) => at,
+            _ => now,
+        };
+        self.observed = Some((camera, changed_at));
+        let settled_at = changed_at + CAMERA_SETTLE_TIME;
+        let final_save_due =
+            now >= settled_at && self.last_attempt.is_none_or(|at| at < settled_at);
+        if should_save_camera(
+            self.saved.is_none_or(|saved| !same_camera(&camera, &saved)),
+            self.in_flight.is_some(),
+            self.last_attempt.map(|at| now.duration_since(at)),
+            final_save_due,
+        ) {
+            let (done, result) = mpsc::channel();
+            self.last_attempt = Some(now);
+            self.in_flight = Some((camera, result));
+            rayon::spawn(move || {
+                let _ = done.send(save_camera_file(&camera));
+            });
+        }
+    }
+}
+
+impl Drop for CameraSave {
+    fn drop(&mut self) {
+        // The event loop drops the camera on exit. Finish any write before flushing the latest view.
+        if let Some((submitted, result)) = self.in_flight.take() {
+            if result.recv() == Ok(true) {
+                self.saved = Some(submitted);
+            }
+        }
+        if let Some((camera, _)) = self.observed {
+            if self.saved.is_none_or(|saved| !same_camera(&camera, &saved)) {
+                save_camera_file(&camera);
+            }
+        }
+    }
+}
 
 /// CameraHandler3D is the camera handler for the 3D view
 /// It controls the camera using an orbit view
@@ -20,6 +127,7 @@ pub struct OrbitCamera {
     pub targetpitch: Radians,
     pub targetdist: f32,
     pub maxdist: f32,
+    save: CameraSave,
 }
 
 impl OrbitCamera {
@@ -29,6 +137,9 @@ impl OrbitCamera {
         let params = ctx.gfx.render_params.value_mut();
         params.cam_pos = self.camera.eye();
         params.cam_dir = -self.camera.dir();
+        if self.save.enabled {
+            self.save.update(self.camera, Instant::now());
+        }
     }
 
     pub fn height(&self) -> f32 {
@@ -66,17 +177,13 @@ impl OrbitCamera {
         self.camera.project(pos)
     }
 
-    fn save(&self) {
-        let cam = self.camera;
-        rayon::spawn(move || {
-            common::saveload::JSONPretty::save_silent(&cam, "camera3D");
-        });
-    }
-
     pub fn load(viewport: (u32, u32)) -> Self {
-        let camera = common::saveload::JSON::load("camera3D")
-            .unwrap_or_else(|_| Self::default_camera(viewport.0 as f32, viewport.1 as f32));
-        Self::from_camera(camera)
+        let saved = JSON::load("camera3D").ok();
+        let camera =
+            saved.unwrap_or_else(|| Self::default_camera(viewport.0 as f32, viewport.1 as f32));
+        let mut orbit = Self::from_camera(camera);
+        orbit.save.saved = saved;
+        orbit
     }
 
     pub(crate) fn slot_camera(&self) -> SlotCamera {
@@ -111,7 +218,10 @@ impl OrbitCamera {
             camera.dist = saved.distance;
         }
         camera.update();
-        *self = Self::from_camera(camera);
+        *self = Self {
+            save: std::mem::take(&mut self.save),
+            ..Self::from_camera(camera)
+        };
     }
 
     fn default_camera(width: f32, height: f32) -> Camera {
@@ -128,6 +238,7 @@ impl OrbitCamera {
             targetpitch: camera.pitch,
             targetdist: camera.dist,
             maxdist: 1500.0,
+            save: CameraSave::default(),
         }
     }
 
@@ -153,8 +264,6 @@ impl OrbitCamera {
         if !self.camera.pitch.0.is_finite() {
             self.camera.pitch.0 = 0.3;
         }
-
-        self.save();
 
         // prepare useful variables
         let delta = delta.min(0.1);
@@ -265,8 +374,8 @@ impl OrbitCamera {
             .clamp(0.0, 100000.0);
 
         // update camera
+        self.save.enabled = true;
         self.update(ctx);
-        self.save();
     }
 }
 
@@ -300,6 +409,41 @@ fn starter_view(map: &Map) -> Option<Vec3> {
                 .distance2(preferred)
                 .total_cmp(&b.xy().distance2(preferred))
         })
+}
+
+#[cfg(test)]
+mod qf1_tests {
+    use super::*;
+
+    #[test]
+    fn qf1_camera_saves_only_changes_and_throttles_until_settled() {
+        assert!(!should_save_camera(false, false, None, false));
+        assert!(should_save_camera(true, false, None, false));
+        assert!(!should_save_camera(
+            true,
+            false,
+            Some(CAMERA_SAVE_INTERVAL - Duration::from_millis(1)),
+            false,
+        ));
+        assert!(should_save_camera(
+            true,
+            false,
+            Some(CAMERA_SAVE_INTERVAL),
+            false
+        ));
+        assert!(should_save_camera(
+            true,
+            false,
+            Some(CAMERA_SETTLE_TIME),
+            true
+        ));
+        assert!(!should_save_camera(
+            true,
+            true,
+            Some(CAMERA_SAVE_INTERVAL),
+            true
+        ));
+    }
 }
 
 #[cfg(test)]

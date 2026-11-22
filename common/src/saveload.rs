@@ -144,9 +144,14 @@ pub trait Encoder {
     }
 
     fn save_silent(x: &impl Serialize, name: &str) -> Option<()> {
-        save_encoded::<Self>(x, name, Durability::RenameOnly)
+        Self::try_save(x, name)
             .map_err(|error| log::error!("failed saving {}: {}", name, error))
             .ok()
+    }
+
+    /// Encode and atomically replace the file without directory syncing or logging.
+    fn try_save(x: &impl Serialize, name: &str) -> std::result::Result<(), AtomicWriteError> {
+        save_encoded::<Self>(x, name, Durability::RenameOnly)
     }
 
     /// Encode, atomically replace, and sync the file for this encoder and name.

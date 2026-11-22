@@ -43,6 +43,11 @@ pub enum InputAction {
     OpenDebugMenu,
     PausePlay,
     OpenChat,
+    Speed1,
+    Speed3,
+    Speed8,
+    Speed20,
+    Speed50,
 }
 
 // All unit inputs need to match
@@ -108,6 +113,11 @@ const DEFAULT_BINDINGS: &[(InputAction, &[&[UnitInput]])] = &[
     (OpenEconomyMenu, &[&[Key(K::c("E"))]]),
     (OpenDebugMenu,   &[&[Key(K::F3)]]),
     (PausePlay,       &[&[Key(K::Space)]]),
+    (Speed1,          &[&[Key(K::c("1"))]]),
+    (Speed3,          &[&[Key(K::c("2"))]]),
+    (Speed8,          &[&[Key(K::c("3"))]]),
+    (Speed20,         &[&[Key(K::c("4"))]]),
+    (Speed50,         &[&[Key(K::c("5"))]]),
     (OpenChat,        &[&[Key(K::c("T"))]]),
 ];
 
@@ -478,6 +488,11 @@ impl Display for InputAction {
                 DownElevation => "Down Elevation",
                 OpenEconomyMenu => "Economy Menu",
                 PausePlay => "Pause/Play",
+                Speed1 => "Simulation Speed 1×",
+                Speed3 => "Simulation Speed 3×",
+                Speed8 => "Simulation Speed 8×",
+                Speed20 => "Simulation Speed 20×",
+                Speed50 => "Simulation Speed 50×",
                 OpenChat => "Interact with Chat",
                 SizeUp => "Size Up",
                 SizeDown => "Size Down",

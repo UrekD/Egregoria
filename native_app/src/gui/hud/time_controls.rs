@@ -13,8 +13,25 @@ use simulation::Simulation;
 
 use crate::gui::windows::settings::Settings;
 use crate::gui::GuiState;
-use crate::inputmap::{InputAction, InputMap};
+use crate::inputmap::{Bindings, InputAction, InputMap};
+use crate::network::NetworkState;
 use crate::uiworld::UiWorld;
+
+const SPEEDS: [(u32, &str, Option<&str>, InputAction); 6] = [
+    (0, "Pause 0×", Some("pause"), InputAction::PausePlay),
+    (1, "1×", Some("play"), InputAction::Speed1),
+    (3, "3×", Some("forward"), InputAction::Speed3),
+    (8, "8×", None, InputAction::Speed8),
+    (20, "20×", None, InputAction::Speed20),
+    (50, "50×", None, InputAction::Speed50),
+];
+
+fn set_warp(warp: &mut u32, depause_warp: &mut u32, requested: u32) {
+    if requested == 0 && *warp != 0 {
+        *depause_warp = *warp;
+    }
+    *warp = requested;
+}
 
 pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::time_controls");
@@ -22,18 +39,26 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
     let warp = &mut uiworld.write::<Settings>().time_warp;
     let mut gui = uiworld.write::<GuiState>();
     let depause_warp = &mut gui.depause_warp;
-    if uiworld
-        .read::<InputMap>()
-        .just_act
-        .contains(&InputAction::PausePlay)
+    let input = uiworld.read::<InputMap>();
+    if let Some((requested, _, _, _)) = SPEEDS
+        .iter()
+        .find(|(_, _, _, action)| input.just_act.contains(action))
     {
-        if *warp == 0 {
-            *warp = *depause_warp;
+        let requested = if *requested == 0 && *warp == 0 {
+            *depause_warp
         } else {
-            *depause_warp = *warp;
-            *warp = 0;
-        }
+            *requested
+        };
+        set_warp(warp, depause_warp, requested);
     }
+
+    let network = uiworld.read::<NetworkState>();
+    let actual_warp = match &*network {
+        NetworkState::Singleplayer(step) => step.achieved_warp(*warp),
+        #[cfg(feature = "multiplayer")]
+        NetworkState::Client(_) | NetworkState::Server(_) => None,
+    };
+    let bindings = uiworld.read::<Bindings>();
 
     if *warp == 0 {
         yakui::canvas(|ctx| {
@@ -61,30 +86,37 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
         let mut l = List::row();
         l.main_axis_alignment = MainAxisAlignment::SpaceBetween;
         l.show(|| {
-            let mut time_button = |text: &str, b_warp: u32, label: &'static str| {
-                let mut b = if *warp == b_warp {
-                    icon_button(button_primary(text))
+            for (speed, label, icon, action) in &SPEEDS {
+                let selected = *warp == *speed;
+                let text = icon.unwrap_or(label);
+                let mut b = if selected {
+                    button_primary(text)
                 } else {
-                    icon_button(button_secondary(text))
+                    button_secondary(text)
                 };
-
-                b.padding = Pad::balanced(10.0, 3.0);
-                if tooltip(label, || b.show()).clicked {
-                    if b_warp == 0 {
-                        if *warp == 0 {
-                            *warp = *depause_warp;
-                        } else {
-                            *depause_warp = *warp;
-                        }
-                    }
-                    *warp = b_warp;
+                if icon.is_some() {
+                    b = icon_button(b);
                 }
-            };
+                b.padding = Pad::balanced(7.0, 3.0);
 
-            time_button("pause", 0, "Pause (Space)");
-            time_button("play", 1, "Normal speed");
-            time_button("forward", 3, "Fast speed");
-            time_button("fast-forward", 1000, "Maximum speed");
+                let mut label = label.to_string();
+                if let Some(binding) = bindings
+                    .0
+                    .get(action)
+                    .filter(|binding| !binding.0.is_empty())
+                {
+                    label.push_str(&format!(" ({binding})"));
+                }
+                if let Some(actual) =
+                    actual_warp.filter(|actual| selected && *actual < f64::from(*speed) - 0.5)
+                {
+                    let precision = usize::from(actual < 1.0);
+                    label.push_str(&format!(" · ≈{actual:.precision$}× actual"));
+                }
+                if tooltip(label, || b.show()).clicked {
+                    set_warp(warp, depause_warp, *speed);
+                }
+            }
         });
     };
 
@@ -101,7 +133,7 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
                         blur_bg(secondary_container().with_alpha(0.5), 10.0, || {
                             padxy(10.0, 5.0, || {
                                 constrained(
-                                    Constraints::loose(Vec2::new(170.0, f32::INFINITY)),
+                                    Constraints::loose(Vec2::new(220.0, f32::INFINITY)),
                                     || {
                                         let mut l = List::column();
                                         l.cross_axis_alignment = CrossAxisAlignment::Stretch;
