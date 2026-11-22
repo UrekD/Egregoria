@@ -10,9 +10,8 @@ use crate::map::{
     LanePattern, Lanes, ParkingSpots, Roads, SpatialMap, MAX_SLOPE, ROAD_Z_OFFSET,
 };
 
-// Both endpoints need this much clearance in meters to request a deck.
-// Ground clicks and simplified centerlines can sit slightly above the terrain.
 const MIN_ELEVATED_SPAN_CLEARANCE: f32 = 2.5;
+const MIN_DECK_END_CLEARANCE: f32 = 0.5;
 
 new_key_type! {
     pub struct RoadID;
@@ -111,8 +110,35 @@ impl Road {
         parking: &mut ParkingSpots,
         spatial: &mut SpatialMap,
     ) -> RoadID {
+        Self::make_with_span(
+            src,
+            dst,
+            segment,
+            lane_pattern,
+            env,
+            roads,
+            lanes,
+            parking,
+            spatial,
+            None,
+        )
+    }
+
+    pub(crate) fn make_with_span(
+        src: &Intersection,
+        dst: &Intersection,
+        segment: RoadSegmentKind,
+        lane_pattern: &LanePattern,
+        env: &Environment,
+        roads: &mut Roads,
+        lanes: &mut Lanes,
+        parking: &mut ParkingSpots,
+        spatial: &mut SpatialMap,
+        inherited_span: Option<bool>,
+    ) -> RoadID {
         let width = lane_pattern.width();
-        let elevated_span = Self::is_elevated_span(src.pos, dst.pos, env);
+        let elevated_span =
+            inherited_span.unwrap_or_else(|| Self::is_elevated_span(src.pos, dst.pos, env));
         let (points, error) = Self::generate_points_with_span(
             src.pos,
             dst.pos,
@@ -312,8 +338,12 @@ impl Road {
         &self.interfaced_points
     }
 
+    pub(crate) fn elevated_span(&self) -> bool {
+        self.src_interface.elevated_span()
+    }
+
     pub(crate) fn split_surface_height(&self, point: Vec3, env: &Environment) -> f32 {
-        if self.src_interface.elevated_span() {
+        if self.elevated_span() {
             return point.z;
         }
 
@@ -329,7 +359,7 @@ impl Road {
         let points = &self.points;
         let clipped = points.cut(self.interface_from(self.src), self.interface_from(self.dst));
 
-        if self.src_interface.elevated_span() {
+        if self.elevated_span() {
             // Cutting the original 3D deck interpolates its grade at both interfaces.
             self.interfaced_points = clipped;
             return;
@@ -348,10 +378,16 @@ impl Road {
     }
 
     fn is_elevated_span(from: Vec3, to: Vec3, env: &Environment) -> bool {
-        [from, to].iter().all(|pos| {
-            env.height(pos.xy())
-                .is_some_and(|ground| pos.z >= ground + MIN_ELEVATED_SPAN_CLEARANCE)
-        })
+        let (Some(from_ground), Some(to_ground)) = (env.height(from.xy()), env.height(to.xy()))
+        else {
+            return false;
+        };
+        // One end must clear the terrain by 2.5 m. The other may be a low
+        // approach, with at least 0.5 m of clearance to exclude ground clicks.
+        from.z >= from_ground + MIN_DECK_END_CLEARANCE
+            && to.z >= to_ground + MIN_DECK_END_CLEARANCE
+            && (from.z >= from_ground + MIN_ELEVATED_SPAN_CLEARANCE
+                || to.z >= to_ground + MIN_ELEVATED_SPAN_CLEARANCE)
     }
 
     pub fn heightfinder(

@@ -142,19 +142,43 @@ impl Building {
     }
 
     fn geometry(obb: &OBB, gen: BuildingGen, at: Vec3) -> (ColoredMesh, Vec2, Vec3) {
-        let axis = (obb.corners[1] - obb.corners[0]).normalize();
-        let size = obb.corners[0].distance(obb.corners[1]);
+        let [frontage, depth] = obb.axis();
+        let axis = frontage.normalize();
+        let frontage = frontage.mag();
         let seed = || common::rand::rand2(at.x, at.y).to_bits() as u64;
         let (mesh, door) = match gen {
-            BuildingGen::House => gen_exterior_house(size, seed()),
-            BuildingGen::Farm => gen_exterior_farm(size, seed()),
-            BuildingGen::CenteredDoor { vertical_factor } => {
-                let depth = obb.corners[0].distance(obb.corners[3]);
-                (Default::default(), Vec2::y(-vertical_factor * 0.5 * depth))
-            }
+            BuildingGen::House => gen_exterior_house(frontage, seed()),
+            BuildingGen::Farm => Self::farm_geometry(frontage, depth.mag(), seed()),
+            BuildingGen::CenteredDoor { vertical_factor } => (
+                Default::default(),
+                Vec2::y(-vertical_factor * 0.5 * depth.mag()),
+            ),
             BuildingGen::NoWalkway { door_pos } => (Default::default(), door_pos),
         };
         (mesh, axis, door.rotated_by(axis).z0() + at + Vec3::z(0.1))
+    }
+
+    fn farm_geometry(frontage: f32, depth: f32, seed: u64) -> (ColoredMesh, Vec2) {
+        let (mut mesh, door) = gen_exterior_farm(frontage, seed);
+        let bounds = mesh.bbox();
+        let size = bounds.size();
+        let setback = 3.0_f32.min(depth * 0.5);
+        let scale = (frontage / size.x).min((depth - setback) / size.y).min(1.0);
+
+        // Retain the generated frontage position where it fits, and anchor
+        // the exterior to the lot's road-facing edge using its actual depth.
+        let x = bounds
+            .ll
+            .x
+            .min(frontage * 0.5 - size.x * scale)
+            .max(-frontage * 0.5);
+        let offset = Vec2::new(x, setback - depth * 0.5) - bounds.ll * scale;
+        for (face, _) in &mut mesh.faces {
+            for vertex in face {
+                *vertex = *vertex * scale + offset.z0();
+            }
+        }
+        (mesh, door * scale + offset)
     }
 
     pub fn make(
@@ -221,5 +245,31 @@ impl Building {
         spatial_map.insert(&buildings[b]);
 
         Some(b)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rectangular_farm_exteriors_follow_the_front_edge_and_fit_the_lot() {
+        let _test = crate::tests::TestCtx::new_fast();
+        let at = Vec3::new(100.0, 120.0, 0.0);
+        let front = Vec2::new(0.6, 0.8);
+        for (frontage, depth) in [(80.0, 16.0), (24.0, 80.0)] {
+            let obb = OBB::new(at.xy(), front, depth, frontage);
+            let (mesh, axis, door) = Building::geometry(&obb, BuildingGen::Farm, at);
+            let bounds = mesh.bbox();
+            assert!(!mesh.faces.is_empty());
+            assert!((bounds.ll.y + depth * 0.5 - 3.0).abs() < 0.001);
+            assert!(bounds.ll.x >= -frontage * 0.5 - 0.001);
+            assert!(bounds.ur.x <= frontage * 0.5 + 0.001);
+            assert!(bounds.ur.y <= depth * 0.5 + 0.001);
+
+            let door = (door - at).xy();
+            assert!(door.dot(axis).abs() <= frontage * 0.5 + 0.001);
+            assert!(door.dot(axis.perpendicular()).abs() <= depth * 0.5 + 0.001);
+        }
     }
 }

@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::sync::Once;
 
+use common::saveload::{save_dir, sweep_stale_tmp};
 #[allow(unused_imports)]
 use common::saveload::{Bincode, Encoder, JSONPretty, JSON};
 use flat_spatial::cell::{CellObject, GridCell};
@@ -51,12 +52,74 @@ use crate::{
 };
 
 pub fn init() {
-    static LOAD_PROTOTYPES: Once = Once::new();
-    LOAD_PROTOTYPES.call_once(|| {
+    static STARTUP: Once = Once::new();
+    STARTUP.call_once(|| {
+        let dir = save_dir();
+        if let Err(error) = sweep_stale_tmp(dir, std::time::Duration::from_secs(3600)) {
+            log::warn!(
+                "could not sweep stale staging files in {}: {error}",
+                dir.display()
+            );
+        }
         // SAFETY: Initialization loads the registry once, before simulations use it.
         unsafe { load_prototypes() };
     });
     register_simulation();
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::{self, File};
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn startup_sweeps_old_staging_files_from_the_configured_save_dir() {
+        const SAVE_DIR_ENV: &str = "EGR_TEST_STARTUP_SWEEP_SAVE_DIR";
+        if let Some(root) = std::env::var_os(SAVE_DIR_ENV) {
+            common::saveload::set_save_dir(PathBuf::from(root)).unwrap();
+            super::init();
+            return;
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "egr-startup-sweep-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&root).unwrap();
+        let stale = root.join("bindings.json.42.1.tmp");
+        let recent = root.join("world.zip.42.2.tmp");
+        let save = root.join("world.zip");
+        let now = SystemTime::now();
+        for (path, age) in [(&stale, 3601), (&recent, 3300), (&save, 7200)] {
+            File::create(path)
+                .unwrap()
+                .set_modified(now - Duration::from_secs(age))
+                .unwrap();
+        }
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "init::tests::startup_sweeps_old_staging_files_from_the_configured_save_dir",
+            ])
+            .env(SAVE_DIR_ENV, &root)
+            .output();
+        let remaining = (stale.exists(), recent.exists(), save.exists());
+        fs::remove_dir_all(root).unwrap();
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(remaining, (false, true, true));
+    }
 }
 
 /// Load the full prototype registry.

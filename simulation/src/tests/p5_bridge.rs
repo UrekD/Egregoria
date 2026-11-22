@@ -306,6 +306,79 @@ fn clear_span_near_the_grade_limit_stays_straight() {
 }
 
 #[test]
+fn low_rising_bridge_keeps_a_deck_in_both_directions() {
+    let mut env = Environment::new(1, 1);
+    env.terrain_apply(env.bounds(), |p| {
+        (24.0 - (p.x - 48.0).abs()).max(0.0) * 0.11
+    });
+    let low = vec3(32.0, 64.0, 2.0);
+    let high = vec3(288.0, 64.0, 16.0);
+    let clearance = low.z - env.height(low.xy()).unwrap();
+    assert!((0.5..2.5).contains(&clearance));
+
+    for (start, end) in [(low, high), (high, low)] {
+        let path = PolyLine::new(vec![start.xy(), end.xy()]);
+        let (points, error) = Road::heightfinder(&path, start.z, end.z, MAX_SLOPE, &env);
+        assert!(error.is_none());
+        assert_straight_deck(&points, start, end);
+    }
+
+    let path = PolyLine::new(vec![low.xy(), high.xy()]);
+    let near_ground = env.height(low.xy()).unwrap() + 0.3;
+    let (points, error) = Road::heightfinder(&path, near_ground, high.z, MAX_SLOPE, &env);
+    assert!(error.is_none());
+    assert_eq!(points.project_2d(vec2(160.0, 64.0)).z, ROAD_Z_OFFSET);
+}
+
+#[test]
+fn split_bridge_keeps_both_decks_over_high_ground() {
+    let mut map = Map::empty();
+    map.environment = Environment::new(1, 1);
+    map.environment
+        .terrain_apply(map.environment.bounds(), |p| {
+            (1.0 - (p.x - 160.0).abs() / 32.0).max(0.0) * 4.9
+        });
+    let start = vec3(32.0, 64.0, 5.0);
+    let end = vec3(288.0, 64.0, 5.0);
+    let pattern = LanePatternBuilder::default().build();
+    let (_, original) = map
+        .make_connection(
+            MapProject::ground(start),
+            MapProject::ground(end),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let midpoint = vec3(160.0, 64.0, start.z);
+    let clearance = midpoint.z - map.environment.height(midpoint.xy()).unwrap();
+    assert!((0.0..0.5).contains(&clearance));
+    assert_straight_deck(map.roads[original].interfaced_points(), start, end);
+
+    let (junction, side_road) = map
+        .make_connection(
+            MapProject::ground(vec3(160.0, 144.0, midpoint.z)),
+            MapProject {
+                pos: midpoint + Vec3::z(ROAD_Z_OFFSET),
+                kind: ProjectKind::Road(original),
+            },
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let junction = &map.intersections[junction];
+    assert_eq!(junction.pos, midpoint);
+    assert_eq!(junction.roads.len(), 3);
+    for &id in junction.roads.iter().filter(|&&id| id != side_road) {
+        let road = &map.roads[id];
+        assert_straight_deck(road.points(), start, end);
+        assert_straight_deck(road.interfaced_points(), start, end);
+        for (lane, _) in road.lanes_iter() {
+            assert_straight_deck(&map.lanes[lane].points, start, end);
+        }
+    }
+}
+
+#[test]
 fn rising_bridge_and_lanes_follow_the_deck_after_load_and_junction_edit() {
     let mut map = Map::empty();
     map.environment = Environment::new(1, 1);

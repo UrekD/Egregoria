@@ -855,8 +855,21 @@ impl Map {
         let before = PolyLine3::new(before);
         let after = PolyLine3::new(after);
 
-        let r1 = self.connect(r.src, id, &pat, RoadSegmentKind::Arbitrary(before))?;
-        let r2 = self.connect(id, r.dst, &pat, RoadSegmentKind::Arbitrary(after))?;
+        let inherited_span = Some(r.elevated_span());
+        let r1 = self.connect_with_span(
+            r.src,
+            id,
+            &pat,
+            RoadSegmentKind::Arbitrary(before),
+            inherited_span,
+        )?;
+        let r2 = self.connect_with_span(
+            id,
+            r.dst,
+            &pat,
+            RoadSegmentKind::Arbitrary(after),
+            inherited_span,
+        )?;
 
         self.invalidate(r.src);
         self.invalidate(r.dst);
@@ -1038,12 +1051,23 @@ impl Map {
         pattern: &LanePattern,
         segment: RoadSegmentKind,
     ) -> Option<RoadID> {
+        self.connect_with_span(src_id, dst_id, pattern, segment, None)
+    }
+
+    fn connect_with_span(
+        &mut self,
+        src_id: IntersectionID,
+        dst_id: IntersectionID,
+        pattern: &LanePattern,
+        segment: RoadSegmentKind,
+        inherited_span: Option<bool>,
+    ) -> Option<RoadID> {
         let src = self.intersections.get(src_id)?;
         let dst = self.intersections.get(dst_id)?;
 
         let gen_lots = !matches!(segment, RoadSegmentKind::Arbitrary(_));
 
-        let rid = Road::make(
+        let rid = Road::make_with_span(
             src,
             dst,
             segment,
@@ -1053,6 +1077,7 @@ impl Map {
             &mut self.lanes,
             &mut self.parking,
             &mut self.spatial_map,
+            inherited_span,
         );
         self.lane_topology_changed();
 

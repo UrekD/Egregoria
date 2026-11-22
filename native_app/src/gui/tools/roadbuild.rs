@@ -61,9 +61,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
     // Prepare mousepos depending on snap to grid or snap to angle
     let mousepos = match state.snapping {
         Snapping::None => state.mouse_height(map, unproj),
-        Snapping::SnapToGrid => {
-            state.mouse_height(map, unproj.xy().snap(grid_size, grid_size).z(unproj.z))
-        }
+        Snapping::SnapToGrid => state.grid_mouse_height(map, unproj, grid_size),
         Snapping::SnapToAngle => {
             interpolation_points = state
                 .possible_interpolations(map, unproj)
@@ -349,6 +347,12 @@ pub struct RoadBuildResource {
 }
 
 impl RoadBuildResource {
+    fn grid_mouse_height(&self, map: &Map, unprojected: Vec3, grid_size: f32) -> Vec3 {
+        let snapped = unprojected.xy().snap(grid_size, grid_size);
+        let height = map.environment.height(snapped).unwrap_or(unprojected.z);
+        self.mouse_height(map, snapped.z(height))
+    }
+
     fn mouse_height(&self, map: &Map, h: Vec3) -> Vec3 {
         match (self.height_reference, self.build_state) {
             (
@@ -730,6 +734,35 @@ mod tests {
     use super::*;
     use geom::{vec2, vec3};
     use simulation::map::Environment;
+
+    #[test]
+    fn grid_snap_uses_terrain_at_the_snapped_position() {
+        let mut map = Map::empty();
+        map.environment = Environment::new(1, 1);
+        map.environment
+            .terrain_apply(map.environment.bounds(), |p| p.y * 0.4);
+        let xy = vec2(100.0, 109.0);
+        let click = xy.z(map.environment.height(xy).unwrap());
+        let snapped = vec2(100.0, 100.0);
+        let ground = map.environment.height(snapped).unwrap();
+        assert!(click.z - ground > 2.5);
+
+        let mut state = RoadBuildResource::default();
+        assert_eq!(
+            state.grid_mouse_height(&map, click, 20.0),
+            snapped.z(ground)
+        );
+
+        state.height_offset = 5.0;
+        assert_eq!(
+            state.grid_mouse_height(&map, click, 20.0),
+            snapped.z(ground + 5.0)
+        );
+
+        state.height_reference = HeightReference::Start;
+        state.build_state = Start(MapProject::ground(vec3(40.0, 60.0, 50.0)));
+        assert_eq!(state.grid_mouse_height(&map, click, 20.0), snapped.z(55.0));
+    }
 
     #[test]
     fn curved_start_reference_uses_the_selected_start_height() {
