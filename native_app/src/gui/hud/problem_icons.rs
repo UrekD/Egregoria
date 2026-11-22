@@ -1,15 +1,17 @@
 use geom::{vec2, Intersect, Vec2, AABB};
-use goryak::{minrow, padxy, round_rect, secondary_container};
+use goryak::{interact_box_radius, minrow, padxy, secondary_container};
 use ordered_float::OrderedFloat;
-use simulation::map::{BuildingKind, ProjectFilter};
+use simulation::map::{BuildingID, BuildingKind, ProjectFilter};
 use simulation::map_dynamic::{ElectricityFlow, UtilityFlow, UtilityStatus};
 use simulation::souls::{
     events::Fires,
     residence::{self, Residences},
 };
 use simulation::Simulation;
-use yakui::{reflow, Alignment, Color, Dim2, Pivot};
+use yakui::{opaque, reflow, Alignment, Color, Dim2, Pivot};
 
+use super::toasts::{AdvisorFocus, ToastState};
+use crate::gui::notifications::{AlertTarget, NotificationKind};
 use crate::gui::overlays::view;
 use crate::gui::textures::UiTextures;
 use crate::uiworld::UiWorld;
@@ -38,12 +40,33 @@ impl BadgeKind {
             Self::NoSewage => ("No sewage", "S", Color::rgb(255, 212, 132)),
         }
     }
+
+    /// The advisor notification that reports this problem.
+    fn notification(self) -> NotificationKind {
+        match self {
+            Self::Fire => NotificationKind::Fire,
+            Self::Blackout => NotificationKind::Blackout,
+            Self::Disconnected | Self::NoWater => NotificationKind::NoWater,
+            Self::NoSewage => NotificationKind::NoSewage,
+        }
+    }
 }
 
 struct Badge {
     point: Vec2,
     depth: f32,
     kind: BadgeKind,
+    building: BuildingID,
+}
+
+impl Badge {
+    fn advisor_focus(&self) -> AdvisorFocus {
+        AdvisorFocus {
+            kind: self.kind.notification(),
+            daytime: None,
+            target: Some(AlertTarget::Building(self.building)),
+        }
+    }
 }
 
 impl Badge {
@@ -105,6 +128,7 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
                 point,
                 depth,
                 kind: BadgeKind::Fire,
+                building: id,
             });
         }
         if map
@@ -116,6 +140,7 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
                 point,
                 depth,
                 kind: BadgeKind::Blackout,
+                building: id,
             });
         }
 
@@ -131,10 +156,16 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
             (_, UtilityStatus::Shortage) => BadgeKind::NoSewage,
             _ => continue,
         };
-        visible.push(Badge { point, depth, kind });
+        visible.push(Badge {
+            point,
+            depth,
+            kind,
+            building: id,
+        });
     }
 
     let no_power_img = uiworld.read::<UiTextures>().get("no_power");
+    let mut clicked = None;
     for PlacedBadge {
         badge,
         point,
@@ -147,44 +178,55 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
             Pivot::BOTTOM_CENTER,
             Dim2::pixels(point.x, point.y),
             || {
-                round_rect(5.0, secondary_container().with_alpha(0.93), || {
-                    padxy(4.0, 1.0, || {
-                        if badge.kind == BadgeKind::Blackout {
-                            minrow(BADGE_ROW_SPACING, || {
-                                let size = yakui::Vec2::splat(BLACKOUT_ICON_SIZE);
-                                let mut image = yakui::widgets::Image::new(no_power_img, size);
-                                image.color = Color::WHITE.with_alpha(0.7);
-                                image.show();
-                                if count > 1 {
+                let fill = secondary_container().with_alpha(0.93);
+                let hover = secondary_container();
+                let mut response = None;
+                opaque(|| {
+                    response = Some(interact_box_radius(fill, hover, hover, 5.0, || {
+                        padxy(4.0, 1.0, || {
+                            if badge.kind == BadgeKind::Blackout {
+                                minrow(BADGE_ROW_SPACING, || {
+                                    let size = yakui::Vec2::splat(BLACKOUT_ICON_SIZE);
+                                    let mut image = yakui::widgets::Image::new(no_power_img, size);
+                                    image.color = Color::WHITE.with_alpha(0.7);
+                                    image.show();
+                                    if count > 1 {
+                                        yakui::widgets::Text::new(
+                                            BADGE_TEXT_SIZE,
+                                            format!("+{}", count - 1),
+                                        )
+                                        .show();
+                                    }
+                                });
+                            } else {
+                                let (label, short, color) = badge.kind.appearance();
+                                let mut text = if count > 1 {
                                     yakui::widgets::Text::new(
                                         BADGE_TEXT_SIZE,
-                                        format!("+{}", count - 1),
+                                        format!("{} +{}", short, count - 1),
                                     )
-                                    .show();
-                                }
-                            });
-                        } else {
-                            let (label, short, color) = badge.kind.appearance();
-                            let mut text = if count > 1 {
-                                yakui::widgets::Text::new(
-                                    BADGE_TEXT_SIZE,
-                                    format!("{} +{}", short, count - 1),
-                                )
-                            } else {
-                                let label = if badge.depth < COMPACT_BADGE_DEPTH {
-                                    label
                                 } else {
-                                    short
+                                    let label = if badge.depth < COMPACT_BADGE_DEPTH {
+                                        label
+                                    } else {
+                                        short
+                                    };
+                                    yakui::widgets::Text::new(BADGE_TEXT_SIZE, label)
                                 };
-                                yakui::widgets::Text::new(BADGE_TEXT_SIZE, label)
-                            };
-                            text.style.color = color;
-                            text.show();
-                        }
-                    });
+                                text.style.color = color;
+                                text.show();
+                            }
+                        });
+                    }));
                 });
+                if response.is_some_and(|response| response.clicked) {
+                    clicked = Some(badge.advisor_focus());
+                }
             },
         );
+    }
+    if let Some(focus) = clicked {
+        uiworld.write::<ToastState>().open_advisor(focus);
     }
 }
 
@@ -273,17 +315,20 @@ mod tests {
                 point,
                 depth: 100.0,
                 kind: BadgeKind::NoWater,
+                building: BuildingID::default(),
             },
             Badge {
                 point,
                 depth: 100.0,
                 kind: BadgeKind::Blackout,
+                building: BuildingID::default(),
             },
         ];
         visible.extend((0..3).map(|_| Badge {
             point,
             depth: 200.0,
             kind: BadgeKind::Fire,
+            building: BuildingID::default(),
         }));
 
         let placed = place_badges(visible, screen);
@@ -305,16 +350,19 @@ mod tests {
                     point: vec2(80.0, 45.0),
                     depth: 1200.0,
                     kind: BadgeKind::Blackout,
+                    building: BuildingID::default(),
                 },
                 Badge {
                     point: vec2(80.0, 45.0),
                     depth: 1200.0,
                     kind: BadgeKind::Blackout,
+                    building: BuildingID::default(),
                 },
                 Badge {
                     point: vec2(110.0, 45.0),
                     depth: 1300.0,
                     kind: BadgeKind::NoWater,
+                    building: BuildingID::default(),
                 },
             ],
             screen,

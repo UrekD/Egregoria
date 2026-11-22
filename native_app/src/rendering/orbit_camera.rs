@@ -19,6 +19,15 @@ const CAMERA_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
 const CAMERA_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 static WARNED_CAMERA_SAVE: AtomicBool = AtomicBool::new(false);
 
+/// How far past the map edge the orbit centre may go.
+const EDGE_MARGIN: f32 = 100.0;
+
+/// Area the orbit centre may move in: the whole map at every zoom level, so the
+/// player can look at the map edge.
+fn movement_bounds(map: AABB) -> AABB {
+    map.expand(EDGE_MARGIN)
+}
+
 fn same_camera(a: &Camera, b: &Camera) -> bool {
     a.pos == b.pos
         && a.yaw == b.yaw
@@ -244,7 +253,7 @@ impl OrbitCamera {
         let valid = saved.filter(|saved| {
             let pos = Vec3::from(saved.position);
             pos.is_finite()
-                && bounds.contains(pos.xy())
+                && movement_bounds(bounds).contains(pos.xy())
                 && saved.yaw.is_finite()
                 && (0.0..Radians::HALFPI.0).contains(&saved.pitch)
                 && (5.0..=self.maxdist).contains(&saved.distance)
@@ -376,8 +385,9 @@ impl OrbitCamera {
         // make sure things are in reasonable bounds
         self.targetdist = self.targetdist.clamp(5.0, self.maxdist);
         self.camera.fovy = settings.camera_fov.clamp(1.0, 179.0);
-        self.targetpos.x = self.targetpos.x.clamp(map_bounds.ll.x, map_bounds.ur.x);
-        self.targetpos.y = self.targetpos.y.clamp(map_bounds.ll.y, map_bounds.ur.y);
+        let bounds = movement_bounds(map_bounds);
+        self.targetpos.x = self.targetpos.x.clamp(bounds.ll.x, bounds.ur.x);
+        self.targetpos.y = self.targetpos.y.clamp(bounds.ll.y, bounds.ur.y);
         self.targetpos.z = self.targetpos.z.clamp(0.0, 100000.0);
 
         // smooth camera movement
@@ -566,6 +576,46 @@ mod qf1_tests {
             })
         );
         assert!(save.poll_shutdown(pose(2), deadline, |_| panic!("second writer")));
+    }
+}
+
+#[cfg(test)]
+mod ux2_tests {
+    use super::*;
+    use geom::vec2;
+
+    fn clamp(point: Vec2, world: AABB) -> Vec2 {
+        let bounds = movement_bounds(world);
+        vec2(
+            point.x.clamp(bounds.ll.x, bounds.ur.x),
+            point.y.clamp(bounds.ll.y, bounds.ur.y),
+        )
+    }
+
+    #[test]
+    fn ux2_orbit_centre_reaches_every_map_edge_plus_a_margin() {
+        for (width, height) in [
+            (0.0, 0.0),
+            (512.0, 512.0),
+            (512.0, 8192.0),
+            (8192.0, 8192.0),
+            (25000.0, 25000.0),
+        ] {
+            let world = AABB::new_ll_ur(vec2(0.0, 0.0), vec2(width, height));
+            let reach = |point| clamp(point, world);
+            let far = 1.0e6;
+            assert_eq!(reach(vec2(-far, -far)), vec2(-EDGE_MARGIN, -EDGE_MARGIN));
+            assert_eq!(
+                reach(vec2(far, far)),
+                vec2(width + EDGE_MARGIN, height + EDGE_MARGIN)
+            );
+            for edge in [vec2(0.0, height * 0.5), vec2(width, height * 0.5)] {
+                assert_eq!(reach(edge), edge, "{width}x{height}");
+            }
+            // Clamping a clamped position is stable, so the camera cannot jitter at the edge.
+            let edge = reach(vec2(width + 37.0, -far));
+            assert_eq!(reach(edge), edge);
+        }
     }
 }
 

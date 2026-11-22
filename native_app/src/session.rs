@@ -14,14 +14,7 @@ use simulation::world_command::CommandOutcomes;
 use simulation::{SaveLoadError, Simulation, SimulationReplayLoader};
 
 use crate::game_loop::VERSION;
-use crate::gui::bulldozer::BulldozerState;
-use crate::gui::follow::FollowEntity;
-use crate::gui::roadbuild::RoadBuildResource;
-use crate::gui::terraforming::TerraformingResource;
-use crate::gui::zoning::ZoningState;
-use crate::gui::{
-    ExitState, GuiState, InspectedBuilding, InspectedEntity, PotentialCommands, Tool,
-};
+use crate::gui::{ExitState, GuiState};
 use crate::inputmap::InputMap;
 use crate::network::NetworkState;
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
@@ -547,30 +540,7 @@ pub(crate) fn close_modal(uiw: &UiWorld) {
 }
 
 fn close_world_interaction(uiw: &UiWorld) -> bool {
-    *uiw.write::<crate::gui::PlacementPreview>() = Default::default();
-    let road = uiw.write::<crate::gui::InspectedRoad>().0.take().is_some();
-    let mut tool = uiw.write::<Tool>();
-    if *tool != Tool::Hand {
-        let keep_road_tool =
-            tool.is_roadbuild() && uiw.write::<RoadBuildResource>().cancel_placement();
-        if !keep_road_tool {
-            match *tool {
-                Tool::Bulldozer => uiw.write::<BulldozerState>().reset_gesture(),
-                Tool::Terraforming => uiw.write::<TerraformingResource>().cancel_gesture(),
-                Tool::Zoning => uiw.write::<ZoningState>().cancel_gesture(),
-                _ => {}
-            }
-            *tool = Tool::Hand;
-        }
-        uiw.write::<PotentialCommands>().0.clear();
-        return true;
-    }
-    drop(tool);
-
-    let entity = uiw.write::<InspectedEntity>().e.take().is_some();
-    let building = uiw.write::<InspectedBuilding>().e.take().is_some();
-    let following = uiw.write::<FollowEntity>().0.take().is_some();
-    if entity || building || road || following || crate::gui::chat::close(uiw) {
+    if crate::gui::cancel_interaction(uiw) || crate::gui::chat::close(uiw) {
         return true;
     }
 

@@ -2,6 +2,10 @@ use std::time::{Duration, Instant};
 
 const UP_DT: Duration = Duration::from_millis(20);
 
+/// The "as fast as possible" speed. It is high enough that the per-frame budget
+/// (`Timestep::MAXTIME`), not the multiplier, limits the simulation, so the UI stays responsive.
+pub const MAX_WARP: u32 = 10_000;
+
 pub fn debug_up_dt() -> Duration {
     UP_DT
 }
@@ -158,6 +162,29 @@ mod tests {
         step.record_tick();
         step.prepare_frame_at(1, start + Duration::from_secs(1));
         assert_eq!(step.achieved_warp(1), Some(0.04));
+    }
+
+    #[test]
+    fn ux2_max_warp_runs_until_the_frame_budget_without_backlog() {
+        let mut step = Timestep::default();
+        let frame = step.last_time + Duration::from_millis(16);
+        step.prepare_frame_at(MAX_WARP, frame);
+        let tick_cost = Duration::from_millis(1);
+        let mut count = 0;
+        while step.tick_at(frame + tick_cost * count) {
+            count += 1;
+        }
+        assert_eq!(count, 25);
+        assert!(step.acc < step.period, "{:?} carried over", step.acc);
+
+        // A slow frame still gets only one budget of ticks.
+        let frame = frame + Duration::from_secs(2);
+        step.prepare_frame_at(MAX_WARP, frame);
+        let mut count = 0;
+        while step.tick_at(frame + tick_cost * count) {
+            count += 1;
+        }
+        assert_eq!(count, 25);
     }
 
     #[test]

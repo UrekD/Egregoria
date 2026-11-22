@@ -2,29 +2,64 @@ use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use goryak::{
-    blur_bg, constrained_viewport, error, mincolumn, on_secondary_container, padxy, primary,
-    secondary_container, textc,
+    blur_bg, constrained_viewport, error, interact_box_radius, mincolumn, on_secondary_container,
+    padxy, primary, secondary_container, textc,
 };
+use prototypes::DayTime;
 use simulation::Simulation;
 use yakui::widgets::List;
-use yakui::{reflow, Alignment, Color, Dim2, MainAxisAlignment, Pivot};
+use yakui::{opaque, reflow, Alignment, Color, Dim2, MainAxisAlignment, Pivot};
 
 use crate::gui::notifications::{
-    AlertTarget, Notification, NotificationCenter, NotificationSampler, Severity,
+    AlertTarget, Notification, NotificationCenter, NotificationKind, NotificationSampler, Severity,
 };
 use crate::uiworld::UiWorld;
 
 const LIFETIME: Duration = Duration::from_secs(5);
 const MAX_TOASTS: usize = 3;
 
+/// The advisor entry a toast or problem icon refers to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AdvisorFocus {
+    pub kind: NotificationKind,
+    /// Narrows the focus to one notification, when known.
+    pub daytime: Option<DayTime>,
+    /// Preferred among several matching notifications.
+    pub target: Option<AlertTarget>,
+}
+
 #[derive(Default)]
 pub(crate) struct ToastState {
     sampler: NotificationSampler,
     observed_at: Option<Instant>,
     notices: VecDeque<(Notification, Instant)>,
+    advisor_request: Option<AdvisorFocus>,
+    advisor_focus: Option<AdvisorFocus>,
 }
 
 impl ToastState {
+    /// Open the advisor window on its next frame, focused on `focus`.
+    pub(crate) fn open_advisor(&mut self, focus: AdvisorFocus) {
+        self.advisor_request = Some(focus);
+    }
+
+    /// Moves a pending request into the focus. Returns whether the advisor should open.
+    pub(super) fn take_advisor_request(&mut self) -> bool {
+        let Some(focus) = self.advisor_request.take() else {
+            return false;
+        };
+        self.advisor_focus = Some(focus);
+        true
+    }
+
+    pub(super) fn advisor_focus(&self) -> Option<AdvisorFocus> {
+        self.advisor_focus
+    }
+
+    pub(super) fn clear_advisor_focus(&mut self) {
+        self.advisor_focus = None;
+    }
+
     pub(super) fn advisor_details<'a>(
         &'a self,
         notice: &'a Notification,
@@ -50,7 +85,11 @@ impl ToastState {
 
     #[cfg(test)]
     pub(crate) fn world_state_is_clear(&self) -> bool {
-        self.sampler.is_clear() && self.observed_at.is_none() && self.notices.is_empty()
+        self.sampler.is_clear()
+            && self.observed_at.is_none()
+            && self.notices.is_empty()
+            && self.advisor_request.is_none()
+            && self.advisor_focus.is_none()
     }
 }
 
@@ -68,6 +107,7 @@ pub(super) fn publish(uiworld: &UiWorld) {
         sampler,
         observed_at,
         notices,
+        ..
     } = &mut *state;
     let Some(now) = *observed_at else { return };
     let pending = sampler.drain();
@@ -95,6 +135,7 @@ pub(super) fn render(_sim: &Simulation, uiworld: &UiWorld) {
     if notices.is_empty() {
         return;
     }
+    let mut clicked = None;
 
     reflow(
         Alignment::TOP_LEFT,
@@ -105,15 +146,20 @@ pub(super) fn render(_sim: &Simulation, uiworld: &UiWorld) {
                 let mut row = List::row();
                 row.main_axis_alignment = MainAxisAlignment::End;
                 row.show(|| {
-                    blur_bg(secondary_container().with_alpha(0.96), 8.0, || {
-                        padxy(12.0, 8.0, || {
-                            mincolumn(8.0, || {
-                                for (notice, _) in notices.iter().rev() {
-                                    mincolumn(2.0, || {
-                                        textc(severity_color(notice.severity), notice.kind.label());
-                                        textc(on_secondary_container(), notice.text.clone());
-                                    });
-                                }
+                    opaque(|| {
+                        blur_bg(secondary_container().with_alpha(0.96), 8.0, || {
+                            padxy(8.0, 4.0, || {
+                                mincolumn(0.0, || {
+                                    for (notice, _) in notices.iter().rev() {
+                                        if toast(notice) {
+                                            clicked = Some(AdvisorFocus {
+                                                kind: notice.kind,
+                                                daytime: Some(notice.daytime),
+                                                target: Some(notice.target),
+                                            });
+                                        }
+                                    }
+                                });
                             });
                         });
                     });
@@ -121,6 +167,24 @@ pub(super) fn render(_sim: &Simulation, uiworld: &UiWorld) {
             });
         },
     );
+    drop(state);
+    if let Some(focus) = clicked {
+        uiworld.write::<ToastState>().open_advisor(focus);
+    }
+}
+
+/// A toast opens its entry in the advisor when clicked.
+fn toast(notice: &Notification) -> bool {
+    let hover = on_secondary_container().with_alpha(0.08);
+    interact_box_radius(Color::CLEAR, hover, hover, 6.0, || {
+        padxy(4.0, 4.0, || {
+            mincolumn(2.0, || {
+                textc(severity_color(notice.severity), notice.kind.label());
+                textc(on_secondary_container(), notice.text.clone());
+            });
+        });
+    })
+    .clicked
 }
 
 #[cfg(test)]

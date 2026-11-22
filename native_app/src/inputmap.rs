@@ -49,6 +49,9 @@ pub enum InputAction {
     Speed8,
     Speed20,
     Speed50,
+    SpeedMax,
+    Cancel,
+    Bulldozer,
 }
 
 // All unit inputs need to match
@@ -60,6 +63,9 @@ struct InputTree {
     actions: Vec<InputAction>,
     childs: FastMap<UnitInput, Box<InputTree>>,
 }
+
+/// Screen distance a pointer may travel and still count as a click rather than a drag.
+const CLICK_DRAG_THRESHOLD: f32 = 5.0;
 
 #[derive(Default)]
 pub struct InputMap {
@@ -80,6 +86,9 @@ pub struct InputMap {
     input_tree: InputTree,
     require_pointer_release: bool,
     close_down: bool,
+    cancel_held: bool,
+    /// Where the Cancel press started, until the pointer moves far enough to make it a drag.
+    cancel_origin: Option<Vec2>,
 }
 
 #[derive(Serialize)]
@@ -126,15 +135,16 @@ use MouseButton::*;
 use UnitInput::*;
 
 #[cfg(target_os = "macos")]
-const TOP_ROW_DIGITS: [u32; 5] = [0x12, 0x13, 0x14, 0x15, 0x17];
+const TOP_ROW_DIGITS: [u32; 6] = [0x12, 0x13, 0x14, 0x15, 0x17, 0x16];
 #[cfg(not(target_os = "macos"))]
-const TOP_ROW_DIGITS: [u32; 5] = [2, 3, 4, 5, 6];
-const SPEED_DEFAULTS: [(InputAction, u32, &str); 5] = [
+const TOP_ROW_DIGITS: [u32; 6] = [2, 3, 4, 5, 6, 7];
+const SPEED_DEFAULTS: [(InputAction, u32, &str); 6] = [
     (Speed1, TOP_ROW_DIGITS[0], "1"),
     (Speed3, TOP_ROW_DIGITS[1], "2"),
     (Speed8, TOP_ROW_DIGITS[2], "3"),
     (Speed20, TOP_ROW_DIGITS[3], "4"),
     (Speed50, TOP_ROW_DIGITS[4], "5"),
+    (SpeedMax, TOP_ROW_DIGITS[5], "6"),
 ];
 
 // https://stackoverflow.com/a/38068969/5000800 for key scans
@@ -162,6 +172,8 @@ const DEFAULT_BINDINGS: &[(InputAction, &[&[UnitInput]])] = &[
     (OpenDebugMenu,   &[&[Key(K::F3)]]),
     (PausePlay,       &[&[Key(K::Space)]]),
     (OpenChat,        &[&[Key(K::c("T"))]]),
+    (Cancel,          &[&[Mouse(Right)]]),
+    (Bulldozer,       &[&[Key(K::c("B"))]]),
 ];
 
 impl Default for Bindings {
@@ -191,22 +203,56 @@ impl Default for Bindings {
 
 impl Bindings {
     pub(crate) fn fill_missing_defaults(&mut self) {
-        let mut defaults = Self::default();
+        let defaults = Self::default();
         self.0.retain(|act, _| defaults.0.contains_key(act));
-        for (action, scan, digit) in &SPEED_DEFAULTS {
-            let taken = self.0.values().any(|combinations| {
-                combinations.0.iter().any(|combination| {
-                    combination.0.contains(&KeyScan(*scan))
-                        || combination.0.contains(&Key(K::c(digit)))
-                })
-            });
-            if taken {
-                defaults.0.get_mut(action).unwrap().0.clear();
+        for (action, mut combinations) in defaults.0 {
+            if self.0.contains_key(&action) {
+                continue;
             }
+            // Defaults added after bindings.json existed never take an input the player uses.
+            if added_later(&action) {
+                combinations
+                    .0
+                    .retain(|combination| !self.uses_input_of(&action, combination));
+            }
+            self.0.insert(action, combinations);
         }
-        for (act, comb) in defaults.0 {
-            self.0.entry(act).or_insert(comb);
-        }
+    }
+
+    fn uses_input_of(&self, action: &InputAction, default: &InputCombination) -> bool {
+        let primary: Vec<_> = default
+            .0
+            .iter()
+            .filter(|unit| !matches!(unit, Key(k) if k.is_modifier()))
+            .map(same_key)
+            .collect();
+        self.0
+            .iter()
+            .filter(|(other, _)| !shares_inputs(action, other))
+            .flat_map(|(_, combinations)| &combinations.0)
+            .flat_map(|combination| &combination.0)
+            .any(|unit| primary.contains(&same_key(unit)))
+    }
+}
+
+fn added_later(action: &InputAction) -> bool {
+    matches!(action, Cancel | Bulldozer)
+        || SPEED_DEFAULTS.iter().any(|(speed, _, _)| speed == action)
+}
+
+/// Right click cancels, while right drag moves the camera.
+fn shares_inputs(action: &InputAction, other: &InputAction) -> bool {
+    *action == Cancel && matches!(other, CameraRotate | CameraMove)
+}
+
+/// Top-row digits match whether they were bound by character or by scan code.
+fn same_key(unit: &UnitInput) -> UnitInput {
+    match unit {
+        Key(Key::Char(c)) => SPEED_DEFAULTS
+            .iter()
+            .find(|(_, _, digit)| c == digit)
+            .map_or_else(|| unit.clone(), |(_, scan, _)| KeyScan(*scan)),
+        _ => unit.clone(),
     }
 }
 
@@ -228,6 +274,8 @@ impl InputMap {
         self.ray = None;
         self.unprojected = None;
         self.unprojected_normal = None;
+        self.cancel_held = false;
+        self.cancel_origin = None;
         self.require_fresh_pointer_press();
     }
 
@@ -320,11 +368,15 @@ impl InputMap {
             .actions(input, kb, mouse)
             .filter(|action| *action != Close)
             .collect();
+        let cancel_held = acts.remove(&Cancel);
         std::mem::swap(&mut self.act, &mut acts);
         for v in &self.act {
             if !acts.contains(v) {
                 self.just_act.insert(v.clone());
             }
+        }
+        if self.cancel_clicked(cancel_held, input.mouse.screen, mouse) {
+            self.just_act.insert(Cancel);
         }
         self.screen = input.mouse.screen;
         self.wheel = if self.require_pointer_release {
@@ -332,6 +384,26 @@ impl InputMap {
         } else {
             input.mouse.wheel_delta
         };
+    }
+}
+
+impl InputMap {
+    /// Cancel acts on release, and only if the pointer stayed put and over the world.
+    fn cancel_clicked(&mut self, held: bool, screen: Vec2, mouse: bool) -> bool {
+        let was_held = std::mem::replace(&mut self.cancel_held, held);
+        if held && !was_held {
+            self.cancel_origin = Some(screen);
+        }
+        if self
+            .cancel_origin
+            .is_some_and(|origin| origin.distance(screen) > CLICK_DRAG_THRESHOLD)
+        {
+            self.cancel_origin = None;
+        }
+        if held {
+            return false;
+        }
+        self.cancel_origin.take().is_some() && was_held && mouse
     }
 }
 
@@ -570,6 +642,9 @@ impl Display for InputAction {
                 Speed8 => "Simulation Speed 8×",
                 Speed20 => "Simulation Speed 20×",
                 Speed50 => "Simulation Speed 50×",
+                SpeedMax => "Simulation Speed MAX",
+                Cancel => "Cancel tool / Deselect (click)",
+                Bulldozer => "Bulldozer",
                 OpenChat => "Interact with Chat",
                 SizeUp => "Size Up",
                 SizeDown => "Size Down",
@@ -608,6 +683,161 @@ mod tests {
         assert!(input_map.just_act.contains(&Speed20));
         input_map.prepare_frame(&input, false, true);
         assert!(!input_map.act.contains(&Speed20));
+    }
+
+    fn right_button(input_map: &mut InputMap, held: bool, screen: Vec2) {
+        let mut input = InputContext::default();
+        if held {
+            input.mouse.pressed.insert(Right);
+        }
+        input.mouse.screen = screen;
+        input_map.prepare_frame(&input, true, true);
+    }
+
+    #[test]
+    fn ux2_right_click_cancels_on_release_but_right_drag_does_not() {
+        let mut bindings = Bindings::default();
+        let mut input_map = InputMap::default();
+        input_map.build_input_tree(&mut bindings);
+
+        right_button(&mut input_map, true, Vec2::new(100.0, 100.0));
+        assert!(input_map.act.contains(&CameraRotate));
+        assert!(!input_map.just_act.contains(&Cancel), "cancelled on press");
+        right_button(&mut input_map, true, Vec2::new(102.0, 101.0));
+        right_button(&mut input_map, false, Vec2::new(102.0, 101.0));
+        assert!(input_map.just_act.contains(&Cancel), "click did not cancel");
+        right_button(&mut input_map, false, Vec2::new(102.0, 101.0));
+        assert!(!input_map.just_act.contains(&Cancel), "cancel repeated");
+
+        // Dragging past the threshold rotates the camera, even if it returns to the origin.
+        right_button(&mut input_map, true, Vec2::new(100.0, 100.0));
+        right_button(
+            &mut input_map,
+            true,
+            Vec2::new(100.0 + CLICK_DRAG_THRESHOLD + 1.0, 100.0),
+        );
+        right_button(&mut input_map, true, Vec2::new(100.0, 100.0));
+        right_button(&mut input_map, false, Vec2::new(100.0, 100.0));
+        assert!(!input_map.just_act.contains(&Cancel), "drag cancelled");
+
+        // Shift + right drag moves the camera instead.
+        let mut input = InputContext::default();
+        input.keyboard.pressed.insert(K::Shift);
+        input.mouse.pressed.insert(Right);
+        input_map.prepare_frame(&input, true, true);
+        assert!(input_map.act.contains(&CameraMove));
+        input.mouse.pressed.clear();
+        input_map.prepare_frame(&input, true, true);
+        assert!(
+            !input_map.just_act.contains(&Cancel),
+            "shift click cancelled"
+        );
+    }
+
+    #[test]
+    fn ux2_right_click_released_over_the_ui_does_not_cancel() {
+        let mut bindings = Bindings::default();
+        let mut input_map = InputMap::default();
+        input_map.build_input_tree(&mut bindings);
+        right_button(&mut input_map, true, Vec2::ZERO);
+        let mut input = InputContext::default();
+        input.mouse.pressed.insert(Right);
+        input_map.prepare_frame(&input, true, false);
+        input.mouse.pressed.clear();
+        input_map.prepare_frame(&input, true, false);
+        right_button(&mut input_map, false, Vec2::ZERO);
+        assert!(!input_map.just_act.contains(&Cancel));
+
+        right_button(&mut input_map, true, Vec2::ZERO);
+        input_map.reset_world_input();
+        input_map.observe_pointer_buttons(false);
+        right_button(&mut input_map, false, Vec2::ZERO);
+        assert!(
+            !input_map.just_act.contains(&Cancel),
+            "cancel survived reset"
+        );
+    }
+
+    #[test]
+    fn ux2_new_defaults_are_max_speed_on_6_bulldozer_on_b_and_cancel_on_right_click() {
+        let defaults = Bindings::default();
+        assert_eq!(
+            defaults.0[&SpeedMax].0,
+            [InputCombination(vec![KeyScan(TOP_ROW_DIGITS[5])])]
+        );
+        assert_eq!(defaults.0[&SpeedMax].to_string(), "6");
+        assert_eq!(
+            defaults.0[&Bulldozer].0,
+            [InputCombination(vec![Key(K::c("B"))])]
+        );
+        assert_eq!(
+            defaults.0[&Cancel].0,
+            [InputCombination(vec![Mouse(Right)])]
+        );
+        // B is free among the defaults.
+        let b = Key(K::c("B"));
+        assert!(defaults
+            .0
+            .iter()
+            .filter(|(action, _)| **action != Bulldozer)
+            .all(|(_, combinations)| combinations.0.iter().all(|c| !c.0.contains(&b))));
+    }
+
+    #[test]
+    fn ux2_new_defaults_never_take_a_saved_binding() {
+        let mut bindings = saved_bindings();
+        bindings.fill_missing_defaults();
+        assert_eq!(
+            bindings.0[&Bulldozer].0,
+            Bindings::default().0[&Bulldozer].0
+        );
+        assert_eq!(bindings.0[&SpeedMax].0, Bindings::default().0[&SpeedMax].0);
+        assert_eq!(bindings.0[&Cancel].0, Bindings::default().0[&Cancel].0);
+
+        let mut bindings = Bindings(BTreeMap::from([
+            (
+                OpenChat,
+                InputCombinations(vec![InputCombination(vec![
+                    Key(K::Control),
+                    Key(K::c("B")),
+                ])]),
+            ),
+            (
+                GoLeft,
+                InputCombinations(vec![InputCombination(vec![Key(K::c("6"))])]),
+            ),
+            (
+                CameraRotate,
+                InputCombinations(vec![InputCombination(vec![Mouse(Right)])]),
+            ),
+            (
+                CameraMove,
+                InputCombinations(vec![InputCombination(vec![Key(K::Shift), Mouse(Right)])]),
+            ),
+        ]));
+        bindings.fill_missing_defaults();
+        assert!(bindings.0[&Bulldozer].0.is_empty(), "B was hijacked");
+        assert!(bindings.0[&SpeedMax].0.is_empty(), "6 was hijacked");
+        // Right click and right drag share the button by design.
+        assert_eq!(bindings.0[&Cancel].0, Bindings::default().0[&Cancel].0);
+
+        let mut bindings = Bindings(BTreeMap::from([(
+            Select,
+            InputCombinations(vec![InputCombination(vec![Mouse(Right)])]),
+        )]));
+        bindings.fill_missing_defaults();
+        assert!(bindings.0[&Cancel].0.is_empty(), "right click was hijacked");
+
+        // A saved binding for the new action is kept as is.
+        let mut bindings = Bindings(BTreeMap::from([(
+            Bulldozer,
+            InputCombinations(vec![InputCombination(vec![Key(K::c("X"))])]),
+        )]));
+        bindings.fill_missing_defaults();
+        assert_eq!(
+            bindings.0[&Bulldozer].0,
+            [InputCombination(vec![Key(K::c("X"))])]
+        );
     }
 
     fn saved_bindings() -> Bindings {

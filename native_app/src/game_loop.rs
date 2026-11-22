@@ -8,7 +8,7 @@ use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use common::history::History;
 use common::saveload::{self, SlotId};
 use engine::{Context, FrameContext, InputContext, MeshBuilder};
-use geom::{vec2, vec3, Camera, LinearColor, AABB};
+use geom::{vec2, vec3, Camera, LinearColor};
 use simulation::economy::Government;
 use simulation::Simulation;
 
@@ -850,7 +850,7 @@ impl State {
             ctx.delta,
             &self.uiw.read::<InputMap>(),
             &self.uiw.read::<Settings>(),
-            camera_movement_bounds(map.environment.bounds()),
+            map.environment.bounds(),
             |p| map.environment.height(p),
         );
         *self.uiw.write::<Camera>() = self.uiw.read::<OrbitCamera>().camera;
@@ -1140,41 +1140,6 @@ fn startup_world() -> Result<StartupWorld, String> {
         loaded_entry: None,
         message: recovery.or(message),
     })
-}
-
-fn camera_movement_bounds(bounds: AABB) -> AABB {
-    const INSET: f32 = 3000.0;
-    let inset_x = if bounds.w() >= 2.0 * INSET {
-        INSET
-    } else {
-        0.0
-    };
-    let inset_y = if bounds.h() >= 2.0 * INSET {
-        INSET
-    } else {
-        0.0
-    };
-    let inset = vec2(inset_x, inset_y);
-    AABB::new_ll_ur(bounds.ll + inset, bounds.ur - inset)
-}
-
-#[cfg(test)]
-#[test]
-fn p4_camera_bounds_allow_clamping_on_small_maps() {
-    for (width, height) in [
-        (0.0, 0.0),
-        (512.0, 512.0),
-        (512.0, 8192.0),
-        (8192.0, 8192.0),
-    ] {
-        let world = AABB::new_ll_ur(vec2(0.0, 0.0), vec2(width, height));
-        let bounds = camera_movement_bounds(world);
-        let clamped = vec2(
-            (-100.0_f32).clamp(bounds.ll.x, bounds.ur.x),
-            (height + 100.0_f32).clamp(bounds.ll.y, bounds.ur.y),
-        );
-        assert!(world.contains(clamped));
-    }
 }
 
 #[derive(Clone, Default)]

@@ -4,6 +4,7 @@ use yakui::{
     Dim2, MainAxisAlignment, MainAxisSize, Pivot, Vec2,
 };
 
+use common::timestep::MAX_WARP;
 use goryak::{
     blur_bg, button_primary, button_secondary, constrained_viewport, icon_button, monospace,
     on_secondary_container, padx, padxy, secondary_container, tooltip,
@@ -13,18 +14,39 @@ use simulation::Simulation;
 
 use crate::gui::windows::settings::Settings;
 use crate::gui::GuiState;
-use crate::inputmap::{Bindings, InputAction, InputMap};
+use crate::inputmap::{Bindings, InputAction, InputCombinations, InputMap};
 use crate::network::NetworkState;
 use crate::uiworld::UiWorld;
 
-const SPEEDS: [(u32, &str, Option<&str>, InputAction); 6] = [
+const SPEEDS: [(u32, &str, Option<&str>, InputAction); 7] = [
     (0, "Pause", Some("pause"), InputAction::PausePlay),
     (1, "1×", Some("play"), InputAction::Speed1),
     (3, "3×", Some("forward"), InputAction::Speed3),
     (8, "8×", None, InputAction::Speed8),
     (20, "20×", None, InputAction::Speed20),
     (50, "50×", None, InputAction::Speed50),
+    (MAX_WARP, "MAX", None, InputAction::SpeedMax),
 ];
+
+fn speed_tooltip(
+    label: &str,
+    binding: Option<&InputCombinations>,
+    speed: u32,
+    selected: bool,
+    actual: Option<f64>,
+) -> String {
+    let mut text = label.to_string();
+    if let Some(binding) = binding.filter(|binding| !binding.0.is_empty()) {
+        text.push_str(&format!(" ({binding})"));
+    }
+    // MAX has no target speed, so it always reports what it reaches.
+    if let Some(actual) =
+        actual.filter(|actual| selected && (speed == MAX_WARP || *actual < f64::from(speed) * 0.9))
+    {
+        text.push_str(&format!(" · ≈{actual:.1}× actual"));
+    }
+    text
+}
 
 fn set_warp(warp: &mut u32, depause_warp: &mut u32, requested: u32) {
     if requested == 0 {
@@ -110,19 +132,8 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
                 }
                 b.padding = Pad::balanced(7.0, 3.0);
 
-                let mut label = label.to_string();
-                if let Some(binding) = bindings
-                    .0
-                    .get(action)
-                    .filter(|binding| !binding.0.is_empty())
-                {
-                    label.push_str(&format!(" ({binding})"));
-                }
-                if let Some(actual) =
-                    actual_warp.filter(|actual| selected && *actual < f64::from(*speed) * 0.9)
-                {
-                    label.push_str(&format!(" · ≈{actual:.1}× actual"));
-                }
+                let label =
+                    speed_tooltip(label, bindings.0.get(action), *speed, selected, actual_warp);
                 if tooltip(label, || b.show()).clicked {
                     set_warp(warp, depause_warp, *speed);
                 }
@@ -173,6 +184,52 @@ mod tests {
         assert_eq!(warp, 0);
         set_warp(&mut warp, &mut depause_warp, 0);
         assert_eq!(warp, 20);
+    }
+
+    #[test]
+    fn ux2_ladder_ends_with_max_on_its_own_shortcut() {
+        let speeds: Vec<_> = SPEEDS.iter().map(|(speed, ..)| *speed).collect();
+        assert_eq!(speeds, [0, 1, 3, 8, 20, 50, MAX_WARP]);
+        assert!(matches!(
+            SPEEDS.last(),
+            Some((_, "MAX", None, InputAction::SpeedMax))
+        ));
+
+        let mut uiw = UiWorld::default();
+        uiw.insert(GuiState::default());
+        uiw.insert(Settings::default());
+        uiw.insert(InputMap::default());
+        for action in [InputAction::SpeedMax, InputAction::PausePlay] {
+            uiw.write::<InputMap>().just_act.clear();
+            uiw.write::<InputMap>().just_act.insert(action);
+            GuiState::apply_time_shortcut(&uiw);
+        }
+        assert_eq!(uiw.read::<Settings>().time_warp, 0);
+        GuiState::apply_time_shortcut(&uiw);
+        assert_eq!(uiw.read::<Settings>().time_warp, MAX_WARP);
+    }
+
+    #[test]
+    fn ux2_max_tooltip_always_reports_the_achieved_speed() {
+        let binding = Bindings::default();
+        let binding = binding.0.get(&InputAction::SpeedMax);
+        assert_eq!(
+            speed_tooltip("MAX", binding, MAX_WARP, true, Some(312.04)),
+            "MAX (6) · ≈312.0× actual"
+        );
+        assert_eq!(
+            speed_tooltip("MAX", binding, MAX_WARP, false, Some(312.0)),
+            "MAX (6)"
+        );
+        assert_eq!(
+            speed_tooltip("MAX", binding, MAX_WARP, true, None),
+            "MAX (6)"
+        );
+        assert_eq!(speed_tooltip("8×", None, 8, true, Some(7.9)), "8×");
+        assert_eq!(
+            speed_tooltip("8×", None, 8, true, Some(4.0)),
+            "8× · ≈4.0× actual"
+        );
     }
 
     #[test]

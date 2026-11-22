@@ -45,6 +45,7 @@ impl Default for GuiState {
 
 pub fn run_ui_systems(sim: &Simulation, uiworld: &UiWorld) {
     profiling::scope!("gui::run_ui_systems");
+    tool_shortcuts(uiworld);
     let tool = *uiworld.read::<Tool>();
     if tool != Tool::Hand {
         uiworld.write::<InspectedRoad>().0 = None;
