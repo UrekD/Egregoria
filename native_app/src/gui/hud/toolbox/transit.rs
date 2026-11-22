@@ -1,6 +1,6 @@
 use goryak::{
     blur_bg, button_primary, button_secondary, mincolumn, minrow, on_secondary_container, padxy,
-    secondary_container, textc,
+    secondary_container, textc, tooltip,
 };
 use simulation::Simulation;
 use yakui::{opaque, reflow, Alignment, Dim2, Pivot};
@@ -73,28 +73,33 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
                             }
 
                             minrow(6.0, || {
-                                if tool_button(tool, Tool::TransitStop, "Bus stop") {
+                                if tool_button(tool, Tool::TransitStop) {
                                     tool = Tool::TransitStop;
                                     state.remove_stops = false;
                                     state.line.cancel();
                                 }
-                                if tool_button(tool, Tool::TransitLine, "Bus line") {
+                                if tool_button(tool, Tool::TransitLine) {
                                     tool = Tool::TransitLine;
                                     state.line.cancel();
                                 }
                                 if tool == Tool::TransitStop
-                                    && button_secondary(if state.remove_stops {
-                                        "Add stops"
-                                    } else {
-                                        "Remove stops"
+                                    && tooltip("Switch between adding and removing stops", || {
+                                        button_secondary(if state.remove_stops {
+                                            "Add stops"
+                                        } else {
+                                            "Remove stops"
+                                        })
+                                        .show()
                                     })
-                                    .show()
                                     .clicked
                                 {
                                     state.remove_stops = !state.remove_stops;
                                 }
                                 if matches!(tool, Tool::TransitStop | Tool::TransitLine)
-                                    && button_secondary("Cancel").show().clicked
+                                    && tooltip("Leave the transit tool", || {
+                                        button_secondary("Cancel").show()
+                                    })
+                                    .clicked
                                 {
                                     tool = Tool::Hand;
                                     state.line.cancel();
@@ -115,12 +120,16 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
     }
 }
 
-fn tool_button(tool: Tool, choice: Tool, label: &'static str) -> bool {
-    if tool == choice {
-        button_primary(label).show().clicked
-    } else {
-        button_secondary(label).show().clicked
-    }
+fn tool_button(tool: Tool, choice: Tool) -> bool {
+    let label = super::tool_label(choice);
+    tooltip(label, || {
+        if tool == choice {
+            button_primary(label).show()
+        } else {
+            button_secondary(label).show()
+        }
+    })
+    .clicked
 }
 
 #[cfg(test)]

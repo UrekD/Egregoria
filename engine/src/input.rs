@@ -2,6 +2,7 @@ use common::FastSet;
 use geom::{vec2, Vec2};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
+use std::cell::{Cell, RefCell};
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
@@ -31,6 +32,39 @@ pub struct InputContext {
     pub mouse: MouseInfo,
     pub keyboard: KeyboardInfo,
     pub cursor_left: bool,
+    pub focus_lost: bool,
+    physical_mouse_buttons: FastSet<MouseButton>,
+    cursor_outside: bool,
+    unfocused: bool,
+    pointer_released: bool,
+}
+
+/// Pointer state for world tools running during the engine's update callback.
+#[derive(Clone, Copy, Default)]
+pub struct PointerFrame {
+    pub blocked: bool,
+    pub interrupted: bool,
+    pub mouse_held: bool,
+}
+
+thread_local! {
+    static POINTER_FRAME: Cell<PointerFrame> = Cell::new(PointerFrame::default());
+    static EGUI_CONTEXT: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
+}
+
+pub fn pointer_frame() -> PointerFrame {
+    POINTER_FRAME.get()
+}
+
+pub fn pointer_over_egui(screen: Vec2) -> bool {
+    EGUI_CONTEXT.with_borrow(|context| {
+        context.as_ref().is_some_and(|context| {
+            let pos = egui::pos2(screen.x, screen.y) / context.pixels_per_point();
+            context
+                .layer_id_at(pos)
+                .is_some_and(|layer| layer.order != egui::Order::Background)
+        })
+    })
 }
 
 impl InputContext {
@@ -39,6 +73,56 @@ impl InputContext {
         self.mouse.wheel_delta = 0.0;
         self.mouse.screen_delta = Vec2::ZERO;
         self.cursor_left = false;
+        self.focus_lost = false;
+        self.pointer_released = false;
+    }
+
+    pub fn physical_mouse_buttons(&self) -> &FastSet<MouseButton> {
+        &self.physical_mouse_buttons
+    }
+
+    pub(crate) fn publish_pointer_frame(&self, egui: &crate::egui::EguiWrapper) {
+        POINTER_FRAME.set(PointerFrame {
+            blocked: self.cursor_outside || self.unfocused || egui.last_mouse_captured,
+            interrupted: self.cursor_left || self.focus_lost || self.pointer_released,
+            mouse_held: !self.physical_mouse_buttons.is_empty(),
+        });
+        EGUI_CONTEXT.with_borrow_mut(|context| *context = Some(egui.platform.egui_ctx().clone()));
+    }
+
+    /// Observe hardware state before an adapter can capture the event.
+    pub(crate) fn observe_window_event(&mut self, event: &WindowEvent) {
+        match event {
+            WindowEvent::MouseInput { button, state, .. } => {
+                let button = MouseButton::from(*button);
+                match state {
+                    ElementState::Pressed if !self.unfocused => {
+                        self.physical_mouse_buttons.insert(button);
+                    }
+                    ElementState::Released => {
+                        self.physical_mouse_buttons.remove(&button);
+                        self.mouse.pressed.remove(&button);
+                        self.pointer_released = true;
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.cursor_left = true;
+                self.cursor_outside = true;
+            }
+            WindowEvent::CursorMoved { .. } => self.cursor_outside = false,
+            WindowEvent::Focused(focused) => {
+                self.unfocused = !focused;
+                if !focused {
+                    self.focus_lost = true;
+                    self.physical_mouse_buttons.clear();
+                    self.mouse.pressed.clear();
+                    self.keyboard = KeyboardInfo::default();
+                }
+            }
+            _ => {}
+        }
     }
 
     pub fn handle_device(&mut self, event: &winit::event::DeviceEvent) {
@@ -101,9 +185,10 @@ impl InputContext {
             WindowEvent::MouseInput { button, state, .. } => {
                 let b = MouseButton::from(*button);
                 match state {
-                    ElementState::Pressed => {
+                    ElementState::Pressed if !self.unfocused => {
                         self.mouse.pressed.insert(b);
                     }
+                    ElementState::Pressed => {}
                     ElementState::Released => {
                         self.mouse.pressed.remove(&b);
                     }
@@ -316,4 +401,54 @@ pub enum Key {
     Copy,
     Paste,
     Cut,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use winit::event::{DeviceId, MouseButton as NativeButton};
+
+    fn mouse_event(button: NativeButton, state: ElementState) -> WindowEvent {
+        WindowEvent::MouseInput {
+            device_id: unsafe { DeviceId::dummy() },
+            state,
+            button,
+        }
+    }
+
+    #[test]
+    fn p4d_native_release_survives_capture_and_cursor_exit() {
+        let mut input = InputContext::default();
+        let down = mouse_event(NativeButton::Other(21), ElementState::Pressed);
+        input.observe_window_event(&down);
+        input.handle(&down);
+        input.observe_window_event(&WindowEvent::CursorLeft {
+            device_id: unsafe { DeviceId::dummy() },
+        });
+        input.observe_window_event(&mouse_event(
+            NativeButton::Other(21),
+            ElementState::Released,
+        ));
+        assert!(input.physical_mouse_buttons().is_empty());
+        assert!(input.mouse.pressed.is_empty());
+        input.observe_window_event(&down);
+        assert!(input
+            .physical_mouse_buttons()
+            .contains(&MouseButton::Other(21)));
+    }
+
+    #[test]
+    fn p4d_focus_loss_clears_buttons_and_reports_cancellation() {
+        let mut input = InputContext::default();
+        let down = mouse_event(NativeButton::Left, ElementState::Pressed);
+        input.observe_window_event(&down);
+        input.handle(&down);
+        input.observe_window_event(&WindowEvent::Focused(false));
+        input.observe_window_event(&WindowEvent::Focused(true));
+        assert!(input.focus_lost);
+        assert!(input.physical_mouse_buttons().is_empty());
+        assert!(input.mouse.pressed.is_empty());
+        input.end_frame();
+        assert!(!input.focus_lost);
+    }
 }

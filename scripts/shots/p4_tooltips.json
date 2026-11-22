@@ -1,0 +1,19 @@
+[
+  {"Camera": {"x": 990, "y": 905, "z": 0, "yaw": -0.6, "pitch": 1.05, "dist": 730}},
+  {"Builder": "grid_city"},
+  {"Pointer": {"action": "Move", "screen_pos": [381, 678]}},
+  {"WaitFrames": 45},
+  {"Screenshot": "toolbar-tooltip"},
+  {"Pointer": {"action": "Move", "screen_pos": [1104, 51]}},
+  {"WaitFrames": 2},
+  {"Screenshot": "time-control-tooltip"},
+  {"Pointer": {"action": "Move", "screen_pos": [991, 24]}},
+  {"WaitFrames": 2},
+  {"Screenshot": "overlay-combo-hover"},
+  {"SetSession": "MainMenu"},
+  {"WaitFrames": 3},
+  {"Pointer": {"action": "Move", "screen_pos": [617, 285]}},
+  {"WaitFrames": 3},
+  {"Screenshot": "main-menu-hover"},
+  "Exit"
+]

@@ -33,6 +33,7 @@ pub struct Settings {
     pub gfx: GfxSettings,
 
     pub gui_scale: f32,
+    pub bulldozer_drag: bool,
 
     pub master_volume_percent: f32,
     pub music_volume_percent: f32,
@@ -58,8 +59,15 @@ impl Default for Settings {
             camera_smooth_tightness: 1.0,
             camera_fov: 60.0,
             gui_scale: 1.0,
+            bulldozer_drag: false,
             gfx: GfxSettings::default(),
         }
+    }
+}
+
+impl Settings {
+    pub(crate) fn save(&self) {
+        common::saveload::JSONPretty::save_silent(self, SETTINGS_SAVE_NAME);
     }
 }
 
@@ -365,7 +373,7 @@ pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
                 );
 
                 if *settings != before {
-                    common::saveload::JSONPretty::save_silent(&*settings, SETTINGS_SAVE_NAME);
+                    settings.save();
                 }
             });
         });

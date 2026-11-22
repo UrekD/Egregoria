@@ -6,7 +6,7 @@ use yakui::{
 
 use goryak::{
     blur_bg, button_primary, button_secondary, constrained_viewport, icon_button, monospace,
-    on_secondary_container, padx, padxy, secondary_container,
+    on_secondary_container, padx, padxy, secondary_container, tooltip,
 };
 use prototypes::GameTime;
 use simulation::Simulation;
@@ -61,7 +61,7 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
         let mut l = List::row();
         l.main_axis_alignment = MainAxisAlignment::SpaceBetween;
         l.show(|| {
-            let mut time_button = |text: &str, b_warp: u32| {
+            let mut time_button = |text: &str, b_warp: u32, label: &'static str| {
                 let mut b = if *warp == b_warp {
                     icon_button(button_primary(text))
                 } else {
@@ -69,7 +69,7 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
                 };
 
                 b.padding = Pad::balanced(10.0, 3.0);
-                if b.show().clicked {
+                if tooltip(label, || b.show()).clicked {
                     if b_warp == 0 {
                         if *warp == 0 {
                             *warp = *depause_warp;
@@ -81,10 +81,10 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
                 }
             };
 
-            time_button("pause", 0);
-            time_button("play", 1);
-            time_button("forward", 3);
-            time_button("fast-forward", 1000);
+            time_button("pause", 0, "Pause (Space)");
+            time_button("play", 1, "Normal speed");
+            time_button("forward", 3, "Fast speed");
+            time_button("fast-forward", 1000, "Maximum speed");
         });
     };
 
