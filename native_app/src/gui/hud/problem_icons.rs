@@ -1,8 +1,11 @@
 use goryak::{padxy, round_rect, secondary_container};
 use ordered_float::OrderedFloat;
-use simulation::map::ProjectFilter;
+use simulation::map::{BuildingKind, ProjectFilter};
 use simulation::map_dynamic::{UtilityFlow, UtilityStatus};
-use simulation::souls::{events::Fires, residence::Residences};
+use simulation::souls::{
+    events::Fires,
+    residence::{self, Residences},
+};
 use simulation::Simulation;
 use yakui::{reflow, Alignment, Color, Dim2, Pivot};
 
@@ -43,15 +46,15 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
         let (label, short, color) = if fires.by_building.contains_key(&id) {
             ("Fire", "F", Color::rgb(255, 153, 96))
         } else {
+            if building.kind == BuildingKind::House && !residence::uses_water(sim, id) {
+                continue;
+            }
             let Some(status) = utilities.status(&map, &residences, id) else {
                 continue;
             };
             match (status.water, status.sewage) {
                 (UtilityStatus::Disconnected, _) => {
                     ("Disconnected", "D", Color::rgb(210, 195, 255))
-                }
-                (UtilityStatus::Unknown, _) => {
-                    ("Awaiting utilities", "U", Color::rgb(210, 195, 255))
                 }
                 (UtilityStatus::Shortage, _) => ("No water", "W", Color::rgb(135, 216, 255)),
                 (_, UtilityStatus::Shortage) => ("No sewage", "S", Color::rgb(255, 212, 132)),

@@ -1,13 +1,12 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 
 use goryak::{
     blur_bg, error, mincolumn, on_secondary_container, padxy, secondary_container, textc,
 };
-use prototypes::{Tick, TICKS_PER_HOUR};
-use simulation::map::{BuildingID, ElectricityNetworkID};
+use simulation::map::ElectricityNetworkID;
 use simulation::map_dynamic::UtilityFlow;
-use simulation::souls::events::Fires;
+use simulation::souls::events::{FireEventKind, Fires};
 use simulation::world_command::{CommandOutcomes, Rejection};
 use simulation::Simulation;
 use yakui::{reflow, Alignment, Dim2, Pivot};
@@ -15,7 +14,6 @@ use yakui::{reflow, Alignment, Dim2, Pivot};
 use crate::uiworld::UiWorld;
 
 const LIFETIME: Duration = Duration::from_secs(5);
-const COLLAPSE_TICKS: u64 = 3 * TICKS_PER_HOUR;
 
 type Outcome = (&'static str, Rejection);
 
@@ -32,7 +30,7 @@ pub(crate) struct ToastState {
 struct CityEvents {
     tick: Option<u64>,
     map: usize,
-    fires: BTreeMap<BuildingID, Tick>,
+    fire_cursor: u64,
     no_water: BTreeSet<ElectricityNetworkID>,
 }
 
@@ -67,15 +65,11 @@ impl CityEvents {
         let tick = sim.get_tick();
         let map = sim.map();
         let map_id = std::ptr::from_ref(&map.subscribers) as usize;
-        if self.tick == Some(tick) && self.map == map_id {
-            return Some([0; 3]);
-        }
-        let same_city = self.map == map_id && self.tick.is_some_and(|last| tick >= last);
+        let same_city = self.map == map_id && self.tick.is_some();
         let utility_refresh = !same_city || self.tick.unwrap_or_default() / 3000 != tick / 3000;
         self.map = map_id;
         self.tick = Some(tick);
         if !same_city {
-            self.fires.clear();
             self.no_water.clear();
         }
         let shortages = if utility_refresh {
@@ -93,29 +87,19 @@ impl CityEvents {
         };
 
         let fires = sim.read::<Fires>();
-        let started = fires
-            .by_building
-            .iter()
-            .filter(|&(id, start)| self.fires.get(id) != Some(start) && map.get(*id).is_some())
-            .count();
-
-        // A fire can leave the snapshot before its building is removed.
-        // Keep its last observed start until the building actually disappears.
-        self.fires.extend(
-            fires
-                .by_building
-                .iter()
-                .filter(|(id, _)| map.get(**id).is_some())
-                .map(|(&id, &start)| (id, start)),
-        );
+        let latest = fires.events.back().map_or(0, |event| event.seq);
+        let mut started = 0;
         let mut collapsed = 0;
-        self.fires.retain(|&id, start| {
-            let exists = map.get(id).is_some();
-            if !exists && tick.saturating_sub(start.0) >= COLLAPSE_TICKS {
-                collapsed += 1;
+        if same_city && latest > self.fire_cursor {
+            for event in fires.events_since(self.fire_cursor) {
+                match event.kind {
+                    FireEventKind::Ignited => started += 1,
+                    FireEventKind::Collapsed => collapsed += 1,
+                    FireEventKind::Extinguished => {}
+                }
             }
-            exists
-        });
+        }
+        self.fire_cursor = latest;
         same_city.then_some([started, collapsed, shortages])
     }
 }
@@ -257,15 +241,17 @@ fn message(reason: Rejection) -> &'static str {
 mod tests {
     use super::*;
     use geom::vec2;
+    use prototypes::{Tick, TICKS_PER_HOUR};
     use scenarios::{
         builders::{fill_houses, grid_city},
         ScenarioCtx,
     };
+    use simulation::souls::events::FireEvent;
     use simulation::world_command::WorldCommand;
     use simulation::SimulationOptions;
 
     #[test]
-    fn p2e_fix_collapse_survives_fire_snapshot_removal() {
+    fn p2_ui_wire_demolition_after_fire_is_not_a_collapse() {
         let mut test = ScenarioCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
@@ -281,6 +267,32 @@ mod tests {
         test.submit(&[WorldCommand::MapRemoveBuilding(house)]);
         test.run_ticks(1);
         assert!(test.sim.map().get(house).is_none());
-        assert_eq!(events.update(&test.sim).unwrap()[1], 1);
+        assert_eq!(events.update(&test.sim).unwrap()[1], 0);
+    }
+
+    #[test]
+    fn p2_ui_wire_consumes_fire_events_once_even_in_the_same_tick() {
+        let mut test = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            save_replay: false,
+        });
+        grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
+        let house = fill_houses(&mut test, 1)[0];
+        let mut events = CityEvents::default();
+        let record = |seq, kind| {
+            test.sim.write::<Fires>().events.push_back(FireEvent {
+                seq,
+                tick: Tick(0),
+                building: house,
+                kind,
+            });
+        };
+        record(1, FireEventKind::Ignited);
+        assert!(events.update(&test.sim).is_none());
+        record(2, FireEventKind::Extinguished);
+        record(3, FireEventKind::Ignited);
+        record(4, FireEventKind::Collapsed);
+        assert_eq!(events.update(&test.sim), Some([1, 1, 0]));
+        assert_eq!(events.update(&test.sim), Some([0, 0, 0]));
     }
 }

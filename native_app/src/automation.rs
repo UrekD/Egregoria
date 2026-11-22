@@ -8,16 +8,20 @@ use std::time::{Duration, SystemTime};
 
 use common::saveload::{self, Encoder, JSONPretty, JSON};
 use engine::{Context, Key, MouseButton};
-use geom::{vec2, vec3, Radians, Vec2};
+use geom::{vec2, vec3, Radians, Vec2, OBB};
+use prototypes::{BuildingGen, GoodsCompanyID};
 use scenarios::builders::{self, CommandSink};
 use serde::{Deserialize, Serialize};
 use simulation::economy::{Budget, CityStats, Government, ZoneDemand};
-use simulation::map::{ZoneGrid, ZoneKind};
+use simulation::map::{BuildingKind, Map, ProjectFilter, ProjectKind, Zone, ZoneGrid, ZoneKind};
 use simulation::utils::scheduler::SeqSchedule;
-use simulation::world_command::{CommandOutcomes, WorldCommand, WorldCommands};
+use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand, WorldCommands};
 use simulation::Simulation;
 
-use crate::gui::{overlays::OverlayMode, top_demand_driver, zoning::ZONES, GuiState, Tool};
+use crate::gui::{
+    overlays::OverlayMode, toolbox::building::BuildingTab, top_demand_driver, zoning::ZONES,
+    GuiState, InspectedBuilding, Tool,
+};
 use crate::uiworld::{ReceivedCommands, UiWorld};
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
@@ -35,6 +39,7 @@ enum Step {
     WaitFrames(u64),
     RunTicks(u64),
     Commands(Vec<WorldCommand>),
+    BuildSpecialBuildings(Vec<SpecialBuildingPlacement>),
     Pointer {
         action: PointerAction,
         #[serde(flatten)]
@@ -57,9 +62,27 @@ enum Step {
     SelectTool(Tool),
     SetOverlay(OverlayMode),
     OpenWindow(String),
+    Assert(Assertion),
     Screenshot(String),
     DumpState(String),
     Exit,
+}
+
+#[derive(Deserialize)]
+struct SpecialBuildingPlacement {
+    pos: OBB,
+    kind: BuildingKind,
+    gen: BuildingGen,
+    zone: Option<Zone>,
+    road_at: [f32; 2],
+}
+
+#[derive(Deserialize)]
+enum Assertion {
+    NoRejections,
+    ServicesTab,
+    HouseInspector,
+    BuildingCount { prototype: String, count: usize },
 }
 
 #[derive(Deserialize)]
@@ -110,6 +133,7 @@ pub(crate) struct Automation {
     dir: PathBuf,
     exit_after_script: bool,
     wait: Option<Wait>,
+    first_rejection: Option<(&'static str, Rejection)>,
     _watchdog: mpsc::Sender<()>,
 }
 
@@ -153,6 +177,7 @@ pub(crate) fn configure() -> Result<(), String> {
         dir,
         exit_after_script: args.exit_after_script,
         wait: None,
+        first_rejection: None,
         _watchdog: watchdog,
     });
     Ok(())
@@ -329,6 +354,19 @@ impl Automation {
                 self.apply_commands(uiw, &mut sim.write().unwrap(), schedule, batch);
             }
             Step::Commands(_) => {}
+            Step::BuildSpecialBuildings(placements) => {
+                let mut sim = sim.write().unwrap();
+                let mut batch = WorldCommands::default();
+                {
+                    let map = sim.map();
+                    for placement in placements {
+                        batch.push(placement.command(&map)?);
+                    }
+                }
+                if !batch.is_empty() {
+                    self.apply_commands(uiw, &mut sim, schedule, batch);
+                }
+            }
             Step::Pointer { action, position } => {
                 let start = position.to_screen(uiw)?;
                 match action {
@@ -365,6 +403,7 @@ impl Automation {
                     sim: &mut sim,
                     schedule,
                     queued: Vec::new(),
+                    first_rejection: &mut self.first_rejection,
                 };
                 builder.build(&mut sink)?;
                 let tick = sim.get_tick();
@@ -414,6 +453,9 @@ impl Automation {
                     .ok_or_else(|| format!("unknown window {name:?}"))?;
                 *open = true;
             }
+            Step::Assert(assertion) => {
+                assertion.check(uiw, &sim.read().unwrap(), self.first_rejection)?
+            }
             Step::Screenshot(name) => {
                 ctx.request_screenshot(self.output_path(&name, "png")?)?;
                 self.wait = Some(Wait::Screenshot);
@@ -441,6 +483,7 @@ impl Automation {
         } else {
             sim.tick(schedule, commands.as_ref());
         }
+        remember_rejection(&mut self.first_rejection, sim);
         *uiw.write::<ReceivedCommands>() = ReceivedCommands::new(commands);
         // The next step can run as soon as this batch has been rendered.
         self.wait = Some(Wait::Map {
@@ -508,6 +551,84 @@ impl Automation {
             file.flush()
         };
         write().map_err(|e| format!("writing state {}: {e}", path.display()))
+    }
+}
+
+fn remember_rejection(first: &mut Option<(&'static str, Rejection)>, sim: &Simulation) {
+    if first.is_none() {
+        *first = sim.read::<CommandOutcomes>().last.first().copied();
+    }
+}
+
+impl SpecialBuildingPlacement {
+    fn command(self, map: &Map) -> Result<WorldCommand, String> {
+        let [x, y] = self.road_at;
+        let xy = vec2(x, y);
+        let road = xy.is_finite().then(|| {
+            let z = map.environment.height(xy).unwrap_or_default();
+            map.project(xy.z(z), 0.0, ProjectFilter::ROAD).kind
+        });
+        let Some(ProjectKind::Road(connected_road)) = road else {
+            return Err(format!("no road at {x}, {y} for {:?}", self.kind));
+        };
+        Ok(WorldCommand::MapBuildSpecialBuilding {
+            pos: self.pos,
+            kind: self.kind,
+            gen: self.gen,
+            zone: self.zone,
+            connected_road: Some(connected_road),
+        })
+    }
+}
+
+impl Assertion {
+    fn check(
+        self,
+        uiw: &UiWorld,
+        sim: &Simulation,
+        first_rejection: Option<(&'static str, Rejection)>,
+    ) -> Result<(), String> {
+        match self {
+            Self::NoRejections => {
+                if let Some((command, reason)) = first_rejection {
+                    return Err(format!("unexpected rejection of {command}: {reason:?}"));
+                }
+            }
+            Self::ServicesTab => {
+                if uiw.read::<GuiState>().hidden
+                    || *uiw.read::<Tool>() != Tool::SpecialBuilding
+                    || *uiw.read::<BuildingTab>() != BuildingTab::Services
+                {
+                    return Err("Services tab is not open".into());
+                }
+            }
+            Self::HouseInspector => {
+                if uiw.read::<GuiState>().hidden
+                    || !uiw
+                        .read::<InspectedBuilding>()
+                        .e
+                        .and_then(|id| sim.map().get(id).map(|building| building.kind))
+                        .is_some_and(|kind| kind == BuildingKind::House)
+                {
+                    return Err("house inspector is not open".into());
+                }
+            }
+            Self::BuildingCount { prototype, count } => {
+                let kind = BuildingKind::GoodsCompany(GoodsCompanyID::new(&prototype));
+                let actual = sim
+                    .map()
+                    .buildings()
+                    .values()
+                    .filter(|b| b.kind == kind)
+                    .count();
+                if actual != count {
+                    return Err(format!(
+                        "expected {count} {prototype:?} buildings, found {actual}"
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -606,6 +727,7 @@ struct LiveCommandSink<'a> {
     sim: &'a mut Simulation,
     schedule: &'a mut SeqSchedule,
     queued: Vec<WorldCommand>,
+    first_rejection: &'a mut Option<(&'static str, Rejection)>,
 }
 
 impl CommandSink for LiveCommandSink<'_> {
@@ -623,6 +745,7 @@ impl CommandSink for LiveCommandSink<'_> {
 
     fn flush(&mut self) {
         self.sim.tick(self.schedule, &self.queued);
+        remember_rejection(self.first_rejection, self.sim);
         self.queued.clear();
     }
 }
@@ -630,6 +753,18 @@ impl CommandSink for LiveCommandSink<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p2_ui_wire_assertion_steps_decode() {
+        for json in [
+            r#"{"Assert":"NoRejections"}"#,
+            r#"{"Assert":"ServicesTab"}"#,
+            r#"{"Assert":"HouseInspector"}"#,
+            r#"{"Assert":{"BuildingCount":{"prototype":"water-pump","count":1}}}"#,
+        ] {
+            assert!(JSON::decode::<Step>(json.as_bytes()).is_ok(), "{json}");
+        }
+    }
 
     #[test]
     fn p2e_set_overlay_step_decodes() {

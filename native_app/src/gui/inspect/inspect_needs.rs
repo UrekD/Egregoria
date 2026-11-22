@@ -3,7 +3,7 @@ use prototypes::ServiceKind;
 use simulation::map::{BuildingID, BuildingKind};
 use simulation::map_dynamic::{CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow, UtilityStatus};
 use simulation::souls::happiness::Happiness;
-use simulation::souls::residence::Residences;
+use simulation::souls::residence::{self, Residences};
 use simulation::Simulation;
 
 use crate::gui::overlays::{is_coverage_receiver, power_available};
@@ -29,12 +29,31 @@ pub(super) fn render(sim: &Simulation, building: BuildingID) {
             ),
         }
     }
-    if sim
-        .map()
-        .get(building)
-        .is_some_and(|b| b.kind == BuildingKind::House)
-    {
-        textc(on_secondary_container(), "requirements: see P2d");
+    let requirements = residence::requirements(sim, building);
+    if !requirements.is_empty() {
+        fixed_spacer((0.0, 5.0));
+        textc(on_secondary_container(), "Upgrade requirements");
+        for requirement in requirements {
+            let (color, status) = if requirement.met {
+                (on_secondary_container(), "Met")
+            } else {
+                (error(), "Unmet")
+            };
+            let unit = if requirement.name.ends_with(" coverage")
+                || matches!(requirement.name, "Occupancy" | "Employment")
+            {
+                "%"
+            } else {
+                ""
+            };
+            textc(
+                color,
+                format!(
+                    "{} · {status} · {:.1}{unit} / {:.0}{unit}",
+                    requirement.name, requirement.value, requirement.threshold
+                ),
+            );
+        }
     }
 }
 

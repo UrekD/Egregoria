@@ -12,7 +12,7 @@ use serde::{Deserialize, Deserializer};
 use simulation::map::{Building, BuildingID, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow, UtilityStatus};
 use simulation::souls::happiness::Happiness;
-use simulation::souls::residence::Residences;
+use simulation::souls::residence::{self, Residences};
 use simulation::Simulation;
 
 use crate::gui::hud::toolbox::building::draw_service_radius;
@@ -235,11 +235,13 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
     let mut buildings = |value: &dyn Fn(&Building) -> Option<f32>| {
         for building in map.buildings().values() {
             if let Some(value) = value(building) {
-                // The visible skirt extends beyond models that fill the lot.
-                // Building::height is the foundation elevation.
+                // Keep a visible border around asset meshes and procedural boxes.
                 let footprint = match building.kind {
                     BuildingKind::GoodsCompany(company)
-                        if try_prototype(company).is_some_and(|proto| proto.asset.is_mesh()) =>
+                        if company.is_growable()
+                            || try_prototype(company).is_none_or(|proto| {
+                                proto.asset.is_mesh() || proto.zone.is_some()
+                            }) =>
                     {
                         building.obb.expand(FOOTPRINT_PADDING)
                     }
@@ -262,6 +264,9 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
             let flow = sim.read::<UtilityFlow>();
             let residences = sim.read::<Residences>();
             buildings(&|b| {
+                if b.kind == BuildingKind::House && !residence::uses_water(sim, b.id) {
+                    return None;
+                }
                 let status = flow.status(map, &residences, b.id)?;
                 let relevant = if mode == OverlayMode::Water {
                     status.water
@@ -334,6 +339,49 @@ pub(crate) fn selector(uiworld: &UiWorld) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn p2_ui_wire_tints_procedural_specials_beyond_their_footprint() {
+        use prototypes::{BuildingGen, GoodsCompanyID};
+        use scenarios::{builders::grid_city, ScenarioCtx};
+        use simulation::SimulationOptions;
+
+        let mut test = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+        });
+        let grid = grid_city(&mut test, vec2(700.0, 700.0), 4, 4, 160.0);
+        let mut map = test.sim.write::<Map>();
+        let sites = [
+            ("p2-overlay-procedural", vec2(400.0, 450.0)),
+            ("cereal-farm", vec2(550.0, 450.0)),
+        ];
+        for (prototype, center) in sites {
+            map.build_special_building(
+                &OBB::new(center, Vec2::X, 100.0, 100.0),
+                BuildingKind::GoodsCompany(GoodsCompanyID::new(prototype)),
+                BuildingGen::CenteredDoor {
+                    vertical_factor: 1.0,
+                },
+                None,
+                Some(grid.roads[0]),
+            )
+            .unwrap();
+        }
+        drop(map);
+
+        let mut tiles = TileIndex::default();
+        collect_tiles(&test.sim, &test.sim.map(), OverlayMode::Power, &mut tiles);
+        for (prototype, center) in sites {
+            let tile = tiles
+                .chunks
+                .values()
+                .flatten()
+                .find(|tile| tile.footprint.center() == center)
+                .unwrap();
+            assert!(tile.footprint.bbox().w() > 100.0, "{prototype}");
+        }
+    }
 
     #[test]
     fn p2e_fix_coverage_version_changes_only_at_its_update() {
