@@ -71,8 +71,8 @@ pub struct Map {
     pub(crate) walking_topology_generation: u64,
     // Derived from lanes and turns. Map deserialization starts with an empty cache.
     pub(super) driving_reachability: OnceLock<DrivingReachability>,
-    // Recovered from the saved trim distances on the first edit after loading.
-    pub(super) import_lane_reserve: OnceLock<bool>,
+    // Imported networks reserve usable lane length when rebuilding junction geometry.
+    pub(super) import_lane_reserve: bool,
 
     pub electricity: ElectricityCache,
     pub environment: Environment,
@@ -114,6 +114,7 @@ impl Clone for Map {
             external_train_stations: self.external_train_stations.clone(),
             lot_origins: self.lot_origins.clone(),
             walking_topology_generation: self.walking_topology_generation,
+            import_lane_reserve: self.import_lane_reserve,
             electricity: self.electricity.clone(),
             environment: self.environment.clone(),
             parking: self.parking.clone(),
@@ -143,7 +144,7 @@ impl Map {
                 .expect("map identities exhausted"),
             walking_topology_generation: 0,
             driving_reachability: OnceLock::new(),
-            import_lane_reserve: OnceLock::new(),
+            import_lane_reserve: false,
             electricity: Default::default(),
             override_subscriber: subscribers.subscribe(UpdateType::Road | UpdateType::Building),
             subscribers,
@@ -735,7 +736,7 @@ impl Map {
     }
 
     pub(crate) fn finalize_import(&mut self, junctions: &[IntersectionID], roads: &[RoadID]) {
-        self.import_lane_reserve = OnceLock::from(true);
+        self.import_lane_reserve = true;
         self.lane_topology_changed();
         for &id in junctions {
             let junction = &mut self.intersections[id];
@@ -756,17 +757,6 @@ impl Map {
         }
     }
 
-    fn has_binding_import_reserve(road: &Road) -> bool {
-        let length = road.length();
-        length >= Self::IMPORT_LANE_RESERVE
-            && (length
-                - road.interface_from(road.src)
-                - road.interface_from(road.dst)
-                - Self::IMPORT_LANE_RESERVE)
-                .abs()
-                < 0.002
-    }
-
     fn invalidate(&mut self, id: IntersectionID) {
         info!("invalidate {:?}", id);
 
@@ -782,10 +772,7 @@ impl Map {
             return;
         }
 
-        if !*self
-            .import_lane_reserve
-            .get_or_init(|| self.roads.values().any(Self::has_binding_import_reserve))
-        {
+        if !self.import_lane_reserve {
             self.invalidate_legacy(id);
             return;
         }
@@ -836,11 +823,7 @@ impl Map {
             for &road in &self.intersections[junction].roads {
                 previous.entry(road).or_insert_with(|| {
                     let r = &self.roads[road];
-                    (
-                        r.interface_from(r.src),
-                        r.interface_from(r.dst),
-                        Self::has_binding_import_reserve(r),
-                    )
+                    (r.interface_from(r.src), r.interface_from(r.dst))
                 });
             }
         }
@@ -856,20 +839,11 @@ impl Map {
                 .filter(|road| !direct.contains(road)),
         );
         for road_id in road_order {
-            let (old_src, old_dst, was_binding) = previous[&road_id];
+            let old_interfaces = previous[&road_id];
             let road = &mut self.roads[road_id];
             Self::reserve_import_lane(road);
-            // Keep existing evidence of the reserve if the new policy would
-            // loosen the trim. That lets later save loads recognize the mode.
-            if was_binding
-                && road.interface_from(road.src) + road.interface_from(road.dst) + 0.002
-                    < old_src + old_dst
-            {
-                road.set_interface(road.src, old_src);
-                road.set_interface(road.dst, old_dst);
-            }
-            let changed = (old_src, old_dst)
-                != (road.interface_from(road.src), road.interface_from(road.dst));
+            let changed =
+                old_interfaces != (road.interface_from(road.src), road.interface_from(road.dst));
             if changed || direct.contains(&road_id) {
                 self.subscribers.dispatch(UpdateType::Road, road);
                 road.update_lanes(&mut self.lanes, &mut self.parking, &self.environment);

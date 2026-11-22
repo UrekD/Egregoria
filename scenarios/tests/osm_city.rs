@@ -288,3 +288,69 @@ fn osm_wood_multipolygon_respects_holes() {
     assert!(city.forests[0].contains(LESCE_BOUNDS.project(46.3585, 14.157)));
     assert!(!city.forests[0].contains(LESCE_BOUNDS.project(46.3585, 14.155)));
 }
+
+#[test]
+fn osm_bounds_overlapping_amenity_polygon_matches() {
+    let mut input: serde_json::Value = serde_json::from_slice(FIXTURE).unwrap();
+    let elements = input["elements"].as_array_mut().unwrap();
+    // The points are inside each triangular footprint's bounds, across its diagonal.
+    for id in 100..112 {
+        let mut geometry: Vec<_> = (0..5000)
+            .map(|i| serde_json::json!({"lat":46.35 + i as f64 * 0.000001, "lon":14.14}))
+            .collect();
+        geometry.push(serde_json::json!({"lat":46.35, "lon":14.145}));
+        geometry.push(geometry[0].clone());
+        let mut nodes: Vec<_> = (0..geometry.len() - 1).map(|i| id * 10_000 + i).collect();
+        nodes.push(nodes[0]);
+        elements.push(serde_json::json!({
+            "type":"way", "id":id, "nodes":nodes, "geometry":geometry,
+            "tags":{"amenity":"school"}
+        }));
+    }
+    for id in 10_000..11_000 {
+        elements.push(serde_json::json!({
+            "type":"node", "id":id, "lat":46.354, "lon":14.144,
+            "tags":{"amenity":"school"}
+        }));
+    }
+    let bytes = serde_json::to_vec(&input).unwrap();
+    let error = normalize(read_overpass(bytes.as_slice()).unwrap(), LESCE_BOUNDS)
+        .err()
+        .expect("overlapping amenity matches must exceed the geometry work limit");
+    assert!(error.to_string().contains("amenity polygon matching"));
+}
+
+#[test]
+fn osm_does_not_infer_homes_from_buildings_tagged_as_accessories() {
+    let mut input: serde_json::Value = serde_json::from_slice(FIXTURE).unwrap();
+    let elements = input["elements"].as_array_mut().unwrap();
+    for (id, tags) in [
+        (101, serde_json::json!({"building":"yes"})),
+        (
+            102,
+            serde_json::json!({"building":"yes", "building:use":"garage"}),
+        ),
+        (
+            103,
+            serde_json::json!({"building":"yes", "building:part":"shed"}),
+        ),
+        (104, serde_json::json!({"building":"shed"})),
+    ] {
+        elements.push(serde_json::json!({
+            "type":"way","id":id,"nodes":[id * 10, id * 10 + 1, id * 10 + 2, id * 10],
+            "tags":tags,
+            "geometry":[{"lat":46.35,"lon":14.14},{"lat":46.351,"lon":14.14},
+                        {"lat":46.35,"lon":14.141},{"lat":46.35,"lon":14.14}]
+        }));
+    }
+    let bytes = serde_json::to_vec(&input).unwrap();
+    let city = normalize(read_overpass(bytes.as_slice()).unwrap(), LESCE_BOUNDS).unwrap();
+    assert_eq!(
+        city.features
+            .iter()
+            .filter(|feature| feature.inferred_house)
+            .map(|feature| feature.source.as_str())
+            .collect::<Vec<_>>(),
+        ["way/101"]
+    );
+}

@@ -1,6 +1,6 @@
-use super::lesce::{Facilities, STATION};
-use super::normalize::{ring_center, ring_contains};
-use super::spatial::{point_bounds, points_bounds, BoundsIndex};
+use super::lesce::{Facilities, STATION, TARGET_OPENING_BEDS};
+use super::normalize::{ring_area, ring_center};
+use super::spatial::{point_bounds, points_bounds, BoundsIndex, PolygonWork};
 use super::{Feature, ImportReport, LinkClass, NormalizedCity, LESCE_BOUNDS};
 use geom::{Intersect, Polygon, Shape, Vec2, AABB, OBB};
 use prototypes::{try_prototype, GrowableCompanyID, GrowableCompanyPrototype};
@@ -13,11 +13,8 @@ use simulation::souls::{growth, human::spawn_human, residence::Residences};
 use simulation::Simulation;
 use std::collections::BTreeMap;
 
-const MAX_POLYGON_SAMPLE_VERTICES: usize = 50_000_000;
-
-fn vertices(outers: &[Vec<Vec2>], holes: &[Vec<Vec2>]) -> usize {
-    outers.iter().chain(holes).map(Vec::len).sum()
-}
+const MIN_INFERRED_HOME_AREA_M2: f32 = 68.0;
+const MAX_INFERRED_HOME_SHARE_PCT: usize = 15;
 
 pub(super) fn zone_and_seed(
     sim: &mut Simulation,
@@ -143,32 +140,43 @@ pub(super) fn zone_and_seed(
             .sum::<usize>()
     };
     let mut inferred = 0;
-    for feature in city
+    let max_inferred =
+        seeded_homes.len() * MAX_INFERRED_HOME_SHARE_PCT / (100 - MAX_INFERRED_HOME_SHARE_PCT);
+    let bounds = LESCE_BOUNDS.limits_aabb();
+    let mut work = PolygonWork::new("inferred home and residential landuse matching");
+    'inference: for feature in city
         .features
         .iter()
         .filter(|feature| feature.inferred_house)
     {
-        if beds >= 2900 {
-            break;
-        }
         for ring in &feature.outers {
-            let position = ring_center(ring);
-            let bounds = points_bounds(ring.iter().copied());
-            if bounds.w() * bounds.h() < 68.0
-                || !LESCE_BOUNDS.limits_aabb().contains(position)
-                || !features.query(point_bounds(position)).any(|(_, area)| {
-                    !area.building && area.kind == ZoneKind::Residential && area.contains(position)
-                })
-            {
+            if beds >= TARGET_OPENING_BEDS || inferred >= max_inferred {
+                break 'inference;
+            }
+            if footprint_area(ring, &feature.holes, &mut work)? < MIN_INFERRED_HOME_AREA_M2 {
                 continue;
             }
-            if let Some((id, shape)) =
-                mapped_home(sim, facilities.plant, Density::Low, ring, position)
-            {
-                beds += sim.read::<Residences>().by_building[&id].capacity as usize;
-                seeded_homes.push(id);
-                paint(sim, shape, ZoneKind::Residential, Density::Low);
-                inferred += 1;
+            work.charge(ring.len() * 2)?;
+            let position = ring_center(ring);
+            if !bounds.contains(position) {
+                continue;
+            }
+            for &(_, area) in features.query(point_bounds(position)) {
+                work.charge(1)?;
+                if !area.building
+                    && area.kind == ZoneKind::Residential
+                    && work.contains(&area.outers, &area.holes, position)?
+                {
+                    if let Some((id, shape)) =
+                        mapped_home(sim, facilities.plant, Density::Low, ring, position)
+                    {
+                        beds += sim.read::<Residences>().by_building[&id].capacity as usize;
+                        seeded_homes.push(id);
+                        paint(sim, shape, ZoneKind::Residential, Density::Low);
+                        inferred += 1;
+                    }
+                    break;
+                }
             }
         }
     }
@@ -184,7 +192,7 @@ pub(super) fn zone_and_seed(
     let mut landuse_homes = 0;
     mapped_residential_lots.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
     for (_, lot) in mapped_residential_lots {
-        if beds >= 2900 {
+        if beds >= TARGET_OPENING_BEDS {
             break;
         }
         if let Some(id) = sim.seed_imported_growable(lot, BuildingKind::House, Density::Low) {
@@ -220,11 +228,30 @@ pub(super) fn zone_and_seed(
         &features,
         (population * 108 / 100).saturating_sub(mapped_jobs),
         report,
-    );
+    )?;
     report
         .feature_counts
         .insert("seeded_zone_jobs".into(), mapped_jobs + synthetic_jobs);
     Ok(())
+}
+
+fn footprint_area(
+    outer: &[Vec2],
+    holes: &[Vec<Vec2>],
+    work: &mut PolygonWork,
+) -> Result<f32, String> {
+    work.charge(outer.len())?;
+    let mut area = ring_area(outer).abs();
+    for hole in holes {
+        if area < MIN_INFERRED_HOME_AREA_M2 {
+            break;
+        }
+        if work.ring_contains(outer, hole[0])? {
+            work.charge(hole.len())?;
+            area -= ring_area(hole).abs();
+        }
+    }
+    Ok(area)
 }
 
 fn feature_index(features: &[Feature]) -> BoundsIndex<(usize, &Feature)> {
@@ -245,7 +272,7 @@ fn mapped_lots<'a>(
     let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
     let mut grid = ZoneGrid::default();
     let mut plans = BTreeMap::new();
-    let mut work = 0;
+    let mut work = PolygonWork::new("lot and polygon matching");
     for lot in map.lots().values() {
         if map.electricity.net_id(lot.parent) != net
             || map
@@ -259,26 +286,26 @@ fn mapped_lots<'a>(
         grid.paint(lot.shape, Some(ZoneKind::Residential), Density::Low);
         let mut best = None;
         for &(index, feature) in features.query(lot.shape.bbox()) {
+            work.charge(1)?;
             if feature.inferred_house {
                 continue;
             }
-            work += (grid.cells.len() + 2) * vertices(&feature.outers, &feature.holes);
-            if work > MAX_POLYGON_SAMPLE_VERTICES {
-                return Err("OSM lot and polygon matching exceeded the geometry work limit".into());
+            let mut samples = 0;
+            for &(x, y) in grid.cells.keys() {
+                let p = (geom::vec2(x as f32, y as f32) + Vec2::splat(0.5)) * ZONE_CELL_SIZE;
+                samples += usize::from(work.contains(&feature.outers, &feature.holes, p)?);
             }
-            let samples = grid
-                .cells
-                .keys()
-                .filter(|&&(x, y)| {
-                    let p = (geom::vec2(x as f32, y as f32) + Vec2::splat(0.5)) * ZONE_CELL_SIZE;
-                    feature.contains(p)
-                })
-                .count();
-            let center = feature.building
-                && feature.outers.iter().any(|ring| {
+            let mut center = false;
+            if feature.building {
+                for ring in &feature.outers {
+                    work.charge(ring.len() * 2)?;
                     let p = ring_center(ring);
-                    lot.shape.contains(p) && feature.contains(p)
-                });
+                    if lot.shape.contains(p) && work.contains(&feature.outers, &feature.holes, p)? {
+                        center = true;
+                        break;
+                    }
+                }
+            }
             let score = samples * 2 + usize::from(center) * 3;
             let key = (feature.building, score, std::cmp::Reverse(index));
             if score > 0 && best.is_none_or(|(previous, _)| key > previous) {
@@ -408,7 +435,7 @@ fn seed_synthetic_jobs(
     features: &BoundsIndex<(usize, &Feature)>,
     target: usize,
     report: &mut ImportReport,
-) -> usize {
+) -> Result<usize, String> {
     let candidates = {
         let map = sim.map();
         let net = map.electricity.net_id(plant);
@@ -434,28 +461,32 @@ fn seed_synthetic_jobs(
                 }),
         );
         let grid = sim.read::<ZoneGrid>();
-        let mut candidates: Vec<_> = map
-            .lots()
-            .values()
-            .filter_map(|lot| {
-                let p = lot.shape.center();
-                let town = p.distance(STATION);
-                if town > 2000.0
-                    || map.electricity.net_id(lot.parent) != net
-                    || grid.lot_zone(&lot.shape).is_some()
-                    || features
-                        .query(point_bounds(p))
-                        .any(|(_, f)| f.holes.iter().any(|ring| ring_contains(ring, p)))
-                {
-                    return None;
+        let mut candidates = Vec::new();
+        let mut work = PolygonWork::new("synthetic job site and polygon hole matching");
+        'lots: for lot in map.lots().values() {
+            let p = lot.shape.center();
+            let town = p.distance(STATION);
+            if town > 2000.0
+                || map.electricity.net_id(lot.parent) != net
+                || grid.lot_zone(&lot.shape).is_some()
+            {
+                continue;
+            }
+            for &(_, feature) in features.query(point_bounds(p)) {
+                work.charge(1)?;
+                if work.any_ring_contains(&feature.holes, p)? {
+                    continue 'lots;
                 }
-                let distance = arterials
-                    .query(AABB::centered(p, Vec2::splat(320.0)))
-                    .map(|line| line.project(p).distance(p))
-                    .min_by(f32::total_cmp)?;
-                (distance <= 160.0).then_some((distance * 2.0 + town, lot.id))
-            })
-            .collect();
+            }
+            if let Some(distance) = arterials
+                .query(AABB::centered(p, Vec2::splat(320.0)))
+                .map(|line| line.project(p).distance(p))
+                .min_by(f32::total_cmp)
+                .filter(|&distance| distance <= 160.0)
+            {
+                candidates.push((distance * 2.0 + town, lot.id));
+            }
+        }
         candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         candidates
     };
@@ -486,36 +517,66 @@ fn seed_synthetic_jobs(
             "{sites} {kind:?} sites near arterials, {jobs} job positions"
         ));
     }
-    total
+    Ok(total)
 }
 
-pub(super) fn filter_vegetation(sim: &mut Simulation, city: &NormalizedCity) -> Result<(), String> {
+pub(super) fn filter_vegetation(sim: &Simulation, city: &NormalizedCity) -> Result<(), String> {
     let bounds = LESCE_BOUNDS.limits_aabb();
     let woods = BoundsIndex::new(city.forests.iter().map(|forest| (forest.bounds(), forest)));
     let built = feature_index(&city.features);
     let grid = sim.read::<ZoneGrid>();
-    let mut work = 0;
-    sim.write::<Map>().environment.retain_imported_trees(|p| {
+    let mut work = PolygonWork::new("woodland and vegetation matching");
+    sim.filter_imported_trees(|p| {
         if !bounds.contains(p) {
-            return true;
+            return Ok(true);
         }
         let cell = |coordinate: f32| (coordinate / ZONE_CELL_SIZE).floor() as i32;
-        if grid.cells.contains_key(&(cell(p.x), cell(p.y))) || work > MAX_POLYGON_SAMPLE_VERTICES {
-            return false;
+        if grid.cells.contains_key(&(cell(p.x), cell(p.y))) {
+            return Ok(false);
         }
-        let mut test = |outers: &[Vec<Vec2>], holes: &[Vec<Vec2>]| {
-            work += vertices(outers, holes);
-            work <= MAX_POLYGON_SAMPLE_VERTICES
-        };
-        !built
-            .query(point_bounds(p))
-            .any(|(_, feature)| test(&feature.outers, &feature.holes) && feature.contains(p))
-            && woods
-                .query(point_bounds(p))
-                .any(|forest| test(&forest.outers, &forest.holes) && forest.contains(p))
-    });
-    if work > MAX_POLYGON_SAMPLE_VERTICES {
-        return Err("OSM woodland and vegetation matching exceeded the geometry work limit".into());
+        for &(_, feature) in built.query(point_bounds(p)) {
+            if work.contains(&feature.outers, &feature.holes, p)? {
+                return Ok(false);
+            }
+        }
+        for forest in woods.query(point_bounds(p)) {
+            if work.contains(&forest.outers, &forest.holes, p)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geom::vec2;
+
+    #[test]
+    fn osm_inferred_home_area_uses_the_footprint_and_excludes_courtyards() {
+        let mut work = PolygonWork::new("test footprint");
+        let origin = Vec2::ZERO;
+        let triangle = [origin, vec2(10.0, 0.0), vec2(0.0, 10.0), origin];
+        assert!(footprint_area(&triangle, &[], &mut work).unwrap() < MIN_INFERRED_HOME_AREA_M2);
+
+        let square = [
+            origin,
+            vec2(10.0, 0.0),
+            vec2(10.0, 10.0),
+            vec2(0.0, 10.0),
+            origin,
+        ];
+        let courtyard = vec![
+            vec2(2.0, 2.0),
+            vec2(8.0, 2.0),
+            vec2(8.0, 8.0),
+            vec2(2.0, 8.0),
+            vec2(2.0, 2.0),
+        ];
+        assert_eq!(
+            footprint_area(&square, &[courtyard], &mut work).unwrap(),
+            64.0
+        );
     }
-    Ok(())
 }

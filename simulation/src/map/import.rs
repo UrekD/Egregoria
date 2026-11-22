@@ -1,4 +1,5 @@
 //! Transient, source-independent network import contracts.
+use crate::economy::{Budget, BudgetCategory, Government};
 use crate::init::INIT_FUNCS;
 use crate::map::{
     BuildingID, BuildingKind, Density, IntersectionID, LaneKind, LanePattern, Lot, LotID, Map,
@@ -9,7 +10,7 @@ use crate::souls::{growth, residence};
 use crate::world_command::WorldCommand;
 use crate::{NewGameOptions, Simulation, SimulationOptions};
 use geom::{Vec2, Vec3, OBB};
-use prototypes::BuildingGen;
+use prototypes::{BuildingGen, Money};
 use std::collections::BTreeMap;
 use std::ptr::addr_of;
 
@@ -90,6 +91,45 @@ impl Simulation {
 }
 
 impl Simulation {
+    /// Set the handoff treasury after commissioning and post the adjustment to the ledger.
+    pub fn fund_imported_opening(&self, balance: Money) -> Result<(), &'static str> {
+        if !self.map().import_lane_reserve {
+            return Err("opening funding requires an imported map");
+        }
+        let current = self.read::<Government>().money;
+        let delta = balance
+            .inner()
+            .checked_sub(current.inner())
+            .ok_or("opening funding exceeds the supported money range")?;
+        Budget::apply(
+            &self.resources,
+            BudgetCategory::StarterInfrastructure,
+            Money::new_inner(delta),
+        );
+        Ok(())
+    }
+
+    /// Filter the generated trees during import setup, before the map is displayed.
+    pub fn filter_imported_trees<E>(
+        &self,
+        mut retain: impl FnMut(Vec2) -> Result<bool, E>,
+    ) -> Result<(), E> {
+        let mut error = None;
+        self.map_mut().environment.retain_imported_trees(|pos| {
+            if error.is_some() {
+                return true;
+            }
+            match retain(pos) {
+                Ok(keep) => keep,
+                Err(e) => {
+                    error = Some(e);
+                    true
+                }
+            }
+        });
+        error.map_or(Ok(()), Err)
+    }
+
     /// Seed a growable on an existing imported frontage lot without waiting for demand.
     pub fn seed_imported_growable(
         &mut self,
@@ -303,6 +343,141 @@ mod tests {
     use crate::tests::TestCtx;
     use crate::{MapPreset, NewGameOptions, Simulation};
     use geom::vec2;
+
+    #[test]
+    fn osm_ordinary_junction_edits_continue_after_reload() {
+        assert_junction_edit_continuation(false, 28.0);
+    }
+
+    #[test]
+    fn osm_imported_junction_edits_continue_after_reload_without_binding_links() {
+        assert_junction_edit_continuation(true, 28.5);
+    }
+
+    fn assert_junction_edit_continuation(imported: bool, length: f32) {
+        let _ctx = TestCtx::new();
+        let options = NewGameOptions {
+            preset: MapPreset::Flat,
+            terrain_chunks: 16,
+            ..Default::default()
+        };
+        let a = vec2(500.0, 500.0);
+        let b = a + vec2(length, 0.0);
+        let pattern = LanePatternBuilder::default()
+            .parking(false)
+            .sidewalks(false)
+            .build();
+        let (mut sim, road) = if imported {
+            let city = ImportedCity {
+                junctions: [a, b]
+                    .into_iter()
+                    .enumerate()
+                    .map(|(id, position)| ImportedJunction {
+                        id,
+                        position,
+                        roundabout_radius: None,
+                    })
+                    .collect(),
+                links: vec![ImportedLink {
+                    source_way_ids: vec![],
+                    from: 0,
+                    to: 1,
+                    points: vec![a, b],
+                    pattern: pattern.clone(),
+                    frontage: false,
+                }],
+                boundary_stubs: vec![],
+            };
+            let (sim, network) = Simulation::from_imported_city(&city, &options).unwrap();
+            (sim, network.roads[&0])
+        } else {
+            let mut sim = Simulation {
+                world: Default::default(),
+                resources: Default::default(),
+            };
+            unsafe {
+                for system in &*addr_of!(INIT_FUNCS) {
+                    (system.f)(&mut sim);
+                }
+            }
+            WorldCommand::bootstrap_import(
+                &mut sim,
+                SimulationOptions {
+                    preset: options.preset,
+                    terrain_size: options.terrain_chunks,
+                    save_replay: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let road = {
+                let mut map = sim.map_mut();
+                let ground = map.environment.height(a).unwrap();
+                let long_start = map.add_intersection(vec2(500.0, 800.0).z(ground));
+                let long_end = map.add_intersection(vec2(600.0, 800.0).z(ground));
+                map.connect(long_start, long_end, &pattern, RoadSegmentKind::Straight)
+                    .unwrap();
+                map.update_intersection(long_start, |junction| {
+                    junction.turn_policy.back_turns = true;
+                });
+                let src = map.add_intersection(a.z(ground));
+                let dst = map.add_intersection(b.z(ground));
+                let points = [a, b].map(|p| p.z(ground + ROAD_Z_OFFSET));
+                map.connect(
+                    src,
+                    dst,
+                    &pattern,
+                    RoadSegmentKind::Arbitrary(points.to_vec().into()),
+                )
+                .unwrap()
+            };
+            (sim, road)
+        };
+        let junction = sim.map().roads()[road].src;
+        let edit_policy = |sim: &mut Simulation| {
+            let (mut turn, light) = {
+                let map = sim.map();
+                let inter = &map.intersections()[junction];
+                (inter.turn_policy, inter.light_policy)
+            };
+            turn.back_turns = !turn.back_turns;
+            sim.apply_commands([&WorldCommand::MapUpdateIntersectionPolicy {
+                inter: junction,
+                turn,
+                light,
+            }]);
+        };
+        let length_after = |sim: &Simulation| sim.map().roads()[road].interfaced_points().length();
+        edit_policy(&mut sim);
+        assert!((length_after(&sim) - (length - 18.0)).abs() < 0.01);
+
+        let root = std::env::temp_dir().join(format!(
+            "egr-osm-continuation-{}-{imported}",
+            std::process::id()
+        ));
+        let id = crate::SlotId::new("continuation").unwrap();
+        sim.save_to_slot(&root, &id, crate::SnapshotRevision::new(1))
+            .unwrap();
+        let mut loaded = Simulation::load_from_slot(&root, &id).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(length_after(&sim), length_after(&loaded));
+        for sim in [&mut sim, &mut loaded] {
+            {
+                let mut map = sim.map_mut();
+                let pos = a + vec2(75.0, 30.0);
+                let ground = map.environment.height(pos).unwrap();
+                let spur = map.add_intersection(pos.z(ground));
+                map.connect(junction, spur, &pattern, RoadSegmentKind::Straight)
+                    .unwrap();
+            }
+            edit_policy(sim);
+        }
+        let continuous = length_after(&sim);
+        let resumed = length_after(&loaded);
+        assert_eq!(continuous, resumed, "interfaced lane length");
+        assert_eq!(continuous >= 9.99, imported);
+        assert_eq!(sim.hashes(), loaded.hashes());
+    }
 
     #[test]
     fn osm_import_retains_short_link_geometry_after_reload_and_policy_edit() {

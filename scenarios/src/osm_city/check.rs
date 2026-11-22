@@ -1,4 +1,4 @@
-use super::lesce::Facilities;
+use super::lesce::{Facilities, OPENING_POPULATION};
 use super::{CitySample, HeadlessReport};
 use crate::ScenarioCtx;
 use prototypes::TICKS_PER_HOUR;
@@ -10,14 +10,22 @@ use simulation::Simulation;
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+const HOURS_PER_DAY: u64 = prototypes::HOURS_PER_DAY as u64;
+const CHECK_HOURS: u64 = 3 * HOURS_PER_DAY;
+const SAMPLE_HOURS: u64 = 4;
+const MAX_UNEMPLOYMENT_PCT: f64 = 25.0;
+const MIN_POPULATION_GROWTH_PCT: usize = 1;
+const MIN_PEAK_POPULATION_RETENTION_PCT: usize = 97;
+const MIN_PEAK_HOME_RETENTION_PCT: usize = 95;
+
 pub(super) fn warm_opening(
     ctx: &mut ScenarioCtx,
     facilities: &Facilities,
 ) -> Result<CitySample, String> {
     let population = ctx.sim.world().humans.len();
-    if !(2500..=3500).contains(&population) {
+    if !OPENING_POPULATION.contains(&population) {
         return Err(format!(
-            "mapped homes produced {population} residents; expected 2,500–3,500"
+            "mapped homes produced {population} residents; expected {OPENING_POPULATION:?}"
         ));
     }
     for _ in 0..80 {
@@ -25,7 +33,7 @@ pub(super) fn warm_opening(
         let sample = city_sample(&ctx.sim, 0, facilities);
         if sample.unserved_buildings == 0
             && staffing_ready(&ctx.sim, facilities, &sample)
-            && sample.unemployment_pct < 25.0
+            && sample.unemployment_pct < MAX_UNEMPLOYMENT_PCT
         {
             return Ok(sample);
         }
@@ -123,7 +131,8 @@ pub(super) fn validate_opening(
     let opening = city_sample(sim, 0, facilities);
     if opening.unserved_buildings != 0
         || !staffing_ready(sim, facilities, &opening)
-        || !(2500..=3500).contains(&opening.population)
+        || opening.unemployment_pct >= MAX_UNEMPLOYMENT_PCT
+        || !OPENING_POPULATION.contains(&opening.population)
     {
         return Err(format!(
             "reloaded opening lost population, utility service or staffing: {opening:?}"
@@ -140,77 +149,84 @@ pub(super) fn check_days(
     let opening = validate_opening(&ctx.sim, &facilities)?;
     let mut samples = vec![opening];
     let mut money_per_day_cents = Vec::new();
-    let mut freight_departed = false;
     let mut freight_completed = false;
-    let get_freight = |sim: &Simulation| {
-        sim.world()
-            .freight_stations
-            .values()
-            .find(|station| station.f.building == facilities.terminal)
-            .map(|station| {
-                (
-                    station
-                        .f
-                        .trains
-                        .iter()
-                        .any(|(_, state)| matches!(state, FreightTrainState::Moving)),
-                    station.f.trains.is_empty(),
-                )
-            })
-            .ok_or("freight station soul was lost")
-    };
-    ctx.sim
-        .world_mut_unchecked()
+    let mut freight = FreightRoundTrip::default();
+    let station = ctx
+        .sim
+        .world()
         .freight_stations
-        .values_mut()
-        .find(|station| station.f.building == facilities.terminal)
-        .ok_or("reloaded slot has no freight station soul")?
+        .iter()
+        .find_map(|(id, station)| (station.f.building == facilities.terminal).then_some(id))
+        .ok_or("reloaded slot has no freight station soul")?;
+    let train = ctx
+        .sim
+        .world()
+        .trains
+        .keys()
+        .next()
+        .ok_or("reloaded slot has no freight train")?;
+    ctx.sim.world_mut_unchecked().freight_stations[station]
         .f
         .waiting_cargo = 100;
 
-    let ticks = 72 * TICKS_PER_HOUR;
+    let ticks = CHECK_HOURS * TICKS_PER_HOUR;
     let start = Instant::now();
     eprintln!("Checking three game days ({ticks} ticks) from the reloaded slot");
-    for hour in 1..=72 {
-        if freight_completed {
-            ctx.run_ticks(TICKS_PER_HOUR);
-        } else {
-            for _ in 0..(TICKS_PER_HOUR / 300) {
-                ctx.run_ticks(300);
-                let (moving, empty) = get_freight(&ctx.sim)?;
-                freight_departed |= moving;
-                freight_completed |= freight_departed && empty;
+    for hour in 1..=CHECK_HOURS {
+        let mut remaining = TICKS_PER_HOUR;
+        while !freight_completed && remaining > 0 {
+            ctx.run_ticks(1);
+            remaining -= 1;
+            let world = ctx.sim.world();
+            let terminal = world
+                .freight_stations
+                .get(station)
+                .ok_or("freight station soul was lost")?;
+            if !world.trains.contains_key(train) {
+                return Err("freight train was lost before completing its round trip".into());
+            }
+            let state = terminal
+                .f
+                .trains
+                .iter()
+                .find_map(|&(id, state)| (id == train).then_some(state));
+            freight_completed = freight.observe(state);
+            if freight_completed {
+                let elapsed = hour * TICKS_PER_HOUR - remaining;
+                eprintln!("Headless freight round trip completed after {elapsed} ticks");
             }
         }
-        if hour % 4 == 0 {
+        ctx.run_ticks(remaining);
+        if hour % SAMPLE_HOURS == 0 {
             let sample = city_sample(&ctx.sim, hour, &facilities);
             eprintln!(
-                "Headless hour {hour}: {} residents, {:.1}% unemployment, ${:.2}, {} unserved, water {:.0}/{:.0}, {:.0} ticks/s",
-                sample.population, sample.unemployment_pct, sample.money_cents as f64 / 100.0,
+                "Headless hour {hour}: {} residents, {} homes, {:.1}% unemployment, ${:.2}, {} unserved, water {:.0}/{:.0}, {:.0} ticks/s",
+                sample.population, sample.homes, sample.unemployment_pct, sample.money_cents as f64 / 100.0,
                 sample.unserved_buildings,
                 sample.water_demand,
                 sample.water_production,
                 (hour * TICKS_PER_HOUR) as f64 / start.elapsed().as_secs_f64(),
             );
-            if sample.unserved_buildings != 0 || (hour == 24 && sample.unemployment_pct >= 25.0) {
+            if sample.unserved_buildings != 0
+                || (hour == HOURS_PER_DAY && sample.unemployment_pct >= MAX_UNEMPLOYMENT_PCT)
+            {
                 return Err(format!(
                     "employment or utility gate failed at hour {hour}: {sample:?}"
                 ));
             }
-            if hour % 24 == 0 {
-                money_per_day_cents
-                    .push(sample.money_cents - samples[samples.len() - 6].money_cents);
+            if hour % HOURS_PER_DAY == 0 {
+                let previous_day = samples.len() - (HOURS_PER_DAY / SAMPLE_HOURS) as usize;
+                money_per_day_cents.push(sample.money_cents - samples[previous_day].money_cents);
             }
             samples.push(sample);
         }
     }
 
-    let last = &samples[samples.len() - 1];
-    if last.unserved_buildings > 0 || !freight_completed {
-        return Err(format!(
-            "three-day gate failed | day 3: {last:?}; freight completed: {freight_completed}"
-        ));
+    if !freight_completed {
+        return Err("three-day gate failed: freight round trip did not complete".into());
     }
+    validate_growth(&samples)?;
+    let last = samples.last().unwrap();
     let mut developed = BTreeMap::from([("residential".to_owned(), last.homes)]);
     for building in ctx.sim.map().buildings().values() {
         if let Some(company) = building
@@ -233,4 +249,66 @@ pub(super) fn check_days(
         below_perf_baseline: ticks_per_second < crate::builtin::perf::MIN_TICKS_PER_SEC,
         freight_completed,
     })
+}
+
+#[derive(Default)]
+struct FreightRoundTrip {
+    loaded: bool,
+    departed: bool,
+}
+
+impl FreightRoundTrip {
+    fn observe(&mut self, state: Option<FreightTrainState>) -> bool {
+        use FreightTrainState::{Arriving, Loading, Moving};
+
+        if self.departed {
+            // The station can assign the same train to its next inbound leg on the
+            // tick it finishes the outbound leg.
+            return matches!(state, None | Some(Arriving));
+        }
+        match state {
+            Some(Loading) => self.loaded = true,
+            Some(Moving) => self.departed = self.loaded,
+            _ => {}
+        }
+        false
+    }
+}
+
+fn validate_growth(samples: &[CitySample]) -> Result<(), String> {
+    let opening = &samples[0];
+    let last = samples.last().unwrap();
+    let peak_population = samples
+        .iter()
+        .map(|sample| sample.population)
+        .max()
+        .unwrap();
+    let peak_homes = samples.iter().map(|sample| sample.homes).max().unwrap();
+    if last.population * 100 < opening.population * (100 + MIN_POPULATION_GROWTH_PCT)
+        || last.population * 100 < peak_population * MIN_PEAK_POPULATION_RETENTION_PCT
+        || last.homes * 100 < peak_homes * MIN_PEAK_HOME_RETENTION_PCT
+    {
+        return Err(format!(
+            "three-day growth gate failed: population {} opening, {peak_population} peak, {} final; homes {} opening, {peak_homes} peak, {} final",
+            opening.population, last.population, opening.homes, last.homes,
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use FreightTrainState::{Arriving, Loading, Moving};
+
+    #[test]
+    fn osm_freight_round_trip_can_finish_with_an_immediate_redispatch() {
+        let mut freight = FreightRoundTrip::default();
+        // The train was already outbound when the city opened.
+        assert!(!freight.observe(Some(Moving)));
+        assert!(!freight.observe(Some(Arriving)));
+        assert!(!freight.observe(Some(Loading)));
+        assert!(!freight.observe(Some(Moving)));
+        assert!(freight.observe(Some(Arriving)));
+    }
 }

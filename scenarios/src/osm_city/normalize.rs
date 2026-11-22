@@ -1,5 +1,5 @@
 use super::source::{Coordinate, Element, ElementKind, OverpassExtract};
-use super::spatial::{point_bounds, points_bounds, BoundsIndex};
+use super::spatial::{point_bounds, points_bounds, ring_contains, BoundsIndex, PolygonWork};
 use super::ImportError;
 use geom::{vec2, Vec2, AABB};
 use serde::Serialize;
@@ -346,7 +346,7 @@ pub fn normalize(
     if normalized.city.links.is_empty() {
         return Err("no usable road or rail links inside the bounds".into());
     }
-    collect_features(&extract.elements, bounds, &mut normalized);
+    collect_features(&extract.elements, bounds, &mut normalized)?;
     Ok(normalized)
 }
 
@@ -836,7 +836,11 @@ fn ordered_coordinate(value: f64) -> u64 {
 
 type Rings = (Vec<Vec<Vec2>>, Vec<Vec<Vec2>>);
 
-fn collect_features(elements: &[Element], bounds: GeoBounds, city: &mut NormalizedCity) {
+fn collect_features(
+    elements: &[Element],
+    bounds: GeoBounds,
+    city: &mut NormalizedCity,
+) -> Result<(), String> {
     let mut members = BTreeSet::new();
     let mut forest_members = BTreeSet::new();
     let mut area_sites = Vec::new();
@@ -899,8 +903,10 @@ fn collect_features(elements: &[Element], bounds: GeoBounds, city: &mut Normaliz
         if let Some(kind) = site_kind {
             let largest = outers
                 .iter()
-                .max_by(|a, b| ring_area(a).abs().total_cmp(&ring_area(b).abs()))
-                .unwrap();
+                .map(|ring| (ring_area(ring).abs(), ring))
+                .max_by(|a, b| a.0.total_cmp(&b.0))
+                .unwrap()
+                .1;
             let center = ring_center(largest);
             if bounds.contains(center) {
                 area_sites.push((
@@ -958,26 +964,25 @@ fn collect_features(elements: &[Element], bounds: GeoBounds, city: &mut Normaliz
     }
     city.features.sort_by(|a, b| a.source.cmp(&b.source));
     city.forests.sort_by(|a, b| a.source.cmp(&b.source));
-    let site_index = BoundsIndex::new(
-        area_sites
-            .iter()
-            .map(|entry| (points_bounds(entry.1.iter().flatten().copied()), entry)),
-    );
-    for site in point_sites {
-        if !site_index.query(point_bounds(site.position)).any(
-            |&(ref area, ref outer, ref holes)| {
-                area.kind == site.kind
-                    && outer.iter().any(|ring| ring_contains(ring, site.position))
-                    && !holes.iter().any(|ring| ring_contains(ring, site.position))
-            },
-        ) {
-            city.sites.push(site);
+    let site_index = BoundsIndex::new(area_sites.iter().map(|entry| {
+        let bounds = points_bounds(entry.1.iter().flatten().copied());
+        (bounds, entry)
+    }));
+    let mut work = PolygonWork::new("amenity polygon matching");
+    'points: for site in point_sites {
+        for (area, outer, holes) in site_index.query(point_bounds(site.position)).copied() {
+            work.charge(1)?;
+            if area.kind == site.kind && work.contains(outer, holes, site.position)? {
+                continue 'points;
+            }
         }
+        city.sites.push(site);
     }
     drop(site_index);
     city.sites
         .extend(area_sites.into_iter().map(|(site, _, _)| site));
     city.sites.sort_by(|a, b| a.source.cmp(&b.source));
+    Ok(())
 }
 
 fn make_site(element: &Element, kind: &'static str, position: Vec2) -> Site {
@@ -1018,10 +1023,32 @@ fn zone_class(element: &Element) -> Option<(ZoneKind, Density, bool, bool)> {
         }
         _ if !element.tag("office").is_empty() => (Office, Density::Low, false),
         _ if !element.tag("shop").is_empty() => (Commercial, Density::Low, false),
-        "yes" => (Residential, Density::Low, true),
+        "yes" if can_infer_home(element) => (Residential, Density::Low, true),
         _ => return None,
     };
     Some((kind, density, true, house))
+}
+
+fn can_infer_home(element: &Element) -> bool {
+    matches!(
+        element.tag("building:use"),
+        "" | "residential" | "house" | "apartments"
+    ) && matches!(element.tag("building:part"), "" | "no")
+        && [
+            "amenity",
+            "craft",
+            "emergency",
+            "garage",
+            "industrial",
+            "leisure",
+            "man_made",
+            "power",
+            "public_transport",
+            "shed",
+            "tourism",
+        ]
+        .into_iter()
+        .all(|key| matches!(element.tag(key), "" | "no"))
 }
 
 fn rings(element: &Element, bounds: GeoBounds) -> Option<Rings> {
@@ -1091,20 +1118,7 @@ fn rings(element: &Element, bounds: GeoBounds) -> Option<Rings> {
     }
 }
 
-pub(super) fn ring_contains(ring: &[Vec2], point: Vec2) -> bool {
-    let mut inside = false;
-    for pair in ring.windows(2) {
-        let [a, b] = [pair[0], pair[1]];
-        if (a.y > point.y) != (b.y > point.y)
-            && point.x < a.x + (b.x - a.x) * (point.y - a.y) / (b.y - a.y)
-        {
-            inside = !inside;
-        }
-    }
-    inside
-}
-
-fn ring_area(ring: &[Vec2]) -> f32 {
+pub(super) fn ring_area(ring: &[Vec2]) -> f32 {
     let origin = ring[0];
     ring.windows(2)
         .map(|pair| (pair[0] - origin).perp_dot(pair[1] - origin))

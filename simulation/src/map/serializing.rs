@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 
 use geom::Vec2;
 use serde::{Deserialize, Serialize};
+use slotmapd::Key;
 
 use crate::map::{
     BuildingID, Buildings, ElectricityCache, Environment, Intersections, Lanes, LotOrigin, Lots,
@@ -9,9 +10,17 @@ use crate::map::{
 };
 
 #[derive(Serialize, Deserialize)]
-struct MapWithLotOrigins {
-    map: SerializedMap,
+struct MapWithLotOrigins<T> {
+    map: T,
     lot_origins: BTreeMap<BuildingID, LotOrigin>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ReadableMap {
+    #[serde(flatten)]
+    map: SerializedMap,
+    #[serde(default)]
+    import_lane_reserve: bool,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -43,22 +52,49 @@ impl From<&Map> for SerializedMap {
 
 impl Serialize for Map {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        MapWithLotOrigins {
-            map: self.into(),
-            lot_origins: self.lot_origins.clone(),
+        let mut map = SerializedMap::from(self);
+        let lot_origins = self.lot_origins.clone();
+        if serializer.is_human_readable() {
+            return MapWithLotOrigins {
+                map: ReadableMap {
+                    map,
+                    import_lane_reserve: self.import_lane_reserve,
+                },
+                lot_origins,
+            }
+            .serialize(serializer);
         }
-        .serialize(serializer)
+        // Bincode uses positional fields. A trailing null station key explicitly
+        // marks an import and preserves the byte layout of ordinary maps.
+        if self.import_lane_reserve {
+            map.external_train_stations.push(BuildingID::null());
+        }
+        MapWithLotOrigins { map, lot_origins }.serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Map {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let MapWithLotOrigins { map, lot_origins } = MapWithLotOrigins::deserialize(deserializer)?;
+        let (map, lot_origins, import_lane_reserve) = if deserializer.is_human_readable() {
+            let MapWithLotOrigins { map, lot_origins } =
+                MapWithLotOrigins::<ReadableMap>::deserialize(deserializer)?;
+            (map.map, lot_origins, map.import_lane_reserve)
+        } else {
+            let MapWithLotOrigins {
+                mut map,
+                lot_origins,
+            } = MapWithLotOrigins::<SerializedMap>::deserialize(deserializer)?;
+            let imported = map.external_train_stations.last().is_some_and(Key::is_null);
+            if imported {
+                map.external_train_stations.pop();
+            }
+            (map, lot_origins, imported)
+        };
         map.validate_references()
             .map_err(serde::de::Error::custom)?;
         map.validate_spatial_geometry()
             .map_err(serde::de::Error::custom)?;
-        Ok(map.into_map(lot_origins))
+        Ok(map.into_map(lot_origins, import_lane_reserve))
     }
 }
 
@@ -160,7 +196,11 @@ impl SerializedMap {
         Ok(())
     }
 
-    fn into_map(self, lot_origins: BTreeMap<BuildingID, LotOrigin>) -> Map {
+    fn into_map(
+        self,
+        lot_origins: BTreeMap<BuildingID, LotOrigin>,
+        import_lane_reserve: bool,
+    ) -> Map {
         let spatial_map = mk_spatial_map(&self);
         let mut m = Map {
             roads: self.roads,
@@ -172,6 +212,7 @@ impl SerializedMap {
             parking: self.parking,
             environment: self.environment,
             external_train_stations: self.external_train_stations,
+            import_lane_reserve,
             lot_origins,
             ..Map::empty()
         };
@@ -201,10 +242,10 @@ fn mk_spatial_map(m: &SerializedMap) -> SpatialMap {
 mod tests {
     use super::*;
     use crate::map::{LanePatternBuilder, MapProject, RoadID};
-    use common::saveload::{Bincode, Encoder};
+    use common::saveload::{Bincode, Encoder, JSON};
     use geom::{vec3, PolyLine3, Vec3};
 
-    fn serialized_map_with_road() -> (MapWithLotOrigins, RoadID) {
+    fn serialized_map_with_road() -> (MapWithLotOrigins<SerializedMap>, RoadID) {
         let mut map = Map::empty();
         let (_, road) = map
             .make_connection(
@@ -222,6 +263,32 @@ mod tests {
             },
             road,
         )
+    }
+
+    #[test]
+    fn osm_trim_mode_round_trips_and_defaults_to_ordinary() {
+        let legacy = MapWithLotOrigins {
+            map: SerializedMap::default(),
+            lot_origins: BTreeMap::new(),
+        };
+        let legacy_bytes = Bincode::encode(&legacy).unwrap();
+        let mut ordinary = Bincode::decode::<Map>(&legacy_bytes).unwrap();
+        assert!(!ordinary.import_lane_reserve);
+        assert_eq!(Bincode::encode(&ordinary).unwrap(), legacy_bytes);
+        let legacy_json = JSON::encode(&legacy).unwrap();
+        assert!(
+            !JSON::decode::<Map>(&legacy_json)
+                .unwrap()
+                .import_lane_reserve
+        );
+
+        ordinary.import_lane_reserve = true;
+        assert!(ordinary.clone().import_lane_reserve);
+        let imported = Bincode::decode::<Map>(&Bincode::encode(&ordinary).unwrap()).unwrap();
+        assert!(imported.import_lane_reserve);
+        assert!(imported.external_train_stations.is_empty());
+        let imported = JSON::decode::<Map>(&JSON::encode(&ordinary).unwrap()).unwrap();
+        assert!(imported.import_lane_reserve);
     }
 
     #[test]

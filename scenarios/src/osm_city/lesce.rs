@@ -20,7 +20,10 @@ pub(super) const OPTIONS: NewGameOptions = NewGameOptions {
     starting_money_bucks: 250_000,
     progression: simulation::economy::progression::ProgressionMode::FreeBuild,
 };
+pub(super) const TARGET_OPENING_BEDS: usize = 2_900;
+pub(super) const OPENING_POPULATION: std::ops::RangeInclusive<usize> = 2_500..=3_500;
 pub(super) const STATION: Vec2 = vec2(3890.0, 4080.0);
+const SUPPLEMENTAL_FIRE_SITE: Vec2 = vec2(4390.0, 3570.0);
 pub(super) struct Layout {
     utility_road: usize,
     external_rail: usize,
@@ -419,6 +422,21 @@ pub(super) fn place_facilities(
     report
         .feature_counts
         .insert("placed_mapped_services".into(), service_count);
+    // The mapped stations are about 2 km apart before accounting for road travel.
+    let fire = place_company(ctx, "fire-station", SUPPLEMENTAL_FIRE_SITE)
+        .filter(|&id| {
+            let map = ctx.sim.map();
+            map.electricity.net_id(id) == map.electricity.net_id(plant)
+        })
+        .ok_or("could not place the supplemental fire station on the utility network")?;
+    let center = ctx.sim.map().buildings()[fire].obb.center();
+    report.synthetic.push(format!(
+        "supplemental fire station between Lesce and Radovljica at ({:.1}, {:.1})",
+        center.x, center.y
+    ));
+    report
+        .feature_counts
+        .insert("placed_supplemental_fire_stations".into(), 1);
     Ok(Facilities {
         plant,
         utilities,

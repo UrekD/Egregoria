@@ -4,7 +4,7 @@ use simulation::economy::{Budget, BudgetCategory, Government};
 use simulation::map::ZoneGrid;
 use simulation::{SavePhase, Simulation, SlotCamera, SlotId, SnapshotRevision};
 use std::collections::BTreeMap;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -16,6 +16,9 @@ const NAME: &str = "Lesce, Slovenia · © OpenStreetMap contributors";
 const ZIP: &str = "lesce_osm.zip";
 const META: &str = "lesce_osm.meta.json";
 const REPORT: &str = "lesce_osm.import-report.json";
+const ALIASES: [&str; 2] = ["ATTRIBUTION-OSM.txt", REPORT];
+const LEGACY_LOCK: &str = ".lesce_osm.import.lock";
+const COMMIT_REVISION: &str = "commit-revision";
 const ATTRIBUTION: &str = include_str!("../../../scripts/osm/ATTRIBUTION-OSM.txt");
 const QUERY: &str = include_str!("../../../scripts/osm/lesce.overpassql");
 const CAMERA: SlotCamera = SlotCamera {
@@ -53,7 +56,7 @@ pub fn generate_with_options(
     let mut city = normalize(extract, LESCE_BOUNDS).map_err(|e| e.to_string())?;
     let id = SlotId::new(SLOT).map_err(|e| e.to_string())?;
     fs::create_dir_all(&root).map_err(|e| e.to_string())?;
-    let _lock = PublicationLock::acquire(&root)?;
+    let lock = PublicationLock::acquire(&root)?;
     check_target(&root, replace)?;
 
     let mut report = ImportReport {
@@ -97,7 +100,7 @@ pub fn generate_with_options(
     let facilities = lesce::place_facilities(&mut ctx, &city, &network, &layout, &mut report)?;
     lesce::check_routes(&ctx.sim, &city, &network, &layout, &facilities, &mut report)?;
     super::zoning::zone_and_seed(&mut ctx.sim, &city, &network, &facilities, &mut report)?;
-    super::zoning::filter_vegetation(&mut ctx.sim, &city)?;
+    super::zoning::filter_vegetation(&ctx.sim, &city)?;
     if ctx.sim.read::<Government>().money.cents() <= 0 {
         return Err("construction exhausted the setup budget".into());
     }
@@ -107,12 +110,7 @@ pub fn generate_with_options(
             report.feature_counts
         )
     })?;
-    // Construction and commissioning belong to scenario setup. Give the
-    // player the advertised FreeBuild treasury at the actual opening tick.
     let opening_money = prototypes::Money::new_bucks(lesce::OPTIONS.starting_money_bucks as i64);
-    ctx.sim.write::<Government>().money = opening_money;
-    opening.money_cents = opening_money.cents();
-    report.opening = Some(opening);
     if ctx
         .sim
         .read::<Budget>()
@@ -121,6 +119,9 @@ pub fn generate_with_options(
     {
         return Err("import charged for starter infrastructure".into());
     }
+    ctx.sim.fund_imported_opening(opening_money)?;
+    opening.money_cents = ctx.sim.read::<Government>().money.cents();
+    report.opening = Some(opening);
     report.opening_budget_cents = ctx.sim.read::<Government>().money.cents();
     {
         let map = ctx.sim.map();
@@ -146,76 +147,151 @@ pub fn generate_with_options(
 
     let revision = snapshot_revision(&ctx.sim);
     report.revision = format!("{:032x}", revision.get());
-    let stage = Scratch::create(&root)?;
-    publish_snapshot(&ctx.sim, &stage.0, &id, revision)?;
-    verify_catalog(&stage.0, &id, revision)?;
-    report.snapshot_bytes = fs::metadata(stage.0.join(format!("{SLOT}.zip")))
+    let mut stage = Scratch::create(&root)?;
+    publish_snapshot(&ctx.sim, &stage.path, &id, revision)?;
+    verify_catalog(&stage.path, &id, revision)?;
+    report.snapshot_bytes = fs::metadata(stage.path.join(format!("{SLOT}.zip")))
         .map_err(|e| e.to_string())?
         .len();
     let loaded =
-        Simulation::load_from_slot(&stage.0, &id).map_err(|e| format!("staged slot: {e}"))?;
+        Simulation::load_from_slot(&stage.path, &id).map_err(|e| format!("staged slot: {e}"))?;
     check::validate_opening(&loaded, &facilities)?;
     report.generation_seconds = start.elapsed().as_secs_f64();
     if check {
         report.headless = Some(check::check_days(loaded, facilities)?);
     }
 
-    commit_snapshot(&stage.0, &root, &report.revision, &report, replace)?;
+    commit_snapshot(&mut stage, &root, &report.revision, &report, replace)?;
+    if replace {
+        lock.prune_legacy(&root)?;
+    }
     Ok(report)
 }
 
 fn commit_snapshot(
+    stage: &mut Scratch,
+    root: &Path,
+    revision: &str,
+    report: &impl serde::Serialize,
+    replace: bool,
+) -> Result<(), String> {
+    prepare_snapshot(&stage.path, root, revision, report, replace)?;
+    // The old catalog metadata and aliases remain in place until the ZIP commits.
+    install(&stage.path, root, ZIP)?;
+    stage.keep_for_recovery = true;
+    finish_snapshot(&stage.path, root, revision)?;
+    stage.keep_for_recovery = false;
+    Ok(())
+}
+
+fn prepare_snapshot(
     stage: &Path,
     root: &Path,
     revision: &str,
     report: &impl serde::Serialize,
     replace: bool,
 ) -> Result<(), String> {
-    let revision_report = format!("{SLOT}.{revision}.import-report.json");
-    let revision_attribution = format!("{SLOT}.{revision}.ATTRIBUTION-OSM.txt");
-    let aliases = ["ATTRIBUTION-OSM.txt", REPORT];
-    let required = [revision_attribution.as_str(), revision_report.as_str()];
+    let required = revision_sidecars(revision);
     check_target(root, replace)?;
-    for name in [ZIP, META].into_iter().chain(required).chain(aliases) {
+    for name in [ZIP, META]
+        .into_iter()
+        .chain(required.each_ref().map(String::as_str))
+        .chain(ALIASES)
+    {
         check_destination(&root.join(name))?;
     }
     let diagnostics = serde_json::to_vec_pretty(report).map_err(|e| e.to_string())?;
-    for (name, content) in [
-        (required[0], ATTRIBUTION.as_bytes()),
-        (required[1], diagnostics.as_slice()),
-        (aliases[0], ATTRIBUTION.as_bytes()),
-        (aliases[1], diagnostics.as_slice()),
-    ] {
-        write_staged(stage, name, content)?;
+    for ((required, alias), content) in required
+        .iter()
+        .zip(ALIASES)
+        .zip([ATTRIBUTION.as_bytes(), diagnostics.as_slice()])
+    {
+        write_staged(stage, required, content)?;
+        write_staged(stage, alias, content)?;
     }
-
-    // The ZIP is the commit point. The catalog correlates metadata by revision.
-    let old_meta = stage.join("previous.meta.json");
-    let had_meta = root.join(META).is_file();
-    if had_meta {
-        fs::copy(root.join(META), &old_meta).map_err(|e| format!("backup metadata: {e}"))?;
-    }
-    let install = |name| {
-        fs::rename(stage.join(name), root.join(name)).map_err(|e| format!("publish {name}: {e}"))
-    };
+    write_staged(stage, COMMIT_REVISION, revision.as_bytes())?;
     for name in required {
-        install(name)?;
+        install(stage, root, &name)?;
     }
-    install(META)?;
-    if let Err(error) = install(ZIP) {
-        let restore = if had_meta {
-            fs::rename(old_meta, root.join(META))
-        } else {
-            fs::remove_file(root.join(META))
+    Ok(())
+}
+
+fn finish_snapshot(stage: &Path, root: &Path, revision: &str) -> Result<(), String> {
+    for name in [META].into_iter().chain(ALIASES) {
+        if stage.join(name).try_exists().map_err(|e| e.to_string())? {
+            check_destination(&root.join(name))?;
+            install(stage, root, name)?;
+        }
+    }
+    prune_revision_sidecars(root, revision)
+}
+
+fn install(stage: &Path, root: &Path, name: &str) -> Result<(), String> {
+    fs::rename(stage.join(name), root.join(name)).map_err(|e| format!("publish {name}: {e}"))
+}
+
+fn revision_sidecars(revision: &str) -> [String; 2] {
+    [
+        format!("{SLOT}.{revision}.ATTRIBUTION-OSM.txt"),
+        format!("{SLOT}.{revision}.import-report.json"),
+    ]
+}
+
+fn valid_revision(revision: &str) -> bool {
+    revision.len() == 32
+        && revision
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn prune_revision_sidecars(root: &Path, revision: &str) -> Result<(), String> {
+    for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let Some((old_revision, suffix)) = name
+            .to_str()
+            .and_then(|name| name.strip_prefix("lesce_osm."))
+            .and_then(|name| name.split_once('.'))
+        else {
+            continue;
         };
-        return Err(match restore {
-            Ok(()) => error,
-            Err(restore) => format!("{error}; restore previous metadata: {restore}"),
-        });
+        if old_revision != revision
+            && valid_revision(old_revision)
+            && matches!(suffix, "ATTRIBUTION-OSM.txt" | "import-report.json")
+            && entry.file_type().map_err(|e| e.to_string())?.is_file()
+        {
+            fs::remove_file(entry.path())
+                .map_err(|e| format!("remove obsolete sidecar {}: {e}", entry.path().display()))?;
+        }
     }
-    for name in aliases {
-        if let Err(error) = install(name) {
-            eprintln!("{error}; the revision-associated copy is available");
+    Ok(())
+}
+
+fn recover_stage(stage: &Path, root: &Path) -> Result<(), String> {
+    let marker = stage.join(COMMIT_REVISION);
+    if !marker.symlink_metadata().is_ok_and(|meta| meta.is_file()) || stage.join(ZIP).exists() {
+        return Ok(());
+    }
+    let mut revision = String::new();
+    File::open(&marker)
+        .and_then(|file| file.take(33).read_to_string(&mut revision))
+        .map_err(|e| format!("read interrupted publication at {}: {e}", stage.display()))?;
+    if valid_revision(&revision) {
+        let zip = root.join(ZIP);
+        let entries = simulation::list_slots_with_revisions(root, |path, kind| {
+            if path != zip {
+                return None;
+            }
+            Simulation::read_slot_snapshot_header(path, kind)
+                .ok()
+                .and_then(|header| header.revision)
+        })
+        .map_err(|e| e.to_string())?;
+        let expected = u128::from_str_radix(&revision, 16).unwrap();
+        if entries.iter().any(|entry| {
+            entry.id.as_str() == SLOT && entry.revision == Some(SnapshotRevision::new(expected))
+        }) {
+            finish_snapshot(stage, root, &revision)?;
         }
     }
     Ok(())
@@ -259,24 +335,42 @@ fn source_digest(bytes: &[u8]) -> Result<String, String> {
 
 struct PublicationLock {
     _file: File,
+    #[cfg(unix)]
+    legacy: Option<File>,
 }
 
 impl PublicationLock {
     fn acquire(root: &Path) -> Result<Self, String> {
-        let path = root.join(".lesce_osm.import.lock");
-        let file = OpenOptions::new()
+        // The directory is a stable lock target even when obsolete sidecars disappear.
+        #[cfg(unix)]
+        let path = root;
+        #[cfg(unix)]
+        let file = File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        #[cfg(not(unix))]
+        let path = root.join(LEGACY_LOCK);
+        #[cfg(not(unix))]
+        let file = fs::OpenOptions::new()
             .write(true)
             .read(true)
             .create(true)
             .truncate(false)
             .open(&path)
             .map_err(|e| format!("{}: {e}", path.display()))?;
-        file.try_lock().map_err(|e| {
-            format!(
-                "{}: {e}; wait for the current import to finish",
-                path.display()
-            )
-        })?;
+        Self::try_lock(&file, &path)?;
+        #[cfg(unix)]
+        let legacy = {
+            let path = root.join(LEGACY_LOCK);
+            match path.symlink_metadata() {
+                Ok(meta) if meta.is_file() => {
+                    let file = File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+                    Self::try_lock(&file, &path)?;
+                    Some(file)
+                }
+                Ok(_) => return Err(format!("{} is not a regular file", path.display())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+                Err(e) => return Err(format!("{}: {e}", path.display())),
+            }
+        };
         // A kernel lock expires with the owner, including on SIGINT or SIGKILL.
         for entry in fs::read_dir(root).map_err(|e| e.to_string())? {
             let entry = entry.map_err(|e| e.to_string())?;
@@ -289,15 +383,41 @@ impl PublicationLock {
                     pid.parse::<u32>().is_ok() && stamp.parse::<u128>().is_ok()
                 });
             if stale && entry.file_type().map_err(|e| e.to_string())?.is_dir() {
+                recover_stage(&entry.path(), root)?;
                 fs::remove_dir_all(entry.path())
                     .map_err(|e| format!("clean abandoned stage: {e}"))?;
             }
         }
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            #[cfg(unix)]
+            legacy,
+        })
+    }
+
+    fn try_lock(file: &File, path: &Path) -> Result<(), String> {
+        file.try_lock().map_err(|e| {
+            format!(
+                "{}: {e}; wait for the current import to finish",
+                path.display()
+            )
+        })
+    }
+
+    fn prune_legacy(&self, _root: &Path) -> Result<(), String> {
+        #[cfg(unix)]
+        if self.legacy.is_some() {
+            let path = _root.join(LEGACY_LOCK);
+            fs::remove_file(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        }
+        Ok(())
     }
 }
 
-struct Scratch(PathBuf);
+struct Scratch {
+    path: PathBuf,
+    keep_for_recovery: bool,
+}
 
 impl Scratch {
     fn create(root: &Path) -> Result<Self, String> {
@@ -307,13 +427,18 @@ impl Scratch {
             .as_nanos();
         let stage = root.join(format!(".lesce_osm-stage-{}-{stamp}", std::process::id()));
         fs::create_dir(&stage).map_err(|e| e.to_string())?;
-        Ok(Self(stage))
+        Ok(Self {
+            path: stage,
+            keep_for_recovery: false,
+        })
     }
 }
 
 impl Drop for Scratch {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        if !self.keep_for_recovery {
+            let _ = fs::remove_dir_all(&self.path);
+        }
     }
 }
 
@@ -419,47 +544,103 @@ mod tests {
         let mut ctx = ScenarioCtx::from_sim(sim);
         let school = place_company(&mut ctx, "school", vec2(3650.0, 3950.0)).unwrap();
         assert!(ctx.sim.map().buildings()[school].connected_road.is_some());
+        let opening = prototypes::Money::new_bucks(lesce::OPTIONS.starting_money_bucks as i64);
+        let before_grant = ctx.sim.read::<Government>().money;
+        assert!(before_grant < opening);
+        ctx.sim.fund_imported_opening(opening).unwrap();
+        assert_eq!(ctx.sim.read::<Government>().money, opening);
+        let budget = ctx.sim.read::<Budget>();
+        assert_eq!(
+            budget.total(BudgetCategory::StarterInfrastructure),
+            i128::from(opening.inner() - before_grant.inner())
+        );
+        assert_eq!(
+            budget
+                .days()
+                .values()
+                .flat_map(BTreeMap::values)
+                .sum::<i128>(),
+            0
+        );
+        drop(budget);
 
         let root = Scratch::create(&std::env::temp_dir()).unwrap();
-        let stale = root.0.join(".lesce_osm-stage-123-456");
+        let stale = root.path.join(".lesce_osm-stage-123-456");
         fs::create_dir(&stale).unwrap();
-        let lock = PublicationLock::acquire(&root.0).unwrap();
+        fs::write(root.path.join(LEGACY_LOCK), []).unwrap();
+        let lock = PublicationLock::acquire(&root.path).unwrap();
         assert!(!stale.exists());
-        assert!(PublicationLock::acquire(&root.0).is_err());
-        let stage = Scratch::create(&root.0).unwrap();
+        assert!(PublicationLock::acquire(&root.path).is_err());
+        let mut stage = Scratch::create(&root.path).unwrap();
         let id = SlotId::new(SLOT).unwrap();
         let revision = snapshot_revision(&ctx.sim);
         let revision_text = format!("{:032x}", revision.get());
-        publish_snapshot(&ctx.sim, &stage.0, &id, revision).unwrap();
+        publish_snapshot(&ctx.sim, &stage.path, &id, revision).unwrap();
 
         let attribution = root
-            .0
+            .path
             .join(format!("{SLOT}.{revision_text}.ATTRIBUTION-OSM.txt"));
         fs::create_dir(&attribution).unwrap();
-        assert!(commit_snapshot(&stage.0, &root.0, &revision_text, &(), false).is_err());
-        assert!(!root.0.join(ZIP).exists());
-        assert!(!root.0.join(META).exists());
+        assert!(commit_snapshot(&mut stage, &root.path, &revision_text, &(), false).is_err());
+        assert!(!root.path.join(ZIP).exists());
+        assert!(!root.path.join(META).exists());
         fs::remove_dir(&attribution).unwrap();
-        commit_snapshot(&stage.0, &root.0, &revision_text, &(), false).unwrap();
-        verify_catalog(&root.0, &id, revision).unwrap();
-        let zip = fs::read(root.0.join(ZIP)).unwrap();
-        let metadata = fs::read(root.0.join(META)).unwrap();
+        commit_snapshot(&mut stage, &root.path, &revision_text, &(), false).unwrap();
+        verify_catalog(&root.path, &id, revision).unwrap();
+        let zip = fs::read(root.path.join(ZIP)).unwrap();
+        let metadata = fs::read(root.path.join(META)).unwrap();
 
         let replacement = SnapshotRevision::new(revision.get() ^ 1);
         let replacement_text = format!("{:032x}", replacement.get());
-        publish_snapshot(&ctx.sim, &stage.0, &id, replacement).unwrap();
-        assert!(check_target(&root.0, false)
+        publish_snapshot(&ctx.sim, &stage.path, &id, replacement).unwrap();
+        assert!(check_target(&root.path, false)
             .unwrap_err()
             .contains("already exists"));
         let obstruction = root
-            .0
+            .path
             .join(format!("{SLOT}.{replacement_text}.import-report.json"));
         fs::create_dir(&obstruction).unwrap();
-        assert!(commit_snapshot(&stage.0, &root.0, &replacement_text, &(), true).is_err());
-        assert_eq!(fs::read(root.0.join(ZIP)).unwrap(), zip);
-        assert_eq!(fs::read(root.0.join(META)).unwrap(), metadata);
-        verify_catalog(&root.0, &id, revision).unwrap();
+        assert!(commit_snapshot(&mut stage, &root.path, &replacement_text, &(), true).is_err());
+        assert_eq!(fs::read(root.path.join(ZIP)).unwrap(), zip);
+        assert_eq!(fs::read(root.path.join(META)).unwrap(), metadata);
+        verify_catalog(&root.path, &id, revision).unwrap();
+        fs::remove_dir(obstruction).unwrap();
+
+        let old_report = fs::read(root.path.join(REPORT)).unwrap();
+        prepare_snapshot(&stage.path, &root.path, &replacement_text, &42, true).unwrap();
+        verify_catalog(&root.path, &id, revision).unwrap();
+        assert_eq!(fs::read(root.path.join(REPORT)).unwrap(), old_report);
+        assert_eq!(fs::read(root.path.join(META)).unwrap(), metadata);
+
+        // Simulate process exit before the ZIP rename, then open the old slot again.
+        stage.keep_for_recovery = true;
+        let abandoned = stage.path.clone();
+        drop(stage);
         drop(lock);
-        PublicationLock::acquire(&root.0).unwrap();
+        let lock = PublicationLock::acquire(&root.path).unwrap();
+        assert!(!abandoned.exists());
+        verify_catalog(&root.path, &id, revision).unwrap();
+        assert_eq!(fs::read(root.path.join(ZIP)).unwrap(), zip);
+        assert_eq!(fs::read(root.path.join(REPORT)).unwrap(), old_report);
+
+        // Once the ZIP has committed, lock recovery completes its staged sidecars.
+        let mut stage = Scratch::create(&root.path).unwrap();
+        publish_snapshot(&ctx.sim, &stage.path, &id, replacement).unwrap();
+        prepare_snapshot(&stage.path, &root.path, &replacement_text, &42, true).unwrap();
+        install(&stage.path, &root.path, ZIP).unwrap();
+        stage.keep_for_recovery = true;
+        drop(stage);
+        drop(lock);
+        let lock = PublicationLock::acquire(&root.path).unwrap();
+        verify_catalog(&root.path, &id, replacement).unwrap();
+        assert_eq!(fs::read(root.path.join(REPORT)).unwrap(), b"42");
+        assert!(!attribution.exists(), "prior revision attribution remained");
+        assert!(!root
+            .path
+            .join(revision_sidecars(&revision_text)[1].as_str())
+            .exists());
+        lock.prune_legacy(&root.path).unwrap();
+        #[cfg(unix)]
+        assert!(!root.path.join(LEGACY_LOCK).exists());
     }
 }

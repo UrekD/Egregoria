@@ -74,9 +74,13 @@ For a separate save directory, run `cargo run --locked --release -p scenarios --
 
 ### Try Lesce, Slovenia
 
-Run `make osm-lesce` and open **Lesce, Slovenia** from **Load**. The Free-build slot uses local OpenStreetMap road and rail geometry, zoning from mapped buildings and land use, and a starter set of houses. Its import report identifies synthetic utilities, freight, motorway turnarounds and supplemental zoning. Bridges and tunnels are rendered flat. Road boundary stubs are cosmetic, and outside trade uses freight rail.
+Run `make osm-lesce` and open **Lesce, Slovenia** from **Load**. The Free-build slot uses local OpenStreetMap road and rail geometry, occupied houses, and zoning from mapped buildings and land use. The import report identifies supplemental employment, utilities, freight and motorway turnarounds. Bridges and tunnels are rendered flat. Road boundary stubs are cosmetic, and outside trade uses freight rail. Lesce earns high income under the game's default tax rates, so the opening treasury grows quickly during free build.
 
-The default extract cache is `target/osm-cache/lesce.overpass.json`. Set `EGR_OSM_CACHE` to choose another cache directory or `EGR_OSM_INPUT` to use a local Overpass response without fetching. The fetch uses `curl` and `jq`, and the generator uses `sha256sum`. Set `EGR_OSM_SAVE_ROOT` to change the default `world/` save root. Use `EGR_OSM_FLAGS=--check` to run the one-game-day growth, utilities and freight checks before publication. Use `--replace` in `EGR_OSM_FLAGS` to explicitly replace an existing Lesce slot.
+The pinned extract opens with 2,903 residents in 1,366 homes, $250,000 in the treasury, and full utility service. The opening has two mapped fire stations and a supplemental station between Lesce and Radovljica.
+
+The three-day check ends with 3,129 residents in 1,311 homes and full utility service at every four-hour sample. The treasury gains about $121,000–$126,000 per game day.
+
+The default extract cache is `target/osm-cache/lesce-20261122-wood.overpass.json`. Set `EGR_OSM_CACHE` to choose another cache directory or `EGR_OSM_INPUT` to use a local Overpass response without fetching. The fetch uses `curl` and `jq`, and the generator uses `sha256sum`. Set `EGR_OSM_SAVE_ROOT` to change the default `world/` save root. Use `EGR_OSM_FLAGS=--check` to run the three-game-day growth, utilities, employment and freight checks before publication. Use `--replace` in `EGR_OSM_FLAGS` to explicitly replace an existing Lesce slot.
 
 On Linux, run `make osm-lesce-shots EGR_OSM_SAVE_ROOT=<dir>` to capture the opening camera, zoning and traffic under Xvfb. The generated slot, import report and attribution are local artifacts.
 

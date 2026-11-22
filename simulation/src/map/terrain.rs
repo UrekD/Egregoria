@@ -142,7 +142,7 @@ impl Environment {
     }
 
     /// Filter generated vegetation before the imported map is first displayed.
-    pub fn retain_imported_trees(&mut self, mut retain: impl FnMut(Vec2) -> bool) {
+    pub(crate) fn retain_imported_trees(&mut self, mut retain: impl FnMut(Vec2) -> bool) {
         let mut remove = Vec::new();
         let mut cells: Vec<_> = self.trees.storage().cells.iter().collect();
         cells.sort_unstable_by_key(|(&id, _)| id);

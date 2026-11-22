@@ -8,6 +8,10 @@ attic data. To reuse an existing extract, set `EGR_OSM_INPUT=/path/to/extract.js
 Use `EGR_OSM_SAVE_ROOT` for the output directory and `EGR_OSM_FLAGS=--check`
 to run the additional three-day headless verification. The default refuses to
 overwrite the slot. Use `EGR_OSM_FLAGS=--replace` for an intentional replacement.
+The checked run verifies utility service, first-day employment, population
+growth, retention of homes and residents from the sampled peak, and a freight
+round trip. Combine the flags as `EGR_OSM_FLAGS='--check --replace'` to verify a
+replacement before publishing it.
 
 The report records the SHA-256 of the bytes actually consumed, the server's
 `timestamp_osm_base`, and the preset query and requested historical date. An
@@ -24,7 +28,8 @@ The `osm-city` executable command is the Lesce scenario preset. Other areas
 need their own corridor anchors, services, zoning, target scale, and camera.
 
 The opening slot contains occupied mapped housing, mapped employment,
-synthetic employment near arterials, and commissioned utilities. Passenger
-service is represented by a static Lesce-Bled station marker. Flat terrain and
+synthetic employment near arterials, and commissioned utilities. An extra fire
+station covers part of the gap between the mapped stations. Passenger service
+is represented by a static Lesce-Bled station marker. Flat terrain and
 grade-separated structures are drawn in plan view. Run `make osm-lesce-shots`
 against the generated save root for the overview, zoning, and traffic captures.

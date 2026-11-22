@@ -1,5 +1,69 @@
 use geom::{Vec2, AABB};
 
+const MAX_POLYGON_WORK: usize = 50_000_000;
+
+pub(super) struct PolygonWork {
+    remaining: usize,
+    operation: &'static str,
+}
+
+impl PolygonWork {
+    pub(super) fn new(operation: &'static str) -> Self {
+        Self {
+            remaining: MAX_POLYGON_WORK,
+            operation,
+        }
+    }
+
+    pub(super) fn charge(&mut self, work: usize) -> Result<(), String> {
+        self.remaining = self
+            .remaining
+            .checked_sub(work)
+            .ok_or_else(|| format!("OSM {} exceeded the geometry work limit", self.operation))?;
+        Ok(())
+    }
+
+    pub(super) fn contains(
+        &mut self,
+        outers: &[Vec<Vec2>],
+        holes: &[Vec<Vec2>],
+        point: Vec2,
+    ) -> Result<bool, String> {
+        Ok(self.any_ring_contains(outers, point)? && !self.any_ring_contains(holes, point)?)
+    }
+
+    pub(super) fn any_ring_contains(
+        &mut self,
+        rings: &[Vec<Vec2>],
+        point: Vec2,
+    ) -> Result<bool, String> {
+        for ring in rings {
+            if self.ring_contains(ring, point)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    pub(super) fn ring_contains(&mut self, ring: &[Vec2], point: Vec2) -> Result<bool, String> {
+        self.charge(ring.len())?;
+        Ok(ring_contains(ring, point))
+    }
+}
+
+pub(super) fn ring_contains(ring: &[Vec2], point: Vec2) -> bool {
+    let mut inside = false;
+    for pair in ring.windows(2) {
+        let [a, b] = [pair[0], pair[1]];
+        if (a.y > point.y) != (b.y > point.y)
+            && point.x < a.x + (b.x - a.x) * (point.y - a.y) / (b.y - a.y)
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
 /// A static bounding-volume tree. Leaves retain their individual bounds so
 /// large queries do not emit candidates from the empty parts of a branch.
 pub(super) struct BoundsIndex<T>(Option<Box<Node<T>>>);
