@@ -1,24 +1,434 @@
 [
-  {"Camera": {"x": 940.0, "y": 915.0, "z": 0.0, "yaw": -0.6, "pitch": 1.05, "dist": 900.0}},
-  {"Builder": "grid_city"},
-  {"Builder": "place_company"},
-  {"SelectTool": "Zoning"},
-  {"Pointer": {"action": "Click", "screen_pos": [667, 608]}},
-  {"Pointer": {"action": {"Drag": {"to": {"world_pos": [925, 915, 0]}}}, "world_pos": [680, 680, 0]}},
-  {"Pointer": {"action": "Click", "screen_pos": [183, 608]}},
-  {"Pointer": {"action": {"Drag": {"to": {"world_pos": [870, 1198, 0]}}}, "world_pos": [680, 926, 0]}},
-  {"Pointer": {"action": "Click", "screen_pos": [302, 608]}},
-  {"Pointer": {"action": {"Drag": {"to": {"world_pos": [1210, 1200, 0]}}}, "world_pos": [934, 970, 0]}},
-  {"Pointer": {"action": "Click", "screen_pos": [398, 608]}},
-  {"Pointer": {"action": {"Drag": {"to": {"world_pos": [1200, 920, 0]}}}, "world_pos": [960, 703, 0]}},
-  {"Key": {"key": "Escape", "down": true}},
-  {"Key": {"key": "Escape", "down": false}},
-  {"Camera": {"x": 940.0, "y": 915.0, "z": 0.0, "yaw": -0.6, "pitch": 1.05, "dist": 650.0}},
-  {"RunTicks": 300},
-  {"DumpState": "before-growth"},
-  {"RunTicks": 300000},
-  {"WaitFrames": 8},
-  {"Screenshot": "grown-city"},
-  {"DumpState": "grown-city"},
+  {
+    "Camera": {
+      "x": 940.0,
+      "y": 915.0,
+      "z": 0.0,
+      "yaw": -0.6,
+      "pitch": 1.05,
+      "dist": 900.0
+    }
+  },
+  {
+    "Builder": "grid_city"
+  },
+  {
+    "Builder": "place_company"
+  },
+  {
+    "SelectTool": "Zoning"
+  },
+  {
+    "Pointer": {
+      "action": "Click",
+      "screen_pos": [
+        667,
+        608
+      ]
+    }
+  },
+  {
+    "Pointer": {
+      "action": {
+        "Drag": {
+          "to": {
+            "world_pos": [
+              925,
+              915,
+              0
+            ]
+          }
+        }
+      },
+      "world_pos": [
+        680,
+        680,
+        0
+      ]
+    }
+  },
+  {
+    "Pointer": {
+      "action": "Click",
+      "screen_pos": [
+        183,
+        608
+      ]
+    }
+  },
+  {
+    "Pointer": {
+      "action": {
+        "Drag": {
+          "to": {
+            "world_pos": [
+              870,
+              1198,
+              0
+            ]
+          }
+        }
+      },
+      "world_pos": [
+        680,
+        926,
+        0
+      ]
+    }
+  },
+  {
+    "Pointer": {
+      "action": "Click",
+      "screen_pos": [
+        302,
+        608
+      ]
+    }
+  },
+  {
+    "Pointer": {
+      "action": {
+        "Drag": {
+          "to": {
+            "world_pos": [
+              1210,
+              1200,
+              0
+            ]
+          }
+        }
+      },
+      "world_pos": [
+        934,
+        970,
+        0
+      ]
+    }
+  },
+  {
+    "Pointer": {
+      "action": "Click",
+      "screen_pos": [
+        398,
+        608
+      ]
+    }
+  },
+  {
+    "Pointer": {
+      "action": {
+        "Drag": {
+          "to": {
+            "world_pos": [
+              1200,
+              920,
+              0
+            ]
+          }
+        }
+      },
+      "world_pos": [
+        960,
+        703,
+        0
+      ]
+    }
+  },
+  {
+    "Key": {
+      "key": "Escape",
+      "down": true
+    }
+  },
+  {
+    "Key": {
+      "key": "Escape",
+      "down": false
+    }
+  },
+  {
+    "Camera": {
+      "x": 940.0,
+      "y": 915.0,
+      "z": 0.0,
+      "yaw": -0.6,
+      "pitch": 1.05,
+      "dist": 650.0
+    }
+  },
+  {
+    "BuildSpecialBuildings": [
+      {
+        "pos": {
+          "corners": [
+            4944336665485008896,
+            4938531244090351616,
+            4938531244087648256,
+            4944336665482305536
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 17699481749046210215
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          1100,
+          700
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4936508142695587840,
+            4940730267346247680,
+            4940730267348213760,
+            4936508142697553920
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 7759206203148193615
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": {
+          "poly": [
+            4936508142695587840,
+            4940730267346247680,
+            4940730267348213760,
+            4936508142697553920
+          ],
+          "area": 14400.0,
+          "filldir": 4575657221408423936
+        },
+        "road_at": [
+          1100,
+          700
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4930737905672675328,
+            4929330530789122048,
+            4929330530788794368,
+            4930737905672347648
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 1075791784279675837
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          940,
+          700
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4941803390696259584,
+            4941803390695931904,
+            4942507078137708544,
+            4942507078138036224
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 9333688838218784667
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          1180,
+          780
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4941064518884687872,
+            4941064518885015552,
+            4940360831443238912,
+            4940360831442911232
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 11895989582669773744
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          1180,
+          940
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4941803390700797952,
+            4941803390700634112,
+            4942507078142410752,
+            4942507078142574592
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 4761500172902867360
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          1180,
+          1100
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4938267361306529792,
+            4938971048748306432,
+            4938971048748470272,
+            4938267361306693632
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 14211706759220955472
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          1100,
+          1180
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4929330530795966464,
+            4930737905679519744,
+            4930737905679683584,
+            4929330530796130304
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 16636901822346546003
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          940,
+          1180
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4918071531727540224,
+            4919478906611093504,
+            4919478906611257344,
+            4918071531727704064
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 6619385437289231944
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          780,
+          1180
+        ]
+      },
+      {
+        "pos": {
+          "corners": [
+            4912406847820414976,
+            4912406847820578816,
+            4910999472937025536,
+            4910999472936861696
+          ]
+        },
+        "kind": {
+          "GoodsCompany": 6320984592099759368
+        },
+        "gen": {
+          "CenteredDoor": {
+            "vertical_factor": 1.0
+          }
+        },
+        "zone": null,
+        "road_at": [
+          700,
+          1100
+        ]
+      }
+    ]
+  },
+  {
+    "Assert": "NoRejections"
+  },
+  {
+    "RunTicks": 300
+  },
+  {
+    "DumpState": "before-growth"
+  },
+  {
+    "RunTicks": 300000
+  },
+  {
+    "Camera": {
+      "x": 960,
+      "y": 900,
+      "z": 0,
+      "yaw": -0.6,
+      "pitch": 1.05,
+      "dist": 715
+    }
+  },
+  {
+    "WaitFrames": 8
+  },
+  {
+    "Screenshot": "grown-city"
+  },
+  {
+    "DumpState": "grown-city"
+  },
   "Exit"
 ]

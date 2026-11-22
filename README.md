@@ -29,6 +29,22 @@ Headless scenario runner, determinism and save/resume checks, lifecycle cleanup,
 |---|---|
 | ![P0 smoke overview](docs/screenshots/p0-smoke-overview.png) | ![P0 smoke economy](docs/screenshots/p0-smoke-economy.png) |
 
+### Milestone P1 — zoning, demand, growth, budget
+
+Residential/commercial/industrial/office zoning (low/high density), RCI demand with driver tooltips, automatic growth and level-ups, households with immigration/emigration, growable companies on the goods market, retail trips, taxes, upkeep and a daily budget ledger.
+
+| Zoning | Grown city | Budget |
+|---|---|---|
+| ![P1 zoning](docs/screenshots/p1-zoning.png) | ![P1 grown city](docs/screenshots/p1-grown-city.png) | ![P1 budget](docs/screenshots/p1-budget.png) |
+
+### Milestone P2 — services, utilities, environment, happiness
+
+Health, fire, police, school, garbage and park services with road-network coverage and shared capacity; water and sewage on the road network; pollution and land value; per-household happiness feeding demand; L2/L3 upgrades gated by services; fires; service upkeep; map overlays, needs inspector and problem badges.
+
+| Coverage overlay | Needs inspector | Services |
+|---|---|---|
+| ![P2 school coverage](docs/screenshots/p2-coverage-school.png) | ![P2 needs inspector](docs/screenshots/p2-needs-inspector.png) | ![P2 services](docs/screenshots/p2-services-tab.png) |
+
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
 ## How to play
