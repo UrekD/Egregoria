@@ -53,6 +53,14 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         return;
     }
 
+    // Switching between straight and curved mode keeps the selected start point.
+    state.build_state = match (tool, state.build_state) {
+        (Tool::RoadbuildCurved, Start(start)) => StartCurved(start),
+        (Tool::RoadbuildStraight, StartCurved(start) | Curved(_, start))
+        | (Tool::RoadbuildStraight, CurvedConnection(start, _)) => Start(start),
+        (_, build_state) => build_state,
+    };
+
     let grid_size = 20.0;
     let unproj = unwrap_ret!(inp.unprojected);
     let mut interpolation_points: Vec<Vec3> = Vec::new();
@@ -831,5 +839,116 @@ mod tests {
 
         let applied = map.get(road).unwrap().points();
         assert_eq!(preview.as_slice(), applied.as_slice());
+    }
+
+    fn ui(tool: Tool) -> UiWorld {
+        crate::init::init();
+        let mut ui = UiWorld::with_defaults();
+        ui.insert(Camera::new(vec3(0.0, 0.0, 300.0), 1280.0, 720.0));
+        *ui.write::<Tool>() = tool;
+        ui
+    }
+
+    /// Run one frame of the tool with the pointer over the terrain at `point`.
+    fn frame(sim: &Simulation, ui: &UiWorld, point: Vec2, click: bool) {
+        let z = sim.map().environment.height(point).unwrap().max(0.0);
+        {
+            let mut input = ui.write::<InputMap>();
+            input.unprojected = Some(point.z(z));
+            input.just_act.clear();
+            input.act.clear();
+            if click {
+                input.act.insert(InputAction::Select);
+                input.just_act.insert(InputAction::Select);
+            }
+        }
+        roadbuild(sim, ui);
+    }
+
+    fn click_through(sim: &Simulation, ui: &UiWorld, points: &[Vec2]) {
+        for &point in points {
+            frame(sim, ui, point, false);
+            frame(sim, ui, point, true);
+        }
+    }
+
+    #[test]
+    fn traffic1_curved_mode_places_a_curved_road_on_the_ground() {
+        let mut city = scenarios::ScenarioCtx::new(simulation::SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..simulation::SimulationOptions::LEGACY
+        });
+        let ui = ui(Tool::RoadbuildCurved);
+        let (start, control, end) = (vec2(700.0, 700.0), vec2(800.0, 700.0), vec2(800.0, 800.0));
+        click_through(&city.sim, &ui, &[start, control, end]);
+
+        let commands = std::mem::take(&mut *ui.commands());
+        let [WorldCommand::MapMakeConnection { inter, .. }] = commands.as_ref() else {
+            panic!(
+                "curved placement queued {:?} (state {:?})",
+                commands.as_ref(),
+                ui.read::<RoadBuildResource>().build_state
+            );
+        };
+        assert_eq!(*inter, Some(control));
+        let before: Vec<_> = city.sim.map().roads().keys().collect();
+        city.sim.apply_commands(commands.as_ref());
+        let map = city.sim.map();
+        let mut added = map.roads().values().filter(|r| !before.contains(&r.id));
+        let road = added.next().expect("curved road was not built");
+        assert!(added.next().is_none());
+        // The deck bends towards the control point instead of joining the ends directly.
+        let middle = road.points().point_along(road.points().length() * 0.5);
+        assert!(middle.xy().distance(vec2(750.0, 750.0)) > 10.0);
+    }
+
+    #[test]
+    fn traffic1_switching_to_curved_mode_keeps_the_chained_start_point() {
+        let mut city = scenarios::ScenarioCtx::new(simulation::SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..simulation::SimulationOptions::LEGACY
+        });
+        let ui = ui(Tool::RoadbuildStraight);
+        let (a, b) = (vec2(600.0, 700.0), vec2(700.0, 700.0));
+        click_through(&city.sim, &ui, &[a, b]);
+        let straight = std::mem::take(&mut *ui.commands());
+        city.sim.apply_commands(straight.as_ref());
+        // The applied command chains the tool to the new road's end.
+        *ui.write::<crate::uiworld::ReceivedCommands>() =
+            crate::uiworld::ReceivedCommands::new(straight);
+        frame(&city.sim, &ui, b, false);
+        *ui.write::<crate::uiworld::ReceivedCommands>() = Default::default();
+        assert!(matches!(
+            ui.read::<RoadBuildResource>().build_state,
+            Start(MapProject {
+                kind: Intersection(_),
+                ..
+            })
+        ));
+
+        *ui.write::<Tool>() = Tool::RoadbuildCurved;
+        let (control, end) = (vec2(800.0, 700.0), vec2(800.0, 800.0));
+        click_through(&city.sim, &ui, &[control, end]);
+        let commands = std::mem::take(&mut *ui.commands());
+        assert!(
+            matches!(
+                commands.as_ref(),
+                [WorldCommand::MapMakeConnection { inter: Some(p), .. }] if *p == control
+            ),
+            "{:?}",
+            commands.as_ref()
+        );
+
+        // And back: a half-placed curve continues as a straight road from its start.
+        let start = MapProject::ground(vec3(600.0, 900.0, 0.0));
+        ui.write::<RoadBuildResource>().build_state = Curved(vec2(650.0, 950.0), start);
+        *ui.write::<Tool>() = Tool::RoadbuildStraight;
+        frame(&city.sim, &ui, vec2(700.0, 900.0), false);
+        assert!(matches!(
+            ui.read::<RoadBuildResource>().build_state,
+            Start(selected) if selected.pos == start.pos
+        ));
     }
 }

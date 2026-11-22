@@ -310,7 +310,7 @@ impl Pathfinder for CarPath {
 }
 
 impl Map {
-    fn can_drive_between(&self, start: LaneID, end: LaneID) -> bool {
+    pub(crate) fn can_drive_between(&self, start: LaneID, end: LaneID) -> bool {
         self.driving_reachability
             .get_or_init(|| super::reachability::DrivingReachability::build(self))
             .can_reach(start, end)
