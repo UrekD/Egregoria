@@ -89,6 +89,18 @@ use Key as K;
 use MouseButton::*;
 use UnitInput::*;
 
+#[cfg(target_os = "macos")]
+const TOP_ROW_DIGITS: [u32; 5] = [0x12, 0x13, 0x14, 0x15, 0x17];
+#[cfg(not(target_os = "macos"))]
+const TOP_ROW_DIGITS: [u32; 5] = [2, 3, 4, 5, 6];
+const SPEED_DEFAULTS: [(InputAction, u32, &str); 5] = [
+    (Speed1, TOP_ROW_DIGITS[0], "1"),
+    (Speed3, TOP_ROW_DIGITS[1], "2"),
+    (Speed8, TOP_ROW_DIGITS[2], "3"),
+    (Speed20, TOP_ROW_DIGITS[3], "4"),
+    (Speed50, TOP_ROW_DIGITS[4], "5"),
+];
+
 // https://stackoverflow.com/a/38068969/5000800 for key scans
 #[rustfmt::skip]
 const DEFAULT_BINDINGS: &[(InputAction, &[&[UnitInput]])] = &[
@@ -113,11 +125,6 @@ const DEFAULT_BINDINGS: &[(InputAction, &[&[UnitInput]])] = &[
     (OpenEconomyMenu, &[&[Key(K::c("E"))]]),
     (OpenDebugMenu,   &[&[Key(K::F3)]]),
     (PausePlay,       &[&[Key(K::Space)]]),
-    (Speed1,          &[&[Key(K::c("1"))]]),
-    (Speed3,          &[&[Key(K::c("2"))]]),
-    (Speed8,          &[&[Key(K::c("3"))]]),
-    (Speed20,         &[&[Key(K::c("4"))]]),
-    (Speed50,         &[&[Key(K::c("5"))]]),
     (OpenChat,        &[&[Key(K::c("T"))]]),
 ];
 
@@ -136,7 +143,34 @@ impl Default for Bindings {
             }
         }
 
+        m.extend(SPEED_DEFAULTS.iter().map(|(action, scan, _)| {
+            (
+                action.clone(),
+                InputCombinations(vec![InputCombination(vec![KeyScan(*scan)])]),
+            )
+        }));
         Bindings(m)
+    }
+}
+
+impl Bindings {
+    pub(crate) fn fill_missing_defaults(&mut self) {
+        let mut defaults = Self::default();
+        self.0.retain(|act, _| defaults.0.contains_key(act));
+        for (action, scan, digit) in &SPEED_DEFAULTS {
+            let taken = self.0.values().any(|combinations| {
+                combinations.0.iter().any(|combination| {
+                    combination.0.contains(&KeyScan(*scan))
+                        || combination.0.contains(&Key(K::c(digit)))
+                })
+            });
+            if taken {
+                defaults.0.get_mut(action).unwrap().0.clear();
+            }
+        }
+        for (act, comb) in defaults.0 {
+            self.0.entry(act).or_insert(comb);
+        }
     }
 }
 
@@ -351,7 +385,14 @@ impl Display for UnitInput {
             WheelDown => {
                 write!(f, "Scroll Down")
             }
-            KeyScan(scan) => write!(f, "ScanCode({scan})"),
+            KeyScan(scan) => {
+                if let Some((_, _, digit)) = SPEED_DEFAULTS.iter().find(|(_, code, _)| code == scan)
+                {
+                    f.write_str(digit)
+                } else {
+                    write!(f, "ScanCode({scan})")
+                }
+            }
         }
     }
 }
@@ -499,5 +540,58 @@ impl Display for InputAction {
                 OpenDebugMenu => "Debug Menu",
             }
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qf1_missing_speed_defaults_respect_saved_bindings() {
+        let mut bindings = saved_bindings();
+        bindings.fill_missing_defaults();
+        assert!(bindings.0[&Speed1].0.is_empty());
+        assert!(bindings.0[&Speed3].0.is_empty());
+        assert!(bindings.0[&Speed8].0.is_empty());
+        assert!(bindings.0[&Speed50].0.is_empty());
+
+        let mut input_map = InputMap::default();
+        input_map.build_input_tree(&mut bindings);
+        let mut input = InputContext::default();
+        input.keyboard.pressed.insert(K::c("1"));
+        input.keyboard.pressed_scancode.insert(TOP_ROW_DIGITS[0]);
+        input_map.prepare_frame(&input, true, true);
+        assert!(input_map.just_act.contains(&GoRight));
+        assert!(!input_map.just_act.contains(&Speed1));
+
+        input.keyboard.pressed.clear();
+        input.keyboard.pressed_scancode.clear();
+        input.keyboard.pressed_scancode.insert(TOP_ROW_DIGITS[3]);
+        input_map.prepare_frame(&input, true, true);
+        assert!(input_map.just_act.contains(&Speed20));
+        input_map.prepare_frame(&input, false, true);
+        assert!(!input_map.act.contains(&Speed20));
+    }
+
+    fn saved_bindings() -> Bindings {
+        Bindings(BTreeMap::from([
+            (
+                GoRight,
+                InputCombinations(vec![InputCombination(vec![Key(K::c("1"))])]),
+            ),
+            (
+                Select,
+                InputCombinations(vec![InputCombination(vec![KeyScan(TOP_ROW_DIGITS[1])])]),
+            ),
+            (
+                GoLeft,
+                InputCombinations(vec![InputCombination(vec![
+                    Key(K::Control),
+                    Key(K::c("3")),
+                ])]),
+            ),
+            (Speed50, InputCombinations(vec![])),
+        ]))
     }
 }

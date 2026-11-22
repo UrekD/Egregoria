@@ -18,7 +18,7 @@ use crate::network::NetworkState;
 use crate::uiworld::UiWorld;
 
 const SPEEDS: [(u32, &str, Option<&str>, InputAction); 6] = [
-    (0, "Pause 0×", Some("pause"), InputAction::PausePlay),
+    (0, "Pause", Some("pause"), InputAction::PausePlay),
     (1, "1×", Some("play"), InputAction::Speed1),
     (3, "3×", Some("forward"), InputAction::Speed3),
     (8, "8×", None, InputAction::Speed8),
@@ -27,10 +27,32 @@ const SPEEDS: [(u32, &str, Option<&str>, InputAction); 6] = [
 ];
 
 fn set_warp(warp: &mut u32, depause_warp: &mut u32, requested: u32) {
-    if requested == 0 && *warp != 0 {
-        *depause_warp = *warp;
+    if requested == 0 {
+        if *warp == 0 {
+            *warp = *depause_warp;
+        } else {
+            *depause_warp = *warp;
+            *warp = 0;
+        }
+    } else {
+        *warp = requested;
     }
-    *warp = requested;
+}
+
+impl GuiState {
+    pub(crate) fn apply_time_shortcut(uiworld: &UiWorld) {
+        let input = uiworld.read::<InputMap>();
+        if let Some((requested, _, _, _)) = SPEEDS
+            .iter()
+            .find(|(_, _, _, action)| input.just_act.contains(action))
+        {
+            set_warp(
+                &mut uiworld.write::<Settings>().time_warp,
+                &mut uiworld.write::<GuiState>().depause_warp,
+                *requested,
+            );
+        }
+    }
 }
 
 pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
@@ -39,19 +61,6 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
     let warp = &mut uiworld.write::<Settings>().time_warp;
     let mut gui = uiworld.write::<GuiState>();
     let depause_warp = &mut gui.depause_warp;
-    let input = uiworld.read::<InputMap>();
-    if let Some((requested, _, _, _)) = SPEEDS
-        .iter()
-        .find(|(_, _, _, action)| input.just_act.contains(action))
-    {
-        let requested = if *requested == 0 && *warp == 0 {
-            *depause_warp
-        } else {
-            *requested
-        };
-        set_warp(warp, depause_warp, requested);
-    }
-
     let network = uiworld.read::<NetworkState>();
     let actual_warp = match &*network {
         NetworkState::Singleplayer(step) => step.achieved_warp(*warp),
@@ -60,8 +69,10 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
     };
     let bindings = uiworld.read::<Bindings>();
 
-    if *warp == 0 {
-        yakui::canvas(|ctx| {
+    let paused = *warp == 0;
+    // Keep the control widgets in place when the pause outline changes.
+    yakui::canvas(move |ctx| {
+        if paused {
             let w = ctx.layout.viewport().size().length() * 0.002;
             yakui::shapes::outline(
                 ctx.paint,
@@ -69,8 +80,8 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
                 w,
                 Color::rgba(255, 0, 0, 128),
             );
-        });
-    }
+        }
+    });
 
     let time_text = || {
         padx(5.0, || {
@@ -108,10 +119,9 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
                     label.push_str(&format!(" ({binding})"));
                 }
                 if let Some(actual) =
-                    actual_warp.filter(|actual| selected && *actual < f64::from(*speed) - 0.5)
+                    actual_warp.filter(|actual| selected && *actual < f64::from(*speed) * 0.9)
                 {
-                    let precision = usize::from(actual < 1.0);
-                    label.push_str(&format!(" · ≈{actual:.precision$}× actual"));
+                    label.push_str(&format!(" · ≈{actual:.1}× actual"));
                 }
                 if tooltip(label, || b.show()).clicked {
                     set_warp(warp, depause_warp, *speed);
@@ -149,4 +159,45 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
             });
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qf1_pause_toggle_restores_previous_speed() {
+        let mut warp = 20;
+        let mut depause_warp = 1;
+        set_warp(&mut warp, &mut depause_warp, 0);
+        assert_eq!(warp, 0);
+        set_warp(&mut warp, &mut depause_warp, 0);
+        assert_eq!(warp, 20);
+    }
+
+    #[test]
+    fn qf1_speed_shortcuts_apply_with_the_hud_hidden() {
+        let mut uiw = UiWorld::default();
+        uiw.insert(GuiState {
+            hidden: true,
+            ..GuiState::default()
+        });
+        uiw.insert(Settings::default());
+        uiw.insert(InputMap::default());
+
+        uiw.write::<InputMap>()
+            .just_act
+            .insert(InputAction::Speed50);
+        GuiState::apply_time_shortcut(&uiw);
+        assert_eq!(uiw.read::<Settings>().time_warp, 50);
+
+        uiw.write::<InputMap>().just_act.clear();
+        uiw.write::<InputMap>()
+            .just_act
+            .insert(InputAction::PausePlay);
+        GuiState::apply_time_shortcut(&uiw);
+        assert_eq!(uiw.read::<Settings>().time_warp, 0);
+        GuiState::apply_time_shortcut(&uiw);
+        assert_eq!(uiw.read::<Settings>().time_warp, 50);
+    }
 }

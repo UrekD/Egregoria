@@ -15,18 +15,9 @@ use crate::inputmap::{InputAction, InputMap};
 
 const CAMERA_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 const CAMERA_SETTLE_TIME: Duration = Duration::from_millis(250);
+const CAMERA_MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+const CAMERA_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
 static WARNED_CAMERA_SAVE: AtomicBool = AtomicBool::new(false);
-
-fn should_save_camera(
-    changed: bool,
-    in_flight: bool,
-    since_attempt: Option<Duration>,
-    settled: bool,
-) -> bool {
-    changed
-        && !in_flight
-        && (settled || since_attempt.is_none_or(|elapsed| elapsed >= CAMERA_SAVE_INTERVAL))
-}
 
 fn same_camera(a: &Camera, b: &Camera) -> bool {
     a.pos == b.pos
@@ -52,6 +43,14 @@ fn save_camera_file(camera: &Camera) -> bool {
     }
 }
 
+fn spawn_camera_save(camera: Camera) -> Receiver<bool> {
+    let (done, result) = mpsc::channel();
+    rayon::spawn(move || {
+        let _ = done.send(save_camera_file(&camera));
+    });
+    result
+}
+
 #[derive(Default)]
 struct CameraSave {
     enabled: bool,
@@ -59,22 +58,21 @@ struct CameraSave {
     saved: Option<Camera>,
     last_attempt: Option<Instant>,
     in_flight: Option<(Camera, Receiver<bool>)>,
+    retry: Option<(Instant, Duration)>,
+    shutdown_deadline: Option<Instant>,
 }
 
 impl CameraSave {
-    fn update(&mut self, camera: Camera, now: Instant) {
-        if let Some((submitted, result)) = &self.in_flight {
-            match result.try_recv() {
-                Ok(success) => {
-                    if success {
-                        self.saved = Some(*submitted);
-                    }
-                    self.in_flight = None;
-                }
-                Err(TryRecvError::Disconnected) => self.in_flight = None,
-                Err(TryRecvError::Empty) => {}
-            }
+    fn update(
+        &mut self,
+        camera: Camera,
+        now: Instant,
+        spawn: impl FnOnce(Camera) -> Receiver<bool>,
+    ) {
+        if self.shutdown_deadline.is_some() {
+            return;
         }
+        self.poll_write(now);
 
         let changed_at = match self.observed {
             Some((previous, at)) if same_camera(&camera, &previous) => at,
@@ -84,35 +82,76 @@ impl CameraSave {
         let settled_at = changed_at + CAMERA_SETTLE_TIME;
         let final_save_due =
             now >= settled_at && self.last_attempt.is_none_or(|at| at < settled_at);
-        if should_save_camera(
-            self.saved.is_none_or(|saved| !same_camera(&camera, &saved)),
-            self.in_flight.is_some(),
-            self.last_attempt.map(|at| now.duration_since(at)),
-            final_save_due,
-        ) {
-            let (done, result) = mpsc::channel();
-            self.last_attempt = Some(now);
-            self.in_flight = Some((camera, result));
-            rayon::spawn(move || {
-                let _ = done.send(save_camera_file(&camera));
-            });
+        let interval_elapsed = self
+            .last_attempt
+            .is_none_or(|at| now.duration_since(at) >= CAMERA_SAVE_INTERVAL);
+        if self.in_flight.is_none()
+            && self.needs_save(&camera)
+            && self.retry.is_none_or(|(retry_at, _)| now >= retry_at)
+            && (final_save_due || interval_elapsed)
+        {
+            self.start_write(camera, now, spawn);
         }
     }
-}
 
-impl Drop for CameraSave {
-    fn drop(&mut self) {
-        // The event loop drops the camera on exit. Finish any write before flushing the latest view.
-        if let Some((submitted, result)) = self.in_flight.take() {
-            if result.recv() == Ok(true) {
-                self.saved = Some(submitted);
-            }
+    fn poll_shutdown(
+        &mut self,
+        camera: Camera,
+        now: Instant,
+        spawn: impl FnOnce(Camera) -> Receiver<bool>,
+    ) -> bool {
+        if !self.enabled {
+            return true;
         }
-        if let Some((camera, _)) = self.observed {
-            if self.saved.is_none_or(|saved| !same_camera(&camera, &saved)) {
-                save_camera_file(&camera);
-            }
+        let deadline = *self
+            .shutdown_deadline
+            .get_or_insert(now + CAMERA_SHUTDOWN_TIMEOUT);
+        if now >= deadline {
+            return true;
         }
+        self.poll_write(now);
+        if self.in_flight.is_some() {
+            return false;
+        }
+        if !self.needs_save(&camera) || self.retry.is_some_and(|(retry_at, _)| now < retry_at) {
+            return true;
+        }
+        self.start_write(camera, now, spawn);
+        false
+    }
+
+    fn needs_save(&self, camera: &Camera) -> bool {
+        self.saved.is_none_or(|saved| !same_camera(camera, &saved))
+    }
+
+    fn start_write(
+        &mut self,
+        camera: Camera,
+        now: Instant,
+        spawn: impl FnOnce(Camera) -> Receiver<bool>,
+    ) {
+        self.last_attempt = Some(now);
+        self.in_flight = Some((camera, spawn(camera)));
+    }
+
+    fn poll_write(&mut self, now: Instant) {
+        let Some((submitted, result)) = &self.in_flight else {
+            return;
+        };
+        match result.try_recv() {
+            Ok(true) => {
+                self.saved = Some(*submitted);
+                self.retry = None;
+            }
+            Ok(false) | Err(TryRecvError::Disconnected) => {
+                let delay = self.retry.map_or(CAMERA_SAVE_INTERVAL, |(_, previous)| {
+                    (previous * 2).min(CAMERA_MAX_RETRY_DELAY)
+                });
+                self.retry = Some((now + delay, delay));
+            }
+            Err(TryRecvError::Empty) => return,
+        }
+        self.in_flight = None;
     }
 }
 
@@ -138,8 +177,13 @@ impl OrbitCamera {
         params.cam_pos = self.camera.eye();
         params.cam_dir = -self.camera.dir();
         if self.save.enabled {
-            self.save.update(self.camera, Instant::now());
+            self.save
+                .update(self.camera, Instant::now(), spawn_camera_save);
         }
+    }
+
+    pub(crate) fn poll_save_on_exit(&mut self, now: Instant) -> bool {
+        self.save.poll_shutdown(self.camera, now, spawn_camera_save)
     }
 
     pub fn height(&self) -> f32 {
@@ -415,34 +459,113 @@ fn starter_view(map: &Map) -> Option<Vec3> {
 mod qf1_tests {
     use super::*;
 
+    fn pose(x: u32) -> Camera {
+        Camera::new(Vec3::new(x as f32, 0.0, 0.0), 1280.0, 720.0)
+    }
+
     #[test]
-    fn qf1_camera_saves_only_changes_and_throttles_until_settled() {
-        assert!(!should_save_camera(false, false, None, false));
-        assert!(should_save_camera(true, false, None, false));
-        assert!(!should_save_camera(
-            true,
-            false,
-            Some(CAMERA_SAVE_INTERVAL - Duration::from_millis(1)),
-            false,
-        ));
-        assert!(should_save_camera(
-            true,
-            false,
-            Some(CAMERA_SAVE_INTERVAL),
-            false
-        ));
-        assert!(should_save_camera(
-            true,
-            false,
-            Some(CAMERA_SETTLE_TIME),
-            true
-        ));
-        assert!(!should_save_camera(
-            true,
-            true,
-            Some(CAMERA_SAVE_INTERVAL),
-            true
-        ));
+    fn qf1_camera_update_throttles_motion_and_flushes_when_still() {
+        let start = Instant::now();
+        let mut save = CameraSave::default();
+        let mut writes = Vec::new();
+        let mut writer = |camera: Camera| {
+            writes.push(camera.pos.x as u32);
+            let (done, result) = mpsc::channel();
+            done.send(true).unwrap();
+            result
+        };
+        for step in 0..=20 {
+            save.update(pose(step), start + CAMERA_SETTLE_TIME * step, &mut writer);
+        }
+        save.update(pose(20), start + CAMERA_SETTLE_TIME * 21, &mut writer);
+        save.update(pose(20), start + CAMERA_SETTLE_TIME * 40, &mut writer);
+        assert_eq!(writes, [0, 8, 16, 20]);
+    }
+
+    #[test]
+    fn qf1_camera_update_coalesces_while_a_write_is_in_flight() {
+        let start = Instant::now();
+        let mut save = CameraSave::default();
+        let (done, result) = mpsc::channel();
+        save.update(pose(1), start, |_| result);
+        save.update(pose(2), start + CAMERA_SAVE_INTERVAL, |_| {
+            panic!("second writer")
+        });
+        assert!(save.saved.is_none());
+        done.send(true).unwrap();
+        save.update(pose(3), start + CAMERA_SAVE_INTERVAL * 2, |camera| {
+            assert!(same_camera(&camera, &pose(3)));
+            mpsc::channel().1
+        });
+        assert!(same_camera(&save.saved.unwrap(), &pose(1)));
+    }
+
+    #[test]
+    fn qf1_camera_failure_backs_off_even_after_the_camera_settles() {
+        let start = Instant::now();
+        let mut save = CameraSave::default();
+        let fail = |_| {
+            let (done, result) = mpsc::channel();
+            done.send(false).unwrap();
+            result
+        };
+        save.update(pose(1), start, fail);
+        save.update(pose(1), start, |_| panic!("immediate retry"));
+        save.update(pose(1), start + CAMERA_SETTLE_TIME, |_| {
+            panic!("settling bypassed backoff")
+        });
+        assert!(save.saved.is_none());
+        let retry = start + CAMERA_SAVE_INTERVAL;
+        save.update(pose(1), retry, fail);
+        save.update(pose(1), retry, |_| panic!("immediate retry"));
+        save.update(pose(1), retry + CAMERA_SAVE_INTERVAL, |_| {
+            panic!("backoff did not grow")
+        });
+        save.update(pose(1), retry + CAMERA_SAVE_INTERVAL * 2, fail);
+        assert!(save.in_flight.is_some());
+    }
+
+    #[test]
+    fn qf1_camera_shutdown_flushes_the_latest_pose_in_order() {
+        let start = Instant::now();
+        let mut save = CameraSave {
+            enabled: true,
+            ..CameraSave::default()
+        };
+        let (done, result) = mpsc::channel();
+        save.update(pose(1), start, |_| result);
+
+        assert!(!save.poll_shutdown(pose(2), start, |_| panic!("second writer")));
+        done.send(true).unwrap();
+        let (done, result) = mpsc::channel();
+        let next_poll = start + Duration::from_millis(100);
+        assert!(!save.poll_shutdown(pose(2), next_poll, |camera| {
+            assert!(same_camera(&camera, &pose(2)));
+            result
+        }));
+        done.send(true).unwrap();
+        assert!(save.poll_shutdown(pose(2), next_poll, |_| panic!("pose already saved")));
+        assert!(same_camera(&save.saved.unwrap(), &pose(2)));
+    }
+
+    #[test]
+    fn qf1_camera_shutdown_stops_waiting_at_the_deadline() {
+        let start = Instant::now();
+        let mut save = CameraSave {
+            enabled: true,
+            ..CameraSave::default()
+        };
+        let (_stalled, result) = mpsc::channel();
+        save.update(pose(1), start, |_| result);
+        assert!(!save.poll_shutdown(pose(2), start, |_| panic!("second writer")));
+
+        let deadline = start + CAMERA_SHUTDOWN_TIMEOUT;
+        assert!(
+            !save.poll_shutdown(pose(2), deadline - Duration::from_millis(1), |_| {
+                panic!("second writer")
+            })
+        );
+        assert!(save.poll_shutdown(pose(2), deadline, |_| panic!("second writer")));
     }
 }
 

@@ -25,6 +25,7 @@ use crate::gui::windows::settings::{manage_settings, Settings};
 use crate::gui::UiTextures;
 use crate::gui::{render_newgui, GuiState, TimeAlways, Tool};
 use crate::inputmap::{Bindings, InputAction, InputMap};
+use crate::network::NetworkState;
 use crate::rendering::{InstancedRender, MapRenderOptions, MapRenderer, OrbitCamera};
 use crate::session::save_coordinator::SaveCoordinator;
 use crate::session::{
@@ -86,13 +87,7 @@ impl engine::framework::State for State {
         };
 
         let mut bindings = uiworld.write::<Bindings>();
-        let default_bindings = Bindings::default();
-        bindings
-            .0
-            .retain(|act, _| default_bindings.0.contains_key(act));
-        for (act, comb) in default_bindings.0 {
-            bindings.0.entry(act).or_insert(comb);
-        }
+        bindings.fill_missing_defaults();
         uiworld.write::<InputMap>().build_input_tree(&mut bindings);
         drop(bindings);
 
@@ -190,6 +185,9 @@ impl engine::framework::State for State {
                 !ctx.egui.last_mouse_captured,
             );
             if world_interaction {
+                if !ctx.keybind_mode {
+                    GuiState::apply_time_shortcut(&self.uiw);
+                }
                 if *self.uiw.read::<Tool>() == Tool::Bulldozer {
                     self.uiw
                         .write::<gui::bulldozer::BulldozerState>()
@@ -308,7 +306,7 @@ impl engine::framework::State for State {
                 session::finish_departure(&self.uiw, Departure::Exit);
             }
         }
-        ready_to_exit(&self.uiw)
+        ready_to_exit(&self.uiw) && self.uiw.camera_mut().poll_save_on_exit(Instant::now())
     }
 
     fn render_gui(&mut self, ui: &egui::Context) {
@@ -344,7 +342,7 @@ impl State {
         if self.uiw.read::<SaveLoadState>().exit_requested {
             // The worker reports completion after it has published or cleaned up staging files.
             self.poll_save();
-            if ready_to_exit(&self.uiw) {
+            if ready_to_exit(&self.uiw) && self.uiw.camera_mut().poll_save_on_exit(Instant::now()) {
                 ctx.request_exit();
             }
             self.uiw.write::<SessionState>().interaction_blocked = true;
@@ -414,6 +412,12 @@ impl State {
         {
             if let Some(replacement) = crate::network::sim_update(self) {
                 self.replace_world(ctx, replacement);
+            }
+        } else {
+            // Time spent in menus or a modal is not simulation catch-up time.
+            #[allow(irrefutable_let_patterns)]
+            if let NetworkState::Singleplayer(step) = &mut *self.uiw.write::<NetworkState>() {
+                step.prepare_frame(0);
             }
         }
         true

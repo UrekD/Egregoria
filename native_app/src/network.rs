@@ -70,6 +70,7 @@ fn handle_singleplayer(state: &mut State) {
     step.prepare_frame(timewarp);
     while step.tick() || (has_commands && commands_once.is_some()) {
         let t = sim.tick(sched, commands_once.take().unwrap_or_default().as_ref());
+        step.record_tick();
         timings.world_update.add_value(t.as_secs_f32());
     }
 
