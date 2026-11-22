@@ -1,0 +1,23 @@
+[
+  {"SetSession": "MainMenu"},
+  {"OpenWindow": "Load"},
+  {"WaitFrames": 8},
+  {"LoadSlot": "showcase_city"},
+  {"WaitFrames": 6},
+  {"Camera": {"x": 3570, "y": 5930, "z": 0, "yaw": -0.91, "pitch": 1.16, "dist": 120}},
+  {"FollowHuman": {"pick": "BoardingCar", "max_ticks": 432000}},
+  {"WaitFrames": 4},
+  {"Assert": "CameraOnFollowed"},
+  {"Screenshot": "follow1-before"},
+  {"RunFollowing": {"ticks": 6000, "until": "Vehicle"}},
+  {"Assert": "CameraOnFollowed"},
+  {"Screenshot": "follow1-entered"},
+  {"RunFollowing": {"ticks": 300, "until": null}},
+  {"Assert": "CameraOnFollowed"},
+  {"Screenshot": "follow1-driving"},
+  {"RunFollowing": {"ticks": 36000, "until": "Outside"}},
+  {"Assert": "CameraOnFollowed"},
+  {"Screenshot": "follow1-exited"},
+  {"DumpState": "follow1"},
+  "Exit"
+]

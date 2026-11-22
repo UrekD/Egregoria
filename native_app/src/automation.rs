@@ -16,13 +16,15 @@ use simulation::economy::{Budget, CityStats, Government, ZoneDemand};
 use simulation::map::{
     BuildingKind, Map, ProjectFilter, ProjectKind, RoadID, Zone, ZoneGrid, ZoneKind,
 };
+use simulation::transportation::Location;
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand, WorldCommands};
-use simulation::Simulation;
+use simulation::{AnyEntity, HumanID, Simulation};
 
+use crate::gui::follow::{follow_pos, FollowEntity};
 use crate::gui::{
     overlays::OverlayMode, toolbox::building::BuildingTab, top_demand_driver, zoning::ZONES,
-    GuiState, InspectedBuilding, Tool,
+    GuiState, InspectedBuilding, InspectedEntity, Tool,
 };
 use crate::session::{self, SessionScreen, SlotCompatibility};
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
@@ -62,6 +64,17 @@ enum Step {
         dist: f32,
     },
     Builder(Builder),
+    /// Tick until a human matches `pick`, then inspect and follow them.
+    /// The game loop does not move a scripted camera, so the follow steps do.
+    FollowHuman {
+        pick: HumanPick,
+        max_ticks: u64,
+    },
+    /// Tick until the followed human reaches `until` (or for `ticks`), then move the camera to them.
+    RunFollowing {
+        ticks: u64,
+        until: Option<FollowedLocation>,
+    },
     SelectTool(Tool),
     SetOverlay(OverlayMode),
     SetSession(SessionScreen),
@@ -96,6 +109,34 @@ enum Assertion {
         after: String,
         expected: BTreeSet<RoadID>,
     },
+    /// The followed human is still inspected and the camera is on whatever carries them.
+    CameraOnFollowed,
+}
+
+#[derive(Deserialize, Clone, Copy)]
+enum HumanPick {
+    /// The human on a trip standing closest to their own parked car, within the
+    /// distance the router walks to a personal car.
+    BoardingCar,
+}
+
+#[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
+enum FollowedLocation {
+    Outside,
+    Vehicle,
+    Transit,
+    Building,
+}
+
+impl FollowedLocation {
+    fn of(location: &Location) -> Self {
+        match location {
+            Location::Outside => Self::Outside,
+            Location::Vehicle(_) => Self::Vehicle,
+            Location::Transit(_) => Self::Transit,
+            Location::Building(_) => Self::Building,
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -385,6 +426,8 @@ impl Automation {
                     | Step::BuildSpecialBuildings(_)
                     | Step::EmptyTreasury
                     | Step::Builder(_)
+                    | Step::FollowHuman { .. }
+                    | Step::RunFollowing { .. }
                     | Step::Camera { .. }
                     | Step::SelectTool(_)
             )
@@ -502,6 +545,52 @@ impl Automation {
                 orbit.camera.yaw = orbit.targetyaw;
                 orbit.camera.pitch = orbit.targetpitch;
                 orbit.camera.dist = dist;
+            }
+            Step::FollowHuman { pick, max_ticks } => {
+                let mut sim = sim.write().unwrap();
+                let mut ran = 0;
+                let human = loop {
+                    if let Some(human) = pick.find(&sim) {
+                        break human;
+                    }
+                    if ran == max_ticks {
+                        return Err(format!("no human matched the pick in {max_ticks} ticks"));
+                    }
+                    sim.tick(schedule, []);
+                    ran += 1;
+                };
+                *uiw.write::<InspectedEntity>() = InspectedEntity {
+                    e: Some(human.into()),
+                    ..Default::default()
+                };
+                uiw.write::<FollowEntity>().0 = Some(human.into());
+                FollowEntity::track(uiw, &sim);
+                eprintln!("automation: following {human:?} after {ran} ticks");
+                self.wait = Some(Wait::Map {
+                    tick: sim.get_tick(),
+                    settle_frames: 2,
+                });
+            }
+            Step::RunFollowing { ticks, until } => {
+                let mut sim = sim.write().unwrap();
+                let followed = followed_human(uiw)?;
+                let mut ran = 0;
+                while ran < ticks && until != Some(followed_location(&sim, followed)?) {
+                    sim.tick(schedule, []);
+                    ran += 1;
+                }
+                let location = followed_location(&sim, followed)?;
+                if until.is_some_and(|until| until != location) {
+                    return Err(format!(
+                        "followed human still {location:?} after {ticks} ticks"
+                    ));
+                }
+                eprintln!("automation: followed human {location:?} after {ran} ticks");
+                FollowEntity::track(uiw, &sim);
+                self.wait = Some(Wait::Map {
+                    tick: sim.get_tick(),
+                    settle_frames: 2,
+                });
             }
             Step::SelectTool(tool) => *uiw.write::<Tool>() = tool,
             Step::SetOverlay(mode) => *uiw.write::<OverlayMode>() = mode,
@@ -749,9 +838,54 @@ impl Assertion {
                     ));
                 }
             }
+            Self::CameraOnFollowed => {
+                let human = followed_human(uiw)?;
+                if uiw.read::<InspectedEntity>().e != Some(human.into()) {
+                    return Err("the followed human is no longer inspected".into());
+                }
+                let expected = follow_pos(sim, human.into()).ok_or("followed human despawned")?;
+                let actual = uiw.camera().targetpos;
+                if actual.distance(expected) > 0.01 {
+                    return Err(format!(
+                        "camera at {actual:?}, followed human at {expected:?}"
+                    ));
+                }
+            }
         }
         Ok(())
     }
+}
+
+impl HumanPick {
+    fn find(self, sim: &Simulation) -> Option<HumanID> {
+        match self {
+            Self::BoardingCar => sim
+                .world()
+                .humans
+                .iter()
+                .filter(|(_, h)| h.location == Location::Outside && h.router.target_dest.is_some())
+                .filter_map(|(id, h)| {
+                    let car = sim.get(h.router.personal_car?)?;
+                    let dist = car.trans.pos.distance(h.trans.pos);
+                    (car.vehicle.state.is_parked() && dist <= 400.0).then_some((id, dist))
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1))
+                .map(|(id, _)| id),
+        }
+    }
+}
+
+fn followed_human(uiw: &UiWorld) -> Result<HumanID, String> {
+    match uiw.read::<FollowEntity>().0 {
+        Some(AnyEntity::HumanID(id)) => Ok(id),
+        other => Err(format!("expected to follow a human, following {other:?}")),
+    }
+}
+
+fn followed_location(sim: &Simulation, human: HumanID) -> Result<FollowedLocation, String> {
+    sim.get(human)
+        .map(|h| FollowedLocation::of(&h.location))
+        .ok_or_else(|| "followed human despawned".into())
 }
 
 impl PointerPosition {
@@ -924,6 +1058,30 @@ mod tests {
             JSON::decode::<Step>(json).unwrap(),
             Step::LoadSlot(id) if id == "showcase_city"
         ));
+    }
+
+    #[test]
+    fn follow1_follow_script_decodes() {
+        let path =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/shots/follow1_showcase.json");
+        let steps: Vec<Step> = JSON::decode(&fs::read(path).unwrap()).unwrap();
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            Step::FollowHuman {
+                pick: HumanPick::BoardingCar,
+                ..
+            }
+        )));
+        assert!(steps.iter().any(|s| matches!(
+            s,
+            Step::RunFollowing {
+                until: Some(FollowedLocation::Vehicle),
+                ..
+            }
+        )));
+        assert!(steps
+            .iter()
+            .any(|s| matches!(s, Step::Assert(Assertion::CameraOnFollowed))));
     }
 
     #[test]
