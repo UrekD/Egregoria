@@ -3,10 +3,10 @@ use crate::economy::{Budget, BudgetCategory, Government, Market};
 use crate::map::{BuildingID, BuildingKind, RoadID, Zone};
 use crate::map_dynamic::{
     electricity_flow_system, utility_flow_update, BuildingInfos, CoverageGrid, ElectricityFlow,
-    UtilityFlow,
+    EnvGrid, UtilityFlow,
 };
 use crate::souls::desire::{Work, WorkKind};
-use crate::souls::{goods_company::company_soul, human::spawn_human, residence};
+use crate::souls::{events, goods_company::company_soul, human::spawn_human, residence};
 use crate::world::CompanyID;
 use crate::world_command::{CommandOutcomes, Rejection};
 use crate::{Simulation, SoulID, WorldCommand};
@@ -151,10 +151,12 @@ fn p2_spine_school_alone_does_not_advance_residence() {
         test.g.world.humans[resident].work =
             Some(Work::new(school_building, WorkKind::Worker, 0.0));
     }
+    let before = Bincode::encode(&*test.g.read::<residence::Residences>()).unwrap();
     for hour in 1..=6 {
-        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
-        residence::residence_update(&mut test.g);
+        p2d_residence_check(&mut test.g, hour);
     }
+    let after = Bincode::encode(&*test.g.read::<residence::Residences>()).unwrap();
+    assert_ne!(after, before, "the hourly checks should record residence state");
     assert_eq!(
         test.g.read::<residence::Residences>().by_building[&house].level,
         1
@@ -271,7 +273,13 @@ fn p2b_staff(test: &mut TestCtx, company: CompanyID, house: BuildingID) {
     test.g.world.companies[company].workers.0.push(worker);
 }
 
-fn p2b_update(sim: &mut Simulation, tick: u64) {
+fn p2b_update(sim: &mut Simulation, boundary: u64) {
+    let tick = boundary + UtilityFlow::UPDATE_OFFSET;
+    assert!(UtilityFlow::due(tick));
+    p2b_update_at(sim, tick);
+}
+
+fn p2b_update_at(sim: &mut Simulation, tick: u64) {
     *sim.write::<GameTime>() = GameTime::new(Tick(tick));
     let (world, resources) = sim.world_res();
     electricity_flow_system(world, resources);
@@ -317,7 +325,7 @@ fn p2b_road_removal_splits_pipe_supply() {
     p2b_staff(&mut test, outlet, supplied);
     p2b_staff(&mut test, plant, separated);
 
-    *test.g.write::<GameTime>() = GameTime::new(Tick(2_998));
+    *test.g.write::<GameTime>() = GameTime::new(Tick(3_000 + UtilityFlow::UPDATE_OFFSET - 2));
     test.tick_fast();
     assert!(!test.g.read::<UtilityFlow>().has_water(supplied));
     test.tick_fast();
@@ -334,7 +342,9 @@ fn p2b_road_removal_splits_pipe_supply() {
         test.g.map().electricity.net_id(supplied),
         test.g.map().electricity.net_id(separated)
     );
-    p2b_update(&mut test.g, 5_999);
+    let off_tick = 6_000 + UtilityFlow::UPDATE_OFFSET - 1;
+    assert!(!UtilityFlow::due(off_tick));
+    p2b_update_at(&mut test.g, off_tick);
     assert!(test.g.read::<UtilityFlow>().has_water(separated));
     p2b_update(&mut test.g, 6_000);
 
@@ -471,7 +481,7 @@ fn p2c_emitter_adds_pollution_with_linear_falloff() {
     let center = vec2(208.0, 208.0);
     p2c_place_polluter(&mut test, center);
 
-    test.g.write::<GameTime>().tick.0 = 2998;
+    test.g.write::<GameTime>().tick.0 = 3_000 + EnvGrid::UPDATE_OFFSET - 2;
     test.tick_fast();
     assert!(test.g.read::<EnvGrid>().cells.is_empty());
     test.tick_fast();
@@ -611,9 +621,18 @@ fn p2c_place_polluter(test: &mut TestCtx, center: geom::Vec2) -> crate::map::Bui
     building
 }
 
-fn p2c_update_at(sim: &mut Simulation, tick: u64) {
-    sim.write::<prototypes::GameTime>().tick.0 = tick;
+fn p2c_update_at(sim: &mut Simulation, boundary: u64) {
+    let tick = boundary + EnvGrid::UPDATE_OFFSET;
+    assert!(EnvGrid::due(tick));
+    sim.write::<GameTime>().tick.0 = tick;
     crate::map_dynamic::env_update(sim);
+}
+
+fn p2d_residence_check(sim: &mut Simulation, hour: u64) {
+    let tick = (hour - 1) * TICKS_PER_HOUR + residence::UPDATE_OFFSET;
+    assert!(residence::due(tick));
+    *sim.write::<GameTime>() = GameTime::new(Tick(tick));
+    residence::residence_update(sim);
 }
 
 struct P2dProgression {
@@ -681,8 +700,9 @@ impl P2dProgression {
     }
 
     fn check(&mut self, hour: u64) {
-        p2b_update(&mut self.test.g, hour * TICKS_PER_HOUR);
-        residence::residence_update(&mut self.test.g);
+        let previous_period = hour * TICKS_PER_HOUR - 3_000;
+        p2b_update(&mut self.test.g, previous_period);
+        p2d_residence_check(&mut self.test.g, hour);
     }
 
     fn level(&self) -> u8 {
@@ -724,10 +744,9 @@ fn p2d_l2_requires_power_water_sewage_and_school() {
         for hour in 1..=6 {
             if unmet == "power" {
                 let sim = &mut fixture.test.g;
-                *sim.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
                 let (world, resources) = sim.world_res();
                 electricity_flow_system(world, resources);
-                residence::residence_update(sim);
+                p2d_residence_check(sim, hour);
             } else {
                 fixture.check(hour);
             }
@@ -812,13 +831,15 @@ fn p2d_abandonment_requires_twelve_consecutive_unserved_checks() {
 }
 
 fn p2d_force_ignite(sim: &Simulation, building: BuildingID) {
-    *sim.write::<GameTime>() = GameTime::new(Tick(TICKS_PER_HOUR));
-    crate::souls::events::force_ignite(sim, building);
+    *sim.write::<GameTime>() = GameTime::new(Tick(TICKS_PER_HOUR + events::UPDATE_OFFSET));
+    events::force_ignite(sim, building);
 }
 
 fn p2d_fire_at(sim: &mut Simulation, hour: u64) {
-    *sim.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
-    crate::souls::events::events_update(sim);
+    let tick = hour * TICKS_PER_HOUR + events::UPDATE_OFFSET;
+    assert!(events::due(tick));
+    *sim.write::<GameTime>() = GameTime::new(Tick(tick));
+    events::events_update(sim);
 }
 
 #[test]
@@ -899,7 +920,7 @@ fn p2d_fire_lifetime_ignores_game_time_jumps() {
         let (mut test, house, _) = p2d_house();
         p2d_force_ignite(&test.g, house);
         test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(
-            destination * TICKS_PER_HOUR,
+            destination * TICKS_PER_HOUR + events::UPDATE_OFFSET,
         )))]);
 
         let mut schedule = crate::utils::scheduler::SeqSchedule::default();
@@ -953,8 +974,8 @@ fn p2d_fire_events_keep_the_latest_256_across_save_and_resume() {
         .or_default()
         .insert(house, 100.0);
     for hour in 1..=130 {
-        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
-        crate::souls::events::force_ignite(&test.g, house);
+        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR + events::UPDATE_OFFSET));
+        events::force_ignite(&test.g, house);
         p2d_fire_at(&mut test.g, hour + 1);
     }
     let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
@@ -1009,15 +1030,13 @@ fn p2d_mass_outage_benchmark() {
         .collect();
     test.g.map().check_invariants();
     for hour in 1..12 {
-        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
-        residence::residence_update(&mut test.g);
+        p2d_residence_check(&mut test.g, hour);
     }
     assert!(homes
         .iter()
         .all(|&(house, _)| !test.g.read::<residence::Residences>().is_abandoned(house)));
-    *test.g.write::<GameTime>() = GameTime::new(Tick(12 * TICKS_PER_HOUR));
     let start = std::time::Instant::now();
-    residence::residence_update(&mut test.g);
+    p2d_residence_check(&mut test.g, 12);
     let update_ms = start.elapsed().as_secs_f64() * 1000.0;
     crate::utils::scheduler::drain_commands(&mut test.g);
     let total_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -1106,6 +1125,7 @@ fn p2d_abandonment_batch_rehomes_in_id_order_and_clears_visitor_routes() {
 
 #[test]
 fn p2d_happiness_demand_is_weighted_by_residents_and_reported_separately() {
+    use crate::economy::balance::{DEMAND_INTERVAL_TICKS, DEMAND_OFFSET_TICKS};
     use crate::economy::{demand_update, DemandDriver, ZoneDemand};
     use crate::map::ZoneKind;
     use crate::souls::happiness::Happiness;
@@ -1126,7 +1146,9 @@ fn p2d_happiness_demand_is_weighted_by_residents_and_reported_separately() {
     spawn_human(&mut test.g, house).unwrap();
     spawn_human(&mut test.g, house).unwrap();
     spawn_human(&mut test.g, other).unwrap();
-    test.g.write::<GameTime>().tick.0 = TICKS_PER_HOUR;
+    let tick = TICKS_PER_HOUR - DEMAND_INTERVAL_TICKS + DEMAND_OFFSET_TICKS;
+    assert!(ZoneDemand::due(tick));
+    test.g.write::<GameTime>().tick.0 = tick;
     let (world, resources) = test.g.world_res();
     demand_update(world, resources);
     let demand = test.g.read::<ZoneDemand>();
@@ -1146,6 +1168,9 @@ fn p2d_happiness_demand_is_weighted_by_residents_and_reported_separately() {
             test.g.world.humans[human].work = Some(Work::new(house, WorkKind::Worker, 0.0));
         }
     }
+    let tick = tick + DEMAND_INTERVAL_TICKS;
+    assert!(ZoneDemand::due(tick));
+    test.g.write::<GameTime>().tick.0 = tick;
     let (world, resources) = test.g.world_res();
     demand_update(world, resources);
     assert_eq!(
@@ -1260,7 +1285,7 @@ fn p2d_l3_requires_health_and_land_value() {
         fixture.set_coverage(ServiceKind::Health, health);
         fixture.set_coverage(ServiceKind::Police, police);
         p2b_update(&mut fixture.test.g, 3_000);
-        crate::map_dynamic::env_update(&mut fixture.test.g);
+        p2c_update_at(&mut fixture.test.g, 3_000);
         let land_value = fixture
             .test
             .g
@@ -1290,17 +1315,25 @@ fn p2d_l3_requires_health_and_land_value() {
 
 #[test]
 fn p2d_happiness_changes_residential_demand() {
-    use crate::economy::balance::K_HAPPY;
+    use crate::economy::balance::{DEMAND_OFFSET_TICKS, K_HAPPY};
     use crate::economy::{demand_update, ZoneDemand};
     use crate::map::ZoneKind;
-    use crate::souls::happiness::{happiness_update, Happiness};
+    use crate::souls::happiness::{self, Happiness};
 
     let mut fixture = P2dProgression::new();
     let house = fixture.house;
     let sample = |sim: &mut Simulation, hour| {
-        p2b_update(sim, hour * TICKS_PER_HOUR);
-        crate::map_dynamic::env_update(sim);
-        happiness_update(sim);
+        let boundary = hour * TICKS_PER_HOUR;
+        p2b_update(sim, boundary);
+        p2c_update_at(sim, boundary);
+        let happiness_tick = boundary + happiness::UPDATE_OFFSET;
+        assert!(happiness::due(happiness_tick));
+        sim.write::<GameTime>().tick.0 = happiness_tick;
+        happiness::happiness_update(sim);
+        let demand_tick = boundary + DEMAND_OFFSET_TICKS;
+        assert!(ZoneDemand::due(demand_tick));
+        assert!(demand_tick > happiness_tick);
+        sim.write::<GameTime>().tick.0 = demand_tick;
         let (world, resources) = sim.world_res();
         demand_update(world, resources);
         (

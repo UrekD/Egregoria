@@ -4,7 +4,7 @@ use geom::{vec2, Vec2};
 use prototypes::{try_prototype, ServiceKind};
 use serde::{Deserialize, Serialize};
 
-use crate::map::{BuildingID, BuildingKind};
+use crate::map::{Building, BuildingID, BuildingKind};
 use crate::map_dynamic::{BuildingInfos, CoverageGrid, UtilityFlow};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
@@ -25,6 +25,11 @@ pub struct EnvGrid {
 
 impl EnvGrid {
     pub const CELL_SIZE: f32 = 32.0;
+    pub(crate) const UPDATE_OFFSET: u64 = 2;
+
+    pub(crate) const fn due(tick: u64) -> bool {
+        tick >= UPDATE_INTERVAL && tick % UPDATE_INTERVAL == Self::UPDATE_OFFSET
+    }
 
     /// Pollution in the cell containing `pos`, or zero for an empty cell.
     pub fn pollution_at(&self, pos: Vec2) -> f32 {
@@ -68,7 +73,7 @@ pub struct EnvCell {
 }
 
 pub fn env_update(sim: &mut Simulation) {
-    if sim.get_tick() % UPDATE_INTERVAL != 0 {
+    if !EnvGrid::due(sim.get_tick()) {
         return;
     }
     profiling::scope!("map_dynamic::env_update");
@@ -114,14 +119,10 @@ pub fn env_update(sim: &mut Simulation) {
         cell.pollution >= MIN_POLLUTION
     });
 
-    env.by_building.clear();
+    env.by_building
+        .retain(|&id, _| map.get(id).is_some_and(has_land_value));
     for building in map.buildings().values() {
-        let eligible = match building.kind {
-            BuildingKind::House => true,
-            BuildingKind::GoodsCompany(company) => company.is_growable(),
-            _ => false,
-        };
-        if !eligible {
+        if !has_land_value(building) {
             continue;
         }
 
@@ -144,5 +145,13 @@ pub fn env_update(sim: &mut Simulation) {
         let land_value = BASE_LAND_VALUE + coverage_bonus + utilities_bonus - pollution / 2.0;
         env.by_building
             .insert(id, land_value.clamp(0.0, 100.0) as u8);
+    }
+}
+
+fn has_land_value(building: &Building) -> bool {
+    match building.kind {
+        BuildingKind::House => true,
+        BuildingKind::GoodsCompany(company) => company.is_growable(),
+        _ => false,
     }
 }

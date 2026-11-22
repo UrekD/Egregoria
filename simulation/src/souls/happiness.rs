@@ -17,6 +17,8 @@ use crate::{Simulation, SoulID};
 
 use super::residence::{has_power, has_retail_access, retail_store_positions, Residences};
 
+pub(crate) const UPDATE_OFFSET: u64 = 3;
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct Happiness {
     pub by_building: BTreeMap<BuildingID, u8>,
@@ -41,8 +43,12 @@ impl Happiness {
     }
 }
 
+pub(crate) const fn due(tick: u64) -> bool {
+    tick >= TICKS_PER_HOUR && tick % TICKS_PER_HOUR == UPDATE_OFFSET
+}
+
 pub fn happiness_update(sim: &mut Simulation) {
-    if sim.get_tick() % TICKS_PER_HOUR != 0 {
+    if !due(sim.get_tick()) {
         return;
     }
     profiling::scope!("souls::happiness_update");

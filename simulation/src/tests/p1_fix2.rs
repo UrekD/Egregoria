@@ -4,7 +4,7 @@ use crate::map::{
     BuildingID, BuildingKind, Density, Map, ProjectFilter, ProjectKind, RoadID, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{BuildingInfos, Destination, RouterError};
-use crate::souls::{desire::BuyGoods, growth::growth_update, residence};
+use crate::souls::{desire::BuyGoods, growth, residence};
 use crate::transportation::Location;
 use crate::{HumanEnt, HumanID, ParCommandBuffer, Simulation, SoulID, WorldCommand};
 use common::saveload::{Bincode, Encoder};
@@ -27,10 +27,15 @@ fn p1_fix2_player_house_restores_lot_after_reload() {
     test.g = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
     assert!(test.g.map().lot_origin(house).is_none());
 
+    let before = Bincode::encode(&*test.g.read::<residence::Residences>()).unwrap();
     for hour in 1..=24 {
-        test.g.write::<GameTime>().tick.0 = hour * TICKS_PER_HOUR;
+        let tick = (hour - 1) * TICKS_PER_HOUR + residence::UPDATE_OFFSET;
+        assert!(residence::due(tick));
+        test.g.write::<GameTime>().tick.0 = tick;
         residence::residence_update(&mut test.g);
     }
+    let after = Bincode::encode(&*test.g.read::<residence::Residences>()).unwrap();
+    assert_ne!(after, before, "the hourly checks should record residence state");
     assert!(!test.g.read::<residence::Residences>().is_abandoned(house));
     test.apply(&[WorldCommand::MapRemoveBuilding(house)]);
     let map = test.g.map();
@@ -250,8 +255,9 @@ fn p1_fix2_sparse_growth_has_bounded_search_time() {
             .write::<ZoneGrid>()
             .paint(shape, Some(ZoneKind::Residential), Density::Low);
         test.set_residential_demand(20.0);
-        test.g.write::<GameTime>().tick.0 = 3_000;
-        growth_update(&mut test.g);
+        test.g.write::<GameTime>().tick.0 = growth::GROWTH_INTERVAL;
+        assert!(growth::due(test.g.get_tick()));
+        growth::growth_update(&mut test.g);
         finished
             .send(
                 test.g

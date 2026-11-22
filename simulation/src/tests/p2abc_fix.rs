@@ -1,7 +1,5 @@
 use super::TestCtx;
-use crate::map::{
-    BuildingID, BuildingKind, LaneKind, LanePatternBuilder, Map, ProjectFilter, RoadID, Zone,
-};
+use crate::map::{BuildingKind, LaneKind, LanePatternBuilder, Map, ProjectFilter, RoadID, Zone};
 use crate::map_dynamic::{
     electricity_flow_system, env_update, utility_flow_update, CoverageGrid, EnvGrid, UtilityFlow,
 };
@@ -64,6 +62,44 @@ fn tick_at(test: &mut TestCtx, tick: u64) {
 }
 
 #[test]
+fn p2abc_periodic_passes_keep_distinct_phases() {
+    use crate::economy::ZoneDemand;
+    use crate::souls::{events, growth, happiness, residence};
+    use prototypes::TICKS_PER_HOUR;
+
+    let mut counts = [0; 7];
+    for tick in TICKS_PER_HOUR..(2 * TICKS_PER_HOUR) {
+        let coverage = matches!(tick % 6_000, 300 | 900 | 1_500 | 2_100 | 2_700 | 3_300);
+        let due = [
+            ZoneDemand::due(tick),
+            growth::due(tick),
+            UtilityFlow::due(tick),
+            EnvGrid::due(tick),
+            residence::due(tick),
+            happiness::due(tick),
+            events::due(tick),
+        ];
+        assert!(
+            due.iter().filter(|&&runs| runs).count() + usize::from(coverage) <= 1,
+            "periodic passes overlap at tick {tick}"
+        );
+        for (count, runs) in counts.iter_mut().zip(due) {
+            *count += usize::from(runs);
+        }
+        if growth::due(tick) {
+            assert!(ZoneDemand::due(tick - 1));
+        }
+        if EnvGrid::due(tick) {
+            assert!(UtilityFlow::due(tick - 1));
+        }
+        if happiness::due(tick) {
+            assert!(EnvGrid::due(tick - 1));
+        }
+    }
+    assert_eq!(counts, [6, 6, 6, 6, 1, 1, 1]);
+}
+
+#[test]
 fn p2abc_rail_bridge_pipes_and_land_value_follow_refresh_offsets() {
     let mut test = TestCtx::new_fast();
     let lanes = LanePatternBuilder::new();
@@ -94,12 +130,21 @@ fn p2abc_rail_bridge_pipes_and_land_value_follow_refresh_offsets() {
     let worker = spawn_human(&mut test.g, remote).unwrap();
     test.g.world.companies[clinic].workers.0.push(worker);
 
-    tick_at(&mut test, 2_999);
+    let utility_tick = 3_000 + UtilityFlow::UPDATE_OFFSET;
+    let env_tick = 3_000 + EnvGrid::UPDATE_OFFSET;
+    tick_at(&mut test, utility_tick - 1);
     assert!(!test.g.read::<UtilityFlow>().has_water(remote));
-    test.tick_fast();
+    assert_eq!(test.g.read::<EnvGrid>().land_value(remote), 0);
+    tick_at(&mut test, utility_tick);
+    assert!(UtilityFlow::due(test.g.get_tick()));
     for home in [local, remote] {
         let flow = test.g.read::<UtilityFlow>();
         assert!(flow.has_water(home) && flow.has_sewage(home));
+        assert_eq!(test.g.read::<EnvGrid>().land_value(home), 0);
+    }
+    tick_at(&mut test, env_tick);
+    assert!(EnvGrid::due(test.g.get_tick()));
+    for home in [local, remote] {
         assert_eq!(test.g.read::<EnvGrid>().land_value(home), 40);
     }
 
@@ -109,7 +154,7 @@ fn p2abc_rail_bridge_pipes_and_land_value_follow_refresh_offsets() {
             .coverage(home, ServiceKind::Health)
     };
 
-    tick_at(&mut test, 6_000);
+    tick_at(&mut test, 6_000 + UtilityFlow::UPDATE_OFFSET);
     assert_eq!(
         health(&test, local),
         0.0,
@@ -127,7 +172,10 @@ fn p2abc_rail_bridge_pipes_and_land_value_follow_refresh_offsets() {
     );
     assert_eq!(test.g.read::<EnvGrid>().land_value(local), 40);
 
-    tick_at(&mut test, 9_000);
+    tick_at(&mut test, 9_000 + EnvGrid::UPDATE_OFFSET - 1);
+    assert_eq!(test.g.read::<EnvGrid>().land_value(local), 40);
+    test.tick_fast();
+    assert!(EnvGrid::due(test.g.get_tick()));
     let env = test.g.read::<EnvGrid>();
     assert_eq!(env.land_value(local), (40.0 + 15.0 * covered / 100.0) as u8);
     assert_eq!(env.land_value(remote), 40);
@@ -171,7 +219,8 @@ fn p2abc_exact_fractional_staffing_meets_utility_demand() {
         test.g.world.companies[company].workers.0 = vec![HumanID::default(); 7];
     }
 
-    test.g.write::<GameTime>().tick.0 = 3_000;
+    test.g.write::<GameTime>().tick.0 = 3_000 + UtilityFlow::UPDATE_OFFSET;
+    assert!(UtilityFlow::due(test.g.get_tick()));
     let (world, resources) = test.g.world_res();
     electricity_flow_system(world, resources);
     utility_flow_update(&mut test.g);
@@ -206,12 +255,14 @@ fn p2abc_company_pollution_scales_with_staffing() {
     );
     let center = vec2(208.0, 208.0);
     let emitter = place_company(&mut test, "coal-power-plant", center, road);
-    test.g.write::<GameTime>().tick.0 = 3_000;
+    test.g.write::<GameTime>().tick.0 = 3_000 + EnvGrid::UPDATE_OFFSET;
+    assert!(EnvGrid::due(test.g.get_tick()));
     env_update(&mut test.g);
     assert_eq!(test.g.read::<EnvGrid>().pollution_at(center), 0.0);
 
     test.g.world.companies[emitter].workers.0 = vec![HumanID::default(); 5];
-    test.g.write::<GameTime>().tick.0 = 6_000;
+    test.g.write::<GameTime>().tick.0 = 6_000 + EnvGrid::UPDATE_OFFSET;
+    assert!(EnvGrid::due(test.g.get_tick()));
     env_update(&mut test.g);
     assert!((test.g.read::<EnvGrid>().pollution_at(center) - 18.0).abs() < 0.001);
     let saved = Bincode::encode(&test.g).unwrap();
@@ -220,7 +271,8 @@ fn p2abc_company_pollution_scales_with_staffing() {
 
     for sim in [&mut test.g, &mut restored] {
         sim.world.companies[emitter].workers.0.clear();
-        sim.write::<GameTime>().tick.0 = 9_000;
+        sim.write::<GameTime>().tick.0 = 9_000 + EnvGrid::UPDATE_OFFSET;
+        assert!(EnvGrid::due(sim.get_tick()));
         env_update(sim);
         assert!((sim.read::<EnvGrid>().pollution_at(center) - 16.2).abs() < 0.001);
     }
@@ -243,7 +295,8 @@ fn p2abc_environment_skips_missing_residence_prototype() {
         .get_mut(&home)
         .unwrap()
         .prototype = ResidencePrototypeID::new("removed-residence");
-    test.g.write::<GameTime>().tick.0 = 3_000;
+    test.g.write::<GameTime>().tick.0 = 3_000 + EnvGrid::UPDATE_OFFSET;
+    assert!(EnvGrid::due(test.g.get_tick()));
     env_update(&mut test.g);
     let env = test.g.read::<EnvGrid>();
     assert!(env.cells.is_empty());

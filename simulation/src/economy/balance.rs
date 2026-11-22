@@ -2,7 +2,13 @@
 
 use prototypes::ServiceKind;
 
+// Schedule phases use the simulation tick. Demand samples one tick before growth.
+// After growth, utilities refresh before environment and hourly happiness. Environment
+// uses the latest coverage from each kind's independent kind * 600 + 300 phase.
+// Hourly residence progression runs just before the boundary using the preceding
+// snapshots. Fire events follow environment and happiness after the boundary.
 pub const DEMAND_INTERVAL_TICKS: u64 = 3_000;
+pub(crate) const DEMAND_OFFSET_TICKS: u64 = DEMAND_INTERVAL_TICKS - 1;
 pub const DEMAND_EMA_ALPHA: f32 = 0.2;
 pub const DEFAULT_TAX_RATE_PERMILLE: u16 = 90;
 pub const NEUTRAL_HAPPINESS: f32 = 50.0;

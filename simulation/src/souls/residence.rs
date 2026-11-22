@@ -17,6 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 const UPGRADE_CHECKS: u8 = 6;
 const UNSERVED_CHECKS: u8 = 12;
+pub(crate) const UPDATE_OFFSET: u64 = TICKS_PER_HOUR - 2;
 
 #[derive(Serialize, Deserialize)]
 pub struct Residence {
@@ -414,8 +415,12 @@ pub fn uses_water(sim: &Simulation, building: BuildingID) -> bool {
         .is_some_and(|consumption| consumption > 0.0)
 }
 
+pub(crate) const fn due(tick: u64) -> bool {
+    tick % TICKS_PER_HOUR == UPDATE_OFFSET
+}
+
 pub fn residence_update(sim: &mut Simulation) {
-    if sim.get_tick() % TICKS_PER_HOUR != 0 {
+    if !due(sim.get_tick()) {
         return;
     }
 

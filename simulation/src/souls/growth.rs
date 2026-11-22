@@ -5,24 +5,40 @@ use crate::map::{
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{lifecycle, residence};
 use crate::Simulation;
+use common::FastMap;
 use geom::Vec2;
 use ordered_float::OrderedFloat;
-use prototypes::GrowableCompanyPrototype;
-use std::collections::BTreeMap;
+use prototypes::{GrowableCompanyPrototype, ResidencePrototype};
 
-const GROWTH_INTERVAL: u64 = 3_000;
+pub(crate) const GROWTH_INTERVAL: u64 = 3_000;
 const MAX_BUILDING_SEARCH_RADIUS: f32 = 2_048.0;
 
 #[derive(Default)]
 struct GrowthCache {
     zone_generation: u64,
-    zones: BTreeMap<LotID, Option<ZoneCell>>,
+    zones: FastMap<LotID, Option<ZoneCell>>,
     buildings: Vec<(BuildingID, Vec2)>,
-    distances: BTreeMap<LotID, OrderedFloat<f32>>,
+    distances: FastMap<LotID, OrderedFloat<f32>>,
+    zoned_lots: Vec<(LotID, ZoneCell)>,
+    off_center_buildings: Vec<Vec2>,
+    candidates: Vec<GrowthCandidate>,
+}
+
+struct GrowthCandidate {
+    zone: ZoneKind,
+    distance: OrderedFloat<f32>,
+    lot: LotID,
+    kind: BuildingKind,
+    home: Option<&'static ResidencePrototype>,
+    quota: u8,
+}
+
+pub(crate) const fn due(tick: u64) -> bool {
+    tick % GROWTH_INTERVAL == 0
 }
 
 pub fn growth_update(sim: &mut Simulation) {
-    if sim.get_tick() % GROWTH_INTERVAL != 0 {
+    if !due(sim.get_tick()) {
         return;
     }
     profiling::scope!("souls::growth_pass");
@@ -44,7 +60,11 @@ pub fn growth_update(sim: &mut Simulation) {
         remove_growable(sim, id);
     }
 
-    let zoned_lots = {
+    if sim.read::<ZoneGrid>().cells.is_empty() {
+        return;
+    }
+
+    let mut zoned_lots = {
         let (_, resources) = sim.world_res();
         resources.write_or_default::<GrowthCache>();
         let map = resources.read::<Map>();
@@ -57,21 +77,27 @@ pub fn growth_update(sim: &mut Simulation) {
         // A lot's shape is immutable for its ID, even when frontage changes.
         cache.zones.retain(|&id, _| map.get(id).is_some());
         cache.distances.retain(|&id, _| map.get(id).is_some());
-        map.lots()
-            .iter()
-            .filter_map(|(id, lot)| {
-                cache
-                    .zones
-                    .entry(id)
-                    .or_insert_with(|| zones.lot_zone(&lot.shape))
-                    .map(|zone| (id, zone))
-            })
-            .collect()
+        let GrowthCache {
+            zones: lot_zones,
+            zoned_lots,
+            ..
+        } = &mut *cache;
+        zoned_lots.extend(map.lots().iter().filter_map(|(id, lot)| {
+            lot_zones
+                .entry(id)
+                .or_insert_with(|| zones.lot_zone(&lot.shape))
+                .map(|zone| (id, zone))
+        }));
+        std::mem::take(zoned_lots)
     };
-    grow_zoned_lots(sim, zoned_lots);
+    grow_zoned_lots(sim, zoned_lots.drain(..));
+    sim.write::<GrowthCache>().zoned_lots = zoned_lots;
 }
 
-fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: Vec<(LotID, ZoneCell)>) {
+fn grow_zoned_lots(
+    sim: &mut Simulation,
+    zoned_lots: impl IntoIterator<Item = (LotID, ZoneCell)>,
+) {
     let mut candidates = {
         let (_, resources) = sim.world_res();
         resources.write_or_default::<GrowthCache>();
@@ -84,8 +110,13 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: Vec<(LotID, ZoneCell)>) {
             cache.buildings.extend(building_centers());
             cache.distances.clear();
         }
-        let mut off_center_buildings = None;
-        let mut candidates = Vec::new();
+        let GrowthCache {
+            distances,
+            off_center_buildings,
+            candidates,
+            ..
+        } = &mut *cache;
+        let mut scanned_off_center_buildings = false;
         for (id, cell) in zoned_lots {
             let value = demand.values.get(&cell.kind).copied().unwrap_or_default();
             if value <= 5.0 || !value.is_finite() {
@@ -120,33 +151,41 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: Vec<(LotID, ZoneCell)>) {
                 continue;
             }
             let center = lot.shape.center();
-            let distance = *cache.distances.entry(id).or_insert_with(|| {
-                let off_center = off_center_buildings.get_or_insert_with(|| {
+            let distance = *distances.entry(id).or_insert_with(|| {
+                if !scanned_off_center_buildings {
                     // A zoned building is indexed by its zone polygon, which can omit its center.
-                    map.buildings()
-                        .values()
-                        .filter_map(|building| {
-                            let center = building.obb.center();
-                            building
-                                .zone
-                                .as_ref()
-                                .filter(|zone| !zone.poly.contains(center))?;
-                            Some(center)
-                        })
-                        .collect::<Vec<_>>()
-                });
-                nearest_building_distance(&map, center, off_center)
+                    off_center_buildings.clear();
+                    off_center_buildings.extend(map.buildings().values().filter_map(|building| {
+                        let center = building.obb.center();
+                        building
+                            .zone
+                            .as_ref()
+                            .filter(|zone| !zone.poly.contains(center))?;
+                        Some(center)
+                    }));
+                    scanned_off_center_buildings = true;
+                }
+                nearest_building_distance(&map, center, off_center_buildings)
             });
             let quota = ((value / 20.0).ceil() as u8).min(4);
-            candidates.push((cell.kind, distance, id, kind, home, quota));
+            candidates.push(GrowthCandidate {
+                zone: cell.kind,
+                distance,
+                lot: id,
+                kind,
+                home,
+                quota,
+            });
         }
-        candidates
+        std::mem::take(candidates)
     };
-    candidates.sort_unstable_by_key(|&(zone, distance, lot, ..)| (zone, distance, lot));
+    candidates.sort_unstable_by_key(|candidate| (candidate.zone, candidate.distance, candidate.lot));
 
     let mut current_zone = None;
     let mut remaining = 0;
-    for (zone, _, lot, kind, home, quota) in candidates {
+    for GrowthCandidate {
+        zone, lot, kind, home, quota, ..
+    } in candidates.drain(..) {
         if current_zone != Some(zone) {
             current_zone = Some(zone);
             remaining = quota;
@@ -163,6 +202,7 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: Vec<(LotID, ZoneCell)>) {
             remaining -= 1;
         }
     }
+    sim.write::<GrowthCache>().candidates = candidates;
 }
 
 fn nearest_building_distance(
@@ -255,7 +295,13 @@ mod tests {
     }
 
     fn hourly_check(sim: &mut Simulation) {
-        sim.write::<GameTime>().tick.0 += TICKS_PER_HOUR;
+        let tick = sim.get_tick();
+        let mut next = tick - tick % TICKS_PER_HOUR + residence::UPDATE_OFFSET;
+        if next <= tick {
+            next += TICKS_PER_HOUR;
+        }
+        assert!(residence::due(next));
+        sim.write::<GameTime>().tick.0 = next;
         residence::residence_update(sim);
         crate::utils::scheduler::drain_commands(sim);
     }
@@ -293,7 +339,11 @@ mod tests {
         }
         let (world, resources) = sim.world_res();
         crate::map_dynamic::electricity_flow_system(world, resources);
+        let tick = sim.get_tick();
+        sim.write::<GameTime>().tick.0 = GROWTH_INTERVAL + UtilityFlow::UPDATE_OFFSET;
+        assert!(UtilityFlow::due(sim.get_tick()));
         crate::map_dynamic::utility_flow_update(sim);
+        sim.write::<GameTime>().tick.0 = tick;
         let utilities = sim.read::<UtilityFlow>();
         assert!(utilities.has_water(house) && utilities.has_sewage(house));
     }
@@ -315,6 +365,7 @@ mod tests {
                 density: Density::High,
             }]);
             test.g.write::<ZoneDemand>().values.insert(zone, 40.0);
+            assert!(due(GROWTH_INTERVAL));
             test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;
             growth_update(&mut test.g);
             let map = test.g.map();
@@ -916,6 +967,8 @@ mod tests {
             .unwrap()
             .1;
         assert_ne!(replacement, origin.parent);
+        assert!(test.g.read::<ZoneGrid>().cells.is_empty());
+        assert!(due(GROWTH_INTERVAL));
         test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;
         growth_update(&mut test.g);
         crate::utils::scheduler::drain_commands(&mut test.g);
@@ -927,5 +980,9 @@ mod tests {
             .read::<BuildingInfos>()
             .building_owned_by(company)
             .is_none());
+        assert!(
+            !test.g.world_res().1.contains::<GrowthCache>(),
+            "empty zones should skip the lot cache even when orphan cleanup runs"
+        );
     }
 }

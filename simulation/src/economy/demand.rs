@@ -1,16 +1,17 @@
 use crate::economy::balance::{
-    DEFAULT_TAX_RATE_PERMILLE, DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS, I_BASE,
+    DEFAULT_TAX_RATE_PERMILLE, DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS, DEMAND_OFFSET_TICKS, I_BASE,
     I_BOOTSTRAP_COMPANIES, K_GOODS, K_HAPPY, K_JOBS, K_RET, K_TAX, K_UNEMP, K_VAC,
     MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, RETAIL_PER_CAPITA_PER_HOUR, R_BASE,
     R_BOOTSTRAP_POPULATION,
 };
 use crate::economy::{Budget, Market};
-use crate::map::ZoneKind;
+use crate::map::{BuildingID, ZoneKind};
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::happiness::Happiness;
 use crate::souls::residence::Residences;
 use crate::utils::resources::Resources;
 use crate::{SoulID, World};
+use common::FastMap;
 use prototypes::{try_prototype, GrowableCompanyID, ItemID, RecipeItem, DELTA_F64, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -19,6 +20,11 @@ use std::collections::BTreeMap;
 pub struct ZoneDemand {
     pub values: BTreeMap<ZoneKind, f32>,
     drivers: BTreeMap<ZoneKind, DemandDrivers>,
+}
+
+#[derive(Default)]
+struct DemandScratch {
+    occupants: FastMap<BuildingID, u32>,
 }
 
 /// Signed contributions to a zone's latest demand sample, before clamping and smoothing.
@@ -47,6 +53,10 @@ pub enum DemandDriver {
 }
 
 impl ZoneDemand {
+    pub(crate) const fn due(tick: u64) -> bool {
+        tick % DEMAND_INTERVAL_TICKS == DEMAND_OFFSET_TICKS
+    }
+
     pub fn drivers(&self, zone: ZoneKind) -> Option<&DemandDrivers> {
         self.drivers.get(&zone)
     }
@@ -72,10 +82,11 @@ impl ZoneDemand {
 }
 
 pub fn demand_update(world: &mut World, resources: &mut Resources) {
-    if resources.tick().0 % DEMAND_INTERVAL_TICKS != 0 {
+    if !ZoneDemand::due(resources.tick().0) {
         return;
     }
 
+    resources.write_or_default::<DemandScratch>();
     let jobs = ItemID::new("job-opening");
     let market = resources.read::<Market>();
     let open_jobs: u64 = market.inner().get(&jobs).map_or(0, |job_market| {
@@ -88,7 +99,9 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     });
 
     let residences = resources.read::<Residences>();
-    let mut occupants = BTreeMap::new();
+    let mut scratch = resources.write::<DemandScratch>();
+    let occupants = &mut scratch.occupants;
+    occupants.clear();
     let mut unemployed = 0;
     for human in world.humans.values() {
         *occupants.entry(human.home.house).or_insert(0u32) += 1;
@@ -257,7 +270,13 @@ mod tests {
     use geom::{vec2, vec3, Transform, Vec3};
     use prototypes::{Density, GameTime, GoodsCompanyID, ResidencePrototypeID, Tick};
 
-    fn sample(sim: &mut Simulation, tick: u64) -> BTreeMap<ZoneKind, f32> {
+    fn sample(sim: &mut Simulation, cycle: u64) -> BTreeMap<ZoneKind, f32> {
+        let tick = (cycle - 1) * DEMAND_INTERVAL_TICKS + DEMAND_OFFSET_TICKS;
+        assert!(ZoneDemand::due(tick));
+        sample_at(sim, tick)
+    }
+
+    fn sample_at(sim: &mut Simulation, tick: u64) -> BTreeMap<ZoneKind, f32> {
         *sim.write::<GameTime>() = GameTime::new(Tick(tick));
         let (world, resources) = sim.world_res();
         demand_update(world, resources);
@@ -300,11 +319,12 @@ mod tests {
     fn p1a_demand_bootstrap_and_ema_cadence() {
         let mut ctx = TestCtx::new_fast();
         ctx.apply(&[crate::world_command::WorldCommand::SetGameTime(
-            GameTime::new(Tick(2_998)),
+            GameTime::new(Tick(DEMAND_OFFSET_TICKS - 2)),
         )]);
         ctx.tick_fast();
         assert!(ctx.g.read::<ZoneDemand>().values.is_empty());
         ctx.tick_fast();
+        assert!(ZoneDemand::due(ctx.g.get_tick()));
         let first = ctx.g.read::<ZoneDemand>().values.clone();
         assert_eq!(first.get(&ZoneKind::Residential), Some(&40.0));
         assert_eq!(first.get(&ZoneKind::Industrial), Some(&30.0));
@@ -312,11 +332,13 @@ mod tests {
         assert_eq!(first.get(&ZoneKind::Office), Some(&0.0));
 
         let house = home(&ctx, 1);
-        assert_eq!(sample(&mut ctx.g, 5_999), first);
-        let smoothed = sample(&mut ctx.g, 6_000);
+        let off_tick = DEMAND_INTERVAL_TICKS + DEMAND_OFFSET_TICKS - 1;
+        assert!(!ZoneDemand::due(off_tick));
+        assert_eq!(sample_at(&mut ctx.g, off_tick), first);
+        let smoothed = sample(&mut ctx.g, 2);
         spawn_human(&mut ctx.g, house).unwrap();
         ctx.g.write::<ZoneDemand>().values.clear();
-        let raw = sample(&mut ctx.g, 9_000);
+        let raw = sample(&mut ctx.g, 3);
         assert_eq!(raw[&ZoneKind::Residential], 40.0 - K_JOBS * 10.0);
         assert!(raw[&ZoneKind::Office] > 0.0);
         assert_eq!(smoothed[&ZoneKind::Industrial], 30.0);
@@ -330,7 +352,7 @@ mod tests {
             .unwrap()
             .capacity = 1_000;
         ctx.g.write::<ZoneDemand>().values.clear();
-        assert_eq!(sample(&mut ctx.g, 12_000)[&ZoneKind::Residential], -100.0);
+        assert_eq!(sample(&mut ctx.g, 4)[&ZoneKind::Residential], -100.0);
     }
 
     #[test]
@@ -342,7 +364,7 @@ mod tests {
         company(world, "office-l1", 6);
         let goods_shortfall = K_GOODS * 100.0;
         assert_eq!(
-            sample(&mut ctx.g, 3_000)[&ZoneKind::Industrial],
+            sample(&mut ctx.g, 1)[&ZoneKind::Industrial],
             I_BASE + goods_shortfall
         );
 
@@ -352,7 +374,7 @@ mod tests {
         }
         ctx.g.write::<ZoneDemand>().values.clear();
         assert_eq!(
-            sample(&mut ctx.g, 6_000)[&ZoneKind::Industrial],
+            sample(&mut ctx.g, 2)[&ZoneKind::Industrial],
             goods_shortfall
         );
     }
@@ -363,14 +385,14 @@ mod tests {
 
         let mut ctx = TestCtx::new_fast();
         assert!(ctx.g.read::<ZoneDemand>().drivers(Residential).is_none());
-        sample(&mut ctx.g, 3_000);
+        sample(&mut ctx.g, 1);
         assert!(ctx.g.read::<ZoneDemand>().top_driver(Office).is_none());
 
         let house = home(&ctx, 4);
         spawn_human(&mut ctx.g, house).unwrap();
         ctx.g.write::<Budget>().set_tax_rate(Residential, 190);
         ctx.g.write::<Budget>().set_tax_rate(Office, 290);
-        let values = sample(&mut ctx.g, 6_000);
+        let values = sample(&mut ctx.g, 2);
         let demand = ctx.g.read::<ZoneDemand>();
         assert_eq!(
             demand.drivers(Residential),
@@ -406,7 +428,7 @@ mod tests {
     fn p1a_demand_deterministic_two_runs() {
         fn trajectory() -> Vec<BTreeMap<ZoneKind, f32>> {
             let mut ctx = TestCtx::new_fast();
-            let initial = sample(&mut ctx.g, 3_000);
+            let initial = sample(&mut ctx.g, 1);
             let house = home(&ctx, 1);
             let human = spawn_human(&mut ctx.g, house).unwrap();
             let (world, res) = ctx.g.world_res();
@@ -420,7 +442,7 @@ mod tests {
                 market.produce(seller, jobs, 6);
                 market.sell(seller, vec2(150.0, 125.0), jobs, 2, 0);
             }
-            let unstaffed = sample(&mut ctx.g, 6_000);
+            let unstaffed = sample(&mut ctx.g, 2);
             let unstaffed_industrial = *ctx
                 .g
                 .read::<ZoneDemand>()
@@ -429,7 +451,7 @@ mod tests {
             let (world, res) = ctx.g.world_res();
             market_update(world, res);
             assert!(world.get(human).unwrap().work.is_none());
-            let pending_hire = sample(&mut ctx.g, 9_000);
+            let pending_hire = sample(&mut ctx.g, 3);
             let pending_industrial = *ctx
                 .g
                 .read::<ZoneDemand>()
@@ -438,7 +460,7 @@ mod tests {
             let (world, _) = ctx.g.world_res();
             let hired = world.companies[industrial].workers.0.pop().unwrap();
             world.companies[commercial].workers.0.push(hired);
-            let staffed = sample(&mut ctx.g, 12_000);
+            let staffed = sample(&mut ctx.g, 4);
 
             let raw_residential = 40.0 + K_JOBS * 10.0;
             let first_ema = 40.0 + 0.2 * (raw_residential - 40.0);
