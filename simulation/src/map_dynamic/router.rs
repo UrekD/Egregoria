@@ -1,5 +1,5 @@
 use crate::economy::{on_arrival, on_cancel, on_start, TripMode, TripProgress, TripPurpose};
-use crate::map::{BuildingID, Map, PathKind};
+use crate::map::{Building, BuildingID, LaneID, LaneKind, Map, PathKind, TraverseDirection};
 use crate::map_dynamic::transit::{elapsed_ticks, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
     BuildingInfos, Itinerary, LineID, ParkingManagement, ParkingReserveError, SpotReservation,
@@ -16,6 +16,7 @@ use geom::{Transform, Vec3};
 use prototypes::Tick;
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
+use std::collections::{btree_map::Entry, BTreeMap};
 
 #[path = "transit_path.rs"]
 mod transit_path;
@@ -139,6 +140,7 @@ fn routing_changed(
                 if h.location == Location::Building(build) {
                     router.cur_dest = router.target_dest;
                     router.last_error = None;
+                    on_cancel(router);
                     return;
                 }
 
@@ -373,6 +375,26 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                                 )
                             });
                     }
+                    if h.router.walk_only_pickup
+                        && (h.household.basket.is_some()
+                            || h.household.leisure_visit.is_some()
+                            || !h.household.carried.is_empty())
+                    {
+                        route = Itinerary::route(
+                            elapsed_ticks(resources),
+                            pos,
+                            obj,
+                            map,
+                            PathKind::Pedestrian,
+                        );
+                        if route.is_none() {
+                            h.router
+                                .cancel_route(&mut resources.write::<ParkingManagement>());
+                            h.it = Itinerary::NONE;
+                            h.decision.wait = 0;
+                            return;
+                        }
+                    }
                     h.it = route
                         .unwrap_or_else(|| Itinerary::wait_for_reroute(PathKind::Pedestrian, obj));
                 }
@@ -427,6 +449,14 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                         .write::<BuildingInfos>()
                         .get_in(build, SoulID::Human(body));
                     walk_inside(body, h, cbuf_human);
+                    match h.router.trip_purpose {
+                        TripPurpose::Work => {
+                            h.attend_work(&resources.read::<prototypes::GameTime>(), build)
+                        }
+                        TripPurpose::Shopping | TripPurpose::Leisure => h.decision.wait = 0,
+                        TripPurpose::Home if !h.household.carried.is_empty() => h.decision.wait = 0,
+                        _ => {}
+                    }
                     on_arrival(&mut h.router, resources);
                 }
                 RoutingStep::GetOutBuilding(build) => {
@@ -462,6 +492,60 @@ fn walk_outside(body: HumanID, pos: Vec3, cbuf: &ParCommandBuffer<HumanEnt>, loc
         h.trans.pos = pos;
         h.collider = Some(coll);
     });
+}
+
+/// Per-pass cache for destinations that require a connected walking route.
+#[derive(Default)]
+pub(crate) struct WalkingReach {
+    labels: BTreeMap<LaneID, LaneID>,
+}
+
+impl WalkingReach {
+    pub(crate) fn component_at(&mut self, map: &Map, position: Vec3) -> Option<LaneID> {
+        let start = map.nearest_lane(position, LaneKind::Walking, None)?;
+        Some(self.lane_component(map, start))
+    }
+
+    pub(crate) fn reaches_building(
+        &mut self,
+        map: &Map,
+        origin: LaneID,
+        target: &Building,
+    ) -> bool {
+        let Some(road) = target.connected_road.and_then(|road| map.get(road)) else {
+            return false;
+        };
+        // A closer sidewalk on a different road does not connect this building.
+        road.lanes_iter().any(|(lane, kind)| {
+            kind == LaneKind::Walking && self.lane_component(map, lane) == origin
+        }) && self.component_at(map, target.door_pos) == Some(origin)
+    }
+
+    fn lane_component(&mut self, map: &Map, start: LaneID) -> LaneID {
+        if let Some(&component) = self.labels.get(&start) {
+            return component;
+        }
+        self.labels.insert(start, start);
+        let mut pending = vec![start];
+        while let Some(id) = pending.pop() {
+            let lane = &map.lanes()[id];
+            for junction in [lane.src, lane.dst] {
+                for (turn, direction) in map.intersections()[junction].turns_from(id) {
+                    let adjacent = match direction {
+                        TraverseDirection::Forward => turn.dst,
+                        TraverseDirection::Backward => turn.src,
+                    };
+                    if map.lanes()[adjacent].kind == LaneKind::Walking {
+                        if let Entry::Vacant(entry) = self.labels.entry(adjacent) {
+                            entry.insert(start);
+                            pending.push(adjacent);
+                        }
+                    }
+                }
+            }
+        }
+        start
+    }
 }
 
 impl Router {
@@ -573,12 +657,14 @@ impl Router {
     }
 
     pub fn references_stop(&self, stop: StopID) -> bool {
-        self.steps.iter().chain(self.cur_step()).any(|step| match *step {
-            RoutingStep::WaitAtStop { stop: id, .. } | RoutingStep::RideTransit { alight: id, .. } => {
-                id == stop
-            }
-            _ => false,
-        })
+        self.steps
+            .iter()
+            .chain(self.cur_step())
+            .any(|step| match *step {
+                RoutingStep::WaitAtStop { stop: id, .. }
+                | RoutingStep::RideTransit { alight: id, .. } => id == stop,
+                _ => false,
+            })
     }
 
     pub fn use_vehicle(&mut self, v: Option<VehicleID>) {
@@ -648,6 +734,10 @@ impl Router {
 
     /// Returns wheter or not the destination was already attained
     pub fn go_to(&mut self, dest: Destination) -> bool {
+        self.go_to_for(dest, TripPurpose::Other)
+    }
+
+    pub(crate) fn go_to_for(&mut self, dest: Destination, purpose: TripPurpose) -> bool {
         if let Some(router_dest) = self.cur_dest {
             if router_dest == dest {
                 return self.steps.is_empty() && self.cur_step.is_none();
@@ -655,6 +745,7 @@ impl Router {
         }
         if self.target_dest != Some(dest) {
             self.target_dest = Some(dest);
+            self.trip_purpose = purpose;
             on_start(self);
         }
         false
@@ -673,13 +764,18 @@ impl Router {
             steps.push(RoutingStep::GetOutBuilding(*cur_build));
         }
 
+        let vehicle = if self.walk_only_pickup {
+            None
+        } else {
+            self.vehicle
+        };
         if let Location::Vehicle(current) = *loc {
-            if self.vehicle != Some(current) {
+            if vehicle != Some(current) {
                 steps.push(RoutingStep::GetOutVehicle(current));
             }
         }
 
-        if let Some(car) = self.vehicle {
+        if let Some(car) = vehicle {
             let spot_resa = if self.personal_car == Some(car) {
                 parking
                     .reserve_near_radius(obj, map, NEAR_PARKING_RADIUS)

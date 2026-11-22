@@ -1,8 +1,8 @@
 use crate::economy::balance::{
     periodic_tick, DEFAULT_TAX_RATE_PERMILLE, DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS,
-    DEMAND_OFFSET_TICKS, I_BASE, I_BOOTSTRAP_COMPANIES, K_GOODS, K_HAPPY, K_JOBS, K_RET, K_TAX,
-    K_UNEMP, K_VAC, MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, RETAIL_PER_CAPITA_PER_HOUR, R_BASE,
-    R_BOOTSTRAP_POPULATION,
+    DEMAND_OFFSET_TICKS, FOOD_UNIT_TICKS, GOODS_UNIT_TICKS, I_BASE, I_BOOTSTRAP_COMPANIES, K_GOODS,
+    K_HAPPY, K_JOBS, K_RET, K_TAX, K_UNEMP, K_VAC, MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS,
+    RETAIL_PER_CAPITA_PER_HOUR, R_BASE, R_BOOTSTRAP_POPULATION,
 };
 use crate::economy::{Budget, Market};
 use crate::map::{BuildingID, ZoneKind};
@@ -127,7 +127,6 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     let population = world.humans.len();
     let per_capita = 100.0 / population.max(MIN_DEMAND_POPULATION) as f32;
     let unemployed_norm = unemployed as f32 * per_capita;
-    let retail_need = population as f64 * RETAIL_PER_CAPITA_PER_HOUR;
     let rates = company_rates(world);
     let r_base = if population < R_BOOTSTRAP_POPULATION {
         R_BASE
@@ -159,7 +158,7 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
         (
             ZoneKind::Commercial,
             DemandDrivers {
-                shortfall: K_RET * shortfall_norm(retail_need, rates.retail_supply),
+                shortfall: K_RET * rates.retail_shortfall(population),
                 ..Default::default()
             },
         ),
@@ -208,12 +207,29 @@ struct CompanyRates {
     goods_need: f64,
     goods_supply: f64,
     retail_supply: f64,
+    groceries_supply: f64,
+    grocery_producers: bool,
     industrial_growables: usize,
+}
+
+impl CompanyRates {
+    fn retail_shortfall(&self, population: usize) -> f32 {
+        let residents = population as f64;
+        if !self.grocery_producers {
+            return shortfall_norm(residents * RETAIL_PER_CAPITA_PER_HOUR, self.retail_supply);
+        }
+        let staple_rate = TICKS_PER_HOUR as f64 / FOOD_UNIT_TICKS as f64;
+        let goods_rate = TICKS_PER_HOUR as f64 / GOODS_UNIT_TICKS as f64;
+        let staples = shortfall_norm(residents * staple_rate, self.groceries_supply);
+        let goods = shortfall_norm(residents * goods_rate, self.retail_supply);
+        (staples * staple_rate as f32 + goods * goods_rate as f32)
+            / (staple_rate + goods_rate) as f32
+    }
 }
 
 fn company_rates(world: &World) -> CompanyRates {
     let goods = ItemID::new("goods");
-    let retail_goods = ItemID::new("retail-goods");
+    let [groceries, retail_goods] = crate::souls::household::household_items();
     let mut rates = CompanyRates::default();
     let amount = |items: &[RecipeItem], kind| {
         items
@@ -224,10 +240,10 @@ fn company_rates(world: &World) -> CompanyRates {
     };
 
     for company in world.companies.values() {
-        let Some(proto) = try_prototype(GrowableCompanyID::from(company.comp.proto)) else {
-            continue;
-        };
-        if proto.growable && proto.zone_kind == ZoneKind::Industrial {
+        let proto = company.comp.proto.prototype();
+        let growable = try_prototype(GrowableCompanyID::from(company.comp.proto))
+            .filter(|proto| proto.growable);
+        if growable.is_some_and(|proto| proto.zone_kind == ZoneKind::Industrial) {
             rates.industrial_growables += 1;
         }
         let Some(recipe) = &proto.recipe else {
@@ -240,15 +256,18 @@ fn company_rates(world: &World) -> CompanyRates {
         // The company system advances recipe progress by DELTA per simulation tick.
         let full_batches = TICKS_PER_HOUR as f64 * DELTA_F64 / duration;
         let staffed_batches = full_batches * f64::from(company.raw_productivity(proto, None));
-        match proto.zone_kind {
-            ZoneKind::Commercial => {
+        let grocery_output = amount(&recipe.production, groceries);
+        rates.grocery_producers |= grocery_output > 0.0;
+        rates.groceries_supply += grocery_output * staffed_batches;
+        rates.retail_supply += amount(&recipe.production, retail_goods) * staffed_batches;
+        match growable.map(|proto| proto.zone_kind) {
+            Some(ZoneKind::Commercial) => {
                 rates.goods_need += amount(&recipe.consumption, goods) * full_batches;
-                rates.retail_supply += amount(&recipe.production, retail_goods) * staffed_batches;
             }
-            ZoneKind::Industrial => {
+            Some(ZoneKind::Industrial) => {
                 rates.goods_supply += amount(&recipe.production, goods) * staffed_batches;
             }
-            ZoneKind::Residential | ZoneKind::Office => {}
+            _ => {}
         }
     }
     rates

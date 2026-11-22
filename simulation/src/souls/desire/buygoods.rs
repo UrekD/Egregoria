@@ -40,6 +40,15 @@ struct TimedOutSeller {
 debug_inspect_impl!(BuyGoods);
 
 impl BuyGoods {
+    pub(crate) fn basket_score(stock: &crate::souls::household::HouseholdStock) -> f32 {
+        let [groceries, retail] = crate::souls::household::household_items();
+        if stock.units(retail) == 0 && stock.units(groceries) <= 2 && stock.needs.goods < 0.4 {
+            0.58
+        } else {
+            0.0
+        }
+    }
+
     #[inline]
     pub(crate) fn update_pickup(
         human: &mut HumanEnt,
@@ -221,7 +230,7 @@ mod tests {
     use crate::tests::TestCtx;
     use crate::{CompanyID, FreightStationID, WorldCommand};
     use geom::{vec2, vec3, Vec2, OBB};
-    use prototypes::{BuildingGen, FreightStationPrototypeID, GoodsCompanyID, Tick};
+    use prototypes::{BuildingGen, FreightStationPrototypeID, GoodsCompanyID};
 
     fn city_street() -> TestCtx {
         let test = TestCtx::new();
@@ -361,62 +370,33 @@ mod tests {
         assert!(test.g.read::<Market>().capital(store_soul, retail) > 0);
         let car = test.g.get(human).unwrap().router.personal_car.unwrap();
 
-        let period = 6 * TICKS_PER_HOUR;
-        let offset = common::hash_u64(human) % period;
-        let due = offset + 3 * period;
-        test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(due)))]);
-        let bought_at = (0..200)
-            .find_map(|_| {
-                test.tick_fast();
-                (test.g.read::<Market>().capital(buyer, retail) == 1).then(|| test.g.get_tick())
-            })
-            .expect("resident bought retail goods at the six-hour cadence");
-        assert!(bought_at >= due);
-        assert_ne!(
-            test.g.get(human).unwrap().location,
-            Location::Building(store_building)
-        );
-        test.tick();
+        // Exercise the household default path with real growable production.
+        let now = test
+            .g
+            .read::<crate::economy::Budget>()
+            .elapsed_ticks(test.g.read::<GameTime>().tick);
+        let resident = &mut test.g.world_mut_unchecked().humans[human];
+        resident.household.next_shop = now;
+        resident.work = None;
+        let pos = test.g.map().get(store_building).unwrap().door_pos.xy();
+        test.g
+            .write::<Market>()
+            .sell(store_soul, pos, ItemID::new("job-opening"), 0, 0);
 
-        for _ in 0..5_000 {
+        for _ in 0..3 * TICKS_PER_HOUR {
             test.tick_fast();
-            assert_ne!(test.g.get(human).unwrap().location, Location::Vehicle(car));
-            if test.g.read::<Market>().capital(buyer, retail) == 0 {
+            if !test.g.get(human).unwrap().household.on_hand.is_empty() {
                 break;
             }
         }
         let resident = test.g.get(human).unwrap();
-        assert_eq!(resident.location, Location::Building(store_building));
+        assert_eq!(resident.location, Location::Building(house));
         assert_eq!(resident.router.personal_car, Some(car));
         assert_eq!(resident.router.selected_vehicle(), Some(car));
-        let infos = test.g.read::<BuildingInfos>();
-        assert!(!infos.get(house).unwrap().inside.contains(&buyer));
-        assert!(infos.get(store_building).unwrap().inside.contains(&buyer));
-        drop(infos);
-        assert_eq!(
-            test.g.read::<Market>().capital(buyer, retail),
-            0,
-            "resident collected the unit"
-        );
-        assert!(resident.bought.0.get(&retail).is_none_or(Vec::is_empty));
-        for (tick, order_due) in [(due + period - 1, false), (due + period, true)] {
-            let score = resident.goods.score(
-                &GameTime::new(Tick(tick)),
-                human,
-                &resident.location,
-                &resident.bought,
-            );
-            assert_eq!(score.is_sign_positive(), order_due);
-        }
+        assert!(resident.household.on_hand[&retail] > 0);
+        assert!(resident.household.carried.is_empty());
+        assert_eq!(test.g.read::<Market>().capital(buyer, retail), 0);
         assert!(test.g.get(store).unwrap().sold.0.is_empty());
-        for _ in 0..100 {
-            test.tick_fast();
-        }
-        assert_eq!(
-            test.g.read::<Market>().capital(buyer, retail),
-            0,
-            "one purchase per period"
-        );
     }
 
     #[test]

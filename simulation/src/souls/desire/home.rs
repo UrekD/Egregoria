@@ -22,7 +22,11 @@ impl Home {
         HumanDecisionKind::GoTo(Destination::Building(self.house))
     }
 
-    pub fn score(&self) -> f32 {
-        0.2
+    pub fn score(&self, rest: f32) -> f32 {
+        if rest < 0.20 {
+            0.65
+        } else {
+            0.2
+        }
     }
 }

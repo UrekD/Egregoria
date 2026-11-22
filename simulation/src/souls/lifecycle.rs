@@ -12,6 +12,7 @@ use crate::map_dynamic::{
 };
 use crate::souls::desire::WorkKind;
 use crate::souls::freight_station::FreightTrainState;
+use crate::souls::household::cancel_visit;
 use crate::souls::human::HumanDecisionKind;
 use crate::souls::residence;
 use crate::transportation::testing_vehicles::RandomVehicles;
@@ -39,6 +40,20 @@ pub fn despawn_company(sim: &mut Simulation, id: CompanyID) {
 pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_external_target: bool) {
     let id = building.id;
     if building.kind == BuildingKind::House {
+        let (world, resources) = sim.world_res();
+        let infos = resources.read::<BuildingInfos>();
+        if let Some(info) = infos.get(id) {
+            let mut market = resources.write::<Market>();
+            for &resident in &info.residents {
+                if let SoulID::Human(human) = resident {
+                    if let Some(human) = world.humans.get_mut(human) {
+                        market
+                            .record_household_losses(std::mem::take(&mut human.household.on_hand));
+                    }
+                }
+            }
+        }
+        drop(infos);
         residence::evict_residents(sim, id, building.door_pos);
     }
     sim.write::<BuildingInfos>().remove(id);
@@ -87,6 +102,17 @@ pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_exte
 }
 
 pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut HumanEnt) {
+    let (_, resources) = sim.world_res();
+    if let Some(basket) = human.household.reservation.as_ref() {
+        let refund =
+            resources.read::<BuildingInfos>().owner(basket.building) == Some(basket.seller);
+        human.household.cancel(resources, refund);
+    }
+    sim.write::<Market>().record_household_losses(
+        std::mem::take(&mut human.household.on_hand)
+            .into_iter()
+            .chain(std::mem::take(&mut human.household.carried)),
+    );
     if let Some(car) = human.router.personal_car {
         sim.read::<ParCommandBuffer<VehicleEnt>>().kill(car);
     }
@@ -390,6 +416,22 @@ fn human_trade_participants<'a>(trades: impl Iterator<Item = &'a Trade>) -> BTre
 
 fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<CompanyID>> {
     let (world, resources) = sim.world_res();
+    if !matches!(soul, SoulID::Human(_)) {
+        let mut parking = resources.write::<ParkingManagement>();
+        for human in world.humans.values_mut() {
+            if human
+                .household
+                .reservation
+                .as_ref()
+                .is_some_and(|basket| basket.seller == soul)
+            {
+                // The seller account is about to disappear. Record the write-off.
+                human.household.cancel(resources, false);
+                human.router.walk_only_pickup = false;
+                cancel_trip(human, resources, &mut parking);
+            }
+        }
+    }
     let mut market = resources.write::<Market>();
     let mut infos = resources.write::<BuildingInfos>();
     let departure = match (soul, &mut world.departing) {
@@ -547,7 +589,9 @@ fn decision_references_buildings(
         HumanDecisionKind::GoTo(Destination::Building(id))
         | HumanDecisionKind::VisitLeisure(id)
         | HumanDecisionKind::DeliverAtBuilding(id)
-        | HumanDecisionKind::DeliverLoad { destination: id, .. } => buildings.contains_key(id),
+        | HumanDecisionKind::DeliverLoad {
+            destination: id, ..
+        } => buildings.contains_key(id),
         HumanDecisionKind::MultiStack(steps) => steps
             .iter()
             .any(|step| decision_references_buildings(step, buildings)),
@@ -574,7 +618,16 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
             human.food.forget_building(id);
         }
 
-        let mut cancel = door.is_some();
+        let seller_removed = human
+            .household
+            .reservation
+            .as_ref()
+            .is_some_and(|basket| buildings.contains_key(&basket.building));
+        if seller_removed {
+            human.household.cancel(resources, false);
+            human.router.walk_only_pickup = false;
+        }
+        let mut cancel = door.is_some() || seller_removed;
         if let Some(work) = &mut human.work {
             if buildings.contains_key(&work.workplace) {
                 human.work = None;
@@ -772,6 +825,10 @@ fn move_outside(human: &mut HumanEnt, pos: Vec3, resources: &Resources) {
 }
 
 fn cancel_trip(human: &mut HumanEnt, resources: &Resources, parking: &mut ParkingManagement) {
+    cancel_visit(human);
+    if human.household.cancel(resources, true) {
+        human.router.walk_only_pickup = false;
+    }
     if crate::map_dynamic::transit::on_route_cancelled(human, resources) {
         return;
     }

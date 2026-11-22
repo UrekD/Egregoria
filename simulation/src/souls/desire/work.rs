@@ -70,6 +70,23 @@ impl Work {
         }
     }
 
+    pub(crate) fn shift_score(
+        &self,
+        time: &GameTime,
+        loc: &Location,
+        attended: Option<i32>,
+    ) -> f32 {
+        if self.work_inter.dist_start(&time.daytime) != 0 {
+            return 0.0;
+        }
+        let at_work = *loc == Location::Building(self.workplace);
+        if at_work || attended.is_none_or(|day| day < time.daytime.day) {
+            1.0
+        } else {
+            0.0
+        }
+    }
+
     pub fn score(&self, time: &GameTime) -> f32 {
         if self.work_inter.dist_start(&time.daytime) == 0 {
             0.5

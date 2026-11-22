@@ -10,6 +10,8 @@ use prototypes::{prototypes_iter, GoodsCompanyID, GoodsCompanyPrototype, ItemPro
 use crate::economy::{ItemID, WORKER_CONSUMPTION_PER_MINUTE};
 use crate::map::BuildingID;
 use crate::map_dynamic::BuildingInfos;
+use crate::souls::household::{household_items, BasketId};
+use crate::HumanID;
 use crate::SoulID;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,12 +70,32 @@ impl SingleMarket {
 #[derive(Serialize, Deserialize)]
 pub struct Market {
     markets: BTreeMap<ItemID, SingleMarket>,
+    #[serde(default)]
+    household_losses: BTreeMap<ItemID, u64>,
     // reuse the trade vec to avoid allocations
     #[serde(skip)]
     all_trades: Vec<Trade>,
     // reuse the potential vec to avoid allocations
     #[serde(skip)]
     potential: Vec<(Trade, f32)>,
+}
+
+pub(crate) struct BasketRequest {
+    pub staples: u32,
+    pub goods: u32,
+    pub fallback: u32,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct BasketReservation {
+    pub id: BasketId,
+    pub shopper: HumanID,
+    pub seller: SoulID,
+    pub building: BuildingID,
+    pub expires: u64,
+    pub due: u64,
+    pub lines: Vec<(ItemID, u32)>,
+    shelf_pos: Vec2,
 }
 
 #[derive(PartialOrd, Ord, PartialEq, Eq, Copy, Clone, Debug, Serialize, Deserialize)]
@@ -107,6 +129,7 @@ impl Default for Market {
             markets: prototypes_iter::<ItemPrototype>()
                 .map(|v| (v.id, SingleMarket::new(prices[&v.id], v.optout_exttrade)))
                 .collect(),
+            household_losses: Default::default(),
             all_trades: Default::default(),
             potential: Default::default(),
         }
@@ -222,7 +245,7 @@ impl Market {
         mut can_pick_up: impl FnMut(SoulID, SoulID) -> bool,
     ) -> &[Trade] {
         self.all_trades.clear();
-        let retail = ItemID::new("retail-goods");
+        let local = household_items();
 
         for (&kind, market) in &mut self.markets {
             // Naive O(n²) alg
@@ -247,7 +270,7 @@ impl Market {
                     if qty_buy > qty_sell {
                         continue;
                     }
-                    if kind == retail && !can_pick_up(buyer, seller) {
+                    if local.contains(&kind) && !can_pick_up(buyer, seller) {
                         continue;
                     }
                     let score = sorder.pos.distance2(border.pos);
@@ -263,8 +286,15 @@ impl Market {
                     ))
                 }
             }
-            self.potential
-                .sort_unstable_by_key(|(_, x)| OrderedFloat(*x));
+            self.potential.sort_unstable_by_key(|(trade, distance)| {
+                (
+                    OrderedFloat(*distance),
+                    trade.seller,
+                    trade.buyer,
+                    trade.kind,
+                    0_u64,
+                )
+            });
             let SingleMarket {
                 buy_orders,
                 sell_orders,
@@ -359,6 +389,117 @@ impl Market {
         }
 
         &self.all_trades
+    }
+
+    /// Picks one reachable shelf and removes its accepted lines in one market operation.
+    /// A useful basket is preferred to a tiny partial fill. Distance and IDs break ties
+    /// within each group. There is no buyer market credit until or after collection.
+    pub(crate) fn reserve_basket(
+        &mut self,
+        shopper: HumanID,
+        origin: Vec2,
+        request: BasketRequest,
+        now: u64,
+        mut reachable: impl FnMut(SoulID) -> Option<(BuildingID, Vec2)>,
+    ) -> Option<BasketReservation> {
+        let [groceries, retail] = household_items();
+        let staples = self.markets.get(&groceries)?;
+        let goods = self.markets.get(&retail)?;
+        let id = BasketId(common::hash_u64((shopper, now)));
+        let buyer = SoulID::Human(shopper);
+        let available = |market: &SingleMarket, seller| {
+            market.sell_order(seller).map_or(0, |order| {
+                order
+                    .qty
+                    .min(market.capital(seller).unwrap_or(0).max(0) as u32)
+            })
+        };
+        let mut best: Option<(_, BuildingID, Vec2, u32, u32)> = None;
+        for &seller in staples.sell_orders.keys().chain(
+            goods
+                .sell_orders
+                .keys()
+                .filter(|seller| !staples.sell_orders.contains_key(seller)),
+        ) {
+            let food = available(staples, seller).min(request.staples);
+            let goods_target = request.fallback.saturating_sub(food).max(request.goods);
+            let other = available(goods, seller).min(goods_target);
+            if food + other == 0 || seller == buyer {
+                continue;
+            }
+            let Some((building, pos)) = reachable(seller) else {
+                continue;
+            };
+            let item = if food > 0 { groceries } else { retail };
+            let key = (
+                food + other < 4,
+                OrderedFloat(origin.distance2(pos)),
+                seller,
+                buyer,
+                item,
+                id,
+            );
+            if best.as_ref().is_none_or(|(best_key, ..)| key < *best_key) {
+                best = Some((key, building, pos, food, other));
+            }
+        }
+
+        let ((_, _, seller, _, _, _), building, shelf_pos, food, other) = best?;
+        let lines: Vec<_> = [(groceries, food), (retail, other)]
+            .into_iter()
+            .filter(|&(_, units)| units > 0)
+            .collect();
+        for &(item, units) in &lines {
+            let market = self.m(item);
+            *market.capital.get_mut(&seller).unwrap() -= units as i32;
+            let order = market.sell_orders.get_mut(&seller).unwrap();
+            order.qty -= units;
+            if order.qty == 0 {
+                market.sell_orders.remove(&seller);
+            }
+        }
+        Some(BasketReservation {
+            id,
+            shopper,
+            seller,
+            building,
+            expires: now + 2 * prototypes::TICKS_PER_HOUR,
+            due: now,
+            lines,
+            shelf_pos,
+        })
+    }
+
+    pub(crate) fn release_basket(&mut self, basket: BasketReservation, refund: bool) {
+        if refund {
+            for (item, units) in basket.lines {
+                self.produce(basket.seller, item, units as i32);
+                self.m(item)
+                    .sell_orders
+                    .entry(basket.seller)
+                    .or_insert(SellOrder {
+                        pos: basket.shelf_pos,
+                        qty: 0,
+                        stock: 0,
+                    })
+                    .qty += units;
+            }
+        } else {
+            self.record_household_losses(basket.lines);
+        }
+    }
+
+    pub(crate) fn record_household_losses(
+        &mut self,
+        lines: impl IntoIterator<Item = (ItemID, u32)>,
+    ) {
+        for (item, units) in lines {
+            *self.household_losses.entry(item).or_default() += u64::from(units);
+        }
+    }
+
+    pub fn household_losses(&self) -> &BTreeMap<ItemID, u64> {
+        &self.household_losses
     }
 
     /// Reverses the stock transfer for a local pickup that was never collected.
