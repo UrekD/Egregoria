@@ -188,7 +188,17 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
 
 pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: CompanyEnt) {
     cancel_removed(sim, CargoRemoval::Soul(SoulID::GoodsCompany(id)));
-    sim.write::<CargoBook>().policies.remove(&id);
+    sim.write::<CargoBook>().forget_company(id);
+    if let Some(storage) = &company.comp.proto.prototype().storage {
+        let soul = SoulID::GoodsCompany(id);
+        let mut market = sim.write::<Market>();
+        for &item in &storage.accepted_items {
+            let stock = market.capital(soul, item).max(0) as u32;
+            if stock > 0 {
+                market.record_freight_loss(item, stock);
+            }
+        }
+    }
     sim.read::<ParCommandBuffer<VehicleEnt>>()
         .kill_all(&company.comp.trucks);
     // A hire can be matched before the company's update assigns the workplace.

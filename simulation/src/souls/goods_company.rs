@@ -6,11 +6,14 @@ use prototypes::{
     try_prototype, CompanyKind, GoodsCompanyID, GoodsCompanyPrototype, ItemID, Power, Recipe, DELTA,
 };
 
-use crate::economy::{cargo::uses_road_freight, find_trade_place, record_coal_stockout, Market};
+use crate::economy::{
+    cargo::{uses_road_freight, CargoBook},
+    find_trade_place, record_coal_stockout, Market,
+};
 use crate::map::{Building, BuildingID, Map, Zone, MAX_ZONE_AREA};
 use crate::map_dynamic::{BuildingInfos, ElectricityFlow};
 use crate::souls::desire::WorkKind;
-use crate::transportation::{spawn_parked_vehicle, VehicleKind};
+use crate::transportation::{spawn_parked_vehicle, spawn_truck_at_depot, VehicleKind};
 use crate::utils::resources::Resources;
 use crate::world::{CompanyEnt, HumanID, VehicleID};
 use crate::{ParCommandBuffer, SoulID, VehicleEnt};
@@ -163,7 +166,11 @@ pub fn company_soul(
     drop(map);
 
     let mut trucks = vec![];
-    if proto.kind == CompanyKind::Factory && !proto.id.is_growable() {
+    if proto.storage.is_some()
+        || (proto.id.is_growable() && sim.read::<CargoBook>().growable_freight)
+    {
+        trucks.extend((0..proto.n_trucks).map(|_| spawn_truck_at_depot(sim, door_pos)));
+    } else if proto.kind == CompanyKind::Factory && !proto.id.is_growable() {
         for _ in 0..proto.n_trucks {
             trucks.extend(spawn_parked_vehicle(sim, VehicleKind::Truck, door_pos))
         }
@@ -203,7 +210,7 @@ pub fn company_soul(
         m.produce(soul, job_opening, company.max_workers as i32);
         m.sell_all(soul, door_pos.xy(), job_opening, 0);
 
-        if let Some(ref r) = proto.recipe {
+        if let Some(r) = proto.recipe.as_ref().filter(|_| proto.storage.is_none()) {
             recipe_init(r, soul, door_pos.xy(), m);
         }
     }
@@ -212,6 +219,33 @@ pub fn company_soul(
         .set_owner(company.building, soul);
 
     Some(soul)
+}
+
+/// Enables zoned road freight in a scenario, including for firms already on the map.
+pub fn enable_growable_freight(sim: &mut Simulation) {
+    if sim.read::<CargoBook>().growable_freight {
+        return;
+    }
+    sim.write::<CargoBook>().growable_freight = true;
+    let existing: Vec<_> = {
+        let map = sim.map();
+        sim.world()
+            .companies
+            .iter()
+            .filter_map(|(id, company)| {
+                let proto = company.comp.proto.prototype();
+                let building = map.get(company.comp.building)?;
+                (proto.id.is_growable() && proto.n_trucks > 0 && company.comp.trucks.is_empty())
+                    .then_some((id, building.door_pos, proto.n_trucks))
+            })
+            .collect()
+    };
+    for (company, door, count) in existing {
+        let trucks = (0..count)
+            .map(|_| spawn_truck_at_depot(sim, door))
+            .collect();
+        sim.world.companies[company].comp.trucks = trucks;
+    }
 }
 
 pub fn is_special_building_company(proto: GoodsCompanyID) -> bool {
@@ -227,6 +261,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
     let job_opening = ItemID::new("job-opening");
     let coal_plant = GoodsCompanyID::new("coal-power-plant");
     let coal = ItemID::new("coal");
+    let growable_freight = res.read::<CargoBook>().growable_freight;
 
     world.companies.iter_mut().for_each(|(me, c)| {
         let soul = SoulID::GoodsCompany(me);
@@ -241,12 +276,12 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
         // New physical matches live in CargoBook. Virtual matches finish at the market.
         c.sold
             .0
-            .retain(|trade| uses_road_freight(proto, trade.kind));
+            .retain(|trade| uses_road_freight(proto, trade.kind, growable_freight));
         for trades in c.bought.0.values_mut() {
             trades.clear();
         }
 
-        if let Some(recipe) = &proto.recipe {
+        if let Some(recipe) = proto.recipe.as_ref().filter(|_| proto.storage.is_none()) {
             if recipe_should_produce(recipe, soul, market) {
                 let productivity = c.productivity(proto, b.zone.as_ref(), map, elec_flow);
 
@@ -264,7 +299,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                     let proto = kind.prototype();
                     let recipe = proto.recipe.as_ref().unwrap();
                     run_recipe(recipe, soul, bpos.xy(), market, |item| {
-                        uses_road_freight(proto, item)
+                        uses_road_freight(proto, item, growable_freight)
                     });
                 });
                 return;
@@ -280,6 +315,29 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                 human.work = Some(Work::new(c.comp.building, WorkKind::Worker, offset));
                 human.bought.0.remove(&job_opening);
             }
+        }
+        if proto.storage.is_some() {
+            let mut workers: Vec<_> = c.workers.0.iter().copied().filter(|&worker| {
+                world.humans.get(worker).and_then(|human| human.work.as_ref())
+                    .is_some_and(|work| work.workplace == c.comp.building && matches!(work.kind, WorkKind::Worker))
+            }).collect();
+            let mut trucks: Vec<_> = c.comp.trucks.iter().copied().filter(|&truck| {
+                world.vehicles.contains_key(truck) && !c.workers.0.iter().any(|&worker| {
+                    world.humans.get(worker).and_then(|human| human.work.as_ref())
+                        .is_some_and(|work| work.workplace == c.comp.building
+                            && matches!(work.kind, WorkKind::Driver { truck: assigned, .. } if assigned == truck))
+                })
+            }).collect();
+            workers.sort_unstable();
+            trucks.sort_unstable();
+            for (worker, truck) in workers.into_iter().zip(trucks) {
+                world.humans[worker].work.as_mut().unwrap().kind = WorkKind::Driver {
+                    truck,
+                    deliver_order: None,
+                    load: None,
+                };
+            }
+            return;
         }
         if c.comp.driver.is_some_and(|driver| {
             !c.workers.0.contains(&driver)

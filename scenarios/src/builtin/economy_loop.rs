@@ -1,13 +1,20 @@
 use geom::vec2;
-use prototypes::{ItemID, TICKS_PER_HOUR};
+use prototypes::{ItemID, RecTimeInterval, TICKS_PER_HOUR};
 use simulation::economy::{DailyEconomyMetrics, Market, TripPurpose, TICKS_PER_BUDGET_DAY};
 use simulation::map::Density::{High, Low};
 use simulation::map::ZoneKind::{Commercial, Industrial, Office, Residential};
-use simulation::{Simulation, SimulationOptions, SlotId};
+use simulation::map::{BuildingID, BuildingKind};
+use simulation::map_dynamic::BuildingInfos;
+use simulation::souls::desire::{Work, WorkKind};
+use simulation::souls::goods_company::enable_growable_freight;
+use simulation::souls::human::spawn_human;
+use simulation::transportation::Location;
+use simulation::world_command::WorldCommand;
+use simulation::{Simulation, SimulationOptions, SlotId, SnapshotRevision, SoulID};
 
 use crate::builders::{
-    grid_city, paint_zone_blocks, place_company, place_freight_station, place_grid_power_plant,
-    place_service_sites, UTILITY_SITES,
+    fill_houses, grid_city, paint_zone_blocks, place_company, place_freight_station,
+    place_grid_power_plant, place_service_sites, CommandSink, UTILITY_SITES,
 };
 use crate::{Scenario, ScenarioCtx};
 
@@ -24,6 +31,10 @@ pub(super) const SCENARIO: (Scenario, SimulationOptions) = (
 );
 
 fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    if std::env::var_os("EGREGORIA_ECONOMY_WAREHOUSE").is_some() {
+        return compare_warehouse(ctx);
+    }
+    let growable_freight = std::env::var_os("EGREGORIA_ECONOMY_GROWABLE_FREIGHT").is_some();
     let showcase = std::env::var_os("EGREGORIA_ECONOMY_SHOWCASE_ROOT");
     let demo_slot =
         std::env::var("EGREGORIA_ECONOMY_DEMO_SLOT").unwrap_or_else(|_| "showcase_city".into());
@@ -31,6 +42,9 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         let slot = SlotId::new(&demo_slot).map_err(|error| error.to_string())?;
         ctx.sim = Simulation::load_from_slot(std::path::Path::new(root), &slot)
             .map_err(|error| error.to_string())?;
+        if growable_freight {
+            enable_growable_freight(&mut ctx.sim);
+        }
         if demo_slot == "starter_town" {
             // The opening town's first 46 workers fill closer jobs. Grow the
             // neighbourhood by the mine to exercise a staffed freight route.
@@ -42,6 +56,9 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
             );
         }
     } else {
+        if growable_freight {
+            enable_growable_freight(&mut ctx.sim);
+        }
         build_fixture(ctx)?;
         ctx.run_ticks(2 * TICKS_PER_BUDGET_DAY);
     }
@@ -224,5 +241,143 @@ fn build_fixture(ctx: &mut ScenarioCtx) -> Result<(), String> {
         }),
     );
 
+    Ok(())
+}
+
+fn compare_warehouse(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    let mut direct = ScenarioCtx::new(SCENARIO.1);
+    let (direct_ticks, direct_units) = coal_supply_shock(&mut direct, false)?;
+    let (buffer_ticks, buffer_units) = coal_supply_shock(ctx, true)?;
+    println!(
+        "economy_loop warehouse: direct {direct_ticks} stockout ticks for {direct_units} units;          with depot {buffer_ticks} stockout ticks for {buffer_units} units"
+    );
+    if buffer_ticks >= direct_ticks || buffer_units != direct_units || buffer_units != 16 {
+        return Err("Depot must shorten the shortage while delivering the same batch".into());
+    }
+    ctx.sample("warehouse_recovery");
+    Ok(())
+}
+
+fn coal_supply_shock(ctx: &mut ScenarioCtx, buffered: bool) -> Result<(u64, i32), String> {
+    let stations: Vec<_> = ctx
+        .sim
+        .map()
+        .buildings()
+        .iter()
+        .filter_map(|(id, building)| {
+            matches!(building.kind, BuildingKind::RailFreightStation(_))
+                .then_some(WorldCommand::MapRemoveBuilding(id))
+        })
+        .collect();
+    ctx.submit(&stations);
+    ctx.flush();
+
+    let origin = vec2(704.0, 704.0);
+    grid_city(ctx, origin, 5, 2, 200.0);
+    let mine = place_company(ctx, "coal-mine", origin + vec2(100.0, 25.0))
+        .ok_or("could not place the direct coal source")?;
+    let plant = place_company(ctx, "coal-power-plant", origin + vec2(700.0, -100.0))
+        .ok_or("could not place the coal consumer")?;
+    let house = *fill_houses(ctx, 1)
+        .first()
+        .ok_or("could not place the driver's home")?;
+    let dispatch = if buffered {
+        place_company(ctx, "small-depot", origin + vec2(680.0, 24.0))
+            .ok_or("could not place the local depot")?
+    } else {
+        mine
+    };
+    let owner = |building| {
+        ctx.sim
+            .read::<BuildingInfos>()
+            .owner(building)
+            .ok_or("missing company owner")
+    };
+    let source = owner(dispatch)?;
+    let consumer = owner(plant)?;
+    let coal = ItemID::new("coal");
+
+    // Start each recovery with the same stock and the driver at the dispatch
+    // site. The buffer leg uses coal delivered before the shortage window.
+    ctx.sim.write::<Market>().produce(source, coal, 48);
+    staff_dispatch(&mut ctx.sim, house, dispatch, source)?;
+
+    let snapshot = buffered
+        .then(|| std::env::var_os("EGREGORIA_WAREHOUSE_CAPTURE"))
+        .flatten();
+    let mut captured = false;
+    for ticks in 1..=TICKS_PER_HOUR {
+        ctx.run_ticks(1);
+        if !captured {
+            if let Some(root) = &snapshot {
+                let book = ctx.sim.read::<simulation::economy::cargo::CargoBook>();
+                if book.outgoing_loads(dispatch).next().is_some() {
+                    drop(book);
+                    let slot =
+                        SlotId::new("warehouse_capture").map_err(|error| error.to_string())?;
+                    let revision = SnapshotRevision::new(u128::from(ctx.sim.get_tick()));
+                    ctx.sim
+                        .encode_slot(revision)
+                        .and_then(|save| {
+                            save.with_display_name("Warehouse capture".into())
+                                .publish(std::path::Path::new(root), &slot)
+                        })
+                        .map_err(|error| error.to_string())?;
+                    let map = ctx.sim.map();
+                    let center = map.buildings()[dispatch].obb.center();
+                    println!("warehouse_capture site at {}, {}", center.x, center.y);
+                    captured = true;
+                }
+            }
+        }
+        let units = ctx.sim.read::<Market>().capital(consumer, coal);
+        if units > 0 {
+            return Ok((ticks - 1, units));
+        }
+    }
+    Err(format!(
+        "coal did not arrive via {} within one hour",
+        if buffered {
+            "the depot"
+        } else {
+            "the direct route"
+        }
+    ))
+}
+
+fn staff_dispatch(
+    sim: &mut Simulation,
+    house: BuildingID,
+    building: BuildingID,
+    source: SoulID,
+) -> Result<(), String> {
+    let SoulID::GoodsCompany(company) = source else {
+        return Err("dispatch site is not a company".into());
+    };
+    let driver = spawn_human(sim, house).ok_or("could not seed the freight driver")?;
+    let world = sim.world_mut_unchecked();
+    let entity = &mut world.companies[company];
+    let truck = *entity
+        .comp
+        .trucks
+        .first()
+        .ok_or("dispatch fleet has no truck")?;
+    entity.comp.driver = Some(driver);
+    entity.workers.0.push(driver);
+    let mut work = Work::new(
+        building,
+        WorkKind::Driver {
+            truck,
+            load: None,
+            deliver_order: None,
+        },
+        0.0,
+    );
+    work.work_inter = RecTimeInterval::always();
+    world.humans[driver].work = Some(work);
+    world.humans[driver].location = Location::Building(building);
+    let mut infos = sim.write::<BuildingInfos>();
+    infos.get_out(house, SoulID::Human(driver));
+    infos.get_in(building, SoulID::Human(driver));
     Ok(())
 }

@@ -799,7 +799,20 @@ impl WorldCommand {
             }
             SetWarehousePolicy { building, policy } => {
                 let company = Self::warehouse_company(sim, building)?;
-                sim.write::<CargoBook>().policies.insert(company, policy);
+                let has_access = {
+                    let map = sim.map();
+                    map.get(building)
+                        .and_then(|site| site.connected_road)
+                        .and_then(|road| map.get(road))
+                        .is_some_and(|road| {
+                            road.lanes_iter()
+                                .any(|(_, kind)| kind == crate::map::LaneKind::Driving)
+                        })
+                };
+                if !has_access {
+                    return Err(Rejection::InvalidWarehouse);
+                }
+                CargoBook::set_warehouse_policy(sim, company, policy);
             }
             Init(_) => return Err(Rejection::UnexpectedInit),
             UpdateZone { building, ref zone } => {

@@ -10,6 +10,9 @@ data:extend {
         lot_size_min = 400,
         growable = true,
         kind = "factory",
+        n_trucks = 1,
+        cargo_capacity_units = 16,
+        dispatch_min_units = 8,
         n_workers = 18,
         water_consumption = 12,
         recipe = {
@@ -83,6 +86,9 @@ data:extend {
         lot_size_min = 400,
         growable = true,
         kind = "factory",
+        n_trucks = 1,
+        cargo_capacity_units = 16,
+        dispatch_min_units = 8,
         n_workers = 27,
         water_consumption = 18,
         recipe = {
@@ -156,6 +162,9 @@ data:extend {
         lot_size_min = 900,
         growable = true,
         kind = "factory",
+        n_trucks = 1,
+        cargo_capacity_units = 16,
+        dispatch_min_units = 8,
         n_workers = 36,
         water_consumption = 24,
         recipe = {

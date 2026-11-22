@@ -1,5 +1,6 @@
 require("items")
 require("companies")
+require("warehouses")
 require("residences")
 require("growables")
 require("services")
