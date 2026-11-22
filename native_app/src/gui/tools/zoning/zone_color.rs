@@ -11,11 +11,19 @@ pub fn zone_color(kind: ZoneKind) -> LinearColor {
 }
 
 pub fn zone_cell_color(kind: ZoneKind, density: Density) -> LinearColor {
-    let (scale, white) = match density {
-        Density::Low => (0.16, 0.0),
-        Density::Medium => (0.64, 0.01),
-        Density::High => (0.48, 0.52),
+    let [r, g, b] = match (kind, density) {
+        (ZoneKind::Residential, Density::Low) => [0.327, 0.726, 0.392],
+        (ZoneKind::Residential, Density::Medium) => [0.109, 0.550, 0.208],
+        (ZoneKind::Residential, Density::High) => [0.001, 0.316, 0.114],
+        (ZoneKind::Commercial, Density::Low) => [0.360, 0.634, 0.946],
+        (ZoneKind::Commercial, Density::Medium) => [0.163, 0.438, 0.846],
+        (ZoneKind::Commercial, Density::High) => [0.039, 0.226, 0.635],
+        (ZoneKind::Industrial, Density::Low) => [0.894, 0.527, 0.236],
+        (ZoneKind::Industrial, Density::Medium) => [0.782, 0.308, 0.073],
+        (ZoneKind::Industrial, Density::High) => [0.556, 0.149, 0.015],
+        (ZoneKind::Office, Density::Low) => [0.713, 0.492, 0.963],
+        (ZoneKind::Office, Density::Medium) => [0.514, 0.300, 0.842],
+        (ZoneKind::Office, Density::High) => [0.309, 0.124, 0.601],
     };
-    let LinearColor { r, g, b, .. } = zone_color(kind);
-    LinearColor::new(r * scale + white, g * scale + white, b * scale + white, 1.0)
+    LinearColor::new(r, g, b, 1.0)
 }

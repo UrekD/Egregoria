@@ -1,4 +1,4 @@
-use crate::gui::zoning::{zone_cell_color, zone_color};
+use crate::gui::zoning::{density_name, zone_cell_color, zone_color, zone_name, ZoningPreview};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::MapRenderOptions;
 use common::FastMap;
@@ -8,19 +8,23 @@ use engine::{
     Drawable, FrameContext, GfxContext, InstancedMeshBuilder, Material, Mesh, MeshInstance,
     MeshVertex, MetallicRoughness, SpriteBatch, SpriteBatchBuilder, Tesselator,
 };
-use geom::{minmax, vec2, vec3, Color, LinearColor, PolyLine3, Polygon, Radians, Vec2, Vec3};
+use geom::{
+    minmax, vec2, vec3, Circle, Color, Intersect, LinearColor, PolyLine3, Polygon, Radians, Shape,
+    Vec2, Vec3, AABB, OBB,
+};
 use prototypes::{
     try_prototype, FreightStationPrototype, GoodsCompanyID, GoodsCompanyPrototype,
     GrowableCompanyID, GrowableCompanyPrototype, RenderAsset,
 };
 use simulation::map::{
-    Building, BuildingKind, CanonicalPosition, Environment, Intersection, LaneKind, Lanes, LotKind,
-    Map, MapSubscriber, ProjectFilter, ProjectKind, PylonPosition, Road, Roads, SubscriberChunkID,
-    Turn, TurnKind, UpdateType, ZoneCell, ZoneGrid, ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET,
-    ZONE_CELL_SIZE,
+    Building, BuildingKind, CanonicalPosition, Density, Environment, Intersection, LaneKind, Lanes,
+    LotID, LotKind, Map, MapSubscriber, ProjectFilter, ProjectKind, PylonPosition, Road, Roads,
+    SubscriberChunkID, Turn, TurnKind, UpdateType, ZoneCell, ZoneGrid, ZoneKind, CROSSWALK_WIDTH,
+    ROAD_Z_OFFSET, ZONE_CELL_SIZE,
 };
-use simulation::souls::growth::growable_for_lot;
+use simulation::souls::growth::{check_growable_lot, GrowableLotError};
 use simulation::Simulation;
+use std::cell::RefCell;
 use std::ops::{Mul, Neg};
 use std::sync::Arc;
 
@@ -34,6 +38,7 @@ pub struct MapMeshHandler {
     building_sub: MapSubscriber,
     map_version: Option<u64>,
     rebuilt_version: Option<u64>,
+    zoning: ZoningMeshes,
 }
 
 #[derive(Default)]
@@ -64,52 +69,255 @@ struct MapBuilders {
     mesh_lots: MeshBuilder<false>,
 }
 
+const ZONING_OVERVIEW_DISTANCE: f32 = 900.0;
+const ZONING_CAMERA_BUCKET: f32 = 256.0;
+const ZONING_FILL_LIFT: f32 = 0.20;
+
+type ZonedLot = (ZoneCell, Result<(), GrowableLotError>);
+
+#[derive(PartialEq)]
+struct ZoningPreviewMesh {
+    fill: Option<ZoningPreviewFill>,
+    outlines: Vec<LotOutline>,
+}
+
+#[derive(PartialEq)]
+struct ZoningPreviewFill {
+    area: AABB,
+    pitch: f32,
+    inset: f32,
+    color: [f32; 4],
+}
+
+#[derive(PartialEq)]
+struct LotOutline {
+    corners: [Vec2; 4],
+    width: f32,
+    color: [f32; 4],
+}
+
+struct ZoningFrame {
+    world: u64,
+    grid: Arc<ZoneGrid>,
+    key: ZoningMeshKey,
+    preview: ZoningPreviewMesh,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct ZoningMeshKey {
+    bounds: AABB,
+    overview: bool,
+    detail: bool,
+}
+
+impl ZoningMeshKey {
+    fn new(center: Vec2, distance: f32, detail: bool) -> Self {
+        // Pad the view to bucket boundaries so small pans and zooms reuse the same mesh.
+        let radius = Vec2::splat(distance * 1.5);
+        let bounds = AABB::new_ll_ur(
+            ((center - radius) / ZONING_CAMERA_BUCKET).floor() * ZONING_CAMERA_BUCKET,
+            ((center + radius) / ZONING_CAMERA_BUCKET).ceil() * ZONING_CAMERA_BUCKET,
+        );
+        let overview = distance >= ZONING_OVERVIEW_DISTANCE;
+        Self {
+            bounds,
+            overview,
+            detail: detail && !overview,
+        }
+    }
+}
+
+thread_local! {
+    // UI systems have the simulation and pointer. The renderer consumes their latest request
+    // on the same thread, where it has access to the GPU. No request means no zoning mesh.
+    static ZONING_FRAME: RefCell<Option<ZoningFrame>> = const { RefCell::new(None) };
+}
+
+struct ZoningMeshes {
+    updates: MapSubscriber,
+    world_revision: Option<(u64, u64)>,
+    key: Option<ZoningMeshKey>,
+    lots: FastMap<LotID, Option<ZonedLot>>,
+    committed: Option<Arc<Mesh>>,
+    preview: Option<Arc<Mesh>>,
+    preview_key: Option<ZoningPreviewMesh>,
+    builder: MeshBuilder<false>,
+}
+
+impl ZoningMeshes {
+    fn draw(&mut self, map: &Map, ctx: &mut FrameContext<'_>) {
+        let Some(frame) = ZONING_FRAME.take() else {
+            return;
+        };
+        profiling::scope!("zoning_overlay");
+        let revision = (frame.world, frame.grid.generation);
+        let cleared = self.updates.take_cleared();
+        let updated = self.updates.take_updated_chunks().next().is_some();
+        if self.world_revision != Some(revision) || cleared || updated {
+            self.world_revision = Some(revision);
+            self.key = None;
+            self.preview_key = None;
+            self.lots.clear();
+        }
+
+        if self.key != Some(frame.key) {
+            profiling::scope!("build zoning mesh");
+            self.builder.clear();
+            build_painted_cells(map, &frame.grid, frame.key, &mut self.builder);
+            if !frame.key.overview && !frame.grid.cells.is_empty() {
+                let mut tess = self.builder.mk_tess();
+                for project in map
+                    .spatial_map()
+                    .query(frame.key.bounds, ProjectFilter::LOT)
+                {
+                    let ProjectKind::Lot(id) = project else {
+                        continue;
+                    };
+                    let lot = &map.lots()[id];
+                    let zoned = *self.lots.entry(id).or_insert_with(|| {
+                        frame
+                            .grid
+                            .lot_zone(&lot.shape)
+                            .map(|zone| (zone, check_growable_lot(map, lot, zone).map(|_| ())))
+                    });
+                    if let Some((width, color)) = lot_outline(zoned, false) {
+                        draw_lot_outline(
+                            &map.environment,
+                            &mut tess,
+                            lot.shape.corners,
+                            width,
+                            color.into(),
+                        );
+                    }
+                }
+            }
+            self.committed = build_zoning_mesh(&mut self.builder, ctx.gfx);
+            self.key = Some(frame.key);
+        }
+
+        let preview = frame.preview;
+        if self.preview_key.as_ref() != Some(&preview) {
+            self.builder.clear();
+            if let Some(fill) = &preview.fill {
+                for (x, y) in zoning_tiles(fill.area, fill.pitch) {
+                    let tile = tile_bounds(x, y, fill.pitch).intersection(fill.area);
+                    add_zoning_tile(
+                        map,
+                        inset_tile(tile, fill.inset),
+                        fill.color,
+                        ZONING_FILL_LIFT + 0.04,
+                        &mut self.builder,
+                    );
+                }
+            }
+            let mut tess = self.builder.mk_tess();
+            for mark in &preview.outlines {
+                draw_lot_outline(
+                    &map.environment,
+                    &mut tess,
+                    mark.corners,
+                    mark.width,
+                    mark.color,
+                );
+            }
+            self.preview = build_zoning_mesh(&mut self.builder, ctx.gfx);
+            self.preview_key = Some(preview);
+        }
+
+        if let Some(mesh) = &self.committed {
+            ctx.draw(mesh.clone());
+        }
+        if let Some(mesh) = &self.preview {
+            ctx.draw(mesh.clone());
+        }
+    }
+}
+
+fn build_zoning_mesh(builder: &mut MeshBuilder<false>, gfx: &GfxContext) -> Option<Arc<Mesh>> {
+    let mut mesh = builder.build(gfx)?;
+    mesh.skip_depth = true;
+    Some(Arc::new(mesh))
+}
+
 impl super::MapRenderer {
-    pub fn draw_zoning_overlay(
-        sim: &Simulation,
+    pub(crate) fn queue_zoning_overlay(
+        map: &Map,
+        grid: Arc<ZoneGrid>,
+        world: u64,
+        center: Vec2,
+        distance: f32,
+        stroke: ZoningPreview<'_>,
+    ) -> Option<String> {
+        let ZoningPreview {
+            areas,
+            pointer,
+            hover_radius,
+            pitch,
+            kind,
+            density,
+            held,
+        } = stroke;
+        profiling::scope!("zoning_preview");
+        let key = ZoningMeshKey::new(center, distance, pitch == ZONE_CELL_SIZE);
+        let replacement = kind.map(|kind| ZoneCell { kind, density });
+        let fill = areas.last().map(|area| ZoningPreviewFill {
+            area: area.bbox(),
+            pitch: if key.overview { ZONE_CELL_SIZE } else { pitch },
+            inset: if key.overview {
+                0.0
+            } else {
+                density_inset(density)
+            },
+            color: kind
+                .map_or(LinearColor::new(0.96, 0.28, 0.28, 1.0), |kind| {
+                    zone_cell_color(kind, density)
+                })
+                .a(if held { 0.66 } else { 0.50 })
+                .into(),
+        });
+        let (outlines, warning) = pointer.map_or_else(
+            || (Vec::new(), None),
+            |pointer| {
+                preview_lots(
+                    map,
+                    &grid,
+                    areas,
+                    replacement,
+                    pointer,
+                    hover_radius,
+                    key.overview,
+                )
+            },
+        );
+        let preview = ZoningPreviewMesh { fill, outlines };
+        ZONING_FRAME.replace(Some(ZoningFrame {
+            world,
+            grid,
+            key,
+            preview,
+        }));
+        warning
+    }
+
+    pub(crate) fn draw_zoned_lots(
+        map: &Map,
+        zones: &ZoneGrid,
         draw: &mut ImmediateDraw,
         center: Vec2,
         distance: f32,
-        editing: bool,
     ) {
-        let zones = sim.read::<ZoneGrid>();
-        if !editing && zones.cells.is_empty() {
+        if zones.cells.is_empty() {
             return;
-        }
-        let map = sim.map();
-        let radius = distance * 1.5;
-        if editing {
-            draw_painted_cells(
-                &map.environment,
-                draw,
-                &zones,
-                center,
-                radius,
-                distance >= 900.0,
-            );
         }
         for project in map
             .spatial_map()
-            .query_around(center, radius, ProjectFilter::LOT)
+            .query_around(center, distance * 1.5, ProjectFilter::LOT)
         {
             let ProjectKind::Lot(id) = project else {
                 continue;
             };
             let lot = &map.lots()[id];
-            let zone = zones.lot_zone(&lot.shape);
-            if editing {
-                let eligible = zone.is_some_and(|zone| growable_for_lot(&map, lot, zone).is_some());
-                let (width, color) = if eligible {
-                    (0.8, LinearColor::WHITE.a(0.88))
-                } else {
-                    (0.4, LinearColor::gray(0.68).a(0.55))
-                };
-                let corners = lot.shape.corners.map(|corner| {
-                    corner.z(map.environment.height(corner).unwrap_or(lot.height) + 0.85)
-                });
-                let [a, b, c, d] = corners;
-                draw.polyline(vec![a, b, c, d, a], width, true).color(color);
-            } else if let Some(zone) = zone {
+            if let Some(zone) = zones.lot_zone(&lot.shape) {
                 draw.obb(lot.shape, lot.height + 0.32)
                     .color(zone_color(zone.kind).a(0.65));
             }
@@ -117,96 +325,319 @@ impl super::MapRenderer {
     }
 }
 
-fn draw_painted_cells(
-    terrain: &Environment,
-    draw: &mut ImmediateDraw,
-    zones: &ZoneGrid,
-    center: Vec2,
-    radius: f32,
-    merge: bool,
-) {
-    let min = ((center - Vec2::splat(radius)) / ZONE_CELL_SIZE).floor();
-    let max = ((center + Vec2::splat(radius)) / ZONE_CELL_SIZE).floor();
-    let visible = zones
-        .cells
-        .range((min.x as i32, i32::MIN)..=(max.x as i32, i32::MAX))
-        .filter(|&(&(_, y), _)| (min.y as i32..=max.y as i32).contains(&y))
-        .map(|(&pos, &cell)| (pos, cell));
+fn preview_lots(
+    map: &Map,
+    grid: &ZoneGrid,
+    paints: &[OBB],
+    replacement: Option<ZoneCell>,
+    pointer: Vec2,
+    hover_radius: f32,
+    overview: bool,
+) -> (Vec<LotOutline>, Option<String>) {
+    let hover = Circle::new(pointer, hover_radius);
+    let affected = paints.iter().map(Shape::bbox).reduce(AABB::union);
+    let pointer_bounds = if overview {
+        AABB::new_ll_ur(pointer, pointer)
+    } else {
+        hover.bbox()
+    };
+    let lots_in = |bounds| map.spatial_map().query(bounds, ProjectFilter::LOT);
+    let nearby = lots_in(pointer_bounds).filter(|&project| match project {
+        ProjectKind::Lot(id) => {
+            !affected.is_some_and(|area| area.intersects(&map.lots()[id].shape))
+        }
+        _ => false,
+    });
+    let mut outlines = Vec::new();
+    let mut hovered = None;
+    let mut blocked = None;
+    let mut frontage = false;
+    let mut eligible = false;
+    for project in affected.into_iter().flat_map(lots_in).chain(nearby) {
+        let ProjectKind::Lot(id) = project else {
+            continue;
+        };
+        let lot = &map.lots()[id];
+        let under_pointer = lot.shape.contains(pointer);
+        let near_brush = !overview && lot.shape.intersects(&hover);
+        let intersects_paint = affected.is_some_and(|area| area.intersects(&lot.shape));
+        if !intersects_paint && !under_pointer && !near_brush {
+            continue;
+        }
+        let before = grid.lot_zone(&lot.shape);
+        let (touched, zone) = if intersects_paint {
+            grid.lot_zone_after_paint(&lot.shape, paints, replacement)
+        } else {
+            (false, before)
+        };
+        let zoned = zone
+            .filter(|_| touched || under_pointer)
+            .map(|zone| (zone, check_growable_lot(map, lot, zone).map(|_| ())));
+        if touched {
+            frontage |= map.get(lot.parent).is_some();
+            eligible |= zoned.is_some_and(|(_, status)| status.is_ok());
+            if blocked.is_none() {
+                blocked = zoned.filter(|(_, status)| status.is_err());
+            }
+        }
+        if under_pointer && hovered.is_none() {
+            hovered = zoned.filter(|(_, status)| status.is_err());
+        }
+        if !overview && (zone != before || zone.is_none()) {
+            if let Some((width, color)) = lot_outline(zoned, near_brush) {
+                outlines.push(LotOutline {
+                    corners: lot.shape.corners,
+                    width,
+                    color: color.into(),
+                });
+            }
+        }
+    }
+    let warning = hovered.map(lot_warning).or_else(|| {
+        if replacement.is_none() || paints.is_empty() || eligible {
+            return None;
+        }
+        if let Some(blocked) = blocked {
+            return Some(lot_warning(blocked));
+        }
+        Some(if frontage {
+            "Cover at least half of a roadside lot to zone it".into()
+        } else {
+            "Zones need road frontage to grow".into()
+        })
+    });
+    (outlines, warning)
+}
 
-    let inset = if merge { 0.08 } else { 0.24 };
-    for ((x, start), end, zone) in zone_runs(visible, merge) {
-        let x = (x as f32 + 0.5) * ZONE_CELL_SIZE;
-        let first = start as f32 * ZONE_CELL_SIZE + inset;
-        let last = (end as f32 + 1.0) * ZONE_CELL_SIZE - inset;
-        let points = std::iter::once(first)
-            .chain((start + 1..=end).map(|y| y as f32 * ZONE_CELL_SIZE))
-            .chain(std::iter::once(last))
-            .filter_map(|y| {
-                let pos = vec2(x, y);
-                Some(pos.z(terrain.height(pos)? + 0.55))
-            })
-            .collect::<Vec<_>>();
-        draw.polyline(points, ZONE_CELL_SIZE - 2.0 * inset, false)
-            .color(zone_cell_color(zone.kind, zone.density).a(0.88));
+fn lot_warning((zone, status): ZonedLot) -> String {
+    match status.expect_err("only blocked lots produce warnings") {
+        GrowableLotError::MissingRoad => "Lot needs road frontage to grow".into(),
+        GrowableLotError::TooSmall => format!(
+            "Lot too small for {} {}",
+            density_name(zone.density),
+            zone_name(zone.kind),
+        ),
+        GrowableLotError::Obstructed => "Lot is obstructed".into(),
+        GrowableLotError::MissingPrototype => "No growable for this zone and density".into(),
     }
 }
 
-// The grid is ordered by column, so a run only joins consecutive equal cells in that column.
-fn zone_runs(
-    cells: impl Iterator<Item = ((i32, i32), ZoneCell)>,
-    merge: bool,
-) -> impl Iterator<Item = ((i32, i32), i32, ZoneCell)> {
-    let mut cells = cells.peekable();
-    std::iter::from_fn(move || {
-        let ((x, start), zone) = cells.next()?;
-        let mut end = start;
-        if merge {
-            while cells.next_if_eq(&((x, end + 1), zone)).is_some() {
-                end += 1;
-            }
+fn lot_outline(zone: Option<ZonedLot>, near_brush: bool) -> Option<(f32, LinearColor)> {
+    match zone {
+        None => near_brush.then_some((0.3, LinearColor::gray(0.6).a(0.45))),
+        Some((_, Ok(()))) => Some((0.35, LinearColor::new(0.05, 0.05, 0.05, 0.45))),
+        Some((_, Err(GrowableLotError::MissingRoad))) => {
+            Some((0.9, LinearColor::new(1.0, 0.22, 0.36, 0.95)))
         }
-        Some(((x, start), end, zone))
-    })
+        Some((_, Err(_))) => Some((0.9, LinearColor::new(1.0, 0.55, 0.10, 0.95))),
+    }
+}
+
+fn draw_lot_outline(
+    terrain: &Environment,
+    tess: &mut Tesselator<'_>,
+    corners: [Vec2; 4],
+    width: f32,
+    color: [f32; 4],
+) {
+    let mut points = [Vec3::ZERO; 25];
+    let mut len = 0;
+    for i in 0..4 {
+        let from = corners[i];
+        let to = corners[(i + 1) % 4];
+        let steps = ((to - from).mag() / ZONE_CELL_SIZE).ceil().clamp(1.0, 6.0) as usize;
+        for step in 0..steps {
+            let xy = from + (to - from) * (step as f32 / steps as f32);
+            let Some(height) = terrain.true_height(xy) else {
+                return;
+            };
+            points[len] = xy.z(height + ROAD_Z_OFFSET * 0.85);
+            len += 1;
+        }
+    }
+    points[len] = points[0];
+    let [r, g, b, a] = color;
+    tess.set_color(LinearColor::new(r, g, b, a));
+    tess.draw_polyline(&points[..=len], width, true);
+}
+
+fn density_inset(density: Density) -> f32 {
+    match density {
+        Density::Low => 1.2,
+        Density::Medium => 0.5,
+        Density::High => 0.1,
+    }
+}
+
+fn zoning_tiles(bounds: AABB, pitch: f32) -> impl Iterator<Item = (i32, i32)> {
+    let min = (bounds.ll / pitch).floor();
+    let max = (bounds.ur / pitch).ceil();
+    (min.x as i32..max.x as i32)
+        .flat_map(move |x| (min.y as i32..max.y as i32).map(move |y| (x, y)))
+}
+
+fn tile_bounds(x: i32, y: i32, pitch: f32) -> AABB {
+    AABB::new_ll_size(vec2(x as f32, y as f32) * pitch, Vec2::splat(pitch))
+}
+
+fn inset_tile(tile: AABB, inset: f32) -> AABB {
+    AABB::new_ll_ur(tile.ll + Vec2::splat(inset), tile.ur - Vec2::splat(inset))
+}
+
+fn uniform_block(zones: &ZoneGrid, x: i32, y: i32, zone: ZoneCell) -> bool {
+    [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)]
+        .iter()
+        .all(|key| zones.cells.get(key) == Some(&zone))
+}
+
+fn build_painted_cells(
+    map: &Map,
+    grid: &ZoneGrid,
+    key: ZoningMeshKey,
+    mesh: &mut MeshBuilder<false>,
+) {
+    let min = (key.bounds.ll / ZONE_CELL_SIZE).floor();
+    let max = (key.bounds.ur / ZONE_CELL_SIZE).ceil();
+    for (&(x, y), &zone) in grid
+        .cells
+        .range((min.x as i32, i32::MIN)..(max.x as i32, i32::MIN))
+    {
+        if !(min.y as i32..max.y as i32).contains(&y) {
+            continue;
+        }
+        let color = zone_cell_color(zone.kind, zone.density).a(0.88);
+        let tile = painted_tile(grid, key, x, y, zone);
+        add_zoning_tile(map, tile, color.into(), ZONING_FILL_LIFT, mesh);
+    }
+}
+
+fn painted_tile(grid: &ZoneGrid, key: ZoningMeshKey, x: i32, y: i32, zone: ZoneCell) -> AABB {
+    let tile = tile_bounds(x, y, ZONE_CELL_SIZE);
+    let inset = density_inset(zone.density);
+    if key.overview {
+        // Shared XY boundaries are sampled at exactly the same positions in overview.
+        tile
+    } else if !key.detail && uniform_block(grid, x & !1, y & !1, zone) {
+        // Keep the terrain samples at 8 m pitch even inside a visually solid 16 m tile.
+        let block = inset_tile(
+            tile_bounds(x.div_euclid(2), y.div_euclid(2), 2.0 * ZONE_CELL_SIZE),
+            inset,
+        );
+        tile.intersection(block)
+    } else {
+        inset_tile(tile, inset)
+    }
+}
+
+fn add_zoning_tile(
+    map: &Map,
+    tile: AABB,
+    color: [f32; 4],
+    lift: f32,
+    mesh: &mut MeshBuilder<false>,
+) {
+    let roads = ProjectFilter::ROAD | ProjectFilter::INTER;
+    if map.spatial_map().query(tile, roads).next().is_some() {
+        // Trim at the road footprint on slopes too, where terrain and road heights can diverge.
+        let size = tile.size();
+        if size.x.max(size.y) <= 2.0 {
+            return;
+        }
+        let center = tile.center();
+        for (ll, ur) in [
+            (tile.ll, center),
+            (vec2(center.x, tile.ll.y), vec2(tile.ur.x, center.y)),
+            (vec2(tile.ll.x, center.y), vec2(center.x, tile.ur.y)),
+            (center, tile.ur),
+        ] {
+            add_zoning_tile(map, AABB::new_ll_ur(ll, ur), color, lift, mesh);
+        }
+        return;
+    }
+
+    // Use the same 8 m terrain sampling for coarse preview tiles and committed cells.
+    for (x, y) in zoning_tiles(tile, ZONE_CELL_SIZE) {
+        let part = tile.intersection(tile_bounds(x, y, ZONE_CELL_SIZE));
+        let [ll, lr, ur, ul] = [
+            part.ll,
+            vec2(part.ur.x, part.ll.y),
+            part.ur,
+            vec2(part.ll.x, part.ur.y),
+        ];
+        let bounds = map.environment.bounds();
+        let sample = |p: Vec2| {
+            map.environment
+                .true_height(p.min(bounds.ur - Vec2::splat(0.01)))
+        };
+        let [Some(hll), Some(hlr), Some(hur), Some(hul)] = [ll, lr, ur, ul].map(sample) else {
+            continue;
+        };
+        mesh.extend(
+            None,
+            &[(ll, hll), (lr, hlr), (ur, hur), (ul, hul)].map(|(p, height)| MeshVertex {
+                position: p.z(height + lift).into(),
+                color,
+                ..Default::default()
+            }),
+            &[0, 1, 3, 1, 2, 3],
+        );
+    }
 }
 
 #[cfg(test)]
 mod zoning_tests {
     use super::*;
-    use simulation::map::Density;
 
     #[test]
-    fn u1_zoning_overview_batches_only_matching_neighbors() {
-        let low = ZoneCell {
+    fn u1_zoning_outlines_distinguish_blocked_lots_from_hover_halos() {
+        let zone = ZoneCell {
+            kind: ZoneKind::Industrial,
+            density: Density::High,
+        };
+        assert!(lot_outline(None, false).is_none());
+        assert_eq!(lot_outline(None, true).unwrap().0, 0.3);
+        assert_eq!(lot_outline(Some((zone, Ok(()))), false).unwrap().0, 0.35);
+        let (width, amber) =
+            lot_outline(Some((zone, Err(GrowableLotError::TooSmall))), false).unwrap();
+        let (_, rose) =
+            lot_outline(Some((zone, Err(GrowableLotError::MissingRoad))), false).unwrap();
+        assert_eq!(width, 0.9);
+        assert_eq!(amber.g, 0.55);
+        assert!(rose.g < amber.g);
+        assert_eq!(
+            lot_warning((zone, Err(GrowableLotError::TooSmall))),
+            "Lot too small for High Industrial"
+        );
+    }
+
+    #[test]
+    fn u1_zoning_tiles_share_edges_in_overview_and_uniform_coarse_blocks() {
+        let zone = ZoneCell {
             kind: ZoneKind::Residential,
             density: Density::Low,
         };
-        let medium = ZoneCell {
-            density: Density::Medium,
-            ..low
-        };
-        let office = ZoneCell {
-            kind: ZoneKind::Office,
-            ..medium
-        };
-        let cells = [
-            ((0, 0), low),
-            ((0, 1), low),
-            ((0, 2), medium),
-            ((0, 3), office),
-            ((0, 5), office),
-            ((1, 0), office),
-        ];
-        assert_eq!(
-            zone_runs(cells.into_iter(), true).collect::<Vec<_>>(),
-            [
-                ((0, 0), 1, low),
-                ((0, 2), 2, medium),
-                ((0, 3), 3, office),
-                ((0, 5), 5, office),
-                ((1, 0), 0, office),
-            ]
+        let mut grid = ZoneGrid::default();
+        grid.paint(
+            OBB::new(Vec2::splat(8.0), Vec2::X, 16.0, 16.0),
+            Some(zone.kind),
+            zone.density,
         );
-        assert_eq!(zone_runs(cells.into_iter(), false).count(), cells.len());
+        let center = Vec2::ZERO;
+        let coarse = ZoningMeshKey::new(center, 300.0, false);
+        let detail = ZoningMeshKey::new(center, 300.0, true);
+        let overview = ZoningMeshKey::new(center, 900.0, true);
+        for key in [coarse, overview] {
+            assert_eq!(
+                painted_tile(&grid, key, 0, 0, zone).ur.x,
+                painted_tile(&grid, key, 1, 0, zone).ll.x
+            );
+        }
+        assert_eq!(painted_tile(&grid, coarse, 0, 0, zone).ll.x, 1.2);
+        assert_eq!(painted_tile(&grid, overview, 0, 0, zone).ll.x, 0.0);
+        assert!(painted_tile(&grid, detail, 0, 0, zone).ur.x < 8.0);
+
+        grid.cells.get_mut(&(1, 0)).unwrap().density = Density::High;
+        assert!(painted_tile(&grid, coarse, 0, 0, zone).ur.x < 8.0);
     }
 }
 
@@ -337,6 +768,18 @@ impl MapMeshHandler {
             building_sub: sim.map().subscribe(UpdateType::Building),
             map_version: None,
             rebuilt_version: None,
+            zoning: ZoningMeshes {
+                updates: sim
+                    .map()
+                    .subscribe(UpdateType::Road | UpdateType::Building | UpdateType::Terrain),
+                world_revision: None,
+                key: None,
+                lots: Default::default(),
+                committed: None,
+                preview: None,
+                preview_key: None,
+                builder: MeshBuilder::new(gfx.tess_material),
+            },
         }
     }
 
@@ -446,6 +889,7 @@ impl MapMeshHandler {
                 }
             }
         }
+        self.zoning.draw(map, ctx);
     }
 }
 

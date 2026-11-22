@@ -3,18 +3,18 @@ use crate::gui::{ErrorTooltip, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::MapRenderer;
+use crate::session::SessionState;
 use crate::uiworld::UiWorld;
 use geom::{vec2, LinearColor, Vec2, AABB, OBB};
 use goryak::{
-    button_secondary, fixed_spacer, is_hovered, mincolumn, minrow, on_secondary_container, padxy,
-    selectable_label_primary, textc, tooltip,
+    button_secondary, fixed_spacer, icon, is_hovered, mincolumn, minrow, on_secondary_container,
+    padxy, selectable_label_primary, textc, tooltip,
 };
 use simulation::economy::progression::{can_build, BuildCapability, LockedUntil};
-use simulation::map::{
-    Density, Map, ProjectFilter, ProjectKind, ZoneGrid, ZoneKind, ZONE_CELL_SIZE,
-};
+use simulation::map::{Density, ZoneGrid, ZoneKind, ZONE_CELL_SIZE};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
+use std::sync::Arc;
 use yakui::{colored_box_container, Color};
 
 mod zone_color;
@@ -39,6 +39,24 @@ pub fn zone_name(zone: ZoneKind) -> &'static str {
     }
 }
 
+pub(crate) fn density_name(density: Density) -> &'static str {
+    match density {
+        Density::Low => "Low",
+        Density::Medium => "Medium",
+        Density::High => "High",
+    }
+}
+
+pub(crate) struct ZoningPreview<'a> {
+    pub areas: &'a [OBB],
+    pub pointer: Option<Vec2>,
+    pub hover_radius: f32,
+    pub pitch: f32,
+    pub kind: Option<ZoneKind>,
+    pub density: Density,
+    pub held: bool,
+}
+
 pub struct ZoningState {
     kind: Option<ZoneKind>,
     density: Density,
@@ -49,6 +67,8 @@ pub struct ZoningState {
     drag_start: Option<Vec2>,
     last_brush: Option<Vec2>,
     over_controls: bool,
+    overlay_grid: Option<(u64, Arc<ZoneGrid>)>,
+    preview_areas: Vec<OBB>,
 }
 
 impl Default for ZoningState {
@@ -59,10 +79,12 @@ impl Default for ZoningState {
             density_locks: [None; 3],
             rectangle: false,
             detail: false,
-            brush_radius: 0,
+            brush_radius: 1,
             drag_start: None,
             last_brush: None,
             over_controls: false,
+            overlay_grid: None,
+            preview_areas: Vec::new(),
         }
     }
 }
@@ -73,6 +95,19 @@ impl ZoningState {
             ZONE_CELL_SIZE
         } else {
             2.0 * ZONE_CELL_SIZE
+        }
+    }
+
+    fn brush_side(&self) -> f32 {
+        (2.0 * f32::from(self.brush_radius) + 1.0) * self.pitch()
+    }
+
+    fn refresh_density_locks(&mut self, sim: &Simulation) {
+        self.density_locks =
+            DENSITIES.map(|density| can_build(sim, BuildCapability::ZoneDensity(density)).err());
+        if self.density_locks[usize::from(self.density.ordinal())].is_some() {
+            self.density = Density::Low;
+            self.cancel_stroke();
         }
     }
 
@@ -88,19 +123,12 @@ impl ZoningState {
 }
 
 fn density_picker(state: &mut ZoningState, kind: ZoneKind) {
-    for (density, label) in DENSITIES.into_iter().zip(["Low", "Medium", "High"]) {
-        let lock = state.density_locks[usize::from(density.ordinal())];
-        let color = if lock.is_some() {
-            LinearColor::gray(0.23)
-        } else {
-            zone_cell_color(kind, density)
-        };
-        minrow(4.0, || {
-            colored_box_container(Color::from_linear(<[f32; 4]>::from(color).into()), || {
-                fixed_spacer((12.0, 12.0));
-            });
-            if let Some(lock) = lock {
-                tooltip(format!("Unlocks at {} citizens", lock.population), || {
+    for density in DENSITIES {
+        let label = density_name(density);
+        if let Some(lock) = state.density_locks[usize::from(density.ordinal())] {
+            tooltip(format!("Unlocks at {} citizens", lock.population), || {
+                minrow(2.0, || {
+                    icon(Color::rgb(188, 190, 192), "lock");
                     let mut button = button_secondary(label);
                     button.style.fill = Color::rgb(64, 66, 69);
                     button.style.text.color = Color::rgb(188, 190, 192);
@@ -108,18 +136,30 @@ fn density_picker(state: &mut ZoningState, kind: ZoneKind) {
                     button.down_style = button.style.clone();
                     button.show();
                 });
-            } else if selectable_label_primary(state.density == density, label).clicked {
-                state.density = density;
-                state.cancel_stroke();
-            }
-        });
+            });
+        } else {
+            minrow(4.0, || {
+                let color = <[f32; 4]>::from(zone_cell_color(kind, density));
+                colored_box_container(Color::from_linear(color.into()), || {
+                    fixed_spacer((12.0, 12.0));
+                });
+                if tooltip("Density applies to new growth", || {
+                    selectable_label_primary(state.density == density, label)
+                })
+                .clicked
+                {
+                    state.density = density;
+                    state.cancel_stroke();
+                }
+            });
+        }
     }
 }
 
 pub fn properties(uiworld: &UiWorld) {
     let narrow = uiworld.camera().camera.viewport_w < 830.0 * uiworld.read::<Settings>().gui_scale;
     let brush_hint = |state: &ZoningState| {
-        let side = (2 * u32::from(state.brush_radius) + 1) * state.pitch() as u32;
+        let side = state.brush_side() as u32;
         textc(
             on_secondary_container(),
             format!("{side} × {side} m · Ctrl + wheel"),
@@ -175,148 +215,152 @@ pub fn properties(uiworld: &UiWorld) {
 pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
     let tool = *uiworld.read::<Tool>();
     let mut state = uiworld.write::<ZoningState>();
-    let active = tool == Tool::Zoning;
-    if active {
-        state.density_locks =
-            DENSITIES.map(|density| can_build(sim, BuildCapability::ZoneDensity(density)).err());
-        if state.density_locks[usize::from(state.density.ordinal())].is_some() {
-            state.density = Density::Low;
-            state.cancel_stroke();
+    if tool != Tool::Zoning {
+        state.cancel_gesture();
+        if tool.show_lots() {
+            let camera = uiworld.camera();
+            MapRenderer::draw_zoned_lots(
+                &sim.map(),
+                &sim.read::<ZoneGrid>(),
+                &mut uiworld.write::<ImmediateDraw>(),
+                camera.camera.pos.xy(),
+                camera.camera.dist,
+            );
         }
+        return;
     }
-
-    if active || tool.show_lots() {
-        let camera = uiworld.camera();
-        MapRenderer::draw_zoning_overlay(
-            sim,
-            &mut uiworld.write::<ImmediateDraw>(),
-            camera.camera.pos.xy(),
-            camera.camera.dist,
-            active,
-        );
-    }
+    state.refresh_density_locks(sim);
 
     let input = uiworld.read::<InputMap>();
-    let Some(pointer) = input.unprojected.filter(|p| p.is_finite()) else {
+    let camera = uiworld.camera();
+    let viewport = AABB::new_ll_ur(
+        Vec2::ZERO,
+        vec2(camera.camera.viewport_w, camera.camera.viewport_h),
+    );
+    let pointer = input
+        .unprojected
+        .filter(|p| p.is_finite())
+        .filter(|_| {
+            viewport.contains(input.screen)
+                && !state.over_controls
+                && !input.act.contains(&InputAction::CameraRotate)
+        })
+        .map(|p| p.xy());
+    if pointer.is_none() {
         state.cancel_stroke();
-        return;
-    };
-    if !active || state.over_controls || input.act.contains(&InputAction::CameraRotate) {
-        state.cancel_stroke();
-        state.over_controls &= active;
-        return;
     }
-
     let pressed = input.just_act.contains(&InputAction::Select);
     let held = input.act.contains(&InputAction::Select);
-    let pitch = state.pitch();
-    let cell = (pointer.xy() / pitch).floor();
     let map = sim.map();
     let bounds = map.environment.bounds();
-    let mut commands = uiworld.commands();
-    let command_kind = state.kind;
-    let command_density = state.density;
-    let mut paint = |area| {
-        commands.push(WorldCommand::ZonePaint {
-            area,
-            kind: command_kind,
-            density: command_density,
-        });
-    };
+    let pitch = state.pitch();
+    let mut areas = std::mem::take(&mut state.preview_areas);
+    areas.clear();
 
-    let area = if state.rectangle {
-        if pressed {
-            state.drag_start = Some(cell);
-        }
-        let area = paint_area(state.drag_start.unwrap_or(cell), cell, bounds, pitch);
-        if !held && state.drag_start.take().is_some() {
-            if let Some(area) = area {
-                paint(area);
-            }
-        }
-        area
-    } else {
-        if input.just_act.contains(&InputAction::SizeUp) {
-            state.brush_radius = (state.brush_radius + 1).min(MAX_BRUSH_RADIUS);
-        }
-        if input.just_act.contains(&InputAction::SizeDown) {
-            state.brush_radius = state.brush_radius.saturating_sub(1);
-        }
+    if let Some(pointer) = pointer {
+        let cell = (pointer / pitch).floor();
+        let mut commands = uiworld.commands();
+        let kind = state.kind;
+        let density = state.density;
+        let mut paint = |area| {
+            commands.push(WorldCommand::ZonePaint {
+                area,
+                kind,
+                density,
+            })
+        };
 
-        let radius = Vec2::splat(f32::from(state.brush_radius));
-        let stamp = |center| paint_area(center - radius, center + radius, bounds, pitch);
-        let area = stamp(cell);
-        if pressed {
-            state.last_brush = Some(cell);
-            if let Some(area) = area {
-                paint(area);
+        if state.rectangle {
+            if pressed {
+                state.drag_start = Some(cell);
             }
-        } else if held {
-            if let Some(start) = state.last_brush.filter(|&previous| previous != cell) {
-                state.last_brush = Some(cell);
-                let delta = cell - start;
-                let steps = delta.x.abs().max(delta.y.abs()) as u32;
-                // Fill gaps between frames without repainting the previous stamp.
-                for step in 1..=steps {
-                    let center = (start + delta * (step as f32 / steps as f32)).round();
-                    if let Some(area) = stamp(center) {
-                        paint(area);
-                    }
+            let area = paint_area(state.drag_start.unwrap_or(cell), cell, bounds, pitch);
+            if !held && state.drag_start.take().is_some() {
+                if let Some(area) = area {
+                    paint(area);
                 }
             }
+            areas.extend(area);
         } else {
-            state.last_brush = None;
-        }
-        area
-    };
+            if input.just_act.contains(&InputAction::SizeUp) {
+                state.brush_radius = (state.brush_radius + 1).min(MAX_BRUSH_RADIUS);
+            }
+            if input.just_act.contains(&InputAction::SizeDown) {
+                state.brush_radius = state.brush_radius.saturating_sub(1);
+            }
 
-    let Some(area) = area else {
-        return;
-    };
-    let ll = area.corners[0].min(area.corners[2]);
-    let ur = area.corners[0].max(area.corners[2]);
-    let min = (ll / pitch).floor();
-    let max = (ur / pitch).ceil();
-    let color = state
-        .kind
-        .map_or(LinearColor::new(0.96, 0.28, 0.28, 1.0), |kind| {
-            zone_cell_color(kind, state.density)
-        });
-    let alpha = if held { 0.66 } else { 0.46 };
-    if state.kind.is_some() && !has_frontage(&map, (cell + Vec2::splat(0.5)) * pitch) {
-        *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new("Zones need road frontage to grow");
-    }
-    let mut draw = uiworld.write::<ImmediateDraw>();
-    for x in min.x as i32..max.x as i32 {
-        for y in min.y as i32..max.y as i32 {
-            let cell_ll = vec2(x as f32, y as f32) * pitch;
-            let tile_ll = cell_ll.max(ll);
-            let tile_ur = (cell_ll + Vec2::splat(pitch)).min(ur);
-            let center = (tile_ll + tile_ur) * 0.5;
-            if let Some(height) = map.environment.height(center) {
-                let color = if state.kind.is_some() && !has_frontage(&map, center) {
-                    LinearColor::new(0.58, 0.58, 0.58, 1.0)
-                } else {
-                    color
-                };
-                let inset = Vec2::splat(0.45);
-                draw.aabb(
-                    AABB::new_ll_ur(tile_ll + inset, tile_ur - inset),
-                    height + 0.97,
-                )
-                .color(color.a(alpha));
+            let radius = Vec2::splat(f32::from(state.brush_radius));
+            let stamp = |center| paint_area(center - radius, center + radius, bounds, pitch);
+            if pressed {
+                state.last_brush = Some(cell);
+                areas.extend(stamp(cell));
+                areas.iter().copied().for_each(&mut paint);
+            } else if held {
+                if let Some(start) = state.last_brush.filter(|&previous| previous != cell) {
+                    state.last_brush = Some(cell);
+                    for center in brush_centers(start, cell, state.brush_radius == 0) {
+                        areas.extend(stamp(center));
+                    }
+                    areas.iter().copied().for_each(&mut paint);
+                }
+            } else {
+                state.last_brush = None;
+            }
+            if areas.is_empty() {
+                areas.extend(stamp(cell));
             }
         }
+    }
+
+    let world = uiworld.read::<SessionState>().generation;
+    let zones = sim.read::<ZoneGrid>();
+    let grid = state
+        .overlay_grid
+        .get_or_insert_with(|| (world, Arc::new((*zones).clone())));
+    if grid.0 != world || grid.1.generation != zones.generation {
+        *grid = (world, Arc::new((*zones).clone()));
+    }
+    let grid = grid.1.clone();
+    let warning = MapRenderer::queue_zoning_overlay(
+        &map,
+        grid,
+        world,
+        camera.camera.pos.xy(),
+        camera.camera.dist,
+        ZoningPreview {
+            areas: &areas,
+            pointer,
+            hover_radius: if state.rectangle {
+                pitch
+            } else {
+                state.brush_side()
+            } + 16.0,
+            pitch,
+            kind: state.kind,
+            density: state.density,
+            held,
+        },
+    );
+    state.preview_areas = areas;
+    if let Some(warning) =
+        warning.filter(|_| !goryak::pointer_over_ui(input.screen.x, input.screen.y))
+    {
+        *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(warning);
     }
 }
 
-fn has_frontage(map: &Map, center: Vec2) -> bool {
-    map.spatial_map()
-        .query(center, ProjectFilter::LOT)
-        .any(|project| match project {
-            ProjectKind::Lot(id) => map.get(id).is_some_and(|lot| map.get(lot.parent).is_some()),
-            _ => false,
-        })
+fn brush_centers(start: Vec2, end: Vec2, connect_corners: bool) -> impl Iterator<Item = Vec2> {
+    let delta = end - start;
+    let steps = delta.x.abs().max(delta.y.abs()) as u32;
+    let mut previous = start;
+    // A radius-zero stamp must share an edge with the next stamp, even on diagonals.
+    (1..=steps).flat_map(move |step| {
+        let center = (start + delta * (step as f32 / steps as f32)).round();
+        let edge = (connect_corners && center.x != previous.x && center.y != previous.y)
+            .then(|| vec2(center.x, previous.y));
+        previous = center;
+        edge.into_iter().chain([center])
+    })
 }
 
 /// Convert inclusive editor coordinates to a map-clipped area aligned to the storage grid.
@@ -351,7 +395,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn u1_zoning_default_brush_stamps_four_storage_cells() {
+    fn u1_zoning_default_brush_stamps_thirty_six_storage_cells() {
         let state = ZoningState::default();
         let mut grid = ZoneGrid::default();
         let radius = Vec2::splat(f32::from(state.brush_radius));
@@ -359,11 +403,56 @@ mod tests {
         let bounds = AABB::new_ll_ur(Vec2::ZERO, Vec2::splat(512.0));
         let area = paint_area(center - radius, center + radius, bounds, state.pitch()).unwrap();
         grid.paint(area, state.kind, state.density);
-        assert_eq!(grid.cells.len(), 4);
+        assert_eq!(grid.cells.len(), 36);
         assert_eq!(
             grid.cells.keys().copied().collect::<Vec<_>>(),
-            [(6, 6), (6, 7), (7, 6), (7, 7)]
+            (4..10)
+                .flat_map(|x| (4..10).map(move |y| (x, y)))
+                .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn u1_zoning_radius_zero_brush_connects_diagonal_stamps() {
+        let centers = brush_centers(Vec2::ZERO, Vec2::splat(3.0), true).collect::<Vec<_>>();
+        assert_eq!(centers.last(), Some(&Vec2::splat(3.0)));
+        for (a, b) in std::iter::once(Vec2::ZERO)
+            .chain(centers.iter().copied())
+            .zip(centers.iter().copied())
+        {
+            let delta = b - a;
+            assert_eq!(delta.x.abs() + delta.y.abs(), 1.0);
+        }
+    }
+
+    #[test]
+    fn u1_zoning_guided_locks_cancel_a_locked_density_stroke() {
+        use simulation::economy::progression::{ProgressionMode, ProgressionState};
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let sim = Simulation::new(false);
+        sim.write::<ProgressionState>().mode = ProgressionMode::Guided;
+        let mut state = ZoningState {
+            density: Density::High,
+            drag_start: Some(Vec2::ZERO),
+            last_brush: Some(Vec2::ZERO),
+            ..ZoningState::default()
+        };
+        state.refresh_density_locks(&sim);
+        assert_eq!(state.density, Density::Low);
+        assert!(state.gesture_is_clear());
+        assert_eq!(
+            state
+                .density_locks
+                .map(|lock| lock.map(|lock| lock.population)),
+            [None, Some(100), Some(250)]
+        );
+
+        sim.write::<ProgressionState>().highest_milestone = 1;
+        state.refresh_density_locks(&sim);
+        assert!(state.density_locks[1].is_none());
+        assert_eq!(state.density_locks[2].unwrap().population, 250);
     }
 
     #[test]
@@ -385,21 +474,42 @@ mod tests {
     }
 
     #[test]
-    fn u1_zoning_palette_has_distinct_lightness() {
-        // OKLab lightness computed from the rendered linear RGB values.
-        let lightness = |LinearColor { r, g, b, .. }| {
+    fn u1_zoning_palette_separates_densities_kinds_and_grass() {
+        let oklab = |LinearColor { r, g, b, .. }| {
             let l = (0.41222146 * r + 0.53633255 * g + 0.051445995 * b).cbrt();
             let m = (0.2119035 * r + 0.6806995 * g + 0.10739696 * b).cbrt();
             let s = (0.08830246 * r + 0.28171885 * g + 0.6299787 * b).cbrt();
-            0.21045426 * l + 0.7936178 * m - 0.004072047 * s
+            geom::vec3(
+                0.21045426 * l + 0.7936178 * m - 0.004072047 * s,
+                1.9779985 * l - 2.4285922 * m + 0.4505937 * s,
+                0.025904037 * l + 0.78277177 * m - 0.80867577 * s,
+            )
         };
-        for kind in ZONES {
-            let [low, medium, high] = [Density::Low, Density::Medium, Density::High]
-                .map(|density| lightness(zone_cell_color(kind, density)));
-            assert!(
-                medium - low >= 0.15 && high - medium >= 0.15,
-                "{kind:?}: {low}, {medium}, {high}"
-            );
+        let grass = oklab(LinearColor::new(0.071, 0.155, 0.018, 1.0));
+        for (index, kind) in ZONES.into_iter().enumerate() {
+            let [low, medium, high] =
+                DENSITIES.map(|density| oklab(zone_cell_color(kind, density)));
+            for (lighter, deeper) in [(low, medium), (medium, high)] {
+                assert!(lighter.distance(deeper) >= 0.10, "{kind:?} densities");
+            }
+            for (density, color) in DENSITIES.into_iter().zip([low, medium, high]) {
+                assert!(
+                    color.distance(grass) >= 0.12,
+                    "{kind:?} {density:?} vs grass"
+                );
+                assert!(
+                    color.y.hypot(color.z) >= 0.07,
+                    "{kind:?} {density:?} chroma"
+                );
+                for &other in &ZONES[index + 1..] {
+                    let other_color = oklab(zone_cell_color(other, density));
+                    assert!(
+                        color.distance(other_color) >= 0.085,
+                        "{kind:?} vs {other:?} at {density:?}"
+                    );
+                }
+            }
+            assert!(low.x > medium.x && medium.x > high.x, "{kind:?} ramp");
         }
     }
 }

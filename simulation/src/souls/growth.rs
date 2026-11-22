@@ -1,7 +1,8 @@
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::{Budget, ZoneDemand};
 use crate::map::{
-    BuildingID, BuildingKind, Lot, LotID, Map, ProjectFilter, ZoneCell, ZoneGrid, ZoneKind,
+    Building, BuildingID, BuildingKind, Lot, LotID, Map, ProjectFilter, ProjectKind, ZoneCell,
+    ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{lifecycle, residence};
@@ -9,7 +10,7 @@ use crate::Simulation;
 use common::FastMap;
 use geom::Vec2;
 use ordered_float::OrderedFloat;
-use prototypes::{GrowableCompanyPrototype, ResidencePrototype, Tick};
+use prototypes::{BuildingGen, GrowableCompanyPrototype, ResidencePrototype, Tick};
 
 pub(crate) const GROWTH_INTERVAL: u64 = CITY_UPDATE_INTERVAL_TICKS;
 const MAX_BUILDING_SEARCH_RADIUS: f32 = 2_048.0;
@@ -195,34 +196,81 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: impl IntoIterator<Item = (L
     sim.write::<GrowthCache>().candidates = candidates;
 }
 
-/// The level-one growable that fits this lot's frontage, size, kind and density.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrowableLotError {
+    MissingRoad,
+    MissingPrototype,
+    TooSmall,
+    Obstructed,
+}
+
 pub fn growable_for_lot(
     map: &Map,
     lot: &Lot,
     cell: ZoneCell,
 ) -> Option<(BuildingKind, Option<&'static ResidencePrototype>)> {
-    map.get(lot.parent)?;
+    check_growable_lot(map, lot, cell).ok()
+}
+
+/// Find the level-one growable and apply the same footprint checks as growable placement.
+pub fn check_growable_lot(
+    map: &Map,
+    lot: &Lot,
+    cell: ZoneCell,
+) -> Result<(BuildingKind, Option<&'static ResidencePrototype>), GrowableLotError> {
+    if map.get(lot.parent).is_none() {
+        return Err(GrowableLotError::MissingRoad);
+    }
+    let (kind, home, generator) = growable_that_fits(lot, cell)?;
+    if !Building::valid_footprint(&lot.shape, generator)
+        || map
+            .spatial_map()
+            .query(lot.shape, ProjectFilter::ALL)
+            .any(|object| object != ProjectKind::Lot(lot.id))
+    {
+        return Err(GrowableLotError::Obstructed);
+    }
+    Ok((kind, home))
+}
+
+fn growable_that_fits(
+    lot: &Lot,
+    cell: ZoneCell,
+) -> Result<
+    (
+        BuildingKind,
+        Option<&'static ResidencePrototype>,
+        BuildingGen,
+    ),
+    GrowableLotError,
+> {
     let home = if cell.kind == ZoneKind::Residential {
         residence::prototype(cell.density, 1)
     } else {
         None
     };
-    let (kind, lot_size_min) = if let Some(proto) = home {
-        (BuildingKind::House, proto.lot_size_min)
+    let (kind, generator, lot_size_min) = if let Some(proto) = home {
+        (BuildingKind::House, BuildingGen::House, proto.lot_size_min)
     } else {
-        let proto = GrowableCompanyPrototype::iter().find(|proto| {
-            proto.growable
-                && proto.zone_kind == cell.kind
-                && proto.density == cell.density
-                && proto.level == 1
-        })?;
+        let proto = GrowableCompanyPrototype::iter()
+            .find(|proto| {
+                proto.growable
+                    && proto.zone_kind == cell.kind
+                    && proto.density == cell.density
+                    && proto.level == 1
+            })
+            .ok_or(GrowableLotError::MissingPrototype)?;
         (
             BuildingKind::GoodsCompany(proto.base.id),
+            proto.base.bgen,
             proto.lot_size_min,
         )
     };
     let [width, depth] = lot.shape.axis();
-    (width.mag() * depth.mag() + 0.001 >= lot_size_min).then_some((kind, home))
+    if width.mag() * depth.mag() + 0.001 < lot_size_min {
+        return Err(GrowableLotError::TooSmall);
+    }
+    Ok((kind, home, generator))
 }
 
 fn nearest_building_distance(
@@ -417,6 +465,27 @@ mod tests {
         test.g.write::<ZoneDemand>().values.insert(kind, 15.0);
         test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;
         growth_update(&mut test.g);
+    }
+
+    #[test]
+    fn u1_zone_medium_companies_fit_twenty_metres_and_high_needs_thirty() {
+        let test = street();
+        let map = test.g.map();
+        let mut lot = map.lots().values().next().unwrap().clone();
+        for kind in [ZoneKind::Commercial, ZoneKind::Industrial, ZoneKind::Office] {
+            for (side, density, fits) in [
+                (20.0, Density::Medium, true),
+                (20.0, Density::High, false),
+                (30.0, Density::High, true),
+            ] {
+                lot.shape = OBB::new(lot.shape.center(), geom::Vec2::X, side, side);
+                assert_eq!(
+                    growable_that_fits(&lot, ZoneCell { kind, density }).is_ok(),
+                    fits,
+                    "{kind:?} {density:?} on a {side} m lot"
+                );
+            }
+        }
     }
 
     #[test]

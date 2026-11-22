@@ -1,4 +1,4 @@
-use geom::{vec2, Shape, AABB, OBB};
+use geom::{vec2, Shape, Vec2, AABB, OBB};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -14,7 +14,7 @@ pub struct ZoneCell {
     pub density: Density,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ZoneGrid {
     pub cells: BTreeMap<(i32, i32), ZoneCell>,
     /// Changes once for each paint or unzone that changes the grid.
@@ -57,32 +57,69 @@ impl ZoneGrid {
         if self.cells.is_empty() {
             return None;
         }
-
-        let mut counts = BTreeMap::<_, [usize; 3]>::new();
-        let mut total = 0;
-        let mut zoned = 0;
-        for key in cells_under(area) {
-            total += 1;
-            if let Some(cell) = self.cells.get(&key) {
-                counts.entry(cell.kind).or_default()[usize::from(cell.density.ordinal())] += 1;
-                zoned += 1;
-            }
-        }
-        if 2 * zoned < total {
-            return None;
-        }
-
-        let (kind, densities) = counts
-            .into_iter()
-            .max_by_key(|(kind, counts)| (counts.iter().sum::<usize>(), Reverse(*kind)))?;
-        let density = [Density::Low, Density::Medium, Density::High]
-            .into_iter()
-            .max_by_key(|density| {
-                let ordinal = density.ordinal();
-                (densities[usize::from(ordinal)], Reverse(ordinal))
-            })?;
-        Some(ZoneCell { kind, density })
+        lot_vote(area, |key| self.cells.get(&key).copied())
     }
+
+    /// Vote as if the already clipped paint rectangles had been applied. The first return
+    /// value says whether the stroke touched any of the lot's storage cell centres.
+    pub fn lot_zone_after_paint(
+        &self,
+        lot: &OBB,
+        paints: &[OBB],
+        replacement: Option<ZoneCell>,
+    ) -> (bool, Option<ZoneCell>) {
+        let mut touched = false;
+        let vote = lot_vote(lot, |key| {
+            if paints.iter().any(|area| area.contains(cell_center(key))) {
+                touched = true;
+                replacement
+            } else {
+                self.cells.get(&key).copied()
+            }
+        });
+        (touched, vote)
+    }
+}
+
+fn lot_vote(
+    area: &OBB,
+    mut cell_at: impl FnMut((i32, i32)) -> Option<ZoneCell>,
+) -> Option<ZoneCell> {
+    const KINDS: [ZoneKind; 4] = [
+        ZoneKind::Residential,
+        ZoneKind::Commercial,
+        ZoneKind::Industrial,
+        ZoneKind::Office,
+    ];
+    let mut counts = [[0usize; 3]; KINDS.len()];
+    let mut total = 0;
+    let mut zoned = 0;
+    for key in cells_under(area) {
+        total += 1;
+        if let Some(cell) = cell_at(key) {
+            counts[cell.kind as usize][usize::from(cell.density.ordinal())] += 1;
+            zoned += 1;
+        }
+    }
+    if zoned == 0 || 2 * zoned < total {
+        return None;
+    }
+
+    let (kind, densities) = KINDS
+        .into_iter()
+        .zip(counts)
+        .max_by_key(|(kind, counts)| (counts.iter().sum::<usize>(), Reverse(*kind)))?;
+    let density = [Density::Low, Density::Medium, Density::High]
+        .into_iter()
+        .max_by_key(|density| {
+            let ordinal = density.ordinal();
+            (densities[usize::from(ordinal)], Reverse(ordinal))
+        })?;
+    Some(ZoneCell { kind, density })
+}
+
+fn cell_center((x, y): (i32, i32)) -> Vec2 {
+    (vec2(x as f32, y as f32) + Vec2::splat(0.5)) * ZONE_CELL_SIZE
 }
 
 fn paint_cells(area: &OBB) -> Option<impl Iterator<Item = (i32, i32)> + '_> {
@@ -109,10 +146,7 @@ fn cells_under(area: &OBB) -> impl Iterator<Item = (i32, i32)> + '_ {
     let xs = index(bbox.ll.x)..=index(bbox.ur.x);
     let ys = index(bbox.ll.y)..=index(bbox.ur.y);
     xs.flat_map(move |x| ys.clone().map(move |y| (x, y)))
-        .filter(|&(x, y)| {
-            let centre = (vec2(x as f32, y as f32) + vec2(0.5, 0.5)) * ZONE_CELL_SIZE;
-            area.contains(centre)
-        })
+        .filter(|&key| area.contains(cell_center(key)))
 }
 
 #[cfg(test)]
@@ -265,6 +299,37 @@ mod tests {
 
         let misses_centres = OBB::new(vec2(-8.0, 4.0), Vec2::X, 7.0, 8.0);
         assert_eq!(grid.lot_zone(&misses_centres), None);
+    }
+
+    #[test]
+    fn u1_zone_prospective_vote_matches_applied_stamps_and_erase() {
+        let mut grid = ZoneGrid::default();
+        let lot = OBB::new(Vec2::splat(24.0), Vec2::X, 40.0, 40.0);
+        let stamps = [12.0, 28.0, 36.0].map(|x| OBB::new(vec2(x, 20.0), Vec2::X, 16.0, 24.0));
+        let zone = ZoneCell {
+            kind: ZoneKind::Office,
+            density: Density::High,
+        };
+        assert_eq!(
+            grid.lot_zone_after_paint(&lot, &stamps[..1], Some(zone)),
+            (true, None)
+        );
+        assert_eq!(
+            grid.lot_zone_after_paint(&lot, &stamps, Some(zone)),
+            (true, Some(zone))
+        );
+        for stamp in stamps {
+            grid.paint(stamp, Some(zone.kind), zone.density);
+        }
+        assert_eq!(grid.lot_zone(&lot), Some(zone));
+        assert_eq!(
+            grid.lot_zone_after_paint(&lot, &stamps[..2], None),
+            (true, None)
+        );
+        for stamp in &stamps[..2] {
+            grid.paint(*stamp, None, zone.density);
+        }
+        assert_eq!(grid.lot_zone(&lot), None);
     }
 
     #[test]
