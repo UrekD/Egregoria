@@ -172,6 +172,38 @@ mod tests {
     }
 
     #[test]
+    fn u5_throughput_preserves_paused_history_and_resets_on_map_replacement() {
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), vec3(270.0, 180.0, 0.0)]);
+        let road = ctx.g.map().roads().keys().next().unwrap();
+        ctx.tick_fast();
+        let now = elapsed_ticks(&ctx.g.resources).0;
+        ctx.g
+            .write::<RoadThroughput>()
+            .record_entry(road, RoadUserKind::Car, now);
+
+        // Paused commands can change the calendar without running the schedule.
+        ctx.g
+            .apply_commands([&WorldCommand::SetGameTime(GameTime::new(Tick(8_000_000)))]);
+        assert_eq!(elapsed_ticks(&ctx.g.resources).0, now);
+        assert_eq!(
+            ctx.g.read::<RoadThroughput>().current_window(road),
+            ([1, 0, 0, 0], 1)
+        );
+
+        // Reuse the road IDs while replacing only the map resource.
+        let replacement: Map = Bincode::decode(&Bincode::encode(&*ctx.g.map()).unwrap()).unwrap();
+        assert!(replacement.get(road).is_some());
+        *ctx.g.map_mut() = replacement;
+        ctx.tick_fast();
+        assert_eq!(elapsed_ticks(&ctx.g.resources).0, now + 1);
+        assert_eq!(
+            ctx.g.read::<RoadThroughput>().current_window(road),
+            ([0; 4], 1)
+        );
+    }
+
+    #[test]
     fn u5_prunes_split_and_demolished_roads_on_bucket_boundary() {
         let mut ctx = TestCtx::new();
         let a = vec3(60.0, 150.0, 0.0);
