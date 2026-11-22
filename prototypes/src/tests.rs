@@ -43,8 +43,8 @@ fn test_base() {
         }
 
         let residences: Vec<_> = ResidencePrototype::iter().collect();
-        assert_eq!(residences.len(), 6);
-        for density in [Density::Low, Density::High] {
+        assert_eq!(residences.len(), 9);
+        for density in [Density::Low, Density::Medium, Density::High] {
             for level in 1..=3 {
                 let residence = residences
                     .iter()
