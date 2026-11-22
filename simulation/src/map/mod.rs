@@ -37,6 +37,7 @@ mod pathfinding;
 mod reachability;
 mod serializing;
 mod spatial_map;
+pub mod special_placement;
 pub mod terrain;
 mod traffic_control;
 mod traversable;

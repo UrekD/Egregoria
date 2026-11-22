@@ -1,0 +1,26 @@
+[
+  {"SetSession": "MainMenu"},
+  {"OpenWindow": "Load"},
+  {"WaitFrames": 8},
+  {"LoadSlot": "showcase_city"},
+  {"WaitFrames": 6},
+  {"Assert": {"BuildingCount": {"prototype": "park", "count": 2}}},
+  {"Commands": [{"MapMakeConnection": {
+    "from": {"pos": [3170, 5390, 0], "kind": "Ground"},
+    "to": {"pos": [3270, 5390, 0], "kind": "Ground"},
+    "inter": null,
+    "pat": {"lanes_forward": [["Driving", 9], ["Walking", 9]], "lanes_backward": [["Walking", 9]]}
+  }}]},
+  {"Assert": "NoRejections"},
+  {"Camera": {"x": 3235, "y": 5450, "z": 0, "yaw": -0.91, "pitch": 1.16, "dist": 500}},
+  {"SelectTool": "SpecialBuilding"},
+  {"WaitFrames": 4},
+  {"Pointer": {"action": "Click", "screen_pos": [156, 573]}},
+  {"Pointer": {"action": "Move", "world_pos": [3220, 5405, 0]}},
+  {"WaitFrames": 4},
+  {"Screenshot": "p5-flour-factory-preview"},
+  {"Pointer": {"action": "Click", "world_pos": [3220, 5405, 0]}},
+  {"Assert": "NoRejections"},
+  {"Assert": {"BuildingCount": {"prototype": "flour-factory", "count": 1}}},
+  "Exit"
+]

@@ -4,9 +4,9 @@ use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use crate::uiworld::UiWorld;
 use engine::AudioKind;
 use geom::{Degrees, Intersect, OBB};
-use ordered_float::OrderedFloat;
 use prototypes::{RenderAsset, Size2D};
-use simulation::map::{ProjectFilter, ProjectKind, RoadID};
+use simulation::map::special_placement::{snap_special_building, PlacementError};
+use simulation::map::{ProjectFilter, RoadID};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 use std::borrow::Cow;
@@ -62,14 +62,13 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
     } = *unwrap_or!(&state.opt, return);
 
     let mpos = unwrap_ret!(inp.unprojected);
-    let roads = map.roads();
-
-    let half_diag = 0.5 * size.diag();
     let hover_obb = OBB::new(mpos.xy(), state.rotation.vec2(), size.w, size.h);
 
-    let mut draw = |obb: OBB, red| {
+    let mut draw = |obb: OBB, height, red| {
         let col = if red {
             simulation::colors().gui_danger.adjust_luminosity(1.3)
+        } else if road_snap {
+            simulation::colors().gui_success.adjust_luminosity(1.5)
         } else {
             simulation::colors().gui_primary.adjust_luminosity(1.5)
         };
@@ -78,98 +77,62 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
             RenderAsset::Mesh { path } => {
                 draw.mesh(
                     path.to_string_lossy().to_string(),
-                    obb.center().z(mpos.z),
+                    obb.center().z(height),
                     obb.axis()[0].normalize().z0(),
                 )
                 .color(col);
             }
             RenderAsset::Sprite { path } => {
-                draw.textured_obb(obb, path.to_string_lossy().to_string(), mpos.z + 0.1)
+                draw.textured_obb(obb, path.to_string_lossy().to_string(), height + 0.1)
                     .color(col);
             }
         }
     };
 
-    let mut rid = None;
-    let mut obb = hover_obb;
-
-    if road_snap {
-        let closest_road = map
-            .spatial_map()
-            .query_around(mpos.xy(), half_diag, ProjectFilter::ROAD)
-            .filter_map(|x| match x {
-                ProjectKind::Road(id) => Some(&roads[id]),
-                _ => None,
-            })
-            .min_by_key(move |p| OrderedFloat(p.points().project_dist2(mpos)));
-        let Some(closest_road) = closest_road else {
-            *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(Cow::Borrowed("No road nearby"));
-            return draw(hover_obb, true);
-        };
-
-        let (proj, _, dir) = closest_road.points().project_segment_dir(mpos);
-        let dir = dir.xy();
-
-        if !proj.is_close(mpos, half_diag + closest_road.width * 0.5) {
-            *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(Cow::Borrowed("No road nearby"));
-            return draw(hover_obb, true);
-        }
-
-        let side = if (mpos.xy() - proj.xy()).dot(dir.perpendicular()) > 0.0 {
-            dir.perpendicular()
-        } else {
-            -dir.perpendicular()
-        };
-
-        let first = closest_road.points().first();
-        let last = closest_road.points().last();
-
-        obb = OBB::new(
-            proj.xy() + side * (size.h + closest_road.width + 0.5) * 0.5,
-            side,
-            size.w,
-            size.h,
-        );
-
-        if proj.distance(first) < half_diag || proj.distance(last) < half_diag {
-            *uiworld.write::<ErrorTooltip>() =
-                ErrorTooltip::new(Cow::Borrowed("Too close to side"));
-            draw(obb, true);
-            return;
-        }
-
-        if closest_road.sidewalks(closest_road.src).incoming.is_none() {
-            *uiworld.write::<ErrorTooltip>() =
-                ErrorTooltip::new(Cow::Borrowed("Sidewalk required"));
-            draw(obb, true);
-            return;
-        }
-
-        rid = Some(closest_road.id);
-    }
-
-    if map
-        .spatial_map()
-        .query(
-            obb,
-            ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING,
-        )
-        .any(|x| {
-            if let Some(rid) = rid {
-                ProjectKind::Road(rid) != x
-            } else {
-                true
+    let (obb, rid, height) = if road_snap {
+        match snap_special_building(&map, mpos, size) {
+            Ok(snap) => (snap.obb, Some(snap.connected_road), snap.height),
+            Err(error) => {
+                let message = match error {
+                    PlacementError::NoRoad => Cow::Borrowed("No road nearby"),
+                    PlacementError::NoSidewalk => Cow::Borrowed("Sidewalk required"),
+                    PlacementError::InsufficientFrontage {
+                        required_m,
+                        available_m,
+                    } => Cow::Owned(format!(
+                        "Needs {required_m:.1} m of road frontage, this road has {available_m:.1} m — use a longer road"
+                    )),
+                    PlacementError::IntersectionOverlap | PlacementError::Occupied => {
+                        Cow::Borrowed("Intersecting with something")
+                    }
+                    PlacementError::InvalidTerrain => Cow::Borrowed("Invalid terrain"),
+                };
+                *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(message);
+                return draw(hover_obb, mpos.z, true);
             }
-        })
+        }
+    } else {
+        (hover_obb, None, mpos.z)
+    };
+
+    if (!road_snap
+        && map
+            .spatial_map()
+            .query(
+                obb,
+                ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING,
+            )
+            .next()
+            .is_some())
         || state.last_obb.map(|x| x.intersects(&obb)).unwrap_or(false)
     {
         *uiworld.write::<ErrorTooltip>() =
             ErrorTooltip::new(Cow::Borrowed("Intersecting with something"));
-        draw(obb, true);
+        draw(obb, height, true);
         return;
     }
 
-    draw(obb, false);
+    draw(obb, height, false);
 
     let cmds: Vec<WorldCommand> = make(&SpecialBuildArgs {
         obb,
