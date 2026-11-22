@@ -1,14 +1,20 @@
-use crate::map::{BuildingID, BuildingKind, Density};
-use crate::map_dynamic::BuildingInfos;
+use crate::economy::balance::RETAIL_ACCESS_RADIUS_M;
+use crate::map::{BuildingID, BuildingKind, Density, Map};
+use crate::map_dynamic::{BuildingInfos, CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow};
+use crate::souls::happiness::Happiness;
 use crate::souls::lifecycle;
 use crate::{Simulation, SoulID};
-use geom::Vec3;
+use geom::{Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use prototypes::{
-    try_prototype, CompanyKind, ItemID, ResidencePrototype, ResidencePrototypeID, TICKS_PER_HOUR,
+    try_prototype, CompanyKind, ItemID, ResidencePrototype, ResidencePrototypeID, ServiceKind,
+    TICKS_PER_HOUR,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+
+const UPGRADE_CHECKS: i8 = 6;
+const UNSERVED_CHECKS: i8 = 12;
 
 #[derive(Serialize, Deserialize)]
 pub struct Residence {
@@ -31,7 +37,9 @@ impl From<&ResidencePrototype> for Residence {
 
 #[derive(Default, Serialize, Deserialize)]
 struct ResidenceChecks {
-    good: u8,
+    // Positive for an upgrade streak, negative for a utility outage. These
+    // streaks are mutually exclusive. Existing saves used this byte for 0..=6.
+    service_streak: i8,
     poor: u8,
     abandoned_hours: Option<u8>,
 }
@@ -71,6 +79,7 @@ pub fn on_building_removed(sim: &mut Simulation, building: BuildingID) {
     let mut residences = sim.write::<Residences>();
     residences.by_building.remove(&building);
     residences.checks.remove(&building);
+    sim.write::<Happiness>().by_building.remove(&building);
 }
 
 pub(crate) fn evict_residents(sim: &mut Simulation, building: BuildingID, door: Vec3) {
@@ -145,6 +154,26 @@ pub fn is_retail_store(kind: BuildingKind) -> bool {
     })
 }
 
+pub(super) fn retail_store_positions(map: &Map) -> Vec<Vec2> {
+    map.buildings()
+        .values()
+        .filter(|building| is_retail_store(building.kind))
+        .map(|building| building.door_pos.xy())
+        .collect()
+}
+
+pub(super) fn has_retail_access(stores: &[Vec2], door: Vec2) -> bool {
+    stores
+        .iter()
+        .any(|store| store.distance2(door) <= RETAIL_ACCESS_RADIUS_M.powi(2))
+}
+
+pub(super) fn has_power(map: &Map, electricity: &ElectricityFlow, building: BuildingID) -> bool {
+    map.electricity
+        .net_id(building)
+        .is_some_and(|network| !electricity.blackout(network))
+}
+
 pub fn residence_update(sim: &mut Simulation) {
     if sim.get_tick() % TICKS_PER_HOUR != 0 {
         return;
@@ -157,12 +186,11 @@ pub fn residence_update(sim: &mut Simulation) {
         let map = sim.map();
         let infos = sim.read::<BuildingInfos>();
         let mut residences = sim.write::<Residences>();
-        let stores: Vec<_> = map
-            .buildings()
-            .values()
-            .filter(|building| is_retail_store(building.kind))
-            .map(|building| building.door_pos.xy())
-            .collect();
+        let stores = retail_store_positions(&map);
+        let electricity = sim.read::<ElectricityFlow>();
+        let utilities = sim.read::<UtilityFlow>();
+        let coverage = sim.read::<CoverageGrid>();
+        let environment = sim.read::<EnvGrid>();
         let Residences {
             by_building,
             checks,
@@ -191,29 +219,48 @@ pub fn residence_update(sim: &mut Simulation) {
                 && occupied * 5 < capacity
                 && (occupied == 0 || employed * 10 < occupied * 3);
             checks.poor = if poor { checks.poor + 1 } else { 0 };
-            if building.is_orphaned() || checks.poor >= 24 {
+            let utilities_ok = utilities.has_water(id) && utilities.has_sewage(id);
+            if !utilities_ok {
+                checks.service_streak = checks.service_streak.min(0) - 1;
+            }
+            if building.is_orphaned()
+                || checks.poor >= 24
+                || checks.service_streak <= -UNSERVED_CHECKS
+            {
                 checks.abandoned_hours = Some(0);
                 abandon.push((id, building.door_pos));
                 continue;
             }
+            if !utilities_ok {
+                continue;
+            }
 
-            let good = occupied > 0
+            let next = residence
+                .level
+                .checked_add(1)
+                .and_then(|level| prototype(residence.density, level));
+            let Some(next) = next else {
+                checks.service_streak = 0;
+                continue;
+            };
+            let good = has_power(&map, &electricity, id)
+                && coverage.coverage(id, ServiceKind::School) >= 30.0
+                && (next.level < 3
+                    || (coverage.coverage(id, ServiceKind::Health) >= 30.0
+                        && environment.land_value(id) >= 50))
+                && occupied > 0
                 && occupied * 5 >= capacity * 4
                 && employed * 10 >= occupied * 7
-                && stores
-                    .iter()
-                    .any(|store| store.distance2(building.door_pos.xy()) <= 1_500.0_f32.powi(2));
-            checks.good = if good { (checks.good + 1).min(6) } else { 0 };
-            if checks.good == 6 {
-                if let Some(next) = residence
-                    .level
-                    .checked_add(1)
-                    .and_then(|level| prototype(residence.density, level))
-                {
-                    *residence = next.into();
-                    checks.good = 0;
-                    upgrades.push((id, next.level));
-                }
+                && has_retail_access(&stores, building.door_pos.xy());
+            checks.service_streak = if good {
+                checks.service_streak.max(0) + 1
+            } else {
+                0
+            };
+            if checks.service_streak >= UPGRADE_CHECKS {
+                *residence = next.into();
+                checks.service_streak = 0;
+                upgrades.push((id, next.level));
             }
         }
     }

@@ -2,6 +2,7 @@ data:extend {
     {
         type = "growable-company",
         name = "industrial-l1",
+        pollution = 6,
         label = "Industrial Workshop",
         zone_kind = "industrial",
         density = "low",
@@ -74,6 +75,7 @@ data:extend {
     {
         type = "growable-company",
         name = "industrial-high-l1",
+        pollution = 9,
         label = "Industrial Works",
         zone_kind = "industrial",
         density = "high",

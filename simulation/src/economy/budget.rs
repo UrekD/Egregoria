@@ -3,7 +3,9 @@ use crate::economy::Government;
 use crate::map::{BuildingKind, Map, ZoneKind};
 use crate::souls::residence::Residences;
 use crate::{utils::resources::Resources, World, INITIAL_TICK};
-use prototypes::{try_prototype, GrowableCompanyID, Money, Tick, HOURS_PER_DAY, TICKS_PER_HOUR};
+use prototypes::{
+    try_prototype, GrowableCompanyID, Money, ServiceID, Tick, HOURS_PER_DAY, TICKS_PER_HOUR,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -117,12 +119,22 @@ impl Budget {
         daily_numerator: i128,
         daily_divisor: i128,
     ) {
+        let delta = self.hourly_delta(category, daily_numerator, daily_divisor);
+        self.post(government, day, category, delta);
+    }
+
+    fn hourly_delta(
+        &mut self,
+        category: BudgetCategory,
+        daily_numerator: i128,
+        daily_divisor: i128,
+    ) -> Money {
         let remainder = self.hourly_remainders.entry(category).or_default();
         let hourly_divisor = daily_divisor * i128::from(HOURS_PER_DAY);
         let numerator = daily_numerator + *remainder;
         *remainder = numerator % hourly_divisor;
         let delta = (numerator / hourly_divisor).clamp(i128::from(i64::MIN), i128::from(i64::MAX));
-        self.post(government, day, category, Money::new_inner(delta as i64));
+        Money::new_inner(delta as i64)
     }
 }
 
@@ -176,14 +188,19 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
         .buildings()
         .values()
         .filter(|building| match building.kind {
-            BuildingKind::GoodsCompany(id) => {
-                !try_prototype(GrowableCompanyID::from(id)).is_some_and(|proto| proto.growable)
-            }
+            BuildingKind::GoodsCompany(id) => !id.is_service() && !id.is_growable(),
             BuildingKind::RailFreightStation(_) | BuildingKind::TrainStation => true,
             BuildingKind::House | BuildingKind::ExternalTrading => false,
         })
         .filter_map(|building| Government::special_building_price(building.kind))
         .map(|price| i128::from(price.inner()))
+        .sum();
+    let service_upkeep: i128 = map
+        .buildings()
+        .values()
+        .filter_map(|building| building.kind.as_goods_company())
+        .filter_map(|id| try_prototype(ServiceID::from(id)))
+        .map(|proto| i128::from(proto.upkeep_per_day.inner()))
         .sum();
 
     let mut government = resources.write::<Government>();
@@ -214,6 +231,10 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
         SPECIAL_BUILDING_UPKEEP_DIVISOR,
     );
     budget.last_accrued_hour = hour;
+    let service_delta = budget.hourly_delta(BudgetCategory::ServiceUpkeep, -service_upkeep, 1);
+    drop(budget);
+    drop(government);
+    Budget::apply(resources, BudgetCategory::ServiceUpkeep, service_delta);
 }
 
 #[cfg(test)]

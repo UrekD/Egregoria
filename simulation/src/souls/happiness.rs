@@ -1,12 +1,96 @@
 use std::collections::BTreeMap;
 
+use prototypes::TICKS_PER_HOUR;
 use serde::{Deserialize, Serialize};
 
-use crate::{map::BuildingID, Simulation};
+use crate::economy::{
+    balance::{
+        HAPPINESS_CLEAN_AIR, HAPPINESS_COMMUTE, HAPPINESS_COMMUTE_LIMIT_M, HAPPINESS_COVERAGE,
+        HAPPINESS_EMPLOYMENT, HAPPINESS_LAND_VALUE, HAPPINESS_POWER, HAPPINESS_RETAIL,
+        HAPPINESS_SEWAGE, HAPPINESS_TAX, HAPPINESS_WATER, NEUTRAL_HAPPINESS,
+    },
+    Budget, MAX_TAX_RATE_PERMILLE,
+};
+use crate::map::{BuildingID, ZoneKind};
+use crate::map_dynamic::{BuildingInfos, CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow};
+use crate::{Simulation, SoulID};
+
+use super::residence::{has_power, has_retail_access, retail_store_positions, Residences};
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Happiness {
     pub by_building: BTreeMap<BuildingID, u8>,
 }
 
-pub fn happiness_update(_sim: &mut Simulation) {}
+impl Happiness {
+    pub fn average(&self) -> f32 {
+        if self.by_building.is_empty() {
+            return NEUTRAL_HAPPINESS;
+        }
+        let sum: u64 = self
+            .by_building
+            .values()
+            .map(|&score| u64::from(score))
+            .sum();
+        sum as f32 / self.by_building.len() as f32
+    }
+}
+
+pub fn happiness_update(sim: &mut Simulation) {
+    if sim.get_tick() % TICKS_PER_HOUR != 0 {
+        return;
+    }
+    profiling::scope!("souls::happiness_update");
+
+    let map = sim.map();
+    let infos = sim.read::<BuildingInfos>();
+    let residences = sim.read::<Residences>();
+    let electricity = sim.read::<ElectricityFlow>();
+    let utilities = sim.read::<UtilityFlow>();
+    let coverage = sim.read::<CoverageGrid>();
+    let environment = sim.read::<EnvGrid>();
+    let stores = retail_store_positions(&map);
+    let tax_rate = sim.read::<Budget>().tax_rate(ZoneKind::Residential);
+    let tax_score = 1.0 - f32::from(tax_rate) / f32::from(MAX_TAX_RATE_PERMILLE);
+    let mut scores = BTreeMap::new();
+
+    for &id in residences.by_building.keys() {
+        let Some(home) = map.get(id) else { continue };
+        let door = home.door_pos.xy();
+        let mut occupied = 0;
+        let mut employed = 0;
+        let mut commute_score = 0.0;
+        for &resident in infos.get(id).into_iter().flat_map(|info| &info.residents) {
+            let SoulID::Human(human) = resident else {
+                continue;
+            };
+            let Some(human) = sim.get(human) else {
+                continue;
+            };
+            occupied += 1;
+            if let Some(workplace) = human.work.as_ref().and_then(|work| map.get(work.workplace)) {
+                employed += 1;
+                let distance = door.distance(workplace.door_pos.xy());
+                commute_score += (1.0 - distance / HAPPINESS_COMMUTE_LIMIT_M).max(0.0);
+            }
+        }
+
+        let service_score: f32 = HAPPINESS_COVERAGE
+            .iter()
+            .map(|&(kind, weight)| coverage.coverage(id, kind) / 100.0 * weight)
+            .sum();
+        let pollution = environment.pollution_at(home.obb.center());
+        let score = service_score
+            + f32::from(has_power(&map, &electricity, id)) * HAPPINESS_POWER
+            + f32::from(utilities.has_water(id)) * HAPPINESS_WATER
+            + f32::from(utilities.has_sewage(id)) * HAPPINESS_SEWAGE
+            + (1.0 - pollution / 100.0).max(0.0) * HAPPINESS_CLEAN_AIR
+            + f32::from(environment.land_value(id)) / 100.0 * HAPPINESS_LAND_VALUE
+            + tax_score * HAPPINESS_TAX
+            + f32::from(has_retail_access(&stores, door)) * HAPPINESS_RETAIL
+            + employed as f32 / occupied.max(1) as f32 * HAPPINESS_EMPLOYMENT
+            + commute_score / employed.max(1) as f32 * HAPPINESS_COMMUTE;
+        scores.insert(id, score.round().clamp(0.0, 100.0) as u8);
+    }
+    sim.write::<Happiness>().by_building = scores;
+}

@@ -1,4 +1,7 @@
-use crate::builders::{grid_city, paint_zone_blocks, place_company, place_freight_station};
+use crate::builders::{
+    grid_city, paint_zone_blocks, place_freight_station, place_grid_power_plant,
+    place_service_sites, SCHOOL_SITE, UTILITY_SITES,
+};
 use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, Vec2, OBB};
 use prototypes::{GrowableCompanyID, GrowableCompanyPrototype, ResidencePrototype, Size2D};
@@ -67,16 +70,8 @@ fn run_for(ctx: &mut ScenarioCtx, resume: bool) -> Result<(), String> {
         }
     }
 
-    // A utility spur supplies the connected grid from an existing power plant.
-    let spur = grid_city(ctx, ORIGIN + vec2(-260.0, 200.0), 2, 1, 260.0);
-    let plant = place_company(ctx, "coal-power-plant", ORIGIN + vec2(-130.0, 100.0));
-    if spur.roads.len() != 1
-        || !plant.is_some_and(|id| {
-            ctx.sim.map().buildings()[id].connected_road == spur.roads.first().copied()
-        })
-    {
-        return Err("could not connect a power plant to the grid".into());
-    }
+    place_grid_power_plant(ctx, ORIGIN)?;
+    place_service_sites(ctx, ORIGIN, UTILITY_SITES.into_iter().chain([SCHOOL_SITE]))?;
 
     // Fifteen residential blocks, six industrial blocks, and four commercial
     // blocks. Repaint one quarter of a commercial block for a 60/25/15 area split.

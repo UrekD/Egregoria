@@ -25,6 +25,7 @@ data:extend {
         type = "goods-company",
         order = "a-1",
         name = "flour-factory",
+        pollution = 4,
         label = "Flour Factory",
         bgen = {
             kind = "centered_door",
@@ -96,6 +97,7 @@ data:extend {
         type = "goods-company",
         order = "b-2",
         name = "coal-power-plant",
+        pollution = 12,
         label = "Coal power plant",
         bgen = {
             kind = "centered_door",
@@ -162,6 +164,7 @@ data:extend {
         type = "goods-company",
         order = "d-2",
         name = "cloth-factory",
+        pollution = 5,
         label = "Cloth factory",
         bgen = {
             kind = "centered_door",
@@ -185,6 +188,7 @@ data:extend {
         type = "goods-company",
         order = "d-3",
         name = "textile-processing-facility",
+        pollution = 5,
         label = "Textile processing facility",
         bgen = {
             kind = "centered_door",
@@ -208,6 +212,7 @@ data:extend {
         type = "goods-company",
         order = "d-4",
         name = "polyester-refinery",
+        pollution = 10,
         label = "Polyester refinery",
         bgen = {
             kind = "centered_door",
@@ -231,6 +236,7 @@ data:extend {
         type = "goods-company",
         order = "e-1",
         name = "oil-pump",
+        pollution = 7,
         label = "Oil pump",
         bgen = {
             kind = "centered_door",
@@ -254,6 +260,7 @@ data:extend {
         type = "goods-company",
         order = "e-2",
         name = "coal-mine",
+        pollution = 9,
         label = "Coal mine",
         bgen = {
             kind = "centered_door",
@@ -389,6 +396,7 @@ data:extend {
         type = "goods-company",
         order = "i-1",
         name = "iron-mine",
+        pollution = 8,
         label = "Iron mine",
         bgen = {
             kind = "centered_door",
@@ -412,6 +420,7 @@ data:extend {
         type = "goods-company",
         order = "i-1",
         name = "gold-mine",
+        pollution = 8,
         label = "Gold mine",
         bgen = {
             kind = "centered_door",
@@ -435,6 +444,7 @@ data:extend {
         type = "goods-company",
         order = "j-1",
         name = "lumber-yard",
+        pollution = 5,
         label = "Lumber yard",
         bgen = "farm",
         kind = "factory",
@@ -455,6 +465,7 @@ data:extend {
         type = "goods-company",
         order = "j-2",
         name = "woodmill",
+        pollution = 5,
         label = "Woodmill",
         bgen = {
             kind = "centered_door",
@@ -500,6 +511,7 @@ data:extend {
         type = "goods-company",
         order = "h-1",
         name = "foundry",
+        pollution = 11,
         label = "Foundry",
         bgen = {
             kind = "centered_door",
@@ -523,6 +535,7 @@ data:extend {
         type = "goods-company",
         order = "k-1",
         name = "slaughterhouse",
+        pollution = 6,
         label = "Slaughterhouse",
         bgen = {
             kind = "centered_door",

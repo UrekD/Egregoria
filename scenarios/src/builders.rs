@@ -262,6 +262,39 @@ pub fn place_company(
     id
 }
 
+pub(crate) fn place_grid_power_plant(
+    ctx: &mut ScenarioCtx,
+    origin: Vec2,
+) -> Result<BuildingID, String> {
+    let spur = grid_city(ctx, origin + vec2(-260.0, 200.0), 2, 1, 260.0);
+    let Some(&road) = spur.roads.first().filter(|_| spur.roads.len() == 1) else {
+        return Err("could not connect a power spur to the grid".into());
+    };
+    place_company(ctx, "coal-power-plant", origin + vec2(-130.0, 100.0))
+        .filter(|&id| ctx.sim.map().buildings()[id].connected_road == Some(road))
+        .ok_or_else(|| "could not connect a power plant to the grid".into())
+}
+
+pub(crate) fn place_service_sites(
+    ctx: &mut ScenarioCtx,
+    origin: Vec2,
+    sites: impl IntoIterator<Item = (&'static str, Vec2)>,
+) -> Result<Vec<BuildingID>, String> {
+    sites
+        .into_iter()
+        .map(|(name, offset)| {
+            place_company(ctx, name, origin + offset)
+                .ok_or_else(|| format!("could not place {name} at {offset:?}"))
+        })
+        .collect()
+}
+
+pub(crate) const UTILITY_SITES: [(&str, Vec2); 2] = [
+    ("water-pump", vec2(-30.0, 50.0)),
+    ("sewage-outlet", vec2(-30.0, 350.0)),
+];
+pub(crate) const SCHOOL_SITE: (&str, Vec2) = ("school", vec2(-30.0, 250.0));
+
 fn roadside_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
     let mut best: Option<(f32, RoadID, OBB)> = None;
     let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;

@@ -1,10 +1,12 @@
 use crate::economy::balance::{
     DEFAULT_TAX_RATE_PERMILLE, DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS, I_BASE,
-    I_BOOTSTRAP_COMPANIES, K_GOODS, K_JOBS, K_RET, K_TAX, K_UNEMP, K_VAC, MIN_DEMAND_POPULATION,
-    RETAIL_PER_CAPITA_PER_HOUR, R_BASE, R_BOOTSTRAP_POPULATION,
+    I_BOOTSTRAP_COMPANIES, K_GOODS, K_HAPPY, K_JOBS, K_RET, K_TAX, K_UNEMP, K_VAC,
+    MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, RETAIL_PER_CAPITA_PER_HOUR, R_BASE,
+    R_BOOTSTRAP_POPULATION,
 };
 use crate::economy::{Budget, Market};
 use crate::map::ZoneKind;
+use crate::souls::happiness::Happiness;
 use crate::souls::residence::Residences;
 use crate::utils::resources::Resources;
 use crate::{SoulID, World};
@@ -21,6 +23,7 @@ pub struct ZoneDemand {
 /// Signed contributions to a zone's latest demand sample, before clamping and smoothing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct DemandDrivers {
+    /// Zone bootstrap contribution, plus the happiness adjustment for residential demand.
     pub base: f32,
     /// Open job orders minus unemployed residents, weighted for residential demand.
     pub jobs: f32,
@@ -118,6 +121,7 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     } else {
         0.0
     };
+    let happiness = K_HAPPY * (resources.read::<Happiness>().average() - NEUTRAL_HAPPINESS);
 
     let budget = resources.read::<Budget>();
     let mut demand = resources.write::<ZoneDemand>();
@@ -125,7 +129,7 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
         (
             ZoneKind::Residential,
             DemandDrivers {
-                base: r_base,
+                base: r_base + happiness,
                 jobs: K_JOBS * (open_jobs as f32 - unemployed as f32) * per_capita,
                 vacancies: -K_VAC * vacancies as f32 * per_capita,
                 ..Default::default()
