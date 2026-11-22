@@ -1,16 +1,16 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
 use yakui_core::dom::Dom;
 use yakui_core::event::{EventInterest, EventResponse, WidgetEvent};
 use yakui_core::geometry::{Constraints, Dim2, Rect, Vec2};
 use yakui_core::layout::LayoutDom;
+use yakui_core::paint::{PaintDom, Pipeline};
 use yakui_core::widget::{EventContext, LayoutContext, PaintContext, Widget};
 use yakui_core::{context, Alignment, Flow, WidgetId};
 use yakui_widgets::util::widget_children;
-use yakui_widgets::widgets::{ColoredBoxWidget, CutOutWidget};
 
 use crate::{on_primary, padxy, primary, round_rect, textc};
 
@@ -25,6 +25,27 @@ struct HitRegion {
     rect: Rect,
     layer: usize,
     label: Option<Label>,
+    takes_pointer: bool,
+}
+
+#[derive(Debug)]
+struct PaintedRegion {
+    rect: Rect,
+    points: [Vec2; 3],
+    layer: usize,
+}
+
+impl PaintedRegion {
+    fn contains(&self, point: Vec2) -> bool {
+        if !self.rect.contains_point(point) {
+            return false;
+        }
+        let [a, b, c] = self.points;
+        let ab = (b - a).perp_dot(point - a);
+        let bc = (c - b).perp_dot(point - b);
+        let ca = (a - c).perp_dot(point - c);
+        (ab >= 0.0 && bc >= 0.0 && ca >= 0.0) || (ab <= 0.0 && bc <= 0.0 && ca <= 0.0)
+    }
 }
 
 #[derive(Debug)]
@@ -38,6 +59,7 @@ struct TooltipState {
     pointer: Option<Vec2>,
     hovered: Option<Hover>,
     regions: Vec<HitRegion>,
+    painted: Vec<PaintedRegion>,
 }
 
 impl TooltipState {
@@ -53,6 +75,14 @@ impl TooltipState {
                     front_layer = hit.layer;
                     label = hit.label.as_ref();
                 }
+            }
+            if label.is_some()
+                && self
+                    .painted
+                    .iter()
+                    .any(|hit| hit.layer > front_layer && hit.contains(pointer))
+            {
+                label = None;
             }
         }
         if label != self.hovered.as_ref().map(|hover| &hover.label) {
@@ -72,15 +102,21 @@ impl TooltipState {
 type SharedState = Rc<RefCell<TooltipState>>;
 
 thread_local! {
-    static WORLD_BLOCKERS: RefCell<Vec<Rect>> = const { RefCell::new(Vec::new()) };
+    static LAST_PAINTED_UI: RefCell<Weak<RefCell<TooltipState>>> = const { RefCell::new(Weak::new()) };
 }
 
 /// Test the last rendered Yakui layout at a point in physical screen pixels.
 pub fn pointer_over_ui(x: f32, y: f32) -> bool {
-    WORLD_BLOCKERS.with_borrow(|regions| {
-        regions
-            .iter()
-            .any(|rect| rect.contains_point(Vec2::new(x, y)))
+    let point = Vec2::new(x, y);
+    LAST_PAINTED_UI.with_borrow(|state| {
+        state.upgrade().is_some_and(|state| {
+            let state = state.borrow();
+            state
+                .regions
+                .iter()
+                .any(|hit| hit.takes_pointer && hit.rect.contains_point(point))
+                || state.painted.iter().any(|hit| hit.contains(point))
+        })
     })
 }
 
@@ -104,7 +140,7 @@ pub(crate) fn tooltip_after<T>(
     response
 }
 
-/// Render a single hover label above the current Yakui frame.
+/// Render a single hover label after the rest of the Yakui UI.
 pub fn render_tooltip() {
     let state = context::dom().get_global_or_init(SharedState::default);
     let shown = state.borrow().ready_label().cloned();
@@ -207,24 +243,61 @@ impl Widget for TooltipLayer {
     fn paint(&self, ctx: PaintContext<'_>) {
         let mut state = self.state.borrow_mut();
         state.regions.clear();
-        WORLD_BLOCKERS.with_borrow_mut(|blockers| {
-            blockers.clear();
-            collect_regions(
-                ctx.dom,
-                ctx.layout,
-                ctx.dom.root(),
-                &mut 0,
-                0,
-                &mut state.regions,
-                blockers,
-            );
-        });
+        collect_regions(
+            ctx.dom,
+            ctx.layout,
+            ctx.dom.root(),
+            &mut 0,
+            0,
+            &mut state.regions,
+        );
+        collect_painted_regions(ctx.paint, &mut state.painted);
+        LAST_PAINTED_UI.set(Rc::downgrade(&self.state));
         state.refresh_hover();
 
         // Layout is final here. Hide an obsolete bubble immediately when its control
         // moves or is covered. A newly exposed label can be built on the next frame.
         if self.shown.is_some() && self.shown.as_ref() == state.ready_label() {
             self.default_paint(ctx);
+        }
+    }
+}
+
+fn collect_painted_regions(paint: &PaintDom, regions: &mut Vec<PaintedRegion>) {
+    regions.clear();
+    let size = paint.surface_size();
+    let surface = Rect::from_pos_size(Vec2::ZERO, size);
+    // Yakui batches faces from arbitrary widgets together. Use their triangles so
+    // visible backgrounds count without filling clipped or unpainted gaps.
+    // The tooltip itself has yet to paint, so it remains transparent to input.
+    for (layer, painted_layer) in paint.layers().iter().enumerate() {
+        for call in painted_layer
+            .calls
+            .iter()
+            .filter(|call| call.pipeline == Pipeline::Main)
+        {
+            let clip = call.clip.map_or(surface, |clip| surface.constrain(clip));
+            for triangle in call.indices.chunks_exact(3) {
+                let [a, b, c] = [triangle[0], triangle[1], triangle[2]]
+                    .map(|index| call.vertices[usize::from(index)]);
+                if a.color.w <= 0.0 && b.color.w <= 0.0 && c.color.w <= 0.0 {
+                    continue;
+                }
+                let [a, b, c] = [a, b, c].map(|vertex| vertex.position * size);
+                if (b - a).perp_dot(c - a) == 0.0 {
+                    continue;
+                }
+                let min = a.min(b).min(c);
+                let max = a.max(b).max(c);
+                let rect = Rect::from_pos_size(min, max - min).constrain(clip);
+                if rect.size().min_element() > 0.0 {
+                    regions.push(PaintedRegion {
+                        rect,
+                        points: [a, b, c],
+                        layer,
+                    });
+                }
+            }
         }
     }
 }
@@ -236,7 +309,6 @@ fn collect_regions(
     next_layer: &mut usize,
     mut layer: usize,
     regions: &mut Vec<HitRegion>,
-    blockers: &mut Vec<Rect>,
 ) {
     let Some(layout_node) = layout.get(id) else {
         return;
@@ -246,16 +318,14 @@ fn collect_regions(
         return;
     }
     if layout_node.new_layer {
-        *next_layer += 1;
         layer = *next_layer;
+        *next_layer += 1;
     }
     let label = node.widget.downcast_ref::<TooltipHover>();
     let takes_pointer = layout_node
         .event_interest
         .contains(EventInterest::MOUSE_INSIDE);
-    let panel =
-        layer > 1 && (node.widget.is::<ColoredBoxWidget>() || node.widget.is::<CutOutWidget>());
-    if (label.is_some() || takes_pointer || panel) && layout_node.rect.size().min_element() > 0.0 {
+    if (label.is_some() || takes_pointer) && layout_node.rect.size().min_element() > 0.0 {
         let mut rect = layout_node.rect;
         let mut clip = layout_node.clipped_by;
         while let Some(clip_id) = clip {
@@ -273,14 +343,12 @@ fn collect_regions(
                 rect,
                 layer,
                 label: label.map(|hover| hover.0.clone()),
+                takes_pointer,
             });
-            if takes_pointer {
-                blockers.push(rect);
-            }
         }
     }
     for &child in &node.children {
-        collect_regions(dom, layout, child, next_layer, layer, regions, blockers);
+        collect_regions(dom, layout, child, next_layer, layer, regions);
     }
 }
 
@@ -389,5 +457,28 @@ mod layout_tests {
         assert!(!has_tooltip(&mut ui, Vec2::ZERO, true));
         ui.handle_event(Event::CursorMoved(Some(Vec2::new(15.0, 12.0))));
         assert!(!has_tooltip(&mut ui, Vec2::ZERO, true));
+    }
+
+    #[test]
+    fn p4d_painted_foreground_occludes_a_tooltip_without_capture() {
+        let mut ui = ui();
+        let frame = |ui: &mut Yakui, covered| {
+            ui.start();
+            tooltip("Hover label", || Button::styled("Open").show());
+            if covered {
+                Layer::new().show(|| {
+                    crate::RoundRect::new(4.0)
+                        .min_size(Vec2::splat(80.0))
+                        .show();
+                });
+            }
+            render_tooltip();
+            ui.finish();
+            tooltip_painted(ui)
+        };
+        assert!(!frame(&mut ui, false));
+        ui.handle_event(Event::CursorMoved(Some(Vec2::new(15.0, 12.0))));
+        assert!(frame(&mut ui, false));
+        assert!(!frame(&mut ui, true));
     }
 }

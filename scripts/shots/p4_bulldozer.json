@@ -4,6 +4,7 @@
   {"SelectTool": "Bulldozer"},
   {"WaitFrames": 3},
   {"Screenshot": "before"},
+  {"DumpState": "before"},
   {"Pointer": {"action": "Click", "screen_pos": [22, 625]}},
   {"WaitFrames": 2},
   {"Pointer": {"action": "Down", "screen_pos": [360, 370]}},
@@ -11,18 +12,25 @@
   {"WaitFrames": 4},
   {"Screenshot": "swept"},
   {"DumpState": "swept"},
+  {"Assert": {"RoadRemovals": {"before": "before", "after": "swept", "expected": [
+    {"idx": 6, "version": 3}, {"idx": 7, "version": 3}, {"idx": 10, "version": 3},
+    {"idx": 18, "version": 1}, {"idx": 21, "version": 1}, {"idx": 27, "version": 1}
+  ]}}},
   {"Pointer": {"action": "Move", "screen_pos": [1104, 51]}},
   {"Pointer": {"action": "Move", "screen_pos": [635, 533]}},
   {"WaitFrames": 3},
   {"DumpState": "returned-while-held"},
+  {"Assert": {"RoadRemovals": {"before": "swept", "after": "returned-while-held", "expected": []}}},
   {"Pointer": {"action": "Up", "screen_pos": [1104, 51]}},
   {"Pointer": {"action": "Move", "screen_pos": [635, 533]}},
   {"WaitFrames": 3},
   {"DumpState": "released-over-control"},
+  {"Assert": {"RoadRemovals": {"before": "swept", "after": "released-over-control", "expected": []}}},
   {"Pointer": {"action": "Click", "screen_pos": [635, 533]}},
   {"WaitFrames": 4},
   {"Screenshot": "fresh-press"},
   {"DumpState": "fresh-press"},
+  {"Assert": {"RoadRemovals": {"before": "swept", "after": "fresh-press", "expected": [{"idx": 13, "version": 1}]}}},
   {"Assert": "NoRejections"},
   "Exit"
 ]

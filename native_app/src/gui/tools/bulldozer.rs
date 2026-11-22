@@ -3,9 +3,10 @@ use std::collections::BTreeSet;
 use crate::gui::specialbuilding::SpecialBuildingResource;
 use crate::gui::windows::settings::Settings;
 use crate::gui::Tool;
-use crate::inputmap::{InputAction, InputMap};
+use crate::inputmap::{Bindings, InputAction, InputMap, UnitInput};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
+use engine::MouseButton;
 use geom::{Camera, Vec2, Vec3};
 use simulation::map::{BuildingKind, Map, ProjectFilter, ProjectKind};
 use simulation::world_command::WorldCommands;
@@ -159,17 +160,39 @@ fn queue_target(map: &Map, target: ProjectKind, commands: &mut WorldCommands) {
     }
 }
 
+fn is_select_button(bindings: &Bindings, button: MouseButton) -> bool {
+    bindings.0.get(&InputAction::Select).is_some_and(|select| {
+        select.0.iter().any(|binding| {
+            let mut combination = binding.clone();
+            combination.push_unique(UnitInput::Mouse(button));
+            combination == *binding
+        })
+    })
+}
+
 pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
     profiling::scope!("gui::bulldozer");
     let input = uiworld.read::<InputMap>();
     let pointer = engine::pointer_frame();
     let selecting = input.act.contains(&InputAction::Select);
-    let pressed = input.just_act.contains(&InputAction::Select);
-    let held = selecting || pointer.mouse_held;
+    let bindings = uiworld.read::<Bindings>();
+    let select_button = |&button| is_select_button(&bindings, button);
+    let held = selecting || pointer.held_buttons.iter().any(select_button);
     let mut state = uiworld.write::<BulldozerState>();
     if *uiworld.read::<Tool>() != Tool::Bulldozer || pointer.blocked || over_ui(input.screen) {
         state.cancel(held);
         return;
+    }
+    // InputMap compares held actions between redraws. A release followed by a
+    // press of the same Select button within one redraw starts a new stroke.
+    let repressed = selecting
+        && pointer
+            .held_buttons
+            .intersection(&pointer.released_buttons)
+            .any(select_button);
+    let pressed = input.just_act.contains(&InputAction::Select) || repressed;
+    if repressed {
+        state.reset_gesture();
     }
 
     let map = sim.map();
@@ -317,13 +340,9 @@ mod tests {
     }
 
     #[test]
-    fn p4d_drag_queues_once_while_paused_and_keeps_partially_swept_junctions() {
+    fn p4d_partial_sweep_keeps_junction_until_all_incident_roads_are_removed() {
         let mut city = city();
-        crate::init::init();
-        let ui = UiWorld::with_defaults();
-        ui.write::<Settings>().time_warp = 0;
         let map = city.sim.map();
-        let tick = city.sim.get_tick();
         let road_count = map.roads().len();
         let junction = map.project(
             sample(vec2(860.0, 860.0)).unwrap(),
@@ -335,7 +354,7 @@ mod tests {
         };
         let incident = map.get(junction).unwrap().roads.clone();
         let mut state = BulldozerState::default();
-        let mut commands = ui.commands();
+        let mut commands = WorldCommands::default();
         let a = vec2(700.0, 780.0);
         let b = vec2(1180.0, 780.0);
         state.update_drag(true, true, a, &map, sample, &mut commands);
@@ -345,8 +364,17 @@ mod tests {
         assert!(commands
             .iter()
             .all(|cmd| matches!(cmd, WorldCommand::MapRemoveRoad(_))));
-        assert_eq!(city.sim.get_tick(), tick);
-        assert_eq!(map.roads().len(), road_count);
+        drop(map);
+        city.sim
+            .apply_commands(std::mem::take(&mut commands).as_ref());
+        let map = city.sim.map();
+        assert_eq!(map.roads().len(), road_count - 4);
+        let remaining = &map
+            .get(junction)
+            .expect("partial sweep removed the junction")
+            .roads;
+        assert_eq!(remaining.len(), incident.len() - 1);
+        assert!(remaining.iter().all(|road| incident.contains(road)));
 
         // A second segment covers the other roads at a four-way junction. Applying the
         // batch lets map removal clean up that junction exactly when its last road goes.
@@ -363,7 +391,7 @@ mod tests {
             })
             .collect();
         assert_eq!(removed_roads.len(), commands.as_ref().len());
-        assert!(incident.iter().all(|road| removed_roads.contains(road)));
+        assert!(remaining.iter().all(|road| removed_roads.contains(road)));
         drop(map);
         city.sim.apply_commands(commands.as_ref());
         assert!(city.sim.map().get(junction).is_none());
@@ -392,5 +420,102 @@ mod tests {
         state.update_drag(false, false, b, &map, sample, &mut commands);
         state.update_drag(true, true, b, &map, sample, &mut commands);
         assert_eq!(commands.as_ref().len(), 2);
+    }
+
+    #[test]
+    fn p4d_paused_tool_queues_commands_and_requires_a_fresh_press_after_interruption() {
+        let city = city();
+        crate::init::init();
+        let mut ui = UiWorld::with_defaults();
+        {
+            let mut settings = ui.write::<Settings>();
+            settings.time_warp = 0;
+            settings.bulldozer_drag = true;
+        }
+        *ui.write::<Tool>() = Tool::Bulldozer;
+        let mut camera = Camera::new(vec2(960.0, 900.0).z(0.0), 1280.0, 720.0);
+        camera.update();
+        ui.insert(crate::rendering::OrbitCamera::from_camera(camera));
+        let map = city.sim.map();
+        let on_road = |point: Vec2| {
+            let height = map.environment.height(point).unwrap();
+            let (screen, _) = camera.project(point.z(height));
+            let terrain = project_terrain(&camera, &map, screen).unwrap();
+            let ProjectKind::Road(road) = map.project(terrain, 0.0, drag_filter()).kind else {
+                panic!("expected a road at {point:?}");
+            };
+            (screen, road)
+        };
+        let (a, road_a) = on_road(vec2(700.0, 780.0));
+        let (b, road_b) = on_road(vec2(1180.0, 780.0));
+        drop(map);
+        let update = |screen, selecting, pressed, frame: engine::PointerFrame| {
+            frame.publish();
+            {
+                let mut input = ui.write::<InputMap>();
+                input.screen = screen;
+                input.act.clear();
+                input.just_act.clear();
+                if selecting {
+                    input.act.insert(InputAction::Select);
+                }
+                if pressed {
+                    input.just_act.insert(InputAction::Select);
+                }
+            }
+            bulldozer(&city.sim, &ui);
+        };
+        let open = engine::PointerFrame::default;
+
+        for (blocked, interrupted) in [(true, false), (false, true)] {
+            update(a, true, true, open());
+            assert!(
+                matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(id)] if *id == road_a)
+            );
+            assert!(city.sim.map().get(road_a).is_some());
+
+            let mut frame = open();
+            frame.blocked = blocked;
+            frame.interrupted = interrupted;
+            update(b, true, false, frame);
+            update(b, true, false, open());
+            assert_eq!(ui.commands().as_ref().len(), 1);
+
+            update(b, false, false, open());
+            update(b, true, true, open());
+            assert!(
+                matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(a), WorldCommand::MapRemoveRoad(b)] if (*a, *b) == (road_a, road_b))
+            );
+            update(b, false, false, open());
+            *ui.commands() = WorldCommands::default();
+        }
+
+        let mut select = crate::inputmap::InputCombination::default();
+        select.push_unique(UnitInput::Mouse(MouseButton::Right));
+        ui.write::<Bindings>().0.insert(
+            InputAction::Select,
+            crate::inputmap::InputCombinations(vec![select]),
+        );
+        let mut frame = open();
+        frame.held_buttons.insert(MouseButton::Right);
+        update(a, true, true, frame.clone());
+        let mut secondary_released = frame.clone();
+        secondary_released
+            .released_buttons
+            .insert(MouseButton::Left);
+        update(b, true, false, secondary_released);
+        assert!(ui.commands().iter().any(|command| {
+            matches!(command, WorldCommand::MapRemoveRoad(id) if *id == road_b)
+        }));
+
+        update(b, false, false, open());
+        *ui.commands() = WorldCommands::default();
+        update(a, true, true, frame.clone());
+        frame.released_buttons.insert(MouseButton::Right);
+        update(b, true, false, frame);
+        assert!(
+            matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(a), WorldCommand::MapRemoveRoad(b)] if (*a, *b) == (road_a, road_b))
+        );
+        open().publish();
     }
 }

@@ -2,7 +2,7 @@ use common::FastSet;
 use geom::{vec2, Vec2};
 use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
-use std::cell::{Cell, RefCell};
+use std::cell::RefCell;
 use std::fmt::Debug;
 use std::sync::{Arc, Mutex};
 use winit::event::{ElementState, KeyEvent, MouseScrollDelta, WindowEvent};
@@ -36,24 +36,32 @@ pub struct InputContext {
     physical_mouse_buttons: FastSet<MouseButton>,
     cursor_outside: bool,
     unfocused: bool,
-    pointer_released: bool,
+    released_mouse_buttons: FastSet<MouseButton>,
 }
 
 /// Pointer state for world tools running during the engine's update callback.
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Default)]
 pub struct PointerFrame {
     pub blocked: bool,
     pub interrupted: bool,
-    pub mouse_held: bool,
+    pub held_buttons: FastSet<MouseButton>,
+    pub released_buttons: FastSet<MouseButton>,
 }
 
 thread_local! {
-    static POINTER_FRAME: Cell<PointerFrame> = Cell::new(PointerFrame::default());
+    static POINTER_FRAME: RefCell<PointerFrame> = RefCell::new(PointerFrame::default());
     static EGUI_CONTEXT: RefCell<Option<egui::Context>> = const { RefCell::new(None) };
 }
 
 pub fn pointer_frame() -> PointerFrame {
-    POINTER_FRAME.get()
+    POINTER_FRAME.with_borrow(Clone::clone)
+}
+
+impl PointerFrame {
+    /// Publish this pointer state for tools running in the current update.
+    pub fn publish(self) {
+        POINTER_FRAME.set(self);
+    }
 }
 
 pub fn pointer_over_egui(screen: Vec2) -> bool {
@@ -74,38 +82,46 @@ impl InputContext {
         self.mouse.screen_delta = Vec2::ZERO;
         self.cursor_left = false;
         self.focus_lost = false;
-        self.pointer_released = false;
+        self.released_mouse_buttons.clear();
     }
 
     pub fn physical_mouse_buttons(&self) -> &FastSet<MouseButton> {
         &self.physical_mouse_buttons
     }
 
+    /// Build a pointer frame from observed buttons, window state, and UI capture.
+    pub fn pointer_frame(&self, captured: bool) -> PointerFrame {
+        PointerFrame {
+            blocked: self.cursor_outside || self.unfocused || captured,
+            interrupted: self.cursor_left || self.focus_lost,
+            held_buttons: self.physical_mouse_buttons.clone(),
+            released_buttons: self.released_mouse_buttons.clone(),
+        }
+    }
+
     pub(crate) fn publish_pointer_frame(&self, egui: &crate::egui::EguiWrapper) {
-        POINTER_FRAME.set(PointerFrame {
-            blocked: self.cursor_outside || self.unfocused || egui.last_mouse_captured,
-            interrupted: self.cursor_left || self.focus_lost || self.pointer_released,
-            mouse_held: !self.physical_mouse_buttons.is_empty(),
-        });
+        self.pointer_frame(egui.last_mouse_captured).publish();
         EGUI_CONTEXT.with_borrow_mut(|context| *context = Some(egui.platform.egui_ctx().clone()));
+    }
+
+    /// Record a button transition before passing it to the UI adapter.
+    pub fn observe_mouse_button(&mut self, button: MouseButton, down: bool) {
+        if down {
+            if !self.unfocused {
+                self.physical_mouse_buttons.insert(button);
+            }
+        } else {
+            self.physical_mouse_buttons.remove(&button);
+            self.mouse.pressed.remove(&button);
+            self.released_mouse_buttons.insert(button);
+        }
     }
 
     /// Observe hardware state before an adapter can capture the event.
     pub(crate) fn observe_window_event(&mut self, event: &WindowEvent) {
         match event {
             WindowEvent::MouseInput { button, state, .. } => {
-                let button = MouseButton::from(*button);
-                match state {
-                    ElementState::Pressed if !self.unfocused => {
-                        self.physical_mouse_buttons.insert(button);
-                    }
-                    ElementState::Released => {
-                        self.physical_mouse_buttons.remove(&button);
-                        self.mouse.pressed.remove(&button);
-                        self.pointer_released = true;
-                    }
-                    _ => {}
-                }
+                self.observe_mouse_button((*button).into(), *state == ElementState::Pressed);
             }
             WindowEvent::CursorLeft { .. } => {
                 self.cursor_left = true;
@@ -450,5 +466,26 @@ mod tests {
         assert!(input.mouse.pressed.is_empty());
         input.end_frame();
         assert!(!input.focus_lost);
+    }
+
+    #[test]
+    fn p4d_releasing_secondary_button_does_not_interrupt_select() {
+        let mut input = InputContext::default();
+        for button in [NativeButton::Left, NativeButton::Right] {
+            input.observe_window_event(&mouse_event(button, ElementState::Pressed));
+        }
+        input.observe_window_event(&mouse_event(NativeButton::Right, ElementState::Released));
+        let frame = input.pointer_frame(false);
+        assert!(frame.held_buttons.contains(&MouseButton::Left));
+        assert!(frame.released_buttons.contains(&MouseButton::Right));
+        assert!(!frame.interrupted, "secondary release interrupted Select");
+        assert!(!frame.released_buttons.contains(&MouseButton::Left));
+
+        input.observe_window_event(&mouse_event(NativeButton::Left, ElementState::Released));
+        let frame = input.pointer_frame(false);
+        assert!(!frame.held_buttons.contains(&MouseButton::Left));
+        assert!(frame.released_buttons.contains(&MouseButton::Left));
+        input.end_frame();
+        assert!(input.pointer_frame(false).released_buttons.is_empty());
     }
 }
