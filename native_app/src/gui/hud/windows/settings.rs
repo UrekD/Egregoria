@@ -9,16 +9,14 @@ use common::saveload::Encoder;
 use engine::GfxSettings;
 use engine::ShadowQuality;
 use goryak::{
-    button_primary, checkbox_value, combo_box, dragvalue, icon_button, minrow,
+    button_primary, checkbox_value, combo_box, dragvalue, error, icon_button, mincolumn, minrow,
     on_secondary_container, outline, padx, padxy, textc, VertScrollSize, Window,
 };
 use serde::{Deserialize, Serialize};
 use simulation::Simulation;
 
 use crate::game_loop::Timings;
-use crate::gui::keybinds::{
-    apply_and_save_bindings, reset_binding, KeybindState, KeybindStateInner,
-};
+use crate::gui::keybinds::{BindingSaveFailure, KeybindState, KeybindStateInner};
 use crate::inputmap::{Bindings, InputMap};
 use crate::uiworld::UiWorld;
 
@@ -315,9 +313,17 @@ pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
                 divider(outline(), 10.0, 1.0);
                 textc(on_secondary_container(), "Keybinds");
                 let mut bindings = uiw.write::<Bindings>();
+                let mut keybind_state = uiw.write::<KeybindState>();
                 if button_primary("Reset").show().clicked {
                     *bindings = Bindings::default();
-                    apply_and_save_bindings(&mut bindings, &mut uiw.write::<InputMap>());
+                    keybind_state.apply_and_save_bindings(
+                        &mut bindings,
+                        &mut uiw.write::<InputMap>(),
+                        None,
+                    );
+                }
+                if matches!(keybind_state.save_failure, Some(BindingSaveFailure::All)) {
+                    textc(error(), "Could not save bindings.");
                 }
 
                 let mut sorted_inps = bindings.0.keys().cloned().collect::<Vec<_>>();
@@ -334,9 +340,18 @@ pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
                                 for action in &sorted_inps {
                                     let comb = bindings.0.get(action).unwrap();
                                     padx(2.0, || {
-                                        textc(on_secondary_container(), action.to_string());
+                                        mincolumn(2.0, || {
+                                            textc(on_secondary_container(), action.to_string());
+                                            if matches!(
+                                                &keybind_state.save_failure,
+                                                Some(BindingSaveFailure::Action(failed_action))
+                                                    if failed_action == action
+                                            ) {
+                                                textc(error(), "Could not save binding.");
+                                            }
+                                        });
                                     });
-                                    let print_comb = |index: usize| {
+                                    let mut print_comb = |index: usize| {
                                         padx(2.0, || {
                                             minrow(0.0, || {
                                                 let resp = if comb.0.len() > index {
@@ -346,12 +361,12 @@ pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
                                                     button_primary("<empty>").show()
                                                 };
                                                 if resp.clicked {
-                                                    let mut state = uiw.write::<KeybindState>();
-                                                    state.enabled = Some(KeybindStateInner {
+                                                    let binding = KeybindStateInner {
                                                         to_bind_to: action.clone(),
                                                         cur: Default::default(),
                                                         bind_index: index,
-                                                    });
+                                                    };
+                                                    keybind_state.enabled = Some(binding);
                                                 }
                                             });
                                         });
@@ -364,7 +379,7 @@ pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
                                                 .show()
                                                 .clicked
                                             {
-                                                reset_binding(
+                                                keybind_state.reset_binding(
                                                     &mut bindings,
                                                     &mut uiw.write::<InputMap>(),
                                                     action,

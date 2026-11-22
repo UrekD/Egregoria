@@ -4,7 +4,7 @@ use crate::gui::addtrain::TrainSpawnResource;
 use crate::gui::bulldozer::BulldozerState;
 use crate::gui::chat::GUIChatState;
 use crate::gui::follow::FollowEntity;
-use crate::gui::keybinds::KeybindState;
+use crate::gui::keybinds::{load_bindings, KeybindState};
 use crate::gui::lotbrush::LotBrushResource;
 use crate::gui::notifications::NotificationCenter;
 use crate::gui::overlays::{self, OverlayMode};
@@ -49,7 +49,16 @@ fn register_ui_resources() {
     #[cfg(feature = "multiplayer")]
     register_resource::<crate::gui::windows::network::NetworkConnectionInfo>("netinfo");
     register_resource::<LotBrushResource>("lot_brush");
-    register_resource::<Bindings>("bindings");
+    register_resource_noserialize::<Bindings>();
+    unsafe {
+        (*std::ptr::addr_of_mut!(SAVELOAD_FUNCS)).push(SaveLoadFunc {
+            save: Box::new(|uiw| {
+                uiw.write::<KeybindState>()
+                    .save_bindings(&uiw.read::<Bindings>(), None);
+            }),
+            load: Box::new(|uiw| uiw.insert(load_bindings())),
+        });
+    }
 
     register_resource_noserialize::<SessionScreen>();
     register_resource_noserialize::<SessionState>();

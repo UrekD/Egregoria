@@ -1,7 +1,8 @@
 use common::{FastMap, FastSet};
 use engine::{Context, InputContext, Key, MouseButton};
 use geom::{Ray3, Vec2, Vec3};
-use serde::{Deserialize, Serialize};
+use serde::de::{value::StrDeserializer, IgnoredAny, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
@@ -81,8 +82,43 @@ pub struct InputMap {
     close_down: bool,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize)]
 pub struct Bindings(pub BTreeMap<InputAction, InputCombinations>);
+
+impl<'de> Deserialize<'de> for Bindings {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        if !deserializer.is_human_readable() {
+            return BTreeMap::deserialize(deserializer).map(Self);
+        }
+
+        struct BindingsVisitor;
+
+        impl<'de> Visitor<'de> for BindingsVisitor {
+            type Value = Bindings;
+
+            fn expecting(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a map of input actions to key bindings")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, mut entries: A) -> Result<Bindings, A::Error> {
+                let mut bindings = BTreeMap::new();
+                while let Some(name) = entries.next_key::<String>()? {
+                    match InputAction::deserialize(StrDeserializer::<A::Error>::new(&name)) {
+                        Ok(action) => {
+                            bindings.insert(action, entries.next_value()?);
+                        }
+                        Err(_) => {
+                            entries.next_value::<IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(Bindings(bindings))
+            }
+        }
+
+        deserializer.deserialize_map(BindingsVisitor)
+    }
+}
 
 use InputAction::*;
 use Key as K;
