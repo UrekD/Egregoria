@@ -1,9 +1,10 @@
 use crate::map::{
-    LaneID, LaneKind, Map, PathKind, Pathfinder, RoadID, Traversable, TraverseDirection, TraverseKind,
+    LaneID, LaneKind, Map, PathKind, Pathfinder, RoadID, Traversable, TraverseDirection,
+    TraverseKind,
 };
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
-use crate::transportation::RoadThroughput;
+use crate::transportation::{RoadThroughput, RoadUserKind};
 use crate::utils::resources::Resources;
 use crate::world::TrainID;
 use crate::World;
@@ -32,6 +33,17 @@ pub struct ItineraryLeader {
 pub struct Itinerary {
     kind: ItineraryKind,
     reversed_local_path: Vec<Vec3>,
+    #[inspect(skip)]
+    #[serde(skip)]
+    road_approach: RoadApproach,
+}
+
+#[derive(Debug, Default)]
+enum RoadApproach {
+    #[default]
+    Unchecked,
+    Joining(RoadID, PathKind),
+    Done,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -139,6 +151,7 @@ impl Itinerary {
     pub const NONE: Self = Self {
         kind: ItineraryKind::None,
         reversed_local_path: Vec::new(),
+        road_approach: RoadApproach::Unchecked,
     };
 
     pub fn simple(mut path: Vec<Vec3>) -> Self {
@@ -146,13 +159,14 @@ impl Itinerary {
         Self {
             kind: ItineraryKind::Simple(*path.last().unwrap()),
             reversed_local_path: path,
+            ..Self::default()
         }
     }
 
     pub fn wait_until(x: f64) -> Self {
         Self {
             kind: ItineraryKind::WaitUntil(x),
-            reversed_local_path: Default::default(),
+            ..Self::default()
         }
     }
 
@@ -182,7 +196,7 @@ impl Itinerary {
                 target,
                 wait_ticks: 0,
             },
-            reversed_local_path: Default::default(),
+            ..Self::default()
         }
     }
 
@@ -277,6 +291,7 @@ impl Itinerary {
                         pathkind,
                     ),
                     reversed_local_path: local_path,
+                    ..Self::default()
                 });
             }
         }
@@ -320,6 +335,7 @@ impl Itinerary {
         let mut it = Self {
             kind,
             reversed_local_path: points,
+            ..Self::default()
         };
         if matches!(pathkind, PathKind::Rail) {
             return Some(it);
@@ -333,7 +349,7 @@ impl Itinerary {
         &mut self,
         map: &Map,
         position: Vec3,
-        on_road_entry: &mut impl FnMut(RoadID),
+        on_road_entry: &mut Option<impl FnMut(RoadID, PathKind)>,
     ) -> Option<Vec3> {
         let v = self.reversed_local_path.pop();
 
@@ -372,7 +388,10 @@ impl Itinerary {
                 }
                 self.reversed_local_path.reverse();
 
-                if pathkind != PathKind::Rail {
+                if let Some(record) = on_road_entry
+                    .as_mut()
+                    .filter(|_| pathkind != PathKind::Rail)
+                {
                     if let TraverseKind::Lane(id) = r.cur.kind {
                         let previous_lane = match previous.kind {
                             TraverseKind::Lane(lane) => lane,
@@ -381,11 +400,14 @@ impl Itinerary {
                                 TraverseDirection::Backward => turn.dst,
                             },
                         };
-                        if let Some(lane) = map.get(id) {
+                        if let Some(lane) = map
+                            .get(id)
+                            .filter(|lane| pathkind.authorized_lane(lane.kind))
+                        {
                             if map.get(previous_lane).map(|previous| previous.parent)
                                 != Some(lane.parent)
                             {
-                                on_road_entry(lane.parent);
+                                record(lane.parent, pathkind);
                             }
                         }
                     }
@@ -393,6 +415,38 @@ impl Itinerary {
             }
         }
         v
+    }
+
+    fn initial_road_approach(&self, map: &Map, position: Vec3) -> RoadApproach {
+        let ItineraryKind::Route(route, kind) = &self.kind else {
+            return RoadApproach::Done;
+        };
+        let TraverseKind::Lane(id) = route.cur.kind else {
+            return RoadApproach::Done;
+        };
+        let Some(lane) = map
+            .get(id)
+            .filter(|lane| *kind != PathKind::Rail && kind.authorized_lane(lane.kind))
+        else {
+            return RoadApproach::Done;
+        };
+        let Some(road) = map.get(lane.parent) else {
+            return RoadApproach::Done;
+        };
+
+        // A route can start in a driveway, a parking bay or next to a sidewalk.
+        // A reroute from any travel lane of this same segment is already on it.
+        if road.lanes_iter().any(|(id, lane_kind)| {
+            kind.authorized_lane(lane_kind)
+                && map.get(id).is_some_and(|lane| {
+                    let half_width = lane_kind.width() * 0.5;
+                    lane.points.project_dist2(position) <= half_width * half_width
+                })
+        }) {
+            RoadApproach::Done
+        } else {
+            RoadApproach::Joining(road.id, *kind)
+        }
     }
 
     pub fn update(
@@ -409,7 +463,7 @@ impl Itinerary {
             time,
             map,
             |start, target, kind| Self::route_to_target(tick, start, target, map, kind),
-            |_| {},
+            None::<fn(RoadID, PathKind)>,
         )
     }
 
@@ -420,7 +474,7 @@ impl Itinerary {
         time: u32,
         map: &Map,
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
-        mut on_road_entry: impl FnMut(RoadID),
+        mut on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
     ) -> Vec3 {
         if let ItineraryKind::Route(ref active, kind) = self.kind {
             if matches!(active.target, ItineraryTarget::DirectedLane(..))
@@ -429,9 +483,23 @@ impl Itinerary {
                 *self = Self::retry(kind, active.target);
             }
         }
+        if on_road_entry.is_some()
+            && matches!(self.road_approach, RoadApproach::Unchecked)
+            && !self.reversed_local_path.is_empty()
+        {
+            self.road_approach = self.initial_road_approach(map, position);
+        }
         while let Some(p) = self.get_point() {
             let dist = position.distance(p);
             if dist <= dist_to_move + 0.01 {
+                if let RoadApproach::Joining(road, kind) = self.road_approach {
+                    if let Some(record) = &mut on_road_entry {
+                        if map.get(road).is_some() {
+                            record(road, kind);
+                        }
+                    }
+                    self.road_approach = RoadApproach::Done;
+                }
                 dist_to_move -= dist;
                 position = p;
                 if self.is_terminal() {
@@ -687,9 +755,11 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     failures.sync_map(map);
     let mut throughput = resources.write::<RoadThroughput>();
     let tick = elapsed_ticks(resources).0;
+    throughput.begin_tick(map, tick);
 
-    world.query_it_trans_speed().for_each(
-        |(it, trans, speed, kind)| {
+    world
+        .query_it_trans_speed()
+        .for_each(|(it, trans, speed, kind)| {
             // A stationary entity with a route may still cross an itinerary
             // boundary. Only the inert itinerary kinds can skip movement here.
             if it.reversed_local_path.is_empty()
@@ -697,20 +767,27 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             {
                 return;
             }
+            let record = kind.map(|kind| {
+                let throughput = &mut *throughput;
+                move |road, path| {
+                    let expected = match kind {
+                        RoadUserKind::Pedestrian => PathKind::Pedestrian,
+                        _ => PathKind::Vehicle,
+                    };
+                    if path == expected {
+                        throughput.record_entry(road, kind, tick);
+                    }
+                }
+            });
             trans.pos = it.update_with_route(
                 trans.pos,
                 speed * DELTA,
                 time.seconds,
                 map,
                 |start, target, kind| failures.route(time.tick, start, target, map, kind),
-                |road| {
-                    if let Some(kind) = kind {
-                        throughput.record_entry(road, kind, tick);
-                    }
-                },
+                record,
             );
-        },
-    );
+        });
 
     world.trains.values_mut().for_each(|train| {
         train.leader.past.push(train.trans.pos);
@@ -742,6 +819,191 @@ mod tests {
     fn update_at(sim: &mut Simulation, tick: u64) {
         *sim.write::<GameTime>() = GameTime::new(Tick(tick));
         itinerary_update(&mut sim.world, &mut sim.resources);
+    }
+
+    #[test]
+    fn u5_first_entry_turn_and_multiple_roads_in_one_tick() {
+        let mut ctx = TestCtx::new();
+        let existing: BTreeSet<_> = ctx.g.map().roads().keys().collect();
+        ctx.build_roads(&[
+            vec3(60.0, 150.0, 0.0),
+            vec3(200.0, 150.0, 0.0),
+            vec3(330.0, 220.0, 0.0),
+            vec3(450.0, 220.0, 0.0),
+        ]);
+        let (roads, lanes) = {
+            let map = ctx.g.map();
+            let mut roads: Vec<_> = map
+                .roads()
+                .values()
+                .filter(|road| !existing.contains(&road.id))
+                .collect();
+            roads.sort_by(|a, b| a.points.first().x.total_cmp(&b.points.first().x));
+            assert_eq!(roads.len(), 3);
+            let lanes: Vec<_> = roads
+                .iter()
+                .map(|road| {
+                    road.lanes_iter()
+                        .find_map(|(id, kind)| {
+                            let lane = map.get(id)?;
+                            (kind == LaneKind::Driving
+                                && lane.points.first().x < lane.points.last().x)
+                                .then_some(id)
+                        })
+                        .unwrap()
+                })
+                .collect();
+            (roads.iter().map(|road| road.id).collect::<Vec<_>>(), lanes)
+        };
+        let (pos, route) = {
+            let map = ctx.g.map();
+            let pos = map.get(lanes[0]).unwrap().points.point_along(20.0) + vec3(0.0, -9.0, 0.0);
+            let route = Itinerary::route_from(
+                Tick(0),
+                pos,
+                lanes[0],
+                ItineraryTarget::DirectedLane(lanes[2], 30.0),
+                &map,
+                PathKind::Vehicle,
+            )
+            .unwrap();
+            (pos, route)
+        };
+        let truck = spawn_truck_at_depot(&mut ctx.g, pos);
+        ctx.g.world.vehicles[truck].it = route;
+        let tick = ctx.g.get_tick();
+
+        update_at(&mut ctx.g, tick + 1);
+        assert_eq!(ctx.g.read::<RoadThroughput>().recent(roads[0], 1), [0; 4]);
+
+        ctx.g.world.vehicles[truck].speed.0 = 50.0;
+        let mut turn_tick = None;
+        for offset in 2..200 {
+            update_at(&mut ctx.g, tick + offset);
+            if ctx.g.world.vehicles[truck]
+                .it
+                .get_travers()
+                .is_some_and(|t| matches!(t.kind, TraverseKind::Turn(_)))
+            {
+                turn_tick = Some(offset);
+                break;
+            }
+        }
+        let turn_tick = turn_tick.expect("truck entered the first turn");
+        assert_eq!(
+            ctx.g.read::<RoadThroughput>().recent(roads[0], turn_tick),
+            [0, 1, 0, 0]
+        );
+        assert_eq!(
+            ctx.g.read::<RoadThroughput>().recent(roads[1], turn_tick),
+            [0; 4]
+        );
+
+        ctx.g.world.vehicles[truck].speed.0 = 50_000.0;
+        update_at(&mut ctx.g, tick + turn_tick + 1);
+        for road in roads {
+            let now = elapsed_ticks(&ctx.g.resources).0;
+            assert_eq!(
+                ctx.g.read::<RoadThroughput>().recent(road, now),
+                [0, 1, 0, 0]
+            );
+        }
+    }
+
+    #[test]
+    fn u5_reroute_and_same_road_lane_change_keep_the_prior_road() {
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), vec3(270.0, 180.0, 0.0)]);
+        let (road, lane, opposite, pos) = {
+            let map = ctx.g.map();
+            let road = map
+                .roads()
+                .values()
+                .find(|r| r.points.first().y == 180.0)
+                .unwrap();
+            let mut driving = road
+                .lanes_iter()
+                .filter_map(|(id, kind)| (kind == LaneKind::Driving).then_some(id));
+            let lane = driving.next().unwrap();
+            let opposite = driving.next().unwrap();
+            let pos = map.get(lane).unwrap().points.point_along(15.0);
+            (road.id, lane, opposite, pos)
+        };
+        let truck = spawn_truck_at_depot(&mut ctx.g, pos);
+        ctx.g.world.vehicles[truck].it = Itinerary::wait_for_reroute_to_lane(lane, 30.0);
+        ctx.g.world.vehicles[truck].speed.0 = 20.0;
+        let tick = ctx.g.get_tick();
+        update_at(&mut ctx.g, tick + 1);
+        assert!(ctx.g.world.vehicles[truck].it.get_route().is_some());
+        update_at(&mut ctx.g, tick + 2);
+
+        let vehicle = &mut ctx.g.world.vehicles[truck];
+        let itinerary = &mut vehicle.it;
+        let ItineraryKind::Route(route, _) = &mut itinerary.kind else {
+            panic!("expected route");
+        };
+        route.target = ItineraryTarget::DirectedLane(opposite, 30.0);
+        route.reversed_route.push(Traversable::new(
+            TraverseKind::Lane(opposite),
+            TraverseDirection::Forward,
+        ));
+        vehicle.speed.0 = 10_000.0;
+        update_at(&mut ctx.g, tick + 3);
+        assert_eq!(
+            ctx.g
+                .read::<RoadThroughput>()
+                .recent(road, elapsed_ticks(&ctx.g.resources).0),
+            [0; 4]
+        );
+    }
+
+    #[test]
+    fn u5_passengers_are_excluded_from_lane_entries() {
+        use crate::souls::human::spawn_human;
+        use crate::transportation::Location;
+
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), vec3(290.0, 180.0, 0.0)]);
+        let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
+        let human = spawn_human(&mut ctx.g, house).unwrap();
+        let (road, start, end) = {
+            let map = ctx.g.map();
+            let road = map
+                .roads()
+                .values()
+                .find(|r| r.points.first().y == 180.0)
+                .unwrap();
+            let (lane, _) = road
+                .lanes_iter()
+                .find(|&(_, kind)| kind == LaneKind::Walking)
+                .unwrap();
+            let points = &map.get(lane).unwrap().points;
+            let start = points.point_along(15.0) + vec3(0.0, 5.0, 0.0);
+            (road.id, start, points.point_along(50.0))
+        };
+        let truck = spawn_truck_at_depot(&mut ctx.g, start);
+        let tick = ctx.g.get_tick();
+        for (offset, location, expected) in [
+            (1, Location::Vehicle(truck), [0; 4]),
+            (2, Location::Transit(truck), [0; 4]),
+            (3, Location::Outside, [0, 0, 0, 1]),
+        ] {
+            let itinerary =
+                Itinerary::route(Tick(tick), start, end, &ctx.g.map(), PathKind::Pedestrian)
+                    .unwrap();
+            let human = &mut ctx.g.world.humans[human];
+            human.location = location;
+            human.trans.pos = start;
+            human.speed.0 = 2_000.0;
+            human.it = itinerary;
+            update_at(&mut ctx.g, tick + offset);
+            assert_eq!(
+                ctx.g
+                    .read::<RoadThroughput>()
+                    .recent(road, elapsed_ticks(&ctx.g.resources).0),
+                expected
+            );
+        }
     }
 
     #[test]
