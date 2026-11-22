@@ -247,3 +247,21 @@ fn s5_zone_lock_precedes_charging_and_keeps_erase_available() {
         .values()
         .any(|cell| cell.density == Density::High));
 }
+
+#[test]
+fn s5b_capability_resolves_registered_goods_companies_by_name() {
+    use crate::economy::progression::BuildCapability;
+    use prototypes::{GoodsCompanyID, ServiceID};
+
+    let _test = super::TestCtx::new();
+    assert_eq!(
+        BuildCapability::prototype_from_name("bakery"),
+        Some(BuildCapability::Prototype(GoodsCompanyID::new("bakery")))
+    );
+    assert_eq!(
+        BuildCapability::prototype_from_name("clinic"),
+        Some(BuildCapability::Prototype(ServiceID::new("clinic").into()))
+    );
+    assert_eq!(BuildCapability::prototype_from_name("bread"), None);
+    assert_eq!(BuildCapability::prototype_from_name("missing-warehouse"), None);
+}

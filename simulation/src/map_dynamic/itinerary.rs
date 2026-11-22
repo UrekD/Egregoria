@@ -687,7 +687,6 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     failures.sync_map(map);
     let mut throughput = resources.write::<RoadThroughput>();
     let tick = elapsed_ticks(resources).0;
-    throughput.sync_map(map);
 
     world.query_it_trans_speed().for_each(
         |(it, trans, speed, kind)| {

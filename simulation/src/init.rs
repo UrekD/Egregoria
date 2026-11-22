@@ -36,7 +36,7 @@ use crate::souls::household::household_update;
 use crate::souls::human::update_decision_system;
 use crate::transportation::pedestrian_decision_system;
 use crate::transportation::road::{vehicle_decision_system, vehicle_state_update_system};
-use crate::transportation::road_throughput::RoadThroughput;
+use crate::transportation::road_throughput::{road_throughput_update, RoadThroughput};
 use crate::transportation::testing_vehicles::{random_vehicles_update, RandomVehicles};
 use crate::transportation::train::{
     locomotive_system, train_reservations_update, TrainReservations,
@@ -95,6 +95,7 @@ fn register_systems_and_resources() {
     register_system("routing_changed_system", routing_changed_system);
     register_system("routing_update_system", routing_update_system);
     register_system("itinerary_update", itinerary_update);
+    register_system("road_throughput_update", road_throughput_update);
     register_system("market_update", market_update);
     register_system("cargo_update", cargo_update);
     register_system("budget_update", crate::economy::budget_update);

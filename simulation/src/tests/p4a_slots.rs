@@ -253,3 +253,39 @@ fn s5_progression_mode_survives_slot_and_replay_round_trips() {
         }
     }
 }
+
+#[test]
+fn s5b_deliver_load_survives_slot_round_trip() {
+    use crate::economy::cargo::LoadId;
+    use crate::souls::human::{spawn_human, HumanDecisionKind};
+    use geom::vec2;
+
+    let root = TestRoot::new();
+    let id = SlotId::new("delivery").unwrap();
+    let mut test = crate::tests::TestCtx::new();
+    super::street(&test);
+    let house = test.build_house_near(vec2(150.0, 125.0));
+    let destination = test.build_house_near(vec2(250.0, 125.0));
+    let driver = spawn_human(&mut test.g, house).unwrap();
+    let load = LoadId(42);
+    test.g.world_mut_unchecked().humans[driver].decision.kind =
+        HumanDecisionKind::MultiStack(vec![HumanDecisionKind::DeliverLoad { destination, load }]);
+
+    test.g
+        .save_to_slot(&root.0, &id, SnapshotRevision::new(1))
+        .unwrap();
+    let mut restored = Simulation::load_from_slot(&root.0, &id).unwrap();
+    assert_eq!(restored.hashes(), test.g.hashes());
+    let decision = &restored.get(driver).unwrap().decision.kind;
+    assert!(matches!(decision, HumanDecisionKind::MultiStack(steps) if matches!(
+        steps.as_slice(),
+        [HumanDecisionKind::DeliverLoad { destination: saved_destination, load: saved_load }]
+            if *saved_destination == destination && *saved_load == load
+    )));
+
+    crate::WorldCommand::MapRemoveBuilding(destination).apply(&mut restored);
+    assert!(matches!(
+        restored.get(driver).unwrap().decision.kind,
+        HumanDecisionKind::Yield
+    ));
+}

@@ -16,7 +16,7 @@ use std::borrow::Cow;
 use yakui::widgets::Pad;
 use yakui::Vec2;
 
-use crate::gui::inspect::{entity_link, inspect_needs};
+use crate::gui::inspect::{entity_link, inspect_needs, inspect_utility, inspect_warehouse};
 use crate::gui::item_icon_yakui;
 use crate::gui::zoning::zone_name;
 use crate::uiworld::UiWorld;
@@ -83,6 +83,8 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                 };
 
                 inspect_needs::render(sim, id, &diagnostics);
+                inspect_utility::section(sim, id);
+                inspect_warehouse::section(uiworld, sim, id);
 
                 if let Some(ref zone) = building.zone {
                     let mut cpy = zone.filldir;

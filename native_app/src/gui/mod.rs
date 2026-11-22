@@ -3,7 +3,7 @@ use crate::uiworld::UiWorld;
 use geom::OBB;
 use prototypes::GoodsCompanyID;
 use serde::{Deserialize, Serialize};
-use simulation::map::{BuildingID, RoadID};
+use simulation::map::{BuildingID, BuildingKind, RoadID};
 use simulation::world_command::WorldCommand;
 use simulation::{AnyEntity, Simulation};
 use std::borrow::Cow;
@@ -112,11 +112,13 @@ pub struct InspectedBuilding {
 pub struct InspectedRoad(pub Option<RoadID>);
 
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Read by the placement overlay when command outcome tracking is added.
 pub struct PendingPlacement {
-    pub world_generation: u64,
-    /// Last command outcome sequence observed before submitting this command.
-    pub after_batch: u64,
-    pub command: WorldCommand,
+    pub kind: BuildingKind,
+    pub obb: OBB,
+    pub road: Option<RoadID>,
+    /// UI frame on which the placement command was submitted.
+    pub frame: u64,
 }
 
 #[derive(Clone, Debug, Default)]

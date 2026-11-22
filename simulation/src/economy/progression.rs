@@ -31,6 +31,14 @@ pub enum BuildCapability {
     BusService,
 }
 
+impl BuildCapability {
+    /// Resolves a prototype name from a progression table against the loaded registry.
+    pub fn prototype_from_name(name: &str) -> Option<Self> {
+        let prototype = try_prototype(GoodsCompanyID::new(name))?;
+        (prototype.name == name).then_some(Self::Prototype(prototype.id))
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LockedUntil {
     pub milestone: u8,

@@ -22,6 +22,7 @@ use simulation::souls::residence::{self, Residences};
 use simulation::Simulation;
 
 use crate::gui::hud::toolbox::building::draw_service_radius;
+use crate::gui::{PlacementPreview, Tool};
 use crate::rendering::immediate::ImmediateDraw;
 
 use crate::uiworld::UiWorld;
@@ -39,6 +40,24 @@ pub(crate) enum OverlayMode {
     Happiness,
     Transit,
     Traffic,
+}
+
+pub(crate) fn effective_overlay(
+    manual: OverlayMode,
+    _tool: Tool,
+    _preview: &PlacementPreview,
+) -> OverlayMode {
+    manual
+}
+
+fn current_overlay(manual: OverlayMode, uiworld: &UiWorld) -> OverlayMode {
+    let tool = *uiworld.read::<Tool>();
+    let preview = (tool == Tool::SpecialBuilding).then(|| uiworld.read::<PlacementPreview>());
+    effective_overlay(
+        manual,
+        tool,
+        preview.as_deref().unwrap_or(&PlacementPreview::default()),
+    )
 }
 
 fn deserialize_coverage<'de, D: Deserializer<'de>>(
@@ -161,7 +180,7 @@ fn power_version(map: &Map, flow: &ElectricityFlow) -> u64 {
 }
 
 pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
-    let mode = *uiworld.read::<OverlayMode>();
+    let mode = current_overlay(*uiworld.read::<OverlayMode>(), uiworld);
     let mut draw = uiworld.write::<ImmediateDraw>();
     draw_service_radius(sim, uiworld, &mut draw);
 
@@ -390,24 +409,31 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
     let count = MODES.len() - usize::from(!show_traffic);
     let modes = &MODES[..count];
     let labels = MODES.map(|(_, label)| label);
-    let mut mode = uiworld.write::<OverlayMode>();
+    let mut manual = uiworld.write::<OverlayMode>();
     let mut selected = modes
         .iter()
-        .position(|(option, _)| *option == *mode)
+        .position(|(option, _)| *option == *manual)
         .unwrap_or(0);
     if tooltip(labels[selected], || {
         combo_box(&mut selected, &labels[..count], 170.0)
     }) {
-        *mode = modes[selected].0;
+        *manual = modes[selected].0;
     }
-    let empty = CACHE.with_borrow(|cache| cache.mode == *mode && cache.tiles.chunks.is_empty());
-    match *mode {
+    let mode = current_overlay(*manual, uiworld);
+    let empty = CACHE.with_borrow(|cache| cache.mode == mode && cache.tiles.chunks.is_empty());
+    match mode {
         Transit => {
             let empty = uiworld.read::<ImmediateDraw>().persistent_orders.is_empty();
             transit::legend(empty);
         }
         Traffic if !show_traffic => {}
-        _ => legend::render(*mode, labels[selected], empty, uiworld),
+        _ => {
+            let label = modes
+                .iter()
+                .find_map(|&(option, label)| (option == mode).then_some(label))
+                .unwrap_or(labels[selected]);
+            legend::render(mode, label, empty, uiworld);
+        }
     }
 }
 

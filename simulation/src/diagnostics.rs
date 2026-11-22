@@ -199,7 +199,10 @@ pub fn citizen_diagnostics(sim: &Simulation, id: HumanID) -> Option<CitizenDiagn
     }
     let intent_destination = match decision {
         HumanDecisionKind::GoTo(destination) => Some(*destination),
-        HumanDecisionKind::DeliverAtBuilding(building) => Some(Destination::Building(*building)),
+        HumanDecisionKind::DeliverAtBuilding(building)
+        | HumanDecisionKind::DeliverLoad { destination: building, .. } => {
+            Some(Destination::Building(*building))
+        }
         HumanDecisionKind::PickupBasket(_)
         | HumanDecisionKind::DepositAtHome
         | HumanDecisionKind::VisitLeisure(_) => None,
@@ -210,7 +213,9 @@ pub fn citizen_diagnostics(sim: &Simulation, id: HumanID) -> Option<CitizenDiagn
     }));
     let intention = match decision {
         HumanDecisionKind::SetVehicle(_) => CitizenIntention::ChangeVehicle,
-        HumanDecisionKind::DeliverAtBuilding(_) => CitizenIntention::Deliver,
+        HumanDecisionKind::DeliverAtBuilding(_) | HumanDecisionKind::DeliverLoad { .. } => {
+            CitizenIntention::Deliver
+        }
         _ if citizen.router.walk_only_pickup => CitizenIntention::PickUpGoods,
         _ => match destination {
             Some(Destination::Building(id)) if id == citizen.home.house => CitizenIntention::GoHome,

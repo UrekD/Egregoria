@@ -118,6 +118,12 @@ data:extend {
     },
     {
         type = "item",
+        name = "groceries",
+        label = "Groceries",
+        optout_exttrade = true,
+    },
+    {
+        type = "item",
         name = "services",
         label = "Services",
     },

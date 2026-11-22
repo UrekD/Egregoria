@@ -1,4 +1,4 @@
-use crate::economy::cargo::settle_delivery;
+use crate::economy::cargo::{complete_delivery, settle_delivery, LoadId};
 use crate::economy::{Bought, Market};
 use crate::map::BuildingID;
 use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, Router};
@@ -37,6 +37,10 @@ pub enum HumanDecisionKind {
     PickupBasket(BasketId),
     DepositAtHome,
     VisitLeisure(BuildingID),
+    DeliverLoad {
+        destination: BuildingID,
+        load: LoadId,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Inspect)]
@@ -89,7 +93,10 @@ impl Default for HumanDecisionKind {
 impl HumanDecisionKind {
     pub(crate) fn references_building(&self, building: BuildingID) -> bool {
         match self {
-            Self::GoTo(Destination::Building(id)) | Self::DeliverAtBuilding(id) | Self::VisitLeisure(id) => *id == building,
+            Self::GoTo(Destination::Building(id))
+            | Self::DeliverAtBuilding(id)
+            | Self::DeliverLoad { destination: id, .. }
+            | Self::VisitLeisure(id) => *id == building,
             Self::MultiStack(steps) => steps.iter().any(|step| step.references_building(building)),
             _ => false,
         }
@@ -130,7 +137,15 @@ impl HumanDecisionKind {
                 router.use_vehicle(id);
                 true
             }
-            HumanDecisionKind::DeliverAtBuilding(bid) => {
+            HumanDecisionKind::DeliverAtBuilding(bid)
+            | HumanDecisionKind::DeliverLoad { destination: bid, .. } => {
+                if let (Self::DeliverLoad { load, .. }, Some(WorkKind::Driver { truck, .. })) =
+                    (&*self, work.as_deref().map(|work| work.kind))
+                {
+                    if complete_delivery(*load, truck, bid) {
+                        return true;
+                    }
+                }
                 if settle_delivery(cbuf, driver, location, bid, work.as_deref_mut()) {
                     return true;
                 }

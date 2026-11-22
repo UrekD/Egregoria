@@ -63,4 +63,9 @@ pub fn settle_delivery(
     false
 }
 
+/// Returns true when the cargo system settles the load's arrival.
+pub fn complete_delivery(_load: LoadId, _truck: VehicleID, _at: BuildingID) -> bool {
+    false
+}
+
 pub fn cargo_update(_world: &mut World, _resources: &mut Resources) {}

@@ -546,7 +546,8 @@ fn decision_references_buildings(
     match decision {
         HumanDecisionKind::GoTo(Destination::Building(id))
         | HumanDecisionKind::VisitLeisure(id)
-        | HumanDecisionKind::DeliverAtBuilding(id) => buildings.contains_key(id),
+        | HumanDecisionKind::DeliverAtBuilding(id)
+        | HumanDecisionKind::DeliverLoad { destination: id, .. } => buildings.contains_key(id),
         HumanDecisionKind::MultiStack(steps) => steps
             .iter()
             .any(|step| decision_references_buildings(step, buildings)),
