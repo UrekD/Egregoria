@@ -331,6 +331,11 @@ mod tests {
     #[test]
     fn p1c_industrial_supplies_commercial() {
         let mut test = city_street();
+        // Saves from before zoned trucks became the default keep the
+        // instantaneous local lane.
+        test.g
+            .write::<crate::economy::cargo::CargoBook>()
+            .growable_freight = false;
         let (_, industry) = company(&mut test, 160.0, "industrial-l1");
         let (_, store) = company(&mut test, 230.0, "commercial-l1");
         let goods = ItemID::new("goods");

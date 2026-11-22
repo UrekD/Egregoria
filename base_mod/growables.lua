@@ -19,7 +19,8 @@ data:extend {
             consumption = {},
             production = {{"goods", 4}},
             duration = "480s",
-            storage_multiplier = 2,
+            -- Hold a truckload for local stores plus a dispatchable batch for a depot.
+            storage_multiplier = 5,
         },
         bgen = {kind = "centered_door", vertical_factor = 1.0},
         size = 20,
@@ -95,7 +96,8 @@ data:extend {
             consumption = {},
             production = {{"goods", 6}},
             duration = "480s",
-            storage_multiplier = 2,
+            -- Hold a truckload for local stores plus a dispatchable batch for a depot.
+            storage_multiplier = 3,
         },
         bgen = {kind = "centered_door", vertical_factor = 1.25},
         size = 20,
@@ -171,6 +173,7 @@ data:extend {
             consumption = {},
             production = {{"goods", 8}},
             duration = "480s",
+            -- Hold a truckload for local stores plus a dispatchable batch for a depot.
             storage_multiplier = 2,
         },
         bgen = {kind = "centered_door", vertical_factor = 1.25},

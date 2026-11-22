@@ -452,3 +452,63 @@ fn slopes_use_horizontal_frontage() {
         }
     );
 }
+
+#[test]
+fn warehouse_meshes_stay_inside_their_snapped_footprint_on_both_road_sides() {
+    use geom::{Intersect, Polygon, OBB};
+    use prototypes::RenderAsset;
+
+    // Half extents of assets/models/flour_factory.glb in the render frame: x
+    // along the frontage, y away from the road. Mesh instances are not scaled
+    // to the footprint, so the footprint has to hold the whole model.
+    const FLOUR_FACTORY_HALF: (f32, f32) = (33.4, 33.9);
+
+    for name in ["small-depot", "large-warehouse"] {
+        for side in [-1.0, 1.0] {
+            let test = TestCtx::new_fast();
+            let proto = GoodsCompanyID::new(name).prototype();
+            assert_eq!(
+                proto.asset,
+                RenderAsset::Mesh {
+                    path: "flour_factory.glb".into()
+                },
+                "{name}: measure the new mesh before changing this asset",
+            );
+            let id = connect(
+                &test,
+                vec3(100.0, 100.0, 0.0),
+                vec3(400.0, 100.0, 0.0),
+                &street(),
+            );
+            let map = test.g.map();
+            let cursor = vec3(250.0, 100.0 + side * 12.0, 0.0);
+            let snap = snap_geometry(&map, cursor, proto.size).unwrap();
+            assert_eq!(snap.connected_road, id);
+
+            let [frontage, depth] = snap.obb.axis();
+            let (half_x, half_y) = FLOUR_FACTORY_HALF;
+            let mesh = OBB::new(
+                snap.obb.center(),
+                depth.normalize(),
+                2.0 * half_y,
+                2.0 * half_x,
+            );
+            let road = map.get(id).unwrap();
+            assert!(
+                !road
+                    .boldline()
+                    .intersects(&Polygon::from(mesh.corners.as_slice())),
+                "{name} on side {side}: the mesh clips the road",
+            );
+            let footprint = snap.obb.expand(0.01);
+            for corner in mesh.corners {
+                assert!(
+                    footprint.contains(corner),
+                    "{name} on side {side}: mesh corner {corner:?} outside {:?}",
+                    snap.obb.corners,
+                );
+            }
+            assert!(frontage.mag() >= 2.0 * half_x && depth.mag() >= 2.0 * half_y);
+        }
+    }
+}

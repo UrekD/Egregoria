@@ -137,7 +137,24 @@ struct SuspendedRoute {
     roads: [Option<RoadID>; 2],
 }
 
-#[derive(Default, Serialize, Deserialize)]
+/// What a warehouse is doing, or why it is idle, as of the last freight match.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WarehouseActivity {
+    /// A truck is on the road to or from it.
+    Moving,
+    /// Cargo to or from it waits for a driver at the loading dock.
+    Queued,
+    /// No worker is assigned to drive its trucks.
+    NoWorkers,
+    /// It is restocking, but no producer of a stored item reaches it by road.
+    NoSupplierInReach,
+    /// It is restocking, and the producers in reach have nothing to spare yet.
+    WaitingForSupply,
+    /// Stock is above the restock level and no reachable recipe needs it.
+    NothingBelowWatermark,
+}
+
+#[derive(Serialize, Deserialize)]
 pub struct CargoBook {
     next_id: u64,
     shipments: BTreeMap<ShipmentId, Shipment>,
@@ -150,6 +167,28 @@ pub struct CargoBook {
     days: BTreeMap<u64, FreightDay>,
     #[serde(skip)]
     routes: RouteCache,
+    // Derived at every match, so a loaded game shows it after the first one.
+    #[serde(skip)]
+    activity: BTreeMap<CompanyID, WarehouseActivity>,
+}
+
+impl Default for CargoBook {
+    fn default() -> Self {
+        Self {
+            next_id: 0,
+            shipments: BTreeMap::new(),
+            loads: BTreeMap::new(),
+            policies: BTreeMap::new(),
+            restocking: BTreeSet::new(),
+            // New games truck zoned industry's output. Saves keep their setting.
+            growable_freight: true,
+            returning: BTreeMap::new(),
+            suspended: BTreeMap::new(),
+            days: BTreeMap::new(),
+            routes: RouteCache::default(),
+            activity: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -273,6 +312,11 @@ impl CargoBook {
         self.restocking.contains(&company)
     }
 
+    /// The warehouse's state at the last freight match, if it has been matched.
+    pub fn warehouse_activity(&self, company: CompanyID) -> Option<WarehouseActivity> {
+        self.activity.get(&company).copied()
+    }
+
     /// Stores a warehouse policy. Queued exports return to the shelf and are
     /// matched again under the new policy. Reserve locally also recalls
     /// exports that are already on the road. Neither counts as a missed delivery.
@@ -316,6 +360,7 @@ impl CargoBook {
     pub(crate) fn forget_company(&mut self, company: CompanyID) {
         self.policies.remove(&company);
         self.restocking.remove(&company);
+        self.activity.remove(&company);
     }
 
     pub fn outgoing_loads(&self, building: BuildingID) -> impl Iterator<Item = &TruckLoad> {
@@ -1986,6 +2031,80 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
         if !book.shipments.is_empty() {
             dispatch(book, world, resources, &map, now, &released_sources);
         }
+        record_warehouse_activity(book, world, &map, &infos, now);
+    }
+}
+
+/// Records what each warehouse is doing after a match and dispatch, or the
+/// first reason it is idle.
+fn record_warehouse_activity(
+    book: &mut CargoBook,
+    world: &World,
+    map: &Map,
+    infos: &BuildingInfos,
+    now: u64,
+) {
+    book.activity.clear();
+    let live = |id: CompanyID, building: BuildingID| {
+        let endpoint = Endpoint {
+            soul: SoulID::GoodsCompany(id),
+            building,
+        };
+        endpoint.live(world, map, infos).then_some(endpoint)
+    };
+    let producers: Vec<_> = world
+        .companies
+        .iter()
+        .filter_map(|(id, company)| {
+            let proto = company.comp.proto.prototype();
+            if proto.storage.is_some() || (proto.id.is_growable() && !book.growable_freight) {
+                return None;
+            }
+            DispatchPolicy::for_prototype(proto)?;
+            let recipe = proto.recipe.as_ref()?;
+            Some((live(id, company.comp.building)?, recipe))
+        })
+        .collect();
+    for (id, company) in &world.companies {
+        let Some(spec) = company.comp.proto.prototype().storage.as_ref() else {
+            continue;
+        };
+        let Some(warehouse) = live(id, company.comp.building) else {
+            continue;
+        };
+        let building = warehouse.building;
+        let activity = if book
+            .loads
+            .values()
+            .any(|load| load.source() == building || load.destination() == building)
+        {
+            WarehouseActivity::Moving
+        } else if book
+            .shipments
+            .values()
+            .any(|s| s.source == warehouse || s.destination == warehouse)
+        {
+            WarehouseActivity::Queued
+        } else if assigned_driver(world, warehouse, id).is_none() {
+            WarehouseActivity::NoWorkers
+        } else if book.restocking.contains(&id) {
+            let items = stored_items(spec);
+            let in_reach = producers.iter().any(|&(producer, recipe)| {
+                recipe
+                    .production
+                    .iter()
+                    .any(|output| items.contains(&output.id))
+                    && book.physical_route(map, producer, warehouse, now)
+            });
+            if in_reach {
+                WarehouseActivity::WaitingForSupply
+            } else {
+                WarehouseActivity::NoSupplierInReach
+            }
+        } else {
+            WarehouseActivity::NothingBelowWatermark
+        };
+        book.activity.insert(id, activity);
     }
 }
 
@@ -2038,14 +2157,12 @@ mod lifecycle_tests {
         }
 
         fn with_companies(source: &str, destination: &str) -> Self {
-            Self::with_freight(source, destination, false)
+            Self::with_freight(source, destination, true)
         }
 
         fn with_freight(source: &str, destination: &str, growable_freight: bool) -> Self {
             let mut ctx = TestCtx::new_fast();
-            if growable_freight {
-                crate::souls::goods_company::enable_growable_freight(&mut ctx.g);
-            }
+            ctx.g.write::<CargoBook>().growable_freight = growable_freight;
             let stations: Vec<_> = ctx
                 .g
                 .map()
@@ -3167,12 +3284,10 @@ mod lifecycle_tests {
     #[test]
     fn e2fix_only_staffed_depots_take_producer_stock() {
         let mut f = Fixture::new();
-        let idle = warehouse(&mut f, "small-depot");
-        let staffed = place_warehouse(
-            &mut f,
-            GoodsCompanyID::new("small-depot").prototype(),
-            vec2(150.0, 450.0),
-        );
+        let depot = GoodsCompanyID::new("small-depot").prototype();
+        // The idle depot is closer to the mine, and both sit upstream of the plant.
+        let idle = place_warehouse(&mut f, depot, vec2(225.0, 450.0));
+        let staffed = place_warehouse(&mut f, depot, vec2(150.0, 450.0));
         warehouse_driver(&mut f, staffed);
         let target = plant_target(&f);
         f.seed(100, target);
@@ -3402,5 +3517,106 @@ mod lifecycle_tests {
         let human = &f.ctx.g.world().humans[f.driver];
         assert_eq!(human.location, Location::Building(f.source.building));
         assert!(f.ctx.g.get(f.truck).unwrap().vehicle.state.is_parked());
+    }
+
+    #[test]
+    fn whfix_new_games_truck_zoned_goods_and_stores_wait_for_the_delivery() {
+        assert!(
+            TestCtx::new_fast().g.read::<CargoBook>().growable_freight,
+            "new games truck zoned industry's output"
+        );
+        let mut f = Fixture::with_companies("industrial-l1", "commercial-l1");
+        let goods = ItemID::new("goods");
+        let SoulID::GoodsCompany(industry) = f.source.soul else {
+            unreachable!()
+        };
+        // The factory finishes a batch. The store may only receive it by truck.
+        f.ctx.g.world_mut_unchecked().companies[industry]
+            .comp
+            .progress = 1.0;
+        for _ in 0..2 * FREIGHT_MATCH_INTERVAL {
+            f.ctx.tick_fast();
+        }
+        let store_goods = |f: &Fixture| f.ctx.g.read::<Market>().capital(f.destination.soul, goods);
+        assert_eq!(store_goods(&f), 0, "no virtual hand-off to the store");
+        let loaded = f.manifest_units();
+        assert!(loaded > 0, "the factory's truck carries the batch");
+        assert_eq!(incoming(&f, f.destination.building, goods), loaded);
+    }
+
+    #[test]
+    fn whfix_a_staffed_depot_takes_a_zoned_factory_surplus_once_stores_are_stocked() {
+        let mut f = Fixture::with_companies("industrial-l1", "commercial-l1");
+        let goods = ItemID::new("goods");
+        let depot = warehouse(&mut f, "small-depot");
+        warehouse_driver(&mut f, depot);
+        let proto = GoodsCompanyID::new("industrial-l1").prototype();
+        let recipe = proto.recipe.as_ref().unwrap();
+        let output = &recipe.production[0];
+        assert_eq!(output.id, goods);
+        // The factory stops producing at this stock.
+        let full = output.amount * (recipe.storage_multiplier + 1);
+        let policy = DispatchPolicy::for_prototype(proto).unwrap();
+        let input = destination_input(f.ctx.g.world(), f.destination, goods).unwrap();
+        {
+            let mut market = f.ctx.g.write::<Market>();
+            market.produce(f.source.soul, goods, full);
+            market.receive_freight(f.destination.soul, goods, input.target(policy));
+        }
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert!(
+            incoming(&f, depot.building, goods) >= policy.minimum,
+            "a full factory hands a dispatchable batch to the depot (holds {full})",
+        );
+        assert!(
+            f.manifest_units() >= policy.minimum,
+            "the batch leaves at once"
+        );
+    }
+
+    #[test]
+    fn whfix_depot_activity_names_why_it_is_idle() {
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        let SoulID::GoodsCompany(id) = depot.soul else {
+            unreachable!()
+        };
+        let activity = |f: &Fixture| f.ctx.g.read::<CargoBook>().warehouse_activity(id);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(activity(&f), Some(WarehouseActivity::NoWorkers));
+
+        warehouse_driver(&mut f, depot);
+        f.update(2 * FREIGHT_MATCH_INTERVAL);
+        assert_eq!(activity(&f), Some(WarehouseActivity::WaitingForSupply));
+
+        let target = plant_target(&f);
+        f.seed(100, target);
+        f.update(3 * FREIGHT_MATCH_INTERVAL);
+        assert_eq!(activity(&f), Some(WarehouseActivity::Moving));
+
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        let SoulID::GoodsCompany(id) = depot.soul else {
+            unreachable!()
+        };
+        warehouse_driver(&mut f, depot);
+        let target = plant_target(&f);
+        f.seed(0, target);
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(depot.soul, Fixture::coal(), 48);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(activity(&f), Some(WarehouseActivity::NothingBelowWatermark));
+
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(depot.soul, Fixture::coal(), -48);
+        f.ctx
+            .apply(&[WorldCommand::MapRemoveBuilding(f.source.building)]);
+        f.ctx.tick_fast();
+        f.update(2 * FREIGHT_MATCH_INTERVAL);
+        assert_eq!(activity(&f), Some(WarehouseActivity::NoSupplierInReach));
     }
 }
