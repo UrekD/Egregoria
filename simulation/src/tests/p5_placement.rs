@@ -455,24 +455,19 @@ fn slopes_use_horizontal_frontage() {
 
 #[test]
 fn warehouse_meshes_stay_inside_their_snapped_footprint_on_both_road_sides() {
-    use geom::{Intersect, Polygon, OBB};
+    use geom::{Intersect, Polygon};
     use prototypes::RenderAsset;
 
-    // Half extents of assets/models/flour_factory.glb in the render frame: x
-    // along the frontage, y away from the road. Mesh instances are not scaled
-    // to the footprint, so the footprint has to hold the whole model.
-    const FLOUR_FACTORY_HALF: (f32, f32) = (33.4, 33.9);
+    // Warehouses render as lettered placeholder boxes drawn at exactly their
+    // footprint, so the snapped footprint itself must stay clear of the road.
 
     for name in ["small-depot", "large-warehouse"] {
         for side in [-1.0, 1.0] {
             let test = TestCtx::new_fast();
             let proto = GoodsCompanyID::new(name).prototype();
-            assert_eq!(
-                proto.asset,
-                RenderAsset::Mesh {
-                    path: "flour_factory.glb".into()
-                },
-                "{name}: measure the new mesh before changing this asset",
+            assert!(
+                matches!(proto.asset, RenderAsset::Sprite { .. }),
+                "{name}: a mesh asset needs its model extents checked here",
             );
             let id = connect(
                 &test,
@@ -485,14 +480,7 @@ fn warehouse_meshes_stay_inside_their_snapped_footprint_on_both_road_sides() {
             let snap = snap_geometry(&map, cursor, proto.size).unwrap();
             assert_eq!(snap.connected_road, id);
 
-            let [frontage, depth] = snap.obb.axis();
-            let (half_x, half_y) = FLOUR_FACTORY_HALF;
-            let mesh = OBB::new(
-                snap.obb.center(),
-                depth.normalize(),
-                2.0 * half_y,
-                2.0 * half_x,
-            );
+            let mesh = snap.obb;
             let road = map.get(id).unwrap();
             assert!(
                 !road
@@ -508,7 +496,6 @@ fn warehouse_meshes_stay_inside_their_snapped_footprint_on_both_road_sides() {
                     snap.obb.corners,
                 );
             }
-            assert!(frontage.mag() >= 2.0 * half_x && depth.mag() >= 2.0 * half_y);
         }
     }
 }
