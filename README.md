@@ -53,6 +53,14 @@ Bus stops anchored to road geometry, looped lines with fleet and fare controls, 
 |---|---|
 | ![P3 transit overlay](docs/screenshots/p3-transit-overlay.png) | ![P3 transit lines](docs/screenshots/p3-transit-lines.png) |
 
+### Milestone P4 — game shell and UX
+
+Main menu with Continue/New Game/Load, new-game options (terrain preset, seed, map size, starting money), named save slots with atomic writes, Save As, rotating autosaves, Esc pause menu with unsaved-changes prompts, drag-to-bulldoze, tooltips, traffic congestion overlay, an advisor panel with alerts and "go to" links, and "why" diagnostics for buildings and citizens. A second performance pass brings 10,000 commuting citizens to ~440–530 simulation ticks/s on the test host.
+
+| New game | Advisor | Traffic overlay |
+|---|---|---|
+| ![P4 new game](docs/screenshots/p4-new-game.png) | ![P4 advisor](docs/screenshots/p4-advisor.png) | ![P4 traffic](docs/screenshots/p4-traffic.png) |
+
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
 ## How to play
