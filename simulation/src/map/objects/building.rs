@@ -149,7 +149,8 @@ impl Building {
             BuildingGen::House => gen_exterior_house(size, seed()),
             BuildingGen::Farm => gen_exterior_farm(size, seed()),
             BuildingGen::CenteredDoor { vertical_factor } => {
-                (Default::default(), Vec2::y(-vertical_factor * 0.5 * size))
+                let depth = obb.corners[0].distance(obb.corners[3]);
+                (Default::default(), Vec2::y(-vertical_factor * 0.5 * depth))
             }
             BuildingGen::NoWalkway { door_pos } => (Default::default(), door_pos),
         };

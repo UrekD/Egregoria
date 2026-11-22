@@ -245,9 +245,15 @@ impl ImmediateDraw {
                     let Ok(tex) = ctx.gfx.try_texture(path, "some immediate obb") else {
                         continue;
                     };
+                    let [frontage, depth] = obb.axis();
                     ctx.objs.push(Box::new(
                         SpriteBatchBuilder::<false>::new(&tex, ctx.gfx)
-                            .push(obb.center().z(z), obb.axis()[0].z0(), *color, (1.0, 1.0))
+                            .push(
+                                obb.center().z(z),
+                                frontage.normalize().z0(),
+                                *color,
+                                (frontage.mag(), depth.mag()),
+                            )
                             .build(ctx.gfx)
                             .unwrap(),
                     ));

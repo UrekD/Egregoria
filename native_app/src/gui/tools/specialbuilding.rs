@@ -7,7 +7,7 @@ use geom::{Degrees, Intersect, OBB};
 use prototypes::{RenderAsset, Size2D};
 use simulation::map::special_placement::{snap_special_building, PlacementError};
 use simulation::map::{ProjectFilter, RoadID};
-use simulation::world_command::WorldCommand;
+use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand};
 use simulation::Simulation;
 use std::borrow::Cow;
 
@@ -28,6 +28,7 @@ pub struct SpecialBuildingResource {
     pub opt: Option<SpecialBuildKind>,
     pub last_obb: Option<OBB>,
     pub rotation: Degrees,
+    pending_batch_seq: u64,
 }
 
 /// SpecialBuilding tool
@@ -41,8 +42,21 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
     let mut sound = uiworld.write::<ImmediateSound>();
 
     let map = sim.map();
-
     let commands = &mut *uiworld.commands();
+    let batch_seq = sim.read::<CommandOutcomes>().batch_seq();
+
+    if let Some(last) = state.last_obb {
+        let resolved = if crate::network::is_singleplayer(uiworld) {
+            batch_seq != state.pending_batch_seq
+        } else {
+            uiworld.received_commands().iter().any(|cmd| {
+                matches!(cmd, WorldCommand::MapBuildSpecialBuilding { pos, .. } if pos.corners == last.corners)
+            })
+        };
+        if resolved {
+            state.last_obb = None;
+        }
+    }
 
     if !matches!(tool, Tool::SpecialBuilding) {
         state.opt = None;
@@ -89,11 +103,21 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
         }
     };
 
-    let (obb, rid, height) = if road_snap {
-        match snap_special_building(&map, mpos, size) {
-            Ok(snap) => (snap.obb, Some(snap.connected_road), snap.height),
-            Err(error) => {
-                let message = match error {
+    let (obb, height, cmds, using_fallback) = if road_snap {
+        let build_commands = |args: &simulation::map::special_placement::SpecialBuildArgs| {
+            let cmds = make(&SpecialBuildArgs {
+                obb: args.obb,
+                connected_road: Some(args.connected_road),
+            });
+            for cmd in &cmds {
+                cmd.validate_and_price(sim)?;
+            }
+            Ok(cmds)
+        };
+        match snap_special_building(&map, mpos, size, build_commands) {
+            Ok((snap, cmds)) => (snap.obb, snap.height, cmds, snap.using_fallback),
+            Err(failure) => {
+                let message = match failure.error {
                     PlacementError::NoRoad => Cow::Borrowed("No road nearby"),
                     PlacementError::NoSidewalk => Cow::Borrowed("Sidewalk required"),
                     PlacementError::InsufficientFrontage {
@@ -106,13 +130,30 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
                         Cow::Borrowed("Intersecting with something")
                     }
                     PlacementError::InvalidTerrain => Cow::Borrowed("Invalid terrain"),
+                    PlacementError::CommandRejected(Rejection::InvalidBuilding) => {
+                        Cow::Borrowed("Building entrance needs road access")
+                    }
+                    PlacementError::CommandRejected(Rejection::InsufficientFunds) => {
+                        Cow::Borrowed("Not enough money to build here")
+                    }
+                    PlacementError::CommandRejected(_) => {
+                        Cow::Borrowed("Cannot place this building here")
+                    }
                 };
                 *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(message);
-                return draw(hover_obb, mpos.z, true);
+                return if let Some(pose) = failure.attempted {
+                    draw(pose.obb, pose.height.unwrap_or(mpos.z), true);
+                } else {
+                    draw(hover_obb, mpos.z, true);
+                };
             }
         }
     } else {
-        (hover_obb, None, mpos.z)
+        let cmds = make(&SpecialBuildArgs {
+            obb: hover_obb,
+            connected_road: None,
+        });
+        (hover_obb, mpos.z, cmds, false)
     };
 
     if (!road_snap
@@ -133,15 +174,16 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
     }
 
     draw(obb, height, false);
+    if using_fallback {
+        *uiworld.write::<ErrorTooltip>() =
+            ErrorTooltip::new("Placement uses a nearby road because the closest road is blocked");
+    }
 
-    let cmds: Vec<WorldCommand> = make(&SpecialBuildArgs {
-        obb,
-        connected_road: rid,
-    });
     if inp.act.contains(&InputAction::Select) {
         commands.extend(cmds);
         sound.play("road_lay", AudioKind::Ui);
         state.last_obb = Some(obb);
+        state.pending_batch_seq = batch_seq;
     } else if let Some(last) = cmds.last() {
         uiworld.write::<PotentialCommands>().set(last.clone());
     }

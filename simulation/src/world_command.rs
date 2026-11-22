@@ -578,6 +578,12 @@ impl WorldCommand {
         }
     }
 
+    /// Run the validation and cost checks used before applying a special building.
+    pub fn validate_and_price(&self, sim: &Simulation) -> Result<Money, Rejection> {
+        self.validate(&sim.map())?;
+        Self::affordable_cost(sim, Government::checked_action_cost(self, sim))
+    }
+
     fn affordable_cost(sim: &Simulation, cost: Option<Money>) -> Result<Money, Rejection> {
         let cost = cost.ok_or(Rejection::CostOverflow)?;
         let money = sim.read::<Government>().money;
@@ -704,8 +710,7 @@ impl WorldCommand {
         sim: &mut Simulation,
         construction: BudgetCategory,
     ) -> Result<(), Rejection> {
-        self.validate(&sim.map())?;
-        let cost = Self::affordable_cost(sim, Government::checked_action_cost(self, sim))?;
+        let cost = self.validate_and_price(sim)?;
 
         match *self {
             MapRemoveIntersection(id) => sim.map_mut().remove_intersection(id),
