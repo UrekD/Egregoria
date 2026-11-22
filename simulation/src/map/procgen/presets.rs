@@ -1,6 +1,6 @@
 #![allow(clippy::indexing_slicing)]
 
-use crate::map::{IntersectionID, LanePatternBuilder, Map, RoadSegmentKind};
+use crate::map::{IntersectionID, LanePatternBuilder, Map, RoadSegmentKind, UpdateType};
 use common::FastMap;
 use flat_spatial::Grid;
 use geom::{vec2, vec3, Vec2};
@@ -126,6 +126,13 @@ pub fn load_parismap(map: &mut Map) {
         .unwrap();
     }
 
+    // Connect builds road lanes but leaves intersection turns to the caller.
+    // Build them once all roads are present, in slot order.
+    for intersection in map.intersections.values_mut() {
+        intersection.update_turns(&map.lanes, &map.roads);
+        map.subscribers.dispatch(UpdateType::Road, intersection);
+    }
+
     info!(
         "loading parismap took {}ms",
         time.elapsed().as_secs_f32() * 1000.0
@@ -246,6 +253,12 @@ pub fn load_testfield(map: &mut Map, pos: Vec2, size: u32, spacing: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map::{LaneKind, PathKind};
+    use crate::map_dynamic::Itinerary;
+    use common::saveload::{Bincode, Encoder};
+    use prototypes::Tick;
+    use std::collections::BTreeSet;
+
     #[test]
     fn testfield_valid() {
         let mut m = Map::empty();
@@ -258,5 +271,91 @@ mod tests {
         let mut m = Map::empty();
         load_parismap(&mut m);
         m.check_invariants();
+    }
+
+    #[test]
+    fn parismap_generates_turns_at_junctions() {
+        let mut map = Map::empty();
+        load_parismap(&mut map);
+
+        let junctions = map.intersections.values().filter(|i| i.roads.len() >= 2);
+        let total = junctions.clone().count();
+        let with_turns = junctions.filter(|i| i.turns().len() > 0).count();
+        assert!(
+            total > 0 && with_turns * 100 >= total * 95,
+            "{with_turns}/{total} Paris junctions have turns"
+        );
+
+        let mut repeated = Map::empty();
+        load_parismap(&mut repeated);
+        assert!(
+            Bincode::encode(&map.intersections).unwrap()
+                == Bincode::encode(&repeated.intersections).unwrap(),
+            "repeated Paris imports should generate identical intersections and turns"
+        );
+    }
+
+    #[test]
+    fn parismap_routes_within_largest_component() {
+        let mut map = Map::empty();
+        load_parismap(&mut map);
+
+        // Find the component from road connections, independently of the turn graph.
+        let mut visited = BTreeSet::new();
+        let mut largest = BTreeSet::new();
+        for id in map.intersections.keys() {
+            if !visited.insert(id) {
+                continue;
+            }
+            let mut component = BTreeSet::new();
+            let mut pending = vec![id];
+            while let Some(id) = pending.pop() {
+                component.insert(id);
+                pending.extend(
+                    map.intersections[id]
+                        .undirected_neighbors(&map.roads)
+                        .filter(|&neighbor| visited.insert(neighbor)),
+                );
+            }
+            if component.len() > largest.len() {
+                largest = component;
+            }
+        }
+
+        let endpoints: Vec<_> = map
+            .roads
+            .values()
+            .filter(|road| largest.contains(&road.src))
+            .filter_map(|road| {
+                let (lane, _) = road
+                    .lanes_iter()
+                    .find(|&(_, kind)| kind == LaneKind::Walking)?;
+                Some(map.lanes[lane].points.middle())
+            })
+            .collect();
+        assert!(endpoints.len() >= 100);
+
+        let mut rng = common::rand::gen(42);
+        let mut failed = 0;
+        for _ in 0..100 {
+            let origin = (rng.next_f32() * endpoints.len() as f32) as usize;
+            let offset = 1 + (rng.next_f32() * (endpoints.len() - 1) as f32) as usize;
+            let destination = (origin + offset) % endpoints.len();
+            if Itinerary::route(
+                Tick(0),
+                endpoints[origin],
+                endpoints[destination],
+                &map,
+                PathKind::Pedestrian,
+            )
+            .is_none()
+            {
+                failed += 1;
+            }
+        }
+        assert_eq!(
+            failed, 0,
+            "{failed}/100 Paris routes failed in the largest component"
+        );
     }
 }
