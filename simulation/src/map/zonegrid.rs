@@ -6,7 +6,6 @@ use std::collections::BTreeMap;
 pub use prototypes::{Density, ZoneKind};
 
 pub const ZONE_CELL_SIZE: f32 = 8.0;
-const MAX_PAINT_SIDE: f32 = 400.0;
 const MAX_PAINT_CELLS: usize = 2_500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -23,6 +22,8 @@ pub struct ZoneGrid {
 }
 
 impl ZoneGrid {
+    pub const MAX_PAINT_SIDE: f32 = 400.0;
+
     pub(crate) fn valid_paint(area: &OBB, bounds: AABB) -> bool {
         area.corners.iter().all(|&corner| bounds.contains(corner))
             && paint_cells(area).is_some_and(|cells| cells.count() <= MAX_PAINT_CELLS)
@@ -97,7 +98,7 @@ fn paint_cells(area: &OBB) -> Option<impl Iterator<Item = (i32, i32)> + '_> {
         && (area.corners[2] - area.corners[0]).is_close(a + b, corner_tolerance);
     let valid_size = area.segments().iter().all(|side| {
         let length_squared = (side.dst - side.src).mag2();
-        length_squared <= MAX_PAINT_SIDE * MAX_PAINT_SIDE
+        length_squared <= ZoneGrid::MAX_PAINT_SIDE * ZoneGrid::MAX_PAINT_SIDE
     });
     (valid_rectangle && valid_size).then(|| cells_under(area).take(MAX_PAINT_CELLS + 1))
 }
@@ -264,6 +265,89 @@ mod tests {
 
         let misses_centres = OBB::new(vec2(-8.0, 4.0), Vec2::X, 7.0, 8.0);
         assert_eq!(grid.lot_zone(&misses_centres), None);
+    }
+
+    #[test]
+    fn u1_zone_density_majority_and_ordinal_ties() {
+        use Density::{High, Low, Medium};
+
+        let kind = ZoneKind::Residential;
+        let lot = OBB::new(vec2(20.0, 4.0), Vec2::X, 40.0, 8.0);
+        for (votes, expected) in [
+            ([Medium, High, Medium, Low, Medium], Medium),
+            ([Medium, High, Medium, Low, High], Medium),
+            ([Low, High, Medium, Low, High], Low),
+        ] {
+            let mut grid = ZoneGrid::default();
+            for (x, density) in votes.into_iter().enumerate() {
+                grid.cells.insert((x as i32, 0), ZoneCell { kind, density });
+            }
+            assert_eq!(
+                grid.lot_zone(&lot),
+                Some(ZoneCell {
+                    kind,
+                    density: expected
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn u1_zone_paint_and_erase_at_map_edge() {
+        let mut ctx = TestCtx::new_fast();
+        let edge = ctx.g.map().environment.bounds().ur;
+        let area = OBB::new(edge - Vec2::splat(8.0), Vec2::X, 16.0, 16.0);
+        let kind = Some(ZoneKind::Office);
+        ctx.apply(&[WorldCommand::ZonePaint {
+            area,
+            kind,
+            density: Density::Medium,
+        }]);
+        let grid = ctx.g.read::<ZoneGrid>();
+        let last = edge / ZONE_CELL_SIZE - Vec2::splat(1.0);
+        assert_eq!(grid.cells.len(), 4);
+        for x in last.x as i32 - 1..=last.x as i32 {
+            for y in last.y as i32 - 1..=last.y as i32 {
+                assert_eq!(grid.cells[&(x, y)].density, Density::Medium);
+            }
+        }
+        drop(grid);
+        ctx.apply(&[WorldCommand::ZonePaint {
+            area,
+            kind: None,
+            density: Density::Medium,
+        }]);
+        assert!(ctx.g.read::<ZoneGrid>().cells.is_empty());
+        assert!(ctx.g.read::<CommandOutcomes>().last.is_empty());
+    }
+
+    #[test]
+    fn u1_zone_guided_medium_paint_is_locked_but_erase_is_allowed() {
+        use crate::economy::progression::{ProgressionMode, ProgressionState};
+
+        let mut ctx = TestCtx::new_fast();
+        let area = OBB::new(vec2(8.0, 8.0), Vec2::X, 16.0, 16.0);
+        let paint = |kind, density| WorldCommand::ZonePaint {
+            area,
+            kind,
+            density,
+        };
+        let kind = Some(ZoneKind::Residential);
+        ctx.apply(&[paint(kind, Density::Medium)]);
+        ctx.g.write::<ProgressionState>().mode = ProgressionMode::Guided;
+        let generation = ctx.g.read::<ZoneGrid>().generation;
+        assert_eq!(ctx.g.read::<ZoneGrid>().cells.len(), 4);
+
+        ctx.apply(&[paint(Some(ZoneKind::Office), Density::Medium)]);
+        assert_eq!(
+            ctx.g.read::<CommandOutcomes>().last,
+            vec![("ZonePaint", Rejection::Locked { milestone: 1 })]
+        );
+        assert_eq!(ctx.g.read::<ZoneGrid>().generation, generation);
+
+        ctx.apply(&[paint(None, Density::Medium)]);
+        assert!(ctx.g.read::<ZoneGrid>().cells.is_empty());
+        assert!(ctx.g.read::<CommandOutcomes>().last.is_empty());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::{Budget, ZoneDemand};
 use crate::map::{
-    BuildingID, BuildingKind, LotID, Map, ProjectFilter, ZoneCell, ZoneGrid, ZoneKind,
+    BuildingID, BuildingKind, Lot, LotID, Map, ProjectFilter, ZoneCell, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{lifecycle, residence};
@@ -103,10 +103,7 @@ pub fn growth_update(sim: &mut Simulation) {
     sim.write::<GrowthCache>().zoned_lots = zoned_lots;
 }
 
-fn grow_zoned_lots(
-    sim: &mut Simulation,
-    zoned_lots: impl IntoIterator<Item = (LotID, ZoneCell)>,
-) {
+fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: impl IntoIterator<Item = (LotID, ZoneCell)>) {
     let mut candidates = {
         let (_, resources) = sim.world_res();
         let map = resources.read::<Map>();
@@ -130,34 +127,12 @@ fn grow_zoned_lots(
             if value <= 5.0 || !value.is_finite() {
                 continue;
             }
-            let Some(lot) = map.get(id).filter(|lot| map.get(lot.parent).is_some()) else {
+            let Some(lot) = map.get(id) else {
                 continue;
             };
-            let home = if cell.kind == ZoneKind::Residential {
-                residence::prototype(cell.density, 1)
-            } else {
-                None
-            };
-            let (kind, lot_size_min) = if let Some(proto) = home {
-                (BuildingKind::House, proto.lot_size_min)
-            } else if let Some(proto) = GrowableCompanyPrototype::iter().find(|proto| {
-                proto.growable
-                    && proto.zone_kind == cell.kind
-                    && proto.density == cell.density
-                    && proto.level == 1
-            }) {
-                (
-                    BuildingKind::GoodsCompany(proto.base.id),
-                    proto.lot_size_min,
-                )
-            } else {
+            let Some((kind, home)) = growable_for_lot(&map, lot, cell) else {
                 continue;
             };
-
-            let [width, depth] = lot.shape.axis();
-            if width.mag() * depth.mag() + 0.001 < lot_size_min {
-                continue;
-            }
             let center = lot.shape.center();
             let distance = *distances.entry(id).or_insert_with(|| {
                 if !scanned_off_center_buildings {
@@ -187,13 +162,20 @@ fn grow_zoned_lots(
         }
         std::mem::take(candidates)
     };
-    candidates.sort_unstable_by_key(|candidate| (candidate.zone, candidate.distance, candidate.lot));
+    candidates
+        .sort_unstable_by_key(|candidate| (candidate.zone, candidate.distance, candidate.lot));
 
     let mut current_zone = None;
     let mut remaining = 0;
     for GrowthCandidate {
-        zone, lot, kind, home, quota, ..
-    } in candidates.drain(..) {
+        zone,
+        lot,
+        kind,
+        home,
+        quota,
+        ..
+    } in candidates.drain(..)
+    {
         if current_zone != Some(zone) {
             current_zone = Some(zone);
             remaining = quota;
@@ -211,6 +193,36 @@ fn grow_zoned_lots(
         }
     }
     sim.write::<GrowthCache>().candidates = candidates;
+}
+
+/// The level-one growable that fits this lot's frontage, size, kind and density.
+pub fn growable_for_lot(
+    map: &Map,
+    lot: &Lot,
+    cell: ZoneCell,
+) -> Option<(BuildingKind, Option<&'static ResidencePrototype>)> {
+    map.get(lot.parent)?;
+    let home = if cell.kind == ZoneKind::Residential {
+        residence::prototype(cell.density, 1)
+    } else {
+        None
+    };
+    let (kind, lot_size_min) = if let Some(proto) = home {
+        (BuildingKind::House, proto.lot_size_min)
+    } else {
+        let proto = GrowableCompanyPrototype::iter().find(|proto| {
+            proto.growable
+                && proto.zone_kind == cell.kind
+                && proto.density == cell.density
+                && proto.level == 1
+        })?;
+        (
+            BuildingKind::GoodsCompany(proto.base.id),
+            proto.lot_size_min,
+        )
+    };
+    let [width, depth] = lot.shape.axis();
+    (width.mag() * depth.mag() + 0.001 >= lot_size_min).then_some((kind, home))
 }
 
 fn nearest_building_distance(
@@ -389,6 +401,98 @@ mod tests {
                     proto.density == Density::High && proto.zone_kind == zone && proto.level == 1
                 }),
                 "high-density {zone:?} lot did not grow"
+            );
+        }
+    }
+
+    fn grow_medium_zone(test: &mut TestCtx, kind: ZoneKind) {
+        test.apply(&[WorldCommand::ZonePaint {
+            area: OBB::new(vec2(250.0, 100.0), Vec2::X, 320.0, 140.0),
+            kind: Some(kind),
+            density: Density::Medium,
+        }]);
+        test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL - 1;
+        let (world, resources) = test.g.world_res();
+        crate::economy::demand_update(world, resources);
+        test.g.write::<ZoneDemand>().values.insert(kind, 15.0);
+        test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;
+        growth_update(&mut test.g);
+    }
+
+    #[test]
+    fn u1_zone_growth_uses_medium_prototypes_for_all_kinds() {
+        for (kind, name) in [
+            (ZoneKind::Residential, "residence-medium-l1"),
+            (ZoneKind::Commercial, "commercial-medium-l1"),
+            (ZoneKind::Industrial, "industrial-medium-l1"),
+            (ZoneKind::Office, "office-medium-l1"),
+        ] {
+            let mut test = street();
+            grow_medium_zone(&mut test, kind);
+            let map = test.g.map();
+            let building = map
+                .buildings()
+                .values()
+                .find(|building| map.lot_origin(building.id).is_some())
+                .unwrap_or_else(|| panic!("Medium {kind:?} lot did not grow"));
+            if kind == ZoneKind::Residential {
+                let residences = test.g.read::<residence::Residences>();
+                let home = &residences.by_building[&building.id];
+                assert_eq!(home.prototype, prototypes::ResidencePrototypeID::new(name));
+                assert_eq!(
+                    (home.density, home.level, home.capacity),
+                    (Density::Medium, 1, 3)
+                );
+            } else {
+                assert_eq!(
+                    building.kind,
+                    BuildingKind::GoodsCompany(GoodsCompanyID::new(name))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn u1_zone_medium_residence_upgrades_at_same_density() {
+        let mut test = street();
+        grow_medium_zone(&mut test, ZoneKind::Residential);
+        let house = *test
+            .g
+            .read::<residence::Residences>()
+            .by_building
+            .keys()
+            .next()
+            .expect("Medium residence should grow before upgrading");
+        let lot = test.g.map().lots().keys().next().unwrap();
+        let store = place_store(&test.g, lot);
+        residential_demand(&test.g, 40.0);
+        serve_house(&mut test.g, house);
+        for kind in [ServiceKind::School, ServiceKind::Health] {
+            test.g
+                .write::<CoverageGrid>()
+                .by_kind
+                .entry(kind)
+                .or_default()
+                .insert(house, 100.0);
+        }
+        test.g.write::<GameTime>().tick.0 =
+            GROWTH_INTERVAL + crate::map_dynamic::EnvGrid::UPDATE_OFFSET;
+        crate::map_dynamic::env_update(&mut test.g);
+        for (capacity, level, next_capacity) in [(3, 2, 6), (6, 3, 9)] {
+            while test.g.world().humans.len() < capacity {
+                crate::souls::human::spawn_human(&mut test.g, house).unwrap();
+            }
+            for human in test.g.world_mut_unchecked().humans.values_mut() {
+                human.work = Some(Work::new(store, WorkKind::Worker, 0.0));
+            }
+            for _ in 0..6 {
+                hourly_check(&mut test.g);
+            }
+            let residences = test.g.read::<residence::Residences>();
+            let home = &residences.by_building[&house];
+            assert_eq!(
+                (home.density, home.level, home.capacity),
+                (Density::Medium, level, next_capacity)
             );
         }
     }

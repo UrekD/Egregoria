@@ -1,4 +1,4 @@
-use crate::gui::zoning::zone_color;
+use crate::gui::zoning::{zone_cell_color, zone_color};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::MapRenderOptions;
 use common::FastMap;
@@ -16,8 +16,10 @@ use prototypes::{
 use simulation::map::{
     Building, BuildingKind, CanonicalPosition, Environment, Intersection, LaneKind, Lanes, LotKind,
     Map, MapSubscriber, ProjectFilter, ProjectKind, PylonPosition, Road, Roads, SubscriberChunkID,
-    Turn, TurnKind, UpdateType, ZoneGrid, ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET,
+    Turn, TurnKind, UpdateType, ZoneCell, ZoneGrid, ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET,
+    ZONE_CELL_SIZE,
 };
+use simulation::souls::growth::growable_for_lot;
 use simulation::Simulation;
 use std::ops::{Mul, Neg};
 use std::sync::Arc;
@@ -63,19 +65,29 @@ struct MapBuilders {
 }
 
 impl super::MapRenderer {
-    /// Reads the current zone grid so paint, regenerated lots and loads need no cache invalidation.
-    pub fn draw_zone_lots(
+    pub fn draw_zoning_overlay(
         sim: &Simulation,
         draw: &mut ImmediateDraw,
         center: Vec2,
-        radius: f32,
-        show_unzoned: bool,
+        distance: f32,
+        editing: bool,
     ) {
         let zones = sim.read::<ZoneGrid>();
-        if !show_unzoned && zones.cells.is_empty() {
+        if !editing && zones.cells.is_empty() {
             return;
         }
         let map = sim.map();
+        let radius = distance * 1.5;
+        if editing {
+            draw_painted_cells(
+                &map.environment,
+                draw,
+                &zones,
+                center,
+                radius,
+                distance >= 900.0,
+            );
+        }
         for project in map
             .spatial_map()
             .query_around(center, radius, ProjectFilter::LOT)
@@ -84,15 +96,117 @@ impl super::MapRenderer {
                 continue;
             };
             let lot = &map.lots()[id];
-            let Some(color) = zones
-                .lot_zone(&lot.shape)
-                .map(|zone| zone_color(zone.kind).a(0.65))
-                .or_else(|| show_unzoned.then(|| LinearColor::gray(0.38).a(0.65)))
-            else {
-                continue;
-            };
-            draw.obb(lot.shape, lot.height + 0.32).color(color);
+            let zone = zones.lot_zone(&lot.shape);
+            if editing {
+                let eligible = zone.is_some_and(|zone| growable_for_lot(&map, lot, zone).is_some());
+                let (width, color) = if eligible {
+                    (0.8, LinearColor::WHITE.a(0.88))
+                } else {
+                    (0.4, LinearColor::gray(0.68).a(0.55))
+                };
+                let corners = lot.shape.corners.map(|corner| {
+                    corner.z(map.environment.height(corner).unwrap_or(lot.height) + 0.85)
+                });
+                let [a, b, c, d] = corners;
+                draw.polyline(vec![a, b, c, d, a], width, true).color(color);
+            } else if let Some(zone) = zone {
+                draw.obb(lot.shape, lot.height + 0.32)
+                    .color(zone_color(zone.kind).a(0.65));
+            }
         }
+    }
+}
+
+fn draw_painted_cells(
+    terrain: &Environment,
+    draw: &mut ImmediateDraw,
+    zones: &ZoneGrid,
+    center: Vec2,
+    radius: f32,
+    merge: bool,
+) {
+    let min = ((center - Vec2::splat(radius)) / ZONE_CELL_SIZE).floor();
+    let max = ((center + Vec2::splat(radius)) / ZONE_CELL_SIZE).floor();
+    let visible = zones
+        .cells
+        .range((min.x as i32, i32::MIN)..=(max.x as i32, i32::MAX))
+        .filter(|&(&(_, y), _)| (min.y as i32..=max.y as i32).contains(&y))
+        .map(|(&pos, &cell)| (pos, cell));
+
+    let inset = if merge { 0.08 } else { 0.24 };
+    for ((x, start), end, zone) in zone_runs(visible, merge) {
+        let x = (x as f32 + 0.5) * ZONE_CELL_SIZE;
+        let first = start as f32 * ZONE_CELL_SIZE + inset;
+        let last = (end as f32 + 1.0) * ZONE_CELL_SIZE - inset;
+        let points = std::iter::once(first)
+            .chain((start + 1..=end).map(|y| y as f32 * ZONE_CELL_SIZE))
+            .chain(std::iter::once(last))
+            .filter_map(|y| {
+                let pos = vec2(x, y);
+                Some(pos.z(terrain.height(pos)? + 0.55))
+            })
+            .collect::<Vec<_>>();
+        draw.polyline(points, ZONE_CELL_SIZE - 2.0 * inset, false)
+            .color(zone_cell_color(zone.kind, zone.density).a(0.88));
+    }
+}
+
+// The grid is ordered by column, so a run only joins consecutive equal cells in that column.
+fn zone_runs(
+    cells: impl Iterator<Item = ((i32, i32), ZoneCell)>,
+    merge: bool,
+) -> impl Iterator<Item = ((i32, i32), i32, ZoneCell)> {
+    let mut cells = cells.peekable();
+    std::iter::from_fn(move || {
+        let ((x, start), zone) = cells.next()?;
+        let mut end = start;
+        if merge {
+            while cells.next_if_eq(&((x, end + 1), zone)).is_some() {
+                end += 1;
+            }
+        }
+        Some(((x, start), end, zone))
+    })
+}
+
+#[cfg(test)]
+mod zoning_tests {
+    use super::*;
+    use simulation::map::Density;
+
+    #[test]
+    fn u1_zoning_overview_batches_only_matching_neighbors() {
+        let low = ZoneCell {
+            kind: ZoneKind::Residential,
+            density: Density::Low,
+        };
+        let medium = ZoneCell {
+            density: Density::Medium,
+            ..low
+        };
+        let office = ZoneCell {
+            kind: ZoneKind::Office,
+            ..medium
+        };
+        let cells = [
+            ((0, 0), low),
+            ((0, 1), low),
+            ((0, 2), medium),
+            ((0, 3), office),
+            ((0, 5), office),
+            ((1, 0), office),
+        ];
+        assert_eq!(
+            zone_runs(cells.into_iter(), true).collect::<Vec<_>>(),
+            [
+                ((0, 0), 1, low),
+                ((0, 2), 2, medium),
+                ((0, 3), 3, office),
+                ((0, 5), 5, office),
+                ((1, 0), 0, office),
+            ]
+        );
+        assert_eq!(zone_runs(cells.into_iter(), false).count(), cells.len());
     }
 }
 
