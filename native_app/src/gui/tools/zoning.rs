@@ -61,6 +61,14 @@ impl Default for ZoningState {
     }
 }
 
+impl ZoningState {
+    pub(crate) fn cancel_gesture(&mut self) {
+        self.drag_start = None;
+        self.last_brush = None;
+        self.over_controls = false;
+    }
+}
+
 pub fn properties(uiworld: &UiWorld) {
     let mut state = uiworld.write::<ZoningState>();
     state.over_controls = is_hovered(|| {
@@ -133,11 +141,7 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         state.last_brush = None;
         return;
     };
-    if !active
-        || state.over_controls
-        || input.just_act.contains(&InputAction::Close)
-        || input.act.contains(&InputAction::CameraRotate)
-    {
+    if !active || state.over_controls || input.act.contains(&InputAction::CameraRotate) {
         state.drag_start = None;
         state.last_brush = None;
         state.over_controls &= active;

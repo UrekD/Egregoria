@@ -7,8 +7,7 @@ use std::time::Instant;
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use common::history::History;
 use common::saveload::{self, SlotId};
-use engine::input::Key;
-use engine::{Context, FrameContext, MeshBuilder};
+use engine::{Context, FrameContext, InputContext, MeshBuilder};
 use geom::{vec2, vec3, Camera, LinearColor, AABB};
 use simulation::Simulation;
 
@@ -49,7 +48,6 @@ pub struct State {
     immediate_renderer: MeshBuilder<true>,
     automation: Option<Automation>,
     startup: Option<Receiver<Result<StartupWorld, String>>>,
-    escape_down: bool,
     dormant_script_state: Option<(u64, BTreeMap<String, u64>)>,
 
     all_audio: GameAudio,
@@ -124,7 +122,6 @@ impl engine::framework::State for State {
             immediate_renderer: MeshBuilder::new(ctx.gfx.tess_material),
             automation,
             startup,
-            escape_down: false,
             dormant_script_state: None,
         };
         me.sim.write().unwrap().map().dispatch_all();
@@ -290,12 +287,15 @@ impl engine::framework::State for State {
         if self.automation.is_some() {
             crate::automation::fail("window closed before the script finished");
         }
-        if self.uiw.read::<SaveLoadState>().exit_requested || !session::playing(&self.uiw) {
-            return true;
+        if !self.uiw.read::<SaveLoadState>().exit_requested {
+            if session::playing(&self.uiw) {
+                let sim = self.sim.read().unwrap();
+                session::request_departure(&self.uiw, &sim, Departure::Exit);
+            } else {
+                session::finish_departure(&self.uiw, Departure::Exit);
+            }
         }
-        let sim = self.sim.read().unwrap();
-        session::request_departure(&self.uiw, &sim, Departure::Exit);
-        self.uiw.read::<SaveLoadState>().exit_requested
+        ready_to_exit(&self.uiw)
     }
 
     fn render_gui(&mut self, ui: &egui::Context) {
@@ -328,7 +328,12 @@ impl State {
     fn step_session(&mut self, ctx: &mut Context) -> bool {
         self.check_dormant_script_state();
         if self.uiw.read::<SaveLoadState>().exit_requested {
-            ctx.request_exit();
+            // The worker reports completion after it has published or cleaned up staging files.
+            self.poll_save();
+            if ready_to_exit(&self.uiw) {
+                ctx.request_exit();
+            }
+            self.uiw.write::<SessionState>().interaction_blocked = true;
             return false;
         }
         if self.poll_startup(ctx) {
@@ -345,7 +350,7 @@ impl State {
         self.delete_slot();
         self.uiw.write::<SessionState>().poll_slot_scan();
         if self.automation.is_none() {
-            self.update_pause_key(ctx);
+            self.route_close_input(ctx);
         }
         if std::mem::take(&mut self.uiw.write::<SessionState>().replay_requested) {
             let sim = self.sim.read().unwrap();
@@ -379,7 +384,7 @@ impl State {
                 }
                 Err(error) => crate::automation::fail(&error),
             }
-            self.update_pause_key(ctx);
+            self.route_close_input(ctx);
             let open_save_as = self
                 .uiw
                 .write::<GuiState>()
@@ -400,17 +405,13 @@ impl State {
         true
     }
 
-    fn update_pause_key(&mut self, ctx: &Context) {
-        let down = ctx.input.keyboard.pressed.contains(&Key::Escape);
-        if down
-            && !self.escape_down
-            && !session::cancel_generation(&self.uiw)
-            && !ctx.egui.last_kb_captured
-            && self.uiw.read::<KeybindState>().enabled.is_none()
-        {
-            session::close_modal(&self.uiw);
-        }
-        self.escape_down = down;
+    fn route_close_input(&self, ctx: &Context) {
+        route_close_input(
+            &self.uiw,
+            &ctx.input,
+            ctx.egui.last_kb_captured,
+            ctx.egui.last_mouse_captured,
+        );
     }
 
     /// All scripts using session screens verify that the dormant city is immutable.
@@ -874,6 +875,100 @@ impl State {
             x.skip_depth = true;
             ctx.draw(x)
         }
+    }
+}
+
+fn route_close_input(
+    uiw: &UiWorld,
+    input: &InputContext,
+    keyboard_captured: bool,
+    mouse_captured: bool,
+) {
+    let keyboard = !keyboard_captured || session::world_job_active(uiw);
+    let pressed = uiw
+        .write::<InputMap>()
+        .close_pressed(input, keyboard, !mouse_captured);
+    if pressed && uiw.read::<KeybindState>().enabled.is_none() {
+        session::close_modal(uiw);
+    }
+}
+
+fn ready_to_exit(uiw: &UiWorld) -> bool {
+    let io = uiw.read::<SaveLoadState>();
+    io.exit_requested && io.save_result.is_none()
+}
+
+#[cfg(test)]
+mod p4_fix_esc_tests {
+    use super::*;
+    use crate::inputmap::{InputCombination, UnitInput};
+    use engine::input::Key;
+
+    fn playing_ui() -> UiWorld {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        UiWorld::with_defaults()
+    }
+
+    #[test]
+    fn p4_fix_esc_rebound_close_and_held_press_across_pause() {
+        let uiw = playing_ui();
+        let key = Key::c("Q");
+        let mut binding = InputCombination::default();
+        binding.push_unique(UnitInput::Key(key.clone()));
+        let mut bindings = Bindings::default();
+        bindings.0.get_mut(&InputAction::Close).unwrap().0 = vec![binding];
+        uiw.write::<InputMap>().build_input_tree(&mut bindings);
+
+        let mut input = InputContext::default();
+        input.keyboard.pressed.insert(key.clone());
+        route_close_input(&uiw, &input, true, false);
+        assert!(!uiw.read::<SessionState>().paused);
+        route_close_input(&uiw, &input, false, false);
+        assert!(!uiw.read::<SessionState>().paused);
+        input.keyboard.pressed.clear();
+        route_close_input(&uiw, &input, false, false);
+        input.keyboard.pressed.insert(Key::Escape);
+        route_close_input(&uiw, &input, false, false);
+        assert!(!uiw.read::<SessionState>().paused);
+        input.keyboard.pressed.clear();
+        input.keyboard.pressed.insert(key.clone());
+        route_close_input(&uiw, &input, false, false);
+        assert!(uiw.read::<SessionState>().paused);
+        route_close_input(&uiw, &input, false, false);
+        assert!(uiw.read::<SessionState>().paused);
+        input.keyboard.pressed.clear();
+        route_close_input(&uiw, &input, false, false);
+        input.keyboard.pressed.insert(key);
+        route_close_input(&uiw, &input, false, false);
+        assert!(!uiw.read::<SessionState>().paused);
+    }
+
+    #[test]
+    fn p4_fix_esc_quit_waits_for_in_flight_autosave() {
+        let uiw = playing_ui();
+        let (sender, result) = mpsc::channel();
+        session::finish_departure(&uiw, Departure::Exit);
+        uiw.write::<SaveLoadState>().save_result = Some(SaveInFlight {
+            id: 1,
+            request: SaveRequest {
+                slot: SlotId::autosave(0),
+                name: "City".into(),
+                kind: SaveKind::Autosave,
+            },
+            result,
+        });
+        assert!(!ready_to_exit(&uiw));
+        sender.send(Err("test save result".into())).unwrap();
+        uiw.write::<SaveLoadState>()
+            .save_result
+            .take()
+            .unwrap()
+            .result
+            .try_recv()
+            .unwrap()
+            .unwrap_err();
+        assert!(ready_to_exit(&uiw));
     }
 }
 

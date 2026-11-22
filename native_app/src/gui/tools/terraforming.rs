@@ -17,6 +17,14 @@ pub struct TerraformingResource {
     slope_end: Option<Vec3>,
 }
 
+impl TerraformingResource {
+    pub(crate) fn cancel_gesture(&mut self) {
+        self.level = None;
+        self.slope_start = None;
+        self.slope_end = None;
+    }
+}
+
 /// Lot brush tool
 /// Allows to build houses on lots
 pub fn terraforming(sim: &Simulation, uiworld: &UiWorld) {
@@ -29,8 +37,7 @@ pub fn terraforming(sim: &Simulation, uiworld: &UiWorld) {
     let commands = &mut *uiworld.commands();
 
     if !matches!(tool, Tool::Terraforming) {
-        res.slope_start = None;
-        res.slope_end = None;
+        res.cancel_gesture();
         return;
     }
 
@@ -77,11 +84,6 @@ pub fn terraforming(sim: &Simulation, uiworld: &UiWorld) {
             // Set the start slope (first click)
             if res.slope_start.is_none() && inp.just_act.contains(&InputAction::Select) {
                 res.slope_start = Some(mpos);
-            }
-
-            if inp.just_act.contains(&InputAction::Close) {
-                res.slope_start = None;
-                res.slope_end = None;
             }
         }
         TerraformKind::Erode => {}

@@ -14,7 +14,14 @@ use simulation::world_command::CommandOutcomes;
 use simulation::{Simulation, SimulationReplayLoader};
 
 use crate::game_loop::VERSION;
-use crate::gui::{ExitState, GuiState};
+use crate::gui::bulldozer::BulldozerState;
+use crate::gui::follow::FollowEntity;
+use crate::gui::roadbuild::RoadBuildResource;
+use crate::gui::terraforming::TerraformingResource;
+use crate::gui::zoning::ZoningState;
+use crate::gui::{
+    ExitState, GuiState, InspectedBuilding, InspectedEntity, PotentialCommands, Tool,
+};
 use crate::inputmap::InputMap;
 use crate::network::NetworkState;
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
@@ -227,6 +234,9 @@ fn continue_slot<T>(slots: &[(T, SlotCompatibility)]) -> Option<&T> {
 }
 
 pub(crate) fn continue_entry(uiw: &UiWorld) -> Option<SlotEntry> {
+    if !crate::network::is_singleplayer(uiw) {
+        return None;
+    }
     continue_slot(&uiw.read::<SessionState>().slots).cloned()
 }
 
@@ -413,10 +423,14 @@ pub(crate) fn reset_interaction(uiw: &UiWorld) {
 }
 
 pub(crate) fn set_paused(uiw: &UiWorld, paused: bool) {
-    uiw.write::<SessionState>().paused = paused;
+    let was_paused = std::mem::replace(&mut uiw.write::<SessionState>().paused, paused);
+    if was_paused && !paused {
+        uiw.write::<GuiState>().last_save = Instant::now();
+    }
     reset_interaction(uiw);
 }
 
+/// Close the current interaction before falling back to the pause menu.
 pub(crate) fn close_modal(uiw: &UiWorld) {
     let mut session = uiw.write::<SessionState>();
     if let Some(departure) = session.departure {
@@ -435,24 +449,71 @@ pub(crate) fn close_modal(uiw: &UiWorld) {
         cancel_generation(uiw);
         return;
     }
-    let mut ui = uiw.write::<SessionUi>();
-    if ui.save_as.take().is_some()
-        || ui.delete.take().is_some()
-        || std::mem::take(&mut ui.settings_open)
-    {
-        drop(ui);
+    let closed_session_window = {
+        let mut ui = uiw.write::<SessionUi>();
+        ui.save_as.take().is_some()
+            || ui.delete.take().is_some()
+            || std::mem::take(&mut ui.settings_open)
+    };
+    if closed_session_window {
         reset_interaction(uiw);
     } else if playing(uiw) && uiw.read::<SaveLoadState>().replay.is_none() {
-        drop(ui);
-        let paused = uiw.read::<SessionState>().paused;
-        set_paused(uiw, !paused);
+        if uiw.read::<SessionState>().paused {
+            set_paused(uiw, false);
+        } else if close_world_interaction(uiw) {
+            uiw.write::<InputMap>().require_fresh_pointer_press();
+        } else {
+            set_paused(uiw, true);
+        }
+    } else if uiw
+        .write::<SaveLoadState>()
+        .startup_message
+        .take()
+        .is_some()
+    {
+        reset_interaction(uiw);
     } else if matches!(
         *uiw.read::<SessionScreen>(),
         SessionScreen::LoadGame | SessionScreen::NewGame
     ) {
-        drop(ui);
         back(uiw);
     }
+}
+
+fn close_world_interaction(uiw: &UiWorld) -> bool {
+    let mut tool = uiw.write::<Tool>();
+    if *tool != Tool::Hand {
+        let keep_road_tool =
+            tool.is_roadbuild() && uiw.write::<RoadBuildResource>().cancel_placement();
+        if !keep_road_tool {
+            match *tool {
+                Tool::Bulldozer => uiw.write::<BulldozerState>().reset_gesture(),
+                Tool::Terraforming => uiw.write::<TerraformingResource>().cancel_gesture(),
+                Tool::Zoning => uiw.write::<ZoningState>().cancel_gesture(),
+                _ => {}
+            }
+            *tool = Tool::Hand;
+        }
+        uiw.write::<PotentialCommands>().0.clear();
+        return true;
+    }
+    drop(tool);
+
+    let entity = uiw.write::<InspectedEntity>().e.take().is_some();
+    let building = uiw.write::<InspectedBuilding>().e.take().is_some();
+    let following = uiw.write::<FollowEntity>().0.take().is_some();
+    if entity || building || following || crate::gui::chat::close(uiw) {
+        return true;
+    }
+
+    let mut gui = uiw.write::<GuiState>();
+    gui.windows.close_open_window()
+        || std::mem::take(&mut gui.debug_window)
+        || uiw
+            .write::<SaveLoadState>()
+            .startup_message
+            .take()
+            .is_some()
 }
 
 pub(crate) fn back(uiw: &UiWorld) {
@@ -694,6 +755,9 @@ pub fn set_screen(uiw: &UiWorld, screen: SessionScreen) -> bool {
         if screen == SessionScreen::NewGame {
             ui.new_game = new_game::NewGameForm::fresh();
         }
+        if screen == SessionScreen::Playing {
+            uiw.write::<GuiState>().last_save = Instant::now();
+        }
         reset_interaction(uiw);
         *uiw.commands() = Default::default();
         *uiw.write::<ReceivedCommands>() = Default::default();
@@ -768,6 +832,179 @@ pub fn apply_world_replacement(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod p4_fix_esc_tests {
+    use super::*;
+    use crate::gui::bulldozer::BulldozerState;
+    use crate::gui::follow::FollowEntity;
+    use crate::gui::roadbuild::{BuildState, RoadBuildResource};
+    use crate::gui::terraforming::TerraformingResource;
+    use crate::gui::zoning::ZoningState;
+    use crate::gui::{InspectedBuilding, InspectedEntity, Tool};
+    use crate::inputmap::{Bindings, InputAction};
+    use engine::{InputContext, MouseButton};
+    use geom::Vec3;
+    use simulation::map::MapProject;
+    use simulation::AnyEntity;
+
+    fn playing_ui() -> UiWorld {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        UiWorld::with_defaults()
+    }
+
+    #[test]
+    fn p4_fix_esc_idle_pauses_and_paused_resumes() {
+        let uiw = playing_ui();
+        close_modal(&uiw);
+        assert!(uiw.read::<SessionState>().paused);
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+    }
+
+    #[test]
+    fn p4_fix_esc_road_placement_then_tool_then_pause() {
+        let uiw = playing_ui();
+        *uiw.write::<Tool>() = Tool::RoadbuildStraight;
+        uiw.write::<RoadBuildResource>().build_state =
+            BuildState::Start(MapProject::ground(Vec3::ZERO));
+
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(matches!(
+            uiw.read::<RoadBuildResource>().build_state,
+            BuildState::Hover
+        ));
+        assert!(*uiw.read::<Tool>() == Tool::RoadbuildStraight);
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(*uiw.read::<Tool>() == Tool::Hand);
+        close_modal(&uiw);
+        assert!(uiw.read::<SessionState>().paused);
+    }
+
+    #[test]
+    fn p4_fix_esc_cancels_active_tool() {
+        let uiw = playing_ui();
+        *uiw.write::<Tool>() = Tool::SpecialBuilding;
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(*uiw.read::<Tool>() == Tool::Hand);
+    }
+
+    #[test]
+    fn p4_fix_esc_cancels_zoning_drag() {
+        let uiw = playing_ui();
+        *uiw.write::<Tool>() = Tool::Zoning;
+        uiw.write::<ZoningState>().start_test_gesture();
+        let mut input = InputContext::default();
+        input.mouse.pressed.insert(MouseButton::Left);
+        input.keyboard.pressed.insert(engine::Key::c("E"));
+        {
+            let mut actions = uiw.write::<InputMap>();
+            actions.build_input_tree(&mut Bindings::default());
+            actions.prepare_frame(&input, true, true);
+            assert!(actions.just_act.contains(&InputAction::OpenEconomyMenu));
+        }
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(uiw.read::<ZoningState>().gesture_is_clear());
+        assert!(*uiw.read::<Tool>() == Tool::Hand);
+
+        let mut actions = uiw.write::<InputMap>();
+        actions.prepare_frame(&input, true, true);
+        assert!(!actions.act.contains(&InputAction::Select));
+        assert!(!actions.just_act.contains(&InputAction::OpenEconomyMenu));
+        input.mouse.pressed.clear();
+        actions.observe_pointer_buttons(false);
+        actions.prepare_frame(&input, true, true);
+        input.mouse.pressed.insert(MouseButton::Left);
+        actions.prepare_frame(&input, true, true);
+        assert!(actions.just_act.contains(&InputAction::Select));
+    }
+
+    #[test]
+    fn p4_fix_esc_cancels_terraforming_drag() {
+        let uiw = playing_ui();
+        *uiw.write::<Tool>() = Tool::Terraforming;
+        uiw.write::<TerraformingResource>().start_test_gesture();
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(uiw.read::<TerraformingResource>().gesture_is_clear());
+        assert!(*uiw.read::<Tool>() == Tool::Hand);
+    }
+
+    #[test]
+    fn p4_fix_esc_cancels_bulldozer_drag() {
+        let uiw = playing_ui();
+        *uiw.write::<Tool>() = Tool::Bulldozer;
+        uiw.write::<BulldozerState>().start_test_gesture();
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(uiw.read::<BulldozerState>().gesture_is_clear());
+        assert!(*uiw.read::<Tool>() == Tool::Hand);
+    }
+
+    #[test]
+    fn p4_fix_esc_clears_selection() {
+        let uiw = playing_ui();
+        uiw.write::<InspectedEntity>().e = Some(AnyEntity::VehicleID(Default::default()));
+        uiw.write::<InspectedBuilding>().e = Some(Default::default());
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(uiw.read::<InspectedEntity>().e.is_none());
+        assert!(uiw.read::<InspectedBuilding>().e.is_none());
+    }
+
+    #[test]
+    fn p4_fix_esc_stops_following() {
+        let uiw = playing_ui();
+        uiw.write::<FollowEntity>().0 = Some(AnyEntity::VehicleID(Default::default()));
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(uiw.read::<FollowEntity>().0.is_none());
+    }
+
+    #[test]
+    fn p4_fix_esc_dismisses_open_window_before_pause() {
+        let uiw = playing_ui();
+        let window_states = || {
+            let mut gui = uiw.write::<GuiState>();
+            gui.windows
+                .window_states()
+                .filter_map(|(name, open)| open.then_some(name))
+                .collect::<Vec<_>>()
+        };
+        for (name, open) in uiw.write::<GuiState>().windows.window_states() {
+            *open = matches!(name, "Economy" | "Settings");
+        }
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert_eq!(window_states(), ["Economy"]);
+        close_modal(&uiw);
+        assert!(!uiw.read::<SessionState>().paused);
+        assert!(window_states().is_empty());
+        close_modal(&uiw);
+        assert!(uiw.read::<SessionState>().paused);
+    }
+
+    #[test]
+    fn p4_fix_esc_restarts_autosave_interval_when_play_resumes() {
+        let uiw = playing_ui();
+        let old = Instant::now() - Duration::from_secs(3600);
+
+        set_paused(&uiw, true);
+        uiw.write::<GuiState>().last_save = old;
+        close_modal(&uiw);
+        assert!(uiw.read::<GuiState>().last_save > old);
+
+        set_screen(&uiw, SessionScreen::MainMenu);
+        uiw.write::<GuiState>().last_save = old;
+        set_screen(&uiw, SessionScreen::Playing);
+        assert!(uiw.read::<GuiState>().last_save > old);
+    }
+}
 
 #[cfg(test)]
 #[test]

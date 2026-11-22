@@ -73,6 +73,7 @@ pub struct InputMap {
     pub screen: Vec2,
     input_tree: InputTree,
     require_pointer_release: bool,
+    close_down: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -147,6 +148,10 @@ impl InputMap {
         self.ray = None;
         self.unprojected = None;
         self.unprojected_normal = None;
+        self.require_fresh_pointer_press();
+    }
+
+    pub(crate) fn require_fresh_pointer_press(&mut self) {
         self.require_pointer_release = true;
     }
 
@@ -192,24 +197,48 @@ impl InputMap {
         self.require_pointer_release &= held;
     }
 
-    pub fn prepare_frame(&mut self, input: &InputContext, kb: bool, mouse: bool) {
-        let mouse = mouse && !self.require_pointer_release;
-        self.just_act.clear();
+    fn actions(
+        &self,
+        input: &InputContext,
+        kb: bool,
+        mouse: bool,
+    ) -> impl Iterator<Item = InputAction> + '_ {
         let empty1 = FastSet::default();
         let empty2 = FastSet::default();
         let empty3 = FastSet::default();
+        self.input_tree.query(
+            if kb { &input.keyboard.pressed } else { &empty1 },
+            if kb {
+                &input.keyboard.pressed_scancode
+            } else {
+                &empty2
+            },
+            if mouse { &input.mouse.pressed } else { &empty3 },
+            if mouse { input.mouse.wheel_delta } else { 0.0 },
+        )
+    }
+
+    /// Track the binding across world-input resets and menu transitions.
+    pub(crate) fn close_pressed(&mut self, input: &InputContext, kb: bool, mouse: bool) -> bool {
+        let inputs_held = !input.keyboard.pressed.is_empty()
+            || !input.keyboard.pressed_scancode.is_empty()
+            || !input.mouse.pressed.is_empty()
+            || input.mouse.wheel_delta != 0.0;
+        let down = inputs_held
+            && self
+                .actions(input, true, true)
+                .any(|action| action == Close);
+        let was_down = std::mem::replace(&mut self.close_down, down);
+        down && !was_down
+            && ((kb && mouse) || self.actions(input, kb, mouse).any(|action| action == Close))
+    }
+
+    pub fn prepare_frame(&mut self, input: &InputContext, kb: bool, mouse: bool) {
+        let mouse = mouse && !self.require_pointer_release;
+        self.just_act.clear();
         let mut acts: FastSet<_> = self
-            .input_tree
-            .query(
-                if kb { &input.keyboard.pressed } else { &empty1 },
-                if kb {
-                    &input.keyboard.pressed_scancode
-                } else {
-                    &empty2
-                },
-                if mouse { &input.mouse.pressed } else { &empty3 },
-                if mouse { input.mouse.wheel_delta } else { 0.0 },
-            )
+            .actions(input, kb, mouse)
+            .filter(|action| *action != Close)
             .collect();
         std::mem::swap(&mut self.act, &mut acts);
         for v in &self.act {

@@ -15,7 +15,6 @@ use crate::gui::bulldozer::BulldozerState;
 use crate::gui::textures::UiTextures;
 use crate::gui::windows::settings::Settings;
 use crate::gui::Tool;
-use crate::inputmap::{InputAction, InputMap};
 use crate::uiworld::UiWorld;
 
 pub mod building;
@@ -26,14 +25,6 @@ pub mod train;
 pub(crate) mod transit;
 
 pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
-    if uiworld
-        .read::<InputMap>()
-        .just_act
-        .contains(&InputAction::Close)
-    {
-        *uiworld.write::<Tool>() = Tool::Hand;
-    }
-
     reflow(Alignment::TOP_LEFT, Pivot::TOP_LEFT, Dim2::ZERO, || {
         constrained_viewport(|| {
             let mut l = List::column();

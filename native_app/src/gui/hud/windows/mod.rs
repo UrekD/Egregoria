@@ -54,13 +54,8 @@ impl GUIWindows {
             self.settings_open ^= true;
         }
 
-        if crate::network::is_singleplayer(uiw) {
-            if button_primary("Load").show().clicked {
-                session::request_departure(uiw, sim, Departure::Screen(SessionScreen::LoadGame));
-            }
-            if button_primary("Back").show().clicked {
-                session::request_departure(uiw, sim, Departure::Screen(SessionScreen::MainMenu));
-            }
+        if crate::network::is_singleplayer(uiw) && button_primary("Exit to menu").show().clicked {
+            session::request_departure(uiw, sim, Departure::Screen(SessionScreen::MainMenu));
         }
 
         #[cfg(feature = "multiplayer")]
@@ -133,15 +128,23 @@ impl GUIWindows {
         settings::settings(uiw, sim, &mut self.settings_open);
     }
 
+    pub(crate) fn close_open_window(&mut self) -> bool {
+        if let Some((_, open)) = self.window_states().filter(|(_, open)| **open).last() {
+            *open = false;
+            return true;
+        }
+        false
+    }
+
     pub(crate) fn window_states(&mut self) -> impl Iterator<Item = (&'static str, &mut bool)> {
         [
             ("Economy", &mut self.economy_open),
             ("Budget", &mut self.budget_open),
             ("City Stats", &mut self.citystats_open),
+            ("Transit", &mut self.transit_lines_open),
             ("Settings", &mut self.settings_open),
             ("Save As", &mut self.save_as_open),
             ("Advisor", &mut self.advisor_open),
-            ("Transit", &mut self.transit_lines_open),
             #[cfg(feature = "multiplayer")]
             ("Network", &mut self.network_open),
         ]
