@@ -20,6 +20,7 @@ mod service;
 pub use service::{transit_board_update, transit_dispatch_update};
 
 pub(crate) const WAIT_NOT_STARTED: Tick = Tick(u64::MAX);
+pub const GIVE_UP_TICKS: u64 = 2 * prototypes::TICKS_PER_HOUR;
 const STOP_RECHECK_TICKS: u64 = 600;
 const SUSPENSION_HISTORY_LIMIT: usize = 256;
 
@@ -137,11 +138,21 @@ impl Transit {
             .filter(|run| run.line == line)
             .take(info.target_vehicles as usize)
             .count() as u64;
-        let times = self.leg_times.get(&line)?;
+        let (times, dwell) = self.directed_leg_times(line)?;
         (buses > 0).then(|| {
-            let loop_ticks = times.iter().sum::<u64>() + times.len() as u64 * service::DWELL_TICKS;
+            let loop_ticks = times.iter().sum::<u64>() + times.len() as u64 * dwell;
             loop_ticks.div_ceil(buses)
         })
+    }
+
+    /// Estimated elapsed ticks for the directed legs in stop order, and the stop dwell.
+    pub fn directed_leg_times(&self, line: LineID) -> Option<(&[u64], u64)> {
+        let count = self.lines.get(line)?.stops.len();
+        let times = self
+            .leg_times
+            .get(&line)
+            .filter(|times| times.len() == count)?;
+        Some((times, service::DWELL_TICKS))
     }
 
     /// Whether this line may be considered when (re)planning the human's current trip.

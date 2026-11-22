@@ -1,4 +1,4 @@
-use crate::economy::{on_arrival, on_cancel, on_start, TripMode};
+use crate::economy::{on_arrival, on_cancel, on_start, TripMode, TripProgress};
 use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::transit::{elapsed_ticks, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
@@ -19,9 +19,9 @@ use slotmapd::HopSlotMap;
 
 #[path = "transit_path.rs"]
 mod transit_path;
-use transit_path::{legacy_cost, TransitPaths, HEADWAY_MULTIPLIER};
+use transit_path::{legacy_cost, TransitPaths, ValidatedWalk};
 
-const PERSONAL_CAR_ACCESS_RADIUS: f32 = 300.0;
+const PERSONAL_CAR_ACCESS_RADIUS: f32 = 4.0 * NEAR_PARKING_RADIUS;
 
 #[derive(Inspect, Serialize, Deserialize)]
 pub struct Router {
@@ -34,9 +34,12 @@ pub struct Router {
     pub last_error: Option<RouterError>,
     pub trip_start: Option<Tick>,
     #[inspect(skip)]
-    pub(crate) trip_mode: TripMode,
+    pub(crate) trip_mode: TripProgress,
     pub(crate) walk_only_pickup: bool,
     replan_at_alight: bool,
+    #[inspect(skip)]
+    #[serde(skip)]
+    transit_walks: Option<Box<[Option<ValidatedWalk>; 2]>>,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -81,11 +84,7 @@ pub enum RoutingStep {
 debug_inspect_impl!(RoutingStep);
 
 pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
-    routing_changed(world, resources, |transit, line| {
-        transit
-            .headway(line)
-            .map(|ticks| ticks.saturating_mul(HEADWAY_MULTIPLIER))
-    });
+    routing_changed(world, resources, Transit::headway);
 }
 
 fn routing_changed(
@@ -125,7 +124,12 @@ fn routing_changed(
         }
         let dest = unwrap_ret!(router.target_dest);
 
+        let replacing_wait = matches!(router.cur_step, Some(RoutingStep::WaitAtStop { .. }));
         router.clear_steps(parking);
+        if replacing_wait && h.location == Location::Outside && h.collider.is_none() {
+            Router::restore_walking(h, h.trans.pos, resources);
+        }
+        let router = &mut h.router;
         let (pos, building) = match dest {
             Destination::Outside(pos) => (pos, None),
             Destination::Building(build) => {
@@ -146,7 +150,6 @@ fn routing_changed(
             router.trip_start = Some(elapsed_ticks(resources));
         }
 
-        let mut use_selected_vehicle = true;
         let mut transit_steps = None;
         if !transit.runs.is_empty()
             && router.allows_transit()
@@ -159,8 +162,9 @@ fn routing_changed(
         {
             let car = router.vehicle.and_then(|id| world.vehicles.get(id));
             if car.is_none_or(|vehicle| matches!(vehicle.vehicle.kind, VehicleKind::Car)) {
+                let now = elapsed_ticks(resources);
                 let paths =
-                    transit_paths.get_or_insert_with(|| TransitPaths::new(&transit, &headway));
+                    transit_paths.get_or_insert_with(|| TransitPaths::new(&transit, now, &headway));
                 if paths.has_service() {
                     let origin = match h.location {
                         Location::Building(id) => map.get(id).map_or(h.trans.pos, |b| b.door_pos),
@@ -169,40 +173,24 @@ fn routing_changed(
                     let nearby_car = car.map(|car| car.trans.pos).filter(|&car_pos| {
                         car_pos.distance2(origin) <= PERSONAL_CAR_ACCESS_RADIUS.powi(2)
                     });
-                    use_selected_vehicle = nearby_car.is_some();
-                    let allows_line = |line| transit.allows_line_for_trip(id, router, line);
-                    let restricted;
-                    let paths = if transit.lines.keys().any(|line| !allows_line(line)) {
-                        restricted = TransitPaths::new(&transit, |transit, line| {
-                            if allows_line(line) {
-                                headway(transit, line)
-                            } else {
-                                None
-                            }
-                        });
-                        &restricted
-                    } else {
-                        paths
-                    };
+                    let walk_speed = f64::from(h.pedestrian.walking_speed);
                     transit_steps = paths.winning_steps(
                         origin,
                         pos,
                         &h.location,
                         map,
-                        elapsed_ticks(resources),
-                        legacy_cost(origin, pos, nearby_car),
+                        now,
+                        legacy_cost(origin, pos, nearby_car, walk_speed),
+                        walk_speed,
+                        |line| transit.allows_line_for_trip(id, router, line),
                     );
                 }
             }
         }
 
-        let mut route = if let Some(steps) = transit_steps {
+        let mut route = if let Some((steps, paths)) = transit_steps {
+            router.transit_walks = Some(Box::new(paths.map(Some)));
             Ok(steps)
-        } else if !use_selected_vehicle && router.vehicle.is_some() {
-            let selected = router.vehicle.take();
-            let route = router.steps_to(pos, parking, map, &h.location, &world.vehicles);
-            router.vehicle = selected;
-            route
         } else {
             router.steps_to(pos, parking, map, &h.location, &world.vehicles)
         };
@@ -236,6 +224,22 @@ fn routing_changed(
                 return;
             }
         };
+        let mode = if router
+            .steps
+            .iter()
+            .any(|step| matches!(step, RoutingStep::RideTransit { .. }))
+        {
+            TripMode::Transit
+        } else if router
+            .steps
+            .iter()
+            .any(|step| matches!(step, RoutingStep::DriveTo(..)))
+        {
+            TripMode::Car
+        } else {
+            TripMode::Walk
+        };
+        router.trip_mode.plan(mode);
         if let Some(building) = building {
             router.steps.push(RoutingStep::GetInBuilding(building));
         }
@@ -332,19 +336,49 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
 
         h.router.cur_step = h.router.steps.pop();
 
+        let transit_walk = matches!(h.router.steps.last(), Some(RoutingStep::WaitAtStop { .. }))
+            || matches!(h.router.trip_mode, TripProgress::RodeTransit);
         if let Some(ref mut next_step) = h.router.cur_step {
             match *next_step {
                 RoutingStep::WalkTo(obj) => {
-                    h.it = Itinerary::wait_for_reroute(PathKind::Pedestrian, obj);
+                    let mut route = None;
+                    if transit_walk {
+                        // Rebuild the same itinerary after loading or invalidating a cached walk.
+                        route = h
+                            .router
+                            .transit_walks
+                            .as_deref_mut()
+                            .and_then(|paths| {
+                                paths.iter_mut().find_map(|path| {
+                                    if path
+                                        .as_ref()
+                                        .is_some_and(|path| path.matches(pos, obj, map))
+                                    {
+                                        path.take().map(ValidatedWalk::into_itinerary)
+                                    } else {
+                                        None
+                                    }
+                                })
+                            })
+                            .or_else(|| {
+                                Itinerary::route(
+                                    elapsed_ticks(resources),
+                                    pos,
+                                    obj,
+                                    map,
+                                    PathKind::Pedestrian,
+                                )
+                            });
+                    }
+                    h.it = route
+                        .unwrap_or_else(|| Itinerary::wait_for_reroute(PathKind::Pedestrian, obj));
                 }
                 RoutingStep::DriveTo(vehicle, obj) => {
                     let route = Itinerary::wait_for_reroute(PathKind::Vehicle, obj);
                     if let Some(x) = world.vehicles.get_mut(vehicle) {
                         x.it = route;
-                        if h.location == Location::Vehicle(vehicle)
-                            && h.router.trip_mode == TripMode::Walk
-                        {
-                            h.router.trip_mode = TripMode::Car;
+                        if h.location == Location::Vehicle(vehicle) {
+                            h.router.trip_mode.drove();
                         }
                     }
                 }
@@ -438,9 +472,10 @@ impl Router {
             cur_dest: None,
             last_error: None,
             trip_start: None,
-            trip_mode: TripMode::Walk,
+            trip_mode: TripProgress::Walk,
             walk_only_pickup: false,
             replan_at_alight: false,
+            transit_walks: None,
         }
     }
 
@@ -551,6 +586,7 @@ impl Router {
     }
 
     pub(crate) fn clear_steps(&mut self, parking: &mut ParkingManagement) {
+        self.transit_walks = None;
         for s in self.steps.drain(..).chain(self.cur_step.take()) {
             if let RoutingStep::Park(_, Some(spot)) = s {
                 parking.free(spot);
@@ -643,7 +679,7 @@ impl Router {
             let spot_resa = if self.personal_car == Some(car) {
                 parking
                     .reserve_near_radius(obj, map, NEAR_PARKING_RADIUS)
-                    .or_else(|_| parking.reserve_near_radius(obj, map, 4.0 * NEAR_PARKING_RADIUS))
+                    .or_else(|_| parking.reserve_near_radius(obj, map, PERSONAL_CAR_ACCESS_RADIUS))
             } else {
                 parking.reserve_near(obj, map)
             }
@@ -683,9 +719,11 @@ mod tests {
     use super::*;
     use crate::map::LaneKind;
     use crate::map_dynamic::{BusRun, TransitLine, TransitStop};
+    use crate::souls::desire::Work;
     use crate::souls::human::spawn_human;
     use crate::tests::TestCtx;
     use crate::transportation::{spawn_driving_vehicle, VehicleKind};
+    use crate::world_command::WorldCommand;
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Color};
     use prototypes::Money;
@@ -756,6 +794,7 @@ mod tests {
             traveler.location = Location::Outside;
             traveler.trans.pos = origin;
             traveler.router = Router::new(None);
+            traveler.pedestrian.walking_speed = 1.2;
             Self {
                 ctx,
                 human,
@@ -782,7 +821,7 @@ mod tests {
             car
         }
 
-        // The spine headway is a stub, so exercise routing with a supplied interval.
+        // Analytical cost and fallback cases use a fixed service interval.
         fn plan(&mut self, headway: u64) -> &[RoutingStep] {
             let (world, resources) = self.ctx.g.world_res();
             world.humans[self.human]
@@ -846,7 +885,7 @@ mod tests {
     #[test]
     fn p3b_owner_far_from_car_chooses_transit_without_reserving_parking() {
         let mut f = RouteFixture::new(500.0);
-        let car = f.assign_car(f.origin + Vec3::X * 350.0);
+        let car = f.assign_car(f.origin + Vec3::X * 401.0);
         let before = Bincode::encode(&*f.ctx.g.read::<ParkingManagement>()).unwrap();
         f.assert_ride(400);
         let after = Bincode::encode(&*f.ctx.g.read::<ParkingManagement>()).unwrap();
@@ -863,6 +902,58 @@ mod tests {
         f.ctx.g.world.humans[f.human].router.walk_only_pickup = true;
         let destination = f.destination;
         assert!(matches!(f.plan(400), [RoutingStep::WalkTo(end)] if *end == destination));
+    }
+
+    #[test]
+    fn p3b_driver_truck_and_in_vehicle_trips_keep_legacy_routes() {
+        let mut driver = RouteFixture::new(500.0);
+        let human = &mut driver.ctx.g.world.humans[driver.human];
+        human.work = Some(Work::new(
+            human.home.house,
+            WorkKind::Driver {
+                deliver_order: None,
+                truck: VehicleID::default(),
+            },
+            0.0,
+        ));
+        assert!(matches!(driver.plan(400), [RoutingStep::WalkTo(_)]));
+
+        let mut truck = RouteFixture::new(500.0);
+        let vehicle = truck.assign_car(truck.origin + Vec3::X * 50.0);
+        truck.ctx.g.world.vehicles[vehicle].vehicle.kind = VehicleKind::Truck;
+        assert!(truck
+            .plan(400)
+            .iter()
+            .any(|step| matches!(step, RoutingStep::DriveTo(..))));
+
+        let mut occupied = RouteFixture::new(500.0);
+        let vehicle = occupied.assign_car(occupied.origin + Vec3::X * 50.0);
+        occupied.ctx.g.world.humans[occupied.human].location = Location::Vehicle(vehicle);
+        assert!(occupied
+            .plan(400)
+            .iter()
+            .any(|step| matches!(step, RoutingStep::DriveTo(..))));
+    }
+
+    #[test]
+    fn p3b_replacing_a_wait_restores_the_walking_collider() {
+        let mut f = RouteFixture::new(500.0);
+        let human = &mut f.ctx.g.world.humans[f.human];
+        human.router.set_test_route(
+            Destination::Outside(f.destination),
+            vec![RoutingStep::WaitAtStop {
+                stop: f.stops[0],
+                line: f.line,
+                since: Tick(0),
+            }],
+        );
+        let collider = human.collider.take();
+        if let Some(collider) = collider {
+            f.ctx.g.write::<TransportGrid>().remove_maintain(collider.0);
+        }
+        f.destination = f.origin + Vec3::X * 20.0;
+        assert!(matches!(f.plan(400), [RoutingStep::WalkTo(_)]));
+        assert!(f.ctx.g.world.humans[f.human].collider.is_some());
     }
 
     #[test]
@@ -894,5 +985,113 @@ mod tests {
         // Walking is 10,000 ticks. Riding takes 1,500 ticks plus half the headway.
         assert!(matches!(tie.plan(17_000), [RoutingStep::WalkTo(end)] if *end == destination));
         RouteFixture::new(240.0).assert_ride(16_999);
+    }
+
+    #[test]
+    fn p3b_fractional_tick_tie_prefers_legacy() {
+        let mut f = RouteFixture::new(454.0);
+        for (stop, offset) in f.stops.into_iter().zip([41.0, 413.0]) {
+            let mut transit = f.ctx.g.write::<Transit>();
+            transit.stops[stop].walk_pos = f.origin + Vec3::X * offset;
+            transit.stops[stop].berth = f.origin + Vec3::X * offset;
+        }
+        let destination = f.destination;
+        // Both estimates are exactly 56,750 / 3 ticks.
+        assert!(matches!(f.plan(26_350), [RoutingStep::WalkTo(end)] if *end == destination));
+    }
+
+    #[test]
+    fn p3b_active_service_without_a_winning_ride_preserves_parked_car() {
+        let mut f = RouteFixture::new(500.0);
+        let car = f.assign_car(f.origin + Vec3::X * 350.0);
+        {
+            let mut transit = f.ctx.g.write::<Transit>();
+            for stop in transit.stops.values_mut() {
+                stop.walk_pos += Vec3::Y * 700.0;
+            }
+        }
+        assert!(f
+            .plan(400)
+            .iter()
+            .any(|step| { matches!(step, RoutingStep::DriveTo(vehicle, _) if *vehicle == car) }));
+        assert_eq!(
+            f.ctx.g.world.humans[f.human].router.trip_mode.mode(),
+            TripMode::Car
+        );
+    }
+
+    #[test]
+    fn p3b_ride_cost_follows_the_order_around_the_loop() {
+        let mut f = RouteFixture::new(240.0);
+        let [alight, board] = f.stops;
+        {
+            let mut transit = f.ctx.g.write::<Transit>();
+            let far = f.origin + Vec3::Y * 1_000.0;
+            let via = transit.stops.insert_with_key(|id| TransitStop {
+                id,
+                pos: far,
+                walk_pos: far,
+                berth: far,
+                dir: vec2(1.0, 0.0),
+            });
+            transit.lines[f.line].stops = vec![alight, board, via];
+        }
+        f.destination = f.origin;
+        f.ctx.g.world.humans[f.human].trans.pos = f.origin + Vec3::X * 240.0;
+        let destination = f.destination;
+        assert!(matches!(f.plan(400), [RoutingStep::WalkTo(end)] if *end == destination));
+    }
+
+    #[test]
+    fn p3b_carless_commuter_uses_scheduled_headway() {
+        let mut f = RouteFixture::new(500.0);
+        let old_bus = *f.ctx.g.read::<Transit>().runs.keys().next().unwrap();
+        let old_vehicle = f.ctx.g.world.vehicles.remove(old_bus).unwrap();
+        f.ctx
+            .g
+            .write::<TransportGrid>()
+            .remove_maintain(old_vehicle.collider.unwrap().0);
+        *f.ctx.g.write::<Transit>() = Transit::default();
+        let commands = {
+            let map = f.ctx.g.map();
+            let lane = map
+                .lanes()
+                .values()
+                .find(|lane| {
+                    lane.kind == LaneKind::Driving && lane.points.first().x < lane.points.last().x
+                })
+                .unwrap();
+            [f.origin, f.destination].map(|pos| {
+                let (pos, _, dir) = lane.points.project_segment_dir(pos);
+                WorldCommand::TransitAddStop { pos, dir: dir.xy() }
+            })
+        };
+        f.ctx.apply(&commands);
+        let stops: Vec<_> = f.ctx.g.read::<Transit>().stops.keys().collect();
+        assert_eq!(stops.len(), 2);
+        f.ctx.apply(&[WorldCommand::TransitCreateLine { stops }]);
+        let line = f.ctx.g.read::<Transit>().lines.keys().next().unwrap();
+        f.ctx
+            .apply(&[WorldCommand::TransitSetVehicles { line, n: 1 }]);
+        f.ctx.tick_fast();
+        {
+            let transit = f.ctx.g.read::<Transit>();
+            let (legs, dwell) = transit.directed_leg_times(line).unwrap();
+            assert_eq!(
+                transit.headway(line),
+                Some(legs.iter().sum::<u64>() + legs.len() as u64 * dwell)
+            );
+        }
+
+        let (world, resources) = f.ctx.g.world_res();
+        let human = &mut world.humans[f.human];
+        human.router.go_to(Destination::Outside(f.destination));
+        routing_changed_system(world, resources);
+        let router = &world.humans[f.human].router;
+        assert!(router
+            .steps
+            .iter()
+            .any(|step| matches!(step, RoutingStep::RideTransit { line: id, .. } if *id == line)));
+        assert_eq!(router.trip_mode.mode(), TripMode::Transit);
     }
 }

@@ -12,6 +12,44 @@ pub enum TripMode {
     Transit,
 }
 
+// The first three variants retain the serialized values of the original trip modes.
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) enum TripProgress {
+    #[default]
+    Walk,
+    Drove,
+    RodeTransit,
+    PlannedCar,
+    PlannedTransit,
+}
+
+impl TripProgress {
+    pub(crate) fn plan(&mut self, mode: TripMode) {
+        if matches!(self, Self::Drove | Self::RodeTransit) {
+            return;
+        }
+        *self = match mode {
+            TripMode::Walk => Self::Walk,
+            TripMode::Car => Self::PlannedCar,
+            TripMode::Transit => Self::PlannedTransit,
+        };
+    }
+
+    pub(crate) fn drove(&mut self) {
+        if !matches!(self, Self::RodeTransit) {
+            *self = Self::Drove;
+        }
+    }
+
+    pub(crate) fn mode(&self) -> TripMode {
+        match self {
+            Self::Walk => TripMode::Walk,
+            Self::Drove | Self::PlannedCar => TripMode::Car,
+            Self::RodeTransit | Self::PlannedTransit => TripMode::Transit,
+        }
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub struct TripModeStats {
     pub completed: u64,
@@ -23,17 +61,19 @@ pub struct TripStats {
     pub walk: TripModeStats,
     pub car: TripModeStats,
     pub transit: TripModeStats,
+    /// Stop waits that exceeded the transit timeout.
     pub timeouts: u64,
+    /// Passengers who abandoned transit after an expired wait.
     pub give_ups: u64,
 }
 
 pub(crate) fn on_start(router: &mut Router) {
     router.trip_start = None;
-    router.trip_mode = TripMode::Walk;
+    router.trip_mode = TripProgress::Walk;
 }
 
 pub(crate) fn on_arrival(router: &mut Router, resources: &Resources) {
-    let mode = std::mem::take(&mut router.trip_mode);
+    let mode = std::mem::take(&mut router.trip_mode).mode();
     on_arrival_by_mode(router, resources, mode);
 }
 
@@ -53,8 +93,7 @@ pub fn on_arrival_by_mode(router: &mut Router, resources: &Resources, mode: Trip
 }
 
 pub(crate) fn on_cancel(router: &mut Router) {
-    router.trip_start = None;
-    router.trip_mode = TripMode::Walk;
+    on_start(router);
 }
 
 /// Record a wait that expired and forced the passenger to give up on transit.
@@ -72,6 +111,36 @@ mod tests {
     use crate::{Simulation, INITIAL_TICK};
     use common::saveload::{Bincode, Encoder};
     use prototypes::{GameTime, Tick, TICKS_PER_HOUR};
+
+    #[test]
+    fn p3c_arrival_uses_the_planned_mode_and_keeps_modes_used_before_a_replan() {
+        let mut sim = TestCtx::new_fast().g;
+        let (_, resources) = sim.world_res();
+        let mut router = Router::new(Some(crate::VehicleID::default()));
+        resources.write::<GameTime>().tick = Tick(INITIAL_TICK + 200);
+
+        router.trip_start = Some(Tick(20));
+        router.trip_mode.plan(TripMode::Transit);
+        router.trip_mode.plan(TripMode::Walk);
+        on_arrival(&mut router, resources);
+
+        router.trip_start = Some(Tick(150));
+        router.trip_mode.plan(TripMode::Car);
+        on_arrival(&mut router, resources);
+
+        router.trip_start = Some(Tick(40));
+        router.trip_mode = TripProgress::RodeTransit;
+        router.trip_mode.plan(TripMode::Walk);
+        on_arrival(&mut router, resources);
+
+        let stats = resources.read::<TripStats>();
+        assert_eq!((stats.walk.completed, stats.walk.duration_ticks), (1, 180));
+        assert_eq!((stats.car.completed, stats.car.duration_ticks), (1, 50));
+        assert_eq!(
+            (stats.transit.completed, stats.transit.duration_ticks),
+            (1, 160)
+        );
+    }
 
     #[test]
     fn p3c_trip_stats_complete_each_mode_once_and_discard_cancelled_trips() {

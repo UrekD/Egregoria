@@ -1,12 +1,13 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use geom::{Transform, Vec3};
-use prototypes::{Tick, DELTA, TICKS_PER_HOUR, TICKS_PER_SECOND};
+use prototypes::{Tick, DELTA, TICKS_PER_SECOND};
 
 use super::{
     detach_for_replan, elapsed_ticks, walkable_egress, Berth, BusRun, Transit, TransitStop,
+    GIVE_UP_TICKS,
 };
-use crate::economy::{on_wait_timeout, transit_stats, TripMode};
+use crate::economy::{on_wait_timeout, transit_stats, TripProgress};
 use crate::map::Map;
 use crate::map_dynamic::{Itinerary, LineID, Router, RoutingStep, StopID};
 use crate::transportation::{
@@ -16,7 +17,6 @@ use crate::utils::resources::Resources;
 use crate::{HumanEnt, HumanID, ParCommandBuffer, Simulation, VehicleEnt, VehicleID, World};
 
 pub(super) const DWELL_TICKS: u64 = 30 * TICKS_PER_SECOND;
-const GIVE_UP_TICKS: u64 = 2 * TICKS_PER_HOUR;
 const MAX_CONSECUTIVE_SKIPS: u8 = 3;
 const CAPACITY: usize = 40;
 const BERTH_DISTANCE: f32 = 6.0;
@@ -164,6 +164,20 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
             transit.runs.get_mut(&bus).unwrap().next_stop_idx = next;
             begin_leg(&mut transit, &map, bus, vehicle, now, Some(stop_id));
         } else if arrived(vehicle, stop) {
+            let previous = (run.next_stop_idx + line.stops.len() - 1) % line.stops.len();
+            let line_id = run.line;
+            let actual = now.0.saturating_sub(run.leg_started.0);
+            if transit.legs.get(&bus).and_then(|leg| leg.from) == Some(line.stops[previous]) {
+                if let Some(expected) = transit
+                    .leg_times
+                    .get_mut(&line_id)
+                    .and_then(|times| times.get_mut(previous))
+                {
+                    // Smooth travel observations from completed legs. The skip
+                    // watchdog still uses the itinerary's nominal travel time.
+                    *expected = (7 * *expected + actual).div_ceil(8);
+                }
+            }
             let run = transit.runs.get_mut(&bus).unwrap();
             run.dwell_until = Some(Tick(now.0.saturating_add(DWELL_TICKS)));
             run.failures = 0;
@@ -464,7 +478,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
                 continue;
             }
             remaining += 1;
-            human.router.trip_mode = TripMode::Transit;
+            human.router.trip_mode = TripProgress::RodeTransit;
             transit_stats::on_board_with_fare(
                 resources,
                 at.line,
@@ -506,7 +520,7 @@ fn alight_passenger(
 mod tests {
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3};
-    use prototypes::Money;
+    use prototypes::{Money, TICKS_PER_HOUR};
 
     use super::*;
     use crate::economy::{Budget, BudgetCategory, TICKS_PER_BUDGET_DAY};

@@ -147,23 +147,25 @@ fn budget_day(tick: u64) -> u64 {
     tick.saturating_sub(1) / TICKS_PER_BUDGET_DAY
 }
 
-/// Called after transit dispatch, with all runs for the elapsed hour in place.
+/// Sample the live fleet once per elapsed tick after dispatch and boarding.
+/// Settle accumulated bus-ticks, including dwell, at elapsed-hour boundaries.
 pub fn accrue_transit_upkeep(world: &World, resources: &Resources) {
+    use crate::economy::transit_stats::UpkeepAccrual;
     use crate::economy::TransitStats;
     use crate::map_dynamic::Transit;
     use crate::transportation::VehicleKind;
 
     const BUS_UPKEEP_PER_DAY: Money = Money::new_bucks(25);
 
-    let hour = resources.read::<Budget>().elapsed_ticks(resources.tick()) / TICKS_PER_HOUR;
-    {
-        let mut stats = resources.write::<TransitStats>();
-        if hour <= stats.last_upkeep_hour {
-            return;
-        }
-        stats.last_upkeep_hour = hour;
+    let tick = resources.read::<Budget>().elapsed_ticks(resources.tick());
+    let mut stats = resources.write::<TransitStats>();
+    let (previous, pending) = match stats.upkeep {
+        UpkeepAccrual::LegacyHour(hour) => (hour.saturating_mul(TICKS_PER_HOUR), 0),
+        UpkeepAccrual::BusTicks { tick, pending } => (tick, pending),
+    };
+    if tick <= previous {
+        return;
     }
-
     let running = resources
         .read::<Transit>()
         .runs
@@ -174,15 +176,31 @@ pub fn accrue_transit_upkeep(world: &World, resources: &Resources) {
                 .get(id)
                 .is_some_and(|vehicle| matches!(vehicle.vehicle.kind, VehicleKind::Bus))
         })
-        .count();
-    if running > 0 {
+        .count() as u64;
+    let mut pending = pending + running;
+    if pending == 0 {
+        return;
+    }
+    if matches!(stats.upkeep, UpkeepAccrual::LegacyHour(_)) {
+        // The old remainder was expressed in bus-hours.
+        let mut budget = resources.write::<Budget>();
+        if let Some(remainder) = budget
+            .hourly_remainders
+            .get_mut(&BudgetCategory::TransitUpkeep)
+        {
+            *remainder *= i128::from(TICKS_PER_HOUR);
+        }
+    }
+    if tick % TICKS_PER_HOUR == 0 {
         let delta = resources.write::<Budget>().hourly_delta(
             BudgetCategory::TransitUpkeep,
-            -(running as i128) * i128::from(BUS_UPKEEP_PER_DAY.inner()),
-            1,
+            -i128::from(pending) * i128::from(BUS_UPKEEP_PER_DAY.inner()),
+            i128::from(TICKS_PER_HOUR),
         );
         Budget::apply(resources, BudgetCategory::TransitUpkeep, delta);
+        pending = 0;
     }
+    stats.upkeep = UpkeepAccrual::BusTicks { tick, pending };
 }
 
 pub fn budget_update(world: &mut World, resources: &mut Resources) {
