@@ -102,6 +102,7 @@ pub(crate) fn top_driver(sim: &Simulation, zone: ZoneKind) -> Option<(&'static s
         DemandDriver::Shortfall if zone == ZoneKind::Commercial => "Retail supply gap",
         DemandDriver::Shortfall => "Goods supply gap",
         DemandDriver::Unemployment => "Unemployment",
+        DemandDriver::Happiness => "Happiness",
     };
     Some((label, points))
 }

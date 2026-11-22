@@ -23,16 +23,21 @@ pub struct Happiness {
 }
 
 impl Happiness {
-    pub fn average(&self) -> f32 {
-        if self.by_building.is_empty() {
-            return NEUTRAL_HAPPINESS;
+    pub fn average(&self, infos: &BuildingInfos) -> f32 {
+        let mut residents = 0;
+        let mut total = 0;
+        for (&building, &score) in &self.by_building {
+            if let Some(info) = infos.get(building) {
+                let occupied = info.residents.len() as u64;
+                residents += occupied;
+                total += occupied * u64::from(score);
+            }
         }
-        let sum: u64 = self
-            .by_building
-            .values()
-            .map(|&score| u64::from(score))
-            .sum();
-        sum as f32 / self.by_building.len() as f32
+        if residents == 0 {
+            NEUTRAL_HAPPINESS
+        } else {
+            total as f32 / residents as f32
+        }
     }
 }
 

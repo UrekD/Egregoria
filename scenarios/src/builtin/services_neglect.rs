@@ -1,4 +1,4 @@
-use super::services_basic::{assess, reference_demand, run_to, OPTIONS, TICKS};
+use super::services_basic::{reference_demand, run_verified, OPTIONS};
 use crate::{Scenario, ScenarioCtx};
 use simulation::SimulationOptions;
 
@@ -12,8 +12,7 @@ pub const SCENARIO: (Scenario, SimulationOptions) = (
 
 fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let (basic_tick, basic_demand) = reference_demand()?;
-    ctx.verify_resumed(TICKS, |ctx, ticks| run_to(ctx, ticks, false))?;
-    let metrics = assess(ctx)?;
+    let metrics = run_verified(ctx, false)?;
     if metrics.tick != basic_tick
         || metrics.happiness > 45.0
         || metrics.residential_demand >= basic_demand

@@ -19,7 +19,7 @@ pub const K_TAX: f32 = 1.0;
 pub const K_RET: f32 = 0.6;
 pub const K_GOODS: f32 = 0.2;
 pub const K_UNEMP: f32 = 1.0;
-pub const K_HAPPY: f32 = 2.75;
+pub const K_HAPPY: f32 = 0.8;
 
 // Weights are points at maximum satisfaction and sum to 100.
 pub(crate) const HAPPINESS_POWER: f32 = 5.0;

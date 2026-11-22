@@ -6,12 +6,9 @@ pub mod services_basic;
 pub mod services_neglect;
 pub mod smoke;
 
-use crate::builders::{grid_city, place_grid_power_plant, place_service_sites};
+use crate::builders::{grid_city, place_company, place_grid_power_plant, place_service_sites};
 use crate::{Scenario, ScenarioCtx};
 use geom::vec2;
-use simulation::economy::MAX_TAX_RATE_PERMILLE;
-use simulation::map::ZoneKind;
-use simulation::world_command::WorldCommand;
 use simulation::SimulationOptions;
 
 pub const PERF_10K: (Scenario, SimulationOptions) = (
@@ -61,8 +58,8 @@ fn run_served_budget_day(ctx: &mut ScenarioCtx) -> Result<(), String> {
     // corner while the smoke grid adds its first eastbound road.
     grid_city(ctx, vec2(700.0, 475.0), 1, 2, 225.0);
     let spur_origin = vec2(700.0, 500.0);
-    place_grid_power_plant(ctx, spur_origin)?;
-    place_service_sites(
+    let plant = place_grid_power_plant(ctx, spur_origin)?;
+    let sites = place_service_sites(
         ctx,
         spur_origin,
         [
@@ -71,10 +68,8 @@ fn run_served_budget_day(ctx: &mut ScenarioCtx) -> Result<(), String> {
             ("fire-station", vec2(-65.0, 230.0)),
         ],
     )?;
-    ctx.submit(&[WorldCommand::SetTaxRate {
-        zone: ZoneKind::Residential,
-        rate_permille: MAX_TAX_RATE_PERMILLE,
-    }]);
-    ctx.run_ticks(1);
-    (budget_day::SCENARIO.0.run)(ctx)
+    place_company(ctx, "coal-mine", spur_origin + vec2(40.0, 75.0))
+        .ok_or("could not place coal supplier for the budget fixture")?;
+    (budget_day::SCENARIO.0.run)(ctx)?;
+    services_basic::check_service_network(ctx, plant, &sites, "budget_day final")
 }

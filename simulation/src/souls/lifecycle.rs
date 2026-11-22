@@ -1,15 +1,16 @@
 use geom::Vec3;
 use prototypes::{GameTime, ItemID};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::economy::Market;
 use crate::map::{Building, BuildingID, BuildingKind, Map, PathKind};
 use crate::map_dynamic::{
-    BuildingInfos, DispatchID, Dispatcher, Itinerary, ParkingManagement, SpotReservation,
-    OBJECTIVE_OK_DIST,
+    BuildingInfos, Destination, DispatchID, Dispatcher, Itinerary, ParkingManagement,
+    SpotReservation, OBJECTIVE_OK_DIST,
 };
 use crate::souls::desire::WorkKind;
 use crate::souls::freight_station::FreightTrainState;
+use crate::souls::human::HumanDecisionKind;
 use crate::souls::residence;
 use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::train::{cancel_train_route, TrainReservations};
@@ -250,16 +251,49 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) {
 }
 
 pub(crate) fn clear_building_references(sim: &mut Simulation, id: BuildingID, door: Option<Vec3>) {
+    clear_references(sim, &BTreeMap::from([(id, door)]));
+}
+
+pub(crate) fn clear_abandoned_home_references(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
+    let buildings = homes.iter().map(|&(id, door)| (id, Some(door))).collect();
+    clear_references(sim, &buildings);
+}
+
+fn decision_references_buildings(
+    decision: &HumanDecisionKind,
+    buildings: &BTreeMap<BuildingID, Option<Vec3>>,
+) -> bool {
+    match decision {
+        HumanDecisionKind::GoTo(Destination::Building(id))
+        | HumanDecisionKind::DeliverAtBuilding(id) => buildings.contains_key(id),
+        HumanDecisionKind::MultiStack(steps) => steps
+            .iter()
+            .any(|step| decision_references_buildings(step, buildings)),
+        _ => false,
+    }
+}
+
+fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Option<Vec3>>) {
     let (world, resources) = sim.world_res();
     let mut returning_trucks = BTreeSet::new();
     let mut idle_drivers = BTreeSet::new();
+    let single = buildings
+        .keys()
+        .next()
+        .copied()
+        .filter(|_| buildings.len() == 1);
     for (human_id, human) in world.humans.iter_mut() {
-        let mut cancel =
-            human.router.references_building(id) || human.decision.kind.references_building(id);
-        human.food.forget_building(id);
+        let door = match human.location {
+            Location::Building(id) => buildings.get(&id).copied().flatten(),
+            _ => None,
+        };
+        for &id in buildings.keys() {
+            human.food.forget_building(id);
+        }
 
+        let mut cancel = door.is_some();
         if let Some(work) = &mut human.work {
-            if work.workplace == id {
+            if buildings.contains_key(&work.workplace) {
                 human.work = None;
                 resources.write::<Market>().buy(
                     SoulID::Human(human_id),
@@ -273,7 +307,7 @@ pub(crate) fn clear_building_references(sim: &mut Simulation, id: BuildingID, do
                 truck,
             } = &mut work.kind
             {
-                if *deliver_order == Some(id) {
+                if deliver_order.is_some_and(|id| buildings.contains_key(&id)) {
                     *deliver_order = None;
                     resources
                         .write::<Dispatcher>()
@@ -286,10 +320,21 @@ pub(crate) fn clear_building_references(sim: &mut Simulation, id: BuildingID, do
             }
         }
 
-        if let Some(door) = door.filter(|_| human.location == Location::Building(id)) {
+        if let Some(door) = door {
             move_outside(human, door, resources);
-            cancel = true;
         }
+        cancel = cancel
+            || if let Some(id) = single {
+                human.router.references_building(id) || human.decision.kind.references_building(id)
+            } else {
+                decision_references_buildings(&human.decision.kind, buildings)
+                    || human.router.target_dest.is_some_and(|target| {
+                        matches!(target, Destination::Building(id) if buildings.contains_key(&id))
+                            || buildings
+                                .keys()
+                                .any(|&id| human.router.references_building(id))
+                    })
+            };
         if cancel {
             if let Location::Vehicle(vehicle) = human.location {
                 if let Some(body) = world.vehicles.get_mut(vehicle) {
@@ -303,18 +348,23 @@ pub(crate) fn clear_building_references(sim: &mut Simulation, id: BuildingID, do
             cancel_trip(human, resources);
         }
     }
-    if door.is_some() {
-        if let Some(info) = resources.write::<BuildingInfos>().get_mut(id) {
-            info.inside.clear();
+    {
+        let mut infos = resources.write::<BuildingInfos>();
+        for (&id, door) in buildings {
+            if let Some(info) = infos.get_mut(id).filter(|_| door.is_some()) {
+                info.inside.clear();
+            }
         }
     }
-    for company in world.companies.values_mut() {
-        if company
-            .comp
-            .driver
-            .is_some_and(|driver| idle_drivers.contains(&driver))
-        {
-            company.comp.driver = None;
+    if !idle_drivers.is_empty() {
+        for company in world.companies.values_mut() {
+            if company
+                .comp
+                .driver
+                .is_some_and(|driver| idle_drivers.contains(&driver))
+            {
+                company.comp.driver = None;
+            }
         }
     }
     for truck in returning_trucks {

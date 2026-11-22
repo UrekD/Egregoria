@@ -4,7 +4,7 @@ use crate::builders::{
 };
 use crate::{Scenario, ScenarioCtx};
 use geom::{vec2, Vec2};
-use prototypes::{ServiceID, Size2D};
+use prototypes::Size2D;
 use simulation::economy::ZoneDemand;
 use simulation::map::{BuildingID, BuildingKind, Density, ZoneKind};
 use simulation::map_dynamic::{BuildingInfos, ElectricityFlow, UtilityFlow};
@@ -42,8 +42,7 @@ const COVERAGE_SITES: [(&str, Vec2); 6] = [
 static BASELINE: OnceLock<(u64, f32)> = OnceLock::new();
 
 fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
-    ctx.verify_resumed(TICKS, |ctx, ticks| run_to(ctx, ticks, true))?;
-    let metrics = assess(ctx)?;
+    let metrics = run_verified(ctx, true)?;
     metrics.check_basic()?;
     BASELINE.get_or_init(|| (metrics.tick, metrics.residential_demand));
     metrics.sample(ctx, SCENARIO.0.name);
@@ -55,17 +54,30 @@ pub(super) fn reference_demand() -> Result<(u64, f32), String> {
         return Ok(baseline);
     }
     let mut ctx = ScenarioCtx::new(OPTIONS);
-    run_to(&mut ctx, TICKS, true)?;
-    let metrics = assess(&ctx)?;
+    let metrics = run_to(&mut ctx, true, false)?;
     metrics.check_basic()?;
     Ok(*BASELINE.get_or_init(|| (metrics.tick, metrics.residential_demand)))
 }
 
-pub(super) fn run_to(
+pub(super) fn run_verified(
     ctx: &mut ScenarioCtx,
-    ticks: u64,
     coverage_services: bool,
-) -> Result<(), String> {
+) -> Result<Metrics, String> {
+    let metrics = run_to(ctx, coverage_services, false)?;
+    let mut resumed = ScenarioCtx::new(OPTIONS);
+    run_to(&mut resumed, coverage_services, true)?;
+    let resumed_hashes = resumed.sim.hashes();
+    for (resource, hash) in ctx.sim.hashes() {
+        if resumed_hashes.get(&resource) != Some(&hash) {
+            return Err(format!(
+                "midpoint resume changed final state for {resource}"
+            ));
+        }
+    }
+    Ok(metrics)
+}
+
+fn run_to(ctx: &mut ScenarioCtx, coverage_services: bool, resume: bool) -> Result<Metrics, String> {
     let start = ctx.sim.get_tick();
     // The fixture places its own connected terminal.
     let orphaned_terminals: Vec<_> = ctx
@@ -100,8 +112,8 @@ pub(super) fn run_to(
         (0..6).filter_map(move |x| {
             let (kind, density) = match x {
                 0..=3 => (ZoneKind::Residential, Density::High),
-                4 => (ZoneKind::Commercial, Density::Low),
-                _ if y < 4 => (ZoneKind::Industrial, Density::Low),
+                4 if y < 4 => (ZoneKind::Commercial, Density::Low),
+                5 if y < 2 => (ZoneKind::Industrial, Density::Low),
                 _ => return None,
             };
             Some((x, y, kind, density))
@@ -112,12 +124,21 @@ pub(super) fn run_to(
     // Let the usual immigration and hiring systems staff the sites.
     let setup_ticks = ctx.sim.get_tick() - start;
     ctx.run_ticks(PREFLIGHT_TICKS - setup_ticks);
-    preflight(ctx, plant, &services)?;
-    ctx.run_ticks(ticks - PREFLIGHT_TICKS);
-    Ok(())
+    check_service_network(ctx, plant, &services, "preflight")?;
+    if resume {
+        ctx.reload()?;
+    }
+    ctx.run_ticks(TICKS - PREFLIGHT_TICKS);
+    check_service_network(ctx, plant, &services, "final")?;
+    assess(ctx)
 }
 
-fn preflight(ctx: &ScenarioCtx, plant: BuildingID, sites: &[BuildingID]) -> Result<(), String> {
+pub(super) fn check_service_network(
+    ctx: &ScenarioCtx,
+    plant: BuildingID,
+    sites: &[BuildingID],
+    stage: &str,
+) -> Result<(), String> {
     let map = ctx.sim.map();
     let net = map
         .electricity
@@ -125,23 +146,27 @@ fn preflight(ctx: &ScenarioCtx, plant: BuildingID, sites: &[BuildingID]) -> Resu
         .ok_or("power plant is disconnected")?;
     let electricity = ctx.sim.read::<ElectricityFlow>();
     if electricity.blackout(net) {
-        return Err("preflight: service network is in a blackout".into());
+        return Err(format!("{stage}: service network is in a blackout"));
     }
 
     let infos = ctx.sim.read::<BuildingInfos>();
-    for &site in sites {
+    for site in std::iter::once(plant).chain(sites.iter().copied()) {
         let prototype = map
             .get(site)
             .and_then(|building| building.kind.as_goods_company())
-            .map(|id| ServiceID::from(id).prototype())
-            .ok_or_else(|| format!("preflight: service site {site:?} is missing"))?;
-        let workers = match infos.owner(site) {
-            Some(SoulID::GoodsCompany(id)) => ctx.sim.world().companies[id].workers.0.len(),
+            .map(|id| id.prototype())
+            .ok_or_else(|| format!("{stage}: provider site {site:?} is missing"))?;
+        let company = match infos.owner(site) {
+            Some(SoulID::GoodsCompany(id)) => ctx.sim.world().companies.get(id),
+            _ => None,
+        };
+        let workers = match company {
+            Some(company) => company.workers.0.len(),
             _ => 0,
         };
         if workers * 2 < prototype.n_workers as usize || map.electricity.net_id(site) != Some(net) {
             return Err(format!(
-                "preflight: {} has {workers}/{} workers or is disconnected",
+                "{stage}: {} has {workers}/{} workers or is disconnected",
                 prototype.label, prototype.n_workers
             ));
         }
@@ -155,11 +180,11 @@ fn preflight(ctx: &ScenarioCtx, plant: BuildingID, sites: &[BuildingID]) -> Resu
         || totals.water_production < totals.water_demand
         || totals.sewage_capacity < totals.sewage_demand
     {
-        return Err(format!("preflight: inadequate utility capacity {totals:?}"));
+        return Err(format!("{stage}: inadequate utility capacity {totals:?}"));
     }
     println!(
-        "services preflight: {} sites staffed at least 50%, water {:.0}/{:.0}, sewage {:.0}/{:.0}",
-        sites.len(),
+        "services {stage}: {} providers staffed at least 50%, water {:.0}/{:.0}, sewage {:.0}/{:.0}",
+        sites.len() + 1,
         totals.water_production,
         totals.water_demand,
         totals.sewage_capacity,
@@ -174,10 +199,9 @@ pub(super) struct Metrics {
     pub(super) happiness: f32,
     l2: usize,
     l3: usize,
-    unserved: usize,
 }
 
-pub(super) fn assess(ctx: &ScenarioCtx) -> Result<Metrics, String> {
+fn assess(ctx: &ScenarioCtx) -> Result<Metrics, String> {
     let population = ctx.sim.world().humans.len();
     if population < 100 {
         return Err(format!("population {population} is below the floor of 100"));
@@ -196,30 +220,34 @@ pub(super) fn assess(ctx: &ScenarioCtx) -> Result<Metrics, String> {
         .map(|building| (building.id, building.kind, building.connected_road))
         .collect::<Vec<_>>();
     if !unserved.is_empty() {
-        println!("buildings without water or sewage: {unserved:?}");
+        return Err(format!(
+            "final: buildings without water or sewage: {unserved:?}"
+        ));
     }
     let (mut l2, mut l3) = (0, 0);
     for home in homes.by_building.values() {
-        l2 += usize::from(home.level == 2);
+        l2 += usize::from(home.level >= 2);
         l3 += usize::from(home.level == 3);
     }
     let residential_demand = ctx.sim.read::<ZoneDemand>().values[&ZoneKind::Residential];
-    let happiness = ctx.sim.read::<Happiness>().average();
+    let happiness = ctx
+        .sim
+        .read::<Happiness>()
+        .average(&ctx.sim.read::<BuildingInfos>());
     Ok(Metrics {
         tick: ctx.sim.get_tick(),
         residential_demand,
         happiness,
         l2,
         l3,
-        unserved: unserved.len(),
     })
 }
 
 impl Metrics {
     fn check_basic(&self) -> Result<(), String> {
-        if self.l2 < 10 || self.happiness < 60.0 || self.unserved != 0 {
+        if self.l2 < 10 || self.happiness < 60.0 {
             return Err(format!(
-                "expected at least 10 L2 homes, happiness of at least 60, and no unserved buildings. Observed {}",
+                "expected at least 10 homes at L2 or higher and happiness of at least 60. Observed {}",
                 self.summary()
             ));
         }
@@ -228,8 +256,8 @@ impl Metrics {
 
     pub(super) fn summary(&self) -> String {
         format!(
-            "L2={} L3={} happiness={:.2} unserved={} R demand={:.2}",
-            self.l2, self.l3, self.happiness, self.unserved, self.residential_demand
+            "L2+={} L3={} happiness={:.2} unserved=0 R demand={:.2}",
+            self.l2, self.l3, self.happiness, self.residential_demand
         )
     }
 
@@ -240,7 +268,7 @@ impl Metrics {
             ("l2_residences".into(), self.l2 as f64),
             ("l3_residences".into(), self.l3 as f64),
             ("average_happiness".into(), f64::from(self.happiness)),
-            ("unserved_buildings".into(), self.unserved as f64),
+            ("unserved_buildings".into(), 0.0),
             (
                 "residential_demand".into(),
                 f64::from(self.residential_demand),

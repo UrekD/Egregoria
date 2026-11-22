@@ -81,13 +81,15 @@ impl Budget {
         self.clock_offset += i128::from(previous.0) - i128::from(next.0);
     }
 
-    fn elapsed_ticks(&self, tick: Tick) -> u64 {
+    pub(crate) fn elapsed_ticks(&self, tick: Tick) -> u64 {
         let elapsed = i128::from(tick.0) - i128::from(INITIAL_TICK) + self.clock_offset;
         elapsed.clamp(0, i128::from(u64::MAX)) as u64
     }
 
     /// Entry point for treasury transactions. Posts the signed change to both the
     /// treasury and the current day's budget ledger, with income positive.
+    /// The hourly accrual path runs every tick and posts at the hour boundary,
+    /// so its elapsed hour and the current elapsed tick resolve to the same day.
     pub(crate) fn apply(resources: &Resources, category: BudgetCategory, delta: Money) {
         if delta != Money::ZERO {
             let tick = resources.tick();

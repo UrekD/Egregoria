@@ -1,27 +1,73 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 
 use prototypes::{ServiceKind, Tick, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
 use slotmapd::Key;
 
+use crate::economy::Budget;
 use crate::map::{BuildingID, BuildingKind};
 use crate::map_dynamic::{CoverageGrid, EnvGrid};
 use crate::utils::rand_provider::RandProvider;
-use crate::{Simulation, RNG_SEED};
+use crate::{Simulation, INITIAL_TICK, RNG_SEED};
 
 const EVENT_FIRE: u64 = 0x4649_5245;
 const FIRE_CHANCE: f32 = 0.002;
 const COLLAPSE_TICKS: u64 = 3 * TICKS_PER_HOUR;
+const EVENT_HISTORY_LIMIT: usize = 256;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FireEventKind {
+    Ignited,
+    Extinguished,
+    Collapsed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FireEvent {
+    pub seq: u64,
+    /// Elapsed simulation tick.
+    pub tick: Tick,
+    pub building: BuildingID,
+    pub kind: FireEventKind,
+}
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Fires {
-    /// Tick at which each active fire started.
+    /// Elapsed tick at which each active fire started.
     pub by_building: BTreeMap<BuildingID, Tick>,
+    pub events: VecDeque<FireEvent>,
+    last_event_seq: u64,
+}
+
+impl Fires {
+    /// Iterates over retained events newer than the given sequence, oldest first.
+    pub fn events_since(&self, seq: u64) -> impl Iterator<Item = &FireEvent> {
+        self.events.iter().filter(move |event| event.seq > seq)
+    }
+
+    fn record(&mut self, tick: Tick, building: BuildingID, kind: FireEventKind) {
+        self.last_event_seq += 1;
+        if self.events.len() == EVENT_HISTORY_LIMIT {
+            self.events.pop_front();
+        }
+        self.events.push_back(FireEvent {
+            seq: self.last_event_seq,
+            tick,
+            building,
+            kind,
+        });
+    }
+}
+
+fn elapsed_tick(sim: &Simulation) -> Tick {
+    Tick(sim.read::<Budget>().elapsed_ticks(Tick(sim.get_tick())))
 }
 
 pub fn events_update(sim: &mut Simulation) {
-    let tick = sim.get_tick();
-    if tick % TICKS_PER_HOUR != 0 {
+    let tick = elapsed_tick(sim);
+    // Preserve the original hourly cadence and RNG keys on an unshifted clock.
+    let hour_tick = tick.0 + INITIAL_TICK;
+    if hour_tick % TICKS_PER_HOUR != 0 {
         return;
     }
     profiling::scope!("souls::events_update");
@@ -32,10 +78,10 @@ pub fn events_update(sim: &mut Simulation) {
         let coverage = sim.read::<CoverageGrid>();
         let environment = sim.read::<EnvGrid>();
         let mut fires = sim.write::<Fires>();
-        let hour = tick / TICKS_PER_HOUR;
+        let hour = hour_tick / TICKS_PER_HOUR;
 
         // A building extinguished this hour is eligible to ignite again next hour.
-        let ignitions: Vec<_> = map
+        let mut ignitions: Vec<_> = map
             .buildings()
             .values()
             .filter_map(|building| {
@@ -45,24 +91,37 @@ pub fn events_update(sim: &mut Simulation) {
                 }
                 let pollution = environment.pollution_at(building.obb.center());
                 let fire_coverage = coverage.coverage(id, ServiceKind::Fire);
-                let chance = FIRE_CHANCE * (1.0 + pollution / 50.0) * (1.0 - fire_coverage / 100.0);
-                (fire_draw(hour, id) < chance).then_some((id, Tick(tick)))
+                let chance = FIRE_CHANCE
+                    * (1.0 + pollution.min(100.0) / 50.0)
+                    * (1.0 - fire_coverage / 100.0);
+                (fire_draw(hour, id) < chance).then_some(id)
             })
             .collect();
+        ignitions.sort_unstable();
 
+        let mut resolved = Vec::new();
         fires.by_building.retain(|&id, start| {
-            if !map.get(id).is_some_and(|building| can_burn(building.kind))
-                || coverage.coverage(id, ServiceKind::Fire) > 0.0
-            {
+            if !map.get(id).is_some_and(|building| can_burn(building.kind)) {
                 return false;
             }
-            if tick.saturating_sub(start.0) >= COLLAPSE_TICKS {
+            if coverage.coverage(id, ServiceKind::Fire) > 0.0 {
+                resolved.push((id, FireEventKind::Extinguished));
+                return false;
+            }
+            if tick.0.saturating_sub(start.0) >= COLLAPSE_TICKS {
                 collapse.push(id);
+                resolved.push((id, FireEventKind::Collapsed));
                 return false;
             }
             true
         });
-        fires.by_building.extend(ignitions);
+        for (id, kind) in resolved {
+            fires.record(tick, id, kind);
+        }
+        for id in ignitions {
+            fires.by_building.insert(id, tick);
+            fires.record(tick, id, FireEventKind::Ignited);
+        }
     }
     for id in collapse {
         super::growth::remove_growable(sim, id);
@@ -89,7 +148,8 @@ fn splitmix64(value: u64) -> u64 {
 
 #[cfg(test)]
 pub(crate) fn force_ignite(sim: &Simulation, building: BuildingID) {
-    sim.write::<Fires>()
-        .by_building
-        .insert(building, Tick(sim.get_tick()));
+    let tick = elapsed_tick(sim);
+    let mut fires = sim.write::<Fires>();
+    fires.by_building.insert(building, tick);
+    fires.record(tick, building, FireEventKind::Ignited);
 }

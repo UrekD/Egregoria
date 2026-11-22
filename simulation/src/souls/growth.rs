@@ -231,14 +231,16 @@ mod tests {
     use super::*;
     use crate::economy::{Market, ZoneDemand};
     use crate::map::{Density, LanePatternBuilder, Map, MapProject, RoadID};
-    use crate::map_dynamic::{BuildingInfos, Destination, ParkingManagement, SpotReservation};
+    use crate::map_dynamic::{
+        BuildingInfos, CoverageGrid, Destination, ParkingManagement, SpotReservation, UtilityFlow,
+    };
     use crate::souls::desire::{Work, WorkKind};
     use crate::souls::{add_souls_to_empty_buildings, lifecycle};
     use crate::tests::TestCtx;
     use crate::{SoulID, WorldCommand};
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, OBB};
-    use prototypes::{GameTime, ItemID, TICKS_PER_HOUR};
+    use prototypes::{GameTime, GoodsCompanyID, ItemID, ServiceKind, TICKS_PER_HOUR};
 
     fn street() -> TestCtx {
         let test = TestCtx::new();
@@ -256,6 +258,44 @@ mod tests {
         sim.write::<GameTime>().tick.0 += TICKS_PER_HOUR;
         residence::residence_update(sim);
         crate::utils::scheduler::drain_commands(sim);
+    }
+
+    fn serve_house(sim: &mut Simulation, house: BuildingID) {
+        let road = sim.map().get(house).unwrap().connected_road.unwrap();
+        for (name, x) in [
+            ("coal-power-plant", 160.0),
+            ("water-pump", 230.0),
+            ("sewage-outlet", 300.0),
+        ] {
+            let proto = GoodsCompanyID::new(name).prototype();
+            let site = sim
+                .map_mut()
+                .build_special_building(
+                    &OBB::new(vec2(x, 70.0), geom::Vec2::X, 20.0, 20.0),
+                    BuildingKind::GoodsCompany(proto.id),
+                    proto.bgen,
+                    None,
+                    Some(road),
+                )
+                .unwrap();
+            sim.write::<BuildingInfos>().insert(site);
+            let Some(SoulID::GoodsCompany(owner)) =
+                crate::souls::goods_company::company_soul(sim, site, proto.id)
+            else {
+                panic!("could not start {name}");
+            };
+            // The fixture only runs residence checks. Model staffing for the
+            // utility snapshots without adding residents or running the labor market.
+            sim.world.companies[owner]
+                .workers
+                .0
+                .push(crate::HumanID::default());
+        }
+        let (world, resources) = sim.world_res();
+        crate::map_dynamic::electricity_flow_system(world, resources);
+        crate::map_dynamic::utility_flow_update(sim);
+        let utilities = sim.read::<UtilityFlow>();
+        assert!(utilities.has_water(house) && utilities.has_sewage(house));
     }
 
     fn place_store(sim: &Simulation, lot: LotID) -> BuildingID {
@@ -297,6 +337,7 @@ mod tests {
         let house = test.build_house_near(vec2(175.0, 125.0));
         assert!(test.g.map().lot_origin(house).is_none());
         test.g.write::<GameTime>().tick.0 = 0;
+        serve_house(&mut test.g, house);
         for _ in 0..36 {
             hourly_check(&mut test.g);
         }
@@ -424,6 +465,13 @@ mod tests {
             human.work = Some(Work::new(store, WorkKind::Worker, 0.0));
         }
         test.g.write::<GameTime>().tick.0 = 0;
+        serve_house(&mut test.g, house);
+        test.g
+            .write::<CoverageGrid>()
+            .by_kind
+            .entry(ServiceKind::School)
+            .or_default()
+            .insert(house, 30.0);
         for _ in 0..5 {
             hourly_check(&mut test.g);
         }
@@ -782,6 +830,7 @@ mod tests {
         let house = grow_house(&mut test.g, lot);
         residential_demand(&test.g, 0.0);
         test.g.write::<GameTime>().tick.0 = 0;
+        serve_house(&mut test.g, house);
         for _ in 0..23 {
             hourly_check(&mut test.g);
         }

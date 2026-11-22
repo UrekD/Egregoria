@@ -732,6 +732,24 @@ fn p2d_l2_requires_power_water_sewage_and_school() {
                 fixture.check(hour);
             }
         }
+        if unmet != "none" {
+            let requirements = residence::requirements(&fixture.test.g, fixture.house);
+            let name = match unmet {
+                "power" => "Power",
+                "water" => "Water",
+                "sewage" => "Sewage",
+                "school" => "School coverage",
+                "retail" => "Retail access",
+                _ => unreachable!(),
+            };
+            let failed = requirements
+                .iter()
+                .find(|requirement| requirement.name == name)
+                .unwrap();
+            assert!(!failed.met && failed.value < failed.threshold, "{failed:?}");
+        }
+        assert!(residence::uses_water(&fixture.test.g, fixture.house));
+        assert!(!residence::uses_water(&fixture.test.g, fixture.retailer));
         assert_eq!(
             fixture.level(),
             if unmet == "none" { 2 } else { 1 },
@@ -824,7 +842,7 @@ fn p2d_covered_forced_fire_is_extinguished() {
 
 #[test]
 fn p2d_uncovered_forced_fire_collapses_building_and_restores_lot() {
-    use crate::souls::events::Fires;
+    use crate::souls::events::{FireEventKind, Fires};
 
     let (mut test, house, _) = p2d_house();
     let replacement = test.build_house_near(vec2(310.0, 125.0));
@@ -850,6 +868,15 @@ fn p2d_uncovered_forced_fire_collapses_building_and_restores_lot() {
             .values()
             .any(|lot| lot.shape.contains(origin)));
         assert_eq!(sim.world.humans[resident].home.house, replacement);
+        let fires = sim.read::<Fires>();
+        let events: Vec<_> = fires
+            .events_since(0)
+            .filter(|e| e.building == house)
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind, FireEventKind::Ignited);
+        assert_eq!(events[1].kind, FireEventKind::Collapsed);
+        assert_eq!(events[1].tick.0 - events[0].tick.0, 3 * TICKS_PER_HOUR);
     }
 }
 
@@ -863,6 +890,270 @@ fn p2d_removing_a_building_mid_fire_is_safe() {
     p2d_fire_at(&mut test.g, 2);
     assert!(test.g.map().get(house).is_none());
     assert!(!test.g.read::<Fires>().by_building.contains_key(&house));
+}
+
+#[test]
+fn p2d_fire_lifetime_ignores_game_time_jumps() {
+    let mut failures = Vec::new();
+    for destination in [0, 20] {
+        let (mut test, house, _) = p2d_house();
+        p2d_force_ignite(&test.g, house);
+        test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(
+            destination * TICKS_PER_HOUR,
+        )))]);
+
+        let mut schedule = crate::utils::scheduler::SeqSchedule::default();
+        schedule.add_system(Box::new(crate::utils::scheduler::RunnableFn {
+            f: crate::souls::events::events_update,
+            name: "events_update",
+        }));
+        let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        for _ in 1..3 * TICKS_PER_HOUR {
+            resumed.tick(&mut schedule, []);
+        }
+        if resumed.map().get(house).is_none() {
+            failures.push(format!("jump to hour {destination} shortened the fire"));
+        }
+        resumed.tick(&mut schedule, []);
+        if resumed.map().get(house).is_some() {
+            failures.push(format!("jump to hour {destination} prolonged the fire"));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("; "));
+}
+
+#[test]
+fn p2d_forced_fire_never_collapses_a_service_or_special_building() {
+    let (mut test, _, road) = p2d_house();
+    let (school, _) = p2b_place_company(&mut test, "school", vec2(200.0, 70.0), road);
+    let (plant, _) = p2b_place_company(&mut test, "coal-power-plant", vec2(280.0, 70.0), road);
+    for building in [school, plant] {
+        p2d_force_ignite(&test.g, building);
+    }
+    p2d_fire_at(&mut test.g, 4);
+    for building in [school, plant] {
+        assert!(test.g.map().get(building).is_some());
+        assert!(!test
+            .g
+            .read::<crate::souls::events::Fires>()
+            .by_building
+            .contains_key(&building));
+    }
+}
+
+#[test]
+fn p2d_fire_events_keep_the_latest_256_across_save_and_resume() {
+    use crate::souls::events::{FireEventKind, Fires};
+
+    let (mut test, house, _) = p2d_house();
+    test.g
+        .write::<CoverageGrid>()
+        .by_kind
+        .entry(ServiceKind::Fire)
+        .or_default()
+        .insert(house, 100.0);
+    for hour in 1..=130 {
+        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
+        crate::souls::events::force_ignite(&test.g, house);
+        p2d_fire_at(&mut test.g, hour + 1);
+    }
+    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    {
+        let fires = resumed.read::<Fires>();
+        assert_eq!(fires.events.len(), 256);
+        assert!(fires.events_since(0).map(|event| event.seq).eq(5..=260));
+        let last: Vec<_> = fires.events_since(258).map(|event| event.kind).collect();
+        assert_eq!(last, [FireEventKind::Ignited, FireEventKind::Extinguished]);
+    }
+    crate::souls::events::force_ignite(&resumed, house);
+    p2d_fire_at(&mut resumed, 132);
+    assert!(resumed
+        .read::<Fires>()
+        .events_since(260)
+        .map(|event| event.seq)
+        .eq(261..=262));
+}
+
+#[test]
+fn p2d_mass_outage_benchmark() {
+    const HOMES: usize = 2_000;
+    let (mut test, _, road) = p2d_house();
+    let homes: Vec<_> = (0..HOMES)
+        .map(|i| {
+            let center = vec2(
+                1000.0 + (i % 50) as f32 * 24.0,
+                1000.0 + (i / 50) as f32 * 24.0,
+            );
+            let house = {
+                // The footprints are spaced apart and share an existing road.
+                // Skip the debug-only whole-map validation after every placement.
+                let map = &mut *test.g.map_mut();
+                crate::map::Building::make(
+                    &mut map.buildings,
+                    &mut map.spatial_map,
+                    &mut map.electricity,
+                    &mut map.roads,
+                    &map.environment,
+                    OBB::new(center, Vec2::X, 16.0, 16.0),
+                    BuildingKind::House,
+                    prototypes::BuildingGen::House,
+                    None,
+                    Some(road),
+                )
+                .unwrap()
+            };
+            crate::souls::growth::on_growable_placed(&test.g, house, BuildingKind::House);
+            let resident = spawn_human(&mut test.g, house).unwrap();
+            (house, resident)
+        })
+        .collect();
+    test.g.map().check_invariants();
+    for hour in 1..12 {
+        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR));
+        residence::residence_update(&mut test.g);
+    }
+    assert!(homes
+        .iter()
+        .all(|&(house, _)| !test.g.read::<residence::Residences>().is_abandoned(house)));
+    *test.g.write::<GameTime>() = GameTime::new(Tick(12 * TICKS_PER_HOUR));
+    let start = std::time::Instant::now();
+    residence::residence_update(&mut test.g);
+    let update_ms = start.elapsed().as_secs_f64() * 1000.0;
+    crate::utils::scheduler::drain_commands(&mut test.g);
+    let total_ms = start.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("mass outage ({HOMES} occupied homes): update {update_ms:.2} ms, with command drain {total_ms:.2} ms");
+    for (house, resident) in homes {
+        assert!(test.g.map().get(house).is_some());
+        assert!(test.g.read::<residence::Residences>().is_abandoned(house));
+        let infos = test.g.read::<BuildingInfos>();
+        assert!(infos.get(house).unwrap().inside.is_empty());
+        assert!(infos.residence_of(SoulID::Human(resident)).is_none());
+        assert!(test.g.get(resident).is_none());
+    }
+}
+
+#[test]
+fn p2d_abandonment_batch_rehomes_in_id_order_and_clears_visitor_routes() {
+    use crate::map_dynamic::Destination;
+    use crate::souls::human::HumanDecisionKind;
+    use crate::transportation::Location;
+
+    let mut fixture = P2dProgression::new();
+    let test = &mut fixture.test;
+    let left = test.build_house_near(vec2(190.0, 125.0));
+    let right = test.build_house_near(vec2(380.0, 125.0));
+    let visitor = spawn_human(&mut test.g, left).unwrap();
+    spawn_human(&mut test.g, right).unwrap();
+    test.build_roads(&[vec3(80.0, 250.0, 0.0), vec3(440.0, 250.0, 0.0)]);
+    let first = test.build_house_near(vec2(280.0, 275.0));
+    let second = test.build_house_near(vec2(190.0, 275.0));
+    assert!(first < second);
+    let first_resident = spawn_human(&mut test.g, first).unwrap();
+    let next_resident = spawn_human(&mut test.g, first).unwrap();
+    let last_resident = spawn_human(&mut test.g, second).unwrap();
+    assert!(first_resident < next_resident);
+    {
+        let human = &mut test.g.world.humans[visitor];
+        human.location = Location::Building(second);
+        human.router.target_dest = Some(Destination::Building(first));
+        human.decision.kind = HumanDecisionKind::MultiStack(vec![HumanDecisionKind::GoTo(
+            Destination::Building(first),
+        )]);
+        test.g
+            .write::<BuildingInfos>()
+            .get_in(second, SoulID::Human(visitor));
+    }
+    let nearest = {
+        let map = test.g.map();
+        let door = map.get(first).unwrap().door_pos;
+        [left, right].map(|id| {
+            (
+                ordered_float::OrderedFloat(map.get(id).unwrap().door_pos.distance2(door)),
+                id,
+            )
+        })
+    };
+    let [(_, first_destination), (_, second_destination)] = if nearest[0] < nearest[1] {
+        nearest
+    } else {
+        [nearest[1], nearest[0]]
+    };
+    for hour in 1..=12 {
+        fixture.check(hour);
+    }
+    let sim = &mut fixture.test.g;
+    crate::utils::scheduler::drain_commands(sim);
+    assert_eq!(
+        sim.get(first_resident).unwrap().home.house,
+        first_destination
+    );
+    assert_eq!(
+        sim.get(next_resident).unwrap().home.house,
+        second_destination
+    );
+    assert!(sim.get(last_resident).is_none());
+    let visitor = sim.get(visitor).unwrap();
+    assert_eq!(visitor.location, Location::Outside);
+    assert!(visitor.router.target_dest.is_none());
+    assert!(matches!(visitor.decision.kind, HumanDecisionKind::Yield));
+    assert!(sim
+        .read::<BuildingInfos>()
+        .get(second)
+        .unwrap()
+        .inside
+        .is_empty());
+}
+
+#[test]
+fn p2d_happiness_demand_is_weighted_by_residents_and_reported_separately() {
+    use crate::economy::{demand_update, DemandDriver, ZoneDemand};
+    use crate::map::ZoneKind;
+    use crate::souls::happiness::Happiness;
+
+    let (mut test, house, _) = p2d_house();
+    let other = test.build_house_near(vec2(250.0, 125.0));
+    let empty = test.build_house_near(vec2(320.0, 125.0));
+    test.g
+        .write::<Happiness>()
+        .by_building
+        .extend([(house, 5), (other, 65), (empty, 100)]);
+    assert_eq!(
+        test.g
+            .read::<Happiness>()
+            .average(&test.g.read::<BuildingInfos>()),
+        50.0
+    );
+    spawn_human(&mut test.g, house).unwrap();
+    spawn_human(&mut test.g, house).unwrap();
+    spawn_human(&mut test.g, other).unwrap();
+    test.g.write::<GameTime>().tick.0 = TICKS_PER_HOUR;
+    let (world, resources) = test.g.world_res();
+    demand_update(world, resources);
+    let demand = test.g.read::<ZoneDemand>();
+    let drivers = demand.drivers(ZoneKind::Residential).unwrap();
+    assert_eq!(drivers.base, 40.0);
+    assert_eq!(drivers.happiness, -20.0);
+    assert_eq!(demand.drivers(ZoneKind::Industrial).unwrap().happiness, 0.0);
+    assert_eq!(crate::economy::balance::K_HAPPY, 0.8);
+    drop(demand);
+    // Above the bootstrap population, happiness can be a negative top driver.
+    let l3 = residence::prototype(Density::High, 3).unwrap();
+    for x in [100.0, 190.0, 290.0, 410.0] {
+        let extra = test.build_house_near(vec2(x, 75.0));
+        residence::register(&test.g, extra, l3);
+        for _ in 0..l3.capacity {
+            let human = spawn_human(&mut test.g, extra).unwrap();
+            test.g.world.humans[human].work = Some(Work::new(house, WorkKind::Worker, 0.0));
+        }
+    }
+    let (world, resources) = test.g.world_res();
+    demand_update(world, resources);
+    assert_eq!(
+        test.g
+            .read::<ZoneDemand>()
+            .top_driver(ZoneKind::Residential),
+        Some((DemandDriver::Happiness, -20.0))
+    );
 }
 
 #[test]
@@ -907,10 +1198,10 @@ fn p2d_service_upkeep_remainder_is_exact_over_one_day() {
         .map(|price| i128::from(price.inner()))
         .sum::<i128>()
         / 200;
-    p2b_place_company(&mut test, "water-pump", vec2(200.0, 70.0), road);
+    p2b_place_company(&mut test, "garbage-depot", vec2(200.0, 70.0), road);
     let initial = i128::from(test.g.read::<Government>().money.inner());
     let target = -i128::from(
-        ServiceID::new("water-pump")
+        ServiceID::new("garbage-depot")
             .prototype()
             .upkeep_per_day
             .inner(),
@@ -976,6 +1267,16 @@ fn p2d_l3_requires_health_and_land_value() {
             .read::<crate::map_dynamic::EnvGrid>()
             .land_value(fixture.house);
         assert_eq!(land_value >= 50, police > 0.0);
+        let requirements = residence::requirements(&fixture.test.g, fixture.house);
+        for (name, expected_value, expected_threshold) in [
+            ("Health coverage", health, 30.0),
+            ("Land value", f32::from(land_value), 50.0),
+        ] {
+            let requirement = requirements.iter().find(|req| req.name == name).unwrap();
+            assert_eq!(requirement.value, expected_value);
+            assert_eq!(requirement.threshold, expected_threshold);
+            assert_eq!(requirement.met, expected_value >= expected_threshold);
+        }
         for hour in 1..=6 {
             fixture.check(hour);
         }
@@ -1007,7 +1308,7 @@ fn p2d_happiness_changes_residential_demand() {
             sim.read::<ZoneDemand>()
                 .drivers(ZoneKind::Residential)
                 .unwrap()
-                .base,
+                .happiness,
         )
     };
     let (neglected, low_demand) = sample(&mut fixture.test.g, 1);
