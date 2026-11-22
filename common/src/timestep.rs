@@ -3,11 +3,25 @@ use std::time::{Duration, Instant};
 const UP_DT: Duration = Duration::from_millis(20);
 
 /// The "as fast as possible" speed. It is high enough that the per-frame budget
-/// (`Timestep::MAXTIME`), not the multiplier, limits the simulation, so the UI stays responsive.
+/// ([`frame_budget`]), not the multiplier, limits the simulation, so the UI stays responsive.
 pub const MAX_WARP: u32 = 10_000;
 
 pub fn debug_up_dt() -> Duration {
     UP_DT
+}
+
+/// Wall time the simulation may spend per frame at `warp`.
+///
+/// Higher speeds trade frame rate for ticks. Input is still handled once per frame,
+/// so the game stays responsive at the lower frame rate.
+pub fn frame_budget(warp: u32) -> Duration {
+    match warp {
+        0..=8 => Duration::from_millis(25),
+        9..=20 => Duration::from_millis(40),
+        // 50× and MAX. MAX does not get 80% of a 20 fps frame (40 ms): that would make it
+        // slower than 50×.
+        _ => Duration::from_millis(60),
+    }
 }
 
 /// A timestep that can be used to update the game state.
@@ -30,8 +44,6 @@ impl Default for Timestep {
 }
 
 impl Timestep {
-    const MAXTIME: Duration = Duration::from_millis(25);
-
     pub fn new(period: Duration) -> Self {
         let period = if period.is_zero() { UP_DT } else { period };
         Self {
@@ -90,7 +102,7 @@ impl Timestep {
         if self.acc < self.period {
             return false;
         }
-        if now.duration_since(self.last_time) >= Self::MAXTIME {
+        if now.duration_since(self.last_time) >= frame_budget(self.warp) {
             // Keep the fractional tick but drop catch-up work that no longer fits this frame.
             self.discard_backlog();
             return false;
@@ -122,7 +134,7 @@ mod tests {
     #[test]
     fn qf1_tick_drops_backlog_when_the_frame_budget_is_spent() {
         let mut step = Timestep::default();
-        step.last_time = Instant::now() - Timestep::MAXTIME;
+        step.last_time = Instant::now() - frame_budget(0);
         step.acc = UP_DT * 10 + Duration::from_millis(5);
 
         assert!(!step.tick());
@@ -174,7 +186,7 @@ mod tests {
         while step.tick_at(frame + tick_cost * count) {
             count += 1;
         }
-        assert_eq!(count, 25);
+        assert_eq!(count, 60);
         assert!(step.acc < step.period, "{:?} carried over", step.acc);
 
         // A slow frame still gets only one budget of ticks.
@@ -184,7 +196,42 @@ mod tests {
         while step.tick_at(frame + tick_cost * count) {
             count += 1;
         }
-        assert_eq!(count, 25);
+        assert_eq!(count, 60);
+    }
+
+    #[test]
+    fn ux2a_frame_budget_grows_with_speed() {
+        let ms = |warp| frame_budget(warp).as_millis();
+        for warp in [0, 1, 3, 8] {
+            assert_eq!(ms(warp), 25, "{warp}×");
+        }
+        assert_eq!(ms(20), 40);
+        assert_eq!(ms(50), 60);
+        assert_eq!(ms(MAX_WARP), 60);
+
+        let ladder = [0, 1, 3, 8, 20, 50, MAX_WARP];
+        assert!(ladder.windows(2).all(|w| ms(w[0]) <= ms(w[1])));
+    }
+
+    #[test]
+    fn ux2a_ticks_run_until_the_budget_for_the_current_speed() {
+        for (warp, budget_ms) in [(8, 25), (20, 40), (50, 60), (MAX_WARP, 60)] {
+            let mut step = Timestep::default();
+            // A long frame leaves more ticks due than any budget allows.
+            let frame = step.last_time + Duration::from_secs(1);
+            step.prepare_frame_at(warp, frame);
+            let tick_cost = Duration::from_millis(1);
+            let mut count = 0;
+            while step.tick_at(frame + tick_cost * count) {
+                count += 1;
+            }
+            assert_eq!(count, budget_ms, "{warp}×");
+            assert!(
+                step.acc < step.period,
+                "{warp}×: {:?} carried over",
+                step.acc
+            );
+        }
     }
 
     #[test]
