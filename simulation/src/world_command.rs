@@ -151,6 +151,8 @@ pub enum Rejection {
     InsufficientFunds,
     MutationFailed,
     TransitNotImplemented,
+    UnexpectedInit,
+    InvalidInitOptions,
 }
 
 #[derive(Default)]
@@ -164,6 +166,10 @@ pub struct CommandOutcomes {
 }
 
 impl CommandOutcomes {
+    pub fn batch_seq(&self) -> u64 {
+        self.sequence
+    }
+
     pub(crate) fn begin_batch(&mut self) {
         static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
         self.sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -307,6 +313,11 @@ impl WorldCommand {
     }
 
     pub(crate) fn apply_in_batch(&self, sim: &mut Simulation) {
+        if matches!(self, Init(_)) {
+            self.reject(sim, Rejection::UnexpectedInit);
+            return;
+        }
+
         let is_transit = transit::is_command(self);
         if is_transit {
             // Record transit commands only after validation and application succeed.
@@ -728,21 +739,7 @@ impl WorldCommand {
             MapLoadTestField { pos, size, spacing } => {
                 load_testfield(&mut sim.map_mut(), pos, size, spacing)
             }
-            Init(ref opts) => {
-                if opts.save_replay {
-                    let mut rep = sim.resources.write::<Replay>();
-                    rep.enabled = true;
-                    let tick = sim.read::<GameTime>().tick;
-                    rep.push(tick, Init(opts.clone()));
-                }
-
-                if opts.terrain_size > 0 {
-                    generate_terrain(sim, opts.terrain_size);
-                }
-
-                sim.resources
-                    .insert::<SimulationOptions>(SimulationOptions::clone(opts));
-            }
+            Init(_) => return Err(Rejection::UnexpectedInit),
             UpdateZone { building, ref zone } => {
                 sim.map_mut()
                     .update_zone(building, zone.clone())
@@ -791,13 +788,40 @@ impl WorldCommand {
         Self::charge_construction(sim, cost);
         Ok(())
     }
+
+    pub(crate) fn bootstrap(sim: &mut Simulation, options: SimulationOptions) -> Result<(), Rejection> {
+        let tick = sim.read::<GameTime>().tick;
+        if tick.0 != crate::INITIAL_TICK || sim.resources.try_read::<SimulationOptions>().is_ok() {
+            return Err(Rejection::UnexpectedInit);
+        }
+        if !options.valid_for_bootstrap() {
+            return Err(Rejection::InvalidInitOptions);
+        }
+        info!("Initializing world with {options:?}");
+        sim.insert(RandProvider::for_world(options.seed));
+        sim.insert(Government {
+            money: Money::new_bucks(i64::from(options.starting_money_bucks)),
+        });
+        {
+            let mut replay = sim.write::<Replay>();
+            replay.enabled = options.save_replay;
+            if replay.enabled {
+                replay.push(tick, Init(Box::new(options)));
+            }
+        }
+        if options.terrain_size > 0 {
+            generate_terrain(sim, options);
+        }
+        sim.resources.insert(options);
+        Ok(())
+    }
 }
 
-fn generate_terrain(sim: &mut Simulation, size: u16) {
+fn generate_terrain(sim: &mut Simulation, options: SimulationOptions) {
     info!("generating terrain..");
     let t = Instant::now();
 
-    sim.map_mut().environment = Environment::new(size, size);
+    sim.map_mut().environment = Environment::from_options(options);
     info!("took {}s", t.elapsed().as_secs_f32());
 
     let c = vec3(3000.0 + 72.2 / 2.0, 200.0 / 2.0 + 1.0, 0.0);
@@ -807,12 +831,15 @@ fn generate_terrain(sim: &mut Simulation, size: u16) {
 
     let pat = LanePatternBuilder::new().rail(true).build();
 
-    sim.map_mut().make_connection(
-        MapProject::ground(c - offy * 100.0),
-        MapProject::ground(c + offy * 120.0),
-        None,
-        &pat,
-    );
+    {
+        let mut map = sim.map_mut();
+        let ground = |pos: Vec3| {
+            MapProject::ground(pos.xy().z(map.environment.height(pos.xy()).unwrap_or(pos.z)))
+        };
+        let from = ground(c - offy * 100.0);
+        let to = ground(c + offy * 120.0);
+        map.make_connection(from, to, None, &pat);
+    }
 
     let external_trading = sim.map_mut().build_special_building(
         &obb,

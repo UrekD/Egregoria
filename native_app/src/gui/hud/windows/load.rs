@@ -1,142 +1,171 @@
-#![allow(unused)]
+use crate::session;
 use crate::uiworld::{SaveLoadState, UiWorld};
-use common::saveload::{Encoder, JSON};
-use egui::{Color32, DroppedFile, Widget};
-use goryak::{
-    button_primary, error, minrow, on_primary, on_secondary_container, primary, textc, ProgressBar,
-    Window,
-};
-use simulation::utils::scheduler::SeqSchedule;
-use simulation::Simulation;
-use std::path::PathBuf;
-use yakui::widgets::Pad;
-use yakui::{Color, Vec2};
 
+#[derive(Default)]
 pub struct LoadState {
-    curpath: Option<PathBuf>,
-    load_fail: String,
-    has_save: bool,
+    #[cfg(test)]
+    pub(crate) has_save: bool,
 }
 
-impl Default for LoadState {
-    fn default() -> Self {
-        Self {
-            curpath: None,
-            load_fail: String::new(),
-            has_save: JSON::filename("world_replay").is_file(),
-        }
+pub(crate) fn replay_controls(ctx: &egui::Context, uiw: &UiWorld) {
+    let mut io = uiw.write::<SaveLoadState>();
+    let Some(replay) = &mut io.replay else {
+        return;
+    };
+    let mut end = false;
+    egui::TopBottomPanel::bottom("replay_controls").show(ctx, |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let progress = if let Some((step, total)) = replay.step_progress() {
+                format!("Replay {step} / {total} steps")
+            } else {
+                let tick = replay.pastt.0;
+                let last_tick = replay.replay.last_tick_recorded.0;
+                format!("Replay tick {tick} / {last_tick}")
+            };
+            ui.label(progress);
+            for (label, speed) in [("Pause", 0), ("Play", 1), ("Fast", 100), ("Max", 10_000)] {
+                if ui.selectable_label(replay.speed == speed, label).clicked() {
+                    replay.speed = speed;
+                }
+            }
+            ui.separator();
+            for ticks in [1, 10, 100, 1000] {
+                if ui.button(format!("+{ticks}")).clicked() {
+                    replay.speed = 0;
+                    replay.advance_n_ticks = ticks;
+                }
+            }
+            ui.separator();
+            end = ui.button("End replay").clicked();
+        });
+    });
+    drop(io);
+    if end {
+        session::end_replay(uiw);
     }
 }
 
-/// Load window
-/// Allows to load a replay from disk and play it
-pub fn load(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
+pub(crate) fn debug_replay(ui: &mut egui::Ui, uiw: &UiWorld) {
+    if uiw.read::<SaveLoadState>().replay.is_some() {
+        return;
+    }
+
+    if ui
+        .add_enabled(
+            crate::network::is_singleplayer(uiw),
+            egui::Button::new("Load replay"),
+        )
+        .clicked()
+    {
+        uiw.write::<session::SessionState>().replay_requested = true;
+    }
+}
+
+pub(crate) fn render_slots(uiw: &UiWorld) {
+    use crate::session::{SessionState, SessionUi, SlotCompatibility};
+    use goryak::{
+        button_primary, button_secondary, error, minrow, on_secondary_container, textc,
+        VertScrollSize,
+    };
+
+    let state = uiw.read::<SessionState>();
+    let mut load = None;
+    let mut delete = None;
+    if state.scanning_slots() {
+        textc(on_secondary_container(), "Scanning…");
+    } else if let Some(message) = &state.slot_error {
+        textc(error(), message.clone());
+    } else if state.slots.is_empty() {
+        textc(on_secondary_container(), "No saved cities.");
+    } else {
+        VertScrollSize::Fixed(310.0).show(|| {
+            goryak::mincolumn(10.0, || {
+                for (entry, compatibility) in &state.slots {
+                    let name = session::display_name(entry);
+                    minrow(12.0, || {
+                        if *compatibility == SlotCompatibility::Compatible {
+                            if button_primary(name).show().clicked {
+                                load = Some(entry.clone());
+                            }
+                        } else {
+                            let reason = if *compatibility == SlotCompatibility::Incompatible {
+                                "incompatible version"
+                            } else {
+                                "unreadable snapshot"
+                            };
+                            textc(
+                                on_secondary_container().adjust(0.6),
+                                format!("{name} ({reason})"),
+                            );
+                        }
+                        if button_secondary("Delete").show().clicked {
+                            delete = Some(entry.id.clone());
+                        }
+                    });
+                    if let Some(meta) = &entry.meta {
+                        textc(
+                            on_secondary_container(),
+                            format!(
+                                "Tick {}  ·  Population {}  ·  {}",
+                                meta.game_tick,
+                                meta.population,
+                                prototypes::Money::new_cents(meta.money_cents)
+                            ),
+                        );
+                    }
+                }
+            });
+        });
+    }
+    drop(state);
+    if let Some(entry) = load {
+        session::load_slot(uiw, entry);
+    } else if let Some(id) = delete {
+        uiw.write::<SessionUi>().delete = Some(id);
+    } else if button_secondary("Back").show().clicked {
+        session::back(uiw);
+    }
+}
+
+pub(crate) fn render_delete(uiw: &UiWorld) -> bool {
+    use crate::session::{SessionState, SessionUi};
+    use goryak::{button_primary, button_secondary, minrow, on_secondary_container, textc, Window};
+    use yakui::widgets::Pad;
+
+    let Some(id) = uiw.read::<SessionUi>().delete.clone() else {
+        return false;
+    };
+    let name = uiw
+        .read::<SessionState>()
+        .slots
+        .iter()
+        .find_map(|(entry, _)| (entry.id == id).then(|| session::display_name(entry).to_owned()))
+        .unwrap_or_else(|| id.to_string());
+    let mut opened = true;
+    let mut confirmed = false;
+    let mut cancelled = false;
     Window {
-        title: "Load".into(),
-        pad: Pad::all(10.0),
+        title: "Delete save?".into(),
+        pad: Pad::all(16.0),
         radius: 10.0,
-        opened,
-        child_spacing: 10.0,
+        opened: &mut opened,
+        child_spacing: 8.0,
     }
     .show(|| {
-        let mut state = uiw.write::<LoadState>();
-        let replay_path = JSON::filename("world_replay");
-
-        if button_primary("New Game").show().clicked {
-            uiw.write::<SaveLoadState>().please_load_sim = Some(Simulation::new(true));
-        }
-
-        if state.has_save {
-            if button_primary(format!("Load {}", replay_path.display()))
-                .show()
-                .clicked
-            {
-                let replay = Simulation::load_replay_from_disk("world");
-
-                if let Some(replay) = replay {
-                    let (mut sim, mut loader) = Simulation::from_replay(replay);
-                    let mut s = SeqSchedule::default();
-                    loader.advance_tick(&mut sim, &mut s); // advance by one tick to get the initial state (like map size info)
-
-                    uiw.write::<SaveLoadState>().please_load = Some(loader);
-                    uiw.write::<SaveLoadState>().please_load_sim = Some(sim);
-                } else {
-                    state.load_fail = "Failed to load replay".to_string();
-                }
-            }
-        } else {
-            textc(
-                on_secondary_container(),
-                format!("No replay found in {}", replay_path.display()),
-            );
-        }
-
-        if let Some(ref mut loading) = uiw.write::<SaveLoadState>().please_load {
-            let ticks_done = loading.pastt.0;
-            let ticks_total = loading.replay.last_tick_recorded.0;
-            ProgressBar {
-                value: ticks_done as f32 / ticks_total as f32,
-                size: Vec2::new(400.0, 25.0),
-                color: primary().adjust(0.7),
-            }
-            .show_children(|| {
-                textc(
-                    on_secondary_container(),
-                    format!("Loading replay: {ticks_done}/{ticks_total}"),
-                );
-            });
-
-            minrow(5.0, || {
-                if button_primary("||").show().clicked {
-                    loading.speed = 0;
-                }
-
-                if button_primary(">").show().clicked {
-                    loading.speed = 1;
-                }
-                if button_primary(">>>").show().clicked {
-                    loading.speed = 100;
-                }
-                if button_primary("max").show().clicked {
-                    loading.speed = 10000;
-                }
-
-                if button_primary("1").show().clicked {
-                    loading.speed = 0;
-                    loading.advance_n_ticks = 1;
-                }
-                if button_primary("10").show().clicked {
-                    loading.speed = 0;
-                    loading.advance_n_ticks = 10;
-                }
-                if button_primary("100").show().clicked {
-                    loading.speed = 0;
-                    loading.advance_n_ticks = 100;
-                }
-                if button_primary("1000").show().clicked {
-                    loading.speed = 0;
-                    loading.advance_n_ticks = 1000;
-                }
-            });
-        }
-
-        if !state.load_fail.is_empty() {
-            textc(error(), state.load_fail.clone());
-        }
+        textc(
+            on_secondary_container(),
+            format!("Delete {name} from disk?"),
+        );
+        minrow(8.0, || {
+            confirmed = button_primary("Delete").show().clicked;
+            cancelled = button_secondary("Cancel").show().clicked;
+        });
     });
-}
-
-impl super::GUIWindows {
-    pub(crate) fn window_states(&mut self) -> impl Iterator<Item = (&'static str, &mut bool)> {
-        [
-            ("Economy", &mut self.economy_open),
-            ("Budget", &mut self.budget_open),
-            ("City Stats", &mut self.citystats_open),
-            ("Settings", &mut self.settings_open),
-            ("Load", &mut self.load_open),
-            #[cfg(feature = "multiplayer")]
-            ("Network", &mut self.network_open),
-        ]
-        .into_iter()
+    if confirmed {
+        uiw.write::<SaveLoadState>().delete_slot = Some(id);
     }
+    if !opened || confirmed || cancelled {
+        uiw.write::<SessionUi>().delete = None;
+    }
+    true
 }

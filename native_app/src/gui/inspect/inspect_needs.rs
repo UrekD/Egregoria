@@ -1,15 +1,14 @@
 use goryak::{error, fixed_spacer, on_secondary_container, textc};
 use prototypes::ServiceKind;
+use simulation::diagnostics::{BuildingDiagnostics, PowerStatus};
 use simulation::map::{BuildingID, BuildingKind};
-use simulation::map_dynamic::{CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow, UtilityStatus};
-use simulation::souls::happiness::Happiness;
-use simulation::souls::residence::{self, Residences};
+use simulation::map_dynamic::{CoverageGrid, EnvGrid, UtilityStatus};
 use simulation::Simulation;
 
-use crate::gui::overlays::{is_coverage_receiver, power_available};
+use crate::gui::overlays::is_coverage_receiver;
 
-pub(super) fn render(sim: &Simulation, building: BuildingID) {
-    let list = needs(sim, building);
+pub(super) fn render(sim: &Simulation, building: BuildingID, diagnostics: &BuildingDiagnostics) {
+    let list = needs(sim, building, diagnostics);
     if list.is_empty() {
         return;
     }
@@ -29,7 +28,7 @@ pub(super) fn render(sim: &Simulation, building: BuildingID) {
             ),
         }
     }
-    let requirements = residence::requirements(sim, building);
+    let requirements = &diagnostics.upgrade_requirements;
     if !requirements.is_empty() {
         fixed_spacer((0.0, 5.0));
         textc(on_secondary_container(), "Upgrade requirements");
@@ -64,36 +63,36 @@ struct Need {
     detail: String,
 }
 
-fn needs(sim: &Simulation, id: BuildingID) -> Vec<Need> {
+fn needs(sim: &Simulation, id: BuildingID, diagnostics: &BuildingDiagnostics) -> Vec<Need> {
     let map = sim.map();
     let Some(building) = map.get(id) else {
         return Vec::new();
     };
     let receiver = is_coverage_receiver(building.kind);
-    let utilities = sim
-        .read::<UtilityFlow>()
-        .status(&map, &sim.read::<Residences>(), id);
+    let utilities = diagnostics.utilities;
     if !receiver && utilities.is_none() {
         return Vec::new();
     }
 
-    let power = sim.read::<ElectricityFlow>();
-    let network = map
-        .electricity
-        .net_id(id)
-        .filter(|_| !building.is_orphaned());
-    let power_met = power_available(&map, &power, id);
     let mut list = Vec::new();
-    let power_detail = match network {
-        None => "No network connection",
-        Some(_) if power_met => "Network powered",
-        Some(_) => "Network blackout",
-    };
     list.push(Need {
         label: "Power",
-        met: Some(power_met),
-        detail: power_detail.into(),
+        met: Some(diagnostics.power == PowerStatus::Available),
+        detail: power_detail(diagnostics.power).into(),
     });
+
+    if let Some(retail) = diagnostics.retail_access {
+        list.push(Need {
+            label: "Retail access",
+            met: Some(retail),
+            detail: if retail {
+                "Store in range"
+            } else {
+                "No store in range"
+            }
+            .into(),
+        });
+    }
 
     if let Some(utilities) = utilities {
         for (label, status, capacity_demand) in [
@@ -170,17 +169,24 @@ fn needs(sim: &Simulation, id: BuildingID) -> Vec<Need> {
     }
 
     if building.kind == BuildingKind::House {
-        let happiness = sim.read::<Happiness>();
         list.push(Need {
             label: "Happiness",
             met: None,
-            detail: happiness.by_building.get(&id).map_or_else(
+            detail: diagnostics.happiness.map_or_else(
                 || "Awaiting first score".into(),
                 |score| format!("{score} / 100"),
             ),
         });
     }
     list
+}
+
+pub(super) fn power_detail(power: PowerStatus) -> &'static str {
+    match power {
+        PowerStatus::MissingNetwork => "No network connection",
+        PowerStatus::Available => "Network powered",
+        PowerStatus::Blackout => "Network blackout",
+    }
 }
 
 #[cfg(test)]
@@ -194,6 +200,11 @@ mod tests {
 
     use super::*;
 
+    fn diagnosed_needs(sim: &Simulation, id: BuildingID) -> Vec<Need> {
+        let diagnostics = simulation::diagnostics::building_diagnostics(sim, id).unwrap();
+        needs(sim, id, &diagnostics)
+    }
+
     #[test]
     fn p2e_fix_orphaned_house_reports_disconnection_immediately() {
         use scenarios::builders::CommandSink;
@@ -202,13 +213,14 @@ mod tests {
         let mut test = TestCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
         let house = fill_houses(&mut test, 1)[0];
         let road = test.sim.map().get(house).unwrap().connected_road.unwrap();
         test.submit(&[WorldCommand::MapRemoveRoad(road)]);
         test.flush();
-        let list = needs(&test.sim, house);
+        let list = diagnosed_needs(&test.sim, house);
         for label in ["Water", "Sewage"] {
             let need = list.iter().find(|need| need.label == label).unwrap();
             assert_eq!(need.met, Some(false));
@@ -221,6 +233,7 @@ mod tests {
         let mut test = TestCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
         let house = fill_houses(&mut test, 1)[0];
@@ -229,7 +242,7 @@ mod tests {
             .by_building
             .insert(house, 63);
 
-        let list = needs(&test.sim, house);
+        let list = diagnosed_needs(&test.sim, house);
         let find = |label| list.iter().find(|need| need.label == label).unwrap();
         assert_eq!(find("Power").met, Some(false));
         assert_eq!(find("Power").detail, "Network blackout");

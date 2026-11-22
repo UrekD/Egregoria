@@ -25,6 +25,10 @@ pub struct Happiness {
 }
 
 impl Happiness {
+    pub fn score(&self, building: BuildingID) -> Option<u8> {
+        self.by_building.get(&building).copied()
+    }
+
     pub fn average(&self, infos: &BuildingInfos) -> f32 {
         let mut residents = 0;
         let mut total = 0;

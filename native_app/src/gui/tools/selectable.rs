@@ -76,7 +76,7 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
         }
     }
 
-    if inp.just_act.contains(&InputAction::Close) || matches!(*tool, Tool::Bulldozer) {
+    if matches!(*tool, Tool::Bulldozer) {
         inspected.e = None;
         inspected_b.e = None;
     }

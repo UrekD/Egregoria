@@ -16,12 +16,17 @@ use crate::transportation::{spawn_parked_vehicle, unpark, Location, VehicleKind,
 use crate::utils::replay::ReplayJson;
 use crate::world_command::{CommandOutcomes, Rejection};
 use crate::{
-    SaveHeader, SaveLoadError, Simulation, SimulationSer, SoulID, WorldCommand, START_COMMANDS,
-    VERSION,
+    NewGameOptions, Replay, SaveHeader, SaveLoadError, Simulation, SimulationOptions,
+    SimulationSer, SoulID, WorldCommand, START_COMMANDS, VERSION,
 };
 use common::saveload::{Bincode, CompressedBincode, Encoder, JSON};
 use geom::{vec2, vec3, Polygon, OBB};
-use prototypes::{BuildingGen, GoodsCompanyID, ItemID, Money, RollingStockID};
+use prototypes::{BuildingGen, GameTime, GoodsCompanyID, ItemID, Money, RollingStockID, Tick};
+
+#[path = "p4a_new_game.rs"]
+mod p4a_new_game;
+#[path = "p4a_slots.rs"]
+mod p4a_slots;
 
 fn street(test: &TestCtx) {
     test.build_roads(&[
@@ -43,6 +48,145 @@ fn run_systems(test: &mut TestCtx) {
     for _ in 0..50 {
         test.tick();
     }
+}
+
+#[test]
+fn p4_init_is_rejected_in_ordinary_batches_even_at_the_initial_tick() {
+    let mut test = TestCtx::new();
+    test.g = Simulation::new_with_options(SimulationOptions {
+        terrain_size: 0,
+        save_replay: true,
+        ..Default::default()
+    });
+    assert!(test.g.read::<Replay>().enabled);
+    let init = WorldCommand::Init(Box::new(SimulationOptions::LEGACY));
+    assert_eq!(test.g.get_tick(), crate::INITIAL_TICK);
+    for tick in [crate::INITIAL_TICK, crate::INITIAL_TICK + 1] {
+        assert_eq!(test.g.get_tick(), tick);
+        let before = test.g.hashes();
+        let replay = JSON::encode(&*test.g.read::<crate::utils::replay::Replay>()).unwrap();
+        init.apply(&mut test.g);
+        assert_eq!(test.g.read::<CommandOutcomes>().last[0].0, "Init");
+        assert!(test.g.read::<CommandOutcomes>().accepted.is_empty());
+        assert_eq!(test.g.hashes(), before);
+        assert_eq!(
+            JSON::encode(&*test.g.read::<crate::utils::replay::Replay>()).unwrap(),
+            replay
+        );
+        test.tick();
+    }
+}
+
+fn recorded_city() -> Simulation {
+    drop(TestCtx::new());
+    Simulation::new_with_options(SimulationOptions {
+        terrain_size: NewGameOptions::MIN_TERRAIN_CHUNKS,
+        ..SimulationOptions::LEGACY
+    })
+}
+
+fn load_recording(sim: &Simulation) -> (Simulation, crate::SimulationReplayLoader) {
+    let bytes = ReplayJson::encode(&*sim.read::<Replay>()).unwrap();
+    Simulation::try_from_replay(ReplayJson::decode(&bytes).unwrap()).unwrap()
+}
+
+fn assert_replay_matches(sim: &Simulation) {
+    let (mut replayed, mut loader) = load_recording(sim);
+    let mut schedule = Simulation::schedule();
+    for _ in 0..10 {
+        if loader.advance_tick(&mut replayed, &mut schedule) {
+            assert_eq!(replayed.get_tick(), sim.get_tick());
+            assert_eq!(replayed.hashes(), sim.hashes());
+            return;
+        }
+    }
+    panic!("replay did not finish");
+}
+
+#[test]
+fn p4_replay_bootstraps_without_stepping_systems() {
+    let sim = recorded_city();
+    let (mut replayed, mut loader) = load_recording(&sim);
+    assert_eq!(replayed.get_tick(), crate::INITIAL_TICK);
+    assert_eq!(replayed.hashes(), sim.hashes());
+    assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
+    assert_eq!(replayed.get_tick(), crate::INITIAL_TICK);
+    assert_eq!(replayed.hashes(), sim.hashes());
+}
+
+#[test]
+fn p4_replay_preserves_paused_edits_and_clock_changes() {
+    let mut sim = recorded_city();
+    let mut schedule = Simulation::schedule();
+    let edit = WorldCommand::SetTaxRate {
+        zone: crate::map::ZoneKind::Residential,
+        rate_permille: 125,
+    };
+    sim.apply_commands([&edit]);
+    assert_replay_matches(&sim);
+
+    sim.apply_commands([&WorldCommand::SetGameTime(GameTime::new(Tick(90_000)))]);
+    assert_replay_matches(&sim);
+
+    sim.tick(&mut schedule, &[]);
+    sim.tick(
+        &mut schedule,
+        [&WorldCommand::SetGameTime(GameTime::new(Tick(50))), &edit],
+    );
+    sim.apply_commands([&WorldCommand::SetTaxRate {
+        zone: crate::map::ZoneKind::Residential,
+        rate_permille: 150,
+    }]);
+    assert_replay_matches(&sim);
+}
+
+#[test]
+fn p4_replay_recognizes_the_constructor_batch_in_legacy_recordings() {
+    let sim = recorded_city();
+    let options = *sim.read::<SimulationOptions>();
+    let mut replay = Replay::default();
+    replay.enabled = true;
+    let initial_tick = Tick(crate::INITIAL_TICK);
+    replay.push(initial_tick, WorldCommand::Init(Box::new(options)));
+    let starters: Vec<(u32, WorldCommand)> = JSON::decode(START_COMMANDS.as_bytes()).unwrap();
+    for (_, command) in starters {
+        replay.push(initial_tick, command);
+    }
+    *sim.write::<Replay>() = replay;
+    assert_replay_matches(&sim);
+}
+
+#[test]
+fn p4_replay_rejects_small_bootstrap_but_legacy_snapshot_loads() {
+    drop(TestCtx::new());
+    let terrain_size = NewGameOptions::MIN_TERRAIN_CHUNKS - 1;
+    assert!(!NewGameOptions {
+        terrain_chunks: terrain_size,
+        ..NewGameOptions::default()
+    }
+    .is_valid());
+    let sim = Simulation::new_with_options(SimulationOptions {
+        terrain_size,
+        save_replay: false,
+        ..SimulationOptions::LEGACY
+    });
+    let name = save_fixture("p4-small-snapshot");
+    CompressedBincode::save(&sim, &name).unwrap();
+    let loaded = Simulation::load_from_disk(&name);
+    std::fs::remove_file(CompressedBincode::filename(&name)).unwrap();
+    assert_eq!(loaded.unwrap().hashes(), sim.hashes());
+
+    let mut replay = Replay::default();
+    replay.enabled = true;
+    replay.push(
+        Tick(crate::INITIAL_TICK),
+        WorldCommand::Init(Box::new(SimulationOptions {
+            terrain_size,
+            ..SimulationOptions::LEGACY
+        })),
+    );
+    let err = Simulation::try_from_replay(replay).err().unwrap();
+    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
 }
 
 #[test]

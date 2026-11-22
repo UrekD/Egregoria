@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
@@ -7,13 +7,15 @@ use std::sync::{mpsc, Mutex, RwLock};
 use std::time::{Duration, SystemTime};
 
 use common::saveload::{self, Encoder, JSONPretty, JSON};
-use engine::{Context, Key, MouseButton};
+use engine::{Context, InputContext, Key, MouseButton};
 use geom::{vec2, vec3, Radians, Vec2, OBB};
 use prototypes::{BuildingGen, GoodsCompanyID};
 use scenarios::builders::{self, CommandSink};
 use serde::{Deserialize, Serialize};
 use simulation::economy::{Budget, CityStats, Government, ZoneDemand};
-use simulation::map::{BuildingKind, Map, ProjectFilter, ProjectKind, Zone, ZoneGrid, ZoneKind};
+use simulation::map::{
+    BuildingKind, Map, ProjectFilter, ProjectKind, RoadID, Zone, ZoneGrid, ZoneKind,
+};
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand, WorldCommands};
 use simulation::Simulation;
@@ -22,6 +24,7 @@ use crate::gui::{
     overlays::OverlayMode, toolbox::building::BuildingTab, top_demand_driver, zoning::ZONES,
     GuiState, InspectedBuilding, Tool,
 };
+use crate::session::{self, SessionScreen};
 use crate::uiworld::{ReceivedCommands, UiWorld};
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
@@ -61,6 +64,7 @@ enum Step {
     Builder(Builder),
     SelectTool(Tool),
     SetOverlay(OverlayMode),
+    SetSession(SessionScreen),
     OpenWindow(String),
     Assert(Assertion),
     Screenshot(String),
@@ -82,7 +86,15 @@ enum Assertion {
     NoRejections,
     ServicesTab,
     HouseInspector,
-    BuildingCount { prototype: String, count: usize },
+    BuildingCount {
+        prototype: String,
+        count: usize,
+    },
+    RoadRemovals {
+        before: String,
+        after: String,
+        expected: BTreeSet<RoadID>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -129,6 +141,7 @@ enum Wait {
 pub(crate) struct Automation {
     steps: VecDeque<Step>,
     pointer_events: VecDeque<PointerEvent>,
+    pointer_input: InputContext,
     step_number: usize,
     dir: PathBuf,
     exit_after_script: bool,
@@ -173,6 +186,7 @@ pub(crate) fn configure() -> Result<(), String> {
     *STARTUP.lock().unwrap() = Some(Automation {
         steps,
         pointer_events: VecDeque::new(),
+        pointer_input: InputContext::default(),
         step_number: 0,
         dir,
         exit_after_script: args.exit_after_script,
@@ -276,7 +290,30 @@ impl Automation {
         schedule: &mut SeqSchedule,
         rebuilt_version: Option<u64>,
     ) -> Result<bool, String> {
+        // The window can still receive real cursor and focus events during a script.
+        // Restore the script's cursor before Yakui handles the next queued event.
+        move_yakui_pointer(ctx, self.pointer_input.mouse.screen);
         let result = self.advance(ctx, uiw, sim, schedule, rebuilt_version);
+        match result {
+            Ok(true) => {
+                ctx.input.mouse.clone_from(&self.pointer_input.mouse);
+                ctx.egui.last_mouse_captured = engine::pointer_over_egui(ctx.input.mouse.screen);
+                self.pointer_input
+                    .pointer_frame(ctx.egui.last_mouse_captured)
+                    .publish();
+                self.pointer_input.end_frame();
+            }
+            Ok(false)
+                if self
+                    .pointer_input
+                    .physical_mouse_buttons()
+                    .contains(&MouseButton::Left) =>
+            {
+                PointerEvent::Button { down: false }.send(ctx, &mut self.pointer_input);
+                ctx.input.mouse.pressed.remove(&MouseButton::Left);
+            }
+            _ => {}
+        }
         result.map_err(|e| format!("script step {}: {e}", self.step_number))
     }
 
@@ -312,14 +349,14 @@ impl Automation {
         self.wait = None;
 
         let pending = std::mem::take(&mut *uiw.commands());
-        if !pending.is_empty() {
+        if session::world_interaction(uiw) && !pending.is_empty() {
             self.apply_commands(uiw, &mut sim.write().unwrap(), schedule, pending);
             return Ok(true);
         }
 
         // Each event gets its own update and layout pass before the next event.
         if let Some(event) = self.pointer_events.pop_front() {
-            event.send(ctx);
+            event.send(ctx, &mut self.pointer_input);
             return Ok(true);
         }
 
@@ -330,6 +367,20 @@ impl Automation {
             return Ok(false);
         };
         self.step_number += 1;
+        if !session::playing(uiw)
+            && matches!(
+                step,
+                Step::RunTicks(1..)
+                    | Step::Commands(_)
+                    | Step::BuildSpecialBuildings(_)
+                    | Step::EmptyTreasury
+                    | Step::Builder(_)
+                    | Step::Camera { .. }
+                    | Step::SelectTool(_)
+            )
+        {
+            return Err("world interactions require the Playing session".into());
+        }
         match step {
             Step::WaitFrames(count) => {
                 self.wait = Some(Wait::Frames {
@@ -389,7 +440,7 @@ impl Automation {
                         PointerEvent::Button { down: false },
                     ]),
                 }
-                PointerEvent::Move(start).send(ctx);
+                PointerEvent::Move(start).send(ctx, &mut self.pointer_input);
             }
             Step::Key { key, down } => key.send(ctx, down),
             Step::EmptyTreasury => {
@@ -444,7 +495,24 @@ impl Automation {
             }
             Step::SelectTool(tool) => *uiw.write::<Tool>() = tool,
             Step::SetOverlay(mode) => *uiw.write::<OverlayMode>() = mode,
+            Step::SetSession(screen) => {
+                if !session::set_screen(uiw, screen) {
+                    return Err("session screens are unavailable during multiplayer".into());
+                }
+            }
             Step::OpenWindow(name) => {
+                let screen = match name.as_str() {
+                    "Main Menu" => Some(SessionScreen::MainMenu),
+                    "New Game" => Some(SessionScreen::NewGame),
+                    "Load" => Some(SessionScreen::LoadGame),
+                    _ => None,
+                };
+                if let Some(screen) = screen {
+                    if !session::set_screen(uiw, screen) {
+                        return Err("session screens are unavailable during multiplayer".into());
+                    }
+                    return Ok(true);
+                }
                 let mut gui = uiw.write::<GuiState>();
                 let (_, open) = gui
                     .windows
@@ -453,9 +521,7 @@ impl Automation {
                     .ok_or_else(|| format!("unknown window {name:?}"))?;
                 *open = true;
             }
-            Step::Assert(assertion) => {
-                assertion.check(uiw, &sim.read().unwrap(), self.first_rejection)?
-            }
+            Step::Assert(assertion) => assertion.check(uiw, &sim.read().unwrap(), self)?,
             Step::Screenshot(name) => {
                 ctx.request_screenshot(self.output_path(&name, "png")?)?;
                 self.wait = Some(Wait::Screenshot);
@@ -508,6 +574,7 @@ impl Automation {
         struct Snapshot<'a> {
             tick: u64,
             active_tool: Tool,
+            road_ids: BTreeSet<RoadID>,
             open_windows: Vec<&'static str>,
             city_stats: &'a CityStats,
             zone_cells: usize,
@@ -528,6 +595,7 @@ impl Automation {
         let state = Snapshot {
             tick: sim.get_tick(),
             active_tool: *uiw.read::<Tool>(),
+            road_ids: sim.map().roads().keys().collect(),
             open_windows,
             city_stats: &sim.read::<CityStats>(),
             zone_cells: sim.read::<ZoneGrid>().cells.len(),
@@ -551,6 +619,19 @@ impl Automation {
             file.flush()
         };
         write().map_err(|e| format!("writing state {}: {e}", path.display()))
+    }
+
+    fn dump_road_ids(&self, name: &str) -> Result<BTreeSet<RoadID>, String> {
+        #[derive(Deserialize)]
+        struct RoadSnapshot {
+            road_ids: BTreeSet<RoadID>,
+        }
+
+        let path = self.output_path(name, "json")?;
+        fs::read(&path)
+            .and_then(|bytes| JSON::decode::<RoadSnapshot>(&bytes))
+            .map(|snapshot| snapshot.road_ids)
+            .map_err(|e| format!("reading state {}: {e}", path.display()))
     }
 }
 
@@ -582,15 +663,10 @@ impl SpecialBuildingPlacement {
 }
 
 impl Assertion {
-    fn check(
-        self,
-        uiw: &UiWorld,
-        sim: &Simulation,
-        first_rejection: Option<(&'static str, Rejection)>,
-    ) -> Result<(), String> {
+    fn check(self, uiw: &UiWorld, sim: &Simulation, automation: &Automation) -> Result<(), String> {
         match self {
             Self::NoRejections => {
-                if let Some((command, reason)) = first_rejection {
+                if let Some((command, reason)) = automation.first_rejection {
                     return Err(format!("unexpected rejection of {command}: {reason:?}"));
                 }
             }
@@ -627,6 +703,21 @@ impl Assertion {
                     ));
                 }
             }
+            Self::RoadRemovals {
+                before,
+                after,
+                expected,
+            } => {
+                let before_ids = automation.dump_road_ids(&before)?;
+                let after_ids = automation.dump_road_ids(&after)?;
+                let removed: BTreeSet<_> = before_ids.difference(&after_ids).copied().collect();
+                if removed != expected || !after_ids.is_subset(&before_ids) {
+                    let added: Vec<_> = after_ids.difference(&before_ids).collect();
+                    return Err(format!(
+                        "{before} to {after}: expected removals {expected:?}, found {removed:?} and additions {added:?}"
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -655,30 +746,35 @@ impl PointerPosition {
 }
 
 impl PointerEvent {
-    fn send(self, ctx: &mut Context) {
+    fn send(self, ctx: &mut Context, input: &mut InputContext) {
         use yakui::event::Event;
 
         match self {
             Self::Move(pos) => {
-                ctx.input.mouse.screen_delta += pos - ctx.input.mouse.screen;
-                ctx.input.mouse.screen = pos;
-                ctx.yakui
-                    .yakui
-                    .handle_event(Event::CursorMoved(Some(yakui::Vec2::new(pos.x, pos.y))));
+                input.mouse.screen_delta += pos - input.mouse.screen;
+                input.mouse.screen = pos;
+                move_yakui_pointer(ctx, pos);
             }
             Self::Button { down } => {
+                input.observe_mouse_button(MouseButton::Left, down);
                 let captured = ctx.yakui.yakui.handle_event(Event::MouseButtonChanged {
                     button: yakui::input::MouseButton::One,
                     down,
                 });
                 if down && !captured {
-                    ctx.input.mouse.pressed.insert(MouseButton::Left);
-                } else if !down {
-                    ctx.input.mouse.pressed.remove(&MouseButton::Left);
+                    input.mouse.pressed.insert(MouseButton::Left);
                 }
             }
         }
     }
+}
+
+fn move_yakui_pointer(ctx: &mut Context, pos: Vec2) {
+    ctx.yakui
+        .yakui
+        .handle_event(yakui::event::Event::CursorMoved(Some(yakui::Vec2::new(
+            pos.x, pos.y,
+        ))));
 }
 
 impl ScriptKey {
@@ -775,6 +871,19 @@ mod tests {
         ));
         assert!(JSON::decode::<Step>(br#"{"SetOverlay":{"Coverage":"WaterPump"}}"#).is_err());
         assert!(JSON::decode::<Step>(br#"{"SetOverlay":{"Coverage":"SewageOutlet"}}"#).is_err());
+    }
+
+    #[test]
+    fn p4_session_and_traffic_steps_decode() {
+        assert!(matches!(
+            JSON::decode::<Step>(br#"{"SetSession":"MainMenu"}"#).unwrap(),
+            Step::SetSession(SessionScreen::MainMenu)
+        ));
+        assert!(matches!(
+            JSON::decode::<Step>(br#"{"SetOverlay":"Traffic"}"#).unwrap(),
+            Step::SetOverlay(OverlayMode::Traffic)
+        ));
+        assert_eq!(SessionScreen::default(), SessionScreen::Playing);
     }
 
     #[test]

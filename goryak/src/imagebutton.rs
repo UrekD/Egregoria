@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::time::Instant;
+use std::time::Duration;
 
 use yakui_core::event::{EventInterest, EventResponse, WidgetEvent};
 use yakui_core::geometry::{Color, Constraints, Rect, Vec2};
@@ -8,7 +8,7 @@ use yakui_core::paint::PaintRect;
 use yakui_core::widget::{EventContext, LayoutContext, PaintContext, Widget};
 use yakui_core::{Response, TextureId};
 
-use crate::{on_primary, padxy, primary, round_rect, textc};
+use crate::{primary, tooltip::tooltip_after};
 
 /**
 A button based on an image
@@ -54,8 +54,11 @@ impl ImageButton {
         }
     }
 
-    pub fn show(self) -> Response<ImageButtonResponse> {
-        yakui_widgets::util::widget::<ImageButtonWidget>(self)
+    pub fn show(mut self) -> Response<ImageButtonResponse> {
+        let label = std::mem::take(&mut self.tooltip);
+        tooltip_after(label, Duration::from_millis(500), || {
+            yakui_widgets::util::widget::<ImageButtonWidget>(self)
+        })
     }
 }
 
@@ -97,8 +100,6 @@ pub fn image_button(
 pub struct ImageButtonWidget {
     props: ImageButton,
     resp: ImageButtonResponse,
-    stopped_moving: Option<Instant>,
-    show_tooltip: bool,
 }
 
 #[derive(Copy, Clone, Debug, Default)]
@@ -117,8 +118,6 @@ impl Widget for ImageButtonWidget {
         Self {
             props: ImageButton::empty(),
             resp: ImageButtonResponse::default(),
-            stopped_moving: None,
-            show_tooltip: false,
         }
     }
 
@@ -128,38 +127,14 @@ impl Widget for ImageButtonWidget {
         self.resp.mouse_entered = false;
         self.resp.clicked = false;
 
-        if !self.props.tooltip.is_empty() {
-            if let Some(i) = self.stopped_moving {
-                if i.elapsed().as_millis() > 500 {
-                    self.show_tooltip = true;
-                }
-                if self.show_tooltip {
-                    round_rect(5.0, primary(), || {
-                        padxy(5.0, 4.0, || {
-                            textc(on_primary(), self.props.tooltip.clone());
-                        });
-                    });
-                }
-            }
-        }
-
         resp
     }
 
-    fn layout(&self, mut ctx: LayoutContext<'_>, input: Constraints) -> Vec2 {
-        if let Some(tooltip) = ctx.dom.get_current().children.first() {
-            let size = ctx.calculate_layout(*tooltip, Constraints::none());
-            ctx.layout.set_pos(
-                *tooltip,
-                Vec2::new((self.props.size.x - size.x) / 2.0, -size.y - 10.0),
-            );
-        }
-
+    fn layout(&self, _: LayoutContext<'_>, input: Constraints) -> Vec2 {
         input.constrain_min(self.props.size)
     }
 
-    fn paint(&self, mut ctx: PaintContext<'_>) {
-        let node = ctx.dom.get_current();
+    fn paint(&self, ctx: PaintContext<'_>) {
         let layout_node = ctx.layout.get(ctx.dom.current()).unwrap();
 
         let curcolor = if self.resp.mouse_down {
@@ -176,10 +151,6 @@ impl Widget for ImageButtonWidget {
             rect.texture = Some((tex, Rect::ONE));
         }
         rect.add(ctx.paint);
-
-        for &child in &node.children {
-            ctx.paint(child);
-        }
     }
 
     fn event_interest(&self) -> EventInterest {
@@ -188,13 +159,6 @@ impl Widget for ImageButtonWidget {
 
     fn event(&mut self, _: EventContext<'_>, event: &WidgetEvent) -> EventResponse {
         match *event {
-            WidgetEvent::MouseMoved(Some(_)) => {
-                if self.resp.hovering {
-                    self.stopped_moving = Some(Instant::now());
-                }
-                self.show_tooltip = false;
-                EventResponse::Bubble
-            }
             WidgetEvent::MouseEnter => {
                 self.resp.mouse_entered = true;
                 self.resp.hovering = true;
@@ -202,8 +166,6 @@ impl Widget for ImageButtonWidget {
             }
             WidgetEvent::MouseLeave => {
                 self.resp.hovering = false;
-                self.show_tooltip = false;
-                self.stopped_moving = None;
                 EventResponse::Bubble
             }
             WidgetEvent::MouseButtonChanged {

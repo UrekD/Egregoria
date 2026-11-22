@@ -2,6 +2,7 @@ use crate::debug_gui::debug_window::DebugState;
 use crate::gui::follow::FollowEntity;
 use crate::gui::{InspectedBuilding, InspectedEntity};
 use crate::uiworld::UiWorld;
+use geom::Vec3;
 use goryak::{button_primary, primary_link};
 use inspect_building::inspect_building;
 use inspect_human::inspect_human;
@@ -62,11 +63,16 @@ pub fn new_inspector(uiworld: &UiWorld, sim: &Simulation) {
 
 pub fn building_link(uiworld: &UiWorld, sim: &Simulation, b: BuildingID) {
     if primary_link(format!("{:?}", b.data())) {
-        uiworld.write::<InspectedBuilding>().e = Some(b);
         if let Some(b) = sim.map().buildings().get(b) {
-            uiworld.camera_mut().targetpos = b.door_pos;
+            focus_building(uiworld, b.id, b.door_pos);
         }
     }
+}
+
+pub(crate) fn focus_building(uiworld: &UiWorld, building: BuildingID, door: Vec3) {
+    uiworld.write::<InspectedBuilding>().e = Some(building);
+    uiworld.write::<FollowEntity>().0 = None;
+    uiworld.camera_mut().targetpos = door;
 }
 
 pub fn entity_link(uiworld: &UiWorld, sim: &Simulation, e: impl Into<AnyEntity>) {

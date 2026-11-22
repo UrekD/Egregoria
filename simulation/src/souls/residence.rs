@@ -242,7 +242,7 @@ pub fn is_retail_store(kind: BuildingKind) -> bool {
     })
 }
 
-pub(super) fn retail_store_positions(map: &Map) -> Vec<Vec2> {
+pub fn retail_store_positions(map: &Map) -> Vec<Vec2> {
     map.buildings()
         .values()
         .filter(|building| is_retail_store(building.kind))
@@ -250,16 +250,31 @@ pub(super) fn retail_store_positions(map: &Map) -> Vec<Vec2> {
         .collect()
 }
 
-pub(super) fn has_retail_access(stores: &[Vec2], door: Vec2) -> bool {
+pub fn has_retail_access(stores: &[Vec2], door: Vec2) -> bool {
     stores
         .iter()
         .any(|store| store.distance2(door) <= RETAIL_ACCESS_RADIUS_M.powi(2))
 }
 
-pub(super) fn has_power(map: &Map, electricity: &ElectricityFlow, building: BuildingID) -> bool {
-    map.electricity
-        .net_id(building)
-        .is_some_and(|network| !electricity.blackout(network))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowerStatus {
+    Available,
+    MissingNetwork,
+    Blackout,
+}
+
+/// State of the electrical graph at this building. A disconnected building
+/// can still have its own isolated node in the graph.
+pub fn power_status(map: &Map, electricity: &ElectricityFlow, building: BuildingID) -> PowerStatus {
+    match map.electricity.net_id(building) {
+        None => PowerStatus::MissingNetwork,
+        Some(network) if electricity.blackout(network) => PowerStatus::Blackout,
+        Some(_) => PowerStatus::Available,
+    }
+}
+
+pub fn has_power(map: &Map, electricity: &ElectricityFlow, building: BuildingID) -> bool {
+    power_status(map, electricity, building) == PowerStatus::Available
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -376,6 +391,14 @@ fn next_prototype(residence: &Residence) -> Option<&'static ResidencePrototype> 
 /// Requirements for a residence's next level. Coverage and resident ratios are
 /// percentages, land value is on its 0–100 scale, and availability is 0 or 1.
 pub fn requirements(sim: &Simulation, building: BuildingID) -> Vec<Requirement> {
+    requirements_with_stores(sim, building, None)
+}
+
+pub(crate) fn requirements_with_stores(
+    sim: &Simulation,
+    building: BuildingID,
+    stores: Option<&[Vec2]>,
+) -> Vec<Requirement> {
     let residences = sim.read::<Residences>();
     let Some(residence) = residences.by_building.get(&building) else {
         return Vec::new();
@@ -388,13 +411,21 @@ pub fn requirements(sim: &Simulation, building: BuildingID) -> Vec<Requirement> 
     let Some((building, info)) = map.get(building).zip(infos.get(building)) else {
         return Vec::new();
     };
+    let positions;
+    let stores = match stores {
+        Some(stores) => stores,
+        None => {
+            positions = retail_store_positions(&map);
+            &positions
+        }
+    };
     Progression {
         map: &map,
         electricity: &sim.read::<ElectricityFlow>(),
         utilities: &sim.read::<UtilityFlow>(),
         coverage: &sim.read::<CoverageGrid>(),
         environment: &sim.read::<EnvGrid>(),
-        stores: &retail_store_positions(&map),
+        stores,
     }
     .requirements(
         building,

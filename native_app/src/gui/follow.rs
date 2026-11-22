@@ -10,7 +10,6 @@ impl FollowEntity {
     pub fn update_camera(state: &mut State) {
         let just = &state.uiw.read::<InputMap>().just_act;
         if [
-            InputAction::Close,
             InputAction::CameraMove,
             InputAction::GoForward,
             InputAction::GoBackward,

@@ -1,12 +1,15 @@
 use geom::{fnoise, simplex_noise, vec2, Vec2};
 
-pub(crate) fn height(p: Vec2) -> (f32, Vec2) {
-    let (noise, mut grad) = fnoise::<4>(Vec2::splat(70.69) + 0.00006 * p);
+pub(crate) const LEGACY_VALLEY_AXIS: f32 = 25_000.0;
+
+pub(crate) fn height(p: Vec2, noise_offset: Vec2, valley_axis: f32) -> (f32, Vec2) {
+    let (noise, mut grad) = fnoise::<4>(Vec2::splat(70.69) + 0.00006 * p + noise_offset);
     grad *= 0.00006;
 
     let ratio = 0.00005;
-    let mut noise = noise - 0.1 + (p.y * 2.0 - 25000.0).abs() * ratio;
-    grad += vec2(0.0, (p.y * 2.0 - 25000.0).signum() * ratio);
+    let valley_distance = p.y * 2.0 - valley_axis;
+    let mut noise = noise - 0.1 + valley_distance.abs() * ratio;
+    grad += vec2(0.0, valley_distance.signum() * ratio);
     if noise < -0.0 {
         noise = noise * noise;
         grad = 2.0 * noise * grad;

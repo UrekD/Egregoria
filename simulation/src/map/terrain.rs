@@ -12,6 +12,8 @@ use prototypes::{Tick, DELTA};
 
 use crate::map::procgen::heightmap;
 use crate::map::procgen::heightmap::tree_density;
+use crate::utils::rand_provider::RandProvider;
+use crate::{MapPreset, NewGameOptions, SimulationOptions};
 
 pub type TerrainChunkID = common::ChunkID_512;
 
@@ -57,21 +59,46 @@ impl Default for Environment {
 
 impl Environment {
     pub fn new(w: u16, h: u16) -> Self {
+        Self::generate(
+            w,
+            h,
+            MapPreset::Procedural,
+            0,
+            heightmap::LEGACY_VALLEY_AXIS,
+        )
+    }
+
+    pub(crate) fn from_options(options: SimulationOptions) -> Self {
+        let size = options.terrain_size;
+        let mut valley_axis = heightmap::LEGACY_VALLEY_AXIS;
+        // Low-level small maps used by scenarios retain their legacy terrain.
+        if size >= NewGameOptions::MIN_TERRAIN_CHUNKS {
+            valley_axis *= f32::from(size) / f32::from(SimulationOptions::LEGACY.terrain_size);
+        }
+        Self::generate(size, size, options.preset, options.seed, valley_axis)
+    }
+
+    fn generate(w: u16, h: u16, preset: MapPreset, seed: u64, valley_axis: f32) -> Self {
         let mut me = Self {
             heightmap: Heightmap::new(w, h),
             trees: Grid::new(TREE_GRID_SIZE as i32),
         };
+        // Bound the shift in noise space to keep enough precision for nearby cells.
+        let noise_offset = if seed == 0 {
+            Vec2::ZERO
+        } else {
+            let mut rng = RandProvider::new(seed);
+            64.0 * vec2(rng.next_f32(), rng.next_f32())
+        };
         for y in 0..h {
             let chunks: Vec<_> = (0..w)
                 .into_par_iter()
-                .map(|x| me.generate_chunk((x, y)))
+                .map(|x| me.generate_chunk((x, y), preset, seed, noise_offset, valley_axis))
                 .collect();
-            for (x, chunk) in (0..w).zip(chunks) {
-                if let Some((v, trees)) = chunk {
-                    me.heightmap.set_chunk((x, y), v);
-                    for tree in trees {
-                        me.trees.insert(tree.pos, tree);
-                    }
+            for (x, (chunk, trees)) in (0..w).zip(chunks) {
+                me.heightmap.set_chunk((x, y), chunk);
+                for tree in trees {
+                    me.trees.insert(tree.pos, tree);
                 }
             }
         }
@@ -256,27 +283,36 @@ impl Environment {
         }
     }
 
-    fn generate_chunk(&self, (x, y): (u16, u16)) -> Option<(Chunk, Vec<Tree>)> {
-        let mut heights = [[0; TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION];
-
-        let offchunk = vec2(x as f32, y as f32) * TerrainChunkID::SIZE_F32;
-        for (y, l) in heights.iter_mut().enumerate() {
-            for (x, h) in l.iter_mut().enumerate() {
-                let offcell = vec2(x as f32, y as f32) * CELL_SIZE;
-                let mut rh = heightmap::height(offchunk + offcell).0 - 0.12;
-
-                if rh > 0.0 {
-                    rh = 0.0;
+    fn generate_chunk(
+        &self,
+        (x, y): (u16, u16),
+        preset: MapPreset,
+        seed: u64,
+        noise_offset: Vec2,
+        valley_axis: f32,
+    ) -> (Chunk, Vec<Tree>) {
+        let pchunk = TerrainChunkID::SIZE_F32 * vec2(x as f32, y as f32);
+        let mut heights = [[pack_height(10.0); TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION];
+        if preset == MapPreset::Procedural {
+            for (y, line) in heights.iter_mut().enumerate() {
+                for (x, height) in line.iter_mut().enumerate() {
+                    let offcell = vec2(x as f32, y as f32) * CELL_SIZE;
+                    let mut relief =
+                        heightmap::height(pchunk + offcell, noise_offset, valley_axis).0 - 0.12;
+                    if relief > 0.0 {
+                        relief = 0.0;
+                    }
+                    *height = pack_height(1000.0 * relief);
                 }
-
-                *h = pack_height(1000.0 * rh);
             }
         }
-
         let chunk = Chunk::new(heights);
 
-        let rchunk = common::rand::rand2(x as f32, y as f32);
-        let pchunk = TerrainChunkID::SIZE_F32 * vec2(x as f32, y as f32);
+        let rchunk = if seed == 0 {
+            common::rand::rand2(x as f32, y as f32)
+        } else {
+            common::rand::randhash((seed, x, y))
+        };
 
         const RES_TREES: usize = 64;
         const TCELLW: f32 = TerrainChunkID::SIZE_F32 / RES_TREES as f32;
@@ -308,7 +344,7 @@ impl Environment {
             }
         }
 
-        Some((chunk, trees))
+        (chunk, trees)
     }
 }
 

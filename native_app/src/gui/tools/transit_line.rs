@@ -37,7 +37,7 @@ impl LineDraft {
         self.stops.len()
     }
 
-    fn select_stop(&mut self, stop: StopID) -> Option<WorldCommand> {
+    pub(super) fn select_stop(&mut self, stop: StopID) -> Option<WorldCommand> {
         if self.stops.first() == Some(&stop) && self.stops.len() >= 2 {
             let stops = self.stops.clone();
             return Some(match self.editing {

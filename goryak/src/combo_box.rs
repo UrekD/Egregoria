@@ -56,3 +56,52 @@ pub fn combo_box(selected: &mut usize, items: &[&str], w: f32) -> bool {
 
     changed
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yakui_core::event::Event;
+    use yakui_core::geometry::Rect;
+    use yakui_core::input::MouseButton;
+    use yakui_core::{WidgetId, Yakui};
+    use yakui_widgets::widgets::ColoredBoxWidget;
+
+    #[test]
+    fn p4d_combo_padding_and_option_gaps_block_world_input() {
+        fn panel(ui: &Yakui, id: WidgetId) -> Option<Rect> {
+            let node = ui.dom().get(id)?;
+            if node.widget.is::<ColoredBoxWidget>() {
+                return Some(ui.layout_dom().get(id)?.rect);
+            }
+            node.children.iter().find_map(|&child| panel(ui, child))
+        }
+
+        let mut ui = Yakui::new();
+        let size = Vec2::new(400.0, 160.0);
+        ui.set_surface_size(size);
+        ui.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, size));
+        let mut selected = 0;
+        let mut frame = |ui: &mut Yakui| {
+            ui.start();
+            combo_box(&mut selected, &["Traffic", "Electricity"], 180.0);
+            crate::render_tooltip();
+            ui.finish();
+            ui.paint();
+        };
+        frame(&mut ui);
+        ui.handle_event(Event::CursorMoved(Some(Vec2::new(15.0, 12.0))));
+        for down in [true, false] {
+            ui.handle_event(Event::MouseButtonChanged {
+                button: MouseButton::One,
+                down,
+            });
+        }
+        frame(&mut ui);
+        let panel = panel(&ui, ui.dom().root()).expect("the dropdown is open");
+        let padding = panel.pos() + Vec2::ONE;
+        let gap = panel.pos() + panel.size() * 0.5;
+        assert!(!crate::pointer_over_ui(panel.pos().x - 1.0, padding.y));
+        assert!(crate::pointer_over_ui(padding.x, padding.y));
+        assert!(crate::pointer_over_ui(gap.x, gap.y));
+    }
+}

@@ -20,6 +20,15 @@ pub struct GUIChatState {
     chat_bar_showed: bool,
 }
 
+pub(crate) fn close(uiw: &UiWorld) -> bool {
+    let mut state = uiw.write::<GUIChatState>();
+    if !std::mem::take(&mut state.chat_bar_showed) {
+        return false;
+    }
+    state.cur_msg.clear();
+    true
+}
+
 pub fn chat(uiw: &UiWorld, sim: &Simulation) {
     const MAX_MESSAGES: usize = 30;
     let mut state = uiw.write::<GUIChatState>();
@@ -34,15 +43,6 @@ pub fn chat(uiw: &UiWorld, sim: &Simulation) {
 
     if just_opened {
         state.chat_bar_showed = true;
-    }
-
-    if uiw
-        .read::<InputMap>()
-        .just_act
-        .contains(&InputAction::Close)
-    {
-        state.chat_bar_showed = false;
-        state.cur_msg.clear();
     }
 
     let msgs: Vec<_> = mstate

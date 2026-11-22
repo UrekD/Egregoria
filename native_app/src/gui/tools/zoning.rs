@@ -61,6 +61,14 @@ impl Default for ZoningState {
     }
 }
 
+impl ZoningState {
+    pub(crate) fn cancel_gesture(&mut self) {
+        self.drag_start = None;
+        self.last_brush = None;
+        self.over_controls = false;
+    }
+}
+
 pub fn properties(uiworld: &UiWorld) {
     let mut state = uiworld.write::<ZoningState>();
     state.over_controls = is_hovered(|| {
@@ -133,11 +141,7 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         state.last_brush = None;
         return;
     };
-    if !active
-        || state.over_controls
-        || input.just_act.contains(&InputAction::Close)
-        || input.act.contains(&InputAction::CameraRotate)
-    {
+    if !active || state.over_controls || input.act.contains(&InputAction::CameraRotate) {
         state.drag_start = None;
         state.last_brush = None;
         state.over_controls &= active;
@@ -244,4 +248,17 @@ fn paint_area(start: Vec2, end: Vec2, bounds: AABB) -> Option<OBB> {
         .min((bounds.ur / ZONE_CELL_SIZE).floor() * ZONE_CELL_SIZE);
     let size = ur - ll;
     (size.x > 0.0 && size.y > 0.0).then(|| OBB::new((ll + ur) * 0.5, Vec2::X, size.x, size.y))
+}
+
+#[cfg(test)]
+impl ZoningState {
+    pub(crate) fn start_test_gesture(&mut self) {
+        self.drag_start = Some(Vec2::X);
+        self.last_brush = Some(Vec2::Y);
+        self.over_controls = true;
+    }
+
+    pub(crate) fn gesture_is_clear(&self) -> bool {
+        self.drag_start.is_none() && self.last_brush.is_none() && !self.over_controls
+    }
 }

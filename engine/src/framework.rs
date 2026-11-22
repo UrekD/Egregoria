@@ -53,7 +53,33 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
         target.set_control_flow(ControlFlow::Poll);
 
         if let Event::WindowEvent { event, .. } = &event {
+            let egui_events = ctx.egui.platform.egui_input().events.len();
             ctx.egui.handle_event(&ctx.gfx.window, event);
+            let raw = ctx.egui.platform.egui_input_mut();
+            if raw.events.len() == egui_events {
+                if let WindowEvent::MouseInput {
+                    state: winit::event::ElementState::Released,
+                    button,
+                    ..
+                } = event
+                {
+                    // Egui's adapter omits button events without a cursor position.
+                    if push_egui_release(raw, (*button).into()) {
+                        raw.events.push(egui::Event::PointerGone);
+                    }
+                }
+            }
+            if matches!(event, WindowEvent::Focused(false)) {
+                for &button in ctx.input.physical_mouse_buttons() {
+                    push_egui_release(raw, button);
+                }
+                raw.events.push(egui::Event::PointerGone);
+                #[cfg(feature = "yakui")]
+                ctx.yakui
+                    .yakui
+                    .handle_event(yakui::event::Event::CursorMoved(None));
+            }
+            ctx.input.observe_window_event(event);
         }
 
         #[cfg(feature = "yakui")]
@@ -122,6 +148,7 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                         let d = last_update.elapsed();
                         last_update = Instant::now();
                         ctx.delta = d.as_secs_f32();
+                        ctx.input.publish_pointer_frame(&ctx.egui);
                         state.update(&mut ctx);
                         if ctx.exit_requested {
                             target.exit();
@@ -163,6 +190,54 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
         }
     })
     .expect("Failed to run event loop");
+}
+
+fn push_egui_release(raw: &mut egui::RawInput, button: crate::MouseButton) -> bool {
+    use crate::MouseButton;
+    let button = match button {
+        MouseButton::Left => egui::PointerButton::Primary,
+        MouseButton::Right => egui::PointerButton::Secondary,
+        MouseButton::Middle => egui::PointerButton::Middle,
+        MouseButton::Other(4) => egui::PointerButton::Extra1,
+        MouseButton::Other(5) => egui::PointerButton::Extra2,
+        MouseButton::Other(_) => return false,
+    };
+    raw.events.push(egui::Event::PointerButton {
+        pos: egui::pos2(-1.0, -1.0),
+        button,
+        pressed: false,
+        modifiers: raw.modifiers,
+    });
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn p4d_egui_release_clears_button_after_pointer_gone() {
+        let ctx = egui::Context::default();
+        let mut raw = egui::RawInput::default();
+        raw.events.push(egui::Event::PointerButton {
+            pos: egui::pos2(15.0, 15.0),
+            button: egui::PointerButton::Primary,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        });
+        raw.events.push(egui::Event::PointerGone);
+        let _ = ctx.run(raw, |_| {});
+        assert!(ctx.input(|input| input.pointer.primary_down()));
+
+        let mut raw = egui::RawInput::default();
+        assert!(!push_egui_release(&mut raw, crate::MouseButton::Other(21)));
+        assert!(raw.events.is_empty());
+        assert!(push_egui_release(&mut raw, crate::MouseButton::Left));
+        raw.events.push(egui::Event::PointerGone);
+        let _ = ctx.run(raw, |_| {});
+        assert!(!ctx.input(|input| input.pointer.primary_down()));
+        assert!(ctx.input(|input| input.pointer.hover_pos().is_none()));
+    }
 }
 
 pub fn init() {

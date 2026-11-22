@@ -40,7 +40,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
     let immdraw = &mut *uiworld.write::<ImmediateDraw>();
     let immsound = &mut *uiworld.write::<ImmediateSound>();
     let potential_command = &mut *uiworld.write::<PotentialCommands>();
-    let mut inp = uiworld.write::<InputMap>();
+    let inp = uiworld.read::<InputMap>();
     let tool = *uiworld.read::<Tool>();
     let map = &*sim.map();
     let commands: &mut WorldCommands = &mut uiworld.commands();
@@ -95,26 +95,23 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
 
     let log_camheight = cam.eye().z.log10();
 
-    // If a road was placed recently (as it is async with networking) prepare the next road
-    for command in uiworld.received_commands().iter() {
-        if let WorldCommand::MapMakeConnection { to, .. } = command {
-            if let proj @ MapProject {
-                kind: Intersection(_),
-                ..
-            } = map.project(to.pos, 0.0, ProjectFilter::ALL)
-            {
-                if matches!(tool, Tool::RoadbuildCurved) {
-                    state.build_state = StartCurved(proj);
-                } else {
-                    state.build_state = Start(proj);
+    // If a road was placed recently (as it is async with networking) prepare the next road.
+    if !state.suppress_chaining {
+        for command in uiworld.received_commands().iter() {
+            if let WorldCommand::MapMakeConnection { to, .. } = command {
+                if let proj @ MapProject {
+                    kind: Intersection(_),
+                    ..
+                } = map.project(to.pos, 0.0, ProjectFilter::ALL)
+                {
+                    if matches!(tool, Tool::RoadbuildCurved) {
+                        state.build_state = StartCurved(proj);
+                    } else {
+                        state.build_state = Start(proj);
+                    }
                 }
             }
         }
-    }
-
-    if inp.just_act.contains(&InputAction::Close) && !matches!(state.build_state, Hover) {
-        inp.just_act.remove(&InputAction::Close);
-        state.build_state = Hover;
     }
 
     if inp.just_act.contains(&InputAction::UpElevation) {
@@ -314,6 +311,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         match (state.build_state, cur_proj.kind) {
             (Hover, Ground | Road(_) | Intersection(_)) => {
                 // Hover selection
+                state.suppress_chaining = false;
                 if tool == Tool::RoadbuildCurved {
                     state.build_state = StartCurved(cur_proj);
                 } else {
@@ -364,6 +362,19 @@ pub struct RoadBuildResource {
     pub snapping: Snapping,
     pub height_offset: f32,
     pub height_reference: HeightReference,
+    suppress_chaining: bool,
+}
+
+impl RoadBuildResource {
+    pub(crate) fn cancel_placement(&mut self) -> bool {
+        if matches!(self.build_state, Hover) {
+            return false;
+        }
+        self.build_state = Hover;
+        // A delayed command acknowledgement can arrive after Close.
+        self.suppress_chaining = true;
+        true
+    }
 }
 
 #[derive(Default, Clone, Copy)]

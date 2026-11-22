@@ -818,6 +818,7 @@ mod tests {
         let options = SimulationOptions {
             terrain_size: 0,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         };
         let run = |ctx: &mut ScenarioCtx| {
             ctx.run_ticks(CHECKPOINT_INTERVAL + 1);

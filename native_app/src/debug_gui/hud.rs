@@ -12,15 +12,19 @@ use crate::uiworld::UiWorld;
 /// Root GUI entrypoint
 pub fn render_oldgui(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::render");
+    crate::gui::windows::load::replay_controls(ui, uiworld);
     if uiworld.read::<GuiState>().hidden {
         return;
     }
 
-    debug_inspector(ui, uiworld, sim);
-
+    let interactive = crate::session::world_interaction(uiworld);
+    if interactive {
+        debug_inspector(ui, uiworld, sim);
+    }
     debug_window(ui, uiworld, sim);
-
-    tooltip(ui, uiworld, sim);
+    if interactive {
+        tooltip(ui, uiworld, sim);
+    }
 }
 
 pub fn tooltip(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {

@@ -1,12 +1,12 @@
 use crate::gui::TimeAlways;
 use crate::init::{INIT_FUNCS, SAVELOAD_FUNCS};
+use crate::session::{CityProgress, SaveInFlight, SaveRequest, WorldJob, WorldReplacement};
 use simulation::utils::resources::{RefMutSingle, RefSingle, ResourcesSingleThread};
 use simulation::world_command::{WorldCommand, WorldCommands};
-use simulation::{Simulation, SimulationReplayLoader};
+use simulation::SimulationReplayLoader;
 use std::any::Any;
 use std::ptr::addr_of;
-use std::sync::atomic::AtomicBool;
-use std::sync::Arc;
+use std::time::Instant;
 
 #[derive(Default)]
 pub struct UiWorld {
@@ -16,23 +16,37 @@ pub struct UiWorld {
 #[derive(Default)]
 pub struct SaveLoadState {
     pub startup_message: Option<String>,
-    pub please_load: Option<SimulationReplayLoader>,
-    pub please_load_sim: Option<Simulation>,
-    pub render_reset: bool,
+    pub pending: Option<WorldReplacement>,
+    pub replay: Option<SimulationReplayLoader>,
     pub please_save: bool,
-    pub saving_status: Arc<AtomicBool>,
+    #[cfg(test)]
+    pub saving_status: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    pub(crate) saved_progress: Option<CityProgress>,
+    pub(crate) save_result: Option<SaveInFlight>,
+    pub(crate) pending_save: Option<SaveRequest>,
+    pub(crate) autosave_index: u8,
+    pub(crate) world_job: Option<WorldJob>,
+    pub(crate) world_error: Option<String>,
+    pub(crate) delete_slot: Option<common::saveload::SlotId>,
+    pub(crate) exit_requested: bool,
+    pub(crate) notice: Option<(Instant, String)>,
 }
 
 #[allow(dead_code)]
 impl UiWorld {
     pub fn init() -> UiWorld {
+        let mut w = Self::with_defaults();
+        w.load_from_disk();
+        w
+    }
+
+    pub(crate) fn with_defaults() -> UiWorld {
         let mut w = UiWorld::default();
         unsafe {
             for s in &*addr_of!(INIT_FUNCS) {
                 (s.f)(&mut w);
             }
         }
-        w.load_from_disk();
         w
     }
 

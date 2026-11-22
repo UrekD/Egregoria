@@ -5,15 +5,16 @@ use yakui::{
 };
 
 use goryak::{
-    blur_bg, button_primary, constrained_viewport, fixed_spacer, icon_button, image_button,
-    monospace, on_primary, outline, padxy, primary, primary_container, round_rect,
-    secondary_container,
+    blur_bg, button_primary, checkbox_value, constrained_viewport, fixed_spacer, icon_button,
+    image_button, monospace, on_primary, on_secondary_container, outline, padxy, primary,
+    primary_container, round_rect, secondary_container, tooltip,
 };
 use simulation::Simulation;
 
+use crate::gui::bulldozer::BulldozerState;
 use crate::gui::textures::UiTextures;
+use crate::gui::windows::settings::Settings;
 use crate::gui::Tool;
-use crate::inputmap::{InputAction, InputMap};
 use crate::uiworld::UiWorld;
 
 pub mod building;
@@ -21,17 +22,9 @@ pub mod roadbuild;
 pub mod roadedit;
 pub mod terraforming;
 pub mod train;
-mod transit;
+pub(crate) mod transit;
 
 pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
-    if uiworld
-        .read::<InputMap>()
-        .just_act
-        .contains(&InputAction::Close)
-    {
-        *uiworld.write::<Tool>() = Tool::Hand;
-    }
-
     reflow(Alignment::TOP_LEFT, Pivot::TOP_LEFT, Dim2::ZERO, || {
         constrained_viewport(|| {
             let mut l = List::column();
@@ -74,7 +67,23 @@ fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {
 
     match tool {
         Tool::Hand => return false,
-        Tool::Bulldozer => return false,
+        Tool::Bulldozer => {
+            let mut settings = uiw.write::<Settings>();
+            let before = settings.bulldozer_drag;
+            padxy(10.0, 5.0, || {
+                tooltip("Hold Select and sweep over roads and buildings", || {
+                    checkbox_value(
+                        &mut settings.bulldozer_drag,
+                        on_secondary_container(),
+                        "Drag to bulldoze",
+                    );
+                });
+            });
+            if before != settings.bulldozer_drag {
+                settings.save();
+                uiw.write::<BulldozerState>().reset_gesture();
+            }
+        }
         Tool::LotBrush => return false,
         Tool::TransitStop | Tool::TransitLine => return false,
         Tool::Zoning => crate::gui::zoning::properties(uiw),
@@ -95,6 +104,23 @@ fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {
         }
     }
     true
+}
+
+pub(crate) fn tool_label(tool: Tool) -> &'static str {
+    match tool {
+        Tool::Hand => "Hand (Esc)",
+        Tool::RoadbuildStraight => "Build straight road",
+        Tool::RoadbuildCurved => "Build curved road",
+        Tool::RoadEditor => "Edit roads and intersections",
+        Tool::Bulldozer => "Bulldozer",
+        Tool::LotBrush => "Lot brush",
+        Tool::SpecialBuilding => "Place buildings",
+        Tool::Train => "Place trains",
+        Tool::Terraforming => "Terraform",
+        Tool::Zoning => "Zoning",
+        Tool::TransitStop => "Bus stop",
+        Tool::TransitLine => "Bus line",
+    }
 }
 
 fn tools_list(uiworld: &UiWorld) {
@@ -123,7 +149,7 @@ fn tools_list(uiworld: &UiWorld) {
                 default_col,
                 hover_col,
                 primary(),
-                if *tool == Tool::Zoning { "Zoning" } else { "" },
+                tool_label(*tool),
             )
             .clicked
             {
@@ -167,7 +193,7 @@ pub fn updown_value(v: &mut f32, step: f32, suffix: &'static str) -> bool {
     l.main_axis_size = MainAxisSize::Min;
     l.item_spacing = 3.0;
     l.show(|| {
-        if updown_button("caret-up").show().clicked {
+        if tooltip("Increase", || updown_button("caret-up").show()).clicked {
             *v += step;
             changed = true;
         }
@@ -176,7 +202,7 @@ pub fn updown_value(v: &mut f32, step: f32, suffix: &'static str) -> bool {
                 monospace(on_primary(), format!("{:.0}{}", *v, suffix));
             });
         });
-        if updown_button("caret-down").show().clicked {
+        if tooltip("Decrease", || updown_button("caret-down").show()).clicked {
             *v -= step;
             changed = true;
         }

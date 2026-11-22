@@ -291,6 +291,7 @@ fn paris_hashes_survive_serde() {
     let mut sim = Simulation::new_with_options(SimulationOptions {
         terrain_size: 50,
         save_replay: false,
+        ..SimulationOptions::LEGACY
     });
     WorldCommand::MapLoadParis.apply(&mut sim);
 

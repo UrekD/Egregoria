@@ -36,6 +36,7 @@ pub use selectable_label::*;
 pub use sized_canvas::*;
 pub use text::*;
 pub use theme::*;
+pub use tooltip::*;
 pub use util::*;
 pub use window::*;
 

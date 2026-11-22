@@ -120,6 +120,7 @@ mod tests {
         let test = ScenarioCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         let tick = test.sim.get_tick();
         let mut uiworld = UiWorld::default();

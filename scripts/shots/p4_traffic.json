@@ -1,0 +1,17 @@
+[
+  {"Builder": "grid_city"},
+  {"Builder": "fill_houses"},
+  {"Builder": "place_company"},
+  {"Commands": [{"SpawnRandomCars": {"n_cars": 64}}]},
+  {"RunTicks": 3000},
+  {"Camera": {"x": 940, "y": 920, "z": 0, "yaw": -0.6, "pitch": 1.15, "dist": 680}},
+  {"SetOverlay": "Traffic"},
+  {"WaitFrames": 4},
+  {"Screenshot": "traffic-overview"},
+  {"RunTicks": 1000},
+  {"Camera": {"x": 955, "y": 920, "z": 0, "yaw": -0.6, "pitch": 1.15, "dist": 350}},
+  {"WaitFrames": 4},
+  {"Screenshot": "traffic-closer"},
+  {"Assert": "NoRejections"},
+  "Exit"
+]

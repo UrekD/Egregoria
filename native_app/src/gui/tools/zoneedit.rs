@@ -164,3 +164,16 @@ pub fn zoneedit(sim: &Simulation, uiworld: &UiWorld) {
         }
     }
 }
+
+#[cfg(test)]
+impl ZoneEditState {
+    pub(crate) fn start_test_gesture(&mut self) {
+        self.offset = Some(Vec2::X);
+        self.i = 1;
+        self.insert = true;
+    }
+
+    pub(crate) fn gesture_is_clear(&self) -> bool {
+        self.offset.is_none() && self.i == 0 && !self.insert
+    }
+}

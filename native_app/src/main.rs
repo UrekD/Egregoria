@@ -21,6 +21,7 @@ mod init;
 mod inputmap;
 mod network;
 mod rendering;
+mod session;
 
 fn main() {
     #[cfg(feature = "profile")]

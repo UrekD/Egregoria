@@ -8,13 +8,14 @@ use yakui::{reflow, Alignment, Color, Dim2, Pivot, Vec2};
 use simulation::map_dynamic::ElectricityFlow;
 use simulation::Simulation;
 
-use crate::gui::hud::menu::menu_bar;
+use crate::gui::hud::menu::{menu_bar, render_departure};
 use crate::gui::hud::time_controls::time_controls;
 use crate::gui::hud::toolbox::new_toolbox;
 use crate::gui::inspect::new_inspector;
 use crate::gui::textures::UiTextures;
 use crate::gui::windows::settings::Settings;
 use crate::gui::GuiState;
+use crate::session::{self, SessionState};
 use crate::uiworld::{SaveLoadState, UiWorld};
 
 pub mod chat;
@@ -33,7 +34,25 @@ pub(crate) use toasts::ToastState;
 /// Root GUI entrypoint
 pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::render");
-    auto_save(uiworld);
+    if uiworld.read::<SessionState>().interaction_blocked {
+        return;
+    }
+    if !session::playing(uiworld) {
+        let mut gui = uiworld.write::<GuiState>();
+        let show_unfinished_ui = gui.show_unfinished_ui;
+        gui.windows.render_session(uiworld, sim, show_unfinished_ui);
+        drop(gui);
+        keybinds::keybind_modal(uiworld, sim);
+        startup_save_message(uiworld);
+        return;
+    }
+    if !session::world_interaction(uiworld) {
+        render_departure(uiworld);
+        return;
+    }
+    if session::can_save(uiworld) {
+        auto_save(uiworld);
+    }
 
     let hidden = uiworld.read::<GuiState>().hidden;
     uiworld
@@ -48,10 +67,18 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
         yakui::column(|| problem_icons::render(uiworld, sim));
         new_toolbox(uiworld, sim);
         menu_bar(uiworld, sim);
+        if !session::world_interaction(uiworld) {
+            render_departure(uiworld);
+            return;
+        }
         demand_bars::render(uiworld, sim);
         chat::chat(uiworld, sim);
         new_inspector(uiworld, sim);
-        uiworld.write::<GuiState>().windows.render(uiworld, sim);
+        {
+            let mut gui = uiworld.write::<GuiState>();
+            let show_unfinished_ui = gui.show_unfinished_ui;
+            gui.windows.render(uiworld, sim, show_unfinished_ui);
+        }
         time_controls(uiworld, sim);
         yakui::column(|| toasts::render(sim, uiworld));
         keybinds::keybind_modal(uiworld, sim);

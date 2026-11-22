@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 use std::fs::{self, File, Metadata};
-use std::io::{self, BufReader, ErrorKind};
+use std::io::{self, BufReader, ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -91,6 +91,10 @@ impl SlotId {
         Self(format!("{AUTOSAVE_PREFIX}{n}"))
     }
 
+    pub fn is_autosave(&self) -> bool {
+        self.0.starts_with(AUTOSAVE_PREFIX)
+    }
+
     pub fn as_str(&self) -> &str {
         &self.0
     }
@@ -170,8 +174,61 @@ pub struct SlotEntry {
     pub snapshot: SnapshotKind,
     pub replay_available: bool,
     pub modified_unix: u64,
+    pub modified: SystemTime,
+    pub revision: Option<SnapshotRevision>,
     /// Existing members retain their exact spelling. Absent members use canonical paths.
     pub paths: SlotPaths,
+    file: SnapshotFile,
+}
+
+impl SlotEntry {
+    pub fn snapshot_path(&self) -> &Path {
+        match self.snapshot {
+            SnapshotKind::Bc => &self.paths.bc,
+            _ => &self.paths.zip,
+        }
+    }
+
+    pub fn same_snapshot_as(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.snapshot == other.snapshot
+            && self.snapshot_path() == other.snapshot_path()
+            && self.revision == other.revision
+            && self.file == other.file
+    }
+
+    /// Compare the listing to the handle that will be used for the read.
+    pub fn matches_snapshot_file(
+        &self,
+        path: &Path,
+        kind: SnapshotKind,
+        file: &File,
+    ) -> io::Result<bool> {
+        Ok(self.snapshot == kind
+            && self.snapshot_path() == path
+            && self.file == SnapshotFile::from_metadata(&file.metadata()?)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFile {
+    modified: SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    device_inode: (u64, u64),
+}
+
+impl SnapshotFile {
+    fn from_metadata(metadata: &Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            modified: metadata.modified()?,
+            len: metadata.len(),
+            #[cfg(unix)]
+            device_inode: (metadata.dev(), metadata.ino()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -359,16 +416,19 @@ pub fn list_slots_with_revisions(
             continue;
         };
 
-        let Ok(modified) = report_entry_error(member.metadata.modified(), &member.path) else {
+        let Ok(file) =
+            report_entry_error(SnapshotFile::from_metadata(&member.metadata), &member.path)
+        else {
             continue;
         };
-        let (meta, replay_available) = if snapshot == SnapshotKind::Obstructed {
-            (None, false)
+        let modified = file.modified;
+        let (meta, replay_available, revision) = if snapshot == SnapshotKind::Obstructed {
+            (None, false, None)
         } else {
             let revision = snapshot_revision(&member.path, snapshot);
             let meta = fresh_slot_meta(&paths.meta, modified, revision);
             let replay_available = available_replay(&paths.replay, revision);
-            (meta, replay_available)
+            (meta, replay_available, revision)
         };
         slots.push(SlotEntry {
             id,
@@ -379,7 +439,10 @@ pub fn list_slots_with_revisions(
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs(),
+            modified,
+            revision,
             paths,
+            file,
         });
     }
 
@@ -504,24 +567,61 @@ fn available_replay(path: &Path, revision: Option<SnapshotRevision>) -> bool {
         .is_ok_and(|sidecar| revision.matches_sidecar(sidecar.revision))
 }
 
-fn open_regular(path: &Path) -> io::Result<File> {
-    let require_regular = |metadata: Metadata| {
-        if metadata.is_file() {
-            Ok(())
-        } else {
-            Err(io::Error::new(
+impl SlotPaths {
+    /// Open a slot member without following a final symlink or waiting on a FIFO.
+    pub fn open_member(path: &Path) -> io::Result<File> {
+        open_regular(path)
+    }
+}
+
+impl CompressedBincode {
+    /// Inflate a complete zlib payload, limiting the decompressed byte count.
+    pub fn decompress_limited(bytes: &[u8], max_output: usize) -> io::Result<Vec<u8>> {
+        use miniz_oxide::inflate::{decompress_to_vec_zlib_with_limit, TINFLStatus};
+
+        decompress_to_vec_zlib_with_limit(bytes, max_output).map_err(|error| {
+            if error.status == TINFLStatus::HasMoreOutput {
+                io::Error::new(
+                    ErrorKind::FileTooLarge,
+                    "snapshot exceeds the inflate size limit",
+                )
+            } else {
+                io::Error::new(ErrorKind::InvalidData, error.to_string())
+            }
+        })
+    }
+
+    /// Inflate into a caller-supplied prefix buffer, with at most 4 KiB of input.
+    pub fn read_prefix(reader: impl Read, prefix: &mut [u8]) -> io::Result<usize> {
+        use miniz_oxide::inflate::core::{decompress, inflate_flags::*, DecompressorOxide};
+        use miniz_oxide::inflate::TINFLStatus;
+
+        let mut input = Vec::new();
+        reader.take(4096).read_to_end(&mut input)?;
+        let (status, _, written) = decompress(
+            &mut DecompressorOxide::new(),
+            &input,
+            prefix,
+            0,
+            TINFL_FLAG_PARSE_ZLIB_HEADER | TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF,
+        );
+        match status {
+            TINFLStatus::Done | TINFLStatus::HasMoreOutput => Ok(written),
+            _ => Err(io::Error::new(
                 ErrorKind::InvalidData,
-                "slot sidecar must be a regular file",
-            ))
+                "could not decode zipped file prefix",
+            )),
         }
-    };
-    require_regular(report_entry_error(path.symlink_metadata(), path)?)?;
+    }
+}
+
+fn open_regular(path: &Path) -> io::Result<File> {
     let mut options = File::options();
     options.read(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(unix_sidecar_flags()?);
+        options.custom_flags(unix_slot_open_flags()?);
     }
     #[cfg(windows)]
     {
@@ -529,13 +629,40 @@ fn open_regular(path: &Path) -> io::Result<File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(path)?;
-    require_regular(report_entry_error(file.metadata(), path)?)?;
+    let file = options.open(path).map_err(|error| {
+        if path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_symlink())
+        {
+            nonregular_member(path)
+        } else {
+            error
+        }
+    })?;
+    let metadata = report_entry_error(file.metadata(), path)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+        if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(nonregular_member(path));
+        }
+    }
+    if !metadata.is_file() {
+        return Err(nonregular_member(path));
+    }
     Ok(file)
 }
 
+fn nonregular_member(path: &Path) -> io::Error {
+    io::Error::new(
+        ErrorKind::InvalidData,
+        format!("slot path {} is not a regular file", path.display()),
+    )
+}
+
 #[cfg(unix)]
-fn unix_sidecar_flags() -> io::Result<i32> {
+fn unix_slot_open_flags() -> io::Result<i32> {
     // O_NOFOLLOW handles a replaced symlink; O_NONBLOCK lets us reject a replaced FIFO.
     // The standard library accepts the platform flags but does not export them.
     if cfg!(any(target_os = "linux", target_os = "android")) {
@@ -574,7 +701,7 @@ fn unix_sidecar_flags() -> io::Result<i32> {
     } else {
         Err(io::Error::new(
             ErrorKind::Unsupported,
-            "platform sidecar open flags are unavailable",
+            "platform slot open flags are unavailable",
         ))
     }
 }
