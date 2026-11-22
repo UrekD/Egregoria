@@ -1,8 +1,27 @@
 //! Balance constants for zoning demand and growth.
 
-use prototypes::ServiceKind;
+use prototypes::{ServiceKind, Tick};
 
-pub const DEMAND_INTERVAL_TICKS: u64 = 3_000;
+use crate::economy::Budget;
+use crate::INITIAL_TICK;
+
+// Demand, growth, utilities, environment and fires use elapsed ticks. Anchor their
+// phases at INITIAL_TICK to preserve the cadence of an uninterrupted calendar.
+pub(crate) const fn elapsed_phase_tick(elapsed: u64) -> u64 {
+    elapsed.saturating_add(INITIAL_TICK)
+}
+
+pub(crate) fn periodic_tick(budget: &Budget, calendar_tick: Tick) -> u64 {
+    elapsed_phase_tick(budget.elapsed_ticks(calendar_tick))
+}
+
+// Demand samples one tick before growth, and utilities refresh one tick before
+// environment. On an uninterrupted calendar, residence uses the preceding snapshots
+// just before the boundary. Coverage refreshes independently by kind, and hourly
+// happiness and fires follow the environment pass.
+pub(crate) const CITY_UPDATE_INTERVAL_TICKS: u64 = 3_000;
+pub const DEMAND_INTERVAL_TICKS: u64 = CITY_UPDATE_INTERVAL_TICKS;
+pub(crate) const DEMAND_OFFSET_TICKS: u64 = DEMAND_INTERVAL_TICKS - 1;
 pub const DEMAND_EMA_ALPHA: f32 = 0.2;
 pub const DEFAULT_TAX_RATE_PERMILLE: u16 = 90;
 pub const NEUTRAL_HAPPINESS: f32 = 50.0;

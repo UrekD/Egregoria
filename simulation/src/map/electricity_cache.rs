@@ -2,6 +2,7 @@ use crate::map::{BuildingID, Buildings, IntersectionID, Intersections, Map, Road
 use serde::{Deserialize, Serialize};
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A network object is an object that can be connected to an electricity network
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -51,7 +52,7 @@ pub struct ElectricityNetwork {
 /// It maintains a mapping from network objects to network ids that are connected to each other
 #[derive(Debug, Default, Eq, PartialEq, Clone)]
 pub struct ElectricityCache {
-    pub(crate) generation: u64,
+    generation: u64,
     pub(crate) networks: BTreeMap<ElectricityNetworkID, ElectricityNetwork>,
 
     /// The network that each intersection is connected to
@@ -64,6 +65,16 @@ pub struct ElectricityCache {
 }
 
 impl ElectricityCache {
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub(super) fn topology_changed(&mut self) {
+        // A replacement map can have a different topology with the same edit count.
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+        self.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Add a new network object. Must be called before adding or removing edges.
     pub fn add_object(&mut self, object_id: impl Into<NetworkObjectID>) {
         let object_id = object_id.into();
@@ -89,7 +100,7 @@ impl ElectricityCache {
 
         self.networks.insert(network_id, network);
         self.ids.insert(object_id, network_id);
-        self.generation = self.generation.wrapping_add(1);
+        self.topology_changed();
     }
 
     /// Remove a network object.
@@ -111,7 +122,7 @@ impl ElectricityCache {
         let network_id = self.ids.remove(&object_id).unwrap();
         let network = self.networks.remove(&network_id).unwrap();
         self.graph.remove(&object_id);
-        self.generation = self.generation.wrapping_add(1);
+        self.topology_changed();
 
         debug_assert!(network.objects.len() == 1, "{:?}", object_id);
     }
@@ -130,7 +141,7 @@ impl ElectricityCache {
 
         self.graph.get_mut(src).unwrap().push(*dst);
         self.graph.get_mut(dst).unwrap().push(*src);
-        self.generation = self.generation.wrapping_add(1);
+        self.topology_changed();
 
         let Some(src) = self.ids.get(src) else {
             log::error!("electricity add_edge src {:?} not found", src);
@@ -165,7 +176,7 @@ impl ElectricityCache {
         // Even though we use retain for removal which ends up as O(degree²) the degree is never big
         self.graph.get_mut(src).unwrap().retain(|v| v != dst);
         self.graph.get_mut(dst).unwrap().retain(|v| v != src);
-        self.generation = self.generation.wrapping_add(1);
+        self.topology_changed();
 
         let Some(src_net) = self.ids.get(src) else {
             log::error!("electricity remove_edge src {:?} not found", src);

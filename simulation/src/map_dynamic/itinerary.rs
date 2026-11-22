@@ -82,16 +82,13 @@ enum RerouteTarget {
 
 #[derive(Default)]
 pub(crate) struct RerouteFailures {
-    map_revision: (usize, u64),
+    map_revision: (u64, u64),
     entries: BTreeSet<RerouteKey>,
 }
 
 impl RerouteFailures {
     fn sync_map(&mut self, map: &Map) {
-        let revision = (
-            std::ptr::from_ref(map).addr(),
-            map.walking_topology_generation,
-        );
+        let revision = (map.identity(), map.walking_topology_generation);
         if self.map_revision != revision {
             self.entries.clear();
             self.map_revision = revision;

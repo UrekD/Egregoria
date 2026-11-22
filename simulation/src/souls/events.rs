@@ -4,16 +4,18 @@ use prototypes::{ServiceKind, Tick, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
 use slotmapd::Key;
 
+use crate::economy::balance::elapsed_phase_tick;
 use crate::economy::Budget;
 use crate::map::{BuildingID, BuildingKind};
 use crate::map_dynamic::{CoverageGrid, EnvGrid};
 use crate::utils::rand_provider::RandProvider;
-use crate::{Simulation, INITIAL_TICK, RNG_SEED};
+use crate::{Simulation, RNG_SEED};
 
 const EVENT_FIRE: u64 = 0x4649_5245;
 const FIRE_CHANCE: f32 = 0.002;
 const COLLAPSE_TICKS: u64 = 3 * TICKS_PER_HOUR;
 const EVENT_HISTORY_LIMIT: usize = 256;
+pub(crate) const UPDATE_OFFSET: u64 = 4;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FireEventKind {
@@ -63,22 +65,25 @@ fn elapsed_tick(sim: &Simulation) -> Tick {
     Tick(sim.read::<Budget>().elapsed_ticks(Tick(sim.get_tick())))
 }
 
+pub(crate) const fn due(tick: u64) -> bool {
+    tick >= TICKS_PER_HOUR && tick % TICKS_PER_HOUR == UPDATE_OFFSET
+}
+
 pub fn events_update(sim: &mut Simulation) {
     let tick = elapsed_tick(sim);
-    // Preserve the original hourly cadence and RNG keys on an unshifted clock.
-    let hour_tick = tick.0 + INITIAL_TICK;
-    if hour_tick % TICKS_PER_HOUR != 0 {
+    let phase_tick = elapsed_phase_tick(tick.0);
+    if !due(phase_tick) {
         return;
     }
     profiling::scope!("souls::events_update");
 
+    let hour = phase_tick / TICKS_PER_HOUR;
     let mut collapse = Vec::new();
     {
         let map = sim.map();
         let coverage = sim.read::<CoverageGrid>();
         let environment = sim.read::<EnvGrid>();
         let mut fires = sim.write::<Fires>();
-        let hour = hour_tick / TICKS_PER_HOUR;
 
         // A building extinguished this hour is eligible to ignite again next hour.
         let mut ignitions: Vec<_> = map

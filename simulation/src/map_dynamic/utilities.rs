@@ -1,21 +1,24 @@
 use std::collections::BTreeMap;
 
-use prototypes::{try_prototype, ServiceID, ServiceKind};
+use prototypes::{try_prototype, ServiceID, ServiceKind, Tick};
 use serde::{Deserialize, Serialize};
 
+use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
+use crate::economy::Budget;
 use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID, Map, MAX_ZONE_AREA};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
 
 use super::{BuildingInfos, ElectricityFlow};
 
-const UTILITY_INTERVAL_TICKS: u64 = 3_000;
 const RELATIVE_RATE_EPSILON: f64 = 1e-6;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct UtilityFlow {
     by_building: BTreeMap<BuildingID, ElectricityNetworkID>,
     by_network: BTreeMap<ElectricityNetworkID, UtilityTotals>,
+    #[serde(skip)]
+    topology_generation: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -34,6 +37,13 @@ pub struct BuildingUtilityStatus {
 }
 
 impl UtilityFlow {
+    pub(crate) const UPDATE_OFFSET: u64 = 1;
+
+    pub(crate) const fn due(tick: u64) -> bool {
+        tick >= CITY_UPDATE_INTERVAL_TICKS
+            && tick % CITY_UPDATE_INTERVAL_TICKS == Self::UPDATE_OFFSET
+    }
+
     pub fn has_water(&self, building: BuildingID) -> bool {
         self.totals_for(building)
             .is_some_and(UtilityTotals::has_water)
@@ -140,7 +150,8 @@ fn valid_rate(rate: Option<f32>) -> f64 {
 }
 
 pub fn utility_flow_update(sim: &mut Simulation) {
-    if sim.get_tick() % UTILITY_INTERVAL_TICKS != 0 {
+    let tick = periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()));
+    if !UtilityFlow::due(tick) {
         return;
     }
     profiling::scope!("map_dynamic::utility_flow");
@@ -149,7 +160,19 @@ pub fn utility_flow_update(sim: &mut Simulation) {
     let electricity = sim.read::<ElectricityFlow>();
     let infos = sim.read::<BuildingInfos>();
     let residences = sim.read::<Residences>();
-    let mut flow = UtilityFlow::default();
+    let mut flow = sim.write::<UtilityFlow>();
+    let generation = map.electricity.generation();
+    let topology_changed = flow.topology_generation != Some(generation);
+    if topology_changed {
+        // Keep existing entries where possible, including on the first pass after loading.
+        flow.by_building.retain(|&id, _| {
+            map.get(id).is_some_and(|building| !building.is_orphaned())
+                && map.electricity.net_id(id).is_some()
+        });
+        flow.by_network
+            .retain(|id, _| map.electricity.networks.contains_key(id));
+        flow.topology_generation = Some(generation);
+    }
 
     // Every road in the electricity graph carries pipes, including rail-only roads.
     for network in map.electricity.networks() {
@@ -159,7 +182,9 @@ pub fn utility_flow_update(sim: &mut Simulation) {
             let Some(building) = map.get(id).filter(|building| !building.is_orphaned()) else {
                 continue;
             };
-            flow.by_building.insert(id, network.id);
+            if topology_changed {
+                flow.by_building.insert(id, network.id);
+            }
 
             match building.kind {
                 BuildingKind::House => {
@@ -212,6 +237,4 @@ pub fn utility_flow_update(sim: &mut Simulation) {
         }
         flow.by_network.insert(network.id, totals);
     }
-
-    *sim.write::<UtilityFlow>() = flow;
 }

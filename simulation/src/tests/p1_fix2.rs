@@ -4,7 +4,7 @@ use crate::map::{
     BuildingID, BuildingKind, Density, Map, ProjectFilter, ProjectKind, RoadID, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{BuildingInfos, Destination, RouterError};
-use crate::souls::{desire::BuyGoods, growth::growth_update, residence};
+use crate::souls::{desire::BuyGoods, growth, residence};
 use crate::transportation::Location;
 use crate::{HumanEnt, HumanID, ParCommandBuffer, Simulation, SoulID, WorldCommand};
 use common::saveload::{Bincode, Encoder};
@@ -27,10 +27,15 @@ fn p1_fix2_player_house_restores_lot_after_reload() {
     test.g = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
     assert!(test.g.map().lot_origin(house).is_none());
 
+    let before = Bincode::encode(&*test.g.read::<residence::Residences>()).unwrap();
     for hour in 1..=24 {
-        test.g.write::<GameTime>().tick.0 = hour * TICKS_PER_HOUR;
+        let tick = (hour - 1) * TICKS_PER_HOUR + residence::UPDATE_OFFSET;
+        assert!(residence::due(tick));
+        test.g.write::<GameTime>().tick.0 = tick;
         residence::residence_update(&mut test.g);
     }
+    let after = Bincode::encode(&*test.g.read::<residence::Residences>()).unwrap();
+    assert_ne!(after, before, "the hourly checks should record residence state");
     assert!(!test.g.read::<residence::Residences>().is_abandoned(house));
     test.apply(&[WorldCommand::MapRemoveBuilding(house)]);
     let map = test.g.map();
@@ -225,6 +230,107 @@ fn p1_fix2_walking_components_follow_road_removal_and_reconnection() {
 }
 
 #[test]
+fn pfc_growth_uses_the_demand_sample_on_elapsed_ticks() {
+    use crate::economy::ZoneDemand;
+
+    for destination in [2_998, 2_999] {
+        let mut test = street();
+        let shape = test.g.map().lots().values().next().unwrap().shape;
+        test.g
+            .write::<ZoneGrid>()
+            .paint(shape, Some(ZoneKind::Residential), Density::Low);
+        let houses = |sim: &Simulation| {
+            sim.map()
+                .buildings()
+                .values()
+                .filter(|building| building.kind == BuildingKind::House)
+                .count()
+        };
+
+        test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(destination)))]);
+        for _ in 0..2 {
+            test.tick_fast();
+        }
+        assert_eq!(houses(&test.g), 0, "jump destination {destination}");
+        assert!(test
+            .g
+            .read::<ZoneDemand>()
+            .drivers(ZoneKind::Residential)
+            .is_none());
+
+        for _ in 2..2_998 {
+            test.tick_fast();
+        }
+        assert!(test
+            .g
+            .read::<ZoneDemand>()
+            .drivers(ZoneKind::Residential)
+            .is_some());
+        assert_eq!(houses(&test.g), 0);
+        let mut restored: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        test.tick_fast();
+        restored.tick(&mut Simulation::schedule(), []);
+        assert_eq!(houses(&test.g), 1);
+        assert_eq!(test.g.hashes(), restored.hashes());
+    }
+}
+
+#[test]
+fn pfc_demand_scratch_preserves_equality_after_reload() {
+    use crate::utils::scheduler::{RunnableFn, SeqSchedule};
+
+    let mut test = TestCtx::new_fast();
+    // Isolate demand from the market's independently lazy walking cache.
+    let mut schedule = SeqSchedule::default();
+    schedule.add_system(Box::new(RunnableFn {
+        f: |sim: &mut Simulation| {
+            let (world, resources) = sim.world_res();
+            crate::economy::demand_update(world, resources);
+        },
+        name: "demand_update",
+    }));
+    while test.g.get_tick() < 2_999 {
+        test.g.tick(&mut schedule, []);
+    }
+    assert!(test
+        .g
+        .read::<crate::economy::ZoneDemand>()
+        .drivers(ZoneKind::Residential)
+        .is_some());
+    let restored: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    assert_eq!(test.g.hashes(), restored.hashes());
+    assert!(
+        test.g.is_equal(&restored),
+        "demand sampling changed the resource count"
+    );
+}
+
+#[test]
+fn pfc_growth_waits_for_the_first_sample_in_a_pre_staggering_save() {
+    let mut test = street();
+    let shape = test.g.map().lots().values().next().unwrap().shape;
+    test.g
+        .write::<ZoneGrid>()
+        .paint(shape, Some(ZoneKind::Residential), Density::Low);
+    // Older saves at this tick are still waiting for their first demand pass.
+    test.g.write::<GameTime>().tick.0 = 2_999;
+    test.g = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    let has_house = |sim: &Simulation| {
+        sim.map()
+            .buildings()
+            .values()
+            .any(|building| building.kind == BuildingKind::House)
+    };
+    test.tick_fast();
+    assert_eq!(test.g.get_tick(), 3_000);
+    assert!(!has_house(&test.g));
+    while test.g.get_tick() < 6_000 {
+        test.tick_fast();
+    }
+    assert!(has_house(&test.g));
+}
+
+#[test]
 fn p1_fix2_sparse_growth_has_bounded_search_time() {
     let (finished, result) = mpsc::channel();
     let worker = std::thread::spawn(move || {
@@ -249,9 +355,12 @@ fn p1_fix2_sparse_growth_has_bounded_search_time() {
         test.g
             .write::<ZoneGrid>()
             .paint(shape, Some(ZoneKind::Residential), Density::Low);
-        test.set_residential_demand(20.0);
-        test.g.write::<GameTime>().tick.0 = 3_000;
-        growth_update(&mut test.g);
+        test.g.write::<GameTime>().tick.0 = growth::GROWTH_INTERVAL - 1;
+        let (world, resources) = test.g.world_res();
+        crate::economy::demand_update(world, resources);
+        test.g.write::<GameTime>().tick.0 = growth::GROWTH_INTERVAL;
+        assert!(growth::due(test.g.get_tick()));
+        growth::growth_update(&mut test.g);
         finished
             .send(
                 test.g

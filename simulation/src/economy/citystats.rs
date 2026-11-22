@@ -112,7 +112,7 @@ pub fn citystats_update(sim: &mut Simulation) {
 #[cfg(test)]
 mod tests {
     use super::{CityStats, CityStatsSample, SAMPLES_PER_LEVEL};
-    use crate::economy::{balance::DEMAND_INTERVAL_TICKS, Government};
+    use crate::economy::Government;
     use crate::map::{LanePatternBuilder, MapProject};
     use crate::tests::TestCtx;
     use crate::world_command::WorldCommand;
@@ -148,8 +148,9 @@ mod tests {
         let mut ctx = TestCtx::new();
         ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
         let lot = ctx.g.map().lots().keys().next().unwrap();
+        ctx.set_residential_demand(40.0);
         ctx.apply(&[
-            WorldCommand::SetGameTime(GameTime::new(Tick(DEMAND_INTERVAL_TICKS - 1))),
+            WorldCommand::SetGameTime(GameTime::new(Tick(TICKS_PER_MINUTE - 1))),
             WorldCommand::MapBuildHouse(lot),
         ]);
         assert!(ctx.g.world().humans.is_empty());
@@ -189,8 +190,9 @@ mod tests {
             )
             .unwrap();
         let lot = ctx.g.map().lots().keys().next().unwrap();
+        ctx.set_residential_demand(40.0);
         ctx.apply(&[
-            WorldCommand::SetGameTime(GameTime::new(Tick(DEMAND_INTERVAL_TICKS - 1))),
+            WorldCommand::SetGameTime(GameTime::new(Tick(TICKS_PER_MINUTE - 1))),
             WorldCommand::MapBuildHouse(lot),
         ]);
         assert!(ctx.g.world().humans.is_empty());

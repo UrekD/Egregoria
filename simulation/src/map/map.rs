@@ -1,6 +1,7 @@
 use crate::map::electricity_cache::ElectricityCache;
 use crate::map::height_override::find_overrides;
 use crate::map::procgen::gen_exterior_house;
+use crate::map::reachability::DrivingReachability;
 use crate::map::{
     Building, BuildingID, BuildingKind, Environment, Intersection, IntersectionID, Lane, LaneID,
     LaneKind, LanePattern, Lot, LotID, LotKind, MapSubscriber, MapSubscribers, ParkingSpotID,
@@ -14,6 +15,8 @@ use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
 use slotmapd::{HopSlotMap, Key};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
 pub type Roads = HopSlotMap<RoadID, Road>;
 pub type Lanes = HopSlotMap<LaneID, Lane>;
@@ -63,7 +66,11 @@ pub struct Map {
     pub(crate) spatial_map: SpatialMap,
     pub(crate) external_train_stations: Vec<BuildingID>,
     pub(crate) lot_origins: BTreeMap<BuildingID, LotOrigin>,
+    // Derived identity for caches whose lifetime can exceed this map's.
+    pub(super) identity: u64,
     pub(crate) walking_topology_generation: u64,
+    // Derived from lanes and turns. Map deserialization starts with an empty cache.
+    pub(super) driving_reachability: OnceLock<DrivingReachability>,
 
     pub electricity: ElectricityCache,
     pub environment: Environment,
@@ -78,9 +85,45 @@ impl Default for Map {
     }
 }
 
+impl Clone for Map {
+    fn clone(&self) -> Self {
+        let mut spatial_map = SpatialMap::default();
+        for building in self.buildings.values() {
+            spatial_map.insert(building);
+        }
+        for road in self.roads.values() {
+            spatial_map.insert(road);
+        }
+        for intersection in self.intersections.values() {
+            spatial_map.insert(intersection);
+        }
+        for lot in self.lots.values() {
+            spatial_map.insert(lot);
+        }
+
+        // Like a loaded map, the clone starts with its own subscriptions and identity.
+        Self {
+            roads: self.roads.clone(),
+            lanes: self.lanes.clone(),
+            intersections: self.intersections.clone(),
+            buildings: self.buildings.clone(),
+            lots: self.lots.clone(),
+            spatial_map,
+            external_train_stations: self.external_train_stations.clone(),
+            lot_origins: self.lot_origins.clone(),
+            walking_topology_generation: self.walking_topology_generation,
+            electricity: self.electricity.clone(),
+            environment: self.environment.clone(),
+            parking: self.parking.clone(),
+            ..Self::empty()
+        }
+    }
+}
+
 impl Map {
     // Public API
     pub fn empty() -> Self {
+        static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
         let subscribers = MapSubscribers::default();
         Self {
             roads: Roads::default(),
@@ -93,11 +136,19 @@ impl Map {
             spatial_map: SpatialMap::default(),
             external_train_stations: Default::default(),
             lot_origins: BTreeMap::new(),
+            identity: NEXT_IDENTITY
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("map identities exhausted"),
             walking_topology_generation: 0,
+            driving_reachability: OnceLock::new(),
             electricity: Default::default(),
             override_subscriber: subscribers.subscribe(UpdateType::Road | UpdateType::Building),
             subscribers,
         }
+    }
+
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
     }
 
     /// Perform cleanups potentially required every frame
@@ -129,6 +180,7 @@ impl Map {
 
     fn remove_intersection_inner(&mut self, src: IntersectionID) {
         let inter = unwrap_ret!(self.intersections.remove(src));
+        self.lane_topology_changed();
         self.subscribers.dispatch(UpdateType::Road, &inter);
 
         for road in inter.roads {
@@ -650,6 +702,11 @@ impl Map {
 
     // Private mutating
 
+    fn lane_topology_changed(&mut self) {
+        self.walking_topology_generation += 1;
+        self.driving_reachability.take();
+    }
+
     pub(crate) fn add_intersection(&mut self, pos: Vec3) -> IntersectionID {
         let id = Intersection::make(&mut self.intersections, &mut self.spatial_map, pos);
         self.subscribers
@@ -661,8 +718,11 @@ impl Map {
     fn invalidate(&mut self, id: IntersectionID) {
         info!("invalidate {:?}", id);
 
-        let inter = unwrap_ret!(self.intersections.get_mut(id));
-        self.walking_topology_generation += 1;
+        if !self.intersections.contains_key(id) {
+            return;
+        }
+        self.lane_topology_changed();
+        let inter = &mut self.intersections[id];
         self.subscribers.dispatch(UpdateType::Road, inter);
 
         if inter.roads.is_empty() {
@@ -703,7 +763,7 @@ impl Map {
     /// and potentially empty intersections.
     fn remove_raw_road(&mut self, road_id: RoadID) -> Option<Road> {
         let road = self.roads.remove(road_id)?;
-        self.walking_topology_generation += 1;
+        self.lane_topology_changed();
 
         self.spatial_map.remove(road_id);
         self.electricity.remove_object(road_id);
@@ -956,7 +1016,7 @@ impl Map {
             &mut self.parking,
             &mut self.spatial_map,
         );
-        self.walking_topology_generation += 1;
+        self.lane_topology_changed();
 
         self.electricity.add_object(rid);
         self.electricity.add_edge(src_id, rid);

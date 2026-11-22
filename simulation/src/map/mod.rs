@@ -34,6 +34,7 @@ mod light_policy;
 #[allow(clippy::module_inception)]
 mod map;
 mod pathfinding;
+mod reachability;
 mod serializing;
 mod spatial_map;
 pub mod terrain;
