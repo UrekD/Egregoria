@@ -14,6 +14,9 @@ use serde::{Deserialize, Serialize};
 pub struct Pedestrian {
     pub walking_speed: f32,
     pub walk_anim: f32,
+    #[inspect(skip)]
+    #[serde(skip)]
+    still_direction: Option<[u32; 3]>,
 }
 
 const PED_SIZE: f32 = 0.5;
@@ -37,6 +40,7 @@ impl Pedestrian {
         Self {
             walking_speed: (0.8 + r.next_f32() * 0.8),
             walk_anim: 0.0,
+            still_direction: None,
         }
     }
 }
@@ -67,10 +71,29 @@ pub fn random_pedestrian_shirt_color(r: &mut RandProvider) -> Color {
 
 pub fn pedestrian_decision_system(world: &mut World, _resources: &mut Resources) {
     profiling::scope!("transportation::pedestrian_decision_system");
-    world.humans
-        .values_mut()
-        //.par_bridge()
-        .for_each(|human| pedestrian_decision(&mut human.it, &mut human.trans, &mut human.speed, &mut human.pedestrian))
+    for human in world.humans.values_mut() {
+        let p = &mut human.pedestrian;
+        if human.speed.0.to_bits() == 0 && human.it.get_point().is_none() {
+            // Positive walking speed and an already wrapped nonnegative animation
+            // make the zero-speed animation update a bitwise no-op.
+            if p.walking_speed.is_finite()
+                && p.walking_speed > 0.0
+                && p.walk_anim.is_sign_positive()
+                && p.walk_anim < std::f32::consts::TAU
+            {
+                let before = <[f32; 3]>::from(human.trans.dir).map(f32::to_bits);
+                if p.still_direction == Some(before) {
+                    continue;
+                }
+                let dir = angle_lerpxy(human.trans.dir, human.trans.dir, DELTA);
+                let after = <[f32; 3]>::from(dir).map(f32::to_bits);
+                p.still_direction = (before == after).then_some(before);
+                human.trans.dir = dir;
+                continue;
+            }
+        }
+        pedestrian_decision(&mut human.it, &mut human.trans, &mut human.speed, p);
+    }
 }
 
 pub fn pedestrian_decision(

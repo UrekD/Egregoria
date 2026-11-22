@@ -156,3 +156,55 @@ fn test_router_and_back_change_middle() {
         }
     }
 }*/
+
+#[test]
+fn pf_d_parked_vehicle_revalidates_reused_spot_and_after_load() {
+    use crate::transportation::road::vehicle_state_update_system;
+    use crate::transportation::{spawn_parked_vehicle, VehicleKind, VehicleState};
+    use crate::{Simulation, VehicleID};
+    use common::saveload::{Bincode, Encoder};
+    use geom::vec3;
+
+    fn validate(sim: &mut Simulation) {
+        let (world, resources) = sim.world_res();
+        vehicle_state_update_system(world, resources);
+        sim.apply_commands([]);
+    }
+
+    fn spot(sim: &Simulation, car: VehicleID) -> crate::map::ParkingSpot {
+        let VehicleState::Parked(spot) = &sim.get(car).unwrap().vehicle.state else {
+            panic!("expected a parked car");
+        };
+        *spot.get(&sim.map().parking).unwrap()
+    }
+
+    let mut ctx = super::TestCtx::new_fast();
+    ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(400.0, 100.0, 0.0)]);
+    let car = spawn_parked_vehicle(&mut ctx.g, VehicleKind::Car, vec3(230.0, 100.0, 0.0)).unwrap();
+    validate(&mut ctx.g);
+    let original = spot(&ctx.g, car);
+    {
+        let mut map = ctx.g.map_mut();
+        let mut lane = map.lanes()[original.parent].clone();
+        lane.points = lane
+            .points
+            .iter()
+            .map(|p| *p + vec3(0.0, 0.0, 1.0))
+            .collect::<Vec<_>>()
+            .into();
+        map.parking.generate_spots(&lane);
+        map.parking.clean_reuse();
+    }
+    let moved = spot(&ctx.g, car);
+    assert_ne!(original.trans, moved.trans);
+    validate(&mut ctx.g);
+    assert_eq!(ctx.g.get(car).unwrap().trans, moved.trans);
+
+    ctx.g.world.vehicles[car].trans = original.trans;
+    let mut restored: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+    validate(&mut restored);
+    assert_eq!(restored.get(car).unwrap().trans, moved.trans);
+    restored.map_mut().parking.remove_spots(moved.parent);
+    validate(&mut restored);
+    assert!(restored.get(car).is_none());
+}

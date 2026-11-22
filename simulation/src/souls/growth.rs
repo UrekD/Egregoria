@@ -15,7 +15,7 @@ pub(crate) const GROWTH_INTERVAL: u64 = CITY_UPDATE_INTERVAL_TICKS;
 const MAX_BUILDING_SEARCH_RADIUS: f32 = 2_048.0;
 
 #[derive(Default)]
-struct GrowthCache {
+pub(crate) struct GrowthCache {
     zone_generation: u64,
     zones: FastMap<LotID, Option<ZoneCell>>,
     buildings: Vec<(BuildingID, Vec2)>,
@@ -72,7 +72,6 @@ pub fn growth_update(sim: &mut Simulation) {
 
     let mut zoned_lots = {
         let (_, resources) = sim.world_res();
-        resources.write_or_default::<GrowthCache>();
         let map = resources.read::<Map>();
         let zones = resources.read::<ZoneGrid>();
         let mut cache = resources.write::<GrowthCache>();
@@ -106,7 +105,6 @@ fn grow_zoned_lots(
 ) {
     let mut candidates = {
         let (_, resources) = sim.world_res();
-        resources.write_or_default::<GrowthCache>();
         let map = resources.read::<Map>();
         let demand = resources.read::<ZoneDemand>();
         let mut cache = resources.write::<GrowthCache>();
@@ -990,8 +988,8 @@ mod tests {
             .building_owned_by(company)
             .is_none());
         assert!(
-            !test.g.world_res().1.contains::<GrowthCache>(),
-            "empty zones should skip the lot cache even when orphan cleanup runs"
+            test.g.read::<GrowthCache>().zones.is_empty(),
+            "orphan cleanup should leave the lot cache empty without zones"
         );
     }
 }

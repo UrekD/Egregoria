@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
 
 use prototypes::{ServiceKind, Tick, TICKS_PER_HOUR};
+use serde::de::{SeqAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use slotmapd::Key;
 
@@ -37,8 +39,38 @@ pub struct FireEvent {
 pub struct Fires {
     /// Elapsed tick at which each active fire started.
     pub by_building: BTreeMap<BuildingID, Tick>,
+    #[serde(deserialize_with = "deserialize_history")]
     pub events: VecDeque<FireEvent>,
     last_event_seq: u64,
+}
+
+fn deserialize_history<'de, D>(deserializer: D) -> Result<VecDeque<FireEvent>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct History;
+
+    impl<'de> Visitor<'de> for History {
+        type Value = VecDeque<FireEvent>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a sequence of fire events")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut events =
+                VecDeque::with_capacity(seq.size_hint().unwrap_or(0).min(EVENT_HISTORY_LIMIT));
+            while let Some(event) = seq.next_element()? {
+                if events.len() == EVENT_HISTORY_LIMIT {
+                    events.pop_front();
+                }
+                events.push_back(event);
+            }
+            Ok(events)
+        }
+    }
+
+    deserializer.deserialize_seq(History)
 }
 
 impl Fires {
@@ -48,10 +80,12 @@ impl Fires {
     }
 
     fn record(&mut self, tick: Tick, building: BuildingID, kind: FireEventKind) {
-        self.last_event_seq += 1;
-        if self.events.len() == EVENT_HISTORY_LIMIT {
-            self.events.pop_front();
-        }
+        self.last_event_seq = self
+            .last_event_seq
+            .checked_add(1)
+            .expect("fire event sequence exhausted");
+        let overflow = self.events.len().saturating_sub(EVENT_HISTORY_LIMIT - 1);
+        self.events.drain(..overflow);
         self.events.push_back(FireEvent {
             seq: self.last_event_seq,
             tick,
@@ -157,4 +191,45 @@ pub(crate) fn force_ignite(sim: &Simulation, building: BuildingID) {
     let mut fires = sim.write::<Fires>();
     fires.by_building.insert(building, tick);
     fires.record(tick, building, FireEventKind::Ignited);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::saveload::{Bincode, Encoder};
+
+    #[test]
+    fn pf_d_fire_history_is_bounded_on_load() {
+        let mut fires = Fires::default();
+        for seq in 1..=300 {
+            fires.events.push_back(FireEvent {
+                seq,
+                tick: Tick(seq),
+                building: BuildingID::default(),
+                kind: FireEventKind::Ignited,
+            });
+        }
+        fires.last_event_seq = 300;
+        let encoded = Bincode::encode(&fires).unwrap();
+        let mut restored: Fires = Bincode::decode(&encoded).unwrap();
+        assert_eq!(restored.events.len(), EVENT_HISTORY_LIMIT);
+        assert_eq!(restored.events.front().unwrap().seq, 45);
+        restored.record(
+            Tick(301),
+            BuildingID::default(),
+            FireEventKind::Extinguished,
+        );
+        assert_eq!(restored.events.len(), EVENT_HISTORY_LIMIT);
+        assert_eq!(restored.events.back().unwrap().seq, 301);
+    }
+
+    #[test]
+    #[should_panic(expected = "fire event sequence exhausted")]
+    fn pf_d_fire_sequence_checks_overflow() {
+        let mut fires = Fires {
+            last_event_seq: u64::MAX,
+            ..Fires::default()
+        };
+        fires.record(Tick(1), BuildingID::default(), FireEventKind::Ignited);
+    }
 }

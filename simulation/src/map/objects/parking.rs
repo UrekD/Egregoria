@@ -4,6 +4,7 @@ use geom::{Transform, Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use slotmapd::{new_key_type, SecondaryMap, SlotMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 new_key_type! {
     pub struct ParkingSpotID;
@@ -22,6 +23,13 @@ pub struct ParkingSpots {
     pub(crate) spots: SlotMap<ParkingSpotID, ParkingSpot>,
     pub(crate) lane_spots: SecondaryMap<LaneID, Vec<ParkingSpotID>>,
     pub(crate) reuse_spot: Grid<ParkingSpotID, Vec2>,
+    #[serde(skip, default = "next_revision")]
+    revision: u64,
+}
+
+fn next_revision() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Default for ParkingSpots {
@@ -30,11 +38,16 @@ impl Default for ParkingSpots {
             spots: Default::default(),
             lane_spots: Default::default(),
             reuse_spot: Grid::new(10),
+            revision: next_revision(),
         }
     }
 }
 
 impl ParkingSpots {
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn get(&self, spot: ParkingSpotID) -> Option<&ParkingSpot> {
         self.spots.get(spot)
     }
@@ -45,6 +58,9 @@ impl ParkingSpots {
 
     pub fn remove_spots(&mut self, lane: LaneID) {
         if let Some(spots) = self.lane_spots.remove(lane) {
+            if !spots.is_empty() {
+                self.revision = next_revision();
+            }
             for spot in spots {
                 self.spots.remove(spot);
             }
@@ -64,6 +80,9 @@ impl ParkingSpots {
         for (_, spot) in self.reuse_spot.clear() {
             self.spots.remove(spot);
             has_reused += 1;
+        }
+        if has_reused != 0 {
+            self.revision = next_revision();
         }
         has_reused
     }
@@ -95,10 +114,11 @@ impl ParkingSpots {
         let parent = lane.id;
         let spots = &mut self.spots;
         let reuse = &mut self.reuse_spot;
+        let mut moved = false;
         let spots = lane
             .points
             .points_dirs_along((0..n_spots).map(|x| (x as f32 + 0.5) * step + gap))
-            .map(move |(pos, dir)| {
+            .map(|(pos, dir)| {
                 let mut iter = reuse.query_around(pos.xy(), 3.0);
                 if let Some((h, _)) = iter.next() {
                     if let Some((_, spot_id)) = reuse.get(h) {
@@ -107,10 +127,9 @@ impl ParkingSpots {
 
                         reuse.remove_maintain(h);
                         if let Some(p) = spots.get_mut(spot_id) {
-                            *p = ParkingSpot {
-                                parent,
-                                trans: Transform::new_dir(pos, dir),
-                            };
+                            let trans = Transform::new_dir(pos, dir);
+                            moved |= p.trans != trans;
+                            *p = ParkingSpot { parent, trans };
                             return spot_id;
                         } else {
                             log::error!("found a spot in reuse that doesn't exist anymore");
@@ -126,9 +145,13 @@ impl ParkingSpots {
             .collect();
 
         self.lane_spots.insert(lane.id, spots);
+        if moved {
+            self.revision = next_revision();
+        }
     }
 
     pub fn clear(&mut self) {
+        self.revision = next_revision();
         self.spots.clear();
         self.lane_spots.clear();
         for _ in self.reuse_spot.clear() {}

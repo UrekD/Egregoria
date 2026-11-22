@@ -150,6 +150,18 @@ impl HumanDecisionKind {
     }
 }
 
+impl HumanDecision {
+    /// Number of simulation steps before the next decision, independent of calendar jumps.
+    #[inline]
+    fn wait_one_tick(&mut self) -> bool {
+        if let Some(wait) = self.wait.checked_sub(1) {
+            self.wait = wait;
+            return true;
+        }
+        false
+    }
+}
+
 #[derive(Debug)]
 enum NextDesire<'a> {
     None,
@@ -170,6 +182,9 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
     let vehicles = &world.vehicles;
     world.humans.iter_mut().for_each(|(ent, h)| {
         BuyGoods::update_pickup(h, rc, re, vehicles, resources);
+        if h.decision.wait_one_tick() {
+            return;
+        }
         update_decision(
             ra,
             rb,
@@ -208,8 +223,7 @@ pub fn update_decision(
     home: Option<&mut Home>,
     mut work: Option<&mut Work>,
 ) {
-    if decision.wait != 0 {
-        decision.wait -= 1;
+    if decision.wait_one_tick() {
         return;
     }
     let pos = trans.pos;

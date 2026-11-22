@@ -125,6 +125,8 @@ fn register_systems_and_resources() {
     register_resource_noserialize::<ParCommandBuffer<WagonEnt>>();
     register_resource_noserialize::<ParCommandBuffer<FreightStationEnt>>();
     register_resource_noserialize::<ParCommandBuffer<CompanyEnt>>();
+    register_resource_noserialize::<crate::economy::WalkingComponents>();
+    register_resource_noserialize::<crate::souls::growth::GrowthCache>();
     register_resource_noinit::<SimulationOptions, Bincode>("simoptions");
 
     register_resource_default::<ElectricityFlow, Bincode>("electricity_flow");

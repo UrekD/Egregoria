@@ -52,7 +52,7 @@ pub struct Bought(pub BTreeMap<ItemID, Vec<Trade>>);
 pub struct Workers(pub Vec<HumanID>);
 
 #[derive(Default)]
-struct WalkingComponents {
+pub(crate) struct WalkingComponents {
     generation: u64,
     labels: BTreeMap<LaneID, LaneID>,
 }
@@ -70,9 +70,6 @@ impl EcoStats {
 
 pub fn market_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("economy::market_update");
-    if !resources.contains::<WalkingComponents>() {
-        resources.insert(WalkingComponents::default());
-    }
     let mut m = resources.write::<Market>();
     let job_opening = ItemID::new("job-opening");
     let tick = resources.read::<GameTime>().tick;

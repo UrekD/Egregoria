@@ -50,6 +50,19 @@ impl BuildingInfos {
     }
 
     pub(crate) fn remove_soul(&mut self, soul: SoulID) {
+        self.remove_soul_affiliations(soul);
+        for (_, info) in self.assignment.iter_mut() {
+            info.inside.retain(|&occupant| occupant != soul);
+        }
+    }
+
+    pub(crate) fn remove_soul_occupancy(&mut self, souls: &BTreeSet<SoulID>) {
+        for (_, info) in self.assignment.iter_mut() {
+            info.inside.retain(|occupant| !souls.contains(occupant));
+        }
+    }
+
+    pub(crate) fn remove_soul_affiliations(&mut self, soul: SoulID) {
         self.remove_resident(soul);
         if let Some(building) = self.owners.remove(&soul) {
             if let Some(info) = self.get_mut(building) {
@@ -58,9 +71,6 @@ impl BuildingInfos {
                 }
             }
             self.mark_vacancy_changed(building);
-        }
-        for (_, info) in self.assignment.iter_mut() {
-            info.inside.retain(|&occupant| occupant != soul);
         }
     }
 

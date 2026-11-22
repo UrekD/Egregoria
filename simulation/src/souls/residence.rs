@@ -1,4 +1,5 @@
-use crate::economy::balance::RETAIL_ACCESS_RADIUS_M;
+use crate::economy::balance::{periodic_tick, RETAIL_ACCESS_RADIUS_M};
+use crate::economy::Budget;
 use crate::map::{BuildingID, BuildingKind, Density, Map};
 use crate::map_dynamic::{BuildingInfos, CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow};
 use crate::souls::happiness::Happiness;
@@ -8,7 +9,7 @@ use geom::{Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use prototypes::{
     try_prototype, CompanyKind, ItemID, ResidencePrototype, ResidencePrototypeID, ServiceKind,
-    TICKS_PER_HOUR,
+    Tick, TICKS_PER_HOUR,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -451,7 +452,8 @@ pub(crate) const fn due(tick: u64) -> bool {
 }
 
 pub fn residence_update(sim: &mut Simulation) {
-    if !due(sim.get_tick()) {
+    // Use the preceding elapsed-time utility and environment snapshots.
+    if !due(periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()))) {
         return;
     }
 
