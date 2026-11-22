@@ -3,11 +3,11 @@ use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::transit::{elapsed_ticks, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
     BuildingInfos, Itinerary, LineID, ParkingManagement, ParkingReserveError, SpotReservation,
-    StopID, NEAR_PARKING_RADIUS,
+    StopID, Transit, NEAR_PARKING_RADIUS,
 };
 use crate::souls::desire::WorkKind;
 use crate::transportation::TransportGrid;
-use crate::transportation::{put_pedestrian_in_transport_grid, unpark, Location};
+use crate::transportation::{put_pedestrian_in_transport_grid, unpark, Location, VehicleKind};
 use crate::utils::resources::Resources;
 use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
 use crate::{ParCommandBuffer, SoulID, World};
@@ -16,6 +16,12 @@ use geom::{Transform, Vec3};
 use prototypes::Tick;
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
+
+#[path = "transit_path.rs"]
+mod transit_path;
+use transit_path::{legacy_cost, TransitPaths};
+
+const PERSONAL_CAR_ACCESS_RADIUS: f32 = 300.0;
 
 #[derive(Inspect, Serialize, Deserialize)]
 pub struct Router {
@@ -73,11 +79,21 @@ pub enum RoutingStep {
 debug_inspect_impl!(RoutingStep);
 
 pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
+    routing_changed(world, resources, Transit::headway);
+}
+
+fn routing_changed(
+    world: &mut World,
+    resources: &mut Resources,
+    headway: impl Fn(&Transit, LineID) -> Option<u64>,
+) {
     profiling::scope!("map_dynamic::routing_changed_system");
     let map: &Map = &resources.read();
     let parking: &mut ParkingManagement = &mut resources.write();
     let cbuf_human = resources.read::<ParCommandBuffer<HumanEnt>>();
     let cbuf_vehicle = resources.read::<ParCommandBuffer<VehicleEnt>>();
+    let transit = resources.read::<Transit>();
+    let mut transit_paths = None;
 
     world.humans.iter_mut().for_each(|(id, h)| {
         let router = &mut h.router;
@@ -124,7 +140,52 @@ pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
             router.trip_start = Some(elapsed_ticks(resources));
         }
 
-        let mut route = router.steps_to(pos, parking, map, &h.location, &world.vehicles);
+        let mut use_selected_vehicle = true;
+        let mut transit_steps = None;
+        if !transit.runs.is_empty()
+            && router.allows_transit()
+            && !matches!(h.location, Location::Vehicle(_))
+            && (router.vehicle.is_none() || router.vehicle == router.personal_car)
+            && !h
+                .work
+                .as_ref()
+                .is_some_and(|work| matches!(work.kind, WorkKind::Driver { .. }))
+        {
+            let car = router.vehicle.and_then(|id| world.vehicles.get(id));
+            if car.is_none_or(|vehicle| matches!(vehicle.vehicle.kind, VehicleKind::Car)) {
+                let paths =
+                    transit_paths.get_or_insert_with(|| TransitPaths::new(&transit, &headway));
+                if paths.has_service() {
+                    let origin = match h.location {
+                        Location::Building(id) => map.get(id).map_or(h.trans.pos, |b| b.door_pos),
+                        _ => h.trans.pos,
+                    };
+                    let nearby_car = car.map(|car| car.trans.pos).filter(|&car_pos| {
+                        car_pos.distance2(origin) <= PERSONAL_CAR_ACCESS_RADIUS.powi(2)
+                    });
+                    use_selected_vehicle = nearby_car.is_some();
+                    transit_steps = paths.winning_steps(
+                        origin,
+                        pos,
+                        &h.location,
+                        map,
+                        elapsed_ticks(resources),
+                        legacy_cost(origin, pos, nearby_car),
+                    );
+                }
+            }
+        }
+
+        let mut route = if let Some(steps) = transit_steps {
+            Ok(steps)
+        } else if !use_selected_vehicle && router.vehicle.is_some() {
+            let selected = router.vehicle.take();
+            let route = router.steps_to(pos, parking, map, &h.location, &world.vehicles);
+            router.vehicle = selected;
+            route
+        } else {
+            router.steps_to(pos, parking, map, &h.location, &world.vehicles)
+        };
         if matches!(route, Err(RouterError::ReservingParkingSpot(_))) {
             if let Some(car) = router
                 .personal_car
@@ -591,5 +652,224 @@ impl Router {
 
         steps.push(RoutingStep::WalkTo(obj));
         Ok(steps)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map::LaneKind;
+    use crate::map_dynamic::{BusRun, TransitLine, TransitStop};
+    use crate::souls::human::spawn_human;
+    use crate::tests::TestCtx;
+    use crate::transportation::{spawn_driving_vehicle, VehicleKind};
+    use common::saveload::{Bincode, Encoder};
+    use geom::{vec2, vec3, Color};
+    use prototypes::Money;
+
+    struct RouteFixture {
+        ctx: TestCtx,
+        human: HumanID,
+        line: LineID,
+        stops: [StopID; 2],
+        origin: Vec3,
+        destination: Vec3,
+    }
+
+    impl RouteFixture {
+        fn new(distance: f32) -> Self {
+            let mut ctx = TestCtx::new();
+            ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(900.0, 100.0, 0.0)]);
+            let house = ctx.build_house_near(vec2(200.0, 100.0));
+            let human = spawn_human(&mut ctx.g, house).unwrap();
+            let origin = Self::sidewalk_at(&ctx, vec3(200.0, 100.0, 0.0));
+            let destination = origin + Vec3::X * distance;
+            let berths = [origin, destination].map(|pos| {
+                let map = ctx.g.map();
+                map.get(map.nearest_lane(pos, LaneKind::Driving, None).unwrap())
+                    .unwrap()
+                    .points
+                    .project_segment_dir(pos)
+            });
+            let (line, stops) = {
+                let mut transit = ctx.g.write::<Transit>();
+                let stops = [(origin, berths[0]), (destination, berths[1])].map(
+                    |(walk_pos, (berth, _, dir))| {
+                        transit.stops.insert_with_key(|id| TransitStop {
+                            id,
+                            pos: berth,
+                            dir: dir.xy(),
+                            walk_pos,
+                            berth,
+                        })
+                    },
+                );
+                let line = transit.lines.insert_with_key(|id| TransitLine {
+                    id,
+                    stops: stops.to_vec(),
+                    target_vehicles: 1,
+                    fare: Money::ZERO,
+                    color: Color::WHITE,
+                    suspended: false,
+                });
+                (line, stops)
+            };
+            let (berth, _, dir) = berths[0];
+            let bus =
+                spawn_driving_vehicle(&mut ctx.g, VehicleKind::Bus, Transform { pos: berth, dir })
+                    .unwrap();
+            ctx.g.write::<Transit>().runs.insert(
+                bus,
+                BusRun {
+                    line,
+                    next_stop_idx: 1,
+                    dwell_until: None,
+                    leg_started: Tick(0),
+                    failures: 0,
+                },
+            );
+
+            let traveler = &mut ctx.g.world.humans[human];
+            traveler.location = Location::Outside;
+            traveler.trans.pos = origin;
+            traveler.router = Router::new(None);
+            Self {
+                ctx,
+                human,
+                line,
+                stops,
+                origin,
+                destination,
+            }
+        }
+
+        fn sidewalk_at(ctx: &TestCtx, pos: Vec3) -> Vec3 {
+            let map = ctx.g.map();
+            map.get(map.nearest_lane(pos, LaneKind::Walking, None).unwrap())
+                .unwrap()
+                .points
+                .project(pos)
+        }
+
+        fn assign_car(&mut self, position: Vec3) -> VehicleID {
+            let car =
+                spawn_driving_vehicle(&mut self.ctx.g, VehicleKind::Car, Transform::new(position))
+                    .unwrap();
+            self.ctx.g.world.humans[self.human].router = Router::new(Some(car));
+            car
+        }
+
+        // The spine headway is a stub, so exercise routing with a supplied interval.
+        fn plan(&mut self, headway: u64) -> &[RoutingStep] {
+            let (world, resources) = self.ctx.g.world_res();
+            world.humans[self.human]
+                .router
+                .go_to(Destination::Outside(self.destination));
+            routing_changed(world, resources, |_, line| {
+                (line == self.line).then_some(headway)
+            });
+            &world.humans[self.human].router.steps
+        }
+
+        fn assert_ride(&mut self, headway: u64) {
+            let [board, alight] = self.stops;
+            let line = self.line;
+            let origin = self.origin;
+            let destination = self.destination;
+            assert!(matches!(
+                self.plan(headway),
+                [RoutingStep::WalkTo(end), RoutingStep::RideTransit { line: ride, alight: off },
+                    RoutingStep::WaitAtStop { stop: on, line: wait, since }, RoutingStep::WalkTo(start)]
+                    if *end == destination && *start == origin
+                        && *ride == line && *wait == line && *on == board && *off == alight
+                        && *since == WAIT_NOT_STARTED
+            ));
+        }
+    }
+
+    #[test]
+    fn p3b_zero_running_buses_preserve_legacy_steps() {
+        let mut f = RouteFixture::new(500.0);
+        let car = f.assign_car(f.origin + Vec3::X * 350.0);
+        f.ctx.g.write::<Transit>().runs.clear();
+        let mut expected = {
+            let map = f.ctx.g.map();
+            let parking = Bincode::encode(&*f.ctx.g.read::<ParkingManagement>()).unwrap();
+            Router::new(Some(car))
+                .steps_to(
+                    f.destination,
+                    &mut Bincode::decode(&parking).unwrap(),
+                    &map,
+                    &Location::Outside,
+                    &f.ctx.g.world.vehicles,
+                )
+                .unwrap()
+        };
+        assert!(expected
+            .iter()
+            .any(|step| matches!(step, RoutingStep::DriveTo(..))));
+        expected.reverse();
+        assert_eq!(
+            Bincode::encode(&f.plan(400)).unwrap(),
+            Bincode::encode(&expected).unwrap(),
+        );
+    }
+
+    #[test]
+    fn p3b_carless_commuter_near_stops_chooses_transit() {
+        RouteFixture::new(500.0).assert_ride(400);
+    }
+
+    #[test]
+    fn p3b_owner_far_from_car_chooses_transit_without_reserving_parking() {
+        let mut f = RouteFixture::new(500.0);
+        let car = f.assign_car(f.origin + Vec3::X * 350.0);
+        let before = Bincode::encode(&*f.ctx.g.read::<ParkingManagement>()).unwrap();
+        f.assert_ride(400);
+        let after = Bincode::encode(&*f.ctx.g.read::<ParkingManagement>()).unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            f.ctx.g.world.humans[f.human].router.selected_vehicle(),
+            Some(car)
+        );
+    }
+
+    #[test]
+    fn p3b_pickup_stays_walk_only() {
+        let mut f = RouteFixture::new(500.0);
+        f.ctx.g.world.humans[f.human].router.walk_only_pickup = true;
+        let destination = f.destination;
+        assert!(matches!(f.plan(400), [RoutingStep::WalkTo(end)] if *end == destination));
+    }
+
+    #[test]
+    fn p3b_unreachable_access_or_egress_falls_back_to_legacy() {
+        for stop_index in 0..2 {
+            let mut f = RouteFixture::new(500.0);
+            f.ctx
+                .build_roads(&[vec3(100.0, 200.0, 0.0), vec3(900.0, 200.0, 0.0)]);
+            let endpoint = [f.origin, f.destination][stop_index];
+            let disconnected = RouteFixture::sidewalk_at(&f.ctx, endpoint + Vec3::Y * 100.0);
+            let result = Itinerary::route(
+                Tick(0),
+                endpoint,
+                disconnected,
+                &f.ctx.g.map(),
+                PathKind::Pedestrian,
+            );
+            assert!(result.is_none(), "fixture must have disconnected sidewalks");
+            f.ctx.g.write::<Transit>().stops[f.stops[stop_index]].walk_pos = disconnected;
+            let destination = f.destination;
+            assert!(matches!(f.plan(400), [RoutingStep::WalkTo(end)] if *end == destination));
+        }
+    }
+
+    #[test]
+    fn p3b_ties_prefer_legacy() {
+        let mut tie = RouteFixture::new(240.0);
+        let destination = tie.destination;
+        // Walking is 10,000 ticks. Riding takes 1,500 ticks plus half the headway.
+        assert!(matches!(tie.plan(17_000), [RoutingStep::WalkTo(end)] if *end == destination));
+        RouteFixture::new(240.0).assert_ride(16_999);
     }
 }
