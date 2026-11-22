@@ -1,9 +1,7 @@
 use goryak::{
-    blur_bg, button_primary, button_secondary, mincolumn, minrow, on_secondary_container, padxy,
-    secondary_container, textc, tooltip,
+    button_primary, button_secondary, minrow, on_secondary_container, padxy, textc, tooltip,
 };
 use simulation::Simulation;
-use yakui::{opaque, reflow, Alignment, Dim2, Pivot};
 
 use crate::gui::{GuiState, Tool};
 use crate::uiworld::UiWorld;
@@ -19,100 +17,89 @@ pub(crate) struct TransitTools {
     remove_stops: bool,
 }
 
-pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
-    let mut state = uiworld.write::<TransitTools>();
-
+pub(super) fn update_lines(uiworld: &UiWorld, sim: &Simulation) {
     if let Some(line) = uiworld
         .read::<GuiState>()
         .windows
         .update_transit_lines(uiworld, sim)
     {
-        state.line.begin_edit(line);
+        uiworld.write::<TransitTools>().line.begin_edit(line);
         *uiworld.write::<Tool>() = Tool::TransitLine;
     }
+}
 
-    let mut tool = *uiworld.read::<Tool>();
+pub(super) fn buttons(uiworld: &UiWorld) {
+    minrow(6.0, || {
+        let current = *uiworld.read::<Tool>();
+        for choice in [Tool::TransitStop, Tool::TransitLine] {
+            if tool_button(current, choice) {
+                let mut state = uiworld.write::<TransitTools>();
+                state.line.cancel();
+                state.remove_stops = false;
+                *uiworld.write::<Tool>() = choice;
+            }
+        }
+    });
+}
+
+pub(super) fn properties(uiworld: &UiWorld, tool: Tool) {
+    let mut state = uiworld.write::<TransitTools>();
+    padxy(12.0, 8.0, || {
+        minrow(10.0, || {
+            if tool == Tool::TransitStop {
+                let hint = if state.remove_stops {
+                    "Click a stop to remove it."
+                } else {
+                    "Click a lane beside a sidewalk, away from junctions."
+                };
+                textc(on_secondary_container(), hint);
+                if tooltip("Switch between adding and removing stops", || {
+                    button_secondary(if state.remove_stops {
+                        "Add stops"
+                    } else {
+                        "Remove stops"
+                    })
+                    .show()
+                })
+                .clicked
+                {
+                    state.remove_stops = !state.remove_stops;
+                }
+            } else {
+                let action = if state.line.editing() {
+                    "Edit loop"
+                } else {
+                    "New loop"
+                };
+                textc(
+                    on_secondary_container(),
+                    format!("{action} · {} of 30 stops", state.line.len()),
+                );
+                textc(
+                    on_secondary_container(),
+                    "Click stops in order. Click the first to close.",
+                );
+            }
+            if tooltip("Leave the transit tool", || {
+                button_secondary("Cancel").show()
+            })
+            .clicked
+            {
+                *uiworld.write::<Tool>() = Tool::Hand;
+            }
+        });
+    });
+}
+
+pub(super) fn update_tool(uiworld: &UiWorld, sim: &Simulation) {
+    let mut state = uiworld.write::<TransitTools>();
+    let tool = *uiworld.read::<Tool>();
     if tool != Tool::TransitLine {
         state.line.cancel();
     }
     if tool != Tool::TransitStop {
         state.remove_stops = false;
     }
-
-    reflow(
-        Alignment::BOTTOM_RIGHT,
-        Pivot::BOTTOM_RIGHT,
-        Dim2::pixels(-12.0, -100.0),
-        || {
-            opaque(|| {
-                blur_bg(secondary_container().with_alpha(0.92), 8.0, || {
-                    padxy(8.0, 6.0, || {
-                        mincolumn(4.0, || {
-                            if tool == Tool::TransitStop {
-                                let hint = if state.remove_stops {
-                                    "Click a stop to remove it."
-                                } else {
-                                    "Click a lane beside a sidewalk, away from junctions."
-                                };
-                                textc(on_secondary_container(), hint);
-                            }
-                            if tool == Tool::TransitLine {
-                                let action = if state.line.editing() {
-                                    "Edit loop"
-                                } else {
-                                    "New loop"
-                                };
-                                textc(
-                                    on_secondary_container(),
-                                    format!("{action} · {} of 30 stops", state.line.len()),
-                                );
-                                textc(
-                                    on_secondary_container(),
-                                    "Click stops in order. Click the first to close.",
-                                );
-                            }
-
-                            minrow(6.0, || {
-                                if tool_button(tool, Tool::TransitStop) {
-                                    tool = Tool::TransitStop;
-                                    state.remove_stops = false;
-                                    state.line.cancel();
-                                }
-                                if tool_button(tool, Tool::TransitLine) {
-                                    tool = Tool::TransitLine;
-                                    state.line.cancel();
-                                }
-                                if tool == Tool::TransitStop
-                                    && tooltip("Switch between adding and removing stops", || {
-                                        button_secondary(if state.remove_stops {
-                                            "Add stops"
-                                        } else {
-                                            "Remove stops"
-                                        })
-                                        .show()
-                                    })
-                                    .clicked
-                                {
-                                    state.remove_stops = !state.remove_stops;
-                                }
-                                if matches!(tool, Tool::TransitStop | Tool::TransitLine)
-                                    && tooltip("Leave the transit tool", || {
-                                        button_secondary("Cancel").show()
-                                    })
-                                    .clicked
-                                {
-                                    tool = Tool::Hand;
-                                    state.line.cancel();
-                                }
-                            });
-                        });
-                    });
-                });
-            });
-        },
-    );
-
-    *uiworld.write::<Tool>() = tool;
     match tool {
         Tool::TransitStop => transit_stop::update(sim, uiworld, state.remove_stops),
         Tool::TransitLine => transit_line::update(sim, uiworld, &mut state.line),

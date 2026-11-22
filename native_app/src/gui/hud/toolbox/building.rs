@@ -18,12 +18,14 @@ use prototypes::{
     prototypes_iter, try_prototype, BuildingPrototypeID, GoodsCompanyID, GoodsCompanyPrototype,
     Prototype, RenderAsset, ServiceID, ServiceKind,
 };
-use simulation::map::{BuildingKind, Zone};
+use simulation::map::{BuildingKind, Zone, MAX_ZONE_AREA};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 
 use crate::gui::specialbuilding::{SpecialBuildKind, SpecialBuildingResource};
-use crate::gui::{item_icon_yakui, ErrorTooltip, PotentialCommands, Tool};
+use crate::gui::{
+    item_icon_yakui, ErrorTooltip, InspectedBuilding, InspectedEntity, PotentialCommands, Tool,
+};
 use crate::rendering::immediate::{ImmediateDraw, OrderKind};
 use crate::uiworld::UiWorld;
 
@@ -35,6 +37,9 @@ pub(crate) enum BuildingTab {
 }
 
 pub fn special_building_properties(uiw: &UiWorld) {
+    // Inspector windows are drawn over the shelf and can intercept card clicks.
+    uiw.write::<InspectedBuilding>().e = None;
+    uiw.write::<InspectedEntity>().e = None;
     let mut tab = uiw.write::<BuildingTab>();
     mincolumn(5.0, || {
         minrow(5.0, || {
@@ -185,9 +190,20 @@ fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
                                                         }
                                                         if let Some(p) = descr.power_production {
                                                             fixed_spacer((0.0, 10.0));
+                                                            let output = if descr.zone.is_some() {
+                                                                format!(
+                                                                    "{} W/m²",
+                                                                    p.watts() as f64
+                                                                        / f64::from(MAX_ZONE_AREA)
+                                                                )
+                                                            } else {
+                                                                p.to_string()
+                                                            };
                                                             textc(
                                                                 on_secondary_container(),
-                                                                format!("Power production: {}", p),
+                                                                format!(
+                                                                    "Power production: {output}"
+                                                                ),
                                                             );
                                                         }
                                                     });
@@ -230,13 +246,29 @@ fn building_choices(uiw: &UiWorld, tab: BuildingTab) {
                                     );
                                 }
                             }
+                            if matches!(
+                                service.service_kind,
+                                ServiceKind::WaterPump | ServiceKind::SewageOutlet
+                            ) {
+                                let power = match service.service_kind {
+                                    ServiceKind::WaterPump => descr.power_consumption.map_or_else(
+                                        || "Needs power".into(),
+                                        |power| format!("Needs {power}"),
+                                    ),
+                                    _ => "No power needed".into(),
+                                };
+                                textc(
+                                    on_secondary_container(),
+                                    format!("{} workers · {power}", descr.n_workers),
+                                );
+                            }
                             textc(
                                 on_secondary_container(),
                                 format!("{} / day", service.upkeep_per_day),
                             );
                         }
 
-                        if resp.clicked || state.opt.is_none() {
+                        if resp.clicked {
                             selected.set(Some(descr.id));
                             let bkind = BuildingKind::GoodsCompany(descr.id);
                             let bgen = descr.bgen;

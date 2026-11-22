@@ -1,4 +1,4 @@
-use crate::gui::{ErrorTooltip, InspectedBuilding, PotentialCommands, Tool};
+use crate::gui::{ErrorTooltip, PotentialCommands, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use crate::uiworld::UiWorld;
@@ -45,23 +45,8 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
     let commands = &mut *uiworld.commands();
 
     if !matches!(tool, Tool::SpecialBuilding) {
+        state.opt = None;
         return;
-    }
-
-    for command in uiworld.received_commands().iter() {
-        if let WorldCommand::MapBuildSpecialBuilding { pos, kind, .. } = command {
-            if let Some(ProjectKind::Building(bid)) = map
-                .spatial_map()
-                .query(pos.center(), ProjectFilter::BUILDING)
-                .next()
-            {
-                if let Some(b) = map.buildings().get(bid) {
-                    if b.kind == *kind {
-                        uiworld.write::<InspectedBuilding>().e = Some(bid);
-                    }
-                }
-            }
-        }
     }
 
     if inp.act.contains(&InputAction::Rotate) {

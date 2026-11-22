@@ -25,6 +25,7 @@ pub mod train;
 pub(crate) mod transit;
 
 pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
+    transit::update_lines(uiworld, sim);
     reflow(Alignment::TOP_LEFT, Pivot::TOP_LEFT, Dim2::ZERO, || {
         constrained_viewport(|| {
             let mut l = List::column();
@@ -51,6 +52,12 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
                                 l.item_spacing = 10.0;
                                 l.show(|| {
                                     tools_list(uiworld);
+                                    reflow(
+                                        Alignment::CENTER_RIGHT,
+                                        Pivot::CENTER_RIGHT,
+                                        Dim2::pixels(-12.0, 0.0),
+                                        || transit::buttons(uiworld),
+                                    );
                                 });
                             });
                         });
@@ -59,7 +66,7 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
             });
         });
     });
-    transit::render(uiworld, sim);
+    transit::update_tool(uiworld, sim);
 }
 
 fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {
@@ -85,7 +92,7 @@ fn tool_properties(uiw: &UiWorld, _sim: &Simulation) -> bool {
             }
         }
         Tool::LotBrush => return false,
-        Tool::TransitStop | Tool::TransitLine => return false,
+        Tool::TransitStop | Tool::TransitLine => transit::properties(uiw, tool),
         Tool::Zoning => crate::gui::zoning::properties(uiw),
         Tool::RoadbuildStraight | Tool::RoadbuildCurved => {
             roadbuild::roadbuild_properties(uiw);

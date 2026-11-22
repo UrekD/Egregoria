@@ -82,37 +82,53 @@ pub(crate) fn render_slots(uiw: &UiWorld) {
             goryak::mincolumn(10.0, || {
                 for (entry, compatibility) in &state.slots {
                     let name = session::display_name(entry);
-                    minrow(12.0, || {
-                        if *compatibility == SlotCompatibility::Compatible {
-                            if button_primary(name).show().clicked {
-                                load = Some(entry.clone());
-                            }
-                        } else {
-                            let reason = if *compatibility == SlotCompatibility::Incompatible {
-                                "incompatible version"
+                    goryak::mincolumn(3.0, || {
+                        minrow(12.0, || {
+                            if *compatibility == SlotCompatibility::Compatible {
+                                if button_primary(name).show().clicked {
+                                    load = Some(entry.clone());
+                                }
                             } else {
-                                "unreadable snapshot"
-                            };
-                            textc(
-                                on_secondary_container().adjust(0.6),
-                                format!("{name} ({reason})"),
-                            );
+                                let reason = if *compatibility == SlotCompatibility::Incompatible {
+                                    "incompatible version"
+                                } else {
+                                    "unreadable snapshot"
+                                };
+                                textc(
+                                    on_secondary_container().adjust(0.6),
+                                    format!("{name} ({reason})"),
+                                );
+                            }
+                            if button_secondary("Delete").show().clicked {
+                                delete = Some(entry.id.clone());
+                            }
+                        });
+                        let mut identity = format!("Slot {}", entry.id);
+                        if let Some(revision) = entry.revision {
+                            let short = (revision.get() >> 96) as u32;
+                            identity.push_str(&format!("  ·  Rev {short:08x}"));
                         }
-                        if button_secondary("Delete").show().clicked {
-                            delete = Some(entry.id.clone());
-                        }
-                    });
-                    if let Some(meta) = &entry.meta {
+                        textc(on_secondary_container(), identity);
+                        let saved_at = entry
+                            .meta
+                            .as_ref()
+                            .map_or(entry.modified_unix, |meta| meta.saved_at_unix);
                         textc(
                             on_secondary_container(),
-                            format!(
-                                "Tick {}  ·  Population {}  ·  {}",
-                                meta.game_tick,
-                                meta.population,
-                                prototypes::Money::new_cents(meta.money_cents)
-                            ),
+                            format!("Saved {}", saved_time(saved_at)),
                         );
-                    }
+                        if let Some(meta) = &entry.meta {
+                            textc(
+                                on_secondary_container(),
+                                format!(
+                                    "Tick {}  ·  Population {}  ·  {}",
+                                    meta.game_tick,
+                                    meta.population,
+                                    prototypes::Money::new_cents(meta.money_cents)
+                                ),
+                            );
+                        }
+                    });
                 }
             });
         });
@@ -125,6 +141,62 @@ pub(crate) fn render_slots(uiw: &UiWorld) {
     } else if button_secondary("Back").show().clicked {
         session::back(uiw);
     }
+}
+
+fn saved_time(seconds: u64) -> String {
+    fn is_leap(year: u64) -> bool {
+        year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
+    }
+
+    const SECONDS_PER_DAY: u64 = 86_400;
+    const DAYS_PER_400_YEARS: u64 = 146_097;
+    let days = seconds / SECONDS_PER_DAY;
+    let mut year = 1970 + days / DAYS_PER_400_YEARS * 400;
+    let mut day = days % DAYS_PER_400_YEARS;
+    loop {
+        let days_in_year = 365 + u64::from(is_leap(year));
+        if day < days_in_year {
+            break;
+        }
+        day -= days_in_year;
+        year += 1;
+    }
+    let mut month = 1;
+    for days_in_month in [
+        31,
+        28 + u64::from(is_leap(year)),
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ] {
+        if day < days_in_month {
+            break;
+        }
+        day -= days_in_month;
+        month += 1;
+    }
+    let hour = seconds / 3600 % 24;
+    let minute = seconds / 60 % 60;
+    let second = seconds % 60;
+    format!(
+        "{year:04}-{month:02}-{:02} {hour:02}:{minute:02}:{second:02} UTC",
+        day + 1
+    )
+}
+
+#[cfg(test)]
+#[test]
+fn af1_saved_time_formats_utc_date_and_time() {
+    assert_eq!(saved_time(0), "1970-01-01 00:00:00 UTC");
+    assert_eq!(saved_time(951_827_696), "2000-02-29 12:34:56 UTC");
+    assert_eq!(saved_time(4_107_542_400), "2100-03-01 00:00:00 UTC");
 }
 
 pub(crate) fn render_delete(uiw: &UiWorld) -> bool {

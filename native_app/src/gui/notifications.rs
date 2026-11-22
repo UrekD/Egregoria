@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use prototypes::{ItemID, Money, Tick};
+use prototypes::{DayTime, GameTime, ItemID, Money, Tick};
 use simulation::diagnostics::elapsed_tick;
 use simulation::economy::{
     balance::{DEMAND_INTERVAL_TICKS, MIN_DEMAND_POPULATION},
@@ -77,7 +77,9 @@ pub(crate) enum AlertTarget {
 pub(crate) struct Notification {
     pub kind: NotificationKind,
     pub severity: Severity,
-    pub tick: Tick,
+    tick: Tick,
+    pub daytime: DayTime,
+    source: Option<AlertSource>,
     pub target: AlertTarget,
     pub text: String,
 }
@@ -110,7 +112,7 @@ fn push_bounded(items: &mut VecDeque<Notification>, notification: Notification) 
     items.push_back(notification);
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum AlertSource {
     Line(LineID),
     CityWide,
@@ -120,6 +122,31 @@ enum AlertSource {
 struct AlertKey {
     kind: NotificationKind,
     source: AlertSource,
+}
+
+#[derive(Clone, Copy)]
+struct SampleTime {
+    elapsed: Tick,
+    calendar: GameTime,
+}
+
+impl SampleTime {
+    fn daytime_at(self, tick: Tick) -> DayTime {
+        // Fire events use elapsed ticks, which are independent of clock changes.
+        let age = self.elapsed.0.saturating_sub(tick.0);
+        if age == 0 {
+            self.calendar.daytime
+        } else {
+            GameTime::new(Tick(self.calendar.tick.0.saturating_sub(age))).daytime
+        }
+    }
+}
+
+struct ActiveAlert {
+    started: Tick,
+    last_seen: Tick,
+    target: AlertTarget,
+    text: String,
 }
 
 #[derive(Default)]
@@ -152,7 +179,7 @@ pub(super) struct NotificationSampler {
     last_batch_seq: Option<u64>,
     fire_cursor: Option<u64>,
     last_sampled_tick: Option<Tick>,
-    active: BTreeMap<AlertKey, Tick>,
+    active: BTreeMap<AlertKey, ActiveAlert>,
     operating_balance: Option<i128>,
     operating_losses: u8,
     stalled_samples: u8,
@@ -161,22 +188,43 @@ pub(super) struct NotificationSampler {
 impl NotificationSampler {
     pub(super) fn observe(&mut self, sim: &Simulation) {
         let tick = elapsed_tick(sim);
-        self.observe_rejections(sim, tick);
-        self.observe_fires(sim, tick);
+        let now = SampleTime {
+            elapsed: tick,
+            calendar: *sim.read::<GameTime>(),
+        };
+        self.observe_rejections(sim, now);
+        self.observe_fires(sim, now);
         if self
             .last_sampled_tick
             .is_none_or(|previous| tick.0.saturating_sub(previous.0) >= SAMPLE_INTERVAL)
         {
             self.last_sampled_tick = Some(tick);
-            self.sample(sim, tick);
+            self.sample(sim, now);
             // The sampling interval gives recovered conditions a cooldown before
             // they can recur. Resolved or deleted sources keep no state.
-            self.active.retain(|_, seen| *seen == tick);
+            self.active.retain(|_, active| active.last_seen == tick);
         }
     }
 
     pub(super) fn drain(&mut self) -> impl ExactSizeIterator<Item = Notification> + '_ {
         self.pending.drain(..)
+    }
+
+    pub(super) fn details<'a>(&'a self, notice: &'a Notification) -> (&'a str, AlertTarget) {
+        if let Some(source) = notice.source {
+            let key = AlertKey {
+                kind: notice.kind,
+                source,
+            };
+            if let Some(active) = self
+                .active
+                .get(&key)
+                .filter(|active| active.started == notice.tick)
+            {
+                return (&active.text, active.target);
+            }
+        }
+        (&notice.text, notice.target)
     }
 
     #[cfg(test)]
@@ -191,20 +239,30 @@ impl NotificationSampler {
             && self.stalled_samples == 0
     }
 
-    fn emit(&mut self, kind: NotificationKind, tick: Tick, target: AlertTarget, text: String) {
+    fn emit(
+        &mut self,
+        kind: NotificationKind,
+        tick: Tick,
+        daytime: DayTime,
+        source: Option<AlertSource>,
+        target: AlertTarget,
+        text: String,
+    ) {
         push_bounded(
             &mut self.pending,
             Notification {
                 kind,
                 severity: kind.severity(),
                 tick,
+                daytime,
+                source,
                 target,
                 text,
             },
         );
     }
 
-    fn observe_rejections(&mut self, sim: &Simulation, tick: Tick) {
+    fn observe_rejections(&mut self, sim: &Simulation, now: SampleTime) {
         let outcomes = sim.read::<CommandOutcomes>();
         let sequence = outcomes.batch_seq();
         let previous = self.last_batch_seq.replace(sequence);
@@ -217,15 +275,21 @@ impl NotificationSampler {
                 reasons.push((command, reason));
                 self.emit(
                     NotificationKind::CommandRejected,
-                    tick,
+                    now.elapsed,
+                    now.calendar.daytime,
+                    None,
                     AlertTarget::CityWide,
-                    format!("{command}: {}", command_message(command, reason)),
+                    format!(
+                        "{}: {}",
+                        command_label(command),
+                        command_message(command, reason)
+                    ),
                 );
             }
         }
     }
 
-    fn observe_fires(&mut self, sim: &Simulation, tick: Tick) {
+    fn observe_fires(&mut self, sim: &Simulation, now: SampleTime) {
         let fires = sim.read::<Fires>();
         let latest = fires.events.back().map_or(0, |event| event.seq);
         if let Some(previous) = self.fire_cursor.replace(latest) {
@@ -244,6 +308,8 @@ impl NotificationSampler {
                 self.emit(
                     kind,
                     event.tick,
+                    now.daytime_at(event.tick),
+                    None,
                     AlertTarget::Building(event.building),
                     text.into(),
                 );
@@ -253,15 +319,22 @@ impl NotificationSampler {
             let (target, text) = if count == 1 {
                 (
                     AlertTarget::Building(building),
-                    "A building is on fire".into(),
+                    "A building was on fire".into(),
                 )
             } else {
                 (
                     AlertTarget::CityWide,
-                    format!("{count} buildings are on fire"),
+                    format!("{count} buildings were on fire"),
                 )
             };
-            self.emit(NotificationKind::Fire, tick, target, text);
+            self.emit(
+                NotificationKind::Fire,
+                now.elapsed,
+                now.calendar.daytime,
+                None,
+                target,
+                text,
+            );
         }
     }
 
@@ -269,17 +342,38 @@ impl NotificationSampler {
         &mut self,
         kind: NotificationKind,
         source: AlertSource,
-        tick: Tick,
+        now: SampleTime,
         target: AlertTarget,
-        text: impl FnOnce() -> String,
+        live_text: String,
+        history_text: impl FnOnce() -> String,
     ) {
         let key = AlertKey { kind, source };
-        if self.active.insert(key, tick).is_none() {
-            self.emit(kind, tick, target, text());
+        if let Some(active) = self.active.get_mut(&key) {
+            active.last_seen = now.elapsed;
+            active.target = target;
+            active.text = live_text;
+            return;
         }
+        self.active.insert(
+            key,
+            ActiveAlert {
+                started: now.elapsed,
+                last_seen: now.elapsed,
+                target,
+                text: live_text,
+            },
+        );
+        self.emit(
+            kind,
+            now.elapsed,
+            now.calendar.daytime,
+            Some(source),
+            target,
+            history_text(),
+        );
     }
 
-    fn sample(&mut self, sim: &Simulation, tick: Tick) {
+    fn sample(&mut self, sim: &Simulation, now: SampleTime) {
         use AlertSource::CityWide;
         use NotificationKind::*;
 
@@ -288,8 +382,9 @@ impl NotificationSampler {
             self.condition(
                 NegativeBudget,
                 CityWide,
-                tick,
+                now,
                 AlertTarget::CityWide,
+                format!("The treasury balance is {treasury}"),
                 || format!("The treasury balance fell to {treasury}"),
             );
         }
@@ -309,9 +404,14 @@ impl NotificationSampler {
             }
         }
         if self.operating_losses >= 2 {
-            self.condition(BudgetDeficit, CityWide, tick, AlertTarget::CityWide, || {
-                "Operating expenses have repeatedly exceeded income".into()
-            });
+            self.condition(
+                BudgetDeficit,
+                CityWide,
+                now,
+                AlertTarget::CityWide,
+                "Operating expenses have repeatedly exceeded income".into(),
+                || "Operating expenses repeatedly exceeded income".into(),
+            );
         }
 
         let humans = &sim.world().humans;
@@ -329,9 +429,10 @@ impl NotificationSampler {
             self.condition(
                 HighUnemployment,
                 CityWide,
-                tick,
+                now,
                 AlertTarget::CityWide,
-                || format!("{unemployed} of {population} citizens are unemployed"),
+                format!("{unemployed} of {population} citizens are unemployed"),
+                || format!("{unemployed} of {population} citizens were unemployed"),
             );
         }
         let demand = sim.read::<ZoneDemand>();
@@ -350,9 +451,14 @@ impl NotificationSampler {
             0
         };
         if self.stalled_samples >= 2 {
-            self.condition(StalledDemand, CityWide, tick, AlertTarget::CityWide, || {
-                "Demand has stalled across all zone types".into()
-            });
+            self.condition(
+                StalledDemand,
+                CityWide,
+                now,
+                AlertTarget::CityWide,
+                "Demand has stalled across all zone types".into(),
+                || "Demand stalled across all zone types".into(),
+            );
         }
 
         for line in sim
@@ -364,8 +470,12 @@ impl NotificationSampler {
             self.condition(
                 SuspendedLine,
                 AlertSource::Line(line.id),
-                tick,
+                now,
                 AlertTarget::Line(line.id),
+                format!(
+                    "Transit line {} is suspended",
+                    line.id.data().as_ffi() as u32
+                ),
                 || {
                     format!(
                         "Transit line {} suspended service",
@@ -374,10 +484,10 @@ impl NotificationSampler {
                 },
             );
         }
-        self.sample_networks(sim, tick);
+        self.sample_networks(sim, now);
     }
 
-    fn sample_networks(&mut self, sim: &Simulation, tick: Tick) {
+    fn sample_networks(&mut self, sim: &Simulation, now: SampleTime) {
         use NotificationKind::*;
 
         let map = sim.map();
@@ -411,20 +521,56 @@ impl NotificationSampler {
             let source = AlertSource::CityWide;
             if let Some(building) = alert.first {
                 let count = alert.count;
-                self.condition(kind, source, tick, AlertTarget::Building(building), || {
-                    if count == 1 {
-                        format!("1 building lacks {issue}")
-                    } else {
-                        format!("{count} buildings lack {issue}")
-                    }
-                });
+                let (buildings, verb) = if count == 1 {
+                    ("building", "lacks")
+                } else {
+                    ("buildings", "lack")
+                };
+                self.condition(
+                    kind,
+                    source,
+                    now,
+                    AlertTarget::Building(building),
+                    format!("{count} {buildings} {verb} {issue}"),
+                    || format!("{count} {buildings} lacked {issue}"),
+                );
             } else if alert.awaiting_refresh {
                 // Utility totals can lag a topology edit until the next utility pass.
-                if let Some(last_seen) = self.active.get_mut(&AlertKey { kind, source }) {
-                    *last_seen = tick;
+                if let Some(active) = self.active.get_mut(&AlertKey { kind, source }) {
+                    active.last_seen = now.elapsed;
                 }
             }
         }
+    }
+}
+
+fn command_label(command: &str) -> &'static str {
+    match command {
+        "Init" => "Create city",
+        "MapRemoveIntersection" => "Demolish intersection",
+        "MapRemoveRoad" => "Demolish road",
+        "MapRemoveBuilding" => "Demolish building",
+        "MapBuildHouse" => "Build house",
+        "Terraform" => "Edit terrain",
+        "SendMessage" => "Send message",
+        "SpawnRandomCars" => "Spawn cars",
+        "AddTrain" | "SpawnTrain" => "Place train",
+        "MapMakeConnection" | "MapMakeMultipleConnections" => "Build road or track",
+        "MapUpdateIntersectionPolicy" => "Edit intersection",
+        "MapBuildSpecialBuilding" => "Place building",
+        "MapLoadParis" | "MapLoadTestField" => "Load map",
+        "UpdateZone" => "Resize building zone",
+        "SetGameTime" => "Set game clock",
+        "ZonePaint" => "Paint zoning",
+        "SetTaxRate" => "Set tax rate",
+        "TransitAddStop" => "Add bus stop",
+        "TransitRemoveStop" => "Remove bus stop",
+        "TransitCreateLine" => "Create bus line",
+        "TransitEditLine" => "Edit bus line",
+        "TransitRemoveLine" => "Remove bus line",
+        "TransitSetVehicles" => "Set bus fleet size",
+        "TransitSetFare" => "Set bus fare",
+        _ => "City action",
     }
 }
 
@@ -464,6 +610,8 @@ fn p4_notification_history_evicts_oldest_and_clears() {
             kind: NotificationKind::Blackout,
             severity: Severity::Warning,
             tick: Tick(tick),
+            daytime: GameTime::new(Tick(tick)).daytime,
+            source: None,
             target: AlertTarget::CityWide,
             text: "Blackout".into(),
         });
@@ -538,6 +686,52 @@ mod tests {
         let notices = sampler.drain().collect::<Vec<_>>();
         assert_eq!(notices.len(), 1);
         assert_eq!(notices[0].kind, NotificationKind::CommandRejected);
+        assert_eq!(
+            notices[0].text,
+            "Demolish building: Object no longer exists"
+        );
+    }
+
+    #[test]
+    fn af1_sustained_water_alert_refreshes_its_count_without_a_second_toast() {
+        let (mut test, _) = city();
+        let mut sampler = NotificationSampler::default();
+        let mut center = NotificationCenter::default();
+        let mut sample = |test: &mut ScenarioCtx, tick| {
+            *test.sim.write::<GameTime>() = GameTime::new(Tick(tick));
+            let (world, resources) = test.sim.world_res();
+            electricity_flow_system(world, resources);
+            utility_flow_update(&mut test.sim);
+            sampler.observe(&test.sim);
+            let notices = sampler.drain().collect::<Vec<_>>();
+            let toasts = notices
+                .iter()
+                .filter(|n| n.kind == NotificationKind::NoWater)
+                .count();
+            for notice in notices {
+                center.push(notice);
+            }
+            let notice = center
+                .iter()
+                .find(|n| n.kind == NotificationKind::NoWater)
+                .unwrap();
+            let (text, target) = sampler.details(notice);
+            assert!(matches!(target, AlertTarget::Building(_)));
+            assert_eq!(
+                notice.daytime,
+                GameTime::new(Tick(SAMPLE_INTERVAL + 1)).daytime
+            );
+            (toasts, text.to_owned())
+        };
+        assert_eq!(
+            sample(&mut test, SAMPLE_INTERVAL + 1),
+            (1, "1 building lacks water".into())
+        );
+        fill_houses(&mut test, 1);
+        assert_eq!(
+            sample(&mut test, 2 * SAMPLE_INTERVAL + 1),
+            (0, "2 buildings lack water".into())
+        );
     }
 
     #[test]
@@ -711,6 +905,8 @@ mod tests {
             kind: NotificationKind::Blackout,
             severity: Severity::Error,
             tick: Tick(1),
+            daytime: GameTime::new(Tick(1)).daytime,
+            source: None,
             target: AlertTarget::Building(house),
             text: "An electrical network is in blackout".into(),
         });

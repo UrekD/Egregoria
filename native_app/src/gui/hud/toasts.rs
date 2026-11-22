@@ -9,7 +9,9 @@ use simulation::Simulation;
 use yakui::widgets::List;
 use yakui::{reflow, Alignment, Color, Dim2, MainAxisAlignment, Pivot};
 
-use crate::gui::notifications::{Notification, NotificationCenter, NotificationSampler, Severity};
+use crate::gui::notifications::{
+    AlertTarget, Notification, NotificationCenter, NotificationSampler, Severity,
+};
 use crate::uiworld::UiWorld;
 
 const LIFETIME: Duration = Duration::from_secs(5);
@@ -23,6 +25,13 @@ pub(crate) struct ToastState {
 }
 
 impl ToastState {
+    pub(super) fn advisor_details<'a>(
+        &'a self,
+        notice: &'a Notification,
+    ) -> (&'a str, AlertTarget) {
+        self.sampler.details(notice)
+    }
+
     pub(super) fn observe(&mut self, sim: &Simulation, visible: bool, now: Instant) {
         self.sampler.observe(sim);
         self.observed_at = visible.then_some(now);
@@ -71,7 +80,11 @@ pub(super) fn publish(uiworld: &UiWorld) {
         if notices.len() == MAX_TOASTS {
             notices.pop_front();
         }
-        notices.push_back((notice.clone(), now));
+        let (text, target) = sampler.details(notice);
+        let mut toast = notice.clone();
+        toast.text = text.to_owned();
+        toast.target = target;
+        notices.push_back((toast, now));
     }
 }
 

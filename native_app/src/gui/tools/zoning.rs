@@ -1,11 +1,14 @@
-use crate::gui::Tool;
+use crate::gui::windows::settings::Settings;
+use crate::gui::{ErrorTooltip, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::MapRenderer;
 use crate::uiworld::UiWorld;
 use geom::{vec2, LinearColor, Vec2, AABB, OBB};
-use goryak::{is_hovered, minrow, on_secondary_container, padxy, selectable_label_primary, textc};
-use simulation::map::{Density, ZoneKind, ZONE_CELL_SIZE};
+use goryak::{
+    is_hovered, mincolumn, minrow, on_secondary_container, padxy, selectable_label_primary, textc,
+};
+use simulation::map::{Density, Map, ProjectFilter, ProjectKind, ZoneKind, ZONE_CELL_SIZE};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 
@@ -70,48 +73,57 @@ impl ZoningState {
 }
 
 pub fn properties(uiworld: &UiWorld) {
+    let narrow = uiworld.camera().camera.viewport_w < 1120.0 * uiworld.read::<Settings>().gui_scale;
+    let brush_hint = |radius| {
+        let side = 2 * radius + 1;
+        textc(
+            on_secondary_container(),
+            format!("{side}×{side} · Ctrl + wheel"),
+        );
+    };
     let mut state = uiworld.write::<ZoningState>();
     state.over_controls = is_hovered(|| {
         padxy(12.0, 8.0, || {
-            minrow(5.0, || {
-                for kind in ZONES.into_iter().map(Some).chain([None]) {
-                    if selectable_label_primary(
-                        state.kind == kind,
-                        kind.map_or("Unzone", zone_name),
-                    )
-                    .clicked
-                    {
-                        state.kind = kind;
-                        state.drag_start = None;
-                        state.last_brush = None;
-                    }
-                }
-
-                for (rectangle, label) in [(false, "Brush"), (true, "Rectangle")] {
-                    if selectable_label_primary(state.rectangle == rectangle, label).clicked {
-                        state.rectangle = rectangle;
-                        state.drag_start = None;
-                        state.last_brush = None;
-                    }
-                }
-
-                if state.kind.is_some() {
-                    for (density, label) in [
-                        (Density::Low, "Low density"),
-                        (Density::High, "High density"),
-                    ] {
-                        if selectable_label_primary(state.density == density, label).clicked {
-                            state.density = density;
+            mincolumn(3.0, || {
+                minrow(5.0, || {
+                    for kind in ZONES.into_iter().map(Some).chain([None]) {
+                        if selectable_label_primary(
+                            state.kind == kind,
+                            kind.map_or("Unzone", zone_name),
+                        )
+                        .clicked
+                        {
+                            state.kind = kind;
+                            state.drag_start = None;
+                            state.last_brush = None;
                         }
                     }
-                }
 
-                if !state.rectangle {
-                    let side = 2 * state.brush_radius + 1;
-                    textc(
-                        on_secondary_container(),
-                        format!("{side}×{side} · Ctrl + wheel"),
-                    );
+                    for (rectangle, label) in [(false, "Brush"), (true, "Rectangle")] {
+                        if selectable_label_primary(state.rectangle == rectangle, label).clicked {
+                            state.rectangle = rectangle;
+                            state.drag_start = None;
+                            state.last_brush = None;
+                        }
+                    }
+
+                    if state.kind.is_some() {
+                        for (density, label) in [
+                            (Density::Low, "Low density"),
+                            (Density::High, "High density"),
+                        ] {
+                            if selectable_label_primary(state.density == density, label).clicked {
+                                state.density = density;
+                            }
+                        }
+                    }
+
+                    if !state.rectangle && !narrow {
+                        brush_hint(state.brush_radius);
+                    }
+                });
+                if !state.rectangle && narrow {
+                    brush_hint(state.brush_radius);
                 }
             });
         });
@@ -219,12 +231,20 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         .kind
         .map_or(LinearColor::new(0.96, 0.28, 0.28, 1.0), zone_color);
     let alpha = if held { 0.66 } else { 0.46 };
+    if state.kind.is_some() && !has_frontage(&map, (cell + Vec2::splat(0.5)) * ZONE_CELL_SIZE) {
+        *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new("Zones need road frontage to grow");
+    }
     let mut draw = uiworld.write::<ImmediateDraw>();
     for x in min.x as i32..max.x as i32 {
         for y in min.y as i32..max.y as i32 {
             let ll = vec2(x as f32, y as f32) * ZONE_CELL_SIZE;
             let center = ll + Vec2::splat(ZONE_CELL_SIZE * 0.5);
             if let Some(height) = map.environment.height(center) {
+                let color = if state.kind.is_some() && !has_frontage(&map, center) {
+                    LinearColor::new(0.58, 0.58, 0.58, 1.0)
+                } else {
+                    color
+                };
                 let ur = ll + Vec2::splat(ZONE_CELL_SIZE - 0.45);
                 draw.aabb(
                     AABB::new_ll_ur(ll + Vec2::splat(0.45), ur),
@@ -234,6 +254,15 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
             }
         }
     }
+}
+
+fn has_frontage(map: &Map, center: Vec2) -> bool {
+    map.spatial_map()
+        .query(center, ProjectFilter::LOT)
+        .any(|project| match project {
+            ProjectKind::Lot(id) => map.get(id).is_some_and(|lot| map.get(lot.parent).is_some()),
+            _ => false,
+        })
 }
 
 /// Convert inclusive cell coordinates to a map-clipped area of at most 50 × 50 cells.

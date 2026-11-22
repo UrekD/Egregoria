@@ -7,6 +7,7 @@ use simulation::Simulation;
 use crate::debug_gui::debug_inspect::debug_inspector;
 use crate::debug_gui::debug_window::debug_window;
 use crate::gui::{ErrorTooltip, GuiState, PotentialCommands};
+use crate::inputmap::InputMap;
 use crate::uiworld::UiWorld;
 
 /// Root GUI entrypoint
@@ -32,13 +33,15 @@ pub fn tooltip(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
     let tooltip = std::mem::take(&mut *uiworld.write::<ErrorTooltip>());
     if let Some(msg) = tooltip.msg {
         if !(tooltip.isworld && ui.is_pointer_over_area()) {
-            let s = ui.available_rect().size();
-            egui::show_tooltip_at(
-                ui,
-                Id::new("tooltip_error"),
-                egui::Pos2::new(s.x, s.y),
-                |ui| ui.label(RichText::new(msg).color(Color32::from_rgb(255, 100, 100))),
-            );
+            let pointer = uiworld.read::<InputMap>().screen;
+            let pos = egui::pos2(pointer.x, pointer.y) / ui.pixels_per_point();
+            let anchor = egui::Rect::from_center_size(pos, egui::vec2(30.0, 30.0));
+            egui::show_tooltip_for(ui, Id::new("tooltip_error"), &anchor, |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(msg).color(Color32::from_rgb(255, 100, 100)))
+                        .wrap_mode(egui::TextWrapMode::Extend),
+                );
+            });
         }
     }
 

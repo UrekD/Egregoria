@@ -1,8 +1,9 @@
 use crate::gui::follow::FollowEntity;
-use crate::gui::hud::toasts::{publish, severity_color};
+use crate::gui::hud::toasts::{publish, severity_color, ToastState};
 use crate::gui::inspect::focus_building;
 use crate::gui::notifications::{AlertTarget, NotificationCenter};
 use crate::gui::overlays::OverlayMode;
+use crate::gui::Tool;
 use crate::uiworld::UiWorld;
 use geom::Vec3;
 use goryak::{
@@ -28,6 +29,7 @@ pub(super) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
     .show(|| {
         publish(uiw);
         let center = uiw.read::<NotificationCenter>();
+        let alerts = uiw.read::<ToastState>();
         if center.iter().len() == 0 {
             textc(on_secondary_container(), "No notifications yet");
             return;
@@ -47,17 +49,25 @@ pub(super) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
                                 divider(outline().with_alpha(0.4), 2.0, 1.0);
                             }
                             mincolumn(3.0, || {
+                                let time = notice.daytime;
+                                let (text, target) = alerts.advisor_details(notice);
                                 minrow(12.0, || {
                                     textc(severity_color(notice.severity), notice.kind.label());
                                     textc(
                                         on_secondary_container(),
-                                        format!("Tick {}", notice.tick.0),
+                                        format!(
+                                            "Day {} {:02}:{:02}",
+                                            time.day, time.hour, time.minute
+                                        ),
                                     );
                                 });
-                                textc(on_secondary_container(), notice.text.clone());
-                                match resolve_target(&map, &transit, notice.target) {
+                                textc(on_secondary_container(), text.to_owned());
+                                match resolve_target(&map, &transit, target) {
                                     TargetLink::Building(id, door) => {
                                         if primary_link("Go to building") {
+                                            if *uiw.read::<Tool>() == Tool::SpecialBuilding {
+                                                *uiw.write::<Tool>() = Tool::Hand;
+                                            }
                                             focus_building(uiw, id, door);
                                             navigated = true;
                                         }
