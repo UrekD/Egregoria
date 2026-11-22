@@ -1,6 +1,6 @@
 #!/bin/sh
 mkdir build
-cp -r assets build
+cp -r assets base_mod build
 rm -f build/screen*.png
 rm -f build/crate_architecture.png
 cp target/release/native_app build/egregoria_bin

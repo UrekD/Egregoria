@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use simulation::Simulation;
 
 use crate::game_loop::Timings;
-use crate::gui::keybinds::{KeybindState, KeybindStateInner};
+use crate::gui::keybinds::{
+    apply_and_save_bindings, reset_binding, KeybindState, KeybindStateInner,
+};
 use crate::inputmap::{Bindings, InputMap};
 use crate::uiworld::UiWorld;
 
@@ -315,7 +317,7 @@ pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
                 let mut bindings = uiw.write::<Bindings>();
                 if button_primary("Reset").show().clicked {
                     *bindings = Bindings::default();
-                    uiw.write::<InputMap>().build_input_tree(&mut bindings);
+                    apply_and_save_bindings(&mut bindings, &mut uiw.write::<InputMap>());
                 }
 
                 let mut sorted_inps = bindings.0.keys().cloned().collect::<Vec<_>>();
@@ -330,7 +332,7 @@ pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
                             .main_axis_align_items(MainAxisAlignItems::Center)
                             .show(|| {
                                 for action in &sorted_inps {
-                                    let comb = bindings.0.get_mut(action).unwrap();
+                                    let comb = bindings.0.get(action).unwrap();
                                     padx(2.0, || {
                                         textc(on_secondary_container(), action.to_string());
                                     });
@@ -362,8 +364,11 @@ pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
                                                 .show()
                                                 .clicked
                                             {
-                                                comb.0 =
-                                                    Bindings::default().0.remove(action).unwrap().0;
+                                                reset_binding(
+                                                    &mut bindings,
+                                                    &mut uiw.write::<InputMap>(),
+                                                    action,
+                                                );
                                             }
                                         });
                                     });
