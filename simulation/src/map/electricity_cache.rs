@@ -69,7 +69,7 @@ impl ElectricityCache {
         self.generation
     }
 
-    fn topology_changed(&mut self) {
+    pub(super) fn topology_changed(&mut self) {
         // A replacement map can have a different topology with the same edit count.
         static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         self.generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);

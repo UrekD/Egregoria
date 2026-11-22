@@ -211,7 +211,9 @@ impl Pathfinder for CarPath {
 
         let end_pos = inters.get(lanes.get(end)?.dst)?.pos;
 
-        if !map.can_drive_between(start_lane, end) {
+        let can_drive = map.can_drive_between(start_lane, end);
+        #[cfg(not(debug_assertions))]
+        if !can_drive {
             return None;
         }
 
@@ -244,8 +246,16 @@ impl Pathfinder for CarPath {
             })
         };
 
-        let (v, _) =
-            pathfinding::directed::astar::astar(&dummy, successors, heuristic, |p| *p == end)?;
+        let route =
+            pathfinding::directed::astar::astar(&dummy, successors, heuristic, |p| *p == end);
+        #[cfg(debug_assertions)]
+        if !can_drive {
+            assert!(
+                route.is_none(),
+                "reachability rejected a route from {start_lane:?} to {end:?}",
+            );
+        }
+        let (v, _) = route?;
 
         let mut path = Vec::with_capacity(v.len() * 2);
         path.push(start);
@@ -333,33 +343,52 @@ mod tests {
         reached
     }
 
-    fn check_random_pairs(map: &Map) {
+    fn check_random_pairs(map: &Map, kind: LaneKind) {
         let lanes: Vec<_> = map
             .lanes()
             .values()
-            .filter(|lane| lane.kind == LaneKind::Driving)
+            .filter(|lane| lane.kind == kind)
             .map(|lane| lane.id)
             .collect();
+        let path_kind = if kind == LaneKind::Rail {
+            PathKind::Rail
+        } else {
+            PathKind::Vehicle
+        };
         let mut rng = common::rand::gen(42);
         let mut sample = || lanes[(rng.next_f32() * lanes.len() as f32) as usize];
         for _ in 0..32 {
             let start = sample();
             let reachable = reachable_lanes(map, start);
             for end in std::iter::once(start).chain((0..32).map(|_| sample())) {
-                assert_eq!(
-                    map.can_drive_between(start, end),
-                    reachable.contains(&end),
-                    "{start:?} -> {end:?}",
+                let expected = reachable.contains(&end);
+                let may_reach = map.can_drive_between(start, end);
+                assert!(
+                    may_reach || !expected,
+                    "{kind:?}: precheck rejected {start:?} -> {end:?}",
                 );
+                if kind != LaneKind::Driving || may_reach != expected {
+                    assert_eq!(
+                        path_kind
+                            .path(map, Tick(0), forward_lane(start), end)
+                            .is_some(),
+                        expected,
+                        "{kind:?}: {start:?} -> {end:?}",
+                    );
+                }
             }
         }
+    }
+
+    fn forward_lane(lane: LaneID) -> Traversable {
+        Traversable::new(TraverseKind::Lane(lane), TraverseDirection::Forward)
     }
 
     #[test]
     fn driving_reachability_matches_bfs_on_paris() {
         let mut map = Map::empty();
         procgen::load_parismap(&mut map);
-        check_random_pairs(&map);
+        check_random_pairs(&map, LaneKind::Driving);
     }
 
     #[test]
@@ -392,7 +421,66 @@ mod tests {
         for id in grid {
             map.update_intersection(id, |_| {});
         }
-        check_random_pairs(&map);
+        check_random_pairs(&map, LaneKind::Driving);
+    }
+
+    #[test]
+    fn pfb2a3_reachability_samples_bus_and_rail_lanes() {
+        for kind in [LaneKind::Bus, LaneKind::Rail] {
+            let mut map = Map::empty();
+            let intersections: Vec<_> = (0..6)
+                .map(|x| map.add_intersection(geom::vec3(100.0 * x as f32, 0.0, 0.3)))
+                .collect();
+            let mut pattern = LanePatternBuilder::new()
+                .one_way(true)
+                .sidewalks(false)
+                .parking(false)
+                .build();
+            pattern.lanes_forward[0].0 = kind;
+            for pair in intersections.windows(2) {
+                map.connect(pair[0], pair[1], &pattern, RoadSegmentKind::Straight)
+                    .unwrap();
+            }
+            for id in intersections {
+                map.update_intersection(id, |_| {});
+            }
+            check_random_pairs(&map, kind);
+        }
+    }
+
+    #[test]
+    fn pfb2a3_same_lane_loop_tracks_turn_policy() {
+        let mut map = Map::empty();
+        let a = map.add_intersection(geom::vec3(0.0, 0.0, 0.3));
+        let b = map.add_intersection(geom::vec3(100.0, 0.0, 0.3));
+        let c = map.add_intersection(geom::vec3(200.0, 0.0, 0.3));
+        let ab = map
+            .connect(
+                a,
+                b,
+                &LanePatternBuilder::new().build(),
+                RoadSegmentKind::Straight,
+            )
+            .unwrap();
+        connect_one_way(&mut map, b, c);
+        map.update_intersection(a, |_| {});
+        let lane = map.roads[ab]
+            .outgoing_lanes_from(a)
+            .iter()
+            .find(|&&(_, kind)| kind == LaneKind::Driving)
+            .unwrap()
+            .0;
+        let start = forward_lane(lane);
+        assert!(PathKind::Vehicle.path(&map, Tick(0), start, lane).is_none());
+
+        map.update_intersection(b, |junction| junction.turn_policy.back_turns = true);
+        let path = PathKind::Vehicle.path(&map, Tick(0), start, lane).unwrap();
+        assert!(path.len() > 1);
+        assert_eq!(path.first(), Some(&start));
+        assert_eq!(path.last(), Some(&start));
+
+        map.update_intersection(b, |junction| junction.turn_policy.back_turns = false);
+        assert!(PathKind::Vehicle.path(&map, Tick(0), start, lane).is_none());
     }
 
     fn connect_one_way(map: &mut Map, src: IntersectionID, dst: IntersectionID) -> RoadID {
@@ -435,7 +523,13 @@ mod tests {
         assert!(map.can_drive_between(start, end));
         assert!(!map.can_drive_between(end, start));
         assert_eq!(bytes, Bincode::encode(&map).unwrap());
+        let cloned = map.clone();
+        assert_ne!(map.identity(), cloned.identity());
+        assert_eq!(bytes, Bincode::encode(&cloned).unwrap());
+        assert!(cloned.can_drive_between(start, end));
         let loaded = Bincode::decode::<Map>(&bytes).unwrap();
+        assert_ne!(map.identity(), loaded.identity());
+        assert_ne!(cloned.identity(), loaded.identity());
         assert!(loaded.can_drive_between(start, end));
         assert!(!loaded.can_drive_between(end, start));
 

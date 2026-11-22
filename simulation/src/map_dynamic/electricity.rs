@@ -55,6 +55,7 @@ impl Default for NetworkFlow {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 struct PowerCacheKey {
+    map_identity: u64,
     topology_generation: u64,
     residence_generation: u64,
     prototype_registry: usize,
@@ -63,6 +64,7 @@ struct PowerCacheKey {
 impl PowerCacheKey {
     fn new(map: &Map, residences: &Residences) -> Self {
         Self {
+            map_identity: map.identity(),
             topology_generation: map.electricity.generation(),
             residence_generation: residences.generation(),
             prototype_registry: std::ptr::from_ref(prototypes()).addr(),
@@ -113,10 +115,10 @@ impl PowerCache {
         if self.key == Some(key) {
             return;
         }
-        if self
-            .key
-            .is_none_or(|previous| previous.topology_generation != key.topology_generation)
-        {
+        if self.key.is_none_or(|previous| {
+            previous.map_identity != key.map_identity
+                || previous.topology_generation != key.topology_generation
+        }) {
             self.networks = map
                 .electricity
                 .networks()
@@ -222,7 +224,7 @@ fn assert_matches_full_recompute(
 ) {
     assert_eq!(flowmap.len(), map.electricity.networks().count());
     for network in map.electricity.networks() {
-        let mut consumed_watts = 0i64;
+        let mut consumed_power = Power::ZERO;
         let mut produced_power = Power::ZERO;
         for &id in &network.buildings {
             let building = &map.buildings[id];
@@ -233,10 +235,9 @@ fn assert_matches_full_recompute(
                 }
                 _ => continue,
             };
-            consumed_watts = consumed_watts.wrapping_add(consumed.watts());
+            consumed_power += consumed;
             produced_power += produced;
         }
-        let consumed_power = Power::new(consumed_watts);
         assert_eq!(
             flowmap[&network.id],
             NetworkFlow {
@@ -284,7 +285,7 @@ mod tests {
     use crate::world::HumanID;
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Vec2, OBB};
-    use prototypes::{GameTime, ItemID, ResidencePrototypeID, Tick};
+    use prototypes::{BuildingGen, GameTime, ItemID, ResidencePrototypeID, Tick};
 
     fn company(test: &mut TestCtx, house: BuildingID, name: &str, x: f32) -> CompanyID {
         let road = test.g.map().get(house).unwrap().connected_road.unwrap();
@@ -306,6 +307,85 @@ mod tests {
             panic!("could not start {name}");
         };
         company
+    }
+
+    #[test]
+    fn pfb2a3_map_replacement_reclassifies_buildings() {
+        let mut test = TestCtx::new();
+        let footprint = OBB::new(vec2(140.0, 125.0), Vec2::X, 20.0, 20.0);
+        let mut original = Map::empty();
+        let house = original
+            .build_special_building(
+                &footprint,
+                BuildingKind::House,
+                BuildingGen::House,
+                None,
+                None,
+            )
+            .unwrap();
+        let network = original.electricity.net_id(house).unwrap();
+        let electricity = original.electricity.clone();
+        test.g.insert(original);
+
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+        assert_eq!(
+            resources
+                .read::<ElectricityFlow>()
+                .network_stats(network)
+                .consumed_power,
+            HOUSE_FALLBACK_POWER,
+        );
+
+        let mut replacement = Map::empty();
+        let station = replacement
+            .build_special_building(
+                &footprint,
+                BuildingKind::TrainStation,
+                BuildingGen::NoWalkway {
+                    door_pos: Vec2::ZERO,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        assert_eq!(station, house);
+        replacement.electricity = electricity;
+        test.g.insert(replacement);
+
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+        assert_eq!(
+            resources.read::<ElectricityFlow>().network_stats(network),
+            NetworkFlow::default(),
+        );
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "attempt to add with overflow")]
+    fn pfb2a3_power_consumption_overflow_panics_in_debug() {
+        let mut test = TestCtx::new();
+        prototypes::test_prototypes(
+            r#"
+            package.path = "../base_mod/?.lua"
+            require("data")
+            for _, prototype in ipairs(data) do
+                if prototype.name == "residence-low-l1" then
+                    prototype.power_consumption = "9223372036854775807 W"
+                end
+            end
+            "#,
+        );
+        test.build_roads(&[vec3(80.0, 100.0, 0.0), vec3(440.0, 100.0, 0.0)]);
+        let a = test.build_house_near(vec2(140.0, 125.0));
+        let b = test.build_house_near(vec2(190.0, 125.0));
+        assert_ne!(a, b);
+        let map = test.g.map();
+        assert_eq!(map.electricity.net_id(a), map.electricity.net_id(b));
+        drop(map);
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
     }
 
     #[test]

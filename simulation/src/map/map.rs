@@ -15,6 +15,7 @@ use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
 use slotmapd::{HopSlotMap, Key};
 use std::collections::BTreeMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 pub type Roads = HopSlotMap<RoadID, Road>;
@@ -65,6 +66,8 @@ pub struct Map {
     pub(crate) spatial_map: SpatialMap,
     pub(crate) external_train_stations: Vec<BuildingID>,
     pub(crate) lot_origins: BTreeMap<BuildingID, LotOrigin>,
+    // Derived identity for caches whose lifetime can exceed this map's.
+    pub(super) identity: u64,
     pub(crate) walking_topology_generation: u64,
     // Derived from lanes and turns. Map deserialization starts with an empty cache.
     pub(super) driving_reachability: OnceLock<DrivingReachability>,
@@ -82,9 +85,45 @@ impl Default for Map {
     }
 }
 
+impl Clone for Map {
+    fn clone(&self) -> Self {
+        let mut spatial_map = SpatialMap::default();
+        for building in self.buildings.values() {
+            spatial_map.insert(building);
+        }
+        for road in self.roads.values() {
+            spatial_map.insert(road);
+        }
+        for intersection in self.intersections.values() {
+            spatial_map.insert(intersection);
+        }
+        for lot in self.lots.values() {
+            spatial_map.insert(lot);
+        }
+
+        // Like a loaded map, the clone starts with its own subscriptions and identity.
+        Self {
+            roads: self.roads.clone(),
+            lanes: self.lanes.clone(),
+            intersections: self.intersections.clone(),
+            buildings: self.buildings.clone(),
+            lots: self.lots.clone(),
+            spatial_map,
+            external_train_stations: self.external_train_stations.clone(),
+            lot_origins: self.lot_origins.clone(),
+            walking_topology_generation: self.walking_topology_generation,
+            electricity: self.electricity.clone(),
+            environment: self.environment.clone(),
+            parking: self.parking.clone(),
+            ..Self::empty()
+        }
+    }
+}
+
 impl Map {
     // Public API
     pub fn empty() -> Self {
+        static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
         let subscribers = MapSubscribers::default();
         Self {
             roads: Roads::default(),
@@ -97,12 +136,19 @@ impl Map {
             spatial_map: SpatialMap::default(),
             external_train_stations: Default::default(),
             lot_origins: BTreeMap::new(),
+            identity: NEXT_IDENTITY
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+                .expect("map identities exhausted"),
             walking_topology_generation: 0,
             driving_reachability: OnceLock::new(),
             electricity: Default::default(),
             override_subscriber: subscribers.subscribe(UpdateType::Road | UpdateType::Building),
             subscribers,
         }
+    }
+
+    pub(crate) fn identity(&self) -> u64 {
+        self.identity
     }
 
     /// Perform cleanups potentially required every frame

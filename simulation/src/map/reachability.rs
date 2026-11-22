@@ -1,6 +1,9 @@
 use super::pathfinding::lane_turn_successors;
 use super::{LaneID, Map};
+use common::FastSet;
 use slotmapd::SecondaryMap;
+
+const COMPONENT_EDGE_BUDGET: usize = 256;
 
 pub(super) struct DrivingReachability {
     lanes: SecondaryMap<LaneID, LaneReachability>,
@@ -61,7 +64,7 @@ impl DrivingReachability {
         Self { lanes, components }
     }
 
-    /// Reachability via one or more turns, after the caller's local-route check.
+    /// Returns false only when no route via one or more turns exists.
     pub(super) fn can_reach(&self, start: LaneID, end: LaneID) -> bool {
         let Some((from, to)) = self.lanes.get(start).zip(self.lanes.get(end)) else {
             return false;
@@ -84,8 +87,9 @@ impl DrivingReachability {
             Err(_) => {}
         }
 
-        let mut visited = vec![false; end - start];
+        let mut visited = FastSet::default();
         let mut pending = vec![start];
+        let mut remaining_edges = COMPONENT_EDGE_BUDGET;
         while let Some(component) = pending.pop() {
             for &next in &self.components[component].successors {
                 if next == end {
@@ -94,7 +98,12 @@ impl DrivingReachability {
                 if next > end {
                     break;
                 }
-                if !std::mem::replace(&mut visited[next - start], true) {
+                if remaining_edges == 0 {
+                    // Let A* decide when the component search has more work to do.
+                    return true;
+                }
+                remaining_edges -= 1;
+                if visited.insert(next) {
                     pending.push(next);
                 }
             }
@@ -154,4 +163,38 @@ fn strong_components(
         components.push(component);
     }
     (component_of, components)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pfb2a3_component_search_defers_after_budget() {
+        let mut map_lanes = slotmapd::HopSlotMap::<LaneID, ()>::default();
+        let start = map_lanes.insert(());
+        let end = map_lanes.insert(());
+        let mut lanes = SecondaryMap::new();
+        let destination = 2 * COMPONENT_EDGE_BUDGET + 1;
+        for (lane, component) in [(start, 0), (end, destination)] {
+            lanes.insert(
+                lane,
+                LaneReachability {
+                    component,
+                    has_incoming_turn: true,
+                },
+            );
+        }
+        let mut components: Vec<_> = (0..=destination).map(|_| Component::default()).collect();
+        for (i, component) in components[..destination - 2].iter_mut().enumerate() {
+            component.successors.push(i + 1);
+        }
+        components[destination - 1].successors.push(destination);
+        let mut index = DrivingReachability { lanes, components };
+
+        // A disconnected chain beyond the budget must be left to A*.
+        assert!(index.can_reach(start, end));
+        index.components[1].successors.clear();
+        assert!(!index.can_reach(start, end));
+    }
 }
