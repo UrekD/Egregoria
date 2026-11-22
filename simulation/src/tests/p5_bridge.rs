@@ -1,8 +1,9 @@
 use crate::map::{
-    Environment, LanePatternBuilder, Map, MapProject, ProjectKind, Road, MAX_SLOPE, ROAD_Z_OFFSET,
+    Environment, LanePatternBuilder, Map, MapProject, ProjectKind, Road, RoadSegmentKind,
+    MAX_SLOPE, ROAD_Z_OFFSET,
 };
 use common::saveload::{Bincode, Encoder};
-use geom::{vec2, vec3, PolyLine, PolyLine3, Vec3};
+use geom::{vec2, vec3, PolyLine, PolyLine3, Vec2, Vec3};
 
 fn point_bits(points: &PolyLine3) -> Vec<[u32; 3]> {
     points
@@ -27,7 +28,7 @@ fn elevated_level_span_keeps_its_deck_above_flat_terrain() {
     let mut env = Environment::new(1, 1);
     env.terrain_apply(env.bounds(), |_| 0.0);
     let path = PolyLine::new(vec![vec2(32.0, 64.0), vec2(252.0, 64.0)]);
-    let deck_height = 20.0;
+    let deck_height = 2.5;
     let midpoint = path.point_along(110.0);
     assert_eq!(env.height(midpoint), Some(0.0));
 
@@ -35,12 +36,10 @@ fn elevated_level_span_keeps_its_deck_above_flat_terrain() {
     assert!(error.is_none());
     assert_eq!(points.first(), path.first().z(deck_height + ROAD_Z_OFFSET));
     assert_eq!(points.last(), path.last().z(deck_height + ROAD_Z_OFFSET));
-    let midpoint_height = points.project_2d(midpoint).z;
-    assert!(
-        points
-            .iter()
-            .all(|p| p.z >= deck_height - MAX_SLOPE + ROAD_Z_OFFSET),
-        "level bridge midpoint at {midpoint_height} m"
+    assert_straight_deck(
+        &points,
+        path.first().z(deck_height),
+        path.last().z(deck_height),
     );
 }
 
@@ -67,6 +66,135 @@ fn terrain_level_valley_road_keeps_its_original_points() {
     ]
     .map(|(x, z)| [x.to_bits(), 64.0_f32.to_bits(), z]);
     assert_eq!(point_bits(&points), expected);
+}
+
+#[test]
+fn noisy_ground_clicks_keep_the_legacy_valley_profile() {
+    let mut map = Map::empty();
+    map.environment = Environment::new(1, 1);
+    map.environment
+        .terrain_apply(map.environment.bounds(), |p| {
+            ((p.x - 160.0).abs() - 32.0).max(0.0) * 0.125
+        });
+    let ground_click =
+        |pos: Vec2| MapProject::ground(pos.z(map.environment.height(pos).unwrap() + 0.3));
+    let (_, id) = map
+        .make_connection(
+            ground_click(vec2(32.0, 64.0)),
+            ground_click(vec2(288.0, 64.0)),
+            None,
+            &LanePatternBuilder::default().build(),
+        )
+        .unwrap();
+
+    // Full centerline from the pre-PORT2 solver (2b47bffd) with the same clicks.
+    let expected = [
+        (32.0_f32, 0x4149_5b1a),
+        (33.0, 0x4147_fe87),
+        (34.0, 0x4144_add3),
+        (35.0, 0x4140_9083),
+        (36.0, 0x413c_ce23),
+        (128.0, 0x3e99_999a),
+        (192.0, 0x3e99_999a),
+        (284.0, 0x413c_ce24),
+        (285.0, 0x4140_9085),
+        (286.0, 0x4144_add2),
+        (287.0, 0x4147_fe87),
+        (288.0, 0x4149_5b1a),
+    ]
+    .map(|(x, z)| [x.to_bits(), 64.0_f32.to_bits(), z]);
+    assert_eq!(point_bits(map.roads[id].points()), expected);
+}
+
+#[test]
+fn splitting_a_valley_road_snaps_the_junction_to_terrain() {
+    let mut map = Map::empty();
+    map.environment = Environment::new(1, 1);
+    map.environment
+        .terrain_apply(map.environment.bounds(), |p| {
+            let distance = (p.x - 160.0).abs();
+            (distance - 80.0).max(0.0) * 0.125 + distance.min(32.0) * 0.00625
+        });
+    let ground = |map: &Map, pos: Vec2| pos.z(map.environment.height(pos).unwrap());
+    let start = ground(&map, vec2(32.0, 64.0));
+    let end = ground(&map, vec2(288.0, 64.0));
+    let pattern = LanePatternBuilder::default().build();
+    let (_, original) = map
+        .make_connection(
+            MapProject::ground(start),
+            MapProject::ground(end),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let midpoint = ground(&map, vec2(160.0, 64.0));
+    let projected = map.roads[original].points().project_2d(midpoint.xy());
+    assert!(projected.z - ROAD_Z_OFFSET > midpoint.z + 0.05);
+    let (junction, side_road) = map
+        .make_connection(
+            MapProject::ground(ground(&map, vec2(160.0, 144.0))),
+            MapProject {
+                pos: projected,
+                kind: ProjectKind::Road(original),
+            },
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let junction = &map.intersections[junction];
+    assert_eq!(junction.pos, midpoint);
+    assert!(!map.roads.contains_key(original));
+    assert_eq!(junction.roads.len(), 3);
+    for &id in junction.roads.iter().filter(|&&id| id != side_road) {
+        let road = &map.roads[id];
+        let (split_end, outer_end) = if road.src == junction.id {
+            (road.points().first(), road.points().last())
+        } else {
+            (road.points().last(), road.points().first())
+        };
+        assert_eq!(split_end, midpoint + Vec3::z(ROAD_Z_OFFSET));
+        let sample = vec2((outer_end.x + midpoint.x) * 0.5, midpoint.y);
+        for profile in [road.points(), road.interfaced_points()] {
+            let height = profile.project_2d(sample).z - ROAD_Z_OFFSET;
+            assert!((height - ground(&map, sample).z).abs() < 0.25);
+        }
+    }
+}
+
+#[test]
+fn splitting_at_a_centerline_vertex_replaces_its_height() {
+    let mut map = Map::empty();
+    map.environment = Environment::new(1, 1);
+    map.environment
+        .terrain_apply(map.environment.bounds(), |_| 0.0);
+    let src = map.add_intersection(vec3(32.0, 64.0, 0.0));
+    let dst = map.add_intersection(vec3(288.0, 64.0, 0.0));
+    let projected = vec3(160.0, 64.0, ROAD_Z_OFFSET + 0.3);
+    let centerline = PolyLine3::new(vec![
+        vec3(32.0, 64.0, ROAD_Z_OFFSET),
+        projected,
+        vec3(288.0, 64.0, ROAD_Z_OFFSET),
+    ]);
+    let pattern = LanePatternBuilder::default().build();
+    let original = map
+        .connect(src, dst, &pattern, RoadSegmentKind::Arbitrary(centerline))
+        .unwrap();
+    let (junction, side_road) = map
+        .make_connection(
+            MapProject::ground(vec3(160.0, 144.0, 0.0)),
+            MapProject {
+                pos: projected,
+                kind: ProjectKind::Road(original),
+            },
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let junction = &map.intersections[junction];
+    for &id in junction.roads.iter().filter(|&&id| id != side_road) {
+        assert_eq!(map.roads[id].points().len(), 2);
+    }
+    assert_eq!(junction.pos.z, 0.0);
 }
 
 #[test]
@@ -185,7 +313,7 @@ fn rising_bridge_and_lanes_follow_the_deck_after_load_and_junction_edit() {
         .terrain_apply(map.environment.bounds(), |p| {
             (24.0 - (p.x - 48.0).abs()).max(0.0) * 0.11
         });
-    let start = vec3(32.0, 64.0, 2.0);
+    let start = vec3(32.0, 64.0, 4.0);
     let end = vec3(288.0, 64.0, 16.0);
     let pattern = LanePatternBuilder::default().build();
     let (junction, id) = map
@@ -222,4 +350,25 @@ fn rising_bridge_and_lanes_follow_the_deck_after_load_and_junction_edit() {
     map.update_intersection(junction, |junction| junction.turn_policy.back_turns = true);
     assert_ne!(map.roads[id].interface_point(junction).x, old_clip.x);
     check_deck(&map);
+
+    let midpoint = vec3(160.0, 64.0, (start.z + end.z) * 0.5);
+    let (junction, side_road) = map
+        .make_connection(
+            MapProject::ground(vec3(160.0, 144.0, midpoint.z)),
+            MapProject {
+                pos: midpoint + Vec3::z(ROAD_Z_OFFSET),
+                kind: ProjectKind::Road(id),
+            },
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let junction = &map.intersections[junction];
+    assert!((junction.pos.z - midpoint.z).abs() < 0.001);
+    assert_eq!(junction.roads.len(), 3);
+    for &id in junction.roads.iter().filter(|&&id| id != side_road) {
+        let road = &map.roads[id];
+        assert_straight_deck(road.points(), start, end);
+        assert_straight_deck(road.interfaced_points(), start, end);
+    }
 }

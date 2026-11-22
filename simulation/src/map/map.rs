@@ -345,7 +345,8 @@ impl Map {
         {
             return None;
         }
-        let (pos, segment) = road.points.project_segment(pos);
+        let (mut pos, segment) = road.points.project_segment(pos);
+        pos.z = road.split_surface_height(pos, &self.environment);
         (pos.xy().distance(road.points.first().xy()) >= 1.0
             && pos.xy().distance(road.points.last().xy()) >= 1.0)
             .then_some((pos, segment))
@@ -831,17 +832,19 @@ impl Map {
 
         let id = self.add_intersection(pos - Vec3::z(ROAD_Z_OFFSET));
 
-        let mut before: Vec<_> = r
+        let mut before: Vec<_> = r.points.iter().copied().take(segment).collect();
+        // A split at an existing vertex replaces its height.
+        while before.last().is_some_and(|point| point.xy() == pos.xy()) {
+            before.pop();
+        }
+        before.push(pos);
+        let after_split = r
             .points
             .iter()
             .copied()
-            .take(segment)
-            .chain([pos])
-            .collect();
-        let mut after: Vec<_> = [pos]
-            .into_iter()
-            .chain(r.points.iter().copied().skip(segment))
-            .collect();
+            .skip(segment)
+            .skip_while(|point| point.xy() == pos.xy());
+        let mut after: Vec<_> = [pos].into_iter().chain(after_split).collect();
         before.dedup();
         after.dedup();
         let before = PolyLine3::new(before);

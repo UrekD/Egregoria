@@ -10,6 +10,10 @@ use crate::map::{
     LanePattern, Lanes, ParkingSpots, Roads, SpatialMap, MAX_SLOPE, ROAD_Z_OFFSET,
 };
 
+// Both endpoints need this much clearance in meters to request a deck.
+// Ground clicks and simplified centerlines can sit slightly above the terrain.
+const MIN_ELEVATED_SPAN_CLEARANCE: f32 = 2.5;
+
 new_key_type! {
     pub struct RoadID;
 }
@@ -308,6 +312,19 @@ impl Road {
         &self.interfaced_points
     }
 
+    pub(crate) fn split_surface_height(&self, point: Vec3, env: &Environment) -> f32 {
+        if self.src_interface.elevated_span() {
+            return point.z;
+        }
+
+        // Sample the terrain at the split in near-ground sections. Larger
+        // differences can be part of the road's grade through cuts or fills.
+        let road_height = point.z - ROAD_Z_OFFSET;
+        env.height(point.xy())
+            .filter(|&ground| (road_height - ground).abs() < MIN_ELEVATED_SPAN_CLEARANCE)
+            .map_or(point.z, |ground| ground + ROAD_Z_OFFSET)
+    }
+
     fn update_interfaced_points(&mut self, env: &Environment) {
         let points = &self.points;
         let clipped = points.cut(self.interface_from(self.src), self.interface_from(self.dst));
@@ -331,10 +348,9 @@ impl Road {
     }
 
     fn is_elevated_span(from: Vec3, to: Vec3, env: &Environment) -> bool {
-        // Allow for rounding when an endpoint height round-trips through ROAD_Z_OFFSET.
         [from, to].iter().all(|pos| {
             env.height(pos.xy())
-                .is_some_and(|ground| pos.z - ground > 0.001)
+                .is_some_and(|ground| pos.z >= ground + MIN_ELEVATED_SPAN_CLEARANCE)
         })
     }
 
