@@ -14,6 +14,7 @@ use crate::rendering::map_rendering::trees::TreesRender;
 
 mod lamps;
 mod map_mesh;
+mod placeholder_color;
 mod terrain;
 mod trees;
 

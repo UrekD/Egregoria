@@ -1,5 +1,6 @@
 use crate::gui::zoning::{density_name, zone_cell_color, zone_color, zone_name, ZoningPreview};
 use crate::rendering::immediate::ImmediateDraw;
+use crate::rendering::map_rendering::placeholder_color::placeholder_color;
 use crate::rendering::MapRenderOptions;
 use common::{ChunkID_32, FastMap, FastSet};
 use engine::earcut::earcut;
@@ -1448,15 +1449,26 @@ impl MapBuilders {
             if SubscriberChunkID::new(building.canonical_position()) != chunk {
                 continue;
             }
+            let mut sprite_z = building.height;
+            let mut placeholder = false;
             if let BuildingKind::GoodsCompany(id) = building.kind {
                 if let Some(proto) = growable_company(id) {
                     let tint = zone_color(proto.zone_kind);
                     self.building_box(building, tint, proto.level);
                     continue;
                 }
+                // Lettered placeholders: a solid box with the sprite on its roof.
+                if self.buildsprites.contains_key(&building.kind) {
+                    if let Some(color) = placeholder_color(id) {
+                        sprite_z = self.building_box(building, color, 1);
+                        placeholder = true;
+                    }
+                }
             }
-            self.zone_mesh(building);
-            self.houses_mesh(building);
+            if !placeholder {
+                self.zone_mesh(building);
+                self.houses_mesh(building);
+            }
 
             if let Some(x) = self.buildsprites.get_mut(&building.kind) {
                 let axis = building.obb.axis();
@@ -1464,12 +1476,7 @@ impl MapBuilders {
                 let w = axis[0].mag();
                 let d = axis[0] / w;
                 let h = axis[1].mag();
-                x.push(
-                    c.z(building.height + 0.1),
-                    d.z0(),
-                    LinearColor::WHITE,
-                    (w, h),
-                );
+                x.push(c.z(sprite_z + 0.1), d.z0(), LinearColor::WHITE, (w, h));
             } else if let Some(x) = self.buildmeshes.get_mut(&building.kind) {
                 let pos = building.obb.center().z(building.height);
                 let dir = building.obb.axis()[0].normalize().z0();
@@ -1491,7 +1498,8 @@ impl MapBuilders {
         }
     }
 
-    fn building_box(&mut self, building: &Building, tint: LinearColor, level: u8) {
+    /// Returns the roof height.
+    fn building_box(&mut self, building: &Building, tint: LinearColor, level: u8) -> f32 {
         let [width, depth] = building.obb.axis().map(Vec2::mag);
         let height = (width.min(depth) * 0.45).clamp(3.0, 18.0)
             * (1.0 + f32::from(level.saturating_sub(1)) * 0.45);
@@ -1531,6 +1539,7 @@ impl MapBuilders {
                 LinearColor::new(tint.r * 0.78, tint.g * 0.75, tint.b * 0.73, tint.a),
             );
         }
+        building.height + height
     }
 
     fn zone_mesh(&mut self, building: &Building) {

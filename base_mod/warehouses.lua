@@ -1,4 +1,4 @@
-local function warehouse(name, label, size, capacity, low, high, trucks, workers, price)
+local function warehouse(name, label, asset, size, capacity, low, high, trucks, workers, price)
     return {
         type = "goods-company",
         name = name,
@@ -6,7 +6,7 @@ local function warehouse(name, label, size, capacity, low, high, trucks, workers
         kind = "factory",
         size = size,
         bgen = {kind = "centered_door", vertical_factor = 0.7},
-        asset = "flour_factory.glb",
+        asset = asset,
         n_workers = workers,
         n_trucks = trucks,
         price = price,
@@ -24,6 +24,6 @@ local function warehouse(name, label, size, capacity, low, high, trucks, workers
 end
 
 data:extend {
-    warehouse("small-depot", "Small depot", {40, 40}, 64, 24, 48, 2, 4, 2500),
-    warehouse("large-warehouse", "Large warehouse", {80, 60}, 256, 96, 224, 4, 10, 8000),
+    warehouse("small-depot", "Small depot", "assets/sprites/small_depot.png", {40, 40}, 64, 24, 48, 2, 4, 2500),
+    warehouse("large-warehouse", "Large warehouse", "assets/sprites/large_warehouse.png", {80, 60}, 256, 96, 224, 4, 10, 8000),
 }
