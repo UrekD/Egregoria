@@ -63,6 +63,15 @@ Main menu with Continue/New Game/Load, new-game options (terrain preset, seed, m
 
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
+### Try the demo cities
+
+Run `make demo-cities` from the repository root. The generator writes **Starter Town** and **Showcase City** to `world/`, replacing any saves with the same slot IDs. Open either city from **Load**, or use **Continue** for the most recent one.
+
+- **Starter Town** has a small zoned grid, utilities, and a road to the rail freight terminal. Resume time to watch the first residents move in and staff the town.
+- **Showcase City** has grown for over three game days. Try its staffed services, traffic and utility overlays, two bus loops, Budget, and City Stats.
+
+For a separate save directory, run `cargo run --locked --release -p scenarios -- demo-cities --save-root <dir>` and launch with `cargo run --locked --release -p native_app -- --save-dir <dir>`. Camera position and time speed use the game's normal settings when you load. Press **Space** to pause if time is running, and pan toward the freight terminal near map coordinates `(4300, 6300)`. Both cities lie just west of it.
+
 ## How to play
 
 A small tutorial is available on the [github wiki]((https://github.com/Uriopass/Egregoria/wiki/Introduction-Guide)) to get you started.

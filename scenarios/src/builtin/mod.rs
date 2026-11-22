@@ -1,4 +1,5 @@
 mod budget_day;
+pub mod demo_cities;
 pub mod determinism;
 pub mod growth_basic;
 pub mod perf;

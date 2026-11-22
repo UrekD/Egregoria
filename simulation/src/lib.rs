@@ -10,8 +10,8 @@ use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
 use crate::world_command::{CommandOutcomes, WorldCommand};
 use common::saveload::{
-    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotCamera, SlotEntry, SlotId,
-    SlotMeta, SnapshotKind, SnapshotRevision,
+    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotCamera, SlotEntry, SlotMeta,
+    SnapshotKind,
 };
 use common::FastMap;
 use derive_more::{From, TryInto};
@@ -60,7 +60,7 @@ pub mod utils;
 mod world;
 pub mod world_command;
 
-pub use common::saveload::save_dir;
+pub use common::saveload::{save_dir, SlotId, SnapshotRevision};
 pub use world::*;
 
 pub use utils::par_command_buffer::ParCommandBuffer;

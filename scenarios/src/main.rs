@@ -1,4 +1,4 @@
-use scenarios::builtin::{growth_basic, perf, PERF_10K, SCENARIOS};
+use scenarios::builtin::{demo_cities, growth_basic, perf, PERF_10K, SCENARIOS};
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{MetricSample, ScenarioCtx};
 use serde::Serialize;
@@ -24,7 +24,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>")
 }
 
 fn main() -> ExitCode {
@@ -59,6 +59,16 @@ fn run() -> Result<(), String> {
     if name == "--help" || name == "-h" {
         println!("{}", usage());
         return Ok(());
+    }
+    if name == "demo-cities" {
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("--save-root")) {
+            return Err("usage: scenarios demo-cities --save-root <dir>".into());
+        }
+        let root = path_arg(&mut args, "--save-root", "a directory")?;
+        if let Some(arg) = args.next() {
+            return Err(format!("unexpected demo-cities argument {arg:?}"));
+        }
+        return demo_cities::generate(&root);
     }
     let available = if name == PERF_10K.0.name {
         std::slice::from_ref(&PERF_10K)

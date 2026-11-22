@@ -20,6 +20,10 @@ test-sim:
 scenarios:
 	cargo run --locked -p scenarios --release -- all
 
+.PHONY: demo-cities
+demo-cities:
+	cargo run --locked --release -p scenarios -- demo-cities --save-root world
+
 determinism:
 	cargo run --locked -p scenarios --release -- determinism --twice
 
