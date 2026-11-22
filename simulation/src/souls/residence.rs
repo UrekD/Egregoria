@@ -12,6 +12,8 @@ use prototypes::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Deref;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 const UPGRADE_CHECKS: u8 = 6;
 const UNSERVED_CHECKS: u8 = 12;
@@ -45,11 +47,69 @@ struct ResidenceChecks {
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Residences {
-    pub by_building: BTreeMap<BuildingID, Residence>,
+    #[serde(rename = "by_building")]
+    entries: ResidenceEntries,
     checks: BTreeMap<BuildingID, ResidenceChecks>,
+    #[serde(skip, default = "next_residence_generation")]
+    residence_generation: u64,
+}
+
+/// Read access for callers that use `residences.by_building`.
+#[derive(Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResidenceEntries {
+    pub by_building: BTreeMap<BuildingID, Residence>,
+}
+
+impl Deref for Residences {
+    type Target = ResidenceEntries;
+
+    fn deref(&self) -> &Self::Target {
+        &self.entries
+    }
+}
+
+// Existing unit fixtures edit individual residence fields directly.
+#[cfg(test)]
+impl std::ops::DerefMut for Residences {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.residence_generation = next_residence_generation();
+        &mut self.entries
+    }
+}
+
+fn next_residence_generation() -> u64 {
+    static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
+    NEXT_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
 impl Residences {
+    pub(crate) fn generation(&self) -> u64 {
+        self.residence_generation
+    }
+
+    pub(crate) fn insert(&mut self, building: BuildingID, residence: Residence) {
+        self.entries.by_building.insert(building, residence);
+        self.residence_generation = next_residence_generation();
+    }
+
+    fn remove(&mut self, building: BuildingID) {
+        if self.entries.by_building.remove(&building).is_some() {
+            self.residence_generation = next_residence_generation();
+        }
+        self.checks.remove(&building);
+    }
+
+    pub(crate) fn upgrade(&mut self, building: BuildingID, proto: &ResidencePrototype) {
+        let residence = self
+            .entries
+            .by_building
+            .get_mut(&building)
+            .expect("registered residence");
+        *residence = proto.into();
+        self.residence_generation = next_residence_generation();
+    }
+
     pub fn is_abandoned(&self, building: BuildingID) -> bool {
         self.checks
             .get(&building)
@@ -68,16 +128,12 @@ pub fn on_house_built(sim: &Simulation, building: BuildingID) {
 }
 
 pub(crate) fn register(sim: &Simulation, building: BuildingID, proto: &ResidencePrototype) {
-    sim.write::<Residences>()
-        .by_building
-        .insert(building, proto.into());
+    sim.write::<Residences>().insert(building, proto.into());
     sim.write::<BuildingInfos>().mark_vacancy_changed(building);
 }
 
 pub fn on_building_removed(sim: &mut Simulation, building: BuildingID) {
-    let mut residences = sim.write::<Residences>();
-    residences.by_building.remove(&building);
-    residences.checks.remove(&building);
+    sim.write::<Residences>().remove(building);
     sim.write::<Happiness>().by_building.remove(&building);
 }
 
@@ -379,11 +435,10 @@ pub fn residence_update(sim: &mut Simulation) {
             stores: &retail_store_positions(&map),
         };
         let Residences {
-            by_building,
-            checks,
+            entries, checks, ..
         } = &mut *residences;
 
-        for (&id, residence) in by_building.iter_mut() {
+        for (&id, residence) in &entries.by_building {
             let Some(building) = map.get(id) else {
                 continue;
             };
@@ -436,10 +491,12 @@ pub fn residence_update(sim: &mut Simulation) {
                 0
             };
             if checks.upgrade_streak >= UPGRADE_CHECKS {
-                *residence = next.into();
                 checks.upgrade_streak = 0;
-                upgrades.push((id, next.level));
+                upgrades.push((id, next));
             }
+        }
+        for &(id, proto) in &upgrades {
+            residences.upgrade(id, proto);
         }
     }
 
@@ -454,9 +511,9 @@ pub fn residence_update(sim: &mut Simulation) {
     if !upgrades.is_empty() {
         let mut map = sim.map_mut();
         let mut infos = sim.write::<BuildingInfos>();
-        for (id, level) in upgrades {
+        for (id, proto) in upgrades {
             infos.mark_vacancy_changed(id);
-            map.regenerate_house_mesh(id, level);
+            map.regenerate_house_mesh(id, proto.level);
         }
     }
 }
