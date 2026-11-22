@@ -9,7 +9,7 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use common::{ChunkID_256, FastMap};
 use geom::{vec2, InfiniteFrustrum, Intersect3, Shape, Vec2, AABB, AABB3, OBB};
 use goryak::{combo_box, tooltip};
-use prototypes::{try_prototype, ServiceKind, TICKS_PER_HOUR};
+use prototypes::{try_prototype, ServiceID, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer};
 use simulation::map::{Building, BuildingID, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
@@ -93,6 +93,21 @@ impl TileIndex {
             });
     }
 
+    fn push_outline(&mut self, footprint: OBB, z: f32, color: [f32; 4]) {
+        const WIDTH: f32 = 5.0;
+        let corners = footprint.corners;
+        for (start, end) in corners.into_iter().zip(corners.into_iter().cycle().skip(1)) {
+            let edge = end - start;
+            let strip = OBB::new(
+                (start + end) * 0.5,
+                edge.normalize(),
+                edge.mag() + WIDTH,
+                WIDTH,
+            );
+            self.push(strip, z, color);
+        }
+    }
+
     fn visible_chunks(&self, bounds: AABB) -> impl Iterator<Item = &Tile> {
         let bounds = bounds.expand(self.padding);
         let ll = ChunkID_256::new(bounds.ll);
@@ -122,30 +137,16 @@ pub(crate) fn world_cache_is_clear() -> bool {
 const FOOTPRINT_PADDING: f32 = 6.0;
 
 impl OverlayMode {
-    fn data_version(self, tick: u64) -> u64 {
+    fn data_version(self, sim: &Simulation, map: &Map, tick: u64) -> u64 {
         match self {
-            Self::Off | Self::Power | Self::Transit | Self::Traffic => 0,
-            // Coverage passes occur at tick % 6000 == 300 + 600 * kind_index.
-            Self::Coverage(kind) => tick / 6000 + u64::from(tick % 6000 >= coverage_offset(kind)),
+            Self::Off | Self::Traffic => 0,
+            Self::Power => power_version(map, &sim.read::<ElectricityFlow>()),
+            Self::Transit => transit::invalidation_key(&sim.read::<Transit>()),
+            Self::Coverage(kind) => sim.read::<CoverageGrid>().revision(kind),
             Self::Water | Self::Sewage | Self::Pollution | Self::LandValue => tick / 3000,
             Self::Happiness => tick / TICKS_PER_HOUR,
         }
     }
-}
-
-fn coverage_offset(kind: ServiceKind) -> u64 {
-    let idx = match kind {
-        ServiceKind::Health => 0,
-        ServiceKind::Fire => 1,
-        ServiceKind::Police => 2,
-        ServiceKind::School => 3,
-        ServiceKind::Garbage => 4,
-        ServiceKind::Park => 5,
-        ServiceKind::WaterPump | ServiceKind::SewageOutlet => {
-            unreachable!("utility services have no coverage overlay")
-        }
-    };
-    300 + 600 * idx
 }
 
 fn power_version(map: &Map, flow: &ElectricityFlow) -> u64 {
@@ -188,11 +189,7 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
         let map_changed = changes.take_updated_chunks().next().is_some() || cleared || new_map;
 
         let tick = sim.get_tick();
-        let data_version = match mode {
-            OverlayMode::Power => power_version(&map, &sim.read::<ElectricityFlow>()),
-            OverlayMode::Transit => transit::invalidation_key(&sim.read::<Transit>()),
-            _ => mode.data_version(tick),
-        };
+        let data_version = mode.data_version(sim, &map, tick);
         let rebuild = mode != cache.mode
             || map_changed
             || tick < cache.tick
@@ -267,6 +264,31 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
         return;
     }
 
+    if let OverlayMode::Coverage(kind) = mode {
+        let coverage = sim.read::<CoverageGrid>();
+        for building in map.buildings().values() {
+            let service = building
+                .kind
+                .as_goods_company()
+                .and_then(|id| try_prototype(ServiceID::from(id)));
+            let z = building.height + 0.35;
+            if service.is_some_and(|proto| proto.service_kind == kind) {
+                tiles.push_outline(
+                    building.obb.expand(2.0 * FOOTPRINT_PADDING),
+                    z,
+                    legend::COVERAGE_PROVIDER_COLOR,
+                );
+            } else if is_coverage_receiver(building.kind) {
+                tiles.push(
+                    building.obb.expand(FOOTPRINT_PADDING),
+                    z,
+                    scale.color(coverage.coverage(building.id, kind)),
+                );
+            }
+        }
+        return;
+    }
+
     let mut buildings = |value: &dyn Fn(&Building) -> Option<f32>| {
         for building in map.buildings().values() {
             if let Some(value) = value(building) {
@@ -311,10 +333,6 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
                 Some(f32::from(relevant == UtilityStatus::Served))
             });
         }
-        OverlayMode::Coverage(kind) => {
-            let coverage = sim.read::<CoverageGrid>();
-            buildings(&|b| is_coverage_receiver(b.kind).then(|| coverage.coverage(b.id, kind)));
-        }
         OverlayMode::LandValue => {
             let env = sim.read::<EnvGrid>();
             buildings(&|b| is_coverage_receiver(b.kind).then(|| f32::from(env.land_value(b.id))));
@@ -323,7 +341,11 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
             let happiness = sim.read::<Happiness>();
             buildings(&|b| happiness.by_building.get(&b.id).copied().map(f32::from));
         }
-        OverlayMode::Pollution | OverlayMode::Off | OverlayMode::Transit | OverlayMode::Traffic => {}
+        OverlayMode::Coverage(_)
+        | OverlayMode::Pollution
+        | OverlayMode::Off
+        | OverlayMode::Transit
+        | OverlayMode::Traffic => {}
     }
 }
 
@@ -392,6 +414,82 @@ mod tests {
     use super::*;
 
     #[test]
+    fn coverage_overlay_uses_high_opacity_for_uncovered_receivers() {
+        let scale = OverlayMode::Coverage(ServiceKind::School).scale().unwrap();
+        let [r, g, b, alpha] = scale.color(0.0);
+        assert!(r >= 0.5 && g <= 0.025 && b <= 0.025);
+        assert!(alpha >= 0.9);
+    }
+
+    #[test]
+    fn coverage_overlay_draws_receivers_and_only_the_selected_service_kind() {
+        use prototypes::{BuildingGen, GoodsCompanyID};
+        use scenarios::ScenarioCtx;
+        use simulation::SimulationOptions;
+
+        let test = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        let sites = [
+            BuildingKind::House,
+            BuildingKind::House,
+            BuildingKind::GoodsCompany(GoodsCompanyID::new("school")),
+            BuildingKind::GoodsCompany(GoodsCompanyID::new("clinic")),
+        ];
+        let mut map = test.sim.write::<Map>();
+        let buildings = sites.map(|kind| {
+            let center = vec2(400.0 + 40.0 * map.buildings().len() as f32, 450.0);
+            let id = map
+                .build_special_building(
+                    &OBB::new(center, Vec2::X, 20.0, 20.0),
+                    kind,
+                    BuildingGen::CenteredDoor {
+                        vertical_factor: 1.0,
+                    },
+                    None,
+                    None,
+                )
+                .unwrap();
+            (id, center)
+        });
+        drop(map);
+        test.sim
+            .write::<CoverageGrid>()
+            .by_kind
+            .entry(ServiceKind::School)
+            .or_default()
+            .insert(buildings[0].0, 95.0);
+
+        let mut tiles = TileIndex::default();
+        let mode = OverlayMode::Coverage(ServiceKind::School);
+        let scale = mode.scale().unwrap();
+        collect_tiles(&test.sim, &test.sim.map(), mode, &mut tiles);
+        let color_at = |index: usize| {
+            tiles
+                .chunks
+                .values()
+                .flatten()
+                .find(|tile| tile.footprint.center() == buildings[index].1)
+                .map(|tile| tile.color)
+        };
+        assert_eq!(color_at(0), Some(scale.color(95.0)));
+        assert_eq!(color_at(1), Some(scale.color(0.0)));
+        let outlines: Vec<_> = tiles
+            .chunks
+            .values()
+            .flatten()
+            .filter(|tile| tile.color == legend::COVERAGE_PROVIDER_COLOR)
+            .collect();
+        assert_eq!(outlines.len(), 4);
+        assert!(outlines
+            .iter()
+            .all(|tile| tile.footprint.center().distance(buildings[2].1) < 25.0));
+        assert_eq!(color_at(3), None);
+    }
+
+    #[test]
     fn p2_ui_wire_tints_procedural_specials_beyond_their_footprint() {
         use prototypes::{BuildingGen, GoodsCompanyID};
         use scenarios::{builders::grid_city, ScenarioCtx};
@@ -436,26 +534,27 @@ mod tests {
     }
 
     #[test]
-    fn p2e_fix_coverage_version_changes_only_at_its_update() {
-        for (idx, kind) in [
-            ServiceKind::Health,
-            ServiceKind::Fire,
-            ServiceKind::Police,
-            ServiceKind::School,
-            ServiceKind::Garbage,
-            ServiceKind::Park,
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let mode = OverlayMode::Coverage(kind);
-            let boundary = 300 + idx as u64 * 600;
-            assert_eq!(mode.data_version(0), mode.data_version(boundary - 1));
-            assert_ne!(mode.data_version(boundary - 1), mode.data_version(boundary));
-            assert_eq!(
-                mode.data_version(boundary),
-                mode.data_version(boundary + 5999)
-            );
+    fn coverage_overlay_version_tracks_per_kind_snapshots() {
+        use prototypes::{GameTime, Tick};
+        use scenarios::ScenarioCtx;
+        use simulation::map_dynamic::coverage_update;
+        use simulation::SimulationOptions;
+
+        let mut test = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        let school = OverlayMode::Coverage(ServiceKind::School);
+        let health = OverlayMode::Coverage(ServiceKind::Health);
+
+        for tick in [300, 2099, 2100, 2101] {
+            test.sim.write::<GameTime>().tick = Tick(tick);
+            coverage_update(&mut test.sim);
+            let map = test.sim.map();
+            let expected = u64::from(tick >= 2100);
+            assert_eq!(school.data_version(&test.sim, &map, tick), expected);
+            assert_eq!(health.data_version(&test.sim, &map, tick), 1);
         }
     }
 

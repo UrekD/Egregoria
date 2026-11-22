@@ -16,6 +16,20 @@
   {"WaitFrames": 3},
   {"Screenshot": "water-shallow"},
   {"Camera": {"x": 940, "y": 915, "z": 0, "yaw": -0.6, "pitch": 1.05, "dist": 650}},
+  {"Commands": [{"MapMakeConnection": {
+    "from": {"pos": [1248, 800, 0], "kind": "Ground"},
+    "to": {"pos": [1248, 1090, 0], "kind": "Ground"},
+    "inter": null,
+    "pat": {
+      "lanes_forward": [["Driving", 9], ["Parking", 9], ["Walking", 9]],
+      "lanes_backward": [["Driving", 9], ["Parking", 9], ["Walking", 9]]
+    }
+  }}]},
+  {"Commands": [
+    {"MapBuildHouse": {"idx": 21, "version": 3}},
+    {"MapBuildHouse": {"idx": 22, "version": 5}},
+    {"MapBuildHouse": {"idx": 23, "version": 3}}
+  ]},
   {"BuildSpecialBuildings": [
     {"pos": {"corners": [4944336665485008896, 4938531244090351616, 4938531244087648256, 4944336665482305536]}, "kind": {"GoodsCompany": 17699481749046210215}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1100, 700]},
     {"pos": {"corners": [4936508142695587840, 4940730267346247680, 4940730267348213760, 4936508142697553920]}, "kind": {"GoodsCompany": 7759206203148193615}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": {"poly": [4936508142695587840, 4940730267346247680, 4940730267348213760, 4936508142697553920], "area": 14400.0, "filldir": 4575657221408423936}, "road_at": [1100, 700]},
@@ -24,11 +38,13 @@
     {"pos": {"corners": [4941064518884687872, 4941064518885015552, 4940360831443238912, 4940360831442911232]}, "kind": {"GoodsCompany": 11895989582669773744}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1180, 940]},
     {"pos": {"corners": [4941803390700797952, 4941803390700634112, 4942507078142410752, 4942507078142574592]}, "kind": {"GoodsCompany": 4761500172902867360}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1180, 1100]},
     {"pos": {"corners": [4938267361306529792, 4938971048748306432, 4938971048748470272, 4938267361306693632]}, "kind": {"GoodsCompany": 14211706759220955472}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [1100, 1180]},
-    {"pos": {"corners": [4929330530795966464, 4930737905679519744, 4930737905679683584, 4929330530796130304]}, "kind": {"GoodsCompany": 16636901822346546003}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [940, 1180]},
+    {"pos": {"corners": [4929330530789466112, 4930737905673019392, 4930737905673347072, 4929330530789793792]}, "kind": {"GoodsCompany": 16636901822346546003}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [940, 700]},
     {"pos": {"corners": [4918071531727540224, 4919478906611093504, 4919478906611257344, 4918071531727704064]}, "kind": {"GoodsCompany": 6619385437289231944}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [780, 1180]},
     {"pos": {"corners": [4912406847820414976, 4912406847820578816, 4910999472937025536, 4910999472936861696]}, "kind": {"GoodsCompany": 6320984592099759368}, "gen": {"CenteredDoor": {"vertical_factor": 1.0}}, "zone": null, "road_at": [700, 1100]}
   ]},
   {"Assert": "NoRejections"},
+  {"Assert": {"BuildingCount": {"prototype": "school", "count": 1}}},
+  {"Assert": {"BuildingCount": {"prototype": "clinic", "count": 1}}},
   {"DumpState": "service-placement"},
   {"RunTicks": 72000},
   {"DumpState": "city-with-services"},
@@ -44,6 +60,9 @@
   {"Screenshot": "water"},
   {"SetOverlay": "Sewage"},
   {"Screenshot": "sewage"},
+  {"Camera": {"x": 970, "y": 865, "z": 0, "yaw": -0.6, "pitch": 1.05, "dist": 600}},
+  {"WaitFrames": 3},
+  {"DumpState": "coverage-capture"},
   {"SetOverlay": {"Coverage": "Health"}},
   {"Screenshot": "coverage-health"},
   {"SetOverlay": {"Coverage": "Fire"}},
@@ -56,6 +75,8 @@
   {"Screenshot": "coverage-garbage"},
   {"SetOverlay": {"Coverage": "Park"}},
   {"Screenshot": "coverage-park"},
+  {"Camera": {"x": 940, "y": 915, "z": 0, "yaw": -0.6, "pitch": 1.05, "dist": 650}},
+  {"WaitFrames": 3},
   {"SetOverlay": "Pollution"},
   {"Screenshot": "pollution"},
   {"SetOverlay": "Happiness"},

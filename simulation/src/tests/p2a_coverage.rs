@@ -1,4 +1,4 @@
-use super::{coverage_update, recompute, CoverageGrid};
+use super::{active_providers, coverage_update, recompute, CoverageGrid, COVERAGE_KINDS};
 use crate::map::{BuildingID, BuildingKind, LanePatternBuilder, ProjectFilter, RoadID};
 use crate::map_dynamic::{electricity_flow_system, BuildingInfos, ElectricityFlow};
 use crate::souls::goods_company::company_soul;
@@ -96,6 +96,95 @@ fn coverage(sim: &Simulation, building: BuildingID, kind: ServiceKind) -> f32 {
 }
 
 #[test]
+fn p2a_coverage_starts_promptly_after_staffing() {
+    let mut sim = TestCtx::new_fast().g;
+    let road = road(
+        &sim,
+        vec2(100.0, 400.0),
+        vec2(600.0, 400.0),
+        LanePatternBuilder::new(),
+    );
+    let home = house(&sim, road, vec2(330.0, 420.0), 1, 2);
+    let school = company(&mut sim, road, vec2(310.0, 420.0), "school", 0);
+    company(&mut sim, road, vec2(210.0, 420.0), "solar-panel", 0);
+    refresh_power(&mut sim);
+    update(&mut sim, 8100);
+    assert_eq!(coverage(&sim, home, ServiceKind::School), 0.0);
+    let revision = sim.read::<CoverageGrid>().revision(ServiceKind::School);
+
+    set_staff(&mut sim, school, 1);
+    for tick in 8101..=8400 {
+        update(&mut sim, tick);
+    }
+    assert!(coverage(&sim, home, ServiceKind::School) > 0.0);
+    assert_ne!(
+        sim.read::<CoverageGrid>().revision(ServiceKind::School),
+        revision
+    );
+}
+
+#[test]
+fn p2a_coverage_starts_promptly_for_an_additional_provider() {
+    let mut sim = TestCtx::new_fast().g;
+    let road = road(
+        &sim,
+        vec2(100.0, 400.0),
+        vec2(600.0, 400.0),
+        LanePatternBuilder::new(),
+    );
+    let near = house(&sim, road, vec2(330.0, 420.0), 1, 60);
+    let far = house(&sim, road, vec2(540.0, 420.0), 61, 2);
+    company(&mut sim, road, vec2(310.0, 420.0), "school", 1);
+    company(&mut sim, road, vec2(210.0, 420.0), "solar-panel", 0);
+    refresh_power(&mut sim);
+    update(&mut sim, 8100);
+    assert!(coverage(&sim, near, ServiceKind::School) > 0.0);
+    assert_eq!(coverage(&sim, far, ServiceKind::School), 0.0);
+
+    let mut restored: Simulation = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+    for run in [&mut sim, &mut restored] {
+        let revision = run.read::<CoverageGrid>().revision(ServiceKind::School);
+        update(run, 8275);
+        assert_eq!(
+            run.read::<CoverageGrid>().revision(ServiceKind::School),
+            revision
+        );
+
+        company(run, road, vec2(520.0, 420.0), "school", 1);
+        refresh_power(run);
+        for tick in 8276..=8575 {
+            update(run, tick);
+        }
+        assert!(coverage(run, far, ServiceKind::School) > 0.0);
+    }
+    assert_eq!(
+        restored.hashes()["coverage_grid"],
+        sim.hashes()["coverage_grid"]
+    );
+}
+
+#[test]
+fn p2a_coverage_loads_the_legacy_grid_format() {
+    use std::collections::BTreeMap;
+
+    #[derive(serde::Serialize)]
+    struct LegacyGrid {
+        by_kind: BTreeMap<ServiceKind, BTreeMap<BuildingID, f32>>,
+    }
+
+    let by_kind = COVERAGE_KINDS
+        .into_iter()
+        .chain([ServiceKind::WaterPump, ServiceKind::SewageOutlet])
+        .map(|kind| (kind, [(BuildingID::null(), 42.0)].into()))
+        .collect();
+    let legacy = LegacyGrid { by_kind };
+    let old = Bincode::encode(&legacy).unwrap();
+    let grid: CoverageGrid = Bincode::decode(&old).unwrap();
+    assert_eq!(grid.by_kind, legacy.by_kind);
+    assert_eq!(Bincode::encode(&grid).unwrap(), old);
+}
+
+#[test]
 fn p2a_coverage_respects_one_way_lanes_and_missing_sidewalks() {
     let mut sim = TestCtx::new_fast().g;
     let both = LanePatternBuilder::new().parking(false);
@@ -172,14 +261,22 @@ fn p2a_overlapping_providers_allocate_capacity_deterministically() {
     }
     let near_score = 100.0 * (1.0 - 60.0 / radius);
     refresh_power(&mut sim);
-    let covered = recompute(&sim, ServiceKind::Fire);
+    let covered = recompute(
+        &sim,
+        ServiceKind::Fire,
+        &mut active_providers(&sim, ServiceKind::Fire),
+    );
     assert!((covered[&first] - near_score).abs() < 0.001);
     let partial = near_score * (capacity - 40.0) / 40.0;
     assert!((covered[&second] - partial).abs() < 0.001);
     assert!(!covered.contains_key(&third));
 
     set_staff(&mut sim, adjacent, 1);
-    let covered = recompute(&sim, ServiceKind::Fire);
+    let covered = recompute(
+        &sim,
+        ServiceKind::Fire,
+        &mut active_providers(&sim, ServiceKind::Fire),
+    );
     assert!(
         covered.contains_key(&third),
         "second provider must extend coverage"

@@ -12,9 +12,16 @@ pub(super) struct Scale {
     pub(super) labels: [&'static str; 2],
     maximum: f32,
     colors: [[f32; 3]; 3],
+    opacity: f32,
 }
 
 const SERVICE_COLORS: [[f32; 3]; 3] = [[0.85, 0.07, 0.09], [0.98, 0.55, 0.03], [0.03, 0.80, 0.38]];
+const COVERAGE_COLORS: [[f32; 3]; 3] = [
+    [0.80, 0.012, 0.018],
+    [0.96, 0.43, 0.015],
+    [0.01, 0.68, 0.075],
+];
+pub(super) const COVERAGE_PROVIDER_COLOR: [f32; 4] = [0.025, 0.45, 1.0, 0.96];
 
 impl Scale {
     pub(super) fn color(self, value: f32) -> [f32; 4] {
@@ -25,7 +32,7 @@ impl Scale {
             (self.colors[1], self.colors[2], 2.0 * t - 1.0)
         };
         let channel = |i: usize| from[i] + (to[i] - from[i]) * weight;
-        [channel(0), channel(1), channel(2), 0.62]
+        [channel(0), channel(1), channel(2), self.opacity]
     }
 }
 
@@ -47,13 +54,20 @@ impl OverlayMode {
             _ => 100.0,
         };
         let colors = match self {
+            Coverage(_) => COVERAGE_COLORS,
             Pollution => [[0.08, 0.23, 0.65], [0.55, 0.06, 0.62], [0.98, 0.19, 0.02]],
             _ => SERVICE_COLORS,
+        };
+        let opacity = if matches!(self, Coverage(_)) {
+            0.94
+        } else {
+            0.62
         };
         Some(Scale {
             labels,
             maximum,
             colors,
+            opacity,
         })
     }
 }
@@ -103,6 +117,12 @@ pub(super) fn render(mode: OverlayMode, label: &str, empty: bool, uiw: &UiWorld)
                                 textc(on_secondary_container(), scale.labels[1]);
                             });
                         }
+                        if matches!(mode, OverlayMode::Coverage(_)) {
+                            minrow(4.0, || {
+                                color_swatch(COVERAGE_PROVIDER_COLOR, 12.0);
+                                textc(on_secondary_container(), "Service building");
+                            });
+                        }
                         match (mode, empty) {
                             (OverlayMode::Pollution, true) => {
                                 textc(on_secondary_container(), "No pollution recorded")
@@ -120,7 +140,10 @@ pub(super) fn render(mode: OverlayMode, label: &str, empty: bool, uiw: &UiWorld)
 }
 
 fn swatch(scale: Scale, value: f32, width: f32) {
-    let [r, g, b, _] = scale.color(value);
+    color_swatch(scale.color(value), width);
+}
+
+fn color_swatch([r, g, b, _]: [f32; 4], width: f32) {
     colored_box_container(Color::from_linear(Vec4::new(r, g, b, 1.0)), || {
         fixed_spacer((width, 9.0));
     });

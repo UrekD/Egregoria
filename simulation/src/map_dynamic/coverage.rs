@@ -1,10 +1,13 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::fmt;
 
 use geom::Vec3;
 use ordered_float::OrderedFloat;
 use prototypes::{try_prototype, ServiceID, ServiceKind};
-use serde::{Deserialize, Serialize};
+use serde::de::{MapAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeStruct};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use slotmapd::SecondaryMap;
 
 use crate::map::{BuildingID, BuildingKind, IntersectionID, LaneKind, Map, Road, RoadID};
@@ -12,9 +15,11 @@ use crate::{Simulation, SoulID};
 
 use super::{BuildingInfos, ElectricityFlow};
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default)]
 pub struct CoverageGrid {
     pub by_kind: BTreeMap<ServiceKind, BTreeMap<BuildingID, f32>>,
+    started_providers: BTreeSet<BuildingID>,
+    revisions: BTreeMap<ServiceKind, u64>,
 }
 
 impl CoverageGrid {
@@ -24,6 +29,99 @@ impl CoverageGrid {
             .and_then(|receivers| receivers.get(&building))
             .copied()
             .unwrap_or_default()
+    }
+
+    pub fn revision(&self, kind: ServiceKind) -> u64 {
+        self.revisions.get(&kind).copied().unwrap_or_default()
+    }
+}
+
+// Keep the existing service kind discriminants in the Bincode map. The extra
+// record is written only for cities that have started at least one provider.
+#[derive(Serialize, Deserialize)]
+enum SnapshotKey {
+    Health,
+    Fire,
+    Police,
+    School,
+    Garbage,
+    Park,
+    WaterPump,
+    SewageOutlet,
+    StartedProviders,
+}
+
+impl Serialize for CoverageGrid {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        struct Records<'a>(&'a CoverageGrid);
+
+        impl Serialize for Records<'_> {
+            fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+                let has_providers = !self.0.started_providers.is_empty();
+                let mut map = serializer
+                    .serialize_map(Some(self.0.by_kind.len() + usize::from(has_providers)))?;
+                for (kind, coverage) in &self.0.by_kind {
+                    map.serialize_entry(kind, coverage)?;
+                }
+                if has_providers {
+                    map.serialize_entry(&SnapshotKey::StartedProviders, &self.0.started_providers)?;
+                }
+                map.end()
+            }
+        }
+
+        let mut state = serializer.serialize_struct("CoverageGrid", 1)?;
+        state.serialize_field("by_kind", &Records(self))?;
+        state.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for CoverageGrid {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct SavedGrid {
+            #[serde(deserialize_with = "read_records")]
+            by_kind: CoverageGrid,
+        }
+
+        fn read_records<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<CoverageGrid, D::Error> {
+            struct Records;
+            impl<'de> Visitor<'de> for Records {
+                type Value = CoverageGrid;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("coverage snapshots")
+                }
+
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                    let mut grid = CoverageGrid::default();
+                    while let Some(key) = map.next_key()? {
+                        let kind = match key {
+                            SnapshotKey::Health => ServiceKind::Health,
+                            SnapshotKey::Fire => ServiceKind::Fire,
+                            SnapshotKey::Police => ServiceKind::Police,
+                            SnapshotKey::School => ServiceKind::School,
+                            SnapshotKey::Garbage => ServiceKind::Garbage,
+                            SnapshotKey::Park => ServiceKind::Park,
+                            SnapshotKey::WaterPump => ServiceKind::WaterPump,
+                            SnapshotKey::SewageOutlet => ServiceKind::SewageOutlet,
+                            SnapshotKey::StartedProviders => {
+                                grid.started_providers = map.next_value()?;
+                                continue;
+                            }
+                        };
+                        grid.by_kind.insert(kind, map.next_value()?);
+                    }
+                    Ok(grid)
+                }
+            }
+
+            deserializer.deserialize_map(Records)
+        }
+
+        Ok(SavedGrid::deserialize(deserializer)?.by_kind)
     }
 }
 
@@ -35,6 +133,9 @@ const COVERAGE_KINDS: [ServiceKind; 6] = [
     ServiceKind::Garbage,
     ServiceKind::Park,
 ];
+const REFRESH_INTERVAL: u64 = 6000;
+const STARTUP_INTERVAL: u64 = 300;
+const STARTUP_STEP: u64 = STARTUP_INTERVAL / COVERAGE_KINDS.len() as u64;
 
 #[derive(Clone, Copy)]
 struct RoadPosition {
@@ -134,34 +235,61 @@ fn road_directions(map: &Map, road: &Road, walking: bool) -> [bool; 2] {
 }
 
 pub fn coverage_update(sim: &mut Simulation) {
-    let offset = sim.get_tick() % 6000;
-    // Keep coverage off the utility, environment and hourly refresh ticks.
-    if offset % 600 != 300 {
+    let tick = sim.get_tick();
+    let offset = tick % REFRESH_INTERVAL;
+    let scheduled = offset % 600 == 300;
+    let startup_offset = tick % STARTUP_INTERVAL;
+    let index = if scheduled {
+        offset / 600
+    } else if startup_offset % STARTUP_STEP == STARTUP_STEP / 2 {
+        // Stagger first snapshots and keep them off the other city refresh ticks.
+        startup_offset / STARTUP_STEP
+    } else {
         return;
-    }
-    let Some(&kind) = COVERAGE_KINDS.get((offset / 600) as usize) else {
+    };
+    let Some(&kind) = COVERAGE_KINDS.get(index as usize) else {
         return;
     };
 
     profiling::scope!("map_dynamic::coverage_update");
-    let coverage = recompute(sim, kind);
-    sim.write::<CoverageGrid>().by_kind.insert(kind, coverage);
+    let mut providers = active_providers(sim, kind);
+    if !scheduled {
+        let grid = sim.read::<CoverageGrid>();
+        if providers
+            .iter()
+            .all(|provider| grid.started_providers.contains(&provider.building))
+        {
+            return;
+        }
+    }
+
+    let coverage = recompute(sim, kind, &mut providers);
+    let map = sim.map();
+    let mut grid = sim.write::<CoverageGrid>();
+    grid.started_providers
+        .retain(|id| map.buildings().contains_key(*id));
+    grid.started_providers
+        .extend(providers.iter().map(|provider| provider.building));
+    grid.by_kind.insert(kind, coverage);
+    let revision = grid.revisions.entry(kind).or_default();
+    *revision = revision.wrapping_add(1);
 }
 
-fn recompute(sim: &Simulation, kind: ServiceKind) -> BTreeMap<BuildingID, f32> {
+fn active_providers(sim: &Simulation, kind: ServiceKind) -> Vec<Provider> {
     let map = sim.map();
     let electricity = sim.read::<ElectricityFlow>();
     let infos = sim.read::<BuildingInfos>();
-    let mut providers: Vec<_> = sim
-        .world
+    sim.world
         .companies
         .iter()
         .filter_map(|(id, company)| {
             let proto = try_prototype(ServiceID::from(company.comp.proto))?;
+            if proto.service_kind != kind {
+                return None;
+            }
             let building = map.get(company.comp.building)?;
             let road = building.connected_road?;
-            if proto.service_kind != kind
-                || infos.owner(building.id) != Some(SoulID::GoodsCompany(id))
+            if infos.owner(building.id) != Some(SoulID::GoodsCompany(id))
                 || map
                     .electricity
                     .net_id(building.id)
@@ -179,13 +307,22 @@ fn recompute(sim: &Simulation, kind: ServiceKind) -> BTreeMap<BuildingID, f32> {
                 capacity,
             })
         })
-        .collect();
+        .collect()
+}
+
+fn recompute(
+    sim: &Simulation,
+    kind: ServiceKind,
+    providers: &mut [Provider],
+) -> BTreeMap<BuildingID, f32> {
     let mut coverage = BTreeMap::new();
     if providers.is_empty() {
         return coverage;
     }
     providers.sort_unstable_by_key(|provider| provider.building);
 
+    let map = sim.map();
+    let infos = sim.read::<BuildingInfos>();
     let walking = matches!(kind, ServiceKind::School | ServiceKind::Park);
     let mut roads = SecondaryMap::with_capacity(map.roads().len());
     for (id, road) in map.roads() {
@@ -227,8 +364,8 @@ fn recompute(sim: &Simulation, kind: ServiceKind) -> BTreeMap<BuildingID, f32> {
     }
 
     let mut search = RoadSearch::default();
-    for (index, provider) in providers.into_iter().enumerate() {
-        search.serve(&map, &mut roads, &provider, index + 1, &mut coverage);
+    for (index, provider) in providers.iter().enumerate() {
+        search.serve(&map, &mut roads, provider, index + 1, &mut coverage);
     }
     coverage
 }
