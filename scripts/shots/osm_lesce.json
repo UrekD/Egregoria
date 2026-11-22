@@ -1,7 +1,5 @@
 [
   {"SetSession": "MainMenu"},
-  {"Screenshot": "osm-ready"},
-  {"WaitFrames": 24},
   {"OpenWindow": "Load"},
   {"LoadSlot": "lesce_osm"},
   {"WaitFrames": 6},

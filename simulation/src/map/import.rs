@@ -1,12 +1,15 @@
 //! Transient, source-independent network import contracts.
 use crate::init::INIT_FUNCS;
 use crate::map::{
-    IntersectionID, LaneKind, LanePattern, Lot, Map, RoadID, RoadSegmentKind, RoundaboutPolicy,
-    ROAD_Z_OFFSET,
+    BuildingID, BuildingKind, Density, IntersectionID, LaneKind, LanePattern, Lot, LotID, Map,
+    RoadID, RoadSegmentKind, RoundaboutPolicy, ROAD_Z_OFFSET,
 };
+use crate::map_dynamic::BuildingInfos;
+use crate::souls::{growth, residence};
 use crate::world_command::WorldCommand;
 use crate::{NewGameOptions, Simulation, SimulationOptions};
-use geom::{Vec2, Vec3};
+use geom::{Vec2, Vec3, OBB};
+use prototypes::BuildingGen;
 use std::collections::BTreeMap;
 use std::ptr::addr_of;
 
@@ -83,6 +86,48 @@ impl Simulation {
         let network = import_network(&mut sim.map_mut(), city)?;
         sim.record_constructor_end();
         Ok((sim, network))
+    }
+}
+
+impl Simulation {
+    /// Seed a growable on an existing imported frontage lot without waiting for demand.
+    pub fn seed_imported_growable(
+        &mut self,
+        lot: LotID,
+        kind: BuildingKind,
+        density: Density,
+    ) -> Option<BuildingID> {
+        let home = if kind == BuildingKind::House {
+            Some(residence::prototype(density, 1)?)
+        } else {
+            None
+        };
+        let id = self.map_mut().place_growable(lot, kind)?;
+        growth::on_growable_placed(self, id, kind);
+        if let Some(home) = home.filter(|home| home.density != Density::Low) {
+            residence::register(self, id, home);
+        }
+        Some(id)
+    }
+
+    /// Seed a mapped residence whose parcel is outside the generated frontage lots.
+    pub fn seed_imported_residence(
+        &mut self,
+        shape: OBB,
+        road: RoadID,
+        density: Density,
+    ) -> Option<BuildingID> {
+        let home = residence::prototype(density, 1)?;
+        let id = self.map_mut().build_special_building(
+            &shape,
+            BuildingKind::House,
+            BuildingGen::House,
+            None,
+            Some(road),
+        )?;
+        self.write::<BuildingInfos>().insert(id);
+        residence::register(self, id, home);
+        Some(id)
     }
 }
 
@@ -258,6 +303,78 @@ mod tests {
     use crate::tests::TestCtx;
     use crate::{MapPreset, NewGameOptions, Simulation};
     use geom::vec2;
+
+    #[test]
+    fn osm_import_retains_short_link_geometry_after_reload_and_policy_edit() {
+        let _ctx = TestCtx::new();
+        let positions = [
+            (200.0, 200.0),
+            (212.0, 200.0),
+            (100.0, 200.0),
+            (312.0, 200.0),
+            (200.0, 100.0),
+            (200.0, 300.0),
+            (212.0, 100.0),
+            (212.0, 300.0),
+        ];
+        let city = ImportedCity {
+            junctions: positions
+                .iter()
+                .enumerate()
+                .map(|(id, &(x, y))| ImportedJunction {
+                    id,
+                    position: vec2(x, y),
+                    roundabout_radius: None,
+                })
+                .collect(),
+            links: [(0, 1), (0, 2), (1, 3), (0, 4), (0, 5), (1, 6), (1, 7)]
+                .into_iter()
+                .map(|(from, to)| ImportedLink {
+                    source_way_ids: vec![],
+                    from,
+                    to,
+                    points: [from, to]
+                        .map(|i| vec2(positions[i].0, positions[i].1))
+                        .to_vec(),
+                    pattern: LanePatternBuilder::default().build(),
+                    frontage: false,
+                })
+                .collect(),
+            boundary_stubs: vec![],
+        };
+        let (sim, network) = Simulation::from_imported_city(
+            &city,
+            &NewGameOptions {
+                preset: MapPreset::Flat,
+                terrain_chunks: 16,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let id = crate::SlotId::new("osm_edit").unwrap();
+        let root = std::env::temp_dir().join(format!("egr-osm-edit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        sim.save_to_slot(&root, &id, crate::SnapshotRevision::new(1))
+            .unwrap();
+        let mut loaded = Simulation::load_from_slot(&root, &id).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+
+        let junction = network.junctions[&1];
+        let (turn, light) = {
+            let map = loaded.map();
+            let inter = &map.intersections[junction];
+            (inter.turn_policy.clone(), inter.light_policy)
+        };
+        loaded.apply_commands([&WorldCommand::MapUpdateIntersectionPolicy {
+            inter: junction,
+            turn,
+            light,
+        }]);
+        let map = loaded.map();
+        let road = &map.roads[network.roads[&0]];
+        assert!(road.interfaced_points().length() >= 9.99);
+        validate_geometry(&map, &network.roads, &network.junctions).unwrap();
+    }
 
     #[test]
     fn osm_import_finalizes_network_without_starter_assets() {

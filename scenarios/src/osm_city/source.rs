@@ -7,6 +7,7 @@ use super::ImportError;
 pub(crate) const MAX_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_ELEMENTS: usize = 20_000;
 const MAX_GEOMETRY: usize = 300_000;
+const MAX_WAY_POINTS: usize = 8192;
 
 #[derive(Debug, Deserialize)]
 pub struct OverpassExtract {
@@ -125,6 +126,18 @@ pub fn read_overpass(reader: impl Read) -> Result<OverpassExtract, ImportError> 
     let mut geometry_count = 0;
     let mut nodes = BTreeMap::new();
     for element in &extract.elements {
+        if element.geometry.len() > MAX_WAY_POINTS
+            || element
+                .members
+                .iter()
+                .any(|member| member.geometry.len() > MAX_WAY_POINTS)
+        {
+            return Err(format!(
+                "{} exceeds the {MAX_WAY_POINTS}-point geometry limit",
+                element.label()
+            )
+            .into());
+        }
         let valid = match element.kind {
             ElementKind::Node => element.point().is_some_and(Coordinate::valid),
             ElementKind::Way => {

@@ -1,13 +1,15 @@
 use super::source::{Coordinate, Element, ElementKind, OverpassExtract};
+use super::spatial::{point_bounds, points_bounds, BoundsIndex};
 use super::ImportError;
-use geom::{vec2, Vec2};
+use geom::{vec2, Vec2, AABB};
 use serde::Serialize;
 use simulation::map::import::{BoundaryStub, ImportedCity, ImportedJunction, ImportedLink};
 use simulation::map::{Density, LaneKind, LanePattern, LanePatternBuilder, ZoneKind};
 use std::collections::{BTreeMap, BTreeSet};
 
 const METRES_NORTH: f64 = 111_158.360;
-const METRES_EAST: f64 = 76_958.685;
+const LESCE_LATITUDE: f64 = 46.3605;
+const LESCE_METRES_EAST: f64 = 76_958.685;
 const MIN_LINK_LENGTH: f32 = 10.0;
 const MAX_LINKS: usize = 6000;
 
@@ -21,7 +23,10 @@ pub struct GeoBounds {
 
 impl GeoBounds {
     pub fn project(self, lat: f64, lon: f64) -> Vec2 {
-        let east = (lon - (self.west + self.east) * 0.5) * METRES_EAST;
+        let mid_latitude = (self.south + self.north) * 0.5;
+        let metres_east =
+            LESCE_METRES_EAST * mid_latitude.to_radians().cos() / LESCE_LATITUDE.to_radians().cos();
+        let east = (lon - (self.west + self.east) * 0.5) * metres_east;
         let north = (lat - (self.south + self.north) * 0.5) * METRES_NORTH;
         vec2((4096.0 + east) as f32, (4096.0 + north) as f32)
     }
@@ -31,6 +36,11 @@ impl GeoBounds {
             self.project(self.south, self.west),
             self.project(self.north, self.east),
         )
+    }
+
+    pub(super) fn limits_aabb(self) -> AABB {
+        let (ll, ur) = self.limits();
+        AABB { ll, ur }
     }
 
     fn point(self, point: Coordinate) -> Vec2 {
@@ -67,6 +77,7 @@ pub struct Feature {
     pub density: Density,
     pub building: bool,
     pub house: bool,
+    pub inferred_house: bool,
     pub outers: Vec<Vec<Vec2>>,
     pub holes: Vec<Vec<Vec2>>,
 }
@@ -75,6 +86,24 @@ impl Feature {
     pub fn contains(&self, point: Vec2) -> bool {
         self.outers.iter().any(|ring| ring_contains(ring, point))
             && !self.holes.iter().any(|ring| ring_contains(ring, point))
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Forest {
+    pub source: String,
+    pub outers: Vec<Vec<Vec2>>,
+    pub holes: Vec<Vec<Vec2>>,
+}
+
+impl Forest {
+    pub fn contains(&self, point: Vec2) -> bool {
+        self.outers.iter().any(|ring| ring_contains(ring, point))
+            && !self.holes.iter().any(|ring| ring_contains(ring, point))
+    }
+
+    pub(super) fn bounds(&self) -> AABB {
+        points_bounds(self.outers.iter().flatten().copied())
     }
 }
 
@@ -91,6 +120,7 @@ pub struct NormalizedCity {
     pub city: ImportedCity,
     pub classes: Vec<LinkClass>,
     pub features: Vec<Feature>,
+    pub forests: Vec<Forest>,
     pub sites: Vec<Site>,
     pub skipped: Vec<(String, String)>,
     pub flat_crossings: Vec<(String, String)>,
@@ -148,6 +178,7 @@ pub fn normalize(
         city: ImportedCity::default(),
         classes: Vec::new(),
         features: Vec::new(),
+        forests: Vec::new(),
         sites: Vec::new(),
         skipped: Vec::new(),
         flat_crossings: Vec::new(),
@@ -234,8 +265,37 @@ pub fn normalize(
             return Err(format!("OSM extract exceeds the {MAX_LINKS}-link import limit").into());
         }
     }
-    contract_short_edges(&mut raw_edges, &mut normalized.skipped);
-    report_grade_crossings(&raw_edges, &mut normalized.flat_crossings);
+    let mut raw_edges = contract_short_edges(raw_edges, &mut normalized.skipped)?;
+    raw_edges.retain_mut(|edge| {
+        let first = edge.vertices[0].point;
+        let last = edge.vertices.last().unwrap().point;
+        // Match the engine's sample cleanup before testing the minimum length.
+        let end = edge.vertices.pop().unwrap();
+        let mut samples = edge.vertices.drain(..);
+        let start = samples.next().unwrap();
+        let mut cleaned = vec![start];
+        for sample in samples {
+            if sample.point.distance2(first) >= 1.0
+                && sample.point.distance2(last) >= 1.0
+                && sample.point.distance2(cleaned.last().unwrap().point) >= 0.04
+            {
+                cleaned.push(sample);
+            }
+        }
+        cleaned.push(end);
+        edge.vertices = cleaned;
+        let valid = first.distance(last) >= 1.0
+            && edge.vertices.len() >= 2
+            && edge_length(&edge.vertices) >= MIN_LINK_LENGTH;
+        if !valid {
+            normalized.skipped.push((
+                format!("way/{}", edge.way),
+                "unusable endpoints or cleaned geometry".into(),
+            ));
+        }
+        valid
+    });
+    report_grade_crossings(&raw_edges, &mut normalized.flat_crossings)?;
 
     let anchors: BTreeMap<_, _> = raw_edges
         .iter()
@@ -593,20 +653,30 @@ fn edge_length(vertices: &[Vertex]) -> f32 {
         .sum()
 }
 
-fn contract_short_edges(edges: &mut Vec<Edge>, skipped: &mut Vec<(String, String)>) {
-    loop {
-        let short = edges
-            .iter()
-            .position(|edge| edge_length(&edge.vertices) < MIN_LINK_LENGTH);
-        let Some(index) = short else { break };
-        let edge = edges.remove(index);
+fn contract_short_edges(
+    edges: Vec<Edge>,
+    skipped: &mut Vec<(String, String)>,
+) -> Result<Vec<Edge>, ImportError> {
+    let mut incident = BTreeMap::<Anchor, BTreeSet<usize>>::new();
+    let mut pending = BTreeSet::new();
+    let mut edges: Vec<_> = edges.into_iter().map(Some).collect();
+    for (i, edge) in edges.iter().enumerate() {
+        let edge = edge.as_ref().unwrap();
+        for anchor in [edge.vertices[0].key, edge.vertices.last().unwrap().key] {
+            incident.entry(anchor).or_default().insert(i);
+        }
+        if edge_length(&edge.vertices) < MIN_LINK_LENGTH {
+            pending.insert(i);
+        }
+    }
+    let mut rewired = 0;
+    while let Some(index) = pending.pop_first() {
+        let edge = edges[index].take().unwrap();
         let from = edge.vertices[0];
         let to = *edge.vertices.last().unwrap();
-        let attached = |key| {
-            edges.iter().filter(move |edge| {
-                [edge.vertices[0].key, edge.vertices.last().unwrap().key].contains(&key)
-            })
-        };
+        incident.get_mut(&from.key).unwrap().remove(&index);
+        incident.get_mut(&to.key).unwrap().remove(&index);
+        let attached = |key| incident[&key].iter().map(|&id| edges[id].as_ref().unwrap());
         let forward = edge
             .pattern
             .lanes_forward
@@ -664,12 +734,27 @@ fn contract_short_edges(edges: &mut Vec<Edge>, skipped: &mut Vec<(String, String
             } else {
                 (from, to)
             };
-            for other in edges.iter_mut() {
+            let moved = std::mem::take(incident.get_mut(&discard.key).unwrap());
+            let retained = incident.get_mut(&keep.key).unwrap();
+            for i in moved {
+                let other = edges[i].as_mut().unwrap();
+                rewired += other.vertices.len();
+                if rewired > 1_000_000 {
+                    return Err(
+                        "OSM short-link contraction exceeded the geometry work limit".into(),
+                    );
+                }
                 let last = other.vertices.len() - 1;
-                for i in [0, last] {
-                    if other.vertices[i].key == discard.key {
-                        other.vertices[i] = keep;
+                for endpoint in [0, last] {
+                    if other.vertices[endpoint].key == discard.key {
+                        other.vertices[endpoint] = keep;
                     }
+                }
+                retained.insert(i);
+                if edge_length(&other.vertices) < MIN_LINK_LENGTH {
+                    pending.insert(i);
+                } else {
+                    pending.remove(&i);
                 }
             }
             skipped.push((
@@ -680,31 +765,55 @@ fn contract_short_edges(edges: &mut Vec<Edge>, skipped: &mut Vec<(String, String
             skipped.push((format!("way/{}", edge.way), "sub-10 m link dropped".into()));
         }
     }
+    Ok(edges.into_iter().flatten().collect())
 }
 
-fn report_grade_crossings(edges: &[Edge], report: &mut Vec<(String, String)>) {
+fn report_grade_crossings(
+    edges: &[Edge],
+    report: &mut Vec<(String, String)>,
+) -> Result<(), ImportError> {
+    let segments: Vec<_> = edges
+        .iter()
+        .flat_map(|edge| {
+            edge.vertices
+                .windows(2)
+                .map(|pair| (edge.way, edge.grade, pair[0].point, pair[1].point))
+        })
+        .collect();
+    let index = BoundsIndex::new(
+        segments
+            .iter()
+            .enumerate()
+            .map(|(i, &(_, _, p, q))| (points_bounds([p, q].into_iter()), i)),
+    );
     let mut pairs = BTreeSet::new();
-    for (i, edge) in edges.iter().enumerate() {
-        for other in &edges[..i] {
-            if edge.grade == other.grade || edge.way == other.way {
+    let mut work = 0;
+    for (i, &(way, grade, p, end)) in segments.iter().enumerate() {
+        for &j in index.query(points_bounds([p, end].into_iter())) {
+            work += 1;
+            if work > 4_000_000 {
+                return Err("OSM grade crossing candidates exceeded the spatial work limit".into());
+            }
+            if j >= i {
                 continue;
             }
-            if edge.vertices.windows(2).any(|a| {
-                other.vertices.windows(2).any(|b| {
-                    let p = a[0].point;
-                    let q = b[0].point;
-                    let r = a[1].point - p;
-                    let s = b[1].point - q;
-                    let cross = r.perp_dot(s);
-                    if cross.abs() < 0.0001 {
-                        return false;
-                    }
-                    let t = (q - p).perp_dot(s) / cross;
-                    let u = (q - p).perp_dot(r) / cross;
-                    (0.001..0.999).contains(&t) && (0.001..0.999).contains(&u)
-                })
-            }) {
-                pairs.insert((edge.way.min(other.way), edge.way.max(other.way)));
+            let (other, layer, q, other_end) = segments[j];
+            if grade == layer || way == other {
+                continue;
+            }
+            let pair = (way.min(other), way.max(other));
+            if pairs.contains(&pair) {
+                continue;
+            }
+            let r = end - p;
+            let s = other_end - q;
+            let cross = r.perp_dot(s);
+            if cross.abs() >= 0.0001 {
+                let t = (q - p).perp_dot(s) / cross;
+                let u = (q - p).perp_dot(r) / cross;
+                if (0.001..0.999).contains(&t) && (0.001..0.999).contains(&u) {
+                    pairs.insert(pair);
+                }
             }
         }
     }
@@ -714,17 +823,28 @@ fn report_grade_crossings(edges: &[Edge], report: &mut Vec<(String, String)>) {
             "grade-separated in OSM; rendered flat, potential z-fighting".into(),
         )
     }));
+    Ok(())
+}
+
+fn ordered_coordinate(value: f64) -> u64 {
+    if value == 0.0 {
+        0
+    } else {
+        value.to_bits()
+    }
 }
 
 type Rings = (Vec<Vec<Vec2>>, Vec<Vec<Vec2>>);
 
 fn collect_features(elements: &[Element], bounds: GeoBounds, city: &mut NormalizedCity) {
     let mut members = BTreeSet::new();
+    let mut forest_members = BTreeSet::new();
     let mut area_sites = Vec::new();
     let mut point_sites = Vec::new();
     // Relations are considered first so member ways do not duplicate their area.
     for element in elements.iter().rev() {
         let class = zone_class(element);
+        let forest = element.tag("landuse") == "forest" || element.tag("natural") == "wood";
         let site_kind = match element.tag("amenity") {
             "school" => Some("school"),
             "clinic" | "hospital" => Some("clinic"),
@@ -737,7 +857,7 @@ fn collect_features(elements: &[Element], bounds: GeoBounds, city: &mut Normaliz
             }
             _ => None,
         };
-        if class.is_none() && site_kind.is_none() {
+        if class.is_none() && site_kind.is_none() && !forest {
             if !element.tag("amenity").is_empty() {
                 city.skipped.push((
                     element.label(),
@@ -795,6 +915,22 @@ fn collect_features(elements: &[Element], bounds: GeoBounds, city: &mut Normaliz
                 ));
             }
         }
+        if forest && !(element.kind == ElementKind::Way && forest_members.contains(&element.id)) {
+            if element.kind == ElementKind::Relation {
+                forest_members.extend(
+                    element
+                        .members
+                        .iter()
+                        .filter(|m| m.kind == ElementKind::Way)
+                        .map(|m| m.id),
+                );
+            }
+            city.forests.push(Forest {
+                source: element.label(),
+                outers: outers.clone(),
+                holes: holes.clone(),
+            });
+        }
         if let Some((kind, density, building, house)) = class {
             if element.kind == ElementKind::Way && members.contains(&(element.id, kind, building)) {
                 continue;
@@ -814,21 +950,31 @@ fn collect_features(elements: &[Element], bounds: GeoBounds, city: &mut Normaliz
                 density,
                 building,
                 house,
+                inferred_house: element.tag("building") == "yes" && house,
                 outers,
                 holes,
             });
         }
     }
     city.features.sort_by(|a, b| a.source.cmp(&b.source));
+    city.forests.sort_by(|a, b| a.source.cmp(&b.source));
+    let site_index = BoundsIndex::new(
+        area_sites
+            .iter()
+            .map(|entry| (points_bounds(entry.1.iter().flatten().copied()), entry)),
+    );
     for site in point_sites {
-        if !area_sites.iter().any(|(area, outer, holes)| {
-            area.kind == site.kind
-                && outer.iter().any(|ring| ring_contains(ring, site.position))
-                && !holes.iter().any(|ring| ring_contains(ring, site.position))
-        }) {
+        if !site_index.query(point_bounds(site.position)).any(
+            |&(ref area, ref outer, ref holes)| {
+                area.kind == site.kind
+                    && outer.iter().any(|ring| ring_contains(ring, site.position))
+                    && !holes.iter().any(|ring| ring_contains(ring, site.position))
+            },
+        ) {
             city.sites.push(site);
         }
     }
+    drop(site_index);
     city.sites
         .extend(area_sites.into_iter().map(|(site, _, _)| site));
     city.sites.sort_by(|a, b| a.source.cmp(&b.source));
@@ -848,12 +994,16 @@ fn zone_class(element: &Element) -> Option<(ZoneKind, Density, bool, bool)> {
     let building = element.tag("building");
     let levels = element.tag("building:levels").parse::<u32>().unwrap_or(0);
     let (kind, density, house) = match building {
-        "house" | "detached" | "semidetached_house" | "terrace" | "bungalow" => {
-            (Residential, Density::Low, true)
+        "apartments" if levels >= 3 => (Residential, Density::High, true),
+        "apartments" | "terrace" | "terraced_house" => (Residential, Density::Medium, true),
+        "house" | "detached" | "semidetached_house" | "bungalow" | "residential" => {
+            let density = match levels {
+                0 | 1 => Density::Low,
+                2 => Density::Medium,
+                _ => Density::High,
+            };
+            (Residential, density, true)
         }
-        "apartments" => (Residential, Density::High, false),
-        "residential" if levels >= 3 => (Residential, Density::High, false),
-        "residential" => (Residential, Density::Low, true),
         "retail" | "commercial" | "supermarket" | "hotel" => (Commercial, Density::Low, false),
         "industrial" | "warehouse" | "manufacture" => (Industrial, Density::Low, false),
         "office" => (Office, Density::Low, false),
@@ -868,6 +1018,7 @@ fn zone_class(element: &Element) -> Option<(ZoneKind, Density, bool, bool)> {
         }
         _ if !element.tag("office").is_empty() => (Office, Density::Low, false),
         _ if !element.tag("shop").is_empty() => (Commercial, Density::Low, false),
+        "yes" => (Residential, Density::Low, true),
         _ => return None,
     };
     Some((kind, density, true, house))
@@ -892,19 +1043,35 @@ fn rings(element: &Element, bounds: GeoBounds) -> Option<Rings> {
                     })
                     .collect();
                 segments.sort_by_key(|member| member.id);
-                let mut result = Vec::new();
-                while !segments.is_empty() {
-                    let mut ring = segments.remove(0).geometry.clone();
-                    if ring.len() < 2 {
+                let key = |p: Coordinate| (ordered_coordinate(p.lat), ordered_coordinate(p.lon));
+                let mut endpoints = BTreeMap::<_, BTreeSet<_>>::new();
+                for (i, member) in segments.iter().enumerate() {
+                    if member.geometry.len() < 2 {
                         return None;
                     }
+                    for &p in [member.geometry.first()?, member.geometry.last()?] {
+                        endpoints.entry(key(p)).or_default().insert(i);
+                    }
+                }
+                let mut unused: BTreeSet<_> = (0..segments.len()).collect();
+                let take = |i: usize,
+                            unused: &mut BTreeSet<_>,
+                            endpoints: &mut BTreeMap<_, BTreeSet<_>>| {
+                    let segment = &segments[i].geometry;
+                    unused.remove(&i);
+                    for &p in [segment.first().unwrap(), segment.last().unwrap()] {
+                        endpoints.get_mut(&key(p)).unwrap().remove(&i);
+                    }
+                    segment
+                };
+                let mut result = Vec::new();
+                while let Some(&first) = unused.first() {
+                    let mut ring = take(first, &mut unused, &mut endpoints).clone();
                     while ring.first() != ring.last() {
-                        let point = ring.last();
-                        let index = segments.iter().position(|m| {
-                            m.geometry.first() == point || m.geometry.last() == point
-                        })?;
-                        let segment = &segments.remove(index).geometry;
-                        if segment.first() == point {
+                        let point = *ring.last()?;
+                        let index = *endpoints.get(&key(point))?.first()?;
+                        let segment = take(index, &mut unused, &mut endpoints);
+                        if segment.first() == Some(&point) {
                             ring.extend(segment.iter().skip(1).copied());
                         } else {
                             ring.extend(segment.iter().rev().skip(1).copied());

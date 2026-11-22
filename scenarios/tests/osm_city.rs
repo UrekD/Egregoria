@@ -37,6 +37,17 @@ fn osm_normalizes_shared_nodes_clips_and_reverses() {
         .links
         .iter()
         .all(|link| !link.source_way_ids.contains(&15)));
+    let bridge = link(19);
+    assert!(![road.from, road.to].contains(&bridge.from));
+    assert!(![road.from, road.to].contains(&bridge.to));
+    assert!(normalized
+        .flat_crossings
+        .iter()
+        .any(|(ways, _)| ways.contains("way/19")));
+    assert!(normalized
+        .skipped
+        .iter()
+        .any(|(id, reason)| id == "way/18" && reason.contains("sub-10 m")));
     assert_eq!(normalized.sites.len(), 1);
     let feature = &normalized.features[0];
     assert!(!feature.contains(LESCE_BOUNDS.project(46.3585, 14.155)));
@@ -56,14 +67,45 @@ fn osm_normalizes_shared_nodes_clips_and_reverses() {
 
 #[test]
 fn osm_rejects_partial_or_malformed_extracts() {
-    for input in [
-        r#"{"elements":[],"remark":null}"#,
-        r#"{"elements":["#,
-        r#"{"elements":[{"type":"way","id":1,"nodes":[1,2],"geometry":[{"lat":46,"lon":14}]}]}"#,
-        r#"{"elements":[{"type":"node","id":1,"lat":1e999,"lon":14}]}"#,
+    for (input, message) in [
+        (
+            r#"{"elements":[{"type":"node","id":1,"lat":46,"lon":14}],"remark":null}"#,
+            "has a remark",
+        ),
+        (r#"{"elements":["#, "invalid Overpass JSON"),
+        (
+            r#"{"elements":[{"type":"way","id":1,"nodes":[1,2],"geometry":[{"lat":46,"lon":14}]}]}"#,
+            "node/geometry",
+        ),
+        (
+            r#"{"elements":[{"type":"node","id":1,"lat":91,"lon":14}]}"#,
+            "malformed coordinates",
+        ),
+        (
+            r#"{"elements":[{"type":"node","id":1,"lat":46,"lon":14},{"type":"node","id":1,"lat":46,"lon":14}]}"#,
+            "duplicate node/1",
+        ),
+        (
+            r#"{"elements":[{"type":"node","id":1,"lat":46,"lon":14},{"type":"way","id":1,"nodes":[1,2],"geometry":[{"lat":47,"lon":14},{"lat":46,"lon":14}]}]}"#,
+            "inconsistent coordinates",
+        ),
     ] {
-        assert!(read_overpass(input.as_bytes()).is_err(), "{input}");
+        assert!(
+            read_overpass(input.as_bytes())
+                .unwrap_err()
+                .to_string()
+                .contains(message),
+            "{input}"
+        );
     }
+    let nodes: Vec<_> = (0..20_001)
+        .map(|id| serde_json::json!({"type":"node","id":id,"lat":46,"lon":14}))
+        .collect();
+    let input = serde_json::to_vec(&serde_json::json!({"elements":nodes})).unwrap();
+    assert!(read_overpass(input.as_slice())
+        .unwrap_err()
+        .to_string()
+        .contains("element count"));
 }
 
 #[test]
@@ -172,4 +214,77 @@ fn osm_fixture_builds_routes_and_round_trips_a_slot() {
     assert_eq!(loaded.get_tick(), a.get_tick() + TICKS_PER_HOUR);
     loaded.map().check_invariants();
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn osm_reports_and_drops_nearly_closed_way() {
+    let mut input: serde_json::Value = serde_json::from_slice(FIXTURE).unwrap();
+    input["elements"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type":"way", "id":9001, "nodes":[9001,9002,9003],
+            "tags":{"highway":"residential"},
+            "geometry":[{"lat":46.35,"lon":14.14}, {"lat":46.3501,"lon":14.14},
+                        {"lat":46.35,"lon":14.140006}]
+        }));
+    let bytes = serde_json::to_vec(&input).unwrap();
+    let city = normalize(read_overpass(bytes.as_slice()).unwrap(), LESCE_BOUNDS).unwrap();
+    assert!(city
+        .skipped
+        .iter()
+        .any(|(id, reason)| id == "way/9001" && reason.contains("endpoints")));
+    assert!(city
+        .city
+        .links
+        .iter()
+        .all(|link| !link.source_way_ids.contains(&9001)));
+}
+
+#[test]
+fn osm_bounds_long_ways_and_link_counts() {
+    let make_way = |id: u64, lat: f64, count: usize| {
+        let nodes: Vec<_> = (0..count as u64).map(|i| id * 100_000 + i).collect();
+        let geometry: Vec<_> = (0..count)
+            .map(|i| serde_json::json!({"lat":lat + (i % 2) as f64 * 0.000003,"lon":14.14 + (i as f64 * 0.000004)}))
+            .collect();
+        serde_json::json!({
+            "type":"way", "id":id, "nodes":nodes, "geometry":geometry,
+            "tags":{"highway":"residential", "layer":format!("{id}")}
+        })
+    };
+    let too_long =
+        serde_json::to_vec(&serde_json::json!({"elements":[make_way(1,46.35,25_000)]})).unwrap();
+    assert!(read_overpass(too_long.as_slice())
+        .unwrap_err()
+        .to_string()
+        .contains("point geometry limit"));
+
+    let disjoint = serde_json::to_vec(&serde_json::json!({
+        "elements":[make_way(1,46.35,8000),make_way(2,46.36,8000)]
+    }))
+    .unwrap();
+    let disjoint = normalize(read_overpass(disjoint.as_slice()).unwrap(), LESCE_BOUNDS).unwrap();
+    assert_eq!(disjoint.city.links.len(), 2);
+    assert!(disjoint.flat_crossings.is_empty());
+
+    let ways: Vec<_> = (1..=6001).map(|id| make_way(id, 46.35, 2)).collect();
+    let input = serde_json::to_vec(&serde_json::json!({"elements":ways})).unwrap();
+    let error = normalize(read_overpass(input.as_slice()).unwrap(), LESCE_BOUNDS).unwrap_err();
+    assert!(error.to_string().contains("6000-link import limit"));
+}
+
+#[test]
+fn osm_wood_multipolygon_respects_holes() {
+    let mut input: serde_json::Value = serde_json::from_slice(FIXTURE).unwrap();
+    let elements = input["elements"].as_array_mut().unwrap();
+    let mut wood = elements.iter().find(|e| e["id"] == 50).unwrap().clone();
+    wood["id"] = 51.into();
+    wood["tags"] = serde_json::json!({"type":"multipolygon", "natural":"wood"});
+    elements.push(wood);
+    let bytes = serde_json::to_vec(&input).unwrap();
+    let city = normalize(read_overpass(bytes.as_slice()).unwrap(), LESCE_BOUNDS).unwrap();
+    assert_eq!(city.forests.len(), 1);
+    assert!(city.forests[0].contains(LESCE_BOUNDS.project(46.3585, 14.157)));
+    assert!(!city.forests[0].contains(LESCE_BOUNDS.project(46.3585, 14.155)));
 }

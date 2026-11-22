@@ -141,6 +141,23 @@ impl Environment {
         }
     }
 
+    /// Filter generated vegetation before the imported map is first displayed.
+    pub fn retain_imported_trees(&mut self, mut retain: impl FnMut(Vec2) -> bool) {
+        let mut remove = Vec::new();
+        let mut cells: Vec<_> = self.trees.storage().cells.iter().collect();
+        cells.sort_unstable_by_key(|(&id, _)| id);
+        for (_, cell) in cells {
+            remove.extend(
+                cell.objs
+                    .iter()
+                    .filter_map(|&(id, pos)| (!retain(pos)).then_some(id)),
+            );
+        }
+        for id in remove {
+            self.trees.remove_maintain(id);
+        }
+    }
+
     pub fn get_chunk(&self, id: TerrainChunkID) -> Option<&Chunk> {
         self.heightmap.get_chunk((id.0 as u16, id.1 as u16))
     }
