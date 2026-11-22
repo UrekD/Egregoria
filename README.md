@@ -45,6 +45,14 @@ Health, fire, police, school, garbage and park services with road-network covera
 |---|---|---|
 | ![P2 school coverage](docs/screenshots/p2-coverage-school.png) | ![P2 needs inspector](docs/screenshots/p2-needs-inspector.png) | ![P2 services](docs/screenshots/p2-services-tab.png) |
 
+### Milestone P3 — public transit (buses)
+
+Bus stops anchored to road geometry, looped lines with fleet and fare controls, buses dispatched on directed berths with dwell and FIFO boarding, citizens choosing walk/car/bus by estimated travel time (headway learned from completed runs), fares and bus upkeep in the budget, trip statistics by mode, transit overlay and line panel. Plus a performance pass: 10,000 commuting citizens run at ~290 simulation ticks/s on the test host.
+
+| Transit overlay | Line panel |
+|---|---|
+| ![P3 transit overlay](docs/screenshots/p3-transit-overlay.png) | ![P3 transit lines](docs/screenshots/p3-transit-lines.png) |
+
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
 ## How to play
