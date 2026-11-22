@@ -211,7 +211,7 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         "economy_loop two-day totals: {total_filled}/{total_due} baskets filled, \
          {food_stockout:.3} food stockout hours/resident-day, {outings:.3} outings/resident-day, \
          {units:.3} units/resident-day, {total_groceries} grocery units; failed attempts {failures:?}; \
-         cumulative household losses {:?}, seller write-offs {:?}",
+         cumulative household losses {:?}, seller write-offs (shelves, freight and removed companies) {:?}",
         market.household_losses(),
         market.seller_losses(),
     );

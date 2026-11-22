@@ -315,6 +315,14 @@ impl Map {
             .get_or_init(|| super::reachability::DrivingReachability::build(self))
             .can_reach(start, end)
     }
+
+    /// Labels the driving component of a lane. Lanes with the same label reach
+    /// each other both ways. Labels last until the lane topology changes.
+    pub(crate) fn driving_component(&self, lane: LaneID) -> Option<usize> {
+        self.driving_reachability
+            .get_or_init(|| super::reachability::DrivingReachability::build(self))
+            .cyclic_component(lane)
+    }
 }
 
 #[cfg(test)]

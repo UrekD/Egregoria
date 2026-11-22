@@ -64,6 +64,13 @@ impl DrivingReachability {
         Self { lanes, components }
     }
 
+    /// The lane's strongly connected component, if a route via one or more
+    /// turns leads from every lane in it to every other, itself included.
+    pub(super) fn cyclic_component(&self, lane: LaneID) -> Option<usize> {
+        let component = self.lanes.get(lane)?.component;
+        self.components[component].cyclic.then_some(component)
+    }
+
     /// Returns false only when no route via one or more turns exists.
     pub(super) fn can_reach(&self, start: LaneID, end: LaneID) -> bool {
         let Some((from, to)) = self.lanes.get(start).zip(self.lanes.get(end)) else {

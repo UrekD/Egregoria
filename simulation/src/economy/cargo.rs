@@ -11,7 +11,9 @@
 //! Blocked routes release their stock first. A live station can then handle a
 //! separate virtual trade. Cancellation never posts an import or export.
 //! An outbound leg that keeps failing in the router suspends its route until the
-//! cooldown ends or the road network changes, so the stock can take another lane.
+//! cooldown ends or the road network changes. While the consumer is still in
+//! reach, its source keeps the reorder on hand, so only stock an open route
+//! would leave over takes another lane.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -25,7 +27,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Budget, BudgetCategory, EcoStats, FreightDay, Market, Trade, TradeTarget, TICKS_PER_BUDGET_DAY,
 };
-use crate::map::{BuildingID, LaneID, LaneKind, Map, PathKind, RoadID};
+use crate::map::{BuildingID, LaneKind, Map, PathKind, RoadID};
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, ParkingManagement};
 use crate::souls::desire::WorkKind;
@@ -339,7 +341,14 @@ impl CargoBook {
     ) {
         let (world, resources) = sim.world_res();
         let mut book = resources.write::<CargoBook>();
-        if book.policies.insert(company, policy) == Some(policy) {
+        // Compare with the policy in effect, which may be the prototype default.
+        let current = world
+            .companies
+            .get(company)
+            .and_then(|entity| entity.comp.proto.prototype().storage.as_ref())
+            .map(|storage| book.warehouse_policy(company, storage));
+        book.policies.insert(company, policy);
+        if current == Some(policy) {
             return;
         }
         let exports = |source: Endpoint, dest: Endpoint| {
@@ -411,12 +420,22 @@ impl CargoBook {
     /// A road route that matching may use: both ends reach the same driving
     /// component from their parking, and the route is not suspended.
     fn physical_route(&mut self, map: &Map, from: Endpoint, to: Endpoint, now: u64) -> bool {
-        let suspended = self.suspended.get(&(from, to)).is_some_and(|route| {
+        !self.is_suspended(map, from, to, now)
+            && self.routes.reaches(map, from.building, to.building)
+    }
+
+    /// A reachable route whose outbound leg gave up and is cooling down.
+    fn held_route(&mut self, map: &Map, from: Endpoint, to: Endpoint, now: u64) -> bool {
+        self.is_suspended(map, from, to, now)
+            && self.routes.reaches(map, from.building, to.building)
+    }
+
+    fn is_suspended(&self, map: &Map, from: Endpoint, to: Endpoint, now: u64) -> bool {
+        self.suspended.get(&(from, to)).is_some_and(|route| {
             now < route.until
                 && route.topology == map.walking_topology_generation
                 && route.roads == connected_roads(map, from, to)
-        });
-        !suspended && self.routes.reaches(map, from.building, to.building)
+        })
     }
 
     fn suspend_route(&mut self, map: &Map, from: Endpoint, to: Endpoint, now: u64) {
@@ -482,18 +501,17 @@ pub(crate) fn uses_road_freight(
 /// Where a truck parks to serve a building, and the driving component it joins.
 #[derive(Clone, Copy)]
 struct ParkingAccess {
-    component: LaneID,
+    component: usize,
     drive_pos: geom::Vec3,
 }
 
 /// Road reachability for freight, derived from the map and rebuilt when the
-/// lane topology changes. Reachability compares strongly connected driving
-/// components, so it never runs a route search. Driven lengths, which only
-/// warehouses compare, take one search per ordered pair.
+/// lane topology changes. Reachability compares the map's strongly connected
+/// driving components, so it never runs a route search. Driven lengths, which
+/// only warehouses compare, take one search per ordered pair.
 #[derive(Default)]
 struct RouteCache {
     revision: (u64, u64),
-    components: Option<BTreeMap<LaneID, LaneID>>,
     // Keyed by the building's road connection, which can change without a
     // lane topology change.
     access: BTreeMap<BuildingID, (Option<RoadID>, Option<ParkingAccess>)>,
@@ -534,9 +552,6 @@ impl RouteCache {
             }
             self.forget(id);
         }
-        let components = self
-            .components
-            .get_or_insert_with(|| driving_components(map));
         let access = (|| {
             let connected = map.get(road?)?;
             let spot = ParkingManagement::default()
@@ -544,10 +559,10 @@ impl RouteCache {
                 .ok()?;
             let drive_pos = spot.park_pos(map)?;
             let lane = map.nearest_lane(drive_pos, LaneKind::Driving, None)?;
-            let component = *components.get(&lane)?;
+            let component = map.driving_component(lane)?;
             connected
                 .lanes_iter()
-                .any(|(lane, _)| components.get(&lane) == Some(&component))
+                .any(|(lane, _)| map.driving_component(lane) == Some(component))
                 .then_some(ParkingAccess {
                     component,
                     drive_pos,
@@ -583,85 +598,6 @@ impl RouteCache {
         self.distances.insert((from, to), distance);
         distance
     }
-}
-
-/// Labels each driving or bus lane with the smallest lane of its strongly
-/// connected component. Iterative Kosaraju, in lane order for determinism.
-fn driving_components(map: &Map) -> BTreeMap<LaneID, LaneID> {
-    let drivable = |kind| matches!(kind, LaneKind::Driving | LaneKind::Bus);
-    let lanes: Vec<LaneID> = map
-        .lanes()
-        .iter()
-        .filter(|(_, lane)| drivable(lane.kind))
-        .map(|(id, _)| id)
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let index: BTreeMap<_, _> = lanes.iter().enumerate().map(|(i, &id)| (id, i)).collect();
-    let mut forward = vec![Vec::new(); lanes.len()];
-    let mut reverse = vec![Vec::new(); lanes.len()];
-    for (src, &lane) in lanes.iter().enumerate() {
-        let Some(intersection) = map.intersections().get(map.lanes()[lane].dst) else {
-            continue;
-        };
-        for (turn, _) in intersection.turns_from(lane) {
-            if let Some(&dst) = index.get(&turn.dst) {
-                forward[src].push(dst);
-                reverse[dst].push(src);
-            }
-        }
-    }
-
-    let mut visited = vec![false; lanes.len()];
-    let mut finished = Vec::with_capacity(lanes.len());
-    for root in 0..lanes.len() {
-        if visited[root] {
-            continue;
-        }
-        visited[root] = true;
-        let mut stack = vec![(root, 0)];
-        while let Some(top) = stack.last_mut() {
-            let node = top.0;
-            if let Some(&next) = forward[node].get(top.1) {
-                top.1 += 1;
-                if !visited[next] {
-                    visited[next] = true;
-                    stack.push((next, 0));
-                }
-            } else {
-                stack.pop();
-                finished.push(node);
-            }
-        }
-    }
-
-    let mut label = vec![usize::MAX; lanes.len()];
-    for &root in finished.iter().rev() {
-        if label[root] != usize::MAX {
-            continue;
-        }
-        let mut members = vec![root];
-        label[root] = root;
-        let mut pending = vec![root];
-        while let Some(node) = pending.pop() {
-            for &prev in &reverse[node] {
-                if label[prev] == usize::MAX {
-                    label[prev] = root;
-                    members.push(prev);
-                    pending.push(prev);
-                }
-            }
-        }
-        let smallest = *members.iter().min().unwrap();
-        for member in members {
-            label[member] = smallest;
-        }
-    }
-    lanes
-        .iter()
-        .enumerate()
-        .map(|(i, &lane)| (lane, lanes[label[i]]))
-        .collect()
 }
 
 fn vehicle_distance(map: &Map, start: geom::Vec3, end: geom::Vec3) -> Option<OrderedFloat<f32>> {
@@ -880,14 +816,8 @@ impl Matching<'_> {
             .saturating_sub(stock.saturating_add(self.incoming((input.destination, item))))
     }
 
-    fn reserve_for_input(
-        &mut self,
-        policy: DispatchPolicy,
-        source: Endpoint,
-        input: Input,
-        item: ItemID,
-        available: u32,
-    ) -> u32 {
+    /// Units of `available` a reorder for the input would take now.
+    fn wanted(&self, policy: DispatchPolicy, input: Input, item: ItemID, available: u32) -> u32 {
         let key = (input.destination, item);
         let pending = self.queued.get(&key).copied().unwrap_or(0);
         let stock = on_hand(self.market, input.destination, item);
@@ -896,7 +826,18 @@ impl Matching<'_> {
         if pending == 0 && deficit < policy.minimum && stock >= input.amount {
             return 0;
         }
-        let units = deficit.min(available);
+        deficit.min(available)
+    }
+
+    fn reserve_for_input(
+        &mut self,
+        policy: DispatchPolicy,
+        source: Endpoint,
+        input: Input,
+        item: ItemID,
+        available: u32,
+    ) -> u32 {
+        let units = self.wanted(policy, input, item, available);
         if units > 0 {
             self.queue(source, input.destination, ItemQuantity { item, units });
         }
@@ -905,6 +846,12 @@ impl Matching<'_> {
 
     fn route(&mut self, from: Endpoint, to: Endpoint) -> bool {
         self.book.physical_route(self.map, from, to, self.now)
+    }
+
+    /// A suspended route that still reaches its consumer. Its reorder stays
+    /// on hand, so a failure that may be passing does not export it.
+    fn held_route(&mut self, from: Endpoint, to: Endpoint) -> bool {
+        self.book.held_route(self.map, from, to, self.now)
     }
 
     fn road_distance(&mut self, from: Endpoint, to: Endpoint) -> Option<OrderedFloat<f32>> {
@@ -983,6 +930,10 @@ impl Matching<'_> {
             });
             for input in candidates {
                 let Some(distance) = self.road_distance(source, input.destination) else {
+                    if self.held_route(source, input.destination) {
+                        used_locally.insert(item);
+                        *available -= self.wanted(policy, input, item, *available);
+                    }
                     continue;
                 };
                 used_locally.insert(item);
@@ -1320,14 +1271,19 @@ fn match_shipments(
             });
             let mut local = false;
             for input in candidates {
-                if !matching.route(source, input.destination) {
+                let open = matching.route(source, input.destination);
+                if !open && !matching.held_route(source, input.destination) {
                     continue;
                 }
                 local = true;
                 if !has_driver {
                     break;
                 }
-                available -= matching.reserve_for_input(policy, source, input, item, available);
+                available -= if open {
+                    matching.reserve_for_input(policy, source, input, item, available)
+                } else {
+                    matching.wanted(policy, input, item, available)
+                };
                 if available == 0 {
                     break;
                 }
@@ -1890,22 +1846,27 @@ fn release(
     }
 }
 
-/// A route error, or a failed reroute of the driver or of the truck they ride.
+/// A route error, or the driver or the truck they ride waiting for a reroute.
+/// The wait between reroute attempts counts down to zero for a tick before
+/// each attempt, so the whole wait counts until a route is found.
 fn routing_failed(human: &HumanEnt, vehicle: &crate::VehicleEnt, truck: VehicleID) -> bool {
-    let rerouting = |it: &Itinerary| it.is_wait_for_reroute().is_some_and(|wait| wait > 0);
+    let rerouting = |it: &Itinerary| it.is_wait_for_reroute().is_some();
     human.router.last_error.is_some()
         || rerouting(&human.it)
         || (human.location == Location::Vehicle(truck) && rerouting(&vehicle.it))
 }
 
-/// Follows empty trucks home. A return leg that keeps failing, or outlasts a
-/// delivery window, gives the truck back to its depot and frees the driver.
+/// Follows empty trucks home. A return leg that keeps failing, outlasts a
+/// delivery window or loses its driver gives the truck back to its depot and
+/// frees the driver.
 fn track_returns(book: &mut CargoBook, world: &World, resources: &Resources, now: u64) {
     let mut stranded = Vec::new();
     book.returning.retain(|&truck, trip| {
-        let (Some(human), Some(vehicle)) =
-            (world.humans.get(trip.driver), world.vehicles.get(truck))
-        else {
+        let Some(vehicle) = world.vehicles.get(truck) else {
+            return false;
+        };
+        let Some(human) = world.humans.get(trip.driver) else {
+            stranded.push((trip.driver, truck));
             return false;
         };
         let still_assigned = human.work.as_ref().is_some_and(|work| {
@@ -1915,7 +1876,12 @@ fn track_returns(book: &mut CargoBook, world: &World, resources: &Resources, now
         });
         let home = human.location == Location::Building(trip.depot.building)
             && vehicle.vehicle.state.is_parked();
-        if !still_assigned || home {
+        if home {
+            return false;
+        }
+        if !still_assigned {
+            // Nobody drives the truck back, so it is recalled.
+            stranded.push((trip.driver, truck));
             return false;
         }
         let homebound =
@@ -3089,7 +3055,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn e2fix_outbound_router_errors_retry_before_cancelling_then_use_the_station() {
+    fn e2fix_outbound_router_errors_retry_before_cancelling_then_suspend_the_route() {
         use crate::map_dynamic::ParkingReserveError;
 
         let mut f = Fixture::new();
@@ -3122,14 +3088,15 @@ mod lifecycle_tests {
         f.update(start + 30 * TICKS_PER_MINUTE);
         assert_eq!((f.manifest_units(), f.hand(f.source)), (0, 16));
 
-        // The failing route is not reserved again. The batch uses the station.
+        // The failing route is not reserved again. The plant still needs the
+        // batch, so it stays at the mine instead of leaving by rail.
         set_router(&mut f, truck, destination, None);
         f.update(FREIGHT_MATCH_INTERVAL + 31 * TICKS_PER_MINUTE);
         assert_eq!(
             (f.manifest_units(), f.reserved(), f.hand(f.source)),
-            (0, 0, 0)
+            (0, 0, 16)
         );
-        assert_eq!(f.ctx.g.get(station).unwrap().f.waiting_cargo, 16);
+        assert_eq!(f.ctx.g.get(station).unwrap().f.waiting_cargo, 0);
     }
 
     #[test]
@@ -3677,5 +3644,245 @@ mod lifecycle_tests {
             2,
             "the station fills the store once no truck is coming",
         );
+    }
+
+    /// Ticks until the driver rides the loaded truck on its planned route, and
+    /// returns where that route ends.
+    fn drive_off(f: &mut Fixture) -> geom::Vec3 {
+        for _ in 0..5_000 {
+            f.ctx.tick_fast();
+            let world = f.ctx.g.world();
+            let riding = world.humans[f.driver].location == Location::Vehicle(f.truck);
+            if let Some(end) = world.vehicles[f.truck].it.end_pos().filter(|_| riding) {
+                return end;
+            }
+        }
+        panic!("the driver never drove off in the truck");
+    }
+
+    fn suspend(f: &mut Fixture, from: Endpoint, to: Endpoint, now: u64) {
+        let map = f.ctx.g.map();
+        f.ctx
+            .g
+            .write::<CargoBook>()
+            .suspend_route(&map, from, to, now);
+    }
+
+    /// Unloads at the plant and leaves the driver there, so the empty return
+    /// is still being tracked.
+    fn unload_and_stay(f: &mut Fixture) -> u64 {
+        let (driver, truck, destination) = (f.driver, f.truck, f.destination.building);
+        let token = f.token();
+        f.ctx
+            .g
+            .write::<CargoBook>()
+            .loads
+            .get_mut(&token)
+            .unwrap()
+            .used_truck = true;
+        {
+            let human = &mut f.ctx.g.world_mut_unchecked().humans[driver];
+            human.location = Location::Building(destination);
+            human.router.use_vehicle(Some(truck));
+        }
+        assert!(complete_delivery(&mut f.ctx.g, token, driver, truck, destination).is_ok());
+        assert!(f.ctx.g.read::<CargoBook>().returning.contains_key(&truck));
+        elapsed_ticks(&f.ctx.g.resources).0
+    }
+
+    #[test]
+    fn e2fix2_a_real_failed_reroute_gives_up_after_the_retry_window() {
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let token = f.token();
+        let end = drive_off(&mut f);
+
+        // A road edit leaves the truck on a fragment that cannot reach the
+        // plant, while the mine and the plant still reach each other.
+        f.ctx
+            .build_roads(&[vec3(700.0, 700.0, 0.0), vec3(900.0, 700.0, 0.0)]);
+        let fragment = {
+            let map = f.ctx.g.map();
+            let (_, road) = map
+                .roads()
+                .iter()
+                .find(|(_, road)| road.points().first().x >= 700.0)
+                .unwrap();
+            road.points().first().lerp(road.points().last(), 0.5)
+        };
+        {
+            let truck = &mut f.ctx.g.world_mut_unchecked().vehicles[f.truck];
+            truck.trans.pos = fragment;
+            truck.it = Itinerary::wait_for_reroute(PathKind::Vehicle, end);
+        }
+        let mut retried = false;
+        for _ in 0..ROUTING_RETRY_WINDOW + 2 * FREIGHT_MATCH_INTERVAL {
+            f.ctx.tick_fast();
+            if !f.ctx.g.read::<CargoBook>().loads.contains_key(&token) {
+                break;
+            }
+            retried |= f.ctx.g.world().vehicles[f.truck]
+                .it
+                .is_wait_for_reroute()
+                .is_some_and(|wait| wait > 0);
+        }
+        assert!(retried, "the router really tried and failed to reroute");
+        let book = f.ctx.g.read::<CargoBook>();
+        assert!(
+            !book.loads.contains_key(&token),
+            "a reroute that keeps failing gives up within the retry window"
+        );
+        assert!(book.suspended.contains_key(&(f.source, f.destination)));
+    }
+
+    #[test]
+    fn e2fix2_recovering_an_empty_truck_leaves_the_drivers_other_trip_alone() {
+        use crate::souls::human::HumanDecisionKind;
+
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let started = unload_and_stay(&mut f);
+        let elsewhere = f.ctx.build_house_near(vec2(100.0, 380.0));
+        {
+            let human = &mut f.ctx.g.world_mut_unchecked().humans[f.driver];
+            let personal = human.router.personal_car;
+            human.router.use_vehicle(personal);
+            human.router.go_to(Destination::Building(elsewhere));
+            human.decision.kind = HumanDecisionKind::GoTo(Destination::Building(elsewhere));
+        }
+        // The return outlasts a delivery window, so the truck is recovered.
+        f.update(started + DELIVERY_EXPIRY);
+        drain_commands(&mut f);
+        assert!(f.ctx.g.read::<CargoBook>().returning.is_empty());
+        let human = &f.ctx.g.world().humans[f.driver];
+        assert_eq!(
+            human.router.target_dest,
+            Some(Destination::Building(elsewhere)),
+            "an unrelated trip is not cancelled"
+        );
+        assert!(matches!(
+            human.decision.kind,
+            HumanDecisionKind::GoTo(Destination::Building(id)) if id == elsewhere
+        ));
+    }
+
+    #[test]
+    fn e2fix2_a_return_without_its_driver_brings_the_truck_back_to_the_depot() {
+        for reason in ["despawned", "reassigned"] {
+            let mut f = Fixture::new();
+            f.seed(16, 1);
+            f.update(FREIGHT_MATCH_INTERVAL);
+            let started = unload_and_stay(&mut f);
+            let (driver, truck) = (f.driver, f.truck);
+            let plant_door = f.ctx.g.map().buildings()[f.destination.building].door_pos;
+            // The empty truck is parked at the plant.
+            f.ctx.g.world_mut_unchecked().vehicles[truck].trans.pos = plant_door;
+            match reason {
+                "despawned" => {
+                    crate::souls::lifecycle::despawn_human(&mut f.ctx.g, driver);
+                    drain_commands(&mut f);
+                    assert!(f.ctx.g.get(driver).is_none());
+                }
+                "reassigned" => {
+                    f.ctx.g.world_mut_unchecked().humans[driver]
+                        .work
+                        .as_mut()
+                        .unwrap()
+                        .kind = WorkKind::Worker;
+                }
+                _ => unreachable!(),
+            }
+            f.update(started + 1);
+            drain_commands(&mut f);
+            assert!(f.ctx.g.read::<CargoBook>().returning.is_empty(), "{reason}");
+            let SoulID::GoodsCompany(mine) = f.source.soul else {
+                unreachable!()
+            };
+            let depot_door = f.ctx.g.map().buildings()[f.source.building].door_pos;
+            let fleet = f.ctx.g.world().companies[mine].comp.trucks.clone();
+            assert_eq!(fleet.len(), 1, "{reason}");
+            let at_depot = f.ctx.g.get(fleet[0]).is_some_and(|vehicle| {
+                vehicle.trans.pos.distance(depot_door) <= crate::map_dynamic::NEAR_PARKING_RADIUS
+            });
+            assert!(at_depot, "{reason}: the truck is back at its depot");
+        }
+    }
+
+    #[test]
+    fn e2fix2_a_suspended_route_keeps_the_consumers_stock_back() {
+        let mut f = Fixture::new();
+        let terminal = station(&mut f, false);
+        let SoulID::FreightStation(station_id) = terminal.soul else {
+            unreachable!()
+        };
+        let policy = mine_policy();
+        // The plant could take this much if its route were open.
+        let wanted = plant_target(&f) as u32 - 1;
+        let surplus = 16;
+        f.seed((wanted + policy.capacity + surplus) as i32, 1);
+        let (source, destination) = (f.source, f.destination);
+        suspend(&mut f, source, destination, 0);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(f.reserved(), 0, "a suspended route is not reserved");
+        assert_eq!(
+            f.ctx.g.get(station_id).unwrap().f.waiting_cargo,
+            surplus,
+            "only stock an open route would leave over is exported"
+        );
+        assert_eq!(f.hand(f.source) as u32, wanted + policy.capacity);
+
+        // A depot keeps a locally used item below its high watermark.
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        warehouse_driver(&mut f, depot);
+        let terminal = station(&mut f, true);
+        let target = plant_target(&f);
+        f.seed(0, target);
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(depot.soul, Fixture::coal(), 40);
+        let destination = f.destination;
+        suspend(&mut f, depot, destination, 0);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(incoming(&f, terminal.building, Fixture::coal()), 0);
+        assert_eq!(f.hand(depot), 40);
+    }
+
+    #[test]
+    fn e2fix2_setting_the_default_policy_explicitly_keeps_queued_exports() {
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        let (driver, _) = warehouse_driver(&mut f, depot);
+        // The driver is away, so the export stays queued at the dock.
+        f.ctx.g.world_mut_unchecked().humans[driver].location = Location::Outside;
+        let terminal = station(&mut f, true);
+        let flour = ItemID::new("flour");
+        f.ctx.g.write::<Market>().produce(depot.soul, flour, 40);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let queued = |f: &Fixture| {
+            f.ctx
+                .g
+                .read::<CargoBook>()
+                .shipments
+                .values()
+                .filter(|s| s.destination == terminal)
+                .count()
+        };
+        assert_eq!(queued(&f), 1);
+        let default = GoodsCompanyID::new("small-depot")
+            .prototype()
+            .storage
+            .as_ref()
+            .unwrap()
+            .default_policy;
+        f.ctx.apply(&[WorldCommand::SetWarehousePolicy {
+            building: depot.building,
+            policy: default,
+        }]);
+        assert_eq!(queued(&f), 1, "an unchanged policy withdraws nothing");
+        assert_eq!(f.ctx.g.read::<Market>().capital(depot.soul, flour), 24);
     }
 }

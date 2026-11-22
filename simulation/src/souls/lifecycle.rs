@@ -813,13 +813,17 @@ pub(crate) fn abort_freight_trip(
     recall_truck(sim, truck, used_truck);
 }
 
-/// Frees a driver whose empty return leg kept failing and brings the truck
-/// back to its depot. A truck parked away from the depot is replaced there.
+/// Brings an empty truck back to its depot when its return leg kept failing or
+/// its driver left. A driver still on a trip with the truck is freed; any other
+/// trip of theirs goes on. A truck parked away from the depot is replaced there.
 pub(crate) fn recover_empty_truck(sim: &mut Simulation, driver: HumanID, truck: VehicleID) {
     if sim.read::<CargoBook>().manifest_for(truck).is_some() {
         return;
     }
-    stop_freight_driver(sim, driver, truck, |_| true);
+    stop_freight_driver(sim, driver, truck, |human| {
+        human.router.selected_vehicle() == Some(truck)
+            || human.decision.kind.references_vehicle(truck)
+    });
     let depot = truck_company(sim, truck).and_then(|company| {
         sim.map()
             .get(sim.get(company)?.comp.building)

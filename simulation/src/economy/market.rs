@@ -645,6 +645,8 @@ impl Market {
         }
     }
 
+    /// Writes off freight stock whose owner is gone: a cancelled load or queued
+    /// batch of a removed source, or the on-hand stock of a removed company.
     pub(crate) fn record_freight_loss(&mut self, item: ItemID, units: u32) {
         *self.seller_losses.entry(item).or_default() += u64::from(units);
     }
@@ -1441,6 +1443,11 @@ impl Market {
         }
     }
 
+    /// Units written off by sellers, per item: shelf overflow and removed shelves,
+    /// uncollected pickups, freight cancelled after its source was removed, and
+    /// the recipe and storage stock of every removed company. Industrial items
+    /// therefore include stock lost to demolition and growth churn, not only
+    /// freight losses.
     pub fn seller_losses(&self) -> &BTreeMap<ItemID, u64> {
         &self.seller_losses
     }
