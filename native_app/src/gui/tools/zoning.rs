@@ -11,7 +11,7 @@ use goryak::{
     padxy, selectable_label_primary, textc, tooltip,
 };
 use simulation::economy::progression::{can_build, BuildCapability, LockedUntil};
-use simulation::map::{Density, ZoneGrid, ZoneKind, ZONE_CELL_SIZE};
+use simulation::map::{Density, LotLayout, ZoneGrid, ZoneKind, ZONE_CELL_SIZE};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 use std::sync::Arc;
@@ -29,6 +29,19 @@ pub const ZONES: [ZoneKind; 4] = [
 
 const MAX_BRUSH_RADIUS: u8 = 5;
 const DENSITIES: [Density; 3] = [Density::Low, Density::Medium, Density::High];
+const LOT_LAYOUTS: [(LotLayout, &str, &str); 2] = [
+    (
+        LotLayout::Varied,
+        "Varied",
+        "Plots of 20, 30 and 40 m mixed along each road",
+    ),
+    (
+        LotLayout::Uniform,
+        "Uniform",
+        "30 m plots that line up evenly along both sides of each road",
+    ),
+];
+const LOT_LAYOUT_NOTE: &str = "Switching redraws empty plots; buildings and zoning stay";
 
 pub fn zone_name(zone: ZoneKind) -> &'static str {
     match zone {
@@ -69,6 +82,7 @@ pub struct ZoningState {
     over_controls: bool,
     overlay_grid: Option<(u64, Arc<ZoneGrid>)>,
     preview_areas: Vec<OBB>,
+    lot_layout: LotLayout,
 }
 
 impl Default for ZoningState {
@@ -85,6 +99,7 @@ impl Default for ZoningState {
             over_controls: false,
             overlay_grid: None,
             preview_areas: Vec::new(),
+            lot_layout: LotLayout::default(),
         }
     }
 }
@@ -156,6 +171,23 @@ fn density_picker(state: &mut ZoningState, kind: ZoneKind) {
     }
 }
 
+/// "Plots: Varied | Uniform" buttons. `select` runs when a different layout is clicked.
+pub(crate) fn lot_layout_picker(current: LotLayout, mut select: impl FnMut(LotLayout)) {
+    minrow(5.0, || {
+        textc(on_secondary_container(), "Plots:");
+        for (layout, label, hint) in LOT_LAYOUTS {
+            if tooltip(format!("{hint}. {LOT_LAYOUT_NOTE}."), || {
+                selectable_label_primary(current == layout, label)
+            })
+            .clicked
+                && current != layout
+            {
+                select(layout);
+            }
+        }
+    });
+}
+
 pub fn properties(uiworld: &UiWorld) {
     let narrow = uiworld.camera().camera.viewport_w < 830.0 * uiworld.read::<Settings>().gui_scale;
     let brush_hint = |state: &ZoningState| {
@@ -206,6 +238,10 @@ pub fn properties(uiworld: &UiWorld) {
                 if !state.rectangle && narrow {
                     brush_hint(&state);
                 }
+                lot_layout_picker(state.lot_layout, |layout| {
+                    state.lot_layout = layout;
+                    uiworld.commands().push(WorldCommand::SetLotLayout(layout));
+                });
             });
         });
     })
@@ -230,6 +266,7 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         return;
     }
     state.refresh_density_locks(sim);
+    state.lot_layout = sim.map().lot_layout();
 
     let input = uiworld.read::<InputMap>();
     let camera = uiworld.camera();

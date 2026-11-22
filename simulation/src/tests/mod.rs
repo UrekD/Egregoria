@@ -23,6 +23,7 @@ mod p5_placement;
 mod p5_spine_followups;
 mod test_iso;
 mod vehicles;
+mod zone2_lot_layout;
 
 fn init_test_simulation() {
     // SAFETY: Simulation unit tests run serially because they replace the global registry.

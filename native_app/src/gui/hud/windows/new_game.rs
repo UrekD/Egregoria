@@ -3,6 +3,7 @@ use goryak::{
     selectable_label_primary, text_edit, textc,
 };
 use simulation::economy::progression::ProgressionMode;
+use simulation::map::LotLayout;
 use simulation::{MapPreset, NewGameOptions, Simulation};
 
 use super::{self as session, PreparedWorld, SessionUi, WorldJobKind, WorldReplacement};
@@ -16,6 +17,7 @@ pub(super) struct NewGameForm {
     money: String,
     preset: MapPreset,
     progression: ProgressionMode,
+    lot_layout: LotLayout,
     advanced: bool,
     record_replay: bool,
     error: Option<&'static str>,
@@ -66,6 +68,7 @@ impl NewGameForm {
             terrain_chunks,
             starting_money_bucks,
             progression: self.progression,
+            lot_layout: self.lot_layout,
         })
     }
 }
@@ -98,6 +101,11 @@ pub(super) fn render(uiw: &UiWorld) {
                 form.progression = mode;
             }
         }
+    });
+
+    textc(on_secondary_container(), "Plots");
+    crate::gui::zoning::lot_layout_picker(form.lot_layout, |layout| {
+        form.lot_layout = layout;
     });
 
     textc(on_secondary_container(), "Seed (0 uses legacy generation)");

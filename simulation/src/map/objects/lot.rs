@@ -15,6 +15,19 @@ pub enum LotKind {
     Residential,
 }
 
+/// How new lots are sized along roads. Built lots keep the shape they were built on.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LotLayout {
+    /// A deterministic mix of 20, 30 and 40 m lots.
+    #[default]
+    Varied,
+    /// Every lot is `UNIFORM_LOT_SIZE` square, so lots line up along both sides of a road.
+    Uniform,
+}
+
+/// The middle of the varied mix and the smallest lot every growable fits on (900 m²).
+pub const UNIFORM_LOT_SIZE: f32 = 30.0;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lot {
     pub id: LotID,
@@ -114,12 +127,16 @@ impl Lot {
             let r1 = r.points.first().x + r.points.last().x;
             let r2 = r.points.last().y + r.points.first().y;
             let r3 = side * r.length();
-            let mut picksize = || {
-                ri += 1.0;
-                match (common::rand::rand4(r1, r2, r3, ri) * 3.0) as usize {
-                    0 => 20.0,
-                    1 => 30.0,
-                    _ => 40.0,
+            let layout = map.lot_layout;
+            let mut picksize = || match layout {
+                LotLayout::Uniform => UNIFORM_LOT_SIZE,
+                LotLayout::Varied => {
+                    ri += 1.0;
+                    match (common::rand::rand4(r1, r2, r3, ri) * 3.0) as usize {
+                        0 => 20.0,
+                        1 => 30.0,
+                        _ => 40.0,
+                    }
                 }
             };
 

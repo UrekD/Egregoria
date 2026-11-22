@@ -250,6 +250,24 @@ fn register_systems_and_resources() {
     register_resource_default::<ProgressionState, Bincode>("progression");
     register_resource_default::<CargoBook, Bincode>("cargo_book");
     register_resource_default::<DailyEconomyMetrics, Bincode>("daily_economy_metrics");
+    register_lot_layout();
+}
+
+// The layout lives on the map, which sizes lots as roads are built. A separate entry keeps the
+// map encoding unchanged, and saves from before the setting load with the varied layout.
+// Registered after "map" so loading overrides the decoded map's default.
+fn register_lot_layout() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "lot_layout",
+            optional: true,
+            save: Box::new(|sim| Bincode::encode(&sim.map().lot_layout).unwrap()),
+            load: Box::new(|sim, data| {
+                sim.map_mut().lot_layout = Bincode::decode(data)?;
+                Ok(())
+            }),
+        });
+    }
 }
 
 // Match flat_spatial::Grid's Bincode layout while ordering the storage cells by
@@ -275,6 +293,7 @@ fn register_transport_grid() {
         });
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "transport_grid",
+            optional: false,
             save: Box::new(|sim| {
                 let data = Bincode::encode(&*sim.read::<TransportGrid>()).unwrap();
                 let sorted: SavedTransportGrid = Bincode::decode(&data).unwrap();
@@ -294,6 +313,8 @@ pub struct InitFunc {
 
 pub(crate) struct SaveLoadFunc {
     pub name: &'static str,
+    /// Saves without this entry keep the value set by the init functions.
+    pub optional: bool,
     pub save: Box<dyn Fn(&Simulation) -> Vec<u8> + 'static>,
     pub load: Box<dyn Fn(&mut Simulation, &[u8]) -> std::io::Result<()> + 'static>,
 }
@@ -370,6 +391,7 @@ fn register_resource_noinit<T: 'static + Send + Sync + Serialize + DeserializeOw
     unsafe {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name,
+            optional: false,
             save: Box::new(move |uiworld| E::encode(&*uiworld.read::<T>()).unwrap()),
             load: Box::new(move |sim, data| {
                 sim.insert(E::decode::<T>(data)?);

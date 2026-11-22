@@ -127,6 +127,7 @@ fn osm_fixture_builds_routes_and_round_trips_a_slot() {
         terrain_chunks: 16,
         starting_money_bucks: 1_000_000,
         progression: simulation::economy::progression::ProgressionMode::FreeBuild,
+        lot_layout: simulation::map::LotLayout::Varied,
     };
     let build = || {
         let (mut sim, network) =

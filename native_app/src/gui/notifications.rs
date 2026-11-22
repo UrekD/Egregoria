@@ -591,6 +591,7 @@ fn command_label(command: &str) -> &'static str {
         "TransitSetVehicles" => "Set bus fleet size",
         "TransitSetFare" => "Set bus fare",
         "SetWarehousePolicy" => "Set warehouse policy",
+        "SetLotLayout" => "Change plot layout",
         _ => "City action",
     }
 }
@@ -724,6 +725,11 @@ mod tests {
     #[test]
     fn s5c_warehouse_policy_has_a_command_label() {
         assert_eq!(command_label("SetWarehousePolicy"), "Set warehouse policy");
+    }
+
+    #[test]
+    fn zone2_lot_layout_has_a_command_label() {
+        assert_eq!(command_label("SetLotLayout"), "Change plot layout");
     }
 
     #[test]

@@ -4,9 +4,9 @@ use crate::map::procgen::gen_exterior_house;
 use crate::map::reachability::DrivingReachability;
 use crate::map::{
     Building, BuildingID, BuildingKind, Environment, Intersection, IntersectionID, Lane, LaneID,
-    LaneKind, LanePattern, Lot, LotID, LotKind, MapSubscriber, MapSubscribers, ParkingSpotID,
-    ParkingSpots, ProjectFilter, ProjectKind, Road, RoadID, RoadSegmentKind, SpatialMap,
-    SubscriberChunkID, TerraformKind, UpdateType, Zone, ROAD_Z_OFFSET,
+    LaneKind, LanePattern, Lot, LotID, LotKind, LotLayout, MapSubscriber, MapSubscribers,
+    ParkingSpotID, ParkingSpots, ProjectFilter, ProjectKind, Road, RoadID, RoadSegmentKind,
+    SpatialMap, SubscriberChunkID, TerraformKind, UpdateType, Zone, ROAD_Z_OFFSET,
 };
 use geom::OBB;
 use geom::{PolyLine3, Vec2, Vec3};
@@ -73,6 +73,8 @@ pub struct Map {
     pub(super) driving_reachability: OnceLock<DrivingReachability>,
     // Imported networks reserve usable lane length when rebuilding junction geometry.
     pub(super) import_lane_reserve: bool,
+    // Saved as its own `lot_layout` entry so the map's encoding is unchanged.
+    pub(crate) lot_layout: LotLayout,
 
     pub electricity: ElectricityCache,
     pub environment: Environment,
@@ -115,6 +117,7 @@ impl Clone for Map {
             lot_origins: self.lot_origins.clone(),
             walking_topology_generation: self.walking_topology_generation,
             import_lane_reserve: self.import_lane_reserve,
+            lot_layout: self.lot_layout,
             electricity: self.electricity.clone(),
             environment: self.environment.clone(),
             parking: self.parking.clone(),
@@ -145,6 +148,7 @@ impl Map {
             walking_topology_generation: 0,
             driving_reachability: OnceLock::new(),
             import_lane_reserve: false,
+            lot_layout: LotLayout::default(),
             electricity: Default::default(),
             override_subscriber: subscribers.subscribe(UpdateType::Road | UpdateType::Building),
             subscribers,
@@ -676,6 +680,31 @@ impl Map {
         }
 
         Some(road)
+    }
+
+    pub fn lot_layout(&self) -> LotLayout {
+        self.lot_layout
+    }
+
+    /// Sizes later lots with `layout`. A change replaces the empty lots of every road with
+    /// frontage, built or not. Buildings, their lot origins and zoning paint stay unchanged.
+    pub fn set_lot_layout(&mut self, layout: LotLayout) {
+        if self.lot_layout == layout {
+            return;
+        }
+        info!("set_lot_layout {:?}", layout);
+        self.lot_layout = layout;
+
+        let mut frontage: BTreeSet<RoadID> = self.lots.values().map(|lot| lot.parent).collect();
+        frontage.extend(self.lot_origins.values().map(|origin| origin.parent_road));
+        frontage.retain(|&road| self.roads.contains_key(road));
+
+        let empty = self.lots.keys().map(ProjectKind::Lot).collect();
+        self.clean_lots_inner(empty);
+        for road in frontage {
+            Lot::generate_along_road(self, road);
+        }
+        self.check_invariants();
     }
 
     pub fn set_lot_kind(&mut self, lot: LotID, kind: LotKind) {

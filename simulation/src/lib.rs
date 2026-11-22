@@ -3,7 +3,7 @@
 #![warn(clippy::iter_over_hash_type)]
 
 use crate::init::{GSYSTEMS, INIT_FUNCS, SAVELOAD_FUNCS};
-use crate::map::{BuildingKind, Map};
+use crate::map::{BuildingKind, LotLayout, Map};
 use crate::map_dynamic::{transit, Itinerary, ItineraryLeader};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
@@ -138,6 +138,7 @@ pub struct NewGameOptions {
     pub terrain_chunks: u16,
     pub starting_money_bucks: u32,
     pub progression: ProgressionMode,
+    pub lot_layout: LotLayout,
 }
 
 impl NewGameOptions {
@@ -199,6 +200,7 @@ impl Default for NewGameOptions {
             terrain_chunks: legacy.terrain_size,
             starting_money_bucks: legacy.starting_money_bucks,
             progression: legacy.progression,
+            lot_layout: LotLayout::Varied,
         }
     }
 }
@@ -231,6 +233,7 @@ impl SimulationOptions {
             terrain_chunks: self.terrain_size,
             starting_money_bucks: self.starting_money_bucks,
             progression: self.progression,
+            lot_layout: LotLayout::Varied,
         }
     }
 
@@ -285,14 +288,17 @@ impl Simulation {
         save_replay: bool,
     ) -> Result<Self, NewGameError> {
         options.validate()?;
-        Ok(Self::new_with_options(SimulationOptions {
-            terrain_size: options.terrain_chunks,
-            save_replay,
-            preset: options.preset,
-            seed: options.seed,
-            starting_money_bucks: options.starting_money_bucks,
-            progression: options.progression,
-        }))
+        Ok(Self::new_with_lot_layout(
+            SimulationOptions {
+                terrain_size: options.terrain_chunks,
+                save_replay,
+                preset: options.preset,
+                seed: options.seed,
+                starting_money_bucks: options.starting_money_bucks,
+                progression: options.progression,
+            },
+            options.lot_layout,
+        ))
     }
 
     /// Creates a simulation and loader for a replay from the current version.
@@ -340,6 +346,10 @@ impl Simulation {
     }
 
     pub fn new_with_options(opts: SimulationOptions) -> Simulation {
+        Self::new_with_lot_layout(opts, LotLayout::Varied)
+    }
+
+    fn new_with_lot_layout(opts: SimulationOptions, lot_layout: LotLayout) -> Simulation {
         let mut sim = Simulation {
             world: Default::default(),
             resources: Default::default(),
@@ -366,8 +376,14 @@ impl Simulation {
                 }
             }
         }
+        // The layout is recorded with the starting commands, so replays bootstrap with it.
+        // The default needs no command, which keeps existing replays unchanged.
+        let layout =
+            (lot_layout != LotLayout::default()).then_some(WorldCommand::SetLotLayout(lot_layout));
         sim.apply_command_batch(
-            start_commands.iter().map(|(_, cmd)| cmd),
+            layout
+                .iter()
+                .chain(start_commands.iter().map(|(_, cmd)| cmd)),
             false,
             BudgetCategory::StarterInfrastructure,
         );
@@ -1114,10 +1130,12 @@ impl SimulationDeser {
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let data = self
-                    .res
-                    .get(l.name)
-                    .ok_or_else(|| format!("Missing resource {}", l.name))?;
+                let Some(data) = self.res.get(l.name) else {
+                    if l.optional {
+                        continue;
+                    }
+                    return Err(format!("Missing resource {}", l.name));
+                };
                 (l.load)(&mut sim, data)
                     .map_err(|error| format!("Could not decode resource {}: {error}", l.name))?;
             }

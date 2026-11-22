@@ -16,8 +16,8 @@ use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
     Building, BuildingID, BuildingKind, Density, Environment, IntersectionID, LaneID, LaneKind,
-    LanePattern, LanePatternBuilder, LightPolicy, LotID, Map, MapProject, ProjectKind, RoadID,
-    TerraformKind, TurnPolicy, Zone, ZoneGrid, ZoneKind,
+    LanePattern, LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, ProjectKind,
+    RoadID, TerraformKind, TurnPolicy, Zone, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
@@ -140,6 +140,8 @@ pub enum WorldCommand {
         building: BuildingID,
         policy: WarehousePolicy,
     },
+    /// Sizes new lots and regenerates the empty lots along every frontage road.
+    SetLotLayout(LotLayout),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -314,6 +316,7 @@ impl WorldCommand {
                 | TransitSetVehicles { .. }
                 | TransitSetFare { .. }
                 | SetWarehousePolicy { .. }
+                | SetLotLayout(_)
         )
     }
 
@@ -400,6 +403,7 @@ impl WorldCommand {
             TransitSetVehicles { .. } => "TransitSetVehicles",
             TransitSetFare { .. } => "TransitSetFare",
             SetWarehousePolicy { .. } => "SetWarehousePolicy",
+            SetLotLayout(_) => "SetLotLayout",
         };
         sim.write::<CommandOutcomes>().last.push((kind, reason));
     }
@@ -814,6 +818,7 @@ impl WorldCommand {
                 }
                 CargoBook::set_warehouse_policy(sim, company, policy);
             }
+            SetLotLayout(layout) => sim.map_mut().set_lot_layout(layout),
             Init(_) => return Err(Rejection::UnexpectedInit),
             UpdateZone { building, ref zone } => {
                 sim.map_mut()

@@ -84,6 +84,7 @@ impl Simulation {
             },
         )
         .map_err(|error| format!("import bootstrap: {error:?}"))?;
+        sim.map_mut().lot_layout = options.lot_layout;
         let network = import_network(&mut sim.map_mut(), city)?;
         sim.record_constructor_end();
         Ok((sim, network))
@@ -585,6 +586,7 @@ mod tests {
             terrain_chunks: 16,
             starting_money_bucks: 1_000_000,
             progression: crate::economy::progression::ProgressionMode::FreeBuild,
+            lot_layout: crate::map::LotLayout::Varied,
         };
         let (sim, report) = Simulation::from_imported_city(&city, &options).unwrap();
         let map = sim.map();

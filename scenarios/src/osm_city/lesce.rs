@@ -19,6 +19,7 @@ pub(super) const OPTIONS: NewGameOptions = NewGameOptions {
     terrain_chunks: 16,
     starting_money_bucks: 250_000,
     progression: simulation::economy::progression::ProgressionMode::FreeBuild,
+    lot_layout: simulation::map::LotLayout::Varied,
 };
 pub(super) const TARGET_OPENING_BEDS: usize = 2_900;
 pub(super) const OPENING_POPULATION: std::ops::RangeInclusive<usize> = 2_500..=3_500;
