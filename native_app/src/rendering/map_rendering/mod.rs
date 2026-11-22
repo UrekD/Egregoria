@@ -1,6 +1,8 @@
 use engine::heightmap::{GroundOverlayDisc, GroundOverlayImage};
 use engine::{Context, FrameContext, GfxContext, Water};
-use geom::{vec2, Camera, Circle, InfiniteFrustrum, Intersect3, LinearColor, AABB};
+#[cfg(feature = "debug-ground-overlay")]
+use geom::{vec2, LinearColor, AABB};
+use geom::{Camera, Circle, InfiniteFrustrum, Intersect3};
 use map_mesh::MapMeshHandler;
 use simulation::map::{Lane, LaneID, LaneKind, Map, ProjectFilter, ProjectKind, TrafficBehavior};
 use simulation::Simulation;
@@ -32,15 +34,18 @@ pub struct MapRenderOptions {
 impl MapRenderer {
     pub fn new(gfx: &mut GfxContext, sim: &Simulation) -> Self {
         defer!(log::info!("finished init of road render"));
-        let mut renderer = MapRenderer {
+        let renderer = MapRenderer {
             meshb: MapMeshHandler::new(gfx, sim),
             trees: TreesRender::new(gfx, &sim.map()),
             terrain: TerrainRender::new(gfx, sim),
             water: Water::new(gfx, sim.map().environment.bounds()),
             lamps: LampsRender::new(&sim.map()),
         };
-        if std::env::var_os("EGR_DEBUG_GROUND_OVERLAY").is_some() {
+        #[cfg(feature = "debug-ground-overlay")]
+        if std::env::var("EGR_DEBUG_GROUND_OVERLAY").as_deref() == Ok("1") {
+            let mut renderer = renderer;
             renderer.set_debug_ground_overlay(gfx, sim.map().environment.bounds());
+            return renderer;
         }
         renderer
     }
@@ -54,7 +59,8 @@ impl MapRenderer {
 
     /// Submit the atlas from the pre-terrain preparation hook, or clear it with `None`.
     /// Pass `mode_changed` for an immediate mode switch. Retry with the latest
-    /// image next frame if an ordinary refresh is throttled.
+    /// image next frame if an ordinary refresh is throttled. Returns false if
+    /// the submission is throttled or rejected.
     pub(crate) fn set_ground_overlay(
         &mut self,
         gfx: &mut GfxContext,
@@ -72,6 +78,7 @@ impl MapRenderer {
         self.terrain.set_overlay_preview(gfx, preview);
     }
 
+    #[cfg(feature = "debug-ground-overlay")]
     fn set_debug_ground_overlay(&mut self, gfx: &mut GfxContext, bounds: AABB) {
         let extent = bounds.ur - bounds.ll;
         let pitch = 32.0;

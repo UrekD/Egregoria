@@ -33,6 +33,7 @@ itertools     = { workspace = true }
 
 [features]
 default = []
+debug-ground-overlay = []
 profile = ["profiling/profile-with-tracy"]
 multiplayer = ["networking"]
 

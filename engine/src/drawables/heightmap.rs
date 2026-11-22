@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
 use wgpu::{
-    BindGroup, BindGroupDescriptor, BindGroupLayoutDescriptor, BufferUsages, CommandEncoder,
-    CommandEncoderDescriptor, Extent3d, FilterMode, ImageCopyTexture, ImageDataLayout, IndexFormat,
-    Origin3d, RenderPass, RenderPipeline, RenderPipelineDescriptor, ShaderStages, TextureFormat,
-    TextureUsages, TextureView, VertexAttribute, VertexBufferLayout,
+    BindGroup, BindGroupDescriptor, BindGroupLayout, BindGroupLayoutDescriptor, BufferUsages,
+    CommandEncoder, CommandEncoderDescriptor, Device, Extent3d, FilterMode, ImageCopyTexture,
+    ImageDataLayout, IndexFormat, Origin3d, RenderPass, RenderPipeline, RenderPipelineDescriptor,
+    ShaderStages, TextureFormat, TextureUsages, TextureView, VertexAttribute, VertexBufferLayout,
 };
 
 use geom::{vec2, vec3, Camera, HeightmapChunk, Intersect3, LinearColor, Matrix4, Vec2, AABB3};
@@ -76,24 +76,18 @@ struct GroundOverlayAtlas {
 
 struct GroundOverlay {
     params: Uniform<GroundOverlayParams>,
-    fallback: Arc<BindGroup>,
+    fallback: Option<Arc<BindGroup>>,
     atlas: Option<GroundOverlayAtlas>,
+    warned_invalid_image: bool,
 }
 
 impl GroundOverlay {
     fn new(gfx: &GfxContext) -> Self {
-        let params = Uniform::new(GroundOverlayParams::default(), &gfx.device);
-        let size = Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        };
-        let (texture, fallback) = Self::create_atlas(gfx, &params, size);
-        write_overlay_texture(gfx, &texture, size, &[0; 4]);
         Self {
-            params,
-            fallback,
+            params: Uniform::new(GroundOverlayParams::default(), &gfx.device),
+            fallback: None,
             atlas: None,
+            warned_invalid_image: false,
         }
     }
 
@@ -113,15 +107,9 @@ impl GroundOverlay {
                 ..Default::default()
             })
             .build_no_queue(&gfx.device);
-        let layout = gfx
-            .get_pipeline(HeightmapPipeline {
-                depth: false,
-                smap: false,
-            })
-            .get_bind_group_layout(3);
         let bind_group = gfx.device.create_bind_group(&BindGroupDescriptor {
             label: Some("ground overlay"),
-            layout: &layout,
+            layout: &ground_overlay_layout(&gfx.device),
             entries: &Texture::multi_bindgroup_entries(0, &[&texture])
                 .chain(std::iter::once(params.bindgroup_entry(2)))
                 .collect::<Vec<_>>(),
@@ -129,18 +117,16 @@ impl GroundOverlay {
         (texture, Arc::new(bind_group))
     }
 
-    fn set_image(&mut self, gfx: &GfxContext, image: GroundOverlayImage<'_>) {
+    fn set_image(&mut self, gfx: &GfxContext, image: GroundOverlayImage<'_>) -> bool {
         let Some(bounds) = GroundOverlayBounds::new(image.origin, image.extent) else {
-            self.clear_image(gfx);
-            return;
+            return self.reject_image(&image, "invalid world bounds");
         };
         let Some(size) = overlay_texture_size(
             image.size,
             image.rgba.len(),
             gfx.device.limits().max_texture_dimension_2d,
         ) else {
-            self.clear_image(gfx);
-            return;
+            return self.reject_image(&image, "invalid dimensions or packed RGBA byte count");
         };
 
         if !self
@@ -169,10 +155,25 @@ impl GroundOverlay {
                 ..*self.params.value()
             },
         );
+        true
+    }
+
+    fn reject_image(&mut self, image: &GroundOverlayImage<'_>, reason: &str) -> bool {
+        if !self.warned_invalid_image {
+            self.warned_invalid_image = true;
+            log::warn!(
+                "Rejected ground overlay image at revision {} with size {:?}: {reason}",
+                image.revision,
+                image.size
+            );
+        }
+        false
     }
 
     fn clear_image(&mut self, gfx: &GfxContext) {
-        self.atlas = None;
+        if self.atlas.take().is_none() {
+            return;
+        }
         self.write_params(
             gfx,
             GroundOverlayParams {
@@ -183,12 +184,18 @@ impl GroundOverlay {
     }
 
     fn set_preview(&mut self, gfx: &GfxContext, preview: Option<GroundOverlayDisc>) {
+        if preview.is_none() && self.params.value().preview_radius == 0.0 {
+            return;
+        }
         let (preview_center, preview_radius, preview_color) = preview
             .filter(|disc| {
                 disc.center.is_finite()
                     && disc.radius.is_finite()
                     && disc.radius > 0.0
                     && disc.color.a > 0.0
+                    && [disc.color.r, disc.color.g, disc.color.b, disc.color.a]
+                        .into_iter()
+                        .all(f32::is_finite)
             })
             .map_or((Vec2::ZERO, 0.0, [0.0; 4]), |disc| {
                 (
@@ -197,6 +204,16 @@ impl GroundOverlay {
                     premultiply_overlay_color(disc.color),
                 )
             });
+        if preview_radius > 0.0 && self.fallback.is_none() {
+            let size = Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            };
+            let (texture, bind_group) = Self::create_atlas(gfx, &self.params, size);
+            write_overlay_texture(gfx, &texture, size, &[0; 4]);
+            self.fallback = Some(bind_group);
+        }
         self.write_params(
             gfx,
             GroundOverlayParams {
@@ -215,12 +232,29 @@ impl GroundOverlay {
         }
     }
 
-    fn bind_group(&self) -> Arc<BindGroup> {
+    fn bind_group(&self) -> Option<Arc<BindGroup>> {
         match &self.atlas {
-            Some(atlas) => atlas.bind_group.clone(),
-            None => self.fallback.clone(),
+            Some(atlas) => Some(atlas.bind_group.clone()),
+            None if self.params.value().preview_radius > 0.0 => self.fallback.clone(),
+            None => None,
         }
     }
+}
+
+fn ground_overlay_layout(device: &Device) -> BindGroupLayout {
+    let entries = Texture::bindgroup_layout_entries(0, [TL::Float].into_iter())
+        .chain(std::iter::once(
+            Uniform::<GroundOverlayParams>::bindgroup_layout_entry(2),
+        ))
+        .map(|mut entry| {
+            entry.visibility = ShaderStages::FRAGMENT;
+            entry
+        })
+        .collect::<Vec<_>>();
+    device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("ground overlay layout"),
+        entries: &entries,
+    })
 }
 
 fn overlay_texture_size(size: [u32; 2], bytes: usize, limit: u32) -> Option<Extent3d> {
@@ -280,7 +314,7 @@ pub struct HeightmapRender<const CSIZE: u32, const CRESOLUTION: usize> {
 
 pub struct HeightmapPrepared {
     heightmapbgs: Arc<[wgpu::BindGroup; LOD]>,
-    overlay_bg: Arc<BindGroup>,
+    overlay_bg: Option<Arc<BindGroup>>,
     indices: [(PBuffer, u32); LOD],
     instances: [(PBuffer, u32); LOD],
 }
@@ -288,10 +322,16 @@ pub struct HeightmapPrepared {
 impl<const CSIZE: u32, const CRESOLUTION: usize> HeightmapRender<CSIZE, CRESOLUTION> {
     const LOD0_RESOLUTION: usize = CRESOLUTION * (1 << UPSCALE_LOD);
 
-    pub fn set_ground_overlay(&mut self, gfx: &mut GfxContext, image: GroundOverlayImage<'_>) {
-        if self.w != 0 && self.h != 0 {
-            self.overlay.set_image(gfx, image);
+    /// Accept an atlas revision, or return false and retain the current atlas.
+    pub fn set_ground_overlay(
+        &mut self,
+        gfx: &mut GfxContext,
+        image: GroundOverlayImage<'_>,
+    ) -> bool {
+        if self.w == 0 || self.h == 0 {
+            return self.overlay.reject_image(&image, "terrain is empty");
         }
+        self.overlay.set_image(gfx, image)
     }
 
     pub fn clear_ground_overlay(&mut self, gfx: &mut GfxContext) {
@@ -386,6 +426,7 @@ impl<const CSIZE: u32, const CRESOLUTION: usize> HeightmapRender<CSIZE, CRESOLUT
                         .get_pipeline(HeightmapPipeline {
                             depth: false,
                             smap: false,
+                            overlay: false,
                         })
                         .get_bind_group_layout(1),
                     entries: &bg_entries,
@@ -853,6 +894,7 @@ fn upsample_update(
 struct HeightmapPipeline {
     depth: bool,
     smap: bool,
+    overlay: bool,
 }
 
 #[derive(Copy, Clone)]
@@ -909,31 +951,20 @@ impl PipelineKey for HeightmapPipeline {
         let vert = &mk_module("heightmap/heightmap.vert", &[]);
 
         if !self.depth {
-            let frag = &mk_module("heightmap/heightmap.frag", &[]);
-            let overlay_entries = Texture::bindgroup_layout_entries(0, [TL::Float].into_iter())
-                .chain(std::iter::once(
-                    Uniform::<GroundOverlayParams>::bindgroup_layout_entry(2),
-                ))
-                .map(|mut entry| {
-                    entry.visibility = ShaderStages::FRAGMENT;
-                    entry
-                })
-                .collect::<Vec<_>>();
-            let overlay_layout = gfx
-                .device
-                .create_bind_group_layout(&BindGroupLayoutDescriptor {
-                    label: Some("ground overlay layout"),
-                    entries: &overlay_entries,
-                });
+            let defines: &[&str] = if self.overlay {
+                &["GROUND_OVERLAY"]
+            } else {
+                &[]
+            };
+            let frag = &mk_module("heightmap/heightmap.frag", defines);
+            let litmesh_layout = bg_layout_litmesh(&gfx.device);
+            let mut layouts = vec![&gfx.render_params.layout, &heightmaplayout, &litmesh_layout];
+            let overlay_layout = self.overlay.then(|| ground_overlay_layout(&gfx.device));
+            layouts.extend(overlay_layout.as_ref());
 
             return PipelineBuilder::color(
                 "heightmap",
-                &[
-                    &gfx.render_params.layout,
-                    &heightmaplayout,
-                    &bg_layout_litmesh(&gfx.device),
-                    &overlay_layout,
-                ],
+                &layouts,
                 &[HeightmapInstance::desc()],
                 vert,
                 frag,
@@ -958,12 +989,15 @@ impl Drawable for HeightmapPrepared {
         let pipeline = gfx.get_pipeline(HeightmapPipeline {
             depth: false,
             smap: false,
+            overlay: self.overlay_bg.is_some(),
         });
 
         rp.set_pipeline(pipeline);
 
         rp.set_bind_group(2, &gfx.simplelit_bg, &[]);
-        rp.set_bind_group(3, &self.overlay_bg, &[]);
+        if let Some(overlay_bg) = &self.overlay_bg {
+            rp.set_bind_group(3, overlay_bg, &[]);
+        }
 
         self.set_buffers(rp);
 
@@ -990,6 +1024,7 @@ impl Drawable for HeightmapPrepared {
         rp.set_pipeline(gfx.get_pipeline(HeightmapPipeline {
             depth: true,
             smap: shadow_cascade.is_some(),
+            overlay: false,
         }));
 
         self.set_buffers(rp);
@@ -1034,19 +1069,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn ground_overlay_uv_maps_texel_centers_without_flipping_y() {
+    fn ground_overlay_bounds_store_origin_and_reciprocal_extent() {
         let bounds = GroundOverlayBounds::new(vec2(-32.0, 64.0), vec2(64.0, 128.0)).unwrap();
-        // The fragment shader applies this same transform to world XY.
-        let uv = |world: Vec2| {
-            let xy = world - bounds.origin;
-            vec2(xy.x * bounds.inv_extent.x, xy.y * bounds.inv_extent.y)
-        };
-        assert_eq!(uv(vec2(-32.0, 64.0)), Vec2::ZERO);
-        assert_eq!(uv(vec2(-16.0, 80.0)), vec2(0.25, 0.125));
-        assert_eq!(uv(vec2(16.0, 176.0)), vec2(0.75, 0.875));
-        assert_eq!(uv(vec2(32.0, 192.0)), vec2(1.0, 1.0));
-        assert!(uv(vec2(-33.0, 100.0)).x < 0.0);
-        assert!(uv(vec2(0.0, 193.0)).y > 1.0);
+        assert_eq!(bounds.origin, vec2(-32.0, 64.0));
+        assert_eq!(bounds.inv_extent, vec2(1.0 / 64.0, 1.0 / 128.0));
         assert!(GroundOverlayBounds::new(Vec2::ZERO, vec2(0.0, 64.0)).is_none());
         assert!(GroundOverlayBounds::new(vec2(f32::NAN, 0.0), vec2(64.0, 64.0)).is_none());
     }
