@@ -1,7 +1,7 @@
 use crate::economy::balance::{
-    DEFAULT_TAX_RATE_PERMILLE, DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS, DEMAND_OFFSET_TICKS, I_BASE,
-    I_BOOTSTRAP_COMPANIES, K_GOODS, K_HAPPY, K_JOBS, K_RET, K_TAX, K_UNEMP, K_VAC,
-    MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, RETAIL_PER_CAPITA_PER_HOUR, R_BASE,
+    periodic_tick, DEFAULT_TAX_RATE_PERMILLE, DEMAND_EMA_ALPHA, DEMAND_INTERVAL_TICKS,
+    DEMAND_OFFSET_TICKS, I_BASE, I_BOOTSTRAP_COMPANIES, K_GOODS, K_HAPPY, K_JOBS, K_RET, K_TAX,
+    K_UNEMP, K_VAC, MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, RETAIL_PER_CAPITA_PER_HOUR, R_BASE,
     R_BOOTSTRAP_POPULATION,
 };
 use crate::economy::{Budget, Market};
@@ -20,10 +20,7 @@ use std::collections::BTreeMap;
 pub struct ZoneDemand {
     pub values: BTreeMap<ZoneKind, f32>,
     drivers: BTreeMap<ZoneKind, DemandDrivers>,
-}
-
-#[derive(Default)]
-struct DemandScratch {
+    #[serde(skip)]
     occupants: FastMap<BuildingID, u32>,
 }
 
@@ -57,6 +54,10 @@ impl ZoneDemand {
         tick % DEMAND_INTERVAL_TICKS == DEMAND_OFFSET_TICKS
     }
 
+    pub(crate) fn has_sample(&self) -> bool {
+        !self.drivers.is_empty()
+    }
+
     pub fn drivers(&self, zone: ZoneKind) -> Option<&DemandDrivers> {
         self.drivers.get(&zone)
     }
@@ -82,11 +83,11 @@ impl ZoneDemand {
 }
 
 pub fn demand_update(world: &mut World, resources: &mut Resources) {
-    if !ZoneDemand::due(resources.tick().0) {
+    let budget = resources.read::<Budget>();
+    if !ZoneDemand::due(periodic_tick(&budget, resources.tick())) {
         return;
     }
 
-    resources.write_or_default::<DemandScratch>();
     let jobs = ItemID::new("job-opening");
     let market = resources.read::<Market>();
     let open_jobs: u64 = market.inner().get(&jobs).map_or(0, |job_market| {
@@ -99,8 +100,8 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     });
 
     let residences = resources.read::<Residences>();
-    let mut scratch = resources.write::<DemandScratch>();
-    let occupants = &mut scratch.occupants;
+    let mut demand = resources.write::<ZoneDemand>();
+    let occupants = &mut demand.occupants;
     occupants.clear();
     let mut unemployed = 0;
     for human in world.humans.values() {
@@ -144,8 +145,6 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
             .average(&resources.read::<BuildingInfos>())
             - NEUTRAL_HAPPINESS);
 
-    let budget = resources.read::<Budget>();
-    let mut demand = resources.write::<ZoneDemand>();
     for (zone, mut drivers) in [
         (
             ZoneKind::Residential,
@@ -318,9 +317,7 @@ mod tests {
     #[test]
     fn p1a_demand_bootstrap_and_ema_cadence() {
         let mut ctx = TestCtx::new_fast();
-        ctx.apply(&[crate::world_command::WorldCommand::SetGameTime(
-            GameTime::new(Tick(DEMAND_OFFSET_TICKS - 2)),
-        )]);
+        *ctx.g.write::<GameTime>() = GameTime::new(Tick(DEMAND_OFFSET_TICKS - 2));
         ctx.tick_fast();
         assert!(ctx.g.read::<ZoneDemand>().values.is_empty());
         ctx.tick_fast();

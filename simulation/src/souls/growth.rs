@@ -1,4 +1,5 @@
-use crate::economy::ZoneDemand;
+use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
+use crate::economy::{Budget, ZoneDemand};
 use crate::map::{
     BuildingID, BuildingKind, LotID, Map, ProjectFilter, ZoneCell, ZoneGrid, ZoneKind,
 };
@@ -8,9 +9,9 @@ use crate::Simulation;
 use common::FastMap;
 use geom::Vec2;
 use ordered_float::OrderedFloat;
-use prototypes::{GrowableCompanyPrototype, ResidencePrototype};
+use prototypes::{GrowableCompanyPrototype, ResidencePrototype, Tick};
 
-pub(crate) const GROWTH_INTERVAL: u64 = 3_000;
+pub(crate) const GROWTH_INTERVAL: u64 = CITY_UPDATE_INTERVAL_TICKS;
 const MAX_BUILDING_SEARCH_RADIUS: f32 = 2_048.0;
 
 #[derive(Default)]
@@ -34,11 +35,12 @@ struct GrowthCandidate {
 }
 
 pub(crate) const fn due(tick: u64) -> bool {
-    tick % GROWTH_INTERVAL == 0
+    tick >= GROWTH_INTERVAL && tick % GROWTH_INTERVAL == 0
 }
 
 pub fn growth_update(sim: &mut Simulation) {
-    if !due(sim.get_tick()) {
+    let tick = periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()));
+    if !due(tick) {
         return;
     }
     profiling::scope!("souls::growth_pass");
@@ -61,6 +63,10 @@ pub fn growth_update(sim: &mut Simulation) {
     }
 
     if sim.read::<ZoneGrid>().cells.is_empty() {
+        return;
+    }
+    // A save from before staggering can reach the first growth phase without a demand sample.
+    if !sim.read::<ZoneDemand>().has_sample() {
         return;
     }
 
@@ -364,6 +370,9 @@ mod tests {
                 kind: Some(zone),
                 density: Density::High,
             }]);
+            test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL - 1;
+            let (world, resources) = test.g.world_res();
+            crate::economy::demand_update(world, resources);
             test.g.write::<ZoneDemand>().values.insert(zone, 40.0);
             assert!(due(GROWTH_INTERVAL));
             test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;

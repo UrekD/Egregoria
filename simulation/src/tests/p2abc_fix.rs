@@ -67,9 +67,14 @@ fn p2abc_periodic_passes_keep_distinct_phases() {
     use crate::souls::{events, growth, happiness, residence};
     use prototypes::TICKS_PER_HOUR;
 
-    let mut counts = [0; 7];
+    let mut test = TestCtx::new_fast();
+    let mut counts = [0; 8];
     for tick in TICKS_PER_HOUR..(2 * TICKS_PER_HOUR) {
-        let coverage = matches!(tick % 6_000, 300 | 900 | 1_500 | 2_100 | 2_700 | 3_300);
+        test.g.write::<GameTime>().tick.0 = tick;
+        crate::map_dynamic::coverage_update(&mut test.g);
+        let mut coverage = test.g.write::<CoverageGrid>();
+        let coverage_ran = !coverage.by_kind.is_empty();
+        coverage.by_kind.clear();
         let due = [
             ZoneDemand::due(tick),
             growth::due(tick),
@@ -78,9 +83,10 @@ fn p2abc_periodic_passes_keep_distinct_phases() {
             residence::due(tick),
             happiness::due(tick),
             events::due(tick),
+            coverage_ran,
         ];
         assert!(
-            due.iter().filter(|&&runs| runs).count() + usize::from(coverage) <= 1,
+            due.iter().filter(|&&runs| runs).count() <= 1,
             "periodic passes overlap at tick {tick}"
         );
         for (count, runs) in counts.iter_mut().zip(due) {
@@ -92,11 +98,54 @@ fn p2abc_periodic_passes_keep_distinct_phases() {
         if EnvGrid::due(tick) {
             assert!(UtilityFlow::due(tick - 1));
         }
+        if residence::due(tick) {
+            assert!(ZoneDemand::due(tick + 1));
+            assert!(growth::due(tick + 2));
+        }
         if happiness::due(tick) {
             assert!(EnvGrid::due(tick - 1));
         }
+        if events::due(tick) {
+            assert!(happiness::due(tick - 1));
+        }
     }
-    assert_eq!(counts, [6, 6, 6, 6, 1, 1, 1]);
+    assert_eq!(counts, [6, 6, 6, 6, 1, 1, 1, 18]);
+}
+
+#[test]
+fn pfc_environment_uses_the_utility_pass_on_elapsed_ticks() {
+    for destination in [2_998, 2_999, 3_001] {
+        let mut test = TestCtx::new_fast();
+        road(
+            &test,
+            vec2(80.0, 100.0),
+            vec2(420.0, 100.0),
+            LanePatternBuilder::new(),
+        );
+        let home = test.build_house_near(vec2(200.0, 125.0));
+        test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(destination)))]);
+        for _ in 0..4 {
+            test.tick_fast();
+        }
+        assert_eq!(
+            test.g.read::<EnvGrid>().land_value(home),
+            0,
+            "jump destination {destination}"
+        );
+        assert_eq!(test.g.read::<UtilityFlow>().networks().count(), 0);
+
+        for _ in 4..3_000 {
+            test.tick_fast();
+        }
+        assert!(test.g.read::<UtilityFlow>().networks().next().is_some());
+        assert_eq!(test.g.read::<EnvGrid>().land_value(home), 0);
+        let mut restored: crate::Simulation =
+            Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        test.tick_fast();
+        restored.tick(&mut crate::Simulation::schedule(), []);
+        assert!(test.g.read::<EnvGrid>().land_value(home) > 0);
+        assert_eq!(test.g.hashes(), restored.hashes());
+    }
 }
 
 #[test]

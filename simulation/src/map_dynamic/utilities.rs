@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 
-use prototypes::{try_prototype, ServiceID, ServiceKind};
+use prototypes::{try_prototype, ServiceID, ServiceKind, Tick};
 use serde::{Deserialize, Serialize};
 
+use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
+use crate::economy::Budget;
 use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID, Map, MAX_ZONE_AREA};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
 
 use super::{BuildingInfos, ElectricityFlow};
 
-const UTILITY_INTERVAL_TICKS: u64 = 3_000;
 const RELATIVE_RATE_EPSILON: f64 = 1e-6;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -39,7 +40,8 @@ impl UtilityFlow {
     pub(crate) const UPDATE_OFFSET: u64 = 1;
 
     pub(crate) const fn due(tick: u64) -> bool {
-        tick >= UTILITY_INTERVAL_TICKS && tick % UTILITY_INTERVAL_TICKS == Self::UPDATE_OFFSET
+        tick >= CITY_UPDATE_INTERVAL_TICKS
+            && tick % CITY_UPDATE_INTERVAL_TICKS == Self::UPDATE_OFFSET
     }
 
     pub fn has_water(&self, building: BuildingID) -> bool {
@@ -148,7 +150,8 @@ fn valid_rate(rate: Option<f32>) -> f64 {
 }
 
 pub fn utility_flow_update(sim: &mut Simulation) {
-    if !UtilityFlow::due(sim.get_tick()) {
+    let tick = periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()));
+    if !UtilityFlow::due(tick) {
         return;
     }
     profiling::scope!("map_dynamic::utility_flow");

@@ -914,14 +914,17 @@ fn p2d_removing_a_building_mid_fire_is_safe() {
 }
 
 #[test]
-fn p2d_fire_lifetime_ignores_game_time_jumps() {
+fn pfc_fire_lifetime_ignores_game_time_jumps() {
+    use events::{FireEventKind, Fires};
+
     let mut failures = Vec::new();
-    for destination in [0, 20] {
+    let mut lifetimes = Vec::new();
+    for destination in [None, Some(0), Some(20 * TICKS_PER_HOUR + 1)] {
         let (mut test, house, _) = p2d_house();
         p2d_force_ignite(&test.g, house);
-        test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(
-            destination * TICKS_PER_HOUR + events::UPDATE_OFFSET,
-        )))]);
+        if let Some(destination) = destination {
+            test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(destination)))]);
+        }
 
         let mut schedule = crate::utils::scheduler::SeqSchedule::default();
         schedule.add_system(Box::new(crate::utils::scheduler::RunnableFn {
@@ -933,14 +936,68 @@ fn p2d_fire_lifetime_ignores_game_time_jumps() {
             resumed.tick(&mut schedule, []);
         }
         if resumed.map().get(house).is_none() {
-            failures.push(format!("jump to hour {destination} shortened the fire"));
+            failures.push(format!("destination {destination:?} shortened the fire"));
         }
         resumed.tick(&mut schedule, []);
         if resumed.map().get(house).is_some() {
-            failures.push(format!("jump to hour {destination} prolonged the fire"));
+            failures.push(format!("destination {destination:?} prolonged the fire"));
+        }
+        let fires = resumed.read::<Fires>();
+        let events: Vec<_> = fires
+            .events_since(0)
+            .filter(|event| event.building == house)
+            .collect();
+        if let [ignition, collapse] = events.as_slice() {
+            assert_eq!(ignition.kind, FireEventKind::Ignited);
+            assert_eq!(collapse.kind, FireEventKind::Collapsed);
+            lifetimes.push(collapse.tick.0 - ignition.tick.0);
         }
     }
-    assert!(failures.is_empty(), "{}", failures.join("; "));
+    assert!(failures.is_empty(), "{}", failures.join(", "));
+    assert_eq!(lifetimes, [3 * TICKS_PER_HOUR; 3]);
+}
+
+#[test]
+fn pfc_fire_dispatch_runs_once_in_an_elapsed_hour() {
+    use events::{FireEventKind, Fires};
+
+    let (mut test, house, _) = p2d_house();
+    test.g
+        .write::<CoverageGrid>()
+        .by_kind
+        .entry(ServiceKind::Fire)
+        .or_default()
+        .insert(house, 100.0);
+    p2d_force_ignite(&test.g, house);
+    p2d_fire_at(&mut test.g, 2);
+    assert!(!test.g.read::<Fires>().by_building.contains_key(&house));
+
+    let shifted_dispatch = 20 * TICKS_PER_HOUR + events::UPDATE_OFFSET;
+    test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(
+        shifted_dispatch - 1,
+    )))]);
+    events::force_ignite(&test.g, house);
+    let mut schedule = crate::utils::scheduler::SeqSchedule::default();
+    schedule.add_system(Box::new(crate::utils::scheduler::RunnableFn {
+        f: events::events_update,
+        name: "events_update",
+    }));
+    for _ in 1..TICKS_PER_HOUR {
+        test.g.tick(&mut schedule, []);
+    }
+    assert!(test.g.read::<Fires>().by_building.contains_key(&house));
+    test.g.tick(&mut schedule, []);
+    let fires = test.g.read::<Fires>();
+    assert!(!fires.by_building.contains_key(&house));
+    let extinguished: Vec<_> = fires
+        .events_since(0)
+        .filter(|event| event.building == house && event.kind == FireEventKind::Extinguished)
+        .collect();
+    assert_eq!(extinguished.len(), 2);
+    assert_eq!(
+        extinguished[1].tick.0 - extinguished[0].tick.0,
+        TICKS_PER_HOUR
+    );
 }
 
 #[test]
@@ -1182,7 +1239,7 @@ fn p2d_happiness_demand_is_weighted_by_residents_and_reported_separately() {
 }
 
 #[test]
-fn p2d_fire_rng_is_independent_of_unrelated_spawns() {
+fn p2d_fire_rng_is_independent_of_unrelated_spawns_and_calendar_time() {
     use crate::souls::events::Fires;
     use crate::utils::rand_provider::RandProvider;
 
@@ -1192,11 +1249,18 @@ fn p2d_fire_rng_is_independent_of_unrelated_spawns() {
     let extra_house = expanded.map_mut().build_house(extra_lot).unwrap();
     crate::souls::growth::on_growable_placed(&expanded, extra_house, BuildingKind::House);
     spawn_human(&mut expanded, extra_house).unwrap();
+    let shift = 20 * TICKS_PER_HOUR + 1;
+    let shifted_start = expanded.get_tick() + shift;
+    expanded.apply_commands([&WorldCommand::SetGameTime(GameTime::new(Tick(
+        shifted_start,
+    )))]);
 
     let mut ignitions = 0;
     for hour in 1..=4096 {
         expanded.write::<RandProvider>().next_u32();
-        p2d_fire_at(&mut expanded, hour);
+        let tick = hour * TICKS_PER_HOUR + events::UPDATE_OFFSET;
+        expanded.write::<GameTime>().tick.0 = tick + shift;
+        events::events_update(&mut expanded);
         p2d_fire_at(&mut original.g, hour);
         let ignited = original.g.write::<Fires>().by_building.remove(&house);
         assert_eq!(

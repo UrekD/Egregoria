@@ -4,11 +4,12 @@ use prototypes::{ServiceKind, Tick, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
 use slotmapd::Key;
 
+use crate::economy::balance::elapsed_phase_tick;
 use crate::economy::Budget;
 use crate::map::{BuildingID, BuildingKind};
 use crate::map_dynamic::{CoverageGrid, EnvGrid};
 use crate::utils::rand_provider::RandProvider;
-use crate::{Simulation, INITIAL_TICK, RNG_SEED};
+use crate::{Simulation, RNG_SEED};
 
 const EVENT_FIRE: u64 = 0x4649_5245;
 const FIRE_CHANCE: f32 = 0.002;
@@ -69,15 +70,14 @@ pub(crate) const fn due(tick: u64) -> bool {
 }
 
 pub fn events_update(sim: &mut Simulation) {
-    if !due(sim.get_tick()) {
+    let tick = elapsed_tick(sim);
+    let phase_tick = elapsed_phase_tick(tick.0);
+    if !due(phase_tick) {
         return;
     }
     profiling::scope!("souls::events_update");
 
-    // Schedule on the shared phase, while keeping fire ages and RNG keys on
-    // elapsed simulation time so calendar jumps do not directly advance them.
-    let tick = elapsed_tick(sim);
-    let hour = tick.0.saturating_add(INITIAL_TICK) / TICKS_PER_HOUR;
+    let hour = phase_tick / TICKS_PER_HOUR;
     let mut collapse = Vec::new();
     {
         let map = sim.map();

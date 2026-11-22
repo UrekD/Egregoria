@@ -1,15 +1,16 @@
 use std::collections::BTreeMap;
 
 use geom::{vec2, Vec2};
-use prototypes::{try_prototype, ServiceKind};
+use prototypes::{try_prototype, ServiceKind, Tick};
 use serde::{Deserialize, Serialize};
 
+use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
+use crate::economy::Budget;
 use crate::map::{Building, BuildingID, BuildingKind};
 use crate::map_dynamic::{BuildingInfos, CoverageGrid, UtilityFlow};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
 
-const UPDATE_INTERVAL: u64 = 3_000;
 const POLLUTION_RADIUS: f32 = 160.0;
 const POLLUTION_RETENTION: f32 = 0.9;
 const MIN_POLLUTION: f32 = 1.0;
@@ -28,7 +29,8 @@ impl EnvGrid {
     pub(crate) const UPDATE_OFFSET: u64 = 2;
 
     pub(crate) const fn due(tick: u64) -> bool {
-        tick >= UPDATE_INTERVAL && tick % UPDATE_INTERVAL == Self::UPDATE_OFFSET
+        tick >= CITY_UPDATE_INTERVAL_TICKS
+            && tick % CITY_UPDATE_INTERVAL_TICKS == Self::UPDATE_OFFSET
     }
 
     /// Pollution in the cell containing `pos`, or zero for an empty cell.
@@ -73,7 +75,8 @@ pub struct EnvCell {
 }
 
 pub fn env_update(sim: &mut Simulation) {
-    if !EnvGrid::due(sim.get_tick()) {
+    let tick = periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()));
+    if !EnvGrid::due(tick) {
         return;
     }
     profiling::scope!("map_dynamic::env_update");
