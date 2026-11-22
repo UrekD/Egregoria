@@ -201,17 +201,35 @@ fn slot_discovery_ignores_fifo_sidecars() {
 
     let root = TestRoot::new();
     root.file("harbor.zip", b"snapshot", 100);
-    for suffix in [".meta.json", "_replay.json"] {
-        let path = root.0.join(format!("harbor{suffix}"));
-        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    for name in ["harbor.meta.json", "harbor_replay.json", "blocked.zip"] {
+        let path = CString::new(root.0.join(name).as_os_str().as_bytes()).unwrap();
         // mkfifo receives a live, NUL-terminated path.
         assert_eq!(unsafe { mkfifo(path.as_ptr(), 0o600) }, 0);
     }
+    let blocked_snapshot = root.0.join("blocked.zip");
+    let (sender, result) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        sender
+            .send(SlotPaths::open_member(&blocked_snapshot))
+            .unwrap();
+    });
+    let error = result
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .unwrap()
+        .unwrap_err();
+    worker.join().unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     let entries = list_slots(&root.0).unwrap();
-    assert_eq!(entries.len(), 1);
-    assert!(!entries[0].replay_available);
-    assert_eq!(entries[0].meta, None);
-    assert!(read_slot_meta(&root.0, &entries[0].id).is_err());
+    let harbor = entries
+        .iter()
+        .find(|entry| entry.id.as_str() == "harbor")
+        .unwrap();
+    assert!(!harbor.replay_available);
+    assert_eq!(harbor.meta, None);
+    assert!(read_slot_meta(&root.0, &harbor.id).is_err());
+    assert!(entries
+        .iter()
+        .any(|entry| entry.snapshot == SnapshotKind::Obstructed));
 }
 
 #[test]

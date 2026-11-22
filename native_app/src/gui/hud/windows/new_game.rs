@@ -4,7 +4,7 @@ use goryak::{
 };
 use simulation::{MapPreset, NewGameOptions, Simulation};
 
-use super::{self as session, PreparedWorld, SessionUi, WorldReplacement};
+use super::{self as session, PreparedWorld, SessionUi, WorldJobKind, WorldReplacement};
 use crate::uiworld::UiWorld;
 
 #[derive(Default)]
@@ -142,14 +142,10 @@ pub(super) fn render(uiw: &UiWorld) {
         let record = form.record_replay;
         form.error = None;
         drop(ui);
-        let slot = match session::new_city_slot(uiw, &name) {
-            Ok(slot) => slot,
-            Err(error) => {
-                session::notify(uiw, format!("Could not choose a save slot. {error}"));
-                return;
-            }
-        };
-        session::start_world_job(uiw, "Generating…", move || {
+        let existing = session::known_slot_ids(uiw);
+        session::start_world_job(uiw, WorldJobKind::NewGame, move || {
+            let slot = session::choose_city_slot(common::saveload::save_dir(), &name, existing)
+                .map_err(|error| format!("Could not choose a save slot. {error}"))?;
             let sim = if record {
                 Simulation::new_game_with_replay(&options)
             } else {

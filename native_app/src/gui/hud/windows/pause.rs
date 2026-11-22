@@ -14,6 +14,9 @@ pub(crate) fn render_modal(uiw: &UiWorld, sim: &Simulation) {
         render_departure(uiw, departure);
         return;
     }
+    if session::render_loading(uiw) {
+        return;
+    }
     let (saving_as, settings_open) = {
         let ui = uiw.read::<SessionUi>();
         (ui.save_as.is_some(), ui.settings_open)
@@ -114,7 +117,7 @@ pub(crate) fn render_departure(uiw: &UiWorld, departure: session::PendingDepartu
             "Save"
         };
         minrow(8.0, || {
-            if button_primary(label).show().clicked {
+            if session::can_save(uiw) && button_primary(label).show().clicked {
                 uiw.write::<SessionState>()
                     .departure
                     .as_mut()

@@ -1,11 +1,10 @@
-use crate::session::{self, WorldReplacement};
+use crate::session;
 use crate::uiworld::{SaveLoadState, UiWorld};
-use simulation::Simulation;
 
 #[derive(Default)]
 pub struct LoadState {
+    #[cfg(test)]
     pub(crate) has_save: bool,
-    error: Option<String>,
 }
 
 pub(crate) fn replay_controls(ctx: &egui::Context, uiw: &UiWorld) {
@@ -51,7 +50,6 @@ pub(crate) fn debug_replay(ui: &mut egui::Ui, uiw: &UiWorld) {
         return;
     }
 
-    let mut state = uiw.write::<LoadState>();
     if ui
         .add_enabled(
             crate::network::is_singleplayer(uiw),
@@ -59,43 +57,7 @@ pub(crate) fn debug_replay(ui: &mut egui::Ui, uiw: &UiWorld) {
         )
         .clicked()
     {
-        use common::saveload::{self, SlotId};
-
-        let slot = uiw
-            .read::<session::SessionState>()
-            .active_slot
-            .clone()
-            .unwrap_or_else(SlotId::legacy);
-        let root = saveload::save_dir();
-        let standalone_legacy = slot == SlotId::legacy()
-            && saveload::slot_paths(root, &slot).is_ok_and(|paths| {
-                [paths.zip, paths.bc].into_iter().all(|path| {
-                    std::fs::symlink_metadata(path)
-                        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                })
-            });
-        let replay = if standalone_legacy {
-            Simulation::load_replay_from_disk("world").ok_or_else(|| "Could not load replay".into())
-        } else {
-            Simulation::load_replay_from_slot(root, &slot).map_err(|error| error.to_string())
-        };
-        state.has_save = replay.is_ok();
-        match replay {
-            Ok(replay) => match Simulation::try_from_replay(replay) {
-                Ok((sim, loader)) => {
-                    state.error = None;
-                    session::request_world_replacement(
-                        uiw,
-                        WorldReplacement::ReplayDebug(sim, loader),
-                    );
-                }
-                Err(error) => state.error = Some(error.to_string()),
-            },
-            Err(error) => state.error = Some(error),
-        }
-    }
-    if let Some(error) = &state.error {
-        ui.colored_label(egui::Color32::LIGHT_RED, error);
+        uiw.write::<session::SessionState>().replay_requested = true;
     }
 }
 
@@ -109,7 +71,9 @@ pub(crate) fn render_slots(uiw: &UiWorld) {
     let state = uiw.read::<SessionState>();
     let mut load = None;
     let mut delete = None;
-    if let Some(message) = &state.slot_error {
+    if state.scanning_slots() {
+        textc(on_secondary_container(), "Scanning…");
+    } else if let Some(message) = &state.slot_error {
         textc(error(), message.clone());
     } else if state.slots.is_empty() {
         textc(on_secondary_container(), "No saved cities.");

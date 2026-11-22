@@ -6,7 +6,7 @@ use simulation::Simulation;
 use yakui::widgets::Pad;
 use yakui::{reflow, Alignment, Dim2, Pivot};
 
-use super::{self as session, SessionScreen, SessionState, SessionUi};
+use super::{self as session, SessionScreen, SessionState, SessionUi, WorldJobKind};
 use crate::gui::windows::{load, settings};
 use crate::uiworld::{SaveLoadState, UiWorld};
 
@@ -14,7 +14,7 @@ pub(crate) fn main_menu_buttons(uiw: &UiWorld, sim: Option<&Simulation>, setting
     if let Some(entry) = session::continue_entry(uiw) {
         let label = format!("Continue {}", session::display_name(&entry));
         if tooltip(label, || button_primary("Continue").show()).clicked {
-            let active = uiw.read::<SessionState>().active_slot.as_ref() == Some(&entry.id);
+            let active = uiw.read::<SessionState>().snapshot_slot() == Some(&entry.id);
             let clean = sim.is_some_and(|sim| {
                 uiw.read::<SaveLoadState>().saved_progress
                     == Some(session::CityProgress::capture(sim))
@@ -51,6 +51,19 @@ pub(crate) fn render_session(uiw: &UiWorld, sim: &Simulation) {
     }
 
     let screen = *uiw.read::<SessionScreen>();
+    if uiw.read::<SessionState>().starting_up {
+        Window {
+            title: "".into(),
+            pad: Pad::all(24.0),
+            radius: 10.0,
+            opened: &mut true,
+            child_spacing: 0.0,
+        }
+        .show(|| {
+            textc(on_secondary_container(), "Scanning…");
+        });
+        return;
+    }
     if screen == SessionScreen::MainMenu && render_startup_message(uiw) {
         return;
     }
@@ -88,6 +101,9 @@ pub(crate) fn render_session(uiw: &UiWorld, sim: &Simulation) {
                 main_menu_buttons(uiw, Some(sim), &mut settings_open);
                 if settings_open {
                     uiw.write::<SessionUi>().settings_open = true;
+                }
+                if uiw.read::<SessionState>().scanning_slots() {
+                    textc(on_secondary_container(), "Scanning…");
                 }
             }
             SessionScreen::NewGame => super::new_game::render(uiw),
@@ -128,22 +144,34 @@ fn render_startup_message(uiw: &UiWorld) -> bool {
     true
 }
 
-fn render_loading(uiw: &UiWorld) -> bool {
-    let mut io = uiw.write::<SaveLoadState>();
-    let Some(job) = io.world_job.as_mut() else {
+pub(crate) fn render_loading(uiw: &UiWorld) -> bool {
+    if !session::world_job_active(uiw) {
         return false;
+    }
+    let (label, cancellable) = {
+        let mut io = uiw.write::<SaveLoadState>();
+        let job = io.world_job.as_mut().unwrap();
+        job.presented = true;
+        (job.kind.label(), matches!(job.kind, WorldJobKind::NewGame))
     };
-    job.presented = true;
+    let mut opened = true;
+    let mut cancel = false;
     Window {
         title: "".into(),
         pad: Pad::all(24.0),
         radius: 10.0,
-        opened: &mut true,
-        child_spacing: 0.0,
+        opened: &mut opened,
+        child_spacing: 8.0,
     }
     .show(|| {
-        textc(on_secondary_container(), job.label);
+        textc(on_secondary_container(), label);
+        if cancellable {
+            cancel = button_secondary("Cancel").show().clicked;
+        }
     });
+    if cancellable && (!opened || cancel) {
+        session::cancel_generation(uiw);
+    }
     true
 }
 

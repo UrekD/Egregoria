@@ -22,6 +22,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
+use std::io::Read;
 use std::path::Path;
 use std::ptr::addr_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -483,21 +484,11 @@ impl Simulation {
             let bytes = read_save(&path)
                 .map_err(SaveLoadError::Io)?
                 .ok_or(SaveLoadError::NotFound)?;
-            let revision = match read_snapshot(
+            decode_snapshot_replay(
+                &bytes,
                 &CompressedBincode::filename(save_name),
                 &Bincode::filename(save_name),
-                read_save,
-            ) {
-                Ok(snapshot) => {
-                    let (header, _) = snapshot_header(&snapshot)?;
-                    header.check_version()?;
-                    header.revision
-                }
-                // A legacy replay can exist on its own.
-                Err(SaveLoadError::NotFound) => None,
-                Err(error) => return Err(error),
-            };
-            ReplayJson::decode_sidecar(&bytes, revision).map_err(replay_corrupt)
+            )
         })();
         match result {
             Ok(replay) => Some(replay),
@@ -530,13 +521,10 @@ impl Simulation {
         let bytes = read_slot_member(&paths.replay)
             .map_err(SaveLoadError::Io)?
             .ok_or(SaveLoadError::NotFound)?;
-        let snapshot = read_snapshot(&paths.zip, &paths.bc, read_slot_member)?;
-        let (header, _) = snapshot_header(&snapshot)?;
-        header.check_version()?;
-        ReplayJson::decode_sidecar(&bytes, header.revision).map_err(replay_corrupt)
+        decode_snapshot_replay(&bytes, &paths.zip, &paths.bc)
     }
 
-    /// Reads the header of the selected snapshot for slot discovery.
+    /// Reads a bounded prefix of the selected snapshot for slot discovery.
     pub fn read_slot_snapshot_header(
         path: &Path,
         kind: SnapshotKind,
@@ -544,15 +532,36 @@ impl Simulation {
         if kind == SnapshotKind::Obstructed {
             return Err(SaveLoadError::Io(nonregular_slot_member(path)));
         }
-        let bytes = read_slot_member(path)
+        let file = open_slot_member(path)
             .map_err(SaveLoadError::Io)?
             .ok_or(SaveLoadError::NotFound)?;
-        let bytes = if kind == SnapshotKind::Zip {
-            CompressedBincode::decompress(&bytes).map_err(corrupt_header)?
+        // The envelope contains magic, a version string and a u128 revision.
+        let mut prefix = [0u8; 256];
+        let len = if kind == SnapshotKind::Zip {
+            CompressedBincode::read_prefix(file, &mut prefix).map_err(corrupt_header)?
         } else {
-            bytes
+            let mut bytes = Vec::new();
+            file.take(prefix.len() as u64)
+                .read_to_end(&mut bytes)
+                .map_err(SaveLoadError::Io)?;
+            prefix[..bytes.len()].copy_from_slice(&bytes);
+            bytes.len()
         };
-        snapshot_header(&bytes).map(|(header, _)| header)
+        let bytes = &prefix[..len];
+        if bytes.starts_with(&SLOT_SNAPSHOT_MAGIC) {
+            let header: SlotSnapshotHeader =
+                Bincode::decode_prefix(bytes).map_err(corrupt_header)?;
+            Ok(SnapshotHeader {
+                version: header.version,
+                revision: Some(header.revision),
+            })
+        } else {
+            let SaveHeader { version } = Bincode::decode_prefix(bytes).map_err(corrupt_header)?;
+            Ok(SnapshotHeader {
+                version,
+                revision: None,
+            })
+        }
     }
 
     fn decode_snapshot(bytes: &[u8]) -> Result<Self, SaveLoadError> {
@@ -928,6 +937,22 @@ fn read_snapshot(
     }
 }
 
+fn decode_snapshot_replay(bytes: &[u8], zip: &Path, bc: &Path) -> Result<Replay, SaveLoadError> {
+    let header = match Simulation::read_slot_snapshot_header(zip, SnapshotKind::Zip) {
+        Err(SaveLoadError::NotFound) => Simulation::read_slot_snapshot_header(bc, SnapshotKind::Bc),
+        result => result,
+    };
+    // An unrevisioned debug replay can stand alone when its snapshot cannot be used.
+    let revision = header
+        .and_then(|header| {
+            header.check_version()?;
+            Ok(header.revision)
+        })
+        .ok()
+        .flatten();
+    ReplayJson::decode_sidecar(bytes, revision).map_err(replay_corrupt)
+}
+
 fn corrupt_header(error: io::Error) -> SaveLoadError {
     SaveLoadError::Corrupt {
         version: None,
@@ -949,13 +974,21 @@ fn nonregular_slot_member(path: &Path) -> io::Error {
     )
 }
 
-fn read_slot_member(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.is_file() => read_save(path),
-        Ok(_) => Err(nonregular_slot_member(path)),
+fn open_slot_member(path: &Path) -> io::Result<Option<fs::File>> {
+    match saveload::SlotPaths::open_member(path) {
+        Ok(file) => Ok(Some(file)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
     }
+}
+
+fn read_slot_member(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let Some(mut file) = open_slot_member(path)? else {
+        return Ok(None);
+    };
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(Some(bytes))
 }
 
 fn read_save(path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -1066,3 +1099,71 @@ const START_COMMANDS: &str = r#"
   [0, {"AddTrain": {"dist": 150.0, "n_wagons": 7, "lane": {"idx": 3, "version": 1}}}]
 ]
 "#;
+
+#[cfg(test)]
+mod p4_fix_ac_tests {
+    use super::*;
+
+    fn save_root() -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!(
+            "egr-p4-fix-ac-{}-{:032x}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn p4_fix_ac_discovery_reads_header_even_if_zlib_trailer_is_missing() {
+        let root = save_root();
+        let path = root.join("city.zip");
+        let revision = SnapshotRevision::new(42);
+        let header = SlotSnapshotHeader {
+            magic: SLOT_SNAPSHOT_MAGIC,
+            version: VERSION.to_owned(),
+            revision,
+        };
+        let mut compressed = CompressedBincode::encode(&(header, vec![0u8; 1024 * 1024])).unwrap();
+        compressed.truncate(compressed.len() - 4);
+        fs::write(&path, compressed).unwrap();
+        let header = Simulation::read_slot_snapshot_header(&path, SnapshotKind::Zip);
+        fs::remove_dir_all(root).unwrap();
+        assert_eq!(header.unwrap().revision, Some(revision));
+    }
+
+    #[test]
+    fn p4_fix_ac_debug_replay_recovers_without_a_usable_snapshot() {
+        let root = save_root();
+        let slot = SlotId::legacy();
+        let paths = saveload::slot_paths(&root, &slot).unwrap();
+        let replay = Replay::default();
+        fs::write(&paths.replay, ReplayJson::encode(&replay).unwrap()).unwrap();
+        fs::write(&paths.zip, b"corrupt snapshot").unwrap();
+        let recovered = Simulation::load_replay_from_slot(&root, &slot);
+        assert!(recovered.is_ok(), "{:?}", recovered.err());
+        let path_name = root.join(slot.as_str());
+        assert!(Simulation::load_replay_from_disk(path_name.to_str().unwrap()).is_some());
+
+        let revision = SnapshotRevision::new(42);
+        let write_snapshot = |version: &str| {
+            let header = SlotSnapshotHeader {
+                magic: SLOT_SNAPSHOT_MAGIC,
+                version: version.to_owned(),
+                revision,
+            };
+            fs::write(&paths.zip, CompressedBincode::encode(&header).unwrap()).unwrap();
+        };
+        write_snapshot("0.0.0");
+        assert!(Simulation::load_replay_from_slot(&root, &slot).is_ok());
+        fs::write(&paths.replay, ReplayJson::encode_sidecar(&replay, revision).unwrap()).unwrap();
+        assert!(Simulation::load_replay_from_slot(&root, &slot).is_err());
+
+        write_snapshot(VERSION);
+        assert!(Simulation::load_replay_from_slot(&root, &slot).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
+}

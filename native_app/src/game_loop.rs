@@ -1,12 +1,12 @@
 use std::collections::BTreeMap;
 use std::ptr::addr_of;
-use std::sync::mpsc::{self, TryRecvError};
+use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use common::history::History;
-use common::saveload::{self, SlotEntry, SlotId};
+use common::saveload::{self, SlotId};
 use engine::input::Key;
 use engine::{Context, FrameContext, MeshBuilder};
 use geom::{vec2, vec3, Camera, LinearColor, AABB};
@@ -28,8 +28,9 @@ use crate::inputmap::{Bindings, InputAction, InputMap};
 use crate::rendering::{InstancedRender, MapRenderOptions, MapRenderer, OrbitCamera};
 use crate::session::save_coordinator::SaveCoordinator;
 use crate::session::{
-    self, CityProgress, Departure, DeparturePhase, SaveInFlight, SaveKind, SaveRequest,
-    SessionScreen, SessionState, SlotCompatibility, WorldReplacement,
+    self, CityProgress, Departure, DeparturePhase, DiscoveredSlots, FailedSnapshots, PreparedWorld,
+    SaveInFlight, SaveKind, SaveRequest, SessionScreen, SessionState, SlotCompatibility,
+    WorldJobKind, WorldReplacement,
 };
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
 use prototypes::GameTime;
@@ -44,9 +45,10 @@ pub struct State {
     pub game_schedule: SeqSchedule,
 
     instanced_renderer: InstancedRender,
-    map_renderer: MapRenderer,
+    map_renderer: Option<MapRenderer>,
     immediate_renderer: MeshBuilder<true>,
     automation: Option<Automation>,
+    startup: Option<Receiver<Result<StartupWorld, String>>>,
     escape_down: bool,
     dormant_script_state: Option<(u64, BTreeMap<String, u64>)>,
 
@@ -58,13 +60,14 @@ impl engine::framework::State for State {
         profiling::scope!("game_loop::init");
         goryak::set_blur_texture(ctx.yakui.blur_bg_texture);
 
-        let mut camera = OrbitCamera::load((ctx.gfx.size.0, ctx.gfx.size.1));
+        let camera = OrbitCamera::load((ctx.gfx.size.0, ctx.gfx.size.1));
 
         log::info!("loaded egui_render");
 
         let automation = Automation::take_startup();
         let game_schedule = Simulation::schedule();
         let mut uiworld = UiWorld::init();
+        let mut startup = None;
         let sim = if automation.is_some() {
             crate::init::configure_script_settings(&uiworld);
             let sim = Simulation::new_with_options(scenarios::builtin::smoke::OPTIONS);
@@ -74,11 +77,14 @@ impl engine::framework::State for State {
             sim
         } else {
             *uiworld.write::<SessionScreen>() = SessionScreen::MainMenu;
-            startup_world(&uiworld)
+            uiworld.write::<SessionState>().starting_up = true;
+            let (sender, result) = mpsc::channel();
+            startup = Some(result);
+            std::thread::spawn(move || {
+                let _ = sender.send(startup_world());
+            });
+            Simulation::new(false)
         };
-        if automation.is_none() {
-            camera.reset_for_world(&sim.map());
-        }
 
         let mut bindings = uiworld.write::<Bindings>();
         let default_bindings = Bindings::default();
@@ -110,11 +116,14 @@ impl engine::framework::State for State {
             uiw: uiworld,
             game_schedule,
             instanced_renderer: InstancedRender::new(&mut ctx.gfx),
-            map_renderer: MapRenderer::new(&mut ctx.gfx, &sim),
+            map_renderer: startup
+                .is_none()
+                .then(|| MapRenderer::new(&mut ctx.gfx, &sim)),
             all_audio: GameAudio::new(&mut ctx.audio),
             sim: Arc::new(RwLock::new(sim)),
             immediate_renderer: MeshBuilder::new(ctx.gfx.tess_material),
             automation,
+            startup,
             escape_down: false,
             dormant_script_state: None,
         };
@@ -201,7 +210,9 @@ impl engine::framework::State for State {
             self.manage_io(ctx);
         }
 
-        self.map_renderer.update(&self.sim.read().unwrap(), ctx);
+        if let Some(renderer) = &mut self.map_renderer {
+            renderer.update(&self.sim.read().unwrap(), ctx);
+        }
 
         ctx.gfx
             .set_time(self.sim.read().unwrap().read::<GameTime>().timestamp as f32);
@@ -209,7 +220,7 @@ impl engine::framework::State for State {
         for (sound, kind) in self.uiw.write::<ImmediateSound>().orders.drain(..) {
             ctx.audio.play(sound, kind);
         }
-        if !self.uiw.read::<SessionState>().interaction_blocked {
+        if self.startup.is_none() && !self.uiw.read::<SessionState>().interaction_blocked {
             self.all_audio
                 .update(&self.sim.read().unwrap(), &self.uiw, &mut ctx.audio);
         }
@@ -226,6 +237,9 @@ impl engine::framework::State for State {
 
     fn render(&mut self, ctx: &mut FrameContext<'_>) {
         profiling::scope!("game_loop::render");
+        let Some(map_renderer) = &mut self.map_renderer else {
+            return;
+        };
         let start = Instant::now();
         let sim = self.sim.read().unwrap();
 
@@ -235,9 +249,9 @@ impl engine::framework::State for State {
 
         if self.automation.is_some() {
             // Scripted map changes are applied through ticks, so the tick identifies the snapshot.
-            self.map_renderer.meshb.set_map_version(sim.get_tick());
+            map_renderer.meshb.set_map_version(sim.get_tick());
         }
-        self.map_renderer.render(
+        map_renderer.render(
             &sim.map(),
             time.seconds,
             &camera.camera,
@@ -313,6 +327,13 @@ impl engine::framework::State for State {
 impl State {
     fn step_session(&mut self, ctx: &mut Context) -> bool {
         self.check_dormant_script_state();
+        if self.uiw.read::<SaveLoadState>().exit_requested {
+            ctx.request_exit();
+            return false;
+        }
+        if self.poll_startup(ctx) {
+            return true;
+        }
 
         let replacement = self.uiw.write::<SaveLoadState>().pending.take();
         if let Some(replacement) = replacement {
@@ -322,21 +343,19 @@ impl State {
 
         self.poll_save();
         self.delete_slot();
-        if std::mem::take(&mut self.uiw.write::<SessionState>().refresh_slots) {
-            refresh_slots(&self.uiw);
+        self.uiw.write::<SessionState>().poll_slot_scan();
+        if self.automation.is_none() {
+            self.update_pause_key(ctx);
+        }
+        if std::mem::take(&mut self.uiw.write::<SessionState>().replay_requested) {
+            let sim = self.sim.read().unwrap();
+            session::request_departure(&self.uiw, &sim, Departure::ReplayDebug);
         }
         if !self.poll_world_job(ctx) || self.uiw.read::<SessionState>().interaction_blocked {
             return true;
         }
 
-        if self.automation.is_none() {
-            self.update_pause_key(ctx);
-        }
         self.start_save();
-        if self.uiw.read::<SaveLoadState>().exit_requested {
-            ctx.request_exit();
-            return false;
-        }
         if self.advance_replay() {
             return true;
         }
@@ -350,7 +369,7 @@ impl State {
                 &self.uiw,
                 &self.sim,
                 &mut self.game_schedule,
-                self.map_renderer.meshb.rebuilt_version(),
+                self.map_renderer.as_ref().unwrap().meshb.rebuilt_version(),
             ) {
                 Ok(true) => {}
                 Ok(false) => {
@@ -385,6 +404,7 @@ impl State {
         let down = ctx.input.keyboard.pressed.contains(&Key::Escape);
         if down
             && !self.escape_down
+            && !session::cancel_generation(&self.uiw)
             && !ctx.egui.last_kb_captured
             && self.uiw.read::<KeybindState>().enabled.is_none()
         {
@@ -417,21 +437,81 @@ impl State {
         }
     }
 
-    /// Returns false while a generation or snapshot worker owns the session transition.
+    /// Returns true while startup owns the dormant world.
+    fn poll_startup(&mut self, ctx: &mut Context) -> bool {
+        let Some(startup) = &self.startup else {
+            return false;
+        };
+        let result = match startup.try_recv() {
+            Ok(result) => result,
+            Err(TryRecvError::Empty) => return true,
+            Err(TryRecvError::Disconnected) => {
+                Err("The startup worker stopped unexpectedly.".into())
+            }
+        };
+        self.startup = None;
+        let StartupWorld {
+            world,
+            slots,
+            failed_snapshots,
+            message,
+        } = match result {
+            Ok(startup) => startup,
+            Err(error) => {
+                log::error!("{error}");
+                eprintln!("{error}");
+                std::process::exit(1);
+            }
+        };
+        self.replace_world(ctx, world.replacement);
+        session::set_screen(&self.uiw, SessionScreen::MainMenu);
+        let mut state = self.uiw.write::<SessionState>();
+        state.starting_up = false;
+        state.refresh_slots = false;
+        state.city_name = world.name;
+        state.failed_snapshots = failed_snapshots;
+        state.update_slot_catalog(slots);
+        let mut io = self.uiw.write::<SaveLoadState>();
+        io.autosave_index = (0..3)
+            .min_by_key(|&index| {
+                let id = SlotId::autosave(index);
+                state.slots.iter().find_map(|(entry, _)| {
+                    (entry.id == id).then(|| {
+                        entry
+                            .meta
+                            .as_ref()
+                            .map_or(entry.modified_unix, |meta| meta.saved_at_unix)
+                    })
+                })
+            })
+            .unwrap_or_default();
+        io.startup_message = message;
+        true
+    }
+
+    /// Returns false while a world job owns the session transition.
     fn poll_world_job(&mut self, ctx: &mut Context) -> bool {
+        if self.uiw.read::<SessionState>().departure.is_some() {
+            return true;
+        }
+        let job_id = self.uiw.read::<SessionState>().world_job_id;
         let mut io = self.uiw.write::<SaveLoadState>();
         let Some(job) = &io.world_job else {
             return true;
         };
-        if !job.presented {
+        let current = job.id == job_id;
+        if current && !job.presented {
             return false;
         }
         let result = match job.result.try_recv() {
             Ok(result) => result,
-            Err(TryRecvError::Empty) => return false,
+            Err(TryRecvError::Empty) => return !current,
             Err(TryRecvError::Disconnected) => Err("The city worker stopped unexpectedly.".into()),
         };
-        io.world_job = None;
+        let job = io.world_job.take().unwrap();
+        if !current {
+            return true;
+        }
         match result {
             Ok(world) if crate::network::is_singleplayer(&self.uiw) => {
                 drop(io);
@@ -441,7 +521,17 @@ impl State {
             Ok(_) => {
                 io.world_error = Some("New Game and Load are unavailable in multiplayer.".into())
             }
-            Err(error) => io.world_error = Some(error),
+            Err(error) => match job.kind {
+                WorldJobKind::Snapshot(entry) => {
+                    self.uiw.write::<SessionState>().mark_unreadable(&entry);
+                    io.world_error = Some(error);
+                }
+                WorldJobKind::Replay => {
+                    drop(io);
+                    session::notify(&self.uiw, format!("Could not load replay. {error}"));
+                }
+                WorldJobKind::NewGame => io.world_error = Some(error),
+            },
         }
         false
     }
@@ -458,7 +548,7 @@ impl State {
                 self.all_audio.reset_world();
                 self.immediate_renderer.clear();
                 ctx.gfx.lamplights.reset(&ctx.gfx.device, &ctx.gfx.queue);
-                self.map_renderer = MapRenderer::new(&mut ctx.gfx, sim);
+                self.map_renderer = Some(MapRenderer::new(&mut ctx.gfx, sim));
                 sim.map().dispatch_all();
                 ctx.gfx.update_simplelit_bg();
             },
@@ -483,37 +573,43 @@ impl State {
         {
             return;
         }
-        let mut session = self.uiw.write::<SessionState>();
-        let active_slot = session.active_slot.as_ref().unwrap();
-        let (slot, kind) = if departure_save {
-            (active_slot.clone(), SaveKind::Departure)
-        } else if let Some(request) = &io.pending_save {
-            (request.slot.clone(), request.kind)
-        } else {
-            let slot = loop {
-                let slot = SlotId::autosave(io.autosave_index);
-                io.autosave_index = (io.autosave_index + 1) % 3;
-                if &slot != active_slot {
-                    break slot;
+        let request = if departure_save {
+            match session::departure_save_request(&self.uiw, saveload::save_dir()) {
+                Ok(request) => request,
+                Err(error) => {
+                    drop(io);
+                    self.uiw
+                        .write::<SessionState>()
+                        .departure
+                        .as_mut()
+                        .unwrap()
+                        .phase = DeparturePhase::SaveFailed;
+                    session::notify(&self.uiw, format!("Could not choose a save slot. {error}"));
+                    return;
                 }
-            };
-            (slot, SaveKind::Autosave)
+            }
+        } else if let Some(request) = &io.pending_save {
+            request.clone()
+        } else {
+            let slot = SlotId::autosave(io.autosave_index);
+            io.autosave_index = (io.autosave_index + 1) % 3;
+            let state = self.uiw.read::<SessionState>();
+            SaveRequest {
+                slot,
+                name: format!(
+                    "{} (autosave)",
+                    state.city_name.trim_end_matches(" (autosave)")
+                ),
+                kind: SaveKind::Autosave,
+            }
         };
 
+        let mut session = self.uiw.write::<SessionState>();
         let coordinator = self.uiw.read::<SaveCoordinator>().clone();
-        let Some(permit) = coordinator.request(session.generation, &slot) else {
+        let Some(permit) = coordinator.request(session.generation, &request.slot) else {
             return;
         };
-        let name = match kind {
-            SaveKind::SaveAs => io.pending_save.as_ref().unwrap().name.clone(),
-            SaveKind::Autosave => format!(
-                "{} (autosave)",
-                session.city_name.trim_end_matches(" (autosave)")
-            ),
-            _ => session.city_name.clone(),
-        };
-        let request = SaveRequest { slot, name, kind };
-        match kind {
+        match request.kind {
             SaveKind::Departure => {
                 session.departure.as_mut().unwrap().phase = DeparturePhase::Saving(permit.id)
             }
@@ -583,8 +679,8 @@ impl State {
         let mut destination = None;
         match saved {
             Ok((progress, phase)) => {
-                if matches!(request.kind, SaveKind::SaveAs) {
-                    session.active_slot = Some(request.slot);
+                if matches!(request.kind, SaveKind::SaveAs | SaveKind::Departure) {
+                    session.set_snapshot_slot(Some(request.slot));
                     session.city_name = request.name;
                 }
                 if !matches!(request.kind, SaveKind::Autosave) {
@@ -636,7 +732,7 @@ impl State {
             session::notify(&self.uiw, format!("Could not delete {slot}. {error}"));
         }
         let mut session = self.uiw.write::<SessionState>();
-        if session.active_slot.as_ref() == Some(&slot) {
+        if session.snapshot_slot() == Some(&slot) {
             self.uiw.write::<SaveLoadState>().saved_progress = None;
         }
         session.refresh_slots = true;
@@ -781,87 +877,58 @@ impl State {
     }
 }
 
-fn refresh_slots(uiw: &UiWorld) {
-    let result = session::discover_slots(saveload::save_dir());
-    let mut session = uiw.write::<SessionState>();
-    match result {
-        Ok(slots) => {
-            session.slots = slots;
-            session.slot_error = None;
-        }
-        Err(error) => {
-            session.slots.clear();
-            session.slot_error = Some(format!("Could not list saves. {error}"));
-        }
-    }
+struct StartupWorld {
+    world: PreparedWorld,
+    slots: std::io::Result<DiscoveredSlots>,
+    failed_snapshots: FailedSnapshots,
+    message: Option<String>,
 }
 
-fn startup_world(uiw: &UiWorld) -> Simulation {
-    refresh_slots(uiw);
-    let candidates = uiw.read::<SessionState>().slots.clone();
-    // Start with the oldest rotation slot, preferring any unoccupied slot.
-    uiw.write::<SaveLoadState>().autosave_index = (0..3)
-        .min_by_key(|&index| {
-            let id = SlotId::autosave(index);
-            candidates.iter().find_map(|(entry, _)| {
-                (entry.id == id).then(|| {
-                    entry
-                        .meta
-                        .as_ref()
-                        .map_or(entry.modified_unix, |meta| meta.saved_at_unix)
-                })
-            })
-        })
-        .unwrap_or_default();
-
-    let mut startup_error = None;
-    for (entry, status) in candidates {
-        if status != SlotCompatibility::Compatible {
-            continue;
-        }
-        match Simulation::load_from_slot(saveload::save_dir(), &entry.id) {
-            Ok(sim) => {
-                initialize_dormant_world(uiw, &sim, &entry);
-                uiw.write::<SaveLoadState>().startup_message = startup_error;
-                return sim;
+fn startup_world() -> Result<StartupWorld, String> {
+    let root = saveload::save_dir();
+    let mut slots = session::discover_slots(root);
+    let mut failed_snapshots = FailedSnapshots::default();
+    let mut message = None;
+    if let Ok(candidates) = &slots {
+        for (entry, status) in candidates {
+            if *status != SlotCompatibility::Compatible {
+                continue;
             }
-            Err(error) => {
-                log::warn!("Could not load {} at startup: {error}", entry.id);
-                startup_error.get_or_insert_with(|| error.to_string());
-                if let Some((_, status)) = uiw
-                    .write::<SessionState>()
-                    .slots
-                    .iter_mut()
-                    .find(|(slot, _)| slot.id == entry.id)
-                {
-                    *status = SlotCompatibility::Unreadable;
+            match Simulation::load_from_slot(root, &entry.id) {
+                Ok(sim) => {
+                    let world = PreparedWorld {
+                        replacement: WorldReplacement::Snapshot(sim, entry.id.clone()),
+                        name: session::display_name(entry).to_owned(),
+                    };
+                    return Ok(StartupWorld {
+                        world,
+                        slots,
+                        failed_snapshots,
+                        message,
+                    });
+                }
+                Err(error) => {
+                    log::warn!("Could not load {} at startup: {error}", entry.id);
+                    message.get_or_insert_with(|| error.to_string());
+                    failed_snapshots.record(entry);
                 }
             }
         }
     }
 
-    let (sim, recovery) = match Simulation::load_or_new("world") {
-        Ok(world) => world,
-        Err(error) => {
-            log::error!("{error}");
-            eprintln!("{error}");
-            std::process::exit(1);
-        }
-    };
-    uiw.write::<SessionState>().active_slot = Some(SlotId::legacy());
-    uiw.write::<SessionState>().city_name = "World (legacy)".into();
+    let (sim, recovery) = Simulation::load_or_new("world")?;
     if recovery.is_some() {
-        refresh_slots(uiw);
+        slots = session::discover_slots(root);
     }
-    uiw.write::<SaveLoadState>().startup_message = recovery.or(startup_error);
-    sim
-}
-
-fn initialize_dormant_world(uiw: &UiWorld, sim: &Simulation, entry: &SlotEntry) {
-    let mut state = uiw.write::<SessionState>();
-    state.active_slot = Some(entry.id.clone());
-    state.city_name = session::display_name(entry).to_owned();
-    uiw.write::<SaveLoadState>().saved_progress = Some(CityProgress::capture(sim));
+    Ok(StartupWorld {
+        world: PreparedWorld {
+            replacement: WorldReplacement::NewGame(sim, SlotId::legacy()),
+            name: "World (legacy)".into(),
+        },
+        slots,
+        failed_snapshots,
+        message: recovery.or(message),
+    })
 }
 
 fn camera_movement_bounds(bounds: AABB) -> AABB {
