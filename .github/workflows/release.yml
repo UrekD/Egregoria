@@ -82,7 +82,12 @@ jobs:
         shell: bash
         run: |
           for f in artifacts/*.zip; do
-            7z l "$f" | grep -q 'base_mod[/\\]data.lua' || { echo "$f is missing base_mod/data.lua"; exit 1; }
+            listing=$(7z l -slt "$f") || exit 1
+            if ! grep -Fxq -e 'Path = base_mod/data.lua' -e 'Path = base_mod\data.lua' \
+              <<< "${listing//$'\r'/}"; then
+              printf '%s is missing base_mod/data.lua\n' "$f" >&2
+              exit 1
+            fi
           done
 
       # Artifact names must be unique per run.
@@ -96,7 +101,7 @@ jobs:
   create-release:
     name: Create release
     needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -123,6 +128,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: >
           gh release create "${GITHUB_REF_NAME}"
+          --verify-tag
           --repo "${GITHUB_REPOSITORY}"
           --title "Release ${GITHUB_REF_NAME}"
           artifacts/macos.zip artifacts/linux.zip artifacts/windows.zip
