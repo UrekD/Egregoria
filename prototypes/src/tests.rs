@@ -239,3 +239,70 @@ fn p2_spine_service_name_cannot_collide_with_another_prototype_type() {
         }
     }
 }
+
+#[test]
+fn s5_cargo_and_storage_validation() {
+    let lua = mlua::Lua::new();
+    for (field, value) in [
+        ("cargo_capacity_units", 0),
+        ("dispatch_min_units", 17),
+        ("dispatch_max_wait_ticks", 0),
+        ("unlock_milestone", 4),
+    ] {
+        let company = s5_company_table(&lua);
+        company.set(field, value).unwrap();
+        let error = prototype_result([company]).expect_err(field);
+        assert!(error.contains(field), "{error}");
+    }
+
+    for (field, value) in [
+        ("capacity_units", 0),
+        ("low_water_units", 48),
+        ("high_water_units", 65),
+    ] {
+        let company = s5_company_table(&lua);
+        let storage: mlua::Table = company.get("storage").unwrap();
+        storage.set(field, value).unwrap();
+        let error = prototype_result([company]).expect_err(field);
+        assert!(error.contains(field), "{error}");
+    }
+
+    let company = s5_company_table(&lua);
+    let storage: mlua::Table = company.get("storage").unwrap();
+    storage.set("accepted_items", vec!["missing-item"]).unwrap();
+    let error = prototype_result([company]).expect_err("unknown warehouse item");
+    assert!(error.contains("accepted_items"), "{error}");
+    prototype_result([s5_company_table(&lua)]).unwrap();
+}
+
+fn s5_company_table(lua: &mlua::Lua) -> mlua::Table<'_> {
+    lua.load(
+        r#"return {
+            type = "goods-company", name = "test-depot", label = "Test Depot",
+            size = 20, bgen = "house", asset = "bakery.glb", price = 10,
+            kind = "factory", n_trucks = 1, n_workers = 1,
+            cargo_capacity_units = 16, dispatch_min_units = 8,
+            dispatch_max_wait_ticks = 1200,
+            storage = { capacity_units = 64, accepted_items = {},
+                        low_water_units = 16, high_water_units = 48,
+                        default_policy = "balanced" }
+        }"#,
+    )
+    .eval()
+    .unwrap()
+}
+
+#[test]
+fn s5_medium_density_lua_and_ordinal() {
+    use mlua::FromLua;
+    let lua = mlua::Lua::new();
+    for (name, density, ordinal) in [
+        ("low", Density::Low, 0),
+        ("medium", Density::Medium, 1),
+        ("high", Density::High, 2),
+    ] {
+        let value = mlua::Value::String(lua.create_string(name).unwrap());
+        assert_eq!(Density::from_lua(value, &lua).unwrap(), density);
+        assert_eq!(density.ordinal(), ordinal);
+    }
+}

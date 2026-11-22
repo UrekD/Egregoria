@@ -547,6 +547,8 @@ pub(crate) fn close_modal(uiw: &UiWorld) {
 }
 
 fn close_world_interaction(uiw: &UiWorld) -> bool {
+    *uiw.write::<crate::gui::PlacementPreview>() = Default::default();
+    let road = uiw.write::<crate::gui::InspectedRoad>().0.take().is_some();
     let mut tool = uiw.write::<Tool>();
     if *tool != Tool::Hand {
         let keep_road_tool =
@@ -568,7 +570,7 @@ fn close_world_interaction(uiw: &UiWorld) -> bool {
     let entity = uiw.write::<InspectedEntity>().e.take().is_some();
     let building = uiw.write::<InspectedBuilding>().e.take().is_some();
     let following = uiw.write::<FollowEntity>().0.take().is_some();
-    if entity || building || following || crate::gui::chat::close(uiw) {
+    if entity || building || road || following || crate::gui::chat::close(uiw) {
         return true;
     }
 

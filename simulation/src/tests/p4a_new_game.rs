@@ -129,6 +129,7 @@ fn p4a_starter_layout_is_connected_and_affordable_at_both_size_limits() {
                     seed,
                     terrain_chunks,
                     starting_money_bucks: NewGameOptions::MIN_STARTING_MONEY_BUCKS,
+                    ..Default::default()
                 };
                 let sim = Simulation::new_game(&opts).unwrap();
                 let map = sim.map();
@@ -199,4 +200,50 @@ fn p4a_seeded_new_game_replay_preserves_paused_batches_and_clock_changes() {
         slope: None,
     }]);
     super::assert_replay_matches(&city);
+}
+
+#[test]
+fn s5_zone_lock_precedes_charging_and_keeps_erase_available() {
+    use crate::economy::progression::ProgressionMode;
+    use crate::map::{ZoneGrid, ZoneKind};
+    use crate::world_command::{CommandOutcomes, Rejection};
+    use geom::{Vec2, OBB};
+    use prototypes::Density;
+
+    drop(super::TestCtx::new());
+    let area = OBB::new(vec2(256.0, 256.0), Vec2::X, 16.0, 16.0);
+    let paint = WorldCommand::ZonePaint {
+        area,
+        kind: Some(ZoneKind::Residential),
+        density: Density::High,
+    };
+    let mut guided = Simulation::new_game(&NewGameOptions {
+        progression: ProgressionMode::Guided,
+        ..options()
+    })
+    .unwrap();
+    let before = guided.hashes();
+    guided.apply_commands([&paint]);
+    assert_eq!(
+        guided.read::<CommandOutcomes>().last,
+        [("ZonePaint", Rejection::Locked { milestone: 2 })]
+    );
+    assert!(guided.read::<CommandOutcomes>().accepted.is_empty());
+    assert_eq!(guided.hashes(), before);
+
+    guided.apply_commands([&WorldCommand::ZonePaint {
+        area,
+        kind: None,
+        density: Density::High,
+    }]);
+    assert_eq!(guided.read::<CommandOutcomes>().accepted.len(), 1);
+
+    let mut free_build = Simulation::new_game(&options()).unwrap();
+    free_build.apply_commands([&paint]);
+    assert_eq!(free_build.read::<CommandOutcomes>().accepted.len(), 1);
+    assert!(free_build
+        .read::<ZoneGrid>()
+        .cells
+        .values()
+        .any(|cell| cell.density == Density::High));
 }

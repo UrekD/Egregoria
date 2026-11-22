@@ -5,11 +5,11 @@ use serde::{Deserialize, Serialize};
 
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::Budget;
-use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID, Map, MAX_ZONE_AREA};
+use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID, Map, RoadID, MAX_ZONE_AREA};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
 
-use super::{BuildingInfos, ElectricityFlow};
+use super::{BuildingInfos, ElectricityFlow, NetworkFlow};
 
 const RELATIVE_RATE_EPSILON: f64 = 1e-6;
 
@@ -34,6 +34,28 @@ pub struct BuildingUtilityStatus {
     pub water: UtilityStatus,
     pub sewage: UtilityStatus,
     pub totals: Option<UtilityTotals>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UtilityNetworkState {
+    Updating,
+    Disconnected,
+    Shortage,
+    Ok,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct UtilityNetworkReadout {
+    pub network: Option<ElectricityNetworkID>,
+    pub electricity: UtilityNetworkState,
+    pub water: UtilityNetworkState,
+    pub sewage: UtilityNetworkState,
+    pub power_totals: Option<NetworkFlow>,
+    pub utility_totals: Option<UtilityTotals>,
+}
+
+pub fn utility_network_at_road(_sim: &Simulation, _road: RoadID) -> Option<UtilityNetworkReadout> {
+    None
 }
 
 impl UtilityFlow {

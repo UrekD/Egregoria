@@ -45,6 +45,7 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
                         "Starter infrastructure",
                     ),
                     (BudgetCategory::Construction, "Construction"),
+                    (BudgetCategory::MilestoneGrant, "Milestone grants"),
                     (BudgetCategory::TradeImport, "Imports"),
                     (BudgetCategory::TradeExport, "Exports"),
                     (BudgetCategory::Tax(ZONES[0]), "Residential tax"),

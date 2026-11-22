@@ -18,16 +18,19 @@ use std::fmt::Debug;
 
 pub mod balance;
 mod budget;
+pub mod cargo;
 mod citystats;
 mod demand;
 mod ecostats;
 mod government;
 mod market;
+pub mod progression;
 pub mod transit_stats;
 mod trip_stats;
 
 use crate::map::{BuildingKind, LaneID, LaneKind, Map, TraverseDirection};
 use crate::map_dynamic::BuildingInfos;
+use crate::souls::household::settle_local_pickup;
 use crate::transportation::Location;
 use crate::world::HumanID;
 pub use budget::*;
@@ -85,7 +88,7 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
     }
     let mut buyer_lanes = BTreeMap::new();
     let mut seller_lanes = BTreeMap::new();
-    let trades = m.make_trades_filtered(
+    let mut trades = m.make_trades_filtered(
         |pos| {
             freights
                 .iter()
@@ -136,17 +139,21 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
                     == walking_component(&map, &mut components.labels, seller_lane)
             })
         },
-    );
+    ).to_vec();
+    drop((m, map, infos, components));
 
     let retail = ItemID::new("retail-goods");
-    let completed: Vec<_> = trades
-        .iter()
-        .copied()
-        .filter(|trade| trade.kind != retail || !matches!(trade.buyer.0, SoulID::Human(_)))
-        .collect();
-    resources.write::<EcoStats>().advance(tick.0, &completed);
+    trades.retain(|&trade| {
+        if trade.kind == job_opening {
+            return true;
+        }
+        if matches!(trade.buyer.0, SoulID::Human(_)) {
+            return !settle_local_pickup(world, resources, trade);
+        }
+        !cargo::settle_physical_match(world, resources, trade)
+    });
 
-    for &trade in trades.iter() {
+    for &trade in &trades {
         log::debug!("A trade was made! {:?}", trade);
 
         if trade.kind == job_opening {
@@ -182,6 +189,8 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
             SoulID::FreightStation(_) => {}
         }
     }
+    trades.retain(|trade| trade.kind != retail || !matches!(trade.buyer.0, SoulID::Human(_)));
+    resources.write::<EcoStats>().advance(tick.0, &trades);
 }
 
 /// Labels walking lanes connected by sidewalk corners and crossings for the current topology.

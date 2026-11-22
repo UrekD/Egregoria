@@ -6,8 +6,10 @@ use crate::map_dynamic::{
 use crate::souls::desire::{BuyFood, BuyGoods, Home, Work};
 use crate::souls::freight_station::FreightStation;
 use crate::souls::goods_company::GoodsCompanyState;
+use crate::souls::household::HouseholdStock;
 use crate::souls::human::{HumanDecision, PersonalInfo};
 use crate::souls::lifecycle;
+use crate::transportation::road_throughput::RoadUserKind;
 use crate::transportation::train::{Locomotive, LocomotiveReservation, RailWagon};
 use crate::transportation::{
     Location, Pedestrian, Speed, TransportGrid, Transporter, Vehicle, VehicleKind, VehicleState,
@@ -106,6 +108,8 @@ pub struct HumanEnt {
     pub work: Option<Work>,
 
     pub personal_info: Box<PersonalInfo>,
+    #[inspect(skip)]
+    pub household: HouseholdStock,
 }
 
 impl SimDrop for HumanEnt {
@@ -261,15 +265,25 @@ impl World {
         ))
     }
 
-    #[rustfmt::skip]
     pub fn query_it_trans_speed(
         &mut self,
-    ) -> impl Iterator<Item = (&mut Itinerary, &mut Transform, f32)> + '_ {
-        chain((
-            self.humans  .values_mut().map(|h| (&mut h.it, &mut h.trans, h.speed.0)),
-            self.trains  .values_mut().map(|h| (&mut h.it, &mut h.trans, h.speed.0)),
-            self.vehicles.values_mut().map(|h| (&mut h.it, &mut h.trans, h.speed.0)),
-        ))
+    ) -> impl Iterator<Item = (&mut Itinerary, &mut Transform, f32, Option<RoadUserKind>)> + '_ {
+        let humans = self.humans.values_mut().map(|human| {
+            let kind = (human.location == Location::Outside).then_some(RoadUserKind::Pedestrian);
+            (&mut human.it, &mut human.trans, human.speed.0, kind)
+        });
+        let trains = self.trains.values_mut().map(|train| {
+            (&mut train.it, &mut train.trans, train.speed.0, None)
+        });
+        let vehicles = self.vehicles.values_mut().map(|vehicle| {
+            let kind = match vehicle.vehicle.kind {
+                VehicleKind::Car => RoadUserKind::Car,
+                VehicleKind::Truck => RoadUserKind::Truck,
+                VehicleKind::Bus => RoadUserKind::Bus,
+            };
+            (&mut vehicle.it, &mut vehicle.trans, vehicle.speed.0, Some(kind))
+        });
+        chain((humans, trains, vehicles))
     }
 
 

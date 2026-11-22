@@ -1,6 +1,6 @@
 use crate::debug_gui::debug_window::DebugState;
 use crate::gui::follow::FollowEntity;
-use crate::gui::{InspectedBuilding, InspectedEntity};
+use crate::gui::{InspectedBuilding, InspectedEntity, InspectedRoad};
 use crate::uiworld::UiWorld;
 use geom::Vec3;
 use goryak::{button_primary, primary_link};
@@ -15,6 +15,9 @@ use slotmapd::Key;
 mod inspect_building;
 mod inspect_human;
 mod inspect_needs;
+mod inspect_road;
+mod inspect_utility;
+mod inspect_warehouse;
 mod inspect_train;
 mod inspect_vehicle;
 
@@ -28,7 +31,18 @@ pub fn new_inspector(uiworld: &UiWorld, sim: &Simulation) {
         }
     }
 
-    let e = unwrap_or!(uiworld.read::<InspectedEntity>().e, return);
+    let inspected_entity = uiworld.read::<InspectedEntity>().e;
+    let Some(e) = inspected_entity else {
+        let road = uiworld.read::<InspectedRoad>().0;
+        if inspected_building.e.is_none() {
+            if let Some(road) = road {
+                if !inspect_road::inspect_road(uiworld, sim, road) {
+                    uiworld.write::<InspectedRoad>().0 = None;
+                }
+            }
+        }
+        return;
+    };
 
     let force_debug_inspect = uiworld.read::<DebugState>().debug_inspector;
     if force_debug_inspect {

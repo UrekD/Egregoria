@@ -76,6 +76,7 @@ impl Simulation {
                 preset: options.preset,
                 seed: options.seed,
                 starting_money_bucks: options.starting_money_bucks,
+                progression: options.progression,
             },
         )
         .map_err(|error| format!("import bootstrap: {error:?}"))?;
@@ -291,6 +292,7 @@ mod tests {
             seed: 42,
             terrain_chunks: 16,
             starting_money_bucks: 1_000_000,
+            progression: crate::economy::progression::ProgressionMode::FreeBuild,
         };
         let (sim, report) = Simulation::from_imported_city(&city, &options).unwrap();
         let map = sim.map();

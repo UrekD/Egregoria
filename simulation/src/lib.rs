@@ -15,6 +15,7 @@ use common::saveload::{
 };
 use common::FastMap;
 use derive_more::{From, TryInto};
+use economy::progression::ProgressionMode;
 use economy::BudgetCategory;
 use geom::Vec3;
 use prototypes::{prototype, ColorsPrototype, ColorsPrototypeID, GameTime, Tick};
@@ -136,6 +137,7 @@ pub struct NewGameOptions {
     pub seed: u64,
     pub terrain_chunks: u16,
     pub starting_money_bucks: u32,
+    pub progression: ProgressionMode,
 }
 
 impl NewGameOptions {
@@ -196,6 +198,7 @@ impl Default for NewGameOptions {
             seed: legacy.seed,
             terrain_chunks: legacy.terrain_size,
             starting_money_bucks: legacy.starting_money_bucks,
+            progression: legacy.progression,
         }
     }
 }
@@ -208,6 +211,7 @@ pub struct SimulationOptions {
     pub preset: MapPreset,
     pub seed: u64,
     pub starting_money_bucks: u32,
+    pub progression: ProgressionMode,
 }
 
 impl SimulationOptions {
@@ -217,6 +221,7 @@ impl SimulationOptions {
         preset: MapPreset::Procedural,
         seed: 0,
         starting_money_bucks: 150_000,
+        progression: ProgressionMode::FreeBuild,
     };
 
     fn new_game_options(self) -> NewGameOptions {
@@ -225,6 +230,7 @@ impl SimulationOptions {
             seed: self.seed,
             terrain_chunks: self.terrain_size,
             starting_money_bucks: self.starting_money_bucks,
+            progression: self.progression,
         }
     }
 
@@ -285,6 +291,7 @@ impl Simulation {
             preset: options.preset,
             seed: options.seed,
             starting_money_bucks: options.starting_money_bucks,
+            progression: options.progression,
         }))
     }
 

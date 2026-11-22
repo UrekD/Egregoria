@@ -2,6 +2,7 @@ use goryak::{
     button_primary, button_secondary, error, minrow, on_secondary_container,
     selectable_label_primary, text_edit, textc,
 };
+use simulation::economy::progression::ProgressionMode;
 use simulation::{MapPreset, NewGameOptions, Simulation};
 
 use super::{self as session, PreparedWorld, SessionUi, WorldJobKind, WorldReplacement};
@@ -14,6 +15,7 @@ pub(super) struct NewGameForm {
     size: String,
     money: String,
     preset: MapPreset,
+    progression: ProgressionMode,
     advanced: bool,
     record_replay: bool,
     error: Option<&'static str>,
@@ -26,6 +28,7 @@ impl NewGameForm {
             seed: session::random_seed().to_string(),
             size: "50".into(),
             money: "150000".into(),
+            progression: ProgressionMode::Guided,
             ..Self::default()
         }
     }
@@ -62,6 +65,7 @@ impl NewGameForm {
             seed,
             terrain_chunks,
             starting_money_bucks,
+            progression: self.progression,
         })
     }
 }

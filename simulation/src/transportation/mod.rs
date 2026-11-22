@@ -16,6 +16,8 @@ use crate::{Simulation, World};
 
 pub mod pedestrian;
 pub mod road;
+pub mod road_throughput;
+pub use road_throughput::{RoadThroughput, RoadUserKind};
 pub mod testing_vehicles;
 pub mod traffic_metrics;
 pub mod train;

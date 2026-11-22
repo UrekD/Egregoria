@@ -200,6 +200,9 @@ pub fn citizen_diagnostics(sim: &Simulation, id: HumanID) -> Option<CitizenDiagn
     let intent_destination = match decision {
         HumanDecisionKind::GoTo(destination) => Some(*destination),
         HumanDecisionKind::DeliverAtBuilding(building) => Some(Destination::Building(*building)),
+        HumanDecisionKind::PickupBasket(_)
+        | HumanDecisionKind::DepositAtHome
+        | HumanDecisionKind::VisitLeisure(_) => None,
         _ => None,
     };
     let destination = intent_destination.or(citizen.router.target_dest.filter(|destination| {

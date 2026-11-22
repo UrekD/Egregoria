@@ -7,7 +7,7 @@ use wgpu::{
     VertexAttribute, VertexBufferLayout,
 };
 
-use geom::{vec2, vec3, Camera, HeightmapChunk, Intersect3, Matrix4, Vec2, AABB3};
+use geom::{vec2, vec3, Camera, HeightmapChunk, Intersect3, LinearColor, Matrix4, Vec2, AABB3};
 
 use crate::{
     bg_layout_litmesh, pbuffer::PBuffer, CompiledModule, Drawable, FrameContext, GfxContext,
@@ -19,6 +19,21 @@ const LOD_MIN_DIST_LOG2: f32 = 9.0; // 2^9 = 512, meaning until 1048m away, we u
 const MAX_HEIGHT: f32 = 2008.0;
 const MIN_HEIGHT: f32 = -40.0;
 const UPSCALE_LOD: usize = 2; // amount of LOD that are superior to base heightmap data
+
+/// World-aligned RGBA8 pixels with premultiplied color channels.
+pub struct GroundOverlayImage<'a> {
+    pub origin: Vec2,
+    pub extent: Vec2,
+    pub size: [u32; 2],
+    pub rgba: &'a [u8],
+    pub revision: u64,
+}
+
+pub struct GroundOverlayDisc {
+    pub center: Vec2,
+    pub radius: f32,
+    pub color: LinearColor,
+}
 
 /// CSIZE is the size of a chunk in meters
 /// CRESOLUTION is the resolution of a chunk, in vertices, at the chunk data level (not LOD0 since we upsample)
@@ -46,6 +61,10 @@ pub struct HeightmapPrepared {
 
 impl<const CSIZE: u32, const CRESOLUTION: usize> HeightmapRender<CSIZE, CRESOLUTION> {
     const LOD0_RESOLUTION: usize = CRESOLUTION * (1 << UPSCALE_LOD);
+
+    pub fn set_ground_overlay(&mut self, _gfx: &mut GfxContext, _image: GroundOverlayImage<'_>) {}
+
+    pub fn set_overlay_preview(&mut self, _gfx: &mut GfxContext, _preview: Option<GroundOverlayDisc>) {}
 
     pub fn new(gfx: &mut GfxContext, w: u32, h: u32) -> Self {
         debug_assert!(

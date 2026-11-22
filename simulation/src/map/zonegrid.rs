@@ -57,17 +57,13 @@ impl ZoneGrid {
             return None;
         }
 
-        let mut counts = BTreeMap::<_, (usize, usize)>::new();
+        let mut counts = BTreeMap::<_, [usize; 3]>::new();
         let mut total = 0;
         let mut zoned = 0;
         for key in cells_under(area) {
             total += 1;
             if let Some(cell) = self.cells.get(&key) {
-                let (low, high) = counts.entry(cell.kind).or_default();
-                match cell.density {
-                    Density::Low => *low += 1,
-                    Density::High => *high += 1,
-                }
+                counts.entry(cell.kind).or_default()[usize::from(cell.density.ordinal())] += 1;
                 zoned += 1;
             }
         }
@@ -75,14 +71,15 @@ impl ZoneGrid {
             return None;
         }
 
-        let (kind, (low, high)) = counts
+        let (kind, densities) = counts
             .into_iter()
-            .max_by_key(|&(kind, (low, high))| (low + high, Reverse(kind)))?;
-        let density = if high > low {
-            Density::High
-        } else {
-            Density::Low
-        };
+            .max_by_key(|(kind, counts)| (counts.iter().sum::<usize>(), Reverse(*kind)))?;
+        let density = [Density::Low, Density::Medium, Density::High]
+            .into_iter()
+            .max_by_key(|density| {
+                let ordinal = density.ordinal();
+                (densities[usize::from(ordinal)], Reverse(ordinal))
+            })?;
         Some(ZoneCell { kind, density })
     }
 }

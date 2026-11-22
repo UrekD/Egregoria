@@ -1,4 +1,9 @@
+use std::collections::BTreeMap;
+
+use prototypes::ItemID;
 use serde::{Deserialize, Serialize};
+
+use super::TICKS_PER_BUDGET_DAY;
 
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::Router;
@@ -10,6 +15,53 @@ pub enum TripMode {
     Walk,
     Car,
     Transit,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TripPurpose {
+    #[default]
+    Other,
+    Home,
+    Work,
+    Shopping,
+    Leisure,
+    School,
+    FreightOutbound,
+    FreightReturn,
+}
+
+/// Measurements indexed by elapsed day. Absent fields have yet to be measured.
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct DailyEconomyMetrics {
+    pub days: BTreeMap<u64, EconomyDayMetrics>,
+}
+
+impl DailyEconomyMetrics {
+    pub fn closed_day(&self, day: u64, elapsed_tick: u64) -> Option<&EconomyDayMetrics> {
+        (day < elapsed_tick / TICKS_PER_BUDGET_DAY)
+            .then(|| self.days.get(&day))
+            .flatten()
+    }
+
+    pub fn record_arrival(&mut self, day: u64, purpose: TripPurpose, ticks: u64) {
+        let trip = self.days.entry(day).or_default().trips_by_purpose.entry(purpose).or_default();
+        trip.completed += 1;
+        trip.duration_ticks += ticks;
+    }
+}
+
+#[derive(Default, Debug, Serialize, Deserialize)]
+pub struct EconomyDayMetrics {
+    pub baskets_due: Option<u64>,
+    pub baskets_filled: Option<u64>,
+    pub units_fulfilled_by_sku: BTreeMap<ItemID, u64>,
+    pub stockout_ticks_by_sku: BTreeMap<ItemID, u64>,
+    pub loads: Option<u64>,
+    pub load_units: Option<u64>,
+    pub late_loads: Option<u64>,
+    pub utility_served_demand: Option<f64>,
+    pub utility_total_demand: Option<f64>,
+    pub trips_by_purpose: BTreeMap<TripPurpose, TripModeStats>,
 }
 
 // The first three variants retain the serialized values of the original trip modes.
@@ -50,7 +102,7 @@ impl TripProgress {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 pub struct TripModeStats {
     pub completed: u64,
     pub duration_ticks: u64,
@@ -85,10 +137,19 @@ pub(crate) fn on_arrival(router: &mut Router, resources: &Resources) {
 }
 
 pub fn on_arrival_by_mode(router: &mut Router, resources: &Resources, mode: TripMode) {
+    let purpose = std::mem::take(&mut router.trip_purpose);
     let Some(start) = router.trip_start.take() else {
         return;
     };
-    let ticks = elapsed_ticks(resources).0.saturating_sub(start.0);
+    let now = elapsed_ticks(resources).0;
+    let ticks = now.saturating_sub(start.0);
+    if purpose != TripPurpose::Other {
+        resources.write::<DailyEconomyMetrics>().record_arrival(
+            now / TICKS_PER_BUDGET_DAY,
+            purpose,
+            ticks,
+        );
+    }
     let mut stats = resources.write::<TripStats>();
     let mode = match mode {
         TripMode::Walk => &mut stats.walk,
@@ -100,6 +161,7 @@ pub fn on_arrival_by_mode(router: &mut Router, resources: &Resources, mode: Trip
 }
 
 pub(crate) fn on_cancel(router: &mut Router) {
+    router.trip_purpose = TripPurpose::Other;
     on_start(router);
 }
 

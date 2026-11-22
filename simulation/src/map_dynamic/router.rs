@@ -1,4 +1,4 @@
-use crate::economy::{on_arrival, on_cancel, on_start, TripMode, TripProgress};
+use crate::economy::{on_arrival, on_cancel, on_start, TripMode, TripProgress, TripPurpose};
 use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::transit::{elapsed_ticks, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
@@ -37,6 +37,9 @@ pub struct Router {
     pub(crate) trip_mode: TripProgress,
     pub(crate) walk_only_pickup: bool,
     replan_at_alight: bool,
+    #[serde(default)]
+    #[inspect(skip)]
+    pub trip_purpose: TripPurpose,
     #[inspect(skip)]
     #[serde(skip)]
     transit_walks: Option<Box<[Option<ValidatedWalk>; 2]>>,
@@ -473,6 +476,7 @@ impl Router {
             last_error: None,
             trip_start: None,
             trip_mode: TripProgress::Walk,
+            trip_purpose: TripPurpose::Other,
             walk_only_pickup: false,
             replan_at_alight: false,
             transit_walks: None,
@@ -913,6 +917,7 @@ mod tests {
             WorkKind::Driver {
                 deliver_order: None,
                 truck: VehicleID::default(),
+                load: None,
             },
             0.0,
         ));

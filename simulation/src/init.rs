@@ -12,8 +12,10 @@ use flat_spatial::storage::CellIdx;
 use geom::Vec2;
 use prototypes::{GameTime, Tick};
 
+use crate::economy::cargo::{cargo_update, CargoBook};
+use crate::economy::progression::{progression_update, ProgressionState};
 use crate::economy::{
-    citystats_update, market_update, CityStats, EcoStats, Government, Market, TransitStats,
+    citystats_update, market_update, CityStats, DailyEconomyMetrics, EcoStats, Government, Market, TransitStats,
     TripStats,
 };
 use crate::map::Map;
@@ -30,9 +32,11 @@ use crate::souls::events::{events_update, Fires};
 use crate::souls::freight_station::freight_station_system;
 use crate::souls::goods_company::company_system;
 use crate::souls::happiness::{happiness_update, Happiness};
+use crate::souls::household::household_update;
 use crate::souls::human::update_decision_system;
 use crate::transportation::pedestrian_decision_system;
 use crate::transportation::road::{vehicle_decision_system, vehicle_state_update_system};
+use crate::transportation::road_throughput::RoadThroughput;
 use crate::transportation::testing_vehicles::{random_vehicles_update, RandomVehicles};
 use crate::transportation::train::{
     locomotive_system, train_reservations_update, TrainReservations,
@@ -78,6 +82,7 @@ fn register_systems_and_resources() {
     register_system("electricity_flow_system", electricity_flow_system);
     register_system("dispatch_system", dispatch_system);
     register_system("update_decision_system", update_decision_system);
+    register_system("household_update", household_update);
     register_system("company_system", company_system);
     register_system("pedestrian_decision_system", pedestrian_decision_system);
     register_system("transport_grid_synchronize", transport_grid_synchronize);
@@ -91,6 +96,7 @@ fn register_systems_and_resources() {
     register_system("routing_update_system", routing_update_system);
     register_system("itinerary_update", itinerary_update);
     register_system("market_update", market_update);
+    register_system("cargo_update", cargo_update);
     register_system("budget_update", crate::economy::budget_update);
     register_system("accrue_transit_upkeep", |world, resources| {
         crate::economy::accrue_transit_upkeep(world, resources);
@@ -117,6 +123,7 @@ fn register_systems_and_resources() {
 
     register_system_sim("add_souls_to_empty_buildings", add_souls_to_empty_buildings);
     register_system_sim("citystats_update", citystats_update);
+    register_system_sim("progression_update", progression_update);
 
     register_resource_noserialize::<crate::world_command::CommandOutcomes>();
     register_resource_noserialize::<ParCommandBuffer<VehicleEnt>>();
@@ -126,6 +133,7 @@ fn register_systems_and_resources() {
     register_resource_noserialize::<ParCommandBuffer<FreightStationEnt>>();
     register_resource_noserialize::<ParCommandBuffer<CompanyEnt>>();
     register_resource_noserialize::<crate::economy::WalkingComponents>();
+    register_resource_noserialize::<RoadThroughput>();
     register_resource_noserialize::<crate::souls::growth::GrowthCache>();
     register_resource_noinit::<SimulationOptions, Bincode>("simoptions");
 
@@ -157,6 +165,9 @@ fn register_systems_and_resources() {
     register_resource_default::<Transit, Bincode>("transit");
     register_resource_default::<TripStats, Bincode>("trip_stats");
     register_resource_default::<TransitStats, Bincode>("transit_stats");
+    register_resource_default::<ProgressionState, Bincode>("progression");
+    register_resource_default::<CargoBook, Bincode>("cargo_book");
+    register_resource_default::<DailyEconomyMetrics, Bincode>("daily_economy_metrics");
 }
 
 // Match flat_spatial::Grid's Bincode layout while ordering the storage cells by

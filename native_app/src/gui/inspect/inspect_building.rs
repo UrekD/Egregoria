@@ -192,6 +192,7 @@ fn density_name(density: Density) -> &'static str {
     match density {
         Density::Low => "Low",
         Density::High => "High",
+        Density::Medium => "Medium",
     }
 }
 

@@ -1,13 +1,38 @@
 use crate::{get_lua, BuildingPrototype, Prototype, ResidencePrototypeID};
 use mlua::{FromLua, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
+use std::cmp::Ordering;
 use std::ops::Deref;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Density {
     #[default]
     Low,
     High,
+    Medium,
+}
+
+impl Density {
+    /// Density order for comparisons and indexing. Enum variants retain their serialized order.
+    pub const fn ordinal(self) -> u8 {
+        match self {
+            Self::Low => 0,
+            Self::Medium => 1,
+            Self::High => 2,
+        }
+    }
+}
+
+impl Ord for Density {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.ordinal().cmp(&other.ordinal())
+    }
+}
+
+impl PartialOrd for Density {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
 }
 
 impl<'lua> FromLua<'lua> for Density {
@@ -16,6 +41,7 @@ impl<'lua> FromLua<'lua> for Density {
         match density.as_str() {
             "low" => Ok(Self::Low),
             "high" => Ok(Self::High),
+            "medium" => Ok(Self::Medium),
             _ => Err(mlua::Error::external(format!("Unknown density: {density}"))),
         }
     }

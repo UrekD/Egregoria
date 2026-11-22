@@ -15,6 +15,7 @@ pub mod freight_station;
 pub mod goods_company;
 pub mod growth;
 pub mod happiness;
+pub mod household;
 pub mod human;
 pub mod lifecycle;
 pub mod residence;

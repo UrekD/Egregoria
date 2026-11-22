@@ -22,7 +22,7 @@ use crate::gui::zoneedit::ZoneEditState;
 use crate::gui::zoning::ZoningState;
 use crate::gui::{
     ErrorTooltip, ExitState, GuiState, InspectedBuilding, InspectedEntity, PotentialCommands,
-    TimeAlways, ToastState, Tool,
+    InspectedRoad, PlacementPreview, TimeAlways, ToastState, Tool,
 };
 use crate::inputmap::{Bindings, InputMap};
 use crate::network::NetworkState;
@@ -71,6 +71,8 @@ fn register_ui_resources() {
     register_resource_noserialize::<InputMap>();
     register_world_resource::<InspectedEntity>();
     register_world_resource::<InspectedBuilding>();
+    register_world_resource::<InspectedRoad>();
+    register_world_resource::<PlacementPreview>();
     register_resource_noserialize::<OverlayMode>();
     register_world_resource::<ToastState>();
     register_resource_noserialize::<NetworkState>();

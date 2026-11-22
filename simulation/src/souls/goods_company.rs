@@ -315,6 +315,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                 work.kind = WorkKind::Driver {
                     truck,
                     deliver_order: None,
+                    load: None,
                 };
                 c.comp.driver = Some(driver);
             }
@@ -330,6 +331,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             let WorkKind::Driver {
                 truck,
                 deliver_order: None,
+                ..
             } = w.kind
             else {
                 return;

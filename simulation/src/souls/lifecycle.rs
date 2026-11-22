@@ -1,3 +1,4 @@
+use crate::economy::cargo::CargoBook;
 use geom::Vec3;
 use itertools::Itertools;
 use prototypes::{GameTime, ItemID};
@@ -152,6 +153,7 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
 }
 
 pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: CompanyEnt) {
+    sim.write::<CargoBook>().policies.remove(&id);
     sim.read::<ParCommandBuffer<VehicleEnt>>()
         .kill_all(&company.comp.trucks);
     clear_soul_references(sim, SoulID::GoodsCompany(id));
@@ -543,6 +545,7 @@ fn decision_references_buildings(
 ) -> bool {
     match decision {
         HumanDecisionKind::GoTo(Destination::Building(id))
+        | HumanDecisionKind::VisitLeisure(id)
         | HumanDecisionKind::DeliverAtBuilding(id) => buildings.contains_key(id),
         HumanDecisionKind::MultiStack(steps) => steps
             .iter()
@@ -584,6 +587,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
             } else if let WorkKind::Driver {
                 deliver_order,
                 truck,
+                ..
             } = &mut work.kind
             {
                 if deliver_order.is_some_and(|id| buildings.contains_key(&id)) {

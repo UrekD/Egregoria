@@ -1,4 +1,6 @@
+mod ground;
 mod legend;
+pub(crate) use ground::prepare_ground;
 mod traffic;
 mod transit;
 pub(crate) mod view;

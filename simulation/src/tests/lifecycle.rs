@@ -321,6 +321,7 @@ fn removing_a_company_frees_trucks_and_workers_and_discards_pending_trades() {
         WorkKind::Driver {
             truck,
             deliver_order: Some(other_house),
+            load: None,
         },
         0.0,
     ));
@@ -649,6 +650,7 @@ fn staffed_factory(
         WorkKind::Driver {
             truck,
             deliver_order: None,
+            load: None,
         },
         0.0,
     ));
@@ -711,7 +713,7 @@ fn deleted_active_truck_is_replaced_for_pending_deliveries() {
     let driver = driver.min(worker);
     let human = test.g.world_mut_unchecked().humans.get_mut(driver).unwrap();
     assert!(matches!(human.work.as_ref().unwrap().kind,
-        WorkKind::Driver { truck, deliver_order: Some(target) } if truck == replacement && target == station));
+        WorkKind::Driver { truck, deliver_order: Some(target), .. } if truck == replacement && target == station));
     // Exercise delivery completion after the replacement driver reaches the target.
     human.decision.kind = HumanDecisionKind::DeliverAtBuilding(station);
     human.decision.wait = 0;
@@ -719,7 +721,7 @@ fn deleted_active_truck_is_replaced_for_pending_deliveries() {
     assert_eq!(test.g.get(station_soul).unwrap().f.waiting_cargo, 1);
     let work = test.g.get(driver).unwrap().work.as_ref().unwrap();
     assert!(matches!(work.kind,
-        WorkKind::Driver { truck, deliver_order: Some(target) } if truck == replacement && target == customer));
+        WorkKind::Driver { truck, deliver_order: Some(target), .. } if truck == replacement && target == customer));
 }
 
 #[test]

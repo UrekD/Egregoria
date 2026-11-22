@@ -1,13 +1,15 @@
 use crate::map::{
-    LaneID, LaneKind, Map, PathKind, Pathfinder, Traversable, TraverseDirection, TraverseKind,
+    LaneID, LaneKind, Map, PathKind, Pathfinder, RoadID, Traversable, TraverseDirection, TraverseKind,
 };
+use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
+use crate::transportation::RoadThroughput;
 use crate::utils::resources::Resources;
 use crate::world::TrainID;
 use crate::World;
 use egui_inspect::egui::Ui;
 use egui_inspect::{Inspect, InspectArgs};
-use geom::{Follower, PolyLine3, Polyline3Queue, Transform, Vec3};
+use geom::{Follower, PolyLine3, Polyline3Queue, Vec3};
 use prototypes::{GameTime, Tick, DELTA};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -327,11 +329,17 @@ impl Itinerary {
         Some(it)
     }
 
-    fn advance(&mut self, map: &Map, position: Vec3) -> Option<Vec3> {
+    fn advance(
+        &mut self,
+        map: &Map,
+        position: Vec3,
+        on_road_entry: &mut impl FnMut(RoadID),
+    ) -> Option<Vec3> {
         let v = self.reversed_local_path.pop();
 
         if self.reversed_local_path.is_empty() {
             if let ItineraryKind::Route(ref mut r, pathkind) = self.kind {
+                let previous = r.cur;
                 r.cur = r.reversed_route.pop()?;
 
                 let points = match r.cur.points(map) {
@@ -363,6 +371,25 @@ impl Itinerary {
                     self.reversed_local_path = points.into_vec();
                 }
                 self.reversed_local_path.reverse();
+
+                if pathkind != PathKind::Rail {
+                    if let TraverseKind::Lane(id) = r.cur.kind {
+                        let previous_lane = match previous.kind {
+                            TraverseKind::Lane(lane) => lane,
+                            TraverseKind::Turn(turn) => match previous.dir {
+                                TraverseDirection::Forward => turn.src,
+                                TraverseDirection::Backward => turn.dst,
+                            },
+                        };
+                        if let Some(lane) = map.get(id) {
+                            if map.get(previous_lane).map(|previous| previous.parent)
+                                != Some(lane.parent)
+                            {
+                                on_road_entry(lane.parent);
+                            }
+                        }
+                    }
+                }
             }
         }
         v
@@ -376,9 +403,14 @@ impl Itinerary {
         time: u32,
         map: &Map,
     ) -> Vec3 {
-        self.update_with_route(position, dist_to_move, time, map, |start, target, kind| {
-            Self::route_to_target(tick, start, target, map, kind)
-        })
+        self.update_with_route(
+            position,
+            dist_to_move,
+            time,
+            map,
+            |start, target, kind| Self::route_to_target(tick, start, target, map, kind),
+            |_| {},
+        )
     }
 
     fn update_with_route(
@@ -388,6 +420,7 @@ impl Itinerary {
         time: u32,
         map: &Map,
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
+        mut on_road_entry: impl FnMut(RoadID),
     ) -> Vec3 {
         if let ItineraryKind::Route(ref active, kind) = self.kind {
             if matches!(active.target, ItineraryTarget::DirectedLane(..))
@@ -402,12 +435,12 @@ impl Itinerary {
                 dist_to_move -= dist;
                 position = p;
                 if self.is_terminal() {
-                    self.advance(map, position);
+                    self.advance(map, position, &mut on_road_entry);
                     return p;
                 }
 
                 if self.remaining_points() > 1 {
-                    self.advance(map, position);
+                    self.advance(map, position, &mut on_road_entry);
                     continue;
                 }
 
@@ -417,7 +450,7 @@ impl Itinerary {
                 });
 
                 if k.can_pass(time, map.lanes()) {
-                    self.advance(map, position);
+                    self.advance(map, position, &mut on_road_entry);
                     continue;
                 }
                 return p;
@@ -652,9 +685,12 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     let map = &*resources.read::<Map>();
     let failures = &mut resources.write::<ParkingManagement>().reroute_failures;
     failures.sync_map(map);
+    let mut throughput = resources.write::<RoadThroughput>();
+    let tick = elapsed_ticks(resources).0;
+    throughput.sync_map(map);
 
     world.query_it_trans_speed().for_each(
-        |(it, trans, speed): (&mut Itinerary, &mut Transform, f32)| {
+        |(it, trans, speed, kind)| {
             // A stationary entity with a route may still cross an itinerary
             // boundary. Only the inert itinerary kinds can skip movement here.
             if it.reversed_local_path.is_empty()
@@ -668,6 +704,11 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                 time.seconds,
                 map,
                 |start, target, kind| failures.route(time.tick, start, target, map, kind),
+                |road| {
+                    if let Some(kind) = kind {
+                        throughput.record_entry(road, kind, tick);
+                    }
+                },
             );
         },
     );

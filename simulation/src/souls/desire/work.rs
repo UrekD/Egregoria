@@ -1,3 +1,4 @@
+use crate::economy::cargo::LoadId;
 use crate::map::BuildingID;
 use crate::map_dynamic::{Destination, Router};
 use crate::souls::human::HumanDecisionKind;
@@ -12,6 +13,8 @@ pub enum WorkKind {
     Driver {
         deliver_order: Option<BuildingID>,
         truck: VehicleID,
+        #[serde(default)]
+        load: Option<LoadId>,
     },
     Worker,
 }
@@ -45,6 +48,7 @@ impl Work {
             WorkKind::Driver {
                 deliver_order,
                 truck,
+                ..
             } => {
                 if &Location::Building(self.workplace) != loc {
                     MultiStack(vec![

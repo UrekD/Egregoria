@@ -448,6 +448,7 @@ mod tests {
             WorkKind::Driver {
                 truck,
                 deliver_order: None,
+                load: None,
             },
             0.0,
         ));

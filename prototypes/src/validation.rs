@@ -22,6 +22,16 @@ pub enum ValidationError {
 pub(crate) fn validate(proto: &Prototypes) -> Result<(), MultiError<ValidationError>> {
     let mut errors = vec![];
 
+    for building in proto.building.values() {
+        if building.unlock_milestone.is_some_and(|milestone| milestone > 3) {
+            errors.push(ValidationError::InvalidField(
+                building.name.clone(),
+                "unlock_milestone",
+                "must be in [0, 3]".into(),
+            ));
+        }
+    }
+
     for service in proto.service.values() {
         for (invalid, field, message) in [
             (
@@ -71,6 +81,56 @@ pub(crate) fn validate(proto: &Prototypes) -> Result<(), MultiError<ValidationEr
     }
 
     for comp in proto.goods_company.values() {
+        for (invalid, field, message) in [
+            (
+                comp.cargo_capacity_units == Some(0),
+                "cargo_capacity_units",
+                "must be positive",
+            ),
+            (
+                comp.dispatch_min_units.is_some_and(|minimum| {
+                    comp.cargo_capacity_units.is_none_or(|capacity| minimum > capacity)
+                }),
+                "dispatch_min_units",
+                "requires cargo_capacity_units and must not exceed it",
+            ),
+            (
+                comp.dispatch_max_wait_ticks == Some(0),
+                "dispatch_max_wait_ticks",
+                "must be positive",
+            ),
+        ] {
+            if invalid {
+                errors.push(ValidationError::InvalidField(comp.name.clone(), field, message.into()));
+            }
+        }
+
+        if let Some(storage) = &comp.storage {
+            for (invalid, field, message) in [
+                (storage.capacity_units == 0, "storage.capacity_units", "must be positive"),
+                (
+                    storage.low_water_units >= storage.high_water_units,
+                    "storage.low_water_units",
+                    "must be below high_water_units",
+                ),
+                (
+                    storage.high_water_units > storage.capacity_units,
+                    "storage.high_water_units",
+                    "must not exceed capacity_units",
+                ),
+            ] {
+                if invalid {
+                    errors.push(ValidationError::InvalidField(comp.name.clone(), field, message.into()));
+                }
+            }
+            if storage.accepted_items.iter().any(|item| !proto.item.contains_key(item)) {
+                errors.push(ValidationError::ReferencedProtoNotFound(
+                    comp.name.clone(),
+                    "storage.accepted_items",
+                ));
+            }
+        }
+
         if comp.n_trucks > 0 && comp.kind != CompanyKind::Factory {
             errors.push(ValidationError::WrongTrucks(comp.name.clone()));
         }

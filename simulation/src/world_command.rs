@@ -10,6 +10,8 @@ use prototypes::BuildingGen;
 use prototypes::GameTime;
 use WorldCommand::*;
 
+use crate::economy::cargo::{CargoBook, WarehousePolicy};
+use crate::economy::progression::{can_build, BuildCapability, ProgressionState};
 use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
@@ -25,7 +27,7 @@ use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::train::{spawn_train, RailWagonKind};
 use crate::transportation::{spawn_parked_vehicle_with_spot, unpark, VehicleKind};
 use crate::utils::rand_provider::RandProvider;
-use crate::{Replay, Simulation, SimulationOptions};
+use crate::{CompanyID, Replay, Simulation, SimulationOptions, SoulID};
 
 #[derive(Clone, Default)]
 pub struct WorldCommands {
@@ -134,6 +136,10 @@ pub enum WorldCommand {
         line: LineID,
         fare: Money,
     },
+    SetWarehousePolicy {
+        building: BuildingID,
+        policy: WarehousePolicy,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +159,8 @@ pub enum Rejection {
     TransitNotImplemented,
     UnexpectedInit,
     InvalidInitOptions,
+    Locked { milestone: u8 },
+    InvalidWarehouse,
 }
 
 #[derive(Default)]
@@ -305,6 +313,7 @@ impl WorldCommand {
                 | TransitRemoveLine { .. }
                 | TransitSetVehicles { .. }
                 | TransitSetFare { .. }
+                | SetWarehousePolicy { .. }
         )
     }
 
@@ -315,6 +324,11 @@ impl WorldCommand {
     pub(crate) fn apply_in_batch(&self, sim: &mut Simulation, construction: BudgetCategory) {
         if matches!(self, Init(_)) {
             self.reject(sim, Rejection::UnexpectedInit);
+            return;
+        }
+
+        if let Err(reason) = self.validate_progression(sim) {
+            self.reject(sim, reason);
             return;
         }
 
@@ -385,8 +399,47 @@ impl WorldCommand {
             TransitRemoveLine { .. } => "TransitRemoveLine",
             TransitSetVehicles { .. } => "TransitSetVehicles",
             TransitSetFare { .. } => "TransitSetFare",
+            SetWarehousePolicy { .. } => "SetWarehousePolicy",
         };
         sim.write::<CommandOutcomes>().last.push((kind, reason));
+    }
+
+    fn validate_progression(&self, sim: &Simulation) -> Result<(), Rejection> {
+        let capability = match self {
+            MapBuildSpecialBuilding { kind: BuildingKind::GoodsCompany(id), .. } => {
+                BuildCapability::Prototype(*id)
+            }
+            // Rail freight connectors are available at the start.
+            ZonePaint { kind: Some(_), density, .. } if *density != Density::Low => {
+                BuildCapability::ZoneDensity(*density)
+            }
+            TransitCreateLine { .. } | TransitSetVehicles { n: 1.., .. } => {
+                BuildCapability::BusService
+            }
+            _ => return Ok(()),
+        };
+        can_build(sim, capability).map_err(|lock| Rejection::Locked {
+            milestone: lock.milestone,
+        })
+    }
+
+    fn warehouse_company(sim: &Simulation, building: BuildingID) -> Result<CompanyID, Rejection> {
+        let map = sim.map();
+        let site = map.get(building).ok_or(Rejection::MissingReference)?;
+        let Some(id) = site.kind.as_goods_company() else {
+            return Err(Rejection::InvalidWarehouse);
+        };
+        let Some(SoulID::GoodsCompany(owner)) = sim.read::<BuildingInfos>().owner(building) else {
+            return Err(Rejection::InvalidWarehouse);
+        };
+        let company = sim.world().companies.get(owner).ok_or(Rejection::MissingReference)?;
+        if company.comp.building != building
+            || company.comp.proto != id
+            || try_prototype(id).is_none_or(|proto| proto.storage.is_none())
+        {
+            return Err(Rejection::InvalidWarehouse);
+        }
+        Ok(owner)
     }
 
     fn validate(&self, map: &Map) -> Result<(), Rejection> {
@@ -739,6 +792,10 @@ impl WorldCommand {
             MapLoadTestField { pos, size, spacing } => {
                 load_testfield(&mut sim.map_mut(), pos, size, spacing)
             }
+            SetWarehousePolicy { building, policy } => {
+                let company = Self::warehouse_company(sim, building)?;
+                sim.write::<CargoBook>().policies.insert(company, policy);
+            }
             Init(_) => return Err(Rejection::UnexpectedInit),
             UpdateZone { building, ref zone } => {
                 sim.map_mut()
@@ -807,6 +864,7 @@ impl WorldCommand {
         }
         info!("Initializing world with {options:?}");
         sim.insert(RandProvider::for_world(options.seed));
+        sim.write::<ProgressionState>().mode = options.progression;
         sim.insert(Government {
             money: Money::new_bucks(i64::from(options.starting_money_bucks)),
         });

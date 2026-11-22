@@ -49,6 +49,7 @@ const OPTIONS: NewGameOptions = NewGameOptions {
     seed: 46_360_514_160,
     terrain_chunks: 16,
     starting_money_bucks: 1_000_000,
+    progression: simulation::economy::progression::ProgressionMode::FreeBuild,
 };
 const STATION: Vec2 = vec2(3890.0, 4080.0);
 const CAMERA: SlotCamera = SlotCamera {

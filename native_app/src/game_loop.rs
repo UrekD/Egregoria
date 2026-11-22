@@ -254,6 +254,13 @@ impl engine::framework::State for State {
             // Scripted map changes are applied through ticks, so the tick identifies the snapshot.
             map_renderer.meshb.set_map_version(sim.get_tick());
         }
+        gui::overlays::prepare_ground(
+            &self.uiw,
+            &sim,
+            map_renderer,
+            &mut ctx.gfx,
+            self.uiw.read::<SessionState>().generation,
+        );
         map_renderer.render(
             &sim.map(),
             time.seconds,

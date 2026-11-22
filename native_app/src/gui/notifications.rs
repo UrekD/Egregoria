@@ -598,6 +598,11 @@ fn command_message(command: &str, reason: Rejection) -> &'static str {
         (_, TransitNotImplemented) => "Transit editing is unavailable",
         (_, UnexpectedInit) => "Init is available only when creating a world",
         (_, InvalidInitOptions) => "Invalid world options",
+        (_, Locked { milestone: 1 }) => "Unlocks at 100 citizens",
+        (_, Locked { milestone: 2 }) => "Unlocks at 250 citizens",
+        (_, Locked { milestone: 3 }) => "Unlocks at 500 citizens",
+        (_, Locked { .. }) => "Locked by city progression",
+        (_, InvalidWarehouse) => "Choose an active warehouse",
     }
 }
 

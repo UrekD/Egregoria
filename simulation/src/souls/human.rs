@@ -1,7 +1,9 @@
+use crate::economy::cargo::settle_delivery;
 use crate::economy::{Bought, Market};
 use crate::map::BuildingID;
 use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, Router};
 use crate::souls::desire::{BuyFood, BuyGoods, Home, Work, WorkKind};
+use crate::souls::household::{BasketId, HouseholdStock};
 use crate::souls::residence::Residences;
 use crate::transportation::Speed;
 use crate::transportation::{
@@ -32,6 +34,9 @@ pub enum HumanDecisionKind {
     GoTo(Destination),
     DeliverAtBuilding(BuildingID),
     MultiStack(Vec<HumanDecisionKind>),
+    PickupBasket(BasketId),
+    DepositAtHome,
+    VisitLeisure(BuildingID),
 }
 
 #[derive(Debug, Serialize, Deserialize, Inspect)]
@@ -84,7 +89,7 @@ impl Default for HumanDecisionKind {
 impl HumanDecisionKind {
     pub(crate) fn references_building(&self, building: BuildingID) -> bool {
         match self {
-            Self::GoTo(Destination::Building(id)) | Self::DeliverAtBuilding(id) => *id == building,
+            Self::GoTo(Destination::Building(id)) | Self::DeliverAtBuilding(id) | Self::VisitLeisure(id) => *id == building,
             Self::MultiStack(steps) => steps.iter().any(|step| step.references_building(building)),
             _ => false,
         }
@@ -104,13 +109,16 @@ impl HumanDecisionKind {
         binfos: &BuildingInfos,
         map: &Map,
         cbuf_freight: &ParCommandBuffer<FreightStationEnt>,
-        work: Option<&mut Work>,
+        cbuf: &ParCommandBuffer<HumanEnt>,
+        driver: HumanID,
+        location: &Location,
+        mut work: Option<&mut Work>,
     ) -> bool {
         match *self {
             HumanDecisionKind::GoTo(dest) => router.go_to(dest),
             HumanDecisionKind::MultiStack(ref mut decisions) => {
                 if let Some(d) = decisions.last_mut() {
-                    if d.update(router, binfos, map, cbuf_freight, work) {
+                    if d.update(router, binfos, map, cbuf_freight, cbuf, driver, location, work) {
                         decisions.pop();
                     }
                     false
@@ -123,6 +131,9 @@ impl HumanDecisionKind {
                 true
             }
             HumanDecisionKind::DeliverAtBuilding(bid) => {
+                if settle_delivery(cbuf, driver, location, bid, work.as_deref_mut()) {
+                    return true;
+                }
                 if let Some(WorkKind::Driver { deliver_order, .. }) =
                     work.map(|work| &mut work.kind)
                 {
@@ -145,7 +156,10 @@ impl HumanDecisionKind {
                 }
                 true
             }
-            HumanDecisionKind::Yield => true,
+            HumanDecisionKind::Yield
+            | HumanDecisionKind::PickupBasket(_)
+            | HumanDecisionKind::DepositAtHome
+            | HumanDecisionKind::VisitLeisure(_) => true,
         }
     }
 }
@@ -230,7 +244,7 @@ pub fn update_decision(
     decision.wait = (30.0 + common::rand::rand2(pos.x, pos.y) * 50.0) as u8;
     if !decision
         .kind
-        .update(router, binfos, map, cbuf_freight, work.as_deref_mut())
+        .update(router, binfos, map, cbuf_freight, cbuf, me, loc, work.as_deref_mut())
     {
         return;
     }
@@ -326,6 +340,7 @@ pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
         collider: None,
         work: None,
         personal_info,
+        household: HouseholdStock::default(),
     });
 
     let key = id.data().as_ffi();

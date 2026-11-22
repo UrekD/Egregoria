@@ -3,6 +3,7 @@ pub mod budget;
 pub mod citystats;
 pub mod economy;
 pub mod load;
+mod progression;
 pub mod settings;
 pub(crate) mod transit_lines;
 
@@ -28,6 +29,7 @@ pub struct GUIWindows {
     save_as_open: bool,
     advisor_open: bool,
     transit_lines_open: bool,
+    pub progression_open: bool,
     #[cfg(feature = "multiplayer")]
     network_open: bool,
 }
@@ -44,6 +46,10 @@ impl GUIWindows {
 
         if button_primary("City Stats").show().clicked {
             self.citystats_open ^= true;
+        }
+
+        if button_primary("Progression").show().clicked {
+            self.progression_open ^= true;
         }
 
         if button_primary("Transit").show().clicked {
@@ -78,6 +84,7 @@ impl GUIWindows {
         budget::budget(uiworld, sim, &mut self.budget_open);
         citystats::citystats(uiworld, sim, &mut self.citystats_open);
         transit_lines::transit_lines(uiworld, &mut self.transit_lines_open);
+        progression::render(uiworld, sim, &mut self.progression_open);
         settings::settings(uiworld, sim, &mut self.settings_open);
         if show_unfinished_ui {
             stub_window("Save As", &mut self.save_as_open);
@@ -142,6 +149,7 @@ impl GUIWindows {
             ("Budget", &mut self.budget_open),
             ("City Stats", &mut self.citystats_open),
             ("Transit", &mut self.transit_lines_open),
+            ("Progression", &mut self.progression_open),
             ("Settings", &mut self.settings_open),
             ("Save As", &mut self.save_as_open),
             ("Advisor", &mut self.advisor_open),

@@ -37,6 +37,7 @@ pub struct BuildingPrototype {
     pub water_production: Option<f32>,
     pub sewage_capacity: Option<f32>,
     pub pollution: Option<f32>,
+    pub unlock_milestone: Option<u8>,
 }
 
 impl Prototype for BuildingPrototype {
@@ -59,6 +60,7 @@ impl Prototype for BuildingPrototype {
             water_production: nonnegative_rate(table, "water_production")?,
             sewage_capacity: nonnegative_rate(table, "sewage_capacity")?,
             pollution: nonnegative_rate(table, "pollution")?,
+            unlock_milestone: get_lua(table, "unlock_milestone")?,
         })
     }
 

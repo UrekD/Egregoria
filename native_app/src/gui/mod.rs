@@ -1,7 +1,9 @@
 use crate::gui::windows::GUIWindows;
 use crate::uiworld::UiWorld;
+use geom::OBB;
+use prototypes::GoodsCompanyID;
 use serde::{Deserialize, Serialize};
-use simulation::map::BuildingID;
+use simulation::map::{BuildingID, RoadID};
 use simulation::world_command::WorldCommand;
 use simulation::{AnyEntity, Simulation};
 use std::borrow::Cow;
@@ -43,6 +45,13 @@ impl Default for GuiState {
 
 pub fn run_ui_systems(sim: &Simulation, uiworld: &UiWorld) {
     profiling::scope!("gui::run_ui_systems");
+    let tool = *uiworld.read::<Tool>();
+    if tool != Tool::Hand {
+        uiworld.write::<InspectedRoad>().0 = None;
+    }
+    if tool != Tool::SpecialBuilding {
+        *uiworld.write::<PlacementPreview>() = PlacementPreview::default();
+    }
     bulldozer::bulldozer(sim, uiworld);
     inspected_aura::inspected_aura(sim, uiworld);
     lotbrush::lotbrush(sim, uiworld);
@@ -97,6 +106,24 @@ impl PotentialCommands {
 pub struct InspectedBuilding {
     pub e: Option<BuildingID>,
     pub dontclear: bool,
+}
+
+#[derive(Copy, Clone, Debug, Default)]
+pub struct InspectedRoad(pub Option<RoadID>);
+
+#[derive(Clone, Debug)]
+pub struct PendingPlacement {
+    pub world_generation: u64,
+    /// Last command outcome sequence observed before submitting this command.
+    pub after_batch: u64,
+    pub command: WorldCommand,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct PlacementPreview {
+    pub company: Option<GoodsCompanyID>,
+    pub ghost: Option<(OBB, RoadID)>,
+    pub pending: Option<PendingPlacement>,
 }
 
 #[derive(Copy, Clone, Debug)]

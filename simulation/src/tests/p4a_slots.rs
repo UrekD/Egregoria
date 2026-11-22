@@ -210,3 +210,46 @@ fn p4a_failed_slot_load_leaves_the_entire_family_unchanged() {
         matches!(fs::metadata(root.0.join("missing.zip")), Err(err) if err.kind() == ErrorKind::NotFound)
     );
 }
+
+#[test]
+fn s5_slot_reports_0_8_7_as_incompatible() {
+    let root = TestRoot::new();
+    let id = SlotId::legacy();
+    let paths = slot_paths(&root.0, &id).unwrap();
+    let bytes = Bincode::encode(&crate::SaveHeader {
+        version: "0.8.7".into(),
+    })
+    .unwrap();
+    fs::write(&paths.bc, bytes).unwrap();
+    assert!(matches!(
+        Simulation::load_from_slot(&root.0, &id),
+        Err(SaveLoadError::Incompatible { version }) if version == "0.8.7"
+    ));
+}
+
+#[test]
+fn s5_progression_mode_survives_slot_and_replay_round_trips() {
+    use crate::economy::progression::{ProgressionMode, ProgressionState};
+
+    let root = TestRoot::new();
+    let id = SlotId::new("progression").unwrap();
+    let options = options();
+    for mode in [ProgressionMode::Guided, ProgressionMode::FreeBuild] {
+        let city = Simulation::new_game_with_replay(&NewGameOptions {
+            progression: mode,
+            ..options
+        })
+        .unwrap();
+        assert_eq!(city.read::<ProgressionState>().mode, mode);
+        city.save_to_slot(&root.0, &id, SnapshotRevision::new(mode as u128 + 1))
+            .unwrap();
+
+        let snapshot = Simulation::load_from_slot(&root.0, &id).unwrap();
+        let replay = Simulation::load_replay_from_slot(&root.0, &id).unwrap();
+        let (replayed, _) = Simulation::try_from_replay(replay).unwrap();
+        for restored in [snapshot, replayed] {
+            assert_eq!(restored.read::<ProgressionState>().mode, mode);
+            assert_eq!(restored.hashes(), city.hashes());
+        }
+    }
+}
