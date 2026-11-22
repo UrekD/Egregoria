@@ -209,6 +209,7 @@ fn determinism_detects_a_difference_at_a_checkpoint() {
     let mut ctx = ScenarioCtx::new(SimulationOptions {
         terrain_size: 0,
         save_replay: false,
+        ..SimulationOptions::LEGACY
     });
     let checkpoint_tick = ctx.sim.get_tick() + 10_000;
     let mut first = true;
@@ -239,6 +240,7 @@ fn determinism_captures_checkpoint_when_game_clock_jumps() {
     let mut ctx = ScenarioCtx::new(SimulationOptions {
         terrain_size: 0,
         save_replay: false,
+        ..SimulationOptions::LEGACY
     });
     let mut first = true;
 

@@ -15,6 +15,7 @@ use crate::gui::inspect::new_inspector;
 use crate::gui::textures::UiTextures;
 use crate::gui::windows::settings::Settings;
 use crate::gui::GuiState;
+use crate::session::{self, SessionState};
 use crate::uiworld::{SaveLoadState, UiWorld};
 
 pub mod chat;
@@ -33,7 +34,21 @@ pub(crate) use toasts::ToastState;
 /// Root GUI entrypoint
 pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::render");
-    auto_save(uiworld);
+    if uiworld.read::<SessionState>().interaction_blocked {
+        return;
+    }
+    if !session::playing(uiworld) {
+        uiworld.write::<GuiState>().windows.render_session(uiworld, sim);
+        keybinds::keybind_modal(uiworld, sim);
+        startup_save_message(uiworld);
+        return;
+    }
+    if !session::world_interaction(uiworld) {
+        return;
+    }
+    if session::can_save(uiworld) {
+        auto_save(uiworld);
+    }
 
     let hidden = uiworld.read::<GuiState>().hidden;
     uiworld
@@ -48,6 +63,9 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
         yakui::column(|| problem_icons::render(uiworld, sim));
         new_toolbox(uiworld, sim);
         menu_bar(uiworld, sim);
+        if !session::world_interaction(uiworld) {
+            return;
+        }
         demand_bars::render(uiworld, sim);
         chat::chat(uiworld, sim);
         new_inspector(uiworld, sim);

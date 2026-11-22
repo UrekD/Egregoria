@@ -6,13 +6,14 @@ use yakui::{column, opaque, reflow, spacer, Alignment, CrossAxisAlignment, Dim2,
 
 use goryak::{
     blur_bg, button_primary, button_secondary, constrained_viewport, on_primary_container,
-    on_secondary_container, padxy, secondary_container, textc, Window,
+    on_secondary_container, padxy, secondary_container, textc, tooltip, Window,
 };
 use simulation::economy::Government;
 use simulation::Simulation;
 
 use crate::gui::{ExitState, GuiState};
 use crate::inputmap::{InputAction, InputMap};
+use crate::session::{self, SessionScreen};
 use crate::uiworld::{SaveLoadState, UiWorld};
 
 pub fn menu_bar(uiworld: &UiWorld, sim: &Simulation) {
@@ -30,13 +31,14 @@ pub fn menu_bar(uiworld: &UiWorld, sim: &Simulation) {
 
                             l.show(|| {
                                 let mut gui = uiworld.write::<GuiState>();
-                                gui.windows.menu();
+                                gui.windows.menu(uiworld);
                                 save_window(&mut gui, uiworld);
                                 textc(
                                     on_primary_container(),
                                     format!("Money: {}", sim.read::<Government>().money),
                                 );
                                 crate::gui::overlays::selector(uiworld);
+                                gui.windows.additional_menu(session::can_save(uiworld));
                             });
                         });
                     });
@@ -47,7 +49,31 @@ pub fn menu_bar(uiworld: &UiWorld, sim: &Simulation) {
     });
 }
 
+pub(super) fn main_menu(uiw: &UiWorld, settings_open: &mut bool) {
+    if tooltip("Enter the current city", || button_primary("Play").show()).clicked {
+        session::set_screen(uiw, SessionScreen::Playing);
+    }
+    if button_primary("New Game").show().clicked {
+        session::set_screen(uiw, SessionScreen::NewGame);
+    }
+    if button_primary("Load").show().clicked {
+        session::set_screen(uiw, SessionScreen::LoadGame);
+    }
+    if button_primary("Settings").show().clicked {
+        *settings_open ^= true;
+    }
+    if button_secondary("Quit").show().clicked {
+        std::process::exit(0);
+    }
+}
+
 fn save_window(gui: &mut GuiState, uiw: &UiWorld) {
+    if !session::can_save(uiw) {
+        if session::world_interaction(uiw) && button_secondary("Exit").show().clicked {
+            std::process::exit(0);
+        }
+        return;
+    }
     let mut slstate = uiw.write::<SaveLoadState>();
     if slstate.saving_status.load(Ordering::SeqCst) {
         textc(on_secondary_container(), "Saving...");

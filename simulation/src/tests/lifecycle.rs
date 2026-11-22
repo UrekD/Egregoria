@@ -46,6 +46,31 @@ fn run_systems(test: &mut TestCtx) {
 }
 
 #[test]
+fn p4_init_is_rejected_in_ordinary_batches_even_at_the_initial_tick() {
+    let mut test = TestCtx::new();
+    let init = WorldCommand::Init(Box::new(crate::SimulationOptions {
+        terrain_size: 0,
+        save_replay: true,
+        ..Default::default()
+    }));
+    assert_eq!(test.g.get_tick(), crate::INITIAL_TICK);
+    for tick in [crate::INITIAL_TICK, crate::INITIAL_TICK + 1] {
+        assert_eq!(test.g.get_tick(), tick);
+        let before = test.g.hashes();
+        let replay = JSON::encode(&*test.g.read::<crate::utils::replay::Replay>()).unwrap();
+        init.apply(&mut test.g);
+        assert_eq!(test.g.read::<CommandOutcomes>().last[0].0, "Init");
+        assert!(test.g.read::<CommandOutcomes>().accepted.is_empty());
+        assert_eq!(test.g.hashes(), before);
+        assert_eq!(
+            JSON::encode(&*test.g.read::<crate::utils::replay::Replay>()).unwrap(),
+            replay
+        );
+        test.tick();
+    }
+}
+
+#[test]
 fn p1bce_identical_rejections_have_distinct_batch_sequences() {
     let mut test = TestCtx::new();
     let invalid = WorldCommand::MapBuildHouse(crate::map::LotID::default());

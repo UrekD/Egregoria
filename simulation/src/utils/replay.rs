@@ -1,6 +1,6 @@
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::WorldCommand;
-use crate::Simulation;
+use crate::{Simulation, SimulationOptions, INITIAL_TICK};
 use common::saveload::{Encoder, JSON};
 use prototypes::Tick;
 use serde::{Deserialize, Serialize};
@@ -27,6 +27,16 @@ impl Default for Replay {
 }
 
 impl Replay {
+    pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
+        match self.commands.first() {
+            Some((Tick(INITIAL_TICK), WorldCommand::Init(options))) => Ok(**options),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "Replay must begin with Init at the initial tick",
+            )),
+        }
+    }
+
     pub fn push(&mut self, tick: Tick, command: WorldCommand) {
         self.commands.push((tick, command));
     }

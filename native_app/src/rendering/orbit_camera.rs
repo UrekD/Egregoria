@@ -3,6 +3,7 @@
 use common::saveload::Encoder;
 use engine::{Context, Tesselator};
 use geom::{Camera, Plane, Radians, Vec2, Vec3, AABB};
+use simulation::map::Map;
 use simulation::map::pathfinding_crate::num_traits::Pow;
 
 use crate::gui::windows::settings::Settings;
@@ -73,14 +74,27 @@ impl OrbitCamera {
     }
 
     pub fn load(viewport: (u32, u32)) -> Self {
-        let camera = common::saveload::JSON::load("camera3D").unwrap_or_else(|_| {
-            Camera::new(
-                Vec3::new(6511.0, 9590.0, 0.0),
-                viewport.0 as f32,
-                viewport.1 as f32,
-            )
-        });
+        let camera = common::saveload::JSON::load("camera3D")
+            .unwrap_or_else(|_| Self::default_camera(viewport.0 as f32, viewport.1 as f32));
+        Self::from_camera(camera)
+    }
 
+    pub(crate) fn reset_for_world(&mut self, map: &Map) {
+        let mut camera = Self::default_camera(self.camera.viewport_w, self.camera.viewport_h);
+        let bounds = map.environment.bounds();
+        if !bounds.contains(camera.pos.xy()) {
+            let center = bounds.center();
+            camera.pos = center.z(map.environment.height(center).unwrap_or_default());
+        }
+        camera.update();
+        *self = Self::from_camera(camera);
+    }
+
+    fn default_camera(width: f32, height: f32) -> Camera {
+        Camera::new(Vec3::new(6511.0, 9590.0, 0.0), width, height)
+    }
+
+    pub(crate) fn from_camera(camera: Camera) -> Self {
         Self {
             camera,
             lastscreenpos: Default::default(),

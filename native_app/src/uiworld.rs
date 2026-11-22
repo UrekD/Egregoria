@@ -1,8 +1,9 @@
 use crate::gui::TimeAlways;
 use crate::init::{INIT_FUNCS, SAVELOAD_FUNCS};
+use crate::session::WorldReplacement;
 use simulation::utils::resources::{RefMutSingle, RefSingle, ResourcesSingleThread};
 use simulation::world_command::{WorldCommand, WorldCommands};
-use simulation::{Simulation, SimulationReplayLoader};
+use simulation::SimulationReplayLoader;
 use std::any::Any;
 use std::ptr::addr_of;
 use std::sync::atomic::AtomicBool;
@@ -16,9 +17,8 @@ pub struct UiWorld {
 #[derive(Default)]
 pub struct SaveLoadState {
     pub startup_message: Option<String>,
-    pub please_load: Option<SimulationReplayLoader>,
-    pub please_load_sim: Option<Simulation>,
-    pub render_reset: bool,
+    pub pending: Option<WorldReplacement>,
+    pub replay: Option<SimulationReplayLoader>,
     pub please_save: bool,
     pub saving_status: Arc<AtomicBool>,
 }
@@ -26,13 +26,18 @@ pub struct SaveLoadState {
 #[allow(dead_code)]
 impl UiWorld {
     pub fn init() -> UiWorld {
+        let mut w = Self::with_defaults();
+        w.load_from_disk();
+        w
+    }
+
+    pub(crate) fn with_defaults() -> UiWorld {
         let mut w = UiWorld::default();
         unsafe {
             for s in &*addr_of!(INIT_FUNCS) {
                 (s.f)(&mut w);
             }
         }
-        w.load_from_disk();
         w
     }
 

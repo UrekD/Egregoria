@@ -9,6 +9,7 @@ use simulation::SimulationOptions;
 pub const OPTIONS: SimulationOptions = SimulationOptions {
     terrain_size: 50,
     save_replay: false,
+    ..SimulationOptions::LEGACY
 };
 
 pub const MIN_TICKS_PER_SEC: f64 = 150.0;

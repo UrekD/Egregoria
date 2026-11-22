@@ -21,7 +21,7 @@ pub mod roadbuild;
 pub mod roadedit;
 pub mod terraforming;
 pub mod train;
-mod transit;
+pub(crate) mod transit;
 
 pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
     if uiworld

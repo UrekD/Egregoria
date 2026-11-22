@@ -7,6 +7,7 @@ use simulation::{SimulationOptions, SoulID};
 pub const OPTIONS: SimulationOptions = SimulationOptions {
     terrain_size: 10,
     save_replay: false,
+    ..SimulationOptions::LEGACY
 };
 
 pub fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {

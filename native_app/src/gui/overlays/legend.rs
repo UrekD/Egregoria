@@ -33,7 +33,7 @@ impl OverlayMode {
         use OverlayMode::*;
 
         let labels = match self {
-            Off | Transit => return None,
+            Off | Transit | Traffic => return None,
             Power => ["Blackout / disconnected", "Powered"],
             Water => ["No water", "Supplied"],
             Sewage => ["No sewage service", "Served"],

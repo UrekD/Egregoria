@@ -20,6 +20,7 @@ pub const SCENARIO: (Scenario, SimulationOptions) = (
     SimulationOptions {
         terrain_size: 10,
         save_replay: false,
+        ..SimulationOptions::LEGACY
     },
 );
 

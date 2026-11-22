@@ -24,6 +24,7 @@ pub const SCENARIO: (Scenario, SimulationOptions) = (
 pub(super) const OPTIONS: SimulationOptions = SimulationOptions {
     terrain_size: 10,
     save_replay: false,
+    ..SimulationOptions::LEGACY
 };
 pub(super) const TICKS: u64 = 600_000;
 

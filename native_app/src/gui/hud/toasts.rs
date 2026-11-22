@@ -49,6 +49,33 @@ struct Notice {
     at: Instant,
 }
 
+#[cfg(test)]
+impl ToastState {
+    pub(crate) fn track_test_world(&mut self, sim: &Simulation) {
+        let now = Instant::now();
+        self.observe(sim, true, now);
+        self.city.fire_cursor = 1;
+        if let Some(network) = sim.map().electricity.networks().next() {
+            self.city.no_water.insert(network.id);
+        }
+        self.notices.push(Notice {
+            event: Event::Fire,
+            count: 1,
+            at: now,
+        });
+    }
+
+    pub(crate) fn world_state_is_clear(&self) -> bool {
+        self.sequence == 0
+            && self.started.is_none()
+            && self.city.tick.is_none()
+            && self.city.fire_cursor == 0
+            && self.city.no_water.is_empty()
+            && self.city.suspended_lines.is_empty()
+            && self.notices.is_empty()
+    }
+}
+
 impl Event {
     fn describe(self, count: usize) -> String {
         match (self, count) {
@@ -264,6 +291,8 @@ fn message(reason: Rejection) -> &'static str {
         Rejection::InsufficientFunds => "Not enough money",
         Rejection::MutationFailed => "The map change could not be applied",
         Rejection::TransitNotImplemented => "Transit editing is unavailable",
+        Rejection::UnexpectedInit => "Init is available only when creating a world",
+        Rejection::InvalidInitOptions => "Invalid world options",
     }
 }
 
@@ -285,6 +314,7 @@ mod tests {
         let mut test = ScenarioCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
         let house = fill_houses(&mut test, 1)[0];
@@ -305,6 +335,7 @@ mod tests {
         let mut test = ScenarioCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
         let house = fill_houses(&mut test, 1)[0];

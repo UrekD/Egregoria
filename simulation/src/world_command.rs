@@ -151,6 +151,8 @@ pub enum Rejection {
     InsufficientFunds,
     MutationFailed,
     TransitNotImplemented,
+    UnexpectedInit,
+    InvalidInitOptions,
 }
 
 #[derive(Default)]
@@ -164,6 +166,10 @@ pub struct CommandOutcomes {
 }
 
 impl CommandOutcomes {
+    pub fn batch_seq(&self) -> u64 {
+        self.sequence
+    }
+
     pub(crate) fn begin_batch(&mut self) {
         static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
         self.sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
@@ -307,6 +313,11 @@ impl WorldCommand {
     }
 
     pub(crate) fn apply_in_batch(&self, sim: &mut Simulation) {
+        if matches!(self, Init(_)) {
+            self.reject(sim, Rejection::UnexpectedInit);
+            return;
+        }
+
         let is_transit = transit::is_command(self);
         if is_transit {
             // Record transit commands only after validation and application succeed.
@@ -728,21 +739,7 @@ impl WorldCommand {
             MapLoadTestField { pos, size, spacing } => {
                 load_testfield(&mut sim.map_mut(), pos, size, spacing)
             }
-            Init(ref opts) => {
-                if opts.save_replay {
-                    let mut rep = sim.resources.write::<Replay>();
-                    rep.enabled = true;
-                    let tick = sim.read::<GameTime>().tick;
-                    rep.push(tick, Init(opts.clone()));
-                }
-
-                if opts.terrain_size > 0 {
-                    generate_terrain(sim, opts.terrain_size);
-                }
-
-                sim.resources
-                    .insert::<SimulationOptions>(SimulationOptions::clone(opts));
-            }
+            Init(_) => return Err(Rejection::UnexpectedInit),
             UpdateZone { building, ref zone } => {
                 sim.map_mut()
                     .update_zone(building, zone.clone())
@@ -789,6 +786,26 @@ impl WorldCommand {
             }
         }
         Self::charge_construction(sim, cost);
+        Ok(())
+    }
+
+    pub(crate) fn bootstrap(sim: &mut Simulation, options: SimulationOptions) -> Result<(), Rejection> {
+        let tick = sim.read::<GameTime>().tick;
+        if tick.0 != crate::INITIAL_TICK || sim.resources.try_read::<SimulationOptions>().is_ok() {
+            return Err(Rejection::UnexpectedInit);
+        }
+        if !options.valid_for_bootstrap() {
+            return Err(Rejection::InvalidInitOptions);
+        }
+        if options.save_replay {
+            let mut replay = sim.write::<Replay>();
+            replay.enabled = true;
+            replay.push(tick, Init(Box::new(options)));
+        }
+        if options.terrain_size > 0 {
+            generate_terrain(sim, options.terrain_size);
+        }
+        sim.resources.insert(options);
         Ok(())
     }
 }

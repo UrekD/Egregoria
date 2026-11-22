@@ -1,6 +1,4 @@
-use std::cell::RefCell;
 use std::collections::BTreeMap;
-use std::rc::Rc;
 
 use goryak::{
     button_primary, button_secondary, error, fixed_spacer, mincolumn, minrow,
@@ -18,8 +16,7 @@ use yakui::{colored_box_container, divider, Color, Vec4};
 use crate::uiworld::UiWorld;
 
 #[derive(Default)]
-struct PanelState {
-    map: usize,
+pub(crate) struct PanelState {
     lines: Vec<LineDetails>,
     commands: Vec<WorldCommand>,
     edit: Option<LineID>,
@@ -31,10 +28,6 @@ struct LineDetails {
     boardings: u64,
 }
 
-fn state() -> Rc<RefCell<PanelState>> {
-    yakui::context::dom().get_global_or_init(|| Rc::new(RefCell::new(PanelState::default())))
-}
-
 impl super::GUIWindows {
     // The toolbox has the world context. The window uses its current snapshot
     // and sends player actions back through the same frame's HUD state.
@@ -43,15 +36,10 @@ impl super::GUIWindows {
         uiworld: &UiWorld,
         sim: &Simulation,
     ) -> Option<LineID> {
-        let state = state();
-        let mut state = state.borrow_mut();
-        let map = std::ptr::from_ref(&sim.map().subscribers).addr();
-        if state.map != map {
-            *state = PanelState {
-                map,
-                ..Default::default()
-            };
+        if !crate::session::world_interaction(uiworld) {
+            return None;
         }
+        let mut state = uiworld.write::<PanelState>();
         uiworld.commands().extend(state.commands.drain(..));
         let edit = state.edit.take();
         state.lines.clear();
@@ -76,9 +64,8 @@ impl super::GUIWindows {
     }
 }
 
-pub(super) fn transit_lines(opened: &mut bool) {
-    let state = state();
-    let mut state = state.borrow_mut();
+pub(super) fn transit_lines(uiworld: &UiWorld, opened: &mut bool) {
+    let mut state = uiworld.write::<PanelState>();
     let PanelState {
         lines,
         commands,
@@ -187,4 +174,21 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>) -> bool 
         }
     });
     edit
+}
+
+#[cfg(test)]
+impl PanelState {
+    pub(crate) fn seed_edit(&mut self, line: &TransitLine) {
+        self.lines.push(LineDetails {
+            line: line.clone(),
+            running: 0,
+            boardings: 0,
+        });
+        self.edit = Some(line.id);
+        self.commands.push(WorldCommand::TransitRemoveLine { line: line.id });
+    }
+
+    pub(crate) fn is_clear(&self) -> bool {
+        self.lines.is_empty() && self.commands.is_empty() && self.edit.is_none()
+    }
 }

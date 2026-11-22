@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use common::history::History;
+use common::saveload::SlotId;
 use engine::{Context, FrameContext, MeshBuilder};
 use geom::{vec2, vec3, Camera, LinearColor};
 use simulation::Simulation;
@@ -23,7 +24,8 @@ use crate::gui::UiTextures;
 use crate::gui::{render_newgui, ExitState, GuiState, TimeAlways, Tool};
 use crate::inputmap::{Bindings, InputAction, InputMap};
 use crate::rendering::{InstancedRender, MapRenderOptions, MapRenderer, OrbitCamera};
-use crate::uiworld::{SaveLoadState, UiWorld};
+use crate::session::{self, SessionScreen, SessionState, WorldReplacement};
+use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
 use prototypes::GameTime;
 use simulation::utils::scheduler::SeqSchedule;
 
@@ -71,8 +73,11 @@ impl engine::framework::State for State {
         let game_schedule = Simulation::schedule();
         let mut uiworld = UiWorld::init();
         uiworld.write::<SaveLoadState>().startup_message = startup_message;
+        uiworld.write::<SessionState>().active_slot = Some(SlotId::legacy());
         if automation.is_some() {
             crate::init::configure_script_settings(&uiworld);
+        } else {
+            *uiworld.write::<SessionScreen>() = SessionScreen::MainMenu;
         }
 
         let mut bindings = uiworld.write::<Bindings>();
@@ -126,45 +131,17 @@ impl engine::framework::State for State {
             timings.total_cpu_time.add_value(ctx.times.total_cpu_time);
         }
 
-        let mut slstate = self.uiw.write::<SaveLoadState>();
-        if slstate.please_save && !slstate.saving_status.load(Ordering::SeqCst) {
-            slstate.please_save = false;
-            let cpy = self.sim.clone();
-            slstate.saving_status.store(true, Ordering::SeqCst);
-            let status = slstate.saving_status.clone();
-            std::thread::spawn(move || {
-                profiling::scope!("game_loop::update::save");
-                cpy.read().unwrap().save_to_disk("world");
-                status.store(false, Ordering::SeqCst);
-            });
-        }
-        drop(slstate);
-
+        self.uiw.write::<SessionState>().interaction_blocked = false;
         let scripted = self.automation.is_some();
-        if let Some(automation) = &mut self.automation {
-            match automation.step(
-                ctx,
-                &self.uiw,
-                &self.sim,
-                &mut self.game_schedule,
-                self.map_renderer.meshb.rebuilt_version(),
-            ) {
-                Ok(true) => {}
-                Ok(false) => {
-                    self.automation = None;
-                    return;
-                }
-                Err(error) => crate::automation::fail(&error),
-            }
-        } else {
-            crate::network::sim_update(self);
+        if !self.step_session(ctx) {
+            return;
         }
 
-        if std::mem::take(&mut self.uiw.write::<SaveLoadState>().render_reset) {
-            self.reset(ctx);
-        }
-
-        if !ctx.egui.last_mouse_captured {
+        self.uiw
+            .write::<InputMap>()
+            .observe_pointer_release(ctx, scripted);
+        let world_interaction = session::world_interaction(&self.uiw);
+        if world_interaction && !ctx.egui.last_mouse_captured {
             let sim = self.sim.read().unwrap();
             let map = sim.map();
             let ray = self
@@ -194,12 +171,14 @@ impl engine::framework::State for State {
             &mut self.uiw.write::<InputMap>(),
             &ctx.input,
         );
-        self.uiw.write::<InputMap>().prepare_frame(
-            &ctx.input,
-            !ctx.egui.last_kb_captured,
-            !ctx.egui.last_mouse_captured,
-        );
-        gui::run_ui_systems(&self.sim.read().unwrap(), &self.uiw);
+        if world_interaction {
+            self.uiw.write::<InputMap>().prepare_frame(
+                &ctx.input,
+                !ctx.egui.last_kb_captured,
+                !ctx.egui.last_mouse_captured,
+            );
+            gui::run_ui_systems(&self.sim.read().unwrap(), &self.uiw);
+        }
 
         self.uiw.write::<Timings>().all.add_value(ctx.delta);
         self.uiw.write::<Timings>().per_game_system = self.game_schedule.times();
@@ -211,7 +190,7 @@ impl engine::framework::State for State {
             .contains(&InputAction::HideInterface);
 
         manage_settings(ctx, &self.uiw.read::<Settings>());
-        if !scripted {
+        if !scripted && world_interaction {
             self.manage_io(ctx);
         }
 
@@ -223,10 +202,12 @@ impl engine::framework::State for State {
         for (sound, kind) in self.uiw.write::<ImmediateSound>().orders.drain(..) {
             ctx.audio.play(sound, kind);
         }
-        self.all_audio
-            .update(&self.sim.read().unwrap(), &self.uiw, &mut ctx.audio);
+        if !self.uiw.read::<SessionState>().interaction_blocked {
+            self.all_audio
+                .update(&self.sim.read().unwrap(), &self.uiw, &mut ctx.audio);
+        }
 
-        if !scripted {
+        if !scripted && world_interaction {
             FollowEntity::update_camera(self);
         }
         self.uiw.camera_mut().update(ctx);
@@ -263,7 +244,9 @@ impl engine::framework::State for State {
 
         self.instanced_renderer
             .render(&self.sim.read().unwrap(), ctx);
-        gui::overlays::draw(&sim, &self.uiw);
+        if !self.uiw.read::<SessionState>().interaction_blocked {
+            gui::overlays::draw(&sim, &self.uiw);
+        }
 
         drop(sim);
         drop(camera);
@@ -286,7 +269,9 @@ impl engine::framework::State for State {
         if self.automation.is_some() {
             crate::automation::fail("window closed before the script finished");
         }
-        if self.uiw.read::<GuiState>().last_save.elapsed() < Duration::from_secs(30) {
+        if !session::can_save(&self.uiw)
+            || self.uiw.read::<GuiState>().last_save.elapsed() < Duration::from_secs(30)
+        {
             return true;
         }
         let mut estate = self.uiw.write::<ExitState>();
@@ -303,22 +288,116 @@ impl engine::framework::State for State {
     }
 
     fn render_gui(&mut self, ui: &egui::Context) {
-        let sim = self.sim.read().unwrap();
-        render_oldgui(ui, &self.uiw, &sim);
+        if session::playing(&self.uiw) && !self.uiw.read::<SessionState>().interaction_blocked {
+            let sim = self.sim.read().unwrap();
+            render_oldgui(ui, &self.uiw, &sim);
+        }
     }
 
     fn render_yakui(&mut self) {
         let sim = self.sim.read().unwrap();
         render_newgui(&self.uiw, &sim);
+        goryak::render_tooltip();
     }
 }
 
 impl State {
-    fn reset(&mut self, ctx: &mut Context) {
-        ctx.gfx.lamplights.reset(&ctx.gfx.device, &ctx.gfx.queue);
-        self.map_renderer = MapRenderer::new(&mut ctx.gfx, &self.sim.read().unwrap());
-        self.sim.write().unwrap().map().dispatch_all();
-        ctx.gfx.update_simplelit_bg();
+    fn step_session(&mut self, ctx: &mut Context) -> bool {
+        let replacement = self.uiw.write::<SaveLoadState>().pending.take();
+        if let Some(replacement) = replacement {
+            self.replace_world(ctx, replacement);
+            return true;
+        }
+
+        self.start_save();
+        if self.advance_replay() {
+            return true;
+        }
+
+        if let Some(automation) = &mut self.automation {
+            match automation.step(
+                ctx,
+                &self.uiw,
+                &self.sim,
+                &mut self.game_schedule,
+                self.map_renderer.meshb.rebuilt_version(),
+            ) {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.automation = None;
+                    return false;
+                }
+                Err(error) => crate::automation::fail(&error),
+            }
+        } else if session::playing(&self.uiw) {
+            if let Some(replacement) = crate::network::sim_update(self) {
+                self.replace_world(ctx, replacement);
+            }
+        }
+        true
+    }
+
+    fn replace_world(&mut self, ctx: &mut Context, replacement: WorldReplacement) {
+        let mut sim = self.sim.write().unwrap();
+        session::apply_world_replacement(
+            &self.uiw,
+            &mut sim,
+            &mut self.game_schedule,
+            replacement,
+            |sim| {
+                self.all_audio.reset_world();
+                self.immediate_renderer.clear();
+                ctx.gfx.lamplights.reset(&ctx.gfx.device, &ctx.gfx.queue);
+                self.map_renderer = MapRenderer::new(&mut ctx.gfx, sim);
+                sim.map().dispatch_all();
+                ctx.gfx.update_simplelit_bg();
+            },
+        );
+    }
+
+    fn start_save(&mut self) {
+        if !session::can_save(&self.uiw) {
+            return;
+        }
+        let mut io = self.uiw.write::<SaveLoadState>();
+        if !io.please_save || io.saving_status.load(Ordering::SeqCst) {
+            return;
+        }
+        let Some(slot) = self.uiw.read::<SessionState>().active_slot.clone() else {
+            return;
+        };
+        io.please_save = false;
+        let sim = self.sim.clone();
+        let status = io.saving_status.clone();
+        status.store(true, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            profiling::scope!("game_loop::update::save");
+            let sim = sim.read().unwrap();
+            if status.load(Ordering::SeqCst) {
+                sim.save_to_disk(slot.as_str());
+                status.store(false, Ordering::SeqCst);
+            }
+        });
+    }
+
+    fn advance_replay(&mut self) -> bool {
+        if !session::playing(&self.uiw) {
+            return false;
+        }
+        let mut io = self.uiw.write::<SaveLoadState>();
+        let Some(replay) = io.replay.as_mut() else {
+            return false;
+        };
+        *self.uiw.commands() = Default::default();
+        *self.uiw.write::<ReceivedCommands>() = Default::default();
+        let mut sim = self.sim.write().unwrap();
+        if replay.advance_tick(&mut sim, &mut self.game_schedule) {
+            io.replay = None;
+            self.uiw.write::<SessionState>().interaction_blocked = true;
+            self.uiw.write::<InputMap>().reset_world_input();
+            log::info!("finished loading replay");
+        }
+        true
     }
 
     fn manage_gfx_params(&mut self, ctx: &mut Context) {
@@ -388,7 +467,7 @@ impl State {
 
         self.uiw.read::<OrbitCamera>().cull_tess(&mut tess);
 
-        {
+        if session::world_interaction(&self.uiw) {
             profiling::scope!("debug_objs");
             let sim = self.sim.read().unwrap();
             let objs = self.uiw.read::<DebugObjs>();

@@ -22,6 +22,7 @@ use crate::gui::{
     overlays::OverlayMode, toolbox::building::BuildingTab, top_demand_driver, zoning::ZONES,
     GuiState, InspectedBuilding, Tool,
 };
+use crate::session::{self, SessionScreen};
 use crate::uiworld::{ReceivedCommands, UiWorld};
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
@@ -61,6 +62,7 @@ enum Step {
     Builder(Builder),
     SelectTool(Tool),
     SetOverlay(OverlayMode),
+    SetSession(SessionScreen),
     OpenWindow(String),
     Assert(Assertion),
     Screenshot(String),
@@ -312,7 +314,7 @@ impl Automation {
         self.wait = None;
 
         let pending = std::mem::take(&mut *uiw.commands());
-        if !pending.is_empty() {
+        if session::world_interaction(uiw) && !pending.is_empty() {
             self.apply_commands(uiw, &mut sim.write().unwrap(), schedule, pending);
             return Ok(true);
         }
@@ -330,6 +332,20 @@ impl Automation {
             return Ok(false);
         };
         self.step_number += 1;
+        if !session::playing(uiw)
+            && matches!(
+                step,
+                Step::RunTicks(1..)
+                    | Step::Commands(_)
+                    | Step::BuildSpecialBuildings(_)
+                    | Step::EmptyTreasury
+                    | Step::Builder(_)
+                    | Step::Camera { .. }
+                    | Step::SelectTool(_)
+            )
+        {
+            return Err("world interactions require the Playing session".into());
+        }
         match step {
             Step::WaitFrames(count) => {
                 self.wait = Some(Wait::Frames {
@@ -444,7 +460,24 @@ impl Automation {
             }
             Step::SelectTool(tool) => *uiw.write::<Tool>() = tool,
             Step::SetOverlay(mode) => *uiw.write::<OverlayMode>() = mode,
+            Step::SetSession(screen) => {
+                if !session::set_screen(uiw, screen) {
+                    return Err("session screens are unavailable during multiplayer".into());
+                }
+            }
             Step::OpenWindow(name) => {
+                let screen = match name.as_str() {
+                    "Main Menu" => Some(SessionScreen::MainMenu),
+                    "New Game" => Some(SessionScreen::NewGame),
+                    "Load" => Some(SessionScreen::LoadGame),
+                    _ => None,
+                };
+                if let Some(screen) = screen {
+                    if !session::set_screen(uiw, screen) {
+                        return Err("session screens are unavailable during multiplayer".into());
+                    }
+                    return Ok(true);
+                }
                 let mut gui = uiw.write::<GuiState>();
                 let (_, open) = gui
                     .windows
@@ -775,6 +808,19 @@ mod tests {
         ));
         assert!(JSON::decode::<Step>(br#"{"SetOverlay":{"Coverage":"WaterPump"}}"#).is_err());
         assert!(JSON::decode::<Step>(br#"{"SetOverlay":{"Coverage":"SewageOutlet"}}"#).is_err());
+    }
+
+    #[test]
+    fn p4_session_and_traffic_steps_decode() {
+        assert!(matches!(
+            JSON::decode::<Step>(br#"{"SetSession":"MainMenu"}"#).unwrap(),
+            Step::SetSession(SessionScreen::MainMenu)
+        ));
+        assert!(matches!(
+            JSON::decode::<Step>(br#"{"SetOverlay":"Traffic"}"#).unwrap(),
+            Step::SetOverlay(OverlayMode::Traffic)
+        ));
+        assert_eq!(SessionScreen::default(), SessionScreen::Playing);
     }
 
     #[test]

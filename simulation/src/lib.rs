@@ -8,7 +8,6 @@ use crate::map_dynamic::{transit, Itinerary, ItineraryLeader};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
-use crate::world_command::WorldCommand::Init;
 use crate::world_command::{CommandOutcomes, WorldCommand};
 use common::saveload::{self, Bincode, CompressedBincode, Encoder};
 use common::FastMap;
@@ -117,18 +116,84 @@ const RNG_SEED: u64 = 123;
 const INITIAL_TICK: u64 = 1;
 const VERSION: &str = include_str!("../../VERSION");
 
+#[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MapPreset {
+    #[default]
+    Procedural,
+    Flat,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct NewGameOptions {
+    pub preset: MapPreset,
+    pub seed: u64,
+    pub terrain_chunks: u16,
+    pub starting_money_bucks: u32,
+}
+
+impl NewGameOptions {
+    pub const MIN_TERRAIN_CHUNKS: u16 = 16;
+    pub const MAX_TERRAIN_CHUNKS: u16 = 80;
+    pub const MIN_STARTING_MONEY_BUCKS: u32 = 10_000;
+    pub const MAX_STARTING_MONEY_BUCKS: u32 = 10_000_000;
+
+    pub fn is_valid(&self) -> bool {
+        (Self::MIN_TERRAIN_CHUNKS..=Self::MAX_TERRAIN_CHUNKS).contains(&self.terrain_chunks)
+            && (Self::MIN_STARTING_MONEY_BUCKS..=Self::MAX_STARTING_MONEY_BUCKS)
+                .contains(&self.starting_money_bucks)
+    }
+}
+
+impl Default for NewGameOptions {
+    fn default() -> Self {
+        let legacy = SimulationOptions::LEGACY;
+        Self {
+            preset: legacy.preset,
+            seed: legacy.seed,
+            terrain_chunks: legacy.terrain_size,
+            starting_money_bucks: legacy.starting_money_bucks,
+        }
+    }
+}
+
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SimulationOptions {
     pub terrain_size: u16,
     pub save_replay: bool,
+    pub preset: MapPreset,
+    pub seed: u64,
+    pub starting_money_bucks: u32,
+}
+
+impl SimulationOptions {
+    pub const LEGACY: Self = Self {
+        terrain_size: 50,
+        save_replay: true,
+        preset: MapPreset::Procedural,
+        seed: 0,
+        starting_money_bucks: 150_000,
+    };
+
+    fn valid_for_bootstrap(self) -> bool {
+        let options = NewGameOptions {
+            preset: self.preset,
+            seed: self.seed,
+            terrain_chunks: self.terrain_size,
+            starting_money_bucks: self.starting_money_bucks,
+        };
+        // Legacy scenarios and tests can start with a small or empty map.
+        options.is_valid()
+            || (options.terrain_chunks < NewGameOptions::MIN_TERRAIN_CHUNKS
+                && options.preset == Self::LEGACY.preset
+                && options.seed == Self::LEGACY.seed
+                && options.starting_money_bucks == Self::LEGACY.starting_money_bucks)
+    }
 }
 
 impl Default for SimulationOptions {
     fn default() -> Self {
-        SimulationOptions {
-            terrain_size: 50,
-            save_replay: true,
-        }
+        Self::LEGACY
     }
 }
 
@@ -157,11 +222,17 @@ impl Simulation {
     ///
     /// Panics if the replay version differs from the simulation version.
     pub fn from_replay(replay: Replay) -> (Simulation, SimulationReplayLoader) {
-        assert!(
-            replay.version == VERSION,
-            "Replay has version {:?}, expected {VERSION:?}",
-            replay.version
-        );
+        Self::try_from_replay(replay).unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub fn try_from_replay(replay: Replay) -> io::Result<(Simulation, SimulationReplayLoader)> {
+        if replay.version != VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Replay has version {:?}, expected {VERSION:?}", replay.version),
+            ));
+        }
+        let options = replay.bootstrap_options()?;
         let mut sim = Simulation {
             world: Default::default(),
             resources: Default::default(),
@@ -175,16 +246,20 @@ impl Simulation {
             }
         }
 
-        (
+        WorldCommand::bootstrap(&mut sim, options).map_err(|reason| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {reason:?}"))
+        })?;
+        let pastt = Tick(sim.get_tick());
+        Ok((
             sim,
             SimulationReplayLoader {
                 replay,
-                pastt: Tick::default(),
-                idx: 0,
+                pastt,
+                idx: 1,
                 speed: 1,
                 advance_n_ticks: 0,
             },
-        )
+        ))
     }
 
     pub fn new_with_options(opts: SimulationOptions) -> Simulation {
@@ -204,8 +279,8 @@ impl Simulation {
 
         let start_commands: Vec<(u32, WorldCommand)> =
             common::saveload::JSON::decode(START_COMMANDS.as_bytes()).unwrap();
-        let init = Init(Box::new(opts));
-        sim.apply_commands(std::iter::once(&init).chain(start_commands.iter().map(|(_, cmd)| cmd)));
+        WorldCommand::bootstrap(&mut sim, opts).expect("invalid simulation bootstrap options");
+        sim.apply_commands(start_commands.iter().map(|(_, cmd)| cmd));
 
         sim
     }

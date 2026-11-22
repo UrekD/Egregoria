@@ -13,6 +13,14 @@ pub struct CarSound {
     engine: Option<(SpeedControl, GainControl, Mixed)>,
 }
 
+impl CarSound {
+    fn stop(self) {
+        for (_, _, mut mixed) in [self.road, self.engine].into_iter().flatten() {
+            mixed.stop();
+        }
+    }
+}
+
 /// CarSounds are sounds that are played when cars are near the player
 /// They are tied to a car entity
 pub struct CarSounds {
@@ -31,6 +39,15 @@ impl CarSounds {
                     AudioKind::Effect,
                 )
                 .map(|x| x.0),
+        }
+    }
+
+    pub(crate) fn reset_world(&mut self) {
+        for (_, sound) in self.sounds.drain() {
+            sound.stop();
+        }
+        if let Some(gain) = &mut self.generic_car_sound {
+            gain.set_amplitude_ratio(0.0);
         }
     }
 
@@ -59,13 +76,7 @@ impl CarSounds {
         }
 
         for h in to_remove {
-            let cs = self.sounds.remove(h).unwrap();
-            if let Some((_, _, mut mixed)) = cs.road {
-                mixed.stop();
-            }
-            if let Some((_, _, mut mixed)) = cs.engine {
-                mixed.stop();
-            }
+            self.sounds.remove(h).unwrap().stop();
         }
 
         // Gather
@@ -161,5 +172,42 @@ impl CarSounds {
         } else if let Some(ref mut s) = self.generic_car_sound {
             s.set_amplitude_ratio(0.0);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use oddio::{Constant, Mixer, Signal};
+
+    #[test]
+    fn p4_car_sound_reset_stops_both_vehicle_loops() {
+        let (mut control, mut mixer) = Mixer::<f32>::new();
+        let mut start_loop = || {
+            let (gain, signal) = Gain::new(Constant::new(1.0), 1.0);
+            let (speed, signal) = Speed::new(signal);
+            (speed, gain, control.play(signal))
+        };
+        let mut grid = TransportGrid::new(100);
+        let handle = grid.insert(Vec2::ZERO, Default::default());
+        let mut cars = CarSounds {
+            sounds: SecondaryMap::new(),
+            generic_car_sound: None,
+        };
+        cars.sounds.insert(
+            handle,
+            CarSound {
+                road: Some(start_loop()),
+                engine: Some(start_loop()),
+            },
+        );
+        let mut samples = [0.0; 16];
+        mixer.sample(1.0 / 48_000.0, &mut samples);
+        assert_eq!(samples, [2.0; 16]);
+
+        cars.reset_world();
+        assert!(cars.sounds.is_empty());
+        mixer.sample(1.0 / 48_000.0, &mut samples);
+        assert_eq!(samples, [0.0; 16]);
     }
 }

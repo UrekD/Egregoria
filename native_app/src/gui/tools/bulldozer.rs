@@ -79,3 +79,14 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
         }
     }
 }
+
+#[cfg(test)]
+impl BulldozerState {
+    pub(crate) fn start_test_gesture(&mut self) {
+        self.hold = true;
+    }
+
+    pub(crate) fn gesture_is_clear(&self) -> bool {
+        !self.hold
+    }
+}

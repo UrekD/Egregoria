@@ -148,3 +148,16 @@ impl Default for TerraformingResource {
         }
     }
 }
+
+#[cfg(test)]
+impl TerraformingResource {
+    pub(crate) fn start_test_gesture(&mut self) {
+        self.level = Some(20.0);
+        self.slope_start = Some(Vec3::X);
+        self.slope_end = Some(Vec3::Y);
+    }
+
+    pub(crate) fn gesture_is_clear(&self) -> bool {
+        self.level.is_none() && self.slope_start.is_none() && self.slope_end.is_none()
+    }
+}

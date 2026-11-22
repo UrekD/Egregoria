@@ -202,6 +202,7 @@ mod tests {
         let mut test = TestCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
         let house = fill_houses(&mut test, 1)[0];
@@ -221,6 +222,7 @@ mod tests {
         let mut test = TestCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
         let house = fill_houses(&mut test, 1)[0];

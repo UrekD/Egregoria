@@ -3,7 +3,7 @@ use goryak::{
     secondary_container, textc,
 };
 use simulation::Simulation;
-use yakui::{opaque, reflow, use_state, Alignment, Dim2, Pivot};
+use yakui::{opaque, reflow, Alignment, Dim2, Pivot};
 
 use crate::gui::{GuiState, Tool};
 use crate::uiworld::UiWorld;
@@ -14,22 +14,13 @@ mod transit_line;
 mod transit_stop;
 
 #[derive(Default)]
-struct TransitTools {
+pub(crate) struct TransitTools {
     line: transit_line::LineDraft,
     remove_stops: bool,
-    map: usize,
 }
 
 pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
-    let state = use_state(TransitTools::default);
-    let mut state = state.borrow_mut();
-    let map = std::ptr::from_ref(&sim.map().subscribers).addr();
-    if state.map != map {
-        *state = TransitTools {
-            map,
-            ..Default::default()
-        };
-    }
+    let mut state = uiworld.write::<TransitTools>();
 
     if let Some(line) = uiworld
         .read::<GuiState>()
@@ -129,5 +120,24 @@ fn tool_button(tool: Tool, choice: Tool, label: &'static str) -> bool {
         button_primary(label).show().clicked
     } else {
         button_secondary(label).show().clicked
+    }
+}
+
+#[cfg(test)]
+impl TransitTools {
+    pub(crate) fn seed_draft(
+        &mut self,
+        line: simulation::map_dynamic::LineID,
+        stops: &[simulation::map_dynamic::StopID],
+    ) {
+        self.line.begin_edit(line);
+        for &stop in stops {
+            assert!(self.line.select_stop(stop).is_none());
+        }
+        self.remove_stops = true;
+    }
+
+    pub(crate) fn draft_is_clear(&self) -> bool {
+        !self.line.editing() && self.line.len() == 0 && !self.remove_stops
     }
 }

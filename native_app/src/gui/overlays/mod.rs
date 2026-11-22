@@ -35,6 +35,7 @@ pub(crate) enum OverlayMode {
     LandValue,
     Happiness,
     Transit,
+    Traffic,
 }
 
 fn deserialize_coverage<'de, D: Deserializer<'de>>(
@@ -106,12 +107,23 @@ thread_local! {
     static CACHE: RefCell<OverlayCache> = RefCell::new(OverlayCache::default());
 }
 
+pub(crate) fn reset_world_cache() {
+    CACHE.with_borrow_mut(|cache| *cache = OverlayCache::default());
+    view::reset_world_cache();
+}
+
+#[cfg(test)]
+pub(crate) fn world_cache_is_clear() -> bool {
+    CACHE.with_borrow(|cache| cache.changes.is_none() && cache.tiles.chunks.is_empty())
+        && view::world_cache_is_clear()
+}
+
 const FOOTPRINT_PADDING: f32 = 6.0;
 
 impl OverlayMode {
     fn data_version(self, tick: u64) -> u64 {
         match self {
-            Self::Off | Self::Power | Self::Transit => 0,
+            Self::Off | Self::Power | Self::Transit | Self::Traffic => 0,
             // Coverage passes occur at tick % 6000 == 300 + 600 * kind_index.
             Self::Coverage(kind) => tick / 6000 + u64::from(tick % 6000 >= coverage_offset(kind)),
             Self::Water | Self::Sewage | Self::Pollution | Self::LandValue => tick / 3000,
@@ -191,12 +203,21 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             collect_tiles(sim, &map, mode, &mut cache.tiles);
         }
 
-        if mode == OverlayMode::Transit {
-            if rebuild {
-                draw.clear_persistent();
-                transit::draw(&map, &sim.read::<Transit>(), &mut draw);
+        match mode {
+            OverlayMode::Transit => {
+                if rebuild {
+                    draw.clear_persistent();
+                    transit::draw(&map, &sim.read::<Transit>(), &mut draw);
+                }
+                return;
             }
-            return;
+            OverlayMode::Traffic => {
+                if rebuild {
+                    draw.clear_persistent();
+                }
+                return;
+            }
+            _ => {}
         }
 
         let camera = uiworld.camera().camera;
@@ -300,7 +321,7 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
             let happiness = sim.read::<Happiness>();
             buildings(&|b| happiness.by_building.get(&b.id).copied().map(f32::from));
         }
-        OverlayMode::Pollution | OverlayMode::Off | OverlayMode::Transit => {}
+        OverlayMode::Pollution | OverlayMode::Off | OverlayMode::Transit | OverlayMode::Traffic => {}
     }
 }
 
@@ -320,7 +341,7 @@ pub(crate) fn power_available(map: &Map, flow: &ElectricityFlow, building: Build
 pub(crate) fn selector(uiworld: &UiWorld) {
     use OverlayMode::*;
 
-    const MODES: [(OverlayMode, &str); 14] = [
+    const MODES: [(OverlayMode, &str); 15] = [
         (Off, "Overlay off"),
         (Power, "Power"),
         (Water, "Water"),
@@ -335,6 +356,7 @@ pub(crate) fn selector(uiworld: &UiWorld) {
         (LandValue, "Land value"),
         (Happiness, "Happiness"),
         (Transit, "Transit"),
+        (Traffic, "Traffic"),
     ];
 
     let mut mode = uiworld.write::<OverlayMode>();
@@ -368,6 +390,7 @@ mod tests {
         let mut test = ScenarioCtx::new(SimulationOptions {
             terrain_size: 4,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         let grid = grid_city(&mut test, vec2(700.0, 700.0), 4, 4, 160.0);
         let mut map = test.sim.write::<Map>();
@@ -441,6 +464,7 @@ mod tests {
         let mut test = ScenarioCtx::new(SimulationOptions {
             terrain_size: 10,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         let road = grid_city(&mut test, vec2(4600.0, 4600.0), 2, 2, 160.0).roads[0];
         let bakery = GoodsCompanyID::new("bakery");

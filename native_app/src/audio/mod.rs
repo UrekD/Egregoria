@@ -36,6 +36,10 @@ impl GameAudio {
         }
     }
 
+    pub(crate) fn reset_world(&mut self) {
+        self.carsounds.reset_world();
+    }
+
     pub fn update(&mut self, sim: &Simulation, uiworld: &UiWorld, ctx: &mut AudioContext) {
         self.music.update(ctx);
         self.ambiant.update(sim, uiworld);

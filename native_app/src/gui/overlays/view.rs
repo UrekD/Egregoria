@@ -39,6 +39,15 @@ thread_local! {
     static TERRAIN_HEIGHTS: RefCell<TerrainHeights> = RefCell::default();
 }
 
+pub(super) fn reset_world_cache() {
+    TERRAIN_HEIGHTS.with_borrow_mut(|cache| *cache = TerrainHeights::default());
+}
+
+#[cfg(test)]
+pub(super) fn world_cache_is_clear() -> bool {
+    TERRAIN_HEIGHTS.with_borrow(|cache| cache.changes.is_none() && cache.range == [0.0; 2])
+}
+
 /// Projects the frustum's intersection with the map's ground and building
 /// heights onto XY. Clipping to the map also handles views above the horizon.
 pub(crate) fn bounds(camera: &Camera, map: &Map) -> Option<AABB> {
@@ -104,6 +113,7 @@ mod tests {
         let test = scenarios::ScenarioCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         let target = vec3(250.0, 250.0, -30.0);
         let mut camera = Camera::new(target, 1600.0, 900.0);

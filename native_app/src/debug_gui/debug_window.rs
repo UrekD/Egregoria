@@ -88,6 +88,10 @@ pub fn debug_window(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
 /// debug window for various debug options
 fn debug(window: egui::Window<'_>, ui: &egui::Context, uiworld: &UiWorld, sim: &Simulation) {
     window.show(ui, |ui| {
+        crate::gui::windows::load::debug_replay(ui, uiworld);
+        if !crate::session::world_interaction(uiworld) {
+            return;
+        }
         let mut objs = uiworld.write::<DebugObjs>();
         for (val, name, _) in &mut objs.0 {
             ui.checkbox(val, *name);

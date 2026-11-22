@@ -245,3 +245,16 @@ fn paint_area(start: Vec2, end: Vec2, bounds: AABB) -> Option<OBB> {
     let size = ur - ll;
     (size.x > 0.0 && size.y > 0.0).then(|| OBB::new((ll + ur) * 0.5, Vec2::X, size.x, size.y))
 }
+
+#[cfg(test)]
+impl ZoningState {
+    pub(crate) fn start_test_gesture(&mut self) {
+        self.drag_start = Some(Vec2::X);
+        self.last_brush = Some(Vec2::Y);
+        self.over_controls = true;
+    }
+
+    pub(crate) fn gesture_is_clear(&self) -> bool {
+        self.drag_start.is_none() && self.last_brush.is_none() && !self.over_controls
+    }
+}

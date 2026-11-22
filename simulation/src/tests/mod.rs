@@ -40,6 +40,7 @@ impl TestCtx {
         let g = Simulation::new_with_options(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
+            ..SimulationOptions::LEGACY
         });
         let sched = Simulation::schedule();
 

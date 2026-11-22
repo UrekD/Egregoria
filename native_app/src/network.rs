@@ -1,9 +1,8 @@
 pub use self::inner::*;
 use crate::game_loop::{State, Timings};
 use crate::gui::windows::settings::Settings;
-use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
+use crate::uiworld::{ReceivedCommands, UiWorld};
 use common::timestep::Timestep;
-use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::{CommandOutcomes, WorldCommand, WorldCommands};
 use simulation::Simulation;
 
@@ -13,17 +12,29 @@ impl Default for NetworkState {
     }
 }
 
+impl NetworkState {
+    pub fn reset_timestep(&mut self) {
+        match self {
+            Self::Singleplayer(step) => *step = Timestep::default(),
+            #[cfg(feature = "multiplayer")]
+            Self::Client(_) | Self::Server(_) => {}
+        }
+    }
+}
+
 #[cfg(not(feature = "multiplayer"))]
 mod inner {
     use crate::network::{State, Timestep};
+    use crate::session::WorldReplacement;
 
     #[allow(clippy::large_enum_variant)]
     pub enum NetworkState {
         Singleplayer(Timestep),
     }
 
-    pub fn sim_update(state: &mut State) {
+    pub fn sim_update(state: &mut State) -> Option<WorldReplacement> {
         super::handle_singleplayer(state);
+        None
     }
 }
 
@@ -34,14 +45,6 @@ fn handle_singleplayer(state: &mut State) {
     let timewarp = state.uiw.read::<Settings>().time_warp;
     let mut commands = std::mem::take(&mut *state.uiw.write::<WorldCommands>());
     *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
-
-    if handle_replay(
-        &mut sim,
-        &mut state.game_schedule,
-        &mut state.uiw.write::<SaveLoadState>(),
-    ) {
-        return;
-    }
 
     let sched = &mut state.game_schedule;
     let mut timings = state.uiw.write::<Timings>();
@@ -90,32 +93,16 @@ fn publish_accepted_commands(uiw: &UiWorld, sim: &Simulation, commands: &WorldCo
     *uiw.write::<ReceivedCommands>() = ReceivedCommands::new(accepted);
 }
 
-fn handle_replay(
-    sim: &mut Simulation,
-    schedule: &mut SeqSchedule,
-    slstate: &mut SaveLoadState,
-) -> bool {
-    if let Some(new_sim) = slstate.please_load_sim.take() {
-        *sim = new_sim;
-        slstate.render_reset = true;
-        log::info!("replaced sim");
-    }
-    if let Some(ref mut replay) = slstate.please_load {
-        if replay.advance_tick(sim, schedule) {
-            slstate.please_load = None;
-            log::info!("finished loading replay");
-        }
-        return true;
-    }
-    false
+pub fn is_singleplayer(uiw: &UiWorld) -> bool {
+    matches!(*uiw.read::<NetworkState>(), NetworkState::Singleplayer(_))
 }
 
 #[cfg(feature = "multiplayer")]
 mod inner {
     use crate::game_loop::{State, Timings, VERSION};
     use crate::gui::windows::network::NetworkConnectionInfo;
-    use crate::network::handle_replay;
-    use crate::uiworld::{ReceivedCommands, SaveLoadState};
+    use crate::session::WorldReplacement;
+    use crate::uiworld::ReceivedCommands;
     use common::timestep::Timestep;
     use networking::{
         ConnectConf, Frame, PollResult, ServerConfiguration, ServerPollResult, VirtualClientConf,
@@ -137,27 +124,16 @@ mod inner {
         Server(Server),
     }
 
-    pub fn sim_update(state: &mut State) {
-        if matches!(
-            *state.uiw.read::<NetworkState>(),
-            NetworkState::Singleplayer(_)
-        ) {
+    pub fn sim_update(state: &mut State) -> Option<WorldReplacement> {
+        if super::is_singleplayer(&state.uiw) {
             super::handle_singleplayer(state);
-            return;
+            return None;
         }
 
-        let mut sim = unwrap_orr!(state.sim.try_write(), return); // mut for tick
+        let mut sim = state.sim.try_write().ok()?;
 
         let commands = std::mem::take(&mut *state.uiw.write::<WorldCommands>());
         *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
-
-        if handle_replay(
-            &mut sim,
-            &mut state.game_schedule,
-            &mut state.uiw.write::<SaveLoadState>(),
-        ) {
-            return;
-        }
 
         let mut net_state = state.uiw.write::<NetworkState>();
 
@@ -190,9 +166,10 @@ mod inner {
                     PollResult::Input(inputs) => {
                         inputs_to_apply = Some(inputs);
                     }
-                    PollResult::GameWorld(commands, prepared_sim) => {
-                        *sim = prepared_sim;
-                        *state.uiw.write::<WorldCommands>() = commands;
+                    PollResult::GameWorld(_, prepared_sim) => {
+                        // The returned batch is local input from the old world. The
+                        // client's catch-up state holds the actual protocol inputs.
+                        return Some(WorldReplacement::Network(prepared_sim));
                     }
                     PollResult::Disconnect(reason) => {
                         log::error!(
@@ -231,6 +208,7 @@ mod inner {
             }
             *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::new(merged);
         }
+        None
     }
 
     pub fn start_server(info: &mut NetworkConnectionInfo, sim: &Simulation) -> Option<Server> {

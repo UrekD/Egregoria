@@ -1,5 +1,5 @@
 use common::{FastMap, FastSet};
-use engine::{InputContext, Key, MouseButton};
+use engine::{Context, InputContext, Key, MouseButton};
 use geom::{Ray3, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::Entry;
@@ -72,6 +72,7 @@ pub struct InputMap {
     /// Mouse position in screen space
     pub screen: Vec2,
     input_tree: InputTree,
+    require_pointer_release: bool,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -138,7 +139,61 @@ impl InputMap {
         self.input_tree = InputTree::new(bindings);
     }
 
+    pub(crate) fn reset_world_input(&mut self) {
+        self.just_act.clear();
+        self.act.clear();
+        self.wheel = 0.0;
+        self.screen = Vec2::ZERO;
+        self.ray = None;
+        self.unprojected = None;
+        self.unprojected_normal = None;
+        self.require_pointer_release = true;
+    }
+
+    pub(crate) fn observe_pointer_release(&mut self, ctx: &mut Context, scripted: bool) {
+        if !self.require_pointer_release {
+            return;
+        }
+        if scripted {
+            self.observe_pointer_buttons(!ctx.input.mouse.pressed.is_empty());
+            return;
+        }
+
+        // Egui receives window events before Yakui can consume them.
+        let platform = &ctx.egui.platform;
+        let raw = platform.egui_input();
+        let held = raw.focused
+            && platform.egui_ctx().input(|input| {
+                use egui::PointerButton::*;
+                [Primary, Secondary, Middle, Extra1, Extra2]
+                    .into_iter()
+                    .any(|button| {
+                        raw.events
+                            .iter()
+                            .rev()
+                            .find_map(|event| match event {
+                                egui::Event::PointerButton {
+                                    button: event_button,
+                                    pressed,
+                                    ..
+                                } if *event_button == button => Some(*pressed),
+                                _ => None,
+                            })
+                            .unwrap_or_else(|| input.pointer.button_down(button))
+                    })
+            });
+        if !held {
+            ctx.input.mouse.pressed.clear();
+        }
+        self.observe_pointer_buttons(held);
+    }
+
+    pub(crate) fn observe_pointer_buttons(&mut self, held: bool) {
+        self.require_pointer_release &= held;
+    }
+
     pub fn prepare_frame(&mut self, input: &InputContext, kb: bool, mouse: bool) {
+        let mouse = mouse && !self.require_pointer_release;
         self.just_act.clear();
         let empty1 = FastSet::default();
         let empty2 = FastSet::default();
@@ -163,7 +218,11 @@ impl InputMap {
             }
         }
         self.screen = input.mouse.screen;
-        self.wheel = input.mouse.wheel_delta;
+        self.wheel = if self.require_pointer_release {
+            0.0
+        } else {
+            input.mouse.wheel_delta
+        };
     }
 }
 
