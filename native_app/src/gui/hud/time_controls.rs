@@ -39,13 +39,23 @@ fn speed_tooltip(
     if let Some(binding) = binding.filter(|binding| !binding.0.is_empty()) {
         text.push_str(&format!(" ({binding})"));
     }
-    // MAX has no target speed, so it always reports what it reaches.
-    if let Some(actual) =
-        actual.filter(|actual| selected && (speed == MAX_WARP || *actual < f64::from(speed) * 0.9))
-    {
+    if let Some(actual) = shortfall(speed, actual).filter(|_| selected) {
         text.push_str(&format!(" · ≈{actual:.1}× actual"));
     }
     text
+}
+
+/// The achieved speed when it is worth reporting for `warp`.
+fn shortfall(warp: u32, actual: Option<f64>) -> Option<f64> {
+    // MAX has no target speed, so it always reports what it reaches.
+    actual.filter(|actual| warp == MAX_WARP || *actual < f64::from(warp) * 0.9)
+}
+
+/// The achieved speed shown next to the clock.
+fn achieved_readout(warp: u32, actual: Option<f64>) -> Option<String> {
+    shortfall(warp, actual)
+        .filter(|_| warp != 0)
+        .map(|actual| format!("≈{actual:.0}×"))
 }
 
 fn set_warp(warp: &mut u32, depause_warp: &mut u32, requested: u32) {
@@ -90,6 +100,7 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
         NetworkState::Client(_) | NetworkState::Server(_) => None,
     };
     let bindings = uiworld.read::<Bindings>();
+    let readout = achieved_readout(*warp, actual_warp);
 
     let paused = *warp == 0;
     // Keep the control widgets in place when the pause outline changes.
@@ -110,6 +121,10 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
             row(|| {
                 monospace(on_secondary_container(), format!("Day {}", time.day));
                 spacer(1);
+                if let Some(readout) = &readout {
+                    monospace(on_secondary_container(), readout.clone());
+                    spacer(1);
+                }
                 monospace(
                     on_secondary_container(),
                     format!("{:02}:{:02}:{:02}", time.hour, time.minute, time.second),
@@ -230,6 +245,18 @@ mod tests {
             speed_tooltip("8×", None, 8, true, Some(4.0)),
             "8× · ≈4.0× actual"
         );
+    }
+
+    #[test]
+    fn ux2a_clock_shows_the_achieved_speed_when_it_falls_short() {
+        assert_eq!(
+            achieved_readout(MAX_WARP, Some(312.04)).as_deref(),
+            Some("≈312×")
+        );
+        assert_eq!(achieved_readout(50, Some(31.6)).as_deref(), Some("≈32×"));
+        assert_eq!(achieved_readout(50, Some(48.0)), None);
+        assert_eq!(achieved_readout(MAX_WARP, None), None);
+        assert_eq!(achieved_readout(0, Some(0.0)), None);
     }
 
     #[test]
