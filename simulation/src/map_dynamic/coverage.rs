@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 
 use geom::{Vec2, Vec3};
 use ordered_float::OrderedFloat;
@@ -18,6 +19,9 @@ pub struct CoverageGrid {
     started_providers: BTreeSet<BuildingID>,
     #[serde(skip)]
     revisions: BTreeMap<ServiceKind, u64>,
+    // Presentation data is rebuilt by coverage passes after loading.
+    #[serde(skip)]
+    served_distances: BTreeMap<ServiceKind, BTreeMap<BuildingID, f32>>,
 }
 
 impl CoverageGrid {
@@ -29,6 +33,11 @@ impl CoverageGrid {
             .unwrap_or_default()
     }
 
+    /// Farthest network distance at which this provider allocated any service in the last pass.
+    pub fn served_distance(&self, building: BuildingID, kind: ServiceKind) -> Option<f32> {
+        self.served_distances.get(&kind)?.get(&building).copied()
+    }
+
     pub fn revision(&self, kind: ServiceKind) -> u64 {
         self.revisions.get(&kind).copied().unwrap_or_default()
     }
@@ -38,8 +47,18 @@ impl CoverageGrid {
 pub struct ServiceReachSource {
     pub building: BuildingID,
     pub center: Vec2,
-    pub radius_m: f32,
+    pub served_distance_m: f32,
     pub effective_capacity: f32,
+}
+
+/// Invalidate the display when either the allocation or the set of active providers changes.
+pub fn service_reach_version(sim: &Simulation, kind: ServiceKind) -> u64 {
+    let mut hash = DefaultHasher::new();
+    sim.read::<CoverageGrid>().revision(kind).hash(&mut hash);
+    for provider in active_providers(sim, kind) {
+        provider.building.hash(&mut hash);
+    }
+    hash.finish()
 }
 
 /// Service providers on the map, including inactive facilities for display.
@@ -49,16 +68,27 @@ pub fn service_reach_sources(sim: &Simulation, kind: ServiceKind) -> Vec<Service
         .map(|provider| (provider.building, provider.capacity))
         .collect();
     let map = sim.map();
+    let coverage = sim.read::<CoverageGrid>();
     let mut sources: Vec<_> = map
         .buildings()
         .values()
         .filter_map(|building| {
             let service = try_prototype(ServiceID::from(building.kind.as_goods_company()?))?;
-            (service.service_kind == kind).then(|| ServiceReachSource {
+            if service.service_kind != kind {
+                return None;
+            }
+            let effective_capacity = active.get(&building.id).copied().unwrap_or(0.0);
+            Some(ServiceReachSource {
                 building: building.id,
                 center: building.obb.center(),
-                radius_m: service.radius_m,
-                effective_capacity: active.get(&building.id).copied().unwrap_or(0.0),
+                served_distance_m: if effective_capacity > 0.0 {
+                    coverage
+                        .served_distance(building.id, kind)
+                        .unwrap_or_default()
+                } else {
+                    0.0
+                },
+                effective_capacity,
             })
         })
         .collect();
@@ -107,6 +137,7 @@ struct Provider {
     door: Vec3,
     radius: f32,
     capacity: f32,
+    served_distance: Option<f32>,
 }
 
 struct Receiver {
@@ -212,6 +243,13 @@ pub fn coverage_update(sim: &mut Simulation) {
     grid.started_providers
         .extend(providers.iter().map(|provider| provider.building));
     grid.by_kind.insert(kind, coverage);
+    grid.served_distances.insert(
+        kind,
+        providers
+            .iter()
+            .filter_map(|provider| Some((provider.building, provider.served_distance?)))
+            .collect(),
+    );
     let revision = grid.revisions.entry(kind).or_default();
     *revision = revision.wrapping_add(1);
 }
@@ -246,6 +284,7 @@ fn active_providers(sim: &Simulation, kind: ServiceKind) -> Vec<Provider> {
                 door: building.door_pos,
                 radius: proto.radius_m,
                 capacity,
+                served_distance: None,
             })
         })
         .collect()
@@ -305,8 +344,9 @@ fn recompute(
     }
 
     let mut search = RoadSearch::default();
-    for (index, provider) in providers.iter().enumerate() {
-        search.serve(&map, &mut roads, provider, index + 1, &mut coverage);
+    for (index, provider) in providers.iter_mut().enumerate() {
+        provider.served_distance =
+            search.serve(&map, &mut roads, provider, index + 1, &mut coverage);
     }
     coverage
 }
@@ -326,10 +366,8 @@ impl RoadSearch {
         provider: &Provider,
         pass: usize,
         coverage: &mut BTreeMap<BuildingID, f32>,
-    ) {
-        let Some(origin) = roads.get(provider.road) else {
-            return;
-        };
+    ) -> Option<f32> {
+        let origin = roads.get(provider.road)?;
         self.queue.clear();
         self.candidates.clear();
 
@@ -357,6 +395,7 @@ impl RoadSearch {
         }
 
         let mut remaining = provider.capacity;
+        let mut farthest_served = None;
         while remaining > 0.0 {
             if let Some(&Reverse(candidate)) = self.candidates.peek() {
                 // Finish all graph nodes at this distance before breaking receiver ties by ID.
@@ -370,6 +409,8 @@ impl RoadSearch {
                     // A receiver can be reached from both ends of its road.
                     let served = remaining.min(receiver.unserved);
                     if served > 0.0 {
+                        // Candidates are handled in ascending network distance.
+                        farthest_served = Some(candidate.distance.0);
                         remaining -= served;
                         receiver.unserved -= served;
                         let falloff = 1.0 - candidate.distance.0 / provider.radius;
@@ -425,6 +466,7 @@ impl RoadSearch {
                 }
             }
         }
+        farthest_served
     }
 
     fn add_candidate(
@@ -466,3 +508,102 @@ impl RoadSearch {
 #[cfg(test)]
 #[path = "../tests/p2a_coverage.rs"]
 mod tests;
+
+#[cfg(test)]
+mod u3_tests {
+    use geom::{vec2, vec3, OBB};
+    use prototypes::{BuildingGen, GameTime, GoodsCompanyID};
+    use slotmapd::KeyData;
+
+    use super::*;
+    use crate::map_dynamic::electricity_flow_system;
+    use crate::souls::goods_company::company_soul;
+    use crate::tests::TestCtx;
+    use crate::world::HumanID;
+
+    #[test]
+    fn u3_coverage_reach_tracks_allocated_distance_and_live_activity() {
+        let mut test = TestCtx::new_fast();
+        let initial: Vec<_> = test.g.map().roads().keys().collect();
+        test.build_roads(&[vec3(100.0, 400.0, 0.0), vec3(600.0, 400.0, 0.0)]);
+        let road = test
+            .g
+            .map()
+            .roads()
+            .keys()
+            .find(|id| !initial.contains(id))
+            .unwrap();
+        let build = |sim: &Simulation, x, kind, gen| {
+            let id = sim
+                .map_mut()
+                .build_special_building(
+                    &OBB::new(vec2(x, 420.0), Vec2::X, 20.0, 20.0),
+                    kind,
+                    gen,
+                    None,
+                    Some(road),
+                )
+                .unwrap();
+            sim.write::<BuildingInfos>().insert(id);
+            id
+        };
+        let near = build(&test.g, 330.0, BuildingKind::House, BuildingGen::House);
+        let far = build(&test.g, 440.0, BuildingKind::House, BuildingGen::House);
+        let worker = HumanID::from(KeyData::from_ffi(1));
+        for home in [near, far] {
+            test.g
+                .write::<BuildingInfos>()
+                .get_mut(home)
+                .unwrap()
+                .residents
+                .insert(worker.into());
+        }
+
+        let mut provider = |name, x, staff| {
+            let proto = GoodsCompanyID::new(name).prototype();
+            let id = build(&test.g, x, BuildingKind::GoodsCompany(proto.id), proto.bgen);
+            let Some(SoulID::GoodsCompany(company)) = company_soul(&mut test.g, id, proto.id)
+            else {
+                panic!("missing company");
+            };
+            test.g.world.companies[company].workers.0 = vec![worker; staff];
+            company
+        };
+        let school = provider("school", 280.0, 1);
+        let plant = provider("coal-power-plant", 210.0, 10);
+        let refresh_power = |sim: &mut Simulation| {
+            let (world, resources) = sim.world_res();
+            electricity_flow_system(world, resources);
+        };
+        let reach = |sim: &Simulation| {
+            let sources = service_reach_sources(sim, ServiceKind::School);
+            assert_eq!(sources.len(), 1);
+            sources[0].served_distance_m
+        };
+        refresh_power(&mut test.g);
+        assert_eq!(reach(&test.g), 0.0);
+        *test.g.write::<GameTime>() = GameTime::new(prototypes::Tick(8100));
+        coverage_update(&mut test.g);
+        let radius = ServiceID::new("school").prototype().radius_m;
+        let coverage = test.g.read::<CoverageGrid>();
+        let score = coverage.coverage(far, ServiceKind::School);
+        assert!(coverage.coverage(near, ServiceKind::School) > score);
+        drop(coverage);
+        let served = reach(&test.g);
+        let version = service_reach_version(&test.g, ServiceKind::School);
+        assert!(served > 0.0 && served < radius);
+        assert!((served - radius * (1.0 - score / 100.0)).abs() < 0.01);
+
+        test.g.world.companies[plant].workers.0.clear();
+        refresh_power(&mut test.g);
+        assert_eq!(reach(&test.g), 0.0);
+        assert_ne!(service_reach_version(&test.g, ServiceKind::School), version);
+        test.g.world.companies[plant].workers.0 = vec![worker; 10];
+        refresh_power(&mut test.g);
+        assert_eq!(reach(&test.g), served);
+        assert_eq!(service_reach_version(&test.g, ServiceKind::School), version);
+
+        test.g.world.companies[school].workers.0.clear();
+        assert_eq!(reach(&test.g), 0.0);
+    }
+}

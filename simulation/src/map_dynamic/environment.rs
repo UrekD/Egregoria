@@ -11,7 +11,7 @@ use crate::map_dynamic::{BuildingInfos, CoverageGrid, UtilityFlow};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
 
-const POLLUTION_RADIUS: f32 = 160.0;
+pub const POLLUTION_RADIUS: f32 = 160.0;
 const POLLUTION_RETENTION: f32 = 0.9;
 const MIN_POLLUTION: f32 = 1.0;
 const BASE_LAND_VALUE: f32 = 20.0 + 10.0;
@@ -42,7 +42,12 @@ impl EnvGrid {
 
     /// Most recent land value for `building`, or zero if it has no entry.
     pub fn land_value(&self, building: BuildingID) -> u8 {
-        self.by_building.get(&building).copied().unwrap_or_default()
+        self.land_value_sample(building).unwrap_or_default()
+    }
+
+    /// Most recent land value for a building with a recorded environment sample.
+    pub fn land_value_sample(&self, building: BuildingID) -> Option<u8> {
+        self.by_building.get(&building).copied()
     }
 
     fn cell_at(pos: Vec2) -> (i32, i32) {

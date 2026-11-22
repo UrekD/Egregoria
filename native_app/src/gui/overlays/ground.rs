@@ -9,12 +9,12 @@ use prototypes::{try_prototype, ServiceID};
 use simulation::map::{ElectricityNetworkID, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
     service_reach_sources, utility_network_at_road, utility_network_readout, ElectricityFlow,
-    EnvGrid, ServiceReachSource, UtilityFlow, UtilityNetworkReadout,
+    EnvGrid, ServiceReachSource, UtilityFlow, UtilityNetworkReadout, POLLUTION_RADIUS,
 };
 use simulation::souls::happiness::Happiness;
 use simulation::Simulation;
 
-use super::{current_overlay, is_coverage_receiver, legend, placement_overlay, OverlayMode};
+use super::{current_overlay, legend, placement_overlay, OverlayMode};
 use crate::gui::{PlacementPreview, Tool};
 use crate::rendering::MapRenderer;
 use crate::uiworld::UiWorld;
@@ -22,8 +22,6 @@ use crate::uiworld::UiWorld;
 const PITCH: f32 = EnvGrid::CELL_SIZE;
 const FIELD_INTERVAL: Duration = Duration::from_millis(500);
 const SCORE_RADIUS: f32 = 128.0;
-// The simulation currently uses a single radius for all pollution sources.
-const POLLUTION_RADIUS: f32 = 160.0;
 
 #[derive(Default)]
 struct GroundCache {
@@ -117,7 +115,7 @@ pub(crate) fn prepare_ground(
         }
         let key = FieldKey {
             topology: UtilityFlow::topology_revision(&map),
-            data: mode.data_version(sim, &map, sim.get_tick()),
+            data: mode.data_version(sim, &map),
             focus,
         };
         if !mode_changed
@@ -148,8 +146,7 @@ pub(crate) fn prepare_ground(
                     &atlas.layout,
                     &service_reach_sources(sim, kind),
                 )) {
-                    let color = legend::REACH_COLOR;
-                    encode(pixel, color, reach.sqrt());
+                    encode_reach(pixel, reach);
                 }
             }
             OverlayMode::Pollution => {
@@ -166,19 +163,19 @@ pub(crate) fn prepare_ground(
                 }
             }
             OverlayMode::LandValue | OverlayMode::Happiness => {
-                let env = sim.read::<EnvGrid>();
-                let happiness = sim.read::<Happiness>();
-                let environment_sampled = super::environment_version(sim) > 0;
-                let scores = map.buildings().values().filter_map(|building| {
-                    let score = if mode == OverlayMode::LandValue {
-                        (environment_sampled && is_coverage_receiver(building.kind))
-                            .then(|| env.land_value(building.id))
-                    } else {
-                        happiness.by_building.get(&building.id).copied()
-                    };
-                    score.map(|score| (building.obb.center(), f32::from(score)))
-                });
-                let field = score_field(&atlas.layout, scores);
+                let field = if mode == OverlayMode::LandValue {
+                    score_field(
+                        &atlas.layout,
+                        land_value_samples(&map, &sim.read::<EnvGrid>()),
+                    )
+                } else {
+                    let happiness = sim.read::<Happiness>();
+                    let scores = map.buildings().values().filter_map(|building| {
+                        let score = happiness.by_building.get(&building.id)?;
+                        Some((building.obb.center(), f32::from(*score)))
+                    });
+                    score_field(&atlas.layout, scores)
+                };
                 for (pixel, [sum, weight]) in atlas.rgba.chunks_exact_mut(4).zip(field) {
                     if weight > 0.0 {
                         encode(pixel, scale.color(sum / weight), weight.min(1.0));
@@ -203,10 +200,13 @@ pub(super) fn preview_disc(preview: &PlacementPreview) -> Option<GroundOverlayDi
     let company = preview.company?;
     let (obb, _) = preview.ghost?;
     let (radius, color) = match placement_overlay(company)? {
-        OverlayMode::Coverage(_) => (
-            try_prototype(ServiceID::from(company))?.radius_m,
-            LinearColor::new(0.05, 0.68, 0.9, 0.46),
-        ),
+        OverlayMode::Coverage(_) => {
+            let [r, g, b, a] = legend::MAX_REACH_COLOR;
+            (
+                try_prototype(ServiceID::from(company))?.radius_m,
+                LinearColor::new(r, g, b, a),
+            )
+        }
         OverlayMode::Pollution => (POLLUTION_RADIUS, LinearColor::new(0.95, 0.28, 0.08, 0.5)),
         _ => return None,
     };
@@ -344,13 +344,17 @@ fn encode(out: &mut [u8], [r, g, b, opacity]: [f32; 4], weight: f32) {
     ]);
 }
 
+fn encode_reach(pixel: &mut [u8], reach: f32) {
+    encode(pixel, legend::REACH_COLOR, reach);
+}
+
 fn radial_field(layout: &AtlasLayout, sources: &[ServiceReachSource]) -> Vec<f32> {
     let mut field = vec![0.0_f32; layout.len()];
     for source in sources {
-        if source.effective_capacity <= 0.0 || source.radius_m <= 0.0 {
+        if source.effective_capacity <= 0.0 || source.served_distance_m <= 0.0 {
             continue;
         }
-        let (center, radius) = (source.center, source.radius_m);
+        let (center, radius) = (source.center, source.served_distance_m);
         let margin = Vec2::splat(radius);
         layout.visit(center - margin, center + margin, |i, pos| {
             field[i] = field[i].max(1.0 - pos.distance(center) / radius);
@@ -370,6 +374,16 @@ fn pollution_field(layout: &AtlasLayout, grid: &EnvGrid) -> Vec<f32> {
         }
     }
     field
+}
+
+fn land_value_samples<'a>(
+    map: &'a Map,
+    env: &'a EnvGrid,
+) -> impl Iterator<Item = (Vec2, f32)> + 'a {
+    map.buildings().values().filter_map(move |building| {
+        let score = env.land_value_sample(building.id)?;
+        Some((building.obb.center(), f32::from(score)))
+    })
 }
 
 fn score_field(layout: &AtlasLayout, scores: impl Iterator<Item = (Vec2, f32)>) -> Vec<[f32; 2]> {
@@ -397,7 +411,7 @@ mod tests {
         let left = ServiceReachSource {
             building: Default::default(),
             center: vec2(16.0, 16.0),
-            radius_m: 128.0,
+            served_distance_m: 128.0,
             effective_capacity: 1.0,
         };
         let right = ServiceReachSource {
@@ -419,6 +433,53 @@ mod tests {
         assert_eq!(&field[..5], &[1.0, 0.75, 0.75, 1.0, 0.75]);
         assert_eq!(field[5], 0.75);
         assert_eq!(field[24], 0.0);
+    }
+
+    #[test]
+    fn u3_coverage_field_has_linear_alpha() {
+        let mut pixel = [0; 4];
+        encode_reach(&mut pixel, 0.5);
+        assert_eq!(pixel[3], alpha_byte(0.5 * legend::REACH_COLOR[3]));
+    }
+
+    #[test]
+    fn u3_land_value_uses_measured_zero_and_skips_a_new_building() {
+        use geom::OBB;
+        use prototypes::{BuildingGen, GameTime, Tick};
+        use scenarios::ScenarioCtx;
+        use simulation::map::BuildingKind;
+        use simulation::map_dynamic::env_update;
+        use simulation::SimulationOptions;
+
+        let mut fixture = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            ..SimulationOptions::LEGACY
+        });
+        let build = |sim: &Simulation, center| {
+            sim.write::<Map>()
+                .build_special_building(
+                    &OBB::new(center, Vec2::X, 20.0, 20.0),
+                    BuildingKind::House,
+                    BuildingGen::House,
+                    None,
+                    None,
+                )
+                .unwrap();
+        };
+        let measured = vec2(720.0, 720.0);
+        build(&fixture.sim, measured);
+        fixture
+            .sim
+            .write::<EnvGrid>()
+            .cells
+            .insert((22, 22), EnvCell { pollution: 200.0 });
+        *fixture.sim.write::<GameTime>() = GameTime::new(Tick(3002));
+        env_update(&mut fixture.sim);
+        build(&fixture.sim, vec2(784.0, 720.0));
+
+        let samples: Vec<_> =
+            land_value_samples(&fixture.sim.map(), &fixture.sim.read::<EnvGrid>()).collect();
+        assert_eq!(samples, [(measured, 0.0)]);
     }
 
     #[test]

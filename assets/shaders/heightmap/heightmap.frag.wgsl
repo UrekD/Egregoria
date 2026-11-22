@@ -62,8 +62,10 @@ fn ground_overlay_at(world_xy: vec2<f32>) -> vec4<f32> {
         }
     }
     if (overlay.preview_radius > 0.0) {
-        let d = distance(world_xy, overlay.preview_center) / overlay.preview_radius;
-        let preview = overlay.preview_color * (1.0 - smoothstep(0.8, 1.0, d));
+        let d = distance(world_xy, overlay.preview_center);
+        let falloff = max(1.0 - d / overlay.preview_radius, 0.0);
+        let ring = 1.0 - smoothstep(2.0, 6.0, abs(d - overlay.preview_radius));
+        let preview = overlay.preview_color * max(falloff, ring);
         coverage = preview + coverage * (1.0 - preview.a);
     }
     return coverage;

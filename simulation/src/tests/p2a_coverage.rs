@@ -265,7 +265,7 @@ fn p2a_overlapping_providers_allocate_capacity_deterministically() {
     assert!(first < second && near < adjacent);
 
     // Put both receivers at the same road station and the same distance from the centerline.
-    let (radius, capacity) = (1800.0, 50.0);
+    let (radius, capacity) = (900.0, 50.0);
     {
         let mut map = sim.map_mut();
         for id in [first, second, third, near, adjacent] {

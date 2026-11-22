@@ -12,6 +12,8 @@ use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand};
 use simulation::Simulation;
 use std::borrow::Cow;
 
+const MP_PLACEMENT_TIMEOUT_FRAMES: u64 = 300;
+
 pub struct SpecialBuildArgs {
     pub obb: OBB,
     pub connected_road: Option<RoadID>,
@@ -37,6 +39,10 @@ pub struct SpecialBuildingResource {
 /// SpecialBuilding tool
 /// Allows to build special buildings like farms, factories, etc.
 pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
+    specialbuilding_input(sim, uiworld, || crate::network::is_singleplayer(uiworld));
+}
+
+fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnOnce() -> bool) {
     profiling::scope!("gui::specialbuilding");
     let mut state = uiworld.write::<SpecialBuildingResource>();
     let tool = *uiworld.read::<Tool>();
@@ -57,8 +63,13 @@ pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {
             .received_commands()
             .iter()
             .any(|command| pending.matches(command));
-        let local = crate::network::is_singleplayer(uiworld);
-        if !echoed && (!local || batch_seq == state.pending_batch_seq) {
+        let local = is_local();
+        let waiting = if local {
+            batch_seq == state.pending_batch_seq
+        } else {
+            state.frame.wrapping_sub(pending.frame) < MP_PLACEMENT_TIMEOUT_FRAMES
+        };
+        if !echoed && waiting {
             return;
         }
         // Singleplayer publishes only accepted commands. Multiplayer echoes attempted
@@ -259,6 +270,46 @@ mod tests {
     use crate::rendering::OrbitCamera;
     use crate::session::{self, WorldReplacement};
     use crate::uiworld::ReceivedCommands;
+
+    #[test]
+    fn u3_multiplayer_placement_releases_pending_when_echo_is_lost() {
+        let fixture = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            ..SimulationOptions::LEGACY
+        });
+        crate::init::init();
+        let uiw = UiWorld::with_defaults();
+        *uiw.write::<Tool>() = Tool::SpecialBuilding;
+        let obb = OBB::new(vec2(700.0, 700.0), geom::Vec2::X, 20.0, 20.0);
+        let company = GoodsCompanyID::new("school");
+        let prototype = company.prototype();
+        {
+            let mut state = uiw.write::<SpecialBuildingResource>();
+            state.last_obb = Some(obb);
+            state.opt = Some(SpecialBuildKind {
+                company: Some(company),
+                make: Box::new(|_| Vec::new()),
+                size: prototype.size,
+                asset: prototype.asset.clone(),
+                road_snap: true,
+            });
+        }
+        uiw.write::<PlacementPreview>().pending = Some(PendingPlacement {
+            kind: BuildingKind::GoodsCompany(company),
+            obb,
+            road: None,
+            frame: 0,
+        });
+
+        specialbuilding_input(&fixture.sim, &uiw, || false);
+        assert!(uiw.read::<PlacementPreview>().pending.is_some());
+        for _ in 1..MP_PLACEMENT_TIMEOUT_FRAMES {
+            specialbuilding_input(&fixture.sim, &uiw, || false);
+        }
+        assert!(uiw.read::<PlacementPreview>().pending.is_none());
+        assert!(uiw.read::<SpecialBuildingResource>().last_obb.is_none());
+        assert_eq!(uiw.read::<PlacementPreview>().company, Some(company));
+    }
 
     #[test]
     fn u3_placement_restores_manual_mode_across_gestures_and_worlds() {

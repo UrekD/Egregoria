@@ -1,11 +1,13 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use prototypes::{try_prototype, Power, ServiceID, ServiceKind, Tick};
 use serde::{Deserialize, Serialize};
 
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::Budget;
-use crate::map::{BuildingID, BuildingKind, ElectricityNetworkID, Map, RoadID, MAX_ZONE_AREA};
+use crate::map::{
+    BuildingID, BuildingKind, ElectricityNetworkID, Map, NetworkObjectID, RoadID, MAX_ZONE_AREA,
+};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
 
@@ -18,7 +20,9 @@ pub struct UtilityFlow {
     by_building: BTreeMap<BuildingID, ElectricityNetworkID>,
     by_network: BTreeMap<ElectricityNetworkID, UtilityTotals>,
     #[serde(skip)]
-    topology_generation: Option<u64>,
+    sampled_generation: Option<u64>,
+    #[serde(skip)]
+    sampled_members: BTreeMap<ElectricityNetworkID, BTreeSet<NetworkObjectID>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +44,7 @@ pub struct BuildingUtilityStatus {
 pub enum UtilityNetworkState {
     Updating,
     Disconnected,
+    Idle,
     Shortage,
     Ok,
 }
@@ -49,6 +54,7 @@ impl UtilityNetworkState {
         match self {
             Self::Updating => "Updating",
             Self::Disconnected => "Disconnected",
+            Self::Idle => "Idle",
             Self::Shortage => "Shortage",
             Self::Ok => "OK",
         }
@@ -77,43 +83,59 @@ pub fn utility_network_at_road(sim: &Simulation, road: RoadID) -> Option<Utility
     ))
 }
 
-/// Read current topology and only report totals belonging to its completed snapshot.
+/// Read the latest power flow and water/sewage totals for the current component.
 pub fn utility_network_readout(
     map: &Map,
     power: &ElectricityFlow,
     flow: &UtilityFlow,
     network: Option<ElectricityNetworkID>,
 ) -> UtilityNetworkReadout {
-    use UtilityNetworkState::{Disconnected, Ok, Shortage, Updating};
+    use UtilityNetworkState::{Disconnected, Idle, Ok, Shortage, Updating};
 
-    let totals = network
-        .filter(|_| flow.topology_generation == Some(map.electricity.generation()))
-        .and_then(|id| flow.by_network.get(&id).map(|totals| (id, *totals)));
-    let Some((id, utility_totals)) = totals else {
-        let state = if network.is_some() {
-            Updating
-        } else {
-            Disconnected
-        };
+    let network = network.filter(|id| map.electricity.networks.contains_key(id));
+    let Some(id) = network else {
         return UtilityNetworkReadout {
             network,
-            electricity: state,
-            water: state,
-            sewage: state,
+            electricity: Disconnected,
+            water: Disconnected,
+            sewage: Disconnected,
             power_totals: None,
             utility_totals: None,
         };
     };
 
     let power_totals = power.network_stats(id);
-    let state = |available| if available { Ok } else { Shortage };
+    let electricity = if power_totals.produced_power == Power::ZERO
+        && power_totals.consumed_power == Power::ZERO
+    {
+        Idle
+    } else if power_totals.blackout || power_totals.produced_power <= Power::ZERO {
+        Shortage
+    } else {
+        Ok
+    };
+
+    let utility_state = |supply, demand| {
+        if supply == 0.0 && demand == 0.0 {
+            Idle
+        } else if meets_demand(supply, demand) {
+            Ok
+        } else {
+            Shortage
+        }
+    };
+    let utility_totals = flow.current_totals(map, id);
     UtilityNetworkReadout {
         network,
-        electricity: state(!power_totals.blackout && power_totals.produced_power > Power::ZERO),
-        water: state(utility_totals.has_water()),
-        sewage: state(utility_totals.has_sewage()),
+        electricity,
+        water: utility_totals.map_or(Updating, |totals| {
+            utility_state(totals.water_production, totals.water_demand)
+        }),
+        sewage: utility_totals.map_or(Updating, |totals| {
+            utility_state(totals.sewage_capacity, totals.sewage_demand)
+        }),
         power_totals: Some(power_totals),
-        utility_totals: Some(utility_totals),
+        utility_totals,
     }
 }
 
@@ -128,8 +150,14 @@ impl UtilityFlow {
         map.electricity.generation()
     }
 
-    pub fn sampled_topology(&self) -> Option<u64> {
-        self.topology_generation
+    fn current_totals(&self, map: &Map, id: ElectricityNetworkID) -> Option<UtilityTotals> {
+        // Skip the membership comparison until the graph changes.
+        if self.sampled_generation != Some(map.electricity.generation())
+            && self.sampled_members.get(&id)? != &map.electricity.networks.get(&id)?.objects
+        {
+            return None;
+        }
+        self.by_network.get(&id).copied()
     }
 
     pub(crate) const fn due(tick: u64) -> bool {
@@ -255,7 +283,7 @@ pub fn utility_flow_update(sim: &mut Simulation) {
     let residences = sim.read::<Residences>();
     let mut flow = sim.write::<UtilityFlow>();
     let generation = map.electricity.generation();
-    let topology_changed = flow.topology_generation != Some(generation);
+    let topology_changed = flow.sampled_generation != Some(generation);
     if topology_changed {
         // Keep existing entries where possible, including on the first pass after loading.
         flow.by_building.retain(|&id, _| {
@@ -264,7 +292,12 @@ pub fn utility_flow_update(sim: &mut Simulation) {
         });
         flow.by_network
             .retain(|id, _| map.electricity.networks.contains_key(id));
-        flow.topology_generation = Some(generation);
+        flow.sampled_members = map
+            .electricity
+            .networks()
+            .map(|network| (network.id, network.objects.clone()))
+            .collect();
+        flow.sampled_generation = Some(generation);
     }
 
     // Every road in the electricity graph carries pipes, including rail-only roads.
@@ -388,7 +421,9 @@ mod tests {
         assert_ne!(read(&test.g, a).network, read(&test.g, b).network);
         assert_eq!(read(&test.g, a).electricity, Shortage);
         assert_eq!(read(&test.g, a).water, Shortage);
-        assert_eq!(read(&test.g, b).electricity, Shortage);
+        assert_eq!(read(&test.g, b).electricity, Idle);
+        assert_eq!(read(&test.g, b).water, Idle);
+        assert_eq!(read(&test.g, b).sewage, Idle);
         assert!(read(&test.g, a).utility_totals.unwrap().water_demand > 0.0);
         assert_eq!(read(&test.g, b).utility_totals.unwrap().water_demand, 0.0);
 
@@ -402,7 +437,10 @@ mod tests {
         }
         assert_eq!(read(&test.g, a).water, Ok);
         assert_eq!(read(&test.g, a).sewage, Ok);
-        assert_eq!(read(&test.g, b).water, Shortage);
+        let previous = read(&test.g, a);
+        test.build_roads(&[vec3(80.0, 500.0, 0.0), vec3(440.0, 500.0, 0.0)]);
+        assert_eq!(read(&test.g, a), previous);
+        let roads: Vec<_> = test.g.map().roads().keys().collect();
 
         test.build_roads(&[a_end, b_end]);
         let bridge = test
@@ -415,6 +453,12 @@ mod tests {
         assert_eq!(read(&test.g, a).network, read(&test.g, b).network);
         assert_eq!(read(&test.g, a).water, Updating);
         assert_eq!(read(&test.g, b).utility_totals, None);
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+        assert_eq!(read(&test.g, a).electricity, Shortage);
+        assert!(read(&test.g, a).power_totals.is_some());
+        assert_eq!(read(&test.g, a).water, Updating);
+        assert_eq!(read(&test.g, a).sewage, Updating);
         refresh(&mut test.g, 6001);
         assert_eq!(read(&test.g, a), read(&test.g, b));
 

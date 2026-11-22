@@ -10,19 +10,20 @@ use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
 
 use common::{ChunkID_256, FastMap};
-use geom::{InfiniteFrustrum, Intersect3, Shape, AABB, AABB3, OBB};
+use geom::{InfiniteFrustrum, Intersect3, LinearColor, Radians, Shape, AABB, AABB3, OBB};
 use goryak::{combo_box, tooltip};
 use prototypes::{try_prototype, GoodsCompanyID, Power, ServiceID, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer};
 use simulation::map::{Building, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
-    city_field_tick, service_reach_sources, utility_network_readout, CoverageGrid, ElectricityFlow,
-    Transit, UtilityFlow, UtilityNetworkReadout, UtilityNetworkState,
+    city_field_tick, service_reach_sources, service_reach_version, utility_network_readout,
+    CoverageGrid, ElectricityFlow, Transit, UtilityFlow, UtilityNetworkReadout,
+    UtilityNetworkState,
 };
 use simulation::souls::residence;
 use simulation::Simulation;
 
-use crate::gui::{PlacementPreview, Tool};
+use crate::gui::{InspectedBuilding, PlacementPreview, Tool};
 use crate::rendering::immediate::ImmediateDraw;
 
 use crate::uiworld::UiWorld;
@@ -186,16 +187,12 @@ pub(crate) fn world_cache_is_clear() -> bool {
 const FOOTPRINT_PADDING: f32 = 6.0;
 
 impl OverlayMode {
-    fn data_version(self, sim: &Simulation, map: &Map, _tick: u64) -> u64 {
+    fn data_version(self, sim: &Simulation, map: &Map) -> u64 {
         match self {
             Self::Off | Self::Traffic => 0,
-            Self::Power => power_version(
-                map,
-                &sim.read::<ElectricityFlow>(),
-                &sim.read::<UtilityFlow>(),
-            ),
+            Self::Power => power_version(map, &sim.read::<ElectricityFlow>()),
             Self::Transit => transit::invalidation_key(&sim.read::<Transit>()),
-            Self::Coverage(kind) => sim.read::<CoverageGrid>().revision(kind),
+            Self::Coverage(kind) => service_reach_version(sim, kind),
             Self::Water | Self::Sewage => city_field_tick(sim).saturating_sub(1) / 3000,
             Self::Pollution | Self::LandValue => environment_version(sim),
             Self::Happiness => city_field_tick(sim).saturating_sub(3) / TICKS_PER_HOUR,
@@ -222,15 +219,15 @@ fn environment_version(sim: &Simulation) -> u64 {
     city_field_tick(sim).saturating_sub(2) / 3000
 }
 
-fn power_version(map: &Map, power: &ElectricityFlow, flow: &UtilityFlow) -> u64 {
+fn power_version(map: &Map, power: &ElectricityFlow) -> u64 {
     let mut hash = DefaultHasher::new();
     UtilityFlow::topology_revision(map).hash(&mut hash);
-    flow.sampled_topology().hash(&mut hash);
     for network in map.electricity.networks() {
         let totals = power.network_stats(network.id);
         network.id.hash(&mut hash);
         totals.blackout.hash(&mut hash);
-        (totals.produced_power > Power::ZERO).hash(&mut hash);
+        totals.produced_power.cmp(&Power::ZERO).hash(&mut hash);
+        (totals.consumed_power == Power::ZERO).hash(&mut hash);
     }
     hash.finish()
 }
@@ -265,7 +262,7 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
         let map_changed = changes.take_updated_chunks().next().is_some() || cleared || new_map;
 
         let tick = sim.get_tick();
-        let data_version = mode.data_version(sim, &map, tick);
+        let data_version = mode.data_version(sim, &map);
         let rebuild = mode != cache.mode
             || map_changed
             || tick < cache.tick
@@ -295,6 +292,10 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             _ => {}
         }
 
+        if let OverlayMode::Coverage(kind) = mode {
+            draw_selected_service_ring(uiworld, &map, kind, &mut draw);
+        }
+
         let camera = uiworld.camera().camera;
         let projection = *camera.proj_cache.as_ref();
         if rebuild || cache.projection != projection {
@@ -315,6 +316,45 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             }
         }
     });
+}
+
+fn draw_selected_service_ring(
+    uiworld: &UiWorld,
+    map: &Map,
+    kind: ServiceKind,
+    draw: &mut ImmediateDraw,
+) {
+    if *uiworld.read::<Tool>() == Tool::SpecialBuilding {
+        return;
+    }
+    let Some(building) = uiworld
+        .read::<InspectedBuilding>()
+        .e
+        .and_then(|id| map.get(id))
+    else {
+        return;
+    };
+    let Some(service) = building
+        .kind
+        .as_goods_company()
+        .and_then(|id| try_prototype(ServiceID::from(id)))
+        .filter(|service| service.service_kind == kind && service.radius_m > 0.0)
+    else {
+        return;
+    };
+
+    const SEGMENTS: usize = 256;
+    let center = building.obb.center();
+    let points = (0..SEGMENTS)
+        .map(|i| {
+            let angle = Radians(i as f32 * std::f32::consts::TAU / SEGMENTS as f32);
+            let pos = center + angle.vec2() * service.radius_m;
+            pos.z(map.environment.height(pos).unwrap_or_default().max(0.0) + 0.4)
+        })
+        .collect::<Vec<_>>();
+    let [r, g, b, a] = legend::MAX_REACH_COLOR;
+    draw.polyline(points, 5.0, true)
+        .color(LinearColor::new(r, g, b, a));
 }
 
 fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut TileIndex) {
@@ -656,13 +696,25 @@ mod tests {
         let school = OverlayMode::Coverage(ServiceKind::School);
         let health = OverlayMode::Coverage(ServiceKind::Health);
 
-        for tick in [300, 2099, 2100, 2101] {
+        let versions = |sim: &Simulation| {
+            let map = sim.map();
+            (
+                school.data_version(sim, &map),
+                health.data_version(sim, &map),
+            )
+        };
+        for (tick, school_updated, health_updated) in [
+            (300, false, true),
+            (2099, false, false),
+            (2100, true, false),
+            (2101, false, false),
+        ] {
+            let (school_before, health_before) = versions(&test.sim);
             test.sim.write::<GameTime>().tick = Tick(tick);
             coverage_update(&mut test.sim);
-            let map = test.sim.map();
-            let expected = u64::from(tick >= 2100);
-            assert_eq!(school.data_version(&test.sim, &map, tick), expected);
-            assert_eq!(health.data_version(&test.sim, &map, tick), 1);
+            let (school_after, health_after) = versions(&test.sim);
+            assert_eq!(school_before != school_after, school_updated);
+            assert_eq!(health_before != health_after, health_updated);
         }
     }
 

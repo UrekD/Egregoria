@@ -30,10 +30,12 @@ const COVERAGE_COLORS: [[f32; 3]; 3] = [
 pub(super) const COVERAGE_PROVIDER_COLOR: [f32; 4] = [0.025, 0.45, 1.0, 0.96];
 pub(super) const INACTIVE_PROVIDER_COLOR: [f32; 4] = [0.47, 0.48, 0.57, 0.95];
 pub(super) const REACH_COLOR: [f32; 4] = [0.02, 0.76, 0.20, 0.55];
+pub(super) const MAX_REACH_COLOR: [f32; 4] = [0.05, 0.68, 0.9, 0.72];
 pub(crate) const UTILITY_EXPLANATION: &str = "Roads carry electricity, water and sewage. Buildings on the same connected road network share each utility's capacity; a pump needs power.";
 
 pub(super) fn utility_color(state: UtilityNetworkState) -> [f32; 4] {
     match state {
+        UtilityNetworkState::Idle => [0.48, 0.52, 0.55, 0.72],
         UtilityNetworkState::Disconnected => [0.31, 0.33, 0.43, 0.80],
         UtilityNetworkState::Updating => [0.82, 0.66, 0.07, 0.84],
         UtilityNetworkState::Shortage => [0.95, 0.16, 0.10, 0.85],
@@ -130,7 +132,8 @@ pub(super) fn render(mode: OverlayMode, label: &str, empty: bool, uiw: &UiWorld)
                         });
                         match mode {
                             OverlayMode::Coverage(_) => {
-                                legend_item(REACH_COLOR, "Potential reach on land");
+                                legend_item(REACH_COLOR, "Served area");
+                                legend_item(MAX_REACH_COLOR, "Max reach (ring)");
                                 legend_item(COVERAGE_PROVIDER_COLOR, "Active provider");
                                 legend_item(INACTIVE_PROVIDER_COLOR, "Inactive provider");
                                 textc(
@@ -149,7 +152,9 @@ pub(super) fn render(mode: OverlayMode, label: &str, empty: bool, uiw: &UiWorld)
                             }
                             _ => {}
                         }
-                        if placement.and_then(ground::preview_disc).is_some() {
+                        if mode == OverlayMode::Pollution
+                            && placement.and_then(ground::preview_disc).is_some()
+                        {
                             textc(on_secondary_container(), "Potential at full operation");
                         }
                     });
@@ -160,10 +165,10 @@ pub(super) fn render(mode: OverlayMode, label: &str, empty: bool, uiw: &UiWorld)
 }
 
 fn utility_legend(mode: OverlayMode, company: Option<GoodsCompanyID>) {
-    use UtilityNetworkState::{Disconnected, Ok, Shortage, Updating};
-    for states in [[Ok, Shortage], [Updating, Disconnected]] {
+    use UtilityNetworkState::{Disconnected, Idle, Ok, Shortage, Updating};
+    for states in [&[Ok, Shortage, Idle][..], &[Updating, Disconnected]] {
         minrow(12.0, || {
-            for state in states {
+            for &state in states {
                 legend_item(utility_color(state), state.label());
             }
         });

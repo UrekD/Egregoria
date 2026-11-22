@@ -147,7 +147,13 @@ fn build_showcase() -> Result<ScenarioCtx, String> {
             (x, y, kind, density)
         })
     });
-    paint_zone_blocks(&mut ctx, SHOWCASE_ORIGIN, SPACING, blocks);
+    let (housing, workplaces): (Vec<_>, Vec<_>) =
+        blocks.partition(|&(_, _, kind, _)| kind == Residential);
+    paint_zone_blocks(&mut ctx, SHOWCASE_ORIGIN, SPACING, housing);
+    check_commands(&ctx.sim)?;
+    // Give the existing service sites time to hire before growable workplaces open.
+    ctx.run_ticks(3 * TICKS_PER_HOUR);
+    paint_zone_blocks(&mut ctx, SHOWCASE_ORIGIN, SPACING, workplaces);
     check_commands(&ctx.sim)?;
 
     add_bus_loop(
