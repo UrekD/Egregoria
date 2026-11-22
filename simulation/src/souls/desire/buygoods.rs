@@ -102,6 +102,7 @@ impl BuyGoods {
             }
         }
         human.goods.pickup = None;
+        human.router.walk_only_pickup = false;
         human
             .router
             .cancel_route(&mut resources.write::<ParkingManagement>());
@@ -149,6 +150,7 @@ impl BuyGoods {
         bought: &mut Bought,
     ) -> HumanDecisionKind {
         if let Some(pickup) = &self.pickup {
+            router.walk_only_pickup = true;
             router.use_vehicle(None);
             return HumanDecisionKind::GoTo(Destination::Building(pickup.store));
         }
@@ -168,6 +170,7 @@ impl BuyGoods {
                         last_progress_tick: None,
                         vehicle: router.selected_vehicle(),
                     });
+                    router.walk_only_pickup = true;
                     router.use_vehicle(None);
                     router.last_error = None;
                     return HumanDecisionKind::GoTo(Destination::Building(store));

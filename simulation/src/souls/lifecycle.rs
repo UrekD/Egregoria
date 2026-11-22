@@ -488,6 +488,9 @@ fn move_outside(human: &mut HumanEnt, pos: Vec3, resources: &Resources) {
 }
 
 fn cancel_trip(human: &mut HumanEnt, resources: &Resources) {
+    if crate::map_dynamic::transit::on_route_cancelled(human, resources) {
+        return;
+    }
     human
         .router
         .cancel_route(&mut resources.write::<ParkingManagement>());

@@ -185,20 +185,31 @@ pub fn spawn_parked_vehicle_with_spot(
 pub fn spawn_driving_vehicle(
     sim: &mut Simulation,
     kind: VehicleKind,
-    trans: Transform,
+    mut trans: Transform,
 ) -> Option<VehicleID> {
-    if !trans.pos.is_finite() || !trans.dir.is_finite() || trans.dir.xy() == Vec2::ZERO {
+    let length_sq = trans.dir.mag2();
+    if !trans.pos.is_finite() || !length_sq.is_finite() || trans.dir.xy().mag2() < f32::EPSILON {
         return None;
     }
+    trans.dir /= length_sq.sqrt();
 
-    let blocked = sim.world.vehicles.values().any(|other| {
-        let clearance = (kind.width() + other.vehicle.kind.width()) * 0.5;
-        other.collider.is_some()
-            && (trans.pos.z - other.trans.pos.z).abs() <= 5.0
-            && trans.pos.xy().is_close(other.trans.pos.xy(), clearance)
-    });
-    if blocked {
-        return None;
+    let radius = kind.width() * 0.5;
+    {
+        let grid = sim.read::<TransportGrid>();
+        let center = trans.pos.xy();
+        let extent = Vec2::splat(radius + VehicleKind::Bus.width() * 0.5);
+        if grid
+            .query_aabb(center - extent, center + extent)
+            .any(|(id, pos)| {
+                grid.get(id).is_some_and(|(_, other)| {
+                    other.group == TransportationGroup::Vehicles
+                        && (trans.pos.z - other.height).abs() <= 5.0
+                        && center.is_close(pos, radius + other.radius)
+                })
+            })
+        {
+            return None;
+        }
     }
 
     let mut rng = sim.write::<RandProvider>();
@@ -209,7 +220,14 @@ pub fn spawn_driving_vehicle(
     let vehicle = Vehicle::with_state(kind, VehicleState::Driving, tint, &mut rng);
     drop(rng);
 
-    Some(make_vehicle_entity(sim, trans, vehicle, Itinerary::NONE, true))
+    let id = make_vehicle_entity(sim, trans, vehicle, Itinerary::NONE, true);
+    let collider = sim.world.vehicles[id].collider.unwrap();
+    sim.write::<TransportGrid>()
+        .get_mut(collider.0)
+        .unwrap()
+        .1
+        .height = trans.pos.z;
+    Some(id)
 }
 
 pub(crate) fn spawn_truck_at_depot(sim: &mut Simulation, door: Vec3) -> VehicleID {

@@ -307,9 +307,13 @@ impl WorldCommand {
     }
 
     pub(crate) fn apply_in_batch(&self, sim: &mut Simulation) {
-        if let Err(reason) = transit::validate(self) {
-            self.reject(sim, reason);
-            return;
+        let is_transit = transit::is_command(self);
+        if is_transit {
+            // Record transit commands only after validation and application succeed.
+            if let Err(reason) = transit::validate(sim, self).and_then(|()| self.apply_one(sim)) {
+                self.reject(sim, reason);
+                return;
+            }
         }
 
         {
@@ -317,6 +321,9 @@ impl WorldCommand {
             if replay.enabled {
                 replay.push(sim.read::<GameTime>().tick, self.clone());
             }
+        }
+        if is_transit {
+            return;
         }
 
         let result = match self {
@@ -702,7 +709,7 @@ impl WorldCommand {
             | TransitEditLine { .. }
             | TransitRemoveLine { .. }
             | TransitSetVehicles { .. }
-            | TransitSetFare { .. } => return Err(Rejection::TransitNotImplemented),
+            | TransitSetFare { .. } => transit::apply(sim, self)?,
             AddTrain {
                 dist: _,
                 n_wagons: _,

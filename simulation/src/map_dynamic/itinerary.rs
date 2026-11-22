@@ -1,11 +1,13 @@
-use crate::map::{Map, PathKind, Pathfinder, Traversable, TraverseDirection, TraverseKind};
+use crate::map::{
+    LaneID, LaneKind, Map, PathKind, Pathfinder, Traversable, TraverseDirection, TraverseKind,
+};
 use crate::map_dynamic::ParkingManagement;
 use crate::utils::resources::Resources;
 use crate::world::TrainID;
 use crate::World;
 use egui_inspect::egui::Ui;
 use egui_inspect::{Inspect, InspectArgs};
-use geom::{Follower, Polyline3Queue, Transform, Vec3};
+use geom::{Follower, PolyLine3, Polyline3Queue, Transform, Vec3};
 use prototypes::{GameTime, Tick, DELTA};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -39,9 +41,16 @@ pub enum ItineraryKind {
     Route(Route, PathKind),
     WaitForReroute {
         kind: PathKind,
-        dest: Vec3,
+        target: ItineraryTarget,
         wait_ticks: u16,
     },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum ItineraryTarget {
+    Position(Vec3),
+    /// Offset in meters from the start of the driving lane.
+    DirectedLane(LaneID, f32),
 }
 
 #[derive(Debug, Serialize, Deserialize, Inspect)]
@@ -50,6 +59,8 @@ pub struct Route {
     pub reversed_route: Vec<Traversable>,
     pub end_pos: Vec3,
     pub cur: Traversable,
+    #[inspect(skip)]
+    target: ItineraryTarget,
 }
 
 pub const OBJECTIVE_OK_DIST: f32 = 3.0;
@@ -60,7 +71,13 @@ const MAX_REROUTE_FAILURES: usize = 8_192;
 struct RerouteKey {
     kind: PathKind,
     start: [u32; 3],
-    end: [u32; 3],
+    end: RerouteTarget,
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+enum RerouteTarget {
+    Position([u32; 3]),
+    DirectedLane(LaneID, u32),
 }
 
 #[derive(Default)]
@@ -85,7 +102,7 @@ impl RerouteFailures {
         &mut self,
         tick: Tick,
         start: Vec3,
-        end: Vec3,
+        target: ItineraryTarget,
         map: &Map,
         kind: PathKind,
     ) -> Option<Itinerary> {
@@ -93,7 +110,14 @@ impl RerouteFailures {
         let key = RerouteKey {
             kind,
             start: <[f32; 3]>::from(start).map(f32::to_bits),
-            end: <[f32; 3]>::from(end).map(f32::to_bits),
+            end: match target {
+                ItineraryTarget::Position(end) => {
+                    RerouteTarget::Position(<[f32; 3]>::from(end).map(f32::to_bits))
+                }
+                ItineraryTarget::DirectedLane(lane, offset) => {
+                    RerouteTarget::DirectedLane(lane, offset.to_bits())
+                }
+            },
         };
         if self.entries.contains(&key) {
             return None;
@@ -101,7 +125,7 @@ impl RerouteFailures {
 
         // The tick seeds vehicle and rail search costs. Reachability for these
         // endpoints depends on the lane geometry and turns in this map revision.
-        let result = Itinerary::route(tick, start, end, map, kind);
+        let result = Itinerary::route_to_target(tick, start, target, map, kind);
         if result.is_none() {
             if self.entries.len() == MAX_REROUTE_FAILURES {
                 self.entries.pop_first();
@@ -142,10 +166,21 @@ impl Itinerary {
     }
 
     pub fn wait_for_reroute(kind: PathKind, dest: Vec3) -> Self {
+        Self::retry(kind, ItineraryTarget::Position(dest))
+    }
+
+    pub fn wait_for_reroute_to_lane(lane: LaneID, offset: f32) -> Self {
+        Self::retry(
+            PathKind::Vehicle,
+            ItineraryTarget::DirectedLane(lane, offset),
+        )
+    }
+
+    fn retry(kind: PathKind, target: ItineraryTarget) -> Self {
         Self {
             kind: ItineraryKind::WaitForReroute {
                 kind,
-                dest,
+                target,
                 wait_ticks: 0,
             },
             reversed_local_path: Default::default(),
@@ -159,27 +194,90 @@ impl Itinerary {
         map: &Map,
         pathkind: PathKind,
     ) -> Option<Itinerary> {
+        Self::route_to_target(tick, start, ItineraryTarget::Position(end), map, pathkind)
+    }
+
+    pub fn route_to_lane(
+        tick: Tick,
+        start: Vec3,
+        map: &Map,
+        lane: LaneID,
+        offset: f32,
+    ) -> Option<Itinerary> {
+        Self::route_to_target(
+            tick,
+            start,
+            ItineraryTarget::DirectedLane(lane, offset),
+            map,
+            PathKind::Vehicle,
+        )
+    }
+
+    pub(crate) fn route_between_lanes(
+        tick: Tick,
+        map: &Map,
+        (start_lane, start_offset): (LaneID, f32),
+        (end_lane, end_offset): (LaneID, f32),
+    ) -> Option<Itinerary> {
+        let start = driving_lane_points(map, start_lane, start_offset)?.point_along(start_offset);
+        let target = ItineraryTarget::DirectedLane(end_lane, end_offset);
+        Self::route_from(tick, start, start_lane, target, map, PathKind::Vehicle)
+    }
+
+    fn route_to_target(
+        tick: Tick,
+        start: Vec3,
+        target: ItineraryTarget,
+        map: &Map,
+        pathkind: PathKind,
+    ) -> Option<Itinerary> {
         #[cfg(test)]
         ROUTE_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
 
         let start_lane = pathkind.nearest_lane(map, start)?;
-        let end_lane = pathkind.nearest_lane(map, end)?;
+        Self::route_from(tick, start, start_lane, target, map, pathkind)
+    }
+
+    fn route_from(
+        tick: Tick,
+        start: Vec3,
+        start_lane: LaneID,
+        target: ItineraryTarget,
+        map: &Map,
+        pathkind: PathKind,
+    ) -> Option<Itinerary> {
+        let (end_lane, end) = match target {
+            ItineraryTarget::Position(end) => (pathkind.nearest_lane(map, end)?, end),
+            ItineraryTarget::DirectedLane(lane, offset) => (
+                lane,
+                driving_lane_points(map, lane, offset)?.point_along(offset),
+            ),
+        };
 
         let mut cur = Traversable::new(TraverseKind::Lane(start_lane), TraverseDirection::Forward);
 
         if start_lane == end_lane {
-            if let Some(mut p) = pathkind.local_route(map, start_lane, start, end) {
-                p.reverse();
+            let local_path = match target {
+                ItineraryTarget::Position(_) => pathkind
+                    .local_route(map, start_lane, start, end)
+                    .map(PolyLine3::into_vec),
+                ItineraryTarget::DirectedLane(lane, offset) => {
+                    directed_local_path(driving_lane_points(map, lane, offset)?, start, offset, end)
+                }
+            };
+            if let Some(mut local_path) = local_path {
+                local_path.reverse();
                 return Some(Itinerary {
                     kind: ItineraryKind::Route(
                         Route {
                             reversed_route: vec![],
                             end_pos: end,
                             cur,
+                            target,
                         },
                         pathkind,
                     ),
-                    reversed_local_path: p.into_vec(),
+                    reversed_local_path: local_path,
                 });
             }
         }
@@ -208,6 +306,7 @@ impl Itinerary {
                 reversed_route,
                 end_pos: end,
                 cur,
+                target,
             },
             pathkind,
         );
@@ -241,16 +340,28 @@ impl Itinerary {
                 let points = match r.cur.points(map) {
                     Some(x) => x,
                     None => {
-                        *self = Self::wait_for_reroute(pathkind, r.end_pos);
+                        *self = Self::retry(pathkind, r.target);
                         return None;
                     }
                 };
 
                 if r.reversed_route.is_empty() {
-                    self.reversed_local_path = pathkind
-                        .local_route(map, r.cur.destination_lane(), position, r.end_pos)
-                        .unwrap_or(points)
-                        .into_vec();
+                    self.reversed_local_path = match r.target {
+                        ItineraryTarget::Position(_) => pathkind
+                            .local_route(map, r.cur.destination_lane(), position, r.end_pos)
+                            .unwrap_or(points)
+                            .into_vec(),
+                        ItineraryTarget::DirectedLane(lane, offset) => {
+                            let path = driving_lane_points(map, lane, offset).and_then(|points| {
+                                directed_local_path(points, points.first(), offset, r.end_pos)
+                            });
+                            let Some(path) = path else {
+                                *self = Self::retry(pathkind, r.target);
+                                return None;
+                            };
+                            path
+                        }
+                    };
                 } else {
                     self.reversed_local_path = points.into_vec();
                 }
@@ -268,8 +379,8 @@ impl Itinerary {
         time: u32,
         map: &Map,
     ) -> Vec3 {
-        self.update_with_route(position, dist_to_move, time, map, |start, end, kind| {
-            Self::route(tick, start, end, map, kind)
+        self.update_with_route(position, dist_to_move, time, map, |start, target, kind| {
+            Self::route_to_target(tick, start, target, map, kind)
         })
     }
 
@@ -279,8 +390,15 @@ impl Itinerary {
         mut dist_to_move: f32,
         time: u32,
         map: &Map,
-        route: impl FnOnce(Vec3, Vec3, PathKind) -> Option<Self>,
+        route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
     ) -> Vec3 {
+        if let ItineraryKind::Route(ref active, kind) = self.kind {
+            if matches!(active.target, ItineraryTarget::DirectedLane(..))
+                && active.cur.raw_points(map).is_none()
+            {
+                *self = Self::retry(kind, active.target);
+            }
+        }
         while let Some(p) = self.get_point() {
             let dist = position.distance(p);
             if dist <= dist_to_move + 0.01 {
@@ -313,7 +431,7 @@ impl Itinerary {
 
         if let ItineraryKind::WaitForReroute {
             kind,
-            dest,
+            target,
             ref mut wait_ticks,
         } = self.kind
         {
@@ -321,7 +439,7 @@ impl Itinerary {
                 *wait_ticks -= 1;
                 return position;
             }
-            *self = unwrap_or!(route(position, dest, kind), {
+            *self = unwrap_or!(route(position, target, kind), {
                 *wait_ticks = REROUTE_WAIT_TICKS;
                 return position;
             });
@@ -357,6 +475,15 @@ impl Itinerary {
             ItineraryKind::WaitUntil(_) | ItineraryKind::WaitForReroute { .. } => None,
             ItineraryKind::Simple(e) => Some(e),
             ItineraryKind::Route(ref r, _) => Some(r.end_pos),
+        }
+    }
+
+    pub fn target(&self) -> Option<ItineraryTarget> {
+        match &self.kind {
+            ItineraryKind::Route(route, _) => Some(route.target),
+            ItineraryKind::WaitForReroute { target, .. } => Some(*target),
+            ItineraryKind::Simple(end) => Some(ItineraryTarget::Position(*end)),
+            _ => None,
         }
     }
 
@@ -440,6 +567,40 @@ impl Itinerary {
     }
 }
 
+fn driving_lane_points(map: &Map, lane: LaneID, offset: f32) -> Option<&PolyLine3> {
+    let lane = map.get(lane)?;
+    (lane.kind == LaneKind::Driving && (0.0..=lane.points.length()).contains(&offset))
+        .then_some(&lane.points)
+}
+
+fn directed_local_path(
+    points: &PolyLine3,
+    start: Vec3,
+    offset: f32,
+    end: Vec3,
+) -> Option<Vec<Vec3>> {
+    let (start, start_segment) = points.project_segment(start);
+    let segment_start = start_segment.checked_sub(1)?;
+    let mut distance = points
+        .segments()
+        .take(segment_start)
+        .map(|segment| segment.src.distance(segment.dst))
+        .sum::<f32>();
+    if offset + 0.0001 < distance + points[segment_start].distance(start) {
+        return None;
+    }
+    let mut path = vec![start];
+    for segment in points.segments().skip(segment_start) {
+        distance += segment.src.distance(segment.dst);
+        if distance >= offset {
+            break;
+        }
+        path.push(segment.dst);
+    }
+    path.push(end);
+    Some(path)
+}
+
 impl Inspect<ItineraryKind> for ItineraryKind {
     fn render(d: &ItineraryKind, label: &'static str, ui: &mut Ui, args: &InspectArgs) {
         match *d {
@@ -502,7 +663,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                 speed * DELTA,
                 time.seconds,
                 map,
-                |start, end, kind| failures.route(time.tick, start, end, map, kind),
+                |start, target, kind| failures.route(time.tick, start, target, map, kind),
             );
         },
     );
