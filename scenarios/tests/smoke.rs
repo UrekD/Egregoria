@@ -7,8 +7,47 @@ use simulation::world_command::WorldCommand;
 use simulation::SimulationOptions;
 use std::process::Command;
 
+fn final_projection(ctx: &mut ScenarioCtx) -> u64 {
+    let mut dump = Vec::new();
+    ctx.run_with_hashes("test", &mut dump, |_| Ok(())).unwrap();
+    let checkpoint: serde_json::Value = serde_json::from_slice(&dump).unwrap();
+    checkpoint["projection"]
+        .as_u64()
+        .expect("missing projection hash")
+}
+
 #[test]
-fn hashes_cli_advertises_output_path() {
+fn projection_ignores_an_unserialized_resource() {
+    struct UnrelatedResource(u32);
+    let mut without = ScenarioCtx::new(smoke::OPTIONS);
+    let mut with = ScenarioCtx::new(smoke::OPTIONS);
+    with.sim.insert(UnrelatedResource(42));
+    smoke::run_for(&mut without, 500).unwrap();
+    smoke::run_for(&mut with, 500).unwrap();
+
+    assert_eq!(with.sim.read::<UnrelatedResource>().0, 42);
+    assert_eq!(final_projection(&mut without), final_projection(&mut with));
+}
+
+#[test]
+fn projection_changes_when_a_human_moves() {
+    let mut ctx = ScenarioCtx::new(smoke::OPTIONS);
+    smoke::run_for(&mut ctx, 500).unwrap();
+
+    let before = final_projection(&mut ctx);
+    let human = ctx
+        .sim
+        .world_mut_unchecked()
+        .humans
+        .values_mut()
+        .next()
+        .unwrap();
+    human.trans.pos.x += 0.02;
+    assert_ne!(before, final_projection(&mut ctx));
+}
+
+#[test]
+fn checkpoint_cli_advertises_paths() {
     let output = Command::new(env!("CARGO_BIN_EXE_scenarios"))
         .arg("--help")
         .output()
@@ -16,6 +55,7 @@ fn hashes_cli_advertises_output_path() {
     assert!(output.status.success());
     let usage = String::from_utf8(output.stdout).unwrap();
     assert!(usage.contains("--hashes"), "{usage}");
+    assert!(usage.contains("--check-projection"), "{usage}");
 }
 
 #[test]

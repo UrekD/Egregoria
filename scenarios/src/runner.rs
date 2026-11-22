@@ -1,12 +1,17 @@
 use crate::builders::CommandSink;
 use crate::MetricSample;
-use serde::Serialize;
+use geom::Vec3;
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use simulation::economy::Government;
+use simulation::map_dynamic::{Destination, ParkingManagement, RoutingStep};
+use simulation::transportation::{Location, VehicleKind, VehicleState};
+use simulation::utils::rand_provider::RandProvider;
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::WorldCommand;
-use simulation::{Simulation, SimulationOptions};
+use simulation::{EntityID, Simulation, SimulationOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::hash::Hasher;
 use std::io::{ErrorKind, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
@@ -17,10 +22,20 @@ pub const P99_MS_PER_TICK: &str = "p99_ms_per_tick";
 const P95_MS_PER_TICK: &str = "p95_ms_per_tick";
 
 const CHECKPOINT_INTERVAL: u64 = 10_000;
-type Checkpoint = (u64, BTreeMap<String, u64>);
 
-#[derive(Default)]
-struct HashDump {
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ProjectionCheckpoint {
+    tick: u64,
+    projection: u64,
+}
+
+struct Checkpoint {
+    projection: ProjectionCheckpoint,
+    hashes: BTreeMap<String, u64>,
+}
+
+struct CheckpointDump {
+    include_hashes: bool,
     first: Vec<Checkpoint>,
     second: Option<Vec<Checkpoint>>,
 }
@@ -29,7 +44,8 @@ struct HashDump {
 struct HashLine<'a> {
     scenario: &'a str,
     run: usize,
-    tick: u64,
+    #[serde(flatten)]
+    projection: ProjectionCheckpoint,
     hashes: &'a BTreeMap<String, u64>,
 }
 
@@ -118,7 +134,7 @@ pub struct ScenarioCtx {
     queued: Vec<WorldCommand>,
     executed_ticks: u64,
     checkpoints: Option<Vec<Checkpoint>>,
-    hash_dump: Option<HashDump>,
+    hash_dump: Option<CheckpointDump>,
     perf_timings: Option<PerfTimingRecorder>,
 }
 
@@ -169,12 +185,17 @@ impl ScenarioCtx {
                 timings.record_tick(self.sim.get_tick(), elapsed, self.sched.latest_samples());
             }
             if self.executed_ticks % CHECKPOINT_INTERVAL == 0 {
+                let include_hashes = self.checkpoints.is_some()
+                    || self
+                        .hash_dump
+                        .as_ref()
+                        .is_some_and(|dump| dump.include_hashes);
                 let checkpoints = self
                     .checkpoints
                     .as_mut()
                     .or_else(|| self.hash_dump.as_mut().map(|dump| &mut dump.first));
                 if let Some(checkpoints) = checkpoints {
-                    checkpoints.push((self.sim.get_tick(), self.sim.hashes()));
+                    checkpoints.push(checkpoint(&self.sim, include_hashes));
                 }
             }
         }
@@ -268,26 +289,51 @@ impl ScenarioCtx {
         out: &mut impl Write,
         run: impl FnOnce(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.run_with_checkpoints(scenario, Some(out), None, run)
+    }
+
+    /// Emit checkpoint dumps and/or compare each run against a projection baseline.
+    pub fn run_with_checkpoints(
+        &mut self,
+        scenario: &str,
+        mut out: Option<&mut dyn Write>,
+        expected: Option<&[ProjectionCheckpoint]>,
+        run: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         if self.hash_dump.is_some() {
             return Err("hash dumps cannot be nested".to_string());
         }
-        self.hash_dump = Some(HashDump::default());
+        let include_hashes = out.is_some();
+        self.hash_dump = Some(CheckpointDump {
+            include_hashes,
+            first: Vec::new(),
+            second: None,
+        });
         let result = run(self);
-        let HashDump { mut first, second } = self.hash_dump.take().unwrap();
+        let CheckpointDump {
+            mut first, second, ..
+        } = self.hash_dump.take().unwrap();
         result?;
         if second.is_none() {
-            first.push(self.checkpoint());
+            first.push(checkpoint(&self.sim, include_hashes));
         }
         for (index, checkpoints) in std::iter::once(first).chain(second).enumerate() {
-            for (tick, hashes) in &checkpoints {
-                let line = HashLine {
-                    scenario,
-                    run: index + 1,
-                    tick: *tick,
-                    hashes,
-                };
-                serde_json::to_writer(&mut *out, &line).map_err(|err| err.to_string())?;
-                out.write_all(b"\n").map_err(|err| err.to_string())?;
+            let run = index + 1;
+            if let Some(expected) = expected {
+                compare_projection(&checkpoints, expected)
+                    .map_err(|err| format!("run {run}: {err}"))?;
+            }
+            if let Some(out) = out.as_deref_mut() {
+                for checkpoint in &checkpoints {
+                    let line = HashLine {
+                        scenario,
+                        run,
+                        projection: checkpoint.projection,
+                        hashes: &checkpoint.hashes,
+                    };
+                    serde_json::to_writer(&mut *out, &line).map_err(|err| err.to_string())?;
+                    out.write_all(b"\n").map_err(|err| err.to_string())?;
+                }
             }
         }
         Ok(())
@@ -333,7 +379,10 @@ impl ScenarioCtx {
         resumed.reload()?;
         resumed.run_ticks(ticks - midpoint);
 
-        compare_checkpoint(&self.checkpoint(), &resumed.checkpoint())
+        compare_checkpoint(
+            &checkpoint(&self.sim, true),
+            &checkpoint(&resumed.sim, true),
+        )
     }
 
     pub(crate) fn reload(&mut self) -> Result<(), String> {
@@ -364,14 +413,10 @@ impl ScenarioCtx {
                 self.sim.get_tick()
             )
         })?;
-        compare_checkpoint(&self.checkpoint(), &(sim.get_tick(), sim.hashes()))?;
+        compare_checkpoint(&checkpoint(&self.sim, true), &checkpoint(&sim, true))?;
         self.sim = sim;
         self.sched = Simulation::schedule();
         Ok(())
-    }
-
-    fn checkpoint(&self) -> Checkpoint {
-        (self.sim.get_tick(), self.sim.hashes())
     }
 
     fn record_checkpoints(
@@ -385,14 +430,243 @@ impl ScenarioCtx {
         let result = run(self);
         let mut checkpoints = self.checkpoints.take().unwrap();
         result?;
-        checkpoints.push(self.checkpoint());
+        checkpoints.push(checkpoint(&self.sim, true));
         Ok(checkpoints)
     }
 }
 
+fn checkpoint(sim: &Simulation, include_hashes: bool) -> Checkpoint {
+    Checkpoint {
+        projection: ProjectionCheckpoint {
+            tick: sim.get_tick(),
+            projection: gameplay_projection(sim),
+        },
+        hashes: include_hashes.then(|| sim.hashes()).unwrap_or_default(),
+    }
+}
+
+fn compare_projection(
+    actual: &[Checkpoint],
+    expected: &[ProjectionCheckpoint],
+) -> Result<(), String> {
+    for (actual, expected) in actual.iter().zip(expected) {
+        let actual = actual.projection;
+        if actual.tick != expected.tick {
+            return Err(format!(
+                "projection checkpoint tick mismatch: expected {}, got {}",
+                expected.tick, actual.tick
+            ));
+        }
+        if actual.projection != expected.projection {
+            return Err(format!(
+                "projection mismatch at tick {}: expected {}, got {}",
+                actual.tick, expected.projection, actual.projection
+            ));
+        }
+    }
+    if actual.len() != expected.len() {
+        return Err(format!(
+            "projection checkpoint count mismatch: expected {}, got {}",
+            expected.len(),
+            actual.len()
+        ));
+    }
+    Ok(())
+}
+
+// These named views read private fields without changing simulation APIs.
+// Only the explicitly encoded gameplay values below enter the hash.
+#[derive(Deserialize)]
+struct RouterView {
+    #[serde(deserialize_with = "Deserialize::deserialize")]
+    cur_step: Option<RoutingStep>,
+    steps: Vec<RoutingStep>,
+}
+
+#[derive(Deserialize)]
+struct ParkingView {
+    reserved_spots: Vec<SlotKey>,
+}
+
+#[derive(Deserialize)]
+struct SlotKey {
+    idx: u32,
+    version: u32,
+}
+
+impl SlotKey {
+    fn ffi(&self) -> u64 {
+        (u64::from(self.version) << 32) | u64::from(self.idx)
+    }
+}
+
+fn serde_view<T: DeserializeOwned>(value: &impl Serialize) -> T {
+    serde_json::from_value(serde_json::to_value(value).expect("could not read gameplay state"))
+        .expect("could not decode gameplay state")
+}
+
+fn entity_ffi(id: impl EntityID) -> u64 {
+    id.data().as_ffi()
+}
+
+fn slot_ffi(id: &impl Serialize) -> u64 {
+    serde_view::<SlotKey>(id).ffi()
+}
+
+fn write_u64_le(hash: &mut impl Hasher, value: u64) {
+    hash.write(&value.to_le_bytes());
+}
+
+fn write_tagged_id(hash: &mut impl Hasher, tag: u8, id: u64) {
+    hash.write_u8(tag);
+    write_u64_le(hash, id);
+}
+
+fn write_position_cm(hash: &mut impl Hasher, pos: Vec3) {
+    for coord in [pos.x, pos.y, pos.z] {
+        let cm = (f64::from(coord) * 100.0).round() as i64;
+        hash.write(&cm.to_le_bytes());
+    }
+}
+
+fn write_route_position(hash: &mut impl Hasher, pos: Vec3) {
+    for coord in [pos.x, pos.y, pos.z] {
+        hash.write(&coord.to_bits().to_le_bytes());
+    }
+}
+
+fn write_routing_step(hash: &mut impl Hasher, step: Option<&RoutingStep>) {
+    match step {
+        None => hash.write_u8(0),
+        Some(RoutingStep::WalkTo(pos)) => {
+            hash.write_u8(1);
+            write_route_position(hash, *pos);
+        }
+        Some(RoutingStep::DriveTo(id, pos)) => {
+            write_tagged_id(hash, 2, entity_ffi(*id));
+            write_route_position(hash, *pos);
+        }
+        Some(RoutingStep::Park(id, spot)) => {
+            write_tagged_id(hash, 3, entity_ffi(*id));
+            match spot {
+                None => hash.write_u8(0),
+                Some(spot) => write_tagged_id(hash, 1, slot_ffi(spot)),
+            }
+        }
+        Some(RoutingStep::Unpark(id)) => write_tagged_id(hash, 4, entity_ffi(*id)),
+        Some(RoutingStep::GetInVehicle(id)) => write_tagged_id(hash, 5, entity_ffi(*id)),
+        Some(RoutingStep::GetOutVehicle(id)) => write_tagged_id(hash, 6, entity_ffi(*id)),
+        Some(RoutingStep::GetInBuilding(id)) => write_tagged_id(hash, 7, slot_ffi(id)),
+        Some(RoutingStep::GetOutBuilding(id)) => write_tagged_id(hash, 8, slot_ffi(id)),
+    }
+}
+
+/// Hash stable gameplay fields with fixed tags, length prefixes and little-endian primitives.
+/// Entities are ordered by slot key, and their XYZ positions use signed centimetres.
+/// Humans include location, the active routing step and its operands, and the requested
+/// destination. Route coordinates retain their f32 bits. Vehicles include kind.
+#[allow(deprecated)] // SipHasher exposes a specified SipHash-2-4 with fixed keys.
+fn gameplay_projection(sim: &Simulation) -> u64 {
+    let mut hash = std::hash::SipHasher::new_with_keys(0, 0);
+    let world = sim.world();
+    let mut humans: Vec<_> = world
+        .humans
+        .iter()
+        .map(|(id, human)| (entity_ffi(id), human))
+        .collect();
+    humans.sort_unstable_by_key(|&(id, _)| id);
+    let mut vehicles: Vec<_> = world
+        .vehicles
+        .iter()
+        .map(|(id, vehicle)| (entity_ffi(id), vehicle))
+        .collect();
+    vehicles.sort_unstable_by_key(|&(id, _)| id);
+
+    // The parking manager tracks reserved spots. Vehicles and pending Park steps
+    // hold the reservation tokens and identify their owners. Include orphaned spots
+    // with zero owners, since those spots still affect future parking searches.
+    let parking: ParkingView = serde_view(&*sim.read::<ParkingManagement>());
+    let mut reservations: BTreeMap<u64, BTreeSet<u64>> = parking
+        .reserved_spots
+        .iter()
+        .map(|spot| (spot.ffi(), BTreeSet::new()))
+        .collect();
+
+    write_u64_le(&mut hash, humans.len() as u64);
+    let mut employed = 0_u64;
+    for (id, human) in humans {
+        write_u64_le(&mut hash, id);
+        write_position_cm(&mut hash, human.trans.pos);
+        employed += u64::from(human.work.is_some());
+        match human.location {
+            Location::Outside => hash.write_u8(0),
+            Location::Vehicle(id) => write_tagged_id(&mut hash, 1, entity_ffi(id)),
+            Location::Building(id) => write_tagged_id(&mut hash, 2, slot_ffi(&id)),
+        }
+
+        let router: RouterView = serde_view(&human.router);
+        write_routing_step(&mut hash, router.cur_step.as_ref());
+        match human.router.target_dest {
+            None => hash.write_u8(0),
+            Some(Destination::Outside(pos)) => {
+                hash.write_u8(1);
+                write_route_position(&mut hash, pos);
+            }
+            Some(Destination::Building(id)) => write_tagged_id(&mut hash, 2, slot_ffi(&id)),
+        }
+        for step in router.cur_step.iter().chain(&router.steps) {
+            if let RoutingStep::Park(vehicle, Some(spot)) = step {
+                reservations
+                    .entry(slot_ffi(spot))
+                    .or_default()
+                    .insert(entity_ffi(*vehicle));
+            }
+        }
+    }
+    write_u64_le(&mut hash, employed);
+
+    write_u64_le(&mut hash, vehicles.len() as u64);
+    for (id, vehicle) in vehicles {
+        write_u64_le(&mut hash, id);
+        write_position_cm(&mut hash, vehicle.trans.pos);
+        hash.write_u8(match vehicle.vehicle.kind {
+            VehicleKind::Car => 0,
+            VehicleKind::Truck => 1,
+            VehicleKind::Bus => 2,
+        });
+        match &vehicle.vehicle.state {
+            VehicleState::Parked(spot)
+            | VehicleState::RoadToPark(_, _, spot)
+            | VehicleState::ReturningToDepot { spot, .. } => {
+                reservations.entry(slot_ffi(spot)).or_default().insert(id);
+            }
+            VehicleState::Driving | VehicleState::Panicking(_) | VehicleState::ParkedAtDepot => {}
+        }
+    }
+    write_u64_le(&mut hash, reservations.len() as u64);
+    for (spot, owners) in reservations {
+        write_u64_le(&mut hash, spot);
+        write_u64_le(&mut hash, owners.len() as u64);
+        for owner in owners {
+            write_u64_le(&mut hash, owner);
+        }
+    }
+
+    // Four successive outputs identify the current four-word xorshift state.
+    // Advance a copy to keep the live RNG and simulation untouched.
+    let mut rng: RandProvider = serde_view(&*sim.read::<RandProvider>());
+    for _ in 0..4 {
+        hash.write(&rng.next_u32().to_le_bytes());
+    }
+    hash.write(&sim.read::<Government>().money.inner().to_le_bytes());
+    hash.finish()
+}
+
 fn compare_checkpoint(first: &Checkpoint, second: &Checkpoint) -> Result<(), String> {
-    let (tick, hashes) = first;
-    let (other_tick, other_hashes) = second;
+    let tick = first.projection.tick;
+    let other_tick = second.projection.tick;
+    let hashes = &first.hashes;
+    let other_hashes = &second.hashes;
     if tick != other_tick {
         return Err(format!(
             "determinism checkpoint ticks differ ({tick} and {other_tick})"
@@ -410,6 +684,9 @@ fn compare_checkpoint(first: &Checkpoint, second: &Checkpoint) -> Result<(), Str
             "determinism mismatch at tick {tick} ({})",
             changed.join(", ")
         ));
+    }
+    if first.projection != second.projection {
+        return Err(format!("determinism projection mismatch at tick {tick}"));
     }
     Ok(())
 }
@@ -474,10 +751,13 @@ mod tests {
                     assert_eq!(line["tick"], start + CHECKPOINT_INTERVAL + offset as u64);
                     assert!(line["hashes"]["world"].is_u64());
                     assert!(line["hashes"]["government"].is_u64());
+                    assert!(line["projection"].is_u64());
                     assert_eq!(line["hashes"], lines[offset]["hashes"]);
+                    assert_eq!(line["projection"], lines[offset]["projection"]);
                 }
             }
             assert_eq!(lines[1]["hashes"], json!(ctx.sim.hashes()));
+            assert_eq!(lines[1]["projection"], json!(gameplay_projection(&ctx.sim)));
         }
     }
 

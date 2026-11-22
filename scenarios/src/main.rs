@@ -1,11 +1,11 @@
 use scenarios::builtin::{growth_basic, perf, PERF_10K, SCENARIOS};
-use scenarios::runner::{PerfTimings, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
+use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{MetricSample, ScenarioCtx};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
-use std::io::{BufWriter, Write};
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -24,7 +24,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--twice | --gate (perf_10k only)]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]")
 }
 
 fn main() -> ExitCode {
@@ -37,11 +37,15 @@ fn main() -> ExitCode {
     }
 }
 
-fn output_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<PathBuf, String> {
+fn path_arg(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+    kind: &str,
+) -> Result<PathBuf, String> {
     let path = args
         .next()
         .filter(|path| !path.as_encoded_bytes().starts_with(b"--"))
-        .ok_or_else(|| format!("{flag} requires an output path"))?;
+        .ok_or_else(|| format!("{flag} requires {kind}"))?;
     // Prototype initialization changes the process working directory.
     std::path::absolute(Path::new(&path)).map_err(|err| err.to_string())
 }
@@ -67,15 +71,25 @@ fn run() -> Result<(), String> {
 
     let mut json = None;
     let mut hashes = None;
+    let mut projection = None;
     let mut twice = false;
     let mut gate = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--twice") if !twice => twice = true,
             Some("--gate") if !gate => gate = true,
-            Some("--json") if json.is_none() => json = Some(output_path(&mut args, "--json")?),
+            Some("--json") if json.is_none() => {
+                json = Some(path_arg(&mut args, "--json", "an output path")?)
+            }
             Some("--hashes") if hashes.is_none() => {
-                hashes = Some(output_path(&mut args, "--hashes")?)
+                hashes = Some(path_arg(&mut args, "--hashes", "an output path")?)
+            }
+            Some("--check-projection") if projection.is_none() => {
+                projection = Some(path_arg(
+                    &mut args,
+                    "--check-projection",
+                    "a baseline path",
+                )?)
             }
             _ => return Err(format!("unexpected argument {arg:?}\n{}", usage())),
         }
@@ -89,7 +103,20 @@ fn run() -> Result<(), String> {
     if hashes.is_some() && hashes == json {
         return Err("--hashes and --json require different output paths".to_string());
     }
+    if projection.is_some() && (projection == hashes || projection == json) {
+        return Err(
+            "--check-projection requires a path distinct from the output paths".to_string(),
+        );
+    }
 
+    let baseline: Option<BTreeMap<String, Vec<ProjectionCheckpoint>>> = projection
+        .as_ref()
+        .map(|path| {
+            let file = File::open(path).map_err(|err| format!("{}: {err}", path.display()))?;
+            serde_json::from_reader(BufReader::new(file))
+                .map_err(|err| format!("{}: {err}", path.display()))
+        })
+        .transpose()?;
     let mut hash_output = hashes
         .as_ref()
         .map(|path| {
@@ -103,6 +130,17 @@ fn run() -> Result<(), String> {
         if name != "all" && name != scenario.name {
             continue;
         }
+        let expected = match &baseline {
+            Some(baseline) => Some(baseline.get(scenario.name).map(Vec::as_slice).ok_or_else(
+                || {
+                    format!(
+                        "projection baseline has no checkpoints for {}",
+                        scenario.name
+                    )
+                },
+            )?),
+            None => None,
+        };
         let mut ctx = ScenarioCtx::new(*options);
         if json.is_some() && (scenario.name == "perf" || scenario.name == PERF_10K.0.name) {
             ctx.enable_perf_timings();
@@ -116,8 +154,9 @@ fn run() -> Result<(), String> {
                 (scenario.run)(ctx)
             }
         };
-        let result = if let Some(out) = &mut hash_output {
-            ctx.run_with_hashes(scenario.name, out, run)
+        let result = if hash_output.is_some() || expected.is_some() {
+            let out = hash_output.as_mut().map(|out| out as &mut dyn Write);
+            ctx.run_with_checkpoints(scenario.name, out, expected, run)
         } else {
             run(&mut ctx)
         };
