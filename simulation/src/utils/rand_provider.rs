@@ -10,6 +10,10 @@ pub struct RandProvider {
 }
 
 impl RandProvider {
+    pub(crate) fn for_world(seed: u64) -> Self {
+        Self::new(if seed == 0 { crate::RNG_SEED } else { seed })
+    }
+
     pub fn new(mut seed: u64) -> Self {
         let tmp = splitmix64(&mut seed);
         let tmp2 = splitmix64(&mut seed);

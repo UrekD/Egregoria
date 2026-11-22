@@ -43,7 +43,7 @@ use crate::world::{CompanyEnt, FreightStationEnt, HumanEnt, TrainEnt, VehicleEnt
 use crate::World;
 use crate::{
     add_souls_to_empty_buildings, utils, ParCommandBuffer, RandProvider, Replay, RunnableSystem,
-    Simulation, SimulationOptions, INITIAL_TICK, RNG_SEED,
+    Simulation, SimulationOptions, INITIAL_TICK,
 };
 
 pub fn init() {
@@ -140,7 +140,7 @@ fn register_systems_and_resources() {
     register_resource_default::<RandomVehicles, Bincode>("random_vehicles");
     register_resource_default::<Map, Bincode>("map");
     register_resource_default::<TrainReservations, Bincode>("train_reservations");
-    register_resource_default::<Government, Bincode>("government");
+    register_resource_noinit::<Government, Bincode>("government");
     register_resource_default::<crate::map::ZoneGrid, Bincode>("zone_grid");
     register_resource_default::<crate::souls::residence::Residences, Bincode>("residences");
     register_resource_default::<crate::economy::ZoneDemand, Bincode>("zone_demand");
@@ -149,7 +149,7 @@ fn register_systems_and_resources() {
     register_resource_default::<BuildingInfos, Bincode>("binfos");
     register_resource::<GameTime, Bincode>("game_time", || GameTime::new(Tick(INITIAL_TICK)));
     register_transport_grid();
-    register_resource::<RandProvider, Bincode>("randprovider", || RandProvider::new(RNG_SEED));
+    register_resource_noinit::<RandProvider, Bincode>("randprovider");
     register_resource_default::<Dispatcher, Bincode>("dispatcher");
     register_resource_default::<Replay, crate::utils::replay::ReplayJson>("replay");
     register_resource_default::<Transit, Bincode>("transit");

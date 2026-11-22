@@ -9,7 +9,10 @@ use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
 use crate::world_command::{CommandOutcomes, WorldCommand};
-use common::saveload::{self, Bincode, CompressedBincode, Encoder};
+use common::saveload::{
+    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotId, SlotMeta, SnapshotKind,
+    SnapshotRevision,
+};
 use common::FastMap;
 use derive_more::{From, TryInto};
 use geom::Vec3;
@@ -19,11 +22,12 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
-use std::io;
 use std::path::Path;
 use std::ptr::addr_of;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::{fs, io};
 use utils::rand_provider::RandProvider;
+use utils::replay::ReplayJson;
 use utils::scheduler::SeqSchedule;
 
 #[macro_use]
@@ -138,11 +142,48 @@ impl NewGameOptions {
     pub const MAX_STARTING_MONEY_BUCKS: u32 = 10_000_000;
 
     pub fn is_valid(&self) -> bool {
-        (Self::MIN_TERRAIN_CHUNKS..=Self::MAX_TERRAIN_CHUNKS).contains(&self.terrain_chunks)
-            && (Self::MIN_STARTING_MONEY_BUCKS..=Self::MAX_STARTING_MONEY_BUCKS)
-                .contains(&self.starting_money_bucks)
+        self.validate().is_ok()
+    }
+
+    fn validate(&self) -> Result<(), NewGameError> {
+        if !(Self::MIN_TERRAIN_CHUNKS..=Self::MAX_TERRAIN_CHUNKS).contains(&self.terrain_chunks) {
+            return Err(NewGameError::TerrainChunks(self.terrain_chunks));
+        }
+        if !(Self::MIN_STARTING_MONEY_BUCKS..=Self::MAX_STARTING_MONEY_BUCKS)
+            .contains(&self.starting_money_bucks)
+        {
+            return Err(NewGameError::StartingMoneyBucks(self.starting_money_bucks));
+        }
+        Ok(())
     }
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewGameError {
+    TerrainChunks(u16),
+    StartingMoneyBucks(u32),
+}
+
+impl Display for NewGameError {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::TerrainChunks(chunks) => write!(
+                f,
+                "Terrain size {chunks} is outside {}..={} chunks",
+                NewGameOptions::MIN_TERRAIN_CHUNKS,
+                NewGameOptions::MAX_TERRAIN_CHUNKS
+            ),
+            Self::StartingMoneyBucks(bucks) => write!(
+                f,
+                "Starting money {bucks} is outside {}..={} bucks",
+                NewGameOptions::MIN_STARTING_MONEY_BUCKS,
+                NewGameOptions::MAX_STARTING_MONEY_BUCKS
+            ),
+        }
+    }
+}
+
+impl std::error::Error for NewGameError {}
 
 impl Default for NewGameOptions {
     fn default() -> Self {
@@ -213,10 +254,35 @@ impl Simulation {
     }
 
     pub fn new(gen_terrain: bool) -> Simulation {
+        if gen_terrain {
+            return Self::new_game(&NewGameOptions::default()).expect("valid default new game");
+        }
         Self::new_with_options(SimulationOptions {
-            terrain_size: if gen_terrain { 50 } else { 0 },
-            ..Default::default()
+            terrain_size: 0,
+            ..SimulationOptions::LEGACY
         })
+    }
+
+    pub fn new_game(options: &NewGameOptions) -> Result<Self, NewGameError> {
+        Self::new_game_with_recording(options, false)
+    }
+
+    pub fn new_game_with_replay(options: &NewGameOptions) -> Result<Self, NewGameError> {
+        Self::new_game_with_recording(options, true)
+    }
+
+    fn new_game_with_recording(
+        options: &NewGameOptions,
+        save_replay: bool,
+    ) -> Result<Self, NewGameError> {
+        options.validate()?;
+        Ok(Self::new_with_options(SimulationOptions {
+            terrain_size: options.terrain_chunks,
+            save_replay,
+            preset: options.preset,
+            seed: options.seed,
+            starting_money_bucks: options.starting_money_bucks,
+        }))
     }
 
     /// Creates a simulation and loader for a replay from the current version.
@@ -242,8 +308,6 @@ impl Simulation {
             resources: Default::default(),
         };
 
-        info!("Seed is {}", RNG_SEED);
-
         unsafe {
             for s in &*addr_of!(INIT_FUNCS) {
                 (s.f)(&mut sim);
@@ -267,18 +331,27 @@ impl Simulation {
             resources: Default::default(),
         };
 
-        info!("Seed is {}", RNG_SEED);
-        info!("{:?}", opts);
-
         unsafe {
             for s in &*addr_of!(INIT_FUNCS) {
                 (s.f)(&mut sim);
             }
         }
 
-        let start_commands: Vec<(u32, WorldCommand)> =
+        let mut start_commands: Vec<(u32, WorldCommand)> =
             common::saveload::JSON::decode(START_COMMANDS.as_bytes()).unwrap();
         WorldCommand::bootstrap(&mut sim, opts).expect("invalid simulation bootstrap options");
+        {
+            let map = sim.map();
+            for (_, command) in &mut start_commands {
+                if let WorldCommand::MapMakeMultipleConnections(projects, _) = command {
+                    for project in projects.iter_mut().filter(|project| project.is_ground()) {
+                        if let Some(height) = map.environment.height(project.pos.xy()) {
+                            project.pos.z = height;
+                        }
+                    }
+                }
+            }
+        }
         sim.apply_commands(start_commands.iter().map(|(_, cmd)| cmd));
         sim.record_constructor_end();
 
@@ -404,37 +477,89 @@ impl Simulation {
     }
 
     pub fn load_replay_from_disk(save_name: &str) -> Option<Replay> {
-        let path = format!("{save_name}_replay");
-        match utils::replay::ReplayJson::load(&path) {
+        let path = ReplayJson::filename(&format!("{save_name}_replay"));
+        let result = (|| {
+            let bytes = read_save(&path)
+                .map_err(SaveLoadError::Io)?
+                .ok_or(SaveLoadError::NotFound)?;
+            let revision = match read_snapshot(
+                &CompressedBincode::filename(save_name),
+                &Bincode::filename(save_name),
+                read_save,
+            ) {
+                Ok(snapshot) => {
+                    let (header, _) = snapshot_header(&snapshot)?;
+                    header.check_version()?;
+                    header.revision
+                }
+                // A legacy replay can exist on its own.
+                Err(SaveLoadError::NotFound) => None,
+                Err(error) => return Err(error),
+            };
+            ReplayJson::decode_sidecar(&bytes, revision).map_err(replay_corrupt)
+        })();
+        match result {
             Ok(replay) => Some(replay),
             Err(error) => {
-                log::error!("Could not load replay {path}: {error}");
+                log::error!("Could not load replay {}: {error}", path.display());
                 None
             }
         }
     }
 
     pub fn load_from_disk(save_name: &str) -> Result<Self, SaveLoadError> {
-        let corrupt_header = |error: io::Error| SaveLoadError::Corrupt {
-            version: None,
-            reason: error.to_string(),
-        };
-        let bytes =
-            match read_save(&CompressedBincode::filename(save_name)).map_err(SaveLoadError::Io)? {
-                Some(bytes) => CompressedBincode::decompress(&bytes).map_err(corrupt_header)?,
-                None => read_save(&Bincode::filename(save_name))
-                    .map_err(SaveLoadError::Io)?
-                    .ok_or(SaveLoadError::NotFound)?,
-            };
+        let bytes = read_snapshot(
+            &CompressedBincode::filename(save_name),
+            &Bincode::filename(save_name),
+            read_save,
+        )?;
+        let sim = Self::decode_snapshot(&bytes)?;
+        log::info!("successfully loaded simulation {save_name}");
+        Ok(sim)
+    }
 
-        // Decode only the prefix so an old World layout cannot hide an incompatible version.
-        let SaveHeader { version } = Bincode::decode_prefix(&bytes).map_err(corrupt_header)?;
-        if version != VERSION {
-            return Err(SaveLoadError::Incompatible { version });
+    pub fn load_from_slot(root: &Path, id: &SlotId) -> Result<Self, SaveLoadError> {
+        let paths = saveload::slot_paths(root, id).map_err(SaveLoadError::Io)?;
+        let bytes = read_snapshot(&paths.zip, &paths.bc, read_slot_member)?;
+        Self::decode_snapshot(&bytes)
+    }
+
+    pub fn load_replay_from_slot(root: &Path, id: &SlotId) -> Result<Replay, SaveLoadError> {
+        let paths = saveload::slot_paths(root, id).map_err(SaveLoadError::Io)?;
+        let bytes = read_slot_member(&paths.replay)
+            .map_err(SaveLoadError::Io)?
+            .ok_or(SaveLoadError::NotFound)?;
+        let snapshot = read_snapshot(&paths.zip, &paths.bc, read_slot_member)?;
+        let (header, _) = snapshot_header(&snapshot)?;
+        header.check_version()?;
+        ReplayJson::decode_sidecar(&bytes, header.revision).map_err(replay_corrupt)
+    }
+
+    /// Reads the header of the selected snapshot for slot discovery.
+    pub fn read_slot_snapshot_header(
+        path: &Path,
+        kind: SnapshotKind,
+    ) -> Result<SnapshotHeader, SaveLoadError> {
+        if kind == SnapshotKind::Obstructed {
+            return Err(SaveLoadError::Io(nonregular_slot_member(path)));
         }
+        let bytes = read_slot_member(path)
+            .map_err(SaveLoadError::Io)?
+            .ok_or(SaveLoadError::NotFound)?;
+        let bytes = if kind == SnapshotKind::Zip {
+            CompressedBincode::decompress(&bytes).map_err(corrupt_header)?
+        } else {
+            bytes
+        };
+        snapshot_header(&bytes).map(|(header, _)| header)
+    }
 
+    fn decode_snapshot(bytes: &[u8]) -> Result<Self, SaveLoadError> {
+        let (header, payload) = snapshot_header(bytes)?;
+        header.check_version()?;
+        let version = header.version;
         let data: SimulationDeser =
-            Bincode::decode(&bytes).map_err(|error| SaveLoadError::Corrupt {
+            Bincode::decode(payload).map_err(|error| SaveLoadError::Corrupt {
                 version: Some(version.clone()),
                 reason: error.to_string(),
             })?;
@@ -453,7 +578,6 @@ impl Simulation {
                 reason: "the map has no terrain".into(),
             });
         }
-        log::info!("successfully loaded simulation {save_name}");
         Ok(sim)
     }
 
@@ -483,18 +607,57 @@ impl Simulation {
         Ok((Self::new(true), Some(message)))
     }
 
+    pub fn save_to_slot(
+        &self,
+        root: &Path,
+        id: &SlotId,
+        revision: SnapshotRevision,
+    ) -> Result<SavePhase, SaveLoadError> {
+        self.encode_slot(revision)?.publish(root, id)
+    }
+
+    /// Encodes a save under the caller's simulation lock so publication can happen after unlocking.
+    pub fn encode_slot(&self, revision: SnapshotRevision) -> Result<EncodedSlot, SaveLoadError> {
+        let header = SlotSnapshotHeader {
+            magic: SLOT_SNAPSHOT_MAGIC,
+            version: VERSION.to_owned(),
+            revision,
+        };
+        let snapshot = CompressedBincode::encode(&(header, self)).map_err(SaveLoadError::Encode)?;
+        let replay = self.read::<Replay>();
+        let replay = replay
+            .enabled
+            .then(|| ReplayJson::encode_sidecar(&replay, revision))
+            .transpose()
+            .map_err(AtomicWriteError::PreCommit);
+        Ok(EncodedSlot {
+            snapshot,
+            replay,
+            display_name: None,
+            revision,
+            game_tick: self.get_tick(),
+            population: self.world.humans.len().try_into().unwrap_or(u32::MAX),
+            money_cents: self.read::<economy::Government>().money.cents(),
+        })
+    }
+
     pub fn save_to_disk(&self, save_name: &str) {
         self.save_snapshot_and_replay(save_name);
     }
 
     /// Saves through the usual snapshot and replay paths and reports snapshot success.
     pub fn save_snapshot_and_replay(&self, save_name: &str) -> bool {
-        let snapshot_saved = common::saveload::CompressedBincode::save(&self, save_name).is_some();
-        let rep = self.resources.read::<Replay>();
-        if rep.enabled {
-            common::saveload::JSONPretty::save(&*rep, &format!("{save_name}_replay"));
+        if CompressedBincode::save(self, save_name).is_none() {
+            return false;
         }
-        snapshot_saved
+        let replay = self.read::<Replay>();
+        let name = format!("{save_name}_replay");
+        if replay.enabled {
+            saveload::JSONPretty::save(&*replay, &name);
+        } else if let Err(error) = remove_replay(&ReplayJson::filename(&name)) {
+            log::error!("Could not remove replay {name}: {error}");
+        }
+        true
     }
 
     pub fn pos<E: WorldTransform>(&self, id: E) -> Option<Vec3> {
@@ -578,6 +741,56 @@ struct SaveHeader {
     version: String,
 }
 
+// A legacy Bincode string length cannot start with 0xff. Keep the normal
+// Simulation serialization inside the slot envelope for legacy and network callers.
+const SLOT_SNAPSHOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x01";
+
+#[derive(Serialize, Deserialize)]
+struct SlotSnapshotHeader {
+    magic: [u8; 12],
+    version: String,
+    revision: SnapshotRevision,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct SnapshotHeader {
+    pub version: String,
+    pub revision: Option<SnapshotRevision>,
+}
+
+impl SnapshotHeader {
+    fn check_version(&self) -> Result<(), SaveLoadError> {
+        if self.version != VERSION {
+            return Err(SaveLoadError::Incompatible {
+                version: self.version.clone(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_header(mut bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SaveLoadError> {
+    if bytes.starts_with(&SLOT_SNAPSHOT_MAGIC) {
+        let header: SlotSnapshotHeader =
+            Bincode::decode_reader(&mut bytes).map_err(corrupt_header)?;
+        return Ok((
+            SnapshotHeader {
+                version: header.version,
+                revision: Some(header.revision),
+            },
+            bytes,
+        ));
+    }
+    let SaveHeader { version } = Bincode::decode_prefix(bytes).map_err(corrupt_header)?;
+    Ok((
+        SnapshotHeader {
+            version,
+            revision: None,
+        },
+        bytes,
+    ))
+}
+
 fn deserialize_save_header<'de, D: Deserializer<'de>>(
     deserializer: D,
 ) -> Result<SaveHeader, D::Error> {
@@ -602,6 +815,8 @@ pub enum SaveLoadError {
         reason: String,
     },
     Io(io::Error),
+    Encode(io::Error),
+    SnapshotWrite(AtomicWriteError),
 }
 
 impl Display for SaveLoadError {
@@ -618,14 +833,132 @@ impl Display for SaveLoadError {
             }
             Self::Corrupt { reason, .. } => write!(f, "Save is corrupt ({reason})"),
             Self::Io(error) => write!(f, "Could not read save ({error})"),
+            Self::Encode(error) => write!(f, "Could not encode snapshot ({error})"),
+            Self::SnapshotWrite(error) => write!(f, "Could not publish snapshot ({error})"),
         }
     }
 }
 
-impl std::error::Error for SaveLoadError {}
+impl std::error::Error for SaveLoadError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(error) | Self::Encode(error) => Some(error),
+            Self::SnapshotWrite(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+/// Returned after a durable snapshot replacement.
+#[derive(Debug)]
+pub enum SavePhase {
+    Complete,
+    SidecarsFailed {
+        replay: Option<AtomicWriteError>,
+        meta: Option<AtomicWriteError>,
+    },
+}
+
+pub struct EncodedSlot {
+    snapshot: Vec<u8>,
+    replay: Result<Option<Vec<u8>>, AtomicWriteError>,
+    display_name: Option<String>,
+    revision: SnapshotRevision,
+    game_tick: u64,
+    population: u32,
+    money_cents: i64,
+}
+
+impl EncodedSlot {
+    pub fn with_display_name(mut self, display_name: String) -> Self {
+        self.display_name = Some(display_name);
+        self
+    }
+
+    /// Publishes a snapshot followed by its sidecars. The caller coordinates
+    /// publication and deletion of the same slot.
+    pub fn publish(self, root: &Path, id: &SlotId) -> Result<SavePhase, SaveLoadError> {
+        let paths = saveload::slot_paths(root, id)
+            .map_err(|error| SaveLoadError::SnapshotWrite(AtomicWriteError::PreCommit(error)))?;
+        saveload::write_atomic(&paths.zip, &self.snapshot).map_err(SaveLoadError::SnapshotWrite)?;
+        let replay = self.replay.and_then(|bytes| match bytes {
+            Some(bytes) => saveload::write_atomic(&paths.replay, &bytes),
+            None => remove_replay(&paths.replay).map_err(AtomicWriteError::PreCommit),
+        });
+        let meta = SlotMeta {
+            display_name: self.display_name.unwrap_or_else(|| id.to_string()),
+            game_tick: self.game_tick,
+            population: self.population,
+            money_cents: self.money_cents,
+            saved_at_unix: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            revision: Some(self.revision.get()),
+        };
+        let meta = saveload::write_slot_meta(root, id, &meta);
+        match (replay, meta) {
+            (Ok(()), Ok(())) => Ok(SavePhase::Complete),
+            (replay, meta) => Ok(SavePhase::SidecarsFailed {
+                replay: replay.err(),
+                meta: meta.err(),
+            }),
+        }
+    }
+}
+
+fn remove_replay(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
+}
+
+fn read_snapshot(
+    zip: &Path,
+    bc: &Path,
+    read: fn(&Path) -> io::Result<Option<Vec<u8>>>,
+) -> Result<Vec<u8>, SaveLoadError> {
+    match read(zip).map_err(SaveLoadError::Io)? {
+        Some(bytes) => CompressedBincode::decompress(&bytes).map_err(corrupt_header),
+        None => read(bc)
+            .map_err(SaveLoadError::Io)?
+            .ok_or(SaveLoadError::NotFound),
+    }
+}
+
+fn corrupt_header(error: io::Error) -> SaveLoadError {
+    SaveLoadError::Corrupt {
+        version: None,
+        reason: error.to_string(),
+    }
+}
+
+fn replay_corrupt(error: io::Error) -> SaveLoadError {
+    SaveLoadError::Corrupt {
+        version: None,
+        reason: format!("replay sidecar: {error}"),
+    }
+}
+
+fn nonregular_slot_member(path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("slot path {} is not a regular file", path.display()),
+    )
+}
+
+fn read_slot_member(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => read_save(path),
+        Ok(_) => Err(nonregular_slot_member(path)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
 
 fn read_save(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match std::fs::read(path) {
+    match fs::read(path) {
         Ok(bytes) => Ok(Some(bytes)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => match path.symlink_metadata() {
             Ok(_) => Ok(Some(Vec::new())), // A dangling save symlink still needs backing up.

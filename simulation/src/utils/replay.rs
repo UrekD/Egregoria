@@ -1,7 +1,7 @@
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::WorldCommand;
 use crate::{Simulation, SimulationOptions, INITIAL_TICK, START_COMMANDS};
-use common::saveload::{Encoder, JSON};
+use common::saveload::{Encoder, JSONPretty, SnapshotRevision, JSON};
 use prototypes::Tick;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -169,6 +169,64 @@ fn invalid_replay(message: &'static str) -> io::Error {
 
 pub(crate) struct ReplayJson;
 
+#[derive(Deserialize)]
+struct ReplayHeader {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    revision: Option<u128>,
+}
+
+impl ReplayHeader {
+    fn decode(bytes: &[u8]) -> io::Result<Self> {
+        // Read the header before decoding commands, regardless of JSON field order.
+        let header: Self = JSON::decode(bytes)?;
+        if header.version != crate::VERSION {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "Replay has version {:?}, expected {:?}",
+                    header.version,
+                    crate::VERSION
+                ),
+            ));
+        }
+        Ok(header)
+    }
+}
+
+impl ReplayJson {
+    pub(crate) fn encode_sidecar(
+        replay: &Replay,
+        revision: SnapshotRevision,
+    ) -> io::Result<Vec<u8>> {
+        #[derive(Serialize)]
+        struct Sidecar<'a> {
+            revision: u128,
+            #[serde(flatten)]
+            replay: &'a Replay,
+        }
+
+        JSONPretty::encode(&Sidecar {
+            revision: revision.get(),
+            replay,
+        })
+    }
+
+    pub(crate) fn decode_sidecar(
+        bytes: &[u8],
+        revision: Option<SnapshotRevision>,
+    ) -> io::Result<Replay> {
+        let header = ReplayHeader::decode(bytes)?;
+        if header.revision != revision.map(SnapshotRevision::get) {
+            return Err(invalid_replay(
+                "Replay revision does not match the snapshot",
+            ));
+        }
+        JSON::decode(bytes)
+    }
+}
+
 impl Encoder for ReplayJson {
     const EXTENSION: &'static str = JSON::EXTENSION;
 
@@ -177,23 +235,7 @@ impl Encoder for ReplayJson {
     }
 
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
-        #[derive(Deserialize)]
-        struct ReplayHeader {
-            #[serde(default)]
-            version: String,
-        }
-
-        // Decode only the version on the first pass, regardless of JSON field order.
-        let ReplayHeader { version } = JSON::decode(bytes)?;
-        if version != crate::VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Replay has version {version:?}, expected {:?}",
-                    crate::VERSION
-                ),
-            ));
-        }
+        ReplayHeader::decode(bytes)?;
         JSON::decode(bytes)
     }
 }

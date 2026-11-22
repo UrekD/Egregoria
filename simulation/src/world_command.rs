@@ -797,24 +797,31 @@ impl WorldCommand {
         if !options.valid_for_bootstrap() {
             return Err(Rejection::InvalidInitOptions);
         }
-        if options.save_replay {
+        info!("Initializing world with {options:?}");
+        sim.insert(RandProvider::for_world(options.seed));
+        sim.insert(Government {
+            money: Money::new_bucks(i64::from(options.starting_money_bucks)),
+        });
+        {
             let mut replay = sim.write::<Replay>();
-            replay.enabled = true;
-            replay.push(tick, Init(Box::new(options)));
+            replay.enabled = options.save_replay;
+            if replay.enabled {
+                replay.push(tick, Init(Box::new(options)));
+            }
         }
         if options.terrain_size > 0 {
-            generate_terrain(sim, options.terrain_size);
+            generate_terrain(sim, options);
         }
         sim.resources.insert(options);
         Ok(())
     }
 }
 
-fn generate_terrain(sim: &mut Simulation, size: u16) {
+fn generate_terrain(sim: &mut Simulation, options: SimulationOptions) {
     info!("generating terrain..");
     let t = Instant::now();
 
-    sim.map_mut().environment = Environment::new(size, size);
+    sim.map_mut().environment = Environment::from_options(options);
     info!("took {}s", t.elapsed().as_secs_f32());
 
     let c = vec3(3000.0 + 72.2 / 2.0, 200.0 / 2.0 + 1.0, 0.0);
@@ -824,12 +831,15 @@ fn generate_terrain(sim: &mut Simulation, size: u16) {
 
     let pat = LanePatternBuilder::new().rail(true).build();
 
-    sim.map_mut().make_connection(
-        MapProject::ground(c - offy * 100.0),
-        MapProject::ground(c + offy * 120.0),
-        None,
-        &pat,
-    );
+    {
+        let mut map = sim.map_mut();
+        let ground = |pos: Vec3| {
+            MapProject::ground(pos.xy().z(map.environment.height(pos.xy()).unwrap_or(pos.z)))
+        };
+        let from = ground(c - offy * 100.0);
+        let to = ground(c + offy * 120.0);
+        map.make_connection(from, to, None, &pat);
+    }
 
     let external_trading = sim.map_mut().build_special_building(
         &obb,

@@ -23,6 +23,11 @@ use common::saveload::{Bincode, CompressedBincode, Encoder, JSON};
 use geom::{vec2, vec3, Polygon, OBB};
 use prototypes::{BuildingGen, GameTime, GoodsCompanyID, ItemID, Money, RollingStockID, Tick};
 
+#[path = "p4a_new_game.rs"]
+mod p4a_new_game;
+#[path = "p4a_slots.rs"]
+mod p4a_slots;
+
 fn street(test: &TestCtx) {
     test.build_roads(&[
         vec3(100.0, 100.0, 0.0),
