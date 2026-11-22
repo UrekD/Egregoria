@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use common::{FastMap, FastSet};
+use geom::AABB;
 
 use crate::map::{Lane, LaneKind, Map, RoadID};
 use crate::map_dynamic::Transit;
@@ -21,18 +22,70 @@ struct Observations {
     count: u32,
 }
 
+const LANE_SEARCH_RADIUS: f32 = 8.0;
+
+/// Identifies the map and the revision of its road network, including turns.
+pub fn road_network_revision(map: &Map) -> (u64, u64) {
+    (map.identity(), map.walking_topology_generation)
+}
+
+/// UI-owned lookup for repeatedly sampling the same roads.
+pub struct RoadSampler {
+    roads: FastSet<RoadID>,
+    revision: (u64, u64),
+    fallback_bounds: Option<AABB>,
+}
+
+impl RoadSampler {
+    pub fn new(map: &Map, roads: impl Iterator<Item = RoadID>) -> Self {
+        let mut sampler = Self {
+            roads: roads.collect(),
+            revision: road_network_revision(map),
+            fallback_bounds: None,
+        };
+        sampler.update_bounds(map);
+        sampler
+    }
+
+    fn update_bounds(&mut self, map: &Map) {
+        self.revision = road_network_revision(map);
+        // The spatial query for route-less vehicles starts with roads' bold lines.
+        self.fallback_bounds = self
+            .roads
+            .iter()
+            .filter_map(|&id| map.get(id))
+            .map(|road| road.points.bbox().flatten().expand(road.width * 0.5))
+            .reduce(AABB::union);
+    }
+
+    /// Roads without usable observations are omitted.
+    pub fn sample(&mut self, sim: &Simulation) -> BTreeMap<RoadID, RoadTraffic> {
+        let map = sim.map();
+        if self.revision != road_network_revision(&map) {
+            self.update_bounds(&map);
+        }
+        sample_visible(sim, &map, &self.roads, self.fallback_bounds)
+    }
+}
+
 /// Sample the requested roads. Roads without usable observations are omitted.
 pub fn sample(
     sim: &Simulation,
     roads: impl Iterator<Item = RoadID>,
 ) -> BTreeMap<RoadID, RoadTraffic> {
+    sample_visible(sim, &sim.map(), &roads.collect(), None)
+}
+
+fn sample_visible(
+    sim: &Simulation,
+    map: &Map,
+    requested: &FastSet<RoadID>,
+    fallback_bounds: Option<AABB>,
+) -> BTreeMap<RoadID, RoadTraffic> {
     profiling::scope!("traffic_metrics::sample");
-    let requested: FastSet<_> = roads.collect();
     if requested.is_empty() {
         return BTreeMap::new();
     }
-
-    let map = sim.map();
     let transit = sim.read::<Transit>();
     let mut observations: FastMap<_, Observations> = FastMap::default();
     // Vehicle slot order fixes the order of floating-point additions.
@@ -51,14 +104,23 @@ pub fn sample(
             continue;
         }
 
-        let Some(lane) = current_lane(&map, ent) else {
+        let lane = if let Some(traversable) = ent.it.get_travers() {
+            map.get(traversable.destination_lane())
+        } else {
+            // Avoid searching outside the requested roads' envelope. Near its
+            // edge, an unrequested road can still provide the nearest lane.
+            if fallback_bounds.is_some_and(|bounds| {
+                !bounds.contains_within(ent.trans.pos.xy(), LANE_SEARCH_RADIUS)
+            }) {
+                continue;
+            }
+            nearest_driving_lane(map, ent)
+        };
+        let Some(lane) = lane.filter(|lane| requested.contains(&lane.parent)) else {
             continue;
         };
-        if !requested.contains(&lane.parent) {
-            continue;
-        }
 
-        // Vehicle movement applies the kind factor and the individual multiplier
+        // Vehicle movement applies the kind factor and individual multiplier
         // to the lane limit when computing free-flow speed.
         let limit = lane.speed_limit;
         let vehicle_limit =
@@ -90,14 +152,9 @@ pub fn sample(
         .collect()
 }
 
-fn current_lane<'a>(map: &'a Map, entity: &VehicleEnt) -> Option<&'a Lane> {
-    if let Some(traversable) = entity.it.get_travers() {
-        return map.get(traversable.destination_lane());
-    }
-
+fn nearest_driving_lane<'a>(map: &'a Map, entity: &VehicleEnt) -> Option<&'a Lane> {
     // A route-less car can wait on a road. Bound the projection to avoid
     // assigning a vehicle in a yard or on another level to a distant lane.
-    const LANE_SEARCH_RADIUS: f32 = 8.0;
     let pos = entity.trans.pos;
     let lane = map.get(map.nearest_lane(pos, LaneKind::Driving, Some(LANE_SEARCH_RADIUS))?)?;
     (lane.points.project_dist2(pos) <= LANE_SEARCH_RADIUS * LANE_SEARCH_RADIUS).then_some(lane)

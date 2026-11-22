@@ -1,5 +1,7 @@
 use std::collections::BTreeSet;
 
+use common::FastSet;
+
 use crate::gui::specialbuilding::SpecialBuildingResource;
 use crate::gui::windows::settings::Settings;
 use crate::gui::Tool;
@@ -15,6 +17,8 @@ use simulation::Simulation;
 #[derive(Default)]
 pub struct BulldozerState {
     gesture: Gesture,
+    initiating_button: Option<MouseButton>,
+    previous_buttons: FastSet<MouseButton>,
 }
 
 #[derive(Default)]
@@ -31,6 +35,8 @@ enum Gesture {
 impl BulldozerState {
     pub fn reset_gesture(&mut self) {
         self.gesture = Gesture::Idle;
+        self.initiating_button = None;
+        self.previous_buttons.clear();
     }
 
     fn cancel(&mut self, held: bool) {
@@ -39,6 +45,41 @@ impl BulldozerState {
         } else {
             self.reset_gesture();
         }
+    }
+
+    fn drag_pressed(
+        &mut self,
+        pointer: &engine::PointerFrame,
+        select_button: impl Fn(&MouseButton) -> bool,
+        selecting: bool,
+        just_selected: bool,
+    ) -> bool {
+        if self
+            .initiating_button
+            .is_some_and(|button| pointer.released_buttons.contains(&button))
+        {
+            self.gesture = Gesture::Idle;
+            self.initiating_button = None;
+        }
+
+        // InputMap only reports transitions of the aggregate Select action. A
+        // newly held binding can start a stroke even when Select stayed active.
+        let fresh = |button| {
+            !self.previous_buttons.contains(&button) || pointer.released_buttons.contains(&button)
+        };
+        let button = pointer
+            .held_buttons
+            .iter()
+            .filter(|button| select_button(button))
+            .copied()
+            .min_by_key(|&button| (!fresh(button), button));
+        let pressed =
+            matches!(self.gesture, Gesture::Idle) && (just_selected || button.is_some_and(fresh));
+        self.previous_buttons.clone_from(&pointer.held_buttons);
+        if pressed {
+            self.initiating_button = button;
+        }
+        selecting && pressed
     }
 
     fn update_drag(
@@ -176,29 +217,29 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
     let pointer = engine::pointer_frame();
     let selecting = input.act.contains(&InputAction::Select);
     let bindings = uiworld.read::<Bindings>();
-    let select_button = |&button| is_select_button(&bindings, button);
+    let select_button = |&button: &MouseButton| is_select_button(&bindings, button);
     let held = selecting || pointer.held_buttons.iter().any(select_button);
     let mut state = uiworld.write::<BulldozerState>();
+    let drag_enabled = uiworld.read::<Settings>().bulldozer_drag;
+    let just_selected = input.just_act.contains(&InputAction::Select);
+    let pressed = if drag_enabled {
+        state.drag_pressed(&pointer, select_button, selecting, just_selected)
+    } else {
+        just_selected
+            || selecting
+                && pointer
+                    .held_buttons
+                    .intersection(&pointer.released_buttons)
+                    .any(select_button)
+    };
     if *uiworld.read::<Tool>() != Tool::Bulldozer || pointer.blocked || over_ui(input.screen) {
         state.cancel(held);
         return;
-    }
-    // InputMap compares held actions between redraws. A release followed by a
-    // press of the same Select button within one redraw starts a new stroke.
-    let repressed = selecting
-        && pointer
-            .held_buttons
-            .intersection(&pointer.released_buttons)
-            .any(select_button);
-    let pressed = input.just_act.contains(&InputAction::Select) || repressed;
-    if repressed {
-        state.reset_gesture();
     }
 
     let map = sim.map();
     let mut commands = uiworld.commands();
     let before = commands.as_ref().len();
-    let drag_enabled = uiworld.read::<Settings>().bulldozer_drag;
     let projection = if drag_enabled {
         let camera = &uiworld.camera().camera;
         let project = |point| project_terrain(camera, &map, point);
@@ -515,6 +556,59 @@ mod tests {
         update(b, true, false, frame);
         assert!(
             matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(a), WorldCommand::MapRemoveRoad(b)] if (*a, *b) == (road_a, road_b))
+        );
+
+        update(b, false, false, open());
+        *ui.commands() = WorldCommands::default();
+        let mut left = crate::inputmap::InputCombination::default();
+        left.push_unique(UnitInput::Mouse(MouseButton::Left));
+        ui.write::<Bindings>()
+            .0
+            .get_mut(&InputAction::Select)
+            .unwrap()
+            .0
+            .push(left);
+        let mut pointer = engine::InputContext::default();
+        pointer.observe_mouse_button(MouseButton::Left, true);
+        update(a, true, true, pointer.pointer_frame(false));
+        pointer.end_frame();
+        pointer.observe_mouse_button(MouseButton::Left, false);
+        pointer.observe_mouse_button(MouseButton::Right, true);
+        update(b, true, false, pointer.pointer_frame(false));
+        assert!(
+            matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(a), WorldCommand::MapRemoveRoad(b)] if (*a, *b) == (road_a, road_b))
+        );
+
+        // A Select button held from an earlier redraw cannot inherit the stroke.
+        update(b, false, false, open());
+        *ui.commands() = WorldCommands::default();
+        let mut pointer = engine::InputContext::default();
+        pointer.observe_mouse_button(MouseButton::Left, true);
+        update(a, true, true, pointer.pointer_frame(false));
+        pointer.end_frame();
+        pointer.observe_mouse_button(MouseButton::Right, true);
+        update(a, true, false, pointer.pointer_frame(false));
+        pointer.end_frame();
+        pointer.observe_mouse_button(MouseButton::Left, false);
+        update(b, true, false, pointer.pointer_frame(false));
+        assert!(
+            matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(id)] if *id == road_a)
+        );
+
+        // A press over UI is cancelled, but a release and fresh press can
+        // occur between two redraws before the tool sees Select inactive.
+        update(b, false, false, open());
+        *ui.commands() = WorldCommands::default();
+        let mut pointer = engine::InputContext::default();
+        pointer.observe_mouse_button(MouseButton::Left, true);
+        update(a, false, false, pointer.pointer_frame(true));
+        assert!(ui.commands().as_ref().is_empty());
+        pointer.end_frame();
+        pointer.observe_mouse_button(MouseButton::Left, false);
+        pointer.observe_mouse_button(MouseButton::Left, true);
+        update(b, true, true, pointer.pointer_frame(false));
+        assert!(
+            matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(id)] if *id == road_b)
         );
         open().publish();
     }

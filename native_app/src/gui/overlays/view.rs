@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 
-use geom::{vec2, Camera, Vec2, AABB};
+use geom::{vec2, Camera, Vec2, AABB, AABB3};
 use simulation::map::{Map, MapSubscriber, UpdateType};
 
 #[derive(Default)]
@@ -53,6 +53,10 @@ pub(super) fn world_cache_is_clear() -> bool {
 pub(crate) fn bounds(camera: &Camera, map: &Map) -> Option<AABB> {
     let [bottom, top] = TERRAIN_HEIGHTS.with_borrow_mut(|cache| cache.get(map));
     footprint(camera, map.environment.bounds(), bottom, top + 32.0) // badge clearance
+}
+
+pub(super) fn geometry_bounds(camera: &Camera, bounds: AABB3) -> Option<AABB> {
+    footprint(camera, bounds.flatten(), bounds.ll.z, bounds.ur.z)
 }
 
 fn footprint(camera: &Camera, bounds: AABB, bottom: f32, top: f32) -> Option<AABB> {

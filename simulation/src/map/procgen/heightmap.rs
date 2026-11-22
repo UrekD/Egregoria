@@ -3,7 +3,7 @@ use geom::{fnoise, simplex_noise, vec2, Vec2};
 pub(crate) const LEGACY_VALLEY_AXIS: f32 = 25_000.0;
 
 pub(crate) fn height(p: Vec2, noise_offset: Vec2, valley_axis: f32) -> (f32, Vec2) {
-    let (noise, mut grad) = fnoise::<4>(Vec2::splat(70.69) + 0.00006 * (p + noise_offset));
+    let (noise, mut grad) = fnoise::<4>(Vec2::splat(70.69) + 0.00006 * p + noise_offset);
     grad *= 0.00006;
 
     let ratio = 0.00005;

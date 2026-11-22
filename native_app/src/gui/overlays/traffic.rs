@@ -2,19 +2,18 @@ use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-use geom::{Camera, InfiniteFrustrum, Intersect3, AABB3};
+use geom::{Camera, InfiniteFrustrum, Intersect3, Vec3, AABB3};
 use goryak::{
     blur_bg, fixed_spacer, mincolumn, minrow, on_secondary_container, padxy, secondary_container,
     textc,
 };
-use simulation::map::{Map, MapSubscriber, ProjectFilter, ProjectKind, RoadID, UpdateType};
-use simulation::transportation::traffic_metrics;
+use simulation::map::{Map, ProjectFilter, ProjectKind, Road, RoadID, TurnID, TurnKind};
+use simulation::transportation::traffic_metrics::{road_network_revision, RoadSampler};
 use simulation::Simulation;
 use yakui::{colored_box_container, reflow, Alignment, Color, Dim2, Pivot, Vec4};
 
 use super::view;
 use crate::rendering::immediate::ImmediateDraw;
-use crate::session::SessionState;
 use crate::uiworld::UiWorld;
 
 pub(super) const AVAILABLE: bool = true;
@@ -27,9 +26,11 @@ const NO_DATA: [f32; 4] = [0.35, 0.38, 0.42, 1.0];
 
 #[derive(Default)]
 struct TrafficOverlay {
-    map: Option<((usize, u64), MapSubscriber)>,
+    revision: (u64, u64),
+    road_bounds: Option<AABB3>,
     projection: [f32; 16],
     visible: Vec<RoadID>,
+    sampler: Option<RoadSampler>,
     history: BTreeMap<RoadID, RecentTraffic>,
     last_sample: Option<Instant>,
 }
@@ -37,6 +38,22 @@ struct TrafficOverlay {
 struct RecentTraffic {
     rel_speed: f32,
     observed_at: Instant,
+    points: Vec<Vec3>,
+    turns: Vec<TurnID>,
+}
+
+fn road_turns<'a>(map: &'a Map, road: &'a Road) -> impl Iterator<Item = TurnID> + 'a {
+    [road.src, road.dst]
+        .into_iter()
+        .filter_map(|id| map.get(id))
+        .flat_map(|intersection| intersection.turns())
+        .filter(|turn| {
+            turn.kind == TurnKind::Driving
+                && road
+                    .lanes_iter()
+                    .any(|(lane, _)| lane == turn.id.src || lane == turn.id.dst)
+        })
+        .map(|turn| turn.id)
 }
 
 thread_local! {
@@ -51,28 +68,8 @@ pub(super) fn draw(
     rebuild: bool,
 ) {
     let camera = uiw.camera().camera;
-    let generation = uiw.read::<SessionState>().generation;
     TRAFFIC.with_borrow_mut(|traffic| {
-        let map_key = (std::ptr::from_ref(&map.subscribers) as usize, generation);
-        let new_map = traffic.map.as_ref().is_none_or(|(key, _)| *key != map_key);
-        if new_map {
-            *traffic = TrafficOverlay::default();
-            traffic.map = Some((map_key, map.subscribers.subscribe(UpdateType::Road)));
-        }
-        let (_, changes) = traffic.map.as_mut().unwrap();
-        let cleared = changes.take_cleared();
-        let roads_changed = changes.take_updated_chunks().next().is_some() || cleared;
-        if roads_changed {
-            traffic.history.clear();
-        }
-        traffic.update(
-            sim,
-            map,
-            &camera,
-            draw,
-            rebuild || new_map || roads_changed,
-            Instant::now(),
-        );
+        traffic.update(sim, map, &camera, draw, rebuild, Instant::now());
     });
 }
 
@@ -86,11 +83,30 @@ impl TrafficOverlay {
         rebuild: bool,
         now: Instant,
     ) {
+        let revision = road_network_revision(map);
+        if self.revision.0 != revision.0 {
+            *self = Self::default();
+        }
+        let roads_changed = self.revision != revision;
+        if roads_changed {
+            self.revision = revision;
+            self.road_bounds = road_geometry_bounds(map);
+            self.history.retain(|&id, recent| {
+                map.get(id).is_some_and(|road| {
+                    road.interfaced_points.as_slice() == recent.points
+                        && road_turns(map, road).eq(recent.turns.iter().copied())
+                })
+            });
+        }
         let projection = *camera.proj_cache.as_ref();
-        let view_changed = rebuild || self.projection != projection;
+        let view_changed = rebuild || roads_changed || self.projection != projection;
         if view_changed {
             self.projection = projection;
-            self.visible = visible_roads(camera, map);
+            let visible = visible_roads(camera, map, self.road_bounds);
+            if roads_changed || self.visible != visible {
+                self.sampler = None;
+                self.visible = visible;
+            }
             self.history
                 .retain(|road, _| self.visible.binary_search(road).is_ok());
         }
@@ -103,20 +119,24 @@ impl TrafficOverlay {
             self.last_sample = Some(now);
             self.history
                 .retain(|_, recent| now - recent.observed_at < SAMPLE_EXPIRY);
-            for (road, observed) in traffic_metrics::sample(sim, self.visible.iter().copied()) {
-                let rel_speed = self
-                    .history
-                    .get(&road)
-                    .map_or(observed.rel_speed, |recent| {
-                        recent.rel_speed + EMA_ALPHA * (observed.rel_speed - recent.rel_speed)
-                    });
-                self.history.insert(
-                    road,
-                    RecentTraffic {
-                        rel_speed,
-                        observed_at: now,
-                    },
-                );
+            let sampler = self
+                .sampler
+                .get_or_insert_with(|| RoadSampler::new(map, self.visible.iter().copied()));
+            for (id, observed) in sampler.sample(sim) {
+                if let Some(recent) = self.history.get_mut(&id) {
+                    recent.rel_speed += EMA_ALPHA * (observed.rel_speed - recent.rel_speed);
+                    recent.observed_at = now;
+                } else if let Some(road) = map.get(id) {
+                    self.history.insert(
+                        id,
+                        RecentTraffic {
+                            rel_speed: observed.rel_speed,
+                            observed_at: now,
+                            points: road.interfaced_points.as_slice().to_vec(),
+                            turns: road_turns(map, road).collect(),
+                        },
+                    );
+                }
             }
         }
 
@@ -141,8 +161,18 @@ impl TrafficOverlay {
     }
 }
 
-fn visible_roads(camera: &Camera, map: &Map) -> Vec<RoadID> {
-    let Some(bounds) = view::bounds(camera, map) else {
+fn road_geometry_bounds(map: &Map) -> Option<AABB3> {
+    map.roads()
+        .values()
+        .map(|road| {
+            let bounds = road.interfaced_points.bbox();
+            AABB3::new(bounds.ll.up(ROAD_LIFT), bounds.ur.up(ROAD_LIFT))
+        })
+        .reduce(AABB3::union)
+}
+
+fn visible_roads(camera: &Camera, map: &Map, road_bounds: Option<AABB3>) -> Vec<RoadID> {
+    let Some(bounds) = road_bounds.and_then(|bounds| view::geometry_bounds(camera, bounds)) else {
         return Vec::new();
     };
     let frustum = InfiniteFrustrum::from_reversez_invviewproj(camera.eye(), camera.inv_proj_cache);
@@ -226,7 +256,7 @@ mod tests {
     use crate::rendering::OrbitCamera;
     use geom::{vec2, vec3, Camera, Radians, Transform};
     use scenarios::{builders::grid_city, ScenarioCtx};
-    use simulation::map::{LaneKind, RoadID};
+    use simulation::map::{LaneKind, LanePatternBuilder, LotKind, MapProject, RoadID};
     use simulation::transportation::{spawn_driving_vehicle, VehicleKind};
     use simulation::{SimulationOptions, VehicleID};
 
@@ -265,10 +295,91 @@ mod tests {
         let mut uiw = UiWorld::default();
         uiw.insert(Tool::Hand);
         uiw.insert(OverlayMode::Traffic);
-        uiw.insert(SessionState::default());
         uiw.insert(ImmediateDraw::default());
         uiw.insert(camera(780.0, 700.0));
         uiw
+    }
+
+    #[test]
+    fn p4e_traffic_overlay_keeps_history_on_lot_dispatch() {
+        let (ctx, road, _) = city();
+        let uiw = traffic_ui();
+        super::super::draw(&ctx.sim, &uiw);
+        let observed_at = TRAFFIC.with_borrow(|traffic| traffic.history[&road].observed_at);
+        {
+            let mut map = ctx.sim.write::<Map>();
+            let lot = map.lots().keys().next().unwrap();
+            map.set_lot_kind(lot, LotKind::Residential);
+        }
+        super::super::draw(&ctx.sim, &uiw);
+        assert_eq!(
+            TRAFFIC.with_borrow(|traffic| traffic.history.get(&road).map(|v| v.observed_at)),
+            Some(observed_at)
+        );
+
+        let pattern = LanePatternBuilder::default().build();
+        let ground = |pos| MapProject {
+            pos,
+            kind: ProjectKind::Ground,
+        };
+        ctx.sim
+            .write::<Map>()
+            .make_connection(
+                ground(vec3(1600.0, 1600.0, 0.0)),
+                ground(vec3(1700.0, 1600.0, 0.0)),
+                None,
+                &pattern,
+            )
+            .unwrap();
+        super::super::draw(&ctx.sim, &uiw);
+        assert_eq!(
+            TRAFFIC.with_borrow(|traffic| traffic.history.get(&road).map(|v| v.observed_at)),
+            Some(observed_at)
+        );
+
+        {
+            let mut map = ctx.sim.write::<Map>();
+            let src = map.get(road).unwrap().src;
+            let pos = map.get(src).unwrap().pos;
+            map.make_connection(
+                MapProject {
+                    pos,
+                    kind: ProjectKind::Intersection(src),
+                },
+                ground(pos - vec3(0.0, 100.0, 0.0)),
+                None,
+                &pattern,
+            )
+            .unwrap();
+            assert!(map.get(road).is_some());
+        }
+        super::super::draw(&ctx.sim, &uiw);
+        assert!(TRAFFIC.with_borrow(|traffic| !traffic.history.contains_key(&road)));
+    }
+
+    #[test]
+    fn p4e_traffic_overlay_includes_a_visible_elevated_road() {
+        let (ctx, _, _) = city();
+        let mut map = ctx.sim.write::<Map>();
+        let ground = |pos| MapProject {
+            pos,
+            kind: ProjectKind::Ground,
+        };
+        let (_, bridge) = map
+            .make_connection(
+                ground(vec3(900.0, 850.0, 100.0)),
+                ground(vec3(900.0, 950.0, 100.0)),
+                None,
+                &LanePatternBuilder::default().build(),
+            )
+            .unwrap();
+        let mut camera = Camera::new(vec3(900.0, 900.0, 95.0), 1600.0, 900.0);
+        camera.yaw = Radians(0.0);
+        camera.pitch = Radians(0.28);
+        camera.dist = 35.0;
+        camera.update();
+
+        assert!(visible_roads(&camera, &map, road_geometry_bounds(&map)).contains(&bridge));
     }
 
     #[test]
@@ -375,34 +486,60 @@ mod tests {
         *uiw.camera_mut() = OrbitCamera::from_camera(camera);
 
         let mut timings = Vec::new();
+        let mut cold_peak = 0.0_f64;
         for ticks in [0, 300, 300] {
             ctx.run_ticks(ticks);
             super::super::draw(&ctx.sim, &uiw);
+            let sample = || {
+                TRAFFIC
+                    .with_borrow_mut(|traffic| traffic.sampler.as_mut().unwrap().sample(&ctx.sim))
+            };
             let roads = TRAFFIC.with_borrow(|traffic| traffic.visible.clone());
-            let observed = traffic_metrics::sample(&ctx.sim, roads.iter().copied());
+            let observed = sample();
             assert!(!observed.is_empty());
+            let start = Instant::now();
+            let mut rebuilt = RoadSampler::new(&ctx.sim.map(), roads.iter().copied());
+            let rebuilt = rebuilt.sample(&ctx.sim);
+            let rebuild_and_sample_ms = start.elapsed().as_secs_f64() * 1000.0;
+            cold_peak = cold_peak.max(rebuild_and_sample_ms);
+            assert_eq!(observed, rebuilt);
+            assert_eq!(
+                observed,
+                simulation::transportation::traffic_metrics::sample(
+                    &ctx.sim,
+                    roads.iter().copied()
+                )
+            );
             let vehicles: u32 = observed.values().map(|road| road.samples).sum();
             println!(
-                "tick {}, residents {}, visible roads {}, sampled vehicles {}",
+                "tick {}, residents {}, visible roads {}, sampled vehicles {}, rebuild and sample {:.3} ms",
                 ctx.sim.get_tick(),
                 ctx.sim.world().humans.len(),
                 roads.len(),
-                vehicles
+                vehicles,
+                rebuild_and_sample_ms
             );
-            for _ in 0..32 {
+            for _ in 0..128 {
                 let start = Instant::now();
-                let result = traffic_metrics::sample(&ctx.sim, roads.iter().copied());
+                let result = sample();
                 timings.push(start.elapsed().as_secs_f64() * 1000.0);
                 std::hint::black_box(&result);
             }
         }
         timings.sort_unstable_by(f64::total_cmp);
+        let peak = *timings.last().unwrap();
         println!(
-            "{} samples, median {:.3} ms, p95 {:.3} ms, peak {:.3} ms",
+            "{} cached samples, median {:.3} ms, p95 {:.3} ms, p99 {:.3} ms, peak {:.3} ms; rebuild and sample peak {:.3} ms",
             timings.len(),
             timings[timings.len() / 2],
             timings[(timings.len() * 95).div_ceil(100) - 1],
-            timings.last().unwrap()
+            timings[(timings.len() * 99).div_ceil(100) - 1],
+            peak,
+            cold_peak,
+        );
+        assert!(
+            peak.max(cold_peak) <= 2.0,
+            "sampler exceeded the 2 ms wall-clock budget"
         );
     }
 }

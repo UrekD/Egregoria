@@ -40,7 +40,7 @@ fn p4a_seed_controls_terrain_and_rng_deterministically() {
         seed: 1,
         ..options()
     };
-    let other = NewGameOptions { seed: 77, ..first };
+    let other = NewGameOptions { seed: 2, ..first };
     let sim = Simulation::new_game(&first).unwrap();
     let same = Simulation::new_game(&first).unwrap();
     let other = Simulation::new_game(&other).unwrap();
@@ -50,11 +50,25 @@ fn p4a_seed_controls_terrain_and_rng_deterministically() {
     let map = sim.map();
     let other_map = other.map();
     let (width, height) = map.environment.size();
-    let chunk_width = crate::map::TerrainChunkID::SIZE_F32;
-    assert!((0..height).any(|y| (0..width).any(|x| {
-        let point = vec2(f32::from(x), f32::from(y)) * chunk_width;
-        map.environment.true_height(point) != other_map.environment.true_height(point)
-    })));
+    let samples_per_chunk = crate::map::TerrainChunkID::SIZE as usize / 64;
+    let mut different = 0;
+    let (width, height) = (
+        usize::from(width) * samples_per_chunk,
+        usize::from(height) * samples_per_chunk,
+    );
+    for y in 0..height {
+        for x in 0..width {
+            let point = vec2(x as f32, y as f32) * 64.0;
+            let a = map.environment.true_height(point).unwrap();
+            let b = other_map.environment.true_height(point).unwrap();
+            different += usize::from((a - b).abs() > 0.5);
+        }
+    }
+    assert!(
+        different >= width * height / 4,
+        "seeds 1 and 2 differed by over 0.5 m at {different}/{} grid points",
+        width * height,
+    );
     assert_eq!(
         sim.write::<RandProvider>().next_u64(),
         RandProvider::new(first.seed).next_u64(),

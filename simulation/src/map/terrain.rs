@@ -12,6 +12,7 @@ use prototypes::{Tick, DELTA};
 
 use crate::map::procgen::heightmap;
 use crate::map::procgen::heightmap::tree_density;
+use crate::utils::rand_provider::RandProvider;
 use crate::{MapPreset, NewGameOptions, SimulationOptions};
 
 pub type TerrainChunkID = common::ChunkID_512;
@@ -82,7 +83,13 @@ impl Environment {
             heightmap: Heightmap::new(w, h),
             trees: Grid::new(TREE_GRID_SIZE as i32),
         };
-        let noise_offset = Vec2::splat((seed % 4096) as f32 * 1.37);
+        // Bound the shift in noise space to keep enough precision for nearby cells.
+        let noise_offset = if seed == 0 {
+            Vec2::ZERO
+        } else {
+            let mut rng = RandProvider::new(seed);
+            64.0 * vec2(rng.next_f32(), rng.next_f32())
+        };
         for y in 0..h {
             let chunks: Vec<_> = (0..w)
                 .into_par_iter()
