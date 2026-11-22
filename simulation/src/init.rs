@@ -33,7 +33,7 @@ use crate::souls::events::{events_update, Fires};
 use crate::souls::freight_station::freight_station_system;
 use crate::souls::goods_company::company_system;
 use crate::souls::happiness::{happiness_update, Happiness};
-use crate::souls::household::household_update;
+use crate::souls::household::{household_update, HouseholdClaims};
 use crate::souls::human::update_decision_system;
 use crate::transportation::pedestrian_decision_system;
 use crate::transportation::road::{vehicle_decision_system, vehicle_state_update_system};
@@ -211,6 +211,12 @@ fn register_systems_and_resources() {
     register_resource_noserialize::<crate::economy::WalkingComponents>();
     register_resource_noserialize::<RoadThroughput>();
     register_resource_noserialize::<crate::souls::growth::GrowthCache>();
+    // The registry is populated once before any simulation uses it.
+    unsafe {
+        (*std::ptr::addr_of_mut!(INIT_FUNCS)).push(InitFunc {
+            f: Box::new(|sim| sim.insert(HouseholdClaims::from_world(sim.world()))),
+        });
+    }
     register_resource_noinit::<SimulationOptions, Bincode>("simoptions");
 
     register_resource_default::<ElectricityFlow, Bincode>("electricity_flow");

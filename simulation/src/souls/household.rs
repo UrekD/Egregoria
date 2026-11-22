@@ -85,10 +85,7 @@ pub(crate) struct HouseholdClaims {
 }
 
 impl HouseholdClaims {
-    pub(crate) fn ensure(world: &World, resources: &mut Resources) {
-        if resources.try_read::<Self>().is_ok() {
-            return;
-        }
+    pub(crate) fn from_world(world: &World) -> Self {
         let mut claims = Self::default();
         for (id, human) in world.humans.iter() {
             if let Some(basket) = &human.household.reservation {
@@ -98,7 +95,7 @@ impl HouseholdClaims {
                 claims.parks.entry(park).or_default().insert(id);
             }
         }
-        resources.insert(claims);
+        claims
     }
 }
 
@@ -896,6 +893,10 @@ mod tests {
         test.tick_fast();
         assert!(test.g.get(id).unwrap().household.basket.is_some());
         let mut restored: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        assert_eq!(
+            restored.read::<super::HouseholdClaims>().baskets,
+            test.g.read::<super::HouseholdClaims>().baskets,
+        );
         let mut schedule = Simulation::schedule();
         for _ in 0..3 * TICKS_PER_HOUR {
             test.tick_fast();
@@ -965,6 +966,11 @@ mod tests {
             }
         }
         assert_eq!(test.g.get(id).unwrap().location, Location::Building(park));
+        let restored: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        assert_eq!(
+            restored.read::<super::HouseholdClaims>().parks,
+            test.g.read::<super::HouseholdClaims>().parks,
+        );
         for _ in 0..100 {
             test.tick_fast();
         }

@@ -442,7 +442,6 @@ impl HumanEnt {
 
 pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
     profiling::scope!("souls::update_decision_system");
-    HouseholdClaims::ensure(world, resources);
     let time = &*resources.read::<GameTime>();
     let infos = &*resources.read::<BuildingInfos>();
     let map = &*resources.read::<Map>();

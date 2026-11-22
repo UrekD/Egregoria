@@ -1101,7 +1101,8 @@ impl SimulationDeser {
     fn into_sim(self) -> Result<Simulation, String> {
         let t = Instant::now();
         let mut sim = Simulation {
-            world: World::default(),
+            // Resource initializers can rebuild derived indexes from the loaded world.
+            world: self.world,
             resources: Resources::default(),
         };
 
@@ -1110,8 +1111,6 @@ impl SimulationDeser {
                 (s.f)(&mut sim);
             }
         }
-
-        sim.world = self.world;
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {

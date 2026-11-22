@@ -501,14 +501,28 @@ fn test_world_survives_serde() {
     }
 }
 
+#[track_caller]
+fn assert_save_load_equality(original: &Simulation, decoded: &Simulation) {
+    use crate::souls::household::HouseholdClaims;
+
+    assert_eq!(original.hashes(), decoded.hashes());
+    assert!(
+        original.is_equal(decoded),
+        "resource count before/after load {}/{} and HouseholdClaims present {}/{}",
+        original.resources.iter().count(),
+        decoded.resources.iter().count(),
+        original.resources.contains::<HouseholdClaims>(),
+        decoded.resources.contains::<HouseholdClaims>(),
+    );
+}
+
 #[test]
 fn pf_d_market_cache_preserves_save_load_equality() {
     let mut ctx = TestCtx::new_fast();
     ctx.tick_fast();
     let bytes = Bincode::encode(&ctx.g).unwrap();
     let decoded: Simulation = Bincode::decode(&bytes).unwrap();
-    assert_eq!(ctx.g.hashes(), decoded.hashes());
-    assert!(ctx.g.is_equal(&decoded));
+    assert_save_load_equality(&ctx.g, &decoded);
 }
 
 #[test]
@@ -533,8 +547,7 @@ fn pf_d_fix_zoned_growth_preserves_save_load_equality() {
     assert!(ctx.g.read::<crate::economy::ZoneDemand>().has_sample());
 
     let decoded: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
-    assert_eq!(ctx.g.hashes(), decoded.hashes());
-    assert!(ctx.g.is_equal(&decoded));
+    assert_save_load_equality(&ctx.g, &decoded);
 }
 
 #[test]

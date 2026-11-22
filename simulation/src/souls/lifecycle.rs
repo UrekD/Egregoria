@@ -418,7 +418,6 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<Compa
     let (world, resources) = sim.world_res();
     let seller = !matches!(soul, SoulID::Human(_));
     if seller {
-        HouseholdClaims::ensure(world, resources);
         let shoppers = resources.write::<HouseholdClaims>().baskets.remove(&soul);
         if let Some(shoppers) = shoppers {
             let mut parking = resources.write::<ParkingManagement>();
