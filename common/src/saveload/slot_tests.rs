@@ -48,6 +48,7 @@ fn meta(saved_at_unix: u64) -> SlotMeta {
         money_cents: -678,
         saved_at_unix,
         revision: None,
+        camera: None,
     }
 }
 

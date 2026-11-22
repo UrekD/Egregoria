@@ -1,10 +1,10 @@
 #![allow(clippy::redundant_closure_call)]
 
-use common::saveload::Encoder;
+use common::saveload::{Encoder, SlotCamera};
 use engine::{Context, Tesselator};
 use geom::{Camera, Plane, Radians, Vec2, Vec3, AABB};
-use simulation::map::Map;
 use simulation::map::pathfinding_crate::num_traits::Pow;
+use simulation::map::{BuildingKind, Map};
 
 use crate::gui::windows::settings::Settings;
 use crate::inputmap::{InputAction, InputMap};
@@ -79,12 +79,36 @@ impl OrbitCamera {
         Self::from_camera(camera)
     }
 
-    pub(crate) fn reset_for_world(&mut self, map: &Map) {
-        let mut camera = Self::default_camera(self.camera.viewport_w, self.camera.viewport_h);
+    pub(crate) fn slot_camera(&self) -> SlotCamera {
+        SlotCamera {
+            position: self.camera.pos.into(),
+            yaw: self.camera.yaw.0,
+            pitch: self.camera.pitch.0,
+            distance: self.camera.dist,
+        }
+    }
+
+    pub(crate) fn reset_for_world(&mut self, map: &Map, saved: Option<SlotCamera>) {
         let bounds = map.environment.bounds();
-        if !bounds.contains(camera.pos.xy()) {
+        let valid = saved.filter(|saved| {
+            let pos = Vec3::from(saved.position);
+            pos.is_finite()
+                && bounds.contains(pos.xy())
+                && saved.yaw.is_finite()
+                && (0.0..Radians::HALFPI.0).contains(&saved.pitch)
+                && (5.0..=self.maxdist).contains(&saved.distance)
+        });
+        let default_position = || {
             let center = bounds.center();
-            camera.pos = center.z(map.environment.height(center).unwrap_or_default());
+            starter_view(map)
+                .unwrap_or_else(|| center.z(map.environment.height(center).unwrap_or_default()))
+        };
+        let position = valid.map_or_else(default_position, |saved| Vec3::from(saved.position));
+        let mut camera = Camera::new(position, self.camera.viewport_w, self.camera.viewport_h);
+        if let Some(saved) = valid {
+            camera.yaw = Radians(saved.yaw);
+            camera.pitch = Radians(saved.pitch);
+            camera.dist = saved.distance;
         }
         camera.update();
         *self = Self::from_camera(camera);
@@ -243,5 +267,77 @@ impl OrbitCamera {
         // update camera
         self.update(ctx);
         self.save();
+    }
+}
+
+fn starter_view(map: &Map) -> Option<Vec3> {
+    let station = map
+        .buildings()
+        .values()
+        .find(|building| matches!(building.kind, BuildingKind::RailFreightStation(_)))?;
+    let center = station.obb.center();
+    // Leave room between the station and the center of the opening view for construction.
+    let preferred = center + Vec2::X * 256.0;
+    (-12..=12)
+        .flat_map(|x| (-12..=12).map(move |y| (x, y)))
+        .filter(|&(x, y)| x * x + y * y <= 12 * 12)
+        .filter_map(|(x, y)| {
+            let point = center + Vec2::new(x as f32, y as f32) * 64.0;
+            // Procedural land is at zero elevation and underwater terrain is negative.
+            let height = map.environment.true_height(point).filter(|&z| z >= 0.0)?;
+            // A patch of land gives the player more usable space than a narrow shoreline.
+            [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y]
+                .into_iter()
+                .all(|dir| {
+                    map.environment
+                        .true_height(point + dir * 32.0)
+                        .is_some_and(|z| z >= 0.0)
+                })
+                .then_some(point.z(height))
+        })
+        .min_by(|a, b| {
+            a.xy()
+                .distance2(preferred)
+                .total_cmp(&b.xy().distance2(preferred))
+        })
+}
+
+#[cfg(test)]
+mod af2_tests {
+    use super::*;
+    use simulation::{NewGameOptions, Simulation};
+
+    #[test]
+    fn af2_new_game_frames_land_near_the_starter_station() {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let sim = Simulation::new_game(&NewGameOptions {
+            seed: 5831623300802791913,
+            ..NewGameOptions::default()
+        })
+        .unwrap();
+        let map = sim.map();
+        let station = map
+            .buildings()
+            .values()
+            .find(|building| matches!(building.kind, BuildingKind::RailFreightStation(_)))
+            .unwrap();
+        let mut orbit = OrbitCamera::from_camera(Camera::new(Vec3::ZERO, 1280.0, 720.0));
+        orbit.reset_for_world(&map, None);
+
+        let point = orbit.camera.pos.xy();
+        let center = station.obb.center();
+        assert!(
+            point.distance(center) <= 800.0,
+            "{point:?}, station {center:?}"
+        );
+        assert!(
+            map.environment.true_height(point).unwrap() >= 0.0,
+            "{point:?}"
+        );
+        let (screen, depth) = orbit.camera.project(station.obb.center().z(station.height));
+        assert!(
+            depth > 0.0 && (0.0..1280.0).contains(&screen.x) && (0.0..720.0).contains(&screen.y)
+        );
     }
 }

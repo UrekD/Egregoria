@@ -7,7 +7,7 @@ use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::time::{Duration, Instant};
 
-use common::saveload::{self, SlotEntry, SlotId, SnapshotRevision};
+use common::saveload::{self, SlotCamera, SlotEntry, SlotId, SnapshotRevision};
 use serde::Deserialize;
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::CommandOutcomes;
@@ -53,10 +53,24 @@ pub enum SessionScreen {
 
 pub enum WorldReplacement {
     Snapshot(Simulation, SlotId),
+    SnapshotWithCamera(Simulation, SlotId, SlotCamera),
     NewGame(Simulation, SlotId),
     ReplayDebug(Simulation, SimulationReplayLoader),
     #[cfg(feature = "multiplayer")]
     Network(Simulation),
+}
+
+impl WorldReplacement {
+    pub(crate) fn from_slot(sim: Simulation, entry: &SlotEntry) -> Self {
+        match slot_camera(entry) {
+            Some(camera) => Self::SnapshotWithCamera(sim, entry.id.clone(), camera),
+            None => Self::Snapshot(sim, entry.id.clone()),
+        }
+    }
+}
+
+fn slot_camera(entry: &SlotEntry) -> Option<SlotCamera> {
+    entry.meta.as_ref().and_then(|meta| meta.camera)
 }
 
 #[derive(Default)]
@@ -247,6 +261,12 @@ pub(crate) fn continue_city(uiw: &UiWorld, sim: Option<&Simulation>, entry: Slot
     start_snapshot_job(uiw, entry, resume_dormant);
 }
 
+pub(crate) fn restore_dormant_camera(uiw: &UiWorld, sim: &Simulation, entry: &SlotEntry) {
+    if let Some(camera) = slot_camera(entry) {
+        reset_world_camera(uiw, sim, Some(camera));
+    }
+}
+
 pub(crate) fn display_name(entry: &SlotEntry) -> &str {
     entry.meta.as_ref().map_or_else(
         || {
@@ -424,7 +444,7 @@ fn start_snapshot_job(uiw: &UiWorld, entry: SlotEntry, resume_dormant: bool) {
         let name = display_name(&entry).to_owned();
         let simulation = Simulation::load_listed_snapshot(root, &entry)?;
         Ok(WorldJobOutcome::Replace(PreparedWorld {
-            replacement: WorldReplacement::Snapshot(simulation, entry.id),
+            replacement: WorldReplacement::from_slot(simulation, &entry),
             name,
         }))
     });
@@ -830,12 +850,15 @@ pub fn apply_world_replacement(
     replacement: WorldReplacement,
     reset_runtime: impl FnOnce(&Simulation),
 ) {
-    let (next, slot, replay, is_saved) = match replacement {
-        WorldReplacement::Snapshot(sim, slot) => (sim, Some(slot), None, true),
-        WorldReplacement::NewGame(sim, slot) => (sim, Some(slot), None, false),
-        WorldReplacement::ReplayDebug(sim, replay) => (sim, None, Some(replay), false),
+    let (next, slot, replay, is_saved, camera) = match replacement {
+        WorldReplacement::Snapshot(sim, slot) => (sim, Some(slot), None, true, None),
+        WorldReplacement::SnapshotWithCamera(sim, slot, camera) => {
+            (sim, Some(slot), None, true, Some(camera))
+        }
+        WorldReplacement::NewGame(sim, slot) => (sim, Some(slot), None, false, None),
+        WorldReplacement::ReplayDebug(sim, replay) => (sim, None, Some(replay), false, None),
         #[cfg(feature = "multiplayer")]
-        WorldReplacement::Network(sim) => (sim, None, None, false),
+        WorldReplacement::Network(sim) => (sim, None, None, false, None),
     };
 
     let generation = uiw.read::<SessionState>().generation + 1;
@@ -868,14 +891,18 @@ pub fn apply_world_replacement(
 
     uiw.write::<GuiState>().last_save = Instant::now();
     uiw.write::<InputMap>().reset_world_input();
-    uiw.camera_mut().reset_for_world(&sim.map());
-    *uiw.write::<geom::Camera>() = uiw.camera().camera;
+    reset_world_camera(uiw, sim, camera);
 
     let hooks = uiw.read::<WorldResetHooks>().0.clone();
     for reset in hooks {
         reset(uiw, generation);
     }
     reset_runtime(sim);
+}
+
+fn reset_world_camera(uiw: &UiWorld, sim: &Simulation, camera: Option<SlotCamera>) {
+    uiw.camera_mut().reset_for_world(&sim.map(), camera);
+    *uiw.write::<geom::Camera>() = uiw.camera().camera;
 }
 
 #[cfg(test)]
@@ -1169,6 +1196,62 @@ mod p4_fix_ac_tests {
         uiw.insert(camera);
         uiw.insert(OrbitCamera::from_camera(camera));
         uiw
+    }
+
+    #[test]
+    fn af2_loading_a_slot_restores_its_camera_pose() {
+        let uiw = ui_with_camera();
+        let root = std::env::temp_dir().join(format!("af2-slot-camera-{}", random_seed()));
+        std::fs::create_dir(&root).unwrap();
+        let mut sim = Simulation::new_with_options(simulation::SimulationOptions {
+            terrain_size: 8,
+            save_replay: false,
+            ..simulation::SimulationOptions::LEGACY
+        });
+        let poses = [
+            SlotCamera {
+                position: [3000.0, 3100.0, 0.0],
+                yaw: -0.25,
+                pitch: 0.75,
+                distance: 450.0,
+            },
+            SlotCamera {
+                position: [3300.0, 3050.0, 0.0],
+                yaw: 0.3,
+                pitch: 0.6,
+                distance: 650.0,
+            },
+        ];
+        for (index, pose) in poses.into_iter().enumerate() {
+            sim.encode_slot(SnapshotRevision::new(index as u128 + 1))
+                .unwrap()
+                .with_camera(pose)
+                .publish(&root, &SlotId::autosave(index as u8))
+                .unwrap();
+        }
+
+        let catalog = discover_slots(&root).unwrap();
+        for (index, pose) in poses.into_iter().enumerate().rev() {
+            let slot = SlotId::autosave(index as u8);
+            let (entry, _) = catalog.iter().find(|(entry, _)| entry.id == slot).unwrap();
+            let loaded = Simulation::load_listed_snapshot(&root, entry).unwrap();
+            apply_world_replacement(
+                &uiw,
+                &mut sim,
+                &mut SeqSchedule::default(),
+                WorldReplacement::from_slot(loaded, entry),
+                |_| {},
+            );
+            let camera = uiw.camera();
+            assert_eq!(camera.slot_camera(), pose);
+            assert_eq!(camera.targetpos, Vec3::from(pose.position));
+            assert_eq!(camera.targetdist, pose.distance);
+            assert_eq!(
+                (camera.camera.viewport_w, camera.camera.viewport_h),
+                (1280.0, 720.0)
+            );
+        }
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

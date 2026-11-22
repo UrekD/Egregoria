@@ -149,7 +149,9 @@ fn p4a_starter_layout_is_connected_and_affordable_at_both_size_limits() {
                     );
                 }
                 let balance = sim.read::<Government>().money;
-                let charges = sim.read::<Budget>().total(BudgetCategory::Construction);
+                let charges = sim
+                    .read::<Budget>()
+                    .total(BudgetCategory::StarterInfrastructure);
                 assert!(charges < 0 && balance > Money::ZERO, "{opts:?}");
                 assert_eq!(
                     i128::from(balance.inner()),

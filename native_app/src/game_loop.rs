@@ -9,6 +9,7 @@ use common::history::History;
 use common::saveload::{self, SlotId};
 use engine::{Context, FrameContext, InputContext, MeshBuilder};
 use geom::{vec2, vec3, Camera, LinearColor, AABB};
+use simulation::economy::Government;
 use simulation::Simulation;
 
 use crate::audio::GameAudio;
@@ -323,7 +324,8 @@ impl engine::framework::State for State {
             } else {
                 render_newgui(&self.uiw, &sim);
             }
-            session::render_status(&self.uiw);
+            // The root does not position relative children. A full-width row anchors the notice.
+            yakui::widgets::List::row().show(|| session::render_status(&self.uiw));
         }
         goryak::render_tooltip();
     }
@@ -512,14 +514,27 @@ impl State {
             Ok(WorldJobOutcome::Replace(world)) if crate::network::is_singleplayer(&self.uiw) => {
                 drop(io);
                 self.replace_world(ctx, world.replacement);
-                let mut state = self.uiw.write::<SessionState>();
-                state.city_name = world.name;
-                if let WorldJobKind::Snapshot(entry) = job.kind {
-                    state.remember_loaded_snapshot(entry);
+                self.uiw.write::<SessionState>().city_name = world.name;
+                match job.kind {
+                    WorldJobKind::Snapshot(entry) => self
+                        .uiw
+                        .write::<SessionState>()
+                        .remember_loaded_snapshot(entry),
+                    WorldJobKind::NewGame => {
+                        let treasury = self.sim.read().unwrap().read::<Government>().money;
+                        session::notify(
+                            &self.uiw,
+                            format!("Opening balance after starter infrastructure is {treasury}."),
+                        );
+                    }
+                    WorldJobKind::Replay => {}
                 }
             }
             Ok(WorldJobOutcome::ResumeDormant) if crate::network::is_singleplayer(&self.uiw) => {
                 drop(io);
+                if let WorldJobKind::Snapshot(entry) = job.kind {
+                    session::restore_dormant_camera(&self.uiw, &self.sim.read().unwrap(), &entry);
+                }
                 session::set_screen(&self.uiw, SessionScreen::Playing);
             }
             Ok(_) => {
@@ -632,6 +647,7 @@ impl State {
         let id = permit.id;
         let slot = request.slot.clone();
         let name = request.name.clone();
+        let camera = self.uiw.camera().slot_camera();
         let revision = session::snapshot_revision();
         io.save_result = Some(SaveInFlight {
             id,
@@ -653,7 +669,7 @@ impl State {
                     .map_err(|error| error.to_string())?;
                 Ok((
                     CityProgress::capture(&sim),
-                    snapshot.with_display_name(name),
+                    snapshot.with_display_name(name).with_camera(camera),
                 ))
             };
             let saved = encode().and_then(|(progress, snapshot)| {
@@ -1069,7 +1085,7 @@ fn startup_world() -> Result<StartupWorld, String> {
             match Simulation::load_listed_snapshot(root, entry) {
                 Ok(sim) => {
                     let world = PreparedWorld {
-                        replacement: WorldReplacement::Snapshot(sim, entry.id.clone()),
+                        replacement: WorldReplacement::from_slot(sim, entry),
                         name: session::display_name(entry).to_owned(),
                     };
                     let loaded_entry = Some(entry.clone());

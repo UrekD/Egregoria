@@ -148,7 +148,16 @@ impl SnapshotRevision {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Orbit pose stored with a city snapshot. The viewport is local to the player.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct SlotCamera {
+    pub position: [f32; 3],
+    pub yaw: f32,
+    pub pitch: f32,
+    pub distance: f32,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SlotMeta {
     pub display_name: String,
     pub game_tick: u64,
@@ -157,6 +166,35 @@ pub struct SlotMeta {
     pub saved_at_unix: u64,
     #[serde(default)]
     pub revision: Option<u128>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub camera: Option<SlotCamera>,
+}
+
+#[cfg(test)]
+#[test]
+fn af2_slot_camera_metadata_round_trips() {
+    let mut sidecar = serde_json::json!({
+        "display_name": "Port",
+        "game_tick": 8,
+        "population": 0,
+        "money_cents": 20,
+        "saved_at_unix": 42
+    });
+    let legacy: SlotMeta = serde_json::from_value(sidecar.clone()).unwrap();
+    assert!(serde_json::to_value(legacy)
+        .unwrap()
+        .get("camera")
+        .is_none());
+
+    let camera = serde_json::json!({
+        "position": [42.0, 150.0, 10.0],
+        "yaw": -0.25,
+        "pitch": 0.75,
+        "distance": 410.0
+    });
+    sidecar["camera"] = camera.clone();
+    let meta: SlotMeta = serde_json::from_value(sidecar).unwrap();
+    assert_eq!(serde_json::to_value(meta).unwrap()["camera"], camera);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -167,7 +205,7 @@ pub enum SnapshotKind {
     Obstructed,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct SlotEntry {
     pub id: SlotId,
     pub meta: Option<SlotMeta>,

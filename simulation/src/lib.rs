@@ -10,11 +10,12 @@ use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
 use crate::world_command::{CommandOutcomes, WorldCommand};
 use common::saveload::{
-    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry, SlotId, SlotMeta,
-    SnapshotKind, SnapshotRevision,
+    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotCamera, SlotEntry, SlotId,
+    SlotMeta, SnapshotKind, SnapshotRevision,
 };
 use common::FastMap;
 use derive_more::{From, TryInto};
+use economy::BudgetCategory;
 use geom::Vec3;
 use prototypes::{prototype, ColorsPrototype, ColorsPrototypeID, GameTime, Tick};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -319,7 +320,11 @@ impl Simulation {
         WorldCommand::bootstrap(&mut sim, options).map_err(|reason| {
             io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {reason:?}"))
         })?;
-        sim.apply_commands(replay.commands(1..bootstrap_end));
+        sim.apply_command_batch(
+            replay.commands(1..bootstrap_end),
+            false,
+            BudgetCategory::StarterInfrastructure,
+        );
         if replay.has_timeline() {
             sim.record_constructor_end();
         }
@@ -354,7 +359,11 @@ impl Simulation {
                 }
             }
         }
-        sim.apply_commands(start_commands.iter().map(|(_, cmd)| cmd));
+        sim.apply_command_batch(
+            start_commands.iter().map(|(_, cmd)| cmd),
+            false,
+            BudgetCategory::StarterInfrastructure,
+        );
         sim.record_constructor_end();
 
         sim
@@ -410,7 +419,7 @@ impl Simulation {
         // so that instant commands work on single player but the game is still deterministic
         {
             profiling::scope!("applying commands");
-            self.apply_command_batch(commands, true);
+            self.apply_command_batch(commands, true, BudgetCategory::Construction);
         }
 
         {
@@ -427,13 +436,14 @@ impl Simulation {
 
     /// Applies a command batch without advancing the simulation clock.
     pub fn apply_commands<'a>(&mut self, commands: impl IntoIterator<Item = &'a WorldCommand>) {
-        self.apply_command_batch(commands, false);
+        self.apply_command_batch(commands, false, BudgetCategory::Construction);
     }
 
     fn apply_command_batch<'a>(
         &mut self,
         commands: impl IntoIterator<Item = &'a WorldCommand>,
         steps_systems: bool,
+        construction: BudgetCategory,
     ) {
         let mut commands = commands.into_iter().peekable();
         if commands.peek().is_none() {
@@ -445,7 +455,7 @@ impl Simulation {
         self.write::<CommandOutcomes>().begin_batch();
         for (index, command) in commands.enumerate() {
             let before = self.read::<CommandOutcomes>().last.len();
-            command.apply_in_batch(self);
+            command.apply_in_batch(self, construction);
             utils::scheduler::drain_commands(self);
             let mut outcomes = self.write::<CommandOutcomes>();
             if outcomes.last.len() == before {
@@ -632,6 +642,7 @@ impl Simulation {
             snapshot,
             replay,
             display_name: None,
+            camera: None,
             revision,
             game_tick: self.get_tick(),
             population: self.world.humans.len().try_into().unwrap_or(u32::MAX),
@@ -869,6 +880,7 @@ pub struct EncodedSlot {
     snapshot: Vec<u8>,
     replay: Result<Option<Vec<u8>>, AtomicWriteError>,
     display_name: Option<String>,
+    camera: Option<SlotCamera>,
     revision: SnapshotRevision,
     game_tick: u64,
     population: u32,
@@ -878,6 +890,11 @@ pub struct EncodedSlot {
 impl EncodedSlot {
     pub fn with_display_name(mut self, display_name: String) -> Self {
         self.display_name = Some(display_name);
+        self
+    }
+
+    pub fn with_camera(mut self, camera: SlotCamera) -> Self {
+        self.camera = Some(camera);
         self
     }
 
@@ -901,6 +918,7 @@ impl EncodedSlot {
                 .unwrap_or_default()
                 .as_secs(),
             revision: Some(self.revision.get()),
+            camera: self.camera,
         };
         let meta = saveload::write_slot_meta(root, id, &meta);
         match (replay, meta) {
@@ -1242,4 +1260,29 @@ mod p4_fix_ac_tests {
         assert!(Simulation::load_replay_from_slot(&root, &slot).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
+}
+
+#[cfg(test)]
+#[test]
+fn af2_opening_balance_matches_starter_infrastructure_ledger() {
+    use crate::economy::{Budget, BudgetCategory, Government};
+    use prototypes::Money;
+
+    drop(crate::tests::TestCtx::new());
+    let options = NewGameOptions {
+        preset: MapPreset::Flat,
+        starting_money_bucks: 150_000,
+        ..Default::default()
+    };
+    let city = Simulation::new_game(&options).unwrap();
+    let budget = city.read::<Budget>();
+    let treasury = city.read::<Government>().money;
+    let spent = i128::from(Money::new_bucks(i64::from(options.starting_money_bucks)).inner())
+        - i128::from(treasury.inner());
+    assert!(spent > 0);
+    assert_eq!(budget.total(BudgetCategory::Construction), 0);
+    assert_eq!(
+        budget.days()[&0].get(&BudgetCategory::StarterInfrastructure),
+        Some(&-spent)
+    );
 }

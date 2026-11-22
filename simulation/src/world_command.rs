@@ -312,7 +312,7 @@ impl WorldCommand {
         sim.apply_commands(std::iter::once(self));
     }
 
-    pub(crate) fn apply_in_batch(&self, sim: &mut Simulation) {
+    pub(crate) fn apply_in_batch(&self, sim: &mut Simulation, construction: BudgetCategory) {
         if matches!(self, Init(_)) {
             self.reject(sim, Rejection::UnexpectedInit);
             return;
@@ -321,7 +321,9 @@ impl WorldCommand {
         let is_transit = transit::is_command(self);
         if is_transit {
             // Record transit commands only after validation and application succeed.
-            if let Err(reason) = transit::validate(sim, self).and_then(|()| self.apply_one(sim)) {
+            if let Err(reason) =
+                transit::validate(sim, self).and_then(|()| self.apply_one(sim, construction))
+            {
                 self.reject(sim, reason);
                 return;
             }
@@ -339,15 +341,15 @@ impl WorldCommand {
 
         let result = match self {
             MapMakeMultipleConnections(projects, links) => {
-                self.apply_connections(sim, projects, links)
+                self.apply_connections(sim, projects, links, construction)
             }
             MapMakeConnection {
                 from,
                 to,
                 inter,
                 pat,
-            } => Self::apply_connection(sim, *from, *to, *inter, pat),
-            _ => self.apply_one(sim),
+            } => Self::apply_connection(sim, *from, *to, *inter, pat, construction),
+            _ => self.apply_one(sim, construction),
         };
         if let Err(reason) = result {
             self.reject(sim, reason);
@@ -536,21 +538,13 @@ impl WorldCommand {
             .ok_or(Rejection::CostOverflow)
     }
 
-    fn charge_construction(sim: &Simulation, cost: Money) {
+    fn charge_construction(sim: &Simulation, cost: Money, category: BudgetCategory) {
         if let Some(delta) = cost.inner().checked_neg() {
-            Budget::apply(
-                &sim.resources,
-                BudgetCategory::Construction,
-                Money::new_inner(delta),
-            );
+            Budget::apply(&sim.resources, category, Money::new_inner(delta));
         } else {
             // A refund of -i64::MIN fits when the balance is negative, but needs two Money deltas.
-            Budget::apply(&sim.resources, BudgetCategory::Construction, Money::MAX);
-            Budget::apply(
-                &sim.resources,
-                BudgetCategory::Construction,
-                Money::new_inner(1),
-            );
+            Budget::apply(&sim.resources, category, Money::MAX);
+            Budget::apply(&sim.resources, category, Money::new_inner(1));
         }
     }
 
@@ -560,6 +554,7 @@ impl WorldCommand {
         to: MapProject,
         inter: Option<Vec2>,
         pattern: &LanePattern,
+        construction: BudgetCategory,
     ) -> Result<(), Rejection> {
         let mut map = sim.map_mut();
         let from = map
@@ -574,7 +569,7 @@ impl WorldCommand {
         let cost =
             Self::affordable_cost(sim, Government::connection_cost(from.pos, to.pos, pattern))?;
         map.make_resolved_connection(from, to, inter, pattern);
-        Self::charge_construction(sim, cost);
+        Self::charge_construction(sim, cost, construction);
         Ok(())
     }
 
@@ -583,6 +578,7 @@ impl WorldCommand {
         sim: &mut Simulation,
         projects: &[MapProject],
         links: &[(usize, usize, Option<Vec2>, LanePattern)],
+        construction: BudgetCategory,
     ) -> Result<(), Rejection> {
         if links
             .iter()
@@ -640,7 +636,7 @@ impl WorldCommand {
                 });
                 junctions.insert(id);
             }
-            Self::charge_construction(sim, cost);
+            Self::charge_construction(sim, cost, construction);
         }
         // Keep junction IDs alive until every link that names them has been processed.
         for junction in junctions {
@@ -650,7 +646,11 @@ impl WorldCommand {
         Ok(())
     }
 
-    fn apply_one(&self, sim: &mut Simulation) -> Result<(), Rejection> {
+    fn apply_one(
+        &self,
+        sim: &mut Simulation,
+        construction: BudgetCategory,
+    ) -> Result<(), Rejection> {
         self.validate(&sim.map())?;
         let cost = Self::affordable_cost(sim, Government::checked_action_cost(self, sim))?;
 
@@ -785,7 +785,7 @@ impl WorldCommand {
                     .terraform(tick, kind, center, radius, amount, level, slope);
             }
         }
-        Self::charge_construction(sim, cost);
+        Self::charge_construction(sim, cost, construction);
         Ok(())
     }
 

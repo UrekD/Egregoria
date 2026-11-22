@@ -143,6 +143,33 @@ pub(crate) fn evict_residents(sim: &mut Simulation, building: BuildingID, door: 
     evict_from_homes(sim, &[(building, door)]);
 }
 
+pub(crate) fn abandon_orphaned_growables(sim: &mut Simulation, mut homes: Vec<(BuildingID, Vec3)>) {
+    if homes.is_empty() {
+        return;
+    }
+    {
+        let mut residences = sim.write::<Residences>();
+        homes.retain(|&(id, _)| {
+            let hours = &mut residences.checks.entry(id).or_default().abandoned_hours;
+            if hours.is_some() {
+                return false;
+            }
+            *hours = Some(0);
+            true
+        });
+    }
+    homes.sort_unstable_by_key(|&(id, _)| id);
+    evict_abandoned_homes(sim, &homes);
+}
+
+fn evict_abandoned_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
+    // Mark every home before looking for vacancies.
+    if !homes.is_empty() {
+        evict_from_homes(sim, homes);
+        lifecycle::clear_abandoned_home_references(sim, homes);
+    }
+}
+
 fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
     let displaced = {
         let mut infos = sim.write::<BuildingInfos>();
@@ -538,11 +565,7 @@ pub fn residence_update(sim: &mut Simulation) {
         }
     }
 
-    // All newly abandoned residences are marked before looking for vacancies.
-    if !abandon.is_empty() {
-        evict_from_homes(sim, &abandon);
-        lifecycle::clear_abandoned_home_references(sim, &abandon);
-    }
+    evict_abandoned_homes(sim, &abandon);
     for building in collapse {
         super::growth::remove_growable(sim, building);
     }

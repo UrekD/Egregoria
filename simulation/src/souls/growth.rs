@@ -45,20 +45,24 @@ pub fn growth_update(sim: &mut Simulation) {
     }
     profiling::scope!("souls::growth_pass");
 
-    let mut orphaned = {
+    let mut orphaned_companies = Vec::new();
+    let mut orphaned_homes = Vec::new();
+    {
         let map = sim.map();
-        map.buildings()
-            .iter()
-            .filter_map(|(id, building)| {
-                (building.is_orphaned()
-                    && matches!(building.kind, BuildingKind::GoodsCompany(_))
-                    && map.lot_origin(id).is_some())
-                .then_some(id)
-            })
-            .collect::<Vec<_>>()
-    };
-    orphaned.sort_unstable();
-    for id in orphaned {
+        for (id, building) in map.buildings().iter() {
+            if !building.is_orphaned() || map.lot_origin(id).is_none() {
+                continue;
+            }
+            match building.kind {
+                BuildingKind::House => orphaned_homes.push((id, building.door_pos)),
+                BuildingKind::GoodsCompany(_) => orphaned_companies.push(id),
+                _ => {}
+            }
+        }
+    }
+    residence::abandon_orphaned_growables(sim, orphaned_homes);
+    orphaned_companies.sort_unstable();
+    for id in orphaned_companies {
         remove_growable(sim, id);
     }
 
@@ -650,6 +654,35 @@ mod tests {
             .by_building
             .contains_key(&house));
         assert!(test.g.read::<BuildingInfos>().get(house).is_none());
+    }
+
+    #[test]
+    fn af2_orphaned_growable_house_is_abandoned_on_the_next_growth_pass() {
+        let mut test = street();
+        let lot = front_lot(&test.g);
+        let home = grow_house(&mut test.g, lot);
+        let road = test.g.map().get(home).unwrap().connected_road.unwrap();
+        let resident = crate::souls::human::spawn_human(&mut test.g, home).unwrap();
+        assert!(test.g.get(resident).is_some());
+        let other = test.build_house_near(vec2(275.0, 125.0));
+        assert_eq!(test.g.map().get(other).unwrap().connected_road, Some(road));
+
+        test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL - 1;
+        test.apply(&[WorldCommand::MapRemoveRoad(road)]);
+        assert!(test.g.map().get(home).unwrap().is_orphaned());
+        assert!(!test.g.read::<residence::Residences>().is_abandoned(home));
+        assert!(!residence::due(GROWTH_INTERVAL));
+
+        test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;
+        growth_update(&mut test.g);
+        crate::utils::scheduler::drain_commands(&mut test.g);
+
+        let residences = test.g.read::<residence::Residences>();
+        assert!(residences.is_abandoned(home));
+        assert!(!residences.is_abandoned(other));
+        assert!(test.g.get(resident).is_none());
+        let infos = test.g.read::<BuildingInfos>();
+        assert!(infos.get(home).unwrap().residents.is_empty());
     }
 
     #[test]

@@ -40,6 +40,10 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
             mincolumn(5.0, || {
                 titlec(color, format!("Day {} ledger", day + 1));
                 for (category, name) in [
+                    (
+                        BudgetCategory::StarterInfrastructure,
+                        "Starter infrastructure",
+                    ),
                     (BudgetCategory::Construction, "Construction"),
                     (BudgetCategory::TradeImport, "Imports"),
                     (BudgetCategory::TradeExport, "Exports"),

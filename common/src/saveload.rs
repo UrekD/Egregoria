@@ -14,7 +14,7 @@ pub use atomic::{sweep_stale_tmp, write_atomic, AtomicWriteError};
 use atomic::{write_staged, Durability};
 pub use slots::{
     delete_slot, list_slots, list_slots_with_revisions, read_slot_meta, slot_paths,
-    write_slot_meta, SlotEntry, SlotId, SlotIdError, SlotMeta, SlotPaths, SnapshotKind,
+    write_slot_meta, SlotCamera, SlotEntry, SlotId, SlotIdError, SlotMeta, SlotPaths, SnapshotKind,
     SnapshotRevision,
 };
 

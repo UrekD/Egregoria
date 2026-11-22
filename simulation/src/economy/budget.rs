@@ -27,6 +27,7 @@ pub enum BudgetCategory {
     ServiceUpkeep,
     TransitFares,
     TransitUpkeep,
+    StarterInfrastructure,
 }
 
 #[derive(Default, Serialize, Deserialize)]
