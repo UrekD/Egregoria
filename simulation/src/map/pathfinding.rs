@@ -21,7 +21,7 @@ pub trait Pathfinder {
     fn authorized_lane(&self, kind: LaneKind) -> bool;
 }
 
-#[derive(Copy, Clone, Debug, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum PathKind {
     Pedestrian,
     Vehicle,

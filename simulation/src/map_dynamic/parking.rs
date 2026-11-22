@@ -1,3 +1,4 @@
+use super::itinerary::RerouteFailures;
 use crate::map::{Lane, LaneKind, Map, ParkingSpot, ParkingSpotID, ParkingSpots};
 use common::AccessCmp;
 use geom::Vec3;
@@ -14,6 +15,8 @@ pub struct SpotReservation(ParkingSpotID);
 #[derive(Default, Serialize, Deserialize)]
 pub struct ParkingManagement {
     reserved_spots: BTreeSet<ParkingSpotID>,
+    #[serde(skip)]
+    pub(crate) reroute_failures: RerouteFailures,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]

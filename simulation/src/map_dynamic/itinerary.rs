@@ -1,4 +1,5 @@
 use crate::map::{Map, PathKind, Pathfinder, Traversable, TraverseDirection, TraverseKind};
+use crate::map_dynamic::ParkingManagement;
 use crate::utils::resources::Resources;
 use crate::world::TrainID;
 use crate::World;
@@ -7,6 +8,7 @@ use egui_inspect::{Inspect, InspectArgs};
 use geom::{Follower, Polyline3Queue, Transform, Vec3};
 use prototypes::{GameTime, Tick, DELTA};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 #[derive(Inspect, Debug, Serialize, Deserialize)]
 pub struct ItineraryFollower {
@@ -51,6 +53,64 @@ pub struct Route {
 }
 
 pub const OBJECTIVE_OK_DIST: f32 = 3.0;
+const REROUTE_WAIT_TICKS: u16 = 200;
+const MAX_REROUTE_FAILURES: usize = 8_192;
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+struct RerouteKey {
+    kind: PathKind,
+    start: [u32; 3],
+    end: [u32; 3],
+}
+
+#[derive(Default)]
+pub(crate) struct RerouteFailures {
+    map_revision: (usize, u64),
+    entries: BTreeSet<RerouteKey>,
+}
+
+impl RerouteFailures {
+    fn sync_map(&mut self, map: &Map) {
+        let revision = (
+            std::ptr::from_ref(map).addr(),
+            map.walking_topology_generation,
+        );
+        if self.map_revision != revision {
+            self.entries.clear();
+            self.map_revision = revision;
+        }
+    }
+
+    fn route(
+        &mut self,
+        tick: Tick,
+        start: Vec3,
+        end: Vec3,
+        map: &Map,
+        kind: PathKind,
+    ) -> Option<Itinerary> {
+        // Exact endpoints preserve same-lane direction checks and changes in origin.
+        let key = RerouteKey {
+            kind,
+            start: <[f32; 3]>::from(start).map(f32::to_bits),
+            end: <[f32; 3]>::from(end).map(f32::to_bits),
+        };
+        if self.entries.contains(&key) {
+            return None;
+        }
+
+        // The tick seeds vehicle and rail search costs. Reachability for these
+        // endpoints depends on the lane geometry and turns in this map revision.
+        let result = Itinerary::route(tick, start, end, map, kind);
+        if result.is_none() {
+            if self.entries.len() == MAX_REROUTE_FAILURES {
+                self.entries.pop_first();
+            }
+            self.entries.insert(key);
+        }
+        result
+    }
+}
 
 impl Itinerary {
     pub const NONE: Self = Self {
@@ -99,6 +159,9 @@ impl Itinerary {
         map: &Map,
         pathkind: PathKind,
     ) -> Option<Itinerary> {
+        #[cfg(test)]
+        ROUTE_ATTEMPTS.with(|attempts| attempts.set(attempts.get() + 1));
+
         let start_lane = pathkind.nearest_lane(map, start)?;
         let end_lane = pathkind.nearest_lane(map, end)?;
 
@@ -199,11 +262,24 @@ impl Itinerary {
 
     pub fn update(
         &mut self,
-        mut position: Vec3,
-        mut dist_to_move: f32,
+        position: Vec3,
+        dist_to_move: f32,
         tick: Tick,
         time: u32,
         map: &Map,
+    ) -> Vec3 {
+        self.update_with_route(position, dist_to_move, time, map, |start, end, kind| {
+            Self::route(tick, start, end, map, kind)
+        })
+    }
+
+    fn update_with_route(
+        &mut self,
+        mut position: Vec3,
+        mut dist_to_move: f32,
+        time: u32,
+        map: &Map,
+        route: impl FnOnce(Vec3, Vec3, PathKind) -> Option<Self>,
     ) -> Vec3 {
         while let Some(p) = self.get_point() {
             let dist = position.distance(p);
@@ -245,8 +321,8 @@ impl Itinerary {
                 *wait_ticks -= 1;
                 return position;
             }
-            *self = unwrap_or!(Self::route(tick, position, dest, map, kind), {
-                *wait_ticks = 200;
+            *self = unwrap_or!(route(position, dest, kind), {
+                *wait_ticks = REROUTE_WAIT_TICKS;
                 return position;
             });
         }
@@ -416,11 +492,18 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("map_dynamic::itinerary_update");
     let time = &*resources.read::<GameTime>();
     let map = &*resources.read::<Map>();
-    let tick = resources.read::<GameTime>().tick;
+    let failures = &mut resources.write::<ParkingManagement>().reroute_failures;
+    failures.sync_map(map);
 
     world.query_it_trans_speed().for_each(
         |(it, trans, speed): (&mut Itinerary, &mut Transform, f32)| {
-            trans.pos = it.update(trans.pos, speed * DELTA, tick, time.seconds, map);
+            trans.pos = it.update_with_route(
+                trans.pos,
+                speed * DELTA,
+                time.seconds,
+                map,
+                |start, end, kind| failures.route(time.tick, start, end, map, kind),
+            );
         },
     );
 
@@ -435,4 +518,70 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         wagon.trans.pos = (pos + pos2) * 0.5;
         wagon.trans.dir = (dir + dir2).try_normalize().unwrap_or(dir);
     });
+}
+
+#[cfg(test)]
+thread_local! {
+    static ROUTE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::TestCtx;
+    use crate::transportation::spawn_truck_at_depot;
+    use crate::Simulation;
+    use common::saveload::{Bincode, Encoder};
+    use geom::vec3;
+
+    fn update_at(sim: &mut Simulation, tick: u64) {
+        *sim.write::<GameTime>() = GameTime::new(Tick(tick));
+        itinerary_update(&mut sim.world, &mut sim.resources);
+    }
+
+    #[test]
+    fn reroute_reuses_failure_until_road_edit() {
+        let mut sim = TestCtx::new();
+        let a = vec3(100.0, 100.0, 0.0);
+        let b = vec3(200.0, 100.0, 0.0);
+        let c = vec3(400.0, 100.0, 0.0);
+        let d = vec3(500.0, 100.0, 0.0);
+        sim.build_roads(&[a, b]);
+        sim.build_roads(&[c, d]);
+        let start = (a + b) * 0.5;
+        let end = (c + d) * 0.5;
+        let car = spawn_truck_at_depot(&mut sim.g, start);
+        sim.g.world.vehicles[car].it = Itinerary::wait_for_reroute(PathKind::Pedestrian, end);
+
+        let first = sim.g.get_tick() + 1;
+        ROUTE_ATTEMPTS.with(|attempts| attempts.set(0));
+        for tick in first..=first + 201 {
+            update_at(&mut sim.g, tick);
+        }
+        assert_eq!(
+            sim.g.world.vehicles[car].it.is_wait_for_reroute(),
+            Some(200)
+        );
+        assert_eq!(ROUTE_ATTEMPTS.with(|attempts| attempts.get()), 1);
+
+        let save = Bincode::encode(&sim.g).unwrap();
+        let mut resumed = TestCtx::new();
+        resumed.g = Bincode::decode(&save).unwrap();
+        assert_eq!(sim.g.hashes(), resumed.g.hashes());
+        for tick in first + 202..=first + 402 {
+            update_at(&mut sim.g, tick);
+            update_at(&mut resumed.g, tick);
+        }
+        assert_eq!(sim.g.hashes(), resumed.g.hashes());
+        assert_eq!(ROUTE_ATTEMPTS.with(|attempts| attempts.get()), 2);
+
+        for branch in [&mut sim, &mut resumed] {
+            branch.build_roads(&[b, c]);
+            for tick in first + 403..=first + 603 {
+                update_at(&mut branch.g, tick);
+            }
+            assert_eq!(branch.g.world.vehicles[car].it.end_pos(), Some(end));
+        }
+        assert_eq!(sim.g.hashes(), resumed.g.hashes());
+    }
 }
