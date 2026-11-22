@@ -1,4 +1,4 @@
-use super::services_basic::{reference_demand, run_verified, OPTIONS};
+use super::services_basic::{reference_metrics, run_verified, OPTIONS};
 use crate::{Scenario, ScenarioCtx};
 use simulation::SimulationOptions;
 
@@ -11,22 +11,22 @@ pub const SCENARIO: (Scenario, SimulationOptions) = (
 );
 
 fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
-    let (basic_tick, basic_demand) = reference_demand()?;
+    let basic = reference_metrics()?;
     let metrics = run_verified(ctx, false)?;
-    if metrics.tick != basic_tick
+    // Job availability can offset the demand penalty from missing services.
+    if metrics.tick != basic.tick
         || metrics.happiness > 45.0
-        || metrics.residential_demand >= basic_demand
+        || metrics.residential_happiness_driver >= basic.residential_happiness_driver
     {
         return Err(format!(
-            "expected happiness of at most 45 and R demand below basic ({basic_demand:.2} at tick {basic_tick}). Observed {} at tick {}",
-            metrics.summary(), metrics.tick,
+            "expected happiness of at most 45 and R demand's happiness contribution below basic ({:.2} at tick {}). Observed {} at tick {}",
+            basic.residential_happiness_driver, basic.tick, metrics.summary(), metrics.tick,
         ));
     }
     metrics.sample(ctx, SCENARIO.0.name);
-    ctx.samples
-        .last_mut()
-        .unwrap()
-        .extra
-        .insert("basic_residential_demand".into(), f64::from(basic_demand));
+    ctx.samples.last_mut().unwrap().extra.insert(
+        "basic_residential_demand".into(),
+        f64::from(basic.residential_demand),
+    );
     Ok(())
 }

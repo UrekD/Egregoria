@@ -29,7 +29,7 @@ data:extend {
     service("clinic", "Clinic", "health", "assets/sprites/hightech_store.png", 1800, 400, 8, 45),
     service("fire-station", "Fire Station", "fire", "bakery.glb", 1800, 400, 8, 45),
     service("police-station", "Police Station", "police", "assets/sprites/supermarket.png", 1800, 400, 8, 45),
-    service("school", "School", "school", "cinema.glb", 1500, 300, 6, 45),
+    service("school", "School", "school", "cinema.glb", 1500, 360, 6, 45),
     service("garbage-depot", "Garbage Depot", "garbage", "assets/sprites/woodmill.png", 1800, 400, 6, 35),
     service("park", "Park", "park", "assets/sprites/horticulturalist.png", 1200, 200, 2, 25),
     pump,

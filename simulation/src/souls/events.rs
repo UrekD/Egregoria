@@ -14,7 +14,7 @@ use crate::utils::rand_provider::RandProvider;
 use crate::{Simulation, RNG_SEED};
 
 const EVENT_FIRE: u64 = 0x4649_5245;
-const FIRE_CHANCE: f32 = 0.002;
+const FIRE_CHANCE: f32 = 0.001;
 const COLLAPSE_TICKS: u64 = 3 * TICKS_PER_HOUR;
 const EVENT_HISTORY_LIMIT: usize = 256;
 pub(crate) const UPDATE_OFFSET: u64 = 4;

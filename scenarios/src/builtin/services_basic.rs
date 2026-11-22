@@ -39,24 +39,24 @@ const COVERAGE_SITES: [(&str, Vec2); 6] = [
     ("park", vec2(175.0, 350.0)),
 ];
 
-static BASELINE: OnceLock<(u64, f32)> = OnceLock::new();
+static BASELINE: OnceLock<Metrics> = OnceLock::new();
 
 fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let metrics = run_verified(ctx, true)?;
     metrics.check_basic()?;
-    BASELINE.get_or_init(|| (metrics.tick, metrics.residential_demand));
+    BASELINE.get_or_init(|| metrics);
     metrics.sample(ctx, SCENARIO.0.name);
     Ok(())
 }
 
-pub(super) fn reference_demand() -> Result<(u64, f32), String> {
+pub(super) fn reference_metrics() -> Result<Metrics, String> {
     if let Some(&baseline) = BASELINE.get() {
         return Ok(baseline);
     }
     let mut ctx = ScenarioCtx::new(OPTIONS);
     let metrics = run_to(&mut ctx, true, false)?;
     metrics.check_basic()?;
-    Ok(*BASELINE.get_or_init(|| (metrics.tick, metrics.residential_demand)))
+    Ok(*BASELINE.get_or_init(|| metrics))
 }
 
 pub(super) fn run_verified(
@@ -193,9 +193,11 @@ pub(super) fn check_service_network(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct Metrics {
     pub(super) tick: u64,
     pub(super) residential_demand: f32,
+    pub(super) residential_happiness_driver: f32,
     pub(super) happiness: f32,
     l2: usize,
     l3: usize,
@@ -229,7 +231,12 @@ fn assess(ctx: &ScenarioCtx) -> Result<Metrics, String> {
         l2 += usize::from(home.level >= 2);
         l3 += usize::from(home.level == 3);
     }
-    let residential_demand = ctx.sim.read::<ZoneDemand>().values[&ZoneKind::Residential];
+    let demand = ctx.sim.read::<ZoneDemand>();
+    let residential_demand = demand.values[&ZoneKind::Residential];
+    let residential_happiness_driver = demand
+        .drivers(ZoneKind::Residential)
+        .ok_or("final: missing residential demand drivers")?
+        .happiness;
     let happiness = ctx
         .sim
         .read::<Happiness>()
@@ -237,6 +244,7 @@ fn assess(ctx: &ScenarioCtx) -> Result<Metrics, String> {
     Ok(Metrics {
         tick: ctx.sim.get_tick(),
         residential_demand,
+        residential_happiness_driver,
         happiness,
         l2,
         l3,
@@ -256,8 +264,12 @@ impl Metrics {
 
     pub(super) fn summary(&self) -> String {
         format!(
-            "L2+={} L3={} happiness={:.2} unserved=0 R demand={:.2}",
-            self.l2, self.l3, self.happiness, self.residential_demand
+            "L2+={} L3={} happiness={:.2} unserved=0 R demand={:.2} (happiness contribution={:.2})",
+            self.l2,
+            self.l3,
+            self.happiness,
+            self.residential_demand,
+            self.residential_happiness_driver,
         )
     }
 
