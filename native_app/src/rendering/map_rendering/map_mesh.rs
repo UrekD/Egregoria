@@ -10,8 +10,8 @@ use engine::{
     MeshVertex, MetallicRoughness, SpriteBatch, SpriteBatchBuilder, Tesselator,
 };
 use geom::{
-    minmax, vec2, vec3, Circle, Color, Intersect, LinearColor, PolyLine3, Polygon, Radians, Shape,
-    Vec2, Vec3, AABB, OBB,
+    minmax, vec2, vec3, Camera, Circle, Color, Intersect, LinearColor, PolyLine3, Polygon, Radians,
+    Shape, Vec2, Vec3, AABB, OBB,
 };
 use itertools::{EitherOrBoth, Itertools};
 use prototypes::{
@@ -1073,6 +1073,21 @@ mod zoning_tests {
     }
 }
 
+/// Sprite direction and size so that its top faces the top of the screen as closely as
+/// the footprint allows at the default camera yaw.
+fn upright_sprite([a, b]: [Vec2; 2]) -> (Vec2, (f32, f32)) {
+    let screen_up = -Camera::new(Vec3::ZERO, 1.0, 1.0).yaw.vec2();
+    let (up, across) = [(a, b), (-a, b), (b, a), (-b, a)]
+        .into_iter()
+        .max_by(|(p, _), (q, _)| {
+            let p = p.normalize().dot(screen_up);
+            p.total_cmp(&q.normalize().dot(screen_up))
+        })
+        .unwrap();
+    let right = vec2(up.y, -up.x).normalize();
+    (right, (across.mag(), up.mag()))
+}
+
 fn growable_company(id: GoodsCompanyID) -> Option<&'static GrowableCompanyPrototype> {
     try_prototype(GrowableCompanyID::from(id)).filter(|proto| proto.growable)
 }
@@ -1270,16 +1285,6 @@ impl MapMeshHandler {
             cached.build.clear();
             cached.build.reserve(4);
 
-            let sprites = b
-                .buildsprites
-                .values_mut()
-                .flat_map(|x| x.build(ctx.gfx))
-                .collect::<Vec<_>>();
-
-            if !sprites.is_empty() {
-                cached.build.push(Arc::new(sprites));
-            }
-
             let buildmeshes = b
                 .buildmeshes
                 .values_mut()
@@ -1292,6 +1297,17 @@ impl MapMeshHandler {
 
             if let Some(mesh) = b.houses_mesh.build(ctx.gfx) {
                 cached.build.push(Arc::new(mesh));
+            }
+
+            // Sprites don't write depth, so they go after the placeholder boxes they sit on.
+            let sprites = b
+                .buildsprites
+                .values_mut()
+                .flat_map(|x| x.build(ctx.gfx))
+                .collect::<Vec<_>>();
+
+            if !sprites.is_empty() {
+                cached.build.push(Arc::new(sprites));
             }
 
             let zonemeshes = b
@@ -1473,10 +1489,13 @@ impl MapBuilders {
             if let Some(x) = self.buildsprites.get_mut(&building.kind) {
                 let axis = building.obb.axis();
                 let c = building.obb.center();
-                let w = axis[0].mag();
-                let d = axis[0] / w;
-                let h = axis[1].mag();
-                x.push(c.z(sprite_z + 0.1), d.z0(), LinearColor::WHITE, (w, h));
+                let (dir, scale) = if placeholder {
+                    upright_sprite(axis)
+                } else {
+                    let w = axis[0].mag();
+                    (axis[0] / w, (w, axis[1].mag()))
+                };
+                x.push(c.z(sprite_z + 0.1), dir.z0(), LinearColor::WHITE, scale);
             } else if let Some(x) = self.buildmeshes.get_mut(&building.kind) {
                 let pos = building.obb.center().z(building.height);
                 let dir = building.obb.axis()[0].normalize().z0();
