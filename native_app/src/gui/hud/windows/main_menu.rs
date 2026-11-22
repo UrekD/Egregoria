@@ -14,16 +14,7 @@ pub(crate) fn main_menu_buttons(uiw: &UiWorld, sim: Option<&Simulation>, setting
     if let Some(entry) = session::continue_entry(uiw) {
         let label = format!("Continue {}", session::display_name(&entry));
         if tooltip(label, || button_primary("Continue").show()).clicked {
-            let active = uiw.read::<SessionState>().snapshot_slot() == Some(&entry.id);
-            let clean = sim.is_some_and(|sim| {
-                uiw.read::<SaveLoadState>().saved_progress
-                    == Some(session::CityProgress::capture(sim))
-            });
-            if active && clean {
-                session::set_screen(uiw, SessionScreen::Playing);
-            } else {
-                session::load_slot(uiw, entry);
-            }
+            session::continue_city(uiw, sim, entry);
             return;
         }
     }

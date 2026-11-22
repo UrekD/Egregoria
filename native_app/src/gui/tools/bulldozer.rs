@@ -19,6 +19,7 @@ pub struct BulldozerState {
     gesture: Gesture,
     initiating_button: Option<MouseButton>,
     previous_buttons: FastSet<MouseButton>,
+    press_order: Vec<MouseButton>,
 }
 
 #[derive(Default)]
@@ -33,10 +34,37 @@ enum Gesture {
 }
 
 impl BulldozerState {
+    pub(crate) fn record_press_order(&mut self, events: &[egui::Event]) {
+        self.press_order.clear();
+        for event in events {
+            let egui::Event::PointerButton {
+                button, pressed, ..
+            } = event
+            else {
+                continue;
+            };
+            let button = match button {
+                egui::PointerButton::Primary => MouseButton::Left,
+                egui::PointerButton::Secondary => MouseButton::Right,
+                egui::PointerButton::Middle => MouseButton::Middle,
+                egui::PointerButton::Extra1 => MouseButton::Other(4),
+                egui::PointerButton::Extra2 => MouseButton::Other(5),
+            };
+            if *pressed {
+                if !self.press_order.contains(&button) {
+                    self.press_order.push(button);
+                }
+            } else {
+                self.press_order.retain(|&pending| pending != button);
+            }
+        }
+    }
+
     pub fn reset_gesture(&mut self) {
         self.gesture = Gesture::Idle;
         self.initiating_button = None;
         self.previous_buttons.clear();
+        self.press_order.clear();
     }
 
     fn cancel(&mut self, held: bool) {
@@ -50,14 +78,13 @@ impl BulldozerState {
     fn drag_pressed(
         &mut self,
         pointer: &engine::PointerFrame,
-        select_button: impl Fn(&MouseButton) -> bool,
+        binding_order: impl Fn(MouseButton) -> Option<usize>,
         selecting: bool,
         just_selected: bool,
     ) -> bool {
-        if self
-            .initiating_button
-            .is_some_and(|button| pointer.released_buttons.contains(&button))
-        {
+        if self.initiating_button.is_some_and(|button| {
+            pointer.released_buttons.contains(&button) || !pointer.held_buttons.contains(&button)
+        }) {
             self.gesture = Gesture::Idle;
             self.initiating_button = None;
         }
@@ -70,9 +97,21 @@ impl BulldozerState {
         let button = pointer
             .held_buttons
             .iter()
-            .filter(|button| select_button(button))
-            .copied()
-            .min_by_key(|&button| (!fresh(button), button));
+            .filter_map(|&button| {
+                let binding = binding_order(button)?;
+                let press = self
+                    .press_order
+                    .iter()
+                    .position(|&pressed| pressed == button);
+                // egui reports the common buttons in event order. Binding order
+                // breaks ties for physical buttons it does not report.
+                Some((
+                    (!fresh(button), press.unwrap_or(usize::MAX), binding, button),
+                    button,
+                ))
+            })
+            .min_by_key(|&(priority, _)| priority)
+            .map(|(_, button)| button);
         let pressed =
             matches!(self.gesture, Gesture::Idle) && (just_selected || button.is_some_and(fresh));
         self.previous_buttons.clone_from(&pointer.held_buttons);
@@ -202,8 +241,12 @@ fn queue_target(map: &Map, target: ProjectKind, commands: &mut WorldCommands) {
 }
 
 fn is_select_button(bindings: &Bindings, button: MouseButton) -> bool {
-    bindings.0.get(&InputAction::Select).is_some_and(|select| {
-        select.0.iter().any(|binding| {
+    select_binding_order(bindings, button).is_some()
+}
+
+fn select_binding_order(bindings: &Bindings, button: MouseButton) -> Option<usize> {
+    bindings.0.get(&InputAction::Select).and_then(|select| {
+        select.0.iter().position(|binding| {
             let mut combination = binding.clone();
             combination.push_unique(UnitInput::Mouse(button));
             combination == *binding
@@ -223,7 +266,12 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
     let drag_enabled = uiworld.read::<Settings>().bulldozer_drag;
     let just_selected = input.just_act.contains(&InputAction::Select);
     let pressed = if drag_enabled {
-        state.drag_pressed(&pointer, select_button, selecting, just_selected)
+        state.drag_pressed(
+            &pointer,
+            |button| select_binding_order(&bindings, button),
+            selecting,
+            just_selected,
+        )
     } else {
         just_selected
             || selecting
@@ -588,6 +636,49 @@ mod tests {
         pointer.end_frame();
         pointer.observe_mouse_button(MouseButton::Right, true);
         update(a, true, false, pointer.pointer_frame(false));
+        pointer.end_frame();
+        pointer.observe_mouse_button(MouseButton::Left, false);
+        update(b, true, false, pointer.pointer_frame(false));
+        assert!(
+            matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(id)] if *id == road_a)
+        );
+
+        // Right starts first even though the binding list also contains Left.
+        update(b, false, false, open());
+        *ui.commands() = WorldCommands::default();
+        let press = |button| egui::Event::PointerButton {
+            pos: egui::Pos2::ZERO,
+            button,
+            pressed: true,
+            modifiers: egui::Modifiers::NONE,
+        };
+        ui.write::<BulldozerState>().record_press_order(&[
+            press(egui::PointerButton::Secondary),
+            press(egui::PointerButton::Primary),
+        ]);
+        let mut pointer = engine::InputContext::default();
+        pointer.observe_mouse_button(MouseButton::Right, true);
+        pointer.observe_mouse_button(MouseButton::Left, true);
+        update(a, true, true, pointer.pointer_frame(false));
+        ui.write::<BulldozerState>().record_press_order(&[]);
+        pointer.end_frame();
+        pointer.observe_mouse_button(MouseButton::Right, false);
+        update(b, true, false, pointer.pointer_frame(false));
+        assert!(
+            matches!(ui.commands().as_ref(), [WorldCommand::MapRemoveRoad(id)] if *id == road_a)
+        );
+
+        update(b, false, false, open());
+        *ui.commands() = WorldCommands::default();
+        let mut pointer = engine::InputContext::default();
+        ui.write::<BulldozerState>().record_press_order(&[
+            press(egui::PointerButton::Primary),
+            press(egui::PointerButton::Secondary),
+        ]);
+        pointer.observe_mouse_button(MouseButton::Left, true);
+        pointer.observe_mouse_button(MouseButton::Right, true);
+        update(a, true, true, pointer.pointer_frame(false));
+        ui.write::<BulldozerState>().record_press_order(&[]);
         pointer.end_frame();
         pointer.observe_mouse_button(MouseButton::Left, false);
         update(b, true, false, pointer.pointer_frame(false));

@@ -29,7 +29,7 @@ use crate::session::save_coordinator::SaveCoordinator;
 use crate::session::{
     self, CityProgress, Departure, DeparturePhase, DiscoveredSlots, FailedSnapshots, PreparedWorld,
     SaveInFlight, SaveKind, SaveRequest, SessionScreen, SessionState, SlotCompatibility,
-    WorldJobKind, WorldReplacement,
+    WorldJobError, WorldJobKind, WorldJobOutcome, WorldReplacement,
 };
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
 use prototypes::GameTime;
@@ -189,6 +189,11 @@ impl engine::framework::State for State {
                 !ctx.egui.last_mouse_captured,
             );
             if world_interaction {
+                if *self.uiw.read::<Tool>() == Tool::Bulldozer {
+                    self.uiw
+                        .write::<gui::bulldozer::BulldozerState>()
+                        .record_press_order(&ctx.egui.platform.egui_input().events);
+                }
                 gui::run_ui_systems(&self.sim.read().unwrap(), &self.uiw);
             }
         }
@@ -455,6 +460,7 @@ impl State {
             world,
             slots,
             failed_snapshots,
+            loaded_entry,
             message,
         } = match result {
             Ok(startup) => startup,
@@ -470,6 +476,9 @@ impl State {
         state.starting_up = false;
         state.refresh_slots = false;
         state.city_name = world.name;
+        if let Some(entry) = loaded_entry {
+            state.remember_loaded_snapshot(entry);
+        }
         state.failed_snapshots = failed_snapshots;
         state.update_slot_catalog(slots);
         let mut io = self.uiw.write::<SaveLoadState>();
@@ -495,34 +504,32 @@ impl State {
         if self.uiw.read::<SessionState>().departure.is_some() {
             return true;
         }
-        let job_id = self.uiw.read::<SessionState>().world_job_id;
+        let Some((job, result)) = take_world_job_result(&self.uiw, &engine::pointer_frame()) else {
+            return !session::world_job_active(&self.uiw);
+        };
         let mut io = self.uiw.write::<SaveLoadState>();
-        let Some(job) = &io.world_job else {
-            return true;
-        };
-        let current = job.id == job_id;
-        if current && !job.presented {
-            return false;
-        }
-        let result = match job.result.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return !current,
-            Err(TryRecvError::Disconnected) => Err("The city worker stopped unexpectedly.".into()),
-        };
-        let job = io.world_job.take().unwrap();
-        if !current {
-            return true;
-        }
         match result {
-            Ok(world) if crate::network::is_singleplayer(&self.uiw) => {
+            Ok(WorldJobOutcome::Replace(world)) if crate::network::is_singleplayer(&self.uiw) => {
                 drop(io);
                 self.replace_world(ctx, world.replacement);
-                self.uiw.write::<SessionState>().city_name = world.name;
+                let mut state = self.uiw.write::<SessionState>();
+                state.city_name = world.name;
+                if let WorldJobKind::Snapshot(entry) = job.kind {
+                    state.remember_loaded_snapshot(entry);
+                }
+            }
+            Ok(WorldJobOutcome::ResumeDormant) if crate::network::is_singleplayer(&self.uiw) => {
+                drop(io);
+                session::set_screen(&self.uiw, SessionScreen::Playing);
             }
             Ok(_) => {
                 io.world_error = Some("New Game and Load are unavailable in multiplayer.".into())
             }
-            Err(error) => match job.kind {
+            Err(WorldJobError::SnapshotChanged) => {
+                self.uiw.write::<SessionState>().refresh_slots = true;
+                io.world_error = Some("The save changed. Choose it again after scanning.".into());
+            }
+            Err(WorldJobError::Failed(error)) => match job.kind {
                 WorldJobKind::Snapshot(entry) => {
                     self.uiw.write::<SessionState>().mark_unreadable(&entry);
                     io.world_error = Some(error);
@@ -625,9 +632,11 @@ impl State {
         let id = permit.id;
         let slot = request.slot.clone();
         let name = request.name.clone();
+        let revision = session::snapshot_revision();
         io.save_result = Some(SaveInFlight {
             id,
             request,
+            revision,
             result,
         });
         let sim = self.sim.clone();
@@ -640,7 +649,7 @@ impl State {
                     return Err("The save was cancelled.".into());
                 }
                 let snapshot = sim
-                    .encode_slot(session::snapshot_revision())
+                    .encode_slot(revision)
                     .map_err(|error| error.to_string())?;
                 Ok((
                     CityProgress::capture(&sim),
@@ -669,7 +678,12 @@ impl State {
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => Err("The save worker stopped unexpectedly.".into()),
         };
-        let SaveInFlight { id, request, .. } = io.save_result.take().unwrap();
+        let SaveInFlight {
+            id,
+            request,
+            revision,
+            ..
+        } = io.save_result.take().unwrap();
         let mut session = self.uiw.write::<SessionState>();
         // Refresh even after errors: the snapshot may have been renamed before fsync failed.
         session.refresh_slots = true;
@@ -686,6 +700,7 @@ impl State {
                 }
                 if !matches!(request.kind, SaveKind::Autosave) {
                     io.saved_progress = Some(progress);
+                    session.remember_published_snapshot(revision);
                 }
                 if let simulation::SavePhase::SidecarsFailed { replay, meta } = phase {
                     log::warn!(
@@ -878,6 +893,39 @@ impl State {
     }
 }
 
+fn take_world_job_result(
+    uiw: &UiWorld,
+    pointer: &engine::PointerFrame,
+) -> Option<(session::WorldJob, Result<WorldJobOutcome, WorldJobError>)> {
+    let job_id = uiw.read::<SessionState>().world_job_id;
+    let mut io = uiw.write::<SaveLoadState>();
+    let job = io.world_job.as_ref()?;
+    if job.id != job_id {
+        io.world_job = None;
+        return None;
+    }
+    // Yakui registers a click on the primary release and the loading
+    // dialog reads it during render, after this update.
+    if !job.presented
+        || matches!(job.kind, WorldJobKind::NewGame)
+            && (pointer.held_buttons.contains(&engine::MouseButton::Left)
+                || pointer
+                    .released_buttons
+                    .contains(&engine::MouseButton::Left))
+    {
+        return None;
+    }
+    let result = match job.result.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return None,
+        Err(TryRecvError::Disconnected) => Err(WorldJobError::Failed(
+            "The city worker stopped unexpectedly.".into(),
+        )),
+    };
+    let job = io.world_job.take().unwrap();
+    Some((job, result))
+}
+
 fn route_close_input(
     uiw: &UiWorld,
     input: &InputContext,
@@ -951,6 +999,7 @@ mod p4_fix_esc_tests {
         session::finish_departure(&uiw, Departure::Exit);
         uiw.write::<SaveLoadState>().save_result = Some(SaveInFlight {
             id: 1,
+            revision: session::snapshot_revision(),
             request: SaveRequest {
                 slot: SlotId::autosave(0),
                 name: "City".into(),
@@ -970,12 +1019,38 @@ mod p4_fix_esc_tests {
             .unwrap_err();
         assert!(ready_to_exit(&uiw));
     }
+
+    #[test]
+    fn p4_fix_final_cancel_click_gets_the_frame_before_a_ready_generation() {
+        let uiw = playing_ui();
+        let (sender, result) = mpsc::channel();
+        uiw.write::<SaveLoadState>().world_job = Some(session::WorldJob {
+            id: 0,
+            kind: WorldJobKind::NewGame,
+            presented: true,
+            result,
+        });
+        sender
+            .send(Ok(WorldJobOutcome::Replace(PreparedWorld {
+                replacement: WorldReplacement::NewGame(Simulation::new(false), SlotId::legacy()),
+                name: "Ready city".into(),
+            })))
+            .unwrap();
+        let mut input = InputContext::default();
+        input.observe_mouse_button(engine::MouseButton::Left, true);
+        input.observe_mouse_button(engine::MouseButton::Left, false);
+        assert!(take_world_job_result(&uiw, &input.pointer_frame(false)).is_none());
+        assert!(session::cancel_generation(&uiw));
+        input.end_frame();
+        assert!(take_world_job_result(&uiw, &input.pointer_frame(false)).is_none());
+    }
 }
 
 struct StartupWorld {
     world: PreparedWorld,
     slots: std::io::Result<DiscoveredSlots>,
     failed_snapshots: FailedSnapshots,
+    loaded_entry: Option<common::saveload::SlotEntry>,
     message: Option<String>,
 }
 
@@ -984,24 +1059,33 @@ fn startup_world() -> Result<StartupWorld, String> {
     let mut slots = session::discover_slots(root);
     let mut failed_snapshots = FailedSnapshots::default();
     let mut message = None;
-    if let Ok(candidates) = &slots {
+    for attempt in 0..2 {
+        let Ok(candidates) = &slots else { break };
+        let mut listing_changed = false;
         for (entry, status) in candidates {
             if *status != SlotCompatibility::Compatible {
                 continue;
             }
-            match Simulation::load_from_slot(root, &entry.id) {
+            match Simulation::load_listed_snapshot(root, entry) {
                 Ok(sim) => {
                     let world = PreparedWorld {
                         replacement: WorldReplacement::Snapshot(sim, entry.id.clone()),
                         name: session::display_name(entry).to_owned(),
                     };
+                    let loaded_entry = Some(entry.clone());
                     return Ok(StartupWorld {
                         world,
                         slots,
                         failed_snapshots,
+                        loaded_entry,
                         message,
                     });
                 }
+                Err(simulation::SaveLoadError::SnapshotChanged) if attempt == 0 => {
+                    listing_changed = true;
+                    break;
+                }
+                Err(simulation::SaveLoadError::SnapshotChanged) => continue,
                 Err(error) => {
                     log::warn!("Could not load {} at startup: {error}", entry.id);
                     message.get_or_insert_with(|| error.to_string());
@@ -1009,6 +1093,10 @@ fn startup_world() -> Result<StartupWorld, String> {
                 }
             }
         }
+        if !listing_changed {
+            break;
+        }
+        slots = session::discover_slots(root);
     }
 
     let (sim, recovery) = Simulation::load_or_new("world")?;
@@ -1022,6 +1110,7 @@ fn startup_world() -> Result<StartupWorld, String> {
         },
         slots,
         failed_snapshots,
+        loaded_entry: None,
         message: recovery.or(message),
     })
 }

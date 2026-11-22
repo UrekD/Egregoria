@@ -10,8 +10,8 @@ use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
 use crate::world_command::{CommandOutcomes, WorldCommand};
 use common::saveload::{
-    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotId, SlotMeta, SnapshotKind,
-    SnapshotRevision,
+    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry, SlotId, SlotMeta,
+    SnapshotKind, SnapshotRevision,
 };
 use common::FastMap;
 use derive_more::{From, TryInto};
@@ -22,7 +22,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
-use std::io::Read;
+use std::io::{Read, Seek};
 use std::path::Path;
 use std::ptr::addr_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -481,7 +481,7 @@ impl Simulation {
     pub fn load_replay_from_disk(save_name: &str) -> Option<Replay> {
         let path = ReplayJson::filename(&format!("{save_name}_replay"));
         let result = (|| {
-            let bytes = read_save(&path)
+            let bytes = read_slot_member(&path)
                 .map_err(SaveLoadError::Io)?
                 .ok_or(SaveLoadError::NotFound)?;
             decode_snapshot_replay(
@@ -500,20 +500,29 @@ impl Simulation {
     }
 
     pub fn load_from_disk(save_name: &str) -> Result<Self, SaveLoadError> {
-        let bytes = read_snapshot(
+        let (file, kind, _) = open_snapshot(
             &CompressedBincode::filename(save_name),
             &Bincode::filename(save_name),
-            read_save,
         )?;
-        let sim = Self::decode_snapshot(&bytes)?;
+        let sim = Self::decode_snapshot(&read_snapshot(file, kind)?)?;
         log::info!("successfully loaded simulation {save_name}");
         Ok(sim)
     }
 
     pub fn load_from_slot(root: &Path, id: &SlotId) -> Result<Self, SaveLoadError> {
         let paths = saveload::slot_paths(root, id).map_err(SaveLoadError::Io)?;
-        let bytes = read_snapshot(&paths.zip, &paths.bc, read_slot_member)?;
-        Self::decode_snapshot(&bytes)
+        let (file, kind, _) = open_snapshot(&paths.zip, &paths.bc)?;
+        Self::decode_snapshot(&read_snapshot(file, kind)?)
+    }
+
+    pub fn validate_listed_snapshot(root: &Path, entry: &SlotEntry) -> Result<(), SaveLoadError> {
+        open_listed_snapshot(root, entry).map(|_| ())
+    }
+
+    pub fn load_listed_snapshot(root: &Path, entry: &SlotEntry) -> Result<Self, SaveLoadError> {
+        let (mut file, kind) = open_listed_snapshot(root, entry)?;
+        file.rewind().map_err(SaveLoadError::Io)?;
+        Self::decode_snapshot(&read_snapshot(file, kind)?)
     }
 
     pub fn load_replay_from_slot(root: &Path, id: &SlotId) -> Result<Replay, SaveLoadError> {
@@ -535,33 +544,7 @@ impl Simulation {
         let file = open_slot_member(path)
             .map_err(SaveLoadError::Io)?
             .ok_or(SaveLoadError::NotFound)?;
-        // The envelope contains magic, a version string and a u128 revision.
-        let mut prefix = [0u8; 256];
-        let len = if kind == SnapshotKind::Zip {
-            CompressedBincode::read_prefix(file, &mut prefix).map_err(corrupt_header)?
-        } else {
-            let mut bytes = Vec::new();
-            file.take(prefix.len() as u64)
-                .read_to_end(&mut bytes)
-                .map_err(SaveLoadError::Io)?;
-            prefix[..bytes.len()].copy_from_slice(&bytes);
-            bytes.len()
-        };
-        let bytes = &prefix[..len];
-        if bytes.starts_with(&SLOT_SNAPSHOT_MAGIC) {
-            let header: SlotSnapshotHeader =
-                Bincode::decode_prefix(bytes).map_err(corrupt_header)?;
-            Ok(SnapshotHeader {
-                version: header.version,
-                revision: Some(header.revision),
-            })
-        } else {
-            let SaveHeader { version } = Bincode::decode_prefix(bytes).map_err(corrupt_header)?;
-            Ok(SnapshotHeader {
-                version,
-                revision: None,
-            })
-        }
+        read_snapshot_header(file, kind)
     }
 
     fn decode_snapshot(bytes: &[u8]) -> Result<Self, SaveLoadError> {
@@ -597,12 +580,17 @@ impl Simulation {
         let error = match Self::load_from_disk(save_name) {
             Ok(sim) => return Ok((sim, None)),
             Err(SaveLoadError::NotFound) => return Ok((Self::new(true), None)),
+            Err(SaveLoadError::Io(error)) if error.kind() == io::ErrorKind::InvalidData => {
+                let message = format!("Could not read save ({error}). Started a new world with the obstructed save left in place.");
+                return Ok((Self::new(true), Some(message)));
+            }
             Err(error @ SaveLoadError::Io(_)) => return Err(error.to_string()),
             Err(error) => error,
         };
         let version = match &error {
             SaveLoadError::Incompatible { version } => Some(version.as_str()),
             SaveLoadError::Corrupt { version, .. } => version.as_deref(),
+            SaveLoadError::SnapshotTooLarge { .. } => None,
             _ => unreachable!(),
         };
         let backups = saveload::backup_save_files(save_name, version).map_err(|backup_error| {
@@ -817,6 +805,10 @@ fn deserialize_save_header<'de, D: Deserializer<'de>>(
 #[derive(Debug)]
 pub enum SaveLoadError {
     NotFound,
+    SnapshotChanged,
+    SnapshotTooLarge {
+        limit: usize,
+    },
     Incompatible {
         version: String,
     },
@@ -833,6 +825,10 @@ impl Display for SaveLoadError {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::NotFound => f.write_str("Save not found"),
+            Self::SnapshotChanged => f.write_str("Save changed since it was listed"),
+            Self::SnapshotTooLarge { limit } => {
+                write!(f, "Save exceeds the inflate size limit of {limit} bytes")
+            }
             Self::Incompatible { version } => {
                 write!(
                     f,
@@ -924,17 +920,75 @@ fn remove_replay(path: &Path) -> io::Result<()> {
     }
 }
 
-fn read_snapshot(
-    zip: &Path,
-    bc: &Path,
-    read: fn(&Path) -> io::Result<Option<Vec<u8>>>,
-) -> Result<Vec<u8>, SaveLoadError> {
-    match read(zip).map_err(SaveLoadError::Io)? {
-        Some(bytes) => CompressedBincode::decompress(&bytes).map_err(corrupt_header),
-        None => read(bc)
-            .map_err(SaveLoadError::Io)?
-            .ok_or(SaveLoadError::NotFound),
+fn open_snapshot<'a>(
+    zip: &'a Path,
+    bc: &'a Path,
+) -> Result<(fs::File, SnapshotKind, &'a Path), SaveLoadError> {
+    if let Some(file) = open_slot_member(zip).map_err(SaveLoadError::Io)? {
+        return Ok((file, SnapshotKind::Zip, zip));
     }
+    let file = open_slot_member(bc)
+        .map_err(SaveLoadError::Io)?
+        .ok_or(SaveLoadError::NotFound)?;
+    Ok((file, SnapshotKind::Bc, bc))
+}
+
+fn open_listed_snapshot(
+    root: &Path,
+    entry: &SlotEntry,
+) -> Result<(fs::File, SnapshotKind), SaveLoadError> {
+    let paths = saveload::slot_paths(root, &entry.id).map_err(SaveLoadError::Io)?;
+    let (mut file, kind, path) =
+        open_snapshot(&paths.zip, &paths.bc).map_err(|_| SaveLoadError::SnapshotChanged)?;
+    if !entry
+        .matches_snapshot_file(path, kind, &file)
+        .map_err(SaveLoadError::Io)?
+    {
+        return Err(SaveLoadError::SnapshotChanged);
+    }
+    let header =
+        read_snapshot_header(&mut file, kind).map_err(|_| SaveLoadError::SnapshotChanged)?;
+    if header.version != VERSION || header.revision != entry.revision {
+        return Err(SaveLoadError::SnapshotChanged);
+    }
+    Ok((file, kind))
+}
+
+fn read_snapshot_header(
+    file: impl Read,
+    kind: SnapshotKind,
+) -> Result<SnapshotHeader, SaveLoadError> {
+    // The envelope contains magic, a version string and a u128 revision.
+    let mut prefix = [0u8; 256];
+    let len = if kind == SnapshotKind::Zip {
+        CompressedBincode::read_prefix(file, &mut prefix).map_err(corrupt_header)?
+    } else {
+        let mut bytes = Vec::new();
+        file.take(prefix.len() as u64)
+            .read_to_end(&mut bytes)
+            .map_err(SaveLoadError::Io)?;
+        prefix[..bytes.len()].copy_from_slice(&bytes);
+        bytes.len()
+    };
+    snapshot_header(&prefix[..len]).map(|(header, _)| header)
+}
+
+fn read_snapshot(mut file: fs::File, kind: SnapshotKind) -> Result<Vec<u8>, SaveLoadError> {
+    const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes).map_err(SaveLoadError::Io)?;
+    if kind == SnapshotKind::Bc {
+        return Ok(bytes);
+    }
+    CompressedBincode::decompress_limited(&bytes, MAX_SNAPSHOT_BYTES).map_err(|error| {
+        if error.kind() == io::ErrorKind::FileTooLarge {
+            SaveLoadError::SnapshotTooLarge {
+                limit: MAX_SNAPSHOT_BYTES,
+            }
+        } else {
+            corrupt_header(error)
+        }
+    })
 }
 
 fn decode_snapshot_replay(bytes: &[u8], zip: &Path, bc: &Path) -> Result<Replay, SaveLoadError> {
@@ -989,18 +1043,6 @@ fn read_slot_member(path: &Path) -> io::Result<Option<Vec<u8>>> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
     Ok(Some(bytes))
-}
-
-fn read_save(path: &Path) -> io::Result<Option<Vec<u8>>> {
-    match fs::read(path) {
-        Ok(bytes) => Ok(Some(bytes)),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => match path.symlink_metadata() {
-            Ok(_) => Ok(Some(Vec::new())), // A dangling save symlink still needs backing up.
-            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        },
-        Err(error) => Err(error),
-    }
 }
 
 #[derive(Serialize)]
@@ -1115,6 +1157,40 @@ mod p4_fix_ac_tests {
         ));
         fs::create_dir(&root).unwrap();
         root
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn p4_fix_final_legacy_snapshot_rejects_symlinks() {
+        let root = save_root();
+        let name = root.join("world");
+        for extension in ["zip", "bc"] {
+            let path = name.with_extension(extension);
+            let target = root.join("target");
+            fs::write(&target, b"bad snapshot").unwrap();
+            std::os::unix::fs::symlink(&target, &path).unwrap();
+            let error = Simulation::load_from_disk(name.to_str().unwrap())
+                .err()
+                .expect("legacy snapshot resolved a symlink");
+            assert!(matches!(error, SaveLoadError::Io(_)), "{error}");
+            fs::remove_file(path).unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn p4_fix_final_inflate_reports_size_limit() {
+        let bytes = CompressedBincode::encode(&vec![0u8; 256 * 1024 * 1024]).unwrap();
+        let root = save_root();
+        let zip = root.join("world.zip");
+        fs::write(&zip, bytes).unwrap();
+        let result = Simulation::load_from_disk(root.join("world").to_str().unwrap());
+        fs::remove_dir_all(root).unwrap();
+        let error = result.err().expect("oversize snapshot was accepted");
+        assert!(
+            matches!(error, SaveLoadError::SnapshotTooLarge { .. }),
+            "{error}"
+        );
     }
 
     #[test]

@@ -178,6 +178,57 @@ pub struct SlotEntry {
     pub revision: Option<SnapshotRevision>,
     /// Existing members retain their exact spelling. Absent members use canonical paths.
     pub paths: SlotPaths,
+    file: SnapshotFile,
+}
+
+impl SlotEntry {
+    pub fn snapshot_path(&self) -> &Path {
+        match self.snapshot {
+            SnapshotKind::Bc => &self.paths.bc,
+            _ => &self.paths.zip,
+        }
+    }
+
+    pub fn same_snapshot_as(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.snapshot == other.snapshot
+            && self.snapshot_path() == other.snapshot_path()
+            && self.revision == other.revision
+            && self.file == other.file
+    }
+
+    /// Compare the listing to the handle that will be used for the read.
+    pub fn matches_snapshot_file(
+        &self,
+        path: &Path,
+        kind: SnapshotKind,
+        file: &File,
+    ) -> io::Result<bool> {
+        Ok(self.snapshot == kind
+            && self.snapshot_path() == path
+            && self.file == SnapshotFile::from_metadata(&file.metadata()?)?)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SnapshotFile {
+    modified: SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    device_inode: (u64, u64),
+}
+
+impl SnapshotFile {
+    fn from_metadata(metadata: &Metadata) -> io::Result<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Ok(Self {
+            modified: metadata.modified()?,
+            len: metadata.len(),
+            #[cfg(unix)]
+            device_inode: (metadata.dev(), metadata.ino()),
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,9 +416,12 @@ pub fn list_slots_with_revisions(
             continue;
         };
 
-        let Ok(modified) = report_entry_error(member.metadata.modified(), &member.path) else {
+        let Ok(file) =
+            report_entry_error(SnapshotFile::from_metadata(&member.metadata), &member.path)
+        else {
             continue;
         };
+        let modified = file.modified;
         let (meta, replay_available, revision) = if snapshot == SnapshotKind::Obstructed {
             (None, false, None)
         } else {
@@ -388,6 +442,7 @@ pub fn list_slots_with_revisions(
             modified,
             revision,
             paths,
+            file,
         });
     }
 
@@ -520,6 +575,22 @@ impl SlotPaths {
 }
 
 impl CompressedBincode {
+    /// Inflate a complete zlib payload, limiting the decompressed byte count.
+    pub fn decompress_limited(bytes: &[u8], max_output: usize) -> io::Result<Vec<u8>> {
+        use miniz_oxide::inflate::{decompress_to_vec_zlib_with_limit, TINFLStatus};
+
+        decompress_to_vec_zlib_with_limit(bytes, max_output).map_err(|error| {
+            if error.status == TINFLStatus::HasMoreOutput {
+                io::Error::new(
+                    ErrorKind::FileTooLarge,
+                    "snapshot exceeds the inflate size limit",
+                )
+            } else {
+                io::Error::new(ErrorKind::InvalidData, error.to_string())
+            }
+        })
+    }
+
     /// Inflate into a caller-supplied prefix buffer, with at most 4 KiB of input.
     pub fn read_prefix(reader: impl Read, prefix: &mut [u8]) -> io::Result<usize> {
         use miniz_oxide::inflate::core::{decompress, inflate_flags::*, DecompressorOxide};
@@ -558,7 +629,16 @@ fn open_regular(path: &Path) -> io::Result<File> {
         const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
         options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
-    let file = options.open(path)?;
+    let file = options.open(path).map_err(|error| {
+        if path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.is_symlink())
+        {
+            nonregular_member(path)
+        } else {
+            error
+        }
+    })?;
     let metadata = report_entry_error(file.metadata(), path)?;
     #[cfg(windows)]
     {

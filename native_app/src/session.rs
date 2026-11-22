@@ -1,17 +1,17 @@
 use std::collections::{hash_map::RandomState, BTreeMap};
 use std::hash::BuildHasher;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
-use common::saveload::{self, SlotEntry, SlotId, SnapshotKind, SnapshotRevision};
+use common::saveload::{self, SlotEntry, SlotId, SnapshotRevision};
 use serde::Deserialize;
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::CommandOutcomes;
-use simulation::{Simulation, SimulationReplayLoader};
+use simulation::{SaveLoadError, Simulation, SimulationReplayLoader};
 
 use crate::game_loop::VERSION;
 use crate::gui::bulldozer::BulldozerState;
@@ -63,6 +63,7 @@ pub enum WorldReplacement {
 pub struct SessionState {
     pub active_slot: Option<SlotId>,
     recovery_slot: Option<SlotId>,
+    dormant_snapshot: Option<DormantSnapshot>,
     pub generation: u64,
     pub(crate) interaction_blocked: bool,
     pub(crate) departure: Option<PendingDeparture>,
@@ -89,39 +90,23 @@ pub(crate) enum SlotCompatibility {
 pub(crate) type DiscoveredSlots = Vec<(SlotEntry, SlotCompatibility)>;
 
 #[derive(Default)]
-pub(crate) struct FailedSnapshots(BTreeMap<SlotId, SnapshotIdentity>);
+pub(crate) struct FailedSnapshots(BTreeMap<SlotId, SlotEntry>);
 
-#[derive(PartialEq, Eq)]
-struct SnapshotIdentity {
-    path: PathBuf,
-    modified: SystemTime,
-    revision: Option<SnapshotRevision>,
-}
-
-impl From<&SlotEntry> for SnapshotIdentity {
-    fn from(entry: &SlotEntry) -> Self {
-        let path = match entry.snapshot {
-            SnapshotKind::Bc => &entry.paths.bc,
-            _ => &entry.paths.zip,
-        };
-        Self {
-            path: path.clone(),
-            modified: entry.modified,
-            revision: entry.revision,
-        }
-    }
+enum DormantSnapshot {
+    Loaded(SlotEntry),
+    Published(SnapshotRevision),
 }
 
 impl FailedSnapshots {
     pub(crate) fn record(&mut self, entry: &SlotEntry) {
-        self.0.insert(entry.id.clone(), entry.into());
+        self.0.insert(entry.id.clone(), entry.clone());
     }
 
     pub(crate) fn apply(&mut self, slots: &mut DiscoveredSlots) {
         let mut previous = std::mem::take(&mut self.0);
         for (entry, status) in slots {
             if let Some(failed) = previous.remove(&entry.id) {
-                if failed == SnapshotIdentity::from(&*entry) {
+                if failed.same_snapshot_as(entry) {
                     *status = SlotCompatibility::Unreadable;
                     self.0.insert(entry.id.clone(), failed);
                 }
@@ -136,6 +121,7 @@ impl SessionState {
     }
 
     pub(crate) fn set_snapshot_slot(&mut self, slot: Option<SlotId>) {
+        self.dormant_snapshot = None;
         if slot.as_ref().is_some_and(SlotId::is_autosave) {
             self.active_slot = None;
             self.recovery_slot = slot;
@@ -145,15 +131,22 @@ impl SessionState {
         }
     }
 
+    pub(crate) fn remember_loaded_snapshot(&mut self, entry: SlotEntry) {
+        self.dormant_snapshot = Some(DormantSnapshot::Loaded(entry));
+    }
+
+    pub(crate) fn remember_published_snapshot(&mut self, revision: SnapshotRevision) {
+        self.dormant_snapshot = Some(DormantSnapshot::Published(revision));
+    }
+
     pub(crate) fn scanning_slots(&self) -> bool {
         self.starting_up || self.refresh_slots || self.slot_scan.is_some()
     }
 
     pub(crate) fn mark_unreadable(&mut self, entry: &SlotEntry) {
         self.failed_snapshots.record(entry);
-        let failed = SnapshotIdentity::from(entry);
         for (candidate, status) in &mut self.slots {
-            if candidate.id == entry.id && SnapshotIdentity::from(&*candidate) == failed {
+            if candidate.same_snapshot_as(entry) {
                 *status = SlotCompatibility::Unreadable;
             }
         }
@@ -215,12 +208,8 @@ pub(crate) fn discover_slots(root: &Path) -> io::Result<DiscoveredSlots> {
     Ok(slots
         .into_iter()
         .map(|slot| {
-            let path = match slot.snapshot {
-                saveload::SnapshotKind::Bc => &slot.paths.bc,
-                _ => &slot.paths.zip,
-            };
             let status = compatibility
-                .remove(path)
+                .remove(slot.snapshot_path())
                 .unwrap_or(SlotCompatibility::Unreadable);
             (slot, status)
         })
@@ -238,6 +227,24 @@ pub(crate) fn continue_entry(uiw: &UiWorld) -> Option<SlotEntry> {
         return None;
     }
     continue_slot(&uiw.read::<SessionState>().slots).cloned()
+}
+
+fn can_resume_dormant(uiw: &UiWorld, sim: Option<&Simulation>, entry: &SlotEntry) -> bool {
+    let session = uiw.read::<SessionState>();
+    session.snapshot_slot() == Some(&entry.id)
+        && match &session.dormant_snapshot {
+            Some(DormantSnapshot::Loaded(loaded)) => loaded.same_snapshot_as(entry),
+            Some(DormantSnapshot::Published(revision)) => entry.revision == Some(*revision),
+            None => false,
+        }
+        && sim.is_some_and(|sim| {
+            uiw.read::<SaveLoadState>().saved_progress == Some(CityProgress::capture(sim))
+        })
+}
+
+pub(crate) fn continue_city(uiw: &UiWorld, sim: Option<&Simulation>, entry: SlotEntry) {
+    let resume_dormant = can_resume_dormant(uiw, sim, &entry);
+    start_snapshot_job(uiw, entry, resume_dormant);
 }
 
 pub(crate) fn display_name(entry: &SlotEntry) -> &str {
@@ -339,13 +346,45 @@ pub(crate) struct WorldJob {
     pub id: u64,
     pub kind: WorldJobKind,
     pub presented: bool,
-    pub result: Receiver<Result<PreparedWorld, String>>,
+    pub result: Receiver<Result<WorldJobOutcome, WorldJobError>>,
+}
+
+pub(crate) enum WorldJobOutcome {
+    Replace(PreparedWorld),
+    ResumeDormant,
+}
+
+#[derive(Debug)]
+pub(crate) enum WorldJobError {
+    SnapshotChanged,
+    Failed(String),
+}
+
+impl From<SaveLoadError> for WorldJobError {
+    fn from(error: SaveLoadError) -> Self {
+        match error {
+            SaveLoadError::SnapshotChanged => Self::SnapshotChanged,
+            _ => Self::Failed(error.to_string()),
+        }
+    }
 }
 
 fn start_world_job(
     uiw: &UiWorld,
     kind: WorldJobKind,
     prepare: impl FnOnce() -> Result<PreparedWorld, String> + Send + 'static,
+) {
+    spawn_world_job(uiw, kind, move || {
+        prepare()
+            .map(WorldJobOutcome::Replace)
+            .map_err(WorldJobError::Failed)
+    });
+}
+
+fn spawn_world_job(
+    uiw: &UiWorld,
+    kind: WorldJobKind,
+    prepare: impl FnOnce() -> Result<WorldJobOutcome, WorldJobError> + Send + 'static,
 ) {
     let mut io = uiw.write::<SaveLoadState>();
     if !crate::network::is_singleplayer(uiw) {
@@ -372,14 +411,22 @@ fn start_world_job(
 }
 
 pub(crate) fn load_slot(uiw: &UiWorld, entry: SlotEntry) {
-    start_world_job(uiw, WorldJobKind::Snapshot(entry.clone()), move || {
+    start_snapshot_job(uiw, entry, false);
+}
+
+fn start_snapshot_job(uiw: &UiWorld, entry: SlotEntry, resume_dormant: bool) {
+    spawn_world_job(uiw, WorldJobKind::Snapshot(entry.clone()), move || {
+        let root = saveload::save_dir();
+        if resume_dormant {
+            Simulation::validate_listed_snapshot(root, &entry)?;
+            return Ok(WorldJobOutcome::ResumeDormant);
+        }
         let name = display_name(&entry).to_owned();
-        let simulation = Simulation::load_from_slot(saveload::save_dir(), &entry.id)
-            .map_err(|error| error.to_string())?;
-        Ok(PreparedWorld {
+        let simulation = Simulation::load_listed_snapshot(root, &entry)?;
+        Ok(WorldJobOutcome::Replace(PreparedWorld {
             replacement: WorldReplacement::Snapshot(simulation, entry.id),
             name,
-        })
+        }))
     });
 }
 
@@ -393,15 +440,14 @@ pub(crate) fn world_job_active(uiw: &UiWorld) -> bool {
 
 pub(crate) fn cancel_generation(uiw: &UiWorld) -> bool {
     let mut session = uiw.write::<SessionState>();
-    let cancellable = uiw
-        .read::<SaveLoadState>()
-        .world_job
-        .as_ref()
-        .is_some_and(|job| {
-            job.id == session.world_job_id && matches!(job.kind, WorldJobKind::NewGame)
-        });
+    let mut io = uiw.write::<SaveLoadState>();
+    let cancellable = io.world_job.as_ref().is_some_and(|job| {
+        job.id == session.world_job_id && matches!(job.kind, WorldJobKind::NewGame)
+    });
     if cancellable {
+        io.world_job = None;
         session.world_job_id += 1;
+        drop(io);
         drop(session);
         reset_interaction(uiw);
     }
@@ -547,6 +593,7 @@ pub(crate) struct SaveRequest {
 pub(crate) struct SaveInFlight {
     pub id: u64,
     pub request: SaveRequest,
+    pub revision: SnapshotRevision,
     pub result: Receiver<Result<(CityProgress, simulation::SavePhase), String>>,
 }
 
@@ -746,6 +793,7 @@ pub fn set_screen(uiw: &UiWorld, screen: SessionScreen) -> bool {
         session.refresh_slots |= screen != SessionScreen::Playing;
         let mut io = uiw.write::<SaveLoadState>();
         io.please_save = false;
+        io.world_job = None;
         io.world_error = None;
         drop(io);
         let mut ui = uiw.write::<SessionUi>();
@@ -1246,10 +1294,10 @@ mod p4_fix_ac_tests {
             result,
         });
         sender
-            .send(Ok(PreparedWorld {
+            .send(Ok(WorldJobOutcome::Replace(PreparedWorld {
                 replacement: WorldReplacement::NewGame(Simulation::new(false), SlotId::legacy()),
                 name: "Cancelled".into(),
-            }))
+            })))
             .unwrap();
         assert!(world_job_active(&uiw));
 
@@ -1258,6 +1306,80 @@ mod p4_fix_ac_tests {
         assert!(!world_job_active(&uiw));
         assert_ne!(uiw.read::<SessionState>().world_job_id, 1);
         assert!(uiw.read::<SaveLoadState>().pending.is_none());
+    }
+
+    #[test]
+    fn p4_fix_final_cancel_allows_retry_before_the_old_worker_finishes() {
+        let uiw = ui_with_camera();
+        let (sender, result) = mpsc::channel();
+        uiw.write::<SaveLoadState>().world_job = Some(WorldJob {
+            id: 0,
+            kind: WorldJobKind::NewGame,
+            presented: true,
+            result,
+        });
+        assert!(cancel_generation(&uiw));
+        start_world_job(&uiw, WorldJobKind::NewGame, || Err("new worker".into()));
+
+        assert!(
+            world_job_active(&uiw),
+            "the previous receiver blocked the retry"
+        );
+        assert!(sender
+            .send(Err(WorldJobError::Failed("old worker".into())))
+            .is_err());
+    }
+
+    #[test]
+    fn p4_fix_final_continue_checks_the_dormant_snapshot_revision() {
+        let uiw = ui_with_camera();
+        let sim = Simulation::new(false);
+        let root = std::env::temp_dir().join(format!("p4-fix-final-continue-{}", random_seed()));
+        std::fs::create_dir(&root).unwrap();
+        let slot = SlotId::new("city").unwrap();
+        sim.save_to_slot(&root, &slot, SnapshotRevision::new(1))
+            .unwrap();
+        let listed = discover_slots(&root).unwrap().pop().unwrap().0;
+        uiw.write::<SessionState>()
+            .set_snapshot_slot(Some(slot.clone()));
+        uiw.write::<SessionState>()
+            .remember_loaded_snapshot(listed.clone());
+        uiw.write::<SaveLoadState>().saved_progress = Some(CityProgress::capture(&sim));
+        assert!(can_resume_dormant(&uiw, Some(&sim), &listed));
+        assert!(Simulation::validate_listed_snapshot(&root, &listed).is_ok());
+
+        sim.save_to_slot(&root, &slot, SnapshotRevision::new(2))
+            .unwrap();
+        let replacement = discover_slots(&root).unwrap().pop().unwrap().0;
+        assert!(matches!(
+            Simulation::validate_listed_snapshot(&root, &listed),
+            Err(SaveLoadError::SnapshotChanged)
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(!can_resume_dormant(&uiw, Some(&sim), &replacement));
+    }
+
+    #[test]
+    fn p4_fix_final_open_distinguishes_a_replacement_from_a_listed_snapshot_failure() {
+        let root = std::env::temp_dir().join(format!("p4-fix-final-open-{}", random_seed()));
+        std::fs::create_dir(&root).unwrap();
+        let slot = SlotId::new("city").unwrap();
+        Simulation::new(false)
+            .save_to_slot(&root, &slot, SnapshotRevision::new(1))
+            .unwrap();
+        let listed = discover_slots(&root).unwrap().pop().unwrap().0;
+        let replacement = root.join("replacement.tmp");
+        std::fs::write(&replacement, b"bad snapshot").unwrap();
+        std::fs::File::open(&replacement)
+            .unwrap()
+            .set_modified(listed.modified)
+            .unwrap();
+        std::fs::rename(replacement, &listed.paths.zip).unwrap();
+        let error = Simulation::load_listed_snapshot(&root, &listed)
+            .err()
+            .unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(matches!(error, SaveLoadError::SnapshotChanged), "{error}");
     }
 
     #[test]

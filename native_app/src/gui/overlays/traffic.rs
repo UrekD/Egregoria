@@ -20,6 +20,9 @@ pub(super) const AVAILABLE: bool = true;
 
 const SAMPLE_INTERVAL: Duration = Duration::from_millis(500);
 const SAMPLE_EXPIRY: Duration = Duration::from_millis(1500);
+const SAMPLE_BUDGET: Duration = Duration::from_millis(2);
+const ROADS_PER_BATCH: usize = 64;
+const MAX_BATCHES_PER_FRAME: usize = 2;
 const EMA_ALPHA: f32 = 0.3;
 const ROAD_LIFT: f32 = 0.55;
 const NO_DATA: [f32; 4] = [0.35, 0.38, 0.42, 1.0];
@@ -30,7 +33,8 @@ struct TrafficOverlay {
     road_bounds: Option<AABB3>,
     projection: [f32; 16],
     visible: Vec<RoadID>,
-    sampler: Option<RoadSampler>,
+    samplers: Vec<RoadSampler>,
+    next_road: Option<usize>,
     history: BTreeMap<RoadID, RecentTraffic>,
     last_sample: Option<Instant>,
 }
@@ -104,43 +108,15 @@ impl TrafficOverlay {
             self.projection = projection;
             let visible = visible_roads(camera, map, self.road_bounds);
             if roads_changed || self.visible != visible {
-                self.sampler = None;
+                self.samplers.clear();
+                self.next_road = None;
                 self.visible = visible;
             }
             self.history
                 .retain(|road, _| self.visible.binary_search(road).is_ok());
         }
 
-        let sample_due = !self.visible.is_empty()
-            && self
-                .last_sample
-                .is_none_or(|last| now - last >= SAMPLE_INTERVAL);
-        if sample_due {
-            self.last_sample = Some(now);
-            self.history
-                .retain(|_, recent| now - recent.observed_at < SAMPLE_EXPIRY);
-            let sampler = self
-                .sampler
-                .get_or_insert_with(|| RoadSampler::new(map, self.visible.iter().copied()));
-            for (id, observed) in sampler.sample(sim) {
-                if let Some(recent) = self.history.get_mut(&id) {
-                    recent.rel_speed += EMA_ALPHA * (observed.rel_speed - recent.rel_speed);
-                    recent.observed_at = now;
-                } else if let Some(road) = map.get(id) {
-                    self.history.insert(
-                        id,
-                        RecentTraffic {
-                            rel_speed: observed.rel_speed,
-                            observed_at: now,
-                            points: road.interfaced_points.as_slice().to_vec(),
-                            turns: road_turns(map, road).collect(),
-                        },
-                    );
-                }
-            }
-        }
-
-        if view_changed || sample_due {
+        if view_changed {
             draw.clear_persistent();
             for road in self.visible.iter().filter_map(|&id| map.get(id)) {
                 let color = self
@@ -157,6 +133,82 @@ impl TrafficOverlay {
                     .color(color)
                     .persistent();
             }
+        }
+
+        if self.next_road.is_none()
+            && !self.visible.is_empty()
+            && self
+                .last_sample
+                .is_none_or(|last| now - last >= SAMPLE_INTERVAL)
+        {
+            self.last_sample = Some(now);
+            self.next_road = Some(0);
+        }
+
+        let start = Instant::now();
+        let mut previous = Duration::ZERO;
+        self.sample_frame(sim, map, draw, now, || {
+            let elapsed = start.elapsed();
+            let batch_cost = elapsed - previous;
+            previous = elapsed;
+            elapsed + batch_cost >= SAMPLE_BUDGET
+        });
+    }
+
+    fn sample_frame(
+        &mut self,
+        sim: &Simulation,
+        map: &Map,
+        draw: &mut ImmediateDraw,
+        now: Instant,
+        mut out_of_budget: impl FnMut() -> bool,
+    ) {
+        for _ in 0..MAX_BATCHES_PER_FRAME {
+            let Some(start) = self.next_road else {
+                break;
+            };
+            if out_of_budget() {
+                break;
+            }
+            let end = (start + ROADS_PER_BATCH).min(self.visible.len());
+            let roads = &self.visible[start..end];
+            let batch = start / ROADS_PER_BATCH;
+            if batch == self.samplers.len() {
+                self.samplers
+                    .push(RoadSampler::new(map, roads.iter().copied()));
+            }
+            let observed = self.samplers[batch].sample(sim);
+            for (index, &id) in (start..end).zip(roads) {
+                if self
+                    .history
+                    .get(&id)
+                    .is_some_and(|recent| now - recent.observed_at >= SAMPLE_EXPIRY)
+                {
+                    self.history.remove(&id);
+                }
+                if let Some(observed) = observed.get(&id) {
+                    if let Some(recent) = self.history.get_mut(&id) {
+                        recent.rel_speed += EMA_ALPHA * (observed.rel_speed - recent.rel_speed);
+                        recent.observed_at = now;
+                    } else if let Some(road) = map.get(id) {
+                        self.history.insert(
+                            id,
+                            RecentTraffic {
+                                rel_speed: observed.rel_speed,
+                                observed_at: now,
+                                points: road.interfaced_points.as_slice().to_vec(),
+                                turns: road_turns(map, road).collect(),
+                            },
+                        );
+                    }
+                }
+                let color = self
+                    .history
+                    .get(&id)
+                    .map_or(NO_DATA, |recent| speed_color(recent.rel_speed));
+                draw.persistent_orders[index].color = color.into();
+            }
+            self.next_road = (end < self.visible.len()).then_some(end);
         }
     }
 }
@@ -474,6 +526,66 @@ mod tests {
     }
 
     #[test]
+    fn p4_fix_final_traffic_updates_only_a_batch_of_roads_per_frame() {
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        let roads = grid_city(&mut ctx, vec2(150.0, 150.0), 12, 12, 120.0).roads;
+        for &road in &roads {
+            let pos = {
+                let map = ctx.sim.map();
+                let lane = map
+                    .get(road)
+                    .unwrap()
+                    .lanes_iter()
+                    .find(|&(_, kind)| kind == LaneKind::Driving)
+                    .unwrap()
+                    .0;
+                map.get(lane).unwrap().points.point_along(55.0)
+            };
+            spawn_driving_vehicle(&mut ctx.sim, VehicleKind::Car, Transform::new(pos)).unwrap();
+        }
+        let mut camera = camera(810.0, 810.0).camera;
+        camera.dist = 2_800.0;
+        camera.update();
+        let mut traffic = TrafficOverlay::default();
+        let mut draw = ImmediateDraw::default();
+        let now = Instant::now();
+        let map = ctx.sim.map();
+        traffic.update(&ctx.sim, &map, &camera, &mut draw, false, now);
+        let max_roads = ROADS_PER_BATCH * MAX_BATCHES_PER_FRAME;
+        assert!(traffic.visible.len() > max_roads);
+        assert!((1..=max_roads).contains(&traffic.history.len()));
+        let expected = simulation::transportation::traffic_metrics::sample(
+            &ctx.sim,
+            traffic.visible.iter().copied(),
+        );
+
+        let before = traffic.next_road.unwrap();
+        let mut budget_checks = 0;
+        traffic.sample_frame(&ctx.sim, &map, &mut draw, now, || {
+            budget_checks += 1;
+            budget_checks > 1
+        });
+        assert_eq!(budget_checks, 2);
+        assert_eq!(traffic.next_road, Some(before + ROADS_PER_BATCH));
+        assert_eq!(
+            traffic.history.len(),
+            traffic.visible[..before + ROADS_PER_BATCH]
+                .iter()
+                .filter(|id| expected.contains_key(id))
+                .count()
+        );
+        for _ in 0..traffic.visible.len().div_ceil(ROADS_PER_BATCH) {
+            traffic.update(&ctx.sim, &map, &camera, &mut draw, false, now);
+        }
+        assert!(traffic.history.keys().eq(expected.keys()));
+        assert!(traffic.next_road.is_none());
+    }
+
+    #[test]
     #[ignore = "runs the release perf_10k city"]
     fn p4e_traffic_sampler_perf_10k() {
         let (scenario, options) = scenarios::builtin::PERF_10K;
@@ -486,60 +598,57 @@ mod tests {
         *uiw.camera_mut() = OrbitCamera::from_camera(camera);
 
         let mut timings = Vec::new();
-        let mut cold_peak = 0.0_f64;
         for ticks in [0, 300, 300] {
             ctx.run_ticks(ticks);
             super::super::draw(&ctx.sim, &uiw);
-            let sample = || {
-                TRAFFIC
-                    .with_borrow_mut(|traffic| traffic.sampler.as_mut().unwrap().sample(&ctx.sim))
-            };
             let roads = TRAFFIC.with_borrow(|traffic| traffic.visible.clone());
-            let observed = sample();
-            assert!(!observed.is_empty());
-            let start = Instant::now();
-            let mut rebuilt = RoadSampler::new(&ctx.sim.map(), roads.iter().copied());
-            let rebuilt = rebuilt.sample(&ctx.sim);
-            let rebuild_and_sample_ms = start.elapsed().as_secs_f64() * 1000.0;
-            cold_peak = cold_peak.max(rebuild_and_sample_ms);
-            assert_eq!(observed, rebuilt);
-            assert_eq!(
-                observed,
-                simulation::transportation::traffic_metrics::sample(
-                    &ctx.sim,
-                    roads.iter().copied()
-                )
+            let observed = simulation::transportation::traffic_metrics::sample(
+                &ctx.sim,
+                roads.iter().copied(),
             );
+            assert!(!observed.is_empty());
             let vehicles: u32 = observed.values().map(|road| road.samples).sum();
             println!(
-                "tick {}, residents {}, visible roads {}, sampled vehicles {}, rebuild and sample {:.3} ms",
+                "tick {}, residents {}, visible roads {}, sampled vehicles {}",
                 ctx.sim.get_tick(),
                 ctx.sim.world().humans.len(),
                 roads.len(),
                 vehicles,
-                rebuild_and_sample_ms
             );
+            let map = ctx.sim.map();
+            let mut draw = uiw.write::<ImmediateDraw>();
+            let now = Instant::now();
+            TRAFFIC.with_borrow_mut(|traffic| {
+                traffic.history.clear();
+                traffic.samplers.clear();
+                traffic.next_road = Some(0);
+                traffic.last_sample = Some(now);
+            });
             for _ in 0..128 {
-                let start = Instant::now();
-                let result = sample();
-                timings.push(start.elapsed().as_secs_f64() * 1000.0);
-                std::hint::black_box(&result);
+                TRAFFIC.with_borrow_mut(|traffic| {
+                    if traffic.next_road.is_none() {
+                        assert_eq!(observed.len(), traffic.history.len());
+                        assert!(observed.iter().all(|(id, speed)| {
+                            (traffic.history[id].rel_speed - speed.rel_speed).abs() < f32::EPSILON
+                        }));
+                        traffic.next_road = Some(0);
+                    }
+                    let start = Instant::now();
+                    traffic.update(&ctx.sim, &map, &camera, &mut draw, false, now);
+                    timings.push(start.elapsed().as_secs_f64() * 1000.0);
+                });
             }
         }
         timings.sort_unstable_by(f64::total_cmp);
         let peak = *timings.last().unwrap();
         println!(
-            "{} cached samples, median {:.3} ms, p95 {:.3} ms, p99 {:.3} ms, peak {:.3} ms; rebuild and sample peak {:.3} ms",
+            "{} sampling frames, median {:.3} ms, p95 {:.3} ms, p99 {:.3} ms, peak {:.3} ms",
             timings.len(),
             timings[timings.len() / 2],
             timings[(timings.len() * 95).div_ceil(100) - 1],
             timings[(timings.len() * 99).div_ceil(100) - 1],
             peak,
-            cold_peak,
         );
-        assert!(
-            peak.max(cold_peak) <= 2.0,
-            "sampler exceeded the 2 ms wall-clock budget"
-        );
+        assert!(peak <= 2.0, "sampler exceeded the 2 ms wall-clock budget");
     }
 }
