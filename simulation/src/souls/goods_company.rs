@@ -79,19 +79,24 @@ pub fn recipe_blockers<'a>(
 }
 
 pub fn recipe_act(recipe: &Recipe, soul: SoulID, near: Vec2, market: &mut Market) {
-    run_recipe(recipe, soul, near, market, |_| false);
+    run_recipe(recipe, soul, near, market, |_| false, |_| false);
 }
 
+/// Inputs with a truck on its way are not ordered from a station: the recipe
+/// waits for the delivery.
 fn run_recipe(
     recipe: &Recipe,
     soul: SoulID,
     near: Vec2,
     market: &mut Market,
     road_freight: impl Fn(ItemID) -> bool,
+    trucked_in: impl Fn(ItemID) -> bool,
 ) {
     for item in &recipe.consumption {
         market.produce(soul, item.id, -item.amount);
-        market.buy_until(soul, near, item.id, item.amount as u32);
+        if !trucked_in(item.id) {
+            market.buy_until(soul, near, item.id, item.amount as u32);
+        }
     }
     for item in &recipe.production {
         market.produce(soul, item.id, item.amount);
@@ -262,6 +267,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
     let coal_plant = GoodsCompanyID::new("coal-power-plant");
     let coal = ItemID::new("coal");
     let growable_freight = res.read::<CargoBook>().growable_freight;
+    let trucked_in = res.read::<CargoBook>().inputs_in_transit();
 
     world.companies.iter_mut().for_each(|(me, c)| {
         let soul = SoulID::GoodsCompany(me);
@@ -286,21 +292,53 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                 let productivity = c.productivity(proto, b.zone.as_ref(), map, elec_flow);
 
                 c.comp.progress += productivity * DELTA / recipe.duration.seconds() as f32;
-            } else if proto.id == coal_plant && market.capital(soul, coal) == 0 {
-                record_coal_stockout(res, coal);
+            } else {
+                if proto.id == coal_plant && market.capital(soul, coal) == 0 {
+                    record_coal_stockout(res, coal);
+                }
+                // Once no truck is bringing a missing input, a live station may fill it.
+                let reorder: Vec<_> = recipe
+                    .consumption
+                    .iter()
+                    .filter(|item| {
+                        market.capital(soul, item.id) < item.amount
+                            && !trucked_in.contains(&(soul, item.id))
+                            && market.inner()[&item.id].buy_order(soul).is_none()
+                    })
+                    .map(|item| (item.id, item.amount as u32))
+                    .collect();
+                if !reorder.is_empty() {
+                    let near = b.door_pos.xy();
+                    cbuf.exec_on(me, move |market: &mut Market| {
+                        for (item, amount) in reorder {
+                            market.buy_until(soul, near, item, amount);
+                        }
+                    });
+                }
             }
 
             if c.comp.progress >= 1.0 {
                 c.comp.progress -= 1.0;
                 let kind = c.comp.proto;
                 let bpos = b.door_pos;
+                let waiting: Vec<_> = recipe
+                    .consumption
+                    .iter()
+                    .map(|item| item.id)
+                    .filter(|&item| trucked_in.contains(&(soul, item)))
+                    .collect();
 
                 cbuf.exec_on(me, move |market| {
                     let proto = kind.prototype();
                     let recipe = proto.recipe.as_ref().unwrap();
-                    run_recipe(recipe, soul, bpos.xy(), market, |item| {
-                        uses_road_freight(proto, item, growable_freight)
-                    });
+                    run_recipe(
+                        recipe,
+                        soul,
+                        bpos.xy(),
+                        market,
+                        |item| uses_road_freight(proto, item, growable_freight),
+                        |item| waiting.contains(&item),
+                    );
                 });
                 return;
             }

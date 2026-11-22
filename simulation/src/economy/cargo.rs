@@ -140,7 +140,7 @@ struct SuspendedRoute {
 /// What a warehouse is doing, or why it is idle, as of the last freight match.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WarehouseActivity {
-    /// A truck is on the road to or from it.
+    /// One of its trucks or a delivery to it is on the road.
     Moving,
     /// Cargo to or from it waits for a driver at the loading dock.
     Queued,
@@ -310,6 +310,18 @@ impl CargoBook {
     /// Whether the warehouse is below its low watermark and refilling to high.
     pub fn is_restocking(&self, company: CompanyID) -> bool {
         self.restocking.contains(&company)
+    }
+
+    /// Recipients and items with a loaded truck on its way.
+    pub(crate) fn inputs_in_transit(&self) -> BTreeSet<(SoulID, ItemID)> {
+        self.loads
+            .values()
+            .flat_map(|load| {
+                load.items
+                    .iter()
+                    .map(|line| (load.destination.soul, line.item))
+            })
+            .collect()
     }
 
     /// The warehouse's state at the last freight match, if it has been matched.
@@ -2077,6 +2089,7 @@ fn record_warehouse_activity(
             .loads
             .values()
             .any(|load| load.source() == building || load.destination() == building)
+            || book.returning.values().any(|trip| trip.depot == warehouse)
         {
             WarehouseActivity::Moving
         } else if book
@@ -3621,5 +3634,48 @@ mod lifecycle_tests {
         f.ctx.tick_fast();
         f.update(2 * FREIGHT_MATCH_INTERVAL);
         assert_eq!(activity(&f, id), Some(WarehouseActivity::NoSupplierInReach));
+    }
+
+    #[test]
+    fn whfix_a_store_waits_for_its_truck_instead_of_importing_then_reorders() {
+        let mut f = Fixture::with_companies("industrial-l1", "commercial-l1");
+        station(&mut f, true);
+        let goods = ItemID::new("goods");
+        let store = f.destination;
+        let SoulID::GoodsCompany(store_id) = store.soul else {
+            unreachable!()
+        };
+        {
+            let mut market = f.ctx.g.write::<Market>();
+            market.receive_freight(store.soul, goods, 2);
+            market.produce(f.source.soul, goods, 16);
+        }
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(f.manifest_units(), 16, "a truck is on its way to the store");
+
+        // The store uses its last goods while the truck drives.
+        f.ctx.g.world_mut_unchecked().companies[store_id]
+            .comp
+            .progress = 1.0;
+        for _ in 0..10 {
+            f.ctx.tick_fast();
+        }
+        let market = f.ctx.g.read::<Market>();
+        assert_eq!(market.capital(store.soul, goods), 0, "no station import");
+        assert!(market.inner()[&goods].buy_order(store.soul).is_none());
+        drop(market);
+
+        // Without the truck, the station fills the stockout.
+        f.ctx
+            .apply(&[WorldCommand::MapRemoveBuilding(f.source.building)]);
+        for _ in 0..10 {
+            f.ctx.tick_fast();
+        }
+        assert!(f.ctx.g.read::<CargoBook>().manifest_for(f.truck).is_none());
+        assert_eq!(
+            f.ctx.g.read::<Market>().capital(store.soul, goods),
+            2,
+            "the station fills the store once no truck is coming",
+        );
     }
 }

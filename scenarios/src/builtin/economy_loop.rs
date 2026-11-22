@@ -1,5 +1,5 @@
 use geom::vec2;
-use prototypes::{GameTime, GoodsCompanyID, ItemID, RecTimeInterval, TICKS_PER_HOUR};
+use prototypes::{CompanyKind, GameTime, GoodsCompanyID, ItemID, RecTimeInterval, TICKS_PER_HOUR};
 use simulation::economy::cargo::CargoBook;
 use simulation::economy::{DailyEconomyMetrics, Market, TripPurpose, TICKS_PER_BUDGET_DAY};
 use simulation::map::Density::{High, Low};
@@ -86,6 +86,7 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mut total_coal_road = 0;
     let mut total_coal_station = 0;
     let coal = ItemID::new("coal");
+    let goods = ItemID::new("goods");
     let plant = GoodsCompanyID::new("coal-power-plant");
     let failures_before = ctx.sim.read::<Market>().basket_failures().clone();
 
@@ -113,6 +114,7 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         // Separate the plant's coal by lane: verified truck unloads, and
         // station imports that filled an order freight left open.
         let (mut cancelled, mut coal_road, mut coal_station) = (0, 0, 0);
+        let (mut store_road, mut store_station) = (0, 0);
         if let Some(freight) = ctx.sim.read::<CargoBook>().freight_day(day) {
             cancelled = freight.cancelled_loads;
             for (id, company) in &ctx.sim.world().companies {
@@ -121,8 +123,19 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
                     coal_road += receipt.road_units;
                     coal_station += receipt.station_units;
                 }
+                if company.comp.proto.prototype().kind == CompanyKind::Store {
+                    let receipt = freight.receipt(SoulID::GoodsCompany(id), goods);
+                    store_road += receipt.road_units;
+                    store_station += receipt.station_units;
+                }
             }
         }
+        // Stores stock goods from trucks. A live station fills a stockout that
+        // no truck is on its way to.
+        println!(
+            "economy_loop store goods day {day}: {store_road} units by road, {store_station} \
+             station imports"
+        );
         total_loads += loads;
         total_load_units += load_units;
         total_late += late;
