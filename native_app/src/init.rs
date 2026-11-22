@@ -27,7 +27,8 @@ use crate::gui::{
 use crate::inputmap::{Bindings, InputMap};
 use crate::network::NetworkState;
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
-use crate::session::{SessionScreen, SessionState, WorldResetHook, WorldResetHooks};
+use crate::session::save_coordinator::SaveCoordinator;
+use crate::session::{SessionScreen, SessionState, SessionUi, WorldResetHook, WorldResetHooks};
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
 use common::saveload::Encoder;
 use serde::de::DeserializeOwned;
@@ -52,6 +53,8 @@ fn register_ui_resources() {
 
     register_resource_noserialize::<SessionScreen>();
     register_resource_noserialize::<SessionState>();
+    register_resource_noserialize::<SessionUi>();
+    register_resource_noserialize::<SaveCoordinator>();
     register_resource_noserialize::<WorldResetHooks>();
     register_resource_noserialize::<GuiState>();
     register_world_resource::<TerraformingResource>();
