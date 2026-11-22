@@ -1,20 +1,22 @@
 use std::collections::BTreeMap;
 
 use common::{FastMap, FastSet};
-use geom::AABB;
+use geom::{Vec3, AABB};
 
 use crate::economy::cargo::{CargoBook, ItemQuantity};
 use crate::economy::TripPurpose;
-use crate::map::{BuildingID, Lane, LaneKind, Map, RoadID, TraverseKind};
+use crate::map::{BuildingID, Lane, LaneKind, Map, Road, RoadID, TraverseKind};
 use crate::map_dynamic::{Itinerary, Transit};
 use crate::souls::desire::WorkKind;
-use crate::transportation::{Location, VehicleKind, VehicleState};
+use crate::transportation::{Location, VehicleKind, VehicleState, TIME_TO_PARK};
 use crate::{Simulation, VehicleEnt, VehicleID};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct RoadTraffic {
     pub vehicles: u16,
     pub rel_speed: f32,
+    /// Mean vehicle speed as a fraction of each vehicle's posted lane limit.
+    pub rel_limit_speed: f32,
     /// Number of usable vehicle observations in this sample.
     pub samples: u32,
 }
@@ -43,6 +45,7 @@ pub enum TruckCargo {
 #[derive(Default)]
 struct Observations {
     total_speed: f64,
+    total_limit_ratio: f64,
     count: u32,
 }
 
@@ -51,6 +54,11 @@ const LANE_SEARCH_RADIUS: f32 = 8.0;
 /// Identifies the map and the revision of its road network, including turns.
 pub fn road_network_revision(map: &Map) -> (u64, u64) {
     (map.identity(), map.walking_topology_generation)
+}
+
+/// Whether the road uses elevated deck geometry, including inherited spans.
+pub fn road_is_elevated(road: &Road) -> bool {
+    road.elevated_span()
 }
 
 /// UI-owned lookup for repeatedly sampling the same roads.
@@ -101,7 +109,7 @@ pub fn sample(
 }
 
 /// Snapshot of traffic occupying a single road. A bus at a stop still occupies its
-/// lane. For a junction turn, attribute the traveler to its destination lane.
+/// lane. A traveler inside a junction turn is between roads.
 pub fn sample_road_users(sim: &Simulation, road: RoadID) -> RoadUsers {
     profiling::scope!("traffic_metrics::sample_road_users");
     let map = sim.map();
@@ -114,24 +122,7 @@ pub fn sample_road_users(sim: &Simulation, road: RoadID) -> RoadUsers {
     let cargo = sim.read::<CargoBook>();
 
     for (id, vehicle) in sim.world().vehicles.iter() {
-        if !matches!(
-            vehicle.vehicle.state,
-            VehicleState::Driving
-                | VehicleState::Panicking(_)
-                | VehicleState::ReturningToDepot { .. }
-        ) || !vehicle.trans.pos.is_finite()
-        {
-            continue;
-        }
-        let lane = if vehicle.it.get_travers().is_some() {
-            occupying_lane(&map, &vehicle.it, vehicle.trans.pos, road)
-        } else if bounds.contains_within(vehicle.trans.pos.xy(), LANE_SEARCH_RADIUS) {
-            nearest_driving_lane(&map, vehicle)
-                .filter(|lane| lane.parent == road && within_lane(lane, vehicle.trans.pos))
-        } else {
-            None
-        };
-        if !lane.is_some_and(|lane| matches!(lane.kind, LaneKind::Driving | LaneKind::Bus)) {
+        if vehicle_lane(&map, vehicle, Some(bounds), |id| id == road).is_none() {
             continue;
         }
         match vehicle.vehicle.kind {
@@ -160,8 +151,11 @@ pub fn sample_road_users(sim: &Simulation, road: RoadID) -> RoadUsers {
 
     for human in sim.world().humans.values() {
         if human.location == Location::Outside
-            && occupying_lane(&map, &human.it, human.trans.pos, road)
-                .is_some_and(|lane| lane.kind == LaneKind::Walking)
+            && route_lane(&map, &human.it).is_some_and(|lane| {
+                lane.parent == road
+                    && lane.kind == LaneKind::Walking
+                    && within_lane(lane, human.trans.pos)
+            })
         {
             users.pedestrians += 1;
         }
@@ -192,24 +186,65 @@ pub fn sample_road_users(sim: &Simulation, road: RoadID) -> RoadUsers {
     users
 }
 
-fn occupying_lane<'a>(
-    map: &'a Map,
-    itinerary: &Itinerary,
-    pos: geom::Vec3,
-    road: RoadID,
-) -> Option<&'a Lane> {
-    let traversal = itinerary.get_travers()?;
-    let lane = map.get(traversal.destination_lane())?;
-    if lane.parent != road {
+fn route_lane<'a>(map: &'a Map, itinerary: &Itinerary) -> Option<&'a Lane> {
+    let TraverseKind::Lane(id) = itinerary.get_travers()?.kind else {
         return None;
-    }
-    // An itinerary can have its first lane assigned while still off-road.
-    (matches!(traversal.kind, TraverseKind::Turn(_)) || within_lane(lane, pos)).then_some(lane)
+    };
+    map.get(id)
 }
 
-fn within_lane(lane: &Lane, pos: geom::Vec3) -> bool {
+pub(crate) fn within_lane(lane: &Lane, pos: Vec3) -> bool {
     let half_width = lane.kind.width() * 0.5;
     lane.points.project_dist2(pos) <= half_width * half_width
+}
+
+fn vehicle_lane<'a>(
+    map: &'a Map,
+    entity: &VehicleEnt,
+    fallback_bounds: Option<AABB>,
+    requested: impl Fn(RoadID) -> bool,
+) -> Option<&'a Lane> {
+    let pos = entity.trans.pos;
+    if !pos.is_finite() {
+        return None;
+    }
+    match &entity.vehicle.state {
+        VehicleState::RoadToPark(_, _, reservation) => {
+            // The animation crosses from the driving lane into a parking lane
+            // on the same road. Use the adjacent driving lane's speed limit.
+            let parking = map.get(reservation.get(&map.parking)?.parent)?;
+            if !requested(parking.parent) {
+                return None;
+            }
+            let road = map.get(parking.parent)?;
+            let (lane, _) = road
+                .outgoing_lanes_from(parking.src)
+                .iter()
+                .rfind(|&&(_, kind)| kind == LaneKind::Driving)?;
+            map.get(*lane)
+        }
+        VehicleState::Driving
+        | VehicleState::Panicking(_)
+        | VehicleState::ReturningToDepot { .. } => {
+            let lane = if entity.it.get_travers().is_some() {
+                route_lane(map, &entity.it)?
+            } else {
+                // A route-less driver may be stopped on a travel lane.
+                if fallback_bounds
+                    .is_some_and(|bounds| !bounds.contains_within(pos.xy(), LANE_SEARCH_RADIUS))
+                {
+                    return None;
+                }
+                let id = map.nearest_lane(pos, LaneKind::Driving, Some(LANE_SEARCH_RADIUS))?;
+                map.get(id)?
+            };
+            (requested(lane.parent)
+                && matches!(lane.kind, LaneKind::Driving | LaneKind::Bus)
+                && within_lane(lane, pos))
+            .then_some(lane)
+        }
+        VehicleState::Parked(_) | VehicleState::ParkedAtDepot => None,
+    }
 }
 
 fn sample_visible(
@@ -226,35 +261,27 @@ fn sample_visible(
     let mut observations: FastMap<_, Observations> = FastMap::default();
     // Vehicle slot order fixes the order of floating-point additions.
     for (id, ent) in sim.world().vehicles.iter() {
-        if !matches!(
-            ent.vehicle.state,
-            VehicleState::Driving | VehicleState::Panicking(_)
-        ) || !ent.speed.0.is_finite()
-            || !ent.trans.pos.is_finite()
-            || matches!(ent.vehicle.kind, VehicleKind::Bus)
-                && transit
-                    .runs
-                    .get(&id)
-                    .is_some_and(|run| run.dwell_until.is_some())
+        if matches!(ent.vehicle.kind, VehicleKind::Bus)
+            && transit
+                .runs
+                .get(&id)
+                .is_some_and(|run| run.dwell_until.is_some())
         {
             continue;
         }
-
-        let lane = if let Some(traversable) = ent.it.get_travers() {
-            map.get(traversable.destination_lane())
-        } else {
-            // Avoid searching outside the requested roads' envelope. Near its
-            // edge, an unrequested road can still provide the nearest lane.
-            if fallback_bounds.is_some_and(|bounds| {
-                !bounds.contains_within(ent.trans.pos.xy(), LANE_SEARCH_RADIUS)
-            }) {
-                continue;
-            }
-            nearest_driving_lane(map, ent)
-        };
-        let Some(lane) = lane.filter(|lane| requested.contains(&lane.parent)) else {
+        let Some(lane) = vehicle_lane(map, ent, fallback_bounds, |road| requested.contains(&road))
+        else {
             continue;
         };
+        let speed = match ent.vehicle.state {
+            VehicleState::RoadToPark(spline, progress, _) => {
+                spline.derivative(progress).mag() / TIME_TO_PARK
+            }
+            _ => ent.speed.0,
+        };
+        if !speed.is_finite() {
+            continue;
+        }
 
         // Vehicle movement applies the kind factor and individual multiplier
         // to the lane limit when computing free-flow speed.
@@ -269,7 +296,8 @@ fn sample_visible(
             continue;
         }
         let road = observations.entry(lane.parent).or_default();
-        road.total_speed += (f64::from(ent.speed.0) / f64::from(effective_limit)).clamp(0.0, 1.0);
+        road.total_speed += (f64::from(speed) / f64::from(effective_limit)).clamp(0.0, 1.0);
+        road.total_limit_ratio += (f64::from(speed) / f64::from(limit)).max(0.0);
         road.count = road.count.saturating_add(1);
     }
 
@@ -281,19 +309,12 @@ fn sample_visible(
                 RoadTraffic {
                     vehicles: road.count.min(u32::from(u16::MAX)) as u16,
                     rel_speed: (road.total_speed / f64::from(road.count)) as f32,
+                    rel_limit_speed: (road.total_limit_ratio / f64::from(road.count)) as f32,
                     samples: road.count,
                 },
             )
         })
         .collect()
-}
-
-fn nearest_driving_lane<'a>(map: &'a Map, entity: &VehicleEnt) -> Option<&'a Lane> {
-    // A route-less car can wait on a road. Bound the projection to avoid
-    // assigning a vehicle in a yard or on another level to a distant lane.
-    let pos = entity.trans.pos;
-    let lane = map.get(map.nearest_lane(pos, LaneKind::Driving, Some(LANE_SEARCH_RADIUS))?)?;
-    (lane.points.project_dist2(pos) <= LANE_SEARCH_RADIUS * LANE_SEARCH_RADIUS).then_some(lane)
 }
 
 #[cfg(test)]
@@ -357,6 +378,58 @@ mod tests {
     }
 
     #[test]
+    fn u5_traffic_ignores_a_route_assigned_to_an_off_lane_vehicle() {
+        let (mut ctx, [road, _], [lane, _]) = streets();
+        let car = add_vehicle(&mut ctx, lane, 30.0, VehicleKind::Car);
+        let pos = ctx.g.world.vehicles[car].trans.pos + vec3(0.0, -9.0, 0.0);
+        let route = {
+            let map = ctx.g.map();
+            Itinerary::route_to_lane(Tick(0), pos, &map, lane, 85.0).unwrap()
+        };
+        ctx.g.world.vehicles[car].it = route;
+        ctx.g.world.vehicles[car].trans.pos = pos;
+        assert_eq!(sample_road_users(&ctx.g, road).cars, 0);
+        assert_eq!(sample(&ctx.g, [road].into_iter()).get(&road), None);
+    }
+
+    #[test]
+    fn u5_traffic_includes_returning_and_parking_trucks_in_both_samples() {
+        use crate::map_dynamic::ParkingManagement;
+
+        let (mut ctx, [road, _], [lane, _]) = streets();
+        let truck = add_vehicle(&mut ctx, lane, 30.0, VehicleKind::Truck);
+        let pos = ctx.g.world.vehicles[truck].trans.pos;
+        let reserve = |sim: &Simulation| {
+            sim.write::<ParkingManagement>()
+                .reserve_near(pos, &sim.map())
+                .unwrap()
+        };
+        ctx.g.world.vehicles[truck].vehicle.state = VehicleState::ReturningToDepot {
+            spot: reserve(&ctx.g),
+            stopped_ticks: 0,
+        };
+        ctx.g.world.vehicles[truck].speed.0 = 3.0;
+        assert_eq!(sample_road_users(&ctx.g, road).trucks, 1);
+        assert_eq!(
+            sample(&ctx.g, [road].into_iter())
+                .get(&road)
+                .map(|t| t.samples),
+            Some(1)
+        );
+
+        let spot = reserve(&ctx.g);
+        let target = spot.get(&ctx.g.map().parking).unwrap().trans;
+        ctx.g.world.vehicles[truck].begin_parking(target, spot);
+        assert_eq!(sample_road_users(&ctx.g, road).trucks, 1);
+        assert_eq!(
+            sample(&ctx.g, [road].into_iter())
+                .get(&road)
+                .map(|t| t.samples),
+            Some(1)
+        );
+    }
+
+    #[test]
     fn p4e_traffic_stopped_drivers_count_but_parked_and_dwelling_do_not() {
         let (mut ctx, [road, empty], [lane, _]) = streets();
         add_vehicle(&mut ctx, lane, 20.0, VehicleKind::Car);
@@ -384,6 +457,7 @@ mod tests {
             Some(&RoadTraffic {
                 vehicles: 1,
                 rel_speed: 0.0,
+                rel_limit_speed: 0.0,
                 samples: 1
             })
         );
@@ -482,7 +556,7 @@ mod tests {
     }
 
     #[test]
-    fn p4e_traffic_aggregation_is_deterministic_and_turns_use_destination_lane() {
+    fn p4e_traffic_aggregation_is_deterministic_and_excludes_junction_turns() {
         let (mut ctx, [from, to], [from_lane, to_lane]) = streets();
         let truck = add_vehicle(&mut ctx, to_lane, 20.0, VehicleKind::Truck);
         let turning = add_vehicle(&mut ctx, from_lane, 30.0, VehicleKind::Car);
@@ -521,11 +595,16 @@ mod tests {
         assert_eq!(
             traffic.get(&to),
             Some(&RoadTraffic {
-                vehicles: 2,
-                rel_speed: 0.75,
-                samples: 2
+                vehicles: 1,
+                rel_speed: 1.0,
+                rel_limit_speed: 0.8,
+                samples: 1
             })
         );
         assert!(sample(&ctx.g, [from].into_iter()).is_empty());
+        assert_eq!(sample_road_users(&ctx.g, from).cars, 0);
+        let users = sample_road_users(&ctx.g, to);
+        assert_eq!(users.cars, 1); // The car with an invalid speed still occupies its lane.
+        assert_eq!(users.trucks, 1);
     }
 }

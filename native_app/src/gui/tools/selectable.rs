@@ -3,7 +3,8 @@ use crate::gui::{InspectedBuilding, InspectedEntity, InspectedRoad, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
-use geom::{Ray3, Vec2, Vec3, AABB};
+use engine::Tesselator;
+use geom::{Intersect, Ray3, Segment, Vec2, Vec3};
 use simulation::map::{Map, ProjectFilter, ProjectKind, Road, RoadID};
 use simulation::{AnyEntity, Simulation};
 
@@ -115,55 +116,61 @@ fn pick_road(map: &Map, ray: Ray3, terrain: Option<Vec3>) -> Option<RoadID> {
     let limit = terrain.map_or(f32::INFINITY, |pos| {
         (pos - ray.from).dot(ray.dir) / ray.dir.mag2()
     });
-    let hit = |road: &Road| road_hit(road, ray, limit).map(|depth| (depth, road.id));
-    let nearest =
-        |a: &(f32, RoadID), b: &(f32, RoadID)| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1));
-    let picked = if let Some(pos) = terrain {
-        let from = ray.from.xy();
-        let to = pos.xy();
-        let bounds = AABB::new_ll_ur(from.min(to), from.max(to)).expand(0.5);
-        map.spatial_map()
-            .query(bounds, ProjectFilter::ROAD)
-            .filter_map(|kind| match kind {
-                ProjectKind::Road(id) => map.get(id),
-                _ => None,
+    let ray_xy = terrain.map(|_| Segment::new(ray.from.xy(), (ray.from + ray.dir * limit).xy()));
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let mut mesh = Tesselator::new(&mut vertices, &mut indices, None, 1.0);
+
+    map.roads()
+        .values()
+        .filter(|road| {
+            // The tessellator caps a join's miter at ten times the half-width.
+            // The spatial index uses the centerline and plain half-width.
+            ray_xy.is_none_or(|ray| {
+                road.interfaced_points()
+                    .bbox()
+                    .flatten()
+                    .expand(5.0 * road.width)
+                    .intersects(&ray)
             })
-            .filter_map(hit)
-            .min_by(nearest)
-    } else {
-        // A ray can still hit an elevated deck when it misses the terrain.
-        map.roads().values().filter_map(hit).min_by(nearest)
-    };
-    picked.map(|(_, id)| id)
+        })
+        .filter_map(|road| road_hit(road, ray, limit, &mut mesh).map(|depth| (depth, road.id)))
+        .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|(_, id)| id)
 }
 
-fn road_hit(road: &Road, ray: Ray3, limit: f32) -> Option<f32> {
-    // Each centerline segment defines a sloping strip with the width of the deck.
-    road.interfaced_points()
-        .segments()
-        .filter_map(|segment| {
-            let delta = segment.dst - segment.src;
-            let length = delta.xy().mag();
-            if length <= f32::EPSILON {
-                return None;
-            }
-            let axis = delta.xy() / length;
-            let grade = delta.z / length;
-            let origin = ray.from.xy() - segment.src.xy();
-            let vertical = ray.dir.z - grade * ray.dir.xy().dot(axis);
-            if vertical.abs() <= f32::EPSILON {
-                return None;
-            }
-            let depth = (segment.src.z + grade * origin.dot(axis) - ray.from.z) / vertical;
-            if !(0.0..=limit).contains(&depth) {
-                return None;
-            }
-            let at = origin + ray.dir.xy() * depth;
-            ((0.0..=length).contains(&at.dot(axis))
-                && at.dot(axis.perpendicular()).abs() <= road.width * 0.5)
-                .then_some(depth)
+fn road_hit(road: &Road, ray: Ray3, limit: f32, mesh: &mut Tesselator<'_>) -> Option<f32> {
+    let points = road.interfaced_points();
+    let first = points.first_dir()?.xy();
+    let last = points.last_dir()?.xy();
+    // Use the renderer's tessellator so the triangles follow the deck's mitered joins and grade.
+    mesh.vertices.clear();
+    mesh.indices.clear();
+    mesh.draw_polyline_with_dir(points.as_slice(), first, last, road.width);
+
+    mesh.indices
+        .chunks_exact(3)
+        .filter_map(|indices| {
+            let point = |i: usize| Vec3::from(mesh.vertices[indices[i] as usize].position);
+            triangle_hit(ray, point(0), point(1), point(2))
+                .filter(|depth| (0.0..=limit).contains(depth))
         })
         .min_by(f32::total_cmp)
+}
+
+fn triangle_hit(ray: Ray3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let ab = b - a;
+    let ac = c - a;
+    let cross = ray.dir.cross(ac);
+    let det = ab.dot(cross);
+    if det.abs() <= f32::EPSILON {
+        return None;
+    }
+    let origin = ray.from - a;
+    let u = origin.dot(cross) / det;
+    let side = origin.cross(ab);
+    let v = ray.dir.dot(side) / det;
+    (u >= 0.0 && v >= 0.0 && u + v <= 1.0).then(|| ac.dot(side) / det)
 }
 
 #[cfg(test)]
@@ -174,6 +181,40 @@ mod tests {
     use simulation::map::{LanePatternBuilder, MapProject};
     use simulation::transportation::{spawn_driving_vehicle, VehicleKind};
     use simulation::SimulationOptions;
+
+    #[test]
+    fn u5_road_click_hits_the_outside_of_a_mitered_bend() {
+        use geom::PolyLine3;
+
+        let ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            ..SimulationOptions::LEGACY
+        });
+        let mut map = ctx.sim.write::<Map>();
+        let from = vec3(1400.0, 1400.0, 25.0);
+        let elbow = from + vec3(100.0, 0.0, 5.0);
+        let to = elbow + vec3(0.0, 100.0, 3.0);
+        let endpoint = |pos| MapProject {
+            pos,
+            kind: ProjectKind::Ground,
+        };
+        let (_, id) = map
+            .make_connection(
+                endpoint(from),
+                endpoint(to),
+                None,
+                &LanePatternBuilder::default().build(),
+            )
+            .unwrap();
+        let mut road = map.get(id).unwrap().clone();
+        road.interfaced_points = PolyLine3::new(vec![from, elbow, to]);
+        let outside = elbow + vec3(1.0, -1.0, 0.0) * (road.width * 0.4);
+        let ray = Ray3::new(outside.up(50.0), -Vec3::Z);
+        let mut vertices = Vec::new();
+        let mut indices = Vec::new();
+        let mut mesh = Tesselator::new(&mut vertices, &mut indices, None, 1.0);
+        assert!(road_hit(&road, ray, 100.0, &mut mesh).is_some());
+    }
 
     #[test]
     fn u5_road_click_uses_the_visible_deck_and_preserves_entity_priority() {

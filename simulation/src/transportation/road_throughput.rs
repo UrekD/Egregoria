@@ -4,9 +4,9 @@ use crate::utils::resources::Resources;
 use crate::World;
 use common::FastMap;
 use prototypes::TICKS_PER_MINUTE;
+use std::collections::VecDeque;
 
-const BUCKETS: usize = 10;
-pub const ROAD_HISTORY_TICKS: u64 = BUCKETS as u64 * TICKS_PER_MINUTE;
+pub const ROAD_HISTORY_TICKS: u64 = 10 * TICKS_PER_MINUTE;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RoadUserKind {
@@ -16,15 +16,16 @@ pub enum RoadUserKind {
     Pedestrian,
 }
 
-#[derive(Default)]
-struct Bucket {
-    minute: Option<u64>,
-    entries: FastMap<RoadID, [u32; 4]>,
+struct TickEntries {
+    tick: u64,
+    counts: [u32; 4],
 }
 
+/// Counts changes of road on reaching a travel lane, including departures
+/// from roadside parking. Turns and lane changes within one road add no entry.
 #[derive(Default)]
 pub struct RoadThroughput {
-    buckets: [Bucket; BUCKETS],
+    entries: FastMap<RoadID, VecDeque<TickEntries>>,
     map_identity: Option<u64>,
     first_tick: u64,
     now: u64,
@@ -44,27 +45,25 @@ impl RoadThroughput {
     }
 
     pub fn record_entry(&mut self, road: RoadID, kind: RoadUserKind, tick: u64) {
-        let minute = tick / TICKS_PER_MINUTE;
-        let bucket = &mut self.buckets[(minute % BUCKETS as u64) as usize];
-        if bucket.minute != Some(minute) {
-            bucket.entries.clear();
-            bucket.minute = Some(minute);
+        let entries = self.entries.entry(road).or_default();
+        if entries.back().is_none_or(|latest| latest.tick != tick) {
+            entries.push_back(TickEntries {
+                tick,
+                counts: [0; 4],
+            });
         }
-        let count = &mut bucket.entries.entry(road).or_default()[kind as usize];
+        let count = &mut entries.back_mut().unwrap().counts[kind as usize];
         *count = count.saturating_add(1);
     }
 
-    /// Recent entries in car, truck, bus and pedestrian order.
-    /// Includes the current partial minute and the preceding nine whole minutes.
+    /// Entries in the last ten game minutes, in car, truck, bus and pedestrian order.
     pub fn recent(&self, road: RoadID, now: u64) -> [u32; 4] {
-        let minute = now / TICKS_PER_MINUTE;
+        let window = window_start(now)..=now;
         let mut totals = [0u32; 4];
-        for bucket in &self.buckets {
-            if bucket.is_recent(minute) {
-                if let Some(entries) = bucket.entries.get(&road) {
-                    for (total, count) in totals.iter_mut().zip(entries) {
-                        *total = total.saturating_add(*count);
-                    }
+        if let Some(entries) = self.entries.get(&road) {
+            for entry in entries.iter().filter(|entry| window.contains(&entry.tick)) {
+                for (total, count) in totals.iter_mut().zip(entry.counts) {
+                    *total = total.saturating_add(count);
                 }
             }
         }
@@ -72,17 +71,14 @@ impl RoadThroughput {
     }
 
     pub fn prune(&mut self, map: &Map, now: u64) {
-        let minute = now / TICKS_PER_MINUTE;
-        for bucket in &mut self.buckets {
-            if bucket.is_recent(minute) {
-                bucket
-                    .entries
-                    .retain(|road, _| map.roads().contains_key(*road));
-            } else {
-                bucket.entries.clear();
-                bucket.minute = None;
+        let oldest = window_start(now);
+        self.entries.retain(|road, entries| {
+            if !map.roads().contains_key(*road) {
+                return false;
             }
-        }
+            entries.retain(|entry| entry.tick >= oldest);
+            !entries.is_empty()
+        });
     }
 
     /// Counts and elapsed history since the current world began recording.
@@ -96,11 +92,8 @@ impl RoadThroughput {
     }
 }
 
-impl Bucket {
-    fn is_recent(&self, now_minute: u64) -> bool {
-        self.minute
-            .is_some_and(|minute| minute <= now_minute && now_minute - minute < BUCKETS as u64)
-    }
+fn window_start(now: u64) -> u64 {
+    now.saturating_sub(ROAD_HISTORY_TICKS - 1)
 }
 
 pub fn road_throughput_update(_world: &mut World, resources: &mut Resources) {
@@ -122,6 +115,27 @@ mod tests {
     use common::saveload::{Bincode, Encoder};
     use geom::vec3;
     use prototypes::{GameTime, Tick, TICKS_PER_MINUTE};
+
+    #[test]
+    fn u5_throughput_keeps_exactly_ten_minutes_across_minute_boundaries() {
+        let ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), vec3(270.0, 180.0, 0.0)]);
+        let map = ctx.g.map();
+        let road = map.roads().keys().next().unwrap();
+        let history = ROAD_HISTORY_TICKS;
+        let mut through = RoadThroughput::default();
+        through.begin_tick(&map, 1);
+        through.record_entry(road, RoadUserKind::Car, 1);
+        through.record_entry(road, RoadUserKind::Truck, 2);
+        through.begin_tick(&map, history - 1);
+        assert_eq!(through.current_window(road), ([1, 1, 0, 0], history - 1));
+        through.begin_tick(&map, history);
+        through.record_entry(road, RoadUserKind::Bus, history);
+        through.prune(&map, history);
+        assert_eq!(through.current_window(road), ([1, 1, 1, 0], history));
+        assert_eq!(through.recent(road, history + 1), [0, 1, 1, 0]);
+        assert_eq!(through.recent(road, history + 2), [0, 0, 1, 0]);
+    }
 
     #[test]
     fn u5_window_uses_elapsed_ticks_and_resets_on_load() {
@@ -151,7 +165,7 @@ mod tests {
         through.record_entry(road, RoadUserKind::Bus, 2 * minute);
         through.record_entry(road, RoadUserKind::Pedestrian, 2 * minute);
         assert_eq!(through.recent(road, 10 * minute - 1), [1, 1, 1, 1]);
-        assert_eq!(through.recent(road, 10 * minute), [0, 1, 1, 1]);
+        assert_eq!(through.recent(road, 10 * minute), [1, 1, 1, 1]);
         assert_eq!(through.recent(road, 12 * minute), [0; 4]);
         through.record_entry(road, RoadUserKind::Truck, 12 * minute);
         assert_eq!(through.recent(road, 12 * minute), [0, 1, 0, 0]);
