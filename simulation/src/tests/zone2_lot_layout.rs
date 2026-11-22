@@ -9,7 +9,7 @@ use crate::{MapPreset, NewGameOptions, Replay, Simulation, SimulationDeser, Simu
 use common::saveload::{Bincode, Encoder};
 use geom::{vec2, vec3, Vec2, Vec3, OBB};
 use prototypes::Density;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn connect(from: Vec3, to: Vec3) -> WorldCommand {
     WorldCommand::MapMakeConnection {
@@ -276,4 +276,60 @@ fn zone2_lot_layout_survives_save_and_load() {
     let legacy = legacy.into_sim().unwrap();
     assert_eq!(legacy.map().lot_layout(), LotLayout::Varied);
     assert_eq!(legacy.map().lots().len(), test.g.map().lots().len());
+}
+
+#[test]
+fn zone2_switching_layout_regenerates_roads_that_had_no_lots() {
+    // Short isolated streets: some fit a 30 m uniform lot but not the 40 m varied lot they drew.
+    let streets: Vec<WorldCommand> = (0..20)
+        .map(|i| {
+            let x = 20.0 + (i % 4) as f32 * 120.0;
+            let y = 20.0 + (i / 4) as f32 * 100.0;
+            let length = 15.5 + (i % 5) as f32;
+            connect(vec3(x, y, 0.0), vec3(x + length, y, 0.0))
+        })
+        .collect();
+    let lots_per_road = |map: &Map| -> BTreeMap<RoadID, usize> {
+        map.roads()
+            .keys()
+            .map(|road| {
+                let lots = map.lots().values().filter(|lot| lot.parent == road);
+                (road, lots.count())
+            })
+            .collect()
+    };
+
+    let mut switched = TestCtx::new();
+    switched.apply(&streets);
+    assert_accepted(&switched.g);
+    let varied = lots_per_road(&switched.g.map());
+    switched.apply(&[WorldCommand::SetLotLayout(LotLayout::Uniform)]);
+    assert_accepted(&switched.g);
+
+    let mut fresh = TestCtx::new();
+    fresh.apply(&[WorldCommand::SetLotLayout(LotLayout::Uniform)]);
+    fresh.apply(&streets);
+    let uniform = lots_per_road(&fresh.g.map());
+    assert!(
+        varied
+            .iter()
+            .any(|(road, &lots)| lots == 0 && uniform[road] > 0),
+        "no street went without lots under the varied layout: {varied:?} vs {uniform:?}"
+    );
+    assert_eq!(lots_per_road(&switched.g.map()), uniform);
+}
+
+#[test]
+fn zone2_switching_layout_after_load_matches_the_live_city() {
+    let mut live = TestCtx::new();
+    live.apply(&[street()]);
+    live.build_house_near(vec2(250.0, 130.0));
+    let bytes = Bincode::encode(&live.g).unwrap();
+    let mut loaded: Simulation = Bincode::decode(&bytes).unwrap();
+
+    let switch = WorldCommand::SetLotLayout(LotLayout::Uniform);
+    live.apply(std::slice::from_ref(&switch));
+    loaded.apply_commands([&switch]);
+    assert_eq!(loaded.map().lot_layout(), LotLayout::Uniform);
+    assert_eq!(loaded.hashes(), live.g.hashes());
 }

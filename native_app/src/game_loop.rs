@@ -184,6 +184,9 @@ impl engine::framework::State for State {
                 !ctx.egui.last_kb_captured || replaying,
                 !ctx.egui.last_mouse_captured,
             );
+            if ctx.keybind_mode {
+                self.uiw.write::<InputMap>().suppress_tool_shortcuts();
+            }
             if world_interaction {
                 if !ctx.keybind_mode {
                     GuiState::apply_time_shortcut(&self.uiw);

@@ -688,6 +688,11 @@ impl Map {
 
     /// Sizes later lots with `layout`. A change replaces the empty lots of every road with
     /// frontage, built or not. Buildings, their lot origins and zoning paint stay unchanged.
+    ///
+    /// Roads regenerate in `RoadID` order rather than build order, so contested corners
+    /// can resolve differently and switching back does not restore the previous lots.
+    /// It all happens within the command: about 50 ms for the ~1000 roads of the Lesce
+    /// import in a release build, a one-off hitch for an occasional settings change.
     pub fn set_lot_layout(&mut self, layout: LotLayout) {
         if self.lot_layout == layout {
             return;
@@ -695,8 +700,22 @@ impl Map {
         info!("set_lot_layout {:?}", layout);
         self.lot_layout = layout;
 
+        // Roads do not record whether they have frontage. Besides roads holding lots or
+        // built lots, take every street on the ground: it can be left without lots when
+        // no size it drew fitted, or when a neighbour's lots took its frontage.
+        let street = |road: &Road| {
+            !road.elevated_span()
+                && road.has_sidewalks()
+                && road.lanes_iter().any(|(_, kind)| kind == LaneKind::Driving)
+        };
         let mut frontage: BTreeSet<RoadID> = self.lots.values().map(|lot| lot.parent).collect();
         frontage.extend(self.lot_origins.values().map(|origin| origin.parent_road));
+        frontage.extend(
+            self.roads
+                .values()
+                .filter(|road| street(road))
+                .map(|road| road.id),
+        );
         frontage.retain(|&road| self.roads.contains_key(road));
 
         let empty = self.lots.keys().map(ProjectKind::Lot).collect();

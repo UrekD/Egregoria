@@ -1,5 +1,5 @@
 use geom::{vec2, Intersect, Vec2, AABB};
-use goryak::{interact_box_radius, minrow, padxy, secondary_container};
+use goryak::{minrow, padxy, round_rect, secondary_container};
 use ordered_float::OrderedFloat;
 use simulation::map::{BuildingID, BuildingKind, ProjectFilter};
 use simulation::map_dynamic::{ElectricityFlow, UtilityFlow, UtilityStatus};
@@ -8,18 +8,23 @@ use simulation::souls::{
     residence::{self, Residences},
 };
 use simulation::Simulation;
-use yakui::{opaque, reflow, Alignment, Color, Dim2, Pivot};
+use yakui::event::{EventInterest, EventResponse, WidgetEvent};
+use yakui::input::MouseButton;
+use yakui::widget::{EventContext, Widget};
+use yakui::{reflow, Alignment, Color, Dim2, Pivot, TextureId};
 
 use super::toasts::{AdvisorFocus, ToastState};
 use crate::gui::notifications::{AlertTarget, NotificationKind};
 use crate::gui::overlays::view;
 use crate::gui::textures::UiTextures;
+use crate::gui::Tool;
 use crate::uiworld::UiWorld;
 
 const COMPACT_BADGE_DEPTH: f32 = 550.0;
 const BLACKOUT_ICON_SIZE: f32 = 14.0;
 const BADGE_TEXT_SIZE: f32 = 11.0;
 const BADGE_ROW_SPACING: f32 = 3.0;
+const BADGE_RADIUS: f32 = 5.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BadgeKind {
@@ -41,13 +46,15 @@ impl BadgeKind {
         }
     }
 
-    /// The advisor notification that reports this problem.
-    fn notification(self) -> NotificationKind {
+    /// The advisor notification that reports this problem. No notification reports a
+    /// disconnected building, so its badge has nothing to focus.
+    fn notification(self) -> Option<NotificationKind> {
         match self {
-            Self::Fire => NotificationKind::Fire,
-            Self::Blackout => NotificationKind::Blackout,
-            Self::Disconnected | Self::NoWater => NotificationKind::NoWater,
-            Self::NoSewage => NotificationKind::NoSewage,
+            Self::Fire => Some(NotificationKind::Fire),
+            Self::Blackout => Some(NotificationKind::Blackout),
+            Self::NoWater => Some(NotificationKind::NoWater),
+            Self::NoSewage => Some(NotificationKind::NoSewage),
+            Self::Disconnected => None,
         }
     }
 }
@@ -60,12 +67,12 @@ struct Badge {
 }
 
 impl Badge {
-    fn advisor_focus(&self) -> AdvisorFocus {
-        AdvisorFocus {
-            kind: self.kind.notification(),
+    fn advisor_focus(&self) -> Option<AdvisorFocus> {
+        Some(AdvisorFocus {
+            kind: self.kind.notification()?,
             daytime: None,
             target: Some(AlertTarget::Building(self.building)),
-        }
+        })
     }
 }
 
@@ -165,6 +172,8 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
     }
 
     let no_power_img = uiworld.read::<UiTextures>().get("no_power");
+    // Other tools drag from a press on the world, so only the hand takes badge clicks.
+    let hand = *uiworld.read::<Tool>() == Tool::Hand;
     let mut clicked = None;
     for PlacedBadge {
         badge,
@@ -178,55 +187,115 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
             Pivot::BOTTOM_CENTER,
             Dim2::pixels(point.x, point.y),
             || {
-                let fill = secondary_container().with_alpha(0.93);
-                let hover = secondary_container();
-                let mut response = None;
-                opaque(|| {
-                    response = Some(interact_box_radius(fill, hover, hover, 5.0, || {
-                        padxy(4.0, 1.0, || {
-                            if badge.kind == BadgeKind::Blackout {
-                                minrow(BADGE_ROW_SPACING, || {
-                                    let size = yakui::Vec2::splat(BLACKOUT_ICON_SIZE);
-                                    let mut image = yakui::widgets::Image::new(no_power_img, size);
-                                    image.color = Color::WHITE.with_alpha(0.7);
-                                    image.show();
-                                    if count > 1 {
-                                        yakui::widgets::Text::new(
-                                            BADGE_TEXT_SIZE,
-                                            format!("+{}", count - 1),
-                                        )
-                                        .show();
-                                    }
-                                });
-                            } else {
-                                let (label, short, color) = badge.kind.appearance();
-                                let mut text = if count > 1 {
-                                    yakui::widgets::Text::new(
-                                        BADGE_TEXT_SIZE,
-                                        format!("{} +{}", short, count - 1),
-                                    )
-                                } else {
-                                    let label = if badge.depth < COMPACT_BADGE_DEPTH {
-                                        label
-                                    } else {
-                                        short
-                                    };
-                                    yakui::widgets::Text::new(BADGE_TEXT_SIZE, label)
-                                };
-                                text.style.color = color;
-                                text.show();
-                            }
-                        });
-                    }));
-                });
-                if response.is_some_and(|response| response.clicked) {
-                    clicked = Some(badge.advisor_focus());
+                let focus = badge.advisor_focus().filter(|_| hand);
+                if show_badge(&badge, count, no_power_img, focus.is_some()) {
+                    clicked = focus;
                 }
             },
         );
     }
     if let Some(focus) = clicked {
         uiworld.write::<ToastState>().open_advisor(focus);
+    }
+}
+
+/// Shows one badge. Returns whether a clickable badge was clicked.
+fn show_badge(badge: &Badge, count: usize, no_power_img: TextureId, clickable: bool) -> bool {
+    let fill = secondary_container().with_alpha(0.93);
+    let content = || {
+        padxy(4.0, 1.0, || {
+            if badge.kind == BadgeKind::Blackout {
+                minrow(BADGE_ROW_SPACING, || {
+                    let size = yakui::Vec2::splat(BLACKOUT_ICON_SIZE);
+                    let mut image = yakui::widgets::Image::new(no_power_img, size);
+                    image.color = Color::WHITE.with_alpha(0.7);
+                    image.show();
+                    if count > 1 {
+                        yakui::widgets::Text::new(BADGE_TEXT_SIZE, format!("+{}", count - 1))
+                            .show();
+                    }
+                });
+            } else {
+                let (label, short, color) = badge.kind.appearance();
+                let mut text = if count > 1 {
+                    yakui::widgets::Text::new(BADGE_TEXT_SIZE, format!("{} +{}", short, count - 1))
+                } else {
+                    let label = if badge.depth < COMPACT_BADGE_DEPTH {
+                        label
+                    } else {
+                        short
+                    };
+                    yakui::widgets::Text::new(BADGE_TEXT_SIZE, label)
+                };
+                text.style.color = color;
+                text.show();
+            }
+        });
+    };
+    if !clickable {
+        round_rect(BADGE_RADIUS, fill, content);
+        return false;
+    }
+
+    let dom = yakui::context::dom();
+    let hit = dom.begin_widget::<BadgeHitWidget>(());
+    let color = if hit.hovering {
+        secondary_container()
+    } else {
+        fill
+    };
+    round_rect(BADGE_RADIUS, color, content);
+    dom.end_widget::<BadgeHitWidget>(hit.id);
+    hit.clicked
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct BadgeHit {
+    hovering: bool,
+    clicked: bool,
+}
+
+/// The click target of a badge. Badges float over the world, so it takes a left press on
+/// the badge itself and lets everything else through: hover, the wheel, other buttons and
+/// releases still reach the world underneath.
+#[derive(Debug, Default)]
+struct BadgeHitWidget(BadgeHit);
+
+impl Widget for BadgeHitWidget {
+    type Props<'a> = ();
+    type Response = BadgeHit;
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn update(&mut self, _: Self::Props<'_>) -> Self::Response {
+        BadgeHit {
+            clicked: std::mem::take(&mut self.0.clicked),
+            ..self.0
+        }
+    }
+
+    fn event_interest(&self) -> EventInterest {
+        EventInterest::MOUSE_INSIDE
+    }
+
+    fn event(&mut self, _: EventContext<'_>, event: &WidgetEvent) -> EventResponse {
+        match event {
+            WidgetEvent::MouseEnter => self.0.hovering = true,
+            WidgetEvent::MouseLeave => self.0.hovering = false,
+            WidgetEvent::MouseButtonChanged {
+                button: MouseButton::One,
+                down: true,
+                inside: true,
+                ..
+            } => {
+                self.0.clicked = true;
+                return EventResponse::Sink;
+            }
+            _ => {}
+        }
+        EventResponse::Bubble
     }
 }
 
@@ -305,6 +374,102 @@ fn place_badges(mut visible: Vec<Badge>, screen: AABB) -> Vec<PlacedBadge> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn uxfix_badges_focus_only_the_notification_of_their_own_problem() {
+        use NotificationKind as N;
+        for (kind, notification) in [
+            (BadgeKind::Fire, Some(N::Fire)),
+            (BadgeKind::Blackout, Some(N::Blackout)),
+            (BadgeKind::NoWater, Some(N::NoWater)),
+            (BadgeKind::NoSewage, Some(N::NoSewage)),
+            // No notification reports a disconnected building.
+            (BadgeKind::Disconnected, None),
+        ] {
+            let badge = Badge {
+                point: Vec2::ZERO,
+                depth: 100.0,
+                kind,
+                building: BuildingID::default(),
+            };
+            let focus = badge.advisor_focus();
+            assert_eq!(focus.map(|focus| focus.kind), notification, "{kind:?}");
+            assert!(focus.is_none_or(|focus| focus.daytime.is_none()
+                && focus.target == Some(AlertTarget::Building(badge.building))));
+        }
+    }
+
+    /// Lays out one badge at the centre of a small viewport. Returns its rect and
+    /// whether it reported a click.
+    fn badge_frame(ui: &mut yakui::Yakui, kind: BadgeKind, clickable: bool) -> (yakui::Rect, bool) {
+        let badge = Badge {
+            point: vec2(100.0, 50.0),
+            depth: 100.0,
+            kind,
+            building: BuildingID::default(),
+        };
+        ui.start();
+        let mut clicked = false;
+        let reflowed = reflow(
+            Alignment::TOP_LEFT,
+            Pivot::BOTTOM_CENTER,
+            Dim2::pixels(100.0, 50.0),
+            || clicked = show_badge(&badge, 1, TextureId::User(0), clickable),
+        );
+        ui.finish();
+        let badge = ui.dom().get(reflowed.id).unwrap().children[0];
+        let rect = ui.layout_dom().get(badge).unwrap().rect;
+        (rect, clicked)
+    }
+
+    #[test]
+    fn uxfix_badges_take_only_a_left_click_on_themselves() {
+        use yakui::event::Event;
+        use yakui::input::MouseButton;
+
+        let button = |button, down| Event::MouseButtonChanged { button, down };
+        for (kind, clickable) in [
+            (BadgeKind::Fire, true),
+            (BadgeKind::Fire, false),
+            (BadgeKind::NoWater, true),
+        ] {
+            let mut ui = yakui::Yakui::new();
+            let viewport = yakui::Vec2::new(200.0, 100.0);
+            ui.set_surface_size(viewport);
+            ui.set_unscaled_viewport(yakui::Rect::from_pos_size(yakui::Vec2::ZERO, viewport));
+            let (rect, _) = badge_frame(&mut ui, kind, clickable);
+            assert!(rect.size().x > 0.0 && rect.size().x < 120.0, "{rect:?}");
+            let centre = rect.pos() + rect.size() * 0.5;
+            ui.handle_event(Event::CursorMoved(Some(centre)));
+            badge_frame(&mut ui, kind, clickable);
+
+            // Camera drags, zoom and right-click cancel reach the world.
+            for button_event in [
+                button(MouseButton::Two, true),
+                button(MouseButton::Two, false),
+                button(MouseButton::Three, true),
+                button(MouseButton::Three, false),
+            ] {
+                let shown = format!("{button_event:?}");
+                assert!(!ui.handle_event(button_event), "{kind:?} sank {shown}");
+            }
+            assert!(!ui.handle_event(Event::MouseScroll {
+                delta: yakui::Vec2::new(0.0, 1.0)
+            }));
+
+            let sunk = ui.handle_event(button(MouseButton::One, true));
+            assert_eq!(sunk, clickable, "{kind:?} left press");
+            assert!(!ui.handle_event(button(MouseButton::One, false)));
+            assert_eq!(badge_frame(&mut ui, kind, clickable).1, clickable);
+
+            // Beside the badge nothing is taken.
+            let beside = rect.pos() + yakui::Vec2::new(rect.size().x + 3.0, rect.size().y * 0.5);
+            ui.handle_event(Event::CursorMoved(Some(beside)));
+            badge_frame(&mut ui, kind, clickable);
+            assert!(!ui.handle_event(button(MouseButton::One, true)));
+            assert!(!ui.handle_event(button(MouseButton::One, false)));
+        }
+    }
 
     #[test]
     fn fires_take_priority_and_collisions_cluster() {

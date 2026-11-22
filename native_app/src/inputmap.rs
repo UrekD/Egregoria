@@ -279,6 +279,14 @@ impl InputMap {
         self.require_fresh_pointer_press();
     }
 
+    /// While a keybind is being captured, the press being bound must not also act as B or
+    /// right-click, neither now nor when it is released after capture ends.
+    pub(crate) fn suppress_tool_shortcuts(&mut self) {
+        self.just_act.remove(&Cancel);
+        self.just_act.remove(&Bulldozer);
+        self.cancel_origin = None;
+    }
+
     pub(crate) fn require_fresh_pointer_press(&mut self) {
         self.require_pointer_release = true;
     }
@@ -389,6 +397,8 @@ impl InputMap {
 
 impl InputMap {
     /// Cancel acts on release, and only if the pointer stayed put and over the world.
+    /// `mouse` only knows about egui; Yakui lets releases through, so its panels are
+    /// checked here.
     fn cancel_clicked(&mut self, held: bool, screen: Vec2, mouse: bool) -> bool {
         let was_held = std::mem::replace(&mut self.cancel_held, held);
         if held && !was_held {
@@ -403,7 +413,10 @@ impl InputMap {
         if held {
             return false;
         }
-        self.cancel_origin.take().is_some() && was_held && mouse
+        self.cancel_origin.take().is_some()
+            && was_held
+            && mouse
+            && !goryak::pointer_over_ui(screen.x, screen.y)
     }
 }
 
@@ -755,6 +768,75 @@ mod tests {
         assert!(
             !input_map.just_act.contains(&Cancel),
             "cancel survived reset"
+        );
+    }
+
+    #[test]
+    fn uxfix_keybind_capture_swallows_b_and_right_click() {
+        let mut bindings = Bindings::default();
+        let mut input_map = InputMap::default();
+        input_map.build_input_tree(&mut bindings);
+        let mut b = InputContext::default();
+        b.keyboard.pressed.insert(K::c("B"));
+
+        // The press being bound is no shortcut, also once capture ends with it held.
+        input_map.prepare_frame(&b, true, true);
+        input_map.suppress_tool_shortcuts();
+        assert!(!input_map.just_act.contains(&Bulldozer));
+        input_map.prepare_frame(&b, true, true);
+        assert!(!input_map.just_act.contains(&Bulldozer));
+        input_map.prepare_frame(&InputContext::default(), true, true);
+
+        // A right click bound on press does not cancel on its release.
+        right_button(&mut input_map, true, Vec2::ZERO);
+        input_map.suppress_tool_shortcuts();
+        right_button(&mut input_map, true, Vec2::ZERO);
+        right_button(&mut input_map, false, Vec2::ZERO);
+        assert!(!input_map.just_act.contains(&Cancel));
+
+        // Outside capture both act again.
+        input_map.prepare_frame(&b, true, true);
+        assert!(input_map.just_act.contains(&Bulldozer));
+        input_map.prepare_frame(&InputContext::default(), true, true);
+        right_button(&mut input_map, true, Vec2::ZERO);
+        right_button(&mut input_map, false, Vec2::ZERO);
+        assert!(input_map.just_act.contains(&Cancel));
+    }
+
+    #[test]
+    fn uxfix_right_click_released_over_a_yakui_panel_does_not_cancel() {
+        let mut ui = yakui::Yakui::new();
+        let viewport = yakui::Vec2::new(400.0, 160.0);
+        ui.set_surface_size(viewport);
+        ui.set_unscaled_viewport(yakui::Rect::from_pos_size(yakui::Vec2::ZERO, viewport));
+        ui.start();
+        yakui::offset(yakui::Vec2::new(200.0, 0.0), || {
+            yakui::opaque(|| {
+                yakui::constrained(yakui::Constraints::tight(yakui::Vec2::splat(100.0)), || {});
+            });
+        });
+        goryak::render_tooltip();
+        ui.finish();
+        ui.paint();
+        assert!(goryak::pointer_over_ui(201.0, 50.0));
+        assert!(!goryak::pointer_over_ui(198.0, 50.0));
+
+        let mut bindings = Bindings::default();
+        let mut input_map = InputMap::default();
+        input_map.build_input_tree(&mut bindings);
+        // Yakui lets the release through to the window, so the panel has to be checked.
+        right_button(&mut input_map, true, Vec2::new(197.0, 50.0));
+        right_button(&mut input_map, false, Vec2::new(201.0, 50.0));
+        assert!(
+            !input_map.just_act.contains(&Cancel),
+            "released over a panel"
+        );
+
+        right_button(&mut input_map, true, Vec2::new(195.0, 50.0));
+        right_button(&mut input_map, false, Vec2::new(198.0, 50.0));
+        assert!(
+            input_map.just_act.contains(&Cancel),
+            "released over the world"
         );
     }
 
