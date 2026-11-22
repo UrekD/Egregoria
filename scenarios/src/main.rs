@@ -1,10 +1,21 @@
 use scenarios::builtin::{growth_basic, perf, PERF_10K, SCENARIOS};
-use scenarios::runner::{MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
-use scenarios::ScenarioCtx;
+use scenarios::runner::{PerfTimings, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
+use scenarios::{MetricSample, ScenarioCtx};
+use serde::Serialize;
 use std::collections::BTreeMap;
+use std::ffi::OsString;
 use std::fs::File;
-use std::path::Path;
+use std::io::{BufWriter, Write};
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+
+#[derive(Serialize)]
+struct JsonSample {
+    #[serde(flatten)]
+    metrics: MetricSample,
+    #[serde(flatten, skip_serializing_if = "Option::is_none")]
+    timings: Option<PerfTimings>,
+}
 
 fn usage() -> String {
     let names = SCENARIOS
@@ -13,7 +24,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--twice | --gate (perf_10k only)]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--twice | --gate (perf_10k only)]")
 }
 
 fn main() -> ExitCode {
@@ -24,6 +35,15 @@ fn main() -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn output_path(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<PathBuf, String> {
+    let path = args
+        .next()
+        .filter(|path| !path.as_encoded_bytes().starts_with(b"--"))
+        .ok_or_else(|| format!("{flag} requires an output path"))?;
+    // Prototype initialization changes the process working directory.
+    std::path::absolute(Path::new(&path)).map_err(|err| err.to_string())
 }
 
 fn run() -> Result<(), String> {
@@ -46,19 +66,16 @@ fn run() -> Result<(), String> {
     }
 
     let mut json = None;
+    let mut hashes = None;
     let mut twice = false;
     let mut gate = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--twice") if !twice => twice = true,
             Some("--gate") if !gate => gate = true,
-            Some("--json") if json.is_none() => {
-                let path = args
-                    .next()
-                    .filter(|path| !path.as_encoded_bytes().starts_with(b"--"))
-                    .ok_or("--json requires an output path")?;
-                // Prototype initialization changes the process working directory.
-                json = Some(std::path::absolute(Path::new(&path)).map_err(|err| err.to_string())?);
+            Some("--json") if json.is_none() => json = Some(output_path(&mut args, "--json")?),
+            Some("--hashes") if hashes.is_none() => {
+                hashes = Some(output_path(&mut args, "--hashes")?)
             }
             _ => return Err(format!("unexpected argument {arg:?}\n{}", usage())),
         }
@@ -69,19 +86,40 @@ fn run() -> Result<(), String> {
     if gate && name != PERF_10K.0.name {
         return Err("--gate requires perf_10k".to_string());
     }
+    if hashes.is_some() && hashes == json {
+        return Err("--hashes and --json require different output paths".to_string());
+    }
 
+    let mut hash_output = hashes
+        .as_ref()
+        .map(|path| {
+            File::create(path)
+                .map(BufWriter::new)
+                .map_err(|err| format!("{}: {err}", path.display()))
+        })
+        .transpose()?;
     let mut results = BTreeMap::new();
     for (scenario, options) in available {
         if name != "all" && name != scenario.name {
             continue;
         }
         let mut ctx = ScenarioCtx::new(*options);
-        let result = if twice && scenario.name == growth_basic::SCENARIO.0.name {
-            growth_basic::verify_twice(&mut ctx)
-        } else if twice && scenario.name != "determinism" {
-            ctx.verify_twice(scenario.run)
+        if json.is_some() && (scenario.name == "perf" || scenario.name == PERF_10K.0.name) {
+            ctx.enable_perf_timings();
+        }
+        let run = |ctx: &mut ScenarioCtx| {
+            if twice && scenario.name == growth_basic::SCENARIO.0.name {
+                growth_basic::verify_twice(ctx)
+            } else if twice && scenario.name != "determinism" {
+                ctx.verify_twice(scenario.run)
+            } else {
+                (scenario.run)(ctx)
+            }
+        };
+        let result = if let Some(out) = &mut hash_output {
+            ctx.run_with_hashes(scenario.name, out, run)
         } else {
-            (scenario.run)(&mut ctx)
+            run(&mut ctx)
         };
         result.map_err(|err| format!("{}: {err}", scenario.name))?;
 
@@ -108,9 +146,26 @@ fn run() -> Result<(), String> {
                 sample.companies, sample.trains, sample.money_cents, sample.ticks_per_sec,
             );
         }
-        results.insert(scenario.name, ctx.samples);
+        let mut timings = ctx.take_measured_timings();
+        let samples = ctx
+            .samples
+            .into_iter()
+            .map(|metrics| JsonSample {
+                timings: if metrics.label == "measured" {
+                    timings.take()
+                } else {
+                    None
+                },
+                metrics,
+            })
+            .collect::<Vec<_>>();
+        results.insert(scenario.name, samples);
     }
 
+    if let Some((mut out, path)) = hash_output.zip(hashes) {
+        out.flush()
+            .map_err(|err| format!("{}: {err}", path.display()))?;
+    }
     if let Some(path) = json {
         let file = File::create(&path).map_err(|err| format!("{}: {err}", path.display()))?;
         serde_json::to_writer_pretty(file, &results)
@@ -120,6 +175,7 @@ fn run() -> Result<(), String> {
     if gate {
         let median = results[PERF_10K.0.name]
             .iter()
+            .map(|sample| &sample.metrics)
             .find(|sample| sample.label == "measured")
             .and_then(|sample| sample.extra.get(MEDIAN_TICKS_PER_SEC))
             .ok_or("perf_10k: missing measured median throughput")?;

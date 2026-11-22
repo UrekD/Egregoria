@@ -8,6 +8,50 @@ use simulation::SimulationOptions;
 use std::process::Command;
 
 #[test]
+fn hashes_cli_advertises_output_path() {
+    let output = Command::new(env!("CARGO_BIN_EXE_scenarios"))
+        .arg("--help")
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let usage = String::from_utf8(output.stdout).unwrap();
+    assert!(usage.contains("--hashes"), "{usage}");
+}
+
+#[test]
+fn hashes_cli_rejects_missing_or_option_like_paths() {
+    for args in [
+        &["smoke", "--hashes"][..],
+        &["smoke", "--hashes", "--twice"],
+    ] {
+        let output = Command::new(env!("CARGO_BIN_EXE_scenarios"))
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains("--hashes requires an output path"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn hashes_cli_rejects_duplicate_flags() {
+    let output = Command::new(env!("CARGO_BIN_EXE_scenarios"))
+        .args(["smoke", "--hashes", "out.jsonl", "--hashes", "--help"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        error.contains("unexpected argument \"--hashes\""),
+        "{error}"
+    );
+}
+
+#[test]
 fn perf_10k_cli_is_opt_in() {
     let scenarios = env!("CARGO_BIN_EXE_scenarios");
     let help = Command::new(scenarios).arg("--help").output().unwrap();

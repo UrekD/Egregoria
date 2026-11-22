@@ -60,6 +60,14 @@ impl SeqSchedule {
         times.sort_unstable_by_key(|(_, t)| OrderedFloat(-*t));
         times
     }
+
+    /// Return each system's latest execution time in milliseconds, in schedule order.
+    pub fn latest_samples(&self) -> impl Iterator<Item = (&'static str, f32)> + '_ {
+        self.systems
+            .iter()
+            .filter(|(_, history)| history.start_value != 0)
+            .map(|(system, history)| (system.name(), *history.values.last().unwrap()))
+    }
 }
 
 pub(crate) fn drain_commands(sim: &mut Simulation) {

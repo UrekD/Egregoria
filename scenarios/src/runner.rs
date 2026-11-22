@@ -1,12 +1,13 @@
 use crate::builders::CommandSink;
 use crate::MetricSample;
+use serde::Serialize;
 use simulation::economy::Government;
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::WorldCommand;
 use simulation::{Simulation, SimulationOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
 use std::time::Duration;
@@ -17,6 +18,92 @@ const P95_MS_PER_TICK: &str = "p95_ms_per_tick";
 
 const CHECKPOINT_INTERVAL: u64 = 10_000;
 type Checkpoint = (u64, BTreeMap<String, u64>);
+
+#[derive(Default)]
+struct HashDump {
+    first: Vec<Checkpoint>,
+    second: Option<Vec<Checkpoint>>,
+}
+
+#[derive(Serialize)]
+struct HashLine<'a> {
+    scenario: &'a str,
+    run: usize,
+    tick: u64,
+    hashes: &'a BTreeMap<String, u64>,
+}
+
+#[derive(Serialize)]
+pub struct PerfTimings {
+    system_timings: BTreeMap<&'static str, SystemTiming>,
+    max_ms_per_tick: f64,
+    max_tick: u64,
+}
+
+#[derive(Serialize)]
+struct SystemTiming {
+    median_ms: f64,
+    p99_ms: f32,
+    max_ms: f32,
+    max_tick: u64,
+}
+
+#[derive(Default)]
+struct PerfTimingRecorder {
+    systems: BTreeMap<&'static str, Vec<(u64, f32)>>,
+    peak: Option<(u64, Duration)>,
+    measured: Option<PerfTimings>,
+}
+
+impl PerfTimingRecorder {
+    fn record_tick(
+        &mut self,
+        tick: u64,
+        elapsed: Duration,
+        system_samples: impl IntoIterator<Item = (&'static str, f32)>,
+    ) {
+        for (system, ms) in system_samples {
+            self.systems.entry(system).or_default().push((tick, ms));
+        }
+        if self.peak.is_none_or(|(_, max)| elapsed >= max) {
+            self.peak = Some((tick, elapsed));
+        }
+    }
+
+    fn finish_phase(&mut self, label: &str) {
+        if let Some((max_tick, elapsed)) = self.peak.take().filter(|_| label == "measured") {
+            let system_timings = self
+                .systems
+                .iter_mut()
+                .filter(|(_, samples)| !samples.is_empty())
+                .map(|(&system, samples)| {
+                    // Preserve tick order for equal durations so the last maximum wins.
+                    samples.sort_by(|a, b| a.1.total_cmp(&b.1));
+                    let n = samples.len();
+                    let median_ms =
+                        (f64::from(samples[(n - 1) / 2].1) + f64::from(samples[n / 2].1)) / 2.0;
+                    let p99_ms = samples[(n * 99).div_ceil(100) - 1].1;
+                    let (max_tick, max_ms) = samples[n - 1];
+                    let timing = SystemTiming {
+                        median_ms,
+                        p99_ms,
+                        max_ms,
+                        max_tick,
+                    };
+                    (system, timing)
+                })
+                .collect();
+            self.measured = Some(PerfTimings {
+                system_timings,
+                max_ms_per_tick: elapsed.as_secs_f64() * 1_000.0,
+                max_tick,
+            });
+        }
+        for samples in self.systems.values_mut() {
+            samples.clear();
+        }
+    }
+}
 
 pub struct Scenario {
     pub name: &'static str,
@@ -31,6 +118,8 @@ pub struct ScenarioCtx {
     queued: Vec<WorldCommand>,
     executed_ticks: u64,
     checkpoints: Option<Vec<Checkpoint>>,
+    hash_dump: Option<HashDump>,
+    perf_timings: Option<PerfTimingRecorder>,
 }
 
 /// Set the process working directory to the repository root for prototype loading.
@@ -59,6 +148,8 @@ impl ScenarioCtx {
             queued: Vec::new(),
             executed_ticks: 0,
             checkpoints: None,
+            hash_dump: None,
+            perf_timings: None,
         }
     }
 
@@ -69,17 +160,33 @@ impl ScenarioCtx {
 
     pub fn run_ticks(&mut self, n: u64) {
         for _ in 0..n {
-            self.tick_times
-                .push(self.sim.tick(&mut self.sched, &self.queued));
+            let elapsed = self.sim.tick(&mut self.sched, &self.queued);
+            self.tick_times.push(elapsed);
             self.queued.clear();
             self.executed_ticks += 1;
 
-            if let Some(checkpoints) = &mut self.checkpoints {
-                if self.executed_ticks % CHECKPOINT_INTERVAL == 0 {
+            if let Some(timings) = &mut self.perf_timings {
+                timings.record_tick(self.sim.get_tick(), elapsed, self.sched.latest_samples());
+            }
+            if self.executed_ticks % CHECKPOINT_INTERVAL == 0 {
+                let checkpoints = self
+                    .checkpoints
+                    .as_mut()
+                    .or_else(|| self.hash_dump.as_mut().map(|dump| &mut dump.first));
+                if let Some(checkpoints) = checkpoints {
                     checkpoints.push((self.sim.get_tick(), self.sim.hashes()));
                 }
             }
         }
+    }
+
+    /// Collect raw per-tick timing samples for the perf JSON report.
+    pub fn enable_perf_timings(&mut self) {
+        self.perf_timings = Some(PerfTimingRecorder::default());
+    }
+
+    pub fn take_measured_timings(&mut self) -> Option<PerfTimings> {
+        self.perf_timings.as_mut()?.measured.take()
     }
 
     /// Capture current world counts and tick throughput since the previous sample.
@@ -132,6 +239,9 @@ impl ScenarioCtx {
             0.0
         };
         self.tick_times.clear();
+        if let Some(timings) = &mut self.perf_timings {
+            timings.finish_phase(label);
+        }
 
         let world = self.sim.world();
         let employed = world.humans.values().filter(|h| h.work.is_some()).count();
@@ -149,6 +259,38 @@ impl ScenarioCtx {
         };
         self.samples.push(sample.clone());
         sample
+    }
+
+    /// Run a scenario and emit its periodic and final checkpoints as JSON lines.
+    pub fn run_with_hashes(
+        &mut self,
+        scenario: &str,
+        out: &mut impl Write,
+        run: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<(), String> {
+        if self.hash_dump.is_some() {
+            return Err("hash dumps cannot be nested".to_string());
+        }
+        self.hash_dump = Some(HashDump::default());
+        let result = run(self);
+        let HashDump { mut first, second } = self.hash_dump.take().unwrap();
+        result?;
+        if second.is_none() {
+            first.push(self.checkpoint());
+        }
+        for (index, checkpoints) in std::iter::once(first).chain(second).enumerate() {
+            for (tick, hashes) in &checkpoints {
+                let line = HashLine {
+                    scenario,
+                    run: index + 1,
+                    tick: *tick,
+                    hashes,
+                };
+                serde_json::to_writer(&mut *out, &line).map_err(|err| err.to_string())?;
+                out.write_all(b"\n").map_err(|err| err.to_string())?;
+            }
+        }
+        Ok(())
     }
 
     /// Run from this fresh context and another with identical options, retaining the first run.
@@ -169,6 +311,10 @@ impl ScenarioCtx {
                 first.len(),
                 second.len()
             ));
+        }
+        if let Some(dump) = &mut self.hash_dump {
+            dump.first = first;
+            dump.second = Some(second);
         }
         Ok(())
     }
@@ -283,5 +429,81 @@ impl CommandSink for ScenarioCtx {
 
     fn flush(&mut self) {
         self.run_ticks(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::{json, Value};
+
+    #[test]
+    fn hashes_dump_includes_checkpoints_and_final_for_each_run() {
+        let options = SimulationOptions {
+            terrain_size: 0,
+            save_replay: false,
+        };
+        let run = |ctx: &mut ScenarioCtx| {
+            ctx.run_ticks(CHECKPOINT_INTERVAL + 1);
+            Ok(())
+        };
+
+        for twice in [false, true] {
+            let mut ctx = ScenarioCtx::new(options);
+            let start = ctx.sim.get_tick();
+            let mut dump = Vec::new();
+            ctx.run_with_hashes("test", &mut dump, |ctx| {
+                if twice {
+                    ctx.verify_twice(run)
+                } else {
+                    run(ctx)
+                }
+            })
+            .unwrap();
+
+            let lines: Vec<Value> = std::str::from_utf8(&dump)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(lines.len(), if twice { 4 } else { 2 });
+            for (index, pair) in lines.chunks_exact(2).enumerate() {
+                for (offset, line) in pair.iter().enumerate() {
+                    assert_eq!(line["scenario"], "test");
+                    assert_eq!(line["run"], index + 1);
+                    assert_eq!(line["tick"], start + CHECKPOINT_INTERVAL + offset as u64);
+                    assert!(line["hashes"]["world"].is_u64());
+                    assert!(line["hashes"]["government"].is_u64());
+                    assert_eq!(line["hashes"], lines[offset]["hashes"]);
+                }
+            }
+            assert_eq!(lines[1]["hashes"], json!(ctx.sim.hashes()));
+        }
+    }
+
+    #[test]
+    fn perf_timing_uses_all_raw_samples_in_the_measured_phase() {
+        let mut timings = PerfTimingRecorder::default();
+        timings.record_tick(1, Duration::from_millis(500), [("periodic", 200.0)]);
+        timings.finish_phase("warmup");
+
+        timings.record_tick(2, Duration::from_millis(25), [("periodic", 20.0)]);
+        for tick in 3..103 {
+            let ms = if tick == 3 { 40 } else { 2 };
+            timings.record_tick(tick, Duration::from_millis(ms), [("periodic", 1.0)]);
+        }
+        timings.record_tick(103, Duration::from_millis(5), [("periodic", 4.0)]);
+        timings.finish_phase("measured");
+
+        assert_eq!(
+            json!(timings.measured.unwrap()),
+            json!({
+                "system_timings": {
+                    "periodic": {"median_ms": 1.0, "p99_ms": 4.0, "max_ms": 20.0, "max_tick": 2}
+                },
+                "max_ms_per_tick": 40.0,
+                "max_tick": 3,
+            })
+        );
     }
 }
