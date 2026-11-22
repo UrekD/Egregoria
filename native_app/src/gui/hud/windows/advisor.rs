@@ -8,7 +8,7 @@ use geom::Vec3;
 use goryak::{
     mincolumn, minrow, on_secondary_container, outline, primary_link, textc, VertScrollSize, Window,
 };
-use simulation::map::BuildingID;
+use simulation::map::{BuildingID, Map};
 use simulation::map_dynamic::Transit;
 use simulation::Simulation;
 use yakui::widgets::Pad;
@@ -32,6 +32,8 @@ pub(super) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
             textc(on_secondary_container(), "No notifications yet");
             return;
         }
+        let map = sim.map();
+        let transit = sim.read::<Transit>();
         constrained(
             Constraints {
                 min: Vec2::new(320.0, 0.0),
@@ -53,7 +55,7 @@ pub(super) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
                                     );
                                 });
                                 textc(on_secondary_container(), notice.text.clone());
-                                match resolve_target(sim, notice.target) {
+                                match resolve_target(&map, &transit, notice.target) {
                                     TargetLink::Building(id, door) => {
                                         if primary_link("Go to building") {
                                             focus_building(uiw, id, door);
@@ -92,13 +94,12 @@ enum TargetLink {
     NoLocation,
 }
 
-fn resolve_target(sim: &Simulation, target: AlertTarget) -> TargetLink {
+fn resolve_target(map: &Map, transit: &Transit, target: AlertTarget) -> TargetLink {
     match target {
-        AlertTarget::Building(id) => sim.map().get(id).map_or(TargetLink::Removed, |building| {
+        AlertTarget::Building(id) => map.get(id).map_or(TargetLink::Removed, |building| {
             TargetLink::Building(id, building.door_pos)
         }),
         AlertTarget::Line(id) => {
-            let transit = sim.read::<Transit>();
             let Some(line) = transit.lines.get(id) else {
                 return TargetLink::Removed;
             };
@@ -125,21 +126,20 @@ fn p4g_advisor_resolves_removed_targets_safely() {
     scenarios::builders::grid_city(&mut test, geom::vec2(150.0, 150.0), 2, 2, 160.0);
     let house = scenarios::builders::fill_houses(&mut test, 1)[0];
     let target = AlertTarget::Building(house);
-    assert!(matches!(
-        resolve_target(&test.sim, target),
-        TargetLink::Building(_, _)
-    ));
+    let door = test.sim.map().get(house).unwrap().door_pos;
+    let resolve =
+        |sim: &Simulation, target| resolve_target(&sim.map(), &sim.read::<Transit>(), target);
+    assert!(
+        matches!(resolve(&test.sim, target), TargetLink::Building(id, pos) if id == house && pos == door)
+    );
     test.sim.apply_commands(
         &[simulation::world_command::WorldCommand::MapRemoveBuilding(
             house,
         )],
     );
+    assert!(matches!(resolve(&test.sim, target), TargetLink::Removed));
     assert!(matches!(
-        resolve_target(&test.sim, target),
-        TargetLink::Removed
-    ));
-    assert!(matches!(
-        resolve_target(&test.sim, AlertTarget::Line(Default::default())),
+        resolve(&test.sim, AlertTarget::Line(Default::default())),
         TargetLink::Removed
     ));
 }

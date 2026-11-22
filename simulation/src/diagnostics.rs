@@ -1,5 +1,8 @@
 //! Read-only explanations of building and citizen state.
 
+use std::cell::RefCell;
+
+use geom::Vec2;
 use prototypes::{try_prototype, Power, Tick};
 
 use crate::economy::Market;
@@ -43,17 +46,23 @@ pub enum BuildingBlocker {
     Recipe(RecipeBlocker),
 }
 
+#[derive(Default)]
+struct RetailStores {
+    map_revision: (u64, u64),
+    positions: Vec<Vec2>,
+}
+
+thread_local! {
+    static RETAIL_STORES: RefCell<RetailStores> = RefCell::default();
+}
+
 pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<BuildingDiagnostics> {
     let map = sim.map();
     let building = map.get(id)?;
     let residences = sim.read::<Residences>();
     let house = building.kind == BuildingKind::House;
     let utilities = sim.read::<UtilityFlow>().status(&map, &residences, id);
-    let power = if building.is_orphaned() {
-        PowerStatus::MissingNetwork
-    } else {
-        residence::power_status(&map, &sim.read::<ElectricityFlow>(), id)
-    };
+    let power = residence::power_status(&map, &sim.read::<ElectricityFlow>(), id);
     let mut blockers = Vec::new();
     if building.is_orphaned() {
         blockers.push(BuildingBlocker::RoadDisconnected);
@@ -66,11 +75,12 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
     }
 
     let owner = sim.read::<BuildingInfos>().owner(id);
-    let mut needs_power = house;
+    let mut power_blocked = house && power != PowerStatus::Available;
     match building.kind {
         BuildingKind::GoodsCompany(prototype) => {
-            needs_power = try_prototype(prototype)
-                .is_some_and(|proto| proto.power_consumption > Some(Power::ZERO));
+            power_blocked = power == PowerStatus::Blackout
+                && try_prototype(prototype)
+                    .is_some_and(|proto| proto.power_consumption > Some(Power::ZERO));
             let company = owner
                 .and_then(|soul| match soul {
                     SoulID::GoodsCompany(company) => {
@@ -104,7 +114,7 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
         }
         _ => {}
     }
-    if needs_power && power != PowerStatus::Available {
+    if power_blocked {
         blockers.push(BuildingBlocker::Power(power));
     }
     if let Some(utilities) = utilities {
@@ -117,15 +127,23 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
     }
 
     let (retail_access, upgrade_requirements) = if house {
-        let stores = residence::retail_store_positions(&map);
-        let has_retail = residence::has_retail_access(&stores, building.door_pos.xy());
-        if !has_retail {
-            blockers.push(BuildingBlocker::NoRetailAccess);
-        }
-        (
-            Some(has_retail),
-            residence::requirements_with_stores(sim, id, Some(&stores)),
-        )
+        RETAIL_STORES.with_borrow_mut(|stores| {
+            // Building insertion and removal update the electrical graph, even off-road.
+            let revision = (map.identity(), map.electricity.generation());
+            if stores.map_revision != revision {
+                stores.map_revision = revision;
+                stores.positions = residence::retail_store_positions(&map);
+            }
+            let has_retail =
+                residence::has_retail_access(&stores.positions, building.door_pos.xy());
+            if !has_retail {
+                blockers.push(BuildingBlocker::NoRetailAccess);
+            }
+            (
+                Some(has_retail),
+                residence::requirements_with_stores(sim, id, Some(&stores.positions)),
+            )
+        })
     } else {
         (None, Vec::new())
     };
@@ -168,6 +186,8 @@ pub struct CitizenDiagnostics {
     pub intention: CitizenIntention,
     pub destination: Option<Destination>,
     pub blocker: Option<CitizenBlocker>,
+    /// Remaining ticks before the active itinerary searches again.
+    pub reroute_wait_ticks: Option<u16>,
 }
 
 pub fn citizen_diagnostics(sim: &Simulation, id: HumanID) -> Option<CitizenDiagnostics> {
@@ -203,6 +223,13 @@ pub fn citizen_diagnostics(sim: &Simulation, id: HumanID) -> Option<CitizenDiagn
             None => CitizenIntention::Idle,
         },
     };
+    let reroute_wait_ticks = match citizen.location {
+        Location::Outside => citizen.it.is_wait_for_reroute(),
+        Location::Vehicle(id) => sim
+            .get(id)
+            .and_then(|vehicle| vehicle.it.is_wait_for_reroute()),
+        Location::Building(_) | Location::Transit(_) => None,
+    };
     let blocker = citizen
         .router
         .last_error
@@ -217,6 +244,9 @@ pub fn citizen_diagnostics(sim: &Simulation, id: HumanID) -> Option<CitizenDiagn
                     Some(_) => {}
                 }
             }
+            if reroute_wait_ticks.is_some_and(|ticks| ticks > 0) {
+                return Some(CitizenBlocker::DestinationDisconnected);
+            }
             citizen
                 .goods
                 .excluded_seller()
@@ -226,6 +256,7 @@ pub fn citizen_diagnostics(sim: &Simulation, id: HumanID) -> Option<CitizenDiagn
         intention,
         destination,
         blocker,
+        reroute_wait_ticks,
     })
 }
 
@@ -299,9 +330,26 @@ mod tests {
 
         let road = test.g.map().get(house).unwrap().connected_road.unwrap();
         test.apply(&[crate::world_command::WorldCommand::MapRemoveRoad(road)]);
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+        let shared = |sim: &Simulation| {
+            residence::power_status(&sim.map(), &sim.read::<ElectricityFlow>(), house)
+        };
+        assert_eq!(shared(&test.g), PowerStatus::Blackout);
+        let diagnostics = building_diagnostics(&test.g, house).unwrap();
+        assert_eq!(diagnostics.power, shared(&test.g));
+        assert!(diagnostics
+            .blockers
+            .contains(&BuildingBlocker::RoadDisconnected));
+        assert!(diagnostics
+            .blockers
+            .contains(&BuildingBlocker::Power(PowerStatus::Blackout)));
+
+        test.g.map_mut().electricity.remove_object(house);
+        assert_eq!(shared(&test.g), PowerStatus::MissingNetwork);
         assert_eq!(
             building_diagnostics(&test.g, house).unwrap().power,
-            PowerStatus::MissingNetwork
+            shared(&test.g)
         );
     }
 
@@ -385,5 +433,38 @@ mod tests {
             Some(CitizenBlocker::Route(RouterError::LocatingVehicle))
         ));
         assert_eq!(test.g.hashes(), before);
+    }
+
+    #[test]
+    fn p4g_citizen_why_reports_a_failed_search_between_disconnected_roads() {
+        let (mut test, house) = city();
+        let a = vec3(175.0, 435.0, 0.0);
+        let b = vec3(275.0, 435.0, 0.0);
+        test.build_roads(&[a, b]);
+        let citizen = spawn_human(&mut test.g, house).unwrap();
+        let destination = Destination::Outside((a + b) * 0.5);
+        let human = test.g.world.humans.get_mut(citizen).unwrap();
+        human.router.use_vehicle(None);
+        human.router.go_to(destination);
+        human.decision.kind = HumanDecisionKind::GoTo(destination);
+
+        for _ in 0..200 {
+            test.tick_fast();
+            let human = test.g.get(citizen).unwrap();
+            if let Some(ticks) = human.it.is_wait_for_reroute().filter(|&ticks| ticks > 0) {
+                assert!(human.router.last_error.is_none());
+                let before = test.g.hashes();
+                let diagnostics = citizen_diagnostics(&test.g, citizen).unwrap();
+                assert_eq!(diagnostics.destination, Some(destination));
+                assert!(matches!(
+                    diagnostics.blocker,
+                    Some(CitizenBlocker::DestinationDisconnected)
+                ));
+                assert_eq!(diagnostics.reroute_wait_ticks, Some(ticks));
+                assert_eq!(test.g.hashes(), before);
+                return;
+            }
+        }
+        panic!("citizen did not enter a reroute wait after searching");
     }
 }

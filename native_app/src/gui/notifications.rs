@@ -1,12 +1,12 @@
 use std::collections::{BTreeMap, VecDeque};
 
-use prototypes::{Money, Tick};
+use prototypes::{ItemID, Money, Tick};
 use simulation::diagnostics::elapsed_tick;
 use simulation::economy::{
     balance::{DEMAND_INTERVAL_TICKS, MIN_DEMAND_POPULATION},
     Budget, BudgetCategory, Government, ZoneDemand,
 };
-use simulation::map::{BuildingID, ElectricityNetworkID, ZoneKind};
+use simulation::map::{BuildingID, ZoneKind};
 use simulation::map_dynamic::{ElectricityFlow, LineID, Transit, UtilityFlow, UtilityStatus};
 use simulation::souls::events::{FireEventKind, Fires};
 use simulation::souls::residence::Residences;
@@ -112,7 +112,6 @@ fn push_bounded(items: &mut VecDeque<Notification>, notification: Notification) 
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum AlertSource {
-    Network(ElectricityNetworkID),
     Line(LineID),
     CityWide,
 }
@@ -121,6 +120,28 @@ enum AlertSource {
 struct AlertKey {
     kind: NotificationKind,
     source: AlertSource,
+}
+
+#[derive(Default)]
+struct NetworkAlert {
+    first: Option<BuildingID>,
+    count: usize,
+    awaiting_refresh: bool,
+}
+
+impl NetworkAlert {
+    fn add_affected(&mut self, id: BuildingID) {
+        self.first.get_or_insert(id);
+        self.count += 1;
+    }
+
+    fn record_status(&mut self, id: BuildingID, status: UtilityStatus) {
+        match status {
+            UtilityStatus::Shortage => self.add_affected(id),
+            UtilityStatus::Unknown => self.awaiting_refresh = true,
+            UtilityStatus::Served | UtilityStatus::Disconnected => {}
+        }
+    }
 }
 
 /// The HUD observes even while hidden. The next visible frame publishes the
@@ -187,8 +208,7 @@ impl NotificationSampler {
         let outcomes = sim.read::<CommandOutcomes>();
         let sequence = outcomes.batch_seq();
         let previous = self.last_batch_seq.replace(sequence);
-        // A world first observed after replay can carry a playback batch.
-        if previous.is_none_or(|previous| previous == sequence) {
+        if previous == Some(sequence) {
             return;
         }
         let mut reasons = Vec::new();
@@ -228,15 +248,20 @@ impl NotificationSampler {
                     text.into(),
                 );
             }
-        } else {
-            for &building in fires.by_building.keys() {
-                self.emit(
-                    NotificationKind::Fire,
-                    tick,
+        } else if let Some((&building, _)) = fires.by_building.first_key_value() {
+            let count = fires.by_building.len();
+            let (target, text) = if count == 1 {
+                (
                     AlertTarget::Building(building),
                     "A building is on fire".into(),
-                );
-            }
+                )
+            } else {
+                (
+                    AlertTarget::CityWide,
+                    format!("{count} buildings are on fire"),
+                )
+            };
+            self.emit(NotificationKind::Fire, tick, target, text);
         }
     }
 
@@ -291,7 +316,13 @@ impl NotificationSampler {
 
         let humans = &sim.world().humans;
         let population = humans.len();
-        let unemployed = humans.values().filter(|human| human.work.is_none()).count();
+        let jobs = ItemID::new("job-opening");
+        let unemployed = humans
+            .values()
+            .filter(|human| {
+                human.work.is_none() && human.bought.0.get(&jobs).is_none_or(Vec::is_empty)
+            })
+            .count();
         if population >= MIN_DEMAND_POPULATION
             && unemployed * 100 >= population * UNEMPLOYMENT_PERCENT
         {
@@ -353,59 +384,44 @@ impl NotificationSampler {
         let power = sim.read::<ElectricityFlow>();
         let utilities = sim.read::<UtilityFlow>();
         let residences = sim.read::<Residences>();
-        let totals = utilities.networks().collect::<BTreeMap<_, _>>();
+        let mut blackout = NetworkAlert::default();
+        let mut water = NetworkAlert::default();
+        let mut sewage = NetworkAlert::default();
         for network in map.electricity.networks() {
-            let buildings = || {
-                network
-                    .buildings
-                    .iter()
-                    .copied()
-                    .filter(|&id| map.get(id).is_some_and(|building| !building.is_orphaned()))
-            };
-            let source = AlertSource::Network(network.id);
-            if power.blackout(network.id) {
-                if let Some(building) = buildings().next() {
-                    self.condition(
-                        Blackout,
-                        source,
-                        tick,
-                        AlertTarget::Building(building),
-                        || "An electrical network is in blackout".into(),
-                    );
+            let in_blackout = power.blackout(network.id);
+            for &id in &network.buildings {
+                if map.get(id).is_none_or(|building| building.is_orphaned()) {
+                    continue;
+                }
+                if in_blackout {
+                    blackout.add_affected(id);
+                }
+                if let Some(status) = utilities.status(&map, &residences, id) {
+                    water.record_status(id, status.water);
+                    sewage.record_status(id, status.sewage);
                 }
             }
-            let Some(totals) = totals.get(&network.id) else {
-                continue;
-            };
-            for (kind, shortage, text) in [
-                (
-                    NoWater,
-                    totals.water_demand > 0.0 && !totals.has_water(),
-                    "A network is short of water",
-                ),
-                (
-                    NoSewage,
-                    totals.sewage_demand > 0.0 && !totals.has_sewage(),
-                    "A network lacks sewage capacity",
-                ),
-            ] {
-                if shortage {
-                    if let Some(building) = buildings().find(|&id| {
-                        utilities
-                            .status(&map, &residences, id)
-                            .is_some_and(|status| {
-                                let service = if kind == NoWater {
-                                    status.water
-                                } else {
-                                    status.sewage
-                                };
-                                service == UtilityStatus::Shortage
-                            })
-                    }) {
-                        self.condition(kind, source, tick, AlertTarget::Building(building), || {
-                            text.into()
-                        });
+        }
+        for (kind, alert, issue) in [
+            (Blackout, blackout, "power"),
+            (NoWater, water, "water"),
+            (NoSewage, sewage, "sewage service"),
+        ] {
+            // The graph ID is the lowest member and can change while an outage persists.
+            let source = AlertSource::CityWide;
+            if let Some(building) = alert.first {
+                let count = alert.count;
+                self.condition(kind, source, tick, AlertTarget::Building(building), || {
+                    if count == 1 {
+                        format!("1 building lacks {issue}")
+                    } else {
+                        format!("{count} buildings lack {issue}")
                     }
+                });
+            } else if alert.awaiting_refresh {
+                // Utility totals can lag a topology edit until the next utility pass.
+                if let Some(last_seen) = self.active.get_mut(&AlertKey { kind, source }) {
+                    *last_seen = tick;
                 }
             }
         }
@@ -466,7 +482,7 @@ mod tests {
         builders::{fill_houses, grid_city},
         ScenarioCtx,
     };
-    use simulation::map_dynamic::ElectricityFlow;
+    use simulation::map_dynamic::{electricity_flow_system, utility_flow_update};
     use simulation::world_command::WorldCommand;
     use simulation::SimulationOptions;
 
@@ -505,6 +521,128 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(rejections.len(), 2);
         assert_eq!(rejections[0].text, rejections[1].text);
+    }
+
+    #[test]
+    fn p4g_first_observation_reports_the_first_rejected_batch() {
+        let mut test = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        test.sim
+            .apply_commands(&[WorldCommand::MapRemoveBuilding(BuildingID::default())]);
+        let mut sampler = NotificationSampler::default();
+        sampler.observe(&test.sim);
+        sampler.observe(&test.sim);
+        let notices = sampler.drain().collect::<Vec<_>>();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].kind, NotificationKind::CommandRejected);
+    }
+
+    #[test]
+    fn p4g_removing_building_3v1_preserves_sustained_network_alerts() {
+        let (mut test, first_house) = city();
+        let other_house = fill_houses(&mut test, 1)[0];
+        assert_eq!(first_house.data().as_ffi(), (1 << 32) | 3);
+        let network = test.sim.map().electricity.net_id(first_house).unwrap();
+        assert_eq!(
+            test.sim.map().electricity.net_id(other_house),
+            Some(network)
+        );
+
+        let sample = |test: &mut ScenarioCtx, sampler: &mut NotificationSampler, tick| {
+            *test.sim.write::<GameTime>() = GameTime::new(Tick(tick));
+            let (world, resources) = test.sim.world_res();
+            electricity_flow_system(world, resources);
+            utility_flow_update(&mut test.sim);
+            let status = test
+                .sim
+                .read::<UtilityFlow>()
+                .status(&test.sim.map(), &test.sim.read::<Residences>(), other_house)
+                .unwrap();
+            assert_eq!(status.water, UtilityStatus::Shortage);
+            assert_eq!(status.sewage, UtilityStatus::Shortage);
+            assert_eq!(status.totals.unwrap().sewage_demand, 0.0);
+            sampler.observe(&test.sim);
+            sampler
+                .drain()
+                .filter_map(|notice| match notice.kind {
+                    NotificationKind::Blackout
+                    | NotificationKind::NoWater
+                    | NotificationKind::NoSewage => Some(notice.kind),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut sampler = NotificationSampler::default();
+        let first = sample(&mut test, &mut sampler, SAMPLE_INTERVAL + 1);
+        test.sim
+            .apply_commands(&[WorldCommand::MapRemoveBuilding(first_house)]);
+        assert_ne!(
+            test.sim.map().electricity.net_id(other_house),
+            Some(network)
+        );
+        assert!(sample(&mut test, &mut sampler, 2 * SAMPLE_INTERVAL + 1).is_empty());
+        assert_eq!(
+            first,
+            [
+                NotificationKind::Blackout,
+                NotificationKind::NoWater,
+                NotificationKind::NoSewage,
+            ]
+        );
+    }
+
+    #[test]
+    fn p4g_initial_fires_are_coalesced() {
+        let (mut test, house) = city();
+        let other_house = fill_houses(&mut test, 1)[0];
+        test.sim
+            .write::<Fires>()
+            .by_building
+            .extend([(house, Tick(1)), (other_house, Tick(1))]);
+        let mut sampler = NotificationSampler::default();
+        sampler.observe(&test.sim);
+        sampler.observe(&test.sim);
+        let fires = sampler
+            .drain()
+            .filter(|notice| notice.kind == NotificationKind::Fire)
+            .collect::<Vec<_>>();
+        assert_eq!(fires.len(), 1);
+        assert_eq!(fires[0].target, AlertTarget::CityWide);
+    }
+
+    #[test]
+    fn p4g_pending_hires_are_excluded_from_unemployment_alerts() {
+        use simulation::economy::{Trade, TradeTarget};
+        use simulation::souls::human::spawn_human;
+        use simulation::SoulID;
+
+        let (mut test, _) = city();
+        let houses = fill_houses(&mut test, MIN_DEMAND_POPULATION);
+        assert_eq!(houses.len(), MIN_DEMAND_POPULATION);
+        let jobs = ItemID::new("job-opening");
+        for house in houses {
+            let id = spawn_human(&mut test.sim, house).unwrap();
+            let target = TradeTarget(SoulID::Human(id));
+            let human = test.sim.world_mut_unchecked().humans.get_mut(id).unwrap();
+            human.bought.0.insert(
+                jobs,
+                vec![Trade {
+                    buyer: target,
+                    seller: target,
+                    qty: 1,
+                    kind: jobs,
+                    money_delta: Money::ZERO,
+                }],
+            );
+        }
+        let mut sampler = NotificationSampler::default();
+        sampler.observe(&test.sim);
+        assert!(!sampler
+            .drain()
+            .any(|notice| notice.kind == NotificationKind::HighUnemployment));
     }
 
     #[test]
