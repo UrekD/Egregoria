@@ -62,7 +62,7 @@
   {"WaitFrames": 3},
   {"Assert": "HouseInspector"},
   {"Screenshot": "13a-inspector-open"},
-  {"Pointer": {"action": "Click", "screen_pos": [672, 701]}},
+  {"Pointer": {"action": "Click", "screen_pos": [640, 678]}},
   {"WaitFrames": 3},
   {"DumpState": "13b-inspector-closed"},
   {"Screenshot": "13b-inspector-closed"},
