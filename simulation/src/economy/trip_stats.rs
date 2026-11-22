@@ -30,6 +30,9 @@ pub enum TripPurpose {
     FreightReturn,
 }
 
+/// Closed days kept beside the open day. Older days are dropped so saves stay bounded.
+pub const KEPT_CLOSED_DAYS: u64 = 14;
+
 /// Measurements indexed by elapsed day. Absent fields have yet to be measured.
 #[derive(Default, Debug, Serialize, Deserialize)]
 pub struct DailyEconomyMetrics {
@@ -41,6 +44,17 @@ impl DailyEconomyMetrics {
         (day < elapsed_tick / TICKS_PER_BUDGET_DAY)
             .then(|| self.days.get(&day))
             .flatten()
+    }
+
+    /// Drops days closed more than `KEPT_CLOSED_DAYS` before `open_day`.
+    pub fn retain_recent(&mut self, open_day: u64) {
+        let oldest = open_day.saturating_sub(KEPT_CLOSED_DAYS);
+        while let Some(day) = self.days.first_entry() {
+            if *day.key() >= oldest {
+                break;
+            }
+            day.remove();
+        }
     }
 
     pub fn record_arrival(&mut self, day: u64, purpose: TripPurpose, ticks: u64) {

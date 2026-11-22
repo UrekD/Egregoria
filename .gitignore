@@ -12,3 +12,5 @@ world
 __pycache__
 */target*
 target*
+# Windows packages from make windows
+/build/

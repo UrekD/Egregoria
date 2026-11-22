@@ -20,6 +20,14 @@ test-sim:
 scenarios:
 	cargo run --locked -p scenarios --release -- all
 
+# Windows zip (cross-compiled; see scripts/build-windows.sh for prerequisites).
+# WINDOWS_SLOTS=<dir> bundles save slots, e.g. WINDOWS_SLOTS=world after make demo-cities osm-lesce.
+WINDOWS_OUT ?= build
+WINDOWS_SLOTS ?=
+.PHONY: windows
+windows:
+	scripts/build-windows.sh "$(WINDOWS_OUT)" "$(WINDOWS_SLOTS)"
+
 .PHONY: demo-cities
 demo-cities:
 	cargo run --locked --release -p scenarios -- demo-cities --save-root world

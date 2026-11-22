@@ -1,3 +1,4 @@
+use crate::gui::notifications::command_message;
 use crate::gui::{ErrorTooltip, PendingPlacement, PlacementPreview, PotentialCommands, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
@@ -13,6 +14,7 @@ use simulation::Simulation;
 use std::borrow::Cow;
 
 const MP_PLACEMENT_TIMEOUT_FRAMES: u64 = 300;
+const REJECTION_TOOLTIP_FRAMES: u64 = 180;
 
 pub struct SpecialBuildArgs {
     pub obb: OBB,
@@ -34,6 +36,8 @@ pub struct SpecialBuildingResource {
     pub rotation: Degrees,
     pending_batch_seq: u64,
     frame: u64,
+    /// Reason the last submitted placement was rejected, and the frame it arrived on.
+    rejection: Option<(Cow<'static, str>, u64)>,
 }
 
 /// SpecialBuilding tool
@@ -50,6 +54,7 @@ fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnO
     if tool != Tool::SpecialBuilding {
         state.opt = None;
         state.last_obb = None;
+        state.rejection = None;
         *preview = PlacementPreview::default();
         return;
     }
@@ -63,28 +68,49 @@ fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnO
             .received_commands()
             .iter()
             .any(|command| pending.matches(command));
-        let local = is_local();
-        let waiting = if local {
-            batch_seq == state.pending_batch_seq
+        let accepted = if is_local() {
+            // Singleplayer applies the whole command queue as one batch, so the placement
+            // keeps its queue index in that batch. While it is still queued, the latest
+            // outcomes belong to some other batch.
+            let queued = uiworld
+                .commands()
+                .as_ref()
+                .get(pending.index)
+                .is_some_and(|command| pending.matches(command));
+            if queued || batch_seq == state.pending_batch_seq {
+                return;
+            }
+            let outcome = placement_outcome(&sim.read::<CommandOutcomes>(), pending.index);
+            if let Err(Some(reason)) = outcome {
+                let message = command_message("MapBuildSpecialBuilding", reason);
+                state.rejection = Some((message, state.frame));
+            }
+            // The batch also publishes the placement when it is accepted.
+            outcome.is_ok() && echoed
         } else {
-            state.frame.wrapping_sub(pending.frame) < MP_PLACEMENT_TIMEOUT_FRAMES
-        };
-        if !echoed && waiting {
-            return;
-        }
-        // Singleplayer publishes only accepted commands. Multiplayer echoes attempted
-        // commands, so also check that the exact placement exists in the applied world.
-        let accepted = echoed
-            && (local
-                || sim.map().buildings().values().any(|building| {
+            if !echoed && state.frame.wrapping_sub(pending.frame) < MP_PLACEMENT_TIMEOUT_FRAMES {
+                return;
+            }
+            // Multiplayer echoes attempted commands, so also check that the exact
+            // placement exists in the applied world.
+            echoed
+                && sim.map().buildings().values().any(|building| {
                     building.kind == pending.kind
                         && building.obb.corners == pending.obb.corners
                         && building.connected_road == pending.road
-                }));
+                })
+        };
         preview.pending = None;
         state.last_obb = None;
         if accepted {
             state.opt = None;
+        }
+    }
+    if let Some((message, since)) = state.rejection.clone() {
+        if state.frame.wrapping_sub(since) < REJECTION_TOOLTIP_FRAMES {
+            *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(message);
+        } else {
+            state.rejection = None;
         }
     }
     preview.company = state.opt.as_ref().and_then(|kind| kind.company);
@@ -236,9 +262,11 @@ fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnO
                 obb,
                 road,
                 frame: state.frame,
+                index: uiworld.commands().as_ref().len() + cmds.len() - 1,
             });
         }
         uiworld.commands().extend(cmds);
+        state.rejection = None;
         uiworld
             .write::<ImmediateSound>()
             .play("road_lay", AudioKind::Ui);
@@ -247,6 +275,21 @@ fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnO
     } else if let Some(last) = cmds.last() {
         uiworld.write::<PotentialCommands>().set(last.clone());
     }
+}
+
+/// The outcome of the command at `index` in the latest batch. Each rejected command adds
+/// exactly one entry to `last`, in command order, so its entry follows from the accepted
+/// indices before it. The error is `None` when the entry is not a placement rejection.
+fn placement_outcome(outcomes: &CommandOutcomes, index: usize) -> Result<(), Option<Rejection>> {
+    if outcomes.accepted.contains(&index) {
+        return Ok(());
+    }
+    let accepted_before = outcomes.accepted.iter().filter(|&&i| i < index).count();
+    Err(outcomes
+        .last
+        .get(index - accepted_before)
+        .filter(|(command, _)| *command == "MapBuildSpecialBuilding")
+        .map(|&(_, reason)| reason))
 }
 
 impl PendingPlacement {
@@ -299,6 +342,7 @@ mod tests {
             obb,
             road: None,
             frame: 0,
+            index: 0,
         });
 
         specialbuilding_input(&fixture.sim, &uiw, || false);
@@ -367,6 +411,14 @@ mod tests {
             .read::<PlacementPreview>()
             .ghost
             .expect("valid school ghost");
+        let unrelated = WorldCommand::MapBuildSpecialBuilding {
+            kind,
+            pos: OBB::new(vec2(-700.0, -700.0), geom::Vec2::X, 20.0, 20.0),
+            gen: prototype.bgen,
+            zone: None,
+            connected_road: Some(ghost.1),
+        };
+        uiw.commands().push(unrelated.clone());
         uiw.write::<InputMap>().just_act.insert(InputAction::Select);
         specialbuilding(&fixture.sim, &uiw);
         uiw.write::<InputMap>().just_act.clear();
@@ -379,18 +431,40 @@ mod tests {
                 .corners,
             ghost.0.corners
         );
-        let batch = std::mem::take(&mut *uiw.commands());
-        assert_eq!(batch.as_ref().len(), 1);
-
         let money = fixture.sim.read::<Government>().money;
+        fixture.sim.apply_commands([&unrelated]);
+        specialbuilding(&fixture.sim, &uiw);
+        assert!(uiw.read::<PlacementPreview>().pending.is_some());
+
+        let mut batch = std::mem::take(&mut *uiw.commands());
+        assert_eq!(batch.as_ref().len(), 2);
+        batch.push(WorldCommand::SetTaxRate {
+            zone: simulation::map::ZoneKind::Residential,
+            rate_permille: 100,
+        });
         fixture.sim.write::<Government>().money = prototypes::Money::ZERO;
         fixture.sim.apply_commands(batch.iter());
-        assert!(fixture.sim.read::<CommandOutcomes>().accepted.is_empty());
+        assert_eq!(fixture.sim.read::<CommandOutcomes>().accepted, [2]);
+        assert_eq!(
+            fixture.sim.read::<CommandOutcomes>().last,
+            [
+                ("MapBuildSpecialBuilding", Rejection::InvalidBuilding),
+                ("MapBuildSpecialBuilding", Rejection::InsufficientFunds),
+            ]
+        );
+        // The tooltip must come from the outcome even with no hovered world point.
+        uiw.write::<InputMap>().unprojected = None;
         specialbuilding(&fixture.sim, &uiw);
         assert!(uiw.read::<PlacementPreview>().pending.is_none());
+        assert!(uiw.read::<SpecialBuildingResource>().last_obb.is_none());
+        assert_eq!(
+            uiw.read::<ErrorTooltip>().msg.as_deref(),
+            Some("Not enough money")
+        );
         assert_eq!(effective(), auto);
 
         fixture.sim.write::<Government>().money = money;
+        uiw.write::<InputMap>().unprojected = Some(vec3(770.0, 688.0, 0.0));
         uiw.write::<InputMap>().just_act.insert(InputAction::Select);
         specialbuilding(&fixture.sim, &uiw);
         uiw.write::<InputMap>().just_act.clear();

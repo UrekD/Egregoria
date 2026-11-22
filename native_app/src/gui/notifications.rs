@@ -590,11 +590,12 @@ fn command_label(command: &str) -> &'static str {
         "TransitRemoveLine" => "Remove bus line",
         "TransitSetVehicles" => "Set bus fleet size",
         "TransitSetFare" => "Set bus fare",
+        "SetWarehousePolicy" => "Set warehouse policy",
         _ => "City action",
     }
 }
 
-fn command_message(command: &str, reason: Rejection) -> std::borrow::Cow<'static, str> {
+pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::Cow<'static, str> {
     use Rejection::*;
     if let Locked { milestone } = reason {
         if let Some(population) = milestone_population(milestone) {
@@ -718,6 +719,11 @@ mod tests {
             notices[0].text,
             "Demolish building: Object no longer exists"
         );
+    }
+
+    #[test]
+    fn s5c_warehouse_policy_has_a_command_label() {
+        assert_eq!(command_label("SetWarehousePolicy"), "Set warehouse policy");
     }
 
     #[test]

@@ -29,6 +29,7 @@ pub mod transit_stats;
 mod trip_stats;
 
 use crate::map::{BuildingKind, LaneID, LaneKind, Map, TraverseDirection};
+use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::household::settle_local_pickup;
 use crate::transportation::Location;
@@ -144,6 +145,9 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
     drop((m, map, infos, components));
 
     let retail = ItemID::new("retail-goods");
+    // A hook that returns true owns the whole settlement: budget, stock and the
+    // trade's EcoStats entry via `EcoStats::record_trade` when it completes.
+    // Recording here as well would count the trade twice.
     trades.retain(|&trade| {
         if trade.kind == job_opening {
             return true;
@@ -192,6 +196,11 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
     }
     trades.retain(|trade| trade.kind != retail || !matches!(trade.buyer.0, SoulID::Human(_)));
     resources.write::<EcoStats>().advance(tick.0, &trades);
+
+    let open_day = elapsed_ticks(resources).0 / TICKS_PER_BUDGET_DAY;
+    resources
+        .write::<DailyEconomyMetrics>()
+        .retain_recent(open_day);
 }
 
 /// Labels walking lanes connected by sidewalk corners and crossings for the current topology.

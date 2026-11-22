@@ -112,13 +112,15 @@ pub struct InspectedBuilding {
 pub struct InspectedRoad(pub Option<RoadID>);
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // Read by the placement overlay when command outcome tracking is added.
 pub struct PendingPlacement {
     pub kind: BuildingKind,
     pub obb: OBB,
     pub road: Option<RoadID>,
     /// UI frame on which the placement command was submitted.
     pub frame: u64,
+    /// Position of the placement command in the queued `WorldCommands`, which
+    /// singleplayer applies as one batch.
+    pub index: usize,
 }
 
 #[derive(Clone, Debug, Default)]

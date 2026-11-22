@@ -20,6 +20,7 @@ mod p3_spine;
 mod p5_bridge;
 mod p5_core_loop;
 mod p5_placement;
+mod p5_spine_followups;
 mod test_iso;
 mod vehicles;
 
