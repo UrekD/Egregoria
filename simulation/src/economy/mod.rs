@@ -15,6 +15,8 @@ use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt::Debug;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub mod balance;
 mod budget;
@@ -59,6 +61,107 @@ pub struct Workers(pub Vec<HumanID>);
 pub(crate) struct WalkingComponents {
     generation: u64,
     labels: BTreeMap<LaneID, LaneID>,
+}
+
+static NEXT_STAMP: AtomicU64 = AtomicU64::new(1);
+
+/// A value with a process-unique stamp, renewed on every mutable access.
+/// A cache keyed by the stamp stays valid while the value is unchanged.
+/// Serializes as the bare value.
+pub(crate) struct Stamped<T> {
+    value: T,
+    stamp: u64,
+}
+
+impl<T> Stamped<T> {
+    fn new(value: T) -> Self {
+        Self {
+            value,
+            stamp: NEXT_STAMP.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn stamp(&self) -> u64 {
+        self.stamp
+    }
+}
+
+impl<T: Default> Default for Stamped<T> {
+    fn default() -> Self {
+        Self::new(T::default())
+    }
+}
+
+impl<T> Deref for Stamped<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.value
+    }
+}
+
+impl<T> DerefMut for Stamped<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        self.stamp = NEXT_STAMP.fetch_add(1, Ordering::Relaxed);
+        &mut self.value
+    }
+}
+
+impl<'a, T> IntoIterator for &'a Stamped<T>
+where
+    &'a T: IntoIterator,
+{
+    type Item = <&'a T as IntoIterator>::Item;
+    type IntoIter = <&'a T as IntoIterator>::IntoIter;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.value.into_iter()
+    }
+}
+
+impl<T: Serialize> Serialize for Stamped<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.value.serialize(serializer)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Stamped<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        T::deserialize(deserializer).map(Self::new)
+    }
+}
+
+/// Sorted set of every worker on a company roster, rebuilt only when a roster changes.
+/// Also keeps the job applicants found for one state of the job buy orders.
+#[derive(Default)]
+pub(crate) struct JobRosters {
+    flat: Vec<HumanID>,
+    sorted: Vec<HumanID>,
+    /// Stamp of the job buy orders that `applicants` and `stale` were collected from.
+    orders: Option<u64>,
+    applicants: Vec<HumanID>,
+    stale: Vec<SoulID>,
+}
+
+impl JobRosters {
+    /// Returns the sorted, deduplicated workers. The second value is true when rebuilt.
+    pub(crate) fn refresh(&mut self, world: &World) -> (&[HumanID], bool) {
+        let workers = || {
+            world
+                .companies
+                .values()
+                .flat_map(|company| company.workers.0.iter().copied())
+        };
+        let rebuilt = !workers().eq(self.flat.iter().copied());
+        if rebuilt {
+            self.flat.clear();
+            self.flat.extend(workers());
+            self.sorted.clone_from(&self.flat);
+            self.sorted.sort_unstable();
+            self.sorted.dedup();
+        }
+        (&self.sorted, rebuilt)
+    }
 }
 
 impl EcoStats {

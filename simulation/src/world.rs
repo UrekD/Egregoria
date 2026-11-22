@@ -109,7 +109,7 @@ pub struct HumanEnt {
 
     pub personal_info: Box<PersonalInfo>,
     #[inspect(skip)]
-    pub household: HouseholdStock,
+    pub household: Box<HouseholdStock>,
 }
 
 impl SimDrop for HumanEnt {
@@ -268,20 +268,22 @@ impl World {
     pub fn query_it_trans_speed(
         &mut self,
     ) -> impl Iterator<Item = (&mut Itinerary, &mut Transform, f32, Option<RoadUserKind>)> + '_ {
+        // Inert itineraries record no road entries. Skip reading their user kind.
         let humans = self.humans.values_mut().map(|human| {
-            let kind = (human.location == Location::Outside).then_some(RoadUserKind::Pedestrian);
+            let kind = (!human.it.is_inert() && human.location == Location::Outside)
+                .then_some(RoadUserKind::Pedestrian);
             (&mut human.it, &mut human.trans, human.speed.0, kind)
         });
         let trains = self.trains.values_mut().map(|train| {
             (&mut train.it, &mut train.trans, train.speed.0, None)
         });
         let vehicles = self.vehicles.values_mut().map(|vehicle| {
-            let kind = match vehicle.vehicle.kind {
+            let kind = (!vehicle.it.is_inert()).then(|| match vehicle.vehicle.kind {
                 VehicleKind::Car => RoadUserKind::Car,
                 VehicleKind::Truck => RoadUserKind::Truck,
                 VehicleKind::Bus => RoadUserKind::Bus,
-            };
-            (&mut vehicle.it, &mut vehicle.trans, vehicle.speed.0, Some(kind))
+            });
+            (&mut vehicle.it, &mut vehicle.trans, vehicle.speed.0, kind)
         });
         chain((humans, trains, vehicles))
     }

@@ -11,8 +11,8 @@ use crate::souls::desire::{
     PARK_DWELL, PARK_TRAVEL_LIMIT,
 };
 use crate::souls::household::{
-    cancel_visit, household_items, BasketId, HouseholdClaims, HouseholdStock, BASKET_TRAVEL_LIMIT,
-    HOMEBOUND_RETRY, HOMEBOUND_TRAVEL_LIMIT,
+    cancel_visit, household_items, BasketId, HouseholdClaims, BASKET_TRAVEL_LIMIT, HOMEBOUND_RETRY,
+    HOMEBOUND_TRAVEL_LIMIT,
 };
 use crate::souls::residence::Residences;
 use crate::transportation::Speed;
@@ -775,7 +775,7 @@ pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
         collider: None,
         work: None,
         personal_info,
-        household: HouseholdStock::default(),
+        household: Box::default(),
     });
 
     let now = sim

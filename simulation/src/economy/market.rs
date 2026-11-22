@@ -12,7 +12,7 @@ use prototypes::{
 };
 
 use crate::economy::balance::{periodic_tick, shelf_delivery_item, shelf_delivery_units};
-use crate::economy::{walking_component, WalkingComponents};
+use crate::economy::{walking_component, JobRosters, Stamped, WalkingComponents};
 use crate::economy::{
     Budget, ItemID, TripPurpose, TICKS_PER_BUDGET_DAY, WORKER_CONSUMPTION_PER_MINUTE,
 };
@@ -125,7 +125,7 @@ impl WalkingComponents {
 pub struct SingleMarket {
     // todo: change i32 to Quantity
     capital: BTreeMap<SoulID, i32>,
-    buy_orders: BTreeMap<SoulID, BuyOrder>,
+    buy_orders: Stamped<BTreeMap<SoulID, BuyOrder>>,
     sell_orders: BTreeMap<SoulID, SellOrder>,
     pub ext_value: Money,
     optout_exttrade: bool,
@@ -657,24 +657,50 @@ impl Market {
         let Some(market) = self.markets.get_mut(&job) else {
             return Vec::new();
         };
-        market.buy_orders.retain(|buyer, order| {
-            matches!(*buyer, SoulID::Human(id) if world.humans.get(id).is_some_and(|human| {
-                order.qty == 1
-                    && human.work.is_none()
-                    && human.bought.0.get(&job).is_none_or(Vec::is_empty)
-            }))
-        });
         if !market.buy_orders.is_empty() {
             // A roster can already contain an applicant before Work is assigned.
-            for &worker in world
-                .companies
-                .values()
-                .flat_map(|company| &company.workers.0)
-            {
-                market.buy_orders.remove(&SoulID::Human(worker));
-                if market.buy_orders.is_empty() {
-                    break;
+            let mut rosters = resources.write::<JobRosters>();
+            let (_, rebuilt) = rosters.refresh(world);
+            let JobRosters {
+                sorted,
+                orders,
+                applicants,
+                stale,
+                ..
+            } = &mut *rosters;
+            // Unchanged orders and rosters give the same applicants.
+            if rebuilt || *orders != Some(market.buy_orders.stamp()) {
+                *orders = Some(market.buy_orders.stamp());
+                applicants.clear();
+                stale.clear();
+                // Buyers ascend, so the sorted roster is merged in step.
+                let mut rostered = sorted.iter().peekable();
+                let mut on_roster = |id: HumanID| {
+                    while rostered.next_if(|&&worker| worker < id).is_some() {}
+                    rostered.peek() == Some(&&id)
+                };
+                for (&buyer, order) in &market.buy_orders {
+                    match buyer {
+                        SoulID::Human(id) if order.qty == 1 && !on_roster(id) => {
+                            applicants.push(id)
+                        }
+                        _ => stale.push(buyer),
+                    }
                 }
+            }
+            let ineligible = applicants.iter().filter(|&&id| {
+                !world.humans.get(id).is_some_and(|human| {
+                    human.work.is_none() && human.bought.0.get(&job).is_none_or(Vec::is_empty)
+                })
+            });
+            let stale: Vec<_> = stale
+                .iter()
+                .copied()
+                .chain(ineligible.map(|&id| SoulID::Human(id)))
+                .collect();
+            // Removing an order renews the stamp, so the next tick collects again.
+            for buyer in stale {
+                market.buy_orders.remove(&buyer);
             }
         }
         let phase = periodic_tick(&resources.read::<Budget>(), tick);

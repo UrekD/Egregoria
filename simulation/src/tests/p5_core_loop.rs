@@ -4,8 +4,8 @@ use crate::economy::progression::{
     ProgressionState,
 };
 use crate::economy::{
-    demand_update, market_update, Budget, BudgetCategory, DailyEconomyMetrics, Market, TripPurpose,
-    TICKS_PER_BUDGET_DAY,
+    demand_update, market_update, Budget, BudgetCategory, DailyEconomyMetrics, JobRosters, Market,
+    Stamped, TripPurpose, TICKS_PER_BUDGET_DAY,
 };
 use crate::map::{
     BuildingID, BuildingKind, Density, LanePatternBuilder, Lot, LotID, ProjectFilter, RoadID,
@@ -22,10 +22,12 @@ use crate::souls::{
     residence,
 };
 use crate::world::CompanyID;
-use crate::{NewGameOptions, Simulation, SoulID, WorldCommand, INITIAL_TICK};
+use crate::{HumanID, NewGameOptions, Simulation, SoulID, WorldCommand, INITIAL_TICK};
 use common::saveload::{Bincode, Encoder};
 use geom::{vec2, vec3, Intersect, Polygon, Vec2, OBB};
 use prototypes::{GameTime, GoodsCompanyID, ItemID, Money, ServiceKind, TICKS_PER_HOUR};
+use slotmapd::KeyData;
+use std::collections::BTreeMap;
 
 #[test]
 fn p5_core_loop_starter_residential_lots_are_all_buildable() {
@@ -487,6 +489,162 @@ fn p5_core_loop_purges_stale_job_orders_for_rostered_workers() {
             .buy_order(SoulID::Human(worker))
             .is_none());
     }
+}
+
+#[test]
+fn p5_core_loop_job_orders_follow_roster_edits_between_ticks() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let road = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 250.0)
+        .unwrap()
+        .0;
+    let home = test.build_house_near(vec2(120.0, 285.0));
+    let (shop_building, shop) = place_company(&mut test, "commercial-l1", vec2(90.0, 225.0), road);
+    let door = test.g.map().get(shop_building).unwrap().door_pos.xy();
+    let job = ItemID::new("job-opening");
+    let former = spawn_human(&mut test.g, home).unwrap();
+    hire(&mut test.g);
+    assert_eq!(test.g.world().companies[shop].workers.0, [former]);
+
+    // A rostered applicant is purged before the ordinary job market runs.
+    test.g.world.humans[former].work = None;
+    test.g
+        .write::<Market>()
+        .buy(SoulID::Human(former), door, job, 1);
+    let (world, resources) = test.g.world_res();
+    market_update(world, resources);
+    assert!(test.g.read::<Market>().inner()[&job]
+        .buy_order(SoulID::Human(former))
+        .is_none());
+    assert_eq!(test.g.world().companies[shop].workers.0, [former]);
+
+    // Swap the roster outside the market. The next tick must see the new roster.
+    let rostered = spawn_human(&mut test.g, home).unwrap();
+    test.g.world.companies[shop].workers.0 = vec![rostered];
+    test.g
+        .write::<Market>()
+        .buy(SoulID::Human(former), door, job, 1);
+    let (world, resources) = test.g.world_res();
+    market_update(world, resources);
+    assert_eq!(test.g.world().companies[shop].workers.0, [rostered, former]);
+    let market = test.g.read::<Market>();
+    for worker in [rostered, former] {
+        assert!(market.inner()[&job]
+            .buy_order(SoulID::Human(worker))
+            .is_none());
+    }
+}
+
+#[test]
+fn p5_core_loop_job_orders_follow_applicant_edits_between_ticks() {
+    use crate::souls::desire::{Work, WorkKind};
+
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let home = test.build_house_near(vec2(120.0, 285.0));
+    let job = ItemID::new("job-opening");
+    let tick = |test: &mut TestCtx| {
+        let (world, resources) = test.g.world_res();
+        market_update(world, resources);
+    };
+    let has_order = |test: &TestCtx, human| {
+        test.g.read::<Market>().inner()[&job]
+            .buy_order(SoulID::Human(human))
+            .is_some()
+    };
+    let [employed, pending, removed] = [160.0, 200.0, 240.0].map(|x| {
+        let house = test.build_house_near(vec2(x, 285.0));
+        spawn_human(&mut test.g, house).unwrap()
+    });
+    tick(&mut test);
+    assert!([employed, pending, removed]
+        .iter()
+        .all(|&human| has_order(&test, human)));
+
+    // Neither the orders nor the rosters change here.
+    test.g.world.humans[employed].work = Some(Work::new(home, WorkKind::Worker, 0.0));
+    test.g.world.humans[pending].bought.0.insert(
+        job,
+        vec![crate::economy::Trade {
+            buyer: crate::economy::TradeTarget(SoulID::Human(pending)),
+            seller: crate::economy::TradeTarget(SoulID::Human(employed)),
+            qty: 1,
+            kind: job,
+            money_delta: Money::ZERO,
+        }],
+    );
+    test.g.world.humans.remove(removed);
+    tick(&mut test);
+    for human in [employed, pending, removed] {
+        assert!(!has_order(&test, human));
+    }
+
+    let house = test.build_house_near(vec2(280.0, 285.0));
+    let arrival = spawn_human(&mut test.g, house).unwrap();
+    tick(&mut test);
+    assert!(has_order(&test, arrival));
+    test.g.world.humans[arrival].work = Some(Work::new(home, WorkKind::Worker, 0.0));
+    tick(&mut test);
+    assert!(!has_order(&test, arrival));
+}
+
+#[test]
+fn p5_core_loop_stamped_orders_renew_on_mutable_access_only() {
+    let mut orders = Stamped::<BTreeMap<u32, u32>>::default();
+    let other = Stamped::<BTreeMap<u32, u32>>::default();
+    assert_ne!(orders.stamp(), other.stamp());
+
+    let initial = orders.stamp();
+    assert!(orders.is_empty());
+    assert_eq!((&orders).into_iter().count(), 0);
+    assert_eq!(orders.stamp(), initial);
+    orders.insert(1, 2);
+    let inserted = orders.stamp();
+    assert_ne!(inserted, initial);
+    assert_eq!(orders.get(&1), Some(&2));
+    assert_eq!(orders.stamp(), inserted);
+
+    // The stamp is not saved, and a loaded value gets a fresh one.
+    let bytes = Bincode::encode(&orders).unwrap();
+    assert_eq!(bytes, Bincode::encode(&*orders).unwrap());
+    let loaded: Stamped<BTreeMap<u32, u32>> = Bincode::decode(&bytes).unwrap();
+    assert_eq!(*loaded, *orders);
+    assert_ne!(loaded.stamp(), orders.stamp());
+}
+
+#[test]
+fn p5_core_loop_job_rosters_rebuild_only_after_a_roster_edit() {
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let road = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 250.0)
+        .unwrap()
+        .0;
+    let (_, shop) = place_company(&mut test, "commercial-l1", vec2(90.0, 225.0), road);
+    let (_, school) = place_company(&mut test, "school", vec2(355.0, 225.0), road);
+    let worker = |id: u64| HumanID::from(KeyData::from_ffi((1 << 32) | id));
+    test.g.world.companies[shop].workers.0 = vec![worker(3), worker(1)];
+    test.g.world.companies[school].workers.0 = vec![worker(2), worker(1)];
+
+    let mut rosters = JobRosters::default();
+    let expected = [worker(1), worker(2), worker(3)];
+    assert_eq!(rosters.refresh(test.g.world()), (&expected[..], true));
+    assert_eq!(rosters.refresh(test.g.world()), (&expected[..], false));
+
+    // An in-place edit keeps every roster length unchanged.
+    test.g.world.companies[school].workers.0[1] = worker(4);
+    let expected = [worker(1), worker(2), worker(3), worker(4)];
+    assert_eq!(rosters.refresh(test.g.world()), (&expected[..], true));
+    assert_eq!(rosters.refresh(test.g.world()), (&expected[..], false));
 }
 
 #[test]

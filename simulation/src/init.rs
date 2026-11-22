@@ -209,6 +209,7 @@ fn register_systems_and_resources() {
     register_resource_noserialize::<ParCommandBuffer<FreightStationEnt>>();
     register_resource_noserialize::<ParCommandBuffer<CompanyEnt>>();
     register_resource_noserialize::<crate::economy::WalkingComponents>();
+    register_resource_noserialize::<crate::economy::JobRosters>();
     register_resource_noserialize::<RoadThroughput>();
     register_resource_noserialize::<crate::souls::growth::GrowthCache>();
     // The registry is populated once before any simulation uses it.

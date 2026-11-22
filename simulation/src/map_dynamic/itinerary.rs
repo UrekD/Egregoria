@@ -757,6 +757,13 @@ impl Itinerary {
         self.reversed_local_path.len()
     }
 
+    /// A stationary entity with a route may still cross an itinerary
+    /// boundary. Only the inert itinerary kinds can skip movement.
+    pub(crate) fn is_inert(&self) -> bool {
+        self.reversed_local_path.is_empty()
+            && matches!(self.kind, ItineraryKind::None | ItineraryKind::WaitUntil(_))
+    }
+
     pub fn is_terminal(&self) -> bool {
         match &self.kind {
             ItineraryKind::None | ItineraryKind::WaitUntil(_) => true,
@@ -916,7 +923,18 @@ impl Inspect<ItineraryKind> for ItineraryKind {
 }
 
 fn movement_reaches_lane(lane: &Lane, from: Vec3, to: Vec3) -> bool {
-    if within_lane(lane, from) || within_lane(lane, to) {
+    let half_width = lane.kind.width() * 0.5;
+    let from_dist2 = lane.points.project_dist2(from);
+    if from_dist2 <= half_width * half_width {
+        return true;
+    }
+    // Every point of the movement is within its length of the start. A start
+    // farther than that from the lane cannot reach it. The margin covers rounding.
+    let reach = half_width + from.distance(to) + 1.0;
+    if from_dist2 > reach * reach {
+        return false;
+    }
+    if within_lane(lane, to) {
         return true;
     }
     if from == to {
@@ -961,11 +979,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     world
         .query_it_trans_speed()
         .for_each(|(it, trans, speed, kind)| {
-            // A stationary entity with a route may still cross an itinerary
-            // boundary. Only the inert itinerary kinds can skip movement here.
-            if it.reversed_local_path.is_empty()
-                && matches!(it.kind, ItineraryKind::None | ItineraryKind::WaitUntil(_))
-            {
+            if it.is_inert() {
                 return;
             }
             let record = kind.map(|kind| {
@@ -1216,6 +1230,86 @@ mod tests {
                 branch.update_with_route(pos, 100.0, 0, &map, reroute, Some(reject_entry));
             assert!(within_lane(map.get(lane).unwrap(), arrived));
         }
+    }
+
+    #[test]
+    fn u5_movement_reaches_lane_matches_the_full_segment_test() {
+        // The full test from before the distance early-out.
+        fn reference(lane: &Lane, from: Vec3, to: Vec3) -> bool {
+            if within_lane(lane, from) || within_lane(lane, to) {
+                return true;
+            }
+            if from == to {
+                return false;
+            }
+            let movement = Segment3::new(from, to);
+            let along_movement = movement.vec();
+            let radius2 = (lane.kind.width() * 0.5).powi(2);
+            lane.points.segments().any(|segment| {
+                if movement.project(segment.src).distance2(segment.src) <= radius2
+                    || movement.project(segment.dst).distance2(segment.dst) <= radius2
+                {
+                    return true;
+                }
+                let along_lane = segment.vec();
+                let normal = along_movement.cross(along_lane);
+                let normal_sq = normal.mag2();
+                let offset = segment.src - from;
+                if normal_sq == 0.0 || offset.dot(normal).powi(2) > radius2 * normal_sq {
+                    return false;
+                }
+                let movement_dist = offset.cross(along_lane).dot(normal);
+                let lane_dist = offset.cross(along_movement).dot(normal);
+                let range = 0.0..=normal_sq;
+                range.contains(&movement_dist) && range.contains(&lane_dist)
+            })
+        }
+
+        let ctx = TestCtx::new();
+        // A bend gives lanes with several segments. Far coordinates exercise rounding.
+        ctx.build_roads(&[
+            vec3(11_400.0, 7_400.0, 0.0),
+            vec3(11_520.0, 7_430.0, 0.0),
+            vec3(11_600.0, 7_520.0, 0.0),
+        ]);
+        let map = ctx.g.map();
+        let steps = [
+            vec3(0.0, 0.0, 0.0),
+            vec3(0.4, 0.0, 0.0),
+            vec3(0.0, -1.3, 0.0),
+            vec3(3.0, 2.0, 0.0),
+            vec3(-9.0, 6.5, 0.0),
+            vec3(25.0, -25.0, 0.0),
+            vec3(-60.0, 10.0, 0.0),
+        ];
+        let (mut reached, mut missed) = (0, 0);
+        for lane in map.lanes().values() {
+            let center = lane.points.middle();
+            for x in -40..=40 {
+                for y in -40..=40 {
+                    let from = center + vec3(x as f32 * 1.7, y as f32 * 1.3, 0.0);
+                    for step in steps {
+                        let to = from + step;
+                        let expected = reference(lane, from, to);
+                        assert_eq!(
+                            movement_reaches_lane(lane, from, to),
+                            expected,
+                            "lane {:?} from {from:?} to {to:?}",
+                            lane.id
+                        );
+                        if expected {
+                            reached += 1;
+                        } else {
+                            missed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            reached > 1000 && missed > 1000,
+            "{reached} reached, {missed} missed"
+        );
     }
 
     #[test]
