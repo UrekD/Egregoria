@@ -7,7 +7,7 @@ use geom::{Vec2, Vec3};
 
 use crate::map::{
     BuildingID, Environment, Intersection, IntersectionID, Lane, LaneDirection, LaneID, LaneKind,
-    LanePattern, Lanes, ParkingSpots, Roads, SpatialMap, MAX_SLOPE, ROAD_Z_OFFSET,
+    LanePattern, Lanes, Map, MapProject, ParkingSpots, Roads, SpatialMap, MAX_SLOPE, ROAD_Z_OFFSET,
 };
 
 const MIN_ELEVATED_SPAN_CLEARANCE: f32 = 2.5;
@@ -94,6 +94,15 @@ pub struct PylonPosition {
 pub enum PointGenerateError {
     OutsideOfMap,
     TooSteep,
+}
+
+impl MapProject {
+    /// Position used for road placement, including any terrain snap at a split.
+    /// The road surface offset is excluded.
+    pub fn road_connection_position(self, map: &Map) -> Option<Vec3> {
+        map.resolve_connection_endpoint(self)
+            .map(|endpoint| endpoint.pos)
+    }
 }
 
 impl Road {

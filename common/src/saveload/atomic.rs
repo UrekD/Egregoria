@@ -277,10 +277,13 @@ fn replace_file(staging: &Path, path: &Path, durability: Durability) -> io::Resu
     )
 }
 
-/// Remove regular staging files directly under `root` older than `older_than`.
-/// Call at startup or use an age safely above the lifetime of an in-progress write.
+/// Remove regular staging files directly under `root` at least `older_than` old.
+/// On Unix the owner PID must be absent. Elsewhere the minimum age is 24 hours.
 /// Entry errors are skipped and logged. Entries that disappear are skipped quietly.
 pub fn sweep_stale_tmp(root: &Path, older_than: Duration) -> io::Result<usize> {
+    #[cfg(not(unix))]
+    let older_than = older_than.max(Duration::from_secs(24 * 60 * 60));
+
     let dir = match fs::read_dir(root) {
         Ok(dir) => dir,
         Err(error) if error.kind() == ErrorKind::NotFound => return Ok(0),
@@ -300,16 +303,17 @@ pub fn sweep_stale_tmp(root: &Path, older_than: Duration) -> io::Result<usize> {
                 continue;
             }
         };
-        if !is_staging_name(entry.file_name().as_encoded_bytes()) {
+        let Some(pid) = staging_pid(entry.file_name().as_encoded_bytes()) else {
             continue;
-        }
+        };
         let path = entry.path();
         let result: io::Result<()> = (|| {
             let metadata = path.symlink_metadata()?;
             if metadata.is_file()
                 && now
                     .duration_since(metadata.modified()?)
-                    .is_ok_and(|age| age > older_than)
+                    .is_ok_and(|age| age >= older_than)
+                && can_sweep_pid(pid)
             {
                 fs::remove_file(&path)?;
                 removed += 1;
@@ -325,19 +329,53 @@ pub fn sweep_stale_tmp(root: &Path, older_than: Duration) -> io::Result<usize> {
     Ok(removed)
 }
 
-fn is_staging_name(name: &[u8]) -> bool {
-    let Some(stem) = name.strip_suffix(b".tmp") else {
-        return false;
-    };
+fn staging_pid(name: &[u8]) -> Option<u32> {
+    let stem = name.strip_suffix(b".tmp")?;
     let mut parts = stem.rsplitn(3, |&b| b == b'.');
-    let (Some(nonce), Some(pid), Some(target)) = (parts.next(), parts.next(), parts.next()) else {
-        return false;
+    let (nonce, pid, target) = (parts.next()?, parts.next()?, parts.next()?);
+    if target.is_empty()
+        || !pid.iter().all(u8::is_ascii_digit)
+        || !nonce.iter().all(u8::is_ascii_digit)
+    {
+        return None;
+    }
+    std::str::from_utf8(nonce).ok()?.parse::<u64>().ok()?;
+    std::str::from_utf8(pid).ok()?.parse().ok()
+}
+
+#[cfg(unix)]
+fn can_sweep_pid(pid: u32) -> bool {
+    use std::ffi::c_int;
+
+    unsafe extern "C" {
+        fn kill(pid: c_int, sig: c_int) -> c_int;
+    }
+
+    const ESRCH: c_int = if cfg!(target_os = "emscripten") {
+        71
+    } else if cfg!(target_os = "haiku") {
+        -2_147_454_963
+    } else if cfg!(target_os = "hurd") {
+        1_073_741_827
+    } else {
+        3
     };
-    !target.is_empty()
-        && pid.iter().all(u8::is_ascii_digit)
-        && nonce.iter().all(u8::is_ascii_digit)
-        && std::str::from_utf8(pid).is_ok_and(|pid| pid.parse::<u32>().is_ok())
-        && std::str::from_utf8(nonce).is_ok_and(|nonce| nonce.parse::<u64>().is_ok())
+
+    let Ok(pid) = c_int::try_from(pid) else {
+        return true;
+    };
+    if pid == 0 {
+        return true;
+    }
+    // SAFETY: This probes a single positive PID. Signal 0 sends no signal.
+    let result = unsafe { kill(pid, 0) };
+    // Permission failures and other errors leave the staging file alone.
+    result == -1 && io::Error::last_os_error().raw_os_error() == Some(ESRCH)
+}
+
+#[cfg(not(unix))]
+fn can_sweep_pid(_pid: u32) -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -417,10 +455,11 @@ mod tests {
     #[test]
     fn slot_sweep_removes_only_old_staging_files() {
         let root = TestRoot::new();
-        let old = root.file("world.zip.42.11.tmp", b"staged", 100);
-        let fresh = root.file("world.zip.42.12.tmp", b"staged", 100);
+        let pid = i32::MAX;
+        let old = root.file(&format!("world.zip.{pid}.11.tmp"), b"staged", 100);
+        let fresh = root.file(&format!("world.zip.{pid}.12.tmp"), b"staged", 100);
         let unrelated = root.file("world.zip.unrelated.tmp", b"keep", 100);
-        let directory = old.with_file_name("world.zip.42.13.tmp");
+        let directory = old.with_file_name(format!("world.zip.{pid}.13.tmp"));
         fs::create_dir(&directory).unwrap();
         File::options()
             .write(true)
@@ -441,11 +480,30 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn slot_sweep_preserves_an_open_staging_file_owned_by_a_live_process() {
+        let root = TestRoot::new();
+        let save = root.file("world.zip", b"old", 100);
+
+        write_staged(&save, Durability::RenameOnly, |file| {
+            file.set_modified(SystemTime::UNIX_EPOCH + Duration::from_secs(100))?;
+            assert_eq!(
+                sweep_stale_tmp(save.parent().unwrap(), Duration::from_secs(3600))?,
+                0
+            );
+            assert_eq!(fs::read(&save)?, b"old");
+            file.write_all(b"new")
+        })
+        .unwrap();
+        assert_eq!(fs::read(save).unwrap(), b"new");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn slot_sweep_skips_entry_removal_errors() {
         use std::os::unix::fs::PermissionsExt;
 
         let root = TestRoot::new();
-        let stale = root.file("world.zip.42.11.tmp", b"staged", 100);
+        let stale = root.file(&format!("world.zip.{}.11.tmp", i32::MAX), b"staged", 100);
         let probe = root.file("probe", b"", 100);
         let dir = stale.parent().unwrap();
         let permissions = fs::metadata(dir).unwrap().permissions();

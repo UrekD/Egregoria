@@ -13,20 +13,21 @@ if [ ! -f "$binary" ]; then
     exit 1
 fi
 
-staging=./egregoria_build
-if [ -L "$staging" ] || { [ -e "$staging" ] && [ ! -d "$staging" ]; }; then
-    printf 'Expected a staging directory at %s/%s\n' "$PWD" "${staging#./}" >&2
+build=./egregoria_build
+if [ -L "$build" ] || { [ -e "$build" ] && [ ! -d "$build" ]; }; then
+    printf 'Expected a staging directory at %s/%s\n' "$PWD" "${build#./}" >&2
     exit 1
 fi
-if [ -d "$staging" ]; then
-    rm -rf "$staging"
-fi
 
-mkdir "$staging"
-trap 'rm -rf "$staging"' EXIT
-mkdir "$staging/assets" "$staging/base_mod"
+mkdir -p "$build"
+run_dir=$(mktemp -d "$build/package.XXXXXXXX")
+trap 'rm -rf "$run_dir"' EXIT
+trap 'exit 1' HUP INT TERM
+staging="$run_dir/egregoria_build"
+mkdir -p "$staging/assets" "$staging/base_mod"
 cp -R assets/. "$staging/assets"
 cp -R base_mod/. "$staging/base_mod"
 rm -f "$staging"/assets/screen*.jpg "$staging"/assets/screen*.png
 cp "$binary" "$staging/egregoria_bin"
-tar -czvf goria.tar.gz "${staging#./}"
+tar -czvf "$run_dir/goria.tar.gz" -C "$run_dir" egregoria_build
+mv -f "$run_dir/goria.tar.gz" .

@@ -5,7 +5,7 @@ use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use simulation::map::{
     LanePatternBuilder, Map, MapProject, PointGenerateError, ProjectFilter, ProjectKind,
-    PylonPosition, RoadSegmentKind, ROAD_Z_OFFSET,
+    PylonPosition, RoadSegmentKind,
 };
 use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::Simulation;
@@ -359,8 +359,9 @@ impl RoadBuildResource {
                 HeightReference::Start,
                 Start(start) | StartCurved(start) | CurvedConnection(start, _) | Curved(_, start),
             ) => {
-                let start_height =
-                    connection_endpoint_position(map, start).map_or(start.pos.z, |p| p.z);
+                let start_height = start
+                    .road_connection_position(map)
+                    .map_or(start.pos.z, |p| p.z);
                 h.xy().z(start_height + self.height_offset)
             }
             (HeightReference::Ground | HeightReference::Start, _) => h.up(self.height_offset),
@@ -396,26 +397,6 @@ pub enum HeightReference {
     MaxDecline,
 }
 
-fn connection_endpoint_position(map: &Map, project: MapProject) -> Option<Vec3> {
-    // Match the coordinate conversion in Map::resolve_connection_endpoint.
-    let pos = match project.kind {
-        Ground => project.pos,
-        Intersection(id) => map.get(id)?.pos,
-        Road(id) if project.pos.is_finite() => {
-            let points = map.get(id)?.points();
-            let point = points.project(project.pos);
-            if point.xy().distance(points.first().xy()) < 1.0
-                || point.xy().distance(points.last().xy()) < 1.0
-            {
-                return None;
-            }
-            point - Vec3::z(ROAD_Z_OFFSET)
-        }
-        _ => return None,
-    };
-    pos.is_finite().then_some(pos)
-}
-
 fn connection_preview(
     map: &Map,
     src: MapProject,
@@ -423,8 +404,8 @@ fn connection_preview(
     inter: Option<Vec2>,
     is_rail: bool,
 ) -> Option<(PolyLine3, Option<PointGenerateError>)> {
-    let src = connection_endpoint_position(map, src)?;
-    let dst = connection_endpoint_position(map, dst)?;
+    let src = src.road_connection_position(map)?;
+    let dst = dst.road_connection_position(map)?;
     let segment = match inter {
         Some(x) => RoadSegmentKind::from_elbow(src.xy(), dst.xy(), x),
         None => RoadSegmentKind::Straight,
@@ -818,5 +799,37 @@ mod tests {
             (preview.first(), preview.last()),
             (applied.first(), applied.last())
         );
+    }
+
+    #[test]
+    fn road_preview_matches_placement_at_a_low_terrain_following_split() {
+        let mut map = Map::empty();
+        map.environment = Environment::new(1, 1);
+        map.environment
+            .terrain_apply(map.environment.bounds(), |_| 1.0);
+        let pattern = LanePatternBuilder::default().build();
+        let (_, original) = map
+            .make_connection(
+                MapProject::ground(vec3(32.0, 64.0, 1.0)),
+                MapProject::ground(vec3(288.0, 64.0, 1.0)),
+                None,
+                &pattern,
+            )
+            .unwrap();
+        map.environment
+            .terrain_apply(map.environment.bounds(), |_| 0.0);
+
+        let points = map.get(original).unwrap().points();
+        let from = MapProject {
+            pos: points.project_2d(vec2(160.0, 64.0)),
+            kind: Road(original),
+        };
+        let to = MapProject::ground(vec3(160.0, 224.0, 5.0));
+        let (preview, error) = connection_preview(&map, from, to, None, false).unwrap();
+        assert!(error.is_none());
+        let (_, road) = map.make_connection(from, to, None, &pattern).unwrap();
+
+        let applied = map.get(road).unwrap().points();
+        assert_eq!(preview.as_slice(), applied.as_slice());
     }
 }

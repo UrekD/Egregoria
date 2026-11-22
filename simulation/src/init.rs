@@ -92,11 +92,18 @@ mod tests {
                 .as_nanos(),
         ));
         fs::create_dir(&root).unwrap();
-        let stale = root.join("bindings.json.42.1.tmp");
-        let recent = root.join("world.zip.42.2.tmp");
+        let stale = root.join(format!("bindings.json.{}.1.tmp", i32::MAX));
+        let recent = root.join(format!("world.zip.{}.2.tmp", i32::MAX));
+        let live = root.join(format!("world.zip.{}.3.tmp", std::process::id()));
         let save = root.join("world.zip");
         let now = SystemTime::now();
-        for (path, age) in [(&stale, 3601), (&recent, 3300), (&save, 7200)] {
+        let live_age = if cfg!(unix) { 90_000 } else { 7200 };
+        for (path, age) in [
+            (&stale, 90_000),
+            (&recent, 3300),
+            (&live, live_age),
+            (&save, 90_000),
+        ] {
             File::create(path)
                 .unwrap()
                 .set_modified(now - Duration::from_secs(age))
@@ -110,7 +117,12 @@ mod tests {
             ])
             .env(SAVE_DIR_ENV, &root)
             .output();
-        let remaining = (stale.exists(), recent.exists(), save.exists());
+        let remaining = (
+            stale.exists(),
+            recent.exists(),
+            live.exists(),
+            save.exists(),
+        );
         fs::remove_dir_all(root).unwrap();
         let output = output.unwrap();
         assert!(
@@ -118,7 +130,7 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stdout)
         );
-        assert_eq!(remaining, (false, true, true));
+        assert_eq!(remaining, (false, true, true, true));
     }
 }
 

@@ -354,17 +354,24 @@ fn split_bridge_keeps_both_decks_over_high_ground() {
     assert!((0.0..0.5).contains(&clearance));
     assert_straight_deck(map.roads[original].interfaced_points(), start, end);
 
-    let (junction, side_road) = map
-        .make_connection(
-            MapProject::ground(vec3(160.0, 144.0, midpoint.z)),
-            MapProject {
-                pos: midpoint + Vec3::z(ROAD_Z_OFFSET),
-                kind: ProjectKind::Road(original),
-            },
-            None,
-            &pattern,
-        )
-        .unwrap();
+    let from = MapProject::ground(vec3(160.0, 144.0, midpoint.z));
+    let to = MapProject {
+        pos: midpoint + Vec3::z(ROAD_Z_OFFSET),
+        kind: ProjectKind::Road(original),
+    };
+    let preview_end = to.road_connection_position(&map).unwrap();
+    assert_eq!(preview_end, midpoint);
+    let (preview, error) = Road::generate_points(
+        from.road_connection_position(&map).unwrap(),
+        preview_end,
+        RoadSegmentKind::Straight,
+        false,
+        &map.environment,
+    );
+    assert!(error.is_none());
+
+    let (junction, side_road) = map.make_connection(from, to, None, &pattern).unwrap();
+    assert_eq!(preview.as_slice(), map.roads[side_road].points().as_slice());
     let junction = &map.intersections[junction];
     assert_eq!(junction.pos, midpoint);
     assert_eq!(junction.roads.len(), 3);
