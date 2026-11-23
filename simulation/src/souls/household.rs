@@ -889,6 +889,71 @@ mod tests {
         assert_eq!(human.location, Location::Outside);
         assert_ne!(human.router.target_dest, Some(Destination::Building(home)));
         assert_eq!(human.household.carried.get(&groceries), Some(&3));
+        // The car was parked before its owner left it, not abandoned on the lane.
+        assert!(test.g.get(car).unwrap().vehicle.state.is_parked());
+        assert!(crate::map_dynamic::abandoned_cars(test.g.world()).is_empty());
+    }
+
+    #[test]
+    fn parkfix_homebound_deadline_parks_the_car_before_leaving_it() {
+        use crate::map::{LaneKind, PathKind};
+        use crate::map_dynamic::{Destination, Itinerary, RoutingStep};
+        use crate::souls::human::HumanDecisionKind;
+
+        let (mut test, id, home) = street();
+        let car_pos = {
+            let map = test.g.map();
+            let pos = vec3(400.0, 100.0, 0.0);
+            map.get(map.nearest_lane(pos, LaneKind::Driving, None).unwrap())
+                .unwrap()
+                .points
+                .project_segment(pos)
+                .0
+        };
+        let home_pos = test.g.map().get(home).unwrap().door_pos;
+        let car = test.g.get(id).unwrap().router.personal_car.unwrap();
+        crate::transportation::unpark(&mut test.g, car);
+        test.g
+            .write::<crate::map_dynamic::BuildingInfos>()
+            .get_out(home, SoulID::Human(id));
+        let world = test.g.world_mut_unchecked();
+        let human = &mut world.humans[id];
+        human.location = Location::Vehicle(car);
+        if let Some(collider) = human.collider.take() {
+            test.g
+                .write::<crate::transportation::TransportGrid>()
+                .remove_maintain(collider.0);
+        }
+        let world = test.g.world_mut_unchecked();
+        let human = &mut world.humans[id];
+        human.router.set_test_route(
+            Destination::Building(home),
+            vec![RoutingStep::DriveTo(car, home_pos)],
+        );
+        human.household.carried.insert(ItemID::new("groceries"), 3);
+        // The homebound deadline has already passed.
+        human.household.homebound_until = Some(0);
+        human.decision.kind = HumanDecisionKind::DepositAtHome;
+        human.decision.wait = 0;
+        world.vehicles[car].trans.pos = car_pos;
+        world.vehicles[car].it = Itinerary::wait_for_reroute(PathKind::Vehicle, home_pos);
+        test.tick_fast();
+        assert!(!matches!(
+            test.g.get(id).unwrap().decision.kind,
+            HumanDecisionKind::DepositAtHome
+        ));
+        let parked = (0..prototypes::TICKS_PER_MINUTE).any(|_| {
+            test.tick_fast();
+            test.g.get(car).unwrap().vehicle.state.is_parked()
+        });
+        let v = test.g.get(car).unwrap();
+        assert!(
+            parked,
+            "the car is still on the road: {:?} at {:?}",
+            v.vehicle.state, v.trans.pos
+        );
+        assert!(v.collider.is_none());
+        assert!(crate::map_dynamic::abandoned_cars(test.g.world()).is_empty());
     }
 
     #[test]

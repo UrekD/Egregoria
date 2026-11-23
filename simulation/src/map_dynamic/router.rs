@@ -16,9 +16,10 @@ use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
 use crate::{ParCommandBuffer, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
-use prototypes::Tick;
+use prototypes::{Tick, TICKS_PER_MINUTE};
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
+use std::collections::BTreeSet;
 
 #[path = "transit_path.rs"]
 mod transit_path;
@@ -90,6 +91,9 @@ pub enum RoutingStep {
 debug_inspect_impl!(RoutingStep);
 
 pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
+    if elapsed_ticks(resources).0 % ABANDONED_CAR_SWEEP == 0 {
+        recover_abandoned_cars(world, resources);
+    }
     routing_changed(world, resources, Transit::headway);
 }
 
@@ -126,6 +130,18 @@ fn routing_changed(
             }
         }
         if router.cur_dest == router.target_dest {
+            if router.cur_step.is_none() && router.steps.is_empty() {
+                // The trip was cancelled while driving: take the car off the road first.
+                park_idle_car(
+                    id,
+                    h,
+                    map,
+                    parking,
+                    &world.vehicles,
+                    &cbuf_human,
+                    &cbuf_vehicle,
+                );
+            }
             return;
         }
         let dest = unwrap_ret!(router.target_dest);
@@ -470,6 +486,17 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                         .map(|v| v.trans)
                         .map(|vtrans| vtrans.pos + vtrans.dir.cross(Vec3::Z) * 2.0)
                         .unwrap_or(pos);
+                    if h.router.personal_car == Some(vehicle) {
+                        // Nobody would move a personal car left on the road again.
+                        recover_abandoned_car(
+                            &mut world.vehicles,
+                            map,
+                            &mut resources.write(),
+                            resources,
+                            vehicle,
+                            map.get(h.home.house).map(|home| home.door_pos),
+                        );
+                    }
                     walk_outside(body, pos, cbuf_human, &mut h.location);
                 }
                 RoutingStep::GetInBuilding(build) => {
@@ -527,6 +554,187 @@ fn walk_outside(body: HumanID, pos: Vec3, cbuf: &ParCommandBuffer<HumanEnt>, loc
         h.trans.pos = pos;
         h.collider = Some(coll);
     });
+}
+
+/// Personal cars standing on the road with no route left and nobody inside or on the way to
+/// them, with their owners. Nothing moves such a car, so it blocks its lane for good.
+pub(crate) fn abandoned_cars(world: &World) -> Vec<(VehicleID, HumanID)> {
+    let riding: BTreeSet<VehicleID> = world
+        .humans
+        .values()
+        .filter_map(|h| match h.location {
+            Location::Vehicle(id) => Some(id),
+            _ => None,
+        })
+        .collect();
+    world
+        .humans
+        .iter()
+        .filter_map(|(owner, h)| {
+            let car = h.router.personal_car?;
+            let vehicle = world.vehicles.get(car)?;
+            (on_road(vehicle).is_some()
+                && vehicle.it.is_terminal()
+                && !riding.contains(&car)
+                && !h.router.plans_with(car))
+            .then_some((car, owner))
+        })
+        .collect()
+}
+
+/// How often personal cars left on the road are looked for, e.g. in saves from before cancelled
+/// trips parked the car. Nothing in the simulation leaves one there otherwise.
+const ABANDONED_CAR_SWEEP: u64 = TICKS_PER_MINUTE;
+
+fn recover_abandoned_cars(world: &mut World, resources: &Resources) {
+    let abandoned = abandoned_cars(world);
+    if abandoned.is_empty() {
+        return;
+    }
+    log::warn!(
+        "taking {} abandoned personal cars off the road",
+        abandoned.len()
+    );
+    let map = resources.read::<Map>();
+    let mut parking = resources.write::<ParkingManagement>();
+    for (car, owner) in abandoned {
+        let home = world
+            .humans
+            .get(owner)
+            .and_then(|owner| map.get(owner.home.house))
+            .map(|home| home.door_pos);
+        recover_abandoned_car(
+            &mut world.vehicles,
+            &map,
+            &mut parking,
+            resources,
+            car,
+            home,
+        );
+    }
+}
+
+/// Takes a personal car nobody drives off the road: it parks in a spot near where it stands,
+/// otherwise it is moved to a spot near its owner's home. A car with neither is removed.
+fn recover_abandoned_car(
+    vehicles: &mut HopSlotMap<VehicleID, VehicleEnt>,
+    map: &Map,
+    parking: &mut ParkingManagement,
+    resources: &Resources,
+    car: VehicleID,
+    home: Option<Vec3>,
+) {
+    let Some(vehicle) = vehicles.get_mut(car) else {
+        return;
+    };
+    let Some(pos) = on_road(vehicle) else {
+        return;
+    };
+    vehicle.it = Itinerary::NONE;
+    if let Ok(spot) = parking.reserve_near_radius(pos, map, NEAR_PARKING_RADIUS) {
+        if let Some(trans) = spot.get(&map.parking).map(|spot| spot.trans) {
+            vehicle.begin_parking(trans, spot);
+            return;
+        }
+        parking.free(spot);
+    }
+    if let Some(spot) = home.and_then(|door| parking.reserve_near(door, map).ok()) {
+        if let Some(trans) = spot.get(&map.parking).map(|spot| spot.trans) {
+            if let Some(collider) = vehicle.collider.take() {
+                resources
+                    .write::<TransportGrid>()
+                    .remove_maintain(collider.0);
+            }
+            vehicle.trans = trans;
+            vehicle.speed.0 = 0.0;
+            vehicle.vehicle.state = VehicleState::Parked(spot);
+            return;
+        }
+        parking.free(spot);
+    }
+    resources.read::<ParCommandBuffer<VehicleEnt>>().kill(car);
+}
+
+/// Steps that take a personal car off the road near where it stands and let its driver out.
+/// A spot within [`NEAR_PARKING_RADIUS`] is parked in directly; otherwise the car drives to the
+/// nearest spot it can reach.
+fn park_where_it_stands(
+    car: VehicleID,
+    pos: Vec3,
+    parking: &mut ParkingManagement,
+    map: &Map,
+) -> Option<Vec<RoutingStep>> {
+    if let Ok(here) = parking.reserve_near_radius(pos, map, NEAR_PARKING_RADIUS) {
+        return Some(vec![
+            RoutingStep::Park(car, Some(here)),
+            RoutingStep::GetOutVehicle(car),
+        ]);
+    }
+    let spot = parking.reserve_near(pos, map).ok()?;
+    match spot.park_pos(map).filter(|&to| can_drive(map, pos, to)) {
+        Some(to) => Some(vec![
+            RoutingStep::DriveTo(car, to),
+            RoutingStep::Park(car, Some(spot)),
+            RoutingStep::GetOutVehicle(car),
+        ]),
+        None => {
+            parking.free(spot);
+            None
+        }
+    }
+}
+
+/// Parks the personal car a human sits in once their trip is cancelled. Without a spot the human
+/// gets out and the car is taken off the road like an abandoned one.
+fn park_idle_car(
+    id: HumanID,
+    h: &mut HumanEnt,
+    map: &Map,
+    parking: &mut ParkingManagement,
+    vehicles: &HopSlotMap<VehicleID, VehicleEnt>,
+    cbuf_human: &ParCommandBuffer<HumanEnt>,
+    cbuf_vehicle: &ParCommandBuffer<VehicleEnt>,
+) {
+    let Location::Vehicle(car) = h.location else {
+        return;
+    };
+    if h.router.personal_car != Some(car) {
+        return;
+    }
+    let Some(pos) = vehicles.get(car).and_then(on_road) else {
+        return;
+    };
+    if let Some(mut steps) = park_where_it_stands(car, pos, parking, map) {
+        steps.reverse();
+        h.router.steps = steps;
+        return;
+    }
+    walk_outside(id, pos, cbuf_human, &mut h.location);
+    h.it = Itinerary::NONE;
+    let home = map.get(h.home.house).map(|home| home.door_pos);
+    cbuf_vehicle.exec_ent(car, move |sim| recover_car_later(sim, car, home));
+}
+
+fn recover_car_later(sim: &mut crate::Simulation, car: VehicleID, home: Option<Vec3>) {
+    let (world, resources) = sim.world_res();
+    recover_abandoned_car(
+        &mut world.vehicles,
+        &resources.read::<Map>(),
+        &mut resources.write::<ParkingManagement>(),
+        resources,
+        car,
+        home,
+    );
+}
+
+/// Position of a car that is on a driving lane, as opposed to parked or parking.
+fn on_road(vehicle: &VehicleEnt) -> Option<Vec3> {
+    (matches!(vehicle.vehicle.kind, VehicleKind::Car)
+        && matches!(
+            vehicle.vehicle.state,
+            VehicleState::Driving | VehicleState::Panicking(_)
+        ))
+    .then_some(vehicle.trans.pos)
 }
 
 pub(crate) type WalkingReach = crate::economy::WalkingComponents;
@@ -657,6 +865,8 @@ impl Router {
         self.defer_replan();
     }
 
+    /// Leaves the vehicle of an aborted trip. A personal car on the road is parked first, where
+    /// it stands, so that it does not block the lane once its driver is gone.
     pub(crate) fn exit_aborted_vehicle(
         human: &mut HumanEnt,
         id: VehicleID,
@@ -664,6 +874,17 @@ impl Router {
         map: &Map,
         resources: &Resources,
     ) {
+        let personal = human.router.personal_car == Some(id);
+        if let Some(pos) = vehicles.get(id).and_then(on_road).filter(|_| personal) {
+            let parking = &mut resources.write::<ParkingManagement>();
+            if let Some(mut steps) = park_where_it_stands(id, pos, parking, map) {
+                human.router.clear_steps(parking);
+                steps.reverse();
+                human.router.steps = steps;
+                return;
+            }
+        }
+        let home = map.get(human.home.house).map(|home| home.door_pos);
         let pos = vehicles.get(id).map_or(human.trans.pos, |car| {
             car.trans.pos + car.trans.dir.cross(Vec3::Z) * 2.0
         });
@@ -680,6 +901,9 @@ impl Router {
             .exec_ent(id, move |sim| {
                 if let Some(vehicle) = sim.world.vehicles.get_mut(id) {
                     vehicle.it = Itinerary::NONE;
+                }
+                if personal {
+                    recover_car_later(sim, id, home);
                 }
             });
         Self::restore_walking(human, exit, resources);
@@ -747,6 +971,21 @@ impl Router {
             })
     }
 
+    /// Whether a planned or current step uses the vehicle.
+    fn plans_with(&self, id: VehicleID) -> bool {
+        self.steps
+            .iter()
+            .chain(self.cur_step.iter())
+            .any(|step| match *step {
+                RoutingStep::DriveTo(vehicle, _)
+                | RoutingStep::Park(vehicle, _)
+                | RoutingStep::Unpark(vehicle)
+                | RoutingStep::GetInVehicle(vehicle)
+                | RoutingStep::GetOutVehicle(vehicle) => vehicle == id,
+                _ => false,
+            })
+    }
+
     pub(crate) fn forget_vehicle(&mut self, id: VehicleID) -> bool {
         if self.personal_car == Some(id) {
             self.personal_car = None;
@@ -755,19 +994,7 @@ impl Router {
         if selected {
             self.vehicle = self.personal_car;
         }
-        selected
-            || self
-                .steps
-                .iter()
-                .chain(self.cur_step.iter())
-                .any(|step| match *step {
-                    RoutingStep::DriveTo(vehicle, _)
-                    | RoutingStep::Park(vehicle, _)
-                    | RoutingStep::Unpark(vehicle)
-                    | RoutingStep::GetInVehicle(vehicle)
-                    | RoutingStep::GetOutVehicle(vehicle) => vehicle == id,
-                    _ => false,
-                })
+        selected || self.plans_with(id)
     }
 
     pub(crate) fn cancel_route(&mut self, parking: &mut ParkingManagement) {
@@ -814,6 +1041,29 @@ impl Router {
         cars: &HopSlotMap<VehicleID, VehicleEnt>,
     ) -> Result<Vec<RoutingStep>, RouterError> {
         let mut steps = vec![];
+        let planned = self.push_steps_to(&mut steps, obj, parking, map, loc, cars);
+        match planned {
+            Ok(()) => Ok(steps),
+            Err(error) => {
+                for step in steps {
+                    if let RoutingStep::Park(_, Some(spot)) = step {
+                        parking.free(spot);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn push_steps_to(
+        &mut self,
+        steps: &mut Vec<RoutingStep>,
+        obj: Vec3,
+        parking: &mut ParkingManagement,
+        map: &Map,
+        loc: &Location,
+        cars: &HopSlotMap<VehicleID, VehicleEnt>,
+    ) -> Result<(), RouterError> {
         if let Location::Building(cur_build) = loc {
             steps.push(RoutingStep::GetOutBuilding(*cur_build));
         }
@@ -825,7 +1075,16 @@ impl Router {
         };
         if let Location::Vehicle(current) = *loc {
             if vehicle != Some(current) {
-                steps.push(RoutingStep::GetOutVehicle(current));
+                // Park a personal car before leaving it, so it does not block the lane.
+                let park = cars
+                    .get(current)
+                    .and_then(on_road)
+                    .filter(|_| self.personal_car == Some(current))
+                    .and_then(|pos| park_where_it_stands(current, pos, parking, map));
+                match park {
+                    Some(park) => steps.extend(park),
+                    None => steps.push(RoutingStep::GetOutVehicle(current)),
+                }
             }
         }
 
@@ -852,7 +1111,7 @@ impl Router {
                         // An unparked car would wait on the road forever for a route.
                         parking.free(spot_resa);
                         steps.push(RoutingStep::WalkTo(obj));
-                        return Ok(steps);
+                        return Ok(());
                     }
                     steps.push(RoutingStep::WalkTo(pos));
                     steps.push(RoutingStep::GetInVehicle(car));
@@ -883,13 +1142,12 @@ impl Router {
             {
                 // Park where the car stands instead of waiting on the road for a route.
                 parking.free(spot_resa);
-                let here = parking
-                    .reserve_near_radius(pos, map, NEAR_PARKING_RADIUS)
-                    .map_err(RouterError::ReservingParkingSpot)?;
-                steps.push(RoutingStep::Park(car, Some(here)));
-                steps.push(RoutingStep::GetOutVehicle(car));
+                let park = park_where_it_stands(car, pos, parking, map).ok_or(
+                    RouterError::ReservingParkingSpot(ParkingReserveError::NoSpotFoundAfterSearch),
+                )?;
+                steps.extend(park);
                 steps.push(RoutingStep::WalkTo(obj));
-                return Ok(steps);
+                return Ok(());
             }
 
             steps.push(RoutingStep::DriveTo(car, parking_pos));
@@ -898,7 +1156,7 @@ impl Router {
         }
 
         steps.push(RoutingStep::WalkTo(obj));
-        Ok(steps)
+        Ok(())
     }
 }
 
@@ -1237,6 +1495,163 @@ mod tests {
         assert!(steps
             .iter()
             .any(|step| matches!(step, RoutingStep::DriveTo(vehicle, _) if *vehicle == car)));
+    }
+
+    fn parkfix_tick(ctx: &mut TestCtx, human: HumanID) {
+        // Keep decisions from planning a new trip in the middle of the test.
+        ctx.g.world.humans[human].decision.wait = u8::MAX;
+        ctx.tick_fast();
+    }
+
+    /// An owner driving their personal car along a connected road.
+    fn parkfix_driving_owner() -> (TestCtx, HumanID, VehicleID) {
+        let (mut ctx, human, car, _) = traffic1_owner_with_car_on(100.0, 100.0);
+        crate::transportation::unpark(&mut ctx.g, car);
+        let h = &mut ctx.g.world.humans[human];
+        h.location = Location::Vehicle(car);
+        if let Some(collider) = h.collider.take() {
+            ctx.g.write::<TransportGrid>().remove_maintain(collider.0);
+        }
+        let destination = RouteFixture::sidewalk_at(&ctx, vec3(850.0, 100.0, 0.0));
+        ctx.g.world.humans[human]
+            .router
+            .go_to(Destination::Outside(destination));
+        let driving = (0..3000).any(|_| {
+            parkfix_tick(&mut ctx, human);
+            ctx.g.world.humans[human].location == Location::Vehicle(car)
+                && ctx.g.world.vehicles[car].speed.0 > 1.0
+        });
+        let h = &ctx.g.world.humans[human];
+        assert!(
+            driving,
+            "the owner never drove off: {:?} {:?} {:?} {:?} car {:?} {:?}",
+            h.location,
+            h.router.cur_step(),
+            h.router.steps,
+            h.router.last_error,
+            ctx.g.world.vehicles[car].vehicle.state,
+            ctx.g.world.vehicles[car].speed.0
+        );
+        (ctx, human, car)
+    }
+
+    /// The car ends up parked with its owner out of it, and nothing is left on the lane.
+    fn parkfix_assert_parked(ctx: &mut TestCtx, human: HumanID, car: VehicleID) {
+        let parked = (0..1500).any(|_| {
+            parkfix_tick(ctx, human);
+            ctx.g.world.vehicles[car].vehicle.state.is_parked()
+                && ctx.g.world.humans[human].location != Location::Vehicle(car)
+        });
+        let v = &ctx.g.world.vehicles[car];
+        assert!(
+            parked,
+            "the car is still on the road: {:?} at {:?}, owner {:?}",
+            v.vehicle.state, v.trans.pos, ctx.g.world.humans[human].location
+        );
+        assert!(v.collider.is_none());
+        assert!(abandoned_cars(&ctx.g.world).is_empty());
+    }
+
+    #[test]
+    fn parkfix_cancelling_a_drive_parks_the_car_where_it_stands() {
+        let (mut ctx, human, car) = parkfix_driving_owner();
+        let start = ctx.g.world.vehicles[car].trans.pos;
+        let (world, resources) = ctx.g.world_res();
+        let h = &mut world.humans[human];
+        h.router
+            .cancel_route(&mut resources.write::<ParkingManagement>());
+        h.it = Itinerary::NONE;
+        parkfix_assert_parked(&mut ctx, human, car);
+        let parked_at = ctx.g.world.vehicles[car].trans.pos;
+        assert!(
+            parked_at.distance(start) <= NEAR_PARKING_RADIUS + 10.0,
+            "parked at {parked_at:?}, the drive was cancelled at {start:?}"
+        );
+    }
+
+    #[test]
+    fn parkfix_walking_on_from_a_moving_car_parks_it_first() {
+        let (mut ctx, human, car) = parkfix_driving_owner();
+        let destination = RouteFixture::sidewalk_at(&ctx, vec3(500.0, 100.0, 0.0));
+        let (world, resources) = ctx.g.world_res();
+        let router = &mut world.humans[human].router;
+        router.walk_only_pickup = true;
+        router.go_to(Destination::Outside(destination));
+        routing_changed(world, resources, |_, _| None);
+        assert_parks_and_walks(&world.humans[human].router.steps, car, destination);
+        parkfix_assert_parked(&mut ctx, human, car);
+    }
+
+    #[test]
+    fn parkfix_aborting_a_drive_parks_the_car_before_the_owner_leaves() {
+        let (mut ctx, human, car) = parkfix_driving_owner();
+        let (world, resources) = ctx.g.world_res();
+        let map = resources.read::<Map>();
+        let h = &mut world.humans[human];
+        h.router
+            .cancel_route(&mut resources.write::<ParkingManagement>());
+        h.it = Itinerary::NONE;
+        Router::exit_aborted_vehicle(h, car, &world.vehicles, &map, resources);
+        drop(map);
+        parkfix_assert_parked(&mut ctx, human, car);
+    }
+
+    /// A car left driving with no route and nobody inside, as older saves may contain.
+    fn parkfix_abandoned_car(at_x: f32) -> (TestCtx, HumanID, VehicleID) {
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(1500.0, 100.0, 0.0)]);
+        let house = ctx.build_house_near(vec2(300.0, 100.0));
+        let human = spawn_human(&mut ctx.g, house).unwrap();
+        let pos = {
+            let map = ctx.g.map();
+            let pos = vec3(at_x, 100.0, 0.0);
+            map.get(map.nearest_lane(pos, LaneKind::Driving, None).unwrap())
+                .unwrap()
+                .points
+                .project_segment_dir(pos)
+        };
+        let car = spawn_driving_vehicle(
+            &mut ctx.g,
+            VehicleKind::Car,
+            Transform {
+                pos: pos.0,
+                dir: pos.2,
+            },
+        )
+        .unwrap();
+        ctx.g.world.humans[human].router = Router::new(Some(car));
+        assert_eq!(abandoned_cars(&ctx.g.world), vec![(car, human)]);
+        (ctx, human, car)
+    }
+
+    #[test]
+    fn parkfix_an_abandoned_car_is_parked_near_where_it_stands() {
+        let (mut ctx, human, car) = parkfix_abandoned_car(900.0);
+        let start = ctx.g.world.vehicles[car].trans.pos;
+        parkfix_assert_parked(&mut ctx, human, car);
+        assert!(ctx.g.world.vehicles[car].trans.pos.distance(start) <= NEAR_PARKING_RADIUS + 10.0);
+    }
+
+    #[test]
+    fn parkfix_an_abandoned_car_without_a_spot_nearby_is_parked_at_home() {
+        let (mut ctx, human, car) = parkfix_abandoned_car(1200.0);
+        let start = ctx.g.world.vehicles[car].trans.pos;
+        {
+            let map = ctx.g.map();
+            let mut parking = ctx.g.write::<ParkingManagement>();
+            while parking
+                .reserve_near_radius(start, &map, NEAR_PARKING_RADIUS)
+                .is_ok()
+            {}
+        }
+        parkfix_assert_parked(&mut ctx, human, car);
+        let home = ctx.g.world.humans[human].home.house;
+        let door = ctx.g.map().get(home).unwrap().door_pos;
+        let parked_at = ctx.g.world.vehicles[car].trans.pos;
+        assert!(
+            parked_at.distance(door) < parked_at.distance(start),
+            "parked at {parked_at:?}, home {door:?}, abandoned at {start:?}"
+        );
     }
 
     #[test]
