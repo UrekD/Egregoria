@@ -71,7 +71,9 @@ const STALL_DISTANCE: f32 = 5.0;
 /// Import units one freight train call unloads at a station.
 pub const TRAIN_CAPACITY: u32 = 100;
 const STATION_TRUCKS: usize = 6;
-const STATION_TRUCK_CAPACITY: u32 = 16;
+// Round trips take three times the game time on the faster clock, so a truck
+// carries three times as much, like the coal mine's.
+const STATION_TRUCK_CAPACITY: u32 = 48;
 /// The import lead time a reorder plans for: a train call, then a truck trip
 /// in town traffic. Vehicles drive in real time while game time runs faster,
 /// so this is real time: 24 real minutes, twelve game hours.

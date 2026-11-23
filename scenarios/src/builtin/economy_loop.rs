@@ -2,7 +2,7 @@ use geom::{vec2, vec3, Vec2};
 use prototypes::{
     CompanyKind, GameTime, GoodsCompanyID, ItemID, RecTimeInterval, Tick, TICKS_PER_HOUR,
 };
-use simulation::economy::cargo::CargoBook;
+use simulation::economy::cargo::{CargoBook, IMPORT_WAIT_WARNING};
 use simulation::economy::{DailyEconomyMetrics, Market, TripPurpose, TICKS_PER_BUDGET_DAY};
 use simulation::map::Density::{High, Low};
 use simulation::map::ZoneKind::{Commercial, Industrial, Office, Residential};
@@ -141,10 +141,11 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         let imports = ctx.sim.read::<CargoBook>().import_problems(elapsed);
         println!(
             "economy_loop store goods day {day}: {store_road} units by road, {store_station} \
-             station imports; {} companies without an import route, {} waiting over 2 h \
+             station imports; {} companies without an import route, {} waiting over {} h \
              for an import",
             imports.no_route.len(),
             imports.slow.len(),
+            IMPORT_WAIT_WARNING / TICKS_PER_HOUR,
         );
         total_loads += loads;
         total_load_units += load_units;
