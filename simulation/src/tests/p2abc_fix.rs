@@ -1,10 +1,10 @@
 use super::TestCtx;
-use crate::map_dynamic::{REFRESH_INTERVAL, REFRESH_SLOT};
 use crate::economy::balance::CITY_UPDATE_INTERVAL_TICKS as CITY;
 use crate::map::{BuildingKind, LaneKind, LanePatternBuilder, Map, ProjectFilter, RoadID, Zone};
 use crate::map_dynamic::{
     electricity_flow_system, env_update, utility_flow_update, CoverageGrid, EnvGrid, UtilityFlow,
 };
+use crate::map_dynamic::{REFRESH_INTERVAL, REFRESH_SLOT};
 use crate::souls::{goods_company::company_soul, human::spawn_human, residence::Residences};
 use crate::world::{CompanyID, HumanID};
 use crate::{SoulID, WorldCommand};
