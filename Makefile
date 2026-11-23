@@ -62,6 +62,40 @@ osm-lesce-shots:
 		scripts/osm/shots.sh "$(CARGO_TARGET_DIR)/release/native_app" "$$shots_dir" "$$EGR_OSM_SAVE_ROOT"; \
 	printf 'Screenshots in %s\n' "$$shots_dir"
 
+# Curated P5 release screenshots. Demo and Lesce slots are generated into a
+# temporary root and installed into the script directory as in osm-lesce-shots.
+.PHONY: p5-shots
+p5-shots:
+	cargo build --locked --release -p native_app -p scenarios
+	@set -efu; \
+	if [ "$${EGR_OSM_INPUT+x}" ]; then \
+		input="$$EGR_OSM_INPUT"; \
+	else \
+		input="$$EGR_OSM_CACHE/lesce-20261122-signals.overpass.json"; \
+		scripts/osm/fetch.sh "$$input"; \
+	fi; \
+	root=$$(mktemp -d "$${TMPDIR:-/tmp}/egr-p5-shots.XXXXXX"); \
+	"$(CARGO_TARGET_DIR)/release/scenarios" demo-cities --save-root "$$root/slots"; \
+	"$(CARGO_TARGET_DIR)/release/scenarios" osm-city --input "$$input" --save-root "$$root/slots"; \
+	timeout 900 xvfb-run -a -s "-screen 0 1600x900x24" env WGPU_BACKEND=vulkan \
+		VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json \
+		bash -c 'set -eu; \
+			display=$${DISPLAY#:}; \
+			read -r xpid < "/tmp/.X$${display%%.*}-lock"; \
+			[ "$$(ps -p "$$xpid" -o comm=)" = Xvfb ]; \
+			kill -STOP "$$xpid"; \
+			trap "kill -CONT $$xpid" EXIT; \
+			"$$1" --script scripts/shots/p5_release.json --exit-after-script --save-dir "$$2" & \
+			pid=$$!; \
+			trap "kill -CONT $$xpid; kill $$pid 2>/dev/null || true" EXIT; \
+			while [ ! -f "$$2/.egregoria-run" ]; do kill -0 "$$pid"; sleep 0.05; done; \
+			cp -- "$$3"/* "$$2/"; \
+			kill -CONT "$$xpid"; \
+			wait "$$pid"; \
+			trap - EXIT' \
+		p5-shots "$(CARGO_TARGET_DIR)/release/native_app" "$$root/shots" "$$root/slots"; \
+	printf 'Screenshots in %s\n' "$$root/shots"
+
 determinism:
 	cargo run --locked -p scenarios --release -- determinism --twice
 

@@ -8,15 +8,17 @@ use std::time::{Duration, SystemTime};
 
 use common::saveload::{self, Encoder, JSONPretty, JSON};
 use engine::{Context, InputContext, Key, MouseButton};
-use geom::{vec2, vec3, Radians, Vec2, OBB};
+use geom::{vec2, vec3, Radians, Vec2, Vec3, OBB};
 use prototypes::{BuildingGen, GoodsCompanyID};
 use scenarios::builders::{self, CommandSink};
 use serde::{Deserialize, Serialize};
+use simulation::economy::cargo::CargoBook;
 use simulation::economy::{Budget, CityStats, Government, ZoneDemand};
 use simulation::map::{
-    BuildingKind, Map, ProjectFilter, ProjectKind, RoadID, Zone, ZoneGrid, ZoneKind,
+    BuildingKind, Map, ProjectFilter, ProjectKind, RoadID, TraverseKind, Zone, ZoneGrid, ZoneKind,
 };
-use simulation::transportation::Location;
+use simulation::transportation::traffic_metrics::{sample_road_users, TruckCargo};
+use simulation::transportation::{Location, VehicleKind};
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand, WorldCommands};
 use simulation::{AnyEntity, HumanID, Simulation};
@@ -24,7 +26,8 @@ use simulation::{AnyEntity, HumanID, Simulation};
 use crate::gui::follow::{follow_pos, FollowEntity};
 use crate::gui::{
     overlays::OverlayMode, toolbox, toolbox::building::BuildingTab, top_demand_driver,
-    zoning::ZONES, GuiState, InspectedBuilding, InspectedEntity, Tool, ToolSelection,
+    zoning::ZONES, GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool,
+    ToolSelection,
 };
 use crate::session::{self, SessionScreen, SlotCompatibility};
 use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
@@ -74,6 +77,10 @@ enum Step {
     RunFollowing {
         ticks: u64,
         until: Option<FollowedLocation>,
+    },
+    /// Tick until a loaded truck is on a road, then inspect that road with the camera on the truck.
+    InspectCargoRoad {
+        max_ticks: u64,
     },
     /// `"hand"`, a toolbar category (`"zoning"`) or a mode (`"roads/curved"`).
     SelectTool(ToolSelection),
@@ -429,6 +436,7 @@ impl Automation {
                     | Step::Builder(_)
                     | Step::FollowHuman { .. }
                     | Step::RunFollowing { .. }
+                    | Step::InspectCargoRoad { .. }
                     | Step::Camera { .. }
                     | Step::SelectTool(_)
             )
@@ -588,6 +596,33 @@ impl Automation {
                 }
                 eprintln!("automation: followed human {location:?} after {ran} ticks");
                 FollowEntity::track(uiw, &sim);
+                self.wait = Some(Wait::Map {
+                    tick: sim.get_tick(),
+                    settle_frames: 2,
+                });
+            }
+            Step::InspectCargoRoad { max_ticks } => {
+                let mut sim = sim.write().unwrap();
+                let mut ran = 0;
+                let (road, pos) = loop {
+                    if let Some(found) = loaded_truck_road(&sim) {
+                        break found;
+                    }
+                    if ran == max_ticks {
+                        return Err(format!("no loaded truck on a road in {max_ticks} ticks"));
+                    }
+                    sim.tick(schedule, []);
+                    ran += 1;
+                };
+                *uiw.write::<InspectedEntity>() = InspectedEntity::default();
+                uiw.write::<InspectedBuilding>().e = None;
+                uiw.write::<FollowEntity>().0 = None;
+                uiw.write::<InspectedRoad>().0 = Some(road);
+                let mut orbit = uiw.camera_mut();
+                orbit.targetpos = pos;
+                orbit.camera.pos = pos;
+                drop(orbit);
+                eprintln!("automation: inspecting {road:?} after {ran} ticks");
                 self.wait = Some(Wait::Map {
                     tick: sim.get_tick(),
                     settle_frames: 2,
@@ -878,6 +913,30 @@ impl HumanPick {
     }
 }
 
+/// The road under the first truck (in entity order) whose manifest the road inspector lists.
+fn loaded_truck_road(sim: &Simulation) -> Option<(RoadID, Vec3)> {
+    let map = sim.map();
+    let cargo = sim.read::<CargoBook>();
+    sim.world().vehicles.iter().find_map(|(id, truck)| {
+        if !matches!(truck.vehicle.kind, VehicleKind::Truck)
+            || cargo
+                .manifest_for(id)
+                .is_none_or(|load| load.items.is_empty())
+        {
+            return None;
+        }
+        let TraverseKind::Lane(lane) = truck.it.get_travers()?.kind else {
+            return None;
+        };
+        let road = map.get(lane)?.parent;
+        sample_road_users(sim, road)
+            .cargo
+            .iter()
+            .any(|row| row.truck == id && matches!(row.cargo, TruckCargo::Manifest(_)))
+            .then_some((road, truck.trans.pos))
+    })
+}
+
 fn followed_human(uiw: &UiWorld) -> Result<HumanID, String> {
     match uiw.read::<FollowEntity>().0 {
         Some(AnyEntity::HumanID(id)) => Ok(id),
@@ -1085,6 +1144,19 @@ mod tests {
         assert!(steps
             .iter()
             .any(|s| matches!(s, Step::Assert(Assertion::CameraOnFollowed))));
+    }
+
+    #[test]
+    fn shotsprep_inspect_cargo_road_step_decodes() {
+        assert!(matches!(
+            JSON::decode::<Step>(br#"{"InspectCargoRoad":{"max_ticks":6000}}"#).unwrap(),
+            Step::InspectCargoRoad { max_ticks: 6000 }
+        ));
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../scripts/shots/p5_release.json");
+        let steps: Vec<Step> = JSON::decode(&fs::read(path).unwrap()).unwrap();
+        assert!(steps
+            .iter()
+            .any(|s| matches!(s, Step::InspectCargoRoad { .. })));
     }
 
     #[test]
