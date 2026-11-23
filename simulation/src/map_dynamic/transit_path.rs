@@ -113,11 +113,15 @@ impl<'a> TransitPaths<'a> {
         location: &Location,
         map: &Map,
         now: Tick,
-        legacy_ticks: f64,
+        car_pos: Option<Vec3>,
         walk_speed: f64,
         allows_line: impl Fn(LineID) -> bool,
     ) -> Option<(Vec<RoutingStep>, [ValidatedWalk; 2])> {
-        let ride = self.best_ride(origin, destination, legacy_ticks, walk_speed, allows_line)?;
+        let ride = self.best_ride(origin, destination, f64::INFINITY, walk_speed, allows_line)?;
+        let legacy_ticks = legacy_cost(origin, destination, car_pos, walk_speed, now, map);
+        if ride.ticks + COST_EPSILON >= legacy_ticks {
+            return None;
+        }
         let access = ride.board.walk_pos;
         let egress = ride.alight.walk_pos;
         let (access_ticks, access_path) =
@@ -330,18 +334,25 @@ impl Ride<'_> {
     }
 }
 
-pub(super) fn legacy_cost(
+fn legacy_cost(
     origin: Vec3,
     destination: Vec3,
     car_pos: Option<Vec3>,
     walk_speed: f64,
+    now: Tick,
+    map: &Map,
 ) -> f64 {
     if let Some(car) = car_pos {
         travel_ticks(origin.distance(car), walk_speed)
             + travel_ticks(car.distance(destination), CAR_SPEED)
             + PARKING_SECONDS * TICKS_PER_REALTIME_SECOND as f64
     } else {
-        travel_ticks(origin.distance(destination), walk_speed)
+        // Measure the walk on the sidewalks, as the access and egress walks are.
+        // A straight line can cut across blocks and undercount it several times over.
+        ValidatedWalk::route(now, origin, destination, map, walk_speed).map_or_else(
+            || travel_ticks(origin.distance(destination), walk_speed),
+            |(ticks, _)| ticks,
+        )
     }
 }
 
@@ -376,7 +387,7 @@ impl ValidatedWalk {
     }
 }
 
-fn walking_distance(it: &Itinerary, start: Vec3, end: Vec3, map: &Map) -> Option<f32> {
+pub(super) fn walking_distance(it: &Itinerary, start: Vec3, end: Vec3, map: &Map) -> Option<f32> {
     let mut position = start;
     let mut distance = 0.0;
     for &point in it.local_path().iter().rev() {

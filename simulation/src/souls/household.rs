@@ -127,6 +127,11 @@ fn remove_claim<K: Ord, V: Ord>(claims: &mut BTreeMap<K, BTreeSet<V>>, key: K, i
 }
 
 impl HouseholdStock {
+    /// A basket pickup, park visit or trip home with groceries is under way.
+    pub(crate) fn on_errand(&self) -> bool {
+        self.basket.is_some() || self.leisure_visit.is_some() || !self.carried.is_empty()
+    }
+
     fn park_claim(&self, id: HumanID) -> (bool, u64, HumanID) {
         // A visitor already dwelling keeps precedence over someone en route.
         match self.leisure_until {

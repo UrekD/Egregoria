@@ -6,6 +6,7 @@ use crate::map_dynamic::{
     StopID, Transit, NEAR_PARKING_RADIUS,
 };
 use crate::souls::desire::WorkKind;
+use crate::souls::household::HouseholdStock;
 use crate::souls::human::HumanDecisionKind;
 use crate::transportation::TransportGrid;
 use crate::transportation::{
@@ -23,7 +24,7 @@ use std::collections::BTreeSet;
 
 #[path = "transit_path.rs"]
 mod transit_path;
-use transit_path::{legacy_cost, TransitPaths, ValidatedWalk};
+use transit_path::{TransitPaths, ValidatedWalk};
 
 const PERSONAL_CAR_ACCESS_RADIUS: f32 = 4.0 * NEAR_PARKING_RADIUS;
 
@@ -175,7 +176,7 @@ fn routing_changed(
 
         let mut transit_steps = None;
         if !transit.runs.is_empty()
-            && router.allows_transit()
+            && router.allows_transit(&h.household)
             && !matches!(h.location, Location::Vehicle(_))
             && (router.vehicle.is_none() || router.vehicle == router.personal_car)
             && !h
@@ -208,7 +209,7 @@ fn routing_changed(
                         &h.location,
                         map,
                         now,
-                        legacy_cost(origin, pos, nearby_car, walk_speed),
+                        nearby_car,
                         walk_speed,
                         |line| transit.allows_line_for_trip(id, router, line),
                     );
@@ -422,11 +423,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                                 )
                             });
                     }
-                    if h.router.walk_only_pickup
-                        && (h.household.basket.is_some()
-                            || h.household.leisure_visit.is_some()
-                            || !h.household.carried.is_empty())
-                    {
+                    if h.router.walk_only_pickup && h.household.on_errand() {
                         route = Itinerary::route(
                             elapsed_ticks(resources),
                             pos,
@@ -856,8 +853,10 @@ impl Router {
         self.cur_step.as_ref()
     }
 
-    pub(crate) fn allows_transit(&self) -> bool {
-        !self.walk_only_pickup
+    /// Legacy goods pickups and errands of car owners stay on foot. A household without a
+    /// car may take the bus for its errands.
+    pub(crate) fn allows_transit(&self, household: &HouseholdStock) -> bool {
+        !self.walk_only_pickup || (self.personal_car.is_none() && household.on_errand())
     }
 
     pub(crate) fn stamp_wait_start(&mut self, now: Tick) {
@@ -871,7 +870,7 @@ impl Router {
     /// Start the next ride after the boarding system has checked the bus and stop.
     pub(crate) fn board(human: &mut HumanEnt, bus: VehicleID, resources: &Resources) -> bool {
         let router = &mut human.router;
-        if human.location != Location::Outside || !router.allows_transit() {
+        if human.location != Location::Outside || !router.allows_transit(&human.household) {
             return false;
         }
         let Some(RoutingStep::WaitAtStop { line, .. }) = router.cur_step else {
@@ -1223,13 +1222,14 @@ mod tests {
     use crate::map::LaneKind;
     use crate::map_dynamic::{BusRun, TransitLine, TransitStop};
     use crate::souls::desire::Work;
+    use crate::souls::household::BasketId;
     use crate::souls::human::spawn_human;
     use crate::tests::TestCtx;
     use crate::transportation::{spawn_driving_vehicle, VehicleKind};
     use crate::world_command::WorldCommand;
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Color};
-    use prototypes::Money;
+    use prototypes::{ItemID, Money};
 
     #[test]
     fn e1_fix_replacing_a_pending_destination_resets_trip_purpose() {
@@ -1257,12 +1257,17 @@ mod tests {
 
     impl RouteFixture {
         fn new(distance: f32) -> Self {
-            let mut ctx = TestCtx::new();
+            let ctx = TestCtx::new();
             ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(900.0, 100.0, 0.0)]);
+            Self::serving(ctx, |_, origin| origin + Vec3::X * distance)
+        }
+
+        /// A two-stop line from the sidewalk at (200, 100) to `destination(origin)`.
+        fn serving(mut ctx: TestCtx, destination: impl FnOnce(&TestCtx, Vec3) -> Vec3) -> Self {
             let house = ctx.build_house_near(vec2(200.0, 100.0));
             let human = spawn_human(&mut ctx.g, house).unwrap();
             let origin = Self::sidewalk_at(&ctx, vec3(200.0, 100.0, 0.0));
-            let destination = origin + Vec3::X * distance;
+            let destination = destination(&ctx, origin);
             let berths = [origin, destination].map(|pos| {
                 let map = ctx.g.map();
                 map.get(map.nearest_lane(pos, LaneKind::Driving, None).unwrap())
@@ -1739,6 +1744,33 @@ mod tests {
     }
 
     #[test]
+    fn transitfix_carless_household_errands_may_ride() {
+        let errands: [fn(&mut HumanEnt); 3] = [
+            |h| h.household.basket = Some(BasketId(1)),
+            |h| h.household.leisure_visit = Some(h.home.house),
+            |h| {
+                h.household.carried.insert(ItemID::new("bread"), 1);
+            },
+        ];
+        for errand in errands {
+            let mut f = RouteFixture::new(500.0);
+            let human = &mut f.ctx.g.world.humans[f.human];
+            human.router.walk_only_pickup = true;
+            errand(human);
+            f.assert_ride(400);
+
+            // A car owner's errand stays on foot, without the car.
+            let mut f = RouteFixture::new(500.0);
+            f.assign_car(f.origin + Vec3::X * 401.0);
+            let human = &mut f.ctx.g.world.humans[f.human];
+            human.router.walk_only_pickup = true;
+            errand(human);
+            let destination = f.destination;
+            assert!(matches!(f.plan(400), [RoutingStep::WalkTo(end)] if *end == destination));
+        }
+    }
+
+    #[test]
     fn p3b_driver_truck_and_in_vehicle_trips_keep_legacy_routes() {
         let mut driver = RouteFixture::new(500.0);
         let human = &mut driver.ctx.g.world.humans[driver.human];
@@ -1823,6 +1855,43 @@ mod tests {
     }
 
     #[test]
+    fn transitfix_carless_walk_is_costed_on_the_sidewalk_route() {
+        // A U-shaped street: the far side is 200 m across but about 1.6 km on foot.
+        let detour = || {
+            let ctx = TestCtx::new();
+            ctx.build_roads(&[
+                vec3(100.0, 100.0, 0.0),
+                vec3(900.0, 100.0, 0.0),
+                vec3(900.0, 300.0, 0.0),
+                vec3(100.0, 300.0, 0.0),
+            ]);
+            RouteFixture::serving(ctx, |ctx, _| {
+                RouteFixture::sidewalk_at(ctx, vec3(200.0, 300.0, 0.0))
+            })
+        };
+        let mut f = detour();
+        let walk = Itinerary::route(
+            Tick(0),
+            f.origin,
+            f.destination,
+            &f.ctx.g.map(),
+            PathKind::Pedestrian,
+        )
+        .and_then(|it| transit_path::walking_distance(&it, f.origin, f.destination, &f.ctx.g.map()))
+        .unwrap();
+        let across = f.origin.distance(f.destination);
+        assert!(walk > 5.0 * across, "walk {walk} m, across {across} m");
+        // Riding beats the straight line only with a short wait, and the sidewalk route
+        // even with a long one.
+        let walk_ticks = f64::from(across) / 1.2 * prototypes::TICKS_PER_REALTIME_SECOND as f64;
+        let headway = (2.0 * walk_ticks) as u64;
+        f.assert_ride(headway);
+        let mut close = RouteFixture::new(across);
+        let destination = close.destination;
+        assert!(matches!(close.plan(headway), [RoutingStep::WalkTo(end)] if *end == destination));
+    }
+
+    #[test]
     fn p3b_fractional_tick_tie_prefers_legacy() {
         let mut f = RouteFixture::new(454.0);
         for (stop, offset) in f.stops.into_iter().zip([41.0, 413.0]) {
@@ -1858,7 +1927,8 @@ mod tests {
     #[test]
     fn p3b_ride_cost_follows_the_order_around_the_loop() {
         let mut f = RouteFixture::new(240.0);
-        let [alight, board] = f.stops;
+        // Walk along the sidewalk's direction; the ride must go round by the far stop.
+        let [board, alight] = f.stops;
         {
             let mut transit = f.ctx.g.write::<Transit>();
             let far = f.origin + Vec3::Y * 1_000.0;
@@ -1871,8 +1941,6 @@ mod tests {
             });
             transit.lines[f.line].stops = vec![alight, board, via];
         }
-        f.destination = f.origin;
-        f.ctx.g.world.humans[f.human].trans.pos = f.origin + Vec3::X * 240.0;
         let destination = f.destination;
         assert!(matches!(f.plan(400), [RoutingStep::WalkTo(end)] if *end == destination));
     }

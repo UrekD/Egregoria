@@ -49,11 +49,12 @@ fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Simulation, String> {
     let control_start = totals(&control.sim);
     for now in start + 1..=start + TICKS_PER_BUDGET_DAY {
         control.run_ticks(1);
-        without_line.observe(&control.sim, now);
+        without_line.observe(&control.sim, now, true);
     }
     let control_totals = totals(&control.sim).since(control_start);
     let control_sample = control.sample("without_transit");
     ctx.samples.push(control_sample);
+    without_line.finish(&mut control, start + TICKS_PER_BUDGET_DAY);
 
     let transit_start = totals(&ctx.sim);
     let mut resume = None;
@@ -63,7 +64,7 @@ fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Simulation, String> {
     for day_tick in 1..=TICKS_PER_BUDGET_DAY {
         ctx.run_ticks(1);
         let now = start + day_tick;
-        with_line.observe(&ctx.sim, now);
+        with_line.observe(&ctx.sim, now, true);
         let buses = ctx.sim.read::<Transit>().runs.len();
         running_buses = running_buses.max(buses);
         bus_ticks += buses as u64;
@@ -85,6 +86,10 @@ fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Simulation, String> {
             stats.max_wait_ticks,
         )
     };
+    let day_end_hashes = ctx.sim.hashes();
+    ctx.sample("with_transit");
+    let transit_sample = ctx.samples.len() - 1;
+    with_line.finish(ctx, start + TICKS_PER_BUDGET_DAY);
     let comparison = without_line.compare(&with_line)?;
     let [commute_a, commute_b] = comparison.means;
     let [matched_a, matched_b] = comparison.matched_means;
@@ -120,7 +125,7 @@ fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Simulation, String> {
     let mut resumed = ScenarioCtx::new(SCENARIO.1);
     resumed.sim = saved;
     resumed.run_ticks(TICKS_PER_BUDGET_DAY - resume_tick);
-    if resumed.sim.hashes() != ctx.sim.hashes() {
+    if resumed.sim.hashes() != day_end_hashes {
         return Err(format!(
             "transit continuation diverged after tick {}",
             start_tick + resume_tick
@@ -130,8 +135,7 @@ fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Simulation, String> {
         "transit_basic: {summary} resumed from tick {}",
         start_tick + resume_tick
     );
-    ctx.sample("with_transit");
-    ctx.samples.last_mut().unwrap().extra.extend([
+    ctx.samples[transit_sample].extra.extend([
         ("bus_trips".into(), transit.bus as f64),
         ("car_trips".into(), transit.car as f64),
         (
@@ -387,7 +391,8 @@ impl Commutes {
         )
     }
 
-    fn observe(&mut self, sim: &Simulation, now: u64) {
+    /// Follows open attempts and, while `departures` is set, records new ones.
+    fn observe(&mut self, sim: &Simulation, now: u64, departures: bool) {
         for (&id, commute) in &mut self.0 {
             let human = sim.get(id);
             if let Some((attempt, start)) =
@@ -410,7 +415,8 @@ impl Commutes {
             }
             let dest = Some(Destination::Building(commute.job));
             if let Some(human) = human {
-                if commute.was_home
+                if departures
+                    && commute.was_home
                     && human.router.target_dest == dest
                     && human.router.trip_start == Some(Tick(now))
                 {
@@ -418,6 +424,25 @@ impl Commutes {
                 }
                 commute.was_home = human.location == Location::Building(commute.home);
             }
+        }
+    }
+
+    fn pending(&self) -> bool {
+        self.0
+            .values()
+            .any(|commute| matches!(commute.attempts.last(), Some(Attempt::Pending(_))))
+    }
+
+    /// Runs past the end of the day until every attempt has finished or timed out. The
+    /// morning shift starts in the last game hours of the day, about 8 real minutes at the
+    /// 3x clock, so stopping at the day's end would score late departures as timeouts.
+    fn finish(&mut self, branch: &mut ScenarioCtx, end: u64) {
+        for now in end + 1..=end + COMMUTE_TIMEOUT {
+            if !self.pending() {
+                break;
+            }
+            branch.run_ticks(1);
+            self.observe(&branch.sim, now, false);
         }
     }
 
