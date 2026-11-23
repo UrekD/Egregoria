@@ -61,6 +61,29 @@ Main menu with Continue/New Game/Load, new-game options (terrain preset, seed, m
 |---|---|---|
 | ![P4 new game](docs/screenshots/p4-new-game.png) | ![P4 advisor](docs/screenshots/p4-advisor.png) | ![P4 traffic](docs/screenshots/p4-traffic.png) |
 
+### Milestone P5 — playtest feedback
+
+- **Households keep a pantry.** Needs drive multi-unit grocery baskets bought at one reachable bakery or store, carried home and eaten over time. Citizens also go to work daily, visit parks and shop after work.
+- **Freight moves on trucks.** Stock is tracked as on hand, reserved and in transit, and trucks leave with full 16-unit loads. The Small depot (64 units) and Large warehouse (256 units) buffer goods under Balanced, Reserve locally or Export surplus policies. Outside trade goes through the rail freight terminal, and a recipe waits for a truck already on its way instead of importing by rail.
+- **Guided mode.** New Game offers Guided or Free build. Guided cities reach milestones at 100, 250 and 500 citizens with one-time grants and closed-day objectives. Locked cards show the population they need, and the Progression window tracks the next milestone.
+- **Zoning densities and plots.** All four zones have low, medium and high density in distinct shades. Zoning uses a 16 m stamp with 8 m detail and draws its grid while zoning. Plots are Varied (mixed 20/30/40 m) or Uniform, and lots never overlap.
+- **Overlays painted on the land.** Service reach, pollution, estimated land value and utility networks are drawn on the terrain. Each service shows its served area and a max-reach ring, and placing a service turns on its overlay. Service radii are at city scale, for example a 600 m school and a 900 m fire station.
+- **Placement and inspectors.** Placement uses real intersection and curb geometry, previews are validated like the command, and a red ghost marks a rejected spot. Services and warehouses are lettered placeholder boxes. The road inspector shows current users, entries in the last 10 game minutes, average speed against the limit (Free/Busy/Jammed) and each truck's cargo and destination.
+- **Toolbar and time controls.** The toolbar uses Cities: Skylines-style categories with shelves (Roads holds Straight and Curved) and remembers each category's last mode. Speeds run 8×, 20×, 50× and MAX (key 6). The per-frame simulation budget grows from 25 ms up to 8× to 60 ms at 50× and MAX, and the clock shows the achieved speed when it falls short. Right click cancels the tool or selection.
+- **Lesce at real scale.** The Lesce import opens with about 2.9k residents in 1.4k homes. It uses OpenStreetMap forests, priority signage at junctions, traffic lights where OSM maps signals and at arterial crossroads, and yielding roundabouts.
+- **Performance.** A P5 pass recovers the `perf_10k` throughput lost earlier in P5. <!-- TODO(release gate): re-measure `make perf-10k` on the test host and state ticks/s. -->
+<!-- TODO(release gate): add the 3× clock bullet if it has merged; re-check the Lesce opening numbers against the final import. -->
+
+| Zoning densities | School placement | Road inspector |
+|---|---|---|
+| ![P5 zoning densities](docs/screenshots/p5-zoning-densities.png) | ![P5 school placement](docs/screenshots/p5-school-placement.png) | ![P5 road inspector](docs/screenshots/p5-road-inspector-cargo.png) |
+
+| Guided progression | Roads shelf | Lesce |
+|---|---|---|
+| ![P5 guided progression](docs/screenshots/p5-guided-progression.png) | ![P5 roads shelf](docs/screenshots/p5-toolbar-roads.png) | ![P5 Lesce overview](docs/screenshots/p5-lesce-overview.png) |
+
+On Linux, `make p5-shots` regenerates the P5 screenshots under Xvfb from freshly generated demo and Lesce slots.
+
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
 ### Try the demo cities
