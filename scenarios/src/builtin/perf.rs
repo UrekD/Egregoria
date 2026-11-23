@@ -64,7 +64,8 @@ fn run_with_options(ctx: &mut ScenarioCtx, options: PerfOptions) -> Result<(), S
         .map(|company| company.comp.max_workers as usize)
         .sum();
 
-    // perf_10k measures the 08:08–08:42 morning commute ramp in game time.
+    // perf_10k measures the 08:25–10:05 morning commute ramp in game time (fixed tick
+    // counts, so the hourly passes at 09:00 and 10:00 fall inside the measured window).
     for (label, ticks) in [("setup", 0), ("warmup", 2_000), ("measured", 10_000)] {
         ctx.run_ticks(ticks);
         let houses = ctx

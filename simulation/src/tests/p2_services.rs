@@ -13,7 +13,7 @@ use crate::{Simulation, SoulID, WorldCommand};
 use common::saveload::{Bincode, Encoder};
 use geom::{vec2, vec3, Polygon, Vec2, OBB};
 use prototypes::{
-    Density, GameTime, GoodsCompanyID, ItemID, Money, ServiceKind, Tick, DELTA, TICKS_PER_HOUR,
+    Density, GameTime, GoodsCompanyID, ItemID, Money, ServiceKind, Tick, TICKS_PER_HOUR,
 };
 
 const SPINE_RESOURCES: [&str; 5] = [
@@ -197,7 +197,7 @@ fn p2_spine_power_cut_stops_batch_about_to_finish() {
     assert!(!test.g.read::<ElectricityFlow>().blackout(network));
     let recipe = proto.recipe.as_ref().unwrap();
     let productivity = test.g.world.companies[company].raw_productivity(proto, None);
-    let progress = 1.0 - 0.5 * productivity * DELTA / recipe.duration.seconds() as f32;
+    let progress = 1.0 - 0.5 * productivity / recipe.batch_ticks() as f32;
     assert!(progress < 1.0);
     test.g.world.companies[company].comp.progress = progress;
     let goods = ItemID::new("goods");
@@ -325,7 +325,9 @@ fn p2b_road_removal_splits_pipe_supply() {
     p2b_staff(&mut test, outlet, supplied);
     p2b_staff(&mut test, plant, separated);
 
-    *test.g.write::<GameTime>() = GameTime::new(Tick(3_000 + UtilityFlow::UPDATE_OFFSET - 2));
+    *test.g.write::<GameTime>() = GameTime::new(Tick(
+        crate::economy::balance::CITY_UPDATE_INTERVAL_TICKS + UtilityFlow::UPDATE_OFFSET - 2,
+    ));
     test.tick_fast();
     assert!(!test.g.read::<UtilityFlow>().has_water(supplied));
     test.tick_fast();

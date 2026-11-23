@@ -7,18 +7,38 @@ use std::ops::{Add, Sub};
 use std::str::FromStr;
 use thiserror::Error;
 
-pub const SECONDS_PER_REALTIME_SECOND: u32 = 10;
+/// Game seconds that pass per real second at 1× speed.
+pub const SECONDS_PER_REALTIME_SECOND: u32 = 30;
 pub const SECONDS_PER_HOUR: i32 = 60 * SECONDS_PER_MINUTE;
 pub const SECONDS_PER_MINUTE: i32 = 60;
 pub const MINUTES_PER_HOUR: i32 = 60;
 pub const HOURS_PER_DAY: i32 = 24;
 pub const SECONDS_PER_DAY: i32 = SECONDS_PER_HOUR * HOURS_PER_DAY;
+/// Simulation steps per real second. Agent physics integrates [`DELTA`] real seconds per tick.
 pub const TICKS_PER_REALTIME_SECOND: u64 = 50;
-pub const TICKS_PER_SECOND: u64 = TICKS_PER_REALTIME_SECOND / SECONDS_PER_REALTIME_SECOND as u64;
-pub const TICKS_PER_MINUTE: u64 = TICKS_PER_SECOND * SECONDS_PER_MINUTE as u64;
-pub const TICKS_PER_HOUR: u64 = TICKS_PER_SECOND * SECONDS_PER_HOUR as u64;
+/// The calendar is built on whole-tick game minutes, so tick ↔ (day, hour, minute, second)
+/// stays integer math even when a game second is a fraction of a tick.
+pub const TICKS_PER_MINUTE: u64 =
+    TICKS_PER_REALTIME_SECOND * SECONDS_PER_MINUTE as u64 / SECONDS_PER_REALTIME_SECOND as u64;
+const _: () = assert!(
+    TICKS_PER_MINUTE * SECONDS_PER_REALTIME_SECOND as u64
+        == TICKS_PER_REALTIME_SECOND * SECONDS_PER_MINUTE as u64,
+    "a game minute must be a whole number of ticks"
+);
+pub const TICKS_PER_HOUR: u64 = TICKS_PER_MINUTE * MINUTES_PER_HOUR as u64;
+pub const TICKS_PER_DAY: u64 = TICKS_PER_HOUR * HOURS_PER_DAY as u64;
+/// Ticks per game second. Not an integer in general: display and float rates only, never the calendar.
+pub const TICKS_PER_SECOND_F64: f64 = TICKS_PER_MINUTE as f64 / SECONDS_PER_MINUTE as f64;
 pub const DELTA_F64: f64 = 1.0 / TICKS_PER_REALTIME_SECOND as f64;
 pub const DELTA: f32 = DELTA_F64 as f32;
+
+/// Tick 0 is 08:00 on day 1.
+const CALENDAR_OFFSET_TICKS: u64 = TICKS_PER_DAY + 8 * TICKS_PER_HOUR;
+
+/// Ticks covering `secs` game seconds, rounded to the nearest tick.
+pub const fn game_secs_to_ticks(secs: u64) -> u64 {
+    (secs * TICKS_PER_MINUTE + SECONDS_PER_MINUTE as u64 / 2) / SECONDS_PER_MINUTE as u64
+}
 
 /// The amount of time the game was updated
 /// Used as a resource
@@ -210,6 +230,14 @@ impl DayTime {
     pub fn gamesec(&self) -> i32 {
         self.day * SECONDS_PER_DAY + self.daysec()
     }
+
+    /// The first tick whose calendar time is this daytime (inverse of [`GameTime::new`]).
+    /// Saturates to tick 0 for daytimes before the game start.
+    pub fn tick(&self) -> Tick {
+        let secs = self.gamesec().max(0) as u64;
+        let calendar_ticks = (secs * TICKS_PER_MINUTE).div_ceil(SECONDS_PER_MINUTE as u64);
+        Tick(calendar_ticks.saturating_sub(CALENDAR_OFFSET_TICKS))
+    }
 }
 
 impl GameTime {
@@ -217,9 +245,9 @@ impl GameTime {
     pub const DAY: i32 = SECONDS_PER_DAY;
 
     pub fn new(tick: Tick) -> GameTime {
-        let timestamp = Self::DAY as f64
-            + (tick.0 as f64 + 8.0 * TICKS_PER_HOUR as f64) / TICKS_PER_SECOND as f64;
-        let seconds = timestamp as u32;
+        let calendar_ticks = tick.0 + CALENDAR_OFFSET_TICKS;
+        let seconds = (calendar_ticks * SECONDS_PER_MINUTE as u64 / TICKS_PER_MINUTE) as u32;
+        let timestamp = calendar_ticks as f64 / TICKS_PER_SECOND_F64;
 
         GameTime {
             tick,
@@ -241,7 +269,7 @@ impl GameTime {
 
 impl GameDuration {
     pub fn from_secs(secs: u64) -> Self {
-        GameDuration(Tick(secs * TICKS_PER_SECOND))
+        GameDuration(Tick(game_secs_to_ticks(secs)))
     }
 
     pub fn from_minutes(mins: u64) -> Self {
@@ -249,7 +277,7 @@ impl GameDuration {
     }
 
     pub fn seconds(&self) -> f64 {
-        self.0 .0 as f64 / TICKS_PER_SECOND as f64
+        self.0 .0 as f64 / TICKS_PER_SECOND_F64
     }
 
     pub fn minutes(&self) -> f64 {
@@ -344,7 +372,7 @@ impl Display for GameDuration {
         let x = self.0 .0 as f64;
         #[rustfmt::skip]
         let (v, unit) = match () {
-            _ if x < TICKS_PER_MINUTE as f64 => (x / TICKS_PER_SECOND as f64, "s"),
+            _ if x < TICKS_PER_MINUTE as f64 => (x / TICKS_PER_SECOND_F64,      "s"),
             _ if x < TICKS_PER_HOUR   as f64 => (x / TICKS_PER_MINUTE as f64, "m"),
             _                                => (x / TICKS_PER_HOUR   as f64, "h"),
         };
@@ -397,12 +425,10 @@ impl<'lua> FromLua<'lua> for GameDuration {
 fn parse_tick_suffix(v: f64, suffix: &str) -> Option<f64> {
     Some(match suffix {
         "t" | "tick" | "ticks" => v,
-        "s" | "sec" | "secs" | "second" | "seconds" => (v * TICKS_PER_SECOND as f64).round(),
-        "m" | "min" | "mins" | "minute" | "minutes" => {
-            (v * TICKS_PER_SECOND as f64 * SECONDS_PER_MINUTE as f64).round()
-        }
-        "h" | "hour" | "hours" => (v * TICKS_PER_SECOND as f64 * SECONDS_PER_HOUR as f64).round(),
-        "d" | "day" | "days" => (v * TICKS_PER_SECOND as f64 * SECONDS_PER_DAY as f64).round(),
+        "s" | "sec" | "secs" | "second" | "seconds" => (v * TICKS_PER_SECOND_F64).round(),
+        "m" | "min" | "mins" | "minute" | "minutes" => (v * TICKS_PER_MINUTE as f64).round(),
+        "h" | "hour" | "hours" => (v * TICKS_PER_HOUR as f64).round(),
+        "d" | "day" | "days" => (v * TICKS_PER_DAY as f64).round(),
         _ => return None,
     })
 }
@@ -723,5 +749,124 @@ mod tests {
         assert_eq!(parse_rectime("invalid -> 2h30"), Err(InvalidStart(InvalidNumber)));
         assert_eq!(parse_rectime("1h30 -> invalid"), Err(InvalidEnd(InvalidNumber)));
         assert_eq!(parse_rectime("1h30 -> 2h30 -> invalid"), Err(UnexpectedSuffix("-> invalid".into())));
+    }
+
+    #[test]
+    fn calendar_is_built_on_whole_tick_minutes() {
+        use super::*;
+        assert_eq!(SECONDS_PER_REALTIME_SECOND, 30);
+        assert_eq!(TICKS_PER_MINUTE, 100);
+        assert_eq!(TICKS_PER_HOUR, 6_000);
+        assert_eq!(TICKS_PER_DAY, 144_000);
+        assert_eq!(
+            TICKS_PER_MINUTE * SECONDS_PER_REALTIME_SECOND as u64,
+            TICKS_PER_REALTIME_SECOND * SECONDS_PER_MINUTE as u64
+        );
+    }
+
+    fn dt(day: i32, hour: i32, minute: i32, second: i32) -> super::DayTime {
+        super::DayTime {
+            day,
+            hour,
+            minute,
+            second,
+        }
+    }
+
+    #[test]
+    fn calendar_rollovers_are_exact() {
+        use super::*;
+        assert_eq!(GameTime::new(Tick(0)).daytime, dt(1, 8, 0, 0));
+
+        // 08:00 + 16h is midnight of day 2, on the exact tick.
+        let midnight = 16 * TICKS_PER_HOUR;
+        assert_eq!(GameTime::new(Tick(midnight - 1)).daytime, dt(1, 23, 59, 59));
+        assert_eq!(GameTime::new(Tick(midnight)).daytime, dt(2, 0, 0, 0));
+        assert_eq!(
+            GameTime::new(Tick(midnight + TICKS_PER_DAY)).daytime,
+            dt(3, 0, 0, 0)
+        );
+
+        // A whole game day: minutes and hours turn exactly on multiples of their tick length,
+        // seconds never run backwards or past 59.
+        let mut prev = GameTime::new(Tick(midnight - 1)).daytime;
+        for tick in midnight..midnight + TICKS_PER_DAY {
+            let d = GameTime::new(Tick(tick)).daytime;
+            let since_midnight = tick - midnight;
+            assert_eq!(d.day, 2);
+            assert_eq!(d.hour as u64, since_midnight / TICKS_PER_HOUR);
+            assert_eq!(
+                d.minute as u64,
+                since_midnight % TICKS_PER_HOUR / TICKS_PER_MINUTE
+            );
+            assert_eq!(
+                d.minute != prev.minute,
+                since_midnight % TICKS_PER_MINUTE == 0,
+                "tick {tick}"
+            );
+            assert!((0..SECONDS_PER_MINUTE).contains(&d.second));
+            assert!(d.gamesec() >= prev.gamesec());
+            prev = d;
+        }
+        assert_eq!(
+            GameTime::new(Tick(midnight + TICKS_PER_DAY)).daytime,
+            dt(3, 0, 0, 0)
+        );
+    }
+
+    #[test]
+    fn daytime_tick_round_trips_every_second() {
+        use super::*;
+        for day in [1, 2, 40] {
+            for daysec in 0..SECONDS_PER_DAY {
+                let d = DayTime::new(day * SECONDS_PER_DAY + daysec);
+                if d < dt(1, 8, 0, 0) {
+                    continue;
+                }
+                let tick = d.tick();
+                assert_eq!(GameTime::new(tick).daytime, d, "{d:?}");
+                assert!(tick.0 == 0 || GameTime::new(Tick(tick.0 - 1)).daytime < d);
+            }
+        }
+        assert_eq!(dt(2, 6, 0, 0).tick().0, 22 * TICKS_PER_HOUR);
+        // SetGameTime is driven by GameTime::new: the hour boundary lands on its own tick.
+        assert_eq!(
+            GameTime::new(dt(5, 17, 30, 0).tick()).tick.0 % TICKS_PER_MINUTE,
+            0
+        );
+    }
+
+    #[test]
+    fn durations_convert_through_minutes() {
+        use super::*;
+        assert_eq!(GameDuration::from_minutes(1).0, Tick(100));
+        assert_eq!(GameDuration::from_secs(60).0, Tick(100));
+        assert_eq!(GameDuration::from_secs(3_600).0, Tick(TICKS_PER_HOUR));
+        assert_eq!(GameDuration::from_secs(30).0, Tick(50));
+        assert_eq!(GameDuration(Tick(TICKS_PER_HOUR)).seconds(), 3_600.0);
+        assert_eq!(GameDuration(Tick(150)).minutes(), 1.5);
+        assert_eq!(GameDuration(Tick(TICKS_PER_HOUR)).to_string(), "1h");
+
+        assert_eq!(Tick::from_str("1m").unwrap(), Tick(100));
+        assert_eq!(Tick::from_str("1.5h").unwrap(), Tick(9_000));
+        assert_eq!(Tick::from_str("1d").unwrap(), Tick(TICKS_PER_DAY));
+        assert_eq!(Tick::from_str("30s").unwrap(), Tick(50));
+        assert_eq!(Tick::from_str("1s").unwrap(), Tick(2));
+        assert_eq!(Tick::from_str("7t").unwrap(), Tick(7));
+    }
+
+    #[test]
+    fn schedule_window_spans_its_game_hours_in_ticks() {
+        use super::*;
+        let work = RecTimeInterval::new((9, 0), (17, 0));
+        let day_start = 16 * TICKS_PER_HOUR;
+        let active = (day_start..day_start + TICKS_PER_DAY)
+            .filter(|&t| work.is_active(&GameTime::new(Tick(t)).daytime))
+            .count() as u64;
+        assert_eq!(active, 8 * TICKS_PER_HOUR);
+        assert_eq!(active, 48_000);
+        let opens = dt(2, 9, 0, 0).tick();
+        assert!(!work.is_active(&GameTime::new(Tick(opens.0 - 1)).daytime));
+        assert!(work.is_active(&GameTime::new(opens).daytime));
     }
 }

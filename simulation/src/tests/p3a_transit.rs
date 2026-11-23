@@ -1,10 +1,10 @@
 use geom::{vec3, Transform, Vec2, Vec3};
-use prototypes::{GameTime, Money, Tick, TICKS_PER_HOUR};
+use prototypes::{GameTime, Money, Tick};
 
 use super::p3_spine::loop_fixture;
 use crate::economy::{Budget, BudgetCategory, Government, TripStats};
 use crate::map::{LaneKind, LanePatternBuilder, ProjectFilter};
-use crate::map_dynamic::transit::{self, WAIT_NOT_STARTED};
+use crate::map_dynamic::transit::{self, GIVE_UP_TICKS, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
     BuildingInfos, BusRun, Destination, Itinerary, LineID, Router, RoutingStep, StopID, Transit,
 };
@@ -307,8 +307,10 @@ fn p3a_suspends_after_three_skips_and_ejects_if_no_stop_is_reachable() {
     assert!(Router::board(&mut world.humans[id], bus, resources));
     ctx.build_roads(&[vec3(500.0, 100.0, 0.0), vec3(680.0, 100.0, 0.0)]);
     ctx.g.world.vehicles[bus].trans.pos = vec3(590.0, 100.0, 0.0);
+    // Each step is far beyond three nominal legs (bus movement, real time).
+    let long_leg = 6 * 60 * prototypes::TICKS_PER_REALTIME_SECOND;
     for skips in 1..=3 {
-        set_elapsed(&ctx.g, skips * TICKS_PER_HOUR);
+        set_elapsed(&ctx.g, skips * long_leg);
         dispatch(&mut ctx.g);
         if skips < 3 {
             assert_eq!(ctx.g.read::<Transit>().runs[&bus].failures, skips as u8);
@@ -322,13 +324,13 @@ fn p3a_suspends_after_three_skips_and_ejects_if_no_stop_is_reachable() {
 }
 
 #[test]
-fn p3a_wait_gives_up_once_after_two_elapsed_hours() {
+fn p3a_wait_gives_up_once_after_the_give_up_window() {
     let (mut ctx, line) = loop_fixture();
     let [first, second] = two_stops(&ctx.g, line);
     bus_at(&mut ctx.g, line, 0, None);
     let id = waiter(&mut ctx.g, line, first, second, Tick(0));
     let dest = ctx.g.get(id).unwrap().router.target_dest;
-    set_elapsed(&ctx.g, 2 * TICKS_PER_HOUR);
+    set_elapsed(&ctx.g, GIVE_UP_TICKS);
     ctx.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(900_000)))]);
     board(&mut ctx.g);
     assert!(matches!(

@@ -6,12 +6,13 @@ use crate::transportation::Location;
 use crate::utils::resources::Resources;
 use crate::{HumanEnt, HumanID, ParCommandBuffer, SoulID, VehicleEnt, VehicleID};
 use geom::{Transform, Vec3};
-use prototypes::{GameTime, ItemID, TICKS_PER_HOUR};
+use prototypes::{GameTime, ItemID, TICKS_PER_HOUR, TICKS_PER_REALTIME_SECOND};
 use serde::{Deserialize, Serialize};
 use slotmapd::HopSlotMap;
 
 const PURCHASE_INTERVAL: u64 = 6 * TICKS_PER_HOUR;
-const PICKUP_STALL_TICKS: u64 = TICKS_PER_HOUR;
+/// A pickup trip that makes no progress for six real minutes is stalled (movement, real time).
+pub(crate) const PICKUP_STALL_TICKS: u64 = 6 * 60 * TICKS_PER_REALTIME_SECOND;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct BuyGoods {
@@ -452,7 +453,7 @@ mod tests {
             test.tick_fast();
         }
         assert!(test.g.get(human).unwrap().router.references_building(store));
-        for _ in 0..TICKS_PER_HOUR + 5_000 {
+        for _ in 0..PICKUP_STALL_TICKS + 5_000 {
             test.tick_fast();
             if test.g.read::<Market>().capital(buyer, retail) == 0 {
                 break;

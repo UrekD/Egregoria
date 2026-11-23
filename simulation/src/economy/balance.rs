@@ -19,7 +19,7 @@ pub(crate) fn periodic_tick(budget: &Budget, calendar_tick: Tick) -> u64 {
 // environment. On an uninterrupted calendar, residence uses the preceding snapshots
 // just before the boundary. Coverage refreshes independently by kind, and hourly
 // happiness and fires follow the environment pass.
-pub(crate) const CITY_UPDATE_INTERVAL_TICKS: u64 = 3_000;
+pub(crate) const CITY_UPDATE_INTERVAL_TICKS: u64 = 10 * prototypes::TICKS_PER_MINUTE;
 pub const DEMAND_INTERVAL_TICKS: u64 = CITY_UPDATE_INTERVAL_TICKS;
 pub(crate) const DEMAND_OFFSET_TICKS: u64 = DEMAND_INTERVAL_TICKS - 1;
 pub const DEMAND_EMA_ALPHA: f32 = 0.2;

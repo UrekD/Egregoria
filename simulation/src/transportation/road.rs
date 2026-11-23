@@ -9,7 +9,7 @@ use crate::world::{VehicleEnt, VehicleID};
 use crate::ParCommandBuffer;
 use crate::World;
 use geom::{angle_lerpxy, Ray, Transform, Vec2, Vec3};
-use prototypes::{GameTime, DELTA};
+use prototypes::{GameTime, DELTA, TICKS_PER_REALTIME_SECOND};
 use slotmapd::Key;
 
 pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
@@ -274,7 +274,8 @@ pub fn calc_decision<'a>(
     );
 
     if let VehicleState::Panicking(since) = vehicle.state {
-        if since.elapsed(time).seconds() > 200.0 {
+        // Gridlock recovery is agent physics: 20 real seconds.
+        if since.elapsed(time).0 .0 > 20 * TICKS_PER_REALTIME_SECOND {
             vehicle.state = VehicleState::Driving;
         }
     } else if speed.abs() < 0.2 && front_dist < 1.5 {

@@ -31,6 +31,9 @@ use prototypes::{GameTime, ItemID, TICKS_PER_HOUR, TICKS_PER_MINUTE, TICKS_PER_R
 use serde::{Deserialize, Serialize};
 use slotmapd::{HopSlotMap, Key};
 
+/// A trip home waiting this long for a route has stalled (movement, real time).
+pub(crate) const HOMEBOUND_STALL: u64 = 30 * TICKS_PER_REALTIME_SECOND;
+
 #[derive(Inspect, Serialize, Deserialize, Default)]
 pub struct HumanDecision {
     pub kind: HumanDecisionKind,
@@ -367,7 +370,7 @@ impl HumanEnt {
                         _ => self.it.is_wait_for_reroute().is_some(),
                     };
                     let stalled =
-                        waiting_for_route && now.saturating_sub(started) >= 5 * TICKS_PER_MINUTE;
+                        waiting_for_route && now.saturating_sub(started) >= HOMEBOUND_STALL;
                     if now >= until
                         || stalled
                         || self.router.last_error.is_some()
@@ -679,7 +682,7 @@ fn start_basket(
     resources: &Resources,
 ) -> bool {
     let request = h.household.place_order(now);
-    let travel_budget = BASKET_TRAVEL_LIMIT - 10 * TICKS_PER_MINUTE;
+    let travel_budget = BASKET_TRAVEL_LIMIT - 60 * TICKS_PER_REALTIME_SECOND;
     let walk_radius =
         h.pedestrian.walking_speed * travel_budget as f32 / TICKS_PER_REALTIME_SECOND as f32;
     let radius = if h.at_work() {

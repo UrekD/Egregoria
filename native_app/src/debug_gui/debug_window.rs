@@ -13,7 +13,7 @@ use crate::inputmap::{InputAction, InputMap};
 use egui::{Context, Widget};
 use engine::{PerfCountersStatic, Tesselator};
 use geom::{Camera, Color, LinearColor, Spline3, Vec2};
-use prototypes::{GameDuration, GameTime, SECONDS_PER_DAY};
+use prototypes::{DayTime, GameTime};
 use simulation::map::{
     IntersectionID, Map, MapSubscriber, NetworkObjectID, TraverseKind, UpdateType,
 };
@@ -114,36 +114,32 @@ fn debug(window: egui::Window<'_>, ui: &egui::Context, uiworld: &UiWorld, sim: &
         }
 
         let time = *sim.read::<GameTime>();
-        let daysecleft = SECONDS_PER_DAY - sim.read::<GameTime>().daytime.daysec();
+        let tomorrow_at = |hour, minute| {
+            GameTime::new(
+                DayTime {
+                    day: time.daytime.day + 1,
+                    hour,
+                    minute,
+                    second: 0,
+                }
+                .tick(),
+            )
+        };
 
         if ui.small_button("set night").clicked() {
-            uiworld
-                .commands()
-                .set_game_time(time + GameDuration::from_secs(daysecleft as u64));
+            uiworld.commands().set_game_time(tomorrow_at(0, 0));
         }
 
         if ui.small_button("set morning").clicked() {
-            uiworld.commands().set_game_time(
-                time + GameDuration::from_secs(
-                    (daysecleft as f64 + 6.0 * GameTime::HOUR as f64) as u64,
-                ),
-            );
+            uiworld.commands().set_game_time(tomorrow_at(6, 0));
         }
 
         if ui.small_button("set day").clicked() {
-            uiworld.commands().set_game_time(
-                time + GameDuration::from_secs(
-                    (daysecleft as f64 + 12.0 * GameTime::HOUR as f64) as u64,
-                ),
-            );
+            uiworld.commands().set_game_time(tomorrow_at(12, 0));
         }
 
         if ui.small_button("set dawn").clicked() {
-            uiworld.commands().set_game_time(
-                time + GameDuration::from_secs(
-                    (daysecleft as f64 + 21.7 * GameTime::HOUR as f64) as u64,
-                ),
-            );
+            uiworld.commands().set_game_time(tomorrow_at(21, 42));
         }
 
         ui.label(format!(

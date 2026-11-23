@@ -333,6 +333,23 @@ mod tests {
     }
 
     #[test]
+    fn budget_day_is_one_calendar_day() {
+        assert_eq!(TICKS_PER_BUDGET_DAY, prototypes::TICKS_PER_DAY);
+        assert_eq!(TICKS_PER_BUDGET_DAY, 144_000);
+        assert_eq!(budget_day(1), 0);
+        assert_eq!(budget_day(TICKS_PER_BUDGET_DAY), 0);
+        assert_eq!(budget_day(TICKS_PER_BUDGET_DAY + 1), 1);
+        // Every budget day closes at the same time of day.
+        let close = |day| GameTime::new(Tick(day * TICKS_PER_BUDGET_DAY)).daytime;
+        for day in 1..40 {
+            let (a, b) = (close(day), close(day + 1));
+            assert_eq!(b.day, a.day + 1);
+            assert_eq!((a.hour, a.minute, a.second), (b.hour, b.minute, b.second));
+        }
+        assert_eq!((close(1).hour, close(1).minute, close(1).second), (8, 0, 0));
+    }
+
+    #[test]
     fn hourly_budget_ignores_clock_jumps() {
         let mut sim = TestCtx::new_fast().g;
         let category = BudgetCategory::SpecialBuildingUpkeep;

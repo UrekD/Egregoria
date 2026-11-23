@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use geom::Transform;
-use prototypes::{FreightStationPrototypeID, GameTime};
+use prototypes::{FreightStationPrototypeID, GameTime, SECONDS_PER_REALTIME_SECOND};
 
 use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::{
@@ -23,6 +23,8 @@ pub enum FreightTrainState {
 }
 
 const MAX_TRAINS_PER_STATION: usize = 2;
+/// Train loading is agent movement: one real second, in game seconds.
+const LOADING_SECONDS: f64 = SECONDS_PER_REALTIME_SECOND as f64;
 
 /// A freight train station
 /// A component that identifies freight station souls, managing freight station logic
@@ -111,7 +113,7 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
                         *state = FreightTrainState::Loading;
                         station.waiting_cargo = station.waiting_cargo.saturating_sub(100);
                         station.wanted_cargo = station.wanted_cargo.saturating_sub(100);
-                        *itin = Itinerary::wait_until(time.timestamp + 10.0);
+                        *itin = Itinerary::wait_until(time.timestamp + LOADING_SECONDS);
                     }
                 }
                 FreightTrainState::Loading => {
@@ -121,7 +123,7 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
                             .first()
                             .and_then(|&id| map.get(id))
                         else {
-                            *itin = Itinerary::wait_until(time.timestamp + 10.0);
+                            *itin = Itinerary::wait_until(time.timestamp + LOADING_SECONDS);
                             continue;
                         };
                         let bpos = building.obb.center().z(0.0);
@@ -131,7 +133,7 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
                         {
                             r
                         } else {
-                            Itinerary::wait_until(time.timestamp + 10.0);
+                            Itinerary::wait_until(time.timestamp + LOADING_SECONDS);
                             continue;
                         };
                         *state = FreightTrainState::Moving;

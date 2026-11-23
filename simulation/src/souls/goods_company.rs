@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec2};
 use prototypes::{
-    try_prototype, CompanyKind, GoodsCompanyID, GoodsCompanyPrototype, ItemID, Power, Recipe, DELTA,
+    try_prototype, CompanyKind, GoodsCompanyID, GoodsCompanyPrototype, ItemID, Power, Recipe,
 };
 
 use crate::economy::{
@@ -291,7 +291,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             if recipe_should_produce(recipe, soul, market) {
                 let productivity = c.productivity(proto, b.zone.as_ref(), map, elec_flow);
 
-                c.comp.progress += productivity * DELTA / recipe.duration.seconds() as f32;
+                c.comp.progress += productivity / recipe.batch_ticks() as f32;
             } else {
                 if proto.id == coal_plant && market.capital(soul, coal) == 0 {
                     record_coal_stockout(res, coal);

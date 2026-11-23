@@ -401,6 +401,7 @@ fn score_field(layout: &AtlasLayout, scores: impl Iterator<Item = (Vec2, f32)>) 
 #[cfg(test)]
 mod tests {
     use geom::{vec2, Vec2};
+    use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
     use simulation::map_dynamic::{EnvCell, EnvGrid, ServiceReachSource};
 
     use super::*;
@@ -473,7 +474,7 @@ mod tests {
             .write::<EnvGrid>()
             .cells
             .insert((22, 22), EnvCell { pollution: 200.0 });
-        *fixture.sim.write::<GameTime>() = GameTime::new(Tick(3002));
+        *fixture.sim.write::<GameTime>() = GameTime::new(Tick(DEMAND_INTERVAL_TICKS + 2));
         env_update(&mut fixture.sim);
         build(&fixture.sim, vec2(784.0, 720.0));
 

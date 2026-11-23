@@ -35,7 +35,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"cereal", 1}},
             production = {{"flour", 10}},
@@ -58,7 +58,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"cereal", 1}},
@@ -180,7 +180,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"polyester", 1}, {"wool", 1}},
             production = {{"cloth", 1}},
@@ -207,7 +207,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"wool", 1}},
             production = {{"cloth", 1}},
@@ -234,7 +234,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"oil", 1}},
             production = {{"polyester", 1}},
@@ -261,7 +261,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"oil", 1}},
@@ -288,7 +288,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"coal", 1}},
@@ -313,7 +313,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"wool", 1}},
@@ -361,7 +361,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"flower", 1}},
@@ -409,7 +409,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"gold", 1}, {"metal", 1}},
             production = {{"high-tech-product", 1}},
@@ -436,7 +436,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"iron-ore", 1}},
@@ -463,7 +463,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"gold", 1}},
@@ -487,7 +487,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"tree-log", 1}},
@@ -514,7 +514,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"tree-log", 1}},
             production = {{"wood-plank", 1}},
@@ -563,7 +563,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"iron-ore", 1}},
             production = {{"metal", 1}},
@@ -590,7 +590,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"carcass", 1}},
             production = {{"raw-meat", 1}},
@@ -613,7 +613,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"cereal", 1}},
             production = {{"carcass", 1}},
@@ -639,7 +639,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {{"raw-meat", 1}},
             production = {{"meat", 1}},
@@ -662,7 +662,7 @@ data:extend {
         n_trucks = 1,
         cargo_capacity_units = 16,
         dispatch_min_units = 8,
-        dispatch_max_wait_ticks = 36000, -- two game hours
+        dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"vegetable", 2}},

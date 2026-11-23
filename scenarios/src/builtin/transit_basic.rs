@@ -24,7 +24,8 @@ pub const SCENARIO: (Scenario, SimulationOptions) = (
     super::growth_basic::SCENARIO.1,
 );
 
-const COMMUTE_TIMEOUT: u64 = 2 * TICKS_PER_HOUR;
+// Commute durations are agent movement: cap at 12 real minutes.
+const COMMUTE_TIMEOUT: u64 = 12 * 60 * prototypes::TICKS_PER_REALTIME_SECOND;
 const FLEET_SIZE: u8 = 3;
 // Changes in jobs and fire losses can shift which departures have a match.
 const MAX_ALL_ATTEMPT_COMMUTE_RATIO: f64 = 1.05;

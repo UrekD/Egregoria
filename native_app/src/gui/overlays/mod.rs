@@ -14,6 +14,7 @@ use geom::{InfiniteFrustrum, Intersect3, LinearColor, Radians, Shape, AABB, AABB
 use goryak::{combo_box, tooltip};
 use prototypes::{try_prototype, GoodsCompanyID, Power, ServiceID, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer};
+use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
 use simulation::map::{Building, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
     city_field_tick, service_reach_sources, service_reach_version, utility_network_readout,
@@ -193,7 +194,9 @@ impl OverlayMode {
             Self::Power => power_version(map, &sim.read::<ElectricityFlow>()),
             Self::Transit => transit::invalidation_key(&sim.read::<Transit>()),
             Self::Coverage(kind) => service_reach_version(sim, kind),
-            Self::Water | Self::Sewage => city_field_tick(sim).saturating_sub(1) / 3000,
+            Self::Water | Self::Sewage => {
+                city_field_tick(sim).saturating_sub(1) / DEMAND_INTERVAL_TICKS
+            }
             Self::Pollution | Self::LandValue => environment_version(sim),
             Self::Happiness => city_field_tick(sim).saturating_sub(3) / TICKS_PER_HOUR,
         }
@@ -216,7 +219,7 @@ impl OverlayMode {
 }
 
 fn environment_version(sim: &Simulation) -> u64 {
-    city_field_tick(sim).saturating_sub(2) / 3000
+    city_field_tick(sim).saturating_sub(2) / DEMAND_INTERVAL_TICKS
 }
 
 fn power_version(map: &Map, power: &ElectricityFlow) -> u64 {
@@ -704,10 +707,10 @@ mod tests {
             )
         };
         for (tick, school_updated, health_updated) in [
-            (300, false, true),
-            (2099, false, false),
-            (2100, true, false),
-            (2101, false, false),
+            (100, false, true),
+            (699, false, false),
+            (700, true, false),
+            (701, false, false),
         ] {
             let (school_before, health_before) = versions(&test.sim);
             test.sim.write::<GameTime>().tick = Tick(tick);

@@ -1,9 +1,11 @@
 use super::TestCtx;
+use crate::economy::balance::CITY_UPDATE_INTERVAL_TICKS as CITY;
 use crate::economy::{market_update, EcoStats, Market};
 use crate::map::{
     BuildingID, BuildingKind, Density, Map, ProjectFilter, ProjectKind, RoadID, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{BuildingInfos, Destination, RouterError};
+use crate::souls::desire::PICKUP_STALL_TICKS;
 use crate::souls::{desire::BuyGoods, growth, residence};
 use crate::transportation::Location;
 use crate::{HumanEnt, HumanID, ParCommandBuffer, Simulation, SoulID, WorldCommand};
@@ -108,7 +110,7 @@ fn p1_fix2_progress_keeps_pickup_and_timeout_skips_seller_after_reload() {
     start_pickup(&mut test.g, buyer, store);
 
     let buyer_soul = SoulID::Human(buyer);
-    for _ in 0..2 * TICKS_PER_HOUR + 5 {
+    for _ in 0..2 * PICKUP_STALL_TICKS + 5 {
         test.g.write::<GameTime>().tick.0 += 1;
         test.g.world_mut_unchecked().humans[buyer].trans.pos.x += 0.025;
         update_pickup(&mut test.g, buyer);
@@ -116,11 +118,11 @@ fn p1_fix2_progress_keeps_pickup_and_timeout_skips_seller_after_reload() {
     assert_eq!(
         test.g.read::<Market>().capital(buyer_soul, retail()),
         1,
-        "a moving resident should keep the reservation beyond two hours"
+        "a moving resident should keep the reservation beyond two stall windows"
     );
 
     test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(1)))]);
-    for _ in 0..TICKS_PER_HOUR - 1 {
+    for _ in 0..PICKUP_STALL_TICKS - 1 {
         test.g.write::<GameTime>().tick.0 += 1;
         update_pickup(&mut test.g, buyer);
     }
@@ -133,7 +135,7 @@ fn p1_fix2_progress_keeps_pickup_and_timeout_skips_seller_after_reload() {
         assert_eq!(
             market.capital(buyer_soul, retail()),
             0,
-            "one hour without position progress should cancel"
+            "a stall window without position progress should cancel"
         );
         assert_eq!(market.capital(seller, retail()), 1);
         assert_eq!(market.inner()[&retail()].sell_order(seller).unwrap().qty, 1);
@@ -233,7 +235,7 @@ fn p1_fix2_walking_components_follow_road_removal_and_reconnection() {
 fn pfc_growth_uses_the_demand_sample_on_elapsed_ticks() {
     use crate::economy::ZoneDemand;
 
-    for destination in [2_998, 2_999] {
+    for destination in [CITY - 2, CITY - 1] {
         let mut test = street();
         let shape = test.g.map().lots().values().next().unwrap().shape;
         test.g
@@ -258,7 +260,7 @@ fn pfc_growth_uses_the_demand_sample_on_elapsed_ticks() {
             .drivers(ZoneKind::Residential)
             .is_none());
 
-        for _ in 2..2_998 {
+        for _ in 2..CITY - 2 {
             test.tick_fast();
         }
         assert!(test
@@ -289,7 +291,7 @@ fn pfc_demand_scratch_preserves_equality_after_reload() {
         },
         name: "demand_update",
     }));
-    while test.g.get_tick() < 2_999 {
+    while test.g.get_tick() < CITY - 1 {
         test.g.tick(&mut schedule, []);
     }
     assert!(test
@@ -313,7 +315,7 @@ fn pfc_growth_waits_for_the_first_sample_in_a_pre_staggering_save() {
         .write::<ZoneGrid>()
         .paint(shape, Some(ZoneKind::Residential), Density::Low);
     // Older saves at this tick are still waiting for their first demand pass.
-    test.g.write::<GameTime>().tick.0 = 2_999;
+    test.g.write::<GameTime>().tick.0 = CITY - 1;
     test.g = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
     let has_house = |sim: &Simulation| {
         sim.map()
@@ -322,9 +324,9 @@ fn pfc_growth_waits_for_the_first_sample_in_a_pre_staggering_save() {
             .any(|building| building.kind == BuildingKind::House)
     };
     test.tick_fast();
-    assert_eq!(test.g.get_tick(), 3_000);
+    assert_eq!(test.g.get_tick(), CITY);
     assert!(!has_house(&test.g));
-    while test.g.get_tick() < 6_000 {
+    while test.g.get_tick() < 2 * CITY {
         test.tick_fast();
     }
     assert!(has_house(&test.g));

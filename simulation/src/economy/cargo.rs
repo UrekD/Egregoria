@@ -38,8 +38,10 @@ use crate::{CompanyID, HumanEnt, HumanID, ParCommandBuffer, Simulation, SoulID, 
 
 pub use prototypes::WarehousePolicy;
 
-const FREIGHT_MATCH_INTERVAL: u64 = TICKS_PER_MINUTE / 2;
-const DELIVERY_LEAD: u64 = TICKS_PER_HOUR;
+// Matching runs on game-minute boundaries, where the retry windows land (two real seconds).
+const FREIGHT_MATCH_INTERVAL: u64 = TICKS_PER_MINUTE;
+// Loading and parking slack is truck movement, so real time.
+const DELIVERY_LEAD: u64 = 6 * 60 * TICKS_PER_REALTIME_SECOND;
 // The standard ten-hour driver shift leaves a fourteen-hour replenishment gap.
 const BETWEEN_DRIVER_SHIFTS: u64 = 14 * TICKS_PER_HOUR;
 const DELIVERY_EXPIRY: u64 = 6 * TICKS_PER_HOUR;
@@ -639,8 +641,7 @@ impl Input {
         Self {
             destination,
             amount: amount as u32,
-            recipe_ticks: (recipe.duration.seconds() as f64 / f64::from(prototypes::DELTA)).ceil()
-                as u64,
+            recipe_ticks: recipe.batch_ticks().ceil() as u64,
         }
     }
 

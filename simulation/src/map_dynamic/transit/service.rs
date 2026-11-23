@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, VecDeque};
 
 use geom::{Transform, Vec3};
-use prototypes::{Tick, DELTA, TICKS_PER_SECOND};
+use prototypes::{Tick, DELTA, TICKS_PER_REALTIME_SECOND};
 
 use super::{
     detach_for_replan, elapsed_ticks, walkable_egress, Berth, BusRun, Transit, TransitStop,
@@ -16,7 +16,8 @@ use crate::transportation::{
 use crate::utils::resources::Resources;
 use crate::{HumanEnt, HumanID, ParCommandBuffer, Simulation, VehicleEnt, VehicleID, World};
 
-pub(super) const DWELL_TICKS: u64 = 30 * TICKS_PER_SECOND;
+/// Boarding is agent movement, so the dwell is in real time.
+pub(super) const DWELL_TICKS: u64 = 3 * TICKS_PER_REALTIME_SECOND;
 const MAX_CONSECUTIVE_SKIPS: u8 = 3;
 const CAPACITY: usize = 40;
 const BERTH_DISTANCE: f32 = 6.0;
@@ -25,7 +26,7 @@ const ARRIVAL_SPEED: f32 = 0.5;
 const BUS_SPEED: f32 = 8.0;
 
 fn travel_ticks(distance: f32) -> u64 {
-    // DELTA is the physics step in real seconds. Dwell uses game seconds.
+    // DELTA is the physics step in real seconds.
     ((distance / (BUS_SPEED * DELTA)).ceil() as u64).max(1)
 }
 
@@ -644,7 +645,8 @@ mod tests {
             assert!(vehicle.it.is_wait_for_reroute().is_some());
         }
         drop(map);
-        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + TICKS_PER_HOUR);
+        // Long past three nominal legs, but within three learned ones.
+        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + 3 * TICKS_PER_HOUR);
         transit_dispatch_update(world, resources);
         assert_eq!(resources.read::<Transit>().runs[&bus].failures, 1);
     }

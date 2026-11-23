@@ -13,7 +13,7 @@ use crate::souls::residence::Residences;
 use crate::utils::resources::Resources;
 use crate::{SoulID, World};
 use common::FastMap;
-use prototypes::{try_prototype, GrowableCompanyID, ItemID, RecipeItem, DELTA_F64, TICKS_PER_HOUR};
+use prototypes::{try_prototype, GrowableCompanyID, ItemID, RecipeItem, TICKS_PER_HOUR};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -267,12 +267,11 @@ fn company_rates(world: &World) -> CompanyRates {
         let Some(recipe) = &proto.recipe else {
             continue;
         };
-        let duration = recipe.duration.seconds();
-        if duration <= 0.0 {
+        let batch_ticks = recipe.batch_ticks();
+        if batch_ticks <= 0.0 {
             continue;
         }
-        // The company system advances recipe progress by DELTA per simulation tick.
-        let full_batches = TICKS_PER_HOUR as f64 * DELTA_F64 / duration;
+        let full_batches = TICKS_PER_HOUR as f64 / batch_ticks;
         let staffed_batches = full_batches * f64::from(company.raw_productivity(proto, None));
         let delivery = amount(&recipe.production, shelf_delivery_item()) as i32;
         let [staples, _] = shelf_delivery_units(delivery);

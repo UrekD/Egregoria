@@ -20,7 +20,9 @@ mod service;
 pub use service::{transit_board_update, transit_dispatch_update};
 
 pub(crate) const WAIT_NOT_STARTED: Tick = Tick(u64::MAX);
-pub const GIVE_UP_TICKS: u64 = 2 * prototypes::TICKS_PER_HOUR;
+/// Waiting for a bus is bounded by bus movement, so real time (12 real minutes,
+/// two game hours at the old 10× clock).
+pub const GIVE_UP_TICKS: u64 = 12 * 60 * prototypes::TICKS_PER_REALTIME_SECOND;
 const STOP_RECHECK_TICKS: u64 = 600;
 const SUSPENSION_HISTORY_LIMIT: usize = 256;
 

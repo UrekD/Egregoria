@@ -104,8 +104,10 @@ const COVERAGE_KINDS: [ServiceKind; 6] = [
     ServiceKind::Garbage,
     ServiceKind::Park,
 ];
-const REFRESH_INTERVAL: u64 = 6000;
-const STARTUP_INTERVAL: u64 = 300;
+// Each kind refreshes every 20 game minutes, in its own 2-minute slot.
+pub(crate) const REFRESH_INTERVAL: u64 = 20 * prototypes::TICKS_PER_MINUTE;
+pub(crate) const REFRESH_SLOT: u64 = 2 * prototypes::TICKS_PER_MINUTE;
+const STARTUP_INTERVAL: u64 = prototypes::TICKS_PER_MINUTE;
 const STARTUP_STEP: u64 = STARTUP_INTERVAL / COVERAGE_KINDS.len() as u64;
 
 #[derive(Clone, Copy)]
@@ -209,10 +211,10 @@ fn road_directions(map: &Map, road: &Road, walking: bool) -> [bool; 2] {
 pub fn coverage_update(sim: &mut Simulation) {
     let tick = sim.get_tick();
     let offset = tick % REFRESH_INTERVAL;
-    let scheduled = offset % 600 == 300;
+    let scheduled = offset % REFRESH_SLOT == REFRESH_SLOT / 2;
     let startup_offset = tick % STARTUP_INTERVAL;
     let index = if scheduled {
-        offset / 600
+        offset / REFRESH_SLOT
     } else if startup_offset % STARTUP_STEP == STARTUP_STEP / 2 {
         // Stagger first snapshots and keep them off the other city refresh ticks.
         startup_offset / STARTUP_STEP
@@ -582,7 +584,9 @@ mod u3_tests {
         };
         refresh_power(&mut test.g);
         assert_eq!(reach(&test.g), 0.0);
-        *test.g.write::<GameTime>() = GameTime::new(prototypes::Tick(8100));
+        *test.g.write::<GameTime>() = GameTime::new(prototypes::Tick(
+            REFRESH_INTERVAL + 3 * REFRESH_SLOT + REFRESH_SLOT / 2,
+        ));
         coverage_update(&mut test.g);
         let radius = ServiceID::new("school").prototype().radius_m;
         let coverage = test.g.read::<CoverageGrid>();

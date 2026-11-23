@@ -12,7 +12,7 @@
 //! - `PROBE_WATCH=VehicleID(…)` follows one vehicle and its driver every sample.
 
 use geom::Vec3;
-use prototypes::{GameTime, TICKS_PER_SECOND};
+use prototypes::{game_secs_to_ticks, GameTime, TICKS_PER_HOUR};
 use simulation::map::{
     LaneKind, Map, PathKind, Pathfinder, ProjectFilter, ProjectKind, Traversable,
     TraverseDirection, TraverseKind,
@@ -47,8 +47,8 @@ fn main() {
         dump_area(&sim, geom::vec2(v[0], v[1]), v[2]);
     }
     let mut sched = Simulation::schedule();
-    let ticks = (hours * 3600.0) as u64 * TICKS_PER_SECOND;
-    let sample = SAMPLE_SECONDS * TICKS_PER_SECOND;
+    let ticks = (hours * TICKS_PER_HOUR as f64) as u64;
+    let sample = game_secs_to_ticks(SAMPLE_SECONDS);
     let threshold = threshold_minutes * 60;
 
     let mut still: BTreeMap<VehicleID, Still> = BTreeMap::new();

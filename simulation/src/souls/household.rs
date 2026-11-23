@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use prototypes::{ItemID, Money, TICKS_PER_HOUR, TICKS_PER_MINUTE};
+use prototypes::{ItemID, Money, TICKS_PER_HOUR, TICKS_PER_MINUTE, TICKS_PER_REALTIME_SECOND};
 use serde::{Deserialize, Serialize};
 
 use crate::economy::balance::{
@@ -21,8 +21,10 @@ const NEEDS_INTERVAL: u64 = 5 * TICKS_PER_MINUTE;
 const SHOP_RETRY: u64 = 30 * TICKS_PER_MINUTE;
 const SHOP_EPISODE_LIMIT: u64 = 8 * TICKS_PER_HOUR;
 const SHELF_SHORTFALL_WINDOW: u64 = 4 * TICKS_PER_HOUR;
-pub(crate) const BASKET_TRAVEL_LIMIT: u64 = 2 * TICKS_PER_HOUR;
-pub(crate) const HOMEBOUND_TRAVEL_LIMIT: u64 = 3 * TICKS_PER_HOUR;
+// Travel budgets bound how far an agent moves, so they are real time
+// (12 and 18 real minutes, two and three game hours at the old 10× clock).
+pub(crate) const BASKET_TRAVEL_LIMIT: u64 = 12 * 60 * TICKS_PER_REALTIME_SECOND;
+pub(crate) const HOMEBOUND_TRAVEL_LIMIT: u64 = 18 * 60 * TICKS_PER_REALTIME_SECOND;
 pub(crate) const HOMEBOUND_RETRY: u64 = 2 * TICKS_PER_HOUR;
 
 #[derive(Default, Serialize, Deserialize)]
@@ -273,7 +275,9 @@ impl HouseholdStock {
         resources.write::<Market>().record_basket_failure(reason);
         match reason {
             BasketFailure::Throttled => {
-                self.next_shop = now + TICKS_PER_MINUTE / 4 + self.phase % (TICKS_PER_MINUTE / 2);
+                // A seller takes one reservation per tick: retry within a real second or so.
+                self.next_shop =
+                    now + TICKS_PER_REALTIME_SECOND / 2 + self.phase % TICKS_PER_REALTIME_SECOND;
             }
             BasketFailure::SellerRemoved => {
                 self.next_shop = now + 5 * TICKS_PER_MINUTE + self.phase % (5 * TICKS_PER_MINUTE);
@@ -803,7 +807,7 @@ mod tests {
         human.router = Router::new(None);
         human.decision.kind = HumanDecisionKind::DepositAtHome;
         human.decision.wait = 0;
-        for _ in 0..10 * prototypes::TICKS_PER_MINUTE {
+        for _ in 0..2 * crate::souls::human::HOMEBOUND_STALL {
             test.tick_fast();
         }
         let human = test.g.get(id).unwrap();
@@ -874,11 +878,12 @@ mod tests {
         human.decision.wait = 0;
         world.vehicles[car].trans.pos = car_pos;
         world.vehicles[car].it = Itinerary::wait_for_reroute(PathKind::Vehicle, home_pos);
-        for _ in 0..4 * prototypes::TICKS_PER_MINUTE {
+        let stall = crate::souls::human::HOMEBOUND_STALL;
+        for _ in 0..stall * 4 / 5 {
             test.tick_fast();
         }
         assert!(test.g.get(car).unwrap().it.is_wait_for_reroute().is_some());
-        for _ in 0..6 * prototypes::TICKS_PER_MINUTE {
+        for _ in 0..stall * 6 / 5 {
             test.tick_fast();
         }
         let human = test.g.get(id).unwrap();
@@ -1203,7 +1208,9 @@ mod tests {
         test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(
             TICKS_PER_HOUR,
         )))]);
-        for _ in 0..TICKS_PER_HOUR {
+        // Walking takes real time.
+        let travel = 6 * 60 * prototypes::TICKS_PER_REALTIME_SECOND;
+        for _ in 0..travel {
             test.tick_fast();
         }
         assert_eq!(test.g.get(id).unwrap().location, Location::Building(job));
@@ -1218,7 +1225,7 @@ mod tests {
         let stock = &mut test.g.world_mut_unchecked().humans[id].household;
         stock.needs.leisure = 0.0;
         stock.next_leisure = 0;
-        for _ in 0..TICKS_PER_HOUR {
+        for _ in 0..travel {
             test.tick_fast();
             if test.g.get(id).unwrap().location == Location::Building(park) {
                 break;

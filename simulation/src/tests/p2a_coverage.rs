@@ -1,4 +1,7 @@
-use super::{active_providers, coverage_update, recompute, CoverageGrid};
+use super::{
+    active_providers, coverage_update, recompute, CoverageGrid, REFRESH_INTERVAL, REFRESH_SLOT,
+    STARTUP_INTERVAL, STARTUP_STEP,
+};
 use crate::map::{BuildingID, BuildingKind, LanePatternBuilder, ProjectFilter, RoadID};
 use crate::map_dynamic::{electricity_flow_system, BuildingInfos, ElectricityFlow};
 use crate::souls::goods_company::company_soul;
@@ -86,6 +89,21 @@ fn set_tick(sim: &Simulation, tick: u64) {
     *sim.write::<GameTime>() = GameTime::new(Tick(tick));
 }
 
+// Kind indices in COVERAGE_KINDS.
+const FIRE: u64 = 1;
+const SCHOOL: u64 = 3;
+const PARK: u64 = 5;
+
+/// The scheduled refresh tick of a kind in a refresh cycle.
+fn slot(cycle: u64, kind: u64) -> u64 {
+    cycle * REFRESH_INTERVAL + kind * REFRESH_SLOT + REFRESH_SLOT / 2
+}
+
+/// The first startup-stagger tick of a kind at or after `from`.
+fn startup(from: u64, kind: u64) -> u64 {
+    from - from % STARTUP_INTERVAL + kind * STARTUP_STEP + STARTUP_STEP / 2
+}
+
 fn update(sim: &mut Simulation, tick: u64) {
     set_tick(sim, tick);
     coverage_update(sim);
@@ -108,12 +126,12 @@ fn p2a_coverage_starts_promptly_after_staffing() {
     let school = company(&mut sim, road, vec2(310.0, 420.0), "school", 0);
     company(&mut sim, road, vec2(210.0, 420.0), "solar-panel", 0);
     refresh_power(&mut sim);
-    update(&mut sim, 8100);
+    update(&mut sim, slot(1, SCHOOL));
     assert_eq!(coverage(&sim, home, ServiceKind::School), 0.0);
     let revision = sim.read::<CoverageGrid>().revision(ServiceKind::School);
 
     set_staff(&mut sim, school, 1);
-    for tick in 8101..=8400 {
+    for tick in slot(1, SCHOOL) + 1..=slot(1, SCHOOL) + STARTUP_INTERVAL {
         update(&mut sim, tick);
     }
     assert!(coverage(&sim, home, ServiceKind::School) > 0.0);
@@ -137,14 +155,14 @@ fn p2a_coverage_starts_promptly_for_an_additional_provider() {
     company(&mut sim, road, vec2(310.0, 420.0), "school", 1);
     company(&mut sim, road, vec2(210.0, 420.0), "solar-panel", 0);
     refresh_power(&mut sim);
-    update(&mut sim, 8100);
+    update(&mut sim, slot(1, SCHOOL));
     assert!(coverage(&sim, near, ServiceKind::School) > 0.0);
     assert_eq!(coverage(&sim, far, ServiceKind::School), 0.0);
 
     let mut restored: Simulation = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
     for run in [&mut sim, &mut restored] {
         let revision = run.read::<CoverageGrid>().revision(ServiceKind::School);
-        update(run, 8275);
+        update(run, startup(slot(1, SCHOOL), SCHOOL));
         assert_eq!(
             run.read::<CoverageGrid>().revision(ServiceKind::School),
             revision
@@ -152,7 +170,8 @@ fn p2a_coverage_starts_promptly_for_an_additional_provider() {
 
         company(run, road, vec2(520.0, 420.0), "school", 1);
         refresh_power(run);
-        for tick in 8276..=8575 {
+        let from = startup(slot(1, SCHOOL), SCHOOL);
+        for tick in from + 1..=from + STARTUP_INTERVAL {
             update(run, tick);
         }
         assert!(coverage(run, far, ServiceKind::School) > 0.0);
@@ -230,13 +249,13 @@ fn p2a_coverage_respects_one_way_lanes_and_missing_sidewalks() {
     company(&mut sim, up, vec2(220.0, 575.0), "solar-panel", 0);
     refresh_power(&mut sim);
 
-    update(&mut sim, 6900);
+    update(&mut sim, slot(1, FIRE));
     assert!(coverage(&sim, downstream, ServiceKind::Fire) > 0.0);
     assert!(coverage(&sim, behind_missing_sidewalk, ServiceKind::Fire) > 0.0);
     assert_eq!(coverage(&sim, upstream, ServiceKind::Fire), 0.0);
     assert_eq!(coverage(&sim, same_road_upstream, ServiceKind::Fire), 0.0);
 
-    update(&mut sim, 8100);
+    update(&mut sim, slot(1, SCHOOL));
     assert!(coverage(&sim, downstream, ServiceKind::School) > 0.0);
     assert!(coverage(&sim, upstream, ServiceKind::School) > 0.0);
     assert!(coverage(&sim, same_road_upstream, ServiceKind::School) > 0.0);
@@ -324,12 +343,12 @@ fn p2a_coverage_requires_staff_and_power_and_serves_growables() {
 
     refresh_power(&mut sim);
     assert!(!sim.read::<ElectricityFlow>().blackout(network));
-    update(&mut sim, 9300);
+    update(&mut sim, slot(1, PARK));
     assert_eq!(coverage(&sim, home, ServiceKind::Park), 0.0);
 
     set_staff(&mut sim, park, 1);
     refresh_power(&mut sim);
-    update(&mut sim, 15300);
+    update(&mut sim, slot(2, PARK));
     assert!(coverage(&sim, home, ServiceKind::Park) > 0.0);
     assert!(coverage(&sim, shop, ServiceKind::Park) > 0.0);
     assert_eq!(coverage(&sim, empty, ServiceKind::Park), 0.0);
@@ -338,7 +357,7 @@ fn p2a_coverage_requires_staff_and_power_and_serves_growables() {
     set_staff(&mut sim, power, 0);
     refresh_power(&mut sim);
     assert!(sim.read::<ElectricityFlow>().blackout(network));
-    update(&mut sim, 21300);
+    update(&mut sim, slot(3, PARK));
     assert_eq!(coverage(&sim, home, ServiceKind::Park), 0.0);
     assert_eq!(coverage(&sim, shop, ServiceKind::Park), 0.0);
 }
@@ -358,14 +377,14 @@ fn p2a_coverage_survives_save_load() {
     company(&mut sim, road, vec2(210.0, 420.0), "solar-panel", 0);
     let mut schedule = Simulation::schedule();
 
-    set_tick(&sim, 5999);
+    set_tick(&sim, REFRESH_INTERVAL - 1);
     sim.tick(&mut schedule, &[]);
-    set_tick(&sim, 6899);
+    set_tick(&sim, slot(1, FIRE) - 1);
     sim.tick(&mut schedule, &[]);
     let fire = coverage(&sim, home, ServiceKind::Fire);
     assert!(fire > 0.0);
     assert_eq!(coverage(&sim, home, ServiceKind::School), 0.0);
-    set_tick(&sim, 8099);
+    set_tick(&sim, slot(1, SCHOOL) - 1);
     sim.tick(&mut schedule, &[]);
     let value = coverage(&sim, home, ServiceKind::School);
     assert!(value > 0.0);
@@ -378,7 +397,7 @@ fn p2a_coverage_survives_save_load() {
     for run in [&mut sim, &mut restored] {
         let mut schedule = Simulation::schedule();
         set_staff(run, school, 0);
-        set_tick(run, 14098);
+        set_tick(run, slot(2, SCHOOL) - 2);
         run.tick(&mut schedule, &[]);
         assert_eq!(coverage(run, home, ServiceKind::School), value);
         run.tick(&mut schedule, &[]);
@@ -536,18 +555,18 @@ fn measure_services(name: &str, mut sim: Simulation) {
     let mut peak_tick_ms = 0.0_f64;
     let mut hourly_peak_ms = 0.0_f64;
     for cycle in 1..=CYCLES {
-        let start = 6_000 * cycle;
-        if cycle == 1 || start % 18_000 == 0 {
+        let start = REFRESH_INTERVAL * cycle;
+        if cycle == 1 || start % prototypes::TICKS_PER_HOUR == 0 {
             set_tick(&sim, start - 1);
             let elapsed = sim.tick(&mut Simulation::schedule(), &[]);
             let tick_ms = elapsed.as_secs_f64() * 1000.0;
             peak_tick_ms = peak_tick_ms.max(tick_ms);
-            if start % 18_000 == 0 {
+            if start % prototypes::TICKS_PER_HOUR == 0 {
                 hourly_peak_ms = hourly_peak_ms.max(tick_ms);
             }
         }
         for (index, _) in PERF_KINDS.iter().enumerate() {
-            let tick = start + 600 * index as u64 + 300;
+            let tick = slot(cycle, index as u64);
             set_tick(&sim, tick - 1);
             let mut schedule = Simulation::schedule();
             let elapsed = sim.tick(&mut schedule, &[]);

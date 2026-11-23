@@ -4,8 +4,7 @@ use std::collections::BTreeMap;
 use geom::Vec3;
 use ordered_float::OrderedFloat;
 use prototypes::{
-    try_prototype, GameTime, ServiceID, ServiceKind, TICKS_PER_HOUR, TICKS_PER_MINUTE,
-    TICKS_PER_REALTIME_SECOND,
+    try_prototype, GameTime, ServiceID, ServiceKind, TICKS_PER_MINUTE, TICKS_PER_REALTIME_SECOND,
 };
 
 use crate::map::{Building, BuildingID, Map, ProjectFilter, ProjectKind};
@@ -17,7 +16,8 @@ use crate::{CompanyID, HumanID, SoulID};
 use slotmapd::HopSlotMap;
 
 pub(crate) const PARK_DWELL: u64 = 35 * TICKS_PER_MINUTE;
-pub(crate) const PARK_TRAVEL_LIMIT: u64 = TICKS_PER_HOUR;
+/// A walking budget (real time, one game hour at the old 10× clock).
+pub(crate) const PARK_TRAVEL_LIMIT: u64 = 6 * 60 * TICKS_PER_REALTIME_SECOND;
 pub(crate) const AFTER_WORK_RADIUS: f32 = 600.0;
 
 pub(crate) fn leisure_score(stock: &HouseholdStock, time: &GameTime, now: u64) -> f32 {

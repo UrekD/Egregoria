@@ -1,4 +1,6 @@
 use super::TestCtx;
+use crate::map_dynamic::{REFRESH_INTERVAL, REFRESH_SLOT};
+use crate::economy::balance::CITY_UPDATE_INTERVAL_TICKS as CITY;
 use crate::map::{BuildingKind, LaneKind, LanePatternBuilder, Map, ProjectFilter, RoadID, Zone};
 use crate::map_dynamic::{
     electricity_flow_system, env_update, utility_flow_update, CoverageGrid, EnvGrid, UtilityFlow,
@@ -114,7 +116,7 @@ fn p2abc_periodic_passes_keep_distinct_phases() {
 
 #[test]
 fn pfc_environment_uses_the_utility_pass_on_elapsed_ticks() {
-    for destination in [2_998, 2_999, 3_001] {
+    for destination in [CITY - 2, CITY - 1, CITY + 1] {
         let mut test = TestCtx::new_fast();
         road(
             &test,
@@ -134,7 +136,7 @@ fn pfc_environment_uses_the_utility_pass_on_elapsed_ticks() {
         );
         assert_eq!(test.g.read::<UtilityFlow>().networks().count(), 0);
 
-        for _ in 4..3_000 {
+        for _ in 4..CITY {
             test.tick_fast();
         }
         assert!(test.g.read::<UtilityFlow>().networks().next().is_some());
@@ -179,8 +181,8 @@ fn p2abc_rail_bridge_pipes_and_land_value_follow_refresh_offsets() {
     let worker = spawn_human(&mut test.g, remote).unwrap();
     test.g.world.companies[clinic].workers.0.push(worker);
 
-    let utility_tick = 3_000 + UtilityFlow::UPDATE_OFFSET;
-    let env_tick = 3_000 + EnvGrid::UPDATE_OFFSET;
+    let utility_tick = CITY + UtilityFlow::UPDATE_OFFSET;
+    let env_tick = CITY + EnvGrid::UPDATE_OFFSET;
     tick_at(&mut test, utility_tick - 1);
     assert!(!test.g.read::<UtilityFlow>().has_water(remote));
     assert_eq!(test.g.read::<EnvGrid>().land_value(remote), 0);
@@ -203,13 +205,14 @@ fn p2abc_rail_bridge_pipes_and_land_value_follow_refresh_offsets() {
             .coverage(home, ServiceKind::Health)
     };
 
-    tick_at(&mut test, 6_000 + UtilityFlow::UPDATE_OFFSET);
+    tick_at(&mut test, 2 * CITY + UtilityFlow::UPDATE_OFFSET);
     assert_eq!(
         health(&test, local),
         0.0,
         "coverage shares the utility tick"
     );
-    tick_at(&mut test, 6_299);
+    // One tick before the first scheduled Health refresh.
+    tick_at(&mut test, REFRESH_INTERVAL + REFRESH_SLOT / 2 - 1);
     assert_eq!(health(&test, local), 0.0);
     test.tick_fast();
     let covered = health(&test, local);
@@ -268,7 +271,7 @@ fn p2abc_exact_fractional_staffing_meets_utility_demand() {
         test.g.world.companies[company].workers.0 = vec![HumanID::default(); 7];
     }
 
-    test.g.write::<GameTime>().tick.0 = 3_000 + UtilityFlow::UPDATE_OFFSET;
+    test.g.write::<GameTime>().tick.0 = CITY + UtilityFlow::UPDATE_OFFSET;
     assert!(UtilityFlow::due(test.g.get_tick()));
     let (world, resources) = test.g.world_res();
     electricity_flow_system(world, resources);
@@ -304,13 +307,13 @@ fn p2abc_company_pollution_scales_with_staffing() {
     );
     let center = vec2(208.0, 208.0);
     let emitter = place_company(&mut test, "coal-power-plant", center, road);
-    test.g.write::<GameTime>().tick.0 = 3_000 + EnvGrid::UPDATE_OFFSET;
+    test.g.write::<GameTime>().tick.0 = CITY + EnvGrid::UPDATE_OFFSET;
     assert!(EnvGrid::due(test.g.get_tick()));
     env_update(&mut test.g);
     assert_eq!(test.g.read::<EnvGrid>().pollution_at(center), 0.0);
 
     test.g.world.companies[emitter].workers.0 = vec![HumanID::default(); 5];
-    test.g.write::<GameTime>().tick.0 = 6_000 + EnvGrid::UPDATE_OFFSET;
+    test.g.write::<GameTime>().tick.0 = 2 * CITY + EnvGrid::UPDATE_OFFSET;
     assert!(EnvGrid::due(test.g.get_tick()));
     env_update(&mut test.g);
     assert!((test.g.read::<EnvGrid>().pollution_at(center) - 18.0).abs() < 0.001);
@@ -344,7 +347,7 @@ fn p2abc_environment_skips_missing_residence_prototype() {
         .get_mut(&home)
         .unwrap()
         .prototype = ResidencePrototypeID::new("removed-residence");
-    test.g.write::<GameTime>().tick.0 = 3_000 + EnvGrid::UPDATE_OFFSET;
+    test.g.write::<GameTime>().tick.0 = CITY + EnvGrid::UPDATE_OFFSET;
     assert!(EnvGrid::due(test.g.get_tick()));
     env_update(&mut test.g);
     let env = test.g.read::<EnvGrid>();
