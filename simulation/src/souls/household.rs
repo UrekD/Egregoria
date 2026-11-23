@@ -948,8 +948,8 @@ mod tests {
             test.g.get(id).unwrap().decision.kind,
             HumanDecisionKind::DepositAtHome
         ));
-        // Parking is vehicle motion, so bound it in real ticks (6 real seconds).
-        let parked = (0..300).any(|_| {
+        // Parking is movement, so its glide takes real time.
+        let parked = (0..10 * prototypes::TICKS_PER_REALTIME_SECOND).any(|_| {
             test.tick_fast();
             test.g.get(car).unwrap().vehicle.state.is_parked()
         });

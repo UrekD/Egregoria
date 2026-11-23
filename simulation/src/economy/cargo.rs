@@ -13,7 +13,9 @@
 //! An outbound leg that keeps failing in the router suspends its route until the
 //! cooldown ends or the road network changes. While the consumer is still in
 //! reach, its source keeps the reorder on hand, so only stock an open route
-//! would leave over takes another lane.
+//! would leave over takes another lane. Open routes are served before stock is
+//! held for suspended ones. A loaded truck that stops moving releases its load,
+//! and a load past its due time no longer keeps the recipient from importing.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -32,7 +34,7 @@ use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, ParkingManagement};
 use crate::souls::desire::WorkKind;
 use crate::souls::household::household_items;
-use crate::transportation::{Location, VehicleKind};
+use crate::transportation::{Location, VehicleKind, VehicleState};
 use crate::utils::resources::Resources;
 use crate::{CompanyID, HumanEnt, HumanID, ParCommandBuffer, Simulation, SoulID, VehicleID, World};
 
@@ -52,6 +54,10 @@ const ROUTING_RETRY_WINDOW: u64 = 10 * TICKS_PER_MINUTE;
 // A route whose outbound leg gave up is skipped by matching for this long.
 const FAILED_ROUTE_COOLDOWN: u64 = 2 * TICKS_PER_HOUR;
 const FREIGHT_DAYS_KEPT: u64 = 8;
+// A loaded truck that has not moved this far for this long is stuck in a jam,
+// and its load is released. Movement is real time: two real minutes.
+const LOAD_STALL_TICKS: u64 = 60 * TICKS_PER_MINUTE;
+const STALL_DISTANCE: f32 = 5.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct ShipmentId(pub u64);
@@ -137,8 +143,17 @@ struct EmptyReturn {
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 struct SuspendedRoute {
     until: u64,
+    // Unused: a road edit lifts every suspension instead, since the topology
+    // generation restarts at load. Kept so the save layout does not change.
     topology: u64,
     roads: [Option<RoadID>; 2],
+}
+
+/// Where a loaded truck last moved on its way, and when.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub(crate) struct LoadProgress {
+    at: geom::Vec3,
+    since: u64,
 }
 
 /// What a warehouse is doing, or why it is idle, as of the last freight match.
@@ -174,6 +189,12 @@ pub struct CargoBook {
     // Derived at every match, so a loaded game shows it after the first one.
     #[serde(skip)]
     activity: BTreeMap<CompanyID, WarehouseActivity>,
+    // Saved as its own `cargo_progress` entry so the book's encoding is unchanged.
+    #[serde(skip)]
+    pub(crate) progress: BTreeMap<LoadId, LoadProgress>,
+    // Set by a road edit and taken by the next update, within the same tick.
+    #[serde(skip)]
+    topology_edited: bool,
 }
 
 impl Default for CargoBook {
@@ -191,6 +212,8 @@ impl Default for CargoBook {
             days: BTreeMap::new(),
             routes: RouteCache::default(),
             activity: BTreeMap::new(),
+            progress: BTreeMap::new(),
+            topology_edited: false,
         }
     }
 }
@@ -316,10 +339,11 @@ impl CargoBook {
         self.restocking.contains(&company)
     }
 
-    /// Recipients and items with a loaded truck on its way.
-    pub(crate) fn inputs_in_transit(&self) -> BTreeSet<(SoulID, ItemID)> {
+    /// Recipients and items with a loaded truck on its way and not yet overdue.
+    pub(crate) fn inputs_in_transit(&self, now: u64) -> BTreeSet<(SoulID, ItemID)> {
         self.loads
             .values()
+            .filter(|load| now < load.due_at)
             .flat_map(|load| {
                 load.items
                     .iter()
@@ -433,11 +457,9 @@ impl CargoBook {
     }
 
     fn is_suspended(&self, map: &Map, from: Endpoint, to: Endpoint, now: u64) -> bool {
-        self.suspended.get(&(from, to)).is_some_and(|route| {
-            now < route.until
-                && route.topology == map.walking_topology_generation
-                && route.roads == connected_roads(map, from, to)
-        })
+        self.suspended
+            .get(&(from, to))
+            .is_some_and(|route| now < route.until && route.roads == connected_roads(map, from, to))
     }
 
     fn suspend_route(&mut self, map: &Map, from: Endpoint, to: Endpoint, now: u64) {
@@ -445,11 +467,19 @@ impl CargoBook {
             (from, to),
             SuspendedRoute {
                 until: now + FAILED_ROUTE_COOLDOWN,
-                topology: map.walking_topology_generation,
+                topology: 0,
                 roads: connected_roads(map, from, to),
             },
         );
     }
+}
+
+/// A road edit may reopen any route. Suspended routes are matched again, and
+/// queued shipments are checked on this tick's update instead of the next match.
+pub(crate) fn on_topology_changed(sim: &Simulation) {
+    let mut book = sim.write::<CargoBook>();
+    book.suspended.clear();
+    book.topology_edited = true;
 }
 
 fn connected_roads(map: &Map, from: Endpoint, to: Endpoint) -> [Option<RoadID>; 2] {
@@ -920,7 +950,9 @@ impl Matching<'_> {
         let mut stock = before.clone();
 
         // Local recipes claim stock for every item before anything is exported.
+        // Open routes are served first, then suspended ones keep their reorder on site.
         let mut used_locally = BTreeSet::new();
+        let mut kept = BTreeMap::<ItemID, u32>::new();
         for (&item, available) in &mut stock {
             let mut candidates = inputs.get(&item).cloned().unwrap_or_default();
             candidates.sort_unstable_by_key(|input| {
@@ -929,11 +961,12 @@ impl Matching<'_> {
                     straight_distance(self.map, source, input.destination),
                 )
             });
+            let mut held = Vec::new();
             for input in candidates {
                 let Some(distance) = self.road_distance(source, input.destination) else {
                     if self.held_route(source, input.destination) {
                         used_locally.insert(item);
-                        *available -= self.wanted(policy, input, item, *available);
+                        held.push(input);
                     }
                     continue;
                 };
@@ -946,6 +979,11 @@ impl Matching<'_> {
                     continue;
                 }
                 *available -= self.reserve_for_input(policy, source, input, item, *available);
+            }
+            for input in held {
+                let units = self.wanted(policy, input, item, *available);
+                *available -= units;
+                *kept.entry(item).or_default() += units;
             }
         }
 
@@ -987,8 +1025,9 @@ impl Matching<'_> {
             }
         }
 
+        // Stock kept on site for a suspended route has not left.
         for (item, units) in before {
-            let sent = units - stock[&item];
+            let sent = units - stock[&item] - kept.get(&item).copied().unwrap_or(0);
             if sent > 0 {
                 warehouse.on_hand -= sent;
                 warehouse.staged -= sent;
@@ -1270,23 +1309,27 @@ fn match_shipments(
                     distance(input.destination),
                 )
             });
+            // Open routes are served first. Suspended routes that still reach their
+            // consumer keep their reorder on hand from what is left.
             let mut local = false;
+            let mut held = Vec::new();
             for input in candidates {
-                let open = matching.route(source, input.destination);
-                if !open && !matching.held_route(source, input.destination) {
+                if !matching.route(source, input.destination) {
+                    if matching.held_route(source, input.destination) {
+                        local = true;
+                        held.push(input);
+                    }
                     continue;
                 }
                 local = true;
-                if !has_driver {
+                if !has_driver || available == 0 {
                     break;
                 }
-                available -= if open {
-                    matching.reserve_for_input(policy, source, input, item, available)
-                } else {
-                    matching.wanted(policy, input, item, available)
-                };
-                if available == 0 {
-                    break;
+                available -= matching.reserve_for_input(policy, source, input, item, available);
+            }
+            if has_driver {
+                for input in held {
+                    available -= matching.wanted(policy, input, item, available);
                 }
             }
 
@@ -1915,6 +1958,8 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
     let now = elapsed_ticks(resources).0;
     let mut book = resources.write::<CargoBook>();
     let match_due = now % FREIGHT_MATCH_INTERVAL == 0;
+    // Taken before any early return: the flag is not saved, so it must not outlive the tick.
+    let topology_edited = std::mem::take(&mut book.topology_edited);
     if !match_due && book.loads.is_empty() && book.shipments.is_empty() && book.returning.is_empty()
     {
         return;
@@ -1928,8 +1973,9 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
             && dest.live(world, &map, &infos)
             && routes.reaches(&map, source.building, dest.building)
     };
-    let check_queued =
-        match_due || book.routes.revision != (map.identity(), map.walking_topology_generation);
+    // Not on a route cache rebuild: the cache is not saved, so a loaded game would
+    // check off-cycle where the uninterrupted one does not.
+    let check_queued = match_due || topology_edited;
     let mut shipments: BTreeSet<_> = book
         .shipments
         .iter()
@@ -1974,10 +2020,36 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
             });
             let assigned = matches!(load.source.soul, SoulID::GoodsCompany(company)
                 if owns_assignment(world, load.source, company, load.driver, load.vehicle));
+            let on_the_road = human.location == Location::Vehicle(load.vehicle)
+                && matches!(
+                    vehicle.vehicle.state,
+                    VehicleState::Driving | VehicleState::Panicking(_)
+                );
+            let stalled = on_the_road && {
+                let pos = vehicle.trans.pos;
+                let progress = book.progress.entry(id).or_insert(LoadProgress {
+                    at: pos,
+                    since: now,
+                });
+                if progress.at.distance(pos) >= STALL_DISTANCE {
+                    *progress = LoadProgress {
+                        at: pos,
+                        since: now,
+                    };
+                }
+                now >= progress.since + LOAD_STALL_TICKS
+            };
+            if !on_the_road {
+                book.progress.remove(&id);
+            }
+            if stalled {
+                log::warn!("freight load {id:?} has not moved for an hour; releasing it");
+            }
             (now >= load.departed_at + DELIVERY_EXPIRY
                 || !valid(&mut book.routes, load.source, load.destination)
                 || !assigned
-                || !holds_load)
+                || !holds_load
+                || stalled)
                 .then_some(id)
         })
         .collect();
@@ -2003,6 +2075,7 @@ pub fn cargo_update(world: &mut World, resources: &mut Resources) {
         loads,
         Release::Cancelled,
     );
+    book.progress.retain(|id, _| book.loads.contains_key(id));
     track_returns(book, world, resources, now);
     if match_due {
         book.suspended.retain(|_, route| now < route.until);
@@ -3778,6 +3851,48 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn finalsim_replacing_a_truck_parked_away_leaves_the_drivers_other_trip_alone() {
+        use crate::souls::human::HumanDecisionKind;
+
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let started = unload_and_stay(&mut f);
+        // The empty truck is parked at the plant, so recovery replaces it at the depot.
+        let plant_door = f.ctx.g.map().buildings()[f.destination.building].door_pos;
+        f.ctx.g.world_mut_unchecked().vehicles[f.truck].trans.pos = plant_door;
+        let elsewhere = f.ctx.build_house_near(vec2(100.0, 380.0));
+        {
+            let human = &mut f.ctx.g.world_mut_unchecked().humans[f.driver];
+            let personal = human.router.personal_car;
+            human.router.use_vehicle(personal);
+            human.router.go_to(Destination::Building(elsewhere));
+            human.decision.kind = HumanDecisionKind::GoTo(Destination::Building(elsewhere));
+        }
+        f.update(started + DELIVERY_EXPIRY);
+        drain_commands(&mut f);
+        drain_commands(&mut f);
+        let SoulID::GoodsCompany(mine) = f.source.soul else {
+            unreachable!()
+        };
+        let fleet = f.ctx.g.world().companies[mine].comp.trucks.clone();
+        assert_ne!(fleet, vec![f.truck], "the truck was replaced");
+        let human = &f.ctx.g.world().humans[f.driver];
+        assert_eq!(
+            human.router.target_dest,
+            Some(Destination::Building(elsewhere)),
+            "an unrelated trip is not cancelled"
+        );
+        assert!(
+            matches!(
+                human.work.as_ref().unwrap().kind,
+                WorkKind::Driver { truck, .. } if fleet.contains(&truck)
+            ),
+            "the driver keeps the job with the replacement truck"
+        );
+    }
+
+    #[test]
     fn e2fix2_a_return_without_its_driver_brings_the_truck_back_to_the_depot() {
         for reason in ["despawned", "reassigned"] {
             let mut f = Fixture::new();
@@ -3893,5 +4008,215 @@ mod lifecycle_tests {
         }]);
         assert_eq!(queued(&f), 1, "an unchanged policy withdraws nothing");
         assert_eq!(f.ctx.g.read::<Market>().capital(depot.soul, flour), 24);
+    }
+
+    fn update_sim(sim: &mut Simulation, tick: u64) {
+        *sim.write::<GameTime>() = GameTime::new(Tick(INITIAL_TICK + tick));
+        let (world, resources) = sim.world_res();
+        cargo_update(world, resources);
+    }
+
+    #[test]
+    fn finalsim_a_suspended_route_stays_suspended_after_a_save() {
+        let mut f = Fixture::new();
+        // Road building elsewhere advances the topology generation, which a save does not keep.
+        f.ctx
+            .build_roads(&[vec3(700.0, 700.0, 0.0), vec3(900.0, 700.0, 0.0)]);
+        assert!(f.ctx.g.map().walking_topology_generation > 0);
+        let wanted = plant_target(&f) as u32 - 1;
+        f.seed((wanted + mine_policy().capacity) as i32, 1);
+        let (source, destination) = (f.source, f.destination);
+        suspend(&mut f, source, destination, 0);
+
+        let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&f.ctx.g).unwrap()).unwrap();
+        let held = |sim: &Simulation| {
+            let map = sim.map();
+            sim.write::<CargoBook>()
+                .held_route(&map, source, destination, FREIGHT_MATCH_INTERVAL)
+        };
+        assert!(held(&f.ctx.g));
+        assert!(held(&resumed), "the resumed run keeps the suspension");
+
+        f.update(FREIGHT_MATCH_INTERVAL);
+        update_sim(&mut resumed, FREIGHT_MATCH_INTERVAL);
+        assert_eq!(
+            f.reserved(),
+            0,
+            "the uninterrupted run holds the stock back"
+        );
+        assert_eq!(f.ctx.g.hashes(), resumed.hashes());
+    }
+
+    #[test]
+    fn finalsim_a_road_edit_lifts_suspensions() {
+        let mut f = Fixture::new();
+        let (source, destination) = (f.source, f.destination);
+        suspend(&mut f, source, destination, 0);
+        // Building a new road is a topology edit that keeps both ends connected.
+        f.ctx.apply(&[WorldCommand::MapMakeConnection {
+            from: crate::map::MapProject::ground(vec3(700.0, 700.0, 0.0)),
+            to: crate::map::MapProject::ground(vec3(900.0, 700.0, 0.0)),
+            inter: None,
+            pat: crate::map::LanePatternBuilder::default().build(),
+        }]);
+        let map = f.ctx.g.map();
+        assert!(!f.ctx.g.write::<CargoBook>().held_route(
+            &map,
+            source,
+            destination,
+            FREIGHT_MATCH_INTERVAL
+        ));
+    }
+
+    #[test]
+    fn finalsim_queued_shipments_wait_for_the_match_after_a_load() {
+        let mut f = Fixture::new();
+        f.ctx.g.world_mut_unchecked().humans[f.driver].location = Location::Outside;
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(f.reserved(), 16, "queued: the driver is away");
+        // The driver loses the job between matches. The uninterrupted run only notices at the
+        // next match, and so must the resumed one.
+        f.ctx.g.world_mut_unchecked().companies[match f.source.soul {
+            SoulID::GoodsCompany(id) => id,
+            _ => unreachable!(),
+        }]
+        .comp
+        .driver = None;
+        let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&f.ctx.g).unwrap()).unwrap();
+        f.update(FREIGHT_MATCH_INTERVAL + 1);
+        update_sim(&mut resumed, FREIGHT_MATCH_INTERVAL + 1);
+        assert_eq!(f.reserved(), 16);
+        assert_eq!(f.ctx.g.hashes(), resumed.hashes());
+    }
+
+    #[test]
+    fn finalsim_a_truck_that_stops_moving_releases_its_load() {
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let token = f.token();
+        drive_off(&mut f);
+        let start = elapsed_ticks(&f.ctx.g.resources).0;
+        // The truck stands still from here on, without a routing error.
+        f.update(start + 1);
+        f.update(start + LOAD_STALL_TICKS / 2);
+        let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&f.ctx.g).unwrap()).unwrap();
+        assert!(f.ctx.g.read::<CargoBook>().loads.contains_key(&token));
+        f.update(start + 1 + LOAD_STALL_TICKS);
+        update_sim(&mut resumed, start + 1 + LOAD_STALL_TICKS);
+        assert_eq!(
+            f.ctx.g.hashes(),
+            resumed.hashes(),
+            "the stall timer is saved"
+        );
+        drain_commands(&mut f);
+        let book = f.ctx.g.read::<CargoBook>();
+        assert!(
+            !book.loads.contains_key(&token),
+            "a stalled load is released"
+        );
+        assert!(
+            book.suspended.is_empty(),
+            "a jam does not suspend the route"
+        );
+        assert!(!book
+            .inputs_in_transit(start + 1 + LOAD_STALL_TICKS)
+            .contains(&(f.destination.soul, Fixture::coal())));
+        drop(book);
+        assert_eq!((f.hand(f.source), f.hand(f.destination)), (16, 1));
+        assert!(f.ctx.g.world().humans[f.driver].location != Location::Vehicle(f.truck));
+    }
+
+    #[test]
+    fn finalsim_a_store_imports_once_its_truck_is_overdue() {
+        let mut f = Fixture::with_companies("industrial-l1", "commercial-l1");
+        station(&mut f, true);
+        let goods = ItemID::new("goods");
+        let store = f.destination;
+        let SoulID::GoodsCompany(store_id) = store.soul else {
+            unreachable!()
+        };
+        {
+            let mut market = f.ctx.g.write::<Market>();
+            market.receive_freight(store.soul, goods, 2);
+            market.produce(f.source.soul, goods, 16);
+        }
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert_eq!(f.manifest_units(), 16, "a truck is on its way to the store");
+        let now = elapsed_ticks(&f.ctx.g.resources).0;
+        for load in f.ctx.g.write::<CargoBook>().loads.values_mut() {
+            load.due_at = now;
+        }
+        f.ctx.g.world_mut_unchecked().companies[store_id]
+            .comp
+            .progress = 1.0;
+        for _ in 0..10 {
+            f.ctx.tick_fast();
+        }
+        assert_eq!(
+            f.ctx.g.read::<Market>().capital(store.soul, goods),
+            2,
+            "the station fills the store while its truck is overdue",
+        );
+    }
+
+    #[test]
+    fn finalsim_held_stock_is_not_booked_as_shipped() {
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, "small-depot");
+        warehouse_driver(&mut f, depot);
+        f.seed(0, 1);
+        f.ctx
+            .g
+            .write::<Market>()
+            .produce(depot.soul, Fixture::coal(), 40);
+        let destination = f.destination;
+        suspend(&mut f, depot, destination, 0);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let SoulID::GoodsCompany(id) = depot.soul else {
+            unreachable!()
+        };
+        assert_eq!(f.hand(depot), 40);
+        assert!(
+            !f.ctx.g.read::<CargoBook>().is_restocking(id),
+            "40 units held back on site are above the low watermark"
+        );
+    }
+
+    #[test]
+    fn finalsim_a_held_reorder_leaves_stock_for_an_open_consumer() {
+        let mut f = Fixture::new();
+        // A second plant on the plant's road, farther from the mine.
+        let road = f.ctx.g.map().buildings()[f.destination.building].connected_road;
+        let proto = GoodsCompanyID::new("coal-power-plant");
+        let building = f
+            .ctx
+            .g
+            .map_mut()
+            .build_special_building(
+                &OBB::new(vec2(480.0, 467.0), Vec2::X, 20.0, 20.0),
+                BuildingKind::GoodsCompany(proto),
+                BuildingGen::CenteredDoor {
+                    vertical_factor: 1.0,
+                },
+                None,
+                road,
+            )
+            .unwrap();
+        f.ctx.g.write::<BuildingInfos>().insert(building);
+        let soul = company_soul(&mut f.ctx.g, building, proto).unwrap();
+        let open = Endpoint { soul, building };
+        let target = plant_target(&f);
+        f.seed(target, 0);
+        // The nearer plant's route failed and is cooling down.
+        let (source, held) = (f.source, f.destination);
+        suspend(&mut f, source, held, 0);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        assert!(
+            incoming(&f, open.building, Fixture::coal()) > 0,
+            "the reachable plant is served before stock is held for the suspended one"
+        );
+        assert_eq!(incoming(&f, held.building, Fixture::coal()), 0);
     }
 }

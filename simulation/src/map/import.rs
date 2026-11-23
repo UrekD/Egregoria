@@ -266,6 +266,7 @@ fn import_network(map: &mut Map, city: &ImportedCity) -> Result<ImportedNetwork,
             .ok_or_else(|| format!("could not insert imported link {index}"))?;
         roads.insert(index, road);
     }
+    keep_lights_where_auto_would(map, &junctions);
     map.finalize_import(
         &junctions.values().copied().collect::<Vec<_>>(),
         &roads.values().copied().collect::<Vec<_>>(),
@@ -274,6 +275,8 @@ fn import_network(map: &mut Map, city: &ImportedCity) -> Result<ImportedNetwork,
     for (&index, &road) in &roads {
         if city.links[index].frontage {
             Lot::generate_along_road(map, road);
+        } else {
+            map.no_frontage.insert(road);
         }
     }
     map.check_invariants();
@@ -282,6 +285,32 @@ fn import_network(map: &mut Map, city: &ImportedCity) -> Result<ImportedNetwork,
         roads,
         short_lanes,
     })
+}
+
+/// Imported lights follow `LightPolicy::Auto`'s rule: four or more approaches and left turns
+/// allowed. With fewer approaches, phases are shared by legs that may conflict, so the junction
+/// keeps the priority signage of other imported junctions instead.
+fn keep_lights_where_auto_would(map: &mut Map, junctions: &BTreeMap<usize, IntersectionID>) {
+    for &id in junctions.values() {
+        let junction = &map.intersections[id];
+        if junction.light_policy != LightPolicy::Lights {
+            continue;
+        }
+        let approaches = junction
+            .roads
+            .iter()
+            .filter(|&&road| {
+                map.roads.get(road).is_some_and(|road| {
+                    road.incoming_lanes_to(id)
+                        .iter()
+                        .any(|(_, kind)| kind.needs_light())
+                })
+            })
+            .count();
+        if approaches < 4 || !junction.turn_policy.left_turns {
+            map.intersections[id].light_policy = LightPolicy::NoLights;
+        }
+    }
 }
 
 fn clean_samples(mut points: Vec<Vec3>) -> Vec<Vec3> {
@@ -346,6 +375,7 @@ mod tests {
     use crate::map::LanePatternBuilder;
     use crate::tests::TestCtx;
     use crate::{MapPreset, NewGameOptions, Simulation};
+    use common::saveload::{Bincode, Encoder};
     use geom::vec2;
 
     #[test]
@@ -613,5 +643,97 @@ mod tests {
             .values()
             .any(|junction| junction.turns().next().is_some()));
         map.check_invariants();
+    }
+
+    fn flat_options() -> NewGameOptions {
+        NewGameOptions {
+            preset: MapPreset::Flat,
+            seed: 42,
+            terrain_chunks: 16,
+            starting_money_bucks: 1_000_000,
+            progression: crate::economy::progression::ProgressionMode::FreeBuild,
+            lot_layout: crate::map::LotLayout::Varied,
+        }
+    }
+
+    /// A junction at the centre with a link to each of the given ends.
+    fn star(ends: &[Vec2], light_policy: LightPolicy) -> ImportedCity {
+        let center = vec2(500.0, 500.0);
+        ImportedCity {
+            junctions: std::iter::once(center)
+                .chain(ends.iter().copied())
+                .enumerate()
+                .map(|(id, position)| ImportedJunction {
+                    id,
+                    position,
+                    roundabout_radius: None,
+                    light_policy: if id == 0 {
+                        light_policy
+                    } else {
+                        LightPolicy::NoLights
+                    },
+                })
+                .collect(),
+            links: ends
+                .iter()
+                .enumerate()
+                .map(|(index, &end)| ImportedLink {
+                    source_way_ids: vec![index as u64],
+                    from: 0,
+                    to: index + 1,
+                    points: vec![center, end],
+                    pattern: LanePatternBuilder::new().build(),
+                    frontage: false,
+                })
+                .collect(),
+            boundary_stubs: vec![],
+        }
+    }
+
+    #[test]
+    fn finalsim_imported_lights_need_four_approaches_like_auto() {
+        let _ctx = TestCtx::new();
+        let ends = [
+            vec2(500.0, 380.0),
+            vec2(380.0, 500.0),
+            vec2(620.0, 500.0),
+            vec2(500.0, 620.0),
+        ];
+        for (legs, expected) in [(3, LightPolicy::NoLights), (4, LightPolicy::Lights)] {
+            let city = star(&ends[..legs], LightPolicy::Lights);
+            let (sim, network) = Simulation::from_imported_city(&city, &flat_options()).unwrap();
+            let map = sim.map();
+            let junction = &map.intersections()[network.junctions[&0]];
+            assert_eq!(junction.light_policy, expected, "{legs} legs");
+            let lights = junction
+                .roads
+                .iter()
+                .flat_map(|&road| map.roads()[road].incoming_lanes_to(junction.id).iter())
+                .any(|&(lane, _)| map.lanes()[lane].control.is_light());
+            assert_eq!(lights, expected == LightPolicy::Lights, "{legs} legs");
+        }
+    }
+
+    #[test]
+    fn finalsim_a_lot_layout_switch_keeps_roads_the_importer_left_without_lots() {
+        let _ctx = TestCtx::new();
+        let mut city = star(
+            &[vec2(500.0, 300.0), vec2(300.0, 500.0), vec2(700.0, 500.0)],
+            LightPolicy::NoLights,
+        );
+        city.links[0].frontage = true;
+        let (sim, network) = Simulation::from_imported_city(&city, &flat_options()).unwrap();
+        let with_lots = network.roads[&0];
+        let only_frontage = |sim: &Simulation| {
+            let map = sim.map();
+            assert!(!map.lots().is_empty());
+            map.lots().values().all(|lot| lot.parent == with_lots)
+        };
+        assert!(only_frontage(&sim));
+        let mut loaded: Simulation = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+        for sim in [&sim, &mut loaded] {
+            sim.map_mut().set_lot_layout(crate::map::LotLayout::Uniform);
+            assert!(only_frontage(sim));
+        }
     }
 }

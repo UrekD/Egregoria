@@ -11,6 +11,7 @@ use crate::economy::{
     find_trade_place, record_coal_stockout, Market,
 };
 use crate::map::{Building, BuildingID, Map, Zone, MAX_ZONE_AREA};
+use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{BuildingInfos, ElectricityFlow};
 use crate::souls::desire::WorkKind;
 use crate::transportation::{spawn_parked_vehicle, spawn_truck_at_depot, VehicleKind};
@@ -267,7 +268,9 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
     let coal_plant = GoodsCompanyID::new("coal-power-plant");
     let coal = ItemID::new("coal");
     let growable_freight = res.read::<CargoBook>().growable_freight;
-    let trucked_in = res.read::<CargoBook>().inputs_in_transit();
+    let trucked_in = res
+        .read::<CargoBook>()
+        .inputs_in_transit(elapsed_ticks(res).0);
 
     world.companies.iter_mut().for_each(|(me, c)| {
         let soul = SoulID::GoodsCompany(me);

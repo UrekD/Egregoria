@@ -14,6 +14,14 @@ const MIN_LINK_LENGTH: f32 = 10.0;
 const MAX_LINKS: usize = 6000;
 /// Mapped signals usually sit on the approaches, a few metres before the junction node.
 const SIGNAL_RADIUS: f32 = 25.0;
+/// `traffic_signals=*` values for signals that do not control a junction's traffic.
+const NOT_JUNCTION_SIGNALS: [&str; 5] = [
+    "crossing",
+    "emergency",
+    "ramp_meter",
+    "level_crossing",
+    "blinker",
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct GeoBounds {
@@ -423,13 +431,13 @@ fn signalled_junctions(
     legs: &BTreeMap<Anchor, Vec<LinkClass>>,
     skipped: &mut Vec<(String, String)>,
 ) -> BTreeSet<Anchor> {
-    // Pedestrian-only signals do not control the junction.
+    // Pedestrian-only and special-purpose signals do not control the junction.
     let mut signals: Vec<_> = elements
         .iter()
         .filter(|element| {
             element.kind == ElementKind::Node
                 && element.tag("highway") == "traffic_signals"
-                && matches!(element.tag("traffic_signals"), "" | "signal")
+                && !NOT_JUNCTION_SIGNALS.contains(&element.tag("traffic_signals"))
         })
         .collect();
     signals.sort_by_key(|element| element.id);
@@ -438,9 +446,12 @@ fn signalled_junctions(
         let Some(point) = element.point().map(|point| bounds.point(point)) else {
             continue;
         };
+        // A signalled pedestrian crossing controls a junction only on the junction node.
+        let crossing = element.tag("crossing") == "traffic_signals";
         let nearest = anchors
             .iter()
             .filter(|(key, _)| legs.get(key).is_some_and(|legs| legs.len() >= 3))
+            .filter(|(key, _)| !crossing || **key == Anchor::Node(false, element.id))
             .map(|(key, position)| (position.distance(point), *key))
             .filter(|&(distance, _)| distance <= SIGNAL_RADIUS)
             .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
@@ -448,6 +459,8 @@ fn signalled_junctions(
             Some((_, key)) => {
                 signalled.insert(key);
             }
+            // Like `traffic_signals=crossing`, a mid-block crossing is not a junction signal.
+            None if crossing => {}
             None if bounds.contains(point) => skipped.push((
                 element.label(),
                 "traffic signal not at a road junction".into(),

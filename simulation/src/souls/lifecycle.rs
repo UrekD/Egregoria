@@ -983,6 +983,23 @@ fn replace_truck(sim: &mut Simulation, company: CompanyID, old: VehicleID, new: 
         .find(|truck| **truck == old)
         .unwrap();
     *truck = new;
+    // Its driver keeps the job with the new truck, so removing the old one does not
+    // cancel whatever trip they are on now.
+    for &driver in company.workers.0.iter().chain(&company.comp.driver) {
+        let Some(work) = sim
+            .world
+            .humans
+            .get_mut(driver)
+            .and_then(|human| human.work.as_mut())
+        else {
+            continue;
+        };
+        if let WorkKind::Driver { truck, .. } = &mut work.kind {
+            if *truck == old {
+                *truck = new;
+            }
+        }
+    }
     sim.read::<ParCommandBuffer<VehicleEnt>>().kill(old);
 }
 

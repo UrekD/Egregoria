@@ -252,6 +252,8 @@ fn register_systems_and_resources() {
     register_resource_default::<CargoBook, Bincode>("cargo_book");
     register_resource_default::<DailyEconomyMetrics, Bincode>("daily_economy_metrics");
     register_lot_layout();
+    register_road_frontage();
+    register_cargo_progress();
 }
 
 // The layout lives on the map, which sizes lots as roads are built. A separate entry keeps the
@@ -265,6 +267,40 @@ fn register_lot_layout() {
             save: Box::new(|sim| Bincode::encode(&sim.map().lot_layout).unwrap()),
             load: Box::new(|sim, data| {
                 sim.map_mut().lot_layout = Bincode::decode(data)?;
+                Ok(())
+            }),
+        });
+    }
+}
+
+// Roads the importer left without lots. A separate entry keeps the map encoding unchanged,
+// and saves from before it treat every street as frontage.
+// Registered after "map" so loading overrides the decoded map's default.
+fn register_road_frontage() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "road_frontage",
+            optional: true,
+            save: Box::new(|sim| Bincode::encode(&sim.map().no_frontage).unwrap()),
+            load: Box::new(|sim, data| {
+                sim.map_mut().no_frontage = Bincode::decode(data)?;
+                Ok(())
+            }),
+        });
+    }
+}
+
+// Stall timers of loaded trucks. A separate entry keeps the cargo book encoding unchanged,
+// and saves from before it restart the timers at load.
+// Registered after "cargo_book" so loading overrides the decoded book's default.
+fn register_cargo_progress() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "cargo_progress",
+            optional: true,
+            save: Box::new(|sim| Bincode::encode(&sim.read::<CargoBook>().progress).unwrap()),
+            load: Box::new(|sim, data| {
+                sim.write::<CargoBook>().progress = Bincode::decode(data)?;
                 Ok(())
             }),
         });

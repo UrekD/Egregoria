@@ -426,3 +426,131 @@ fn osm_junctions_default_to_priority_and_keep_mapped_signals() {
         .iter()
         .any(|(id, reason)| id == "node/5103" && reason.contains("traffic signal")));
 }
+
+/// Crossroads of two residential streets, or a tee without the south leg, with a signal node
+/// tagged `signal` a little west of the junction (or on the junction node itself when `at_node`).
+fn signal_junction(
+    elements: &mut Vec<serde_json::Value>,
+    id: u64,
+    lat: f64,
+    tee: bool,
+    at_node: bool,
+    signal: serde_json::Value,
+) {
+    let (west, center, east) = (id * 10, id * 10 + 1, id * 10 + 2);
+    let (south, north, light) = (id * 10 + 3, id * 10 + 4, id * 10 + 5);
+    let point = |lat: f64, lon: f64| serde_json::json!({"lat":lat, "lon":lon});
+    let (signal_node, signal_lon) = if at_node {
+        (center, 14.142)
+    } else {
+        (light, 14.1418)
+    };
+    let mut through_nodes = vec![west];
+    let mut through_points = vec![point(lat, 14.14)];
+    if !at_node {
+        through_nodes.push(light);
+        through_points.push(point(lat, 14.1418));
+    }
+    through_nodes.extend([center, east]);
+    through_points.extend([point(lat, 14.142), point(lat, 14.144)]);
+    elements.push(serde_json::json!({
+        "type":"way", "id":id, "nodes":through_nodes, "geometry":through_points,
+        "tags":{"highway":"residential"}
+    }));
+    let (cross_nodes, cross_points) = if tee {
+        (
+            vec![center, north],
+            vec![point(lat, 14.142), point(lat + 0.0008, 14.142)],
+        )
+    } else {
+        (
+            vec![south, center, north],
+            vec![
+                point(lat - 0.0008, 14.142),
+                point(lat, 14.142),
+                point(lat + 0.0008, 14.142),
+            ],
+        )
+    };
+    elements.push(serde_json::json!({
+        "type":"way", "id":id + 1, "nodes":cross_nodes, "geometry":cross_points,
+        "tags":{"highway":"residential"}
+    }));
+    elements.push(serde_json::json!({
+        "type":"node", "id":signal_node, "lat":lat, "lon":signal_lon, "tags":signal
+    }));
+}
+
+#[test]
+fn finalsim_signal_tags_control_junctions_like_mapped_traffic_lights() {
+    use simulation::map::TrafficControl;
+    use simulation::{MapPreset, NewGameOptions, Simulation};
+
+    scenarios::ensure_repo_root_cwd();
+    simulation::init::init();
+    let mut elements = Vec::new();
+    let signals = serde_json::json!({"highway":"traffic_signals"});
+    let crossing = serde_json::json!({"highway":"traffic_signals", "crossing":"traffic_signals"});
+    let traffic_lights =
+        serde_json::json!({"highway":"traffic_signals", "traffic_signals":"traffic_lights"});
+    signal_junction(&mut elements, 700, 46.350, false, false, crossing.clone());
+    signal_junction(&mut elements, 710, 46.352, false, false, traffic_lights);
+    signal_junction(&mut elements, 720, 46.354, false, true, crossing);
+    signal_junction(&mut elements, 730, 46.356, true, false, signals);
+    let input = serde_json::json!({
+        "osm3s":{"timestamp_osm_base":"2020-01-01T00:00:00Z"},
+        "elements":elements,
+    });
+    let bytes = serde_json::to_vec(&input).unwrap();
+    let normalized = normalize(read_overpass(bytes.as_slice()).unwrap(), LESCE_BOUNDS).unwrap();
+    let options = NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: 16,
+        ..Default::default()
+    };
+    let (sim, network) = Simulation::from_imported_city(&normalized.city, &options).unwrap();
+    let map = sim.map();
+    let lights = |lat| {
+        let at = LESCE_BOUNDS.project(lat, 14.142);
+        let junction = normalized
+            .city
+            .junctions
+            .iter()
+            .find(|junction| junction.position.distance(at) < 1.0)
+            .unwrap();
+        let id = network.junctions[&junction.id];
+        let controls: Vec<TrafficControl> = map.intersections()[id]
+            .roads
+            .iter()
+            .flat_map(|&road| map.roads()[road].incoming_lanes_to(id).iter())
+            .filter(|(_, kind)| *kind == LaneKind::Driving)
+            .map(|&(lane, _)| map.lanes()[lane].control)
+            .collect();
+        assert!(controls.len() >= 3, "{lat}: {controls:?}");
+        if controls.iter().all(TrafficControl::is_light) {
+            true
+        } else {
+            assert!(
+                controls.iter().all(TrafficControl::is_always),
+                "{lat}: {controls:?}"
+            );
+            false
+        }
+    };
+    assert!(
+        !lights(46.350),
+        "a signalled pedestrian crossing on an approach leaves the junction under priority"
+    );
+    assert!(
+        lights(46.352),
+        "traffic_signals=traffic_lights signals the junction"
+    );
+    assert!(
+        lights(46.354),
+        "a signalled crossing on the junction node signals the junction"
+    );
+    assert!(
+        !lights(46.356),
+        "a signalled tee keeps priority: lights need four approaches"
+    );
+}

@@ -487,6 +487,7 @@ impl Simulation {
         }
         if self.map().walking_topology_generation != topology_generation {
             transit::on_topology_changed(self);
+            economy::cargo::on_topology_changed(self);
         }
         self.write::<Replay>()
             .record_batch(recording_start, steps_systems, Tick(self.get_tick()));
