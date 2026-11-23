@@ -64,7 +64,7 @@ Main menu with Continue/New Game/Load, new-game options (terrain preset, seed, m
 ### Milestone P5 — playtest feedback
 
 - **Households keep a pantry.** Needs drive multi-unit grocery baskets bought at one reachable bakery or store, carried home and eaten over time. Citizens also go to work daily, visit parks and shop after work.
-- **Freight moves on trucks.** Stock is tracked as on hand, reserved and in transit, and trucks leave with full 16-unit loads. The Small depot (64 units) and Large warehouse (256 units) buffer goods under Balanced, Reserve locally or Export surplus policies. Outside trade goes through the rail freight terminal, and a recipe waits for a truck already on its way instead of importing by rail.
+- **Freight moves on trucks.** Stock is tracked as on hand, reserved and in transit, and trucks leave with full 16-unit loads. The Small depot (64 units) and Large warehouse (256 units) buffer goods under Balanced, Reserve locally or Export surplus policies. Rail imports are physical: trains deliver to the freight station, station trucks carry the goods to the buyer (with a freight surcharge), and without a route there is no import. Zoned industry has its own trucks.
 - **Guided mode.** New Game offers Guided or Free build. Guided cities reach milestones at 100, 250 and 500 citizens with one-time grants and closed-day objectives. Locked cards show the population they need, and the Progression window tracks the next milestone.
 - **Zoning densities and plots.** All four zones have low, medium and high density in distinct shades. Zoning uses a 16 m stamp with 8 m detail and draws its grid while zoning. Plots are Varied (mixed 20/30/40 m) or Uniform, and lots never overlap.
 - **Overlays painted on the land.** Service reach, pollution, estimated land value and utility networks are drawn on the terrain. Each service shows its served area and a max-reach ring, and placing a service turns on its overlay. Service radii are at city scale, for example a 600 m school and a 900 m fire station.
@@ -72,7 +72,8 @@ Main menu with Continue/New Game/Load, new-game options (terrain preset, seed, m
 - **Toolbar and time controls.** The toolbar uses Cities: Skylines-style categories with shelves (Roads holds Straight and Curved) and remembers each category's last mode. Speeds run 8×, 20×, 50× and MAX (key 6). The per-frame simulation budget grows from 25 ms up to 8× to 60 ms at 50× and MAX, and the clock shows the achieved speed when it falls short. Right click cancels the tool or selection.
 - **Lesce at real scale.** The Lesce import opens with about 2.9k residents in 1.4k homes. It uses OpenStreetMap forests, priority signage at junctions, traffic lights where OSM maps signals and at arterial crossroads, and yielding roundabouts.
 - **Performance.** A P5 pass recovers the `perf_10k` throughput lost earlier in P5. <!-- TODO(release gate): re-measure `make perf-10k` on the test host and state ticks/s. -->
-<!-- TODO(release gate): add the 3× clock bullet if it has merged; re-check the Lesce opening numbers against the final import. -->
+- **Faster calendar.** The game clock runs 30 game seconds per real second, so a day takes 48 real minutes at 1×. Vehicles still move at real speed.
+- **Traffic fixes.** Cars with no driving route park and walk, cancelled drives park before the driver leaves, and carless errands may ride the bus.
 
 | Zoning densities | School placement | Road inspector |
 |---|---|---|
