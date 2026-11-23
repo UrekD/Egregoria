@@ -275,9 +275,10 @@ impl HouseholdStock {
         resources.write::<Market>().record_basket_failure(reason);
         match reason {
             BasketFailure::Throttled => {
-                // A seller takes one reservation per tick: retry within a real second or so.
-                self.next_shop =
-                    now + TICKS_PER_REALTIME_SECOND / 2 + self.phase % TICKS_PER_REALTIME_SECOND;
+                // A seller takes one reservation per tick: retry after 1.5–4.5 real seconds.
+                self.next_shop = now
+                    + 3 * TICKS_PER_REALTIME_SECOND / 2
+                    + self.phase % (3 * TICKS_PER_REALTIME_SECOND);
             }
             BasketFailure::SellerRemoved => {
                 self.next_shop = now + 5 * TICKS_PER_MINUTE + self.phase % (5 * TICKS_PER_MINUTE);
