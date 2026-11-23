@@ -48,6 +48,18 @@ pub struct Router {
     #[inspect(skip)]
     #[serde(skip)]
     transit_walks: Option<Box<[Option<ValidatedWalk>; 2]>>,
+    #[inspect(skip)]
+    #[serde(skip)]
+    drive_check: Option<Box<DriveCheck>>,
+}
+
+/// The last `can_drive` answer for a car waiting for a route. It holds until the car or its
+/// target moves or the map's lanes change.
+struct DriveCheck {
+    lanes: (u64, u64),
+    from: [u32; 3],
+    to: [u32; 3],
+    can_drive: bool,
 }
 
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
@@ -313,7 +325,8 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
             // loading a save or when its road lost its connection to the destination.
             if h.router.personal_car == Some(car)
                 && world.vehicles.get(car).is_some_and(|v| {
-                    v.it.is_wait_for_reroute().is_some() && !can_drive(map, v.trans.pos, obj)
+                    v.it.is_wait_for_reroute().is_some()
+                        && !h.router.can_drive_cached(map, v.trans.pos, obj)
                 })
             {
                 if h.router.target_dest.is_none() {
@@ -792,8 +805,15 @@ fn on_road(vehicle: &VehicleEnt) -> Option<Vec3> {
 
 pub(crate) type WalkingReach = crate::economy::WalkingComponents;
 
+#[cfg(test)]
+thread_local! {
+    static CAN_DRIVE_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Whether a vehicle route can exist between the driving lanes nearest to both positions.
 fn can_drive(map: &Map, from: Vec3, to: Vec3) -> bool {
+    #[cfg(test)]
+    CAN_DRIVE_CHECKS.set(CAN_DRIVE_CHECKS.get() + 1);
     let nearest = |pos| PathKind::Vehicle.nearest_lane(map, pos);
     match (nearest(from), nearest(to)) {
         // Same-lane trips may only need a local path.
@@ -846,11 +866,33 @@ impl Router {
             walk_only_pickup: false,
             replan_at_alight: false,
             transit_walks: None,
+            drive_check: None,
         }
     }
 
     pub fn cur_step(&self) -> Option<&RoutingStep> {
         self.cur_step.as_ref()
+    }
+
+    /// `can_drive` for a car that keeps waiting for a route, evaluated again only when its
+    /// inputs change: the nearest lanes and their reachability are fixed between lane edits.
+    fn can_drive_cached(&mut self, map: &Map, from: Vec3, to: Vec3) -> bool {
+        let key = DriveCheck {
+            lanes: (map.identity(), map.walking_topology_generation),
+            from: <[f32; 3]>::from(from).map(f32::to_bits),
+            to: <[f32; 3]>::from(to).map(f32::to_bits),
+            can_drive: false,
+        };
+        if let Some(check) = self
+            .drive_check
+            .as_deref()
+            .filter(|c| c.lanes == key.lanes && c.from == key.from && c.to == key.to)
+        {
+            return check.can_drive;
+        }
+        let can_drive = can_drive(map, from, to);
+        self.drive_check = Some(Box::new(DriveCheck { can_drive, ..key }));
+        can_drive
     }
 
     /// Legacy goods pickups and errands of car owners stay on foot. A household without a
@@ -2165,5 +2207,68 @@ mod tests {
             reserved,
             "the spot reserved near the destination was released"
         );
+    }
+
+    #[test]
+    fn perf6_a_waiting_driver_checks_its_road_again_only_after_a_lane_change() {
+        let (mut ctx, human, car, destination) = traffic1_stranded_driver();
+        // A connector between both roads makes the destination reachable by car.
+        ctx.build_roads(&[vec3(900.0, 100.0, 0.0), vec3(900.0, 400.0, 0.0)]);
+        let connector = ctx
+            .g
+            .map()
+            .roads()
+            .iter()
+            .find(|(_, road)| {
+                [road.points.first(), road.points.last()]
+                    == [vec3(900.0, 100.0, 0.3), vec3(900.0, 400.0, 0.3)]
+            })
+            .map(|(id, _)| id)
+            .unwrap();
+        let park_pos = destination - Vec3::Y * 6.0;
+        ctx.g.world.vehicles[car].it = Itinerary::wait_for_reroute(PathKind::Vehicle, park_pos);
+        ctx.g.world.humans[human].router.set_test_route(
+            Destination::Outside(destination),
+            vec![
+                RoutingStep::DriveTo(car, park_pos),
+                RoutingStep::Park(car, None),
+                RoutingStep::GetOutVehicle(car),
+                RoutingStep::WalkTo(destination),
+            ],
+        );
+        // The trip is planned again from scratch once its destination is reset.
+        let driving = |ctx: &TestCtx| {
+            let router = &ctx.g.world.humans[human].router;
+            matches!(router.cur_step, Some(RoutingStep::DriveTo(..))) && router.cur_dest.is_some()
+        };
+
+        CAN_DRIVE_CHECKS.set(0);
+        for _ in 0..5 {
+            let (world, resources) = ctx.g.world_res();
+            routing_update_system(world, resources);
+            assert!(driving(&ctx), "the car can still reach its spot");
+        }
+        assert_eq!(
+            CAN_DRIVE_CHECKS.get(),
+            1,
+            "the unchanged road is checked once"
+        );
+
+        ctx.g.map_mut().remove_road(connector);
+        let (world, resources) = ctx.g.world_res();
+        routing_update_system(world, resources);
+        assert_eq!(
+            CAN_DRIVE_CHECKS.get(),
+            2,
+            "a lane change checks the road again"
+        );
+        assert!(
+            !driving(&ctx),
+            "the drive that lost its road is planned again"
+        );
+        let (world, resources) = ctx.g.world_res();
+        routing_changed(world, resources, |_, _| None);
+        let steps = std::mem::take(&mut world.humans[human].router.steps);
+        assert_parks_and_walks(&steps, car, destination);
     }
 }
