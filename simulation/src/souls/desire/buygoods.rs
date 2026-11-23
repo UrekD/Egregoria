@@ -379,6 +379,10 @@ mod tests {
         let retail = ItemID::new("retail-goods");
 
         assert!(retail.prototype().optout_exttrade);
+        // Imports arrive by station truck, so stock the store's input directly.
+        test.g
+            .write::<Market>()
+            .produce(store_soul, ItemID::new("goods"), 2);
         finish_batch(&mut test, store);
         assert!(test.g.read::<Market>().capital(store_soul, retail) > 0);
         let car = test.g.get(human).unwrap().router.personal_car.unwrap();
@@ -515,15 +519,12 @@ mod tests {
         let pos = vec2(160.0, 145.0);
         let opening = test.g.read::<Government>().money;
         let construction = test.g.read::<Budget>().total(BudgetCategory::Construction);
-        let (import_cost, export_income) = {
+        let export_income = {
             let mut market = test.g.write::<Market>();
             market.buy(importer, pos, goods, 2);
             market.produce(exporter, services, 4);
             market.sell(exporter, pos, services, 4, 1);
-            (
-                -market.m(goods).ext_value * 2,
-                market.m(services).ext_value * 3,
-            )
+            market.m(services).ext_value * 3
         };
         let (world, resources) = test.g.world_res();
         assert!(world.freight_stations.is_empty());
@@ -543,9 +544,10 @@ mod tests {
         let (world, resources) = test.g.world_res();
         crate::economy::market_update(world, resources);
         let market = test.g.read::<Market>();
-        assert_eq!(market.capital(importer, goods), 2);
+        // Exports leave at once. Imports wait for a train and a station truck.
+        assert_eq!(market.capital(importer, goods), 0);
         assert_eq!(market.capital(exporter, services), 1);
-        assert!(market.inner()[&goods].buy_order(importer).is_none());
+        assert_eq!(market.inner()[&goods].buy_order(importer).unwrap().qty, 2);
         assert_eq!(
             market.inner()[&services].sell_order(exporter).unwrap().qty,
             1
@@ -554,12 +556,9 @@ mod tests {
         let construction_delta = budget.total(BudgetCategory::Construction) - construction;
         assert_eq!(
             i128::from(test.g.read::<Government>().money.inner()),
-            i128::from((opening + import_cost + export_income).inner()) + construction_delta,
+            i128::from((opening + export_income).inner()) + construction_delta,
         );
-        assert_eq!(
-            budget.total(BudgetCategory::TradeImport),
-            i128::from(import_cost.inner())
-        );
+        assert_eq!(budget.total(BudgetCategory::TradeImport), 0);
         assert_eq!(
             budget.total(BudgetCategory::TradeExport),
             i128::from(export_income.inner())

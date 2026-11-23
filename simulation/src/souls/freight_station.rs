@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 
-use geom::Transform;
+use geom::{Transform, Vec3};
 use prototypes::{FreightStationPrototypeID, GameTime, SECONDS_PER_REALTIME_SECOND};
 
+use crate::economy::cargo::{CargoBook, TRAIN_CAPACITY};
 use crate::map::{BuildingID, Map, PathKind};
 use crate::map_dynamic::{
     BuildingInfos, DispatchID, DispatchKind, DispatchQueryTarget, Dispatcher, Itinerary,
@@ -34,17 +35,16 @@ pub struct FreightStation {
     pub proto: FreightStationPrototypeID,
     pub building: BuildingID,
     pub trains: Vec<(TrainID, FreightTrainState)>,
+    /// Exported units waiting for a train.
     pub waiting_cargo: u32,
+    /// Imported units on order by rail. A train call unloads them into the
+    /// station's import stock, which its trucks carry to the buyers.
     pub wanted_cargo: u32,
 }
 
 impl FreightStation {
     pub(crate) fn accept_export(&mut self, units: u32) {
         self.waiting_cargo = self.waiting_cargo.saturating_add(units);
-    }
-
-    pub(crate) fn request_import(&mut self, units: u32) {
-        self.wanted_cargo = self.wanted_cargo.saturating_add(units);
     }
 }
 
@@ -82,10 +82,17 @@ pub fn freight_station_soul(
     Some(id)
 }
 
+/// Where a station's trains stop on its platform. The dispatcher looks for
+/// platform track within 50 m of it.
+pub fn train_stop(trans: &Transform) -> Vec3 {
+    trans.pos + trans.dir * 75.0 - trans.dir.perp_up() * 40.0
+}
+
 pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
     profiling::scope!("souls::freight_station_system");
     let cbuf = resources.read::<ParCommandBuffer<FreightStationEnt>>();
     let mut dispatch = resources.write::<Dispatcher>();
+    let mut cargo = resources.write::<CargoBook>();
     let map = resources.read::<Map>();
     let time = resources.read::<GameTime>();
     let tick = time.tick;
@@ -111,8 +118,10 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
                 FreightTrainState::Arriving => {
                     if itin.has_ended(0.0) {
                         *state = FreightTrainState::Loading;
-                        station.waiting_cargo = station.waiting_cargo.saturating_sub(100);
-                        station.wanted_cargo = station.wanted_cargo.saturating_sub(100);
+                        station.waiting_cargo =
+                            station.waiting_cargo.saturating_sub(TRAIN_CAPACITY);
+                        station.wanted_cargo =
+                            cargo.unload_train(SoulID::FreightStation(me), TRAIN_CAPACITY);
                         *itin = Itinerary::wait_until(time.timestamp + LOADING_SECONDS);
                     }
                 }
@@ -151,16 +160,23 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
             dispatch.free(v)
         }
 
-        // If enough goods are waiting, query for a train to take them to the external trading station
+        // Query for a train when enough exports wait or any import is on order.
         if station.trains.len() >= MAX_TRAINS_PER_STATION || map.external_train_stations.is_empty()
         {
             continue;
         }
-        if station.waiting_cargo.saturating_add(station.wanted_cargo) < 10 {
+        let ordered_by_rail = station.wanted_cargo
+            > station
+                .trains
+                .iter()
+                .filter(|(_, state)| matches!(state, FreightTrainState::Arriving))
+                .count() as u32
+                * TRAIN_CAPACITY;
+        if station.waiting_cargo < 10 && !ordered_by_rail {
             continue;
         }
 
-        let destination = pos.pos + pos.dir * 75.0 - pos.dir.perp_up() * 40.0;
+        let destination = train_stop(&pos);
 
         let Some(DispatchID::FreightTrain(trainid)) = dispatch.query(
             &map,

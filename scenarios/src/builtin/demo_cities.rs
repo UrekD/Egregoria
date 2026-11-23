@@ -309,22 +309,35 @@ fn connect_freight(ctx: &mut ScenarioCtx, grid_point: Vec2) -> Result<BuildingID
         }
     }
     let terminal = terminal.id;
-    let rail = map
-        .nearest_lane(outside.obb.center().z0(), LaneKind::Rail, None)
-        .and_then(|id| map.get(id))
-        .ok_or("outside trading has no freight train starting lane")?;
-    let train = WorldCommand::SpawnTrain {
-        wagons: std::iter::once(RollingStockID::new("locomotive"))
-            .chain([RollingStockID::new("freight-wagon"); 3])
-            .collect(),
-        lane: rail.id,
-        dist: rail.points.length() * 0.5,
-    };
     drop(map);
-    // The legacy startup train command is a no-op. Dispatch needs a real consist.
-    ctx.sim.apply_commands([&train]);
-    check_commands(&ctx.sim)?;
+    spawn_freight_train(&mut ctx.sim)?;
     Ok(terminal)
+}
+
+/// Puts a locomotive with three freight wagons on the outside trading track.
+/// The legacy startup train command is a no-op. Dispatch needs a real consist.
+pub(super) fn spawn_freight_train(sim: &mut Simulation) -> Result<(), String> {
+    let train = {
+        let map = sim.map();
+        let outside = map
+            .buildings()
+            .values()
+            .find(|building| building.kind == BuildingKind::ExternalTrading)
+            .ok_or("map is missing the external trading building")?;
+        let rail = map
+            .nearest_lane(outside.obb.center().z0(), LaneKind::Rail, None)
+            .and_then(|id| map.get(id))
+            .ok_or("outside trading has no freight train starting lane")?;
+        WorldCommand::SpawnTrain {
+            wagons: std::iter::once(RollingStockID::new("locomotive"))
+                .chain([RollingStockID::new("freight-wagon"); 3])
+                .collect(),
+            lane: rail.id,
+            dist: rail.points.length() * 0.5,
+        }
+    };
+    sim.apply_commands([&train]);
+    check_commands(sim)
 }
 
 type GridPoint = (u32, u32);

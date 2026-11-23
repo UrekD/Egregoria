@@ -5,6 +5,7 @@ use std::cell::RefCell;
 use geom::Vec2;
 use prototypes::{try_prototype, Power, Tick};
 
+use crate::economy::cargo::CargoBook;
 use crate::economy::Market;
 use crate::map::{BuildingID, BuildingKind};
 use crate::map_dynamic::{
@@ -19,6 +20,7 @@ use crate::souls::residence::{self, Requirement, Residences};
 use crate::transportation::Location;
 use crate::{HumanID, Simulation, SoulID};
 
+pub use crate::economy::cargo::ImportStatus;
 pub use crate::souls::goods_company::RecipeBlocker;
 pub use crate::souls::residence::PowerStatus;
 
@@ -44,6 +46,8 @@ pub enum BuildingBlocker {
     OnFire,
     NoWorkers,
     Recipe(RecipeBlocker),
+    /// A recipe input that no truck brings waits for an import, or has no import route.
+    Import(ImportStatus),
 }
 
 #[derive(Default)]
@@ -99,6 +103,9 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
                         blockers.extend(
                             recipe_blockers(recipe, owner, &market).map(BuildingBlocker::Recipe),
                         );
+                        if let Some(status) = sim.read::<CargoBook>().import_status(owner) {
+                            blockers.push(BuildingBlocker::Import(status));
+                        }
                     }
                 }
             } else {

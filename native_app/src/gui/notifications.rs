@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, VecDeque};
 
 use prototypes::{DayTime, GameTime, ItemID, Money, Tick};
 use simulation::diagnostics::elapsed_tick;
+use simulation::economy::cargo::{CargoBook, IMPORT_WAIT_WARNING};
 use simulation::economy::progression::{milestone_population, milestone_reward, ProgressionState};
 use simulation::economy::{
     balance::{DEMAND_INTERVAL_TICKS, MIN_DEMAND_POPULATION},
@@ -33,6 +34,8 @@ pub(crate) enum NotificationKind {
     SuspendedLine,
     HighUnemployment,
     StalledDemand,
+    NoImportRoute,
+    ImportsLagging,
 }
 
 impl NotificationKind {
@@ -50,13 +53,19 @@ impl NotificationKind {
             Self::SuspendedLine => "Suspended line",
             Self::HighUnemployment => "High unemployment",
             Self::StalledDemand => "Stalled demand",
+            Self::NoImportRoute => "No import route",
+            Self::ImportsLagging => "Imports lagging",
         }
     }
 
     pub(crate) fn severity(self) -> Severity {
         match self {
             Self::MilestoneReached | Self::StalledDemand => Severity::Info,
-            Self::BudgetDeficit | Self::SuspendedLine | Self::HighUnemployment => Severity::Warning,
+            Self::BudgetDeficit
+            | Self::SuspendedLine
+            | Self::HighUnemployment
+            | Self::NoImportRoute
+            | Self::ImportsLagging => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -481,6 +490,8 @@ impl NotificationSampler {
             );
         }
 
+        self.sample_imports(sim, now);
+
         for line in sim
             .read::<Transit>()
             .lines
@@ -505,6 +516,54 @@ impl NotificationSampler {
             );
         }
         self.sample_networks(sim, now);
+    }
+
+    /// Imports come by train and station truck. Businesses that cannot get
+    /// them, or wait too long, need a station or local industry.
+    fn sample_imports(&mut self, sim: &Simulation, now: SampleTime) {
+        use NotificationKind::*;
+
+        let problems = sim.read::<CargoBook>().import_problems(now.elapsed.0);
+        let businesses = |count: usize| {
+            if count == 1 {
+                ("1 business".to_owned(), "is", "was")
+            } else {
+                (format!("{count} businesses"), "are", "were")
+            }
+        };
+        if let Some(&first) = problems.no_route.first() {
+            let (who, is, was) = businesses(problems.no_route.len());
+            let tail = "no freight station with trains reaches them by road. \
+                        Connect a station or zone industry nearby";
+            self.condition(
+                NoImportRoute,
+                AlertSource::CityWide,
+                now,
+                AlertTarget::Building(first),
+                format!("{who} {is} short of inputs and {tail}"),
+                || format!("{who} {was} short of inputs and {tail}"),
+            );
+        }
+        if let Some(&first) = problems.slow.first() {
+            let (who, _, _) = businesses(problems.slow.len());
+            let hours = IMPORT_WAIT_WARNING / prototypes::TICKS_PER_HOUR;
+            self.condition(
+                ImportsLagging,
+                AlertSource::CityWide,
+                now,
+                AlertTarget::Building(first),
+                format!(
+                    "{who} waited over {hours} h for imported goods. \
+                     Zone industry to supply them locally"
+                ),
+                || {
+                    format!(
+                        "{who} waited over {hours} h for imported goods. \
+                         Zone industry to supply them locally"
+                    )
+                },
+            );
+        }
     }
 
     fn sample_networks(&mut self, sim: &Simulation, now: SampleTime) {
@@ -825,6 +884,28 @@ mod tests {
                 NotificationKind::NoWater,
                 NotificationKind::NoSewage,
             ]
+        );
+    }
+
+    #[test]
+    fn imports_a_short_business_without_an_import_route_alerts_the_advisor() {
+        let (mut test, _) = city();
+        // The startup terminal has no train, so nothing can be imported.
+        scenarios::builders::place_company(&mut test, "bakery", vec2(230.0, 150.0))
+            .expect("bakery site");
+        test.run_ticks(prototypes::TICKS_PER_MINUTE);
+        let mut sampler = NotificationSampler::default();
+        sampler.observe(&test.sim);
+        let alerts: Vec<_> = sampler
+            .drain()
+            .filter(|notice| notice.kind == NotificationKind::NoImportRoute)
+            .collect();
+        assert_eq!(alerts.len(), 1);
+        assert!(matches!(alerts[0].target, AlertTarget::Building(_)));
+        assert!(
+            alerts[0].text.contains("zone industry"),
+            "{}",
+            alerts[0].text
         );
     }
 

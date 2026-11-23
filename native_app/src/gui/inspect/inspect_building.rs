@@ -3,7 +3,8 @@ use goryak::{
     ProgressBar, VertScrollSize, Window,
 };
 use prototypes::{try_prototype, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID};
-use simulation::diagnostics::{building_diagnostics, BuildingBlocker, RecipeBlocker};
+use simulation::diagnostics::{building_diagnostics, BuildingBlocker, ImportStatus, RecipeBlocker};
+use simulation::economy::cargo::CargoBook;
 use simulation::economy::Market;
 use simulation::map::{Building, BuildingID, BuildingKind, Density, Zone, MAX_ZONE_AREA};
 use simulation::map_dynamic::{BuildingInfos, ElectricityFlow, UtilityStatus};
@@ -234,6 +235,12 @@ fn render_why(blockers: &[BuildingBlocker]) {
                     item.prototype().label
                 )
             }
+            BuildingBlocker::Import(ImportStatus::Waiting { .. }) => {
+                "Waiting for imported goods by train and truck".into()
+            }
+            BuildingBlocker::Import(ImportStatus::NoRoute) => {
+                "No import route · no freight station with trains reaches it by road".into()
+            }
         };
         textc(error(), description);
     }
@@ -256,8 +263,22 @@ fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         return;
     };
 
-    label(format!("Waiting cargo: {}", freight.f.waiting_cargo));
-    label(format!("Wanted cargo: {}", freight.f.wanted_cargo));
+    label(format!(
+        "Exports waiting for a train: {}",
+        freight.f.waiting_cargo
+    ));
+    label(format!(
+        "Imports on order by rail: {}",
+        freight.f.wanted_cargo
+    ));
+    let stock = sim.read::<CargoBook>().import_stock(b.id);
+    if !stock.is_empty() {
+        let lines: Vec<_> = stock
+            .iter()
+            .map(|(item, units)| format!("{units} {}", item.prototype().label))
+            .collect();
+        label(format!("Imports for delivery: {}", lines.join(", ")));
+    }
 
     fixed_spacer((0.0, 10.0));
     label("Trains:");

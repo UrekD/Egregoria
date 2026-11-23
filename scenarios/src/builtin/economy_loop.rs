@@ -1,12 +1,17 @@
-use geom::vec2;
-use prototypes::{CompanyKind, GameTime, GoodsCompanyID, ItemID, RecTimeInterval, TICKS_PER_HOUR};
+use geom::{vec2, vec3, Vec2};
+use prototypes::{
+    CompanyKind, GameTime, GoodsCompanyID, ItemID, RecTimeInterval, Tick, TICKS_PER_HOUR,
+};
 use simulation::economy::cargo::CargoBook;
 use simulation::economy::{DailyEconomyMetrics, Market, TripPurpose, TICKS_PER_BUDGET_DAY};
 use simulation::map::Density::{High, Low};
 use simulation::map::ZoneKind::{Commercial, Industrial, Office, Residential};
-use simulation::map::{BuildingID, BuildingKind};
-use simulation::map_dynamic::BuildingInfos;
+use simulation::map::{
+    BuildingID, BuildingKind, LaneKind, LanePatternBuilder, PathKind, ProjectFilter, ProjectKind,
+};
+use simulation::map_dynamic::{BuildingInfos, Itinerary};
 use simulation::souls::desire::{Work, WorkKind};
+use simulation::souls::freight_station::train_stop;
 use simulation::souls::goods_company::enable_growable_freight;
 use simulation::souls::human::spawn_human;
 use simulation::transportation::Location;
@@ -130,11 +135,16 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 }
             }
         }
-        // Stores stock goods from trucks. A live station fills a stockout that
-        // no truck is on its way to.
+        // Stores stock goods from trucks. A stockout that no truck is on its
+        // way to is imported by train and a station truck, with a lead time.
+        let elapsed = simulation::diagnostics::elapsed_tick(&ctx.sim).0;
+        let imports = ctx.sim.read::<CargoBook>().import_problems(elapsed);
         println!(
             "economy_loop store goods day {day}: {store_road} units by road, {store_station} \
-             station imports"
+             station imports; {} companies without an import route, {} waiting over 2 h \
+             for an import",
+            imports.no_route.len(),
+            imports.slow.len(),
         );
         total_loads += loads;
         total_load_units += load_units;
@@ -260,6 +270,7 @@ fn build_fixture(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let origin = vec2(704.0, 704.0);
     let spacing = 100.0;
     grid_city(ctx, origin, 7, 7, spacing);
+    // The town's station has no platform track, so trains cannot call there.
     place_freight_station(
         ctx,
         origin + vec2(450.0, 250.0),
@@ -289,6 +300,64 @@ fn build_fixture(ctx: &mut ScenarioCtx) -> Result<(), String> {
         }),
     );
 
+    // Imports come by train. A terminal east of the grid faces open ground, so
+    // it gets platform track to the outside line, and a train runs.
+    let terminal = place_freight_station(
+        ctx,
+        origin + vec2(650.0, 250.0),
+        prototypes::Size2D::new(40.0, 50.0),
+    )
+    .ok_or("could not place the economy loop rail terminal")?;
+    connect_platform(ctx, terminal)?;
+    super::demo_cities::spawn_freight_train(&mut ctx.sim)
+}
+
+/// Lays rail from the outside track's junction with the main line to the
+/// station's platform. The spur leaves the junction straight on, northwards,
+/// and curves west to the platform, since trains cannot take sharp turns.
+fn connect_platform(ctx: &mut ScenarioCtx, station: BuildingID) -> Result<(), String> {
+    let Some(SoulID::FreightStation(id)) = ctx.sim.read::<BuildingInfos>().owner(station) else {
+        return Err("the freight station has no owner".into());
+    };
+    let stop = train_stop(&ctx.sim.world().freight_stations[id].trans);
+    let command = {
+        let map = ctx.sim.map();
+        let ground = |xy: Vec2| {
+            let height = map.environment.height(xy).unwrap_or_default();
+            map.project(xy.z(height), 0.0, ProjectFilter::INTER)
+        };
+        let junction = map.project(vec3(3036.0, 222.0, 0.0), 10.0, ProjectFilter::INTER);
+        if !matches!(junction.kind, ProjectKind::Intersection(_)) {
+            return Err("the outside track has no junction to branch from".into());
+        }
+        WorldCommand::MapMakeConnection {
+            from: junction,
+            to: ground(stop.xy()),
+            inter: Some(vec2(3036.0, stop.y)),
+            pat: LanePatternBuilder::new().rail(true).build(),
+        }
+    };
+    ctx.sim.apply_commands([&command]);
+    let map = ctx.sim.map();
+    let platform = map
+        .nearest_lane(stop, LaneKind::Rail, Some(50.0))
+        .and_then(|lane| map.get(lane))
+        .ok_or("the freight station has no platform track")?;
+    let outside = map
+        .buildings()
+        .values()
+        .find(|building| building.kind == BuildingKind::ExternalTrading)
+        .ok_or("map is missing the external trading building")?
+        .obb
+        .center()
+        .z0();
+    let platform = platform.points.project(stop);
+    let tick = Tick(ctx.sim.get_tick());
+    for (from, to) in [(outside, platform), (platform, outside)] {
+        if Itinerary::route(tick, from, to, &map, PathKind::Rail).is_none() {
+            return Err("the platform track has no rail route to the outside".into());
+        }
+    }
     Ok(())
 }
 

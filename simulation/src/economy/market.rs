@@ -28,6 +28,9 @@ use crate::utils::resources::Resources;
 use crate::world::{CompanyEnt, CompanyID};
 use crate::{HumanID, SoulID, World};
 
+/// Freight by rail and station truck on an import, in percent of the item's value.
+pub const IMPORT_FREIGHT_PERCENT: i64 = 25;
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SellOrder {
     pub pos: Vec2,
@@ -147,6 +150,12 @@ impl SingleMarket {
     }
     pub fn buy_order(&self, soul: SoulID) -> Option<&BuyOrder> {
         self.buy_orders.get(&soul)
+    }
+    pub(crate) fn buy_orders(&self) -> impl Iterator<Item = (SoulID, &BuyOrder)> {
+        self.buy_orders.iter().map(|(&soul, order)| (soul, order))
+    }
+    pub fn optout_exttrade(&self) -> bool {
+        self.optout_exttrade
     }
     pub fn sell_order(&self, soul: SoulID) -> Option<&SellOrder> {
         self.sell_orders.get(&soul)
@@ -579,7 +588,7 @@ impl Market {
         if c >= qty as i32 {
             return;
         }
-        self.buy(soul, near, kind, qty - c as u32);
+        self.buy(soul, near, kind, (qty as i64 - i64::from(c)) as u32);
     }
 
     /// Stock owned by the agent. Direct grocery producers still hold basket
@@ -642,6 +651,25 @@ impl Market {
             qty: units as i32,
             kind: item,
             money_delta: self.markets[&item].ext_value * i64::from(units),
+        }
+    }
+
+    /// An import delivered by a station truck. The price adds freight by rail
+    /// and road to the item's value.
+    pub(crate) fn freight_import(
+        &self,
+        station: SoulID,
+        buyer: SoulID,
+        item: ItemID,
+        units: u32,
+    ) -> Trade {
+        let units_with_freight = i64::from(units) * (100 + IMPORT_FREIGHT_PERCENT);
+        Trade {
+            buyer: TradeTarget(buyer),
+            seller: TradeTarget(station),
+            qty: units as i32,
+            kind: item,
+            money_delta: -(self.markets[&item].ext_value * units_with_freight / 100),
         }
     }
 
@@ -1196,25 +1224,9 @@ impl Market {
                     Some(trade)
                 }));
 
-            // External trading
+            // External trading. Imports are physical: open buy orders wait for
+            // the cargo book to order them by rail and truck them from a station.
             if !*optout_exttrade {
-                buy_orders.retain(|&buyer, order| {
-                    let Some(ext @ SoulID::FreightStation(_)) = find_external(order.pos) else {
-                        return true;
-                    };
-                    let qty_buy = order.qty as i32;
-                    *capital.entry(buyer).or_default() += qty_buy;
-
-                    self.all_trades.push(Trade {
-                        buyer: TradeTarget(buyer),
-                        seller: TradeTarget(ext),
-                        qty: qty_buy,
-                        kind,
-                        money_delta: -(*ext_value * qty_buy as i64), // we buy from external so we pay
-                    });
-                    false
-                });
-
                 // Seller surplus goes to external trading
                 for (&seller, order) in sell_orders.iter_mut() {
                     let qty_sell = order.qty as i32 - order.stock as i32;
