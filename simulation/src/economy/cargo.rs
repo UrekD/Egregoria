@@ -2631,18 +2631,19 @@ mod lifecycle_tests {
     #[test]
     fn e2a_full_load_conserves_stock_and_unloads_once_after_a_real_drive() {
         let mut fixture = Fixture::new();
-        fixture.seed(25, 1);
+        let capacity = mine_policy().capacity;
+        fixture.seed(capacity as i32 + 9, 1);
         fixture.update(FREIGHT_MATCH_INTERVAL);
         let load = fixture.token();
         let (driver, truck, destination) =
             (fixture.driver, fixture.truck, fixture.destination.building);
-        assert_eq!(fixture.manifest_units(), 16);
+        assert_eq!(fixture.manifest_units(), capacity);
         assert_eq!(fixture.reserved(), 9);
         assert_eq!(fixture.hand(fixture.source), 0);
         assert_eq!(fixture.hand(fixture.destination), 1);
         assert_eq!(
             fixture.ctx.g.read::<CargoBook>().stock_for(destination)[&Fixture::coal()].incoming,
-            25
+            capacity + 9
         );
         assert!(complete_delivery(&mut fixture.ctx.g, load, driver, truck, destination).is_err());
 
@@ -2671,14 +2672,14 @@ mod lifecycle_tests {
                 break;
             }
         }
-        assert_eq!(fixture.hand(fixture.destination), 17);
+        assert_eq!(fixture.hand(fixture.destination), capacity as i32 + 1);
         assert_eq!(fixture.manifest_units(), 0);
         assert_eq!(fixture.reserved(), 9);
         assert_eq!(fixture.ctx.g.hashes(), resumed.hashes());
         assert!(complete_delivery(&mut fixture.ctx.g, load, driver, truck, destination).is_err());
         let metrics = fixture.ctx.g.read::<DailyEconomyMetrics>();
         assert_eq!(metrics.days[&0].loads, Some(1));
-        assert_eq!(metrics.days[&0].load_units, Some(16));
+        assert_eq!(metrics.days[&0].load_units, Some(u64::from(capacity)));
         assert_eq!(metrics.days[&0].late_loads, Some(0));
     }
 
@@ -3104,9 +3105,11 @@ mod lifecycle_tests {
     fn e2fix_demolition_writes_off_on_hand_queued_and_loaded_freight_once() {
         for destination_first in [true, false] {
             let mut f = Fixture::new();
-            f.seed(100, 1);
+            // More than the plant takes, so some stays on hand at the mine.
+            let seeded = plant_target(&f) + 16;
+            f.seed(seeded, 1);
             f.update(FREIGHT_MATCH_INTERVAL);
-            assert_eq!(f.manifest_units(), 16);
+            assert_eq!(f.manifest_units(), mine_policy().capacity);
             assert!(f.reserved() > 0 && f.hand(f.source) > 0);
             let (mut first, mut second) = (f.destination.building, f.source.building);
             if !destination_first {
@@ -3124,7 +3127,11 @@ mod lifecycle_tests {
                 .seller_losses()
                 .get(&Fixture::coal())
                 .copied();
-            assert_eq!(losses, Some(101), "destination first: {destination_first}");
+            assert_eq!(
+                losses,
+                Some(seeded as u64 + 1),
+                "destination first: {destination_first}"
+            );
         }
     }
 
@@ -3366,7 +3373,8 @@ mod lifecycle_tests {
             policy: WarehousePolicy::ExportSurplus,
         }]);
         let target = plant_target(&f);
-        f.seed(40, target);
+        // One truckload stays for the plant; the rest is surplus for the depot.
+        f.seed(mine_policy().capacity as i32 + 24, target);
         f.update(FREIGHT_MATCH_INTERVAL);
         let resumed: Simulation = Bincode::decode(&Bincode::encode(&f.ctx.g).unwrap()).unwrap();
         assert_eq!(f.ctx.g.hashes(), resumed.hashes());

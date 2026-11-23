@@ -286,14 +286,14 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 48,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
             consumption = {},
             production = {{"coal", 1}},
             duration = "100s",
-            storage_multiplier = 31, -- stage two truckloads for the morning shift
+            storage_multiplier = 31, -- stage the morning shift's first load
         },
         n_workers = 5,
         size = 20.0,
