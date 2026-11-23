@@ -185,7 +185,7 @@ impl engine::framework::State for State {
                 !ctx.egui.last_mouse_captured,
             );
             if ctx.keybind_mode {
-                self.uiw.write::<InputMap>().suppress_tool_shortcuts();
+                self.uiw.write::<InputMap>().suppress_shortcuts();
             }
             if world_interaction {
                 if !ctx.keybind_mode {

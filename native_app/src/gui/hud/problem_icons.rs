@@ -1,5 +1,5 @@
 use geom::{vec2, Intersect, Vec2, AABB};
-use goryak::{minrow, padxy, round_rect, secondary_container};
+use goryak::{minrow, padxy, pass_pointer, round_rect, secondary_container};
 use ordered_float::OrderedFloat;
 use simulation::map::{BuildingID, BuildingKind, ProjectFilter};
 use simulation::map_dynamic::{ElectricityFlow, UtilityFlow, UtilityStatus};
@@ -200,7 +200,18 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
 }
 
 /// Shows one badge. Returns whether a clickable badge was clicked.
+/// Badges float over the world, so world tools act through them: cancel, placement and
+/// bulldozing never see them as UI. Only the click target takes its left press.
 fn show_badge(badge: &Badge, count: usize, no_power_img: TextureId, clickable: bool) -> bool {
+    pass_pointer(|| show_badge_content(badge, count, no_power_img, clickable))
+}
+
+fn show_badge_content(
+    badge: &Badge,
+    count: usize,
+    no_power_img: TextureId,
+    clickable: bool,
+) -> bool {
     let fill = secondary_container().with_alpha(0.93);
     let content = || {
         padxy(4.0, 1.0, || {
@@ -416,6 +427,7 @@ mod tests {
             Dim2::pixels(100.0, 50.0),
             || clicked = show_badge(&badge, 1, TextureId::User(0), clickable),
         );
+        goryak::render_tooltip();
         ui.finish();
         let badge = ui.dom().get(reflowed.id).unwrap().children[0];
         let rect = ui.layout_dom().get(badge).unwrap().rect;
@@ -468,6 +480,53 @@ mod tests {
             badge_frame(&mut ui, kind, clickable);
             assert!(!ui.handle_event(button(MouseButton::One, true)));
             assert!(!ui.handle_event(button(MouseButton::One, false)));
+        }
+    }
+
+    #[test]
+    fn finalnative_badges_never_block_cancel_placement_or_bulldozing() {
+        use crate::inputmap::{Bindings, InputAction, InputMap};
+        use engine::{InputContext, MouseButton};
+
+        let right_button = |input_map: &mut InputMap, held: bool, screen: yakui::Vec2| {
+            let mut input = InputContext::default();
+            if held {
+                input.mouse.pressed.insert(MouseButton::Right);
+            }
+            input.mouse.screen = vec2(screen.x, screen.y);
+            input_map.prepare_frame(&input, true, true);
+        };
+        for (kind, clickable) in [
+            (BadgeKind::Fire, true),
+            (BadgeKind::Fire, false),
+            (BadgeKind::Blackout, true),
+            (BadgeKind::Blackout, false),
+            (BadgeKind::Disconnected, false),
+        ] {
+            let mut ui = yakui::Yakui::new();
+            let viewport = yakui::Vec2::new(200.0, 100.0);
+            ui.set_surface_size(viewport);
+            ui.set_unscaled_viewport(yakui::Rect::from_pos_size(yakui::Vec2::ZERO, viewport));
+            let (rect, _) = badge_frame(&mut ui, kind, clickable);
+            let centre = rect.pos() + rect.size() * 0.5;
+            ui.handle_event(yakui::event::Event::CursorMoved(Some(centre)));
+            badge_frame(&mut ui, kind, clickable);
+            ui.paint();
+
+            // Placement and bulldozing test the same point before acting.
+            assert!(
+                !goryak::pointer_over_ui(centre.x, centre.y),
+                "{kind:?} clickable={clickable} blocks the world"
+            );
+
+            let mut input_map = InputMap::default();
+            input_map.build_input_tree(&mut Bindings::default());
+            right_button(&mut input_map, true, centre);
+            right_button(&mut input_map, false, centre);
+            assert!(
+                input_map.just_act.contains(&InputAction::Cancel),
+                "{kind:?} clickable={clickable} swallowed a right click"
+            );
         }
     }
 

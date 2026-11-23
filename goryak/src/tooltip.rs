@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::cell::RefCell;
+use std::ops::Range;
 use std::rc::{Rc, Weak};
 use std::time::{Duration, Instant};
 
@@ -54,12 +55,31 @@ struct Hover {
     since: Instant,
 }
 
+/// Where the next triangle of a paint layer goes: a call and an index into its indices.
+type PaintCursor = (usize, usize);
+
+/// Triangles painted by a [`pass_pointer`] subtree.
+#[derive(Debug)]
+struct PassSpan {
+    layer: usize,
+    triangles: Range<PaintCursor>,
+    /// Layers the subtree opened, painted by it alone.
+    layers: Range<usize>,
+}
+
+impl PassSpan {
+    fn contains(&self, layer: usize, triangle: PaintCursor) -> bool {
+        self.layers.contains(&layer) || (self.layer == layer && self.triangles.contains(&triangle))
+    }
+}
+
 #[derive(Debug, Default)]
 struct TooltipState {
     pointer: Option<Vec2>,
     hovered: Option<Hover>,
     regions: Vec<HitRegion>,
     painted: Vec<PaintedRegion>,
+    passes: Vec<PassSpan>,
 }
 
 impl TooltipState {
@@ -118,6 +138,65 @@ pub fn pointer_over_ui(x: f32, y: f32) -> bool {
                 || state.painted.iter().any(|hit| hit.contains(point))
         })
     })
+}
+
+/// Draw content that floats over the world without capturing it, such as markers anchored
+/// to world positions. Neither its paint nor its widgets count for [`pointer_over_ui`], so
+/// world tools keep working under it. Its widgets still get their own events, and may sink
+/// them as usual.
+pub fn pass_pointer<T>(children: impl FnOnce() -> T) -> T {
+    let dom = context::dom();
+    let pass = dom.begin_widget::<PassPointer>(());
+    let response = children();
+    dom.end_widget::<PassPointer>(pass.id);
+    response
+}
+
+#[derive(Debug)]
+struct PassPointer;
+
+impl PassPointer {
+    fn cursor(paint: &PaintDom) -> Option<(usize, PaintCursor)> {
+        let layers = paint.layers();
+        let current = layers.current()?;
+        let layer = layers
+            .iter()
+            .position(|layer| std::ptr::eq(layer, current))?;
+        let call = current.calls.len().saturating_sub(1);
+        let index = current.calls.last().map_or(0, |call| call.indices.len());
+        Some((layer, (call, index)))
+    }
+}
+
+impl Widget for PassPointer {
+    type Props<'a> = ();
+    type Response = ();
+
+    fn new() -> Self {
+        Self
+    }
+
+    fn update(&mut self, _: Self::Props<'_>) {}
+
+    fn paint(&self, mut ctx: PaintContext<'_>) {
+        let start = Self::cursor(ctx.paint);
+        let first_layer = ctx.paint.layers().len();
+        let node = ctx.dom.get_current();
+        for &child in &node.children {
+            ctx.paint(child);
+        }
+        let end = Self::cursor(ctx.paint);
+        let span = match (start, end) {
+            (Some((layer, start)), Some((_, end))) => PassSpan {
+                layer,
+                triangles: start..end,
+                layers: first_layer..ctx.paint.layers().len(),
+            },
+            _ => return,
+        };
+        let state = ctx.dom.get_global_or_init(SharedState::default);
+        state.borrow_mut().passes.push(span);
+    }
 }
 
 /// Wrap a control with a hover label. Returns the control's own response.
@@ -249,9 +328,11 @@ impl Widget for TooltipLayer {
             ctx.dom.root(),
             &mut 0,
             0,
+            false,
             &mut state.regions,
         );
-        collect_painted_regions(ctx.paint, &mut state.painted);
+        let passes = std::mem::take(&mut state.passes);
+        collect_painted_regions(ctx.paint, &passes, &mut state.painted);
         LAST_PAINTED_UI.set(Rc::downgrade(&self.state));
         state.refresh_hover();
 
@@ -263,7 +344,11 @@ impl Widget for TooltipLayer {
     }
 }
 
-fn collect_painted_regions(paint: &PaintDom, regions: &mut Vec<PaintedRegion>) {
+fn collect_painted_regions(
+    paint: &PaintDom,
+    passes: &[PassSpan],
+    regions: &mut Vec<PaintedRegion>,
+) {
     regions.clear();
     let size = paint.surface_size();
     let surface = Rect::from_pos_size(Vec2::ZERO, size);
@@ -271,13 +356,16 @@ fn collect_painted_regions(paint: &PaintDom, regions: &mut Vec<PaintedRegion>) {
     // visible backgrounds count without filling clipped or unpainted gaps.
     // The tooltip itself has yet to paint, so it remains transparent to input.
     for (layer, painted_layer) in paint.layers().iter().enumerate() {
-        for call in painted_layer
-            .calls
-            .iter()
-            .filter(|call| call.pipeline == Pipeline::Main)
-        {
+        for (call_index, call) in painted_layer.calls.iter().enumerate() {
+            if call.pipeline != Pipeline::Main {
+                continue;
+            }
             let clip = call.clip.map_or(surface, |clip| surface.constrain(clip));
-            for triangle in call.indices.chunks_exact(3) {
+            for (triangle_index, triangle) in call.indices.chunks_exact(3).enumerate() {
+                let cursor = (call_index, triangle_index * 3);
+                if passes.iter().any(|pass| pass.contains(layer, cursor)) {
+                    continue;
+                }
                 let [a, b, c] = [triangle[0], triangle[1], triangle[2]]
                     .map(|index| call.vertices[usize::from(index)]);
                 if a.color.w <= 0.0 && b.color.w <= 0.0 && c.color.w <= 0.0 {
@@ -308,6 +396,7 @@ fn collect_regions(
     id: WidgetId,
     next_layer: &mut usize,
     mut layer: usize,
+    mut passes: bool,
     regions: &mut Vec<HitRegion>,
 ) {
     let Some(layout_node) = layout.get(id) else {
@@ -321,10 +410,12 @@ fn collect_regions(
         layer = *next_layer;
         *next_layer += 1;
     }
+    passes |= node.widget.is::<PassPointer>();
     let label = node.widget.downcast_ref::<TooltipHover>();
-    let takes_pointer = layout_node
-        .event_interest
-        .contains(EventInterest::MOUSE_INSIDE);
+    let takes_pointer = !passes
+        && layout_node
+            .event_interest
+            .contains(EventInterest::MOUSE_INSIDE);
     if (label.is_some() || takes_pointer) && layout_node.rect.size().min_element() > 0.0 {
         let mut rect = layout_node.rect;
         let mut clip = layout_node.clipped_by;
@@ -348,7 +439,7 @@ fn collect_regions(
         }
     }
     for &child in &node.children {
-        collect_regions(dom, layout, child, next_layer, layer, regions);
+        collect_regions(dom, layout, child, next_layer, layer, passes, regions);
     }
 }
 
@@ -480,5 +571,31 @@ mod layout_tests {
         ui.handle_event(Event::CursorMoved(Some(Vec2::new(15.0, 12.0))));
         assert!(frame(&mut ui, false));
         assert!(!frame(&mut ui, true));
+    }
+    #[test]
+    fn finalnative_pass_pointer_content_leaves_the_world_reachable() {
+        let mut ui = ui();
+        ui.start();
+        pass_pointer(|| {
+            crate::RoundRect::new(4.0)
+                .min_size(Vec2::splat(80.0))
+                .show();
+        });
+        yakui_widgets::offset(Vec2::new(0.0, 100.0), || {
+            pass_pointer(|| Button::styled("Marker").show());
+        });
+        // Ordinary UI painted afterwards over part of it still counts.
+        yakui_widgets::offset(Vec2::new(40.0, 0.0), || {
+            crate::RoundRect::new(4.0)
+                .min_size(Vec2::splat(80.0))
+                .show();
+        });
+        render_tooltip();
+        ui.finish();
+        ui.paint();
+        assert!(!pointer_over_ui(20.0, 20.0));
+        assert!(!pointer_over_ui(10.0, 110.0));
+        assert!(pointer_over_ui(60.0, 20.0));
+        assert!(pointer_over_ui(100.0, 20.0));
     }
 }

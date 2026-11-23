@@ -19,6 +19,7 @@ use crate::inputmap::{InputAction, InputMap};
 use crate::uiworld::UiWorld;
 use bulldozer::BulldozerState;
 use roadbuild::RoadBuildResource;
+use specialbuilding::SpecialBuildingResource;
 use terraforming::TerraformingResource;
 use zoning::ZoningState;
 
@@ -32,12 +33,10 @@ pub fn tool_shortcuts(uiworld: &UiWorld) {
         cancel_interaction(uiworld);
     }
     if bulldozer {
-        let mut tool = uiworld.write::<Tool>();
-        if *tool == Tool::Bulldozer {
-            uiworld.write::<BulldozerState>().reset_gesture();
-            *tool = Tool::Hand;
-        } else {
-            *tool = Tool::Bulldozer;
+        let was_bulldozer = *uiworld.read::<Tool>() == Tool::Bulldozer;
+        close_tool(uiworld);
+        if !was_bulldozer {
+            *uiworld.write::<Tool>() = Tool::Bulldozer;
         }
     }
 }
@@ -72,6 +71,7 @@ pub(crate) fn close_tool(uiw: &UiWorld) {
             uiw.write::<RoadBuildResource>().cancel_placement();
         }
         Tool::Bulldozer => uiw.write::<BulldozerState>().reset_gesture(),
+        Tool::SpecialBuilding => uiw.write::<SpecialBuildingResource>().opt = None,
         Tool::Terraforming => uiw.write::<TerraformingResource>().cancel_gesture(),
         Tool::Zoning => uiw.write::<ZoningState>().cancel_gesture(),
         _ => {}
@@ -423,6 +423,37 @@ mod ux2_tests {
         press(&uiw, InputAction::Bulldozer);
         assert!(*uiw.read::<Tool>() == Tool::Hand);
         assert!(uiw.read::<BulldozerState>().gesture_is_clear());
+    }
+
+    #[test]
+    fn finalnative_b_closes_the_previous_tool_like_the_toolbar() {
+        let uiw = playing_ui();
+        uiw.write::<ZoningState>().start_test_gesture();
+        *uiw.write::<Tool>() = Tool::Zoning;
+        press(&uiw, InputAction::Bulldozer);
+        assert!(*uiw.read::<Tool>() == Tool::Bulldozer);
+        assert!(uiw.read::<ZoningState>().gesture_is_clear());
+
+        // An armed building does not stay armed behind the bulldozer.
+        let school = prototypes::GoodsCompanyID::new("school");
+        *uiw.write::<Tool>() = Tool::SpecialBuilding;
+        uiw.write::<specialbuilding::SpecialBuildingResource>().opt =
+            Some(specialbuilding::SpecialBuildKind {
+                company: Some(school),
+                make: Box::new(|_| Vec::new()),
+                size: school.prototype().size,
+                asset: school.prototype().asset.clone(),
+                road_snap: true,
+            });
+        uiw.write::<PotentialCommands>()
+            .set(simulation::world_command::WorldCommand::MapLoadParis);
+        press(&uiw, InputAction::Bulldozer);
+        assert!(*uiw.read::<Tool>() == Tool::Bulldozer);
+        assert!(uiw
+            .read::<specialbuilding::SpecialBuildingResource>()
+            .opt
+            .is_none());
+        assert!(uiw.read::<PotentialCommands>().0.is_empty());
     }
 }
 

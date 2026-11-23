@@ -279,11 +279,11 @@ impl InputMap {
         self.require_fresh_pointer_press();
     }
 
-    /// While a keybind is being captured, the press being bound must not also act as B or
-    /// right-click, neither now nor when it is released after capture ends.
-    pub(crate) fn suppress_tool_shortcuts(&mut self) {
-        self.just_act.remove(&Cancel);
-        self.just_act.remove(&Bulldozer);
+    /// While a keybind is being captured, the press being bound must not also act as a
+    /// shortcut, neither now nor when it is released after capture ends.
+    pub(crate) fn suppress_shortcuts(&mut self) {
+        self.just_act.clear();
+        self.wheel = 0.0;
         self.cancel_origin = None;
     }
 
@@ -781,7 +781,7 @@ mod tests {
 
         // The press being bound is no shortcut, also once capture ends with it held.
         input_map.prepare_frame(&b, true, true);
-        input_map.suppress_tool_shortcuts();
+        input_map.suppress_shortcuts();
         assert!(!input_map.just_act.contains(&Bulldozer));
         input_map.prepare_frame(&b, true, true);
         assert!(!input_map.just_act.contains(&Bulldozer));
@@ -789,7 +789,7 @@ mod tests {
 
         // A right click bound on press does not cancel on its release.
         right_button(&mut input_map, true, Vec2::ZERO);
-        input_map.suppress_tool_shortcuts();
+        input_map.suppress_shortcuts();
         right_button(&mut input_map, true, Vec2::ZERO);
         right_button(&mut input_map, false, Vec2::ZERO);
         assert!(!input_map.just_act.contains(&Cancel));
@@ -801,6 +801,30 @@ mod tests {
         right_button(&mut input_map, true, Vec2::ZERO);
         right_button(&mut input_map, false, Vec2::ZERO);
         assert!(input_map.just_act.contains(&Cancel));
+    }
+
+    #[test]
+    fn finalnative_keybind_capture_swallows_every_shortcut() {
+        let mut bindings = Bindings::default();
+        let mut input_map = InputMap::default();
+        input_map.build_input_tree(&mut bindings);
+        for key in [K::c("H"), K::c("E"), K::c("T"), K::Escape] {
+            let mut input = InputContext::default();
+            input.keyboard.pressed.insert(key.clone());
+            input.mouse.wheel_delta = 1.0;
+            input_map.prepare_frame(&input, true, true);
+            assert!(!input_map.just_act.is_empty(), "{key:?} is no shortcut");
+            input_map.suppress_shortcuts();
+            assert!(
+                input_map.just_act.is_empty(),
+                "{key:?} acted during capture"
+            );
+            assert_eq!(input_map.wheel, 0.0, "{key:?} zoomed during capture");
+            // Held after capture ends, it still does not act.
+            input_map.prepare_frame(&input, true, true);
+            assert!(input_map.just_act.is_empty(), "{key:?} acted after capture");
+            input_map.prepare_frame(&InputContext::default(), true, true);
+        }
     }
 
     #[test]

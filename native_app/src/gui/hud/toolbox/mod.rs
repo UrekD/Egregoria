@@ -131,14 +131,7 @@ fn transport_properties(uiw: &UiWorld, sim: &Simulation, tool: Tool) {
                 })
                 .clicked
                 {
-                    let mut gui = uiw.write::<GuiState>();
-                    let panel = gui
-                        .windows
-                        .window_states()
-                        .find(|(name, _)| *name == "Transit");
-                    if let Some((_, open)) = panel {
-                        *open = !*open;
-                    }
+                    toggle_lines_panel(uiw);
                 }
             });
         });
@@ -147,6 +140,20 @@ fn transport_properties(uiw: &UiWorld, sim: &Simulation, tool: Tool) {
             _ => transit::properties(uiw, tool),
         }
     });
+}
+
+/// Show or hide the transit lines window. Returns false if there is no such window.
+fn toggle_lines_panel(uiw: &UiWorld) -> bool {
+    let mut gui = uiw.write::<GuiState>();
+    let panel = gui
+        .windows
+        .window_states()
+        .find(|(name, _)| *name == "Transit");
+    let Some((_, open)) = panel else {
+        return false;
+    };
+    *open = !*open;
+    true
 }
 
 /// A text button for a mode inside a shelf. Locked modes show when they unlock instead.
@@ -195,6 +202,11 @@ fn remember_current_mode(uiw: &UiWorld) {
 
 /// Switch to a mode, resetting the shelf state that belongs to the previous one.
 pub(crate) fn select_mode(uiw: &UiWorld, mode: ToolMode) {
+    // Straight and curved roads share the chained start point.
+    let tool = *uiw.read::<Tool>();
+    if tool != mode.tool() && !(tool.is_roadbuild() && mode.tool().is_roadbuild()) {
+        close_tool(uiw);
+    }
     if let Some(choice) = mode.building_tab() {
         let mut tab = uiw.write::<BuildingTab>();
         if *tab != choice {
@@ -229,11 +241,17 @@ fn open_category(uiw: &UiWorld, sim: &Simulation, category: ToolCategory) {
     select_mode(uiw, mode);
 }
 
-/// Apply a tool picked by name, as automation scripts do.
+/// Apply a tool picked by name, as automation scripts do. Locked modes stay locked, as
+/// they do on the toolbar.
 pub(crate) fn select_tool(uiw: &UiWorld, sim: &Simulation, selection: ToolSelection) {
     match selection {
         ToolSelection::Hand => close_tool(uiw),
         ToolSelection::Category(category) => open_category(uiw, sim, category),
+        ToolSelection::Mode(mode) if mode_lock(sim, mode).is_some() => {
+            let fallback = mode.category().modes()[0];
+            log::warn!("{} is locked, opening {}", mode.path(), fallback.path());
+            select_mode(uiw, fallback);
+        }
         ToolSelection::Mode(mode) => select_mode(uiw, mode),
     }
 }
@@ -461,6 +479,38 @@ mod toolbar1_tests {
     }
 
     #[test]
+    fn finalnative_switching_tools_closes_the_previous_one() {
+        use crate::gui::roadbuild::{BuildState, RoadBuildResource};
+        use simulation::map::MapProject;
+
+        let (uiw, sim) = fixture();
+        select_mode(&uiw, ToolMode::RoadStraight);
+        uiw.write::<RoadBuildResource>().build_state =
+            BuildState::Start(MapProject::ground(geom::Vec3::ZERO));
+        toggle_category(&uiw, &sim, ToolCategory::Zoning);
+        assert!(matches!(
+            uiw.read::<RoadBuildResource>().build_state,
+            BuildState::Hover
+        ));
+
+        // Arm a school, leave for the bulldozer and come back: it is no longer armed.
+        toggle_category(&uiw, &sim, ToolCategory::Services);
+        let school = prototypes::GoodsCompanyID::new("school");
+        uiw.write::<SpecialBuildingResource>().opt =
+            Some(crate::gui::specialbuilding::SpecialBuildKind {
+                company: Some(school),
+                make: Box::new(|_| Vec::new()),
+                size: school.prototype().size,
+                asset: school.prototype().asset.clone(),
+                road_snap: true,
+            });
+        select_mode(&uiw, ToolMode::Bulldoze);
+        toggle_category(&uiw, &sim, ToolCategory::Services);
+        assert!(tool(&uiw) == Tool::SpecialBuilding);
+        assert!(uiw.read::<SpecialBuildingResource>().opt.is_none());
+    }
+
+    #[test]
     fn toolbar1_guided_bus_line_stays_locked() {
         let (uiw, sim) = fixture();
         sim.write::<ProgressionState>().mode = ProgressionMode::Guided;
@@ -471,11 +521,31 @@ mod toolbar1_tests {
         toggle_category(&uiw, &sim, ToolCategory::Transport);
         assert!(tool(&uiw) == Tool::TransitStop);
 
+        // Scripts cannot pick it either.
+        select_tool(&uiw, &sim, ToolSelection::Mode(ToolMode::BusLine));
+        assert!(tool(&uiw) == Tool::TransitStop);
+
         sim.write::<ProgressionState>().mode = ProgressionMode::FreeBuild;
         close_tool(&uiw);
         uiw.write::<ToolbarMemory>().remember(ToolMode::BusLine);
         toggle_category(&uiw, &sim, ToolCategory::Transport);
         assert!(tool(&uiw) == Tool::TransitLine);
+    }
+
+    #[test]
+    fn finalnative_lines_panel_button_finds_its_window() {
+        let (uiw, _) = fixture();
+        let open = |uiw: &UiWorld| {
+            uiw.write::<GuiState>()
+                .windows
+                .window_states()
+                .any(|(name, open)| name == "Transit" && *open)
+        };
+        assert!(!open(&uiw));
+        assert!(toggle_lines_panel(&uiw));
+        assert!(open(&uiw));
+        assert!(toggle_lines_panel(&uiw));
+        assert!(!open(&uiw));
     }
 
     #[test]
