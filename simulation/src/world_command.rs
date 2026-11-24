@@ -18,8 +18,8 @@ use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
     Building, BuildingID, BuildingKind, Density, Environment, IntersectionID, LaneID, LaneKind,
     LanePattern, LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, ProjectKind,
-    RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, Zone,
-    ZoneCellCoord, ZoneGrid, ZoneKind, ZonePaintError, MAX_WATER_BATCH_WORK,
+    RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, WaterTopologyWork,
+    Zone, ZoneCellCoord, ZoneGrid, ZoneKind, ZonePaintError, MAX_WATER_BATCH_WORK,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
@@ -1181,7 +1181,7 @@ impl WorldCommand {
         let mut work = map
             .environment()
             .has_water_configuration()
-            .then_some(MAX_WATER_BATCH_WORK);
+            .then(WaterTopologyWork::new);
         let (from, to) = map
             .prepare_connection(from, to, inter, pattern, work.as_mut())
             .map_err(Rejection::water_connection_error)?;
@@ -1207,7 +1207,10 @@ impl WorldCommand {
         }
 
         let mut map = sim.map_mut();
-        let mut water_work = map.environment().has_water_configuration().then_some(MAX_WATER_BATCH_WORK);
+        let mut water_work = map
+            .environment()
+            .has_water_configuration()
+            .then(WaterTopologyWork::new);
         let mut endpoints: Vec<_> = projects
             .iter()
             .map(|&project| project.kind.check_valid(&map).then_some(project))
@@ -1224,11 +1227,16 @@ impl WorldCommand {
                 let Some(project) = endpoints[index] else { return Ok(None) };
                 if let ProjectKind::Road(id) = project.kind {
                     if splits.contains_key(&id) {
-                        return map.reproject_split_endpoint(id, project.pos, &splits, water_work.as_mut());
+                        return map.reproject_split_endpoint(
+                            id,
+                            project.pos,
+                            &splits,
+                            water_work.as_mut().map(|work| &mut work.remaining),
+                        );
                     }
                 }
                 if let Some(work) = &mut water_work {
-                    map.resolve_water_connection_endpoint(project, work)
+                    map.resolve_water_connection_endpoint(project, &mut work.remaining)
                 } else {
                     Ok(map.resolve_connection_endpoint(project))
                 }
@@ -1248,16 +1256,21 @@ impl WorldCommand {
                 record_link(index, Err(Rejection::InvalidConnection));
                 continue;
             }
-            if let Some(work) = &mut water_work {
-                if let Err(error) = map.preflight_water_connection(fromproj, toproj, interpoint, pat, work) {
-                    let reason = Rejection::water_connection_error(error);
-                    record_link(index, Err(reason));
-                    if reason == Rejection::WaterWorkLimit && *work == 0 {
-                        break;
+            let profile_samples = if let Some(work) = &mut water_work {
+                match map.preflight_water_connection(fromproj, toproj, interpoint, pat, work) {
+                    Ok(samples) => samples,
+                    Err(error) => {
+                        let reason = Rejection::water_connection_error(error);
+                        record_link(index, Err(reason));
+                        if reason == Rejection::WaterWorkLimit && work.remaining == 0 {
+                            break;
+                        }
+                        continue;
                     }
-                    continue;
                 }
-            }
+            } else {
+                0
+            };
             let cost = match Self::affordable_cost(
                 sim,
                 Government::connection_cost(fromproj.pos, toproj.pos, pat),
@@ -1268,6 +1281,9 @@ impl WorldCommand {
                     continue;
                 }
             };
+            if let Some(work) = &mut water_work {
+                work.spend_profile_samples(profile_samples);
+            }
             let connected = map.connect_projects(fromproj, toproj, interpoint, pat);
             for split in connected.splits.into_iter().flatten() {
                 splits.insert(split.original, split);
@@ -1291,7 +1307,7 @@ impl WorldCommand {
             if map
                 .merge_shallow_junction(junction, water_work.as_mut())
                 .is_err()
-                && water_work == Some(0)
+                && water_work.as_ref().is_some_and(|work| work.remaining == 0)
             {
                 break;
             }

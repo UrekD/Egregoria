@@ -534,16 +534,21 @@ impl Road {
             }
         }
 
-        // merge interface points that overlap
-        let mut i = 0;
-        while i + 3 < interface.len() {
-            if interface[i + 1] >= interface[i + 2] {
-                interface.remove(i + 2);
-                interface.remove(i + 1);
+        // Compact overlapping spans in place. Both endpoints are ordered, so
+        // an overlap extends the last retained span to the current end.
+        let mut merged = 0;
+        for i in (0..interface.len()).step_by(2) {
+            let start = interface[i];
+            let end = interface[i + 1];
+            if merged > 0 && interface[merged - 1] >= start {
+                interface[merged - 1] = end;
             } else {
-                i += 2;
+                interface[merged] = start;
+                interface[merged + 1] = end;
+                merged += 2;
             }
         }
+        interface.truncate(merged);
 
         let mut slope_was_too_steep = false;
 

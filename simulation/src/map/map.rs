@@ -538,7 +538,7 @@ impl Map {
         let mut work = self
             .environment
             .has_water_configuration()
-            .then_some(super::MAX_WATER_BATCH_WORK);
+            .then(WaterTopologyWork::new);
         let (from, to) = self
             .prepare_connection(from, to, interpoint, pattern, work.as_mut())
             .ok()?;
@@ -564,15 +564,15 @@ impl Map {
         to: MapProject,
         elbow: Option<Vec2>,
         pattern: &LanePattern,
-        work: Option<&mut usize>,
+        work: Option<&mut WaterTopologyWork>,
     ) -> Result<(ConnectionEndpoint, ConnectionEndpoint), WaterEditError> {
         let mut work = work;
         let endpoints = if let Some(work) = work.as_deref_mut() {
             if !wet_lane_count_fits(pattern) {
                 return Err(WaterEditError::Limit);
             }
-            self.resolve_water_connection_endpoint(from, work)?
-                .zip(self.resolve_water_connection_endpoint(to, work)?)
+            self.resolve_water_connection_endpoint(from, &mut work.remaining)?
+                .zip(self.resolve_water_connection_endpoint(to, &mut work.remaining)?)
         } else {
             self.resolve_connection_endpoint(from)
                 .zip(self.resolve_connection_endpoint(to))
@@ -582,7 +582,8 @@ impl Map {
             return Err(WaterEditError::InvalidInput);
         }
         if let Some(work) = work {
-            self.preflight_water_connection(from, to, elbow, pattern, work)?;
+            let samples = self.preflight_water_connection(from, to, elbow, pattern, work)?;
+            work.spend_profile_samples(samples);
         }
         Ok((from, to))
     }
@@ -595,8 +596,8 @@ impl Map {
         to: ConnectionEndpoint,
         elbow: Option<Vec2>,
         pattern: &LanePattern,
-        remaining: &mut usize,
-    ) -> Result<(), WaterEditError> {
+        work: &mut WaterTopologyWork,
+    ) -> Result<usize, WaterEditError> {
         let map_bounds = self.environment.bounds();
         let a = from.pos.xy();
         let b = to.pos.xy();
@@ -631,7 +632,36 @@ impl Map {
                 _ => {}
             }
         }
-        self.reserve_water_topology(junctions, &splits, lanes, length, remaining)?;
+        // The Hermite curve's control polygon is at most the chord plus 2/3
+        // of the sum of the tangent lengths. Each tangent is its elbow leg
+        // scaled by 1/sqrt(2), as in RoadSegmentKind::from_elbow.
+        let path_length = if elbow.is_some() {
+            a.distance(b) + length * (2.0 * std::f32::consts::FRAC_1_SQRT_2 / 3.0)
+        } else {
+            length
+        };
+        // Initial profiling, lane creation, and invalidation of the two endpoints.
+        let mut profile_samples = profile_sample_bound(path_length).saturating_mul(4);
+        let invalidations = 2 + 3 * splits.len();
+        for &id in &splits {
+            let road = &self.roads[id];
+            if !road.elevated_span() {
+                // Splitting partitions the horizontal path. Allow for rounding
+                // and endpoint samples of both pieces, plus their lane creation.
+                let samples = profile_sample_bound(road.length()).saturating_add(5);
+                profile_samples = profile_samples
+                    .saturating_add(samples.saturating_mul(1 + invalidations));
+            }
+        }
+        let profile_samples = self.reserve_water_topology(
+            junctions,
+            &splits,
+            lanes,
+            length,
+            profile_samples,
+            invalidations,
+            work,
+        )?;
         let radius = pattern.width() + 16.0;
         let envelope = bounds.expand(radius);
         let clipped = envelope.intersection(map_bounds);
@@ -641,7 +671,7 @@ impl Map {
         if tests > 2_000_000 {
             return Err(WaterEditError::Limit);
         }
-        spend_water_work(remaining, tests + length.ceil() as usize)?;
+        spend_water_work(&mut work.remaining, tests + length.ceil() as usize)?;
         let footprint = if elbow.is_some() {
             geom::Polygon(envelope.points().to_vec())
         } else {
@@ -665,7 +695,7 @@ impl Map {
                 }
             }
         }
-        Ok(())
+        Ok(profile_samples)
     }
 
     pub(crate) fn make_resolved_connection(
@@ -674,7 +704,7 @@ impl Map {
         to: ConnectionEndpoint,
         interpoint: Option<Vec2>,
         pattern: &LanePattern,
-        mut work: Option<&mut usize>,
+        mut work: Option<&mut WaterTopologyWork>,
     ) -> (IntersectionID, RoadID) {
         let connected = self.connect_projects(from, to, interpoint, pattern);
         let _ = self.merge_shallow_junction(connected.src, work.as_deref_mut());
@@ -729,7 +759,7 @@ impl Map {
     pub(crate) fn merge_shallow_junction(
         &mut self,
         id: IntersectionID,
-        work: Option<&mut usize>,
+        work: Option<&mut WaterTopologyWork>,
     ) -> Result<(), WaterEditError> {
         let Some(intersection) = self.intersections.get(id) else {
             return Ok(());
@@ -743,13 +773,19 @@ impl Map {
                     let a = &self.roads[first];
                     let b = &self.roads[second];
                     let junctions = BTreeSet::from([a.src, a.dst, b.src, b.dst]);
-                    self.reserve_water_topology(
+                    let length = a.length() + b.length();
+                    // The merged road reuses the old path and may profile it when
+                    // creating lanes and invalidating each of the two far ends.
+                    let samples = self.reserve_water_topology(
                         junctions,
                         &[first, second],
                         a.n_lanes(),
-                        a.length() + b.length(),
+                        length,
+                        profile_sample_bound(length).saturating_mul(3),
+                        2,
                         work,
                     )?;
+                    work.spend_profile_samples(samples);
                 }
                 self.merge_road(first, second);
             }
@@ -763,8 +799,12 @@ impl Map {
         replaced_roads: &[RoadID],
         new_lanes: usize,
         new_length: f32,
-        work: &mut usize,
-    ) -> Result<(), WaterEditError> {
+        mut profile_samples: usize,
+        invalidations: usize,
+        work: &mut WaterTopologyWork,
+    ) -> Result<usize, WaterEditError> {
+        work.check_profile_samples(profile_samples)?;
+        let remaining = &mut work.remaining;
         // Splits can invalidate three junctions each, followed by both ends of
         // the new link. Imported roads also rebuild lanes across the first ring
         // and turns at the far ends of those roads.
@@ -776,14 +816,14 @@ impl Map {
                 .saturating_mul(lanes + 1)
                 .saturating_mul(INVALIDATIONS)
         };
-        spend_water_work(work, profile(new_length * 3.0, 0, new_lanes))?;
+        spend_water_work(remaining, profile(new_length * 3.0, 0, new_lanes))?;
         let mut added_lanes = new_lanes;
         for &id in replaced_roads {
             let road = &self.roads[id];
             added_lanes = added_lanes.saturating_add(road.n_lanes());
-            spend_water_work(work, self.lots.len())?;
+            spend_water_work(remaining, self.lots.len())?;
             spend_water_work(
-                work,
+                remaining,
                 road.connected_buildings
                     .len()
                     .saturating_mul(road.points().len() + 2),
@@ -793,16 +833,33 @@ impl Map {
         let mut roads = BTreeSet::new();
         let mut parallel = BTreeMap::<_, usize>::new();
         let mut inspected = BTreeSet::new();
-        for _ in 0..2 {
+        for ring in 0..2 {
             let mut neighbors = BTreeSet::new();
             for &id in &junctions {
                 if !inspected.insert(id) {
                     continue;
                 }
                 for &road in &self.intersections[id].roads {
-                    spend_water_work(work, 1)?;
-                    roads.insert(road);
-                    if let Some(other) = self.roads[road].other_end(id) {
+                    spend_water_work(remaining, 1)?;
+                    let r = &self.roads[road];
+                    // A legacy invalidation profiles only its own roads. Imported
+                    // topology may also profile a road incident to a neighbor.
+                    if roads.insert(road)
+                        && (ring == 0 || self.import_lane_reserve)
+                        && !replaced_roads.contains(&road)
+                        && !r.elevated_span()
+                    {
+                        let rebuilds = if !self.import_lane_reserve && invalidations == 2 {
+                            usize::from(junctions.contains(&r.src))
+                                + usize::from(junctions.contains(&r.dst))
+                        } else {
+                            invalidations
+                        };
+                        let samples = profile_sample_bound(r.length());
+                        profile_samples = profile_samples
+                            .saturating_add(samples.saturating_mul(rebuilds));
+                    }
+                    if let Some(other) = r.other_end(id) {
                         neighbors.insert(other);
                         *parallel.entry((id, other)).or_default() += 1;
                     }
@@ -819,7 +876,7 @@ impl Map {
                 return Err(WaterEditError::Limit);
             }
             spend_water_work(
-                work,
+                remaining,
                 profile(road.length(), road.points().len(), road.n_lanes()).saturating_add(
                     (road.length().ceil() as usize)
                         .saturating_mul(profile_repeats)
@@ -836,7 +893,7 @@ impl Map {
         for id in junctions {
             let mut lanes = added_lanes;
             for &road in &self.intersections[id].roads {
-                spend_water_work(work, 1)?;
+                spend_water_work(remaining, 1)?;
                 lanes = lanes.saturating_add(self.roads[road].n_lanes());
             }
             let roundabout = self.intersections[id]
@@ -850,7 +907,7 @@ impl Map {
             }
             let samples = (roundabout.abs() / 10.0).ceil() as usize + 1;
             spend_water_work(
-                work,
+                remaining,
                 lanes
                     .saturating_mul(lanes)
                     .saturating_mul(samples)
@@ -858,8 +915,10 @@ impl Map {
             )?;
         }
         // New ground endpoints and the two possible split junctions.
-        reserve_turns(added_lanes.saturating_mul(2), work)?;
-        reserve_turns(added_lanes.saturating_mul(2), work)
+        reserve_turns(added_lanes.saturating_mul(2), remaining)?;
+        reserve_turns(added_lanes.saturating_mul(2), remaining)?;
+        work.check_profile_samples(profile_samples)?;
+        Ok(profile_samples)
     }
 
     pub fn update_zone(&mut self, id: BuildingID, zone: Zone) -> Option<()> {
@@ -2252,6 +2311,38 @@ impl Map {
 }
 
 const MAX_WET_LINK_LANES: usize = 32;
+const MAX_WATER_PROFILE_SAMPLES: usize = 65_536;
+
+pub(crate) struct WaterTopologyWork {
+    pub(crate) remaining: usize,
+    profile_samples: usize,
+}
+
+impl WaterTopologyWork {
+    pub(crate) fn new() -> Self {
+        Self {
+            remaining: super::MAX_WATER_BATCH_WORK,
+            profile_samples: MAX_WATER_PROFILE_SAMPLES,
+        }
+    }
+
+    fn check_profile_samples(&self, samples: usize) -> Result<(), WaterEditError> {
+        if samples > self.profile_samples {
+            return Err(WaterEditError::Limit);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn spend_profile_samples(&mut self, samples: usize) {
+        self.profile_samples -= samples;
+    }
+}
+
+fn profile_sample_bound(length: f32) -> usize {
+    // The profiler samples once per meter plus the endpoints. The lane clip
+    // can extend a road shorter than two meters to a two-meter interface.
+    (length.ceil() as usize).max(2).saturating_add(2)
+}
 
 pub(crate) fn wet_lane_count_fits(pattern: &LanePattern) -> bool {
     pattern

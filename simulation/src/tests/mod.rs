@@ -704,3 +704,128 @@ fn w0_water_indexed_links_share_the_topology_budget() {
     assert_eq!(sim.map().roads().len(), accepted);
     assert_eq!(sim.read::<Replay>().command_count(), 1);
 }
+
+#[test]
+fn w0_water_rejects_alternating_terrain_links_before_profiling() {
+    use crate::map::{Environment, LaneKind, LanePattern, Map, MapProject};
+    use crate::world_command::{CommandOutcomes, Rejection};
+    use geom::{vec2, AABB};
+
+    init_test_simulation();
+    let mut terrain = Environment::new(80, 1);
+    terrain.terrain_apply(
+        AABB::new_ll_ur(vec2(0.0, 0.0), vec2(40_959.0, 511.0)),
+        |point| if (point.x as u32 / 16) % 2 == 0 { 12.0 } else { 0.0 },
+    );
+    terrain.set_sea_level(Some(-100)).unwrap();
+    assert!(!terrain.strict_water_siting());
+
+    let projects = [128.0, 384.0]
+        .into_iter()
+        .flat_map(|y| {
+            [32.0, 40_928.0].map(|x| {
+                let pos = vec2(x, y);
+                MapProject::ground(pos.z(terrain.height(pos).unwrap()))
+            })
+        })
+        .collect();
+    let pattern = LanePattern {
+        lanes_forward: vec![(LaneKind::Driving, 10.0)],
+        lanes_backward: vec![],
+    };
+    let links = vec![(0, 1, None, pattern.clone()), (2, 3, None, pattern)];
+    let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+    let mut map = Map::empty();
+    assert!(map.install_environment(terrain));
+    *sim.write::<Map>() = map;
+
+    sim.apply_commands([&WorldCommand::MapMakeMultipleConnections(projects, links)]);
+    let outcomes = sim.read::<CommandOutcomes>();
+    let limit = Err(("MapMakeMultipleConnections", Rejection::WaterWorkLimit));
+    assert_eq!(outcomes.link_outcomes(0), &[(0, limit), (1, limit)]);
+    assert!(sim.map().roads().is_empty());
+    assert!(sim.map().intersections().is_empty());
+}
+
+#[test]
+fn w0_water_profile_samples_are_shared_by_indexed_links() {
+    use crate::map::{LaneKind, LanePattern, MapProject, WaterEdit};
+    use crate::world_command::{CommandOutcomes, Rejection};
+    use geom::vec3;
+
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(20, 0).unwrap();
+    sim.edit_water(WaterEdit::SetSeaLevel {
+        level_dm: Some(-100),
+    })
+    .unwrap();
+    let pattern = LanePattern {
+        lanes_forward: vec![(LaneKind::Driving, 10.0)],
+        lanes_backward: vec![],
+    };
+    let projects = [(128.0, 9_000.0), (256.0, 9_000.0), (384.0, 100.0)]
+        .into_iter()
+        .flat_map(|(y, length)| [32.0, 32.0 + length].map(|x| MapProject::ground(vec3(x, y, 0.0))))
+        .collect();
+    let links = (0..3)
+        .map(|i| (i * 2, i * 2 + 1, None, pattern.clone()))
+        .collect();
+
+    sim.apply_commands([&WorldCommand::MapMakeMultipleConnections(projects, links)]);
+    assert_eq!(
+        sim.read::<CommandOutcomes>().link_outcomes(0),
+        &[
+            (0, Ok(())),
+            (1, Err(("MapMakeMultipleConnections", Rejection::WaterWorkLimit))),
+            (2, Ok(())),
+        ]
+    );
+    assert_eq!(sim.map().roads().len(), 2);
+}
+
+#[test]
+fn w0_water_profile_samples_include_split_road_rebuilds() {
+    use crate::map::{Environment, LaneKind, LanePattern, Map, MapProject, WaterEdit, ROAD_Z_OFFSET};
+    use crate::world_command::{CommandOutcomes, Rejection};
+    use geom::vec3;
+
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+    let mut terrain = Environment::new(80, 1);
+    terrain.terrain_apply(terrain.bounds(), |_| 0.0);
+    let mut map = Map::empty();
+    assert!(map.install_environment(terrain));
+    let pattern = LanePattern {
+        lanes_forward: vec![(LaneKind::Driving, 10.0)],
+        lanes_backward: vec![],
+    };
+    let (_, road) = map
+        .make_connection(
+            MapProject::ground(vec3(32.0, 256.0, 0.0)),
+            MapProject::ground(vec3(40_928.0, 256.0, 0.0)),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    *sim.write::<Map>() = map;
+    sim.edit_water(WaterEdit::SetSeaLevel {
+        level_dm: Some(-100),
+    })
+    .unwrap();
+    let before = sim.hashes()["map"];
+
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject {
+            pos: vec3(20_480.0, 256.0, ROAD_Z_OFFSET),
+            kind: road.into(),
+        },
+        to: MapProject::ground(vec3(20_480.0, 384.0, 0.0)),
+        inter: None,
+        pat: pattern,
+    }]);
+    assert_eq!(
+        sim.read::<CommandOutcomes>().rejections_for(0),
+        [("MapMakeConnection", Rejection::WaterWorkLimit)]
+    );
+    assert_eq!(sim.hashes()["map"], before);
+}
