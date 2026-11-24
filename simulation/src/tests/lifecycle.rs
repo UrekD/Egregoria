@@ -1435,12 +1435,18 @@ fn l1_activity_skips_idle_slots_and_keeps_reused_ids_in_storage_order() {
     test.g.world.collect_active(HumanWork::Outside, &mut ids);
     assert!(ids.is_empty(), "residents inside buildings must be skipped");
 
-    test.g
-        .world
-        .edit_human(second, |h| h.location = Location::Outside);
+    for id in [first, second] {
+        test.g
+            .world
+            .edit_human(id, |h| h.location = Location::Outside);
+    }
+    test.g.world.collect_active(HumanWork::Outside, &mut ids);
+    assert_eq!(ids, [first, second]);
     crate::souls::lifecycle::despawn_human(&mut test.g, first);
     test.g.apply_commands([]);
     assert!(test.g.get(first).is_none());
+    test.g.world.collect_active(HumanWork::Outside, &mut ids);
+    assert_eq!(ids, [second]);
     let replacement = spawn_human(&mut test.g, first_home).unwrap();
     assert_ne!(replacement, first);
     assert_eq!(
@@ -1448,11 +1454,259 @@ fn l1_activity_skips_idle_slots_and_keeps_reused_ids_in_storage_order() {
         first.data().as_ffi() as u32
     );
     assert!(test.g.world.edit_human(first, |_| ()).is_none());
+    test.g.world.collect_active(HumanWork::Outside, &mut ids);
+    assert_eq!(ids, [second]);
     test.g
         .world
         .edit_human(replacement, |h| h.location = Location::Outside);
     test.g.world.collect_active(HumanWork::Outside, &mut ids);
     assert_eq!(ids, [replacement, second]);
+}
+
+#[test]
+fn l1_activity_split_edit_refreshes_after_callback_forgets_its_argument() {
+    use crate::souls::human::spawn_human;
+    use crate::HumanWork;
+
+    let mut test = TestCtx::new();
+    street(&test);
+    let home = test.build_house_near(vec2(150.0, 125.0));
+    let resident = spawn_human(&mut test.g, home).unwrap();
+    let mut ids = Vec::new();
+    test.g.world.collect_active(HumanWork::Outside, &mut ids);
+    assert!(ids.is_empty());
+
+    #[allow(unused_mut, forgetting_references)]
+    test.g.world.humans.edit_each_split(|_, mut human| {
+        human.location = Location::Outside;
+        std::mem::forget(human);
+    });
+
+    test.g.world.collect_active(HumanWork::Outside, &mut ids);
+    assert_eq!(ids, [resident]);
+}
+
+#[test]
+fn l1_activity_ordered_roster_basket_and_route_boundaries() {
+    use crate::economy::BasketRequest;
+    use crate::economy::{market_update, TripPurpose};
+    use crate::map_dynamic::{itinerary_update, routing_changed_system, routing_update_system};
+    use crate::souls::goods_company::{company_soul, company_system};
+    use crate::souls::household::BasketId;
+    use crate::souls::human::{spawn_human, update_decision_system};
+    use crate::souls::residence::Residences;
+    use crate::utils::scheduler::drain_commands;
+    use crate::{HumanEnt, HumanWork, ParCommandBuffer, INITIAL_TICK};
+    use prototypes::TICKS_PER_HOUR;
+
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
+    let road = test
+        .g
+        .map()
+        .roads()
+        .iter()
+        .find(|(_, road)| road.points().first().y == 250.0)
+        .unwrap()
+        .0;
+    let home = test.build_house_near(vec2(120.0, 275.0));
+    test.g
+        .write::<Residences>()
+        .by_building
+        .get_mut(&home)
+        .unwrap()
+        .capacity = 12;
+    let place = |sim: &mut Simulation, name, at| {
+        let proto = GoodsCompanyID::new(name);
+        let building = sim
+            .map_mut()
+            .build_special_building(
+                &OBB::new(at, geom::Vec2::X, 20.0, 20.0),
+                BuildingKind::GoodsCompany(proto),
+                proto.prototype().bgen,
+                None,
+                Some(road),
+            )
+            .unwrap();
+        sim.write::<BuildingInfos>().insert(building);
+        let SoulID::GoodsCompany(company) = company_soul(sim, building, proto).unwrap() else {
+            unreachable!();
+        };
+        (building, company)
+    };
+    let (shop, donor) = place(&mut test.g, "commercial-l1", vec2(90.0, 225.0));
+    let workers: Vec<_> = (0..12)
+        .map(|_| spawn_human(&mut test.g, home).unwrap())
+        .collect();
+    let sim = &mut test.g;
+    let (world, resources) = sim.world_res();
+    market_update(world, resources);
+    company_system(world, resources);
+    assert_eq!(sim.world.companies[donor].workers.0, workers);
+    drain_commands(sim);
+
+    let (school, recipient) = place(sim, "school", vec2(355.0, 225.0));
+    for &id in &workers {
+        let human = &mut sim.world.humans[id];
+        let destination = Destination::Building(shop);
+        human.decision.kind = HumanDecisionKind::GoTo(destination);
+        human.decision.wait = 100;
+        human.router.go_to_for(destination, TripPurpose::Work);
+    }
+    *sim.write::<GameTime>() = GameTime::new(Tick(INITIAL_TICK + TICKS_PER_HOUR + 1));
+    let mut trace = Vec::new();
+    let mut record = |phase, sim: &Simulation| trace.push((phase, common::hash_u64(sim.hashes())));
+    let (world, resources) = sim.world_res();
+    market_update(world, resources);
+    let moved = sim.world.companies[recipient].workers.0[0];
+    assert_eq!(moved, workers[0]);
+    let remaining: Vec<_> = workers
+        .iter()
+        .copied()
+        .filter(|&worker| worker != moved)
+        .collect();
+    assert_eq!(sim.world.companies[donor].workers.0, remaining);
+    assert_eq!(
+        sim.get(moved).unwrap().router.target_dest,
+        Some(Destination::Building(school))
+    );
+    record("market and roster transfer", sim);
+
+    // Two purchases are ready for collection during the same decision pass.
+    // Leave their route planning and the subsequent building exits to the real systems.
+    let buyers = [remaining[0], remaining[1]];
+    let seller = SoulID::GoodsCompany(donor);
+    let item = ItemID::new("retail-goods");
+    let pos = sim.map().get(shop).unwrap().door_pos.xy();
+    {
+        let mut market = sim.write::<Market>();
+        market.produce(seller, item, 5);
+        market.sell_all(seller, pos, item, 0);
+    }
+    let now = crate::map_dynamic::transit::elapsed_ticks(&sim.resources).0;
+    let mut expected_pickups = Vec::new();
+    for ((id, units), reserved_at) in buyers.into_iter().zip([2, 3]).zip([now - 1, now]) {
+        let request = BasketRequest {
+            fallback: units,
+            ..Default::default()
+        };
+        let (basket, _) = sim
+            .write::<Market>()
+            .reserve_basket(id, pos, 600.0, request, reserved_at, |_| Some(shop))
+            .unwrap();
+        let basket_id = basket.id;
+        expected_pickups.push(basket_id);
+        let (world, resources) = sim.world_res();
+        let human = &mut world.humans[id];
+        resources
+            .write::<BuildingInfos>()
+            .get_out(home, SoulID::Human(id));
+        resources
+            .write::<BuildingInfos>()
+            .get_in(shop, SoulID::Human(id));
+        human.location = Location::Building(shop);
+        human.decision.kind = HumanDecisionKind::PickupBasket(basket_id);
+        human.decision.wait = 0;
+        assert!(human.household.reserve(basket, resources));
+    }
+    sim.insert(Vec::<BasketId>::new());
+    let (world, resources) = sim.world_res();
+    update_decision_system(world, resources);
+    assert_eq!(*sim.read::<Vec<BasketId>>(), expected_pickups);
+    for (id, units) in buyers.into_iter().zip([2, 3]) {
+        assert_eq!(sim.get(id).unwrap().household.carried[&item], units);
+        sim.world.humans[id].decision.wait = 0;
+    }
+    record("basket collected in decision pass", sim);
+    let (world, resources) = sim.world_res();
+    update_decision_system(world, resources);
+    let (world, resources) = sim.world_res();
+    let mut candidates = Vec::new();
+    world.collect_active(HumanWork::RouteChanged, &mut candidates);
+    assert_eq!(candidates, workers);
+    routing_changed_system(world, resources);
+    record("routes planned", sim);
+    let (world, resources) = sim.world_res();
+    world.collect_active(HumanWork::RouteStep, &mut candidates);
+    assert_eq!(
+        candidates
+            .iter()
+            .copied()
+            .filter(|id| buyers.contains(id))
+            .collect::<Vec<_>>(),
+        buyers
+    );
+    routing_update_system(world, resources);
+    record("route step before callbacks", sim);
+    for id in buyers {
+        let human = sim.get(id).unwrap();
+        assert_eq!(human.location, Location::Outside);
+        assert!(human.collider.is_none());
+    }
+    assert!(ParCommandBuffer::<HumanEnt>::apply(sim));
+    assert!(buyers
+        .into_iter()
+        .all(|id| sim.get(id).unwrap().collider.is_some()));
+    record("ordered walking callbacks", sim);
+    drain_commands(sim);
+    let (world, resources) = sim.world_res();
+    itinerary_update(world, resources);
+    record("itinerary phase", sim);
+
+    // Captured by running this fixture with the serial phase implementations
+    // from the base on which L1 was cherry-picked.
+    assert_eq!(
+        trace,
+        [
+            ("market and roster transfer", 15932243669541147862),
+            ("basket collected in decision pass", 4499298847199328628),
+            ("routes planned", 15333327391016120918),
+            ("route step before callbacks", 7653428565931336012),
+            ("ordered walking callbacks", 397648402682092739),
+            ("itinerary phase", 397648402682092739),
+        ]
+    );
+}
+
+#[test]
+fn l1_activity_cancelled_driver_wakes_when_only_the_car_changes() {
+    use crate::map_dynamic::{routing_changed_system, Router};
+    use crate::souls::human::spawn_human;
+    use crate::HumanWork;
+
+    let mut test = TestCtx::new_fast();
+    street(&test);
+    let home = test.build_house_near(vec2(150.0, 125.0));
+    let driver = spawn_human(&mut test.g, home).unwrap();
+    let car = spawn_parked_vehicle(&mut test.g, VehicleKind::Car, vec3(175.0, 100.0, 0.0)).unwrap();
+    let (world, resources) = test.g.world_res();
+    world.humans[driver].router = Router::new(Some(car));
+    world.humans[driver].location = Location::Vehicle(car);
+    resources
+        .write::<BuildingInfos>()
+        .get_out(home, SoulID::Human(driver));
+    *resources.write::<GameTime>() = GameTime::new(Tick(crate::INITIAL_TICK + 1));
+    let mut candidates = Vec::new();
+    world.collect_active(HumanWork::RouteChanged, &mut candidates);
+    assert_eq!(candidates, [driver]);
+    routing_changed_system(world, resources);
+    let before = Bincode::encode(test.g.get(driver).unwrap()).unwrap();
+
+    unpark(&mut test.g, car);
+    assert_eq!(
+        Bincode::encode(test.g.get(driver).unwrap()).unwrap(),
+        before
+    );
+    let (world, resources) = test.g.world_res();
+    world.collect_active(HumanWork::RouteChanged, &mut candidates);
+    assert_eq!(candidates, [driver]);
+    routing_changed_system(world, resources);
+    world.collect_active(HumanWork::RouteStep, &mut candidates);
+    assert_eq!(candidates, [driver]);
+    assert_ne!(
+        Bincode::encode(test.g.get(driver).unwrap()).unwrap(),
+        before
+    );
 }
 
 fn l1_assert_phase_hashes(indexed: &mut Simulation, full_scan: &mut Simulation) {

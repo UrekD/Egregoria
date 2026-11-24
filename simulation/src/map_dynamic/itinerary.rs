@@ -1004,7 +1004,9 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         };
     world.humans.edit_active(HumanWork::Itinerary, |_, human| {
         let kind = (human.location == Location::Outside).then_some(RoadUserKind::Pedestrian);
-        update(&mut human.it, &mut human.trans.pos, human.speed.0, kind);
+        let speed = human.speed.0;
+        let (itinerary, pos) = human.itinerary_mut();
+        update(itinerary, pos, speed, kind);
     });
     for train in world.trains.values_mut() {
         update(&mut train.it, &mut train.trans.pos, train.speed.0, None);

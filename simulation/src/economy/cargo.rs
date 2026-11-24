@@ -4271,6 +4271,87 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn l1_activity_queued_late_cargo_refusal_then_driver_recovery() {
+        use crate::map_dynamic::{Destination, RoutingStep};
+        use crate::souls::human::{update_decision_system, HumanDecisionKind};
+        use crate::HumanWork;
+
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let load = f.token();
+        let due = f.ctx.g.read::<CargoBook>().loads[&load].due_at;
+        f.at_tick(due + 1);
+        let sim = &mut f.ctx.g;
+        let (driver, truck, destination) = (f.driver, f.truck, f.destination.building);
+        let pos = sim.get(truck).unwrap().trans.pos;
+        let human = &mut sim.world.humans[driver];
+        human.location = Location::Vehicle(truck);
+        human.router.use_vehicle(Some(truck));
+        human
+            .router
+            .set_test_route(Destination::Outside(pos), vec![RoutingStep::WalkTo(pos)]);
+        human.it = Itinerary::simple(vec![pos]);
+        human.decision.kind = HumanDecisionKind::DeliverLoad { destination, load };
+        human.decision.wait = 0;
+
+        let mut trace = Vec::new();
+        let mut record = |sim: &Simulation| trace.push(common::hash_u64(sim.hashes()));
+        let (world, resources) = sim.world_res();
+        let mut candidates = Vec::new();
+        world.collect_active(HumanWork::Itinerary, &mut candidates);
+        assert_eq!(candidates, [driver]);
+        update_decision_system(world, resources);
+        assert!(sim.read::<CargoBook>().manifest_for(truck).is_some());
+        record(sim);
+
+        // The delivery callback refuses the unload and queues a second human
+        // callback. Inspect the state before that recovery is allowed to run.
+        assert!(ParCommandBuffer::<HumanEnt>::apply(sim));
+        assert!(sim.read::<CargoBook>().manifest_for(truck).is_none());
+        assert_eq!(sim.get(driver).unwrap().location, Location::Vehicle(truck));
+        assert_eq!(
+            sim.read::<Market>().capital(f.source.soul, Fixture::coal()),
+            16
+        );
+        record(sim);
+
+        assert!(ParCommandBuffer::<HumanEnt>::apply(sim));
+        let human = sim.get(driver).unwrap();
+        assert_eq!(human.location, Location::Outside);
+        assert_eq!(human.router.target_dest, None);
+        assert!(human.collider.is_some());
+        assert!(human.it.is_inert());
+        let book = sim.read::<CargoBook>();
+        let day = book.freight_day(0).unwrap();
+        assert_eq!(
+            (
+                day.refused_unloads,
+                day.cancelled_loads,
+                day.delivered_loads
+            ),
+            (1, 1, 0)
+        );
+        drop(book);
+        sim.world
+            .collect_active(HumanWork::Itinerary, &mut candidates);
+        assert!(candidates.is_empty());
+        sim.world
+            .collect_active(HumanWork::Outside, &mut candidates);
+        assert_eq!(candidates, [driver]);
+        record(sim);
+        // Decision, unload refusal, then queued recovery on the pre-L1 serial systems.
+        assert_eq!(
+            trace,
+            [
+                17887467045716917398,
+                7880503562002474480,
+                13459859128024714272
+            ]
+        );
+    }
+
+    #[test]
     fn e2fix_reachability_runs_no_route_search_and_tracks_topology() {
         let mut f = Fixture::new();
         f.seed(100, 1);

@@ -344,6 +344,12 @@ impl HumanEnt {
                     true
                 } else if arrived {
                     self.household.collect(id, now, resources);
+                    #[cfg(test)]
+                    if self.household.reservation.is_none() {
+                        if let Ok(mut pickups) = resources.try_write::<Vec<BasketId>>() {
+                            pickups.push(id);
+                        }
+                    }
                     self.router.walk_only_pickup = false;
                     self.stop_route(resources);
                     self.decision.kind = HumanDecisionKind::DepositAtHome;
@@ -485,9 +491,9 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
         walk_distances: Default::default(),
     };
 
-    world.humans.edit_each_split(|id, mut h| {
+    world.humans.edit_each_split(|id, h| {
         if h.goods.has_pickup() {
-            BuyGoods::update_pickup(&mut h, time, map, vehicles, resources);
+            BuyGoods::update_pickup(h, time, map, vehicles, resources);
         }
         if h.decision_mut().wait_one_tick() {
             let pickup_interrupted = matches!(h.decision.kind, HumanDecisionKind::PickupBasket(_))
@@ -499,7 +505,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
                 return;
             }
         }
-        let h: &mut HumanEnt = &mut h;
+        let h: &mut HumanEnt = h;
         h.household.refresh_needs(
             now,
             h.location == Location::Building(h.home.house),

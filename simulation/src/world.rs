@@ -192,13 +192,19 @@ pub enum HumanWork {
 impl HumanWork {
     const COUNT: usize = 5;
 
+    const ITINERARY_MEMBERSHIP: u8 =
+        (1 << Self::Pedestrian as usize) | (1 << Self::Itinerary as usize);
+
+    fn movement_membership(human: &HumanEnt) -> u8 {
+        (u8::from(!human.pedestrian.is_still(human)) << Self::Pedestrian as usize)
+            | (u8::from(!human.it.is_inert()) << Self::Itinerary as usize)
+    }
+
     fn membership(human: &HumanEnt) -> u8 {
-        let mut mask = 0;
-        mask |= u8::from(!human.pedestrian.is_still(human)) << Self::Pedestrian as usize;
+        let mut mask = Self::movement_membership(human);
         mask |= u8::from(human.router.needs_route_change(&human.location))
             << Self::RouteChanged as usize;
         mask |= u8::from(human.router.has_route_step()) << Self::RouteStep as usize;
-        mask |= u8::from(!human.it.is_inert()) << Self::Itinerary as usize;
         mask |= u8::from(matches!(
             human.location,
             Location::Outside | Location::Transit(_)
@@ -208,9 +214,66 @@ impl HumanWork {
 }
 
 #[derive(Default)]
+struct ActivitySet {
+    words: Vec<u64>,
+    // One bit per nonempty word. This skips vacant slot ranges in order.
+    nonempty: Vec<u64>,
+}
+
+fn set_bits(mut word: u64) -> impl Iterator<Item = usize> {
+    std::iter::from_fn(move || {
+        if word == 0 {
+            return None;
+        }
+        let bit = word.trailing_zeros() as usize;
+        word &= word - 1;
+        Some(bit)
+    })
+}
+
+impl ActivitySet {
+    fn toggle(&mut self, slot: usize) {
+        let block = slot / 64;
+        let group = block / 64;
+        if block >= self.words.len() {
+            self.words.resize(block + 1, 0);
+        }
+        let word = &mut self.words[block];
+        let was_empty = *word == 0;
+        *word ^= 1 << (slot % 64);
+        if was_empty != (*word == 0) {
+            if group >= self.nonempty.len() {
+                self.nonempty.resize(group + 1, 0);
+            }
+            self.nonempty[group] ^= 1 << (block % 64);
+            while self.nonempty.last() == Some(&0) {
+                self.nonempty.pop();
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        self.words.clear();
+        self.nonempty.clear();
+    }
+
+    fn active_slots(&self) -> impl Iterator<Item = usize> + '_ {
+        self.nonempty
+            .iter()
+            .enumerate()
+            .flat_map(move |(group, &blocks)| {
+                set_bits(blocks).flat_map(move |bit| {
+                    let block = group * 64 + bit;
+                    set_bits(self.words[block]).map(move |offset| block * 64 + offset)
+                })
+            })
+    }
+}
+
+#[derive(Default)]
 struct HumanActivity {
     slots: Vec<(HumanID, u8)>,
-    sets: [Vec<u64>; HumanWork::COUNT],
+    sets: [ActivitySet; HumanWork::COUNT],
     scratch: [Vec<HumanID>; HumanWork::COUNT],
     dirty: bool,
     #[cfg(test)]
@@ -228,9 +291,6 @@ impl HumanActivity {
         let slot = Self::slot(id);
         if slot >= self.slots.len() {
             self.slots.resize(slot + 1, (HumanID::null(), 0));
-            for set in &mut self.sets {
-                set.resize(slot / 64 + 1, 0);
-            }
         }
         self.slots[slot].0 = id;
         self.set(slot, HumanWork::membership(human));
@@ -238,21 +298,31 @@ impl HumanActivity {
 
     fn set(&mut self, slot: usize, mask: u8) {
         let previous = &mut self.slots[slot].1;
-        let mut changed = *previous ^ mask;
+        let changed = *previous ^ mask;
         if changed == 0 {
             return;
         }
         *previous = mask;
-        while changed != 0 {
-            let kind = changed.trailing_zeros() as usize;
-            changed &= changed - 1;
-            self.sets[kind][slot / 64] ^= 1 << (slot % 64);
+        for kind in set_bits(u64::from(changed)) {
+            self.sets[kind].toggle(slot);
         }
     }
 
     fn refresh(&mut self, id: HumanID, human: &HumanEnt) {
         if !self.dirty {
             self.set(Self::slot(id), HumanWork::membership(human));
+        }
+    }
+
+    fn refresh_itinerary(&mut self, id: HumanID, human: &HumanEnt) {
+        if !self.dirty {
+            let slot = Self::slot(id);
+            let previous = self.slots[slot].1;
+            self.set(
+                slot,
+                (previous & !HumanWork::ITINERARY_MEMBERSHIP)
+                    | HumanWork::movement_membership(human),
+            );
         }
     }
 
@@ -281,14 +351,11 @@ impl HumanActivity {
             out.extend(humans.keys());
             return;
         }
-        for (block, &word) in self.sets[kind as usize].iter().enumerate() {
-            let mut word = word;
-            while word != 0 {
-                let slot = block * 64 + word.trailing_zeros() as usize;
-                out.push(self.slots[slot].0);
-                word &= word - 1;
-            }
-        }
+        out.extend(
+            self.sets[kind as usize]
+                .active_slots()
+                .map(|slot| self.slots[slot].0),
+        );
     }
 }
 
@@ -335,18 +402,34 @@ impl<'a> IntoIterator for &'a HumanStorage {
     }
 }
 
-/// A split borrow of one human and its indexed contribution. The index still
-/// holds the old mask until the edit ends. Dropping the borrow refreshes it.
+#[derive(Clone, Copy)]
+enum HumanRefresh {
+    None,
+    Itinerary,
+    All,
+}
+
+/// The storage keeps this guard until its edit callback returns. The index
+/// still holds the old mask until the guard drops.
 pub(crate) struct HumanEdit<'a> {
     id: HumanID,
     human: &'a mut HumanEnt,
     activity: &'a mut HumanActivity,
-    refresh: bool,
+    refresh: HumanRefresh,
 }
 
 impl HumanEdit<'_> {
     pub(crate) fn decision_mut(&mut self) -> &mut HumanDecision {
         &mut self.human.decision
+    }
+
+    pub(crate) fn itinerary_mut(&mut self) -> (&mut Itinerary, &mut geom::Vec3) {
+        // Movement can wake the pedestrian pass, and can finish the itinerary.
+        // The other work sets depend only on the router and location.
+        if matches!(self.refresh, HumanRefresh::None) {
+            self.refresh = HumanRefresh::Itinerary;
+        }
+        (&mut self.human.it, &mut self.human.trans.pos)
     }
 }
 
@@ -360,15 +443,17 @@ impl Deref for HumanEdit<'_> {
 
 impl DerefMut for HumanEdit<'_> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.refresh = true;
+        self.refresh = HumanRefresh::All;
         self.human
     }
 }
 
 impl Drop for HumanEdit<'_> {
     fn drop(&mut self) {
-        if self.refresh {
-            self.activity.refresh(self.id, self.human);
+        match self.refresh {
+            HumanRefresh::None => (),
+            HumanRefresh::Itinerary => self.activity.refresh_itinerary(self.id, self.human),
+            HumanRefresh::All => self.activity.refresh(self.id, self.human),
         }
     }
 }
@@ -379,30 +464,36 @@ impl HumanStorage {
         id: HumanID,
         edit: impl FnOnce(&mut HumanEnt) -> R,
     ) -> Option<R> {
+        self.edit_guarded(id, |human| edit(human))
+    }
+
+    fn edit_guarded<R>(
+        &mut self,
+        id: HumanID,
+        edit: impl FnOnce(&mut HumanEdit<'_>) -> R,
+    ) -> Option<R> {
         let mut human = HumanEdit {
             id,
             human: self.entities.get_mut(id)?,
             activity: &mut self.activity,
-            refresh: true,
+            refresh: HumanRefresh::None,
         };
         Some(edit(&mut human))
     }
 
     pub(crate) fn edit_each(&mut self, mut edit: impl FnMut(HumanID, &mut HumanEnt)) {
-        self.edit_each_split(|id, mut human| edit(id, &mut human));
+        self.edit_each_split(|id, human| edit(id, human));
     }
 
-    pub(crate) fn edit_each_split(&mut self, mut edit: impl FnMut(HumanID, HumanEdit<'_>)) {
+    pub(crate) fn edit_each_split(&mut self, mut edit: impl FnMut(HumanID, &mut HumanEdit<'_>)) {
         for (id, human) in &mut self.entities {
-            edit(
+            let mut human = HumanEdit {
                 id,
-                HumanEdit {
-                    id,
-                    human,
-                    activity: &mut self.activity,
-                    refresh: false,
-                },
-            );
+                human,
+                activity: &mut self.activity,
+                refresh: HumanRefresh::None,
+            };
+            edit(id, &mut human);
         }
     }
 
@@ -419,14 +510,14 @@ impl HumanStorage {
     pub(crate) fn edit_active(
         &mut self,
         kind: HumanWork,
-        mut edit: impl FnMut(HumanID, &mut HumanEnt),
+        mut edit: impl FnMut(HumanID, &mut HumanEdit<'_>),
     ) {
         // These passes only change the current human. Cross-entity callbacks
         // drain after the pass, before the next phase collects its own IDs.
         let mut ids = std::mem::take(&mut self.activity.scratch[kind as usize]);
         self.collect_active(kind, &mut ids);
         for &id in &ids {
-            self.edit(id, |human| edit(id, human));
+            self.edit_guarded(id, |human| edit(id, human));
         }
         self.activity.scratch[kind as usize] = ids;
     }
@@ -709,5 +800,34 @@ impl Display for AnyEntity {
             AnyEntity::FreightStationID(id) => write!(f, "{:?}", id),
             AnyEntity::CompanyID(id) => write!(f, "{:?}", id),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ActivitySet;
+
+    #[test]
+    fn l1_activity_sparse_words_preserve_slot_order_after_mass_removal() {
+        let mut set = ActivitySet::default();
+        let last = 16_384;
+        for slot in 1..=last {
+            set.toggle(slot);
+        }
+        for slot in 2..last {
+            set.toggle(slot);
+        }
+        assert_eq!(set.active_slots().collect::<Vec<_>>(), [1, last]);
+        assert_eq!(set.nonempty, [1, 0, 0, 0, 1]);
+
+        set.toggle(last);
+        assert_eq!(set.nonempty, [1]);
+        for slot in [last, 4096, 64, 2] {
+            set.toggle(slot);
+        }
+        assert_eq!(
+            set.active_slots().collect::<Vec<_>>(),
+            [1, 2, 64, 4096, last]
+        );
     }
 }

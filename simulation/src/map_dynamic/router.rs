@@ -124,6 +124,7 @@ fn routing_changed(
     let mut transit_paths = None;
 
     world.humans.edit_active(HumanWork::RouteChanged, |id, h| {
+        let h: &mut HumanEnt = h;
         let router = &mut h.router;
         if matches!(h.location, Location::Transit(_)) {
             return;
@@ -304,7 +305,6 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
         }
 
         let trans: &Transform = &h.trans;
-        let itin: &Itinerary = &h.it;
 
         let pos = match h.location {
             Location::Outside => trans.pos,
@@ -341,6 +341,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
             }
         }
 
+        let itin: &Itinerary = &h.it;
         let mut cur_step_over = true;
 
         if let Some(ref step) = h.router.cur_step {
@@ -400,6 +401,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
             return;
         }
 
+        let h: &mut HumanEnt = h;
         h.router.cur_step = h.router.steps.pop();
 
         let transit_walk = matches!(h.router.steps.last(), Some(RoutingStep::WaitAtStop { .. }))

@@ -89,6 +89,7 @@ pub fn random_pedestrian_shirt_color(r: &mut RandProvider) -> Color {
 pub fn pedestrian_decision_system(world: &mut World, _resources: &mut Resources) {
     profiling::scope!("transportation::pedestrian_decision_system");
     world.humans.edit_active(HumanWork::Pedestrian, |_, human| {
+        let human: &mut HumanEnt = human;
         let p = &mut human.pedestrian;
         if p.can_cache_still(&human.speed, &human.it) {
             let before = <[f32; 3]>::from(human.trans.dir).map(f32::to_bits);

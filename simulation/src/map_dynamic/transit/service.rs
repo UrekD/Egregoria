@@ -389,6 +389,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         true
     });
     world.humans.edit_active(HumanWork::Outside, |id, human| {
+        let human: &mut HumanEnt = human;
         if let Location::Transit(bus) = human.location {
             if let Some(at) = service.get_mut(&bus) {
                 alight_passenger(&mut transit, id, human, at, bus, resources);
