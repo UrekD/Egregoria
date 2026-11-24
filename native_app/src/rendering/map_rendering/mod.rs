@@ -1,5 +1,5 @@
 use engine::heightmap::{GroundOverlayDisc, GroundOverlayImage};
-use engine::{Context, FrameContext, GfxContext, Water};
+use engine::{Context, FrameContext, GfxContext};
 #[cfg(feature = "debug-ground-overlay")]
 use geom::{vec2, LinearColor, AABB};
 use geom::{Camera, Circle, InfiniteFrustrum, Intersect3};
@@ -17,13 +17,18 @@ mod map_mesh;
 mod placeholder_color;
 mod terrain;
 mod trees;
+mod water;
+
+pub(crate) use map_mesh::intersection_mesh;
+use water::WaterRender;
+pub(crate) use water::{water_color, WATER_TILE_PITCH};
 
 /// Render the entire map including the terrain, trees, water etc
 pub struct MapRenderer {
     pub meshb: MapMeshHandler,
     pub terrain: TerrainRender,
     pub trees: TreesRender,
-    pub water: Water,
+    water: WaterRender,
     pub lamps: LampsRender,
 }
 
@@ -39,7 +44,7 @@ impl MapRenderer {
             meshb: MapMeshHandler::new(gfx, sim),
             trees: TreesRender::new(gfx, &sim.map()),
             terrain: TerrainRender::new(gfx, sim),
-            water: Water::new(gfx, sim.map().environment().bounds()),
+            water: WaterRender::new(&sim.map()),
             lamps: LampsRender::new(&sim.map()),
         };
         #[cfg(feature = "debug-ground-overlay")]
@@ -146,7 +151,8 @@ impl MapRenderer {
 
         Self::signals_render(map, time, cam, &ctx.gfx.frustrum, draw);
 
-        ctx.draw(self.water.clone());
+        self.water
+            .draw(crate::inputmap::water_environment(map), ctx);
     }
 
     fn render_lane_signals(n: &Lane, draw: &mut ImmediateDraw, time: u32) {

@@ -1,8 +1,9 @@
 use common::{FastMap, FastSet};
-use engine::{Context, InputContext, Key, MouseButton};
-use geom::{Ray3, Vec2, Vec3};
+use engine::{Context, InputContext, Key, MouseButton, Tesselator};
+use geom::{Intersect, Ray3, Vec2, Vec3, AABB};
 use serde::de::{value::StrDeserializer, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
+use simulation::map::{Environment, Map, MapProject, ProjectFilter, ProjectKind, Road, WaterHit};
 use std::collections::hash_map::Entry;
 use std::collections::{BTreeMap, HashSet};
 use std::fmt::{Debug, Display, Formatter};
@@ -89,6 +90,203 @@ pub struct InputMap {
     cancel_held: bool,
     /// Where the Cancel press started, until the pointer moves far enough to make it a drag.
     cancel_origin: Option<Vec2>,
+}
+
+/// Separate signed terrain and half-open water intersections for the same ray.
+#[derive(Default)]
+pub(crate) struct SurfaceHits {
+    pub ground: Option<(Vec3, Vec3)>,
+    pub water: Option<WaterHit>,
+}
+
+impl SurfaceHits {
+    pub(crate) fn cast(env: &Environment, ray: Ray3) -> Self {
+        if !ray.from.is_finite() || !ray.dir.is_finite() || ray.dir.mag2() == 0.0 {
+            return Self::default();
+        }
+        let ground = env.raycast(ray);
+        let limit = ground.map_or(f32::MAX, |(point, _)| ray_parameter(ray, point));
+        let water = if env.has_water_configuration() {
+            env.raycast_water(ray, limit)
+        } else {
+            None
+        };
+        Self { ground, water }
+    }
+
+    pub(crate) fn nearest(&self) -> Option<Vec3> {
+        self.water
+            .map(|hit| hit.point)
+            .or(self.ground.map(|(point, _)| point))
+    }
+}
+
+pub(crate) fn ray_parameter(ray: Ray3, point: Vec3) -> f32 {
+    (point - ray.from).dot(ray.dir) / ray.dir.mag2()
+}
+
+/// Shared depth-ranked deck and junction picking. Reuse one mesh scratch per sweep.
+pub(crate) struct DeckPicker<'a> {
+    map: &'a Map,
+    padding: f32,
+    vertices: Vec<engine::MeshVertex>,
+    indices: Vec<u32>,
+}
+
+impl<'a> DeckPicker<'a> {
+    pub(crate) fn new(map: &'a Map) -> Self {
+        // The tessellator caps a miter at ten times the half-width.
+        let padding = 5.0
+            * map
+                .roads()
+                .values()
+                .map(|road| road.width)
+                .fold(0.0, f32::max);
+        Self {
+            map,
+            padding,
+            vertices: Vec::new(),
+            indices: Vec::new(),
+        }
+    }
+
+    pub(crate) fn pick(
+        &mut self,
+        ray: Ray3,
+        surfaces: &SurfaceHits,
+        filter: ProjectFilter,
+    ) -> Option<MapProject> {
+        let limit = surfaces
+            .nearest()
+            .map_or(f32::INFINITY, |p| ray_parameter(ray, p));
+        let world = self.map.environment().bounds().expand(self.padding);
+        let ray_bounds = ray_xy_bounds(ray, world, limit)?;
+        let search = ray_bounds.expand(self.padding);
+        let map = self.map;
+        let mut mesh = engine::Tesselator::new(&mut self.vertices, &mut self.indices, None, 1.0);
+        map.spatial_map()
+            .query(search, filter)
+            .filter_map(|kind| {
+                let depth = match kind {
+                    ProjectKind::Road(id) => {
+                        let road = map.get(id)?;
+                        if !road
+                            .interfaced_points()
+                            .bbox()
+                            .flatten()
+                            .expand(5.0 * road.width)
+                            .intersects(&ray_bounds)
+                        {
+                            return None;
+                        }
+                        road_hit(road, ray, limit, &mut mesh)?
+                    }
+                    ProjectKind::Intersection(id) => {
+                        mesh.vertices.clear();
+                        mesh.indices.clear();
+                        crate::rendering::intersection_mesh(
+                            &mut mesh,
+                            &geom::LinearColor::WHITE,
+                            map.get(id)?,
+                            map.roads(),
+                        );
+                        mesh.indices
+                            .chunks_exact(3)
+                            .filter_map(|indices| {
+                                let point =
+                                    |i: usize| mesh.vertices[indices[i] as usize].position.into();
+                                triangle_hit(
+                                    ray,
+                                    point(0),
+                                    point(1),
+                                    point(2),
+                                )
+                                .filter(|depth| (0.0..=limit).contains(depth))
+                            })
+                            .min_by(f32::total_cmp)?
+                    }
+                    _ => return None,
+                };
+                Some((depth, kind))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+            .map(|(depth, kind)| MapProject {
+                kind,
+                pos: ray.from + ray.dir * depth,
+            })
+    }
+}
+
+fn road_hit(
+    road: &Road,
+    ray: Ray3,
+    limit: f32,
+    mesh: &mut Tesselator<'_>,
+) -> Option<f32> {
+    let points = road.interfaced_points();
+    let first = points.first_dir()?.xy();
+    let last = points.last_dir()?.xy();
+    // Use the renderer's tessellator so the triangles follow the deck's mitered joins and grade.
+    mesh.vertices.clear();
+    mesh.indices.clear();
+    mesh.draw_polyline_with_dir(points.as_slice(), first, last, road.width);
+
+    mesh.indices
+        .chunks_exact(3)
+        .filter_map(|indices| {
+            let point = |i: usize| Vec3::from(mesh.vertices[indices[i] as usize].position);
+            triangle_hit(ray, point(0), point(1), point(2))
+                .filter(|depth| (0.0..=limit).contains(depth))
+        })
+        .min_by(f32::total_cmp)
+}
+
+fn triangle_hit(ray: Ray3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+    let ab = b - a;
+    let ac = c - a;
+    let cross = ray.dir.cross(ac);
+    let det = ab.dot(cross);
+    if det.abs() <= f32::EPSILON {
+        return None;
+    }
+    let origin = ray.from - a;
+    let u = origin.dot(cross) / det;
+    let side = origin.cross(ab);
+    let v = ray.dir.dot(side) / det;
+    (u >= 0.0 && v >= 0.0 && u + v <= 1.0).then(|| ac.dot(side) / det)
+}
+
+fn ray_xy_bounds(ray: Ray3, world: AABB, limit: f32) -> Option<AABB> {
+    if !ray.from.is_finite() || !ray.dir.is_finite() || ray.dir.mag2() == 0.0 {
+        return None;
+    }
+    let mut near = 0.0_f32;
+    let mut far = limit;
+    for (origin, direction, low, high) in [
+        (ray.from.x, ray.dir.x, world.ll.x, world.ur.x),
+        (ray.from.y, ray.dir.y, world.ll.y, world.ur.y),
+    ] {
+        if direction == 0.0 {
+            if !(low..=high).contains(&origin) {
+                return None;
+            }
+            continue;
+        }
+        let a = (low - origin) / direction;
+        let b = (high - origin) / direction;
+        near = near.max(a.min(b));
+        far = far.min(a.max(b));
+    }
+    if near > far {
+        return None;
+    }
+    let start = ray.from.xy() + ray.dir.xy() * near;
+    let end = if far.is_finite() {
+        ray.from.xy() + ray.dir.xy() * far
+    } else {
+        start
+    };
+    Some(AABB::new_ll_ur(start.min(end), start.max(end)))
 }
 
 #[derive(Serialize)]
@@ -257,6 +455,11 @@ fn same_key(unit: &UnitInput) -> UnitInput {
 }
 
 impl InputMap {
+    pub(crate) fn surface_hits(&self, env: &Environment) -> SurfaceHits {
+        self.ray
+            .map_or_else(SurfaceHits::default, |ray| SurfaceHits::cast(env, ray))
+    }
+
     pub fn build_input_tree(&mut self, bindings: &mut Bindings) {
         for v in &mut bindings.0.values_mut() {
             for x in &mut v.0 {
@@ -965,5 +1168,42 @@ mod tests {
             ),
             (Speed50, InputCombinations(vec![])),
         ]))
+    }
+}
+
+#[cfg(test)]
+mod water_w4_tests {
+    use super::*;
+    use geom::{vec2, vec3};
+    use simulation::map::Environment;
+
+    #[test]
+    fn water_w4_picks_the_surface_before_the_bed_and_respects_tile_edges() {
+        let mut env = Environment::new(1, 1);
+        let basin = [
+            vec2(64.0, 64.0),
+            vec2(96.0, 64.0),
+            vec2(96.0, 96.0),
+            vec2(64.0, 96.0),
+        ];
+        env.fill_lake(&geom::Polygon::from(basin.to_vec()), -10, 4.0)
+            .unwrap();
+
+        let cast = |x| {
+            SurfaceHits::cast(
+                &env,
+                Ray3 {
+                    from: vec3(x, 80.0, 20.0),
+                    dir: -Vec3::Z,
+                },
+            )
+        };
+        let inside = cast(80.0);
+        assert!(inside.ground.unwrap().0.z < -1.0);
+        assert_eq!(inside.nearest().unwrap().z, -1.0);
+        assert!(inside.water.is_some());
+        let edge = cast(96.0);
+        assert!(edge.water.is_none());
+        assert!(edge.nearest().is_some());
     }
 }

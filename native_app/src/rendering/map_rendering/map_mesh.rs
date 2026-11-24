@@ -2119,7 +2119,7 @@ fn inter_pylon(tess: &mut Tesselator, env: &Environment, inter: &Intersection, r
     );
 }
 
-fn intersection_mesh(
+pub(crate) fn intersection_mesh(
     tess: &mut Tesselator,
     center_col: &LinearColor,
     inter: &Intersection,

@@ -120,16 +120,16 @@ impl TerrainRender {
         let mut changed = false;
         for cell in self.terrain_sub.take_updated_chunks() {
             for chunkid in cell.convert() {
-                let chunk =
-                    unwrap_retlog!(ter.get_chunk(chunkid), "trying to update nonexistent chunk");
-
+                let Some(chunk) = ter.get_chunk(chunkid) else {
+                    continue;
+                };
+                changed = true;
                 self.heightmap.update_chunk(
                     &mut ctx.gfx,
                     (chunkid.0 as u32, chunkid.1 as u32),
                     chunk,
                 );
             }
-            changed = true;
         }
 
         if changed {

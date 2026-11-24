@@ -11,7 +11,7 @@ use simulation::map::pathfinding_crate::num_traits::Pow;
 use simulation::map::{BuildingKind, Map};
 
 use crate::gui::windows::settings::Settings;
-use crate::inputmap::{InputAction, InputMap};
+use crate::inputmap::{water_environment, InputAction, InputMap};
 
 const CAMERA_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 const CAMERA_SETTLE_TIME: Duration = Duration::from_millis(250);
@@ -249,7 +249,8 @@ impl OrbitCamera {
     }
 
     pub(crate) fn reset_for_world(&mut self, map: &Map, saved: Option<SlotCamera>) {
-        let bounds = map.environment().bounds();
+        let env = water_environment(map);
+        let bounds = env.bounds();
         let valid = saved.filter(|saved| {
             let pos = Vec3::from(saved.position);
             pos.is_finite()
@@ -260,8 +261,12 @@ impl OrbitCamera {
         });
         let default_position = || {
             let center = bounds.center();
-            starter_view(map)
-                .unwrap_or_else(|| center.z(map.environment().height(center).unwrap_or_default()))
+            starter_view(map).unwrap_or_else(|| {
+                center.z(env
+                    .water_surface_elevation(center)
+                    .or_else(|| env.height(center))
+                    .unwrap_or_default())
+            })
         };
         let position = valid.map_or_else(default_position, |saved| Vec3::from(saved.position));
         let mut camera = Camera::new(position, self.camera.viewport_w, self.camera.viewport_h);
@@ -441,21 +446,23 @@ fn starter_view(map: &Map) -> Option<Vec3> {
     let center = station.obb.center();
     // Leave room between the station and the center of the opening view for construction.
     let preferred = center + Vec2::X * 256.0;
+    let env = water_environment(map);
+    let dry = |point| {
+        env.water_at(point)
+            .is_none()
+            .then(|| env.height(point))
+            .flatten()
+    };
     (-12..=12)
         .flat_map(|x| (-12..=12).map(move |y| (x, y)))
         .filter(|&(x, y)| x * x + y * y <= 12 * 12)
         .filter_map(|(x, y)| {
             let point = center + Vec2::new(x as f32, y as f32) * 64.0;
-            // Procedural land is at zero elevation and underwater terrain is negative.
-            let height = map.environment().true_height(point).filter(|&z| z >= 0.0)?;
+            let height = dry(point)?;
             // A patch of land gives the player more usable space than a narrow shoreline.
             [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y]
                 .into_iter()
-                .all(|dir| {
-                    map.environment()
-                        .true_height(point + dir * 32.0)
-                        .is_some_and(|z| z >= 0.0)
-                })
+                .all(|dir| dry(point + dir * 32.0).is_some())
                 .then_some(point.z(height))
         })
         .min_by(|a, b| {
@@ -649,7 +656,7 @@ mod af2_tests {
             "{point:?}, station {center:?}"
         );
         assert!(
-            map.environment().true_height(point).unwrap() >= 0.0,
+            water_environment(&map).water_at(point).is_none(),
             "{point:?}"
         );
         let (screen, depth) = orbit.camera.project(station.obb.center().z(station.height));

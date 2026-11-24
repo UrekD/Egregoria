@@ -5,12 +5,14 @@ use common::FastSet;
 use crate::gui::specialbuilding::SpecialBuildingResource;
 use crate::gui::windows::settings::Settings;
 use crate::gui::Tool;
-use crate::inputmap::{Bindings, InputAction, InputMap, UnitInput};
+use crate::inputmap::{
+    water_environment, Bindings, DeckPicker, InputAction, InputMap, SurfaceHits, UnitInput,
+};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 use engine::MouseButton;
-use geom::{Camera, Vec2, Vec3};
-use simulation::map::{BuildingKind, Map, ProjectFilter, ProjectKind};
+use geom::{Camera, Ray3, Vec2};
+use simulation::map::{BuildingKind, Map, MapProject, ProjectFilter, ProjectKind};
 use simulation::world_command::WorldCommands;
 use simulation::Simulation;
 
@@ -127,7 +129,7 @@ impl BulldozerState {
         pressed: bool,
         current: Vec2,
         map: &Map,
-        mut project: impl FnMut(Vec2) -> Option<Vec3>,
+        mut project: impl FnMut(Vec2) -> Option<MapProject>,
         commands: &mut WorldCommands,
     ) {
         if !held {
@@ -146,10 +148,10 @@ impl BulldozerState {
             return;
         };
         let mut interrupted = false;
-        let targets = sweep_targets(*previous, current, map, drag_filter(), |point| {
-            let position = project(point).filter(|pos| pos.is_finite());
-            interrupted |= position.is_none();
-            position
+        let targets = sweep_targets(*previous, current, |point| {
+            let hit = project(point).filter(|hit| hit.pos.is_finite());
+            interrupted |= hit.is_none();
+            hit
         });
 
         for target in targets {
@@ -175,9 +177,7 @@ fn drag_filter() -> ProjectFilter {
 fn sweep_targets(
     previous: Vec2,
     current: Vec2,
-    map: &Map,
-    filter: ProjectFilter,
-    mut project: impl FnMut(Vec2) -> Option<Vec3>,
+    mut project: impl FnMut(Vec2) -> Option<MapProject>,
 ) -> Vec<ProjectKind> {
     const MAX_STEP_PX: f32 = 8.0;
     let distance = (current - previous).mag();
@@ -189,10 +189,10 @@ fn sweep_targets(
     let mut targets = Vec::new();
     for step in 0..=steps {
         let point = previous.lerp(current, step as f32 / steps.max(1) as f32);
-        let Some(position) = project(point).filter(|pos| pos.is_finite()) else {
+        let Some(hit) = project(point).filter(|hit| hit.pos.is_finite()) else {
             break;
         };
-        let target = map.project(position, 0.0, filter).kind;
+        let target = hit.kind;
         if target != ProjectKind::Ground && seen.insert(target) {
             targets.push(target);
         }
@@ -204,7 +204,7 @@ fn over_ui(point: Vec2) -> bool {
     goryak::pointer_over_ui(point.x, point.y) || engine::pointer_over_egui(point)
 }
 
-fn project_terrain(camera: &Camera, map: &Map, point: Vec2) -> Option<Vec3> {
+fn screen_ray(camera: &Camera, point: Vec2) -> Option<Ray3> {
     if !point.is_finite()
         || point.x < 0.0
         || point.y < 0.0
@@ -215,13 +215,27 @@ fn project_terrain(camera: &Camera, map: &Map, point: Vec2) -> Option<Vec3> {
         return None;
     }
 
-    let ray = camera.unproj_ray(point)?;
-    if !ray.dir.is_finite() {
-        return None;
+    camera.unproj_ray(point)
+}
+
+fn project_target(
+    map: &Map,
+    picker: &mut DeckPicker<'_>,
+    ray: Ray3,
+    filter: ProjectFilter,
+) -> Option<MapProject> {
+    let hits = SurfaceHits::cast(water_environment(map), ray);
+    if let Some(deck) = picker.pick(ray, &hits, filter) {
+        return Some(deck);
     }
-    let (mut position, _) = map.environment().raycast(ray)?;
-    position.z = position.z.max(0.0);
-    Some(position)
+    if let Some(water) = hits.water {
+        return Some(MapProject {
+            pos: water.point,
+            kind: ProjectKind::Ground,
+        });
+    }
+    let (ground, _) = hits.ground?;
+    Some(map.project(ground.xy().z(ground.z.max(0.0)), 0.0, filter))
 }
 
 fn queue_target(map: &Map, target: ProjectKind, commands: &mut WorldCommands) {
@@ -288,9 +302,11 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
     let map = sim.map();
     let mut commands = uiworld.commands();
     let before = commands.as_ref().len();
+    let mut picker = DeckPicker::new(&map);
     let projection = if drag_enabled {
         let camera = &uiworld.camera().camera;
-        let project = |point| project_terrain(camera, &map, point);
+        let mut project =
+            |point| project_target(&map, &mut picker, screen_ray(camera, point)?, drag_filter());
         let current = project(input.screen);
         if pointer.interrupted || !selecting || current.is_none() {
             state.cancel(held);
@@ -304,12 +320,15 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
                 &mut commands,
             );
         }
-        current.map(|pos| map.project(pos, 0.0, drag_filter()))
+        current
     } else {
         state.reset_gesture();
-        let current = input
-            .unprojected
-            .map(|pos| map.project(pos, 0.0, ProjectFilter::ALL));
+        let current = match input.ray {
+            Some(ray) => project_target(&map, &mut picker, ray, ProjectFilter::ALL),
+            None => input
+                .unprojected
+                .map(|pos| map.project(pos, 0.0, ProjectFilter::ALL)),
+        };
         if pressed && !pointer.interrupted {
             if let Some(current) = current {
                 queue_target(&map, current.kind, &mut commands);
@@ -373,13 +392,18 @@ mod tests {
         Some(point.z(0.0))
     }
 
+    fn sample_target(map: &Map) -> impl FnMut(Vec2) -> Option<MapProject> + '_ {
+        |point| sample(point).map(|pos| map.project(pos, 0.0, drag_filter()))
+    }
+
     #[test]
     fn p4d_sweep_finds_each_traversed_road_once() {
         let city = city();
         let map = city.sim.map();
         let start = vec2(680.0, 780.0);
         let end = vec2(1200.0, 780.0);
-        let targets = sweep_targets(start, end, &map, ProjectFilter::ROAD, sample);
+        let project = |point| sample(point).map(|pos| map.project(pos, 0.0, ProjectFilter::ROAD));
+        let targets = sweep_targets(start, end, project);
         assert_eq!(targets.len(), 4);
         assert!(targets
             .iter()
@@ -393,8 +417,8 @@ mod tests {
             4
         );
         assert_eq!(
-            sweep_targets(start, end, &map, ProjectFilter::ROAD, |point| {
-                (point.x < 900.0).then_some(point.z(0.0))
+            sweep_targets(start, end, |point| {
+                (point.x < 900.0).then(|| project(point)).flatten()
             }),
             targets[..2]
         );
@@ -446,9 +470,9 @@ mod tests {
         let mut commands = WorldCommands::default();
         let a = vec2(700.0, 780.0);
         let b = vec2(1180.0, 780.0);
-        state.update_drag(true, true, a, &map, sample, &mut commands);
-        state.update_drag(true, false, b, &map, sample, &mut commands);
-        state.update_drag(true, false, a, &map, sample, &mut commands);
+        state.update_drag(true, true, a, &map, sample_target(&map), &mut commands);
+        state.update_drag(true, false, b, &map, sample_target(&map), &mut commands);
+        state.update_drag(true, false, a, &map, sample_target(&map), &mut commands);
         assert_eq!(commands.as_ref().len(), 4);
         assert!(commands
             .iter()
@@ -467,10 +491,38 @@ mod tests {
 
         // A second segment covers the other roads at a four-way junction. Applying the
         // batch lets map removal clean up that junction exactly when its last road goes.
-        state.update_drag(true, false, vec2(860.0, 780.0), &map, sample, &mut commands);
-        state.update_drag(true, false, vec2(860.0, 940.0), &map, sample, &mut commands);
-        state.update_drag(true, false, vec2(780.0, 860.0), &map, sample, &mut commands);
-        state.update_drag(true, false, vec2(940.0, 860.0), &map, sample, &mut commands);
+        state.update_drag(
+            true,
+            false,
+            vec2(860.0, 780.0),
+            &map,
+            sample_target(&map),
+            &mut commands,
+        );
+        state.update_drag(
+            true,
+            false,
+            vec2(860.0, 940.0),
+            &map,
+            sample_target(&map),
+            &mut commands,
+        );
+        state.update_drag(
+            true,
+            false,
+            vec2(780.0, 860.0),
+            &map,
+            sample_target(&map),
+            &mut commands,
+        );
+        state.update_drag(
+            true,
+            false,
+            vec2(940.0, 860.0),
+            &map,
+            sample_target(&map),
+            &mut commands,
+        );
 
         let removed_roads: BTreeSet<_> = commands
             .iter()
@@ -495,7 +547,7 @@ mod tests {
         let mut commands = WorldCommands::default();
         let a = vec2(700.0, 780.0);
         let b = vec2(1180.0, 780.0);
-        state.update_drag(true, true, a, &map, sample, &mut commands);
+        state.update_drag(true, true, a, &map, sample_target(&map), &mut commands);
         state.update_drag(
             true,
             false,
@@ -504,10 +556,10 @@ mod tests {
             |_| None,
             &mut commands,
         );
-        state.update_drag(true, true, b, &map, sample, &mut commands);
+        state.update_drag(true, true, b, &map, sample_target(&map), &mut commands);
         assert_eq!(commands.as_ref().len(), 1);
-        state.update_drag(false, false, b, &map, sample, &mut commands);
-        state.update_drag(true, true, b, &map, sample, &mut commands);
+        state.update_drag(false, false, b, &map, sample_target(&map), &mut commands);
+        state.update_drag(true, true, b, &map, sample_target(&map), &mut commands);
         assert_eq!(commands.as_ref().len(), 2);
     }
 
@@ -529,8 +581,10 @@ mod tests {
         let on_road = |point: Vec2| {
             let height = map.environment().height(point).unwrap();
             let (screen, _) = camera.project(point.z(height));
-            let terrain = project_terrain(&camera, &map, screen).unwrap();
-            let ProjectKind::Road(road) = map.project(terrain, 0.0, drag_filter()).kind else {
+            let ray = screen_ray(&camera, screen).unwrap();
+            let project =
+                project_target(&map, &mut DeckPicker::new(&map), ray, drag_filter()).unwrap();
+            let ProjectKind::Road(road) = project.kind else {
                 panic!("expected a road at {point:?}");
             };
             (screen, road)
