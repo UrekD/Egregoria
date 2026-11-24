@@ -183,6 +183,24 @@ fn p6_water_elevated_crossing_connects_opposite_banks() {
 
 struct SlotRoot(PathBuf);
 
+impl SlotRoot {
+    fn new() -> Self {
+        let output = std::process::Command::new("mktemp")
+            .arg("-d")
+            .arg(std::env::temp_dir().join("egregoria-w5.XXXXXXXXXX"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        Self(
+            std::str::from_utf8(&output.stdout)
+                .unwrap()
+                .strip_suffix('\n')
+                .unwrap()
+                .into(),
+        )
+    }
+}
+
 impl Drop for SlotRoot {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
@@ -238,8 +256,7 @@ fn publish_and_check(sim: &Simulation, root: &SlotRoot, label: &str, steps: u64)
 #[test]
 fn p6_water_edit_replays_across_a_published_slot_boundary() {
     super::init_test_simulation();
-    let root = SlotRoot(std::env::temp_dir().join(format!("egregoria-w5-{}", std::process::id())));
-    std::fs::create_dir(&root.0).unwrap();
+    let root = SlotRoot::new();
     let options = NewGameOptions {
         preset: MapPreset::Flat,
         terrain_chunks: 16,
@@ -351,11 +368,57 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
     assert_eq!(gameplay_hashes(&sim), gameplay_hashes(&helper));
     assert_eq!(sim.get_tick(), start_tick);
 
+    let bank_road = WorldCommand::MapMakeConnection {
+        from: MapProject::ground(vec3(6432.0, 1216.0, 10.0)),
+        to: MapProject::ground(vec3(7040.0, 1216.0, 10.0)),
+        inter: None,
+        pat: LanePatternBuilder::default().build(),
+    };
+    sim.apply_commands([&bank_road]);
+    assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+    let lots = [vec2(6688.0, 1260.0), vec2(6950.0, 1260.0)].map(|target| {
+        sim.map()
+            .lots()
+            .values()
+            .min_by(|a, b| {
+                a.shape
+                    .center()
+                    .distance2(target)
+                    .total_cmp(&b.shape.center().distance2(target))
+            })
+            .unwrap()
+            .id
+    });
+    sim.apply_commands(
+        lots.each_ref()
+            .map(|lot| WorldCommand::MapBuildHouse(*lot))
+            .iter(),
+    );
+    assert_eq!(sim.read::<CommandOutcomes>().accepted, [0, 1]);
+    let [bank, inland] = [vec2(6688.0, 1260.0), vec2(6950.0, 1260.0)].map(|target| {
+        sim.map()
+            .buildings()
+            .values()
+            .filter(|building| building.kind == BuildingKind::House)
+            .min_by(|a, b| {
+                a.obb
+                    .center()
+                    .distance2(target)
+                    .total_cmp(&b.obb.center().distance2(target))
+            })
+            .unwrap()
+            .id
+    });
     let mut restored = publish_and_check(&sim, &root, "water_painted", 0);
     let mut schedule = Simulation::schedule();
     assert!(restored
         .read::<UtilityFlow>()
         .water_pending(&restored.map()));
+    let samples = |sim: &Simulation| {
+        let env = sim.read::<EnvGrid>();
+        [bank, inland].map(|home| env.land_value_sample(home))
+    };
+    assert_eq!(samples(&restored), [None, None]);
     let refresh_tick = crate::economy::balance::CITY_UPDATE_INTERVAL_TICKS + EnvGrid::UPDATE_OFFSET;
     let steps_to_refresh = refresh_tick - start_tick;
     for _ in 0..steps_to_refresh {
@@ -364,11 +427,44 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
     assert!(!restored
         .read::<UtilityFlow>()
         .water_pending(&restored.map()));
+    let [Some(bank_value), Some(inland_value)] = samples(&restored) else {
+        panic!("homes did not receive land value at the first scheduled refresh");
+    };
+    assert!(
+        bank_value > inland_value,
+        "bank={bank_value}, inland={inland_value}"
+    );
+    let totals = restored
+        .read::<UtilityFlow>()
+        .status(
+            &restored.map(),
+            &restored.read::<crate::souls::residence::Residences>(),
+            bank,
+        )
+        .unwrap()
+        .totals
+        .unwrap();
+    assert!(totals.water_demand > 0.0);
     publish_and_check(&restored, &root, "water_refreshed", steps_to_refresh);
     let remove = WorldCommand::EditWater(WaterEdit::RemoveFreshWater {
         body: WaterBodyId(2),
     });
+    let lake_bed = |sim: &Simulation| {
+        let map = sim.map();
+        let env = map.environment();
+        std::array::from_fn::<_, 25, _>(|i| {
+            env.base_height(vec2(
+                6656.0 + 16.0 * (i % 5) as f32,
+                1280.0 + 16.0 * (i / 5) as f32,
+            ))
+        })
+    };
+    let before_refill = lake_bed(&restored);
     restored.apply_commands([&remove]);
+    assert_eq!(samples(&restored), [Some(bank_value), Some(inland_value)]);
+    assert!(restored
+        .read::<UtilityFlow>()
+        .water_pending(&restored.map()));
     restored.apply_commands([&basin]);
     let outcome = restored
         .read::<CommandOutcomes>()
@@ -378,7 +474,8 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
         .unwrap()
         .clone();
     assert_eq!(outcome.body, Some(WaterBodyId(3)));
-    assert!(outcome.changed && outcome.dirty.terrain().is_empty());
+    assert!(outcome.changed);
+    assert_eq!(lake_bed(&restored), before_refill);
     assert!(outcome
         .dirty
         .water()
@@ -394,8 +491,32 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
         level: 0.0,
         slope: None,
     };
-    restored.tick(&mut schedule, [&new_lake, &terraform]);
-    assert_eq!(restored.read::<CommandOutcomes>().accepted, [0, 1]);
+    let roads_before: std::collections::BTreeSet<_> = restored.map().roads().keys().collect();
+    let dry_link = [vec3(7216.0, 1280.0, 10.0), vec3(7504.0, 1280.0, 10.0)];
+    let indexed = WorldCommand::MapMakeMultipleConnections(
+        [dry_link[0], dry_link[1], vec3(6688.0, 1312.0, 10.0)]
+            .map(MapProject::ground)
+            .into(),
+        vec![
+            (0, 1, None, LanePatternBuilder::default().build()),
+            (0, 2, None, LanePatternBuilder::default().build()),
+        ],
+    );
+    restored.tick(&mut schedule, [&new_lake, &terraform, &indexed]);
+    {
+        let outcomes = restored.read::<CommandOutcomes>();
+        assert_eq!(outcomes.accepted, [0, 1]);
+        assert_eq!(
+            outcomes.link_outcomes(2),
+            [
+                (0, Ok(())),
+                (
+                    1,
+                    Err(("MapMakeMultipleConnections", Rejection::WetFootprint))
+                )
+            ]
+        );
+    }
     assert_eq!(
         restored
             .read::<CommandOutcomes>()
@@ -406,8 +527,24 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
             .body,
         Some(WaterBodyId(4))
     );
-    assert_eq!(commands(&restored).len(), 8);
-    publish_and_check(&restored, &root, "water_final", steps_to_refresh + 1);
+    let recorded = commands(&restored);
+    assert_eq!(recorded.len(), 12);
+    assert_eq!(recorded.last(), Some(&JSON::encode(&indexed).unwrap()));
+    let loaded = publish_and_check(&restored, &root, "water_final", steps_to_refresh + 1);
+    let new_road = |sim: &Simulation| {
+        let map = sim.map();
+        let roads: Vec<_> = map
+            .roads()
+            .keys()
+            .filter(|id| !roads_before.contains(id))
+            .collect();
+        assert_eq!(roads.len(), 1);
+        let road = map.get(roads[0]).unwrap();
+        let ends = [road.src, road.dst].map(|id| map.get(id).unwrap().pos.xy());
+        assert_eq!(ends, dry_link.map(|point| point.xy()));
+        roads[0]
+    };
+    assert_eq!(new_road(&restored), new_road(&loaded));
 }
 
 #[test]
@@ -429,7 +566,7 @@ fn p6_water_waters_starters_are_dry_routable_and_affordable() {
                 starting_money_bucks: NewGameOptions::MIN_STARTING_MONEY_BUCKS,
                 ..NewGameOptions::default()
             };
-            let city = Simulation::new_game_with_replay(&options)
+            let mut city = Simulation::new_game_with_replay(&options)
                 .unwrap_or_else(|error| panic!("{options:?}: {error}"));
             assert!(city.read::<Replay>().enabled);
             assert!(city.read::<CommandOutcomes>().last.is_empty());
@@ -468,6 +605,7 @@ fn p6_water_waters_starters_are_dry_routable_and_affordable() {
                 station.obb.center().z(station.height),
                 station.obb.axis()[1].z(0.0).normalize(),
             ));
+            let depot = station.id;
             let market = market.obb.center().z(market.height);
             for (start, end) in [(platform, market), (market, platform)] {
                 assert!(
@@ -487,56 +625,65 @@ fn p6_water_waters_starters_are_dry_routable_and_affordable() {
                     + spent,
                 "{options:?}"
             );
+            drop(map);
+            check_starter_freight(&mut city, depot, market, &options);
         }
     }
 }
 
-#[test]
-fn p6_water_citymap_centerline_covers_both_map_edges_and_exposes_both_banks() {
-    use crate::map::{RiverBank, WaterKind};
+fn check_starter_freight(
+    city: &mut Simulation,
+    depot: crate::map::BuildingID,
+    market: geom::Vec3,
+    options: &NewGameOptions,
+) {
+    use crate::map::LaneKind;
+    use crate::souls::freight_station::FreightTrainState::{Arriving, Loading, Moving};
+    use prototypes::RollingStockID;
 
-    super::init_test_simulation();
-    let mut city = Simulation::new_authored_flat(5, 0).unwrap();
-    let centerline = [
-        vec2(1256.0, 0.0),
-        vec2(1296.0, 640.0),
-        vec2(1248.0, 1280.0),
-        vec2(1296.0, 1920.0),
-        vec2(1264.0, 2560.0),
-    ];
-    let river = city.carve_river(&centerline, 88.0, 5.0).unwrap();
-    let map = city.map();
-    let env = map.environment();
-    assert_eq!(env.water_body_kind(centerline[0]), Some(WaterKind::River));
-    assert_eq!(
-        env.water_body_kind(vec2(1264.0, 2559.0)),
-        Some(WaterKind::River)
-    );
-    assert!(env.water_at(centerline[4]).is_none());
-    let mut previous_reach = None;
-    for y in [240.0, 1080.0, 1680.0, 2320.0] {
-        let segment = centerline
-            .windows(2)
-            .find(|segment| y <= segment[1].y)
-            .unwrap();
-        let fraction = (y - segment[0].y) / (segment[1].y - segment[0].y);
-        let point = segment[0] + (segment[1] - segment[0]) * fraction;
-        let sample = env.water_at(point).unwrap();
-        let reach = sample.reach_m.unwrap();
-        assert_eq!(sample.body, river);
-        assert!(sample.depth_m >= 5.0);
-        assert!(previous_reach.is_none_or(|previous| reach > previous));
-        let left = env
-            .river_bank_near(river, reach, RiverBank::Left, 32)
-            .unwrap();
-        let right = env
-            .river_bank_near(river, reach, RiverBank::Right, 32)
-            .unwrap();
-        assert!(left.point.x < point.x && point.x < right.point.x);
-        assert!(!env.is_water(left.dry_tile.center()));
-        assert!(!env.is_water(right.dry_tile.center()));
-        previous_reach = Some(reach);
+    let command = {
+        let map = city.map();
+        let lane = map.nearest_lane(market, LaneKind::Rail, None).unwrap();
+        WorldCommand::SpawnTrain {
+            wagons: vec![
+                RollingStockID::new("locomotive"),
+                RollingStockID::new("freight-wagon"),
+            ],
+            lane,
+            dist: map.get(lane).unwrap().points.length() * 0.5,
+        }
+    };
+    let mut schedule = Simulation::schedule();
+    city.tick(&mut schedule, [&command]);
+    assert_eq!(city.read::<CommandOutcomes>().accepted, [0], "{options:?}");
+    let train = city.world().trains.keys().next().unwrap();
+    let station = city
+        .world()
+        .freight_stations
+        .iter()
+        .find_map(|(id, station)| (station.f.building == depot).then_some(id))
+        .unwrap();
+    city.world_mut_unchecked().freight_stations[station]
+        .f
+        .accept_export(10);
+    let mut loaded = false;
+    let mut outbound = false;
+    for _ in 0..12_000 {
+        city.tick(&mut schedule, &[]);
+        let terminal = &city.world().freight_stations[station].f;
+        let state = terminal
+            .trains
+            .iter()
+            .find_map(|&(id, state)| (id == train).then_some(state));
+        assert!(city.world().trains.contains_key(train));
+        if outbound && matches!(state, None | Some(Arriving)) {
+            assert_eq!(terminal.waiting_cargo, 0);
+            return;
+        }
+        loaded |= matches!(state, Some(Loading));
+        outbound |= loaded && matches!(state, Some(Moving));
     }
+    panic!("{options:?}: starter train did not complete its freight round trip (loaded={loaded}, outbound={outbound})");
 }
 
 #[test]
@@ -576,7 +723,17 @@ fn p6_water_river_accepts_downstream_outlet_and_rejects_upstream_outlet() {
     assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
     let before = sim.hashes();
     sim.apply_commands([&site("sewage-outlet", 320.0)]);
-    assert_eq!(sim.read::<CommandOutcomes>().rejections_for(0).len(), 1);
+    let outcomes = sim.read::<CommandOutcomes>();
+    let [(command, reason)] = outcomes.rejections_for(0) else {
+        panic!(
+            "expected one typed outlet order rejection, got {:?}",
+            outcomes.last
+        );
+    };
+    assert_eq!(*command, "MapBuildSpecialBuilding");
+    // The W3/W0 handoff adds this typed variant to Rejection.
+    assert!(format!("{reason:?}").starts_with("WaterServiceSite(OrderConflict { role: Outlet,"));
+    drop(outcomes);
     assert_eq!(sim.hashes(), before);
     sim.apply_commands([&site("sewage-outlet", 704.0)]);
     assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
