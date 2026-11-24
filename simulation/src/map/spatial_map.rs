@@ -276,6 +276,12 @@ impl SpatialMapObject for Road {
         self.boldline().into()
     }
 
+    fn additional_occupancy(&self) -> Option<AABB> {
+        // The visible deck caps each miter at ten times the half-width.
+        (self.points().n_points() > 2)
+            .then(|| self.points().bbox().flatten().expand(5.0 * self.width))
+    }
+
     fn cut_influence(&self) -> Option<AABB> {
         Some(
             self.points()

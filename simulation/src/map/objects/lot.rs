@@ -1,8 +1,10 @@
+use crate::map::spend_water_work;
 use crate::map::terrain::CELL_SIZE;
 use crate::map::{
     Building, Environment, LotOrigin, Map, ProjectFilter, ProjectKind, Road, RoadID, UpdateType,
+    WaterEditError, WaterFootprint, WaterTileCoord, MAX_WATER_BATCH_WORK,
 };
-use geom::{Intersect, Polygon, Shape, Vec2, Vec3, OBB};
+use geom::{Intersect, Polygon, Segment, Shape, Vec2, Vec3, AABB, OBB};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
@@ -31,8 +33,8 @@ pub enum LotLayout {
 /// The middle of the varied mix and the smallest lot every growable fits on (900 m²).
 pub const UNIFORM_LOT_SIZE: f32 = 30.0;
 pub(crate) const MAX_LOT_SIZE: f32 = 40.0;
-const FRONTAGE_HEIGHT_TOLERANCE_M: f32 = 1.0;
-const MIN_LOT_SIZE: f32 = 20.0;
+pub(crate) const FRONTAGE_HEIGHT_TOLERANCE_M: f32 = 1.0;
+pub(crate) const MIN_LOT_SIZE: f32 = 20.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lot {
@@ -130,6 +132,10 @@ impl Lot {
             return None;
         }
 
+        Some(Self::insert(map, parent, shape, height))
+    }
+
+    pub(crate) fn insert(map: &mut Map, parent: RoadID, shape: OBB, height: f32) -> LotID {
         let id = map.lots.insert_with_key(move |id| Lot {
             id,
             parent,
@@ -138,86 +144,138 @@ impl Lot {
             height,
         });
         map.spatial_map.insert(&map.lots[id]);
-        Some(id)
+        id
     }
 
     pub(crate) fn allows_frontage(map: &Map, road: &Road) -> bool {
         !map.no_frontage.contains(&road.id) && road.has_sidewalks()
     }
 
-    /// Check the full carriageway over the lot's frontage against the local terrain and
-    /// water. Walk both ways from the projection so a dry midpoint cannot hide a wet
-    /// shoulder or an elevated section at one end of the lot.
+    /// Check the lot, its adjoining deck and ground-level access.
     pub(crate) fn has_dry_frontage(env: &Environment, road: &Road, shape: &OBB) -> bool {
-        if !env.strict_water_siting() {
-            return true;
-        }
-        if !Building::dry_footprint(env, shape, None) {
-            return false;
-        }
-        let [a, b, _, _] = shape.corners;
-        let front = (a + b) * 0.5;
-        let points = road.points();
-        let (projected, end) = points.project_segment_2d(front);
-        if end == 0 || projected.xy().distance(front) > road.width * 0.5 + 2.0 {
-            return false;
-        }
-        let start = points[end - 1];
-        let tangent = (points[end] - start).xy();
-        let sidewalks = road.sidewalks(road.src);
-        let sidewalk = if (front - projected.xy()).dot(tangent.perpendicular()) > 0.0 {
-            sidewalks.outgoing
-        } else {
-            sidewalks.incoming
+        let mut remaining = MAX_WATER_BATCH_WORK;
+        !env.strict_water_siting()
+            || Self::check_dry_frontage(
+                road,
+                shape,
+                |front, remaining| {
+                    let points = road.interfaced_points();
+                    spend_water_work(remaining, points.n_points())?;
+                    Ok(Some(points.project_segment_2d(front)))
+                },
+                |point| env.height(point),
+                |tile| env.is_water(tile.center()),
+                &mut remaining,
+            )
+            .unwrap_or(false)
+    }
+
+    pub(crate) fn check_dry_frontage(
+        road: &Road,
+        shape: &OBB,
+        project: impl FnOnce(Vec2, &mut usize) -> Result<Option<(Vec3, usize)>, WaterEditError>,
+        height: impl Fn(Vec2) -> Option<f32>,
+        mut is_wet: impl FnMut(WaterTileCoord) -> bool,
+        remaining: &mut usize,
+    ) -> Result<bool, WaterEditError> {
+        let Some(footprint) = WaterFootprint::new(&shape.corners) else {
+            return Ok(false);
         };
-        if sidewalk.is_none() {
-            return false;
+        for tile in footprint_tiles(shape.bbox()) {
+            spend_water_work(remaining, 1)?;
+            if footprint.overlaps_tile(tile) && is_wet(tile) {
+                return Ok(false);
+            }
         }
 
-        // A horizontal segment's bilinear ground samples are spaced no farther
-        // apart than half a terrain cell, including both ends of the frontage.
-        let usable = |from: Vec3, to: Vec3| {
-            let Some((axis, length)) = (to - from).xy().dir_dist() else {
-                return (to.z - from.z).abs() <= f32::EPSILON;
+        let [a, b, _, _] = shape.corners;
+        let front = (a + b) * 0.5;
+        let points = road.interfaced_points();
+        let Some((projected, end)) = project(front, remaining)? else {
+            return Ok(false);
+        };
+        if end == 0 || projected.xy().distance(front) > road.width * 0.5 + 2.0 {
+            return Ok(false);
+        }
+        let segment = Segment {
+            src: points[end - 1].xy(),
+            dst: points[end].xy(),
+        };
+        let sidewalks = road.sidewalks(road.src);
+        let sidewalk =
+            if (front - projected.xy()).dot((segment.dst - segment.src).perpendicular()) > 0.0 {
+                sidewalks.outgoing
+            } else {
+                sidewalks.incoming
             };
-            let deck = OBB::new((from.xy() + to.xy()) * 0.5, axis, length, road.width);
-            let steps = (length / (CELL_SIZE * 0.5)).ceil() as usize;
-            Building::dry_footprint(env, &deck, None)
-                && (0..=steps).all(|step| {
-                    let pos = from + (to - from) * (step as f32 / steps as f32);
-                    env.height(pos.xy())
-                        .is_some_and(|ground| (ground - pos.z).abs() <= FRONTAGE_HEIGHT_TOLERANCE_M)
-                })
-        };
-        let check_side = |side: &mut dyn Iterator<Item = &Vec3>| {
-            let mut remaining = a.distance(b) * 0.5;
-            let mut from = projected;
-            for &to in side {
-                let length = from.xy().distance(to.xy());
-                if length >= remaining {
-                    return usable(from, from + (to - from) * (remaining / length));
-                }
-                if !usable(from, to) {
-                    return false;
-                }
-                remaining -= length;
-                from = to;
+        if sidewalk.is_none() {
+            return Ok(false);
+        }
+
+        let mut usable = |index: usize, start: f32, end: f32| -> Result<bool, WaterEditError> {
+            spend_water_work(remaining, 1)?;
+            if start == end {
+                return Ok(true);
             }
-            false
+            for triangle in deck_triangles(road, index, start, end) {
+                for tile in footprint_tiles(triangle.bounds) {
+                    spend_water_work(remaining, 1)?;
+                    if triangle.minimum_z_in(tile).is_some() && is_wet(tile) {
+                        return Ok(false);
+                    }
+                }
+            }
+            let from = points[index];
+            let delta = points[index + 1] - from;
+            let length = delta.xy().mag() * (end - start);
+            let steps = (length / (CELL_SIZE * 0.5)).ceil().max(1.0) as usize;
+            for step in 0..=steps {
+                spend_water_work(remaining, 1)?;
+                let pos = from + delta * (start + (end - start) * (step as f32 / steps as f32));
+                if !height(pos.xy())
+                    .is_some_and(|ground| (ground - pos.z).abs() <= FRONTAGE_HEIGHT_TOLERANCE_M)
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         };
-        let (before, after) = points.as_slice().split_at(end);
-        check_side(&mut before.iter().rev()) && check_side(&mut after.iter())
+        let projection = segment.project_t(front);
+        for backwards in [true, false] {
+            let mut left = a.distance(b) * 0.5;
+            let mut index = end - 1;
+            let mut t = projection;
+            while left > 0.0 {
+                let length = points[index].xy().distance(points[index + 1].xy());
+                if length > 0.0 {
+                    let edge = if backwards {
+                        (t - left / length).max(0.0)
+                    } else {
+                        (t + left / length).min(1.0)
+                    };
+                    if !usable(index, edge.min(t), edge.max(t))? {
+                        return Ok(false);
+                    }
+                    if left <= (edge - t).abs() * length || (edge > 0.0 && edge < 1.0) {
+                        break;
+                    }
+                    left -= (edge - t).abs() * length;
+                }
+                if backwards && index > 0 {
+                    index -= 1;
+                    t = 1.0;
+                } else if !backwards && index + 2 < points.n_points() {
+                    index += 1;
+                    t = 0.0;
+                } else {
+                    return Ok(false);
+                }
+            }
+        }
+        Ok(true)
     }
 
     pub fn generate_along_road(map: &mut Map, road: RoadID) {
-        Self::generate_along_road_where(map, road, None);
-    }
-
-    pub(crate) fn generate_along_road_where(
-        map: &mut Map,
-        road: RoadID,
-        eligible: Option<&dyn Fn(OBB, f32) -> bool>,
-    ) {
         let Some(r) = map.roads.get(road) else {
             log::error!("trying to generate along invalid road");
             return;
@@ -226,12 +284,7 @@ impl Lot {
             return;
         }
 
-        fn gen_side(
-            map: &mut Map,
-            road: RoadID,
-            side: f32,
-            eligible: Option<&dyn Fn(OBB, f32) -> bool>,
-        ) {
+        fn gen_side(map: &mut Map, road: RoadID, side: f32) {
             let r = unwrap_ret!(map.roads.get(road));
 
             let w = r.width * 0.5;
@@ -260,24 +313,11 @@ impl Lot {
             while let Some((pos, dir)) = along.next(d) {
                 let axis = side * dir.perp_up();
                 let at = pos + axis * (w + 1.0);
-                // Lots already on the street can leave space for a narrower lot
-                // than this position's first seeded size after drying.
-                let smaller = [UNIFORM_LOT_SIZE, MIN_LOT_SIZE]
-                    .into_iter()
-                    .filter(|&other| {
-                        eligible.is_some() && layout == LotLayout::Varied && other < size
-                    });
-                let lot = std::iter::once(size).chain(smaller).find_map(|size| {
-                    let shape = OBB::new(at.xy() + axis.xy() * size * 0.5, axis.xy(), size, size);
-                    if !eligible.is_none_or(|filter| filter(shape, w)) {
-                        return None;
-                    }
-                    Lot::make_if_clear(map, road, at, shape).map(|id| (id, size))
-                });
-                if let Some((id, placed_size)) = lot {
+                let shape = OBB::new(at.xy() + axis.xy() * size * 0.5, axis.xy(), size, size);
+                if let Some(id) = Lot::make_if_clear(map, road, at, shape) {
                     map.subscribers.dispatch(UpdateType::Road, &map.lots[id]);
 
-                    d += placed_size * 0.5 + 2.0;
+                    d += size * 0.5 + 2.0;
                     size = picksize();
                     d += size * 0.5;
                 } else {
@@ -289,10 +329,10 @@ impl Lot {
         let r = unwrap_ret!(map.roads.get(road));
         let pair = r.sidewalks(r.src);
         if pair.outgoing.is_some() {
-            gen_side(map, road, 1.0, eligible);
+            gen_side(map, road, 1.0);
         }
         if pair.incoming.is_some() {
-            gen_side(map, road, -1.0, eligible);
+            gen_side(map, road, -1.0);
         }
     }
 
@@ -330,6 +370,151 @@ impl Lot {
             }
         }
     }
+}
+
+/// Mirror the deck tessellator's capped XY miter. Endpoint offsets use the same
+/// horizontal component of its 3D tangent as the mesh.
+pub(crate) fn deck_miter(before: Option<Vec3>, pos: Vec3, after: Option<Vec3>) -> Vec2 {
+    if let (Some(before), Some(after)) = (before, after) {
+        let incoming = (pos - before).xy().try_normalize();
+        let outgoing = (pos - after).xy().try_normalize();
+        if let (Some(incoming), Some(outgoing)) = (incoming, outgoing) {
+            let cross = incoming.perp_dot(outgoing);
+            let normal = -incoming.perpendicular();
+            let direction = if cross.abs() < 0.01 {
+                normal
+            } else {
+                (incoming + outgoing)
+                    .try_normalize()
+                    .map_or(normal, |axis| axis * cross.signum())
+            };
+            return direction / incoming.perp_dot(direction).max(0.1);
+        }
+    }
+    let tangent = after
+        .map(|end| end - pos)
+        .or_else(|| before.map(|start| pos - start));
+    -tangent
+        .and_then(Vec3::try_normalize)
+        .unwrap_or_default()
+        .xy()
+        .perpendicular()
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct DeckTriangle {
+    pub(crate) bounds: AABB,
+    pub(crate) vertices: [Vec3; 3],
+}
+
+impl DeckTriangle {
+    pub(crate) fn new(vertices: [Vec3; 3]) -> Self {
+        let [a, b, c] = vertices.map(Vec3::xy);
+        Self {
+            bounds: AABB::new_ll_ur(a.min(b).min(c), a.max(b).max(c)),
+            vertices,
+        }
+    }
+
+    pub(crate) fn minimum_z_in(self, tile: WaterTileCoord) -> Option<f64> {
+        let bounds = AABB::new_ll_size(tile.corner(), Vec2::splat(CELL_SIZE));
+        if !bounds.intersects(&self.bounds) {
+            return None;
+        }
+        let mut clipped = [[0.0; 3]; 8];
+        for (vertex, pos) in clipped.iter_mut().zip(self.vertices) {
+            *vertex = [pos.x.into(), pos.y.into(), pos.z.into()];
+        }
+        let [a, b, c, ..] = clipped;
+        if triangle_area(a, b, c) == 0.0 {
+            return None;
+        }
+        let mut len = 3;
+        // A triangle clipped to a rectangle has at most seven vertices.
+        for (axis, edge, sign) in [
+            (0, bounds.ll.x, 1.0),
+            (0, bounds.ur.x, -1.0),
+            (1, bounds.ll.y, 1.0),
+            (1, bounds.ur.y, -1.0),
+        ] {
+            let mut output = [[0.0; 3]; 8];
+            let mut count = 0;
+            let mut before = *clipped[..len].last()?;
+            for &after in &clipped[..len] {
+                let a = (before[axis] - f64::from(edge)) * sign;
+                let b = (after[axis] - f64::from(edge)) * sign;
+                if (a < 0.0 && b > 0.0) || (a > 0.0 && b < 0.0) {
+                    let t = a / (a - b);
+                    output[count] = std::array::from_fn(|i| before[i] + (after[i] - before[i]) * t);
+                    output[count][axis] = f64::from(edge);
+                    count += 1;
+                }
+                if b >= 0.0 {
+                    output[count] = after;
+                    count += 1;
+                }
+                before = after;
+            }
+            clipped = output;
+            len = count;
+        }
+        if len < 3 {
+            return None;
+        }
+        let twice_area: f64 = clipped[1..len]
+            .windows(2)
+            .map(|pair| triangle_area(clipped[0], pair[0], pair[1]))
+            .sum();
+        if twice_area == 0.0 {
+            return None;
+        }
+        clipped[..len]
+            .iter()
+            .map(|vertex| vertex[2])
+            .reduce(f64::min)
+    }
+}
+
+fn triangle_area([x, y, _]: [f64; 3], [bx, by, _]: [f64; 3], [cx, cy, _]: [f64; 3]) -> f64 {
+    (bx - x) * (cy - y) - (by - y) * (cx - x)
+}
+
+/// Cross-section of the final deck. Fractions clip along the segment while
+/// keeping its rendered miter at each original vertex.
+pub(crate) fn deck_triangles(
+    road: &Road,
+    segment: usize,
+    start: f32,
+    end: f32,
+) -> [DeckTriangle; 2] {
+    let points = road.interfaced_points().as_slice();
+    let edge = |i: usize| {
+        let pos = points[i];
+        let before = i.checked_sub(1).map(|i| points[i]);
+        let after = points.get(i + 1).copied();
+        let offset = (deck_miter(before, pos, after) * (road.width * 0.5)).z0();
+        [pos + offset, pos - offset]
+    };
+    let [a, b] = edge(segment);
+    let [c, d] = edge(segment + 1);
+    let interpolate = |a: Vec3, b: Vec3, t: f32| match t {
+        0.0 => a,
+        1.0 => b,
+        _ => a + (b - a) * t,
+    };
+    let [left, right] = [interpolate(a, c, start), interpolate(b, d, start)];
+    let [next_left, next_right] = [interpolate(a, c, end), interpolate(b, d, end)];
+    [
+        DeckTriangle::new([next_left, right, left]),
+        DeckTriangle::new([right, next_left, next_right]),
+    ]
+}
+
+pub(crate) fn footprint_tiles(bounds: AABB) -> impl Iterator<Item = WaterTileCoord> {
+    let lo = (bounds.ll / CELL_SIZE).floor();
+    let hi = (bounds.ur / CELL_SIZE).ceil();
+    (lo.y as i16..hi.y as i16)
+        .flat_map(move |y| (lo.x as i16..hi.x as i16).map(move |x| WaterTileCoord(x, y)))
 }
 
 #[cfg(test)]
@@ -370,5 +555,48 @@ mod water_tests {
             .intersects_water(&Polygon(frontage_only.corners.to_vec())));
         assert!(Lot::try_make(&mut map, road, at(164.0), Vec2::Y, 20.0).is_none());
         assert!(Lot::try_make(&mut map, road, at(336.0), Vec2::Y, 20.0).is_some());
+    }
+
+    #[test]
+    fn w2b_water_lot_rejects_a_wet_deck_miter() {
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        let (_, road) = map
+            .make_connection(
+                MapProject::ground(vec2(48.0, 132.0).z(8.0)),
+                MapProject::ground(vec2(124.0, 232.0).z(8.0)),
+                None,
+                &LanePatternBuilder::new().build(),
+            )
+            .unwrap();
+        let env = map.environment_mut_for_test();
+        env.fill_lake(
+            &Polygon::centered_rect(vec2(136.0, 120.0), 8.0, 8.0),
+            0,
+            1.0,
+        )
+        .unwrap();
+        let mut road = map.roads[road].clone();
+        assert!(road.elevated_span());
+        // Isolate the ground-level approach of a curved crossing. Only its outer
+        // miter enters the wet tile southeast of the bend.
+        road.points = geom::PolyLine3::new(vec![
+            vec2(48.0, 132.0).z(0.3),
+            vec2(124.0, 132.0).z(0.3),
+            vec2(124.0, 232.0).z(0.3),
+        ]);
+        road.interfaced_points = road.points.clone();
+        let lot = |x| OBB::new(vec2(x, 143.0 + road.width * 0.5), Vec2::Y, 20.0, 20.0);
+        assert!(Lot::has_dry_frontage(map.environment(), &road, &lot(90.0)));
+        assert!(Building::dry_footprint(
+            map.environment(),
+            &lot(119.0),
+            None
+        ));
+        assert!(!Lot::has_dry_frontage(
+            map.environment(),
+            &road,
+            &lot(119.0)
+        ));
     }
 }
