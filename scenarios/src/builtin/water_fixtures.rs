@@ -377,14 +377,29 @@ fn build_perf_fixture(
     let employers = agents.div_ceil(18);
     let jobs: Vec<_> = {
         let map = ctx.sim.map();
-        (0..employers)
-            .map(|index| {
-                let road = &map.roads()[grid_roads[index * grid_roads.len() / employers]];
+        let size = GoodsCompanyID::new("clothes-store").prototype().size;
+        let sites: Vec<_> = grid_roads
+            .iter()
+            .filter_map(|&id| {
+                let road = map.get(id)?;
                 let points = road.points();
                 let (mid, direction) = points.point_dir_along(points.length() * 0.5);
                 let out = direction.xy().normalize().perpendicular();
-                let center = mid.xy() + out * (road.width * 0.5 + 6.0);
-                roadside_company(road.id, "clothes-store", center, out)
+                let center = mid.xy() + out * (road.width * 0.5 + size.w * 0.5 + 1.0);
+                let footprint = OBB::new(center, out, size.w, size.h);
+                (!map.building_overlaps(footprint)).then_some((id, center, out))
+            })
+            .collect();
+        if sites.len() < employers {
+            return Err(format!(
+                "only {} dry job sites for {employers} employers",
+                sites.len()
+            ));
+        }
+        (0..employers)
+            .map(|index| {
+                let (road, center, out) = sites[index * sites.len() / employers];
+                roadside_company(road, "clothes-store", center, out)
             })
             .collect()
     };
