@@ -90,13 +90,13 @@ impl<E: SimDrop> ParCommandBuffer<E> {
 mod tests {
     use super::ParCommandBuffer;
     use crate::tests::TestCtx;
-    use crate::world::{VehicleEnt, VehicleID};
+    use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
     use slotmapd::HopSlotMap;
 
     #[test]
     fn scale_t0_serial_callback_order() {
         let mut sim = TestCtx::new().g;
-        sim.insert(Vec::<&str>::new());
+        sim.insert(Vec::<usize>::new());
 
         let mut ids = HopSlotMap::<VehicleID, ()>::with_key();
         let first = ids.insert(());
@@ -104,34 +104,47 @@ mod tests {
         let third = ids.insert(());
         ids.remove(first).unwrap();
         let reused = ids.insert(());
+        let keys = [
+            first,
+            second,
+            third,
+            reused,
+            ids.insert(()),
+            ids.insert(()),
+            ids.insert(()),
+        ];
 
-        let buffer = sim.read::<ParCommandBuffer<VehicleEnt>>();
-        for (id, label) in [
-            (third, "third a"),
-            (reused, "reused a"),
-            (second, "second a"),
-            (first, "original generation"),
-            (third, "third b"),
-            (second, "second b"),
-            (reused, "reused b"),
-        ] {
-            buffer.exec_on(id, move |trace: &mut Vec<&str>| trace.push(label));
+        {
+            let buffer = sim.read::<ParCommandBuffer<VehicleEnt>>();
+            for ordinal in 0..64 {
+                let key = keys[(ordinal * 5) % keys.len()];
+                buffer.exec_on(key, move |trace: &mut Vec<usize>| trace.push(ordinal));
+            }
         }
-        drop(buffer);
-
-        assert!(ParCommandBuffer::<VehicleEnt>::apply(&mut sim));
+        sim.apply_commands([]);
+        // Captured from the pre-T0 serial drain with Rust 1.95. Some repeated keys
+        // run out of enqueue order when the queue is this large.
         assert_eq!(
-            sim.read::<Vec<&str>>().as_slice(),
+            sim.read::<Vec<usize>>().as_slice(),
             [
-                "original generation",
-                "reused a",
-                "reused b",
-                "second a",
-                "second b",
-                "third a",
-                "third b",
+                0, 63, 7, 14, 21, 28, 35, 42, 49, 56, 30, 16, 23, 9, 2, 37, 44, 51, 58, 3, 17, 31,
+                10, 38, 24, 45, 52, 59, 34, 41, 48, 13, 55, 6, 27, 62, 20, 5, 33, 19, 40, 12, 47,
+                26, 54, 61, 29, 36, 50, 15, 1, 22, 57, 8, 43, 25, 11, 4, 53, 39, 60, 32, 18, 46,
             ],
         );
-        assert!(!ParCommandBuffer::<VehicleEnt>::apply(&mut sim));
+
+        sim.write::<Vec<usize>>().clear();
+        sim.read::<ParCommandBuffer<VehicleEnt>>()
+            .exec_ent(first, move |sim| {
+                sim.write::<Vec<usize>>().push(1);
+                sim.read::<ParCommandBuffer<HumanEnt>>()
+                    .exec_ent(HumanID::default(), move |sim| {
+                        sim.write::<Vec<usize>>().push(2);
+                        sim.read::<ParCommandBuffer<VehicleEnt>>()
+                            .exec_on(reused, |trace: &mut Vec<usize>| trace.push(3));
+                    });
+            });
+        sim.apply_commands([]);
+        assert_eq!(sim.read::<Vec<usize>>().as_slice(), [1, 2, 3]);
     }
 }

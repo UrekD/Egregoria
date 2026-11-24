@@ -166,15 +166,26 @@ pub enum Rejection {
     InvalidWarehouse,
 }
 
+pub type LinkOutcome = (usize, Result<(), (&'static str, Rejection)>);
+
+struct CommandOutcomeRanges {
+    rejections: Range<usize>,
+    links: Range<usize>,
+}
+
 #[derive(Default)]
 pub struct CommandOutcomes {
-    /// Process-wide sequence of the most recent nonempty batch, including across world loads.
+    /// Process-wide sequence of the most recent nonempty outer batch, including across world loads.
     pub sequence: u64,
     /// Rejections from the most recent nonempty batch, in command order.
+    /// Leave this list intact while using indexed attribution. Use [Self::clear]
+    /// to discard the batch's outcome details.
     pub last: Vec<(&'static str, Rejection)>,
     /// Input indices of commands that completed without any rejection.
     pub accepted: Vec<usize>,
-    rejection_ranges: Vec<Range<usize>>,
+    command_ranges: Vec<CommandOutcomeRanges>,
+    links: Vec<LinkOutcome>,
+    batch_in_progress: bool,
 }
 
 impl CommandOutcomes {
@@ -185,26 +196,73 @@ impl CommandOutcomes {
     /// Rejections for the given input index in the most recent nonempty batch.
     /// Returns an empty slice for accepted commands and indices outside the batch.
     pub fn rejections_for(&self, index: usize) -> &[(&'static str, Rejection)] {
-        self.rejection_ranges
+        self.command_ranges
             .get(index)
-            .and_then(|range| self.last.get(range.clone()))
+            .and_then(|ranges| self.last.get(ranges.rejections.clone()))
             .unwrap_or_default()
     }
 
-    pub(crate) fn begin_batch(&mut self) {
-        static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
-        self.sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        self.last.clear();
-        self.accepted.clear();
-        self.rejection_ranges.clear();
+    /// Results of the attempted links in a multi-connection command, in input order.
+    /// Each entry carries its zero-based link index. A command-level rejection
+    /// before link processing yields an empty slice.
+    pub fn link_outcomes(&self, index: usize) -> &[LinkOutcome] {
+        self.command_ranges
+            .get(index)
+            .map(|ranges| &self.links[ranges.links.clone()])
+            .unwrap_or_default()
     }
 
-    pub(crate) fn record_command(&mut self, rejection_start: usize) {
+    /// Discards the completed batch's outcomes while preserving its sequence.
+    pub fn clear(&mut self) {
+        self.last.clear();
+        self.accepted.clear();
+        self.command_ranges.clear();
+        self.links.clear();
+    }
+
+    pub(crate) fn begin_batch(&mut self) -> Option<Self> {
+        static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+        // A callback can apply a nested batch. Keep the outer outcomes intact
+        // while the nested commands and their callbacks run.
+        let parent = self.batch_in_progress.then(|| std::mem::take(self));
+        self.clear();
+        self.sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        self.batch_in_progress = true;
+        parent
+    }
+
+    pub(crate) fn finish_batch(&mut self, parent: Option<Self>) {
+        if let Some(parent) = parent {
+            *self = parent;
+        } else {
+            self.batch_in_progress = false;
+        }
+    }
+
+    pub(crate) fn command_start(&self) -> (usize, usize) {
+        (self.last.len(), self.links.len())
+    }
+
+    pub(crate) fn record_command(
+        &mut self,
+        index: usize,
+        (rejection_start, link_start): (usize, usize),
+    ) {
         let rejection_end = self.last.len();
         if rejection_start == rejection_end {
-            self.accepted.push(self.rejection_ranges.len());
+            self.accepted.push(index);
         }
-        self.rejection_ranges.push(rejection_start..rejection_end);
+        self.command_ranges.push(CommandOutcomeRanges {
+            rejections: rejection_start..rejection_end,
+            links: link_start..self.links.len(),
+        });
+    }
+
+    fn record_link(&mut self, index: usize, result: Result<(), (&'static str, Rejection)>) {
+        if let Err(rejection) = result {
+            self.last.push(rejection);
+        }
+        self.links.push((index, result));
     }
 }
 
@@ -212,6 +270,7 @@ impl CommandOutcomes {
 mod tests {
     use super::*;
     use crate::tests::TestCtx;
+    use crate::{ParCommandBuffer, VehicleEnt, VehicleID};
 
     #[test]
     fn scale_t0_rejections_follow_batch_input_indices() {
@@ -259,6 +318,102 @@ mod tests {
         assert!(outcomes.rejections_for(0).is_empty());
         assert_eq!(outcomes.rejections_for(1), [house]);
         assert!(outcomes.rejections_for(2).is_empty());
+    }
+
+    #[test]
+    fn scale_t0_callback_rejection_belongs_to_command_that_drains_it() {
+        let mut sim = TestCtx::new().g;
+        let command = WorldCommand::SetGameTime(*sim.read::<GameTime>());
+        sim.read::<ParCommandBuffer<VehicleEnt>>()
+            .exec_ent(VehicleID::default(), |sim| {
+                WorldCommand::MapBuildHouse(LotID::default())
+                    .reject(sim, Rejection::MissingReference);
+            });
+
+        sim.apply_commands([&command, &command]);
+
+        let outcomes = sim.read::<CommandOutcomes>();
+        let rejection = ("MapBuildHouse", Rejection::MissingReference);
+        assert_eq!(outcomes.accepted, [1]);
+        assert_eq!(outcomes.last, [rejection]);
+        assert_eq!(outcomes.rejections_for(0), [rejection]);
+        assert!(outcomes.rejections_for(1).is_empty());
+    }
+
+    #[test]
+    fn scale_t0_nested_batches_preserve_outer_outcomes() {
+        let mut sim = TestCtx::new().g;
+        let accepted = WorldCommand::SetGameTime(*sim.read::<GameTime>());
+        let rejected = WorldCommand::MapBuildHouse(LotID::default());
+        sim.read::<ParCommandBuffer<VehicleEnt>>()
+            .exec_ent(VehicleID::default(), |sim| {
+                let nested_accepted = WorldCommand::SetGameTime(*sim.read::<GameTime>());
+                let nested_rejected = WorldCommand::MapRemoveRoad(RoadID::default());
+                nested_rejected.apply(sim);
+                nested_accepted.apply(sim);
+            });
+
+        sim.apply_commands([&rejected, &accepted]);
+
+        let outcomes = sim.read::<CommandOutcomes>();
+        let house = ("MapBuildHouse", Rejection::MissingReference);
+        assert_eq!(outcomes.accepted, [1]);
+        assert_eq!(outcomes.last, [house]);
+        assert_eq!(outcomes.rejections_for(0), [house]);
+        assert!(outcomes.rejections_for(1).is_empty());
+    }
+
+    #[test]
+    fn scale_t0_link_outcomes_distinguish_a_success_between_identical_rejections() {
+        let mut sim = TestCtx::new().g;
+        let accepted = WorldCommand::SetGameTime(*sim.read::<GameTime>());
+        let pattern = LanePatternBuilder::default().build();
+        let projects = vec![
+            MapProject::ground(vec3(100.0, 100.0, 0.0)),
+            MapProject::ground(vec3(100.5, 100.0, 0.0)),
+            MapProject::ground(vec3(310.0, 100.0, 0.0)),
+            MapProject::ground(vec3(310.5, 100.0, 0.0)),
+        ];
+        let multi = WorldCommand::MapMakeMultipleConnections(
+            projects.clone(),
+            vec![
+                (0, 1, None, pattern.clone()),
+                (0, 2, None, pattern.clone()),
+                (2, 3, None, pattern.clone()),
+            ],
+        );
+        let malformed = WorldCommand::MapMakeMultipleConnections(
+            projects,
+            vec![(0, 2, None, pattern.clone()), (0, 4, None, pattern)],
+        );
+        let road_count = sim.map().roads().len();
+
+        sim.apply_commands([&accepted, &multi, &malformed, &accepted]);
+
+        let mut outcomes = sim.write::<CommandOutcomes>();
+        let kind = "MapMakeMultipleConnections";
+        let invalid = (kind, Rejection::InvalidConnection);
+        let invalid_index = (kind, Rejection::InvalidBatchIndex);
+        assert_eq!(sim.map().roads().len(), road_count + 1);
+        assert_eq!(outcomes.accepted, [0, 3]);
+        assert_eq!(outcomes.last, [invalid, invalid, invalid_index]);
+        assert_eq!(outcomes.rejections_for(1), [invalid, invalid]);
+        assert_eq!(outcomes.rejections_for(2), [invalid_index]);
+        assert_eq!(
+            outcomes.link_outcomes(1),
+            [(0, Err(invalid)), (1, Ok(())), (2, Err(invalid))]
+        );
+        for index in [0, 2, 3, 4] {
+            assert!(outcomes.link_outcomes(index).is_empty());
+        }
+
+        let sequence = outcomes.batch_seq();
+        outcomes.clear();
+        assert_eq!(outcomes.batch_seq(), sequence);
+        assert!(outcomes.accepted.is_empty());
+        assert!(outcomes.last.is_empty());
+        assert!(outcomes.rejections_for(1).is_empty());
+        assert!(outcomes.link_outcomes(1).is_empty());
     }
 }
 
@@ -448,7 +603,13 @@ impl WorldCommand {
     }
 
     fn reject(&self, sim: &Simulation, reason: Rejection) {
-        let kind = match self {
+        sim.write::<CommandOutcomes>()
+            .last
+            .push((self.kind(), reason));
+    }
+
+    fn kind(&self) -> &'static str {
+        match self {
             Init(_) => "Init",
             MapRemoveIntersection(_) => "MapRemoveIntersection",
             MapRemoveRoad(_) => "MapRemoveRoad",
@@ -478,8 +639,7 @@ impl WorldCommand {
             TransitSetFare { .. } => "TransitSetFare",
             SetWarehousePolicy { .. } => "SetWarehousePolicy",
             SetLotLayout(_) => "SetLotLayout",
-        };
-        sim.write::<CommandOutcomes>().last.push((kind, reason));
+        }
     }
 
     fn validate_progression(&self, sim: &Simulation) -> Result<(), Rejection> {
@@ -731,7 +891,11 @@ impl WorldCommand {
             .collect();
         let mut junctions = BTreeSet::new();
         let mut splits = BTreeMap::new();
-        for &(from, to, interpoint, ref pat) in links {
+        let record_link = |index, result: Result<(), Rejection>| {
+            sim.write::<CommandOutcomes>()
+                .record_link(index, result.map_err(|reason| (self.kind(), reason)));
+        };
+        for (index, &(from, to, interpoint, ref pat)) in links.iter().enumerate() {
             let resolve = |index: usize| {
                 let project = endpoints[index]?;
                 if let ProjectKind::Road(id) = project.kind {
@@ -742,11 +906,11 @@ impl WorldCommand {
                 map.resolve_connection_endpoint(project)
             };
             let Some((fromproj, toproj)) = resolve(from).zip(resolve(to)) else {
-                self.reject(sim, Rejection::MissingReference);
+                record_link(index, Err(Rejection::MissingReference));
                 continue;
             };
             if !Map::can_connect(fromproj, toproj, interpoint, pat) {
-                self.reject(sim, Rejection::InvalidConnection);
+                record_link(index, Err(Rejection::InvalidConnection));
                 continue;
             }
             let cost = match Self::affordable_cost(
@@ -755,7 +919,7 @@ impl WorldCommand {
             ) {
                 Ok(cost) => cost,
                 Err(reason) => {
-                    self.reject(sim, reason);
+                    record_link(index, Err(reason));
                     continue;
                 }
             };
@@ -774,6 +938,7 @@ impl WorldCommand {
                 junctions.insert(id);
             }
             Self::charge_construction(sim, cost, construction);
+            record_link(index, Ok(()));
         }
         // Keep junction IDs alive until every link that names them has been processed.
         for junction in junctions {

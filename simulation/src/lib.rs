@@ -475,12 +475,12 @@ impl Simulation {
         }
         let topology_generation = self.map().walking_topology_generation;
         let recording_start = self.read::<Replay>().command_count();
-        self.write::<CommandOutcomes>().begin_batch();
-        for command in commands {
-            let before = self.read::<CommandOutcomes>().last.len();
+        let parent = self.write::<CommandOutcomes>().begin_batch();
+        for (index, command) in commands.enumerate() {
+            let start = self.read::<CommandOutcomes>().command_start();
             command.apply_in_batch(self, construction);
             utils::scheduler::drain_commands(self);
-            self.write::<CommandOutcomes>().record_command(before);
+            self.write::<CommandOutcomes>().record_command(index, start);
         }
         if self.map().walking_topology_generation != topology_generation {
             transit::on_topology_changed(self);
@@ -488,6 +488,7 @@ impl Simulation {
         }
         self.write::<Replay>()
             .record_batch(recording_start, steps_systems, Tick(self.get_tick()));
+        self.write::<CommandOutcomes>().finish_batch(parent);
     }
 
     pub fn get_tick(&self) -> u64 {
