@@ -1,5 +1,7 @@
 use super::network::{
-    clean_network, Graph, JunctionSpec, LinkSpec, RoadClass, SourceKey, SpacingLimits,
+    calibrate_storage, clean_network, connect_infill, finish_network, main_components,
+    retire_outer_road_fragments, segment_parameters, Graph, JunctionSpec, LinkSpec, RoadClass,
+    SourceKey, SpacingLimits,
 };
 use super::source::{
     serialize_point, serialize_points, Coordinate, Element, Kind, PinnedInputs, TownConfig,
@@ -17,7 +19,11 @@ pub struct TownPlan {
     pub features: Vec<Feature>,
     pub districts: Vec<District>,
     pub river: Vec<RiverReach>,
+    pub source_river: Vec<RiverReach>,
+    pub riverside_park: Option<RiversidePark>,
     pub crossings: Vec<CrossingSpec>,
+    pub outer_corridor_traces: Vec<CorridorTrace>,
+    pub mapped_sava_bridges: Vec<Feature>,
     #[serde(serialize_with = "serialize_point")]
     pub station: Vec2,
 }
@@ -64,6 +70,21 @@ pub struct RiverReach {
 }
 
 #[derive(Debug, Serialize)]
+pub struct RiversidePark {
+    #[serde(serialize_with = "serialize_points")]
+    pub bank_strip: Vec<Vec2>,
+    pub far_bank_access: SourceKey,
+}
+
+#[derive(Debug, Serialize)]
+pub struct CorridorTrace {
+    pub way: u64,
+    pub class: RoadClass,
+    #[serde(serialize_with = "serialize_points")]
+    pub points: Vec<Vec2>,
+}
+
+#[derive(Debug, Serialize)]
 pub struct CrossingSpec {
     pub key: &'static str,
     #[serde(serialize_with = "serialize_point")]
@@ -71,7 +92,13 @@ pub struct CrossingSpec {
     #[serde(serialize_with = "serialize_points")]
     pub approaches: [Vec2; 2],
     pub river_way: u64,
-    pub mapped_bridge: Option<u64>,
+    pub bridge: SourceKey,
+    pub class: RoadClass,
+    pub approaches_keys: [SourceKey; 2],
+    pub approaches_links: [SourceKey; 2],
+    pub deck_width_m: f32,
+    pub max_approach_grade: f32,
+    pub without_bridge_check: &'static str,
 }
 
 pub fn plan_town(
@@ -83,19 +110,81 @@ pub fn plan_town(
     limits.validate()?;
     let elements = inputs.lesce.elements();
     let source_graph = source_graph(elements, config)?;
-    let graph = clean_network(source_graph.clone(), limits, config)?;
+    let mut graph = clean_network(source_graph.clone(), limits, config)?;
+    let preview = super::preview_world(config)?;
+    let map = preview.map();
     let station = elements
         .iter()
         .find(|element| element.kind == Kind::Node && element.id == 5685260194)
         .and_then(|element| element.point(config))
         .ok_or("missing Lesce-Bled station node")?;
     let features = feature_rings(elements, config);
-    let (river, crossings) = inputs
-        .sava
-        .as_ref()
-        .map(|sava| water_reservations(sava.elements(), config))
-        .transpose()?
-        .unwrap_or_default();
+    let districts = districts(config);
+    let infill: Vec<_> = ["south", "west", "hraska", "station", "employment"]
+        .iter()
+        .filter_map(|key| districts.iter().find(|district| district.key == *key))
+        .map(|district| district.polygon.as_slice())
+        .collect();
+    let mut source_river = Vec::new();
+    let mut river = Vec::new();
+    let mut crossings = Vec::new();
+    let mut riverside_park = None;
+    let mut mapped_sava_bridges = Vec::new();
+    if let Some(sava) = &inputs.sava {
+        source_river = real_river(sava.elements(), config);
+        mapped_sava_bridges = sava
+            .elements()
+            .iter()
+            .filter(|element| element.kind == Kind::Way && !element.tag("bridge").is_empty())
+            .map(|element| Feature {
+                source: element.id,
+                kind: KindLabel::Way,
+                role: format!("bridge={}", element.tag("highway")),
+                geometry: element
+                    .geometry
+                    .iter()
+                    .map(|point| point.project(config))
+                    .collect(),
+                hole: false,
+            })
+            .collect();
+        let reach = authored_river(&source_river, config)?;
+        let drowned_walks: Vec<_> = graph
+            .links
+            .values()
+            .filter(|link| {
+                (link.class == RoadClass::Walk || link.lineage.contains(&168406420))
+                    && !water_intersections(&reach, link).is_empty()
+            })
+            .map(|link| link.key)
+            .collect();
+        graph.links.retain(|key, _| !drowned_walks.contains(key));
+        graph.remove_isolated();
+        graph.record("trails and the outer Šobčeva spur intercepted by the authored Sava reroute through the bridges",
+            &drowned_walks);
+        let (bridges, park) = water_reservations(&reach, &mut graph, config)?;
+        main_components(&mut graph);
+        connect_neighbourhoods(&mut graph, config)?;
+        retire_outer_road_fragments(&mut graph, &infill)?;
+        finish_network(&mut graph, limits)?;
+        calibrate_storage(&mut graph, config, limits, &map.environment)?;
+        main_components(&mut graph);
+        connect_infill(
+            &mut graph,
+            limits,
+            &infill,
+            &reach.downstream,
+            &map.environment,
+        );
+        finish_network(&mut graph, limits)?;
+        validate_river_crossings(&reach, &bridges, &graph)?;
+        river.push(reach);
+        crossings = bridges;
+        riverside_park = Some(park);
+    } else {
+        retire_outer_road_fragments(&mut graph, &infill)?;
+        calibrate_storage(&mut graph, config, limits, &map.environment)?;
+    }
 
     Ok(TownPlan {
         config,
@@ -103,9 +192,13 @@ pub fn plan_town(
         source_graph,
         graph,
         features,
-        districts: districts(config),
+        districts,
         river,
+        source_river,
+        riverside_park,
         crossings,
+        outer_corridor_traces: outer_corridor_traces(elements, config),
+        mapped_sava_bridges,
         station,
     })
 }
@@ -116,7 +209,9 @@ struct Sample {
     point: Vec2,
 }
 
-const A2_MAINLINE: &[u64] = &[64017257, 476387831, 61232337, 475299897, 61233481];
+const A2_MAINLINE: &[u64] = &[
+    61696631, 344507323, 344507322, 37849482, 64017257, 476387831, 61232337, 475299897, 61233481,
+];
 const HRASKA_SPLITTERS: &[u64] = &[
     26270881, 26398035, 358555158, 358555279, 1288727380, 1288727382, 1288727383, 1288727384,
 ];
@@ -233,6 +328,32 @@ fn clipped_way(element: &Element, config: TownConfig, rail: bool) -> Vec<Vec<Sam
         spans.push(span);
     }
     spans
+}
+
+fn outer_corridor_traces(elements: &[Element], config: TownConfig) -> Vec<CorridorTrace> {
+    let max = Vec2::splat(f32::from(config.map_chunks) * 512.0);
+    let outer = TownConfig {
+        owned_min: Vec2::ZERO,
+        owned_max: max,
+        translation: config.translation + (config.owned_min + config.owned_max - max) * 0.5,
+        ..config
+    };
+    elements
+        .iter()
+        .filter_map(|element| {
+            let class = road_class(element)?;
+            matches!(class, RoadClass::Motorway | RoadClass::Rail).then_some((element, class))
+        })
+        .flat_map(|(element, class)| {
+            clipped_way(element, outer, class == RoadClass::Rail)
+                .into_iter()
+                .map(move |span| CorridorTrace {
+                    way: element.id,
+                    class,
+                    points: span.into_iter().map(|sample| sample.point).collect(),
+                })
+        })
+        .collect()
 }
 
 fn source_graph(elements: &[Element], config: TownConfig) -> Result<Graph, String> {
@@ -479,85 +600,471 @@ fn feature_rings(elements: &[Element], config: TownConfig) -> Vec<Feature> {
     features
 }
 
-fn water_reservations(
-    elements: &[Element],
-    config: TownConfig,
-) -> Result<(Vec<RiverReach>, Vec<CrossingSpec>), String> {
-    let mut river = Vec::new();
-    for element in elements
+fn real_river(elements: &[Element], config: TownConfig) -> Vec<RiverReach> {
+    elements
         .iter()
         .filter(|element| element.tag("waterway") == "river")
-    {
-        let width = element
-            .tag("width")
-            .trim_end_matches(" m")
-            .parse::<f32>()
-            .ok()
-            .map(|width| width * TownConfig::SCALE);
-        for span in clipped_way(element, config, false) {
-            river.push(RiverReach {
-                way: element.id,
-                downstream: span.into_iter().map(|sample| sample.point).collect(),
-                source_width_scaled: width,
-            });
+        .map(|element| RiverReach {
+            way: element.id,
+            downstream: element
+                .geometry
+                .iter()
+                .map(|point| point.project(config))
+                .collect(),
+            source_width_scaled: element
+                .tag("width")
+                .trim_end_matches(" m")
+                .parse::<f32>()
+                .ok()
+                .map(|width| width * TownConfig::SCALE),
+        })
+        .collect()
+}
+
+fn authored_river(source: &[RiverReach], config: TownConfig) -> Result<RiverReach, String> {
+    let real = source
+        .iter()
+        .find(|reach| reach.way == 863152620)
+        .ok_or("missing Sava Dolinka trace")?;
+    // Use the real local bend to modulate the authored guide. An along-reach
+    // coordinate preserves downstream order and the smoothed transverse drift
+    // carries the mapped bend's shape into the new alignment.
+    let start = design_point(vec2(-428.0, 1187.0), config);
+    let end = design_point(vec2(970.0, -521.0), config);
+    let nearest = |target: Vec2| {
+        real.downstream
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| a.distance2(target).total_cmp(&b.distance2(target)))
+            .map(|(index, _)| index)
+            .unwrap()
+    };
+    let source = &real.downstream[nearest(start)..=nearest(end)];
+    let start = source[0];
+    let end = *source.last().unwrap();
+    let direction = (end - start).normalize();
+    let mut offset = Vec::with_capacity(source.len());
+    let mut length = 0.0;
+    for (i, point) in source.iter().enumerate() {
+        if i > 0 {
+            length += source[i - 1].distance(*point);
+        }
+        offset.push((length, (*point - start).dot(direction.perpendicular())));
+    }
+    let guide = [
+        (-1300.0, 1590.0),
+        (-550.0, 1440.0),
+        (0.0, 1290.0),
+        (360.0, 1110.0),
+        (650.0, 1000.0),
+        (900.0, 860.0),
+        (1180.0, 720.0),
+        (1410.0, 560.0),
+        (1510.0, 400.0),
+        (1570.0, 210.0),
+        (1600.0, -50.0),
+        (1660.0, -1300.0),
+    ]
+    .map(|(x, y)| vec2(x, y));
+    let smooth = |index: usize, t: f32| {
+        let a = guide[index];
+        let b = guide[index + 1];
+        let before = guide[index.saturating_sub(1)];
+        let after = guide[(index + 2).min(guide.len() - 1)];
+        let dx = b.x - a.x;
+        let da = dx * (b.y - before.y) / (b.x - before.x);
+        let db = dx * (after.y - a.y) / (after.x - a.x);
+        let y = a.y
+            + t * (da
+                + t * (3.0 * (b.y - a.y) - 2.0 * da - db + t * (2.0 * (a.y - b.y) + da + db)));
+        vec2(a.x + t * dx, y)
+    };
+    let mut points = Vec::new();
+    for (i, segment) in guide.windows(2).enumerate() {
+        let steps = (segment[0].distance(segment[1]) / 22.0).ceil() as usize;
+        for j in 0..steps {
+            let point = smooth(i, j as f32 / steps as f32);
+            let progress = (point.x - guide[0].x) / (guide.last().unwrap().x - guide[0].x);
+            let d = length * progress;
+            let next = offset
+                .partition_point(|&(along, _)| along <= d)
+                .clamp(1, offset.len() - 1);
+            let (a, ya) = offset[next - 1];
+            let (b, yb) = offset[next];
+            let drift = ya + (yb - ya) * ((d - a) / (b - a)).clamp(0.0, 1.0);
+            points.push(design_point(point + vec2(0.0, drift * 0.055), config));
         }
     }
-    let reach = river
-        .iter()
-        .max_by(|a, b| {
-            super::network::arc(&a.downstream).total_cmp(&super::network::arc(&b.downstream))
-        })
-        .ok_or("pinned Sava does not reach the owned rectangle")?;
-    let crossings = [
-        ("sava-town", vec2(320.0, 645.0)),
-        ("sava-rim", vec2(245.0, 290.0)),
-    ]
-    .into_iter()
-    .map(|(key, target)| {
-        let target = design_point(target, config);
-        let (point, tangent) = reach
+    points.push(design_point(*guide.last().unwrap(), config));
+    // Retain the entire terrain reach for TILES. The schematic clips it to
+    // the owned rectangle, and WATER can use the same line past that frame.
+    let max = Vec2::splat(f32::from(config.map_chunks) * 512.0);
+    let mut downstream = Vec::new();
+    for segment in points.windows(2) {
+        let (a, b) = (segment[0], segment[1]);
+        if let Some((start, end)) = clip(a, b, Vec2::ZERO, max) {
+            if downstream.is_empty() {
+                downstream.push(a + start * (b - a));
+            }
+            downstream.push(a + end * (b - a));
+        }
+    }
+    if downstream.len() < 2 {
+        return Err("authored Sava misses the terrain".into());
+    }
+    Ok(RiverReach {
+        way: real.way,
+        downstream,
+        source_width_scaled: real.source_width_scaled,
+    })
+}
+
+fn water_reservations(
+    river: &RiverReach,
+    graph: &mut Graph,
+    config: TownConfig,
+) -> Result<(Vec<CrossingSpec>, RiversidePark), String> {
+    let node = |id| SourceKey::Node { id, rail: false };
+    let specs = [
+        (
+            "sava-rim",
+            RoadClass::Collector,
+            895.0,
+            "sava-rim-town",
+            "sava-rim-park",
+            "sava-rim-approach",
+            [node(1796759067), node(1796759070), node(4193639599)],
+        ),
+        (
+            "sava-town",
+            RoadClass::Avenue,
+            1360.0,
+            "sava-town-north",
+            "sava-town-park",
+            "sava-town-approach",
+            [node(1800677047), node(1796759046), node(862116469)],
+        ),
+    ];
+    let mut crossings = Vec::new();
+    let bank_link = SourceKey::Authored("sava-far-bank-parkway");
+    for (key, class, x, town, park, approach, anchors) in specs {
+        let x = design_point(vec2(x, 0.0), config).x;
+        let [a, b] = river
             .downstream
             .windows(2)
-            .map(|segment| {
-                let point = super::network::project_on_segment(target, segment[0], segment[1]);
-                (point, segment[1] - segment[0])
-            })
-            .min_by(|(a, _), (b, _)| a.distance2(target).total_cmp(&b.distance2(target)))
-            .unwrap();
-        let normal = vec2(-tangent.y, tangent.x).normalize();
-        let approaches = [point - 110.0 * normal, point + 110.0 * normal];
+            .find(|pair| pair[0].x <= x && pair[1].x >= x)
+            .map(|pair| [pair[0], pair[1]])
+            .ok_or("Sava crossing lies outside the authored reach")?;
+        let point = a + (b - a) * ((x - a.x) / (b.x - a.x));
+        let normal = -(b - a).normalize().perpendicular();
+        let approaches = [point + 104.0 * normal, point - 104.0 * normal];
         if approaches.iter().any(|&point| !inside(point, config)) {
             return Err(format!(
-                "Sava reservation {key} has an approach beyond the start area"
+                "Sava reservation {key} has an approach outside the owned area"
             ));
         }
-        let mapped_bridge = elements
-            .iter()
-            .filter(|element| !element.tag("bridge").is_empty())
-            .find(|bridge| {
-                bridge.geometry.windows(2).any(|pair| {
-                    let a = pair[0].project(config);
-                    let b = pair[1].project(config);
-                    super::network::project_on_segment(point, a, b).distance(point) < 25.0
-                })
-            })
-            .map(|bridge| bridge.id);
-        Ok(CrossingSpec {
+        let [town, park] = [town, park].map(SourceKey::Authored);
+        for (key, point) in [town, park].into_iter().zip(approaches) {
+            graph.junctions.insert(key, JunctionSpec::new(key, point));
+        }
+        let anchor = anchors
+            .into_iter()
+            .find(|key| graph.junctions.contains_key(key))
+            .ok_or_else(|| format!("missing {key} neighbourhood connection"))?;
+        let bridge = SourceKey::Authored(key);
+        add_authored_road(graph, bridge, [town, park], class, None, 1);
+        let approach = SourceKey::Authored(approach);
+        let bend = (class == RoadClass::Avenue).then(|| design_point(vec2(1370.0, 857.0), config));
+        add_authored_road(graph, approach, [anchor, town], class, bend, 0);
+        crossings.push(CrossingSpec {
             key,
             point,
             approaches,
-            river_way: reach.way,
-            mapped_bridge,
+            river_way: river.way,
+            bridge,
+            class,
+            approaches_keys: [town, park],
+            approaches_links: [approach, bank_link],
+            deck_width_m: class.pattern(false, 0.0).width(),
+            max_approach_grade: 0.08,
+            without_bridge_check: if class == RoadClass::Collector {
+                "far_bank_reachable_without_sava_rim"
+            } else {
+                "far_bank_reachable_without_sava_town"
+            },
+        });
+    }
+    let far_bank = [
+        crossings[0].approaches_keys[1],
+        crossings[1].approaches_keys[1],
+    ];
+    add_authored_road(
+        graph,
+        bank_link,
+        far_bank,
+        RoadClass::Collector,
+        Some(design_point(vec2(1000.0, 590.0), config)),
+        0,
+    );
+    let sobceva = node(275779742);
+    if graph.junctions.contains_key(&sobceva) {
+        let key = SourceKey::Authored("sava-sobceva-access");
+        add_authored_road(
+            graph,
+            key,
+            [far_bank[0], sobceva],
+            RoadClass::Collector,
+            None,
+            0,
+        );
+        graph.record(
+            "collector ties the mapped Šobčeva far-bank streets to the western bridge",
+            &[key, sobceva],
+        );
+    }
+    graph.record(
+        "two Sava reservations connect neighbourhood roads to the far-bank parkway",
+        &[crossings[0].bridge, crossings[1].bridge, bank_link],
+    );
+    let park_start = design_point(vec2(970.0, 0.0), config).x;
+    let park_end = design_point(vec2(1510.0, 0.0), config).x;
+    let bank: Vec<_> = river
+        .downstream
+        .windows(3)
+        .filter(|points| points[1].x >= park_start && points[1].x <= park_end)
+        .map(|points| {
+            (
+                points[1],
+                -(points[2] - points[0]).normalize().perpendicular(),
+            )
         })
-    })
-    .collect::<Result<Vec<_>, String>>()?;
-    Ok((river, crossings))
+        .collect();
+    let bank_strip = bank
+        .iter()
+        .map(|&(point, normal)| point + normal * 52.0)
+        .chain(
+            bank.iter()
+                .rev()
+                .map(|&(point, normal)| point + normal * 86.0),
+        )
+        .collect();
+    Ok((
+        crossings,
+        RiversidePark {
+            bank_strip,
+            far_bank_access: bank_link,
+        },
+    ))
+}
+
+fn connect_neighbourhoods(graph: &mut Graph, config: TownConfig) -> Result<(), String> {
+    let node = |id| SourceKey::Node { id, rail: false };
+    let local = SourceKey::Authored;
+    let h_west = node(4193639703);
+    let h_east = node(4193639677);
+    let h_school = node(13109951568);
+    let e_north = node(4193639635);
+    let e_south = node(4445164883);
+    let station = node(11950257454);
+    let alpska = node(781857034);
+    for key in [h_west, h_east, h_school, station, alpska] {
+        if !graph.junctions.contains_key(&key) {
+            return Err(format!("missing source entrance for neighbourhood {key:?}"));
+        }
+    }
+    let north = [
+        ("hraska-elm", 1790.0, 2410.0),
+        ("hraska-orchard", 1905.0, 2452.0),
+        ("hraska-school-bend", 2033.0, 2430.0),
+        ("hraska-meadow", 2163.0, 2386.0),
+        ("hraska-grove", 1750.0, 2517.0),
+        ("hraska-north-orchard", 1858.0, 2581.0),
+        ("hraska-north-meadow", 1989.0, 2556.0),
+        ("hraska-high-grove", 2100.0, 2548.0),
+        ("hraska-high-meadow", 2198.0, 2489.0),
+        ("hraska-west-grove", 1637.0, 2510.0),
+        ("hraska-west-park", 1636.0, 2398.0),
+        ("hraska-ridge", 1953.0, 2680.0),
+        ("hraska-school-gate", 1912.0, 2330.0),
+        ("hraska-school-approach", 2028.0, 2335.0),
+    ];
+    let employment = [
+        ("freight-north-yard", 2673.0, 2363.0),
+        ("freight-rim-bend", 2788.0, 2308.0),
+        ("freight-east-yard", 2849.0, 2191.0),
+        ("freight-west-yard", 2642.0, 2242.0),
+    ];
+    let fit_employment = [e_north, e_south]
+        .iter()
+        .all(|key| graph.junctions.contains_key(key))
+        && employment.iter().all(|&(_, x, y)| {
+            let point = design_point(vec2(x, y), config);
+            inside(point + Vec2::splat(24.0), config) && inside(point - Vec2::splat(24.0), config)
+        });
+    for (name, x, y) in north
+        .into_iter()
+        .chain(employment.into_iter().filter(|_| fit_employment))
+    {
+        let key = local(name);
+        graph.junctions.insert(
+            key,
+            JunctionSpec::new(key, design_point(vec2(x, y), config)),
+        );
+    }
+    let n = |index: usize| local(north[index].0);
+    let e = |index: usize| local(employment[index].0);
+    let streets = [
+        ("hraska-elm-entry", h_west, n(0), 5.0),
+        ("hraska-orchard-street", n(0), n(1), -7.0),
+        ("hraska-school-frontage", n(1), n(2), 4.0),
+        ("hraska-meadow-street", n(2), n(3), -6.0),
+        ("hraska-east-entry", n(3), h_east, 7.0),
+        ("hraska-grove-approach", n(0), n(4), -5.0),
+        ("hraska-upper-orchard", n(4), n(5), 6.0),
+        ("hraska-upper-meadow", n(5), n(6), -7.0),
+        ("hraska-high-grove-street", n(6), n(7), 5.0),
+        ("hraska-high-meadow-street", n(7), n(8), -5.0),
+        ("hraska-meadow-turn", n(8), n(3), 4.0),
+        ("hraska-orchard-link", n(1), n(5), -4.0),
+        ("hraska-school-link", n(2), n(6), 4.0),
+        ("hraska-west-grove-bend", n(4), n(9), -6.0),
+        ("hraska-west-park-frontage", n(9), n(10), 5.0),
+        ("hraska-park-approach", n(10), h_west, -5.0),
+        ("hraska-north-ridge", n(5), n(11), 9.0),
+        ("hraska-ridge-meadow", n(11), n(6), -7.0),
+        ("hraska-school-south", n(1), n(12), 5.0),
+        ("hraska-school-curve", n(12), n(13), -6.0),
+        ("hraska-school-entry", n(13), h_school, 4.0),
+    ];
+    let freight_streets = [
+        ("freight-north-entry", e_north, e(0), 5.0),
+        ("freight-rim-frontage", e(0), e(1), 9.0),
+        ("freight-east-bend", e(1), e(2), -8.0),
+        ("freight-south-entry", e(2), e_south, 4.0),
+        ("freight-west-frontage", e(0), e(3), -5.0),
+        ("freight-yard-link", e(3), e_south, 6.0),
+    ];
+    for (name, a, b, bend) in streets
+        .into_iter()
+        .chain(freight_streets.into_iter().filter(|_| fit_employment))
+    {
+        let [from, to] = [a, b].map(|key| graph.junctions[&key].position.xy());
+        let elbow = (from + to) * 0.5 + (to - from).normalize().perpendicular() * bend;
+        add_authored_road(graph, local(name), [a, b], RoadClass::Local, Some(elbow), 0);
+    }
+    let station_bend = local("station-civic-block");
+    graph.junctions.insert(
+        station_bend,
+        JunctionSpec::new(station_bend, design_point(vec2(2210.0, 1633.0), config)),
+    );
+    add_authored_road(
+        graph,
+        local("station-civic-entry"),
+        [station, station_bend],
+        RoadClass::Local,
+        Some(design_point(vec2(2158.0, 1643.0), config)),
+        0,
+    );
+    add_authored_road(
+        graph,
+        local("station-alpska-entry"),
+        [station_bend, alpska],
+        RoadClass::Local,
+        Some(design_point(vec2(2253.0, 1645.0), config)),
+        0,
+    );
+    graph.record(
+        "short civic frontage closes the station block and adds an Alpska exit",
+        &[station, station_bend, alpska],
+    );
+    graph.record(
+        "curved Hraška residential streets join three source entrances",
+        &[h_west, h_east, h_school],
+    );
+    if fit_employment {
+        graph.record(
+            "freight frontage loops between two source entrances",
+            &[e_north, e_south],
+        );
+    }
+    Ok(())
+}
+
+fn add_authored_road(
+    graph: &mut Graph,
+    key: SourceKey,
+    endpoints: [SourceKey; 2],
+    class: RoadClass,
+    elbow: Option<Vec2>,
+    layer: i8,
+) {
+    let points = endpoints
+        .map(|key| graph.junctions[&key].position.xy())
+        .to_vec();
+    graph.links.insert(
+        key,
+        LinkSpec {
+            key,
+            endpoints,
+            class,
+            layer,
+            elbow,
+            points,
+            one_way: false,
+            roundabout: false,
+            named: false,
+            lineage: BTreeSet::new(),
+            samples: Vec::new(),
+            realigned: false,
+            inherited: Vec::new(),
+        },
+    );
+}
+
+fn water_intersections(river: &RiverReach, link: &LinkSpec) -> Vec<Vec2> {
+    link.points
+        .windows(2)
+        .flat_map(|road| {
+            river.downstream.windows(2).filter_map(move |water| {
+                let (along, _) = segment_parameters(road[0], road[1], water[0], water[1])?;
+                Some(road[0] + along * (road[1] - road[0]))
+            })
+        })
+        .collect()
+}
+
+fn validate_river_crossings(
+    river: &RiverReach,
+    crossings: &[CrossingSpec],
+    graph: &Graph,
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    for link in graph.links.values() {
+        let intersections = water_intersections(river, link);
+        let expected = crossings
+            .iter()
+            .find(|crossing| crossing.bridge == link.key);
+        match expected {
+            Some(crossing)
+                if intersections.len() == 1 && intersections[0].distance(crossing.point) < 1.0 => {}
+            None if intersections.is_empty() => {}
+            _ => errors.push(format!("{:?}: {intersections:?}", link.key)),
+        }
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "inconsistent Sava crossings: {}",
+            errors.join(", ")
+        ))
+    }
 }
 
 pub(crate) fn design_point(point: Vec2, config: TownConfig) -> Vec2 {
     let baseline = TownConfig::default();
-    point + config.translation - baseline.translation
-        + (config.owned_min + config.owned_max - baseline.owned_max) * 0.5
+    let (lat, lon) = (baseline.latitude, baseline.longitude);
+    point + (config.project(lat, lon) - baseline.project(lat, lon))
 }
 
 fn districts(config: TownConfig) -> Vec<District> {
@@ -596,9 +1103,11 @@ fn districts(config: TownConfig) -> Vec<District> {
             "south",
             "South / river-facing homes",
             &[
-                (1250., 660.),
-                (1570., 510.),
-                (2060., 655.),
+                (1370., 720.),
+                (1620., 525.),
+                (1680., 130.),
+                (2060., 95.),
+                (2170., 610.),
                 (2590., 1040.),
                 (2340., 1470.),
                 (1840., 1330.),
@@ -609,6 +1118,22 @@ fn districts(config: TownConfig) -> Vec<District> {
                 ("park", 1510., 880.),
                 ("infill", 2100., 1110.),
             ][..],
+        ),
+        (
+            "west",
+            "West / Plana and Tovarniška",
+            &[
+                (810., 1530.),
+                (995., 1200.),
+                (1250., 1115.),
+                (1480., 1200.),
+                (1630., 1470.),
+                (1510., 1820.),
+                (1630., 2190.),
+                (1300., 2330.),
+                (1020., 2140.),
+            ][..],
+            &[("infill", 1170., 1740.), ("pocket park", 1150., 1940.)][..],
         ),
         (
             "employment",

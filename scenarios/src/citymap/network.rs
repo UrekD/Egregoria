@@ -1,9 +1,11 @@
 use super::source::{serialize_optional_point, serialize_points, TownConfig};
-use geom::{vec2, Spline, Vec2, Vec3};
+use geom::{vec2, PolyLine3, Spline, Vec2, Vec3};
 use serde::Serialize;
 use simulation::map::{
-    IntersectionID, LaneID, LaneKind, LanePattern, LanePatternBuilder, LightPolicy, Map,
-    MapProject, Road, RoadID, RoadSegmentKind, TurnPolicy,
+    Environment, Intersection, IntersectionID, Intersections, LaneID, LaneKind, LanePattern,
+    LanePatternBuilder, Lanes, LightPolicy, Map, MapProject, ParkingSpots, PathKind, Pathfinder,
+    Road, RoadID, RoadSegmentKind, Roads, SpatialMap, Traversable, TraverseDirection, TraverseKind,
+    TurnPolicy, MAX_SLOPE, ROAD_Z_OFFSET,
 };
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::Simulation;
@@ -15,6 +17,7 @@ pub enum SourceKey {
     Cut { way: u64, segment: u32, side: u8 },
     Way { id: u64, span: u32 },
     Authored(&'static str),
+    Infill { number: u8, part: u8 },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize)]
@@ -172,6 +175,14 @@ impl LinkSpec {
             )
     }
 
+    fn lane_floor(&self, limits: SpacingLimits) -> f32 {
+        if self.layer > 0 && self.class.driving() {
+            limits.lane(self.class).max(limits.arterial_lane)
+        } else {
+            limits.lane(self.class)
+        }
+    }
+
     fn direction_at(&self, end: SourceKey) -> Vec2 {
         let [a, b] = [self.points[0], *self.points.last().unwrap()];
         if end == self.endpoints[0] {
@@ -229,7 +240,7 @@ impl Graph {
         result
     }
 
-    fn remove_isolated(&mut self) {
+    pub(crate) fn remove_isolated(&mut self) {
         let adjacency = self.adjacency();
         self.junctions.retain(|key, _| adjacency.contains_key(key));
     }
@@ -386,6 +397,50 @@ fn contract(
     true
 }
 
+fn consolidate_sobceva(graph: &mut Graph) {
+    // The mapped roundabout and its splitter forks lie inside the minimum
+    // junction spacing. Consolidate the four throats, including the short
+    // walking connection to Na Vrtači, into a local priority crossing.
+    let way_ids = [
+        123625633, 1288843577, 1288843578, 1288843579, 1288843580, 1288856224, 1288856225,
+        1453606426,
+    ];
+    let retired: Vec<_> = graph
+        .links
+        .values()
+        .filter(|link| link.lineage.iter().any(|id| way_ids.contains(id)))
+        .map(|link| link.key)
+        .collect();
+    let node = |id| SourceKey::Node { id, rail: false };
+    let centre = node(1377878734);
+    let Some(junction) = graph.junctions.get_mut(&centre) else {
+        return;
+    };
+    let position = junction.position.xy();
+    let members: BTreeSet<_> = retired
+        .iter()
+        .flat_map(|id| graph.links[id].endpoints)
+        .collect();
+    for id in &retired {
+        graph.links.remove(id);
+    }
+    for link in graph.links.values_mut() {
+        let last = link.points.len() - 1;
+        for (end, i) in link.endpoints.iter_mut().zip([0, last]) {
+            if members.contains(end) {
+                *end = centre;
+                link.points[i] = position;
+                link.realigned = true;
+            }
+        }
+    }
+    graph.remove_isolated();
+    graph.record(
+        "Šobčeva splitter and Na Vrtači connection consolidated into a priority junction",
+        &retired,
+    );
+}
+
 fn collapse_roundabouts(graph: &mut Graph) {
     let mut pending: Vec<_> = graph
         .links
@@ -528,14 +583,23 @@ fn fit(points: &[Vec2], envelope: f32) -> (Option<Vec2>, Vec<Vec2>, f32) {
     best
 }
 
-fn join_seams(graph: &mut Graph, envelope: f32) {
+type SeamCache = BTreeMap<SourceKey, [(SourceKey, Vec<Vec2>); 2]>;
+
+fn join_seams(graph: &mut Graph, envelope: f32, rejected: &mut SeamCache) {
     loop {
         let adjacency = graph.adjacency();
         let joined = adjacency.iter().find_map(|(&via, keys)| {
             let &[a, b] = keys.as_slice() else {
                 return None;
             };
-            if graph.junctions[&via].required {
+            if graph.junctions[&via].required
+                || rejected.get(&via).is_some_and(|entry| {
+                    entry[0].0 == a
+                        && entry[1].0 == b
+                        && entry[0].1 == graph.links[&a].points
+                        && entry[1].1 == graph.links[&b].points
+                })
+            {
                 return None;
             }
             let (mut a, mut b) = (graph.links[&a].clone(), graph.links[&b].clone());
@@ -572,12 +636,26 @@ fn join_seams(graph: &mut Graph, envelope: f32) {
                 .copied()
                 .chain(b.points.iter().copied().skip(1))
                 .collect();
-            let fits = fit(&points, envelope).2 <= envelope;
+            // Keep source junctions usable as access points instead of joining
+            // every collinear town span into a single block-long road.
+            let joins_town = matches!(a.class, RoadClass::Local | RoadClass::Collector);
+            // Fit the consolidated A2 after choosing a ramp station. An
+            // intermediate OSM way seam would otherwise constrain the split
+            // to a short piece of the same through corridor after reframing.
+            let fits = a.class == RoadClass::Motorway
+                || ((!joins_town || arc(&points) <= 170.0) && fit(&points, envelope).2 <= envelope);
+            if !fits {
+                rejected.insert(
+                    via,
+                    [keys[0], keys[1]].map(|key| (key, graph.links[&key].points.clone())),
+                );
+            }
             fits.then_some((via, a, b, points))
         });
         let Some((via, mut a, b, points)) = joined else {
             break;
         };
+        rejected.remove(&via);
         graph.links.remove(&b.key);
         graph.junctions.remove(&via);
         a.endpoints[1] = b.endpoints[1];
@@ -593,7 +671,7 @@ fn join_seams(graph: &mut Graph, envelope: f32) {
 }
 
 /// Trim isolated optional components while retaining the rail and motorway and the main connected town.
-fn main_components(graph: &mut Graph) {
+pub(crate) fn main_components(graph: &mut Graph) {
     let adjacency = graph.adjacency();
     let mut visited = BTreeSet::new();
     let mut components = Vec::<BTreeSet<SourceKey>>::new();
@@ -650,28 +728,251 @@ fn main_components(graph: &mut Graph) {
     graph.remove_isolated();
 }
 
+pub(crate) fn retire_outer_road_fragments(
+    graph: &mut Graph,
+    districts: &[&[Vec2]],
+) -> Result<(), String> {
+    let core = SourceKey::Node {
+        id: 772450604,
+        rail: false,
+    };
+    if !graph.junctions.contains_key(&core) {
+        return Err("missing old-centre road anchor".into());
+    }
+    let mut visited = BTreeSet::from([core]);
+    let mut pending = vec![core];
+    while let Some(key) = pending.pop() {
+        for link in graph.neighbours(key).filter(|link| link.class.driving()) {
+            pending.extend(
+                link.endpoints
+                    .into_iter()
+                    .filter(|&end| visited.insert(end)),
+            );
+        }
+    }
+    let mut retired = Vec::new();
+    for link in graph
+        .links
+        .values()
+        .filter(|link| link.class.driving() && !visited.contains(&link.endpoints[0]))
+    {
+        if link.class >= RoadClass::Ramp
+            || link
+                .points
+                .iter()
+                .any(|&point| districts.iter().any(|area| super::contains(area, point)))
+        {
+            return Err(format!(
+                "district or gateway road {:?} has no driving route to the old centre",
+                link.key
+            ));
+        }
+        retired.push(link.key);
+    }
+    if !retired.is_empty() {
+        graph.record(
+            "disconnected fringe roads outside the town districts remain source overlays",
+            &retired,
+        );
+        graph.links.retain(|key, _| !retired.contains(key));
+        graph.remove_isolated();
+        main_components(graph);
+    }
+    Ok(())
+}
+
 fn remove_link(graph: &mut Graph, key: SourceKey, reason: &'static str) {
     graph.links.remove(&key);
     graph.remove_isolated();
     graph.record(reason, &[key]);
 }
 
-fn trim_short_links(graph: &mut Graph, limits: SpacingLimits) {
+fn trim_estimate(graph: &Graph, link: &LinkSpec, key: SourceKey) -> f32 {
+    let width = link.class.pattern(link.one_way, 0.0).width();
+    let others: Vec<_> = graph
+        .neighbours(key)
+        .filter(|other| other.key != link.key)
+        .collect();
+    let direction = link.direction_at(key);
+    let straight = |other: &LinkSpec| direction.dot(other.direction_at(key));
+    let other_width = |other: &LinkSpec| other.class.pattern(other.one_way, 0.0).width();
+    match others.as_slice() {
+        [] => Intersection::empty_interface(width),
+        [other] => {
+            let dot = straight(other).clamp(-1.0, 1.0);
+            if dot < -0.999 {
+                1.0
+            } else if dot >= 0.985 {
+                50.0
+            } else {
+                ((other_width(other) + width * dot) * 0.5 / (1.0 - dot * dot).sqrt()).max(1.0)
+            }
+        }
+        _ => others
+            .iter()
+            .fold(Intersection::empty_interface(width), |trim, other| {
+                let dot = straight(other).clamp(0.0, 1.0);
+                let radius = (width * 0.5).hypot(other_width(other) * 0.5);
+                trim.max((radius * 1.1 / (1.0 - dot * dot).sqrt()).min(50.0))
+            }),
+    }
+}
+
+fn storage_margin(graph: &Graph, link: &LinkSpec, limits: SpacingLimits) -> f32 {
+    let trim = link
+        .endpoints
+        .into_iter()
+        .map(|key| trim_estimate(graph, link, key))
+        .sum::<f32>();
+    let floor = link
+        .lane_floor(limits)
+        .max(if link.class == RoadClass::Walk {
+            18.0
+        } else {
+            0.0
+        });
+    arc(&link.points) - trim - floor - 2.5
+}
+
+fn move_junction(graph: &mut Graph, key: SourceKey, at: Vec2) {
+    graph.junctions.get_mut(&key).unwrap().position = at.z(graph.junctions[&key].position.z);
+    for link in graph
+        .links
+        .values_mut()
+        .filter(|link| link.endpoints.contains(&key))
+    {
+        let i = if link.endpoints[0] == key {
+            0
+        } else {
+            link.points.len() - 1
+        };
+        link.points[i] = at;
+        link.realigned = true;
+    }
+}
+
+fn spread_approach(
+    graph: &mut Graph,
+    a: SourceKey,
+    b: SourceKey,
+    limits: SpacingLimits,
+    for_spacing: bool,
+) -> bool {
+    let mut best = None;
+    for (key, other) in [(a, b), (b, a)] {
+        let node = &graph.junctions[&key];
+        if node.required
+            || matches!(
+                key,
+                SourceKey::Cut { .. } | SourceKey::Node { rail: true, .. }
+            )
+            || graph.priority(key).0 >= RoadClass::Ramp
+        {
+            continue;
+        }
+        let from = node.position.xy();
+        let away = (from - graph.junctions[&other].position.xy()).normalize();
+        let incident: Vec<_> = graph.neighbours(key).map(|link| link.key).collect();
+        let mut local = BTreeSet::new();
+        for id in &incident {
+            for end in graph.links[id].endpoints {
+                local.extend(graph.neighbours(end).map(|link| link.key));
+            }
+        }
+        let worst = |g: &Graph| {
+            local
+                .iter()
+                .map(|id| storage_margin(g, &g.links[id], limits))
+                .fold(0.0, f32::min)
+        };
+        let before = worst(graph);
+        let target = incident
+            .iter()
+            .copied()
+            .find(|id| graph.links[id].endpoints.contains(&other));
+        let mut directions = vec![
+            away,
+            (away + away.perpendicular()).normalize(),
+            (away - away.perpendicular()).normalize(),
+            away.perpendicular(),
+            -away.perpendicular(),
+        ];
+        directions.extend(incident.iter().flat_map(|id| {
+            let dir = graph.links[id].direction_at(key);
+            [dir, -dir]
+        }));
+        for distance in [8.0, 16.0, 24.0, 32.0, 44.0, 56.0] {
+            for &dir in &directions {
+                let at = from + distance * dir;
+                if !at.is_finite()
+                    || node
+                        .members
+                        .iter()
+                        .any(|&p| p.distance(at) > limits.max_cluster)
+                    || graph.junctions.iter().any(|(&k, n)| {
+                        k != key && at.distance(n.position.xy()) < limits.junction + 0.15
+                    })
+                {
+                    continue;
+                }
+                let mut candidate = graph.clone();
+                move_junction(&mut candidate, key, at);
+                if target.is_some_and(|id| {
+                    !for_spacing && storage_margin(&candidate, &candidate.links[&id], limits) < 0.0
+                }) {
+                    continue;
+                }
+                let after = worst(&candidate);
+                if after < before.min(-1.0) - 0.1 {
+                    continue;
+                }
+                let outward = |g: &Graph, id: SourceKey| g.links[&id].direction_at(key);
+                if incident.iter().enumerate().any(|(i, &l)| {
+                    incident[i + 1..].iter().any(|&r| {
+                        outward(&candidate, l).dot(outward(&candidate, r))
+                            > outward(graph, l).dot(outward(graph, r)).max(0.85) + 0.025
+                    })
+                }) {
+                    continue;
+                }
+                let weight = if graph.priority(key).0 == RoadClass::Avenue {
+                    1.6
+                } else {
+                    1.0
+                };
+                let score = distance * weight - (after - before) * 0.3;
+                if best.is_none_or(|(cost, _, _)| score < cost) {
+                    best = Some((score, key, at));
+                }
+            }
+        }
+    }
+    if let Some((_, key, at)) = best {
+        move_junction(graph, key, at);
+        graph.record(
+            "local junction repositioned to keep adjacent source streets and lane storage",
+            &[key],
+        );
+        true
+    } else {
+        false
+    }
+}
+
+fn trim_short_links(graph: &mut Graph, limits: SpacingLimits, seams: &mut SeamCache) {
+    // A later neighbouring move can shorten a link that was already
+    // repaired. Try one relocation per endpoint pair before contracting
+    // or retiring it, so competing approaches cannot oscillate.
+    let mut relocated = BTreeSet::new();
     loop {
         let mut short: Vec<_> = graph
             .links
             .values()
             .filter_map(|link| {
-                if link.class >= RoadClass::Ramp {
+                if link.class >= RoadClass::Ramp || matches!(link.key, SourceKey::Authored(_)) {
                     return None;
                 }
-                let reserve = match link.class {
-                    RoadClass::Walk => 12.0,
-                    RoadClass::Local => 38.0,
-                    RoadClass::Collector => 36.0,
-                    _ => 43.0,
-                };
-                let margin = arc(&link.points) - limits.lane(link.class) - reserve;
+                let margin = storage_margin(graph, link, limits);
                 (margin < 0.0).then_some((margin, link.key))
             })
             .collect();
@@ -679,31 +980,42 @@ fn trim_short_links(graph: &mut Graph, limits: SpacingLimits) {
         let Some(&(_, key)) = short.first() else {
             break;
         };
-        let link = &graph.links[&key];
-        let [a, b] = link.endpoints;
-        let (keep, retire) = if graph.priority(a) >= graph.priority(b) {
+        let [a, b] = graph.links[&key].endpoints;
+        let (keep, retire) = if (graph.junctions[&a].required, graph.priority(a))
+            >= (graph.junctions[&b].required, graph.priority(b))
+        {
             (a, b)
         } else {
             (b, a)
         };
-        let contraction = graph.junctions[&a]
+        let distance = graph.junctions[&a]
             .position
-            .distance(graph.junctions[&b].position)
-            < limits.max_cluster
-            && contract(graph, keep, retire, limits.max_cluster, false);
-        if !contraction {
-            remove_link(
-                graph,
-                key,
-                "short approach removed for CM0 storage; component and corridors rechecked",
-            );
+            .distance(graph.junctions[&b].position);
+        let contraction = |g: &mut Graph| {
+            distance < limits.max_cluster && contract(g, keep, retire, limits.max_cluster, false)
+        };
+        if !(distance < 52.0 && contraction(graph)
+            || (graph.links[&key].class != RoadClass::Walk
+                && relocated.insert((key, ordered([a, b])))
+                && spread_approach(graph, a, b, limits, false))
+            || contraction(graph))
+        {
+            remove_link(graph, key, "short approach retired after merge and bounded relocation could not preserve lane storage");
         }
-        join_seams(graph, limits.alignment);
+        join_seams(graph, limits.alignment, seams);
     }
 }
 
-fn clear_close_nodes(graph: &mut Graph, limits: SpacingLimits) -> Result<(), String> {
+fn clear_close_nodes(
+    graph: &mut Graph,
+    limits: SpacingLimits,
+    seams: &mut SeamCache,
+) -> Result<(), String> {
+    // A clipped roundabout can lose its last arc during consolidation.
+    // Its orphaned cut must not participate in the junction spacing scan.
+    let mut last_count = usize::MAX;
     loop {
+        graph.remove_isolated();
         let pairs = close_pairs(
             graph.junctions.values().map(|j| (j.key, j.position.xy())),
             limits.junction,
@@ -711,6 +1023,12 @@ fn clear_close_nodes(graph: &mut Graph, limits: SpacingLimits) -> Result<(), Str
         let Some(&(dist, a, b)) = pairs.first() else {
             return Ok(());
         };
+        if pairs.len() >= last_count {
+            return Err(format!(
+                "junction spacing stalled at {a:?}/{b:?} ({dist:.2} m)"
+            ));
+        }
+        last_count = pairs.len();
         let (keep, retire) = if (graph.junctions[&a].required, graph.priority(a))
             >= (graph.junctions[&b].required, graph.priority(b))
         {
@@ -719,7 +1037,10 @@ fn clear_close_nodes(graph: &mut Graph, limits: SpacingLimits) -> Result<(), Str
             (b, a)
         };
         if contract(graph, keep, retire, limits.max_cluster, false) {
-            join_seams(graph, limits.alignment);
+            join_seams(graph, limits.alignment, seams);
+            continue;
+        }
+        if spread_approach(graph, keep, retire, limits, true) {
             continue;
         }
         if graph.junctions[&retire].required || graph.priority(retire).0 >= RoadClass::Ramp {
@@ -735,7 +1056,7 @@ fn clear_close_nodes(graph: &mut Graph, limits: SpacingLimits) -> Result<(), Str
                 "optional close approach retired without a mode, grade or direction merge",
             );
         }
-        join_seams(graph, limits.alignment);
+        join_seams(graph, limits.alignment, seams);
     }
 }
 
@@ -764,7 +1085,7 @@ fn fit_links(graph: &mut Graph, limits: SpacingLimits) {
     }
 }
 
-fn segment_parameters(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> Option<(f32, f32)> {
+pub(crate) fn segment_parameters(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> Option<(f32, f32)> {
     let cross = |a: Vec2, b: Vec2| a.x * b.y - a.y * b.x;
     let determinant = cross(b - a, d - c);
     if determinant.abs() <= 1e-5 {
@@ -776,16 +1097,39 @@ fn segment_parameters(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> Option<(f32, f32)> 
 }
 
 fn overlap(a: &[Vec3], b: &[Vec3], radius: f32) -> bool {
+    sweep_conflict(a, b, radius, None, |_, _| 5.0)
+}
+
+fn sweep_conflict(
+    a: &[Vec3],
+    b: &[Vec3],
+    radius: f32,
+    junction: Option<(Vec2, f32)>,
+    clearance: impl Fn(f32, f32) -> f32,
+) -> bool {
+    let conflict = |p: Vec3, q: Vec3| {
+        !junction.is_some_and(|(centre, radius)| {
+            p.xy().distance2(centre) <= radius * radius
+                && q.xy().distance2(centre) <= radius * radius
+        }) && (p.z - q.z).abs() < clearance(p.z, q.z)
+    };
     for x in a.windows(2) {
         for y in b.windows(2) {
+            let (alo, ahi) = (x[0].xy().min(x[1].xy()), x[0].xy().max(x[1].xy()));
+            let (blo, bhi) = (y[0].xy().min(y[1].xy()), y[0].xy().max(y[1].xy()));
+            if alo.x > bhi.x + radius
+                || blo.x > ahi.x + radius
+                || alo.y > bhi.y + radius
+                || blo.y > ahi.y + radius
+            {
+                continue;
+            }
             if let Some((t, u)) = segment_parameters(x[0].xy(), x[1].xy(), y[0].xy(), y[1].xy()) {
-                let z1 = x[0].z + t * (x[1].z - x[0].z);
-                let z2 = y[0].z + u * (y[1].z - y[0].z);
-                if (z1 - z2).abs() < 5.0 {
+                if conflict(x[0] + t * (x[1] - x[0]), y[0] + u * (y[1] - y[0])) {
                     return true;
                 }
             }
-            for ([p, q], line) in [([x[0], x[1]], y), ([y[0], y[1]], x)] {
+            for ([p, q], line, swap) in [([x[0], x[1]], y, false), ([y[0], y[1]], x, true)] {
                 for point in [p, q] {
                     let nearest = project_on_segment(point.xy(), line[0].xy(), line[1].xy());
                     if nearest.distance(point.xy()) >= radius {
@@ -794,7 +1138,13 @@ fn overlap(a: &[Vec3], b: &[Vec3], radius: f32) -> bool {
                     let length = line[0].xy().distance(line[1].xy()).max(0.001);
                     let z = line[0].z
                         + (line[1].z - line[0].z) * line[0].xy().distance(nearest) / length;
-                    if (point.z - z).abs() < 5.0 {
+                    let nearest = nearest.z(z);
+                    let (first, second) = if swap {
+                        (nearest, point)
+                    } else {
+                        (point, nearest)
+                    };
+                    if conflict(first, second) {
                         return true;
                     }
                 }
@@ -818,12 +1168,43 @@ fn add_rim_access(graph: &mut Graph, config: TownConfig) -> Result<(), String> {
         .ok_or("missing A2 southeast approach")?;
     let rim_key = rim.key;
     let rim_end = rim.endpoints[1];
+    let length = arc(&rim.points);
+    let approach = 156.0;
+    if length < 2.0 * approach {
+        return Err(format!(
+            "A2 corridor is {length:.1} m after the owned cut and cannot fit both ramp approaches"
+        ));
+    }
+    let mut along = 0.0;
+    let desired = rim
+        .points
+        .windows(2)
+        .map(|pair| {
+            let point = project_on_segment(target, pair[0], pair[1]);
+            let station = along + pair[0].distance(point);
+            along += pair[0].distance(pair[1]);
+            (point, station)
+        })
+        .min_by(|(a, _), (b, _)| a.distance2(target).total_cmp(&b.distance2(target)))
+        .unwrap()
+        .1
+        .clamp(approach, length - approach);
+    along = 0.0;
     let (index, aim) = rim
         .points
         .windows(2)
         .enumerate()
-        .map(|(index, pair)| (index, project_on_segment(target, pair[0], pair[1])))
-        .min_by(|(_, a), (_, b)| a.distance2(target).total_cmp(&b.distance2(target)))
+        .find_map(|(index, pair)| {
+            let length = pair[0].distance(pair[1]);
+            let before = along;
+            along += length;
+            (along >= desired && length > 0.0).then(|| {
+                (
+                    index,
+                    pair[0] + (pair[1] - pair[0]) * ((desired - before) / length),
+                )
+            })
+        })
         .unwrap();
     let mut first = rim.points[..=index].to_vec();
     first.push(aim);
@@ -831,7 +1212,7 @@ fn add_rim_access(graph: &mut Graph, config: TownConfig) -> Result<(), String> {
     second.extend_from_slice(&rim.points[index + 1..]);
     first.dedup();
     second.dedup();
-    if arc(&first) < 160.0 || arc(&second) < 160.0 {
+    if arc(&first) < 150.0 || arc(&second) < 150.0 {
         return Err(format!(
             "A2 ramp split has insufficient approach length: {:.1}/{:.1} m",
             arc(&first),
@@ -1017,20 +1398,23 @@ fn restore_avenues(graph: &mut Graph, source: &Graph) -> Result<(), String> {
     let node = |id| SourceKey::Node { id, rail: false };
     let west = node(289194013);
     let middle = node(11950373997);
-    let east_cut = SourceKey::Cut {
-        way: 61233484,
-        segment: 1,
-        side: 0,
-    };
+    let east_ways = &[1288727380, 27690361, 61233484];
+    let east_cut = source
+        .links
+        .values()
+        .filter(|link| east_ways.iter().any(|id| link.lineage.contains(id)))
+        .flat_map(|link| link.endpoints)
+        .max_by(|a, b| {
+            source.junctions[a]
+                .position
+                .x
+                .total_cmp(&source.junctions[b].position.x)
+        })
+        .ok_or("missing Hraška eastern continuation")?;
     let north_local = node(4193639635);
     let specs = [
         ("hraska-west", west, middle, &[663442009, 26398038][..]),
-        (
-            "hraska-east",
-            middle,
-            east_cut,
-            &[1288727380, 27690361, 61233484][..],
-        ),
+        ("hraska-east", middle, east_cut, &east_ways[..]),
         ("hraska-neighbourhood-access", middle, north_local, &[][..]),
         (
             "alpska-rail-underpass",
@@ -1098,7 +1482,11 @@ fn restore_avenues(graph: &mut Graph, source: &Graph) -> Result<(), String> {
                 lineage: ways.iter().copied().collect(),
                 samples,
                 points,
-                elbow: None,
+                elbow: (name == "hraska-east").then(|| {
+                    // Preserve the departure split from the ramp and the
+                    // neighbourhood collector as the east terminal moves.
+                    from + from.distance(to) * vec2(0.46, -0.21)
+                }),
                 realigned: true,
                 inherited: Vec::new(),
             },
@@ -1119,31 +1507,456 @@ pub(crate) fn clean_network(
     config: TownConfig,
 ) -> Result<Graph, String> {
     let source = graph.clone();
-    // The dry A2 is one game corridor. The mapped deck seam remains in the source view.
+    let mut seams = SeamCache::new();
+    // Both dry through corridors run on a continuous deck; mapped layer
+    // changes remain in the source graph for the wet/outer-tile profile.
     for link in graph
         .links
         .values_mut()
-        .filter(|link| link.class == RoadClass::Motorway)
+        .filter(|link| matches!(link.class, RoadClass::Motorway | RoadClass::Rail))
     {
         link.layer = 1;
     }
     inset_cuts(&mut graph, config);
+    consolidate_sobceva(&mut graph);
     collapse_roundabouts(&mut graph);
-    join_seams(&mut graph, limits.alignment);
-    trim_short_links(&mut graph, limits);
-    clear_close_nodes(&mut graph, limits)?;
+    join_seams(&mut graph, limits.alignment, &mut seams);
     restore_avenues(&mut graph, &source)?;
     inset_cuts(&mut graph, config);
+    clear_close_nodes(&mut graph, limits, &mut seams)?;
+    trim_short_links(&mut graph, limits, &mut seams);
     main_components(&mut graph);
     add_rim_access(&mut graph, config)?;
-    clear_close_nodes(&mut graph, limits)?;
+    clear_close_nodes(&mut graph, limits, &mut seams)?;
     fit_links(&mut graph, limits);
     grade_and_controls(&mut graph);
     prune_geometry_conflicts(&mut graph)?;
+    let degree = graph.adjacency();
+    let orphaned_ring: Vec<_> = graph
+        .links
+        .values()
+        .filter(|link| link.roundabout && link.endpoints.iter().any(|key| degree[key].len() == 1))
+        .map(|link| link.key)
+        .collect();
+    for key in orphaned_ring {
+        remove_link(
+            &mut graph,
+            key,
+            "dead-end roundabout arc superseded by the connected priority approach",
+        );
+    }
     main_components(&mut graph);
     grade_and_controls(&mut graph);
     validate_plan(&graph, limits)?;
     Ok(graph)
+}
+
+fn measured_shortfalls(
+    graph: &Graph,
+    limits: SpacingLimits,
+    environment: &Environment,
+) -> Vec<(f32, SourceKey)> {
+    let mut intersections = Intersections::default();
+    let mut roads = Roads::default();
+    let mut lanes = Lanes::default();
+    let mut parking = ParkingSpots::default();
+    let mut spatial = SpatialMap::default();
+    let nodes: BTreeMap<_, _> = graph
+        .junctions
+        .values()
+        .map(|node| {
+            (
+                node.key,
+                Intersection::make(&mut intersections, &mut spatial, node.position),
+            )
+        })
+        .collect();
+    let spans: Vec<_> = graph
+        .links
+        .values()
+        .map(|link| {
+            let [a, b] = link.endpoints.map(|key| nodes[&key]);
+            let [from, to] = [intersections[a].pos, intersections[b].pos];
+            let segment = link.elbow.map_or(RoadSegmentKind::Straight, |elbow| {
+                RoadSegmentKind::from_elbow(from.xy(), to.xy(), elbow)
+            });
+            let road = Road::make(
+                &intersections[a],
+                &intersections[b],
+                segment,
+                &link.class.pattern(link.one_way, 0.0),
+                environment,
+                &mut roads,
+                &mut lanes,
+                &mut parking,
+                &mut spatial,
+            );
+            intersections[a].add_road(&roads, &roads[road]);
+            intersections[b].add_road(&roads, &roads[road]);
+            (link, road)
+        })
+        .collect();
+    for inter in intersections.values_mut() {
+        inter.update_interface_radius(&mut roads);
+    }
+    let mut failures = Vec::new();
+    for (link, id) in spans {
+        let road = &mut roads[id];
+        road.update_lanes(&mut lanes, &mut parking, environment);
+        let minimum = road
+            .lanes_iter()
+            .filter(|(_, kind)| matches!(kind, LaneKind::Driving | LaneKind::Rail))
+            .map(|(id, _)| lanes[id].points.length())
+            .fold(f32::INFINITY, f32::min);
+        if minimum < link.lane_floor(limits) {
+            failures.push((minimum - link.lane_floor(limits), link.key));
+        }
+    }
+    failures.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+    failures
+}
+
+pub(crate) fn calibrate_storage(
+    graph: &mut Graph,
+    config: TownConfig,
+    limits: SpacingLimits,
+    environment: &Environment,
+) -> Result<(), String> {
+    let mut attempts = BTreeSet::new();
+    while let Some(&(shortfall, key)) = measured_shortfalls(graph, limits, environment).first() {
+        let link = &graph.links[&key];
+        if matches!(key, SourceKey::Authored(_)) || link.class >= RoadClass::Ramp {
+            return Err(format!(
+                "protected road {key:?} is {:.1} m short after actual trimming",
+                -shortfall
+            ));
+        }
+        let [a, b] = link.endpoints;
+        let rank = |key| (graph.junctions[&key].required, graph.priority(key));
+        let (keep, retire) = if rank(a) >= rank(b) { (a, b) } else { (b, a) };
+        let mut candidate = graph.clone();
+        if attempts.insert(key)
+            && (contract(&mut candidate, keep, retire, limits.max_cluster, false)
+                || spread_approach(&mut candidate, keep, retire, limits, false))
+        {
+            fit_links(&mut candidate, limits);
+            if validate_plan(&candidate, limits).is_ok()
+                && prune_geometry_conflicts(&mut candidate).is_ok()
+                && !measured_shortfalls(&candidate, limits, environment)
+                    .iter()
+                    .any(|&(deficit, candidate)| candidate == key && deficit <= shortfall)
+            {
+                *graph = candidate;
+                continue;
+            }
+        }
+        remove_link(
+            graph,
+            key,
+            "approach retired after native intersection and offset-lane measurement",
+        );
+        // Removing short dead-end roads can leave their remaining neighbour
+        // in a degree-two seam. Keep the surviving geometry and recalculate
+        // its actual engine trims on the next pass.
+        inset_cuts(graph, config);
+    }
+    grade_and_controls(graph);
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum AccessSite {
+    Junction(SourceKey),
+    Middle {
+        link: SourceKey,
+        segment: usize,
+        point: Vec2,
+    },
+}
+
+impl AccessSite {
+    fn point(self, graph: &Graph) -> Vec2 {
+        match self {
+            Self::Junction(key) => graph.junctions[&key].position.xy(),
+            Self::Middle { point, .. } => point,
+        }
+    }
+
+    fn on(self, link: &LinkSpec) -> bool {
+        match self {
+            Self::Junction(key) => link.endpoints.contains(&key),
+            Self::Middle { link: key, .. } => link.key == key,
+        }
+    }
+}
+
+fn spacing_median(graph: &Graph) -> f32 {
+    let mut chords: Vec<_> = graph
+        .links
+        .values()
+        .filter(|link| link.class.driving())
+        .map(|link| link.points[0].distance(*link.points.last().unwrap()))
+        .collect();
+    chords.sort_by(f32::total_cmp);
+    let n = chords.len();
+    if n == 0 {
+        0.0
+    } else {
+        (chords[n / 2] + chords[(n - 1) / 2]) * 0.5
+    }
+}
+
+/// Densify around retained curved streets. Split a live alignment only when
+/// it gains a connecting residential street, which creates actual access
+/// and blocks. Both new intersections and every affected span are checked
+/// before committing the candidate graph.
+pub(crate) fn connect_infill(
+    graph: &mut Graph,
+    limits: SpacingLimits,
+    areas: &[&[Vec2]],
+    river: &[Vec2],
+    environment: &Environment,
+) {
+    use super::contains;
+    for number in 0..38u8 {
+        if spacing_median(graph) <= 139.5 {
+            break;
+        }
+        let mut sites = Vec::new();
+        let road_access = |link: &LinkSpec| link.frontage() && !link.one_way;
+        for (&key, node) in &graph.junctions {
+            let links: Vec<_> = graph.neighbours(key).collect();
+            if node.position.z == 10.0
+                && !node.required
+                && links.len() <= 3
+                && links.iter().any(|link| road_access(link))
+                && links.iter().all(|link| link.class <= RoadClass::Avenue)
+            {
+                sites.push(AccessSite::Junction(key));
+            }
+        }
+        for link in graph.links.values().filter(|link| road_access(link)) {
+            if link
+                .endpoints
+                .iter()
+                .any(|key| graph.junctions[key].position.z != 10.0)
+            {
+                continue;
+            }
+            let minimum = link.lane_floor(limits) + 33.0;
+            let length = arc(&link.points);
+            let mut target = minimum;
+            let mut along = 0.0;
+            for (segment, edge) in link.points.windows(2).enumerate() {
+                let size = edge[0].distance(edge[1]);
+                while target <= (along + size).min(length - minimum) && size > 0.0 {
+                    let point = edge[0] + ((target - along) / size) * (edge[1] - edge[0]);
+                    if graph
+                        .junctions
+                        .values()
+                        .all(|node| node.position.xy().distance(point) > limits.junction + 1.0)
+                    {
+                        sites.push(AccessSite::Middle {
+                            link: link.key,
+                            point,
+                            segment,
+                        });
+                    }
+                    target += 25.0;
+                }
+                along += size;
+            }
+        }
+        let mut candidates = Vec::new();
+        for (i, &a) in sites.iter().enumerate() {
+            let from = a.point(graph);
+            for &b in &sites[i + 1..] {
+                let to = b.point(graph);
+                let chord = from.distance(to);
+                if !(93.0..=138.0).contains(&chord) {
+                    continue;
+                }
+                let mid = (from + to) * 0.5;
+                let Some(district) = areas.iter().position(|area| contains(area, mid)) else {
+                    continue;
+                };
+                let split_cost = [a, b]
+                    .iter()
+                    .filter(|site| matches!(site, AccessSite::Middle { .. }))
+                    .count();
+                let score = (chord - 116.0).abs() - 4.0 * split_cost as f32 + 5.0 * district as f32;
+                candidates.push((score, a, b));
+            }
+        }
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0));
+        let mut accepted = false;
+        for (_, a, b) in candidates {
+            if let Some(candidate) = try_infill(graph, limits, [a, b], number, river) {
+                if !measured_shortfalls(&candidate, limits, environment).is_empty() {
+                    continue;
+                }
+                *graph = candidate;
+                accepted = true;
+                break;
+            }
+        }
+        if !accepted {
+            break;
+        }
+    }
+}
+
+fn try_infill(
+    graph: &Graph,
+    limits: SpacingLimits,
+    [a, b]: [AccessSite; 2],
+    number: u8,
+    river: &[Vec2],
+) -> Option<Graph> {
+    let [from, to] = [a, b].map(|site| site.point(graph));
+    let tangent = (to - from).normalize();
+    let bend = if number % 2 == 0 { 13.0 } else { -10.0 };
+    let elbow = (from + to) * 0.5 + bend * tangent.perpendicular();
+    let points: Vec<_> = curve(from, to, elbow).points(25).collect();
+    let profile: Vec<_> = points.iter().map(|point| point.z(10.0)).collect();
+    let water: Vec<_> = river.iter().map(|point| point.z(10.0)).collect();
+    if overlap(&profile, &water, 88.0) {
+        return None;
+    }
+    let width = RoadClass::Local.pattern(false, 0.0).width();
+    for link in graph.links.values() {
+        if a.on(link) && b.on(link) {
+            return None;
+        }
+        if let Some((site, heading)) = [
+            (a, (elbow - from).normalize()),
+            (b, (elbow - to).normalize()),
+        ]
+        .into_iter()
+        .find(|(site, _)| site.on(link))
+        {
+            match site {
+                AccessSite::Junction(key) if link.direction_at(key).dot(heading) > 0.64 => {
+                    return None
+                }
+                AccessSite::Middle { segment, .. } => {
+                    let axis = (link.points[segment + 1] - link.points[segment]).normalize();
+                    if axis.dot(heading).abs() > 0.58 {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            continue;
+        }
+        let radius = (link.class.pattern(link.one_way, 0.0).width() + width) * 0.5 + 1.0;
+        let lower = from.min(to) - Vec2::splat(radius + bend.abs());
+        let upper = from.max(to) + Vec2::splat(radius + bend.abs());
+        if link.points.windows(2).any(|pair| {
+            let [p, q] = [pair[0], pair[1]];
+            let lo = p.min(q);
+            let hi = p.max(q);
+            hi.x >= lower.x
+                && lo.x <= upper.x
+                && hi.y >= lower.y
+                && lo.y <= upper.y
+                && overlap(&profile, &[p.z(10.0), q.z(10.0)], radius)
+        }) {
+            return None;
+        }
+    }
+    let mut candidate = graph.clone();
+    let endpoints = [
+        split_for_access(&mut candidate, a, number, 0, limits)?,
+        split_for_access(&mut candidate, b, number, 1, limits)?,
+    ];
+    let key = SourceKey::Infill { number, part: 4 };
+    candidate.links.insert(
+        key,
+        LinkSpec {
+            key,
+            endpoints,
+            class: RoadClass::Local,
+            layer: 0,
+            one_way: false,
+            roundabout: false,
+            named: false,
+            lineage: BTreeSet::new(),
+            samples: Vec::new(),
+            points,
+            elbow: Some(elbow),
+            realigned: false,
+            inherited: Vec::new(),
+        },
+    );
+    if candidate
+        .links
+        .values()
+        .filter(|link| link.endpoints.iter().any(|key| endpoints.contains(key)))
+        .any(|link| storage_margin(&candidate, link, limits) < 2.0)
+    {
+        return None;
+    }
+    candidate.record(
+        "short curved street gives an irregular block two connected frontages",
+        &[key, endpoints[0], endpoints[1]],
+    );
+    Some(candidate)
+}
+
+fn split_for_access(
+    graph: &mut Graph,
+    site: AccessSite,
+    number: u8,
+    side: u8,
+    limits: SpacingLimits,
+) -> Option<SourceKey> {
+    let AccessSite::Middle {
+        link,
+        segment,
+        point,
+    } = site
+    else {
+        let AccessSite::Junction(key) = site else {
+            unreachable!()
+        };
+        return Some(key);
+    };
+    let junction = SourceKey::Infill { number, part: side };
+    let second = SourceKey::Infill {
+        number,
+        part: side + 2,
+    };
+    let mut left = graph.links.get(&link)?.clone();
+    let mut right = left.clone();
+    left.endpoints[1] = junction;
+    right.endpoints[0] = junction;
+    right.key = second;
+    left.points.truncate(segment + 1);
+    left.points.push(point);
+    right.points.drain(..=segment);
+    right.points.insert(0, point);
+    for link in [&mut left, &mut right] {
+        let (elbow, fitted, error) = fit(&link.points, limits.alignment);
+        if error > 3.0 {
+            return None;
+        }
+        link.elbow = elbow;
+        link.points = fitted;
+        link.realigned |= error > 1.0;
+    }
+    graph
+        .junctions
+        .insert(junction, JunctionSpec::new(junction, point));
+    graph.links.insert(left.key, left);
+    graph.links.insert(right.key, right);
+    Some(junction)
+}
+
+pub(crate) fn finish_network(graph: &mut Graph, limits: SpacingLimits) -> Result<(), String> {
+    fit_links(graph, limits);
+    grade_and_controls(graph);
+    validate_plan(graph, limits)
 }
 
 pub fn validate_plan(graph: &Graph, limits: SpacingLimits) -> Result<(), String> {
@@ -1306,6 +2119,7 @@ pub fn resolve_network(map: &Map, graph: &Graph) -> Result<BuiltNetwork, String>
                 link.key
             ));
         }
+        validate_profile(map, graph, link, road)?;
         links.insert(
             link.key,
             DirectedSpan {
@@ -1317,6 +2131,188 @@ pub fn resolve_network(map: &Map, graph: &Graph) -> Result<BuiltNetwork, String>
         );
     }
     Ok(BuiltNetwork { junctions, links })
+}
+
+fn validate_profile(map: &Map, graph: &Graph, link: &LinkSpec, road: &Road) -> Result<(), String> {
+    let [from, to] = link.endpoints.map(|key| graph.junctions[&key].position);
+    let segment = link.elbow.map_or(RoadSegmentKind::Straight, |elbow| {
+        RoadSegmentKind::from_elbow(from.xy(), to.xy(), elbow)
+    });
+    let (expected, error) = Road::generate_points(
+        from,
+        to,
+        segment,
+        link.class == RoadClass::Rail,
+        &map.environment,
+    );
+    if error.is_some() || !same_profile(&expected, &road.points) {
+        return Err(format!(
+            "live centreline differs from the declared 3D profile for {:?}",
+            link.key
+        ));
+    }
+
+    let clipped = expected.cut(road.interface_from(road.src), road.interface_from(road.dst));
+    if !same_profile(&clipped, &road.interfaced_points) {
+        // Terrain-following roads are sampled a second time after trimming.
+        let (terrain_trim, error) = Road::heightfinder(
+            &clipped.flatten(),
+            expected.first().z - ROAD_Z_OFFSET,
+            expected.last().z - ROAD_Z_OFFSET,
+            MAX_SLOPE,
+            &map.environment,
+        );
+        if error.is_some() || !same_profile(&terrain_trim, &road.interfaced_points) {
+            return Err(format!("live trimmed centreline drift for {:?}", link.key));
+        }
+    }
+    for (id, _) in road.lanes_iter() {
+        let lane = map
+            .get(id)
+            .ok_or_else(|| format!("missing live lane {id:?}"))?;
+        let mut expected_lane = lane.clone();
+        expected_lane.gen_pos(road);
+        if !same_profile(&expected_lane.points, &lane.points) {
+            return Err(format!(
+                "live lane geometry drift for {:?} lane {id:?}",
+                link.key
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn same_profile(a: &PolyLine3, b: &PolyLine3) -> bool {
+    // Public construction and reload preserve these polylines. Comparing in
+    // both directions permits equivalent resampling without hiding a detour.
+    a.first().distance2(b.first()) <= 0.01
+        && a.last().distance2(b.last()) <= 0.01
+        && [(a, b), (b, a)].into_iter().all(|(from, to)| {
+            from.iter()
+                .all(|&point| point.is_finite() && to.project(point).distance2(point) <= 0.01)
+        })
+}
+
+fn live_sweeps(map: &Map) -> Result<(), String> {
+    let mut roads: Vec<_> = map.roads().values().collect();
+    roads.sort_by_key(|road| road.id);
+    let profiles: Vec<_> = roads
+        .iter()
+        .map(|road| road.points.iter().copied().collect::<Vec<_>>())
+        .collect();
+    let bounds: Vec<_> = profiles
+        .iter()
+        .map(|points| {
+            points
+                .iter()
+                .fold((points[0].xy(), points[0].xy()), |(lo, hi), point| {
+                    (lo.min(point.xy()), hi.max(point.xy()))
+                })
+        })
+        .collect();
+    let has_rail = |road: &Road| road.lanes_iter().any(|(_, kind)| kind == LaneKind::Rail);
+    for (i, &a) in roads.iter().enumerate() {
+        for (j, &b) in roads.iter().enumerate().skip(i + 1) {
+            let width = (a.width + b.width) * 0.5;
+            let ((alo, ahi), (blo, bhi)) = (bounds[i], bounds[j]);
+            if alo.x > bhi.x + width
+                || blo.x > ahi.x + width
+                || alo.y > bhi.y + width
+                || blo.y > ahi.y + width
+            {
+                continue;
+            }
+            let junction = [a.src, a.dst]
+                .into_iter()
+                .find(|end| [b.src, b.dst].contains(end))
+                .map(|end| {
+                    // Extend the longer interface by the half-width of each
+                    // approach to enclose the junction's swept pavement.
+                    let radius = a.interface_from(end).max(b.interface_from(end)) + width;
+                    (map.get(end).unwrap().pos.xy(), radius)
+                });
+            let (rail_a, rail_b) = (has_rail(a), has_rail(b));
+            let clearance = |az, bz| {
+                let lower_is_rail = if az < bz { rail_a } else { rail_b };
+                // Dry clearance model in metres. The upper deck occupies 1 m
+                // below its running surface. Reserve 5 m for rolling stock or
+                // 4.5 m for road vehicles, plus 0.5 m operating margin.
+                if lower_is_rail {
+                    6.5
+                } else {
+                    6.0
+                }
+            };
+            if sweep_conflict(&profiles[i], &profiles[j], width, junction, clearance) {
+                let problem = if rail_a != rail_b {
+                    "rail clearance"
+                } else {
+                    "live swept overlap"
+                };
+                return Err(format!(
+                    "{problem} {:?}/{:?} at {:?}/{:?}",
+                    a.id,
+                    b.id,
+                    a.points.first(),
+                    b.points.first()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_lane_components(map: &Map) -> Result<(), String> {
+    for kind in [LaneKind::Driving, LaneKind::Walking, LaneKind::Rail] {
+        let lanes: BTreeSet<_> = map
+            .lanes()
+            .values()
+            .filter(|lane| lane.kind == kind)
+            .map(|lane| lane.id)
+            .collect();
+        let Some(&start) = lanes.first() else {
+            continue;
+        };
+        let mut forward = BTreeMap::<_, Vec<_>>::new();
+        let mut backward = BTreeMap::<_, Vec<_>>::new();
+        for junction in map.intersections().values() {
+            for turn in junction
+                .turns()
+                .filter(|turn| lanes.contains(&turn.id.src) && lanes.contains(&turn.id.dst))
+            {
+                let (src, dst) = (turn.id.src, turn.id.dst);
+                forward.entry(src).or_default().push(dst);
+                backward.entry(dst).or_default().push(src);
+                if turn.id.bidirectional {
+                    forward.entry(dst).or_default().push(src);
+                    backward.entry(src).or_default().push(dst);
+                }
+            }
+        }
+        for edges in [&forward, &backward] {
+            let mut visited = BTreeSet::from([start]);
+            let mut remaining = vec![start];
+            while let Some(lane) = remaining.pop() {
+                remaining.extend(
+                    edges
+                        .get(&lane)
+                        .into_iter()
+                        .flatten()
+                        .copied()
+                        .filter(|&next| visited.insert(next)),
+                );
+            }
+            if visited != lanes {
+                return Err(format!(
+                    "{kind:?} connectivity reaches only {}/{} lanes (first missing {:?})",
+                    visited.len(),
+                    lanes.len(),
+                    lanes.difference(&visited).next()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 pub fn validate_live(
@@ -1346,13 +2342,7 @@ pub fn validate_live(
             .ok_or_else(|| format!("missing live road {key:?}"))?;
         let from = graph.junctions[&link.endpoints[0]].position;
         let to = graph.junctions[&link.endpoints[1]].position;
-        let segment = link.elbow.map_or(RoadSegmentKind::Straight, |elbow| {
-            RoadSegmentKind::from_elbow(from.xy(), to.xy(), elbow)
-        });
-        let (_, error) = Road::generate_points(from, to, segment, false, &map.environment);
-        if error.is_some() {
-            return Err(format!("invalid live profile {key:?}"));
-        }
+        validate_profile(map, graph, link, road)?;
         if link.class == RoadClass::Ramp
             && road
                 .points
@@ -1370,10 +2360,10 @@ pub fn validate_live(
             .filter(|&(_, kind)| matches!(kind, LaneKind::Driving | LaneKind::Rail))
         {
             let length = map.get(id).unwrap().points.length();
-            if !length.is_finite() || length < limits.lane(link.class) {
+            if !length.is_finite() || length < link.lane_floor(limits) {
                 lane_errors.push(format!(
                     "{key:?} {kind:?} lane {id:?} is {length:.3} m; requires {:.1} m",
-                    limits.lane(link.class)
+                    link.lane_floor(limits)
                 ));
             }
         }
@@ -1392,25 +2382,8 @@ pub fn validate_live(
             limits.median_driving
         ));
     }
-    for (index, (&key, span)) in built.links.iter().enumerate() {
-        for (&other, second) in built.links.iter().skip(index + 1) {
-            if span
-                .endpoints
-                .iter()
-                .any(|end| second.endpoints.contains(end))
-            {
-                continue;
-            }
-            let a = map.get(span.road).unwrap();
-            let b = map.get(second.road).unwrap();
-            let a_points: Vec<_> = a.points.iter().copied().collect();
-            let b_points: Vec<_> = b.points.iter().copied().collect();
-            if overlap(&a_points, &b_points, (a.width + b.width) * 0.5) {
-                return Err(format!("live swept overlap {key:?}/{other:?}"));
-            }
-        }
-    }
-    Ok(())
+    live_sweeps(map)?;
+    validate_lane_components(map)
 }
 
 #[cfg(test)]
@@ -1452,43 +2425,99 @@ mod tests {
     }
 }
 
+/// Route over the live, directed turn graph, optionally omitting a bridge or excluding through roads.
+pub(crate) fn can_route(
+    map: &Map,
+    from: IntersectionID,
+    to: IntersectionID,
+    kind: LaneKind,
+    allowed: impl Fn(RoadID) -> bool,
+) -> bool {
+    let walking = kind == LaneKind::Walking;
+    let mut visited = BTreeSet::new();
+    let mut pending = Vec::new();
+    for lane in map
+        .lanes()
+        .values()
+        .filter(|lane| lane.kind == kind && allowed(lane.parent))
+    {
+        if lane.src == from {
+            pending.push((lane.id, lane.dst));
+        }
+        if walking && lane.dst == from {
+            pending.push((lane.id, lane.src));
+        }
+    }
+    while let Some((id, end)) = pending.pop() {
+        if !visited.insert((id, end)) {
+            continue;
+        }
+        if end == to {
+            return true;
+        }
+        pending.extend(
+            map.get(end)
+                .unwrap()
+                .turns_from(id)
+                .filter_map(|(turn, dir)| {
+                    let next = match dir {
+                        TraverseDirection::Forward => turn.dst,
+                        TraverseDirection::Backward => turn.src,
+                    };
+                    let lane = map.get(next)?;
+                    if lane.kind != kind || !allowed(lane.parent) {
+                        return None;
+                    }
+                    if lane.src == end {
+                        Some((next, lane.dst))
+                    } else if walking && lane.dst == end {
+                        Some((next, lane.src))
+                    } else {
+                        None
+                    }
+                }),
+        );
+    }
+    false
+}
+
+fn routed_rim_trip(
+    map: &Map,
+    from: IntersectionID,
+    to: IntersectionID,
+    rim: &BTreeSet<RoadID>,
+) -> bool {
+    let incoming = |lane: &&simulation::map::Lane| lane.src == from;
+    let outgoing = |lane: &&simulation::map::Lane| lane.dst == to;
+    let lanes: Vec<_> = map
+        .lanes()
+        .values()
+        .filter(|lane| lane.kind == LaneKind::Driving && rim.contains(&lane.parent))
+        .collect();
+    for start in lanes.iter().copied().filter(incoming) {
+        for end in lanes.iter().copied().filter(outgoing) {
+            let start = Traversable::new(TraverseKind::Lane(start.id), TraverseDirection::Forward);
+            if PathKind::Vehicle
+                .path(map, prototypes::Tick(0), start, end.id)
+                .is_none_or(|path| {
+                    path.iter().any(|step| {
+                        !rim.contains(&map.get(step.destination_lane()).unwrap().parent)
+                    })
+                })
+            {
+                return false;
+            }
+        }
+    }
+    lanes.iter().any(incoming) && lanes.iter().any(outgoing)
+}
+
 /// Probe connectivity through actual directed lanes and generated turn movements.
 pub fn route_checks(
     map: &Map,
     graph: &Graph,
     built: &BuiltNetwork,
 ) -> BTreeMap<&'static str, bool> {
-    let route = |from: IntersectionID,
-                 to: IntersectionID,
-                 kind: LaneKind,
-                 allowed: &dyn Fn(RoadID) -> bool| {
-        let mut visited = BTreeSet::new();
-        let mut pending: Vec<_> = map
-            .lanes()
-            .values()
-            .filter(|lane| lane.src == from && lane.kind == kind && allowed(lane.parent))
-            .map(|lane| lane.id)
-            .collect();
-        while let Some(id) = pending.pop() {
-            if !visited.insert(id) {
-                continue;
-            }
-            let lane = map.get(id).unwrap();
-            if lane.dst == to {
-                return true;
-            }
-            let end = map.get(lane.dst).unwrap();
-            pending.extend(
-                end.turns()
-                    .filter(|turn| turn.id.src == id)
-                    .filter_map(|turn| {
-                        let next = map.get(turn.id.dst)?;
-                        (next.kind == kind && allowed(next.parent)).then_some(next.id)
-                    }),
-            );
-        }
-        false
-    };
     let boundary = |class| {
         let endpoints: BTreeSet<_> = graph
             .links
@@ -1498,7 +2527,15 @@ pub fn route_checks(
             .filter(|key| matches!(key, SourceKey::Cut { .. }))
             .map(|key| built.junctions[&key])
             .collect();
-        endpoints.into_iter().collect::<Vec<_>>()
+        let mut endpoints = endpoints.into_iter().collect::<Vec<_>>();
+        endpoints.sort_by(|&a, &b| {
+            map.get(b)
+                .unwrap()
+                .pos
+                .y
+                .total_cmp(&map.get(a).unwrap().pos.y)
+        });
+        endpoints
     };
     let rim = boundary(RoadClass::Motorway);
     let rail = boundary(RoadClass::Rail);
@@ -1517,30 +2554,94 @@ pub fn route_checks(
         rail: false,
     });
     let rim_through = match rim.as_slice() {
-        &[a, b] => {
-            route(a, b, LaneKind::Driving, &|road| motorway.contains(&road))
-                && route(b, a, LaneKind::Driving, &|road| motorway.contains(&road))
-        }
+        &[a, b] => routed_rim_trip(map, a, b, &motorway) && routed_rim_trip(map, b, a, &motorway),
         _ => false,
     };
     let rail_through = match rail.as_slice() {
-        &[a, b] => route(a, b, LaneKind::Rail, &|_| true) && route(b, a, LaneKind::Rail, &|_| true),
+        &[a, b] => {
+            can_route(map, a, b, LaneKind::Rail, |_| true)
+                && can_route(map, b, a, LaneKind::Rail, |_| true)
+        }
         _ => false,
     };
-    let h_access = h.is_some_and(|&h| {
-        rim.len() == 2
-            && rim.iter().all(|&gate| {
-                route(gate, h, LaneKind::Driving, &|_| true)
-                    && route(h, gate, LaneKind::Driving, &|_| true)
+    let ramp = built
+        .links
+        .get(&SourceKey::Authored("a2-hraska-ramp"))
+        .map(|span| span.road);
+    let access = |index, inbound| {
+        h.zip(rim.get(index)).is_some_and(|(&town, &gate)| {
+            let (from, to) = if inbound { (gate, town) } else { (town, gate) };
+            can_route(map, from, to, LaneKind::Driving, |road| {
+                Some(road) == ramp || motorway.contains(&road)
             })
-    });
+        })
+    };
     let core_access = h.zip(core).is_some_and(|(&h, &core)| {
-        route(h, core, LaneKind::Driving, &|_| true) && route(core, h, LaneKind::Driving, &|_| true)
+        can_route(map, h, core, LaneKind::Driving, |_| true)
+            && can_route(map, core, h, LaneKind::Driving, |_| true)
     });
+    let through_only = |via: u64, source_way: u64, destination: SourceKey| {
+        let key = SourceKey::Node {
+            id: via,
+            rail: false,
+        };
+        let Some(&junction) = built.junctions.get(&key) else {
+            return false;
+        };
+        let inbound: BTreeSet<_> = graph
+            .neighbours(key)
+            .filter(|link| link.lineage.contains(&source_way))
+            .map(|link| built.links[&link.key].road)
+            .collect();
+        // A westward crop can retire the source inlet before this node.
+        // With the inlet absent the restricted movement cannot be made.
+        if inbound.is_empty() {
+            return true;
+        }
+        let Some(destination) = built.links.get(&destination).map(|span| span.road) else {
+            return false;
+        };
+        let mut driving = map
+            .get(junction)
+            .unwrap()
+            .turns()
+            .filter(|turn| {
+                let lane = map.get(turn.id.src).unwrap();
+                lane.kind == LaneKind::Driving && inbound.contains(&lane.parent)
+            })
+            .peekable();
+        driving.peek().is_some()
+            && driving.all(|turn| map.get(turn.id.dst).unwrap().parent == destination)
+    };
+    let consolidated_ramp_no_u_turn = built
+        .links
+        .get(&SourceKey::Authored("a2-hraska-ramp"))
+        .zip(h)
+        .is_some_and(|(ramp, &town)| {
+            map.get(town).unwrap().turns().all(|turn| {
+                let from = map.get(turn.id.src).unwrap();
+                let to = map.get(turn.id.dst).unwrap();
+                from.kind != LaneKind::Driving || from.parent != ramp.road || to.parent != ramp.road
+            })
+        });
     BTreeMap::from([
         ("rim_through_both_directions", rim_through),
         ("mainline_rail_both_directions", rail_through),
-        ("two_way_ramp_from_both_gateways", h_access),
+        ("1231337592_north_gateway_to_hraska", access(0, true)),
+        ("1205190017_hraska_to_north_gateway", access(0, false)),
+        ("1205190016_south_gateway_to_hraska", access(1, true)),
+        (
+            "37854835_26261250_hraska_to_south_gateway",
+            access(1, false),
+        ),
         ("hraska_to_old_centre_both_directions", core_access),
+        (
+            "restriction_2465892_straight_on_to_hraska",
+            through_only(289194013, 26270881, SourceKey::Authored("hraska-west")),
+        ),
+        (
+            "restriction_18225139_no_consolidated_ramp_u_turn",
+            consolidated_ramp_no_u_turn,
+        ),
     ])
 }

@@ -84,7 +84,8 @@ pub fn export_schematic(paths: SourcePaths<'_>, out: &Path) -> Result<(), String
     let mut sim = preview_world(config)?;
     let built = build_network(&mut sim, &plan.graph, plan.limits)?;
     let map = sim.map();
-    let routes = route_checks(&map, &plan.graph, &built);
+    let mut routes = route_checks(&map, &plan.graph, &built);
+    routes.extend(river_routes(&map, &plan, &built));
     if let Some((name, _)) = routes.iter().find(|(_, passes)| !**passes) {
         return Err(format!("CITYMAP directed route failed: {name}"));
     }
@@ -96,7 +97,10 @@ pub fn export_schematic(paths: SourcePaths<'_>, out: &Path) -> Result<(), String
     }
     let blocks = blocks(&plan.graph);
     let frontage = frontage(&plan, &map, &built);
-    let report = report(&plan, &inputs, &map, &blocks, &frontage, lengths, routes);
+    let rail = rail_crossings(&map, &plan, &built);
+    let report = report(
+        &plan, &inputs, &map, &blocks, &frontage, lengths, routes, rail,
+    );
     let svg = out.join("citymap-schematic.svg");
     let files = [
         (
@@ -236,22 +240,65 @@ impl AlignmentLengths {
 fn live_lengths(map: &Map, plan: &TownPlan, built: &BuiltNetwork) -> AlignmentLengths {
     let mut lengths = AlignmentLengths::default();
     for (key, link) in &plan.graph.links {
-        let length = map.get(built.links[key].road).unwrap().length();
-        if link.lineage.is_empty() {
+        let road = map.get(built.links[key].road).unwrap();
+        let length = road.length();
+        let retained = if link.lineage.is_empty() {
             lengths.authored += length;
-        } else if link.realigned {
-            lengths.realigned += length;
+            0.0
         } else {
-            lengths.retained += length;
-        }
+            let retained: f32 = road
+                .points
+                .iter()
+                .zip(road.points.iter().skip(1))
+                .map(|(&a, &b)| {
+                    let length = a.distance(b);
+                    let sections = (length / 4.0).ceil().max(1.0) as usize;
+                    let within_source = (0..sections)
+                        .filter(|&i| {
+                            let midpoint =
+                                (a + (b - a) * ((i as f32 + 0.5) / sections as f32)).xy();
+                            link.samples.windows(2).any(|pair| {
+                                network::project_on_segment(midpoint, pair[0], pair[1])
+                                    .distance2(midpoint)
+                                    <= plan.limits.alignment.powi(2)
+                            })
+                        })
+                        .count();
+                    length * within_source as f32 / sections as f32
+                })
+                .sum();
+            lengths.retained += retained;
+            lengths.realigned += length - retained;
+            retained
+        };
         if matches!(link.class, RoadClass::Local | RoadClass::Collector) {
             lengths.total_local_collector += length;
-            if link.named && !link.realigned && !link.lineage.is_empty() {
-                lengths.retained_named_local_collector += length;
+            if link.named {
+                lengths.retained_named_local_collector += retained;
             }
         }
     }
     lengths
+}
+
+fn river_routes(map: &Map, plan: &TownPlan, built: &BuiltNetwork) -> BTreeMap<&'static str, bool> {
+    let mut routes = BTreeMap::new();
+    if let [west, east] = plan.crossings.as_slice() {
+        for omitted in [west, east] {
+            let [north, south] = omitted.approaches_keys.map(|key| built.junctions[&key]);
+            let blocked = built.links[&omitted.bridge].road;
+            routes.insert(
+                omitted.without_bridge_check,
+                [LaneKind::Driving, LaneKind::Walking]
+                    .into_iter()
+                    .all(|kind| {
+                        network::can_route(map, north, south, kind, |road| road != blocked)
+                            && network::can_route(map, south, north, kind, |road| road != blocked)
+                    }),
+            );
+        }
+    }
+    routes
 }
 
 fn road_bounds(graph: &Graph) -> Option<[Vec2; 2]> {
@@ -333,6 +380,8 @@ struct Frontage {
     link: SourceKey,
     district: Option<&'static str>,
     infill_candidate: bool,
+    left_of_source_direction: bool,
+    river_facing: bool,
     polygon: [[f32; 2]; 4],
 }
 
@@ -372,12 +421,53 @@ fn frontage(plan: &TownPlan, map: &Map, built: &BuiltNetwork) -> Vec<Frontage> {
             }) {
                 return None;
             }
+            let on_water = plan.river.iter().any(|reach| {
+                reach.downstream.windows(2).any(|pair| {
+                    corners.iter().any(|&corner| {
+                        network::project_on_segment(corner, pair[0], pair[1]).distance(corner)
+                            < 50.0
+                    })
+                })
+            });
+            let in_park = plan.riverside_park.as_ref().is_some_and(|park| {
+                corners
+                    .iter()
+                    .any(|&point| contains(&park.bank_strip, point))
+                    || park
+                        .bank_strip
+                        .iter()
+                        .any(|&point| contains(&corners, point))
+            });
+            if on_water || in_park {
+                return None;
+            }
             let district = plan.districts.iter().find(|district| {
                 corners
                     .iter()
                     .all(|&point| contains(&district.polygon, point))
             });
             let centre = corners.into_iter().sum::<Vec2>() * 0.25;
+            let road = map.get(lot.parent).unwrap();
+            let (a, b) =
+                road.points
+                    .iter()
+                    .zip(road.points.iter().skip(1))
+                    .min_by(|&(a, b), &(c, d)| {
+                        let distance = |a: &geom::Vec3, b: &geom::Vec3| {
+                            network::project_on_segment(centre, a.xy(), b.xy()).distance2(centre)
+                        };
+                        distance(a, b).total_cmp(&distance(c, d))
+                    })?;
+            let left = (b.xy() - a.xy()).perp_dot(centre - a.xy()) > 0.0;
+            let river_facing = district.is_some_and(|district| district.key == "south")
+                && plan.river.iter().any(|reach| {
+                    reach.downstream.windows(2).any(|pair| {
+                        let near = network::project_on_segment(centre, pair[0], pair[1]);
+                        let offset = centre - near;
+                        (94.0..=180.0).contains(&offset.mag())
+                            && (pair[1] - pair[0]).perp_dot(offset) > 0.0
+                    })
+                });
             Some(Frontage {
                 link: road_keys[&lot.parent],
                 district: district.map(|district| district.key),
@@ -387,10 +477,139 @@ fn frontage(plan: &TownPlan, map: &Map, built: &BuiltNetwork) -> Vec<Frontage> {
                             && centre.distance(reservation.position) <= 160.0
                     })
                 }),
+                left_of_source_direction: left,
+                river_facing,
                 polygon: corners.map(source::xy),
             })
         })
         .collect()
+}
+
+fn block_depth(ring: &[Vec2]) -> f32 {
+    ring.iter()
+        .zip(ring.iter().cycle().skip(1))
+        .filter_map(|(&a, &b)| (b - a).try_normalize())
+        .map(|dir| {
+            let (min, max) = ring
+                .iter()
+                .map(|point| point.dot(dir.perpendicular()))
+                .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), value| {
+                    (min.min(value), max.max(value))
+                });
+            max - min
+        })
+        .fold(f32::INFINITY, f32::min)
+}
+
+fn district_stats(
+    plan: &TownPlan,
+    blocks: &[Vec<Vec2>],
+    frontage: &[Frontage],
+) -> BTreeMap<&'static str, serde_json::Value> {
+    plan.districts
+        .iter()
+        .map(|district| {
+            let interior = |point| contains(&district.polygon, point);
+            let lots = frontage
+                .iter()
+                .filter(|lot| lot.district == Some(district.key))
+                .collect::<Vec<_>>();
+            let counts = [true, false].map(|left| {
+                lots.iter()
+                    .filter(|lot| lot.left_of_source_direction == left)
+                    .count()
+            });
+            let blocks = blocks
+                .iter()
+                .filter(|ring| interior(ring.iter().copied().sum::<Vec2>() / ring.len() as f32))
+                .map(|ring| {
+                    let lots_in_block = lots
+                        .iter()
+                        .filter(|lot| {
+                            let centre =
+                                lot.polygon.iter().map(|[x, y]| vec2(*x, *y)).sum::<Vec2>() * 0.25;
+                            contains(ring, centre)
+                        })
+                        .count();
+                    serde_json::json!({
+                        "area_m2": area(ring),
+                        "minimum_obb_width_m": block_depth(ring),
+                        "fitting_uniform_lots": lots_in_block,
+                    })
+                })
+                .collect::<Vec<_>>();
+            let mut exits = BTreeSet::new();
+            let mut exit_pairs = Vec::new();
+            for link in plan
+                .graph
+                .links
+                .values()
+                .filter(|link| link.class.driving() && link.class <= RoadClass::Avenue)
+            {
+                let [a, b] = link
+                    .endpoints
+                    .map(|key| interior(plan.graph.junctions[&key].position.xy()));
+                if a != b {
+                    let outer = link.endpoints[usize::from(a)];
+                    let inner = link.endpoints[usize::from(b)];
+                    exits.insert(outer);
+                    exit_pairs.push((inner, outer));
+                }
+            }
+            (
+                district.key,
+                serde_json::json!({
+                    "bounded_blocks": blocks,
+                    "left_right_uniform_lot_counts": counts,
+                    "river_facing_lots": lots.iter().filter(|lot| lot.river_facing).count(),
+                    "distinct_external_road_junctions": exits,
+                    "two_distributed_exits": exit_pairs.iter().enumerate().any(|(i, (a, b))| {
+                        exit_pairs[i + 1..].iter().any(|(c, d)| a != c && b != d)
+                    }),
+                }),
+            )
+        })
+        .collect()
+}
+
+fn rail_crossings(map: &Map, plan: &TownPlan, built: &BuiltNetwork) -> Vec<serde_json::Value> {
+    let live = |key| map.get(built.links[&key].road).unwrap();
+    let mut crossings = Vec::new();
+    for rail in plan
+        .graph
+        .links
+        .values()
+        .filter(|link| link.class == RoadClass::Rail)
+    {
+        let track = live(rail.key);
+        for road in plan
+            .graph
+            .links
+            .values()
+            .filter(|link| link.class.driving())
+        {
+            let street = live(road.key);
+            for (a, b) in track.points.iter().zip(track.points.iter().skip(1)) {
+                for (c, d) in street.points.iter().zip(street.points.iter().skip(1)) {
+                    let Some((t, u)) = network::segment_parameters(a.xy(), b.xy(), c.xy(), d.xy())
+                    else {
+                        continue;
+                    };
+                    let rail_z = a.z + t * (b.z - a.z);
+                    let road_z = c.z + u * (d.z - c.z);
+                    crossings.push(serde_json::json!({
+                        "track": rail.key,
+                        "street": road.key,
+                        "position_m": source::xy((a + (b - a) * t).xy()),
+                        "rail_running_surface_m": rail_z,
+                        "road_running_surface_m": road_z,
+                        "vertical_separation_m": (rail_z - road_z).abs(),
+                    }));
+                }
+            }
+        }
+    }
+    crossings
 }
 
 fn report(
@@ -401,6 +620,7 @@ fn report(
     frontage: &[Frontage],
     lengths: AlignmentLengths,
     routes: BTreeMap<&'static str, bool>,
+    rail: Vec<serde_json::Value>,
 ) -> serde_json::Value {
     let lane_stats = |kind| {
         Distribution::of(
@@ -434,14 +654,29 @@ fn report(
         "live_road_arc": Distribution::of(map.roads().values().map(|road| road.length()).collect()),
         "live_driving_lanes": lane_stats(LaneKind::Driving),
         "live_rail_lanes": lane_stats(LaneKind::Rail),
+        "live_road_rail_crossings": rail,
         "length_by_alignment_m": lengths,
         "link_counts": classes,
         "directed_turn_connectivity": routes,
+        "source_movement_audit": {
+            "scope": "Separate OSM API bbox snapshot for the Lesce core, inspected 2026-11-24",
+            "source": "https://api.openstreetmap.org/api/0.6/map?bbox=14.145,46.348,14.171,46.370",
+            "sha256": "ec7ba0154587caf5b89656ea2930645761c878eb7423769d17acf4c906bf781a",
+            "relations_read": 18,
+            "kept_as_live_turn_checks": [2465892, 18225139],
+            "superseded_or_outside_live_approaches": [1014411, 5516533, 5516534, 5516535, 5516536, 6650471, 8451567, 11569290, 11569298, 11569299, 11569300, 17691026, 17810892, 18140559, 18140560, 18140561]
+        },
         "signals": plan.graph.junctions.values().filter(|node| node.light == LightPolicy::Lights).map(|node| node.key).collect::<Vec<_>>(),
         "town_road_bounds_m": road_bounds(&plan.graph).map(|bounds| bounds.map(source::xy)),
         "bounded_road_face_count": blocks.len(),
         "bounded_road_face_share": filled / (f64::from(extent.x) * f64::from(extent.y)),
         "sava_crossings": plan.crossings,
+        "authored_sava": plan.river,
+        "source_sava": plan.source_river,
+        "mapped_sava_bridges": plan.mapped_sava_bridges,
+        "outer_corridor_traces": plan.outer_corridor_traces,
+        "riverside_park": plan.riverside_park,
+        "district_block_depth_and_frontage": district_stats(plan, blocks, frontage),
         "districts": plan.districts,
         "dry_uniform_frontage_candidates": frontage,
         "district_lot_counts": plan.districts.iter().map(|district| (district.key, frontage.iter().filter(|lot| lot.district == Some(district.key)).count())).collect::<BTreeMap<_,_>>(),
@@ -505,13 +740,15 @@ fn schematic(
     for (district, colour) in plan
         .districts
         .iter()
-        .zip(["#bc674b", "#6c945e", "#a98048", "#7b75a1"])
+        .zip(["#bc674b", "#6c945e", "#a98048", "#50898a", "#7b75a1"])
     {
         writeln!(svg,r#"<polygon points="{}" fill="{colour}" fill-opacity=".13" stroke="{colour}" stroke-width="5" stroke-dasharray="15 13"/>"#,points(&district.polygon)).unwrap();
     }
     for lot in frontage {
         let polygon = lot.polygon.map(|[x, y]| vec2(x, y));
-        let fill = if lot.infill_candidate {
+        let fill = if lot.river_facing {
+            "#708c52"
+        } else if lot.infill_candidate {
             "#c3a14d"
         } else {
             "#9eaa79"
@@ -522,6 +759,14 @@ fn schematic(
             points(&polygon)
         )
         .unwrap();
+    }
+    if let Some(park) = &plan.riverside_park {
+        writeln!(svg, r##"<polygon points="{}" fill="#79a75d" fill-opacity=".48" stroke="#5c8745" stroke-width="4"/>"##,
+            points(&park.bank_strip)).unwrap();
+    }
+    for reach in &plan.source_river {
+        writeln!(svg, r##"<polyline points="{}" fill="none" stroke="#6495a3" stroke-width="8" stroke-dasharray="20 15"/>"##,
+            points(&reach.downstream)).unwrap();
     }
     for reach in &plan.river {
         writeln!(svg,r##"<polyline points="{}" fill="none" stroke="#78b3c8" stroke-opacity=".55" stroke-width="86"/>
@@ -628,7 +873,7 @@ fn schematic(
     }
     svg.push_str(r##"<path d="M0 550h100" stroke="#a8a99d" stroke-width="6" stroke-dasharray="13 9"/><text x="134" y="562" font-size="36">OSM alignment</text>
 <circle cx="50" cy="615" r="13" fill="#e8ba59" stroke="#57392e" stroke-width="5"/><text x="134" y="627" font-size="36">Signal</text>
-<path d="M0 680h100" stroke="#3380a2" stroke-width="12"/><text x="134" y="692" font-size="36">Sava Dolinka</text>
+<path d="M0 680h100" stroke="#3380a2" stroke-width="12"/><text x="134" y="692" font-size="36">Authored Sava</text>
 <path d="M0 745h100" stroke="#205a79" stroke-width="8" stroke-dasharray="15 10"/><text x="134" y="757" font-size="36">Crossing reservation</text>
 <circle cx="50" cy="810" r="9" fill="#faf8f2" stroke="#77796f" stroke-width="4"/><text x="134" y="822" font-size="36">Source crop</text>
 <rect x="39" y="864" width="22" height="22" fill="#1c3335"/><text x="134" y="887" font-size="36">Rim / rail gateway</text>
@@ -645,10 +890,13 @@ fn schematic(
         )
         .unwrap();
     }
-    svg.push_str(r##"<path d="M30 1550v-105m-23 28 23-33 23 33" fill="none" stroke="#293432" stroke-width="7"/>
-<text x="16" y="1420" font-size="40">N</text>
-<path d="M0 1700h500m-500 13v-26m250 26v-26m250 26v-26" fill="none" stroke="#293432" stroke-width="6"/>
-<text y="1760" font-size="33">0</text><text x="226" y="1760" font-size="33">250</text><text x="463" y="1760" font-size="33">500 m</text>
+    svg.push_str(r##"<path d="M0 1490h100" stroke="#6495a3" stroke-width="8" stroke-dasharray="20 15"/><text x="134" y="1502" font-size="33">Mapped Sava</text>
+<rect x="29" y="1530" width="42" height="25" fill="#79a75d" opacity=".65"/><text x="134" y="1554" font-size="33">Riverside park strip</text>
+<rect x="29" y="1590" width="42" height="25" fill="#708c52"/><text x="134" y="1614" font-size="33">River-facing lots</text>
+<path d="M30 1830v-105m-23 28 23-33 23 33" fill="none" stroke="#293432" stroke-width="7"/>
+<text x="16" y="1700" font-size="40">N</text>
+<path d="M0 1980h500m-500 13v-26m250 26v-26m250 26v-26" fill="none" stroke="#293432" stroke-width="6"/>
+<text y="2040" font-size="33">0</text><text x="226" y="2040" font-size="33">250</text><text x="463" y="2040" font-size="33">500 m</text>
 </g>"##);
     writeln!(svg,r##"<text x="84" y="{}" font-size="29" fill="#4d5650">{ATTRIBUTION} · Draft schematic</text></svg>"##,height+335.0).unwrap();
     svg
@@ -684,7 +932,7 @@ fn write_png(svg: &Path, png: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use simulation::map::ProjectKind;
+    use simulation::map::{MapProject, ProjectKind};
     use simulation::world_command::{CommandOutcomes, WorldCommand};
     use simulation::{SlotId, SnapshotRevision};
 
@@ -723,6 +971,331 @@ mod tests {
         graph
     }
 
+    fn reload_fixture(sim: &Simulation) -> Simulation {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("egr-cm1-{}-{stamp}", std::process::id()));
+        std::fs::create_dir(&path).unwrap();
+        let id = SlotId::new("fixture").unwrap();
+        let loaded = (|| {
+            sim.save_to_slot(&path, &id, SnapshotRevision::new(1))?;
+            Simulation::load_from_slot(&path, &id)
+        })();
+        std::fs::remove_dir_all(&path).unwrap();
+        loaded.unwrap()
+    }
+
+    fn pinned_inputs() -> PinnedInputs {
+        read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn citymap_reframes_owned_area_in_banded_terrain() {
+        let inputs = pinned_inputs();
+        let mut baseline_cut = None;
+        for offset in [vec2(0.0, 0.0), vec2(-100.0, -100.0), vec2(-256.0, -128.0)] {
+            let min = vec2(512.0, 512.0) + offset;
+            let config = TownConfig {
+                map_chunks: 8,
+                owned_min: min,
+                owned_max: min + vec2(3072.0, 3072.0),
+                translation: TownConfig::default().translation - offset,
+                ..TownConfig::default()
+            };
+            let plan = plan_town(&inputs, config, SpacingLimits::default())
+                .unwrap_or_else(|err| panic!("{offset:?} planning: {err}"));
+            let east_cut = plan.graph.links[&SourceKey::Authored("hraska-east")].endpoints[1];
+            if offset == Vec2::ZERO {
+                baseline_cut = Some(east_cut);
+            }
+            if offset.x == -256.0 {
+                assert_ne!(baseline_cut, Some(east_cut), "the geographic cut must move");
+            }
+            let terrain_edge = |point: Vec2| {
+                let cap = f32::from(config.map_chunks) * 512.0;
+                [point.x, point.y, cap - point.x, cap - point.y]
+                    .iter()
+                    .any(|value| value.abs() < 0.1)
+            };
+            for class in [RoadClass::Motorway, RoadClass::Rail] {
+                let edge_points = plan
+                    .outer_corridor_traces
+                    .iter()
+                    .filter(|trace| trace.class == class)
+                    .flat_map(|trace| [trace.points[0], *trace.points.last().unwrap()])
+                    .filter(|&point| terrain_edge(point))
+                    .count();
+                assert!(
+                    edge_points >= 2,
+                    "{offset:?}: incomplete outer {class:?} trace"
+                );
+            }
+            let sava = &plan.river[0].downstream;
+            assert!(terrain_edge(sava[0]) && terrain_edge(*sava.last().unwrap()));
+            let mut sim = preview_world(config).unwrap();
+            let built = build_network(&mut sim, &plan.graph, plan.limits)
+                .unwrap_or_else(|err| panic!("{offset:?} live build: {err}"));
+            let routes = route_checks(&sim.map(), &plan.graph, &built);
+            assert!(
+                routes.values().all(|pass| *pass),
+                "{offset:?} routes: {routes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn citymap_reframes_to_seven_compact_chunks() {
+        let config = TownConfig {
+            map_chunks: 7,
+            owned_max: vec2(3584.0, 3584.0),
+            ..TownConfig::default()
+        };
+        let plan = plan_town(&pinned_inputs(), config, SpacingLimits::default()).unwrap();
+        let mut sim = preview_world(config).unwrap();
+        let built = build_network(&mut sim, &plan.graph, plan.limits).unwrap();
+        assert!(route_checks(&sim.map(), &plan.graph, &built)
+            .values()
+            .all(|pass| *pass));
+    }
+
+    #[test]
+    fn citymap_neighbourhood_density_and_frontage() {
+        let plan = plan_town(
+            &pinned_inputs(),
+            TownConfig::default(),
+            SpacingLimits::default(),
+        )
+        .unwrap();
+        let mut sim = preview_world(plan.config).unwrap();
+        let built = build_network(&mut sim, &plan.graph, plan.limits).unwrap();
+        let map = sim.map();
+        assert!(plan
+            .graph
+            .junctions
+            .values()
+            .any(|node| node.light == LightPolicy::Lights));
+        let stats = geometry_stats(&plan.graph, 1.0);
+        let median = stats.adjacent_driving_junction_pairs.median.unwrap();
+        assert!((110.0..=140.5).contains(&median), "median {median:.1} m");
+        let lots = frontage(&plan, &map, &built);
+        let faces = blocks(&plan.graph);
+        let routes = route_checks(&map, &plan.graph, &built);
+        assert!(routes.values().all(|pass| *pass), "{routes:?}");
+        let lengths = live_lengths(&map, &plan, &built);
+        assert!(
+            lengths.has_retained_majority(),
+            "named alignment {}/{}",
+            lengths.retained_named_local_collector,
+            lengths.total_local_collector
+        );
+        let summaries = district_stats(&plan, &faces, &lots);
+        assert!(summaries["south"]["river_facing_lots"]
+            .as_u64()
+            .is_some_and(|n| n >= 2));
+        for (name, summary) in &summaries {
+            let fronted_blocks = summary["bounded_blocks"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|block| {
+                    block["fitting_uniform_lots"]
+                        .as_u64()
+                        .is_some_and(|count| count >= 2)
+                })
+                .count();
+            assert!(
+                fronted_blocks >= 2,
+                "{name} needs two fronted blocks: {summary}"
+            );
+            let sides = summary["left_right_uniform_lot_counts"].as_array().unwrap();
+            assert!(
+                sides.iter().all(|side| side.as_u64().unwrap() >= 2),
+                "{name}: {summary}"
+            );
+            assert_eq!(
+                summary["two_distributed_exits"], true,
+                "{name} lacks two exits: {summary}"
+            );
+        }
+        for district in ["south", "west"] {
+            let area = &plan
+                .districts
+                .iter()
+                .find(|d| d.key == district)
+                .unwrap()
+                .polygon;
+            let faces = faces
+                .iter()
+                .filter(|ring| {
+                    contains(area, ring.iter().copied().sum::<Vec2>() / ring.len() as f32)
+                })
+                .count();
+            assert!(faces >= 2, "{district}: {faces} block faces");
+            let lots = lots
+                .iter()
+                .filter(|lot| lot.district == Some(district))
+                .count();
+            assert!(lots >= 12, "{district}: {lots} lots");
+        }
+    }
+
+    #[test]
+    fn citymap_river_crossings_have_live_approaches() {
+        let plan = plan_town(
+            &pinned_inputs(),
+            TownConfig::default(),
+            SpacingLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(plan.crossings.len(), 2);
+        let mut sim = preview_world(plan.config).unwrap();
+        let built = build_network(&mut sim, &plan.graph, plan.limits).unwrap();
+        let map = sim.map();
+        let routes = river_routes(&map, &plan, &built);
+        assert_eq!(routes.len(), 2);
+        assert!(routes.values().all(|&pass| pass), "{routes:?}");
+        assert_eq!(
+            plan.crossings
+                .iter()
+                .map(|bridge| bridge.class)
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([RoadClass::Collector, RoadClass::Avenue])
+        );
+        assert!(plan
+            .riverside_park
+            .as_ref()
+            .is_some_and(|park| park.bank_strip.len() >= 12));
+        for crossing in &plan.crossings {
+            let bridge = map.get(built.links[&crossing.bridge].road).unwrap();
+            assert!(bridge.has_sidewalks());
+            assert!(bridge
+                .lanes_iter()
+                .filter(|&(_, kind)| kind == LaneKind::Driving)
+                .all(|(id, _)| map.get(id).unwrap().points.length() >= plan.limits.arterial_lane));
+            for end in crossing.approaches {
+                assert!(
+                    plan.graph
+                        .junctions
+                        .values()
+                        .any(|node| node.position.xy().distance(end) < 0.5),
+                    "{} has no road approach at {end:?}",
+                    crossing.key
+                );
+            }
+        }
+        drop(map);
+        let loaded = reload_fixture(&sim);
+        let map = loaded.map();
+        let rebuilt = resolve_network(&map, &plan.graph).unwrap();
+        validate_live(&map, &plan.graph, &rebuilt, plan.limits).unwrap();
+        assert!(river_routes(&map, &plan, &rebuilt)
+            .values()
+            .all(|&pass| pass));
+        assert!(route_checks(&map, &plan.graph, &rebuilt)
+            .values()
+            .all(|&pass| pass));
+    }
+
+    #[test]
+    fn citymap_resolver_rejects_wrong_elbow() {
+        let mut graph = fixture_graph();
+        let mut sim = preview_world(TownConfig::default()).unwrap();
+        let limits = SpacingLimits::default();
+        let built = build_network(&mut sim, &graph, limits).unwrap();
+        let link = graph.links.values_mut().next().unwrap();
+        let [a, b] = link
+            .endpoints
+            .map(|key| graph.junctions[&key].position.xy());
+        link.elbow = Some((a + b) * 0.5 + vec2(0.0, 90.0));
+        let map = sim.map();
+        assert!(resolve_network(&map, &graph)
+            .unwrap_err()
+            .contains("centreline"));
+        assert!(validate_live(&map, &graph, &built, limits)
+            .unwrap_err()
+            .contains("centreline"));
+    }
+
+    fn edit_connection(
+        sim: &mut Simulation,
+        from: MapProject,
+        to: Vec2,
+        elbow: Option<Vec2>,
+        class: RoadClass,
+    ) {
+        sim.apply_commands([&WorldCommand::MapMakeConnection {
+            from,
+            to: MapProject::ground(to.z(10.0)),
+            inter: elbow,
+            pat: class.pattern(false, 0.0),
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+    }
+
+    #[test]
+    fn citymap_validation_rejects_shared_approach_overlap_after_edit() {
+        let graph = fixture_graph();
+        let mut sim = preview_world(TownConfig::default()).unwrap();
+        let limits = SpacingLimits::default();
+        let built = build_network(&mut sim, &graph, limits).unwrap();
+        let centre = built.junctions[&SourceKey::Authored("fixture-centre")];
+        edit_connection(
+            &mut sim,
+            MapProject {
+                kind: ProjectKind::Intersection(centre),
+                pos: graph.junctions[&SourceKey::Authored("fixture-centre")].position,
+            },
+            vec2(690.0, 430.0),
+            Some(vec2(590.0, 645.0)),
+            RoadClass::Local,
+        );
+        assert!(validate_live(&sim.map(), &graph, &built, limits)
+            .unwrap_err()
+            .contains("swept overlap"));
+    }
+
+    #[test]
+    fn citymap_validation_rejects_unsafe_live_rail_crossing() {
+        let graph = fixture_graph();
+        let mut sim = preview_world(TownConfig::default()).unwrap();
+        let limits = SpacingLimits::default();
+        let built = build_network(&mut sim, &graph, limits).unwrap();
+        edit_connection(
+            &mut sim,
+            MapProject::ground(vec2(600.0, 370.0).z(10.0)),
+            vec2(600.0, 650.0),
+            None,
+            RoadClass::Rail,
+        );
+        assert!(validate_live(&sim.map(), &graph, &built, limits)
+            .unwrap_err()
+            .contains("rail clearance"));
+    }
+
+    #[test]
+    fn citymap_validation_rejects_disconnected_neighbourhood_after_edit() {
+        let graph = fixture_graph();
+        let mut sim = preview_world(TownConfig::default()).unwrap();
+        let limits = SpacingLimits::default();
+        let built = build_network(&mut sim, &graph, limits).unwrap();
+        edit_connection(
+            &mut sim,
+            MapProject::ground(vec2(825.0, 870.0).z(10.0)),
+            vec2(1015.0, 850.0),
+            None,
+            RoadClass::Local,
+        );
+        assert!(validate_live(&sim.map(), &graph, &built, limits)
+            .unwrap_err()
+            .contains("Driving connectivity"));
+    }
+
     #[test]
     fn citymap_live_resolution_survives_an_adjacent_command_and_reload() {
         let graph = fixture_graph();
@@ -751,19 +1324,7 @@ mod tests {
         let resolved = resolve_network(&sim.map(), &graph).unwrap();
         validate_live(&sim.map(), &graph, &resolved, limits).unwrap();
 
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let path = std::env::temp_dir().join(format!("egr-cm1-{}-{stamp}", std::process::id()));
-        std::fs::create_dir(&path).unwrap();
-        let id = SlotId::new("fixture").unwrap();
-        let loaded = (|| {
-            sim.save_to_slot(&path, &id, SnapshotRevision::new(1))?;
-            Simulation::load_from_slot(&path, &id)
-        })();
-        std::fs::remove_dir_all(&path).unwrap();
-        let loaded = loaded.unwrap();
+        let loaded = reload_fixture(&sim);
         let map = loaded.map();
         let rebuilt = resolve_network(&map, &graph).unwrap();
         assert_eq!(resolved.junctions, rebuilt.junctions);
