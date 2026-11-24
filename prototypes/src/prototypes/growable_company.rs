@@ -1,10 +1,12 @@
 use crate::{
     get_lua, try_prototype, Density, GoodsCompanyID, GoodsCompanyPrototype, GrowableChainKey,
-    GrowableCompanyID, GrowableMassing, GrowableZoneKind, Prototype,
+    GrowableCompanyID, GrowableMassing, GrowableZoneKind, Prototype, MAX_PROFILED_SLOTS,
 };
 use mlua::{FromLua, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
 use std::ops::Deref;
+
+use super::growable_massing::{lua_number, profile_integer};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ZoneKind {
@@ -67,8 +69,21 @@ impl Prototype for GrowableCompanyPrototype {
     const NAME: &'static str = "growable-company";
 
     fn from_lua(table: &Table) -> mlua::Result<Self> {
-        let base = GoodsCompanyPrototype::from_lua(table)?;
         let kind = get_lua::<GrowableZoneKind>(table, "zone_kind")?;
+        let massing = get_lua::<Option<GrowableMassing>>(table, "massing")?;
+        let profiled = massing.is_some() || kind == GrowableZoneKind::MixedUse;
+        let level = if profiled {
+            profile_integer(table.get("level")?, 5, "level")? as u8
+        } else {
+            get_lua(table, "level")?
+        };
+        if profiled {
+            profile_integer(table.get("n_workers")?, MAX_PROFILED_SLOTS, "n_workers")?;
+            if let Some(recipe) = get_lua::<Option<Table>>(table, "recipe")? {
+                validate_profile_recipe_lua(&recipe)?;
+            }
+        }
+        let base = GoodsCompanyPrototype::from_lua(table)?;
         Ok(Self {
             id: Self::ID::new(&base.name),
             base,
@@ -77,10 +92,10 @@ impl Prototype for GrowableCompanyPrototype {
                 GrowableZoneKind::MixedUse => ZoneKind::Commercial,
             },
             density: get_lua(table, "density")?,
-            level: get_lua(table, "level")?,
+            level,
             lot_size_min: get_lua(table, "lot_size_min")?,
             growable: get_lua(table, "growable")?,
-            massing: get_lua(table, "massing")?,
+            massing,
             mixed_use: kind == GrowableZoneKind::MixedUse,
         })
     }
@@ -92,6 +107,48 @@ impl Prototype for GrowableCompanyPrototype {
     fn parent(&self) -> &Self::Parent {
         &self.base
     }
+}
+
+fn validate_profile_recipe_lua(recipe: &Table) -> mlua::Result<()> {
+    profile_integer(
+        recipe.get("storage_multiplier")?,
+        i32::MAX as u32,
+        "recipe.storage_multiplier",
+    )?;
+    for field in ["consumption", "production"] {
+        for item in get_lua::<Vec<Table>>(recipe, field)? {
+            let amount = if matches!(item.get::<_, Value>(1)?, Value::Nil) {
+                item.get("amount")?
+            } else {
+                item.get(2)?
+            };
+            profile_integer(amount, i32::MAX as u32, &format!("recipe.{field}"))?;
+        }
+    }
+
+    // Each supported unit fits safely in the Tick parser at this bound. Registry
+    // validation checks the resulting full-speed batch duration separately.
+    let valid = |part| (0.0..=f64::from(u32::MAX)).contains(&part);
+    let bad_duration =
+        || mlua::Error::external("field recipe.duration: invalid duration component");
+    match recipe.get::<_, Value>("duration")? {
+        Value::Table(parts) => {
+            for pair in parts.pairs::<Value, Value>() {
+                let (_, part) = pair?;
+                if !lua_number(&part).is_some_and(valid) {
+                    return Err(bad_duration());
+                }
+            }
+        }
+        Value::String(text) => {
+            if !common::parse_f64(text.to_str()?.trim()).is_ok_and(|(part, _)| valid(part)) {
+                return Err(bad_duration());
+            }
+        }
+        part if lua_number(&part).is_some_and(valid) => {}
+        _ => return Err(bad_duration()),
+    }
+    Ok(())
 }
 
 impl Deref for GrowableCompanyPrototype {

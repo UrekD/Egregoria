@@ -11,6 +11,7 @@ use crate::{
 #[test]
 fn test_base() {
     unsafe {
+        zones2_check_live_loader_rejects_mixed();
         match load_prototypes("../") {
             Ok(_) => {}
             Err(e) => {
@@ -110,6 +111,45 @@ fn test_base() {
         ] {
             assert_eq!(ItemID::new(name).prototype().optout_exttrade, local_only);
         }
+    }
+}
+
+unsafe fn zones2_check_live_loader_rejects_mixed() {
+    let fixture = std::env::temp_dir().join(format!("egregoria-zones2-{}", std::process::id()));
+    let mod_dir = fixture.join("base_mod");
+    std::fs::create_dir_all(&mod_dir).unwrap();
+    let mut outcomes = Vec::new();
+    for (lua_prelude, kind, density) in [
+        ("", "growable-company", "low"),
+        (
+            "zones2_profiles_enabled = true",
+            "growable-company",
+            "medium",
+        ),
+        ("zones2_profiles_enabled = true", "residence", "high"),
+    ] {
+        let script = format!(
+            r#"{lua_prelude}
+            data:extend {{
+                type = "{kind}", name = "staged-mixed", label = "Staged Mixed Use",
+                size = 20, bgen = "house", asset = "bakery.glb", price = 0,
+                zone_kind = "mixed-use", density = "{density}", level = 1,
+                lot_size_min = 400, capacity = 4, growable = true, kind = "store",
+                n_workers = 12,
+            }}"#
+        );
+        std::fs::write(mod_dir.join("data.lua"), script).unwrap();
+        outcomes.push(unsafe { load_prototypes(&format!("{}/", fixture.display())) });
+    }
+    std::fs::remove_dir_all(fixture).unwrap();
+    for outcome in outcomes {
+        let error = outcome
+            .expect_err("live loader accepted staged Mixed Use")
+            .to_string();
+        assert!(
+            error.contains("Mixed Use requires checked placement"),
+            "{error}"
+        );
     }
 }
 
@@ -289,6 +329,100 @@ fn zones2_pure_chains_keep_ids_and_profile_each_density() {
     }
 }
 
+#[test]
+fn zones2_named_legacy_home_does_not_shadow_profiled_chain() {
+    let registry = zones2_base_with(
+        r#"data:extend {
+            type = "residence", name = "legacy-home", label = "Legacy Home", order = "!",
+            size = 20, bgen = "house", asset = "bakery.glb", price = 0,
+            density = "medium", level = 1, lot_size_min = 400, capacity = 3,
+        }"#,
+    );
+    let key = GrowableChainKey {
+        zone_kind: GrowableZoneKind::Pure(ZoneKind::Residential),
+        density: Density::Medium,
+        level: 1,
+    };
+    assert_eq!(
+        registry.residence_for_chain(key).unwrap().name,
+        "residence-medium-l1"
+    );
+    let legacy = &registry.residence[&ResidencePrototypeID::new("legacy-home")];
+    assert!(legacy.massing.is_none());
+    assert_eq!(legacy.capacity, 3);
+    assert_eq!(
+        registry
+            .legacy_residence(key.density, key.level)
+            .unwrap()
+            .id,
+        legacy.id
+    );
+}
+
+#[test]
+fn zones2_profile_floors_require_raw_integers() {
+    use mlua::FromLua;
+
+    let lua = mlua::Lua::new();
+    let good = "style = 'block', min_plot_width_m = 20, min_plot_depth_m = 20";
+    for (floors, cap, field) in [
+        ("{1.9, 5, 6, 7, 8}", "10", "floors_by_level"),
+        ("{4.5, 5, 6, 7, 8}", "10", "floors_by_level"),
+        ("{4, 5, 6, 7, 8}", "10.5", "max_floors"),
+        ("{0, 5, 6, 7, 8}", "10", "floors_by_level"),
+        ("{4, 5, 6, 7, 8}", "256", "max_floors"),
+    ] {
+        let spec = format!("return {{{good}, floors_by_level = {floors}, max_floors = {cap}}}");
+        let value = lua.load(spec).eval().unwrap();
+        let error = GrowableMassing::from_lua(value, &lua).expect_err(field);
+        assert!(error.to_string().contains(field), "{error}");
+    }
+}
+
+#[test]
+fn zones2_profile_recipe_rejects_fractional_amounts() {
+    for (change, field) in [
+        ("shop.recipe.consumption[1][2] = 2.9", "consumption"),
+        ("shop.recipe.production[1][2] = 1.9", "production"),
+        (
+            "shop.recipe.storage_multiplier = 12.5",
+            "storage_multiplier",
+        ),
+    ] {
+        let error = zones2_profile_parse_result(change).expect_err(field);
+        assert!(error.contains(field), "{error}");
+    }
+}
+
+#[test]
+fn zones2_profile_recipe_rejects_invalid_duration_components() {
+    for duration in [
+        "{seconds = 360, ticks = 0/0}",
+        "{seconds = 360, ticks = -0.01}",
+        "math.huge",
+    ] {
+        let error = zones2_profile_parse_result(&format!("shop.recipe.duration = {duration}"))
+            .expect_err(duration);
+        assert!(error.contains("recipe.duration"), "{error}");
+    }
+}
+
+fn zones2_profile_parse_result(change: &str) -> Result<(), String> {
+    let lua = zones2_lua();
+    let script = format!(
+        r#"for _, shop in ipairs(data) do
+            if shop.name == "mixed-medium-l1" then
+                {change}
+                return shop
+            end
+        end"#
+    );
+    let table: mlua::Table = lua.load(script).eval().unwrap();
+    crate::Prototypes::default()
+        .parse_prototype(table)
+        .map_err(|error| error.to_string())
+}
+
 fn assert_profile(profile: GrowableMassing, floors: [u8; 5], cap: u8) {
     assert_eq!(profile.floors_by_level, floors);
     assert_eq!(profile.max_floors, cap);
@@ -303,7 +437,26 @@ fn assert_profile(profile: GrowableMassing, floors: [u8; 5], cap: u8) {
 }
 
 fn zones2_base() -> crate::Prototypes {
+    zones2_base_with("")
+}
+
+fn zones2_base_with(extra_lua: &str) -> crate::Prototypes {
+    let lua = zones2_lua();
+    lua.load(extra_lua).exec().unwrap();
+
+    let mut registry = crate::Prototypes::default();
+    let data: mlua::Table = lua.globals().get("data").unwrap();
+    for table in data.sequence_values::<mlua::Table>() {
+        registry.parse_prototype(table.unwrap()).unwrap();
+    }
+    crate::validation::validate(&registry).unwrap();
+    registry.compute_orderings();
+    registry
+}
+
+fn zones2_lua() -> mlua::Lua {
     let lua = mlua::Lua::new();
+    lua.set_app_data(crate::AllowStagedMixedUse);
     let globals = lua.globals();
     globals
         .get::<_, mlua::Table>("package")
@@ -316,14 +469,8 @@ fn zones2_base() -> crate::Prototypes {
         .exec()
         .unwrap();
 
-    let mut registry = crate::Prototypes::default();
-    let data: mlua::Table = globals.get("data").unwrap();
-    for table in data.sequence_values::<mlua::Table>() {
-        registry.parse_prototype(table.unwrap()).unwrap();
-    }
-    crate::validation::validate(&registry).unwrap();
-    registry.compute_orderings();
-    registry
+    drop(globals);
+    lua
 }
 
 #[test]

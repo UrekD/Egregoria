@@ -22,7 +22,7 @@ local function residences(density, capacities, lot_size_min, massing, mixed)
     end
 end
 
--- Enable with the checked placement and save-version integration.
+-- Select the staged data when the engine's Mixed Use placement gate is open.
 if zones2_profiles_enabled == true then
     local low = {
         style = "house",

@@ -1,11 +1,13 @@
 use crate::{
     get_lua, BuildingPrototype, GrowableChainKey, GrowableMassing, GrowableZoneKind, Prototype,
-    ResidencePrototypeID,
+    ResidencePrototypeID, MAX_PROFILED_SLOTS,
 };
 use mlua::{FromLua, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 use std::ops::Deref;
+
+use super::growable_massing::profile_integer;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Density {
@@ -78,16 +80,27 @@ impl Prototype for ResidencePrototype {
     const NAME: &'static str = "residence";
 
     fn from_lua(table: &Table) -> mlua::Result<Self> {
+        let zone_kind =
+            get_lua::<Option<GrowableZoneKind>>(table, "zone_kind")?.unwrap_or_default();
+        let massing = get_lua::<Option<GrowableMassing>>(table, "massing")?;
+        let (level, capacity) = if massing.is_some() || zone_kind == GrowableZoneKind::MixedUse {
+            (
+                profile_integer(table.get("level")?, 5, "level")? as u8,
+                profile_integer(table.get("capacity")?, MAX_PROFILED_SLOTS, "capacity")?,
+            )
+        } else {
+            (get_lua(table, "level")?, get_lua(table, "capacity")?)
+        };
         let base = BuildingPrototype::from_lua(table)?;
         Ok(Self {
             id: Self::ID::new(&base.name),
             base,
-            zone_kind: get_lua::<Option<_>>(table, "zone_kind")?.unwrap_or_default(),
+            zone_kind,
             density: get_lua(table, "density")?,
-            level: get_lua(table, "level")?,
-            capacity: get_lua(table, "capacity")?,
+            level,
+            capacity,
             lot_size_min: get_lua(table, "lot_size_min")?,
-            massing: get_lua(table, "massing")?,
+            massing,
         })
     }
 
