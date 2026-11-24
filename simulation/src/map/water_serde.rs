@@ -3,17 +3,34 @@
 
 use super::water::{
     empty_fresh_chunk, packed_bed_limit, valid_river_width, valid_water_depth, BodyShape,
-    FreshBody, FreshCell, WaterBasin, WaterBodyId, WaterState, WaterStroke, MAX_FRESHWATER_BODIES,
-    MAX_WATER_CHUNKS, MAX_WATER_RIVER_VERTICES, MAX_WATER_VERTICES, MIN_DEPTH, TILES_PER_CHUNK,
+    FreshBody, FreshCell, WaterBasin, WaterBodyId, WaterEdit, WaterState, WaterStroke,
+    MAX_FRESHWATER_BODIES, MAX_WATER_CHUNKS, MAX_WATER_EDIT_BYTES, MAX_WATER_RIVER_VALIDATION_WORK,
+    MAX_WATER_RIVER_VERTICES, MAX_WATER_VERTICES, MIN_DEPTH, TILES_PER_CHUNK,
 };
 use super::TerrainChunkID;
+use common::saveload::Encoder;
 use geom::Vec2;
 use serde::de::{DeserializeSeed, Error, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeMap;
 use std::fmt;
+use std::io;
 use std::marker::PhantomData;
+
+impl WaterEdit {
+    /// Decode a standalone, length-delimited edit. Embedded edits are bounded
+    /// by their Serde field and sequence visitors.
+    pub fn decode_bounded<E: Encoder>(payload: &[u8]) -> io::Result<Self> {
+        if payload.len() > MAX_WATER_EDIT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "water edit exceeds 8 KiB",
+            ));
+        }
+        E::decode(payload)
+    }
+}
 
 struct RejectExtra(&'static str);
 
@@ -106,6 +123,7 @@ pub(super) fn optional_level<'de, D: Deserializer<'de>>(
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireBody<T> {
     id: WaterBodyId,
     level_dm: i16,
@@ -113,6 +131,7 @@ struct WireBody<T> {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WireChunk<T> {
     chunk: TerrainChunkID,
     cells: T,
@@ -163,6 +182,7 @@ impl Serialize for ChunksRef<'_> {
 struct Bodies {
     table: BTreeMap<WaterBodyId, FreshBody>,
     vertices: usize,
+    shape_work: usize,
 }
 
 impl<'de> Deserialize<'de> for Bodies {
@@ -217,6 +237,7 @@ impl Default for Bodies {
         Self {
             table: BTreeMap::new(),
             vertices: 0,
+            shape_work: 0,
         }
     }
 }
@@ -232,6 +253,14 @@ impl RecordTable for Bodies {
                 .is_some_and(|(&last, _)| last >= record.id)
         {
             return Err(Error::custom("unordered or invalid freshwater body ID"));
+        }
+        if let BodyShape::River { stroke, .. } = &record.shape {
+            self.shape_work += stroke.validation_work();
+            if self.shape_work > MAX_WATER_RIVER_VALIDATION_WORK {
+                return Err(Error::custom(
+                    "total river shape validation work limit exceeded",
+                ));
+            }
         }
         let body = FreshBody::new(record.level_dm, record.shape);
         self.vertices += body.vertex_count();
@@ -282,6 +311,7 @@ impl RecordTable for DecodedChunks {
 }
 
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct WaterRecord<B, C> {
     strict: bool,
     revision: u64,
@@ -323,9 +353,29 @@ impl<'de> Deserialize<'de> for WaterState {
 #[cfg(test)]
 mod water_w1_tests {
     use super::*;
-    use crate::map::{Environment, Heightmap, WaterEdit};
-    use common::saveload::{Bincode, Encoder, JSON};
+    use crate::map::{Environment, Heightmap};
+    use common::saveload::{Bincode, JSON};
     use geom::{vec2, Polygon};
+
+    #[test]
+    fn w1_water_readable_edit_rejects_oversized_unknown_field() {
+        let input = format!(
+            r#"{{"SetSeaLevel":{{"level_dm":0,"extra":"{}"}}}}"#,
+            "x".repeat(9 * 1024)
+        );
+        let mut reader = input.as_bytes();
+        let result = JSON::decode_reader::<WaterEdit>(&mut reader);
+        assert!(result.is_err(), "{result:?}");
+        assert!(reader.len() > 8 * 1024, "read the oversized field");
+
+        let edit = WaterEdit::SetSeaLevel { level_dm: Some(0) };
+        let mut framed = JSON::encode(&edit).unwrap();
+        assert_eq!(WaterEdit::decode_bounded::<JSON>(&framed).unwrap(), edit);
+        framed.resize(MAX_WATER_EDIT_BYTES, b' ');
+        assert_eq!(WaterEdit::decode_bounded::<JSON>(&framed).unwrap(), edit);
+        framed.push(b' ');
+        assert!(WaterEdit::decode_bounded::<JSON>(&framed).is_err());
+    }
 
     #[test]
     fn w1_water_wire_rejects_advertised_lengths_and_invalid_vertices() {

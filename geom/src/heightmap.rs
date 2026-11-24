@@ -152,13 +152,21 @@ impl<const RESOLUTION: usize, const SIZE: u32> Heightmap<RESOLUTION, SIZE> {
             h: u16,
         }
         let Record { chunks, w, h } = Record::<RESOLUTION, SIZE, LIMIT>::deserialize(deserializer)?;
-        if w > LIMIT
-            || h > LIMIT
-            || chunks.0.len() != usize::from(w) * usize::from(h)
-            || chunks.0.iter().any(|chunk| !chunk.max_height.is_finite())
-        {
+        if w > LIMIT || h > LIMIT {
             return Err(serde::de::Error::custom(
-                "invalid heightmap dimensions or chunk count",
+                "heightmap dimensions exceed the supported limit",
+            ));
+        }
+        let expected = usize::from(w) * usize::from(h);
+        if chunks.0.len() != expected {
+            return Err(serde::de::Error::custom(format_args!(
+                "heightmap chunk count mismatch: expected {expected}, got {}",
+                chunks.0.len()
+            )));
+        }
+        if chunks.0.iter().any(|chunk| !chunk.max_height.is_finite()) {
+            return Err(serde::de::Error::custom(
+                "non-finite heightmap chunk maximum",
             ));
         }
         Ok(Self {

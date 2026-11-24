@@ -20,6 +20,7 @@ pub const MAX_FRESHWATER_CANDIDATES: usize = 65_536;
 pub const MAX_WATER_TILE_TESTS: usize = 2_097_152;
 pub const MAX_WATER_BASE_WRITES: usize = 131_072;
 pub const MAX_WATER_BATCH_WORK: usize = 4_194_304;
+pub(super) const MAX_WATER_RIVER_VALIDATION_WORK: usize = MAX_WATER_BATCH_WORK;
 pub const MAX_WATER_RIVER_VERTICES: usize = 262_144;
 pub(super) const MAX_FRESHWATER_BODIES: usize = u16::MAX as usize;
 pub(super) const MAX_WATER_CHUNKS: usize = (MAX_WATER_CHUNKS_PER_AXIS as usize).pow(2);
@@ -29,6 +30,8 @@ const TERMINAL_BODY_ID: u32 = u16::MAX as u32 + 1;
 pub(super) const MIN_DEPTH: f64 = 0.25;
 const PITCH: f64 = CELL_SIZE as f64;
 const RES: i16 = TERRAIN_CHUNK_RESOLUTION as i16;
+const FIRST_COLUMN: u64 = 0x0000_0001_0000_0001;
+const LAST_COLUMN: u64 = 0x8000_0000_8000_0000;
 const DIRECTIONS: [(i16, i16); 4] = [(-1, 0), (0, -1), (0, 1), (1, 0)];
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -145,6 +148,11 @@ impl WaterStroke {
     pub fn points(&self) -> &[Vec2] {
         &self.0
     }
+
+    pub(super) fn validation_work(&self) -> usize {
+        let vertices = self.0.len();
+        vertices * (vertices - 1) / 2
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -163,6 +171,7 @@ impl WaterBasin {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum WaterEdit {
     SetSeaLevel {
         #[serde(deserialize_with = "super::water_serde::optional_level")]
@@ -414,6 +423,37 @@ impl TileMask {
         }))
     }
 
+    const WORDS: usize = TILES_PER_CHUNK / 64;
+
+    fn intersection(self, other: Self) -> Self {
+        Self(std::array::from_fn(|i| self.0[i] & other.0[i]))
+    }
+
+    /// Marks this chunk's tiles whose neighbor in `direction` is marked.
+    /// Each word stores two 32-tile rows.
+    fn shift_from(self, across: Self, direction: usize) -> Self {
+        Self(std::array::from_fn(|i| {
+            let word = self.0[i];
+            match direction {
+                0 => ((word << 1) & !FIRST_COLUMN) | ((across.0[i] & LAST_COLUMN) >> 31),
+                1 => {
+                    let previous = if i == 0 {
+                        across.0[Self::WORDS - 1]
+                    } else {
+                        self.0[i - 1]
+                    };
+                    (word << 32) | (previous >> 32)
+                }
+                2 => {
+                    let next = self.0.get(i + 1).copied().unwrap_or(across.0[0]);
+                    (word >> 32) | (next << 32)
+                }
+                3 => ((word >> 1) & !LAST_COLUMN) | ((across.0[i] & FIRST_COLUMN) << 31),
+                _ => unreachable!(),
+            }
+        }))
+    }
+
     fn indices(self) -> impl Iterator<Item = usize> {
         self.0.into_iter().enumerate().flat_map(|(word, mut bits)| {
             std::iter::from_fn(move || {
@@ -428,7 +468,7 @@ impl TileMask {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct TileSet(BTreeMap<TerrainChunkID, TileMask>);
 
 impl TileSet {
@@ -443,6 +483,12 @@ impl TileSet {
         if !mask.is_empty() {
             self.0.entry(chunk).or_default().union(&mask);
         }
+    }
+
+    fn contains(&self, tile: WaterTileCoord) -> bool {
+        self.0
+            .get(&tile.chunk())
+            .is_some_and(|mask| mask.contains(tile.local_index()))
     }
 
     fn tiles(&self) -> impl Iterator<Item = WaterTileCoord> + '_ {
@@ -462,6 +508,7 @@ pub(super) struct FreshCell {
 type FreshChunk = [FreshCell; TILES_PER_CHUNK];
 
 #[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(super) enum BodyShape {
     Lake,
     River {
@@ -477,6 +524,7 @@ pub(super) struct FreshBody {
     pub(super) shape: BodyShape,
     pub(super) chunks: BTreeSet<TerrainChunkID>,
     pub(super) cells: usize,
+    validation_work: usize,
     river: Option<RiverGeometry>,
 }
 
@@ -491,6 +539,7 @@ impl FreshBody {
             shape,
             chunks: BTreeSet::new(),
             cells: 0,
+            validation_work: 0,
             river,
         }
     }
@@ -521,8 +570,10 @@ pub(super) struct WaterState {
     pub(super) fresh: BTreeMap<TerrainChunkID, Box<FreshChunk>>,
     pub(super) cell_count: usize,
     pub(super) river_vertex_count: usize,
+    river_validation_work: usize,
     sea: Vec<TileMask>,
-    banks: BTreeMap<WaterBodyId, [Vec<BankEdge>; 2]>,
+    fresh_masks: TileSet,
+    banks: BTreeMap<WaterBodyId, [BTreeSet<BankEdge>; 2]>,
 }
 
 impl Default for WaterState {
@@ -536,7 +587,9 @@ impl Default for WaterState {
             fresh: BTreeMap::new(),
             cell_count: 0,
             river_vertex_count: 0,
+            river_validation_work: 0,
             sea: Vec::new(),
+            fresh_masks: TileSet::default(),
             banks: BTreeMap::new(),
         }
     }
@@ -611,6 +664,98 @@ impl WaterState {
             return self.sea_level_dm.map(Occupant::sea);
         }
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::saveload::{Bincode, Encoder};
+
+    #[test]
+    fn w1_water_collinear_raster_reuses_candidate_work() {
+        let dense: Vec<_> = (0..256)
+            .map(|i| vec2(240.0 + i as f32 / 64.0, 248.0))
+            .collect();
+        let sparse = [dense[0], *dense.last().unwrap()];
+        let bounds = TileBounds::new(&Heightmap::new(1, 1));
+        let mut dense_work = Work(0);
+        let mut sparse_work = Work(0);
+        let dense_raster = RiverGeometry::new(&dense)
+            .rasterize(bounds, 512.0, &mut dense_work)
+            .unwrap();
+        let sparse_raster = RiverGeometry::new(&sparse)
+            .rasterize(bounds, 512.0, &mut sparse_work)
+            .unwrap();
+        assert_eq!(dense_raster, sparse_raster);
+        assert_eq!(dense_work.0, sparse_work.0);
+    }
+
+    #[test]
+    fn w1_water_river_validation_budget_round_trips_near_limit() {
+        use crate::map::Map;
+        use std::time::Instant;
+
+        let mut map = Map::empty();
+        map.environment = Environment::new(13, 13);
+        let stroke = |i: usize| {
+            let x = 288.0 + (i % 11) as f32 * 576.0;
+            let y = 288.0 + (i / 11) as f32 * 576.0;
+            (0..256)
+                .map(|j| vec2(x + j as f32 / 64.0, y))
+                .collect::<Vec<_>>()
+        };
+        let mut accepted = 0;
+        for i in 0..121 {
+            let revision = map.environment.water_revision();
+            match map
+                .environment
+                .carve_river_at_level(&stroke(i), 512.0, 2.0, Some(0))
+            {
+                Ok(_) => accepted += 1,
+                Err(WaterEditError::Limit) => {
+                    assert_eq!(map.environment.water_revision(), revision);
+                    assert_eq!(
+                        map.environment.water.next_freshwater_id,
+                        accepted as u32 + 1
+                    );
+                    break;
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert!(accepted < 121, "accepted the over-budget map");
+        let work = map.environment.water.river_validation_work;
+        assert!(work > MAX_WATER_RIVER_VALIDATION_WORK * 99 / 100, "{work}");
+        let bytes = Bincode::encode(&map).unwrap();
+        let start = Instant::now();
+        let loaded: Map = Bincode::decode(&bytes).unwrap();
+        eprintln!(
+            "Decoded {} rivers, {} work units, {} Map bytes in {:?}",
+            accepted,
+            work,
+            bytes.len(),
+            start.elapsed()
+        );
+        assert_eq!(loaded.environment.water.river_validation_work, work);
+        assert_eq!(Bincode::encode(&loaded).unwrap(), bytes);
+
+        // Forge an otherwise valid Map resource with one more river by
+        // bypassing the derived authoring counter. Decoding must reconstruct
+        // the budget from the records and refuse it.
+        map.environment.water.river_validation_work = 0;
+        map.environment
+            .carve_river_at_level(&stroke(accepted), 512.0, 2.0, Some(0))
+            .unwrap();
+        let error = Bincode::decode::<Map>(&Bincode::encode(&map).unwrap())
+            .err()
+            .unwrap();
+        assert!(
+            error
+                .to_string()
+                .contains("water work or storage limit exceeded"),
+            "{error}"
+        );
     }
 }
 
@@ -857,7 +1002,20 @@ struct RiverGeometry {
 
 impl RiverGeometry {
     fn new(points: &[Vec2]) -> Self {
-        let segments: Vec<_> = segments(points, false).collect();
+        let mut merged: Vec<Segment> = Vec::new();
+        for segment in segments(points, false) {
+            // Forward collinear runs share one corridor and one continuous
+            // distance axis. Keep the supplied vertices in the save record.
+            if let Some(previous) = merged.last_mut().filter(|previous| {
+                previous.side(segment.b) == 0.0
+                    && previous.direction().dot(segment.direction()) > 0.0
+            }) {
+                previous.b = segment.b;
+            } else {
+                merged.push(segment);
+            }
+        }
+        let segments = merged;
         let mut starts = Vec::with_capacity(segments.len() + 1);
         starts.push(0.0);
         for s in &segments {
@@ -871,14 +1029,37 @@ impl RiverGeometry {
         (start + fraction * (self.starts[segment + 1] - start) + 0.5).floor() as u16
     }
 
-    fn bank(&self, tile: WaterTileCoord, direction: usize, reach: u16) -> Option<RiverBank> {
-        let center = point(tile.center());
+    fn bank_segments(&self, reach: u16) -> std::ops::Range<usize> {
         let reach_m = f64::from(reach);
         let first = self.starts[1..].partition_point(|&end| end < reach_m - 0.5);
         let end =
             self.starts[..self.segments.len()].partition_point(|&start| start < reach_m + 0.5);
+        first..end
+    }
+
+    fn reserve_raster_validation(
+        &self,
+        raster: &Raster,
+        work: &mut Work,
+    ) -> Result<(), WaterEditError> {
+        work.charge(raster.len() * 8)?;
+        for &reach in raster.values() {
+            // A river can have a dry neighbor on any side after a later sea edit.
+            work.charge(4 * self.bank_segments(reach).len())?;
+        }
+        Ok(())
+    }
+
+    fn bank(
+        &self,
+        tile: WaterTileCoord,
+        direction: usize,
+        reach: u16,
+        segments: std::ops::Range<usize>,
+    ) -> Option<RiverBank> {
+        let center = point(tile.center());
         let mut best = None;
-        for index in first..end {
+        for index in segments {
             let (dist, t) = self.segments[index].projection(center);
             if self.reach(index, t) == reach && best.is_none_or(|(prev, _)| dist < prev) {
                 best = Some((dist, index));
@@ -1260,15 +1441,13 @@ impl FreshDelta {
 
     fn insert(
         state: &WaterState,
-        level_dm: i16,
-        shape: BodyShape,
+        mut body: FreshBody,
         raster: Raster,
         coverage: &mut TileSet,
     ) -> Result<Self, WaterEditError> {
         let id = WaterBodyId(
             u16::try_from(state.next_freshwater_id).map_err(|_| WaterEditError::BodyIdExhausted)?,
         );
-        let mut body = FreshBody::new(level_dm, shape);
         body.cells = raster.len();
         if state.river_vertex_count + body.vertex_count() > MAX_WATER_RIVER_VERTICES
             || state.cell_count + body.cells > MAX_FRESHWATER_CELLS
@@ -1329,11 +1508,12 @@ impl FreshDelta {
         })
     }
 
-    fn apply(self, state: &mut WaterState) {
+    fn apply(self, state: &mut WaterState, coverage: TileSet) {
         match self.body {
             Some(BodyDelta::Insert(id, body)) => {
                 state.cell_count += body.cells;
                 state.river_vertex_count += body.vertex_count();
+                state.river_validation_work += body.validation_work;
                 state.bodies.insert(id, body);
                 state.next_freshwater_id = u32::from(id.0) + 1;
             }
@@ -1341,6 +1521,7 @@ impl FreshDelta {
                 let body = state.bodies.remove(&id).unwrap();
                 state.cell_count -= body.cells;
                 state.river_vertex_count -= body.vertex_count();
+                state.river_validation_work -= body.validation_work;
                 state.banks.remove(&id);
             }
             None => {}
@@ -1348,8 +1529,11 @@ impl FreshDelta {
         for (chunk, replacement) in self.chunks {
             if let Some(cells) = replacement {
                 state.fresh.insert(chunk, cells);
+                let mask = state.fresh_masks.0.entry(chunk).or_default();
+                *mask = mask.diff(coverage.0[&chunk], true);
             } else {
                 state.fresh.remove(&chunk);
+                state.fresh_masks.0.remove(&chunk);
             }
         }
     }
@@ -1362,8 +1546,6 @@ pub(super) fn empty_fresh_chunk() -> Box<FreshChunk> {
 impl TileSet {
     fn dependency_chunks(&self, bounds: TileBounds) -> BTreeSet<TerrainChunkID> {
         let mut chunks = BTreeSet::new();
-        const FIRST_COLUMN: u64 = 0x0000_0001_0000_0001;
-        const LAST_COLUMN: u64 = 0x8000_0000_8000_0000;
         for (&chunk, mask) in &self.0 {
             chunks.insert(chunk);
             let left = mask.0.iter().any(|word| (word & FIRST_COLUMN) != 0);
@@ -1417,7 +1599,7 @@ impl BankEdge {
     }
 }
 
-type BankChanges = BTreeMap<WaterBodyId, [Vec<(BankEdge, bool)>; 2]>;
+type BankChanges = Vec<(WaterBodyId, RiverBank, BankEdge, bool)>;
 
 /// An immutable candidate until the owning map has checked its structures and occupancy.
 pub struct PreparedWaterEdit {
@@ -1429,7 +1611,9 @@ pub struct PreparedWaterEdit {
     sea: Option<Vec<TileMask>>,
     patch: BaseNodePatch,
     affected: TileSet,
+    fresh_changes: TileSet,
     surface_changes: TileSet,
+    bank_changes: BankChanges,
     strict: bool,
     next_revision: u64,
     body: Option<WaterBodyId>,
@@ -1517,107 +1701,109 @@ impl PreparedWaterEdit {
         self.work
     }
 
-    fn changed_near_freshwater<'a>(
-        &'a self,
-        env: &'a Environment,
-    ) -> impl Iterator<Item = WaterTileCoord> + 'a {
-        self.surface_changes
-            .0
-            .iter()
-            .filter(move |&(chunk, _)| {
-                let has_fresh =
-                    |id| env.water.fresh.contains_key(&id) || self.fresh.chunks.contains_key(&id);
-                has_fresh(*chunk)
-                    || DIRECTIONS.iter().any(|&(dx, dy)| {
-                        has_fresh(TerrainChunkID::new_i16(chunk.0 + dx, chunk.1 + dy))
-                    })
-            })
-            .flat_map(|(&chunk, &mask)| {
-                mask.indices()
-                    .map(move |index| WaterTileCoord::from_local(chunk, index))
-            })
-    }
-
-    fn bank_changes(&self, env: &Environment) -> BankChanges {
-        let mut changes: BankChanges = BTreeMap::new();
-        let old = |tile| env.water.occupant(self.bounds, tile);
-        let new = |tile| self.occupant(env, tile);
-        for tile in self.changed_near_freshwater(env) {
-            let old_tile = old(tile);
-            let new_tile = new(tile);
-            for direction in 0..DIRECTIONS.len() {
-                let neighbor = tile.neighbor(direction);
-                if !self.bounds.contains(neighbor) {
+    fn prepare_contacts(
+        &self,
+        env: &Environment,
+        work: &mut Work,
+    ) -> Result<BankChanges, WaterEditError> {
+        let mut changes = Vec::new();
+        let mut visit = |tile: WaterTileCoord, direction: usize, work: &mut Work| {
+            let neighbor = tile.neighbor(direction);
+            if !self.bounds.contains(neighbor) {
+                return Ok(());
+            }
+            work.charge(1)?;
+            let before = [tile, neighbor].map(|t| env.water.occupant(self.bounds, t));
+            let after = [tile, neighbor].map(|t| self.occupant(env, t));
+            if let [Some(a), Some(b)] = after {
+                if a.level_dm != b.level_dm {
+                    return Err(WaterEditError::IncompatibleMouth(tile, neighbor));
+                }
+            }
+            for (i, wet_tile, edge) in [(0, tile, direction), (1, neighbor, 3 - direction)] {
+                let bank_water = |sides: [Option<Occupant>; 2]| {
+                    sides[i]
+                        .filter(|water| sides[1 - i].is_none() && water.kind == WaterKind::River)
+                };
+                let before = bank_water(before);
+                let after = bank_water(after);
+                if before == after {
                     continue;
                 }
-                let old_neighbor = old(neighbor);
-                let new_neighbor = new(neighbor);
-                for (wet_tile, edge, before, after, dry_before, dry_after) in [
-                    (
-                        tile,
-                        direction,
-                        old_tile,
-                        new_tile,
-                        old_neighbor.is_none(),
-                        new_neighbor.is_none(),
-                    ),
-                    (
-                        neighbor,
-                        3 - direction,
-                        old_neighbor,
-                        new_neighbor,
-                        old_tile.is_none(),
-                        new_tile.is_none(),
-                    ),
-                ] {
-                    let before =
-                        before.filter(|water| dry_before && water.kind == WaterKind::River);
-                    let after = after.filter(|water| dry_after && water.kind == WaterKind::River);
-                    if before == after {
-                        continue;
+                for (water, insert) in [(before, false), (after, true)] {
+                    let Some(water) = water else { continue };
+                    let Some(river) = self
+                        .fresh
+                        .body(&env.water, water.body)
+                        .and_then(|record| record.river.as_ref())
+                    else {
+                        continue; // Removing the body drops its whole bank index.
+                    };
+                    let reach = water.reach.unwrap();
+                    let segments = river.bank_segments(reach);
+                    work.charge(1 + segments.len())?;
+                    if let Some(bank) = river.bank(wet_tile, edge, reach, segments) {
+                        changes.push((
+                            water.body,
+                            bank,
+                            BankEdge::new(wet_tile, edge, reach),
+                            insert,
+                        ));
                     }
-                    for (water, insert) in [(before, false), (after, true)] {
-                        let Some(water) = water else { continue };
-                        let Some(river) = self
-                            .fresh
-                            .body(&env.water, water.body)
-                            .and_then(|record| record.river.as_ref())
-                        else {
-                            continue;
-                        };
-                        let reach = water.reach.unwrap();
-                        if let Some(bank) = river.bank(wet_tile, edge, reach) {
-                            changes.entry(water.body).or_default()[bank.index()]
-                                .push((BankEdge::new(wet_tile, edge, reach), insert));
+                }
+            }
+            Ok(())
+        };
+
+        for tile in self.fresh_changes.tiles() {
+            for direction in 0..DIRECTIONS.len() {
+                let neighbor = tile.neighbor(direction);
+                if tile < neighbor || !self.fresh_changes.contains(neighbor) {
+                    visit(tile, direction, work)?;
+                }
+            }
+        }
+
+        if let Some(sea) = &self.sea {
+            let sea_diff = |chunk| {
+                if !self.bounds.contains_chunk(chunk) {
+                    return TileMask::default();
+                }
+                let i = self.bounds.index(chunk);
+                let old = env.water.sea.get(i).copied().unwrap_or_default();
+                let new = sea.get(i).copied().unwrap_or_default();
+                old.diff(new, self.sea_level_dm == env.water.sea_level_dm)
+            };
+            // Intersect each freshwater mask with the shifted sea diff. Only
+            // actual freshwater edges touching a changed sea tile reach visit.
+            for (&chunk, &fresh) in &env.water.fresh_masks.0 {
+                let local = sea_diff(chunk);
+                for (direction, (dx, dy)) in DIRECTIONS.into_iter().enumerate() {
+                    let across = sea_diff(TerrainChunkID::new_i16(chunk.0 + dx, chunk.1 + dy));
+                    work.charge(3 * TileMask::WORDS)?;
+                    let contacts = fresh.intersection(local.shift_from(across, direction));
+                    for index in contacts.indices() {
+                        let tile = WaterTileCoord::from_local(chunk, index);
+                        if !self.fresh_changes.contains(tile)
+                            && !self.fresh_changes.contains(tile.neighbor(direction))
+                        {
+                            visit(tile, direction, work)?;
                         }
                     }
                 }
             }
         }
-        changes
+        Ok(changes)
     }
 }
 
-fn merge_banks(state: &mut WaterState, changes: BankChanges) {
-    for (body, banks) in changes {
-        let retained = state.banks.entry(body).or_default();
-        for (edges, mut changes) in retained.iter_mut().zip(banks) {
-            if changes.is_empty() {
-                continue;
-            }
-            changes.sort_unstable();
-            changes.dedup();
-            let mut old = std::mem::take(edges).into_iter().peekable();
-            for (edge, insert) in changes {
-                while old.peek().is_some_and(|&candidate| candidate < edge) {
-                    edges.push(old.next().unwrap());
-                }
-                old.next_if_eq(&edge);
-                if insert {
-                    edges.push(edge);
-                }
-            }
-            edges.extend(old);
+fn apply_bank_changes(state: &mut WaterState, changes: BankChanges) {
+    for (body, bank, edge, insert) in changes {
+        let edges = &mut state.banks.entry(body).or_default()[bank.index()];
+        if insert {
+            edges.insert(edge);
+        } else {
+            edges.remove(&edge);
         }
     }
 }
@@ -1764,8 +1950,7 @@ impl Environment {
                 level_dm,
             } => {
                 bounds.validate_vertices(polyline.points())?;
-                let n = polyline.points().len();
-                work.charge(n * (n - 1) / 2)?;
+                work.charge(polyline.validation_work())?;
                 let level = match level_dm {
                     Some(level) => *level,
                     None => {
@@ -1777,14 +1962,23 @@ impl Environment {
                     }
                 };
                 packed_bed_limit(level, f64::from(*depth_m))?;
-                let river = RiverGeometry::new(polyline.points());
-                let raster = river.rasterize(bounds, *width_m, &mut work)?;
-                work.charge(raster.len() * 12)?;
-                let shape = BodyShape::River {
-                    stroke: polyline.clone(),
-                    width_m: *width_m,
-                };
-                fresh = FreshDelta::insert(&self.water, level, shape, raster, &mut coverage)?;
+                let mut record = FreshBody::new(
+                    level,
+                    BodyShape::River {
+                        stroke: polyline.clone(),
+                        width_m: *width_m,
+                    },
+                );
+                let river = record.river.as_ref().unwrap();
+                let old_validation_work = self.water.river_validation_work;
+                let mut validation = Work(old_validation_work);
+                validation.charge(work.0)?;
+                let before_raster = validation.0;
+                let raster = river.rasterize(bounds, *width_m, &mut validation)?;
+                work.charge(validation.0 - before_raster + raster.len() * 12)?;
+                river.reserve_raster_validation(&raster, &mut validation)?;
+                record.validation_work = validation.0 - old_validation_work;
+                fresh = FreshDelta::insert(&self.water, record, raster, &mut coverage)?;
                 packed_carve(&self.heightmap, &mut patch, &coverage, level, *depth_m)?;
                 (
                     Some(WaterBodyId(self.water.next_freshwater_id as u16)),
@@ -1804,8 +1998,7 @@ impl Environment {
                 work.charge(raster.len() * 12)?;
                 fresh = FreshDelta::insert(
                     &self.water,
-                    *level_dm,
-                    BodyShape::Lake,
+                    FreshBody::new(*level_dm, BodyShape::Lake),
                     raster,
                     &mut coverage,
                 )?;
@@ -1859,7 +2052,7 @@ impl Environment {
         &self,
         patch: BaseNodePatch,
         fresh: FreshDelta,
-        mut surface_changes: TileSet,
+        fresh_changes: TileSet,
         sea_level_dm: Option<i16>,
         body: Option<WaterBodyId>,
         level_dm: Option<i16>,
@@ -1890,7 +2083,7 @@ impl Environment {
             patch: (writes != 0).then_some(&patch),
         };
         let mut local = TileSet(beds.0.clone());
-        for (&chunk, &mask) in &surface_changes.0 {
+        for (&chunk, &mask) in &fresh_changes.0 {
             local.union_mask(chunk, mask);
         }
         for tile in local.tiles() {
@@ -1937,6 +2130,7 @@ impl Environment {
         } else {
             None
         };
+        let mut surface_changes = fresh_changes.clone();
         if let Some(sea) = &sea {
             for index in 0..sea.len().max(self.water.sea.len()) {
                 let old = self.water.sea.get(index).copied().unwrap_or_default();
@@ -1963,7 +2157,7 @@ impl Environment {
             terrain: beds.dependency_chunks(bounds),
             road_support: affected.dependency_chunks(bounds),
         };
-        let candidate = PreparedWaterEdit {
+        let mut candidate = PreparedWaterEdit {
             revision: self.water.revision,
             base_revision: self.base_revision,
             bounds,
@@ -1972,17 +2166,18 @@ impl Environment {
             sea,
             patch,
             affected,
+            fresh_changes,
             surface_changes,
+            bank_changes: Vec::new(),
             strict,
             next_revision,
             body,
             level_dm,
             dirty,
-            work: work.0,
+            work: 0,
         };
-        for tile in candidate.changed_near_freshwater(self) {
-            validate_mouth(tile, |tile| candidate.occupant(self, tile))?;
-        }
+        candidate.bank_changes = candidate.prepare_contacts(self, &mut work)?;
+        candidate.work = work.0;
         Ok(candidate)
     }
 
@@ -1998,7 +2193,6 @@ impl Environment {
         }
         let changed = prepared.next_revision != prepared.revision;
         if changed {
-            let changes = prepared.bank_changes(self);
             self.heightmap.apply_base_patch(prepared.patch)?;
             if let Some(sea) = prepared.sea {
                 self.water.sea = sea;
@@ -2006,8 +2200,10 @@ impl Environment {
             self.water.sea_level_dm = prepared.sea_level_dm;
             self.water.strict = prepared.strict;
             self.water.revision = prepared.next_revision;
-            prepared.fresh.apply(&mut self.water);
-            merge_banks(&mut self.water, changes);
+            prepared
+                .fresh
+                .apply(&mut self.water, prepared.fresh_changes);
+            apply_bank_changes(&mut self.water, prepared.bank_changes);
         }
         Ok(WaterEditOutcome {
             changed,
@@ -2157,12 +2353,13 @@ impl Environment {
         max_reach_delta_m: u16,
     ) -> Option<ShoreContact> {
         let edges = &self.water.banks.get(&body)?[bank.index()];
-        let after = edges.partition_point(|edge| edge.reach < reach_m);
-        let below = after.checked_sub(1).map(|i| {
-            let reach = edges[i].reach;
-            edges[edges.partition_point(|e| e.reach < reach)]
-        });
-        let edge = [below, edges.get(after).copied()]
+        let first_at = |reach| BankEdge { reach, edge: 0 };
+        let after = edges.range(first_at(reach_m)..).next().copied();
+        let below = edges
+            .range(..first_at(reach_m))
+            .next_back()
+            .and_then(|edge| edges.range(first_at(edge.reach)..).next().copied());
+        let edge = [below, after]
             .into_iter()
             .flatten()
             .min_by_key(|edge| (edge.reach.abs_diff(reach_m), edge.edge))?;
@@ -2229,8 +2426,13 @@ impl Environment {
             (f64::from(f32::from(water.level_dm) / 10.0) - f64::from(ray.from.z))
                 / f64::from(ray.dir.z)
         };
-        let hit = |water: Occupant, t: f64, [x, y]: [f64; 2]| {
-            let xy = vec2(x as f32, y as f32);
+        let hit = |owner: WaterTileCoord, water: Occupant, t: f64, [x, y]: [f64; 2]| {
+            let min = owner.corner();
+            let max = min + Vec2::splat(CELL_SIZE);
+            let xy = vec2(
+                (x as f32).clamp(min.x, max.x.next_down()),
+                (y as f32).clamp(min.y, max.y.next_down()),
+            );
             let sample = water.sample(self.base_height(xy)?);
             Some(WaterHit {
                 point: xy.z(sample.surface_z),
@@ -2256,7 +2458,7 @@ impl Environment {
             if let Some(owner) = bounds.position(point[0], point[1]) {
                 if let Some(water) = self.water.occupant(bounds, owner) {
                     if plane_t(water) == start {
-                        return hit(water, start, point);
+                        return hit(owner, water, start, point);
                     }
                 }
             }
@@ -2274,13 +2476,11 @@ impl Environment {
                 }
             }
             let next = crossing[0].min(crossing[1]).min(end);
-            if let Some(water) = self
-                .water
-                .occupant(bounds, WaterTileCoord(tile[0], tile[1]))
-            {
+            let owner = WaterTileCoord(tile[0], tile[1]);
+            if let Some(water) = self.water.occupant(bounds, owner) {
                 let t = plane_t(water);
                 if t > start && t < next {
-                    return hit(water, t, point_at(t));
+                    return hit(owner, water, t, point_at(t));
                 }
             }
             point = point_at(next);
@@ -2350,25 +2550,32 @@ impl WaterState {
             }
         }
 
-        // Validate and index one body at a time. The scratch bound is per
-        // authored body even for a full map or malicious disconnected input.
-        for (&id, body) in &self.bodies {
+        // Scratch is per body. The river work budget is shared across the map.
+        let mut validation = Work(0);
+        let fresh = &self.fresh;
+        let fresh_cell = |tile: WaterTileCoord| {
+            fresh
+                .get(&tile.chunk())
+                .map_or(FreshCell::default(), |c| c[tile.local_index()])
+        };
+        for (&id, body) in &mut self.bodies {
             let first_tile = *first.get(&id).ok_or(WaterEditError::BodyUnavailable(id))?;
             let cells = body.cells;
             match &body.shape {
-                BodyShape::River { width_m, .. } => {
-                    let raster =
-                        body.river
-                            .as_ref()
-                            .unwrap()
-                            .rasterize(bounds, *width_m, &mut Work(0))?;
+                BodyShape::River { stroke, width_m } => {
+                    let previous = validation.0;
+                    validation.charge(stroke.validation_work())?;
+                    let river = body.river.as_ref().unwrap();
+                    let raster = river.rasterize(bounds, *width_m, &mut validation)?;
+                    river.reserve_raster_validation(&raster, &mut validation)?;
+                    body.validation_work = validation.0 - previous;
                     if raster.len() != cells {
                         return Err(WaterEditError::Disconnected(first_tile));
                     }
                     let mut connected = TileSet::default();
                     for ((chunk, index), reach) in raster {
                         let tile = WaterTileCoord::from_local(chunk, index);
-                        let cell = self.fresh_cell(tile);
+                        let cell = fresh_cell(tile);
                         if cell != (FreshCell { body: id.0, reach }) {
                             return Err(WaterEditError::InvalidInput);
                         }
@@ -2395,7 +2602,7 @@ impl WaterState {
                         }
                         for direction in 0..DIRECTIONS.len() {
                             let neighbor = tile.neighbor(direction);
-                            if bounds.contains(neighbor) && self.fresh_cell(neighbor).body == id.0 {
+                            if bounds.contains(neighbor) && fresh_cell(neighbor).body == id.0 {
                                 let mask = coverage.0.entry(neighbor.chunk()).or_default();
                                 let local = neighbor.local_index();
                                 if !mask.contains(local) {
@@ -2411,6 +2618,7 @@ impl WaterState {
                 }
             }
         }
+        self.river_validation_work = validation.0;
         self.finish_loaded_bodies(bounds);
 
         let prospective =
@@ -2432,7 +2640,7 @@ impl WaterState {
             }
             None
         };
-        let mut banks: BTreeMap<WaterBodyId, [Vec<BankEdge>; 2]> = BTreeMap::new();
+        let mut banks: BTreeMap<WaterBodyId, [BTreeSet<BankEdge>; 2]> = BTreeMap::new();
         for (&chunk, cells) in &self.fresh {
             for (index, cell) in cells.iter().enumerate().filter(|(_, cell)| cell.body != 0) {
                 let tile = WaterTileCoord::from_local(chunk, index);
@@ -2442,17 +2650,15 @@ impl WaterState {
                     for direction in 0..DIRECTIONS.len() {
                         let dry = tile.neighbor(direction);
                         if bounds.contains(dry) && occupant(dry).is_none() {
-                            if let Some(bank) = river.bank(tile, direction, cell.reach) {
+                            let segments = river.bank_segments(cell.reach);
+                            if let Some(bank) = river.bank(tile, direction, cell.reach, segments) {
                                 banks.entry(id).or_default()[bank.index()]
-                                    .push(BankEdge::new(tile, direction, cell.reach));
+                                    .insert(BankEdge::new(tile, direction, cell.reach));
                             }
                         }
                     }
                 }
             }
-        }
-        for edges in banks.values_mut().flatten() {
-            edges.sort_unstable();
         }
         self.sea = prospective;
         self.banks = banks;
@@ -2462,13 +2668,16 @@ impl WaterState {
     fn finish_loaded_bodies(&mut self, bounds: TileBounds) {
         for (&chunk, cells) in &self.fresh {
             debug_assert!(bounds.contains_chunk(chunk));
-            for cell in cells.iter().filter(|cell| cell.body != 0) {
+            let mut mask = TileMask::default();
+            for (index, cell) in cells.iter().enumerate().filter(|(_, cell)| cell.body != 0) {
+                mask.insert(index);
                 self.bodies
                     .get_mut(&WaterBodyId(cell.body))
                     .unwrap()
                     .chunks
                     .insert(chunk);
             }
+            self.fresh_masks.0.insert(chunk, mask);
         }
     }
 }

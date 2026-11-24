@@ -621,6 +621,123 @@ mod water_w1_tests {
     }
 
     #[test]
+    fn w1_water_raycast_keeps_the_half_open_owner() {
+        let mut env = flat(2, 1);
+        for edge in [32.0, 512.0, 1024.0] {
+            env.fill_lake(
+                &Polygon::centered_rect(vec2(edge - 16.0, 16.0), 32.0, 32.0),
+                0,
+                2.0,
+            )
+            .unwrap();
+            for ray in [
+                Ray3::new(
+                    vec3(edge - 1.0, 8.0, 1.0),
+                    vec3(1.0f32.next_down(), 0.0, -1.0),
+                ),
+                Ray3::new(vec3(edge, 8.0, 1.0), vec3(-f32::EPSILON / 2.0, 0.0, -1.0)),
+            ] {
+                let hit = env.raycast_water(ray, 1.0).unwrap();
+                assert!(hit.point.x < edge, "{hit:?}");
+                assert_eq!(env.water_at(hit.point.xy()), Some(hit.sample));
+                assert_eq!(hit.t, 1.0);
+            }
+            let boundary = Ray3::new(vec3(edge, 8.0, 1.0), -Vec3::Z);
+            assert!(env.raycast_water(boundary, 1.0).is_none());
+        }
+    }
+
+    #[test]
+    fn w1_water_sea_preparation_charges_contacts_and_stages_banks() {
+        let mut env = flat(3, 2);
+        env.terrain_apply(env.bounds(), |_| -4.0);
+        let id = env
+            .carve_river_at_level(
+                &[vec2(464.0, 520.0), vec2(560.0, 520.0)],
+                32.0,
+                2.0,
+                Some(0),
+            )
+            .unwrap();
+        let bank = env.river_bank_near(id, 48, RiverBank::Left, 32).unwrap();
+        assert!(env
+            .prepare_water_edit(&WaterEdit::SetSeaLevel { level_dm: Some(1) })
+            .is_err());
+        let prepared = env
+            .prepare_water_edit(&WaterEdit::SetSeaLevel { level_dm: Some(0) })
+            .unwrap();
+        assert!(
+            prepared.work() > 0 && prepared.work() < 2048,
+            "{}",
+            prepared.work()
+        );
+        assert_eq!(env.river_bank_near(id, 48, RiverBank::Left, 32), Some(bank));
+        env.commit_prepared_water(prepared).unwrap();
+        assert!(env.river_bank_near(id, 48, RiverBank::Left, 32).is_none());
+        env.set_sea_level(None).unwrap();
+        assert_eq!(env.river_bank_near(id, 48, RiverBank::Left, 32), Some(bank));
+    }
+
+    #[test]
+    fn w1_water_slot_rejects_mismatched_heightmap_chunk_count() {
+        use crate::{
+            SaveHeader, SaveLoadError, Simulation, SimulationDeser, SimulationSer,
+            SlotSnapshotHeader,
+        };
+        use common::saveload::{slot_paths, SlotId, SnapshotRevision};
+
+        let ctx = crate::tests::TestCtx::new();
+        let mut data: SimulationDeser = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+        let map = data.res.get_mut("map").unwrap();
+        let heightmap = &ctx.g.map().environment.heightmap;
+        let original = Bincode::encode(heightmap).unwrap();
+        let chunks = heightmap
+            .chunks()
+            .map(|(_, chunk)| chunk)
+            .collect::<Vec<_>>();
+        assert_eq!(chunks.len(), 1);
+        let malformed = Bincode::encode(&(chunks, 2u16, 1u16)).unwrap();
+        let offset = map
+            .windows(original.len())
+            .position(|window| window == original)
+            .unwrap();
+        map.splice(offset..offset + original.len(), malformed);
+
+        let header = SlotSnapshotHeader {
+            magic: crate::SLOT_SNAPSHOT_MAGIC,
+            version: crate::VERSION.into(),
+            revision: SnapshotRevision::new(1),
+        };
+        let payload = SimulationSer {
+            header: SaveHeader {
+                version: crate::VERSION.into(),
+            },
+            world: &data.world,
+            res: data.res,
+        };
+        let root = std::env::temp_dir().join(format!("egregoria-w1-slot-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let id = SlotId::new("bad-heightmap").unwrap();
+        let path = slot_paths(&root, &id).unwrap().bc;
+        std::fs::write(path, Bincode::encode(&(header, payload)).unwrap()).unwrap();
+        let result = Simulation::load_from_slot(&root, &id);
+        std::fs::remove_dir_all(&root).unwrap();
+        let Err(SaveLoadError::Corrupt {
+            version: Some(version),
+            reason,
+        }) = result
+        else {
+            panic!("expected a corrupt current-version snapshot");
+        };
+        assert_eq!(version, crate::VERSION);
+        assert!(reason.contains("resource map"), "{reason}");
+        assert!(
+            reason.contains("heightmap chunk count mismatch: expected 2, got 1"),
+            "{reason}"
+        );
+    }
+
+    #[test]
     fn w1_water_coast_lake_river_and_roundtrip() {
         let mut env = flat(3, 2);
         env.terrain_apply(env.bounds(), |p| if p.x < 128.0 { -6.0 } else { p.z });
@@ -727,12 +844,17 @@ mod water_w1_tests {
         assert!(noop.affected_tiles().next().is_none());
         assert!(noop.work() > 0);
         assert!(!env.commit_prepared_water(noop).unwrap().changed);
-        assert!(!env.set_sea_level(Some(0)).unwrap().changed);
-        assert_eq!(env.water_revision(), revision);
         let change = env.set_sea_level(Some(5)).unwrap();
+        assert!(change.changed);
+        assert_eq!(env.sea_level_dm(), Some(5));
+        assert_eq!(env.water_revision(), revision + 1);
         assert!(!change.dirty.water().is_empty());
         assert!(change.dirty.terrain().is_empty());
         assert!(!change.dirty.road_support().is_empty());
+        let retry = env.set_sea_level(Some(5)).unwrap();
+        assert!(!retry.changed);
+        assert_eq!(retry.dirty, Default::default());
+        assert_eq!(env.water_revision(), revision + 1);
     }
 
     #[test]
