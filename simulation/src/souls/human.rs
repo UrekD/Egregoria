@@ -485,18 +485,21 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
         walk_distances: Default::default(),
     };
 
-    for (id, h) in world.humans.iter_mut() {
-        BuyGoods::update_pickup(h, time, map, vehicles, resources);
-        if h.decision.wait_one_tick() {
+    world.humans.edit_each_split(|id, mut h| {
+        if h.goods.has_pickup() {
+            BuyGoods::update_pickup(&mut h, time, map, vehicles, resources);
+        }
+        if h.decision_mut().wait_one_tick() {
             let pickup_interrupted = matches!(h.decision.kind, HumanDecisionKind::PickupBasket(_))
                 && h.household
                     .reservation
                     .as_ref()
                     .is_some_and(|basket| now >= basket.expires || h.router.last_error.is_some());
             if !pickup_interrupted {
-                continue;
+                return;
             }
         }
+        let h: &mut HumanEnt = &mut h;
         h.household.refresh_needs(
             now,
             h.location == Location::Building(h.home.house),
@@ -513,7 +516,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
                 | HumanDecisionKind::VisitLeisure(_)
         ) {
             if !h.update_household_action(id, now, &parks, vehicles, &mut walking, resources) {
-                continue;
+                return;
             }
             h.decision.kind = HumanDecisionKind::Yield;
         }
@@ -527,7 +530,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             h.home.house,
             h.work.as_mut(),
         ) {
-            continue;
+            return;
         }
         if !h.household.carried.is_empty() && h.location == Location::Building(h.home.house) {
             h.household.deposit(now, resources);
@@ -535,7 +538,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
         let carrying = !h.household.carried.is_empty();
         if carrying && now >= h.household.next_deposit {
             h.decision.kind = HumanDecisionKind::DepositAtHome;
-            continue;
+            return;
         }
 
         let home_score = h.home.score(h.household.needs.rest);
@@ -576,7 +579,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
                 resources,
             )
         {
-            continue;
+            return;
         }
 
         if let Some(work) = h.work.as_mut() {
@@ -601,7 +604,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
                 if let Location::Building(building) = h.location {
                     h.attend_work(time, building);
                 }
-                continue;
+                return;
             }
         }
 
@@ -621,7 +624,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
                 &mut h.router,
                 &mut h.bought,
             );
-            continue;
+            return;
         }
 
         let leisure = leisure_score(&h.household, time, now);
@@ -639,7 +642,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
                 resources,
             )
         {
-            continue;
+            return;
         }
         if can_walk && leisure > home_score {
             h.household.next_leisure =
@@ -659,7 +662,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
                     .add_park_claim(park, id, &h.household);
                 h.start_walk(park, TripPurpose::Leisure, resources);
                 h.decision.kind = HumanDecisionKind::VisitLeisure(park);
-                continue;
+                return;
             }
         }
         h.decision.kind = if carrying {
@@ -667,7 +670,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
         } else {
             h.go_home()
         };
-    }
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -784,12 +787,14 @@ pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
     let now = sim
         .read::<crate::economy::Budget>()
         .elapsed_ticks(sim.read::<GameTime>().tick);
-    sim.world.humans[id].household.initialize(id, now);
+    sim.world
+        .edit_human(id, |human| human.household.initialize(id, now));
 
     let key = id.data().as_ffi();
     if common::rand::randu(key as u32 ^ (key >> 32) as u32) < 0.7 {
         let car = spawn_parked_vehicle(sim, VehicleKind::Car, housepos);
-        sim.world.humans[id].router = Router::new(car);
+        sim.world
+            .edit_human(id, |human| human.router = Router::new(car));
     }
 
     let soul = SoulID::Human(id);

@@ -47,10 +47,10 @@ pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_exte
             let mut market = resources.write::<Market>();
             for &resident in &info.residents {
                 if let SoulID::Human(human) = resident {
-                    if let Some(human) = world.humans.get_mut(human) {
+                    world.edit_human(human, |human| {
                         market
                             .record_household_losses(std::mem::take(&mut human.household.on_hand));
-                    }
+                    });
                 }
             }
         }
@@ -104,7 +104,7 @@ pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_exte
 
 pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut HumanEnt) {
     cancel_removed(sim, CargoRemoval::Driver(id));
-    let (_, resources) = sim.world_res();
+    let resources = &sim.resources;
     human
         .household
         .cancel(resources, BasketFailure::ShopperRemoved);
@@ -200,19 +200,18 @@ pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: Comp
         let job = ItemID::new("job-opening");
         let seller = SoulID::GoodsCompany(id);
         for &worker in &company.workers.0 {
-            let Some(human) = world.humans.get_mut(worker) else {
-                continue;
-            };
-            let Some(orders) = human.bought.0.get_mut(&job) else {
-                continue;
-            };
-            orders.retain(|trade| trade.seller.0 != seller);
-            if orders.is_empty() {
-                human.bought.0.remove(&job);
-                if human.work.is_none() {
-                    market.buy(SoulID::Human(worker), human.trans.pos.xy(), job, 1);
+            world.edit_human(worker, |human| {
+                let Some(orders) = human.bought.0.get_mut(&job) else {
+                    return;
+                };
+                orders.retain(|trade| trade.seller.0 != seller);
+                if orders.is_empty() {
+                    human.bought.0.remove(&job);
+                    if human.work.is_none() {
+                        market.buy(SoulID::Human(worker), human.trans.pos.xy(), job, 1);
+                    }
                 }
-            }
+            });
         }
     }
     clear_soul_references(sim, SoulID::GoodsCompany(id));
@@ -316,14 +315,12 @@ pub(crate) fn vehicle_dropped(sim: &mut Simulation, id: VehicleID, position: Vec
             .iter()
             .merge_by(active_routes.iter(), |a, b| a.0 < b.0)
         {
-            if let Some(human) = world.humans.get_mut(human_id) {
-                clear_human(human_id, human);
-            }
+            world
+                .humans
+                .edit(human_id, |human| clear_human(human_id, human));
         }
     } else {
-        for (human_id, human) in world.humans.iter_mut() {
-            clear_human(human_id, human);
-        }
+        world.humans.edit_each(clear_human);
     }
 
     let clear_company = |company: &mut CompanyEnt| {
@@ -486,13 +483,13 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<Compa
         if let Some(shoppers) = shoppers {
             let mut parking = resources.write::<ParkingManagement>();
             for id in shoppers {
-                if let Some(human) = world.humans.get_mut(id) {
+                world.edit_human(id, |human| {
                     human
                         .household
                         .cancel(resources, BasketFailure::SellerRemoved);
                     human.router.walk_only_pickup = false;
                     cancel_trip(id, human, resources, &mut parking);
-                }
+                });
             }
         }
     }
@@ -548,9 +545,7 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<Compa
     };
     if let Some(entry) = departure {
         for buyer in entry.human_buyers {
-            if let Some(human) = world.humans.get_mut(buyer) {
-                remove_human_trades(human);
-            }
+            world.edit_human(buyer, &mut remove_human_trades);
         }
         for company in entry.company_traders {
             if let Some(company) = world.companies.get_mut(company) {
@@ -561,14 +556,12 @@ fn clear_soul_references(sim: &mut Simulation, soul: SoulID) -> Option<Vec<Compa
     }
     if seller {
         for buyer in legacy_buyers {
-            if let Some(human) = world.humans.get_mut(buyer) {
-                remove_human_trades(human);
-            }
+            world.edit_human(buyer, &mut remove_human_trades);
         }
     } else {
-        for human in world.humans.values_mut() {
-            remove_human_trades(human);
-        }
+        world
+            .humans
+            .edit_each(|_, human| remove_human_trades(human));
     }
     for company in world.companies.values_mut() {
         remove_company_trades(company);
@@ -687,7 +680,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
         .next()
         .copied()
         .filter(|_| buildings.len() == 1);
-    for (human_id, human) in world.humans.iter_mut() {
+    world.humans.edit_each(|human_id, human| {
         let door = match human.location {
             Location::Building(id) => buildings.get(&id).copied().flatten(),
             _ => None,
@@ -764,7 +757,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
             }
             cancel_trip(human_id, human, resources, &mut parking);
         }
-    }
+    });
     drop(parking);
     {
         let mut infos = resources.write::<BuildingInfos>();
@@ -842,28 +835,27 @@ fn stop_freight_driver(
     on_trip: impl Fn(&HumanEnt) -> bool,
 ) {
     let (world, resources) = sim.world_res();
-    let Some(human) = world.humans.get_mut(driver) else {
-        return;
-    };
-    let riding = human.location == Location::Vehicle(truck);
-    if riding {
-        let pos = world
-            .vehicles
-            .get(truck)
-            .map_or(human.trans.pos, |v| v.trans.pos);
-        move_outside(human, pos, resources);
-    }
-    if riding || on_trip(human) {
-        if human.router.selected_vehicle() == Some(truck) {
-            human.router.use_vehicle(human.router.personal_car);
+    world.humans.edit(driver, |human| {
+        let riding = human.location == Location::Vehicle(truck);
+        if riding {
+            let pos = world
+                .vehicles
+                .get(truck)
+                .map_or(human.trans.pos, |v| v.trans.pos);
+            move_outside(human, pos, resources);
         }
-        cancel_trip(
-            driver,
-            human,
-            resources,
-            &mut resources.write::<ParkingManagement>(),
-        );
-    }
+        if riding || on_trip(human) {
+            if human.router.selected_vehicle() == Some(truck) {
+                human.router.use_vehicle(human.router.personal_car);
+            }
+            cancel_trip(
+                driver,
+                human,
+                resources,
+                &mut resources.write::<ParkingManagement>(),
+            );
+        }
+    });
 }
 
 /// Returns a truck to its depot. A truck that is parked or parking away from
@@ -986,19 +978,15 @@ fn replace_truck(sim: &mut Simulation, company: CompanyID, old: VehicleID, new: 
     // Its driver keeps the job with the new truck, so removing the old one does not
     // cancel whatever trip they are on now.
     for &driver in company.workers.0.iter().chain(&company.comp.driver) {
-        let Some(work) = sim
-            .world
-            .humans
-            .get_mut(driver)
-            .and_then(|human| human.work.as_mut())
-        else {
-            continue;
-        };
-        if let WorkKind::Driver { truck, .. } = &mut work.kind {
-            if *truck == old {
-                *truck = new;
+        sim.world.humans.edit(driver, |human| {
+            if let Some(WorkKind::Driver { truck, .. }) =
+                human.work.as_mut().map(|work| &mut work.kind)
+            {
+                if *truck == old {
+                    *truck = new;
+                }
             }
-        }
+        });
     }
     sim.read::<ParCommandBuffer<VehicleEnt>>().kill(old);
 }

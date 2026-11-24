@@ -50,6 +50,10 @@ impl BuyGoods {
         }
     }
 
+    pub(crate) fn has_pickup(&self) -> bool {
+        self.pickup.is_some()
+    }
+
     #[inline]
     pub(crate) fn update_pickup(
         human: &mut HumanEnt,

@@ -16,7 +16,7 @@ use crate::map_dynamic::{BuildingInfos, ElectricityFlow};
 use crate::souls::desire::WorkKind;
 use crate::transportation::{spawn_parked_vehicle, spawn_truck_at_depot, VehicleKind};
 use crate::utils::resources::Resources;
-use crate::world::{CompanyEnt, HumanID, VehicleID};
+use crate::world::{CompanyEnt, HumanID, HumanStorage, VehicleID};
 use crate::{ParCommandBuffer, SoulID, VehicleEnt};
 use crate::{Simulation, World};
 
@@ -348,13 +348,16 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
         }
 
         for &worker in &c.workers.0 {
-            let Some(human) = world.humans.get_mut(worker) else {
-                continue;
-            };
-            if human.work.is_none() {
-                let offset = common::rand::randu(common::hash_u64(worker) as u32);
-                human.work = Some(Work::new(c.comp.building, WorkKind::Worker, offset));
-                human.bought.0.remove(&job_opening);
+            if world
+                .humans
+                .get(worker)
+                .is_some_and(|human| human.work.is_none())
+            {
+                world.humans.edit(worker, |human| {
+                    let offset = common::rand::randu(common::hash_u64(worker) as u32);
+                    human.work = Some(Work::new(c.comp.building, WorkKind::Worker, offset));
+                    human.bought.0.remove(&job_opening);
+                });
             }
         }
         if proto.storage.is_some() {
@@ -400,39 +403,38 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
                 })
                 .min();
             if let Some((truck, driver)) = truck.zip(driver) {
-                let work = world.humans.get_mut(driver).unwrap().work.as_mut().unwrap();
-                work.kind = WorkKind::Driver {
-                    truck,
-                    deliver_order: None,
-                    load: None,
-                };
+                world.humans.edit(driver, |human| {
+                    human.work.as_mut().unwrap().kind = WorkKind::Driver {
+                        truck,
+                        deliver_order: None,
+                        load: None,
+                    };
+                });
                 c.comp.driver = Some(driver);
             }
         }
 
         if let Some(driver) = c.comp.driver.filter(|_| !c.sold.0.is_empty()) {
-            let Some(WorkKind::Driver {
-                truck,
-                deliver_order,
-                load,
-            }) = world
-                .humans
-                .get_mut(driver)
-                .and_then(|human| human.work.as_mut())
-                .map(|work| &mut work.kind)
-            else {
-                return;
-            };
-            if deliver_order.is_none()
-                && load.is_none()
-                && world
-                    .vehicles
-                    .get(*truck)
-                    .is_some_and(|vehicle| vehicle.vehicle.state.is_parked())
-            {
-                let trade = c.sold.0.pop().unwrap();
-                *deliver_order = find_trade_place(trade.buyer, &res.read::<BuildingInfos>());
-            }
+            world.humans.edit(driver, |human| {
+                let Some(WorkKind::Driver {
+                    truck,
+                    deliver_order,
+                    load,
+                }) = human.work.as_mut().map(|work| &mut work.kind)
+                else {
+                    return;
+                };
+                if deliver_order.is_none()
+                    && load.is_none()
+                    && world
+                        .vehicles
+                        .get(*truck)
+                        .is_some_and(|vehicle| vehicle.vehicle.state.is_parked())
+                {
+                    let trade = c.sold.0.pop().unwrap();
+                    *deliver_order = find_trade_place(trade.buyer, &res.read::<BuildingInfos>());
+                }
+            });
         }
     });
 }
@@ -440,7 +442,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
 /// Pairs idle warehouse staff with trucks that have no driver, both in ID order.
 fn assign_warehouse_drivers(
     company: &CompanyEnt,
-    humans: &mut slotmapd::HopSlotMap<HumanID, crate::HumanEnt>,
+    humans: &mut HumanStorage,
     vehicles: &slotmapd::HopSlotMap<VehicleID, VehicleEnt>,
 ) {
     let building = company.comp.building;
@@ -476,10 +478,12 @@ fn assign_warehouse_drivers(
     idle.sort_unstable();
     trucks.sort_unstable();
     for (worker, truck) in idle.into_iter().zip(trucks) {
-        humans[worker].work.as_mut().unwrap().kind = WorkKind::Driver {
-            truck,
-            deliver_order: None,
-            load: None,
-        };
+        humans.edit(worker, |human| {
+            human.work.as_mut().unwrap().kind = WorkKind::Driver {
+                truck,
+                deliver_order: None,
+                load: None,
+            };
+        });
     }
 }

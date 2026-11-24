@@ -994,24 +994,25 @@ impl Market {
             },
         );
 
-        let human = &mut world.humans[worker];
-        human.work = None;
-        human.household.attended_shift = None;
-        human.bought.0.remove(&job);
+        world.edit_human(worker, |human| {
+            human.work = None;
+            human.household.attended_shift = None;
+            human.bought.0.remove(&job);
 
-        let old_dest = Destination::Building(previous);
-        let new_dest = Destination::Building(workplace);
-        // A worker's commute is a plain GoTo. Household and leisure actions
-        // own their own routes, including reservations and carried purchases.
-        if matches!(human.decision.kind, HumanDecisionKind::GoTo(dest) if dest == old_dest) {
-            human.decision.kind = HumanDecisionKind::GoTo(new_dest);
-            human.decision.wait = 0;
-            if human.router.target_dest == Some(old_dest)
-                && human.router.trip_purpose == TripPurpose::Work
-            {
-                human.router.go_to_for(new_dest, TripPurpose::Work);
+            let old_dest = Destination::Building(previous);
+            let new_dest = Destination::Building(workplace);
+            // A worker's commute is a plain GoTo. Household and leisure actions
+            // own their own routes, including reservations and carried purchases.
+            if matches!(human.decision.kind, HumanDecisionKind::GoTo(dest) if dest == old_dest) {
+                human.decision.kind = HumanDecisionKind::GoTo(new_dest);
+                human.decision.wait = 0;
+                if human.router.target_dest == Some(old_dest)
+                    && human.router.trip_purpose == TripPurpose::Work
+                {
+                    human.router.go_to_for(new_dest, TripPurpose::Work);
+                }
             }
-        }
+        });
     }
 
     fn hire_worker(market: &mut SingleMarket, job: ItemID, seller: SoulID, buyer: SoulID) -> Trade {

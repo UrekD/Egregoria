@@ -285,9 +285,9 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
 
         match trade.buyer.0 {
             SoulID::Human(id) => {
-                if let Some(h) = world.humans.get_mut(id) {
+                world.edit_human(id, |h| {
                     h.bought.0.entry(trade.kind).or_default().push(trade);
-                }
+                });
             }
             SoulID::GoodsCompany(id) => {
                 if let Some(c) = world.companies.get_mut(id) {

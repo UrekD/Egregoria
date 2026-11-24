@@ -371,6 +371,7 @@ impl Simulation {
         if replay.has_timeline() {
             sim.record_constructor_end();
         }
+        sim.world.reconcile_derived("replay bootstrap");
         let loader = SimulationReplayLoader::new(replay, Tick(sim.get_tick()), bootstrap_end);
         Ok((sim, loader))
     }
@@ -429,6 +430,7 @@ impl Simulation {
             sim.check_waters_starters()?;
         }
         sim.record_constructor_end();
+        sim.world.reconcile_derived("new world");
 
         Ok(sim)
     }
@@ -465,6 +467,8 @@ impl Simulation {
             .record_constructor_end(Tick(self.get_tick()));
     }
 
+    /// Splits the world from its resources. Raw human storage edits through
+    /// the returned world invalidate its work sets automatically.
     pub fn world_res(&mut self) -> (&mut World, &mut Resources) {
         (&mut self.world, &mut self.resources)
     }
@@ -473,6 +477,7 @@ impl Simulation {
         &self.world
     }
     pub fn world_mut_unchecked(&mut self) -> &mut World {
+        self.world.invalidate_derived("unchecked world access");
         &mut self.world
     }
 
@@ -1258,6 +1263,8 @@ impl SimulationDeser {
                     .map_err(|error| format!("Could not decode resource {}: {error}", l.name))?;
             }
         }
+
+        sim.world.reconcile_derived("after resource decode");
 
         log::info!(
             "took {}s to deserialize in total",

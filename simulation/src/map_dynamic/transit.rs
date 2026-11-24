@@ -488,7 +488,7 @@ pub fn apply(sim: &mut Simulation, command: &WorldCommand) -> Result<(), Rejecti
             }
             let removed = replace_stops(world, &map, &mut transit, *line, stops.clone(), now);
             transit.lines[*line].suspended = false;
-            for (id, human) in world.humans.iter_mut() {
+            world.humans.edit_each(|id, human| {
                 if matches!(human.router.cur_step(), Some(RoutingStep::WaitAtStop { line: waiting, .. }) if waiting == line)
                     && removed
                         .iter()
@@ -497,7 +497,7 @@ pub fn apply(sim: &mut Simulation, command: &WorldCommand) -> Result<(), Rejecti
                     let pos = walkable_egress(&map, human.trans.pos);
                     detach_for_replan(&mut transit, id, human, pos, resources, Some(*line));
                 }
-            }
+            });
         }
         (TransitRemoveLine { line }, _) => {
             let map = resources.read::<Map>();
@@ -603,13 +603,13 @@ fn remove_stops(
         }
     }
 
-    for (id, human) in world.humans.iter_mut() {
+    world.humans.edit_each(|id, human| {
         if matches!(human.location, Location::Transit(_))
             || !removed
                 .iter()
                 .any(|&stop| human.router.references_stop(stop))
         {
-            continue;
+            return;
         }
         if let Some(RoutingStep::WaitAtStop { line, .. }) = human.router.cur_step() {
             let line = *line;
@@ -618,7 +618,7 @@ fn remove_stops(
         } else {
             human.router.defer_replan();
         }
-    }
+    });
 }
 
 fn remove_line(
@@ -634,14 +634,14 @@ fn remove_line(
     for (&id, _) in transit.runs.iter().filter(|(_, run)| run.line == line) {
         vehicles.kill(id);
     }
-    for (id, human) in world.humans.iter_mut() {
+    world.humans.edit_each(|id, human| {
         if matches!(human.router.cur_step(), Some(RoutingStep::WaitAtStop { line: waiting, .. }) if *waiting == line)
             && human.location == Location::Outside
         {
             let pos = walkable_egress(map, human.trans.pos);
             detach_for_replan(transit, id, human, pos, resources, Some(line));
         }
-    }
+    });
 }
 
 fn refresh_line_times(map: &Map, transit: &mut Transit, line: LineID) {
@@ -737,18 +737,14 @@ pub fn on_vehicle_dropped(sim: &mut Simulation, vehicle: VehicleID, position: Ve
         return;
     };
     transit.legs.remove(&vehicle);
-    let mut riders = world
-        .humans
-        .iter_mut()
-        .filter(|(_, human)| human.location == Location::Transit(vehicle))
-        .peekable();
-    if riders.peek().is_none() {
-        return;
-    }
-    let egress = walkable_egress(&resources.read::<Map>(), position);
-    for (id, human) in riders {
-        detach_for_replan(&mut transit, id, human, egress, resources, Some(run.line));
-    }
+    let mut egress = None;
+    world.humans.edit_each(|id, human| {
+        if human.location == Location::Transit(vehicle) {
+            let egress =
+                *egress.get_or_insert_with(|| walkable_egress(&resources.read::<Map>(), position));
+            detach_for_replan(&mut transit, id, human, egress, resources, Some(run.line));
+        }
+    });
 }
 
 pub fn on_topology_changed(sim: &mut Simulation) {

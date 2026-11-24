@@ -14,7 +14,9 @@ use crate::transportation::{
     put_pedestrian_in_transport_grid, spawn_driving_vehicle, Location, TransportGrid, VehicleKind,
 };
 use crate::utils::resources::Resources;
-use crate::{HumanEnt, HumanID, ParCommandBuffer, Simulation, VehicleEnt, VehicleID, World};
+use crate::{
+    HumanEnt, HumanID, HumanWork, ParCommandBuffer, Simulation, VehicleEnt, VehicleID, World,
+};
 
 /// Boarding is agent movement, so the dwell is in real time.
 pub(super) const DWELL_TICKS: u64 = 3 * TICKS_PER_REALTIME_SECOND;
@@ -386,15 +388,15 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         exclusions.started = human.router.trip_start;
         true
     });
-    for (id, human) in world.humans.iter_mut() {
+    world.humans.edit_active(HumanWork::Outside, |id, human| {
         if let Location::Transit(bus) = human.location {
             if let Some(at) = service.get_mut(&bus) {
                 alight_passenger(&mut transit, id, human, at, bus, resources);
             }
-            continue;
+            return;
         }
         if human.location != Location::Outside {
-            continue;
+            return;
         }
         human.router.stamp_wait_start(now);
         let Some(RoutingStep::WaitAtStop { stop, line, since }) = human.router.cur_step() else {
@@ -405,7 +407,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
                 grid.get_mut(collider.0).unwrap().1.height = human.trans.pos.z;
                 human.collider = Some(collider);
             }
-            continue;
+            return;
         };
         let (stop, line, since) = (*stop, *line, *since);
         let timed_out = now.0.saturating_sub(since.0) > GIVE_UP_TICKS;
@@ -429,7 +431,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
             if timed_out {
                 on_wait_timeout(resources);
             }
-            continue;
+            return;
         };
 
         if let Some(collider) = human.collider.take() {
@@ -446,7 +448,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
                 queue.push((since, id));
             }
         }
-    }
+    });
 
     let mut queues: BTreeMap<_, VecDeque<_>> = queues
         .into_iter()
@@ -471,25 +473,26 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
             let Some((since, id)) = queue.pop_front() else {
                 break;
             };
-            let human = &mut world.humans[id];
-            if !Router::board(human, bus, resources) {
-                continue;
-            }
-            let line = &transit.lines[at.line];
-            if matches!(human.router.cur_step(), Some(RoutingStep::RideTransit { alight, .. }) if !line.stops.contains(alight))
-            {
-                let walk_pos = transit.stops[at.stop].walk_pos;
-                detach_for_replan(&mut transit, id, human, walk_pos, resources, Some(at.line));
-                continue;
-            }
-            remaining += 1;
-            human.router.trip_mode = TripProgress::RodeTransit;
-            transit_stats::on_board_with_fare(
-                resources,
-                at.line,
-                line.fare,
-                now.0.saturating_sub(since.0),
-            );
+            world.edit_human(id, |human| {
+                if !Router::board(human, bus, resources) {
+                    return;
+                }
+                let line = &transit.lines[at.line];
+                if matches!(human.router.cur_step(), Some(RoutingStep::RideTransit { alight, .. }) if !line.stops.contains(alight))
+                {
+                    let walk_pos = transit.stops[at.stop].walk_pos;
+                    detach_for_replan(&mut transit, id, human, walk_pos, resources, Some(at.line));
+                    return;
+                }
+                remaining += 1;
+                human.router.trip_mode = TripProgress::RodeTransit;
+                transit_stats::on_board_with_fare(
+                    resources,
+                    at.line,
+                    line.fare,
+                    now.0.saturating_sub(since.0),
+                );
+            });
         }
     }
 }

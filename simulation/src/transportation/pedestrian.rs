@@ -4,7 +4,7 @@ use crate::transportation::{
 };
 use crate::utils::rand_provider::RandProvider;
 use crate::utils::resources::Resources;
-use crate::World;
+use crate::{HumanEnt, HumanWork, World};
 use egui_inspect::Inspect;
 use geom::{angle_lerpxy, Color, Transform, Vec3};
 use prototypes::DELTA;
@@ -43,6 +43,23 @@ impl Pedestrian {
             still_direction: None,
         }
     }
+
+    fn can_cache_still(&self, speed: &Speed, it: &Itinerary) -> bool {
+        // At +0 speed a finite positive walking speed and an already wrapped,
+        // nonnegative animation make the animation update a bitwise no-op.
+        speed.0.to_bits() == 0
+            && it.get_point().is_none()
+            && self.walking_speed.is_finite()
+            && self.walking_speed > 0.0
+            && self.walk_anim.is_sign_positive()
+            && self.walk_anim < std::f32::consts::TAU
+    }
+
+    pub(crate) fn is_still(&self, human: &HumanEnt) -> bool {
+        self.still_direction.is_some()
+            && self.can_cache_still(&human.speed, &human.it)
+            && self.still_direction == Some(<[f32; 3]>::from(human.trans.dir).map(f32::to_bits))
+    }
 }
 
 pub fn random_pedestrian_shirt_color(r: &mut RandProvider) -> Color {
@@ -71,29 +88,21 @@ pub fn random_pedestrian_shirt_color(r: &mut RandProvider) -> Color {
 
 pub fn pedestrian_decision_system(world: &mut World, _resources: &mut Resources) {
     profiling::scope!("transportation::pedestrian_decision_system");
-    for human in world.humans.values_mut() {
+    world.humans.edit_active(HumanWork::Pedestrian, |_, human| {
         let p = &mut human.pedestrian;
-        if human.speed.0.to_bits() == 0 && human.it.get_point().is_none() {
-            // Positive walking speed and an already wrapped nonnegative animation
-            // make the zero-speed animation update a bitwise no-op.
-            if p.walking_speed.is_finite()
-                && p.walking_speed > 0.0
-                && p.walk_anim.is_sign_positive()
-                && p.walk_anim < std::f32::consts::TAU
-            {
-                let before = <[f32; 3]>::from(human.trans.dir).map(f32::to_bits);
-                if p.still_direction == Some(before) {
-                    continue;
-                }
-                let dir = angle_lerpxy(human.trans.dir, human.trans.dir, DELTA);
-                let after = <[f32; 3]>::from(dir).map(f32::to_bits);
-                p.still_direction = (before == after).then_some(before);
-                human.trans.dir = dir;
-                continue;
+        if p.can_cache_still(&human.speed, &human.it) {
+            let before = <[f32; 3]>::from(human.trans.dir).map(f32::to_bits);
+            if p.still_direction == Some(before) {
+                return;
             }
+            let dir = angle_lerpxy(human.trans.dir, human.trans.dir, DELTA);
+            let after = <[f32; 3]>::from(dir).map(f32::to_bits);
+            p.still_direction = (before == after).then_some(before);
+            human.trans.dir = dir;
+            return;
         }
         pedestrian_decision(&mut human.it, &mut human.trans, &mut human.speed, p);
-    }
+    });
 }
 
 pub fn pedestrian_decision(

@@ -5,10 +5,10 @@ use crate::map::{
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
 use crate::transportation::traffic_metrics::within_lane;
-use crate::transportation::{RoadThroughput, RoadUserKind};
+use crate::transportation::{Location, RoadThroughput, RoadUserKind, VehicleKind};
 use crate::utils::resources::Resources;
 use crate::world::TrainID;
-use crate::World;
+use crate::{HumanWork, World};
 use egui_inspect::egui::Ui;
 use egui_inspect::{Inspect, InspectArgs};
 use geom::{Follower, PolyLine3, Polyline3Queue, Segment3, Vec3};
@@ -976,9 +976,8 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     let tick = elapsed_ticks(resources).0;
     throughput.begin_tick(map, tick);
 
-    world
-        .query_it_trans_speed()
-        .for_each(|(it, trans, speed, kind)| {
+    let mut update =
+        |it: &mut Itinerary, pos: &mut Vec3, speed: f32, kind: Option<RoadUserKind>| {
             if it.is_inert() {
                 return;
             }
@@ -994,15 +993,35 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                     }
                 }
             });
-            trans.pos = it.update_with_route(
-                trans.pos,
+            *pos = it.update_with_route(
+                *pos,
                 speed * DELTA,
                 time.seconds,
                 map,
                 |start, target, kind| failures.route(time.tick, start, target, map, kind),
                 record,
             );
-        });
+        };
+    world.humans.edit_active(HumanWork::Itinerary, |_, human| {
+        let kind = (human.location == Location::Outside).then_some(RoadUserKind::Pedestrian);
+        update(&mut human.it, &mut human.trans.pos, human.speed.0, kind);
+    });
+    for train in world.trains.values_mut() {
+        update(&mut train.it, &mut train.trans.pos, train.speed.0, None);
+    }
+    for vehicle in world.vehicles.values_mut() {
+        let kind = match vehicle.vehicle.kind {
+            VehicleKind::Car => RoadUserKind::Car,
+            VehicleKind::Truck => RoadUserKind::Truck,
+            VehicleKind::Bus => RoadUserKind::Bus,
+        };
+        update(
+            &mut vehicle.it,
+            &mut vehicle.trans.pos,
+            vehicle.speed.0,
+            Some(kind),
+        );
+    }
 
     world.trains.values_mut().for_each(|train| {
         train.leader.past.push(train.trans.pos);

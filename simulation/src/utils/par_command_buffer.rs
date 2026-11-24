@@ -61,7 +61,7 @@ impl<E: SimDrop> ParCommandBuffer<E> {
         deleted.sort_unstable();
 
         for entity in deleted {
-            let Some(v) = E::storage_mut(&mut sim.world).remove(entity) else {
+            let Some(v) = E::remove(&mut sim.world, entity) else {
                 continue;
             };
 

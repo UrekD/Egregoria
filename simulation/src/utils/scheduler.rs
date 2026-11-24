@@ -51,6 +51,19 @@ impl SeqSchedule {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn execute_observed(
+        &self,
+        sim: &mut Simulation,
+        mut observe: impl FnMut(&'static str, &mut Simulation),
+    ) {
+        for (system, _) in &self.systems {
+            system.run(sim);
+            drain_commands(sim);
+            observe(system.name(), sim);
+        }
+    }
+
     pub fn times(&self) -> Vec<(String, f32)> {
         let mut times = self
             .systems

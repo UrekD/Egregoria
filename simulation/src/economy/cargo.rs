@@ -1830,13 +1830,14 @@ fn dispatch(
                     routing_error_since: None,
                 },
             );
-            let human = &mut world.humans[driver];
-            let work = human.work.as_mut().unwrap();
-            work.kind = WorkKind::Driver {
-                truck,
-                deliver_order: Some(destination.building),
-                load: Some(load),
-            };
+            world.edit_human(driver, |human| {
+                let work = human.work.as_mut().unwrap();
+                work.kind = WorkKind::Driver {
+                    truck,
+                    deliver_order: Some(destination.building),
+                    load: Some(load),
+                };
+            });
             // Do not replace an existing decision. The work scorer picks up this
             // assignment while the driver is at the depot.
             remaining.retain(|id| book.shipments.contains_key(id));
@@ -2140,24 +2141,20 @@ fn cancel_removed_imports(
 }
 
 fn clear_assignment(world: &mut World, manifest: &TruckLoad, token: LoadId) {
-    let Some(work) = world
-        .humans
-        .get_mut(manifest.driver)
-        .and_then(|human| human.work.as_mut())
-    else {
-        return;
-    };
-    if let WorkKind::Driver {
-        load,
-        deliver_order,
-        ..
-    } = &mut work.kind
-    {
+    world.edit_human(manifest.driver, |human| {
+        let Some(WorkKind::Driver {
+            load,
+            deliver_order,
+            ..
+        }) = human.work.as_mut().map(|work| &mut work.kind)
+        else {
+            return;
+        };
         if *load == Some(token) {
             *load = None;
             *deliver_order = None;
         }
-    }
+    });
 }
 
 fn release(

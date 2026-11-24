@@ -250,11 +250,11 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
         let mut destinations = nearest.iter().map(|&(_, id)| id).peekable();
         for soul in residents {
             let SoulID::Human(id) = soul else { continue };
-            let Some(human) = world.humans.get_mut(id) else {
+            if !world.humans.contains_key(id) {
                 continue;
-            };
+            }
             if let Some(&home) = destinations.peek() {
-                human.home.house = home;
+                world.edit_human(id, |human| human.home.house = home);
                 infos.add_resident(home, soul);
                 let (_, free) = vacancies.get_mut(&home).unwrap();
                 *free -= 1;

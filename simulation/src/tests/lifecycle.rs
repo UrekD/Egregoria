@@ -1417,3 +1417,253 @@ fn pf_d_abandonment_batch_cleans_departing_workers_and_trade_references() {
     assert!(employer.sold.0.is_empty());
     assert!(test.g.world.departing.is_none());
 }
+
+#[test]
+fn l1_activity_skips_idle_slots_and_keeps_reused_ids_in_storage_order() {
+    use crate::souls::human::spawn_human;
+    use crate::world::HumanWork;
+    use slotmapd::Key;
+
+    let mut test = TestCtx::new();
+    street(&test);
+    let first_home = test.build_house_near(vec2(150.0, 125.0));
+    let second_home = test.build_house_near(vec2(250.0, 125.0));
+    let first = spawn_human(&mut test.g, first_home).unwrap();
+    let second = spawn_human(&mut test.g, second_home).unwrap();
+
+    let mut ids = Vec::new();
+    test.g.world.collect_active(HumanWork::Outside, &mut ids);
+    assert!(ids.is_empty(), "residents inside buildings must be skipped");
+
+    test.g
+        .world
+        .edit_human(second, |h| h.location = Location::Outside);
+    crate::souls::lifecycle::despawn_human(&mut test.g, first);
+    test.g.apply_commands([]);
+    assert!(test.g.get(first).is_none());
+    let replacement = spawn_human(&mut test.g, first_home).unwrap();
+    assert_ne!(replacement, first);
+    assert_eq!(
+        replacement.data().as_ffi() as u32,
+        first.data().as_ffi() as u32
+    );
+    assert!(test.g.world.edit_human(first, |_| ()).is_none());
+    test.g
+        .world
+        .edit_human(replacement, |h| h.location = Location::Outside);
+    test.g.world.collect_active(HumanWork::Outside, &mut ids);
+    assert_eq!(ids, [replacement, second]);
+}
+
+fn l1_assert_phase_hashes(indexed: &mut Simulation, full_scan: &mut Simulation) {
+    use crate::utils::scheduler::SeqSchedule;
+    assert_eq!(indexed.hashes(), full_scan.hashes(), "paused boundary");
+
+    // Go through the normal command/clock entry point, then run the registered
+    // schedule with observations immediately after each callback drain.
+    for sim in [&mut *indexed, &mut *full_scan] {
+        sim.tick(&mut SeqSchedule::default(), []);
+    }
+    let schedule = Simulation::schedule();
+    let mut legacy = std::collections::VecDeque::new();
+    schedule.execute_observed(full_scan, |phase, sim| {
+        legacy.push_back((phase, sim.hashes()));
+    });
+    schedule.execute_observed(indexed, |phase, sim| {
+        let (name, expected) = legacy.pop_front().unwrap();
+        assert_eq!(phase, name);
+        assert_eq!(sim.hashes(), expected, "after {phase}");
+    });
+    assert!(legacy.is_empty());
+}
+
+#[test]
+fn l1_activity_transit_removal_clock_jumps_and_dirty_mid_wait_resume() {
+    use super::p3_spine::loop_fixture;
+    use crate::map_dynamic::transit::elapsed_ticks;
+    use crate::map_dynamic::{BusRun, Router, RoutingStep, Transit};
+    use crate::souls::human::spawn_human;
+    use crate::souls::residence::Residences;
+    use crate::transportation::{spawn_driving_vehicle, TransportGrid};
+    use crate::HumanWork;
+    use geom::Transform;
+
+    let (mut test, line) = loop_fixture();
+    let home = *test
+        .g
+        .read::<Residences>()
+        .by_building
+        .keys()
+        .next()
+        .unwrap();
+    test.g
+        .write::<Residences>()
+        .by_building
+        .get_mut(&home)
+        .unwrap()
+        .capacity = 4;
+    let rider = spawn_human(&mut test.g, home).unwrap();
+    let waiter = spawn_human(&mut test.g, home).unwrap();
+    let idle = spawn_human(&mut test.g, home).unwrap();
+    let (first, second, first_pos, second_pos, berth, dir) = {
+        let transit = test.g.read::<Transit>();
+        let first = transit.lines[line].stops[0];
+        let second = transit.lines[line].stops[1];
+        let stop = &transit.stops[first];
+        (
+            first,
+            second,
+            stop.walk_pos,
+            transit.stops[second].walk_pos,
+            stop.berth,
+            stop.dir.z0(),
+        )
+    };
+    let bus = spawn_driving_vehicle(&mut test.g, VehicleKind::Bus, Transform { pos: berth, dir })
+        .unwrap();
+    let now = elapsed_ticks(&test.g.resources);
+    {
+        let mut transit = test.g.write::<Transit>();
+        transit.lines[line].target_vehicles = 1;
+        transit.runs.insert(
+            bus,
+            BusRun {
+                line,
+                next_stop_idx: 0,
+                dwell_until: Some(Tick(now.0 + 150)),
+                leg_started: now,
+                failures: 0,
+            },
+        );
+    }
+
+    let mut candidates = Vec::new();
+    test.g
+        .world
+        .collect_active(HumanWork::Outside, &mut candidates);
+    assert!(candidates.is_empty());
+
+    // Save without giving a consumer the opportunity to rebuild these dirty sets.
+    let (world, resources) = test.g.world_res();
+    for id in [rider, waiter] {
+        resources
+            .write::<BuildingInfos>()
+            .get_out(home, SoulID::Human(id));
+        let human = &mut world.humans[id];
+        human.location = Location::Outside;
+        human.trans.pos = second_pos;
+        human.router.set_test_route(
+            Destination::Outside(first_pos),
+            vec![
+                RoutingStep::WaitAtStop {
+                    stop: second,
+                    line,
+                    since: now,
+                },
+                RoutingStep::RideTransit {
+                    line,
+                    alight: second,
+                },
+            ],
+        );
+        human.decision.wait = 2;
+    }
+    // The rider is bound for the second stop. The waiter stays at that stop.
+    assert!(Router::board(&mut world.humans[rider], bus, resources));
+    world.humans[idle].decision.wait = 2;
+    let paused = Bincode::encode(&test.g).unwrap();
+    let mut resumed: Simulation = Bincode::decode(&paused).unwrap();
+    assert_eq!(Bincode::encode(&resumed).unwrap(), paused);
+    resumed
+        .world
+        .collect_active(HumanWork::Outside, &mut candidates);
+    assert_eq!(candidates, [rider, waiter]);
+    resumed
+        .world
+        .collect_active(HumanWork::RouteStep, &mut candidates);
+    assert_eq!(candidates, [rider, waiter]);
+    let mut full_scan: Simulation = Bincode::decode(&paused).unwrap();
+    full_scan.world.use_legacy_human_scan();
+
+    for wait in [1, 0] {
+        l1_assert_phase_hashes(&mut resumed, &mut full_scan);
+        assert_eq!(resumed.get(idle).unwrap().decision.wait, wait);
+        assert_eq!(resumed.get(rider).unwrap().location, Location::Transit(bus));
+    }
+    l1_assert_phase_hashes(&mut resumed, &mut full_scan);
+    assert!(resumed.get(idle).unwrap().decision.wait > 0);
+
+    for sim in [&mut resumed, &mut full_scan] {
+        sim.apply_commands([&WorldCommand::TransitRemoveLine { line }]);
+        for id in [rider, waiter] {
+            let human = sim.get(id).unwrap();
+            assert_eq!(human.location, Location::Outside);
+            assert!(human.collider.is_some());
+        }
+        assert!(sim.get(bus).is_none());
+    }
+    resumed
+        .world
+        .collect_active(HumanWork::RouteChanged, &mut candidates);
+    assert!(candidates.contains(&rider) && candidates.contains(&waiter));
+
+    for to in [crate::INITIAL_TICK + 5000, crate::INITIAL_TICK + 50] {
+        for sim in [&mut resumed, &mut full_scan] {
+            sim.apply_commands([&WorldCommand::SetGameTime(GameTime::new(Tick(to)))]);
+        }
+        l1_assert_phase_hashes(&mut resumed, &mut full_scan);
+    }
+    assert_eq!(
+        resumed.read::<TransportGrid>().len(),
+        full_scan.read::<TransportGrid>().len()
+    );
+}
+
+#[test]
+fn l1_activity_rehome_and_freight_abort_refresh_before_the_next_phase() {
+    use crate::economy::cargo::LoadId;
+    use crate::souls::lifecycle::abort_freight_trip;
+    use crate::HumanWork;
+
+    let mut test = TestCtx::new();
+    let (_, driver, _, truck, _) = staffed_factory(&mut test);
+    let old_home = test.g.get(driver).unwrap().home.house;
+    let new_home = test.build_house_near(vec2(285.0, 260.0));
+    let pos = test.g.get(truck).unwrap().trans.pos;
+    let dest = Destination::Outside(pos);
+    test.g.world.edit_human(driver, |human| {
+        human.location = Location::Vehicle(truck);
+        human.router.use_vehicle(Some(truck));
+        human.router.go_to(dest);
+        human.it = Itinerary::simple(vec![pos]);
+    });
+    let bytes = Bincode::encode(&test.g).unwrap();
+    let mut indexed: Simulation = Bincode::decode(&bytes).unwrap();
+    let mut full_scan: Simulation = Bincode::decode(&bytes).unwrap();
+    full_scan.world.use_legacy_human_scan();
+
+    for sim in [&mut indexed, &mut full_scan] {
+        abort_freight_trip(sim, driver, truck, LoadId(1), false);
+        sim.apply_commands([]);
+        let human = sim.get(driver).unwrap();
+        assert_eq!(human.location, Location::Outside);
+        assert!(human.router.target_dest.is_none());
+        assert!(human.it.is_inert());
+    }
+    let mut candidates = Vec::new();
+    indexed
+        .world
+        .collect_active(HumanWork::Itinerary, &mut candidates);
+    assert!(!candidates.contains(&driver));
+    indexed
+        .world
+        .collect_active(HumanWork::Outside, &mut candidates);
+    assert!(candidates.contains(&driver));
+    l1_assert_phase_hashes(&mut indexed, &mut full_scan);
+
+    for sim in [&mut indexed, &mut full_scan] {
+        sim.apply_commands([&WorldCommand::MapRemoveBuilding(old_home)]);
+        assert_eq!(sim.get(driver).unwrap().home.house, new_home);
+    }
+    l1_assert_phase_hashes(&mut indexed, &mut full_scan);
+}

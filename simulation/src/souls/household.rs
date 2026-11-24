@@ -439,10 +439,10 @@ pub fn household_update(world: &mut World, resources: &mut Resources) {
     }
     // Flush the last partial interval before progression reads the closed day.
     let mut metrics = resources.write::<DailyEconomyMetrics>();
-    for human in world.humans.values_mut() {
+    world.humans.edit_each(|_, human| {
         let at_home = human.location == Location::Building(human.home.house);
         human.household.advance(now, at_home, &mut metrics);
-    }
+    });
 }
 
 pub(crate) fn cancel_visit(id: HumanID, human: &mut HumanEnt, resources: &Resources) {

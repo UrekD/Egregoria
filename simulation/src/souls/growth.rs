@@ -75,7 +75,7 @@ pub fn growth_update(sim: &mut Simulation) {
     }
 
     let mut zoned_lots = {
-        let (_, resources) = sim.world_res();
+        let resources = &sim.resources;
         let map = resources.read::<Map>();
         let zones = resources.read::<ZoneGrid>();
         let mut cache = resources.write::<GrowthCache>();
@@ -105,7 +105,7 @@ pub fn growth_update(sim: &mut Simulation) {
 
 fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: impl IntoIterator<Item = (LotID, ZoneCell)>) {
     let mut candidates = {
-        let (_, resources) = sim.world_res();
+        let resources = &sim.resources;
         let map = resources.read::<Map>();
         let demand = resources.read::<ZoneDemand>();
         let mut cache = resources.write::<GrowthCache>();

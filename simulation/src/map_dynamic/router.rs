@@ -14,7 +14,7 @@ use crate::transportation::{
 };
 use crate::utils::resources::Resources;
 use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
-use crate::{ParCommandBuffer, SoulID, World};
+use crate::{HumanWork, ParCommandBuffer, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
 use prototypes::{Tick, TICKS_PER_MINUTE};
@@ -123,7 +123,7 @@ fn routing_changed(
     let transit = resources.read::<Transit>();
     let mut transit_paths = None;
 
-    world.humans.iter_mut().for_each(|(id, h)| {
+    world.humans.edit_active(HumanWork::RouteChanged, |id, h| {
         let router = &mut h.router;
         if matches!(h.location, Location::Transit(_)) {
             return;
@@ -298,8 +298,8 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
     let cbuf_human: &ParCommandBuffer<HumanEnt> = &resources.read();
     let cbuf_vehicle: &ParCommandBuffer<VehicleEnt> = &resources.read();
 
-    world.humans.iter_mut().for_each(|(body, h)| {
-        if h.router.cur_step.is_none() && h.router.steps.is_empty() {
+    world.humans.edit_active(HumanWork::RouteStep, |body, h| {
+        if !h.router.has_route_step() {
             return;
         }
 
@@ -567,9 +567,10 @@ fn walk_outside(body: HumanID, pos: Vec3, cbuf: &ParCommandBuffer<HumanEnt>, loc
     *loc = Location::Outside;
     cbuf.exec_ent(body, move |sim| {
         let coll = put_pedestrian_in_transport_grid(&mut sim.write::<TransportGrid>(), pos);
-        let h = unwrap_ret!(sim.world.humans.get_mut(body));
-        h.trans.pos = pos;
-        h.collider = Some(coll);
+        sim.world.edit_human(body, |h| {
+            h.trans.pos = pos;
+            h.collider = Some(coll);
+        });
     });
 }
 
@@ -899,6 +900,26 @@ impl Router {
     /// car may take the bus for its errands.
     pub(crate) fn allows_transit(&self, household: &HouseholdStock) -> bool {
         !self.walk_only_pickup || (self.personal_car.is_none() && household.on_errand())
+    }
+
+    pub(crate) fn has_route_step(&self) -> bool {
+        self.cur_step.is_some() || !self.steps.is_empty()
+    }
+
+    pub(crate) fn needs_route_change(&self, location: &Location) -> bool {
+        if matches!(location, Location::Transit(_)) {
+            return false;
+        }
+        if self.replan_at_alight {
+            return true;
+        }
+        if self.cur_dest != self.target_dest {
+            return self.target_dest.is_some();
+        }
+        // Keep the car-state check in the routing pass. Vehicle edits can
+        // make a cancelled driver eligible without mutating the human.
+        !self.has_route_step()
+            && matches!(location, Location::Vehicle(car) if Some(*car) == self.personal_car)
     }
 
     pub(crate) fn stamp_wait_start(&mut self, now: Tick) {
