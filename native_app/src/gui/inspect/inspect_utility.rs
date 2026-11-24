@@ -1,6 +1,6 @@
 use goryak::{mincolumn, on_secondary_container, textc, tooltip};
 use simulation::map::{BuildingID, RoadID};
-use simulation::map_dynamic::{utility_network_at_road, UtilityNetworkState};
+use simulation::map_dynamic::{utility_network_at_road, UtilityFlow, UtilityNetworkState};
 
 use crate::gui::overlays::UTILITY_EXPLANATION;
 use simulation::Simulation;
@@ -49,6 +49,12 @@ pub(crate) fn render(sim: &Simulation, road: RoadID) {
                 )
             }),
         );
+        if network.network.is_some() && sim.read::<UtilityFlow>().water_pending(&sim.map()) {
+            textc(
+                on_secondary_container(),
+                "Water and sewage totals update on the next utility pass",
+            );
+        }
     });
 }
 
