@@ -527,9 +527,11 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                         .get_in(build, SoulID::Human(body));
                     walk_inside(body, h, cbuf_human);
                     match h.router.trip_purpose {
-                        TripPurpose::Work => {
-                            h.attend_work(&resources.read::<prototypes::GameTime>(), build)
-                        }
+                        TripPurpose::Work => h.attend_work_for(
+                            &resources.read::<prototypes::GameTime>(),
+                            build,
+                            &resources.read::<BuildingInfos>(),
+                        ),
                         TripPurpose::Shopping | TripPurpose::Leisure => h.decision.wait = 0,
                         TripPurpose::Home if !h.household.carried.is_empty() => h.decision.wait = 0,
                         _ => {}
@@ -1053,6 +1055,10 @@ impl Router {
         }
     }
 
+    pub(crate) fn commutes_to(&self, building: BuildingID) -> bool {
+        self.trip_purpose == TripPurpose::Work && self.references_building(building)
+    }
+
     pub(crate) fn references_building(&self, building: BuildingID) -> bool {
         self.target_dest == Some(Destination::Building(building))
             || self.cur_dest == Some(Destination::Building(building))
@@ -1111,6 +1117,12 @@ impl Router {
 
     pub(crate) fn go_to_for(&mut self, dest: Destination, purpose: TripPurpose) -> bool {
         if self.target_dest == Some(dest) {
+            if matches!(
+                (self.trip_purpose, purpose),
+                (TripPurpose::Work, TripPurpose::Home) | (TripPurpose::Home, TripPurpose::Work)
+            ) {
+                self.trip_purpose = purpose;
+            }
             return self.cur_dest == Some(dest) && self.steps.is_empty() && self.cur_step.is_none();
         }
         if self.cur_dest == Some(dest) {

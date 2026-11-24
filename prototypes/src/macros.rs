@@ -39,6 +39,7 @@ macro_rules! gen_prototypes {
             )+
             pub(crate) orderings: Orderings,
             declared_types: std::collections::BTreeMap<String, &'static str>,
+            conflicting_declarations: std::collections::BTreeSet<String>,
         }
 
         $(
@@ -70,6 +71,10 @@ macro_rules! gen_prototypes {
         )+
 
         impl Prototypes {
+            pub(crate) fn has_conflicting_declarations(&self, name: &str) -> bool {
+                self.conflicting_declarations.contains(name)
+            }
+
             pub(crate) fn print_stats(&self) {
                 $(
                     if <$t as $crate::ConcretePrototype>::storage(self).is_empty() {
@@ -114,6 +119,10 @@ macro_rules! gen_prototypes {
                                     proto.name.clone(),
                                     if kind == service { previous } else { kind },
                                 ));
+                            }
+
+                            if previous != kind {
+                                self.conflicting_declarations.insert(proto.name.clone());
                             }
 
                             <$t as $crate::ConcretePrototype>::insert_parents(&proto, self);

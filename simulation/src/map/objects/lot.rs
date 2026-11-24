@@ -1,6 +1,7 @@
-use crate::map::{LotOrigin, Map, ProjectFilter, ProjectKind, RoadID, UpdateType};
+use crate::map::{Building, LotOrigin, Map, ProjectFilter, ProjectKind, RoadID, UpdateType};
 use geom::{Intersect, Polygon, Shape, Vec2, Vec3, OBB};
 use ordered_float::OrderedFloat;
+use prototypes::BuildingGen;
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
 use std::collections::BTreeSet;
@@ -37,7 +38,40 @@ pub struct Lot {
     pub height: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrowableLotError {
+    MissingLot,
+    MissingRoad,
+    UnsupportedDensity,
+    MissingPrototype,
+    TooSmall,
+    Obstructed,
+    Wet,
+    InfeasibleGrade,
+    MixedUseDisabled,
+}
+
 impl Lot {
+    pub(crate) fn check_growable_footprint(
+        &self,
+        map: &Map,
+        generator: BuildingGen,
+    ) -> Result<(), GrowableLotError> {
+        if map.get(self.parent).is_none() {
+            return Err(GrowableLotError::MissingRoad);
+        }
+        if !Building::valid_footprint(&self.shape, generator) {
+            return Err(GrowableLotError::Obstructed);
+        }
+        if !Building::dry_footprint(map.environment(), &self.shape, None) {
+            return Err(GrowableLotError::Wet);
+        }
+        if Self::footprint_obstructed(map, self.shape, false) {
+            return Err(GrowableLotError::Obstructed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn footprint_obstructed(map: &Map, shape: OBB, include_lots: bool) -> bool {
         let mut filter = ProjectFilter::INTER | ProjectFilter::BUILDING;
         if include_lots {
@@ -55,7 +89,9 @@ impl Lot {
         const FRONTAGE_RADIUS: f32 = 15.0;
 
         let shape = origin.shape;
-        if Self::footprint_obstructed(map, shape, true) {
+        if !Building::dry_footprint(map.environment(), &shape, None)
+            || Self::footprint_obstructed(map, shape, true)
+        {
             return None;
         }
 

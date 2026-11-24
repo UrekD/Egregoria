@@ -1,12 +1,13 @@
 use std::collections::BTreeMap;
 
 use geom::{vec2, Vec2};
+use ordered_float::OrderedFloat;
 use prototypes::{try_prototype, ServiceKind, Tick};
 use serde::{Deserialize, Serialize};
 
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::Budget;
-use crate::map::{Building, BuildingID, BuildingKind, Map};
+use crate::map::{Building, BuildingID, BuildingKind, Lot, Map};
 use crate::map_dynamic::{BuildingInfos, CoverageGrid, UtilityFlow};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
@@ -22,6 +23,8 @@ const UTILITIES_BONUS: f32 = 10.0;
 pub struct EnvGrid {
     pub cells: BTreeMap<(i32, i32), EnvCell>,
     by_building: BTreeMap<BuildingID, u8>,
+    #[serde(default)]
+    service_access: BTreeMap<BuildingID, f32>,
 }
 
 impl EnvGrid {
@@ -48,6 +51,33 @@ impl EnvGrid {
     /// Most recent land value for a building with a recorded environment sample.
     pub fn land_value_sample(&self, building: BuildingID) -> Option<u8> {
         self.by_building.get(&building).copied()
+    }
+
+    /// Estimate an empty lot from its nearest measured frontage neighbour and local conditions.
+    pub fn initial_lot_value(&self, map: &Map, lot: &Lot) -> u8 {
+        const RADIUS_SQUARED: f32 = 96.0 * 96.0;
+        let center = lot.shape.center();
+        let service_bonus = map
+            .get(lot.parent)
+            .into_iter()
+            .flat_map(|road| road.connected_buildings.iter().copied())
+            .filter_map(|id| {
+                let building = map.get(id)?;
+                let bonus = *self.service_access.get(&id)?;
+                let distance = building.obb.center().distance2(center);
+                (distance <= RADIUS_SQUARED && building.connected_road == Some(lot.parent))
+                    .then_some((OrderedFloat(distance), id, bonus))
+            })
+            .min_by_key(|&(distance, id, _)| (distance, id))
+            .map_or(0.0, |(_, _, bonus)| bonus);
+        self.value_at(map, center, service_bonus, 0.0)
+    }
+
+    fn value_at(&self, map: &Map, center: Vec2, coverage_bonus: f32, utilities_bonus: f32) -> u8 {
+        let value =
+            BASE_LAND_VALUE + coverage_bonus + utilities_bonus + shoreline_value_bonus(map, center)
+                - self.pollution_at(center) / 2.0;
+        value.clamp(0.0, 100.0) as u8
     }
 
     fn cell_at(pos: Vec2) -> (i32, i32) {
@@ -129,6 +159,8 @@ pub fn env_update(sim: &mut Simulation) {
 
     env.by_building
         .retain(|&id, _| map.get(id).is_some_and(has_land_value));
+    env.service_access
+        .retain(|&id, _| map.get(id).is_some_and(has_land_value));
     for building in map.buildings().values() {
         if !has_land_value(building) {
             continue;
@@ -149,15 +181,9 @@ pub fn env_update(sim: &mut Simulation) {
         } else {
             0.0
         };
-        let center = building.obb.center();
-        let pollution = env.pollution_at(center);
-        let land_value = BASE_LAND_VALUE
-            + coverage_bonus
-            + utilities_bonus
-            + shoreline_value_bonus(&map, center)
-            - pollution / 2.0;
-        env.by_building
-            .insert(id, land_value.clamp(0.0, 100.0) as u8);
+        let value = env.value_at(&map, building.obb.center(), coverage_bonus, utilities_bonus);
+        env.by_building.insert(id, value);
+        env.service_access.insert(id, coverage_bonus);
     }
 }
 

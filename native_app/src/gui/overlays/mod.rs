@@ -17,11 +17,11 @@ use serde::{Deserialize, Deserializer};
 use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
 use simulation::map::{Building, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
-    city_field_tick, service_reach_sources, service_reach_version, utility_network_readout,
-    CoverageGrid, ElectricityFlow, Transit, UtilityFlow, UtilityNetworkReadout,
-    UtilityNetworkState,
+    active_business, city_field_tick, effective_load, service_reach_sources, service_reach_version,
+    utility_network_readout, BuildingInfos, CoverageGrid, ElectricityFlow, Transit, UtilityFlow,
+    UtilityNetworkReadout, UtilityNetworkState,
 };
-use simulation::souls::residence;
+use simulation::souls::residence::{self, Residences};
 use simulation::Simulation;
 
 use crate::gui::{InspectedBuilding, PlacementPreview, Tool};
@@ -404,6 +404,8 @@ fn collect_utility_markers(sim: &Simulation, map: &Map, mode: OverlayMode, tiles
     let power = sim.read::<ElectricityFlow>();
     let flow = sim.read::<UtilityFlow>();
     let mut states = FastMap::default();
+    let infos = sim.read::<BuildingInfos>();
+    let residences = sim.read::<Residences>();
     for building in map.buildings().values() {
         let company = building.kind.as_goods_company().and_then(try_prototype);
         let service = company.and_then(|proto| try_prototype(ServiceID::from(proto.id)));
@@ -417,7 +419,21 @@ fn collect_utility_markers(sim: &Simulation, map: &Map, mode: OverlayMode, tiles
             }
             _ => unreachable!(),
         };
-        let consumer = if mode == OverlayMode::Power {
+        let consumer = if building.development().is_some() {
+            let load = effective_load(
+                building,
+                residences.by_building.get(&building.id),
+                active_business(building, &infos, sim.world()),
+            );
+            match mode {
+                OverlayMode::Power => {
+                    load.residential_power > Power::ZERO || load.business_power > Power::ZERO
+                }
+                OverlayMode::Water => load.water_demand() > 0.0,
+                OverlayMode::Sewage => load.sewage_demand() > 0.0,
+                _ => unreachable!(),
+            }
+        } else if mode == OverlayMode::Power {
             matches!(
                 building.kind,
                 BuildingKind::House | BuildingKind::GoodsCompany(_)

@@ -2,7 +2,6 @@ use prototypes::{Money, TICKS_PER_HOUR, TICKS_PER_MINUTE};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use super::{Government, LEVEL_NAMES};
-use crate::map::BuildingKind;
 use crate::Simulation;
 
 const SAMPLES_PER_LEVEL: usize = 10;
@@ -92,7 +91,7 @@ pub fn citystats_update(sim: &mut Simulation) {
         .map()
         .buildings()
         .values()
-        .filter(|building| building.kind == BuildingKind::House)
+        .filter(|building| building.has_residential_use())
         .count() as u32;
     stats.companies = world.companies.len() as u32;
     stats.vehicles = world.vehicles.len() as u32;

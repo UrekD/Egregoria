@@ -1,11 +1,11 @@
 use crate::economy::cargo::{cancel_removed, stored_items, CargoBook, CargoRemoval, LoadId};
 use geom::Vec3;
 use itertools::Itertools;
-use prototypes::{GameTime, GoodsCompanyID, ItemID};
+use prototypes::{GameTime, GoodsCompanyID, ItemID, TICKS_PER_HOUR};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::economy::{BasketFailure, Market, Trade};
-use crate::map::{Building, BuildingID, BuildingKind, Map, PathKind};
+use crate::map::{Building, BuildingID, BuildingKind, GrowableBusinessState, Map, PathKind};
 use crate::map_dynamic::{
     BuildingInfos, Destination, DispatchID, Dispatcher, Itinerary, ParkingManagement,
     SpotReservation, NEAR_PARKING_RADIUS, OBJECTIVE_OK_DIST,
@@ -37,10 +37,22 @@ pub fn despawn_company(sim: &mut Simulation, id: CompanyID) {
     sim.read::<ParCommandBuffer<CompanyEnt>>().kill(id);
 }
 
-pub(crate) fn remove_building(sim: &mut Simulation, building: Building, was_external_target: bool) {
+/// Remove a site and settle all uses using the captured building record.
+pub(crate) fn remove_site(sim: &mut Simulation, id: BuildingID) -> bool {
+    let was_external_target = sim.map().external_train_stations.first() == Some(&id);
+    let removed = sim.map_mut().remove_building(id);
+    let Some(building) = removed else {
+        return false;
+    };
+    residence::on_building_removed(sim, id);
+    remove_building(sim, building, was_external_target);
+    true
+}
+
+fn remove_building(sim: &mut Simulation, building: Building, was_external_target: bool) {
     let id = building.id;
     cancel_removed(sim, CargoRemoval::Building(id));
-    if building.kind == BuildingKind::House {
+    if building.has_residential_use() {
         let (world, resources) = sim.world_res();
         let infos = resources.read::<BuildingInfos>();
         if let Some(info) = infos.get(id) {
@@ -186,7 +198,61 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
     }
 }
 
+/// Mark a profiled company unavailable before draining the queued closure.
+pub fn close_business(sim: &mut Simulation, id: CompanyID) -> bool {
+    let Some(company) = sim.get(id) else {
+        return false;
+    };
+    let building = company.comp.building;
+    if !mark_business_closed(sim, id, building) {
+        return false;
+    }
+    despawn_company(sim, id);
+    true
+}
+
+fn mark_business_closed(sim: &Simulation, id: CompanyID, building: BuildingID) -> bool {
+    if sim.read::<BuildingInfos>().owner(building) != Some(SoulID::GoodsCompany(id)) {
+        return false;
+    }
+    let elapsed = crate::map_dynamic::transit::elapsed_ticks(&sim.resources).0;
+    let mut map = sim.map_mut();
+    let open = map
+        .get(building)
+        .and_then(Building::development)
+        .is_some_and(|site| site.business == Some(GrowableBusinessState::Open));
+    if open {
+        map.set_growable_business_state(
+            building,
+            GrowableBusinessState::ClosedUntil {
+                retry_elapsed_tick: elapsed.saturating_add(24 * TICKS_PER_HOUR),
+            },
+        );
+    }
+    open
+}
+
+/// Mark the site before its company departs. The residence leaf settles the marked homes as a batch.
+pub fn mark_site_abandoned(sim: &mut Simulation, building: BuildingID) -> bool {
+    let now = crate::map_dynamic::transit::elapsed_ticks(&sim.resources).0;
+    let marked = sim.map_mut().mark_growable_abandoned(building, now);
+    if marked {
+        let owner = sim.read::<BuildingInfos>().owner(building);
+        if let Some(SoulID::GoodsCompany(company)) = owner {
+            close_business(sim, company);
+        }
+    }
+    marked
+}
+
 pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: CompanyEnt) {
+    let building = company.comp.building;
+    let (profiled, shared_address) = sim.map().get(building).map_or((false, false), |building| {
+        (building.development().is_some(), building.is_mixed_use())
+    });
+    if profiled {
+        mark_business_closed(sim, id, building);
+    }
     cancel_removed(sim, CargoRemoval::Soul(SoulID::GoodsCompany(id)));
     sim.write::<CargoBook>().forget_company(id);
     write_off_physical_stock(sim, SoulID::GoodsCompany(id), company.comp.proto);
@@ -216,7 +282,43 @@ pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: Comp
         }
     }
     clear_soul_references(sim, SoulID::GoodsCompany(id));
-    clear_building_references(sim, company.comp.building, None);
+    if shared_address {
+        clear_company_workers(sim, id, &company);
+    } else {
+        clear_building_references(sim, building, None);
+    }
+}
+
+fn clear_company_workers(sim: &mut Simulation, id: CompanyID, company: &CompanyEnt) {
+    let workplace = company.comp.building;
+    let (world, resources) = sim.world_res();
+    let mut parking = resources.write::<ParkingManagement>();
+    for &worker in &company.workers.0 {
+        let Some(human) = world.humans.get_mut(worker) else {
+            continue;
+        };
+        if !human
+            .work
+            .as_ref()
+            .is_some_and(|work| work.employer == Some(id))
+        {
+            continue;
+        }
+
+        human.work = None;
+        human.household.attended_shift = None;
+        resources.write::<Market>().buy(
+            SoulID::Human(worker),
+            human.trans.pos.xy(),
+            ItemID::new("job-opening"),
+            1,
+        );
+        let pending_commute = matches!(human.decision.kind,
+            HumanDecisionKind::GoTo(Destination::Building(building)) if building == workplace);
+        if human.router.commutes_to(workplace) || pending_commute {
+            cancel_trip(worker, human, resources, &mut parking);
+        }
+    }
 }
 
 /// Physical stock leaves with its company. Record it once in the itemized
@@ -665,6 +767,7 @@ fn decision_references_buildings(
 ) -> bool {
     match decision {
         HumanDecisionKind::GoTo(Destination::Building(id))
+        | HumanDecisionKind::GoHome(id)
         | HumanDecisionKind::VisitLeisure(id)
         | HumanDecisionKind::DeliverAtBuilding(id)
         | HumanDecisionKind::DeliverLoad {
@@ -711,6 +814,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
         if let Some(work) = &mut human.work {
             if buildings.contains_key(&work.workplace) {
                 human.work = None;
+                human.household.attended_shift = None;
                 resources.write::<Market>().buy(
                     SoulID::Human(human_id),
                     human.trans.pos.xy(),

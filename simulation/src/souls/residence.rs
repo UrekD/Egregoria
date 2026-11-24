@@ -8,8 +8,8 @@ use crate::{Simulation, SoulID};
 use geom::{Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use prototypes::{
-    try_prototype, CompanyKind, ItemID, ResidencePrototype, ResidencePrototypeID, ServiceKind,
-    Tick, TICKS_PER_HOUR,
+    try_prototype, CompanyKind, GrowableChainKey, GrowableZoneKind, ItemID, ResidencePrototype,
+    ResidencePrototypeID, ServiceKind, Tick, TICKS_PER_HOUR,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -136,7 +136,14 @@ impl Residences {
 }
 
 pub(crate) fn prototype(density: Density, level: u8) -> Option<&'static ResidencePrototype> {
-    ResidencePrototype::iter().find(|proto| proto.density == density && proto.level == level)
+    let registry = prototypes::prototypes();
+    registry
+        .residence_for_chain(GrowableChainKey {
+            zone_kind: GrowableZoneKind::default(),
+            density,
+            level,
+        })
+        .or_else(|| registry.legacy_residence(density, level))
 }
 
 pub fn on_house_built(sim: &Simulation, building: BuildingID) {

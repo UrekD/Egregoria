@@ -1,4 +1,4 @@
-use crate::gui::zoning::{zone_name, ZONES};
+use crate::gui::zoning::zone_name;
 use crate::uiworld::UiWorld;
 use goryak::{
     mincolumn, minrow, monospace, on_secondary_container, selectable_label_primary, textc, titlec,
@@ -7,6 +7,7 @@ use goryak::{
 use simulation::economy::{
     Budget, BudgetCategory, Government, MAX_TAX_RATE_PERMILLE, TICKS_PER_BUDGET_DAY,
 };
+use simulation::map::ZoneKind;
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 use yakui::widgets::{List, Pad, Slider};
@@ -48,10 +49,10 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
                     (BudgetCategory::MilestoneGrant, "Milestone grants"),
                     (BudgetCategory::TradeImport, "Imports"),
                     (BudgetCategory::TradeExport, "Exports"),
-                    (BudgetCategory::Tax(ZONES[0]), "Residential tax"),
-                    (BudgetCategory::Tax(ZONES[1]), "Commercial tax"),
-                    (BudgetCategory::Tax(ZONES[2]), "Industrial tax"),
-                    (BudgetCategory::Tax(ZONES[3]), "Office tax"),
+                    (BudgetCategory::Tax(ZoneKind::TAXABLE[0]), "Residential tax"),
+                    (BudgetCategory::Tax(ZoneKind::TAXABLE[1]), "Commercial tax"),
+                    (BudgetCategory::Tax(ZoneKind::TAXABLE[2]), "Industrial tax"),
+                    (BudgetCategory::Tax(ZoneKind::TAXABLE[3]), "Office tax"),
                     (BudgetCategory::RoadUpkeep, "Road upkeep"),
                     (
                         BudgetCategory::SpecialBuildingUpkeep,
@@ -72,7 +73,7 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
             });
             mincolumn(3.0, || {
                 titlec(color, "Tax rates");
-                for zone in ZONES {
+                for zone in ZoneKind::TAXABLE {
                     let rate = budget.tax_rate(zone);
                     textc(
                         color,

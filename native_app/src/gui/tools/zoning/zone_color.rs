@@ -6,6 +6,7 @@ pub fn zone_color(kind: ZoneKind) -> LinearColor {
         ZoneKind::Residential => LinearColor::new(0.22, 0.78, 0.32, 1.0),
         ZoneKind::Commercial => LinearColor::new(0.19, 0.55, 0.99, 1.0),
         ZoneKind::Industrial => LinearColor::new(0.98, 0.63, 0.13, 1.0),
+        ZoneKind::MixedUse => LinearColor::new(0.03, 0.67, 0.61, 1.0),
         ZoneKind::Office => LinearColor::new(0.69, 0.38, 0.94, 1.0),
     }
 }
@@ -23,6 +24,8 @@ pub fn zone_cell_color(kind: ZoneKind, density: Density) -> LinearColor {
         (ZoneKind::Industrial, Density::Low) => [0.894, 0.527, 0.236],
         (ZoneKind::Industrial, Density::Medium) => [0.782, 0.308, 0.073],
         (ZoneKind::Industrial, Density::High) => [0.556, 0.149, 0.015],
+        (ZoneKind::MixedUse, Density::Low | Density::Medium) => [0.039, 0.600, 0.535],
+        (ZoneKind::MixedUse, Density::High) => [0.010, 0.337, 0.292],
         (ZoneKind::Office, Density::Low) => [0.713, 0.492, 0.963],
         (ZoneKind::Office, Density::Medium) => [0.514, 0.300, 0.842],
         (ZoneKind::Office, Density::High) => [0.309, 0.124, 0.601],

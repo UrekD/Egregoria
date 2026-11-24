@@ -177,10 +177,13 @@ fn w0_water_zoning_checks_land_before_water_and_votes_from_prepared_cells() {
     let wet = OBB::new(vec2(8.0, 8.0), Vec2::X, 16.0, 16.0);
     let kind = Some(ZoneKind::Residential);
     let map = sim.map();
-    let locked = ZoneGrid::eligible_paint_cells_with_land(&map, &mixed, kind, |key| key != (0, 0));
+    let locked =
+        ZoneGrid::eligible_paint_cells_with_land(&map, &mixed, kind, Density::Low, |key| {
+            key != (0, 0)
+        });
     assert!(matches!(locked, Err(ZonePaintError::TileLocked((0, 0)))));
     assert!(matches!(
-        ZoneGrid::eligible_paint_cells(&map, &wet, kind),
+        ZoneGrid::eligible_paint_cells(&map, &wet, kind, Density::Low),
         Err(ZonePaintError::WetFootprint)
     ));
     drop(map);
@@ -198,16 +201,16 @@ fn w0_water_zoning_checks_land_before_water_and_votes_from_prepared_cells() {
         }
     }
     let map = sim.map();
-    let paint = ZoneGrid::eligible_paint_cells(&map, &mixed, kind).unwrap();
-    let erase = ZoneGrid::eligible_paint_cells(&map, &mixed, None).unwrap();
+    let paint = ZoneGrid::eligible_paint_cells(&map, &mixed, kind, Density::Low).unwrap();
+    let erase = ZoneGrid::eligible_paint_cells(&map, &mixed, None, Density::Low).unwrap();
     assert_eq!(paint.cells(), &[(2, 0), (2, 1), (3, 0), (3, 1)]);
     assert_eq!(erase.cells().len(), 8);
     drop(map);
 
     for (prepared, kind) in [(paint, kind), (erase, None)] {
-        let vote =
-            sim.read::<ZoneGrid>()
-                .lot_zone_after_prepared_paint(&mixed, &prepared, Density::Low);
+        let vote = sim
+            .read::<ZoneGrid>()
+            .lot_zone_after_prepared_paint(&mixed, &prepared);
         sim.apply_commands([&WorldCommand::ZonePaint {
             area: mixed,
             kind,
@@ -828,4 +831,329 @@ fn w0_water_profile_samples_include_split_road_rebuilds() {
         [("MapMakeConnection", Rejection::WaterWorkLimit)]
     );
     assert_eq!(sim.hashes()["map"], before);
+}
+
+#[test]
+fn zones2_mix_payload_rejections_leave_replay_and_paint_unchanged() {
+    use crate::economy::Budget;
+    use crate::map::{Density, ZoneCell, ZoneGrid, ZoneKind, ZonePaintError};
+    use crate::world_command::{CommandOutcomes, Rejection, WorldCommands};
+    use crate::{MapPreset, NewGameOptions, Replay};
+    use common::saveload::{Bincode, JSON};
+    use geom::OBB;
+
+    init_test_simulation();
+    let mut sim = Simulation::new_game_with_replay(&NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: NewGameOptions::MIN_TERRAIN_CHUNKS,
+        ..NewGameOptions::default()
+    })
+    .unwrap();
+    for (index, kind) in ZoneKind::ALL.into_iter().enumerate() {
+        let wire = Bincode::encode(&kind).unwrap();
+        assert_eq!(wire, [index as u8]);
+        assert_eq!(Bincode::decode::<ZoneKind>(&wire).unwrap(), kind);
+        assert_eq!(
+            JSON::decode::<ZoneKind>(&JSON::encode(&kind).unwrap()).unwrap(),
+            kind
+        );
+    }
+    for (index, density) in [Density::Low, Density::High, Density::Medium]
+        .into_iter()
+        .enumerate()
+    {
+        assert_eq!(Bincode::encode(&density).unwrap(), [index as u8]);
+    }
+    let mixed = JSON::decode(br#""MixedUse""#).expect("mixed-use wire kind");
+    let area = OBB::new(Vec2::splat(160.0), Vec2::X, 16.0, 16.0);
+    let paint = |area, kind, density| WorldCommand::ZonePaint {
+        area,
+        kind,
+        density,
+    };
+    let low = paint(area, Some(mixed), Density::Low);
+    let tax = WorldCommand::SetTaxRate {
+        zone: mixed,
+        rate_permille: 100,
+    };
+    let malformed = paint(OBB::ZERO, Some(mixed), Density::High);
+    let invalid_rate = WorldCommand::SetTaxRate {
+        zone: ZoneKind::Commercial,
+        rate_permille: u16::MAX,
+    };
+
+    let unsupported = ZonePaintError::UnsupportedDensity {
+        kind: mixed,
+        density: Density::Low,
+    };
+    assert_eq!(
+        ZoneGrid::eligible_paint_stroke(&sim.map(), &[area], Some(mixed), Density::Low),
+        Err(unsupported),
+    );
+    assert_eq!(
+        sim.write::<ZoneGrid>()
+            .paint_on_map(&sim.map(), &area, Some(mixed), Density::Low),
+        Err(unsupported),
+    );
+
+    let before = sim.read::<Replay>().command_count();
+    let budget_before = Bincode::encode(&*sim.read::<Budget>()).unwrap();
+    low.apply(&mut sim);
+    assert_eq!(
+        sim.read::<CommandOutcomes>().last,
+        [(
+            "ZonePaint",
+            Rejection::UnsupportedDensity {
+                kind: mixed,
+                density: Density::Low
+            }
+        )],
+    );
+
+    let round_trip = |commands| -> WorldCommands {
+        Bincode::decode(&Bincode::encode(&WorldCommands::from(commands)).unwrap()).unwrap()
+    };
+    let rejected = round_trip(vec![low, tax, malformed, invalid_rate]);
+    sim.apply_commands(&rejected.commands);
+    {
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert!(outcomes.accepted.is_empty());
+        assert_eq!(
+            outcomes.last,
+            [
+                (
+                    "ZonePaint",
+                    Rejection::UnsupportedDensity {
+                        kind: mixed,
+                        density: Density::Low
+                    }
+                ),
+                ("SetTaxRate", Rejection::UnsupportedTax(mixed)),
+                ("ZonePaint", Rejection::InvalidZone),
+                ("SetTaxRate", Rejection::InvalidTaxRate),
+            ],
+        );
+    }
+    assert_eq!(
+        Bincode::encode(&*sim.read::<Budget>()).unwrap(),
+        budget_before
+    );
+    assert_eq!(sim.read::<Replay>().command_count(), before);
+    assert_eq!(sim.read::<ZoneGrid>().generation(), 0);
+    assert!(sim.read::<ZoneGrid>().cells().is_empty());
+
+    for density in [Density::Medium, Density::High] {
+        let batch = round_trip(vec![paint(area, Some(mixed), density)]);
+        sim.apply_commands(&batch.commands);
+        assert_eq!(
+            sim.read::<ZoneGrid>().lot_zone(&area),
+            Some(ZoneCell {
+                kind: mixed,
+                density
+            })
+        );
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+    }
+    let replay = sim.read::<Replay>().clone();
+    let (mut replayed, mut loader) = Simulation::try_from_replay(replay).unwrap();
+    assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
+    assert_eq!(
+        replayed.read::<ZoneGrid>().cells(),
+        sim.read::<ZoneGrid>().cells()
+    );
+    assert_eq!(replayed.read::<ZoneGrid>().generation(), 2);
+
+    paint(area, None, Density::High).apply(&mut sim);
+    assert!(sim.read::<ZoneGrid>().cells().is_empty());
+    assert_eq!(sim.read::<Replay>().command_count(), before + 3);
+}
+
+#[test]
+fn zones2_checked_placement_registers_one_home_and_preserves_a_rejected_parcel() {
+    use crate::map::{Density, GrowableLotError, Lot, ZoneCell, ZoneKind};
+    use crate::souls::{growth, residence::Residences};
+
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[Vec3::new(100.0, 100.0, 0.0), Vec3::new(400.0, 100.0, 0.0)]);
+    let (lot, road) = {
+        let map = test.g.map();
+        let lot = map
+            .lots()
+            .values()
+            .find(|lot| !Lot::footprint_obstructed(&map, lot.shape, false))
+            .unwrap();
+        (lot.id, lot.parent)
+    };
+    let mixed = ZoneCell {
+        kind: ZoneKind::MixedUse,
+        density: Density::Medium,
+    };
+    let before = test.g.hashes();
+    assert_eq!(
+        test.g.place_zoned_growable(lot, mixed),
+        Err(GrowableLotError::MixedUseDisabled)
+    );
+    assert_eq!(test.g.hashes(), before);
+
+    let zone = ZoneCell {
+        kind: ZoneKind::Residential,
+        density: Density::Low,
+    };
+    let placed = test.g.place_zoned_growable(lot, zone).unwrap();
+    assert!(test.g.map().get(lot).is_none());
+    assert_eq!(
+        test.g
+            .map()
+            .lot_origin(placed.building)
+            .unwrap()
+            .parent_road,
+        road
+    );
+    assert!(test
+        .g
+        .read::<BuildingInfos>()
+        .get(placed.building)
+        .is_some());
+    let homes = test.g.read::<Residences>();
+    assert_eq!(homes.by_building.len(), 1);
+    assert_eq!(
+        homes.by_building[&placed.building].capacity,
+        placed.housing_slots
+    );
+    assert_eq!(placed.job_slots, 0);
+    drop(homes);
+
+    let other = {
+        let map = test.g.map();
+        map.lots()
+            .values()
+            .find(|lot| lot.parent == road && !Lot::footprint_obstructed(&map, lot.shape, false))
+            .unwrap()
+            .id
+    };
+    let prepared = growth::plan_growable(&test.g, other, zone).unwrap();
+    test.g.map_mut().remove_road(road).unwrap();
+    let before = test.g.hashes();
+    assert_eq!(
+        test.g.commit_prepared_growable(prepared),
+        Err(GrowableLotError::MissingLot)
+    );
+    assert_eq!(test.g.hashes(), before);
+}
+
+#[test]
+fn zones2_profiled_business_slots_and_closure_are_authoritative() {
+    use crate::map::{
+        Density, GrowableBusinessState, GrowableDevelopment, GrowableSiteState,
+        PreparedGrowableAppearance, UpdateType, ZoneCell, ZoneKind,
+    };
+    use crate::map_dynamic::{active_business, effective_load};
+    use crate::souls::{goods_company::company_soul, growth, lifecycle};
+    use crate::{GrowablePlan, SoulID};
+
+    let mut test = TestCtx::new_fast();
+    test.build_roads(&[Vec3::new(100.0, 100.0, 0.0), Vec3::new(400.0, 100.0, 0.0)]);
+    let zone = ZoneCell {
+        kind: ZoneKind::Commercial,
+        density: Density::Low,
+    };
+    let (plan, proto, door) = {
+        let map = test.g.map();
+        let site = map
+            .lots()
+            .values()
+            .find_map(|lot| growth::check_growable_lot(&map, lot, zone).ok())
+            .unwrap();
+        let proto = site.company.unwrap().base.id;
+        let door = site.shape.center().z(0.1);
+        let plan = GrowablePlan::prepare(
+            &map,
+            site,
+            Some(PreparedGrowableAppearance {
+                development: GrowableDevelopment {
+                    zone,
+                    level: 1,
+                    floors: 1,
+                    roof_z: 4.0,
+                    approved_value_band: 0,
+                    home: None,
+                    planned_jobs: 18,
+                    site: GrowableSiteState::Active,
+                    business: Some(GrowableBusinessState::AwaitingSpawn),
+                },
+                base_z: 0.0,
+                door,
+                mesh: Default::default(),
+            }),
+            None,
+            18,
+        )
+        .unwrap();
+        (plan, proto, door)
+    };
+    let placed = test.g.commit_prepared_growable(plan).unwrap();
+    assert_eq!(placed.job_slots, 18);
+    assert_eq!(
+        test.g
+            .growable_summary(placed.building)
+            .unwrap()
+            .active_job_slots,
+        0
+    );
+    let SoulID::GoodsCompany(company) = company_soul(&mut test.g, placed.building, proto).unwrap()
+    else {
+        panic!("expected a company");
+    };
+    assert_eq!(test.g.get(company).unwrap().comp.max_workers, 18);
+    assert!(company_soul(&mut test.g, placed.building, proto).is_none());
+    let mut dirty = test.g.map().subscribe(UpdateType::Building);
+    {
+        let mut map = test.g.map_mut();
+        let mut next = map
+            .get(placed.building)
+            .unwrap()
+            .development()
+            .unwrap()
+            .clone();
+        next.level = 2;
+        next.roof_z += 0.25;
+        assert!(map.update_growable_appearance(
+            placed.building,
+            PreparedGrowableAppearance {
+                development: next,
+                base_z: 0.0,
+                door,
+                mesh: Default::default(),
+            }
+        ));
+    }
+    assert_eq!(dirty.take_updated_chunks().count(), 1);
+    let upgraded = test.g.growable_summary(placed.building).unwrap();
+    assert_eq!(
+        (
+            upgraded.level,
+            upgraded.planned_jobs,
+            upgraded.active_job_slots
+        ),
+        (2, 18, 18)
+    );
+    assert_eq!(
+        test.g.read::<BuildingInfos>().owner(placed.building),
+        Some(SoulID::GoodsCompany(company))
+    );
+
+    assert!(lifecycle::close_business(&mut test.g, company));
+    assert!(!lifecycle::close_business(&mut test.g, company));
+    let map = test.g.map();
+    let building = map.get(placed.building).unwrap();
+    let active = active_business(building, &test.g.read::<BuildingInfos>(), test.g.world());
+    assert!(active.is_none());
+    assert_eq!(effective_load(building, None, active).water_demand(), 0.0);
+    drop(map);
+    let closed = test.g.growable_summary(placed.building).unwrap();
+    assert_eq!((closed.planned_jobs, closed.active_job_slots), (18, 0));
+    assert!(matches!(
+        closed.business,
+        Some(GrowableBusinessState::ClosedUntil { .. })
+    ));
 }

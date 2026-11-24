@@ -155,6 +155,8 @@ pub enum Rejection {
     InvalidBuilding,
     InvalidZone,
     InvalidTaxRate,
+    UnsupportedDensity { kind: ZoneKind, density: Density },
+    UnsupportedTax(ZoneKind),
     InvalidTrain,
     InvalidTerraform,
     TooManyRandomCars,
@@ -178,6 +180,9 @@ impl From<ZonePaintError> for Rejection {
     fn from(error: ZonePaintError) -> Self {
         match error {
             ZonePaintError::InvalidArea => Self::InvalidZone,
+            ZonePaintError::UnsupportedDensity { kind, density } => {
+                Self::UnsupportedDensity { kind, density }
+            }
             ZonePaintError::TileLocked(_) => Self::TileLocked,
             ZonePaintError::WetFootprint => Self::WetFootprint,
         }
@@ -820,8 +825,30 @@ impl WorldCommand {
             return;
         }
 
+        if matches!(self, MapBuildSpecialBuilding { kind, .. } if kind.is_mixed_growable()) {
+            self.reject(sim, Rejection::InvalidBuilding);
+            return;
+        }
+
         if let Err(reason) = self.validate_progression(sim) {
             self.reject(sim, reason);
+            return;
+        }
+
+        let zoning_result = match self {
+            ZonePaint {
+                area,
+                kind,
+                density,
+            } => Some(Self::apply_zone_paint(sim, area, *kind, *density, |_| true)),
+            SetTaxRate { .. } => Some(self.apply_one(sim, construction)),
+            _ => None,
+        };
+        if let Some(result) = zoning_result {
+            match result {
+                Ok(()) => self.record_for_replay(sim),
+                Err(reason) => self.reject(sim, reason),
+            }
             return;
         }
 
@@ -872,11 +899,6 @@ impl WorldCommand {
         }
 
         let result = match self {
-            ZonePaint {
-                area,
-                kind,
-                density,
-            } => Self::apply_zone_paint(sim, area, *kind, *density, |_| true),
             MapMakeMultipleConnections(projects, links) => self
                 .apply_connections(sim, projects, links, construction)
                 .map(|_| ()),
@@ -1049,7 +1071,7 @@ impl WorldCommand {
                 zone,
                 connected_road,
             } => {
-                if !Building::valid_footprint(pos, *gen) {
+                if kind.is_mixed_growable() || !Building::valid_footprint(pos, *gen) {
                     return Err(Rejection::InvalidBuilding);
                 }
                 let zoneable = match *kind {
@@ -1109,11 +1131,21 @@ impl WorldCommand {
                 }
                 true
             }
-            ZonePaint { area, kind, .. } => {
-                ZoneGrid::eligible_paint_cells(map, area, *kind)?;
+            ZonePaint {
+                area,
+                kind,
+                density,
+            } => {
+                ZoneGrid::eligible_paint_cells(map, area, *kind, *density)?;
                 true
             }
-            SetTaxRate { rate_permille, .. } => {
+            SetTaxRate {
+                zone,
+                rate_permille,
+            } => {
+                if !zone.is_taxable() {
+                    return Err(Rejection::UnsupportedTax(*zone));
+                }
                 if *rate_permille > crate::economy::MAX_TAX_RATE_PERMILLE {
                     return Err(Rejection::InvalidTaxRate);
                 }
@@ -1331,13 +1363,9 @@ impl WorldCommand {
                     .ok_or(Rejection::MutationFailed)?;
             }
             MapRemoveBuilding(id) => {
-                let was_external_target = sim.map().external_train_stations.first() == Some(&id);
-                let building = sim
-                    .map_mut()
-                    .remove_building(id)
-                    .ok_or(Rejection::MutationFailed)?;
-                residence::on_building_removed(sim, id);
-                crate::souls::lifecycle::remove_building(sim, building, was_external_target);
+                if !crate::souls::lifecycle::remove_site(sim, id) {
+                    return Err(Rejection::MutationFailed);
+                }
             }
             MapBuildHouse(id) => {
                 let building = sim

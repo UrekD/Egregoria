@@ -677,3 +677,127 @@ fn s5_medium_density_lua_and_ordinal() {
         assert_eq!(density.ordinal(), ordinal);
     }
 }
+
+fn zones2_validation_result(extra_lua: &str) -> Result<(), String> {
+    let lua = zones2_lua();
+    lua.load(extra_lua).exec().unwrap();
+    let data: mlua::Table = lua.globals().get("data").unwrap();
+    prototype_result(data.sequence_values::<mlua::Table>().map(Result::unwrap))
+}
+
+#[test]
+fn zones2_validation_rejects_both_parent_shadow_orders() {
+    for change in ["data:extend(shadow)", "table.insert(data, 1, shadow)"] {
+        let error = zones2_validation_result(&format!(
+            r#"local shadow = {{
+                type = "goods-company", name = "mixed-medium-l1", label = "Shadow Shop",
+                size = 20, bgen = "house", asset = "bakery.glb", price = 0,
+                kind = "store", n_workers = 1025,
+            }}
+            {change}"#
+        ))
+        .expect_err(change);
+        assert!(
+            error.contains("mixed-medium-l1") && error.contains("prototype type"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn zones2_validation_rejects_mixed_warehouse_in_either_order() {
+    for change in ["data:extend(warehouse)", "table.insert(data, 1, warehouse)"] {
+        let error = zones2_validation_result(&format!(
+            r#"local warehouse
+            local index
+            for i, shop in ipairs(data) do
+                if shop.name == "mixed-medium-l1" then
+                    warehouse = shop
+                    index = i
+                end
+            end
+            table.remove(data, index)
+            warehouse.storage = {{
+                capacity_units = 64, accepted_items = {{"goods"}},
+                low_water_units = 16, high_water_units = 48,
+            }}
+            {change}"#
+        ))
+        .expect_err(change);
+        assert!(
+            error.contains("mixed-medium-l1") && error.contains("storage"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn zones2_validation_checks_canonical_low_recipe_parity() {
+    for (change, field) in [
+        ("shop.recipe.consumption[1][2] = 3", "recipe.consumption"),
+        ("shop.recipe.production[1][2] = 2", "recipe.production"),
+        ("shop.recipe.duration = '720s'", "recipe.duration"),
+        (
+            "shop.recipe.storage_multiplier = 8",
+            "recipe.storage_multiplier",
+        ),
+    ] {
+        let error = zones2_validation_result(&format!(
+            r#"for _, shop in ipairs(data) do
+                if shop.name == "mixed-medium-l1" then {change} end
+            end"#
+        ))
+        .expect_err(field);
+        assert!(
+            error.contains("mixed-medium-l1") && error.contains(field),
+            "{error}"
+        );
+    }
+    zones2_validation_result(
+        r#"for _, shop in ipairs(data) do
+            if shop.name == "mixed-medium-l1" then
+                local outputs = shop.recipe.production
+                outputs[1], outputs[2] = outputs[2], outputs[1]
+            end
+        end"#,
+    )
+    .unwrap();
+}
+
+#[test]
+fn zones2_validation_checks_stock_after_next_batch() {
+    let production = |amount| {
+        format!(
+            r#"for _, firm in ipairs(data) do
+                if firm.name == "commercial-medium-l1" then
+                    firm.recipe.production[1][2] = {amount}
+                end
+            end"#
+        )
+    };
+    let error =
+        zones2_validation_result(&production(160_000_000)).expect_err("post-batch overflow");
+    assert!(
+        error.contains("commercial-medium-l1") && error.contains("post-batch"),
+        "{error}"
+    );
+    zones2_validation_result(&production(153_391_689)).unwrap();
+    let error =
+        zones2_validation_result(&production(153_391_690)).expect_err("first unsafe amount");
+    assert!(error.contains("post-batch"), "{error}");
+}
+
+#[test]
+fn zones2_paint_kind_lua_accepts_all_five_kinds() {
+    use crate::ZoneKind;
+
+    let lua = mlua::Lua::new();
+    for (ordinal, kind) in ZoneKind::ALL.into_iter().enumerate() {
+        let token = lua.create_string(kind.lua_token()).unwrap();
+        let parsed: ZoneKind = lua.unpack(mlua::Value::String(token)).unwrap();
+        assert_eq!(parsed, kind);
+        assert_eq!(usize::from(parsed.ordinal()), ordinal);
+    }
+    assert_eq!(ZoneKind::MixedUse.abbreviation(), "MX");
+    assert!(!ZoneKind::MixedUse.is_taxable());
+}

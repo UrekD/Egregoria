@@ -675,6 +675,8 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         (_, InvalidBatchIndex) => "Invalid connection group",
         (_, InvalidBuilding) => "Building cannot be placed here",
         (_, InvalidZone) => "Zoning area is outside the map or too large",
+        (_, UnsupportedDensity { .. }) => "Mixed Use requires Medium or High density",
+        (_, UnsupportedTax(_)) => "Mixed Use has no separate tax rate",
         (_, InvalidTaxRate) => "Tax rate is outside the allowed range",
         (_, InvalidTerraform) => "Terrain edit is outside the allowed range",
         (_, TooManyRandomCars) => "A command can spawn at most 1,000 random cars",

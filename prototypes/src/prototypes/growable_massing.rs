@@ -23,16 +23,16 @@ pub enum GrowableZoneKind {
 impl GrowableZoneKind {
     pub const fn ordinal(self) -> u8 {
         match self {
-            Self::Pure(ZoneKind::Residential) => 0,
-            Self::Pure(ZoneKind::Commercial) => 1,
-            Self::Pure(ZoneKind::Industrial) => 2,
-            Self::Pure(ZoneKind::Office) => 3,
-            Self::MixedUse => 4,
+            Self::Pure(kind) => kind.ordinal(),
+            Self::MixedUse => ZoneKind::MixedUse.ordinal(),
         }
     }
 
     pub const fn supports_density(self, density: Density) -> bool {
-        !matches!((self, density), (Self::MixedUse, Density::Low))
+        match self {
+            Self::Pure(kind) => kind.supports_density(density),
+            Self::MixedUse => ZoneKind::MixedUse.supports_density(density),
+        }
     }
 }
 

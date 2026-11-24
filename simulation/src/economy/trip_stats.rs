@@ -57,6 +57,14 @@ impl DailyEconomyMetrics {
         }
     }
 
+    pub(crate) fn record_local_pickup(&mut self, elapsed_tick: u64) {
+        let day = self
+            .days
+            .entry(elapsed_tick / TICKS_PER_BUDGET_DAY)
+            .or_default();
+        day.local_pickups += 1;
+    }
+
     pub fn record_arrival(&mut self, day: u64, purpose: TripPurpose, ticks: u64) {
         let trip = self.days.entry(day).or_default().trips_by_purpose.entry(purpose).or_default();
         trip.completed += 1;
@@ -76,6 +84,8 @@ pub struct EconomyDayMetrics {
     pub utility_served_demand: Option<f64>,
     pub utility_total_demand: Option<f64>,
     pub trips_by_purpose: BTreeMap<TripPurpose, TripModeStats>,
+    #[serde(default)]
+    pub local_pickups: u64,
 }
 
 // The first three variants retain the serialized values of the original trip modes.

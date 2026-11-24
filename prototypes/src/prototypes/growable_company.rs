@@ -14,18 +14,64 @@ pub enum ZoneKind {
     Commercial,
     Industrial,
     Office,
+    MixedUse,
+}
+
+impl ZoneKind {
+    pub const ALL: [Self; 5] = [
+        Self::Residential,
+        Self::Commercial,
+        Self::Industrial,
+        Self::Office,
+        Self::MixedUse,
+    ];
+    pub const TAXABLE: [Self; 4] = [
+        Self::Residential,
+        Self::Commercial,
+        Self::Industrial,
+        Self::Office,
+    ];
+
+    pub const fn ordinal(self) -> u8 {
+        self as u8
+    }
+
+    pub const fn supports_density(self, density: Density) -> bool {
+        !matches!((self, density), (Self::MixedUse, Density::Low))
+    }
+
+    pub const fn is_taxable(self) -> bool {
+        !matches!(self, Self::MixedUse)
+    }
+
+    pub const fn abbreviation(self) -> &'static str {
+        match self {
+            Self::Residential => "R",
+            Self::Commercial => "C",
+            Self::Industrial => "I",
+            Self::Office => "O",
+            Self::MixedUse => "MX",
+        }
+    }
+
+    pub const fn lua_token(self) -> &'static str {
+        match self {
+            Self::Residential => "residential",
+            Self::Commercial => "commercial",
+            Self::Industrial => "industrial",
+            Self::Office => "office",
+            Self::MixedUse => "mixed-use",
+        }
+    }
 }
 
 impl<'lua> FromLua<'lua> for ZoneKind {
     fn from_lua(value: Value<'lua>, lua: &'lua Lua) -> mlua::Result<Self> {
         let kind = String::from_lua(value, lua)?;
-        match kind.as_str() {
-            "residential" => Ok(Self::Residential),
-            "commercial" => Ok(Self::Commercial),
-            "industrial" => Ok(Self::Industrial),
-            "office" => Ok(Self::Office),
-            _ => Err(mlua::Error::external(format!("Unknown zone kind: {kind}"))),
-        }
+        Self::ALL
+            .into_iter()
+            .find(|zone| zone.lua_token() == kind)
+            .ok_or_else(|| mlua::Error::external(format!("Unknown zone kind: {kind}")))
     }
 }
 
@@ -73,6 +119,7 @@ impl Prototype for GrowableCompanyPrototype {
         let massing = get_lua::<Option<GrowableMassing>>(table, "massing")?;
         let profiled = massing.is_some() || kind == GrowableZoneKind::MixedUse;
         let level = if profiled {
+            crate::validation::validate_profile_power_fields(table)?;
             profile_integer(table.get("level")?, 5, "level")? as u8
         } else {
             get_lua(table, "level")?
