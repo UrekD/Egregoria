@@ -25,6 +25,48 @@ mod test_iso;
 mod vehicles;
 mod zone2_lot_layout;
 
+#[test]
+fn w0_water_height_free_change_records_once_and_retry_is_clean() {
+    use crate::map::{WaterDirtyChunks, WaterEdit};
+    use crate::{MapPreset, NewGameOptions, Replay};
+
+    init_test_simulation();
+    let mut sim = Simulation::new_game_with_replay(&NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: NewGameOptions::MIN_TERRAIN_CHUNKS,
+        ..NewGameOptions::default()
+    })
+    .unwrap();
+    let initial_revision = sim.map().environment.water_revision();
+    let initial_commands = sim.read::<Replay>().command_count();
+    let edit = WaterEdit::SetSeaLevel { level_dm: Some(-100) };
+
+    let outcome = sim.edit_water(edit.clone()).unwrap();
+    assert!(outcome.changed);
+    assert!(outcome.dirty.terrain().is_empty());
+    assert_eq!(sim.map().environment.sea_level_dm(), Some(-100));
+    assert_eq!(sim.map().environment.water_revision(), initial_revision + 1);
+    {
+        let replay = sim.read::<Replay>();
+        assert_eq!(replay.command_count(), initial_commands + 1);
+        assert!(matches!(
+            replay.commands(initial_commands..initial_commands + 1).next(),
+            Some(WorldCommand::EditWater(WaterEdit::SetSeaLevel { level_dm: Some(-100) }))
+        ));
+    }
+
+    let retry = sim.edit_water(edit).unwrap();
+    assert!(!retry.changed);
+    assert_eq!(retry.dirty, WaterDirtyChunks::default());
+    assert_eq!(sim.map().environment.water_revision(), initial_revision + 1);
+    assert_eq!(sim.read::<Replay>().command_count(), initial_commands + 1);
+
+    let replay = sim.read::<Replay>().clone();
+    let (mut replayed, mut loader) = Simulation::try_from_replay(replay).unwrap();
+    assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
+    assert_eq!(replayed.map().environment.sea_level_dm(), Some(-100));
+    assert_eq!(replayed.map().environment.water_revision(), initial_revision + 1);
+}
 fn init_test_simulation() {
     // SAFETY: Simulation unit tests run serially because they replace the global registry.
     unsafe { crate::init::load_prototypes() };

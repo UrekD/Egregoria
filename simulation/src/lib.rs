@@ -3,7 +3,7 @@
 #![warn(clippy::iter_over_hash_type)]
 
 use crate::init::{GSYSTEMS, INIT_FUNCS, SAVELOAD_FUNCS};
-use crate::map::{BuildingKind, LotLayout, Map};
+use crate::map::{BuildingKind, LotLayout, Map, WaterEdit, WaterEditError, WaterEditOutcome};
 use crate::map_dynamic::{transit, Itinerary, ItineraryLeader};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
@@ -460,6 +460,14 @@ impl Simulation {
     /// Applies a command batch without advancing the simulation clock.
     pub fn apply_commands<'a>(&mut self, commands: impl IntoIterator<Item = &'a WorldCommand>) {
         self.apply_command_batch(commands, false, BudgetCategory::Construction);
+    }
+
+    pub fn edit_water(&mut self, edit: WaterEdit) -> Result<WaterEditOutcome, WaterEditError> {
+        self.apply_commands([&WorldCommand::EditWater(edit)]);
+        self.read::<CommandOutcomes>()
+            .water_edit(0)
+            .expect("EditWater always records an indexed outcome")
+            .clone()
     }
 
     fn apply_command_batch<'a>(

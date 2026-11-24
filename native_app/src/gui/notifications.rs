@@ -686,6 +686,7 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         (_, InvalidInitOptions) => "Invalid world options",
         (_, Locked { .. }) => "Locked by city progression",
         (_, InvalidWarehouse) => "Choose an active warehouse",
+        (_, WaterEditFailed) => "The water edit could not be applied",
     };
     message.into()
 }

@@ -18,7 +18,8 @@ use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
     Building, BuildingID, BuildingKind, Density, Environment, IntersectionID, LaneID, LaneKind,
     LanePattern, LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, ProjectKind,
-    RoadID, TerraformKind, TurnPolicy, Zone, ZoneGrid, ZoneKind,
+    RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, Zone,
+    ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
@@ -143,6 +144,7 @@ pub enum WorldCommand {
     },
     /// Sizes new lots and regenerates the empty lots along every frontage road.
     SetLotLayout(LotLayout),
+    EditWater(WaterEdit),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +166,7 @@ pub enum Rejection {
     InvalidInitOptions,
     Locked { milestone: u8 },
     InvalidWarehouse,
+    WaterEditFailed,
 }
 
 pub type LinkOutcome = (usize, Result<(), (&'static str, Rejection)>);
@@ -186,6 +189,7 @@ pub struct CommandOutcomes {
     command_ranges: Vec<CommandOutcomeRanges>,
     links: Vec<LinkOutcome>,
     batch_in_progress: bool,
+    water_edits: BTreeMap<usize, Result<WaterEditOutcome, WaterEditError>>,
 }
 
 impl CommandOutcomes {
@@ -212,12 +216,18 @@ impl CommandOutcomes {
             .unwrap_or_default()
     }
 
+    /// The result of an EditWater command at the given input index.
+    pub fn water_edit(&self, index: usize) -> Option<&Result<WaterEditOutcome, WaterEditError>> {
+        self.water_edits.get(&index)
+    }
+
     /// Discards the completed batch's outcomes while preserving its sequence.
     pub fn clear(&mut self) {
         self.last.clear();
         self.accepted.clear();
         self.command_ranges.clear();
         self.links.clear();
+        self.water_edits.clear();
     }
 
     pub(crate) fn begin_batch(&mut self) -> Option<Self> {
@@ -546,6 +556,7 @@ impl WorldCommand {
                 | TransitSetFare { .. }
                 | SetWarehousePolicy { .. }
                 | SetLotLayout(_)
+                | EditWater(_)
         )
     }
 
@@ -554,6 +565,19 @@ impl WorldCommand {
     }
 
     pub(crate) fn apply_in_batch(&self, sim: &mut Simulation, construction: BudgetCategory) {
+        if let EditWater(edit) = self {
+            let outcome = sim.map_mut().apply_water_edit(edit);
+            match &outcome {
+                Ok(result) if result.changed => self.record_for_replay(sim),
+                Err(_) => self.reject(sim, Rejection::WaterEditFailed),
+                Ok(_) => {}
+            }
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.rejection_ranges.len();
+            outcomes.water_edits.insert(index, outcome);
+            return;
+        }
+
         if matches!(self, Init(_)) {
             self.reject(sim, Rejection::UnexpectedInit);
             return;
@@ -575,12 +599,7 @@ impl WorldCommand {
             }
         }
 
-        {
-            let mut replay = sim.write::<Replay>();
-            if replay.enabled {
-                replay.push(sim.read::<GameTime>().tick, self.clone());
-            }
-        }
+        self.record_for_replay(sim);
         if is_transit {
             return;
         }
@@ -599,6 +618,13 @@ impl WorldCommand {
         };
         if let Err(reason) = result {
             self.reject(sim, reason);
+        }
+    }
+
+    fn record_for_replay(&self, sim: &Simulation) {
+        let mut replay = sim.write::<Replay>();
+        if replay.enabled {
+            replay.push(sim.read::<GameTime>().tick, self.clone());
         }
     }
 
@@ -639,6 +665,7 @@ impl WorldCommand {
             TransitSetFare { .. } => "TransitSetFare",
             SetWarehousePolicy { .. } => "SetWarehousePolicy",
             SetLotLayout(_) => "SetLotLayout",
+            EditWater(_) => "EditWater",
         }
     }
 
@@ -979,7 +1006,9 @@ impl WorldCommand {
                 sim.write::<BuildingInfos>().insert(building);
                 residence::on_house_built(sim, building);
             }
-            MapMakeConnection { .. } | MapMakeMultipleConnections(..) => unreachable!(),
+            MapMakeConnection { .. } | MapMakeMultipleConnections(..) | EditWater(_) => {
+                unreachable!()
+            }
             MapUpdateIntersectionPolicy {
                 inter: id,
                 turn: tp,

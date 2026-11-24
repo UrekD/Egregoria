@@ -17,10 +17,45 @@ struct MapWithLotOrigins<T> {
 
 #[derive(Serialize, Deserialize)]
 struct ReadableMap {
-    #[serde(flatten)]
-    map: SerializedMap,
+    roads: Roads,
+    intersections: Intersections,
+    buildings: Buildings,
+    lanes: Lanes,
+    parking: ParkingSpots,
+    lots: Lots,
+    environment: Environment,
+    external_train_stations: Vec<BuildingID>,
     #[serde(default)]
     import_lane_reserve: bool,
+}
+
+impl ReadableMap {
+    fn from_serialized(map: SerializedMap, import_lane_reserve: bool) -> Self {
+        Self {
+            roads: map.roads,
+            intersections: map.intersections,
+            buildings: map.buildings,
+            lanes: map.lanes,
+            parking: map.parking,
+            lots: map.lots,
+            environment: map.environment,
+            external_train_stations: map.external_train_stations,
+            import_lane_reserve,
+        }
+    }
+
+    fn into_serialized(self) -> SerializedMap {
+        SerializedMap {
+            roads: self.roads,
+            intersections: self.intersections,
+            buildings: self.buildings,
+            lanes: self.lanes,
+            parking: self.parking,
+            lots: self.lots,
+            environment: self.environment,
+            external_train_stations: self.external_train_stations,
+        }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -56,10 +91,7 @@ impl Serialize for Map {
         let lot_origins = self.lot_origins.clone();
         if serializer.is_human_readable() {
             return MapWithLotOrigins {
-                map: ReadableMap {
-                    map,
-                    import_lane_reserve: self.import_lane_reserve,
-                },
+                map: ReadableMap::from_serialized(map, self.import_lane_reserve),
                 lot_origins,
             }
             .serialize(serializer);
@@ -78,7 +110,8 @@ impl<'de> Deserialize<'de> for Map {
         let (map, lot_origins, import_lane_reserve) = if deserializer.is_human_readable() {
             let MapWithLotOrigins { map, lot_origins } =
                 MapWithLotOrigins::<ReadableMap>::deserialize(deserializer)?;
-            (map.map, lot_origins, map.import_lane_reserve)
+            let imported = map.import_lane_reserve;
+            (map.into_serialized(), lot_origins, imported)
         } else {
             let MapWithLotOrigins {
                 mut map,
@@ -263,6 +296,22 @@ mod tests {
             },
             road,
         )
+    }
+
+    #[test]
+    fn w1_water_readable_map_stops_before_excess_stroke_payload() {
+        let map = String::from_utf8(JSON::encode(&Map::empty()).unwrap()).unwrap();
+        let points = vec!["0"; crate::map::MAX_WATER_VERTICES].join(",");
+        let extra = "x".repeat(24 * 1024);
+        let bodies = format!(
+            r#""bodies":[{{"id":1,"level_dm":0,"shape":{{"River":{{"stroke":[{},"{}"],"width_m":32}}}}}}]"#,
+            points, extra
+        );
+        let input = map.replacen(r#""bodies":[]"#, &bodies, 1);
+        let mut reader = input.as_bytes();
+        let error = JSON::decode_reader::<Map>(&mut reader).err().unwrap();
+        assert!(reader.len() >= extra.len(), "consumed the excess stroke payload");
+        assert!(error.to_string().contains("water record limit exceeded"), "{error}");
     }
 
     #[test]

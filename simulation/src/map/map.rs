@@ -6,7 +6,8 @@ use crate::map::{
     Building, BuildingID, BuildingKind, Environment, Intersection, IntersectionID, Lane, LaneID,
     LaneKind, LanePattern, Lot, LotID, LotKind, LotLayout, MapSubscriber, MapSubscribers,
     ParkingSpotID, ParkingSpots, ProjectFilter, ProjectKind, Road, RoadID, RoadSegmentKind,
-    SpatialMap, SubscriberChunkID, TerraformKind, UpdateType, Zone, ROAD_Z_OFFSET,
+    SpatialMap, SubscriberChunkID, TerraformKind, UpdateType, WaterEdit, WaterEditError,
+    WaterEditOutcome, Zone, ROAD_Z_OFFSET,
 };
 use geom::OBB;
 use geom::{PolyLine3, Vec2, Vec3};
@@ -758,6 +759,16 @@ impl Map {
         for id in modified {
             self.subscribers.dispatch_chunk(UpdateType::Terrain, id);
         }
+    }
+
+    pub(crate) fn apply_water_edit(
+        &mut self,
+        edit: &WaterEdit,
+    ) -> Result<WaterEditOutcome, WaterEditError> {
+        let prepared = self.environment.prepare_water_edit(edit)?;
+        let outcome = self.environment.commit_prepared_water(prepared)?;
+        self.subscribers.dispatch_water(&outcome.dirty);
+        Ok(outcome)
     }
 
     // Private mutating
