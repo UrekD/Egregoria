@@ -71,13 +71,13 @@ fn terrain_level_valley_road_keeps_its_original_points() {
 #[test]
 fn noisy_ground_clicks_keep_the_legacy_valley_profile() {
     let mut map = Map::empty();
-    map.environment = Environment::new(1, 1);
-    map.environment
-        .terrain_apply(map.environment.bounds(), |p| {
-            ((p.x - 160.0).abs() - 32.0).max(0.0) * 0.125
-        });
+    let mut terrain = Environment::new(1, 1);
+    terrain.terrain_apply(terrain.bounds(), |p| {
+        ((p.x - 160.0).abs() - 32.0).max(0.0) * 0.125
+    });
+    assert!(map.install_environment(terrain));
     let ground_click =
-        |pos: Vec2| MapProject::ground(pos.z(map.environment.height(pos).unwrap() + 0.3));
+        |pos: Vec2| MapProject::ground(pos.z(map.environment().height(pos).unwrap() + 0.3));
     let (_, id) = map
         .make_connection(
             ground_click(vec2(32.0, 64.0)),
@@ -109,13 +109,13 @@ fn noisy_ground_clicks_keep_the_legacy_valley_profile() {
 #[test]
 fn splitting_a_valley_road_snaps_the_junction_to_terrain() {
     let mut map = Map::empty();
-    map.environment = Environment::new(1, 1);
-    map.environment
-        .terrain_apply(map.environment.bounds(), |p| {
-            let distance = (p.x - 160.0).abs();
-            (distance - 80.0).max(0.0) * 0.125 + distance.min(32.0) * 0.00625
-        });
-    let ground = |map: &Map, pos: Vec2| pos.z(map.environment.height(pos).unwrap());
+    let mut terrain = Environment::new(1, 1);
+    terrain.terrain_apply(terrain.bounds(), |p| {
+        let distance = (p.x - 160.0).abs();
+        (distance - 80.0).max(0.0) * 0.125 + distance.min(32.0) * 0.00625
+    });
+    assert!(map.install_environment(terrain));
+    let ground = |map: &Map, pos: Vec2| pos.z(map.environment().height(pos).unwrap());
     let start = ground(&map, vec2(32.0, 64.0));
     let end = ground(&map, vec2(288.0, 64.0));
     let pattern = LanePatternBuilder::default().build();
@@ -164,9 +164,9 @@ fn splitting_a_valley_road_snaps_the_junction_to_terrain() {
 #[test]
 fn splitting_at_a_centerline_vertex_replaces_its_height() {
     let mut map = Map::empty();
-    map.environment = Environment::new(1, 1);
-    map.environment
-        .terrain_apply(map.environment.bounds(), |_| 0.0);
+    let mut terrain = Environment::new(1, 1);
+    terrain.terrain_apply(terrain.bounds(), |_| 0.0);
+    assert!(map.install_environment(terrain));
     let src = map.add_intersection(vec3(32.0, 64.0, 0.0));
     let dst = map.add_intersection(vec3(288.0, 64.0, 0.0));
     let projected = vec3(160.0, 64.0, ROAD_Z_OFFSET + 0.3);
@@ -200,15 +200,15 @@ fn splitting_at_a_centerline_vertex_replaces_its_height() {
 #[test]
 fn valley_road_keeps_legacy_clipped_geometry_after_junction_edit() {
     let mut map = Map::empty();
-    map.environment = Environment::new(1, 1);
-    map.environment
-        .terrain_apply(map.environment.bounds(), |p| {
-            ((p.x - 160.0).abs() - 32.0).max(0.0) * 0.125
-        });
+    let mut terrain = Environment::new(1, 1);
+    terrain.terrain_apply(terrain.bounds(), |p| {
+        ((p.x - 160.0).abs() - 32.0).max(0.0) * 0.125
+    });
+    assert!(map.install_environment(terrain));
     let start = vec2(32.0, 64.0);
     let end = vec2(288.0, 64.0);
-    let start = start.z(map.environment.height(start).unwrap());
-    let end = end.z(map.environment.height(end).unwrap());
+    let start = start.z(map.environment().height(start).unwrap());
+    let end = end.z(map.environment().height(end).unwrap());
     let pattern = LanePatternBuilder::default().build();
     let (junction, id) = map
         .make_connection(
@@ -226,7 +226,7 @@ fn valley_road_keeps_legacy_clipped_geometry_after_junction_edit() {
             pos: end,
             kind: ProjectKind::Intersection(junction),
         },
-        MapProject::ground(side.z(map.environment.height(side).unwrap())),
+        MapProject::ground(side.z(map.environment().height(side).unwrap())),
         None,
         &pattern,
     )
@@ -333,11 +333,11 @@ fn low_rising_bridge_keeps_a_deck_in_both_directions() {
 #[test]
 fn split_bridge_keeps_both_decks_over_high_ground() {
     let mut map = Map::empty();
-    map.environment = Environment::new(1, 1);
-    map.environment
-        .terrain_apply(map.environment.bounds(), |p| {
-            (1.0 - (p.x - 160.0).abs() / 32.0).max(0.0) * 4.9
-        });
+    let mut terrain = Environment::new(1, 1);
+    terrain.terrain_apply(terrain.bounds(), |p| {
+        (1.0 - (p.x - 160.0).abs() / 32.0).max(0.0) * 4.9
+    });
+    assert!(map.install_environment(terrain));
     let start = vec3(32.0, 64.0, 5.0);
     let end = vec3(288.0, 64.0, 5.0);
     let pattern = LanePatternBuilder::default().build();
@@ -350,7 +350,7 @@ fn split_bridge_keeps_both_decks_over_high_ground() {
         )
         .unwrap();
     let midpoint = vec3(160.0, 64.0, start.z);
-    let clearance = midpoint.z - map.environment.height(midpoint.xy()).unwrap();
+    let clearance = midpoint.z - map.environment().height(midpoint.xy()).unwrap();
     assert!((0.0..0.5).contains(&clearance));
     assert_straight_deck(map.roads[original].interfaced_points(), start, end);
 
@@ -366,7 +366,7 @@ fn split_bridge_keeps_both_decks_over_high_ground() {
         preview_end,
         RoadSegmentKind::Straight,
         false,
-        &map.environment,
+        map.environment(),
     );
     assert!(error.is_none());
 
@@ -388,11 +388,11 @@ fn split_bridge_keeps_both_decks_over_high_ground() {
 #[test]
 fn rising_bridge_and_lanes_follow_the_deck_after_load_and_junction_edit() {
     let mut map = Map::empty();
-    map.environment = Environment::new(1, 1);
-    map.environment
-        .terrain_apply(map.environment.bounds(), |p| {
-            (24.0 - (p.x - 48.0).abs()).max(0.0) * 0.11
-        });
+    let mut terrain = Environment::new(1, 1);
+    terrain.terrain_apply(terrain.bounds(), |p| {
+        (24.0 - (p.x - 48.0).abs()).max(0.0) * 0.11
+    });
+    assert!(map.install_environment(terrain));
     let start = vec3(32.0, 64.0, 4.0);
     let end = vec3(288.0, 64.0, 16.0);
     let pattern = LanePatternBuilder::default().build();

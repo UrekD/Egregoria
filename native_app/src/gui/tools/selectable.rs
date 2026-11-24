@@ -230,7 +230,7 @@ mod tests {
             let to = vec3(1580.0, 1400.0, 0.0);
             let ground = [from, to]
                 .iter()
-                .map(|p| map.environment.height(p.xy()).unwrap())
+                .map(|p| map.environment().height(p.xy()).unwrap())
                 .reduce(f32::max)
                 .unwrap();
             let mut road_at = |height| {

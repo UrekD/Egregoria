@@ -1068,12 +1068,13 @@ fn p2d_mass_outage_benchmark() {
                 // The footprints are spaced apart and share an existing road.
                 // Skip the debug-only whole-map validation after every placement.
                 let map = &mut *test.g.map_mut();
+                let terrain = map.environment().clone();
                 crate::map::Building::make(
                     &mut map.buildings,
                     &mut map.spatial_map,
                     &mut map.electricity,
                     &mut map.roads,
-                    &map.environment,
+                    &terrain,
                     OBB::new(center, Vec2::X, 16.0, 16.0),
                     BuildingKind::House,
                     prototypes::BuildingGen::House,

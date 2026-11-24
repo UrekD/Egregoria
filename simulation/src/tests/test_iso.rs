@@ -254,7 +254,7 @@ fn p1_spine_growth_resources_round_trip() {
     ctx.g
         .write::<ZoneGrid>()
         .paint(area, Some(ZoneKind::Residential), Density::Low);
-    assert_eq!(ctx.g.read::<ZoneGrid>().generation, 1);
+    assert_eq!(ctx.g.read::<ZoneGrid>().generation(), 1);
     ctx.g.write::<Residences>().by_building.insert(
         house,
         Residence {
@@ -310,7 +310,7 @@ fn resumed_trajectory_matches_continuous_run() {
         let tree_pos = vec2(256.0, 128.0);
         ctx.g
             .map_mut()
-            .environment
+            .environment_mut_for_test()
             .trees
             .insert(tree_pos, Tree::new(tree_pos));
         ctx.build_roads(&[vec3(64.0, 128.0, 0.0), vec3(448.0, 128.0, 0.0)]);
@@ -539,7 +539,7 @@ fn pf_d_fix_zoned_growth_preserves_save_load_equality() {
         kind: Some(ZoneKind::Residential),
         density: Density::Low,
     }]);
-    assert!(!ctx.g.read::<ZoneGrid>().cells.is_empty());
+    assert!(!ctx.g.read::<ZoneGrid>().cells().is_empty());
     while ctx.g.get_tick() < GROWTH_INTERVAL {
         ctx.tick_fast();
     }

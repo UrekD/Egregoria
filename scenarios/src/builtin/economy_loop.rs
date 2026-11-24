@@ -324,7 +324,7 @@ fn connect_platform(ctx: &mut ScenarioCtx, station: BuildingID) -> Result<(), St
     let command = {
         let map = ctx.sim.map();
         let ground = |xy: Vec2| {
-            let height = map.environment.height(xy).unwrap_or_default();
+            let height = map.environment().height(xy).unwrap_or_default();
             map.project(xy.z(height), 0.0, ProjectFilter::INTER)
         };
         let junction = map.project(vec3(3036.0, 222.0, 0.0), 10.0, ProjectFilter::INTER);

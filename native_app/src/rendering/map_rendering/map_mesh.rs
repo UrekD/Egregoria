@@ -19,10 +19,10 @@ use prototypes::{
     GrowableCompanyID, GrowableCompanyPrototype, RenderAsset,
 };
 use simulation::map::{
-    Building, BuildingKind, CanonicalPosition, Density, Environment, Intersection, LaneKind, Lanes,
-    LotID, LotKind, Map, MapSubscriber, ProjectFilter, ProjectKind, PylonPosition, Road, Roads,
-    SubscriberChunkID, Turn, TurnKind, UpdateType, ZoneCell, ZoneGrid, ZoneKind, CROSSWALK_WIDTH,
-    ROAD_Z_OFFSET, ZONE_CELL_SIZE,
+    Building, BuildingKind, CanonicalPosition, Density, EligiblePaintCells, Environment,
+    Intersection, LaneKind, Lanes, LotID, LotKind, Map, MapSubscriber, ProjectFilter, ProjectKind,
+    PylonPosition, Road, Roads, SubscriberChunkID, Turn, TurnKind, UpdateType, ZoneCell, ZoneGrid,
+    ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET, ZONE_CELL_SIZE,
 };
 use simulation::souls::growth::{check_growable_lot, GrowableLotError};
 use simulation::Simulation;
@@ -307,7 +307,7 @@ impl ZoningMeshes {
     }
 
     fn draw_chunks(&mut self, map: &Map, frame: &ZoningFrame, ctx: &mut FrameContext<'_>) {
-        if frame.grid.cells.is_empty() {
+        if frame.grid.cells().is_empty() {
             return;
         }
         profiling::scope!("zoning chunks");
@@ -374,7 +374,7 @@ impl ZoningMeshes {
             let mut tess = self.builder.mk_tess();
             for mark in &preview.outlines {
                 draw_lot_outline(
-                    &map.environment,
+                    map.environment(),
                     &mut tess,
                     mark.corners,
                     mark.width,
@@ -397,7 +397,7 @@ fn update_zone_chunks(
     grid: &ZoneGrid,
 ) {
     let Some(previous) = previous else {
-        for &(x, y) in grid.cells.keys() {
+        for &(x, y) in grid.cells().keys() {
             let chunk = ZoningChunk::new(zone_cell_center(x, y));
             chunks.entry(chunk).or_default().cells += 1;
         }
@@ -408,9 +408,9 @@ fn update_zone_chunks(
     // chunk revisions, including unzones and paints received while the tool was closed.
     let mut changed: FastMap<ZoningChunk, Vec<Vec2>> = FastMap::default();
     for change in previous
-        .cells
+        .cells()
         .iter()
-        .merge_join_by(&grid.cells, |a, b| a.0.cmp(b.0))
+        .merge_join_by(grid.cells(), |a, b| a.0.cmp(b.0))
     {
         let ((x, y), delta) = match change {
             EitherOrBoth::Left((&key, _)) => (key, -1),
@@ -425,7 +425,7 @@ fn update_zone_chunks(
             .cells
             .checked_add_signed(delta)
             .expect("zone chunk cell count");
-        state.grid_revision = grid.generation;
+        state.grid_revision = grid.generation();
         changed.entry(chunk).or_default().push(center);
     }
 
@@ -439,7 +439,7 @@ fn update_zone_chunks(
             let lot = &map.lots()[id];
             let owner = ZoningChunk::new(lot.shape.center());
             if owner != chunk && cells.iter().any(|&cell| lot.shape.contains(cell)) {
-                chunks.entry(owner).or_default().lot_revision = grid.generation;
+                chunks.entry(owner).or_default().lot_revision = grid.generation();
             }
         }
     }
@@ -484,7 +484,7 @@ fn build_zoning_chunk(
             if let Some((width, color)) = lot_outline(zoned, false) {
                 let start = tess.indices.len() as u32;
                 draw_lot_outline(
-                    &map.environment,
+                    map.environment(),
                     &mut tess,
                     lot.shape.corners,
                     width,
@@ -532,30 +532,21 @@ impl super::MapRenderer {
         stroke: ZoningPreview<'_>,
     ) -> Option<String> {
         let ZoningPreview {
-            areas,
+            stamp,
             pointer,
             hover_radius,
             pitch,
-            kind,
             density,
             held,
         } = stroke;
         profiling::scope!("zoning_preview");
         let mode = ZoningMode::new(distance, pitch == ZONE_CELL_SIZE);
         let overview = mode == ZoningMode::Overview;
-        let view = ZoningView::new(center, distance, map.environment.bounds(), mode);
-        let replacement = kind.map(|kind| ZoneCell { kind, density });
-        let fill = (!areas.is_empty()).then(|| ZoningPreviewFill {
-            tiles: preview_tiles(
-                areas,
-                if overview { ZONE_CELL_SIZE } else { pitch },
-                if overview {
-                    0.0
-                } else {
-                    density_inset(density)
-                },
-            ),
-            color: kind
+        let view = ZoningView::new(center, distance, map.environment().bounds(), mode);
+        let fill = (!stamp.cells().is_empty()).then(|| ZoningPreviewFill {
+            tiles: preview_tiles(stamp, mode, density),
+            color: stamp
+                .kind()
                 .map_or(LinearColor::new(0.96, 0.28, 0.28, 1.0), |kind| {
                     zone_cell_color(kind, density)
                 })
@@ -564,17 +555,7 @@ impl super::MapRenderer {
         });
         let (lots, warning) = pointer.map_or_else(
             || (PreviewLots::default(), None),
-            |pointer| {
-                preview_lots(
-                    map,
-                    &grid,
-                    areas,
-                    replacement,
-                    pointer,
-                    hover_radius,
-                    overview,
-                )
-            },
+            |pointer| preview_lots(map, &grid, stamp, density, pointer, hover_radius, overview),
         );
         ZONING_FRAME.replace(Some(ZoningFrame {
             world,
@@ -596,7 +577,7 @@ impl super::MapRenderer {
         center: Vec2,
         distance: f32,
     ) {
-        if zones.cells.is_empty() {
+        if zones.cells().is_empty() {
             return;
         }
         for project in map
@@ -618,14 +599,18 @@ impl super::MapRenderer {
 fn preview_lots(
     map: &Map,
     grid: &ZoneGrid,
-    paints: &[OBB],
-    replacement: Option<ZoneCell>,
+    stamp: &EligiblePaintCells,
+    density: Density,
     pointer: Vec2,
     hover_radius: f32,
     overview: bool,
 ) -> (PreviewLots, Option<String>) {
     let hover = Circle::new(pointer, hover_radius);
-    let affected = paints.iter().map(Shape::bbox).reduce(AABB::union);
+    let affected = stamp
+        .cells()
+        .iter()
+        .map(|&(x, y)| tile_bounds(x, y, ZONE_CELL_SIZE))
+        .reduce(AABB::union);
     let pointer_bounds = if overview {
         AABB::new_ll_ur(pointer, pointer)
     } else {
@@ -656,7 +641,7 @@ fn preview_lots(
         }
         let before = grid.lot_zone(&lot.shape);
         let (touched, zone) = if intersects_paint {
-            grid.lot_zone_after_paint(&lot.shape, paints, replacement)
+            grid.lot_zone_after_prepared_paint(&lot.shape, stamp, density)
         } else {
             (false, before)
         };
@@ -687,7 +672,7 @@ fn preview_lots(
         }
     }
     let warning = hovered.map(lot_warning).or_else(|| {
-        if replacement.is_none() || paints.is_empty() || eligible {
+        if stamp.kind().is_none() || stamp.cells().is_empty() || eligible {
             return None;
         }
         if let Some(blocked) = blocked {
@@ -780,22 +765,40 @@ fn inset_tile(tile: AABB, inset: f32) -> AABB {
 fn uniform_block(zones: &ZoneGrid, x: i32, y: i32, zone: ZoneCell) -> bool {
     [(x, y), (x + 1, y), (x, y + 1), (x + 1, y + 1)]
         .iter()
-        .all(|key| zones.cells.get(key) == Some(&zone))
+        .all(|key| zones.cells().get(key) == Some(&zone))
 }
 
-fn preview_tiles(paints: &[OBB], pitch: f32, inset: f32) -> Vec<AABB> {
-    let mut tiles = std::collections::BTreeMap::new();
-    for area in paints.iter().map(Shape::bbox) {
-        for (x, y) in zoning_tiles(area, pitch) {
-            let part = tile_bounds(x, y, pitch).intersection(area);
-            // All editor stamps use the same storage-aligned map clip. A tile shared
-            // by two stamps has identical bounds and should be drawn only once.
-            tiles.entry((x, y)).or_insert(part);
-        }
-    }
-    tiles
-        .into_values()
-        .map(|tile| inset_tile(tile, inset))
+fn preview_tiles(stamp: &EligiblePaintCells, mode: ZoningMode, density: Density) -> Vec<AABB> {
+    let cells = stamp.cells();
+    let inset = if mode == ZoningMode::Overview {
+        0.0
+    } else {
+        density_inset(density)
+    };
+    cells
+        .iter()
+        .filter_map(|&(x, y)| {
+            if mode == ZoningMode::Coarse {
+                let (left, bottom) = (x & !1, y & !1);
+                if [
+                    (left, bottom),
+                    (left + 1, bottom),
+                    (left, bottom + 1),
+                    (left + 1, bottom + 1),
+                ]
+                .iter()
+                .all(|key| cells.binary_search(key).is_ok())
+                {
+                    return ((x, y) == (left, bottom)).then(|| {
+                        inset_tile(
+                            tile_bounds(left / 2, bottom / 2, 2.0 * ZONE_CELL_SIZE),
+                            inset,
+                        )
+                    });
+                }
+            }
+            Some(inset_tile(tile_bounds(x, y, ZONE_CELL_SIZE), inset))
+        })
         .collect()
 }
 
@@ -810,7 +813,7 @@ fn build_painted_cells(
     let side = (ZoningChunk::SIZE_F32 / ZONE_CELL_SIZE) as i32;
     let (min_x, min_y) = (min.x as i32, min.y as i32);
     for x in min_x..min_x + side {
-        for (&(x, y), &zone) in grid.cells.range((x, min_y)..(x, min_y + side)) {
+        for (&(x, y), &zone) in grid.cells().range((x, min_y)..(x, min_y + side)) {
             let color = zone_cell_color(zone.kind, zone.density).a(0.88);
             let tile = painted_tile(grid, mode, x, y, zone);
             add_zoning_tile(map, tile, color.into(), ZONING_FILL_LIFT, mesh);
@@ -871,9 +874,9 @@ fn add_zoning_tile(
             part.ur,
             vec2(part.ll.x, part.ur.y),
         ];
-        let bounds = map.environment.bounds();
+        let bounds = map.environment().bounds();
         let sample = |p: Vec2| {
-            map.environment
+            map.environment()
                 .true_height(p.min(bounds.ur - Vec2::splat(0.01)))
         };
         let [Some(hll), Some(hlr), Some(hur), Some(hul)] = [ll, lr, ur, ul].map(sample) else {
@@ -912,24 +915,88 @@ mod zoning_tests {
     }
 
     #[test]
+    fn w0_water_coarse_zoning_ghost_covers_every_prepared_cell() {
+        let mut terrain = Environment::new(1, 1);
+        terrain
+            .fill_lake(
+                &geom::Polygon::centered_rect(vec2(8.0, 8.0), 14.0, 14.0),
+                50,
+                1.0,
+            )
+            .unwrap();
+        let mut map = Map::default();
+        assert!(map.install_environment(terrain));
+        let area = OBB::new(vec2(16.0, 8.0), Vec2::X, 32.0, 16.0);
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut sim = simulation::Simulation::new_authored_flat(1, 0).unwrap();
+        *sim.write::<Map>() = map;
+        for (kind, expected) in [(Some(ZoneKind::Residential), 4), (None, 8)] {
+            let map = sim.map();
+            let grid = sim.read::<ZoneGrid>();
+            let stamp = ZoneGrid::eligible_paint_stroke(&map, &[area], kind);
+            let vote = grid.lot_zone_after_prepared_paint(&area, &stamp, Density::Low);
+            super::super::MapRenderer::queue_zoning_overlay(
+                &map,
+                Arc::new((*grid).clone()),
+                1,
+                Vec2::ZERO,
+                300.0,
+                ZoningPreview {
+                    stamp: &stamp,
+                    pointer: None,
+                    hover_radius: 32.0,
+                    pitch: 16.0,
+                    density: Density::Low,
+                    held: true,
+                },
+            );
+            let fill = ZONING_FRAME.take().unwrap().preview.fill.unwrap();
+            assert_eq!(stamp.cells().len(), expected);
+            for x in 0..4 {
+                for y in 0..2 {
+                    assert_eq!(
+                        fill.tiles
+                            .iter()
+                            .any(|tile| tile.contains(tile_bounds(x, y, 8.0).center())),
+                        stamp.cells().contains(&(x, y)),
+                    );
+                }
+            }
+            drop(grid);
+            drop(map);
+            sim.apply_commands([&simulation::world_command::WorldCommand::ZonePaint {
+                area,
+                kind,
+                density: Density::Low,
+            }]);
+            let grid = sim.read::<ZoneGrid>();
+            assert_eq!(grid.lot_zone(&area), vote.1);
+            assert_eq!(grid.cells().len(), if kind.is_some() { 4 } else { 0 });
+        }
+    }
+
+    #[test]
     fn u1_zoning_preview_covers_interpolated_stamps_without_filling_the_gap() {
         let paints = [
             OBB::new(vec2(24.0, 24.0), Vec2::X, 16.0, 16.0),
             OBB::new(vec2(40.0, 24.0), Vec2::X, 16.0, 16.0),
             OBB::new(vec2(40.0, 40.0), Vec2::X, 16.0, 16.0),
         ];
+        let mut map = Map::default();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        let stamp = ZoneGrid::eligible_paint_stroke(&map, &paints, Some(ZoneKind::Residential));
         super::super::MapRenderer::queue_zoning_overlay(
-            &Map::default(),
+            &map,
             Arc::new(ZoneGrid::default()),
             1,
             Vec2::ZERO,
             300.0,
             ZoningPreview {
-                areas: &paints,
+                stamp: &stamp,
                 pointer: None,
                 hover_radius: 32.0,
                 pitch: 16.0,
-                kind: Some(ZoneKind::Residential),
                 density: Density::Low,
                 held: true,
             },
@@ -940,34 +1007,44 @@ mod zoning_tests {
         assert!(covers(vec2(40.0, 24.0)));
         assert!(covers(vec2(40.0, 40.0)));
         assert!(!covers(vec2(24.0, 40.0)));
-        assert_eq!(preview_tiles(&[paints[0], paints[0]], 16.0, 1.2).len(), 1);
+        assert_eq!(
+            ZoneGrid::eligible_paint_stroke(&map, &[paints[0]; 2], None)
+                .cells()
+                .len(),
+            4
+        );
     }
 
     #[test]
     fn u1_zoning_paint_revises_only_changed_chunks() {
-        let map = Map::default();
+        let mut map = Map::default();
+        assert!(map.install_environment(Environment::new(1, 1)));
         let mut grid = ZoneGrid::default();
-        let left = OBB::new(vec2(-4.0, 4.0), Vec2::X, 8.0, 8.0);
-        let right = OBB::new(vec2(4.0, 4.0), Vec2::X, 8.0, 8.0);
+        let left = OBB::new(vec2(60.0, 4.0), Vec2::X, 8.0, 8.0);
+        let right = OBB::new(vec2(68.0, 4.0), Vec2::X, 8.0, 8.0);
         let left_chunk = ZoningChunk::new(left.center());
         let right_chunk = ZoningChunk::new(right.center());
-        grid.paint(left, Some(ZoneKind::Office), Density::Low);
-        grid.paint(right, Some(ZoneKind::Office), Density::Low);
+        grid.paint_on_map(&map, &left, Some(ZoneKind::Office), Density::Low)
+            .unwrap();
+        grid.paint_on_map(&map, &right, Some(ZoneKind::Office), Density::Low)
+            .unwrap();
         let mut chunks = FastMap::default();
         update_zone_chunks(&map, &mut chunks, None, &grid);
 
         let previous = grid.clone();
-        grid.paint(left, Some(ZoneKind::Office), Density::High);
-        grid.paint(right, Some(ZoneKind::Office), Density::Low);
+        grid.paint_on_map(&map, &left, Some(ZoneKind::Office), Density::High)
+            .unwrap();
+        grid.paint_on_map(&map, &right, Some(ZoneKind::Office), Density::Low)
+            .unwrap();
         update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
-        assert_eq!(chunks[&left_chunk].grid_revision, grid.generation);
+        assert_eq!(chunks[&left_chunk].grid_revision, grid.generation());
         assert_eq!(chunks[&left_chunk].cells, 1);
         assert_eq!(chunks[&right_chunk].grid_revision, 0);
 
         let previous = grid.clone();
-        grid.paint(left, None, Density::Low);
+        grid.paint_on_map(&map, &left, None, Density::Low).unwrap();
         update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
-        assert_eq!(chunks[&left_chunk].grid_revision, grid.generation);
+        assert_eq!(chunks[&left_chunk].grid_revision, grid.generation());
         assert_eq!(chunks[&left_chunk].cells, 0);
         assert_eq!(chunks[&right_chunk].grid_revision, 0);
     }
@@ -986,9 +1063,9 @@ mod zoning_tests {
         use simulation::map::{Lot, RoadID};
 
         let mut map = Map::default();
-        map.environment = Environment::new(1, 1);
+        assert!(map.install_environment(Environment::new(1, 1)));
         let at = vec2(59.0, 52.0);
-        let height = map.environment.height(at).unwrap();
+        let height = map.environment().height(at).unwrap();
         let id = Lot::try_make(&mut map, RoadID::default(), at.z(height), Vec2::X, 20.0).unwrap();
         let lot = &map.lots()[id];
         let owner = ZoningChunk::new(lot.shape.center());
@@ -997,12 +1074,14 @@ mod zoning_tests {
         assert_ne!(painted, owner);
 
         let mut grid = ZoneGrid::default();
-        grid.paint(lot.shape, Some(ZoneKind::Commercial), Density::High);
+        grid.paint_on_map(&map, &lot.shape, Some(ZoneKind::Commercial), Density::High)
+            .unwrap();
+        let stamp = ZoneGrid::eligible_paint_stroke(&map, &[lot.shape], None);
         let (preview, _) = preview_lots(
             &map,
             &grid,
-            &[lot.shape],
-            None,
+            &stamp,
+            Density::High,
             lot.shape.center(),
             20.0,
             false,
@@ -1014,10 +1093,10 @@ mod zoning_tests {
         let mut chunks = FastMap::default();
         update_zone_chunks(&map, &mut chunks, None, &grid);
         let previous = grid.clone();
-        grid.paint(area, None, Density::Low);
+        grid.paint_on_map(&map, &area, None, Density::Low).unwrap();
         update_zone_chunks(&map, &mut chunks, Some(&previous), &grid);
-        assert_eq!(chunks[&painted].grid_revision, grid.generation);
-        assert_eq!(chunks[&owner].lot_revision, grid.generation);
+        assert_eq!(chunks[&painted].grid_revision, grid.generation());
+        assert_eq!(chunks[&owner].lot_revision, grid.generation());
         assert_eq!(chunks[&owner].grid_revision, 0);
     }
 
@@ -1050,11 +1129,15 @@ mod zoning_tests {
             density: Density::Low,
         };
         let mut grid = ZoneGrid::default();
-        grid.paint(
-            OBB::new(Vec2::splat(8.0), Vec2::X, 16.0, 16.0),
+        let mut map = Map::default();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        grid.paint_on_map(
+            &map,
+            &OBB::new(Vec2::splat(8.0), Vec2::X, 16.0, 16.0),
             Some(zone.kind),
             zone.density,
-        );
+        )
+        .unwrap();
         let coarse = ZoningMode::Coarse;
         let detail = ZoningMode::Detail;
         let overview = ZoningMode::Overview;
@@ -1068,7 +1151,9 @@ mod zoning_tests {
         assert_eq!(painted_tile(&grid, overview, 0, 0, zone).ll.x, 0.0);
         assert!(painted_tile(&grid, detail, 0, 0, zone).ur.x < 8.0);
 
-        grid.cells.get_mut(&(1, 0)).unwrap().density = Density::High;
+        let cell = OBB::new(vec2(12.0, 4.0), Vec2::X, 8.0, 8.0);
+        grid.paint_on_map(&map, &cell, Some(zone.kind), Density::High)
+            .unwrap();
         assert!(painted_tile(&grid, coarse, 0, 0, zone).ur.x < 8.0);
     }
 }
@@ -1774,7 +1859,7 @@ impl MapBuilders {
         let lanes = map.lanes();
         let roads = map.roads();
         let lots = map.lots();
-        let env = &map.environment;
+        let env = map.environment();
 
         for road in chunk_roads {
             let road = &roads[road];

@@ -39,7 +39,7 @@ fn p5_core_loop_starter_residential_lots_are_all_buildable() {
         let (from, to) = {
             let map = test.g.map();
             let project = |point: Vec2| {
-                let z = map.environment.height(point).unwrap();
+                let z = map.environment().height(point).unwrap();
                 map.project(point.z(z), 0.0, ProjectFilter::INTER | ProjectFilter::ROAD)
             };
             (project(origin + a * 100.0), project(origin + b * 100.0))
@@ -162,7 +162,7 @@ fn p5_core_loop_clear_road_corner_keeps_frontage() {
     let dst = src + Vec2::X * 100.0;
     let project = |p: Vec2| {
         map.project(
-            p.z(map.environment.height(p).unwrap()),
+            p.z(map.environment().height(p).unwrap()),
             0.0,
             ProjectFilter::ALL,
         )
@@ -172,7 +172,7 @@ fn p5_core_loop_clear_road_corner_keeps_frontage() {
     let line = map.get(corner_road).unwrap().boldline();
     assert!(line.intersects(&shape));
     assert!(!line.intersects(&Polygon::from(shape.corners.as_slice())));
-    let at = at.z(map.environment.height(at).unwrap());
+    let at = at.z(map.environment().height(at).unwrap());
     let lot = Lot::try_make(&mut map, parent, at, Vec2::X, 20.0)
         .expect("clear corner frontage should be generated");
     Lot::remove_intersecting_lots(&mut map, corner_road);

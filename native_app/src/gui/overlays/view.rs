@@ -24,7 +24,7 @@ impl TerrainHeights {
         if new_map || cleared || changed {
             // The chunk bounds include the heightmap's below-water range.
             self.range = map
-                .environment
+                .environment()
                 .chunks()
                 .fold([0.0, 0.0], |[low, high], (_, chunk)| {
                     let bounds = chunk.bbox(Vec2::ZERO);
@@ -52,7 +52,7 @@ pub(super) fn world_cache_is_clear() -> bool {
 /// heights onto XY. Clipping to the map also handles views above the horizon.
 pub(crate) fn bounds(camera: &Camera, map: &Map) -> Option<AABB> {
     let [bottom, top] = TERRAIN_HEIGHTS.with_borrow_mut(|cache| cache.get(map));
-    footprint(camera, map.environment.bounds(), bottom, top + 32.0) // badge clearance
+    footprint(camera, map.environment().bounds(), bottom, top + 32.0) // badge clearance
 }
 
 pub(super) fn geometry_bounds(camera: &Camera, bounds: AABB3) -> Option<AABB> {

@@ -352,7 +352,7 @@ fn draw_selected_service_ring(
         .map(|i| {
             let angle = Radians(i as f32 * std::f32::consts::TAU / SEGMENTS as f32);
             let pos = center + angle.vec2() * service.radius_m;
-            pos.z(map.environment.height(pos).unwrap_or_default().max(0.0) + 0.4)
+            pos.z(map.environment().height(pos).unwrap_or_default().max(0.0) + 0.4)
         })
         .collect::<Vec<_>>();
     let [r, g, b, a] = legend::MAX_REACH_COLOR;

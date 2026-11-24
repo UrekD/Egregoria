@@ -39,13 +39,13 @@ impl MapRenderer {
             meshb: MapMeshHandler::new(gfx, sim),
             trees: TreesRender::new(gfx, &sim.map()),
             terrain: TerrainRender::new(gfx, sim),
-            water: Water::new(gfx, sim.map().environment.bounds()),
+            water: Water::new(gfx, sim.map().environment().bounds()),
             lamps: LampsRender::new(&sim.map()),
         };
         #[cfg(feature = "debug-ground-overlay")]
         if std::env::var("EGR_DEBUG_GROUND_OVERLAY").as_deref() == Ok("1") {
             let mut renderer = renderer;
-            renderer.set_debug_ground_overlay(gfx, sim.map().environment.bounds());
+            renderer.set_debug_ground_overlay(gfx, sim.map().environment().bounds());
             return renderer;
         }
         renderer

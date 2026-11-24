@@ -219,7 +219,7 @@ fn project_terrain(camera: &Camera, map: &Map, point: Vec2) -> Option<Vec3> {
     if !ray.dir.is_finite() {
         return None;
     }
-    let (mut position, _) = map.environment.raycast(ray)?;
+    let (mut position, _) = map.environment().raycast(ray)?;
     position.z = position.z.max(0.0);
     Some(position)
 }
@@ -527,7 +527,7 @@ mod tests {
         ui.insert(crate::rendering::OrbitCamera::from_camera(camera));
         let map = city.sim.map();
         let on_road = |point: Vec2| {
-            let height = map.environment.height(point).unwrap();
+            let height = map.environment().height(point).unwrap();
             let (screen, _) = camera.project(point.z(height));
             let terrain = project_terrain(&camera, &map, screen).unwrap();
             let ProjectKind::Road(road) = map.project(terrain, 0.0, drag_filter()).kind else {

@@ -28,6 +28,10 @@ impl EligiblePaintCells {
     pub fn cells(&self) -> &[ZoneCellCoord] {
         &self.cells
     }
+
+    pub fn kind(&self) -> Option<ZoneKind> {
+        self.kind
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -36,11 +40,19 @@ pub struct ZoneCell {
     pub density: Density,
 }
 
+/// Zoning storage is read-only outside the checked paint APIs.
+///
+/// ```compile_fail
+/// use simulation::{map::ZoneGrid, Simulation};
+/// fn bypass(sim: &Simulation) {
+///     sim.write::<ZoneGrid>().cells.clear();
+/// }
+/// ```
 #[derive(Clone, Default, Serialize, Deserialize)]
 pub struct ZoneGrid {
-    pub cells: BTreeMap<(i32, i32), ZoneCell>,
+    cells: BTreeMap<ZoneCellCoord, ZoneCell>,
     /// Changes once for each paint or unzone that changes the grid.
-    pub generation: u64,
+    generation: u64,
 }
 
 impl ZoneGrid {
@@ -83,6 +95,22 @@ impl ZoneGrid {
         Ok(EligiblePaintCells { cells, kind })
     }
 
+    /// Prepare the union of independently submitted editor stamps.
+    pub fn eligible_paint_stroke(
+        map: &Map,
+        areas: &[OBB],
+        kind: Option<ZoneKind>,
+    ) -> EligiblePaintCells {
+        let mut cells: Vec<_> = areas
+            .iter()
+            .filter_map(|area| Self::eligible_paint_cells(map, area, kind).ok())
+            .flat_map(|stamp| stamp.cells)
+            .collect();
+        cells.sort_unstable();
+        cells.dedup();
+        EligiblePaintCells { cells, kind }
+    }
+
     pub fn bounded_paint_cells(
         area: &OBB,
         bounds: AABB,
@@ -106,12 +134,27 @@ impl ZoneGrid {
         kind: Option<ZoneKind>,
         density: Density,
     ) -> Result<(), ZonePaintError> {
-        self.paint_prepared(Self::eligible_paint_cells(map, area, kind)?, density);
+        self.paint_on_map_with_land(map, area, kind, density, |_| true)
+    }
+
+    pub fn paint_on_map_with_land(
+        &mut self,
+        map: &Map,
+        area: &OBB,
+        kind: Option<ZoneKind>,
+        density: Density,
+        owns: impl FnMut(ZoneCellCoord) -> bool,
+    ) -> Result<(), ZonePaintError> {
+        self.paint_prepared(
+            Self::eligible_paint_cells_with_land(map, area, kind, owns)?,
+            density,
+        );
         Ok(())
     }
 
     /// Stamp a detached grid, for example an editor fixture.
-    pub fn paint(&mut self, area: OBB, kind: Option<ZoneKind>, density: Density) {
+    #[cfg(test)]
+    pub(crate) fn paint(&mut self, area: OBB, kind: Option<ZoneKind>, density: Density) {
         let Some(cells) = paint_cells(&area) else {
             return;
         };

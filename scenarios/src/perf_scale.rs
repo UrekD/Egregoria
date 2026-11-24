@@ -416,7 +416,10 @@ fn setup_grid(ctx: &mut ScenarioCtx, side: usize, agents: usize) -> Result<(), S
         for y in 0..side {
             for x in 0..side {
                 let pos = origin + vec2(x as f32, y as f32) * GRID_SPACING_M;
-                let height = map.environment.height(pos).ok_or("grid outside terrain")?;
+                let height = map
+                    .environment()
+                    .height(pos)
+                    .ok_or("grid outside terrain")?;
                 let i = points.len();
                 points.push(MapProject {
                     pos: pos.z(height),

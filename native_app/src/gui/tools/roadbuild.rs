@@ -357,7 +357,7 @@ pub struct RoadBuildResource {
 impl RoadBuildResource {
     fn grid_mouse_height(&self, map: &Map, unprojected: Vec3, grid_size: f32) -> Vec3 {
         let snapped = unprojected.xy().snap(grid_size, grid_size);
-        let height = map.environment.height(snapped).unwrap_or(unprojected.z);
+        let height = map.environment().height(snapped).unwrap_or(unprojected.z);
         self.mouse_height(map, snapped.z(height))
     }
 
@@ -424,7 +424,7 @@ fn connection_preview(
         dst,
         segment,
         is_rail,
-        &map.environment,
+        map.environment(),
     ))
 }
 
@@ -574,7 +574,7 @@ impl RoadBuildResource {
             terrain_height,
             pos,
             ..
-        } in simulation::map::Road::pylons_positions(&p, &map.environment)
+        } in simulation::map::Road::pylons_positions(&p, map.environment())
         {
             immdraw
                 .circle(pos.xy().z(terrain_height + 0.1), patwidth * 0.5)
@@ -622,7 +622,7 @@ impl RoadBuildResource {
                             let ray1 = Ray::new(inter1.pos.xy(), -road1.dir_from(id1));
 
                             let p = ray0.intersection_point(&ray1)?;
-                            let h = map.environment.height(p)?;
+                            let h = map.environment().height(p)?;
                             Some(p.z(h))
                         })
                         .collect(),
@@ -642,7 +642,7 @@ impl RoadBuildResource {
                             let p = Line::new_dir(inter.pos.xy(), road.dir_from(id))
                                 .project(mousepos.xy());
 
-                            let h = map.environment.height(p)?;
+                            let h = map.environment().height(p)?;
 
                             Some(p.z(h))
                         })
@@ -673,7 +673,7 @@ impl RoadBuildResource {
                             let line1 = Line::new_dir(pos.xy(), dir.xy());
 
                             let p = line0.intersection_point(&line1)?;
-                            let h = map.environment.height(p)?;
+                            let h = map.environment().height(p)?;
 
                             Some(p.z(h))
                         })
@@ -694,7 +694,7 @@ impl RoadBuildResource {
                 let line = Line::new_dir(pos.xy(), dir.xy());
                 let p = line.project(mousepos.xy());
 
-                let h = map.environment.height(p)?;
+                let h = map.environment().height(p)?;
                 Some(vec![p.z(h)])
             }
             (Road(id0), Road(id1)) if self.pattern_builder.rail => {
@@ -708,7 +708,7 @@ impl RoadBuildResource {
                 let line1 = Line::new_dir(pos1.xy(), dir1.xy());
 
                 let p = line0.intersection_point(&line1)?;
-                let h = map.environment.height(p)?;
+                let h = map.environment().height(p)?;
 
                 Some(vec![p.z(h)])
             }
@@ -727,13 +727,13 @@ mod tests {
     #[test]
     fn grid_snap_uses_terrain_at_the_snapped_position() {
         let mut map = Map::empty();
-        map.environment = Environment::new(1, 1);
-        map.environment
-            .terrain_apply(map.environment.bounds(), |p| p.y * 0.4);
+        let mut terrain = Environment::new(1, 1);
+        terrain.terrain_apply(terrain.bounds(), |p| p.y * 0.4);
+        assert!(map.install_environment(terrain));
         let xy = vec2(100.0, 109.0);
-        let click = xy.z(map.environment.height(xy).unwrap());
+        let click = xy.z(map.environment().height(xy).unwrap());
         let snapped = vec2(100.0, 100.0);
-        let ground = map.environment.height(snapped).unwrap();
+        let ground = map.environment().height(snapped).unwrap();
         assert!(click.z - ground > 2.5);
 
         let mut state = RoadBuildResource::default();
@@ -772,9 +772,9 @@ mod tests {
     #[test]
     fn curved_road_preview_matches_the_applied_endpoints() {
         let mut map = Map::empty();
-        map.environment = Environment::new(1, 1);
-        map.environment
-            .terrain_apply(map.environment.bounds(), |_| 0.0);
+        let mut terrain = Environment::new(1, 1);
+        terrain.terrain_apply(terrain.bounds(), |_| 0.0);
+        assert!(map.install_environment(terrain));
         let pattern = LanePatternBuilder::default().build();
         let ground = MapProject::ground;
         map.make_connection(
@@ -812,9 +812,9 @@ mod tests {
     #[test]
     fn road_preview_matches_placement_at_a_low_terrain_following_split() {
         let mut map = Map::empty();
-        map.environment = Environment::new(1, 1);
-        map.environment
-            .terrain_apply(map.environment.bounds(), |_| 1.0);
+        let mut terrain = Environment::new(1, 1);
+        terrain.terrain_apply(terrain.bounds(), |_| 1.0);
+        assert!(map.install_environment(terrain));
         let pattern = LanePatternBuilder::default().build();
         let (_, original) = map
             .make_connection(
@@ -824,8 +824,19 @@ mod tests {
                 &pattern,
             )
             .unwrap();
-        map.environment
-            .terrain_apply(map.environment.bounds(), |_| 0.0);
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+        *sim.write::<Map>() = map;
+        sim.apply_commands([&simulation::world_command::WorldCommand::Terraform {
+            kind: simulation::map::TerraformKind::Level,
+            center: vec2(160.0, 128.0),
+            radius: 256.0,
+            amount: 1.0,
+            level: 0.0,
+            slope: None,
+        }]);
+        let mut map = sim.write::<Map>();
 
         let points = map.get(original).unwrap().points();
         let from = MapProject {
@@ -851,7 +862,7 @@ mod tests {
 
     /// Run one frame of the tool with the pointer over the terrain at `point`.
     fn frame(sim: &Simulation, ui: &UiWorld, point: Vec2, click: bool) {
-        let z = sim.map().environment.height(point).unwrap().max(0.0);
+        let z = sim.map().environment().height(point).unwrap().max(0.0);
         {
             let mut input = ui.write::<InputMap>();
             input.unprojected = Some(point.z(z));

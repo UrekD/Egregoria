@@ -28,22 +28,35 @@ pub mod procgen {
     pub use presets::*;
     pub use water::generate_waters;
 
-    pub fn load_parismap(map: &mut super::Map) {
-        if !map.environment().has_water_configuration() {
-            presets::load_parismap(map);
-        }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PresetImportError {
+        WaterConfigured,
     }
 
-    pub fn load_testfield(map: &mut super::Map, pos: geom::Vec2, size: u32, spacing: f32) {
-        if !map.environment().has_water_configuration() {
-            presets::load_testfield(map, pos, size, spacing);
+    pub fn load_parismap(map: &mut super::Map) -> Result<(), PresetImportError> {
+        if map.environment().has_water_configuration() {
+            return Err(PresetImportError::WaterConfigured);
         }
+        presets::load_parismap(map);
+        Ok(())
+    }
+
+    pub fn load_testfield(
+        map: &mut super::Map,
+        pos: geom::Vec2,
+        size: u32,
+        spacing: f32,
+    ) -> Result<(), PresetImportError> {
+        if map.environment().has_water_configuration() {
+            return Err(PresetImportError::WaterConfigured);
+        }
+        presets::load_testfield(map, pos, size, spacing);
+        Ok(())
     }
 }
 
 mod change_detection;
 mod electricity_cache;
-mod height_override;
 pub mod import;
 mod light_policy;
 #[allow(clippy::module_inception)]

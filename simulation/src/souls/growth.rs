@@ -66,7 +66,7 @@ pub fn growth_update(sim: &mut Simulation) {
         remove_growable(sim, id);
     }
 
-    if sim.read::<ZoneGrid>().cells.is_empty() {
+    if sim.read::<ZoneGrid>().cells().is_empty() {
         return;
     }
     // A save from before staggering can reach the first growth phase without a demand sample.
@@ -79,8 +79,8 @@ pub fn growth_update(sim: &mut Simulation) {
         let map = resources.read::<Map>();
         let zones = resources.read::<ZoneGrid>();
         let mut cache = resources.write::<GrowthCache>();
-        if cache.zone_generation != zones.generation {
-            cache.zone_generation = zones.generation;
+        if cache.zone_generation != zones.generation() {
+            cache.zone_generation = zones.generation();
             cache.zones.clear();
         }
         // A lot's shape is immutable for its ID, even when frontage changes.
@@ -1178,7 +1178,7 @@ mod tests {
             .unwrap()
             .1;
         assert_ne!(replacement, origin.parent);
-        assert!(test.g.read::<ZoneGrid>().cells.is_empty());
+        assert!(test.g.read::<ZoneGrid>().cells().is_empty());
         assert!(due(GROWTH_INTERVAL));
         test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;
         growth_update(&mut test.g);

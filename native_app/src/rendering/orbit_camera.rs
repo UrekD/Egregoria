@@ -249,7 +249,7 @@ impl OrbitCamera {
     }
 
     pub(crate) fn reset_for_world(&mut self, map: &Map, saved: Option<SlotCamera>) {
-        let bounds = map.environment.bounds();
+        let bounds = map.environment().bounds();
         let valid = saved.filter(|saved| {
             let pos = Vec3::from(saved.position);
             pos.is_finite()
@@ -261,7 +261,7 @@ impl OrbitCamera {
         let default_position = || {
             let center = bounds.center();
             starter_view(map)
-                .unwrap_or_else(|| center.z(map.environment.height(center).unwrap_or_default()))
+                .unwrap_or_else(|| center.z(map.environment().height(center).unwrap_or_default()))
         };
         let position = valid.map_or_else(default_position, |saved| Vec3::from(saved.position));
         let mut camera = Camera::new(position, self.camera.viewport_w, self.camera.viewport_h);
@@ -447,12 +447,12 @@ fn starter_view(map: &Map) -> Option<Vec3> {
         .filter_map(|(x, y)| {
             let point = center + Vec2::new(x as f32, y as f32) * 64.0;
             // Procedural land is at zero elevation and underwater terrain is negative.
-            let height = map.environment.true_height(point).filter(|&z| z >= 0.0)?;
+            let height = map.environment().true_height(point).filter(|&z| z >= 0.0)?;
             // A patch of land gives the player more usable space than a narrow shoreline.
             [Vec2::X, -Vec2::X, Vec2::Y, -Vec2::Y]
                 .into_iter()
                 .all(|dir| {
-                    map.environment
+                    map.environment()
                         .true_height(point + dir * 32.0)
                         .is_some_and(|z| z >= 0.0)
                 })
@@ -649,7 +649,7 @@ mod af2_tests {
             "{point:?}, station {center:?}"
         );
         assert!(
-            map.environment.true_height(point).unwrap() >= 0.0,
+            map.environment().true_height(point).unwrap() >= 0.0,
             "{point:?}"
         );
         let (screen, depth) = orbit.camera.project(station.obb.center().z(station.height));

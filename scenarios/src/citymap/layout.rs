@@ -167,14 +167,14 @@ pub fn plan_town(
         connect_neighbourhoods(&mut graph, config)?;
         retire_outer_road_fragments(&mut graph, &infill)?;
         finish_network(&mut graph, limits)?;
-        calibrate_storage(&mut graph, config, limits, &map.environment)?;
+        calibrate_storage(&mut graph, config, limits, map.environment())?;
         main_components(&mut graph);
         connect_infill(
             &mut graph,
             limits,
             &infill,
             &reach.downstream,
-            &map.environment,
+            map.environment(),
         );
         prioritize_east_connector(&mut graph);
         finish_network(&mut graph, limits)?;
@@ -185,7 +185,7 @@ pub fn plan_town(
     } else {
         retire_outer_road_fragments(&mut graph, &infill)?;
         prioritize_east_connector(&mut graph);
-        calibrate_storage(&mut graph, config, limits, &map.environment)?;
+        calibrate_storage(&mut graph, config, limits, map.environment())?;
     }
 
     Ok(TownPlan {

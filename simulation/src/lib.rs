@@ -713,7 +713,7 @@ impl Simulation {
             .resources
             .try_read::<Map>()
             .ok()
-            .is_none_or(|map| map.environment.size().0 == 0)
+            .is_none_or(|map| map.environment().size().0 == 0)
         {
             return Err(SaveLoadError::Corrupt {
                 version: Some(version),

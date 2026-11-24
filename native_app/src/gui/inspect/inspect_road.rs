@@ -376,7 +376,7 @@ mod tests {
         ] {
             let y = 1400.0 + 100.0 * index as f32;
             let ground = [1400.0, 1460.0]
-                .map(|x| map.environment.height(vec3(x, y, 0.0).xy()).unwrap())
+                .map(|x| map.environment().height(vec3(x, y, 0.0).xy()).unwrap())
                 .into_iter()
                 .reduce(f32::max)
                 .unwrap();
@@ -389,7 +389,7 @@ mod tests {
                 .unwrap();
             let road = map.get(id).unwrap();
             assert!(
-                Road::pylons_positions(road.interfaced_points(), &map.environment)
+                Road::pylons_positions(road.interfaced_points(), map.environment())
                     .next()
                     .is_none()
             );

@@ -685,7 +685,10 @@ fn walkable_egress(map: &Map, position: Vec3) -> Vec3 {
         .and_then(|lane| map.get(lane))
         .map(|lane| lane.points.project_segment(position).0)
         .unwrap_or_else(|| {
-            let z = map.environment.height(position.xy()).unwrap_or(position.z);
+            let z = map
+                .environment()
+                .height(position.xy())
+                .unwrap_or(position.z);
             position.xy().z(z)
         })
 }

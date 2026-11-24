@@ -756,7 +756,7 @@ impl Automation {
             road_ids: sim.map().roads().keys().collect(),
             open_windows,
             city_stats: &sim.read::<CityStats>(),
-            zone_cells: sim.read::<ZoneGrid>().cells.len(),
+            zone_cells: sim.read::<ZoneGrid>().cells().len(),
             zone_demand: &demand,
             demand_drivers: demand
                 .values
@@ -804,7 +804,7 @@ impl SpecialBuildingPlacement {
         let [x, y] = self.road_at;
         let xy = vec2(x, y);
         let road = xy.is_finite().then(|| {
-            let z = map.environment.height(xy).unwrap_or_default();
+            let z = map.environment().height(xy).unwrap_or_default();
             map.project(xy.z(z), 0.0, ProjectFilter::ROAD).kind
         });
         let Some(ProjectKind::Road(connected_road)) = road else {

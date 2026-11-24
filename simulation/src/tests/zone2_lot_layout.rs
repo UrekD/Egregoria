@@ -169,8 +169,8 @@ fn zone2_switching_layout_regenerates_only_empty_lots_and_keeps_zoning() {
 
         // Zoning paint is geometry and survives; the new lots read it back.
         let grid = test.g.read::<ZoneGrid>();
-        assert_eq!(grid.cells, zones.cells);
-        assert_eq!(grid.generation, zones.generation);
+        assert_eq!(grid.cells(), zones.cells());
+        assert_eq!(grid.generation(), zones.generation());
         let lots: Vec<_> = map.lots().values().filter(|l| l.parent == road).collect();
         assert!(lots.len() >= 8, "only {} lots regenerated", lots.len());
         assert!(lots.iter().all(|lot| grid.lot_zone(&lot.shape).is_some()));
@@ -195,7 +195,7 @@ fn zone2_switching_layout_regenerates_only_empty_lots_and_keeps_zoning() {
 fn zone2_set_lot_layout_replays_deterministically() {
     let run = || {
         let mut sim = recorded_sim();
-        let z = sim.map().environment.height(vec2(600.0, 600.0)).unwrap();
+        let z = sim.map().environment().height(vec2(600.0, 600.0)).unwrap();
         let commands = [
             connect(vec3(600.0, 600.0, z), vec3(900.0, 600.0, z)),
             WorldCommand::SetLotLayout(LotLayout::Uniform),
@@ -233,7 +233,7 @@ fn zone2_new_game_option_sets_the_layout_and_replays() {
     };
     let mut city = Simulation::new_game_with_replay(&options).unwrap();
     assert_eq!(city.map().lot_layout(), LotLayout::Uniform);
-    let ground = city.map().environment.height(vec2(600.0, 600.0)).unwrap();
+    let ground = city.map().environment().height(vec2(600.0, 600.0)).unwrap();
     city.apply_commands([&connect(
         vec3(600.0, 600.0, ground),
         vec3(900.0, 600.0, ground),

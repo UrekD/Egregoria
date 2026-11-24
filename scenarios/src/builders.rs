@@ -53,7 +53,7 @@ pub fn grid_city(
             let map = ctx.sim().map();
             let project = |x, y| {
                 let xy = origin + vec2(x as f32, y as f32) * spacing;
-                let z = map.environment.height(xy).unwrap_or_default();
+                let z = map.environment().height(xy).unwrap_or_default();
                 map.project(xy.z(z), 0.0, ProjectFilter::INTER | ProjectFilter::ROAD)
             };
             let from = project(x, y);
@@ -332,7 +332,7 @@ fn roadside_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
                 }
 
                 let obb = OBB::new(center, outward, size.w, size.h);
-                if map.environment.height(center).is_none()
+                if map.environment().height(center).is_none()
                     || map.spatial_map().query(obb, filter).any(|p| p != project)
                 {
                     continue;
@@ -358,7 +358,7 @@ mod tests {
         let map = sink.sim().map();
         let project = |x, y| {
             let pos = vec2(x, y);
-            let z = map.environment.height(pos).unwrap();
+            let z = map.environment().height(pos).unwrap();
             map.project(pos.z(z), 0.0, ProjectFilter::INTER | ProjectFilter::ROAD)
         };
         let (from, to) = (project(700.0, 700.0), project(860.0, 700.0));

@@ -11,7 +11,7 @@ use goryak::{
     padxy, selectable_label_primary, textc, tooltip,
 };
 use simulation::economy::progression::{can_build, BuildCapability, LockedUntil};
-use simulation::map::{Density, LotLayout, ZoneGrid, ZoneKind, ZONE_CELL_SIZE};
+use simulation::map::{Density, EligiblePaintCells, LotLayout, ZoneGrid, ZoneKind, ZONE_CELL_SIZE};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 use std::sync::Arc;
@@ -61,11 +61,10 @@ pub(crate) fn density_name(density: Density) -> &'static str {
 }
 
 pub(crate) struct ZoningPreview<'a> {
-    pub areas: &'a [OBB],
+    pub stamp: &'a EligiblePaintCells,
     pub pointer: Option<Vec2>,
     pub hover_radius: f32,
     pub pitch: f32,
-    pub kind: Option<ZoneKind>,
     pub density: Density,
     pub held: bool,
 }
@@ -358,22 +357,7 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         *grid = (world, Arc::new((*zones).clone()));
     }
     let grid = grid.1.clone();
-    // The renderer uses the same rectangles for fill and projected lot votes.
-    // On a water map, turn the accepted storage cells into those rectangles.
-    let mut filtered = Vec::new();
-    let preview = if map.environment().has_water_configuration() {
-        for area in &areas {
-            if let Ok(stamp) = ZoneGrid::eligible_paint_cells(&map, area, state.kind) {
-                filtered.extend(stamp.cells().iter().map(|&(x, y)| {
-                    let center = (vec2(x as f32, y as f32) + Vec2::splat(0.5)) * ZONE_CELL_SIZE;
-                    OBB::new(center, Vec2::X, ZONE_CELL_SIZE, ZONE_CELL_SIZE)
-                }));
-            }
-        }
-        &filtered
-    } else {
-        &areas
-    };
+    let stamp = ZoneGrid::eligible_paint_stroke(&map, &areas, state.kind);
     let warning = MapRenderer::queue_zoning_overlay(
         &map,
         grid,
@@ -381,7 +365,7 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         camera.camera.pos.xy(),
         camera.camera.dist,
         ZoningPreview {
-            areas: preview,
+            stamp: &stamp,
             pointer,
             hover_radius: if state.rectangle {
                 pitch
@@ -389,7 +373,6 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
                 state.brush_side()
             } + 16.0,
             pitch,
-            kind: state.kind,
             density: state.density,
             held,
         },
@@ -455,10 +438,13 @@ mod tests {
         let center = Vec2::splat(3.0);
         let bounds = AABB::new_ll_ur(Vec2::ZERO, Vec2::splat(512.0));
         let area = paint_area(center - radius, center + radius, bounds, state.pitch()).unwrap();
-        grid.paint(area, state.kind, state.density);
-        assert_eq!(grid.cells.len(), 36);
+        let mut map = simulation::map::Map::empty();
+        assert!(map.install_environment(simulation::map::Environment::new(1, 1)));
+        grid.paint_on_map(&map, &area, state.kind, state.density)
+            .unwrap();
+        assert_eq!(grid.cells().len(), 36);
         assert_eq!(
-            grid.cells.keys().copied().collect::<Vec<_>>(),
+            grid.cells().keys().copied().collect::<Vec<_>>(),
             (4..10)
                 .flat_map(|x| (4..10).map(move |y| (x, y)))
                 .collect::<Vec<_>>()
@@ -519,10 +505,14 @@ mod tests {
             let edge = (bounds.ur / pitch).ceil() - Vec2::splat(1.0);
             let area = paint_area(edge, edge + Vec2::splat(5.0), bounds, pitch).unwrap();
             let mut grid = ZoneGrid::default();
-            grid.paint(area, Some(ZoneKind::Office), Density::Medium);
-            assert_eq!(grid.cells.keys().copied().collect::<Vec<_>>(), [(62, 62)]);
-            grid.paint(area, None, Density::Medium);
-            assert!(grid.cells.is_empty());
+            let mut map = simulation::map::Map::empty();
+            assert!(map.install_environment(simulation::map::Environment::new(1, 1)));
+            grid.paint_on_map(&map, &area, Some(ZoneKind::Office), Density::Medium)
+                .unwrap();
+            assert_eq!(grid.cells().keys().copied().collect::<Vec<_>>(), [(62, 62)]);
+            grid.paint_on_map(&map, &area, None, Density::Medium)
+                .unwrap();
+            assert!(grid.cells().is_empty());
         }
     }
 

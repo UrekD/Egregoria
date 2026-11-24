@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use geom::Vec2;
+use geom::{Shape, Vec2};
 use serde::{Deserialize, Serialize};
 use slotmapd::Key;
 
@@ -213,12 +213,13 @@ impl SerializedMap {
             }
         }
         for (id, building) in self.buildings.iter() {
-            let points = building
-                .obb
-                .corners
-                .iter()
-                .chain(building.zone.iter().flat_map(|zone| zone.poly.iter()));
-            if points.into_iter().any(|point| !point.is_finite()) {
+            if building.obb.corners.iter().any(|point| !point.is_finite())
+                || !super::valid_building_index_bounds(building.obb.bbox())
+                || building
+                    .zone
+                    .as_ref()
+                    .is_some_and(|zone| zone.validated_area().is_none())
+            {
                 return Err(format!("building {id:?} has invalid spatial bounds"));
             }
         }

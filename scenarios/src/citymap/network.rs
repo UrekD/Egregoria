@@ -2209,7 +2209,7 @@ fn validate_profile(map: &Map, graph: &Graph, link: &LinkSpec, road: &Road) -> R
         to,
         segment,
         link.class == RoadClass::Rail,
-        &map.environment,
+        map.environment(),
     );
     if error.is_some() || !same_profile(&expected, &road.points) {
         return Err(format!(
@@ -2226,7 +2226,7 @@ fn validate_profile(map: &Map, graph: &Graph, link: &LinkSpec, road: &Road) -> R
             expected.first().z - ROAD_Z_OFFSET,
             expected.last().z - ROAD_Z_OFFSET,
             MAX_SLOPE,
-            &map.environment,
+            map.environment(),
         );
         if error.is_some() || !same_profile(&terrain_trim, &road.interfaced_points) {
             return Err(format!("live trimmed centreline drift for {:?}", link.key));

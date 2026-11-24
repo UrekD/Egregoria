@@ -49,7 +49,7 @@ fn p4a_seed_controls_terrain_and_rng_deterministically() {
     assert_ne!(sim.hashes()["map"], other.hashes()["map"]);
     let map = sim.map();
     let other_map = other.map();
-    let (width, height) = map.environment.size();
+    let (width, height) = map.environment().size();
     let samples_per_chunk = crate::map::TerrainChunkID::SIZE as usize / 64;
     let mut different = 0;
     let (width, height) = (
@@ -59,8 +59,8 @@ fn p4a_seed_controls_terrain_and_rng_deterministically() {
     for y in 0..height {
         for x in 0..width {
             let point = vec2(x as f32, y as f32) * 64.0;
-            let a = map.environment.true_height(point).unwrap();
-            let b = other_map.environment.true_height(point).unwrap();
+            let a = map.environment().true_height(point).unwrap();
+            let b = other_map.environment().true_height(point).unwrap();
             different += usize::from((a - b).abs() > 0.5);
         }
     }
@@ -107,13 +107,13 @@ fn p4a_flat_preset_grows_seeded_trees_on_a_constant_heightmap() {
     .unwrap();
     for city in [&sim, &other] {
         let map = city.map();
-        assert_eq!(map.environment.size(), (16, 16));
-        let elevation = map.environment.true_height(vec2(0.0, 0.0)).unwrap();
+        assert_eq!(map.environment().size(), (16, 16));
+        let elevation = map.environment().true_height(vec2(0.0, 0.0)).unwrap();
         assert!((elevation - 10.0).abs() < 0.016);
         for point in [vec2(0.0, 0.0), vec2(677.0, 2180.0), vec2(8180.0, 8179.0)] {
-            assert_eq!(map.environment.true_height(point), Some(elevation));
+            assert_eq!(map.environment().true_height(point), Some(elevation));
         }
-        assert!(map.environment.trees.objects().next().is_some());
+        assert!(map.environment().trees.objects().next().is_some());
     }
     assert_ne!(sim.hashes()["map"], other.hashes()["map"]);
 }
@@ -133,7 +133,7 @@ fn p4a_starter_layout_is_connected_and_affordable_at_both_size_limits() {
                 };
                 let sim = Simulation::new_game(&opts).unwrap();
                 let map = sim.map();
-                assert_eq!(map.environment.size(), (terrain_chunks, terrain_chunks));
+                assert_eq!(map.environment().size(), (terrain_chunks, terrain_chunks));
                 let station = map
                     .buildings()
                     .values()
@@ -243,7 +243,7 @@ fn s5_zone_lock_precedes_charging_and_keeps_erase_available() {
     assert_eq!(free_build.read::<CommandOutcomes>().accepted.len(), 1);
     assert!(free_build
         .read::<ZoneGrid>()
-        .cells
+        .cells()
         .values()
         .any(|cell| cell.density == Density::High));
 }

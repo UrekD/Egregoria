@@ -3,7 +3,7 @@ use crate::map::{
     Buildings, ElectricityCache, Environment, LanePattern, RoadID, Roads, SpatialMap,
 };
 use egui_inspect::debug_inspect_impl;
-use geom::{Color, Polygon, Vec2, Vec3, OBB};
+use geom::{Color, Polygon, Shape, Vec2, Vec3, AABB, OBB};
 use prototypes::{BuildingGen, FreightStationPrototypeID, GoodsCompanyID};
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
@@ -45,6 +45,20 @@ pub struct StraightRoadGen {
 
 pub const MAX_ZONE_AREA: f32 = 50000.0; // in m²
 pub const MAX_ZONE_PERIMETER: f32 = 3000.0;
+
+// Keep each independently indexed shape bounded before it reaches the 50 m grid.
+pub(crate) fn valid_building_index_bounds(bounds: AABB) -> bool {
+    const MAX_SPAN: f32 = MAX_ZONE_PERIMETER * 0.5;
+    const MAX_COORD: f32 = 512.0 * crate::NewGameOptions::MAX_TERRAIN_CHUNKS as f32 + MAX_SPAN;
+    bounds.ll.is_finite()
+        && bounds.ur.is_finite()
+        && bounds.ll.x >= -MAX_SPAN
+        && bounds.ll.y >= -MAX_SPAN
+        && bounds.ur.x <= MAX_COORD
+        && bounds.ur.y <= MAX_COORD
+        && bounds.size().x <= MAX_SPAN
+        && bounds.size().y <= MAX_SPAN
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
@@ -95,8 +109,9 @@ impl Zone {
             && self.poly.iter().all(|point| point.is_finite())
             && area > 0.0
             && area <= MAX_ZONE_AREA
-            && perimeter <= MAX_ZONE_PERIMETER)
-            .then_some(area)
+            && perimeter <= MAX_ZONE_PERIMETER
+            && valid_building_index_bounds(self.poly.bbox()))
+        .then_some(area)
     }
 }
 
@@ -119,6 +134,7 @@ impl Building {
 
     pub(crate) fn valid_footprint(obb: &OBB, gen: BuildingGen) -> bool {
         obb.corners.iter().all(|corner| corner.is_finite())
+            && valid_building_index_bounds(obb.bbox())
             && obb
                 .axis()
                 .iter()
@@ -201,6 +217,9 @@ impl Building {
     ) -> Option<BuildingID> {
         if !Self::valid_footprint(&obb, gen)
             || connected_road.is_some_and(|road| !roads.contains_key(road))
+            || zone
+                .as_ref()
+                .is_some_and(|zone| zone.validated_area().is_none())
             || !Self::dry_footprint(env, &obb, zone.as_ref())
         {
             return None;

@@ -130,7 +130,7 @@ pub(crate) fn prepare_ground(
             renderer.set_ground_overlay(gfx, None, true);
         }
 
-        let bounds = map.environment.bounds();
+        let bounds = map.environment().bounds();
         let mut atlas = Atlas::new(bounds.ll, bounds.ur - bounds.ll);
         cache.mode = mode;
         if atlas.len() == 0 {

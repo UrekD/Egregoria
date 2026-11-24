@@ -234,7 +234,7 @@ fn connect_freight(ctx: &mut ScenarioCtx, grid_point: Vec2) -> Result<BuildingID
     let (command, station) = {
         let map = ctx.sim.map();
         let point = |xy: Vec2| {
-            let height = map.environment.height(xy).unwrap_or_default();
+            let height = map.environment().height(xy).unwrap_or_default();
             map.project(xy.z(height), 0.0, ProjectFilter::INTER)
         };
         let station = map
@@ -255,7 +255,7 @@ fn connect_freight(ctx: &mut ScenarioCtx, grid_point: Vec2) -> Result<BuildingID
     let road = {
         let map = ctx.sim.map();
         let center = (grid_point + FREIGHT_APPROACH) * 0.5;
-        let height = map.environment.height(center).unwrap_or_default();
+        let height = map.environment().height(center).unwrap_or_default();
         let ProjectKind::Road(road) = map.project(center.z(height), 0.0, ProjectFilter::ROAD).kind
         else {
             return Err("freight approach road is missing".into());
@@ -552,13 +552,13 @@ mod tests {
         let zones = starter.sim.read::<ZoneGrid>();
         assert_eq!(
             zones
-                .cells
+                .cells()
                 .values()
                 .map(|cell| cell.kind)
                 .collect::<BTreeSet<_>>(),
             BTreeSet::from([Residential, Commercial, Industrial]),
         );
-        assert!(zones.cells.values().all(|cell| cell.density == Low));
+        assert!(zones.cells().values().all(|cell| cell.density == Low));
         assert!(starter.sim.world().humans.is_empty());
         assert_eq!(starter.sim.world().trains.len(), 1);
         assert!(starter.sim.get_tick() < TICKS_PER_HOUR);

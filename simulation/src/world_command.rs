@@ -18,8 +18,8 @@ use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
     Building, BuildingID, BuildingKind, Density, Environment, IntersectionID, LaneID, LaneKind,
     LanePattern, LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, ProjectKind,
-    RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, Zone, ZoneGrid,
-    ZoneKind, ZonePaintError, MAX_WATER_BATCH_WORK,
+    RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, Zone,
+    ZoneCellCoord, ZoneGrid, ZoneKind, ZonePaintError, MAX_WATER_BATCH_WORK,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
@@ -788,24 +788,30 @@ impl WorldCommand {
             }
         }
 
-        if let MapMakeMultipleConnections(projects, links) = self {
+        if water.guard_terraform {
             const MAX_WET_DESCRIPTORS: usize = 65_536;
-            if water.guard_terraform {
-                let count = projects.len().saturating_add(links.len());
-                let descriptors_fit = count <= MAX_WET_DESCRIPTORS
-                    && links
-                        .iter()
-                        .try_fold(count, |count, (_, _, _, pattern)| {
-                            let total = count
-                                .saturating_add(pattern.lanes_forward.len())
-                                .saturating_add(pattern.lanes_backward.len());
-                            (total <= MAX_WET_DESCRIPTORS).then_some(total)
-                        })
-                        .is_some();
-                if !descriptors_fit {
-                    self.reject(sim, Rejection::WaterWorkLimit);
-                    return;
+            let fits = match self {
+                MapMakeConnection { pat, .. } => crate::map::wet_lane_count_fits(pat),
+                MapMakeMultipleConnections(projects, links) => {
+                    let count = projects.len().saturating_add(links.len());
+                    count <= MAX_WET_DESCRIPTORS
+                        && links
+                            .iter()
+                            .try_fold(count, |count, (_, _, _, pattern)| {
+                                let total = count
+                                    .saturating_add(pattern.lanes_forward.len())
+                                    .saturating_add(pattern.lanes_backward.len());
+                                (total <= MAX_WET_DESCRIPTORS
+                                    && crate::map::wet_lane_count_fits(pattern))
+                                .then_some(total)
+                            })
+                            .is_some()
                 }
+                _ => true,
+            };
+            if !fits {
+                self.reject(sim, Rejection::WaterWorkLimit);
+                return;
             }
         }
 
@@ -830,6 +836,36 @@ impl WorldCommand {
             }
         }
 
+        if matches!(
+            self,
+            MapMakeConnection { .. } | MapMakeMultipleConnections(..)
+        ) && sim.map().environment().has_water_configuration()
+        {
+            let result = match self {
+                MapMakeMultipleConnections(projects, links) => {
+                    Some(self.apply_connections(sim, projects, links, construction))
+                }
+                MapMakeConnection {
+                    from,
+                    to,
+                    inter,
+                    pat,
+                } => Some(
+                    Self::apply_connection(sim, *from, *to, *inter, pat, construction)
+                        .map(|()| true),
+                ),
+                _ => None,
+            };
+            if let Some(result) = result {
+                match result {
+                    Ok(true) => self.record_for_replay(sim),
+                    Ok(false) => {}
+                    Err(reason) => self.reject(sim, reason),
+                }
+                return;
+            }
+        }
+
         self.record_for_replay(sim);
         if is_transit {
             return;
@@ -840,13 +876,10 @@ impl WorldCommand {
                 area,
                 kind,
                 density,
-            } => sim
-                .write::<ZoneGrid>()
-                .paint_on_map(&sim.map(), area, *kind, *density)
-                .map_err(Rejection::from),
-            MapMakeMultipleConnections(projects, links) => {
-                self.apply_connections(sim, projects, links, construction)
-            }
+            } => Self::apply_zone_paint(sim, area, *kind, *density, |_| true),
+            MapMakeMultipleConnections(projects, links) => self
+                .apply_connections(sim, projects, links, construction)
+                .map(|_| ()),
             MapMakeConnection {
                 from,
                 to,
@@ -1029,7 +1062,7 @@ impl WorldCommand {
                             let road = connected_road
                                 .and_then(|road| map.get(road))
                                 .ok_or(Rejection::MissingReference)?;
-                            let door = Building::door_position(pos, *gen, &map.environment);
+                            let door = Building::door_position(pos, *gen, map.environment());
                             let snap_distance = proto.size.diag() * 0.5 + road.width * 0.5;
                             let nearest = road.points().project(door);
                             if !door.is_close(nearest, snap_distance) {
@@ -1124,6 +1157,18 @@ impl WorldCommand {
         }
     }
 
+    pub(crate) fn apply_zone_paint(
+        sim: &Simulation,
+        area: &OBB,
+        kind: Option<ZoneKind>,
+        density: Density,
+        owns: impl FnMut(ZoneCellCoord) -> bool,
+    ) -> Result<(), Rejection> {
+        sim.write::<ZoneGrid>()
+            .paint_on_map_with_land(&sim.map(), area, kind, density, owns)
+            .map_err(Rejection::from)
+    }
+
     fn apply_connection(
         sim: &Simulation,
         from: MapProject,
@@ -1133,23 +1178,16 @@ impl WorldCommand {
         construction: BudgetCategory,
     ) -> Result<(), Rejection> {
         let mut map = sim.map_mut();
-        let from = map
-            .resolve_connection_endpoint(from)
-            .ok_or(Rejection::InvalidConnection)?;
-        let to = map
-            .resolve_connection_endpoint(to)
-            .ok_or(Rejection::InvalidConnection)?;
-        if !Map::can_connect(from, to, inter, pattern) {
-            return Err(Rejection::InvalidConnection);
-        }
-        if map.environment().has_water_configuration() {
-            let mut work = MAX_WATER_BATCH_WORK;
-            map.preflight_water_connection(from, to, inter, pattern, &mut work)
-                .map_err(Rejection::water_connection_error)?;
-        }
+        let mut work = map
+            .environment()
+            .has_water_configuration()
+            .then_some(MAX_WATER_BATCH_WORK);
+        let (from, to) = map
+            .prepare_connection(from, to, inter, pattern, work.as_mut())
+            .map_err(Rejection::water_connection_error)?;
         let cost =
             Self::affordable_cost(sim, Government::connection_cost(from.pos, to.pos, pattern))?;
-        map.make_resolved_connection(from, to, inter, pattern);
+        map.make_resolved_connection(from, to, inter, pattern, work.as_mut());
         Self::charge_construction(sim, cost, construction);
         Ok(())
     }
@@ -1160,7 +1198,7 @@ impl WorldCommand {
         projects: &[MapProject],
         links: &[(usize, usize, Option<Vec2>, LanePattern)],
         construction: BudgetCategory,
-    ) -> Result<(), Rejection> {
+    ) -> Result<bool, Rejection> {
         if links
             .iter()
             .any(|&(from, to, _, _)| from >= projects.len() || to >= projects.len())
@@ -1176,6 +1214,7 @@ impl WorldCommand {
             .collect();
         let mut junctions = BTreeSet::new();
         let mut splits = BTreeMap::new();
+        let mut connected_any = false;
         let record_link = |index, result: Result<(), Rejection>| {
             sim.write::<CommandOutcomes>()
                 .record_link(index, result.map_err(|reason| (self.kind(), reason)));
@@ -1187,12 +1226,12 @@ impl WorldCommand {
                     if splits.contains_key(&id) {
                         return map.reproject_split_endpoint(id, project.pos, &splits, water_work.as_mut());
                     }
-                    if let Some(work) = &mut water_work {
-                        let points = map.get(id).map_or(0, |road| road.points().len());
-                        crate::map::spend_water_work(work, points)?;
-                    }
                 }
-                Ok(map.resolve_connection_endpoint(project))
+                if let Some(work) = &mut water_work {
+                    map.resolve_water_connection_endpoint(project, work)
+                } else {
+                    Ok(map.resolve_connection_endpoint(project))
+                }
             };
             let (fromproj, toproj) = match resolve(from).and_then(|start| Ok(start.zip(resolve(to)?))) {
                 Ok(Some(pair)) => pair,
@@ -1244,24 +1283,21 @@ impl WorldCommand {
                 junctions.insert(id);
             }
             Self::charge_construction(sim, cost, construction);
+            connected_any = true;
             record_link(index, Ok(()));
         }
         // Keep junction IDs alive until every link that names them has been processed.
         for junction in junctions {
-            if let Some(work) = &mut water_work {
-                let points: usize = map.get(junction).into_iter()
-                    .flat_map(|intersection| intersection.roads.iter())
-                    .filter_map(|&road| map.get(road))
-                    .map(|road| road.points().len())
-                    .sum();
-                if crate::map::spend_water_work(work, 1 + points).is_err() {
-                    break;
-                }
+            if map
+                .merge_shallow_junction(junction, water_work.as_mut())
+                .is_err()
+                && water_work == Some(0)
+            {
+                break;
             }
-            map.merge_shallow_junction(junction);
         }
         map.check_invariants();
-        Ok(())
+        Ok(connected_any)
     }
 
     fn apply_one(
@@ -1352,9 +1388,12 @@ impl WorldCommand {
                     .ok_or(Rejection::MutationFailed)?;
             }
 
-            MapLoadParis => load_parismap(&mut sim.map_mut()),
+            MapLoadParis => {
+                load_parismap(&mut sim.map_mut()).map_err(|_| Rejection::WaterConfigured)?;
+            }
             MapLoadTestField { pos, size, spacing } => {
                 load_testfield(&mut sim.map_mut(), pos, size, spacing)
+                    .map_err(|_| Rejection::WaterConfigured)?;
             }
             SetWarehousePolicy { building, policy } => {
                 let company = Self::warehouse_company(sim, building)?;
@@ -1533,7 +1572,10 @@ fn build_starting_external_trading(sim: &mut Simulation) -> bool {
     let road = {
         let mut map = sim.map_mut();
         let ground = |pos: Vec3| {
-            MapProject::ground(pos.xy().z(map.environment.height(pos.xy()).unwrap_or(pos.z)))
+            MapProject::ground(
+                pos.xy()
+                    .z(map.environment().height(pos.xy()).unwrap_or(pos.z)),
+            )
         };
         let from = ground(c - offy * 100.0);
         let to = ground(c + offy * 120.0);

@@ -281,22 +281,41 @@ fn register_pending_construction_cuts() {
             optional: true,
             save: Box::new(|sim| Bincode::encode(&sim.map().pending_construction_cuts).unwrap()),
             load: Box::new(|sim, data| {
-                let pending = Bincode::decode::<BTreeSet<TerrainChunkID>>(data)?;
                 let mut map = sim.map_mut();
-                if pending
-                    .iter()
-                    .any(|&chunk| map.environment().get_chunk(chunk).is_none())
-                {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        "invalid construction cut chunk",
-                    ));
-                }
-                map.pending_construction_cuts = pending;
+                map.pending_construction_cuts =
+                    decode_pending_cut_chunks(data, map.environment().size())?;
                 Ok(())
             }),
         });
     }
+}
+
+fn decode_pending_cut_chunks(
+    data: &[u8],
+    (width, height): (u16, u16),
+) -> std::io::Result<BTreeSet<TerrainChunkID>> {
+    use std::io::{Cursor, Error, ErrorKind};
+    let mut reader = Cursor::new(data);
+    // The sequence length is a varint, followed by the individual chunk keys.
+    let count: u64 = Bincode::decode_reader(&mut reader)?;
+    let invalid = |message| Error::new(ErrorKind::InvalidData, message);
+    if count > u64::from(width) * u64::from(height) {
+        return Err(invalid("too many construction cut chunks"));
+    }
+    let mut chunks = BTreeSet::new();
+    for _ in 0..count {
+        let chunk: TerrainChunkID = Bincode::decode_reader(&mut reader)?;
+        if chunk.0 < 0 || chunk.1 < 0 || chunk.0 as u16 >= width || chunk.1 as u16 >= height {
+            return Err(invalid("invalid construction cut chunk"));
+        }
+        if !chunks.insert(chunk) {
+            return Err(invalid("duplicate construction cut chunk"));
+        }
+    }
+    if reader.position() != data.len() as u64 {
+        return Err(invalid("trailing construction cut data"));
+    }
+    Ok(chunks)
 }
 
 // The layout lives on the map, which sizes lots as roads are built. A separate entry keeps the

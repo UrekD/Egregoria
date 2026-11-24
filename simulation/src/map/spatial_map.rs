@@ -76,13 +76,21 @@ pub trait SpatialMapObject {
     fn kind(&self) -> ProjectKind;
     fn shape(&self) -> ShapeEnum;
 
-    fn bounds(&self, shape: &ShapeEnum) -> AABB {
-        shape.bbox()
+    fn additional_occupancy(&self) -> Option<AABB> {
+        None
+    }
+
+    fn cut_influence(&self) -> Option<AABB> {
+        None
     }
 }
 
 pub struct SpatialMap {
     broad: AABBGrid<ProjectKind, AABB>,
+    occupancy: AABBGrid<ProjectKind, AABB>,
+    occupancy_ids: BTreeMap<ProjectKind, AABBGridHandle>,
+    cuts: AABBGrid<ProjectKind, AABB>,
+    cut_ids: BTreeMap<ProjectKind, AABBGridHandle>,
     near: BTreeMap<ProjectKind, ShapeEnum>,
     ids: BTreeMap<ProjectKind, AABBGridHandle>,
 }
@@ -91,6 +99,10 @@ impl Default for SpatialMap {
     fn default() -> Self {
         Self {
             broad: AABBGrid::new(50),
+            occupancy: AABBGrid::new(50),
+            occupancy_ids: Default::default(),
+            cuts: AABBGrid::new(512),
+            cut_ids: Default::default(),
             near: Default::default(),
             ids: Default::default(),
         }
@@ -101,10 +113,11 @@ impl SpatialMap {
     pub fn insert(&mut self, obj: &impl SpatialMapObject) {
         let kind = obj.kind();
         let shape = obj.shape();
-        let handle = self.broad.insert(obj.bounds(&shape), kind);
+        let handle = self.broad.insert(shape.bbox(), kind);
         if let Some(old_handle) = self.ids.insert(kind, handle) {
             self.broad.remove(old_handle);
         }
+        self.update_auxiliary(obj);
         self.near.insert(kind, shape);
     }
 
@@ -112,6 +125,12 @@ impl SpatialMap {
         let kind = kind.into();
         if let Some(id) = self.ids.remove(&kind) {
             self.broad.remove(id);
+            if let Some(handle) = self.occupancy_ids.remove(&kind) {
+                self.occupancy.remove(handle);
+            }
+            if let Some(handle) = self.cut_ids.remove(&kind) {
+                self.cuts.remove(handle);
+            }
             self.near.remove(&kind);
         } else {
             warn!(
@@ -125,7 +144,8 @@ impl SpatialMap {
         let kind = obj.kind();
         let shape = obj.shape();
         if let Some(id) = self.ids.get(&kind) {
-            self.broad.set_aabb(*id, obj.bounds(&shape));
+            self.broad.set_aabb(*id, shape.bbox());
+            self.update_auxiliary(obj);
             self.near.insert(kind, shape);
         } else {
             warn!(
@@ -133,6 +153,41 @@ impl SpatialMap {
                 kind
             )
         }
+    }
+
+    fn update_auxiliary(&mut self, obj: &impl SpatialMapObject) {
+        for (bounds, grid, ids) in [
+            (
+                obj.additional_occupancy(),
+                &mut self.occupancy,
+                &mut self.occupancy_ids,
+            ),
+            (obj.cut_influence(), &mut self.cuts, &mut self.cut_ids),
+        ] {
+            let kind = obj.kind();
+            match (ids.get(&kind).copied(), bounds) {
+                (Some(handle), Some(bounds)) => grid.set_aabb(handle, bounds),
+                (None, Some(bounds)) => {
+                    ids.insert(kind, grid.insert(bounds, kind));
+                }
+                (Some(handle), None) => {
+                    grid.remove(handle);
+                    ids.remove(&kind);
+                }
+                (None, None) => {}
+            }
+        }
+    }
+
+    pub(super) fn update_cut_influence(&mut self, obj: &impl SpatialMapObject) {
+        if let Some(&handle) = self.cut_ids.get(&obj.kind()) {
+            self.cuts
+                .set_aabb(handle, obj.cut_influence().expect("indexed cut influence"));
+        }
+    }
+
+    pub(super) fn cut_candidates(&self, bounds: AABB) -> impl Iterator<Item = ProjectKind> + '_ {
+        self.cuts.query(bounds).map(|(_, _, &object)| object)
     }
 
     pub fn query_around(
@@ -155,14 +210,19 @@ impl SpatialMap {
             .filter_map(move |(_, _, p)| shape.intersects(self.near.get(p)?).then_some(*p))
     }
 
-    /// Bounds include both shapes of a zoned building. Callers test the shapes separately.
+    /// A zoned building has separate bounds for its polygon and physical footprint.
     pub(crate) fn construction_candidates(
         &self,
         bounds: AABB,
         filter: ProjectFilter,
     ) -> impl Iterator<Item = ProjectKind> + '_ {
+        let additional = self.occupancy.query(bounds).filter(move |&(_, _, object)| {
+            let primary = self.broad.get(self.ids[object]).unwrap().aabb;
+            !primary.intersects(&bounds)
+        });
         self.broad
             .query(bounds)
+            .chain(additional)
             .filter(move |&(_, _, object)| filter.test(object))
             .map(|(_, _, object)| *object)
     }
@@ -171,13 +231,17 @@ impl SpatialMap {
         self.broad
             .handles()
             .filter_map(move |x| self.broad.get(x))
+            .chain(
+                self.occupancy
+                    .handles()
+                    .filter_map(move |x| self.occupancy.get(x)),
+            )
             .map(|obj| obj.aabb)
     }
 
     pub fn contains<T: Into<ProjectKind>>(&self, p: T) -> bool {
         let kind = p.into();
 
-        self.ids.contains_key(&kind);
         let v = unwrap_ret!(self.ids.get(&kind), false);
         self.broad.get(*v).is_some() && self.near.get(&kind).is_some()
     }
@@ -195,6 +259,12 @@ impl SpatialMapObject for Intersection {
     fn shape(&self) -> ShapeEnum {
         self.bcircle().into()
     }
+
+    fn cut_influence(&self) -> Option<AABB> {
+        let mut circle = self.bcircle();
+        circle.radius *= 2.0;
+        Some(circle.bbox())
+    }
 }
 
 impl SpatialMapObject for Road {
@@ -204,6 +274,15 @@ impl SpatialMapObject for Road {
 
     fn shape(&self) -> ShapeEnum {
         self.boldline().into()
+    }
+
+    fn cut_influence(&self) -> Option<AABB> {
+        Some(
+            self.points()
+                .bbox()
+                .flatten()
+                .expand(13.0 + self.width * 3.0),
+        )
     }
 }
 
@@ -229,8 +308,12 @@ impl SpatialMapObject for Building {
         self.obb.into()
     }
 
-    fn bounds(&self, shape: &ShapeEnum) -> AABB {
-        shape.bbox().union(self.obb.bbox())
+    fn additional_occupancy(&self) -> Option<AABB> {
+        self.zone.as_ref().map(|_| self.obb.bbox())
+    }
+
+    fn cut_influence(&self) -> Option<AABB> {
+        Some(self.obb.expand(25.0).bbox())
     }
 }
 

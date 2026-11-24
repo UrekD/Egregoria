@@ -156,7 +156,7 @@ impl engine::framework::State for State {
             self.uiw.write::<InputMap>().ray = ray;
 
             if let Some(ray) = ray {
-                let cast = map.environment.raycast(ray);
+                let cast = map.environment().raycast(ray);
 
                 let inp = &mut self.uiw.write::<InputMap>();
 
@@ -861,8 +861,8 @@ impl State {
             ctx.delta,
             &self.uiw.read::<InputMap>(),
             &self.uiw.read::<Settings>(),
-            map.environment.bounds(),
-            |p| map.environment.height(p),
+            map.environment().bounds(),
+            |p| map.environment().height(p),
         );
         *self.uiw.write::<Camera>() = self.uiw.read::<OrbitCamera>().camera;
 
@@ -890,7 +890,10 @@ impl State {
             }
             for v in &*addr_of!(geom::DEBUG_OBBS) {
                 immediate
-                    .obb(*v, map.environment.height(v.center()).unwrap_or(0.0) + 8.0)
+                    .obb(
+                        *v,
+                        map.environment().height(v.center()).unwrap_or(0.0) + 8.0,
+                    )
                     .color(col);
             }
             for v in &*addr_of!(geom::DEBUG_SPLINES) {

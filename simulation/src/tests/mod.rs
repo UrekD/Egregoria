@@ -37,7 +37,7 @@ fn w0_water_height_free_change_records_once_and_retry_is_clean() {
         ..NewGameOptions::default()
     })
     .unwrap();
-    let initial_revision = sim.map().environment.water_revision();
+    let initial_revision = sim.map().environment().water_revision();
     let initial_commands = sim.read::<Replay>().command_count();
     let edit = WaterEdit::SetSeaLevel {
         level_dm: Some(-100),
@@ -46,8 +46,11 @@ fn w0_water_height_free_change_records_once_and_retry_is_clean() {
     let outcome = sim.edit_water(edit.clone()).unwrap();
     assert!(outcome.changed);
     assert!(outcome.dirty.terrain().is_empty());
-    assert_eq!(sim.map().environment.sea_level_dm(), Some(-100));
-    assert_eq!(sim.map().environment.water_revision(), initial_revision + 1);
+    assert_eq!(sim.map().environment().sea_level_dm(), Some(-100));
+    assert_eq!(
+        sim.map().environment().water_revision(),
+        initial_revision + 1
+    );
     {
         let replay = sim.read::<Replay>();
         assert_eq!(replay.command_count(), initial_commands + 1);
@@ -64,15 +67,18 @@ fn w0_water_height_free_change_records_once_and_retry_is_clean() {
     let retry = sim.edit_water(edit).unwrap();
     assert!(!retry.changed);
     assert_eq!(retry.dirty, WaterDirtyChunks::default());
-    assert_eq!(sim.map().environment.water_revision(), initial_revision + 1);
+    assert_eq!(
+        sim.map().environment().water_revision(),
+        initial_revision + 1
+    );
     assert_eq!(sim.read::<Replay>().command_count(), initial_commands + 1);
 
     let replay = sim.read::<Replay>().clone();
     let (mut replayed, mut loader) = Simulation::try_from_replay(replay).unwrap();
     assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
-    assert_eq!(replayed.map().environment.sea_level_dm(), Some(-100));
+    assert_eq!(replayed.map().environment().sea_level_dm(), Some(-100));
     assert_eq!(
-        replayed.map().environment.water_revision(),
+        replayed.map().environment().water_revision(),
         initial_revision + 1
     );
 }
@@ -92,7 +98,7 @@ fn w0_water_batch_reserves_one_sea_rebuild_and_preserves_dry_commands() {
     });
     let dry = WorldCommand::SetGameTime(*ctx.g.read::<GameTime>());
     ctx.g.apply_commands([&first, &dry, &second]);
-    assert_eq!(ctx.g.map().environment.sea_level_dm(), None);
+    assert_eq!(ctx.g.map().environment().sea_level_dm(), None);
     let outcomes = ctx.g.read::<CommandOutcomes>();
     assert_eq!(outcomes.accepted, [1]);
     for index in [0, 2] {
@@ -129,7 +135,7 @@ fn w0_water_full_dispatch_covers_odd_rectangular_maps() {
     use crate::map::{Environment, Map, SubscriberChunkID, UpdateType};
 
     let mut map = Map::empty();
-    map.environment = Environment::new(5, 3);
+    assert!(map.install_environment(Environment::new(5, 3)));
     let mut water = map.subscribe(UpdateType::Water);
     let mut support = map.subscribe(UpdateType::RoadSupport);
     map.dispatch_all();
@@ -141,7 +147,8 @@ fn w0_water_full_dispatch_covers_odd_rectangular_maps() {
     assert_eq!(water.take_updated_chunks().collect::<Vec<_>>(), expected);
     assert_eq!(support.take_updated_chunks().collect::<Vec<_>>(), expected);
 
-    map.environment = Environment::default();
+    let map = Map::empty();
+    let mut water = map.subscribe(UpdateType::Water);
     map.dispatch_all();
     assert!(water.take_cleared());
     assert_eq!(water.take_updated_chunks().count(), 0);
@@ -176,6 +183,21 @@ fn w0_water_zoning_checks_land_before_water_and_votes_from_prepared_cells() {
         ZoneGrid::eligible_paint_cells(&map, &wet, kind),
         Err(ZonePaintError::WetFootprint)
     ));
+    drop(map);
+    for kind in [kind, None] {
+        for locked in [(0, 0), (2, 0)] {
+            let before = sim.read::<ZoneGrid>().generation();
+            assert_eq!(
+                WorldCommand::apply_zone_paint(&sim, &mixed, kind, Density::Low, |key| key
+                    != locked),
+                Err(crate::world_command::Rejection::TileLocked),
+            );
+            let grid = sim.read::<ZoneGrid>();
+            assert_eq!(grid.generation(), before);
+            assert!(grid.cells().is_empty());
+        }
+    }
+    let map = sim.map();
     let paint = ZoneGrid::eligible_paint_cells(&map, &mixed, kind).unwrap();
     let erase = ZoneGrid::eligible_paint_cells(&map, &mixed, None).unwrap();
     assert_eq!(paint.cells(), &[(2, 0), (2, 1), (3, 0), (3, 1)]);
@@ -451,4 +473,234 @@ fn fast_tick_skips_serde() {
     fast.tick_fast();
 
     assert_eq!(fast.g.get_tick(), fast_tick + 2);
+}
+
+#[test]
+fn w0_water_rejects_excess_lanes_before_topology_and_replay() {
+    use crate::map::{LaneKind, LanePattern, MapProject, WaterEdit};
+    use crate::world_command::{CommandOutcomes, Rejection};
+    use crate::Replay;
+    use geom::vec3;
+
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+    sim.edit_water(WaterEdit::SetSeaLevel {
+        level_dm: Some(-100),
+    })
+    .unwrap();
+    sim.write::<Replay>().enabled = true;
+    let from = MapProject::ground(vec3(32.0, 96.0, 10.0));
+    let to = MapProject::ground(vec3(160.0, 96.0, 10.0));
+    let pat = LanePattern {
+        lanes_forward: vec![(LaneKind::Driving, 10.0); 17],
+        lanes_backward: vec![(LaneKind::Driving, 10.0); 16],
+    };
+    let single = WorldCommand::MapMakeConnection {
+        from,
+        to,
+        inter: None,
+        pat: pat.clone(),
+    };
+    let indexed = WorldCommand::MapMakeMultipleConnections(vec![from, to], vec![(0, 1, None, pat)]);
+    for command in [single, indexed] {
+        sim.apply_commands([&command]);
+        assert_eq!(
+            sim.read::<CommandOutcomes>().last[0].1,
+            Rejection::WaterWorkLimit
+        );
+        assert_eq!(sim.map().roads().len(), 0);
+        assert_eq!(sim.read::<Replay>().command_count(), 0);
+    }
+}
+
+#[test]
+fn w0_water_removing_last_cut_contributor_restores_base() {
+    use crate::map::{BuildingKind, Environment, Map, WaterBasin, WaterEdit};
+    use geom::{vec2, OBB};
+    use prototypes::BuildingGen;
+
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(5, 0).unwrap();
+    let mut terrain = Environment::new(5, 3);
+    terrain.terrain_apply(terrain.bounds(), |p| if p.x >= 1056.0 { 0.0 } else { 10.0 });
+    let mut map = Map::empty();
+    assert!(map.install_environment(terrain));
+    *sim.write::<Map>() = map;
+    let at = vec2(1064.0, 1048.0);
+    let building = sim
+        .map_mut()
+        .build_special_building(
+            &OBB::new(at, Vec2::X, 16.0, 16.0),
+            BuildingKind::ExternalTrading,
+            BuildingGen::NoWalkway {
+                door_pos: Vec2::ZERO,
+            },
+            None,
+            None,
+        )
+        .unwrap();
+    let node = vec2(1040.0, 1040.0);
+    let base = sim.map().environment().base_height(node);
+    sim.map_mut().update();
+    assert_ne!(sim.map().environment().true_height(node), base);
+    sim.apply_commands([&WorldCommand::MapRemoveBuilding(building)]);
+    sim.edit_water(WaterEdit::FillLake {
+        basin: WaterBasin::new(&[
+            node + vec2(1.0, 1.0),
+            node + vec2(15.0, 1.0),
+            node + vec2(15.0, 15.0),
+            node + vec2(1.0, 15.0),
+        ])
+        .unwrap(),
+        level_dm: 50,
+        depth_m: 1.0,
+    })
+    .unwrap();
+    {
+        let map = sim.map();
+        assert_eq!(
+            map.environment().true_height(node),
+            map.environment().base_height(node)
+        );
+    }
+    sim.map_mut().update();
+    let dry = vec2(1040.0, 1056.0 + 16.0);
+    let map = sim.map();
+    assert_eq!(
+        map.environment().true_height(dry),
+        map.environment().base_height(dry)
+    );
+}
+
+#[test]
+fn w0_water_detached_zone_has_two_spatial_entries() {
+    use crate::map::{BuildingKind, Zone};
+    use geom::{vec2, Polygon, OBB};
+    use prototypes::BuildingGen;
+
+    init_test_simulation();
+    let sim = Simulation::new_authored_flat(5, 0).unwrap();
+    let mut map = sim.map_mut();
+    let obb = OBB::new(vec2(200.0, 200.0), Vec2::X, 16.0, 16.0);
+    let polygon = Polygon::centered_rect(vec2(700.0, 700.0), 32.0, 32.0);
+    let building = map
+        .build_special_building(
+            &obb,
+            BuildingKind::ExternalTrading,
+            BuildingGen::NoWalkway {
+                door_pos: Vec2::ZERO,
+            },
+            Some(Zone::new(polygon, Vec2::X)),
+            None,
+        )
+        .unwrap();
+    assert_eq!(map.spatial_map().debug_grid().count(), 2);
+    use geom::Shape;
+    assert_eq!(
+        map.spatial_map
+            .construction_candidates(map.environment().bounds(), ProjectFilter::BUILDING,)
+            .collect::<Vec<_>>(),
+        [building.into()]
+    );
+    assert_eq!(
+        map.spatial_map
+            .construction_candidates(
+                OBB::new(vec2(450.0, 450.0), Vec2::X, 16.0, 16.0).bbox(),
+                ProjectFilter::BUILDING,
+            )
+            .count(),
+        0
+    );
+}
+
+#[test]
+fn w0_water_cut_slot_rejects_count_before_payload() {
+    use crate::map::TerrainChunkID;
+    use common::saveload::Bincode;
+    use std::collections::BTreeSet;
+
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+    let data = Bincode::encode(&BTreeSet::from([
+        TerrainChunkID::new_i16(0, 0),
+        TerrainChunkID::new_i16(1, 0),
+    ]))
+    .unwrap();
+    let error = unsafe { &*std::ptr::addr_of!(crate::init::SAVELOAD_FUNCS) }
+        .iter()
+        .find(|entry| entry.name == "pending_construction_cuts")
+        .unwrap();
+    let error = (error.load)(&mut sim, &data[..1]).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("too many construction cut chunks"),
+        "{error}"
+    );
+}
+
+#[test]
+fn w0_water_direct_imports_reject_empty_configured_sea() {
+    use crate::map::{procgen, WaterEdit};
+
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+    sim.edit_water(WaterEdit::SetSeaLevel {
+        level_dm: Some(-100),
+    })
+    .unwrap();
+    assert!(!sim.map().environment().strict_water_siting());
+    let before = sim.hashes();
+    let rejected = Err(procgen::PresetImportError::WaterConfigured);
+    assert_eq!(procgen::load_parismap(&mut sim.map_mut()), rejected);
+    assert_eq!(
+        procgen::load_testfield(&mut sim.map_mut(), Vec2::splat(64.0), 2, 32.0),
+        rejected
+    );
+    assert_eq!(sim.hashes(), before);
+}
+
+#[test]
+fn w0_water_indexed_links_share_the_topology_budget() {
+    use crate::map::{LaneKind, LanePattern, MapProject, WaterEdit};
+    use crate::world_command::{CommandOutcomes, Rejection};
+    use crate::Replay;
+    use geom::vec3;
+
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(2, 0).unwrap();
+    sim.edit_water(WaterEdit::SetSeaLevel {
+        level_dm: Some(-100),
+    })
+    .unwrap();
+    sim.write::<Replay>().enabled = true;
+    let pat = LanePattern {
+        lanes_forward: vec![(LaneKind::Driving, 10.0); 16],
+        lanes_backward: vec![(LaneKind::Driving, 10.0); 15],
+    };
+    let mut projects = Vec::new();
+    let mut links = Vec::new();
+    for index in 0..60 {
+        let y = 40.0 + index as f32 * 14.0;
+        projects.push(MapProject::ground(vec3(100.0, y, 10.0)));
+        projects.push(MapProject::ground(vec3(220.0, y, 10.0)));
+        links.push((index * 2, index * 2 + 1, None, pat.clone()));
+    }
+    sim.apply_commands([&WorldCommand::MapMakeMultipleConnections(projects, links)]);
+    let outcomes = sim.read::<CommandOutcomes>();
+    let results = outcomes.link_outcomes(0);
+    let accepted = results
+        .iter()
+        .take_while(|(_, result)| result.is_ok())
+        .count();
+    assert!(accepted > 0);
+    assert_eq!(
+        results.last(),
+        Some(&(
+            accepted,
+            Err(("MapMakeMultipleConnections", Rejection::WaterWorkLimit))
+        )),
+    );
+    assert_eq!(sim.map().roads().len(), accepted);
+    assert_eq!(sim.read::<Replay>().command_count(), 1);
 }
