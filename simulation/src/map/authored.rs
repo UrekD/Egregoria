@@ -152,7 +152,7 @@ impl fmt::Display for RailMarketError {
             Self::PlatformTrack => "the freight stop does not resolve to nearby platform track",
             Self::ConsistClearance => "insufficient clear track for the freight consist",
             Self::Route => {
-                "the production rail route does not connect the market and platform both ways"
+                "freight dispatch requires a usable rail route from the market to the platform and back"
             }
             Self::Placement => "rail market building could not be placed",
         };
@@ -281,6 +281,14 @@ impl Simulation {
         {
             return Err(RailMarketError::ConsistClearance);
         }
+        // A route can loop back through the end turns, but the dispatcher
+        // rejects a train already past the stop on the target lane.
+        let dispatch_start = lane.points.length_at_proj(lane.points.project(spawn));
+        let dispatch_target = platform.points.length_at_proj(stop);
+        if service_lane == platform.id && dispatch_start > dispatch_target {
+            return Err(RailMarketError::Route);
+        }
+
         let tick = Tick(self.get_tick());
         // The dispatcher uses the actual stop and raw market centre. Cargo also
         // tests reachability through the platform projection.

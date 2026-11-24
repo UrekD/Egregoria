@@ -2,15 +2,15 @@ use super::init_test_simulation;
 use crate::economy::progression::{ProgressionMode, ProgressionState};
 use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::{
-    AuthoredTownOptions, BuildingKind, LaneKind, LanePatternBuilder, LotLayout, MapProject,
-    RailMarketSite,
+    AuthoredTownOptions, BuildingKind, LaneID, LaneKind, LanePatternBuilder, LotLayout, MapProject,
+    RailMarketError, RailMarketSite,
 };
-use crate::map_dynamic::BuildingInfos;
-use crate::souls::freight_station::train_stop;
+use crate::map_dynamic::{BuildingInfos, DispatchKind, DispatchQueryTarget, Dispatcher, Itinerary};
+use crate::souls::freight_station::{freight_station_soul, train_stop, FreightTrainState};
 use crate::world_command::{CommandOutcomes, WorldCommand};
-use crate::{MapPreset, Replay, Simulation, INITIAL_TICK};
+use crate::{MapPreset, Replay, Simulation, TrainID, INITIAL_TICK};
 use geom::{vec2, vec3, Transform, Vec2, AABB, OBB};
-use prototypes::{BuildingGen, Money};
+use prototypes::{BuildingGen, FreightStationPrototypeID, Money, RollingStockID, Tick};
 
 #[test]
 fn citymap_bootstrap_starts_empty_on_the_compact_frame() {
@@ -125,8 +125,7 @@ fn citymap_bootstrap_validates_extents_and_options() {
     }
 }
 
-#[test]
-fn citymap_bootstrap_places_only_a_clear_routable_rail_market() {
+fn rail_market_track() -> (Simulation, LaneID) {
     init_test_simulation();
     let mut sim = Simulation::new_authored_town(AuthoredTownOptions::default()).unwrap();
     sim.apply_commands([&WorldCommand::MapMakeConnection {
@@ -136,13 +135,32 @@ fn citymap_bootstrap_places_only_a_clear_routable_rail_market() {
         pat: LanePatternBuilder::new().rail(true).build(),
     }]);
     assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+    let lane = sim
+        .map()
+        .lanes()
+        .values()
+        .find(|lane| lane.kind == LaneKind::Rail)
+        .unwrap()
+        .id;
+    (sim, lane)
+}
+
+fn spawn_freight_train(sim: &mut Simulation, lane: LaneID, dist: f32) -> TrainID {
+    sim.apply_commands([&WorldCommand::SpawnTrain {
+        wagons: vec![RollingStockID::new("locomotive")],
+        lane,
+        dist,
+    }]);
+    assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+    sim.world().trains.iter().next().unwrap().0
+}
+
+#[test]
+fn citymap_bootstrap_places_only_a_clear_routable_rail_market() {
+    let (mut sim, rail) = rail_market_track();
     let (lane, offset, market, stop) = {
         let map = sim.map();
-        let lane = map
-            .lanes()
-            .values()
-            .find(|lane| lane.kind == LaneKind::Rail)
-            .unwrap();
+        let lane = map.get(rail).unwrap();
         let offset = 200.0;
         let (pos, dir) = lane.points.point_dir_along(offset);
         let platform = lane.points.point_along(600.0);
@@ -202,13 +220,132 @@ fn citymap_bootstrap_places_only_a_clear_routable_rail_market() {
 }
 
 #[test]
+fn citymap_bootstrap_rejects_a_routable_train_past_its_platform() {
+    use crate::map::PathKind;
+
+    let (mut sim, lane) = rail_market_track();
+    let train = spawn_freight_train(&mut sim, lane, 600.0);
+    let (footprint, stop) = {
+        let map = sim.map();
+        let points = &map.get(lane).unwrap().points;
+        let (spawn, dir) = points.point_dir_along(600.0);
+        let stop = points.point_along(200.0);
+        assert!(
+            Itinerary::route(Tick(sim.get_tick()), spawn, stop, &map, PathKind::Rail).is_some()
+        );
+        let mut dispatcher = Dispatcher::default();
+        dispatcher.update(&map, sim.world());
+        assert!(sim.get(train).is_some());
+        assert_eq!(
+            dispatcher.query(
+                &map,
+                DispatchKind::FreightTrain,
+                DispatchQueryTarget::Pos(stop)
+            ),
+            None
+        );
+        (OBB::new(spawn.xy(), dir.xy(), 100.0, 24.0), stop)
+    };
+    let before = sim.hashes();
+    assert_eq!(
+        sim.place_authored_rail_market(RailMarketSite {
+            footprint,
+            service_lane: lane,
+            service_offset: 600.0,
+            platform_stop: stop,
+            consist_length_m: 100.0,
+        }),
+        Err(RailMarketError::Route)
+    );
+    assert_eq!(sim.hashes(), before);
+}
+
+#[test]
+fn citymap_bootstrap_freight_train_dispatches_returns_and_redispatches() {
+    let (mut sim, lane) = rail_market_track();
+    let (footprint, station, spawn) = {
+        let map = sim.map();
+        let points = &map.get(lane).unwrap().points;
+        let (spawn, dir) = points.point_dir_along(200.0);
+        let platform = points.point_along(600.0);
+        let station = platform - dir * 75.0 + dir.perp_up() * 40.0;
+        (
+            OBB::new(spawn.xy(), dir.xy(), 100.0, 24.0),
+            OBB::new(station.xy(), dir.xy(), 12.0, 12.0),
+            spawn,
+        )
+    };
+    let proto = FreightStationPrototypeID::new("freight-station");
+    sim.apply_commands([&WorldCommand::MapBuildSpecialBuilding {
+        pos: station,
+        kind: BuildingKind::RailFreightStation(proto),
+        gen: BuildingGen::NoWalkway {
+            door_pos: Vec2::ZERO,
+        },
+        zone: None,
+        connected_road: None,
+    }]);
+    assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+    let building = sim.map().buildings().keys().next().unwrap();
+    let station = freight_station_soul(&mut sim, building, proto).unwrap();
+    let stop = train_stop(&sim.get(station).unwrap().trans);
+    sim.place_authored_rail_market(RailMarketSite {
+        footprint,
+        service_lane: lane,
+        service_offset: 200.0,
+        platform_stop: stop,
+        consist_length_m: 100.0,
+    })
+    .unwrap();
+    let train = spawn_freight_train(&mut sim, lane, 200.0);
+    sim.world_mut_unchecked()
+        .freight_stations
+        .get_mut(station)
+        .unwrap()
+        .f
+        .waiting_cargo = 10;
+    let mut schedule = Simulation::schedule();
+    sim.tick(&mut schedule, []);
+    assert!(
+        matches!(sim.get(station).unwrap().f.trains.as_slice(), [(id, FreightTrainState::Arriving)] if *id == train)
+    );
+    let mut loaded = false;
+    let mut returned = false;
+    for _ in 0..120 * prototypes::TICKS_PER_REALTIME_SECOND {
+        sim.tick(&mut schedule, []);
+        match sim.get(station).unwrap().f.trains.as_slice() {
+            [(_, FreightTrainState::Loading)] => loaded = true,
+            [] => {
+                returned = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        loaded && returned,
+        "train must load and return to the market"
+    );
+    assert!(sim.get(train).unwrap().trans.pos.distance(spawn) < 3.0);
+    sim.world_mut_unchecked()
+        .freight_stations
+        .get_mut(station)
+        .unwrap()
+        .f
+        .waiting_cargo = 10;
+    sim.tick(&mut schedule, []);
+    assert!(
+        matches!(sim.get(station).unwrap().f.trains.as_slice(), [(id, FreightTrainState::Arriving)] if *id == train)
+    );
+}
+
+#[test]
 fn citymap_bootstrap_directed_trip_arrives_and_releases_its_collider() {
     use crate::map::{PathKind, Pathfinder};
-    use crate::map_dynamic::Itinerary;
     use crate::transportation::spawn_driving_vehicle;
     use crate::transportation::{TransportGrid, VehicleKind};
     use crate::{ParCommandBuffer, VehicleEnt};
-    use prototypes::{Tick, TICKS_PER_REALTIME_SECOND};
+    use prototypes::TICKS_PER_REALTIME_SECOND;
 
     init_test_simulation();
     let mut sim = Simulation::new_authored_town(AuthoredTownOptions::default()).unwrap();
