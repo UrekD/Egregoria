@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 
-use engine::{FrameContext, MeshBuilder, MeshVertex, Water};
+use engine::{FrameContext, MeshBuilder, MeshVertex, Water, WaterOverviewAtlas};
 use geom::{vec2, Intersect3, LinearColor, AABB3};
 use simulation::map::{
     Environment, Heightmap, Map, MapSubscriber, TerrainChunkID, UpdateType, WaterKind, WaterTile,
@@ -8,6 +9,8 @@ use simulation::map::{
 
 const RES: usize = Heightmap::RESOLUTION;
 pub(crate) const WATER_TILE_PITCH: f32 = Heightmap::SIZE as f32 / RES as f32;
+pub(crate) const WATER_OVERVIEW_POOL: usize = 4;
+const OVERVIEW_PITCH: f32 = WATER_TILE_PITCH * WATER_OVERVIEW_POOL as f32;
 
 pub(crate) fn water_color(kind: WaterKind) -> LinearColor {
     match kind {
@@ -23,6 +26,7 @@ pub(super) struct WaterRender {
     level_range: Option<(f32, f32)>,
     pending: BTreeSet<TerrainChunkID>,
     meshes: BTreeMap<TerrainChunkID, (AABB3, Water)>,
+    overview: Option<Arc<WaterOverviewAtlas>>,
 }
 
 impl WaterRender {
@@ -33,6 +37,7 @@ impl WaterRender {
             level_range: None,
             pending: BTreeSet::new(),
             meshes: BTreeMap::new(),
+            overview: None,
         }
     }
 
@@ -87,6 +92,7 @@ impl WaterRender {
                 ctx.gfx.frustrum.intersects(&bounds)
             })
             .collect();
+        let world_origin = env.bounds().ll;
         for chunk in visible {
             self.pending.remove(&chunk);
             let mut mesh = MeshBuilder::<false>::new_without_mat();
@@ -106,6 +112,7 @@ impl WaterRender {
                     position: xy.z(z).into(),
                     normal: geom::Vec3::Z,
                     color,
+                    uv: ((xy - world_origin) / OVERVIEW_PITCH).into(),
                     ..MeshVertex::default()
                 };
                 mesh.extend(
@@ -126,7 +133,7 @@ impl WaterRender {
 
         for (bounds, mesh) in self.meshes.values() {
             if ctx.gfx.frustrum.intersects(bounds) {
-                ctx.draw(mesh.clone());
+                ctx.draw(mesh.clone().with_overview(self.overview.as_ref()));
             }
         }
     }
@@ -137,6 +144,12 @@ impl WaterRender {
         if env.has_water_configuration() {
             self.pending.extend(env.chunks().map(|(chunk, _)| chunk));
         }
+    }
+}
+
+impl super::MapRenderer {
+    pub(crate) fn set_water_overview(&mut self, overview: Option<Arc<WaterOverviewAtlas>>) {
+        self.water.overview = overview;
     }
 }
 

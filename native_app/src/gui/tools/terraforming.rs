@@ -1,20 +1,18 @@
-use common::saveload::{Encoder, JSON};
+use std::collections::VecDeque;
+
 use geom::{Vec2, Vec3, OBB};
 use simulation::map::{
-    ProjectFilter, TerraformKind, WaterBasin, WaterBodyId, WaterEdit, WaterEditError,
-    WaterEditOutcome, WaterKind, WaterStroke, MAX_WATER_VERTICES,
+    TerraformKind, WaterBasin, WaterBodyId, WaterEdit, WaterEditError, WaterEditOutcome, WaterKind,
+    WaterStroke, MAX_WATER_VERTICES,
 };
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::Simulation;
 
 use crate::gui::Tool;
-use crate::inputmap::{DeckPicker, InputAction, InputMap};
+use crate::inputmap::{InputAction, InputMap, UnitInput};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::{water_color, WATER_TILE_PITCH};
 use crate::uiworld::UiWorld;
-
-#[allow(unused_imports)]
-use w0_preview::{PreviewWater as _, WaterOutcome as _};
 
 pub struct TerraformingResource {
     pub kind: TerraformKind,
@@ -209,7 +207,8 @@ pub(crate) struct WaterTools {
     pub status: Option<String>,
     stroke: Option<WaterGesture>,
     preview: Option<CachedWaterPreview>,
-    submitted: Option<(u64, usize, String)>,
+    pending: VecDeque<WaterEdit>,
+    submitted_summary: Option<String>,
 }
 
 impl Default for WaterTools {
@@ -225,7 +224,8 @@ impl Default for WaterTools {
             status: None,
             stroke: None,
             preview: None,
-            submitted: None,
+            pending: VecDeque::new(),
+            submitted_summary: None,
         }
     }
 }
@@ -243,7 +243,7 @@ impl WaterTools {
         self.sea_action = None;
         self.status = None;
         self.preview = None;
-        self.submitted = None;
+        self.submitted_summary = None;
     }
 
     fn update(
@@ -260,7 +260,6 @@ impl WaterTools {
             self.current_sea_dm = sea;
             self.sea_level_dm = sea.unwrap_or_default();
         }
-        self.read_outcome(&sim.read::<CommandOutcomes>());
         let revision = env.water_revision();
 
         // Toolbox clicks are explicit confirmations, even when they capture the pointer.
@@ -286,15 +285,10 @@ impl WaterTools {
             return;
         }
         let hits = input.surface_hits(env);
-        let held = input.act.contains(&InputAction::Select);
         let pressed = input.just_act.contains(&InputAction::Select);
         if self.mode == WaterMode::Remove {
             if let Some(hit) = hits.water.filter(|hit| hit.sample.body != WaterBodyId::SEA) {
-                if input.ray.is_some_and(|ray| {
-                    DeckPicker::new(&map)
-                        .pick(ray, &hits, ProjectFilter::ROAD | ProjectFilter::INTER)
-                        .is_some()
-                }) {
+                if input.visible_deck(&map).is_some() {
                     return;
                 }
                 drop(map);
@@ -319,9 +313,12 @@ impl WaterTools {
             self.stroke = None;
             return;
         };
-        if pressed {
-            self.status = None;
-            self.stroke = Some(WaterGesture::new(point));
+        if self.stroke.is_none() {
+            if let Some(primary) = input.select_press() {
+                self.status = None;
+                self.submitted_summary = None;
+                self.stroke = Some(WaterGesture::new(point, Some(primary)));
+            }
         }
 
         let color = water_color(match self.mode {
@@ -334,10 +331,22 @@ impl WaterTools {
             return;
         };
 
-        let release = !held
-            || pointer
-                .released_buttons
-                .contains(&engine::MouseButton::Left);
+        let Some(primary) = stroke.primary.as_ref() else {
+            self.stroke = None;
+            return;
+        };
+        if !input.select_input_allowed(primary) {
+            self.stroke = None;
+            return;
+        }
+        let release = match primary {
+            UnitInput::Mouse(button) => pointer.released_buttons.contains(button),
+            _ => !input.select_input_held(primary),
+        };
+        if !release && !input.select_input_held(primary) {
+            self.stroke = None;
+            return;
+        }
         stroke.sample(point, self.mode == WaterMode::Lake, release);
         let thickness = if self.mode == WaterMode::River {
             self.width_m
@@ -375,16 +384,13 @@ impl WaterTools {
         water_revision: u64,
         edit: Result<WaterEdit, WaterEditError>,
     ) {
+        self.submitted_summary = None;
         let edit = match edit {
             Ok(edit) => edit,
             Err(error) => {
                 self.status = Some(error.to_string());
                 return;
             }
-        };
-        let Some(command) = water_command(&edit) else {
-            self.status = Some("Water editing requires the W0 command dispatcher".into());
-            return;
         };
         let sequence = sim.read::<CommandOutcomes>().batch_seq();
         let snapshot = (sim.get_tick(), sequence, water_revision);
@@ -416,39 +422,53 @@ impl WaterTools {
                 return;
             }
         };
-        let mut commands = uiworld.commands();
-        let index = commands.as_ref().len();
-        commands.push(command);
         self.status = Some(format!("{summary} · Submitted"));
-        self.submitted = Some((sequence, index, summary));
+        self.submitted_summary = Some(summary);
+        self.pending.push_back(edit.clone());
+        uiworld.commands().push(WorldCommand::EditWater(edit));
     }
 
-    fn read_outcome(&mut self, outcomes: &CommandOutcomes) {
-        let Some((sequence, index, summary)) = &self.submitted else {
-            return;
-        };
-        if outcomes.batch_seq() <= *sequence {
+    pub(crate) fn receive_outcome(
+        &mut self,
+        edit: &WaterEdit,
+        result: &Result<WaterEditOutcome, WaterEditError>,
+    ) {
+        // Peer filtering and per-batch indexing happen at the dispatcher. The
+        // remaining local water edits arrive in the same order as the UI queue.
+        if self.pending.front() != Some(edit) {
             return;
         }
-        if let Some(result) = outcomes.water_edit(*index) {
-            self.status = Some(match result {
-                Ok(outcome) if outcome.changed => format!("{summary} · Applied"),
-                Ok(_) => format!("{summary} · No change"),
-                Err(error) => error.to_string(),
-            });
-            self.submitted = None;
+        self.pending.pop_front();
+        if self.pending.is_empty() {
+            if let Some(summary) = self.submitted_summary.take() {
+                self.status = Some(match result {
+                    Ok(outcome) if outcome.changed => format!("{summary} · Applied"),
+                    Ok(_) => format!("{summary} · No change"),
+                    Err(error) => error.to_string(),
+                });
+            }
+        }
+    }
+
+    #[cfg(feature = "multiplayer")]
+    pub(crate) fn discard_pending(&mut self) {
+        self.pending.clear();
+        if self.submitted_summary.take().is_some() {
+            self.status = None;
         }
     }
 }
 
 struct WaterGesture {
+    primary: Option<UnitInput>,
     points: Vec<Vec3>,
     overflow: bool,
 }
 
 impl WaterGesture {
-    fn new(point: Vec3) -> Self {
+    fn new(point: Vec3, primary: Option<UnitInput>) -> Self {
         Self {
+            primary,
             points: vec![point],
             overflow: false,
         }
@@ -519,60 +539,85 @@ struct CachedWaterPreview {
     result: Result<String, WaterEditError>,
 }
 
-fn water_command(edit: &WaterEdit) -> Option<WorldCommand> {
-    // TODO(W0): Use WorldCommand::EditWater directly once the W0 dispatcher lands.
-    // The tagged command decodes only with a simulator that handles it.
-    #[derive(serde::Serialize)]
-    enum WireWaterCommand<'a> {
-        EditWater(&'a WaterEdit),
-    }
-    JSON::decode(&JSON::encode(&WireWaterCommand::EditWater(edit)).ok()?).ok()
-}
-
-#[allow(dead_code)]
-mod w0_preview {
-    use super::*;
-
-    pub(super) struct UnavailablePreview {
-        pub strict_before: bool,
-        pub strict_after: bool,
-        pub proposed_surface_dm: Option<i16>,
-    }
-
-    // TODO(W0): Remove this fallback once Simulation::preview_water_edit lands.
-    pub(super) trait PreviewWater {
-        fn preview_water_edit(
-            &self,
-            edit: &WaterEdit,
-        ) -> Result<UnavailablePreview, WaterEditError>;
-    }
-
-    impl PreviewWater for Simulation {
-        fn preview_water_edit(&self, _: &WaterEdit) -> Result<UnavailablePreview, WaterEditError> {
-            Err(WaterEditError::Stale)
-        }
-    }
-
-    // TODO(W0): Use the inherent indexed water outcome once integrated.
-    pub(super) trait WaterOutcome {
-        fn water_edit(&self, index: usize) -> Option<&Result<WaterEditOutcome, WaterEditError>>;
-    }
-
-    impl WaterOutcome for CommandOutcomes {
-        fn water_edit(&self, _index: usize) -> Option<&Result<WaterEditOutcome, WaterEditError>> {
-            None
-        }
-    }
-}
-
 #[cfg(test)]
 mod water_w4_tests {
     use super::*;
+    use common::saveload::{Encoder, JSON};
     use geom::vec3;
 
     #[test]
+    fn water_w4_control_does_not_release_a_stroke() {
+        stroke_waits_for_physical_release(false);
+    }
+
+    #[test]
+    fn water_w4_left_release_does_not_commit_a_rebound_stroke() {
+        stroke_waits_for_physical_release(true);
+    }
+
+    fn stroke_waits_for_physical_release(remapped: bool) {
+        use crate::inputmap::Bindings;
+        use engine::{InputContext, Key, MouseButton, PointerFrame};
+        use geom::Ray3;
+
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let sim = Simulation::new_authored_flat(4, 0).unwrap();
+        crate::init::init();
+        let ui = UiWorld::with_defaults();
+        let mut input = InputMap::default();
+        let mut bindings = Bindings::default();
+        if remapped {
+            bindings.0.insert(
+                InputAction::Select,
+                JSON::decode(br#"[[{"Mouse":"Middle"}]]"#).unwrap(),
+            );
+        }
+        input.build_input_tree(&mut bindings);
+        let primary = if remapped {
+            MouseButton::Middle
+        } else {
+            MouseButton::Left
+        };
+        let mut raw = InputContext::default();
+        let mut water = WaterTools::default();
+        let mut draw = ImmediateDraw::default();
+        let mut frame = |raw: &InputContext, x, released: Option<MouseButton>| {
+            input.prepare_frame(raw, true, true);
+            input.ray = Some(Ray3::new(vec3(x, 1400.0, 100.0), -Vec3::Z));
+            PointerFrame {
+                held_buttons: raw.mouse.pressed.clone(),
+                released_buttons: released.into_iter().collect(),
+                ..Default::default()
+            }
+            .publish();
+            water.update(&sim, &ui, &input, &mut draw);
+        };
+        raw.mouse.pressed.insert(primary);
+        frame(&raw, 1200.0, None);
+        frame(&raw, 1270.0, None);
+        if !remapped {
+            raw.keyboard.pressed.insert(Key::Control);
+        }
+        frame(&raw, 1300.0, remapped.then_some(MouseButton::Left));
+        assert!(
+            ui.commands().is_empty(),
+            "committed before {primary:?} release"
+        );
+        raw.mouse.pressed.remove(&primary);
+        frame(&raw, 1340.0, Some(primary));
+        let commands = ui.commands();
+        let [WorldCommand::EditWater(WaterEdit::CarveRiver { polyline, .. })] = commands.as_ref()
+        else {
+            panic!("expected one river edit after {primary:?} release");
+        };
+        assert_eq!(polyline.points().last().unwrap().x, 1340.0);
+        PointerFrame::default().publish();
+    }
+
+    #[test]
     fn water_w4_river_stroke_preserves_direction_and_keeps_the_release_endpoint() {
-        let mut stroke = WaterGesture::new(vec3(20.0, 30.0, 4.0));
+        let mut stroke = WaterGesture::new(vec3(20.0, 30.0, 4.0), None);
         for x in 21..240 {
             stroke.sample(vec3(x as f32, 30.0, 4.0), false, false);
         }
@@ -590,7 +635,7 @@ mod water_w4_tests {
 
     #[test]
     fn water_w4_lake_gesture_closes_once() {
-        let mut stroke = WaterGesture::new(Vec3::ZERO);
+        let mut stroke = WaterGesture::new(Vec3::ZERO, None);
         stroke.sample(vec3(64.0, 0.0, 0.0), true, false);
         stroke.sample(vec3(64.0, 64.0, 0.0), true, false);
         stroke.sample(vec3(0.0, 64.0, 0.0), true, false);
@@ -612,7 +657,7 @@ impl TerraformingResource {
         self.level = Some(20.0);
         self.slope_start = Some(Vec3::X);
         self.slope_end = Some(Vec3::Y);
-        self.water.stroke = Some(WaterGesture::new(Vec3::ZERO));
+        self.water.stroke = Some(WaterGesture::new(Vec3::ZERO, None));
         self.water.sea_action = Some(Some(10));
     }
 

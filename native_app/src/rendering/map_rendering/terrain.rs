@@ -59,6 +59,7 @@ pub struct TerrainRender {
 
 impl TerrainRender {
     pub fn new(gfx: &mut GfxContext, sim: &Simulation) -> Self {
+        crate::inputmap::reset_deck_picker_cache();
         let (w, h) = sim.map().environment().size();
 
         let terrain = HeightmapRender::new(gfx, w as u32, h as u32);

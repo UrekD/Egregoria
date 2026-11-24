@@ -11,7 +11,7 @@ use simulation::map::pathfinding_crate::num_traits::Pow;
 use simulation::map::{BuildingKind, Map};
 
 use crate::gui::windows::settings::Settings;
-use crate::inputmap::{water_environment, InputAction, InputMap};
+use crate::inputmap::{InputAction, InputMap};
 
 const CAMERA_SAVE_INTERVAL: Duration = Duration::from_secs(2);
 const CAMERA_SETTLE_TIME: Duration = Duration::from_millis(250);
@@ -249,7 +249,7 @@ impl OrbitCamera {
     }
 
     pub(crate) fn reset_for_world(&mut self, map: &Map, saved: Option<SlotCamera>) {
-        let env = water_environment(map);
+        let env = map.environment();
         let bounds = env.bounds();
         let valid = saved.filter(|saved| {
             let pos = Vec3::from(saved.position);
@@ -446,7 +446,7 @@ fn starter_view(map: &Map) -> Option<Vec3> {
     let center = station.obb.center();
     // Leave room between the station and the center of the opening view for construction.
     let preferred = center + Vec2::X * 256.0;
-    let env = water_environment(map);
+    let env = map.environment();
     let dry = |point| {
         env.water_at(point)
             .is_none()
@@ -655,10 +655,7 @@ mod af2_tests {
             point.distance(center) <= 800.0,
             "{point:?}, station {center:?}"
         );
-        assert!(
-            water_environment(&map).water_at(point).is_none(),
-            "{point:?}"
-        );
+        assert!(map.environment().water_at(point).is_none(), "{point:?}");
         let (screen, depth) = orbit.camera.project(station.obb.center().z(station.height));
         assert!(
             depth > 0.0 && (0.0..1280.0).contains(&screen.x) && (0.0..720.0).contains(&screen.y)

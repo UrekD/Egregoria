@@ -21,7 +21,7 @@ mod water;
 
 pub(crate) use map_mesh::intersection_mesh;
 use water::WaterRender;
-pub(crate) use water::{water_color, WATER_TILE_PITCH};
+pub(crate) use water::{water_color, WATER_OVERVIEW_POOL, WATER_TILE_PITCH};
 
 /// Render the entire map including the terrain, trees, water etc
 pub struct MapRenderer {
@@ -151,8 +151,7 @@ impl MapRenderer {
 
         Self::signals_render(map, time, cam, &ctx.gfx.frustrum, draw);
 
-        self.water
-            .draw(crate::inputmap::water_environment(map), ctx);
+        self.water.draw(map.environment(), ctx);
     }
 
     fn render_lane_signals(n: &Lane, draw: &mut ImmediateDraw, time: u32) {

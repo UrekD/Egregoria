@@ -1,11 +1,15 @@
 use common::{FastMap, FastSet};
 use engine::{Context, InputContext, Key, MouseButton, Tesselator};
-use geom::{Intersect, Ray3, Vec2, Vec3, AABB};
+use geom::{Intersect, Ray3, Segment, Vec2, Vec3, AABB};
 use serde::de::{value::StrDeserializer, IgnoredAny, MapAccess, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
-use simulation::map::{Environment, Map, MapProject, ProjectFilter, ProjectKind, Road, WaterHit};
+use simulation::map::{
+    Environment, Map, MapProject, MapSubscriber, ProjectFilter, ProjectKind, Road, UpdateType,
+    WaterHit,
+};
+use std::cell::RefCell;
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 
 // Either combinations can work
@@ -84,7 +88,12 @@ pub struct InputMap {
     pub ray: Option<Ray3>,
     /// Mouse position in screen space
     pub screen: Vec2,
+    world_projection: Option<WorldProjection>,
     input_tree: InputTree,
+    select_press: Option<UnitInput>,
+    held_select_inputs: FastSet<UnitInput>,
+    keyboard_allowed: bool,
+    mouse_allowed: bool,
     require_pointer_release: bool,
     close_down: bool,
     cancel_held: bool,
@@ -93,10 +102,17 @@ pub struct InputMap {
 }
 
 /// Separate signed terrain and half-open water intersections for the same ray.
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 pub(crate) struct SurfaceHits {
     pub ground: Option<(Vec3, Vec3)>,
     pub water: Option<WaterHit>,
+}
+
+struct WorldProjection {
+    ray: Ray3,
+    surfaces: SurfaceHits,
+    deck: Option<MapProject>,
+    picked_deck: bool,
 }
 
 impl SurfaceHits {
@@ -125,6 +141,47 @@ pub(crate) fn ray_parameter(ray: Ray3, point: Vec3) -> f32 {
     (point - ray.from).dot(ray.dir) / ray.dir.mag2()
 }
 
+thread_local! {
+    static DECK_WIDTH: RefCell<Option<DeckWidth>> = const { RefCell::new(None) };
+}
+
+struct DeckWidth {
+    map: usize,
+    changes: MapSubscriber,
+    padding: f32,
+}
+
+pub(crate) fn reset_deck_picker_cache() {
+    DECK_WIDTH.set(None);
+}
+
+fn deck_padding(map: &Map) -> f32 {
+    let key = std::ptr::from_ref(&map.subscribers) as usize;
+    DECK_WIDTH.with_borrow_mut(|cache| {
+        let fresh = cache.as_ref().is_none_or(|entry| entry.map != key);
+        if fresh {
+            *cache = Some(DeckWidth {
+                map: key,
+                changes: map.subscribe(UpdateType::Road),
+                padding: 0.0,
+            });
+        }
+        let entry = cache.as_mut().unwrap();
+        let changed =
+            entry.changes.take_cleared() | entry.changes.take_updated_chunks().next().is_some();
+        if fresh || changed {
+            // The tessellator caps a miter at ten times the half-width.
+            entry.padding = 5.0
+                * map
+                    .roads()
+                    .values()
+                    .map(|road| road.width)
+                    .fold(0.0, f32::max);
+        }
+        entry.padding
+    })
+}
+
 /// Shared depth-ranked deck and junction picking. Reuse one mesh scratch per sweep.
 pub(crate) struct DeckPicker<'a> {
     map: &'a Map,
@@ -135,16 +192,9 @@ pub(crate) struct DeckPicker<'a> {
 
 impl<'a> DeckPicker<'a> {
     pub(crate) fn new(map: &'a Map) -> Self {
-        // The tessellator caps a miter at ten times the half-width.
-        let padding = 5.0
-            * map
-                .roads()
-                .values()
-                .map(|road| road.width)
-                .fold(0.0, f32::max);
         Self {
             map,
-            padding,
+            padding: deck_padding(map),
             vertices: Vec::new(),
             indices: Vec::new(),
         }
@@ -160,12 +210,15 @@ impl<'a> DeckPicker<'a> {
             .nearest()
             .map_or(f32::INFINITY, |p| ray_parameter(ray, p));
         let world = self.map.environment().bounds().expand(self.padding);
-        let ray_bounds = ray_xy_bounds(ray, world, limit)?;
-        let search = ray_bounds.expand(self.padding);
+        let segment = clipped_ray_xy(ray, world, limit)?;
         let map = self.map;
+        let mut candidates = BTreeSet::new();
+        for bounds in ray_corridor(segment, self.padding) {
+            candidates.extend(map.spatial_map().query(bounds, filter));
+        }
         let mut mesh = engine::Tesselator::new(&mut self.vertices, &mut self.indices, None, 1.0);
-        map.spatial_map()
-            .query(search, filter)
+        candidates
+            .into_iter()
             .filter_map(|kind| {
                 let depth = match kind {
                     ProjectKind::Road(id) => {
@@ -175,7 +228,7 @@ impl<'a> DeckPicker<'a> {
                             .bbox()
                             .flatten()
                             .expand(5.0 * road.width)
-                            .intersects(&ray_bounds)
+                            .intersects(&segment)
                         {
                             return None;
                         }
@@ -195,13 +248,8 @@ impl<'a> DeckPicker<'a> {
                             .filter_map(|indices| {
                                 let point =
                                     |i: usize| mesh.vertices[indices[i] as usize].position.into();
-                                triangle_hit(
-                                    ray,
-                                    point(0),
-                                    point(1),
-                                    point(2),
-                                )
-                                .filter(|depth| (0.0..=limit).contains(depth))
+                                triangle_hit(ray, point(0), point(1), point(2))
+                                    .filter(|depth| (0.0..=limit).contains(depth))
                             })
                             .min_by(f32::total_cmp)?
                     }
@@ -217,7 +265,7 @@ impl<'a> DeckPicker<'a> {
     }
 }
 
-fn road_hit(
+pub(crate) fn road_hit(
     road: &Road,
     ray: Ray3,
     limit: f32,
@@ -256,7 +304,7 @@ fn triangle_hit(ray: Ray3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
     (u >= 0.0 && v >= 0.0 && u + v <= 1.0).then(|| ac.dot(side) / det)
 }
 
-fn ray_xy_bounds(ray: Ray3, world: AABB, limit: f32) -> Option<AABB> {
+fn clipped_ray_xy(ray: Ray3, world: AABB, limit: f32) -> Option<Segment> {
     if !ray.from.is_finite() || !ray.dir.is_finite() || ray.dir.mag2() == 0.0 {
         return None;
     }
@@ -286,7 +334,17 @@ fn ray_xy_bounds(ray: Ray3, world: AABB, limit: f32) -> Option<AABB> {
     } else {
         start
     };
-    Some(AABB::new_ll_ur(start.min(end), start.max(end)))
+    Some(Segment::new(start, end))
+}
+
+fn ray_corridor(ray: Segment, padding: f32) -> impl Iterator<Item = AABB> {
+    const STEP: f32 = 128.0;
+    let steps = (ray.src.distance(ray.dst) / STEP).ceil().max(1.0) as u32;
+    (0..steps).map(move |step| {
+        let start = ray.src.lerp(ray.dst, step as f32 / steps as f32);
+        let end = ray.src.lerp(ray.dst, (step + 1) as f32 / steps as f32);
+        AABB::new_ll_ur(start.min(end), start.max(end)).expand(padding)
+    })
 }
 
 #[derive(Serialize)]
@@ -455,9 +513,54 @@ fn same_key(unit: &UnitInput) -> UnitInput {
 }
 
 impl InputMap {
+    pub(crate) fn set_world_ray(&mut self, ray: Option<Ray3>, map: &Map, pick_deck: bool) {
+        self.ray = ray;
+        self.world_projection = ray.map(|ray| {
+            let surfaces = SurfaceHits::cast(map.environment(), ray);
+            let deck = if pick_deck {
+                DeckPicker::new(map).pick(
+                    ray,
+                    &surfaces,
+                    ProjectFilter::ROAD | ProjectFilter::INTER,
+                )
+            } else {
+                None
+            };
+            WorldProjection {
+                ray,
+                surfaces,
+                deck,
+                picked_deck: pick_deck,
+            }
+        });
+        let ground = self
+            .world_projection
+            .as_ref()
+            .and_then(|hit| hit.surfaces.ground);
+        self.unprojected = ground.map(|(pos, _)| pos.xy().z(pos.z.max(0.0)));
+        self.unprojected_normal = ground.map(|(_, normal)| normal);
+    }
+
+    fn world_projection(&self, ray: Ray3) -> Option<&WorldProjection> {
+        self.world_projection
+            .as_ref()
+            .filter(|p| p.ray.from == ray.from && p.ray.dir == ray.dir)
+    }
+
     pub(crate) fn surface_hits(&self, env: &Environment) -> SurfaceHits {
-        self.ray
-            .map_or_else(SurfaceHits::default, |ray| SurfaceHits::cast(env, ray))
+        self.ray.map_or_else(SurfaceHits::default, |ray| {
+            self.world_projection(ray)
+                .map_or_else(|| SurfaceHits::cast(env, ray), |p| p.surfaces)
+        })
+    }
+
+    pub(crate) fn visible_deck(&self, map: &Map) -> Option<MapProject> {
+        let ray = self.ray?;
+        if let Some(frame) = self.world_projection(ray).filter(|p| p.picked_deck) {
+            return frame.deck;
+        }
+        let surfaces = self.surface_hits(map.environment());
+        DeckPicker::new(map).pick(ray, &surfaces, ProjectFilter::ROAD | ProjectFilter::INTER)
     }
 
     pub fn build_input_tree(&mut self, bindings: &mut Bindings) {
@@ -469,12 +572,33 @@ impl InputMap {
         self.input_tree = InputTree::new(bindings);
     }
 
+    pub(crate) fn select_press(&self) -> Option<UnitInput> {
+        self.select_press.clone()
+    }
+
+    pub(crate) fn select_input_allowed(&self, input: &UnitInput) -> bool {
+        match input {
+            Mouse(_) => self.mouse_allowed,
+            Key(_) | KeyScan(_) => self.keyboard_allowed,
+            WheelUp | WheelDown => false,
+        }
+    }
+
+    pub(crate) fn select_input_held(&self, input: &UnitInput) -> bool {
+        self.held_select_inputs.contains(input)
+    }
+
     pub(crate) fn reset_world_input(&mut self) {
+        self.select_press = None;
+        self.held_select_inputs.clear();
+        self.keyboard_allowed = false;
+        self.mouse_allowed = false;
         self.just_act.clear();
         self.act.clear();
         self.wheel = 0.0;
         self.screen = Vec2::ZERO;
         self.ray = None;
+        self.world_projection = None;
         self.unprojected = None;
         self.unprojected_normal = None;
         self.cancel_held = false;
@@ -485,6 +609,9 @@ impl InputMap {
     /// While a keybind is being captured, the press being bound must not also act as a
     /// shortcut, neither now nor when it is released after capture ends.
     pub(crate) fn suppress_shortcuts(&mut self) {
+        self.select_press = None;
+        self.keyboard_allowed = false;
+        self.mouse_allowed = false;
         self.just_act.clear();
         self.wheel = 0.0;
         self.cancel_origin = None;
@@ -536,16 +663,16 @@ impl InputMap {
         self.require_pointer_release &= held;
     }
 
-    fn actions(
+    fn matched_actions(
         &self,
         input: &InputContext,
         kb: bool,
         mouse: bool,
-    ) -> impl Iterator<Item = InputAction> + '_ {
+    ) -> impl Iterator<Item = (Option<UnitInput>, InputAction)> + '_ {
         let empty1 = FastSet::default();
         let empty2 = FastSet::default();
         let empty3 = FastSet::default();
-        self.input_tree.query(
+        self.input_tree.matched_actions(
             if kb { &input.keyboard.pressed } else { &empty1 },
             if kb {
                 &input.keyboard.pressed_scancode
@@ -565,20 +692,53 @@ impl InputMap {
             || input.mouse.wheel_delta != 0.0;
         let down = inputs_held
             && self
-                .actions(input, true, true)
-                .any(|action| action == Close);
+                .matched_actions(input, true, true)
+                .any(|(_, action)| action == Close);
         let was_down = std::mem::replace(&mut self.close_down, down);
         down && !was_down
-            && ((kb && mouse) || self.actions(input, kb, mouse).any(|action| action == Close))
+            && ((kb && mouse)
+                || self
+                    .matched_actions(input, kb, mouse)
+                    .any(|(_, action)| action == Close))
     }
 
     pub fn prepare_frame(&mut self, input: &InputContext, kb: bool, mouse: bool) {
         let mouse = mouse && !self.require_pointer_release;
         self.just_act.clear();
-        let mut acts: FastSet<_> = self
-            .actions(input, kb, mouse)
-            .filter(|action| *action != Close)
+        let mut acts = FastSet::default();
+        let mut select_press = None;
+        let held: FastSet<_> = input
+            .mouse
+            .pressed
+            .iter()
+            .chain(input.physical_mouse_buttons())
+            .copied()
+            .map(Mouse)
+            .chain(input.keyboard.pressed.iter().cloned().map(Key))
+            .chain(input.keyboard.pressed_scancode.iter().copied().map(KeyScan))
             .collect();
+        let pointer = input.pointer_frame(false);
+        for (primary, action) in self.matched_actions(input, kb, mouse) {
+            if action == Close {
+                continue;
+            }
+            if action == Select {
+                if let Some(primary) = primary.filter(|p| {
+                    held.contains(p)
+                        && (!self.held_select_inputs.contains(p)
+                            || matches!(p, Mouse(b) if pointer.released_buttons.contains(b)))
+                }) {
+                    if select_press.as_ref().is_none_or(|old| primary < *old) {
+                        select_press = Some(primary);
+                    }
+                }
+            }
+            acts.insert(action);
+        }
+        self.select_press = select_press;
+        self.held_select_inputs = held;
+        self.keyboard_allowed = kb;
+        self.mouse_allowed = mouse;
         let cancel_held = acts.remove(&Cancel);
         std::mem::swap(&mut self.act, &mut acts);
         for v in &self.act {
@@ -775,13 +935,25 @@ impl InputTree {
         root
     }
 
-    pub fn query(
+    #[cfg(test)]
+    fn query(
         &self,
         kb: &FastSet<Key>,
         kb_scans: &FastSet<u32>,
         mouse: &FastSet<MouseButton>,
         wheel: f32,
     ) -> impl Iterator<Item = InputAction> + '_ {
+        self.matched_actions(kb, kb_scans, mouse, wheel)
+            .map(|(_, action)| action)
+    }
+
+    fn matched_actions(
+        &self,
+        kb: &FastSet<Key>,
+        kb_scans: &FastSet<u32>,
+        mouse: &FastSet<MouseButton>,
+        wheel: f32,
+    ) -> impl Iterator<Item = (Option<UnitInput>, InputAction)> + '_ {
         let mut units: HashSet<UnitInput> = HashSet::with_capacity(kb.len() + mouse.len() + 1);
 
         units.extend(kb.iter().map(|x| UnitInput::Key(x.clone())));
@@ -819,13 +991,24 @@ impl InputTree {
                 if !inp.iter().all(|x| units.contains(x)) {
                     return None;
                 }
+                let primary = inp
+                    .iter()
+                    .find(|input| match input {
+                        Key(key) => !key.is_modifier(),
+                        KeyScan(_) | Mouse(_) => true,
+                        WheelUp | WheelDown => false,
+                    })
+                    .cloned();
                 for v in inp {
                     units.remove(&v);
                 }
-                Some(act)
+                Some(
+                    act.iter()
+                        .cloned()
+                        .map(move |action| (primary.clone(), action)),
+                )
             })
             .flatten()
-            .cloned()
     }
 }
 
@@ -1176,6 +1359,53 @@ mod water_w4_tests {
     use super::*;
     use geom::{vec2, vec3};
     use simulation::map::Environment;
+
+    #[test]
+    fn water_w4_deck_width_cache_tracks_topology_notifications() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        reset_deck_picker_cache();
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        assert_eq!(deck_padding(&map), 0.0);
+        let (_, road) = map
+            .make_connection(
+                MapProject::ground(vec3(64.0, 64.0, 0.0)),
+                MapProject::ground(vec3(320.0, 64.0, 0.0)),
+                None,
+                &simulation::map::LanePatternBuilder::default().build(),
+            )
+            .unwrap();
+        let expected = 5.0 * map.get(road).unwrap().width;
+        assert!(expected > 0.0);
+        assert_eq!(deck_padding(&map), expected);
+        assert_eq!(deck_padding(&map), expected);
+        map.remove_road(road).unwrap();
+        assert_eq!(deck_padding(&map), 0.0);
+        reset_deck_picker_cache();
+    }
+
+    #[test]
+    fn water_w4_deck_broad_phase_uses_a_corridor_on_an_80_chunk_map() {
+        let extent = 80.0 * 512.0;
+        let padding = 100.0;
+        let diagonal = Segment::new(Vec2::ZERO, vec2(extent, extent));
+        // The spatial map uses 50 m cells. Count conservative cell visits including
+        // overlap between queries, since a sweep can touch the same cell twice.
+        let cells = |bounds: AABB| {
+            let lo = (bounds.ll / 50.0).floor();
+            let hi = (bounds.ur / 50.0).floor();
+            let span = hi - lo + Vec2::splat(1.0);
+            (span.x * span.y) as usize
+        };
+        let before = cells(AABB::new_ll_ur(diagonal.src, diagonal.dst).expand(padding));
+        let after: usize = ray_corridor(diagonal, padding).map(cells).sum();
+        assert!(
+            after < before / 30,
+            "{before} bounding-box cells, {after} corridor cells"
+        );
+        println!("80x80 deck ray broad phase: {before} -> {after} cell visits");
+    }
 
     #[test]
     fn water_w4_picks_the_surface_before_the_bed_and_respects_tile_edges() {

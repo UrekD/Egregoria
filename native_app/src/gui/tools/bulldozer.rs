@@ -5,9 +5,7 @@ use common::FastSet;
 use crate::gui::specialbuilding::SpecialBuildingResource;
 use crate::gui::windows::settings::Settings;
 use crate::gui::Tool;
-use crate::inputmap::{
-    water_environment, Bindings, DeckPicker, InputAction, InputMap, SurfaceHits, UnitInput,
-};
+use crate::inputmap::{Bindings, DeckPicker, InputAction, InputMap, SurfaceHits, UnitInput};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 use engine::MouseButton;
@@ -224,7 +222,7 @@ fn project_target(
     ray: Ray3,
     filter: ProjectFilter,
 ) -> Option<MapProject> {
-    let hits = SurfaceHits::cast(water_environment(map), ray);
+    let hits = SurfaceHits::cast(map.environment(), ray);
     if let Some(deck) = picker.pick(ray, &hits, filter) {
         return Some(deck);
     }
@@ -235,7 +233,11 @@ fn project_target(
         });
     }
     let (ground, _) = hits.ground?;
-    Some(map.project(ground.xy().z(ground.z.max(0.0)), 0.0, filter))
+    Some(map.project(
+        ground,
+        0.0,
+        filter - ProjectFilter::ROAD - ProjectFilter::INTER,
+    ))
 }
 
 fn queue_target(map: &Map, target: ProjectKind, commands: &mut WorldCommands) {
@@ -394,6 +396,48 @@ mod tests {
 
     fn sample_target(map: &Map) -> impl FnMut(Vec2) -> Option<MapProject> + '_ {
         |point| sample(point).map(|pos| map.project(pos, 0.0, drag_filter()))
+    }
+
+    #[test]
+    fn water_w4_bulldozer_does_not_restore_an_occluded_deck_from_ground_xy() {
+        use geom::{vec3, Vec3};
+        use simulation::map::LanePatternBuilder;
+
+        let city = city();
+        let center = vec2(1450.0, 1450.0);
+        let mut map = city.sim.write::<Map>();
+        let endpoint = |x| MapProject::ground(vec3(x, center.y, 25.0));
+        let (_, road) = map
+            .make_connection(
+                endpoint(1340.0),
+                endpoint(1560.0),
+                None,
+                &LanePatternBuilder::default().build(),
+            )
+            .unwrap();
+        let ground = map.environment().true_height(center).unwrap();
+        let from_above = Ray3::new(center.z(60.0), -Vec3::Z);
+        let from_under = Ray3::new(center.z(ground + 2.0), -Vec3::Z);
+        let mut picker = DeckPicker::new(&map);
+        assert_eq!(
+            project_target(&map, &mut picker, from_above, ProjectFilter::ROAD)
+                .unwrap()
+                .kind,
+            ProjectKind::Road(road)
+        );
+        let terrain_over_deck = SurfaceHits {
+            ground: Some((center.z(40.0), Vec3::Z)),
+            water: None,
+        };
+        assert!(picker
+            .pick(from_above, &terrain_over_deck, ProjectFilter::ROAD)
+            .is_none());
+        assert_eq!(
+            project_target(&map, &mut picker, from_under, ProjectFilter::ROAD)
+                .unwrap()
+                .kind,
+            ProjectKind::Ground
+        );
     }
 
     #[test]
