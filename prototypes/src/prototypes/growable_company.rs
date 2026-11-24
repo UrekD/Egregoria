@@ -1,6 +1,6 @@
 use crate::{
-    get_lua, try_prototype, Density, GoodsCompanyID, GoodsCompanyPrototype, GrowableCompanyID,
-    Prototype,
+    get_lua, try_prototype, Density, GoodsCompanyID, GoodsCompanyPrototype, GrowableChainKey,
+    GrowableCompanyID, GrowableMassing, GrowableZoneKind, Prototype,
 };
 use mlua::{FromLua, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
@@ -31,11 +31,28 @@ impl<'lua> FromLua<'lua> for ZoneKind {
 pub struct GrowableCompanyPrototype {
     pub base: GoodsCompanyPrototype,
     pub id: GrowableCompanyID,
+    /// The pure sector used by existing consumers. Use `chain_key` for staged Mixed Use.
     pub zone_kind: ZoneKind,
     pub density: Density,
     pub level: u8,
     pub lot_size_min: f32,
     pub growable: bool,
+    pub massing: Option<GrowableMassing>,
+    mixed_use: bool,
+}
+
+impl GrowableCompanyPrototype {
+    pub fn chain_key(&self) -> GrowableChainKey {
+        GrowableChainKey {
+            zone_kind: if self.mixed_use {
+                GrowableZoneKind::MixedUse
+            } else {
+                GrowableZoneKind::Pure(self.zone_kind)
+            },
+            density: self.density,
+            level: self.level,
+        }
+    }
 }
 
 impl GoodsCompanyID {
@@ -51,14 +68,20 @@ impl Prototype for GrowableCompanyPrototype {
 
     fn from_lua(table: &Table) -> mlua::Result<Self> {
         let base = GoodsCompanyPrototype::from_lua(table)?;
+        let kind = get_lua::<GrowableZoneKind>(table, "zone_kind")?;
         Ok(Self {
             id: Self::ID::new(&base.name),
             base,
-            zone_kind: get_lua(table, "zone_kind")?,
+            zone_kind: match kind {
+                GrowableZoneKind::Pure(kind) => kind,
+                GrowableZoneKind::MixedUse => ZoneKind::Commercial,
+            },
             density: get_lua(table, "density")?,
             level: get_lua(table, "level")?,
             lot_size_min: get_lua(table, "lot_size_min")?,
             growable: get_lua(table, "growable")?,
+            massing: get_lua(table, "massing")?,
+            mixed_use: kind == GrowableZoneKind::MixedUse,
         })
     }
 

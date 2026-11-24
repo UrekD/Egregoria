@@ -3,7 +3,8 @@
 use crate::load::load_prototypes;
 use crate::{
     try_prototype, BuildingGen, CompanyKind, Density, GoodsCompanyID, GoodsCompanyPrototype,
-    GrowableCompanyID, ItemID, ResidencePrototype, ServiceID, ServiceKind, ServicePrototype,
+    GrowableChainKey, GrowableCompanyID, GrowableMassing, GrowableMassingStyle, GrowableZoneKind,
+    ItemID, ResidencePrototype, ResidencePrototypeID, ServiceID, ServiceKind, ServicePrototype,
     SolarPanelID, ZoneKind,
 };
 
@@ -40,6 +41,7 @@ fn test_base() {
             assert!(growable.growable);
             assert_eq!(growable.zone_kind, zone);
             assert_eq!(growable.level, 1);
+            assert!(growable.massing.is_none());
         }
 
         let residences: Vec<_> = ResidencePrototype::iter().collect();
@@ -51,10 +53,19 @@ fn test_base() {
                     .find(|r| r.density == density && r.level == level)
                     .unwrap();
                 assert!(matches!(residence.bgen, BuildingGen::House));
+                assert_eq!(
+                    residence.zone_kind,
+                    GrowableZoneKind::Pure(ZoneKind::Residential)
+                );
+                assert!(residence.massing.is_none());
                 assert!(residence.capacity > 0 && residence.power_consumption.is_some());
                 assert!(residence.water_consumption.is_some_and(|rate| rate > 0.0));
             }
         }
+        assert!(crate::prototypes()
+            .mixed_use_pair(Density::Medium)
+            .is_none());
+        assert!(try_prototype(GoodsCompanyID::new("mixed-medium-l1")).is_none());
         let services: Vec<_> = ServicePrototype::iter().collect();
         assert_eq!(services.len(), 8);
         for kind in [
@@ -100,6 +111,219 @@ fn test_base() {
             assert_eq!(ItemID::new(name).prototype().optout_exttrade, local_only);
         }
     }
+}
+
+#[test]
+fn zones2_profiled_base_registers_mixed_pairs() {
+    let registry = zones2_base();
+    assert_eq!(registry.residence.len(), 25);
+    assert_eq!(registry.growable_company.len(), 11);
+    assert!(registry.mixed_use_pair(Density::Low).is_none());
+
+    let low_shop = &registry.goods_company[&GoodsCompanyID::new("commercial-l1")];
+    let low_recipe = low_shop.recipe.as_ref().unwrap();
+    for (density, density_name, l1_slots) in
+        [(Density::Medium, "medium", 4), (Density::High, "high", 11)]
+    {
+        let pair = registry.mixed_use_pair(density).unwrap();
+        let shop_name = format!("mixed-{density_name}-l1");
+        assert_eq!(pair.shop.id, GrowableCompanyID::new(&shop_name));
+        assert_eq!(
+            registry.goods_company[&GoodsCompanyID::new(&shop_name)].kind,
+            CompanyKind::Store
+        );
+        assert_eq!(pair.shop.n_workers, 12);
+        assert_eq!(pair.shop.n_trucks, 0);
+        assert_eq!(pair.shop.massing.unwrap().floors_by_level, [1; 5]);
+        assert!(matches!(pair.shop.bgen, BuildingGen::CenteredDoor { .. }));
+        assert_eq!(pair.home.capacity, l1_slots);
+        assert!(pair.home.lot_size_min.max(pair.shop.lot_size_min) <= 900.0);
+
+        let recipe = pair.shop.recipe.as_ref().unwrap();
+        assert_eq!(recipe.duration, low_recipe.duration);
+        assert_eq!(recipe.storage_multiplier, low_recipe.storage_multiplier);
+        assert_eq!(
+            recipe
+                .consumption
+                .iter()
+                .map(|item| (item.id, item.amount))
+                .collect::<Vec<_>>(),
+            [(ItemID::new("goods"), 2)]
+        );
+        assert_eq!(
+            recipe
+                .production
+                .iter()
+                .map(|item| (item.id, item.amount))
+                .collect::<Vec<_>>(),
+            [
+                (ItemID::new("retail-goods"), 1),
+                (ItemID::new("shop-delivery"), 1)
+            ]
+        );
+
+        for level in 1..=5 {
+            let key = GrowableChainKey {
+                zone_kind: GrowableZoneKind::MixedUse,
+                density,
+                level,
+            };
+            let name = format!("residence-mixed-{density_name}-l{level}");
+            let home = registry.residence_for_chain(key).unwrap();
+            assert_eq!(home.id, ResidencePrototypeID::new(&name));
+            if level == 1 {
+                assert_eq!(pair.home.id, home.id);
+            }
+
+            let pure_key = GrowableChainKey {
+                zone_kind: GrowableZoneKind::Pure(ZoneKind::Residential),
+                ..key
+            };
+            let pure = registry.residence_for_chain(pure_key).unwrap();
+            assert_eq!(pure.name, format!("residence-{density_name}-l{level}"));
+            let massing = home.massing.unwrap();
+            assert_eq!(Some(massing), pure.massing);
+            assert!(massing.nominal_floors(level).unwrap() > 1);
+            let pure_height = massing.nominal_height_m(level, pure_key.zone_kind).unwrap();
+            let mixed_height = massing.nominal_height_m(level, key.zone_kind).unwrap();
+            assert!((mixed_height - pure_height - 1.3).abs() < 0.00001);
+        }
+    }
+}
+
+#[test]
+fn zones2_pure_chains_keep_ids_and_profile_each_density() {
+    use GrowableMassingStyle::{Block, House, Industrial, Tower};
+
+    let registry = zones2_base();
+    for (density, density_name, floors, cap, home_style, home_slots, jobs) in [
+        (
+            Density::Low,
+            "low",
+            [1, 2, 2, 2, 2],
+            2,
+            House,
+            2,
+            [12, 18, 6],
+        ),
+        (
+            Density::Medium,
+            "medium",
+            [4, 5, 6, 7, 8],
+            10,
+            Block,
+            5,
+            [18, 27, 9],
+        ),
+        (
+            Density::High,
+            "high",
+            [12, 15, 18, 21, 24],
+            28,
+            Tower,
+            12,
+            [24, 36, 12],
+        ),
+    ] {
+        let home_kind = GrowableZoneKind::Pure(ZoneKind::Residential);
+        let mut previous_capacity = 0;
+        for level in 1..=5 {
+            let key = GrowableChainKey {
+                zone_kind: home_kind,
+                density,
+                level,
+            };
+            let home = registry.residence_for_chain(key).unwrap();
+            assert_eq!(
+                home.id,
+                ResidencePrototypeID::new(&format!("residence-{density_name}-l{level}"))
+            );
+            assert!(home.capacity > previous_capacity);
+            previous_capacity = home.capacity;
+            if level == 1 {
+                assert_eq!(home.capacity, home_slots);
+            }
+            let profile = home.massing.unwrap();
+            assert_eq!(profile.style, home_style);
+            assert_profile(profile, floors, cap);
+        }
+
+        for ((kind, name), workers) in [
+            (ZoneKind::Commercial, "commercial"),
+            (ZoneKind::Industrial, "industrial"),
+            (ZoneKind::Office, "office"),
+        ]
+        .into_iter()
+        .zip(jobs)
+        {
+            let key = GrowableChainKey {
+                zone_kind: GrowableZoneKind::Pure(kind),
+                density,
+                level: 1,
+            };
+            let firm = registry.growable_company_for_chain(key).unwrap();
+            let name = if density == Density::Low {
+                format!("{name}-l1")
+            } else {
+                format!("{name}-{density_name}-l1")
+            };
+            assert_eq!(firm.id, GrowableCompanyID::new(&name));
+            assert_eq!(firm.n_workers, workers);
+            assert_eq!(
+                firm.lot_size_min,
+                if density == Density::High {
+                    900.0
+                } else {
+                    400.0
+                }
+            );
+            let expected_style = match (kind, density) {
+                (ZoneKind::Industrial, _) => Industrial,
+                (_, Density::High) => Tower,
+                _ => Block,
+            };
+            let profile = firm.massing.unwrap();
+            assert_eq!(profile.style, expected_style);
+            assert_profile(profile, floors, cap);
+        }
+    }
+}
+
+fn assert_profile(profile: GrowableMassing, floors: [u8; 5], cap: u8) {
+    assert_eq!(profile.floors_by_level, floors);
+    assert_eq!(profile.max_floors, cap);
+    assert!((18.0..=30.0).contains(&profile.min_plot_width_m));
+    assert!((18.0..=30.0).contains(&profile.min_plot_depth_m));
+    assert_eq!(profile.nominal_floors(0), None);
+    assert_eq!(profile.nominal_floors(6), None);
+    for (level, floor_count) in (1..=5).zip(floors) {
+        let height = profile.nominal_height_m(level, GrowableZoneKind::Pure(ZoneKind::Residential));
+        assert!((height.unwrap() - f32::from(floor_count) * 3.2).abs() < 0.00001);
+    }
+}
+
+fn zones2_base() -> crate::Prototypes {
+    let lua = mlua::Lua::new();
+    let globals = lua.globals();
+    globals
+        .get::<_, mlua::Table>("package")
+        .unwrap()
+        .set("path", "../base_mod/?.lua")
+        .unwrap();
+    globals.set("zones2_profiles_enabled", true).unwrap();
+    lua.load(include_str!("prototype_init.lua")).exec().unwrap();
+    lua.load(include_str!("../../base_mod/data.lua"))
+        .exec()
+        .unwrap();
+
+    let mut registry = crate::Prototypes::default();
+    let data: mlua::Table = globals.get("data").unwrap();
+    for table in data.sequence_values::<mlua::Table>() {
+        registry.parse_prototype(table.unwrap()).unwrap();
+    }
+    crate::validation::validate(&registry).unwrap();
+    registry.compute_orderings();
+    registry
 }
 
 #[test]

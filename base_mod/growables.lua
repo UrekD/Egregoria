@@ -1,4 +1,13 @@
-data:extend {
+local function low_shop_recipe()
+    return {
+        consumption = {{"goods", 2}},
+        production = {{"retail-goods", 1}, {"shop-delivery", 1}},
+        duration = "360s",
+        storage_multiplier = 12,
+    }
+end
+
+local growables = {
     {
         type = "growable-company",
         name = "industrial-l1",
@@ -40,12 +49,7 @@ data:extend {
         kind = "store",
         n_workers = 12,
         water_consumption = 8,
-        recipe = {
-            consumption = {{"goods", 2}},
-            production = {{"retail-goods", 1}, {"shop-delivery", 1}},
-            duration = "360s",
-            storage_multiplier = 12,
-        },
+        recipe = low_shop_recipe(),
         bgen = {kind = "centered_door", vertical_factor = 1.0},
         size = 20,
         asset = "bakery.glb",
@@ -231,3 +235,57 @@ data:extend {
         power_consumption = "2kW",
     },
 }
+
+if zones2_profiles_enabled == true then
+    local floors = {
+        low = {1, 2, 2, 2, 2},
+        medium = {4, 5, 6, 7, 8},
+        high = {12, 15, 18, 21, 24},
+    }
+    local max_floors = {low = 2, medium = 10, high = 28}
+    for _, company in ipairs(growables) do
+        local density = company.density
+        local style = density == "high" and "tower" or "block"
+        if company.zone_kind == "industrial" then
+            style = "industrial"
+        end
+        company.massing = {
+            style = style,
+            floors_by_level = floors[density],
+            max_floors = max_floors[density],
+            min_plot_width_m = 20,
+            min_plot_depth_m = 20,
+        }
+    end
+
+    for _, density in ipairs({"medium", "high"}) do
+        table.insert(growables, {
+            type = "growable-company",
+            name = "mixed-" .. density .. "-l1",
+            label = "Mixed-use shop (" .. density .. ")",
+            zone_kind = "mixed-use",
+            density = density,
+            level = 1,
+            lot_size_min = 400,
+            growable = true,
+            kind = "store",
+            n_workers = 12,
+            water_consumption = 8,
+            recipe = low_shop_recipe(),
+            massing = {
+                style = "block",
+                floors_by_level = {1, 1, 1, 1, 1},
+                max_floors = 1,
+                min_plot_width_m = 20,
+                min_plot_depth_m = 20,
+            },
+            bgen = {kind = "centered_door", vertical_factor = 1.0},
+            size = 20,
+            asset = "bakery.glb",
+            price = 0,
+            power_consumption = "1kW",
+        })
+    end
+end
+
+data:extend(growables)

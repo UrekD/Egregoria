@@ -1,4 +1,7 @@
-use crate::{get_lua, BuildingPrototype, Prototype, ResidencePrototypeID};
+use crate::{
+    get_lua, BuildingPrototype, GrowableChainKey, GrowableMassing, GrowableZoneKind, Prototype,
+    ResidencePrototypeID,
+};
 use mlua::{FromLua, Lua, Table, Value};
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
@@ -51,10 +54,22 @@ impl<'lua> FromLua<'lua> for Density {
 pub struct ResidencePrototype {
     pub base: BuildingPrototype,
     pub id: ResidencePrototypeID,
+    pub zone_kind: GrowableZoneKind,
     pub density: Density,
     pub level: u8,
     pub capacity: u32,
     pub lot_size_min: f32,
+    pub massing: Option<GrowableMassing>,
+}
+
+impl ResidencePrototype {
+    pub fn chain_key(&self) -> GrowableChainKey {
+        GrowableChainKey {
+            zone_kind: self.zone_kind,
+            density: self.density,
+            level: self.level,
+        }
+    }
 }
 
 impl Prototype for ResidencePrototype {
@@ -67,10 +82,12 @@ impl Prototype for ResidencePrototype {
         Ok(Self {
             id: Self::ID::new(&base.name),
             base,
+            zone_kind: get_lua::<Option<_>>(table, "zone_kind")?.unwrap_or_default(),
             density: get_lua(table, "density")?,
             level: get_lua(table, "level")?,
             capacity: get_lua(table, "capacity")?,
             lot_size_min: get_lua(table, "lot_size_min")?,
+            massing: get_lua(table, "massing")?,
         })
     }
 

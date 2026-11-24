@@ -1,29 +1,58 @@
-local function residence(density, level, capacity, power, lot_size_min)
-    return {
-        type = "residence",
-        name = "residence-" .. density .. "-l" .. level,
-        label = "Residence (" .. density .. ", level " .. level .. ")",
-        density = density,
-        level = level,
-        capacity = capacity,
-        power_consumption = power,
-        water_consumption = capacity,
-        lot_size_min = lot_size_min,
-        bgen = "house",
-        size = 20,
-        asset = "assets/ui/housebrush.png",
-        price = 0,
-    }
+local function residences(density, capacities, lot_size_min, massing, mixed)
+    local prefix = mixed and "residence-mixed-" or "residence-"
+    local label = mixed and "Mixed-use residence" or "Residence"
+    for level, capacity in ipairs(capacities) do
+        data:extend {
+            type = "residence",
+            name = prefix .. density .. "-l" .. level,
+            label = label .. " (" .. density .. ", level " .. level .. ")",
+            zone_kind = mixed and "mixed-use" or nil,
+            density = density,
+            level = level,
+            capacity = capacity,
+            power_consumption = capacity * 100,
+            water_consumption = capacity,
+            lot_size_min = lot_size_min,
+            massing = massing,
+            bgen = "house",
+            size = 20,
+            asset = "assets/ui/housebrush.png",
+            price = 0,
+        }
+    end
 end
 
-data:extend {
-    residence("low", 1, 2, "200W", 300),
-    residence("low", 2, 4, "400W", 300),
-    residence("low", 3, 6, "600W", 300),
-    residence("medium", 1, 3, "300W", 400),
-    residence("medium", 2, 6, "600W", 400),
-    residence("medium", 3, 9, "900W", 400),
-    residence("high", 1, 4, "400W", 400),
-    residence("high", 2, 8, "800W", 400),
-    residence("high", 3, 12, "1.2kW", 400),
-}
+-- Enable with the checked placement and save-version integration.
+if zones2_profiles_enabled == true then
+    local low = {
+        style = "house",
+        floors_by_level = {1, 2, 2, 2, 2},
+        max_floors = 2,
+        min_plot_width_m = 18,
+        min_plot_depth_m = 18,
+    }
+    local medium = {
+        style = "block",
+        floors_by_level = {4, 5, 6, 7, 8},
+        max_floors = 10,
+        min_plot_width_m = 20,
+        min_plot_depth_m = 20,
+    }
+    local high = {
+        style = "tower",
+        floors_by_level = {12, 15, 18, 21, 24},
+        max_floors = 28,
+        min_plot_width_m = 20,
+        min_plot_depth_m = 20,
+    }
+
+    residences("low", {2, 4, 6, 8, 10}, 300, low)
+    residences("medium", {5, 7, 9, 11, 13}, 400, medium)
+    residences("high", {12, 15, 18, 21, 24}, 400, high)
+    residences("medium", {4, 6, 8, 10, 12}, 400, medium, true)
+    residences("high", {11, 14, 17, 20, 23}, 400, high, true)
+else
+    residences("low", {2, 4, 6}, 300)
+    residences("medium", {3, 6, 9}, 400)
+    residences("high", {4, 8, 12}, 400)
+end
