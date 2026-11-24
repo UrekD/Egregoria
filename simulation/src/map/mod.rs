@@ -55,6 +55,7 @@ pub mod procgen {
     }
 }
 
+mod authored;
 mod change_detection;
 mod electricity_cache;
 pub mod import;
@@ -76,6 +77,7 @@ pub mod zonegrid;
 
 // Use self or else it would be ambiguous with "pathfinding" crate
 pub use self::pathfinding::*;
+pub use authored::*;
 pub use change_detection::*;
 pub use electricity_cache::*;
 pub use light_policy::*;

@@ -7,12 +7,19 @@ pub use layout::*;
 pub use network::*;
 pub use source::*;
 
-use simulation::map::LotLayout;
-use simulation::{MapPreset, NewGameOptions, Simulation};
+use geom::AABB;
+use simulation::map::{LotLayout, WaterBodyId};
+use simulation::{
+    AuthoredTownOptions, SavePhase, Simulation, SlotCamera, SlotId, SnapshotRevision,
+};
 use std::ffi::OsString;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
 
-pub fn schematic_cli(args: impl Iterator<Item = OsString>) -> Result<(), String> {
+fn cli_paths(
+    name: &str,
+    args: impl Iterator<Item = OsString>,
+) -> Result<(PathBuf, PathBuf, PathBuf), String> {
     let mut args = args;
     let mut out = None;
     let mut lesce = None;
@@ -20,10 +27,9 @@ pub fn schematic_cli(args: impl Iterator<Item = OsString>) -> Result<(), String>
     while let Some(arg) = args.next() {
         let (Some("--out" | "--input" | "--sava-input"), Some(path)) = (arg.to_str(), args.next())
         else {
-            return Err(
-                "usage: scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]"
-                    .into(),
-            );
+            return Err(format!(
+                "usage: scenarios {name} --out DIR [--input PATH] [--sava-input PATH]"
+            ));
         };
         let destination = match arg.to_str().unwrap() {
             "--out" => &mut out,
@@ -35,9 +41,14 @@ pub fn schematic_cli(args: impl Iterator<Item = OsString>) -> Result<(), String>
         }
         *destination = Some(std::path::absolute(Path::new(&path)).map_err(|err| err.to_string())?);
     }
-    let out = out.ok_or("citymap-schematic requires --out DIR")?;
+    let out = out.ok_or_else(|| format!("{name} requires --out DIR"))?;
     let lesce = lesce.unwrap_or_else(|| PathBuf::from(DEFAULT_LESCE));
     let sava = sava.unwrap_or_else(|| PathBuf::from(DEFAULT_SAVA));
+    Ok((out, lesce, sava))
+}
+
+pub fn schematic_cli(args: impl Iterator<Item = OsString>) -> Result<(), String> {
+    let (out, lesce, sava) = cli_paths("citymap-schematic", args)?;
     export_schematic(
         SourcePaths {
             lesce: &lesce,
@@ -47,34 +58,127 @@ pub fn schematic_cli(args: impl Iterator<Item = OsString>) -> Result<(), String>
     )
 }
 
+pub fn build_cli(args: impl Iterator<Item = OsString>) -> Result<(), String> {
+    let (out, lesce, sava) = cli_paths("citymap-build", args)?;
+    export_dry_slot(
+        SourcePaths {
+            lesce: &lesce,
+            sava: Some(&sava),
+        },
+        &out,
+    )?;
+    println!("Wrote dry lesce_town and build report to {}", out.display());
+    Ok(())
+}
+
 fn preview_world(config: TownConfig) -> Result<Simulation, String> {
     crate::ensure_repo_root_cwd();
     simulation::init::init();
-    // Stock New Game requires at least 16 chunks. Strip its starter
-    // infrastructure via commands so the preview uses ordinary lane trimming.
-    let mut sim = Simulation::new_game(&NewGameOptions {
-        preset: MapPreset::Flat,
-        terrain_chunks: config.map_chunks.max(NewGameOptions::MIN_TERRAIN_CHUNKS),
-        seed: 20261122,
-        starting_money_bucks: NewGameOptions::MAX_STARTING_MONEY_BUCKS,
-        progression: simulation::economy::progression::ProgressionMode::FreeBuild,
-        lot_layout: LotLayout::Uniform,
-    })
-    .map_err(|error| error.to_string())?;
-    use simulation::world_command::{CommandOutcomes, WorldCommand};
-    let commands: Vec<_> = {
-        let map = sim.map();
-        map.buildings()
-            .keys()
-            .map(WorldCommand::MapRemoveBuilding)
-            .chain(map.roads().keys().map(WorldCommand::MapRemoveRoad))
-            .collect()
-    };
-    sim.apply_commands(&commands);
-    if !sim.read::<CommandOutcomes>().last.is_empty() || !sim.map().is_empty() {
-        return Err("could not clear stock infrastructure for CITYMAP preview".into());
-    }
+    // Planning also evaluates exploratory crops before choosing a playable frame.
+    let sim = Simulation::new_authored_flat(config.map_chunks, AuthoredTownOptions::default().seed)
+        .map_err(|error| error.to_string())?;
+    sim.write::<Map>().set_lot_layout(LotLayout::Uniform);
     Ok(sim)
+}
+
+fn blank_town(config: TownConfig) -> Result<Simulation, String> {
+    config.validate()?;
+    crate::ensure_repo_root_cwd();
+    simulation::init::init();
+    Simulation::new_authored_town(AuthoredTownOptions {
+        terrain_chunks: config.map_chunks,
+        owned_rect: AABB::new_ll_ur(config.owned_min, config.owned_max),
+        ..AuthoredTownOptions::default()
+    })
+    .map_err(|error| error.to_string())
+}
+
+/// Builds the dry live network on a fresh authored game.
+pub fn build_dry_town(plan: &TownPlan) -> Result<(Simulation, BuiltNetwork), String> {
+    let mut sim = blank_town(plan.config)?;
+    let built = build_network(&mut sim, &plan.graph, plan.limits)?;
+    Ok((sim, built))
+}
+
+/// Applies the wet terrain before any roads. The bridge builder consumes the
+/// same reservations once WATER supports building across occupied water tiles.
+pub fn carve_authored_sava(sim: &mut Simulation, plan: &TownPlan) -> Result<WaterBodyId, String> {
+    let [reach] = plan.river.as_slice() else {
+        return Err("wet CITYMAP requires one pinned Sava reach".into());
+    };
+    {
+        let map = sim.map();
+        if !map.is_empty()
+            || !map.buildings().is_empty()
+            || map.environment().has_water_configuration()
+            || map.environment().size() != (plan.config.map_chunks, plan.config.map_chunks)
+        {
+            return Err(
+                "the Sava requires a blank authored map matching the planned terrain".into(),
+            );
+        }
+    }
+    sim.carve_river(
+        &reach.downstream,
+        reach.source_width_scaled.unwrap_or(88.0),
+        5.0,
+    )
+    .map_err(|error| format!("Sava water edit: {error}"))
+}
+
+/// Saves the live dry network and its source and geometry report as a local slot.
+pub fn export_dry_slot(paths: SourcePaths<'_>, out: &Path) -> Result<(), String> {
+    let out = std::path::absolute(out).map_err(|error| error.to_string())?;
+    let inputs = read_inputs(paths)?;
+    let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default())?;
+    let (sim, built) = build_dry_town(&plan)?;
+    let mut report = {
+        let map = sim.map();
+        network_report(
+            &map,
+            &inputs,
+            &plan,
+            &built,
+            &blocks(&plan.graph),
+            &frontage(&plan, &map, &built),
+        )?
+    };
+    let id = SlotId::new("lesce_town").map_err(|error| error.to_string())?;
+    let hashes = sim.hashes();
+    let revision_half = |salt: u8| {
+        let mut hasher = DefaultHasher::new();
+        (salt, id.as_str(), &hashes).hash(&mut hasher);
+        u128::from(hasher.finish())
+    };
+    let revision = SnapshotRevision::new(revision_half(0) << 64 | revision_half(1));
+    report["slot"] = serde_json::json!(id.as_str());
+    report["snapshot_revision"] = serde_json::json!(format!("{:032x}", revision.get()));
+    report["variant"] = serde_json::json!("dry");
+    report["scope"] =
+        serde_json::json!("Dry authored network with reserved Sava crossings and facility sites.");
+    let report = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+
+    let slot = sim
+        .encode_slot(revision)
+        .map_err(|error| error.to_string())?
+        .with_display_name("Lesce Town · © OpenStreetMap contributors".into())
+        .with_camera(SlotCamera {
+            position: [plan.station.x, plan.station.y, 10.0],
+            yaw: -0.35,
+            pitch: 1.22,
+            distance: 1490.0,
+        });
+    std::fs::create_dir_all(&out).map_err(|error| format!("{}: {error}", out.display()))?;
+    match slot.publish(&out, &id).map_err(|error| error.to_string())? {
+        SavePhase::Complete => {}
+        SavePhase::SidecarsFailed { replay, meta } => {
+            return Err(format!(
+                "lesce_town sidecars failed: replay={replay:?}, metadata={meta:?}"
+            ));
+        }
+    }
+    let path = out.join("lesce_town.build.json");
+    std::fs::write(&path, report).map_err(|error| format!("{}: {error}", path.display()))
 }
 
 pub fn export_schematic(paths: SourcePaths<'_>, out: &Path) -> Result<(), String> {
@@ -85,23 +189,9 @@ pub fn export_schematic(paths: SourcePaths<'_>, out: &Path) -> Result<(), String
     let mut sim = preview_world(config)?;
     let built = build_network(&mut sim, &plan.graph, plan.limits)?;
     let map = sim.map();
-    let mut routes = route_checks(&map, &plan.graph, &built);
-    routes.extend(river_routes(&map, &plan, &built));
-    if let Some((name, _)) = routes.iter().find(|(_, passes)| !**passes) {
-        return Err(format!("CITYMAP directed route failed: {name}"));
-    }
-    let lengths = live_lengths(&map, &plan, &built);
-    if !lengths.has_retained_majority() {
-        return Err(
-            "CITYMAP requires a majority of named OSM alignment on collectors and locals".into(),
-        );
-    }
     let blocks = blocks(&plan.graph);
     let frontage = frontage(&plan, &map, &built);
-    let rail = rail_crossings(&map, &plan, &built);
-    let report = report(
-        &plan, &inputs, &map, &blocks, &frontage, lengths, routes, rail,
-    );
+    let report = network_report(&map, &inputs, &plan, &built, &blocks, &frontage)?;
     let svg = out.join("citymap-schematic.svg");
     let files = [
         (
@@ -123,6 +213,37 @@ pub fn export_schematic(paths: SourcePaths<'_>, out: &Path) -> Result<(), String
     }
     write_png(&svg, &out.join("citymap-schematic.png"))?;
     Ok(())
+}
+
+fn network_report(
+    map: &Map,
+    inputs: &PinnedInputs,
+    plan: &TownPlan,
+    built: &BuiltNetwork,
+    blocks: &[Vec<Vec2>],
+    frontage: &[Frontage],
+) -> Result<serde_json::Value, String> {
+    let mut routes = route_checks(map, &plan.graph, built);
+    routes.extend(river_routes(map, plan, built));
+    if let Some((name, _)) = routes.iter().find(|(_, passes)| !**passes) {
+        return Err(format!("CITYMAP directed route failed: {name}"));
+    }
+    let lengths = live_lengths(map, plan, built);
+    if !lengths.has_retained_majority() {
+        return Err(
+            "CITYMAP requires a majority of named OSM alignment on collectors and locals".into(),
+        );
+    }
+    Ok(report(
+        plan,
+        inputs,
+        map,
+        blocks,
+        frontage,
+        lengths,
+        routes,
+        rail_crossings(map, plan, built),
+    ))
 }
 
 use geom::{vec2, Vec2};
@@ -752,7 +873,7 @@ fn report(
         "dry_uniform_frontage_candidates": frontage,
         "district_lot_counts": plan.districts.iter().map(|district| (district.key, frontage.iter().filter(|lot| lot.district == Some(district.key)).count())).collect::<BTreeMap<_,_>>(),
         "decisions": plan.graph.decisions,
-        "scope": "Dry geometry preview on an empty stock 16-chunk Flat validation world. Crossing and facility markers are reservations."
+        "scope": "Dry geometry preview on a blank Flat validation world. Crossing and facility markers are reservations."
     })
 }
 
@@ -1019,7 +1140,6 @@ mod tests {
     use super::*;
     use simulation::map::{MapProject, ProjectKind};
     use simulation::world_command::{CommandOutcomes, WorldCommand};
-    use simulation::{SlotId, SnapshotRevision};
 
     fn fixture_graph() -> Graph {
         let mut graph = Graph::default();
@@ -1078,6 +1198,80 @@ mod tests {
             sava: Some(Path::new(DEFAULT_SAVA)),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn citymap_bootstrap_builds_and_reloads_the_compact_town() {
+        use prototypes::{Density, ZoneKind};
+        use simulation::map::{ZoneCell, ZoneGrid};
+        use simulation::souls::growth::check_growable_lot;
+
+        let plan = plan_town(
+            &pinned_inputs(),
+            TownConfig::default(),
+            SpacingLimits::default(),
+        )
+        .unwrap();
+        let (sim, built) = build_dry_town(&plan).unwrap();
+        let loaded = reload_fixture(&sim);
+        let map = loaded.map();
+        assert_eq!(map.environment().size(), (6, 6));
+        assert!(!map.environment().has_water_configuration());
+        assert_eq!(map.lot_layout(), LotLayout::Uniform);
+        assert!(map.buildings().is_empty());
+        let resolved = resolve_network(&map, &plan.graph).unwrap();
+        assert_eq!(built.junctions, resolved.junctions);
+        validate_live(&map, &plan.graph, &resolved, plan.limits).unwrap();
+        assert!(route_checks(&map, &plan.graph, &resolved)
+            .values()
+            .all(|pass| *pass));
+        assert!(river_routes(&map, &plan, &resolved)
+            .values()
+            .all(|pass| *pass));
+        assert!(!rail_crossings(&map, &plan, &resolved).is_empty());
+        assert!(!frontage(&plan, &map, &resolved).is_empty());
+        let zones = loaded.read::<ZoneGrid>();
+        let residential = ZoneCell {
+            kind: ZoneKind::Residential,
+            density: Density::Low,
+        };
+        assert!(map.lots().values().any(|lot| {
+            zones.lot_zone(&lot.shape).is_none()
+                && check_growable_lot(&map, lot, residential).is_ok()
+        }));
+    }
+
+    #[test]
+    fn citymap_bootstrap_carves_the_reserved_sava_before_roads() {
+        let plan = plan_town(
+            &pinned_inputs(),
+            TownConfig::default(),
+            SpacingLimits::default(),
+        )
+        .unwrap();
+        let mut sim = blank_town(plan.config).unwrap();
+        let body = carve_authored_sava(&mut sim, &plan).unwrap();
+        let map = sim.map();
+        assert!(map.is_empty());
+        let reach = &plan.river[0].downstream;
+        for &point in [reach.first().unwrap(), reach.last().unwrap()] {
+            let sample = point.max(Vec2::splat(1.0)).min(Vec2::splat(3071.0));
+            assert_eq!(
+                map.environment().water_at(sample).unwrap().body,
+                body,
+                "{sample:?}"
+            );
+        }
+        for crossing in &plan.crossings {
+            assert_eq!(
+                map.environment().water_at(crossing.point).unwrap().body,
+                body
+            );
+            assert!(crossing
+                .approaches
+                .iter()
+                .all(|&point| !map.environment().is_water(point)));
+        }
     }
 
     #[test]

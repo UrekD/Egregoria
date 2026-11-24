@@ -11,6 +11,7 @@ use common::saveload::Encoder;
 use geom::{Vec2, Vec3};
 use std::sync::Once;
 
+mod citymap_bootstrap;
 mod lifecycle;
 mod p1_fix2;
 mod p2_services;

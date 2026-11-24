@@ -1496,8 +1496,11 @@ impl WorldCommand {
     pub(crate) fn bootstrap_authored(
         sim: &mut Simulation,
         options: SimulationOptions,
+        lot_layout: LotLayout,
     ) -> Result<(), Rejection> {
-        Self::bootstrap_world(sim, options, BootstrapKind::AuthoredFlat)
+        Self::bootstrap_world(sim, options, BootstrapKind::AuthoredFlat)?;
+        sim.map_mut().set_lot_layout(lot_layout);
+        Ok(())
     }
 
     fn bootstrap_world(
