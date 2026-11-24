@@ -616,10 +616,6 @@ impl Map {
             return Err(WaterEditError::Limit);
         }
         let lanes = pattern.lanes_forward.len() + pattern.lanes_backward.len();
-        // The legacy heightfinder coalesces overlapping spans in a vector.
-        // Reserve for moving its tail in rough terrain at every sample.
-        let samples = (length * if elbow.is_some() { 3.0 } else { 1.0 }).ceil() as usize + 2;
-        spend_water_work(remaining, samples.saturating_mul(samples))?;
         let mut junctions = BTreeSet::new();
         let mut splits = Vec::new();
         for endpoint in [from, to] {
