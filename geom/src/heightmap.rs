@@ -1,9 +1,11 @@
 use crate::{vec2, vec3, Ray3, Vec2, Vec3, AABB, AABB3};
-use serde::de::{SeqAccess, Visitor};
+use serde::de::{DeserializeSeed, SeqAccess, Visitor};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize, Serializer};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub type HeightmapChunkID = (u16, u16);
+pub type BaseNode = (usize, usize);
 
 const MAX_HEIGHT_DIFF: f32 = 2048.0;
 const HALF_HEIGHT_DIFF: f32 = MAX_HEIGHT_DIFF / 4.0; // Point where half of the precision goes to
@@ -133,10 +135,120 @@ impl<const RESOLUTION: usize, const SIZE: u32> Heightmap<RESOLUTION, SIZE> {
 
     pub fn new(w: u16, h: u16) -> Self {
         Self {
-            chunks: vec![HeightmapChunk::default(); (w * h) as usize],
+            chunks: vec![HeightmapChunk::default(); usize::from(w) * usize::from(h)],
             w,
             h,
         }
+    }
+
+    /// Decode the normal heightmap format with a caller-supplied size limit.
+    pub fn deserialize_bounded<'de, D: serde::Deserializer<'de>, const LIMIT: u16>(
+        deserializer: D,
+    ) -> Result<Self, D::Error> {
+        #[derive(Deserialize)]
+        struct Record<const R: usize, const S: u32, const LIMIT: u16> {
+            chunks: BoundedChunks<R, S, LIMIT>,
+            w: u16,
+            h: u16,
+        }
+        let Record { chunks, w, h } = Record::<RESOLUTION, SIZE, LIMIT>::deserialize(deserializer)?;
+        if w > LIMIT
+            || h > LIMIT
+            || chunks.0.len() != usize::from(w) * usize::from(h)
+            || chunks.0.iter().any(|chunk| !chunk.max_height.is_finite())
+        {
+            return Err(serde::de::Error::custom(
+                "invalid heightmap dimensions or chunk count",
+            ));
+        }
+        Ok(Self {
+            chunks: chunks.0,
+            w,
+            h,
+        })
+    }
+
+    pub fn packed_base_node(&self, (x, y): BaseNode) -> Option<u16> {
+        if x >= usize::from(self.w) * RESOLUTION || y >= usize::from(self.h) * RESOLUTION {
+            return None;
+        }
+        let chunk = self.get_chunk(((x / RESOLUTION) as u16, (y / RESOLUTION) as u16))?;
+        Some(chunk.heights[y % RESOLUTION][x % RESOLUTION])
+    }
+
+    /// The stored nodes at the corners of an in-map tile, in LL, LR, UL, UR order.
+    pub fn base_tile_nodes(&self, (x, y): BaseNode) -> Option<[BaseNode; 4]> {
+        let w = usize::from(self.w) * RESOLUTION;
+        let h = usize::from(self.h) * RESOLUTION;
+        if x >= w || y >= h {
+            return None;
+        }
+        let right = (x + 1).min(w - 1);
+        let upper = (y + 1).min(h - 1);
+        Some([(x, y), (right, y), (x, upper), (right, upper)])
+    }
+
+    /// Signed bilinear interpolation of the packed base, including the closed outer boundary.
+    pub fn base_height(&self, p: Vec2) -> Option<f32> {
+        self.sample_base(p, |node| self.packed_base_node(node))
+            .map(|(height, _)| height)
+    }
+
+    fn sample_base(
+        &self,
+        p: Vec2,
+        mut packed: impl FnMut(BaseNode) -> Option<u16>,
+    ) -> Option<(f32, Vec2)> {
+        let max = self.bounds().ur;
+        if !p.is_finite() || p.x < 0.0 || p.y < 0.0 || p.x > max.x || p.y > max.y {
+            return None;
+        }
+        let grid = p / Self::CELL_SIZE;
+        let x = (grid.x as usize).min((usize::from(self.w) * RESOLUTION).checked_sub(1)?);
+        let y = (grid.y as usize).min((usize::from(self.h) * RESOLUTION).checked_sub(1)?);
+        let nodes = self.base_tile_nodes((x, y))?;
+        let [ll, lr, ul, ur] = [
+            unpack_height(packed(nodes[0])?),
+            unpack_height(packed(nodes[1])?),
+            unpack_height(packed(nodes[2])?),
+            unpack_height(packed(nodes[3])?),
+        ];
+        let dx = grid.x - x as f32;
+        let dy = grid.y - y as f32;
+        let bottom = ll + dx * (lr - ll);
+        let top = ul + dx * (ur - ul);
+        Some((
+            bottom + dy * (top - bottom),
+            -vec2((lr - ll) + dy * ((ur - ul) - (lr - ll)), top - bottom),
+        ))
+    }
+
+    /// Apply a checked journal. A stale original value rejects the whole patch.
+    pub fn apply_base_patch(
+        &mut self,
+        patch: BaseNodePatch,
+    ) -> Result<BTreeSet<HeightmapChunkID>, BasePatchError> {
+        if patch
+            .nodes
+            .iter()
+            .any(|(&node, &(old, _))| self.packed_base_node(node) != Some(old))
+        {
+            return Err(BasePatchError::Stale);
+        }
+        let mut chunks = BTreeSet::new();
+        for ((x, y), (old, new)) in patch.nodes {
+            if old == new {
+                continue;
+            }
+            *self.height_idx_mut(x, y).unwrap() = new;
+            chunks.insert(((x / RESOLUTION) as u16, (y / RESOLUTION) as u16));
+        }
+        for &id in &chunks {
+            let chunk = self.get_chunk_mut(id).unwrap();
+            chunk.max_height = 0.0;
+            chunk.update_max_height();
+        }
+        Ok(chunks)
     }
 
     #[inline]
@@ -157,7 +269,7 @@ impl<const RESOLUTION: usize, const SIZE: u32> Heightmap<RESOLUTION, SIZE> {
         if !self.check_valid(id) {
             return;
         }
-        self.chunks[(id.0 + id.1 * self.w) as usize] = chunk;
+        self.chunks[usize::from(id.0) + usize::from(id.1) * usize::from(self.w)] = chunk;
     }
 
     #[inline]
@@ -165,7 +277,8 @@ impl<const RESOLUTION: usize, const SIZE: u32> Heightmap<RESOLUTION, SIZE> {
         if !self.check_valid(id) {
             return None;
         }
-        unsafe { Some(self.chunks.get_unchecked((id.0 + id.1 * self.w) as usize)) }
+        self.chunks
+            .get(usize::from(id.0) + usize::from(id.1) * usize::from(self.w))
     }
 
     pub fn set_override(
@@ -188,12 +301,8 @@ impl<const RESOLUTION: usize, const SIZE: u32> Heightmap<RESOLUTION, SIZE> {
         if !self.check_valid(id) {
             return None;
         }
-        unsafe {
-            Some(
-                self.chunks
-                    .get_unchecked_mut((id.0 + id.1 * self.w) as usize),
-            )
-        }
+        self.chunks
+            .get_mut(usize::from(id.0) + usize::from(id.1) * usize::from(self.w))
     }
 
     /// Applies a function to every point in the heightmap in the given bounds
@@ -299,10 +408,10 @@ impl<const RESOLUTION: usize, const SIZE: u32> Heightmap<RESOLUTION, SIZE> {
     pub fn chunks(
         &self,
     ) -> impl Iterator<Item = (HeightmapChunkID, &HeightmapChunk<RESOLUTION, SIZE>)> + '_ {
-        self.chunks
-            .iter()
-            .enumerate()
-            .map(move |(i, chunk)| ((i as u16 % self.w, i as u16 / self.w), chunk))
+        self.chunks.iter().enumerate().map(move |(i, chunk)| {
+            let w = usize::from(self.w);
+            (((i % w) as u16, (i / w) as u16), chunk)
+        })
     }
 
     pub fn covered_chunks(&self, bounds: AABB) -> impl Iterator<Item = HeightmapChunkID> {
@@ -519,6 +628,21 @@ fn binary_search(min: f32, max: f32, mut f: impl FnMut(f32) -> bool) -> f32 {
 
 const HALF_U16: u16 = u16::MAX >> 1;
 
+/// Largest packed base sample whose decoded height does not exceed the requested ceiling.
+pub fn pack_base_height_at_most(height: f64) -> Option<u16> {
+    if !height.is_finite() || height < f64::from(MIN_HEIGHT) {
+        return None;
+    }
+    let mut packed = pack_height(height as f32);
+    while f64::from(unpack_height(packed)) > height {
+        packed -= 1;
+    }
+    while packed < u16::MAX && f64::from(unpack_height(packed + 1)) <= height {
+        packed += 1;
+    }
+    Some(packed)
+}
+
 pub fn pack_height(height: f32) -> u16 {
     let height = height.clamp(MIN_HEIGHT, MAX_HEIGHT);
 
@@ -532,13 +656,96 @@ pub fn pack_height(height: f32) -> u16 {
     (HALF_U16 as f32 + height_off / HALF_HEIGHT_DIFF * HALF_U16 as f32) as u16
 }
 
-fn unpack_height(height: u16) -> f32 {
+pub fn unpack_height(height: u16) -> f32 {
     if height < HALF_U16 {
         return MIN_HEIGHT + height as f32 / HALF_U16 as f32 * HALF_HEIGHT_DIFF;
     }
 
     let height = height - HALF_U16;
     MIN_HEIGHT + HALF_HEIGHT_DIFF + height as f32 / HALF_U16 as f32 * HALF_HEIGHT_DIFF
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub enum BasePatchError {
+    Bounds,
+    Limit,
+    Stale,
+}
+
+/// A bounded journal of packed base writes. Originals are preserved for atomic application.
+#[derive(Debug, Clone)]
+pub struct BaseNodePatch {
+    limit: usize,
+    nodes: BTreeMap<BaseNode, (u16, u16)>,
+}
+
+impl BaseNodePatch {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit,
+            nodes: BTreeMap::new(),
+        }
+    }
+
+    pub fn changes(&self) -> impl Iterator<Item = (BaseNode, u16, u16)> + '_ {
+        self.nodes
+            .iter()
+            .filter_map(|(&node, &(old, new))| (old != new).then_some((node, old, new)))
+    }
+
+    pub fn staged_node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn stage<const R: usize, const S: u32>(
+        &mut self,
+        map: &Heightmap<R, S>,
+        node: BaseNode,
+        value: u16,
+    ) -> Result<(), BasePatchError> {
+        if let Some((_, new)) = self.nodes.get_mut(&node) {
+            *new = value;
+            return Ok(());
+        }
+        let old = map.packed_base_node(node).ok_or(BasePatchError::Bounds)?;
+        if old != value {
+            if self.nodes.len() >= self.limit {
+                return Err(BasePatchError::Limit);
+            }
+            self.nodes.insert(node, (old, value));
+        }
+        Ok(())
+    }
+
+    pub fn packed_base_node<const R: usize, const S: u32>(
+        &self,
+        map: &Heightmap<R, S>,
+        node: BaseNode,
+    ) -> Option<u16> {
+        self.nodes
+            .get(&node)
+            .map(|&(_, new)| new)
+            .or_else(|| map.packed_base_node(node))
+    }
+
+    pub fn base_height<const R: usize, const S: u32>(
+        &self,
+        map: &Heightmap<R, S>,
+        point: Vec2,
+    ) -> Option<f32> {
+        map.sample_base(point, |node| self.packed_base_node(map, node))
+            .map(|(height, _)| height)
+    }
+}
+
+struct BoundedChunks<const R: usize, const S: u32, const LIMIT: u16>(Vec<HeightmapChunk<R, S>>);
+
+impl<'de, const R: usize, const S: u32, const LIMIT: u16> Deserialize<'de>
+    for BoundedChunks<R, S, LIMIT>
+{
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        deserializer.deserialize_seq(Self(Vec::new()))
+    }
 }
 
 #[cfg(test)]
@@ -606,6 +813,39 @@ impl<'de, const RESOLUTION: usize, const SIZE: u32> Deserialize<'de>
     }
 }
 
+impl<'de, const R: usize, const S: u32, const LIMIT: u16> Visitor<'de>
+    for BoundedChunks<R, S, LIMIT>
+{
+    type Value = Self;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "at most {} terrain chunks", usize::from(LIMIT).pow(2))
+    }
+
+    fn visit_seq<A: SeqAccess<'de>>(mut self, mut seq: A) -> Result<Self, A::Error> {
+        use serde::de::Error;
+        let limit = usize::from(LIMIT).pow(2);
+        if let Some(len) = seq.size_hint().filter(|&len| len > limit) {
+            return Err(Error::invalid_length(len, &self));
+        }
+        while self.0.len() < limit {
+            match seq.next_element()? {
+                Some(chunk) => self.0.push(chunk),
+                None => return Ok(self),
+            }
+        }
+        struct Overflow;
+        impl<'de> DeserializeSeed<'de> for Overflow {
+            type Value = ();
+            fn deserialize<D: serde::Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
+                Err(Error::custom("terrain chunk limit exceeded"))
+            }
+        }
+        seq.next_element_seed(Overflow)?;
+        Ok(self)
+    }
+}
+
 struct HeightmapChunkVisitor<const RESOLUTION: usize>;
 
 impl<'de, const RESOLUTION: usize> Visitor<'de> for HeightmapChunkVisitor<RESOLUTION> {
@@ -661,7 +901,7 @@ impl<const RESOLUTION: usize> HeightmapChunkVisitor<RESOLUTION> {
 }
 
 mod erosion {
-    use crate::heightmap::{unpack_height, MIN_HEIGHT};
+    use crate::heightmap::{unpack_height, BaseNode, BaseNodePatch, BasePatchError, MIN_HEIGHT};
     use crate::{
         pack_height, vec2, Heightmap, HeightmapChunk, HeightmapChunkID, Radians, Vec2, AABB,
     };
@@ -690,16 +930,109 @@ mod erosion {
     const INITIAL_WATER_VOLUME: f32 = 1.0;
     const INITIAL_SPEED: f32 = 1.0;
 
-    impl<const RESOLUTION: usize, const SIZE: u32> Heightmap<RESOLUTION, SIZE> {
-        #[rustfmt::skip]
+    enum ErosionTerrain<'a, const R: usize, const S: u32> {
+        Live(&'a mut Heightmap<R, S>, BTreeSet<HeightmapChunkID>),
+        Staged(&'a Heightmap<R, S>, &'a mut BaseNodePatch),
+    }
+
+    impl<const R: usize, const S: u32> Heightmap<R, S> {
+        /// Conservative work for each particle, including brush writes and reads.
+        pub const EROSION_WORK_PER_PARTICLE: usize = MAX_DROPLET_LIFETIME * 64;
+
         pub fn erode(
             &mut self,
             bounds: AABB,
             n_particles: usize,
-            mut randgen: impl FnMut() -> f32,
+            randgen: impl FnMut() -> f32,
         ) -> Vec<HeightmapChunkID> {
-            let mut changed = BTreeSet::new();
+            let mut target = ErosionTerrain::Live(self, BTreeSet::new());
+            target.erode(bounds, n_particles, randgen).unwrap();
+            let ErosionTerrain::Live(map, changed) = target else {
+                unreachable!()
+            };
+            for &id in &changed {
+                if let Some(chunk) = map.get_chunk_mut(id) {
+                    chunk.update_max_height();
+                }
+            }
+            changed.into_iter().collect()
+        }
 
+        pub fn stage_base_erosion(
+            &self,
+            patch: &mut BaseNodePatch,
+            bounds: AABB,
+            n_particles: usize,
+            randgen: impl FnMut() -> f32,
+        ) -> Result<(), BasePatchError> {
+            ErosionTerrain::Staged(self, patch).erode(bounds, n_particles, randgen)
+        }
+    }
+
+    impl<const R: usize, const S: u32> ErosionTerrain<'_, R, S> {
+        fn map(&self) -> &Heightmap<R, S> {
+            match self {
+                Self::Live(map, _) => map,
+                Self::Staged(map, _) => map,
+            }
+        }
+
+        fn height_gradient(&self, point: Vec2) -> Option<(f32, Vec2)> {
+            match self {
+                Self::Live(map, _) => map.height_gradient(point),
+                Self::Staged(map, patch) => {
+                    map.sample_base(point, |node| patch.packed_base_node(map, node))
+                }
+            }
+        }
+
+        fn height(&self, point: Vec2) -> Option<f32> {
+            match self {
+                Self::Live(map, _) => map.height(point),
+                Self::Staged(map, patch) => patch.base_height(map, point),
+            }
+        }
+
+        fn height_idx(&self, (x, y): BaseNode) -> Option<f32> {
+            match self {
+                Self::Live(map, _) => map.height_idx(x, y),
+                Self::Staged(map, patch) => patch.packed_base_node(map, (x, y)).map(unpack_height),
+            }
+        }
+
+        fn add_height(&mut self, node: BaseNode, delta: f32) -> Result<(), BasePatchError> {
+            match self {
+                Self::Live(map, _) => {
+                    if let Some(value) = map.height_idx_mut(node.0, node.1) {
+                        *value = pack_height(unpack_height(*value) + delta);
+                    }
+                }
+                Self::Staged(map, patch) => {
+                    if delta != 0.0 {
+                        if let Some(value) = patch.packed_base_node(map, node) {
+                            patch.stage(map, node, pack_height(unpack_height(value) + delta))?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        fn visit_droplet(&mut self, point: Vec2) {
+            if let Self::Live(_, changed) = self {
+                changed.insert(HeightmapChunk::<R, S>::id(point));
+            }
+        }
+
+        fn erode(
+            &mut self,
+            bounds: AABB,
+            n_particles: usize,
+            mut randgen: impl FnMut() -> f32,
+        ) -> Result<(), BasePatchError> {
+            let width = f32::from(self.map().w) * R as f32;
+            let height_nodes = f32::from(self.map().h) * R as f32;
+            let pitch = Heightmap::<R, S>::CELL_SIZE;
             let mut erosion_brush_total = 0.0;
             for y in -EROSION_RADIUS..=EROSION_RADIUS {
                 for x in -EROSION_RADIUS..=EROSION_RADIUS {
@@ -718,8 +1051,7 @@ mod erosion {
                 let angle = Radians(randgen() * std::f32::consts::TAU);
                 let pos = bounds.center() + angle.vec2() * d;
 
-
-                let mut pos = pos / Self::CELL_SIZE;
+                let mut pos = pos / pitch;
 
                 let mut dir = Vec2::ZERO;
 
@@ -728,16 +1060,10 @@ mod erosion {
                 let mut sediment = 0.0;
 
                 for _ in 0..MAX_DROPLET_LIFETIME {
-                    //unsafe {
-                    //    let size = 10.0 * (MAX_DROPLET_LIFETIME as f32 - i as f32)
-                    //        / MAX_DROPLET_LIFETIME as f32;
-                    //    DEBUG_OBBS.push(OBB::new(pos * Self::CELL_SIZE, Vec2::X, size, size));
-                    //}
                     let cell_offset = pos - pos.floor();
 
                     // Calculate droplet's height and direction of flow with bilinear interpolation of surrounding heights
-                    let Some((height, gradient)) = self.height_gradient(pos * Self::CELL_SIZE)
-                    else {
+                    let Some((height, gradient)) = self.height_gradient(pos * pitch) else {
                         break;
                     };
 
@@ -755,16 +1081,16 @@ mod erosion {
                     // Stop simulating droplet if it's not moving or has flowed over edge of map
                     if (dir.x == 0.0 && dir.y == 0.0)
                         || pos.x < 0.0
-                        || pos.x >= self.w as f32 * RESOLUTION as f32
+                        || pos.x >= width
                         || pos.y < 0.0
-                        || pos.y >= self.h as f32 * RESOLUTION as f32
+                        || pos.y >= height_nodes
                     {
                         break;
                     }
 
                     // Find the droplet's new height and calculate the deltaHeight
-                    let new_height = self.height((pos + dir) * Self::CELL_SIZE).unwrap_or(0.0);
-                    let delta_height = (new_height - height) / Self::CELL_SIZE;
+                    let new_height = self.height((pos + dir) * pitch).unwrap_or(0.0);
+                    let delta_height = (new_height - height) / pitch;
 
                     // Calculate the droplet's sediment capacity (higher when moving fast down a slope and contains lots of water)
                     let sediment_capacity =
@@ -783,17 +1109,25 @@ mod erosion {
 
                         // Add the sediment to the four nodes of the current cell using bilinear interpolation
                         // Deposition is not distributed over a radius (like erosion) so that it can fill small pits
-                        changed.insert(HeightmapChunk::<RESOLUTION, SIZE>::id(
-                            pos * Self::CELL_SIZE,
-                        ));
-
-                        let amount_to_deposit = amount_to_deposit * Self::CELL_SIZE;
-                        {
-                            if let Some(v) = self.height_idx_mut(pos.x as usize    , pos.y as usize)     { *v = pack_height(unpack_height(*v) + amount_to_deposit * (1.0 - cell_offset.x) * (1.0 - cell_offset.y)) };
-                            if let Some(v) = self.height_idx_mut(pos.x as usize + 1, pos.y as usize)     { *v = pack_height(unpack_height(*v) + amount_to_deposit * cell_offset.x         * (1.0 - cell_offset.y)) };
-                            if let Some(v) = self.height_idx_mut(pos.x as usize    , pos.y as usize + 1) { *v = pack_height(unpack_height(*v) + amount_to_deposit * (1.0 - cell_offset.x) * cell_offset.y) };
-                            if let Some(v) = self.height_idx_mut(pos.x as usize + 1, pos.y as usize + 1) { *v = pack_height(unpack_height(*v) + amount_to_deposit * cell_offset.x         * cell_offset.y) };
-                        }
+                        self.visit_droplet(pos * pitch);
+                        let amount_to_deposit = amount_to_deposit * pitch;
+                        let (x, y) = (pos.x as usize, pos.y as usize);
+                        self.add_height(
+                            (x, y),
+                            amount_to_deposit * (1.0 - cell_offset.x) * (1.0 - cell_offset.y),
+                        )?;
+                        self.add_height(
+                            (x + 1, y),
+                            amount_to_deposit * cell_offset.x * (1.0 - cell_offset.y),
+                        )?;
+                        self.add_height(
+                            (x, y + 1),
+                            amount_to_deposit * (1.0 - cell_offset.x) * cell_offset.y,
+                        )?;
+                        self.add_height(
+                            (x + 1, y + 1),
+                            amount_to_deposit * cell_offset.x * cell_offset.y,
+                        )?;
                     } else {
                         // Erode a fraction of the droplet's current carry capacity.
                         // Clamp the erosion to the change in height so that it doesn't dig a hole in the heightmap behind the droplet
@@ -801,7 +1135,7 @@ mod erosion {
                             f32::min((sediment_capacity - sediment) * ERODE_SPEED, -delta_height);
 
                         // Use erosion brush to erode from all nodes inside the droplet's erosion radius
-                        changed.insert(HeightmapChunk::<RESOLUTION, SIZE>::id(pos * Self::CELL_SIZE));
+                        self.visit_droplet(pos * pitch);
 
                         for erode_y in -EROSION_RADIUS..=EROSION_RADIUS {
                             for erode_x in -EROSION_RADIUS..=EROSION_RADIUS {
@@ -809,21 +1143,20 @@ mod erosion {
                                 if dist2 >= EROSION_RADIUS * EROSION_RADIUS {
                                     continue;
                                 }
-                                let w = (1.0 - f32::sqrt(dist2 as f32) / EROSION_RADIUS as f32) / erosion_brush_total;
+                                let w = (1.0 - f32::sqrt(dist2 as f32) / EROSION_RADIUS as f32)
+                                    / erosion_brush_total;
 
                                 let pos_radius = pos + vec2(erode_x as f32, erode_y as f32);
 
                                 let weighed_erode_amount = amount_to_erode * w;
 
-                                let delta_sediment = (self
-                                    .height_idx(pos_radius.x as usize, pos_radius.y as usize)
-                                    .unwrap_or(0.0) - MIN_HEIGHT)
-                                    .div(Self::CELL_SIZE)
+                                let node = (pos_radius.x as usize, pos_radius.y as usize);
+                                let delta_sediment = (self.height_idx(node).unwrap_or(0.0)
+                                    - MIN_HEIGHT)
+                                    .div(pitch)
                                     .min(weighed_erode_amount);
 
-                                if let Some(v) = self.height_idx_mut(pos_radius.x as usize, pos_radius.y as usize)
-                                        {  *v = pack_height(unpack_height(*v) - delta_sediment * Self::CELL_SIZE) }
-
+                                self.add_height(node, -(delta_sediment * pitch))?;
 
                                 sediment += delta_sediment;
                             }
@@ -837,12 +1170,69 @@ mod erosion {
                 }
             }
 
-            for c in &changed {
-                let Some(c) = self.get_chunk_mut(*c) else { continue; };
-                c.update_max_height();
-            }
-
-            changed.into_iter().collect()
+            Ok(())
         }
+    }
+}
+
+#[cfg(test)]
+mod water_base_tests {
+    use super::*;
+
+    #[test]
+    fn water_base_uses_real_seam_and_clamps_each_outer_axis() {
+        let mut map = Heightmap::<2, 32>::new(2, 1);
+        map.set_chunk((0, 0), HeightmapChunk::new([[pack_height(4.0); 2]; 2]));
+        map.set_chunk(
+            (1, 0),
+            HeightmapChunk::new([[pack_height(-4.0), pack_height(8.0)]; 2]),
+        );
+        map.set_override((1, 0), [[pack_height(-20.0); 2]; 2]);
+        assert!(map.base_height(vec2(24.0, 30.0)).unwrap().abs() < 0.03);
+        assert!((map.base_height(vec2(64.0, 32.0)).unwrap() - 8.0).abs() < 0.03);
+        assert!(map.base_height(vec2(-1.0, 0.0)).is_none());
+
+        let mut patch = BaseNodePatch::new(2);
+        patch.stage(&map, (2, 1), pack_height(-12.0)).unwrap();
+        assert!(patch.base_height(&map, vec2(24.0, 32.0)).unwrap() < -3.9);
+        assert!(map.base_height(vec2(24.0, 32.0)).unwrap().abs() < 0.03);
+        map.apply_base_patch(patch).unwrap();
+        assert!(map.base_height(vec2(24.0, 32.0)).unwrap() < -3.9);
+    }
+
+    #[test]
+    fn water_base_erosion_stages_neighbors_on_both_sides_of_a_seam() {
+        let mut map = Heightmap::<32, 512>::new(2, 1);
+        map.apply(map.bounds(), |p| 25.0 - p.x * 0.04);
+        let bounds = AABB::centered(vec2(508.0, 256.0), Vec2::splat(32.0));
+        let mut patch = BaseNodePatch::new(4096);
+        map.stage_base_erosion(&mut patch, bounds, 2, || 0.0)
+            .unwrap();
+        assert!(patch.changes().any(|((x, _), _, _)| x == 31));
+        assert!(patch.changes().any(|((x, _), _, _)| x == 32));
+        for (node, old, new) in patch.changes() {
+            assert_eq!(map.packed_base_node(node), Some(old));
+            assert_eq!(patch.packed_base_node(&map, node), Some(new));
+        }
+        assert_eq!(
+            map.apply_base_patch(patch).unwrap(),
+            BTreeSet::from([(0, 0), (1, 0)])
+        );
+    }
+
+    #[test]
+    fn water_base_patch_rejects_stale_and_excess_nodes_atomically() {
+        let mut map = Heightmap::<2, 32>::new(2, 1);
+        let mut patch = BaseNodePatch::new(1);
+        patch.stage(&map, (1, 0), pack_height(4.0)).unwrap();
+        assert_eq!(
+            patch.stage(&map, (2, 0), pack_height(4.0)),
+            Err(BasePatchError::Limit)
+        );
+        let mut other = BaseNodePatch::new(1);
+        other.stage(&map, (1, 0), pack_height(2.0)).unwrap();
+        map.apply_base_patch(other).unwrap();
+        assert_eq!(map.apply_base_patch(patch), Err(BasePatchError::Stale));
+        assert_eq!(map.packed_base_node((1, 0)), Some(pack_height(2.0)));
     }
 }

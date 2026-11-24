@@ -7,11 +7,18 @@ use serde::{Deserialize, Serialize};
 
 use common::FastSet;
 use egui_inspect::egui::ahash::HashSetExt;
-use geom::{lerp, pack_height, vec2, Intersect, Radians, Ray3, Vec2, Vec3, AABB};
+use geom::{
+    lerp, pack_height, unpack_height, vec2, BaseNodePatch, Intersect, Radians, Ray3, Vec2, Vec3,
+    AABB,
+};
 use prototypes::{Tick, DELTA};
 
 use crate::map::procgen::heightmap;
 use crate::map::procgen::heightmap::tree_density;
+use crate::map::water::{
+    validate_map_dimensions, PreparedWaterEdit, WaterEditError, WaterState, MAX_WATER_BASE_WRITES,
+    MAX_WATER_BATCH_WORK, MAX_WATER_CHUNKS_PER_AXIS,
+};
 use crate::utils::rand_provider::RandProvider;
 use crate::{MapPreset, NewGameOptions, SimulationOptions};
 
@@ -36,7 +43,9 @@ pub struct Tree {
 
 #[derive(Clone)]
 pub struct Environment {
-    heightmap: Heightmap,
+    pub(super) heightmap: Heightmap,
+    pub(super) water: WaterState,
+    pub(super) base_revision: u64,
     pub trees: Grid<Tree, Vec2>,
 }
 
@@ -48,8 +57,6 @@ pub enum TerraformKind {
     Slope,
     Erode,
 }
-
-defer_serialize!(Environment, SerializedEnvironment);
 
 impl Default for Environment {
     fn default() -> Self {
@@ -78,9 +85,11 @@ impl Environment {
         Self::generate(size, size, options.preset, options.seed, valley_axis)
     }
 
-    fn generate(w: u16, h: u16, preset: MapPreset, seed: u64, valley_axis: f32) -> Self {
+    pub(super) fn generate(w: u16, h: u16, preset: MapPreset, seed: u64, valley_axis: f32) -> Self {
         let mut me = Self {
             heightmap: Heightmap::new(w, h),
+            water: WaterState::default(),
+            base_revision: 0,
             trees: Grid::new(TREE_GRID_SIZE as i32),
         };
         // Bound the shift in noise space to keep enough precision for nearby cells.
@@ -142,9 +151,19 @@ impl Environment {
     }
 
     /// Filter generated vegetation before the imported map is first displayed.
-    pub(crate) fn retain_imported_trees(&mut self, mut retain: impl FnMut(Vec2) -> bool) {
+    pub(crate) fn retain_imported_trees(&mut self, retain: impl FnMut(Vec2) -> bool) {
+        Self::retain_trees(&mut self.trees, retain);
+    }
+
+    pub(super) fn remove_wet_generated_trees(&mut self) {
+        let water = &self.water;
+        let map = &self.heightmap;
+        Self::retain_trees(&mut self.trees, |pos| !water.occupies(map, pos));
+    }
+
+    fn retain_trees(trees: &mut Grid<Tree, Vec2>, mut retain: impl FnMut(Vec2) -> bool) {
         let mut remove = Vec::new();
-        let mut cells: Vec<_> = self.trees.storage().cells.iter().collect();
+        let mut cells: Vec<_> = trees.storage().cells.iter().collect();
         cells.sort_unstable_by_key(|(&id, _)| id);
         for (_, cell) in cells {
             remove.extend(
@@ -154,7 +173,7 @@ impl Environment {
             );
         }
         for id in remove {
-            self.trees.remove_maintain(id);
+            trees.remove_maintain(id);
         }
     }
 
@@ -196,13 +215,17 @@ impl Environment {
             .set_override((chunk.0 as u16, chunk.1 as u16), overrides);
     }
 
-    /// Applies a function to the heightmap
-    /// Returns the chunks that were modified
+    /// Apply raw base writes for dry terrain generation and fixtures.
     pub fn terrain_apply(
         &mut self,
         bounds: AABB,
         f: impl FnMut(Vec3) -> f32,
     ) -> Vec<TerrainChunkID> {
+        assert!(
+            !self.has_water_configuration(),
+            "configured water requires a staged base patch"
+        );
+        self.base_revision = self.base_revision.wrapping_add(1);
         self.heightmap
             .apply(bounds, f)
             .into_iter()
@@ -210,7 +233,7 @@ impl Environment {
             .collect()
     }
 
-    pub fn terraform(
+    pub(super) fn terraform(
         &mut self,
         tick: Tick,
         kind: TerraformKind,
@@ -220,84 +243,110 @@ impl Environment {
         level: f32,
         slope: Option<(Vec3, Vec3)>,
     ) -> Vec<TerrainChunkID> {
+        if self.has_water_configuration() {
+            // The live map transaction validates occupancy against staged water.
+            return Vec::new();
+        }
+        self.base_revision = self.base_revision.wrapping_add(1);
+        let brush = TerraformBrush {
+            kind,
+            center,
+            radius,
+            amount,
+            level,
+            slope,
+        };
         let bbox = AABB::centered(center, Vec2::splat(radius * 2.0));
-        match kind {
-            TerraformKind::Elevation => self.terrain_apply(bbox, |pos| {
-                let dist = pos.xy().distance(center) / radius;
-                if dist >= 1.0 {
-                    return pos.z;
-                }
-                let phi = (-1.0 / (1.0 - dist * dist)).exp();
-                pos.z + (amount * DELTA) * phi
-            }),
+        let modified = match kind {
             TerraformKind::Smooth => self
                 .heightmap
-                .apply_convolution(bbox, |pos, vals| {
-                    let dist = pos.distance(center) / radius;
-                    if dist >= 1.0 {
-                        return vals[4];
-                    }
-                    let phi = (-1.0 / (1.0 - dist * dist)).exp();
-
-                    const GAUSSIAN_KERNEL: &[f32; 9] = &[
-                        0.07511361, 0.1238414, 0.07511361, 0.1238414, 0.20417996, 0.1238414,
-                        0.07511361, 0.1238414, 0.07511361,
-                    ];
-                    let mut sum = 0.0;
-                    for (a, b) in vals.iter().zip(GAUSSIAN_KERNEL.iter()) {
-                        sum += a * b;
-                    }
-                    vals[4] + phi * (sum - vals[4])
-                })
-                .into_iter()
-                .map(|(x, y)| TerrainChunkID::new_i16(x as i16, y as i16))
-                .collect(),
-            TerraformKind::Level => self.terrain_apply(bbox, |pos| {
-                let dist = pos.xy().distance(center) / radius;
-                if dist >= 1.0 {
-                    return pos.z;
-                }
-                let phi = (-1.0 / (1.0 - dist * dist)).exp();
-                pos.z
-                    + (amount * DELTA)
-                        * phi
-                        * (level - pos.z).signum()
-                        * (level - pos.z).abs().mul(0.1).clamp(0.0, 1.0)
-            }),
-            TerraformKind::Slope => self.terrain_apply(bbox, |pos| {
-                let dist = pos.xy().distance(center) / radius;
-                if dist >= 1.0 {
-                    return pos.z;
-                }
-                let phi = (-1.0 / (1.0 - dist * dist)).exp();
-                let mut z = pos.z;
-                if let Some((p1, p2)) = slope {
-                    let d = p2.xy() - p1.xy();
-                    let coeff_along_d = (pos.xy() - p1.xy()).dot(d) / d.mag2();
-                    let desired_height = lerp(p1.z, p2.z, coeff_along_d.clamp(0.0, 1.0));
-
-                    z += (amount * DELTA)
-                        * phi
-                        * (desired_height - pos.z).signum()
-                        * (desired_height - pos.z).abs().mul(0.1).clamp(0.0, 1.0);
-                }
-                z
-            }),
+                .apply_convolution(bbox, |pos, vals| brush.smooth(pos, vals)),
             TerraformKind::Erode => {
-                let mut rng = common::rand::gen(tick.0);
-                let n_particles_continuous = amount * DELTA * radius * radius * 0.00002;
-                let mut n_particles = n_particles_continuous as usize;
-                if n_particles_continuous.fract() > rng.next_f32() {
-                    n_particles += 1;
-                }
-
-                self.heightmap
-                    .erode(bbox, n_particles, || rng.next_f32())
-                    .into_iter()
-                    .map(|(x, y)| TerrainChunkID::new_i16(x as i16, y as i16))
-                    .collect()
+                let (particles, mut rng) = brush.erosion_particles(tick);
+                self.heightmap.erode(bbox, particles, &mut rng)
             }
-        }
+            _ => self.heightmap.apply(bbox, |pos| brush.height(pos)),
+        };
+        modified
+            .into_iter()
+            .map(|(x, y)| TerrainChunkID::new_i16(x as i16, y as i16))
+            .collect()
+    }
+
+    /// Stage Terraform against packed base nodes, then prepare the resulting hydrology.
+    pub(crate) fn prepare_water_terraform(
+        &self,
+        tick: Tick,
+        kind: TerraformKind,
+        center: Vec2,
+        radius: f32,
+        amount: f32,
+        level: f32,
+        slope: Option<(Vec3, Vec3)>,
+    ) -> Result<PreparedWaterEdit, WaterEditError> {
+        validate_map_dimensions(&self.heightmap)?;
+        let brush = TerraformBrush {
+            kind,
+            center,
+            radius,
+            amount,
+            level,
+            slope,
+        };
+        brush.validate()?;
+        let bbox = AABB::centered(center, Vec2::splat(radius * 2.0));
+        let mut patch = BaseNodePatch::new(MAX_WATER_BASE_WRITES);
+        let work = if kind == TerraformKind::Erode {
+            let (particles, mut rng) = brush.erosion_particles(tick);
+            let work = particles
+                .checked_mul(Heightmap::EROSION_WORK_PER_PARTICLE)
+                .filter(|&work| work <= MAX_WATER_BATCH_WORK)
+                .ok_or(WaterEditError::Limit)?;
+            self.heightmap
+                .stage_base_erosion(&mut patch, bbox, particles, &mut rng)?;
+            work
+        } else {
+            let r = TERRAIN_CHUNK_RESOLUTION;
+            let work_per_node = if kind == TerraformKind::Smooth { 10 } else { 1 };
+            let chunk_work = r * r * work_per_node;
+            let work = self.heightmap.covered_chunks(bbox).count() * chunk_work;
+            if work > MAX_WATER_BATCH_WORK {
+                return Err(WaterEditError::Limit);
+            }
+            for (cx, cy) in self.heightmap.covered_chunks(bbox) {
+                for y in usize::from(cy) * r..(usize::from(cy) + 1) * r {
+                    for x in usize::from(cx) * r..(usize::from(cx) + 1) * r {
+                        let point = vec2(x as f32, y as f32) * CELL_SIZE;
+                        if !bbox.contains(point) {
+                            continue;
+                        }
+                        let packed = self.heightmap.packed_base_node((x, y)).unwrap();
+                        let current = unpack_height(packed);
+                        let height = if kind == TerraformKind::Smooth {
+                            let nodes = std::array::from_fn(|i| {
+                                let node =
+                                    ((x + i % 3).saturating_sub(1), (y + i / 3).saturating_sub(1));
+                                self.heightmap
+                                    .packed_base_node(node)
+                                    .map(unpack_height)
+                                    .unwrap_or(0.0)
+                            });
+                            brush.smooth(point, nodes)
+                        } else {
+                            brush.height(point.z(current))
+                        };
+                        if !height.is_finite() {
+                            return Err(WaterEditError::InvalidInput);
+                        }
+                        if height != current {
+                            patch.stage(&self.heightmap, (x, y), pack_height(height))?;
+                        }
+                    }
+                }
+            }
+            work
+        };
+        self.prepare_water_base_patch_with_work(patch, work)
     }
 
     fn generate_chunk(
@@ -365,6 +414,90 @@ impl Environment {
     }
 }
 
+struct TerraformBrush {
+    kind: TerraformKind,
+    center: Vec2,
+    radius: f32,
+    amount: f32,
+    level: f32,
+    slope: Option<(Vec3, Vec3)>,
+}
+
+impl TerraformBrush {
+    fn validate(&self) -> Result<(), WaterEditError> {
+        if !self.center.is_finite()
+            || !(self.radius > 0.0 && self.radius <= 2_000.0)
+            || !(-2_000.0..=2_000.0).contains(&self.amount)
+            || !self.level.is_finite()
+            || self.slope.is_some_and(|(start, end)| {
+                let length = start.xy().distance2(end.xy());
+                !start.is_finite() || !end.is_finite() || !length.is_finite() || length == 0.0
+            })
+        {
+            return Err(WaterEditError::InvalidInput);
+        }
+        Ok(())
+    }
+
+    fn weight(&self, pos: Vec2) -> f32 {
+        let dist = pos.distance(self.center) / self.radius;
+        if dist >= 1.0 {
+            0.0
+        } else {
+            (-1.0 / (1.0 - dist * dist)).exp()
+        }
+    }
+
+    fn height(&self, pos: Vec3) -> f32 {
+        let weight = self.weight(pos.xy());
+        if weight == 0.0 {
+            return pos.z;
+        }
+        let delta = (self.amount * DELTA) * weight;
+        let target = match self.kind {
+            TerraformKind::Elevation => return pos.z + delta,
+            TerraformKind::Level => self.level,
+            TerraformKind::Slope => {
+                let Some((p1, p2)) = self.slope else {
+                    return pos.z;
+                };
+                let d = p2.xy() - p1.xy();
+                let along = (pos.xy() - p1.xy()).dot(d) / d.mag2();
+                lerp(p1.z, p2.z, along.clamp(0.0, 1.0))
+            }
+            TerraformKind::Smooth | TerraformKind::Erode => unreachable!(),
+        };
+        pos.z + delta * (target - pos.z).signum() * (target - pos.z).abs().mul(0.1).clamp(0.0, 1.0)
+    }
+
+    fn smooth(&self, pos: Vec2, vals: [f32; 9]) -> f32 {
+        let weight = self.weight(pos);
+        if weight == 0.0 {
+            return vals[4];
+        }
+        const GAUSSIAN_KERNEL: [f32; 9] = [
+            0.07511361, 0.1238414, 0.07511361, 0.1238414, 0.20417996, 0.1238414, 0.07511361,
+            0.1238414, 0.07511361,
+        ];
+        let sum = vals
+            .into_iter()
+            .zip(GAUSSIAN_KERNEL)
+            .map(|(a, b)| a * b)
+            .sum::<f32>();
+        vals[4] + weight * (sum - vals[4])
+    }
+
+    fn erosion_particles(&self, tick: Tick) -> (usize, impl FnMut() -> f32) {
+        let mut rng = common::rand::gen(tick.0);
+        let count = self.amount * DELTA * self.radius * self.radius * 0.00002;
+        let mut particles = count as usize;
+        if count.fract() > rng.next_f32() {
+            particles += 1;
+        }
+        (particles, move || rng.next_f32())
+    }
+}
+
 impl Tree {
     pub fn new(pos: Vec2) -> Self {
         let crand = common::rand::rand3(pos.x, pos.y, 1.0);
@@ -404,40 +537,55 @@ pub fn decode_pos(encoded: SmolTree, chunk: CellIdx) -> Vec2 {
 }
 
 #[derive(Serialize, Deserialize)]
-struct SerializedEnvironment {
-    h: Heightmap,
+struct SerializedEnvironment<H, W> {
+    h: H,
     trees: Vec<(CellIdx, Vec<SmolTree>)>,
+    water: W,
 }
 
-impl From<SerializedEnvironment> for Environment {
-    fn from(ser: SerializedEnvironment) -> Self {
-        let mut terrain = Environment {
-            heightmap: ser.h,
-            ..Self::default()
+struct CheckedHeightmap(Heightmap);
+
+impl<'de> Deserialize<'de> for CheckedHeightmap {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Heightmap::deserialize_bounded::<D, MAX_WATER_CHUNKS_PER_AXIS>(deserializer).map(Self)
+    }
+}
+
+impl<'de> Deserialize<'de> for Environment {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let SerializedEnvironment {
+            h: CheckedHeightmap(heightmap),
+            trees,
+            mut water,
+        } = SerializedEnvironment::<CheckedHeightmap, WaterState>::deserialize(deserializer)?;
+        water
+            .validate_and_rebuild(&heightmap)
+            .map_err(serde::de::Error::custom)?;
+        let mut terrain = Self {
+            heightmap,
+            water,
+            base_revision: 0,
+            trees: Grid::new(TREE_GRID_SIZE as i32),
         };
 
-        for (chunk_id, trees) in ser.trees {
+        for (chunk_id, trees) in trees {
             for tree in trees {
                 let tree = Tree::new(decode_pos(tree, chunk_id));
                 terrain.trees.insert(tree.pos, tree);
             }
         }
-        terrain
+        Ok(terrain)
     }
 }
 
-impl From<&Environment> for SerializedEnvironment {
-    fn from(ter: &Environment) -> Self {
-        let mut t = SerializedEnvironment {
-            h: ter.heightmap.clone(),
-            trees: Vec::new(),
-        };
-
-        let tree_cells = &ter.trees.storage().cells;
+impl Serialize for Environment {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let tree_cells = &self.trees.storage().cells;
 
         let mut keys = tree_cells.keys().copied().collect::<Vec<_>>();
         keys.sort_unstable();
 
+        let mut trees = Vec::new();
         for cell_id in keys {
             let chunk = &tree_cells[&cell_id];
             // Removing trees can leave an empty cell that loading never recreates.
@@ -449,9 +597,236 @@ impl From<&Environment> for SerializedEnvironment {
                 let smol = encode_pos(*tree_pos, cell_id);
                 smoltrees.push(smol);
             }
-            t.trees.push((cell_id, smoltrees));
+            trees.push((cell_id, smoltrees));
         }
 
-        t
+        SerializedEnvironment {
+            h: &self.heightmap,
+            trees,
+            water: &self.water,
+        }
+        .serialize(serializer)
+    }
+}
+
+#[cfg(test)]
+mod water_w1_tests {
+    use super::*;
+    use crate::map::{RiverBank, WaterBodyId, WaterEdit, WaterKind, WaterTileCoord};
+    use common::saveload::{Bincode, Encoder, JSON};
+    use geom::{vec3, Polygon};
+
+    fn flat(w: u16, h: u16) -> Environment {
+        Environment::generate(w, h, MapPreset::Flat, 0, 0.0)
+    }
+
+    #[test]
+    fn w1_water_coast_lake_river_and_roundtrip() {
+        let mut env = flat(3, 2);
+        env.terrain_apply(env.bounds(), |p| if p.x < 128.0 { -6.0 } else { p.z });
+        let lake = Polygon::centered_rect(vec2(600.0, 750.0), 32.0, 32.0);
+        let lake_id = env.fill_lake(&lake, 0, 2.0).unwrap();
+        assert_eq!(
+            env.water_at(vec2(600.0, 750.0)).unwrap().kind,
+            WaterKind::Lake
+        );
+        env.set_sea_level(Some(0)).unwrap();
+        assert_eq!(
+            env.water_at(vec2(1.0, 120.0)).unwrap().body,
+            WaterBodyId::SEA
+        );
+        assert!(!env.is_water(vec2(112.0, 120.0)));
+        let stroke = [vec2(900.0, 512.0), vec2(0.0, 512.0)];
+        let id = env
+            .carve_river_at_level(&stroke, 48.0, 3.0, Some(0))
+            .unwrap();
+        let sample = env.water_at(vec2(520.0, 512.0)).unwrap();
+        assert_eq!(sample.body, id);
+        assert_eq!(sample.reach_m, Some(380));
+        let bank = env
+            .river_bank_near(id, 380, crate::map::RiverBank::Left, 16)
+            .unwrap();
+        assert!(bank.point.y < 512.0);
+        assert!(env.shoreline_distance(vec2(520.0, 512.0), 80.0).unwrap() > 0.0);
+        let ray = Ray3::new(vec3(520.0, 512.0, 20.0), -Vec3::Z);
+        assert_eq!(env.raycast_water(ray, 20.0).unwrap().sample.body, id);
+        assert!(!env.is_water(vec2(1536.0, 512.0)));
+
+        let bytes = Bincode::encode(&env).unwrap();
+        let mut loaded: Environment = Bincode::decode(&bytes).unwrap();
+        assert_eq!(Bincode::encode(&loaded).unwrap(), bytes);
+        let readable: Environment = JSON::decode(&JSON::encode(&env).unwrap()).unwrap();
+        assert_eq!(readable.water_revision(), env.water_revision());
+        assert_eq!(readable.water_at(vec2(600.0, 750.0)).unwrap().body, lake_id);
+        loaded.remove_freshwater(id).unwrap();
+        assert_eq!(
+            loaded.water_at(vec2(520.0, 512.0)).unwrap().kind,
+            WaterKind::Sea
+        );
+        loaded.set_sea_level(None).unwrap();
+        assert!(!loaded.is_water(vec2(520.0, 512.0)));
+        assert_eq!(loaded.height(vec2(520.0, 512.0)), Some(0.0));
+        assert!(loaded.strict_water_siting());
+        assert!(loaded.is_water(vec2(600.0, 750.0)));
+    }
+
+    #[test]
+    fn w1_water_prospective_sill_flood_and_packed_noop() {
+        let mut env = flat(3, 1);
+        env.terrain_apply(env.bounds(), |p| {
+            if p.x > 0.0 && p.x <= 1408.0 && (96.0..=144.0).contains(&p.y) {
+                -3.0
+            } else {
+                p.z
+            }
+        });
+        env.set_sea_level(Some(0)).unwrap();
+        let remote = vec2(1300.0, 108.0);
+        assert!(env.base_height(remote).unwrap() < 0.0);
+        assert!(!env.is_water(remote));
+        assert!(!env.strict_water_siting());
+        let before = Bincode::encode(&env).unwrap();
+        let mut patch = BaseNodePatch::new(MAX_WATER_BASE_WRITES);
+        for y in 6..=7 {
+            patch
+                .stage(&env.heightmap, (0, y), pack_height(-3.0))
+                .unwrap();
+        }
+        let prepared = env.prepare_water_base_patch(patch).unwrap();
+        assert!(prepared.strict_water_siting());
+        assert!(prepared.water_at(&env, remote).is_some());
+        assert!(prepared
+            .surface_changed_tiles()
+            .any(|t| t == WaterTileCoord(81, 6)));
+        assert!(prepared.affected_tiles().any(|t| t == WaterTileCoord(0, 5)));
+        assert!(prepared
+            .dirty()
+            .water()
+            .contains(&TerrainChunkID::new_i16(2, 0)));
+        assert!(!prepared
+            .dirty()
+            .terrain()
+            .contains(&TerrainChunkID::new_i16(2, 0)));
+        assert_eq!(Bincode::encode(&env).unwrap(), before);
+        env.commit_prepared_water(prepared).unwrap();
+        assert!(env.is_water(remote));
+        assert!(env.strict_water_siting());
+
+        let revision = env.water_revision();
+        let noop = env
+            .prepare_water_terraform(
+                Tick(2),
+                TerraformKind::Elevation,
+                vec2(512.0, 108.0),
+                32.0,
+                0.0,
+                0.0,
+                None,
+            )
+            .unwrap();
+        assert!(noop.affected_tiles().next().is_none());
+        assert!(noop.work() > 0);
+        assert!(!env.commit_prepared_water(noop).unwrap().changed);
+        assert!(!env.set_sea_level(Some(0)).unwrap().changed);
+        assert_eq!(env.water_revision(), revision);
+        let change = env.set_sea_level(Some(5)).unwrap();
+        assert!(!change.dirty.water().is_empty());
+        assert!(change.dirty.terrain().is_empty());
+        assert!(!change.dirty.road_support().is_empty());
+    }
+
+    #[test]
+    fn w1_water_citymap_edges_and_atomic_bed_mouth_checks() {
+        let mut env = flat(5, 5);
+        let river = [
+            vec2(1256.0, 0.0),
+            vec2(1296.0, 640.0),
+            vec2(1248.0, 1280.0),
+            vec2(1296.0, 1920.0),
+            vec2(1264.0, 2560.0),
+        ];
+        let id = env.carve_river(&river, 96.0, 5.0).unwrap();
+        assert_eq!(env.river_centerline(id), Some(river.as_slice()));
+        assert_eq!(env.water_surface_elevation(vec2(1264.0, 2559.0)), Some(9.0));
+        assert!(!env.is_water(river[4]));
+        let left = env.river_bank_near(id, 1280, RiverBank::Left, 128).unwrap();
+        let right = env
+            .river_bank_near(id, 1280, RiverBank::Right, 128)
+            .unwrap();
+        assert!(left.point.x < 1248.0 && right.point.x > 1248.0);
+        assert!(env.is_wet_base_node((79, 159)));
+        let seam_tiles = env
+            .water_tiles(TerrainChunkID::new_i16(2, 4))
+            .collect::<Vec<_>>();
+        assert!(seam_tiles
+            .windows(2)
+            .all(|pair| pair[0].tile.local_index() < pair[1].tile.local_index()));
+        let crossing = Polygon::centered_rect(vec2(1264.0, 2552.0), 256.0, 1.0);
+        let boundary = Polygon::centered_rect(right.dry_tile.center(), 16.0, 16.0);
+        assert!(env.intersects_water(&crossing));
+        assert!(!env.intersects_water(&boundary));
+
+        let bytes = Bincode::encode(&env).unwrap();
+        let conflict = env.set_sea_level(Some(110)).unwrap_err();
+        assert!(matches!(conflict, WaterEditError::IncompatibleMouth(_, _)));
+        let mut raised = BaseNodePatch::new(MAX_WATER_BASE_WRITES);
+        raised
+            .stage(&env.heightmap, (79, 159), pack_height(10.0))
+            .unwrap();
+        assert!(matches!(
+            env.prepare_water_base_patch(raised),
+            Err(WaterEditError::InvalidBed(_))
+        ));
+        assert_eq!(Bincode::encode(&env).unwrap(), bytes);
+
+        let stale = env
+            .prepare_water_edit(&WaterEdit::RemoveFreshWater { body: id })
+            .unwrap();
+        env.fill_lake(
+            &Polygon::centered_rect(vec2(2000.0, 1000.0), 48.0, 64.0),
+            0,
+            3.0,
+        )
+        .unwrap();
+        assert!(matches!(
+            env.commit_prepared_water(stale),
+            Err(WaterEditError::Stale)
+        ));
+    }
+
+    #[test]
+    fn w1_water_freshwater_blocks_sea_and_ids_stay_exhausted_after_reload() {
+        let mut env = flat(2, 1);
+        env.terrain_apply(env.bounds(), |p| {
+            if (96.0..=128.0).contains(&p.y) && p.x < 896.0 {
+                -4.0
+            } else {
+                p.z
+            }
+        });
+        env.water.next_freshwater_id = u32::from(u16::MAX);
+        env.water.strict = true;
+        env.water.revision = 2 * u64::from(u16::MAX - 1);
+        let blocker = Polygon::centered_rect(vec2(264.0, 112.0), 16.0, 32.0);
+        let id = env.fill_lake(&blocker, 0, 2.0).unwrap();
+        assert_eq!(id, WaterBodyId(u16::MAX));
+        env.set_sea_level(Some(0)).unwrap();
+        assert_eq!(
+            env.water_at(vec2(128.0, 112.0)).unwrap().kind,
+            WaterKind::Sea
+        );
+        assert!(!env.is_water(vec2(800.0, 112.0)));
+        env.remove_freshwater(id).unwrap();
+        let bytes = Bincode::encode(&env).unwrap();
+        let mut env: Environment = Bincode::decode(&bytes).unwrap();
+        assert_eq!(
+            env.water_at(vec2(800.0, 112.0)).unwrap().kind,
+            WaterKind::Sea
+        );
+        assert_eq!(
+            env.fill_lake(&blocker, 0, 2.0),
+            Err(WaterEditError::BodyIdExhausted)
+        );
+        assert_eq!(Bincode::encode(&env).unwrap(), bytes);
     }
 }

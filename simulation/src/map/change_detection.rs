@@ -2,7 +2,7 @@
 //! This should not be used inside the simulation as change subscribers are not serialized.
 //! It is mostly for rendering purposes by decoupling it from the simulation.
 
-use crate::map::{Building, Intersection, Lot, Road};
+use crate::map::{Building, Intersection, Lot, Road, TerrainChunkID, WaterDirtyChunks};
 use common::{ChunkID, ChunkID_1024};
 use geom::Vec2;
 use std::collections::BTreeSet;
@@ -22,6 +22,8 @@ bitflags::bitflags! {
         const Road = 1;
         const Building = 1 << 1;
         const Terrain = 1 << 2;
+        const Water = 1 << 3;
+        const RoadSupport = 1 << 4;
     }
 }
 
@@ -37,12 +39,37 @@ impl MapSubscribers {
 
     pub fn dispatch_all(&self, chunks: impl Iterator<Item = SubscriberChunkID>) {
         let mut me = self.0.lock().unwrap();
-        for chunk in chunks {
+        for chunk in chunks.collect::<BTreeSet<_>>() {
             for sub in me.iter_mut() {
-                sub.dispatch(UpdateType::Road, chunk);
-                sub.dispatch(UpdateType::Building, chunk);
-                sub.dispatch(UpdateType::Terrain, chunk);
+                sub.dispatch(UpdateType::all(), chunk);
             }
+        }
+    }
+
+    /// Derive subscriber buckets from existing terrain chunks, including odd outer rows/columns.
+    pub fn dispatch_all_terrain(&self, chunks: impl Iterator<Item = TerrainChunkID>) {
+        let buckets: BTreeSet<SubscriberChunkID> = chunks.map(TerrainChunkID::convert_up).collect();
+        for sub in self.0.lock().unwrap().iter() {
+            let mut inner = sub.inner.lock().unwrap();
+            inner.cleared = true;
+            if sub.filter.intersects(UpdateType::all()) {
+                inner.updated_chunks.clone_from(&buckets);
+            }
+        }
+    }
+
+    pub fn dispatch_water(&mut self, dirty: &WaterDirtyChunks) {
+        for (kind, chunks) in [
+            (UpdateType::Water, dirty.water()),
+            (UpdateType::Terrain, dirty.terrain()),
+            (UpdateType::RoadSupport, dirty.road_support()),
+        ] {
+            let buckets: BTreeSet<SubscriberChunkID> = chunks
+                .iter()
+                .copied()
+                .map(TerrainChunkID::convert_up)
+                .collect();
+            self.dispatch_chunks(kind, buckets.into_iter());
         }
     }
 
@@ -146,5 +173,33 @@ impl CanonicalPosition for Building {
 impl CanonicalPosition for Lot {
     fn canonical_position(&self) -> Vec2 {
         self.shape.center()
+    }
+}
+
+#[cfg(test)]
+mod water_w1_tests {
+    use super::*;
+
+    #[test]
+    fn w1_water_full_updates_cover_odd_rectangular_terrain_and_clear_empty_world() {
+        let subscribers = MapSubscribers::default();
+        let mut water = subscribers.subscribe(UpdateType::Water);
+        let mut road_support = subscribers.subscribe(UpdateType::RoadSupport);
+        subscribers.dispatch_all_terrain(
+            (0..5).flat_map(|x| (0..3).map(move |y| TerrainChunkID::new_i16(x, y))),
+        );
+        let expected = (0..3)
+            .flat_map(|x| (0..2).map(move |y| SubscriberChunkID::new_i16(x, y)))
+            .collect::<Vec<_>>();
+        assert!(water.take_cleared());
+        assert_eq!(water.take_updated_chunks().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            road_support.take_updated_chunks().collect::<Vec<_>>(),
+            expected
+        );
+        subscribers.dispatch_all_terrain(std::iter::once(TerrainChunkID::new_i16(2, 2)));
+        subscribers.dispatch_all_terrain(std::iter::empty());
+        assert!(water.take_cleared());
+        assert!(water.take_updated_chunks().next().is_none());
     }
 }

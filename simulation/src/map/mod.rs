@@ -22,9 +22,11 @@ pub mod procgen {
     mod building;
     pub mod heightmap;
     mod presets;
+    mod water;
 
     pub use building::*;
     pub use presets::*;
+    pub use water::generate_waters;
 }
 
 mod change_detection;
@@ -43,6 +45,8 @@ pub mod terrain;
 mod traffic_control;
 mod traversable;
 mod turn_policy;
+mod water;
+mod water_serde;
 pub mod zonegrid;
 
 // Use self or else it would be ambiguous with "pathfinding" crate
@@ -56,6 +60,7 @@ pub use terrain::*;
 pub use traffic_control::*;
 pub use traversable::*;
 pub use turn_policy::*;
+pub use water::*;
 pub use zonegrid::*;
 
 pub use ::pathfinding as pathfinding_crate;
