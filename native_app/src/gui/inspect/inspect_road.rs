@@ -97,7 +97,24 @@ pub(crate) fn inspect_road(_uiw: &UiWorld, sim: &Simulation, road: RoadID) -> bo
                         });
                     }
                     if has_vehicles {
-                        textc(on_primary_container(), speed_label(*traffic));
+                        mincolumn(3.0, || {
+                            textc(on_primary_container(), speed_label(*traffic));
+                            textc(
+                                on_secondary_container(),
+                                format!(
+                                    "Mean of lane-limit percentages · refreshes every {} ms",
+                                    SAMPLE_INTERVAL.as_millis()
+                                ),
+                            );
+                            textc(
+                                on_secondary_container(),
+                                "Both snapshots exclude parked vehicles",
+                            );
+                            textc(
+                                on_secondary_container(),
+                                "Bus dwell counts toward occupancy only",
+                            );
+                        });
                     }
                     inspect_utility::render(sim, road);
                     truck_cargo(&map, users);
@@ -113,13 +130,13 @@ fn history_label(duration: u64) -> String {
         "Entered in last 10 game minutes".to_owned()
     } else {
         let tenths = duration * 10 / TICKS_PER_MINUTE;
-        format!("Entered in last {}.{} min", tenths / 10, tenths % 10)
+        format!("Entered in last {}.{} game min", tenths / 10, tenths % 10)
     }
 }
 
 fn speed_label(traffic: Option<RoadTraffic>) -> String {
     let Some(sample) = traffic else {
-        return "Average speed · no recent samples".to_owned();
+        return "Speed snapshot · no usable samples".to_owned();
     };
     let percent = (100.0 * sample.rel_limit_speed).round();
     let band = if percent >= 80.0 {
@@ -135,7 +152,7 @@ fn speed_label(traffic: Option<RoadTraffic>) -> String {
         "vehicles"
     };
     format!(
-        "Average speed · {percent:.0}% of limit · {band} ({} {unit})",
+        "Speed snapshot · {percent:.0}% of lane limit · {band} ({} {unit})",
         sample.samples
     )
 }
@@ -298,17 +315,17 @@ mod tests {
     use simulation::SimulationOptions;
 
     #[test]
-    fn u5_road_inspector_labels_speed_and_window() {
-        assert_eq!(history_label(0), "Entered in last 0.0 min");
+    fn qw1_road_inspector_labels_speed_and_window() {
+        assert_eq!(history_label(0), "Entered in last 0.0 game min");
         assert_eq!(
             history_label(ROAD_HISTORY_TICKS - 1),
-            "Entered in last 9.9 min"
+            "Entered in last 9.9 game min"
         );
         assert_eq!(
             history_label(ROAD_HISTORY_TICKS),
             "Entered in last 10 game minutes"
         );
-        assert_eq!(speed_label(None), "Average speed · no recent samples");
+        assert_eq!(speed_label(None), "Speed snapshot · no usable samples");
         for (ratio, label) in [(0.0, "Jammed"), (0.5, "Busy"), (0.8, "Free")] {
             let sample = RoadTraffic {
                 vehicles: 1,
@@ -319,7 +336,7 @@ mod tests {
             assert_eq!(
                 speed_label(Some(sample)),
                 format!(
-                    "Average speed · {:.0}% of limit · {label} (1 vehicle)",
+                    "Speed snapshot · {:.0}% of lane limit · {label} (1 vehicle)",
                     ratio * 100.0
                 )
             );

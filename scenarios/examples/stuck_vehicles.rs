@@ -12,7 +12,8 @@
 //! - `PROBE_WATCH=VehicleID(…)` follows one vehicle and its driver every sample.
 
 use geom::Vec3;
-use prototypes::{game_secs_to_ticks, GameTime, TICKS_PER_HOUR};
+use prototypes::{game_secs_to_ticks, GameTime, SECONDS_PER_MINUTE, TICKS_PER_HOUR};
+use simulation::economy::TripStats;
 use simulation::map::{
     LaneKind, Map, PathKind, Pathfinder, ProjectFilter, ProjectKind, Traversable,
     TraverseDirection, TraverseKind,
@@ -30,6 +31,61 @@ const SAMPLE_SECONDS: u64 = 30;
 struct Still {
     since: u32,
     pos: Vec3,
+}
+
+#[derive(Clone, Copy)]
+struct JourneyCompletions {
+    walk: u64,
+    car: u64,
+    transit: u64,
+}
+
+impl From<&TripStats> for JourneyCompletions {
+    fn from(stats: &TripStats) -> Self {
+        Self {
+            walk: stats.walk.completed,
+            car: stats.car.completed,
+            transit: stats.transit.completed,
+        }
+    }
+}
+
+impl JourneyCompletions {
+    fn report_since(self, start: Self) -> String {
+        let walk = self.walk.saturating_sub(start.walk);
+        let car = self.car.saturating_sub(start.car);
+        let transit = self.transit.saturating_sub(start.transit);
+        let total = walk + car + transit;
+        format!(
+            "car journeys completed: {car}\nall journeys completed: {total} (walk={walk} car={car} transit={transit})"
+        )
+    }
+}
+
+#[derive(Default)]
+struct StationaryDelay {
+    peak_vehicles: usize,
+    longest_seconds: u32,
+}
+
+impl StationaryDelay {
+    fn sample(
+        &mut self,
+        still: &BTreeMap<VehicleID, Still>,
+        now: u32,
+        threshold: u32,
+    ) -> BTreeSet<VehicleID> {
+        let stuck: BTreeSet<_> = still
+            .iter()
+            .filter_map(|(&id, s)| {
+                let seconds = now - s.since;
+                self.longest_seconds = self.longest_seconds.max(seconds);
+                (seconds >= threshold).then_some(id)
+            })
+            .collect();
+        self.peak_vehicles = self.peak_vehicles.max(stuck.len());
+        stuck
+    }
 }
 
 fn main() {
@@ -52,12 +108,14 @@ fn main() {
     let threshold = threshold_minutes * 60;
 
     let mut still: BTreeMap<VehicleID, Still> = BTreeMap::new();
+    let mut stationary_delay = StationaryDelay::default();
     // Vehicles that crossed the threshold, with the class seen at that moment.
     let mut episodes: BTreeMap<VehicleID, (String, u32)> = BTreeMap::new();
     let mut episode_classes: BTreeMap<String, usize> = BTreeMap::new();
     let mut examples: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut max_queue: BTreeMap<String, usize> = BTreeMap::new();
     let start = sim.read::<GameTime>().seconds;
+    let start_completions = JourneyCompletions::from(&*sim.read::<TripStats>());
 
     let mut done = 0;
     while done < ticks {
@@ -95,11 +153,7 @@ fn main() {
             });
         }
 
-        let stuck: BTreeSet<VehicleID> = still
-            .iter()
-            .filter(|(_, s)| now - s.since >= threshold)
-            .map(|(&id, _)| id)
-            .collect();
+        let stuck = stationary_delay.sample(&still, now, threshold);
         if (done / sample) % 60 == 0 {
             let mut cells: BTreeMap<(i32, i32), usize> = BTreeMap::new();
             for id in &stuck {
@@ -168,6 +222,18 @@ fn main() {
         root.display(),
         slot.as_str(),
         sim.world().vehicles.len()
+    );
+    let completions = JourneyCompletions::from(&*sim.read::<TripStats>());
+    println!("{}", completions.report_since(start_completions));
+    let final_stuck: usize = final_classes.values().map(|(count, _)| count).sum();
+    let longest_minutes =
+        f64::from(stationary_delay.longest_seconds) / f64::from(SECONDS_PER_MINUTE);
+    println!(
+        "stationary delay ({SAMPLE_SECONDS} game sec samples): longest={longest_minutes:.1} game min"
+    );
+    println!(
+        "vehicles stationary for at least {threshold_minutes} game min: peak={} end={final_stuck}",
+        stationary_delay.peak_vehicles
     );
     println!("episodes (vehicle still >= threshold, class when first detected):");
     for (class, n) in &episode_classes {
@@ -547,5 +613,52 @@ fn snapshot(sim: &Simulation, center: geom::Vec2, radius: f32) {
             v.it.get_point().map(|p| (p.x, p.y)),
             v.it.get_travers().and_then(|t| match t.kind { TraverseKind::Lane(l) => map.get(l).map(|l| (l.control, l.points.length())), _ => None }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn qw1_completion_report_counts_only_arrivals_during_the_probe() {
+        let mut stats = TripStats::default();
+        stats.walk.completed = 10;
+        stats.car.completed = 20;
+        stats.transit.completed = 30;
+        let start = JourneyCompletions::from(&stats);
+        assert_eq!(
+            JourneyCompletions::from(&stats).report_since(start),
+            "car journeys completed: 0\nall journeys completed: 0 (walk=0 car=0 transit=0)"
+        );
+
+        stats.walk.completed += 5;
+        stats.car.completed += 2;
+        stats.transit.completed += 3;
+        assert_eq!(
+            JourneyCompletions::from(&stats).report_since(start),
+            "car journeys completed: 2\nall journeys completed: 10 (walk=5 car=2 transit=3)"
+        );
+    }
+
+    #[test]
+    fn qw1_stationary_delay_retains_peaks_after_traffic_moves() {
+        let id = VehicleID::default();
+        let mut still = BTreeMap::from([(
+            id,
+            Still {
+                since: 30,
+                pos: Vec3::ZERO,
+            },
+        )]);
+        let mut delay = StationaryDelay::default();
+        assert!(delay.sample(&still, 60, 60).is_empty());
+        assert_eq!(delay.longest_seconds, 30);
+        assert_eq!(delay.sample(&still, 90, 60), BTreeSet::from([id]));
+
+        still.clear();
+        assert!(delay.sample(&still, 120, 60).is_empty());
+        assert_eq!(delay.peak_vehicles, 1);
+        assert_eq!(delay.longest_seconds, 60);
     }
 }

@@ -2,8 +2,12 @@ use goryak::{
     dragvalue, error, fixed_spacer, mincolumn, minrow, on_secondary_container, primary, textc,
     ProgressBar, VertScrollSize, Window,
 };
-use prototypes::{try_prototype, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID};
-use simulation::diagnostics::{building_diagnostics, BuildingBlocker, ImportStatus, RecipeBlocker};
+use prototypes::{
+    try_prototype, GameDuration, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID, Tick,
+};
+use simulation::diagnostics::{
+    building_diagnostics, elapsed_tick, BuildingBlocker, ImportStatus, RecipeBlocker,
+};
 use simulation::economy::cargo::CargoBook;
 use simulation::economy::Market;
 use simulation::map::{Building, BuildingID, BuildingKind, Density, Zone, MAX_ZONE_AREA};
@@ -59,7 +63,7 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                     label(format!("{:?}", building.id));
                 }
 
-                render_why(&diagnostics.blockers);
+                render_why(sim, &diagnostics.blockers);
                 match building.kind {
                     BuildingKind::House => render_house(uiworld, sim, building),
                     BuildingKind::GoodsCompany(id) => {
@@ -199,7 +203,7 @@ fn density_name(density: Density) -> &'static str {
     }
 }
 
-fn render_why(blockers: &[BuildingBlocker]) {
+fn render_why(sim: &Simulation, blockers: &[BuildingBlocker]) {
     fixed_spacer((0.0, 5.0));
     label("Why");
     if blockers.is_empty() {
@@ -235,14 +239,21 @@ fn render_why(blockers: &[BuildingBlocker]) {
                     item.prototype().label
                 )
             }
-            BuildingBlocker::Import(ImportStatus::Waiting { .. }) => {
-                "Waiting for imported goods by train and truck".into()
-            }
-            BuildingBlocker::Import(ImportStatus::NoRoute) => {
-                "No import route · no freight station with trains reaches it by road".into()
-            }
+            BuildingBlocker::Import(status) => import_label(status, elapsed_tick(sim).0),
         };
         textc(error(), description);
+    }
+}
+
+fn import_label(status: ImportStatus, now: u64) -> String {
+    match status {
+        ImportStatus::Waiting { since } => {
+            let duration = GameDuration(Tick(now.saturating_sub(since)));
+            format!("Waiting for imported goods by train and truck · {duration} game time")
+        }
+        ImportStatus::NoRoute => {
+            "No import route · no freight station with trains reaches it by road".into()
+        }
     }
 }
 
@@ -448,5 +459,29 @@ fn render_recipe(uiworld: &UiWorld, recipe: &Recipe) {
                 item_icon_yakui(uiworld, item.id, item.amount);
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prototypes::{TICKS_PER_HOUR, TICKS_PER_MINUTE};
+
+    #[test]
+    fn qw1_import_wait_uses_elapsed_game_time() {
+        let since = 500;
+        let status = ImportStatus::Waiting { since };
+        assert_eq!(
+            import_label(status, since + TICKS_PER_HOUR + 30 * TICKS_PER_MINUTE),
+            "Waiting for imported goods by train and truck · 1.50h game time"
+        );
+        assert_eq!(
+            import_label(status, since - 1),
+            "Waiting for imported goods by train and truck · 0s game time"
+        );
+        assert_eq!(
+            import_label(ImportStatus::NoRoute, since),
+            "No import route · no freight station with trains reaches it by road"
+        );
     }
 }
