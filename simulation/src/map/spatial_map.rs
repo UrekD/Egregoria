@@ -99,7 +99,7 @@ impl Default for SpatialMap {
     fn default() -> Self {
         Self {
             broad: AABBGrid::new(50),
-            occupancy: AABBGrid::new(50),
+            occupancy: AABBGrid::new(512),
             occupancy_ids: Default::default(),
             cuts: AABBGrid::new(512),
             cut_ids: Default::default(),
@@ -155,27 +155,34 @@ impl SpatialMap {
         }
     }
 
-    fn update_auxiliary(&mut self, obj: &impl SpatialMapObject) {
-        for (bounds, grid, ids) in [
-            (
-                obj.additional_occupancy(),
-                &mut self.occupancy,
-                &mut self.occupancy_ids,
-            ),
-            (obj.cut_influence(), &mut self.cuts, &mut self.cut_ids),
-        ] {
-            let kind = obj.kind();
-            match (ids.get(&kind).copied(), bounds) {
-                (Some(handle), Some(bounds)) => grid.set_aabb(handle, bounds),
-                (None, Some(bounds)) => {
-                    ids.insert(kind, grid.insert(bounds, kind));
-                }
-                (Some(handle), None) => {
-                    grid.remove(handle);
-                    ids.remove(&kind);
-                }
-                (None, None) => {}
+    pub(super) fn update_auxiliary(&mut self, obj: &impl SpatialMapObject) {
+        let kind = obj.kind();
+        self.set_additional_occupancy(kind, obj.additional_occupancy());
+        match (self.cut_ids.get(&kind).copied(), obj.cut_influence()) {
+            (Some(handle), Some(bounds)) => self.cuts.set_aabb(handle, bounds),
+            (None, Some(bounds)) => {
+                self.cut_ids.insert(kind, self.cuts.insert(bounds, kind));
             }
+            (Some(handle), None) => {
+                self.cut_ids.remove(&kind);
+                self.cuts.remove(handle);
+            }
+            (None, None) => {}
+        }
+    }
+
+    pub(super) fn set_additional_occupancy(&mut self, kind: ProjectKind, bounds: Option<AABB>) {
+        match (self.occupancy_ids.get(&kind).copied(), bounds) {
+            (Some(handle), Some(bounds)) => self.occupancy.set_aabb(handle, bounds),
+            (None, Some(bounds)) => {
+                self.occupancy_ids
+                    .insert(kind, self.occupancy.insert(bounds, kind));
+            }
+            (Some(handle), None) => {
+                self.occupancy_ids.remove(&kind);
+                self.occupancy.remove(handle);
+            }
+            (None, None) => {}
         }
     }
 
@@ -277,9 +284,9 @@ impl SpatialMapObject for Road {
     }
 
     fn additional_occupancy(&self) -> Option<AABB> {
-        // The visible deck caps each miter at ten times the half-width.
-        (self.points().n_points() > 2)
-            .then(|| self.points().bbox().flatten().expand(5.0 * self.width))
+        let bounds = super::road_support_bounds(self);
+        let primary = self.points().bbox().flatten().expand(self.width * 0.5);
+        (!primary.contains(bounds.ll) || !primary.contains(bounds.ur)).then_some(bounds)
     }
 
     fn cut_influence(&self) -> Option<AABB> {

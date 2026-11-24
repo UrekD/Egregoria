@@ -1,17 +1,19 @@
-use super::terrain::{CELL_SIZE, TERRAIN_CHUNK_RESOLUTION};
+use super::height_override::CutHeights;
+use super::terrain::TERRAIN_CHUNK_RESOLUTION;
 use crate::map::electricity_cache::ElectricityCache;
 use crate::map::procgen::gen_exterior_house;
 use crate::map::reachability::DrivingReachability;
 use crate::map::{
-    Building, BuildingID, BuildingKind, Environment, GrowableBusinessState, GrowableLotError,
-    GrowableSiteState, Intersection, IntersectionID, Lane, LaneID, LaneKind, LanePattern, Lot,
-    LotID, LotKind, LotLayout, MapSubscriber, MapSubscribers, ParkingSpotID, ParkingSpots,
-    PreparedBuilding, PreparedGrowableAppearance, ProjectFilter, ProjectKind, Road, RoadID,
+    Building, BuildingID, BuildingKind, ConnectionError, ConnectionOutcome, CrossingEndpoint,
+    CrossingWork, Environment, GrowableBusinessState, GrowableLotError, GrowableSiteState,
+    Intersection, IntersectionID, Lane, LaneID, LaneKind, LanePattern, Lot, LotID, LotKind,
+    LotLayout, MapSubscriber, MapSubscribers, ParkingSpotID, ParkingSpots, PreparedBuilding,
+    PreparedGrowableAppearance, PreparedTopologyEdit, ProjectFilter, ProjectKind, Road, RoadID,
     RoadSegmentKind, SpatialMap, SpatialMapObject, TerraformKind, TerrainChunkID, UpdateType,
-    WaterEditError, WaterFootprint, WaterTileCoord, Zone, ROAD_Z_OFFSET,
+    WaterEditError, Zone, MAX_DECK_TILE_TESTS, ROAD_Z_OFFSET,
 };
 use geom::OBB;
-use geom::{pack_height, BaseNode, PolyLine3, Shape, Vec2, Vec3, AABB, NO_OVERRIDE};
+use geom::{PolyLine3, Vec2, Vec3, AABB};
 use ordered_float::OrderedFloat;
 use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
@@ -53,7 +55,7 @@ pub(crate) struct ConnectionEndpoint {
 pub(crate) struct RoadSplit {
     pub original: RoadID,
     pub junction: IntersectionID,
-    roads: [RoadID; 2],
+    pub(crate) roads: [RoadID; 2],
 }
 
 pub(crate) struct ConnectedRoad {
@@ -106,8 +108,6 @@ pub struct Map {
     pub(super) water_services: super::WaterServiceCache,
 }
 
-type CutHeights = [[u16; TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION];
-
 impl Default for Map {
     fn default() -> Self {
         Self::empty()
@@ -125,6 +125,10 @@ impl Clone for Map {
         }
         for intersection in self.intersections.values() {
             spatial_map.insert(intersection);
+            spatial_map.set_additional_occupancy(
+                intersection.id.into(),
+                super::junction_support_bounds(intersection, &self.roads),
+            );
         }
         for lot in self.lots.values() {
             spatial_map.insert(lot);
@@ -243,108 +247,57 @@ impl Map {
         }
     }
 
-    fn rebuild_construction_cuts(
-        &self,
-        chunk: TerrainChunkID,
-        is_wet: impl Fn(BaseNode) -> bool,
-        work: &mut Option<&mut usize>,
-    ) -> Result<CutHeights, WaterEditError> {
-        let mut heights = [[NO_OVERRIDE; TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION];
-        let chunk_bounds = chunk.bbox();
-        for object in self.spatial_map.cut_candidates(chunk_bounds) {
-            if let Some(work) = work.as_deref_mut() {
-                spend_water_work(work, 1)?;
-            }
-            let mut add_cut = |bounds: AABB,
-                               units: usize,
-                               height: &dyn Fn(Vec2) -> Option<f32>|
-             -> Result<(), WaterEditError> {
-                let bounds = bounds.intersection(chunk_bounds).offset(-chunk_bounds.ll);
-                let start = (bounds.ll / CELL_SIZE).ceil().max(Vec2::ZERO);
-                let end = (bounds.ur / CELL_SIZE)
-                    .floor()
-                    .min(Vec2::splat((TERRAIN_CHUNK_RESOLUTION - 1) as f32));
-                for y in start.y as usize..=end.y as usize {
-                    for x in start.x as usize..=end.x as usize {
-                        if let Some(work) = work.as_deref_mut() {
-                            spend_water_work(work, units)?;
-                        }
-                        let node = (
-                            chunk.0 as usize * TERRAIN_CHUNK_RESOLUTION + x,
-                            chunk.1 as usize * TERRAIN_CHUNK_RESOLUTION + y,
-                        );
-                        if is_wet(node) {
-                            continue;
-                        }
-                        let pos = Vec2::new(x as f32, y as f32) * CELL_SIZE + chunk_bounds.ll;
-                        if let Some(z) = height(pos) {
-                            let z = pack_height(z).max(NO_OVERRIDE + 1);
-                            let old = &mut heights[y][x];
-                            *old = if *old == NO_OVERRIDE {
-                                z
-                            } else {
-                                (*old).min(z)
-                            };
-                        }
-                    }
-                }
-                Ok(())
-            };
-            match object {
-                ProjectKind::Building(id) => {
-                    let building = &self.buildings[id];
-                    let shape = building.obb.expand(25.0);
-                    add_cut(shape.bbox(), 1, &|pos| {
-                        shape.contains(pos).then_some(building.height)
-                    })?;
-                }
-                ProjectKind::Intersection(id) => {
-                    let intersection = &self.intersections[id];
-                    let mut shape = intersection.bcircle();
-                    shape.radius *= 2.0;
-                    add_cut(shape.bbox(), 1, &|pos| {
-                        shape.contains(pos).then_some(intersection.pos.z)
-                    })?;
-                }
-                ProjectKind::Road(id) => {
-                    let road = &self.roads[id];
-                    let radius = 10.0 + road.width * 3.0;
-                    add_cut(road.cut_influence().unwrap(), road.points().len(), &|pos| {
-                        let projected = road.points().project_2d(pos);
-                        projected
-                            .xy()
-                            .is_close(pos, radius)
-                            .then_some(projected.z - ROAD_Z_OFFSET)
-                    })?;
-                }
-                _ => unreachable!("construction cut index only holds contributors"),
-            }
-        }
-        Ok(heights)
+    pub fn update_intersection(&mut self, id: IntersectionID, f: impl Fn(&mut Intersection)) {
+        let _ = self.try_update_intersection(id, f);
     }
 
-    pub fn update_intersection(&mut self, id: IntersectionID, f: impl Fn(&mut Intersection)) {
-        info!("update_intersection {:?}", id);
-
-        let Some(inter) = self.intersections.get_mut(id) else {
-            return;
-        };
-        queue_construction_cut(
-            &mut self.pending_construction_cuts,
-            &self.environment,
-            inter,
-        );
-        f(inter);
+    pub(crate) fn try_update_intersection(
+        &mut self,
+        id: IntersectionID,
+        f: impl FnOnce(&mut Intersection),
+    ) -> Result<(), ConnectionError> {
+        let inter = self
+            .intersections
+            .get(id)
+            .ok_or(ConnectionError::InvalidEndpoint)?;
+        if self.environment.strict_water_siting() {
+            let mut next = inter.clone();
+            f(&mut next);
+            if next.id != id {
+                return Err(ConnectionError::InvalidEndpoint);
+            }
+            super::prepare_junction_update(self, &next, &mut WaterTopologyWork::new().geometry())?;
+            self.intersections[id] = next;
+        } else {
+            queue_construction_cut(
+                &mut self.pending_construction_cuts,
+                &self.environment,
+                inter,
+            );
+            f(&mut self.intersections[id]);
+        }
         self.invalidate(id);
-
-        self.check_invariants()
+        self.check_invariants();
+        Ok(())
     }
 
     pub fn remove_intersection(&mut self, src: IntersectionID) {
-        info!("remove_intersection {:?}", src);
-        self.remove_intersection_inner(src);
+        let _ = self.try_remove_intersection(src);
+    }
 
-        self.check_invariants()
+    pub(crate) fn try_remove_intersection(
+        &mut self,
+        src: IntersectionID,
+    ) -> Result<(), ConnectionError> {
+        if !self.intersections.contains_key(src) {
+            return Err(ConnectionError::InvalidEndpoint);
+        }
+        if self.environment.strict_water_siting() {
+            super::prepare_junction_removal(self, src, &mut WaterTopologyWork::new().geometry())?;
+        }
+        self.remove_intersection_inner(src);
+        self.check_invariants();
+        Ok(())
     }
 
     fn remove_intersection_inner(&mut self, src: IntersectionID) {
@@ -534,14 +487,27 @@ impl Map {
         interpoint: Option<Vec2>,
         pattern: &LanePattern,
     ) -> Option<(IntersectionID, RoadID)> {
+        let connected = self.try_connect(from, to, interpoint, pattern).ok()?;
+        Some((
+            connected.dst.unwrap_or(self.roads[connected.road].dst),
+            connected.road,
+        ))
+    }
+
+    pub fn try_connect(
+        &mut self,
+        from: MapProject,
+        to: MapProject,
+        elbow: Option<Vec2>,
+        pattern: &LanePattern,
+    ) -> Result<ConnectionOutcome, ConnectionError> {
         let mut work = self
             .environment
             .has_water_configuration()
             .then(WaterTopologyWork::new);
-        let (from, to) = self
-            .prepare_connection(from, to, interpoint, pattern, work.as_mut())
-            .ok()?;
-        Some(self.make_resolved_connection(from, to, interpoint, pattern, work.as_mut()))
+        let (from, to, prepared) =
+            self.prepare_connection(from, to, elbow, pattern, work.as_mut())?;
+        self.make_resolved_connection(from, to, elbow, pattern, prepared, work.as_mut())
     }
 
     pub(crate) fn resolve_water_connection_endpoint(
@@ -563,12 +529,18 @@ impl Map {
         to: MapProject,
         elbow: Option<Vec2>,
         pattern: &LanePattern,
-        work: Option<&mut WaterTopologyWork>,
-    ) -> Result<(ConnectionEndpoint, ConnectionEndpoint), WaterEditError> {
-        let mut work = work;
+        mut work: Option<&mut WaterTopologyWork>,
+    ) -> Result<
+        (
+            ConnectionEndpoint,
+            ConnectionEndpoint,
+            Option<PreparedTopologyEdit>,
+        ),
+        ConnectionError,
+    > {
         let endpoints = if let Some(work) = work.as_deref_mut() {
             if !wet_lane_count_fits(pattern) {
-                return Err(WaterEditError::Limit);
+                return Err(ConnectionError::WorkLimit);
             }
             self.resolve_water_connection_endpoint(from, &mut work.remaining)?
                 .zip(self.resolve_water_connection_endpoint(to, &mut work.remaining)?)
@@ -576,44 +548,44 @@ impl Map {
             self.resolve_connection_endpoint(from)
                 .zip(self.resolve_connection_endpoint(to))
         };
-        let (from, to) = endpoints.ok_or(WaterEditError::InvalidInput)?;
+        let (from, to) = endpoints.ok_or(ConnectionError::InvalidEndpoint)?;
         if !Self::can_connect(from, to, elbow, pattern) {
-            return Err(WaterEditError::InvalidInput);
+            return Err(ConnectionError::InvalidEndpoint);
         }
-        if let Some(work) = work {
-            let samples = self.preflight_water_connection(from, to, elbow, pattern, work)?;
+        let prepared = if let Some(work) = work {
+            let (samples, prepared) =
+                self.prepare_resolved_connection(from, to, elbow, pattern, work)?;
             work.spend_profile_samples(samples);
-        }
-        Ok((from, to))
+            prepared
+        } else {
+            None
+        };
+        Ok((from, to, prepared))
     }
 
-    /// Conservative gate for the legacy profiler. W2a will replace the dry
-    /// envelope with its staged deck and junction geometry.
-    pub(crate) fn preflight_water_connection(
+    pub(crate) fn prepare_resolved_connection(
         &self,
         from: ConnectionEndpoint,
         to: ConnectionEndpoint,
         elbow: Option<Vec2>,
         pattern: &LanePattern,
         work: &mut WaterTopologyWork,
-    ) -> Result<usize, WaterEditError> {
+    ) -> Result<(usize, Option<PreparedTopologyEdit>), ConnectionError> {
         let map_bounds = self.environment.bounds();
         let a = from.pos.xy();
         let b = to.pos.xy();
-        let mut bounds = AABB::new_ll_ur(a.min(b), a.max(b));
         let mut length = a.distance(b);
         if let Some(elbow) = elbow {
             if !map_bounds.contains(elbow) {
-                return Err(WaterEditError::OutOfBounds);
+                return Err(ConnectionError::OutOfBounds);
             }
-            bounds = bounds.union(AABB::new_ll_ur(elbow, elbow));
             length = a.distance(elbow) + elbow.distance(b);
         }
         if !map_bounds.contains(a) || !map_bounds.contains(b) {
-            return Err(WaterEditError::OutOfBounds);
+            return Err(ConnectionError::OutOfBounds);
         }
         if !wet_lane_count_fits(pattern) || length > 65_536.0 {
-            return Err(WaterEditError::Limit);
+            return Err(ConnectionError::WorkLimit);
         }
         let lanes = pattern.lanes_forward.len() + pattern.lanes_backward.len();
         let mut junctions = BTreeSet::new();
@@ -661,40 +633,29 @@ impl Map {
             invalidations,
             work,
         )?;
-        let radius = pattern.width() + 16.0;
-        let envelope = bounds.expand(radius);
-        let clipped = envelope.intersection(map_bounds);
-        let min = (clipped.ll / super::terrain::CELL_SIZE).floor();
-        let max = (clipped.ur / super::terrain::CELL_SIZE).ceil();
-        let tests = (max.x - min.x) as usize * (max.y - min.y) as usize;
-        if tests > 2_000_000 {
-            return Err(WaterEditError::Limit);
-        }
-        spend_water_work(&mut work.remaining, tests + length.ceil() as usize)?;
-        let footprint = if elbow.is_some() {
-            geom::Polygon(envelope.points().to_vec())
-        } else {
-            geom::Polygon(
-                OBB::new((a + b) * 0.5, (b - a).normalize(), length + radius * 2.0, radius * 2.0)
-                    .corners
-                    .to_vec(),
-            )
+        let endpoint = |resolved: ConnectionEndpoint| CrossingEndpoint {
+            kind: resolved.kind,
+            pos: resolved.pos,
+            split: resolved.split_point,
         };
-        let shape = WaterFootprint::new(footprint.as_slice()).ok_or(WaterEditError::InvalidInput)?;
-        if self.environment.strict_water_siting() {
-            for x in min.x as i16..max.x as i16 {
-                for y in min.y as i16..max.y as i16 {
-                    let tile = WaterTileCoord(x, y);
-                    if self.environment.is_water(tile.center()) && shape.overlaps_tile(tile) {
-                        return Err(WaterEditError::TopologyConflict {
-                            object: ProjectKind::Ground,
-                            tile,
-                        });
-                    }
-                }
-            }
-        }
-        Ok(profile_samples)
+        let check_geometry = self.environment.strict_water_siting()
+            && !super::connection_is_dry(
+                self, endpoint(from), endpoint(to), elbow, pattern.width(), &mut work.remaining,
+            )?;
+        let prepared = if check_geometry {
+            Some(super::prepare_topology(
+                self,
+                endpoint(from),
+                endpoint(to),
+                elbow,
+                pattern,
+                &mut work.geometry(),
+            )?)
+        } else {
+            None
+        };
+        work.check_profile_samples(profile_samples)?;
+        Ok((profile_samples, prepared))
     }
 
     pub(crate) fn make_resolved_connection(
@@ -703,22 +664,74 @@ impl Map {
         to: ConnectionEndpoint,
         interpoint: Option<Vec2>,
         pattern: &LanePattern,
+        prepared: Option<PreparedTopologyEdit>,
         mut work: Option<&mut WaterTopologyWork>,
-    ) -> (IntersectionID, RoadID) {
-        let connected = self.connect_projects(from, to, interpoint, pattern);
-        let _ = self.merge_shallow_junction(connected.src, work.as_deref_mut());
-        let _ = self.merge_shallow_junction(connected.dst, work);
+    ) -> Result<ConnectionOutcome, ConnectionError> {
+        let connected = self.commit_prepared_connection(from, to, interpoint, pattern, prepared)?;
+        let mut road = connected.road;
+        let mut replacements = BTreeMap::new();
+        for split in connected.splits.into_iter().flatten() {
+            replacements.insert(split.original, split.roads.to_vec());
+        }
+        for junction in [connected.src, connected.dst] {
+            if let Ok(Some((old, new))) = self.merge_shallow_junction(junction, work.as_deref_mut())
+            {
+                super::remap_merged_roads(&mut replacements, old, new);
+                if old.contains(&road) {
+                    road = new;
+                }
+            }
+        }
         self.check_invariants();
-        (connected.dst, connected.road)
+        Ok(ConnectionOutcome {
+            road,
+            src: self
+                .intersections
+                .contains_key(connected.src)
+                .then_some(connected.src),
+            dst: self
+                .intersections
+                .contains_key(connected.dst)
+                .then_some(connected.dst),
+            replacements,
+        })
     }
 
+    #[cfg(test)]
     pub(crate) fn connect_projects(
+        &mut self,
+        from: ConnectionEndpoint,
+        to: ConnectionEndpoint,
+        elbow: Option<Vec2>,
+        pattern: &LanePattern,
+    ) -> ConnectedRoad {
+        let prepared = self
+            .environment
+            .has_water_configuration()
+            .then(WaterTopologyWork::new)
+            .and_then(|mut work| {
+                self.prepare_resolved_connection(from, to, elbow, pattern, &mut work)
+                    .expect("valid fixture connection")
+                    .1
+            });
+        self.commit_prepared_connection(from, to, elbow, pattern, prepared)
+            .expect("prepared fixture belongs to this map")
+    }
+
+    pub(crate) fn commit_prepared_connection(
         &mut self,
         from: ConnectionEndpoint,
         to: ConnectionEndpoint,
         interpoint: Option<Vec2>,
         pattern: &LanePattern,
-    ) -> ConnectedRoad {
+        prepared: Option<PreparedTopologyEdit>,
+    ) -> Result<ConnectedRoad, ConnectionError> {
+        if prepared
+            .as_ref()
+            .is_some_and(|prepared| !prepared.matches(self))
+        {
+            return Err(ConnectionError::Stale);
+        }
         let connection_segment = match interpoint {
             Some(x) => RoadSegmentKind::from_elbow(from.pos.xy(), to.pos.xy(), x),
             None => RoadSegmentKind::Straight,
@@ -739,8 +752,9 @@ impl Map {
 
         let (src, from_split) = mk_inter(from);
         let (dst, to_split) = mk_inter(to);
+        let profile = prepared.map(|prepared| (prepared.profile, prepared.elevated));
         let road = self
-            .connect_with_span(src, dst, pattern, connection_segment, None)
+            .connect_with_span(src, dst, pattern, connection_segment, None, profile)
             .expect("validated connection intersections");
 
         self.invalidate(src);
@@ -750,28 +764,28 @@ impl Map {
         Lot::generate_along_road(self, road);
 
         info!("connected {:?} {:?}: {:?}", src, dst, road);
-        ConnectedRoad {
+        Ok(ConnectedRoad {
             src,
             dst,
             road,
             splits: [from_split, to_split],
-        }
+        })
     }
 
     pub(crate) fn merge_shallow_junction(
         &mut self,
         id: IntersectionID,
-        work: Option<&mut WaterTopologyWork>,
-    ) -> Result<(), WaterEditError> {
+        mut work: Option<&mut WaterTopologyWork>,
+    ) -> Result<Option<([RoadID; 2], RoadID)>, ConnectionError> {
         let Some(intersection) = self.intersections.get(id) else {
-            return Ok(());
+            return Ok(None);
         };
         if let [first, second] = *intersection.roads {
             let angle = self.roads[first]
                 .dir_from(id)
                 .dot(self.roads[second].dir_from(id));
             if angle < -0.9 {
-                if let Some(work) = work {
+                if let Some(work) = work.as_deref_mut() {
                     let a = &self.roads[first];
                     let b = &self.roads[second];
                     let junctions = BTreeSet::from([a.src, a.dst, b.src, b.dst]);
@@ -789,10 +803,12 @@ impl Map {
                     )?;
                     work.spend_profile_samples(samples);
                 }
-                self.merge_road(first, second);
+                return self
+                    .merge_road_checked(first, second, work)
+                    .map(|merged| merged.map(|new| ([first, second], new)));
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     fn reserve_water_topology(
@@ -1292,9 +1308,21 @@ impl Map {
     pub fn remove_road(&mut self, road_id: RoadID) -> Option<Road> {
         info!("remove_road {:?}", road_id);
 
-        let v = self.remove_road_inner(road_id);
+        self.try_remove_road(road_id).ok()
+    }
+
+    pub(crate) fn try_remove_road(&mut self, road_id: RoadID) -> Result<Road, ConnectionError> {
+        if !self.roads.contains_key(road_id) {
+            return Err(ConnectionError::InvalidEndpoint);
+        }
+        if self.environment.strict_water_siting() {
+            super::prepare_road_removal(self, road_id, &mut WaterTopologyWork::new().geometry())?;
+        }
+        let removed = self
+            .remove_road_inner(road_id)
+            .expect("road preflight checked reference");
         self.check_invariants();
-        v
+        Ok(removed)
     }
 
     pub fn subscribe(&self, filter: UpdateType) -> MapSubscriber {
@@ -1447,19 +1475,6 @@ impl Map {
         id
     }
 
-    const IMPORT_LANE_RESERVE: f32 = 10.0;
-
-    fn reserve_import_lane(road: &mut Road) {
-        let src = road.interface_from(road.src);
-        let dst = road.interface_from(road.dst);
-        let available = (road.length() - Self::IMPORT_LANE_RESERVE).max(0.0);
-        if src + dst > available {
-            let scale = available / (src + dst);
-            road.set_interface(road.src, src * scale);
-            road.set_interface(road.dst, dst * scale);
-        }
-    }
-
     pub(crate) fn finalize_import(&mut self, junctions: &[IntersectionID], roads: &[RoadID]) {
         self.import_lane_reserve = true;
         self.lane_topology_changed();
@@ -1469,7 +1484,7 @@ impl Map {
         }
         for &id in roads {
             let road = &mut self.roads[id];
-            Self::reserve_import_lane(road);
+            super::reserve_import_lane(road);
             road.update_lanes(&mut self.lanes, &mut self.parking, &self.environment);
             queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, road);
             self.subscribers.dispatch(UpdateType::Road, road);
@@ -1479,6 +1494,10 @@ impl Map {
             junction.update_traffic_control(&mut self.lanes, &self.roads);
             junction.update_turns(&self.lanes, &self.roads);
             self.spatial_map.update(junction);
+            self.spatial_map.set_additional_occupancy(
+                junction.id.into(),
+                super::junction_support_bounds(junction, &self.roads),
+            );
             queue_construction_cut(
                 &mut self.pending_construction_cuts,
                 &self.environment,
@@ -1548,6 +1567,11 @@ impl Map {
 
             #[allow(clippy::indexing_slicing)] // borrowed before
             self.roads[x].update_lanes(&mut self.lanes, &mut self.parking, &self.environment);
+            self.spatial_map.update_auxiliary(&self.roads[x]);
+            self.spatial_map.set_additional_occupancy(
+                oend_id.into(),
+                super::junction_support_bounds(other_end, &self.roads),
+            );
         }
 
         #[allow(clippy::indexing_slicing)] // borrowed before
@@ -1561,6 +1585,10 @@ impl Map {
             inter,
         );
         self.spatial_map.update(inter);
+        self.spatial_map.set_additional_occupancy(
+            inter.id.into(),
+            super::junction_support_bounds(inter, &self.roads),
+        );
     }
 
     fn invalidate_imported(&mut self, id: IntersectionID) {
@@ -1606,7 +1634,7 @@ impl Map {
         for road_id in road_order {
             let old_interfaces = previous[&road_id];
             let road = &mut self.roads[road_id];
-            Self::reserve_import_lane(road);
+            super::reserve_import_lane(road);
             let changed =
                 old_interfaces != (road.interface_from(road.src), road.interface_from(road.dst));
             if changed || direct.contains(&road_id) {
@@ -1617,6 +1645,7 @@ impl Map {
                 );
                 self.subscribers.dispatch(UpdateType::Road, road);
                 road.update_lanes(&mut self.lanes, &mut self.parking, &self.environment);
+                self.spatial_map.update_auxiliary(road);
             }
             if changed {
                 turns.extend([road.src, road.dst]);
@@ -1629,6 +1658,10 @@ impl Map {
             }
             inter.update_turns(&self.lanes, &self.roads);
             self.spatial_map.update(inter);
+            self.spatial_map.set_additional_occupancy(
+                inter.id.into(),
+                super::junction_support_bounds(inter, &self.roads),
+            );
             queue_construction_cut(
                 &mut self.pending_construction_cuts,
                 &self.environment,
@@ -1681,23 +1714,7 @@ impl Map {
 
         let id = self.add_intersection(pos - Vec3::z(ROAD_Z_OFFSET));
 
-        let mut before: Vec<_> = r.points.iter().copied().take(segment).collect();
-        // A split at an existing vertex replaces its height.
-        while before.last().is_some_and(|point| point.xy() == pos.xy()) {
-            before.pop();
-        }
-        before.push(pos);
-        let after_split = r
-            .points
-            .iter()
-            .copied()
-            .skip(segment)
-            .skip_while(|point| point.xy() == pos.xy());
-        let mut after: Vec<_> = [pos].into_iter().chain(after_split).collect();
-        before.dedup();
-        after.dedup();
-        let before = PolyLine3::new(before);
-        let after = PolyLine3::new(after);
+        let [before, after] = r.split_profiles(pos, segment);
 
         let inherited_span = Some(r.elevated_span());
         let r1 = self.connect_with_span(
@@ -1706,6 +1723,7 @@ impl Map {
             &pat,
             RoadSegmentKind::Arbitrary(before),
             inherited_span,
+            None,
         )?;
         let r2 = self.connect_with_span(
             id,
@@ -1713,6 +1731,7 @@ impl Map {
             &pat,
             RoadSegmentKind::Arbitrary(after),
             inherited_span,
+            None,
         )?;
 
         let frontage_blocked = self.no_frontage.remove(&split_road_id);
@@ -1730,6 +1749,9 @@ impl Map {
         );
 
         let roads = [r1, r2];
+        if self.no_frontage.remove(&split_road_id) {
+            self.no_frontage.extend(roads);
+        }
         let r1 = self.roads.get(r1)?;
         let r2 = self.roads.get(r2)?;
 
@@ -1743,10 +1765,11 @@ impl Map {
             let d1 = r1.points.project_dist2(bpos);
             let d2 = r2.points.project_dist2(bpos);
 
-            b.connected_road = Some(match d1 < d2 {
-                true => r1.id,
-                false => r2.id,
-            });
+            let parent = if d1 < d2 { r1.id } else { r2.id };
+            b.connected_road = Some(parent);
+            if let Some(origin) = self.lot_origins.get_mut(&b.id) {
+                origin.parent_road = parent;
+            }
             self.water_services
                 .building_changed(&self.environment, &self.roads, b);
         }
@@ -1787,13 +1810,32 @@ impl Map {
     }
 
     pub(crate) fn merge_road(&mut self, road1: RoadID, road2: RoadID) -> Option<RoadID> {
-        info!("merge_road {:?} {:?}", road1, road2);
+        let mut work = self
+            .environment
+            .has_water_configuration()
+            .then(WaterTopologyWork::new);
+        self.merge_road_checked(road1, road2, work.as_mut())
+            .ok()
+            .flatten()
+    }
 
-        let r1 = self.roads.get(road1)?;
-        let r2 = self.roads.get(road2)?;
+    fn merge_road_checked(
+        &mut self,
+        road1: RoadID,
+        road2: RoadID,
+        work: Option<&mut WaterTopologyWork>,
+    ) -> Result<Option<RoadID>, ConnectionError> {
+        let r1 = self
+            .roads
+            .get(road1)
+            .ok_or(ConnectionError::InvalidEndpoint)?;
+        let r2 = self
+            .roads
+            .get(road2)
+            .ok_or(ConnectionError::InvalidEndpoint)?;
         let frontage_blocked = self.no_frontage.contains(&road1);
         if frontage_blocked != self.no_frontage.contains(&road2) {
-            return None;
+            return Ok(None);
         }
 
         let same_inter = if r1.src == r2.src || r1.src == r2.dst {
@@ -1802,7 +1844,7 @@ impl Map {
             r1.dst
         } else {
             warn!("trying to merge roads that are not connected to each other");
-            return None;
+            return Ok(None);
         };
 
         let mut pat1 = r1.pattern(&self.lanes);
@@ -1818,7 +1860,7 @@ impl Map {
 
         if pat1 != pat2 {
             log::info!("merge refused because patterns don't match");
-            return None;
+            return Ok(None);
         }
 
         let r1_extremity = if r1.src == same_inter { r1.dst } else { r1.src };
@@ -1826,40 +1868,58 @@ impl Map {
 
         if r1_extremity == r2_extremity {
             log::info!("merge refused because connecting to itself");
-            return None;
+            return Ok(None);
         }
 
-        let r1 = self.remove_raw_road(road1)?;
-        let r2 = self.remove_raw_road(road2)?;
-
-        self.remove_intersection_inner(same_inter);
-
-        queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &r1);
-        self.subscribers.dispatch(UpdateType::Road, &r1);
-        queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &r2);
-        self.subscribers.dispatch(UpdateType::Road, &r2);
-
-        for (id, _) in r2.lanes_iter().chain(r1.lanes_iter()) {
-            self.parking.remove_to_reuse(id);
-        }
-
-        let mut new_polyline = r1.points;
+        let mut new_polyline = r1.points.clone();
         if r1.src == same_inter {
             new_polyline.reverse();
         }
-
         if r2.src == same_inter {
-            new_polyline.extend(r2.points.iter().skip(1))
+            new_polyline.extend(r2.points.iter().skip(1));
         } else {
-            new_polyline.extend(r2.points.iter().rev().skip(1))
+            new_polyline.extend(r2.points.iter().rev().skip(1));
+        }
+        let elevated = r1.elevated_span() || r2.elevated_span();
+
+        if self.environment.strict_water_siting() {
+            if self.intersections[same_inter].roads.len() != 2 {
+                return Ok(None);
+            }
+            let work = work.ok_or(ConnectionError::WorkLimit)?;
+            super::prepare_merge(
+                self,
+                road1,
+                road2,
+                r1_extremity,
+                r2_extremity,
+                &pat1,
+                &new_polyline,
+                elevated,
+                &mut work.geometry(),
+            )?;
         }
 
-        let new_r = self.connect(
-            r1_extremity,
-            r2_extremity,
-            &pat1,
-            RoadSegmentKind::Arbitrary(new_polyline),
-        )?;
+        let r1 = self.remove_raw_road(road1).expect("validated merge road");
+        let r2 = self.remove_raw_road(road2).expect("validated merge road");
+        self.remove_intersection_inner(same_inter);
+        for road in [&r1, &r2] {
+            queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, road);
+            self.subscribers.dispatch(UpdateType::Road, road);
+        }
+        for (id, _) in r2.lanes_iter().chain(r1.lanes_iter()) {
+            self.parking.remove_to_reuse(id);
+        }
+        let new_r = self
+            .connect_with_span(
+                r1_extremity,
+                r2_extremity,
+                &pat1,
+                RoadSegmentKind::Arbitrary(new_polyline),
+                elevated.then_some(true),
+                None,
+            )
+            .expect("validated merge endpoints");
 
         if frontage_blocked {
             self.no_frontage.remove(&road1);
@@ -1879,8 +1939,11 @@ impl Map {
             .iter()
             .chain(r2.connected_buildings.iter())
         {
-            let b = self.buildings.get_mut(*b)?;
+            let b = self.buildings.get_mut(*b).expect("road building exists");
             b.connected_road = Some(new_r.id);
+            if let Some(origin) = self.lot_origins.get_mut(&b.id) {
+                origin.parent_road = new_r.id;
+            }
             new_r.connected_buildings.push(b.id);
 
             self.electricity.add_edge(b.id, new_r.id);
@@ -1910,7 +1973,7 @@ impl Map {
                 .building_changed(&self.environment, &self.roads, &self.buildings[id]);
         }
 
-        Some(new_id)
+        Ok(Some(new_id))
     }
 
     /// Returns None if one of the intersections don't exist
@@ -1921,12 +1984,37 @@ impl Map {
         pattern: &LanePattern,
         segment: RoadSegmentKind,
     ) -> Option<RoadID> {
-        let gen_lots = !matches!(segment, RoadSegmentKind::Arbitrary(_));
-        let road = self.connect_with_span(src_id, dst_id, pattern, segment, None)?;
-        if gen_lots {
-            Lot::generate_along_road(self, road);
+        if !self.environment.strict_water_siting() {
+            let gen_lots = !matches!(segment, RoadSegmentKind::Arbitrary(_));
+            let road = self.connect_with_span(src_id, dst_id, pattern, segment, None, None)?;
+            if gen_lots {
+                Lot::generate_along_road(self, road);
+            }
+            return Some(road);
         }
-        Some(road)
+        if !wet_lane_count_fits(pattern) || pattern.lanes().next().is_none() {
+            return None;
+        }
+        let prepared = super::prepare_direct_road(
+            self,
+            src_id,
+            dst_id,
+            pattern,
+            segment.clone(),
+            &mut WaterTopologyWork::new().geometry(),
+        )
+        .ok()?;
+        let id = self.connect_with_span(
+            src_id,
+            dst_id,
+            pattern,
+            segment,
+            None,
+            Some((prepared.profile, prepared.elevated)),
+        )?;
+        self.invalidate(src_id);
+        self.invalidate(dst_id);
+        Some(id)
     }
 
     fn connect_with_span(
@@ -1936,9 +2024,15 @@ impl Map {
         pattern: &LanePattern,
         segment: RoadSegmentKind,
         inherited_span: Option<bool>,
+        prepared: Option<(PolyLine3, bool)>,
     ) -> Option<RoadID> {
         let src = self.intersections.get(src_id)?;
         let dst = self.intersections.get(dst_id)?;
+
+        let (segment, inherited_span) = prepared
+            .map_or((segment, inherited_span), |(profile, elevated)| {
+                (RoadSegmentKind::Arbitrary(profile), Some(elevated))
+            });
 
         let rid = Road::make_with_span(
             src,
@@ -1965,6 +2059,12 @@ impl Map {
         self.intersections.get_mut(dst_id)?.add_road(&self.roads, r);
 
         Lot::remove_intersecting_lots(self, rid);
+        for id in [src_id, dst_id] {
+            self.spatial_map.set_additional_occupancy(
+                id.into(),
+                super::junction_support_bounds(&self.intersections[id], &self.roads),
+            );
+        }
 
         #[allow(clippy::indexing_slicing)]
         let r = &self.roads[rid];
@@ -2309,6 +2409,7 @@ const MAX_WATER_PROFILE_SAMPLES: usize = 65_536;
 pub(crate) struct WaterTopologyWork {
     pub(crate) remaining: usize,
     profile_samples: usize,
+    deck_tiles: usize,
 }
 
 impl WaterTopologyWork {
@@ -2316,7 +2417,16 @@ impl WaterTopologyWork {
         Self {
             remaining: super::MAX_WATER_BATCH_WORK,
             profile_samples: MAX_WATER_PROFILE_SAMPLES,
+            deck_tiles: MAX_DECK_TILE_TESTS,
         }
+    }
+
+    fn geometry(&mut self) -> CrossingWork<'_> {
+        CrossingWork::new(
+            &mut self.remaining,
+            &mut self.deck_tiles,
+            &mut self.profile_samples,
+        )
     }
 
     fn check_profile_samples(&self, samples: usize) -> Result<(), WaterEditError> {

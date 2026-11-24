@@ -16,10 +16,11 @@ use crate::economy::progression::{can_build, BuildCapability, ProgressionState};
 use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
-    Building, BuildingID, BuildingKind, Density, Environment, IntersectionID, LaneID, LaneKind,
-    LanePattern, LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, ProjectKind,
-    RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, WaterTopologyWork,
-    Zone, ZoneCellCoord, ZoneGrid, ZoneKind, ZonePaintError, MAX_WATER_BATCH_WORK,
+    Building, BuildingID, BuildingKind, ConnectionError, Density, Environment, IntersectionID,
+    LaneID, LaneKind, LanePattern, LanePatternBuilder, LightPolicy, LotID, LotLayout, Map,
+    MapProject, ProjectKind, RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError,
+    WaterEditOutcome, WaterTopologyWork, Zone, ZoneCellCoord, ZoneGrid, ZoneKind, ZonePaintError,
+    MAX_WATER_BATCH_WORK,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
@@ -151,6 +152,7 @@ pub enum WorldCommand {
 pub enum Rejection {
     MissingReference,
     InvalidConnection,
+    WaterConnection(ConnectionError),
     InvalidBatchIndex,
     InvalidBuilding,
     InvalidZone,
@@ -199,11 +201,11 @@ impl Rejection {
         }
     }
 
-    fn water_connection_error(error: WaterEditError) -> Self {
+    fn water_connection_error(error: ConnectionError) -> Self {
         match error {
-            WaterEditError::Limit => Self::WaterWorkLimit,
-            WaterEditError::TopologyConflict { .. } => Self::WetFootprint,
-            _ => Self::InvalidConnection,
+            ConnectionError::WorkLimit => Self::WaterWorkLimit,
+            ConnectionError::InvalidEndpoint => Self::InvalidConnection,
+            other => Self::WaterConnection(other),
         }
     }
 }
@@ -328,6 +330,13 @@ fn dry_water_edit_reservation(edit: &WaterEdit) -> usize {
 
 pub type LinkOutcome = (usize, Result<(), (&'static str, Rejection)>);
 
+/// Final live roads for each indexed link, and resolved project junctions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConnectionBatchOutcome {
+    pub links: Vec<Result<Vec<RoadID>, Rejection>>,
+    pub projects: Vec<Option<IntersectionID>>,
+}
+
 struct CommandOutcomeRanges {
     rejections: Range<usize>,
     links: Range<usize>,
@@ -346,6 +355,7 @@ pub struct CommandOutcomes {
     command_ranges: Vec<CommandOutcomeRanges>,
     links: Vec<LinkOutcome>,
     batch_in_progress: bool,
+    connections: BTreeMap<usize, ConnectionBatchOutcome>,
     water_edits: BTreeMap<usize, Result<WaterEditOutcome, WaterEditError>>,
 }
 
@@ -373,6 +383,10 @@ impl CommandOutcomes {
             .unwrap_or_default()
     }
 
+    pub fn connection_batch(&self, index: usize) -> Option<&ConnectionBatchOutcome> {
+        self.connections.get(&index)
+    }
+
     /// The result of an EditWater command at the given input index.
     pub fn water_edit(&self, index: usize) -> Option<&Result<WaterEditOutcome, WaterEditError>> {
         self.water_edits.get(&index)
@@ -384,6 +398,7 @@ impl CommandOutcomes {
         self.accepted.clear();
         self.command_ranges.clear();
         self.links.clear();
+        self.connections.clear();
         self.water_edits.clear();
     }
 
@@ -894,6 +909,18 @@ impl WorldCommand {
             }
         }
 
+        if matches!(
+            self,
+            MapRemoveRoad(_) | MapRemoveIntersection(_) | MapUpdateIntersectionPolicy { .. }
+        ) && sim.map().environment().strict_water_siting()
+        {
+            match self.apply_one(sim, construction) {
+                Ok(()) => self.record_for_replay(sim),
+                Err(reason) => self.reject(sim, reason),
+            }
+            return;
+        }
+
         self.record_for_replay(sim);
         if is_transit {
             return;
@@ -1217,12 +1244,13 @@ impl WorldCommand {
             .environment()
             .has_water_configuration()
             .then(WaterTopologyWork::new);
-        let (from, to) = map
+        let (from, to, prepared) = map
             .prepare_connection(from, to, inter, pattern, work.as_mut())
             .map_err(Rejection::water_connection_error)?;
         let cost =
             Self::affordable_cost(sim, Government::connection_cost(from.pos, to.pos, pattern))?;
-        map.make_resolved_connection(from, to, inter, pattern, work.as_mut());
+        map.make_resolved_connection(from, to, inter, pattern, prepared, work.as_mut())
+            .map_err(Rejection::water_connection_error)?;
         Self::charge_construction(sim, cost, construction);
         Ok(())
     }
@@ -1253,9 +1281,13 @@ impl WorldCommand {
         let mut junctions = BTreeSet::new();
         let mut splits = BTreeMap::new();
         let mut connected_any = false;
-        let record_link = |index, result: Result<(), Rejection>| {
-            sim.write::<CommandOutcomes>()
-                .record_link(index, result.map_err(|reason| (self.kind(), reason)));
+        let mut details = vec![Err(Rejection::WaterWorkLimit); links.len()];
+        let mut record_link = |index: usize, result: Result<RoadID, Rejection>| {
+            details[index] = result;
+            sim.write::<CommandOutcomes>().record_link(
+                index,
+                result.map(|_| ()).map_err(|reason| (self.kind(), reason)),
+            );
         };
         for (index, &(from, to, interpoint, ref pat)) in links.iter().enumerate() {
             let mut resolve = |index: usize| {
@@ -1276,24 +1308,25 @@ impl WorldCommand {
                     Ok(map.resolve_connection_endpoint(project))
                 }
             };
-            let (fromproj, toproj) = match resolve(from).and_then(|start| Ok(start.zip(resolve(to)?))) {
-                Ok(Some(pair)) => pair,
-                Ok(None) => {
-                    record_link(index, Err(Rejection::MissingReference));
-                    continue;
-                }
-                Err(error) => {
-                    record_link(index, Err(Rejection::water_connection_error(error)));
-                    break;
-                }
-            };
+            let (fromproj, toproj) =
+                match resolve(from).and_then(|start| Ok(start.zip(resolve(to)?))) {
+                    Ok(Some(pair)) => pair,
+                    Ok(None) => {
+                        record_link(index, Err(Rejection::MissingReference));
+                        continue;
+                    }
+                    Err(error) => {
+                        record_link(index, Err(Rejection::water_connection_error(error.into())));
+                        break;
+                    }
+                };
             if !Map::can_connect(fromproj, toproj, interpoint, pat) {
                 record_link(index, Err(Rejection::InvalidConnection));
                 continue;
             }
-            let profile_samples = if let Some(work) = &mut water_work {
-                match map.preflight_water_connection(fromproj, toproj, interpoint, pat, work) {
-                    Ok(samples) => samples,
+            let (profile_samples, prepared) = if let Some(work) = &mut water_work {
+                match map.prepare_resolved_connection(fromproj, toproj, interpoint, pat, work) {
+                    Ok(prepared) => prepared,
                     Err(error) => {
                         let reason = Rejection::water_connection_error(error);
                         record_link(index, Err(reason));
@@ -1304,7 +1337,7 @@ impl WorldCommand {
                     }
                 }
             } else {
-                0
+                (0, None)
             };
             let cost = match Self::affordable_cost(
                 sim,
@@ -1319,7 +1352,14 @@ impl WorldCommand {
             if let Some(work) = &mut water_work {
                 work.spend_profile_samples(profile_samples);
             }
-            let connected = map.connect_projects(fromproj, toproj, interpoint, pat);
+            let connected =
+                match map.commit_prepared_connection(fromproj, toproj, interpoint, pat, prepared) {
+                    Ok(connected) => connected,
+                    Err(error) => {
+                        record_link(index, Err(Rejection::water_connection_error(error)));
+                        continue;
+                    }
+                };
             for split in connected.splits.into_iter().flatten() {
                 splits.insert(split.original, split);
             }
@@ -1335,18 +1375,67 @@ impl WorldCommand {
             }
             Self::charge_construction(sim, cost, construction);
             connected_any = true;
-            record_link(index, Ok(()));
+            record_link(index, Ok(connected.road));
         }
-        // Keep junction IDs alive until every link that names them has been processed.
+        // Keep junctions alive until every link naming them has been processed.
+        let mut merged = BTreeMap::new();
         for junction in junctions {
-            if map
-                .merge_shallow_junction(junction, water_work.as_mut())
-                .is_err()
-                && water_work.as_ref().is_some_and(|work| work.remaining == 0)
-            {
-                break;
+            match map.merge_shallow_junction(junction, water_work.as_mut()) {
+                Ok(Some((old, new))) => merged.extend(old.into_iter().map(|id| (id, new))),
+                Err(_) if water_work.as_ref().is_some_and(|work| work.remaining == 0) => break,
+                _ => {}
             }
         }
+        let mut survivors = BTreeMap::new();
+        let mut follow_merge = |mut road| {
+            let mut path = Vec::new();
+            while let Some(&next) = merged.get(&road) {
+                if let Some(&known) = survivors.get(&road) {
+                    road = known;
+                    break;
+                }
+                path.push(road);
+                road = next;
+            }
+            for id in path {
+                survivors.insert(id, road);
+            }
+            road
+        };
+        let links = details
+            .into_iter()
+            .map(|result| {
+                result.map(|id| {
+                    let mut pending = vec![id];
+                    let mut roads = BTreeSet::new();
+                    while let Some(id) = pending.pop() {
+                        if let Some(split) = splits.get(&id) {
+                            pending.extend(split.roads);
+                        } else {
+                            let id = follow_merge(id);
+                            if map.roads().contains_key(id) {
+                                roads.insert(id);
+                            }
+                        }
+                    }
+                    roads.into_iter().collect()
+                })
+            })
+            .collect();
+        let projects = endpoints
+            .into_iter()
+            .map(|project| {
+                let ProjectKind::Intersection(id) = project?.kind else {
+                    return None;
+                };
+                map.intersections().contains_key(id).then_some(id)
+            })
+            .collect();
+        let mut outcomes = sim.write::<CommandOutcomes>();
+        let index = outcomes.command_ranges.len();
+        outcomes
+            .connections
+            .insert(index, ConnectionBatchOutcome { links, projects });
         map.check_invariants();
         Ok(connected_any)
     }
@@ -1359,11 +1448,14 @@ impl WorldCommand {
         let cost = self.validate_and_price(sim)?;
 
         match *self {
-            MapRemoveIntersection(id) => sim.map_mut().remove_intersection(id),
+            MapRemoveIntersection(id) => sim
+                .map_mut()
+                .try_remove_intersection(id)
+                .map_err(Rejection::water_connection_error)?,
             MapRemoveRoad(id) => {
                 sim.map_mut()
-                    .remove_road(id)
-                    .ok_or(Rejection::MutationFailed)?;
+                    .try_remove_road(id)
+                    .map_err(Rejection::water_connection_error)?;
             }
             MapRemoveBuilding(id) => {
                 if !crate::souls::lifecycle::remove_site(sim, id) {
@@ -1388,10 +1480,13 @@ impl WorldCommand {
                 inter: id,
                 turn: tp,
                 light: lp,
-            } => sim.map_mut().update_intersection(id, move |i| {
-                i.light_policy = lp;
-                i.turn_policy = tp;
-            }),
+            } => sim
+                .map_mut()
+                .try_update_intersection(id, move |i| {
+                    i.light_policy = lp;
+                    i.turn_policy = tp;
+                })
+                .map_err(Rejection::water_connection_error)?,
             MapBuildSpecialBuilding {
                 pos: obb,
                 kind,

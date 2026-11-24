@@ -267,6 +267,7 @@ fn mk_spatial_map(m: &SerializedMap) -> SpatialMap {
     }
     for i in m.intersections.values() {
         sm.insert(i);
+        sm.set_additional_occupancy(i.id.into(), super::junction_support_bounds(i, &m.roads));
     }
     for l in m.lots.values() {
         sm.insert(l);
