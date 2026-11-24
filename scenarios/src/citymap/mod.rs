@@ -13,7 +13,9 @@ use simulation::{
     AuthoredTownOptions, SavePhase, Simulation, SlotCamera, SlotId, SnapshotRevision,
 };
 use std::ffi::OsString;
+use std::fs::{self, File};
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
 
 fn cli_paths(
@@ -126,59 +128,272 @@ pub fn carve_authored_sava(sim: &mut Simulation, plan: &TownPlan) -> Result<Wate
     .map_err(|error| format!("Sava water edit: {error}"))
 }
 
-/// Saves the live dry network and its source and geometry report as a local slot.
+const SLOT_NAME: &str = "Lesce Town · © OpenStreetMap contributors";
+const SAVE_VERSION: &str = include_str!("../../../VERSION");
+const DRY_VARIANT: &str = "dry";
+const BUILD_REPORT: &str = "lesce_town.build.json";
+
+/// Saves the dry network and its report in a dedicated, previously absent directory.
 pub fn export_dry_slot(paths: SourcePaths<'_>, out: &Path) -> Result<(), String> {
     let out = std::path::absolute(out).map_err(|error| error.to_string())?;
+    let name = out
+        .file_name()
+        .ok_or("CITYMAP needs a named output directory")?;
+    let parent = out.parent().ok_or("CITYMAP needs a parent directory")?;
+    let out = parent.join(name);
+    let path_error = |error| format!("{}: {error}", out.display());
+    require_absent_delivery(&out).map_err(path_error)?;
+
     let inputs = read_inputs(paths)?;
     let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default())?;
-    let (sim, built) = build_dry_town(&plan)?;
-    let mut report = {
-        let map = sim.map();
-        network_report(
-            &map,
-            &inputs,
-            &plan,
-            &built,
-            &blocks(&plan.graph),
-            &frontage(&plan, &map, &built),
-        )?
-    };
+    let (sim, _) = build_dry_town(&plan)?;
     let id = SlotId::new("lesce_town").map_err(|error| error.to_string())?;
-    let hashes = sim.hashes();
-    let revision_half = |salt: u8| {
-        let mut hasher = DefaultHasher::new();
-        (salt, id.as_str(), &hashes).hash(&mut hasher);
-        u128::from(hasher.finish())
+    let (revision, blueprint_sha256) =
+        snapshot_revision(&id, &sim, &inputs, &plan, DRY_VARIANT, SAVE_VERSION)?;
+    let camera = SlotCamera {
+        position: [plan.station.x, plan.station.y, 10.0],
+        yaw: -0.35,
+        pitch: 1.22,
+        distance: 1490.0,
     };
-    let revision = SnapshotRevision::new(revision_half(0) << 64 | revision_half(1));
-    report["slot"] = serde_json::json!(id.as_str());
-    report["snapshot_revision"] = serde_json::json!(format!("{:032x}", revision.get()));
-    report["variant"] = serde_json::json!("dry");
-    report["scope"] =
-        serde_json::json!("Dry authored network with reserved Sava crossings and facility sites.");
-    let report = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
-
     let slot = sim
         .encode_slot(revision)
         .map_err(|error| error.to_string())?
-        .with_display_name("Lesce Town · © OpenStreetMap contributors".into())
-        .with_camera(SlotCamera {
-            position: [plan.station.x, plan.station.y, 10.0],
-            yaw: -0.35,
-            pitch: 1.22,
-            distance: 1490.0,
-        });
-    std::fs::create_dir_all(&out).map_err(|error| format!("{}: {error}", out.display()))?;
-    match slot.publish(&out, &id).map_err(|error| error.to_string())? {
+        .with_display_name(SLOT_NAME.into())
+        .with_camera(camera);
+    drop(sim);
+    fs::create_dir_all(parent).map_err(path_error)?;
+    let stage = DeliveryStage::new(parent).map_err(path_error)?;
+    match slot
+        .publish(&stage.path, &id)
+        .map_err(|error| error.to_string())?
+    {
         SavePhase::Complete => {}
         SavePhase::SidecarsFailed { replay, meta } => {
             return Err(format!(
-                "lesce_town sidecars failed: replay={replay:?}, metadata={meta:?}"
+                "lesce_town staging sidecars failed (replay: {replay:?}, metadata: {meta:?})"
             ));
         }
     }
-    let path = out.join("lesce_town.build.json");
-    std::fs::write(&path, report).map_err(|error| format!("{}: {error}", path.display()))
+
+    let entries = simulation::list_slots_with_revisions(&stage.path, |path, kind| {
+        Simulation::read_slot_snapshot_header(path, kind)
+            .ok()
+            .and_then(|header| header.revision)
+    })
+    .map_err(|error| error.to_string())?;
+    let [entry] = entries.as_slice() else {
+        return Err("expected one slot in the CITYMAP staging directory".into());
+    };
+    if entry.id != id
+        || entry.revision != Some(revision)
+        || entry.replay_available
+        || !entry
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.display_name == SLOT_NAME && meta.camera == Some(camera))
+    {
+        return Err("staged CITYMAP slot has invalid revision, metadata or replay".into());
+    }
+
+    let loaded =
+        Simulation::load_listed_snapshot(&stage.path, entry).map_err(|error| error.to_string())?;
+    let map = loaded.map();
+    let built = resolve_network(&map, &plan.graph).map_err(|error| error.to_string())?;
+    validate_live(&map, &plan.graph, &built, plan.limits).map_err(|error| error.to_string())?;
+    let mut report = network_report(
+        &map,
+        &inputs,
+        &plan,
+        &built,
+        &blocks(&plan.graph),
+        &frontage(&plan, &map, &built),
+    )?;
+    report["slot"] = serde_json::json!(id.as_str());
+    report["snapshot_revision"] = serde_json::json!(format!("{:032x}", revision.get()));
+    report["variant"] = serde_json::json!(DRY_VARIANT);
+    report["save_version"] = serde_json::json!(SAVE_VERSION.trim());
+    report["blueprint_sha256"] = serde_json::json!(blueprint_sha256);
+    report["scope"] =
+        serde_json::json!("Dry authored network with reserved Sava crossings and facility sites.");
+    let report = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(stage.path.join(BUILD_REPORT))
+        .map_err(path_error)?;
+    file.write_all(&report)
+        .and_then(|()| file.sync_all())
+        .map_err(path_error)?;
+    drop(file);
+    stage.publish(&out).map_err(path_error)
+}
+
+fn snapshot_revision(
+    id: &SlotId,
+    sim: &Simulation,
+    inputs: &PinnedInputs,
+    plan: &TownPlan,
+    variant: &str,
+    save_version: &str,
+) -> Result<(SnapshotRevision, String), String> {
+    // The plan uses ordered collections and excludes runtime IDs.
+    let blueprint = serde_json::to_vec(plan).map_err(|error| error.to_string())?;
+    let mut sha = Command::new("sha256sum")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("start sha256sum for CITYMAP blueprint: {error}"))?;
+    let written = sha.stdin.take().unwrap().write_all(&blueprint);
+    let output = sha.wait_with_output().map_err(|error| error.to_string())?;
+    written.map_err(|error| error.to_string())?;
+    let blueprint_sha256 = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .filter(|digest| {
+            output.status.success()
+                && digest.len() == 64
+                && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
+        .ok_or("sha256sum failed to digest the CITYMAP blueprint")?
+        .to_owned();
+    // Lesce and Sava occupy fixed roles. The second pin may be absent.
+    let pins = serde_json::to_vec(&(
+        &inputs.lesce.provenance,
+        inputs.sava.as_ref().map(|extract| &extract.provenance),
+    ))
+    .map_err(|error| error.to_string())?;
+    let hashes = sim.hashes();
+    let revision_half = |salt: u8| {
+        let mut hasher = DefaultHasher::new();
+        (
+            salt,
+            id.as_str(),
+            variant,
+            save_version,
+            &pins,
+            &blueprint_sha256,
+            &hashes,
+        )
+            .hash(&mut hasher);
+        u128::from(hasher.finish())
+    };
+    let revision = SnapshotRevision::new(revision_half(0) << 64 | revision_half(1));
+    Ok((revision, blueprint_sha256))
+}
+
+fn require_absent_delivery(out: &Path) -> io::Result<()> {
+    let name = out.file_name().unwrap().as_encoded_bytes();
+    let entries = match fs::read_dir(out.parent().unwrap()) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if name.eq_ignore_ascii_case(entry.file_name().as_encoded_bytes()) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "delivery directory must be absent (found {})",
+                    entry.path().display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+struct DeliveryStage {
+    path: PathBuf,
+    committed: bool,
+}
+
+impl DeliveryStage {
+    fn new(parent: &Path) -> io::Result<Self> {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = parent.join(format!(".lesce_town-stage-{}-{stamp}", std::process::id()));
+        let mut builder = fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder.create(&path)?;
+        Ok(Self {
+            path,
+            committed: false,
+        })
+    }
+
+    fn publish(mut self, out: &Path) -> io::Result<()> {
+        File::open(&self.path)?.sync_all()?;
+        let parent = File::open(out.parent().unwrap())?;
+        // Serialize the case-insensitive sibling check among CITYMAP writers.
+        parent.lock()?;
+        require_absent_delivery(out)?;
+        rename_without_replacement(&self.path, out)?;
+        self.committed = true;
+        parent.sync_all().map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("delivery committed but parent directory sync failed: {error}"),
+            )
+        })
+    }
+}
+
+impl Drop for DeliveryStage {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn rename_without_replacement(from: &Path, to: &Path) -> io::Result<()> {
+    use std::ffi::{c_char, c_int, c_uint, CString};
+    use std::os::unix::ffi::OsStrExt;
+
+    unsafe extern "C" {
+        fn renameat2(
+            old_dir: c_int,
+            old_path: *const c_char,
+            new_dir: c_int,
+            new_path: *const c_char,
+            flags: c_uint,
+        ) -> c_int;
+    }
+
+    const AT_FDCWD: c_int = -100;
+    const RENAME_NOREPLACE: c_uint = 1;
+    let from = CString::new(from.as_os_str().as_bytes())?;
+    let to = CString::new(to.as_os_str().as_bytes())?;
+    // The paths remain live and NUL-terminated for the duration of the call.
+    match unsafe {
+        renameat2(
+            AT_FDCWD,
+            from.as_ptr(),
+            AT_FDCWD,
+            to.as_ptr(),
+            RENAME_NOREPLACE,
+        )
+    } {
+        0 => Ok(()),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rename_without_replacement(_from: &Path, _to: &Path) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "CITYMAP publication requires Linux no-replace directory rename",
+    ))
 }
 
 pub fn export_schematic(paths: SourcePaths<'_>, out: &Path) -> Result<(), String> {
@@ -251,7 +466,7 @@ use serde::Serialize;
 use simulation::map::{LaneKind, LightPolicy, Map};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[derive(Serialize)]
 struct Distribution {
@@ -1193,11 +1408,162 @@ mod tests {
     }
 
     fn pinned_inputs() -> PinnedInputs {
-        read_inputs(SourcePaths {
+        read_inputs(pinned_paths()).unwrap()
+    }
+
+    fn pinned_paths() -> SourcePaths<'static> {
+        SourcePaths {
             lesce: Path::new(DEFAULT_LESCE),
             sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap()
+        }
+    }
+
+    fn publication_fixture(test: &str, check: impl FnOnce(&Path) + std::panic::UnwindSafe) {
+        let scratch = std::env::temp_dir().join(format!("egr-cms-{}-{test}", std::process::id()));
+        fs::create_dir(&scratch).unwrap();
+        let result = std::panic::catch_unwind(|| check(&scratch));
+        fs::remove_dir_all(&scratch).unwrap();
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
+
+    #[test]
+    fn citymap_publication_preserves_existing_slot_and_replay() {
+        publication_fixture("existing", |scratch| {
+            let out = scratch.join("town");
+            fs::create_dir(&out).unwrap();
+            fs::write(out.join("Lesce_Town.zip"), b"existing ZIP").unwrap();
+            fs::write(out.join("Lesce_Town.replay"), b"existing replay").unwrap();
+            let result = export_dry_slot(pinned_paths(), &out);
+            assert!(fs::read(out.join("Lesce_Town.zip")).unwrap() == b"existing ZIP");
+            assert!(fs::read(out.join("Lesce_Town.replay")).unwrap() == b"existing replay");
+            assert!(result.is_err());
+            assert_eq!(fs::read_dir(&out).unwrap().count(), 2);
+        });
+    }
+
+    #[test]
+    fn citymap_publication_rejects_an_obstructed_report_before_exposing_a_slot() {
+        publication_fixture("report-dir", |scratch| {
+            let out = scratch.join("town");
+            fs::create_dir_all(out.join("lesce_town.build.json")).unwrap();
+            assert!(export_dry_slot(pinned_paths(), &out).is_err());
+            assert!(!out.join("lesce_town.zip").exists());
+            assert!(!out.join("lesce_town.meta.json").exists());
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn citymap_publication_leaves_report_symlink_targets_alone() {
+        publication_fixture("report-link", |scratch| {
+            let outside = scratch.join("outside.json");
+            fs::write(&outside, b"outside data").unwrap();
+            let out = scratch.join("town");
+            fs::create_dir(&out).unwrap();
+            std::os::unix::fs::symlink(&outside, out.join("lesce_town.build.json")).unwrap();
+            let result = export_dry_slot(pinned_paths(), &out);
+            assert!(fs::read(outside).unwrap() == b"outside data");
+            assert!(result.is_err());
+            assert!(!out.join("lesce_town.zip").exists());
+        });
+    }
+
+    #[test]
+    fn citymap_publication_rejects_a_case_equivalent_output_root() {
+        publication_fixture("case-root", |scratch| {
+            let out = scratch.join("town");
+            fs::create_dir(scratch.join("Town")).unwrap();
+            assert!(export_dry_slot(pinned_paths(), &out).is_err());
+            assert_eq!(fs::read_dir(scratch).unwrap().count(), 1);
+        });
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn citymap_publication_commit_preserves_an_empty_root_created_after_preflight() {
+        publication_fixture("late-root", |scratch| {
+            let out = scratch.join("town");
+            let stage = DeliveryStage::new(scratch).unwrap();
+            fs::write(stage.path.join(BUILD_REPORT), b"staged report").unwrap();
+            require_absent_delivery(&out).unwrap();
+            fs::create_dir(&out).unwrap();
+            let error = rename_without_replacement(&stage.path, &out).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(fs::read_dir(&out).unwrap().count(), 0);
+            assert!(stage.path.join(BUILD_REPORT).is_file());
+        });
+    }
+
+    #[test]
+    fn citymap_publication_exports_a_complete_deterministic_slot() {
+        publication_fixture("complete", |scratch| {
+            let out = scratch.join("town");
+            let duplicate = scratch.join("other town");
+            export_dry_slot(pinned_paths(), &out).unwrap();
+            export_dry_slot(pinned_paths(), &duplicate).unwrap();
+            assert_eq!(fs::read_dir(&out).unwrap().count(), 3);
+            assert_eq!(fs::read_dir(scratch).unwrap().count(), 2);
+            for name in ["lesce_town.zip", "lesce_town.build.json"] {
+                assert_eq!(
+                    fs::read(out.join(name)).unwrap(),
+                    fs::read(duplicate.join(name)).unwrap()
+                );
+            }
+            let report: serde_json::Value =
+                serde_json::from_slice(&fs::read(out.join("lesce_town.build.json")).unwrap())
+                    .unwrap();
+            assert_eq!(report["blueprint_sha256"].as_str().map(str::len), Some(64));
+            assert_eq!(
+                report["save_version"],
+                include_str!("../../../VERSION").trim()
+            );
+            let id = SlotId::new("lesce_town").unwrap();
+            let loaded = Simulation::load_from_slot(&out, &id).unwrap();
+            assert_eq!(loaded.get_tick(), 1);
+        });
+    }
+
+    #[test]
+    fn citymap_revision_changes_with_generation_identity_at_equal_state() {
+        let mut inputs = pinned_inputs();
+        let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let (sim, _) = build_dry_town(&plan).unwrap();
+        let id = SlotId::new("lesce_town").unwrap();
+        let revision = |inputs: &PinnedInputs, plan: &TownPlan, variant, version| {
+            snapshot_revision(&id, &sim, inputs, plan, variant, version)
+                .unwrap()
+                .0
+        };
+        let original = revision(&inputs, &plan, DRY_VARIANT, SAVE_VERSION);
+        assert_eq!(
+            original,
+            revision(&inputs, &plan, DRY_VARIANT, SAVE_VERSION)
+        );
+        assert_ne!(original, revision(&inputs, &plan, "wet", SAVE_VERSION));
+        assert_ne!(
+            original,
+            revision(&inputs, &plan, DRY_VARIANT, "other version")
+        );
+        let sava = inputs.sava.take().unwrap();
+        assert_ne!(
+            original,
+            revision(&inputs, &plan, DRY_VARIANT, SAVE_VERSION)
+        );
+        inputs.sava = Some(sava);
+        let digest = inputs.lesce.provenance.sha256;
+        inputs.lesce.provenance.sha256 = SAVA_SHA256;
+        assert_ne!(
+            original,
+            revision(&inputs, &plan, DRY_VARIANT, SAVE_VERSION)
+        );
+        inputs.lesce.provenance.sha256 = digest;
+        plan.districts[0].reservations[0].position.x += 1.0;
+        assert_ne!(
+            original,
+            revision(&inputs, &plan, DRY_VARIANT, SAVE_VERSION)
+        );
     }
 
     #[test]
@@ -1326,6 +1692,31 @@ mod tests {
                 "{offset:?} routes: {routes:?}"
             );
         }
+    }
+
+    #[test]
+    fn citymap_reframes_and_reloads_a_shifted_authored_town() {
+        let owned_min = vec2(768.0, 832.0);
+        let config = TownConfig {
+            map_chunks: 9,
+            owned_min,
+            owned_max: owned_min + Vec2::splat(3072.0),
+            ..TownConfig::default()
+        };
+        let plan = plan_town(&pinned_inputs(), config, SpacingLimits::default()).unwrap();
+        let (sim, built) = build_dry_town(&plan).unwrap();
+        let loaded = reload_fixture(&sim);
+        let map = loaded.map();
+        assert_eq!(map.environment().size(), (9, 9));
+        let resolved = resolve_network(&map, &plan.graph).unwrap();
+        assert_eq!(built.junctions, resolved.junctions);
+        validate_live(&map, &plan.graph, &resolved, plan.limits).unwrap();
+        assert!(route_checks(&map, &plan.graph, &resolved)
+            .values()
+            .all(|pass| *pass));
+        assert!(river_routes(&map, &plan, &resolved)
+            .values()
+            .all(|pass| *pass));
     }
 
     #[test]
