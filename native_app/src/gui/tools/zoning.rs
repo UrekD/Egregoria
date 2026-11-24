@@ -289,7 +289,7 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
     let pressed = input.just_act.contains(&InputAction::Select);
     let held = input.act.contains(&InputAction::Select);
     let map = sim.map();
-    let bounds = map.environment.bounds();
+    let bounds = map.environment().bounds();
     let pitch = state.pitch();
     let mut areas = std::mem::take(&mut state.preview_areas);
     areas.clear();
@@ -354,10 +354,26 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
     let grid = state
         .overlay_grid
         .get_or_insert_with(|| (world, Arc::new((*zones).clone())));
-    if grid.0 != world || grid.1.generation != zones.generation {
+    if grid.0 != world || grid.1.generation() != zones.generation() {
         *grid = (world, Arc::new((*zones).clone()));
     }
     let grid = grid.1.clone();
+    // The renderer uses the same rectangles for fill and projected lot votes.
+    // On a water map, turn the accepted storage cells into those rectangles.
+    let mut filtered = Vec::new();
+    let preview = if map.environment().has_water_configuration() {
+        for area in &areas {
+            if let Ok(stamp) = ZoneGrid::eligible_paint_cells(&map, area, state.kind) {
+                filtered.extend(stamp.cells().iter().map(|&(x, y)| {
+                    let center = (vec2(x as f32, y as f32) + Vec2::splat(0.5)) * ZONE_CELL_SIZE;
+                    OBB::new(center, Vec2::X, ZONE_CELL_SIZE, ZONE_CELL_SIZE)
+                }));
+            }
+        }
+        &filtered
+    } else {
+        &areas
+    };
     let warning = MapRenderer::queue_zoning_overlay(
         &map,
         grid,
@@ -365,7 +381,7 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         camera.camera.pos.xy(),
         camera.camera.dist,
         ZoningPreview {
-            areas: &areas,
+            areas: preview,
             pointer,
             hover_radius: if state.rectangle {
                 pitch

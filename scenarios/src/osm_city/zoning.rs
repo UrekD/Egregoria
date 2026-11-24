@@ -51,7 +51,7 @@ pub(super) fn zone_and_seed(
         match seeded {
             Some((home, shape)) => {
                 seeded_homes.push(home);
-                paint(sim, shape, ZoneKind::Residential, feature.density);
+                paint(sim, shape, ZoneKind::Residential, feature.density)?;
             }
             None => report.skipped.push((
                 feature.source.clone(),
@@ -92,10 +92,10 @@ pub(super) fn zone_and_seed(
                     Some(road),
                 )?;
                 growth::on_growable_placed(sim, id, kind);
-                paint(sim, shape, feature.kind, proto.density);
-                Some(id)
+                Some((id, shape))
             });
-            if id.is_some() {
+            if let Some((_, shape)) = id {
+                paint(sim, shape, feature.kind, proto.density)?;
                 mapped_jobs += proto.base.n_workers as usize;
                 *report
                     .feature_counts
@@ -114,7 +114,7 @@ pub(super) fn zone_and_seed(
         let Some(shape) = sim.map().lots().get(lot).map(|lot| lot.shape) else {
             continue;
         };
-        paint(sim, shape, feature.kind, feature.density);
+        paint(sim, shape, feature.kind, feature.density)?;
         *report
             .feature_counts
             .entry(format!("zoned_{:?}_{:?}_lots", feature.kind, feature.density).to_lowercase())
@@ -172,7 +172,7 @@ pub(super) fn zone_and_seed(
                     {
                         beds += sim.read::<Residences>().by_building[&id].capacity as usize;
                         seeded_homes.push(id);
-                        paint(sim, shape, ZoneKind::Residential, Density::Low);
+                        paint(sim, shape, ZoneKind::Residential, Density::Low)?;
                         inferred += 1;
                     }
                     break;
@@ -270,7 +270,6 @@ fn mapped_lots<'a>(
 ) -> Result<BTreeMap<LotID, &'a Feature>, String> {
     let net = map.electricity.net_id(plant);
     let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
-    let mut grid = ZoneGrid::default();
     let mut plans = BTreeMap::new();
     let mut work = PolygonWork::new("lot and polygon matching");
     for lot in map.lots().values() {
@@ -282,8 +281,10 @@ fn mapped_lots<'a>(
         {
             continue;
         }
-        grid.cells.clear();
-        grid.paint(lot.shape, Some(ZoneKind::Residential), Density::Low);
+        let Ok(cells) = ZoneGrid::bounded_paint_cells(&lot.shape, map.environment().bounds())
+        else {
+            continue;
+        };
         let mut best = None;
         for &(index, feature) in features.query(lot.shape.bbox()) {
             work.charge(1)?;
@@ -291,7 +292,7 @@ fn mapped_lots<'a>(
                 continue;
             }
             let mut samples = 0;
-            for &(x, y) in grid.cells.keys() {
+            for &(x, y) in &cells {
                 let p = (geom::vec2(x as f32, y as f32) + Vec2::splat(0.5)) * ZONE_CELL_SIZE;
                 samples += usize::from(work.contains(&feature.outers, &feature.holes, p)?);
             }
@@ -405,8 +406,11 @@ fn mapped_site(map: &Map, plant: BuildingID, ring: &[Vec2], center: Vec2) -> Opt
     Some((road, shape))
 }
 
-fn paint(sim: &Simulation, shape: OBB, kind: ZoneKind, density: Density) {
-    sim.write::<ZoneGrid>().paint(shape, Some(kind), density);
+fn paint(sim: &Simulation, shape: OBB, kind: ZoneKind, density: Density) -> Result<(), String> {
+    let map = sim.map();
+    sim.write::<ZoneGrid>()
+        .paint_on_map(&map, &shape, Some(kind), density)
+        .map_err(|error| format!("imported zoning stamp was rejected ({error:?})"))
 }
 
 fn seed_job(sim: &mut Simulation, id: LotID, kind: ZoneKind) -> Option<usize> {
@@ -423,7 +427,7 @@ fn seed_job(sim: &mut Simulation, id: LotID, kind: ZoneKind) -> Option<usize> {
     };
     let proto = try_prototype(GrowableCompanyID::from(building.as_goods_company()?))?;
     sim.seed_imported_growable(id, building, density)?;
-    paint(sim, shape, kind, density);
+    paint(sim, shape, kind, density).ok()?;
     Some(proto.base.n_workers as usize)
 }
 
@@ -531,7 +535,7 @@ pub(super) fn filter_vegetation(sim: &Simulation, city: &NormalizedCity) -> Resu
             return Ok(true);
         }
         let cell = |coordinate: f32| (coordinate / ZONE_CELL_SIZE).floor() as i32;
-        if grid.cells.contains_key(&(cell(p.x), cell(p.y))) {
+        if grid.cells().contains_key(&(cell(p.x), cell(p.y))) {
             return Ok(false);
         }
         for &(_, feature) in built.query(point_bounds(p)) {

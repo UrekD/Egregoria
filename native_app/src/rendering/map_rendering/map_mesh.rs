@@ -1211,7 +1211,9 @@ impl MapMeshHandler {
         Self {
             builders,
             cache: Default::default(),
-            road_sub: sim.map().subscribe(UpdateType::Road),
+            road_sub: sim
+                .map()
+                .subscribe(UpdateType::Road | UpdateType::RoadSupport),
             building_sub: sim.map().subscribe(UpdateType::Building),
             map_version: None,
             rebuilt_version: None,

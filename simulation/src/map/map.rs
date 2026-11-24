@@ -3,14 +3,16 @@ use crate::map::height_override::find_overrides;
 use crate::map::procgen::gen_exterior_house;
 use crate::map::reachability::DrivingReachability;
 use crate::map::{
-    Building, BuildingID, BuildingKind, Environment, Intersection, IntersectionID, Lane, LaneID,
-    LaneKind, LanePattern, Lot, LotID, LotKind, LotLayout, MapSubscriber, MapSubscribers,
-    ParkingSpotID, ParkingSpots, ProjectFilter, ProjectKind, Road, RoadID, RoadSegmentKind,
-    SpatialMap, SubscriberChunkID, TerraformKind, UpdateType, WaterEdit, WaterEditError,
-    WaterEditOutcome, Zone, ROAD_Z_OFFSET,
+    Building, BuildingID, BuildingKind, CanonicalPosition, Environment, Intersection,
+    IntersectionID, Lane, LaneID, LaneKind, LanePattern, Lot, LotID, LotKind, LotLayout,
+    MapSubscriber, MapSubscribers, ParkingSpotID, ParkingSpots, PreparedWaterEdit, ProjectFilter,
+    ProjectKind, Road, RoadID, RoadSegmentKind, SpatialMap, SubscriberChunkID, TerraformKind,
+    TerrainChunkID, UpdateType, WaterDirtyChunks, WaterEdit, WaterEditError, WaterEditOutcome,
+    WaterFootprint, WaterTileCoord, Zone, ZoneGrid, ROAD_Z_OFFSET,
 };
+use flat_spatial::grid::GridHandle;
 use geom::OBB;
-use geom::{PolyLine3, Vec2, Vec3};
+use geom::{Intersect, PolyLine3, Vec2, Vec3, AABB};
 use ordered_float::OrderedFloat;
 use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
@@ -84,7 +86,29 @@ pub struct Map {
     pub environment: Environment,
     pub parking: ParkingSpots,
     pub subscribers: MapSubscribers,
-    pub(crate) override_subscriber: MapSubscriber,
+    pub(crate) pending_construction_cuts: BTreeSet<TerrainChunkID>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WaterEditPreview {
+    pub changed: bool,
+    pub dirty: WaterDirtyChunks,
+    pub strict_before: bool,
+    pub strict_after: bool,
+    pub proposed_surface_dm: Option<i16>,
+    pub candidate_extent: Option<AABB>,
+}
+
+struct WaterEditEffects {
+    wet_lots: BTreeSet<ProjectKind>,
+    covered_zones: Vec<super::ZoneCellCoord>,
+    wet_trees: Vec<(
+        TerrainChunkID,
+        OrderedFloat<f32>,
+        OrderedFloat<f32>,
+        GridHandle,
+    )>,
+    dirty: WaterDirtyChunks,
 }
 
 impl Default for Map {
@@ -123,6 +147,7 @@ impl Clone for Map {
             import_lane_reserve: self.import_lane_reserve,
             lot_layout: self.lot_layout,
             no_frontage: self.no_frontage.clone(),
+            pending_construction_cuts: self.pending_construction_cuts.clone(),
             electricity: self.electricity.clone(),
             environment: self.environment.clone(),
             parking: self.parking.clone(),
@@ -135,7 +160,6 @@ impl Map {
     // Public API
     pub fn empty() -> Self {
         static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
-        let subscribers = MapSubscribers::default();
         Self {
             roads: Roads::default(),
             lanes: Lanes::default(),
@@ -156,8 +180,8 @@ impl Map {
             lot_layout: LotLayout::default(),
             no_frontage: BTreeSet::new(),
             electricity: Default::default(),
-            override_subscriber: subscribers.subscribe(UpdateType::Road | UpdateType::Building),
-            subscribers,
+            pending_construction_cuts: BTreeSet::new(),
+            subscribers: MapSubscribers::default(),
         }
     }
 
@@ -165,11 +189,31 @@ impl Map {
         self.identity
     }
 
+    pub fn environment(&self) -> &Environment {
+        &self.environment
+    }
+
+    pub(crate) fn install_environment(&mut self, environment: Environment) -> bool {
+        if self.environment.size() != (0, 0)
+            || self.environment.has_water_configuration()
+            || self.spatial_map.objects().next().is_some()
+        {
+            return false;
+        }
+        self.environment = environment;
+        true
+    }
+
     /// Perform cleanups potentially required every frame
     pub fn update(&mut self) {
         profiling::scope!("map::update");
-        for chunk in self.override_subscriber.take_updated_chunks() {
-            find_overrides(self, chunk);
+        let buckets: BTreeSet<SubscriberChunkID> =
+            std::mem::take(&mut self.pending_construction_cuts)
+                .into_iter()
+                .map(TerrainChunkID::convert_up)
+                .collect();
+        for bucket in buckets {
+            find_overrides(self, bucket);
         }
     }
 
@@ -195,6 +239,11 @@ impl Map {
     fn remove_intersection_inner(&mut self, src: IntersectionID) {
         let inter = unwrap_ret!(self.intersections.remove(src));
         self.lane_topology_changed();
+        queue_construction_cut(
+            &mut self.pending_construction_cuts,
+            &self.environment,
+            &inter,
+        );
         self.subscribers.dispatch(UpdateType::Road, &inter);
 
         for road in inter.roads {
@@ -209,22 +258,15 @@ impl Map {
     }
 
     pub fn dispatch_all(&self) {
-        self.subscribers.dispatch_clear();
-        let bounds = self.environment.bounds();
-        let ll = SubscriberChunkID::new(bounds.ll);
-        let ur = SubscriberChunkID::new(bounds.ur);
-        for x in ll.0..ur.0 {
-            for y in ll.0..ur.0 {
-                self.subscribers
-                    .dispatch_all(std::iter::once(SubscriberChunkID::new_i16(x, y)))
-            }
-        }
+        self.subscribers
+            .dispatch_all_terrain(self.environment.chunks().map(|(id, _)| id));
     }
 
     pub fn remove_building(&mut self, b: BuildingID) -> Option<Building> {
         info!("remove_building {:?}", b);
 
         let b = self.buildings.remove(b)?;
+        queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &b);
         self.subscribers.dispatch(UpdateType::Building, &b);
 
         if b.kind == BuildingKind::ExternalTrading {
@@ -239,7 +281,9 @@ impl Map {
         self.spatial_map.remove(b.id);
 
         if let Some(origin) = self.lot_origins.remove(&b.id) {
-            Lot::try_restore(self, origin);
+            if Building::dry_footprint(&self.environment, &origin.shape, None) {
+                Lot::try_restore(self, origin);
+            }
         }
         self.check_invariants();
 
@@ -276,9 +320,10 @@ impl Map {
         original: RoadID,
         pos: Vec3,
         splits: &BTreeMap<RoadID, RoadSplit>,
-    ) -> Option<ConnectionEndpoint> {
+        mut water_work: Option<&mut usize>,
+    ) -> Result<Option<ConnectionEndpoint>, WaterEditError> {
         if !pos.is_finite() {
-            return None;
+            return Ok(None);
         }
         let mut best = None;
         let mut remaining = vec![original];
@@ -295,6 +340,10 @@ impl Map {
             }
         };
         while let Some(id) = remaining.pop() {
+            if let Some(work) = water_work.as_deref_mut() {
+                let points = self.get(id).map_or(0, |road| road.points().len());
+                spend_water_work(work, 1 + points)?;
+            }
             if let Some(split) = splits.get(&id) {
                 remaining.extend(split.roads);
                 if let Some(junction) = self.get(split.junction) {
@@ -318,7 +367,7 @@ impl Map {
                 }
             }
         }
-        best.map(|(_, endpoint)| endpoint)
+        Ok(best.map(|(_, endpoint)| endpoint))
     }
 
     pub(crate) fn can_connect(
@@ -378,7 +427,73 @@ impl Map {
         if !Self::can_connect(from, to, interpoint, pattern) {
             return None;
         }
+        if self.environment.has_water_configuration() {
+            let mut work = super::MAX_WATER_BATCH_WORK;
+            self.preflight_water_connection(from, to, interpoint, pattern, &mut work)
+                .ok()?;
+        }
         Some(self.make_resolved_connection(from, to, interpoint, pattern))
+    }
+
+    /// Conservative gate for the legacy profiler. W2a will replace the dry
+    /// envelope with its staged deck and junction geometry.
+    pub(crate) fn preflight_water_connection(
+        &self,
+        from: ConnectionEndpoint,
+        to: ConnectionEndpoint,
+        elbow: Option<Vec2>,
+        pattern: &LanePattern,
+        remaining: &mut usize,
+    ) -> Result<(), WaterEditError> {
+        let map_bounds = self.environment.bounds();
+        let a = from.pos.xy();
+        let b = to.pos.xy();
+        let mut bounds = AABB::new_ll_ur(a.min(b), a.max(b));
+        let mut length = a.distance(b);
+        if let Some(elbow) = elbow {
+            if !map_bounds.contains(elbow) {
+                return Err(WaterEditError::OutOfBounds);
+            }
+            bounds = bounds.union(AABB::new_ll_ur(elbow, elbow));
+            length = a.distance(elbow) + elbow.distance(b);
+        }
+        if !map_bounds.contains(a) || !map_bounds.contains(b) {
+            return Err(WaterEditError::OutOfBounds);
+        }
+        let radius = pattern.width() + 16.0;
+        let envelope = bounds.expand(radius);
+        let clipped = envelope.intersection(map_bounds);
+        let min = (clipped.ll / super::terrain::CELL_SIZE).floor();
+        let max = (clipped.ur / super::terrain::CELL_SIZE).ceil();
+        let tests = (max.x - min.x) as usize * (max.y - min.y) as usize;
+        if tests > 2_000_000 || length > 65_536.0 {
+            return Err(WaterEditError::Limit);
+        }
+        spend_water_work(remaining, tests + length.ceil() as usize)?;
+        let footprint = if elbow.is_some() {
+            geom::Polygon(envelope.points().to_vec())
+        } else {
+            geom::Polygon(
+                OBB::new((a + b) * 0.5, (b - a).normalize(), length + radius * 2.0, radius * 2.0)
+                    .corners
+                    .to_vec(),
+            )
+        };
+        let shape = WaterFootprint::new(footprint.as_slice()).ok_or(WaterEditError::InvalidInput)?;
+        if self.environment.strict_water_siting() {
+            for x in min.x as i16..max.x as i16 {
+                for y in min.y as i16..max.y as i16 {
+                    let tile = WaterTileCoord(x, y);
+                    if self.environment.is_water(tile.center()) && shape.overlaps_tile(tile) {
+                        return Err(WaterEditError::TopologyConflict {
+                            object: ProjectKind::Ground,
+                            tile,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn make_resolved_connection(
@@ -455,7 +570,11 @@ impl Map {
     pub fn update_zone(&mut self, id: BuildingID, zone: Zone) -> Option<()> {
         let zone = zone.normalized()?;
         let b = self.buildings.get_mut(id)?;
+        if !Building::dry_footprint(&self.environment, &b.obb, Some(&zone)) {
+            return None;
+        }
         *b.zone.as_mut()? = zone;
+        queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, b);
         self.subscribers.dispatch(UpdateType::Building, b);
 
         let z = b.zone.as_ref().unwrap();
@@ -525,6 +644,11 @@ impl Map {
                     .dispatch_chunk(UpdateType::Terrain, tree_chunk)
             });
 
+        queue_construction_cut(
+            &mut self.pending_construction_cuts,
+            &self.environment,
+            &self.buildings[id],
+        );
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
 
@@ -591,6 +715,11 @@ impl Map {
             mesh.faces.push(walkway);
         }
         building.mesh = mesh;
+        queue_construction_cut(
+            &mut self.pending_construction_cuts,
+            &self.environment,
+            building,
+        );
         self.subscribers.dispatch(UpdateType::Building, building);
     }
 
@@ -618,6 +747,11 @@ impl Map {
         let lot = self.lots.remove(lot_id).expect("building lot still exists");
         self.subscribers.dispatch(UpdateType::Road, &lot);
         self.spatial_map.remove(lot_id);
+        queue_construction_cut(
+            &mut self.pending_construction_cuts,
+            &self.environment,
+            &self.buildings[id],
+        );
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
         self.lot_origins.insert(
@@ -662,6 +796,11 @@ impl Map {
 
     fn remove_road_inner(&mut self, road_id: RoadID) -> Option<Road> {
         let road = self.remove_raw_road(road_id)?;
+        queue_construction_cut(
+            &mut self.pending_construction_cuts,
+            &self.environment,
+            &road,
+        );
         self.subscribers.dispatch(UpdateType::Road, &road);
 
         for (id, _) in road.lanes_iter() {
@@ -742,7 +881,7 @@ impl Map {
         }
     }
 
-    pub fn terraform(
+    pub(crate) fn terraform(
         &mut self,
         tick: Tick,
         kind: TerraformKind,
@@ -761,14 +900,164 @@ impl Map {
         }
     }
 
+    pub(crate) fn preview_water_edit(
+        &self,
+        edit: &WaterEdit,
+        zones: &ZoneGrid,
+    ) -> Result<WaterEditPreview, WaterEditError> {
+        let prepared = self.environment.prepare_water_edit(edit)?;
+        let mut remaining = super::MAX_WATER_BATCH_WORK;
+        let effects = self.prepare_water_effects(&prepared, zones, &mut remaining)?;
+        Ok(WaterEditPreview {
+            changed: prepared.changed(),
+            dirty: prepared.dirty().clone().union(effects.dirty),
+            strict_before: self.environment.strict_water_siting(),
+            strict_after: prepared.strict_water_siting(),
+            proposed_surface_dm: prepared.proposed_surface_dm(),
+            candidate_extent: prepared
+                .dirty()
+                .road_support()
+                .iter()
+                .map(|chunk| chunk.bbox())
+                .reduce(AABB::union),
+        })
+    }
+
     pub(crate) fn apply_water_edit(
         &mut self,
         edit: &WaterEdit,
+        zones: &mut ZoneGrid,
+        remaining: &mut usize,
     ) -> Result<WaterEditOutcome, WaterEditError> {
         let prepared = self.environment.prepare_water_edit(edit)?;
-        let outcome = self.environment.commit_prepared_water(prepared)?;
+        self.commit_water_edit(prepared, zones, remaining)
+    }
+
+    pub(crate) fn commit_water_edit(
+        &mut self,
+        prepared: PreparedWaterEdit,
+        zones: &mut ZoneGrid,
+        remaining: &mut usize,
+    ) -> Result<WaterEditOutcome, WaterEditError> {
+        let effects = self.prepare_water_effects(&prepared, zones, remaining)?;
+        let mut outcome = self.environment.commit_prepared_water(prepared)?;
+        self.clean_lots_inner(effects.wet_lots.into_iter().collect());
+        zones.clear_prepared_cells(effects.covered_zones);
+        for (_, _, _, tree) in effects.wet_trees {
+            self.environment.trees.remove_maintain(tree);
+        }
+        outcome.dirty = outcome.dirty.union(effects.dirty);
         self.subscribers.dispatch_water(&outcome.dirty);
         Ok(outcome)
+    }
+
+    fn prepare_water_effects(
+        &self,
+        prepared: &PreparedWaterEdit,
+        zones: &ZoneGrid,
+        remaining: &mut usize,
+    ) -> Result<WaterEditEffects, WaterEditError> {
+        spend_water_work(remaining, prepared.work())?;
+        let mut effects = WaterEditEffects {
+            wet_lots: BTreeSet::new(),
+            covered_zones: Vec::new(),
+            wet_trees: Vec::new(),
+            dirty: WaterDirtyChunks::default(),
+        };
+        let mut road_support = BTreeSet::new();
+
+        let mut candidates = BTreeMap::new();
+        for &chunk in prepared.dirty().road_support() {
+            let mut objects = BTreeSet::new();
+            for object in self
+                .spatial_map
+                .construction_candidates(chunk.bbox(), ProjectFilter::ALL)
+            {
+                spend_water_work(remaining, 1)?;
+                objects.insert(object);
+                if matches!(object, ProjectKind::Road(_) | ProjectKind::Intersection(_)) {
+                    let bucket = TerrainChunkID::new(object.canonical_position(self));
+                    if self.environment.get_chunk(bucket).is_some() {
+                        road_support.insert(bucket);
+                    }
+                }
+            }
+            if !objects.is_empty() {
+                candidates.insert(chunk, objects);
+            }
+        }
+        for tile in prepared.affected_tiles() {
+            let Some(objects) = candidates.get(&tile.chunk()) else {
+                continue;
+            };
+            if prepared.water_at_tile(&self.environment, tile).is_none() {
+                continue;
+            }
+            let bounds = water_tile_bounds(tile);
+            for &object in objects {
+                spend_water_work(remaining, 1)?;
+                let mut overlaps = |points: &[Vec2]| -> Result<bool, WaterEditError> {
+                    spend_water_work(remaining, points.len())?;
+                    Ok(WaterFootprint::new(points).is_some_and(|shape| shape.overlaps_tile(tile)))
+                };
+                match object {
+                    ProjectKind::Building(id) => {
+                        let building = &self.buildings[id];
+                        if overlaps(&building.obb.corners)?
+                            || building
+                                .zone
+                                .as_ref()
+                                .map(|zone| overlaps(zone.poly.as_slice()))
+                                .transpose()?
+                                .unwrap_or(false)
+                        {
+                            return Err(WaterEditError::OccupiedFootprint { object, tile });
+                        }
+                    }
+                    // The crossing leaf replaces this conservative check with final deck,
+                    // junction and underside clearance checks.
+                    ProjectKind::Road(id) => {
+                        let road = &self.roads[id];
+                        spend_water_work(remaining, road.points().len())?;
+                        if road.boldline().intersects(&bounds) {
+                            return Err(WaterEditError::TopologyConflict { object, tile });
+                        }
+                    }
+                    ProjectKind::Intersection(id)
+                        if self.intersections[id].bcircle().intersects(&bounds) =>
+                    {
+                        return Err(WaterEditError::TopologyConflict { object, tile });
+                    }
+                    ProjectKind::Lot(id) if overlaps(&self.lots[id].shape.corners)? => {
+                        effects.wet_lots.insert(object);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        effects.covered_zones = zones.newly_wet_cells(&self.environment, prepared, remaining)?;
+        let mut terrain = BTreeSet::new();
+        for &chunk in prepared.dirty().water() {
+            let bounds = chunk.bbox();
+            for (handle, position) in self.environment.trees.query_aabb(bounds.ll, bounds.ur) {
+                spend_water_work(remaining, 1)?;
+                if TerrainChunkID::new(position) == chunk
+                    && prepared.water_at(&self.environment, position).is_some()
+                    && !self.environment.is_water(position)
+                {
+                    terrain.insert(chunk);
+                    effects.wet_trees.push((
+                        chunk,
+                        OrderedFloat(position.y),
+                        OrderedFloat(position.x),
+                        handle,
+                    ));
+                }
+            }
+        }
+        effects.wet_trees.sort_unstable();
+        effects.dirty = WaterDirtyChunks::new(BTreeSet::new(), terrain, road_support);
+        Ok(effects)
     }
 
     // Private mutating
@@ -780,6 +1069,11 @@ impl Map {
 
     pub(crate) fn add_intersection(&mut self, pos: Vec3) -> IntersectionID {
         let id = Intersection::make(&mut self.intersections, &mut self.spatial_map, pos);
+        queue_construction_cut(
+            &mut self.pending_construction_cuts,
+            &self.environment,
+            &self.intersections[id],
+        );
         self.subscribers
             .dispatch(UpdateType::Building, &self.intersections[id]);
         self.electricity.add_object(id);
@@ -810,6 +1104,7 @@ impl Map {
             let road = &mut self.roads[id];
             Self::reserve_import_lane(road);
             road.update_lanes(&mut self.lanes, &mut self.parking, &self.environment);
+            queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, road);
             self.subscribers.dispatch(UpdateType::Road, road);
         }
         for &id in junctions {
@@ -817,6 +1112,11 @@ impl Map {
             junction.update_traffic_control(&mut self.lanes, &self.roads);
             junction.update_turns(&self.lanes, &self.roads);
             self.spatial_map.update(junction);
+            queue_construction_cut(
+                &mut self.pending_construction_cuts,
+                &self.environment,
+                junction,
+            );
             self.subscribers.dispatch(UpdateType::Road, junction);
         }
     }
@@ -829,6 +1129,11 @@ impl Map {
         }
         self.lane_topology_changed();
         let inter = &mut self.intersections[id];
+        queue_construction_cut(
+            &mut self.pending_construction_cuts,
+            &self.environment,
+            inter,
+        );
         self.subscribers.dispatch(UpdateType::Road, inter);
 
         if inter.roads.is_empty() {
@@ -852,6 +1157,7 @@ impl Map {
                 self.roads.get(x),
                 "intersection has unexisting road in list"
             );
+            queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, road);
             self.subscribers.dispatch(UpdateType::Road, road);
 
             let oend_id = unwrap_cont!(road.other_end(id));
@@ -909,6 +1215,11 @@ impl Map {
             let changed =
                 old_interfaces != (road.interface_from(road.src), road.interface_from(road.dst));
             if changed || direct.contains(&road_id) {
+                queue_construction_cut(
+                    &mut self.pending_construction_cuts,
+                    &self.environment,
+                    road,
+                );
                 self.subscribers.dispatch(UpdateType::Road, road);
                 road.update_lanes(&mut self.lanes, &mut self.parking, &self.environment);
             }
@@ -923,6 +1234,11 @@ impl Map {
             }
             inter.update_turns(&self.lanes, &self.roads);
             self.spatial_map.update(inter);
+            queue_construction_cut(
+                &mut self.pending_construction_cuts,
+                &self.environment,
+                inter,
+            );
             self.subscribers.dispatch(UpdateType::Road, inter);
         }
     }
@@ -961,6 +1277,7 @@ impl Map {
 
         let pat = self.roads.get(split_road_id)?.pattern(&self.lanes);
         let r = self.remove_raw_road(split_road_id)?;
+        queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &r);
         self.subscribers.dispatch(UpdateType::Road, &r);
 
         for (id, _) in r.lanes_iter() {
@@ -1116,7 +1433,9 @@ impl Map {
 
         self.remove_intersection_inner(same_inter);
 
+        queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &r1);
         self.subscribers.dispatch(UpdateType::Road, &r1);
+        queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &r2);
         self.subscribers.dispatch(UpdateType::Road, &r2);
 
         for (id, _) in r2.lanes_iter().chain(r1.lanes_iter()) {
@@ -1563,6 +1882,31 @@ impl Map {
 
         log::info!("invariants checked");
     }
+}
+
+pub(crate) fn spend_water_work(remaining: &mut usize, units: usize) -> Result<(), WaterEditError> {
+    if units > *remaining {
+        *remaining = 0;
+        Err(WaterEditError::Limit)
+    } else {
+        *remaining -= units;
+        Ok(())
+    }
+}
+
+fn queue_construction_cut(
+    pending: &mut BTreeSet<TerrainChunkID>,
+    environment: &Environment,
+    object: &impl CanonicalPosition,
+) {
+    let chunk = TerrainChunkID::new(object.canonical_position());
+    if environment.get_chunk(chunk).is_some() {
+        pending.insert(chunk);
+    }
+}
+
+fn water_tile_bounds(tile: WaterTileCoord) -> AABB {
+    AABB::new_ll_size(tile.corner(), Vec2::splat(super::terrain::CELL_SIZE))
 }
 
 impl MapProject {

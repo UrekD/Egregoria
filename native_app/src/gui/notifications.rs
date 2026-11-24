@@ -631,6 +631,7 @@ fn command_label(command: &str) -> &'static str {
         "MapRemoveBuilding" => "Demolish building",
         "MapBuildHouse" => "Build house",
         "Terraform" => "Edit terrain",
+        "EditWater" => "Edit water",
         "SendMessage" => "Send message",
         "SpawnRandomCars" => "Spawn cars",
         "AddTrain" | "SpawnTrain" => "Place train",
@@ -687,6 +688,11 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         (_, Locked { .. }) => "Locked by city progression",
         (_, InvalidWarehouse) => "Choose an active warehouse",
         (_, WaterEditFailed) => "The water edit could not be applied",
+        (_, WetFootprint) => "Choose a dry footprint",
+        (_, TileLocked) => "Part of the zone is on locked land",
+        (_, WaterWorkLimit) => "The batch exceeds the water work limit",
+        (_, WaterConfigured) => "This map already has configured water",
+        (_, WaterTerrainConflict) => "The terrain edit conflicts with water or nearby structures",
     };
     message.into()
 }

@@ -152,7 +152,10 @@ pub fn generate_with_options(
             ),
             ("lots".into(), map.lots().len()),
             ("buildings".into(), map.buildings().len()),
-            ("zone_cells".into(), ctx.sim.read::<ZoneGrid>().cells.len()),
+            (
+                "zone_cells".into(),
+                ctx.sim.read::<ZoneGrid>().cells().len(),
+            ),
         ]);
     }
 

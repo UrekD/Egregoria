@@ -222,6 +222,7 @@ pub fn check_growable_lot(
     }
     let (kind, home, generator) = growable_that_fits(lot, cell)?;
     if !Building::valid_footprint(&lot.shape, generator)
+        || !Building::dry_footprint(map.environment(), &lot.shape, None)
         || Lot::footprint_obstructed(map, lot.shape, false)
     {
         return Err(GrowableLotError::Obstructed);

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::Budget;
-use crate::map::{Building, BuildingID, BuildingKind};
+use crate::map::{Building, BuildingID, BuildingKind, Map};
 use crate::map_dynamic::{BuildingInfos, CoverageGrid, UtilityFlow};
 use crate::souls::residence::Residences;
 use crate::{Simulation, SoulID};
@@ -149,11 +149,26 @@ pub fn env_update(sim: &mut Simulation) {
         } else {
             0.0
         };
-        let pollution = env.pollution_at(building.obb.center());
-        let land_value = BASE_LAND_VALUE + coverage_bonus + utilities_bonus - pollution / 2.0;
+        let center = building.obb.center();
+        let pollution = env.pollution_at(center);
+        let land_value = BASE_LAND_VALUE
+            + coverage_bonus
+            + utilities_bonus
+            + shoreline_value_bonus(&map, center)
+            - pollution / 2.0;
         env.by_building
             .insert(id, land_value.clamp(0.0, 100.0) as u8);
     }
+}
+
+pub fn shoreline_value_bonus(map: &Map, position: Vec2) -> f32 {
+    let environment = map.environment();
+    if !environment.strict_water_siting() || !environment.has_water_configuration() {
+        return 0.0;
+    }
+    environment
+        .shoreline_distance(position, 96.0)
+        .map_or(0.0, |distance| 10.0 * (1.0 - distance / 96.0))
 }
 
 fn has_land_value(building: &Building) -> bool {

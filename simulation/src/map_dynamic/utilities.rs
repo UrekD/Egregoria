@@ -23,6 +23,8 @@ pub struct UtilityFlow {
     sampled_generation: Option<u64>,
     #[serde(skip)]
     sampled_members: BTreeMap<ElectricityNetworkID, BTreeSet<NetworkObjectID>>,
+    #[serde(skip)]
+    pub(crate) sampled_water_revision: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -144,6 +146,10 @@ pub fn city_field_tick(sim: &Simulation) -> u64 {
 }
 
 impl UtilityFlow {
+    pub fn water_pending(&self, map: &Map) -> bool {
+        self.sampled_water_revision != map.environment().water_revision()
+    }
+
     pub(crate) const UPDATE_OFFSET: u64 = 1;
 
     pub fn topology_revision(map: &Map) -> u64 {
@@ -282,6 +288,7 @@ pub fn utility_flow_update(sim: &mut Simulation) {
     let infos = sim.read::<BuildingInfos>();
     let residences = sim.read::<Residences>();
     let mut flow = sim.write::<UtilityFlow>();
+    flow.sampled_water_revision = map.environment().water_revision();
     let generation = map.electricity.generation();
     let topology_changed = flow.sampled_generation != Some(generation);
     if topology_changed {

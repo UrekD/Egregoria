@@ -3,12 +3,15 @@
 #![warn(clippy::iter_over_hash_type)]
 
 use crate::init::{GSYSTEMS, INIT_FUNCS, SAVELOAD_FUNCS};
-use crate::map::{BuildingKind, LotLayout, Map, WaterEdit, WaterEditError, WaterEditOutcome};
+use crate::map::{
+    BuildingKind, LotLayout, Map, WaterBasin, WaterBodyId, WaterEdit, WaterEditError,
+    WaterEditOutcome, WaterEditPreview, WaterStroke,
+};
 use crate::map_dynamic::{transit, Itinerary, ItineraryLeader};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
-use crate::world_command::{CommandOutcomes, WorldCommand};
+use crate::world_command::{CommandOutcomes, Rejection, WaterBatch, WorldCommand};
 use common::saveload::{
     self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry, SlotMeta,
     SnapshotKind,
@@ -17,7 +20,7 @@ use common::FastMap;
 use derive_more::{From, TryInto};
 use economy::progression::ProgressionMode;
 use economy::BudgetCategory;
-use geom::Vec3;
+use geom::{Polygon, Vec2, Vec3};
 use prototypes::{prototype, ColorsPrototype, ColorsPrototypeID, GameTime, Tick};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::any::Any;
@@ -129,6 +132,7 @@ pub enum MapPreset {
     #[default]
     Procedural,
     Flat,
+    Waters,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -168,6 +172,7 @@ impl NewGameOptions {
 pub enum NewGameError {
     TerrainChunks(u16),
     StartingMoneyBucks(u32),
+    Bootstrap(Rejection),
 }
 
 impl Display for NewGameError {
@@ -185,6 +190,7 @@ impl Display for NewGameError {
                 NewGameOptions::MIN_STARTING_MONEY_BUCKS,
                 NewGameOptions::MAX_STARTING_MONEY_BUCKS
             ),
+            Self::Bootstrap(reason) => write!(f, "Could not initialize the map ({reason:?})"),
         }
     }
 }
@@ -288,7 +294,7 @@ impl Simulation {
         save_replay: bool,
     ) -> Result<Self, NewGameError> {
         options.validate()?;
-        Ok(Self::new_with_lot_layout(
+        Self::new_with_lot_layout(
             SimulationOptions {
                 terrain_size: options.terrain_chunks,
                 save_replay,
@@ -298,9 +304,29 @@ impl Simulation {
                 progression: options.progression,
             },
             options.lot_layout,
-        ))
+        )
+        .map_err(NewGameError::Bootstrap)
     }
 
+    /// Creates a blank, replay-disabled Flat world for an authored layout.
+    pub fn new_authored_flat(terrain_chunks: u16, seed: u64) -> Result<Self, NewGameError> {
+        if !(1..=NewGameOptions::MAX_TERRAIN_CHUNKS).contains(&terrain_chunks) {
+            return Err(NewGameError::TerrainChunks(terrain_chunks));
+        }
+        let mut sim = Self::with_initial_resources();
+        WorldCommand::bootstrap_authored(
+            &mut sim,
+            SimulationOptions {
+                terrain_size: terrain_chunks,
+                save_replay: false,
+                preset: MapPreset::Flat,
+                seed,
+                ..SimulationOptions::LEGACY
+            },
+        )
+        .map_err(NewGameError::Bootstrap)?;
+        Ok(sim)
+    }
     /// Creates a simulation and loader for a replay from the current version.
     ///
     /// # Panics
@@ -319,25 +345,27 @@ impl Simulation {
         }
         let options = replay.bootstrap_options()?;
         let bootstrap_end = replay.bootstrap_end()?;
-        let mut sim = Simulation {
-            world: Default::default(),
-            resources: Default::default(),
-        };
-
-        unsafe {
-            for s in &*addr_of!(INIT_FUNCS) {
-                (s.f)(&mut sim);
-            }
-        }
+        let mut sim = Self::with_initial_resources();
 
         WorldCommand::bootstrap(&mut sim, options).map_err(|reason| {
-            io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {reason:?}"))
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Replay Init: {reason:?}"),
+            )
         })?;
         sim.apply_command_batch(
             replay.commands(1..bootstrap_end),
             false,
             BudgetCategory::StarterInfrastructure,
         );
+        if options.preset == MapPreset::Waters {
+            sim.check_waters_starters().map_err(|reason| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Replay starters: {reason:?}"),
+                )
+            })?;
+        }
         if replay.has_timeline() {
             sim.record_constructor_end();
         }
@@ -347,9 +375,10 @@ impl Simulation {
 
     pub fn new_with_options(opts: SimulationOptions) -> Simulation {
         Self::new_with_lot_layout(opts, LotLayout::Varied)
+            .expect("invalid simulation bootstrap options")
     }
 
-    fn new_with_lot_layout(opts: SimulationOptions, lot_layout: LotLayout) -> Simulation {
+    fn with_initial_resources() -> Self {
         let mut sim = Simulation {
             world: Default::default(),
             resources: Default::default(),
@@ -360,16 +389,23 @@ impl Simulation {
                 (s.f)(&mut sim);
             }
         }
+        sim
+    }
 
+    fn new_with_lot_layout(
+        opts: SimulationOptions,
+        lot_layout: LotLayout,
+    ) -> Result<Self, Rejection> {
+        let mut sim = Self::with_initial_resources();
         let mut start_commands: Vec<(u32, WorldCommand)> =
             common::saveload::JSON::decode(START_COMMANDS.as_bytes()).unwrap();
-        WorldCommand::bootstrap(&mut sim, opts).expect("invalid simulation bootstrap options");
+        WorldCommand::bootstrap(&mut sim, opts)?;
         {
             let map = sim.map();
             for (_, command) in &mut start_commands {
                 if let WorldCommand::MapMakeMultipleConnections(projects, _) = command {
                     for project in projects.iter_mut().filter(|project| project.is_ground()) {
-                        if let Some(height) = map.environment.height(project.pos.xy()) {
+                        if let Some(height) = map.environment().height(project.pos.xy()) {
                             project.pos.z = height;
                         }
                     }
@@ -387,9 +423,39 @@ impl Simulation {
             false,
             BudgetCategory::StarterInfrastructure,
         );
+        if opts.preset == MapPreset::Waters {
+            sim.check_waters_starters()?;
+        }
         sim.record_constructor_end();
 
-        sim
+        Ok(sim)
+    }
+
+    fn check_waters_starters(&self) -> Result<(), Rejection> {
+        if let Some((_, reason)) = self.read::<CommandOutcomes>().last.first() {
+            return Err(*reason);
+        }
+        let map = self.map();
+        let external = map
+            .external_train_stations
+            .first()
+            .and_then(|&id| map.get(id))
+            .ok_or(Rejection::MutationFailed)?;
+        let freight = map
+            .buildings()
+            .values()
+            .find(|building| matches!(building.kind, BuildingKind::RailFreightStation(_)))
+            .ok_or(Rejection::MutationFailed)?;
+        let platform = crate::souls::freight_station::train_stop(&geom::Transform::new_dir(
+            freight.obb.center().z(freight.height),
+            freight.obb.axis()[1].z(0.0).normalize(),
+        ));
+        let market = external.obb.center().z(external.height);
+        let tick = Tick(self.get_tick());
+        if Itinerary::route(tick, platform, market, &map, crate::map::PathKind::Rail).is_none() {
+            return Err(Rejection::MutationFailed);
+        }
+        Ok(())
     }
 
     fn record_constructor_end(&self) {
@@ -470,23 +536,66 @@ impl Simulation {
             .clone()
     }
 
+    pub fn preview_water_edit(&self, edit: &WaterEdit) -> Result<WaterEditPreview, WaterEditError> {
+        self.map()
+            .preview_water_edit(edit, &self.read::<crate::map::ZoneGrid>())
+    }
+
+    pub fn carve_river(
+        &mut self,
+        points: &[Vec2],
+        width_m: f32,
+        depth_m: f32,
+    ) -> Result<WaterBodyId, WaterEditError> {
+        self.edit_water(WaterEdit::CarveRiver {
+            polyline: WaterStroke::new(points)?,
+            width_m,
+            depth_m,
+            level_dm: None,
+        })
+        .map(|outcome| outcome.body.expect("creating a river returns its ID"))
+    }
+
+    pub fn fill_lake(
+        &mut self,
+        basin: &Polygon,
+        level_dm: i16,
+        depth_m: f32,
+    ) -> Result<WaterBodyId, WaterEditError> {
+        self.edit_water(WaterEdit::FillLake {
+            basin: WaterBasin::new(basin.as_slice())?,
+            level_dm,
+            depth_m,
+        })
+        .map(|outcome| outcome.body.expect("creating a lake returns its ID"))
+    }
+
     fn apply_command_batch<'a>(
         &mut self,
         commands: impl IntoIterator<Item = &'a WorldCommand>,
         steps_systems: bool,
         construction: BudgetCategory,
     ) {
-        let mut commands = commands.into_iter().peekable();
-        if commands.peek().is_none() {
+        let mut commands = commands.into_iter();
+        let Some(first) = commands.next() else {
             utils::scheduler::drain_commands(self);
             return;
-        }
+        };
+        let mut batch_commands = Vec::new();
+        let commands = if let Some(second) = commands.next() {
+            batch_commands.extend([first, second]);
+            batch_commands.extend(commands);
+            batch_commands.as_slice()
+        } else {
+            std::slice::from_ref(&first)
+        };
+        let mut water = WaterBatch::new(commands, self.map().environment());
         let topology_generation = self.map().walking_topology_generation;
         let recording_start = self.read::<Replay>().command_count();
         let parent = self.write::<CommandOutcomes>().begin_batch();
-        for (index, command) in commands.enumerate() {
+        for (index, command) in commands.iter().enumerate() {
             let start = self.read::<CommandOutcomes>().command_start();
-            command.apply_in_batch(self, construction);
+            command.apply_in_batch(self, construction, &mut water);
             utils::scheduler::drain_commands(self);
             self.write::<CommandOutcomes>().record_command(index, start);
         }

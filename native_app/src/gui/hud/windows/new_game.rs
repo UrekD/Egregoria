@@ -84,6 +84,7 @@ pub(super) fn render(uiw: &UiWorld) {
         for (preset, label) in [
             (MapPreset::Procedural, "Procedural"),
             (MapPreset::Flat, "Flat"),
+            (MapPreset::Waters, "Waters"),
         ] {
             if selectable_label_primary(form.preset == preset, label).clicked {
                 form.preset = preset;

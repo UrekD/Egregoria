@@ -75,6 +75,10 @@ impl ProjectKind {
 pub trait SpatialMapObject {
     fn kind(&self) -> ProjectKind;
     fn shape(&self) -> ShapeEnum;
+
+    fn bounds(&self, shape: &ShapeEnum) -> AABB {
+        shape.bbox()
+    }
 }
 
 pub struct SpatialMap {
@@ -97,7 +101,7 @@ impl SpatialMap {
     pub fn insert(&mut self, obj: &impl SpatialMapObject) {
         let kind = obj.kind();
         let shape = obj.shape();
-        let handle = self.broad.insert(shape.bbox(), kind);
+        let handle = self.broad.insert(obj.bounds(&shape), kind);
         if let Some(old_handle) = self.ids.insert(kind, handle) {
             self.broad.remove(old_handle);
         }
@@ -121,7 +125,7 @@ impl SpatialMap {
         let kind = obj.kind();
         let shape = obj.shape();
         if let Some(id) = self.ids.get(&kind) {
-            self.broad.set_aabb(*id, shape.bbox());
+            self.broad.set_aabb(*id, obj.bounds(&shape));
             self.near.insert(kind, shape);
         } else {
             warn!(
@@ -149,6 +153,18 @@ impl SpatialMap {
             .query(shape.bbox())
             .filter(move |&(_, _, p)| filter.test(p))
             .filter_map(move |(_, _, p)| shape.intersects(self.near.get(p)?).then_some(*p))
+    }
+
+    /// Bounds include both shapes of a zoned building. Callers test the shapes separately.
+    pub(crate) fn construction_candidates(
+        &self,
+        bounds: AABB,
+        filter: ProjectFilter,
+    ) -> impl Iterator<Item = ProjectKind> + '_ {
+        self.broad
+            .query(bounds)
+            .filter(move |&(_, _, object)| filter.test(object))
+            .map(|(_, _, object)| *object)
     }
 
     pub fn debug_grid(&self) -> impl Iterator<Item = AABB> + '_ {
@@ -211,6 +227,10 @@ impl SpatialMapObject for Building {
             return z.poly.clone().into();
         }
         self.obb.into()
+    }
+
+    fn bounds(&self, shape: &ShapeEnum) -> AABB {
+        shape.bbox().union(self.obb.bbox())
     }
 }
 

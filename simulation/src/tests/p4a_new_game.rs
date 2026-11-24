@@ -21,8 +21,8 @@ fn p4a_seed_zero_matches_legacy_golden() {
     let sim = Simulation::new_game(&NewGameOptions::default()).unwrap();
     let hashes = sim.hashes();
     for (resource, hash) in [
-        // Captured on 2fed76c and confirmed on the P4a base, b72ac061.
-        ("map", 11_059_623_365_414_667_885),
+        // The Map hash includes the WATER authority added by W1.
+        ("map", 12_149_236_398_957_883_477),
         ("randprovider", 14_593_155_757_080_606_368),
         ("government", 14_969_084_836_084_239_989),
         ("world", 17_476_124_382_984_081_698),

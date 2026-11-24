@@ -1,6 +1,6 @@
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::marker::PhantomData;
 use std::sync::Once;
 
@@ -19,7 +19,7 @@ use crate::economy::{
     citystats_update, market_update, CityStats, DailyEconomyMetrics, EcoStats, Government, Market, TransitStats,
     TripStats,
 };
-use crate::map::Map;
+use crate::map::{Map, TerrainChunkID};
 use crate::map_dynamic::transit::{
     transit_board_update, transit_dispatch_update, transit_stop_update,
 };
@@ -223,6 +223,7 @@ fn register_systems_and_resources() {
     register_resource_default::<ElectricityFlow, Bincode>("electricity_flow");
     register_resource_default::<CoverageGrid, Bincode>("coverage_grid");
     register_resource_default::<UtilityFlow, Bincode>("utility_flow");
+    register_utility_water_sample();
     register_resource_default::<EnvGrid, Bincode>("env_grid");
     register_resource_default::<Happiness, Bincode>("happiness");
     register_resource_default::<Fires, Bincode>("fires");
@@ -232,6 +233,7 @@ fn register_systems_and_resources() {
     register_resource_default::<MultiplayerState, Bincode>("multiplayer_state");
     register_resource_default::<RandomVehicles, Bincode>("random_vehicles");
     register_resource_default::<Map, Bincode>("map");
+    register_pending_construction_cuts();
     register_resource_default::<TrainReservations, Bincode>("train_reservations");
     register_resource_noinit::<Government, Bincode>("government");
     register_resource_default::<crate::map::ZoneGrid, Bincode>("zone_grid");
@@ -254,6 +256,47 @@ fn register_systems_and_resources() {
     register_lot_layout();
     register_road_frontage();
     register_cargo_progress();
+}
+
+fn register_utility_water_sample() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "utility_water_sample",
+            optional: true,
+            save: Box::new(|sim| {
+                Bincode::encode(&sim.read::<UtilityFlow>().sampled_water_revision).unwrap()
+            }),
+            load: Box::new(|sim, data| {
+                sim.write::<UtilityFlow>().sampled_water_revision = Bincode::decode(data)?;
+                Ok(())
+            }),
+        });
+    }
+}
+
+fn register_pending_construction_cuts() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "pending_construction_cuts",
+            optional: true,
+            save: Box::new(|sim| Bincode::encode(&sim.map().pending_construction_cuts).unwrap()),
+            load: Box::new(|sim, data| {
+                let pending = Bincode::decode::<BTreeSet<TerrainChunkID>>(data)?;
+                let mut map = sim.map_mut();
+                if pending
+                    .iter()
+                    .any(|&chunk| map.environment().get_chunk(chunk).is_none())
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid construction cut chunk",
+                    ));
+                }
+                map.pending_construction_cuts = pending;
+                Ok(())
+            }),
+        });
+    }
 }
 
 // The layout lives on the map, which sizes lots as roads are built. A separate entry keeps the

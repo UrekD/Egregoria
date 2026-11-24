@@ -213,11 +213,12 @@ impl SerializedMap {
             }
         }
         for (id, building) in self.buildings.iter() {
-            let points = match &building.zone {
-                Some(zone) => zone.poly.as_slice(),
-                None => &building.obb.corners,
-            };
-            if points.iter().any(|point| !point.is_finite()) {
+            let points = building
+                .obb
+                .corners
+                .iter()
+                .chain(building.zone.iter().flat_map(|zone| zone.poly.iter()));
+            if points.into_iter().any(|point| !point.is_finite()) {
                 return Err(format!("building {id:?} has invalid spatial bounds"));
             }
         }
@@ -310,8 +311,14 @@ mod tests {
         let input = map.replacen(r#""bodies":[]"#, &bodies, 1);
         let mut reader = input.as_bytes();
         let error = JSON::decode_reader::<Map>(&mut reader).err().unwrap();
-        assert!(reader.len() >= extra.len(), "consumed the excess stroke payload");
-        assert!(error.to_string().contains("water record limit exceeded"), "{error}");
+        assert!(
+            reader.len() >= extra.len(),
+            "consumed the excess stroke payload"
+        );
+        assert!(
+            error.to_string().contains("water record limit exceeded"),
+            "{error}"
+        );
     }
 
     #[test]

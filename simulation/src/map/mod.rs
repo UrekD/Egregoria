@@ -27,6 +27,18 @@ pub mod procgen {
     pub use building::*;
     pub use presets::*;
     pub use water::generate_waters;
+
+    pub fn load_parismap(map: &mut super::Map) {
+        if !map.environment().has_water_configuration() {
+            presets::load_parismap(map);
+        }
+    }
+
+    pub fn load_testfield(map: &mut super::Map, pos: geom::Vec2, size: u32, spacing: f32) {
+        if !map.environment().has_water_configuration() {
+            presets::load_testfield(map, pos, size, spacing);
+        }
+    }
 }
 
 mod change_detection;

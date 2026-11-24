@@ -181,6 +181,12 @@ impl Building {
         (mesh, door * scale + offset)
     }
 
+    pub(crate) fn dry_footprint(env: &Environment, obb: &OBB, zone: Option<&Zone>) -> bool {
+        !env.has_water_configuration()
+            || (!env.intersects_water(&Polygon(obb.corners.to_vec()))
+                && zone.is_none_or(|zone| !env.intersects_water(&zone.poly)))
+    }
+
     pub fn make(
         buildings: &mut Buildings,
         spatial_map: &mut SpatialMap,
@@ -195,6 +201,7 @@ impl Building {
     ) -> Option<BuildingID> {
         if !Self::valid_footprint(&obb, gen)
             || connected_road.is_some_and(|road| !roads.contains_key(road))
+            || !Self::dry_footprint(env, &obb, zone.as_ref())
         {
             return None;
         }

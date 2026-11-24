@@ -18,8 +18,8 @@ use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
     Building, BuildingID, BuildingKind, Density, Environment, IntersectionID, LaneID, LaneKind,
     LanePattern, LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, ProjectKind,
-    RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, Zone,
-    ZoneGrid, ZoneKind,
+    RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, Zone, ZoneGrid,
+    ZoneKind, ZonePaintError, MAX_WATER_BATCH_WORK,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
@@ -29,7 +29,7 @@ use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::train::{spawn_train, RailWagonKind};
 use crate::transportation::{spawn_parked_vehicle_with_spot, unpark, VehicleKind};
 use crate::utils::rand_provider::RandProvider;
-use crate::{CompanyID, Replay, Simulation, SimulationOptions, SoulID};
+use crate::{CompanyID, MapPreset, Replay, Simulation, SimulationOptions, SoulID};
 
 #[derive(Clone, Default)]
 pub struct WorldCommands {
@@ -167,6 +167,157 @@ pub enum Rejection {
     Locked { milestone: u8 },
     InvalidWarehouse,
     WaterEditFailed,
+    WetFootprint,
+    TileLocked,
+    WaterWorkLimit,
+    WaterConfigured,
+    WaterTerrainConflict,
+}
+
+impl From<ZonePaintError> for Rejection {
+    fn from(error: ZonePaintError) -> Self {
+        match error {
+            ZonePaintError::InvalidArea => Self::InvalidZone,
+            ZonePaintError::TileLocked(_) => Self::TileLocked,
+            ZonePaintError::WetFootprint => Self::WetFootprint,
+        }
+    }
+}
+
+impl Rejection {
+    fn water_error(error: &WaterEditError) -> Self {
+        match error {
+            WaterEditError::Limit => Self::WaterWorkLimit,
+            WaterEditError::OccupiedFootprint { .. } => Self::WetFootprint,
+            _ => Self::WaterEditFailed,
+        }
+    }
+
+    fn water_connection_error(error: WaterEditError) -> Self {
+        match error {
+            WaterEditError::Limit => Self::WaterWorkLimit,
+            WaterEditError::TopologyConflict { .. } => Self::WetFootprint,
+            _ => Self::InvalidConnection,
+        }
+    }
+}
+
+pub(crate) struct WaterBatch {
+    guard_terraform: bool,
+    reject_surface: bool,
+    remaining: usize,
+}
+
+impl WaterBatch {
+    pub(crate) fn new(commands: &[&WorldCommand], environment: &Environment) -> Self {
+        let guard_terraform = environment.has_water_configuration()
+            || commands.iter().any(|command| {
+                matches!(
+                    command,
+                    EditWater(
+                        WaterEdit::SetSeaLevel { level_dm: Some(_) }
+                            | WaterEdit::CarveRiver { .. }
+                            | WaterEdit::FillLake { .. }
+                    )
+                )
+            });
+        let mut batch = Self {
+            guard_terraform,
+            reject_surface: false,
+            remaining: MAX_WATER_BATCH_WORK,
+        };
+        if !guard_terraform || commands.len() < 2 {
+            return batch;
+        }
+
+        let initial_sea = environment.sea_level_dm();
+        let mut possibly_configured_sea = initial_sea.is_some();
+        let mut sea_level_may_change = false;
+        let mut sea_rebuilds = 0;
+        let mut reserved = 0usize;
+        for command in commands {
+            let work = match command {
+                EditWater(WaterEdit::SetSeaLevel { level_dm }) => {
+                    if !sea_level_may_change && *level_dm == initial_sea {
+                        continue;
+                    }
+                    sea_level_may_change = true;
+                    possibly_configured_sea |= level_dm.is_some();
+                    sea_rebuilds += 1;
+                    // A full rebuild may also re-evaluate every river's sea contacts.
+                    MAX_WATER_BATCH_WORK
+                }
+                EditWater(edit) => {
+                    sea_rebuilds += usize::from(possibly_configured_sea);
+                    if possibly_configured_sea {
+                        MAX_WATER_BATCH_WORK
+                    } else {
+                        dry_water_edit_reservation(edit)
+                    }
+                }
+                Terraform { kind, radius, .. } => {
+                    sea_rebuilds += usize::from(possibly_configured_sea);
+                    if possibly_configured_sea || *kind == TerraformKind::Erode {
+                        MAX_WATER_BATCH_WORK
+                    } else {
+                        let side = (radius.clamp(0.0, 2_000.0) / 256.0).ceil() as usize + 2;
+                        side * side * 1024 * 18
+                    }
+                }
+                _ => continue,
+            };
+            reserved = reserved.saturating_add(work);
+            if sea_rebuilds > 1 || reserved > MAX_WATER_BATCH_WORK {
+                batch.reject_surface = true;
+                break;
+            }
+        }
+        batch
+    }
+}
+
+fn dry_water_edit_reservation(edit: &WaterEdit) -> usize {
+    // The per-tile allowance covers base writes, contact checks and both river
+    // banks at a contact, even beside an existing river at the vertex cap.
+    const PER_TILE: usize = 2_100;
+    let cells = |min: Vec2, max: Vec2| {
+        let side = ((max - min) / 16.0).max(Vec2::ZERO);
+        let count = |length: f32| (length.ceil() as usize).saturating_add(2);
+        count(side.x).saturating_mul(count(side.y))
+    };
+    let (vertices, coverage, tests) = match edit {
+        WaterEdit::CarveRiver {
+            polyline, width_m, ..
+        } => {
+            let radius = Vec2::splat(width_m.clamp(32.0, 512.0) * 0.5 + 16.0);
+            let span = polyline.points().windows(2).fold(0usize, |total, segment| {
+                total.saturating_add(cells(
+                    segment[0].min(segment[1]) - radius,
+                    segment[0].max(segment[1]) + radius,
+                ))
+            });
+            (polyline.points().len(), span, span.saturating_mul(2))
+        }
+        WaterEdit::FillLake { basin, .. } => {
+            let mut min = basin.points()[0];
+            let mut max = min;
+            for &point in basin.points() {
+                min = min.min(point);
+                max = max.max(point);
+            }
+            let coverage = cells(min, max);
+            (
+                basin.points().len(),
+                coverage,
+                coverage.saturating_mul(basin.points().len()),
+            )
+        }
+        _ => return MAX_WATER_BATCH_WORK,
+    };
+    (vertices * vertices)
+        .saturating_add(coverage.min(crate::map::MAX_FRESHWATER_CANDIDATES) * PER_TILE)
+        .saturating_add(tests)
+        .min(MAX_WATER_BATCH_WORK)
 }
 
 pub type LinkOutcome = (usize, Result<(), (&'static str, Rejection)>);
@@ -564,18 +715,98 @@ impl WorldCommand {
         sim.apply_commands(std::iter::once(self));
     }
 
-    pub(crate) fn apply_in_batch(&self, sim: &mut Simulation, construction: BudgetCategory) {
+    pub(crate) fn apply_in_batch(
+        &self,
+        sim: &mut Simulation,
+        construction: BudgetCategory,
+        water: &mut WaterBatch,
+    ) {
         if let EditWater(edit) = self {
-            let outcome = sim.map_mut().apply_water_edit(edit);
+            let outcome = if water.reject_surface {
+                Err(WaterEditError::Limit)
+            } else {
+                sim.map_mut().apply_water_edit(
+                    edit,
+                    &mut sim.write::<ZoneGrid>(),
+                    &mut water.remaining,
+                )
+            };
             match &outcome {
                 Ok(result) if result.changed => self.record_for_replay(sim),
-                Err(_) => self.reject(sim, Rejection::WaterEditFailed),
+                Err(error) => self.reject(sim, Rejection::water_error(error)),
                 Ok(_) => {}
             }
             let mut outcomes = sim.write::<CommandOutcomes>();
-            let index = outcomes.rejection_ranges.len();
+            let index = outcomes.command_ranges.len();
             outcomes.water_edits.insert(index, outcome);
             return;
+        }
+
+        if let Terraform {
+            kind,
+            center,
+            radius,
+            amount,
+            level,
+            slope,
+        } = *self
+        {
+            if water.reject_surface {
+                self.reject(sim, Rejection::WaterWorkLimit);
+                return;
+            }
+            if sim.map().environment().has_water_configuration() {
+                let tick = sim.read::<GameTime>().tick;
+                let result = {
+                    let mut map = sim.map_mut();
+                    map.environment()
+                        .prepare_water_terraform(tick, kind, center, radius, amount, level, slope)
+                        .and_then(|prepared| {
+                            map.commit_water_edit(
+                                prepared,
+                                &mut sim.write::<ZoneGrid>(),
+                                &mut water.remaining,
+                            )
+                        })
+                };
+                match result {
+                    Ok(outcome) if outcome.changed => self.record_for_replay(sim),
+                    Ok(_) => {}
+                    Err(error) => self.reject(
+                        sim,
+                        match error {
+                            WaterEditError::InvalidInput | WaterEditError::OutOfBounds => {
+                                Rejection::InvalidTerraform
+                            }
+                            WaterEditError::Limit => Rejection::WaterWorkLimit,
+                            WaterEditError::OccupiedFootprint { .. } => Rejection::WetFootprint,
+                            _ => Rejection::WaterTerrainConflict,
+                        },
+                    ),
+                }
+                return;
+            }
+        }
+
+        if let MapMakeMultipleConnections(projects, links) = self {
+            const MAX_WET_DESCRIPTORS: usize = 65_536;
+            if water.guard_terraform {
+                let count = projects.len().saturating_add(links.len());
+                let descriptors_fit = count <= MAX_WET_DESCRIPTORS
+                    && links
+                        .iter()
+                        .try_fold(count, |count, (_, _, _, pattern)| {
+                            let total = count
+                                .saturating_add(pattern.lanes_forward.len())
+                                .saturating_add(pattern.lanes_backward.len());
+                            (total <= MAX_WET_DESCRIPTORS).then_some(total)
+                        })
+                        .is_some();
+                if !descriptors_fit {
+                    self.reject(sim, Rejection::WaterWorkLimit);
+                    return;
+                }
+            }
         }
 
         if matches!(self, Init(_)) {
@@ -605,6 +836,14 @@ impl WorldCommand {
         }
 
         let result = match self {
+            ZonePaint {
+                area,
+                kind,
+                density,
+            } => sim
+                .write::<ZoneGrid>()
+                .paint_on_map(&sim.map(), area, *kind, *density)
+                .map_err(Rejection::from),
             MapMakeMultipleConnections(projects, links) => {
                 self.apply_connections(sim, projects, links, construction)
             }
@@ -714,9 +953,18 @@ impl WorldCommand {
             }
             MapRemoveRoad(id) => map.get(*id).is_some(),
             MapRemoveBuilding(id) => map.get(*id).is_some(),
-            MapBuildHouse(id) => map
-                .get(*id)
-                .is_some_and(|lot| map.get(lot.parent).is_some()),
+            MapLoadParis | MapLoadTestField { .. }
+                if map.environment().has_water_configuration() =>
+            {
+                return Err(Rejection::WaterConfigured);
+            }
+            MapBuildHouse(id) => {
+                let lot = map.get(*id).ok_or(Rejection::MissingReference)?;
+                if !Building::dry_footprint(map.environment(), &lot.shape, None) {
+                    return Err(Rejection::WetFootprint);
+                }
+                map.get(lot.parent).is_some()
+            }
             Terraform {
                 center,
                 radius,
@@ -807,6 +1055,9 @@ impl WorldCommand {
                 {
                     return Err(Rejection::InvalidZone);
                 }
+                if !Building::dry_footprint(map.environment(), pos, zone.as_ref()) {
+                    return Err(Rejection::WetFootprint);
+                }
                 connected_road.is_none_or(|id| map.get(id).is_some())
             }
             UpdateZone { building, zone } => {
@@ -820,12 +1071,13 @@ impl WorldCommand {
                 {
                     return Err(Rejection::InvalidZone);
                 }
+                if !Building::dry_footprint(map.environment(), &b.obb, Some(zone)) {
+                    return Err(Rejection::WetFootprint);
+                }
                 true
             }
-            ZonePaint { area, .. } => {
-                if !ZoneGrid::valid_paint(area, map.environment.bounds()) {
-                    return Err(Rejection::InvalidZone);
-                }
+            ZonePaint { area, kind, .. } => {
+                ZoneGrid::eligible_paint_cells(map, area, *kind)?;
                 true
             }
             SetTaxRate { rate_permille, .. } => {
@@ -890,6 +1142,11 @@ impl WorldCommand {
         if !Map::can_connect(from, to, inter, pattern) {
             return Err(Rejection::InvalidConnection);
         }
+        if map.environment().has_water_configuration() {
+            let mut work = MAX_WATER_BATCH_WORK;
+            map.preflight_water_connection(from, to, inter, pattern, &mut work)
+                .map_err(Rejection::water_connection_error)?;
+        }
         let cost =
             Self::affordable_cost(sim, Government::connection_cost(from.pos, to.pos, pattern))?;
         map.make_resolved_connection(from, to, inter, pattern);
@@ -912,6 +1169,7 @@ impl WorldCommand {
         }
 
         let mut map = sim.map_mut();
+        let mut water_work = map.environment().has_water_configuration().then_some(MAX_WATER_BATCH_WORK);
         let mut endpoints: Vec<_> = projects
             .iter()
             .map(|&project| project.kind.check_valid(&map).then_some(project))
@@ -923,22 +1181,43 @@ impl WorldCommand {
                 .record_link(index, result.map_err(|reason| (self.kind(), reason)));
         };
         for (index, &(from, to, interpoint, ref pat)) in links.iter().enumerate() {
-            let resolve = |index: usize| {
-                let project = endpoints[index]?;
+            let mut resolve = |index: usize| {
+                let Some(project) = endpoints[index] else { return Ok(None) };
                 if let ProjectKind::Road(id) = project.kind {
                     if splits.contains_key(&id) {
-                        return map.reproject_split_endpoint(id, project.pos, &splits);
+                        return map.reproject_split_endpoint(id, project.pos, &splits, water_work.as_mut());
+                    }
+                    if let Some(work) = &mut water_work {
+                        let points = map.get(id).map_or(0, |road| road.points().len());
+                        crate::map::spend_water_work(work, points)?;
                     }
                 }
-                map.resolve_connection_endpoint(project)
+                Ok(map.resolve_connection_endpoint(project))
             };
-            let Some((fromproj, toproj)) = resolve(from).zip(resolve(to)) else {
-                record_link(index, Err(Rejection::MissingReference));
-                continue;
+            let (fromproj, toproj) = match resolve(from).and_then(|start| Ok(start.zip(resolve(to)?))) {
+                Ok(Some(pair)) => pair,
+                Ok(None) => {
+                    record_link(index, Err(Rejection::MissingReference));
+                    continue;
+                }
+                Err(error) => {
+                    record_link(index, Err(Rejection::water_connection_error(error)));
+                    break;
+                }
             };
             if !Map::can_connect(fromproj, toproj, interpoint, pat) {
                 record_link(index, Err(Rejection::InvalidConnection));
                 continue;
+            }
+            if let Some(work) = &mut water_work {
+                if let Err(error) = map.preflight_water_connection(fromproj, toproj, interpoint, pat, work) {
+                    let reason = Rejection::water_connection_error(error);
+                    record_link(index, Err(reason));
+                    if reason == Rejection::WaterWorkLimit && *work == 0 {
+                        break;
+                    }
+                    continue;
+                }
             }
             let cost = match Self::affordable_cost(
                 sim,
@@ -969,6 +1248,16 @@ impl WorldCommand {
         }
         // Keep junction IDs alive until every link that names them has been processed.
         for junction in junctions {
+            if let Some(work) = &mut water_work {
+                let points: usize = map.get(junction).into_iter()
+                    .flat_map(|intersection| intersection.roads.iter())
+                    .filter_map(|&road| map.get(road))
+                    .map(|road| road.points().len())
+                    .sum();
+                if crate::map::spend_water_work(work, 1 + points).is_err() {
+                    break;
+                }
+            }
             map.merge_shallow_junction(junction);
         }
         map.check_invariants();
@@ -1006,7 +1295,10 @@ impl WorldCommand {
                 sim.write::<BuildingInfos>().insert(building);
                 residence::on_house_built(sim, building);
             }
-            MapMakeConnection { .. } | MapMakeMultipleConnections(..) | EditWater(_) => {
+            MapMakeConnection { .. }
+            | MapMakeMultipleConnections(..)
+            | EditWater(_)
+            | ZonePaint { .. } => {
                 unreachable!()
             }
             MapUpdateIntersectionPolicy {
@@ -1035,11 +1327,6 @@ impl WorldCommand {
                 sim.write::<Budget>().shift_clock(time.tick, gt.tick);
                 *time = gt;
             }
-            ZonePaint {
-                area,
-                kind,
-                density,
-            } => sim.write::<ZoneGrid>().paint(area, kind, density),
             SetTaxRate {
                 zone,
                 rate_permille,
@@ -1137,23 +1424,63 @@ impl WorldCommand {
         Ok(())
     }
 
-    pub(crate) fn bootstrap(sim: &mut Simulation, options: SimulationOptions) -> Result<(), Rejection> {
-        Self::bootstrap_world(sim, options, true)
+    pub(crate) fn bootstrap(
+        sim: &mut Simulation,
+        options: SimulationOptions,
+    ) -> Result<(), Rejection> {
+        Self::bootstrap_world(sim, options, BootstrapKind::Normal)
     }
 
-    pub(crate) fn bootstrap_import(sim: &mut Simulation, options: SimulationOptions) -> Result<(), Rejection> {
-        Self::bootstrap_world(sim, options, false)
+    pub(crate) fn bootstrap_import(
+        sim: &mut Simulation,
+        options: SimulationOptions,
+    ) -> Result<(), Rejection> {
+        Self::bootstrap_world(sim, options, BootstrapKind::Import)
     }
 
-    fn bootstrap_world(sim: &mut Simulation, options: SimulationOptions, legacy_external: bool) -> Result<(), Rejection> {
+    pub(crate) fn bootstrap_authored(
+        sim: &mut Simulation,
+        options: SimulationOptions,
+    ) -> Result<(), Rejection> {
+        Self::bootstrap_world(sim, options, BootstrapKind::AuthoredFlat)
+    }
+
+    fn bootstrap_world(
+        sim: &mut Simulation,
+        options: SimulationOptions,
+        kind: BootstrapKind,
+    ) -> Result<(), Rejection> {
         let tick = sim.read::<GameTime>().tick;
         if tick.0 != crate::INITIAL_TICK || sim.resources.try_read::<SimulationOptions>().is_ok() {
             return Err(Rejection::UnexpectedInit);
         }
-        if !options.valid_for_bootstrap() {
+        let valid = match kind {
+            BootstrapKind::Normal => options.valid_for_bootstrap(),
+            BootstrapKind::Import => {
+                !options.save_replay
+                    && options.preset != MapPreset::Waters
+                    && options.valid_for_bootstrap()
+            }
+            BootstrapKind::AuthoredFlat => {
+                !options.save_replay
+                    && options.preset == MapPreset::Flat
+                    && (1..=crate::NewGameOptions::MAX_TERRAIN_CHUNKS)
+                        .contains(&options.terrain_size)
+            }
+        };
+        if !valid {
             return Err(Rejection::InvalidInitOptions);
         }
         info!("Initializing world with {options:?}");
+        if options.terrain_size > 0 {
+            generate_terrain(sim, options)?;
+            if kind == BootstrapKind::Normal {
+                let starter_built = build_starting_external_trading(sim);
+                if options.preset == MapPreset::Waters && !starter_built {
+                    return Err(Rejection::MutationFailed);
+                }
+            }
+        }
         sim.insert(RandProvider::for_world(options.seed));
         sim.write::<ProgressionState>().mode = options.progression;
         sim.insert(Government {
@@ -1166,26 +1493,36 @@ impl WorldCommand {
                 replay.push(tick, Init(Box::new(options)));
             }
         }
-        if options.terrain_size > 0 {
-            generate_terrain(sim, options);
-            if legacy_external {
-                build_starting_external_trading(sim);
-            }
-        }
         sim.resources.insert(options);
         Ok(())
     }
 }
 
-fn generate_terrain(sim: &mut Simulation, options: SimulationOptions) {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BootstrapKind {
+    Normal,
+    Import,
+    AuthoredFlat,
+}
+
+fn generate_terrain(sim: &mut Simulation, options: SimulationOptions) -> Result<(), Rejection> {
     info!("generating terrain..");
     let t = Instant::now();
 
-    sim.map_mut().environment = Environment::from_options(options);
+    let size = options.terrain_size;
+    let environment = match options.preset {
+        MapPreset::Waters => crate::map::procgen::generate_waters(size, size, options.seed)
+            .map_err(|_| Rejection::WaterEditFailed)?,
+        _ => Environment::from_options(options),
+    };
+    if !sim.map_mut().install_environment(environment) {
+        return Err(Rejection::UnexpectedInit);
+    }
     info!("took {}s", t.elapsed().as_secs_f32());
+    Ok(())
 }
 
-fn build_starting_external_trading(sim: &mut Simulation) {
+fn build_starting_external_trading(sim: &mut Simulation) -> bool {
     let c = vec3(3000.0 + 72.2 / 2.0, 200.0 / 2.0 + 1.0, 0.0);
     let obb = OBB::new(c.xy(), -Vec2::X, 72.2, 200.0);
 
@@ -1193,15 +1530,15 @@ fn build_starting_external_trading(sim: &mut Simulation) {
 
     let pat = LanePatternBuilder::new().rail(true).build();
 
-    {
+    let road = {
         let mut map = sim.map_mut();
         let ground = |pos: Vec3| {
             MapProject::ground(pos.xy().z(map.environment.height(pos.xy()).unwrap_or(pos.z)))
         };
         let from = ground(c - offy * 100.0);
         let to = ground(c + offy * 120.0);
-        map.make_connection(from, to, None, &pat);
-    }
+        map.make_connection(from, to, None, &pat)
+    };
 
     let external_trading = sim.map_mut().build_special_building(
         &obb,
@@ -1215,8 +1552,10 @@ fn build_starting_external_trading(sim: &mut Simulation) {
 
     if let Some(id) = external_trading {
         sim.write::<BuildingInfos>().insert(id);
+        road.is_some_and(|(_, road)| sim.map().get(road).is_some())
     } else {
         log::error!("failed to build external trading");
+        false
     }
 }
 

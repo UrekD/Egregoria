@@ -8,7 +8,7 @@ use crate::map::{
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{growth, residence};
 use crate::world_command::WorldCommand;
-use crate::{NewGameOptions, Simulation, SimulationOptions};
+use crate::{MapPreset, NewGameOptions, Simulation, SimulationOptions};
 use geom::{Vec2, Vec3, OBB};
 use prototypes::{BuildingGen, Money};
 use std::collections::BTreeMap;
@@ -64,6 +64,9 @@ impl Simulation {
         options: &NewGameOptions,
     ) -> Result<(Self, ImportedNetwork), String> {
         options.validate().map_err(|error| error.to_string())?;
+        if options.preset == MapPreset::Waters {
+            return Err("import requires a dry map preset".to_owned());
+        }
         let mut sim = Self {
             world: Default::default(),
             resources: Default::default(),

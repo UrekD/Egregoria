@@ -1,3 +1,4 @@
+use crate::map::{Environment, Map, PreparedWaterEdit, TerrainChunkID, WaterEditError};
 use geom::{vec2, Shape, Vec2, AABB, OBB};
 use serde::{Deserialize, Serialize};
 use std::cmp::Reverse;
@@ -7,6 +8,27 @@ pub use prototypes::{Density, ZoneKind};
 
 pub const ZONE_CELL_SIZE: f32 = 8.0;
 const MAX_PAINT_CELLS: usize = 2_500;
+
+pub type ZoneCellCoord = (i32, i32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ZonePaintError {
+    InvalidArea,
+    TileLocked(ZoneCellCoord),
+    WetFootprint,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct EligiblePaintCells {
+    cells: Vec<ZoneCellCoord>,
+    kind: Option<ZoneKind>,
+}
+
+impl EligiblePaintCells {
+    pub fn cells(&self) -> &[ZoneCellCoord] {
+        &self.cells
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZoneCell {
@@ -24,11 +46,71 @@ pub struct ZoneGrid {
 impl ZoneGrid {
     pub const MAX_PAINT_SIDE: f32 = 400.0;
 
-    pub(crate) fn valid_paint(area: &OBB, bounds: AABB) -> bool {
-        area.corners.iter().all(|&corner| bounds.contains(corner))
-            && paint_cells(area).is_some_and(|cells| cells.count() <= MAX_PAINT_CELLS)
+    pub fn cells(&self) -> &BTreeMap<ZoneCellCoord, ZoneCell> {
+        &self.cells
     }
 
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    pub fn eligible_paint_cells(
+        map: &Map,
+        area: &OBB,
+        kind: Option<ZoneKind>,
+    ) -> Result<EligiblePaintCells, ZonePaintError> {
+        Self::eligible_paint_cells_with_land(map, area, kind, |_| true)
+    }
+
+    pub fn eligible_paint_cells_with_land(
+        map: &Map,
+        area: &OBB,
+        kind: Option<ZoneKind>,
+        mut owns: impl FnMut(ZoneCellCoord) -> bool,
+    ) -> Result<EligiblePaintCells, ZonePaintError> {
+        let env = map.environment();
+        let mut cells = Self::bounded_paint_cells(area, env.bounds())?;
+        if let Some(&key) = cells.iter().find(|&&key| !owns(key)) {
+            return Err(ZonePaintError::TileLocked(key));
+        }
+        if kind.is_some() && env.has_water_configuration() && !cells.is_empty() {
+            // Each 8 m cell lies entirely inside one aligned 16 m water tile.
+            cells.retain(|&key| !env.is_water(cell_center(key)));
+            if cells.is_empty() {
+                return Err(ZonePaintError::WetFootprint);
+            }
+        }
+        Ok(EligiblePaintCells { cells, kind })
+    }
+
+    pub fn bounded_paint_cells(
+        area: &OBB,
+        bounds: AABB,
+    ) -> Result<Vec<ZoneCellCoord>, ZonePaintError> {
+        if !area.corners.iter().all(|&corner| bounds.contains(corner)) {
+            return Err(ZonePaintError::InvalidArea);
+        }
+        let cells: Vec<_> = paint_cells(area)
+            .ok_or(ZonePaintError::InvalidArea)?
+            .collect();
+        if cells.len() > MAX_PAINT_CELLS {
+            return Err(ZonePaintError::InvalidArea);
+        }
+        Ok(cells)
+    }
+
+    pub fn paint_on_map(
+        &mut self,
+        map: &Map,
+        area: &OBB,
+        kind: Option<ZoneKind>,
+        density: Density,
+    ) -> Result<(), ZonePaintError> {
+        self.paint_prepared(Self::eligible_paint_cells(map, area, kind)?, density);
+        Ok(())
+    }
+
+    /// Stamp a detached grid, for example an editor fixture.
     pub fn paint(&mut self, area: OBB, kind: Option<ZoneKind>, density: Density) {
         let Some(cells) = paint_cells(&area) else {
             return;
@@ -38,6 +120,11 @@ impl ZoneGrid {
             return;
         }
 
+        self.paint_prepared(EligiblePaintCells { cells, kind }, density);
+    }
+
+    pub(crate) fn paint_prepared(&mut self, prepared: EligiblePaintCells, density: Density) {
+        let EligiblePaintCells { cells, kind } = prepared;
         let mut changed = false;
         for key in cells {
             changed |= match kind {
@@ -51,6 +138,48 @@ impl ZoneGrid {
         if changed {
             self.generation = self.generation.wrapping_add(1);
         }
+    }
+
+    pub(super) fn newly_wet_cells(
+        &self,
+        env: &Environment,
+        prepared: &PreparedWaterEdit,
+        remaining: &mut usize,
+    ) -> Result<Vec<ZoneCellCoord>, WaterEditError> {
+        if prepared.dirty().water().is_empty() {
+            return Ok(Vec::new());
+        }
+        const CELLS_PER_CHUNK: i32 = TerrainChunkID::SIZE as i32 / ZONE_CELL_SIZE as i32;
+        let chunks = prepared.dirty().water();
+        let mut covered = Vec::new();
+        let mut consider = |key| -> Result<(), WaterEditError> {
+            super::spend_water_work(remaining, 1)?;
+            let center = cell_center(key);
+            if !env.is_water(center) && prepared.water_at(env, center).is_some() {
+                covered.push(key);
+            }
+            Ok(())
+        };
+        if self.cells.len() <= chunks.len() * CELLS_PER_CHUNK as usize {
+            for &key in self.cells.keys() {
+                consider(key)?;
+            }
+        } else {
+            for &chunk in chunks {
+                let x0 = i32::from(chunk.0) * CELLS_PER_CHUNK;
+                let y0 = i32::from(chunk.1) * CELLS_PER_CHUNK;
+                for x in x0..x0 + CELLS_PER_CHUNK {
+                    for (&key, _) in self.cells.range((x, y0)..(x, y0 + CELLS_PER_CHUNK)) {
+                        consider(key)?;
+                    }
+                }
+            }
+        }
+        Ok(covered)
+    }
+
+    pub(super) fn clear_prepared_cells(&mut self, cells: Vec<ZoneCellCoord>) {
+        self.paint_prepared(EligiblePaintCells { cells, kind: None }, Density::Low);
     }
 
     pub fn lot_zone(&self, area: &OBB) -> Option<ZoneCell> {
@@ -73,6 +202,24 @@ impl ZoneGrid {
             if paints.iter().any(|area| area.contains(cell_center(key))) {
                 touched = true;
                 replacement
+            } else {
+                self.cells.get(&key).copied()
+            }
+        });
+        (touched, vote)
+    }
+
+    pub fn lot_zone_after_prepared_paint(
+        &self,
+        area: &OBB,
+        prepared: &EligiblePaintCells,
+        density: Density,
+    ) -> (bool, Option<ZoneCell>) {
+        let mut touched = false;
+        let vote = lot_vote(area, |key| {
+            if prepared.cells.binary_search(&key).is_ok() {
+                touched = true;
+                prepared.kind.map(|kind| ZoneCell { kind, density })
             } else {
                 self.cells.get(&key).copied()
             }
