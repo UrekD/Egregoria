@@ -2,6 +2,7 @@ use scenarios::builtin::{demo_cities, growth_basic, perf, PERF_10K, SCENARIOS};
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
 use serde::Serialize;
+use simulation::SlotId;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::fs::File;
@@ -24,7 +25,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios perf_scale --houses H --warmup W --ticks T\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
 }
 
 fn main() -> ExitCode {
@@ -61,52 +62,91 @@ fn number_arg<T: std::str::FromStr>(
         .ok_or_else(|| format!("{flag} requires a non-negative integer"))
 }
 
+fn parse_slot_id(value: &str) -> Result<SlotId, String> {
+    // Match the catalog's canonical autosave stems and use normal validation
+    // for all user slots.
+    if let Some(number) = value
+        .strip_prefix("autosave_")
+        .and_then(|n| n.parse::<u8>().ok())
+    {
+        let id = SlotId::autosave(number);
+        if id.as_str() == value {
+            return Ok(id);
+        }
+    }
+    SlotId::new(value).map_err(|err| format!("--slot: {err}"))
+}
+
 fn run_benchmark(name: &str, mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
-    let paris = name == "perf_scale";
-    let mut houses = None;
+    let mut agents = None;
+    let mut layout = None;
     let mut root = None;
     let mut slot = None;
     let mut warmup = None;
     let mut ticks = None;
+    let mut workers = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
-            Some("--houses") if paris && houses.is_none() => {
-                houses = Some(number_arg(&mut args, "--houses")?);
+            Some("--houses") if name == "perf_scale" && agents.is_none() => {
+                agents = Some(number_arg(&mut args, "--houses")?);
             }
-            Some("--root") if !paris && root.is_none() => {
+            Some("--agents") if name == "perf-scale" && agents.is_none() => {
+                agents = Some(number_arg(&mut args, "--agents")?);
+            }
+            Some("--layout") if name == "perf-scale" && layout.is_none() => {
+                layout = Some(match args.next().as_deref().and_then(|arg| arg.to_str()) {
+                    Some("compact") => perf_scale::PerfLayout::Compact,
+                    Some("growing") => perf_scale::PerfLayout::Growing,
+                    _ => return Err("--layout requires compact or growing".into()),
+                });
+            }
+            Some("--root") if name == "bench-slot" && root.is_none() => {
                 root = Some(path_arg(&mut args, "--root", "a directory")?);
             }
-            Some("--slot") if !paris && slot.is_none() => {
+            Some("--slot") if name == "bench-slot" && slot.is_none() => {
                 let value = args
                     .next()
                     .and_then(|value| value.into_string().ok())
                     .ok_or("--slot requires a slot ID")?;
-                slot =
-                    Some(simulation::SlotId::new(&value).map_err(|err| format!("--slot: {err}"))?);
+                slot = Some(parse_slot_id(&value)?);
             }
             Some("--warmup") if warmup.is_none() => {
                 warmup = Some(number_arg(&mut args, "--warmup")?)
             }
             Some("--ticks") if ticks.is_none() => ticks = Some(number_arg(&mut args, "--ticks")?),
+            Some("--sim-threads") if workers.is_none() => {
+                workers = Some(number_arg(&mut args, "--sim-threads")?)
+            }
             _ => return Err(format!("unexpected {name} argument {arg:?}")),
         }
     }
     let warmup_ticks = warmup.ok_or_else(|| format!("{name} requires --warmup"))?;
     let measured_ticks = ticks.ok_or_else(|| format!("{name} requires --ticks"))?;
-    let report = if paris {
-        perf_scale::benchmark_paris(perf_scale::PerfCase {
-            agents: houses.ok_or("perf_scale requires --houses")?,
-            warmup_ticks,
-            measured_ticks,
-            workers: 1,
-        })?
-    } else {
-        perf_scale::bench_slot(
+    let workers = workers.unwrap_or(1);
+    let report = if name == "bench-slot" {
+        perf_scale::bench_slot_with_workers(
             &root.ok_or("bench-slot requires --root")?,
             &slot.ok_or("bench-slot requires --slot")?,
             warmup_ticks,
             measured_ticks,
+            workers,
         )?
+    } else {
+        let case = perf_scale::PerfCase {
+            agents: agents.ok_or(if name == "perf_scale" {
+                "perf_scale requires --houses"
+            } else {
+                "perf-scale requires --agents"
+            })?,
+            warmup_ticks,
+            measured_ticks,
+            workers,
+        };
+        if name == "perf_scale" {
+            perf_scale::benchmark_paris(case)?
+        } else {
+            perf_scale::benchmark_layout(case, layout.ok_or("perf-scale requires --layout")?)?
+        }
     };
     println!(
         "{}",
@@ -125,7 +165,7 @@ fn run() -> Result<(), String> {
         println!("{}", usage());
         return Ok(());
     }
-    if matches!(name.as_str(), "perf_scale" | "bench-slot") {
+    if matches!(name.as_str(), "perf_scale" | "perf-scale" | "bench-slot") {
         return run_benchmark(&name, args);
     }
     if name == "osm-city" {
@@ -362,5 +402,52 @@ mod tests {
         .map(OsString::from);
         let err = run_benchmark("bench-slot", args.into_iter()).unwrap_err();
         assert!(err.starts_with("--slot: slot id must be"), "{err}");
+    }
+
+    #[test]
+    fn scale_m0_resolves_native_autosave_ids() {
+        let args = [
+            "--root",
+            ".",
+            "--slot",
+            "autosave_0",
+            "--warmup",
+            "0",
+            "--ticks",
+            "1",
+        ]
+        .map(OsString::from);
+        let err = run_benchmark("bench-slot", args.into_iter()).unwrap_err();
+        assert!(err.contains("(autosave_0):"), "{err}");
+    }
+
+    #[test]
+    fn scale_m0_exposes_the_serial_worker_contract() {
+        for (name, workload) in [
+            ("perf_scale", vec!["--houses", "1"]),
+            ("bench-slot", vec!["--root", ".", "--slot", "city"]),
+        ] {
+            let args =
+                workload
+                    .into_iter()
+                    .chain(["--warmup", "0", "--ticks", "1", "--sim-threads", "2"]);
+            let err = run_benchmark(name, args.map(OsString::from)).unwrap_err();
+            assert!(
+                err.contains("only one simulation worker is available"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn scale_m0_exposes_controlled_layouts() {
+        let args = [
+            "--agents", "4", "--layout", "unknown", "--warmup", "0", "--ticks", "1",
+        ];
+        let err = run_benchmark("perf-scale", args.into_iter().map(OsString::from)).unwrap_err();
+        assert!(
+            err.contains("--layout requires compact or growing"),
+            "{err}"
+        );
     }
 }

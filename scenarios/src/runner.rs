@@ -179,6 +179,15 @@ impl ScenarioCtx {
     }
 
     pub fn run_ticks(&mut self, n: u64) {
+        self.run_ticks_observed(n, |_| {});
+    }
+
+    pub(crate) fn run_ticks_observed(
+        &mut self,
+        n: u64,
+        mut observe: impl FnMut(&Simulation),
+    ) -> u64 {
+        let before = self.executed_ticks;
         for _ in 0..n {
             let elapsed = self.sim.tick(&mut self.sched, &self.queued);
             self.tick_times.push(elapsed);
@@ -202,7 +211,9 @@ impl ScenarioCtx {
                     checkpoints.push(checkpoint(&self.sim, include_hashes));
                 }
             }
+            observe(&self.sim);
         }
+        self.executed_ticks - before
     }
 
     /// Collect raw per-tick timing samples for the perf JSON report.
