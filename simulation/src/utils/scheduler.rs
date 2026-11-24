@@ -4,7 +4,7 @@ use common::history::History;
 use ordered_float::OrderedFloat;
 use std::time::Instant;
 
-pub trait RunnableSystem {
+pub trait RunnableSystem: Send {
     fn run(&self, sim: &mut Simulation);
     fn name(&self) -> &'static str;
 }
@@ -14,7 +14,7 @@ pub struct RunnableFn<F: Fn(&mut Simulation)> {
     pub name: &'static str,
 }
 
-impl<F: Fn(&mut Simulation)> RunnableSystem for RunnableFn<F> {
+impl<F: Fn(&mut Simulation) + Send> RunnableSystem for RunnableFn<F> {
     fn run(&self, sim: &mut Simulation) {
         (self.f)(sim)
     }
@@ -79,4 +79,15 @@ pub(crate) fn drain_commands(sim: &mut Simulation) {
         | ParCommandBuffer::<FreightStationEnt>::apply(sim)
         | ParCommandBuffer::<CompanyEnt>::apply(sim)
     {}
+}
+
+#[cfg(test)]
+mod tests {
+    use super::SeqSchedule;
+
+    #[test]
+    fn scale_t0_schedule_is_send() {
+        fn assert_send<T: Send>() {}
+        assert_send::<SeqSchedule>();
+    }
 }

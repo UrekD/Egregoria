@@ -85,3 +85,53 @@ impl<E: SimDrop> ParCommandBuffer<E> {
         had_kills || had_callbacks
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::ParCommandBuffer;
+    use crate::tests::TestCtx;
+    use crate::world::{VehicleEnt, VehicleID};
+    use slotmapd::HopSlotMap;
+
+    #[test]
+    fn scale_t0_serial_callback_order() {
+        let mut sim = TestCtx::new().g;
+        sim.insert(Vec::<&str>::new());
+
+        let mut ids = HopSlotMap::<VehicleID, ()>::with_key();
+        let first = ids.insert(());
+        let second = ids.insert(());
+        let third = ids.insert(());
+        ids.remove(first).unwrap();
+        let reused = ids.insert(());
+
+        let buffer = sim.read::<ParCommandBuffer<VehicleEnt>>();
+        for (id, label) in [
+            (third, "third a"),
+            (reused, "reused a"),
+            (second, "second a"),
+            (first, "original generation"),
+            (third, "third b"),
+            (second, "second b"),
+            (reused, "reused b"),
+        ] {
+            buffer.exec_on(id, move |trace: &mut Vec<&str>| trace.push(label));
+        }
+        drop(buffer);
+
+        assert!(ParCommandBuffer::<VehicleEnt>::apply(&mut sim));
+        assert_eq!(
+            sim.read::<Vec<&str>>().as_slice(),
+            [
+                "original generation",
+                "reused a",
+                "reused b",
+                "second a",
+                "second b",
+                "third a",
+                "third b",
+            ],
+        );
+        assert!(!ParCommandBuffer::<VehicleEnt>::apply(&mut sim));
+    }
+}

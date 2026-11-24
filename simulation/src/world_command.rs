@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -173,6 +174,7 @@ pub struct CommandOutcomes {
     pub last: Vec<(&'static str, Rejection)>,
     /// Input indices of commands that completed without any rejection.
     pub accepted: Vec<usize>,
+    rejection_ranges: Vec<Range<usize>>,
 }
 
 impl CommandOutcomes {
@@ -180,11 +182,83 @@ impl CommandOutcomes {
         self.sequence
     }
 
+    /// Rejections for the given input index in the most recent nonempty batch.
+    /// Returns an empty slice for accepted commands and indices outside the batch.
+    pub fn rejections_for(&self, index: usize) -> &[(&'static str, Rejection)] {
+        self.rejection_ranges
+            .get(index)
+            .and_then(|range| self.last.get(range.clone()))
+            .unwrap_or_default()
+    }
+
     pub(crate) fn begin_batch(&mut self) {
         static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
         self.sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
         self.last.clear();
         self.accepted.clear();
+        self.rejection_ranges.clear();
+    }
+
+    pub(crate) fn record_command(&mut self, rejection_start: usize) {
+        let rejection_end = self.last.len();
+        if rejection_start == rejection_end {
+            self.accepted.push(self.rejection_ranges.len());
+        }
+        self.rejection_ranges.push(rejection_start..rejection_end);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::TestCtx;
+
+    #[test]
+    fn scale_t0_rejections_follow_batch_input_indices() {
+        let mut sim = TestCtx::new().g;
+        let accepted = WorldCommand::SetGameTime(*sim.read::<GameTime>());
+        let rejected = WorldCommand::MapBuildHouse(LotID::default());
+        let pattern = LanePatternBuilder::default().build();
+        let multi = WorldCommand::MapMakeMultipleConnections(
+            vec![
+                MapProject::ground(vec3(100.0, 100.0, 0.0)),
+                MapProject::ground(vec3(100.5, 100.0, 0.0)),
+                MapProject {
+                    pos: vec3(300.0, 100.0, 0.0),
+                    kind: ProjectKind::Road(RoadID::default()),
+                },
+            ],
+            vec![(0, 1, None, pattern.clone()), (0, 2, None, pattern)],
+        );
+        sim.apply_commands([&rejected, &accepted, &multi, &rejected]);
+
+        let house = ("MapBuildHouse", Rejection::MissingReference);
+        let invalid = ("MapMakeMultipleConnections", Rejection::InvalidConnection);
+        let missing = ("MapMakeMultipleConnections", Rejection::MissingReference);
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert_eq!(outcomes.accepted, [1]);
+        assert_eq!(outcomes.last, [house, invalid, missing, house]);
+        assert_eq!(outcomes.rejections_for(0), [house]);
+        assert!(outcomes.rejections_for(1).is_empty());
+        assert_eq!(outcomes.rejections_for(2), [invalid, missing]);
+        assert_eq!(outcomes.rejections_for(3), [house]);
+        assert!(outcomes.rejections_for(4).is_empty());
+        let sequence = outcomes.batch_seq();
+        drop(outcomes);
+
+        sim.apply_commands([]);
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert_eq!(outcomes.batch_seq(), sequence);
+        assert_eq!(outcomes.rejections_for(2), [invalid, missing]);
+        drop(outcomes);
+
+        sim.apply_commands([&accepted, &rejected]);
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert_eq!(outcomes.accepted, [0]);
+        assert_eq!(outcomes.last, [house]);
+        assert!(outcomes.rejections_for(0).is_empty());
+        assert_eq!(outcomes.rejections_for(1), [house]);
+        assert!(outcomes.rejections_for(2).is_empty());
     }
 }
 

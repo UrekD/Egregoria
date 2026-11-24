@@ -7,7 +7,7 @@ use std::time::Instant;
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use common::history::History;
 use common::saveload::{self, SlotId};
-use engine::{Context, FrameContext, InputContext, MeshBuilder};
+use engine::{Context, FrameContext, InputContext, MeshBuilder, Tesselator};
 use geom::{vec2, vec3, Camera, LinearColor};
 use simulation::economy::Government;
 use simulation::Simulation;
@@ -247,43 +247,51 @@ impl engine::framework::State for State {
         let start = Instant::now();
         let sim = self.sim.read().unwrap();
 
-        let camera = self.uiw.read::<OrbitCamera>();
-
-        let time: GameTime = *self.sim.read().unwrap().read::<GameTime>();
+        let camera = self.uiw.camera().camera;
+        let time = render_time(&sim);
 
         if self.automation.is_some() {
             // Scripted map changes are applied through ticks, so the tick identifies the snapshot.
             map_renderer.meshb.set_map_version(sim.get_tick());
         }
-        gui::overlays::prepare_ground(
-            &self.uiw,
-            &sim,
-            map_renderer,
-            &mut ctx.gfx,
-            self.uiw.read::<SessionState>().generation,
-        );
+        let generation = self.uiw.read::<SessionState>().generation;
+        gui::overlays::prepare_ground(&self.uiw, &sim, map_renderer, &mut ctx.gfx, generation);
+        let tool = *self.uiw.read::<Tool>();
         map_renderer.render(
             &sim.map(),
             time.seconds,
-            &camera.camera,
+            &camera,
             MapRenderOptions {
-                show_arrows: self.uiw.read::<Tool>().show_arrows(),
-                show_lots: self.uiw.read::<Tool>().show_lots(),
+                show_arrows: tool.show_arrows(),
+                show_lots: tool.show_lots(),
             },
             &mut self.uiw.write::<ImmediateDraw>(),
             ctx,
         );
 
-        self.instanced_renderer
-            .render(&self.sim.read().unwrap(), ctx);
+        self.instanced_renderer.render(&sim, ctx);
         if !self.uiw.read::<SessionState>().interaction_blocked {
             gui::overlays::draw(&sim, &self.uiw);
         }
 
-        drop(sim);
-        drop(camera);
+        {
+            profiling::scope!("immediate_draw");
+            self.immediate_renderer.clear();
+            let mut tess = self.immediate_renderer.mk_tess();
+            self.uiw.camera().cull_tess(&mut tess);
+            Self::prepare_debug_draw(&self.uiw, &sim, &mut tess);
+            drop(sim);
 
-        self.immediate_draw(ctx);
+            {
+                let mut immediate = self.uiw.write::<ImmediateDraw>();
+                immediate.apply(&mut tess, ctx);
+                immediate.orders.clear();
+            }
+            if let Some(mut mesh) = self.immediate_renderer.build(ctx.gfx) {
+                mesh.skip_depth = true;
+                ctx.draw(mesh);
+            }
+        }
 
         self.uiw
             .write::<Timings>()
@@ -861,66 +869,50 @@ impl State {
         drop(map);
     }
 
-    fn immediate_draw(&mut self, ctx: &mut FrameContext) {
-        profiling::scope!("immediate_draw");
-
-        self.immediate_renderer.clear();
-
-        let mut tess = self.immediate_renderer.mk_tess();
-
-        self.uiw.read::<OrbitCamera>().cull_tess(&mut tess);
-
-        if session::world_interaction(&self.uiw) {
+    fn prepare_debug_draw(uiw: &UiWorld, sim: &Simulation, tess: &mut Tesselator<'_>) {
+        if session::world_interaction(uiw) {
             profiling::scope!("debug_objs");
-            let sim = self.sim.read().unwrap();
-            let objs = self.uiw.read::<DebugObjs>();
+            let objs = uiw.read::<DebugObjs>();
             for (val, _, obj) in &objs.0 {
                 if *val {
-                    obj(&mut tess, &sim, &self.uiw);
+                    obj(tess, sim, uiw);
                 }
             }
         }
 
-        {
-            let sim = self.sim.read().unwrap();
-            let immediate = &mut *self.uiw.write::<ImmediateDraw>();
-            let map = sim.map();
-            let mut col = LinearColor::WHITE;
-            col.a = 0.2;
-            unsafe {
-                for v in &*addr_of!(geom::DEBUG_POS) {
-                    immediate.circle(*v, 1.0).color(LinearColor::RED);
-                }
-                for v in &*addr_of!(geom::DEBUG_OBBS) {
-                    immediate
-                        .obb(*v, map.environment.height(v.center()).unwrap_or(0.0) + 8.0)
-                        .color(col);
-                }
-                for v in &*addr_of!(geom::DEBUG_SPLINES) {
-                    immediate
-                        .polyline(
-                            v.smart_points(1.0, 0.0, 1.0)
-                                .map(|x| x.z(10.0))
-                                .collect::<Vec<_>>(),
-                            5.0,
-                            false,
-                        )
-                        .color(col);
-                }
-                geom::DEBUG_OBBS.clear();
-                geom::DEBUG_SPLINES.clear();
-                geom::DEBUG_POS.clear();
+        let mut immediate = uiw.write::<ImmediateDraw>();
+        let map = sim.map();
+        let mut col = LinearColor::WHITE;
+        col.a = 0.2;
+        unsafe {
+            for v in &*addr_of!(geom::DEBUG_POS) {
+                immediate.circle(*v, 1.0).color(LinearColor::RED);
             }
-
-            immediate.apply(&mut tess, ctx);
-            immediate.orders.clear();
-        }
-
-        if let Some(mut x) = self.immediate_renderer.build(ctx.gfx) {
-            x.skip_depth = true;
-            ctx.draw(x)
+            for v in &*addr_of!(geom::DEBUG_OBBS) {
+                immediate
+                    .obb(*v, map.environment.height(v.center()).unwrap_or(0.0) + 8.0)
+                    .color(col);
+            }
+            for v in &*addr_of!(geom::DEBUG_SPLINES) {
+                immediate
+                    .polyline(
+                        v.smart_points(1.0, 0.0, 1.0)
+                            .map(|x| x.z(10.0))
+                            .collect::<Vec<_>>(),
+                        5.0,
+                        false,
+                    )
+                    .color(col);
+            }
+            geom::DEBUG_OBBS.clear();
+            geom::DEBUG_SPLINES.clear();
+            geom::DEBUG_POS.clear();
         }
     }
+}
+
+fn render_time(sim: &Simulation) -> GameTime {
+    *sim.read::<GameTime>()
 }
 
 fn take_world_job_result(
@@ -974,6 +966,62 @@ fn route_close_input(
 fn ready_to_exit(uiw: &UiWorld) -> bool {
     let io = uiw.read::<SaveLoadState>();
     io.exit_requested && io.save_result.is_none()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn scale_t0_render_read_with_writer_pending() {
+    use std::sync::TryLockError;
+    use std::thread;
+    use std::time::Duration;
+
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let sim = Simulation::new(false);
+    let expected_tick = sim.get_tick();
+    let sim = Arc::new(RwLock::new(sim));
+    let (guard_held, guard_ready) = mpsc::channel();
+    let (prepare, prepare_frame) = mpsc::channel();
+    let (frame_prepared, frame) = mpsc::channel();
+    let reader = thread::spawn({
+        let sim = Arc::clone(&sim);
+        move || {
+            let guard = sim.read().unwrap();
+            guard_held.send(()).unwrap();
+            prepare_frame.recv().unwrap();
+            let time = render_time(&guard);
+            drop(guard);
+            frame_prepared.send(time.tick.0).unwrap();
+        }
+    });
+    let timeout = Duration::from_secs(5);
+    guard_ready.recv_timeout(timeout).unwrap();
+
+    let writer = thread::spawn({
+        let sim = Arc::clone(&sim);
+        move || drop(sim.write().unwrap())
+    });
+    // On Linux, a queued writer prevents further readers while the first reader holds the lock.
+    let deadline = Instant::now() + timeout;
+    loop {
+        match sim.try_read() {
+            Err(TryLockError::WouldBlock) => break,
+            Err(error) => panic!("could not probe the simulation lock: {error}"),
+            Ok(_) => {}
+        }
+        assert!(Instant::now() < deadline, "the writer did not queue");
+        thread::sleep(Duration::from_millis(1));
+    }
+
+    prepare.send(()).unwrap();
+    assert_eq!(
+        frame
+            .recv_timeout(timeout)
+            .expect("render read blocked behind the writer"),
+        expected_tick,
+    );
+    reader.join().unwrap();
+    writer.join().unwrap();
 }
 
 #[cfg(test)]

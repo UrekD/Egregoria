@@ -476,14 +476,11 @@ impl Simulation {
         let topology_generation = self.map().walking_topology_generation;
         let recording_start = self.read::<Replay>().command_count();
         self.write::<CommandOutcomes>().begin_batch();
-        for (index, command) in commands.enumerate() {
+        for command in commands {
             let before = self.read::<CommandOutcomes>().last.len();
             command.apply_in_batch(self, construction);
             utils::scheduler::drain_commands(self);
-            let mut outcomes = self.write::<CommandOutcomes>();
-            if outcomes.last.len() == before {
-                outcomes.accepted.push(index);
-            }
+            self.write::<CommandOutcomes>().record_command(before);
         }
         if self.map().walking_topology_generation != topology_generation {
             transit::on_topology_changed(self);
