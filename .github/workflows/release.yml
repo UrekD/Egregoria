@@ -28,13 +28,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        build: [linux, macos, windows]
+        build: [linux, windows]  # macos disabled for now (hosted runner capacity)
         include:
           - build: linux
             os: ubuntu-latest
-            exe: ''
-          - build: macos
-            os: macos-latest
             exe: ''
           - build: windows
             os: windows-latest
@@ -115,10 +112,8 @@ jobs:
       - name: Name release assets
         run: |
           cd artifacts
-          mv egregoria-macos-latest.zip macos.zip
           mv egregoria-ubuntu-latest.zip linux.zip
           mv egregoria-windows-latest.zip windows.zip
-          mv egregoria-macos-latest-headless.zip macos-headless.zip
           mv egregoria-ubuntu-latest-headless.zip linux-headless.zip
           mv egregoria-windows-latest-headless.zip windows-headless.zip
           ls -l
@@ -131,5 +126,5 @@ jobs:
           --verify-tag
           --repo "${GITHUB_REPOSITORY}"
           --title "Release ${GITHUB_REF_NAME}"
-          artifacts/macos.zip artifacts/linux.zip artifacts/windows.zip
-          artifacts/macos-headless.zip artifacts/linux-headless.zip artifacts/windows-headless.zip
+          artifacts/linux.zip artifacts/windows.zip
+          artifacts/linux-headless.zip artifacts/windows-headless.zip
