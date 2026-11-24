@@ -1,4 +1,4 @@
-use scenarios::builtin::{demo_cities, growth_basic, perf, PERF_10K, SCENARIOS};
+use scenarios::builtin::{demo_cities, growth_basic, perf, water_fixtures, PERF_10K, SCENARIOS};
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
 use serde::Serialize;
@@ -25,7 +25,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios water-fixtures --save-root <dir>\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
 }
 
 fn main() -> ExitCode {
@@ -204,15 +204,19 @@ fn run() -> Result<(), String> {
         );
         return Ok(());
     }
-    if name == "demo-cities" {
+    if matches!(name.as_str(), "demo-cities" | "water-fixtures") {
         if args.next().as_deref() != Some(std::ffi::OsStr::new("--save-root")) {
-            return Err("usage: scenarios demo-cities --save-root <dir>".into());
+            return Err(format!("usage: scenarios {name} --save-root <dir>"));
         }
         let root = path_arg(&mut args, "--save-root", "a directory")?;
         if let Some(arg) = args.next() {
-            return Err(format!("unexpected demo-cities argument {arg:?}"));
+            return Err(format!("unexpected {name} argument {arg:?}"));
         }
-        return demo_cities::generate(&root);
+        return if name == "water-fixtures" {
+            water_fixtures::generate(&root)
+        } else {
+            demo_cities::generate(&root)
+        };
     }
     let available = if name == PERF_10K.0.name {
         std::slice::from_ref(&PERF_10K)

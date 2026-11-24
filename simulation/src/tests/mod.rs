@@ -22,6 +22,7 @@ mod p5_bridge;
 mod p5_core_loop;
 mod p5_placement;
 mod p5_spine_followups;
+mod p6_water;
 mod test_iso;
 mod vehicles;
 mod zone2_lot_layout;
