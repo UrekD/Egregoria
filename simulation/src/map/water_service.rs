@@ -1,20 +1,21 @@
-use std::collections::BTreeMap;
+use std::cmp::Reverse;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use geom::{vec2, Intersect, Polygon, Segment, Shape, Vec2, AABB, OBB};
+use geom::{vec2, Polygon, Segment, Shape, Vec2, AABB, OBB};
 use ordered_float::OrderedFloat;
 use prototypes::{
     try_prototype, ServiceID, ServiceKind, ServicePrototype, DEFAULT_WATER_SERVICE_DISTANCE_M,
     MAX_WATER_SERVICE_DISTANCE_M,
 };
 
-use crate::map::{spend_water_work, Building, BuildingID, BuildingKind, Map, RoadID};
+use crate::map::{spend_water_work, Building, BuildingID, BuildingKind, Map, RoadID, Roads};
 
 use super::{
     intersects_tiles, Environment, Occupant, PreparedWaterEdit, ShoreContact, TerrainChunkID,
-    TileBounds, TileMask, WaterBodyId, WaterEditError, WaterKind, WaterTileCoord, CELL_SIZE,
-    DIRECTIONS, TILES_PER_CHUNK,
+    TileBounds, TileMask, WaterBodyId, WaterDirtyChunks, WaterEditError, WaterKind, WaterTileCoord,
+    CELL_SIZE, DIRECTIONS, TILES_PER_CHUNK,
 };
 
 pub const MIN_RIVER_SEPARATION_M: u16 = 32;
@@ -58,7 +59,9 @@ impl WaterSiteRequest {
         footprint: OBB,
         connected_road: Option<RoadID>,
     ) -> Option<Self> {
-        let service = try_prototype(ServiceID::from(kind.as_goods_company()?))?;
+        let id = ServiceID::from(kind.as_goods_company()?);
+        prototypes::try_prototypes()?;
+        let service = try_prototype(id)?;
         Self::from_prototype(service, footprint, connected_road)
     }
 
@@ -141,58 +144,73 @@ impl fmt::Display for WaterSiteError {
 
 type SiteResult = Result<WaterSite, WaterSiteError>;
 
-#[derive(Clone, Copy)]
-struct RiverProvider {
-    reach_m: u16,
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct RiverIntake {
+    reach_m: Reverse<u16>,
     id: BuildingID,
 }
 
-#[derive(Default)]
-struct RiverExtrema {
-    intakes: [Option<RiverProvider>; 2],
-    outlets: [Option<RiverProvider>; 2],
+#[derive(Clone, Default)]
+struct RiverProviders {
+    intakes: BTreeSet<RiverIntake>,
+    outlets: BTreeSet<(u16, BuildingID)>,
 }
 
-impl RiverExtrema {
-    fn insert(&mut self, role: WaterServiceRole, mut provider: RiverProvider) {
-        let key = |p: RiverProvider| match role {
-            WaterServiceRole::Intake => (u16::MAX - p.reach_m, p.id),
-            WaterServiceRole::Outlet => (p.reach_m, p.id),
-        };
-        let extrema = match role {
-            WaterServiceRole::Intake => &mut self.intakes,
-            WaterServiceRole::Outlet => &mut self.outlets,
-        };
-        for slot in extrema {
-            if slot.is_none_or(|current| key(provider) < key(current)) {
-                let Some(previous) = slot.replace(provider) else {
-                    break;
-                };
-                provider = previous;
-            }
-        }
-    }
+fn river_contact(site: SiteResult) -> Option<(WaterBodyId, u16)> {
+    let WaterSite::Shore { contact, .. } = site.ok()? else {
+        return None;
+    };
+    Some((contact.body, contact.reach_m?))
 }
 
-/// Physical providers across all roads. The top two extrema allow an existing
-/// provider to be excluded without resampling the river.
-#[derive(Default)]
+/// Physical providers across all roads, ordered by river reach and then building ID.
+#[derive(Clone, Default)]
 pub struct RiverSiteSummary {
-    rivers: BTreeMap<WaterBodyId, RiverExtrema>,
+    rivers: BTreeMap<WaterBodyId, RiverProviders>,
     sites: BTreeMap<BuildingID, (WaterServiceRole, SiteResult)>,
 }
 
 impl RiverSiteSummary {
     fn insert(&mut self, id: BuildingID, role: WaterServiceRole, site: SiteResult) {
-        if let Ok(WaterSite::Shore { contact, .. }) = site {
-            if let Some(reach_m) = contact.reach_m {
-                self.rivers
-                    .entry(contact.body)
-                    .or_default()
-                    .insert(role, RiverProvider { reach_m, id });
+        self.remove(id);
+        if let Some((body, reach_m)) = river_contact(site) {
+            let river = self.rivers.entry(body).or_default();
+            match role {
+                WaterServiceRole::Intake => {
+                    river.intakes.insert(RiverIntake {
+                        reach_m: Reverse(reach_m),
+                        id,
+                    });
+                }
+                WaterServiceRole::Outlet => {
+                    river.outlets.insert((reach_m, id));
+                }
             }
         }
         self.sites.insert(id, (role, site));
+    }
+
+    fn remove(&mut self, id: BuildingID) {
+        let Some((role, site)) = self.sites.remove(&id) else {
+            return;
+        };
+        if let Some((body, reach_m)) = river_contact(site) {
+            let river = self.rivers.get_mut(&body).unwrap();
+            match role {
+                WaterServiceRole::Intake => {
+                    river.intakes.remove(&RiverIntake {
+                        reach_m: Reverse(reach_m),
+                        id,
+                    });
+                }
+                WaterServiceRole::Outlet => {
+                    river.outlets.remove(&(reach_m, id));
+                }
+            }
+            if river.intakes.is_empty() && river.outlets.is_empty() {
+                self.rivers.remove(&body);
+            }
+        }
     }
 
     pub fn provider_site(&self, id: BuildingID) -> Option<SiteResult> {
@@ -207,56 +225,216 @@ impl RiverSiteSummary {
         building: Option<BuildingID>,
         purpose: WaterSitePurpose,
     ) -> SiteResult {
-        let WaterSite::Shore { contact, .. } = site? else {
+        let Some((body, reach_m)) = river_contact(site) else {
             return site;
         };
-        let (Some(reach), Some(river)) = (contact.reach_m, self.rivers.get(&contact.body)) else {
+        let Some(river) = self.rivers.get(&body) else {
             return site;
         };
-        let (extrema, upstream) = match (role, purpose) {
-            (WaterServiceRole::Intake, WaterSitePurpose::Live) => return site,
-            (WaterServiceRole::Intake, WaterSitePurpose::Placement) => (&river.outlets, true),
-            (WaterServiceRole::Outlet, _) => (&river.intakes, false),
-        };
-        let Some(other) = extrema
-            .iter()
-            .flatten()
-            .find(|other| Some(other.id) != building)
-        else {
-            return site;
-        };
-        let (intake, outlet) = if upstream {
-            (reach, other.reach_m)
-        } else {
-            (other.reach_m, reach)
-        };
-        if u32::from(outlet) < u32::from(intake) + u32::from(MIN_RIVER_SEPARATION_M) {
-            return Err(WaterSiteError::OrderConflict {
-                role,
-                body: contact.body,
-                provider: other.id,
-                reach_m: other.reach_m,
-            });
+        match (role, purpose) {
+            (WaterServiceRole::Intake, WaterSitePurpose::Live) => {}
+            (WaterServiceRole::Intake, WaterSitePurpose::Placement) => {
+                if let Some(&(outlet, id)) =
+                    river.outlets.iter().find(|(_, id)| Some(*id) != building)
+                {
+                    if too_close(reach_m, outlet) {
+                        return Err(WaterSiteError::OrderConflict {
+                            role,
+                            body,
+                            provider: id,
+                            reach_m: outlet,
+                        });
+                    }
+                }
+            }
+            (WaterServiceRole::Outlet, _) => {
+                let intake = river
+                    .intakes
+                    .iter()
+                    .find(|intake| Some(intake.id) != building);
+                return check_outlet_order(site, body, reach_m, intake.copied());
+            }
         }
         site
     }
 }
 
+fn too_close(intake: u16, outlet: u16) -> bool {
+    u32::from(outlet) < u32::from(intake) + u32::from(MIN_RIVER_SEPARATION_M)
+}
+
+fn check_outlet_order(
+    site: SiteResult,
+    body: WaterBodyId,
+    outlet_reach_m: u16,
+    intake: Option<RiverIntake>,
+) -> SiteResult {
+    if let Some(intake) = intake.filter(|intake| too_close(intake.reach_m.0, outlet_reach_m)) {
+        return Err(WaterSiteError::OrderConflict {
+            role: WaterServiceRole::Outlet,
+            body,
+            provider: intake.id,
+            reach_m: intake.reach_m.0,
+        });
+    }
+    site
+}
+
 #[derive(Default)]
 pub(crate) struct WaterServiceCache {
     shores: Mutex<ShoreIndex>,
-    providers: Mutex<Option<ProviderSnapshot>>,
+    providers: Mutex<ProviderIndex>,
 }
 
-struct ProviderSnapshot {
-    water_revision: u64,
-    topology_generation: u64,
-    prototypes: &'static prototypes::Prototypes,
+#[derive(Clone)]
+struct ProviderIndex {
+    prototypes: Option<&'static prototypes::Prototypes>,
     summary: Arc<RiverSiteSummary>,
+    requests: BTreeMap<BuildingID, WaterSiteRequest>,
+    chunks: BTreeMap<TerrainChunkID, BTreeSet<BuildingID>>,
+}
+
+impl Default for ProviderIndex {
+    fn default() -> Self {
+        Self {
+            prototypes: prototypes::try_prototypes(),
+            summary: Arc::default(),
+            requests: BTreeMap::new(),
+            chunks: BTreeMap::new(),
+        }
+    }
+}
+
+impl ProviderIndex {
+    fn building_changed(
+        &mut self,
+        env: &Environment,
+        roads: &Roads,
+        shores: &mut ShoreIndex,
+        building: &Building,
+    ) {
+        self.building_removed(env, building.id);
+        let Some(request) = WaterSiteRequest::for_building(building) else {
+            return;
+        };
+        for chunk in provider_chunks(env, request) {
+            self.chunks.entry(chunk).or_default().insert(building.id);
+        }
+        self.requests.insert(building.id, request);
+        shores.sync(env);
+        let mut remaining = usize::MAX;
+        let site = shores
+            .geometric_site(
+                roads,
+                &WaterTerrain::new(env, None),
+                request,
+                &mut remaining,
+            )
+            .expect("map-bounded water site search");
+        Arc::make_mut(&mut self.summary).insert(building.id, request.role, site);
+    }
+
+    fn building_removed(&mut self, env: &Environment, id: BuildingID) {
+        let Some(request) = self.requests.remove(&id) else {
+            return;
+        };
+        for chunk in provider_chunks(env, request) {
+            let providers = self.chunks.get_mut(&chunk).unwrap();
+            providers.remove(&id);
+            if providers.is_empty() {
+                self.chunks.remove(&chunk);
+            }
+        }
+        Arc::make_mut(&mut self.summary).remove(id);
+    }
+
+    fn affected_buildings(
+        &self,
+        chunks: &BTreeSet<TerrainChunkID>,
+        activating: bool,
+        remaining: &mut usize,
+    ) -> Result<BTreeSet<BuildingID>, WaterEditError> {
+        if activating {
+            spend_water_work(remaining, self.requests.len())?;
+            return Ok(self.requests.keys().copied().collect());
+        }
+        let mut candidates = BTreeSet::new();
+        spend_water_work(remaining, chunks.len())?;
+        for chunk in chunks {
+            if let Some(ids) = self.chunks.get(chunk) {
+                spend_water_work(remaining, ids.len())?;
+                candidates.extend(ids);
+            }
+        }
+        Ok(candidates)
+    }
+}
+
+fn provider_chunks(
+    env: &Environment,
+    request: WaterSiteRequest,
+) -> impl Iterator<Item = TerrainChunkID> {
+    let reach = request
+        .max_water_distance_m
+        .min(MAX_WATER_SERVICE_DISTANCE_M);
+    // The extra tile matches the shore lookup for edges on a chunk seam.
+    env.covered_chunks(request.footprint.bbox().expand(reach).expand(CELL_SIZE))
+}
+
+impl Clone for WaterServiceCache {
+    fn clone(&self) -> Self {
+        Self {
+            shores: Mutex::default(),
+            providers: Mutex::new(self.providers.lock().unwrap().clone()),
+        }
+    }
 }
 
 impl WaterServiceCache {
-    pub(crate) fn water_edited(&mut self, env: &Environment, dirty: &super::WaterDirtyChunks) {
+    pub(crate) fn from_map(map: &Map) -> Self {
+        let mut cache = Self::default();
+        for building in map.buildings().values() {
+            cache.building_changed(map.environment(), map.roads(), building);
+        }
+        cache
+    }
+
+    pub(crate) fn building_changed(
+        &mut self,
+        env: &Environment,
+        roads: &Roads,
+        building: &Building,
+    ) {
+        self.providers.get_mut().unwrap().building_changed(
+            env,
+            roads,
+            self.shores.get_mut().unwrap(),
+            building,
+        );
+    }
+
+    pub(crate) fn building_removed(&mut self, env: &Environment, id: BuildingID) {
+        self.providers.get_mut().unwrap().building_removed(env, id);
+    }
+
+    fn provider_index(&self, map: &Map) -> MutexGuard<'_, ProviderIndex> {
+        let mut index = self.providers.lock().unwrap();
+        // Normally prototypes are loaded before the map. Rebuild only if that
+        // registry becomes available later or is replaced.
+        if index.prototypes.map(std::ptr::from_ref)
+            != prototypes::try_prototypes().map(std::ptr::from_ref)
+        {
+            *index = Self::from_map(map).providers.into_inner().unwrap();
+        }
+        index
+    }
+
+    pub(crate) fn water_edited(
+        &mut self,
+        env: &Environment,
+        dirty: &WaterDirtyChunks,
+        changes: PreparedWaterProviders,
+    ) {
         let shores = self.shores.get_mut().unwrap();
         // Commits publish shore dependencies for both sides of an affected seam.
         if shores.revision.checked_add(1) == Some(env.water_revision()) {
@@ -265,47 +443,20 @@ impl WaterServiceCache {
             }
             shores.revision = env.water_revision();
         }
+        let index = self.providers.get_mut().unwrap();
+        for (id, site) in changes.sites {
+            let role = index.requests[&id].role;
+            Arc::make_mut(&mut index.summary).insert(id, role, site);
+        }
     }
 }
 
 /// Acquire one physical summary for placement or the scheduled utility pass.
 pub fn river_site_summary(map: &Map) -> Arc<RiverSiteSummary> {
-    let env = map.environment();
-    if !env.strict_water_siting() {
+    if !map.environment().strict_water_siting() {
         return Arc::default();
     }
-    let water_revision = env.water_revision();
-    let topology_generation = map.electricity.generation();
-    let prototypes = prototypes::prototypes();
-    let mut cached = map.water_services.providers.lock().unwrap();
-    if let Some(snapshot) = cached.as_ref().filter(|snapshot| {
-        snapshot.water_revision == water_revision
-            && snapshot.topology_generation == topology_generation
-            && std::ptr::eq(snapshot.prototypes, prototypes)
-    }) {
-        return Arc::clone(&snapshot.summary);
-    }
-    let mut summary = RiverSiteSummary::default();
-    let mut shores = map.water_services.shores.lock().unwrap();
-    shores.sync(env);
-    let terrain = WaterTerrain::new(env, None);
-    let mut remaining = usize::MAX;
-    for building in map.buildings().values() {
-        if let Some(request) = WaterSiteRequest::for_building(building) {
-            let site = shores
-                .geometric_site(map, &terrain, request, &mut remaining)
-                .expect("map-bounded water site search");
-            summary.insert(building.id, request.role, site);
-        }
-    }
-    let summary = Arc::new(summary);
-    *cached = Some(ProviderSnapshot {
-        water_revision,
-        topology_generation,
-        prototypes,
-        summary: Arc::clone(&summary),
-    });
-    summary
+    Arc::clone(&map.water_services.provider_index(map).summary)
 }
 
 /// Choose the physical contact before applying river order.
@@ -319,7 +470,12 @@ pub fn water_service_site(
     shores.sync(env);
     let mut remaining = usize::MAX;
     let site = shores
-        .geometric_site(map, &WaterTerrain::new(env, None), request, &mut remaining)
+        .geometric_site(
+            map.roads(),
+            &WaterTerrain::new(env, None),
+            request,
+            &mut remaining,
+        )
         .expect("map-bounded water site search");
     summary.check_order(site, request.role, request.building, request.purpose)
 }
@@ -340,10 +496,14 @@ pub fn validate_water_service_placement(
 
 /// Current physical site status for an installed provider, irrespective of staffing or power.
 pub fn water_provider_site(map: &Map, id: BuildingID) -> Option<SiteResult> {
-    if map.environment().strict_water_siting() {
-        return river_site_summary(map).provider_site(id);
-    }
     let request = WaterSiteRequest::for_building(map.get(id)?)?;
+    if map.environment().strict_water_siting() {
+        return map
+            .water_services
+            .provider_index(map)
+            .summary
+            .provider_site(id);
+    }
     Some(water_service_site(
         map,
         request,
@@ -351,66 +511,128 @@ pub fn water_provider_site(map: &Map, id: BuildingID) -> Option<SiteResult> {
     ))
 }
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub struct WaterProviderImpact {
-    pub count: usize,
-    pub sample: Vec<BuildingID>,
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WaterProviderImpactSample {
+    pub building: BuildingID,
+    pub proposed_site: Result<WaterSite, WaterSiteError>,
 }
 
-pub(crate) fn water_provider_impact(
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct WaterProviderImpact {
+    pub count: usize,
+    pub sample: Vec<WaterProviderImpactSample>,
+}
+
+#[derive(Default)]
+pub(crate) struct PreparedWaterProviders {
+    pub(crate) impact: WaterProviderImpact,
+    sites: BTreeMap<BuildingID, SiteResult>,
+}
+
+pub(crate) fn prepare_water_providers(
     map: &Map,
     edit: &PreparedWaterEdit,
     remaining: &mut usize,
-) -> Result<WaterProviderImpact, WaterEditError> {
+) -> Result<PreparedWaterProviders, WaterEditError> {
     const SAMPLE_LIMIT: usize = 8;
+    let mut changes = PreparedWaterProviders::default();
     if !edit.strict_water_siting() || edit.dirty().water().is_empty() {
-        return Ok(WaterProviderImpact::default());
+        return Ok(changes);
     }
     let env = map.environment();
-    let live = WaterTerrain::new(env, None);
+    let index = map.water_services.provider_index(map);
+    let live = &index.summary;
+    let mut shores = ShoreIndex::default();
     let proposed = WaterTerrain::new(env, Some(edit));
-    // Use local indexes so work limits and preview results are independent of cache warmth.
-    let mut live_shores = ShoreIndex::default();
-    let mut proposed_shores = ShoreIndex::default();
-    let mut before = RiverSiteSummary::default();
-    let mut after = RiverSiteSummary::default();
+    let mut affected_rivers = BTreeMap::<_, Option<RiverIntake>>::new();
 
-    spend_water_work(remaining, map.buildings().len())?;
-    for building in map.buildings().values() {
-        let Some(request) = WaterSiteRequest::for_building(building) else {
+    let candidates =
+        index.affected_buildings(edit.dirty().water(), !env.strict_water_siting(), remaining)?;
+    for id in candidates {
+        let request = index.requests[&id];
+        let old = live.sites[&id].1;
+        let new = shores.geometric_site(map.roads(), &proposed, request, remaining)?;
+        if old == new {
             continue;
-        };
-        let old = live_shores.geometric_site(map, &live, request, remaining)?;
-        let new = if !live.strict()
-            || env
-                .covered_chunks(
-                    request
-                        .footprint
-                        .bbox()
-                        .expand(request.max_water_distance_m + CELL_SIZE),
-                )
-                .any(|chunk| edit.dirty().water().contains(&chunk))
-        {
-            proposed_shores.geometric_site(map, &proposed, request, remaining)?
-        } else {
-            old
-        };
-        before.insert(building.id, request.role, old);
-        after.insert(building.id, request.role, new);
-    }
-
-    let mut impact = WaterProviderImpact::default();
-    for &id in after.sites.keys() {
-        if before.sites.get(&id) != after.sites.get(&id)
-            || before.provider_site(id) != after.provider_site(id)
-        {
-            impact.count += 1;
-            if impact.sample.len() < SAMPLE_LIMIT {
-                impact.sample.push(id);
+        }
+        changes.sites.insert(id, new);
+        if request.role == WaterServiceRole::Intake {
+            if let Some((body, _)) = river_contact(old) {
+                affected_rivers.entry(body).or_default();
+            }
+            if let Some((body, reach_m)) = river_contact(new) {
+                let best = affected_rivers.entry(body).or_default();
+                let intake = RiverIntake {
+                    reach_m: Reverse(reach_m),
+                    id,
+                };
+                *best = Some(best.map_or(intake, |previous| previous.min(intake)));
             }
         }
     }
-    Ok(impact)
+
+    let mut affected = BTreeSet::new();
+    for (&body, new_intake) in &mut affected_rivers {
+        let Some(current) = live.rivers.get(&body) else {
+            continue;
+        };
+        // Combine the rebound intakes with the highest unchanged intake on this river.
+        for intake in &current.intakes {
+            spend_water_work(remaining, 1)?;
+            if !changes.sites.contains_key(&intake.id) {
+                *new_intake = Some(new_intake.map_or(*intake, |candidate| candidate.min(*intake)));
+                break;
+            }
+        }
+        let old_intake = current.intakes.first().copied();
+        if old_intake == *new_intake {
+            continue;
+        }
+        let limit = old_intake.into_iter().chain(*new_intake).min().unwrap();
+        // Outlets beyond both separation thresholds stay valid.
+        for &(reach, id) in current
+            .outlets
+            .iter()
+            .take_while(|(reach, _)| too_close(limit.reach_m.0, *reach))
+        {
+            spend_water_work(remaining, 1)?;
+            let site = live.sites[&id].1;
+            if check_outlet_order(site, body, reach, old_intake)
+                != check_outlet_order(site, body, reach, *new_intake)
+            {
+                affected.insert(id);
+            }
+        }
+    }
+    affected.extend(changes.sites.keys().copied());
+
+    changes.impact = WaterProviderImpact {
+        count: affected.len(),
+        sample: affected
+            .into_iter()
+            .take(SAMPLE_LIMIT)
+            .map(|building| {
+                let (role, old) = live.sites[&building];
+                let site = changes.sites.get(&building).copied().unwrap_or(old);
+                let proposed_site = match (role, river_contact(site)) {
+                    (WaterServiceRole::Outlet, Some((body, reach))) => {
+                        let intake = affected_rivers.get(&body).copied().unwrap_or_else(|| {
+                            live.rivers
+                                .get(&body)
+                                .and_then(|river| river.intakes.first().copied())
+                        });
+                        check_outlet_order(site, body, reach, intake)
+                    }
+                    _ => site,
+                };
+                WaterProviderImpactSample {
+                    building,
+                    proposed_site,
+                }
+            })
+            .collect(),
+    };
+    Ok(changes)
 }
 
 /// Add ten points at an actual wet–dry edge, falling linearly to zero at 96 m.
@@ -523,14 +745,14 @@ impl ShoreIndex {
 
     fn geometric_site(
         &mut self,
-        map: &Map,
+        roads: &Roads,
         terrain: &WaterTerrain<'_>,
         request: WaterSiteRequest,
         remaining: &mut usize,
     ) -> Result<SiteResult, WaterEditError> {
         let Some(road) = request
             .connected_road
-            .filter(|&road| map.get(road).is_some())
+            .filter(|&road| roads.contains_key(road))
         else {
             return Ok(Err(WaterSiteError::MissingRoad));
         };
@@ -621,7 +843,12 @@ impl ShoreIndex {
             };
             spend_water_work(remaining, 1 + edges.len())?;
             for edge in edges.iter() {
-                if search.intersects(&edge.segment.bbox()) {
+                let edge_bounds = edge.segment.bbox();
+                if search.ll.x <= edge_bounds.ur.x
+                    && edge_bounds.ll.x <= search.ur.x
+                    && search.ll.y <= edge_bounds.ur.y
+                    && edge_bounds.ll.y <= search.ur.y
+                {
                     visit(edge);
                 }
             }
@@ -770,6 +997,173 @@ mod tests {
             Some(access),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn w3_water_exact_reach_accepts_fractional_footprints() {
+        let _test = crate::tests::TestCtx::new();
+        for (shore, left, right) in [(80.0, 23.999992, 32.0), (33_024.0, 33_072.0, 33_092.012)] {
+            let width = (shore / 512.0) as u16 + 1;
+            let mut env = Environment::generate(width, 1, MapPreset::Flat, 0, 0.0);
+            let center_x = if left < shore {
+                shore + 16.0
+            } else {
+                shore - 16.0
+            };
+            let body = env
+                .fill_lake(
+                    &Polygon::centered_rect(vec2(center_x, 256.0), 32.0, 64.0),
+                    -10,
+                    2.0,
+                )
+                .unwrap();
+            let mut map = Map::empty();
+            assert!(map.install_environment(env));
+            let access = road(&mut map, shore - 56.0, shore + 100.0, 160.0);
+            let request = WaterSiteRequest {
+                role: WaterServiceRole::Intake,
+                footprint: OBB::new_corners([
+                    vec2(left, 250.0),
+                    vec2(left, 262.0),
+                    vec2(right, 262.0),
+                    vec2(right, 250.0),
+                ]),
+                connected_road: Some(access),
+                max_water_distance_m: 48.0,
+                building: None,
+                purpose: WaterSitePurpose::Placement,
+            };
+            let site = water_service_site(&map, request, &RiverSiteSummary::default());
+            assert!(
+                matches!(site, Ok(WaterSite::Shore { contact, distance_m: 48.0, .. })
+                    if contact.body == body && contact.point.x == shore),
+                "expected the shore at x={shore}, got {site:?}"
+            );
+            assert_eq!(
+                water_service_site(
+                    &map,
+                    WaterSiteRequest {
+                        max_water_distance_m: 47.99,
+                        ..request
+                    },
+                    &RiverSiteSummary::default()
+                ),
+                Err(WaterSiteError::NoEligibleShore(WaterServiceRole::Intake))
+            );
+        }
+    }
+
+    #[test]
+    fn w3_water_local_edit_does_not_meter_remote_providers() {
+        let mut test = crate::tests::TestCtx::new();
+        let mut env = Environment::generate(5, 1, MapPreset::Flat, 0, 0.0);
+        env.fill_lake(
+            &Polygon::centered_rect(vec2(448.0, 256.0), 768.0, 32.0),
+            -10,
+            2.0,
+        )
+        .unwrap();
+        let mut map = Map::empty();
+        assert!(map.install_environment(env));
+        let access = road(&mut map, 32.0, 848.0, 176.0);
+        for i in 0..30 {
+            let x = 96.0 + 24.0 * i as f32;
+            place(&mut map, "water-pump", footprint(x, 212.0), access);
+            map.build_special_building(
+                &footprint(x, 144.0),
+                BuildingKind::House,
+                prototypes::BuildingGen::House,
+                None,
+                Some(access),
+            )
+            .unwrap();
+        }
+        let edit = WaterEdit::FillLake {
+            basin: WaterBasin::new(
+                Polygon::centered_rect(vec2(2208.0, 256.0), 32.0, 32.0).as_slice(),
+            )
+            .unwrap(),
+            level_dm: -10,
+            depth_m: 2.0,
+        };
+        let prepared = map.environment().prepare_water_edit(&edit).unwrap();
+        let mut remaining = 32;
+        let changes = prepare_water_providers(&map, &prepared, &mut remaining).unwrap();
+        assert_eq!(changes.impact, WaterProviderImpact::default());
+        assert!(changes.sites.is_empty());
+
+        let summary = river_site_summary(&map);
+        assert_eq!(summary.sites.len(), 30);
+        let house = map
+            .build_special_building(
+                &footprint(816.0, 144.0),
+                BuildingKind::House,
+                prototypes::BuildingGen::House,
+                None,
+                Some(access),
+            )
+            .unwrap();
+        assert!(water_provider_site(&map, house).is_none());
+        assert!(Arc::ptr_eq(&summary, &river_site_summary(&map)));
+
+        *test.g.map_mut() = map;
+        assert_eq!(
+            test.g.preview_water_edit(&edit).unwrap().provider_impact,
+            WaterProviderImpact::default()
+        );
+        test.g.edit_water(edit).unwrap();
+        assert!(Arc::ptr_eq(&summary, &river_site_summary(&test.g.map())));
+    }
+
+    #[test]
+    fn w3_water_local_rebind_rechecks_upstream_outlet() {
+        let mut test = crate::tests::TestCtx::new();
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::generate(3, 1, MapPreset::Flat, 0, 0.0)));
+        let south = road(&mut map, 640.0, 1000.0, 176.0);
+        let north = road(&mut map, 64.0, 432.0, 324.0);
+        let pump = place(&mut map, "water-pump", footprint(864.0, 212.0), south);
+        let outlet = place(&mut map, "sewage-outlet", footprint(240.0, 300.0), north);
+        *test.g.map_mut() = map;
+        let river = WaterEdit::CarveRiver {
+            polyline: WaterStroke::new(&[vec2(64.0, 256.0), vec2(1152.0, 256.0)]).unwrap(),
+            width_m: 32.0,
+            depth_m: 2.0,
+            level_dm: Some(-10),
+        };
+        test.g.edit_water(river).unwrap();
+        assert!(matches!(
+            water_provider_site(&test.g.map(), outlet),
+            Some(Err(WaterSiteError::OrderConflict { provider, .. })) if provider == pump
+        ));
+
+        let edit = WaterEdit::FillLake {
+            basin: WaterBasin::new(
+                Polygon::centered_rect(vec2(864.0, 232.0), 128.0, 16.0).as_slice(),
+            )
+            .unwrap(),
+            level_dm: -10,
+            depth_m: 2.0,
+        };
+        let preview = test.g.preview_water_edit(&edit).unwrap();
+        let outlet_chunk = TerrainChunkID::new(vec2(240.0, 300.0));
+        assert!(!preview.dirty.water().contains(&outlet_chunk));
+        assert_eq!(preview.provider_impact.count, 2);
+        let sample = preview
+            .provider_impact
+            .sample
+            .iter()
+            .find(|sample| sample.building == outlet)
+            .unwrap();
+        assert!(matches!(
+            sample.proposed_site,
+            Ok(WaterSite::Shore { contact, .. }) if contact.kind == WaterKind::River
+        ));
+        test.g.edit_water(edit).unwrap();
+        assert_eq!(
+            water_provider_site(&test.g.map(), outlet),
+            Some(sample.proposed_site)
+        );
     }
 
     #[test]
@@ -1011,14 +1405,14 @@ mod tests {
             };
         assert_eq!(chosen(&test.g), right);
         let remove = WaterEdit::RemoveFreshWater { body: right };
-        assert_eq!(
-            test.g
-                .preview_water_edit(&remove)
-                .unwrap()
-                .provider_impact
-                .sample,
-            [provider]
-        );
+        let impact = test.g.preview_water_edit(&remove).unwrap().provider_impact;
+        assert!(matches!(
+            impact.sample.as_slice(),
+            [WaterProviderImpactSample {
+                building,
+                proposed_site: Ok(WaterSite::Shore { contact, .. }),
+            }] if *building == provider && contact.body == left
+        ));
         test.g.edit_water(remove).unwrap();
         assert_eq!(chosen(&test.g), left);
     }
@@ -1072,18 +1466,33 @@ mod tests {
         assert!(preview.strict_after);
         let mut providers = vec![pump, outlet];
         providers.sort_unstable();
+        assert_eq!(preview.provider_impact.count, 2);
         assert_eq!(
-            preview.provider_impact,
-            WaterProviderImpact {
-                count: 2,
-                sample: providers
-            }
+            preview
+                .provider_impact
+                .sample
+                .iter()
+                .map(|sample| sample.building)
+                .collect::<Vec<_>>(),
+            providers
         );
-        let body = sim.edit_water(river()).unwrap().body.unwrap();
+        let outlet_preview = preview
+            .provider_impact
+            .sample
+            .iter()
+            .find(|sample| sample.building == outlet)
+            .unwrap();
         assert!(matches!(
-            water_provider_site(&sim.map(), outlet),
-            Some(Err(WaterSiteError::OrderConflict { provider, .. })) if provider == pump
+            outlet_preview.proposed_site,
+            Err(WaterSiteError::OrderConflict {
+                role: WaterServiceRole::Outlet, provider, ..
+            }) if provider == pump
         ));
+        let body = sim.edit_water(river()).unwrap().body.unwrap();
+        assert_eq!(
+            water_provider_site(&sim.map(), outlet),
+            Some(outlet_preview.proposed_site)
+        );
         assert!(water_provider_site(&sim.map(), pump).unwrap().is_ok());
         assert_eq!(read(sim).sewage, UtilityNetworkState::Updating);
         assert_eq!(read(sim).utility_totals, Some(old_totals));
@@ -1105,16 +1514,24 @@ mod tests {
             dry_value + value_bonus as u8
         );
 
-        loaded
-            .edit_water(WaterEdit::RemoveFreshWater { body })
-            .unwrap();
+        let removal = WaterEdit::RemoveFreshWater { body };
+        let preview = loaded.preview_water_edit(&removal).unwrap();
+        assert_eq!(preview.provider_impact.count, 2);
+        assert!(preview.strict_after);
+        let failure = WaterSiteError::NoEligibleShore(WaterServiceRole::Outlet);
+        assert!(preview
+            .provider_impact
+            .sample
+            .contains(&WaterProviderImpactSample {
+                building: outlet,
+                proposed_site: Err(failure),
+            }));
+        loaded.edit_water(removal).unwrap();
         assert!(loaded.map().environment().strict_water_siting());
-        assert!(matches!(
+        assert_eq!(
             water_provider_site(&loaded.map(), outlet),
-            Some(Err(WaterSiteError::NoEligibleShore(
-                WaterServiceRole::Outlet
-            )))
-        ));
+            Some(Err(failure))
+        );
     }
 
     #[test]
