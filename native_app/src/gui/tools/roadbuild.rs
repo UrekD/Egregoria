@@ -4,15 +4,15 @@ use geom::{PolyLine3, Vec2, Vec3};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use simulation::map::{
-    LanePatternBuilder, Map, MapProject, PointGenerateError, ProjectFilter, ProjectKind,
-    PylonPosition, RoadSegmentKind,
+    ConnectionError, LanePattern, LanePatternBuilder, Map, MapProject, ProjectFilter, ProjectKind,
+    PylonPosition, RoadPreview,
 };
 use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::Simulation;
 use BuildState::{Curved, CurvedConnection, Hover, Start, StartCurved};
 use ProjectKind::{Building, Ground, Intersection, Road};
 
-use crate::gui::{PotentialCommands, Tool};
+use crate::gui::{ErrorTooltip, PotentialCommands, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use crate::uiworld::UiWorld;
@@ -125,11 +125,16 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
     }
 
     let mut cur_proj = if !matches!(state.build_state, CurvedConnection(..)) {
-        map.project(
-            mousepos,
-            (log_camheight * 5.0).clamp(1.0, 10.0),
-            ProjectFilter::INTER | ProjectFilter::ROAD,
-        )
+        inp.ray
+            .filter(|_| !nosnapping && map.environment().strict_water_siting())
+            .and_then(|ray| map.project_road_deck(ray, unproj))
+            .unwrap_or_else(|| {
+                map.project(
+                    mousepos,
+                    (log_camheight * 5.0).clamp(1.0, 10.0),
+                    ProjectFilter::INTER | ProjectFilter::ROAD,
+                )
+            })
     } else {
         MapProject::ground(mousepos)
     };
@@ -266,18 +271,53 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
     let mut points = None;
 
     if let Some((src, dst, inter, pat)) = build_args {
-        if let Some((p, err)) = connection_preview(map, src, dst, inter, is_rail) {
-            potential_command.set(WorldCommand::MapMakeConnection {
-                from: src,
-                to: dst,
-                inter,
-                pat,
-            });
-            points = Some(p);
-            is_valid &= err.is_none();
-        } else {
-            is_valid = false;
+        match state.preview(map, src, dst, inter, &pat) {
+            Ok(preview) => {
+                points = Some(preview.deck.clone());
+                let color = if is_valid {
+                    simulation::colors().gui_primary
+                } else {
+                    simulation::colors().gui_danger
+                };
+                for outline in &preview.junctions {
+                    immdraw.polyline(outline.clone(), 1.0, true).color(color);
+                }
+                if is_valid {
+                    if preview.crosses_water {
+                        *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new("Bridge");
+                    }
+                    potential_command.set(WorldCommand::MapMakeConnection {
+                        from: src,
+                        to: dst,
+                        inter,
+                        pat,
+                    });
+                }
+            }
+            Err(error) => {
+                *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(error.to_string());
+                is_valid = false;
+                let (a, b) = match (
+                    src.road_connection_position(map),
+                    dst.road_connection_position(map),
+                ) {
+                    (Some(a), Some(b)) => (a, b),
+                    _ => (src.pos, dst.pos),
+                };
+                if a.is_finite() && b.is_finite() && a != b {
+                    immdraw
+                        .line(a.up(0.4), b.up(0.4), patwidth)
+                        .color(simulation::colors().gui_danger);
+                }
+            }
         }
+    } else if cur_proj.kind == Ground
+        && matches!(state.build_state, Hover)
+        && map.environment().is_water(cur_proj.pos.xy())
+    {
+        is_valid = false;
+        *uiworld.write::<ErrorTooltip>() =
+            ErrorTooltip::new("Start on dry land or attach to an elevated deck");
     }
 
     state.update_drawing(
@@ -352,9 +392,48 @@ pub struct RoadBuildResource {
     pub height_offset: f32,
     pub height_reference: HeightReference,
     suppress_chaining: bool,
+    preview: Option<CachedConnectionPreview>,
+}
+
+struct CachedConnectionPreview {
+    revision: (u64, u64, u64, u64, usize),
+    from: MapProject,
+    to: MapProject,
+    elbow: Option<Vec2>,
+    pattern: LanePattern,
+    result: Result<RoadPreview, ConnectionError>,
 }
 
 impl RoadBuildResource {
+    fn preview(
+        &mut self,
+        map: &Map,
+        from: MapProject,
+        to: MapProject,
+        elbow: Option<Vec2>,
+        pattern: &LanePattern,
+    ) -> &Result<RoadPreview, ConnectionError> {
+        let revision = map.road_preview_revision();
+        let same_project = |a: MapProject, b: MapProject| a.kind == b.kind && a.pos == b.pos;
+        if !self.preview.as_ref().is_some_and(|preview| {
+            preview.revision == revision
+                && same_project(preview.from, from)
+                && same_project(preview.to, to)
+                && preview.elbow == elbow
+                && &preview.pattern == pattern
+        }) {
+            self.preview = Some(CachedConnectionPreview {
+                revision,
+                from,
+                to,
+                elbow,
+                pattern: pattern.clone(),
+                result: map.preview_connection(from, to, elbow, pattern),
+            });
+        }
+        &self.preview.as_ref().unwrap().result
+    }
+
     fn grid_mouse_height(&self, map: &Map, unprojected: Vec3, grid_size: f32) -> Vec3 {
         let snapped = unprojected.xy().snap(grid_size, grid_size);
         let height = map.environment().height(snapped).unwrap_or(unprojected.z);
@@ -403,29 +482,6 @@ pub enum HeightReference {
     Start,
     MaxIncline,
     MaxDecline,
-}
-
-fn connection_preview(
-    map: &Map,
-    src: MapProject,
-    dst: MapProject,
-    inter: Option<Vec2>,
-    is_rail: bool,
-) -> Option<(PolyLine3, Option<PointGenerateError>)> {
-    let src = src.road_connection_position(map)?;
-    let dst = dst.road_connection_position(map)?;
-    let segment = match inter {
-        Some(x) => RoadSegmentKind::from_elbow(src.xy(), dst.xy(), x),
-        None => RoadSegmentKind::Straight,
-    };
-
-    Some(simulation::map::Road::generate_points(
-        src,
-        dst,
-        segment,
-        is_rail,
-        map.environment(),
-    ))
 }
 
 fn check_angle(map: &Map, from: MapProject, to: Vec2, is_rail: bool) -> bool {
@@ -799,7 +855,10 @@ mod tests {
             kind: Intersection(intersection),
         };
         let elbow = Some(vec2(110.0, 155.0));
-        let (preview, _) = connection_preview(&map, from, to, elbow, false).unwrap();
+        let preview = map
+            .preview_connection(from, to, elbow, &pattern)
+            .unwrap()
+            .deck;
         let (_, road) = map.make_connection(from, to, elbow, &pattern).unwrap();
         let applied = map.get(road).unwrap().points();
 
@@ -844,8 +903,10 @@ mod tests {
             kind: Road(original),
         };
         let to = MapProject::ground(vec3(160.0, 224.0, 5.0));
-        let (preview, error) = connection_preview(&map, from, to, None, false).unwrap();
-        assert!(error.is_none());
+        let preview = map
+            .preview_connection(from, to, None, &pattern)
+            .unwrap()
+            .deck;
         let (_, road) = map.make_connection(from, to, None, &pattern).unwrap();
 
         let applied = map.get(road).unwrap().points();

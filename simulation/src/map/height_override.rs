@@ -1,156 +1,96 @@
-use std::collections::BTreeSet;
-
-use geom::{pack_height, Shape, Vec2, AABB, NO_OVERRIDE};
+use geom::{pack_height, BaseNode, Shape, Vec2, AABB, NO_OVERRIDE};
 
 use crate::map::terrain::CELL_SIZE;
 use crate::map::{
-    Map, ProjectFilter, ProjectKind, SubscriberChunkID, TerrainChunkID, UpdateType, ROAD_Z_OFFSET,
-    TERRAIN_CHUNK_RESOLUTION,
+    spend_water_work, Map, ProjectKind, SpatialMapObject, TerrainChunkID, WaterEditError,
+    ROAD_Z_OFFSET, TERRAIN_CHUNK_RESOLUTION,
 };
 
-struct OverrideSetter {
-    chunk: TerrainChunkID,
-    overrides: [[u16; TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION],
-    chunk_bound: AABB,
-}
+pub(crate) type CutHeights = [[u16; TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION];
 
-impl OverrideSetter {
-    fn new(chunk: TerrainChunkID) -> Self {
-        let chunk_bound = chunk.bbox();
-
-        let overrides = [[NO_OVERRIDE; TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION];
-
-        Self {
-            chunk,
-            overrides,
-            chunk_bound,
-        }
-    }
-
-    fn set_override(&mut self, obj_bounds: AABB, filter: impl Fn(Vec2) -> Option<f32>) {
-        let b = obj_bounds.intersection(self.chunk_bound);
-        if b.size() == Vec2::ZERO {
-            return;
-        }
-
-        let b = b.offset(-self.chunk_bound.ll);
-
-        let start = (b.ll / CELL_SIZE).floor();
-        let end = (b.ur / CELL_SIZE).ceil();
-
-        for y in start.y as usize..end.y as usize {
-            for x in start.x as usize..end.x as usize {
-                let pos = Vec2::new(x as f32, y as f32) * CELL_SIZE + self.chunk_bound.ll;
-                let Some(h) = filter(pos) else {
-                    continue;
-                };
-                let mut h = pack_height(h);
-                if h == NO_OVERRIDE {
-                    h += 1;
+impl Map {
+    pub(crate) fn rebuild_construction_cuts(
+        &self,
+        chunk: TerrainChunkID,
+        is_wet: impl Fn(BaseNode) -> bool,
+        work: &mut Option<&mut usize>,
+    ) -> Result<CutHeights, WaterEditError> {
+        let mut heights = [[NO_OVERRIDE; TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION];
+        let chunk_bounds = chunk.bbox();
+        for object in self.spatial_map.cut_candidates(chunk_bounds) {
+            if let Some(work) = work.as_deref_mut() {
+                spend_water_work(work, 1)?;
+            }
+            let mut add_cut = |bounds: AABB,
+                               units: usize,
+                               height: &dyn Fn(Vec2) -> Option<f32>|
+             -> Result<(), WaterEditError> {
+                let lower = bounds.ll.max(chunk_bounds.ll);
+                let upper = bounds.ur.min(chunk_bounds.ur);
+                if lower.x > upper.x || lower.y > upper.y {
+                    return Ok(());
                 }
-                let v = self.overrides[y][x];
-                self.overrides[y][x] = if v == NO_OVERRIDE { h } else { v.min(h) }
-            }
-        }
-    }
-
-    fn finish(self, map: &mut Map) {
-        map.environment.set_overrides(self.chunk, self.overrides);
-        map.subscribers
-            .dispatch_chunk(UpdateType::Terrain, self.chunk);
-    }
-}
-
-/// Updates the overrides on the map.
-/// Proceeds in 3 steps:
-///  - Find all objects that could have changed (from chunk)
-///  - Find all terrain chunks that can be affected
-///  - Update each chunk individually
-pub fn find_overrides(map: &mut Map, chunk: SubscriberChunkID) {
-    let mut terrain_affected = BTreeSet::new();
-
-    let sub_chunk_bbox = chunk.bbox();
-
-    for obj in map.spatial_map.query(
-        sub_chunk_bbox,
-        ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING,
-    ) {
-        // ensure the object is only processed once
-        if !sub_chunk_bbox.contains(obj.canonical_position(map)) {
-            continue;
-        }
-
-        let bbox = match obj {
-            ProjectKind::Intersection(i) => {
-                let i = map.get(i).unwrap();
-
-                let mut bounds = i.bcircle();
-                bounds.radius *= 2.0;
-
-                bounds.bbox()
-            }
-            ProjectKind::Road(r) => {
-                let r = map.get(r).unwrap();
-
-                let expand = 10.0 + r.width * 3.0;
-
-                r.points.bbox().flatten().expand(expand + 3.0)
-            }
-            ProjectKind::Building(b) => {
-                let b = map.get(b).unwrap();
-
-                let obb = b.obb.expand(25.0);
-
-                obb.bbox()
-            }
-            _ => continue,
-        };
-
-        for chunk in map.environment.covered_chunks(bbox) {
-            terrain_affected.insert(chunk);
-        }
-    }
-
-    for chunk in terrain_affected {
-        let mut setter = OverrideSetter::new(chunk);
-
-        for obj in map.spatial_map.query(
-            chunk.bbox(),
-            ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING,
-        ) {
-            match obj {
-                ProjectKind::Intersection(i) => {
-                    let i = map.get(i).unwrap();
-
-                    let mut bounds = i.bcircle();
-                    bounds.radius *= 2.0;
-
-                    setter
-                        .set_override(bounds.bbox(), |pos| bounds.contains(pos).then_some(i.pos.z));
+                let bounds = AABB::new_ll_ur(lower, upper).offset(-chunk_bounds.ll);
+                let start = (bounds.ll / CELL_SIZE).ceil().max(Vec2::ZERO);
+                let end = (bounds.ur / CELL_SIZE)
+                    .floor()
+                    .min(Vec2::splat((TERRAIN_CHUNK_RESOLUTION - 1) as f32));
+                for y in start.y as usize..=end.y as usize {
+                    for x in start.x as usize..=end.x as usize {
+                        if let Some(work) = work.as_deref_mut() {
+                            spend_water_work(work, units)?;
+                        }
+                        let node = (
+                            chunk.0 as usize * TERRAIN_CHUNK_RESOLUTION + x,
+                            chunk.1 as usize * TERRAIN_CHUNK_RESOLUTION + y,
+                        );
+                        if is_wet(node) {
+                            continue;
+                        }
+                        let pos = Vec2::new(x as f32, y as f32) * CELL_SIZE + chunk_bounds.ll;
+                        if let Some(z) = height(pos) {
+                            let z = pack_height(z).max(NO_OVERRIDE + 1);
+                            let old = &mut heights[y][x];
+                            *old = if *old == NO_OVERRIDE {
+                                z
+                            } else {
+                                (*old).min(z)
+                            };
+                        }
+                    }
                 }
-                ProjectKind::Road(r) => {
-                    let r = map.get(r).unwrap();
-
-                    let expand = 10.0 + r.width * 3.0;
-
-                    setter.set_override(r.points.bbox().flatten().expand(expand + 3.0), |pos| {
-                        let proj = r.points.project_2d(pos);
-                        proj.xy()
-                            .is_close(pos, expand)
-                            .then_some(proj.z - ROAD_Z_OFFSET)
-                    })
+                Ok(())
+            };
+            match object {
+                ProjectKind::Building(id) => {
+                    let building = &self.buildings[id];
+                    let shape = building.obb.expand(25.0);
+                    add_cut(shape.bbox(), 1, &|pos| {
+                        shape.contains(pos).then_some(building.height)
+                    })?;
                 }
-                ProjectKind::Building(b) => {
-                    let b = map.get(b).unwrap();
-
-                    let obb = b.obb.expand(25.0);
-
-                    setter.set_override(obb.bbox(), |pos| obb.contains(pos).then_some(b.height));
+                ProjectKind::Intersection(id) => {
+                    let intersection = &self.intersections[id];
+                    let mut shape = intersection.bcircle();
+                    shape.radius *= 2.0;
+                    add_cut(shape.bbox(), 1, &|pos| {
+                        shape.contains(pos).then_some(intersection.pos.z)
+                    })?;
                 }
-                _ => {}
+                ProjectKind::Road(id) => {
+                    let road = &self.roads[id];
+                    let radius = 10.0 + road.width * 3.0;
+                    add_cut(road.cut_influence().unwrap(), road.points().len(), &|pos| {
+                        let projected = road.points().project_2d(pos);
+                        projected
+                            .xy()
+                            .is_close(pos, radius)
+                            .then_some(projected.z - ROAD_Z_OFFSET)
+                    })?;
+                }
+                _ => unreachable!("construction cut index only holds contributors"),
             }
         }
-
-        setter.finish(map);
+        Ok(heights)
     }
 }

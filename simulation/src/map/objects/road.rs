@@ -10,6 +10,10 @@ use crate::map::{
     LanePattern, Lanes, Map, MapProject, ParkingSpots, Roads, SpatialMap, MAX_SLOPE, ROAD_Z_OFFSET,
 };
 
+#[path = "../water_crossing.rs"]
+mod water_crossing;
+pub use water_crossing::*;
+
 const MIN_ELEVATED_SPAN_CLEARANCE: f32 = 2.5;
 const MIN_DECK_END_CLEARANCE: f32 = 0.5;
 
@@ -91,9 +95,21 @@ pub struct PylonPosition {
     pub dir: Vec3,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PointGenerateError {
     OutsideOfMap,
     TooSteep,
+}
+
+pub(crate) fn profile_height(env: &Environment, xy: Vec2) -> Option<f32> {
+    env.height(xy).or_else(|| {
+        let bounds = env.bounds();
+        if !env.has_water_configuration() || !bounds.contains(xy) {
+            return None;
+        }
+        let interior = Vec2::new(bounds.ur.x.next_down(), bounds.ur.y.next_down());
+        Some(env.base_height(xy.min(interior))?.max(0.0))
+    })
 }
 
 impl MapProject {
@@ -159,10 +175,27 @@ impl Road {
         let elevated_span =
             elevated_span && !matches!(error, Some(PointGenerateError::OutsideOfMap));
 
-        let id = roads.insert_with_key(|id| Self {
+        let id = Self::insert_profile(roads, src.id, dst.id, points, width, elevated_span);
+        let road = &mut roads[id];
+        road.make_lanes(lane_pattern, lanes);
+        road.update_lanes(lanes, parking, env);
+
+        spatial.insert(road);
+        road.id
+    }
+
+    pub(crate) fn insert_profile(
+        roads: &mut Roads,
+        src: IntersectionID,
+        dst: IntersectionID,
+        points: PolyLine3,
+        width: f32,
+        elevated_span: bool,
+    ) -> RoadID {
+        roads.insert_with_key(|id| Self {
             id,
-            src: src.id,
-            dst: dst.id,
+            src,
+            dst,
             src_interface: SourceInterface::new(9.0, elevated_span),
             dst_interface: 9.0,
             width,
@@ -171,26 +204,58 @@ impl Road {
             interfaced_points: PolyLine3::new(vec![points.first()]),
             points,
             connected_buildings: vec![],
-        });
-        #[allow(clippy::indexing_slicing)]
+        })
+    }
+
+    pub(crate) fn copy_geometry(
+        &self,
+        roads: &mut Roads,
+        src: IntersectionID,
+        dst: IntersectionID,
+    ) -> RoadID {
+        let id = Self::insert_profile(
+            roads,
+            src,
+            dst,
+            self.points.clone(),
+            self.width,
+            self.elevated_span(),
+        );
         let road = &mut roads[id];
+        road.src_interface = self.src_interface;
+        road.dst_interface = self.dst_interface;
+        road.interfaced_points = self.interfaced_points.clone();
+        id
+    }
 
+    pub(crate) fn make_lanes(&mut self, pattern: &LanePattern, lanes: &mut Lanes) {
         let mut dist_from_bottom = 0.0;
-        for (lane_k, dir, limit) in lane_pattern.lanes() {
-            let id = Lane::make(road, lanes, lane_k, limit, dir, dist_from_bottom);
-
+        for (kind, dir, limit) in pattern.lanes() {
+            let id = Lane::make(self, lanes, kind, limit, dir, dist_from_bottom);
             match dir {
-                LaneDirection::Forward => road.lanes_forward.insert(0, (id, lane_k)),
-                LaneDirection::Backward => road.lanes_backward.push((id, lane_k)),
+                LaneDirection::Forward => self.lanes_forward.insert(0, (id, kind)),
+                LaneDirection::Backward => self.lanes_backward.push((id, kind)),
             }
-
-            dist_from_bottom += lane_k.width();
+            dist_from_bottom += kind.width();
         }
+    }
 
-        road.update_lanes(lanes, parking, env);
-
-        spatial.insert(road);
-        road.id
+    pub(crate) fn split_profiles(&self, pos: Vec3, segment: usize) -> [PolyLine3; 2] {
+        let mut before: Vec<_> = self.points.iter().copied().take(segment).collect();
+        while before.last().is_some_and(|point| point.xy() == pos.xy()) {
+            before.pop();
+        }
+        before.push(pos);
+        let after_split = self
+            .points
+            .iter()
+            .copied()
+            .skip(segment)
+            .skip_while(|point| point.xy() == pos.xy());
+        let mut after: Vec<_> = [pos].into_iter().chain(after_split).collect();
+        before.dedup();
+        after.dedup();
+        [PolyLine3::new(before), PolyLine3::new(after)]
     }
 
     pub fn is_one_way(&self) -> bool {
@@ -328,7 +393,11 @@ impl Road {
         interfaced_points
             .equipoints_dir(80.0, true)
             .filter_map(move |(pos, dir)| {
-                let h = env.true_height(pos.xy())?;
+                let h = if env.is_water(pos.xy()) {
+                    env.base_height(pos.xy())?
+                } else {
+                    env.true_height(pos.xy())?
+                };
                 if (h - pos.z).abs() <= 2.0 {
                     return None;
                 }
@@ -347,7 +416,7 @@ impl Road {
         &self.interfaced_points
     }
 
-    pub(crate) fn elevated_span(&self) -> bool {
+    pub fn elevated_span(&self) -> bool {
         self.src_interface.elevated_span()
     }
 
@@ -364,7 +433,7 @@ impl Road {
             .map_or(point.z, |ground| ground + ROAD_Z_OFFSET)
     }
 
-    fn update_interfaced_points(&mut self, env: &Environment) {
+    pub(crate) fn update_interfaced_points(&mut self, env: &Environment) {
         let points = &self.points;
         let clipped = points.cut(self.interface_from(self.src), self.interface_from(self.dst));
 
@@ -386,8 +455,9 @@ impl Road {
         self.interfaced_points = p;
     }
 
-    fn is_elevated_span(from: Vec3, to: Vec3, env: &Environment) -> bool {
-        let (Some(from_ground), Some(to_ground)) = (env.height(from.xy()), env.height(to.xy()))
+    pub(crate) fn is_elevated_span(from: Vec3, to: Vec3, env: &Environment) -> bool {
+        let (Some(from_ground), Some(to_ground)) =
+            (profile_height(env, from.xy()), profile_height(env, to.xy()))
         else {
             return false;
         };
@@ -443,7 +513,7 @@ impl Road {
             )
             .chain(std::iter::once(p.last()))
         {
-            let h = env.height(pos).unwrap_or_else(|| {
+            let h = profile_height(env, pos).unwrap_or_else(|| {
                 height_error = true;
                 0.0
             });
@@ -610,7 +680,7 @@ impl Road {
         Self::generate_points_with_span(from, to, segment, precise, env, elevated_span)
     }
 
-    fn generate_points_with_span(
+    pub(crate) fn generate_points_with_span(
         from: Vec3,
         to: Vec3,
         segment: RoadSegmentKind,

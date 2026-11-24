@@ -452,3 +452,267 @@ fn rising_bridge_and_lanes_follow_the_deck_after_load_and_junction_edit() {
         assert_straight_deck(road.interfaced_points(), start, end);
     }
 }
+
+fn wet_crossing_map() -> Map {
+    let mut environment = Environment::new(1, 1);
+    environment.terrain_apply(environment.bounds(), |_| 4.0);
+    environment
+        .carve_river(&[vec2(256.0, 16.0), vec2(256.0, 496.0)], 48.0, 6.0)
+        .unwrap();
+    assert_eq!(
+        environment.water_surface_elevation(vec2(256.0, 256.0)),
+        Some(3.0)
+    );
+    let mut map = Map::empty();
+    assert!(map.install_environment(environment));
+    map
+}
+
+#[test]
+fn wet_crossing_forms_a_bridge_from_dry_ground_anchors() {
+    let mut map = wet_crossing_map();
+    let pattern = LanePatternBuilder::default().build();
+    let (_, id) = map
+        .make_connection(
+            MapProject::ground(vec3(80.0, 256.0, 4.0)),
+            MapProject::ground(vec3(432.0, 256.0, 4.0)),
+            None,
+            &pattern,
+        )
+        .expect("dry banks can be joined by an elevated crossing");
+    let bridge = &map.roads[id];
+    assert!(bridge.elevated_span());
+    for x in [224.0, 240.0, 256.0, 272.0, 287.9] {
+        let sample = vec2(x, 256.0);
+        let water = map.environment().water_at(sample).unwrap();
+        let deck = bridge.interfaced_points().project_2d(sample);
+        assert!(deck.z - ROAD_Z_OFFSET >= water.surface_z + 2.5);
+    }
+}
+
+#[test]
+fn wet_crossing_rejects_a_ground_anchor_atomically() {
+    let mut map = wet_crossing_map();
+    let before = Bincode::encode(&map).unwrap();
+    let result = map.make_connection(
+        MapProject::ground(vec3(80.0, 256.0, 4.0)),
+        MapProject::ground(vec3(256.0, 256.0, 3.0)),
+        None,
+        &LanePatternBuilder::default().build(),
+    );
+    assert!(result.is_none());
+    assert_eq!(Bincode::encode(&map).unwrap(), before);
+}
+
+#[test]
+fn wet_crossing_rejects_an_explicit_at_grade_deck() {
+    let mut map = wet_crossing_map();
+    let start = vec3(80.0, 256.0, 4.0);
+    let end = vec3(432.0, 256.0, 4.0);
+    let src = map.add_intersection(start);
+    let dst = map.add_intersection(end);
+    let before = Bincode::encode(&map).unwrap();
+    let result = map.connect(
+        src,
+        dst,
+        &LanePatternBuilder::default().build(),
+        RoadSegmentKind::Arbitrary(PolyLine3::new(vec![
+            start.up(ROAD_Z_OFFSET),
+            end.up(ROAD_Z_OFFSET),
+        ])),
+    );
+    assert!(result.is_none());
+    assert_eq!(Bincode::encode(&map).unwrap(), before);
+}
+
+#[test]
+fn wet_crossing_split_and_merge_keep_the_span_and_deck() {
+    let mut map = wet_crossing_map();
+    let pattern = LanePatternBuilder::default().build();
+    let (_, original) = map
+        .make_connection(
+            MapProject::ground(vec3(80.0, 256.0, 4.0)),
+            MapProject::ground(vec3(432.0, 256.0, 4.0)),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let split = vec2(256.0, 256.0);
+    let deck_point = map.roads[original].points().project_2d(split);
+    let (junction, spur) = map
+        .make_connection(
+            MapProject::ground(vec3(112.0, 136.0, 4.0)),
+            MapProject {
+                pos: deck_point,
+                kind: ProjectKind::Road(original),
+            },
+            None,
+            &pattern,
+        )
+        .unwrap();
+    assert!(!map.roads.contains_key(original));
+    assert!((map.intersections[junction].pos.z + ROAD_Z_OFFSET - deck_point.z).abs() < 0.0001);
+    assert!(map.remove_road(spur).is_some());
+    let [first, second] = map.intersections[junction].roads.as_slice() else {
+        panic!("expected the original span's two split pieces");
+    };
+    let [first, second] = [*first, *second];
+    assert!(map.roads[first].elevated_span() && map.roads[second].elevated_span());
+    let merged = map.merge_road(first, second).unwrap();
+    assert!(!map.roads.contains_key(first) && !map.roads.contains_key(second));
+    assert!(map.roads[merged].elevated_span());
+    assert_eq!(map.roads[merged].points().project_2d(split), deck_point);
+    let decoded: Map = Bincode::decode(&Bincode::encode(&map).unwrap()).unwrap();
+    assert!(decoded.roads[merged].elevated_span());
+}
+
+#[test]
+fn wet_crossing_curved_rail_matches_its_final_preview() {
+    let mut map = wet_crossing_map();
+    let pattern = LanePatternBuilder {
+        rail: true,
+        ..LanePatternBuilder::default()
+    }
+    .build();
+    let start = MapProject::ground(vec3(80.0, 232.0, 5.0));
+    let end = MapProject::ground(vec3(432.0, 304.0, 5.0));
+    let elbow = Some(vec2(238.0, 330.0));
+    let preview = map.preview_connection(start, end, elbow, &pattern).unwrap();
+    assert!(preview.crosses_water);
+    assert_eq!(preview.junctions.len(), 2);
+    let (_, id) = map.make_connection(start, end, elbow, &pattern).unwrap();
+    let road = &map.roads[id];
+    assert_eq!(
+        point_bits(&preview.deck),
+        point_bits(road.interfaced_points())
+    );
+    for (id, _) in road.lanes_iter() {
+        for segment in map.lanes[id].points.as_slice().windows(2) {
+            let delta = segment[1] - segment[0];
+            assert!(delta.z.abs() <= delta.xy().mag() * MAX_SLOPE + 0.0001);
+        }
+    }
+}
+
+#[test]
+fn wet_crossing_indexed_replay_keeps_the_accepted_bridge() {
+    use crate::map::{WaterEdit, WaterStroke};
+    use crate::world_command::{CommandOutcomes, WorldCommand};
+    use crate::{MapPreset, NewGameOptions, Replay, Simulation};
+
+    super::init_test_simulation();
+    let mut sim = Simulation::new_game_with_replay(&NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: 16,
+        ..NewGameOptions::default()
+    })
+    .unwrap();
+    let start = vec2(2080.0, 2304.0);
+    let end = vec2(2432.0, 2304.0);
+    let ground = sim.map().environment().height(start).unwrap();
+    let level_dm = ((ground - 1.0) * 10.0).floor() as i16;
+    sim.edit_water(WaterEdit::CarveRiver {
+        polyline: WaterStroke::new(&[vec2(2256.0, 2080.0), vec2(2256.0, 2528.0)]).unwrap(),
+        width_m: 48.0,
+        depth_m: 6.0,
+        level_dm: Some(level_dm),
+    })
+    .unwrap();
+    let projects = vec![
+        MapProject::ground(start.z(ground)),
+        MapProject::ground(end.z(ground)),
+        MapProject::ground(vec3(2256.0, 2336.0, ground)),
+    ];
+    let pattern = LanePatternBuilder::default().build();
+    let command = WorldCommand::MapMakeMultipleConnections(
+        projects,
+        vec![(0, 2, None, pattern.clone()), (0, 1, None, pattern)],
+    );
+    let commands_before = sim.read::<Replay>().command_count();
+    sim.apply_commands([&command]);
+    {
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert!(outcomes.link_outcomes(0)[0].1.is_err());
+        assert!(outcomes.link_outcomes(0)[1].1.is_ok());
+    }
+    assert_eq!(sim.read::<Replay>().command_count(), commands_before + 1);
+
+    let replay = sim.read::<Replay>().clone();
+    let (mut loaded, mut loader) = Simulation::try_from_replay(replay).unwrap();
+    let mut schedule = Simulation::schedule();
+    assert!(loader.advance_tick(&mut loaded, &mut schedule));
+    assert_eq!(sim.hashes()["map"], loaded.hashes()["map"]);
+}
+
+#[test]
+fn wet_crossing_uses_deck_width_even_with_a_dry_centerline() {
+    use geom::Polygon;
+
+    let mut environment = Environment::new(1, 1);
+    environment.terrain_apply(environment.bounds(), |_| 4.0);
+    environment
+        .fill_lake(
+            &Polygon::centered_rect(vec2(256.0, 256.0), 64.0, 96.0),
+            30,
+            5.0,
+        )
+        .unwrap();
+    let mut map = Map::empty();
+    assert!(map.install_environment(environment));
+    let start = MapProject::ground(vec3(220.0, 64.0, 4.0));
+    let end = MapProject::ground(vec3(220.0, 440.0, 4.0));
+    let pattern = LanePatternBuilder::default().build();
+    assert!(!map.environment().is_water(vec2(220.0, 256.0)));
+    assert!(map.environment().is_water(vec2(225.0, 256.0)));
+    let preview = map.preview_connection(start, end, None, &pattern).unwrap();
+    assert!(preview.crosses_water);
+    let (_, id) = map.make_connection(start, end, None, &pattern).unwrap();
+    assert_eq!(
+        point_bits(&preview.deck),
+        point_bits(map.roads[id].interfaced_points())
+    );
+}
+
+#[test]
+fn wet_crossing_bed_change_moves_supports_with_fixed_ids_and_deck() {
+    use crate::map::{TerraformKind, UpdateType};
+    use crate::world_command::{CommandOutcomes, WorldCommand};
+    use crate::Simulation;
+
+    super::init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+    *sim.write::<Map>() = wet_crossing_map();
+    let (junction, road) = sim
+        .map_mut()
+        .make_connection(
+            MapProject::ground(vec3(64.0, 256.0, 4.0)),
+            MapProject::ground(vec3(416.0, 256.0, 4.0)),
+            None,
+            &LanePatternBuilder::default().build(),
+        )
+        .unwrap();
+    let mut support = sim.map().subscribe(UpdateType::RoadSupport);
+    let pylon = |map: &Map| {
+        Road::pylons_positions(map.roads[road].interfaced_points(), map.environment())
+            .find(|pylon| map.environment().is_water(pylon.pos.xy()))
+            .unwrap()
+    };
+    let before = pylon(&sim.map());
+    let lanes: Vec<_> = sim.map().roads[road].lanes_iter().collect();
+    sim.apply_commands([&WorldCommand::Terraform {
+        kind: TerraformKind::Level,
+        center: before.pos.xy(),
+        radius: 24.0,
+        amount: 1.0,
+        level: -7.0,
+        slope: None,
+    }]);
+    assert!(sim.read::<CommandOutcomes>().rejections_for(0).is_empty());
+    let map = sim.map();
+    let after = pylon(&map);
+    assert_eq!(before.pos, after.pos);
+    assert!(after.terrain_height < before.terrain_height);
+    assert!(map.intersections.contains_key(junction));
+    assert_eq!(map.roads[road].lanes_iter().collect::<Vec<_>>(), lanes);
+    assert!(support.take_updated_chunks().next().is_some());
+}
