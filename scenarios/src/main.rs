@@ -1,6 +1,6 @@
 use scenarios::builtin::{demo_cities, growth_basic, perf, PERF_10K, SCENARIOS};
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
-use scenarios::{MetricSample, ScenarioCtx};
+use scenarios::{perf_scale, MetricSample, ScenarioCtx};
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -24,7 +24,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios perf_scale --houses H --warmup W --ticks T\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T")
 }
 
 fn main() -> ExitCode {
@@ -50,6 +50,71 @@ fn path_arg(
     std::path::absolute(Path::new(&path)).map_err(|err| err.to_string())
 }
 
+fn number_arg<T: std::str::FromStr>(
+    args: &mut impl Iterator<Item = OsString>,
+    flag: &str,
+) -> Result<T, String> {
+    args.next()
+        .as_deref()
+        .and_then(|arg| arg.to_str())
+        .and_then(|value| value.parse().ok())
+        .ok_or_else(|| format!("{flag} requires a non-negative integer"))
+}
+
+fn run_benchmark(name: &str, mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
+    let paris = name == "perf_scale";
+    let mut houses = None;
+    let mut root = None;
+    let mut slot = None;
+    let mut warmup = None;
+    let mut ticks = None;
+    while let Some(arg) = args.next() {
+        match arg.to_str() {
+            Some("--houses") if paris && houses.is_none() => {
+                houses = Some(number_arg(&mut args, "--houses")?);
+            }
+            Some("--root") if !paris && root.is_none() => {
+                root = Some(path_arg(&mut args, "--root", "a directory")?);
+            }
+            Some("--slot") if !paris && slot.is_none() => {
+                let value = args
+                    .next()
+                    .and_then(|value| value.into_string().ok())
+                    .ok_or("--slot requires a slot ID")?;
+                slot =
+                    Some(simulation::SlotId::new(&value).map_err(|err| format!("--slot: {err}"))?);
+            }
+            Some("--warmup") if warmup.is_none() => {
+                warmup = Some(number_arg(&mut args, "--warmup")?)
+            }
+            Some("--ticks") if ticks.is_none() => ticks = Some(number_arg(&mut args, "--ticks")?),
+            _ => return Err(format!("unexpected {name} argument {arg:?}")),
+        }
+    }
+    let warmup_ticks = warmup.ok_or_else(|| format!("{name} requires --warmup"))?;
+    let measured_ticks = ticks.ok_or_else(|| format!("{name} requires --ticks"))?;
+    let report = if paris {
+        perf_scale::benchmark_paris(perf_scale::PerfCase {
+            agents: houses.ok_or("perf_scale requires --houses")?,
+            warmup_ticks,
+            measured_ticks,
+            workers: 1,
+        })?
+    } else {
+        perf_scale::bench_slot(
+            &root.ok_or("bench-slot requires --root")?,
+            &slot.ok_or("bench-slot requires --slot")?,
+            warmup_ticks,
+            measured_ticks,
+        )?
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report).map_err(|err| err.to_string())?
+    );
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let mut args = std::env::args_os().skip(1);
     let name = args
@@ -59,6 +124,9 @@ fn run() -> Result<(), String> {
     if name == "--help" || name == "-h" {
         println!("{}", usage());
         return Ok(());
+    }
+    if matches!(name.as_str(), "perf_scale" | "bench-slot") {
+        return run_benchmark(&name, args);
     }
     if name == "osm-city" {
         let mut input = None;
@@ -267,4 +335,32 @@ fn run() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::run_benchmark;
+    use std::ffi::OsString;
+
+    #[test]
+    fn scale_m0_usage_lists_benchmark_commands() {
+        let usage = super::usage();
+        assert!(usage.contains("perf_scale --houses"));
+        assert!(usage.contains("bench-slot --root"));
+    }
+
+    #[test]
+    fn scale_m0_rejects_invalid_benchmark_arguments() {
+        let args = ["--houses", "1", "--warmup", "0", "--ticks", "-1"].map(OsString::from);
+        assert_eq!(
+            run_benchmark("perf_scale", args.into_iter()).unwrap_err(),
+            "--ticks requires a non-negative integer"
+        );
+        let args = [
+            "--root", ".", "--slot", "../city", "--warmup", "0", "--ticks", "1",
+        ]
+        .map(OsString::from);
+        let err = run_benchmark("bench-slot", args.into_iter()).unwrap_err();
+        assert!(err.starts_with("--slot: slot id must be"), "{err}");
+    }
 }

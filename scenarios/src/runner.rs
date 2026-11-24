@@ -19,7 +19,8 @@ use std::time::Duration;
 
 pub const MEDIAN_TICKS_PER_SEC: &str = "median_ticks_per_sec";
 pub const P99_MS_PER_TICK: &str = "p99_ms_per_tick";
-const P95_MS_PER_TICK: &str = "p95_ms_per_tick";
+pub(crate) const P50_MS_PER_TICK: &str = "p50_ms_per_tick";
+pub(crate) const P95_MS_PER_TICK: &str = "p95_ms_per_tick";
 
 const CHECKPOINT_INTERVAL: u64 = 10_000;
 
@@ -146,13 +147,16 @@ pub fn ensure_repo_root_cwd() {
 
 impl ScenarioCtx {
     pub fn new(opts: SimulationOptions) -> Self {
+        Self::initialize();
+        Self::from_sim(Simulation::new_with_options(opts))
+    }
+
+    pub(crate) fn initialize() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
             ensure_repo_root_cwd();
             simulation::init::init();
         });
-
-        Self::from_sim(Simulation::new_with_options(opts))
     }
 
     pub(crate) fn from_sim(sim: Simulation) -> Self {
@@ -216,6 +220,16 @@ impl ScenarioCtx {
     }
 
     pub(crate) fn sample_perf(&mut self, label: &str, houses: usize) -> MetricSample {
+        self.sample_perf_with_extra(label, houses, BTreeMap::new(), false)
+    }
+
+    pub(crate) fn sample_perf_with_extra(
+        &mut self,
+        label: &str,
+        houses: usize,
+        mut extra: BTreeMap<String, f64>,
+        include_p50: bool,
+    ) -> MetricSample {
         let active_vehicles = self
             .sim
             .world()
@@ -223,7 +237,7 @@ impl ScenarioCtx {
             .values()
             .filter(|vehicle| !vehicle.vehicle.state.is_parked())
             .count();
-        let mut extra = BTreeMap::from([
+        extra.extend([
             ("houses".to_string(), houses as f64),
             ("active_vehicles".to_string(), active_vehicles as f64),
         ]);
@@ -233,6 +247,9 @@ impl ScenarioCtx {
             let n = times.len();
             let median_seconds =
                 (times[(n - 1) / 2].as_secs_f64() + times[n / 2].as_secs_f64()) / 2.0;
+            if include_p50 {
+                extra.insert(P50_MS_PER_TICK.to_string(), median_seconds * 1_000.0);
+            }
             let median_ticks_per_sec = if median_seconds > 0.0 {
                 median_seconds.recip()
             } else {
