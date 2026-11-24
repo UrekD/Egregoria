@@ -5,7 +5,9 @@ use std::collections::BTreeSet;
 
 use crate::world_command::Rejection;
 
-use super::{Intersection, IntersectionID, Map, ProjectFilter, ProjectKind, Road, RoadID, Turn};
+use super::{
+    Building, Intersection, IntersectionID, Map, ProjectFilter, ProjectKind, Road, RoadID, Turn,
+};
 
 const CURB_SETBACK_M: f32 = 0.25;
 const FALLBACK_DISTANCE_RATIO: f32 = 1.5;
@@ -189,6 +191,9 @@ fn snap_to_road(
     if sidewalk.is_none() {
         return Err(pose.failure(PlacementError::NoSidewalk));
     }
+    if !Building::dry_footprint(map.environment(), &obb, None) {
+        return Err(pose.failure(PlacementError::CommandRejected(Rejection::WetFootprint)));
+    }
     if let Some(error) = placement_overlap(map, road, obb) {
         return Err(pose.failure(error));
     }
@@ -285,4 +290,49 @@ fn intersection_overlaps(map: &Map, inter: &Intersection, obb: &OBB) -> bool {
         curb.extend(Turn::spline(left, right, -dir, next_dir).smart_points(1.0, 0.0, 1.0));
     }
     curb.len() >= 3 && obb.intersects(&curb)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map::{Environment, LanePatternBuilder, MapProject};
+    use geom::vec2;
+
+    #[test]
+    fn w2b_water_special_preview_checks_footprint_before_callback() {
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        map.make_connection(
+            MapProject::ground(vec2(48.0, 112.0).z0()),
+            MapProject::ground(vec2(448.0, 112.0).z0()),
+            None,
+            &LanePatternBuilder::new().build(),
+        )
+        .unwrap();
+        map.environment_mut_for_test()
+            .fill_lake(
+                &Polygon::centered_rect(vec2(200.0, 152.0), 8.0, 8.0),
+                0,
+                1.0,
+            )
+            .unwrap();
+
+        let mut validated = false;
+        let result = snap_special_building(
+            &map,
+            vec2(200.0, 135.0).z0(),
+            Size2D::new(40.0, 40.0),
+            |_| {
+                validated = true;
+                Ok(())
+            },
+        );
+        let failure = result.unwrap_err();
+        assert_eq!(
+            failure.error,
+            PlacementError::CommandRejected(Rejection::WetFootprint)
+        );
+        assert!(failure.attempted.is_some());
+        assert!(!validated);
+    }
 }

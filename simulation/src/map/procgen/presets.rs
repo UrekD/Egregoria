@@ -1,5 +1,6 @@
 #![allow(clippy::indexing_slicing)]
 
+use super::PresetImportError;
 use crate::map::{IntersectionID, LanePatternBuilder, Map, RoadSegmentKind, UpdateType};
 use common::FastMap;
 use flat_spatial::Grid;
@@ -35,7 +36,7 @@ impl<R: BufRead> Scanner<R> {
 
 static PARISMAP_STR: &str = include_str!("../../../../assets/paris_54000.txt");
 
-pub fn load_parismap(map: &mut Map) {
+pub(super) fn load_parismap(map: &mut Map) {
     let time = std::time::Instant::now();
 
     let mut scanner = Scanner::new(Cursor::new(PARISMAP_STR));
@@ -145,7 +146,8 @@ pub fn load_parismap(map: &mut Map) {
     print_stats(map);
 }
 
-pub fn add_doublecircle(pos: Vec2, m: &mut Map) {
+pub fn add_doublecircle(pos: Vec2, m: &mut Map) -> Result<(), PresetImportError> {
+    require_dry_preset(m)?;
     let mut first_circle = vec![];
     let mut second_circle = vec![];
 
@@ -202,9 +204,23 @@ pub fn add_doublecircle(pos: Vec2, m: &mut Map) {
             RoadSegmentKind::Straight,
         );
     }
+    Ok(())
 }
 
-pub fn add_grid(m: &mut Map, pos: Vec2, size: u32, spacing: f32) {
+pub fn add_grid(m: &mut Map, pos: Vec2, size: u32, spacing: f32) -> Result<(), PresetImportError> {
+    require_dry_preset(m)?;
+    add_dry_grid(m, pos, size, spacing);
+    Ok(())
+}
+
+fn require_dry_preset(map: &Map) -> Result<(), PresetImportError> {
+    if map.environment().has_water_configuration() {
+        return Err(PresetImportError::WaterConfigured);
+    }
+    Ok(())
+}
+
+fn add_dry_grid(m: &mut Map, pos: Vec2, size: u32, spacing: f32) {
     if size == 0 {
         return;
     }
@@ -245,9 +261,8 @@ fn print_stats(map: &Map) {
     );
 }
 
-pub fn load_testfield(map: &mut Map, pos: Vec2, size: u32, spacing: f32) {
-    //add_doublecircle([0.0, 0.0].into(), map);
-    add_grid(map, pos, size, spacing);
+pub(super) fn load_testfield(map: &mut Map, pos: Vec2, size: u32, spacing: f32) {
+    add_dry_grid(map, pos, size, spacing);
     map.check_invariants();
     print_stats(map);
 }
@@ -260,6 +275,26 @@ mod tests {
     use common::saveload::{Bincode, Encoder};
     use prototypes::Tick;
     use std::collections::BTreeSet;
+
+    #[test]
+    fn w2b_water_direct_debug_presets_reject_configured_sea() {
+        let mut env = crate::map::Environment::new(2, 2);
+        env.set_sea_level(Some(-100)).unwrap();
+        assert!(!env.strict_water_siting());
+        let mut map = Map::empty();
+        assert!(map.install_environment(env));
+
+        assert_eq!(
+            add_grid(&mut map, Vec2::splat(512.0), 2, 64.0),
+            Err(PresetImportError::WaterConfigured),
+        );
+        assert_eq!(
+            add_doublecircle(Vec2::splat(512.0), &mut map),
+            Err(PresetImportError::WaterConfigured),
+        );
+        assert!(map.roads().is_empty());
+        assert!(map.intersections().is_empty());
+    }
 
     #[test]
     fn testfield_valid() {
