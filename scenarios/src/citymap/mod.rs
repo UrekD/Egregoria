@@ -1,3 +1,4 @@
+mod clearance;
 mod layout;
 mod network;
 mod source;
@@ -612,6 +613,74 @@ fn rail_crossings(map: &Map, plan: &TownPlan, built: &BuiltNetwork) -> Vec<serde
     crossings
 }
 
+const JUNCTION_CONTROL_POLICIES: [LightPolicy; 4] = [
+    LightPolicy::Lights,
+    LightPolicy::StopSigns,
+    LightPolicy::NoLights,
+    LightPolicy::Auto,
+];
+
+fn junction_control_style(policy: LightPolicy) -> (&'static str, &'static str, &'static str) {
+    match policy {
+        LightPolicy::Lights => (
+            "signals",
+            "Signal",
+            r##"<circle r="14" fill="#e8ba59" stroke="#57392e" stroke-width="5"/>"##,
+        ),
+        LightPolicy::StopSigns => (
+            "all_way_stops",
+            "All-way stop",
+            r##"<rect x="-10" y="-10" width="20" height="20" rx="3" fill="#a5383d" stroke="#faf8f2" stroke-width="3"/>"##,
+        ),
+        LightPolicy::NoLights => (
+            "priority",
+            "Priority",
+            r##"<path d="M0 -12 12 0 0 12 -12 0Z" fill="#2a6e83" stroke="#faf8f2" stroke-width="3"/>"##,
+        ),
+        LightPolicy::Auto => (
+            "auto",
+            "Auto",
+            r##"<circle r="6" fill="#faf8f2" stroke="#586b65" stroke-width="2"/>"##,
+        ),
+    }
+}
+
+fn junction_control_counts(graph: &Graph) -> BTreeMap<&'static str, usize> {
+    let mut counts: BTreeMap<_, _> = JUNCTION_CONTROL_POLICIES
+        .into_iter()
+        .map(|policy| (junction_control_style(policy).0, 0))
+        .collect();
+    for node in graph.junctions.values() {
+        *counts
+            .get_mut(junction_control_style(node.light).0)
+            .unwrap() += 1;
+    }
+    counts
+}
+
+fn live_junction_control_counts(map: &Map) -> BTreeMap<&'static str, usize> {
+    let mut counts = BTreeMap::from([("signals", 0), ("all_way_stops", 0), ("no_controls", 0)]);
+    for node in map.intersections().values() {
+        let control = node.roads.iter().find_map(|&road| {
+            map.get(road)?
+                .incoming_lanes_to(node.id)
+                .iter()
+                .find(|(_, kind)| kind.needs_light())
+                .and_then(|&(lane, _)| map.get(lane))
+                .map(|lane| lane.control)
+        });
+        if let Some(control) = control {
+            let kind = match control {
+                simulation::map::TrafficControl::Light(_) => "signals",
+                simulation::map::TrafficControl::StopSign => "all_way_stops",
+                simulation::map::TrafficControl::Always => "no_controls",
+            };
+            *counts.get_mut(kind).unwrap() += 1;
+        }
+    }
+    counts
+}
+
 fn report(
     plan: &TownPlan,
     inputs: &PinnedInputs,
@@ -666,6 +735,8 @@ fn report(
             "kept_as_live_turn_checks": [2465892, 18225139],
             "superseded_or_outside_live_approaches": [1014411, 5516533, 5516534, 5516535, 5516536, 6650471, 8451567, 11569290, 11569298, 11569299, 11569300, 17691026, 17810892, 18140559, 18140560, 18140561]
         },
+        "junction_control_counts": junction_control_counts(&plan.graph),
+        "live_vehicle_junction_control_counts": live_junction_control_counts(map),
         "signals": plan.graph.junctions.values().filter(|node| node.light == LightPolicy::Lights).map(|node| node.key).collect::<Vec<_>>(),
         "town_road_bounds_m": road_bounds(&plan.graph).map(|bounds| bounds.map(source::xy)),
         "bounded_road_face_count": blocks.len(),
@@ -801,15 +872,18 @@ fn schematic(
             .unwrap();
         }
     }
-    for junction in plan
-        .graph
-        .junctions
-        .values()
-        .filter(|node| node.light == LightPolicy::Lights)
-    {
+    svg.push_str(r#"<g id="junction-controls">"#);
+    for junction in plan.graph.junctions.values() {
         let p = local(junction.position.xy());
-        writeln!(svg,r##"<circle cx="{:.1}" cy="{:.1}" r="13" fill="#e8ba59" stroke="#57392e" stroke-width="5"/>"##,p.x,p.y).unwrap();
+        let (key, _, symbol) = junction_control_style(junction.light);
+        writeln!(
+            svg,
+            r#"<g data-control="{key}" transform="translate({:.1} {:.1})">{symbol}</g>"#,
+            p.x, p.y
+        )
+        .unwrap();
     }
+    svg.push_str("</g>");
     for node in plan
         .source_graph
         .junctions
@@ -872,19 +946,18 @@ fn schematic(
         writeln!(svg,r#"<path d="M0 {y}h100" stroke="{colour}" stroke-width="{line}"/><text x="134" y="{}" font-size="36">{label}</text>"#,y+12).unwrap();
     }
     svg.push_str(r##"<path d="M0 550h100" stroke="#a8a99d" stroke-width="6" stroke-dasharray="13 9"/><text x="134" y="562" font-size="36">OSM alignment</text>
-<circle cx="50" cy="615" r="13" fill="#e8ba59" stroke="#57392e" stroke-width="5"/><text x="134" y="627" font-size="36">Signal</text>
-<path d="M0 680h100" stroke="#3380a2" stroke-width="12"/><text x="134" y="692" font-size="36">Authored Sava</text>
-<path d="M0 745h100" stroke="#205a79" stroke-width="8" stroke-dasharray="15 10"/><text x="134" y="757" font-size="36">Crossing reservation</text>
-<circle cx="50" cy="810" r="9" fill="#faf8f2" stroke="#77796f" stroke-width="4"/><text x="134" y="822" font-size="36">Source crop</text>
-<rect x="39" y="864" width="22" height="22" fill="#1c3335"/><text x="134" y="887" font-size="36">Rim / rail gateway</text>
-<rect x="29" y="931" width="42" height="25" fill="#a6ac85"/><text x="134" y="957" font-size="36">Dry frontage candidate</text>
-<text y="1035" font-weight="bold" font-size="44">Districts</text>
+<path d="M0 615h100" stroke="#3380a2" stroke-width="12"/><text x="134" y="627" font-size="36">Authored Sava</text>
+<path d="M0 680h100" stroke="#205a79" stroke-width="8" stroke-dasharray="15 10"/><text x="134" y="692" font-size="36">Crossing reservation</text>
+<circle cx="50" cy="745" r="9" fill="#faf8f2" stroke="#77796f" stroke-width="4"/><text x="134" y="757" font-size="36">Source crop</text>
+<rect x="39" y="799" width="22" height="22" fill="#1c3335"/><text x="134" y="822" font-size="36">Rim / rail gateway</text>
+<rect x="29" y="866" width="42" height="25" fill="#a6ac85"/><text x="134" y="892" font-size="36">Dry frontage candidate</text>
+<text y="970" font-weight="bold" font-size="44">Districts</text>
 "##);
     for (index, district) in plan.districts.iter().enumerate() {
         writeln!(
             svg,
             r#"<text y="{}" font-size="36">{} · {}</text>"#,
-            1112 + index * 65,
+            1047 + index * 65,
             index + 1,
             district.name
         )
@@ -897,7 +970,19 @@ fn schematic(
 <text x="16" y="1700" font-size="40">N</text>
 <path d="M0 1980h500m-500 13v-26m250 26v-26m250 26v-26" fill="none" stroke="#293432" stroke-width="6"/>
 <text y="2040" font-size="33">0</text><text x="226" y="2040" font-size="33">250</text><text x="463" y="2040" font-size="33">500 m</text>
-</g>"##);
+<text y="2175" font-weight="bold" font-size="44">Junction policies</text>"##);
+    let counts = junction_control_counts(&plan.graph);
+    for (index, policy) in JUNCTION_CONTROL_POLICIES.into_iter().enumerate() {
+        let (key, label, symbol) = junction_control_style(policy);
+        let y = 2240 + index * 58;
+        writeln!(
+            svg,
+            r#"<g transform="translate(50 {y})">{symbol}</g><text x="134" y="{}" font-size="36">{label} · {}</text>"#,
+            y + 12, counts[key]
+        )
+        .unwrap();
+    }
+    svg.push_str("</g>");
     writeln!(svg,r##"<text x="84" y="{}" font-size="29" fill="#4d5650">{ATTRIBUTION} · Draft schematic</text></svg>"##,height+335.0).unwrap();
     svg
 }
@@ -1146,6 +1231,55 @@ mod tests {
     }
 
     #[test]
+    fn citymap_junction_controls_follow_the_town_hierarchy() {
+        let plan = plan_town(
+            &pinned_inputs(),
+            TownConfig::default(),
+            SpacingLimits::default(),
+        )
+        .unwrap();
+        let nodes = &plan.graph.junctions;
+        let osm = |id| SourceKey::Node { id, rail: false };
+        for id in [781857034, 4193639658, 90647245] {
+            assert_eq!(nodes[&osm(id)].light, LightPolicy::Lights, "node {id}");
+        }
+        assert_eq!(nodes[&osm(4193639645)].light, LightPolicy::StopSigns);
+        assert_eq!(nodes[&osm(289183364)].light, LightPolicy::Auto);
+        assert_eq!(nodes[&osm(11950373997)].light, LightPolicy::NoLights);
+
+        let mut sim = preview_world(plan.config).unwrap();
+        let built = build_network(&mut sim, &plan.graph, plan.limits).unwrap();
+        let map = sim.map();
+        for (key, node) in nodes {
+            let live = map.get(built.junctions[key]).unwrap();
+            assert_eq!(live.light_policy, node.light, "{key:?}");
+            assert_eq!(live.turn_policy, node.turn, "{key:?}");
+            if node.light != LightPolicy::Lights {
+                continue;
+            }
+            let controls: Vec<_> = live
+                .roads
+                .iter()
+                .filter_map(|&road| {
+                    map.get(road)?
+                        .incoming_lanes_to(live.id)
+                        .iter()
+                        .find(|(_, kind)| kind.needs_light())
+                        .map(|&(lane, _)| map.get(lane).unwrap().control)
+                })
+                .collect();
+            let [a, b, c, d] = controls.try_into().unwrap();
+            let cycle = 28 * prototypes::SECONDS_PER_REALTIME_SECOND;
+            for second in 0..cycle {
+                let red = [a, b, c, d].map(|control| control.get_behavior(second).is_red());
+                assert_eq!(red[0], red[2], "{key:?}");
+                assert_eq!(red[1], red[3], "{key:?}");
+                assert_ne!(red[0], red[1], "{key:?}");
+            }
+        }
+    }
+
+    #[test]
     fn citymap_river_crossings_have_live_approaches() {
         let plan = plan_town(
             &pinned_inputs(),
@@ -1273,6 +1407,40 @@ mod tests {
             None,
             RoadClass::Rail,
         );
+        assert!(validate_live(&sim.map(), &graph, &built, limits)
+            .unwrap_err()
+            .contains("rail clearance"));
+    }
+
+    #[test]
+    fn citymap_validation_rejects_offset_graded_live_rail_overlap() {
+        let mut graph = fixture_graph();
+        let collector = SourceKey::Authored("fixture-east");
+        graph.links.retain(|key, _| *key == collector);
+        let link = graph.links.get_mut(&collector).unwrap();
+        link.class = RoadClass::Collector;
+        link.points = vec![vec2(400.0, 400.0), vec2(800.0, 400.0)];
+        graph
+            .junctions
+            .retain(|key, _| link.endpoints.contains(key));
+        for (key, position) in link
+            .endpoints
+            .into_iter()
+            .zip([link.points[0].z(20.0), link.points[1].z(60.0)])
+        {
+            graph.junctions.get_mut(&key).unwrap().position = position;
+        }
+
+        let limits = SpacingLimits::default();
+        let mut sim = preview_world(TownConfig::default()).unwrap();
+        let built = build_network(&mut sim, &graph, limits).unwrap();
+        sim.apply_commands([&WorldCommand::MapMakeConnection {
+            from: MapProject::ground(vec2(500.0, 408.0).z(63.0)),
+            to: MapProject::ground(vec2(900.0, 408.0).z(23.0)),
+            inter: None,
+            pat: RoadClass::Rail.pattern(false, 0.0),
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
         assert!(validate_live(&sim.map(), &graph, &built, limits)
             .unwrap_err()
             .contains("rail clearance"));

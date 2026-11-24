@@ -176,6 +176,7 @@ pub fn plan_town(
             &reach.downstream,
             &map.environment,
         );
+        prioritize_east_connector(&mut graph);
         finish_network(&mut graph, limits)?;
         validate_river_crossings(&reach, &bridges, &graph)?;
         river.push(reach);
@@ -183,6 +184,7 @@ pub fn plan_town(
         riverside_park = Some(park);
     } else {
         retire_outer_road_fragments(&mut graph, &infill)?;
+        prioritize_east_connector(&mut graph);
         calibrate_storage(&mut graph, config, limits, &map.environment)?;
     }
 
@@ -201,6 +203,31 @@ pub fn plan_town(
         mapped_sava_bridges,
         station,
     })
+}
+
+fn prioritize_east_connector(graph: &mut Graph) {
+    let mut upgraded = Vec::new();
+    for link in graph
+        .links
+        .values_mut()
+        .filter(|link| link.class == RoadClass::Local)
+    {
+        let class = if link.lineage.contains(&10575173) {
+            RoadClass::Avenue
+        } else if link.lineage.contains(&10521528) {
+            RoadClass::Collector
+        } else {
+            continue;
+        };
+        link.class = class;
+        upgraded.push(link.key);
+    }
+    if !upgraded.is_empty() {
+        graph.record(
+            "Dežmanova ulica and lower Hraška cesta connect Alpska to the Begunjska employment-side collector",
+            &upgraded,
+        );
+    }
 }
 
 #[derive(Clone)]

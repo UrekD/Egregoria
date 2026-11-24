@@ -1,3 +1,4 @@
+use super::clearance::{bounds_overlap, live_conflict, segment_bounds};
 use super::source::{serialize_optional_point, serialize_points, TownConfig};
 use geom::{vec2, PolyLine3, Spline, Vec2, Vec3};
 use serde::Serialize;
@@ -5,7 +6,7 @@ use simulation::map::{
     Environment, Intersection, IntersectionID, Intersections, LaneID, LaneKind, LanePattern,
     LanePatternBuilder, Lanes, LightPolicy, Map, MapProject, ParkingSpots, PathKind, Pathfinder,
     Road, RoadID, RoadSegmentKind, Roads, SpatialMap, Traversable, TraverseDirection, TraverseKind,
-    TurnPolicy, MAX_SLOPE, ROAD_Z_OFFSET,
+    TurnKind, TurnPolicy, MAX_SLOPE, ROAD_Z_OFFSET,
 };
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::Simulation;
@@ -1097,31 +1098,14 @@ pub(crate) fn segment_parameters(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> Option<(
 }
 
 fn overlap(a: &[Vec3], b: &[Vec3], radius: f32) -> bool {
-    sweep_conflict(a, b, radius, None, |_, _| 5.0)
-}
-
-fn sweep_conflict(
-    a: &[Vec3],
-    b: &[Vec3],
-    radius: f32,
-    junction: Option<(Vec2, f32)>,
-    clearance: impl Fn(f32, f32) -> f32,
-) -> bool {
-    let conflict = |p: Vec3, q: Vec3| {
-        !junction.is_some_and(|(centre, radius)| {
-            p.xy().distance2(centre) <= radius * radius
-                && q.xy().distance2(centre) <= radius * radius
-        }) && (p.z - q.z).abs() < clearance(p.z, q.z)
-    };
+    let conflict = |p: Vec3, q: Vec3| (p.z - q.z).abs() < 5.0;
     for x in a.windows(2) {
         for y in b.windows(2) {
-            let (alo, ahi) = (x[0].xy().min(x[1].xy()), x[0].xy().max(x[1].xy()));
-            let (blo, bhi) = (y[0].xy().min(y[1].xy()), y[0].xy().max(y[1].xy()));
-            if alo.x > bhi.x + radius
-                || blo.x > ahi.x + radius
-                || alo.y > bhi.y + radius
-                || blo.y > ahi.y + radius
-            {
+            if !bounds_overlap(
+                segment_bounds(x[0], x[1]),
+                segment_bounds(y[0], y[1]),
+                radius,
+            ) {
                 continue;
             }
             if let Some((t, u)) = segment_parameters(x[0].xy(), x[1].xy(), y[0].xy(), y[1].xy()) {
@@ -1129,8 +1113,8 @@ fn sweep_conflict(
                     return true;
                 }
             }
-            for ([p, q], line, swap) in [([x[0], x[1]], y, false), ([y[0], y[1]], x, true)] {
-                for point in [p, q] {
+            for (endpoints, line) in [(x, y), (y, x)] {
+                for &point in endpoints {
                     let nearest = project_on_segment(point.xy(), line[0].xy(), line[1].xy());
                     if nearest.distance(point.xy()) >= radius {
                         continue;
@@ -1138,13 +1122,7 @@ fn sweep_conflict(
                     let length = line[0].xy().distance(line[1].xy()).max(0.001);
                     let z = line[0].z
                         + (line[1].z - line[0].z) * line[0].xy().distance(nearest) / length;
-                    let nearest = nearest.z(z);
-                    let (first, second) = if swap {
-                        (nearest, point)
-                    } else {
-                        (point, nearest)
-                    };
-                    if conflict(first, second) {
+                    if conflict(point, nearest.z(z)) {
                         return true;
                     }
                 }
@@ -1301,30 +1279,118 @@ fn grade_and_controls(graph: &mut Graph) {
         let node = graph.junctions.get_mut(&key).unwrap();
         node.turn.back_turns = driving.len() == 1;
         node.turn.crosswalks = !driving.iter().any(|link| link.class == RoadClass::Motorway);
-        let mut angles: Vec<_> = driving
-            .iter()
-            .map(|link| {
-                let d = link.direction_at(key);
-                d.y.atan2(d.x)
-            })
-            .collect();
-        angles.sort_by(f32::total_cmp);
-        let opposite = |a: f32, b: f32| (a - b).cos() < -0.9;
-        node.light = if driving.len() == 4
-            && driving.iter().any(|link| link.class == RoadClass::Avenue)
-            && driving
-                .iter()
-                .all(|link| !link.one_way && link.class <= RoadClass::Avenue)
-            && opposite(angles[0], angles[2])
-            && opposite(angles[1], angles[3])
-        {
-            // Suppress permissive left turns across the opposing phase.
-            node.turn.left_turns = false;
-            LightPolicy::Lights
-        } else {
-            LightPolicy::NoLights
-        };
+        node.light = junction_control(key, &driving);
+        // The engine runs opposing legs in the same phase. Eliminate turns
+        // across that phase and restore ordinary turns if the layout changes.
+        node.turn.left_turns = node.light != LightPolicy::Lights;
     }
+}
+
+fn junction_control(key: SourceKey, driving: &[&LinkSpec]) -> LightPolicy {
+    let avenues = driving.iter().any(|link| link.class == RoadClass::Avenue);
+    let collectors = driving
+        .iter()
+        .filter(|link| link.class == RoadClass::Collector)
+        .count();
+    if driving.iter().any(|link| link.class >= RoadClass::Ramp) {
+        return LightPolicy::NoLights;
+    }
+    if let [a, b, c, d] = driving {
+        if avenues && driving.iter().all(|link| !link.one_way && !link.roundabout) {
+            let mut directions = [a, b, c, d].map(|link| link.direction_at(key));
+            directions.sort_by(|a, b| a.y.atan2(a.x).total_cmp(&b.y.atan2(b.x)));
+            if opposing_phases(directions) {
+                return LightPolicy::Lights;
+            }
+        }
+    }
+    if (driving.len() >= 4 && avenues) || (driving.len() >= 3 && collectors >= 2) {
+        LightPolicy::StopSigns
+    } else if driving.len() >= 3 && (avenues || collectors > 0) {
+        LightPolicy::NoLights
+    } else {
+        LightPolicy::Auto
+    }
+}
+
+fn opposing_phases(directions: [Vec2; 4]) -> bool {
+    // Opposite legs must be at least 120° apart. Keep adjacent legs
+    // between 35° and 145° to avoid bunching two approaches into one sector.
+    directions[0].dot(directions[2]) <= -0.5
+        && directions[1].dot(directions[3]) <= -0.5
+        && directions.iter().enumerate().all(|(i, &direction)| {
+            direction.cross(directions[(i + 1) % 4]) >= 35.0_f32.to_radians().sin()
+        })
+}
+
+fn validate_signal_turns(map: &Map, inter: &Intersection, key: SourceKey) -> Result<(), String> {
+    let approaches: Vec<_> = inter
+        .roads
+        .iter()
+        .filter_map(|&id| map.get(id))
+        .filter(|road| {
+            road.incoming_lanes_to(inter.id)
+                .iter()
+                .any(|(_, kind)| kind.needs_light())
+        })
+        .collect();
+    let [a, b, c, d] = approaches.as_slice() else {
+        return Err(format!("signal {key:?} needs four live approaches"));
+    };
+    if !opposing_phases([a, b, c, d].map(|road| road.dir_from(inter.id))) {
+        return Err(format!(
+            "signal {key:?} lacks two opposed live approach pairs"
+        ));
+    }
+    for road in &approaches {
+        if road
+            .incoming_lanes_to(inter.id)
+            .iter()
+            .filter(|(_, kind)| kind.needs_light())
+            .any(|&(lane, _)| !map.get(lane).unwrap().control.is_light())
+        {
+            return Err(format!("signal {key:?} has an uncontrolled approach"));
+        }
+    }
+
+    let approach_index = |lane: LaneID| {
+        let road = map.get(lane)?.parent;
+        approaches.iter().position(|approach| approach.id == road)
+    };
+    let mut movements = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+    for turn in inter.turns().filter(|turn| turn.kind == TurnKind::Driving) {
+        let (Some(src), Some(dst)) = (approach_index(turn.id.src), approach_index(turn.id.dst))
+        else {
+            return Err(format!(
+                "signal {key:?} has a turn outside its four approaches"
+            ));
+        };
+        if dst != (src + 1) % 4 && dst != (src + 2) % 4 {
+            return Err(format!(
+                "signal {key:?} allows a turn across its opposing phase"
+            ));
+        }
+        movements[src].push(turn);
+    }
+    if movements.iter().any(Vec::is_empty) {
+        return Err(format!(
+            "signal {key:?} has an approach with no driving turns"
+        ));
+    }
+    for (first, opposite) in [(0, 2), (1, 3)] {
+        for a in &movements[first] {
+            for b in &movements[opposite] {
+                if a.points.segments().any(|x| {
+                    b.points.segments().any(|y| {
+                        segment_parameters(x.src.xy(), x.dst.xy(), y.src.xy(), y.dst.xy()).is_some()
+                    })
+                }) {
+                    return Err(format!("signal {key:?} has crossing turns in one phase"));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 fn prune_geometry_conflicts(graph: &mut Graph) -> Result<(), String> {
@@ -2214,12 +2280,7 @@ fn live_sweeps(map: &Map) -> Result<(), String> {
     for (i, &a) in roads.iter().enumerate() {
         for (j, &b) in roads.iter().enumerate().skip(i + 1) {
             let width = (a.width + b.width) * 0.5;
-            let ((alo, ahi), (blo, bhi)) = (bounds[i], bounds[j]);
-            if alo.x > bhi.x + width
-                || blo.x > ahi.x + width
-                || alo.y > bhi.y + width
-                || blo.y > ahi.y + width
-            {
+            if !bounds_overlap(bounds[i], bounds[j], width) {
                 continue;
             }
             let junction = [a.src, a.dst]
@@ -2232,18 +2293,17 @@ fn live_sweeps(map: &Map) -> Result<(), String> {
                     (map.get(end).unwrap().pos.xy(), radius)
                 });
             let (rail_a, rail_b) = (has_rail(a), has_rail(b));
-            let clearance = |az, bz| {
-                let lower_is_rail = if az < bz { rail_a } else { rail_b };
-                // Dry clearance model in metres. The upper deck occupies 1 m
-                // below its running surface. Reserve 5 m for rolling stock or
-                // 4.5 m for road vehicles, plus 0.5 m operating margin.
-                if lower_is_rail {
-                    6.5
-                } else {
-                    6.0
-                }
-            };
-            if sweep_conflict(&profiles[i], &profiles[j], width, junction, clearance) {
+            // The upper deck occupies 1 m below its running surface. Reserve
+            // 5 m for rolling stock or 4.5 m for road vehicles, plus 0.5 m
+            // operating margin above the lower corridor.
+            let clearance = |rail| if rail { 6.5 } else { 6.0 };
+            if live_conflict(
+                &profiles[i],
+                &profiles[j],
+                width,
+                junction,
+                [-clearance(rail_a), clearance(rail_b)],
+            ) {
                 let problem = if rail_a != rail_b {
                     "rail clearance"
                 } else {
@@ -2381,6 +2441,18 @@ pub fn validate_live(
             "median adjacent driving junction spacing {median:.3} m below {}",
             limits.median_driving
         ));
+    }
+    for node in graph
+        .junctions
+        .values()
+        .filter(|node| node.light == LightPolicy::Lights)
+    {
+        let inter = built
+            .junctions
+            .get(&node.key)
+            .and_then(|&id| map.get(id))
+            .ok_or_else(|| format!("missing live signal {:?}", node.key))?;
+        validate_signal_turns(map, inter, node.key)?;
     }
     live_sweeps(map)?;
     validate_lane_components(map)
