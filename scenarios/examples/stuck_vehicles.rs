@@ -21,11 +21,13 @@ use simulation::map::{
 use simulation::map_dynamic::ItineraryTarget;
 use simulation::map_dynamic::{Itinerary, RoutingStep};
 use simulation::transportation::{Location, VehicleState};
+use simulation::utils::scheduler::SeqSchedule;
 use simulation::VehicleID;
 use simulation::{Simulation, SlotId};
 use std::collections::{BTreeMap, BTreeSet};
 
 const SAMPLE_SECONDS: u64 = 30;
+const SAMPLE_TICKS: u64 = game_secs_to_ticks(SAMPLE_SECONDS);
 
 #[derive(Clone)]
 struct Still {
@@ -36,7 +38,7 @@ struct Still {
 #[derive(Clone, Copy)]
 struct JourneyCompletions {
     walk: u64,
-    car: u64,
+    driving: u64,
     transit: u64,
 }
 
@@ -44,7 +46,7 @@ impl From<&TripStats> for JourneyCompletions {
     fn from(stats: &TripStats) -> Self {
         Self {
             walk: stats.walk.completed,
-            car: stats.car.completed,
+            driving: stats.car.completed,
             transit: stats.transit.completed,
         }
     }
@@ -53,11 +55,11 @@ impl From<&TripStats> for JourneyCompletions {
 impl JourneyCompletions {
     fn report_since(self, start: Self) -> String {
         let walk = self.walk.saturating_sub(start.walk);
-        let car = self.car.saturating_sub(start.car);
+        let driving = self.driving.saturating_sub(start.driving);
         let transit = self.transit.saturating_sub(start.transit);
-        let total = walk + car + transit;
+        let total = walk + driving + transit;
         format!(
-            "car journeys completed: {car}\nall journeys completed: {total} (walk={walk} car={car} transit={transit})"
+            "driving-mode journeys completed (includes human-driven freight): {driving}\nall tracked journeys completed: {total} (walk={walk} driving={driving} transit={transit})"
         )
     }
 }
@@ -88,6 +90,14 @@ impl StationaryDelay {
     }
 }
 
+fn advance_sample(sim: &mut Simulation, sched: &mut SeqSchedule, remaining_ticks: u64) -> u64 {
+    let batch = remaining_ticks.min(SAMPLE_TICKS);
+    for _ in 0..batch {
+        sim.tick(sched, &[]);
+    }
+    batch
+}
+
 fn main() {
     let mut args = std::env::args().skip(1);
     let root = std::path::absolute(args.next().expect("save root")).unwrap();
@@ -104,7 +114,6 @@ fn main() {
     }
     let mut sched = Simulation::schedule();
     let ticks = (hours * TICKS_PER_HOUR as f64) as u64;
-    let sample = game_secs_to_ticks(SAMPLE_SECONDS);
     let threshold = threshold_minutes * 60;
 
     let mut still: BTreeMap<VehicleID, Still> = BTreeMap::new();
@@ -119,10 +128,7 @@ fn main() {
 
     let mut done = 0;
     while done < ticks {
-        for _ in 0..sample {
-            sim.tick(&mut sched, &[]);
-        }
-        done += sample;
+        done += advance_sample(&mut sim, &mut sched, ticks - done);
         let now = sim.read::<GameTime>().seconds;
         if let Ok(snap) = std::env::var("PROBE_SNAP") {
             let v: Vec<f32> = snap.split(',').map(|x| x.parse().unwrap()).collect();
@@ -154,7 +160,7 @@ fn main() {
         }
 
         let stuck = stationary_delay.sample(&still, now, threshold);
-        if (done / sample) % 60 == 0 {
+        if done % (SAMPLE_TICKS * 60) == 0 {
             let mut cells: BTreeMap<(i32, i32), usize> = BTreeMap::new();
             for id in &stuck {
                 let p = sim.world().vehicles[*id].trans.pos;
@@ -621,6 +627,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn qw1_probe_samples_the_partial_batch_at_the_cutoff() {
+        let mut sim = scenarios::ScenarioCtx::new(simulation::SimulationOptions {
+            terrain_size: 1,
+            save_replay: false,
+            ..simulation::SimulationOptions::LEGACY
+        })
+        .sim;
+        let mut sched = Simulation::schedule();
+        let start = sim.get_tick();
+        let ticks = SAMPLE_TICKS + 7;
+        let first = advance_sample(&mut sim, &mut sched, ticks);
+        assert_eq!(first, SAMPLE_TICKS);
+        assert_eq!(sim.get_tick(), start + first);
+        let last = advance_sample(&mut sim, &mut sched, ticks - first);
+        assert_eq!(sim.get_tick() - start, ticks);
+        assert_eq!(first + last, ticks);
+    }
+
+    #[test]
     fn qw1_completion_report_counts_only_arrivals_during_the_probe() {
         let mut stats = TripStats::default();
         stats.walk.completed = 10;
@@ -629,7 +654,7 @@ mod tests {
         let start = JourneyCompletions::from(&stats);
         assert_eq!(
             JourneyCompletions::from(&stats).report_since(start),
-            "car journeys completed: 0\nall journeys completed: 0 (walk=0 car=0 transit=0)"
+            "driving-mode journeys completed (includes human-driven freight): 0\nall tracked journeys completed: 0 (walk=0 driving=0 transit=0)"
         );
 
         stats.walk.completed += 5;
@@ -637,7 +662,7 @@ mod tests {
         stats.transit.completed += 3;
         assert_eq!(
             JourneyCompletions::from(&stats).report_since(start),
-            "car journeys completed: 2\nall journeys completed: 10 (walk=5 car=2 transit=3)"
+            "driving-mode journeys completed (includes human-driven freight): 2\nall tracked journeys completed: 10 (walk=5 driving=2 transit=3)"
         );
     }
 

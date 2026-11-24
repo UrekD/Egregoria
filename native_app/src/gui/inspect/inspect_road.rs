@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::time::{Duration, Instant};
 
@@ -99,21 +100,9 @@ pub(crate) fn inspect_road(_uiw: &UiWorld, sim: &Simulation, road: RoadID) -> bo
                     if has_vehicles {
                         mincolumn(3.0, || {
                             textc(on_primary_container(), speed_label(*traffic));
-                            textc(
-                                on_secondary_container(),
-                                format!(
-                                    "Mean of lane-limit percentages · refreshes every {} ms",
-                                    SAMPLE_INTERVAL.as_millis()
-                                ),
-                            );
-                            textc(
-                                on_secondary_container(),
-                                "Both snapshots exclude parked vehicles",
-                            );
-                            textc(
-                                on_secondary_container(),
-                                "Bus dwell counts toward occupancy only",
-                            );
+                            for note in speed_snapshot_notes() {
+                                textc(on_secondary_container(), note);
+                            }
                         });
                     }
                     inspect_utility::render(sim, road);
@@ -155,6 +144,18 @@ fn speed_label(traffic: Option<RoadTraffic>) -> String {
         "Speed snapshot · {percent:.0}% of lane limit · {band} ({} {unit})",
         sample.samples
     )
+}
+
+fn speed_snapshot_notes() -> [Cow<'static, str>; 3] {
+    [
+        format!(
+            "Mean of lane-limit percentages · refreshes every {} ms of real time",
+            SAMPLE_INTERVAL.as_millis()
+        )
+        .into(),
+        "Both snapshots exclude parked vehicles".into(),
+        "Bus dwell counts toward occupancy only".into(),
+    ]
 }
 
 struct RoadDetails {
@@ -315,7 +316,7 @@ mod tests {
     use simulation::SimulationOptions;
 
     #[test]
-    fn qw1_road_inspector_labels_speed_and_window() {
+    fn u5_qw1_road_inspector_labels_speed_and_window() {
         assert_eq!(history_label(0), "Entered in last 0.0 game min");
         assert_eq!(
             history_label(ROAD_HISTORY_TICKS - 1),
@@ -326,6 +327,14 @@ mod tests {
             "Entered in last 10 game minutes"
         );
         assert_eq!(speed_label(None), "Speed snapshot · no usable samples");
+        assert_eq!(
+            speed_snapshot_notes().each_ref().map(|note| note.as_ref()),
+            [
+                "Mean of lane-limit percentages · refreshes every 250 ms of real time",
+                "Both snapshots exclude parked vehicles",
+                "Bus dwell counts toward occupancy only",
+            ]
+        );
         for (ratio, label) in [(0.0, "Jammed"), (0.5, "Busy"), (0.8, "Free")] {
             let sample = RoadTraffic {
                 vehicles: 1,

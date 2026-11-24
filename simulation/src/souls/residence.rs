@@ -119,6 +119,20 @@ impl Residences {
             .get(&building)
             .is_some_and(|checks| checks.abandoned_hours.is_some())
     }
+
+    /// Returns completed consecutive eligible hours and the required total for the next level.
+    pub fn upgrade_progress(&self, building: BuildingID) -> Option<(u8, u8)> {
+        let residence = self.by_building.get(&building)?;
+        if self.is_abandoned(building) {
+            return None;
+        }
+        next_prototype(residence)?;
+        let completed = self
+            .checks
+            .get(&building)
+            .map_or(0, |checks| checks.upgrade_streak);
+        Some((completed, UPGRADE_CHECKS))
+    }
 }
 
 pub(crate) fn prototype(density: Density, level: u8) -> Option<&'static ResidencePrototype> {
@@ -586,5 +600,50 @@ pub fn residence_update(sim: &mut Simulation) {
             infos.mark_vacancy_changed(id);
             map.regenerate_house_mesh(id, proto.level);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::TestCtx;
+    use geom::{vec2, vec3};
+    use prototypes::GameTime;
+
+    #[test]
+    fn qw1_residence_progress_reads_the_streak_and_hides_unavailable_upgrades() {
+        let mut test = TestCtx::new();
+        test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(400.0, 100.0, 0.0)]);
+        let house = test.build_house_near(vec2(175.0, 125.0));
+        let progress = |sim: &Simulation| sim.read::<Residences>().upgrade_progress(house);
+
+        assert_eq!(progress(&test.g), Some((0, 6)));
+        test.g
+            .write::<Residences>()
+            .checks
+            .entry(house)
+            .or_default()
+            .upgrade_streak = 3;
+        assert_eq!(progress(&test.g), Some((3, 6)));
+
+        // The house lacks utilities, so the hourly check resets its saved streak.
+        *test.g.write::<GameTime>() = GameTime::new(Tick(UPDATE_OFFSET));
+        residence_update(&mut test.g);
+        assert_eq!(progress(&test.g), Some((0, 6)));
+
+        let mut residences = test.g.write::<Residences>();
+        let checks = residences.checks.get_mut(&house).unwrap();
+        checks.upgrade_streak = 3;
+        checks.abandoned_hours = Some(0);
+        assert_eq!(residences.upgrade_progress(house), None);
+
+        residences.checks.get_mut(&house).unwrap().abandoned_hours = None;
+        let highest = ResidencePrototype::iter()
+            .filter(|proto| proto.density == Density::Low)
+            .max_by_key(|proto| proto.level)
+            .unwrap();
+        residences.upgrade(house, highest);
+        assert_eq!(residences.upgrade_progress(house), None);
+        assert_eq!(residences.upgrade_progress(BuildingID::default()), None);
     }
 }

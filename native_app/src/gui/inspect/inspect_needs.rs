@@ -3,6 +3,7 @@ use prototypes::ServiceKind;
 use simulation::diagnostics::{BuildingDiagnostics, PowerStatus};
 use simulation::map::{BuildingID, BuildingKind};
 use simulation::map_dynamic::{CoverageGrid, EnvGrid, UtilityStatus};
+use simulation::souls::residence::Residences;
 use simulation::Simulation;
 
 use crate::gui::overlays::is_coverage_receiver;
@@ -29,9 +30,13 @@ pub(super) fn render(sim: &Simulation, building: BuildingID, diagnostics: &Build
         }
     }
     let requirements = &diagnostics.upgrade_requirements;
-    if !requirements.is_empty() {
+    let progress = upgrade_progress_label(sim, building);
+    if !requirements.is_empty() || progress.is_some() {
         fixed_spacer((0.0, 5.0));
         textc(on_secondary_container(), "Upgrade requirements");
+        if let Some(progress) = progress {
+            textc(on_secondary_container(), progress);
+        }
         for requirement in requirements {
             let (color, status) = if requirement.met {
                 (on_secondary_container(), "Met")
@@ -54,6 +59,13 @@ pub(super) fn render(sim: &Simulation, building: BuildingID, diagnostics: &Build
             );
         }
     }
+}
+
+fn upgrade_progress_label(sim: &Simulation, building: BuildingID) -> Option<String> {
+    let (completed, required) = sim.read::<Residences>().upgrade_progress(building)?;
+    Some(format!(
+        "Consecutive eligible hours · {completed} / {required}"
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -203,6 +215,21 @@ mod tests {
     fn diagnosed_needs(sim: &Simulation, id: BuildingID) -> Vec<Need> {
         let diagnostics = simulation::diagnostics::building_diagnostics(sim, id).unwrap();
         needs(sim, id, &diagnostics)
+    }
+
+    #[test]
+    fn qw1_residence_inspector_shows_progress_before_the_first_check() {
+        let mut test = TestCtx::new(SimulationOptions {
+            terrain_size: 1,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
+        let house = fill_houses(&mut test, 1)[0];
+        assert_eq!(
+            upgrade_progress_label(&test.sim, house).as_deref(),
+            Some("Consecutive eligible hours · 0 / 6")
+        );
     }
 
     #[test]
