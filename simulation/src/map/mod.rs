@@ -87,6 +87,7 @@ pub use terrain::*;
 pub use traffic_control::*;
 pub use traversable::*;
 pub use turn_policy::*;
+pub use water::water_service::*;
 pub use water::*;
 pub use zonegrid::*;
 

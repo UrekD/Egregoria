@@ -252,6 +252,7 @@ impl SerializedMap {
             ..Map::empty()
         };
         m.electricity = ElectricityCache::build(&m);
+        m.water_services = super::WaterServiceCache::from_map(&m);
         m
     }
 }

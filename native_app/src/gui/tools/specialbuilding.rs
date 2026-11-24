@@ -208,6 +208,9 @@ fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnO
                     PlacementError::CommandRejected(Rejection::InvalidBuilding) => {
                         Cow::Borrowed("Building entrance needs road access")
                     }
+                    PlacementError::CommandRejected(Rejection::WaterServiceSite(reason)) => {
+                        Cow::Owned(reason.to_string())
+                    }
                     PlacementError::CommandRejected(Rejection::InsufficientFunds) => {
                         Cow::Borrowed("Not enough money to build here")
                     }

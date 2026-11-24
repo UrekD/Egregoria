@@ -195,7 +195,11 @@ impl OverlayMode {
             Self::Transit => transit::invalidation_key(&sim.read::<Transit>()),
             Self::Coverage(kind) => service_reach_version(sim, kind),
             Self::Water | Self::Sewage => {
-                city_field_tick(sim).saturating_sub(1) / DEMAND_INTERVAL_TICKS
+                let mut hash = DefaultHasher::new();
+                (city_field_tick(sim).saturating_sub(1) / DEMAND_INTERVAL_TICKS).hash(&mut hash);
+                map.environment().water_revision().hash(&mut hash);
+                sim.read::<UtilityFlow>().water_pending(map).hash(&mut hash);
+                hash.finish()
             }
             Self::Pollution | Self::LandValue => environment_version(sim),
             Self::Happiness => city_field_tick(sim).saturating_sub(3) / TICKS_PER_HOUR,

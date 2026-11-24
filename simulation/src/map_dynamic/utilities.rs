@@ -22,7 +22,7 @@ pub struct UtilityFlow {
     #[serde(skip)]
     sampled_generation: Option<u64>,
     #[serde(skip)]
-    sampled_members: BTreeMap<ElectricityNetworkID, BTreeSet<NetworkObjectID>>,
+    pub(crate) sampled_members: BTreeMap<ElectricityNetworkID, BTreeSet<NetworkObjectID>>,
     #[serde(skip)]
     pub(crate) sampled_water_revision: u64,
 }
@@ -117,8 +117,11 @@ pub fn utility_network_readout(
         Ok
     };
 
+    let water_pending = flow.water_pending(map);
     let utility_state = |supply, demand| {
-        if supply == 0.0 && demand == 0.0 {
+        if water_pending {
+            Updating
+        } else if supply == 0.0 && demand == 0.0 {
             Idle
         } else if meets_demand(supply, demand) {
             Ok
@@ -307,6 +310,11 @@ pub fn utility_flow_update(sim: &mut Simulation) {
         flow.sampled_generation = Some(generation);
     }
 
+    let water_sites = map
+        .environment()
+        .strict_water_siting()
+        .then(|| crate::map::river_site_summary(&map));
+
     // Every road in the electricity graph carries pipes, including rail-only roads.
     for network in map.electricity.networks() {
         let mut totals = UtilityTotals::default();
@@ -347,6 +355,11 @@ pub fn utility_flow_update(sim: &mut Simulation) {
                         }
                         _ => continue,
                     };
+                    if water_sites.as_ref().is_some_and(|sites| {
+                        !sites.provider_site(id).is_some_and(|site| site.is_ok())
+                    }) {
+                        continue;
+                    }
                     let Some(SoulID::GoodsCompany(owner)) = infos.owner(id) else {
                         continue;
                     };

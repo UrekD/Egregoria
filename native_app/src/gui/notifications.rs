@@ -693,6 +693,7 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         (_, WaterWorkLimit) => "The batch exceeds the water work limit",
         (_, WaterConfigured) => "This map already has configured water",
         (_, WaterTerrainConflict) => "The terrain edit conflicts with water or nearby structures",
+        (_, WaterServiceSite(site)) => return site.to_string().into(),
     };
     message.into()
 }

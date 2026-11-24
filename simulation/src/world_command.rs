@@ -172,6 +172,7 @@ pub enum Rejection {
     WaterWorkLimit,
     WaterConfigured,
     WaterTerrainConflict,
+    WaterServiceSite(crate::map::WaterSiteError),
 }
 
 impl From<ZonePaintError> for Rejection {
@@ -1091,6 +1092,8 @@ impl WorldCommand {
                 if !Building::dry_footprint(map.environment(), pos, zone.as_ref()) {
                     return Err(Rejection::WetFootprint);
                 }
+                crate::map::validate_water_service_placement(map, *kind, *pos, *connected_road)
+                    .map_err(Rejection::WaterServiceSite)?;
                 connected_road.is_none_or(|id| map.get(id).is_some())
             }
             UpdateZone { building, zone } => {

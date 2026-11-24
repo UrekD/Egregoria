@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fmt;
 
+#[path = "water_service.rs"]
+pub(super) mod water_service;
+
 pub const MAX_WATER_CHUNKS_PER_AXIS: u16 = 80;
 pub const MAX_WATER_VERTICES: usize = 256;
 pub const MAX_WATER_EDIT_BYTES: usize = 8 * 1024;
