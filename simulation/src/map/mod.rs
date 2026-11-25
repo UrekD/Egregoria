@@ -65,6 +65,7 @@ pub mod import;
 pub(crate) mod land_frontage;
 mod land_ownership;
 mod land_site;
+mod lane_scoring;
 mod light_policy;
 #[allow(clippy::module_inception)]
 mod map;
@@ -89,6 +90,8 @@ pub use change_detection::*;
 pub use electricity_cache::*;
 pub use land_ownership::*;
 pub(crate) use land_site::PreparedEffects;
+pub(crate) use lane_scoring::lane_scoring_update;
+pub use lane_scoring::{LaneScoringError, LaneScoringPilot};
 pub use light_policy::*;
 pub use map::*;
 pub use spatial_map::*;

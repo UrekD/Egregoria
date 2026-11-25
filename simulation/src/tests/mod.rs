@@ -414,7 +414,7 @@ pub(crate) fn load_unprofiled_prototypes() {
     crate::init::register_simulation();
 }
 
-fn init_test_simulation() {
+pub(crate) fn init_test_simulation() {
     static BASE_PROTOTYPES: Mutex<Option<&'static prototypes::Prototypes>> = Mutex::new(None);
     let mut base = BASE_PROTOTYPES.lock().unwrap();
     let base_is_loaded = base

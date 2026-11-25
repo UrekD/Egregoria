@@ -549,38 +549,10 @@ fn showcase_archive_is_historical() {
 
 #[test]
 fn repair_cohort_and_no_loss_preserves_physical_arrivals_and_unloads() {
-    use scenarios::traffic_repair::{
-        prepare_repair_fixture, run_no_loss_arm, FixtureArm, FixtureOffer,
-    };
-    use simulation::{SavePhase, Simulation, SlotId, SnapshotRevision};
+    use scenarios::traffic_repair::{prepare_repair_fixture, FixtureArm, FixtureOffer};
 
     let fixture = prepare_repair_fixture(FixtureArm::NoLoss).unwrap();
-    let root = std::env::temp_dir().join(format!("p7-no-loss-{}", std::process::id()));
-    std::fs::create_dir(&root).unwrap();
-    struct PrivateSlot(std::path::PathBuf);
-    impl Drop for PrivateSlot {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-    let root = PrivateSlot(root);
-    let slot = SlotId::new("no-loss").unwrap();
-    assert!(matches!(
-        fixture
-            .simulation
-            .save_to_slot(&root.0, &slot, SnapshotRevision::new(1))
-            .unwrap(),
-        SavePhase::Complete,
-    ));
-    let run = |treatment| {
-        let snapshot = Simulation::load_from_slot(&root.0, &slot).unwrap();
-        run_no_loss_arm(snapshot, &fixture, treatment).unwrap_or_else(|error| {
-            eprintln!("physical no-loss arm (edited={treatment}): {error}");
-            panic!("physical no-loss run failed")
-        })
-    };
-    let stock = run(false);
-    let edit = run(true);
+    let [stock, edit] = run_repair_checkpoint(&fixture, "no-loss");
     let mut persons = 0;
     let mut freight = 0;
     for ((offer, stock), edit) in fixture.schedule.iter().zip(&stock).zip(&edit) {
@@ -614,4 +586,90 @@ fn repair_cohort_and_no_loss_preserves_physical_arrivals_and_unloads() {
         }
     }
     assert_eq!((persons, freight), (120, 24));
+}
+
+#[test]
+#[ignore = "runs both full matched repair arms"]
+fn repair_cohort_matched_headless() {
+    use scenarios::traffic_repair::{prepare_repair_fixture, FixtureArm, FixtureOffer};
+
+    let fixture = prepare_repair_fixture(FixtureArm::Repair).unwrap();
+    let [control, treatment] = run_repair_checkpoint(&fixture, "repair-cohort");
+    let report = |treatment: bool, observations: &[Observation]| {
+        assert_eq!(observations.len(), fixture.schedule.len());
+        let mut primary = [0, 0];
+        let mut tail = [0, 0];
+        let mut durations = [Vec::new(), Vec::new()];
+        for (offered, observed) in fixture.schedule.iter().zip(observations) {
+            assert_eq!(observed.tag, offered.tag);
+            assert_eq!(observed.admitted_at, Some(offered.tick));
+            let (index, expected) = match offered.offer {
+                FixtureOffer::Person { destination, .. } => (0, destination),
+                FixtureOffer::Freight { receiver, .. } => (1, receiver),
+            };
+            if let Some(Terminal::Completed {
+                tick,
+                destination,
+                units,
+            }) = &observed.terminal
+            {
+                assert_eq!(destination, &format!("{expected:?}"));
+                assert_eq!(*units, 1);
+                assert!((offered.tick..=fixture.tail_cutoff).contains(tick));
+                tail[index] += 1;
+                if *tick <= fixture.primary_cutoff {
+                    primary[index] += 1;
+                    durations[index].push(*tick - offered.tick);
+                }
+            }
+        }
+        let observed_p95 = durations.map(|mut durations| {
+            durations.sort_unstable();
+            (durations.len() * 95)
+                .div_ceil(100)
+                .checked_sub(1)
+                .map(|i| durations[i])
+        });
+        eprintln!(
+            "treatment={treatment} primary={primary:?} tail={tail:?} completed-travel-p95-ticks={observed_p95:?}"
+        );
+        tail
+    };
+    let control = report(false, &control);
+    let treatment = report(true, &treatment);
+    assert!(treatment
+        .into_iter()
+        .zip(control)
+        .all(|(edited, stock)| edited >= stock));
+}
+
+fn run_repair_checkpoint(
+    fixture: &scenarios::traffic_repair::RepairFixture,
+    name: &str,
+) -> [Vec<Observation>; 2] {
+    use scenarios::traffic_repair::run_no_loss_arm;
+    use simulation::{SavePhase, Simulation, SlotId, SnapshotRevision};
+
+    let root = std::env::temp_dir().join(format!("p7-{name}-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    struct PrivateSlot(std::path::PathBuf);
+    impl Drop for PrivateSlot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = PrivateSlot(root);
+    let slot = SlotId::new(name).unwrap();
+    assert!(matches!(
+        fixture
+            .simulation
+            .save_to_slot(&root.0, &slot, SnapshotRevision::new(1))
+            .unwrap(),
+        SavePhase::Complete,
+    ));
+    [false, true].map(|treatment| {
+        let snapshot = Simulation::load_from_slot(&root.0, &slot).unwrap();
+        run_no_loss_arm(snapshot, fixture, treatment)
+            .unwrap_or_else(|error| panic!("{name} arm (edited={treatment}): {error}"))
+    })
 }

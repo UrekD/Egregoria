@@ -59,7 +59,7 @@ pub struct Router {
 /// The last `can_drive` answer for a car waiting for a route. It holds until the car or its
 /// target moves or the map's lanes change.
 struct DriveCheck {
-    lanes: (u64, u64),
+    lanes: (u64, u64, u64),
     from: [u32; 3],
     to: [u32; 3],
     can_drive: bool,
@@ -129,7 +129,7 @@ fn routing_changed(
     world.humans.edit_active(HumanWork::RouteChanged, |id, h| {
         let h: &mut HumanEnt = h;
         let router = &mut h.router;
-        if matches!(h.location, Location::Transit(_)) {
+        if matches!(h.location, Location::Transit(_)) || h.it.is_pedestrian_egress() {
             return;
         }
         if std::mem::take(&mut router.replan_at_alight) {
@@ -303,7 +303,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
     let cbuf_vehicle: &ParCommandBuffer<VehicleEnt> = &resources.read();
 
     world.humans.edit_active(HumanWork::RouteStep, |body, h| {
-        if !h.router.has_route_step() {
+        if !h.router.has_route_step() || h.it.is_pedestrian_egress() {
             return;
         }
 
@@ -887,7 +887,11 @@ impl Router {
     /// inputs change: the nearest lanes and their reachability are fixed between lane edits.
     fn can_drive_cached(&mut self, map: &Map, from: Vec3, to: Vec3) -> bool {
         let key = DriveCheck {
-            lanes: (map.identity(), map.walking_topology_generation),
+            lanes: (
+                map.identity(),
+                map.walking_topology_generation,
+                map.driving_policy_generation,
+            ),
             from: <[f32; 3]>::from(from).map(f32::to_bits),
             to: <[f32; 3]>::from(to).map(f32::to_bits),
             can_drive: false,

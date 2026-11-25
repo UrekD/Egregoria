@@ -16,14 +16,16 @@ use crate::economy::progression::{can_build, BuildCapability, ProgressionState};
 use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::road_edit::{
-    prepare_upgrade, EditReceipt, PreparedRoadEdit, RoadEditStamp, RoadQuote, RoadUpgrade,
+    prepare_junction_edit, prepare_upgrade, EditReceipt, JunctionEditReceipt, JunctionEditStamp,
+    PreparedJunctionEdit, PreparedRoadEdit, RoadEditStamp, RoadQuote, RoadUpgrade,
 };
 use crate::map::{
     Building, BuildingID, BuildingKind, ConnectionError, Density, Environment, IntersectionID,
-    LandDenial, LandTileId, LaneID, LaneKind, LanePattern, LanePatternBuilder, LightPolicy, LotID,
-    LotLayout, Map, MapProject, PreparedEffects, ProjectKind, RoadID, TerraformKind, TilePurchased,
-    TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, WaterTopologyWork, Zone,
-    ZoneGrid, ZoneKind, ZonePaintError, MAX_WATER_BATCH_WORK,
+    JunctionRuleError, JunctionRules, LandDenial, LandTileId, LaneID, LaneKind, LanePattern,
+    LanePatternBuilder, LightPolicy, LotID, LotLayout, Map, MapProject, PreparedEffects,
+    ProjectKind, RoadID, TerraformKind, TilePurchased, TurnPolicy, WaterEdit, WaterEditError,
+    WaterEditOutcome, WaterTopologyWork, Zone, ZoneGrid, ZoneKind, ZonePaintError,
+    MAX_WATER_BATCH_WORK,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
@@ -310,6 +312,12 @@ macro_rules! define_world_command {
                 change: RoadUpgrade,
                 quote: RoadQuote,
             },
+            MapSetJunctionRules {
+                junction: IntersectionID,
+                expected: JunctionEditStamp,
+                rules: JunctionRules,
+                quote: RoadQuote,
+            },
         }
     };
 }
@@ -371,6 +379,8 @@ pub enum Rejection {
     StaleRoadEdit,
     StaleRoadQuote,
     RoadTopologyUnavailable,
+    InvalidJunctionRules(JunctionRuleError),
+    BusyConflict,
 }
 
 impl From<LandDenial> for Rejection {
@@ -453,9 +463,9 @@ impl PrepareBudget {
         let mut batch = Self {
             guard_terraform,
             reject_surface: false,
-            shared_topology: commands
-                .iter()
-                .any(|command| matches!(command, MapUpgradeRoad { .. })),
+            shared_topology: commands.iter().any(|command| {
+                matches!(command, MapUpgradeRoad { .. } | MapSetJunctionRules { .. })
+            }),
             remaining: MAX_WATER_BATCH_WORK,
         };
         if !guard_terraform || commands.len() < 2 {
@@ -585,6 +595,7 @@ pub(crate) enum PreparedAction<'a> {
     },
     SpecialBuilding(crate::map::PreparedSpecialBuilding, Money),
     RoadEdit(PreparedRoadEdit),
+    JunctionEdit(PreparedJunctionEdit),
     Command(&'a WorldCommand, Money),
 }
 
@@ -622,6 +633,12 @@ impl PreparedAction<'_> {
                 let mut outcomes = sim.write::<CommandOutcomes>();
                 let index = outcomes.command_ranges.len();
                 outcomes.road_edits.insert(index, Ok(receipt));
+            }
+            Self::JunctionEdit(prepared) => {
+                let receipt = prepared.commit(sim)?;
+                let mut outcomes = sim.write::<CommandOutcomes>();
+                let index = outcomes.command_ranges.len();
+                outcomes.junction_edits.insert(index, Ok(receipt));
             }
             Self::Command(command, cost) => command.apply_one(sim, construction, cost)?,
         }
@@ -661,6 +678,7 @@ pub struct CommandOutcomes {
     tile_purchases: BTreeMap<usize, Result<TilePurchased, Rejection>>,
     water_edits: BTreeMap<usize, Result<WaterEditOutcome, WaterEditError>>,
     road_edits: BTreeMap<usize, Result<EditReceipt, Rejection>>,
+    junction_edits: BTreeMap<usize, Result<JunctionEditReceipt, Rejection>>,
 }
 
 impl CommandOutcomes {
@@ -716,6 +734,10 @@ impl CommandOutcomes {
         self.road_edits.get(&index)
     }
 
+    pub fn junction_edit(&self, index: usize) -> Option<&Result<JunctionEditReceipt, Rejection>> {
+        self.junction_edits.get(&index)
+    }
+
     /// Discards the completed batch's outcomes while preserving its sequence.
     pub fn clear(&mut self) {
         self.last.clear();
@@ -727,6 +749,7 @@ impl CommandOutcomes {
         self.water_edits.clear();
         self.tile_purchases.clear();
         self.road_edits.clear();
+        self.junction_edits.clear();
     }
 
     pub(crate) fn begin_batch(&mut self) -> Option<Self> {
@@ -1062,6 +1085,7 @@ impl WorldCommand {
                 | EditWater(_)
                 | BuyTile { .. }
                 | MapUpgradeRoad { .. }
+                | MapSetJunctionRules { .. }
         )
     }
 
@@ -1172,6 +1196,7 @@ impl WorldCommand {
                 change: RoadUpgrade::Replace(pat),
                 ..
             } => lanes(pat),
+            MapSetJunctionRules { rules, .. } => rules.approaches().len() + rules.forbidden().len(),
             MapMakeMultipleConnections(projects, links) => {
                 projects.len()
                     + links.len()
@@ -1325,6 +1350,7 @@ impl WorldCommand {
             | TransitSetFare { .. }
             | SetWarehousePolicy { .. }
             | SetLotLayout(_)
+            | MapSetJunctionRules { .. }
             | MapUpgradeRoad {
                 change: RoadUpgrade::ReverseOneWay,
                 ..
@@ -1415,6 +1441,11 @@ impl WorldCommand {
             let index = outcomes.command_ranges.len();
             outcomes.road_edits.insert(index, Err(reason));
         }
+        if matches!(self, MapSetJunctionRules { .. }) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes.junction_edits.insert(index, Err(reason));
+        }
         if matches!(self, EditWater(_)) {
             let mut outcomes = sim.write::<CommandOutcomes>();
             let index = outcomes.command_ranges.len();
@@ -1464,6 +1495,7 @@ impl WorldCommand {
             EditWater(_) => "EditWater",
             BuyTile { .. } => "BuyTile",
             MapUpgradeRoad { .. } => "MapUpgradeRoad",
+            MapSetJunctionRules { .. } => "MapSetJunctionRules",
         }
     }
 
@@ -1518,6 +1550,7 @@ impl WorldCommand {
     fn validate(&self, map: &Map) -> Result<(), Rejection> {
         let exists = match self {
             MapUpgradeRoad { road, .. } => map.get(*road).is_some(),
+            MapSetJunctionRules { junction, .. } => map.get(*junction).is_some(),
             MapRemoveIntersection(id) | MapUpdateIntersectionPolicy { inter: id, .. } => {
                 map.get(*id).is_some()
             }
@@ -1534,6 +1567,9 @@ impl WorldCommand {
                 if map.land_ownership().is_tiled() =>
             {
                 return Err(LandDenial::ForbiddenOperation.into());
+            }
+            MapLoadParis | MapLoadTestField { .. } if map.has_junction_rules() => {
+                return Err(Rejection::RoadTopologyUnavailable);
             }
             SetLotLayout(layout)
                 if map.land_ownership().is_tiled() && *layout != map.lot_layout() =>
@@ -1806,6 +1842,9 @@ impl WorldCommand {
                 PreparedAction::RoadEdit(prepared) => {
                     Ok(ActionPreview::priced(prepared.preview.cost))
                 }
+                PreparedAction::JunctionEdit(prepared) => {
+                    Ok(ActionPreview::priced(prepared.preview.cost))
+                }
                 PreparedAction::SpecialBuilding(_, cost) | PreparedAction::Command(_, cost) => {
                     Ok(ActionPreview::priced(cost))
                 }
@@ -1842,6 +1881,18 @@ impl WorldCommand {
                     return Err(Rejection::StaleRoadQuote);
                 }
                 return Ok(PreparedAction::RoadEdit(prepared));
+            }
+            MapSetJunctionRules {
+                junction,
+                expected,
+                rules,
+                quote,
+            } => {
+                let prepared = prepare_junction_edit(sim, *junction, *expected, rules, budget)?;
+                if prepared.preview.quote != *quote {
+                    return Err(Rejection::StaleRoadQuote);
+                }
+                return Ok(PreparedAction::JunctionEdit(prepared));
             }
             BuyTile { tile } => {
                 let purchase = crate::map::prepare_purchase(sim, *tile)?;
@@ -2193,6 +2244,7 @@ impl WorldCommand {
             MapMakeConnection { .. }
             | MapMakeMultipleConnections(..)
             | MapUpgradeRoad { .. }
+            | MapSetJunctionRules { .. }
             | EditWater(_)
             | BuyTile { .. }
             | ZonePaint { .. } => {

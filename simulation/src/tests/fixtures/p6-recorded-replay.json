@@ -1,0 +1,318 @@
+{
+  "revision": 1,
+  "version": "0.11.0",
+  "enabled": true,
+  "registry": 8266622312067920340,
+  "commands": [
+    [
+      1,
+      {
+        "Init": {
+          "terrain_size": 16,
+          "save_replay": true,
+          "preset": "Procedural",
+          "seed": 6042,
+          "starting_money_bucks": 150000,
+          "progression": "FreeBuild",
+          "land_mode": "Unrestricted",
+          "land_recipe": "Unrestricted"
+        }
+      }
+    ],
+    [
+      1,
+      {
+        "MapMakeMultipleConnections": [
+          [
+            {
+              "pos": [
+                4343.2334,
+                6262.846,
+                0.0
+              ],
+              "kind": "Ground"
+            },
+            {
+              "pos": [
+                4222.163,
+                6318.7007,
+                0.0
+              ],
+              "kind": "Ground"
+            },
+            {
+              "pos": [
+                2024.0668,
+                147.33333,
+                0.0
+              ],
+              "kind": {
+                "Intersection": {
+                  "idx": 2,
+                  "version": 1
+                }
+              }
+            },
+            {
+              "pos": [
+                2831.1282,
+                2172.9182,
+                0.0
+              ],
+              "kind": "Ground"
+            },
+            {
+              "pos": [
+                4098.609,
+                4876.7466,
+                0.0
+              ],
+              "kind": "Ground"
+            },
+            {
+              "pos": [
+                4180.8335,
+                5765.297,
+                0.0
+              ],
+              "kind": "Ground"
+            },
+            {
+              "pos": [
+                4312.9233,
+                5982.129,
+                0.0
+              ],
+              "kind": "Ground"
+            },
+            {
+              "pos": [
+                4418.4004,
+                6150.2427,
+                0.0
+              ],
+              "kind": "Ground"
+            },
+            {
+              "pos": [
+                4080.5332,
+                6242.0093,
+                0.0
+              ],
+              "kind": "Ground"
+            },
+            {
+              "pos": [
+                4134.9575,
+                5988.7896,
+                0.0
+              ],
+              "kind": "Ground"
+            }
+          ],
+          [
+            [
+              0,
+              1,
+              null,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": []
+              }
+            ],
+            [
+              2,
+              3,
+              4972985476040057325,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ]
+              }
+            ],
+            [
+              3,
+              4,
+              5005986054842354977,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ]
+              }
+            ],
+            [
+              4,
+              5,
+              5008381821963615703,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ]
+              }
+            ],
+            [
+              5,
+              6,
+              5009042048632353377,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": []
+              }
+            ],
+            [
+              6,
+              7,
+              5010742073997638941,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": []
+              }
+            ],
+            [
+              7,
+              0,
+              5010861869225921041,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": []
+              }
+            ],
+            [
+              1,
+              8,
+              5008055507530249597,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": []
+              }
+            ],
+            [
+              8,
+              9,
+              5007338222221478024,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": []
+              }
+            ],
+            [
+              9,
+              5,
+              5008608536108168175,
+              {
+                "lanes_forward": [
+                  [
+                    "Rail",
+                    9.0
+                  ]
+                ],
+                "lanes_backward": []
+              }
+            ]
+          ]
+        ]
+      }
+    ],
+    [
+      1,
+      {
+        "MapBuildSpecialBuilding": {
+          "pos": {
+            "corners": [
+              5010057980197058898,
+              5010739497017993874,
+              5009490559183158337,
+              5008809038067256064
+            ]
+          },
+          "kind": {
+            "RailFreightStation": 9010703082962909221
+          },
+          "gen": {
+            "NoWalkway": {
+              "door_pos": 0
+            }
+          },
+          "zone": null,
+          "connected_road": null
+        }
+      }
+    ],
+    [
+      1,
+      {
+        "AddTrain": {
+          "dist": 150.0,
+          "n_wagons": 7,
+          "lane": {
+            "idx": 3,
+            "version": 1
+          }
+        }
+      }
+    ]
+  ],
+  "last_tick_recorded": 1,
+  "timeline": {
+    "constructor_end": 4,
+    "steps": 0,
+    "batches": []
+  }
+}

@@ -8,7 +8,7 @@ use simulation::economy::{
     balance::{DEMAND_INTERVAL_TICKS, MIN_DEMAND_POPULATION},
     Budget, Government, ZoneDemand,
 };
-use simulation::map::{BuildingID, ZoneKind};
+use simulation::map::{BuildingID, JunctionRuleError, ZoneKind};
 use simulation::map_dynamic::{ElectricityFlow, LineID, SiteUtilityReader, Transit, UtilityStatus};
 use simulation::souls::events::{FireEventKind, Fires};
 use simulation::souls::residence::Residences;
@@ -656,7 +656,7 @@ fn command_label(command: &str) -> &'static str {
         "SpawnRandomCars" => "Spawn cars",
         "AddTrain" | "SpawnTrain" => "Place train",
         "MapMakeConnection" | "MapMakeMultipleConnections" => "Build road or track",
-        "MapUpdateIntersectionPolicy" => "Edit intersection",
+        "MapUpdateIntersectionPolicy" | "MapSetJunctionRules" => "Edit intersection",
         "MapBuildSpecialBuilding" => "Place building",
         "MapLoadParis" | "MapLoadTestField" => "Load map",
         "UpdateZone" => "Resize building zone",
@@ -702,6 +702,14 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
             "The road or its quote changed. Preview the edit again."
         }
         (_, RoadTopologyUnavailable) => "This road topology change is unavailable in this session",
+        (_, BusyConflict) => "Traffic or a service route still needs this movement",
+        (_, InvalidJunctionRules(JunctionRuleError::Signalized)) => {
+            "Approach priorities require an unsignalized junction"
+        }
+        (_, InvalidJunctionRules(JunctionRuleError::RailConflict)) => {
+            "Junction control requires clear separation from rail traffic"
+        }
+        (_, InvalidJunctionRules(_)) => "Choose an existing approach or directed vehicle turn",
         (_, InvalidBatchIndex) => "Invalid connection group",
         (_, InvalidBuilding) => "Building cannot be placed here",
         (_, InvalidZone) => "Zoning area is outside the map or too large",

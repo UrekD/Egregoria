@@ -1,9 +1,9 @@
 use super::itinerary::RerouteFailures;
-use crate::map::{Lane, LaneKind, Map, ParkingSpot, ParkingSpotID, ParkingSpots};
+use crate::map::{Lane, LaneKind, Map, ParkingSpot, ParkingSpotID, ParkingSpots, RoadID};
 use common::AccessCmp;
 use geom::Vec3;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::option::Option::None;
 
 pub(crate) const NEAR_PARKING_RADIUS: f32 = 100.0;
@@ -17,6 +17,21 @@ pub struct ParkingManagement {
     reserved_spots: BTreeSet<ParkingSpotID>,
     #[serde(skip)]
     pub(crate) reroute_failures: RerouteFailures,
+    #[serde(skip)]
+    search_observations: ParkingSearchObservations,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ParkingSearchStats {
+    pub attempts: u64,
+    pub exhausted: u64,
+    pub other_road: u64,
+}
+
+#[derive(Default)]
+struct ParkingSearchObservations {
+    map_identity: u64,
+    roads: BTreeMap<RoadID, ParkingSearchStats>,
 }
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
@@ -27,6 +42,32 @@ pub enum ParkingReserveError {
 }
 
 impl ParkingManagement {
+    pub(crate) fn watch_search(&mut self, map: &Map, road: RoadID) -> bool {
+        if self.search_observations.map_identity != map.identity() {
+            self.search_observations = ParkingSearchObservations {
+                map_identity: map.identity(),
+                ..Default::default()
+            };
+        }
+        let roads = &mut self.search_observations.roads;
+        if roads.len() >= 16 || roads.contains_key(&road) {
+            return false;
+        }
+        roads.insert(road, ParkingSearchStats::default());
+        true
+    }
+
+    pub(crate) fn unwatch_search(&mut self, road: RoadID) {
+        self.search_observations.roads.remove(&road);
+    }
+
+    pub(crate) fn search_stats(&self, map: &Map, road: RoadID) -> Option<ParkingSearchStats> {
+        if self.search_observations.map_identity != map.identity() {
+            return None;
+        }
+        self.search_observations.roads.get(&road).copied()
+    }
+
     #[allow(unknown_lints)]
     #[allow(clippy::forget_non_drop)]
     pub fn free(&mut self, spot: SpotReservation) {
@@ -89,6 +130,15 @@ impl ParkingManagement {
             .nearest_lane(near, LaneKind::Driving, radius)
             .ok_or(E::FindingNearestLane)?;
         let lane = map.lanes().get(lane).ok_or(E::FetchingLaneData)?;
+        let start_road = lane.parent;
+        let mut observation = if self.search_observations.map_identity == map.identity() {
+            self.search_observations.roads.get_mut(&start_road)
+        } else {
+            None
+        };
+        if let Some(stats) = observation.as_deref_mut() {
+            stats.attempts = stats.attempts.saturating_add(1);
+        }
 
         let idget = |l: &Lane| l.id;
         let max_dist2 = radius.map(|radius| radius * radius);
@@ -139,6 +189,11 @@ impl ParkingManagement {
                                 .is_some_and(|data| data.trans.pos.xy().distance2(near.xy()) <= max)
                         }) && self.reserved_spots.insert(spot)
                         {
+                            if let Some(stats) = observation {
+                                if lane.parent != start_road {
+                                    stats.other_road = stats.other_road.saturating_add(1);
+                                }
+                            }
                             return Ok(SpotReservation(spot));
                         }
                     }
@@ -147,11 +202,18 @@ impl ParkingManagement {
             std::mem::swap(&mut potential, &mut next);
             next.clear();
         }
+        if let Some(stats) = observation {
+            stats.exhausted = stats.exhausted.saturating_add(1);
+        }
         Err(E::NoSpotFoundAfterSearch)
     }
 }
 
 impl SpotReservation {
+    pub(crate) fn id(&self) -> ParkingSpotID {
+        self.0
+    }
+
     pub fn exists(&self, spots: &ParkingSpots) -> bool {
         spots.contains(self.0)
     }

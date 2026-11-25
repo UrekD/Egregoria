@@ -375,6 +375,279 @@ fn p7_edit_replacement_rejects_rail_and_accepts_both_one_way_directions() {
 }
 
 #[test]
+fn p7_life_busy_one_way_reversal_keeps_occupants_then_allocates_new_lane() {
+    super::init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(2, 6042).unwrap();
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject::ground(vec3(100.0, 200.0, 0.0)),
+        to: MapProject::ground(vec3(400.0, 200.0, 0.0)),
+        inter: None,
+        pat: LanePatternBuilder::new()
+            .one_way(true)
+            .parking(false)
+            .build(),
+    }]);
+    let (road, lane, src, dst, pos, it, walking) = {
+        let map = sim.map();
+        let (road_id, road) = map.roads().iter().next().unwrap();
+        let lane = road
+            .lanes_iter()
+            .find(|&(_, kind)| kind == LaneKind::Driving)
+            .unwrap()
+            .0;
+        let driving = map.get(lane).unwrap();
+        let it =
+            Itinerary::route_between_lanes(Tick(0), &map, (lane, 30.0), (lane, 100.0)).unwrap();
+        let walking = road
+            .lanes_iter()
+            .filter_map(|(id, kind)| (kind == LaneKind::Walking).then_some(id))
+            .collect::<Vec<_>>();
+        (
+            road_id,
+            lane,
+            driving.src,
+            driving.dst,
+            driving.points.point_along(30.0),
+            it,
+            walking,
+        )
+    };
+    let request = || RoadUpgrade::ReverseOneWay;
+    let preview = |sim: &Simulation| {
+        let mut budget = PrepareBudget::for_preview(4_194_304);
+        let expected = road_edit_stamp(sim, road, &mut budget).unwrap();
+        preview_road_edit(
+            sim,
+            &RoadEditRequest::Upgrade {
+                road,
+                expected,
+                change: request(),
+            },
+            &mut budget,
+        )
+    };
+    let initial = preview(&sim).unwrap();
+    let id = spawn_driving_vehicle(
+        &mut sim,
+        VehicleKind::Car,
+        Transform::new_dir(pos, geom::Vec3::X),
+    )
+    .unwrap();
+    sim.world.vehicles[id].it = it;
+    let busy = sim.hashes();
+    sim.apply_commands([&WorldCommand::MapUpgradeRoad {
+        road,
+        expected: initial.stamp,
+        change: request(),
+        quote: initial.quote,
+    }]);
+    let outcome = sim.read::<CommandOutcomes>();
+    assert!(matches!(
+        outcome.road_edit(0),
+        Some(Err(Rejection::BusyConflict))
+    ));
+    drop(outcome);
+    assert_eq!(sim.hashes(), busy);
+
+    sim.read::<crate::ParCommandBuffer<crate::VehicleEnt>>()
+        .kill(id);
+    sim.apply_commands(std::iter::empty());
+    let after = preview(&sim).unwrap();
+    sim.apply_commands([&WorldCommand::MapUpgradeRoad {
+        road,
+        expected: after.stamp,
+        change: request(),
+        quote: after.quote,
+    }]);
+    let outcomes = sim.read::<CommandOutcomes>();
+    assert_eq!(
+        outcomes.road_edit(0).unwrap().as_ref().unwrap().status,
+        RoadEditStatus::Applied
+    );
+    let map = sim.map();
+    assert!(map.get(lane).is_none());
+    let road = map.get(road).unwrap();
+    let next = road
+        .lanes_iter()
+        .find(|&(_, kind)| kind == LaneKind::Driving)
+        .unwrap()
+        .0;
+    assert_eq!(
+        (map.get(next).unwrap().src, map.get(next).unwrap().dst),
+        (dst, src)
+    );
+    assert!(walking.iter().all(|&lane| map.get(lane).is_some()));
+    assert_eq!(road.interfaced_points().as_slice(), after.deck.as_slice());
+}
+
+#[test]
+fn p7_life_same_width_replacement_preserves_a_live_directed_terminal() {
+    super::init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(2, 6042).unwrap();
+    let pattern = LanePatternBuilder::new().parking(false);
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject::ground(vec3(100.0, 200.0, 0.0)),
+        to: MapProject::ground(vec3(400.0, 200.0, 0.0)),
+        inter: None,
+        pat: pattern.one_way(true).n_lanes(2).build(),
+    }]);
+    let (road, lane, position, itinerary) = {
+        let map = sim.map();
+        let (id, road) = map.roads().iter().next().unwrap();
+        let lane = road
+            .lanes_iter()
+            .filter(|&(_, kind)| kind == LaneKind::Driving)
+            .map(|(id, _)| map.get(id).unwrap())
+            .min_by(|a, b| a.dist_from_bottom.total_cmp(&b.dist_from_bottom))
+            .unwrap();
+        let it = Itinerary::route_between_lanes(Tick(0), &map, (lane.id, 30.0), (lane.id, 100.0))
+            .unwrap();
+        (id, lane.id, lane.points.point_along(30.0), it)
+    };
+    let terminal = itinerary.end_pos().unwrap();
+    let target = itinerary.target();
+    let id = spawn_driving_vehicle(
+        &mut sim,
+        VehicleKind::Car,
+        Transform::new_dir(position, geom::Vec3::X),
+    )
+    .unwrap();
+    sim.world.vehicles[id].it = itinerary;
+    let mut budget = PrepareBudget::for_preview(4_194_304);
+    let expected = road_edit_stamp(&sim, road, &mut budget).unwrap();
+    let change = RoadUpgrade::Replace(pattern.build());
+    let preview = preview_road_edit(
+        &sim,
+        &RoadEditRequest::Upgrade {
+            road,
+            expected,
+            change: change.clone(),
+        },
+        &mut budget,
+    )
+    .unwrap();
+    assert!(preview.retained_lanes.contains(&lane));
+    sim.apply_commands([&WorldCommand::MapUpgradeRoad {
+        road,
+        expected,
+        change,
+        quote: preview.quote,
+    }]);
+    let report = sim
+        .read::<CommandOutcomes>()
+        .road_edit(0)
+        .unwrap()
+        .as_ref()
+        .unwrap()
+        .clone();
+    assert_eq!(report.status, RoadEditStatus::Applied);
+    assert!(report.retained_lanes.contains(&lane));
+    assert_eq!(sim.world.vehicles[id].trans.pos, position);
+    assert_eq!(sim.world.vehicles[id].it.end_pos(), Some(terminal));
+    assert_eq!(sim.world.vehicles[id].it.target(), target);
+
+    let mut restored: Simulation = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+    let mut schedule = Simulation::schedule();
+    for _ in 0..900 {
+        restored.tick(&mut schedule, &[]);
+    }
+    assert!(restored.world.vehicles[id]
+        .trans
+        .pos
+        .is_close(terminal, 2.0));
+}
+
+#[test]
+fn p7_edit_junction_mask_applies_in_batch_and_survives_snapshot() {
+    use crate::map::road_edit::{junction_edit_stamp, preview_junction_edit};
+    use crate::map::{ApproachRole, JunctionRules, ProjectKind, TurnKind};
+
+    super::init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(2, 6042).unwrap();
+    let pat = LanePatternBuilder::new().build();
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject::ground(vec3(100.0, 100.0, 0.0)),
+        to: MapProject::ground(vec3(400.0, 100.0, 0.0)),
+        inter: None,
+        pat: pat.clone(),
+    }]);
+    let (approach, junction, pos) = {
+        let map = sim.map();
+        let (id, road) = map.roads().iter().next().unwrap();
+        (id, road.dst, map.get(road.dst).unwrap().pos)
+    };
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject {
+            kind: ProjectKind::Intersection(junction),
+            pos,
+        },
+        to: MapProject::ground(vec3(400.0, 400.0, 0.0)),
+        inter: None,
+        pat: pat.clone(),
+    }]);
+    let turn = sim
+        .map()
+        .get(junction)
+        .unwrap()
+        .turns()
+        .find(|turn| {
+            turn.kind == TurnKind::Driving && sim.map().get(turn.id.src).unwrap().parent == approach
+        })
+        .unwrap()
+        .id;
+    let make_edit = |sim: &Simulation, rules: JunctionRules| {
+        let mut budget = PrepareBudget::for_preview(4_194_304);
+        let expected = junction_edit_stamp(sim, junction, &mut budget).unwrap();
+        let preview = preview_junction_edit(sim, junction, expected, &rules, &mut budget).unwrap();
+        assert_eq!(preview.cost, Money::ZERO);
+        WorldCommand::MapSetJunctionRules {
+            junction,
+            expected,
+            rules,
+            quote: preview.quote,
+        }
+    };
+    let rules = JunctionRules::new(vec![(approach, ApproachRole::Priority)], vec![turn]).unwrap();
+    let command = make_edit(&sim, rules.clone());
+    let command = Bincode::decode::<WorldCommand>(&Bincode::encode(&command).unwrap()).unwrap();
+    let before = sim.hashes();
+    sim.apply_commands([&command, &command]);
+    let outcomes = sim.read::<CommandOutcomes>();
+    assert_eq!(outcomes.accepted, [0]);
+    assert_eq!(
+        outcomes.junction_edit(0).unwrap().as_ref().unwrap().status,
+        RoadEditStatus::Applied
+    );
+    assert_eq!(
+        outcomes.junction_edit(1),
+        Some(&Err(Rejection::StaleRoadEdit))
+    );
+    drop(outcomes);
+    assert!(!sim.map().allows_turn(turn));
+    assert_eq!(
+        sim.map().get(junction).unwrap().raw_turn(turn).unwrap().id,
+        turn
+    );
+    assert_eq!(sim.hashes()["map"], before["map"]);
+    assert_eq!(sim.hashes()["government"], before["government"]);
+
+    let mut loaded: Simulation = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+    assert_eq!(loaded.hashes(), sim.hashes());
+    assert_eq!(loaded.map().junction_rules(junction), Some(&rules));
+    assert!(!loaded.map().allows_turn(turn));
+    let repeat = make_edit(&loaded, rules);
+    let clear = make_edit(&loaded, JunctionRules::default());
+    loaded.apply_commands([&repeat, &clear]);
+    let outcomes = loaded.read::<CommandOutcomes>();
+    assert_eq!(outcomes.accepted, [0, 1]);
+    assert_eq!(
+        outcomes.junction_edit(0).unwrap().as_ref().unwrap().status,
+        RoadEditStatus::NoChange
+    );
+    assert!(loaded.map().allows_turn(turn));
+}
+
+#[test]
 fn p7_edit_speed_checks_protected_deck_footprint() {
     use crate::map::{
         GatewayRole, LandDenial, LandOwnership, LandTileId, OwnedTileRect, PreparedEffects,

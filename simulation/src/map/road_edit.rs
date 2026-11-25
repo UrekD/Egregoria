@@ -1,8 +1,10 @@
 use crate::economy::Government;
 use crate::map::{
-    ConnectionError, LaneID, LaneKind, LanePattern, LanePatternBuilder, Map, PreparedEffects,
-    ProjectFilter, ProjectKind, Road, RoadID,
+    ConnectionError, IntersectionID, JunctionRules, Lane, LaneDirection, LaneID, LaneKind,
+    LanePattern, LanePatternBuilder, Map, PreparedEffects, ProjectFilter, ProjectKind, Road,
+    RoadID, TraverseKind, TurnID, MAX_CONFIGURED_JUNCTIONS,
 };
+use crate::transportation::junction_admission::JunctionAdmission;
 use crate::world_command::{PrepareBudget, Rejection};
 use crate::Simulation;
 use geom::{PolyLine3, AABB};
@@ -18,6 +20,328 @@ pub struct RoadEditStamp(u64);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RoadQuote(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JunctionEditStamp(u64);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JunctionEditPreview {
+    pub junction: IntersectionID,
+    pub stamp: JunctionEditStamp,
+    pub quote: RoadQuote,
+    pub cost: Money,
+    pub changed: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct JunctionEditReceipt {
+    pub junction: IntersectionID,
+    pub stamp: JunctionEditStamp,
+    pub quote: RoadQuote,
+    pub status: RoadEditStatus,
+}
+
+pub(crate) struct PreparedJunctionEdit {
+    pub(crate) preview: JunctionEditPreview,
+    rules: JunctionRules,
+    map_identity: u64,
+    policy_revision: u64,
+}
+
+impl PreparedJunctionEdit {
+    pub(crate) fn commit(self, sim: &mut Simulation) -> Result<JunctionEditReceipt, Rejection> {
+        let mut map = sim.map_mut();
+        let junction = self.preview.junction;
+        if map.identity() != self.map_identity
+            || map.junction_policy_revision() != self.policy_revision
+            || junction_stamp(&map, junction, map.junction_rules(junction))? != self.preview.stamp
+        {
+            return Err(Rejection::StaleRoadEdit);
+        }
+        let status = if self.preview.changed {
+            map.install_junction_rules(junction, self.rules);
+            sim.write::<JunctionAdmission>().reset_junction(junction);
+            RoadEditStatus::Applied
+        } else {
+            RoadEditStatus::NoChange
+        };
+        let stamp = junction_stamp(&map, junction, map.junction_rules(junction))?;
+        Ok(JunctionEditReceipt {
+            junction,
+            stamp,
+            quote: self.preview.quote,
+            status,
+        })
+    }
+}
+
+pub fn junction_edit_stamp(
+    sim: &Simulation,
+    junction: IntersectionID,
+    budget: &mut PrepareBudget,
+) -> Result<JunctionEditStamp, Rejection> {
+    let map = sim.map();
+    reserve_junction(&map, junction, budget)?;
+    junction_stamp(&map, junction, map.junction_rules(junction))
+}
+
+pub fn preview_junction_edit(
+    sim: &Simulation,
+    junction: IntersectionID,
+    expected: JunctionEditStamp,
+    rules: &JunctionRules,
+    budget: &mut PrepareBudget,
+) -> Result<JunctionEditPreview, Rejection> {
+    Ok(prepare_junction_edit(sim, junction, expected, rules, budget)?.preview)
+}
+
+pub(crate) fn prepare_junction_edit(
+    sim: &Simulation,
+    junction: IntersectionID,
+    expected: JunctionEditStamp,
+    rules: &JunctionRules,
+    budget: &mut PrepareBudget,
+) -> Result<PreparedJunctionEdit, Rejection> {
+    let map = sim.map();
+    reserve_junction(&map, junction, budget)?;
+    let previous = map.junction_rules(junction);
+    let stamp = junction_stamp(&map, junction, previous)?;
+    if stamp != expected {
+        return Err(Rejection::StaleRoadEdit);
+    }
+    map.authorize_land_effects(PreparedEffects::Junction(junction))?;
+    rules
+        .validate(&map, junction)
+        .map_err(Rejection::InvalidJunctionRules)?;
+    let changed = previous.map_or(!rules.is_empty(), |previous| previous != rules);
+    if changed {
+        if previous.is_none() && map.junction_rule_count() >= MAX_CONFIGURED_JUNCTIONS {
+            return Err(Rejection::RoadWorkLimit);
+        }
+        let old_roles = previous.map_or(&[][..], JunctionRules::approaches);
+        let old_mask = previous.map_or(&[][..], JunctionRules::forbidden);
+        let new_mask: Vec<_> = rules
+            .forbidden()
+            .iter()
+            .copied()
+            .filter(|turn| old_mask.binary_search(turn).is_err())
+            .collect();
+        let roles_changed = old_roles != rules.approaches();
+        rules.check_rail_sweeps(&map, junction, budget)?;
+        verify_junction_handoff(sim, &map, junction, rules, &new_mask, roles_changed, budget)?;
+    }
+    let next = junction_stamp(&map, junction, (!rules.is_empty()).then_some(rules))?;
+    let quote = RoadQuote(common::hash_u64((junction, stamp.0, next.0)));
+    Ok(PreparedJunctionEdit {
+        preview: JunctionEditPreview {
+            junction,
+            stamp,
+            quote,
+            cost: Money::ZERO,
+            changed,
+        },
+        rules: rules.clone(),
+        map_identity: map.identity(),
+        policy_revision: map.junction_policy_revision(),
+    })
+}
+
+pub(super) fn reserve_junction(
+    map: &Map,
+    junction: IntersectionID,
+    budget: &mut PrepareBudget,
+) -> Result<(), Rejection> {
+    let intersection = map.get(junction).ok_or(Rejection::MissingReference)?;
+    if intersection.roads.len() > 32 || intersection.raw_turns().len() > 4096 {
+        return Err(Rejection::RoadWorkLimit);
+    }
+    budget.spend_road_work(intersection.roads.len() * MAX_LANES + 1)?;
+    let mut points = 0usize;
+    for turn in intersection.raw_turns() {
+        points = points.saturating_add(turn.points.len());
+        if points > MAX_PROFILE_POINTS {
+            return Err(Rejection::RoadWorkLimit);
+        }
+        budget.spend_road_work(1 + turn.points.len().saturating_mul(4))?;
+    }
+    Ok(())
+}
+
+fn junction_stamp(
+    map: &Map,
+    junction: IntersectionID,
+    rules: Option<&JunctionRules>,
+) -> Result<JunctionEditStamp, Rejection> {
+    let intersection = map.get(junction).ok_or(Rejection::MissingReference)?;
+    let graph = common::hash_iter(intersection.raw_turns().map(|turn| {
+        (
+            turn.id,
+            turn.kind as u8,
+            common::hash_iter(
+                turn.points
+                    .iter()
+                    .map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())),
+            ),
+        )
+    }));
+    Ok(JunctionEditStamp(common::hash_u64((
+        junction,
+        &intersection.roads,
+        intersection.light_policy as u8,
+        graph,
+        rules,
+    ))))
+}
+
+fn verify_junction_handoff(
+    sim: &Simulation,
+    map: &Map,
+    junction: IntersectionID,
+    rules: &JunctionRules,
+    new_mask: &[TurnID],
+    roles_changed: bool,
+    budget: &mut PrepareBudget,
+) -> Result<(), Rejection> {
+    let admission = sim.read::<JunctionAdmission>();
+    budget.spend_road_work(
+        admission
+            .crossing_count()
+            .saturating_mul(new_mask.len().max(1)),
+    )?;
+    if (roles_changed && admission.crossing_junction(junction))
+        || new_mask.iter().any(|&turn| admission.crossing_turn(turn))
+    {
+        return Err(Rejection::BusyConflict);
+    }
+    let world = sim.world();
+    budget.spend_road_work(world.vehicles.len().saturating_mul(new_mask.len().max(1)))?;
+    for (_, vehicle) in world.vehicles.iter() {
+        let extent = vehicle.vehicle.kind.width() * 0.5;
+        if occupied_junction_edit(
+            map,
+            junction,
+            &vehicle.it,
+            vehicle.trans.pos,
+            extent,
+            roles_changed,
+            new_mask,
+        ) {
+            return Err(Rejection::BusyConflict);
+        }
+    }
+    if roles_changed {
+        let intersection = map.get(junction).ok_or(Rejection::MissingReference)?;
+        for &road in &intersection.roads {
+            map.mutable_object(road.into())?;
+        }
+        budget.spend_road_work(world.humans.len())?;
+        if world.humans.values().any(|human| {
+            human.location == crate::transportation::Location::Outside
+                && occupied_junction_edit(
+                    map,
+                    junction,
+                    &human.it,
+                    human.trans.pos,
+                    0.3,
+                    true,
+                    new_mask,
+                )
+        }) {
+            return Err(Rejection::BusyConflict);
+        }
+    }
+    // Preserve service reachability before admitting any edit to its graph.
+    // Replacing each removed edge with a legal directed path preserves all
+    // existing route pairs, including lines whose vehicles are currently idle.
+    for &turn in new_mask {
+        for lane in [turn.src, turn.dst] {
+            let road = map.get(lane).ok_or(Rejection::MissingReference)?.parent;
+            map.mutable_object(road.into())?;
+        }
+        if (!sim.read::<crate::map_dynamic::Transit>().lines.is_empty()
+            || !world.companies.is_empty()
+            || !world.freight_stations.is_empty())
+            && !has_directed_alternative(map, turn, rules, budget)?
+        {
+            return Err(Rejection::BusyConflict);
+        }
+    }
+    Ok(())
+}
+
+fn occupied_junction_edit(
+    map: &Map,
+    junction: IntersectionID,
+    itinerary: &crate::map_dynamic::Itinerary,
+    position: geom::Vec3,
+    extent: f32,
+    roles_changed: bool,
+    new_mask: &[TurnID],
+) -> bool {
+    let affected = |turn: TurnID| {
+        turn.parent == junction && (roles_changed || new_mask.binary_search(&turn).is_ok())
+    };
+    match itinerary.get_travers().map(|path| path.kind) {
+        Some(TraverseKind::Turn(turn)) if affected(turn) => return true,
+        Some(TraverseKind::Lane(id))
+            if roles_changed || new_mask.iter().any(|turn| turn.dst == id) =>
+        {
+            if let Some(lane) = map.get(id).filter(|lane| lane.src == junction) {
+                if lane.points.first().is_close(position, extent) {
+                    return true;
+                }
+            }
+        }
+        _ => {}
+    }
+    itinerary
+        .get_route()
+        .and_then(|route| route.reversed_route.last())
+        .is_some_and(|next| {
+            matches!(next.kind, TraverseKind::Turn(turn) if affected(turn))
+                && itinerary
+                    .local_path()
+                    .first()
+                    .is_some_and(|point| point.is_close(position, extent))
+        })
+}
+
+fn has_directed_alternative(
+    map: &Map,
+    removed: TurnID,
+    rules: &JunctionRules,
+    budget: &mut PrepareBudget,
+) -> Result<bool, Rejection> {
+    use std::collections::{BTreeSet, VecDeque};
+
+    let mut visited = BTreeSet::from([removed.src]);
+    let mut pending = VecDeque::from([removed.src]);
+    while let Some(id) = pending.pop_front() {
+        budget.spend_road_work(1)?;
+        let lane = map.get(id).ok_or(Rejection::MissingReference)?;
+        let inter = map.get(lane.dst).ok_or(Rejection::MissingReference)?;
+        for turn in inter.raw_turns() {
+            budget.spend_road_work(1)?;
+            if turn.id.src != id
+                || turn.kind != super::TurnKind::Driving
+                || if turn.id.parent == removed.parent {
+                    !rules.allows(turn.id)
+                } else {
+                    !map.allows_turn(turn.id)
+                }
+            {
+                continue;
+            }
+            if turn.id.dst == removed.dst {
+                return Ok(true);
+            }
+            if visited.insert(turn.id.dst) {
+                pending.push_back(turn.id.dst);
+            }
+        }
+    }
+    Ok(false)
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub enum RoadUpgrade {
@@ -104,7 +428,42 @@ pub(crate) struct PreparedRoadEdit {
     map_identity: u64,
     topology_revision: (u64, u64, u64, u64, usize),
     lane_edits: Vec<(LaneID, f32)>,
+    direction_edits: Option<DirectionEdits>,
     new_stamp: RoadEditStamp,
+}
+
+struct DirectionEdits {
+    remove: Vec<LaneID>,
+    lanes: Vec<(LaneDirection, LanePlacement)>,
+}
+
+enum LanePlacement {
+    Retain { id: LaneID, kind: LaneKind },
+    Add(Lane),
+}
+
+impl DirectionEdits {
+    fn commit(self, map: &mut Map, road: RoadID) {
+        for lane in self.remove {
+            map.lanes.remove(lane);
+        }
+        let lanes = self.lanes.into_iter().map(|(direction, placement)| {
+            let (id, kind) = match placement {
+                LanePlacement::Retain { id, kind } => (id, kind),
+                LanePlacement::Add(mut lane) => {
+                    let kind = lane.kind;
+                    let id = map.lanes.insert_with_key(|id| {
+                        lane.id = id;
+                        lane
+                    });
+                    (id, kind)
+                }
+            };
+            (id, kind, direction)
+        });
+        map.roads[road].install_lane_keys(lanes);
+        map.refresh_driving_road(road);
+    }
 }
 
 impl PreparedRoadEdit {
@@ -114,6 +473,7 @@ impl PreparedRoadEdit {
             map_identity,
             topology_revision,
             lane_edits,
+            direction_edits,
             new_stamp,
         } = self;
         if preview.projected_topology.is_some() {
@@ -133,13 +493,21 @@ impl PreparedRoadEdit {
         for (id, speed) in lane_edits {
             map.lanes[id].speed_limit = speed;
         }
+        let status = if direction_edits.is_some() || preview.changed_lane_costs != 0 {
+            RoadEditStatus::Applied
+        } else {
+            RoadEditStatus::NoChange
+        };
+        let new_stamp = if let Some(edits) = direction_edits {
+            edits.commit(&mut map, preview.road);
+            stamp(&map, &map.roads[preview.road], &[])
+                .expect("committed lane plan contains live lane keys")
+        } else {
+            new_stamp
+        };
         Ok(EditReceipt {
             road: preview.road,
-            status: if preview.changed_lane_costs == 0 {
-                RoadEditStatus::NoChange
-            } else {
-                RoadEditStatus::Applied
-            },
+            status,
             stamp: new_stamp,
             quote: preview.quote,
             debit: preview.cost,
@@ -197,6 +565,7 @@ pub(crate) fn prepare_upgrade(
     let [forward, backward] = road.directed_lanes();
     let same_geometry = pattern_matches(forward, &pattern.lanes_forward)
         && pattern_matches(backward, &pattern.lanes_backward);
+    let mut direction_edits = None;
     let (deck, projected_topology, material, retained_lanes, lane_edits) = if same_geometry {
         let retained = road.lanes_iter().map(|(id, _)| id).collect::<Vec<_>>();
         let edits = forward
@@ -208,6 +577,22 @@ pub(crate) fn prepare_upgrade(
             })
             .collect::<Vec<_>>();
         (road.interfaced_points().clone(), None, 0, retained, edits)
+    } else if let Some((plan, retained, edits)) =
+        prepare_same_width_directions(sim, &map, road, pattern, budget)?
+    {
+        let material = common::hash_iter(
+            pattern
+                .lanes()
+                .map(|(kind, direction, speed)| (kind as u8, direction as u8, speed.to_bits())),
+        );
+        direction_edits = Some(plan);
+        (
+            road.interfaced_points().clone(),
+            None,
+            material,
+            retained,
+            edits,
+        )
     } else {
         let projection =
             super::prepare_road_replacement(&map, id, pattern, budget.road_work_remaining())
@@ -276,8 +661,167 @@ pub(crate) fn prepare_upgrade(
         map_identity: map.identity(),
         topology_revision: map.road_preview_revision(),
         lane_edits,
+        direction_edits,
         new_stamp,
     })
+}
+
+fn prepare_same_width_directions(
+    sim: &Simulation,
+    map: &Map,
+    road: &Road,
+    pattern: &LanePattern,
+    budget: &mut PrepareBudget,
+) -> Result<Option<(DirectionEdits, Vec<LaneID>, Vec<(LaneID, f32)>)>, Rejection> {
+    // The deck, sidewalk geometry, and curb claims must already remain compatible.
+    // Parking and attached access require their own staged handoff.
+    if road.width != pattern.width()
+        || !road.connected_buildings.is_empty()
+        || road.lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
+        || pattern
+            .lanes()
+            .any(|(kind, _, _)| kind == LaneKind::Parking)
+        || !sim.read::<crate::map_dynamic::Transit>().lines.is_empty()
+        || !sim.world().companies.is_empty()
+        || !sim.world().freight_stations.is_empty()
+    {
+        return Ok(None);
+    }
+    for id in [road.src, road.dst] {
+        if map.junction_rules(id).is_some() {
+            return Ok(None);
+        }
+        map.authorize_land_effects(PreparedEffects::Junction(id))?;
+        reserve_junction(map, id, budget)?;
+        // Reserve turn-generation candidates even where no movement is made.
+        let intersection = map.get(id).ok_or(Rejection::MissingReference)?;
+        let mut lanes = MAX_LANES;
+        for &id in &intersection.roads {
+            let neighbor = map.get(id).ok_or(Rejection::MissingReference)?;
+            if neighbor.lanes_iter().any(|(_, kind)| kind.is_rail()) {
+                return Ok(None);
+            }
+            lanes += neighbor.n_lanes();
+        }
+        if lanes > 128 {
+            return Err(Rejection::RoadWorkLimit);
+        }
+        budget.spend_road_work(lanes * lanes * 16)?;
+    }
+
+    let mut retained = Vec::new();
+    let mut speed_edits = Vec::new();
+    let mut lanes = Vec::new();
+    let mut offset = 0.0;
+    for (kind, direction, speed) in pattern.lanes() {
+        let (src, dst) = match direction {
+            LaneDirection::Forward => (road.src, road.dst),
+            LaneDirection::Backward => (road.dst, road.src),
+        };
+        let existing = road.lanes_iter().find_map(|(id, _)| {
+            map.get(id).filter(|lane| {
+                lane.kind == kind
+                    && lane.src == src
+                    && lane.dst == dst
+                    && lane.dist_from_bottom == offset
+            })
+        });
+        let placement = if let Some(existing) = existing {
+            retained.push(existing.id);
+            if existing.speed_limit != speed {
+                speed_edits.push((existing.id, speed));
+            }
+            LanePlacement::Retain {
+                id: existing.id,
+                kind,
+            }
+        } else {
+            if kind != LaneKind::Driving {
+                return Ok(None);
+            }
+            budget.spend_road_work(road.interfaced_points().len() * 2)?;
+            let mut lane = Lane {
+                id: LaneID::default(),
+                parent: road.id,
+                src,
+                dst,
+                kind,
+                control: super::TrafficControl::Always,
+                speed_limit: speed,
+                points: road.interfaced_points().clone(),
+                dist_from_bottom: offset,
+            };
+            lane.gen_pos(road);
+            LanePlacement::Add(lane)
+        };
+        offset += kind.width();
+        lanes.push((direction, placement));
+    }
+    let mut remove = Vec::new();
+    for (id, kind) in road.lanes_iter().filter(|(id, _)| !retained.contains(id)) {
+        if kind != LaneKind::Driving {
+            return Ok(None);
+        }
+        remove.push(id);
+    }
+    verify_direction_handoff(sim, road, &remove, budget)?;
+    Ok(Some((
+        DirectionEdits { remove, lanes },
+        retained,
+        speed_edits,
+    )))
+}
+
+fn verify_direction_handoff(
+    sim: &Simulation,
+    road: &Road,
+    removed: &[LaneID],
+    budget: &mut PrepareBudget,
+) -> Result<(), Rejection> {
+    let transit = sim.read::<crate::map_dynamic::Transit>();
+    for stop in transit.stops.values() {
+        budget.spend_road_work(road.interfaced_points().len())?;
+        if road
+            .interfaced_points()
+            .project(stop.berth)
+            .is_close(stop.berth, road.width * 0.5 + 0.25)
+        {
+            return Err(Rejection::BusyConflict);
+        }
+    }
+    let vehicles = &sim.world().vehicles;
+    budget.spend_road_work(vehicles.len())?;
+    let affected = |kind| match kind {
+        TraverseKind::Lane(id) => removed.contains(&id),
+        TraverseKind::Turn(turn) => turn.parent == road.src || turn.parent == road.dst,
+    };
+    for (_, vehicle) in vehicles.iter() {
+        if matches!(
+            vehicle.it.target(),
+            Some(crate::map_dynamic::ItineraryTarget::DirectedLane(lane, _)) if removed.contains(&lane)
+        ) {
+            return Err(Rejection::BusyConflict);
+        }
+        if let Some(route) = vehicle.it.get_route() {
+            budget.spend_road_work(route.reversed_route.len())?;
+            if affected(route.cur.kind)
+                || route.reversed_route.iter().any(|path| affected(path.kind))
+            {
+                return Err(Rejection::BusyConflict);
+            }
+        } else if vehicle.collider.is_some() {
+            budget.spend_road_work(road.interfaced_points().len())?;
+            let (position, width) = (vehicle.trans.pos, vehicle.vehicle.kind.width());
+            if road
+                .interfaced_points()
+                .project(position)
+                .is_close(position, 0.5 * (road.width + width))
+            {
+                return Err(Rejection::BusyConflict);
+            }
+        }
+    }
+    Ok(())
 }
 
 fn authorize_road_deck(

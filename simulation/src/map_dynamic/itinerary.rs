@@ -4,6 +4,10 @@ use crate::map::{
 };
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
+use crate::transportation::junction_admission::{
+    entry_boundary, EntryOwner, HoldReason, JunctionAdmission, JunctionFrame, MovingOwner,
+};
+use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason};
 use crate::transportation::traffic_metrics::within_lane;
 use crate::transportation::{
     put_pedestrian_in_transport_grid, Location, RoadThroughput, RoadUserKind, TransportGrid,
@@ -15,9 +19,16 @@ use crate::{HumanWork, World};
 use egui_inspect::egui::Ui;
 use egui_inspect::{Inspect, InspectArgs};
 use geom::{Follower, PolyLine3, Polyline3Queue, Segment3, Vec3};
-use prototypes::{GameTime, Tick, DELTA};
+use prototypes::{game_secs_to_ticks, GameTime, Tick, DELTA};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::collections::BTreeSet;
+
+#[path = "road_edit_lifecycle.rs"]
+mod road_edit_lifecycle;
+use road_edit_lifecycle::{crosswalk_path_still_valid, pedestrian_clearance, PedestrianClearance};
+
+const EGRESS_RECHECK_TICKS: u64 = game_secs_to_ticks(30);
+const MAX_EGRESS_CHECKS_PER_TICK: usize = 8;
 
 #[derive(Inspect, Debug, Serialize, Deserialize)]
 pub struct ItineraryFollower {
@@ -74,6 +85,14 @@ pub enum ItineraryKind {
         target: ItineraryTarget,
         wait_ticks: u16,
     },
+    PedestrianEgress(PedestrianEgress),
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct PedestrianEgress {
+    crossing: Option<Traversable>,
+    retry: Option<(ItineraryTarget, u16)>,
+    check_at: Tick,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -103,6 +122,7 @@ enum SavedItineraryKind<R> {
         wait_ticks: u16,
         previous: RoadID,
     },
+    PedestrianEgress(PedestrianEgress, RoadApproach),
 }
 
 impl Serialize for Itinerary {
@@ -133,6 +153,9 @@ impl Serialize for Itinerary {
                     wait_ticks,
                 },
             },
+            ItineraryKind::PedestrianEgress(egress) => {
+                Saved::PedestrianEgress(egress, self.road_approach)
+            }
         };
         SavedItinerary {
             kind,
@@ -148,7 +171,7 @@ impl<'de> Deserialize<'de> for Itinerary {
         let SavedItinerary {
             kind,
             reversed_local_path,
-        } = SavedItinerary::deserialize(deserializer)?;
+        }: SavedItinerary<Route, Vec<Vec3>> = SavedItinerary::deserialize(deserializer)?;
         let mut road_approach = RoadApproach::Unchecked;
         let kind = match kind {
             Saved::None => ItineraryKind::None,
@@ -180,6 +203,20 @@ impl<'de> Deserialize<'de> for Itinerary {
                     target,
                     wait_ticks,
                 }
+            }
+            Saved::PedestrianEgress(egress, approach) => {
+                let valid = if let Some(crossing) = egress.crossing {
+                    matches!(crossing.kind, TraverseKind::Turn(_))
+                        && (1..=2).contains(&reversed_local_path.len())
+                        && reversed_local_path.iter().all(|point| point.is_finite())
+                } else {
+                    reversed_local_path.is_empty()
+                };
+                if !valid {
+                    return Err(serde::de::Error::custom("invalid pedestrian egress path"));
+                }
+                road_approach = approach;
+                ItineraryKind::PedestrianEgress(egress)
             }
         };
         Ok(Self {
@@ -226,15 +263,23 @@ enum RerouteTarget {
 
 #[derive(Default)]
 pub(crate) struct RerouteFailures {
-    map_revision: (u64, u64),
+    map_revision: (u64, u64, u64),
     entries: BTreeSet<RerouteKey>,
 }
 
 impl RerouteFailures {
     fn sync_map(&mut self, map: &Map) {
-        let revision = (map.identity(), map.walking_topology_generation);
+        let revision = (
+            map.identity(),
+            map.walking_topology_generation,
+            map.driving_policy_generation,
+        );
         if self.map_revision != revision {
-            self.entries.clear();
+            if (self.map_revision.0, self.map_revision.1) == (revision.0, revision.1) {
+                self.entries.retain(|key| key.kind != PathKind::Vehicle);
+            } else {
+                self.entries.clear();
+            }
             self.map_revision = revision;
         }
     }
@@ -637,13 +682,29 @@ impl Itinerary {
 
     fn update_with_route(
         &mut self,
+        position: Vec3,
+        dist_to_move: f32,
+        time: u32,
+        map: &Map,
+        route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
+        on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
+    ) -> Vec3 {
+        self.update_guarded(position, dist_to_move, time, map, route, on_road_entry, None)
+    }
+
+    fn update_guarded(
+        &mut self,
         mut position: Vec3,
         mut dist_to_move: f32,
         time: u32,
         map: &Map,
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
         mut on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
+        mut admission: Option<&mut MovementAdmission<'_>>,
     ) -> Vec3 {
+        if self.is_pedestrian_egress() {
+            return self.advance_egress(map, position, dist_to_move);
+        }
         if on_road_entry.is_some()
             && matches!(self.road_approach, RoadApproach::Unchecked)
             && !self.reversed_local_path.is_empty()
@@ -657,8 +718,39 @@ impl Itinerary {
                 *self = Self::retry_after_edit(kind, active.target, self.road_approach);
             }
         }
+        let mut on_initial_approach = true;
         while let Some(p) = self.get_point() {
             let dist = position.distance(p);
+            if let Some(admission) = &mut admission {
+                if let Some(boundary) =
+                    entry_boundary(map, self, position, dist_to_move, admission.user.half_extent)
+                {
+                    if boundary.distance <= dist_to_move + 0.01 {
+                        if let Err(reason) = admission.frame.try_enter(
+                            admission.state,
+                            admission.user.owner,
+                            &boundary,
+                            on_initial_approach,
+                        ) {
+                            if boundary.distance <= dist + 0.001 {
+                                let next = if boundary.distance > 0.0 && dist > 0.0 {
+                                    position + (p - position) * (boundary.distance / dist).min(1.0)
+                                } else {
+                                    position
+                                };
+                                self.observe_road_entry(position, next, map, &mut on_road_entry);
+                                if reason == HoldReason::InvalidTraversal {
+                                    if let ItineraryKind::Route(ref active, kind) = self.kind {
+                                        *self = Self::retry_after_edit(kind, active.target, self.road_approach);
+                                    }
+                                }
+                                admission.hold = Some(reason);
+                                return next;
+                            }
+                        }
+                    }
+                }
+            }
             if dist <= dist_to_move + 0.01 {
                 self.observe_road_entry(position, p, map, &mut on_road_entry);
                 dist_to_move -= dist;
@@ -679,7 +771,15 @@ impl Itinerary {
                 });
 
                 if k.can_pass(time, map.lanes()) {
+                    if let Some(admission) = &mut admission {
+                        if admission.observe_discharge {
+                            if let TraverseKind::Turn(turn) = k.kind {
+                                admission.discharged = Some(turn);
+                            }
+                        }
+                    }
                     self.advance(map, position, on_road_entry.is_some());
+                    on_initial_approach = false;
                     continue;
                 }
                 return p;
@@ -741,7 +841,9 @@ impl Itinerary {
     pub fn end_pos(&self) -> Option<Vec3> {
         match self.kind {
             ItineraryKind::None => None,
-            ItineraryKind::WaitUntil(_) | ItineraryKind::WaitForReroute { .. } => None,
+            ItineraryKind::WaitUntil(_)
+            | ItineraryKind::WaitForReroute { .. }
+            | ItineraryKind::PedestrianEgress(_) => None,
             ItineraryKind::Simple(e) => Some(e),
             ItineraryKind::Route(ref r, _) => Some(r.end_pos),
         }
@@ -752,6 +854,7 @@ impl Itinerary {
             ItineraryKind::Route(route, _) => Some(route.target),
             ItineraryKind::WaitForReroute { target, .. } => Some(*target),
             ItineraryKind::Simple(end) => Some(ItineraryTarget::Position(*end)),
+            ItineraryKind::PedestrianEgress(egress) => egress.retry.map(|(target, _)| target),
             _ => None,
         }
     }
@@ -770,7 +873,7 @@ impl Itinerary {
     pub fn is_terminal(&self) -> bool {
         match &self.kind {
             ItineraryKind::None | ItineraryKind::WaitUntil(_) => true,
-            ItineraryKind::WaitForReroute { .. } => false,
+            ItineraryKind::WaitForReroute { .. } | ItineraryKind::PedestrianEgress(_) => false,
             ItineraryKind::Simple(_) => self.remaining_points() <= 1,
             ItineraryKind::Route(Route { reversed_route, .. }, _) => {
                 reversed_route.is_empty() && self.remaining_points() <= 1
@@ -789,7 +892,8 @@ impl Itinerary {
         match self.kind {
             ItineraryKind::None
             | ItineraryKind::WaitUntil(_)
-            | ItineraryKind::WaitForReroute { .. } => None,
+            | ItineraryKind::WaitForReroute { .. }
+            | ItineraryKind::PedestrianEgress(_) => None,
             ItineraryKind::Simple(e) => Some(e),
             ItineraryKind::Route(Route { end_pos, .. }, _) => Some(end_pos),
         }
@@ -802,6 +906,7 @@ impl Itinerary {
             | ItineraryKind::Simple(_)
             | ItineraryKind::WaitForReroute { .. } => None,
             ItineraryKind::Route(Route { cur, .. }, _) => Some(cur),
+            ItineraryKind::PedestrianEgress(egress) => egress.crossing.as_ref(),
         }
     }
 
@@ -823,7 +928,7 @@ impl Itinerary {
     pub fn has_ended(&self, time: f64) -> bool {
         match self.kind {
             ItineraryKind::WaitUntil(x) => time > x,
-            ItineraryKind::WaitForReroute { .. } => false,
+            ItineraryKind::WaitForReroute { .. } | ItineraryKind::PedestrianEgress(_) => false,
             ItineraryKind::Route(
                 Route {
                     ref reversed_route, ..
@@ -840,6 +945,91 @@ impl Itinerary {
 
     pub fn is_simple(&self) -> bool {
         matches!(self.kind, ItineraryKind::Simple(_))
+    }
+
+    pub(crate) fn is_pedestrian_egress(&self) -> bool {
+        matches!(self.kind, ItineraryKind::PedestrianEgress(_))
+    }
+
+    fn needs_clearance_check(&self, tick: u64) -> bool {
+        self.get_point().is_none()
+            && match self.kind {
+                ItineraryKind::PedestrianEgress(egress) => tick >= egress.check_at.0,
+                _ => true,
+            }
+    }
+
+    fn prepare_egress(&mut self, map: &Map, position: Vec3, tick: u64) -> bool {
+        let retry = match self.kind {
+            ItineraryKind::WaitForReroute { kind: PathKind::Pedestrian, target, wait_ticks } => {
+                Some((target, wait_ticks))
+            }
+            ItineraryKind::PedestrianEgress(egress) => egress.retry,
+            _ => None,
+        };
+        let (crossing, reversed_local_path) = match pedestrian_clearance(map, position) {
+            PedestrianClearance::Clear => {
+                if self.is_pedestrian_egress() {
+                    self.finish_egress(retry);
+                }
+                return true;
+            }
+            PedestrianClearance::Hold => (None, vec![]),
+            PedestrianClearance::Crosswalk { traversal, projection, sidewalk } => {
+                let mut points = vec![sidewalk];
+                if position != projection {
+                    points.push(projection);
+                }
+                (Some(traversal), points)
+            }
+        };
+        self.reversed_local_path = reversed_local_path;
+        self.kind = ItineraryKind::PedestrianEgress(PedestrianEgress {
+            crossing,
+            retry,
+            check_at: Tick(tick.saturating_add(EGRESS_RECHECK_TICKS)),
+        });
+        false
+    }
+
+    fn advance_egress(&mut self, map: &Map, mut position: Vec3, mut distance: f32) -> Vec3 {
+        let ItineraryKind::PedestrianEgress(ref mut egress) = self.kind else {
+            unreachable!();
+        };
+        let Some(crossing) = egress.crossing else {
+            return position;
+        };
+        if !crosswalk_path_still_valid(map, crossing, position, &self.reversed_local_path) {
+            self.reversed_local_path.clear();
+            egress.crossing = None;
+            egress.check_at = Tick(0);
+            return position;
+        }
+        while let Some(&next) = self.reversed_local_path.last() {
+            let segment = next - position;
+            let length = segment.mag();
+            if length > distance {
+                return position + segment * (distance / length);
+            }
+            self.reversed_local_path.pop();
+            position = next;
+            distance -= length;
+        }
+        let retry = egress.retry;
+        self.finish_egress(retry);
+        position
+    }
+
+    fn finish_egress(&mut self, retry: Option<(ItineraryTarget, u16)>) {
+        if let Some((target, wait_ticks)) = retry {
+            self.kind = ItineraryKind::WaitForReroute {
+                kind: PathKind::Pedestrian,
+                target,
+                wait_ticks,
+            };
+        } else {
+            *self = Itinerary::NONE;
+        }
     }
 }
 
@@ -895,6 +1085,9 @@ impl Inspect<ItineraryKind> for ItineraryKind {
             ItineraryKind::WaitForReroute { wait_ticks, .. } => {
                 ui.label(format!("wait for reroute: {wait_ticks}"));
             }
+            ItineraryKind::PedestrianEgress(egress) => {
+                ui.label(if egress.crossing.is_some() { "Clearing crosswalk" } else { "Waiting for a safe exit" });
+            }
         };
     }
 
@@ -920,6 +1113,7 @@ impl Inspect<ItineraryKind> for ItineraryKind {
             ItineraryKind::WaitForReroute { wait_ticks, .. } => {
                 ui.label(format!("wait for reroute: {wait_ticks}"));
             }
+            ItineraryKind::PedestrianEgress(_) => Self::render(d, label, ui, args),
         };
         false
     }
@@ -969,6 +1163,15 @@ fn movement_reaches_lane(lane: &Lane, from: Vec3, to: Vec3) -> bool {
     })
 }
 
+struct MovementAdmission<'a> {
+    frame: &'a mut JunctionFrame,
+    state: &'a mut JunctionAdmission,
+    user: MovingOwner,
+    hold: Option<HoldReason>,
+    observe_discharge: bool,
+    discharged: Option<crate::map::TurnID>,
+}
+
 pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("map_dynamic::itinerary_update");
     let time = &*resources.read::<GameTime>();
@@ -978,6 +1181,30 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     let mut throughput = resources.write::<RoadThroughput>();
     let tick = elapsed_ticks(resources).0;
     throughput.begin_tick(map, tick);
+    let mut remaining_egress_checks = MAX_EGRESS_CHECKS_PER_TICK;
+    let mut checked_clear = Vec::new();
+    if map.has_junction_controller() {
+        world.humans.edit_active(HumanWork::Itinerary, |id, human| {
+            if remaining_egress_checks != 0
+                && human.location == Location::Outside
+                && human.collider.is_some()
+                && human.it.needs_clearance_check(tick)
+            {
+                remaining_egress_checks -= 1;
+                human.speed.0 = 0.0;
+                let position = human.trans.pos;
+                if human.it.prepare_egress(map, position, tick) {
+                    checked_clear.push(id);
+                }
+            }
+        });
+    }
+    // Boarding and routing have settled. Build grants from one frozen view
+    // before any user's final itinerary movement.
+    let mut junction_state = resources.write::<JunctionAdmission>();
+    let mut junction_frame = JunctionFrame::prepare(world, map, &mut junction_state, tick);
+    let mut diagnostics = resources.write::<QueueDiagnostics>();
+    let observing = diagnostics.observing();
 
     use crate::transportation::TraversalOwner;
 
@@ -988,9 +1215,9 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         .begin_traversal_update(map, tick);
 
     let mut update =
-        |it: &mut Itinerary, pos: &mut Vec3, speed: f32, kind: Option<RoadUserKind>| {
+        |it: &mut Itinerary, pos: &mut Vec3, speed: f32, kind: Option<RoadUserKind>, user: Option<MovingOwner>| {
             if it.is_inert() {
-                return;
+                return (None, None);
             }
             let record = kind.map(|kind| {
                 let throughput = &mut *throughput;
@@ -1004,31 +1231,64 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                     }
                 }
             });
-            *pos = it.update_with_route(
+            let mut admission = user.map(|user| MovementAdmission {
+                frame: &mut junction_frame,
+                state: &mut junction_state,
+                user,
+                hold: None,
+                observe_discharge: observing && matches!(user.owner, EntryOwner::Vehicle(_)),
+                discharged: None,
+            });
+            *pos = it.update_guarded(
                 *pos,
                 speed * DELTA,
                 time.seconds,
                 map,
                 |start, target, kind| failures.route(time.tick, start, target, map, kind),
                 record,
+                admission.as_mut(),
             );
+            admission.map_or((None, None), |guard| (guard.hold, guard.discharged))
         };
     world.humans.edit_active(HumanWork::Itinerary, |id, human| {
         let outside = human.location == Location::Outside;
+        let mut safe_to_remove = checked_clear.contains(&id);
+        if outside && human.collider.is_some() && human.it.needs_clearance_check(tick) {
+            human.speed.0 = 0.0;
+            if !safe_to_remove {
+                if remaining_egress_checks == 0 {
+                    return;
+                }
+                remaining_egress_checks -= 1;
+                let position = human.trans.pos;
+                safe_to_remove = human.it.prepare_egress(map, position, tick);
+            }
+        }
+        let clearing = human.it.is_pedestrian_egress();
         let kind = outside.then_some(RoadUserKind::Pedestrian);
         let speed = human.speed.0;
         let (itinerary, pos) = human.itinerary_mut();
-        update(itinerary, pos, speed, kind);
+        let (held, _) = update(
+            itinerary,
+            pos,
+            speed,
+            kind,
+            outside.then_some(MovingOwner { owner: EntryOwner::Human(id), half_extent: 0.3 }),
+        );
         if !outside {
             return;
         }
         if let Some(index) = &mut observed {
             index.record(map, TraversalOwner::Human(id), itinerary);
         }
-        // A cancelled walk or a pending reroute can leave a pedestrian in a crosswalk.
-        // Release its obstruction until the itinerary has a point to walk toward again.
+        if held.is_some() {
+            human.speed.0 = 0.0;
+        }
+        // Keep the collider through a lost route until the person reaches a
+        // sidewalk or the local geometry confirms they are clear of traffic.
+        safe_to_remove |= clearing && !human.it.is_pedestrian_egress();
         match (human.it.get_point(), human.collider) {
-            (None, Some(collider)) => {
+            (None, Some(collider)) if safe_to_remove => {
                 resources.write::<TransportGrid>().remove_maintain(collider.0);
                 human.collider = None;
                 human.speed.0 = 0.0;
@@ -1044,7 +1304,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         }
     });
     for (id, train) in &mut world.trains {
-        update(&mut train.it, &mut train.trans.pos, train.speed.0, None);
+        update(&mut train.it, &mut train.trans.pos, train.speed.0, None, None);
         if let Some(index) = &mut observed {
             index.record(map, TraversalOwner::Train(id), &train.it);
         }
@@ -1055,12 +1315,32 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             VehicleKind::Truck => RoadUserKind::Truck,
             VehicleKind::Bus => RoadUserKind::Bus,
         };
-        update(
+        let before = observing.then(|| vehicle.it.get_travers().copied()).flatten();
+        let (held, discharged) = update(
             &mut vehicle.it,
             &mut vehicle.trans.pos,
             vehicle.speed.0,
             Some(kind),
+            Some(MovingOwner {
+                owner: EntryOwner::Vehicle(id),
+                half_extent: vehicle.vehicle.kind.width() * 0.5,
+            }),
         );
+        if let Some(reason) = held {
+            vehicle.speed.0 = 0.0;
+            if observing {
+                let reason = match reason {
+                    HoldReason::Conflict => QueueHoldReason::Conflict(None),
+                    HoldReason::ExitFull => QueueHoldReason::ExitFull,
+                    HoldReason::StopDwell => QueueHoldReason::StopDwell,
+                    HoldReason::InvalidTraversal => QueueHoldReason::InvalidTraversal,
+                };
+                diagnostics.record_hold(id, vehicle.it.get_travers().copied().or(before), tick, reason);
+            }
+        }
+        if let Some(turn) = discharged {
+            diagnostics.record_discharge(turn, tick);
+        }
         if let Some(index) = &mut observed {
             index.record(map, TraversalOwner::Vehicle(id), &vehicle.it);
         }
@@ -1085,6 +1365,10 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
 }
 
 #[cfg(test)]
+#[path = "../tests/p7_junction.rs"]
+mod p7_junction;
+
+#[cfg(test)]
 thread_local! {
     static ROUTE_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -1106,8 +1390,10 @@ mod tests {
     }
 
     #[test]
-    fn pedfix_cancelled_walk_releases_collider_and_next_walk_restores_it() {
+    fn p7_life_alpska_cancelled_walk_physically_clears_crosswalk() {
         use crate::map_dynamic::Destination;
+        use crate::transportation::spawn_driving_vehicle;
+        use geom::Transform;
 
         let mut ctx = TestCtx::new();
         let junction = vec3(270.0, 180.0, 0.0);
@@ -1115,17 +1401,45 @@ mod tests {
         ctx.build_roads(&[junction, vec3(270.0, 350.0, 0.0)]);
         let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
         let id = spawn_human(&mut ctx.g, house).unwrap();
-        let (position, destination) = {
+        let (position, destination, car_start, car_end, car_route) = {
             let map = ctx.g.map();
-            let crosswalk = map
+            let junction = map
                 .intersections()
                 .values()
-                .flat_map(|intersection| intersection.turns())
+                .find(|intersection| intersection.pos.xy() == junction.xy())
+                .unwrap();
+            let crosswalk = junction
+                .turns()
                 .find(|turn| turn.kind == TurnKind::Crosswalk)
                 .unwrap();
-            (crosswalk.points.middle(), crosswalk.points.last())
+            let crossing_road = map.get(crosswalk.id.src).unwrap().parent;
+            let turn = junction
+                .turns()
+                .filter(|turn| turn.kind == TurnKind::Driving)
+                .find(|turn| map.get(turn.id.src).unwrap().parent == crossing_road)
+                .unwrap();
+            let lane = map.get(turn.id.src).unwrap();
+            let approach = lane.points.length() - 8.0;
+            let (pos, dir) = lane.points.point_dir_along(approach);
+            let route = Itinerary::route_between_lanes(
+                Tick(ctx.g.get_tick()),
+                &map,
+                (turn.id.src, approach),
+                (turn.id.dst, 30.0),
+            )
+            .unwrap();
+            (
+                crosswalk.points.project(lane.points.last()),
+                crosswalk.points.last(),
+                Transform::new_dir(pos, dir),
+                route.end_pos().unwrap(),
+                route,
+            )
         };
+        let original_car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, car_start).unwrap();
+        ctx.g.world.vehicles[original_car].it = car_route;
         let collider = put_pedestrian_in_transport_grid(&mut ctx.g.write::<TransportGrid>(), position);
+        ctx.g.write::<TransportGrid>().get_mut(collider.0).unwrap().1.height = position.z;
         let tick = ctx.g.get_tick();
         let (world, resources) = ctx.g.world_res();
         world.edit_human(id, |human| {
@@ -1142,10 +1456,31 @@ mod tests {
         });
 
         update_at(&mut ctx.g, tick + 1);
-        assert!(ctx.g.world.humans[id].collider.is_none());
-        assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_none());
+        assert!(ctx.g.world.humans[id].collider.is_some());
+        assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_some());
         assert_eq!(ctx.g.world.humans[id].trans.pos, position);
         assert_eq!(ctx.g.world.humans[id].speed.0, 0.0);
+
+        let mut schedule = Simulation::schedule();
+        schedule.retain_systems(|name| {
+            matches!(
+                name,
+                "pedestrian_decision_system"
+                    | "transport_grid_synchronize"
+                    | "vehicle_decision_system"
+                    | "itinerary_update"
+            )
+        });
+        for _ in 0..1600 {
+            ctx.g.tick(&mut schedule, &[]);
+        }
+        let human = &ctx.g.world.humans[id];
+        assert!(human.trans.pos.distance(position) > 1.0);
+        assert!(human.collider.is_none());
+        assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_none());
+        let car = &ctx.g.world.vehicles[original_car];
+        assert!(car.it.has_ended(0.0));
+        assert!(car.trans.pos.distance(car_end) < 0.1);
 
         ctx.g.world.edit_human(id, |human| {
             human.router.go_to(Destination::Outside(destination));
@@ -1153,7 +1488,7 @@ mod tests {
         let (world, resources) = ctx.g.world_res();
         crate::map_dynamic::routing_changed_system(world, resources);
         crate::map_dynamic::routing_update_system(world, resources);
-        update_at(&mut ctx.g, tick + 2);
+        update_at(&mut ctx.g, tick + 1602);
         let human = &ctx.g.world.humans[id];
         assert!(human.it.get_point().is_some());
         assert!(ctx
@@ -1161,6 +1496,112 @@ mod tests {
             .read::<TransportGrid>()
             .get(human.collider.unwrap().0)
             .is_some());
+    }
+
+    #[test]
+    fn p7_life_hraska_waiting_walk_keeps_its_original_target() {
+        let mut ctx = TestCtx::new();
+        let junction = vec3(270.0, 180.0, 0.0);
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), junction, vec3(470.0, 180.0, 0.0)]);
+        ctx.build_roads(&[junction, vec3(380.0, 350.0, 0.0)]);
+        let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
+        let id = spawn_human(&mut ctx.g, house).unwrap();
+        let (position, destination) = {
+            let map = ctx.g.map();
+            let crosswalk = map
+                .intersections()
+                .values()
+                .flat_map(|intersection| intersection.turns())
+                .filter(|turn| turn.kind == TurnKind::Crosswalk)
+                .max_by_key(|turn| turn.id)
+                .unwrap();
+            (
+                crosswalk.points.middle(),
+                map.get(crosswalk.id.dst).unwrap().points.point_along(30.0),
+            )
+        };
+        let collider = put_pedestrian_in_transport_grid(&mut ctx.g.write::<TransportGrid>(), position);
+        ctx.g.world.edit_human(id, |human| {
+            human.location = Location::Outside;
+            human.trans.pos = position;
+            human.collider = Some(collider);
+            human.speed.0 = 1.1;
+            human.it = Itinerary {
+                kind: ItineraryKind::WaitForReroute {
+                    kind: PathKind::Pedestrian,
+                    target: ItineraryTarget::Position(destination),
+                    wait_ticks: 500,
+                },
+                ..Itinerary::default()
+            };
+        });
+
+        let tick = ctx.g.get_tick();
+        update_at(&mut ctx.g, tick + 1);
+        assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_some());
+        assert!(ctx.g.world.humans[id].it.get_point().is_some());
+        assert_eq!(ctx.g.world.humans[id].trans.pos, position);
+        assert_eq!(ctx.g.world.humans[id].speed.0, 0.0);
+
+        let mut schedule = Simulation::schedule();
+        schedule.retain_systems(|name| {
+            matches!(name, "pedestrian_decision_system" | "itinerary_update")
+        });
+        for _ in 0..60 {
+            ctx.g.tick(&mut schedule, &[]);
+        }
+        assert!(ctx.g.world.humans[id].it.is_pedestrian_egress());
+        let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+        for _ in 0..3440 {
+            ctx.g.tick(&mut schedule, &[]);
+        }
+        let mut resumed_schedule = schedule;
+        for _ in 0..3440 {
+            resumed.tick(&mut resumed_schedule, &[]);
+        }
+        let human = &ctx.g.world.humans[id];
+        assert!(human.trans.pos.distance(destination) < 0.1);
+        assert!(human.it.has_ended(0.0));
+        assert_eq!(resumed.world.humans[id].trans.pos, human.trans.pos);
+        assert_eq!(resumed.world.humans[id].it.target(), human.it.target());
+    }
+
+    #[test]
+    fn p7_life_unresolved_midblock_keeps_the_pedestrian_protected() {
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), vec3(470.0, 180.0, 0.0)]);
+        let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
+        let id = spawn_human(&mut ctx.g, house).unwrap();
+        let position = ctx
+            .g
+            .map()
+            .lanes()
+            .values()
+            .find(|lane| lane.kind == LaneKind::Driving)
+            .unwrap()
+            .points
+            .middle();
+        let collider = put_pedestrian_in_transport_grid(&mut ctx.g.write::<TransportGrid>(), position);
+        ctx.g.world.edit_human(id, |human| {
+            human.location = Location::Outside;
+            human.trans.pos = position;
+            human.collider = Some(collider);
+            human.it = Itinerary::NONE;
+        });
+
+        let mut schedule = Simulation::schedule();
+        schedule.retain_systems(|name| {
+            matches!(name, "pedestrian_decision_system" | "itinerary_update")
+        });
+        for _ in 0..(60 * EGRESS_RECHECK_TICKS) {
+            ctx.g.tick(&mut schedule, &[]);
+        }
+        let human = &ctx.g.world.humans[id];
+        assert!(human.it.is_pedestrian_egress());
+        assert!(human.it.get_point().is_none());
+        assert_eq!(human.trans.pos, position);
+        assert_eq!(human.speed.0, 0.0);
+        assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_some());
     }
 
     #[test]

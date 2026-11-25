@@ -550,6 +550,9 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
     };
 
     world.humans.edit_each_split(|id, h| {
+        if h.it.is_pedestrian_egress() {
+            return;
+        }
         if h.goods.has_pickup() {
             BuyGoods::update_pickup(h, time, map, vehicles, resources);
         }

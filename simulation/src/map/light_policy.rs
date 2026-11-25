@@ -13,6 +13,15 @@ pub enum LightPolicy {
 }
 
 impl LightPolicy {
+    pub(crate) fn resolve(self, incoming_groups: usize, left_turns: bool) -> Self {
+        match self {
+            Self::Auto if incoming_groups <= 2 => Self::NoLights,
+            Self::Auto if incoming_groups == 3 || !left_turns => Self::StopSigns,
+            Self::Auto => Self::Lights,
+            explicit => explicit,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             Self::NoLights => "No lights",
@@ -47,7 +56,7 @@ impl LightPolicy {
             }
         }
 
-        match self {
+        match self.resolve(in_road_lanes.len(), inter.turn_policy.left_turns) {
             LightPolicy::NoLights => {}
             LightPolicy::StopSigns => {
                 Self::stop_signs(in_road_lanes, lanes);
@@ -55,21 +64,7 @@ impl LightPolicy {
             LightPolicy::Lights => {
                 Self::lights(in_road_lanes, inter, lanes);
             }
-            LightPolicy::Auto => {
-                if in_road_lanes.len() <= 2 {
-                    return;
-                }
-                if in_road_lanes.len() == 3 {
-                    Self::stop_signs(in_road_lanes, lanes);
-                    return;
-                }
-
-                if inter.turn_policy.left_turns {
-                    Self::lights(in_road_lanes, inter, lanes);
-                } else {
-                    Self::stop_signs(in_road_lanes, lanes);
-                }
-            }
+            LightPolicy::Auto => unreachable!("resolved junction light policy"),
         }
     }
 

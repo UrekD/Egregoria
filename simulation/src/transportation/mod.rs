@@ -18,6 +18,8 @@ use crate::{Simulation, World};
 use common::FastMap;
 
 pub mod pedestrian;
+pub(crate) mod junction_admission;
+pub mod queue_diagnostics;
 pub mod road;
 pub mod road_throughput;
 pub use road_throughput::{RoadThroughput, RoadUserKind};
@@ -89,6 +91,8 @@ pub struct TransportGrid {
     vehicles: ActiveColliders<VehicleID>,
     #[serde(skip)]
     traversal_users: Option<TraversalUsers>,
+    #[serde(skip)]
+    explicit_traversal_watch: bool,
     #[serde(skip, default = "positions_may_be_pending")]
     pending_positions: bool,
 }
@@ -147,6 +151,7 @@ impl Clone for TransportGrid {
                 .traversal_users
                 .as_ref()
                 .map(|_| TraversalUsers::default()),
+            explicit_traversal_watch: self.explicit_traversal_watch,
             pending_positions: self.pending_positions,
         }
     }
@@ -159,6 +164,7 @@ impl TransportGrid {
             humans: ActiveColliders::default(),
             vehicles: ActiveColliders::default(),
             traversal_users: None,
+            explicit_traversal_watch: false,
             pending_positions: false,
         }
     }
@@ -268,8 +274,18 @@ impl TransportGrid {
     /// Enables current directed-use observations at the next itinerary update.
     /// This derived index is cold after cloning, loading or a topology change.
     pub fn watch_traversal_users(&mut self) {
+        self.explicit_traversal_watch = true;
         self.traversal_users
             .get_or_insert_with(TraversalUsers::default);
+    }
+
+    pub(crate) fn watch_queue_traversals(&mut self, enabled: bool) {
+        if enabled {
+            self.traversal_users
+                .get_or_insert_with(TraversalUsers::default);
+        } else if !self.explicit_traversal_watch {
+            self.traversal_users = None;
+        }
     }
 
     pub fn traversal_users(
@@ -382,6 +398,14 @@ pub struct TraversalUserSnapshot<'a> {
 }
 
 impl TraversalUserSnapshot<'_> {
+    pub fn len(&self) -> usize {
+        self.users.map_or(0, BTreeSet::len)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn users(&self) -> impl Iterator<Item = TraversalOwner> + '_ {
         self.users.into_iter().flatten().copied()
     }

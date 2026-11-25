@@ -6,11 +6,12 @@ use crate::map::reachability::DrivingReachability;
 use crate::map::{
     Building, BuildingID, BuildingKind, ConnectionError, ConnectionOutcome, CrossingEndpoint,
     CrossingWork, Environment, GrowableBusinessState, GrowableLotError, GrowableSiteState,
-    Intersection, IntersectionID, Lane, LaneID, LaneKind, LanePattern, Lot, LotID, LotKind,
-    LotLayout, MapSubscriber, MapSubscribers, ParkingSpotID, ParkingSpots, PreparedBuilding,
-    PreparedGrowableAppearance, PreparedTopologyEdit, ProjectFilter, ProjectKind, Road, RoadID,
-    RoadSegmentKind, SpatialMap, SpatialMapObject, TerraformKind, TerrainChunkID, UpdateType,
-    WaterEditError, Zone, MAX_DECK_TILE_TESTS, ROAD_Z_OFFSET,
+    Intersection, IntersectionID, JunctionRules, Lane, LaneID, LaneKind, LanePattern,
+    LaneScoringPilot, Lot, LotID, LotKind, LotLayout, MapSubscriber, MapSubscribers, ParkingSpotID,
+    ParkingSpots, PreparedBuilding, PreparedEffects, PreparedGrowableAppearance,
+    PreparedTopologyEdit, ProjectFilter, ProjectKind, Road, RoadID, RoadSegmentKind, SpatialMap,
+    SpatialMapObject, TerraformKind, TerrainChunkID, UpdateType, WaterEditError, Zone,
+    MAX_DECK_TILE_TESTS, ROAD_Z_OFFSET,
 };
 use geom::OBB;
 use geom::{PolyLine3, Vec2, Vec3, AABB};
@@ -31,6 +32,18 @@ pub type Lanes = HopSlotMap<LaneID, Lane>;
 pub type Intersections = HopSlotMap<IntersectionID, Intersection>;
 pub type Buildings = HopSlotMap<BuildingID, Building>;
 pub type Lots = HopSlotMap<LotID, Lot>;
+
+pub(crate) const MAX_CONFIGURED_JUNCTIONS: usize = 1024;
+
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct SavedJunctionPolicies {
+    pub(crate) revision: u64,
+    pub(crate) driving_revision: u64,
+    #[serde(
+        deserialize_with = "crate::world_command::bounded_command_vec::<_, _, MAX_CONFIGURED_JUNCTIONS>"
+    )]
+    pub(crate) rules: Vec<(IntersectionID, JunctionRules)>,
+}
 
 #[derive(Copy, Clone, Debug, Serialize, Deserialize)]
 pub struct MapProject {
@@ -98,6 +111,10 @@ pub struct Map {
     // Derived identity for caches whose lifetime can exceed this map's.
     pub(super) identity: u64,
     pub(crate) walking_topology_generation: u64,
+    pub(crate) driving_policy_generation: u64,
+    pub(super) junction_policy_revision: u64,
+    pub(super) junction_rules: BTreeMap<IntersectionID, JunctionRules>,
+    pub(super) lane_scoring: Option<LaneScoringPilot>,
     // Derived from lanes and turns. Map deserialization starts with an empty cache.
     pub(super) driving_reachability: OnceLock<DrivingReachability>,
     // Imported networks reserve usable lane length when rebuilding junction geometry.
@@ -157,6 +174,10 @@ impl Clone for Map {
             external_train_stations: self.external_train_stations.clone(),
             lot_origins: self.lot_origins.clone(),
             walking_topology_generation: self.walking_topology_generation,
+            driving_policy_generation: self.driving_policy_generation,
+            junction_policy_revision: self.junction_policy_revision,
+            junction_rules: self.junction_rules.clone(),
+            lane_scoring: self.lane_scoring.clone(),
             import_lane_reserve: self.import_lane_reserve,
             lot_layout: self.lot_layout,
             no_frontage: self.no_frontage.clone(),
@@ -192,6 +213,10 @@ impl Map {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("map identities exhausted"),
             walking_topology_generation: 0,
+            driving_policy_generation: 0,
+            junction_policy_revision: 0,
+            junction_rules: BTreeMap::new(),
+            lane_scoring: None,
             driving_reachability: OnceLock::new(),
             import_lane_reserve: false,
             lot_layout: LotLayout::default(),
@@ -395,6 +420,154 @@ impl Map {
         self.land_ownership.is_tiled() || self.environment.has_water_configuration()
     }
 
+    pub fn junction_rules(&self, id: IntersectionID) -> Option<&JunctionRules> {
+        self.junction_rules.get(&id)
+    }
+
+    pub fn junction_policy_revision(&self) -> u64 {
+        self.junction_policy_revision
+    }
+
+    pub fn allows_turn(&self, turn: crate::map::TurnID) -> bool {
+        self.get(turn.parent)
+            .is_some_and(|junction| junction.find_turn(turn).is_some())
+    }
+
+    pub(crate) fn has_junction_rules(&self) -> bool {
+        !self.junction_rules.is_empty()
+    }
+
+    pub(crate) fn has_junction_controller(&self) -> bool {
+        self.junction_rules
+            .values()
+            .any(|rules| !rules.approaches().is_empty())
+    }
+
+    pub(crate) fn junction_rule_count(&self) -> usize {
+        self.junction_rules.len()
+    }
+
+    fn check_junction_topology_edit(&self, id: IntersectionID) -> Result<(), ConnectionError> {
+        if !self.has_junction_rules() {
+            return Ok(());
+        }
+        let junction = self.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
+        if junction.roads.len() > 128 {
+            return Err(ConnectionError::WorkLimit);
+        }
+        if self.junction_rules(id).is_some()
+            || junction.roads.iter().any(|&road| {
+                self.get(road)
+                    .and_then(|road| road.other_end(id))
+                    .is_some_and(|end| self.junction_rules(end).is_some())
+            })
+        {
+            return Err(ConnectionError::Stale);
+        }
+        Ok(())
+    }
+
+    fn check_connection_junctions(
+        &self,
+        from: ConnectionEndpoint,
+        to: ConnectionEndpoint,
+    ) -> Result<(), ConnectionError> {
+        if !self.has_junction_rules() {
+            return Ok(());
+        }
+        for endpoint in [from, to] {
+            match endpoint.kind {
+                ProjectKind::Intersection(id) => self.check_junction_topology_edit(id)?,
+                ProjectKind::Road(id) => {
+                    let road = self.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
+                    self.check_junction_topology_edit(road.src)?;
+                    self.check_junction_topology_edit(road.dst)?;
+                }
+                _ => (),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn install_junction_rules(&mut self, id: IntersectionID, rules: JunctionRules) {
+        let previous = self.junction_rules.get(&id);
+        let old_mask = previous.map_or(&[][..], JunctionRules::forbidden);
+        if old_mask != rules.forbidden() {
+            self.driving_graph_changed();
+            self.intersections[id].apply_turn_mask(Some(&rules));
+        }
+        if rules.is_empty() {
+            self.junction_rules.remove(&id);
+        } else {
+            self.junction_rules.insert(id, rules);
+        }
+        self.junction_policy_revision += 1;
+    }
+
+    pub(crate) fn save_junction_policies(&self) -> SavedJunctionPolicies {
+        SavedJunctionPolicies {
+            revision: self.junction_policy_revision,
+            driving_revision: self.driving_policy_generation,
+            rules: self
+                .junction_rules
+                .iter()
+                .map(|(&id, rules)| (id, rules.clone()))
+                .collect(),
+        }
+    }
+
+    pub(crate) fn load_junction_policies(
+        &mut self,
+        state: SavedJunctionPolicies,
+    ) -> std::io::Result<()> {
+        let invalid =
+            || std::io::Error::new(std::io::ErrorKind::InvalidData, "Invalid junction policies");
+        if state.revision == u64::MAX
+            || state.driving_revision == u64::MAX
+            || state.rules.windows(2).any(|pair| pair[0].0 >= pair[1].0)
+        {
+            return Err(invalid());
+        }
+        for (id, rules) in &state.rules {
+            if rules.is_empty() {
+                return Err(invalid());
+            }
+            rules.validate(self, *id).map_err(|_| invalid())?;
+            let mut geometry = crate::world_command::PrepareBudget::for_preview(280_000);
+            super::road_edit::reserve_junction(self, *id, &mut geometry)
+                .map_err(|_| invalid())?;
+            let mut budget = crate::world_command::PrepareBudget::for_preview(16_384);
+            rules
+                .check_rail_sweeps(self, *id, &mut budget)
+                .map_err(|_| invalid())?;
+        }
+        for (id, rules) in state.rules {
+            self.intersections[id].apply_turn_mask(Some(&rules));
+            self.junction_rules.insert(id, rules);
+        }
+        self.junction_policy_revision = state.revision;
+        self.driving_policy_generation = state.driving_revision;
+        Ok(())
+    }
+
+    pub(crate) fn validate_junction_policy_land(&self) -> Result<(), super::LandDenial> {
+        for (&id, rules) in &self.junction_rules {
+            self.authorize_land_effects(PreparedEffects::Junction(id))?;
+            if !rules.approaches().is_empty() {
+                for &road in &self.intersections[id].roads {
+                    self.mutable_object(road.into())?;
+                }
+            }
+            for turn in rules.forbidden() {
+                for id in [turn.src, turn.dst] {
+                    let lane = self.get(id).ok_or(super::LandDenial::RequiresMutableAccess)?;
+                    self.mutable_object(lane.parent.into())?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn environment(&self) -> &Environment {
         &self.environment
     }
@@ -453,6 +626,7 @@ impl Map {
         id: IntersectionID,
         f: impl FnOnce(&mut Intersection),
     ) -> Result<(), ConnectionError> {
+        self.check_junction_topology_edit(id)?;
         let inter = self
             .intersections
             .get(id)
@@ -484,6 +658,7 @@ impl Map {
         turn: super::TurnPolicy,
         light: super::LightPolicy,
     ) -> Result<(), ConnectionError> {
+        self.check_junction_topology_edit(id)?;
         let mut next = self
             .get(id)
             .ok_or(ConnectionError::InvalidEndpoint)?
@@ -506,6 +681,14 @@ impl Map {
     ) -> Result<(), ConnectionError> {
         if !self.intersections.contains_key(src) {
             return Err(ConnectionError::InvalidEndpoint);
+        }
+        self.check_junction_topology_edit(src)?;
+        if self.has_junction_rules() {
+            for &road in &self.intersections[src].roads {
+                if let Some(dst) = self.get(road).and_then(|road| road.other_end(src)) {
+                    self.check_junction_topology_edit(dst)?;
+                }
+            }
         }
         if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
             super::prepare_junction_removal(self, src, &mut WaterTopologyWork::new().geometry())?;
@@ -810,6 +993,7 @@ impl Map {
                 .zip(self.resolve_connection_endpoint(to))
         };
         let (from, to) = endpoints.ok_or(ConnectionError::InvalidEndpoint)?;
+        self.check_connection_junctions(from, to)?;
         if !Self::can_connect(from, to, elbow, pattern) {
             return Err(ConnectionError::InvalidEndpoint);
         }
@@ -844,6 +1028,7 @@ impl Map {
         stage_merges: bool,
         work: &mut WaterTopologyWork,
     ) -> Result<(usize, Option<PreparedTopologyEdit>), ConnectionError> {
+        self.check_connection_junctions(from, to)?;
         let map_bounds = self.environment.bounds();
         let a = from.pos.xy();
         let b = to.pos.xy();
@@ -1026,6 +1211,7 @@ impl Map {
         pattern: &LanePattern,
         prepared: Option<PreparedTopologyEdit>,
     ) -> Result<ConnectedRoad, ConnectionError> {
+        self.check_connection_junctions(from, to)?;
         if prepared.is_none() && self.land_ownership.is_tiled() {
             return Err(ConnectionError::Stale);
         }
@@ -1685,9 +1871,9 @@ impl Map {
     }
 
     pub(crate) fn prepare_remove_road(&self, road_id: RoadID) -> Result<(), ConnectionError> {
-        if !self.roads.contains_key(road_id) {
-            return Err(ConnectionError::InvalidEndpoint);
-        }
+        let road = self.get(road_id).ok_or(ConnectionError::InvalidEndpoint)?;
+        self.check_junction_topology_edit(road.src)?;
+        self.check_junction_topology_edit(road.dst)?;
         if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
             super::prepare_road_removal(self, road_id, &mut WaterTopologyWork::new().geometry())?;
         }
@@ -1892,6 +2078,26 @@ impl Map {
     fn lane_topology_changed(&mut self) {
         self.walking_topology_generation += 1;
         self.driving_reachability.take();
+        self.lane_scoring = None;
+    }
+
+    pub(crate) fn driving_graph_changed(&mut self) {
+        self.driving_policy_generation += 1;
+        self.driving_reachability.take();
+    }
+
+    pub(crate) fn refresh_driving_road(&mut self, id: RoadID) {
+        self.driving_graph_changed();
+        self.lane_scoring = None;
+        let road = &self.roads[id];
+        self.subscribers.dispatch(UpdateType::Road, road);
+        for endpoint in [road.src, road.dst] {
+            let junction = &mut self.intersections[endpoint];
+            junction.update_traffic_control(&mut self.lanes, &self.roads);
+            junction.update_turns(&self.lanes, &self.roads);
+            junction.apply_turn_mask(self.junction_rules.get(&endpoint));
+            self.subscribers.dispatch(UpdateType::Road, junction);
+        }
     }
 
     pub(crate) fn add_intersection(&mut self, pos: Vec3) -> IntersectionID {
@@ -2264,6 +2470,9 @@ impl Map {
             .roads
             .get(road2)
             .ok_or(ConnectionError::InvalidEndpoint)?;
+        for id in [r1.src, r1.dst, r2.src, r2.dst] {
+            self.check_junction_topology_edit(id)?;
+        }
         let frontage_blocked = self.no_frontage.contains(&road1);
         if frontage_blocked != self.no_frontage.contains(&road2) {
             return Ok(None);

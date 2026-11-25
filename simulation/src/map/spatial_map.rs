@@ -528,7 +528,7 @@ impl SpatialMap {
         Ok(())
     }
 
-    pub(super) fn reserve_construction_query(
+    pub(crate) fn reserve_construction_query(
         &self,
         bounds: AABB,
         work: &mut usize,

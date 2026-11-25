@@ -27,6 +27,9 @@ pub struct Intersection {
 
     turns: BTreeSet<Turn>,
 
+    #[serde(skip)]
+    legal_turns: Option<BTreeSet<Turn>>,
+
     // sorted by angle
     pub roads: Vec<RoadID>,
 
@@ -41,6 +44,7 @@ impl Intersection {
             pos,
             radius: 0.0,
             turns: Default::default(),
+            legal_turns: None,
             roads: Default::default(),
             turn_policy: Default::default(),
             light_policy: Default::default(),
@@ -89,6 +93,7 @@ impl Intersection {
     }
 
     pub fn update_turns(&mut self, lanes: &Lanes, roads: &Roads) {
+        self.legal_turns = None;
         self.turns = self
             .turn_policy
             .generate_turns(self, lanes, roads)
@@ -283,14 +288,37 @@ impl Intersection {
     }
 
     pub fn find_turn(&self, needle: TurnID) -> Option<&Turn> {
+        self.legal_turns
+            .as_ref()
+            .unwrap_or(&self.turns)
+            .get(&needle)
+    }
+
+    pub(crate) fn raw_turn(&self, needle: TurnID) -> Option<&Turn> {
         self.turns.get(&needle)
+    }
+
+    pub(crate) fn raw_turns(&self) -> impl ExactSizeIterator<Item = &Turn> {
+        self.turns.iter()
+    }
+
+    pub(crate) fn apply_turn_mask(&mut self, rules: Option<&crate::map::JunctionRules>) {
+        self.legal_turns = rules
+            .filter(|rules| !rules.forbidden().is_empty())
+            .map(|rules| {
+                self.turns
+                    .iter()
+                    .filter(|turn| rules.allows(turn.id))
+                    .cloned()
+                    .collect()
+            });
     }
 
     pub fn turns_from(
         &self,
         lane: LaneID,
     ) -> impl Iterator<Item = (TurnID, TraverseDirection)> + '_ {
-        self.turns.iter().filter_map(move |Turn { id, .. }| {
+        self.turns().filter_map(move |Turn { id, .. }| {
             if id.src == lane {
                 Some((*id, TraverseDirection::Forward))
             } else if id.bidirectional && id.dst == lane {
@@ -302,7 +330,7 @@ impl Intersection {
     }
 
     pub fn turns_to(&self, lane: LaneID) -> impl Iterator<Item = (TurnID, TraverseDirection)> + '_ {
-        self.turns.iter().filter_map(move |Turn { id, .. }| {
+        self.turns().filter_map(move |Turn { id, .. }| {
             if id.dst == lane {
                 Some((*id, TraverseDirection::Forward))
             } else if id.bidirectional && id.src == lane {
@@ -314,7 +342,7 @@ impl Intersection {
     }
 
     pub fn turns(&self) -> impl ExactSizeIterator<Item = &Turn> {
-        self.turns.iter()
+        self.legal_turns.as_ref().unwrap_or(&self.turns).iter()
     }
 }
 

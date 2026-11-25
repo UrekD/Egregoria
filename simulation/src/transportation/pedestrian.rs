@@ -123,9 +123,10 @@ const PEDESTRIAN_ACC: f32 = 1.5;
 
 pub fn physics(kin: &mut Speed, trans: &mut Transform, desired_velocity: f32, desired_dir: Vec3) {
     let diff = desired_velocity - kin.0;
-    let mag = diff.min(DELTA * PEDESTRIAN_ACC);
-    if mag > 0.0 {
-        kin.0 += mag;
+    if diff < 0.0 {
+        kin.0 = desired_velocity;
+    } else {
+        kin.0 += diff.min(DELTA * PEDESTRIAN_ACC);
     }
     const ANG_VEL: f32 = 1.0;
     trans.dir = angle_lerpxy(trans.dir, desired_dir, ANG_VEL * DELTA);

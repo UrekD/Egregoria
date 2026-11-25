@@ -33,6 +33,36 @@ use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::{AnyEntity, Simulation, SimulationOptions, VehicleID};
 
 #[test]
+fn p7_recorded_p6_snapshot_warns_when_installed() {
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let root = std::env::temp_dir().join(format!("egregoria-p7-recorded-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let slot = SlotId::new("old-recording").unwrap();
+    let paths = common::saveload::slot_paths(&root, &slot).unwrap();
+    std::fs::write(
+        paths.zip,
+        include_bytes!("../../../simulation/src/tests/fixtures/p6-recorded-replay.zip"),
+    )
+    .unwrap();
+    let loaded = Simulation::load_from_slot(&root, &slot);
+    std::fs::remove_dir_all(root).unwrap();
+    let mut uiw = UiWorld::with_defaults();
+    let camera = Camera::new(vec3(4000.0, 4000.0, 25.0), 1280.0, 720.0);
+    uiw.insert(camera);
+    uiw.insert(OrbitCamera::from_camera(camera));
+    let city = install_world(&uiw, WorldReplacement::Snapshot(loaded.unwrap(), slot), 1);
+    assert_eq!(city.get_tick(), 1);
+    assert!(uiw
+        .read::<SaveLoadState>()
+        .notice
+        .as_ref()
+        .is_some_and(|(_, message)| {
+            message.contains("older debug replay recording was discarded")
+        }));
+}
+
+#[test]
 fn p4_world_replacement_clears_world_identity_and_requires_fresh_input() {
     fn world(fare: i64) -> (Simulation, LineID, VehicleID) {
         let mut sim = ScenarioCtx::new(SimulationOptions {

@@ -239,7 +239,12 @@ impl Pathfinder for CarPath {
 
                 if let Some(l) = lanes.get(dst) {
                     cost = l.points.length() / l.speed_limit;
-                    cost += common::rand::randu(l.dist_from_bottom.to_bits() ^ base_random);
+                    cost += map
+                        .lane_scoring_pilot()
+                        .and_then(|pilot| pilot.wait_real_seconds(dst))
+                        .unwrap_or_else(|| {
+                            common::rand::randu(l.dist_from_bottom.to_bits() ^ base_random)
+                        });
                 }
 
                 (dst, OrderedFloat(cost))

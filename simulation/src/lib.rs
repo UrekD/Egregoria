@@ -667,9 +667,12 @@ impl Simulation {
             return;
         }
         if commands.len() > world_command::MAX_TILED_COMMANDS
-            && commands
-                .iter()
-                .any(|command| matches!(command, WorldCommand::MapUpgradeRoad { .. }))
+            && commands.iter().any(|command| {
+                matches!(
+                    command,
+                    WorldCommand::MapUpgradeRoad { .. } | WorldCommand::MapSetJunctionRules { .. }
+                )
+            })
         {
             self.reject_command_batch(commands, std::iter::empty(), tiled);
             return;
@@ -1533,6 +1536,21 @@ impl SimulationDeser {
 
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
         crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
+        sim.map()
+            .validate_junction_policy_land()
+            .map_err(|reason| corrupt(format!("Invalid junction policy land effect: {reason:?}")))?;
+        let elapsed = transit::elapsed_ticks(&sim.resources).0;
+        sim.write::<crate::transportation::junction_admission::JunctionAdmission>()
+            .validate_loaded(&sim.map(), sim.world(), elapsed)
+            .map_err(&corrupt)?;
+        if sim
+            .map()
+            .lane_scoring_pilot()
+            .and_then(crate::map::LaneScoringPilot::sampled_at)
+            .is_some_and(|sampled| sampled > elapsed)
+        {
+            return Err(corrupt("Lane scoring sample is ahead of the simulation".into()));
+        }
         sim.map_mut()
             .rebuild_land_frontage()
             .map_err(|reason| corrupt(format!("Invalid land frontage: {reason:?}")))?;

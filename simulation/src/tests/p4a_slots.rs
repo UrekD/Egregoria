@@ -55,9 +55,49 @@ fn p7_snapshot_loads_p6_slot_with_disabled_replay() {
     assert_eq!(city.get_tick(), 1);
     let replay = city.read::<crate::Replay>();
     assert!(!replay.enabled);
+    assert!(!replay.obsolete_recording_discarded());
     assert_eq!(replay.command_count(), 0);
     assert_eq!(replay.version, crate::utils::replay::replay_version());
     assert!(!paths.replay.exists());
+}
+
+#[test]
+fn p7_snapshot_loads_p6_slot_with_recorded_replay() {
+    crate::tests::init_test_simulation();
+    let root = TestRoot::new();
+    let id = SlotId::new("floor").unwrap();
+    let paths = slot_paths(&root.0, &id).unwrap();
+    // Published by P6 (c0041a8d) with recording enabled, Flat seed 6042,
+    // 16 terrain chunks, and snapshot revision 1.
+    fs::write(
+        &paths.zip,
+        include_bytes!("fixtures/p6-recorded-replay.zip"),
+    )
+    .unwrap();
+    fs::write(
+        &paths.replay,
+        include_bytes!("fixtures/p6-recorded-replay.json"),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        Simulation::load_replay_from_slot(&root.0, &id),
+        Err(crate::SaveLoadError::IncompatibleReplay { version }) if version == "0.11.0"
+    ));
+    let city = Simulation::load_from_slot(&root.0, &id).unwrap();
+    assert_eq!(city.get_tick(), 1);
+    let replay = city.read::<crate::Replay>();
+    assert!(!replay.enabled);
+    assert!(replay.obsolete_recording_discarded());
+    assert_eq!(replay.command_count(), 0);
+    drop(replay);
+    city.save_to_slot(&root.0, &id, SnapshotRevision::new(2))
+        .unwrap();
+    let reopened = Simulation::load_from_slot(&root.0, &id).unwrap();
+    assert_eq!(reopened.hashes(), city.hashes());
+    assert!(!reopened
+        .read::<crate::Replay>()
+        .obsolete_recording_discarded());
 }
 
 #[test]
