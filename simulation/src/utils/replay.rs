@@ -82,7 +82,11 @@ impl Replay {
                     kind: Some(MixedUse),
                     density,
                     ..
-                } => prototypes::prototypes().mixed_use_pair(*density).is_some(),
+                } => {
+                    *density == crate::map::Density::Low
+                        || prototypes::try_prototypes()
+                            .is_some_and(|registry| registry.mixed_use_pair(*density).is_some())
+                }
                 WorldCommand::MapBuildSpecialBuilding { kind, .. } => {
                     crate::building_kind_prototype_exists(*kind)
                 }

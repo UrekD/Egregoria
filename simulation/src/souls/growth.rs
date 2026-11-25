@@ -1123,7 +1123,14 @@ mod tests {
 
     #[test]
     fn zones2_z1_import_reports_committed_jobs_and_checks_density() {
+        if !crate::tests::in_prototype_fixture_process(
+            module_path!(),
+            "zones2_z1_import_reports_committed_jobs_and_checks_density",
+        ) {
+            return;
+        }
         let mut test = street();
+        crate::tests::load_staged_prototypes();
         let lot = front_lot(&test.g);
         let shop = BuildingKind::GoodsCompany(GoodsCompanyID::new("commercial-medium-l1"));
         assert!(test
@@ -1224,6 +1231,31 @@ mod tests {
         let building = sim.map_mut().place_growable(lot, kind).unwrap();
         on_growable_placed(sim, building, kind);
         building
+    }
+
+    fn staff_store(sim: &mut Simulation, store: BuildingID) {
+        let proto = sim
+            .map()
+            .get(store)
+            .unwrap()
+            .kind
+            .as_goods_company()
+            .unwrap();
+        let owner = sim.read::<BuildingInfos>().owner(store);
+        let Some(SoulID::GoodsCompany(company)) =
+            owner.or_else(|| crate::souls::goods_company::company_soul(sim, store, proto))
+        else {
+            panic!("test store has no company");
+        };
+        let workers: Vec<_> = sim.world().humans.keys().collect();
+        for &id in &workers {
+            sim.world.edit_human(id, |human| {
+                let mut work = Work::new(store, WorkKind::Worker, 0.0);
+                work.employer = Some(company);
+                human.work = Some(work);
+            });
+        }
+        sim.world.companies[company].workers.0 = workers;
     }
 
     #[test]
@@ -1354,9 +1386,7 @@ mod tests {
             while test.g.world().humans.len() < capacity {
                 crate::souls::human::spawn_human(&mut test.g, house).unwrap();
             }
-            for human in test.g.world_mut_unchecked().humans.values_mut() {
-                human.work = Some(Work::new(store, WorkKind::Worker, 0.0));
-            }
+            staff_store(&mut test.g, store);
             for _ in 0..6 {
                 hourly_check(&mut test.g);
             }
@@ -1500,9 +1530,7 @@ mod tests {
         let lot = test.g.map().lots().keys().next().unwrap();
         let store = place_store(&test.g, lot);
 
-        for human in test.g.world_mut_unchecked().humans.values_mut() {
-            human.work = Some(Work::new(store, WorkKind::Worker, 0.0));
-        }
+        staff_store(&mut test.g, store);
         test.g.write::<GameTime>().tick.0 = 0;
         serve_house(&mut test.g, house);
         test.g

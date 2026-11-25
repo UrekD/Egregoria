@@ -397,6 +397,14 @@ pub(crate) fn in_prototype_fixture_process(module: &str, name: &str) -> bool {
     false
 }
 
+pub(crate) fn load_staged_prototypes() {
+    prototypes::test_prototypes(concat!(
+        "package.path = '../base_mod/?.lua'\nzones2_profiles_enabled = true\n",
+        include_str!("../../../base_mod/data.lua")
+    ));
+    crate::init::register_simulation();
+}
+
 fn init_test_simulation() {
     static BASE_PROTOTYPES: Mutex<Option<&'static prototypes::Prototypes>> = Mutex::new(None);
     let mut base = BASE_PROTOTYPES.lock().unwrap();
@@ -404,12 +412,9 @@ fn init_test_simulation() {
         .zip(prototypes::try_prototypes())
         .is_some_and(|(base, current)| std::ptr::eq(base, current));
     if !base_is_loaded {
-        // Regression fixtures exercise the profiled registry even while the live
-        // palette is gated. Custom replacements remain isolated in subprocesses.
-        prototypes::test_prototypes(concat!(
-            "package.path = '../base_mod/?.lua'\nzones2_profiles_enabled = true\n",
-            include_str!("../../../base_mod/data.lua")
-        ));
+        // SAFETY: The mutex serializes default initialization, and custom
+        // fixtures replace the registry only in their own subprocess.
+        unsafe { crate::init::load_prototypes() };
         *base = Some(prototypes::prototypes());
     }
     crate::init::register_simulation();
@@ -1268,7 +1273,13 @@ fn zones2_fix_rejects_mixed_and_unregistered_raw_companies() {
     use geom::{vec2, OBB};
     use prototypes::{BuildingGen, GoodsCompanyID};
 
-    init_test_simulation();
+    if !in_prototype_fixture_process(
+        module_path!(),
+        "zones2_fix_rejects_mixed_and_unregistered_raw_companies",
+    ) {
+        return;
+    }
+    load_staged_prototypes();
     let mut map = Map::empty();
     let obb = OBB::new(vec2(150.0, 150.0), Vec2::X, 20.0, 20.0);
     let gen = BuildingGen::CenteredDoor {

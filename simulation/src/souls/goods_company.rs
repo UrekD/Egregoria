@@ -167,10 +167,7 @@ pub fn company_soul(
     let map = sim.map();
     let b = map.buildings().get(build_id)?;
     if b.kind != BuildingKind::GoodsCompany(proto)
-        || !sim
-            .read::<BuildingInfos>()
-            .get(build_id)
-            .is_some_and(|info| info.owner.is_none())
+        || sim.read::<BuildingInfos>().owner(build_id).is_some()
     {
         return None;
     }
@@ -230,6 +227,8 @@ pub fn company_soul(
     }
 
     let mut infos = sim.write::<BuildingInfos>();
+    // Legacy callers can place a pure building directly on the map.
+    infos.insert(build_id);
     if BuildingKind::GoodsCompany(proto.id).is_mixed_growable() {
         infos.mark_business_address(build_id);
     }

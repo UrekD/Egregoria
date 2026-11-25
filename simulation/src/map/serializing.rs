@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use geom::{Shape, Vec2};
@@ -65,7 +66,7 @@ struct BorrowedMap<'a> {
     parking: &'a ParkingSpots,
     lots: &'a Lots,
     environment: &'a Environment,
-    external_train_stations: &'a [BuildingID],
+    external_train_stations: Cow<'a, [BuildingID]>,
     #[serde(skip_serializing_if = "Option::is_none")]
     import_lane_reserve: Option<bool>,
 }
@@ -75,6 +76,11 @@ impl Serialize for Map {
         let import_lane_reserve = serializer
             .is_human_readable()
             .then_some(self.import_lane_reserve);
+        let mut external_train_stations = Cow::Borrowed(self.external_train_stations.as_slice());
+        // Keep the existing positional encoding for imported Bincode maps.
+        if import_lane_reserve.is_none() && self.import_lane_reserve {
+            external_train_stations.to_mut().push(BuildingID::null());
+        }
         MapWithLotOrigins {
             map: BorrowedMap {
                 roads: &self.roads,
@@ -84,7 +90,7 @@ impl Serialize for Map {
                 parking: &self.parking,
                 lots: &self.lots,
                 environment: &self.environment,
-                external_train_stations: &self.external_train_stations,
+                external_train_stations,
                 import_lane_reserve,
             },
             lot_origins: &self.lot_origins,

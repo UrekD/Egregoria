@@ -1,4 +1,4 @@
-use super::init_test_simulation;
+use super::in_prototype_fixture_process;
 use crate::economy::{progression::ProgressionMode, Market};
 use crate::map::{
     BuildingID, Density, GrowableBusinessState, GrowableSiteState, LanePatternBuilder, LotLayout,
@@ -41,8 +41,15 @@ impl Drop for SlotRoot {
     }
 }
 
+fn load_staged_prototypes(test: &str) -> bool {
+    if !in_prototype_fixture_process(module_path!(), test) {
+        return false;
+    }
+    super::load_staged_prototypes();
+    true
+}
+
 fn flat_city() -> Simulation {
-    init_test_simulation();
     Simulation::new_game_with_replay(&NewGameOptions {
         preset: MapPreset::Flat,
         terrain_chunks: NewGameOptions::MIN_TERRAIN_CHUNKS,
@@ -68,6 +75,9 @@ fn zone(kind: ZoneKind, density: Density) -> ZoneCell {
 
 #[test]
 fn zones2_acceptance_high_residential_placement_has_a_tower_shell() {
+    if !load_staged_prototypes("zones2_acceptance_high_residential_placement_has_a_tower_shell") {
+        return;
+    }
     let mut sim = flat_city();
     sim.apply_commands([&road(vec3(100.0, 180.0, 0.0), vec3(820.0, 180.0, 0.0))]);
     let kinds = [
@@ -143,6 +153,9 @@ fn zones2_acceptance_high_residential_placement_has_a_tower_shell() {
 
 #[test]
 fn zones2_acceptance_same_parcel_value_changes_the_tower_capacity() {
+    if !load_staged_prototypes("zones2_acceptance_same_parcel_value_changes_the_tower_capacity") {
+        return;
+    }
     let mut low_value = flat_city();
     low_value.apply_commands([&road(vec3(100.0, 180.0, 0.0), vec3(680.0, 180.0, 0.0))]);
     let home = zone(ZoneKind::Residential, Density::High);
@@ -243,6 +256,11 @@ fn zones2_acceptance_same_parcel_value_changes_the_tower_capacity() {
 
 #[test]
 fn zones2_acceptance_profiled_home_and_business_loads_match_their_slots() {
+    if !load_staged_prototypes(
+        "zones2_acceptance_profiled_home_and_business_loads_match_their_slots",
+    ) {
+        return;
+    }
     let mut sim = flat_city();
     sim.apply_commands([&road(vec3(100.0, 260.0, 0.0), vec3(680.0, 260.0, 0.0))]);
     let work_zone = zone(ZoneKind::Commercial, Density::High);
@@ -346,6 +364,9 @@ fn zones2_acceptance_profiled_home_and_business_loads_match_their_slots() {
 
 #[test]
 fn zones2_acceptance_mixed_shop_closure_keeps_occupied_apartments() {
+    if !load_staged_prototypes("zones2_acceptance_mixed_shop_closure_keeps_occupied_apartments") {
+        return;
+    }
     let mut sim = flat_city();
     sim.apply_commands([&road(vec3(100.0, 260.0, 0.0), vec3(680.0, 260.0, 0.0))]);
     for density in [Density::Medium, Density::High] {
@@ -393,6 +414,9 @@ fn zones2_acceptance_mixed_shop_closure_keeps_occupied_apartments() {
 
 #[test]
 fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
+    if !load_staged_prototypes("zones2_acceptance_replay_reconstructs_growth_and_bulldozing") {
+        return;
+    }
     let mut sim = flat_city();
     let mut sched = Simulation::schedule();
     let root = SlotRoot::new();
@@ -410,7 +434,13 @@ fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
     };
     let before = sim.read::<Replay>().command_count();
     sim.apply_commands([&invalid, &valid]);
-    assert_eq!(sim.read::<Replay>().command_count(), before + 1);
+    // TILES replay retains complete admitted batches, including a command
+    // whose payload is well-formed but rejected by the zoning rules.
+    assert_eq!(sim.read::<Replay>().command_count(), before + 2);
+    assert_eq!(
+        sim.read::<crate::world_command::CommandOutcomes>().accepted,
+        [1]
+    );
     for _ in 0..TICKS_PER_HOUR {
         sim.tick(&mut sched, []);
     }
@@ -586,10 +616,7 @@ fn assert_incompatible(root: &Path, id: &SlotId, expected_version: &str) {
 
 #[test]
 fn zones2_save_and_replay_reject_a_different_prototype_registry() {
-    if !super::in_prototype_fixture_process(
-        module_path!(),
-        "zones2_save_and_replay_reject_a_different_prototype_registry",
-    ) {
+    if !load_staged_prototypes("zones2_save_and_replay_reject_a_different_prototype_registry") {
         return;
     }
 
