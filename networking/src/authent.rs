@@ -93,18 +93,18 @@ impl Authent {
             log::info!("client authenticated: {}@{}", name, addr);
             let hash = hash_str(&name);
 
-            if self.register(name.clone()) {
-                return Some(AuthentResponse::Refused {
-                    reason: format!("name is already in use: {name}"),
-                });
-            }
-
             if version != self.version {
                 return Some(AuthentResponse::Refused {
                     reason: format!(
                         "Incompatible versions: serv: {} vs client: {}",
                         self.version, version
                     ),
+                });
+            }
+
+            if self.register(name.clone()) {
+                return Some(AuthentResponse::Refused {
+                    reason: format!("name is already in use: {name}"),
                 });
             }
 

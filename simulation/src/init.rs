@@ -247,7 +247,7 @@ fn register_systems_and_resources() {
     register_transport_grid();
     register_resource_noinit::<RandProvider, Bincode>("randprovider");
     register_resource_default::<Dispatcher, Bincode>("dispatcher");
-    register_resource_default::<Replay, crate::utils::replay::ReplayJson>("replay");
+    register_replay();
     register_resource_default::<Transit, Bincode>("transit");
     register_resource_default::<TripStats, Bincode>("trip_stats");
     register_resource_default::<TransitStats, Bincode>("transit_stats");
@@ -436,6 +436,26 @@ fn register_cargo_progress() {
             save: Box::new(|sim| Bincode::encode(&sim.read::<CargoBook>().progress).unwrap()),
             load: Box::new(|sim, data| {
                 sim.write::<CargoBook>().progress = Bincode::decode(data)?;
+                Ok(())
+            }),
+        });
+    }
+}
+
+fn register_replay() {
+    use crate::utils::replay::ReplayJson;
+
+    // SAFETY: Resource registration runs once, before any simulation uses it.
+    unsafe {
+        (*std::ptr::addr_of_mut!(INIT_FUNCS)).push(InitFunc {
+            f: Box::new(|sim| sim.insert(Replay::default())),
+        });
+        (*std::ptr::addr_of_mut!(SAVELOAD_FUNCS)).push(SaveLoadFunc {
+            name: "replay",
+            optional: false,
+            save: Box::new(|sim| ReplayJson::encode(&*sim.read::<Replay>()).unwrap()),
+            load: Box::new(|sim, data| {
+                sim.insert(ReplayJson::decode_snapshot(data)?);
                 Ok(())
             }),
         });

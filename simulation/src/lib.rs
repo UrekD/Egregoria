@@ -32,7 +32,7 @@ use std::ptr::addr_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 use utils::rand_provider::RandProvider;
-use utils::replay::{replay_version_error, ReplayJson};
+use utils::replay::{replay_version, replay_version_error, ReplayJson};
 use utils::scheduler::SeqSchedule;
 
 #[macro_use]
@@ -390,7 +390,7 @@ impl Simulation {
     }
 
     pub fn try_from_replay(replay: Replay) -> io::Result<(Simulation, SimulationReplayLoader)> {
-        if replay.version != VERSION {
+        if replay.version != replay_version() {
             return Err(replay_version_error(&replay.version));
         }
         replay.check_registry()?;
@@ -666,6 +666,14 @@ impl Simulation {
             self.reject_command_batch(commands, remaining, tiled);
             return;
         }
+        if commands.len() > world_command::MAX_TILED_COMMANDS
+            && commands
+                .iter()
+                .any(|command| matches!(command, WorldCommand::MapUpgradeRoad { .. }))
+        {
+            self.reject_command_batch(commands, std::iter::empty(), tiled);
+            return;
+        }
         let wire_errors: Vec<_> = commands
             .iter()
             .map(|command| command.wire_error())
@@ -701,22 +709,16 @@ impl Simulation {
             if let Some(error) = wire_error {
                 command.reject_wire(self, error);
             } else {
-                // Paint preparation also validates map bounds and registry availability.
-                let record_paint = record && matches!(command, WorldCommand::ZonePaint { .. });
-                if record && !record_paint {
+                // Preserve admitted positions, including preparation rejections and no-ops.
+                if record {
                     let tick = self.read::<GameTime>().tick;
                     self.write::<Replay>().push(tick, (*command).clone());
                 }
-                let tick = record_paint.then(|| self.read::<GameTime>().tick);
-                let rejection = match command.admitted(tiled, &water) {
-                    Ok(()) => command.apply_in_batch(self, construction, &mut water),
-                    Err(reason) => {
-                        command.reject_unadmitted(self, reason);
-                        Some(reason)
+                match command.admitted(tiled, &water) {
+                    Ok(()) => {
+                        command.apply_in_batch(self, construction, &mut water);
                     }
-                };
-                if let Some(tick) = tick.filter(|_| rejection.is_none()) {
-                    self.write::<Replay>().push(tick, (*command).clone());
+                    Err(reason) => command.reject_unadmitted(self, reason),
                 }
             }
             utils::scheduler::drain_commands(self);
@@ -1219,6 +1221,9 @@ pub enum SaveLoadError {
     Incompatible {
         version: String,
     },
+    IncompatibleReplay {
+        version: String,
+    },
     PrototypeRegistry,
     Corrupt {
         version: Option<String>,
@@ -1244,6 +1249,9 @@ impl Display for SaveLoadError {
                     version.trim(),
                     VERSION.trim()
                 )
+            }
+            Self::IncompatibleReplay { version } => {
+                write!(f, "{}", replay_version_error(version))
             }
             Self::PrototypeRegistry => {
                 f.write_str("Save or replay requires a different prototype registry")

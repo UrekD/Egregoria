@@ -15,6 +15,9 @@ use crate::economy::cargo::{CargoBook, WarehousePolicy};
 use crate::economy::progression::{can_build, BuildCapability, ProgressionState};
 use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
+use crate::map::road_edit::{
+    prepare_upgrade, EditReceipt, PreparedRoadEdit, RoadEditStamp, RoadQuote, RoadUpgrade,
+};
 use crate::map::{
     Building, BuildingID, BuildingKind, ConnectionError, Density, Environment, IntersectionID,
     LandDenial, LandTileId, LaneID, LaneKind, LanePattern, LanePatternBuilder, LightPolicy, LotID,
@@ -45,8 +48,7 @@ pub struct WorldCommands {
     pub(crate) commands: Vec<WorldCommand>,
 }
 
-// The wire format is shared with legacy unrestricted worlds. Tiled runtime
-// admission enforces its smaller descriptor caps before cloning a batch.
+// Legacy construction DTOs retain their separate descriptor capacity.
 fn bounded_batch_wire<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -112,12 +114,15 @@ fn bounded_frame_wire<'de, D: serde::Deserializer<'de>>(
         }
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
-            if let Some(count) = input.size_hint().filter(|&count| count > MAX_WIRE_COMMANDS) {
+            if let Some(count) = input
+                .size_hint()
+                .filter(|&count| count > MAX_TILED_COMMANDS)
+            {
                 return Err(A::Error::invalid_length(count, &self));
             }
             let mut commands = Vec::new();
             let mut remaining = MAX_WATER_BATCH_WORK;
-            while commands.len() < MAX_WIRE_COMMANDS && remaining > 0 {
+            while commands.len() < MAX_TILED_COMMANDS && remaining > 0 {
                 let Some(command): Option<WorldCommand> = input.next_element()? else {
                     return Ok(commands);
                 };
@@ -299,6 +304,12 @@ macro_rules! define_world_command {
             BuyTile {
                 tile: LandTileId,
             },
+            MapUpgradeRoad {
+                road: RoadID,
+                expected: RoadEditStamp,
+                change: RoadUpgrade,
+                quote: RoadQuote,
+            },
         }
     };
 }
@@ -355,6 +366,11 @@ pub enum Rejection {
     InvalidCommandEncoding,
     BuildingOverlap,
     MixedUseUnavailable,
+    InvalidRoadPattern,
+    RoadWorkLimit,
+    StaleRoadEdit,
+    StaleRoadQuote,
+    RoadTopologyUnavailable,
 }
 
 impl From<LandDenial> for Rejection {
@@ -396,13 +412,32 @@ impl Rejection {
     }
 }
 
-pub(crate) struct PrepareBudget {
+pub struct PrepareBudget {
     guard_terraform: bool,
     reject_surface: bool,
+    shared_topology: bool,
     remaining: usize,
 }
 
 impl PrepareBudget {
+    pub fn for_preview(work_units: usize) -> Self {
+        Self {
+            guard_terraform: false,
+            reject_surface: false,
+            shared_topology: false,
+            remaining: work_units.min(MAX_WATER_BATCH_WORK),
+        }
+    }
+
+    pub(crate) fn spend_road_work(&mut self, work: usize) -> Result<(), Rejection> {
+        crate::map::spend_water_work(&mut self.remaining, work)
+            .map_err(|_| Rejection::RoadWorkLimit)
+    }
+
+    pub(crate) fn road_work_remaining(&mut self) -> &mut usize {
+        &mut self.remaining
+    }
+
     pub(crate) fn new(commands: &[&WorldCommand], environment: &Environment) -> Self {
         let guard_terraform = environment.has_water_configuration()
             || commands.iter().any(|command| {
@@ -418,6 +453,9 @@ impl PrepareBudget {
         let mut batch = Self {
             guard_terraform,
             reject_surface: false,
+            shared_topology: commands
+                .iter()
+                .any(|command| matches!(command, MapUpgradeRoad { .. })),
             remaining: MAX_WATER_BATCH_WORK,
         };
         if !guard_terraform || commands.len() < 2 {
@@ -546,6 +584,7 @@ pub(crate) enum PreparedAction<'a> {
         cost: Money,
     },
     SpecialBuilding(crate::map::PreparedSpecialBuilding, Money),
+    RoadEdit(PreparedRoadEdit),
     Command(&'a WorldCommand, Money),
 }
 
@@ -576,6 +615,13 @@ impl PreparedAction<'_> {
                 let id = sim.map_mut().commit_special_building(prepared);
                 sim.write::<BuildingInfos>().insert(id);
                 WorldCommand::charge_construction(sim, cost, construction);
+            }
+            Self::RoadEdit(prepared) => {
+                let receipt = prepared.commit(sim)?;
+                WorldCommand::charge_construction(sim, receipt.debit, construction);
+                let mut outcomes = sim.write::<CommandOutcomes>();
+                let index = outcomes.command_ranges.len();
+                outcomes.road_edits.insert(index, Ok(receipt));
             }
             Self::Command(command, cost) => command.apply_one(sim, construction, cost)?,
         }
@@ -614,6 +660,7 @@ pub struct CommandOutcomes {
     connections: BTreeMap<usize, ConnectionBatchOutcome>,
     tile_purchases: BTreeMap<usize, Result<TilePurchased, Rejection>>,
     water_edits: BTreeMap<usize, Result<WaterEditOutcome, WaterEditError>>,
+    road_edits: BTreeMap<usize, Result<EditReceipt, Rejection>>,
 }
 
 impl CommandOutcomes {
@@ -665,6 +712,10 @@ impl CommandOutcomes {
         self.tile_purchases.get(&index).copied()
     }
 
+    pub fn road_edit(&self, index: usize) -> Option<&Result<EditReceipt, Rejection>> {
+        self.road_edits.get(&index)
+    }
+
     /// Discards the completed batch's outcomes while preserving its sequence.
     pub fn clear(&mut self) {
         self.last.clear();
@@ -675,6 +726,7 @@ impl CommandOutcomes {
         self.connections.clear();
         self.water_edits.clear();
         self.tile_purchases.clear();
+        self.road_edits.clear();
     }
 
     pub(crate) fn begin_batch(&mut self) -> Option<Self> {
@@ -1009,6 +1061,7 @@ impl WorldCommand {
                 | SetLotLayout(_)
                 | EditWater(_)
                 | BuyTile { .. }
+                | MapUpgradeRoad { .. }
         )
     }
 
@@ -1093,12 +1146,7 @@ impl WorldCommand {
         };
         let rejection = result.err();
         if let Some(reason) = rejection {
-            self.reject(sim, reason);
-            if matches!(self, BuyTile { .. }) {
-                let mut outcomes = sim.write::<CommandOutcomes>();
-                let index = outcomes.command_ranges.len();
-                outcomes.tile_purchases.insert(index, Err(reason));
-            }
+            self.reject_unadmitted(sim, reason);
         }
         rejection
     }
@@ -1120,6 +1168,10 @@ impl WorldCommand {
             |pattern: &LanePattern| pattern.lanes_forward.len() + pattern.lanes_backward.len();
         let nested = match self {
             MapMakeConnection { pat, .. } => lanes(pat),
+            MapUpgradeRoad {
+                change: RoadUpgrade::Replace(pat),
+                ..
+            } => lanes(pat),
             MapMakeMultipleConnections(projects, links) => {
                 projects.len()
                     + links.len()
@@ -1187,6 +1239,21 @@ impl WorldCommand {
                     && to.pos.is_finite()
                     && inter.is_none_or(Vec2::is_finite)
                     && finite_pattern(pat)
+            }
+            MapUpgradeRoad {
+                change: RoadUpgrade::Replace(pattern),
+                ..
+            } => {
+                if pattern
+                    .lanes_forward
+                    .len()
+                    .saturating_add(pattern.lanes_backward.len())
+                    > 32
+                {
+                    return Some(Ok(Rejection::RoadWorkLimit));
+                }
+                // Finite domain and pattern validation run in the checked planner.
+                finite_pattern(pattern)
             }
             MapMakeMultipleConnections(projects, links) => {
                 projects.iter().all(|project| project.pos.is_finite())
@@ -1258,6 +1325,10 @@ impl WorldCommand {
             | TransitSetFare { .. }
             | SetWarehousePolicy { .. }
             | SetLotLayout(_)
+            | MapUpgradeRoad {
+                change: RoadUpgrade::ReverseOneWay,
+                ..
+            }
             | BuyTile { .. } => true,
             EditWater(_) => unreachable!(),
         };
@@ -1339,6 +1410,11 @@ impl WorldCommand {
             let index = outcomes.command_ranges.len();
             outcomes.tile_purchases.insert(index, Err(reason));
         }
+        if matches!(self, MapUpgradeRoad { .. }) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes.road_edits.insert(index, Err(reason));
+        }
         if matches!(self, EditWater(_)) {
             let mut outcomes = sim.write::<CommandOutcomes>();
             let index = outcomes.command_ranges.len();
@@ -1387,6 +1463,7 @@ impl WorldCommand {
             SetLotLayout(_) => "SetLotLayout",
             EditWater(_) => "EditWater",
             BuyTile { .. } => "BuyTile",
+            MapUpgradeRoad { .. } => "MapUpgradeRoad",
         }
     }
 
@@ -1440,6 +1517,7 @@ impl WorldCommand {
 
     fn validate(&self, map: &Map) -> Result<(), Rejection> {
         let exists = match self {
+            MapUpgradeRoad { road, .. } => map.get(*road).is_some(),
             MapRemoveIntersection(id) | MapUpdateIntersectionPolicy { inter: id, .. } => {
                 map.get(*id).is_some()
             }
@@ -1725,6 +1803,9 @@ impl WorldCommand {
                         ..ActionPreview::priced(cost)
                     })
                 }
+                PreparedAction::RoadEdit(prepared) => {
+                    Ok(ActionPreview::priced(prepared.preview.cost))
+                }
                 PreparedAction::SpecialBuilding(_, cost) | PreparedAction::Command(_, cost) => {
                     Ok(ActionPreview::priced(cost))
                 }
@@ -1750,6 +1831,18 @@ impl WorldCommand {
         self.validate_progression(sim)?;
         match self {
             Init(_) => return Err(Rejection::UnexpectedInit),
+            MapUpgradeRoad {
+                road,
+                expected,
+                change,
+                quote,
+            } => {
+                let prepared = prepare_upgrade(sim, *road, *expected, change, budget)?;
+                if prepared.preview.quote != *quote {
+                    return Err(Rejection::StaleRoadQuote);
+                }
+                return Ok(PreparedAction::RoadEdit(prepared));
+            }
             BuyTile { tile } => {
                 let purchase = crate::map::prepare_purchase(sim, *tile)?;
                 let frontage = sim
@@ -1772,18 +1865,17 @@ impl WorldCommand {
                 pat,
             } => {
                 let map = sim.map();
-                let tiled = map.land_ownership().is_tiled();
-                let mut work = map
-                    .needs_topology_preparation()
+                let shared_topology = map.land_ownership().is_tiled() || budget.shared_topology;
+                let mut work = (shared_topology || map.needs_topology_preparation())
                     .then(WaterTopologyWork::new);
                 if let Some(work) = &mut work {
-                    if tiled {
+                    if shared_topology {
                         work.remaining = budget.remaining;
                     }
                 }
                 let prepared = map.prepare_connection(*from, *to, *inter, pat, work.as_mut());
                 if let Some(work) = &work {
-                    if tiled {
+                    if shared_topology {
                         budget.remaining = work.remaining;
                     }
                 }
@@ -1890,10 +1982,10 @@ impl WorldCommand {
         }
 
         let mut map = sim.map_mut();
-        let mut water_work = map
-            .needs_topology_preparation()
-            .then(WaterTopologyWork::new);
-        if tiled {
+        let shared_topology = tiled || batch.shared_topology;
+        let mut water_work =
+            (shared_topology || map.needs_topology_preparation()).then(WaterTopologyWork::new);
+        if shared_topology {
             if let Some(work) = &mut water_work {
                 work.remaining = batch.remaining;
             }
@@ -2061,7 +2153,7 @@ impl WorldCommand {
             .connections
             .insert(index, ConnectionBatchOutcome { links, projects });
         map.check_invariants();
-        if tiled {
+        if shared_topology {
             if let Some(work) = water_work {
                 batch.remaining = work.remaining;
             }
@@ -2100,6 +2192,7 @@ impl WorldCommand {
             }
             MapMakeConnection { .. }
             | MapMakeMultipleConnections(..)
+            | MapUpgradeRoad { .. }
             | EditWater(_)
             | BuyTile { .. }
             | ZonePaint { .. } => {
@@ -2391,4 +2484,65 @@ impl From<&WorldCommands> for Vec<WorldCommand> {
     fn from(x: &WorldCommands) -> Self {
         x.commands.clone()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn p7_mixed_dry_connections_share_remaining_work_at_each_index() {
+    use crate::map::road_edit::road_edit_stamp;
+    use common::saveload::{Bincode, Encoder};
+    drop(crate::tests::TestCtx::new());
+    let mut sim = Simulation::new_authored_flat(2, 6042).unwrap();
+    let project = |x, y| MapProject::ground(vec3(x, y, 0.0));
+    let pattern = LanePatternBuilder::new().build();
+    let single = MapMakeConnection {
+        from: project(100.0, 200.0),
+        to: project(600.0, 200.0),
+        inter: None,
+        pat: pattern.clone(),
+    };
+    sim.apply_commands([&single]);
+    let road = sim.map().roads().keys().next().unwrap();
+    let edit = MapUpgradeRoad {
+        road,
+        expected: road_edit_stamp(&sim, road, &mut PrepareBudget::for_preview(1_000)).unwrap(),
+        change: RoadUpgrade::Replace(pattern.clone()),
+        quote: Bincode::decode(&Bincode::encode(&0u64).unwrap()).unwrap(),
+    };
+    let single = MapMakeConnection {
+        from: project(100.0, 400.0),
+        to: project(600.0, 400.0),
+        inter: None,
+        pat: pattern.clone(),
+    };
+    let projects = [project(100.0, 500.0), project(600.0, 500.0)];
+    let links = [(0, 1, None, pattern.clone()), (0, 1, None, pattern)];
+    let multiple = MapMakeMultipleConnections(projects.to_vec(), links.to_vec());
+    let mut budget = PrepareBudget::new(&[&edit, &single, &multiple], sim.map().environment());
+    assert!(!sim.map().needs_topology_preparation());
+    budget.remaining = 1;
+    let before = sim.hashes();
+    let single_result = single.prepare_single(&sim, &mut budget).err();
+    sim.write::<CommandOutcomes>().clear();
+    multiple
+        .apply_connections(
+            &mut sim,
+            &projects,
+            &links,
+            BudgetCategory::Construction,
+            &mut budget,
+        )
+        .unwrap();
+    assert_eq!(single_result, Some(Rejection::WaterWorkLimit));
+    assert_eq!(
+        sim.read::<CommandOutcomes>()
+            .connection_batch(0)
+            .unwrap()
+            .links,
+        [
+            Err(Rejection::WaterWorkLimit),
+            Err(Rejection::WaterWorkLimit)
+        ]
+    );
+    assert_eq!(sim.hashes(), before);
 }

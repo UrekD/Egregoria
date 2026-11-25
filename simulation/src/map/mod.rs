@@ -70,6 +70,7 @@ mod light_policy;
 mod map;
 mod pathfinding;
 mod reachability;
+pub mod road_edit;
 mod serializing;
 mod spatial_map;
 pub mod special_placement;

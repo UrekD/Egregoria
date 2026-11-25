@@ -230,6 +230,9 @@ impl Encoder for Bincode {
     }
 }
 
+/// Command compatibility is versioned separately from the snapshot schema.
+pub const COMMAND_PROTOCOL_REVISION: &str = "commands.1";
+
 pub struct CompressedBincode;
 
 impl CompressedBincode {
@@ -237,6 +240,17 @@ impl CompressedBincode {
     pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
         miniz_oxide::inflate::decompress_to_vec_zlib(bytes)
             .map_err(|_| std::io::Error::new(ErrorKind::Other, "could not decode zipped file"))
+    }
+
+    pub fn decode_limited<T: DeserializeOwned>(bytes: &[u8], max_decoded: usize) -> Result<T> {
+        let plain = miniz_oxide::inflate::decompress_to_vec_zlib_with_limit(bytes, max_decoded)
+            .map_err(|_| {
+                io::Error::new(
+                    ErrorKind::InvalidData,
+                    "compressed payload exceeds its limit or is invalid",
+                )
+            })?;
+        Bincode::decode(&plain)
     }
 }
 

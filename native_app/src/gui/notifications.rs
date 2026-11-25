@@ -696,6 +696,12 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         }
         (_, MissingReference) => "Object no longer exists",
         (_, InvalidConnection) => "Invalid connection",
+        (_, InvalidRoadPattern) => "Choose a supported road lane pattern",
+        (_, RoadWorkLimit) => "The road edit exceeds the work limit",
+        (_, StaleRoadEdit | StaleRoadQuote) => {
+            "The road or its quote changed. Preview the edit again."
+        }
+        (_, RoadTopologyUnavailable) => "This road topology change is unavailable in this session",
         (_, InvalidBatchIndex) => "Invalid connection group",
         (_, InvalidBuilding) => "Building cannot be placed here",
         (_, InvalidZone) => "Zoning area is outside the map or too large",

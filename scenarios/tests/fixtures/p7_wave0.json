@@ -1,0 +1,1521 @@
+{
+  "schema": 1,
+  "floor": {
+    "commit": "c0041a8d5faba1513ddfaa7f2b4d04758ff663ae",
+    "snapshot_schema": "0.11.0",
+    "base_mod_tree": "b3dcee98b890c14a9d150f2d1f856c68a5a08305",
+    "prototype_tree": "815484df58b9393efe0d5c7d8d827c0130618647",
+    "asset_tree": "ad24a68a1c6daa25efc494b1fe299a2f05c43ee5"
+  },
+  "integration_parents": {
+    "scale": [
+      {
+        "commit": "8aac51cc065357af06e11c55495ef0b965b0f894",
+        "status": "landed",
+        "hooks": [
+          "indexed CommandOutcomes",
+          "scale_t0"
+        ]
+      },
+      {
+        "commit": "b879eaca491981ed41244ed77794939474649f37",
+        "status": "landed",
+        "hooks": [
+          "human activity index",
+          "l1_activity"
+        ]
+      },
+      {
+        "commit": "bc1fa687945ee0a01f1736777620d27454be27aa",
+        "status": "landed",
+        "hooks": [
+          "activity refresh order",
+          "l1_activity"
+        ]
+      },
+      {
+        "commit": "8d2e682e03415218dce3d28b22473baa296974fd",
+        "status": "landed",
+        "hooks": [
+          "AppliedBatch",
+          "capture generation fence",
+          "scale_t1"
+        ]
+      },
+      {
+        "commit": "acafaf991b5c83494188ead1fc638eab4296466d",
+        "status": "landed",
+        "hooks": [
+          "ReplayCursor",
+          "detached import and publication",
+          "scale_t1"
+        ]
+      }
+    ],
+    "water": [
+      {
+        "commit": "8bb08b0e5c735c548bd1270886e72ec57a2d4d3e",
+        "status": "landed",
+        "hooks": [
+          "EditWater",
+          "bounded map decode"
+        ]
+      },
+      {
+        "commit": "a4a07bccd8265007aad098df0c10ae4662c4b9db",
+        "status": "landed",
+        "hooks": [
+          "water work and placement boundaries"
+        ]
+      },
+      {
+        "commit": "909c51a95ee2609d62c40d22caa1b409ef34929a",
+        "status": "landed",
+        "hooks": [
+          "dry frontage through shallow merges"
+        ]
+      },
+      {
+        "commit": "be4dee4b609d7425c49356588be081805248dcfd",
+        "status": "landed",
+        "hooks": [
+          "water provider contacts and utility sampling"
+        ]
+      },
+      {
+        "commit": "541f2e10aac76429e922ee86661dbffd11feabf4",
+        "status": "landed",
+        "hooks": [
+          "deck picking",
+          "roadeditor"
+        ]
+      },
+      {
+        "commit": "6c3f4731e02def18577e4c1be17bfad3d0702d7f",
+        "status": "landed",
+        "hooks": [
+          "split lot spatial scan metering",
+          "harden1_split_reassignment_reserves_and_batches_dense_stale_lots"
+        ]
+      }
+    ],
+    "tiles": [
+      {
+        "commit": "590e04f55bb9a1a9de441bed803f1f9c0be9afb4",
+        "status": "landed",
+        "hooks": [
+          "PrepareBudget",
+          "LandDenial",
+          "land_ownership_c1_keeps_paused_batches_and_water_prepass_inputs"
+        ]
+      }
+    ],
+    "zones2": [
+      {
+        "commit": "a169b7416165110a2dacae1398342525a4b43cc3",
+        "status": "landed",
+        "hooks": [
+          "0.10.0 registry",
+          "checked zoning"
+        ]
+      },
+      {
+        "commit": "7c418197563b54a951aa1cd136f8d4d7ec46d747",
+        "status": "landed; reviewed 0.11.0 integration",
+        "hooks": [
+          "transit_path",
+          "router",
+          "zonegrid",
+          "prototype registry",
+          "snapshot/replay version"
+        ]
+      }
+    ],
+    "citymap": [
+      {
+        "commit": "57f069817852299e0b30ac770cfa522b5e46b34d",
+        "status": "landed",
+        "hooks": [
+          "citymap-spacing schema 2",
+          "cm0_"
+        ]
+      },
+      {
+        "commit": "838ed50b99859b363bd2ab58c5c9ce990b8e5705",
+        "status": "landed",
+        "hooks": [
+          "dry authored topology"
+        ]
+      },
+      {
+        "commit": "10ee5689654d87a092fc27a9f903b83bdd5a7900",
+        "status": "landed",
+        "hooks": [
+          "create-only slot publication"
+        ]
+      },
+      {
+        "commit": "7034ad542b15c42c27a9f4a41da74243014e8770",
+        "status": "landed",
+        "hooks": [
+          "freight route market refresh"
+        ]
+      },
+      {
+        "commit": "c2da3c4d682ad24a9dbcc12a3eb442a8ba16b4ba",
+        "status": "landed",
+        "hooks": [
+          "outdoor inactive pedestrian collider cleanup",
+          "pedfix_"
+        ]
+      },
+      {
+        "commit": "88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7",
+        "status": "landed",
+        "hooks": [
+          "OpeningManifest",
+          "check_loaded_opening",
+          "cm2_freight"
+        ]
+      },
+      {
+        "commit": "a1680763bf4b7e90f24339df2141cbe1c67906b3",
+        "status": "candidate; awaiting WETSAVA integration",
+        "hooks": [
+          "wet opening",
+          "Sava bus schedule",
+          "citymap reports"
+        ]
+      }
+    ]
+  },
+  "work_and_identity": {
+    "accepted_commands_per_batch": 256,
+    "live_pattern_lanes": 32,
+    "profile_samples_per_operation": 65536,
+    "shared_batch_work_units": 4194304,
+    "junction_approaches": 32,
+    "junction_forbidden_turns": 256,
+    "receipt_key": [
+      "session generation",
+      "live frame",
+      "original input index"
+    ],
+    "replay_batch_key": [
+      "absolute elapsed step",
+      "paused ordinal",
+      "advances"
+    ],
+    "replay_policy": "retain every admitted nonempty batch verbatim including gameplay rejections and no-ops",
+    "traversal_key": [
+      "semantic corridor/deck",
+      "directed traversal",
+      "geometry revision",
+      "projected metres"
+    ],
+    "budget_policy": "charge discovery, nonmatches and rejected work; use stricter landed caps",
+    "live_driving_lanes_per_direction": [
+      1,
+      3
+    ],
+    "live_speed_mps": [
+      4,
+      40
+    ],
+    "work_reservations": [
+      "candidate buckets",
+      "expanded graph edges",
+      "swept shape pairs",
+      "frontage fit",
+      "cut nodes",
+      "staged entity effects",
+      "retained command clone"
+    ]
+  },
+  "cm0": {
+    "schema": 2,
+    "archive_commit": "106cf8fa2bca20696f7c345aeafe127a38a9c737",
+    "landed_commit": "57f069817852299e0b30ac770cfa522b5e46b34d",
+    "stable_patch_id": "3bdb44311b0011dbfbd8d6dcbcf05626dae078a2",
+    "build_profile": "release",
+    "features": [],
+    "case_count": 348,
+    "demand": {
+      "demand_basis": "synthetic_baseline",
+      "nominal_envelope": null,
+      "observed_envelope": null,
+      "observed_within_matched_four_ports": null,
+      "observed_within_all_approaches": null,
+      "synthetic_trips_per_peak_hour_nominal_overload": [
+        120,
+        150
+      ],
+      "frontage_zone": {
+        "kind": "Residential",
+        "density": "Low"
+      },
+      "completion_pct": [
+        95,
+        90
+      ],
+      "clearance_minutes": [
+        30,
+        45
+      ],
+      "max_od_p95_delay_minutes": [
+        20,
+        35
+      ],
+      "min_lane_storage_m_local_collector_arterial": [
+        65.0,
+        90.0,
+        110.0
+      ],
+      "start_seed": 6042,
+      "run_ticks": 144000,
+      "peak_start_elapsed_ticks": [
+        6000,
+        54000
+      ],
+      "peak_duration_ticks": 12000,
+      "origin_offset_m": 20.0,
+      "destination_offset_m": 38.0,
+      "mode_order": [
+        "car",
+        "truck",
+        "bus"
+      ],
+      "port_order": [
+        "west",
+        "east",
+        "north",
+        "south",
+        "west_south",
+        "east_north"
+      ]
+    },
+    "groups": [
+      {
+        "demand_pattern": "MatchedFourPorts",
+        "load": "Nominal",
+        "cases": 150,
+        "eligible": 19
+      },
+      {
+        "demand_pattern": "MatchedFourPorts",
+        "load": "Overload",
+        "cases": 150,
+        "eligible": 0
+      },
+      {
+        "demand_pattern": "AllApproaches",
+        "load": "Nominal",
+        "cases": 24,
+        "eligible": 3
+      },
+      {
+        "demand_pattern": "AllApproaches",
+        "load": "Overload",
+        "cases": 24,
+        "eligible": 4
+      }
+    ],
+    "day_totals": {
+      "offered": 187920,
+      "admitted": 187920,
+      "completed": 187920
+    },
+    "controls": [
+      {
+        "id": "cm0-four-red",
+        "case": {
+          "topology": "CurvedCollector",
+          "demand_pattern": "MatchedFourPorts",
+          "pitch_m": 140,
+          "lanes_per_direction": 1,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Overload"
+        },
+        "gates": {
+          "traffic_pass": false,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": null,
+          "eligible": false,
+          "spillback_pass": false,
+          "overload_queue_cleared": false
+        },
+        "completed_by_cutoff": [
+          207,
+          210
+        ],
+        "cutoff_ticks": [
+          22461,
+          70461
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 15,
+            "midblock_vehicles": 17,
+            "conflict_vehicles": 7,
+            "waiting_entries": 24
+          },
+          {
+            "stop_line_vehicles": 2,
+            "midblock_vehicles": 41,
+            "conflict_vehicles": 6,
+            "waiting_entries": 15
+          }
+        ],
+        "worst_od_p95_ticks": 9877,
+        "max_blocking_ticks": 2500
+      },
+      {
+        "id": "cm0-four-green",
+        "case": {
+          "topology": "CurvedCollector",
+          "demand_pattern": "MatchedFourPorts",
+          "pitch_m": 140,
+          "lanes_per_direction": 2,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Nominal"
+        },
+        "gates": {
+          "traffic_pass": true,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": null,
+          "eligible": true,
+          "spillback_pass": true,
+          "overload_queue_cleared": null
+        },
+        "completed_by_cutoff": [
+          240,
+          240
+        ],
+        "cutoff_ticks": [
+          20951,
+          68951
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          },
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          }
+        ],
+        "worst_od_p95_ticks": 960,
+        "max_blocking_ticks": 0
+      },
+      {
+        "id": "cm0-four-overload-delay-red",
+        "case": {
+          "topology": "CurvedCollector",
+          "demand_pattern": "MatchedFourPorts",
+          "pitch_m": 140,
+          "lanes_per_direction": 2,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Overload"
+        },
+        "gates": {
+          "traffic_pass": false,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": null,
+          "eligible": false,
+          "spillback_pass": true,
+          "overload_queue_cleared": true
+        },
+        "completed_by_cutoff": [
+          295,
+          300
+        ],
+        "cutoff_ticks": [
+          22461,
+          70461
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          },
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          }
+        ],
+        "worst_od_p95_ticks": 4962,
+        "max_blocking_ticks": 0
+      },
+      {
+        "id": "cm0-six-red",
+        "case": {
+          "topology": "CurvedCollector",
+          "demand_pattern": "AllApproaches",
+          "pitch_m": 140,
+          "lanes_per_direction": 1,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Overload"
+        },
+        "gates": {
+          "traffic_pass": false,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": true,
+          "eligible": false,
+          "spillback_pass": false,
+          "overload_queue_cleared": false
+        },
+        "completed_by_cutoff": [
+          255,
+          245
+        ],
+        "cutoff_ticks": [
+          22461,
+          70461
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 7,
+            "midblock_vehicles": 4,
+            "conflict_vehicles": 1,
+            "waiting_entries": 15
+          },
+          {
+            "stop_line_vehicles": 11,
+            "midblock_vehicles": 7,
+            "conflict_vehicles": 4,
+            "waiting_entries": 4
+          }
+        ],
+        "worst_od_p95_ticks": 10788,
+        "max_blocking_ticks": 0
+      },
+      {
+        "id": "cm0-six-green",
+        "case": {
+          "topology": "CurvedCollector",
+          "demand_pattern": "AllApproaches",
+          "pitch_m": 140,
+          "lanes_per_direction": 2,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Overload"
+        },
+        "gates": {
+          "traffic_pass": true,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": true,
+          "eligible": true,
+          "spillback_pass": true,
+          "overload_queue_cleared": true
+        },
+        "completed_by_cutoff": [
+          300,
+          300
+        ],
+        "cutoff_ticks": [
+          22461,
+          70461
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          },
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          }
+        ],
+        "worst_od_p95_ticks": 2361,
+        "max_blocking_ticks": 0
+      },
+      {
+        "id": "cm0-six-orth-green",
+        "case": {
+          "topology": "Orthogonal",
+          "demand_pattern": "AllApproaches",
+          "pitch_m": 140,
+          "lanes_per_direction": 2,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Overload"
+        },
+        "gates": {
+          "traffic_pass": true,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": true,
+          "eligible": true,
+          "spillback_pass": true,
+          "overload_queue_cleared": true
+        },
+        "completed_by_cutoff": [
+          300,
+          300
+        ],
+        "cutoff_ticks": [
+          22461,
+          70461
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          },
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          }
+        ],
+        "worst_od_p95_ticks": 3005,
+        "max_blocking_ticks": 0
+      },
+      {
+        "id": "cm0-six-stock-nominal-red",
+        "case": {
+          "topology": "CurvedCollector",
+          "demand_pattern": "AllApproaches",
+          "pitch_m": 140,
+          "lanes_per_direction": 1,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Nominal"
+        },
+        "gates": {
+          "traffic_pass": false,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": true,
+          "eligible": false,
+          "spillback_pass": true,
+          "overload_queue_cleared": null
+        },
+        "completed_by_cutoff": [
+          232,
+          225
+        ],
+        "cutoff_ticks": [
+          20951,
+          68951
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          },
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          }
+        ],
+        "worst_od_p95_ticks": 6924,
+        "max_blocking_ticks": 0
+      },
+      {
+        "id": "cm0-six-stock-nominal-green",
+        "case": {
+          "topology": "CurvedCollector",
+          "demand_pattern": "AllApproaches",
+          "pitch_m": 140,
+          "lanes_per_direction": 2,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Nominal"
+        },
+        "gates": {
+          "traffic_pass": true,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": true,
+          "eligible": true,
+          "spillback_pass": true,
+          "overload_queue_cleared": null
+        },
+        "completed_by_cutoff": [
+          240,
+          240
+        ],
+        "cutoff_ticks": [
+          20951,
+          68951
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          },
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          }
+        ],
+        "worst_od_p95_ticks": 1075,
+        "max_blocking_ticks": 0
+      },
+      {
+        "id": "cm0-six-orth-stock-nominal-green",
+        "case": {
+          "topology": "Orthogonal",
+          "demand_pattern": "AllApproaches",
+          "pitch_m": 140,
+          "lanes_per_direction": 2,
+          "control": "StopSigns",
+          "road_class": "Collector",
+          "load": "Nominal"
+        },
+        "gates": {
+          "traffic_pass": true,
+          "storage_pass": true,
+          "phase_pass": true,
+          "bidirectional_spine_pass": true,
+          "all_approaches_served": true,
+          "eligible": true,
+          "spillback_pass": true,
+          "overload_queue_cleared": null
+        },
+        "completed_by_cutoff": [
+          240,
+          240
+        ],
+        "cutoff_ticks": [
+          20951,
+          68951
+        ],
+        "cutoff_queues": [
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          },
+          {
+            "stop_line_vehicles": 0,
+            "midblock_vehicles": 0,
+            "conflict_vehicles": 0,
+            "waiting_entries": 0
+          }
+        ],
+        "worst_od_p95_ticks": 881,
+        "max_blocking_ticks": 0
+      }
+    ],
+    "live_upgrade": {
+      "id": "cm0-six-live-upgrade",
+      "from_case": "cm0-six-red",
+      "positive_control": "cm0-six-green",
+      "command_boundary": "before first offer",
+      "status": "waiting on live prepared edit"
+    },
+    "floor_verification": {
+      "run_source_commit": "88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7",
+      "matrix_jobs": 8,
+      "simulation_workers_per_case": 1,
+      "report_sha256": "c69598d0408b679726be68f7c7083ea3cc6757870fd12ee1c9959a82f8086517",
+      "matches_archive_byte_for_byte": true,
+      "timing_sha256": "9f7d332fc7127ae0061a79965fa278fc140eedb4a1c1094341a0771fd91b4be2",
+      "timing": {
+        "case": {
+          "topology": "CurvedCollector",
+          "demand_pattern": "MatchedFourPorts",
+          "pitch_m": 120,
+          "lanes_per_direction": 1,
+          "control": "Auto",
+          "road_class": "Collector",
+          "load": "Nominal"
+        },
+        "off_ms": [
+          3678.236006,
+          3791.240788,
+          3544.692269
+        ],
+        "on_ms": [
+          3672.18449,
+          3710.970625,
+          3705.068323
+        ],
+        "median_overhead_pct": -0.16452223267154897,
+        "matching_trip_trace": true
+      },
+      "timing_environment": "shared host, diagnostic only"
+    }
+  },
+  "archive_files": [
+    {
+      "relative_to": "/var/tmp/egr",
+      "path": "cm0-fix.TnPFip/stats.json",
+      "sha256": "c69598d0408b679726be68f7c7083ea3cc6757870fd12ee1c9959a82f8086517"
+    },
+    {
+      "relative_to": "/var/tmp/egr",
+      "path": "cm0-fix.TnPFip/timing.json",
+      "sha256": "6024cf334a18f2458786f7fc1d1c8f0a40ba522106ba873e186c85aa9c6df293"
+    },
+    {
+      "relative_to": "/var/tmp/egr",
+      "path": "cm2-shots/final.gVG9gk/lesce_town.zip",
+      "sha256": "92aa01af8cde5d68bef6927e73998bb5f103214aef9b6d9ce3b7c76983b13ce4",
+      "metadata_sha256": "fd5ded06124729cc9a3bc53fb571d1145b0fcd8b8979dedcc280e3754f1eab67"
+    },
+    {
+      "relative_to": "/var/tmp/egr",
+      "path": "cm2-tuned/traffic-checkpoint/lesce_town.zip",
+      "sha256": "443f29371d6bdad59761a5c4c3dc986d936210b1f946d6dc8bf890e0e3f447b1",
+      "metadata_sha256": "2dc07777169be2d4f6a8b92c71528fb96efb552bec5816d6de6c528b12a0ed1d"
+    },
+    {
+      "relative_to": "/var/tmp/egr",
+      "path": "cm2-tuned/scale-audit/lesce_town.zip",
+      "sha256": "74523cde7630741ae2d277f9920e4030acac3cda0a5bb5ad679ae5c90eb4760f",
+      "metadata_sha256": "563a77653baf7895a30a8d47ee148e79e8c7baf7393ca0e61a65ed4f19f56eac"
+    },
+    {
+      "relative_to": "/var/tmp/egr",
+      "path": "cm2-tuned/hraska-checkpoint/lesce_town.zip",
+      "sha256": "c7c474e224e2e0b6ba5c3ff8047c0ba2cf4836ef5d37a3bcbb319b3107806536",
+      "metadata_sha256": "e35acbdcc19fec1e145da76182eba0cbf07fb51c9d856da6624422e146aad027"
+    },
+    {
+      "relative_to": "/var/tmp/egr",
+      "path": "cm2-tuned/provisioned-audit/lesce_town.zip",
+      "sha256": "df27a33d93c3f6a84857020972d177d982a646f870e46702c2f8a4ae5f84ea22",
+      "metadata_sha256": "76000b8887988c8184eb21a00513ee621b2f008030fe749d32df80a321a812a1"
+    },
+    {
+      "relative_to": "/var/tmp/egr",
+      "path": "cm2-tuned/provisioned-opening-report.json",
+      "sha256": "c287d2bc024d09cef539ca518354ce25c3d022d558049329a27358bb0a4c7e55"
+    }
+  ],
+  "diagnostic_inputs": [
+    {
+      "id": "cm2-alpska-transition",
+      "initial_elapsed_tick": 432001,
+      "snapshot": "cm2-shots/final.gVG9gk/lesce_town.zip",
+      "producer_commit": null,
+      "evidence": "historical replay assertions: car 295v1, human 510v1, westbound lane 868v1 ~3.7 m from stop line"
+    },
+    {
+      "id": "cm2-alpska-checkpoint",
+      "initial_elapsed_tick": 642721,
+      "snapshot": "cm2-tuned/traffic-checkpoint/lesce_town.zip",
+      "producer_commit": null,
+      "score_ticks": 500,
+      "evidence": "archived A/B 0.00m vs 61.86m after pedestrian relocation and collider removal",
+      "fresh_probe": "floor rejected 0.9.0 as incompatible; original probe rerun reproduced 0.00/61.86 m in 500 ticks",
+      "historical_rerun_sha256": "730a39fb45972a63020da3ac4ba61d3d580b43595812b35e98fc6ed3561bbfe6"
+    },
+    {
+      "id": "cm2-hraska-transition",
+      "initial_elapsed_tick": 576001,
+      "snapshot": "cm2-tuned/scale-audit/lesce_town.zip",
+      "producer_commit": null,
+      "evidence": "historical replay car 1455v1 and outside human 1163v1 at ~843952"
+    },
+    {
+      "id": "cm2-hraska-checkpoint",
+      "initial_elapsed_tick": 847052,
+      "snapshot": "cm2-tuned/hraska-checkpoint/lesce_town.zip",
+      "producer_commit": null,
+      "evidence": "Hraska school near lane 610v1",
+      "fresh_probe": "floor rejected 0.9.0 as incompatible; no same-build transition fixture",
+      "historical_trace_sha256": "ffa4c4e7b53adbccd47d52177bff7ed38ae9bf6c69d7394d585fa5fb39048279"
+    },
+    {
+      "id": "cm2-provisioned-diagnostic",
+      "initial_elapsed_tick": 576001,
+      "snapshot": "cm2-tuned/provisioned-audit/lesce_town.zip",
+      "producer_series": "d3f605cbf80c7d19aa61b0c76b9c5d9197bd5599",
+      "opening_report": "cm2-tuned/provisioned-opening-report.json",
+      "commissioning_passed": false,
+      "evidence": "2721 residents; blocked egress 83.5 and standing 261.5 minutes; latter cause unverified"
+    }
+  ],
+  "lesce_town_pin": {
+    "source_commit": "5748e812b4479012a1ffdc398e0f0229082ec011",
+    "run_source_commit": "88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7",
+    "prototype_tree": "551dc343da61015dd0153d850a822683eb0a8592",
+    "base_mod_tree": "33720a58d86c004c29007c1b5b251c2d5eaaaa52",
+    "asset_tree": "ad24a68a1c6daa25efc494b1fe299a2f05c43ee5",
+    "build_profile": "release",
+    "features": [],
+    "snapshot_schema": "0.10.0",
+    "snapshot_revision": "36bc25041dd4954b7560b23932a7e9ea",
+    "snapshot_sha256": "01aded53f1c3dc623f5d0a06009813fe1a869aa29a2680d9f260503f31e8219a",
+    "metadata_sha256": "5c102f6e5f708902e48f09534bd3f273e1b5b7dbf27b077e1c3e2e84b55d4ca5",
+    "replay_sha256": null,
+    "schedule_sha256": "65b79cf1fa8970a5163d21dc87a35c67d864d20b9d576aa8ae8607a0907b441c",
+    "initial_elapsed_tick": 576000,
+    "workers": 1,
+    "opening": {
+      "manifest_sha256": "232eaa6a022ff9ce5d8689af4e6f947daff44cb0363abfb2aa411734de1efadd",
+      "report_sha256": "100154916976c8f96b01f3dd03bd7a603295bf36912899efef98845679c7fe1f",
+      "population": 2703,
+      "passed": true
+    }
+  },
+  "lesce_town_opening": {
+    "source_root": "/var/tmp/egr-keep/lesce_town-published-20261125",
+    "town_schedule": {
+      "slot": "lesce_town",
+      "mode": "unchanged_stock",
+      "workers": 1,
+      "initial_elapsed_tick": 576000,
+      "probe_ticks": 156000,
+      "sample_ticks": 50,
+      "standing_threshold_ticks": 500,
+      "offers": "natural demand",
+      "commands": [],
+      "watch": "VehicleID(665v1)",
+      "options_and_seed": {
+        "preset": "Flat",
+        "seed": 20261122,
+        "terrain_chunks": 6,
+        "owned_rect_m": [
+          [
+            0,
+            0
+          ],
+          [
+            3072,
+            3072
+          ]
+        ],
+        "starting_money_bucks": 500000,
+        "progression": "FreeBuild",
+        "lot_layout": "Uniform",
+        "save_replay": false,
+        "source": "producer authored options and immutable published snapshot"
+      },
+      "blueprint_sha256": "52b493df170721affcb82ac7fe6790621e6c8bcc57c8bd37a2f7d369d4849956",
+      "directed_anchors": [
+        {
+          "road_use": "longest standing approach",
+          "lane": "222v1",
+          "position": [
+            1684.028,
+            831.697,
+            10.285
+          ],
+          "world": "Lesce Town",
+          "road": "40v1",
+          "from_junction": "48v1",
+          "to_junction": "37v1",
+          "directed_lane_length_metres": 229.7
+        },
+        {
+          "road_use": "longest blocked egress",
+          "lane": "180v1",
+          "world": "Lesce Town"
+        }
+      ],
+      "calendar_tick": 576001
+    },
+    "employed": 2703,
+    "proof": {
+      "buyer": {
+        "idx": 426,
+        "version": 1
+      },
+      "dispatch_tick": 917200,
+      "item": "goods",
+      "loaded_units": 45,
+      "observed_unload_units": 32,
+      "receipt_tick": 931821,
+      "return_tick": 662094,
+      "station": {
+        "idx": 2,
+        "version": 1
+      },
+      "train": {
+        "idx": 1,
+        "version": 1
+      },
+      "truck": {
+        "idx": 43,
+        "version": 1
+      },
+      "units_from_train": 29,
+      "unload_tick": 659456
+    },
+    "days": [
+      {
+        "elapsed_day": 4,
+        "line_boardings": {
+          "employment": 9,
+          "neighbourhood": 10
+        },
+        "line_loops": {
+          "employment": 30,
+          "neighbourhood": 21
+        },
+        "line_completed_journeys": {
+          "employment": 9,
+          "neighbourhood": 6
+        },
+        "utility_failures": 0
+      },
+      {
+        "elapsed_day": 5,
+        "line_boardings": {
+          "employment": 8,
+          "neighbourhood": 18
+        },
+        "line_loops": {
+          "employment": 35,
+          "neighbourhood": 28
+        },
+        "line_completed_journeys": {
+          "employment": 7,
+          "neighbourhood": 17
+        },
+        "utility_failures": 0
+      },
+      {
+        "elapsed_day": 6,
+        "line_boardings": {
+          "employment": 5,
+          "neighbourhood": 19
+        },
+        "line_loops": {
+          "employment": 36,
+          "neighbourhood": 28
+        },
+        "line_completed_journeys": {
+          "employment": 5,
+          "neighbourhood": 15
+        },
+        "utility_failures": 0
+      }
+    ],
+    "p6_traffic": {
+      "car_arrivals": 11590,
+      "directed_lanes_entered": 336,
+      "longest_blocked_egress": {
+        "idx": 180,
+        "version": 1
+      },
+      "longest_standing": [
+        {
+          "idx": 665,
+          "version": 1
+        },
+        "Car",
+        [
+          1684.028076171875,
+          831.6973876953125,
+          10.284680366516113
+        ],
+        {
+          "Lane": {
+            "idx": 222,
+            "version": 1
+          }
+        }
+      ],
+      "longest_standing_decision": [
+        {
+          "idx": 665,
+          "version": 1
+        },
+        724300,
+        {
+          "blocking_colliders": [
+            [
+              "Vehicles",
+              [
+                1688.27490234375,
+                832.7919921875
+              ]
+            ]
+          ],
+          "objective": [
+            1694.955322265625,
+            842.0034790039062,
+            10.284680366516113
+          ],
+          "speed": 0.0,
+          "speed_with_neighbours": 0.0,
+          "speed_without_neighbours": 8.570236206054688,
+          "state": "Driving"
+        }
+      ],
+      "longest_standing_elapsed_window": [
+        724300,
+        729500
+      ],
+      "max_blocking_ticks": 1200,
+      "max_standing_ticks": 5200,
+      "panicking": 0,
+      "stranded_drivers": 0
+    },
+    "p7_verdict": "archived opening report already exceeds P7's 30-game-minute standstill limit; collect same-floor traffic independently",
+    "trace": {
+      "name": "town-trace.log",
+      "start": {
+        "version": 1,
+        "calendar_tick": 576001,
+        "sample_ticks": 50,
+        "planned_ticks": 156000,
+        "workers": 1,
+        "initial_elapsed_tick": 576000
+      },
+      "opening_workload": {
+        "humans": 2703,
+        "vehicles": 2004,
+        "companies": 348,
+        "trains": 1,
+        "roads": 223
+      },
+      "summary": {
+        "elapsed_tick": 732000,
+        "calendar_tick": 732001,
+        "peak_exact_zero": 177,
+        "sampled_spillback_candidate_ticks": 1500,
+        "longest_sampled_stationary_game_minutes": 51.0,
+        "peak_stuck": 75,
+        "end_stuck": 26,
+        "driving_mode_completed": 4170,
+        "stranded_drivers_at_cutoff": 0,
+        "inferred_cycle_at_first_stuck_sample": 136
+      },
+      "sha256": "6e69216831f0f66349d2c147c16b41f9b24a376b652098436961ec9afa677d5d",
+      "watched_freeze": {
+        "vehicle": "665v1",
+        "human": "815v1",
+        "lane": "222v1",
+        "zero_start_elapsed_tick": 724350,
+        "zero_last_elapsed_tick": 729450,
+        "movement_resumed_elapsed_tick": 729500,
+        "route_destination": "workplace BuildingID(342v1)",
+        "first_road_to_park_elapsed_tick": 730650
+      }
+    }
+  },
+  "matched_cohort": {
+    "ids": [
+      "repair-cohort",
+      "repair-no-loss"
+    ],
+    "status": "populated synthetic checkpoints and offer keys; no-loss physical comparison; causal improvement pending",
+    "producer": "scenarios::traffic_repair::prepare_repair_fixture",
+    "seed": 6042,
+    "initial_elapsed_tick": 23,
+    "road_grid": {
+      "origin_xy": [400, 520],
+      "columns": 4,
+      "rows": 3,
+      "spacing_m": 260,
+      "repair_link_endpoints_xy": [[660, 780], [920, 780]]
+    },
+    "repair_command": {
+      "variant": "MapUpgradeRoad",
+      "opening_speed_m_per_s": 4,
+      "no_loss_opening_speed_m_per_s": 13,
+      "requested_speed_m_per_s": 13,
+      "no_loss_requested_speed_m_per_s": 15
+    },
+    "repair_offset_ticks": 1,
+    "primary_offset_ticks": 10600,
+    "tail_offset_ticks": 144000,
+    "person": {
+      "count": 120,
+      "directed_groups": 6,
+      "group_order": [
+        "west_to_center",
+        "west_to_east",
+        "center_to_west",
+        "center_to_east",
+        "east_to_west",
+        "east_to_center"
+      ],
+      "first_offset_ticks": 100,
+      "interval_ticks": 50
+    },
+    "freight": {
+      "count": 24,
+      "directed_groups": 2,
+      "group_order": ["west_mine_to_east_plant", "east_mine_to_west_plant"],
+      "sku": "coal",
+      "units_per_offer": 1,
+      "first_offset_ticks": 100,
+      "interval_ticks": 250
+    },
+    "od_limit_ticks": 3500,
+    "unfinished_ticks": 3501,
+    "quantile": "nearest rank, pooled separately for person and freight",
+    "improvement_pct": 10,
+    "maximum_directed_group_regression_pct": 2
+  },
+  "scale_workload": {
+    "paris": {
+      "id": "paris-frozen",
+      "people": 10000,
+      "warmup_ticks": 2000,
+      "measured_ticks": 10000,
+      "min_steps_per_second": 150
+    },
+    "layouts": [
+      "compact",
+      "growing"
+    ],
+    "target_populations": [
+      10000,
+      20000,
+      40000
+    ],
+    "comparison_workers": [
+      1,
+      8
+    ],
+    "parity_workers": [
+      1,
+      4,
+      16
+    ],
+    "current_scenario_workers": [
+      1
+    ],
+    "warmups": 2,
+    "interleaved_pairs": 3,
+    "max_paired_throughput_regression_pct": 5,
+    "max_paired_p99_increase_pct": 5,
+    "burst_workload": "freeze exact offered bursts/backlog limits on integrated parent before calibration",
+    "populated_grid_floor": [
+      {
+        "agents": 10000,
+        "minimum_employed": 5000,
+        "minimum_peak_active_vehicles": 500,
+        "compact_side": 44,
+        "growing_side": 21
+      },
+      {
+        "agents": 20000,
+        "minimum_employed": 10000,
+        "minimum_peak_active_vehicles": 1000,
+        "compact_side": 44,
+        "growing_side": 30
+      },
+      {
+        "agents": 40000,
+        "minimum_employed": 20000,
+        "minimum_peak_active_vehicles": 2000,
+        "compact_side": 44,
+        "growing_side": 42
+      }
+    ],
+    "historical_serial_paris_measurements": [
+      {
+        "member": "/var/tmp/egr/scale-m0.b4UJFG/paris-10000.json",
+        "sha256": "bf6e97aeea39444ecd4e22bf00e93a5837cb1d00b0bf5967ff09243cb74ee491",
+        "requested_agents": 10000,
+        "actual_humans": 10000,
+        "total_vehicles": 7042,
+        "employed": 5500.0,
+        "workers": 1,
+        "warmup_ticks": 2000,
+        "measured_ticks": 3000
+      },
+      {
+        "member": "/var/tmp/egr/scale-m0.b4UJFG/paris-20000.json",
+        "sha256": "c71b5707cd5f5c16a3f2c6fe37eee29f18e14c13c4008edb22f78158384ba041",
+        "requested_agents": 20000,
+        "actual_humans": 20000,
+        "total_vehicles": 14016,
+        "employed": 11000.0,
+        "workers": 1,
+        "warmup_ticks": 2000,
+        "measured_ticks": 3000
+      },
+      {
+        "member": "/var/tmp/egr/scale-m0.b4UJFG/early-paris-38000.json",
+        "sha256": "07ddc8988275c777b9de91533f82b5acd8f248b5e8aba8a63d6246f3dcc5bf1d",
+        "requested_agents": 38000,
+        "actual_humans": 38000,
+        "total_vehicles": 26634,
+        "employed": 20900.0,
+        "workers": 1,
+        "warmup_ticks": 2000,
+        "measured_ticks": 3000
+      }
+    ],
+    "floor_count_verification": {
+      "warmup_ticks": 0,
+      "measured_ticks": 1,
+      "workers": 1,
+      "activity_gates_checked": false,
+      "source_commit": "88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7",
+      "reports": [
+        {
+          "agents": 10000,
+          "layout": "compact",
+          "grid_side": 44,
+          "initial_agents": 10000,
+          "actual_agents": 10000,
+          "companies": 550,
+          "vehicles": 7042,
+          "completed_steps": 1,
+          "peak_active_vehicles": 0,
+          "file": "workload-10000-compact.log",
+          "sha256": "12254cff8d0fb6836bf74026c80276e460db71f4262bfbdc44358e3c6b7eacd6",
+          "job_capacity": 5500
+        },
+        {
+          "agents": 10000,
+          "layout": "growing",
+          "grid_side": 21,
+          "initial_agents": 10000,
+          "actual_agents": 10000,
+          "companies": 550,
+          "vehicles": 7042,
+          "completed_steps": 1,
+          "peak_active_vehicles": 0,
+          "file": "workload-10000-growing.log",
+          "sha256": "6f7dc93f84c437f46fc86166b6d2976b561b3370de734ed348ad5bf67fd2b75c",
+          "job_capacity": 5500
+        },
+        {
+          "agents": 20000,
+          "layout": "compact",
+          "grid_side": 44,
+          "initial_agents": 20000,
+          "actual_agents": 20000,
+          "companies": 1100,
+          "vehicles": 14016,
+          "completed_steps": 1,
+          "peak_active_vehicles": 0,
+          "file": "workload-20000-compact.log",
+          "sha256": "13e61a783fc88aca492ad72aead558673f14cce643622c2803317e7998c7c43e",
+          "job_capacity": 11000
+        },
+        {
+          "agents": 20000,
+          "layout": "growing",
+          "grid_side": 30,
+          "initial_agents": 20000,
+          "actual_agents": 20000,
+          "companies": 1100,
+          "vehicles": 14016,
+          "completed_steps": 1,
+          "peak_active_vehicles": 0,
+          "file": "workload-20000-growing.log",
+          "sha256": "6bde0631f41526b6b5a81ee2006b2f847bd4674bb9be79a54d1a67ec1606eb5d",
+          "job_capacity": 11000
+        }
+      ],
+      "larger_grid_failures": {
+        "compact_40000": "terminated for shared-host memory pressure before count output",
+        "compact_40000_peak_rss_kib": 19772968,
+        "compact_40000_observed_swap_kib": 23768764,
+        "capped_runs": [
+          {
+            "layout": "growing",
+            "agents": 40000
+          },
+          {
+            "layout": "compact",
+            "agents": 38000
+          },
+          {
+            "layout": "growing",
+            "agents": 38000
+          }
+        ],
+        "virtual_memory_cap_kib": 12582912,
+        "requested_allocation_bytes": 17179869184,
+        "backtrace_file": "workload-38000-backtrace.log",
+        "backtrace_sha256": "e21f365c664c79c42fb5e4c2f766f33b114a72bb850ddafcc264c2bbfbcdc660",
+        "backtrace_path": [
+          "benchmark_layout",
+          "Map::build_house",
+          "Building::geometry",
+          "gen_exterior_house",
+          "geom::skeleton::skeleton"
+        ]
+      }
+    }
+  },
+  "stock_slots": {
+    "osm-lesce-stress": {
+      "producer_commit": "88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7",
+      "revision": "bf46f86aeb9e79c8a82b91e4f842335e",
+      "snapshot_sha256": "80c7062260bc7ba86fb9f5a51edef4e4773952d2f8a317e7c236e5528b9ce2ee",
+      "metadata_sha256": "73e55e3483e2ca34dba4e62690d265928bacf293ec29b2d5a7343a4d35818fb4",
+      "calendar_tick": 1048,
+      "snapshot_schema": "0.10.0",
+      "replay_sha256": null,
+      "build_profile": "release",
+      "features": [],
+      "trace": {
+        "name": "osm-trace.log",
+        "start": {
+          "version": 1,
+          "calendar_tick": 1048,
+          "sample_ticks": 50,
+          "planned_ticks": 72000,
+          "workers": 1,
+          "initial_elapsed_tick": 1047
+        },
+        "opening_workload": {
+          "humans": 2903,
+          "vehicles": 2077,
+          "companies": 206,
+          "trains": 1,
+          "roads": 963
+        },
+        "summary": {
+          "elapsed_tick": 73047,
+          "calendar_tick": 73048,
+          "peak_exact_zero": 607,
+          "sampled_spillback_candidate_ticks": 66150,
+          "longest_sampled_stationary_game_minutes": 479.5,
+          "peak_stuck": 433,
+          "end_stuck": 184,
+          "driving_mode_completed": 1557,
+          "stranded_drivers_at_cutoff": 0,
+          "inferred_cycle_at_first_stuck_sample": 35
+        },
+        "sha256": "07a7a138429fd49291568dae87ca1a9790e40b9603b5bb4844bff106838d3992"
+      },
+      "role": "legacy OSM stress, outside nominal release gates",
+      "report_sha256": "569db643b86445f4d53b15578f67662f017745c3b2c7cb057472ca85f5d4ca57",
+      "input_sha256": "ba6bf6be50435cd00402f024f60adfafef6dbf8851ca5768c1beb322612150db",
+      "snapshot_source": "fresh normal OSM import on the floor",
+      "incident": "continuous sampled outgoing occupancy on junction 598v1, movement 267v1 → 273v1",
+      "full_import_check": "ran through eight reported game hours, including freight round trip; stopped before full import gate"
+    },
+    "showcase-release": {
+      "producer_commit": "a86ba8a0f48daa485c2896c6e2d4326bf4f69044",
+      "revision": "f727b68649880148eef7ad94c813a743",
+      "snapshot_sha256": "fff2ec650865a245ad203eb9da20513988b85af2767e5d4b022f2753917a844a",
+      "metadata_sha256": "1bffd8253efeaf9ef797aa6b516d53f12851864157888552c503520fcba3f36c",
+      "calendar_tick": 480001,
+      "snapshot_schema": "0.10.0",
+      "replay_sha256": null,
+      "build_profile": "release",
+      "features": [],
+      "trace": {
+        "name": "showcase-trace.log",
+        "start": {
+          "version": 1,
+          "calendar_tick": 480001,
+          "sample_ticks": 50,
+          "planned_ticks": 72000,
+          "workers": 1,
+          "initial_elapsed_tick": 480000
+        },
+        "opening_workload": {
+          "humans": 878,
+          "vehicles": 660,
+          "companies": 84,
+          "trains": 1,
+          "roads": 150
+        },
+        "summary": {
+          "elapsed_tick": 552000,
+          "calendar_tick": 552001,
+          "peak_exact_zero": 111,
+          "sampled_spillback_candidate_ticks": 600,
+          "longest_sampled_stationary_game_minutes": 42.5,
+          "peak_stuck": 57,
+          "end_stuck": 0,
+          "driving_mode_completed": 702,
+          "stranded_drivers_at_cutoff": 0,
+          "inferred_cycle_at_first_stuck_sample": 1
+        },
+        "sha256": "ac33c4289dddb76f53bb8370eed3b43d9829ffffa69acfcf98787e72fffc3dfe"
+      },
+      "role": "historical published demo control; frozen bytes",
+      "release_eligible": false,
+      "release_pending": "schema-matched Showcase slot",
+      "source_root": "/var/tmp/egr/freight2-confirm.7ZTsvN/demo-slots",
+      "opening_report_sha256": "83e7c7daa6d1afaad1c1f52ce077d0dd5a4cc4de8fc9970442724cf829771b53",
+      "commissioning": {
+        "population": 878,
+        "unserved_buildings": 0,
+        "completed_bus_trips": 545,
+        "bus_count": 10
+      },
+      "incident": "cycle candidate from car 216v1 on lane 81v1 at elapsed tick 504150; clears by cutoff"
+    }
+  },
+  "stock_trace_schema": {
+    "version": 1,
+    "samples": "50 elapsed ticks; 0.1 m/s and 0.5 m standing thresholds; exact zero counted separately",
+    "cycle": "positionally inferred leader graph; candidate only",
+    "spillback": "sampled downstream occupant plus upstream turn request with a permissive observation; no between-sample clearance oracle",
+    "braking": "desired speeds with and without neighbours and individually attributable collider positions; evaluated on a vehicle copy",
+    "cycle_detail_verification": {
+      "probe_sha256": "535edfe94ae22b98877328507fca38b293cda17b646f71781158336ae6f87167",
+      "runs": [
+        {
+          "fixture": "osm-lesce-stress",
+          "file": "osm-cycle.log",
+          "sha256": "1f58c2f504e7c632c3192d5c2ef1675b9af09cdb7adf2505a4bb1f54d2a73822",
+          "start": 1047,
+          "end": 16047,
+          "emitted_candidate_edge_lists": 7
+        },
+        {
+          "fixture": "lesce-release",
+          "file": "town-cycle.log",
+          "sha256": "deb2642f22805089e05514101bfe5d38f32005a215ba1fd86b521ed9c3fa4561",
+          "start": 576000,
+          "end": 588000,
+          "emitted_candidate_edge_lists": 9
+        },
+        {
+          "fixture": "showcase-release",
+          "file": "showcase-cycle.log",
+          "sha256": "252bcc6775af5d11c8eed71f6998940050e0b475bf749b1e0b15002a51779a60",
+          "start": 480000,
+          "end": 510000,
+          "emitted_candidate_edge_lists": 1
+        }
+      ]
+    }
+  },
+  "test_inventory": "p7_wave0_tests.md",
+  "canonical_json": "SHA-256 of compact sorted-key UTF-8 JSON for the embedded schedule and opening manifest; raw-byte SHA-256 for files"
+}

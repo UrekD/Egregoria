@@ -331,3 +331,94 @@ fn land_receipts_keep_local_command_indices_across_catch_up_frames() {
         [(4, 2, 2), (4, 3, 2)]
     );
 }
+
+#[cfg(all(test, feature = "multiplayer"))]
+#[test]
+fn p7_ingress_carries_real_road_commands_and_rejects_oversized_frames() {
+    use common::saveload::{Bincode, Encoder};
+    use networking::{
+        Client, ConnectConf, Frame, PollResult, Server, ServerConfiguration, ServerPollResult,
+    };
+    use simulation::map::road_edit::{RoadEditStamp, RoadQuote, RoadUpgrade};
+    use simulation::map::{LaneKind, LanePatternBuilder, RoadID};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::time::{Duration, Instant};
+
+    let zero = Bincode::encode(&0u64).unwrap();
+    let road_upgrade = |change| WorldCommand::MapUpgradeRoad {
+        road: RoadID::default(),
+        expected: Bincode::decode::<RoadEditStamp>(&zero).unwrap(),
+        change,
+        quote: Bincode::decode::<RoadQuote>(&zero).unwrap(),
+    };
+    let pattern = LanePatternBuilder::new().speed_limit(13.0).build();
+    let command = road_upgrade(RoadUpgrade::Replace(pattern.clone()));
+    let check_wire = |commands| {
+        let bytes = Bincode::encode(&WorldCommands::from(commands)).unwrap();
+        Bincode::decode::<WorldCommands>(&bytes)
+    };
+    let excessive = (0..257).map(|_| command.clone()).collect::<Vec<_>>();
+    let mut overwide = pattern;
+    overwide.lanes_forward = vec![(LaneKind::Driving, 13.0); 33];
+    assert!(check_wire(vec![road_upgrade(RoadUpgrade::Replace(overwide))]).is_err());
+
+    let release = include_str!("../../VERSION");
+    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut frame = Frame(0);
+    let mut server = Server::<u64, WorldCommands>::start(ServerConfiguration {
+        start_frame: frame,
+        period: Duration::from_millis(20),
+        port: Some(port),
+        virtual_client: None,
+        version: release.into(),
+        always_run: false,
+    })
+    .unwrap();
+    let mut client = Client::<u64, WorldCommands>::connect(ConnectConf {
+        name: "road-editor".into(),
+        addr: Ipv4Addr::LOCALHOST.into(),
+        port: Some(port),
+        frame_buffer_advance: 3,
+        version: release.into(),
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut got_world = false;
+    loop {
+        assert!(
+            Instant::now() < deadline,
+            "the server did not consume the road edit"
+        );
+        if let ServerPollResult::Input(frames) = server.poll(&19, frame, None) {
+            for input in frames {
+                frame = input.frame;
+                if let Some(received) = input
+                    .inputs
+                    .iter()
+                    .find(|input| !input.inp.as_ref().is_empty())
+                {
+                    assert!(got_world);
+                    assert_eq!(
+                        Bincode::encode(&received.inp).unwrap(),
+                        Bincode::encode(&WorldCommands::from(vec![command.clone()])).unwrap(),
+                    );
+                    assert!(check_wire(excessive).is_err());
+                    return;
+                }
+            }
+        }
+        match client.poll(WorldCommands::from(vec![command.clone()])) {
+            PollResult::GameWorld(_, value) => {
+                assert_eq!(value, 19);
+                got_world = true;
+            }
+            PollResult::Disconnect(reason) => panic!("{reason}"),
+            PollResult::Wait(_) | PollResult::Input(_) => {}
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}

@@ -13,7 +13,7 @@ use crate::souls::freight_station::FreightTrainState;
 use crate::souls::human::HumanDecisionKind;
 use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::{spawn_parked_vehicle, unpark, Location, VehicleKind, VehicleState};
-use crate::utils::replay::ReplayJson;
+use crate::utils::replay::{replay_version, ReplayJson};
 use crate::world_command::{CommandOutcomes, Rejection};
 use crate::{
     NewGameOptions, Replay, SaveHeader, SaveLoadError, Simulation, SimulationOptions,
@@ -1224,7 +1224,8 @@ fn disk_load_rejects_a_truncated_save_version() {
 
 #[test]
 fn p1_spine_replay_rejects_wrong_version_before_command_decode() {
-    for version in ["0.0.0", VERSION] {
+    let current = replay_version();
+    for version in ["0.0.0", VERSION, current.as_str()] {
         let json = format!(
             r#"{{"commands":[[1,"UnknownCommand"]],"enabled":true,"last_tick_recorded":1,"version":{version:?}}}"#
         );
@@ -1233,7 +1234,7 @@ fn p1_spine_replay_rejects_wrong_version_before_command_decode() {
             .to_string();
         assert_eq!(
             error.contains("Replay has version"),
-            version != VERSION,
+            version != current,
             "{error}"
         );
     }
@@ -1287,8 +1288,9 @@ fn disk_load_rejects_wrong_version_missing_resources_and_bad_resource_bytes() {
 
 #[test]
 fn replay_load_rejects_missing_or_mismatched_version() {
-    drop(TestCtx::new());
+    let _test = TestCtx::new();
     let registry = prototypes::prototypes().fingerprint();
+    let current = replay_version();
     for (variant, bytes) in [
         (
             "legacy",
@@ -1299,9 +1301,15 @@ fn replay_load_rejects_missing_or_mismatched_version() {
             r#"{"version":"0.0","enabled":true,"commands":[],"last_tick_recorded":0}"#.to_owned(),
         ),
         (
-            "current",
+            "same-release",
             format!(
                 r#"{{"version":{VERSION:?},"registry":{registry},"enabled":true,"commands":[],"last_tick_recorded":0}}"#
+            ),
+        ),
+        (
+            "current",
+            format!(
+                r#"{{"version":{current:?},"registry":{registry},"enabled":true,"commands":[],"last_tick_recorded":0}}"#
             ),
         ),
     ] {
