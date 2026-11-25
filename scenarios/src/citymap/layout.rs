@@ -1252,6 +1252,11 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) {
                 (1480., 1190.),
             ][..],
         ),
+        (
+            "employment",
+            0..2,
+            &[(2230., 2070.), (2300., 1940.), (2460., 1890.)][..],
+        ),
     ] {
         let area = plan
             .districts

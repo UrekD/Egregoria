@@ -321,25 +321,22 @@ fn prepare_opening(
         .ok_or("no dry park site on the far-bank parkway")?;
         sites.insert("sava/far-bank-park".into(), park);
 
-        // Claim real retail frontage inside the employment district before
-        // other facilities and parcel reservations occupy its large sites.
-        let employment = plan
-            .districts
-            .iter()
-            .find(|district| district.key == "employment")
-            .unwrap();
-        let anchor = at(2530.0, 2400.0);
-        let (store, _) =
-            place_scored_company(sim, plan, &roads, "supermarket", |map, road, footprint| {
+        // Reserve the staffed, town-facing employment entrance and the
+        // southern shopping pocket before filling their residential frontage.
+        for (key, anchor) in [
+            ("employment", at(2350.0, 1960.0)),
+            ("south", at(2514.0, 1033.0)),
+        ] {
+            let district = plan.districts.iter().find(|district| district.key == key).unwrap();
+            let (store, _) = place_scored_company(sim, plan, &roads, "supermarket", |map, road, footprint| {
                 let center = footprint.center();
-                (contains(&employment.polygon, center)
-                    && map.roads()[road]
-                        .lanes_iter()
-                        .any(|(_, kind)| kind == LaneKind::Parking))
-                .then(|| center.distance2(anchor))
+                (contains(&district.polygon, center)
+                    && map.roads()[road].lanes_iter().any(|(_, kind)| kind == LaneKind::Parking))
+                    .then(|| center.distance2(anchor))
             })?
-            .ok_or("no supermarket frontage in the employment district")?;
-        sites.insert("employment/supermarket".into(), store);
+            .ok_or_else(|| format!("no supermarket frontage in the {key} district"))?;
+            sites.insert(format!("{key}/supermarket"), store);
+        }
     }
     // Use the frontage between South and West so mine drivers can reach work
     // and deliver fuel without competing for the terminal's delivery fleet.
@@ -522,7 +519,7 @@ fn prepare_opening(
         ("west", 1350.0, 1840.0),
         ("employment", 2530.0, 2400.0),
     ] {
-        if wet && district == "employment" {
+        if wet && matches!(district, "employment" | "south") {
             continue;
         }
         let store = place_company_around_parcels(sim, "supermarket", at(x, y), Some(district))?;
@@ -4056,6 +4053,9 @@ mod tests {
             .unwrap();
         let store = &map.buildings()[opening.sites["employment/supermarket"]];
         assert!(contains(&employment.polygon, store.obb.center()));
+        let entry = super::super::layout::design_point(vec2(2350.0, 1960.0), plan.config);
+        assert!(store.obb.center().distance(entry) <= 100.0,
+            "the employment supermarket should fit within 100 m of the staffed town-facing frontage");
         drop(map);
         paint(&mut sim, opening.parcels.iter()).unwrap();
         verify_votes(&sim, opening.parcels.iter()).unwrap();
