@@ -105,6 +105,14 @@ const ALPSKA_WEST_JUNCTION: SourceKey = SourceKey::Node {
     id: 862116385,
     rail: false,
 };
+const SOUTHEAST_STUB: SourceKey = SourceKey::Way {
+    id: 168886779,
+    span: 0,
+};
+const SOUTHEAST_DEAD_END: SourceKey = SourceKey::Node {
+    id: 11951438144,
+    rail: false,
+};
 
 pub fn plan_town(
     inputs: &PinnedInputs,
@@ -205,6 +213,27 @@ pub fn plan_town(
             graph.record(
                 "use surrounding crossings for the Alpska underpass west approach",
                 &[ALPSKA_WEST_JUNCTION],
+            );
+        }
+    }
+    if graph
+        .links
+        .values()
+        .filter(|link| link.endpoints.contains(&SOUTHEAST_DEAD_END))
+        .count()
+        == 1
+    {
+        if let Some(stub) = graph
+            .links
+            .get_mut(&SOUTHEAST_STUB)
+            .filter(|link| link.endpoints.contains(&SOUTHEAST_DEAD_END))
+        {
+            // Commuters were using the stub as a U-turn, spilling back into
+            // its junction and trapping cars that parked on the short road.
+            stub.class = RoadClass::Walk;
+            graph.record(
+                "keep the southeast turnaround as a walking path",
+                &[SOUTHEAST_STUB],
             );
         }
     }
@@ -1223,6 +1252,29 @@ fn districts(config: TownConfig) -> Vec<District> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cm2_layout_keeps_the_southeast_stub_walkable_without_vehicle_egress() {
+        use crate::citymap::{
+            build_dry_town, read_inputs, SourcePaths, DEFAULT_LESCE, DEFAULT_SAVA,
+        };
+        use simulation::map::LaneKind;
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let (sim, built) = build_dry_town(&plan).unwrap();
+        let map = sim.map();
+        let lanes: Vec<_> = map.roads()[built.links[&SOUTHEAST_STUB].road]
+            .lanes_iter()
+            .collect();
+        assert!(lanes.iter().any(|(_, kind)| *kind == LaneKind::Walking));
+        assert!(lanes.iter().all(|(_, kind)| *kind == LaneKind::Walking));
+    }
 
     #[test]
     fn cm2_layout_routes_around_alpska_crosswalk() {

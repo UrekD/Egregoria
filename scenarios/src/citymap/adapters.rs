@@ -56,15 +56,7 @@ pub(super) fn frontage_roads(plan: &TownPlan, built: &BuiltNetwork) -> BTreeSet<
     built
         .links
         .iter()
-        .filter_map(|(key, span)| {
-            // Preserve the short southeast cul-de-sac as local access. New
-            // housing and freight there would share its single exit and U-turn.
-            let southeast_stub = super::SourceKey::Way {
-                id: 168886779,
-                span: 0,
-            };
-            (plan.graph.links[key].frontage() && *key != southeast_stub).then_some(span.road)
-        })
+        .filter_map(|(key, span)| plan.graph.links[key].frontage().then_some(span.road))
         .collect()
 }
 
