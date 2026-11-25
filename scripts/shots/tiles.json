@@ -8,6 +8,7 @@
   {"WaitFrames": 3},
   {"Screenshot": "01-frontier-not-owned"},
   {"Key": {"key": "LandTiles", "down": true}},
+  {"WaitFrames": 3},
   {"Key": {"key": "LandTiles", "down": false}},
   {"Assert": {"LandTiles": {
     "tick": 1,

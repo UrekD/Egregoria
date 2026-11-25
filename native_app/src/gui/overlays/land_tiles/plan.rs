@@ -1,7 +1,7 @@
 use std::{collections::BTreeSet, rc::Rc};
 
 use simulation::map::{
-    LandTileId, LaneKind, Map, ProjectKind, TileExtent, TileStatus, LAND_TILE_SIZE,
+    LandTileId, LaneKind, Map, ProjectKind, Road, TileExtent, TileStatus, LAND_TILE_SIZE,
 };
 use yakui::{
     event::{EventInterest, EventResponse, WidgetEvent},
@@ -13,6 +13,7 @@ use yakui::{
 
 const MAX_PLAN_SIDE: f32 = 440.0;
 const MAX_ROAD_SEGMENTS: usize = 8_192;
+const MAX_APPROACH_MARKERS: usize = 256;
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PlanTransform {
@@ -36,8 +37,8 @@ impl PlanTransform {
         }
         let tile = point / self.pitch();
         Some(LandTileId {
-            x: tile.x as u16,
-            y: self.extent.height - 1 - tile.y as u16,
+            x: (tile.x as u16).min(self.extent.width - 1),
+            y: self.extent.height - 1 - (tile.y as u16).min(self.extent.height - 1),
         })
     }
 
@@ -122,44 +123,22 @@ impl MapGeometry {
             }
         }
 
-        let mut routes = Vec::new();
+        let mut roads = Vec::new();
+        let mut rail = Vec::new();
+        let mut protected_routes = Vec::new();
         let mut approaches = Vec::new();
         let mut marked = BTreeSet::new();
-        // Keep a bounded, even sample of city roads and always include the
-        // reserved trunks. Geometry is simplified in map coordinates.
-        let stride = map.roads().len().div_ceil(MAX_ROAD_SEGMENTS / 8).max(1);
-        for (i, road) in map.roads().values().enumerate() {
+        for road in map.roads().values() {
             let protected = land.is_protected(ProjectKind::Road(road.id));
-            if !protected && i % stride != 0 {
-                continue;
-            }
-            let rail = road.lanes_iter().any(|(_, kind)| kind == LaneKind::Rail);
-            let (color, width) = if protected {
-                (PROTECTED, 2.3)
-            } else if rail {
-                (RAIL, 1.7)
+            let is_rail = road.lanes_iter().any(|(_, kind)| kind == LaneKind::Rail);
+            if protected {
+                protected_routes.push((road, is_rail));
+            } else if is_rail {
+                rail.push((road, false));
             } else {
-                (ROAD, 1.2)
-            };
-            let points = road.points().as_slice();
-            if let Some((first, rest)) = points.split_first() {
-                let stride = rest.len().div_ceil(if protected { 32 } else { 8 }).max(1);
-                let mut from = world_point(first.xy());
-                for to in rest.chunks(stride).filter_map(|chunk| chunk.last()) {
-                    let to = world_point(to.xy());
-                    if from.distance_squared(to) > f32::EPSILON {
-                        routes.push(RouteSegment {
-                            from,
-                            to,
-                            color,
-                            width,
-                            rail_core: rail && protected,
-                        });
-                    }
-                    from = to;
-                }
+                roads.push((road, false));
             }
-            if !protected && road.has_sidewalks() {
+            if !protected && road.has_sidewalks() && approaches.len() < MAX_APPROACH_MARKERS {
                 for junction in [road.src, road.dst] {
                     if !land.is_protected(ProjectKind::Intersection(junction))
                         && marked.insert(junction)
@@ -171,8 +150,19 @@ impl MapGeometry {
                 }
             }
         }
-        // Draw the protected trunk above intersecting routes.
-        routes.sort_by_key(|route| route.color == PROTECTED);
+        // Draw the protected trunk above intersecting routes. Its share includes
+        // the second stroke drawn down the center of protected rail segments.
+        let mut routes = Vec::new();
+        append_routes(&mut routes, &roads, MAX_ROAD_SEGMENTS / 2, 8, ROAD, 1.2);
+        append_routes(&mut routes, &rail, MAX_ROAD_SEGMENTS / 4, 8, RAIL, 1.7);
+        append_routes(
+            &mut routes,
+            &protected_routes,
+            MAX_ROAD_SEGMENTS / 8,
+            32,
+            PROTECTED,
+            2.3,
+        );
         Self {
             extent,
             water,
@@ -187,6 +177,43 @@ impl MapGeometry {
             .iter()
             .filter(|point| point.cmpge(corner).all() && point.cmplt(corner + Vec2::ONE).all())
             .count()
+    }
+}
+
+fn append_routes(
+    routes: &mut Vec<RouteSegment>,
+    roads: &[(&Road, bool)],
+    budget: usize,
+    detail: usize,
+    color: Color,
+    width: f32,
+) {
+    let count = roads.len().min(budget);
+    if count == 0 {
+        return;
+    }
+    let per_road = (budget / count).min(detail);
+    for i in 0..count {
+        let (road, rail_core) = roads[i * roads.len() / count];
+        let Some((first, rest)) = road.points().as_slice().split_first() else {
+            continue;
+        };
+        let stride = rest.len().div_ceil(per_road).max(1);
+        let world_point = |p: geom::Vec3| Vec2::new(p.x, p.y) / LAND_TILE_SIZE;
+        let mut from = world_point(*first);
+        for to in rest.chunks(stride).filter_map(|chunk| chunk.last()) {
+            let to = world_point(*to);
+            if from.distance_squared(to) > f32::EPSILON {
+                routes.push(RouteSegment {
+                    from,
+                    to,
+                    color,
+                    width,
+                    rail_core,
+                });
+            }
+            from = to;
+        }
     }
 }
 

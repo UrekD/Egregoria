@@ -71,6 +71,15 @@ impl PendingPurchase {
 }
 
 impl LandTilesUi {
+    fn sync_generation(&mut self, generation: u64) {
+        if self.generation != generation {
+            *self = Self {
+                generation,
+                ..Default::default()
+            };
+        }
+    }
+
     pub(crate) fn script_state(
         &self,
         sim: &Simulation,
@@ -113,7 +122,11 @@ impl LandTilesUi {
     }
 
     fn submit(&mut self, uiw: &UiWorld, sim: &Simulation, tile: LandTileId, price: Money) {
-        if self.pending.is_some() || !uiw.can_author() || !session::world_interaction(uiw) {
+        if self.pending.is_some()
+            || !crate::network::is_singleplayer(uiw)
+            || !uiw.can_author()
+            || !session::world_interaction(uiw)
+        {
             return;
         }
         if self.confirmation != Some(price) {
@@ -197,7 +210,12 @@ pub(crate) fn open(uiw: &UiWorld) {
     *uiw.write::<PlacementPreview>() = PlacementPreview::default();
     *uiw.write::<crate::gui::toolbox::transit::TransitTools>() = Default::default();
     *uiw.write::<crate::gui::zoneedit::ZoneEditState>() = Default::default();
-    uiw.write::<InputMap>().reset_world_input();
+    let mut input = uiw.write::<InputMap>();
+    let shortcut_held = input.act.contains(&InputAction::OpenLandTiles);
+    input.reset_world_input();
+    if shortcut_held {
+        input.act.insert(InputAction::OpenLandTiles);
+    }
 }
 
 pub(crate) fn toolbar(uiw: &UiWorld, sim: &Simulation) {
@@ -232,7 +250,9 @@ pub(crate) fn shortcut(uiw: &UiWorld, sim: &Simulation) -> bool {
 }
 
 pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
+    let generation = uiw.read::<SessionState>().generation;
     let mut state = uiw.write::<LandTilesUi>();
+    state.sync_generation(generation);
     if !*opened {
         state.confirmation = None;
         return;
@@ -277,9 +297,6 @@ pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
             statuses
         }
     };
-    let generation = uiw.read::<SessionState>().generation;
-    debug_assert_eq!(state.generation, generation);
-
     Window {
         title: "Land Tiles".into(),
         pad: Pad::all(14.0),
@@ -289,6 +306,9 @@ pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
     }
     .show(|| {
         let color = goryak::on_primary_container();
+        if !crate::network::is_singleplayer(uiw) {
+            textc(color, "Land tile purchases are unavailable in multiplayer.");
+        }
         minrow(13.0, || {
             swatch(color, TileStatus::Owned, "Owned");
             swatch(color, TileStatus::Buyable, "Available");
@@ -409,7 +429,9 @@ fn tile_details(
         state.confirmation = None;
         textc(error(), "The quote changed. Review the current terms.");
     }
-    if let Some(price) = price.filter(|_| state.pending.is_none()) {
+    if let Some(price) =
+        price.filter(|_| state.pending.is_none() && crate::network::is_singleplayer(uiw))
+    {
         if uiw.can_author() {
             let button = if state.confirmation == Some(price) {
                 format!("Confirm purchase · {price}")
@@ -501,10 +523,13 @@ pub(crate) fn show_unowned_hover(sim: &Simulation, uiw: &UiWorld) {
     else {
         return;
     };
-    *uiw.write::<ErrorTooltip>() = ErrorTooltip::new(format!(
-        "{} is not owned. Open Land Tiles to expand.",
-        tile_name(tile)
-    ));
+    let mut tooltip = uiw.write::<ErrorTooltip>();
+    if tooltip.msg.is_none() {
+        *tooltip = ErrorTooltip::new(format!(
+            "{} is not owned. Open Land Tiles to expand.",
+            tile_name(tile)
+        ));
+    }
     let Some(bounds) = land.tile_bounds(tile) else {
         return;
     };

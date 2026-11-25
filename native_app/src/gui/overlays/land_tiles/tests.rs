@@ -147,3 +147,90 @@ fn land_tiles_confirmation_respects_backpressure_and_waits_for_authority() {
     );
     assert!(purchase_error(Rejection::Locked { milestone: 1 }).contains("100 residents"));
 }
+
+#[test]
+fn land_tiles_hit_test_last_representable_point() {
+    for (width, height) in [(19, 19), (18, 17), (17, 18)] {
+        let plan = PlanTransform::new(TileExtent { width, height }, Vec2::splat(440.0));
+        let inside = Vec2::new(
+            f32::from_bits(plan.size.x.to_bits() - 1),
+            f32::from_bits(plan.size.y.to_bits() - 1),
+        );
+        assert_eq!(
+            plan.tile_at(inside),
+            Some(LandTileId { x: width - 1, y: 0 })
+        );
+        assert_eq!(plan.tile_at(Vec2::new(plan.size.x, inside.y)), None);
+        assert_eq!(plan.tile_at(Vec2::new(inside.x, plan.size.y)), None);
+    }
+}
+
+#[test]
+fn land_tiles_open_preserves_the_held_shortcut() {
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let uiw = UiWorld::with_defaults();
+    let mut physical = engine::InputContext::default();
+    physical.keyboard.pressed.insert(engine::Key::c("L"));
+    let prepare = || uiw.write::<InputMap>().prepare_frame(&physical, true, true);
+    uiw.write::<InputMap>()
+        .build_input_tree(&mut uiw.write::<Bindings>());
+    prepare();
+    assert!(uiw
+        .read::<InputMap>()
+        .just_act
+        .contains(&InputAction::OpenLandTiles));
+    open(&uiw);
+    prepare();
+    assert!(!uiw
+        .read::<InputMap>()
+        .just_act
+        .contains(&InputAction::OpenLandTiles));
+}
+
+fn native_fixture() -> Simulation {
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    Simulation::new_game(&simulation::NewGameOptions {
+        preset: simulation::MapPreset::Flat,
+        land_mode: simulation::map::LandMode::Tiled,
+        terrain_chunks: 17,
+        progression: ProgressionMode::FreeBuild,
+        ..simulation::NewGameOptions::default()
+    })
+    .unwrap()
+}
+
+#[test]
+fn land_tiles_point_hint_preserves_specific_tool_error() {
+    let sim = native_fixture();
+    let uiw = UiWorld::with_defaults();
+    *uiw.write::<Tool>() = Tool::Terraforming;
+    uiw.write::<InputMap>().unprojected = Some(vec2(4700.0, 4200.0).z(0.0));
+    *uiw.write::<ErrorTooltip>() = ErrorTooltip::new("Reserved footprint");
+    show_unowned_hover(&sim, &uiw);
+    assert_eq!(
+        uiw.read::<ErrorTooltip>().msg.as_deref(),
+        Some("Reserved footprint")
+    );
+}
+
+#[test]
+fn land_tiles_generation_change_clears_stale_pending_purchase() {
+    let tile = LandTileId { x: 9, y: 8 };
+    let mut state = LandTilesUi {
+        generation: 3,
+        selected: Some(tile),
+        pending: Some(PendingPurchase {
+            generation: 3,
+            after_sequence: 7,
+            command_index: 0,
+            tile,
+            batch: None,
+        }),
+        ..Default::default()
+    };
+    state.sync_generation(4);
+    assert_eq!(state.generation, 4);
+    assert!(state.selected.is_none() && state.pending.is_none() && state.receipt.is_none());
+}
