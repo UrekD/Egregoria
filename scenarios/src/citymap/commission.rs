@@ -2062,6 +2062,8 @@ struct FreightEvidence {
     observed_unload: bool,
     #[serde(skip)]
     was_loading: bool,
+    #[serde(skip)]
+    was_returning: bool,
 }
 
 impl FreightEvidence {
@@ -2093,7 +2095,12 @@ impl FreightEvidence {
         if self.observed_unload && stock < self.previous_stock {
             self.dispatched_units_lower_bound += self.previous_stock - stock;
         }
-        if self.observed_unload && state.is_none() {
+        // A free train can be assigned another trip in the same tick it
+        // reaches the market. Either state can follow a completed return leg.
+        if self.observed_unload
+            && self.was_returning
+            && matches!(state, None | Some(FreightTrainState::Arriving))
+        {
             let map = sim.map();
             if let Some(market) = map.get(freight.market) {
                 if world.trains.get(freight.train).is_some_and(|train| {
@@ -2106,6 +2113,7 @@ impl FreightEvidence {
         }
         self.previous_stock = stock;
         self.was_loading = loading;
+        self.was_returning = matches!(state, Some(FreightTrainState::Moving));
     }
 }
 
@@ -2502,6 +2510,58 @@ mod tests {
         assert!(!freight_delivered(2, 0, 2, true));
         assert!(!freight_delivered(2, 2, 0, true));
         assert!(!freight_delivered(2, 2, 2, false));
+    }
+
+    #[test]
+    fn cm2_gate_counts_a_return_when_the_train_is_immediately_reassigned() {
+        use crate::citymap::{
+            build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,
+            DEFAULT_LESCE, DEFAULT_SAVA,
+        };
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let (mut sim, built) = build_dry_town(&plan).unwrap();
+        let roads = frontage_roads(&plan, &built);
+        let (terminal, market, train, market_lane, market_offset, _) =
+            place_freight(&mut sim, &plan, &built, &roads).unwrap();
+        advance(&mut sim, &mut Simulation::schedule(), 1);
+        let station = sim.world().freight_stations.keys().next().unwrap();
+        let freight = Freight {
+            terminal,
+            station,
+            market,
+            train,
+            market_lane,
+            market_offset,
+            buyer: terminal,
+            item: "flour",
+        };
+        let market_center = sim.map().buildings()[market].obb.center();
+        sim.world_mut_unchecked().trains[train].trans.pos = market_center.z(18.0);
+        let mut evidence = FreightEvidence {
+            observed_unload: true,
+            ..FreightEvidence::default()
+        };
+        for state in [FreightTrainState::Moving, FreightTrainState::Arriving] {
+            sim.world_mut_unchecked().freight_stations[station]
+                .f
+                .trains
+                .push((train, state));
+            evidence.observe(&sim, &freight);
+            sim.world_mut_unchecked().freight_stations[station]
+                .f
+                .trains
+                .clear();
+        }
+        assert_eq!(evidence.train_returns_after_unload, 1);
+        evidence.observe(&sim, &freight);
+        assert_eq!(evidence.train_returns_after_unload, 1);
     }
 
     #[test]
