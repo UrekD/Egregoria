@@ -496,7 +496,7 @@ impl Lot {
                 let shape = &map.lots[id].shape;
                 road_shape
                     .intersects(&Polygon::from(shape.corners.as_slice()))
-                    .then_some(object)
+                    .then_some(id)
             })
             .collect();
 
@@ -508,16 +508,15 @@ impl Lot {
             map.spatial_map.update(junction);
             to_remove.extend(
                 map.spatial_map
-                    .query(junction.bcircle(), ProjectFilter::LOT),
+                    .query(junction.bcircle(), ProjectFilter::LOT)
+                    .filter_map(ProjectKind::to_lot),
             );
         }
 
-        for lot in to_remove {
-            if let ProjectKind::Lot(lot) = lot {
-                map.remove_lot_record(lot);
-                map.spatial_map.remove(lot);
-            }
+        for &lot in &to_remove {
+            map.remove_lot_record(lot);
         }
+        map.spatial_map.remove_lots(to_remove);
     }
 }
 
@@ -671,6 +670,56 @@ mod water_tests {
     use super::*;
     use crate::map::{Environment, LanePatternBuilder, MapProject};
     use geom::vec2;
+
+    #[test]
+    fn harden1_dense_lot_clearance_is_batched_and_budgeted() {
+        const LOT_COUNT: usize = 10_000;
+        let mut environment = Environment::new(2, 1);
+        environment
+            .fill_lake(&Polygon::centered_rect(vec2(768.0, 256.0), 32.0, 32.0), 0, 1.0)
+            .unwrap();
+        let mut map = Map::empty();
+        assert!(map.install_environment(environment));
+        let pattern = LanePatternBuilder {
+            rail: true,
+            ..Default::default()
+        }
+        .build();
+        let ground = |x, y| MapProject::ground(vec2(x, y).z0());
+        let (_, parent) = map
+            .make_connection(ground(75.0, 300.0), ground(175.0, 300.0), None, &pattern)
+            .unwrap();
+        let shape = OBB::new(vec2(125.0, 125.0), Vec2::X, 2.0, 2.0);
+        for _ in 0..LOT_COUNT {
+            Lot::insert(&mut map, parent, shape, 0.0);
+        }
+        let survivor = Lot::insert(
+            &mut map,
+            parent,
+            OBB::new(vec2(145.0, 147.0), Vec2::X, 2.0, 2.0),
+            0.0,
+        );
+        // This covers the existing cell scans and geometry tests, with no room
+        // left for scanning the populated cell during removal.
+        let mut work = 3 + 2 * (LOT_COUNT + 1) + 4 * LOT_COUNT;
+        let reservation = map
+            .spatial_map
+            .reserve_lot_query(shape.bbox(), 4, 0, 0, &mut work);
+
+        let start = std::time::Instant::now();
+        let (from, to) = (ground(75.0, 125.0), ground(175.0, 125.0));
+        map.preview_connection(from, to, None, &pattern).unwrap();
+        map.try_connect(from, to, None, &pattern).unwrap();
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(map.lots.keys().collect::<Vec<_>>(), [survivor]);
+        assert!(map.spatial_map.contains(survivor));
+        assert!(map
+            .spatial_map
+            .query(shape, ProjectFilter::LOT)
+            .next()
+            .is_none());
+        assert_eq!(reservation, Err(WaterEditError::Limit));
+    }
 
     #[test]
     fn w2b_zs_prepared_growable_rechecks_dry_frontage() {

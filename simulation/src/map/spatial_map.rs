@@ -2,8 +2,11 @@ use crate::map::{
     spend_water_work, Building, BuildingID, CanonicalPosition, Intersection, IntersectionID, Lot,
     LotID, Map, Road, RoadID, WaterEditError,
 };
+use common::{FastMap, FastSet};
 use derive_more::From;
-use flat_spatial::aabbgrid::AABBGridHandle;
+use flat_spatial::aabbgrid::{AABBGridHandle, AABBGridObjects, StoreObject};
+use flat_spatial::cell::AABBGridCell;
+use flat_spatial::storage::{CellIdx, SparseStorage};
 use flat_spatial::AABBGrid;
 use geom::{Circle, Intersect, Shape, ShapeEnum, Vec2, AABB};
 use serde::{Deserialize, Serialize};
@@ -86,7 +89,7 @@ pub trait SpatialMapObject {
 }
 
 pub struct SpatialMap {
-    broad: AABBGrid<ProjectKind, AABB>,
+    broad: BroadGrid,
     occupancy: AABBGrid<ProjectKind, AABB>,
     occupancy_ids: BTreeMap<ProjectKind, AABBGridHandle>,
     cuts: AABBGrid<ProjectKind, AABB>,
@@ -95,10 +98,146 @@ pub struct SpatialMap {
     ids: BTreeMap<ProjectKind, AABBGridHandle>,
 }
 
+// The broad grid uses the same storage and handles as AABBGrid, whose public
+// API only supports removing entries one at a time.
+struct BroadGrid {
+    storage: SparseStorage<AABBGridCell>,
+    objects: AABBGridObjects<ProjectKind, AABB>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CellRange {
+    first: CellIdx,
+    last: CellIdx,
+}
+
+impl CellRange {
+    fn len(self) -> usize {
+        let (left, bottom) = self.first;
+        let (right, top) = self.last;
+        (right.abs_diff(left) as usize + 1).saturating_mul(top.abs_diff(bottom) as usize + 1)
+    }
+
+    fn iter(self) -> impl Iterator<Item = CellIdx> {
+        let (left, bottom) = self.first;
+        let (right, top) = self.last;
+        (bottom..=top).flat_map(move |y| (left..=right).map(move |x| (x, y)))
+    }
+}
+
+impl BroadGrid {
+    fn cell_range(&self, bounds: AABB) -> CellRange {
+        CellRange {
+            first: self.storage.cell_id(bounds.ll),
+            last: self.storage.cell_id(bounds.ur),
+        }
+    }
+
+    fn insert(&mut self, aabb: AABB, obj: ProjectKind) -> AABBGridHandle {
+        let handle = self.objects.insert(StoreObject { obj, aabb });
+        self.insert_cells(handle, self.cell_range(aabb));
+        handle
+    }
+
+    fn insert_cells(&mut self, handle: AABBGridHandle, cells: CellRange) {
+        let single_cell = cells.first == cells.last;
+        for cell in cells.iter() {
+            self.storage
+                .cell_mut_unchecked(cell)
+                .objs
+                .push((handle, single_cell));
+        }
+    }
+
+    fn remove_cell_entry(cell: &mut AABBGridCell, handle: AABBGridHandle) {
+        if let Some(index) = cell.objs.iter().position(|&(entry, _)| entry == handle) {
+            cell.objs.swap_remove(index);
+        }
+    }
+
+    fn remove_cells(&mut self, handle: AABBGridHandle, cells: CellRange) {
+        for cell in cells.iter() {
+            Self::remove_cell_entry(self.storage.cell_mut_unchecked(cell), handle);
+        }
+    }
+
+    fn remove(&mut self, handle: AABBGridHandle) {
+        if let Some(object) = self.objects.remove(handle) {
+            self.remove_cells(handle, self.cell_range(object.aabb));
+        }
+    }
+
+    fn remove_many(&mut self, handles: impl Iterator<Item = AABBGridHandle>) {
+        let mut by_cell: FastMap<CellIdx, Vec<AABBGridHandle>> = FastMap::default();
+        for handle in handles {
+            let object = self.objects.remove(handle).expect("indexed lot");
+            for cell in self.cell_range(object.aabb).iter() {
+                by_cell.entry(cell).or_default().push(handle);
+            }
+        }
+        for (cell, handles) in by_cell {
+            let cell = self.storage.cell_mut_unchecked(cell);
+            if let [handle] = handles.as_slice() {
+                Self::remove_cell_entry(cell, *handle);
+                continue;
+            }
+
+            // Find the removed entries in one scan, then replay swap-removals
+            // in input order so surviving objects keep their query order.
+            let mut positions: FastMap<_, _> =
+                handles.iter().map(|&handle| (handle, usize::MAX)).collect();
+            for (index, &(handle, _)) in cell.objs.iter().enumerate() {
+                if let Some(position) = positions.get_mut(&handle) {
+                    *position = index;
+                }
+            }
+            for handle in handles {
+                let index = positions[&handle];
+                let moved = cell.objs.last().unwrap().0;
+                cell.objs.swap_remove(index);
+                if let Some(position) = positions.get_mut(&moved) {
+                    *position = index;
+                }
+            }
+        }
+    }
+
+    fn set_aabb(&mut self, handle: AABBGridHandle, aabb: AABB) {
+        let old_cells = self.cell_range(self.objects[handle].aabb);
+        let new_cells = self.cell_range(aabb);
+        self.objects[handle].aabb = aabb;
+        if old_cells != new_cells {
+            self.remove_cells(handle, old_cells);
+            self.insert_cells(handle, new_cells);
+        }
+    }
+
+    fn query(&self, bounds: AABB) -> impl Iterator<Item = (AABBGridHandle, &AABB, &ProjectKind)> {
+        let cells = self.cell_range(bounds);
+        let mut seen = FastSet::default();
+        cells
+            .iter()
+            .filter_map(|cell| self.storage.cell(cell))
+            .flat_map(|cell| cell.objs.iter().copied())
+            .filter_map(move |(handle, single_cell)| {
+                if cells.first != cells.last && !single_cell && !seen.insert(handle) {
+                    return None;
+                }
+                let object = &self.objects[handle];
+                bounds
+                    .intersects(&object.aabb)
+                    .then_some((handle, &object.aabb, &object.obj))
+            })
+    }
+}
+
 impl Default for SpatialMap {
     fn default() -> Self {
         Self {
-            broad: AABBGrid::new(50),
+            broad: BroadGrid {
+                storage: SparseStorage::new(50),
+                objects: Default::default(),
+            },
             occupancy: AABBGrid::new(512),
             occupancy_ids: Default::default(),
             cuts: AABBGrid::new(512),
@@ -138,6 +277,18 @@ impl SpatialMap {
                 kind
             )
         }
+    }
+
+    pub(super) fn remove_lots(&mut self, lots: impl IntoIterator<Item = LotID>) {
+        let ids = &mut self.ids;
+        let near = &mut self.near;
+        // Lots have no entries in the occupancy or cut influence grids.
+        self.broad.remove_many(lots.into_iter().filter_map(|id| {
+            let kind = ProjectKind::Lot(id);
+            let handle = ids.remove(&kind)?;
+            near.remove(&kind);
+            Some(handle)
+        }));
     }
 
     pub fn update(&mut self, obj: &impl SpatialMapObject) {
@@ -225,31 +376,54 @@ impl SpatialMap {
         new_lots: usize,
         work: &mut usize,
     ) -> Result<(), WaterEditError> {
-        let storage = self.broad.storage();
-        let (left, bottom) = storage.cell_id(bounds.ll);
-        let (right, top) = storage.cell_id(bounds.ur);
-        let cells = (right.abs_diff(left) as usize + 1)
-            .saturating_mul(top.abs_diff(bottom) as usize + 1);
+        let cells = self.broad.cell_range(bounds);
+        let storage = &self.broad.storage;
         // Pay for the cell count and both queries, including empty cells and
         // repeated grid entries.
         // An added or updated road/junction can contribute one entry per cell.
         // Generated lots are at most 40 m square and span at most 3x3 cells.
+        // Count each new membership for the live query, removal bookkeeping,
+        // and the removal scan.
         spend_water_work(
             work,
             cells
+                .len()
                 .saturating_mul(changed_objects.saturating_add(3))
-                .saturating_add(new_lots.saturating_mul(per_lot.saturating_add(9))),
+                .saturating_add(new_lots.saturating_mul(per_lot.saturating_add(27))),
         )?;
-        for y in bottom..=top {
-            for x in left..=right {
-                if let Some(cell) = storage.cell((x, y)) {
-                    spend_water_work(work, cell.objs.len().saturating_mul(2))?;
+        for cell in cells.iter() {
+            if let Some(cell) = storage.cell(cell) {
+                spend_water_work(work, cell.objs.len().saturating_mul(2))?;
+            }
+        }
+        let mut removal_cells = FastSet::default();
+        let mut reserve_removal_cell = |cell, work: &mut usize| -> Result<(), WaterEditError> {
+            if removal_cells.insert(cell) {
+                let entries = storage.cell(cell).map_or(0, |cell| cell.objs.len());
+                spend_water_work(work, entries.saturating_add(changed_objects))?;
+            }
+            Ok(())
+        };
+        // Lots can straddle cells outside the query. Budget the batch's
+        // bookkeeping per membership and one scan per affected cell.
+        for (_, lot_bounds, object) in self.broad.query(bounds) {
+            if object.to_lot().is_some() {
+                let occupied = self.broad.cell_range(*lot_bounds);
+                spend_water_work(work, per_lot.saturating_add(occupied.len()))?;
+                for cell in occupied.iter() {
+                    reserve_removal_cell(cell, work)?;
                 }
             }
         }
-        for (_, _, object) in self.broad.query(bounds) {
-            if object.to_lot().is_some() {
-                spend_water_work(work, per_lot)?;
+        if new_lots > 0 {
+            // A merge can clear lots generated during the live connection.
+            // Allow a rounded-up lot diagonal beyond the query for those lots.
+            let possible = self
+                .broad
+                .cell_range(bounds.expand(super::MAX_LOT_SIZE * 1.5));
+            spend_water_work(work, possible.len())?;
+            for cell in possible.iter() {
+                reserve_removal_cell(cell, work)?;
             }
         }
         Ok(())
@@ -262,7 +436,7 @@ impl SpatialMap {
         filter: ProjectFilter,
     ) -> impl Iterator<Item = ProjectKind> + '_ {
         let additional = self.occupancy.query(bounds).filter(move |&(_, _, object)| {
-            let primary = self.broad.get(self.ids[object]).unwrap().aabb;
+            let primary = self.broad.objects[self.ids[object]].aabb;
             !primary.intersects(&bounds)
         });
         self.broad
@@ -274,8 +448,8 @@ impl SpatialMap {
 
     pub fn debug_grid(&self) -> impl Iterator<Item = AABB> + '_ {
         self.broad
-            .handles()
-            .filter_map(move |x| self.broad.get(x))
+            .objects
+            .values()
             .chain(
                 self.occupancy
                     .handles()
@@ -288,7 +462,7 @@ impl SpatialMap {
         let kind = p.into();
 
         let v = unwrap_ret!(self.ids.get(&kind), false);
-        self.broad.get(*v).is_some() && self.near.get(&kind).is_some()
+        self.broad.objects.contains_key(*v) && self.near.get(&kind).is_some()
     }
 
     pub fn objects(&self) -> impl Iterator<Item = &ProjectKind> + '_ {

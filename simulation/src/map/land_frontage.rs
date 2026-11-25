@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{Intersect, Vec2, Vec3, OBB};
+use geom::{Intersect, Vec2, Vec3, AABB, OBB};
 use slotmapd::Key;
 
 use super::{
@@ -265,11 +265,14 @@ impl Map {
                 continue;
             }
             let axis = -road.dir_from(id);
-            let end = start + axis * STREET_END_REACH;
+            let Some(distance) = street_end_entry(bounds, start, axis, STREET_END_REACH) else {
+                continue;
+            };
+            let end = start + axis * distance;
             if land.tile_at(end) != Some(tile) {
                 continue;
             }
-            let corridor = OBB::new((start + end) * 0.5, axis, STREET_END_REACH, road.width);
+            let corridor = OBB::new((start + end) * 0.5, axis, distance, road.width);
             if self
                 .authorize_land_footprint(&corridor.corners, Some(tile))
                 .is_ok()
@@ -342,5 +345,69 @@ impl Map {
             let id = Lot::insert(self, road, shape, height);
             self.subscribers.dispatch(UpdateType::Road, &self.lots[id]);
         }
+    }
+}
+
+fn street_end_entry(bounds: AABB, start: Vec2, axis: Vec2, reach: f32) -> Option<f32> {
+    let mut entry = 0.0_f32;
+    let mut exit = reach;
+    for (start, direction, min, max) in [
+        (start.x, axis.x, bounds.ll.x, bounds.ur.x),
+        (start.y, axis.y, bounds.ll.y, bounds.ur.y),
+    ] {
+        if direction == 0.0 {
+            if start <= min || start >= max {
+                return None;
+            }
+            continue;
+        }
+        let a = (min - start) / direction;
+        let b = (max - start) / direction;
+        entry = entry.max(a.min(b));
+        exit = exit.min(a.max(b));
+    }
+    // Move just inside the tile, including when the ray clips a narrow corner.
+    (entry < exit).then(|| entry + (exit - entry).min(0.02) * 0.5)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map::{
+        Environment, LandOwnership, LanePatternBuilder, MapProject, OwnedTileRect, TileExtent,
+    };
+    use geom::vec2;
+
+    #[test]
+    fn tiles_harden1_street_end_approaches_a_tile_corner() {
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(10, 11)));
+        let end = vec2(4020.0, 4562.0);
+        map.make_connection(
+            MapProject::ground(vec2(3966.0, 4490.0).z0()),
+            MapProject::ground(end.z0()),
+            None,
+            &LanePatternBuilder::new().build(),
+        )
+        .unwrap();
+        map.install_land_ownership(
+            LandOwnership::tiled(
+                TileExtent {
+                    width: 10,
+                    height: 11,
+                },
+                OwnedTileRect {
+                    origin: LandTileId { x: 7, y: 8 },
+                    width: 1,
+                    height: 1,
+                },
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let approaches = map
+            .preview_land_approaches(LandTileId { x: 7, y: 9 })
+            .unwrap();
+        assert!(approaches.contains(&end), "approaches: {approaches:?}");
     }
 }
