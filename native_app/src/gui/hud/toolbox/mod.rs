@@ -32,7 +32,7 @@ pub mod terraforming;
 pub mod train;
 pub(crate) mod transit;
 
-pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
+pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation, yakui_width: f32) {
     transit::update_lines(uiworld, sim);
     remember_current_mode(uiworld);
     reflow(Alignment::TOP_LEFT, Pivot::TOP_LEFT, Dim2::ZERO, || {
@@ -47,7 +47,7 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
                     l.show(|| {
                         let mut needs_outline = false;
                         blur_bg(primary_container().with_alpha(0.3), 0.0, || {
-                            needs_outline = tool_properties(uiworld, sim);
+                            needs_outline = tool_properties(uiworld, sim, yakui_width);
                         });
                         if needs_outline {
                             colored_box_container(outline().with_alpha(0.5), || {
@@ -72,7 +72,7 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
     });
 }
 
-fn tool_properties(uiw: &UiWorld, sim: &Simulation) -> bool {
+fn tool_properties(uiw: &UiWorld, sim: &Simulation, yakui_width: f32) -> bool {
     let tool = *uiw.read::<Tool>();
 
     match tool {
@@ -98,7 +98,7 @@ fn tool_properties(uiw: &UiWorld, sim: &Simulation) -> bool {
         Tool::TransitStop | Tool::TransitLine | Tool::Train => {
             transport_properties(uiw, sim, tool);
         }
-        Tool::Zoning => crate::gui::zoning::properties(uiw),
+        Tool::Zoning => crate::gui::zoning::properties(uiw, yakui_width),
         Tool::RoadbuildStraight | Tool::RoadbuildCurved => {
             roadbuild::roadbuild_properties(uiw);
         }
@@ -582,8 +582,9 @@ mod toolbar1_tests {
         );
         ui.set_surface_size(viewport);
         ui.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, viewport));
+        let yakui_width = ui.layout_dom().viewport().size().x;
         ui.start();
-        new_toolbox(uiw, sim);
+        new_toolbox(uiw, sim, yakui_width);
         ui.finish();
 
         let (mut buttons, mut images) = (Vec::new(), Vec::new());
@@ -649,6 +650,30 @@ mod toolbar1_tests {
                 if selection == ToolSelection::Hand {
                     assert!(shelf.is_empty());
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn zones2_zoning_palette_fits_narrow_viewport_at_both_egui_scales() {
+        let (mut uiw, sim) = fixture();
+        uiw.insert(UiTextures::default());
+        let size = Vec2::new(640.0, 800.0);
+        let camera = Camera::new(geom::Vec3::ZERO, size.x, size.y);
+        uiw.insert(OrbitCamera::from_camera(camera));
+        select_tool(&uiw, &sim, ToolSelection::Mode(ToolMode::Zoning));
+        let viewport = Rect::from_pos_size(Vec2::ZERO, size);
+
+        for scale in [0.5, 1.0] {
+            uiw.write::<Settings>().gui_scale = scale;
+            let (_, shelf) = layout(&uiw, &sim, size);
+            // Six palette choices, three densities, three brush controls, two plot layouts.
+            assert_eq!(shelf.len(), 14);
+            for rect in shelf {
+                assert!(
+                    viewport.contains_point(rect.pos()) && viewport.contains_point(rect.max()),
+                    "Egui scale {scale}: zoning control {rect:?} lies outside the viewport"
+                );
             }
         }
     }

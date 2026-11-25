@@ -3,6 +3,7 @@
   {"Camera": {"x": 980, "y": 1035, "z": 10, "yaw": -0.91, "pitch": 1.28, "dist": 320}},
   {"SelectTool": "zoning"},
   {"WaitFrames": 4},
+  {"Screenshot": "mx-narrow-palette"},
   {"Pointer": {"action": "Click", "screen_pos": [82, 592]}},
   {"WaitFrames": 2},
   {"Pointer": {"action": "Click", "world_pos": [924, 1028, 10]}},

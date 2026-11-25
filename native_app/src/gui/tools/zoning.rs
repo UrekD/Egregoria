@@ -1,4 +1,3 @@
-use crate::gui::windows::settings::Settings;
 use crate::gui::{ErrorTooltip, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
@@ -245,8 +244,7 @@ fn zone_picker(state: &mut ZoningState, width: f32) {
     }
 }
 
-pub fn properties(uiworld: &UiWorld) {
-    let width = uiworld.camera().camera.viewport_w / uiworld.read::<Settings>().gui_scale;
+pub fn properties(uiworld: &UiWorld, width: f32) {
     let narrow = width < 830.0;
     let brush_hint = |state: &ZoningState| {
         let side = state.brush_side() as u32;

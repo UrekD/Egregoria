@@ -310,11 +310,13 @@ impl engine::framework::State for State {
             state.update_warp();
             state.uiw.write::<SaveLoadState>().authoring_blocked = !state.can_collect_commands();
             let commands_observed = state.update_world(ctx, sim, scripted, view_input);
+            let yakui_width =
+                ctx.yakui.yakui.layout_dom().unscaled_viewport().size().x / ctx.yakui.zoom_factor;
             ctx.present(
                 state,
                 |state, frame| state.render_world(frame, sim),
                 |state, ui| state.render_world_gui(ui, sim),
-                |state| state.render_world_yakui(sim),
+                |state| state.render_world_yakui(sim, yakui_width),
             );
             state.invalidate_placements();
             if state.driver.is_some() {
@@ -677,14 +679,14 @@ impl State {
         }
     }
 
-    fn render_world_yakui(&mut self, sim: &Simulation) {
+    fn render_world_yakui(&mut self, sim: &Simulation, yakui_width: f32) {
         if !self.uiw.read::<SessionState>().interaction_blocked {
             if !session::playing(&self.uiw) {
                 session::render_session(&self.uiw, sim);
             } else if session::modal(&self.uiw) {
                 session::render_modal(&self.uiw, sim);
             } else {
-                render_newgui(&self.uiw, sim);
+                render_newgui(&self.uiw, sim, yakui_width);
             }
             yakui::widgets::List::row().show(|| session::render_status(&self.uiw));
         }

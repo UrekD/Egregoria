@@ -30,7 +30,7 @@ pub(crate) use demand_bars::top_driver as top_demand_driver;
 pub(crate) use toasts::ToastState;
 
 /// Root GUI entrypoint
-pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
+pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation, yakui_width: f32) {
     profiling::scope!("hud::render");
     if uiworld.read::<SessionState>().interaction_blocked {
         return;
@@ -62,7 +62,7 @@ pub fn render_newgui(uiworld: &UiWorld, sim: &Simulation) {
 
     yakui::column(|| {
         yakui::column(|| problem_icons::render(uiworld, sim));
-        new_toolbox(uiworld, sim);
+        new_toolbox(uiworld, sim, yakui_width);
         menu_bar(uiworld, sim);
         if !session::world_interaction(uiworld) {
             render_departure(uiworld);
