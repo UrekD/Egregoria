@@ -28,6 +28,11 @@ WINDOWS_SLOTS ?=
 windows:
 	scripts/build-windows.sh "$(WINDOWS_OUT)" "$(WINDOWS_SLOTS)"
 
+.PHONY: build
+# Package a Windows test build and include local saves when world exists.
+build:
+	scripts/build-windows.sh "$(WINDOWS_OUT)" "$(if $(wildcard world/.),world)"
+
 .PHONY: demo-cities
 demo-cities:
 	cargo run --locked --release -p scenarios -- demo-cities --save-root world
