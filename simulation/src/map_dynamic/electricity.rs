@@ -937,7 +937,7 @@ mod tests {
             package.path = "../base_mod/?.lua"
             require("data")
             for _, prototype in ipairs(data) do
-                if prototype.name == "residence-low-l1" then
+                if prototype.name == "residence-legacy-low-l1" then
                     prototype.power_consumption = "9223372036854775807 W"
                 end
             end
@@ -1116,7 +1116,7 @@ mod tests {
         residence::register(
             &test.g,
             b2,
-            ResidencePrototypeID::new("residence-high-l3").prototype(),
+            ResidencePrototypeID::new("residence-legacy-high-l3").prototype(),
         );
 
         let company_a = company(&mut test, a1, "clothes-store", 250.0);
@@ -1145,12 +1145,33 @@ mod tests {
     }
 
     #[test]
+    fn zones2_profiled_house_power_uses_its_stock_rating() {
+        let mut test = TestCtx::new();
+        test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
+        let house = test.build_house_near(vec2(150.0, 125.0));
+        let profile = ResidencePrototypeID::new("residence-high-l3").prototype();
+        assert!(profile.massing.is_some());
+        assert_eq!(profile.capacity, 18);
+        residence::register(&test.g, house, profile);
+        let network = test.g.map().electricity.net_id(house).unwrap();
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+        assert_eq!(
+            resources.read::<ElectricityFlow>().network_stats(network).consumed_power,
+            Power::new(1800),
+        );
+    }
+
+    #[test]
     fn p1bce_house_power_uses_active_prototype() {
         let mut test = TestCtx::new();
         test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(300.0, 100.0, 0.0)]);
         let house = test.build_house_near(vec2(150.0, 125.0));
         let network = test.g.map().electricity.net_id(house).unwrap();
-        for (prototype, watts) in [("residence-low-l1", 200), ("residence-high-l3", 1200)] {
+        for (prototype, watts) in [
+            ("residence-legacy-low-l1", 200),
+            ("residence-legacy-high-l3", 1200),
+        ] {
             test.g.write::<Residences>().insert(
                 house,
                 Residence::from(ResidencePrototypeID::new(prototype).prototype()),
