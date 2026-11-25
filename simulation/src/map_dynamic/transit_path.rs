@@ -7,7 +7,7 @@ use prototypes::{Money, Tick, TICKS_PER_HOUR, TICKS_PER_REALTIME_SECOND};
 
 use super::{LineID, RoutingStep, StopID, Transit};
 use crate::map::{Map, PathKind, Pathfinder, TraverseDirection};
-use crate::map_dynamic::transit::{TransitLine, TransitStop, WAIT_NOT_STARTED};
+use crate::map_dynamic::transit::{TransitLine, TransitStop, GIVE_UP_TICKS, WAIT_NOT_STARTED};
 use crate::map_dynamic::{BusRun, Itinerary};
 use crate::transportation::Location;
 
@@ -38,8 +38,8 @@ impl<'a> TransitPaths<'a> {
             stops: Grid::new(STOP_ACCESS_RADIUS as i32),
         };
         let mut runs = BTreeMap::<_, Vec<_>>::new();
-        for run in transit.runs.values() {
-            runs.entry(run.line).or_default().push(run);
+        for (&bus, run) in &transit.runs {
+            runs.entry(run.line).or_default().push((bus, run));
         }
         for (id, line) in &transit.lines {
             if line.suspended {
@@ -58,13 +58,13 @@ impl<'a> TransitPaths<'a> {
             };
             let (leg_ticks, dwell_ticks, departures) = match transit.directed_leg_times(id) {
                 Some((times, dwell)) => {
-                    let Some(departures) = Departures::new(
-                        now,
-                        times,
-                        dwell,
-                        runs.get(&id).map_or(&[][..], Vec::as_slice),
-                        line.target_vehicles,
-                    ) else {
+                    let active_runs = runs
+                        .get(&id)
+                        .into_iter()
+                        .flatten()
+                        .take(usize::from(line.target_vehicles))
+                        .map(|&(bus, run)| (run, transit.recovery_leg_ticks(bus, run)));
+                    let Some(departures) = Departures::new(now, times, dwell, active_runs) else {
                         continue;
                     };
                     (
@@ -131,9 +131,9 @@ impl<'a> TransitPaths<'a> {
         let egress = ride.alight.walk_pos;
         let (access_ticks, access_path) =
             ValidatedWalk::route(now, origin, access, map, walk_speed)?;
+        let wait = self.lines[&ride.line].wait_ticks(ride.board_index, access_ticks)?;
         let (egress_ticks, egress_path) =
             ValidatedWalk::route(now, egress, destination, map, walk_speed)?;
-        let wait = self.lines[&ride.line].wait_ticks(ride.board_index, access_ticks);
         if access_ticks + wait + ride.ride_and_fare + egress_ticks + COST_EPSILON >= legacy_ticks {
             return None;
         }
@@ -176,6 +176,9 @@ impl<'a> TransitPaths<'a> {
                     continue;
                 }
                 let line = &self.lines[&id];
+                let Some(wait) = line.wait_ticks(from, walk_to_stop) else {
+                    continue;
+                };
                 for &(alight_distance, alight) in &egress {
                     if board.id == alight.id {
                         continue;
@@ -191,7 +194,7 @@ impl<'a> TransitPaths<'a> {
                         alight,
                         ride_and_fare,
                         ticks: walk_to_stop
-                            + line.wait_ticks(from, walk_to_stop)
+                            + wait
                             + ride_and_fare
                             + travel_ticks(alight_distance.0.sqrt(), walk_speed),
                     };
@@ -262,59 +265,81 @@ impl ServiceLine<'_> {
         None
     }
 
-    fn wait_ticks(&self, stop_index: usize, access_ticks: f64) -> f64 {
-        self.departures
+    fn wait_ticks(&self, stop_index: usize, access_ticks: f64) -> Option<f64> {
+        let wait = self
+            .departures
             .as_ref()
             .map_or(self.half_headway, |departures| {
                 departures.wait_ticks(stop_index, access_ticks)
-            })
+            });
+        // The passenger can board at the start of dwell. Trip cost still
+        // includes the remaining time until the bus departs.
+        let until_boarding = (wait - self.dwell_ticks).max(0.0);
+        (until_boarding <= GIVE_UP_TICKS as f64).then_some(wait)
     }
 }
 
 struct Departures {
-    loop_ticks: f64,
+    loop_ticks: u64,
     stop_offsets: Vec<u64>,
-    first_stop_phases: Vec<u64>,
+    first_departures: Vec<(u64, u64)>,
 }
 
 impl Departures {
-    fn new(now: Tick, leg_ticks: &[u64], dwell: u64, runs: &[&BusRun], target: u8) -> Option<Self> {
+    fn new<'a>(
+        now: Tick,
+        leg_ticks: &[u64],
+        dwell: u64,
+        runs: impl Iterator<Item = (&'a BusRun, Option<u64>)>,
+    ) -> Option<Self> {
         let mut stop_offsets = Vec::with_capacity(leg_ticks.len());
         let mut loop_ticks = 0;
         for leg in leg_ticks {
             stop_offsets.push(loop_ticks);
             loop_ticks += leg + dwell;
         }
-        let first_stop_phases: Vec<_> = runs
-            .iter()
-            .take(usize::from(target))
-            .filter_map(|run| {
+        let first_departures: Vec<_> = runs
+            .filter_map(|(run, recovery_ticks)| {
                 let index = run.next_stop_idx;
                 let offset = *stop_offsets.get(index)?;
-                let previous = (index + leg_ticks.len() - 1) % leg_ticks.len();
                 let until_departure = if let Some(until) = run.dwell_until {
                     until.0.saturating_sub(now.0)
                 } else {
+                    let previous = (index + leg_ticks.len() - 1) % leg_ticks.len();
+                    let expected = recovery_ticks.unwrap_or(leg_ticks[previous]);
                     let elapsed = now.0.saturating_sub(run.leg_started.0);
                     // An overdue bus has no reliable arrival forecast until it
                     // reaches a berth. Counting it as imminent hides the wait.
-                    leg_ticks[previous].checked_sub(elapsed)? + dwell
+                    expected.checked_sub(elapsed)? + dwell
                 };
-                Some((until_departure + loop_ticks - offset) % loop_ticks)
+                Some((offset, until_departure))
             })
             .collect();
-        (!first_stop_phases.is_empty()).then_some(Self {
-            loop_ticks: loop_ticks as f64,
+        (!first_departures.is_empty()).then_some(Self {
+            loop_ticks,
             stop_offsets,
-            first_stop_phases,
+            first_departures,
         })
     }
 
     fn wait_ticks(&self, stop_index: usize, access_ticks: f64) -> f64 {
-        let offset = self.stop_offsets[stop_index] as f64;
-        self.first_stop_phases
+        let offset = self.stop_offsets[stop_index];
+        self.first_departures
             .iter()
-            .map(|&phase| (phase as f64 + offset - access_ticks).rem_euclid(self.loop_ticks))
+            .map(|&(target_offset, until_departure)| {
+                let after_target = if offset >= target_offset {
+                    offset - target_offset
+                } else {
+                    self.loop_ticks - target_offset + offset
+                };
+                let wait = until_departure as f64 + after_target as f64 - access_ticks;
+                // Only repeat the schedule after the first reachable call.
+                if wait < 0.0 {
+                    wait.rem_euclid(self.loop_ticks as f64)
+                } else {
+                    wait
+                }
+            })
             .reduce(f64::min)
             .unwrap_or_default()
     }
@@ -431,7 +456,9 @@ fn travel_ticks(distance: f32, meters_per_second: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geom::Color;
+    use crate::map_dynamic::transit::recovery_leg_fixture;
+    use crate::tests::TestCtx;
+    use geom::{vec3, Color};
 
     #[test]
     fn p3b_wait_prediction_accounts_for_boarding_stop_and_access_time() {
@@ -442,7 +469,8 @@ mod tests {
             leg_started: Tick(0),
             failures: 0,
         };
-        let departures = Departures::new(Tick(20), &[100, 200], 10, &[&run], 1).unwrap();
+        let departures =
+            Departures::new(Tick(20), &[100, 200], 10, [(&run, None)].into_iter()).unwrap();
         assert_eq!(departures.wait_ticks(0, 8.0), 2.0);
         assert_eq!(departures.wait_ticks(0, 12.0), 318.0);
         assert_eq!(departures.wait_ticks(1, 110.0), 10.0);
@@ -463,10 +491,169 @@ mod tests {
         };
         let now = Tick(120);
         let legs = [100, 200];
-        let departures = Departures::new(now, &legs, 10, &[&late, &dwelling], 2).unwrap();
+        let departures = Departures::new(
+            now,
+            &legs,
+            10,
+            [(&late, None), (&dwelling, None)].into_iter(),
+        )
+        .unwrap();
         assert_eq!(departures.wait_ticks(1, 0.0), 50.0);
 
-        assert!(Departures::new(now, &legs, 10, &[&late], 1).is_none());
+        assert!(Departures::new(now, &legs, 10, [(&late, None)].into_iter()).is_none());
+    }
+
+    #[test]
+    fn p3b_wait_prediction_keeps_a_single_bus_on_a_recovery_leg() {
+        let (ctx, expected) = recovery_leg_fixture();
+        let transit = ctx.g.read::<Transit>();
+        let run = transit.runs.values().next().unwrap();
+        let line = run.line;
+        let (legs, dwell) = transit.directed_leg_times(line).unwrap();
+        let now = Tick(120);
+        let paths = TransitPaths::new(&transit, now, Transit::headway);
+        assert!(paths.has_service());
+        let departures = paths.lines[&line].departures.as_ref().unwrap();
+        let until_departure = expected - now.0 + dwell;
+        assert_eq!(
+            departures.wait_ticks(run.next_stop_idx, 0.0),
+            until_departure as f64
+        );
+        assert_eq!(
+            departures.wait_ticks(0, 0.0),
+            (until_departure + legs[1] + dwell) as f64
+        );
+        assert!(!TransitPaths::new(&transit, Tick(expected + 1), Transit::headway).has_service());
+    }
+
+    fn wait_limit_line(positions: [Vec3; 2]) -> Transit {
+        let mut transit = Transit::default();
+        let stops = positions.map(|pos| {
+            transit.stops.insert_with_key(|id| TransitStop {
+                id,
+                pos,
+                dir: Vec2::X,
+                walk_pos: pos,
+                berth: pos,
+            })
+        });
+        transit.lines.insert_with_key(|id| TransitLine {
+            id,
+            stops: stops.to_vec(),
+            target_vehicles: 2,
+            fare: Money::ZERO,
+            color: Color::WHITE,
+            suspended: false,
+        });
+        transit
+    }
+
+    #[test]
+    fn p3b_wait_limit_filters_candidates_by_when_boarding_opens() {
+        let origin = Vec3::ZERO;
+        let destination = Vec3::X * 2_000.0;
+        let transit = wait_limit_line([origin, destination]);
+        let line = transit.lines.keys().next().unwrap();
+        let now = Tick(120);
+        let mut paths = TransitPaths::new(&transit, now, |_, _| Some(20_000));
+        let late = BusRun {
+            line,
+            next_stop_idx: 1,
+            dwell_until: None,
+            leg_started: Tick(0),
+            failures: 0,
+        };
+        let next = BusRun {
+            next_stop_idx: 0,
+            ..late.clone()
+        };
+        let dwell = 150;
+        for extra in [0, 1] {
+            let service = paths.lines.get_mut(&line).unwrap();
+            service.dwell_ticks = dwell as f64;
+            service.departures = Departures::new(
+                now,
+                &[100, GIVE_UP_TICKS + now.0 + extra],
+                dwell,
+                [(&late, None), (&next, None)].into_iter(),
+            );
+            assert!(service.departures.is_some());
+            assert_eq!(
+                paths
+                    .best_ride(origin, destination, f64::INFINITY, 1.2, |_| true)
+                    .is_some(),
+                extra == 0,
+                "the boarding window opens {} ticks after reaching the stop",
+                GIVE_UP_TICKS + extra,
+            );
+        }
+    }
+
+    #[test]
+    fn p3b_wait_limit_rechecks_actual_access_walk() {
+        let ctx = TestCtx::new_fast();
+        ctx.build_roads(&[vec3(100.0, 500.0, 0.0), vec3(1_600.0, 500.0, 0.0)]);
+        let map = ctx.g.map();
+        let sidewalk = |pos| {
+            map.get(
+                map.nearest_lane(pos, crate::map::LaneKind::Walking, None)
+                    .unwrap(),
+            )
+            .unwrap()
+            .points
+            .project_segment(pos)
+            .0
+        };
+        let origin = sidewalk(vec3(250.0, 505.0, 0.0)) + Vec3::Y * 15.0;
+        let board = sidewalk(vec3(300.0, 505.0, 0.0)) + Vec3::Y * 15.0;
+        let destination = sidewalk(vec3(1_500.0, 505.0, 0.0));
+        let transit = wait_limit_line([board, destination]);
+        let line = transit.lines.keys().next().unwrap();
+        let now = Tick(76_150);
+        let mut paths = TransitPaths::new(&transit, now, |_, _| Some(80_000));
+        let service = paths.lines.get_mut(&line).unwrap();
+        let departure = 3_000;
+        service.dwell_ticks = 150.0;
+        service.departures = Departures::new(
+            now,
+            &[1_000, 79_000],
+            150,
+            [(
+                &BusRun {
+                    line,
+                    next_stop_idx: 0,
+                    dwell_until: None,
+                    leg_started: Tick(0),
+                    failures: 0,
+                },
+                None,
+            )]
+            .into_iter(),
+        );
+        let walk_speed = 1.0;
+        assert!(travel_ticks(origin.distance(board), walk_speed) < departure as f64);
+        let (access, _) = ValidatedWalk::route(now, origin, board, &map, walk_speed).unwrap();
+        assert!(
+            access > departure as f64,
+            "routed access took {access} ticks"
+        );
+        let wait = service.departures.as_ref().unwrap().wait_ticks(0, access);
+        assert!(wait - service.dwell_ticks > GIVE_UP_TICKS as f64);
+        assert!(paths
+            .best_ride(origin, destination, f64::INFINITY, walk_speed, |_| true)
+            .is_some());
+        assert!(paths
+            .winning_steps(
+                origin,
+                destination,
+                &Location::Outside,
+                &map,
+                now,
+                Some(origin + Vec3::Y * 3_000.0),
+                walk_speed,
+                |_| true
+            )
+            .is_none());
     }
 
     #[test]

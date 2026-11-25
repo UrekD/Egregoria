@@ -17,6 +17,8 @@ use crate::{HumanEnt, HumanID, ParCommandBuffer, Simulation, VehicleEnt, Vehicle
 
 mod service;
 
+#[cfg(test)]
+pub(super) use service::tests::recovery_leg_fixture;
 pub use service::{transit_board_update, transit_dispatch_update};
 
 pub(crate) const WAIT_NOT_STARTED: Tick = Tick(u64::MAX);
@@ -221,6 +223,17 @@ impl Transit {
             .map(|times| times.learned.as_slice())
             .filter(|times| times.len() == count)?;
         Some((times, service::DWELL_TICKS))
+    }
+
+    pub(super) fn recovery_leg_ticks(&self, bus: VehicleID, run: &BusRun) -> Option<u64> {
+        let leg = self.legs.get(&bus)?;
+        let stops = &self.lines.get(run.line)?.stops;
+        let previous = if run.next_stop_idx == 0 {
+            stops.last()
+        } else {
+            stops.get(run.next_stop_idx - 1)
+        }?;
+        (leg.from != Some(*previous) && leg.expected_ticks > 0).then_some(leg.expected_ticks)
     }
 
     /// Whether this line may be considered when (re)planning the human's current trip.

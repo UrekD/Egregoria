@@ -25,6 +25,7 @@ const CAPACITY: usize = 40;
 const BERTH_DISTANCE: f32 = 6.0;
 const BOARDING_DISTANCE: f32 = 8.0;
 const ARRIVAL_SPEED: f32 = 0.5;
+const BRAKING_GRACE_TICKS: u64 = 3 * TICKS_PER_REALTIME_SECOND;
 const BUS_SPEED: f32 = 8.0;
 
 fn travel_ticks(distance: f32) -> u64 {
@@ -199,12 +200,15 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
                     |leg| leg.expected_ticks,
                 );
             let nominal_timeout = expected.saturating_mul(3);
-            // A routed bus can be delayed by traffic or still braking at its
-            // berth. Give it the passenger wait window to finish the stop.
-            let can_serve_stop = vehicle.it.get_route().is_some()
-                && (!vehicle.it.has_ended(0.0) || at_berth(vehicle, stop));
-            let timeout = if can_serve_stop && !line.suspended {
-                nominal_timeout.max(GIVE_UP_TICKS)
+            // Buses completing a scheduled call during retirement get the same
+            // traffic allowance. A finished route at the berth gets time to brake.
+            let completed_route = vehicle.it.has_ended(0.0);
+            let braking = completed_route && at_berth(vehicle, stop);
+            let timeout = if vehicle.it.get_route().is_some() && (!completed_route || braking) {
+                let braking_grace = if braking { BRAKING_GRACE_TICKS } else { 0 };
+                nominal_timeout
+                    .max(GIVE_UP_TICKS)
+                    .saturating_add(braking_grace)
             } else {
                 nominal_timeout
             };
@@ -536,16 +540,21 @@ fn alight_passenger(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::map_dynamic) mod tests {
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3};
     use prototypes::{GameTime, Money, TICKS_PER_HOUR};
 
+    use super::super::WAIT_NOT_STARTED;
     use super::*;
     use crate::economy::{Budget, BudgetCategory, TICKS_PER_BUDGET_DAY};
     use crate::map::{LaneKind, LanePatternBuilder, ProjectFilter};
+    use crate::map_dynamic::{BuildingInfos, Destination};
+    use crate::souls::human::spawn_human;
     use crate::tests::TestCtx;
+    use crate::utils::scheduler::drain_commands;
     use crate::world_command::{CommandOutcomes, WorldCommand};
+    use crate::SoulID;
 
     fn loop_fixture() -> (TestCtx, LineID) {
         let mut ctx = TestCtx::new_fast();
@@ -622,9 +631,7 @@ mod tests {
         assert_eq!(times.learned, [180, 401]);
     }
 
-    #[test]
-    fn p3_watchdog_keeps_a_delayed_routable_stop() {
-        let (mut ctx, line) = loop_fixture();
+    fn start_routed_bus(ctx: &mut TestCtx, line: LineID, from_berth: bool) -> (VehicleID, u64) {
         let (from, start) = {
             let transit = ctx.g.read::<Transit>();
             let first = transit.lines[line].stops[0];
@@ -640,25 +647,46 @@ mod tests {
         )
         .unwrap();
         let (world, resources) = ctx.g.world_res();
-        let nominal = {
-            let mut transit = resources.write::<Transit>();
-            let map = resources.read::<Map>();
-            transit.lines[line].target_vehicles = 1;
-            transit.runs.insert(
-                bus,
-                BusRun {
-                    line,
-                    next_stop_idx: 1,
-                    dwell_until: None,
-                    leg_started: Tick(0),
-                    failures: 0,
-                },
-            );
-            let vehicle = &mut world.vehicles[bus];
-            begin_leg(&mut transit, &map, bus, vehicle, Tick(0), Some(from));
-            assert!(vehicle.it.get_route().is_some());
-            transit.legs[&bus].expected_ticks
-        };
+        let mut transit = resources.write::<Transit>();
+        let map = resources.read::<Map>();
+        transit.lines[line].target_vehicles += 1;
+        transit.runs.insert(
+            bus,
+            BusRun {
+                line,
+                next_stop_idx: 1,
+                dwell_until: None,
+                leg_started: Tick(0),
+                failures: 0,
+            },
+        );
+        let vehicle = &mut world.vehicles[bus];
+        begin_leg(
+            &mut transit,
+            &map,
+            bus,
+            vehicle,
+            Tick(0),
+            from_berth.then_some(from),
+        );
+        assert!(vehicle.it.get_route().is_some());
+        (bus, transit.legs[&bus].expected_ticks)
+    }
+
+    fn reach_berth(world: &mut World, resources: &Resources, bus: VehicleID, now: Tick) {
+        let vehicle = &mut world.vehicles[bus];
+        vehicle.trans.pos =
+            vehicle
+                .it
+                .update(vehicle.trans.pos, 1_000.0, now, 0, &resources.read::<Map>());
+        assert!(vehicle.it.has_ended(0.0));
+    }
+
+    #[test]
+    fn p3_watchdog_keeps_a_delayed_routable_stop() {
+        let (mut ctx, line) = loop_fixture();
+        let (bus, nominal) = start_routed_bus(&mut ctx, line, true);
+        let (world, resources) = ctx.g.world_res();
 
         resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + nominal * 3 + 1);
         transit_dispatch_update(world, resources);
@@ -668,16 +696,8 @@ mod tests {
         drop(transit);
 
         let arrival_tick = Tick(nominal * 3 + 2);
-        let vehicle = &mut world.vehicles[bus];
-        vehicle.trans.pos = vehicle.it.update(
-            vehicle.trans.pos,
-            1_000.0,
-            arrival_tick,
-            0,
-            &resources.read::<Map>(),
-        );
-        assert!(vehicle.it.has_ended(0.0));
-        vehicle.speed.0 = ARRIVAL_SPEED;
+        reach_berth(world, resources, bus, arrival_tick);
+        world.vehicles[bus].speed.0 = ARRIVAL_SPEED;
         resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + arrival_tick.0);
         transit_dispatch_update(world, resources);
         {
@@ -695,6 +715,140 @@ mod tests {
             transit.runs[&bus].dwell_until,
             Some(Tick(arrival_tick.0 + 1 + DWELL_TICKS))
         );
+    }
+
+    #[test]
+    fn p3_watchdog_skips_a_blocked_route_after_its_grace() {
+        let (mut ctx, line) = loop_fixture();
+        let (bus, nominal) = start_routed_bus(&mut ctx, line, true);
+        assert!(nominal * 3 < GIVE_UP_TICKS);
+        let (world, resources) = ctx.g.world_res();
+        assert!(!world.vehicles[bus].it.has_ended(0.0));
+
+        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + GIVE_UP_TICKS);
+        transit_dispatch_update(world, resources);
+        assert_eq!(resources.read::<Transit>().runs[&bus].next_stop_idx, 1);
+        assert_eq!(resources.read::<Transit>().runs[&bus].failures, 0);
+
+        resources.write::<GameTime>().tick.0 += 1;
+        transit_dispatch_update(world, resources);
+        assert_eq!(resources.read::<Transit>().runs[&bus].next_stop_idx, 0);
+        assert_eq!(resources.read::<Transit>().runs[&bus].failures, 1);
+    }
+
+    #[test]
+    fn p3_watchdog_allows_bounded_braking_after_the_deadline() {
+        let (mut ctx, line) = loop_fixture();
+        let (bus, nominal) = start_routed_bus(&mut ctx, line, true);
+        assert!(nominal * 3 < GIVE_UP_TICKS);
+        let (world, resources) = ctx.g.world_res();
+        reach_berth(world, resources, bus, Tick(GIVE_UP_TICKS));
+        world.vehicles[bus].speed.0 = ARRIVAL_SPEED;
+
+        let first_braking_tick = GIVE_UP_TICKS + 1;
+        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + first_braking_tick);
+        transit_dispatch_update(world, resources);
+        assert_eq!(resources.read::<Transit>().runs[&bus].next_stop_idx, 1);
+        assert_eq!(resources.read::<Transit>().runs[&bus].dwell_until, None);
+
+        let last_braking_tick = GIVE_UP_TICKS + 3 * TICKS_PER_REALTIME_SECOND;
+        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + last_braking_tick);
+        transit_dispatch_update(world, resources);
+        assert_eq!(resources.read::<Transit>().runs[&bus].next_stop_idx, 1);
+
+        resources.write::<GameTime>().tick.0 += 1;
+        transit_dispatch_update(world, resources);
+        assert_eq!(resources.read::<Transit>().runs[&bus].next_stop_idx, 0);
+        assert_eq!(resources.read::<Transit>().runs[&bus].failures, 1);
+    }
+
+    #[test]
+    fn p3_watchdog_preserves_a_delayed_riders_stop_during_suspension() {
+        let (mut ctx, line) = loop_fixture();
+        let (bus, nominal) = start_routed_bus(&mut ctx, line, true);
+        let home = ctx.build_house_near(vec2(200.0, 100.0));
+        let rider = spawn_human(&mut ctx.g, home).unwrap();
+        ctx.g
+            .write::<BuildingInfos>()
+            .get_out(home, SoulID::Human(rider));
+        let (from, to, walk_pos) = {
+            let transit = ctx.g.read::<Transit>();
+            let stops = &transit.lines[line].stops;
+            (stops[0], stops[1], transit.stops[stops[1]].walk_pos)
+        };
+        let failing_bus = spawn_driving_vehicle(
+            &mut ctx.g,
+            VehicleKind::Bus,
+            Transform::new(vec3(590.0, 100.0, 0.0)),
+        )
+        .unwrap();
+        {
+            let (world, resources) = ctx.g.world_res();
+            let human = &mut world.humans[rider];
+            human.location = Location::Outside;
+            human.router.set_test_route(
+                Destination::Outside(walk_pos),
+                vec![
+                    RoutingStep::WaitAtStop {
+                        stop: from,
+                        line,
+                        since: WAIT_NOT_STARTED,
+                    },
+                    RoutingStep::RideTransit { line, alight: to },
+                    RoutingStep::WalkTo(walk_pos),
+                ],
+            );
+            assert!(Router::board(human, bus, resources));
+            let mut transit = resources.write::<Transit>();
+            transit.lines[line].target_vehicles += 1;
+            transit.runs.insert(
+                failing_bus,
+                BusRun {
+                    line,
+                    next_stop_idx: 1,
+                    dwell_until: None,
+                    leg_started: Tick(0),
+                    failures: MAX_CONSECUTIVE_SKIPS - 1,
+                },
+            );
+            transit.legs.entry(failing_bus).or_default().expected_ticks = 1;
+        }
+
+        let now = nominal * 3 + 1;
+        assert!(now + 2 < GIVE_UP_TICKS);
+        for tick in [now, now + 1] {
+            let (world, resources) = ctx.g.world_res();
+            resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + tick);
+            transit_dispatch_update(world, resources);
+            drain_commands(&mut ctx.g);
+            assert!(ctx.g.read::<Transit>().lines[line].suspended);
+            assert_eq!(ctx.g.get(rider).unwrap().location, Location::Transit(bus));
+        }
+
+        let (world, resources) = ctx.g.world_res();
+        let arrival = Tick(now + 2);
+        reach_berth(world, resources, bus, arrival);
+        world.vehicles[bus].speed.0 = 0.0;
+        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + arrival.0);
+        transit_dispatch_update(world, resources);
+        transit_board_update(world, resources);
+        drain_commands(&mut ctx.g);
+        let rider = ctx.g.get(rider).unwrap();
+        assert_eq!(rider.location, Location::Outside);
+        assert_eq!(rider.trans.pos, walk_pos);
+        assert!(ctx.g.get(bus).is_none());
+    }
+
+    pub(in crate::map_dynamic) fn recovery_leg_fixture() -> (TestCtx, u64) {
+        let (mut ctx, line) = loop_fixture();
+        let (bus, expected) = start_routed_bus(&mut ctx, line, false);
+        assert!(expected > 120);
+        {
+            let mut transit = ctx.g.write::<Transit>();
+            assert_eq!(transit.legs[&bus].from, None);
+            transit.leg_times.get_mut(&line).unwrap().learned = vec![100, 200];
+        }
+        (ctx, expected)
     }
 
     #[test]
