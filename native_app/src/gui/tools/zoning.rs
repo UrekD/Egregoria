@@ -381,8 +381,14 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         *grid = (world, Arc::new((*zones).clone()));
     }
     let grid = grid.1.clone();
-    let stamp = ZoneGrid::eligible_paint_stroke(&map, &areas, state.kind, state.density)
-        .unwrap_or_default();
+    let (stamp, denied) = match areas.as_slice() {
+        [area] => ZoneGrid::eligible_paint_cells(&map, area, state.kind, state.density),
+        _ => ZoneGrid::eligible_paint_stroke(&map, &areas, state.kind, state.density),
+    }
+    .map_or_else(
+        |denied| (EligiblePaintCells::default(), Some(denied)),
+        |stamp| (stamp, None),
+    );
     let warning = MapRenderer::queue_zoning_overlay(
         &map,
         grid,
@@ -402,8 +408,10 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         },
     );
     state.preview_areas = areas;
-    if let Some(warning) =
-        warning.filter(|_| !goryak::pointer_over_ui(input.screen.x, input.screen.y))
+    let warning = denied
+        .map(|reason| crate::gui::notifications::command_message("ZonePaint", reason.into()))
+        .or_else(|| warning.map(Into::into));
+    if let Some(warning) = warning.filter(|_| !goryak::pointer_over_ui(input.screen.x, input.screen.y))
     {
         *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(warning);
     }

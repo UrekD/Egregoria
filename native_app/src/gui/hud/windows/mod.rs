@@ -29,6 +29,7 @@ pub struct GUIWindows {
     save_as_open: bool,
     advisor_open: bool,
     transit_lines_open: bool,
+    pub(crate) land_tiles_open: bool,
     pub progression_open: bool,
     #[cfg(feature = "multiplayer")]
     network_open: bool,
@@ -85,6 +86,7 @@ impl GUIWindows {
         citystats::citystats(uiworld, sim, &mut self.citystats_open);
         transit_lines::transit_lines(uiworld, &mut self.transit_lines_open);
         progression::render(uiworld, sim, &mut self.progression_open);
+        crate::gui::overlays::land_tiles::render(uiworld, sim, &mut self.land_tiles_open);
         settings::settings(uiworld, sim, &mut self.settings_open);
         if show_unfinished_ui {
             stub_window("Save As", &mut self.save_as_open);
@@ -155,6 +157,7 @@ impl GUIWindows {
             ("Advisor", &mut self.advisor_open),
             #[cfg(feature = "multiplayer")]
             ("Network", &mut self.network_open),
+            ("Land Tiles", &mut self.land_tiles_open),
         ]
         .into_iter()
     }

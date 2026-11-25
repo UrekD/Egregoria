@@ -66,6 +66,7 @@ pub fn run_ui_systems(sim: &Simulation, uiworld: &UiWorld) {
 
     // run last so other systems can have the chance to cancel select
     selectable::selectable(sim, uiworld);
+    overlays::land_tiles::show_unowned_hover(sim, uiworld);
 }
 
 #[derive(Default, Clone, Debug)]

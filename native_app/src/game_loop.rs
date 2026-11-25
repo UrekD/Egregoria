@@ -19,6 +19,7 @@ use crate::debug_gui::render_oldgui;
 use crate::gui;
 use crate::gui::follow::FollowEntity;
 use crate::gui::keybinds::KeybindState;
+use crate::gui::overlays::land_tiles;
 use crate::gui::terraforming::TerraformingResource;
 use crate::gui::toolbox::building;
 use crate::gui::windows::settings::{manage_settings, Settings};
@@ -435,6 +436,9 @@ impl State {
         }
         self.camera_bounds = sim.map().environment().bounds();
         let interaction = view_input && session::world_interaction(&self.uiw);
+        if interaction && land_tiles::shortcut(&self.uiw, sim) {
+            self.deferred_input.clear();
+        }
         if interaction {
             let mut sample = self.sample_world_input(ctx);
             if !self.uiw.can_author() {
@@ -845,6 +849,7 @@ impl State {
                     self.batch_in_flight = false;
                     self.last_batch = Some(batch.id);
                     self.applied_batch = Some(batch.id);
+                    land_tiles::receive_worker_batch(&self.uiw, &batch);
                     self.uiw.write::<ReceivedCommands>().receive(&batch);
                     for (index, result) in batch.water_edits {
                         if let WorldCommand::EditWater(edit) = &batch.commands.as_ref()[index] {
@@ -951,6 +956,7 @@ impl State {
             self.staged = Some(commands);
         } else {
             gui::specialbuilding::reject_local_batch(&self.uiw, &commands);
+            land_tiles::reject_local_batch(&self.uiw, &commands);
             for command in commands.iter() {
                 if let WorldCommand::EditWater(edit) = command {
                     self.uiw
@@ -973,8 +979,12 @@ impl State {
         let Some(commands) = self.staged.take() else {
             return;
         };
+        let land_purchase = land_tiles::queued_in(&self.uiw, &commands);
         match driver.submit(Request::Batch(commands)) {
             Ok(id) => {
+                if land_purchase {
+                    land_tiles::bind_worker_batch(&self.uiw, id);
+                }
                 self.last_batch = Some(id);
                 self.batch_in_flight = true;
             }
@@ -1107,6 +1117,7 @@ impl State {
             }
             *self.uiw.write::<NetworkState>() = NetworkState::default();
             self.uiw.write::<SessionState>().generation = generation;
+            land_tiles::reset(&self.uiw, generation);
             let mut io = self.uiw.write::<SaveLoadState>();
             io.threaded = true;
             io.save_result = None;

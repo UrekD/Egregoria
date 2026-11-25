@@ -254,6 +254,9 @@ fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnO
                     PlacementError::CommandRejected(Rejection::InsufficientFunds) => {
                         Cow::Borrowed("Not enough money to build here")
                     }
+                    PlacementError::CommandRejected(reason @ Rejection::LandDenied(_)) => {
+                        crate::gui::notifications::command_message("MapBuildSpecialBuilding", reason)
+                    }
                     PlacementError::CommandRejected(_) => {
                         Cow::Borrowed("Cannot place this building here")
                     }

@@ -109,6 +109,8 @@ fn register_ui_resources() {
     register_world_reset(|uiw, _| uiw.write::<NotificationCenter>().clear());
     register_world_resource::<TransitTools>();
     register_world_resource::<PanelState>();
+    register_resource_noserialize::<overlays::land_tiles::LandTilesUi>();
+    register_world_reset(overlays::land_tiles::reset);
     register_world_reset(|uiw, _| uiw.write::<DebugState>().connectivity = Default::default());
     register_world_reset(|uiw, _| {
         let mut draw = uiw.write::<ImmediateDraw>();

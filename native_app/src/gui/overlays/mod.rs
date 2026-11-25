@@ -1,4 +1,5 @@
 mod ground;
+pub(crate) mod land_tiles;
 mod legend;
 pub(crate) use ground::prepare_ground;
 pub(crate) use legend::UTILITY_EXPLANATION;

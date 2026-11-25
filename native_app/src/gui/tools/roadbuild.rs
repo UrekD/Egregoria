@@ -7,7 +7,7 @@ use simulation::map::{
     ConnectionError, LanePattern, LanePatternBuilder, Map, MapProject, ProjectFilter, ProjectKind,
     PylonPosition, RoadPreview, ROAD_Z_OFFSET,
 };
-use simulation::world_command::{WorldCommand, WorldCommands};
+use simulation::world_command::{Rejection, WorldCommand, WorldCommands};
 use simulation::Simulation;
 use BuildState::{Curved, CurvedConnection, Hover, Start, StartCurved};
 use ProjectKind::{Building, Ground, Intersection, Road};
@@ -298,7 +298,16 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
                 }
             }
             Err(error) => {
-                *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(error.to_string());
+                let message = match error {
+                    ConnectionError::LandDenied(reason) => {
+                        crate::gui::notifications::command_message(
+                            "MapMakeConnection",
+                            Rejection::LandDenied(*reason),
+                        )
+                    }
+                    _ => error.to_string().into(),
+                };
+                *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(message);
                 is_valid = false;
                 let (a, b) = match (
                     src.road_connection_position(map),

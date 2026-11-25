@@ -321,6 +321,7 @@ fn categories_list(uiworld: &UiWorld, sim: &Simulation) {
             }
         });
     }
+    crate::gui::overlays::land_tiles::toolbar(uiworld, sim);
 }
 
 /// A 64 px round toolbar tile drawn from an icon font glyph, for categories without artwork.

@@ -166,6 +166,7 @@ mod inner {
                     }
                 }
             }
+            crate::gui::overlays::land_tiles::receive_network(&state.uiw, &purchases);
             let mut received = ReceivedCommands::new(merged);
             received.tile_purchases = purchases;
             *state.uiw.write::<ReceivedCommands>() = received;

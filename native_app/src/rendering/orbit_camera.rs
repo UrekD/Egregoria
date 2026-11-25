@@ -268,12 +268,23 @@ impl OrbitCamera {
                     .unwrap_or_default())
             })
         };
-        let position = valid.map_or_else(default_position, |saved| Vec3::from(saved.position));
+        let tiled_view = valid
+            .is_none()
+            .then(|| crate::gui::overlays::land_tiles::opening_view(map))
+            .flatten();
+        let position = match (valid, tiled_view) {
+            (Some(saved), _) => Vec3::from(saved.position),
+            (_, Some((center, _))) => center,
+            _ => default_position(),
+        };
         let mut camera = Camera::new(position, self.camera.viewport_w, self.camera.viewport_h);
         if let Some(saved) = valid {
             camera.yaw = Radians(saved.yaw);
             camera.pitch = Radians(saved.pitch);
             camera.dist = saved.distance;
+        } else if let Some((_, span)) = tiled_view {
+            camera.pitch = Radians(1.25);
+            camera.dist = (span * 0.95).min(self.maxdist);
         }
         camera.update();
         *self = Self {

@@ -57,6 +57,7 @@ pub enum InputAction {
     SpeedMax,
     Cancel,
     Bulldozer,
+    OpenLandTiles,
 }
 
 // All unit inputs need to match
@@ -452,6 +453,7 @@ const DEFAULT_BINDINGS: &[(InputAction, &[&[UnitInput]])] = &[
     (OpenChat,        &[&[Key(K::c("T"))]]),
     (Cancel,          &[&[Mouse(Right)]]),
     (Bulldozer,       &[&[Key(K::c("B"))]]),
+    (OpenLandTiles,   &[&[Key(K::c("L"))]]),
 ];
 
 impl Default for Bindings {
@@ -514,7 +516,7 @@ impl Bindings {
 }
 
 fn added_later(action: &InputAction) -> bool {
-    matches!(action, Cancel | Bulldozer)
+    matches!(action, Cancel | Bulldozer | OpenLandTiles)
         || SPEED_DEFAULTS.iter().any(|(speed, _, _)| speed == action)
 }
 
@@ -1081,6 +1083,7 @@ impl Display for InputAction {
                 UpElevation => "Up Elevation",
                 DownElevation => "Down Elevation",
                 OpenEconomyMenu => "Economy Menu",
+                OpenLandTiles => "Land Tiles",
                 PausePlay => "Pause/Play",
                 Speed1 => "Simulation Speed 1×",
                 Speed3 => "Simulation Speed 3×",

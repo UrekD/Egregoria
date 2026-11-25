@@ -1,3 +1,4 @@
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File};
@@ -15,7 +16,8 @@ use serde::{Deserialize, Serialize};
 use simulation::economy::cargo::CargoBook;
 use simulation::economy::{Budget, CityStats, Government, ZoneDemand};
 use simulation::map::{
-    BuildingKind, Map, ProjectFilter, ProjectKind, RoadID, TraverseKind, Zone, ZoneGrid, ZoneKind,
+    BuildingKind, LandMode, LandTileId, Map, ProjectFilter, ProjectKind, RoadID, TraverseKind, Zone,
+    ZoneGrid, ZoneKind,
 };
 use simulation::transportation::traffic_metrics::{sample_road_users, TruckCargo};
 use simulation::transportation::{Location, VehicleKind};
@@ -32,6 +34,8 @@ use crate::gui::{
 use crate::session::{self, SessionScreen, SessionState, SlotCompatibility};
 use crate::sim_thread::{AppliedBatch, BatchId, Boundary, Reply, ReplyKind, Request, SimThread};
 use crate::uiworld::{SaveLoadState, UiWorld};
+
+mod land_fixture;
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
 static STARTUP: Mutex<Option<Automation>> = Mutex::new(None);
@@ -89,6 +93,11 @@ enum Step {
     SetOverlay(OverlayMode),
     SetSession(SessionScreen),
     OpenWindow(String),
+    NewTiledGame {
+        side: u16,
+        progression: simulation::economy::progression::ProgressionMode,
+    },
+    NewWetTiledFixture,
     LoadSlot(String),
     Assert(Assertion),
     Screenshot(String),
@@ -110,6 +119,15 @@ enum Assertion {
     NoRejections,
     ServicesTab,
     HouseInspector,
+    LandTiles {
+        tick: u64,
+        owned: BTreeSet<LandTileId>,
+        selected: Option<LandTileId>,
+        quote: Option<String>,
+        confirming: bool,
+        paid: Option<u32>,
+        treasury: u32,
+    },
     BuildingCount {
         prototype: String,
         count: usize,
@@ -163,11 +181,13 @@ enum PointerAction {
 enum PointerPosition {
     World { world_pos: [f32; 3] },
     Screen { screen_pos: [f32; 2] },
+    Centered { center_offset: [f32; 2] },
 }
 
 #[derive(Deserialize)]
 enum ScriptKey {
     Escape,
+    LandTiles,
 }
 
 enum PointerEvent {
@@ -210,6 +230,7 @@ pub(crate) struct Automation {
     fixture: Option<FixtureOutcome>,
     load_slot: Option<String>,
     first_rejection: Option<(&'static str, Rejection)>,
+    land_terrain_revision: Cell<Option<(u64, u64, u64)>>,
     _watchdog: mpsc::Sender<()>,
 }
 
@@ -257,6 +278,7 @@ pub(crate) fn configure() -> Result<(), String> {
         fixture: None,
         load_slot: None,
         first_rejection: None,
+        land_terrain_revision: Cell::new(None),
         _watchdog: watchdog,
     });
     Ok(())
@@ -651,7 +673,24 @@ impl Automation {
                     return Err("session screens are unavailable during multiplayer".into());
                 }
             }
+            Step::NewTiledGame { side, progression } => {
+                let sim = Simulation::new_game(&simulation::NewGameOptions {
+                    preset: simulation::MapPreset::Flat,
+                    land_mode: LandMode::Tiled,
+                    terrain_chunks: side,
+                    progression,
+                    starting_money_bucks: 150_000,
+                    ..simulation::NewGameOptions::default()
+                })
+                .map_err(|err| err.to_string())?;
+                replace_land_fixture(uiw, sim)?;
+            }
+            Step::NewWetTiledFixture => replace_land_fixture(uiw, land_fixture::wet_rectangle()?)?,
             Step::OpenWindow(name) => {
+                if name == "Land Tiles" && !uiw.read::<GuiState>().windows.land_tiles_open {
+                    crate::gui::overlays::land_tiles::toggle(uiw);
+                    return Ok(true);
+                }
                 let screen = match name.as_str() {
                     "Main Menu" => Some(SessionScreen::MainMenu),
                     "New Game" => Some(SessionScreen::NewGame),
@@ -833,6 +872,15 @@ impl Automation {
     }
 }
 
+fn replace_land_fixture(uiw: &UiWorld, sim: Simulation) -> Result<(), String> {
+    session::request_world_replacement(
+        uiw,
+        session::WorldReplacement::NewGame(sim, saveload::SlotId::legacy()),
+    )
+    .then_some(())
+    .ok_or_else(|| "creating a Land Tiles fixture requires singleplayer".into())
+}
+
 fn remember_rejection(first: &mut Option<(&'static str, Rejection)>, sim: &Simulation) {
     if first.is_none() {
         *first = sim.read::<CommandOutcomes>().last.first().copied();
@@ -885,6 +933,48 @@ impl Assertion {
                         .is_some_and(|kind| kind == BuildingKind::House)
                 {
                     return Err("house inspector is not open".into());
+                }
+            }
+            Self::LandTiles {
+                tick,
+                owned,
+                selected,
+                quote,
+                confirming,
+                paid,
+                treasury,
+            } => {
+                use crate::gui::overlays::land_tiles::LandTilesUi;
+                let map = sim.map();
+                let land = map.land_ownership();
+                let actual_owned: BTreeSet<_> = land.tiles().filter(|&tile| land.owns(tile)).collect();
+                let (_, _, water, terrain, _) = map.road_preview_revision();
+                drop(map);
+                let generation = uiw.read::<SessionState>().generation;
+                if let Some((previous_generation, previous_water, previous_terrain)) =
+                    automation
+                        .land_terrain_revision
+                        .replace(Some((generation, water, terrain)))
+                {
+                    if generation == previous_generation
+                        && (water, terrain) != (previous_water, previous_terrain)
+                    {
+                        return Err("land purchase changed a terrain or water revision".into());
+                    }
+                }
+                let actual_treasury = sim.read::<Government>().money.bucks();
+                let actual = uiw.read::<LandTilesUi>().script_state(sim);
+                let expected = (selected, quote, confirming, paid);
+                if !uiw.read::<GuiState>().windows.land_tiles_open
+                    || sim.get_tick() != tick
+                    || actual_owned != owned
+                    || actual != expected
+                    || actual_treasury != i64::from(treasury)
+                {
+                    return Err(format!(
+                        "land UI at tick {} with treasury {actual_treasury} and owned {actual_owned:?}: expected {expected:?}, got {actual:?}",
+                        sim.get_tick(),
+                    ));
                 }
             }
             Self::BuildingCount { prototype, count } => {
@@ -1003,6 +1093,10 @@ impl PointerPosition {
                 screen
             }
             Self::Screen { screen_pos: [x, y] } => vec2(x, y),
+            Self::Centered { center_offset: [x, y] } => {
+                let camera = uiw.camera();
+                vec2(camera.camera.viewport_w * 0.5 + x, camera.camera.viewport_h * 0.5 + y)
+            }
         };
         if screen.is_finite() {
             Ok(screen)
@@ -1048,6 +1142,7 @@ impl ScriptKey {
     fn send(self, ctx: &mut Context, down: bool) {
         let (key, code) = match self {
             Self::Escape => (Key::Escape, yakui::input::KeyCode::Escape),
+            Self::LandTiles => (Key::c("L"), yakui::input::KeyCode::KeyL),
         };
         let captured = ctx
             .yakui
