@@ -68,7 +68,7 @@ mkdir -p -- "$out"
 for slot in "${slots[@]}"; do
     [[ ! -e $out/$slot.zip ]]
     cat VERSION > "$out/$slot.zip"
-    printf 'metadata\n' > "$out/$slot.meta.json"
+    printf '{"population":%s}\n' "${TEST_CITYMAP_POPULATION:-2600}" > "$out/$slot.meta.json"
 done
 EOF
 
@@ -104,6 +104,17 @@ expect_members lesce_osm lesce_town showcase_city starter_town
 build
 expect_trace package
 
+meta="$CARGO_TARGET_DIR/windows-slots/current/slots/lesce_town.meta.json"
+cp -- "$meta" "$root/good-meta.json"
+printf '{"population":0}\n' > "$meta"
+if build > "$root/cached-unpopulated.log" 2>&1; then
+    printf 'Build reused an unpopulated Lesce Town slot\n' >&2
+    exit 1
+fi
+rg 'lesce_town.*population' "$root/cached-unpopulated.log"
+[[ ! -s $TRACE ]]
+cp -- "$root/good-meta.json" "$meta"
+
 printf '1.0.1\n' > VERSION
 build
 expect_trace demo-cities osm-city citymap-build package
@@ -130,6 +141,15 @@ for result in fail omit; do
     fi
     expect_members lesce_osm lesce_town showcase_city starter_town
 done
+
+printf 'new Sava input\n' >> sava.json
+if TEST_CITYMAP_POPULATION=0 build > "$root/unpopulated.log" 2>&1; then
+    printf 'Build accepted an unpopulated Lesce Town slot\n' >&2
+    exit 1
+fi
+rg 'lesce_town.*population' "$root/unpopulated.log"
+expect_trace demo-cities osm-city citymap-build
+expect_members lesce_osm lesce_town showcase_city starter_town
 
 build EGR_OSM_INPUT="$root/lesce.json" BUILD_CITYMAP=
 expect_trace demo-cities osm-city package

@@ -1,0 +1,13 @@
+[
+  {"LoadSlot": "lesce_town"},
+  {"WaitFrames": 6},
+  {"Screenshot": "citymap-opening"},
+  {"Camera": {"x": 1785, "y": 1240, "z": 10, "yaw": -0.32, "pitch": 1.03, "dist": 850}},
+  {"WaitFrames": 6},
+  {"Screenshot": "citymap-sava-bridges"},
+  {"Camera": {"x": 2060, "y": 2000, "z": 10, "yaw": 0, "pitch": 1.55, "dist": 2950}},
+  {"OpenWindow": "Land Tiles"},
+  {"WaitFrames": 6},
+  {"Screenshot": "citymap-land-tiles"},
+  "Exit"
+]

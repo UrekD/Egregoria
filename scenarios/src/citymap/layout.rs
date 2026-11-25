@@ -746,6 +746,133 @@ fn authored_river(source: &[RiverReach], config: TownConfig) -> Result<RiverReac
     })
 }
 
+pub(super) fn extend_gateways(plan: &mut TownPlan) -> Result<(), String> {
+    plan.graph.wet = true;
+    let extent = f32::from(plan.config.map_chunks) * 512.0;
+    for (class, names) in [
+        (
+            RoadClass::Motorway,
+            ["a2-outer-north", "a2-outer-southeast"],
+        ),
+        (RoadClass::Rail, ["rail-outer-north", "rail-outer-south"]),
+    ] {
+        let mut cuts: Vec<_> = plan
+            .graph
+            .links
+            .values()
+            .filter(|link| link.class == class)
+            .flat_map(|link| link.endpoints)
+            .filter(|key| matches!(key, SourceKey::Cut { .. }))
+            .collect();
+        cuts.sort_by(|a, b| {
+            plan.graph.junctions[b]
+                .position
+                .y
+                .total_cmp(&plan.graph.junctions[a].position.y)
+        });
+        let [north, south] = cuts.as_slice() else {
+            return Err(format!("expected two {class:?} gateways"));
+        };
+        for (&cut, name) in [north, south].into_iter().zip(names) {
+            let start = plan.graph.junctions[&cut].position.xy();
+            let axis = [
+                (start.x - plan.config.owned_min.x, -Vec2::X),
+                (start.y - plan.config.owned_min.y, -Vec2::Y),
+                (plan.config.owned_max.x - start.x, Vec2::X),
+                (plan.config.owned_max.y - start.y, Vec2::Y),
+            ]
+            .into_iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap()
+            .1;
+            let (way, edge, toward) = plan
+                .outer_corridor_traces
+                .iter()
+                .filter(|trace| trace.class == class)
+                .flat_map(|trace| {
+                    let points = &trace.points;
+                    [
+                        (trace.way, points[0], points[1]),
+                        (
+                            trace.way,
+                            points[points.len() - 1],
+                            points[points.len() - 2],
+                        ),
+                    ]
+                })
+                .filter(|&(_, edge, _)| {
+                    let boundary = if axis.x + axis.y > 0.0 { extent } else { 0.0 };
+                    (edge.dot(axis).abs() - boundary).abs() < 0.1
+                })
+                .min_by(|a, b| a.1.distance2(start).total_cmp(&b.1.distance2(start)))
+                .ok_or_else(|| format!("no outer OSM alignment for {name}"))?;
+            // Match the TILES gateway inset while keeping the terminal sweep on the map.
+            let end = edge + (toward - edge) * (8.0 / (edge - toward).dot(axis));
+            let key = SourceKey::Authored(name);
+            let mut terminal = JunctionSpec::new(key, end);
+            terminal.position.z = plan.graph.junctions[&cut].position.z;
+            terminal.turn = plan.graph.junctions[&cut].turn;
+            plan.graph.junctions.insert(key, terminal);
+            add_authored_road(&mut plan.graph, key, [cut, key], class, None, 0);
+            plan.graph.links.get_mut(&key).unwrap().lineage.insert(way);
+            plan.graph.record(
+                "continue the gateway to the terrain edge on the OSM alignment",
+                &[cut, key],
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn fit_wet_approaches(plan: &mut TownPlan) -> Result<(), String> {
+    let graph = &mut plan.graph;
+    let [rim, town] = plan.crossings.as_mut_slice() else {
+        return Err("wet CITYMAP needs two Sava crossings".into());
+    };
+    let parkway = SourceKey::Authored("sava-far-bank-parkway");
+    let rim_ramp = SourceKey::Authored("sava-rim-park-ramp");
+    let town_ramp = SourceKey::Authored("sava-town-park-ramp");
+    let [park_west, park_east] = [
+        (SourceKey::Authored("sava-park-west"), vec2(953.0, 720.0)),
+        (SourceKey::Authored("sava-park-east"), vec2(1160.0, 607.0)),
+    ]
+    .map(|(key, point)| {
+        let junction = JunctionSpec::new(key, design_point(point, plan.config));
+        graph.junctions.insert(key, junction);
+        key
+    });
+    for (crossing, ramp, bank) in [(rim, rim_ramp, park_west), (town, town_ramp, park_east)] {
+        add_authored_road(
+            graph,
+            ramp,
+            [crossing.approaches_keys[1], bank],
+            RoadClass::Collector,
+            None,
+            0,
+        );
+        crossing.approaches_links[1] = ramp;
+        for link in crossing.approaches_links {
+            for key in graph.links[&link].endpoints {
+                let height = &mut graph.junctions.get_mut(&key).unwrap().position.z;
+                *height = height.max(10.6);
+            }
+        }
+    }
+    add_authored_road(
+        graph,
+        parkway,
+        [park_west, park_east],
+        RoadClass::Collector,
+        Some(design_point(vec2(1056.0, 650.0), plan.config)),
+        0,
+    );
+    graph.record(
+        "return the far-bank parkway to ground level between the bridge ramps",
+        &[rim_ramp, parkway, town_ramp],
+    );
+    Ok(())
+}
+
 fn water_reservations(
     river: &RiverReach,
     graph: &mut Graph,

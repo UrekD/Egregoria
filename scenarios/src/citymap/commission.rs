@@ -1,6 +1,6 @@
 use super::adapters::{
     apply, crosses_reserved_bank, downtown_cells, frontage_roads, place_company,
-    place_scored_company, place_special, site_clear, water_sites,
+    place_scored_company, place_special, site_clear, water_site,
 };
 use super::network::close_pairs;
 use super::{blocks, contains, BuiltNetwork, RoadClass, SourceKey, TownPlan};
@@ -30,6 +30,7 @@ use simulation::map_dynamic::{
 use simulation::souls::freight_station::{train_stop, FreightTrainState};
 use simulation::souls::{
     growth::check_growable_lot,
+    human::HumanDecisionKind,
     residence::{is_retail_store, Residences},
 };
 use simulation::transportation::{
@@ -66,6 +67,14 @@ pub struct OpeningManifest {
     reserves: Vec<Parcel>,
     lines: BTreeMap<&'static str, BusLine>,
     freight: Freight,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cross_bank: Option<CrossBank>,
+}
+
+#[derive(Serialize)]
+struct CrossBank {
+    park: BuildingID,
+    stop: StopID,
 }
 
 #[derive(Clone, Serialize)]
@@ -194,6 +203,15 @@ pub fn commission(
     plan: &TownPlan,
     built: &BuiltNetwork,
 ) -> Result<OpeningManifest, String> {
+    commission_opening(sim, plan, built, None)
+}
+
+pub(super) fn commission_opening(
+    sim: &mut Simulation,
+    plan: &TownPlan,
+    built: &BuiltNetwork,
+    freight: Option<FreightSetup>,
+) -> Result<OpeningManifest, String> {
     let roads = frontage_roads(plan, built);
     let at = |x, y| super::layout::design_point(vec2(x, y), plan.config);
     let cohorts = [
@@ -239,8 +257,17 @@ pub fn commission(
         },
     ];
     let mut sites = BTreeMap::new();
-    let (terminal, market, train, market_lane, market_offset, platform) =
-        place_freight(sim, plan, built, &roads)?;
+    let FreightSetup {
+        terminal,
+        market,
+        train,
+        market_lane,
+        market_offset,
+        platform,
+    } = match freight {
+        Some(freight) => freight,
+        None => prepare_freight(sim, plan, built)?,
+    };
     let bakery_anchor = sim.map().buildings()[terminal].door_pos.xy();
     let buyer = place_company(sim, plan, &roads, "bakery", bakery_anchor)?.0;
     sites.insert("rail-bakery".into(), buyer);
@@ -248,17 +275,46 @@ pub fn commission(
 
     // Give the utilities access to the same labour pool as the shops.
     // A sixth pair covers the utility margin after the reserves are built.
-    let utility_anchors = cohorts.iter().map(|cohort| cohort.anchor)
-        .chain([at(1735.0, 1050.0)]);
-    for (index, anchor) in utility_anchors.enumerate() {
-        for (name, building) in ["water-pump", "sewage-outlet"].into_iter().zip(water_sites(
+    let wet = sim.map().environment().has_water_configuration();
+    let wet_intake = at(760.0, 940.0);
+    let wet_outlet = at(1630.0, 510.0);
+    let mut utilities: Vec<_> = cohorts
+        .iter()
+        .map(|cohort| cohort.anchor)
+        .chain([at(1735.0, 1050.0)])
+        .enumerate()
+        .flat_map(|(index, anchor)| {
+            [("water-pump", wet_intake), ("sewage-outlet", wet_outlet)]
+                .map(|(name, shore)| (name, index + 1, if wet { shore } else { anchor }))
+        })
+        .collect();
+    if wet {
+        // Install all upstream intakes before choosing downstream outlets.
+        utilities.sort_by_key(|&(name, _, _)| name != "water-pump");
+    }
+    for (name, index, anchor) in utilities {
+        let building = water_site(sim, plan, &roads, name, anchor)?;
+        sites.insert(format!("{name}-{index}"), building);
+    }
+    if wet {
+        let parkway = plan
+            .riverside_park
+            .as_ref()
+            .ok_or("missing Sava park reservation")?;
+        let road = built.links[&parkway.far_bank_access].road;
+        let anchor = at(1056.0, 650.0);
+        let (park, _) = place_scored_company(
             sim,
             plan,
-            &roads,
-            anchor,
-        )?) {
-            sites.insert(format!("{name}-{}", index + 1), building);
-        }
+            &BTreeSet::from([road]),
+            "park",
+            |_, _, footprint| {
+                let center = footprint.center();
+                (center.y < anchor.y).then(|| center.distance2(anchor))
+            },
+        )?
+        .ok_or("no dry park site on the far-bank parkway")?;
+        sites.insert("sava/far-bank-park".into(), park);
     }
     // Use the frontage between South and West so mine drivers can reach work
     // and deliver fuel without competing for the terminal's delivery fleet.
@@ -498,7 +554,14 @@ pub fn commission(
     record_development(&sim.map(), &mut parcels);
     verify_votes(sim, parcels.iter())?;
 
-    let lines = install_bus_loops(sim, built, plan, &cohorts, &parcels)?;
+    let park = sites.get("sava/far-bank-park").copied();
+    let (lines, far_stop) = install_bus_loops(sim, built, plan, &cohorts, &parcels, park)?;
+    if park.is_some() && far_stop.is_none() {
+        return Err("Sava park is missing its bus stop".into());
+    }
+    let cross_bank = park
+        .zip(far_stop)
+        .map(|(park, stop)| CrossBank { park, stop });
     let freight = Freight {
         terminal,
         station,
@@ -545,6 +608,7 @@ pub fn commission(
         reserves,
         lines,
         freight,
+        cross_bank,
     })
 }
 
@@ -576,20 +640,21 @@ fn expand_cereal_fields(
                     outward.mag() + extra,
                     along.mag(),
                 );
+                let command = WorldCommand::UpdateZone {
+                    building: farm,
+                    zone: Zone::new(Polygon(field.corners.to_vec()), along),
+                };
                 (site_clear(&map, plan, field, Some(farm))
                     && !parcels
                         .iter()
                         .chain(reserves)
-                        .any(|parcel| parcel.footprint.intersects(&field)))
-                .then(|| Zone::new(Polygon(field.corners.to_vec()), along))
+                        .any(|parcel| parcel.footprint.intersects(&field))
+                    && (map.land_ownership().extent().is_none() || command.preview(sim).is_ok()))
+                .then_some(command)
             })
         };
-        if let Some(zone) = field {
-            apply(
-                sim,
-                "enlarge cereal field",
-                &[WorldCommand::UpdateZone { building: farm, zone }],
-            )?;
+        if let Some(command) = field {
+            apply(sim, "enlarge cereal field", &[command])?;
         }
     }
     Ok(())
@@ -635,12 +700,21 @@ fn verify_parking_pair(map: &Map, a: BuildingID, b: BuildingID, tick: Tick) -> R
     ))
 }
 
-fn place_freight(
+pub(super) struct FreightSetup {
+    pub terminal: BuildingID,
+    pub market: BuildingID,
+    train: TrainID,
+    market_lane: LaneID,
+    market_offset: f32,
+    platform: Vec3,
+}
+
+pub(super) fn prepare_freight(
     sim: &mut Simulation,
     plan: &TownPlan,
     built: &BuiltNetwork,
-    roads: &BTreeSet<RoadID>,
-) -> Result<(BuildingID, BuildingID, TrainID, LaneID, f32, Vec3), String> {
+) -> Result<FreightSetup, String> {
+    let roads = frontage_roads(plan, built);
     let wagons = vec![
         RollingStockID::new("locomotive"),
         RollingStockID::new("freight-wagon"),
@@ -666,10 +740,10 @@ fn place_freight(
             .collect();
         let mut platforms = Vec::new();
         let mut markets = Vec::new();
-        for lane in built
+        for (key, lane) in built
             .links
-            .values()
-            .flat_map(|span| span.lanes.iter().copied())
+            .iter()
+            .flat_map(|(&key, span)| span.lanes.iter().map(move |&lane| (key, lane)))
         {
             let live = &map.lanes()[lane];
             if live.kind != LaneKind::Rail {
@@ -690,6 +764,12 @@ fn place_freight(
                     lane,
                     offset as f32,
                 ));
+                if matches!(
+                    key,
+                    SourceKey::Authored("rail-outer-north" | "rail-outer-south")
+                ) {
+                    continue;
+                }
                 for dir in [dir, -dir] {
                     let across = dir.perpendicular();
                     let center = on_track.xy() - dir * 75.0 + across * 40.0;
@@ -783,7 +863,14 @@ fn place_freight(
                 .keys()
                 .next()
                 .ok_or("missing freight train")?;
-            return Ok((terminal, market, train, lane, offset, *platform_stop));
+            return Ok(FreightSetup {
+                terminal,
+                market,
+                train,
+                market_lane: lane,
+                market_offset: offset,
+                platform: *platform_stop,
+            });
         }
     }
     Err(format!(
@@ -1562,7 +1649,7 @@ struct CurbBerth {
     dir: Vec2,
 }
 
-fn loop_distance(map: &Map, stops: &[CurbBerth; 3], tick: Tick) -> Option<f32> {
+fn loop_distance(map: &Map, stops: &[CurbBerth], tick: Tick) -> Option<f32> {
     let mut distance = 0.0;
     for (from, to) in stops.iter().zip(stops.iter().cycle().skip(1)) {
         let route = Itinerary::route_to_lane(tick, from.pos, map, to.lane, to.offset)?;
@@ -1593,29 +1680,44 @@ fn install_bus_loops(
     plan: &TownPlan,
     cohorts: &[Cohort],
     parcels: &[Parcel],
-) -> Result<BTreeMap<&'static str, BusLine>, String> {
-    let anchors = [
+    far_bank_park: Option<BuildingID>,
+) -> Result<(BTreeMap<&'static str, BusLine>, Option<StopID>), String> {
+    let mut anchors = vec![
         cohorts[0].anchor, // Shared civic hub.
         cohorts[2].anchor, // South.
         cohorts[3].anchor, // West.
         super::layout::design_point(vec2(1920.0, 2400.0), plan.config),
         super::layout::design_point(vec2(2390.0, 2540.0), plan.config), // Employment frontage.
     ];
+    let parkway = far_bank_park.map(|park| {
+        let map = sim.map();
+        let park = &map.buildings()[park];
+        anchors.push(park.door_pos.xy());
+        park.connected_road.unwrap()
+    });
+    let park_index = 5;
+    let neighbourhood: &[usize] = if parkway.is_some() {
+        &[0, 1, park_index, 2]
+    } else {
+        &[0, 1, 2]
+    };
     let routes = [
         // South to West has a long detour around the walking-only link.
-        ("neighbourhood", [0, 1, 2], 7),
-        ("employment", [0, 3, 4], 6),
+        ("neighbourhood", neighbourhood, 7),
+        ("employment", &[0, 3, 4][..], 6),
     ];
     let berths = {
         let map = sim.map();
         let mut options = Vec::new();
         let mut used = BTreeSet::new();
         let walk = ServiceReach::new(&map, true);
-        for (index, anchor) in anchors.into_iter().enumerate() {
-            let district = [0, 2, 3, 1, 4][index];
+        for (index, &anchor) in anchors.iter().enumerate() {
+            let district = [Some(0), Some(2), Some(3), Some(1), Some(4), None][index];
             let destinations: Vec<_> = parcels
                 .iter()
-                .filter(|p| p.district == cohorts[district].district)
+                .filter(|p| {
+                    district.is_some_and(|district| p.district == cohorts[district].district)
+                })
                 .filter_map(|p| {
                     Some((
                         walk.position(p.road, p.footprint.center())?,
@@ -1640,7 +1742,11 @@ fn install_bus_loops(
                 .links
                 .iter()
                 .filter(|(key, span)| {
-                    !used.contains(&span.road)
+                    if index == park_index {
+                        return Some(span.road) == parkway;
+                    }
+                    Some(span.road) != parkway
+                        && !used.contains(&span.road)
                         && matches!(
                             plan.graph.links[key].class,
                             RoadClass::Local | RoadClass::Collector | RoadClass::Avenue
@@ -1677,7 +1783,7 @@ fn install_bus_loops(
                     Some((span.road, berths))
                 })
                 .filter(|(_, berths)| {
-                    let radius = if district == 4 { 350.0 } else { 430.0 };
+                    let radius = if district == Some(4) { 350.0 } else { 430.0 };
                     berths[0].pos.xy().distance(anchor) < radius
                 })
                 .map(|(road, berths)| {
@@ -1707,8 +1813,10 @@ fn install_bus_loops(
                 .map(|(i, berths)| berths[(mask >> i) & 1])
                 .collect();
             let legs = routes.map(|(_, indices, _)| {
-                let a = indices.map(|i| candidate[i]);
-                let b = [a[0], a[2], a[1]];
+                let a: Vec<_> = indices.iter().map(|&i| candidate[i]).collect();
+                let b = std::iter::once(a[0])
+                    .chain(a[1..].iter().rev().copied())
+                    .collect();
                 [a, b]
                     .into_iter()
                     .filter_map(|stops| Some((loop_distance(&map, &stops, tick)?, stops)))
@@ -1727,6 +1835,7 @@ fn install_bus_loops(
 
     let mut lines = BTreeMap::new();
     let mut stops_by_lane = BTreeMap::new();
+    let mut far_stop = None;
     for ((key, _, vehicles), berths) in routes.into_iter().zip(berths) {
         let mut stops = Vec::new();
         let mut lanes = Vec::new();
@@ -1754,6 +1863,9 @@ fn install_bus_loops(
             };
             stops.push(stop);
             lanes.push(berth.lane);
+            if Some(sim.map().lanes()[berth.lane].parent) == parkway {
+                far_stop = Some(stop);
+            }
         }
         let before: BTreeSet<_> = sim.read::<Transit>().lines.keys().collect();
         apply(
@@ -1793,7 +1905,7 @@ fn install_bus_loops(
             },
         );
     }
-    Ok(lines)
+    Ok((lines, far_stop))
 }
 
 fn population_change_ok(earlier: u64, later: u64) -> bool {
@@ -2298,7 +2410,6 @@ fn verify_infill(
                 })
                 .collect::<Option<_>>()
                 .ok_or_else(|| format!("{name} bus lost its berth after the infill road edit"))?;
-            let berths = berths.try_into().map_err(|_| "unexpected number of infill stops")?;
             if loop_distance(&map, &berths, Tick(sim.get_tick())).is_none() {
                 return Err(format!("{name} bus lost its directed loop after the infill road edit"));
             }
@@ -2797,6 +2908,7 @@ struct PassengerEvidence {
     aboard_at_start: BTreeSet<HumanID>,
     completed: BTreeMap<LineID, u64>,
     examples: BTreeMap<LineID, PassengerArrival>,
+    cross_bank_arrival: Option<PassengerArrival>,
 }
 
 struct PassengerJourney {
@@ -2810,7 +2922,7 @@ struct PassengerJourney {
     alighted: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 struct PassengerArrival {
     passenger: HumanID,
     board: StopID,
@@ -2831,7 +2943,13 @@ impl PassengerEvidence {
         }
     }
 
-    fn observe(&mut self, sim: &Simulation, transit: &Transit, tick: u64) {
+    fn observe(
+        &mut self,
+        sim: &Simulation,
+        transit: &Transit,
+        tick: u64,
+        controlled: Option<(&CrossBank, LineID, &BTreeSet<HumanID>)>,
+    ) {
         let world = sim.world();
         self.aboard_at_start.retain(|&id| world.humans.get(id)
             .is_some_and(|human| matches!(human.location, Location::Transit(_))));
@@ -2863,15 +2981,25 @@ impl PassengerEvidence {
                 journey.alighted = true;
             }
             if human.location == Location::Building(journey.destination) && router.trip_start.is_none() {
-                *self.completed.entry(journey.line).or_default() += 1;
-                self.examples.entry(journey.line).or_insert(PassengerArrival {
+                let arrival = PassengerArrival {
                     passenger: id,
                     board: journey.board,
                     alight: journey.alight,
                     destination: journey.destination,
                     purpose: journey.purpose,
                     elapsed_tick: tick,
-                });
+                };
+                if controlled.is_some_and(|(bank, line, riders)| {
+                    journey.destination == bank.park
+                        && journey.alight == bank.stop
+                        && journey.line == line
+                        && riders.contains(&id)
+                        && router.personal_car.is_none()
+                }) {
+                    self.cross_bank_arrival = Some(arrival);
+                }
+                *self.completed.entry(journey.line).or_default() += 1;
+                self.examples.entry(journey.line).or_insert(arrival);
                 return false;
             }
             router.trip_start == Some(journey.started)
@@ -2922,6 +3050,77 @@ impl PassengerEvidence {
             }
         }
     }
+}
+
+pub(super) fn verify_cross_bank_trip(
+    mut sim: Simulation,
+    manifest: &OpeningManifest,
+) -> Result<serde_json::Value, String> {
+    let bank = manifest
+        .cross_bank
+        .as_ref()
+        .ok_or("wet opening has no far-bank destination")?;
+    let line = &manifest.lines["neighbourhood"];
+    let riders = {
+        let map = sim.map();
+        let transit = sim.read::<Transit>();
+        let stops: Vec<_> = line
+            .stops
+            .iter()
+            .filter(|&&stop| stop != bank.stop)
+            .map(|&stop| transit.stops[stop].walk_pos)
+            .collect();
+        let mut candidates: Vec<_> = sim
+            .world()
+            .humans
+            .iter()
+            .filter_map(|(id, human)| {
+                if human.router.personal_car.is_some()
+                    || human.location != Location::Building(human.home.house)
+                {
+                    return None;
+                }
+                let door = map.get(human.home.house)?.door_pos;
+                let access = stops
+                    .iter()
+                    .map(|stop| stop.distance2(door))
+                    .fold(f32::INFINITY, f32::min);
+                Some((access, id))
+            })
+            .collect();
+        candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+        candidates
+            .into_iter()
+            .take(12)
+            .map(|(_, id)| id)
+            .collect::<BTreeSet<_>>()
+    };
+    if riders.is_empty() {
+        return Err("no carless residents at home for the cross-Sava bus fixture".into());
+    }
+    // Give existing carless residents an ordinary destination in this disposable reload.
+    // The router chooses the mode and the scheduled service must carry them there.
+    for &id in &riders {
+        let human = &mut sim.world_mut_unchecked().humans[id];
+        human.router.use_vehicle(None);
+        human.decision.kind = HumanDecisionKind::GoTo(Destination::Building(bank.park));
+        human.decision.wait = 0;
+    }
+    let mut schedule = Simulation::schedule();
+    let mut passengers = PassengerEvidence::new(&sim);
+    for _ in 0..4 * TICKS_PER_HOUR {
+        sim.tick(&mut schedule, []);
+        passengers.observe(
+            &sim,
+            &sim.read::<Transit>(),
+            elapsed_tick(&sim).0,
+            Some((bank, line.id, &riders)),
+        );
+        if let Some(arrival) = passengers.cross_bank_arrival {
+            return serde_json::to_value(arrival).map_err(|error| error.to_string());
+        }
+    }
+    Err("no carless passenger completed a one-seat trip to the far-bank park".into())
 }
 
 #[derive(Default, Serialize)]
@@ -3438,7 +3637,7 @@ pub fn check_loaded_opening(
             {
                 let transit = sim.read::<Transit>();
                 loops.observe(&transit);
-                passengers.observe(&sim, &transit, tick);
+                passengers.observe(&sim, &transit, tick, None);
             }
             if tick < end {
                 freight.observe(&sim, &manifest.freight, tick);
@@ -3644,6 +3843,28 @@ pub fn check_loaded_opening(
 }
 
 impl OpeningReport {
+    pub(super) fn sava_traffic(
+        &self,
+        plan: &TownPlan,
+        built: &BuiltNetwork,
+    ) -> Result<BTreeMap<&'static str, u64>, String> {
+        plan.crossings
+            .iter()
+            .map(|crossing| {
+                let count = built.links[&crossing.bridge]
+                    .lanes
+                    .iter()
+                    .filter_map(|lane| self.traffic.directional_entries.get(lane))
+                    .sum();
+                if count == 0 {
+                    Err(format!("scored traffic did not traverse {}", crossing.key))
+                } else {
+                    Ok((crossing.key, count))
+                }
+            })
+            .collect()
+    }
+
     pub fn verify(&self) -> Result<(), String> {
         if self.failures.is_empty() {
             Ok(())

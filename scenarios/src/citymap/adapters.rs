@@ -10,8 +10,8 @@ use std::collections::BTreeSet;
 
 use super::{BuiltNetwork, TownPlan};
 
-/// The dry opening expresses downtown mixed-use intent as distinct High lots.
-/// A future ZONES2 integration can replace this assignment at the parcel seam.
+/// TODO(MXENABLE): Use the released Mixed Use parcel intent at this seam.
+/// Downtown currently uses separate High residential and commercial lots.
 pub(super) fn downtown_cells() -> (ZoneCell, ZoneCell) {
     use simulation::map::{Density::High, ZoneKind::*};
     (
@@ -28,27 +28,25 @@ pub(super) fn downtown_cells() -> (ZoneCell, ZoneCell) {
 
 /// The W3 site solver resolves legacy road connections on dry terrain and
 /// enforces live shore contact and intake/outlet order on configured terrain.
-pub(super) fn water_sites(
+pub(super) fn water_site(
     sim: &mut Simulation,
     plan: &TownPlan,
     roads: &BTreeSet<RoadID>,
+    name: &str,
     anchor: Vec2,
-) -> Result<[BuildingID; 2], String> {
-    let place = |sim: &mut Simulation, name: &str| {
-        let kind = BuildingKind::GoodsCompany(GoodsCompanyID::new(name));
-        let (building, _) =
-            place_scored_company(sim, plan, roads, name, |map, road, footprint| {
-                let request = WaterSiteRequest::for_placement(kind, footprint, Some(road))?;
-                water_service_site(map, request, &river_site_summary(map)).ok()?;
-                Some(footprint.center().distance2(anchor))
-            })?
-            .ok_or_else(|| format!("no clear W3 site for {name}"))?;
-        water_provider_site(&sim.map(), building)
-            .ok_or_else(|| format!("missing W3 provider site for {name}"))?
-            .map_err(|error| format!("invalid W3 provider site for {name}: {error}"))?;
-        Ok::<_, String>(building)
-    };
-    Ok([place(sim, "water-pump")?, place(sim, "sewage-outlet")?])
+) -> Result<BuildingID, String> {
+    let kind = BuildingKind::GoodsCompany(GoodsCompanyID::new(name));
+    let summary = river_site_summary(&sim.map());
+    let (building, _) = place_scored_company(sim, plan, roads, name, |map, road, footprint| {
+        let request = WaterSiteRequest::for_placement(kind, footprint, Some(road))?;
+        water_service_site(map, request, &summary).ok()?;
+        Some(footprint.center().distance2(anchor))
+    })?
+    .ok_or_else(|| format!("no clear W3 site for {name} near {anchor:?}"))?;
+    water_provider_site(&sim.map(), building)
+        .ok_or_else(|| format!("missing W3 provider site for {name}"))?
+        .map_err(|error| format!("invalid W3 provider site for {name}: {error}"))?;
+    Ok(building)
 }
 
 pub(super) fn frontage_roads(plan: &TownPlan, built: &BuiltNetwork) -> BTreeSet<RoadID> {
@@ -107,6 +105,9 @@ pub(super) fn place_scored_company(
     let id = GoodsCompanyID::new(name);
     let proto = try_prototype(id).ok_or_else(|| format!("missing CITYMAP prototype {name}"))?;
     let kind = BuildingKind::GoodsCompany(id);
+    let gen = BuildingGen::NoWalkway {
+        door_pos: geom::vec2(0.0, -proto.size.h * 0.5),
+    };
     let (obb, road) = {
         let map = sim.map();
         let mut best = None;
@@ -134,7 +135,10 @@ pub(super) fn place_scored_company(
                     if best.as_ref().is_some_and(|(old, _, _)| score >= *old) {
                         continue;
                     }
-                    if site_clear(&map, plan, footprint, None) {
+                    if site_clear(&map, plan, footprint, None)
+                        && (map.land_ownership().extent().is_none()
+                            || special_command(kind, footprint, gen, id).preview(sim).is_ok())
+                    {
                         best = Some((score, footprint, id));
                     }
                 }
@@ -144,9 +148,6 @@ pub(super) fn place_scored_company(
             return Ok(None);
         };
         (footprint, road)
-    };
-    let gen = BuildingGen::NoWalkway {
-        door_pos: geom::vec2(0.0, -proto.size.h * 0.5),
     };
     let building = place_special(sim, name, kind, obb, gen, road)?;
     Ok(Some((building, road)))
@@ -190,6 +191,26 @@ pub(super) fn crosses_reserved_bank(plan: &TownPlan, footprint: OBB) -> bool {
     })
 }
 
+fn special_command(
+    kind: BuildingKind,
+    footprint: OBB,
+    gen: BuildingGen,
+    road: RoadID,
+) -> WorldCommand {
+    let zone = kind
+        .as_goods_company()
+        .and_then(try_prototype)
+        .and_then(|company| company.zone.as_ref())
+        .map(|_| Zone::new(Polygon(footprint.corners.to_vec()), footprint.axis()[0]));
+    WorldCommand::MapBuildSpecialBuilding {
+        pos: footprint,
+        kind,
+        gen,
+        zone,
+        connected_road: Some(road),
+    }
+}
+
 pub(super) fn place_special(
     sim: &mut Simulation,
     key: &str,
@@ -198,22 +219,7 @@ pub(super) fn place_special(
     gen: BuildingGen,
     road: RoadID,
 ) -> Result<BuildingID, String> {
-    let zone = kind
-        .as_goods_company()
-        .and_then(try_prototype)
-        .and_then(|company| company.zone.as_ref())
-        .map(|_| Zone::new(Polygon(footprint.corners.to_vec()), footprint.axis()[0]));
-    apply(
-        sim,
-        key,
-        &[WorldCommand::MapBuildSpecialBuilding {
-            pos: footprint,
-            kind,
-            gen,
-            zone,
-            connected_road: Some(road),
-        }],
-    )?;
+    apply(sim, key, &[special_command(kind, footprint, gen, road)])?;
     sim.map()
         .buildings()
         .values()

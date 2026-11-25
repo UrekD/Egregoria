@@ -4,7 +4,7 @@ use geom::{vec2, PolyLine3, Spline, Vec2, Vec3};
 use serde::Serialize;
 use simulation::map::{
     Environment, Intersection, IntersectionID, Intersections, LaneID, LaneKind, LanePattern,
-    LanePatternBuilder, Lanes, LightPolicy, Map, MapProject, ParkingSpots, PathKind, Pathfinder,
+    LanePatternBuilder, Lanes, LightPolicy, Map, MapProject, ParkingSpots, PathKind, Pathfinder, ProjectKind,
     Road, RoadID, RoadSegmentKind, Roads, SpatialMap, Traversable, TraverseDirection, TraverseKind,
     TurnKind, TurnPolicy, MAX_SLOPE, ROAD_Z_OFFSET,
 };
@@ -214,6 +214,8 @@ pub struct Graph {
     #[serde(serialize_with = "values")]
     pub links: BTreeMap<SourceKey, LinkSpec>,
     pub decisions: Vec<Decision>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(super) wet: bool,
 }
 
 fn values<S: serde::Serializer, T: Serialize>(
@@ -2072,15 +2074,15 @@ pub struct DirectedSpan {
     pub length: f32,
 }
 
-/// Apply a single normal road command batch. A rejection leaves a partial
-/// candidate, so callers build in a disposable world and discard it on error.
+/// Apply normal road commands in a disposable world. Wet topology work is
+/// bounded per command, so carry live endpoint IDs between small batches.
 pub fn build_network(
     sim: &mut Simulation,
     graph: &Graph,
     limits: SpacingLimits,
 ) -> Result<BuiltNetwork, String> {
     validate_plan(graph, limits)?;
-    let projects: Vec<_> = graph
+    let mut projects: Vec<_> = graph
         .junctions
         .values()
         .map(|junction| MapProject::ground(junction.position))
@@ -2105,15 +2107,32 @@ pub fn build_network(
             )
         })
         .collect();
-    sim.apply_commands([&WorldCommand::MapMakeMultipleConnections(projects, links)]);
-    {
+    let batch_size = if graph.wet { 1 } else { links.len().max(1) };
+    let keys: Vec<_> = graph.links.keys().collect();
+    for (batch, links) in links.chunks(batch_size).enumerate() {
+        sim.apply_commands([&WorldCommand::MapMakeMultipleConnections(
+            projects.clone(),
+            links.to_vec(),
+        )]);
         let outcomes = sim.read::<CommandOutcomes>();
         if !outcomes.last.is_empty() || outcomes.accepted != [0] {
+            let base = batch * batch_size;
+            let failed: Vec<_> = outcomes
+                .link_outcomes(0)
+                .iter()
+                .filter_map(|&(index, result)| Some((keys[base + index], result.err()?)))
+                .collect();
             return Err(format!(
-                "CITYMAP connection batch rejected {:?}; ordered links {:?}",
-                outcomes.last,
-                graph.links.keys().collect::<Vec<_>>()
+                "CITYMAP connection batch rejected {:?}; failed links {failed:?}",
+                outcomes.last
             ));
+        }
+        if let Some(result) = outcomes.connection_batch(0) {
+            for (project, &id) in projects.iter_mut().zip(&result.projects) {
+                if let Some(id) = id {
+                    project.kind = ProjectKind::Intersection(id);
+                }
+            }
         }
     }
     let built = resolve_network(&sim.map(), graph)?;
@@ -2149,6 +2168,9 @@ fn pattern(graph: &Graph, link: &LinkSpec, index: usize) -> LanePattern {
     });
     let adjustment = if control {
         (index + 1) as f32 * 0.001
+    } else if graph.wet {
+        // An eventual three-way junction can temporarily have only two arms.
+        -((index + 1) as f32) * 0.000_01
     } else {
         0.0
     };
@@ -2363,11 +2385,18 @@ fn validate_lane_components(map: &Map) -> Result<(), String> {
                 );
             }
             if visited != lanes {
+                let missing = lanes.difference(&visited).next().map(|id| {
+                    let lane = &map.lanes()[*id];
+                    (
+                        id,
+                        map.intersections()[lane.src].pos,
+                        map.intersections()[lane.dst].pos,
+                    )
+                });
                 return Err(format!(
-                    "{kind:?} connectivity reaches only {}/{} lanes (first missing {:?})",
+                    "{kind:?} connectivity reaches only {}/{} lanes (first missing {missing:?})",
                     visited.len(),
                     lanes.len(),
-                    lanes.difference(&visited).next()
                 ));
             }
         }
@@ -2596,7 +2625,14 @@ pub fn route_checks(
             .values()
             .filter(|link| link.class == class)
             .flat_map(|link| link.endpoints)
-            .filter(|key| matches!(key, SourceKey::Cut { .. }))
+            .filter(|key| match key {
+                SourceKey::Cut { .. } => graph.neighbours(*key).count() == 1,
+                SourceKey::Authored(
+                    "a2-outer-north" | "a2-outer-southeast" | "rail-outer-north"
+                    | "rail-outer-south",
+                ) => true,
+                _ => false,
+            })
             .map(|key| built.junctions[&key])
             .collect();
         let mut endpoints = endpoints.into_iter().collect::<Vec<_>>();

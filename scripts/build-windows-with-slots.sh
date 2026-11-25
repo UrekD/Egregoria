@@ -59,6 +59,23 @@ check_slots() {
     done
 }
 
+check_town_population() {
+    [[ -n $town_generator ]] || return 0
+    python3 - "$1/lesce_town.meta.json" <<'PY'
+import json
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+try:
+    population = json.loads(path.read_text()).get("population")
+except (OSError, ValueError, AttributeError) as error:
+    sys.exit(f"{path}: could not read population ({error})")
+if type(population) is not int or population <= 0:
+    sys.exit(f"{path}: expected a positive commissioned population, found {population!r}")
+PY
+}
+
 generate() {
     if ! cargo run --locked --release -p scenarios -- "$@"; then
         printf 'Windows save generation failed (%s).\n' "$1" >&2
@@ -69,6 +86,7 @@ generate() {
 stamp=$(fingerprint)
 if [[ -f $current/stamp && $(< "$current/stamp") == "$stamp" ]] &&
     check_slots "$current/slots" 2>/dev/null; then
+    check_town_population "$current/slots"
     printf 'Reusing staged Windows save slots in %s\n' "$current/slots"
 else
     printf 'Generating Windows save slots for %s\n' "$(cat VERSION)"
@@ -83,6 +101,7 @@ else
         rm -rf -- "$pending/town"
     fi
     check_slots "$pending/slots"
+    check_town_population "$pending/slots"
     if [[ $(fingerprint) != "$stamp" ]]; then
         printf 'Save generator inputs changed during the build. Rerun make build.\n' >&2
         exit 1
