@@ -198,7 +198,7 @@ fn zones2_profiled_base_registers_mixed_pairs() {
                 .collect::<Vec<_>>(),
             [
                 (ItemID::new("retail-goods"), 1),
-                (ItemID::new("shop-delivery"), 1)
+                (ItemID::new("shop-delivery"), 12)
             ]
         );
 

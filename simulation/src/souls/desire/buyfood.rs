@@ -12,6 +12,23 @@ enum BuyFoodState {
     BoughtAt(BuildingID),
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use prototypes::{GameTime, Tick};
+
+    #[test]
+    fn econ_food_orders_before_the_last_two_meals() {
+        let [groceries, _] = household_items();
+        let mut stock = HouseholdStock::default();
+        let mut food = BuyFood::new(GameTime::new(Tick(0)).instant());
+        stock.on_hand.insert(groceries, 2);
+        assert!(food.score(&stock) > 0.0);
+        stock.on_hand.insert(groceries, 3);
+        assert_eq!(food.score(&stock), 0.0);
+    }
+}
+
 debug_inspect_impl!(BuyFoodState);
 
 #[derive(Inspect, Clone, Serialize, Deserialize, Debug)]
@@ -48,7 +65,7 @@ impl BuyFood {
         } else {
             stock.units(retail)
         };
-        self.last_score = if supply <= 1 {
+        self.last_score = if supply <= 2 {
             0.55 + (1.0 - stock.needs.food) * 0.20
         } else {
             0.0

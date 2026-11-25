@@ -2,7 +2,8 @@
 local function low_shop_recipe()
     return {
         consumption = {{"goods", 2}},
-        production = {{"retail-goods", 1}, {"shop-delivery", 1}},
+        -- One freight unit stocks many household purchases.
+        production = {{"retail-goods", 1}, {"shop-delivery", 12}},
         duration = "360s",
         storage_multiplier = 12,
     }
@@ -124,8 +125,8 @@ local growables = {
         water_consumption = 12,
         recipe = {
             consumption = {{"goods", 4}},
-            production = {{"retail-goods", 2}, {"shop-delivery", 2}},
-            duration = "450s",
+            production = {{"retail-goods", 2}, {"shop-delivery", 16}},
+            duration = "360s",
             storage_multiplier = 12,
         },
         bgen = {kind = "centered_door", vertical_factor = 1.25},
@@ -201,8 +202,8 @@ local growables = {
         water_consumption = 16,
         recipe = {
             consumption = {{"goods", 4}},
-            production = {{"retail-goods", 2}, {"shop-delivery", 2}},
-            duration = "360s",
+            production = {{"retail-goods", 2}, {"shop-delivery", 20}},
+            duration = "300s",
             storage_multiplier = 12,
         },
         bgen = {kind = "centered_door", vertical_factor = 1.25},

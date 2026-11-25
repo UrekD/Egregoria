@@ -13,7 +13,8 @@ data:extend {
         kind = "store",
         recipe = {
             consumption = {{"flour", 1}},
-            production = {{"groceries", 3}},
+            -- Flour is a bulk freight unit. Grocery units are household portions.
+            production = {{"groceries", 24}},
             duration = "100s",
             storage_multiplier = 5,
         },
@@ -136,7 +137,7 @@ data:extend {
         kind = "store",
         recipe = {
             consumption = {{"meat", 1}, {"vegetable", 1}, {"cereal", 1}},
-            production = {{"retail-goods", 4}, {"shop-delivery", 4}},
+            production = {{"retail-goods", 4}, {"shop-delivery", 30}},
             duration = "360s",
             storage_multiplier = 12,
         },

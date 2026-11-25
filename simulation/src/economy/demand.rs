@@ -252,18 +252,18 @@ struct CompanyRates {
     goods_supply: f64,
     retail_supply: f64,
     groceries_supply: f64,
+    shelf_packages_supply: f64,
     industrial_growables: usize,
 }
 
 impl CompanyRates {
     fn retail_shortfall(&self, population: usize, unmet: [u64; 2]) -> f32 {
-        let residents = population as f64;
-        let staple_rate = TICKS_PER_HOUR as f64 / FOOD_UNIT_TICKS as f64;
-        let goods_rate = TICKS_PER_HOUR as f64 / GOODS_UNIT_TICKS as f64;
+        let staples_need = population as f64 * TICKS_PER_HOUR as f64 / FOOD_UNIT_TICKS as f64;
+        let retail_need = population as f64 * TICKS_PER_HOUR as f64 / GOODS_UNIT_TICKS as f64;
+        let [staples_per_package, retail_per_package] = shelf_delivery_units(1).map(f64::from);
         // Count live unmet lines by SKU. They can reveal empty or unevenly
         // distributed shelves even when nominal staffed production is high.
-        let shortage = |rate, supply, missing| {
-            let hourly_need: f64 = residents * rate;
+        let shortage = |hourly_need, supply, missing| {
             let nominal = shortfall_norm(hourly_need, supply);
             if missing == 0 {
                 nominal
@@ -274,9 +274,30 @@ impl CompanyRates {
                 ))
             }
         };
-        let staples = shortage(staple_rate, self.groceries_supply, unmet[0]);
-        let goods = shortage(goods_rate, self.retail_supply, unmet[1]);
-        staples.max(goods)
+        let staples = shortage(
+            staples_need,
+            self.groceries_supply + self.shelf_packages_supply * staples_per_package,
+            unmet[0],
+        );
+        let goods = shortage(
+            retail_need,
+            self.retail_supply + self.shelf_packages_supply * retail_per_package,
+            unmet[1],
+        );
+        let shortage = staples.max(goods);
+        // Each package can replenish either shelf. Account for their combined
+        // need after crediting direct output against each SKU.
+        let package_need = (staples_need - self.groceries_supply).max(0.0) / staples_per_package
+            + (retail_need - self.retail_supply).max(0.0) / retail_per_package;
+        if package_need == 0.0 {
+            return shortage;
+        }
+        let package_equivalent =
+            staples_need / staples_per_package + retail_need / retail_per_package;
+        shortage.max(shortfall_norm(
+            package_equivalent,
+            package_equivalent - package_need + self.shelf_packages_supply,
+        ))
     }
 }
 
@@ -329,13 +350,11 @@ fn company_rates(world: &World, map: &Map, infos: &BuildingInfos, market: &Marke
         };
         let full_batches = TICKS_PER_HOUR as f64 / batch_ticks;
         let staffed_batches = full_batches * business_rates.staffed_fraction;
-        let delivery = amount(&recipe.production, shelf_delivery_item()) as i32;
-        let [staples, _] = shelf_delivery_units(delivery);
-        rates.groceries_supply += (amount(&recipe.production, groceries)
-            + f64::from(staples) * SHELF_TARGET_UTILIZATION)
-            * staffed_batches;
+        let delivery = amount(&recipe.production, shelf_delivery_item());
+        rates.shelf_packages_supply += delivery * SHELF_TARGET_UTILIZATION * staffed_batches;
+        rates.groceries_supply += amount(&recipe.production, groceries) * staffed_batches;
         let retail_output = amount(&recipe.production, retail_goods);
-        let retail_utilization = if delivery > 0 {
+        let retail_utilization = if delivery > 0.0 {
             SHELF_TARGET_UTILIZATION
         } else {
             1.0
@@ -676,6 +695,51 @@ mod tests {
         }
 
         assert_eq!(trajectory(), trajectory());
+    }
+
+    #[test]
+    fn econ_food_zoned_shops_can_supply_a_town_at_routine_utilization() {
+        let _ctx = TestCtx::new_fast();
+        let company = GoodsCompanyID::new("commercial-l1").prototype();
+        let recipe = company.recipe.as_ref().unwrap();
+        let shops = 20.0;
+        let batches = shops * TICKS_PER_HOUR as f64 / recipe.batch_ticks();
+        let amount = |id| {
+            f64::from(
+                recipe
+                    .production
+                    .iter()
+                    .find(|item| item.id == id)
+                    .unwrap()
+                    .amount,
+            )
+        };
+        let packages = amount(shelf_delivery_item()) * batches * SHELF_TARGET_UTILIZATION;
+        let direct_retail =
+            amount(ItemID::new("retail-goods")) * batches * SHELF_TARGET_UTILIZATION;
+        let [food_per_package, goods_per_package] = shelf_delivery_units(1).map(f64::from);
+        let population = 2_500.0;
+        let groceries = population * TICKS_PER_HOUR as f64 / FOOD_UNIT_TICKS as f64;
+        let goods = population * TICKS_PER_HOUR as f64 / GOODS_UNIT_TICKS as f64;
+        let required =
+            groceries / food_per_package + (goods - direct_retail).max(0.0) / goods_per_package;
+        assert!(
+            packages >= required,
+            "{packages} wholesale packages/h < {required}"
+        );
+    }
+
+    #[test]
+    fn econ_food_counts_packages_as_shared_shelf_capacity() {
+        // 240 residents need twenty groceries and ten retail goods
+        // per hour. Ten packages cover either shelf on its own.
+        let mut rates = super::CompanyRates {
+            shelf_packages_supply: 10.0,
+            ..Default::default()
+        };
+        assert!(rates.retail_shortfall(240, [0, 0]) > 0.0);
+        rates.retail_supply = 10.0;
+        assert!(rates.retail_shortfall(240, [0, 0]) < 0.0);
     }
 
     #[test]

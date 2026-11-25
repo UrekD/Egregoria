@@ -64,8 +64,8 @@ pub(crate) const RETAIL_ACCESS_RADIUS_M: f32 = 1_500.0;
 /// One retail unit per resident per six game hours.
 pub const RETAIL_PER_CAPITA_PER_HOUR: f64 = 1.0 / 6.0;
 
-/// A stocked household uses three staple units and one general good per day.
-pub(crate) const FOOD_UNIT_TICKS: u64 = 8 * prototypes::TICKS_PER_HOUR;
+/// A grocery unit covers half a resident's daily food needs.
+pub(crate) const FOOD_UNIT_TICKS: u64 = 12 * prototypes::TICKS_PER_HOUR;
 pub(crate) const GOODS_UNIT_TICKS: u64 = 24 * prototypes::TICKS_PER_HOUR;
 pub(crate) const BASKET_FOOD_TARGET: u32 = 4;
 pub(crate) const BASKET_GOODS_TARGET: u32 = 2;
