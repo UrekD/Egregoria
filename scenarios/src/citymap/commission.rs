@@ -246,7 +246,7 @@ fn prepare_opening(
         Cohort {
             district: "south",
             anchor: at(2060.0, 1180.0),
-            houses: 98,
+            houses: if wet { 110 } else { 98 },
             infill: if wet { 14 } else { 10 },
             retail: if wet { 24 } else { 16 },
             industry: if wet { 12 } else { 8 },
@@ -454,6 +454,11 @@ fn prepare_opening(
     }
     // These outlying streets had residents short of park coverage after
     // reload. Give their service sites priority over nearby buildable lots.
+    let [ridge, north_frontage] = if wet {
+        [(1250.0, 2600.0), (1330.0, 2700.0)]
+    } else {
+        [(1940.0, 2647.0), (2040.0, 2755.0)]
+    };
     let [meadow, outer] = if wet {
         [
             ("south/east-frontage-park", 2598.0, 1118.0),
@@ -466,8 +471,12 @@ fn prepare_opening(
         ]
     };
     for (name, x, y) in [
-        ("hraska/ridge-park", 1940.0, 2647.0),
-        ("hraska/north-frontage-park", 2040.0, 2755.0),
+        ("hraska/ridge-park", ridge.0, ridge.1),
+        (
+            "hraska/north-frontage-park",
+            north_frontage.0,
+            north_frontage.1,
+        ),
         ("south/southwest-park", 1695.0, 885.0),
         meadow,
         outer,
@@ -592,19 +601,34 @@ pub(super) fn commission_opening(
 
     let wet = sim.map().environment().has_water_configuration();
     let near_outfalls = |parcel: &Parcel| outfall_housing(parcel, plan.config.owned_min);
+    let near_east_market = |parcel: &Parcel| {
+        let local = parcel.footprint.center() - plan.config.owned_min;
+        parcel.zoning.kind == ZoneKind::Residential
+            && parcel.district == "south"
+            && local.x >= 2700.0
+            && local.y >= 950.0
+    };
     let mut schedule = Simulation::schedule();
     if wet {
         // Settle the houses by the outfalls first so the shoreline services
         // can recruit locally as the rest of the town opens.
         paint(sim, parcels.iter().filter(|parcel| near_outfalls(parcel)))?;
         advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
+        // The eastern supermarket also needs a nearby hiring pool before
+        // the town's other workplaces open.
+        paint(
+            sim,
+            parcels.iter().filter(|parcel| near_east_market(parcel)),
+        )?;
+        advance(sim, &mut schedule, 2 * TICKS_PER_HOUR);
         record_development(&sim.map(), &mut parcels);
     }
     // Ordinary housing opens before the shops/factories. This gives civic and
     // utility sites a chance to hire while the first households arrive.
-    let housing = parcels
-        .iter()
-        .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential && !(wet && near_outfalls(parcel)));
+    let housing = parcels.iter().filter(|parcel| {
+        parcel.zoning.kind == ZoneKind::Residential
+            && !(wet && (near_outfalls(parcel) || near_east_market(parcel)))
+    });
     paint(sim, housing)?;
     verify_votes(
         sim,
@@ -1820,7 +1844,11 @@ fn install_bus_loops(
     };
     let routes = [
         // South to West has a long detour around the walking-only link.
-        ("neighbourhood", neighbourhood, 7),
+        (
+            "neighbourhood",
+            neighbourhood,
+            if parkway.is_some() { 8 } else { 7 },
+        ),
         ("employment", &[0, 3, 4][..], 6),
     ];
     let berths = {
@@ -4077,7 +4105,7 @@ mod tests {
         assert!(near_bakeries * 100 >= housing * 95 && reserve >= 260 && reserve_shops >= 3,
             "{near_bakeries}/{housing} housing places within a 180 m walk of a bakery, {reserve} reserve housing places and {reserve_shops} reserve shops");
         assert!(
-            housing >= 950 && isolated_south == 0,
+            housing >= 1020 && isolated_south == 0,
             "{housing} opening housing places, with {isolated_south} on the remote South fringe"
         );
         assert!(
