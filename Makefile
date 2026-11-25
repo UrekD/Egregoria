@@ -29,9 +29,9 @@ windows:
 	scripts/build-windows.sh "$(WINDOWS_OUT)" "$(WINDOWS_SLOTS)"
 
 .PHONY: build
-# Package a Windows test build and include local saves when world exists.
+# Package a Windows build with save slots generated for this checkout.
 build:
-	scripts/build-windows.sh "$(WINDOWS_OUT)" "$(if $(wildcard world/.),world)"
+	scripts/build-windows-with-slots.sh "$(WINDOWS_OUT)" "$(CARGO_TARGET_DIR)" "$(BUILD_CITYMAP)"
 
 .PHONY: demo-cities
 demo-cities:
@@ -58,6 +58,8 @@ osm-lesce:
 export EGR_CITYMAP_OUT ?= /var/tmp/egr/citymap-build
 export EGR_CITYMAP_LESCE ?=
 export EGR_CITYMAP_SAVA ?=
+# Enable the optional Lesce Town slot on branches with this generator.
+build: BUILD_CITYMAP := citymap-build
 .PHONY: citymap-build
 citymap-build:
 	@set -eu; \
