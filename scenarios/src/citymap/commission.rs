@@ -594,18 +594,32 @@ fn prepare_opening(
         ] {
             verify_parking_pair(&map, sites[from], sites[to], Tick(sim.get_tick()))?;
         }
+        drop(map);
+        // Give the rail terminal a nearby buyer for a regular imported input.
+        // The stock foundry supplies that recurring iron-ore demand.
+        let foundry = place_company_around_parcels(
+            sim,
+            "foundry",
+            at(2510.0, 2490.0),
+            Some("employment"),
+        )?;
+        verify_parking_pair(&sim.map(), terminal, foundry, Tick(sim.get_tick()))?;
+        sites.insert("rail-foundry".into(), foundry);
     }
     place_walkable_bakeries(sim, plan, &roads, &parcels, &reserves, &mut sites)?;
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
     // Fit backup fuel supply around the approved opening and infill lots.
-    let backup_mine = place_company_around_parcels(
-        sim,
-        "coal-mine",
-        plant_door + vec2(0.0, -65.0),
-        None,
-    )?;
-    verify_parking_pair(&sim.map(), backup_mine, plant, Tick(sim.get_tick()))?;
-    sites.insert("coal-mine-4".into(), backup_mine);
+    for (name, offset) in [
+        ("coal-mine-4", vec2(0.0, -65.0)),
+        ("coal-mine-5", vec2(-85.0, -40.0)),
+    ]
+    .into_iter()
+    .take(if profiled_wet { 2 } else { 1 })
+    {
+        let mine = place_company_around_parcels(sim, "coal-mine", plant_door + offset, None)?;
+        verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
+        sites.insert(name.into(), mine);
+    }
     if wet {
         // The existing stations serve the eastern blocks to capacity before
         // reaching this South frontage. Give it local fire service.
@@ -751,7 +765,8 @@ pub(super) fn commission_opening(
     };
     // Use elapsed time for settling periods. The authored clock starts in the
     // morning, so a whole elapsed day returns to the same commute phase.
-    for day in 1..=4 {
+    let warmup_days = if intake_homes.is_empty() { 4 } else { 5 };
+    for day in 1..=warmup_days {
         let target = day * TICKS_PER_BUDGET_DAY;
         let now = elapsed_tick(sim).0;
         advance(sim, &mut schedule, target - now);
