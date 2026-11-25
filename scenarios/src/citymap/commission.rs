@@ -282,8 +282,8 @@ fn prepare_opening(
     // Give the utilities access to the same labour pool as the shops.
     // A sixth pair covers the utility margin after the reserves are built.
     let wet_intake = at(760.0, 940.0);
-    // Keep the outfalls on the downstream bend nearest occupied frontage.
-    let wet_outlet = at(1410.0, 750.0);
+    // This bank frontage fits the outfall foundations clear of the road profile.
+    let wet_outlet = at(1630.0, 510.0);
     let mut utilities: Vec<_> = cohorts
         .iter()
         .map(|cohort| cohort.anchor)
@@ -324,9 +324,10 @@ fn prepare_opening(
 
         // Reserve the staffed, town-facing employment entrance and the
         // southern shopping pocket before filling their residential frontage.
-        for (key, anchor) in [
-            ("employment", at(2350.0, 1960.0)),
-            ("south", at(2514.0, 1033.0)),
+        for (name, key, anchor) in [
+            ("employment/supermarket", "employment", at(2350.0, 1960.0)),
+            ("south/supermarket", "south", at(2514.0, 1033.0)),
+            ("hraska/ridge-supermarket", "hraska", at(1290.0, 2630.0)),
         ] {
             let district = plan.districts.iter().find(|district| district.key == key).unwrap();
             let (store, _) = place_scored_company(sim, plan, &roads, "supermarket", |map, road, footprint| {
@@ -336,7 +337,7 @@ fn prepare_opening(
                     .then(|| center.distance2(anchor))
             })?
             .ok_or_else(|| format!("no supermarket frontage in the {key} district"))?;
-            sites.insert(format!("{key}/supermarket"), store);
+            sites.insert(name.into(), store);
         }
     }
     // Use the frontage between South and West so mine drivers can reach work
@@ -531,7 +532,7 @@ fn prepare_opening(
         ("west", 1350.0, 1840.0),
         ("employment", 2530.0, 2400.0),
     ] {
-        if wet && matches!(district, "employment" | "south") {
+        if wet && matches!(district, "employment" | "south" | "station") {
             continue;
         }
         let store = place_company_around_parcels(sim, "supermarket", at(x, y), Some(district))?;
@@ -589,11 +590,21 @@ pub(super) fn commission_opening(
         bakery,
     } = prepare_opening(sim, plan, built, freight)?;
 
+    let wet = sim.map().environment().has_water_configuration();
+    let near_outfalls = |parcel: &Parcel| outfall_housing(parcel, plan.config.owned_min);
+    let mut schedule = Simulation::schedule();
+    if wet {
+        // Settle the houses by the outfalls first so the shoreline services
+        // can recruit locally as the rest of the town opens.
+        paint(sim, parcels.iter().filter(|parcel| near_outfalls(parcel)))?;
+        advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
+        record_development(&sim.map(), &mut parcels);
+    }
     // Ordinary housing opens before the shops/factories. This gives civic and
     // utility sites a chance to hire while the first households arrive.
     let housing = parcels
         .iter()
-        .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential);
+        .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential && !(wet && near_outfalls(parcel)));
     paint(sim, housing)?;
     verify_votes(
         sim,
@@ -601,7 +612,6 @@ pub(super) fn commission_opening(
             .iter()
             .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential),
     )?;
-    let mut schedule = Simulation::schedule();
     advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
     apply(sim, "district depot policies", &depots)?;
     let (station, ent) = sim
@@ -693,6 +703,14 @@ fn advance(sim: &mut Simulation, schedule: &mut SeqSchedule, ticks: u64) {
     for _ in 0..ticks {
         sim.tick(schedule, []);
     }
+}
+
+fn outfall_housing(parcel: &Parcel, owned_min: Vec2) -> bool {
+    let local = parcel.footprint.center() - owned_min;
+    parcel.zoning.kind == ZoneKind::Residential
+        && parcel.district == "south"
+        && local.x < 1820.0
+        && local.y < 760.0
 }
 
 fn expand_cereal_fields(
@@ -4027,6 +4045,7 @@ mod tests {
         let mut near_bakeries = 0;
         let mut by_district = BTreeMap::new();
         let mut isolated_south = 0;
+        let mut quay_housing = 0;
         for parcel in opening.parcels.iter().filter(|parcel| parcel.capacity > 0) {
             let home = reach
                 .position(parcel.road, parcel.footprint.center())
@@ -4037,6 +4056,9 @@ mod tests {
                 && parcel.footprint.center().y < plan.config.owned_min.y + 600.0
             {
                 isolated_south += parcel.capacity;
+            }
+            if outfall_housing(parcel, plan.config.owned_min) {
+                quay_housing += parcel.capacity;
             }
             if bakeries
                 .iter()
@@ -4058,6 +4080,10 @@ mod tests {
             housing >= 950 && isolated_south == 0,
             "{housing} opening housing places, with {isolated_south} on the remote South fringe"
         );
+        assert!(
+            quay_housing >= 16,
+            "{quay_housing} housing places near the outfall jobs"
+        );
         let employment = plan
             .districts
             .iter()
@@ -4071,6 +4097,9 @@ mod tests {
         drop(map);
         paint(&mut sim, opening.parcels.iter()).unwrap();
         verify_votes(&sim, opening.parcels.iter()).unwrap();
+        let mut updated = (*sim.map()).clone();
+        updated.update();
+        super::super::resolve_network(&updated, &plan.graph).unwrap();
     }
 
     #[test]
