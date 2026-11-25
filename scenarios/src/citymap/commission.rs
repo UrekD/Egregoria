@@ -5,7 +5,7 @@ use super::adapters::{
 use super::{blocks, contains, BuiltNetwork, RoadClass, TownPlan};
 use geom::{vec2, Intersect, Polygon, Transform, Vec2, Vec3, OBB};
 use prototypes::{
-    try_prototype, BuildingGen, FreightStationPrototypeID, ItemID, Money, ResidencePrototype,
+    try_prototype, BuildingGen, FreightStationPrototypeID, GameTime, ItemID, Money, ResidencePrototype,
     RollingStockID, ServiceID, ServiceKind, Tick, TICKS_PER_HOUR, TICKS_PER_MINUTE,
 };
 use serde::Serialize;
@@ -30,10 +30,12 @@ use simulation::souls::{
     growth::check_growable_lot,
     residence::{is_retail_store, Residences},
 };
-use simulation::transportation::{Location, VehicleKind, VehicleState};
+use simulation::transportation::{
+    road::calc_decision, Location, TransportGrid, Vehicle, VehicleKind, VehicleState,
+};
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::WorldCommand;
-use simulation::{FreightStationID, TrainID, VehicleID};
+use simulation::{FreightStationID, TrainID, VehicleEnt, VehicleID};
 use simulation::{Simulation, SoulID};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -1996,6 +1998,7 @@ struct Traffic {
     max_standing_ticks: u64,
     longest_standing: Option<(VehicleID, VehicleKind, [f32; 3], Option<TraverseKind>)>,
     longest_standing_elapsed_window: Option<[u64; 2]>,
+    longest_standing_decision: Option<StandingDecision>,
     max_blocking_ticks: u64,
     stranded_drivers: u64,
     panicking: u64,
@@ -2015,6 +2018,69 @@ struct VehicleProgress {
     path: Option<TraverseKind>,
     sample: u64,
     panicking: bool,
+}
+
+#[derive(Serialize)]
+struct StandingDecision {
+    state: String,
+    speed: f32,
+    objective: Option<[f32; 3]>,
+    speed_with_neighbours: Option<f32>,
+    speed_without_neighbours: Option<f32>,
+    blocking_colliders: Vec<(String, [f32; 2])>,
+}
+
+impl StandingDecision {
+    fn sample(sim: &Simulation, id: VehicleID, car: &VehicleEnt) -> Self {
+        let mut decision = Self {
+            state: format!("{:?}", car.vehicle.state),
+            speed: car.speed.0,
+            objective: car.it.get_point().map(Into::into),
+            speed_with_neighbours: None,
+            speed_without_neighbours: None,
+            blocking_colliders: Vec::new(),
+        };
+        let grid = sim.read::<TransportGrid>();
+        let Some((_, own)) = car.collider.and_then(|collider| grid.get(collider.0)) else {
+            return decision;
+        };
+        if !matches!(car.vehicle.state, VehicleState::Driving) {
+            return decision;
+        }
+        let map = sim.map();
+        let time = sim.read::<GameTime>();
+        let query_radius = 12.0
+            + (own.speed.powi(2) / (2.0 * car.vehicle.kind.deceleration())).min(100.0);
+        let neighbours: Vec<_> = grid
+            .query_around(car.trans.pos.xy(), query_radius)
+            .filter_map(|(handle, pos)| Some((pos, grid.get(handle)?.1)))
+            .collect();
+        let evaluate = |nearby: &[_]| {
+            // Evaluate a detached decision at the same tick without its
+            // short retry delay. The live world and itinerary are read-only.
+            let mut vehicle = Vehicle {
+                ang_velocity: car.vehicle.ang_velocity,
+                wait_time: 0.0,
+                max_speed_multiplier: car.vehicle.max_speed_multiplier,
+                state: VehicleState::Driving,
+                kind: car.vehicle.kind,
+                tint: car.vehicle.tint,
+                flag: car.vehicle.flag,
+            };
+            calc_decision(id, &mut vehicle, &map, &time, &car.trans, own, &car.it, nearby.iter().copied()).0
+        };
+        decision.speed_with_neighbours = Some(evaluate(&neighbours));
+        let isolated = evaluate(&[]);
+        decision.speed_without_neighbours = Some(isolated);
+        if isolated > 0.0 {
+            decision.blocking_colliders = neighbours
+                .iter()
+                .filter(|neighbour| evaluate(std::slice::from_ref(*neighbour)) == 0.0)
+                .map(|(pos, collider)| (format!("{:?}", collider.group), (*pos).into()))
+                .collect();
+        }
+        decision
+    }
 }
 
 impl Traffic {
@@ -2070,6 +2136,9 @@ impl Traffic {
                 self.max_standing_ticks = duration;
                 self.longest_standing = Some((id, car.vehicle.kind, car.trans.pos.into(), path));
                 self.longest_standing_elapsed_window = Some([progress.moved_at, tick]);
+                if duration > 30 * TICKS_PER_MINUTE {
+                    self.longest_standing_decision = Some(StandingDecision::sample(sim, id, car));
+                }
             }
             if duration >= SAMPLE_TICKS {
                 match path {
