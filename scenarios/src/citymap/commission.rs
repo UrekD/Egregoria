@@ -39,7 +39,7 @@ use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::WorldCommand;
 use simulation::{FreightStationID, HumanID, TrainID, VehicleEnt, VehicleID};
 use simulation::{Simulation, SoulID};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const SERVICES: [ServiceKind; 6] = [
     ServiceKind::Fire,
@@ -2980,14 +2980,53 @@ struct FreightDelivery {
 struct RailStock {
     unload_tick: u64,
     unloaded: u64,
-    may_predate_unload: u64,
+    remaining: u64,
     return_tick: Option<u64>,
 }
 
-impl RailStock {
-    fn attributable_units(self, draw: u64) -> u64 {
-        draw.saturating_sub(self.may_predate_unload).min(self.unloaded)
+#[derive(Default)]
+struct StationInventory {
+    unproved: u64,
+    batches: VecDeque<RailStock>,
+}
+
+impl StationInventory {
+    fn withdraw(&mut self, units: u64) -> Option<(RailStock, u64)> {
+        // Station stock is fungible. Charge withdrawals against unproved
+        // stock first, then against observed calls in unload order.
+        let unproved = units.min(self.unproved);
+        self.unproved -= unproved;
+        self.withdraw_batches(units - unproved)
     }
+
+    fn withdraw_batches(&mut self, mut units: u64) -> Option<(RailStock, u64)> {
+        let mut first = None;
+        while units > 0 {
+            let batch = self.batches.front_mut()?;
+            let used = units.min(batch.remaining);
+            first.get_or_insert((*batch, used));
+            batch.remaining -= used;
+            units -= used;
+            if batch.remaining == 0 {
+                self.batches.pop_front();
+            }
+        }
+        first
+    }
+
+    fn account_for_possible_restock(&mut self, units: u64) {
+        let credited = self.batches.iter().map(|batch| batch.remaining).sum::<u64>();
+        let uncertain = units.min(credited);
+        self.withdraw_batches(uncertain);
+        self.unproved += uncertain;
+    }
+}
+
+struct StationDraw {
+    item: ItemID,
+    loaded: u64,
+    batch: RailStock,
+    attributed: u64,
 }
 
 struct TrackedDelivery {
@@ -3011,7 +3050,7 @@ struct FreightMonitor {
     train_state: Option<FreightTrainState>,
     latest_unload: Option<u64>,
     stock: BTreeMap<ItemID, u64>,
-    credited_stock: BTreeMap<ItemID, RailStock>,
+    inventory: BTreeMap<ItemID, StationInventory>,
     trucks: BTreeMap<VehicleID, StationTruck>,
     deliveries: BTreeMap<VehicleID, TrackedDelivery>,
     awaiting_return: Option<FreightDelivery>,
@@ -3027,7 +3066,7 @@ impl FreightMonitor {
             train_state: Self::train_state(sim, freight),
             latest_unload: None,
             stock: sim.read::<CargoBook>().import_stock(freight.terminal),
-            credited_stock: BTreeMap::new(),
+            inventory: BTreeMap::new(),
             trucks: BTreeMap::new(),
             deliveries: BTreeMap::new(),
             awaiting_return: None,
@@ -3099,13 +3138,21 @@ impl FreightMonitor {
         if !full_fleet || unloading || departures > 0 || route_changes > 0 {
             let book = sim.read::<CargoBook>();
             let stock = book.import_stock(freight.terminal);
+            // A station truck can return at most one truckload. When a
+            // return might overlap a draw or train call, reserve that
+            // potential turnover from the observed batch amounts.
+            const STATION_TRUCK_CAPACITY: u64 = 48;
+            let possible_restock = if unloading || departures > 0 {
+                route_changes as u64 * STATION_TRUCK_CAPACITY
+            } else {
+                0
+            };
+            let draw = self.update_stock(stock, tick, unloading, full_fleet, possible_restock);
             if full_fleet && !unloading && departures == 1 && route_changes == 0 {
-                if let Some((truck, destination)) = departure {
-                    self.record_dispatch(sim, &book, freight, tick, &stock, truck, destination);
+                if let (Some((truck, destination)), Some(draw)) = (departure, draw) {
+                    self.record_dispatch(sim, &book, freight, tick, draw, truck, destination);
                 }
             }
-            self.update_stock(stock, tick, full_fleet && unloading && route_changes == 0,
-                !full_fleet || (route_changes > 0 && (departures > 0 || unloading)));
         }
 
         if !self.deliveries.is_empty() {
@@ -3118,34 +3165,53 @@ impl FreightMonitor {
         next: BTreeMap<ItemID, u64>,
         tick: u64,
         train_unload: bool,
-        ambiguous: bool,
-    ) {
-        self.credited_stock.retain(|item, _| next.contains_key(item));
-        for (&item, &units) in &next {
+        fleet_complete: bool,
+        possible_restock: u64,
+    ) -> Option<StationDraw> {
+        if !fleet_complete {
+            self.inventory.clear();
+            self.stock = next;
+            return None;
+        }
+
+        let mut draw = None;
+        for item in self.stock.keys().chain(next.keys().filter(|item| !self.stock.contains_key(*item))) {
+            let item = *item;
             let previous = self.stock.get(&item).copied().unwrap_or(0);
-            if train_unload && units > previous {
-                self.latest_unload = Some(tick);
-                // Any dispatch in the same tick ran before the call, so the
-                // observed stock increase is a lower bound on the train unload.
-                let unloaded = units - previous;
-                *self.evidence.observed_unloads.entry(item.prototype().name.clone()).or_default() += unloaded;
-                self.credited_stock.insert(item, RailStock {
-                    unload_tick: tick,
-                    unloaded,
-                    may_predate_unload: previous,
-                    return_tick: None,
-                });
-            } else if let Some(batch) = self.credited_stock.get_mut(&item) {
-                // An aborted truck can return older units. If an addition may
-                // have coincided with a draw, discard attribution for this stock.
-                batch.may_predate_unload = if ambiguous {
-                    units
+            let units = next.get(&item).copied().unwrap_or(0);
+            let inventory = self.inventory.entry(item).or_insert_with(|| StationInventory {
+                unproved: previous,
+                ..Default::default()
+            });
+            if possible_restock > 0 {
+                inventory.account_for_possible_restock(possible_restock);
+            }
+            if units < previous {
+                let loaded = previous - units;
+                if let Some((batch, attributed)) = inventory.withdraw(loaded) {
+                    draw.get_or_insert(StationDraw { item, loaded, batch, attributed });
+                }
+            } else if units > previous {
+                let added = units - previous;
+                if train_unload && possible_restock == 0 {
+                    // Dispatch runs before the train call. A positive net
+                    // increase is a lower bound on this call's actual unload.
+                    self.latest_unload = Some(tick);
+                    *self.evidence.observed_unloads.entry(item.prototype().name.clone()).or_default() += added;
+                    inventory.batches.push_back(RailStock {
+                        unload_tick: tick,
+                        unloaded: added,
+                        remaining: added,
+                        return_tick: None,
+                    });
                 } else {
-                    batch.may_predate_unload.saturating_add(units.saturating_sub(previous)).min(units)
-                };
+                    inventory.unproved += added;
+                }
             }
         }
+        self.inventory.retain(|item, _| next.contains_key(item));
         self.stock = next;
+        draw
     }
 
     fn record_dispatch(
@@ -3154,16 +3220,11 @@ impl FreightMonitor {
         book: &CargoBook,
         freight: &Freight,
         tick: u64,
-        stock: &BTreeMap<ItemID, u64>,
+        draw: StationDraw,
         truck: VehicleID,
         destination: Vec3,
     ) {
-        let candidate = self.credited_stock.iter().find_map(|(&item, batch)| {
-            let draw = self.stock[&item].saturating_sub(stock.get(&item).copied().unwrap_or(0));
-            let fresh = batch.attributable_units(draw);
-            (fresh > 0).then_some((item, *batch, draw, fresh))
-        });
-        let Some((item, batch, loaded, fresh)) = candidate else { return };
+        let StationDraw { item, batch, loaded, attributed } = draw;
         let map = sim.map();
         let mut matching_buyers = sim.world().companies.iter().filter_map(|(id, company)| {
             let building = company.comp.building;
@@ -3188,7 +3249,7 @@ impl FreightMonitor {
                 unload_tick: batch.unload_tick,
                 dispatch_tick: tick,
                 loaded_units: loaded,
-                units_from_train: fresh,
+                units_from_train: attributed,
                 observed_unload_units: batch.unloaded,
                 receipt_tick: None,
                 return_tick: batch.return_tick,
@@ -3243,8 +3304,12 @@ impl FreightMonitor {
     fn record_train_return(&mut self, tick: u64) {
         let Some(unload_tick) = self.latest_unload.take() else { return };
         self.evidence.train_returns_after_unload += 1;
-        for stock in self.credited_stock.values_mut().filter(|stock| stock.unload_tick == unload_tick) {
-            stock.return_tick = Some(tick);
+        for inventory in self.inventory.values_mut() {
+            for batch in &mut inventory.batches {
+                if batch.unload_tick == unload_tick {
+                    batch.return_tick = Some(tick);
+                }
+            }
         }
         for tracked in self.deliveries.values_mut().filter(|trip| trip.delivery.unload_tick == unload_tick) {
             tracked.delivery.return_tick = Some(tick);
@@ -3796,17 +3861,48 @@ mod tests {
     }
 
     #[test]
-    fn cm2_freight_requires_loaded_units_a_buyer_receipt_and_train_return() {
-        let mut stock = RailStock {
-            unload_tick: 10,
-            unloaded: 12,
-            may_predate_unload: 20,
-            return_tick: None,
+    fn cm2_freight_tracks_a_scored_unload_across_later_train_calls() {
+        crate::ensure_repo_root_cwd();
+        simulation::init::init();
+        let item = ItemID::new("goods");
+        let mut monitor = FreightMonitor {
+            terminal_door: Vec3::ZERO,
+            market_position: Vec2::ZERO,
+            train_state: None,
+            latest_unload: None,
+            stock: BTreeMap::from([(item, 100)]),
+            inventory: BTreeMap::new(),
+            trucks: BTreeMap::new(),
+            deliveries: BTreeMap::new(),
+            awaiting_return: None,
+            evidence: FreightEvidence::default(),
         };
-        assert_eq!(stock.attributable_units(20), 0);
-        assert_eq!(stock.attributable_units(25), 5);
-        stock.may_predate_unload = 25;
-        assert_eq!(stock.attributable_units(25), 0);
+        assert!(monitor.update_stock(BTreeMap::from([(item, 140)]), 10, true, true, 0).is_none());
+        assert!(monitor.update_stock(BTreeMap::from([(item, 90)]), 11, false, true, 0).is_none());
+        monitor.record_train_return(15);
+        assert!(monitor.update_stock(BTreeMap::from([(item, 130)]), 20, true, true, 0).is_none());
+        let draw = monitor.update_stock(BTreeMap::from([(item, 60)]), 21, false, true, 0).unwrap();
+        assert_eq!(draw.loaded, 70);
+        assert_eq!(draw.attributed, 20);
+        assert_eq!(draw.batch.unload_tick, 10);
+        assert_eq!(draw.batch.return_tick, Some(15));
+    }
+
+    #[test]
+    fn cm2_freight_requires_loaded_units_a_buyer_receipt_and_train_return() {
+        let mut stock = StationInventory {
+            unproved: 20,
+            batches: VecDeque::from([RailStock {
+                unload_tick: 10,
+                unloaded: 12,
+                remaining: 12,
+                return_tick: None,
+            }]),
+        };
+        assert!(stock.withdraw(20).is_none());
+        stock.account_for_possible_restock(5);
+        assert!(stock.withdraw(5).is_none());
+        assert_eq!(stock.withdraw(6).unwrap().1, 6);
 
         for item in ["goods", "coal", "flour"] {
             let mut proof = FreightDelivery {
