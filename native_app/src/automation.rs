@@ -34,7 +34,7 @@ use crate::gui::{
     zoning::{ZoningState, ZONES},
     GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool, ToolSelection,
 };
-use crate::session::{self, SessionScreen, SessionState, SlotCompatibility};
+use crate::session::{self, SessionScreen, SessionState};
 use crate::sim_thread::{AppliedBatch, BatchId, Boundary, Reply, ReplyKind, Request, SimThread};
 use crate::uiworld::{SaveLoadState, UiWorld};
 
@@ -513,14 +513,8 @@ impl Automation {
                 .find(|(entry, _)| entry.id.as_str() == id)
                 .cloned()
                 .ok_or_else(|| format!("save slot {id:?} was not found"))?;
-            match compatibility {
-                SlotCompatibility::Compatible => {}
-                SlotCompatibility::Incompatible => {
-                    return Err(format!("save slot {id:?} has an incompatible version"));
-                }
-                SlotCompatibility::Unreadable => {
-                    return Err(format!("save slot {id:?} has an unreadable snapshot"));
-                }
+            if let Some(reason) = compatibility.unavailable_reason() {
+                return Err(format!("save slot {id:?} ({reason})"));
             }
             drop(session);
             session::load_slot(uiw, entry);
