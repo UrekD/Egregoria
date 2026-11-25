@@ -294,8 +294,8 @@ impl TransportGrid {
         traversal: Traversable,
     ) -> Option<TraversalUserSnapshot<'_>> {
         let index = self.traversal_users.as_ref()?;
-        let (identity, topology, elapsed_tick) = index.revision?;
-        if (identity, topology) != (map.identity(), map.walking_topology_generation) {
+        let (revision, elapsed_tick) = index.revision?;
+        if revision != traversal_map_revision(map) {
             return None;
         }
         Some(TraversalUserSnapshot {
@@ -311,22 +311,29 @@ impl TransportGrid {
         elapsed_tick: u64,
     ) -> Option<TraversalUsers> {
         let mut index = self.traversal_users.take()?;
-        let map_revision = (map.identity(), map.walking_topology_generation);
+        let map_revision = traversal_map_revision(map);
         if index.epoch == u64::MAX
             || index
                 .revision
-                .is_some_and(|(identity, topology, _)| (identity, topology) != map_revision)
+                .is_some_and(|(revision, _)| revision != map_revision)
         {
             index = TraversalUsers::default();
         }
         index.epoch += 1;
-        index.revision = Some((map_revision.0, map_revision.1, elapsed_tick));
+        index.revision = Some((map_revision, elapsed_tick));
         Some(index)
     }
 
     pub(crate) fn publish_traversal_users(&mut self, mut snapshot: TraversalUsers) {
         snapshot.remove_departed();
         self.traversal_users = Some(snapshot);
+    }
+
+    pub(crate) fn refresh_admission_colliders(&mut self, world: &World) {
+        if self.humans.refresh || self.vehicles.refresh || self.pending_positions {
+            self.synchronize_owners(world);
+            self.maintain_deterministic();
+        }
     }
 
     fn synchronize_owners(&mut self, world: &World) {
@@ -411,12 +418,22 @@ impl TraversalUserSnapshot<'_> {
     }
 }
 
+type TraversalMapRevision = (u64, u64, u64);
+
+fn traversal_map_revision(map: &Map) -> TraversalMapRevision {
+    (
+        map.identity(),
+        map.walking_topology_generation,
+        map.driving_policy_generation,
+    )
+}
+
 type TraversalKey = (TraverseKind, bool);
 type TraversalIndex = BTreeMap<TraversalKey, BTreeSet<TraversalOwner>>;
 
 #[derive(Default)]
 pub(crate) struct TraversalUsers {
-    revision: Option<(u64, u64, u64)>,
+    revision: Option<(TraversalMapRevision, u64)>,
     epoch: u64,
     by_traversal: TraversalIndex,
     // Last movement pass that observed the owner, including moves that kept

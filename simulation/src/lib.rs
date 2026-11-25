@@ -1541,7 +1541,12 @@ impl SimulationDeser {
             .map_err(|reason| corrupt(format!("Invalid junction policy land effect: {reason:?}")))?;
         let elapsed = transit::elapsed_ticks(&sim.resources).0;
         sim.write::<crate::transportation::junction_admission::JunctionAdmission>()
-            .validate_loaded(&sim.map(), sim.world(), elapsed)
+            .validate_loaded(
+                &sim.map(),
+                sim.world(),
+                &sim.read::<crate::transportation::TransportGrid>(),
+                elapsed,
+            )
             .map_err(|reason| corrupt(reason.to_owned()))?;
         if sim
             .map()

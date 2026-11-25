@@ -8,7 +8,7 @@ use simulation::diagnostics::elapsed_tick;
 use simulation::economy::cargo::{reserve_road_freight, CargoBook, ItemQuantity};
 use simulation::economy::{Market, TICKS_PER_BUDGET_DAY};
 use simulation::map::road_edit::{
-    preview_road_edit, road_edit_stamp, RoadEditRequest, RoadEditStatus, RoadUpgrade,
+    preview_road_upgrade, road_edit_stamp, RoadEditStatus, RoadUpgrade,
 };
 use simulation::map::{BuildingID, LanePatternBuilder, RoadID};
 use simulation::map_dynamic::{BuildingInfos, Destination};
@@ -216,12 +216,7 @@ fn speed_edit(sim: &Simulation, road: RoadID, speed: f32) -> Result<WorldCommand
     let expected = road_edit_stamp(sim, road, &mut budget)
         .map_err(|error| format!("road stamp: {error:?}"))?;
     let change = RoadUpgrade::Replace(LanePatternBuilder::new().speed_limit(speed).build());
-    let request = RoadEditRequest::Upgrade {
-        road,
-        expected,
-        change: change.clone(),
-    };
-    let preview = preview_road_edit(sim, &request, &mut budget)
+    let preview = preview_road_upgrade(sim, road, expected, &change, &mut budget)
         .map_err(|error| format!("road quote: {error:?}"))?;
     Ok(WorldCommand::MapUpgradeRoad {
         road,

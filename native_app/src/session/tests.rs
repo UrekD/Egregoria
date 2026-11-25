@@ -39,12 +39,15 @@ fn p7_recorded_p6_snapshot_warns_when_installed() {
     let root = std::env::temp_dir().join(format!("egregoria-p7-recorded-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
     let slot = SlotId::new("old-recording").unwrap();
-    let paths = common::saveload::slot_paths(&root, &slot).unwrap();
-    std::fs::write(
-        paths.zip,
-        include_bytes!("../../../simulation/src/tests/fixtures/p6-recorded-replay.zip"),
-    )
+    let city = Simulation::new_game_with_replay(&simulation::NewGameOptions {
+        terrain_chunks: 16,
+        seed: 6042,
+        ..simulation::NewGameOptions::default()
+    })
     .unwrap();
+    city.write::<simulation::Replay>().version = include_str!("../../../VERSION").to_owned();
+    city.save_to_slot(&root, &slot, common::saveload::SnapshotRevision::new(1))
+        .unwrap();
     let loaded = Simulation::load_from_slot(&root, &slot);
     std::fs::remove_dir_all(root).unwrap();
     let mut uiw = UiWorld::with_defaults();

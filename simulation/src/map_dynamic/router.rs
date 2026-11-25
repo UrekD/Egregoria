@@ -3,7 +3,7 @@ use crate::map::{BuildingID, Map, PathKind, Pathfinder, TraverseDirection};
 use crate::map_dynamic::transit::{elapsed_ticks, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
     BuildingInfos, Itinerary, LineID, ParkingManagement, ParkingReserveError, SpotReservation,
-    StopID, Transit, NEAR_PARKING_RADIUS,
+    StopID, Transit, NEAR_PARKING_RADIUS, OBJECTIVE_OK_DIST,
 };
 use crate::souls::desire::WorkKind;
 use crate::souls::household::HouseholdStock;
@@ -324,6 +324,19 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
         };
 
         if let Some(RoutingStep::DriveTo(car, obj)) = h.router.cur_step {
+            if h.location == Location::Vehicle(car) {
+                if let Some(vehicle) = world.vehicles.get_mut(car) {
+                    if vehicle.it.is_missing()
+                        && !vehicle.vehicle.state.is_parked()
+                        && !vehicle.trans.pos.is_close(obj, OBJECTIVE_OK_DIST)
+                    {
+                        // Keep the current step and any cargo manifest until the
+                        // original vehicle reaches this drive objective.
+                        vehicle.it = Itinerary::wait_for_reroute(PathKind::Vehicle, obj);
+                        return;
+                    }
+                }
+            }
             // Plan again when the personal car cannot reach its parking spot, e.g. after
             // loading a save or when its road lost its connection to the destination.
             if h.router.personal_car == Some(car)

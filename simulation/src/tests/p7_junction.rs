@@ -8,7 +8,9 @@ use geom::{vec3, Transform};
 
 fn update_at(sim: &mut Simulation, tick: u64) {
     *sim.write::<GameTime>() = GameTime::new(Tick(tick));
-    itinerary_update(&mut sim.world, &mut sim.resources);
+    let (world, resources) = sim.world_res();
+    crate::transportation::transport_grid_synchronize(world, resources);
+    itinerary_update(world, resources);
 }
 
 #[test]
@@ -140,7 +142,9 @@ fn staged_vehicle(
 
 #[test]
 fn p7_junction_mask_replans_original_vehicle_to_physical_arrival() {
-    use crate::map::road_edit::{junction_edit_stamp, preview_junction_edit};
+    use crate::map::road_edit::{
+        junction_edit_stamp, preview_road_edit, RoadEditPreview, RoadEditRequest,
+    };
     use crate::world_command::PrepareBudget;
     use crate::WorldCommand;
 
@@ -187,15 +191,19 @@ fn p7_junction_mask_replans_original_vehicle_to_physical_arrival() {
     let rules = JunctionRules::new(vec![], vec![turn]).unwrap();
     let expected =
         junction_edit_stamp(&ctx.g, junction, &mut PrepareBudget::for_preview(10_000)).unwrap();
-    let quote = preview_junction_edit(
+    let RoadEditPreview::JunctionRules(preview) = preview_road_edit(
         &ctx.g,
-        junction,
-        expected,
-        &rules,
+        &RoadEditRequest::JunctionRules {
+            junction,
+            expected,
+            rules: rules.clone(),
+        },
         &mut PrepareBudget::for_preview(10_000),
     )
-    .unwrap()
-    .quote;
+    .unwrap() else {
+        panic!("expected a junction preview");
+    };
+    let quote = preview.quote;
     ctx.g.apply_commands(&[WorldCommand::MapSetJunctionRules {
         junction,
         expected,
@@ -433,9 +441,14 @@ fn p7_junction_same_tick_walk_and_vehicle_share_the_barrier() {
         junction,
         JunctionRules::new(vec![(road, ApproachRole::Priority)], vec![]).unwrap(),
     );
+    let collider = crate::transportation::put_pedestrian_in_transport_grid(
+        &mut ctx.g.write::<TransportGrid>(),
+        walker_pos,
+    );
     ctx.g.world.edit_human(human, |human| {
         human.trans.pos = walker_pos;
         human.location = Location::Outside;
+        human.collider = Some(collider);
         human.it = walker_path;
         human.speed.0 = 100.0;
     });
@@ -505,4 +518,222 @@ fn p7_junction_aged_stop_precedes_fresh_priority_for_the_same_exit() {
         .g
         .read::<JunctionAdmission>()
         .crossing_turn(TurnID::new(junction, from, to, false)));
+}
+
+fn controlled_straight(sim: &mut TestCtx, role: ApproachRole) -> (LaneID, LaneID, TurnID) {
+    let a = vec3(70.0, 200.0, 0.0);
+    let b = vec3(270.0, 200.0, 0.0);
+    let c = vec3(480.0, 200.0, 0.0);
+    sim.build_roads(&[a, b, c]);
+    sim.build_roads(&[b, vec3(270.0, 410.0, 0.0)]);
+    let (from, to, junction, approach) = {
+        let map = sim.g.map();
+        let from = lane_at(&map, a, b);
+        let incoming = map.get(from).unwrap();
+        (from, lane_at(&map, b, c), incoming.dst, incoming.parent)
+    };
+    sim.g
+        .map_mut()
+        .update_intersection(junction, |inter| inter.light_policy = LightPolicy::NoLights);
+    sim.g.map_mut().install_junction_rules(
+        junction,
+        JunctionRules::new(vec![(approach, role)], vec![]).unwrap(),
+    );
+    (from, to, TurnID::new(junction, from, to, false))
+}
+
+#[test]
+fn p7_junction_fix_heavy_vehicles_leave_stop_from_rest() {
+    for kind in [VehicleKind::Bus, VehicleKind::Truck] {
+        let mut ctx = TestCtx::new();
+        let (from, to, turn) = controlled_straight(&mut ctx, ApproachRole::Stop);
+        let vehicle = staged_vehicle(&mut ctx.g, kind, from, to, 30.0);
+        let terminal = ctx.g.map().get(to).unwrap().points.point_along(50.0);
+        let mut schedule = Simulation::schedule();
+        let mut crossed = false;
+        for _ in 0..1500 {
+            ctx.g.tick(&mut schedule, []);
+            let actor = &ctx.g.world.vehicles[vehicle];
+            crossed |= actor
+                .it
+                .get_travers()
+                .is_some_and(|t| t.kind == TraverseKind::Turn(turn));
+            if actor.trans.pos.distance(terminal) <= 0.05 {
+                break;
+            }
+        }
+        let actor = &ctx.g.world.vehicles[vehicle];
+        assert!(
+            crossed && actor.trans.pos.distance(terminal) <= 0.05,
+            "{kind:?}"
+        );
+    }
+}
+
+#[test]
+fn p7_junction_fix_physical_blocker_and_stop_spillback() {
+    use crate::transportation::queue_diagnostics::{watch_spillback, QueueDiagnostics};
+
+    let mut ctx = TestCtx::new();
+    let (from, to, turn) = controlled_straight(&mut ctx, ApproachRole::Stop);
+    let entrant = staged_vehicle(&mut ctx.g, VehicleKind::Bus, from, to, 8.0);
+    let exit = ctx.g.map().get(to).unwrap().points.point_along(6.0);
+    let blocker = spawn_driving_vehicle(
+        &mut ctx.g,
+        VehicleKind::Car,
+        Transform::new_dir(exit, Vec3::X),
+    )
+    .unwrap();
+    assert!(ctx.g.world.vehicles[blocker].it.get_route().is_none());
+    assert!(watch_spillback(&ctx.g, turn));
+    let tick = ctx.g.get_tick();
+    for step in 1..=5 {
+        let (world, resources) = ctx.g.world_res();
+        crate::transportation::transport_grid_synchronize(world, resources);
+        ctx.g.world.vehicles[entrant].speed.0 = if step == 1 { 400.0 } else { 0.15 };
+        update_at(&mut ctx.g, tick + step);
+        let (world, resources) = ctx.g.world_res();
+        crate::transportation::queue_diagnostics::queue_diagnostics_update(world, resources);
+        let counts = ctx.g.read::<QueueDiagnostics>().spillback(turn).unwrap();
+        if step <= 3 {
+            assert_eq!(
+                counts.longest_permissive_ticks, 0,
+                "Stop dwell is ineligible"
+            );
+        }
+    }
+    let counts = ctx.g.read::<QueueDiagnostics>().spillback(turn).unwrap();
+    assert_eq!(
+        ctx.g.world.vehicles[entrant].speed.0, 0.0,
+        "route-less collider fills the exit"
+    );
+    assert!(
+        counts.longest_permissive_ticks > 0,
+        "approach hold counts toward spillback"
+    );
+    ctx.g.world.vehicles[blocker].trans.pos.z += 8.0;
+    ctx.g.world.vehicles[entrant].speed.0 = 0.15;
+    update_at(&mut ctx.g, tick + 6);
+    assert!(ctx.g.world.vehicles[entrant].speed.0 > 0.0);
+}
+
+#[test]
+fn p7_junction_fix_unrelated_indoor_population_does_not_block_grants() {
+    let mut ctx = TestCtx::new();
+    let (from, to, turn) = controlled_straight(&mut ctx, ApproachRole::Priority);
+    let house = ctx.build_house_near(vec3(160.0, 200.0, 0.0).xy());
+    let human = crate::souls::human::spawn_human(&mut ctx.g, house).unwrap();
+    let template = Bincode::encode(&ctx.g.world.humans[human]).unwrap();
+    for _ in 0..65_536 {
+        ctx.g
+            .world
+            .insert(Bincode::decode::<crate::world::HumanEnt>(&template).unwrap());
+    }
+    let car = staged_vehicle(&mut ctx.g, VehicleKind::Car, from, to, 8.0);
+    ctx.g.world.vehicles[car].speed.0 = 400.0;
+    let (world, resources) = ctx.g.world_res();
+    crate::transportation::transport_grid_synchronize(world, resources);
+    let tick = ctx.g.get_tick();
+    update_at(&mut ctx.g, tick + 1);
+    assert_eq!(
+        ctx.g.world.vehicles[car].it.get_travers().unwrap().kind,
+        TraverseKind::Turn(turn)
+    );
+}
+
+#[test]
+fn p7_junction_fix_track_and_controller_conflict_in_both_build_orders() {
+    use crate::map::road_edit::{junction_edit_stamp, preview_junction_edit};
+    use crate::map::{LanePatternBuilder, MapProject};
+    use crate::world_command::{CommandOutcomes, PrepareBudget};
+    use crate::WorldCommand;
+
+    for track_first in [false, true] {
+        for height in [10.0, 24.0] {
+            let mut ctx = TestCtx::new();
+            let a = vec3(70.0, 200.0, 10.0);
+            let b = vec3(270.0, 200.0, 10.0);
+            let c = vec3(480.0, 200.0, 10.0);
+            ctx.build_roads(&[a, b, c]);
+            ctx.build_roads(&[b, vec3(270.0, 410.0, 10.0)]);
+            let (junction, road) = {
+                let map = ctx.g.map();
+                let lane = map.get(lane_at(&map, a, b)).unwrap();
+                (lane.dst, lane.parent)
+            };
+            ctx.g
+                .map_mut()
+                .update_intersection(junction, |inter| inter.light_policy = LightPolicy::NoLights);
+            let track = WorldCommand::MapMakeConnection {
+                from: MapProject::ground(vec3(100.0, 75.0, height)),
+                to: MapProject::ground(vec3(440.0, 325.0, height)),
+                inter: None,
+                pat: LanePatternBuilder::new().rail(true).build(),
+            };
+            if track_first {
+                ctx.g.apply_commands([&track]);
+                assert!(ctx.g.read::<CommandOutcomes>().last.is_empty());
+            }
+            let rules = JunctionRules::new(vec![(road, ApproachRole::Priority)], vec![]).unwrap();
+            let mut budget = PrepareBudget::for_preview(280_000);
+            let expected = junction_edit_stamp(&ctx.g, junction, &mut budget).unwrap();
+            let preview = preview_junction_edit(&ctx.g, junction, expected, &rules, &mut budget);
+            if track_first && height == 10.0 {
+                assert!(matches!(
+                    preview,
+                    Err(crate::world_command::Rejection::InvalidJunctionRules(
+                        crate::map::JunctionRuleError::RailConflict
+                    ))
+                ));
+                continue;
+            }
+            ctx.g.apply_commands([&WorldCommand::MapSetJunctionRules {
+                junction,
+                expected,
+                rules,
+                quote: preview.unwrap().quote,
+            }]);
+            assert!(ctx
+                .g
+                .read::<CommandOutcomes>()
+                .junction_edit(0)
+                .unwrap()
+                .is_ok());
+            if !track_first {
+                let hashes = ctx.g.hashes();
+                ctx.g.apply_commands([&track]);
+                assert_eq!(
+                    ctx.g.read::<CommandOutcomes>().last.is_empty(),
+                    height != 10.0
+                );
+                if height == 10.0 {
+                    assert_eq!(ctx.g.hashes(), hashes);
+                }
+            }
+            let bytes = Bincode::encode(&ctx.g).unwrap();
+            Bincode::decode::<Simulation>(&bytes).unwrap();
+        }
+    }
+}
+
+#[test]
+fn p7_junction_fix_loaded_hold_line_claim_cannot_skip_dwell() {
+    let mut ctx = TestCtx::new();
+    let (from, to, turn) = controlled_straight(&mut ctx, ApproachRole::Stop);
+    let vehicle = staged_vehicle(&mut ctx.g, VehicleKind::Bus, from, to, 8.0);
+    let lane_end = ctx.g.map().get(from).unwrap().points.last();
+    let half = VehicleKind::Bus.width() * 0.5;
+    ctx.g.world.vehicles[vehicle].trans.pos = lane_end - Vec3::X * half;
+    let hold = ctx.g.world.vehicles[vehicle].trans.pos;
+    ctx.g
+        .write::<JunctionAdmission>()
+        .seed_saved_vehicle_claim(vehicle, turn, 0);
+    ctx.g.write::<crate::Replay>().registry = Some(prototypes::prototypes().fingerprint());
+    let bytes = Bincode::encode(&ctx.g).unwrap();
+    let mut loaded = Bincode::decode::<Simulation>(&bytes).unwrap();
+    assert_eq!(loaded.read::<JunctionAdmission>().crossing_count(), 0);
+    let tick = loaded.get_tick();
+    loaded.world.vehicles[vehicle].speed.0 = 0.15;
+    update_at(&mut loaded, tick + 1);
+    assert_eq!(loaded.world.vehicles[vehicle].trans.pos, hold);
 }

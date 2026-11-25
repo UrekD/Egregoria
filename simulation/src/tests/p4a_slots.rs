@@ -40,7 +40,13 @@ fn options() -> NewGameOptions {
 
 #[test]
 fn p7_snapshot_loads_p6_slot_with_disabled_replay() {
-    crate::tests::init_test_simulation();
+    if !crate::tests::in_prototype_fixture_process(
+        module_path!(),
+        "p7_snapshot_loads_p6_slot_with_disabled_replay",
+    ) {
+        return;
+    }
+    crate::tests::load_unprofiled_prototypes();
     let root = TestRoot::new();
     let id = SlotId::new("floor").unwrap();
     let paths = slot_paths(&root.0, &id).unwrap();
@@ -63,7 +69,13 @@ fn p7_snapshot_loads_p6_slot_with_disabled_replay() {
 
 #[test]
 fn p7_snapshot_loads_p6_slot_with_recorded_replay() {
-    crate::tests::init_test_simulation();
+    if !crate::tests::in_prototype_fixture_process(
+        module_path!(),
+        "p7_snapshot_loads_p6_slot_with_recorded_replay",
+    ) {
+        return;
+    }
+    crate::tests::load_unprofiled_prototypes();
     let root = TestRoot::new();
     let id = SlotId::new("floor").unwrap();
     let paths = slot_paths(&root.0, &id).unwrap();

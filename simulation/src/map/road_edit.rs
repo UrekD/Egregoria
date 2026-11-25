@@ -356,10 +356,21 @@ pub enum RoadEditRequest {
         expected: RoadEditStamp,
         change: RoadUpgrade,
     },
+    JunctionRules {
+        junction: IntersectionID,
+        expected: JunctionEditStamp,
+        rules: JunctionRules,
+    },
 }
 
 #[derive(Clone, Debug)]
-pub struct RoadEditPreview {
+pub enum RoadEditPreview {
+    Upgrade(RoadUpgradePreview),
+    JunctionRules(JunctionEditPreview),
+}
+
+#[derive(Clone, Debug)]
+pub struct RoadUpgradePreview {
     pub road: RoadID,
     pub stamp: RoadEditStamp,
     pub quote: RoadQuote,
@@ -415,16 +426,34 @@ pub fn preview_road_edit(
     request: &RoadEditRequest,
     budget: &mut PrepareBudget,
 ) -> Result<RoadEditPreview, Rejection> {
-    let RoadEditRequest::Upgrade {
-        road,
-        expected,
-        change,
-    } = request;
-    Ok(prepare_upgrade(sim, *road, *expected, change, budget)?.preview)
+    match request {
+        RoadEditRequest::Upgrade {
+            road,
+            expected,
+            change,
+        } => preview_road_upgrade(sim, *road, *expected, change, budget)
+            .map(RoadEditPreview::Upgrade),
+        RoadEditRequest::JunctionRules {
+            junction,
+            expected,
+            rules,
+        } => preview_junction_edit(sim, *junction, *expected, rules, budget)
+            .map(RoadEditPreview::JunctionRules),
+    }
+}
+
+pub fn preview_road_upgrade(
+    sim: &Simulation,
+    road: RoadID,
+    expected: RoadEditStamp,
+    change: &RoadUpgrade,
+    budget: &mut PrepareBudget,
+) -> Result<RoadUpgradePreview, Rejection> {
+    Ok(prepare_upgrade(sim, road, expected, change, budget)?.preview)
 }
 
 pub(crate) struct PreparedRoadEdit {
-    pub(crate) preview: RoadEditPreview,
+    pub(crate) preview: RoadUpgradePreview,
     map_identity: u64,
     topology_revision: (u64, u64, u64, u64, usize),
     lane_edits: Vec<(LaneID, f32)>,
@@ -646,7 +675,7 @@ pub(crate) fn prepare_upgrade(
         attached_lots,
     )));
     Ok(PreparedRoadEdit {
-        preview: RoadEditPreview {
+        preview: RoadUpgradePreview {
             road: id,
             stamp: current,
             quote,
@@ -795,12 +824,58 @@ fn verify_direction_handoff(
         TraverseKind::Lane(id) => removed.contains(&id),
         TraverseKind::Turn(turn) => turn.parent == road.src || turn.parent == road.dst,
     };
+    let map = sim.map();
     for (_, vehicle) in vehicles.iter() {
         if matches!(
             vehicle.it.target(),
             Some(crate::map_dynamic::ItineraryTarget::DirectedLane(lane, _)) if removed.contains(&lane)
         ) {
             return Err(Rejection::BusyConflict);
+        }
+        if vehicle.collider.is_some() {
+            let rear = vehicle.vehicle.kind.width() * 0.5;
+            let position = vehicle.trans.pos;
+            if let Some(path) = vehicle.it.get_travers() {
+                if let TraverseKind::Lane(id) = path.kind {
+                    if let Some(lane) = map.get(id).filter(|lane| lane.kind.vehicles()) {
+                        let (entrance, start) = match path.dir {
+                            super::TraverseDirection::Forward => (lane.src, lane.points.first()),
+                            super::TraverseDirection::Backward => (lane.dst, lane.points.last()),
+                        };
+                        if (entrance == road.src || entrance == road.dst)
+                            && start.is_close(position, rear + 0.8)
+                        {
+                            return Err(Rejection::BusyConflict);
+                        }
+                    }
+                }
+            } else {
+                let body = vehicle.trans.dir * rear;
+                let envelope = geom::Segment3::new(position - body, position + body);
+                for id in [road.src, road.dst] {
+                    let junction = &map.intersections()[id];
+                    if !junction
+                        .pos
+                        .is_close(position, junction.radius + rear + 1.0)
+                    {
+                        continue;
+                    }
+                    for turn in junction.raw_turns() {
+                        budget.spend_road_work(1)?;
+                        if turn.kind != super::TurnKind::Driving {
+                            continue;
+                        }
+                        budget.spend_road_work(turn.points.len())?;
+                        if turn.points.segments().any(|segment| {
+                            crate::transportation::junction_admission::segments_close(
+                                segment, envelope, 1.0,
+                            )
+                        }) {
+                            return Err(Rejection::BusyConflict);
+                        }
+                    }
+                }
+            }
         }
         if let Some(route) = vehicle.it.get_route() {
             budget.spend_road_work(route.reversed_route.len())?;

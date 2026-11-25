@@ -23,13 +23,14 @@ const STANDING_SPEED: f32 = 0.2;
 const PROGRESS: f32 = 0.5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct QueueRevision(u64, u64, u64);
+pub struct QueueRevision(u64, u64, u64, u64);
 
 impl QueueRevision {
     pub fn current(map: &Map) -> Self {
         Self(
             map.identity(),
             map.walking_topology_generation,
+            map.driving_policy_generation,
             map.junction_policy_revision(),
         )
     }
@@ -904,6 +905,7 @@ pub fn parking_pressure(
 
 fn spillback_sample(
     reads: &QueueReads,
+    holds: &BTreeMap<VehicleID, HoldTrace>,
     turn: TurnID,
     budget: &mut ReadBudget,
 ) -> Option<SpillbackSample> {
@@ -917,19 +919,39 @@ fn spillback_sample(
         .iter()
         .filter(|occupant| occupant.speed <= STANDING_SPEED)
         .max_by(|a, b| a.offset.total_cmp(&b.offset).then_with(|| b.id.cmp(&a.id)));
-    let blocked = match standing {
-        Some(standing) if !reads.has_receiving_room(turn.dst, standing.radius * 2.0, budget)? => {
-            Some((standing.id, standing.offset))
+    if let Some(standing) = standing {
+        if !reads.has_receiving_room(turn.dst, standing.radius * 2.0, budget)? {
+            return Some(SpillbackSample {
+                standing: Some((standing.id, lane.points.length() + standing.offset)),
+                permissive: matches!(
+                    lane.control.get_behavior(reads.seconds),
+                    TrafficBehavior::GREEN | TrafficBehavior::STOP
+                ),
+            });
         }
-        _ => None,
-    };
-    let permissive = matches!(
-        lane.control.get_behavior(reads.seconds),
-        TrafficBehavior::GREEN | TrafficBehavior::STOP
-    );
+    }
+    let approach = forward(TraverseKind::Lane(turn.src));
+    let waiting = reads.occupants(approach, budget)?;
+    if budget.omitted > omitted_before {
+        return None;
+    }
+    let blocked = waiting
+        .into_iter()
+        .filter(|actor| {
+            actor.next == Some(turn)
+                && actor.speed <= STANDING_SPEED
+                && lane.points.length() - actor.offset - actor.radius <= HOLD_DISTANCE
+                && holds.get(&actor.id).is_some_and(|hold| {
+                    hold.tick == reads.tick
+                        && hold.traversal == approach
+                        && hold.reason == QueueHoldReason::ExitFull
+                })
+        })
+        .max_by(|a, b| a.offset.total_cmp(&b.offset).then_with(|| b.id.cmp(&a.id)));
     Some(SpillbackSample {
-        standing: blocked,
-        permissive,
+        standing: blocked.map(|actor| (actor.id, actor.offset)),
+        // The actual barrier only publishes ExitFull after authored dwell.
+        permissive: blocked.is_some(),
     })
 }
 
@@ -967,11 +989,12 @@ pub fn queue_diagnostics_update(world: &mut World, resources: &mut Resources) {
         turns.rotate_left(start);
     }
     for turn in turns {
+        let sample = spillback_sample(&reads, &diagnostics.holds, turn, &mut budget);
         diagnostics
             .watched_turns
             .get_mut(&turn)
             .unwrap()
-            .update(tick, spillback_sample(&reads, turn, &mut budget));
+            .update(tick, sample);
     }
     if diagnostics
         .last_presentation_tick

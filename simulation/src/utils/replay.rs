@@ -82,39 +82,7 @@ impl Replay {
     }
 
     pub(crate) fn check_registry(&self) -> io::Result<()> {
-        crate::check_prototype_registry(self.registry)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if self.registry.is_some() {
-            return Ok(());
-        }
-
-        // Older recordings do not have a fingerprint. Check their explicit
-        // prototype references before starting playback.
-        use crate::map::ZoneKind::MixedUse;
-        for (_, command) in &self.commands {
-            let available = match command {
-                WorldCommand::ZonePaint {
-                    kind: Some(MixedUse),
-                    density,
-                    ..
-                } => {
-                    *density == crate::map::Density::Low
-                        || prototypes::try_prototypes()
-                            .is_some_and(|registry| registry.mixed_use_pair(*density).is_some())
-                }
-                WorldCommand::MapBuildSpecialBuilding { kind, .. } => {
-                    crate::building_kind_prototype_exists(*kind)
-                }
-                WorldCommand::SpawnTrain { wagons, .. } => wagons
-                    .iter()
-                    .all(|&id| prototypes::try_prototype(id).is_some()),
-                _ => true,
-            };
-            if !available {
-                return Err(invalid_replay("Replay requires a missing prototype"));
-            }
-        }
-        Ok(())
+        crate::check_prototype_registry(self.registry).map_err(replay_decode_error)
     }
 
     pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
@@ -342,7 +310,6 @@ impl ReplayHeader {
                 SaveLoadError::Incompatible { version }
             });
         }
-        crate::check_prototype_registry(header.registry)?;
         Ok(header)
     }
 }
@@ -405,14 +372,13 @@ impl ReplayJson {
         revision: Option<SnapshotRevision>,
     ) -> Result<Replay, SaveLoadError> {
         let header = ReplayHeader::decode(bytes)?;
+        crate::check_prototype_registry(header.registry)?;
         if header.revision != revision.map(SnapshotRevision::get) {
             return Err(replay_corrupt(invalid_replay(
                 "Replay revision does not match the snapshot",
             )));
         }
-        let replay: Replay = JSON::decode(bytes).map_err(replay_corrupt)?;
-        replay.check_registry().map_err(replay_corrupt)?;
-        Ok(replay)
+        JSON::decode(bytes).map_err(replay_corrupt)
     }
 }
 
@@ -741,6 +707,7 @@ fn scale_t1_replay_boundary_keeps_legacy_edit_pending() {
 #[cfg(test)]
 #[test]
 fn scale_t1_fix_rejects_import_in_replay_constructor() {
+    crate::tests::init_test_simulation();
     let mut replay = Replay::default();
     let options = SimulationOptions {
         terrain_size: crate::NewGameOptions::MIN_TERRAIN_CHUNKS,
@@ -760,9 +727,12 @@ fn scale_t1_fix_rejects_import_in_replay_constructor() {
 #[cfg(test)]
 #[test]
 fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
+    crate::tests::init_test_simulation();
+    let registry = prototypes::prototypes().fingerprint();
     let mut replay = Replay {
         version: crate::VERSION.to_owned(),
         enabled: true,
+        registry: Some(registry),
         ..Replay::default()
     };
     let assert_discarded = |replay: &Replay| {
@@ -778,7 +748,10 @@ fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
     replay.push(Tick(INITIAL_TICK), WorldCommand::MapLoadParis);
     assert_discarded(&replay);
 
-    let obsolete = br#"{"version":"0.11.0","enabled":true,"commands":[[1,{"Obsolete":[]}]]}"#;
+    let obsolete = format!(
+        r#"{{"version":"0.11.0","enabled":true,"registry":{registry},"commands":[[1,{{"Obsolete":[]}}]]}}"#
+    );
+    let obsolete = obsolete.as_bytes();
     assert!(ReplayJson::decode_snapshot(obsolete)
         .unwrap()
         .obsolete_recording_discarded());
@@ -795,10 +768,13 @@ fn p7_replay_rejects_floor_identity_before_decoding_commands() {
     use crate::map::{LanePatternBuilder, RoadID};
     use common::saveload::Bincode;
 
+    crate::tests::init_test_simulation();
+    let registry = prototypes::prototypes().fingerprint();
     let zero = Bincode::encode(&0u64).unwrap();
     let make = |version: &str| {
         let mut replay = Replay::default();
         replay.version = version.to_owned();
+        replay.registry = Some(registry);
         replay.push(
             Tick(1),
             WorldCommand::MapUpgradeRoad {

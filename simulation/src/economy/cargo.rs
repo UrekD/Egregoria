@@ -5735,6 +5735,49 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn p7_life_route_loss_preserves_original_freight_until_physical_unload() {
+        let mut f = Fixture::new();
+        f.seed(16, 1);
+        f.update(FREIGHT_MATCH_INTERVAL);
+        let token = f.token();
+        let start = f.ctx.g.world.vehicles[f.truck].trans.pos;
+        let mut underway = false;
+        for _ in 0..6000 {
+            f.ctx.tick_fast();
+            let vehicle = &f.ctx.g.world.vehicles[f.truck];
+            if f.ctx.g.get(f.driver).unwrap().location == Location::Vehicle(f.truck)
+                && vehicle.it.get_route().is_some()
+                && vehicle.trans.pos.distance(start) > 25.0
+            {
+                underway = true;
+                break;
+            }
+        }
+        assert!(underway);
+        f.ctx.g.world.vehicles[f.truck].it = Itinerary::NONE;
+        f.ctx.tick_fast();
+        assert!(f.ctx.g.world.vehicles[f.truck].it.get_route().is_some());
+        assert_eq!(f.token(), token);
+        for _ in 0..20_000 {
+            f.ctx.tick_fast();
+            if !f.ctx.g.read::<CargoBook>().loads.contains_key(&token) {
+                break;
+            }
+        }
+        let book = f.ctx.g.read::<CargoBook>();
+        assert!(!book.loads.contains_key(&token));
+        assert_eq!(
+            book.freight_day(0)
+                .unwrap()
+                .receipt(f.destination.soul, Fixture::coal())
+                .road_units,
+            16
+        );
+        assert_eq!(book.freight_day(0).unwrap().delivered_loads, 1);
+        assert_eq!(f.hand(f.destination), 17);
+    }
+
+    #[test]
     fn e2fix_a_real_empty_return_finishes_without_recovery() {
         let mut f = Fixture::new();
         f.seed(16, 1);

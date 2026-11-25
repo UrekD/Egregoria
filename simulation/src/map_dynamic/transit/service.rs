@@ -211,6 +211,13 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
                 nominal_timeout
             };
             if now.0.saturating_sub(run.leg_started.0) <= timeout {
+                if vehicle.it.is_missing() && !at_berth(vehicle, stop) {
+                    if let Some(berth) = transit.berth(&map, stop_id) {
+                        // An in-flight route loss is distinct from arriving or
+                        // skipping a stop. Keep the run and its riders together.
+                        vehicle.it = Itinerary::wait_for_reroute_to_lane(berth.lane, berth.offset);
+                    }
+                }
                 continue;
             }
             if line.suspended {
@@ -751,6 +758,72 @@ pub(in crate::map_dynamic) mod tests {
         transit_dispatch_update(world, resources);
         assert_eq!(resources.read::<Transit>().runs[&bus].next_stop_idx, 0);
         assert_eq!(resources.read::<Transit>().runs[&bus].failures, 1);
+    }
+
+    #[test]
+    fn p7_life_route_loss_keeps_the_original_bus_and_alighting_stop() {
+        let (mut ctx, line) = loop_fixture();
+        let (bus, _) = start_routed_bus(&mut ctx, line, true);
+        let home = ctx.build_house_near(vec2(200.0, 100.0));
+        let rider = spawn_human(&mut ctx.g, home).unwrap();
+        ctx.g
+            .write::<BuildingInfos>()
+            .get_out(home, SoulID::Human(rider));
+        let (from, to, berth, walk_pos) = {
+            let transit = ctx.g.read::<Transit>();
+            let stops = &transit.lines[line].stops;
+            let target = &transit.stops[stops[1]];
+            (stops[0], stops[1], target.berth, target.walk_pos)
+        };
+        let (world, resources) = ctx.g.world_res();
+        world.edit_human(rider, |human| {
+            human.location = Location::Outside;
+            human.router.set_test_route(
+                Destination::Outside(walk_pos),
+                vec![
+                    RoutingStep::WaitAtStop {
+                        stop: from,
+                        line,
+                        since: WAIT_NOT_STARTED,
+                    },
+                    RoutingStep::RideTransit { line, alight: to },
+                    RoutingStep::WalkTo(walk_pos),
+                ],
+            );
+            assert!(Router::board(human, bus, resources));
+        });
+        let mut schedule = Simulation::schedule();
+        schedule.retain_systems(|name| {
+            matches!(
+                name,
+                "pedestrian_decision_system"
+                    | "transport_grid_synchronize"
+                    | "vehicle_decision_system"
+                    | "transit_dispatch_update"
+                    | "transit_board_update"
+                    | "routing_update_system"
+                    | "itinerary_update"
+            )
+        });
+        let start = ctx.g.world.vehicles[bus].trans.pos;
+        for _ in 0..100 {
+            ctx.g.tick(&mut schedule, []);
+        }
+        let current = ctx.g.world.vehicles[bus].trans.pos;
+        assert!(current.distance(start) > 1.0 && current.distance(berth) > BERTH_DISTANCE);
+        ctx.g.world.vehicles[bus].it = Itinerary::NONE;
+        ctx.g.tick(&mut schedule, []);
+        assert!(ctx.g.world.vehicles[bus].it.get_route().is_some());
+        let mut resumed = Bincode::decode::<Simulation>(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+        for _ in 0..6000 {
+            resumed.tick(&mut schedule, []);
+            if resumed.get(rider).unwrap().location == Location::Outside {
+                assert!(resumed.world.vehicles[bus].trans.pos.distance(berth) <= BERTH_DISTANCE);
+                assert!(resumed.get(rider).unwrap().trans.pos.distance(walk_pos) < 0.5);
+                return;
+            }
+        }
+        panic!("the original rider never reached the original stop");
     }
 
     #[test]

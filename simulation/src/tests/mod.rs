@@ -1105,7 +1105,10 @@ fn zones2_unprofiled_registry_rejects_inert_mixed_use_paint() {
     let replay_before = sim.read::<crate::Replay>().command_count();
     paint(ZoneKind::MixedUse).apply(&mut sim);
     assert_eq!(sim.read::<ZoneGrid>().cells(), &grid_before);
-    assert_eq!(sim.read::<crate::Replay>().command_count(), replay_before);
+    assert_eq!(
+        sim.read::<crate::Replay>().command_count(),
+        replay_before + 1
+    );
     assert!(sim.read::<CommandOutcomes>().accepted.is_empty());
 }
 

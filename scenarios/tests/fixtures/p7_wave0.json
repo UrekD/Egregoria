@@ -1138,7 +1138,7 @@
       "repair-cohort",
       "repair-no-loss"
     ],
-    "status": "populated synthetic checkpoints and offer keys; no-loss physical comparison; causal improvement pending",
+    "status": "physical comparison at both cutoffs; pinned repair fails the C2 primary gate",
     "producer": "scenarios::traffic_repair::prepare_repair_fixture",
     "seed": 6042,
     "initial_elapsed_tick": 23,
@@ -1182,6 +1182,21 @@
       "first_offset_ticks": 100,
       "interval_ticks": 250
     },
+    "free_flow_reference": {
+      "method": "First tag in each group run alone from the 13 m/s no-loss checkpoint, at its original release tick, including normal handling",
+      "ticks": {
+        "west_to_center": 6093,
+        "west_to_east": 56447,
+        "center_to_west": 8814,
+        "center_to_east": 18570,
+        "east_to_west": 23434,
+        "east_to_center": 5553,
+        "west_mine_to_east_plant": 4815,
+        "east_mine_to_west_plant": 5097
+      }
+    },
+    "expected_primary_improvement": false,
+    "expected_tail_credit": {"person": 120, "freight": 24},
     "od_limit_ticks": 3500,
     "unfinished_ticks": 3501,
     "quantile": "nearest rank, pooled separately for person and freight",

@@ -5,7 +5,7 @@ use crate::map::{
 use crate::transportation::junction_admission::segments_close;
 use crate::transportation::VehicleKind;
 use crate::world_command::{bounded_command_vec, PrepareBudget, Rejection};
-use geom::{Segment3, Vec3, AABB};
+use geom::{PolyLine3, Segment3, Vec3, AABB};
 use serde::{Deserialize, Serialize};
 
 const MAX_APPROACH_RULES: usize = 32;
@@ -240,6 +240,60 @@ impl JunctionRules {
         }
         Ok(())
     }
+}
+
+/// Guard the inverse edit order: a newly constructed track cannot overlap
+/// the swept movements of a controller already on the map.
+pub(crate) fn check_new_rail_sweeps(
+    map: &Map,
+    deck: &PolyLine3,
+    road_width: f32,
+    budget: &mut PrepareBudget,
+) -> Result<(), Rejection> {
+    let first = deck.first().xy();
+    let mut bounds = AABB::new_ll_ur(first, first);
+    budget.spend_road_work(deck.len())?;
+    for point in deck.iter() {
+        bounds.ll = bounds.ll.min(point.xy());
+        bounds.ur = bounds.ur.max(point.xy());
+    }
+    // A curved lane can be offset by its full miter. Use the deck envelope
+    // so every possible rail lane in the final road is covered.
+    let clearance =
+        VehicleKind::Bus.width() * 0.5 + road_width * std::f32::consts::FRAC_1_SQRT_2 + 0.8;
+    let scaled = |segment: Segment3| {
+        let scale = |p: Vec3| p.xy().z(p.z * clearance / 3.0);
+        Segment3::new(scale(segment.src), scale(segment.dst))
+    };
+    for id in map.configured_junctions() {
+        budget.spend_road_work(1)?;
+        let junction = &map.intersections()[id];
+        if !bounds
+            .expand(junction.radius + clearance)
+            .contains(junction.pos.xy())
+        {
+            continue;
+        }
+        for turn in junction
+            .raw_turns()
+            .filter(|turn| turn.kind != TurnKind::Rail)
+        {
+            budget.spend_road_work(1)?;
+            for rail in deck.segments() {
+                budget.spend_road_work(1)?;
+                let rail = scaled(rail);
+                for crossing in turn.points.segments() {
+                    budget.spend_road_work(1)?;
+                    if segments_close(rail, scaled(crossing), clearance * clearance) {
+                        return Err(Rejection::InvalidJunctionRules(
+                            JunctionRuleError::RailConflict,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Copy, Clone, Serialize, Deserialize)]

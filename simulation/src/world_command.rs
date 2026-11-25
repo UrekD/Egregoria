@@ -1916,7 +1916,9 @@ impl WorldCommand {
                 pat,
             } => {
                 let map = sim.map();
-                let shared_topology = map.land_ownership().is_tiled() || budget.shared_topology;
+                let shared_topology = map.land_ownership().is_tiled()
+                    || budget.shared_topology
+                    || map.checks_rail_sweeps(pat);
                 let mut work = (shared_topology || map.needs_topology_preparation())
                     .then(WaterTopologyWork::new);
                 if let Some(work) = &mut work {
@@ -2033,7 +2035,11 @@ impl WorldCommand {
         }
 
         let mut map = sim.map_mut();
-        let shared_topology = tiled || batch.shared_topology;
+        let shared_topology = tiled
+            || batch.shared_topology
+            || links
+                .iter()
+                .any(|(_, _, _, pattern)| map.checks_rail_sweeps(pattern));
         let mut water_work =
             (shared_topology || map.needs_topology_preparation()).then(WaterTopologyWork::new);
         if shared_topology {

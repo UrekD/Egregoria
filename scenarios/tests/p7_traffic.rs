@@ -586,61 +586,76 @@ fn repair_cohort_and_no_loss_preserves_physical_arrivals_and_unloads() {
         }
     }
     assert_eq!((persons, freight), (120, 24));
+    let manifest = wave0_manifest();
+    let offers = physical_offers(&fixture, &manifest["matched_cohort"]);
+    let tail = score_matched_offers(&offers, &stock, &edit, fixture.tail_cutoff).unwrap();
+    assert!(tail.preserves_credit);
 }
 
 #[test]
 #[ignore = "runs both full matched repair arms"]
 fn repair_cohort_matched_headless() {
-    use scenarios::traffic_repair::{prepare_repair_fixture, FixtureArm, FixtureOffer};
+    use scenarios::traffic_repair::{prepare_repair_fixture, FixtureArm};
 
     let fixture = prepare_repair_fixture(FixtureArm::Repair).unwrap();
     let [control, treatment] = run_repair_checkpoint(&fixture, "repair-cohort");
-    let report = |treatment: bool, observations: &[Observation]| {
-        assert_eq!(observations.len(), fixture.schedule.len());
-        let mut primary = [0, 0];
-        let mut tail = [0, 0];
-        let mut durations = [Vec::new(), Vec::new()];
-        for (offered, observed) in fixture.schedule.iter().zip(observations) {
-            assert_eq!(observed.tag, offered.tag);
-            assert_eq!(observed.admitted_at, Some(offered.tick));
-            let (index, expected) = match offered.offer {
-                FixtureOffer::Person { destination, .. } => (0, destination),
-                FixtureOffer::Freight { receiver, .. } => (1, receiver),
-            };
-            if let Some(Terminal::Completed {
-                tick,
-                destination,
-                units,
-            }) = &observed.terminal
-            {
-                assert_eq!(destination, &format!("{expected:?}"));
-                assert_eq!(*units, 1);
-                assert!((offered.tick..=fixture.tail_cutoff).contains(tick));
-                tail[index] += 1;
-                if *tick <= fixture.primary_cutoff {
-                    primary[index] += 1;
-                    durations[index].push(*tick - offered.tick);
-                }
-            }
+    let manifest = wave0_manifest();
+    let pin = &manifest["matched_cohort"];
+    let offers = physical_offers(&fixture, pin);
+    let primary =
+        score_matched_offers(&offers, &control, &treatment, fixture.primary_cutoff).unwrap();
+    let tail = score_matched_offers(&offers, &control, &treatment, fixture.tail_cutoff).unwrap();
+
+    eprintln!("primary {primary:?}");
+    eprintln!("tail {tail:?}");
+    assert_eq!(
+        primary.passes_improvement,
+        pin["expected_primary_improvement"].as_bool().unwrap(),
+    );
+    assert!(
+        tail.preserves_credit,
+        "every original tag must keep its tail credit"
+    );
+    for (cohort, label) in [(Cohort::Person, "person"), (Cohort::Freight, "freight")] {
+        for arm in [&tail.control, &tail.treatment] {
+            assert_eq!(
+                arm[&cohort].credited,
+                pin["expected_tail_credit"][label].as_u64().unwrap()
+            );
+            assert_eq!(arm[&cohort].attrition, 0);
         }
-        let observed_p95 = durations.map(|mut durations| {
-            durations.sort_unstable();
-            (durations.len() * 95)
-                .div_ceil(100)
-                .checked_sub(1)
-                .map(|i| durations[i])
-        });
-        eprintln!(
-            "treatment={treatment} primary={primary:?} tail={tail:?} completed-travel-p95-ticks={observed_p95:?}"
-        );
-        tail
-    };
-    let control = report(false, &control);
-    let treatment = report(true, &treatment);
-    assert!(treatment
-        .into_iter()
-        .zip(control)
-        .all(|(edited, stock)| edited >= stock));
+    }
+}
+
+fn physical_offers(
+    fixture: &scenarios::traffic_repair::RepairFixture,
+    pin: &serde_json::Value,
+) -> Vec<Offer> {
+    use scenarios::traffic_repair::FixtureOffer;
+
+    fixture
+        .schedule
+        .iter()
+        .map(|row| {
+            let (cohort, destination, units) = match row.offer {
+                FixtureOffer::Person { destination, .. } => (Cohort::Person, destination, 1),
+                FixtureOffer::Freight {
+                    receiver, units, ..
+                } => (Cohort::Freight, receiver, units),
+            };
+            Offer {
+                tag: row.tag,
+                cohort,
+                directed_group: row.group.to_string(),
+                destination: format!("{destination:?}"),
+                tick: row.tick,
+                free_flow_ticks: pin["free_flow_reference"]["ticks"][row.group]
+                    .as_u64()
+                    .unwrap_or_else(|| panic!("missing free-flow pin for {}", row.group)),
+                units,
+            }
+        })
+        .collect()
 }
 
 fn run_repair_checkpoint(

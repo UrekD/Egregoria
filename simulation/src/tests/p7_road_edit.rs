@@ -1,7 +1,7 @@
 use crate::economy::Government;
 use crate::map::road_edit::{
     preview_road_edit, road_edit_stamp, RoadEditPreview, RoadEditRequest, RoadEditStatus,
-    RoadUpgrade,
+    RoadUpgrade, RoadUpgradePreview,
 };
 use crate::map::{LaneKind, LanePatternBuilder, MapProject, RoadID};
 use crate::map_dynamic::{itinerary_update, Itinerary, Transit};
@@ -28,7 +28,18 @@ fn road_fixture() -> (Simulation, RoadID) {
     (sim, road)
 }
 
-fn upgrade(sim: &Simulation, road: RoadID, speed: f32) -> (WorldCommand, RoadEditPreview) {
+fn preview_upgrade(
+    sim: &Simulation,
+    request: &RoadEditRequest,
+    budget: &mut PrepareBudget,
+) -> Result<RoadUpgradePreview, Rejection> {
+    preview_road_edit(sim, request, budget).map(|preview| match preview {
+        RoadEditPreview::Upgrade(upgrade) => upgrade,
+        RoadEditPreview::JunctionRules(_) => panic!("expected an upgrade preview"),
+    })
+}
+
+fn upgrade(sim: &Simulation, road: RoadID, speed: f32) -> (WorldCommand, RoadUpgradePreview) {
     let mut budget = PrepareBudget::for_preview(4_194_304);
     let expected = road_edit_stamp(sim, road, &mut budget).unwrap();
     let change = RoadUpgrade::Replace(LanePatternBuilder::new().speed_limit(speed).build());
@@ -37,7 +48,7 @@ fn upgrade(sim: &Simulation, road: RoadID, speed: f32) -> (WorldCommand, RoadEdi
         expected,
         change: change.clone(),
     };
-    let preview = preview_road_edit(sim, &request, &mut budget).unwrap();
+    let preview = preview_upgrade(sim, &request, &mut budget).unwrap();
     let command = WorldCommand::MapUpgradeRoad {
         road,
         expected,
@@ -190,7 +201,7 @@ fn p7_edit_widening_projects_the_final_local_graph_before_the_commit_gate() {
         expected,
         change: change.clone(),
     };
-    let preview = preview_road_edit(&sim, &request, &mut budget).unwrap();
+    let preview = preview_upgrade(&sim, &request, &mut budget).unwrap();
     let topology = preview.projected_topology.as_ref().unwrap();
     assert_eq!(topology.affected_roads, [road]);
     assert_eq!(topology.junctions.len(), 2);
@@ -362,7 +373,7 @@ fn p7_edit_replacement_rejects_rail_and_accepts_both_one_way_directions() {
                 RoadUpgrade::ReverseOneWay
             },
         };
-        let result = preview_road_edit(&sim, &request, &mut budget);
+        let result = preview_upgrade(&sim, &request, &mut budget);
         if row == 0 {
             assert!(
                 matches!(result, Err(Rejection::InvalidRoadPattern)),
@@ -416,7 +427,7 @@ fn p7_life_busy_one_way_reversal_keeps_occupants_then_allocates_new_lane() {
     let preview = |sim: &Simulation| {
         let mut budget = PrepareBudget::for_preview(4_194_304);
         let expected = road_edit_stamp(sim, road, &mut budget).unwrap();
-        preview_road_edit(
+        preview_upgrade(
             sim,
             &RoadEditRequest::Upgrade {
                 road,
@@ -516,7 +527,7 @@ fn p7_life_same_width_replacement_preserves_a_live_directed_terminal() {
     let mut budget = PrepareBudget::for_preview(4_194_304);
     let expected = road_edit_stamp(&sim, road, &mut budget).unwrap();
     let change = RoadUpgrade::Replace(pattern.build());
-    let preview = preview_road_edit(
+    let preview = preview_upgrade(
         &sim,
         &RoadEditRequest::Upgrade {
             road,
@@ -709,7 +720,7 @@ fn p7_edit_speed_checks_protected_deck_footprint() {
         change: RoadUpgrade::Replace(LanePatternBuilder::new().speed_limit(13.0).build()),
     };
     assert!(matches!(
-        preview_road_edit(&sim, &request, &mut budget),
+        preview_upgrade(&sim, &request, &mut budget),
         Err(Rejection::LandDenied(LandDenial::ProtectedGateway)),
     ));
 }
@@ -909,4 +920,174 @@ fn p7_reassigning_frontage_updates_replacement_work() {
         map.reparent_lot(lot, unrelated);
     }
     assert!(before < available(&map));
+}
+
+#[test]
+fn p7_junction_fix_paused_reversal_invalidates_read_revisions() {
+    use crate::map::{Traversable, TraverseDirection, TraverseKind};
+    use crate::transportation::queue_diagnostics::{
+        explain_queue, QueueCoverage, QueueLimits, QueueRevision,
+    };
+
+    super::init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(2, 6042).unwrap();
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject::ground(vec3(100.0, 200.0, 0.0)),
+        to: MapProject::ground(vec3(400.0, 200.0, 0.0)),
+        inter: None,
+        pat: LanePatternBuilder::new()
+            .one_way(true)
+            .parking(false)
+            .build(),
+    }]);
+    let (road, lane, revision) = {
+        let map = sim.map();
+        let road = map.roads().values().next().unwrap();
+        let lane = road
+            .lanes_iter()
+            .find(|(_, kind)| kind.vehicles())
+            .unwrap()
+            .0;
+        (road.id, lane, QueueRevision::current(&map))
+    };
+    let traverse = Traversable::new(TraverseKind::Lane(lane), TraverseDirection::Forward);
+    sim.write::<TransportGrid>().watch_traversal_users();
+    let (world, resources) = sim.world_res();
+    itinerary_update(world, resources);
+    assert!(sim
+        .read::<TransportGrid>()
+        .traversal_users(&sim.map(), traverse)
+        .is_some());
+    let mut budget = PrepareBudget::for_preview(280_000);
+    let expected = road_edit_stamp(&sim, road, &mut budget).unwrap();
+    let preview = preview_upgrade(
+        &sim,
+        &RoadEditRequest::Upgrade {
+            road,
+            expected,
+            change: RoadUpgrade::ReverseOneWay,
+        },
+        &mut budget,
+    )
+    .unwrap();
+    sim.apply_commands([&WorldCommand::MapUpgradeRoad {
+        road,
+        expected,
+        change: RoadUpgrade::ReverseOneWay,
+        quote: preview.quote,
+    }]);
+    assert_eq!(
+        sim.read::<CommandOutcomes>()
+            .road_edit(0)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status,
+        RoadEditStatus::Applied
+    );
+    assert_ne!(revision, QueueRevision::current(&sim.map()));
+    assert!(sim
+        .read::<TransportGrid>()
+        .traversal_users(&sim.map(), traverse)
+        .is_none());
+    assert_eq!(
+        explain_queue(&sim, lane, revision, QueueLimits::default()).coverage,
+        QueueCoverage::StaleRevision
+    );
+}
+
+#[test]
+fn p7_junction_fix_reversal_waits_for_bus_rear_on_neighbor_lane() {
+    use crate::map::ProjectKind;
+
+    super::init_test_simulation();
+    let mut sim = Simulation::new_authored_flat(2, 6042).unwrap();
+    let a = vec3(100.0, 200.0, 0.0);
+    let b = vec3(400.0, 200.0, 0.0);
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject::ground(a),
+        to: MapProject::ground(b),
+        inter: None,
+        pat: LanePatternBuilder::new()
+            .one_way(true)
+            .parking(false)
+            .build(),
+    }]);
+    let (road, junction) = {
+        let map = sim.map();
+        let (id, road) = map.roads().iter().next().unwrap();
+        (id, road.dst)
+    };
+    sim.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject {
+            pos: b,
+            kind: ProjectKind::Intersection(junction),
+        },
+        to: MapProject::ground(vec3(510.0, 400.0, 0.0)),
+        inter: None,
+        pat: LanePatternBuilder::new().build(),
+    }]);
+    let (outgoing, pos, clear, direction, route) = {
+        let map = sim.map();
+        let lane = map
+            .lanes()
+            .values()
+            .find(|lane| {
+                lane.parent != road && lane.src == junction && lane.kind == LaneKind::Driving
+            })
+            .unwrap();
+        let route =
+            Itinerary::route_between_lanes(Tick(0), &map, (lane.id, 1.0), (lane.id, 50.0)).unwrap();
+        (
+            lane.id,
+            lane.points.point_along(1.0),
+            lane.points.point_along(20.0),
+            lane.points.first_dir().unwrap(),
+            route,
+        )
+    };
+    assert!(sim
+        .map()
+        .get(junction)
+        .unwrap()
+        .turns()
+        .any(|turn| turn.id.dst == outgoing));
+    let bus = spawn_driving_vehicle(
+        &mut sim,
+        VehicleKind::Bus,
+        Transform::new_dir(pos, direction),
+    )
+    .unwrap();
+    sim.world.vehicles[bus].it = route;
+    let preview = |sim: &Simulation| {
+        let mut budget = PrepareBudget::for_preview(4_194_304);
+        let expected = road_edit_stamp(sim, road, &mut budget).unwrap();
+        preview_upgrade(
+            sim,
+            &RoadEditRequest::Upgrade {
+                road,
+                expected,
+                change: RoadUpgrade::ReverseOneWay,
+            },
+            &mut budget,
+        )
+    };
+    assert!(matches!(preview(&sim), Err(Rejection::BusyConflict)));
+    sim.world.vehicles[bus].trans.pos = clear;
+    let edit = preview(&sim).unwrap();
+    sim.apply_commands([&WorldCommand::MapUpgradeRoad {
+        road,
+        expected: edit.stamp,
+        change: RoadUpgrade::ReverseOneWay,
+        quote: edit.quote,
+    }]);
+    assert_eq!(
+        sim.read::<CommandOutcomes>()
+            .road_edit(0)
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .status,
+        RoadEditStatus::Applied
+    );
 }

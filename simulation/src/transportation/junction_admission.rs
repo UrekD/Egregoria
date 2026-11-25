@@ -1,21 +1,23 @@
 use crate::map::{
     ApproachRole, IntersectionID, LaneID, LightPolicy, Map, Traversable, TraverseDirection,
-    TraverseKind, TurnID,
+    TraverseKind, TurnID, TurnKind,
 };
 use crate::map_dynamic::Itinerary;
-use crate::transportation::Location;
+use crate::transportation::{
+    ColliderOwnerLookup, Location, TransportGrid, TransportationGroup, Transporter, TraversalOwner,
+};
 use crate::world_command::bounded_command_vec;
-use crate::{HumanID, HumanWork, VehicleID, World};
-use geom::{Segment3, Vec3};
+use crate::{HumanID, VehicleID, World};
+use geom::{Segment3, Vec2, Vec3};
 use prototypes::{game_secs_to_ticks, DELTA};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-const MAX_REQUESTS: usize = 4096;
-const MAX_OWNERS_VISITED: usize = 65_536;
+const MAX_LOCAL_OWNERS: usize = 256;
+const MAX_REQUESTS: usize = crate::map::MAX_CONFIGURED_JUNCTIONS * MAX_LOCAL_OWNERS;
+const LOCAL_MARGIN: f32 = 36.0;
 const MAX_PATH_POINTS: usize = 256;
 const MAX_TURN_SEGMENT_PAIRS: usize = 16_384;
-const MAX_RECEIVING_OCCUPANTS: usize = 64;
 const STOP_DWELL: u64 = game_secs_to_ticks(1);
 const AGE_PRIORITY: u64 = game_secs_to_ticks(60);
 const GAP: f32 = 0.8;
@@ -123,6 +125,11 @@ impl TryFrom<SavedAdmission> for JunctionAdmission {
 }
 
 impl JunctionAdmission {
+    pub(crate) fn clear(&mut self) {
+        self.waiting.clear();
+        self.crossings.clear();
+    }
+
     pub(crate) fn crossing_turn(&self, turn: TurnID) -> bool {
         self.crossings
             .values()
@@ -148,25 +155,54 @@ impl JunctionAdmission {
         &mut self,
         map: &Map,
         world: &World,
+        grid: &TransportGrid,
         tick: u64,
     ) -> Result<(), &'static str> {
         if self.waiting.values().any(|clock| clock.seen > tick) {
             return Err("junction admission clock is ahead of the simulation");
         }
-        let owner_exists = |owner| match owner {
-            EntryOwner::Vehicle(id) => world.vehicles.contains_key(id),
-            EntryOwner::Human(id) => world.humans.get(id).is_some(),
-        };
         let valid_crossing = |crossing: Crossing| {
             (!crossing.backwards || crossing.turn.bidirectional)
                 && map.allows_turn(crossing.turn)
                 && configured(map, crossing.turn.parent).is_some()
         };
-        // A lifecycle system can retire the saved owner after the movement pass.
-        self.waiting
-            .retain(|&owner, clock| owner_exists(owner) && valid_crossing(clock.crossing));
-        self.crossings
-            .retain(|&owner, &mut crossing| owner_exists(owner) && valid_crossing(crossing));
+        let actor_on_grid = |owner| {
+            let actor = Actor::get(world, owner)?;
+            let expected = match owner {
+                EntryOwner::Human(_) => TransportationGroup::Pedestrians,
+                EntryOwner::Vehicle(_) => TransportationGroup::Vehicles,
+            };
+            (grid.get(actor.collider.0)?.1.group == expected).then_some(actor)
+        };
+        self.waiting.retain(|&owner, clock| {
+            if self.crossings.contains_key(&owner)
+                || !valid_crossing(clock.crossing)
+                || tick.saturating_sub(clock.seen) > 1
+            {
+                return false;
+            }
+            let Some(actor) = actor_on_grid(owner) else {
+                return false;
+            };
+            let Some(boundary) = actor.boundary(map) else {
+                return false;
+            };
+            if !boundary.valid
+                || !boundary.bounded
+                || boundary.crossing != clock.crossing
+                || !at_directed_approach(map, clock.crossing, &actor)
+            {
+                return false;
+            }
+            if boundary.distance > HOLD_TOLERANCE || actor.speed.abs() > 0.2 {
+                clock.stopped_since = None;
+            }
+            true
+        });
+        self.crossings.retain(|&owner, crossing| {
+            valid_crossing(*crossing)
+                && actor_on_grid(owner).is_some_and(|actor| still_occupies(map, *crossing, &actor))
+        });
         Ok(())
     }
 }
@@ -188,18 +224,18 @@ pub(crate) struct EntryBoundary {
     overlaps: bool,
 }
 
+impl EntryBoundary {
+    pub(crate) fn reached_by(&self, travel: f32) -> bool {
+        travel > self.distance
+    }
+}
+
 struct EntryRequest {
     user: MovingOwner,
     crossing: Crossing,
     role: ApproachRole,
-    distance: f32,
+    boundary: EntryBoundary,
     speed: f32,
-}
-
-#[derive(Clone, Copy)]
-struct LaneOccupier {
-    user: EntryOwner,
-    rear: f32,
 }
 
 #[derive(Clone, Copy)]
@@ -210,19 +246,64 @@ struct Sweep {
 
 struct Actor<'a> {
     owner: MovingOwner,
+    collider: Transporter,
     itinerary: &'a Itinerary,
     position: Vec3,
+    direction: Vec3,
     speed: f32,
+}
+
+impl<'a> Actor<'a> {
+    fn get(world: &'a World, owner: EntryOwner) -> Option<Self> {
+        let (itinerary, trans, speed, half_extent, collider) = match owner {
+            EntryOwner::Vehicle(id) => {
+                let vehicle = world.vehicles.get(id)?;
+                let collider = vehicle.collider?;
+                if vehicle.vehicle.state.is_parked() {
+                    return None;
+                }
+                (
+                    &vehicle.it,
+                    &vehicle.trans,
+                    vehicle.speed.0,
+                    vehicle.vehicle.kind.width() * 0.5,
+                    collider,
+                )
+            }
+            EntryOwner::Human(id) => {
+                let human = world.humans.get(id)?;
+                let collider = human.collider?;
+                if human.location != Location::Outside {
+                    return None;
+                }
+                (&human.it, &human.trans, human.speed.0, 0.3, collider)
+            }
+        };
+        Some(Self {
+            owner: MovingOwner { owner, half_extent },
+            collider,
+            itinerary,
+            position: trans.pos,
+            direction: trans.dir,
+            speed,
+        })
+    }
+
+    fn boundary(&self, map: &Map) -> Option<EntryBoundary> {
+        entry_boundary(
+            map,
+            self.itinerary,
+            self.position,
+            self.speed * DELTA,
+            self.owner.half_extent,
+        )
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct JunctionFrame {
-    occupied: BTreeMap<IntersectionID, Vec<Sweep>>,
-    requests: Vec<EntryRequest>,
-    receiving: BTreeMap<LaneID, Vec<LaneOccupier>>,
     grants: BTreeMap<EntryOwner, Crossing>,
     denied: BTreeMap<EntryOwner, HoldReason>,
-    overflow: bool,
 }
 
 pub(crate) fn configured(map: &Map, junction: IntersectionID) -> Option<LightPolicy> {
@@ -259,6 +340,7 @@ pub(crate) fn entry_boundary(
         return None;
     }
     let valid = map.allows_turn(crossing.turn)
+        && matches!(route.cur.kind, TraverseKind::Lane(_))
         && route.cur.destination_lane() == crossing.from_lane()
         && route.cur.destination_intersection(map.lanes()) == Some(crossing.turn.parent)
         && (!crossing.backwards || crossing.turn.bidirectional);
@@ -269,7 +351,7 @@ pub(crate) fn entry_boundary(
         valid,
         controlled,
         bounded: distance.is_some(),
-        overlaps: distance.is_some_and(|distance| distance < -0.001),
+        overlaps: distance.is_some_and(|distance| distance < -0.0001),
     })
 }
 
@@ -291,187 +373,172 @@ fn remaining_distance(it: &Itinerary, position: Vec3) -> Option<f32> {
 
 impl JunctionFrame {
     pub(crate) fn prepare(
-        world: &mut World,
+        world: &World,
         map: &Map,
+        grid: &TransportGrid,
         state: &mut JunctionAdmission,
         tick: u64,
     ) -> Self {
         let mut frame = Self::default();
-        if !map.has_junction_controller() {
-            state.waiting.clear();
-            state.crossings.clear();
-            return frame;
-        }
-        if world.vehicles.len().saturating_add(world.humans.len()) > MAX_OWNERS_VISITED {
-            frame.overflow = true;
-            return frame;
-        }
-        let mut human_ids = Vec::new();
-        world.collect_active(HumanWork::Itinerary, &mut human_ids);
+        let mut waiting = BTreeMap::new();
         let mut retained = BTreeMap::new();
-        for (id, vehicle) in &world.vehicles {
-            if vehicle.collider.is_none() || vehicle.vehicle.state.is_parked() {
+        let mut deferred = BTreeSet::new();
+        let mut occupied = BTreeMap::<IntersectionID, Vec<Sweep>>::new();
+        for (&owner, &crossing) in &state.crossings {
+            if let Some(actor) =
+                Actor::get(world, owner).filter(|actor| still_occupies(map, crossing, actor))
+            {
+                occupied
+                    .entry(crossing.turn.parent)
+                    .or_default()
+                    .push(Sweep {
+                        owner: actor.owner,
+                        crossing,
+                    });
+                retained.insert(owner, crossing);
+            }
+        }
+        for junction in map.configured_junctions() {
+            let Some(mode) = configured(map, junction) else {
+                continue;
+            };
+            let inter = &map.intersections()[junction];
+            let reach = Vec2::splat(inter.radius + LOCAL_MARGIN);
+            let center = inter.pos.xy();
+            let mut owners = BTreeSet::new();
+            let candidates = grid.query(center - reach, center + reach);
+            let mut complete = true;
+            for (i, (handle, _)) in candidates.enumerate() {
+                if i == MAX_LOCAL_OWNERS {
+                    complete = false;
+                    break;
+                }
+                match grid.collider_owner(world, handle) {
+                    ColliderOwnerLookup::Owned(TraversalOwner::Vehicle(id)) => {
+                        owners.insert(EntryOwner::Vehicle(id));
+                    }
+                    ColliderOwnerLookup::Owned(TraversalOwner::Human(id)) => {
+                        owners.insert(EntryOwner::Human(id));
+                    }
+                    ColliderOwnerLookup::Deferred => complete = false,
+                    _ => {}
+                }
+            }
+            if !complete {
+                deferred.insert(junction);
                 continue;
             }
-            frame.observe(
-                map,
-                state,
-                &mut retained,
-                Actor {
-                    owner: MovingOwner {
-                        owner: EntryOwner::Vehicle(id),
-                        half_extent: vehicle.vehicle.kind.width() * 0.5,
-                    },
-                    itinerary: &vehicle.it,
-                    position: vehicle.trans.pos,
-                    speed: vehicle.speed.0,
-                },
-            );
-        }
-        for id in human_ids {
-            let human = &world.humans[id];
-            if human.location != Location::Outside {
-                continue;
+            let local = occupied.entry(junction).or_default();
+            let actors: Vec<_> = owners
+                .into_iter()
+                .filter_map(|owner| Actor::get(world, owner))
+                .filter(|actor| {
+                    actor
+                        .position
+                        .xy()
+                        .is_close(center, inter.radius + LOCAL_MARGIN)
+                })
+                .collect();
+            let mut requests = Vec::new();
+            for actor in &actors {
+                let boundary = actor.boundary(map).filter(|boundary| {
+                    boundary.crossing.turn.parent == junction && boundary.valid && boundary.bounded
+                });
+                let active = actor
+                    .itinerary
+                    .get_travers()
+                    .copied()
+                    .and_then(Crossing::from_traversal)
+                    .filter(|crossing| {
+                        crossing.turn.parent == junction && still_occupies(map, *crossing, actor)
+                    })
+                    .or_else(|| {
+                        boundary
+                            .as_ref()
+                            .filter(|boundary| {
+                                boundary.overlaps
+                                    && at_directed_approach(map, boundary.crossing, actor)
+                            })
+                            .map(|b| b.crossing)
+                    });
+                if let Some(crossing) = active {
+                    if retained.insert(actor.owner.owner, crossing) != Some(crossing) {
+                        local.push(Sweep {
+                            owner: actor.owner,
+                            crossing,
+                        });
+                    }
+                }
+                let Some(boundary) =
+                    boundary.filter(|b| retained.get(&actor.owner.owner) != Some(&b.crossing))
+                else {
+                    continue;
+                };
+                let role = match actor.owner.owner {
+                    EntryOwner::Human(_) => ApproachRole::Yield,
+                    EntryOwner::Vehicle(_) => {
+                        let Some(lane) = map.get(boundary.crossing.from_lane()) else {
+                            continue;
+                        };
+                        map.junction_rules(junction)
+                            .and_then(|rules| rules.role(lane.parent))
+                            .unwrap_or(if mode == LightPolicy::StopSigns {
+                                ApproachRole::Stop
+                            } else {
+                                ApproachRole::Yield
+                            })
+                    }
+                };
+                requests.push(EntryRequest {
+                    user: actor.owner,
+                    crossing: boundary.crossing,
+                    role,
+                    boundary,
+                    speed: actor.speed,
+                });
             }
-            frame.observe(
+            frame.reserve(
                 map,
-                state,
-                &mut retained,
-                Actor {
-                    owner: MovingOwner {
-                        owner: EntryOwner::Human(id),
-                        half_extent: 0.3,
-                    },
-                    itinerary: &human.it,
-                    position: human.trans.pos,
-                    speed: human.speed.0,
-                },
+                &state.waiting,
+                &mut waiting,
+                tick,
+                local,
+                &actors,
+                requests,
             );
         }
-        if frame.overflow {
-            return frame;
-        }
+        // Keep the arbitration age across a dense sample. A Stop claimant
+        // must establish uninterrupted dwell again after the deferral.
+        waiting.extend(state.waiting.iter().filter_map(|(&owner, &clock)| {
+            deferred.contains(&clock.crossing.turn.parent).then_some((
+                owner,
+                WaitClock {
+                    seen: tick,
+                    stopped_since: None,
+                    ..clock
+                },
+            ))
+        }));
+        state.waiting = waiting;
         state.crossings = retained;
-        frame.reserve(map, state, tick);
         frame
     }
 
-    fn observe(
+    fn reserve(
         &mut self,
         map: &Map,
-        state: &JunctionAdmission,
-        retained: &mut BTreeMap<EntryOwner, Crossing>,
-        actor: Actor<'_>,
+        previous: &BTreeMap<EntryOwner, WaitClock>,
+        waiting: &mut BTreeMap<EntryOwner, WaitClock>,
+        tick: u64,
+        occupied: &mut Vec<Sweep>,
+        actors: &[Actor<'_>],
+        requests: Vec<EntryRequest>,
     ) {
-        if self.overflow {
-            return;
-        }
-        let Actor {
-            owner,
-            itinerary,
-            position,
-            speed,
-        } = actor;
-        let current = itinerary.get_travers().copied();
-        let boundary = entry_boundary(map, itinerary, position, speed * DELTA, owner.half_extent);
-        let active_turn = current
-            .and_then(Crossing::from_traversal)
-            .filter(|crossing| configured(map, crossing.turn.parent).is_some());
-        let initial_nose = boundary
-            .as_ref()
-            .filter(|boundary| boundary.overlaps && boundary.valid && boundary.controlled)
-            .map(|boundary| boundary.crossing);
-        let previous = state
-            .crossings
-            .get(&owner.owner)
-            .copied()
-            .filter(|crossing| {
-                still_occupies(map, *crossing, current, position, owner.half_extent)
-            });
-        if let Some(crossing) = active_turn.or(previous).or(initial_nose) {
-            self.occupied
-                .entry(crossing.turn.parent)
-                .or_default()
-                .push(Sweep { owner, crossing });
-            retained.insert(owner.owner, crossing);
-            self.overflow = retained.len() > MAX_REQUESTS;
-        }
-
-        if matches!(owner.owner, EntryOwner::Vehicle(_)) {
-            if let Some(Traversable {
-                kind: TraverseKind::Lane(id),
-                ..
-            }) = current
-            {
-                if let Some(lane) = map
-                    .get(id)
-                    .filter(|lane| configured(map, lane.src).is_some())
-                {
-                    let near = lane.points.first().distance(position);
-                    if near < 24.0 {
-                        let projection = lane.points.project(position);
-                        if projection.distance(position) <= owner.half_extent + GAP {
-                            let offset = lane.points.first().distance(projection);
-                            let users = self.receiving.entry(id).or_default();
-                            if users.len() <= MAX_RECEIVING_OCCUPANTS {
-                                users.push(LaneOccupier {
-                                    user: owner.owner,
-                                    rear: offset - owner.half_extent,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        let Some(boundary) = boundary else {
-            return;
-        };
-        if !boundary.valid || !boundary.controlled || !boundary.bounded {
-            return;
-        }
-        let crossing = boundary.crossing;
-        if retained.get(&owner.owner) == Some(&crossing) {
-            return;
-        }
-        let role = match owner.owner {
-            EntryOwner::Human(_) => ApproachRole::Yield,
-            EntryOwner::Vehicle(_) => {
-                let Some(lane) = map.get(crossing.from_lane()) else {
-                    return;
-                };
-                let junction = crossing.turn.parent;
-                map.junction_rules(junction)
-                    .and_then(|rules| rules.role(lane.parent))
-                    .unwrap_or_else(|| {
-                        if configured(map, junction) == Some(LightPolicy::StopSigns) {
-                            ApproachRole::Stop
-                        } else {
-                            ApproachRole::Yield
-                        }
-                    })
-            }
-        };
-        if self.requests.len() == MAX_REQUESTS {
-            self.overflow = true;
-            return;
-        }
-        self.requests.push(EntryRequest {
-            user: owner,
-            crossing,
-            role,
-            distance: boundary.distance,
-            speed,
-        });
-    }
-
-    fn reserve(&mut self, map: &Map, state: &mut JunctionAdmission, tick: u64) {
         let mut eligible = Vec::new();
-        let mut waiting = BTreeMap::new();
         let mut heads = BTreeMap::new();
-        for request in &self.requests {
+        for request in &requests {
             if matches!(request.user.owner, EntryOwner::Vehicle(_)) {
-                let candidate = (request.distance, request.user.owner);
+                let candidate = (request.boundary.distance, request.user.owner);
                 let head = heads
                     .entry(request.crossing.from_lane())
                     .or_insert(candidate);
@@ -480,34 +547,20 @@ impl JunctionFrame {
                 }
             }
         }
-        for request in self.requests.drain(..) {
+        for request in requests {
             let owner = request.user.owner;
             let crossing = request.crossing;
-            let junction = crossing.turn.parent;
-            let needed_storage = request.user.half_extent * 2.0 + GAP;
-            let receives = match owner {
-                EntryOwner::Vehicle(_) => map.get(crossing.to_lane()).is_some_and(|lane| {
-                    lane.points.length() >= needed_storage
-                        && self.receiving.get(&crossing.to_lane()).is_none_or(|users| {
-                            users.len() <= MAX_RECEIVING_OCCUPANTS
-                                && users.iter().all(|other| {
-                                    other.user == owner || other.rear >= needed_storage
-                                })
-                        })
-                }),
-                EntryOwner::Human(_) => true,
-            };
             if matches!(owner, EntryOwner::Vehicle(_)) && heads[&crossing.from_lane()].1 != owner {
                 self.denied.insert(owner, HoldReason::Conflict);
                 continue;
             }
-            let at_hold = request.distance <= HOLD_TOLERANCE;
-            let clock = state.waiting.get(&owner).filter(|clock| {
+            let clock = previous.get(&owner).filter(|clock| {
                 clock.crossing == crossing
                     && (clock.seen == tick || clock.seen.checked_add(1) == Some(tick))
             });
             let eligible_since = clock.map_or(tick, |clock| clock.eligible_since);
-            let stopped_since = (at_hold && request.speed.abs() <= 0.2)
+            let stopped_since = (request.boundary.distance <= HOLD_TOLERANCE
+                && request.speed.abs() <= 0.2)
                 .then(|| clock.and_then(|clock| clock.stopped_since).unwrap_or(tick));
             waiting.insert(
                 owner,
@@ -518,43 +571,47 @@ impl JunctionFrame {
                     stopped_since,
                 },
             );
-
-            let denial = if request.role == ApproachRole::Stop
+            if request.role == ApproachRole::Stop
                 && !stopped_since.is_some_and(|since| tick.saturating_sub(since) >= STOP_DWELL)
             {
-                Some(HoldReason::StopDwell)
-            } else if !receives {
-                Some(HoldReason::ExitFull)
-            } else {
-                None
-            };
-            if let Some(denial) = denial {
-                self.denied.insert(owner, denial);
-            } else if request.speed * DELTA > request.distance + 0.001 {
-                let aged = tick.saturating_sub(eligible_since) >= AGE_PRIORITY;
-                eligible.push((
-                    junction,
-                    !aged,
-                    (!aged).then_some(request.role),
-                    eligible_since,
-                    owner,
-                    Sweep {
-                        owner: request.user,
-                        crossing,
-                    },
-                ));
+                self.denied.insert(owner, HoldReason::StopDwell);
+                continue;
             }
+            let unaged = tick.saturating_sub(eligible_since) < AGE_PRIORITY;
+            eligible.push((
+                unaged,
+                unaged.then_some(request.role),
+                eligible_since,
+                owner,
+                request,
+            ));
         }
-        state.waiting = waiting;
-        eligible.sort_unstable_by_key(|&(junction, unaged, role, since, owner, _)| {
-            (junction, unaged, role, since, owner)
-        });
+        eligible
+            .sort_unstable_by_key(|&(unaged, role, since, owner, _)| (unaged, role, since, owner));
         let mut work = MAX_TURN_SEGMENT_PAIRS;
-        let mut aged_holds: BTreeMap<IntersectionID, Vec<Sweep>> = BTreeMap::new();
-        for (junction, unaged, _, _, owner, sweep) in eligible {
-            let occupied = self.occupied.entry(junction).or_default();
-            let holds = aged_holds.entry(junction).or_default();
-            if holds
+        let mut aged_holds = Vec::new();
+        for (unaged, _, _, owner, request) in eligible {
+            let sweep = Sweep {
+                owner: request.user,
+                crossing: request.crossing,
+            };
+            if matches!(owner, EntryOwner::Vehicle(_)) {
+                match receiving_room(map, &request, actors, &mut work) {
+                    Some(true) => {}
+                    Some(false) => {
+                        self.denied.insert(owner, HoldReason::ExitFull);
+                        continue;
+                    }
+                    None => {
+                        self.denied.insert(owner, HoldReason::Conflict);
+                        continue;
+                    }
+                }
+            }
+            if !request.boundary.reached_by(request.speed * DELTA) {
+                continue;
+            }
+            if aged_holds
                 .iter()
                 .any(|&other| conflicts(map, sweep, other, &mut work))
             {
@@ -567,15 +624,17 @@ impl JunctionFrame {
             {
                 self.denied.insert(owner, HoldReason::Conflict);
                 if !unaged {
-                    // Once the aged movement has receiving room, hold younger
-                    // conflicting arrivals to let the occupied crossing clear.
-                    holds.push(sweep);
+                    aged_holds.push(sweep);
                 }
             } else {
                 occupied.push(sweep);
                 self.grants.insert(owner, sweep.crossing);
             }
         }
+    }
+
+    pub(crate) fn denial(&self, id: VehicleID) -> Option<HoldReason> {
+        self.denied.get(&EntryOwner::Vehicle(id)).copied()
     }
 
     /// A grant is consumed only when the user would move their nose past the hold point.
@@ -598,7 +657,7 @@ impl JunctionFrame {
         if on_initial_approach && state.crossings.get(&owner) == Some(&boundary.crossing) {
             return Ok(());
         }
-        if self.grants.get(&owner) != Some(&boundary.crossing) || self.overflow {
+        if self.grants.get(&owner) != Some(&boundary.crossing) {
             return Err(self
                 .denied
                 .get(&owner)
@@ -615,34 +674,133 @@ impl JunctionFrame {
     }
 }
 
-fn still_occupies(
+fn receiving_room(
     map: &Map,
-    crossing: Crossing,
-    current: Option<Traversable>,
-    position: Vec3,
-    half_extent: f32,
-) -> bool {
+    request: &EntryRequest,
+    actors: &[Actor<'_>],
+    work: &mut usize,
+) -> Option<bool> {
+    let lane = map.get(request.crossing.to_lane())?;
+    let needed = request.user.half_extent * 2.0 + GAP;
+    if lane.points.length() < needed {
+        return Some(false);
+    }
+    let start = lane.points.first();
+    for actor in actors {
+        *work = work.checked_sub(1)?;
+        if actor.owner.owner == request.user.owner
+            || !matches!(actor.owner.owner, EntryOwner::Vehicle(_))
+            || !start
+                .xy()
+                .is_close(actor.position.xy(), needed + actor.owner.half_extent + 3.0)
+        {
+            continue;
+        }
+        // Model the footprint as an oriented capsule. Sweep only the storage
+        // needed from the lane entrance and retain the deck separation.
+        let body = actor.direction.xy().z0() * (actor.owner.half_extent - 1.0);
+        let scale = |p: Vec3| p.xy().z(p.z * 2.0);
+        let vehicle = Segment3::new(scale(actor.position - body), scale(actor.position + body));
+        let mut remaining = needed;
+        for segment in lane.points.segments() {
+            *work = work.checked_sub(1)?;
+            let length = segment.src.distance(segment.dst);
+            if length == 0.0 {
+                continue;
+            }
+            let tangent = segment.vec() / length;
+            let storage_length = remaining.min(length);
+            let center = (actor.position - segment.src).dot(tangent);
+            let extent = body.dot(tangent).abs() + 1.0;
+            // The entrance and its far edge are transverse cuts. Side
+            // clearance must not inflate a bumper's longitudinal extent.
+            if center + extent >= 0.0 && center - extent < storage_length {
+                let end = segment.src + tangent * storage_length;
+                let storage = Segment3::new(scale(segment.src), scale(end));
+                if segments_close(vehicle, storage, (1.0 + lane.kind.width() * 0.5).powi(2)) {
+                    return Some(false);
+                }
+            }
+            remaining -= length;
+            if remaining <= 0.0 {
+                break;
+            }
+        }
+    }
+    Some(true)
+}
+
+fn at_directed_approach(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> bool {
+    let Some(lane) = map.get(crossing.from_lane()) else {
+        return false;
+    };
+    if lane.points.len() > MAX_PATH_POINTS {
+        return false;
+    }
+    let Some(current) = actor.itinerary.get_travers() else {
+        return false;
+    };
+    let endpoint = match current.dir {
+        TraverseDirection::Forward => lane.points.last(),
+        TraverseDirection::Backward => lane.points.first(),
+    };
+    actor
+        .itinerary
+        .local_path()
+        .first()
+        .is_some_and(|p| p.is_close(endpoint, 0.05))
+        && lane
+            .points
+            .project(actor.position)
+            .is_close(actor.position, 0.8)
+}
+
+fn still_occupies(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> bool {
     let Some(turn) = map
         .get(crossing.turn.parent)
         .and_then(|inter| inter.raw_turn(crossing.turn))
     else {
         return false;
     };
-    if let Some(Traversable {
-        kind: TraverseKind::Lane(id),
-        ..
-    }) = current
-    {
-        let endpoint = if (id == crossing.from_lane()) == crossing.backwards {
+    let proper_mode = match actor.owner.owner {
+        EntryOwner::Human(_) => matches!(turn.kind, TurnKind::Crosswalk | TurnKind::WalkingCorner),
+        EntryOwner::Vehicle(_) => turn.kind == TurnKind::Driving,
+    };
+    if !proper_mode || turn.points.len() > MAX_PATH_POINTS {
+        return false;
+    }
+    let Some(&current) = actor.itinerary.get_travers() else {
+        return false;
+    };
+    let position = actor.position;
+    let half_extent = actor.owner.half_extent;
+    if let Some(active) = Crossing::from_traversal(current) {
+        return crossing == active
+            && turn.points.project(position).distance(position) <= half_extent + GAP;
+    }
+    if current.destination_lane() == crossing.from_lane() {
+        let entry = if crossing.backwards {
             turn.points.last()
         } else {
             turn.points.first()
         };
-        if id == crossing.from_lane() || id == crossing.to_lane() {
-            return endpoint.distance(position) <= half_extent + GAP;
-        }
+        return entry.distance(position) < half_extent
+            && at_directed_approach(map, crossing, actor)
+            && actor.boundary(map).is_some_and(|boundary| {
+                boundary.crossing == crossing && boundary.valid && boundary.overlaps
+            });
     }
-    turn.points.project(position).distance(position) <= half_extent + GAP
+    if current.destination_lane() != crossing.to_lane()
+        || current.destination_intersection(map.lanes()) == Some(crossing.turn.parent)
+    {
+        return false;
+    }
+    let exit = if crossing.backwards {
+        turn.points.first()
+    } else {
+        turn.points.last()
+    };
+    exit.distance(position) <= half_extent + GAP
 }
 
 fn conflicts(map: &Map, first: Sweep, second: Sweep, work: &mut usize) -> bool {
@@ -716,4 +874,25 @@ fn p7_junction_conflict_respects_crossing_decks_and_segment_interiors() {
     assert!(!segments_close(route, crossing(6.0), 0.25));
     let disjoint = Segment3::new(vec3(-10.0, 4.0, 0.0), vec3(10.0, 4.0, 0.0));
     assert!(!segments_close(route, disjoint, 4.0));
+}
+
+#[cfg(test)]
+impl JunctionAdmission {
+    pub(crate) fn seed_saved_vehicle_claim(&mut self, vehicle: VehicleID, turn: TurnID, tick: u64) {
+        let owner = EntryOwner::Vehicle(vehicle);
+        let crossing = Crossing {
+            turn,
+            backwards: false,
+        };
+        self.crossings.insert(owner, crossing);
+        self.waiting.insert(
+            owner,
+            WaitClock {
+                crossing,
+                seen: tick,
+                eligible_since: 0,
+                stopped_since: Some(0),
+            },
+        );
+    }
 }

@@ -721,11 +721,15 @@ impl Itinerary {
         let mut on_initial_approach = true;
         while let Some(p) = self.get_point() {
             let dist = position.distance(p);
+            let mut snap = 0.01;
             if let Some(admission) = &mut admission {
                 if let Some(boundary) =
                     entry_boundary(map, self, position, dist_to_move, admission.user.half_extent)
                 {
-                    if boundary.distance <= dist_to_move + 0.01 {
+                    if boundary.reached_by(dist) {
+                        snap = 0.0;
+                    }
+                    if boundary.reached_by(dist_to_move) {
                         if let Err(reason) = admission.frame.try_enter(
                             admission.state,
                             admission.user.owner,
@@ -751,7 +755,7 @@ impl Itinerary {
                     }
                 }
             }
-            if dist <= dist_to_move + 0.01 {
+            if dist <= dist_to_move + snap {
                 self.observe_road_entry(position, p, map, &mut on_road_entry);
                 dist_to_move -= dist;
                 position = p;
@@ -937,6 +941,10 @@ impl Itinerary {
             ) => reversed_route.is_empty() && self.reversed_local_path.is_empty(),
             _ => self.reversed_local_path.is_empty(),
         }
+    }
+
+    pub(crate) fn is_missing(&self) -> bool {
+        matches!(self.kind, ItineraryKind::None)
     }
 
     pub fn is_none_or_wait(&self) -> bool {
@@ -1216,7 +1224,14 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     // Boarding and routing have settled. Build grants from one frozen view
     // before any user's final itinerary movement.
     let mut junction_state = resources.write::<JunctionAdmission>();
-    let mut junction_frame = JunctionFrame::prepare(world, map, &mut junction_state, tick);
+    let mut junction_frame = if map.has_junction_controller() {
+        let mut grid = resources.write::<TransportGrid>();
+        grid.refresh_admission_colliders(world);
+        JunctionFrame::prepare(world, map, &grid, &mut junction_state, tick)
+    } else {
+        junction_state.clear();
+        JunctionFrame::default()
+    };
     let mut diagnostics = resources.write::<QueueDiagnostics>();
     let observing = diagnostics.observing();
 
@@ -1228,42 +1243,51 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         .write::<TransportGrid>()
         .begin_traversal_update(map, tick);
 
-    let mut update =
-        |it: &mut Itinerary, pos: &mut Vec3, speed: f32, kind: Option<RoadUserKind>, user: Option<MovingOwner>| {
-            if it.is_inert() {
-                return (None, None);
-            }
-            let record = kind.map(|kind| {
-                let throughput = &mut *throughput;
-                move |road, path| {
-                    let expected = match kind {
-                        RoadUserKind::Pedestrian => PathKind::Pedestrian,
-                        _ => PathKind::Vehicle,
-                    };
-                    if path == expected {
-                        throughput.record_entry(road, kind, tick);
-                    }
+    let mut update = |it: &mut Itinerary,
+                      pos: &mut Vec3,
+                      speed: f32,
+                      kind: Option<RoadUserKind>,
+                      user: Option<MovingOwner>| {
+        if it.is_inert() {
+            return (None, None, None);
+        }
+        let record = kind.map(|kind| {
+            let throughput = &mut *throughput;
+            move |road, path| {
+                let expected = match kind {
+                    RoadUserKind::Pedestrian => PathKind::Pedestrian,
+                    _ => PathKind::Vehicle,
+                };
+                if path == expected {
+                    throughput.record_entry(road, kind, tick);
                 }
-            });
-            let mut admission = user.map(|user| MovementAdmission {
-                frame: &mut junction_frame,
-                state: &mut junction_state,
-                user,
-                hold: None,
-                observe_discharge: observing && matches!(user.owner, EntryOwner::Vehicle(_)),
-                discharged: None,
-            });
-            *pos = it.update_guarded(
-                *pos,
-                speed * DELTA,
-                time.seconds,
-                map,
-                |start, target, kind| failures.route(time.tick, start, target, map, kind),
-                record,
-                admission.as_mut(),
-            );
-            admission.map_or((None, None), |guard| (guard.hold, guard.discharged))
-        };
+            }
+        });
+        let mut admission = user.map(|user| MovementAdmission {
+            frame: &mut junction_frame,
+            state: &mut junction_state,
+            user,
+            hold: None,
+            observe_discharge: observing && matches!(user.owner, EntryOwner::Vehicle(_)),
+            discharged: None,
+        });
+        *pos = it.update_guarded(
+            *pos,
+            speed * DELTA,
+            time.seconds,
+            map,
+            |start, target, kind| failures.route(time.tick, start, target, map, kind),
+            record,
+            admission.as_mut(),
+        );
+        admission.map_or((None, None, None), |guard| {
+            let observed_hold = match guard.user.owner {
+                EntryOwner::Vehicle(id) if observing => guard.frame.denial(id),
+                _ => None,
+            };
+            (guard.hold, guard.discharged, observed_hold)
+        })
+    };
     world.humans.edit_active(HumanWork::Itinerary, |id, human| {
         let outside = human.location == Location::Outside;
         let has_route_step = human.router.has_route_step();
@@ -1286,7 +1310,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         let kind = outside.then_some(RoadUserKind::Pedestrian);
         let speed = human.speed.0;
         let (itinerary, pos) = human.itinerary_mut();
-        let (held, _) = update(
+        let (held, _, _) = update(
             itinerary,
             pos,
             speed,
@@ -1337,7 +1361,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             VehicleKind::Bus => RoadUserKind::Bus,
         };
         let before = observing.then(|| vehicle.it.get_travers().copied()).flatten();
-        let (held, discharged) = update(
+        let (held, discharged, observed_hold) = update(
             &mut vehicle.it,
             &mut vehicle.trans.pos,
             vehicle.speed.0,
@@ -1347,9 +1371,11 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                 half_extent: vehicle.vehicle.kind.width() * 0.5,
             }),
         );
-        if let Some(reason) = held {
+        if held.is_some() {
             vehicle.speed.0 = 0.0;
-            if observing {
+        }
+        if observing {
+            if let Some(reason) = held.or(observed_hold) {
                 let reason = match reason {
                     HoldReason::Conflict => QueueHoldReason::Conflict(None),
                     HoldReason::ExitFull => QueueHoldReason::ExitFull,

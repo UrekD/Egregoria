@@ -443,6 +443,12 @@ impl Map {
             .any(|rules| !rules.approaches().is_empty())
     }
 
+    pub(crate) fn configured_junctions(&self) -> impl Iterator<Item = IntersectionID> + '_ {
+        self.junction_rules
+            .iter()
+            .filter_map(|(&id, rules)| (!rules.approaches().is_empty()).then_some(id))
+    }
+
     pub(crate) fn junction_rule_count(&self) -> usize {
         self.junction_rules.len()
     }
@@ -976,7 +982,7 @@ impl Map {
         ConnectionError,
     > {
         let mut local;
-        if work.is_none() && self.land_ownership.is_tiled() {
+        if work.is_none() && (self.land_ownership.is_tiled() || self.checks_rail_sweeps(pattern)) {
             local = WaterTopologyWork::new();
             let (from, to, prepared) =
                 self.prepare_connection(from, to, elbow, pattern, Some(&mut local))?;
@@ -1116,7 +1122,32 @@ impl Map {
             &mut work.geometry(),
         );
         work.profile_samples += profile_samples;
-        Ok((profile_samples, Some(prepared?)))
+        let prepared = prepared?;
+        if self.checks_rail_sweeps(pattern) {
+            self.authorize_rail_deck(&prepared.preview.deck, pattern, &mut work.remaining)?;
+        }
+        Ok((profile_samples, Some(prepared)))
+    }
+
+    pub(crate) fn checks_rail_sweeps(&self, pattern: &LanePattern) -> bool {
+        self.has_junction_controller() && pattern.lanes().any(|(kind, _, _)| kind.is_rail())
+    }
+
+    fn authorize_rail_deck(
+        &self,
+        deck: &PolyLine3,
+        pattern: &LanePattern,
+        remaining: &mut usize,
+    ) -> Result<(), ConnectionError> {
+        let allowance = (*remaining).min(16_384);
+        let mut budget = crate::world_command::PrepareBudget::for_preview(allowance);
+        let result =
+            super::traffic_control::check_new_rail_sweeps(self, deck, pattern.width(), &mut budget);
+        *remaining -= allowance - *budget.road_work_remaining();
+        result.map_err(|reason| match reason {
+            crate::world_command::Rejection::RoadWorkLimit => ConnectionError::WorkLimit,
+            _ => ConnectionError::InvalidEndpoint,
+        })
     }
 
     pub(crate) fn make_resolved_connection(
@@ -1221,6 +1252,21 @@ impl Map {
         {
             return Err(ConnectionError::Stale);
         }
+        // Unrestricted bulk connection callers can arrive without a topology
+        // projection. Still authorize track geometry before the first map write.
+        let prepared = if prepared.is_none() && self.checks_rail_sweeps(pattern) {
+            self.prepare_resolved_connection_inner(
+                from,
+                to,
+                interpoint,
+                pattern,
+                false,
+                &mut WaterTopologyWork::new(),
+            )?
+            .1
+        } else {
+            prepared
+        };
         let connection_segment = match interpoint {
             Some(x) => RoadSegmentKind::from_elbow(from.pos.xy(), to.pos.xy(), x),
             None => RoadSegmentKind::Straight,
@@ -2512,6 +2558,9 @@ impl Map {
         }
 
         let new_polyline = r1.merged_profile(r2, same_inter);
+        if self.checks_rail_sweeps(&pat1) {
+            self.authorize_rail_deck(&new_polyline, &pat1, &mut 16_384)?;
+        }
         let elevated = r1.elevated_span()
             || r2.elevated_span()
             || Road::is_elevated_span(
@@ -2635,7 +2684,13 @@ impl Map {
         pattern: &LanePattern,
         segment: RoadSegmentKind,
     ) -> Option<RoadID> {
-        if !self.environment.strict_water_siting() && !self.land_ownership.is_tiled() {
+        let rail_guard = self.checks_rail_sweeps(pattern);
+        if rail_guard {
+            self.check_junction_topology_edit(src_id).ok()?;
+            self.check_junction_topology_edit(dst_id).ok()?;
+        }
+        if !self.environment.strict_water_siting() && !self.land_ownership.is_tiled() && !rail_guard
+        {
             let gen_lots = !matches!(segment, RoadSegmentKind::Arbitrary(_));
             let road = self.connect_with_span(src_id, dst_id, pattern, segment, None, None)?;
             if gen_lots {
@@ -2674,6 +2729,10 @@ impl Map {
             &mut work.geometry(),
         )
         .ok()?;
+        if rail_guard {
+            self.authorize_rail_deck(&prepared.preview.deck, pattern, &mut work.remaining)
+                .ok()?;
+        }
         let mut tiled_frontage = prepared.frontage_work;
         let id = self.connect_with_span(
             src_id,
