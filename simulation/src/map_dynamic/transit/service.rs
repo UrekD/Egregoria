@@ -189,11 +189,8 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
             run.failures = 0;
             vehicle.it = Itinerary::NONE;
         } else {
-            let expected = transit
-                .legs
-                .get(&bus)
-                .filter(|leg| leg.expected_ticks > 0)
-                .map_or_else(
+            let planned_leg = transit.legs.get(&bus).filter(|leg| leg.expected_ticks > 0);
+            let expected = planned_leg.map_or_else(
                     || nominal_leg_ticks(&transit, run, vehicle.trans.pos, stop.berth),
                     |leg| leg.expected_ticks,
                 );
@@ -211,7 +208,7 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
                 nominal_timeout
             };
             if now.0.saturating_sub(run.leg_started.0) <= timeout {
-                if vehicle.it.is_missing() && !at_berth(vehicle, stop) {
+                if planned_leg.is_some() && vehicle.it.is_missing() && !at_berth(vehicle, stop) {
                     if let Some(berth) = transit.berth(&map, stop_id) {
                         // An in-flight route loss is distinct from arriving or
                         // skipping a stop. Keep the run and its riders together.
