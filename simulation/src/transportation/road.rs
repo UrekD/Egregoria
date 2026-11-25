@@ -263,9 +263,13 @@ pub fn calc_decision<'a>(
     let time_to_stop = speed / vehicle.kind.deceleration();
     let stop_dist = time_to_stop * speed * 0.5;
 
-    let cutoff = (0.8 + stop_dist).min(1.5);
-
+    let stopping_threshold = 0.8 + stop_dist;
     let panicking = matches!(vehicle.state, VehicleState::Panicking(_));
+    let cutoff = if panicking {
+        stopping_threshold
+    } else {
+        stopping_threshold.min(1.5)
+    };
     let (front_dist, flag, crossing) =
         calc_front_dist(vehicle, trans, self_obj, it, neighs, cutoff, panicking);
 
@@ -299,7 +303,7 @@ pub fn calc_decision<'a>(
         return default_return;
     } else {
         // Stop at 80 cm of object in front
-        if front_dist < 0.8 + stop_dist {
+        if front_dist < stopping_threshold {
             return (0.0, dir_to_pos);
         }
     }
@@ -474,4 +478,63 @@ fn calc_front_dist<'a>(
         }
     }
     (min_front_dist, flag, false)
+}
+
+#[cfg(test)]
+#[test]
+fn p7_panic_yields_within_moving_stopping_distance() {
+    use crate::transportation::{TransportationGroup, VehicleKind};
+    use geom::{vec2, vec3, Color};
+
+    let time = GameTime::new(prototypes::Tick(1));
+    let map = Map::empty();
+    let approach = Transform::new(vec3(0.0, 0.0, 0.0));
+    let itinerary = Itinerary::simple(vec![vec3(30.0, 0.0, 0.0)]);
+    for (speed, crossing_pos) in [(8.0, vec2(12.0, -3.0)), (9.0, vec2(10.0, -5.0))] {
+        let car = TransportState {
+            speed,
+            radius: VehicleKind::Car.width() * 0.5,
+            group: TransportationGroup::Vehicles,
+            ..TransportState::default()
+        };
+        let crossing = TransportState {
+            dir: Vec2::Y,
+            speed: 1.0,
+            ..car
+        };
+        let above = TransportState {
+            height: 10.0,
+            ..crossing
+        };
+        let drive = |state, neighbors: &[(Vec2, &TransportState)]| {
+            let mut vehicle = Vehicle {
+                ang_velocity: 0.0,
+                wait_time: 0.0,
+                max_speed_multiplier: 1.0,
+                state,
+                kind: VehicleKind::Car,
+                tint: Color::WHITE,
+                flag: 0,
+            };
+            calc_decision(
+                VehicleID::default(),
+                &mut vehicle,
+                &map,
+                &time,
+                &approach,
+                &car,
+                &itinerary,
+                neighbors.iter().copied(),
+            )
+            .0
+        };
+        let panic = || VehicleState::Panicking(time.instant());
+        let leader = (vec2(1.5, 0.0), &car);
+        assert_eq!(
+            drive(VehicleState::Driving, &[(crossing_pos, &crossing)]),
+            0.0
+        );
+        assert_eq!(drive(panic(), &[leader, (crossing_pos, &crossing)]), 0.0);
+        assert!(drive(panic(), &[leader, (crossing_pos, &above)]) > 0.0);
+    }
 }
