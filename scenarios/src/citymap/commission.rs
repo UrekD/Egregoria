@@ -3258,7 +3258,6 @@ struct StationTruck {
 }
 
 struct FreightMonitor {
-    terminal_door: Vec3,
     market_position: Vec2,
     train_state: Option<FreightTrainState>,
     latest_unload: Option<u64>,
@@ -3273,8 +3272,7 @@ struct FreightMonitor {
 impl FreightMonitor {
     fn new(sim: &Simulation, freight: &Freight) -> Self {
         let map = sim.map();
-        Self {
-            terminal_door: map.buildings()[freight.terminal].door_pos,
+        let mut monitor = Self {
             market_position: map.buildings()[freight.market].obb.center(),
             train_state: Self::train_state(sim, freight),
             latest_unload: None,
@@ -3284,6 +3282,19 @@ impl FreightMonitor {
             deliveries: BTreeMap::new(),
             awaiting_return: None,
             evidence: FreightEvidence::default(),
+        };
+        monitor.observe_fleet(sim, freight.terminal);
+        monitor
+    }
+
+    fn observe_fleet(&mut self, sim: &Simulation, terminal: BuildingID) {
+        for id in sim.read::<CargoBook>().station_fleet(terminal) {
+            if let Some(vehicle) = sim.world().vehicles.get(id) {
+                self.trucks.entry(id).or_insert(StationTruck {
+                    parked: matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot),
+                    target: vehicle.it.target(),
+                });
+            }
         }
     }
 
@@ -3311,19 +3322,12 @@ impl FreightMonitor {
             self.record_train_return(tick);
         }
 
-        // The terminal is the only station and its six trucks spawn and park
-        // at its door. Observe stock draws only with the entire fleet visible.
+        // The terminal can have every truck out on deliveries at handoff.
+        // Use the cargo book's assignments to observe the entire fleet.
         const FLEET_SIZE: usize = 6;
         let vehicles = &sim.world().vehicles;
         if self.trucks.len() < FLEET_SIZE && tick % SAMPLE_TICKS == 0 {
-            for (id, vehicle) in vehicles.iter() {
-                if matches!(vehicle.vehicle.kind, VehicleKind::Truck)
-                    && matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot)
-                    && vehicle.trans.pos == self.terminal_door
-                {
-                    self.trucks.entry(id).or_insert(StationTruck { parked: true, target: None });
-                }
-            }
+            self.observe_fleet(sim, freight.terminal);
         }
 
         let full_fleet = self.trucks.len() == FLEET_SIZE
@@ -4101,7 +4105,6 @@ mod tests {
         simulation::init::init();
         let item = ItemID::new("goods");
         let mut monitor = FreightMonitor {
-            terminal_door: Vec3::ZERO,
             market_position: Vec2::ZERO,
             train_state: None,
             latest_unload: None,
