@@ -33,7 +33,7 @@ use std::ptr::addr_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 use utils::rand_provider::RandProvider;
-use utils::replay::ReplayJson;
+use utils::replay::{replay_version_error, ReplayJson};
 use utils::scheduler::SeqSchedule;
 
 #[macro_use]
@@ -340,10 +340,7 @@ impl Simulation {
 
     pub fn try_from_replay(replay: Replay) -> io::Result<(Simulation, SimulationReplayLoader)> {
         if replay.version != VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Replay has version {:?}, expected {VERSION:?}", replay.version),
-            ));
+            return Err(replay_version_error(&replay.version));
         }
         let options = replay.bootstrap_options()?;
         let bootstrap_end = replay.bootstrap_end()?;
@@ -660,7 +657,7 @@ impl Simulation {
             &CompressedBincode::filename(save_name),
             &Bincode::filename(save_name),
         )?;
-        let sim = Self::decode_snapshot(&read_snapshot(file, kind)?)?;
+        let sim = Self::load_snapshot(file, kind)?;
         log::info!("successfully loaded simulation {save_name}");
         Ok(sim)
     }
@@ -668,6 +665,16 @@ impl Simulation {
     pub fn load_from_slot(root: &Path, id: &SlotId) -> Result<Self, SaveLoadError> {
         let paths = saveload::slot_paths(root, id).map_err(SaveLoadError::Io)?;
         let (file, kind, _) = open_snapshot(&paths.zip, &paths.bc)?;
+        Self::load_snapshot(file, kind)
+    }
+
+    fn load_snapshot(mut file: fs::File, kind: SnapshotKind) -> Result<Self, SaveLoadError> {
+        // A readable old header is enough to reject the save. If the prefix is
+        // unreadable, the normal load still distinguishes oversized and corrupt files.
+        if let Ok(header) = read_snapshot_header(&mut file, kind) {
+            header.check_version()?;
+        }
+        file.rewind().map_err(SaveLoadError::Io)?;
         Self::decode_snapshot(&read_snapshot(file, kind)?)
     }
 
@@ -1168,20 +1175,13 @@ fn decode_snapshot_replay(bytes: &[u8], zip: &Path, bc: &Path) -> Result<Replay,
         })
         .ok()
         .flatten();
-    ReplayJson::decode_sidecar(bytes, revision).map_err(replay_corrupt)
+    ReplayJson::decode_sidecar(bytes, revision)
 }
 
 fn corrupt_header(error: io::Error) -> SaveLoadError {
     SaveLoadError::Corrupt {
         version: None,
         reason: error.to_string(),
-    }
-}
-
-fn replay_corrupt(error: io::Error) -> SaveLoadError {
-    SaveLoadError::Corrupt {
-        version: None,
-        reason: format!("replay sidecar: {error}"),
     }
 }
 
@@ -1264,6 +1264,7 @@ impl SimulationDeser {
             }
         }
 
+        crate::souls::lifecycle::restore_company_departures(&mut sim);
         sim.world.reconcile_derived("after resource decode");
 
         log::info!(

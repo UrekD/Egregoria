@@ -69,6 +69,9 @@ impl Budget {
     }
 
     pub fn tax_rate(&self, zone: ZoneKind) -> u16 {
+        if !zone.is_taxable() {
+            return 0;
+        }
         self.tax_rates
             .get(&zone)
             .copied()
@@ -76,7 +79,7 @@ impl Budget {
     }
 
     pub fn set_tax_rate(&mut self, zone: ZoneKind, rate_permille: u16) {
-        if rate_permille <= MAX_TAX_RATE_PERMILLE {
+        if zone.is_taxable() && rate_permille <= MAX_TAX_RATE_PERMILLE {
             self.tax_rates.insert(zone, rate_permille);
         }
     }
@@ -221,10 +224,9 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
     let mut taxable_levels = BTreeMap::<ZoneKind, i128>::new();
     for human in world.humans.values().filter(|human| human.work.is_some()) {
         let house = human.home.house;
-        if map
-            .get(house)
-            .is_some_and(|building| building.kind == BuildingKind::House)
-        {
+        if map.get(house).is_some_and(|building| {
+            building.has_residential_use() && !building.is_abandoned_growable()
+        }) {
             let level = residences
                 .by_building
                 .get(&house)
@@ -235,8 +237,20 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
     for company in world.companies.values() {
         let id = GrowableCompanyID::from(company.comp.proto);
         if let Some(proto) = try_prototype(id).filter(|proto| proto.growable) {
-            *taxable_levels.entry(proto.zone_kind).or_default() +=
-                company.workers.0.len() as i128 * i128::from(proto.level);
+            let level = map
+                .get(company.comp.building)
+                .and_then(|building| building.development())
+                .map_or(proto.level, |site| {
+                    if site.zone.kind == ZoneKind::MixedUse {
+                        1
+                    } else {
+                        site.level
+                    }
+                });
+            if proto.zone_kind.is_taxable() {
+                *taxable_levels.entry(proto.zone_kind).or_default() +=
+                    company.workers.0.len() as i128 * i128::from(level);
+            }
         }
     }
 

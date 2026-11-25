@@ -1468,4 +1468,45 @@ mod p4_fix_ac_tests {
         assert!(continue_slot(&state.slots).is_some());
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[test]
+    fn p6_save_cut_marks_pre_zs_slots_incompatible() {
+        let root = std::env::temp_dir().join(format!("p6-save-cut-{}", random_seed()));
+        std::fs::create_dir(&root).unwrap();
+        let id = SlotId::new("pre-zs-09").unwrap();
+        let paths = saveload::slot_paths(&root, &id).unwrap();
+        // A legacy Bincode header with no world and a replay with an unknown command
+        // show whether the version is checked before either payload is decoded.
+        std::fs::write(&paths.bc, b"\x050.9.0").unwrap();
+        std::fs::write(
+            &paths.replay,
+            br#"{"commands":[[1,"UnknownCommand"]],"version":"0.9.0"}"#,
+        )
+        .unwrap();
+
+        let catalog = discover_slots(&root).unwrap();
+        let [(entry, compatibility)] = catalog.as_slice() else {
+            panic!("expected one slot, got {}", catalog.len());
+        };
+        assert_eq!(entry.id, id);
+        assert!(matches!(compatibility, SlotCompatibility::Incompatible));
+        assert!(continue_slot(&catalog).is_none());
+        assert!(matches!(
+            Simulation::validate_listed_snapshot(&root, entry),
+            Err(SaveLoadError::SnapshotChanged)
+        ));
+        assert!(matches!(
+            Simulation::load_listed_snapshot(&root, entry),
+            Err(SaveLoadError::SnapshotChanged)
+        ));
+        assert!(matches!(
+            Simulation::load_from_slot(&root, &id),
+            Err(SaveLoadError::Incompatible { version }) if version == "0.9.0"
+        ));
+        assert!(matches!(
+            Simulation::load_replay_from_slot(&root, &id),
+            Err(SaveLoadError::Incompatible { version }) if version == "0.9.0"
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }

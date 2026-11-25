@@ -150,9 +150,9 @@ pub(super) fn check_water(sim: &Simulation, bodies: &Bodies) -> Result<(), Strin
 
 fn check_bank_paint(sim: &mut Simulation) -> Result<(), String> {
     let kind = Some(ZoneKind::Residential);
-    let preview = ZoneGrid::eligible_paint_cells(&sim.map(), &SEAM_STAMP, kind)
+    let preview = ZoneGrid::eligible_paint_cells(&sim.map(), &SEAM_STAMP, kind, Density::Low)
         .map_err(|error| format!("zone preview: {error:?}"))?;
-    let all = ZoneGrid::eligible_paint_cells(&sim.map(), &SEAM_STAMP, None)
+    let all = ZoneGrid::eligible_paint_cells(&sim.map(), &SEAM_STAMP, None, Density::Low)
         .map_err(|error| format!("erase preview: {error:?}"))?;
     if preview.cells().is_empty() || preview.cells().len() >= all.cells().len() {
         return Err("seam stamp must contain both wet and dry cells".into());

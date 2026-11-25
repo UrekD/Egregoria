@@ -3,7 +3,7 @@ use crate::map::BuildingID;
 use crate::map_dynamic::{Destination, Router};
 use crate::souls::human::HumanDecisionKind;
 use crate::transportation::Location;
-use crate::world::VehicleID;
+use crate::world::{CompanyID, VehicleID};
 use egui_inspect::Inspect;
 use prototypes::{DayTime, GameTime, RecTimeInterval, MINUTES_PER_HOUR, SECONDS_PER_MINUTE};
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,12 @@ pub struct Work {
     pub work_inter: RecTimeInterval,
     pub kind: WorkKind,
     pub last_score: f32,
+    #[inspect(skip)]
+    #[serde(default)]
+    pub(crate) employer: Option<CompanyID>,
+    #[inspect(skip)]
+    #[serde(default)]
+    attendance: Option<(CompanyID, i32)>,
 }
 
 impl Work {
@@ -38,23 +44,26 @@ impl Work {
             ),
             kind,
             last_score: 0.0,
+            employer: None,
+            attendance: None,
         }
     }
 
     pub fn apply(&mut self, loc: &Location, router: &Router) -> HumanDecisionKind {
         use HumanDecisionKind::*;
+        let commute = GoWork {
+            workplace: self.workplace,
+            employer: self.employer,
+        };
         match self.kind {
-            WorkKind::Worker => GoTo(Destination::Building(self.workplace)),
+            WorkKind::Worker => commute,
             WorkKind::Driver {
                 deliver_order,
                 truck,
                 load,
             } => {
                 if &Location::Building(self.workplace) != loc {
-                    MultiStack(vec![
-                        GoTo(Destination::Building(self.workplace)),
-                        SetVehicle(router.personal_car),
-                    ])
+                    MultiStack(vec![commute, SetVehicle(router.personal_car)])
                 } else if let Some(b) = deliver_order {
                     MultiStack(vec![
                         SetVehicle(router.personal_car),
@@ -71,6 +80,18 @@ impl Work {
                 }
             }
         }
+    }
+
+    pub(crate) fn record_attendance(&mut self, time: &GameTime, employer: CompanyID) {
+        if self.employer == Some(employer) && self.work_inter.is_active(&time.daytime) {
+            self.attendance = Some((employer, time.daytime.day));
+        }
+    }
+
+    pub(crate) fn attended_today(&self, time: &GameTime, live_employer: Option<CompanyID>) -> bool {
+        live_employer.is_some_and(|employer| {
+            self.employer == Some(employer) && self.attendance == Some((employer, time.daytime.day))
+        })
     }
 
     pub(crate) fn shift_ending(&self, time: &GameTime, minutes: i32) -> bool {

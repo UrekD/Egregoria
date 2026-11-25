@@ -1488,6 +1488,18 @@ fn l1_activity_split_edit_refreshes_after_callback_forgets_its_argument() {
 
 #[test]
 fn l1_activity_ordered_roster_basket_and_route_boundaries() {
+    let legacy = l1_roster_basket_and_route_trace(true);
+    let indexed = l1_roster_basket_and_route_trace(false);
+    assert_eq!(legacy.len(), indexed.len());
+    for ((phase, expected), (actual_phase, actual)) in legacy.into_iter().zip(indexed) {
+        assert_eq!(phase, actual_phase);
+        assert_eq!(expected, actual, "after {phase}");
+    }
+}
+
+fn l1_roster_basket_and_route_trace(
+    full_scan: bool,
+) -> Vec<(&'static str, std::collections::BTreeMap<String, u64>)> {
     use crate::economy::BasketRequest;
     use crate::economy::{market_update, TripPurpose};
     use crate::map_dynamic::{itinerary_update, routing_changed_system, routing_update_system};
@@ -1500,6 +1512,9 @@ fn l1_activity_ordered_roster_basket_and_route_boundaries() {
     use prototypes::TICKS_PER_HOUR;
 
     let mut test = TestCtx::new_fast();
+    if full_scan {
+        test.g.world.use_legacy_human_scan();
+    }
     test.build_roads(&[vec3(60.0, 250.0, 0.0), vec3(490.0, 250.0, 0.0)]);
     let road = test
         .g
@@ -1555,7 +1570,7 @@ fn l1_activity_ordered_roster_basket_and_route_boundaries() {
     }
     *sim.write::<GameTime>() = GameTime::new(Tick(INITIAL_TICK + TICKS_PER_HOUR + 1));
     let mut trace = Vec::new();
-    let mut record = |phase, sim: &Simulation| trace.push((phase, common::hash_u64(sim.hashes())));
+    let mut record = |phase, sim: &Simulation| trace.push((phase, sim.hashes()));
     let (world, resources) = sim.world_res();
     market_update(world, resources);
     let moved = sim.world.companies[recipient].workers.0[0];
@@ -1653,19 +1668,7 @@ fn l1_activity_ordered_roster_basket_and_route_boundaries() {
     itinerary_update(world, resources);
     record("itinerary phase", sim);
 
-    // Captured by running this fixture with the serial phase implementations
-    // from the base on which L1 was cherry-picked.
-    assert_eq!(
-        trace,
-        [
-            ("market and roster transfer", 15932243669541147862),
-            ("basket collected in decision pass", 4499298847199328628),
-            ("routes planned", 15333327391016120918),
-            ("route step before callbacks", 7653428565931336012),
-            ("ordered walking callbacks", 397648402682092739),
-            ("itinerary phase", 397648402682092739),
-        ]
-    );
+    trace
 }
 
 #[test]

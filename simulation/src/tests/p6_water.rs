@@ -45,12 +45,13 @@ fn p6_water_mixed_stamp_previews_and_paints_only_dry_cells_and_erases_both() {
     let paint = Some(ZoneKind::Residential);
 
     let preview =
-        ZoneGrid::eligible_paint_cells_with_land(&sim.map(), &stamp, paint, |_| true).unwrap();
+        ZoneGrid::eligible_paint_cells_with_land(&sim.map(), &stamp, paint, Density::Low, |_| true)
+            .unwrap();
     assert_eq!(preview.cells(), dry);
-    assert_eq!(preview.kind(), paint);
-    let (touched, projected) =
-        sim.read::<ZoneGrid>()
-            .lot_zone_after_prepared_paint(&stamp, &preview, Density::Low);
+    assert_eq!(preview.replacement().map(|cell| cell.kind), paint);
+    let (touched, projected) = sim
+        .read::<ZoneGrid>()
+        .lot_zone_after_prepared_paint(&stamp, &preview);
     assert!(touched && projected.is_some());
     let generation = sim.read::<ZoneGrid>().generation();
     sim.apply_commands([&WorldCommand::ZonePaint {
@@ -84,7 +85,8 @@ fn p6_water_mixed_stamp_previews_and_paints_only_dry_cells_and_erases_both() {
     assert_eq!(sim.read::<ZoneGrid>().generation(), generation + 1);
 
     let preview =
-        ZoneGrid::eligible_paint_cells_with_land(&sim.map(), &stamp, None, |_| true).unwrap();
+        ZoneGrid::eligible_paint_cells_with_land(&sim.map(), &stamp, None, Density::Low, |_| true)
+            .unwrap();
     assert_eq!(preview.cells(), all);
     // Seed legacy wet cells so the erase test observes deletion on both sides.
     sim.write::<ZoneGrid>().paint(stamp, paint, Density::Low);
@@ -110,7 +112,7 @@ fn p6_water_locked_wet_seam_precedes_filter_for_paint_and_erase() {
     let before = sim.hashes();
     for kind in [Some(ZoneKind::Residential), None] {
         assert_eq!(
-            ZoneGrid::eligible_paint_cells_with_land(&sim.map(), &stamp, kind, owns),
+            ZoneGrid::eligible_paint_cells_with_land(&sim.map(), &stamp, kind, Density::Low, owns),
             Err(ZonePaintError::TileLocked((64, 32)))
         );
         // TODO(TILES): send this stamp through ZonePaint with actual map ownership.

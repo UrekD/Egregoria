@@ -343,7 +343,8 @@ fn p1_fix2_sparse_growth_has_bounded_search_time() {
             for id in existing {
                 map.remove_building(id).unwrap();
             }
-            let distant = vec2(2_000_000.0, 2_000_000.0);
+            // Stay within the building index bounds while forcing the distant fallback.
+            let distant = Vec2::splat(40_000.0);
             map.build_special_building(
                 &OBB::new(distant, Vec2::X, 20.0, 20.0),
                 BuildingKind::TrainStation,

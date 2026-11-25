@@ -4272,7 +4272,23 @@ mod lifecycle_tests {
 
     #[test]
     fn l1_activity_queued_late_cargo_refusal_then_driver_recovery() {
-        use crate::map_dynamic::{Destination, RoutingStep};
+        let legacy = l1_cargo_refusal_trace(true);
+        let indexed = l1_cargo_refusal_trace(false);
+        for (phase, (expected, actual)) in [
+            "decision",
+            "unload refusal",
+            "queued recovery",
+            "itinerary update",
+        ]
+        .into_iter()
+        .zip(legacy.into_iter().zip(indexed))
+        {
+            assert_eq!(expected, actual, "after {phase}");
+        }
+    }
+
+    fn l1_cargo_refusal_trace(full_scan: bool) -> [BTreeMap<String, u64>; 4] {
+        use crate::map_dynamic::{itinerary_update, Destination, RoutingStep};
         use crate::souls::human::{update_decision_system, HumanDecisionKind};
         use crate::HumanWork;
 
@@ -4283,6 +4299,9 @@ mod lifecycle_tests {
         let due = f.ctx.g.read::<CargoBook>().loads[&load].due_at;
         f.at_tick(due + 1);
         let sim = &mut f.ctx.g;
+        if full_scan {
+            sim.world.use_legacy_human_scan();
+        }
         let (driver, truck, destination) = (f.driver, f.truck, f.destination.building);
         let pos = sim.get(truck).unwrap().trans.pos;
         let human = &mut sim.world.humans[driver];
@@ -4295,15 +4314,15 @@ mod lifecycle_tests {
         human.decision.kind = HumanDecisionKind::DeliverLoad { destination, load };
         human.decision.wait = 0;
 
-        let mut trace = Vec::new();
-        let mut record = |sim: &Simulation| trace.push(common::hash_u64(sim.hashes()));
         let (world, resources) = sim.world_res();
         let mut candidates = Vec::new();
-        world.collect_active(HumanWork::Itinerary, &mut candidates);
-        assert_eq!(candidates, [driver]);
+        if !full_scan {
+            world.collect_active(HumanWork::Itinerary, &mut candidates);
+            assert_eq!(candidates, [driver]);
+        }
         update_decision_system(world, resources);
         assert!(sim.read::<CargoBook>().manifest_for(truck).is_some());
-        record(sim);
+        let decision = sim.hashes();
 
         // The delivery callback refuses the unload and queues a second human
         // callback. Inspect the state before that recovery is allowed to run.
@@ -4314,7 +4333,7 @@ mod lifecycle_tests {
             sim.read::<Market>().capital(f.source.soul, Fixture::coal()),
             16
         );
-        record(sim);
+        let refusal = sim.hashes();
 
         assert!(ParCommandBuffer::<HumanEnt>::apply(sim));
         let human = sim.get(driver).unwrap();
@@ -4333,22 +4352,18 @@ mod lifecycle_tests {
             (1, 1, 0)
         );
         drop(book);
-        sim.world
-            .collect_active(HumanWork::Itinerary, &mut candidates);
-        assert!(candidates.is_empty());
-        sim.world
-            .collect_active(HumanWork::Outside, &mut candidates);
-        assert_eq!(candidates, [driver]);
-        record(sim);
-        // Decision, unload refusal, then queued recovery on the pre-L1 serial systems.
-        assert_eq!(
-            trace,
-            [
-                17887467045716917398,
-                7880503562002474480,
-                13459859128024714272
-            ]
-        );
+        if !full_scan {
+            sim.world
+                .collect_active(HumanWork::Itinerary, &mut candidates);
+            assert!(candidates.is_empty());
+            sim.world
+                .collect_active(HumanWork::Outside, &mut candidates);
+            assert_eq!(candidates, [driver]);
+        }
+        let recovery = sim.hashes();
+        let (world, resources) = sim.world_res();
+        itinerary_update(world, resources);
+        [decision, refusal, recovery, sim.hashes()]
     }
 
     #[test]

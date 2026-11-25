@@ -20,12 +20,8 @@ use yakui::{colored_box_container, Color};
 mod zone_color;
 pub use zone_color::{zone_cell_color, zone_color};
 
-pub const ZONES: [ZoneKind; 4] = [
-    ZoneKind::Residential,
-    ZoneKind::Commercial,
-    ZoneKind::Industrial,
-    ZoneKind::Office,
-];
+// Wave C exposes the Mixed Use swatch once the simulation can commission both roles.
+pub const ZONES: [ZoneKind; 4] = ZoneKind::TAXABLE;
 
 const MAX_BRUSH_RADIUS: u8 = 5;
 const DENSITIES: [Density; 3] = [Density::Low, Density::Medium, Density::High];
@@ -49,6 +45,7 @@ pub fn zone_name(zone: ZoneKind) -> &'static str {
         ZoneKind::Commercial => "Commercial",
         ZoneKind::Industrial => "Industrial",
         ZoneKind::Office => "Office",
+        ZoneKind::MixedUse => "Mixed Use",
     }
 }
 
@@ -65,7 +62,6 @@ pub(crate) struct ZoningPreview<'a> {
     pub pointer: Option<Vec2>,
     pub hover_radius: f32,
     pub pitch: f32,
-    pub density: Density,
     pub held: bool,
 }
 
@@ -116,10 +112,30 @@ impl ZoningState {
         (2.0 * f32::from(self.brush_radius) + 1.0) * self.pitch()
     }
 
+    fn select_kind(&mut self, kind: Option<ZoneKind>) {
+        if self.kind == kind {
+            return;
+        }
+        self.kind = kind;
+        if kind == Some(ZoneKind::MixedUse) && self.density == Density::Low {
+            self.density = Density::Medium;
+        }
+        self.cancel_stroke();
+    }
+
+    fn selected_lock(&self) -> Option<LockedUntil> {
+        self.kind?;
+        self.density_locks[usize::from(self.density.ordinal())]
+    }
+
     fn refresh_density_locks(&mut self, sim: &Simulation) {
+        let previous = self.selected_lock();
         self.density_locks =
             DENSITIES.map(|density| can_build(sim, BuildCapability::ZoneDensity(density)).err());
-        if self.density_locks[usize::from(self.density.ordinal())].is_some() {
+        if previous != self.selected_lock() {
+            self.cancel_stroke();
+        }
+        if self.kind != Some(ZoneKind::MixedUse) && self.selected_lock().is_some() {
             self.density = Density::Low;
             self.cancel_stroke();
         }
@@ -137,14 +153,21 @@ impl ZoningState {
 }
 
 fn density_picker(state: &mut ZoningState, kind: ZoneKind) {
-    for density in DENSITIES {
+    for density in DENSITIES
+        .into_iter()
+        .filter(|&density| kind.supports_density(density))
+    {
         let label = density_name(density);
         if let Some(lock) = state.density_locks[usize::from(density.ordinal())] {
             tooltip(format!("Unlocks at {} citizens", lock.population), || {
                 minrow(2.0, || {
                     icon(Color::rgb(188, 190, 192), "lock");
                     let mut button = button_secondary(label);
-                    button.style.fill = Color::rgb(64, 66, 69);
+                    button.style.fill = if state.density == density {
+                        Color::from_linear(<[f32; 4]>::from(zone_cell_color(kind, density)).into())
+                    } else {
+                        Color::rgb(64, 66, 69)
+                    };
                     button.style.text.color = Color::rgb(188, 190, 192);
                     button.hover_style = button.style.clone();
                     button.down_style = button.style.clone();
@@ -208,8 +231,7 @@ pub fn properties(uiworld: &UiWorld) {
                         )
                         .clicked
                         {
-                            state.kind = kind;
-                            state.cancel_stroke();
+                            state.select_kind(kind);
                         }
                     }
                 });
@@ -293,7 +315,7 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
     let mut areas = std::mem::take(&mut state.preview_areas);
     areas.clear();
 
-    if let Some(pointer) = pointer {
+    if let Some(pointer) = pointer.filter(|_| state.selected_lock().is_none()) {
         let cell = (pointer / pitch).floor();
         let mut commands = uiworld.commands();
         let kind = state.kind;
@@ -357,7 +379,8 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
         *grid = (world, Arc::new((*zones).clone()));
     }
     let grid = grid.1.clone();
-    let stamp = ZoneGrid::eligible_paint_stroke(&map, &areas, state.kind);
+    let stamp = ZoneGrid::eligible_paint_stroke(&map, &areas, state.kind, state.density)
+        .unwrap_or_default();
     let warning = MapRenderer::queue_zoning_overlay(
         &map,
         grid,
@@ -373,7 +396,6 @@ pub fn zoning(sim: &Simulation, uiworld: &UiWorld) {
                 state.brush_side()
             } + 16.0,
             pitch,
-            density: state.density,
             held,
         },
     );
@@ -492,6 +514,32 @@ mod tests {
         state.refresh_density_locks(&sim);
         assert!(state.density_locks[1].is_none());
         assert_eq!(state.density_locks[2].unwrap().population, 250);
+    }
+
+    #[test]
+    fn zones2_mixed_selection_survives_guided_lock_refresh() {
+        use simulation::economy::progression::{ProgressionMode, ProgressionState};
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let sim = Simulation::new(false);
+        sim.write::<ProgressionState>().mode = ProgressionMode::Guided;
+        let mut state = ZoningState {
+            drag_start: Some(Vec2::ZERO),
+            ..ZoningState::default()
+        };
+        state.select_kind(Some(ZoneKind::MixedUse));
+        assert!(state.gesture_is_clear());
+        state.refresh_density_locks(&sim);
+        assert_eq!(state.kind, Some(ZoneKind::MixedUse));
+        assert_eq!(state.density, Density::Medium);
+        assert_eq!(state.selected_lock().unwrap().population, 100);
+
+        state.last_brush = Some(Vec2::ZERO);
+        sim.write::<ProgressionState>().highest_milestone = 1;
+        state.refresh_density_locks(&sim);
+        assert!(state.gesture_is_clear());
+        assert!(state.selected_lock().is_none());
     }
 
     #[test]

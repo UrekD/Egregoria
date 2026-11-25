@@ -15,13 +15,13 @@ use goryak::{combo_box, tooltip};
 use prototypes::{try_prototype, GoodsCompanyID, Power, ServiceID, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer};
 use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
-use simulation::map::{Building, BuildingKind, Map, MapSubscriber, UpdateType};
+use simulation::map::{Building, BuildingID, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
-    city_field_tick, service_reach_sources, service_reach_version, utility_network_readout,
-    CoverageGrid, ElectricityFlow, Transit, UtilityFlow, UtilityNetworkReadout,
-    UtilityNetworkState,
+    active_business, city_field_tick, effective_load, service_reach_sources, service_reach_version,
+    utility_network_readout, BuildingInfos, CoverageGrid, ElectricityFlow, Transit, UtilityFlow,
+    UtilityNetworkReadout, UtilityNetworkState,
 };
-use simulation::souls::residence;
+use simulation::souls::residence::{self, Residences};
 use simulation::Simulation;
 
 use crate::gui::{InspectedBuilding, PlacementPreview, Tool};
@@ -107,6 +107,7 @@ struct OverlayCache {
     changes: Option<MapSubscriber>,
     tick: u64,
     data_version: u64,
+    profiled_power_sites: Vec<BuildingID>,
     projection: [f32; 16],
     tiles: TileIndex,
 }
@@ -239,6 +240,25 @@ fn power_version(map: &Map, power: &ElectricityFlow) -> u64 {
     hash.finish()
 }
 
+fn power_marker_version(sim: &Simulation, map: &Map, profiled_sites: &[BuildingID]) -> u64 {
+    let network_version = OverlayMode::Power.data_version(sim, map);
+    if profiled_sites.is_empty() {
+        return network_version;
+    }
+
+    let mut hash = DefaultHasher::new();
+    network_version.hash(&mut hash);
+    let infos = sim.read::<BuildingInfos>();
+    let homes = sim.read::<Residences>();
+    for &id in profiled_sites {
+        let building = map.get(id).expect("profiled power site");
+        if profiled_consumer(sim, building, &infos, &homes, OverlayMode::Power) {
+            id.hash(&mut hash);
+        }
+    }
+    hash.finish()
+}
+
 pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
     let mode = current_overlay(*uiworld.read::<OverlayMode>(), uiworld);
     let mut draw = uiworld.write::<ImmediateDraw>();
@@ -268,8 +288,16 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
         // Building/road notifications also invalidate the power topology.
         let map_changed = changes.take_updated_chunks().next().is_some() || cleared || new_map;
 
+        if mode == OverlayMode::Power && (map_changed || cache.mode != mode) {
+            cache.profiled_power_sites.clear();
+            cache.profiled_power_sites.extend(profiled_sites(&map));
+        }
         let tick = sim.get_tick();
-        let data_version = mode.data_version(sim, &map);
+        let data_version = if mode == OverlayMode::Power {
+            power_marker_version(sim, &map, &cache.profiled_power_sites)
+        } else {
+            mode.data_version(sim, &map)
+        };
         let rebuild = mode != cache.mode
             || map_changed
             || tick < cache.tick
@@ -404,10 +432,41 @@ fn collect_tiles(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut Til
     }
 }
 
+fn profiled_sites(map: &Map) -> impl Iterator<Item = BuildingID> + '_ {
+    map.buildings()
+        .values()
+        .filter(|building| building.development().is_some())
+        .map(|building| building.id)
+}
+
+fn profiled_consumer(
+    sim: &Simulation,
+    building: &Building,
+    infos: &BuildingInfos,
+    residences: &Residences,
+    mode: OverlayMode,
+) -> bool {
+    let load = effective_load(
+        building,
+        residences.by_building.get(&building.id),
+        active_business(building, infos, sim.world()),
+    );
+    match mode {
+        OverlayMode::Power => {
+            load.residential_power > Power::ZERO || load.business_power > Power::ZERO
+        }
+        OverlayMode::Water => load.water_demand() > 0.0,
+        OverlayMode::Sewage => load.sewage_demand() > 0.0,
+        _ => unreachable!(),
+    }
+}
+
 fn collect_utility_markers(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut TileIndex) {
     let power = sim.read::<ElectricityFlow>();
     let flow = sim.read::<UtilityFlow>();
     let mut states = FastMap::default();
+    let infos = sim.read::<BuildingInfos>();
+    let residences = sim.read::<Residences>();
     for building in map.buildings().values() {
         let company = building.kind.as_goods_company().and_then(try_prototype);
         let service = company.and_then(|proto| try_prototype(ServiceID::from(proto.id)));
@@ -421,7 +480,9 @@ fn collect_utility_markers(sim: &Simulation, map: &Map, mode: OverlayMode, tiles
             }
             _ => unreachable!(),
         };
-        let consumer = if mode == OverlayMode::Power {
+        let consumer = if building.development().is_some() {
+            profiled_consumer(sim, building, &infos, &residences, mode)
+        } else if mode == OverlayMode::Power {
             matches!(
                 building.kind,
                 BuildingKind::House | BuildingKind::GoodsCompany(_)
@@ -658,7 +719,7 @@ mod tests {
         let grid = grid_city(&mut test, vec2(700.0, 700.0), 4, 4, 160.0);
         let mut map = test.sim.write::<Map>();
         let sites = [
-            ("p2-overlay-procedural", vec2(400.0, 450.0)),
+            ("vegetable-farm", vec2(400.0, 450.0)),
             ("cereal-farm", vec2(550.0, 450.0)),
         ];
         for (prototype, center) in sites {
@@ -686,6 +747,115 @@ mod tests {
                 .unwrap();
             assert!(tile.footprint.bbox().w() > 100.0, "{prototype}");
         }
+    }
+
+    #[test]
+    fn zones2_fix_power_markers_follow_staffing_on_a_shared_network() {
+        use common::saveload::{Bincode, Encoder};
+        use scenarios::ScenarioCtx;
+        use simulation::map::{
+            Density, GrowableBusinessState, GrowableDevelopment, GrowableSiteState,
+            LanePatternBuilder, MapProject, ZoneCell, ZoneKind,
+        };
+        use simulation::map_dynamic::electricity_flow_system;
+        use simulation::souls::goods_company::company_soul;
+        use simulation::{HumanID, SimulationOptions, SoulID};
+
+        let _init = ScenarioCtx::new(SimulationOptions::LEGACY);
+        let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let proto = GoodsCompanyID::new("commercial-l1");
+        let (store, house) = {
+            let mut map = sim.write::<Map>();
+            map.make_connection(
+                MapProject::ground(vec2(100.0, 100.0).z(0.0)),
+                MapProject::ground(vec2(400.0, 100.0).z(0.0)),
+                None,
+                &LanePatternBuilder::default().build(),
+            )
+            .unwrap();
+            let lot = map.lots().keys().next().unwrap();
+            let store = map
+                .place_growable(lot, BuildingKind::GoodsCompany(proto))
+                .unwrap();
+            // The production placement API deliberately does not commission profiled sites yet.
+            let building = map.get(store).unwrap();
+            let record = Bincode::encode(building).unwrap();
+            let profile = GrowableDevelopment {
+                zone: ZoneCell {
+                    kind: ZoneKind::Commercial,
+                    density: Density::Low,
+                },
+                level: 1,
+                floors: 1,
+                roof_z: building.height + 4.0,
+                approved_value_band: 0,
+                home: None,
+                planned_jobs: 12,
+                site: GrowableSiteState::Active,
+                business: Some(GrowableBusinessState::AwaitingSpawn),
+            };
+            let mut encoded = Bincode::encode(&*map).unwrap();
+            let start = encoded
+                .windows(record.len())
+                .position(|bytes| bytes == record.as_slice())
+                .unwrap();
+            let option = start + record.len() - 1;
+            assert_eq!(encoded[option], 0);
+            encoded.splice(option..=option, Bincode::encode(&Some(profile)).unwrap());
+            *map = Bincode::decode(&encoded).unwrap();
+            let lot = map.lots().keys().next().unwrap();
+            (store, map.build_house(lot).unwrap())
+        };
+        sim.write::<BuildingInfos>().insert(store);
+        let Some(SoulID::GoodsCompany(company)) = company_soul(&mut sim, store, proto) else {
+            panic!("expected the profiled store to open");
+        };
+        let net = sim.map().electricity.net_id(store).unwrap();
+        assert_eq!(sim.map().electricity.net_id(house), Some(net));
+
+        let mode = OverlayMode::Power;
+        let profiled_sites = profiled_sites(&sim.map()).collect::<Vec<_>>();
+        assert_eq!(profiled_sites, [store]);
+        let sample = |sim: &mut Simulation| {
+            let (world, resources) = sim.world_res();
+            electricity_flow_system(world, resources);
+            let map = sim.map();
+            let stats = sim.read::<ElectricityFlow>().network_stats(net);
+            let mut tiles = TileIndex::default();
+            collect_tiles(sim, &map, mode, &mut tiles);
+            let center = map.get(store).unwrap().obb.center();
+            let marked = tiles
+                .chunks
+                .values()
+                .flatten()
+                .any(|tile| tile.footprint.center() == center);
+            (
+                power_marker_version(sim, &map, &profiled_sites),
+                marked,
+                stats,
+            )
+        };
+        let (unfilled, marked, before) = sample(&mut sim);
+        assert!(!marked);
+        sim.world_mut_unchecked().companies[company]
+            .workers
+            .0
+            .push(HumanID::default());
+        let (filled, marked, after) = sample(&mut sim);
+        assert!(marked);
+        assert!(before.consumed_power > Power::ZERO && after.consumed_power > Power::ZERO);
+        assert_eq!(
+            (before.blackout, before.produced_power),
+            (after.blackout, after.produced_power)
+        );
+        assert_ne!(unfilled, filled);
+        sim.world_mut_unchecked().companies[company]
+            .workers
+            .0
+            .clear();
+        let (vacated, marked, _) = sample(&mut sim);
+        assert!(!marked);
+        assert_eq!(vacated, unfilled);
     }
 
     #[test]

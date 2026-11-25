@@ -98,6 +98,9 @@ impl Map {
         for (_, _, _, tree) in effects.wet_trees {
             self.environment.trees.remove_maintain(tree);
         }
+        if !effects.cuts.is_empty() {
+            self.construction_cut_revision += 1;
+        }
         for (chunk, cuts) in effects.cuts {
             self.environment.set_overrides(chunk, cuts);
             self.pending_construction_cuts.remove(&chunk);

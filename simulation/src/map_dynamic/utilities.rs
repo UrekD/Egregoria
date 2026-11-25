@@ -6,12 +6,13 @@ use serde::{Deserialize, Serialize};
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::Budget;
 use crate::map::{
-    BuildingID, BuildingKind, ElectricityNetworkID, Map, NetworkObjectID, RoadID, MAX_ZONE_AREA,
+    Building, BuildingID, BuildingKind, ElectricityNetworkID, Map, NetworkObjectID, RoadID,
+    MAX_ZONE_AREA,
 };
-use crate::souls::residence::Residences;
-use crate::{Simulation, SoulID};
+use crate::souls::residence::{Residence, Residences};
+use crate::{Simulation, World};
 
-use super::{BuildingInfos, ElectricityFlow, NetworkFlow};
+use super::{active_business, ActiveBusiness, BuildingInfos, ElectricityFlow, NetworkFlow};
 
 const RELATIVE_RATE_EPSILON: f64 = 1e-6;
 
@@ -192,8 +193,6 @@ impl UtilityFlow {
         residences: &Residences,
         id: BuildingID,
     ) -> Option<BuildingUtilityStatus> {
-        use UtilityStatus::*;
-
         let building = map.get(id)?;
         let consumption = match building.kind {
             BuildingKind::House => residences
@@ -206,7 +205,39 @@ impl UtilityFlow {
             }
             _ => None,
         };
-        if valid_rate(consumption) == 0.0 {
+        self.status_with_demand(map, id, valid_rate(consumption))
+    }
+
+    pub fn status_for_site(
+        &self,
+        map: &Map,
+        residences: &Residences,
+        infos: &BuildingInfos,
+        world: &World,
+        id: BuildingID,
+    ) -> Option<BuildingUtilityStatus> {
+        let building = map.get(id)?;
+        if building.development().is_none() {
+            return self.status(map, residences, id);
+        }
+        let demand = effective_load(
+            building,
+            residences.by_building.get(&id),
+            active_business(building, infos, world),
+        )
+        .water_demand();
+        self.status_with_demand(map, id, demand)
+    }
+
+    pub(crate) fn status_with_demand(
+        &self,
+        map: &Map,
+        id: BuildingID,
+        demand: f64,
+    ) -> Option<BuildingUtilityStatus> {
+        use UtilityStatus::*;
+        let building = map.get(id)?;
+        if demand == 0.0 {
             return None;
         }
 
@@ -279,6 +310,138 @@ fn valid_rate(rate: Option<f32>) -> f64 {
         .map_or(0.0, f64::from)
 }
 
+/// Demand for each use at a shared address. Provider power and pipe output keep
+/// their existing staffing and blackout rules.
+#[derive(Clone, Copy, Debug)]
+pub struct SiteLoad {
+    pub residential_power: Power,
+    pub business_power: Power,
+    pub power_production: Power,
+    pub residential_water: f64,
+    pub business_water: f64,
+    pub residential_sewage: f64,
+    pub business_sewage: f64,
+    pub water_production: f64,
+    pub sewage_capacity: f64,
+}
+
+impl SiteLoad {
+    pub fn water_demand(self) -> f64 {
+        self.residential_water + self.business_water
+    }
+
+    pub fn sewage_demand(self) -> f64 {
+        self.residential_sewage + self.business_sewage
+    }
+}
+
+pub fn effective_load(
+    building: &Building,
+    residence: Option<&Residence>,
+    business: Option<ActiveBusiness>,
+) -> SiteLoad {
+    let profiled = building.development().is_some();
+    let home =
+        residence.filter(|_| building.has_residential_use() && !building.is_abandoned_growable());
+    let home_proto = home.and_then(|home| try_prototype(home.prototype));
+    let resident_scale = if profiled {
+        home.zip(home_proto).map_or(0.0, |(home, proto)| {
+            f64::from(home.capacity) / f64::from(proto.capacity)
+        })
+    } else {
+        1.0
+    };
+    let residential_power = if !building.has_residential_use() || building.is_abandoned_growable() {
+        Power::ZERO
+    } else {
+        home_proto
+            .and_then(|proto| proto.power_consumption)
+            .unwrap_or(Power::new(100))
+            * resident_scale
+    };
+    let residential_water =
+        valid_rate(home_proto.and_then(|proto| proto.water_consumption)) * resident_scale;
+
+    // Legacy premises reserve water as soon as the building exists.
+    let business_water = if profiled {
+        business.map_or(0.0, |business| {
+            valid_rate(business.prototype.water_consumption) * business.rates().operating_factor
+        })
+    } else {
+        valid_rate(
+            building
+                .kind
+                .as_goods_company()
+                .and_then(try_prototype)
+                .and_then(|proto| proto.water_consumption),
+        )
+    };
+    let (business_power, power_production) =
+        business.map_or((Power::ZERO, Power::ZERO), |business| {
+            let proto = business.prototype;
+            let scale = if profiled {
+                let rates = business.rates();
+                rates.staffed_fraction * rates.operating_factor
+            } else {
+                let staffing = if proto.n_workers > 0 {
+                    business.filled as f32 / proto.n_workers as f32
+                } else {
+                    1.0
+                };
+                f64::from(
+                    staffing
+                        * building
+                            .zone
+                            .as_ref()
+                            .map_or(1.0, |zone| zone.area / MAX_ZONE_AREA),
+                )
+            };
+            (
+                proto.power_consumption.unwrap_or(Power::ZERO) * scale,
+                proto.power_production.unwrap_or(Power::ZERO) * scale,
+            )
+        });
+    let (water_production, sewage_capacity) = business.map_or((0.0, 0.0), |business| {
+        let proto = business.prototype;
+        let Some(service) = try_prototype(ServiceID::from(proto.id)) else {
+            return (0.0, 0.0);
+        };
+        let staffing = if profiled {
+            business.rates().staffed_fraction
+        } else {
+            business.filled as f64 / f64::from(proto.n_workers)
+        };
+        let zone_factor = building
+            .zone
+            .as_ref()
+            .map_or(1.0, |zone| f64::from(zone.area) / f64::from(MAX_ZONE_AREA));
+        let output = |rate| {
+            let value = valid_rate(rate) * staffing * zone_factor;
+            if value.is_finite() && value >= 0.0 {
+                value
+            } else {
+                0.0
+            }
+        };
+        match service.service_kind {
+            ServiceKind::WaterPump => (output(proto.water_production), 0.0),
+            ServiceKind::SewageOutlet => (0.0, output(proto.sewage_capacity)),
+            _ => (0.0, 0.0),
+        }
+    });
+    SiteLoad {
+        residential_power,
+        business_power,
+        power_production,
+        residential_water,
+        business_water,
+        residential_sewage: residential_water,
+        business_sewage: business_water,
+        water_production,
+        sewage_capacity,
+    }
+}
+
 pub fn utility_flow_update(sim: &mut Simulation) {
     let tick = city_field_tick(sim);
     if !UtilityFlow::due(tick) {
@@ -327,56 +490,24 @@ pub fn utility_flow_update(sim: &mut Simulation) {
                 flow.by_building.insert(id, network.id);
             }
 
-            match building.kind {
-                BuildingKind::House => {
-                    let prototype = residences
-                        .by_building
-                        .get(&id)
-                        .and_then(|residence| try_prototype(residence.prototype));
-                    if let Some(proto) = prototype {
-                        totals.water_demand += valid_rate(proto.water_consumption);
-                    }
-                }
-                BuildingKind::GoodsCompany(company) => {
-                    let Some(proto) = try_prototype(company) else {
-                        continue;
-                    };
-                    totals.water_demand += valid_rate(proto.water_consumption);
-
-                    let Some(service) = try_prototype(ServiceID::from(company)) else {
-                        continue;
-                    };
-                    let (rate, total) = match service.service_kind {
-                        ServiceKind::WaterPump if !blackout => {
-                            (proto.water_production, &mut totals.water_production)
-                        }
-                        ServiceKind::SewageOutlet => {
-                            (proto.sewage_capacity, &mut totals.sewage_capacity)
-                        }
-                        _ => continue,
-                    };
-                    if water_sites.as_ref().is_some_and(|sites| {
-                        !sites.provider_site(id).is_some_and(|site| site.is_ok())
-                    }) {
-                        continue;
-                    }
-                    let Some(SoulID::GoodsCompany(owner)) = infos.owner(id) else {
-                        continue;
-                    };
-                    if let Some(company) = sim.world.companies.get(owner) {
-                        let staffing = company.workers.0.len() as f64 / f64::from(proto.n_workers);
-                        let zone_factor = building
-                            .zone
-                            .as_ref()
-                            .map_or(1.0, |zone| f64::from(zone.area) / f64::from(MAX_ZONE_AREA));
-                        let effective_rate = valid_rate(rate) * staffing * zone_factor;
-                        if effective_rate.is_finite() && effective_rate >= 0.0 {
-                            *total += effective_rate;
-                        }
-                    }
-                }
-                _ => {}
+            let load = effective_load(
+                building,
+                residences.by_building.get(&id),
+                active_business(building, &infos, &sim.world),
+            );
+            totals.water_demand += load.water_demand();
+            if load.water_production == 0.0 && load.sewage_capacity == 0.0 {
+                continue;
             }
+            if water_sites.as_ref().is_some_and(|sites| {
+                !sites.provider_site(id).is_some_and(|site| site.is_ok())
+            }) {
+                continue;
+            }
+            if !blackout {
+                totals.water_production += load.water_production;
+            }
+            totals.sewage_capacity += load.sewage_capacity;
         }
         if totals.has_water() {
             totals.sewage_demand = totals.water_demand;
