@@ -1001,9 +1001,20 @@ pub fn faces_from_skeleton(
         }
     }
 
-    for (&r, l) in &mut graph {
-        l.sort_unstable_by_key(|&p| OrderedFloat((r - p).angle(Vec2::X)));
-        if l.len() <= 1 {
+    // The caller stores the generated faces in the building mesh.
+    // Visit vertices in coordinate order so graph insertion order cannot change the mesh.
+    let mut nodes: Vec<_> = graph.keys().copied().collect();
+    nodes.sort_unstable_by_key(|node| (OrderedFloat(node.x), OrderedFloat(node.y)));
+    for &node in &nodes {
+        let edges = graph.get_mut(&node).unwrap();
+        edges.sort_unstable_by_key(|&edge| {
+            (
+                OrderedFloat((node - edge).angle(Vec2::X)),
+                OrderedFloat(edge.x),
+                OrderedFloat(edge.y),
+            )
+        });
+        if edges.len() <= 1 {
             return None;
         }
     }
@@ -1042,8 +1053,8 @@ pub fn faces_from_skeleton(
 
     let mut contour = None;
 
-    for (&node, l) in &graph {
-        for &edge in l {
+    for node in nodes {
+        for &edge in &graph[&node] {
             if !visited.contains(&(node, edge)) {
                 let face = explore(&graph, &mut visited, &heights, node, edge);
 
@@ -1107,6 +1118,23 @@ mod tests {
         assert!(!skeleton.is_empty());
         let faces = faces_from_skeleton(poly, &skeleton, false).unwrap().0;
         assert_eq!(faces.len(), 4);
+    }
+
+    #[test]
+    fn faces_and_contour_are_stable_when_graph_insertion_order_changes() {
+        let mut poly = [
+            vec2(0.0, 0.0),
+            vec2(20.0, 0.0),
+            vec2(20.0, 10.0),
+            vec2(0.0, 10.0),
+        ];
+        let mut skeleton = skeleton(&poly, &[]);
+        let expected = faces_from_skeleton(&poly, &skeleton, false).unwrap();
+
+        poly.rotate_left(1);
+        skeleton.reverse();
+        let reordered = faces_from_skeleton(&poly, &skeleton, false).unwrap();
+        assert_eq!(reordered, expected);
     }
 
     #[test]
