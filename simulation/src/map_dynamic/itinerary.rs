@@ -1547,13 +1547,16 @@ mod tests {
 
     #[test]
     fn p7_life_hraska_waiting_walk_keeps_its_original_target() {
+        use crate::transportation::spawn_driving_vehicle;
+        use geom::Transform;
+
         let mut ctx = TestCtx::new();
         let junction = vec3(270.0, 180.0, 0.0);
         ctx.build_roads(&[vec3(70.0, 180.0, 0.0), junction, vec3(470.0, 180.0, 0.0)]);
         ctx.build_roads(&[junction, vec3(380.0, 350.0, 0.0)]);
         let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
         let id = spawn_human(&mut ctx.g, house).unwrap();
-        let (position, destination) = {
+        let (position, destination, car_start, car_route) = {
             let map = ctx.g.map();
             let crosswalk = map
                 .intersections()
@@ -1562,11 +1565,33 @@ mod tests {
                 .filter(|turn| turn.kind == TurnKind::Crosswalk)
                 .max_by_key(|turn| turn.id)
                 .unwrap();
+            let junction = map.get(crosswalk.id.parent).unwrap();
+            let crossing_road = map.get(crosswalk.id.src).unwrap().parent;
+            let turn = junction
+                .turns()
+                .filter(|turn| turn.kind == TurnKind::Driving)
+                .find(|turn| map.get(turn.id.src).unwrap().parent == crossing_road)
+                .unwrap();
+            let lane = map.get(turn.id.src).unwrap();
+            let approach = lane.points.length() - 8.0;
+            let (pos, dir) = lane.points.point_dir_along(approach);
+            let car_route = Itinerary::route_between_lanes(
+                Tick(ctx.g.get_tick()),
+                &map,
+                (turn.id.src, approach),
+                (turn.id.dst, 30.0),
+            )
+            .unwrap();
             (
                 crosswalk.points.middle(),
                 map.get(crosswalk.id.dst).unwrap().points.point_along(30.0),
+                Transform::new_dir(pos, dir),
+                car_route,
             )
         };
+        let car_goal = car_route.end_pos().unwrap();
+        let car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, car_start).unwrap();
+        ctx.g.world.vehicles[car].it = car_route;
         let collider = put_pedestrian_in_transport_grid(&mut ctx.g.write::<TransportGrid>(), position);
         ctx.g.world.edit_human(id, |human| {
             human.location = Location::Outside;
@@ -1592,18 +1617,24 @@ mod tests {
 
         let mut schedule = Simulation::schedule();
         schedule.retain_systems(|name| {
-            matches!(name, "pedestrian_decision_system" | "itinerary_update")
+            matches!(
+                name,
+                "pedestrian_decision_system"
+                    | "transport_grid_synchronize"
+                    | "vehicle_decision_system"
+                    | "itinerary_update"
+            )
         });
         for _ in 0..60 {
             ctx.g.tick(&mut schedule, &[]);
         }
         assert!(ctx.g.world.humans[id].it.is_pedestrian_egress());
         let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
-        for _ in 0..3440 {
+        for _ in 0..5940 {
             ctx.g.tick(&mut schedule, &[]);
         }
         let mut resumed_schedule = schedule;
-        for _ in 0..3440 {
+        for _ in 0..5940 {
             resumed.tick(&mut resumed_schedule, &[]);
         }
         let human = &ctx.g.world.humans[id];
@@ -1611,6 +1642,9 @@ mod tests {
         assert!(human.it.has_ended(0.0));
         assert_eq!(resumed.world.humans[id].trans.pos, human.trans.pos);
         assert_eq!(resumed.world.humans[id].it.target(), human.it.target());
+        let vehicle = &ctx.g.world.vehicles[car];
+        assert!(vehicle.it.has_ended(0.0) && vehicle.trans.pos.distance(car_goal) < 0.1);
+        assert_eq!(resumed.world.vehicles[car].trans.pos, vehicle.trans.pos);
     }
 
     #[test]
