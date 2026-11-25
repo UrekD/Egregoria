@@ -1947,12 +1947,14 @@ mod tests {
     }
 
     #[test]
-    fn p3b_ties_prefer_legacy() {
+    fn p3b_transit_must_beat_walking_by_the_savings_margin() {
         let mut tie = RouteFixture::new(240.0);
         let destination = tie.destination;
-        // Walking is 10,000 ticks. Riding takes 1,500 ticks plus half the headway.
+        // Walking is about 10,000 ticks. Riding takes 1,500 ticks plus half the headway.
         assert!(matches!(tie.plan(17_000), [RoutingStep::WalkTo(end)] if *end == destination));
-        RouteFixture::new(240.0).assert_ride(16_999);
+        let mut near_tie = RouteFixture::new(240.0);
+        assert!(matches!(near_tie.plan(15_600), [RoutingStep::WalkTo(end)] if *end == destination));
+        RouteFixture::new(240.0).assert_ride(15_599);
     }
 
     #[test]
@@ -2097,6 +2099,86 @@ mod tests {
             .iter()
             .any(|step| matches!(step, RoutingStep::RideTransit { line: id, .. } if *id == line)));
         assert_eq!(router.trip_mode.mode(), TripMode::Transit);
+    }
+
+    #[test]
+    fn p3b_carless_commute_does_not_chase_a_departing_bus() {
+        let trip = |with_service| {
+            let mut ctx = TestCtx::new();
+            ctx.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(900.0, 100.0, 0.0)]);
+            let house = ctx.build_house_near(vec2(200.0, 100.0));
+            let human = spawn_human(&mut ctx.g, house).unwrap();
+            let stops = {
+                let map = ctx.g.map();
+                let lane = map
+                    .lanes()
+                    .values()
+                    .find(|lane| {
+                        lane.kind == LaneKind::Driving
+                            && lane.points.first().x < lane.points.last().x
+                    })
+                    .unwrap();
+                [200.0, 390.0].map(|x| {
+                    let (pos, _, dir) = lane.points.project_segment_dir(vec3(x, 100.0, 0.0));
+                    WorldCommand::TransitAddStop { pos, dir: dir.xy() }
+                })
+            };
+            ctx.apply(&stops);
+            let stops: Vec<_> = ctx.g.read::<Transit>().stops.keys().collect();
+            let (board, destination) = {
+                let transit = ctx.g.read::<Transit>();
+                (
+                    transit.stops[stops[0]].walk_pos,
+                    transit.stops[stops[1]].walk_pos,
+                )
+            };
+            let origin = board - Vec3::X * 1.2;
+            ctx.apply(&[WorldCommand::TransitCreateLine { stops }]);
+            let line = ctx.g.read::<Transit>().lines.keys().next().unwrap();
+            ctx.apply(&[WorldCommand::TransitSetVehicles {
+                line,
+                n: u8::from(with_service),
+            }]);
+            parkfix_tick(&mut ctx, human);
+            let (world, resources) = ctx.g.world_res();
+            let now = elapsed_ticks(resources);
+            if with_service {
+                let mut transit = resources.write::<Transit>();
+                // At 1.2 m/s the stop is 50 ticks away at full speed. The
+                // pedestrian starting from rest needs longer than 52 ticks.
+                transit.runs.values_mut().next().unwrap().dwell_until = Some(Tick(now.0 + 52));
+            }
+            world.edit_human(human, |h| {
+                h.location = Location::Outside;
+                h.trans.pos = origin;
+                h.speed.0 = 0.0;
+                h.it = Itinerary::NONE;
+                h.router = Router::new(None);
+                h.pedestrian.walking_speed = 1.2;
+                h.router.go_to(Destination::Outside(destination));
+            });
+            routing_changed_system(world, resources);
+            let mode = world.humans[human].router.trip_mode.mode();
+            let duration = (1..=crate::map_dynamic::transit::GIVE_UP_TICKS + 10_000)
+                .find(|_| {
+                    parkfix_tick(&mut ctx, human);
+                    ctx.g.world.humans[human].router.trip_start.is_none()
+                })
+                .unwrap_or_else(|| panic!("{mode:?} trip did not finish"));
+            assert!(ctx.g.world.humans[human]
+                .trans
+                .pos
+                .is_close(destination, 1.0));
+            (mode, duration)
+        };
+
+        let (_, walk_ticks) = trip(false);
+        let (mode, with_service_ticks) = trip(true);
+        assert!(
+            with_service_ticks <= walk_ticks,
+            "{mode:?} took {with_service_ticks} ticks, walking took {walk_ticks}"
+        );
+        assert_eq!(mode, TripMode::Walk);
     }
 
     fn finalsim_fill_spots_near(ctx: &TestCtx, pos: Vec3) {

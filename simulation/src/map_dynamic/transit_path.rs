@@ -17,7 +17,10 @@ const CAR_SPEED: f64 = 10.0;
 const BUS_SPEED: f64 = 8.0;
 const PARKING_SECONDS: f64 = 120.0;
 const VALUE_OF_TIME_PER_GAME_HOUR: Money = Money::new_bucks(20);
-// Ties go to the legacy mode. Leave room for rounding in fractional tick costs.
+// Allow the pedestrian to accelerate and the router to enter the queue.
+const BOARDING_SETUP_TICKS: f64 = TICKS_PER_REALTIME_SECOND as f64;
+// Require a meaningful saving over the routed walk even if the traveler has a car.
+const MIN_WALK_SAVINGS: f64 = 0.07;
 const COST_EPSILON: f64 = 0.01;
 
 type StopWalks<'a> = Vec<(f64, &'a TransitStop, ValidatedWalk)>;
@@ -139,8 +142,22 @@ impl<'a> TransitPaths<'a> {
             egress.iter().map(|&(ticks, stop, _)| (ticks, stop)),
             allows_line,
         )?;
-        let legacy_ticks = legacy_cost(origin, destination, car_pos, walk_speed, now, map);
-        if ride.ticks + COST_EPSILON >= legacy_ticks {
+        let walk_ticks = walk_cost(now, origin, destination, map, walk_speed);
+        if ride.ticks >= walk_ticks * (1.0 - MIN_WALK_SAVINGS)
+            || car_pos.is_some_and(|car| {
+                let car_access = walk_cost(now, origin, car, map, walk_speed);
+                let drive_distance =
+                    Itinerary::route(now, car, destination, map, PathKind::Vehicle)
+                        .and_then(|it| {
+                            itinerary_distance(&it, car, destination, map, PathKind::Vehicle)
+                        })
+                        .unwrap_or_else(|| car.distance(destination));
+                let car_ticks = car_access
+                    + travel_ticks(drive_distance, CAR_SPEED)
+                    + PARKING_SECONDS * TICKS_PER_REALTIME_SECOND as f64;
+                ride.ticks + COST_EPSILON >= car_ticks
+            })
+        {
             return None;
         }
         let access_path = access
@@ -316,23 +333,44 @@ impl ServiceLine<'_> {
     }
 
     fn wait_ticks(&self, stop_index: usize, access_ticks: f64) -> Option<f64> {
-        let wait = self
-            .departures
-            .as_ref()
-            .map_or(self.half_headway, |departures| {
-                departures.wait_ticks(stop_index, access_ticks)
-            });
-        // The passenger can board at the start of dwell. Trip cost still
-        // includes the remaining time until the bus departs.
-        let until_boarding = (wait - self.dwell_ticks).max(0.0);
-        (until_boarding <= GIVE_UP_TICKS as f64).then_some(wait)
+        let Some(departures) = &self.departures else {
+            return self.can_board().then_some(self.half_headway);
+        };
+        let setup = if access_ticks > 0.0 {
+            BOARDING_SETUP_TICKS
+        } else {
+            0.0
+        };
+        let ready = access_ticks + setup;
+        let wait = departures.wait_ticks(stop_index, ready);
+        // The wait deadline is for boarding, which opens at the start of dwell.
+        if wait - self.dwell_ticks > GIVE_UP_TICKS as f64 {
+            return None;
+        }
+        // Keep the departure time of a bus already dwelling at this stop.
+        // For other calls, shift the forecast toward the expected residual wait
+        // as the access walk grows. At two headways we rely on the gap estimate.
+        let wait = if departures.can_catch_dwelling_bus(stop_index, ready) {
+            wait
+        } else {
+            let phase_uncertainty = (ready / (4.0 * self.half_headway)).clamp(0.0, 1.0);
+            wait + (departures.mean_wait_ticks - wait) * phase_uncertainty
+        };
+        Some(setup + wait)
     }
 }
 
 struct Departures {
     loop_ticks: u64,
     stop_offsets: Vec<u64>,
-    first_departures: Vec<(u64, u64)>,
+    first_departures: Vec<Departure>,
+    mean_wait_ticks: f64,
+}
+
+struct Departure {
+    stop_offset: u64,
+    until_departure: u64,
+    dwelling: bool,
 }
 
 impl Departures {
@@ -362,13 +400,49 @@ impl Departures {
                     // reaches a berth. Counting it as imminent hides the wait.
                     expected.checked_sub(elapsed)? + dwell
                 };
-                Some((offset, until_departure))
+                Some(Departure {
+                    stop_offset: offset,
+                    until_departure,
+                    dwelling: run.dwell_until.is_some(),
+                })
             })
             .collect();
-        (!first_departures.is_empty()).then_some(Self {
+        // Estimate the residual wait for an uncertain arrival phase. A long
+        // gap is more likely to contain the arrival and costs half its length
+        // on average. The gaps reflect bunching and exclude overdue buses.
+        let mut phases: Vec<_> = first_departures
+            .iter()
+            .map(|departure| {
+                let time = departure.until_departure % loop_ticks;
+                if time >= departure.stop_offset {
+                    time - departure.stop_offset
+                } else {
+                    loop_ticks - departure.stop_offset + time
+                }
+            })
+            .collect();
+        phases.sort_unstable();
+        let (&first, &last) = phases.first().zip(phases.last())?;
+        let wrap_gap = loop_ticks - last + first;
+        let squared_gaps = phases
+            .windows(2)
+            .fold((wrap_gap as f64).powi(2), |sum, pair| {
+                sum + ((pair[1] - pair[0]) as f64).powi(2)
+            });
+        let mean_wait_ticks = squared_gaps / (2.0 * loop_ticks as f64);
+        Some(Self {
             loop_ticks,
             stop_offsets,
             first_departures,
+            mean_wait_ticks,
+        })
+    }
+
+    fn can_catch_dwelling_bus(&self, stop_index: usize, ready_ticks: f64) -> bool {
+        self.first_departures.iter().any(|departure| {
+            departure.dwelling
+                && departure.stop_offset == self.stop_offsets[stop_index]
+                && ready_ticks < departure.until_departure as f64
         })
     }
 
@@ -376,20 +450,26 @@ impl Departures {
         let offset = self.stop_offsets[stop_index];
         self.first_departures
             .iter()
-            .map(|&(target_offset, until_departure)| {
-                let after_target = if offset >= target_offset {
-                    offset - target_offset
-                } else {
-                    self.loop_ticks - target_offset + offset
-                };
-                let wait = until_departure as f64 + after_target as f64 - access_ticks;
-                // Only repeat the schedule after the first reachable call.
-                if wait < 0.0 {
-                    wait.rem_euclid(self.loop_ticks as f64)
-                } else {
-                    wait
-                }
-            })
+            .map(
+                |&Departure {
+                     stop_offset: target_offset,
+                     until_departure,
+                     ..
+                 }| {
+                    let after_target = if offset >= target_offset {
+                        offset - target_offset
+                    } else {
+                        self.loop_ticks - target_offset + offset
+                    };
+                    let wait = until_departure as f64 + after_target as f64 - access_ticks;
+                    // Only repeat the schedule after the first reachable call.
+                    if wait < 0.0 {
+                        wait.rem_euclid(self.loop_ticks as f64)
+                    } else {
+                        wait
+                    }
+                },
+            )
             .reduce(f64::min)
             .unwrap_or_default()
     }
@@ -413,26 +493,11 @@ impl Ride<'_> {
     }
 }
 
-fn legacy_cost(
-    origin: Vec3,
-    destination: Vec3,
-    car_pos: Option<Vec3>,
-    walk_speed: f64,
-    now: Tick,
-    map: &Map,
-) -> f64 {
-    if let Some(car) = car_pos {
-        travel_ticks(origin.distance(car), walk_speed)
-            + travel_ticks(car.distance(destination), CAR_SPEED)
-            + PARKING_SECONDS * TICKS_PER_REALTIME_SECOND as f64
-    } else {
-        // Measure the walk on the sidewalks, as the access and egress walks are.
-        // A straight line can cut across blocks and undercount it several times over.
-        ValidatedWalk::route(now, origin, destination, map, walk_speed).map_or_else(
-            || travel_ticks(origin.distance(destination), walk_speed),
-            |(ticks, _)| ticks,
-        )
-    }
+fn walk_cost(now: Tick, start: Vec3, end: Vec3, map: &Map, speed: f64) -> f64 {
+    ValidatedWalk::route(now, start, end, map, speed).map_or_else(
+        || travel_ticks(start.distance(end), speed),
+        |(ticks, _)| ticks,
+    )
 }
 
 pub(super) struct ValidatedWalk {
@@ -467,6 +532,16 @@ impl ValidatedWalk {
 }
 
 pub(super) fn walking_distance(it: &Itinerary, start: Vec3, end: Vec3, map: &Map) -> Option<f32> {
+    itinerary_distance(it, start, end, map, PathKind::Pedestrian)
+}
+
+fn itinerary_distance(
+    it: &Itinerary,
+    start: Vec3,
+    end: Vec3,
+    map: &Map,
+    pathkind: PathKind,
+) -> Option<f32> {
     let mut position = start;
     let mut distance = 0.0;
     for &point in it.local_path().iter().rev() {
@@ -476,12 +551,8 @@ pub(super) fn walking_distance(it: &Itinerary, start: Vec3, end: Vec3, map: &Map
     if let Some(route) = it.get_route() {
         for (index, traversal) in route.reversed_route.iter().enumerate().rev() {
             if index == 0 {
-                let points = PathKind::Pedestrian.local_route(
-                    map,
-                    traversal.destination_lane(),
-                    position,
-                    end,
-                )?;
+                let points =
+                    pathkind.local_route(map, traversal.destination_lane(), position, end)?;
                 distance += position.distance(points.first()) + points.length();
             } else {
                 let points = traversal.raw_points(map)?;
