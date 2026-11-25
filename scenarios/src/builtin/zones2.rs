@@ -217,7 +217,11 @@ fn connect_freight(sim: &mut Simulation, terminal: BuildingID) -> Result<(), Str
     super::demo_cities::spawn_freight_train(sim)
 }
 
-fn grow_city(ctx: &mut ScenarioCtx, mixed: bool, replay_root: Option<&Path>) -> Result<(), String> {
+fn grow_city(
+    ctx: &mut ScenarioCtx,
+    mixed: bool,
+    replay_root: Option<&Path>,
+) -> Result<BuildingID, String> {
     grow_city_with_health(ctx, mixed, replay_root, true, &FOOD_SUPPLY)
 }
 
@@ -227,7 +231,7 @@ fn grow_city_with_health(
     replay_root: Option<&Path>,
     with_health: bool,
     extra_sites: &[(&'static str, Vec2)],
-) -> Result<(), String> {
+) -> Result<BuildingID, String> {
     let freight = build_district(ctx, with_health, extra_sites)?;
     connect_freight(&mut ctx.sim, freight)?;
     // The initial industrial and retail hiring keeps unemployment near zero.
@@ -298,14 +302,14 @@ fn grow_city_with_health(
             return Err("no L1 core tower reached L3 in place for the capture".into());
         }
         verify_checkpoint(&ctx.sim, root, "zones2_core_l3")?;
-        Ok(())
     } else {
         if !mixed {
             advance_to(ctx, COMMISSION_END - TICKS_PER_DAY)?;
             paint_pure_control_offices(ctx)?;
         }
-        advance_to(ctx, COMMISSION_END)
+        advance_to(ctx, COMMISSION_END)?;
     }
+    Ok(freight)
 }
 
 fn l1_core_towers(sim: &Simulation) -> Vec<(BuildingID, geom::Vec3)> {
@@ -472,16 +476,16 @@ fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
         scratch = ReplayScratch::new()?;
         scratch.0.as_path()
     };
-    grow_city(ctx, true, Some(replay_root))?;
+    let terminal = grow_city(ctx, true, Some(replay_root))?;
     check_commissioning(ctx, true)?;
-    let mixed_freight = mean_retail_freight_distance(&ctx.sim)?;
+    let mixed_freight = mean_retail_freight_distance(&ctx.sim, terminal)?;
     ctx.sample("commissioned");
     let mixed = observe_days(ctx)?;
 
     let mut control = ScenarioCtx::new(OPTIONS);
-    grow_city(&mut control, false, None)?;
+    let terminal = grow_city(&mut control, false, None)?;
     check_commissioning(&control, false)?;
-    let pure_freight = mean_retail_freight_distance(&control.sim)?;
+    let pure_freight = mean_retail_freight_distance(&control.sim, terminal)?;
     // Average per-direction distance may differ by at most one fixture block.
     if (mixed_freight - pure_freight).abs() > BLOCK {
         return Err(format!(
@@ -502,13 +506,12 @@ fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
     match_result
 }
 
-fn mean_retail_freight_distance(sim: &Simulation) -> Result<f32, String> {
+fn mean_retail_freight_distance(sim: &Simulation, terminal: BuildingID) -> Result<f32, String> {
     use prototypes::CompanyKind;
     let map = sim.map();
     let terminal = map
-        .buildings()
-        .values()
-        .find(|site| matches!(site.kind, BuildingKind::RailFreightStation(_)))
+        .get(terminal)
+        .filter(|site| matches!(site.kind, BuildingKind::RailFreightStation(_)))
         .ok_or("the district has no rail freight terminal")?;
     let mut count = 0;
     let mut distance = 0.0;
