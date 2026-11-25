@@ -2,8 +2,8 @@ use super::contains;
 use geom::{Polygon, Vec2, OBB};
 use prototypes::{try_prototype, BuildingGen, GoodsCompanyID};
 use simulation::map::{
-    river_site_summary, water_provider_site, water_service_site, BuildingID, BuildingKind, Map,
-    ProjectFilter, RoadID, WaterSiteRequest, Zone, ZoneCell,
+    river_site_summary, water_provider_site, water_service_site, BuildingID, BuildingKind,
+    LaneKind, Map, ProjectFilter, RoadID, WaterSiteRequest, Zone, ZoneCell,
 };
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::Simulation;
@@ -56,7 +56,15 @@ pub(super) fn frontage_roads(plan: &TownPlan, built: &BuiltNetwork) -> BTreeSet<
     built
         .links
         .iter()
-        .filter_map(|(key, span)| plan.graph.links[key].frontage().then_some(span.road))
+        .filter_map(|(key, span)| {
+            // Preserve the short southeast cul-de-sac as local access. New
+            // housing and freight there would share its single exit and U-turn.
+            let southeast_stub = super::SourceKey::Way {
+                id: 168886779,
+                span: 0,
+            };
+            (plan.graph.links[key].frontage() && *key != southeast_stub).then_some(span.road)
+        })
         .collect()
 }
 
@@ -89,8 +97,11 @@ pub(super) fn place_company(
     name: &str,
     anchor: Vec2,
 ) -> Result<(BuildingID, RoadID), String> {
-    place_scored_company(sim, plan, roads, name, |_, _, footprint| {
-        Some(footprint.center().distance2(anchor))
+    place_scored_company(sim, plan, roads, name, |map, road, footprint| {
+        map.roads()[road]
+            .lanes_iter()
+            .any(|(_, kind)| kind == LaneKind::Parking)
+            .then(|| footprint.center().distance2(anchor))
     })?
     .ok_or_else(|| format!("no clear fitting site for {name}"))
 }
@@ -146,8 +157,6 @@ pub(super) fn place_scored_company(
     let gen = BuildingGen::NoWalkway {
         door_pos: geom::vec2(0.0, -proto.size.h * 0.5),
     };
-    // A road-facing door is also the search anchor for the real parking and
-    // delivery paths, including for the large power plant.
     let building = place_special(sim, name, kind, obb, gen, road)?;
     Ok(Some((building, road)))
 }
@@ -238,6 +247,40 @@ mod tests {
         DEFAULT_LESCE, DEFAULT_SAVA,
     };
     use std::path::Path;
+
+    #[test]
+    fn cm2_adapter_places_coal_on_truck_frontage() {
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let (mut sim, built) = build_dry_town(&plan).unwrap();
+        let roads = frontage_roads(&plan, &built);
+        let (plant, road) = place_company(
+            &mut sim,
+            &plan,
+            &roads,
+            "coal-power-plant",
+            geom::vec2(2630.0, 2440.0) + geom::vec2(130.0, 320.0),
+        )
+        .unwrap();
+        let map = sim.map();
+        assert_eq!(map.buildings()[plant].connected_road, Some(road));
+        assert!(map.roads()[road]
+            .lanes_iter()
+            .any(|(_, kind)| kind == LaneKind::Parking));
+        let door = map.buildings()[plant].door_pos;
+        assert!(
+            map.roads()[road]
+                .points()
+                .project_2d(door.xy())
+                .xy()
+                .distance(door.xy())
+                < map.roads()[road].width * 0.5 + 5.0
+        );
+    }
 
     #[test]
     fn cm2_adapter_places_a_cereal_farm_with_a_field() {

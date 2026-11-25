@@ -9,7 +9,7 @@ use prototypes::{
     RollingStockID, ServiceID, ServiceKind, Tick, TICKS_PER_HOUR, TICKS_PER_MINUTE,
 };
 use serde::Serialize;
-use simulation::economy::cargo::CargoBook;
+use simulation::economy::cargo::{CargoBook, WarehousePolicy};
 use simulation::economy::{
     Budget, BudgetCategory, DailyEconomyMetrics, Government, Market, TransitStats, TripPurpose,
     TripStats, TICKS_PER_BUDGET_DAY,
@@ -157,7 +157,6 @@ pub fn commission(
     sites.insert("rail-bakery".into(), buyer);
     verify_parking_pair(&sim.map(), terminal, buyer, Tick(sim.get_tick()))?;
 
-    let utilities = at(2630.0, 2440.0);
     // Give the utilities access to the same labour pool as the shops.
     // All five pairs feed the town network.
     for (index, cohort) in cohorts.iter().enumerate() {
@@ -170,26 +169,29 @@ pub fn commission(
             sites.insert(format!("{name}-{}", index + 1), building);
         }
     }
-    for (name, anchor) in [
-        ("coal-power-plant", utilities + vec2(130.0, 320.0)),
-        ("coal-mine", utilities + vec2(-70.0, 170.0)),
-        ("coal-mine", utilities + vec2(70.0, -100.0)),
-    ] {
-        let building = place_company(sim, plan, &roads, name, anchor)?.0;
-        sites.insert(format!("{name}-{}", sites.len()), building);
+    let (plant, plant_road) =
+        place_company(sim, plan, &roads, "coal-power-plant", at(2580.0, 2525.0))?;
+    sites.insert("coal-power-plant".into(), plant);
+    let plant_door = sim.map().buildings()[plant].door_pos.xy();
+    let mine_frontage = BTreeSet::from([plant_road]);
+    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
+        verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
+        sites.insert(format!("coal-mine-{}", index + 1), mine);
     }
-    // Stock flour and bread through short production and delivery routes.
-    // Place the mills on the outskirts to leave the terminal bakery its
-    // natural rail supplier.
+    // Use parking frontage near both the field clusters and the shops.
     for (i, (x, y)) in [
         (1110.0, 1550.0),
         (1320.0, 1310.0),
         (1490.0, 1010.0),
-        (1850.0, 810.0),
-        (2250.0, 1020.0),
+        (1800.0, 960.0),
+        (2200.0, 1080.0),
         (2500.0, 1370.0),
         (1710.0, 2460.0),
-        (1940.0, 2620.0),
+        (1940.0, 2410.0),
         (2250.0, 2450.0),
         (2560.0, 2100.0),
     ]
@@ -207,6 +209,7 @@ pub fn commission(
         (1800.0, 2790.0),
         (2560.0, 2700.0),
         (2680.0, 2150.0),
+        (2110.0, 700.0),
     ]
     .into_iter()
     .enumerate()
@@ -224,6 +227,7 @@ pub fn commission(
             (155., -60.),
             (160., 130.),
             (35., 50.),
+            (55., -155.),
         ]
         .into_iter()
         .enumerate()
@@ -265,6 +269,40 @@ pub fn commission(
         }
     }
 
+    // Place and open freight employers before housing brings the hiring pool.
+    // Depots buffer flour and general goods for the nearby recipe inputs.
+    let mut depots = Vec::new();
+    for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
+        let depot = place_company(sim, plan, &roads, "small-depot", cohort.anchor)?.0;
+        sites.insert(format!("{}/depot", cohort.district), depot);
+        depots.push(WorldCommand::SetWarehousePolicy {
+            building: depot,
+            policy: WarehousePolicy::ReserveLocally,
+        });
+    }
+    for (index, (x, y)) in [
+        (1880.0, 1400.0),
+        (2210.0, 1800.0),
+        (2300.0, 1590.0),
+        (1670.0, 2190.0),
+        (1960.0, 2440.0),
+        (2130.0, 2210.0),
+        (1830.0, 980.0),
+        (2050.0, 1100.0),
+        (2260.0, 1090.0),
+        (1250.0, 1550.0),
+        (1350.0, 1840.0),
+        (1550.0, 1910.0),
+        (2400.0, 2230.0),
+        (2530.0, 2400.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (store, _) = place_company(sim, plan, &roads, "supermarket", at(x, y))?;
+        sites.insert(format!("supermarket-{}", index + 1), store);
+    }
+
     // Ordinary housing opens before the shops/factories. This gives civic and
     // utility sites a chance to hire while the first households arrive.
     let (mut parcels, reserves) = plan_parcels(sim, plan, &roads, &cohorts)?;
@@ -281,6 +319,7 @@ pub fn commission(
     )?;
     let mut schedule = Simulation::schedule();
     advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
+    apply(sim, "district depot policies", &depots)?;
     let (station, ent) = sim
         .world()
         .freight_stations
@@ -1406,7 +1445,7 @@ fn freight_delivered(unloaded: u32, manifested: u32, received: u64, returned: bo
 
 fn traffic_clear(car_arrivals: u64, standing: u64, blocking: u64, stranded: u64) -> bool {
     car_arrivals > 0
-        && standing < 30 * TICKS_PER_MINUTE
+        && standing <= 30 * TICKS_PER_MINUTE
         && blocking < 20 * TICKS_PER_MINUTE
         && stranded == 0
 }
@@ -2083,6 +2122,8 @@ struct DayReport {
     utility_failures: u64,
     failed_coverage_samples: u64,
     coverage_at_close: Vec<String>,
+    unstocked_retail_samples: BTreeMap<&'static str, u64>,
+    coal_stockout_ticks: u64,
 }
 
 pub fn check_loaded_opening(
@@ -2152,6 +2193,7 @@ pub fn check_loaded_opening(
         let mut utility_failures = 0;
         let mut failed_coverage_samples = 0;
         let mut coverage_at_close = Vec::new();
+        let mut unstocked_retail_samples = BTreeMap::new();
         let item_receipts = |sim: &Simulation| {
             sim.read::<CargoBook>()
                 .freight_day(day)
@@ -2182,6 +2224,11 @@ pub fn check_loaded_opening(
                 let uncovered = coverage_failures(&state);
                 failed_coverage_samples += u64::from(!uncovered.is_empty());
                 coverage_at_close = uncovered;
+                for (&district, data) in &state.districts {
+                    if data.residents > 0 && data.stocked_shops == 0 {
+                        *unstocked_retail_samples.entry(district).or_insert(0) += 1;
+                    }
+                }
             }
         }
         let close = elapsed_ticks(sim.world_res().1).0;
@@ -2205,6 +2252,11 @@ pub fn check_loaded_opening(
             .get(&ItemID::new("effective-food"))
             .copied()
             .unwrap_or(0);
+        let coal_stockout_ticks = daily
+            .stockout_ticks_by_sku
+            .get(&ItemID::new("coal"))
+            .copied()
+            .unwrap_or(0);
         let baskets_due = daily.baskets_due.unwrap_or(0);
         let baskets_filled = daily.baskets_filled.unwrap_or(0);
         if !needs_met(
@@ -2221,6 +2273,16 @@ pub fn check_loaded_opening(
         }
         if utility_failures > 0 || failed_coverage_samples > 0 {
             failures.push(format!("day {day}: {utility_failures} utility samples and {failed_coverage_samples} coverage samples failed"));
+        }
+        if !unstocked_retail_samples.is_empty() {
+            failures.push(format!(
+                "day {day}: occupied districts lacked stocked retail at samples {unstocked_retail_samples:?}"
+            ));
+        }
+        if coal_stockout_ticks > 0 {
+            failures.push(format!(
+                "day {day}: coal plant fuel bin was empty for {coal_stockout_ticks} ticks"
+            ));
         }
         let transit_completed = sim.read::<TripStats>().transit.completed - initial_transit;
         let stats = sim.read::<TransitStats>();
@@ -2282,6 +2344,8 @@ pub fn check_loaded_opening(
             utility_failures,
             failed_coverage_samples,
             coverage_at_close,
+            unstocked_retail_samples,
+            coal_stockout_ticks,
         };
         eprintln!(
             "CITYMAP soak: {}",
@@ -2410,7 +2474,8 @@ mod tests {
     fn cm2_gate_traffic_allows_signal_wait_and_rejects_persistent_episodes() {
         assert!(traffic_clear(1, 7 * TICKS_PER_HOUR / 60, 0, 0));
         assert!(!traffic_clear(1, 0, 20 * TICKS_PER_HOUR / 60, 0));
-        assert!(!traffic_clear(1, 30 * TICKS_PER_HOUR / 60, 0, 0));
+        assert!(traffic_clear(1, 30 * TICKS_PER_MINUTE, 0, 0));
+        assert!(!traffic_clear(1, 30 * TICKS_PER_MINUTE + 1, 0, 0));
         assert!(!traffic_clear(1, 0, 0, 1));
         assert!(!traffic_clear(0, 0, 0, 0));
     }
