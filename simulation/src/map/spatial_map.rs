@@ -179,7 +179,7 @@ impl BroadGrid {
     }
 
     fn remove_many(&mut self, handles: impl Iterator<Item = AABBGridHandle>) {
-        let mut by_cell: FastMap<CellIdx, Vec<AABBGridHandle>> = FastMap::default();
+        let mut by_cell: BTreeMap<CellIdx, Vec<AABBGridHandle>> = BTreeMap::new();
         for handle in handles {
             let object = self.objects.remove(handle).expect("indexed lot");
             for cell in self.cell_range(object.aabb).iter() {
