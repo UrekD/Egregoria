@@ -21,11 +21,12 @@ fn p4a_seed_zero_matches_legacy_golden() {
     let sim = Simulation::new_game(&NewGameOptions::default()).unwrap();
     let hashes = sim.hashes();
     for (resource, hash) in [
-        // The Map hash includes the WATER authority added by W1.
-        ("map", 12_149_236_398_957_883_477),
+        // Includes WATER authority and the ZONES2 building development field.
+        ("map", 203_428_324_912_414_977),
         ("randprovider", 14_593_155_757_080_606_368),
         ("government", 14_969_084_836_084_239_989),
-        ("world", 17_476_124_382_984_081_698),
+        // Includes the saved company departure queue.
+        ("world", 17_911_115_052_347_178_937),
     ] {
         assert_eq!(hashes[resource], hash, "{resource}");
     }

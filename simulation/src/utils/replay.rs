@@ -1,6 +1,6 @@
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::WorldCommand;
-use crate::{Simulation, SimulationOptions, INITIAL_TICK, START_COMMANDS};
+use crate::{SaveLoadError, Simulation, SimulationOptions, INITIAL_TICK, START_COMMANDS};
 use common::saveload::{Encoder, JSONPretty, SnapshotRevision, JSON};
 use prototypes::Tick;
 use serde::{Deserialize, Serialize};
@@ -167,6 +167,20 @@ fn invalid_replay(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+pub(crate) fn replay_version_error(version: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("Replay has version {version:?}, expected {:?}", crate::VERSION),
+    )
+}
+
+fn replay_corrupt(error: io::Error) -> SaveLoadError {
+    SaveLoadError::Corrupt {
+        version: None,
+        reason: format!("replay sidecar: {error}"),
+    }
+}
+
 pub(crate) struct ReplayJson;
 
 #[derive(Deserialize)]
@@ -178,18 +192,13 @@ struct ReplayHeader {
 }
 
 impl ReplayHeader {
-    fn decode(bytes: &[u8]) -> io::Result<Self> {
+    fn decode(bytes: &[u8]) -> Result<Self, SaveLoadError> {
         // Read the header before decoding commands, regardless of JSON field order.
-        let header: Self = JSON::decode(bytes)?;
+        let header: Self = JSON::decode(bytes).map_err(replay_corrupt)?;
         if header.version != crate::VERSION {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "Replay has version {:?}, expected {:?}",
-                    header.version,
-                    crate::VERSION
-                ),
-            ));
+            return Err(SaveLoadError::Incompatible {
+                version: header.version,
+            });
         }
         Ok(header)
     }
@@ -216,14 +225,14 @@ impl ReplayJson {
     pub(crate) fn decode_sidecar(
         bytes: &[u8],
         revision: Option<SnapshotRevision>,
-    ) -> io::Result<Replay> {
+    ) -> Result<Replay, SaveLoadError> {
         let header = ReplayHeader::decode(bytes)?;
         if header.revision != revision.map(SnapshotRevision::get) {
-            return Err(invalid_replay(
+            return Err(replay_corrupt(invalid_replay(
                 "Replay revision does not match the snapshot",
-            ));
+            )));
         }
-        JSON::decode(bytes)
+        JSON::decode(bytes).map_err(replay_corrupt)
     }
 }
 
@@ -235,7 +244,10 @@ impl Encoder for ReplayJson {
     }
 
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
-        ReplayHeader::decode(bytes)?;
+        ReplayHeader::decode(bytes).map_err(|error| match error {
+            SaveLoadError::Incompatible { version } => replay_version_error(&version),
+            error => io::Error::new(io::ErrorKind::InvalidData, error),
+        })?;
         JSON::decode(bytes)
     }
 }
