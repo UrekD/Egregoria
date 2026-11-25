@@ -709,7 +709,13 @@ mod water_tests {
         let start = std::time::Instant::now();
         let (from, to) = (ground(75.0, 125.0), ground(175.0, 125.0));
         map.preview_connection(from, to, None, &pattern).unwrap();
+        let before = map.spatial_map.removal_scan_entries();
         map.try_connect(from, to, None, &pattern).unwrap();
+        let scanned = map.spatial_map.removal_scan_entries() - before;
+        assert!(
+            (LOT_COUNT..=LOT_COUNT + 100).contains(&scanned),
+            "scanned {scanned} entries"
+        );
         assert!(start.elapsed() < std::time::Duration::from_secs(2));
         assert_eq!(map.lots.keys().collect::<Vec<_>>(), [survivor]);
         assert!(map.spatial_map.contains(survivor));
@@ -719,6 +725,77 @@ mod water_tests {
             .next()
             .is_none());
         assert_eq!(reservation, Err(WaterEditError::Limit));
+    }
+
+    #[test]
+    fn harden1_multicell_clearance_matches_sequential_removals() {
+        const LOT_COUNT: usize = 1000;
+        let fixture = || {
+            let mut map = Map::empty();
+            assert!(map.install_environment(Environment::new(1, 1)));
+            let (_, road) = map
+                .make_connection(
+                    MapProject::ground(vec2(25.0, 100.0).z0()),
+                    MapProject::ground(vec2(275.0, 100.0).z0()),
+                    None,
+                    &LanePatternBuilder {
+                        rail: true,
+                        ..Default::default()
+                    }
+                    .build(),
+                )
+                .unwrap();
+            let mut removed = Vec::new();
+            let mut survivors = Vec::new();
+            for i in 0..LOT_COUNT {
+                // All cleared lots span the same four broad-grid cells.
+                let shape = OBB::new(vec2(150.0, 100.0), Vec2::X, 4.0, 4.0);
+                removed.push(Lot::insert(&mut map, road, shape, 0.0));
+                if i % (LOT_COUNT / 4) == 0 {
+                    let x = 150.0 + (i / (LOT_COUNT / 4)) as f32 - 1.5;
+                    let y = if survivors.len() % 2 == 0 { 75.0 } else { 125.0 };
+                    let shape = OBB::new(vec2(x, y), Vec2::X, 8.0, 4.0);
+                    survivors.push(Lot::insert(&mut map, road, shape, 0.0));
+                }
+            }
+            removed.sort_unstable();
+            (map, road, removed, survivors)
+        };
+        let (mut map, road, removed, survivors) = fixture();
+        let (mut sequential, _, _, _) = fixture();
+        for &id in &removed {
+            sequential.remove_lot_record(id).unwrap();
+            sequential.spatial_map.remove(id);
+        }
+
+        let before = map.spatial_map.removal_scan_entries();
+        Lot::remove_intersecting_lots(&mut map, road);
+        let scanned = map.spatial_map.removal_scan_entries() - before;
+        assert!(
+            (4 * LOT_COUNT..=4 * (LOT_COUNT + survivors.len() + 1)).contains(&scanned),
+            "scanned {scanned} entries"
+        );
+        assert_eq!(map.lots.keys().collect::<Vec<_>>(), survivors);
+        assert!(removed.iter().all(|&id| !map.spatial_map.contains(id)));
+
+        let query = |map: &Map, low, high| {
+            map.spatial_map
+                .query(AABB::new_ll_ur(low, high), ProjectFilter::LOT)
+                .filter_map(ProjectKind::to_lot)
+                .collect::<Vec<_>>()
+        };
+        let lower = vec2(101.0, 51.0);
+        let upper = vec2(199.0, 149.0);
+        let all = query(&map, lower, upper);
+        assert_eq!(all.len(), survivors.len());
+        assert_eq!(all, query(&sequential, lower, upper));
+        for x in [101.0, 150.0] {
+            for y in [51.0, 100.0] {
+                let low = vec2(x, y);
+                let high = low + Vec2::splat(49.0).min(upper - low);
+                assert_eq!(query(&map, low, high), query(&sequential, low, high));
+            }
+        }
     }
 
     #[test]

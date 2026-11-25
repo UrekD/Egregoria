@@ -349,25 +349,66 @@ impl Map {
 }
 
 fn street_end_entry(bounds: AABB, start: Vec2, axis: Vec2, reach: f32) -> Option<f32> {
-    let mut entry = 0.0_f32;
-    let mut exit = reach;
+    let mut entry = 0.0_f64;
+    let mut exit = f64::from(reach);
     for (start, direction, min, max) in [
         (start.x, axis.x, bounds.ll.x, bounds.ur.x),
         (start.y, axis.y, bounds.ll.y, bounds.ur.y),
     ] {
         if direction == 0.0 {
-            if start <= min || start >= max {
+            if start < min || start >= max {
                 return None;
             }
             continue;
         }
-        let a = (min - start) / direction;
-        let b = (max - start) / direction;
+        let distance_to = |edge| (f64::from(edge) - f64::from(start)) / f64::from(direction);
+        let a = distance_to(min);
+        let b = distance_to(max);
         entry = entry.max(a.min(b));
         exit = exit.min(a.max(b));
     }
-    // Move just inside the tile, including when the ray clips a narrow corner.
-    (entry < exit).then(|| entry + (exit - entry).min(0.02) * 0.5)
+    if entry >= exit {
+        return None;
+    }
+    let mut first = entry as f32;
+    if f64::from(first) < entry {
+        first = first.next_up();
+    }
+    let mut last = exit as f32;
+    if f64::from(last) > exit {
+        last = last.next_down();
+    }
+    if first > last {
+        return None;
+    }
+
+    // For shallow rays, a distance inside the clipped interval can still
+    // round the endpoint onto an excluded upper edge. The entering tests are
+    // monotone, so search the representable distances and check the exit edges
+    // at the first point that passes.
+    let entered = |distance: f32| {
+        let end = start + axis * distance;
+        (axis.x <= 0.0 || end.x >= bounds.ll.x)
+            && (axis.x >= 0.0 || end.x < bounds.ur.x)
+            && (axis.y <= 0.0 || end.y >= bounds.ll.y)
+            && (axis.y >= 0.0 || end.y < bounds.ur.y)
+    };
+    if !entered(first) {
+        let mut low = first.to_bits();
+        let mut high = last.to_bits();
+        while low < high {
+            let mid = low + (high - low) / 2;
+            if entered(f32::from_bits(mid)) {
+                high = mid;
+            } else {
+                low = mid + 1;
+            }
+        }
+        first = f32::from_bits(low);
+    }
+    let end = start + axis * first;
+    (end.x >= bounds.ll.x && end.x < bounds.ur.x && end.y >= bounds.ll.y && end.y < bounds.ur.y)
+        .then_some(first)
 }
 
 #[cfg(test)]
@@ -409,5 +450,53 @@ mod tests {
             .preview_land_approaches(LandTileId { x: 7, y: 9 })
             .unwrap();
         assert!(approaches.contains(&end), "approaches: {approaches:?}");
+    }
+
+    #[test]
+    fn tiles_harden1_street_end_crosses_shallow_upper_x_edge() {
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(32, 32)));
+        let end = vec2(15361.0, 768.0);
+        map.make_connection(
+            MapProject::ground(vec2(15364.0, 668.0).z0()),
+            MapProject::ground(end.z0()),
+            None,
+            &LanePatternBuilder::new().build(),
+        )
+        .unwrap();
+        map.install_land_ownership(
+            LandOwnership::tiled(
+                TileExtent {
+                    width: 32,
+                    height: 32,
+                },
+                OwnedTileRect {
+                    origin: LandTileId { x: 30, y: 1 },
+                    width: 1,
+                    height: 1,
+                },
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        let approaches = map
+            .preview_land_approaches(LandTileId { x: 29, y: 1 })
+            .unwrap();
+        assert!(approaches.contains(&end), "approaches: {approaches:?}");
+    }
+
+    #[test]
+    fn tiles_harden1_street_end_crosses_shallow_upper_y_edge() {
+        let bounds = super::super::tile_bounds(LandTileId { x: 1, y: 63 });
+        let start = vec2(850.0, 32776.0);
+        let axis = vec2(0.9967905, -0.08005474);
+        let distance = street_end_entry(bounds, start, axis, 128.0).unwrap();
+        let point = |distance| start + axis * distance;
+        assert!(
+            point(distance).y < bounds.ur.y,
+            "endpoint: {:?}",
+            point(distance)
+        );
+        assert!(point(distance.next_down()).y >= bounds.ur.y);
     }
 }

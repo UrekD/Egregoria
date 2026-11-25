@@ -103,6 +103,8 @@ pub struct SpatialMap {
 struct BroadGrid {
     storage: SparseStorage<AABBGridCell>,
     objects: AABBGridObjects<ProjectKind, AABB>,
+    #[cfg(test)]
+    removal_scan_entries: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -149,15 +151,21 @@ impl BroadGrid {
         }
     }
 
-    fn remove_cell_entry(cell: &mut AABBGridCell, handle: AABBGridHandle) {
-        if let Some(index) = cell.objs.iter().position(|&(entry, _)| entry == handle) {
+    fn remove_cell_entry(&mut self, cell: CellIdx, handle: AABBGridHandle) {
+        let cell = self.storage.cell_mut_unchecked(cell);
+        let index = cell.objs.iter().position(|&(entry, _)| entry == handle);
+        #[cfg(test)]
+        {
+            self.removal_scan_entries += index.map_or(cell.objs.len(), |index| index + 1);
+        }
+        if let Some(index) = index {
             cell.objs.swap_remove(index);
         }
     }
 
     fn remove_cells(&mut self, handle: AABBGridHandle, cells: CellRange) {
         for cell in cells.iter() {
-            Self::remove_cell_entry(self.storage.cell_mut_unchecked(cell), handle);
+            self.remove_cell_entry(cell, handle);
         }
     }
 
@@ -176,16 +184,20 @@ impl BroadGrid {
             }
         }
         for (cell, handles) in by_cell {
-            let cell = self.storage.cell_mut_unchecked(cell);
             if let [handle] = handles.as_slice() {
-                Self::remove_cell_entry(cell, *handle);
+                self.remove_cell_entry(cell, *handle);
                 continue;
             }
+            let cell = self.storage.cell_mut_unchecked(cell);
 
             // Find the removed entries in one scan, then replay swap-removals
             // in input order so surviving objects keep their query order.
             let mut positions: FastMap<_, _> =
                 handles.iter().map(|&handle| (handle, usize::MAX)).collect();
+            #[cfg(test)]
+            {
+                self.removal_scan_entries += cell.objs.len();
+            }
             for (index, &(handle, _)) in cell.objs.iter().enumerate() {
                 if let Some(position) = positions.get_mut(&handle) {
                     *position = index;
@@ -237,6 +249,8 @@ impl Default for SpatialMap {
             broad: BroadGrid {
                 storage: SparseStorage::new(50),
                 objects: Default::default(),
+                #[cfg(test)]
+                removal_scan_entries: 0,
             },
             occupancy: AABBGrid::new(512),
             occupancy_ids: Default::default(),
@@ -249,6 +263,11 @@ impl Default for SpatialMap {
 }
 
 impl SpatialMap {
+    #[cfg(test)]
+    pub(super) fn removal_scan_entries(&self) -> usize {
+        self.broad.removal_scan_entries
+    }
+
     pub fn insert(&mut self, obj: &impl SpatialMapObject) {
         let kind = obj.kind();
         let shape = obj.shape();
