@@ -122,28 +122,52 @@ impl<'a> TransitPaths<'a> {
         walk_speed: f64,
         allows_line: impl Fn(LineID) -> bool,
     ) -> Option<(Vec<RoutingStep>, [ValidatedWalk; 2])> {
-        let ride = self.best_ride(origin, destination, f64::INFINITY, walk_speed, allows_line)?;
+        let access = self.nearest(origin, &allows_line);
+        let egress = self.nearest(destination, &allows_line);
+        if access.is_empty() || egress.is_empty() {
+            return None;
+        }
+        // A sidewalk detour can change which departure a passenger can catch.
+        // Route each shortlisted walk once, before ranking the stop pairs.
+        let route = |from, to| ValidatedWalk::route(now, from, to, map, walk_speed);
+        let access: Vec<_> = access
+            .into_iter()
+            .filter_map(|(_, stop)| {
+                let (ticks, path) = route(origin, stop.walk_pos)?;
+                Some((ticks, stop, path))
+            })
+            .collect();
+        let egress: Vec<_> = egress
+            .into_iter()
+            .filter_map(|(_, stop)| {
+                let (ticks, path) = route(stop.walk_pos, destination)?;
+                Some((ticks, stop, path))
+            })
+            .collect();
+        let ride = self.best_ride(
+            access.iter().map(|&(ticks, stop, _)| (ticks, stop)),
+            egress.iter().map(|&(ticks, stop, _)| (ticks, stop)),
+            allows_line,
+        )?;
         let legacy_ticks = legacy_cost(origin, destination, car_pos, walk_speed, now, map);
         if ride.ticks + COST_EPSILON >= legacy_ticks {
             return None;
         }
-        let access = ride.board.walk_pos;
-        let egress = ride.alight.walk_pos;
-        let (access_ticks, access_path) =
-            ValidatedWalk::route(now, origin, access, map, walk_speed)?;
-        let wait = self.lines[&ride.line].wait_ticks(ride.board_index, access_ticks)?;
-        let (egress_ticks, egress_path) =
-            ValidatedWalk::route(now, egress, destination, map, walk_speed)?;
-        if access_ticks + wait + ride.ride_and_fare + egress_ticks + COST_EPSILON >= legacy_ticks {
-            return None;
-        }
+        let access_path = access
+            .into_iter()
+            .find(|(_, stop, _)| stop.id == ride.board.id)?
+            .2;
+        let egress_path = egress
+            .into_iter()
+            .find(|(_, stop, _)| stop.id == ride.alight.id)?
+            .2;
 
         let mut steps = Vec::with_capacity(5);
         if let Location::Building(building) = *location {
             steps.push(RoutingStep::GetOutBuilding(building));
         }
         steps.extend([
-            RoutingStep::WalkTo(access),
+            RoutingStep::WalkTo(ride.board.walk_pos),
             RoutingStep::WaitAtStop {
                 stop: ride.board.id,
                 line: ride.line,
@@ -160,17 +184,12 @@ impl<'a> TransitPaths<'a> {
 
     fn best_ride(
         &self,
-        origin: Vec3,
-        destination: Vec3,
-        legacy_ticks: f64,
-        walk_speed: f64,
+        access: impl Iterator<Item = (f64, &'a TransitStop)>,
+        egress: impl Iterator<Item = (f64, &'a TransitStop)> + Clone,
         allows_line: impl Fn(LineID) -> bool,
     ) -> Option<Ride<'a>> {
-        let access = self.nearest(origin, &allows_line);
-        let egress = self.nearest(destination, &allows_line);
         let mut best: Option<Ride<'a>> = None;
-        for (board_distance, board) in access {
-            let walk_to_stop = travel_ticks(board_distance.0.sqrt(), walk_speed);
+        for (walk_to_stop, board) in access {
             for &(id, from) in &self.stop_lines[&board.id] {
                 if !allows_line(id) {
                     continue;
@@ -179,28 +198,20 @@ impl<'a> TransitPaths<'a> {
                 let Some(wait) = line.wait_ticks(from, walk_to_stop) else {
                     continue;
                 };
-                for &(alight_distance, alight) in &egress {
+                for (walk_from_stop, alight) in egress.clone() {
                     if board.id == alight.id {
                         continue;
                     }
                     let Some(bus_ticks) = line.ride_ticks(from, alight.id) else {
                         continue;
                     };
-                    let ride_and_fare = bus_ticks + line.fare_ticks;
                     let ride = Ride {
                         line: id,
                         board,
-                        board_index: from,
                         alight,
-                        ride_and_fare,
-                        ticks: walk_to_stop
-                            + wait
-                            + ride_and_fare
-                            + travel_ticks(alight_distance.0.sqrt(), walk_speed),
+                        ticks: walk_to_stop + wait + bus_ticks + line.fare_ticks + walk_from_stop,
                     };
-                    if ride.ticks + COST_EPSILON < legacy_ticks
-                        && best.as_ref().is_none_or(|other| ride.key() < other.key())
-                    {
+                    if best.as_ref().is_none_or(|other| ride.key() < other.key()) {
                         best = Some(ride);
                     }
                 }
@@ -348,9 +359,7 @@ impl Departures {
 struct Ride<'a> {
     line: LineID,
     board: &'a TransitStop,
-    board_index: usize,
     alight: &'a TransitStop,
-    ride_and_fare: f64,
     ticks: f64,
 }
 
@@ -554,6 +563,10 @@ mod tests {
         let destination = Vec3::X * 2_000.0;
         let transit = wait_limit_line([origin, destination]);
         let line = transit.lines.keys().next().unwrap();
+        let [board, alight] = [
+            &transit.stops[transit.lines[line].stops[0]],
+            &transit.stops[transit.lines[line].stops[1]],
+        ];
         let now = Tick(120);
         let mut paths = TransitPaths::new(&transit, now, |_, _| Some(20_000));
         let late = BusRun {
@@ -580,7 +593,11 @@ mod tests {
             assert!(service.departures.is_some());
             assert_eq!(
                 paths
-                    .best_ride(origin, destination, f64::INFINITY, 1.2, |_| true)
+                    .best_ride(
+                        [(0.0, board)].into_iter(),
+                        [(0.0, alight)].into_iter(),
+                        |_| true
+                    )
                     .is_some(),
                 extra == 0,
                 "the boarding window opens {} ticks after reaching the stop",
@@ -631,7 +648,9 @@ mod tests {
             .into_iter(),
         );
         let walk_speed = 1.0;
-        assert!(travel_ticks(origin.distance(board), walk_speed) < departure as f64);
+        let direct_access = travel_ticks(origin.distance(board), walk_speed);
+        assert!(direct_access < departure as f64);
+        assert!(service.wait_ticks(0, direct_access).is_some());
         let (access, _) = ValidatedWalk::route(now, origin, board, &map, walk_speed).unwrap();
         assert!(
             access > departure as f64,
@@ -639,9 +658,6 @@ mod tests {
         );
         let wait = service.departures.as_ref().unwrap().wait_ticks(0, access);
         assert!(wait - service.dwell_ticks > GIVE_UP_TICKS as f64);
-        assert!(paths
-            .best_ride(origin, destination, f64::INFINITY, walk_speed, |_| true)
-            .is_some());
         assert!(paths
             .winning_steps(
                 origin,
@@ -654,6 +670,55 @@ mod tests {
                 |_| true
             )
             .is_none());
+    }
+
+    #[test]
+    fn p3b_ranks_boarding_stops_by_the_routed_access_walk() {
+        let ctx = TestCtx::new_fast();
+        ctx.build_roads(&[vec3(100.0, 500.0, 0.0), vec3(1_600.0, 500.0, 0.0)]);
+        let map = ctx.g.map();
+        let sidewalk = |x, y| {
+            let pos = vec3(x, y, 0.0);
+            let lane = map
+                .nearest_lane(pos, crate::map::LaneKind::Walking, None)
+                .unwrap();
+            map.get(lane).unwrap().points.project_segment(pos).0
+        };
+        let origin = sidewalk(300.0, 520.0);
+        let across_road = sidewalk(300.0, 480.0);
+        let same_side = sidewalk(380.0, 520.0);
+        let destination = sidewalk(1_500.0, 520.0);
+        let mut transit = wait_limit_line([across_road, destination]);
+        let line = transit.lines.keys().next().unwrap();
+        let other_stop = transit.stops.insert_with_key(|id| TransitStop {
+            id,
+            pos: same_side,
+            dir: Vec2::X,
+            walk_pos: same_side,
+            berth: same_side,
+        });
+        transit.lines[line].stops.insert(1, other_stop);
+
+        let now = Tick(0);
+        let paths = TransitPaths::new(&transit, now, |_, _| Some(400));
+        assert!(origin.distance(across_road) < origin.distance(same_side));
+
+        let (steps, _) = paths
+            .winning_steps(
+                origin,
+                destination,
+                &Location::Outside,
+                &map,
+                now,
+                Some(origin),
+                1.0,
+                |_| true,
+            )
+            .expect("the same-side stop offers a faster trip than driving");
+        assert!(steps.iter().any(|step| matches!(
+            step,
+            RoutingStep::WaitAtStop { stop, .. } if *stop == other_stop
+        )));
     }
 
     #[test]
@@ -700,7 +765,13 @@ mod tests {
             .collect();
         assert_eq!(near_destination, transit.lines[second].stops[..3]);
         assert!(index
-            .best_ride(origin, destination, 100_000.0, 1.2, |_| true)
+            .best_ride(
+                near_origin.iter().map(|&stop| (0.0, &transit.stops[stop])),
+                near_destination
+                    .iter()
+                    .map(|&stop| (0.0, &transit.stops[stop])),
+                |_| true,
+            )
             .is_none());
         assert!(index.nearest(origin, &|id| id == second).is_empty());
 
