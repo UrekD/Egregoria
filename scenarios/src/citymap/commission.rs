@@ -1124,11 +1124,12 @@ fn place_civic_sites(
     reserves: &[Parcel],
     sites: &mut BTreeMap<String, BuildingID>,
 ) -> Result<(), String> {
-    let (street, foot) = {
+    let (street, foot, wet) = {
         let map = sim.map();
         (
             ServiceReach::new(&map, false),
             ServiceReach::new(&map, true),
+            map.environment().has_water_configuration(),
         )
     };
     let protected: Vec<_> = parcels
@@ -1250,6 +1251,28 @@ fn place_civic_sites(
                 }
                 serial += 1;
                 sites.insert(format!("{name}-{serial}"), building);
+            }
+        }
+        if wet && service.service_kind == ServiceKind::School {
+            // The settled South infill strains the schools around its eastern
+            // streets. Use any remaining school allowance near that frontage.
+            for point in [vec2(2363.0, 1168.0), vec2(2488.0, 818.0)]
+                .into_iter()
+                .take(MAX_SCHOOLS - serial)
+            {
+                let anchor = super::layout::design_point(point, plan.config);
+                let school = place_scored_company(sim, plan, roads, name, |_, _, footprint| {
+                    let distance = footprint.center().distance2(anchor);
+                    (distance <= 160.0_f32.powi(2)
+                        && protected
+                            .iter()
+                            .all(|parcel| !parcel.intersects(&footprint)))
+                    .then_some(distance)
+                })?;
+                if let Some((building, _)) = school {
+                    serial += 1;
+                    sites.insert(format!("{name}-{serial}"), building);
+                }
             }
         }
     }
