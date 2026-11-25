@@ -3,7 +3,7 @@ use super::adapters::{
     place_scored_company, place_special, site_clear, water_sites,
 };
 use super::{blocks, contains, BuiltNetwork, RoadClass, TownPlan};
-use geom::{vec2, Intersect, Transform, Vec2, Vec3, OBB};
+use geom::{vec2, Intersect, Polygon, Transform, Vec2, Vec3, OBB};
 use prototypes::{
     try_prototype, BuildingGen, FreightStationPrototypeID, ItemID, Money, ResidencePrototype,
     RollingStockID, ServiceID, ServiceKind, Tick, TICKS_PER_HOUR, TICKS_PER_MINUTE,
@@ -16,7 +16,7 @@ use simulation::economy::{
 };
 use simulation::map::{
     water_provider_site, BuildingID, BuildingKind, Density, LaneID, LaneKind, LotID, Map, PathKind,
-    RoadID, TraverseKind, ZoneCell, ZoneGrid, ZoneKind,
+    RoadID, TraverseKind, Zone, ZoneCell, ZoneGrid, ZoneKind,
 };
 use simulation::map::{RailMarketError, RailMarketSite};
 use simulation::map_dynamic::service_reach_sources;
@@ -114,7 +114,7 @@ pub fn commission(
             houses: 40,
             infill: 11,
             retail: 10,
-            industry: 0,
+            industry: 4,
         },
         Cohort {
             district: "hraska",
@@ -122,7 +122,7 @@ pub fn commission(
             houses: 75,
             infill: 20,
             retail: 14,
-            industry: 0,
+            industry: 6,
         },
         Cohort {
             district: "south",
@@ -130,7 +130,7 @@ pub fn commission(
             houses: 88,
             infill: 22,
             retail: 16,
-            industry: 0,
+            industry: 8,
         },
         Cohort {
             district: "west",
@@ -138,7 +138,7 @@ pub fn commission(
             houses: 82,
             infill: 22,
             retail: 14,
-            industry: 0,
+            industry: 8,
         },
         Cohort {
             district: "employment",
@@ -146,7 +146,7 @@ pub fn commission(
             houses: 0,
             infill: 5,
             retail: 8,
-            industry: 44,
+            industry: 30,
         },
     ];
     let mut sites = BTreeMap::new();
@@ -202,6 +202,7 @@ pub fn commission(
         let (building, _) = place_company(sim, plan, &roads, "flour-factory", at(x, y))?;
         sites.insert(format!("flour-mill-{}", i + 1), building);
     }
+    let mut farms = Vec::new();
     for (i, (x, y)) in [
         (1030.0, 1460.0),
         (1330.0, 1190.0),
@@ -216,6 +217,7 @@ pub fn commission(
     .enumerate()
     {
         let (building, _) = place_company(sim, plan, &roads, "cereal-farm", at(x, y))?;
+        farms.push(building);
         sites.insert(format!("cereal-farm-{}", i + 1), building);
     }
     for cohort in &cohorts {
@@ -301,28 +303,19 @@ pub fn commission(
             policy: WarehousePolicy::ReserveLocally,
         });
     }
-    for (index, (x, y)) in [
-        (1880.0, 1400.0),
-        (2210.0, 1800.0),
-        (2300.0, 1590.0),
-        (1670.0, 2190.0),
-        (1960.0, 2440.0),
-        (2130.0, 2210.0),
-        (1830.0, 980.0),
-        (2050.0, 1100.0),
-        (2260.0, 1090.0),
-        (1250.0, 1550.0),
-        (1350.0, 1840.0),
-        (1550.0, 1910.0),
-        (2400.0, 2230.0),
-        (2530.0, 2400.0),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    // Leave retail an alternative to goods from local workshops while limiting
+    // the number of simultaneous supermarket orders for meat, produce and cereal.
+    for (district, x, y) in [
+        ("station", 2210.0, 1800.0),
+        ("hraska", 1960.0, 2440.0),
+        ("south", 2050.0, 1100.0),
+        ("west", 1350.0, 1840.0),
+        ("employment", 2530.0, 2400.0),
+    ] {
         let store = place_food_site(sim, "supermarket", at(x, y))?;
-        sites.insert(format!("supermarket-{}", index + 1), store);
+        sites.insert(format!("{district}/supermarket"), store);
     }
+    expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
 
     // Ordinary housing opens before the shops/factories. This gives civic and
     // utility sites a chance to hire while the first households arrive.
@@ -405,6 +398,47 @@ fn advance(sim: &mut Simulation, schedule: &mut SeqSchedule, ticks: u64) {
     for _ in 0..ticks {
         sim.tick(schedule, []);
     }
+}
+
+fn expand_cereal_fields(
+    sim: &mut Simulation,
+    plan: &TownPlan,
+    farms: &[BuildingID],
+    parcels: &[Parcel],
+    reserves: &[Parcel],
+) -> Result<(), String> {
+    for &farm in farms {
+        let field = {
+            let map = sim.map();
+            let footprint = map.buildings()[farm].obb;
+            let [along, outward] = footprint.axis();
+            let fill = outward.normalize();
+            // Extend away from the road so the established truck access and
+            // reserved frontage stay usable.
+            [80.0, 40.0].into_iter().find_map(|extra| {
+                let field = OBB::new(
+                    footprint.center() + fill * (extra * 0.5),
+                    fill,
+                    outward.mag() + extra,
+                    along.mag(),
+                );
+                (site_clear(&map, plan, field, Some(farm))
+                    && !parcels
+                        .iter()
+                        .chain(reserves)
+                        .any(|parcel| parcel.footprint.intersects(&field)))
+                .then(|| Zone::new(Polygon(field.corners.to_vec()), along))
+            })
+        };
+        if let Some(zone) = field {
+            apply(
+                sim,
+                "enlarge cereal field",
+                &[WorldCommand::UpdateZone { building: farm, zone }],
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn verify_parking_pair(map: &Map, a: BuildingID, b: BuildingID, tick: Tick) -> Result<(), String> {
@@ -509,7 +543,7 @@ fn place_freight(
                     // its edge clear of the deck while using the real platform offset.
                     let width = size.h.min(56.0);
                     let footprint = OBB::new(center, dir, size.w, width);
-                    if !site_clear(&map, plan, footprint) {
+                    if !site_clear(&map, plan, footprint, None) {
                         continue;
                     }
                     let Some(height) = map.environment().height(center) else {
@@ -1077,6 +1111,34 @@ fn plan_parcels(
             low,
             &mut painted,
         )?;
+        if cohort.houses > 0 {
+            let workshop = ZoneCell {
+                kind: Industrial,
+                density: Medium,
+            };
+            let stores: Vec<_> = painted[base..]
+                .iter()
+                .filter(|parcel| parcel.zoning.kind == Commercial)
+                .map(|parcel| (parcel.road, parcel.footprint.center()))
+                .collect();
+            let distance_to_store = |lot: &simulation::map::Lot| {
+                stores
+                    .iter()
+                    .map(|&(road, center)| {
+                        let distance = center.distance(lot.shape.center());
+                        // Prefer shared frontage when it keeps the leg short.
+                        distance + if road == lot.parent { 0.0 } else { 80.0 }
+                    })
+                    .fold(f32::INFINITY, f32::min)
+            };
+            candidates.sort_by(|(a, _), (b, _)| {
+                distance_to_store(a)
+                    .total_cmp(&distance_to_store(b))
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            let count = cohort.industry.min(fitting(&candidates, workshop));
+            take_parcels(&map, district.key, &mut candidates, workshop, count, &mut painted)?;
+        }
         let mut counts = BTreeMap::new();
         for parcel in &painted[base..] {
             if let Some(block) = parcel.block {
@@ -1889,6 +1951,7 @@ fn verify_infill(sim: &mut Simulation, manifest: &OpeningManifest) -> Result<(),
 struct Traffic {
     max_standing_ticks: u64,
     longest_standing: Option<(VehicleID, VehicleKind, [f32; 3], Option<TraverseKind>)>,
+    longest_standing_elapsed_window: Option<[u64; 2]>,
     max_blocking_ticks: u64,
     stranded_drivers: u64,
     panicking: u64,
@@ -1962,6 +2025,7 @@ impl Traffic {
             if duration > self.max_standing_ticks {
                 self.max_standing_ticks = duration;
                 self.longest_standing = Some((id, car.vehicle.kind, car.trans.pos.into(), path));
+                self.longest_standing_elapsed_window = Some([progress.moved_at, tick]);
             }
             if duration >= SAMPLE_TICKS {
                 match path {
@@ -2137,6 +2201,7 @@ struct DayReport {
     baskets_due: u64,
     baskets_filled: u64,
     effective_food_stockout_ticks: u64,
+    units_fulfilled_by_sku: BTreeMap<ItemID, u64>,
     basket_failures: BTreeMap<String, u64>,
     work_visits: u64,
     park_visits: u64,
@@ -2357,6 +2422,7 @@ pub fn check_loaded_opening(
             baskets_due,
             baskets_filled,
             effective_food_stockout_ticks,
+            units_fulfilled_by_sku: daily.units_fulfilled_by_sku.clone(),
             basket_failures: sim
                 .read::<Market>()
                 .basket_failures()

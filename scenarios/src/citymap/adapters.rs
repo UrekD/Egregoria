@@ -3,7 +3,7 @@ use geom::{Polygon, Vec2, OBB};
 use prototypes::{try_prototype, BuildingGen, GoodsCompanyID};
 use simulation::map::{
     river_site_summary, water_provider_site, water_service_site, BuildingID, BuildingKind,
-    LaneKind, Map, ProjectFilter, RoadID, WaterSiteRequest, Zone, ZoneCell,
+    LaneKind, Map, ProjectFilter, ProjectKind, RoadID, WaterSiteRequest, Zone, ZoneCell,
 };
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::Simulation;
@@ -135,7 +135,7 @@ pub(super) fn place_scored_company(
                     if best.as_ref().is_some_and(|(old, _, _)| score >= *old) {
                         continue;
                     }
-                    if site_clear(&map, plan, footprint) {
+                    if site_clear(&map, plan, footprint, None) {
                         best = Some((score, footprint, id));
                     }
                 }
@@ -153,18 +153,24 @@ pub(super) fn place_scored_company(
     Ok(Some((building, road)))
 }
 
-pub(super) fn site_clear(map: &Map, plan: &TownPlan, footprint: OBB) -> bool {
+pub(super) fn site_clear(
+    map: &Map,
+    plan: &TownPlan,
+    footprint: OBB,
+    own_building: Option<BuildingID>,
+) -> bool {
     let bounds = geom::AABB::new_ll_ur(plan.config.owned_min, plan.config.owned_max);
     footprint
         .corners
         .iter()
         .all(|&corner| bounds.contains(corner))
-        && !map.building_overlaps(footprint)
-        && map
+        && !map
             .spatial_map()
-            .query(footprint, ProjectFilter::INTER | ProjectFilter::ROAD)
-            .next()
-            .is_none()
+            .query(
+                footprint,
+                ProjectFilter::BUILDING | ProjectFilter::INTER | ProjectFilter::ROAD,
+            )
+            .any(|site| Some(site) != own_building.map(ProjectKind::Building))
         && !map
             .environment()
             .intersects_water(&Polygon(footprint.corners.to_vec()))
