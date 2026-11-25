@@ -406,3 +406,226 @@ fn scale_t1_one_credit_retains_a_batch_and_a_pause_fence() {
     assert_eq!(receive(&mut driver).id, batch);
     assert_eq!(receive(&mut driver).id, fence);
 }
+
+#[test]
+fn scale_t1_fix_editor_budgets_expanded_work() {
+    let cars = WorldCommand::SpawnRandomCars { n_cars: 512 };
+    assert!(fits(&WorldCommands::from(vec![cars.clone()])));
+    assert!(!fits(&WorldCommands::from(vec![cars; 8])));
+    assert!(!fits(&WorldCommands::from(vec![
+        WorldCommand::MapLoadParis
+    ])));
+}
+
+#[test]
+fn scale_t1_fix_replay_allows_historical_group_over_editor_limit() {
+    let (_, mut schedule) = world();
+    let tick = prototypes::Tick(1);
+    let group = vec![(tick, WorldCommand::SpawnRandomCars { n_cars: 0 }); BATCH_COMMANDS + 1];
+    assert!(fits_replay_batch(&group));
+    // The wire group is replayed atomically, even though it exceeds the editor envelope.
+    let mut replay = simulation::utils::replay::Replay::default();
+    replay.push(
+        tick,
+        WorldCommand::Init(Box::new(simulation::SimulationOptions {
+            terrain_size: simulation::NewGameOptions::MIN_TERRAIN_CHUNKS,
+            preset: simulation::MapPreset::Flat,
+            ..simulation::SimulationOptions::LEGACY
+        })),
+    );
+    for (tick, command) in group {
+        replay.push(tick, command);
+    }
+    let (mut sim, mut cursor) = Simulation::try_from_replay(replay).unwrap();
+    let expected = sim.get_tick();
+    assert!(matches!(
+        cursor.advance_one(&mut sim, &mut schedule, &mut ReplayBudget::new(1)),
+        ReplayAdvance::Operation {
+            batch: Some(0),
+            advanced: false,
+            ..
+        }
+    ));
+    assert_eq!(cursor.idx, BATCH_COMMANDS + 2);
+    assert_eq!(sim.get_tick(), expected);
+}
+
+#[test]
+fn scale_t1_fix_stop_interrupts_explicit_steps_and_fixture_probes() {
+    for request in [
+        Request::Step { count: 100 },
+        Request::PausedFixtureOp(FixtureOp::FindCargo { remaining: 100 }),
+    ] {
+        let (sim, schedule) = world();
+        let tick = sim.get_tick();
+        let view = WorldView::new(Arc::new(RwLock::new(sim)));
+        let mut worker = Worker::new(schedule, 7, tick, None);
+        let status = Mutex::new(worker.status.clone());
+        let (submit, input) = mpsc::sync_channel(CREDITS);
+        let (output, receive) = mpsc::sync_channel(CREDITS);
+        let id = |sequence| BatchId {
+            generation: 7,
+            sequence,
+        };
+        submit.send(Envelope { id: id(1), request }).ok().unwrap();
+        worker.run_one(&view, &status, &input, &output);
+        worker.run_one(&view, &status, &input, &output);
+        let boundary = worker.status.boundary;
+        assert_eq!(boundary.completed_step, 1);
+
+        // A regular queued request keeps its place before the reserved stop.
+        submit
+            .send(Envelope {
+                id: id(2),
+                request: Request::SetWarp(0),
+            })
+            .ok()
+            .unwrap();
+        submit
+            .send(Envelope {
+                id: id(3),
+                request: Request::Stop,
+            })
+            .ok()
+            .unwrap();
+        for _ in 0..3 {
+            worker.run_one(&view, &status, &input, &output);
+            if worker.exit {
+                break;
+            }
+        }
+        assert!(worker.exit, "reserved stop waited on the explicit run");
+        assert_eq!(worker.status.boundary, boundary);
+        let interrupted = receive.try_recv().unwrap();
+        assert_eq!(interrupted.id, id(1));
+        assert!(matches!(interrupted.kind, ReplyKind::Interrupted(ack) if ack == boundary));
+        assert_eq!(receive.try_recv().unwrap().id, id(2));
+        assert_eq!(receive.try_recv().unwrap().id, id(3));
+    }
+}
+
+#[test]
+fn scale_t1_fix_bulk_import_keeps_the_source_readable_and_matches_inline() {
+    let (sim, schedule) = world();
+    let (mut inline, mut inline_schedule) = world();
+    let mut driver = SimThread::start(sim, schedule, 9, None);
+    let view = driver.view();
+    let frame = view.try_read().unwrap();
+    let tick = frame.get_tick();
+    let import = WorldCommand::MapLoadTestField {
+        pos: geom::vec2(800.0, 800.0),
+        size: 28,
+        spacing: 28.0,
+    };
+    assert!(!fits(&WorldCommands::from(vec![import.clone()])));
+    let id = driver
+        .submit(Request::Batch(WorldCommands::from(vec![import.clone()])))
+        .ok()
+        .unwrap();
+    // A held redraw can still see the old world. The import only publishes
+    // once its detached copy is complete and the redraw drops its lease.
+    inline.tick(&mut inline_schedule, [&import]);
+    assert!(driver.poll_reply().is_none());
+    assert_eq!(frame.get_tick(), tick);
+    assert!(!view.take_replaced());
+    drop(frame);
+
+    let ReplyKind::Applied(applied) = receive(&mut driver).kind else {
+        panic!("expected the detached import acknowledgement");
+    };
+    assert_eq!(applied.id, id);
+    assert_eq!(applied.accepted_indices, vec![0]);
+    let frame = view.try_read().unwrap();
+    assert!(view.take_replaced());
+    assert_eq!(frame.hashes(), inline.hashes());
+}
+
+#[test]
+fn scale_t1_fix_apply_watermark_is_monotonic_only_within_one_generation() {
+    let applied = BatchId {
+        generation: 4,
+        sequence: 8,
+    };
+    assert!(BatchId {
+        sequence: 13,
+        ..applied
+    }
+    .covers(applied));
+    assert!(!BatchId {
+        sequence: 7,
+        ..applied
+    }
+    .covers(applied));
+    assert!(!BatchId {
+        generation: 5,
+        ..applied
+    }
+    .covers(applied));
+}
+
+#[cfg(feature = "multiplayer")]
+#[test]
+fn scale_t1_fix_cancel_ready_network_install_restores_source_boundary() {
+    let (sim, schedule) = world();
+    let mut driver = SimThread::start(sim, schedule, 7, None);
+    let id = driver
+        .submit(Request::Batch(WorldCommands::from(vec![
+            WorldCommand::SpawnRandomCars { n_cars: 0 },
+        ])))
+        .ok()
+        .unwrap();
+    let ReplyKind::Applied(applied) = receive(&mut driver).kind else {
+        panic!("expected source edit");
+    };
+    let release = driver.submit(Request::ReleaseOwner).ok().unwrap();
+    assert!(matches!(receive(&mut driver).kind, ReplyKind::Releasing(_)));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let (mut restored, boundary) = loop {
+        if let Some(result) = driver.restore_paused_owner() {
+            break result.unwrap();
+        }
+        assert!(Instant::now() < deadline);
+        thread::yield_now();
+    };
+    assert_eq!(boundary, applied.boundary);
+    assert_eq!(boundary.last_batch, Some(id));
+    assert_eq!(restored.status().unwrap().owner_mode, OwnerMode::Paused);
+    let resume = restored.submit(Request::Resume).ok().unwrap();
+    assert!(resume.sequence > release.sequence);
+    assert_eq!(resume.generation, id.generation);
+    assert!(matches!(receive(&mut restored).kind, ReplyKind::Resumed));
+}
+
+#[test]
+fn scale_t1_fix_stop_interrupts_builder_between_flushes() {
+    let (sim, mut schedule) = world();
+    let (entered, boundary) = mpsc::channel();
+    let (release, parked) = mpsc::channel();
+    let first = AtomicBool::new(true);
+    schedule.add_system(Box::new(simulation::utils::scheduler::RunnableFn {
+        name: "hold first builder tick",
+        f: move |_| {
+            if first.swap(false, Ordering::AcqRel) {
+                entered.send(()).unwrap();
+                parked.recv_timeout(Duration::from_secs(10)).unwrap();
+            }
+        },
+    }));
+    let mut driver = SimThread::start(sim, schedule, 4, None);
+    let builder = driver
+        .submit(Request::PausedFixtureOp(FixtureOp::Builder(
+            crate::automation::Builder::GridCity,
+        )))
+        .ok()
+        .unwrap();
+    boundary.recv_timeout(Duration::from_secs(10)).unwrap();
+    let stop = driver.submit(Request::Stop).ok().unwrap();
+    release.send(()).unwrap();
+
+    let interrupted = receive(&mut driver);
+    assert_eq!(interrupted.id, builder);
+    assert!(
+        matches!(interrupted.kind, ReplyKind::Interrupted(boundary) if boundary.completed_step == 1)
+    );
+    assert_eq!(receive(&mut driver).id, stop);
+}

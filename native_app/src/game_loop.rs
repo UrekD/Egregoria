@@ -51,6 +51,8 @@ pub struct State {
     pub game_schedule: SeqSchedule,
     driver: Option<SimThread>,
     last_batch: Option<BatchId>,
+    applied_batch: Option<BatchId>,
+    rendered_batch: Option<BatchId>,
     batch_in_flight: bool,
     staged: Option<WorldCommands>,
     sent_warp: u32,
@@ -60,12 +62,13 @@ pub struct State {
     release_sent: bool,
     capture: Option<PendingCapture>,
     departure_target: Option<DepartureTarget>,
-    settings_dirty: bool,
-    settings_save: Option<Receiver<()>>,
+    lot_brush_dirty: bool,
+    lot_brush_save: Option<Receiver<()>>,
 
     delete: Option<(SlotId, Receiver<std::io::Result<()>>)>,
     camera_bounds: AABB,
     deferred_input: VecDeque<WorldInputSample>,
+    bulldozer_view: Option<DragView>,
     close_requested: bool,
     #[cfg(feature = "multiplayer")]
     network: Option<NetworkTransition>,
@@ -97,6 +100,8 @@ enum Install {
     Replacement(WorldReplacement),
     #[cfg(feature = "multiplayer")]
     Network(Simulation, crate::network::Client),
+    #[cfg(feature = "multiplayer")]
+    RestoreNetworkSource,
 }
 
 #[cfg(feature = "multiplayer")]
@@ -128,9 +133,39 @@ struct WorldInputSample {
     ray: Option<geom::Ray3>,
     press_events: Vec<egui::Event>,
     tool: Tool,
+    company: Option<prototypes::GoodsCompanyID>,
+    drag_view: Option<DragView>,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct DragView {
+    eye: geom::Vec3,
+    inverse_projection: [geom::Vec4; 4],
+    viewport: (f32, f32),
+}
+
+impl DragView {
+    fn new(camera: &Camera) -> Self {
+        let geom::Matrix4 { x, y, z, w } = camera.inv_proj_cache;
+        Self {
+            eye: camera.eye(),
+            inverse_projection: [x, y, z, w],
+            viewport: (camera.viewport_w, camera.viewport_h),
+        }
+    }
 }
 
 impl WorldInputSample {
+    fn same_tool(&self, current: &Self) -> bool {
+        self.generation == current.generation
+            && self.tool == current.tool
+            && self.company == current.company
+    }
+
+    fn drag_uses_changed_view(&self, current: Option<DragView>) -> bool {
+        self.drag_view.is_some_and(|view| current != Some(view))
+    }
+
     fn has_edge(&self) -> bool {
         self.input.has_edge()
             || self.pointer.interrupted
@@ -218,6 +253,8 @@ impl engine::framework::State for State {
             sim: world,
             driver,
             last_batch: None,
+            applied_batch: None,
+            rendered_batch: None,
             batch_in_flight: false,
             staged: None,
             sent_warp: 0,
@@ -227,11 +264,12 @@ impl engine::framework::State for State {
             release_sent: false,
             capture: None,
             departure_target: None,
-            settings_dirty: false,
-            settings_save: None,
+            lot_brush_dirty: false,
+            lot_brush_save: None,
             delete: None,
             camera_bounds: AABB::zero(),
             deferred_input: VecDeque::new(),
+            bulldozer_view: None,
             close_requested: false,
             #[cfg(feature = "multiplayer")]
             network: None,
@@ -256,6 +294,7 @@ impl engine::framework::State for State {
         }
 
         self.uiw.write::<SessionState>().interaction_blocked = false;
+        self.invalidate_placements();
         self.pump_simulation();
         if !self.step_session(ctx) {
             return;
@@ -268,6 +307,7 @@ impl engine::framework::State for State {
             }
             let view_input = state.prepare_input(ctx, scripted);
             state.update_warp();
+            state.uiw.write::<SaveLoadState>().authoring_blocked = !state.can_collect_commands();
             let commands_observed = state.update_world(ctx, sim, scripted, view_input);
             ctx.present(
                 state,
@@ -275,6 +315,7 @@ impl engine::framework::State for State {
                 |state, ui| state.render_world_gui(ui, sim),
                 |state| state.render_world_yakui(sim),
             );
+            state.invalidate_placements();
             if state.driver.is_some() {
                 state.seal_frame_commands();
                 state.update_warp();
@@ -287,6 +328,11 @@ impl engine::framework::State for State {
         if let Some(view) = self.driver.as_ref().map(SimThread::view) {
             if view.signal_redraw() && ctx.acquire_surface() {
                 if let Some(sim) = view.try_read() {
+                    if view.take_replaced() {
+                        ctx.gfx.lamplights.reset(&ctx.gfx.device, &ctx.gfx.queue);
+                        self.map_renderer = Some(MapRenderer::new(&mut ctx.gfx, &sim));
+                        sim.map().dispatch_all();
+                    }
                     use_world(self, ctx, &sim);
                     busy = false;
                 }
@@ -304,12 +350,8 @@ impl engine::framework::State for State {
                 if session::world_interaction(&self.uiw) {
                     let sample = self.sample_world_input(ctx);
                     self.defer_world_input(sample);
-                } else {
-                    self.deferred_input.clear();
                 }
                 self.manage_io(ctx, None);
-            } else if !scripted {
-                self.deferred_input.clear();
             }
             self.update_warp();
             self.uiw.camera_mut().update(ctx);
@@ -352,6 +394,19 @@ impl State {
                 self.uiw.write::<InputMap>().suppress_shortcuts();
             } else if !replaying {
                 GuiState::apply_time_shortcut(&self.uiw);
+                let switches_tool = {
+                    let input = self.uiw.read::<InputMap>();
+                    input.just_act.contains(&InputAction::Cancel)
+                        || input.just_act.contains(&InputAction::Bulldozer)
+                };
+                if switches_tool {
+                    self.deferred_input.clear();
+                    self.bulldozer_view = None;
+                    gui::tool_shortcuts(&self.uiw);
+                    let mut input = self.uiw.write::<InputMap>();
+                    input.just_act.remove(&InputAction::Cancel);
+                    input.just_act.remove(&InputAction::Bulldozer);
+                }
             }
             self.uiw.write::<GuiState>().hidden ^= self
                 .uiw
@@ -380,35 +435,34 @@ impl State {
         }
         self.camera_bounds = sim.map().environment().bounds();
         let interaction = view_input && session::world_interaction(&self.uiw);
-        if !interaction {
-            self.deferred_input.clear();
-        } else {
-            let sample = self.sample_world_input(ctx);
-            let can_author = !self.batch_in_flight
-                && self.install.is_none()
-                && matches!(self.fence, Fence::Open)
-                && self.staged.is_none()
-                && self.uiw.commands().is_empty();
-            if can_author {
-                if let Some(deferred) = self.deferred_input.pop_front() {
-                    let current = sample.input.clone();
+        if interaction {
+            let mut sample = self.sample_world_input(ctx);
+            if !self.uiw.can_author() {
+                self.defer_world_input(sample);
+            } else {
+                let deferred = self.deferred_input.pop_front();
+                if self
+                    .bulldozer_view
+                    .is_some_and(|view| sample.drag_view != Some(view))
+                    || deferred
+                        .as_ref()
+                        .is_some_and(|deferred| deferred.drag_uses_changed_view(sample.drag_view))
+                {
+                    self.interrupt_bulldozer(&mut sample);
+                    self.apply_world_input(sim, sample);
+                } else if let Some(deferred) =
+                    deferred.filter(|deferred| deferred.same_tool(&sample))
+                {
+                    let input = sample.input.clone();
                     let pointer = sample.pointer.clone();
-                    let generation = sample.generation;
+                    self.apply_world_input(sim, deferred);
                     self.defer_world_input(sample);
-                    if deferred.generation == generation
-                        && deferred.tool == *self.uiw.read::<Tool>()
-                    {
-                        self.apply_world_input(sim, deferred);
-                        commands_observed = true;
-                    }
-                    self.uiw.write::<InputMap>().set_world_input(current);
+                    self.uiw.write::<InputMap>().set_world_input(input);
                     pointer.publish();
                 } else {
                     self.apply_world_input(sim, sample);
-                    commands_observed = true;
                 }
-            } else {
-                self.defer_world_input(sample);
+                commands_observed = true;
             }
         }
 
@@ -436,12 +490,51 @@ impl State {
         commands_observed
     }
 
+    fn can_collect_commands(&self) -> bool {
+        self.driver.is_none()
+            || (!self.batch_in_flight
+                && self.install.is_none()
+                && matches!(self.fence, Fence::Open)
+                && self.staged.is_none()
+                && self.uiw.commands().is_empty())
+    }
+
+    fn invalidate_placements(&mut self) {
+        let tool = *self.uiw.read::<Tool>();
+        let company = self.placement_company(tool);
+        self.deferred_input
+            .retain(|sample| sample.tool == tool && sample.company == company);
+        if tool != Tool::Bulldozer {
+            self.bulldozer_view = None;
+        }
+    }
+
+    fn placement_company(&self, tool: Tool) -> Option<prototypes::GoodsCompanyID> {
+        if tool != Tool::SpecialBuilding {
+            return None;
+        }
+        self.uiw
+            .read::<gui::specialbuilding::SpecialBuildingResource>()
+            .opt
+            .as_ref()
+            .and_then(|kind| kind.company)
+    }
+
+    fn interrupt_bulldozer(&mut self, current: &mut WorldInputSample) {
+        current.pointer.interrupted = true;
+        self.deferred_input
+            .retain(|sample| sample.drag_view.is_none());
+        self.bulldozer_view = None;
+        self.uiw.write::<InputMap>().require_fresh_pointer_press();
+    }
+
     fn sample_world_input(&self, ctx: &mut Context) -> WorldInputSample {
         let pointer = engine::pointer_frame();
+        let camera = self.uiw.camera().camera;
         let ray = if pointer.blocked || ctx.egui.last_mouse_captured {
             None
         } else {
-            self.uiw.camera().camera.unproj_ray(ctx.input.mouse.screen)
+            camera.unproj_ray(ctx.input.mouse.screen)
         };
         let tool = *self.uiw.read::<Tool>();
         let press_events = if tool == Tool::Bulldozer {
@@ -464,6 +557,9 @@ impl State {
             ray,
             press_events,
             tool,
+            company: self.placement_company(tool),
+            drag_view: (tool == Tool::Bulldozer && self.uiw.read::<Settings>().bulldozer_drag)
+                .then(|| DragView::new(&camera)),
         }
     }
 
@@ -481,15 +577,16 @@ impl State {
         }
     }
 
-    fn apply_world_input(&self, sim: &Simulation, sample: WorldInputSample) {
+    fn apply_world_input(&mut self, sim: &Simulation, sample: WorldInputSample) {
+        self.bulldozer_view = if sample.input.select_held() && !sample.pointer.interrupted {
+            sample.drag_view
+        } else {
+            None
+        };
         let tool = *self.uiw.read::<Tool>();
         let mut input = self.uiw.write::<InputMap>();
         input.set_world_input(sample.input);
-        input.set_world_ray(
-            sample.ray,
-            &sim.map(),
-            tool.is_roadbuild() || tool == Tool::Bulldozer,
-        );
+        input.set_world_ray(sample.ray, &sim.map(), tool.is_roadbuild());
         drop(input);
         sample.pointer.publish();
         if tool == Tool::Bulldozer {
@@ -512,6 +609,7 @@ impl State {
         if self.automation.is_some() {
             // Scripted map changes are applied through ticks, so the tick identifies the snapshot.
             map_renderer.meshb.set_map_version(sim.get_tick());
+            self.rendered_batch = self.applied_batch;
         }
         let generation = self.uiw.read::<SessionState>().generation;
         gui::overlays::prepare_ground(&self.uiw, &sim, map_renderer, &mut ctx.gfx, generation);
@@ -561,6 +659,7 @@ impl State {
         if session::playing(&self.uiw)
             && !self.uiw.read::<SessionState>().interaction_blocked
             && !session::modal(&self.uiw)
+            && self.uiw.can_author()
         {
             render_oldgui(ui, &self.uiw, sim);
         }
@@ -582,8 +681,13 @@ impl State {
 
     fn step_session(&mut self, ctx: &mut Context) -> bool {
         self.poll_save();
-        self.poll_settings_save();
+        self.poll_lot_brush_save();
         self.delete_slot();
+
+        #[cfg(feature = "multiplayer")]
+        if self.close_requested {
+            self.cancel_network_for_close();
+        }
 
         if self.install.is_none() && std::mem::take(&mut self.close_requested) {
             if self.automation.is_some() {
@@ -607,7 +711,7 @@ impl State {
                 }
                 if ready_to_exit(&self.uiw)
                     && self.delete.is_none()
-                    && self.settings_save.is_none()
+                    && self.lot_brush_save.is_none()
                     && self.uiw.camera_mut().poll_save_on_exit(Instant::now())
                 {
                     ctx.request_exit();
@@ -683,6 +787,7 @@ impl State {
             self.map_renderer
                 .as_ref()
                 .and_then(|renderer| renderer.meshb.rebuilt_version()),
+            self.rendered_batch,
         ) {
             Ok(true) => {}
             Ok(false) => {
@@ -736,6 +841,7 @@ impl State {
                     }
                     self.batch_in_flight = false;
                     self.last_batch = Some(batch.id);
+                    self.applied_batch = Some(batch.id);
                     self.uiw.write::<ReceivedCommands>().receive(&batch);
                     for (index, result) in batch.water_edits {
                         if let WorldCommand::EditWater(edit) = &batch.commands.as_ref()[index] {
@@ -766,6 +872,13 @@ impl State {
                     }
                 }
                 ReplyKind::Rejected(error) => {
+                    if Some(reply.id) == self.last_batch {
+                        self.batch_in_flight = false;
+                        self.last_batch = self.applied_batch;
+                        if self.automation.is_some() {
+                            crate::automation::fail(error);
+                        }
+                    }
                     if let Some(automation) = &mut self.automation {
                         if let Err(error) = automation.worker_reply(crate::sim_thread::Reply {
                             id: reply.id,
@@ -778,10 +891,11 @@ impl State {
                     {
                         self.fence = Fence::Open;
                     }
-                    if Some(reply.id) == self.last_batch {
-                        self.batch_in_flight = false;
-                    }
                     session::notify(&self.uiw, error);
+                }
+                ReplyKind::Interrupted(_) if Some(reply.id) == self.last_batch => {
+                    self.batch_in_flight = false;
+                    self.last_batch = self.applied_batch;
                 }
                 _ => {
                     if let Some(automation) = &mut self.automation {
@@ -823,18 +937,25 @@ impl State {
     }
 
     fn seal_frame_commands(&mut self) {
+        if self.staged.is_some() {
+            return;
+        }
         let commands = std::mem::take(&mut *self.uiw.commands());
         if commands.is_empty() {
             return;
         }
-        if self.staged.is_some() || self.uiw.received_commands().is_full() {
-            session::notify(
-                &self.uiw,
-                "Simulation busy. Wait for the pending edits before placing more.",
-            );
-        } else if sim_thread::fits(&commands) {
+        if sim_thread::can_submit_batch(&commands) {
             self.staged = Some(commands);
         } else {
+            gui::specialbuilding::reject_local_batch(&self.uiw, &commands);
+            for command in commands.iter() {
+                if let WorldCommand::EditWater(edit) = command {
+                    self.uiw
+                        .write::<TerraformingResource>()
+                        .water
+                        .receive_outcome(edit, &Err(simulation::map::WaterEditError::Limit));
+                }
+            }
             session::notify(&self.uiw, "This edit exceeds the simulation's batch limit.");
         }
     }
@@ -865,6 +986,9 @@ impl State {
     }
 
     fn drive_worker(&mut self) {
+        if self.driver.is_some() {
+            self.seal_frame_commands();
+        }
         self.submit_frame_commands();
         let Some(driver) = &mut self.driver else {
             return;
@@ -931,6 +1055,26 @@ impl State {
     }
 
     #[cfg(feature = "multiplayer")]
+    fn cancel_network_for_close(&mut self) {
+        // Once the remote world is installed, close that world normally. Until
+        // then, the local world owns the close decision even if bootstrap won
+        // the race and the old worker is already releasing its owner.
+        let ready = matches!(self.install, Some(Install::Network(..)));
+        let waiting = self.network.take().is_some();
+        let mut io = self.uiw.write::<SaveLoadState>();
+        let queued = io.network_target.take().is_some();
+        if ready || waiting || queued {
+            io.network_busy = false;
+            io.network_cancel = false;
+            if self.release_sent {
+                self.install = Some(Install::RestoreNetworkSource);
+            } else if ready {
+                self.install = None;
+            }
+        }
+    }
+
+    #[cfg(feature = "multiplayer")]
     fn poll_network(&mut self) {
         use crate::gui::windows::network::NetworkConnectionInfo;
         use crate::network::{self, Bootstrap, NetworkTarget};
@@ -972,6 +1116,8 @@ impl State {
                 generation,
             ));
             self.last_batch = None;
+            self.applied_batch = None;
+            self.rendered_batch = None;
             self.batch_in_flight = false;
             self.release_sent = false;
             self.sent_warp = 0;
@@ -1236,6 +1382,28 @@ impl State {
 
     fn poll_install(&mut self, ctx: &mut Context) {
         self.uiw.write::<SessionState>().interaction_blocked = true;
+        #[cfg(feature = "multiplayer")]
+        if matches!(self.install, Some(Install::RestoreNetworkSource)) {
+            match self
+                .driver
+                .as_mut()
+                .and_then(SimThread::restore_paused_owner)
+            {
+                Some(Ok((driver, boundary))) => {
+                    self.driver = Some(driver);
+                    self.fence = Fence::Paused(boundary);
+                    self.sent_warp = 0;
+                    self.release_sent = false;
+                    self.install = None;
+                }
+                Some(Err(())) => {
+                    self.install = None;
+                    self.uiw.write::<SaveLoadState>().exit_requested = true;
+                }
+                None => {}
+            }
+            return;
+        }
         self.submit_frame_commands();
         self.release_worker(true);
         if self
@@ -1264,6 +1432,8 @@ impl State {
                 *self.uiw.write::<NetworkState>() = NetworkState::Client(client);
                 self.replace_world(ctx, WorldReplacement::Network(sim), generation);
             }
+            #[cfg(feature = "multiplayer")]
+            Install::RestoreNetworkSource => unreachable!("source restore polled before install"),
             Install::Job(world, kind) => {
                 self.replace_world(ctx, world.replacement, generation);
                 self.uiw.write::<SessionState>().city_name = world.name;
@@ -1333,11 +1503,14 @@ impl State {
         self.fence = Fence::Open;
         self.sent_warp = 0;
         self.last_batch = None;
+        self.applied_batch = None;
+        self.rendered_batch = None;
         self.batch_in_flight = false;
         self.staged = None;
         self.capture = None;
         self.departure_target = None;
         self.deferred_input.clear();
+        self.bulldozer_view = None;
     }
 
     fn start_save(&mut self) {
@@ -1547,7 +1720,7 @@ impl State {
         drop(session);
         drop(io);
         self.uiw.write::<GuiState>().last_save = Instant::now();
-        self.settings_dirty = true;
+        self.lot_brush_dirty = true;
         if let Some(notice) = notice {
             session::notify(&self.uiw, notice);
         }
@@ -1556,15 +1729,15 @@ impl State {
         }
     }
 
-    fn poll_settings_save(&mut self) {
-        if let Some(save) = &self.settings_save {
+    fn poll_lot_brush_save(&mut self) {
+        if let Some(save) = &self.lot_brush_save {
             if matches!(save.try_recv(), Err(TryRecvError::Empty)) {
                 return;
             }
-            self.settings_save = None;
+            self.lot_brush_save = None;
         }
-        if std::mem::take(&mut self.settings_dirty) {
-            self.settings_save = Some(self.uiw.save_to_disk_async());
+        if std::mem::take(&mut self.lot_brush_dirty) {
+            self.lot_brush_save = Some(self.uiw.save_lot_brush_async());
         }
     }
 
@@ -1857,6 +2030,46 @@ mod p4_fix_esc_tests {
         scenarios::ensure_repo_root_cwd();
         crate::init::init();
         UiWorld::with_defaults()
+    }
+
+    #[test]
+    fn scale_t1_fix_deferred_placement_is_bound_to_the_selected_company() {
+        let sample = |company| WorldInputSample {
+            generation: 4,
+            input: InputMap::default().world_input(),
+            pointer: Default::default(),
+            ray: None,
+            press_events: Vec::new(),
+            tool: Tool::SpecialBuilding,
+            company,
+            drag_view: None,
+        };
+
+        let school = Some(prototypes::GoodsCompanyID::new("school"));
+        let bakery = Some(prototypes::GoodsCompanyID::new("bakery"));
+        let old = sample(school);
+        assert!(old.same_tool(&sample(school)));
+        assert!(!old.same_tool(&sample(bakery)));
+        assert!(!old.same_tool(&sample(None)));
+    }
+
+    #[test]
+    fn scale_t1_fix_deferred_bulldozer_drag_requires_the_sampled_view() {
+        let mut camera = Camera::new(geom::Vec3::ZERO, 1280.0, 720.0);
+        let sample = WorldInputSample {
+            generation: 3,
+            input: InputMap::default().world_input(),
+            pointer: Default::default(),
+            ray: None,
+            press_events: Vec::new(),
+            tool: Tool::Bulldozer,
+            company: None,
+            drag_view: Some(DragView::new(&camera)),
+        };
+        assert!(!sample.drag_uses_changed_view(Some(DragView::new(&camera))));
+        camera.pos.x += 100.0;
+        assert!(sample.drag_uses_changed_view(Some(DragView::new(&camera))));
+        assert!(sample.drag_uses_changed_view(None));
     }
 
     #[test]

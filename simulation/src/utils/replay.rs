@@ -82,13 +82,39 @@ impl Replay {
         };
 
         let end = timeline.constructor_end;
-        if end == 0
-            || !self.commands.get(1..end).is_some_and(|commands| {
-                commands.iter().all(|(tick, command)| {
-                    *tick == Tick(INITIAL_TICK) && !matches!(command, WorldCommand::Init(_))
-                })
-            })
-        {
+        // The constructor can contain the optional plot layout followed by
+        // the starter rail. Validate it before allocating or initializing a
+        // world. Import and ordinary editor commands belong to playback.
+        let valid = self.commands.get(1..end).is_some_and(|commands| {
+            let commands = match commands {
+                [(Tick(INITIAL_TICK), WorldCommand::SetLotLayout(_)), rest @ ..] => rest,
+                _ => commands,
+            };
+            match commands {
+                [] => true,
+                [(Tick(INITIAL_TICK), WorldCommand::MapMakeMultipleConnections(projects, links)), (
+                    Tick(INITIAL_TICK),
+                    WorldCommand::MapBuildSpecialBuilding {
+                        kind: crate::map::BuildingKind::RailFreightStation(_),
+                        zone: None,
+                        ..
+                    },
+                ), (Tick(INITIAL_TICK), WorldCommand::AddTrain { n_wagons, .. })] => {
+                    projects.len() <= 512
+                        && links.len() <= 256
+                        && links
+                            .iter()
+                            .map(|(_, _, _, pattern)| pattern.lanes().count())
+                            .try_fold(0usize, |total, count| {
+                                total.checked_add(count).filter(|&total| total <= 512)
+                            })
+                            .is_some()
+                        && *n_wagons <= 128
+                }
+                _ => false,
+            }
+        });
+        if !valid {
             return Err(invalid_replay("Invalid replay constructor batch"));
         }
 
@@ -478,4 +504,23 @@ fn scale_t1_replay_boundary_keeps_legacy_edit_pending() {
         assert_eq!(cursor.idx, pending);
         *sim.write::<prototypes::GameTime>() = prototypes::GameTime::new(Tick(initial));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn scale_t1_fix_rejects_import_in_replay_constructor() {
+    let mut replay = Replay::default();
+    let options = SimulationOptions {
+        terrain_size: crate::NewGameOptions::MIN_TERRAIN_CHUNKS,
+        preset: crate::MapPreset::Flat,
+        ..SimulationOptions::LEGACY
+    };
+    replay.push(Tick(INITIAL_TICK), WorldCommand::Init(Box::new(options)));
+    replay.push(Tick(INITIAL_TICK), WorldCommand::MapLoadParis);
+    replay.enabled = true;
+    replay.record_constructor_end(Tick(INITIAL_TICK));
+    assert!(matches!(
+        Simulation::try_from_replay(replay),
+        Err(err) if err.to_string() == "Invalid replay constructor batch"
+    ));
 }

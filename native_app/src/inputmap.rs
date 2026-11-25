@@ -114,6 +114,10 @@ pub(crate) struct WorldInput {
 }
 
 impl WorldInput {
+    pub(crate) fn select_held(&self) -> bool {
+        self.act.contains(&InputAction::Select)
+    }
+
     pub(crate) fn has_edge(&self) -> bool {
         self.select_press.is_some() || !self.just_act.is_empty()
     }

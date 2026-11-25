@@ -1,6 +1,7 @@
+use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::thread::{self, JoinHandle};
@@ -21,6 +22,12 @@ use crate::session::{save_coordinator::SavePermit, CityProgress};
 
 pub(crate) const BATCH_BYTES: usize = 256 * 1024;
 const BATCH_COMMANDS: usize = 256;
+const BATCH_WORK: usize = 2_048;
+// The replay envelope preserves historical groups and import commands as a
+// single operation. It is independent of the live editor and reply budgets.
+const REPLAY_COMMANDS: usize = 16_384;
+const REPLAY_BYTES: usize = 4 * 1024 * 1024;
+const REPLAY_WORK: usize = 32_768;
 const BATCH_CREDITS: usize = 8;
 // One extra credit is always available to fence or stop a full batch queue.
 const CONTROL_CREDITS: usize = 1;
@@ -32,6 +39,12 @@ const REDRAW_TURN: Duration = Duration::from_millis(16);
 pub(crate) struct BatchId {
     pub generation: u64,
     pub sequence: u64,
+}
+
+impl BatchId {
+    pub(crate) fn covers(self, older: Self) -> bool {
+        self.generation == older.generation && self.sequence >= older.sequence
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -149,6 +162,7 @@ pub(crate) enum ReplyKind {
     Captured(Result<(EncodedSlot, CityProgress), String>),
     ReplayChanged,
     ReplayStepped(Boundary),
+    Interrupted(Boundary),
     Releasing(Boundary),
     Stopping,
     Rejected(&'static str),
@@ -270,7 +284,8 @@ impl Drop for Turn<'_> {
 
 pub(crate) struct WorldView {
     pub world: Arc<RwLock<Simulation>>,
-    admission: Arc<Admission>,
+    admission: Admission,
+    replaced: AtomicBool,
 }
 
 pub(crate) struct ReadLease<'a> {
@@ -287,6 +302,19 @@ impl Deref for ReadLease<'_> {
 }
 
 impl WorldView {
+    fn new(world: Arc<RwLock<Simulation>>) -> Self {
+        Self {
+            world,
+            admission: Admission::default(),
+            replaced: AtomicBool::new(false),
+        }
+    }
+
+    /// Call with the frame's read lease to observe a replacement before drawing.
+    pub(crate) fn take_replaced(&self) -> bool {
+        self.replaced.swap(false, Ordering::AcqRel)
+    }
+
     pub(crate) fn signal_redraw(&self) -> bool {
         self.admission.signal_redraw()
     }
@@ -332,10 +360,7 @@ impl SimThread {
         generation: u64,
         replay: Option<SimulationReplayLoader>,
     ) -> Self {
-        let view = Arc::new(WorldView {
-            world: Arc::new(RwLock::new(sim)),
-            admission: Arc::default(),
-        });
+        let view = Arc::new(WorldView::new(Arc::new(RwLock::new(sim))));
         Self::from_view(view, schedule, generation, replay)
     }
 
@@ -354,10 +379,7 @@ impl SimThread {
         replay: Option<SimulationReplayLoader>,
     ) -> Self {
         Self::from_view(
-            Arc::new(WorldView {
-                world,
-                admission: Arc::default(),
-            }),
+            Arc::new(WorldView::new(world)),
             schedule,
             generation,
             replay,
@@ -372,6 +394,25 @@ impl SimThread {
     ) -> Self {
         let initial_tick = view.world.try_read().expect("unowned world").get_tick();
         let worker = Worker::new(schedule, generation, initial_tick, replay);
+        Self::start_worker(view, worker, 0)
+    }
+
+    #[cfg(feature = "multiplayer")]
+    pub(crate) fn restore_paused_owner(&mut self) -> Option<Result<(Self, Boundary), ()>> {
+        let owner = self.take_owner()?;
+        Some(owner.map(|owner| {
+            let boundary = owner.boundary;
+            let mut worker = Worker::new(owner.schedule, boundary.generation, boundary.tick, None);
+            worker.status.boundary = boundary;
+            worker.status.owner_mode = OwnerMode::Paused;
+            worker.paused = true;
+            let view = Arc::new(WorldView::new(owner.world));
+            (Self::start_worker(view, worker, self.sequence), boundary)
+        }))
+    }
+
+    fn start_worker(view: Arc<WorldView>, worker: Worker, sequence: u64) -> Self {
+        let generation = worker.status.boundary.generation;
         let status = Arc::new(Mutex::new(worker.status.clone()));
         let (requests, input) = mpsc::sync_channel(CREDITS);
         let (output, replies) = mpsc::sync_channel(CREDITS);
@@ -390,7 +431,7 @@ impl SimThread {
         let handle = None;
         Self {
             generation,
-            sequence: 0,
+            sequence,
             credits: Default::default(),
             batch_credits: BATCH_CREDITS,
             requests,
@@ -451,7 +492,7 @@ impl SimThread {
             return Err(SubmitErrorWithRequest(SubmitError::Full, request));
         }
         if let Request::Batch(commands) = &request {
-            if !fits(commands) {
+            if !can_submit_batch(commands) {
                 return Err(SubmitErrorWithRequest(SubmitError::Oversized, request));
             }
         }
@@ -544,30 +585,98 @@ impl Write for LimitedWriter {
 
 pub(crate) fn fits(commands: &WorldCommands) -> bool {
     commands.as_ref().len() <= BATCH_COMMANDS
-        && commands.iter().all(command_fits)
+        && work_fits(commands.iter(), BATCH_WORK, false)
         && Bincode::encode_writer(commands, LimitedWriter(BATCH_BYTES)).is_ok()
 }
 
-pub(crate) fn fits_replay_batch(commands: &[(prototypes::Tick, WorldCommand)]) -> bool {
-    if commands.len() > BATCH_COMMANDS || !commands.iter().all(|(_, command)| command_fits(command))
-    {
-        return false;
-    }
-    let commands: Vec<_> = commands.iter().map(|(_, command)| command).collect();
-    Bincode::encode_writer(&commands, LimitedWriter(BATCH_BYTES)).is_ok()
+pub(crate) fn can_submit_batch(commands: &WorldCommands) -> bool {
+    fits(commands) || is_background_import(commands)
 }
 
-fn command_fits(command: &WorldCommand) -> bool {
-    match command {
-        WorldCommand::Init(_) => false,
-        WorldCommand::SpawnRandomCars { n_cars } => *n_cars <= 512,
-        WorldCommand::AddTrain { n_wagons, .. } => *n_wagons <= 128,
-        WorldCommand::SpawnTrain { wagons, .. } => wagons.len() <= 128,
-        WorldCommand::MapLoadTestField { size, .. } => *size <= 100,
-        WorldCommand::MapMakeMultipleConnections(projects, links) => {
-            projects.len() <= 512 && links.len() <= 256
-        }
-        _ => true,
+fn is_background_import(commands: &WorldCommands) -> bool {
+    if cfg!(target_arch = "wasm32") {
+        return false;
+    }
+    match commands.as_ref() {
+        [WorldCommand::MapLoadParis] => true,
+        [WorldCommand::MapLoadTestField { size, .. }] => *size <= 100 && !fits(commands),
+        _ => false,
+    }
+}
+
+pub(crate) fn fits_replay_batch(commands: &[(prototypes::Tick, WorldCommand)]) -> bool {
+    commands.len() <= REPLAY_COMMANDS
+        && work_fits(
+            commands.iter().map(|(_, command)| command),
+            REPLAY_WORK,
+            true,
+        )
+        && Bincode::encode_writer(&commands, LimitedWriter(REPLAY_BYTES)).is_ok()
+}
+
+// Include generated objects and indexed outcomes as well as the command itself.
+fn work_fits<'a>(
+    commands: impl Iterator<Item = &'a WorldCommand>,
+    limit: usize,
+    replay: bool,
+) -> bool {
+    let mut remaining = limit;
+    for command in commands {
+        use WorldCommand::*;
+        let expanded = match command {
+            Init(_) => return false,
+            SpawnRandomCars { n_cars } if replay || *n_cars <= 512 => *n_cars,
+            AddTrain { n_wagons, .. } if replay || *n_wagons <= 128 => *n_wagons as usize,
+            SpawnTrain { wagons, .. } if replay || wagons.len() <= 128 => wagons.len(),
+            SpawnRandomCars { .. } | AddTrain { .. } | SpawnTrain { .. } => return false,
+            MapLoadParis => 11_348 + 17_958,
+            MapLoadTestField { size, .. } => {
+                let size = *size as usize;
+                size.saturating_mul(size.saturating_add(size.saturating_sub(1).saturating_mul(2)))
+            }
+            MapMakeConnection { pat, .. } => pat.lanes().count(),
+            MapMakeMultipleConnections(projects, links) => {
+                if projects.len().saturating_add(links.len()) > remaining {
+                    return false;
+                }
+                links.iter().fold(projects.len(), |work, (_, _, _, pat)| {
+                    work.saturating_add(2).saturating_add(pat.lanes().count())
+                })
+            }
+            Terraform { radius, .. } => ((radius / 100.0).powi(2) as usize).min(400),
+            ZonePaint { area, .. } => {
+                // Cells are 8 m square. Charge for the footprint and cap the
+                // cost of shapes that the map will reject before applying.
+                ((area.axis()[0].mag() * area.axis()[1].mag() / 256.0) as usize).min(625)
+            }
+            UpdateZone { zone, .. }
+            | MapBuildSpecialBuilding {
+                zone: Some(zone), ..
+            } => zone.poly.0.len(),
+            TransitCreateLine { stops } | TransitEditLine { stops, .. } => stops.len(),
+            // These can scan or rebuild a significant part of the existing map.
+            SetLotLayout(_) | EditWater(_) => BATCH_WORK / 2,
+            _ => 0,
+        };
+        let Some(left) = remaining.checked_sub(expanded.saturating_add(1)) else {
+            return false;
+        };
+        remaining = left;
+    }
+    true
+}
+
+struct PendingImport {
+    id: BatchId,
+    commands: WorldCommands,
+    result: Receiver<Result<(Simulation, Duration), String>>,
+    prepared: Option<(Simulation, Duration)>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl Drop for PendingImport {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
     }
 }
 
@@ -584,7 +693,9 @@ struct Worker {
     replay_due: Instant,
     explicit_steps: Option<(BatchId, usize)>,
     fixture: Option<(BatchId, FixtureOp)>,
+    import: Option<PendingImport>,
     pending: Option<Envelope>,
+    waiting: VecDeque<Envelope>,
     exit: bool,
     next_sample: Instant,
 }
@@ -627,7 +738,9 @@ impl Worker {
             replay_due: now,
             explicit_steps: None,
             fixture: None,
+            import: None,
             pending: None,
+            waiting: VecDeque::new(),
             exit: false,
             next_sample: now,
         }
@@ -669,13 +782,45 @@ impl Worker {
     ) -> Duration {
         let now = Instant::now();
         self.clock.update(now);
-        if self.pending.is_none() && self.explicit_steps.is_none() && self.fixture.is_none() {
-            match input.try_recv() {
-                Ok(envelope) => self.pending = Some(envelope),
-                Err(mpsc::TryRecvError::Empty) => {}
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.exit = true;
-                    return Duration::ZERO;
+        if self.explicit_steps.is_some() || self.fixture.is_some() || self.import.is_some() {
+            // Reply credits also bound this buffer. Keep earlier requests in
+            // FIFO order while finding a terminal request behind the long run.
+            self.waiting.extend(input.try_iter());
+            if self
+                .waiting
+                .iter()
+                .any(|envelope| matches!(envelope.request, Request::Stop | Request::ReleaseOwner))
+            {
+                let id = self
+                    .explicit_steps
+                    .take()
+                    .map(|(id, _)| id)
+                    .or_else(|| self.fixture.take().map(|(id, _)| id))
+                    .or_else(|| self.import.take().map(|pending| pending.id))
+                    .unwrap();
+                view.admission.cancel_write();
+                self.send_reply(
+                    output,
+                    Reply {
+                        id,
+                        kind: ReplyKind::Interrupted(self.status.boundary),
+                    },
+                );
+                return Duration::ZERO;
+            }
+            if self.import.is_some() {
+                return self.poll_import(view, status, output);
+            }
+        } else if self.pending.is_none() {
+            self.pending = self.waiting.pop_front();
+            if self.pending.is_none() {
+                match input.try_recv() {
+                    Ok(envelope) => self.pending = Some(envelope),
+                    Err(mpsc::TryRecvError::Empty) => {}
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        self.exit = true;
+                        return Duration::ZERO;
+                    }
                 }
             }
         }
@@ -698,6 +843,18 @@ impl Worker {
                 self.clock.wait()
             };
         }
+        if self.replay.is_none()
+            && self.pending.as_ref().is_some_and(|pending| {
+                matches!(&pending.request, Request::Batch(commands) if is_background_import(commands))
+            })
+        {
+            view.admission.cancel_write();
+            let Envelope { id, request } = self.pending.take().unwrap();
+            let Request::Batch(commands) = request else { unreachable!() };
+            self.start_import(view, id, commands);
+            return Duration::ZERO;
+        }
+
         // Timing controls and stop/fence do not need the world. In particular,
         // stopping never depends on a redraw consuming a reserved reader turn.
         let world_required = self.pending.as_ref().is_none_or(|envelope| {
@@ -717,7 +874,7 @@ impl Worker {
             if let Some(envelope) = self.pending.take() {
                 self.handle(envelope, Some(&mut sim))
             } else {
-                self.advance(&mut sim, now)
+                self.advance(&mut sim, now, input)
             }
         } else {
             view.admission.cancel_write();
@@ -735,14 +892,123 @@ impl Worker {
             kind: ReplyKind::Rejected("The replay step was cancelled."),
         });
         for reply in cancelled.into_iter().chain(reply) {
-            // A request occupies a reply credit until the receiver polls it.
-            match output.try_send(reply) {
-                Ok(()) => {}
-                Err(TrySendError::Disconnected(_)) => self.exit = true,
-                Err(TrySendError::Full(_)) => panic!("simulation reply credit exhausted"),
-            }
+            self.send_reply(output, reply);
         }
         Duration::ZERO
+    }
+
+    fn terminal_waiting(waiting: &mut VecDeque<Envelope>, input: &Receiver<Envelope>) -> bool {
+        waiting.extend(input.try_iter());
+        waiting
+            .iter()
+            .any(|envelope| matches!(envelope.request, Request::Stop | Request::ReleaseOwner))
+    }
+
+    fn start_import(&mut self, view: &WorldView, id: BatchId, commands: WorldCommands) {
+        let source = view.world.clone();
+        let command = commands.as_ref()[0].clone();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let is_cancelled = cancelled.clone();
+        let (done, result) = mpsc::sync_channel(1);
+        let job = thread::Builder::new()
+            .name("map import".into())
+            .spawn(move || {
+                let prepare = || -> Result<_, String> {
+                    // This is an immutable capture concurrent with frame reads.
+                    // Release the source before constructing or importing the copy.
+                    let snapshot = {
+                        let sim = source.read().map_err(|err| err.to_string())?;
+                        Bincode::encode(&*sim).map_err(|err| err.to_string())?
+                    };
+                    if is_cancelled.load(Ordering::Acquire) {
+                        return Err("Map import cancelled.".into());
+                    }
+                    let mut sim: Simulation =
+                        Bincode::decode(&snapshot).map_err(|err| err.to_string())?;
+                    let elapsed = sim.tick(&mut Simulation::schedule(), [&command]);
+                    Ok((sim, elapsed))
+                };
+                let _ = done.send(prepare());
+            });
+        if let Err(error) = job {
+            log::error!("Could not start map import: {error}");
+        }
+        self.import = Some(PendingImport {
+            id,
+            commands,
+            result,
+            prepared: None,
+            cancelled,
+        });
+    }
+
+    fn poll_import(
+        &mut self,
+        view: &WorldView,
+        status: &Mutex<SimStatus>,
+        output: &SyncSender<Reply>,
+    ) -> Duration {
+        let pending = self.import.as_mut().unwrap();
+        if pending.prepared.is_none() {
+            let result = match pending.result.try_recv() {
+                Ok(result) => result,
+                Err(mpsc::TryRecvError::Empty) => return Duration::from_millis(2),
+                Err(mpsc::TryRecvError::Disconnected) => Err("Map import worker stopped.".into()),
+            };
+            match result {
+                Ok(prepared) => pending.prepared = Some(prepared),
+                Err(error) => {
+                    log::error!("Map import preparation failed: {error}");
+                    let id = self.import.take().unwrap().id;
+                    self.send_reply(
+                        output,
+                        Reply {
+                            id,
+                            kind: ReplyKind::Rejected("Map import preparation failed."),
+                        },
+                    );
+                    return Duration::ZERO;
+                }
+            }
+        }
+        let Some(turn) = view.admission.write() else {
+            return CONTENDED_RETRY;
+        };
+        let mut pending = self.import.take().unwrap();
+        let (sim, elapsed) = pending.prepared.take().unwrap();
+        let commands = std::mem::take(&mut pending.commands);
+        let mut published = view
+            .world
+            .try_write()
+            .expect("world accessed outside admission");
+        self.clock.clear();
+        self.status.boundary.completed_step += 1;
+        self.status.boundary.tick = sim.get_tick();
+        self.status.last_tick_duration = elapsed;
+        let reply = self.applied_batch(&sim, pending.id, commands, true);
+        let old = std::mem::replace(&mut *published, sim);
+        view.replaced.store(true, Ordering::Release);
+        drop(published);
+        drop(turn);
+        *status.lock().unwrap() = self.status.clone();
+        self.send_reply(
+            output,
+            Reply {
+                id: pending.id,
+                kind: reply,
+            },
+        );
+        drop(old);
+        Duration::ZERO
+    }
+
+    fn send_reply(&mut self, output: &SyncSender<Reply>, reply: Reply) {
+        // A request occupies a reply credit until the receiver polls it.
+        match output.try_send(reply) {
+            Ok(()) => {}
+            Err(TrySendError::Disconnected(_)) => self.exit = true,
+            Err(TrySendError::Full(_)) => panic!("simulation reply credit exhausted"),
+        }
     }
 
     fn handle(&mut self, envelope: Envelope, sim: Option<&mut Simulation>) -> Option<Reply> {
@@ -757,30 +1023,7 @@ impl Worker {
                     sim.apply_commands(commands.as_ref());
                     self.status.boundary.tick = sim.get_tick();
                 }
-                self.status.boundary.last_batch = Some(id);
-                let outcomes = sim.read::<CommandOutcomes>();
-                ReplyKind::Applied(AppliedBatch {
-                    id,
-                    boundary: self.status.boundary,
-                    advanced,
-                    outcome_sequence: outcomes.batch_seq(),
-                    accepted_indices: outcomes.accepted.clone(),
-                    rejections: (0..commands.as_ref().len())
-                        .flat_map(|i| {
-                            outcomes
-                                .rejections_for(i)
-                                .iter()
-                                .map(move |&(label, reason)| (i, label, reason))
-                        })
-                        .collect(),
-                    link_outcomes: (0..commands.as_ref().len())
-                        .flat_map(|i| outcomes.link_outcomes(i).iter().map(move |&link| (i, link)))
-                        .collect(),
-                    water_edits: (0..commands.as_ref().len())
-                        .filter_map(|i| outcomes.water_edit(i).cloned().map(|result| (i, result)))
-                        .collect(),
-                    commands,
-                })
+                self.applied_batch(sim, id, commands, advanced)
             }
             Request::Batch(_) => ReplyKind::Rejected("The world cannot apply that batch."),
             Request::SetWarp(warp) => {
@@ -862,11 +1105,13 @@ impl Worker {
                 }
             }
             Request::ReleaseOwner => {
+                self.replay_cancelled = self.replay_step.take();
                 self.exit = true;
                 self.status.owner_mode = OwnerMode::Transferring;
                 ReplyKind::Releasing(self.status.boundary)
             }
             Request::Stop => {
+                self.replay_cancelled = self.replay_step.take();
                 self.exit = true;
                 self.status.owner_mode = OwnerMode::Stopped;
                 ReplyKind::Stopping
@@ -875,12 +1120,61 @@ impl Worker {
         Some(Reply { id, kind })
     }
 
-    fn advance(&mut self, sim: &mut Simulation, now: Instant) -> Option<Reply> {
+    fn applied_batch(
+        &mut self,
+        sim: &Simulation,
+        id: BatchId,
+        commands: WorldCommands,
+        advanced: bool,
+    ) -> ReplyKind {
+        self.status.boundary.last_batch = Some(id);
+        let outcomes = sim.read::<CommandOutcomes>();
+        ReplyKind::Applied(AppliedBatch {
+            id,
+            boundary: self.status.boundary,
+            advanced,
+            outcome_sequence: outcomes.batch_seq(),
+            accepted_indices: outcomes.accepted.clone(),
+            rejections: (0..commands.as_ref().len())
+                .flat_map(|i| {
+                    outcomes
+                        .rejections_for(i)
+                        .iter()
+                        .map(move |&(label, reason)| (i, label, reason))
+                })
+                .collect(),
+            link_outcomes: (0..commands.as_ref().len())
+                .flat_map(|i| outcomes.link_outcomes(i).iter().map(move |&link| (i, link)))
+                .collect(),
+            water_edits: (0..commands.as_ref().len())
+                .filter_map(|i| outcomes.water_edit(i).cloned().map(|result| (i, result)))
+                .collect(),
+            commands,
+        })
+    }
+
+    fn advance(
+        &mut self,
+        sim: &mut Simulation,
+        now: Instant,
+        input: &Receiver<Envelope>,
+    ) -> Option<Reply> {
         if let Some((id, mut op)) = self.fixture.take() {
             let mut steps = 0;
-            let result = op.run(sim, &mut self.schedule, &mut steps);
+            let mut interrupted = false;
+            let waiting = &mut self.waiting;
+            let result = op.run(sim, &mut self.schedule, &mut steps, &mut || {
+                interrupted = Self::terminal_waiting(waiting, input);
+                interrupted
+            });
             self.status.boundary.completed_step += steps;
             self.status.boundary.tick = sim.get_tick();
+            if interrupted {
+                return Some(Reply {
+                    id,
+                    kind: ReplyKind::Interrupted(self.status.boundary),
+                });
+            }
             if let Some(result) = result {
                 return Some(Reply {
                     id,

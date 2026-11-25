@@ -40,6 +40,27 @@ pub struct SpecialBuildingResource {
     rejection: Option<(Cow<'static, str>, u64)>,
 }
 
+pub(crate) fn reject_local_batch(
+    uiw: &UiWorld,
+    commands: &simulation::world_command::WorldCommands,
+) {
+    let mut preview = uiw.write::<PlacementPreview>();
+    if preview.pending.as_ref().is_some_and(|pending| {
+        commands
+            .as_ref()
+            .get(pending.index)
+            .is_some_and(|command| pending.matches(command))
+    }) {
+        preview.pending = None;
+        let mut placement = uiw.write::<SpecialBuildingResource>();
+        placement.last_obb = None;
+        placement.rejection = Some((
+            "This placement exceeds the simulation's batch limit.".into(),
+            placement.frame,
+        ));
+    }
+}
+
 /// SpecialBuilding tool
 /// Allows to build special buildings like farms, factories, etc.
 pub fn specialbuilding(sim: &Simulation, uiworld: &UiWorld) {

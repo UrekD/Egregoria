@@ -185,8 +185,15 @@ pub(crate) enum Builder {
 
 #[derive(Clone, Copy)]
 enum Wait {
-    Map { tick: u64, settle_frames: u64 },
-    Frames { start: u64, count: u64 },
+    Applied(BatchId),
+    Map {
+        boundary: Boundary,
+        settle_frames: u64,
+    },
+    Frames {
+        start: u64,
+        count: u64,
+    },
     LoadSlot,
     Screenshot,
     Simulation(BatchId),
@@ -347,11 +354,12 @@ impl Automation {
         sim: &Simulation,
         driver: &mut SimThread,
         rebuilt_version: Option<u64>,
+        rendered_batch: Option<BatchId>,
     ) -> Result<bool, String> {
         // The window can still receive real cursor and focus events during a script.
         // Restore the script's cursor before Yakui handles the next queued event.
         move_yakui_pointer(ctx, self.pointer_input.mouse.screen);
-        let result = self.advance(ctx, uiw, sim, driver, rebuilt_version);
+        let result = self.advance(ctx, uiw, sim, driver, rebuilt_version, rendered_batch);
         match result {
             Ok(true) => {
                 ctx.input.mouse.clone_from(&self.pointer_input.mouse);
@@ -382,9 +390,19 @@ impl Automation {
         sim: &Simulation,
         driver: &mut SimThread,
         rebuilt_version: Option<u64>,
+        rendered_batch: Option<BatchId>,
     ) -> Result<bool, String> {
         match self.wait {
-            Some(Wait::Map { tick, .. }) if rebuilt_version != Some(tick) => {
+            Some(Wait::Applied(id))
+                if !rendered_batch.is_some_and(|rendered| rendered.covers(id)) =>
+            {
+                return Ok(true);
+            }
+            Some(Wait::Map { boundary, .. })
+                if boundary.generation != uiw.read::<SessionState>().generation
+                    || rebuilt_version != Some(boundary.tick)
+                    || sim.get_tick() != boundary.tick =>
+            {
                 return Ok(true);
             }
             Some(Wait::Map { settle_frames, .. }) if settle_frames > 0 => {
@@ -687,7 +705,7 @@ impl Automation {
     }
 
     fn queue_commands(&self, uiw: &UiWorld, batch: WorldCommands) -> Result<(), String> {
-        if !crate::sim_thread::fits(&batch) {
+        if !crate::sim_thread::can_submit_batch(&batch) {
             return Err("script command batch exceeds the simulation limit".into());
         }
         *uiw.commands() = batch;
@@ -701,7 +719,7 @@ impl Automation {
                 .first()
                 .map(|&(_, label, reason)| (label, reason));
         }
-        self.wait_for_map(batch.boundary, 0);
+        self.wait = Some(Wait::Applied(batch.id));
     }
 
     pub(crate) fn worker_reply(&mut self, reply: Reply) -> Result<(), String> {
@@ -719,6 +737,12 @@ impl Automation {
                     self.wait_for_map(boundary, 2);
                 }
             }
+            ReplyKind::Interrupted(boundary) => {
+                return Err(format!(
+                    "simulation operation interrupted at tick {}",
+                    boundary.tick
+                ));
+            }
             ReplyKind::Rejected(error) => return Err(error.into()),
             _ => return Err("unexpected simulation reply".into()),
         }
@@ -727,7 +751,7 @@ impl Automation {
 
     fn wait_for_map(&mut self, boundary: Boundary, settle_frames: u64) {
         self.wait = Some(Wait::Map {
-            tick: boundary.tick,
+            boundary,
             settle_frames,
         });
     }
@@ -1095,6 +1119,7 @@ impl FixtureOp {
         sim: &mut Simulation,
         schedule: &mut SeqSchedule,
         steps: &mut u64,
+        check_stop: &mut dyn FnMut() -> bool,
     ) -> Option<Result<FixtureOutcome, String>> {
         match self {
             Self::EmptyTreasury => {
@@ -1109,6 +1134,8 @@ impl FixtureOp {
                     queued: Vec::new(),
                     first_rejection: &mut rejection,
                     steps,
+                    check_stop,
+                    cancelled: false,
                 };
                 Some(builder.build(&mut sink).and_then(|()| {
                     if *steps == 0 {
@@ -1171,6 +1198,8 @@ struct LiveCommandSink<'a> {
     queued: Vec<WorldCommand>,
     first_rejection: &'a mut Option<(&'static str, Rejection)>,
     steps: &'a mut u64,
+    check_stop: &'a mut dyn FnMut() -> bool,
+    cancelled: bool,
 }
 
 impl CommandSink for LiveCommandSink<'_> {
@@ -1179,7 +1208,9 @@ impl CommandSink for LiveCommandSink<'_> {
     }
 
     fn submit(&mut self, commands: &[WorldCommand]) {
-        self.queued.extend_from_slice(commands);
+        if !self.cancelled {
+            self.queued.extend_from_slice(commands);
+        }
     }
 
     fn has_pending_commands(&self) -> bool {
@@ -1187,6 +1218,11 @@ impl CommandSink for LiveCommandSink<'_> {
     }
 
     fn flush(&mut self) {
+        if self.cancelled || (self.check_stop)() {
+            self.cancelled = true;
+            self.queued.clear();
+            return;
+        }
         self.sim.tick(self.schedule, &self.queued);
         *self.steps += 1;
         remember_rejection(self.first_rejection, self.sim);

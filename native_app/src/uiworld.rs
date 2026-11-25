@@ -1,6 +1,7 @@
 use crate::gui::TimeAlways;
 use crate::init::{INIT_FUNCS, SAVELOAD_FUNCS};
 use crate::session::{CityProgress, SaveInFlight, SaveRequest, WorldJob, WorldReplacement};
+use common::saveload::Encoder;
 use simulation::utils::resources::{RefMutSingle, RefSingle, ResourcesSingleThread};
 use simulation::world_command::{Rejection, WorldCommand, WorldCommands};
 use simulation::SimulationReplayLoader;
@@ -20,6 +21,7 @@ pub struct SaveLoadState {
     pub replay: Option<SimulationReplayLoader>,
     pub(crate) replay_ui: Option<ReplayUi>,
     pub(crate) threaded: bool,
+    pub(crate) authoring_blocked: bool,
     pub(crate) departure_intent: Option<crate::session::Departure>,
     #[cfg(feature = "multiplayer")]
     pub(crate) network_target: Option<crate::network::NetworkTarget>,
@@ -77,6 +79,10 @@ impl UiWorld {
         w
     }
 
+    pub(crate) fn can_author(&self) -> bool {
+        !self.read::<SaveLoadState>().authoring_blocked
+    }
+
     pub fn commands(&self) -> RefMutSingle<WorldCommands> {
         self.write::<WorldCommands>()
     }
@@ -129,25 +135,18 @@ impl UiWorld {
         }
     }
 
-    pub(crate) fn save_to_disk_async(&self) -> std::sync::mpsc::Receiver<()> {
-        let settings = *self.read::<crate::gui::windows::settings::Settings>();
-        let bindings = self.read::<crate::inputmap::Bindings>().0.clone();
-        let (kind, radius) = {
-            let brush = self.read::<crate::gui::lotbrush::LotBrushResource>();
-            (brush.kind, brush.radius)
+    pub(crate) fn save_lot_brush_async(&self) -> std::sync::mpsc::Receiver<()> {
+        use crate::gui::lotbrush::LotBrushResource;
+        let brush = self.read::<LotBrushResource>();
+        let brush = LotBrushResource {
+            kind: brush.kind,
+            radius: brush.radius,
         };
-        #[cfg(feature = "multiplayer")]
-        let network_info =
-            (*self.read::<crate::gui::windows::network::NetworkConnectionInfo>()).clone();
         let (done, result) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let mut uiw = UiWorld::with_defaults();
-            uiw.insert(settings);
-            #[cfg(feature = "multiplayer")]
-            uiw.insert(network_info);
-            uiw.insert(crate::inputmap::Bindings(bindings));
-            uiw.insert(crate::gui::lotbrush::LotBrushResource { kind, radius });
-            uiw.save_to_disk();
+            // Settings and bindings are persisted by their editing controls.
+            // A late city save must not publish a second snapshot of either.
+            common::saveload::JSONPretty::save_silent(&brush, "lot_brush");
             let _ = done.send(());
         });
         result
@@ -164,7 +163,6 @@ impl UiWorld {
 
 #[derive(Default)]
 pub struct ReceivedCommands {
-    batches: usize,
     commands: WorldCommands,
     placements: Vec<PlacementResult>,
     pub(crate) rejections: Vec<(u64, Vec<(usize, &'static str, Rejection)>)>,
@@ -186,7 +184,6 @@ impl ReceivedCommands {
     }
 
     pub(crate) fn receive(&mut self, batch: &crate::sim_thread::AppliedBatch) {
-        self.batches += 1;
         self.commands.merge(&batch.accepted_commands());
         self.placements
             .extend(
@@ -219,10 +216,6 @@ impl ReceivedCommands {
             .push((batch.outcome_sequence, batch.rejections.clone()));
     }
 
-    pub(crate) fn is_full(&self) -> bool {
-        self.batches >= 8
-    }
-
     pub(crate) fn placement(
         &self,
         index: usize,
@@ -237,4 +230,60 @@ impl ReceivedCommands {
     pub fn iter(&self) -> impl Iterator<Item = &WorldCommand> {
         self.commands.iter()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn scale_t1_fix_city_save_keeps_newer_settings_and_bindings() {
+    use crate::gui::windows::settings::Settings;
+    use crate::inputmap::{Bindings, InputAction};
+    use common::saveload::{self, JSONPretty};
+    use std::{fs, path::PathBuf, process::Command, time::Duration};
+
+    const SAVE_ROOT: &str = "EGR_SCALE_T1_PREFERENCES_TEST";
+    const TEST_NAME: &str = "uiworld::scale_t1_fix_city_save_keeps_newer_settings_and_bindings";
+    if let Some(root) = std::env::var_os(SAVE_ROOT) {
+        saveload::set_save_dir(PathBuf::from(root)).unwrap();
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let uiw = UiWorld::with_defaults();
+
+        // Disk has newer edits than a city-save snapshot would capture.
+        let newer_settings = Settings {
+            camera_fov: 71.0,
+            ..Settings::default()
+        };
+        newer_settings.save();
+        let mut newer_bindings = Bindings::default();
+        newer_bindings.0.remove(&InputAction::OpenDebugMenu);
+        JSONPretty::save_atomic(&newer_bindings, "bindings").unwrap();
+
+        uiw.save_lot_brush_async()
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(
+            JSONPretty::load::<Settings>("settings").unwrap().camera_fov,
+            71.0
+        );
+        assert!(!JSONPretty::load::<Bindings>("bindings")
+            .unwrap()
+            .0
+            .contains_key(&InputAction::OpenDebugMenu));
+        assert!(saveload::save_dir().join("lot_brush.json").is_file());
+        return;
+    }
+
+    let root = std::env::temp_dir().join(format!(
+        "egr-scale-t1-preferences-{}-{}",
+        std::process::id(),
+        crate::session::snapshot_revision().get()
+    ));
+    fs::create_dir(&root).unwrap();
+    let result = Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", TEST_NAME])
+        .env(SAVE_ROOT, &root)
+        .status();
+    let clean = fs::remove_dir_all(root);
+    assert!(result.unwrap().success());
+    clean.unwrap();
 }
