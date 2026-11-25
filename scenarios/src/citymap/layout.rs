@@ -1305,7 +1305,32 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
             &[hraska_egress],
         );
     }
-    connect_south_walk(&mut plan.graph)
+    let ridge_culdesac = SourceKey::Way {
+        id: 419255437,
+        span: 0,
+    };
+    if let Some(link) = plan.graph.links.get_mut(&ridge_culdesac) {
+        link.class = RoadClass::Walk;
+        plan.graph.record(
+            "keep repeated stationary parking queues off the Hraška cul-de-sac",
+            &[ridge_culdesac],
+        );
+    }
+    connect_south_walk(&mut plan.graph)?;
+    let ridge = SourceKey::Node {
+        id: 4193639670,
+        rail: false,
+    };
+    let park = SourceKey::Authored("hraska-west-park");
+    if plan.graph.junctions.contains_key(&ridge) && plan.graph.junctions.contains_key(&park) {
+        let walk = SourceKey::Authored("hraska-rail-walk");
+        add_authored_road(&mut plan.graph, walk, [ridge, park], RoadClass::Walk, None, 0);
+        plan.graph.record(
+            "link Hraška homes to the eastern shops under the elevated railway",
+            &[ridge, park, walk],
+        );
+    }
+    Ok(())
 }
 
 fn connect_south_walk(graph: &mut Graph) -> Result<(), String> {

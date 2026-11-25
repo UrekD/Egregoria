@@ -239,7 +239,7 @@ fn prepare_opening(
             district: "hraska",
             anchor: at(1950.0, 2200.0),
             houses: 85,
-            infill: if wet { 24 } else { 10 },
+            infill: if wet { 21 } else { 10 },
             retail: 14,
             industry: 6,
         },
@@ -4193,6 +4193,19 @@ mod tests {
         let junction = &map.intersections()[hraska_egress];
         assert_eq!(junction.light_policy, simulation::map::LightPolicy::Lights);
         assert!(!junction.turn_policy.left_turns);
+        let ridge = built.links[&SourceKey::Way { id: 419255436, span: 2 }].road;
+        let park = built.links[&SourceKey::Authored("hraska-park-approach")].road;
+        let west = super::super::layout::design_point(vec2(1502.9, 2293.9), plan.config);
+        let east = super::super::layout::design_point(vec2(1636.0, 2398.0), plan.config);
+        let distance = reach.distance(
+            reach.position(ridge, west).unwrap(),
+            reach.position(park, east).unwrap(),
+        );
+        eprintln!("Hraška ridge to jobs and shops across the railway: {distance:.1} m");
+        assert!(distance <= 200.0,
+            "the Hraška walk past the railway is {distance:.1} m");
+        let culdesac = built.links[&SourceKey::Way { id: 419255437, span: 0 }].road;
+        assert!(map.roads()[culdesac].lanes_iter().all(|(_, kind)| kind == LaneKind::Walking));
         drop(map);
         paint(&mut sim, opening.parcels.iter()).unwrap();
         verify_votes(&sim, opening.parcels.iter()).unwrap();
