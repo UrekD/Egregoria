@@ -10,6 +10,7 @@ pub mod smoke;
 mod transit_basic;
 mod water_basic;
 pub mod water_fixtures;
+mod zones2;
 
 use crate::builders::{grid_city, place_company, place_grid_power_plant, place_service_sites};
 use crate::{Scenario, ScenarioCtx};
@@ -38,6 +39,8 @@ pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     services_neglect::SCENARIO,
     transit_basic::SCENARIO,
     water_basic::SCENARIO,
+    zones2::CITY,
+    zones2::CONTROLLED,
     (
         Scenario {
             name: "smoke",

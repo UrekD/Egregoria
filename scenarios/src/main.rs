@@ -165,6 +165,7 @@ fn run() -> Result<(), String> {
         println!("{}", usage());
         return Ok(());
     }
+    let name = if name == "zones2" { "zones2_city".into() } else { name };
     if matches!(name.as_str(), "perf_scale" | "perf-scale" | "bench-slot") {
         return run_benchmark(&name, args);
     }

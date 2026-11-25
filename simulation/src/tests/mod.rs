@@ -26,6 +26,7 @@ mod p6_water;
 mod test_iso;
 mod vehicles;
 mod zone2_lot_layout;
+mod zones2;
 
 #[test]
 fn w0_water_height_free_change_records_retry_without_mutation() {
