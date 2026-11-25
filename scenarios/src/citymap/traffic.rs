@@ -1,6 +1,6 @@
 //! Transient directed traffic measurements for CITYMAP calibration.
 
-use geom::{Transform, Vec3};
+use geom::{PolyLine3, Transform, Vec3};
 use prototypes::{GameTime, Tick, TICKS_PER_MINUTE, TICKS_PER_REALTIME_SECOND};
 use serde::Serialize;
 use simulation::map::{
@@ -122,6 +122,7 @@ struct Active {
     row: usize,
     destination: Vec3,
     traversal: Option<TraverseKind>,
+    incoming_turn: Option<TurnID>,
     stationary: Option<(u64, Vec3)>,
     panicking: bool,
 }
@@ -160,6 +161,85 @@ struct Standing {
     position: Vec3,
     offset: f32,
     radius: f32,
+}
+
+impl Standing {
+    fn project(mut self, points: &PolyLine3) -> Option<Self> {
+        let (projected, segment) = points.project_segment(self.position);
+        let delta = self.position - projected;
+        // Extend the endpoint tangent to keep the signed distance across the
+        // turn/lane boundary. A clamped projection loses the rear footprint.
+        let beyond = if projected == points.last() {
+            delta.dot(points.last_dir()?).max(0.0)
+        } else if projected == points.first() {
+            delta.dot(points.first_dir()?).min(0.0)
+        } else {
+            0.0
+        };
+        if delta.mag2() - beyond * beyond > 1.0 {
+            return None;
+        }
+        let prior = segment.saturating_sub(1);
+        self.offset = points.as_slice()[..=prior]
+            .windows(2)
+            .map(|pair| pair[0].distance(pair[1]))
+            .sum::<f32>()
+            + points.as_slice()[prior].distance(projected)
+            + beyond;
+        Some(self)
+    }
+
+    fn on_lane(self, points: &PolyLine3) -> Option<Self> {
+        self.project(points)
+            .filter(|standing| (0.0..=points.length()).contains(&standing.offset))
+    }
+
+    fn overlapping_turn(self, map: &Map, turn: TurnID) -> Option<StandingTurn> {
+        let points = &map
+            .intersections()
+            .get(turn.parent)?
+            .find_turn(turn)?
+            .points;
+        let standing = self.project(points)?;
+        let to_exit = points.length() - standing.offset;
+        (standing.offset + standing.radius > 0.0 && to_exit + standing.radius > 0.0).then_some(
+            StandingTurn {
+                turn,
+                to_exit,
+                standing,
+            },
+        )
+    }
+}
+
+struct StandingTurn {
+    turn: TurnID,
+    to_exit: f32,
+    standing: Standing,
+}
+
+#[derive(Default)]
+struct TrafficSample {
+    lanes: BTreeMap<LaneID, Vec<Standing>>,
+    turns: Vec<StandingTurn>,
+    speed_sum: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, Serialize)]
+pub(super) struct CutoffQueues {
+    pub stop_line_vehicles: usize,
+    pub midblock_vehicles: usize,
+    pub conflict_vehicles: usize,
+    pub waiting_entries: usize,
+}
+
+impl CutoffQueues {
+    pub fn is_clear(self) -> bool {
+        self.stop_line_vehicles == 0
+            && self.midblock_vehicles == 0
+            && self.conflict_vehicles == 0
+            && self.waiting_entries == 0
+    }
 }
 
 struct Blockage {
@@ -292,6 +372,7 @@ impl TrafficCollector {
                     row: index,
                     destination: prepared.destination,
                     traversal: None,
+                    incoming_turn: None,
                     stationary: None,
                     panicking: false,
                 },
@@ -355,51 +436,83 @@ impl TrafficCollector {
         }
     }
 
-    fn sample(&mut self, sim: &Simulation, now: u64) {
-        let map = sim.map();
-        let mut lanes: BTreeMap<LaneID, Vec<Standing>> = BTreeMap::new();
-        let mut turns = Vec::new();
+    fn traffic_sample(&self, sim: &Simulation, map: &Map) -> TrafficSample {
+        let mut sample = TrafficSample::default();
         for (&id, active) in &self.active {
             let vehicle = &sim.world().vehicles[id];
-            self.occupancy.speed_observations += 1;
-            self.occupancy.speed_sum += f64::from(vehicle.speed.0);
+            sample.speed_sum += f64::from(vehicle.speed.0);
             if vehicle.speed.0.abs() > STOP_SPEED {
                 continue;
             }
-            let Some(traverse) = vehicle.it.get_travers() else {
+            let Some(traverse) = vehicle
+                .it
+                .get_travers()
+                .map(|span| span.kind)
+                .or(active.traversal)
+            else {
                 continue;
             };
-            let Some(points) = traverse.raw_points(&map) else {
-                continue;
-            };
-            let position = vehicle.trans.pos;
-            let (projected, segment) = points.project_segment(position);
-            // The itinerary can switch spans just before crossing the boundary.
-            // Require the collider to be on the span before using its arc length.
-            if projected.distance2(position) > 1.0 {
-                continue;
-            }
-            let prior = segment.saturating_sub(1);
             let standing = Standing {
                 id,
-                position,
-                offset: points.as_slice()[..=prior]
-                    .windows(2)
-                    .map(|pair| pair[0].distance(pair[1]))
-                    .sum::<f32>()
-                    + points.as_slice()[prior].distance(projected),
-                radius: self.records[active.row].spec.vehicle_kind.width() * 0.5,
+                position: vehicle.trans.pos,
+                offset: 0.0,
+                radius: vehicle.vehicle.kind.width() * 0.5,
             };
-            match traverse.kind {
-                TraverseKind::Lane(lane) => lanes.entry(lane).or_default().push(standing),
-                TraverseKind::Turn(turn) => turns.push((turn, points.length(), standing)),
+            let (conflict, lanes) = match traverse {
+                TraverseKind::Lane(lane) => (
+                    active.incoming_turn.filter(|turn| turn.dst == lane),
+                    [Some(lane), None],
+                ),
+                TraverseKind::Turn(turn) => (Some(turn), [Some(turn.dst), Some(turn.src)]),
+            };
+            if let Some(on_turn) = conflict.and_then(|turn| standing.overlapping_turn(map, turn)) {
+                sample.turns.push(on_turn);
+            } else if let Some((lane, on_lane)) = lanes
+                .into_iter()
+                .flatten()
+                .find_map(|lane| Some((lane, standing.on_lane(&map.lanes().get(lane)?.points)?)))
+            {
+                sample.lanes.entry(lane).or_default().push(on_lane);
             }
         }
+        for vehicles in sample.lanes.values_mut() {
+            vehicles.sort_by(|a, b| b.offset.total_cmp(&a.offset).then(a.id.cmp(&b.id)));
+        }
+        sample
+    }
+
+    /// Snapshot the current physical state without altering the periodic metrics.
+    pub(super) fn cutoff_queues(&self, sim: &Simulation) -> CutoffQueues {
+        let map = sim.map();
+        let sample = self.traffic_sample(sim, &map);
+        let mut queues = CutoffQueues {
+            conflict_vehicles: sample.turns.len(),
+            waiting_entries: self.waiting.len(),
+            ..CutoffQueues::default()
+        };
+        for (lane, vehicles) in sample.lanes {
+            let stop_line = map.lanes()[lane].points.length();
+            let stop_count = queue_tail(stop_line, vehicles.iter().map(|v| (v.offset, v.radius)))
+                .map_or(0, |(_, _, count)| count);
+            queues.stop_line_vehicles += stop_count;
+            queues.midblock_vehicles += vehicles.len() - stop_count;
+        }
+        queues
+    }
+
+    fn sample(&mut self, sim: &Simulation, now: u64) {
+        let map = sim.map();
+        let TrafficSample {
+            lanes,
+            mut turns,
+            speed_sum,
+        } = self.traffic_sample(sim, &map);
+        self.occupancy.speed_observations += self.active.len() as u64;
+        self.occupancy.speed_sum += speed_sum;
 
         let mut queues = BTreeMap::new();
-        for (lane, vehicles) in &mut lanes {
-            vehicles.sort_by(|a, b| b.offset.total_cmp(&a.offset).then(a.id.cmp(&b.id)));
-            let stop_line = map.lanes()[*lane].points.length();
+        for (lane, vehicles) in lanes {
+            let stop_line = map.lanes()[lane].points.length();
             let Some((reach, tail, count)) =
                 queue_tail(stop_line, vehicles.iter().map(|v| (v.offset, v.radius)))
             else {
@@ -408,27 +521,32 @@ impl TrafficCollector {
             self.occupancy.last_queued_tick = Some(now);
             if reach > self.occupancy.max_queue_m {
                 self.occupancy.max_queue_m = reach;
-                self.occupancy.max_queue_lane = Some(*lane);
+                self.occupancy.max_queue_lane = Some(lane);
                 self.occupancy.max_queue_tick = Some(now);
             }
             self.occupancy.max_queue_vehicles = self.occupancy.max_queue_vehicles.max(count);
-            queues.insert(*lane, (vehicles[0], tail));
+            queues.insert(lane, (vehicles[0], tail));
         }
 
         let mut observed = BTreeSet::new();
         let seconds = sim.read::<GameTime>().seconds;
         // Sort frontmost first if more than one car is standing on a turn.
         turns.sort_by(|a, b| {
-            a.0.cmp(&b.0)
-                .then(b.2.offset.total_cmp(&a.2.offset))
-                .then(a.2.id.cmp(&b.2.id))
+            a.turn
+                .cmp(&b.turn)
+                .then(a.to_exit.total_cmp(&b.to_exit))
+                .then(a.standing.id.cmp(&b.standing.id))
         });
-        for (turn, length, turn_vehicle) in turns {
+        for StandingTurn {
+            turn,
+            to_exit,
+            standing: turn_vehicle,
+        } in turns
+        {
             let Some(&(head, tail)) = queues.get(&turn.dst) else {
                 continue;
             };
-            let remaining = length - turn_vehicle.offset;
-            if remaining <= 0.5 || !blocks_entry(tail, (remaining - turn_vehicle.radius).max(0.0)) {
+            if !blocks_entry(tail, to_exit - turn_vehicle.radius) {
                 continue;
             }
             let key = (turn.dst, turn);
@@ -460,12 +578,6 @@ impl TrafficCollector {
         self.blockages.retain(|key, _| observed.contains(key));
     }
 
-    pub(super) fn queue_recent(&self, now: u64) -> bool {
-        self.occupancy
-            .last_queued_tick
-            .is_some_and(|tick| now - tick < SAMPLE_TICKS)
-    }
-
     pub fn finish(mut self) -> (Vec<TripRecord>, Occupancy) {
         self.occupancy.mean_speed_mps = (self.occupancy.speed_observations > 0)
             .then(|| self.occupancy.speed_sum / self.occupancy.speed_observations as f64);
@@ -485,6 +597,15 @@ fn track_motion(
 ) -> bool {
     let traverse = vehicle.it.get_travers();
     let traversal = traverse.map(|t| t.kind);
+    match traversal {
+        Some(TraverseKind::Turn(turn)) => active.incoming_turn = Some(turn),
+        Some(TraverseKind::Lane(lane))
+            if active.incoming_turn.is_some_and(|turn| turn.dst != lane) =>
+        {
+            active.incoming_turn = None;
+        }
+        _ => {}
+    }
     if active.traversal != traversal
         && traverse.is_none_or(|part| {
             part.raw_points(map)
@@ -546,7 +667,7 @@ fn queue_tail(
 }
 
 fn blocks_entry(tail: f32, turn_front_to_entry: f32) -> bool {
-    tail.max(0.0) + turn_front_to_entry <= QUEUE_GAP
+    (tail + turn_front_to_entry).max(0.0) <= QUEUE_GAP
 }
 
 pub(super) fn scored_delay(
@@ -633,6 +754,189 @@ mod tests {
             episode.observe(STUCK_TICKS + 2 * SAMPLE_TICKS, moved, tail, true),
             Some((0, false))
         );
+    }
+
+    fn standing_vehicle(
+        sim: &mut Simulation,
+        collector: &mut TrafficCollector,
+        lane: LaneID,
+        offset: f32,
+        goal: LaneOffset,
+    ) -> VehicleID {
+        let key = collector.records.len() as u32;
+        let spec = TripSpec {
+            key,
+            departure_tick: sim.get_tick(),
+            vehicle_kind: VehicleKind::Car,
+            origin_lane_offset: LaneOffset {
+                lane,
+                metres: offset,
+            },
+            destination_lane_offset: goal,
+        };
+        let prepared = Prepared::new(&sim.map(), spec).unwrap();
+        let id = spawn_driving_vehicle(sim, spec.vehicle_kind, prepared.pose).unwrap();
+        sim.world_mut_unchecked().vehicles[id].it = prepared.itinerary;
+        collector.records.push(TripRecord {
+            spec,
+            status: TripStatus::Active,
+            admitted_tick: Some(sim.get_tick()),
+            arrival_tick: None,
+            free_flow_ticks: None,
+            failure: None,
+        });
+        collector.active.insert(
+            id,
+            Active {
+                row: key as usize,
+                destination: prepared.destination,
+                traversal: None,
+                incoming_turn: None,
+                stationary: None,
+                panicking: false,
+            },
+        );
+        id
+    }
+
+    #[test]
+    fn cm0_blocked_exit_spans_turn_to_lane_handoff() {
+        for centre_after_exit in [-0.75_f32, -0.25, 0.25, 3.0] {
+            let (mut sim, source, goal) = super::super::spacing::cm0_boundary_fixture();
+            let mut collector = TrafficCollector::new(Vec::new(), true).unwrap();
+            let mut schedule = Simulation::schedule();
+            let id = standing_vehicle(
+                &mut sim,
+                &mut collector,
+                source,
+                20.0,
+                LaneOffset {
+                    lane: goal,
+                    metres: 38.0,
+                },
+            );
+            let turn = (0..3000)
+                .find_map(|_| {
+                    sim.tick(&mut schedule, []);
+                    collector.observe(&mut sim);
+                    match sim.get(id)?.it.get_travers()?.kind {
+                        TraverseKind::Turn(turn) => Some(turn),
+                        _ => None,
+                    }
+                })
+                .unwrap();
+            if centre_after_exit > 0.0 {
+                assert!((0..3000).any(|_| {
+                    sim.tick(&mut schedule, []);
+                    collector.observe(&mut sim);
+                    sim.get(id).unwrap().it.get_travers().unwrap().kind
+                        == TraverseKind::Lane(turn.dst)
+                }));
+            }
+            let (position, length) = {
+                let map = sim.map();
+                let points = &map.intersections()[turn.parent]
+                    .find_turn(turn)
+                    .unwrap()
+                    .points;
+                let lane = &map.lanes()[turn.dst].points;
+                let position = if centre_after_exit < 0.0 {
+                    points.point_along(points.length() + centre_after_exit)
+                } else {
+                    lane.point_along(centre_after_exit)
+                };
+                (position, lane.length())
+            };
+            let gaps = ((length - 7.9) / 5.3).ceil() as usize;
+            for index in 0..=gaps {
+                let offset = 5.1 + (length - 7.9) * index as f32 / gaps as f32;
+                standing_vehicle(
+                    &mut sim,
+                    &mut collector,
+                    turn.dst,
+                    offset,
+                    LaneOffset {
+                        lane: turn.dst,
+                        metres: length,
+                    },
+                );
+            }
+            let vehicle = &mut sim.world_mut_unchecked().vehicles[id];
+            vehicle.trans.pos = position;
+            vehicle.speed.0 = 0.0;
+            let start = sim.get_tick().next_multiple_of(SAMPLE_TICKS);
+            for offset in (0..=STUCK_TICKS).step_by(SAMPLE_TICKS as usize) {
+                collector.sample(&sim, start + offset);
+            }
+            let queues = collector.cutoff_queues(&sim);
+            assert_eq!(
+                queues.conflict_vehicles,
+                usize::from(centre_after_exit < 2.25)
+            );
+            let (_, occupancy) = collector.finish();
+            assert_eq!(
+                occupancy.blocking_20m_episodes,
+                u32::from(centre_after_exit < 2.25),
+                "vehicle centre {centre_after_exit} m past exit"
+            );
+        }
+    }
+
+    #[test]
+    fn cm0_cutoff_detects_both_queue_transitions_after_the_periodic_sample() {
+        let (mut sim, lane, _) = super::super::spacing::cm0_boundary_fixture();
+        let length = sim.map().lanes()[lane].points.length();
+        let mut collector = TrafficCollector::new(Vec::new(), true).unwrap();
+        let id = standing_vehicle(
+            &mut sim,
+            &mut collector,
+            lane,
+            length - 3.0,
+            LaneOffset {
+                lane,
+                metres: length,
+            },
+        );
+        let first_tick = sim.get_tick().next_multiple_of(SAMPLE_TICKS);
+        let mut sample_tick = first_tick;
+        let actual = [(0.0, 1.0), (1.0, 0.0)].map(|(sample_speed, cutoff_speed)| {
+            sample_tick += SAMPLE_TICKS;
+            sim.world_mut_unchecked().vehicles[id].speed.0 = sample_speed;
+            collector.sample(&sim, sample_tick);
+            sim.world_mut_unchecked().vehicles[id].speed.0 = cutoff_speed;
+            sim.write::<GameTime>().tick = Tick(sample_tick + 11);
+            let cutoff = collector.cutoff_queues(&sim);
+            assert_eq!(cutoff.stop_line_vehicles, usize::from(cutoff_speed == 0.0));
+            cutoff.is_clear()
+        });
+        assert_eq!(actual, [true, false]);
+    }
+
+    #[test]
+    fn cm0_cutoff_counts_midblock_stops_and_entry_backlog() {
+        let (mut sim, source, goal) = super::super::spacing::cm0_boundary_fixture();
+        let spec = TripSpec {
+            key: 0,
+            departure_tick: sim.get_tick(),
+            vehicle_kind: VehicleKind::Car,
+            origin_lane_offset: LaneOffset {
+                lane: source,
+                metres: 20.0,
+            },
+            destination_lane_offset: LaneOffset {
+                lane: goal,
+                metres: 38.0,
+            },
+        };
+        let mut collector =
+            TrafficCollector::new(vec![spec, TripSpec { key: 1, ..spec }], true).unwrap();
+        collector.release(&mut sim);
+        let cutoff = collector.cutoff_queues(&sim);
+        assert_eq!(cutoff.stop_line_vehicles, 0);
+        assert_eq!(cutoff.midblock_vehicles, 1);
+        assert_eq!(cutoff.conflict_vehicles, 0);
+        assert_eq!(cutoff.waiting_entries, 1);
+        assert!(!cutoff.is_clear());
     }
 
     #[test]
