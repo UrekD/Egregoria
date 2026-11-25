@@ -1,3 +1,4 @@
+-- Industrial fleets cover nominal daily output in four trips (see companies.lua).
 local function low_shop_recipe()
     return {
         consumption = {{"goods", 2}},
@@ -20,7 +21,7 @@ local growables = {
         growable = true,
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 18,
         dispatch_min_units = 8,
         n_workers = 18,
         water_consumption = 12,
@@ -92,7 +93,7 @@ local growables = {
         growable = true,
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 27,
         dispatch_min_units = 8,
         n_workers = 27,
         water_consumption = 18,
@@ -169,7 +170,7 @@ local growables = {
         growable = true,
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 36,
         dispatch_min_units = 8,
         n_workers = 36,
         water_consumption = 24,

@@ -183,16 +183,9 @@ pub fn company_soul(
         || (proto.id.is_growable() && sim.read::<CargoBook>().growable_freight)
     {
         trucks.extend((0..proto.n_trucks).map(|_| spawn_truck_at_depot(sim, door_pos)));
-    } else if proto.kind == CompanyKind::Factory && !proto.id.is_growable() {
-        for _ in 0..proto.n_trucks {
-            trucks.extend(spawn_parked_vehicle(sim, VehicleKind::Truck, door_pos))
-        }
-        if trucks.len() as u32 != proto.n_trucks {
-            for truck in trucks {
-                sim.write::<ParCommandBuffer<VehicleEnt>>().kill(truck);
-            }
-            return None;
-        }
+    } else if proto.kind == CompanyKind::Factory && !proto.id.is_growable() && proto.n_trucks > 0 {
+        trucks.push(spawn_parked_vehicle(sim, VehicleKind::Truck, door_pos)?);
+        trucks.extend((1..proto.n_trucks).map(|_| spawn_truck_at_depot(sim, door_pos)));
     }
 
     let comp = GoodsCompanyState {
@@ -291,6 +284,23 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
         });
 
         let proto = c.comp.proto.prototype();
+        if proto.storage.is_none()
+            && !c.comp.trucks.is_empty()
+            && (c.comp.trucks.len() as u32) < proto.n_trucks
+        {
+            // Existing companies keep their trucks and receive any new slots at the depot.
+            let missing = proto.n_trucks - c.comp.trucks.len() as u32;
+            let door = b.door_pos;
+            cbuf.exec_ent(me, move |sim| {
+                if !sim.world.companies.contains_key(me) {
+                    return;
+                }
+                let trucks: Vec<_> = (0..missing)
+                    .map(|_| spawn_truck_at_depot(sim, door))
+                    .collect();
+                sim.world.companies[me].comp.trucks.extend(trucks);
+            });
+        }
 
         // Keep already-settled legacy dispatches from a pre-batching snapshot.
         // New physical matches live in CargoBook. Virtual matches finish at the market.
@@ -376,7 +386,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             }
         }
         if proto.storage.is_some() {
-            assign_warehouse_drivers(c, &mut world.humans, &world.vehicles);
+            assign_fleet_drivers(c, &mut world.humans, &world.vehicles);
             return;
         }
         if c.comp.driver.is_some_and(|driver| {
@@ -393,40 +403,9 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
         }) {
             c.comp.driver = None;
         }
-        if c.comp.driver.is_none() && proto.kind == CompanyKind::Factory {
-            let truck = c
-                .comp
-                .trucks
-                .iter()
-                .copied()
-                .filter(|&id| world.vehicles.contains_key(id))
-                .min();
-            let driver = c
-                .workers
-                .0
-                .iter()
-                .copied()
-                .filter(|&id| {
-                    world
-                        .humans
-                        .get(id)
-                        .and_then(|human| human.work.as_ref())
-                        .is_some_and(|work| {
-                            work.workplace == c.comp.building
-                                && matches!(work.kind, WorkKind::Worker)
-                        })
-                })
-                .min();
-            if let Some((truck, driver)) = truck.zip(driver) {
-                world.humans.edit(driver, |human| {
-                    human.work.as_mut().unwrap().kind = WorkKind::Driver {
-                        truck,
-                        deliver_order: None,
-                        load: None,
-                    };
-                });
-                c.comp.driver = Some(driver);
-            }
+        if proto.kind == CompanyKind::Factory && (c.comp.driver.is_none() || proto.n_trucks > 1) {
+            let driver = assign_fleet_drivers(c, &mut world.humans, &world.vehicles);
+            c.comp.driver = c.comp.driver.or(driver);
         }
 
         if let Some(driver) = c.comp.driver.filter(|_| !c.sold.0.is_empty()) {
@@ -454,12 +433,12 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
     });
 }
 
-/// Pairs idle warehouse staff with trucks that have no driver, both in ID order.
-fn assign_warehouse_drivers(
+/// Pairs idle staff with trucks that have no driver, both in ID order.
+fn assign_fleet_drivers(
     company: &CompanyEnt,
     humans: &mut HumanStorage,
     vehicles: &slotmapd::HopSlotMap<VehicleID, VehicleEnt>,
-) {
+) -> Option<HumanID> {
     let building = company.comp.building;
     let work_at = |worker: HumanID| {
         humans
@@ -479,7 +458,12 @@ fn assign_warehouse_drivers(
         .0
         .iter()
         .filter_map(|&worker| match work_at(worker)?.kind {
-            WorkKind::Driver { truck, .. } => Some(truck),
+            WorkKind::Driver { truck, .. }
+                if company.comp.trucks.contains(&truck) && vehicles.contains_key(truck) =>
+            {
+                Some((truck, worker))
+            }
+            WorkKind::Driver { .. } => None,
             WorkKind::Worker => None,
         })
         .collect();
@@ -488,11 +472,13 @@ fn assign_warehouse_drivers(
         .trucks
         .iter()
         .copied()
-        .filter(|&truck| vehicles.contains_key(truck) && !driven.contains(&truck))
+        .filter(|&truck| vehicles.contains_key(truck) && !driven.iter().any(|&(id, _)| id == truck))
         .collect();
     idle.sort_unstable();
     trucks.sort_unstable();
+    let mut first = driven.iter().map(|&(_, driver)| driver).min();
     for (worker, truck) in idle.into_iter().zip(trucks) {
+        first = Some(first.map_or(worker, |driver| driver.min(worker)));
         humans.edit(worker, |human| {
             human.work.as_mut().unwrap().kind = WorkKind::Driver {
                 truck,
@@ -501,4 +487,5 @@ fn assign_warehouse_drivers(
             };
         });
     }
+    first
 }

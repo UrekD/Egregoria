@@ -1,3 +1,5 @@
+-- Plan four trips per ten-hour shift: 2 x 1 km at 8 m/s plus 30 s handling.
+-- Fleet payload per trip covers the full-staff recipe's daily output / 4.
 data:extend {
     {
         type = "goods-company",
@@ -32,8 +34,8 @@ data:extend {
             vertical_factor = 0.6,
         },
         kind = "factory",
-        n_trucks = 1,
-        cargo_capacity_units = 16,
+        n_trucks = 2,
+        cargo_capacity_units = 54,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -56,7 +58,7 @@ data:extend {
         bgen = "farm",
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 54,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -178,7 +180,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -205,7 +207,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -232,7 +234,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -259,7 +261,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -311,7 +313,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -359,7 +361,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -407,7 +409,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -434,7 +436,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -461,7 +463,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -485,7 +487,7 @@ data:extend {
         bgen = "farm",
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -512,7 +514,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -561,7 +563,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -588,7 +590,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -611,7 +613,7 @@ data:extend {
         bgen = "farm",
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -637,7 +639,7 @@ data:extend {
         },
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 24,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
@@ -660,7 +662,7 @@ data:extend {
         bgen = "farm",
         kind = "factory",
         n_trucks = 1,
-        cargo_capacity_units = 16,
+        cargo_capacity_units = 2160,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
