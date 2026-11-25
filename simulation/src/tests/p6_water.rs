@@ -1,7 +1,7 @@
 use crate::map::{
-    BuildingKind, Density, LanePatternBuilder, MapProject, TerraformKind, TerrainChunkID,
-    UpdateType, WaterBasin, WaterBodyId, WaterDirtyChunks, WaterEdit, WaterEditError, WaterStroke,
-    ZoneGrid, ZoneKind, ZonePaintError,
+    BuildingKind, ConnectionError, Density, LanePatternBuilder, MapProject, TerraformKind,
+    TerrainChunkID, UpdateType, WaterBasin, WaterBodyId, WaterDirtyChunks, WaterEdit, WaterEditError,
+    WaterStroke, WaterTileCoord, ZoneGrid, ZoneKind, ZonePaintError,
 };
 use crate::map_dynamic::{EnvGrid, UtilityFlow};
 use crate::world_command::{CommandOutcomes, Rejection};
@@ -150,7 +150,6 @@ fn p6_water_rejects_special_building_on_water() {
 }
 
 #[test]
-#[ignore = "W2a implements elevated crossings over water"]
 fn p6_water_elevated_crossing_connects_opposite_banks() {
     use crate::map::{PathKind, ROAD_Z_OFFSET};
     use crate::map_dynamic::Itinerary;
@@ -514,7 +513,12 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
                 (0, Ok(())),
                 (
                     1,
-                    Err(("MapMakeMultipleConnections", Rejection::WetFootprint))
+                    Err((
+                        "MapMakeMultipleConnections",
+                        Rejection::WaterConnection(ConnectionError::WetAnchor(WaterTileCoord(
+                            418, 82,
+                        ))),
+                    ))
                 )
             ]
         );

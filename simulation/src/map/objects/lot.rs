@@ -35,6 +35,7 @@ pub enum LotLayout {
 pub const UNIFORM_LOT_SIZE: f32 = 30.0;
 pub(crate) const MAX_LOT_SIZE: f32 = 40.0;
 pub(crate) const FRONTAGE_HEIGHT_TOLERANCE_M: f32 = 1.0;
+const FRONTAGE_DISTANCE_EPSILON_M: f32 = 0.01;
 pub(crate) const MIN_LOT_SIZE: f32 = 20.0;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -295,10 +296,11 @@ impl Lot {
                     if !usable(index, edge.min(t), edge.max(t))? {
                         return Ok(false);
                     }
-                    if left <= (edge - t).abs() * length || (edge > 0.0 && edge < 1.0) {
+                    let covered = (edge - t).abs() * length;
+                    if left <= covered || (edge > 0.0 && edge < 1.0) {
                         break;
                     }
-                    left -= (edge - t).abs() * length;
+                    left -= covered;
                 }
                 if backwards && index > 0 {
                     index -= 1;
@@ -306,6 +308,10 @@ impl Lot {
                 } else if !backwards && index + 2 < points.n_points() {
                     index += 1;
                     t = 0.0;
+                } else if left <= FRONTAGE_DISTANCE_EPSILON_M {
+                    // Reversing a deck during a merge can round a projection
+                    // slightly differently at the same junction.
+                    break;
                 } else {
                     return Ok(false);
                 }
