@@ -3,7 +3,7 @@ use super::normalize::{ring_area, ring_center};
 use super::spatial::{point_bounds, points_bounds, BoundsIndex, PolygonWork};
 use super::{Feature, ImportReport, LinkClass, NormalizedCity, LESCE_BOUNDS};
 use geom::{Intersect, Polygon, Shape, Vec2, AABB, OBB};
-use prototypes::{try_prototype, GrowableCompanyID, GrowableCompanyPrototype};
+use prototypes::GrowableCompanyPrototype;
 use simulation::map::import::ImportedNetwork;
 use simulation::map::{
     BuildingID, BuildingKind, Density, LaneKind, LotID, Map, ProjectFilter, ProjectKind, RoadID,
@@ -425,10 +425,10 @@ fn seed_job(sim: &mut Simulation, id: LotID, kind: ZoneKind) -> Option<usize> {
                     .map(|(building, _)| (building, lot.shape, density))
             })?
     };
-    let proto = try_prototype(GrowableCompanyID::from(building.as_goods_company()?))?;
-    sim.seed_imported_growable(id, building, density)?;
+    building.as_goods_company()?;
+    let placed = sim.seed_imported_growable_with_slots(id, building, density)?;
     paint(sim, shape, kind, density).ok()?;
-    Some(proto.base.n_workers as usize)
+    Some(placed.job_slots as usize)
 }
 
 fn seed_synthetic_jobs(

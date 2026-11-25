@@ -3,16 +3,19 @@ use crate::economy::{Budget, BudgetCategory, Government};
 use crate::init::INIT_FUNCS;
 use crate::map::{
     BuildingID, BuildingKind, Density, IntersectionID, LaneKind, LanePattern, LightPolicy, Lot,
-    LotID, Map, RoadID, RoadSegmentKind, RoundaboutPolicy, ROAD_Z_OFFSET,
+    LotID, Map, RoadID, RoadSegmentKind, RoundaboutPolicy, ZoneCell, ZoneKind, ROAD_Z_OFFSET,
 };
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{growth, residence};
 use crate::world_command::WorldCommand;
-use crate::{MapPreset, NewGameOptions, Simulation, SimulationOptions};
+use crate::{MapPreset, NewGameOptions, PlacedGrowable, Simulation, SimulationOptions};
 use geom::{Vec2, Vec3, OBB};
-use prototypes::{BuildingGen, Money};
+use prototypes::{try_prototype, BuildingGen, GrowableCompanyID, GrowableZoneKind, Money};
 use std::collections::BTreeMap;
 use std::ptr::addr_of;
+
+#[path = "objects/growable_shell.rs"]
+pub(crate) mod growable_shell;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ImportedCity {
@@ -142,17 +145,39 @@ impl Simulation {
         kind: BuildingKind,
         density: Density,
     ) -> Option<BuildingID> {
-        let home = if kind == BuildingKind::House {
-            Some(residence::prototype(density, 1)?)
-        } else {
-            None
+        self.seed_imported_growable_with_slots(lot, kind, density)
+            .map(|placed| placed.building)
+    }
+
+    /// Seed a pure frontage growable and report its committed housing and job slots.
+    pub fn seed_imported_growable_with_slots(
+        &mut self,
+        lot: LotID,
+        kind: BuildingKind,
+        density: Density,
+    ) -> Option<PlacedGrowable> {
+        let zone = match kind {
+            BuildingKind::House => ZoneKind::Residential,
+            BuildingKind::GoodsCompany(id) => {
+                let company = try_prototype(GrowableCompanyID::from(id))?;
+                let GrowableZoneKind::Pure(zone) = company.chain_key().zone_kind else {
+                    return None;
+                };
+                zone
+            }
+            _ => return None,
         };
-        let id = self.map_mut().place_growable(lot, kind)?;
-        growth::on_growable_placed(self, id, kind);
-        if let Some(home) = home.filter(|home| home.density != Density::Low) {
-            residence::register(self, id, home);
+        let cell = ZoneCell {
+            kind: zone,
+            density,
+        };
+        {
+            let map = self.map();
+            if growth::growable_that_fits(map.get(lot)?, cell).ok()?.kind != kind {
+                return None;
+            }
         }
-        Some(id)
+        self.place_zoned_growable(lot, cell).ok()
     }
 
     /// Seed a mapped residence whose parcel is outside the generated frontage lots.
@@ -162,7 +187,9 @@ impl Simulation {
         road: RoadID,
         density: Density,
     ) -> Option<BuildingID> {
-        let home = residence::prototype(density, 1)?;
+        let home = prototypes::prototypes()
+            .legacy_residence(density, 1)
+            .or_else(|| residence::prototype(density, 1))?;
         let id = self.map_mut().build_special_building(
             &shape,
             BuildingKind::House,
