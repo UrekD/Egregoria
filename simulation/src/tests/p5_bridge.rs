@@ -634,8 +634,69 @@ fn wet_crossing_indexed_replay_keeps_the_accepted_bridge() {
         let outcomes = sim.read::<CommandOutcomes>();
         assert!(outcomes.link_outcomes(0)[0].1.is_err());
         assert!(outcomes.link_outcomes(0)[1].1.is_ok());
+        let details = outcomes.connection_batch(0).unwrap();
+        assert!(details.links[0].is_err());
+        let [road] = details.links[1].as_ref().unwrap().as_slice() else {
+            panic!("one live crossing road");
+        };
+        let map = sim.map();
+        let crossing = &map.roads[*road];
+        assert_eq!(
+            details.projects,
+            [Some(crossing.src), Some(crossing.dst), None]
+        );
     }
     assert_eq!(sim.read::<Replay>().command_count(), commands_before + 1);
+
+    let (old, joint, deck) = {
+        let map = sim.map();
+        let outcomes = sim.read::<CommandOutcomes>();
+        let old = outcomes.connection_batch(0).unwrap().links[1]
+            .as_ref()
+            .unwrap()[0];
+        let bridge = &map.roads[old];
+        (
+            old,
+            bridge.dst,
+            bridge.points().project_2d(vec2(2256.0, 2304.0)),
+        )
+    };
+    let pattern = LanePatternBuilder::default().build();
+    let split_and_extend = WorldCommand::MapMakeMultipleConnections(
+        vec![
+            MapProject {
+                kind: ProjectKind::Road(old),
+                pos: deck,
+            },
+            MapProject::ground(vec3(2112.0, 2184.0, ground)),
+            MapProject {
+                kind: ProjectKind::Intersection(joint),
+                pos: end.z(ground),
+            },
+            MapProject::ground(vec3(2592.0, 2304.0, ground)),
+        ],
+        vec![(1, 0, None, pattern.clone()), (2, 3, None, pattern)],
+    );
+    sim.apply_commands([&split_and_extend]);
+    {
+        let map = sim.map();
+        let outcomes = sim.read::<CommandOutcomes>();
+        let details = outcomes.connection_batch(0).unwrap();
+        let split = details.projects[0].expect("the bridge split junction is live");
+        let far = details.projects[3].expect("the extension terminal is live");
+        let [spur] = details.links[0].as_ref().unwrap().as_slice() else {
+            panic!("one live spur");
+        };
+        let [merged] = details.links[1].as_ref().unwrap().as_slice() else {
+            panic!("one live bridge extension");
+        };
+        assert!(!map.roads.contains_key(old));
+        assert!(!map.intersections.contains_key(joint));
+        assert!(details.projects[2].is_none());
+        assert_eq!(map.roads[*spur].other_end(split), details.projects[1]);
+        assert_eq!(map.roads[*merged].other_end(split), Some(far));
+    }
+    assert_eq!(sim.read::<Replay>().command_count(), commands_before + 2);
 
     let replay = sim.read::<Replay>().clone();
     let (mut loaded, mut loader) = Simulation::try_from_replay(replay).unwrap();
@@ -715,4 +776,303 @@ fn wet_crossing_bed_change_moves_supports_with_fixed_ids_and_deck() {
     assert!(map.intersections.contains_key(junction));
     assert_eq!(map.roads[road].lanes_iter().collect::<Vec<_>>(), lanes);
     assert!(support.take_updated_chunks().next().is_some());
+}
+
+#[test]
+fn w2a_fix_load_validates_saved_deck_clips() {
+    let mut map = wet_crossing_map();
+    let (_, id) = map
+        .make_connection(
+            MapProject::ground(vec3(80.0, 256.0, 4.0)),
+            MapProject::ground(vec3(432.0, 256.0, 4.0)),
+            None,
+            &LanePatternBuilder::default().build(),
+        )
+        .unwrap();
+    let point = map.roads[id].interfaced_points.first();
+    map.roads[id].interfaced_points = PolyLine3::new(vec![point]);
+    assert!(Bincode::decode::<Map>(&Bincode::encode(&map).unwrap()).is_ok());
+
+    for invalid in [
+        vec![],
+        vec![point.up(f32::NAN)],
+        vec![point, point.up(f32::MAX)],
+    ] {
+        // Only serialize the malformed record. No polyline geometry methods are called on it.
+        map.roads[id].interfaced_points = unsafe { PolyLine3::new_unchecked(invalid) };
+        let bytes = Bincode::encode(&map).unwrap();
+        assert!(Bincode::decode::<Map>(&bytes).is_err());
+    }
+}
+
+#[test]
+fn w2a_fix_preview_and_legacy_destination_follow_shallow_merges() {
+    let pattern = LanePatternBuilder::default().build();
+    for reverse in [false, true] {
+        let mut map = wet_crossing_map();
+        let [from, shared, far] = [80.0, 384.0, 480.0]
+            .map(|x| MapProject::ground(vec3(if reverse { 512.0 - x } else { x }, 256.0, 4.0)));
+        let (joint, _) = map.make_connection(far, shared, None, &pattern).unwrap();
+        let shared = MapProject {
+            kind: ProjectKind::Intersection(joint),
+            ..shared
+        };
+        let preview = map
+            .preview_connection(from, shared, None, &pattern)
+            .unwrap();
+        let (destination, road) = map.make_connection(from, shared, None, &pattern).unwrap();
+        assert!(!map.intersections.contains_key(joint));
+        assert_eq!(map.intersections[destination].pos, far.pos);
+        assert_eq!(
+            point_bits(&preview.deck),
+            point_bits(map.roads[road].interfaced_points())
+        );
+        assert_eq!(preview.junctions.len(), 2);
+    }
+}
+
+#[test]
+fn w2a_fix_dry_preview_shares_live_work_limit() {
+    use crate::map::ConnectionError;
+
+    let mut environment = Environment::new(35, 1);
+    environment.terrain_apply(environment.bounds(), |_| 4.0);
+    environment
+        .fill_lake(
+            &geom::Polygon::centered_rect(vec2(256.0, 400.0), 64.0, 64.0),
+            30,
+            5.0,
+        )
+        .unwrap();
+    let mut map = Map::empty();
+    assert!(map.install_environment(environment));
+    let pattern = LanePatternBuilder {
+        rail: true,
+        ..Default::default()
+    }
+    .build();
+    let from = MapProject::ground(vec3(128.0, 128.0, 4.0));
+    let near = MapProject::ground(vec3(16_128.0, 128.0, 4.0));
+    let far = MapProject::ground(vec3(17_128.0, 128.0, 4.0));
+    assert!(matches!(
+        map.try_connect(from, far, None, &pattern),
+        Err(ConnectionError::WorkLimit)
+    ));
+    assert!(matches!(
+        map.preview_connection(from, far, None, &pattern),
+        Err(ConnectionError::WorkLimit)
+    ));
+    assert!(map.preview_connection(from, near, None, &pattern).is_ok());
+    assert!(map.try_connect(from, near, None, &pattern).is_ok());
+}
+
+#[test]
+fn w2a_fix_boundary_bridge_support_updates_the_canonical_render_bucket() {
+    use crate::map::{SubscriberChunkID, TerraformKind, UpdateType};
+    use crate::world_command::{CommandOutcomes, WorldCommand};
+    use crate::Simulation;
+
+    super::init_test_simulation();
+    let mut terrain = Environment::new(5, 1);
+    terrain.terrain_apply(terrain.bounds(), |_| 4.0);
+    terrain
+        .carve_river(&[vec2(768.0, 16.0), vec2(768.0, 496.0)], 64.0, 6.0)
+        .unwrap();
+    let mut map = Map::empty();
+    assert!(map.install_environment(terrain));
+    let start = vec2(2560.0, 256.0);
+    let (_, id) = map
+        .make_connection(
+            MapProject::ground(start.z(4.0)),
+            MapProject::ground(vec3(384.0, 256.0, 4.0)),
+            None,
+            &LanePatternBuilder {
+                rail: true,
+                ..Default::default()
+            }
+            .build(),
+        )
+        .unwrap();
+    let pylon = Road::pylons_positions(map.roads[id].interfaced_points(), map.environment())
+        .find(|pylon| map.environment().is_water(pylon.pos.xy()))
+        .unwrap();
+    let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+    *sim.write::<Map>() = map;
+    let mut support = sim.map().subscribe(UpdateType::RoadSupport);
+    sim.apply_commands([&WorldCommand::Terraform {
+        kind: TerraformKind::Level,
+        center: pylon.pos.xy(),
+        radius: 20.0,
+        amount: 1.0,
+        level: -9.0,
+        slope: None,
+    }]);
+    assert!(sim.read::<CommandOutcomes>().rejections_for(0).is_empty());
+    assert!(support
+        .take_updated_chunks()
+        .any(|chunk| chunk == SubscriberChunkID::new(start)));
+}
+
+#[test]
+fn w2a_fix_drain_regenerates_local_frontage() {
+    use crate::map::{WaterBasin, WaterEdit};
+    use crate::{MapPreset, NewGameOptions, Replay, Simulation};
+
+    super::init_test_simulation();
+    let mut sim = Simulation::new_game_with_replay(&NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: 16,
+        ..Default::default()
+    })
+    .unwrap();
+    let ground = sim
+        .map()
+        .environment()
+        .height(vec2(2100.0, 2304.0))
+        .unwrap();
+    let pattern = LanePatternBuilder::default().build();
+    let road = crate::world_command::WorldCommand::MapMakeConnection {
+        from: MapProject::ground(vec3(2080.0, 2304.0, ground)),
+        to: MapProject::ground(vec3(2470.0, 2304.0, ground)),
+        inter: None,
+        pat: pattern,
+    };
+    sim.apply_commands([&road]);
+    let lake = geom::Polygon::centered_rect(vec2(2272.0, 2344.0), 96.0, 16.0);
+    let filled = sim
+        .edit_water(WaterEdit::FillLake {
+            basin: WaterBasin::new(&lake.0).unwrap(),
+            level_dm: ((ground - 1.0) * 10.0).floor() as i16,
+            depth_m: 0.5,
+        })
+        .unwrap();
+    let flooded: std::collections::BTreeSet<_> = sim.map().lots.keys().collect();
+    sim.edit_water(WaterEdit::RemoveFreshWater {
+        body: filled.body.unwrap(),
+    })
+    .unwrap();
+    let map = sim.map();
+    assert!(map.lots.values().any(|lot| {
+        !flooded.contains(&lot.id) && (lot.shape.center() - vec2(2272.0, 2344.0)).mag() < 80.0
+    }));
+    drop(map);
+    let (mut replayed, mut loader) =
+        Simulation::try_from_replay(sim.read::<Replay>().clone()).unwrap();
+    assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
+    assert_eq!(sim.hashes()["map"], replayed.hashes()["map"]);
+}
+
+#[test]
+fn w2a_fix_rejects_low_routes_inside_an_elevated_junction() {
+    use crate::map::ConnectionError;
+    let mut map = wet_crossing_map();
+    let pattern = LanePatternBuilder::default().build();
+    let (_, bridge) = map
+        .make_connection(
+            MapProject::ground(vec3(80.0, 256.0, 4.0)),
+            MapProject::ground(vec3(432.0, 256.0, 4.0)),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let attach = MapProject {
+        kind: ProjectKind::Road(bridge),
+        pos: map.roads[bridge].points().project_2d(vec2(225.0, 256.0)),
+    };
+    let from = MapProject::ground(vec3(96.0, 144.0, 4.0));
+    assert!(matches!(
+        map.preview_connection(from, attach, None, &pattern),
+        Err(ConnectionError::WetJunction(_) | ConnectionError::Grade)
+    ));
+}
+
+#[test]
+fn w2a_fix_replacement_lot_work_depends_on_affected_frontage() {
+    use crate::map::WaterTopologyWork;
+
+    let mut map = wet_crossing_map();
+    let pattern = LanePatternBuilder::default().build();
+    let (_, original) = map
+        .make_connection(
+            MapProject::ground(vec3(80.0, 64.0, 4.0)),
+            MapProject::ground(vec3(80.0, 448.0, 4.0)),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let (_, unrelated) = map
+        .make_connection(
+            MapProject::ground(vec3(432.0, 64.0, 4.0)),
+            MapProject::ground(vec3(432.0, 448.0, 4.0)),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    assert!(map.lots.values().any(|lot| lot.parent == original));
+    let from = MapProject {
+        pos: vec3(80.0, 256.0, 4.3),
+        kind: ProjectKind::Road(original),
+    };
+    let to = MapProject::ground(vec3(176.0, 256.0, 4.0));
+    let remaining = |map: &Map| {
+        let mut work = WaterTopologyWork::new();
+        map.prepare_connection(from, to, None, &pattern, Some(&mut work))
+            .unwrap();
+        work.remaining
+    };
+    let affected = remaining(&map);
+    for lot in map.lots.values_mut().filter(|lot| lot.parent == original) {
+        lot.parent = unrelated;
+    }
+    assert!(affected < remaining(&map));
+}
+
+#[test]
+fn w2a_fix_new_frontage_uses_the_final_junction_clip() {
+    use crate::map::Lot;
+    let pattern = LanePatternBuilder::default().build();
+    for y in [100.0, 140.0, 185.0, 210.0] {
+        let mut map = wet_crossing_map();
+        let joint = map.add_intersection(vec3(110.0, 280.0, 4.0));
+        let anchor = MapProject {
+            pos: map.intersections[joint].pos,
+            kind: ProjectKind::Intersection(joint),
+        };
+        for end in [vec3(100.0, 480.0, 4.0), vec3(175.0, 400.0, 4.0)] {
+            map.make_connection(anchor, MapProject::ground(end), None, &pattern)
+                .unwrap();
+        }
+        let (_, road) = map
+            .make_connection(
+                MapProject::ground(vec3(172.0, y, 4.0)),
+                anchor,
+                None,
+                &pattern,
+            )
+            .unwrap();
+        let frontage = |map: &Map| {
+            let mut centers: Vec<_> = map
+                .lots
+                .values()
+                .filter(|lot| lot.parent == road)
+                .map(|lot| lot.shape.center())
+                .collect();
+            centers.sort_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)));
+            centers
+        };
+        let initial = frontage(&map);
+        assert!(!initial.is_empty());
+        let ids: Vec<_> = map
+            .lots
+            .values()
+            .filter(|lot| lot.parent == road)
+            .map(|lot| lot.id)
+            .collect();
+        for id in ids {
+            map.lots.remove(id);
+            map.spatial_map.remove(id);
+        }
+        Lot::generate_along_road(&mut map, road);
+        assert_eq!(initial, frontage(&map), "widening junction, approach y={y}");
+    }
 }

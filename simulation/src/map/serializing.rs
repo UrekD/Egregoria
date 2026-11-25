@@ -186,20 +186,49 @@ impl SerializedMap {
     }
 
     fn validate_spatial_geometry(&self) -> Result<(), String> {
+        // Grid cell coordinates must stay bounded even when all points in a
+        // malformed record are equal and its cached length is therefore finite.
+        let world = self.environment.bounds().ur;
+        let index_limit =
+            world.x.max(world.y) + crate::NewGameOptions::MAX_TERRAIN_CHUNKS as f32 * 512.0;
         for (id, road) in self.roads.iter() {
             if !road.width.is_finite() || road.width < 0.0 {
                 return Err(format!("road {id:?} has an invalid width"));
             }
-            let radius = Vec2::splat(road.width * 0.5);
-            if road.points.len() < 2
-                || !road.points.length().is_finite()
-                || road.points.iter().any(|point| {
-                    !point.is_finite()
-                        || !(point.xy() - radius).is_finite()
-                        || !(point.xy() + radius).is_finite()
-                })
-            {
+            let radius = Vec2::splat(road.width * 5.0 + 2.0);
+            let valid = |points: &geom::PolyLine3, min_len| {
+                points.len() >= min_len
+                    && points.length().is_finite()
+                    && points.length() >= 0.0
+                    && points.iter().all(|point| {
+                        point.is_finite()
+                            && (point.xy() - radius).is_finite()
+                            && (point.xy() + radius).is_finite()
+                    })
+                    && points
+                        .segments()
+                        .map(|segment| segment.src.distance(segment.dst))
+                        .sum::<f32>()
+                        .is_finite()
+            };
+            if !valid(&road.points, 2) || !valid(road.interfaced_points(), 1) {
                 return Err(format!("road {id:?} has an invalid polyline"));
+            }
+            let raw_bounds = road
+                .points()
+                .bbox()
+                .flatten()
+                .expand(road.width * 5.0 + 2.0);
+            let deck_bounds = super::road_support_bounds(road);
+            if !raw_bounds.contains(deck_bounds.ll)
+                || !raw_bounds.contains(deck_bounds.ur)
+                || raw_bounds.ll.x < -index_limit
+                || raw_bounds.ll.y < -index_limit
+                || raw_bounds.ur.x > index_limit
+                || raw_bounds.ur.y > index_limit
+                || !deck_bounds.size().is_finite()
+            {
+                return Err(format!("road {id:?} has invalid deck index bounds"));
             }
         }
         for (id, intersection) in self.intersections.iter() {

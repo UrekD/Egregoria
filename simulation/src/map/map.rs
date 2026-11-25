@@ -488,10 +488,7 @@ impl Map {
         pattern: &LanePattern,
     ) -> Option<(IntersectionID, RoadID)> {
         let connected = self.try_connect(from, to, interpoint, pattern).ok()?;
-        Some((
-            connected.dst.unwrap_or(self.roads[connected.road].dst),
-            connected.road,
-        ))
+        Some((connected.destination, connected.road))
     }
 
     pub fn try_connect(
@@ -554,7 +551,7 @@ impl Map {
         }
         let prepared = if let Some(work) = work {
             let (samples, prepared) =
-                self.prepare_resolved_connection(from, to, elbow, pattern, work)?;
+                self.prepare_resolved_connection_inner(from, to, elbow, pattern, true, work)?;
             work.spend_profile_samples(samples);
             prepared
         } else {
@@ -569,6 +566,18 @@ impl Map {
         to: ConnectionEndpoint,
         elbow: Option<Vec2>,
         pattern: &LanePattern,
+        work: &mut WaterTopologyWork,
+    ) -> Result<(usize, Option<PreparedTopologyEdit>), ConnectionError> {
+        self.prepare_resolved_connection_inner(from, to, elbow, pattern, false, work)
+    }
+
+    fn prepare_resolved_connection_inner(
+        &self,
+        from: ConnectionEndpoint,
+        to: ConnectionEndpoint,
+        elbow: Option<Vec2>,
+        pattern: &LanePattern,
+        stage_merges: bool,
         work: &mut WaterTopologyWork,
     ) -> Result<(usize, Option<PreparedTopologyEdit>), ConnectionError> {
         let map_bounds = self.environment.bounds();
@@ -603,14 +612,7 @@ impl Map {
                 _ => {}
             }
         }
-        // The Hermite curve's control polygon is at most the chord plus 2/3
-        // of the sum of the tangent lengths. Each tangent is its elbow leg
-        // scaled by 1/sqrt(2), as in RoadSegmentKind::from_elbow.
-        let path_length = if elbow.is_some() {
-            a.distance(b) + length * (2.0 * std::f32::consts::FRAC_1_SQRT_2 / 3.0)
-        } else {
-            length
-        };
+        let path_length = connection_profile_length_bound(a, b, elbow);
         // Initial profiling, lane creation, and invalidation of the two endpoints.
         let mut profile_samples = profile_sample_bound(path_length).saturating_mul(4);
         let invalidations = 2 + 3 * splits.len();
@@ -620,8 +622,8 @@ impl Map {
                 // Splitting partitions the horizontal path. Allow for rounding
                 // and endpoint samples of both pieces, plus their lane creation.
                 let samples = profile_sample_bound(road.length()).saturating_add(5);
-                profile_samples = profile_samples
-                    .saturating_add(samples.saturating_mul(1 + invalidations));
+                profile_samples =
+                    profile_samples.saturating_add(samples.saturating_mul(1 + invalidations));
             }
         }
         let profile_samples = self.reserve_water_topology(
@@ -640,22 +642,36 @@ impl Map {
         };
         let check_geometry = self.environment.strict_water_siting()
             && !super::connection_is_dry(
-                self, endpoint(from), endpoint(to), elbow, pattern.width(), &mut work.remaining,
+                self,
+                endpoint(from),
+                endpoint(to),
+                elbow,
+                pattern.width(),
+                &mut work.remaining,
             )?;
+        if self.environment.strict_water_siting() {
+            spend_water_work(
+                &mut work.remaining,
+                super::generated_frontage_work(path_length, pattern, check_geometry),
+            )?;
+        }
+        work.spend_profile_samples(profile_samples);
         let prepared = if check_geometry {
-            Some(super::prepare_topology(
+            super::prepare_topology(
                 self,
                 endpoint(from),
                 endpoint(to),
                 elbow,
                 pattern,
+                stage_merges,
                 &mut work.geometry(),
-            )?)
+            )
+            .map(Some)
         } else {
-            None
+            Ok(None)
         };
-        work.check_profile_samples(profile_samples)?;
-        Ok((profile_samples, prepared))
+        work.profile_samples += profile_samples;
+        Ok((profile_samples, prepared?))
     }
 
     pub(crate) fn make_resolved_connection(
@@ -667,24 +683,45 @@ impl Map {
         prepared: Option<PreparedTopologyEdit>,
         mut work: Option<&mut WaterTopologyWork>,
     ) -> Result<ConnectionOutcome, ConnectionError> {
+        let merges = prepared.as_ref().and_then(|edit| edit.merges);
         let connected = self.commit_prepared_connection(from, to, interpoint, pattern, prepared)?;
         let mut road = connected.road;
+        let mut source_side = connected.src;
+        let mut destination = connected.dst;
         let mut replacements = BTreeMap::new();
         for split in connected.splits.into_iter().flatten() {
             replacements.insert(split.original, split.roads.to_vec());
         }
-        for junction in [connected.src, connected.dst] {
-            if let Ok(Some((old, new))) = self.merge_shallow_junction(junction, work.as_deref_mut())
-            {
+        for (end, junction) in [connected.src, connected.dst].into_iter().enumerate() {
+            let merged = if let Some(merges) = merges {
+                if merges[end] {
+                    let [first, second] = *self.intersections[junction].roads else {
+                        unreachable!("prepared merge has two arms");
+                    };
+                    self.merge_road_checked(first, second, None, true)
+                        .map(|road| road.map(|road| ([first, second], road)))
+                } else {
+                    continue;
+                }
+            } else {
+                self.merge_shallow_junction(junction, work.as_deref_mut())
+            };
+            if let Ok(Some((old, new))) = merged {
                 super::remap_merged_roads(&mut replacements, old, new);
                 if old.contains(&road) {
                     road = new;
+                    if junction == source_side {
+                        source_side = self.roads[new].other_end(destination).unwrap();
+                    } else {
+                        destination = self.roads[new].other_end(source_side).unwrap();
+                    }
                 }
             }
         }
         self.check_invariants();
         Ok(ConnectionOutcome {
             road,
+            destination,
             src: self
                 .intersections
                 .contains_key(connected.src)
@@ -752,6 +789,11 @@ impl Map {
 
         let (src, from_split) = mk_inter(from);
         let (dst, to_split) = mk_inter(to);
+        let check_water = prepared.is_some();
+        let frontage_work = self.environment.has_water_configuration().then(|| {
+            let length = connection_profile_length_bound(from.pos.xy(), to.pos.xy(), interpoint);
+            super::generated_frontage_work(length, pattern, check_water)
+        });
         let profile = prepared.map(|prepared| (prepared.profile, prepared.elevated));
         let road = self
             .connect_with_span(src, dst, pattern, connection_segment, None, profile)
@@ -759,6 +801,7 @@ impl Map {
 
         self.invalidate(src);
         self.invalidate(dst);
+        Lot::generate_along_final_road(self, road, check_water, frontage_work);
 
         // Frontage checks use the deck clipped by the finalized junction interfaces.
         Lot::generate_along_road(self, road);
@@ -804,7 +847,7 @@ impl Map {
                     work.spend_profile_samples(samples);
                 }
                 return self
-                    .merge_road_checked(first, second, work)
+                    .merge_road_checked(first, second, work, false)
                     .map(|merged| merged.map(|new| ([first, second], new)));
             }
         }
@@ -836,10 +879,19 @@ impl Map {
         };
         spend_water_work(remaining, profile(new_length * 3.0, 0, new_lanes))?;
         let mut added_lanes = new_lanes;
+        let replacement_points = replaced_roads
+            .iter()
+            .map(|id| self.roads[*id].points().len())
+            .sum::<usize>();
+        let mut points = replacement_points.saturating_add(profile_sample_bound(new_length));
         for &id in replaced_roads {
             let road = &self.roads[id];
             added_lanes = added_lanes.saturating_add(road.n_lanes());
-            spend_water_work(remaining, self.lots.len())?;
+            spend_water_work(remaining, self.lots.len().saturating_mul(3))?;
+            if self.environment.strict_water_siting() {
+                points = points.max(profile_sample_bound(road.length() + new_length));
+                spend_water_work(remaining, super::reassigned_frontage_work(self, id, points))?;
+            }
             spend_water_work(
                 remaining,
                 road.connected_buildings
@@ -874,8 +926,8 @@ impl Map {
                             invalidations
                         };
                         let samples = profile_sample_bound(r.length());
-                        profile_samples = profile_samples
-                            .saturating_add(samples.saturating_mul(rebuilds));
+                        profile_samples =
+                            profile_samples.saturating_add(samples.saturating_mul(rebuilds));
                     }
                     if let Some(other) = r.other_end(id) {
                         neighbors.insert(other);
@@ -1814,7 +1866,7 @@ impl Map {
             .environment
             .has_water_configuration()
             .then(WaterTopologyWork::new);
-        self.merge_road_checked(road1, road2, work.as_mut())
+        self.merge_road_checked(road1, road2, work.as_mut(), false)
             .ok()
             .flatten()
     }
@@ -1824,6 +1876,7 @@ impl Map {
         road1: RoadID,
         road2: RoadID,
         work: Option<&mut WaterTopologyWork>,
+        validated: bool,
     ) -> Result<Option<RoadID>, ConnectionError> {
         let r1 = self
             .roads
@@ -1871,18 +1924,10 @@ impl Map {
             return Ok(None);
         }
 
-        let mut new_polyline = r1.points.clone();
-        if r1.src == same_inter {
-            new_polyline.reverse();
-        }
-        if r2.src == same_inter {
-            new_polyline.extend(r2.points.iter().skip(1));
-        } else {
-            new_polyline.extend(r2.points.iter().rev().skip(1));
-        }
+        let new_polyline = r1.merged_profile(r2, same_inter);
         let elevated = r1.elevated_span() || r2.elevated_span();
 
-        if self.environment.strict_water_siting() {
+        if self.environment.strict_water_siting() && !validated {
             if self.intersections[same_inter].roads.len() != 2 {
                 return Ok(None);
             }
@@ -1995,13 +2040,32 @@ impl Map {
         if !wet_lane_count_fits(pattern) || pattern.lanes().next().is_none() {
             return None;
         }
+        let gen_lots = !matches!(segment, RoadSegmentKind::Arbitrary(_));
+        let mut work = WaterTopologyWork::new();
+        let frontage_work = if gen_lots {
+            let length = self
+                .intersections
+                .get(src_id)?
+                .pos
+                .xy()
+                .distance(self.intersections.get(dst_id)?.pos.xy());
+            let length = match &segment {
+                RoadSegmentKind::Curved((u, v)) => length + (u.mag() + v.mag()) * (2.0 / 3.0),
+                _ => length,
+            };
+            let allowance = super::generated_frontage_work(length, pattern, true);
+            spend_water_work(&mut work.remaining, allowance).ok()?;
+            Some(allowance)
+        } else {
+            None
+        };
         let prepared = super::prepare_direct_road(
             self,
             src_id,
             dst_id,
             pattern,
             segment.clone(),
-            &mut WaterTopologyWork::new().geometry(),
+            &mut work.geometry(),
         )
         .ok()?;
         let id = self.connect_with_span(
@@ -2014,6 +2078,9 @@ impl Map {
         )?;
         self.invalidate(src_id);
         self.invalidate(dst_id);
+        if gen_lots {
+            Lot::generate_along_final_road(self, id, true, frontage_work);
+        }
         Some(id)
     }
 
@@ -2439,6 +2506,17 @@ impl WaterTopologyWork {
     pub(crate) fn spend_profile_samples(&mut self, samples: usize) {
         self.profile_samples -= samples;
     }
+}
+
+fn connection_profile_length_bound(a: Vec2, b: Vec2, elbow: Option<Vec2>) -> f32 {
+    // The Hermite control polygon bounds the sampled length. Each tangent
+    // has length 1/sqrt(2) times its elbow leg, with a 1/3 control offset.
+    let chord = a.distance(b);
+    elbow.map_or(chord, |point| {
+        chord
+            + (a.distance(point) + b.distance(point))
+                * (2.0 * std::f32::consts::FRAC_1_SQRT_2 / 3.0)
+    })
 }
 
 fn profile_sample_bound(length: f32) -> usize {

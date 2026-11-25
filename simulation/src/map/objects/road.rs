@@ -240,6 +240,24 @@ impl Road {
         }
     }
 
+    pub(crate) fn clear_staged_lanes(&mut self) {
+        self.lanes_forward.clear();
+        self.lanes_backward.clear();
+    }
+
+    pub(crate) fn merged_profile(&self, next: &Road, joint: IntersectionID) -> PolyLine3 {
+        let mut points = self.points.clone();
+        if self.src == joint {
+            points.reverse();
+        }
+        if next.src == joint {
+            points.extend(next.points.iter().skip(1));
+        } else {
+            points.extend(next.points.iter().rev().skip(1));
+        }
+        points
+    }
+
     pub(crate) fn split_profiles(&self, pos: Vec3, segment: usize) -> [PolyLine3; 2] {
         let mut before: Vec<_> = self.points.iter().copied().take(segment).collect();
         while before.last().is_some_and(|point| point.xy() == pos.xy()) {

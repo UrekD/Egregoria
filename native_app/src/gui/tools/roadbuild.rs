@@ -5,7 +5,7 @@ use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use simulation::map::{
     ConnectionError, LanePattern, LanePatternBuilder, Map, MapProject, ProjectFilter, ProjectKind,
-    PylonPosition, RoadPreview,
+    PylonPosition, RoadPreview, ROAD_Z_OFFSET,
 };
 use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::Simulation;
@@ -13,7 +13,7 @@ use BuildState::{Curved, CurvedConnection, Hover, Start, StartCurved};
 use ProjectKind::{Building, Ground, Intersection, Road};
 
 use crate::gui::{ErrorTooltip, PotentialCommands, Tool};
-use crate::inputmap::{InputAction, InputMap};
+use crate::inputmap::{DeckPicker, InputAction, InputMap};
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use crate::uiworld::UiWorld;
 
@@ -62,9 +62,19 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
     };
 
     let grid_size = 20.0;
-    let unproj = unwrap_ret!(inp.unprojected);
-    let mut interpolation_points: Vec<Vec3> = Vec::new();
     let nosnapping = inp.act.contains(&InputAction::NoSnapping);
+    let attach = !nosnapping && !matches!(state.build_state, CurvedConnection(..));
+    let surfaces = inp.surface_hits(map.environment());
+    let deck = inp.ray.filter(|_| attach).and_then(|ray| {
+        DeckPicker::new(map).pick(ray, &surfaces, ProjectFilter::ROAD | ProjectFilter::INTER)
+    });
+    let surface = surfaces
+        .water
+        .map(|hit| hit.point)
+        .or_else(|| surfaces.ground.map(|(pos, _)| pos.xy().z(pos.z.max(0.0))))
+        .or(inp.unprojected);
+    let unproj = unwrap_ret!(surface.or_else(|| deck.map(|hit| hit.pos)));
+    let mut interpolation_points: Vec<Vec3> = Vec::new();
 
     // Prepare mousepos depending on snap to grid or snap to angle
     let mousepos = match state.snapping {
@@ -124,17 +134,10 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         state.height_offset = state.height_offset.max(0.0);
     }
 
-    let mut cur_proj = if !matches!(state.build_state, CurvedConnection(..)) {
-        inp.ray
-            .filter(|_| !nosnapping && map.environment().strict_water_siting())
-            .and_then(|ray| map.project_road_deck(ray, unproj))
-            .unwrap_or_else(|| {
-                map.project(
-                    mousepos,
-                    (log_camheight * 5.0).clamp(1.0, 10.0),
-                    ProjectFilter::INTER | ProjectFilter::ROAD,
-                )
-            })
+    let mut cur_proj = if attach {
+        deck.unwrap_or_else(|| {
+            project_ground_attachment(map, mousepos, (log_camheight * 5.0).clamp(1.0, 10.0))
+        })
     } else {
         MapProject::ground(mousepos)
     };
@@ -436,7 +439,11 @@ impl RoadBuildResource {
 
     fn grid_mouse_height(&self, map: &Map, unprojected: Vec3, grid_size: f32) -> Vec3 {
         let snapped = unprojected.xy().snap(grid_size, grid_size);
-        let height = map.environment().height(snapped).unwrap_or(unprojected.z);
+        let env = map.environment();
+        let height = env
+            .water_surface_elevation(snapped)
+            .or_else(|| env.height(snapped))
+            .unwrap_or(unprojected.z);
         self.mouse_height(map, snapped.z(height))
     }
 
@@ -482,6 +489,48 @@ pub enum HeightReference {
     Start,
     MaxIncline,
     MaxDecline,
+}
+
+fn project_ground_attachment(map: &Map, pos: Vec3, tolerance: f32) -> MapProject {
+    let env = map.environment();
+    if env.is_water(pos.xy()) {
+        return MapProject::ground(pos);
+    }
+    let on_ground = |point: Vec3| {
+        !env.is_water(point.xy())
+            && env
+                .height(point.xy())
+                .is_some_and(|z| (z - point.z).abs() <= 1.0)
+    };
+    let mut road_hit = None;
+    for kind in map.spatial_map().query_around(
+        pos.xy(),
+        tolerance,
+        ProjectFilter::ROAD | ProjectFilter::INTER,
+    ) {
+        match kind {
+            Intersection(id) => {
+                let intersection = &map.intersections()[id];
+                if on_ground(intersection.pos) {
+                    return MapProject {
+                        pos: intersection.pos,
+                        kind,
+                    };
+                }
+            }
+            Road(id) if road_hit.is_none() => {
+                let road = &map.roads()[id];
+                if !road.elevated_span() {
+                    let point = road.points().project(pos);
+                    if on_ground(point - Vec3::z(ROAD_Z_OFFSET)) {
+                        road_hit = Some(MapProject { pos: point, kind });
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    road_hit.unwrap_or_else(|| MapProject::ground(pos))
 }
 
 fn check_angle(map: &Map, from: MapProject, to: Vec2, is_rail: bool) -> bool {
@@ -807,6 +856,124 @@ mod tests {
         state.height_reference = HeightReference::Start;
         state.build_state = Start(MapProject::ground(vec3(40.0, 60.0, 50.0)));
         assert_eq!(state.grid_mouse_height(&map, click, 20.0), snapped.z(55.0));
+    }
+
+    #[test]
+    fn w2a_fix_grid_resamples_water_for_road_and_rail() {
+        let mut terrain = Environment::new(1, 1);
+        terrain.terrain_apply(terrain.bounds(), |_| 4.0);
+        terrain
+            .fill_lake(
+                &geom::Polygon::centered_rect(vec2(240.0, 240.0), 32.0, 32.0),
+                30,
+                5.0,
+            )
+            .unwrap();
+        let mut map = Map::empty();
+        assert!(map.install_environment(terrain));
+        for rail in [false, true] {
+            let mut state = RoadBuildResource::default();
+            state.pattern_builder.rail = rail;
+            let inside = vec3(242.0, 240.0, 3.0);
+            assert_eq!(
+                state.grid_mouse_height(&map, inside, 20.0),
+                vec3(240.0, 240.0, 3.0)
+            );
+            let edge = vec3(225.0, 240.0, 3.0);
+            let dry = vec2(220.0, 240.0);
+            assert!(!map.environment().is_water(dry));
+            assert_eq!(
+                state.grid_mouse_height(&map, edge, 20.0),
+                dry.z(map.environment().height(dry).unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn w2a_fix_attaches_to_front_deck_without_a_ground_hit() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let pattern = LanePatternBuilder::default().build();
+        let road_at = |sim: &mut Simulation, z| {
+            sim.write::<Map>()
+                .make_connection(
+                    MapProject::ground(vec3(40.0, 256.0, z)),
+                    MapProject::ground(vec3(500.0, 256.0, z)),
+                    None,
+                    &pattern,
+                )
+                .unwrap()
+                .1
+        };
+        road_at(&mut sim, 16.0);
+        let upper = road_at(&mut sim, 24.0);
+        let ui = ui(Tool::RoadbuildStraight);
+        {
+            let mut input = ui.write::<InputMap>();
+            input.set_world_ray(
+                Some(geom::Ray3::new(
+                    vec3(280.0, 256.0, 35.0),
+                    vec3(1.0, 0.0, -0.1),
+                )),
+                &sim.map(),
+                true,
+            );
+            assert!(input.unprojected.is_none());
+            input.just_act.insert(InputAction::Select);
+        }
+        roadbuild(&sim, &ui);
+        assert!(matches!(
+            ui.read::<RoadBuildResource>().build_state,
+            Start(MapProject { kind: Road(id), .. }) if id == upper
+        ));
+    }
+
+    #[test]
+    fn w2a_fix_oblique_free_pointer_snaps_from_the_water_hit() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let mut terrain = Environment::new(1, 1);
+        terrain.terrain_apply(terrain.bounds(), |_| 4.0);
+        terrain
+            .fill_lake(
+                &geom::Polygon::centered_rect(vec2(240.0, 240.0), 32.0, 32.0),
+                30,
+                5.0,
+            )
+            .unwrap();
+        let mut map = Map::empty();
+        assert!(map.install_environment(terrain));
+        *sim.write::<Map>() = map;
+        for rail in [false, true] {
+            let ui = ui(Tool::RoadbuildStraight);
+            {
+                let mut state = ui.write::<RoadBuildResource>();
+                state.pattern_builder.rail = rail;
+                state.snapping = Snapping::SnapToGrid;
+            }
+            {
+                let mut input = ui.write::<InputMap>();
+                input.set_world_ray(
+                    Some(geom::Ray3::new(
+                        vec3(192.0, 240.0, 20.0),
+                        vec3(2.0, 0.0, -1.0),
+                    )),
+                    &sim.map(),
+                    false,
+                );
+                assert!(input.surface_hits(sim.map().environment()).water.is_some());
+                assert!(input.unprojected.unwrap().x >= 230.0);
+                input.just_act.insert(InputAction::Select);
+            }
+            roadbuild(&sim, &ui);
+            assert!(matches!(
+                ui.read::<RoadBuildResource>().build_state,
+                Start(MapProject { kind: Ground, pos })
+                    if pos.xy() == vec2(220.0, 240.0)
+            ));
+        }
     }
 
     #[test]

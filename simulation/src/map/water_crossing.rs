@@ -2,13 +2,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 use crate::map::terrain::CELL_SIZE;
-use geom::{PolyLine3, Polygon, Vec2, Vec3, AABB};
+use flat_spatial::AABBGrid;
+use geom::{
+    unpack_height, Intersect, PolyLine3, Polygon, Shape, Vec2, Vec3, AABB, NO_OVERRIDE, OBB,
+};
 
 use crate::map::{
     profile_height, spend_water_work, Environment, Intersection, IntersectionID, Intersections,
-    LanePattern, Lanes, Map, MapProject, PointGenerateError, ProjectKind, Road, RoadID,
-    RoadSegmentKind, Roads, SpatialMap, Turn, WaterEditError, WaterFootprint, WaterTileCoord,
-    WaterTopologyWork, MAX_SLOPE, ROAD_Z_OFFSET,
+    LanePattern, Lanes, Lot, LotLayout, Map, MapProject, PointGenerateError, PreparedWaterEdit,
+    ProjectKind, Road, RoadID, RoadSegmentKind, Roads, SpatialMap, TerrainChunkID, Turn,
+    WaterEditError, WaterFootprint, WaterTileCoord, WaterTopologyWork, MAX_SLOPE, ROAD_Z_OFFSET,
+    TERRAIN_CHUNK_RESOLUTION, UNIFORM_LOT_SIZE,
 };
 
 pub const WATER_BRIDGE_CLEARANCE: f32 = 2.5;
@@ -68,6 +72,8 @@ pub struct RoadPreview {
 #[derive(Clone, Debug)]
 pub struct ConnectionOutcome {
     pub road: RoadID,
+    /// Final junction on the destination side, even after a shallow merge.
+    pub destination: IntersectionID,
     pub src: Option<IntersectionID>,
     pub dst: Option<IntersectionID>,
     pub replacements: BTreeMap<RoadID, Vec<RoadID>>,
@@ -113,6 +119,7 @@ pub(crate) struct PreparedTopologyEdit {
     pub(crate) profile: PolyLine3,
     pub(crate) elevated: bool,
     pub(crate) preview: RoadPreview,
+    pub(crate) merges: Option<[bool; 2]>,
 }
 
 impl PreparedTopologyEdit {
@@ -150,21 +157,13 @@ impl Map {
         elbow: Option<Vec2>,
         pattern: &LanePattern,
     ) -> Result<RoadPreview, ConnectionError> {
-        let wet = self.environment().strict_water_siting();
-        let mut work = WaterTopologyWork::new();
-        let endpoints = if wet {
-            if !crate::map::wet_lane_count_fits(pattern) {
-                return Err(ConnectionError::WorkLimit);
-            }
-            self.resolve_water_connection_endpoint(from, &mut work.remaining)?
-                .zip(self.resolve_water_connection_endpoint(to, &mut work.remaining)?)
-        } else {
-            self.resolve_connection_endpoint(from)
-                .zip(self.resolve_connection_endpoint(to))
-        };
-        let (a, b) = endpoints.ok_or(ConnectionError::InvalidEndpoint)?;
-        if !Self::can_connect(a, b, elbow, pattern) {
-            return Err(ConnectionError::InvalidEndpoint);
+        let mut work = self
+            .environment()
+            .has_water_configuration()
+            .then(WaterTopologyWork::new);
+        let (a, b, prepared) = self.prepare_connection(from, to, elbow, pattern, work.as_mut())?;
+        if let Some(prepared) = prepared {
+            return Ok(prepared.preview);
         }
         let bounds = self.environment().bounds();
         if !bounds.contains(a.pos.xy())
@@ -173,46 +172,18 @@ impl Map {
         {
             return Err(ConnectionError::OutOfBounds);
         }
-        let from = self.crossing_endpoint(from, a.pos)?;
-        let to = self.crossing_endpoint(to, b.pos)?;
-        if !wet || connection_is_dry(self, from, to, elbow, pattern.width(), &mut work.remaining)? {
-            let (deck, error) = Road::generate_points(
-                a.pos,
-                b.pos,
-                segment(a.pos, b.pos, elbow),
-                pattern.lanes().any(|(kind, _, _)| kind.is_rail()),
-                self.environment(),
-            );
-            check_profile_error(error)?;
-            return Ok(RoadPreview {
-                deck,
-                junctions: Vec::new(),
-                crosses_water: false,
-            });
-        }
-        let mut tiles = MAX_DECK_TILE_TESTS;
-        let mut samples = 65_536;
-        let mut work = CrossingWork::new(&mut work.remaining, &mut tiles, &mut samples);
-        Ok(prepare_topology(self, from, to, elbow, pattern, &mut work)?.preview)
-    }
-
-    fn crossing_endpoint(
-        &self,
-        project: MapProject,
-        pos: Vec3,
-    ) -> Result<CrossingEndpoint, ConnectionError> {
-        let split = if let ProjectKind::Road(id) = project.kind {
-            let road = self.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
-            let (mut point, index) = road.points().project_segment(project.pos);
-            point.z = pos.z + ROAD_Z_OFFSET;
-            Some((point, index))
-        } else {
-            None
-        };
-        Ok(CrossingEndpoint {
-            kind: project.kind,
-            pos,
-            split,
+        let (deck, error) = Road::generate_points(
+            a.pos,
+            b.pos,
+            segment(a.pos, b.pos, elbow),
+            pattern.lanes().any(|(kind, _, _)| kind.is_rail()),
+            self.environment(),
+        );
+        check_profile_error(error)?;
+        Ok(RoadPreview {
+            deck,
+            junctions: Vec::new(),
+            crosses_water: false,
         })
     }
 }
@@ -241,7 +212,7 @@ pub(crate) fn connection_is_dry(
             max = max.max(control);
         }
     }
-    let link_bounds = AABB::new_ll_ur(min, max).expand(width * 5.0 + 32.0);
+    let link_bounds = AABB::new_ll_ur(min, max).expand(width * 5.0 + 56.0);
     let env = map.environment();
     let mut dry_chunks = BTreeSet::new();
     let mut check = |bounds: AABB, remaining: &mut usize| -> Result<bool, ConnectionError> {
@@ -348,6 +319,7 @@ pub(crate) fn prepare_topology(
     to: CrossingEndpoint,
     elbow: Option<Vec2>,
     pattern: &LanePattern,
+    stage_merges: bool,
     work: &mut CrossingWork<'_>,
 ) -> Result<PreparedTopologyEdit, ConnectionError> {
     let env = map.environment();
@@ -387,7 +359,16 @@ pub(crate) fn prepare_topology(
 
     let (profile, lifted) = raise_crossing(profile, pattern.width(), env, work)?;
     let elevated = elevated || lifted;
-    stage_connection(map, from, to, profile, pattern, elevated, work)
+    stage_connection(
+        map,
+        from,
+        to,
+        profile,
+        pattern,
+        elevated,
+        stage_merges,
+        work,
+    )
 }
 
 fn stage_connection(
@@ -397,19 +378,34 @@ fn stage_connection(
     profile: PolyLine3,
     pattern: &LanePattern,
     elevated: bool,
+    stage_merges: bool,
     work: &mut CrossingWork<'_>,
 ) -> Result<PreparedTopologyEdit, ConnectionError> {
     let mut graph = LocalTopology::new(map, work);
     let src = graph.resolve(from)?;
     let dst = graph.resolve(to)?;
-    let id = graph.add_road(src, dst, profile.clone(), pattern, elevated)?;
+    let mut id = graph.add_road(src, dst, profile.clone(), pattern, elevated)?;
     graph.invalidate(src)?;
     graph.invalidate(dst)?;
-    let (wet, junctions) = graph.validate()?;
+    let (mut wet, mut junctions) = graph.validate()?;
+    let merges = stage_merges.then(|| {
+        [src, dst].map(|junction| {
+            if let Some((merged, (next_wet, next_junctions))) = graph.stage_shallow_merge(junction)
+            {
+                id = merged;
+                wet = next_wet;
+                junctions = next_junctions;
+                true
+            } else {
+                false
+            }
+        })
+    });
     Ok(PreparedTopologyEdit {
         revision: topology_revision(map),
         profile,
         elevated,
+        merges,
         preview: RoadPreview {
             deck: graph.roads[id].interfaced_points().clone(),
             junctions,
@@ -891,47 +887,198 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         Ok(())
     }
 
+    fn pattern(&self, id: RoadID) -> LanePattern {
+        self.patterns
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| self.map.roads[self.live_roads[&id]].pattern(&self.map.lanes))
+    }
+
+    fn stage_shallow_merge(
+        &mut self,
+        joint: IntersectionID,
+    ) -> Option<(RoadID, (BTreeSet<RoadID>, Vec<Vec<Vec3>>))> {
+        let [first, second] = *self.junctions.get(joint)?.roads else {
+            return None;
+        };
+        let a = &self.roads[first];
+        let b = &self.roads[second];
+        let (src, dst) = (a.other_end(joint)?, b.other_end(joint)?);
+        if src == dst || a.dir_from(joint).dot(b.dir_from(joint)) >= -0.9 {
+            return None;
+        }
+        let mut pattern = self.pattern(first);
+        let mut other = self.pattern(second);
+        if a.src == joint {
+            std::mem::swap(&mut pattern.lanes_forward, &mut pattern.lanes_backward);
+        }
+        if b.src != joint {
+            std::mem::swap(&mut other.lanes_forward, &mut other.lanes_backward);
+        }
+        if pattern != other {
+            return None;
+        }
+
+        // Reserve the merge's live profiling, lot scans and reassignment before
+        // testing geometry. Keep a snapshot of only this bounded local topology.
+        let length = a.length() + b.length();
+        let samples = (length.ceil() as usize + 2).saturating_mul(3);
+        spend_water_work(self.work.samples, samples).ok()?;
+        self.work
+            .charge(
+                samples
+                    .saturating_mul((pattern.lanes().count() + 1) * 8)
+                    .saturating_add(self.map.lots.len().saturating_mul(2)),
+            )
+            .ok()?;
+        let elevated = a.elevated_span() || b.elevated_span();
+        let points = if elevated {
+            a.points().len() + b.points().len()
+        } else {
+            samples.max(a.points().len() + b.points().len())
+        };
+        for id in [first, second] {
+            if let Some(&live) = self.live_roads.get(&id) {
+                self.work
+                    .charge(reassigned_frontage_work(self.map, live, points))
+                    .ok()?;
+            } else if pattern
+                .lanes()
+                .any(|(kind, _, _)| kind == crate::map::LaneKind::Walking)
+            {
+                // Newly generated vacant lots take at least 22 m of station spacing.
+                let lots = (self.roads[id].length() / 22.0).ceil() as usize * 2;
+                let per_lot = points.saturating_mul(13) + frontage_attempt_work(a.width, true);
+                self.work.charge(lots.saturating_mul(per_lot)).ok()?;
+            }
+        }
+        let snapshot_cost = self
+            .roads
+            .values()
+            .map(|road| road.points().len() + road.interfaced_points().len() + road.n_lanes())
+            .sum::<usize>()
+            + self
+                .junctions
+                .values()
+                .map(|junction| {
+                    junction.roads.len()
+                        + junction
+                            .turns()
+                            .map(|turn| turn.points.len())
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+        self.work.charge(snapshot_cost).ok()?;
+        let mut trial = LocalTopology {
+            map: self.map,
+            work: self.work,
+            roads: self.roads.clone(),
+            junctions: self.junctions.clone(),
+            junction_keys: self.junction_keys.clone(),
+            live_junctions: self.live_junctions.clone(),
+            road_keys: self.road_keys.clone(),
+            live_roads: self.live_roads.clone(),
+            patterns: self.patterns.clone(),
+            loaded_junctions: self.loaded_junctions.clone(),
+            changed_roads: self.changed_roads.clone(),
+            changed_junctions: self.changed_junctions.clone(),
+            wet_splits: self.wet_splits.clone(),
+            spatial: SpatialMap::default(),
+        };
+        let points = a.merged_profile(b, joint);
+        let result = (|| {
+            trial.ensure_arms(src)?;
+            trial.ensure_arms(dst)?;
+            trial.remove_road(first);
+            trial.remove_road(second);
+            trial.changed_junctions.remove(&joint);
+            let id = trial.add_road(src, dst, points, &pattern, elevated)?;
+            trial.invalidate(src)?;
+            trial.invalidate(dst)?;
+            Ok::<_, ConnectionError>((id, trial.validate()?))
+        })()
+        .ok()?;
+        self.roads = trial.roads;
+        self.junctions = trial.junctions;
+        self.junction_keys = trial.junction_keys;
+        self.live_junctions = trial.live_junctions;
+        self.road_keys = trial.road_keys;
+        self.live_roads = trial.live_roads;
+        self.patterns = trial.patterns;
+        self.loaded_junctions = trial.loaded_junctions;
+        self.changed_roads = trial.changed_roads;
+        self.changed_junctions = trial.changed_junctions;
+        self.wet_splits = trial.wet_splits;
+        Some(result)
+    }
+
     fn validate(&mut self) -> Result<(BTreeSet<RoadID>, Vec<Vec<Vec3>>), ConnectionError> {
         let env = self.map.environment();
         let mut wet = BTreeSet::new();
-        let mut outlines = Vec::new();
-        for junction in self.changed_junctions.clone() {
-            self.ensure_arms(junction)?;
-            let inter = &self.junctions[junction];
-            let outline = junction_outline(inter, &self.roads, self.work)?;
-            if outline.is_empty() {
-                continue;
+        for &id in &self.changed_roads {
+            if validate_deck(&self.roads[id], env, self.work)? {
+                wet.insert(id);
             }
+        }
+
+        let junctions = self.changed_junctions.clone();
+        let mut lane_roads = wet.clone();
+        for &id in &junctions {
+            self.ensure_arms(id)?;
+            lane_roads.extend(self.junctions[id].roads.iter().copied());
+        }
+        let mut lanes = Lanes::default();
+        for id in lane_roads {
+            let pattern = self.pattern(id);
+            let road = &mut self.roads[id];
+            self.work.charge(
+                road.interfaced_points()
+                    .len()
+                    .saturating_mul(pattern.lanes().count()),
+            )?;
+            road.clear_staged_lanes();
+            road.make_lanes(&pattern, &mut lanes);
+            for (lane, _) in road.lanes_iter() {
+                let lane = &mut lanes[lane];
+                lane.gen_pos(road);
+                if wet.contains(&id) && !grade_fits(&lane.points) {
+                    return Err(ConnectionError::Grade);
+                }
+            }
+        }
+
+        let mut outlines = Vec::new();
+        for junction in junctions {
+            let inter = &mut self.junctions[junction];
+            let outline = junction_outline(inter, &self.roads, self.work)?;
             let elevated = self.wet_splits.contains(&junction)
                 || is_elevated_junction(inter, &self.roads, env);
             wet_tiles(env, &outline.0, self.work, |tile, water| {
                 validate_junction_height(inter, elevated, tile, water)
             })?;
-            outlines.push(
-                outline
-                    .iter()
-                    .map(|p| p.z(inter.pos.z + ROAD_Z_OFFSET))
-                    .collect(),
-            );
-        }
-        for &id in &self.changed_roads {
-            let road = &self.roads[id];
-            if validate_deck(road, env, self.work)? {
-                wet.insert(id);
-                let pattern = self.patterns.get(&id).cloned().unwrap_or_else(|| {
-                    self.map.roads[self.live_roads[&id]].pattern(&self.map.lanes)
-                });
-                let mut lanes = Lanes::default();
-                let mut road = road.clone();
-                self.work
-                    .charge(road.points().len().saturating_mul(pattern.lanes().count()))?;
-                road.make_lanes(&pattern, &mut lanes);
-                for lane in lanes.values_mut() {
-                    lane.gen_pos(&road);
-                    if !grade_fits(&lane.points) {
-                        return Err(ConnectionError::Grade);
-                    }
-                }
+            let lane_count: usize = inter.roads.iter().map(|&id| self.roads[id].n_lanes()).sum();
+            // A spline's adaptive step is inversely proportional to the
+            // square root of its second derivative. Reserve before creating turns.
+            let span = junction_support_bounds(inter, &self.roads)
+                .map_or(0.0, |bounds| bounds.size().mag());
+            let turn_work = 32_usize.saturating_add((span.sqrt() * 20.0) as usize);
+            self.work.charge(
+                lane_count
+                    .saturating_mul(lane_count)
+                    .saturating_mul(turn_work),
+            )?;
+            inter.update_turns(&lanes, &self.roads);
+            for turn in inter.turns() {
+                let route = JunctionRoute::new(turn, &lanes, self.work)?;
+                route.validate(env, self.work)?;
+            }
+            if !outline.is_empty() {
+                outlines.push(
+                    outline
+                        .iter()
+                        .map(|p| p.z(inter.pos.z + ROAD_Z_OFFSET))
+                        .collect(),
+                );
             }
         }
         Ok((wet, outlines))
@@ -990,6 +1137,108 @@ fn validate_junction_height(
         return Err(ConnectionError::WetJunction(tile));
     }
     Ok(())
+}
+
+fn segment_window(a: Vec2, b: Vec2, bounds: AABB) -> Option<(f32, f32)> {
+    let mut start = 0.0_f32;
+    let mut end = 1.0_f32;
+    for (src, dst, min, max) in [
+        (a.x, b.x, bounds.ll.x, bounds.ur.x),
+        (a.y, b.y, bounds.ll.y, bounds.ur.y),
+    ] {
+        let delta = dst - src;
+        if delta == 0.0 {
+            if src < min || src > max {
+                return None;
+            }
+        } else {
+            let enter = (min - src) / delta;
+            let exit = (max - src) / delta;
+            start = start.max(enter.min(exit));
+            end = end.min(enter.max(exit));
+        }
+    }
+    (start <= end).then_some((start, end))
+}
+
+pub(crate) struct JunctionRoute {
+    points: PolyLine3,
+    fits: bool,
+}
+
+impl JunctionRoute {
+    fn new(
+        turn: &Turn,
+        lanes: &Lanes,
+        work: &mut CrossingWork<'_>,
+    ) -> Result<Self, ConnectionError> {
+        work.charge(turn.points.len() + 1)?;
+        let mut points = turn.points.clone();
+        let destination = lanes[turn.id.dst].get_inter_node_pos(turn.id.parent);
+        points.push(destination);
+        let fits = grade_fits(&points);
+        Ok(Self { points, fits })
+    }
+
+    fn validate_segment(
+        &self,
+        a: Vec3,
+        b: Vec3,
+        tile: WaterTileCoord,
+        water: f32,
+    ) -> Result<(), ConnectionError> {
+        let Some((lo, hi)) = segment_window(a.xy(), b.xy(), tile_bounds(tile)) else {
+            return Ok(());
+        };
+        // Match half-open water tiles, including zero-length transitions at lane joins.
+        let middle = a.xy().lerp(b.xy(), (lo + hi) * 0.5);
+        if tile_at(middle) != tile {
+            return Ok(());
+        }
+        let z = a.z + (b.z - a.z) * if b.z < a.z { hi } else { lo };
+        if z - ROAD_Z_OFFSET + CLEARANCE_EPSILON < water + WATER_BRIDGE_CLEARANCE {
+            return Err(ConnectionError::WetJunction(tile));
+        }
+        if !self.fits {
+            return Err(ConnectionError::Grade);
+        }
+        Ok(())
+    }
+
+    fn validate(
+        &self,
+        env: &Environment,
+        work: &mut CrossingWork<'_>,
+    ) -> Result<(), ConnectionError> {
+        let world = env.bounds();
+        for &[a, b] in self.points.array_windows::<2>() {
+            let min = tile_at(a.xy().min(b.xy()).max(world.ll));
+            let max = tile_at(a.xy().max(b.xy()).min(world.ur));
+            for y in min.1..=max.1 {
+                for x in min.0..=max.0 {
+                    work.tile()?;
+                    let tile = WaterTileCoord(x, y);
+                    if let Some(water) = env.water_surface_elevation(tile.center()) {
+                        self.validate_segment(a, b, tile, water)?;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_tile(
+        &self,
+        tile: WaterTileCoord,
+        water: f32,
+        work: &mut CrossingWork<'_>,
+    ) -> Result<(), ConnectionError> {
+        for &[a, b] in self.points.array_windows::<2>() {
+            work.tile()?;
+            self.validate_segment(a, b, tile, water)?;
+        }
+        Ok(())
+    }
 }
 
 // The outer footprint includes the sidewalks at the full road width. Use the
@@ -1116,7 +1365,7 @@ pub(crate) fn prepare_direct_road(
                 pos: b,
                 split: None,
             };
-            prepare_topology(map, from, to, None, pattern, work)
+            prepare_topology(map, from, to, None, pattern, false, work)
         }
         explicit => {
             let length = match &explicit {
@@ -1167,7 +1416,7 @@ pub(crate) fn prepare_direct_road(
                 pos: b,
                 split: None,
             };
-            stage_connection(map, from, to, profile, pattern, elevated, work)
+            stage_connection(map, from, to, profile, pattern, elevated, false, work)
         }
     }
 }
@@ -1241,6 +1490,7 @@ pub(crate) enum ExistingCrossingGeometry {
     Junction {
         outline: Option<WaterFootprint>,
         elevated: bool,
+        routes: Vec<JunctionRoute>,
     },
 }
 
@@ -1271,6 +1521,10 @@ impl ExistingCrossingGeometry {
                 Ok(Self::Junction {
                     outline: WaterFootprint::new(&outline.0),
                     elevated: is_elevated_junction(inter, &map.roads, map.environment()),
+                    routes: inter
+                        .turns()
+                        .map(|turn| JunctionRoute::new(turn, &map.lanes, work))
+                        .collect::<Result<_, _>>()?,
                 })
             }
             _ => unreachable!("crossing geometry requires a road or intersection"),
@@ -1310,20 +1564,30 @@ impl ExistingCrossingGeometry {
                 }
                 error
             }
-            (Self::Junction { outline, elevated }, ProjectKind::Intersection(id)) => {
-                work.tile().map_err(|_| WaterEditError::Limit)?;
+            (
+                Self::Junction {
+                    outline,
+                    elevated,
+                    routes,
+                },
+                ProjectKind::Intersection(id),
+            ) => (|| {
+                work.tile()?;
                 if outline
                     .as_ref()
                     .is_some_and(|shape| shape.overlaps_tile(tile))
                 {
-                    validate_junction_height(&map.intersections[id], *elevated, tile, water)
-                } else {
-                    Ok(())
+                    validate_junction_height(&map.intersections[id], *elevated, tile, water)?;
                 }
-            }
+                for route in routes {
+                    route.validate_tile(tile, water, work)?;
+                }
+                Ok(())
+            })(),
             _ => unreachable!("crossing geometry and object kind agree"),
         };
         error.map_err(|reason| match reason {
+            ConnectionError::WorkLimit => WaterEditError::Limit,
             ConnectionError::WaterClearance(_) => {
                 WaterEditError::InsufficientClearance { object, tile }
             }
@@ -1380,102 +1644,360 @@ impl Map {
             return false;
         };
         let env = self.environment();
-        if env.intersects_water(&Polygon::from(lot.corners.as_slice())) {
+        dry_frontage(
+            road.width,
+            lot,
+            |xy, _| Some(road.interfaced_points().project_2d(xy)),
+            |xy| profile_height(env, xy),
+            |xy| env.is_water(xy),
+            |polygon| env.intersects_water(polygon),
+        )
+    }
+}
+
+fn frontage_samples(shape: &geom::OBB) -> usize {
+    (shape.corners[0].distance(shape.corners[1]) / (CELL_SIZE * 0.25))
+        .ceil()
+        .clamp(1.0, 256.0) as usize
+}
+
+/// The global scan is reserved by the caller. Only lots on this road need the
+/// split projection and the subsequent sample-by-sample frontage check.
+pub(crate) fn reassigned_frontage_work(map: &Map, id: RoadID, points: usize) -> usize {
+    let tile_work = frontage_attempt_work(map.roads[id].width, true);
+    map.lots
+        .values()
+        .filter(|lot| lot.parent == id)
+        .map(|lot| {
+            let samples = frontage_samples(&lot.shape);
+            points
+                .saturating_mul(samples + 3)
+                .saturating_add(tile_work.saturating_mul(samples.div_ceil(10)))
+        })
+        .fold(0, usize::saturating_add)
+}
+
+pub(crate) fn generated_frontage_work(length: f32, pattern: &LanePattern, wet: bool) -> usize {
+    let sides = pattern
+        .lanes()
+        .filter(|(kind, _, _)| *kind == crate::map::LaneKind::Walking)
+        .count()
+        .min(2);
+    if sides == 0 {
+        return 0;
+    }
+    // Allow a retry every two meters, including steep profiles. At each
+    // station only three segments per frontage sample can be visited.
+    let attempts = ((length * (1.0 + MAX_SLOPE * MAX_SLOPE).sqrt() / 2.0).ceil() as usize + 2)
+        .saturating_mul(sides);
+    attempts.saturating_mul(frontage_attempt_work(pattern.width(), wet) + 10)
+}
+
+pub(crate) fn frontage_attempt_work(width: f32, wet: bool) -> usize {
+    let tiles_across = ((width * 2.0 + 8.0) / CELL_SIZE).ceil() as usize + 2;
+    64 + if wet { 20 * tiles_across.pow(2) } else { 0 }
+}
+
+pub(crate) struct FrontageStations {
+    ends: Vec<f32>,
+}
+
+impl FrontageStations {
+    pub(crate) fn new(points: &PolyLine3) -> Self {
+        let ends = points
+            .segments()
+            .scan(0.0, |end, segment| {
+                *end += segment.src.distance(segment.dst);
+                Some(*end)
+            })
+            .collect();
+        Self { ends }
+    }
+
+    pub(crate) fn project(&self, points: &PolyLine3, xy: Vec2, station: f32) -> Option<Vec3> {
+        if self.ends.is_empty() {
+            return None;
+        }
+        let index = self
+            .ends
+            .partition_point(|&end| end < station)
+            .min(self.ends.len() - 1);
+        let low = index.saturating_sub(1);
+        let high = (index + 2).min(self.ends.len());
+        (low..high)
+            .map(|i| {
+                let (a, b) = (points[i], points[i + 1]);
+                let segment = geom::Segment {
+                    src: a.xy(),
+                    dst: b.xy(),
+                };
+                a.lerp(b, segment.project_t(xy))
+            })
+            .min_by(|a, b| xy.distance2(a.xy()).total_cmp(&xy.distance2(b.xy())))
+    }
+}
+
+pub(crate) fn dry_frontage(
+    width: f32,
+    lot: &geom::OBB,
+    mut project: impl FnMut(Vec2, f32) -> Option<Vec3>,
+    mut height: impl FnMut(Vec2) -> Option<f32>,
+    mut is_water: impl FnMut(Vec2) -> bool,
+    mut intersects_water: impl FnMut(&Polygon) -> bool,
+) -> bool {
+    if intersects_water(&Polygon::from(lot.corners.as_slice())) {
+        return false;
+    }
+    let a = lot.corners[0];
+    let b = lot.corners[1];
+    let count = frontage_samples(lot);
+    let mut previous: Option<[Vec2; 2]> = None;
+    for i in 0..=count {
+        let fraction = i as f32 / count as f32;
+        let xy = a.lerp(b, fraction);
+        let Some(point) = project(xy, fraction) else {
+            return false;
+        };
+        if height(xy).is_none_or(|ground| (point.z - ground).abs() > 1.0)
+            || xy.distance(point.xy()) > width * 0.5 + 2.0
+            || is_water(point.xy())
+        {
             return false;
         }
-        let a = lot.corners[0];
-        let b = lot.corners[1];
-        let count = (a.distance(b) / (CELL_SIZE * 0.25))
-            .ceil()
-            .clamp(1.0, 256.0) as usize;
-        let mut previous: Option<[Vec2; 2]> = None;
-        for i in 0..=count {
-            let xy = a + (b - a) * (i as f32 / count as f32);
-            let point = road.interfaced_points().project_2d(xy);
-            if profile_height(env, xy).is_none_or(|ground| (point.z - ground).abs() > 1.0) {
+        let edge = [xy, point.xy()];
+        if let Some([lot_edge, center]) = previous {
+            if intersects_water(&Polygon(vec![lot_edge, center, edge[1], edge[0]])) {
                 return false;
             }
-            let edge = [xy, point.xy()];
-            if xy.distance(point.xy()) > road.width * 0.5 + 2.0 {
-                return false;
-            }
-            if env.is_water(edge[1]) {
-                return false;
-            }
-            if let Some(last) = previous {
-                let [lot_edge, center] = last;
-                let corridor = Polygon(vec![lot_edge, center, edge[1], edge[0]]);
-                if env.intersects_water(&corridor) {
+            if let Some(direction) = (edge[1] - center).try_normalize() {
+                let normal = direction.perpendicular() * (width * 0.5);
+                let deck = Polygon(vec![
+                    center - normal,
+                    center + normal,
+                    edge[1] + normal,
+                    edge[1] - normal,
+                ]);
+                if intersects_water(&deck) {
                     return false;
                 }
-                if let Some(direction) = (edge[1] - center).try_normalize() {
-                    let normal = direction.perpendicular() * (road.width * 0.5);
-                    let deck = Polygon(vec![
-                        center - normal,
-                        center + normal,
-                        edge[1] + normal,
-                        edge[1] - normal,
-                    ]);
-                    if env.intersects_water(&deck) {
-                        return false;
+            }
+        }
+        previous = Some(edge);
+    }
+    true
+}
+
+pub(crate) struct DryingFrontage<'a> {
+    pub(crate) map: &'a Map,
+    pub(crate) prepared: &'a PreparedWaterEdit,
+    pub(crate) cuts: BTreeMap<TerrainChunkID, &'a crate::map::height_override::CutHeights>,
+    pub(crate) removed: &'a BTreeSet<ProjectKind>,
+    pub(crate) tiles: BTreeMap<TerrainChunkID, BTreeSet<WaterTileCoord>>,
+}
+
+pub(crate) struct StagedFrontageLot {
+    pub(crate) road: RoadID,
+    pub(crate) shape: OBB,
+    pub(crate) height: f32,
+}
+
+impl DryingFrontage<'_> {
+    pub(crate) fn stage(
+        &self,
+        roads: BTreeSet<RoadID>,
+        work: &mut usize,
+    ) -> Result<Vec<StagedFrontageLot>, WaterEditError> {
+        let mut lots = Vec::<StagedFrontageLot>::new();
+        let mut staged = AABBGrid::<usize, AABB>::new(50);
+        for id in roads {
+            let road = &self.map.roads[id];
+            if self.map.no_frontage.contains(&id) || !road.has_sidewalks() {
+                continue;
+            }
+            let points = road.interfaced_points();
+            let windows = self.windows(road, work)?;
+            if windows.is_empty() {
+                continue;
+            }
+            spend_water_work(work, 3 * points.len())?;
+            let stations = FrontageStations::new(points);
+            let sidewalks = road.sidewalks(road.src);
+            for (side, sidewalk) in [(1.0, sidewalks.outgoing), (-1.0, sidewalks.incoming)] {
+                if sidewalk.is_none() {
+                    continue;
+                }
+                let mut along = points.points_dirs_manual();
+                for &(start, end) in &windows {
+                    let mut station = (start / 2.0).ceil() * 2.0;
+                    while station <= end {
+                        spend_water_work(work, 1)?;
+                        let Some((pos, dir)) = along.next(station) else {
+                            break;
+                        };
+                        let axis = side * dir.perp_up().xy().normalize();
+                        let at = pos + (axis * (road.width * 0.5 + 1.0)).z0();
+                        let mut distance = 2.0;
+                        if let Some(height) =
+                            self.height(at.xy()).filter(|z| (z - at.z).abs() <= 1.0)
+                        {
+                            let sizes: &[f32] = match self.map.lot_layout {
+                                LotLayout::Uniform => &[UNIFORM_LOT_SIZE],
+                                LotLayout::Varied => &[40.0, 30.0, 20.0],
+                            };
+                            for &size in sizes {
+                                spend_water_work(work, frontage_attempt_work(road.width, true))?;
+                                let shape = OBB::new(at.xy() + axis * size * 0.5, axis, size, size);
+                                if !self.touches_dried(shape, road.width, work)?
+                                    || !dry_frontage(
+                                        road.width,
+                                        &shape,
+                                        |xy, t| {
+                                            stations.project(
+                                                points,
+                                                xy,
+                                                station + side * (0.5 - t) * size,
+                                            )
+                                        },
+                                        |xy| self.height(xy),
+                                        |xy| {
+                                            self.prepared
+                                                .water_at(self.map.environment(), xy)
+                                                .is_some()
+                                        },
+                                        |polygon| {
+                                            self.prepared
+                                                .intersects_water(self.map.environment(), polygon)
+                                        },
+                                    )
+                                    || Lot::frontage_obstructed(
+                                        self.map,
+                                        shape,
+                                        self.removed,
+                                        work,
+                                    )?
+                                {
+                                    continue;
+                                }
+                                let mut overlaps = false;
+                                for (_, _, &index) in staged.query(shape.bbox()) {
+                                    spend_water_work(work, 1)?;
+                                    overlaps |= shape.intersects(&lots[index].shape);
+                                }
+                                if !overlaps {
+                                    staged.insert(shape.bbox(), lots.len());
+                                    lots.push(StagedFrontageLot {
+                                        road: id,
+                                        shape,
+                                        height,
+                                    });
+                                    distance += size * 0.5 + 10.0;
+                                    break;
+                                }
+                            }
+                        }
+                        station += distance;
                     }
                 }
             }
-            previous = Some(edge);
         }
-        true
+        Ok(lots)
     }
-}
 
-impl Map {
-    /// Closest visible elevated deck along the pointer ray, using its actual deck Z.
-    pub fn project_road_deck(&self, ray: geom::Ray3, terrain: Vec3) -> Option<MapProject> {
-        let limit = (terrain - ray.from).dot(ray.dir) / ray.dir.mag2();
-        if !limit.is_finite() || limit < 0.0 {
-            return None;
+    fn windows(&self, road: &Road, work: &mut usize) -> Result<Vec<(f32, f32)>, WaterEditError> {
+        let mut station = 0.0;
+        let radius = road.width + 48.0;
+        let mut windows = Vec::<(f32, f32)>::new();
+        for segment in road.interfaced_points().segments() {
+            spend_water_work(work, 1)?;
+            let (a, b) = (segment.src.xy(), segment.dst.xy());
+            let len = segment.src.distance(segment.dst);
+            let bounds = AABB::new_ll_ur(a.min(b), a.max(b)).expand(radius);
+            for chunk in self.map.environment().covered_chunks(bounds) {
+                spend_water_work(work, 1)?;
+                for &tile in self.tiles.get(&chunk).into_iter().flatten() {
+                    spend_water_work(work, 1)?;
+                    if let Some((lo, hi)) = segment_window(a, b, tile_bounds(tile).expand(radius)) {
+                        windows.push((station + lo * len, station + hi * len));
+                    }
+                }
+            }
+            station += len;
         }
-        let line = geom::Segment::new(ray.from.xy(), (ray.from + ray.dir * limit).xy());
-        let bounds = bounds_of(&[line.src, line.dst]);
-        self.spatial_map
-            .construction_candidates(bounds, crate::map::ProjectFilter::ROAD)
-            .filter_map(|object| {
-                let ProjectKind::Road(id) = object else {
-                    return None;
-                };
-                let road = self.get(id)?;
-                if !road.elevated_span() {
-                    return None;
-                }
-                let depth = deck_triangles(road)
-                    .filter_map(|tri| ray_triangle(ray, tri).filter(|t| (0.0..=limit).contains(t)))
-                    .min_by(f32::total_cmp)?;
-                Some((depth, id))
-            })
-            .min_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)))
-            .map(|(depth, id)| {
-                let road = &self.roads[id];
-                let hit = ray.from + ray.dir * depth;
-                MapProject {
-                    pos: road.interfaced_points().project(hit),
-                    kind: ProjectKind::Road(id),
-                }
-            })
+        spend_water_work(
+            work,
+            windows
+                .len()
+                .saturating_mul(windows.len().max(1).ilog2() as usize + 1),
+        )?;
+        windows.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        let mut merged = Vec::<(f32, f32)>::new();
+        for (lo, hi) in windows {
+            if let Some(last) = merged.last_mut().filter(|last| lo <= last.1) {
+                last.1 = last.1.max(hi);
+            } else {
+                merged.push((lo, hi));
+            }
+        }
+        Ok(merged)
     }
-}
 
-fn ray_triangle(ray: geom::Ray3, [a, b, c]: [Vec3; 3]) -> Option<f32> {
-    let ab = b - a;
-    let ac = c - a;
-    let cross = ray.dir.cross(ac);
-    let det = ab.dot(cross);
-    if det.abs() <= f32::EPSILON {
-        return None;
+    fn touches_dried(
+        &self,
+        mut shape: OBB,
+        width: f32,
+        work: &mut usize,
+    ) -> Result<bool, WaterEditError> {
+        let back = (shape.corners[3] - shape.corners[0]).normalize() * (width + 1.0);
+        shape.corners[0] -= back;
+        shape.corners[1] -= back;
+        let footprint = WaterFootprint::new(&shape.corners).unwrap();
+        for chunk in self.map.environment().covered_chunks(shape.bbox()) {
+            spend_water_work(work, 1)?;
+            for &tile in self.tiles.get(&chunk).into_iter().flatten() {
+                spend_water_work(work, 1)?;
+                if footprint.overlaps_tile(tile) {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
-    let origin = ray.from - a;
-    let u = origin.dot(cross) / det;
-    let side = origin.cross(ab);
-    let v = ray.dir.dot(side) / det;
-    (u >= 0.0 && v >= 0.0 && u + v <= 1.0).then(|| ac.dot(side) / det)
+
+    fn height(&self, point: Vec2) -> Option<f32> {
+        let env = self.map.environment();
+        let node_height = |point: Vec2| {
+            let chunk = TerrainChunkID::new(point);
+            if !self.prepared.dirty().terrain().contains(&chunk) && !self.cuts.contains_key(&chunk)
+            {
+                return env.heightmap.height_nearest(point);
+            }
+            let node = (point / CELL_SIZE).floor() * CELL_SIZE;
+            let base = self.prepared.base_height(env, node)?;
+            let index = tile_at(node).local_index();
+            let cut = self.cuts.get(&chunk).map(|cuts| {
+                cuts[index / TERRAIN_CHUNK_RESOLUTION][index % TERRAIN_CHUNK_RESOLUTION]
+            });
+            Some(
+                cut.filter(|&cut| cut != NO_OVERRIDE)
+                    .map_or(base, |cut| base.min(unpack_height(cut))),
+            )
+        };
+        let ll = node_height(point)?;
+        let height = match (
+            node_height(point + Vec2::x(CELL_SIZE)),
+            node_height(point + Vec2::y(CELL_SIZE)),
+            node_height(point + Vec2::splat(CELL_SIZE)),
+        ) {
+            (Some(lr), Some(ul), Some(ur)) => {
+                let p = (point / CELL_SIZE).fract();
+                let lower = ll + p.x * (lr - ll);
+                let upper = ul + p.x * (ur - ul);
+                lower + p.y * (upper - lower)
+            }
+            _ => ll,
+        };
+        Some(height.max(0.0))
+    }
 }
 
 pub(crate) fn remap_merged_roads(

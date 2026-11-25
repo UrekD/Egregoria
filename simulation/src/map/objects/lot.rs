@@ -1,7 +1,8 @@
 use crate::map::spend_water_work;
 use crate::map::terrain::CELL_SIZE;
 use crate::map::{
-    Building, Environment, LotOrigin, Map, ProjectFilter, ProjectKind, Road, RoadID, UpdateType,
+    dry_frontage, frontage_attempt_work, profile_height, Building, Environment, FrontageStations,
+    LotOrigin, Map, ProjectFilter, ProjectKind, Road, RoadID, UpdateType,
     WaterEditError, WaterFootprint, WaterTileCoord, MAX_WATER_BATCH_WORK,
 };
 use geom::{Intersect, Polygon, Segment, Shape, Vec2, Vec3, AABB, OBB};
@@ -315,6 +316,15 @@ impl Lot {
     }
 
     pub fn generate_along_road(map: &mut Map, road: RoadID) {
+        Self::generate_along_final_road(map, road, true, None);
+    }
+
+    pub(crate) fn generate_along_final_road(
+        map: &mut Map,
+        road: RoadID,
+        check_water: bool,
+        mut reserved: Option<usize>,
+    ) {
         let Some(r) = map.roads.get(road) else {
             log::error!("trying to generate along invalid road");
             return;
@@ -322,9 +332,14 @@ impl Lot {
         if !Self::allows_frontage(map, r) {
             return;
         }
-
-        fn gen_side(map: &mut Map, road: RoadID, side: f32) {
-            let r = unwrap_ret!(map.roads.get(road));
+        fn gen_side(
+            map: &mut Map,
+            road: RoadID,
+            side: f32,
+            check_water: bool,
+            reserved: &mut Option<usize>,
+        ) -> Result<(), WaterEditError> {
+            let r = &map.roads[road];
 
             let w = r.width * 0.5;
             let mut ri = 0.0;
@@ -344,7 +359,17 @@ impl Lot {
                 }
             };
 
-            let points = r.points.clone();
+            let strict = map.environment.strict_water_siting();
+            let points = if strict {
+                r.interfaced_points()
+            } else {
+                r.points()
+            }
+            .clone();
+            if let Some(work) = reserved.as_mut() {
+                spend_water_work(work, points.len())?;
+            }
+            let stations = strict.then(|| FrontageStations::new(&points));
             let mut along = points.points_dirs_manual();
             let mut size = picksize();
             let mut d = size * 0.5;
@@ -352,8 +377,46 @@ impl Lot {
             while let Some((pos, dir)) = along.next(d) {
                 let axis = side * dir.perp_up();
                 let at = pos + axis * (w + 1.0);
-                let shape = OBB::new(at.xy() + axis.xy() * size * 0.5, axis.xy(), size, size);
-                if let Some(id) = Lot::make_if_clear(map, road, at, shape) {
+                let lot = if let Some(stations) = &stations {
+                    if let Some(work) = reserved.as_mut() {
+                        spend_water_work(work, 1)?;
+                    }
+                    let shape = OBB::new(at.xy() + axis.xy() * size * 0.5, axis.xy(), size, size);
+                    let env = map.environment();
+                    let height = env
+                        .height(at.xy())
+                        .filter(|height| (height - at.z).abs() <= 1.0);
+                    if let Some(height) = height.filter(|_| !map.no_frontage.contains(&road)) {
+                        if let Some(work) = reserved.as_mut() {
+                            spend_water_work(
+                                work,
+                                frontage_attempt_work(2.0 * w, check_water) - 1,
+                            )?;
+                        }
+                        let dry = dry_frontage(
+                            2.0 * w,
+                            &shape,
+                            |point, fraction| {
+                                stations.project(&points, point, d + side * (0.5 - fraction) * size)
+                            },
+                            |point| profile_height(env, point),
+                            |point| check_water && env.is_water(point),
+                            |polygon| check_water && env.intersects_water(polygon),
+                        );
+                        let clear = dry
+                            && if let Some(work) = reserved.as_mut() {
+                                !Lot::frontage_obstructed(map, shape, &BTreeSet::new(), work)?
+                            } else {
+                                !Lot::footprint_obstructed(map, shape, true)
+                            };
+                        clear.then(|| Lot::insert(map, road, shape, height))
+                    } else {
+                        None
+                    }
+                } else {
+                    Lot::try_make(map, road, at, axis.xy(), size)
+                };
+                if let Some(id) = lot {
                     map.subscribers.dispatch(UpdateType::Road, &map.lots[id]);
 
                     d += size * 0.5 + 2.0;
@@ -363,16 +426,61 @@ impl Lot {
                     d += 2.0;
                 }
             }
+            Ok(())
         }
 
-        let r = unwrap_ret!(map.roads.get(road));
+        let r = &map.roads[road];
         let pair = r.sidewalks(r.src);
-        if pair.outgoing.is_some() {
-            gen_side(map, road, 1.0);
+        // Lot allocation is optional. Stop at the reserved limit even when
+        // dense overlapping shapes make the obstruction checks expensive.
+        if pair.outgoing.is_some() && gen_side(map, road, 1.0, check_water, &mut reserved).is_err()
+        {
+            return;
         }
         if pair.incoming.is_some() {
-            gen_side(map, road, -1.0);
+            let _ = gen_side(map, road, -1.0, check_water, &mut reserved);
         }
+    }
+
+    pub(crate) fn frontage_obstructed(
+        map: &Map,
+        shape: OBB,
+        removed: &BTreeSet<ProjectKind>,
+        work: &mut usize,
+    ) -> Result<bool, WaterEditError> {
+        let polygon = Polygon::from(shape.corners.as_slice());
+        for object in map
+            .spatial_map
+            .construction_candidates(shape.bbox(), ProjectFilter::ALL)
+        {
+            spend_water_work(work, 1)?;
+            if removed.contains(&object) {
+                continue;
+            }
+            let blocked = match object {
+                ProjectKind::Road(id) => {
+                    let road = &map.roads[id];
+                    spend_water_work(work, road.points().len().saturating_mul(6))?;
+                    polygon.intersects(&road.boldline())
+                }
+                ProjectKind::Intersection(id) => shape.intersects(&map.intersections[id].bcircle()),
+                ProjectKind::Building(id) => {
+                    let building = &map.buildings[id];
+                    if let Some(zone) = &building.zone {
+                        spend_water_work(work, zone.poly.len().saturating_mul(5))?;
+                        shape.intersects(&zone.poly) || shape.intersects(&building.obb)
+                    } else {
+                        shape.intersects(&building.obb)
+                    }
+                }
+                ProjectKind::Lot(id) => shape.intersects(&map.lots[id].shape),
+                ProjectKind::Ground => false,
+            };
+            if blocked {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn remove_intersecting_lots(map: &mut Map, road: RoadID) {
