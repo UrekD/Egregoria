@@ -401,7 +401,7 @@ fn run_attainment(ctx: &mut ScenarioCtx) -> Result<(), String> {
     use simulation::souls::development::requirements;
 
     require_profiles()?;
-    grow_city_with_health(ctx, true, None, true, &[])?;
+    grow_city(ctx, true, None)?;
     check_commissioning(ctx, true)?;
     for kind in [Residential, MixedUse] {
         let count = summaries(&ctx.sim)
@@ -419,7 +419,7 @@ fn run_attainment(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
 
     let mut control = ScenarioCtx::new(OPTIONS);
-    grow_city_with_health(&mut control, true, None, false, &[])?;
+    grow_city_with_health(&mut control, true, None, false, &FOOD_SUPPLY)?;
     for kind in [Residential, MixedUse] {
         let ids: Vec<_> = control.sim.map().buildings().keys().collect();
         let mut health_blocked = 0;
