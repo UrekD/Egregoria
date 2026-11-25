@@ -1,10 +1,13 @@
+mod adapters;
 mod clearance;
+mod commission;
 mod layout;
 mod network;
 mod source;
 pub mod spacing;
 pub mod traffic;
 
+pub use commission::{check_loaded_opening, commission, OpeningManifest, OpeningReport};
 pub use layout::*;
 pub use network::*;
 pub use source::*;
@@ -64,14 +67,14 @@ pub fn schematic_cli(args: impl Iterator<Item = OsString>) -> Result<(), String>
 
 pub fn build_cli(args: impl Iterator<Item = OsString>) -> Result<(), String> {
     let (out, lesce, sava) = cli_paths("citymap-build", args)?;
-    export_dry_slot(
+    export_commissioned_slot(
         SourcePaths {
             lesce: &lesce,
             sava: Some(&sava),
         },
         &out,
     )?;
-    println!("Wrote dry lesce_town and build report to {}", out.display());
+    println!("Wrote commissioned lesce_town and opening report to {}", out.display());
     Ok(())
 }
 
@@ -137,6 +140,15 @@ const BUILD_REPORT: &str = "lesce_town.build.json";
 
 /// Saves the dry network and its report in a dedicated, previously absent directory.
 pub fn export_dry_slot(paths: SourcePaths<'_>, out: &Path) -> Result<(), String> {
+    export_slot(paths, out, false)
+}
+
+/// Publishes a commissioned dry opening only after the restored slot passes its soak.
+pub fn export_commissioned_slot(paths: SourcePaths<'_>, out: &Path) -> Result<(), String> {
+    export_slot(paths, out, true)
+}
+
+fn export_slot(paths: SourcePaths<'_>, out: &Path, commissioned: bool) -> Result<(), String> {
     let out = std::path::absolute(out).map_err(|error| error.to_string())?;
     let name = out
         .file_name()
@@ -148,10 +160,12 @@ pub fn export_dry_slot(paths: SourcePaths<'_>, out: &Path) -> Result<(), String>
 
     let inputs = read_inputs(paths)?;
     let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default())?;
-    let (sim, _) = build_dry_town(&plan)?;
+    let (mut sim, built) = build_dry_town(&plan)?;
+    let opening = commissioned.then(|| commission(&mut sim, &plan, &built)).transpose()?;
+    let variant = if commissioned { "dry-split-high" } else { DRY_VARIANT };
     let id = SlotId::new("lesce_town").map_err(|error| error.to_string())?;
     let (revision, blueprint_sha256) =
-        snapshot_revision(&id, &sim, &inputs, &plan, DRY_VARIANT, SAVE_VERSION)?;
+        snapshot_revision(&id, &sim, &inputs, &plan, variant, SAVE_VERSION)?;
     let camera = SlotCamera {
         position: [plan.station.x, plan.station.y, 10.0],
         yaw: -0.35,
@@ -213,11 +227,19 @@ pub fn export_dry_slot(paths: SourcePaths<'_>, out: &Path) -> Result<(), String>
     )?;
     report["slot"] = serde_json::json!(id.as_str());
     report["snapshot_revision"] = serde_json::json!(format!("{:032x}", revision.get()));
-    report["variant"] = serde_json::json!(DRY_VARIANT);
+    report["variant"] = serde_json::json!(variant);
     report["save_version"] = serde_json::json!(SAVE_VERSION.trim());
     report["blueprint_sha256"] = serde_json::json!(blueprint_sha256);
     report["scope"] =
         serde_json::json!("Dry authored network with reserved Sava crossings and facility sites.");
+    drop(map);
+    if let Some(opening) = opening {
+        let measured = check_loaded_opening(loaded, &plan, &opening)?;
+        measured.verify()?;
+        report["scope"] = serde_json::json!("Commissioned dry opening with split High downtown zoning.");
+        report["opening_manifest"] = serde_json::to_value(opening).map_err(|error| error.to_string())?;
+        report["opening"] = serde_json::to_value(measured).map_err(|error| error.to_string())?;
+    }
     let report = serde_json::to_vec_pretty(&report).map_err(|error| error.to_string())?;
     let mut file = File::options()
         .write(true)
