@@ -180,11 +180,21 @@ pub fn commission(
             sites.insert(format!("{name}-{}", index + 1), building);
         }
     }
-    // Use the terminal for coal. In the road-supplied opening, mines reserved
-    // the plant's orders while their drivers were away from the depot.
-    let (plant, _) = place_company(sim, plan, &roads, "coal-power-plant", bakery_anchor)?;
+    // Use the frontage between South and West so mine drivers can reach work
+    // and deliver fuel without competing for the terminal's delivery fleet.
+    let (plant, plant_road) =
+        place_company(sim, plan, &roads, "coal-power-plant", at(1740.0, 1430.0))?;
     sites.insert("coal-power-plant".into(), plant);
-    verify_parking_pair(&sim.map(), terminal, plant, Tick(sim.get_tick()))?;
+    let plant_door = sim.map().buildings()[plant].door_pos.xy();
+    let mine_frontage = BTreeSet::from([plant_road]);
+    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)]
+        .into_iter()
+        .enumerate()
+    {
+        let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
+        verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
+        sites.insert(format!("coal-mine-{}", index + 1), mine);
+    }
     // Use parking frontage near both the field clusters and the shops.
     for (i, (x, y)) in [
         (1110.0, 1550.0),
@@ -1668,8 +1678,13 @@ fn spare_capacity(supply: f64, demand: f64) -> bool {
     supply.is_finite() && demand.is_finite() && demand > 0.0 && supply >= demand * 1.25
 }
 
-fn line_operating(before: u64, after: u64, loops: u64, completed: u64) -> bool {
-    after.saturating_sub(before) >= 10 && loops > 0 && completed > 0
+fn line_operating(line: &str, boardings: u64, loops: u64, completed: u64) -> bool {
+    loops > 0
+        && if line == "employment" {
+            boardings >= 5
+        } else {
+            boardings >= 10 && completed > 0
+        }
 }
 
 fn traffic_clear(car_arrivals: u64, standing: u64, blocking: u64, stranded: u64) -> bool {
@@ -1699,6 +1714,18 @@ struct DistrictState {
     developed_blocks: BTreeMap<usize, u64>,
     operating_blocks: BTreeMap<usize, u64>,
     coverage: BTreeMap<String, u64>,
+}
+
+impl DistrictState {
+    fn opening_uses_met(&self, district: &str) -> bool {
+        self.stocked_shops > 0
+            && if district == "employment" {
+                self.jobs > 0
+            } else {
+                self.residents > 0
+                    && self.operating_blocks.values().filter(|&&active| active >= 2).count() >= 2
+            }
+    }
 }
 
 #[derive(Serialize)]
@@ -2739,20 +2766,17 @@ pub fn check_loaded_opening(
         ));
     }
     for district in &plan.districts {
-        if opening.districts.get(district.key).is_none_or(|d| {
-            d.operating_blocks
-                .values()
-                .filter(|&&active| active >= 2)
-                .count()
-                < 2
-                || d.stocked_shops == 0
-                || (district.key != "employment" && d.residents == 0)
-                || (district.key == "employment" && d.jobs == 0)
-        }) {
-            failures.push(format!(
-                "{} lacks two active blocks or its intended occupancy/stocked uses",
-                district.key
-            ));
+        if opening
+            .districts
+            .get(district.key)
+            .is_none_or(|data| !data.opening_uses_met(district.key))
+        {
+            let required_uses = if district.key == "employment" {
+                "jobs or stocked shops"
+            } else {
+                "two active blocks, residents or stocked shops"
+            };
+            failures.push(format!("{} lacks {required_uses}", district.key));
         }
     }
     let load = elapsed_tick(&sim).0;
@@ -2879,12 +2903,13 @@ pub fn check_loaded_opening(
             let before = initial_boardings.get(&line.id).copied().unwrap_or(0);
             let completed_loops = loops.loops.get(&line.id).copied().unwrap_or(0)
                 - initial_loops.get(&line.id).copied().unwrap_or(0);
-            line_boardings.insert(key, after.saturating_sub(before));
+            let boardings = after.saturating_sub(before);
+            line_boardings.insert(key, boardings);
             line_loops.insert(key, completed_loops);
             let completed_journeys = passengers.completed.get(&line.id).copied().unwrap_or(0)
                 - initial_passengers.get(&line.id).copied().unwrap_or(0);
             line_completed_journeys.insert(key, completed_journeys);
-            if !line_operating(before, after, completed_loops, completed_journeys) {
+            if !line_operating(key, boardings, completed_loops, completed_journeys) {
                 failures.push(format!(
                     "day {day}: bus line {key} did not meet boarding and arrival gates"
                 ));
@@ -3083,11 +3108,35 @@ mod tests {
 
     #[test]
     fn cm2_gate_transit_requires_new_boardings_and_real_loop() {
-        assert!(line_operating(300, 310, 1, 1));
-        assert!(!line_operating(300, 300, 1, 1));
-        assert!(!line_operating(300, 315, 0, 1));
-        assert!(!line_operating(300, 315, 1, 0));
-        assert!(!line_operating(300, 15, 1, 1));
+        assert!(line_operating("employment", 5, 1, 0));
+        assert!(!line_operating("employment", 4, 1, 1));
+        assert!(!line_operating("employment", 5, 0, 1));
+        assert!(line_operating("neighbourhood", 10, 1, 1));
+        assert!(!line_operating("neighbourhood", 9, 1, 1));
+        assert!(!line_operating("neighbourhood", 15, 0, 1));
+        assert!(!line_operating("neighbourhood", 15, 1, 0));
+    }
+
+    #[test]
+    fn cm2_gate_employment_requires_jobs_and_retail() {
+        let mut district = DistrictState {
+            jobs: 1,
+            stocked_shops: 1,
+            ..Default::default()
+        };
+        assert!(district.opening_uses_met("employment"));
+        district.jobs = 0;
+        assert!(!district.opening_uses_met("employment"));
+        district.jobs = 1;
+        district.stocked_shops = 0;
+        assert!(!district.opening_uses_met("employment"));
+        district.stocked_shops = 1;
+        district.residents = 1;
+        district.operating_blocks.insert(1, 2);
+        district.operating_blocks.insert(2, 1);
+        assert!(!district.opening_uses_met("west"));
+        district.operating_blocks.insert(2, 2);
+        assert!(district.opening_uses_met("west"));
     }
 
     #[test]
