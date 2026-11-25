@@ -775,13 +775,13 @@ mod tests {
         ctx.run_with_hashes("paris-smoke", &mut hashes, |ctx| run_perf_case(ctx, case))
             .unwrap();
         let checkpoint: serde_json::Value = serde_json::from_slice(&hashes).unwrap();
-        // Keep the M0 gameplay projection. The raw hashes use the current world
-        // and map save formats, which include company departures and terrain water.
+        // Keep the M0 gameplay projection. The 0.11.0 world format also
+        // serializes each resident's education hours.
         assert_eq!(checkpoint["tick"], 5);
         assert_eq!(checkpoint["projection"], 7_202_952_127_034_493_285_u64);
         assert_eq!(
             checkpoint["hashes"]["world"],
-            9_337_612_473_985_617_770_u64
+            14_091_543_823_439_975_702_u64
         );
         assert_eq!(checkpoint["hashes"]["map"], 7_227_799_503_381_117_479_u64);
     }
