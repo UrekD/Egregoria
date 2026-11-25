@@ -5,7 +5,10 @@ use crate::map::{
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
 use crate::transportation::traffic_metrics::within_lane;
-use crate::transportation::{Location, RoadThroughput, RoadUserKind, VehicleKind};
+use crate::transportation::{
+    put_pedestrian_in_transport_grid, Location, RoadThroughput, RoadUserKind, TransportGrid,
+    VehicleKind,
+};
 use crate::utils::resources::Resources;
 use crate::world::TrainID;
 use crate::{HumanWork, World};
@@ -1003,10 +1006,31 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             );
         };
     world.humans.edit_active(HumanWork::Itinerary, |_, human| {
-        let kind = (human.location == Location::Outside).then_some(RoadUserKind::Pedestrian);
+        let outside = human.location == Location::Outside;
+        let kind = outside.then_some(RoadUserKind::Pedestrian);
         let speed = human.speed.0;
         let (itinerary, pos) = human.itinerary_mut();
         update(itinerary, pos, speed, kind);
+        if !outside {
+            return;
+        }
+        // A cancelled walk or a pending reroute can leave a pedestrian in a crosswalk.
+        // Release its obstruction until the itinerary has a point to walk toward again.
+        match (human.it.get_point(), human.collider) {
+            (None, Some(collider)) => {
+                resources.write::<TransportGrid>().remove_maintain(collider.0);
+                human.collider = None;
+                human.speed.0 = 0.0;
+            }
+            (Some(_), None) => {
+                let pos = human.trans.pos;
+                let mut grid = resources.write::<TransportGrid>();
+                let collider = put_pedestrian_in_transport_grid(&mut grid, pos);
+                grid.get_mut(collider.0).unwrap().1.height = pos.z;
+                human.collider = Some(collider);
+            }
+            _ => {}
+        }
     });
     for train in world.trains.values_mut() {
         update(&mut train.it, &mut train.trans.pos, train.speed.0, None);
@@ -1057,6 +1081,64 @@ mod tests {
     fn update_at(sim: &mut Simulation, tick: u64) {
         *sim.write::<GameTime>() = GameTime::new(Tick(tick));
         itinerary_update(&mut sim.world, &mut sim.resources);
+    }
+
+    #[test]
+    fn pedfix_cancelled_walk_releases_collider_and_next_walk_restores_it() {
+        use crate::map_dynamic::Destination;
+
+        let mut ctx = TestCtx::new();
+        let junction = vec3(270.0, 180.0, 0.0);
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), junction, vec3(470.0, 180.0, 0.0)]);
+        ctx.build_roads(&[junction, vec3(270.0, 350.0, 0.0)]);
+        let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
+        let id = spawn_human(&mut ctx.g, house).unwrap();
+        let (position, destination) = {
+            let map = ctx.g.map();
+            let crosswalk = map
+                .intersections()
+                .values()
+                .flat_map(|intersection| intersection.turns())
+                .find(|turn| turn.kind == TurnKind::Crosswalk)
+                .unwrap();
+            (crosswalk.points.middle(), crosswalk.points.last())
+        };
+        let collider = put_pedestrian_in_transport_grid(&mut ctx.g.write::<TransportGrid>(), position);
+        let tick = ctx.g.get_tick();
+        let (world, resources) = ctx.g.world_res();
+        world.edit_human(id, |human| {
+            human.trans.pos = position;
+            human.location = Location::Outside;
+            human.router.go_to(Destination::Outside(destination));
+            human.it = Itinerary::simple(vec![destination]);
+            human.collider = Some(collider);
+            human.speed.0 = 1.4;
+        });
+        world.edit_human(id, |human| {
+            human.router.cancel_route(&mut resources.write::<ParkingManagement>());
+            human.it = Itinerary::NONE;
+        });
+
+        update_at(&mut ctx.g, tick + 1);
+        assert!(ctx.g.world.humans[id].collider.is_none());
+        assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_none());
+        assert_eq!(ctx.g.world.humans[id].trans.pos, position);
+        assert_eq!(ctx.g.world.humans[id].speed.0, 0.0);
+
+        ctx.g.world.edit_human(id, |human| {
+            human.router.go_to(Destination::Outside(destination));
+        });
+        let (world, resources) = ctx.g.world_res();
+        crate::map_dynamic::routing_changed_system(world, resources);
+        crate::map_dynamic::routing_update_system(world, resources);
+        update_at(&mut ctx.g, tick + 2);
+        let human = &ctx.g.world.humans[id];
+        assert!(human.it.get_point().is_some());
+        assert!(ctx
+            .g
+            .read::<TransportGrid>()
+            .get(human.collider.unwrap().0)
+            .is_some());
     }
 
     #[test]

@@ -10,9 +10,7 @@ use super::{
 use crate::economy::{on_wait_timeout, transit_stats, TripProgress};
 use crate::map::Map;
 use crate::map_dynamic::{Itinerary, LineID, Router, RoutingStep, StopID};
-use crate::transportation::{
-    put_pedestrian_in_transport_grid, spawn_driving_vehicle, Location, TransportGrid, VehicleKind,
-};
+use crate::transportation::{spawn_driving_vehicle, Location, TransportGrid, VehicleKind};
 use crate::utils::resources::Resources;
 use crate::{
     HumanEnt, HumanID, HumanWork, ParCommandBuffer, Simulation, VehicleEnt, VehicleID, World,
@@ -415,13 +413,6 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         }
         human.router.stamp_wait_start(now);
         let Some(RoutingStep::WaitAtStop { stop, line, since }) = human.router.cur_step() else {
-            // Routing can replace a wait after the boarding system has run.
-            if human.collider.is_none() {
-                let mut grid = resources.write::<TransportGrid>();
-                let collider = put_pedestrian_in_transport_grid(&mut grid, human.trans.pos);
-                grid.get_mut(collider.0).unwrap().1.height = human.trans.pos.z;
-                human.collider = Some(collider);
-            }
             return;
         };
         let (stop, line, since) = (*stop, *line, *since);

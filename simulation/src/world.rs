@@ -203,8 +203,10 @@ impl HumanWork {
         (1 << Self::Pedestrian as usize) | (1 << Self::Itinerary as usize);
 
     fn movement_membership(human: &HumanEnt) -> u8 {
+        let needs_itinerary_update = !human.it.is_inert()
+            || (human.location == Location::Outside && human.collider.is_some());
         (u8::from(!human.pedestrian.is_still(human)) << Self::Pedestrian as usize)
-            | (u8::from(!human.it.is_inert()) << Self::Itinerary as usize)
+            | (u8::from(needs_itinerary_update) << Self::Itinerary as usize)
     }
 
     fn membership(human: &HumanEnt) -> u8 {
@@ -431,8 +433,8 @@ impl HumanEdit<'_> {
     }
 
     pub(crate) fn itinerary_mut(&mut self) -> (&mut Itinerary, &mut geom::Vec3) {
-        // Movement can wake the pedestrian pass, and can finish the itinerary.
-        // The other work sets depend only on the router and location.
+        // Movement can wake the pedestrian pass and finish the itinerary. The
+        // other work sets depend only on the router and location.
         if matches!(self.refresh, HumanRefresh::None) {
             self.refresh = HumanRefresh::Itinerary;
         }

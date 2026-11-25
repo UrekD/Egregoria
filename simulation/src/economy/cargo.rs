@@ -5532,7 +5532,7 @@ mod lifecycle_tests {
         if !full_scan {
             sim.world
                 .collect_active(HumanWork::Itinerary, &mut candidates);
-            assert!(candidates.is_empty());
+            assert_eq!(candidates, [driver]);
             sim.world
                 .collect_active(HumanWork::Outside, &mut candidates);
             assert_eq!(candidates, [driver]);
@@ -5540,6 +5540,7 @@ mod lifecycle_tests {
         let recovery = sim.hashes();
         let (world, resources) = sim.world_res();
         itinerary_update(world, resources);
+        assert!(sim.get(driver).unwrap().collider.is_none());
         [decision, refusal, recovery, sim.hashes()]
     }
 

@@ -2024,12 +2024,13 @@ fn l1_activity_rehome_and_freight_abort_refresh_before_the_next_phase() {
     indexed
         .world
         .collect_active(HumanWork::Itinerary, &mut candidates);
-    assert!(!candidates.contains(&driver));
+    assert!(candidates.contains(&driver));
     indexed
         .world
         .collect_active(HumanWork::Outside, &mut candidates);
     assert!(candidates.contains(&driver));
     l1_assert_phase_hashes(&mut indexed, &mut full_scan);
+    assert!(indexed.get(driver).unwrap().collider.is_none());
 
     for sim in [&mut indexed, &mut full_scan] {
         sim.apply_commands([&WorldCommand::MapRemoveBuilding(old_home)]);
