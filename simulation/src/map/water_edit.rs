@@ -4,8 +4,8 @@ use super::{
 use crate::map::terrain::CELL_SIZE;
 use crate::map::{
     deck_triangles, footprint_tiles, prepare_water_providers, DeckTriangle, Intersection,
-    IntersectionID, Lot, LotLayout, PreparedWaterEdit, PreparedWaterProviders, Road, RoadID,
-    Roads, TerrainChunkID, Turn, UpdateType, WaterDirtyChunks, WaterEdit, WaterEditError,
+    IntersectionID, Lot, LotLayout, PreparedWaterEdit, PreparedWaterProviders, Road, RoadID, Roads,
+    TerrainChunkID, Turn, UpdateType, WaterDirtyChunks, WaterEdit, WaterEditError,
     WaterEditOutcome, WaterFootprint, WaterProviderImpact, WaterTileCoord, ZoneCellCoord, ZoneGrid,
     FRONTAGE_HEIGHT_TOLERANCE_M, MAX_LOT_SIZE, MAX_SLOPE, MAX_WATER_BATCH_WORK, MIN_LOT_SIZE,
     ROAD_Z_OFFSET, UNIFORM_LOT_SIZE,
@@ -108,8 +108,11 @@ impl Map {
         }
         outcome.dirty = outcome.dirty.union(effects.dirty);
         if outcome.changed {
-            self.water_services
-                .water_edited(&self.environment, &outcome.dirty, effects.water_providers);
+            self.water_services.water_edited(
+                &self.environment,
+                &outcome.dirty,
+                effects.water_providers,
+            );
         }
         self.subscribers.dispatch_water(&outcome.dirty);
         Ok(outcome)
@@ -934,10 +937,64 @@ mod tests {
     }
 
     #[test]
+    fn w2b_water_shallow_merge_preserves_dry_end_lot() {
+        drop(TestCtx::new_fast());
+        let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+        sim.edit_water(lake(vec2(248.0, 392.0), 8.0, 50)).unwrap();
+        let mut map = sim.map_mut();
+        map.set_lot_layout(LotLayout::Uniform);
+
+        let ground = |x| MapProject::ground(vec2(x, 128.0).z(10.0));
+        let junction = |x, id| MapProject {
+            pos: ground(x).pos,
+            kind: ProjectKind::Intersection(id),
+        };
+        let street = LanePatternBuilder::new().build();
+        let approach = LanePatternBuilder::new().speed_limit(8.0).build();
+        let (start, _) = map
+            .make_connection(ground(40.0), ground(100.0), None, &approach)
+            .unwrap();
+        let (middle, first) = map
+            .make_connection(junction(100.0, start), ground(270.0), None, &street)
+            .unwrap();
+        let lot = map
+            .lots()
+            .values()
+            .filter(|lot| lot.parent == first)
+            .min_by(|a, b| a.shape.center().x.total_cmp(&b.shape.center().x))
+            .unwrap()
+            .id;
+        map.make_connection(junction(270.0, middle), ground(440.0), None, &street)
+            .unwrap();
+        assert!(!map.roads().contains_key(first));
+        assert!(
+            map.build_house(lot).is_some(),
+            "end lot was lost in the merge"
+        );
+    }
+
+    #[test]
     fn w2b_water_edit_cleans_and_restores_local_frontage() {
+        use crate::map::{
+            water_provider_site, BuildingKind, WaterProviderImpactSample, WaterServiceRole,
+            WaterSite, WaterSiteError,
+        };
+        use prototypes::{try_prototype, GoodsCompanyID};
+
         drop(TestCtx::new_fast());
         let mut sim = Simulation::new_authored_flat(5, 0).unwrap();
         let road = road(&sim, 128.0, 10.0);
+        let pump_kind = GoodsCompanyID::new("water-pump");
+        let pump = sim
+            .map_mut()
+            .build_special_building(
+                &OBB::new(vec2(248.0, 208.0), Vec2::X, 20.0, 20.0),
+                BuildingKind::GoodsCompany(pump_kind),
+                try_prototype(pump_kind).unwrap().bgen,
+                None,
+                Some(road),
+            )
+            .unwrap();
         let paint = OBB::new(vec2(248.0, 164.0), Vec2::X, 16.0, 8.0);
         sim.write::<ZoneGrid>()
             .paint_on_map(
@@ -968,10 +1025,26 @@ mod tests {
         assert_eq!(sim.read::<ZoneGrid>().generation(), generation + 1);
         assert!(sim.read::<ZoneGrid>().cells().is_empty());
 
-        sim.edit_water(WaterEdit::RemoveFreshWater {
-            body: result.body.unwrap(),
-        })
-        .unwrap();
+        let body = result.body.unwrap();
+        let drain = WaterEdit::RemoveFreshWater { body };
+        assert!(matches!(
+            water_provider_site(&sim.map(), pump),
+            Some(Ok(WaterSite::Shore { contact, .. })) if contact.body == body
+        ));
+        let preview = sim.preview_water_edit(&drain).unwrap();
+        let failure = Err(WaterSiteError::NoEligibleShore(WaterServiceRole::Intake));
+        assert_eq!(preview.provider_impact.count, 1);
+        assert_eq!(
+            preview.provider_impact.sample,
+            [WaterProviderImpactSample {
+                building: pump,
+                proposed_site: failure,
+            }]
+        );
+
+        let result = sim.edit_water(drain).unwrap();
+        assert_eq!(preview.dirty, result.dirty);
+        assert_eq!(water_provider_site(&sim.map(), pump), Some(failure));
         assert!(layout(&sim));
         assert!(sim.read::<ZoneGrid>().cells().is_empty());
         assert_eq!(sim.map().walking_topology_generation, topology);

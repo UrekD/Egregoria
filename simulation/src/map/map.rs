@@ -1719,6 +1719,10 @@ impl Map {
         }
 
         let new_id = new_r.id;
+        self.invalidate(r1_extremity);
+        self.invalidate(r2_extremity);
+
+        let new_r = &self.roads[new_id];
         self.lots.retain(|_, lot| {
             if lot.parent != road1 && lot.parent != road2 {
                 return true;
@@ -1733,13 +1737,10 @@ impl Map {
             lot.parent = new_id;
             true
         });
-        for &id in &self.roads[new_id].connected_buildings {
+        for &id in &new_r.connected_buildings {
             self.water_services
                 .building_changed(&self.environment, &self.roads, &self.buildings[id]);
         }
-
-        self.invalidate(r1_extremity);
-        self.invalidate(r2_extremity);
 
         Some(new_id)
     }
