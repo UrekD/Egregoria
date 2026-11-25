@@ -1,7 +1,10 @@
 use super::contains;
 use geom::{Polygon, Vec2, OBB};
 use prototypes::{try_prototype, BuildingGen, GoodsCompanyID};
-use simulation::map::{BuildingID, BuildingKind, Map, ProjectFilter, RoadID, ZoneCell};
+use simulation::map::{
+    river_site_summary, water_provider_site, water_service_site, BuildingID, BuildingKind, Map,
+    ProjectFilter, RoadID, WaterSiteRequest, ZoneCell,
+};
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::Simulation;
 use std::collections::BTreeSet;
@@ -24,19 +27,27 @@ pub(super) fn downtown_cells() -> (ZoneCell, ZoneCell) {
     )
 }
 
-/// On the dry variant these road-fed utilities use the ordinary service
-/// prototypes. A wet variant must additionally validate water contacts and
-/// downstream order through WATER's siting API.
+/// The W3 site solver resolves legacy road connections on dry terrain and
+/// enforces live shore contact and intake/outlet order on configured terrain.
 pub(super) fn water_sites(
     sim: &mut Simulation,
     plan: &TownPlan,
     roads: &BTreeSet<RoadID>,
     anchor: Vec2,
-) -> Result<[(BuildingID, RoadID); 2], String> {
-    Ok([
-        place_company(sim, plan, roads, "water-pump", anchor)?,
-        place_company(sim, plan, roads, "sewage-outlet", anchor)?,
-    ])
+) -> Result<[BuildingID; 2], String> {
+    let place = |sim: &mut Simulation, name: &str| {
+        let kind = BuildingKind::GoodsCompany(GoodsCompanyID::new(name));
+        let (building, _) = place_checked_company(sim, plan, roads, name, |map, road, footprint| {
+            let request = WaterSiteRequest::for_placement(kind, footprint, Some(road))?;
+            water_service_site(map, request, &river_site_summary(map)).ok()?;
+            Some(footprint.center().distance2(anchor))
+        })?;
+        water_provider_site(&sim.map(), building)
+            .ok_or_else(|| format!("missing W3 provider site for {name}"))?
+            .map_err(|error| format!("invalid W3 provider site for {name}: {error}"))?;
+        Ok::<_, String>(building)
+    };
+    Ok([place(sim, "water-pump")?, place(sim, "sewage-outlet")?])
 }
 
 pub(super) fn frontage_roads(plan: &TownPlan, built: &BuiltNetwork) -> BTreeSet<RoadID> {
@@ -88,6 +99,16 @@ pub(super) fn place_scored_company(
     name: &str,
     mut score: impl FnMut(RoadID, OBB) -> Option<f32>,
 ) -> Result<(BuildingID, RoadID), String> {
+    place_checked_company(sim, plan, roads, name, |_, road, footprint| score(road, footprint))
+}
+
+fn place_checked_company(
+    sim: &mut Simulation,
+    plan: &TownPlan,
+    roads: &BTreeSet<RoadID>,
+    name: &str,
+    mut score: impl FnMut(&Map, RoadID, OBB) -> Option<f32>,
+) -> Result<(BuildingID, RoadID), String> {
     let id = GoodsCompanyID::new(name);
     let proto = try_prototype(id).ok_or_else(|| format!("missing CITYMAP prototype {name}"))?;
     let kind = BuildingKind::GoodsCompany(id);
@@ -112,7 +133,7 @@ pub(super) fn place_scored_company(
                     let center =
                         point.xy() + outward * (road.width * 0.5 + proto.size.h * 0.5 + 2.0);
                     let footprint = OBB::new(center, outward, proto.size.h, proto.size.w);
-                    let Some(score) = score(id, footprint) else {
+                    let Some(score) = score(&map, id, footprint) else {
                         continue;
                     };
                     if best.as_ref().is_some_and(|(old, _, _)| score >= *old) {

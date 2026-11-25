@@ -5,7 +5,8 @@ use super::adapters::{
 use super::{blocks, contains, BuiltNetwork, RoadClass, TownPlan};
 use geom::{vec2, Intersect, Transform, Vec2, Vec3, OBB};
 use prototypes::{
-    try_prototype, BuildingGen, FreightStationPrototypeID, ItemID, Money, RollingStockID,
+    try_prototype, BuildingGen, FreightStationPrototypeID, ItemID, Money, ResidencePrototype,
+    RollingStockID,
     ServiceID, ServiceKind, Tick, TICKS_PER_HOUR, TICKS_PER_MINUTE,
 };
 use serde::Serialize;
@@ -67,6 +68,7 @@ struct Parcel {
     footprint: OBB,
     zoning: ZoneCell,
     capacity: u32,
+    workers: u32,
     building: Option<BuildingID>,
 }
 
@@ -93,6 +95,7 @@ struct Cohort {
     district: &'static str,
     anchor: Vec2,
     houses: usize,
+    infill: usize,
     retail: usize,
     jobs: usize,
 }
@@ -103,42 +106,47 @@ pub fn commission(
     built: &BuiltNetwork,
 ) -> Result<OpeningManifest, String> {
     let roads = frontage_roads(plan, built);
-    let offset = plan.config.owned_min;
+    let at = |x, y| super::layout::design_point(vec2(x, y), plan.config);
     let cohorts = [
         Cohort {
             district: "station",
-            anchor: offset + vec2(2100.0, 1635.0),
-            houses: 23,
-            retail: 11,
+            anchor: at(2100.0, 1635.0),
+            houses: 43,
+            infill: 11,
+            retail: 15,
             jobs: 0,
         },
         Cohort {
             district: "hraska",
-            anchor: offset + vec2(1950.0, 2200.0),
-            houses: 21,
-            retail: 10,
-            jobs: 4,
+            anchor: at(1950.0, 2200.0),
+            houses: 74,
+            infill: 20,
+            retail: 24,
+            jobs: 0,
         },
         Cohort {
             district: "south",
-            anchor: offset + vec2(2060.0, 1180.0),
-            houses: 24,
-            retail: 11,
+            anchor: at(2060.0, 1180.0),
+            houses: 85,
+            infill: 22,
+            retail: 27,
             jobs: 0,
         },
         Cohort {
             district: "west",
-            anchor: offset + vec2(1415.0, 1690.0),
-            houses: 17,
-            retail: 10,
-            jobs: 3,
+            anchor: at(1415.0, 1690.0),
+            houses: 80,
+            infill: 22,
+            retail: 25,
+            jobs: 0,
         },
         Cohort {
             district: "employment",
-            anchor: offset + vec2(2530.0, 2375.0),
+            anchor: at(2530.0, 2375.0),
             houses: 0,
-            retail: 2,
-            jobs: 11,
+            infill: 5,
+            retail: 4,
+            jobs: 37,
         },
     ];
     let mut sites = BTreeMap::new();
@@ -149,16 +157,23 @@ pub fn commission(
     sites.insert("rail-bakery".into(), buyer);
     verify_parking_pair(&sim.map(), terminal, buyer, Tick(sim.get_tick()))?;
 
-    let utilities = offset + vec2(2630.0, 2440.0);
-    for (name, (building, _)) in ["water-pump", "sewage-outlet"]
-        .into_iter()
-        .zip(water_sites(sim, plan, &roads, utilities)?)
-    {
-        sites.insert(name.to_owned(), building);
+    let utilities = at(2630.0, 2440.0);
+    // Each fully staffed pair contributes 2,000 units. Plan for the occupied
+    // town, commercial/industrial draw and unpainted infill on the same network.
+    for (index, shift) in [
+        vec2(0.0, 0.0),
+        vec2(-140.0, 210.0),
+        vec2(160.0, -180.0),
+        vec2(-170.0, -260.0),
+        vec2(110.0, 290.0),
+    ].into_iter().enumerate() {
+        for (name, building) in ["water-pump", "sewage-outlet"]
+            .into_iter()
+            .zip(water_sites(sim, plan, &roads, utilities + shift)?)
+        {
+            sites.insert(format!("{name}-{}", index + 1), building);
+        }
     }
-    let [pump, outlet] = water_sites(sim, plan, &roads, utilities + vec2(-140.0, 210.0))?;
-    sites.insert("water-pump-reserve".into(), pump.0);
-    sites.insert("sewage-outlet-reserve".into(), outlet.0);
     for (name, anchor) in [
         ("coal-power-plant", utilities + vec2(130.0, 320.0)),
         ("coal-mine", utilities + vec2(-70.0, 170.0)),
@@ -179,7 +194,7 @@ pub fn commission(
         plan,
         &roads,
         "flour-factory",
-        offset + vec2(1130.0, 1570.0),
+        at(1130.0, 1570.0),
     )?
     .0;
     sites.insert("west/flour-mill".into(), mill);
@@ -211,20 +226,12 @@ pub fn commission(
             "freight terminal {terminal:?} changed its validated platform"
         ));
     }
-    let industrial = parcels
-        .iter()
-        .filter(|parcel| parcel.zoning.kind == ZoneKind::Industrial);
-    paint(sim, industrial.clone().take(4))?;
-    advance(sim, &mut schedule, TICKS_PER_HOUR);
-    paint(
-        sim,
-        industrial.skip(4).chain(parcels.iter().filter(|parcel| {
-            matches!(parcel.zoning.kind, ZoneKind::Commercial | ZoneKind::Office)
-        })),
-    )?;
+    paint(sim, parcels.iter().filter(|parcel| {
+        matches!(parcel.zoning.kind, ZoneKind::Industrial | ZoneKind::Commercial)
+    }))?;
     verify_votes(sim, parcels.iter())?;
 
-    let lines = install_bus_loops(sim, built, plan, &cohorts)?;
+    let lines = install_bus_loops(sim, built, plan, &cohorts, &parcels)?;
     let freight = Freight {
         terminal,
         station,
@@ -237,7 +244,7 @@ pub fn commission(
     };
     // Use elapsed time for settling periods. The authored clock starts in the
     // morning, so a whole elapsed day returns to the same commute phase.
-    for day in 1..=3 {
+    for day in 1..=4 {
         let target = day * TICKS_PER_BUDGET_DAY;
         let now = elapsed_ticks(sim.world_res().1).0;
         advance(sim, &mut schedule, target - now);
@@ -601,63 +608,65 @@ fn place_civic_sites(
         .chain(reserves)
         .map(|parcel| parcel.footprint)
         .collect();
-    for (name, reach, limit) in [
-        ("school", &foot, 1),
-        ("fire-station", &street, 2),
-        ("police-station", &street, 2),
-        ("clinic", &street, 2),
-        ("garbage-depot", &street, 2),
-        ("park", &foot, 5),
+    for (name, reach) in [
+        ("school", &foot),
+        ("fire-station", &street),
+        ("police-station", &street),
+        ("clinic", &street),
+        ("garbage-depot", &street),
+        ("park", &foot),
     ] {
         let service =
             try_prototype(ServiceID::new(name)).ok_or_else(|| format!("missing service {name}"))?;
-        // Keep some reach in reserve for the exact growable and driveway doors.
         let radius = service.radius_m - 25.0;
-        for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
-            let mut targets: Vec<_> = parcels
-                .iter()
-                .filter(|parcel| {
-                    parcel.district == cohort.district
-                        && parcel.zoning.kind == ZoneKind::Residential
-                })
-                .filter_map(|parcel| {
-                    let mut at = reach.position(parcel.road, parcel.footprint.center())?;
-                    at.offset = at.offset.max(10.0) - 8.0;
-                    Some((at, parcel.capacity))
-                })
-                .collect();
-            let workplaces: Vec<_> = parcels
-                .iter()
-                .filter(|parcel| parcel.zoning.kind != ZoneKind::Residential)
-                .filter_map(|parcel| {
-                    let mut at = reach.position(parcel.road, parcel.footprint.center())?;
-                    at.offset = at.offset.max(10.0) - 8.0;
-                    let workers = match parcel.zoning.kind {
-                        ZoneKind::Commercial => 16,
-                        ZoneKind::Industrial => 18,
-                        _ => 8,
-                    };
-                    Some((at, workers))
-                })
-                .collect();
-            let population: u32 = targets.iter().map(|(_, capacity)| capacity).sum();
-            for iteration in 0..limit {
-                let remaining: u32 = targets.iter().map(|(_, capacity)| capacity).sum();
-                if iteration >= if name == "park" { 3 } else { 1 }
-                    && remaining * 100 <= population * 6
-                {
-                    break;
-                }
-                let served = |road, footprint: OBB, target: ReachPosition| {
-                    let front = (footprint.corners[0] + footprint.corners[1]) * 0.5;
-                    reach
-                        .position(road, front)
-                        .is_some_and(|source| reach.distance(source, target) <= radius)
+        let mut receivers: Vec<_> = parcels
+            .iter()
+            .filter_map(|parcel| {
+                let mut position = reach.position(parcel.road, parcel.footprint.center())?;
+                // The generated door sits closer to the road than the lot center.
+                position.offset = (position.offset - 8.0).max(0.0);
+                let residents = if parcel.zoning.kind == ZoneKind::Residential {
+                    ResidencePrototype::iter()
+                        .filter(|home| home.zone_kind == prototypes::GrowableZoneKind::Pure(ZoneKind::Residential)
+                            && home.density == parcel.zoning.density)
+                        .map(|home| home.capacity)
+                        .max()
+                        .unwrap_or(parcel.capacity)
+                } else {
+                    0
                 };
+                Some((position, residents, residents + parcel.workers, parcel.district))
+            })
+            .collect();
+        let front = |footprint: OBB| (footprint.corners[0] + footprint.corners[1]) * 0.5;
+        let allocation = |source, receivers: &[(ReachPosition, u32, u32, &str)]| {
+            let mut reachable: Vec<_> = receivers.iter().enumerate().filter_map(|(i, receiver)| {
+                let distance = reach.distance(source, receiver.0);
+                (distance <= radius && receiver.2 > 0).then_some((distance, i))
+            }).collect();
+            reachable.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+            let mut available = service.capacity * 9 / 10;
+            let mut serviced = Vec::new();
+            for (_, i) in reachable {
+                if available == 0 { break; }
+                let served = available.min(receivers[i].2);
+                available -= served;
+                serviced.push((i, served));
+            }
+            serviced
+        };
+        let mut serial = 0;
+        for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
+            let in_district = |receiver: &(ReachPosition, u32, u32, &str)| receiver.3 == cohort.district;
+            let total: u32 = receivers.iter().filter(|r| in_district(r)).map(|r| r.1).sum();
+            let remaining = |receivers: &[(ReachPosition, u32, u32, &str)]| {
+                receivers.iter().filter(|r| in_district(r)).map(|r| r.1.min(r.2)).sum::<u32>()
+            };
+            while remaining(&receivers) * 100 > total * 3 {
                 let (building, road) =
                     place_scored_company(sim, plan, roads, name, |road, footprint| {
                         let distance = footprint.center().distance(cohort.anchor);
-                        if distance > 950.0
+                        if distance > 1000.0
                             || protected.iter().any(|parcel| {
                                 parcel.center().distance2(footprint.center()) < 45.0_f32.powi(2)
                                     && parcel.intersects(&footprint)
@@ -665,39 +674,23 @@ fn place_civic_sites(
                         {
                             return None;
                         }
-                        let front = (footprint.corners[0] + footprint.corners[1]) * 0.5;
-                        let source = reach.position(road, front)?;
-                        let mut receivers: Vec<_> = targets
-                            .iter()
-                            .filter_map(|&(target, n)| {
-                                let distance = reach.distance(source, target);
-                                (distance <= radius).then_some((distance, n * 2, true))
+                        let source = reach.position(road, front(footprint))?;
+                        let covered: u32 = allocation(source, &receivers)
+                            .into_iter()
+                            .map(|(i, served)| {
+                                let receiver = &receivers[i];
+                                if in_district(receiver) { served.min(receiver.1) } else { 0 }
                             })
-                            .collect();
-                        if matches!(name, "school" | "park") {
-                            receivers.extend(workplaces.iter().filter_map(|&(target, n)| {
-                                let distance = reach.distance(source, target);
-                                (distance <= radius).then_some((distance, n, false))
-                            }));
-                        }
-                        receivers.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
-                        let mut room = service.capacity;
-                        let mut covered = 0;
-                        for (_, people, resident) in receivers {
-                            let served = room.min(people);
-                            room -= served;
-                            if resident {
-                                covered += served;
-                            }
-                        }
-                        Some(distance / 1000.0 - covered as f32)
+                            .sum();
+                        (covered > 0).then_some(distance / 1000.0 - covered as f32)
                     })?;
                 let footprint = sim.map().buildings()[building].obb;
-                targets.retain(|&(target, _)| !served(road, footprint, target));
-                sites.insert(
-                    format!("{}/{name}-{}", cohort.district, iteration + 1),
-                    building,
-                );
+                let source = reach.position(road, front(footprint)).unwrap();
+                for (i, served) in allocation(source, &receivers) {
+                    receivers[i].2 -= served;
+                }
+                serial += 1;
+                sites.insert(format!("{name}-{serial}"), building);
             }
         }
     }
@@ -760,7 +753,7 @@ fn plan_parcels(
                 .total_cmp(&b.shape.center().distance2(reserve_anchor))
                 .then_with(|| a.id.cmp(&b.id))
         });
-        let reserve_count = if cohort.houses > 0 { 6 } else { 3 };
+        let reserve_count = cohort.infill;
         let reserve_cell = if cohort.houses > 0 {
             high_house
         } else {
@@ -874,12 +867,12 @@ fn plan_parcels(
         let low = if cohort.district == "station" {
             0
         } else {
-            cohort.houses / 5
+            cohort.houses / 15
         };
         let medium = if cohort.district == "station" {
             0
         } else {
-            cohort.houses / 3
+            cohort.houses / 8
         };
         take_parcels(
             &map,
@@ -941,7 +934,7 @@ fn take_parcels(
         if selected.len() - first == count {
             return true;
         }
-        let Ok((_, house)) = check_growable_lot(map, lot, zoning) else {
+        let Ok((kind, house)) = check_growable_lot(map, lot, zoning) else {
             return true;
         };
         selected.push(Parcel {
@@ -952,6 +945,7 @@ fn take_parcels(
             footprint: lot.shape,
             zoning,
             capacity: house.map_or(0, |home| home.capacity),
+            workers: kind.as_goods_company().and_then(try_prototype).map_or(0, |company| company.n_workers),
             building: None,
         });
         false
@@ -1060,12 +1054,13 @@ fn install_bus_loops(
     built: &BuiltNetwork,
     plan: &TownPlan,
     cohorts: &[Cohort],
+    parcels: &[Parcel],
 ) -> Result<BTreeMap<&'static str, BusLine>, String> {
     let anchors = [
         cohorts[0].anchor, // Shared civic hub.
         cohorts[2].anchor, // South.
         cohorts[3].anchor, // West.
-        cohorts[1].anchor, // Hraška.
+        super::layout::design_point(vec2(1920.0, 2400.0), plan.config),
         cohorts[4].anchor, // Employment edge.
     ];
     let routes = [("neighbourhood", [0, 1, 2]), ("employment", [0, 3, 4])];
@@ -1073,7 +1068,23 @@ fn install_bus_loops(
         let map = sim.map();
         let mut options = Vec::new();
         let mut used = BTreeSet::new();
-        for anchor in anchors {
+        let walk = ServiceReach::new(&map, true);
+        for (index, anchor) in anchors.into_iter().enumerate() {
+            let district = [0, 2, 3, 1, 4][index];
+            let destinations: Vec<_> = parcels.iter()
+                .filter(|p| p.district == cohorts[district].district)
+                .filter_map(|p| Some((walk.position(p.road, p.footprint.center())?, p.capacity.max(p.workers))))
+                .collect();
+            let score = |road, berth: CurbBerth| {
+                let distance = berth.pos.xy().distance(anchor);
+                let nearby = walk.position(road, berth.pos.xy()).map_or(0.0, |source| {
+                    destinations.iter().map(|&(target, people)| {
+                        f64::from((1.0 - walk.distance(source, target) / 250.0).max(0.0))
+                            * f64::from(people)
+                    }).sum::<f64>()
+                });
+                nearby - f64::from(distance) * 0.2
+            };
             let (road, berths) = built
                 .links
                 .iter()
@@ -1112,14 +1123,10 @@ fn install_bus_loops(
                     let berths: [CurbBerth; 2] = berths.try_into().ok()?;
                     Some((span.road, berths))
                 })
-                .min_by(|a, b| {
-                    a.1[0]
-                        .pos
-                        .xy()
-                        .distance2(anchor)
-                        .total_cmp(&b.1[0].pos.xy().distance2(anchor))
-                        .then_with(|| a.0.cmp(&b.0))
-                })
+                .filter(|(_, berths)| berths[0].pos.xy().distance(anchor) < 430.0)
+                .map(|(road, berths)| (score(road, berths[0]), road, berths))
+                .max_by(|a, b| a.0.total_cmp(&b.0).then_with(|| b.1.cmp(&a.1)))
+                .map(|(_, road, berths)| (road, berths))
                 .ok_or_else(|| format!("no two-way curb berth near {anchor:?}"))?;
             used.insert(road);
             options.push(berths);
@@ -1217,10 +1224,10 @@ fn population_change_ok(earlier: u64, later: u64) -> bool {
 }
 
 fn stable_population(opening: u64, housed: u64, employed: u64, earlier: u64) -> bool {
-    (600..=900).contains(&opening)
+    opening >= 2500
         && housed > 0
         && employed <= housed
-        && u128::from(employed) * 4 >= u128::from(housed) * 3
+        && u128::from(employed) * 100 >= u128::from(housed) * 95
         && population_change_ok(earlier, housed)
 }
 
@@ -1234,7 +1241,7 @@ fn needs_met(
 ) -> bool {
     due >= 100
         && filled <= due
-        && u128::from(filled) * 100 >= u128::from(due) * 85
+        && u128::from(filled) * 100 >= u128::from(due) * 94
         && resident_ticks > 0
         && u128::from(stockout) * 24 <= u128::from(resident_ticks)
         && work > 0
@@ -1358,7 +1365,7 @@ fn snapshot(sim: &Simulation, plan: &TownPlan, manifest: &OpeningManifest) -> To
     let totals: BTreeMap<_, _> = utility.networks().collect();
     let mut networks = BTreeSet::new();
     let mut unserved_buildings = Vec::new();
-    let mut unfuelled_plant = true;
+    let mut fuelled_plant = false;
     let parcel_at: BTreeMap<_, _> = manifest
         .parcels
         .iter()
@@ -1400,10 +1407,8 @@ fn snapshot(sim: &Simulation, plan: &TownPlan, manifest: &OpeningManifest) -> To
             .as_goods_company()
             .is_some_and(|proto| proto == prototypes::GoodsCompanyID::new("coal-power-plant"))
         {
-            unfuelled_plant = !staffed
-                || infos
-                    .owner(id)
-                    .is_none_or(|soul| market.capital(soul, ItemID::new("coal")) <= 0);
+            fuelled_plant |= staffed
+                && infos.owner(id).is_some_and(|soul| market.capital(soul, ItemID::new("coal")) > 0);
         }
         let parcel = parcel_at.get(&id).copied();
         let district = parcel.map(|p| p.district).or_else(|| {
@@ -1488,7 +1493,7 @@ fn snapshot(sim: &Simulation, plan: &TownPlan, manifest: &OpeningManifest) -> To
         provider_capacity,
         utilities,
         unserved_buildings,
-        unfuelled_plant,
+        unfuelled_plant: !fuelled_plant,
     }
 }
 
@@ -2185,18 +2190,19 @@ mod tests {
 
     #[test]
     fn cm2_gate_employment_and_population() {
-        assert!(stable_population(600, 660, 495, 600));
-        assert!(!stable_population(599, 660, 495, 600));
-        assert!(!stable_population(600, 660, 494, 600));
-        assert!(!stable_population(600, 661, 500, 600));
-        assert!(!stable_population(600, 0, 0, 0));
+        assert!(stable_population(2500, 2750, 2613, 2500));
+        assert!(stable_population(3000, 3000, 2850, 3000));
+        assert!(!stable_population(2499, 2500, 2500, 2500));
+        assert!(!stable_population(2500, 2500, 2374, 2500));
+        assert!(!stable_population(2500, 2751, 2751, 2500));
+        assert!(!stable_population(2500, 0, 0, 0));
     }
 
     #[test]
     fn cm2_gate_needs_use_settled_baskets_and_integrated_population() {
-        assert!(needs_met(100, 85, 10, 240, 1, 1));
+        assert!(needs_met(100, 94, 10, 240, 1, 1));
         assert!(!needs_met(0, 0, 0, 240, 1, 1));
-        assert!(!needs_met(100, 84, 0, 240, 1, 1));
+        assert!(!needs_met(100, 93, 0, 240, 1, 1));
         assert!(!needs_met(100, 100, 11, 240, 1, 1));
         assert!(!needs_met(100, 100, 0, 0, 1, 1));
         assert!(!needs_met(100, 100, 0, 240, 1, 0));
