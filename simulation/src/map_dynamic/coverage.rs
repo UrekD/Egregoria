@@ -8,10 +8,10 @@ use prototypes::{try_prototype, ServiceID, ServiceKind};
 use serde::{Deserialize, Serialize};
 use slotmapd::SecondaryMap;
 
-use crate::map::{BuildingID, BuildingKind, IntersectionID, LaneKind, Map, Road, RoadID};
+use crate::map::{Building, BuildingID, IntersectionID, LaneKind, Map, Road, RoadID};
 use crate::{Simulation, SoulID};
 
-use super::{BuildingInfos, ElectricityFlow};
+use super::{active_business, BuildingInfos, ElectricityFlow};
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct CoverageGrid {
@@ -270,16 +270,21 @@ fn active_providers(sim: &Simulation, kind: ServiceKind) -> Vec<Provider> {
             }
             let building = map.get(company.comp.building)?;
             let road = building.connected_road?;
-            if infos.owner(building.id) != Some(SoulID::GoodsCompany(id))
-                || map
-                    .electricity
-                    .net_id(building.id)
-                    .is_some_and(|net| electricity.blackout(net))
+            let business = active_business(building, &infos, sim.world())
+                .filter(|business| business.company == id)?;
+            if map
+                .electricity
+                .net_id(building.id)
+                .is_some_and(|net| electricity.blackout(net))
             {
                 return None;
             }
-            let capacity =
-                proto.capacity as f32 * company.raw_productivity(proto, building.zone.as_ref());
+            let productivity = if building.development().is_some() {
+                business.rates().staffed_fraction as f32
+            } else {
+                company.raw_productivity(proto, building.zone.as_ref())
+            };
+            let capacity = proto.capacity as f32 * productivity;
             (capacity > 0.0).then_some(Provider {
                 building: building.id,
                 road,
@@ -290,6 +295,35 @@ fn active_providers(sim: &Simulation, kind: ServiceKind) -> Vec<Provider> {
             })
         })
         .collect()
+}
+
+fn coverage_receivers(building: &Building, infos: &BuildingInfos, sim: &Simulation) -> usize {
+    if building.is_abandoned_growable() {
+        return 0;
+    }
+    let residents = infos
+        .get(building.id)
+        .filter(|_| building.has_residential_use())
+        .map(|info| &info.residents);
+    let workers = building
+        .kind
+        .as_goods_company()
+        .filter(|proto| proto.is_growable())
+        .and_then(|_| active_business(building, infos, sim.world()))
+        .and_then(|business| sim.get(business.company))
+        .map(|company| &company.workers.0);
+
+    match (residents, workers) {
+        (Some(residents), Some(workers)) => residents
+            .iter()
+            .copied()
+            .chain(workers.iter().copied().map(SoulID::Human))
+            .collect::<BTreeSet<_>>()
+            .len(),
+        (Some(residents), None) => residents.len(),
+        (None, Some(workers)) => workers.len(),
+        (None, None) => 0,
+    }
 }
 
 fn recompute(
@@ -317,16 +351,7 @@ fn recompute(
             .iter()
             .filter_map(|&id| {
                 let building = map.get(id)?;
-                let people = match building.kind {
-                    BuildingKind::House => infos.get(id)?.residents.len(),
-                    BuildingKind::GoodsCompany(proto) if proto.is_growable() => {
-                        let SoulID::GoodsCompany(company) = infos.owner(id)? else {
-                            return None;
-                        };
-                        sim.get(company)?.workers.0.len()
-                    }
-                    _ => return None,
-                } as f32;
+                let people = coverage_receivers(building, &infos, sim) as f32;
                 (people > 0.0).then(|| Receiver {
                     building: id,
                     position: RoadPosition::at_door(road, building.door_pos),
@@ -351,6 +376,46 @@ fn recompute(
             search.serve(&map, &mut roads, provider, index + 1, &mut coverage);
     }
     coverage
+}
+
+#[cfg(test)]
+#[test]
+fn z3_accounting_coverage_counts_the_union_at_a_mixed_address() {
+    use crate::map_dynamic::accounting_site;
+    use crate::souls::human::spawn_human;
+
+    let (mut test, id, company) = accounting_site(true);
+    let tenant = spawn_human(&mut test.g, id).unwrap();
+    spawn_human(&mut test.g, id).unwrap();
+    let other_home = test.g.map().lots().values().next().unwrap().shape.center();
+    let other_home = test.build_house_near(other_home);
+    let commuter = spawn_human(&mut test.g, other_home).unwrap();
+    test.g.world.companies[company].workers.0 = vec![tenant, commuter];
+    let mut provider = {
+        let map = test.g.map();
+        let building = map.get(id).unwrap();
+        let road = building.connected_road.unwrap();
+        Provider {
+            building: id,
+            road,
+            door: map
+                .get(road)
+                .unwrap()
+                .points()
+                .project_2d(building.door_pos.xy()),
+            radius: 1_000.0,
+            capacity: 1.0,
+            served_distance: None,
+        }
+    };
+    let score = |sim: &Simulation, provider: &mut Provider| {
+        recompute(sim, ServiceKind::Health, std::slice::from_mut(provider))[&id]
+    };
+    let with_shop = score(&test.g, &mut provider);
+    test.g.world.companies[company].workers.0.clear();
+    let housing_only = score(&test.g, &mut provider);
+    assert!(housing_only > 0.0);
+    assert!((with_shop - housing_only * 2.0 / 3.0).abs() < 0.001);
 }
 
 #[derive(Default)]
@@ -518,6 +583,7 @@ mod u3_tests {
     use slotmapd::KeyData;
 
     use super::*;
+    use crate::map::BuildingKind;
     use crate::map_dynamic::electricity_flow_system;
     use crate::souls::goods_company::company_soul;
     use crate::tests::TestCtx;

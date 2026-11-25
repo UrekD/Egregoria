@@ -6,8 +6,8 @@ use crate::economy::balance::{
     SHELF_TARGET_UTILIZATION,
 };
 use crate::economy::{Budget, Market};
-use crate::map::{BuildingID, ZoneKind};
-use crate::map_dynamic::BuildingInfos;
+use crate::map::{BuildingID, Map, ZoneKind};
+use crate::map_dynamic::{active_business, BuildingInfos};
 use crate::souls::happiness::Happiness;
 use crate::souls::residence::Residences;
 use crate::utils::resources::Resources;
@@ -50,6 +50,27 @@ pub enum DemandDriver {
     Happiness,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MixedUseDemand {
+    pub residential: f32,
+    pub commercial: f32,
+    pub limiting_zone: ZoneKind,
+}
+
+impl MixedUseDemand {
+    pub const GROWTH_THRESHOLD: f32 = 5.0;
+
+    pub fn score(self) -> f32 {
+        self.residential.min(self.commercial)
+    }
+
+    pub fn may_grow(self) -> bool {
+        self.residential.is_finite()
+            && self.commercial.is_finite()
+            && self.score() > Self::GROWTH_THRESHOLD
+    }
+}
+
 impl ZoneDemand {
     pub(crate) const fn due(tick: u64) -> bool {
         tick % DEMAND_INTERVAL_TICKS == DEMAND_OFFSET_TICKS
@@ -61,6 +82,20 @@ impl ZoneDemand {
 
     pub fn drivers(&self, zone: ZoneKind) -> Option<&DemandDrivers> {
         self.drivers.get(&zone)
+    }
+
+    pub fn mixed_use(&self) -> Option<MixedUseDemand> {
+        let residential = *self.values.get(&ZoneKind::Residential)?;
+        let commercial = *self.values.get(&ZoneKind::Commercial)?;
+        Some(MixedUseDemand {
+            residential,
+            commercial,
+            limiting_zone: if residential <= commercial {
+                ZoneKind::Residential
+            } else {
+                ZoneKind::Commercial
+            },
+        })
     }
 
     /// Returns the strongest nonzero contribution by magnitude, keeping its sign.
@@ -91,14 +126,9 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
 
     let jobs = ItemID::new("job-opening");
     let market = resources.read::<Market>();
-    let open_jobs: u64 = market.inner().get(&jobs).map_or(0, |job_market| {
-        world
-            .companies
-            .keys()
-            .filter_map(|id| job_market.sell_order(SoulID::GoodsCompany(id)))
-            .map(|order| u64::from(order.qty))
-            .sum()
-    });
+    let map = resources.read::<Map>();
+    let infos = resources.read::<BuildingInfos>();
+    let rates = company_rates(world, &map, &infos, &market);
 
     let residences = resources.read::<Residences>();
     let mut demand = resources.write::<ZoneDemand>();
@@ -127,6 +157,12 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     let vacancies: u64 = residences
         .by_building
         .iter()
+        .filter(|&(building, _)| {
+            !residences.is_abandoned(*building)
+                && map
+                    .get(*building)
+                    .is_some_and(|site| site.has_residential_use() && !site.is_abandoned_growable())
+        })
         .map(|(building, residence)| {
             let occupied = occupants.get(building).copied().unwrap_or(0);
             u64::from(residence.capacity.saturating_sub(occupied))
@@ -136,7 +172,6 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     let population = world.humans.len();
     let per_capita = 100.0 / population.max(MIN_DEMAND_POPULATION) as f32;
     let unemployed_norm = unemployed as f32 * per_capita;
-    let rates = company_rates(world);
     let r_base = if population < R_BOOTSTRAP_POPULATION {
         R_BASE
     } else {
@@ -147,11 +182,7 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     } else {
         0.0
     };
-    let happiness = K_HAPPY
-        * (resources
-            .read::<Happiness>()
-            .average(&resources.read::<BuildingInfos>())
-            - NEUTRAL_HAPPINESS);
+    let happiness = K_HAPPY * (resources.read::<Happiness>().average(&infos) - NEUTRAL_HAPPINESS);
 
     for (zone, mut drivers) in [
         (
@@ -159,7 +190,7 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
             DemandDrivers {
                 base: r_base,
                 happiness,
-                jobs: K_JOBS * (open_jobs as f32 - unemployed as f32) * per_capita,
+                jobs: K_JOBS * (rates.open_jobs as f32 - unemployed as f32) * per_capita,
                 vacancies: -K_VAC * vacancies as f32 * per_capita,
                 ..Default::default()
             },
@@ -205,6 +236,9 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
             .or_insert(raw);
         demand.drivers.insert(zone, drivers);
     }
+    if let Some(mixed) = demand.mixed_use() {
+        demand.values.insert(ZoneKind::MixedUse, mixed.score());
+    }
 }
 
 fn shortfall_norm(need: f64, supply: f64) -> f32 {
@@ -213,6 +247,7 @@ fn shortfall_norm(need: f64, supply: f64) -> f32 {
 
 #[derive(Default)]
 struct CompanyRates {
+    open_jobs: u64,
     goods_need: f64,
     goods_supply: f64,
     retail_supply: f64,
@@ -245,7 +280,7 @@ impl CompanyRates {
     }
 }
 
-fn company_rates(world: &World) -> CompanyRates {
+fn company_rates(world: &World, map: &Map, infos: &BuildingInfos, market: &Market) -> CompanyRates {
     let goods = ItemID::new("goods");
     let [groceries, retail_goods] = crate::souls::household::household_items();
     let mut rates = CompanyRates::default();
@@ -257,22 +292,43 @@ fn company_rates(world: &World) -> CompanyRates {
             .sum::<f64>()
     };
 
-    for company in world.companies.values() {
-        let proto = company.comp.proto.prototype();
-        let growable = try_prototype(GrowableCompanyID::from(company.comp.proto))
-            .filter(|proto| proto.growable);
-        if growable.is_some_and(|proto| proto.zone_kind == ZoneKind::Industrial) {
+    let jobs = market.inner().get(&ItemID::new("job-opening"));
+    for (id, company) in world.companies.iter() {
+        let Some(building) = map.get(company.comp.building) else {
+            continue;
+        };
+        let Some(business) =
+            active_business(building, infos, world).filter(|business| business.company == id)
+        else {
+            continue;
+        };
+        rates.open_jobs += jobs
+            .and_then(|jobs| jobs.sell_order(SoulID::GoodsCompany(id)))
+            .map_or(0, |order| u64::from(order.qty));
+        let proto = business.prototype;
+        let zone = building
+            .development()
+            .map(|site| site.zone.kind)
+            .or_else(|| {
+                try_prototype(GrowableCompanyID::from(proto.id))
+                    .filter(|proto| proto.growable)
+                    .map(|proto| proto.zone_kind)
+            });
+        if zone == Some(ZoneKind::Industrial) {
             rates.industrial_growables += 1;
         }
         let Some(recipe) = &proto.recipe else {
             continue;
         };
-        let batch_ticks = recipe.batch_ticks();
-        if batch_ticks <= 0.0 {
+        let business_rates = business.demand_rates(building);
+        let Some(batch_ticks) = business_rates
+            .full_speed_batch_ticks
+            .filter(|ticks| *ticks > 0.0)
+        else {
             continue;
-        }
+        };
         let full_batches = TICKS_PER_HOUR as f64 / batch_ticks;
-        let staffed_batches = full_batches * f64::from(company.raw_productivity(proto, None));
+        let staffed_batches = full_batches * business_rates.staffed_fraction;
         let delivery = amount(&recipe.production, shelf_delivery_item()) as i32;
         let [staples, _] = shelf_delivery_units(delivery);
         rates.groceries_supply += (amount(&recipe.production, groceries)
@@ -285,8 +341,8 @@ fn company_rates(world: &World) -> CompanyRates {
             1.0
         };
         rates.retail_supply += retail_output * retail_utilization * staffed_batches;
-        match growable.map(|proto| proto.zone_kind) {
-            Some(ZoneKind::Commercial) => {
+        match zone {
+            Some(ZoneKind::Commercial | ZoneKind::MixedUse) => {
                 rates.goods_need += amount(&recipe.consumption, goods) * full_batches;
             }
             Some(ZoneKind::Industrial) => {
@@ -302,7 +358,7 @@ fn company_rates(world: &World) -> CompanyRates {
 mod tests {
     use super::*;
     use crate::economy::market_update;
-    use crate::map::BuildingID;
+    use crate::map::{BuildingID, BuildingKind};
     use crate::souls::goods_company::GoodsCompanyState;
     use crate::souls::human::spawn_human;
     use crate::souls::residence::Residence;
@@ -310,8 +366,86 @@ mod tests {
     use crate::world::{CompanyEnt, CompanyID};
     use crate::Simulation;
     use common::saveload::{Bincode, Encoder};
-    use geom::{vec2, vec3, Transform, Vec3};
+    use geom::{vec2, vec3, Transform, Vec2, Vec3, OBB};
     use prototypes::{Density, GameTime, GoodsCompanyID, ResidencePrototypeID, Tick};
+
+    #[test]
+    fn z3_accounting_mixed_demand_uses_limiting_smoothed_source() {
+        let mut ctx = TestCtx::new_fast();
+        for (residential, commercial, expected) in [
+            (25.0, 17.0, 17.0),
+            (5.0, 20.0, 5.0),
+            (20.0, 3.0, 3.0),
+            (20.0, -9.0, -9.0),
+        ] {
+            let initial_for =
+                |raw, value| (value - DEMAND_EMA_ALPHA * raw) / (1.0 - DEMAND_EMA_ALPHA);
+            let mut demand = ctx.g.write::<ZoneDemand>();
+            demand
+                .values
+                .insert(ZoneKind::Residential, initial_for(R_BASE, residential));
+            demand
+                .values
+                .insert(ZoneKind::Commercial, initial_for(0.0, commercial));
+            drop(demand);
+            let values = sample(&mut ctx.g, 1);
+            assert!((values[&ZoneKind::MixedUse] - expected).abs() < 0.001);
+            let demand = ctx.g.read::<ZoneDemand>();
+            let mixed = demand.mixed_use().unwrap();
+            assert_eq!(
+                mixed.limiting_zone,
+                if residential < commercial {
+                    ZoneKind::Residential
+                } else {
+                    ZoneKind::Commercial
+                }
+            );
+            assert_eq!(
+                mixed.may_grow(),
+                expected > MixedUseDemand::GROWTH_THRESHOLD
+            );
+        }
+    }
+
+    #[test]
+    fn z3_accounting_mixed_shop_counts_one_live_recipe_and_job_order() {
+        use crate::map::GrowableBusinessState;
+        use crate::map_dynamic::accounting_site;
+        use crate::HumanID;
+
+        let (mut ctx, id, company) = accounting_site(true);
+        let entity = &mut ctx.g.world.companies[company];
+        entity.workers.0 = vec![HumanID::default(); 6];
+        let recipe = entity.comp.proto.prototype().recipe.as_ref().unwrap();
+        let full_batches = TICKS_PER_HOUR as f64 / recipe.batch_ticks();
+        let rates = |ctx: &TestCtx| {
+            company_rates(
+                ctx.g.world(),
+                &ctx.g.map(),
+                &ctx.g.read::<BuildingInfos>(),
+                &ctx.g.read::<Market>(),
+            )
+        };
+        let open = rates(&ctx);
+        assert_eq!(open.open_jobs, 12);
+        assert_eq!(open.goods_need, 2.0 * full_batches);
+        assert_eq!(
+            open.retail_supply,
+            SHELF_TARGET_UTILIZATION * full_batches * 0.5
+        );
+
+        ctx.g.map_mut().set_growable_business_state(
+            id,
+            GrowableBusinessState::ClosedUntil {
+                retry_elapsed_tick: u64::MAX,
+            },
+        );
+        let closed = rates(&ctx);
+        assert_eq!(
+            (closed.open_jobs, closed.goods_need, closed.retail_supply),
+            (0, 0.0, 0.0)
+        );
+    }
 
     fn sample(sim: &mut Simulation, cycle: u64) -> BTreeMap<ZoneKind, f32> {
         let tick = (cycle - 1) * DEMAND_INTERVAL_TICKS + DEMAND_OFFSET_TICKS;
@@ -341,12 +475,25 @@ mod tests {
         house
     }
 
-    fn company(world: &mut World, name: &str, max_workers: u32) -> CompanyID {
-        world.insert(CompanyEnt {
+    fn company(ctx: &mut TestCtx, name: &str, max_workers: u32) -> CompanyID {
+        let proto = GoodsCompanyID::new(name).prototype();
+        let index = ctx.g.world.companies.len();
+        let building = ctx
+            .g
+            .map_mut()
+            .build_special_building(
+                &OBB::new(vec2(120.0 + 24.0 * index as f32, 60.0), Vec2::X, 20.0, 20.0),
+                BuildingKind::GoodsCompany(proto.id),
+                proto.bgen,
+                None,
+                None,
+            )
+            .unwrap();
+        let company = ctx.g.world_mut_unchecked().insert(CompanyEnt {
             trans: Transform::new(Vec3::ZERO),
             comp: GoodsCompanyState {
-                proto: GoodsCompanyID::new(name),
-                building: BuildingID::default(),
+                proto: proto.id,
+                building,
                 max_workers,
                 progress: 0.0,
                 driver: None,
@@ -355,7 +502,11 @@ mod tests {
             workers: Default::default(),
             sold: Default::default(),
             bought: Default::default(),
-        })
+        });
+        let mut infos = ctx.g.write::<BuildingInfos>();
+        infos.insert(building);
+        infos.set_owner(building, SoulID::GoodsCompany(company));
+        company
     }
 
     #[test]
@@ -399,19 +550,17 @@ mod tests {
     #[test]
     fn industrial_bootstrap_counts_only_industrial_growables() {
         let mut ctx = TestCtx::new_fast();
-        let world = ctx.g.world_mut_unchecked();
-        company(world, "bakery", 5);
-        company(world, "commercial-l1", 4);
-        company(world, "office-l1", 6);
+        company(&mut ctx, "bakery", 5);
+        company(&mut ctx, "commercial-l1", 4);
+        company(&mut ctx, "office-l1", 6);
         let goods_shortfall = K_GOODS * 100.0;
         assert_eq!(
             sample(&mut ctx.g, 1)[&ZoneKind::Industrial],
             I_BASE + goods_shortfall
         );
 
-        let world = ctx.g.world_mut_unchecked();
         for _ in 0..I_BOOTSTRAP_COMPANIES {
-            company(world, "industrial-l1", 6);
+            company(&mut ctx, "industrial-l1", 6);
         }
         ctx.g.write::<ZoneDemand>().values.clear();
         assert_eq!(
@@ -472,14 +621,13 @@ mod tests {
             let initial = sample(&mut ctx.g, 1);
             let house = home(&ctx, 1);
             let human = spawn_human(&mut ctx.g, house).unwrap();
-            let (world, res) = ctx.g.world_res();
-            let industrial = company(world, "industrial-l1", 6);
-            let commercial = company(world, "commercial-l1", 4);
-            company(world, "office-l1", 6);
+            let industrial = company(&mut ctx, "industrial-l1", 6);
+            let commercial = company(&mut ctx, "commercial-l1", 4);
+            company(&mut ctx, "office-l1", 6);
             let jobs = ItemID::new("job-opening");
             let seller = SoulID::GoodsCompany(industrial);
             {
-                let mut market = res.write::<Market>();
+                let mut market = ctx.g.write::<Market>();
                 market.produce(seller, jobs, 6);
                 market.sell(seller, vec2(150.0, 125.0), jobs, 2, 0);
             }

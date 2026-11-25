@@ -1,16 +1,14 @@
 //! Read-only explanations of building and citizen state.
 
-use std::cell::RefCell;
-
-use geom::Vec2;
-use prototypes::{try_prototype, Power, Tick};
+use prototypes::{Power, Tick};
 
 use crate::economy::cargo::CargoBook;
 use crate::economy::Market;
 use crate::map::{BuildingID, BuildingKind};
 use crate::map_dynamic::{
-    transit, BuildingInfos, BuildingUtilityStatus, Destination, ElectricityFlow, RouterError,
-    UtilityFlow, UtilityStatus,
+    active_business, effective_load, site_power_status, transit, ActiveRetailIndex, BuildingInfos,
+    BuildingUtilityStatus, Destination, ElectricityFlow, RouterError, SiteLoad, UtilityFlow,
+    UtilityStatus,
 };
 use crate::souls::events::Fires;
 use crate::souls::goods_company::recipe_blockers;
@@ -26,6 +24,7 @@ pub use crate::souls::residence::PowerStatus;
 
 #[derive(Debug)]
 pub struct BuildingDiagnostics {
+    pub load: SiteLoad,
     pub power: PowerStatus,
     pub utilities: Option<BuildingUtilityStatus>,
     pub retail_access: Option<bool>,
@@ -50,23 +49,18 @@ pub enum BuildingBlocker {
     Import(ImportStatus),
 }
 
-#[derive(Default)]
-struct RetailStores {
-    map_revision: (u64, u64),
-    positions: Vec<Vec2>,
-}
-
-thread_local! {
-    static RETAIL_STORES: RefCell<RetailStores> = RefCell::default();
-}
-
 pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<BuildingDiagnostics> {
     let map = sim.map();
     let building = map.get(id)?;
     let residences = sim.read::<Residences>();
-    let house = building.kind == BuildingKind::House;
-    let utilities = sim.read::<UtilityFlow>().status(&map, &residences, id);
-    let power = residence::power_status(&map, &sim.read::<ElectricityFlow>(), id);
+    let house = building.has_residential_use();
+    let infos = sim.read::<BuildingInfos>();
+    let business = active_business(building, &infos, sim.world());
+    let load = effective_load(building, residences.by_building.get(&id), business);
+    let utilities =
+        sim.read::<UtilityFlow>()
+            .status_for_site(&map, &residences, &infos, sim.world(), id);
+    let power = site_power_status(&map, &sim.read::<ElectricityFlow>(), building);
     let mut blockers = Vec::new();
     if building.is_orphaned() {
         blockers.push(BuildingBlocker::RoadDisconnected);
@@ -74,38 +68,31 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
     if sim.read::<Fires>().by_building.contains_key(&id) {
         blockers.push(BuildingBlocker::OnFire);
     }
-    if residences.is_abandoned(id) {
+    if building.is_abandoned_growable() || residences.is_abandoned(id) {
         blockers.push(BuildingBlocker::Abandoned);
     }
 
-    let owner = sim.read::<BuildingInfos>().owner(id);
+    let owner = infos.owner(id);
     let mut power_blocked = house && power != PowerStatus::Available;
     match building.kind {
-        BuildingKind::GoodsCompany(prototype) => {
-            power_blocked = power == PowerStatus::Blackout
-                && try_prototype(prototype)
-                    .is_some_and(|proto| proto.power_consumption > Some(Power::ZERO));
-            let company = owner
-                .and_then(|soul| match soul {
-                    SoulID::GoodsCompany(company) => {
-                        sim.get(company).map(|company| (soul, company))
-                    }
-                    _ => None,
-                })
-                .filter(|(_, company)| company.comp.building == id);
-            if let Some((owner, company)) = company {
-                if let Some(proto) = try_prototype(company.comp.proto) {
-                    if proto.n_workers > 0 && company.workers.0.is_empty() {
-                        blockers.push(BuildingBlocker::NoWorkers);
-                    }
-                    if let Some(recipe) = &proto.recipe {
-                        let market = sim.read::<Market>();
-                        blockers.extend(
-                            recipe_blockers(recipe, owner, &market).map(BuildingBlocker::Recipe),
-                        );
-                        if let Some(status) = sim.read::<CargoBook>().import_status(owner) {
-                            blockers.push(BuildingBlocker::Import(status));
-                        }
+        BuildingKind::GoodsCompany(_) => {
+            if let Some(business) = business {
+                let proto = business.prototype;
+                power_blocked |= proto.power_consumption > Some(Power::ZERO)
+                    && (power == PowerStatus::Blackout
+                        || (building.development().is_some()
+                            && power == PowerStatus::MissingNetwork));
+                if business.slots > 0 && business.filled == 0 {
+                    blockers.push(BuildingBlocker::NoWorkers);
+                }
+                if let Some(recipe) = &proto.recipe {
+                    let owner = SoulID::GoodsCompany(business.company);
+                    let market = sim.read::<Market>();
+                    blockers.extend(
+                        recipe_blockers(recipe, owner, &market).map(BuildingBlocker::Recipe),
+                    );
+                    if let Some(status) = sim.read::<CargoBook>().import_status(owner) {
+                        blockers.push(BuildingBlocker::Import(status));
                     }
                 }
             } else {
@@ -134,27 +121,44 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
     }
 
     let (retail_access, upgrade_requirements) = if house {
-        RETAIL_STORES.with_borrow_mut(|stores| {
-            // Building insertion and removal update the electrical graph, even off-road.
-            let revision = (map.identity(), map.electricity.generation());
-            if stores.map_revision != revision {
-                stores.map_revision = revision;
-                stores.positions = residence::retail_store_positions(&map);
+        let index = ActiveRetailIndex::build(&map, &infos, sim.world());
+        let nearby: Vec<_> = index.nearby(building.door_pos.xy()).collect();
+        let has_retail = !nearby.is_empty();
+        if !has_retail {
+            blockers.push(BuildingBlocker::NoRetailAccess);
+        }
+        let mut requirements = residence::requirements_with_stores(sim, id, Some(&nearby));
+        if building.development().is_some() {
+            for requirement in &mut requirements {
+                let met = match requirement.name {
+                    "Power" => power == PowerStatus::Available,
+                    "Water" => {
+                        utilities.is_some_and(|status| status.water == UtilityStatus::Served)
+                    }
+                    "Sewage" => {
+                        utilities.is_some_and(|status| status.sewage == UtilityStatus::Served)
+                    }
+                    _ => continue,
+                };
+                requirement.met = met;
+                requirement.value = f32::from(met);
             }
-            let has_retail =
-                residence::has_retail_access(&stores.positions, building.door_pos.xy());
-            if !has_retail {
-                blockers.push(BuildingBlocker::NoRetailAccess);
+            if building.is_mixed_use() {
+                let staffed = business.is_some_and(|business| business.filled > 0);
+                requirements.push(Requirement {
+                    name: "Staffed storefront",
+                    met: staffed,
+                    value: f32::from(staffed),
+                    threshold: 1.0,
+                });
             }
-            (
-                Some(has_retail),
-                residence::requirements_with_stores(sim, id, Some(&stores.positions)),
-            )
-        })
+        }
+        (Some(has_retail), requirements)
     } else {
         (None, Vec::new())
     };
     Some(BuildingDiagnostics {
+        load,
         power,
         utilities,
         retail_access,
@@ -294,13 +298,46 @@ mod tests {
     }
 
     #[test]
+    fn z3_accounting_mixed_diagnostics_follow_both_live_roles() {
+        use crate::map::GrowableBusinessState;
+        use crate::map_dynamic::accounting_site;
+
+        let (mut test, site, company) = accounting_site(true);
+        let vacant = building_diagnostics(&test.g, site).unwrap();
+        assert_eq!(vacant.retail_access, Some(false));
+        assert!(vacant.blockers.contains(&BuildingBlocker::NoWorkers));
+        assert!(vacant.blockers.contains(&BuildingBlocker::NoRetailAccess));
+
+        let worker = spawn_human(&mut test.g, site).unwrap();
+        test.g.world.companies[company].workers.0.push(worker);
+        assert_eq!(
+            building_diagnostics(&test.g, site).unwrap().retail_access,
+            Some(true)
+        );
+
+        test.g.map_mut().set_growable_business_state(
+            site,
+            GrowableBusinessState::ClosedUntil {
+                retry_elapsed_tick: u64::MAX,
+            },
+        );
+        let closed = building_diagnostics(&test.g, site).unwrap();
+        assert_eq!(closed.retail_access, Some(false));
+        assert!(closed.blockers.contains(&BuildingBlocker::MissingOwner));
+        assert!(!closed.blockers.contains(&BuildingBlocker::NoWorkers));
+        assert!(closed.utilities.is_some());
+    }
+
+    #[test]
     fn p4g_retail_access_uses_doors_and_is_read_only() {
-        let (test, house) = city();
+        let (mut test, house) = city();
         let home_door = test.g.map().get(house).unwrap().door_pos.xy();
         let store = GoodsCompanyID::new("commercial-high-l1");
         let footprint = OBB::new(home_door + Vec2::x(1540.0), Vec2::Y, 50.0, 50.0);
-        let place_store = |offset: f32| {
-            test.g
+        let worker = spawn_human(&mut test.g, house).unwrap();
+        for (offset, met) in [(-41.0, true), (-39.0, false)] {
+            let building = test
+                .g
                 .map_mut()
                 .build_special_building(
                     &footprint,
@@ -311,10 +348,13 @@ mod tests {
                     None,
                     None,
                 )
-                .unwrap()
-        };
-        for (offset, met) in [(-41.0, true), (-39.0, false)] {
-            let store = place_store(offset);
+                .unwrap();
+            test.g.write::<BuildingInfos>().insert(building);
+            let Some(SoulID::GoodsCompany(company)) = company_soul(&mut test.g, building, store)
+            else {
+                panic!("expected a retail company");
+            };
+            test.g.world.companies[company].workers.0.push(worker);
             let before = test.g.hashes();
             let diagnostics = building_diagnostics(&test.g, house).unwrap();
             assert_eq!(diagnostics.retail_access, Some(met));
@@ -328,8 +368,8 @@ mod tests {
                 met
             );
             assert_eq!(test.g.hashes(), before);
-            test.g.map_mut().remove_building(store);
-            assert!(building_diagnostics(&test.g, store).is_none());
+            test.g.map_mut().remove_building(building);
+            assert!(building_diagnostics(&test.g, building).is_none());
         }
     }
 

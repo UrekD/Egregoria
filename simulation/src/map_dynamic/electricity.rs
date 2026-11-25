@@ -1,25 +1,23 @@
-use crate::map::{
-    Building, BuildingID, BuildingKind, ElectricityNetwork, ElectricityNetworkID, Map,
-};
-use crate::map_dynamic::BuildingInfos;
+use super::{active_business, effective_load, BuildingInfos};
+use crate::map::{BuildingID, BuildingKind, ElectricityNetwork, ElectricityNetworkID, Map};
 use crate::souls::residence::Residences;
 use crate::utils::resources::Resources;
-use crate::world::CompanyID;
-use crate::{SoulID, World};
-use prototypes::{prototypes, try_prototype, GoodsCompanyID, Power, TICKS_PER_HOUR};
+use crate::World;
+use prototypes::{prototypes, Power};
 use serde::Deserialize;
 use slotmapd::__impl::Serialize;
 use std::collections::BTreeMap;
 
-const HOUSE_FALLBACK_POWER: Power = Power::new(100);
+// The zoning spine owns registration in map_dynamic/mod.rs.
+#[path = "site_load.rs"]
+mod site_load;
+pub use site_load::*;
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct ElectricityFlow {
     flowmap: BTreeMap<ElectricityNetworkID, NetworkFlow>,
     #[serde(skip)]
     power_cache: PowerCache,
-    #[serde(skip)]
-    company_staffing: Vec<(CompanyID, usize)>,
 }
 
 impl ElectricityFlow {
@@ -81,7 +79,7 @@ struct PowerCache {
 struct NetworkLoads {
     id: ElectricityNetworkID,
     houses: Vec<BuildingID>,
-    companies: Vec<(BuildingID, GoodsCompanyID)>,
+    live_sites: Vec<BuildingID>,
     residential_watts: i64,
 }
 
@@ -90,14 +88,15 @@ impl NetworkLoads {
         let mut loads = Self {
             id: network.id,
             houses: Vec::new(),
-            companies: Vec::new(),
+            live_sites: Vec::new(),
             residential_watts: 0,
         };
         for &building in &network.buildings {
-            match map.buildings[building].kind {
-                BuildingKind::House => loads.houses.push(building),
-                BuildingKind::GoodsCompany(company) => loads.companies.push((building, company)),
-                _ => {}
+            let site = &map.buildings[building];
+            if site.development().is_some() || site.kind.as_goods_company().is_some() {
+                loads.live_sites.push(building);
+            } else if site.kind == BuildingKind::House {
+                loads.houses.push(building);
             }
         }
         loads
@@ -132,40 +131,13 @@ impl PowerCache {
         }
         for loads in &mut self.networks {
             loads.residential_watts = loads.houses.iter().fold(0i64, |watts, &id| {
-                watts.wrapping_add(house_power(residences, id).watts())
+                let load =
+                    effective_load(&map.buildings[id], residences.by_building.get(&id), None);
+                watts.wrapping_add(load.residential_power.watts())
             });
         }
         self.key = Some(key);
     }
-}
-
-fn house_power(residences: &Residences, id: BuildingID) -> Power {
-    residences
-        .by_building
-        .get(&id)
-        .and_then(|residence| try_prototype(residence.prototype))
-        .and_then(|proto| proto.power_consumption)
-        .unwrap_or(HOUSE_FALLBACK_POWER)
-}
-
-fn company_power(
-    world: &World,
-    binfos: &BuildingInfos,
-    building: &Building,
-    company: GoodsCompanyID,
-) -> (Power, Power) {
-    let proto = company.prototype();
-    let Some(SoulID::GoodsCompany(owner)) = binfos.owner(building.id) else {
-        return (Power::ZERO, Power::ZERO);
-    };
-    let Some(ent) = world.companies.get(owner) else {
-        return (Power::ZERO, Power::ZERO);
-    };
-    let productivity = ent.raw_productivity(proto, building.zone.as_ref()) as f64;
-    (
-        proto.power_consumption.unwrap_or(Power::ZERO) * productivity,
-        proto.power_production.unwrap_or(Power::ZERO) * productivity,
-    )
 }
 
 /// Compute the electricity flow of the map and store it in the [`ElectricityFlow`] resource
@@ -173,15 +145,25 @@ fn company_power(
 /// If a network produces less power than it consumes, a blackout will occur
 pub fn electricity_flow_system(world: &mut World, resources: &mut Resources) {
     profiling::scope!("map_dynamic::electricity_flow");
+    update_electricity_flow(world, resources);
+    #[cfg(debug_assertions)]
+    assert_matches_full_recompute(
+        world,
+        &resources.read::<Map>(),
+        &resources.read::<BuildingInfos>(),
+        &resources.read::<Residences>(),
+        &resources.read::<ElectricityFlow>().flowmap,
+    );
+}
 
+fn update_electricity_flow(world: &World, resources: &Resources) {
     let map = resources.read::<Map>();
-    let binfos = resources.read::<BuildingInfos>();
+    let infos = resources.read::<BuildingInfos>();
     let residences = resources.read::<Residences>();
     let mut flow = resources.write::<ElectricityFlow>();
     let ElectricityFlow {
         flowmap,
         power_cache,
-        company_staffing: staffing,
     } = &mut *flow;
 
     power_cache.update(
@@ -190,17 +172,27 @@ pub fn electricity_flow_system(world: &mut World, resources: &mut Resources) {
         &residences,
         flowmap,
     );
-    staffing.clear();
-    staffing.extend(company_staffing(world));
 
     for loads in &power_cache.networks {
         let mut consumed_watts = loads.residential_watts;
         let mut produced_power = Power::ZERO;
-        for &(id, company) in &loads.companies {
-            let (consumed, produced) = company_power(world, &binfos, &map.buildings[id], company);
-            // Preserve integer totals when grouping house loads ahead of company loads.
-            consumed_watts = consumed_watts.wrapping_add(consumed.watts());
-            produced_power += produced;
+        // Profiled housing and companies can change role, owner or capacity
+        // between passes without a topology edit or a different worker count.
+        for &id in &loads.live_sites {
+            let building = &map.buildings[id];
+            if building.development().is_some() && connected_site_network(&map, building).is_none()
+            {
+                continue;
+            }
+            let load = effective_load(
+                building,
+                residences.by_building.get(&id),
+                active_business(building, &infos, world),
+            );
+            consumed_watts = consumed_watts
+                .wrapping_add(load.residential_power.watts())
+                .wrapping_add(load.business_power.watts());
+            produced_power += load.power_production;
         }
         let consumed_power = Power::new(consumed_watts);
         *flowmap.get_mut(&loads.id).unwrap() = NetworkFlow {
@@ -209,9 +201,6 @@ pub fn electricity_flow_system(world: &mut World, resources: &mut Resources) {
             blackout: consumed_power > produced_power,
         };
     }
-
-    #[cfg(debug_assertions)]
-    assert_matches_full_recompute(world, &map, &binfos, &residences, flowmap);
 }
 
 #[cfg(any(debug_assertions, test))]
@@ -228,15 +217,17 @@ fn assert_matches_full_recompute(
         let mut produced_power = Power::ZERO;
         for &id in &network.buildings {
             let building = &map.buildings[id];
-            let (consumed, produced) = match building.kind {
-                BuildingKind::House => (house_power(residences, id), Power::ZERO),
-                BuildingKind::GoodsCompany(company) => {
-                    company_power(world, binfos, building, company)
-                }
-                _ => continue,
-            };
-            consumed_power += consumed;
-            produced_power += produced;
+            if building.development().is_some() && connected_site_network(map, building).is_none() {
+                continue;
+            }
+            let load = effective_load(
+                building,
+                residences.by_building.get(&id),
+                active_business(building, binfos, world),
+            );
+            consumed_power += load.residential_power;
+            consumed_power += load.business_power;
+            produced_power += load.power_production;
         }
         assert_eq!(
             flowmap[&network.id],
@@ -251,28 +242,14 @@ fn assert_matches_full_recompute(
     }
 }
 
-fn company_staffing(world: &World) -> impl Iterator<Item = (CompanyID, usize)> + '_ {
-    world
-        .companies
-        .iter()
-        .map(|(id, company)| (id, company.workers.0.len()))
-}
-
 /// Refresh the snapshot before the utility and coverage passes.
 pub(crate) fn refresh_electricity_flow_system(world: &mut World, resources: &mut Resources) {
-    {
-        let key = PowerCacheKey::new(&resources.read::<Map>(), &resources.read::<Residences>());
-        let flow = resources.read::<ElectricityFlow>();
-        // Keep the hourly refresh for changes made by the systems between the two passes.
-        if resources.tick().0 % TICKS_PER_HOUR != 0
-            && flow.power_cache.key == Some(key)
-            && company_staffing(world).eq(flow.company_staffing.iter().copied())
-        {
-            return;
-        }
-    }
-    electricity_flow_system(world, resources);
+    profiling::scope!("map_dynamic::refresh_electricity_flow");
+    update_electricity_flow(world, resources);
 }
+
+#[cfg(test)]
+pub(crate) use tests::accounting_site;
 
 #[cfg(test)]
 mod tests {
@@ -282,10 +259,164 @@ mod tests {
     use crate::souls::human::spawn_human;
     use crate::souls::residence::{self, Residence};
     use crate::tests::TestCtx;
-    use crate::world::HumanID;
+    use crate::{CompanyID, HumanID, SoulID};
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Vec2, OBB};
-    use prototypes::{BuildingGen, GameTime, ItemID, ResidencePrototypeID, Tick};
+    use prototypes::{
+        BuildingGen, GameTime, GoodsCompanyID, ItemID, ResidencePrototypeID, Tick, TICKS_PER_HOUR,
+    };
+
+    pub(crate) fn accounting_site(mixed: bool) -> (TestCtx, BuildingID, CompanyID) {
+        let jobs = if mixed {
+            12
+        } else {
+            prototypes::MAX_PROFILED_SLOTS
+        };
+        accounting_site_with_jobs(mixed, jobs)
+    }
+
+    fn accounting_site_with_jobs(mixed: bool, jobs: u32) -> (TestCtx, BuildingID, CompanyID) {
+        use crate::map::{
+            Density, GrowableBusinessState, GrowableDevelopment, GrowableSiteState,
+            PreparedGrowableAppearance, ZoneCell, ZoneKind,
+        };
+        use crate::souls::growth::check_growable_lot;
+        use crate::GrowablePlan;
+
+        let mut test = TestCtx::new_fast();
+        test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(400.0, 100.0, 0.0)]);
+        let zone = ZoneCell {
+            kind: ZoneKind::Commercial,
+            density: Density::Low,
+        };
+        let (plan, proto) = {
+            let map = test.g.map();
+            let site = map
+                .lots()
+                .values()
+                .find_map(|lot| check_growable_lot(&map, lot, zone).ok())
+                .unwrap();
+            let proto = site.company.unwrap().base.id;
+            let door = site.shape.center().z(0.1);
+            let plan = GrowablePlan::prepare(
+                &map,
+                site,
+                Some(PreparedGrowableAppearance {
+                    development: GrowableDevelopment {
+                        zone,
+                        level: 1,
+                        floors: 1,
+                        roof_z: 4.0,
+                        approved_value_band: 0,
+                        home: None,
+                        planned_jobs: jobs,
+                        site: GrowableSiteState::Active,
+                        business: Some(GrowableBusinessState::AwaitingSpawn),
+                    },
+                    base_z: 0.0,
+                    door,
+                    mesh: Default::default(),
+                }),
+                None,
+                jobs,
+            )
+            .unwrap();
+            (plan, proto)
+        };
+        let building = test.g.commit_prepared_growable(plan).unwrap().building;
+        let Some(SoulID::GoodsCompany(company)) = company_soul(&mut test.g, building, proto) else {
+            panic!("expected a company");
+        };
+        if mixed {
+            // Mixed prototypes are gated in the stock registry. Give the checked
+            // storefront the same mixed role state that a prepared site would carry.
+            let home = residence::prototype(Density::Medium, 1).unwrap();
+            let mut map = test.g.map_mut();
+            let site = map.get(building).unwrap();
+            let mut development = site.development().unwrap().clone();
+            development.zone = ZoneCell {
+                kind: ZoneKind::MixedUse,
+                density: Density::Medium,
+            };
+            development.home = Some(home.id);
+            let original = Bincode::encode(site.development().unwrap()).unwrap();
+            let mut record = Bincode::encode(site).unwrap();
+            assert!(record.ends_with(&original));
+            record.truncate(record.len() - original.len());
+            record.extend(Bincode::encode(&development).unwrap());
+            map.buildings[building] = Bincode::decode(&record).unwrap();
+            drop(map);
+            residence::register(&test.g, building, home);
+        }
+        (test, building, company)
+    }
+
+    #[test]
+    fn z3_accounting_mixed_power_and_late_role_change() {
+        use crate::map::GrowableBusinessState;
+        use crate::map_dynamic::{active_business, effective_load};
+
+        let (mut test, id, company) = accounting_site(true);
+        let network = test.g.map().electricity.net_id(id).unwrap();
+        let used = |test: &TestCtx| {
+            test.g
+                .read::<ElectricityFlow>()
+                .network_stats(network)
+                .consumed_power
+        };
+        let expected = |test: &TestCtx| {
+            let map = test.g.map();
+            let building = map.get(id).unwrap();
+            let infos = test.g.read::<BuildingInfos>();
+            effective_load(
+                building,
+                test.g.read::<Residences>().by_building.get(&id),
+                active_business(building, &infos, test.g.world()),
+            )
+        };
+        let refresh = |test: &mut TestCtx| {
+            let (world, resources) = test.g.world_res();
+            refresh_electricity_flow_system(world, resources);
+            assert_matches_full_recompute(
+                world,
+                &resources.read::<Map>(),
+                &resources.read::<BuildingInfos>(),
+                &resources.read::<Residences>(),
+                &resources.read::<ElectricityFlow>().flowmap,
+            );
+        };
+
+        let vacant = expected(&test);
+        assert!(vacant.residential_power > Power::ZERO);
+        assert!(vacant.business_water > 0.0);
+        assert_eq!(vacant.business_power, Power::ZERO);
+        refresh(&mut test);
+        assert_eq!(used(&test), vacant.residential_power);
+
+        test.g.world.companies[company].workers.0 = vec![HumanID::default(); 6];
+        refresh(&mut test);
+        let staffed = expected(&test);
+        assert!(staffed.business_power > Power::ZERO);
+        assert_eq!(
+            used(&test),
+            staffed.residential_power + staffed.business_power
+        );
+
+        test.g.write::<GameTime>().tick.0 += 1;
+        assert_ne!(test.g.get_tick() % TICKS_PER_HOUR, 0);
+        test.g.map_mut().set_growable_business_state(
+            id,
+            GrowableBusinessState::ClosedUntil {
+                retry_elapsed_tick: u64::MAX,
+            },
+        );
+        refresh(&mut test);
+        assert_eq!(used(&test), staffed.residential_power);
+
+        test.g.map_mut().mark_growable_abandoned(id, 0);
+        refresh(&mut test);
+        assert_eq!(used(&test), Power::ZERO);
+    }
 
     fn company(test: &mut TestCtx, house: BuildingID, name: &str, x: f32) -> CompanyID {
         let road = test.g.map().get(house).unwrap().connected_road.unwrap();
@@ -307,6 +438,133 @@ mod tests {
             panic!("could not start {name}");
         };
         company
+    }
+
+    #[test]
+    fn z3_accounting_late_power_uses_changed_slots_with_the_same_staff() {
+        use crate::map::PreparedGrowableAppearance;
+
+        let (mut test, id, company) = accounting_site_with_jobs(false, 18);
+        test.g.world.companies[company].workers.0 = vec![HumanID::default(); 9];
+        let network = test.g.map().electricity.net_id(id).unwrap();
+        let business_power = test.g.world.companies[company]
+            .comp
+            .proto
+            .prototype()
+            .power_consumption
+            .unwrap();
+        let refresh = |test: &mut TestCtx| {
+            let (world, res) = test.g.world_res();
+            refresh_electricity_flow_system(world, res);
+            res.read::<ElectricityFlow>()
+                .network_stats(network)
+                .consumed_power
+        };
+        assert_eq!(refresh(&mut test), business_power * 0.5);
+        {
+            let mut map = test.g.map_mut();
+            let building = map.get(id).unwrap();
+            let mut development = building.development().unwrap().clone();
+            development.level += 1;
+            development.planned_jobs = 36;
+            let appearance = PreparedGrowableAppearance {
+                development,
+                base_z: building.height,
+                door: building.door_pos,
+                mesh: Default::default(),
+            };
+            assert!(map.update_growable_appearance(id, appearance));
+        }
+        assert_eq!(refresh(&mut test), business_power * 0.25);
+    }
+
+    #[test]
+    fn z3_accounting_network_reservations_share_live_headroom() {
+        use crate::map_dynamic::{utility_flow_update, UtilityFlow};
+
+        let (mut test, first, shop) = accounting_site(true);
+        let second = test.build_house_near(vec2(175.0, 125.0));
+        for (name, x) in [
+            ("coal-power-plant", 220.0),
+            ("water-pump", 270.0),
+            ("sewage-outlet", 320.0),
+        ] {
+            let provider = company(&mut test, first, name, x);
+            let provider = &mut test.g.world.companies[provider];
+            provider.workers.0 = vec![HumanID::default(); provider.comp.max_workers as usize];
+        }
+        test.g.write::<GameTime>().tick = Tick(3001);
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+        utility_flow_update(&mut test.g);
+
+        let (mut ledger, first_next, second_next) = {
+            use crate::map_dynamic::{active_business, effective_load};
+
+            let map = test.g.map();
+            let homes = test.g.read::<Residences>();
+            let infos = test.g.read::<BuildingInfos>();
+            let world = test.g.world();
+            let network = map.electricity.net_id(first).unwrap();
+            assert_eq!(map.electricity.net_id(second), Some(network));
+            let live = NetworkLoad::live(&map, &homes, &infos, world, network).unwrap();
+            let power = test.g.read::<ElectricityFlow>().network_stats(network);
+            assert_eq!(
+                live.power_demand_watts,
+                i128::from(power.consumed_power.watts())
+            );
+            assert_eq!(
+                live.power_supply_watts,
+                i128::from(power.produced_power.watts())
+            );
+            let flow = test.g.read::<UtilityFlow>();
+            let status = flow
+                .status_for_site(&map, &homes, &infos, world, first)
+                .unwrap();
+            assert_eq!(status.totals, Some(live.pipes));
+            let add = (live.pipes.water_production - live.pipes.water_demand) * 0.75;
+            assert!(add > 0.0);
+            let increased = |id| {
+                let building = map.get(id).unwrap();
+                let active = active_business(building, &infos, world);
+                let home = homes.by_building.get(&id);
+                let mut next = projected_site_load(building, home, active);
+                if id == first {
+                    assert_eq!(active.unwrap().company, shop);
+                    assert_eq!(
+                        effective_load(building, home, active).business_power,
+                        Power::ZERO
+                    );
+                    assert!(next.business_power > Power::ZERO);
+                }
+                next.residential_water += add;
+                next.residential_sewage += add;
+                next
+            };
+            (
+                NetworkReservations::new(&map),
+                increased(first),
+                increased(second),
+            )
+        };
+
+        assert_eq!(ledger.try_reserve(&test.g, first, first_next), Ok(()));
+        assert_eq!(
+            ledger.try_reserve(&test.g, second, second_next),
+            Err(UtilityAdmission::Water)
+        );
+        let mut fresh = NetworkReservations::new(&test.g.map());
+        assert_eq!(fresh.try_reserve(&test.g, second, second_next), Ok(()));
+
+        test.g.map_mut().electricity.remove_object(second);
+        assert_eq!(
+            ledger.try_reserve(&test.g, second, second_next),
+            Err(UtilityAdmission::StaleTopology)
+        );
+        assert_eq!(
+            NetworkReservations::new(&test.g.map()).try_reserve(&test.g, second, second_next),
+            Err(UtilityAdmission::Disconnected)
+        );
     }
 
     #[test]
@@ -334,7 +592,7 @@ mod tests {
                 .read::<ElectricityFlow>()
                 .network_stats(network)
                 .consumed_power,
-            HOUSE_FALLBACK_POWER,
+            Power::new(100),
         );
 
         let mut replacement = Map::empty();

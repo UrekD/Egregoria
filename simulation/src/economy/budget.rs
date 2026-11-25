@@ -1,6 +1,7 @@
 pub use crate::economy::balance::DEFAULT_TAX_RATE_PERMILLE;
 use crate::economy::Government;
 use crate::map::{BuildingKind, Map, ZoneKind};
+use crate::map_dynamic::{active_business, BuildingInfos};
 use crate::souls::residence::Residences;
 use crate::{utils::resources::Resources, World, INITIAL_TICK};
 use prototypes::{
@@ -221,36 +222,51 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("economy::budget_update");
     let map = resources.read::<Map>();
     let residences = resources.read::<Residences>();
+    let infos = resources.read::<BuildingInfos>();
     let mut taxable_levels = BTreeMap::<ZoneKind, i128>::new();
     for human in world.humans.values().filter(|human| human.work.is_some()) {
         let house = human.home.house;
-        if map.get(house).is_some_and(|building| {
-            building.has_residential_use() && !building.is_abandoned_growable()
-        }) {
-            let level = residences
-                .by_building
-                .get(&house)
-                .map_or(1, |home| home.level);
-            *taxable_levels.entry(ZoneKind::Residential).or_default() += i128::from(level);
-        }
+        let Some(building) = map
+            .get(house)
+            .filter(|building| building.has_residential_use() && !building.is_abandoned_growable())
+        else {
+            continue;
+        };
+        let level = building.development().map_or_else(
+            || {
+                residences
+                    .by_building
+                    .get(&house)
+                    .map_or(1, |home| home.level)
+            },
+            |site| site.level,
+        );
+        *taxable_levels.entry(ZoneKind::Residential).or_default() += i128::from(level);
     }
-    for company in world.companies.values() {
-        let id = GrowableCompanyID::from(company.comp.proto);
-        if let Some(proto) = try_prototype(id).filter(|proto| proto.growable) {
-            let level = map
-                .get(company.comp.building)
-                .and_then(|building| building.development())
-                .map_or(proto.level, |site| {
-                    if site.zone.kind == ZoneKind::MixedUse {
-                        1
-                    } else {
-                        site.level
-                    }
-                });
-            if proto.zone_kind.is_taxable() {
-                *taxable_levels.entry(proto.zone_kind).or_default() +=
-                    company.workers.0.len() as i128 * i128::from(level);
-            }
+    for (id, company) in world.companies.iter() {
+        let Some(building) = map.get(company.comp.building) else {
+            continue;
+        };
+        let Some(business) =
+            active_business(building, &infos, world).filter(|business| business.company == id)
+        else {
+            continue;
+        };
+        let Some(proto) = try_prototype(GrowableCompanyID::from(business.prototype.id))
+            .filter(|proto| proto.growable)
+        else {
+            continue;
+        };
+        let (zone, level) = building
+            .development()
+            .map_or((proto.zone_kind, proto.level), |site| {
+                match site.zone.kind {
+                    ZoneKind::MixedUse => (ZoneKind::Commercial, 1),
+                    zone => (zone, site.level),
+                }
+            });
+        if zone.is_taxable() {
+            *taxable_levels.entry(zone).or_default() += business.filled as i128 * i128::from(level);
         }
     }
 
@@ -344,6 +360,90 @@ mod tests {
         for _ in 0..ticks {
             sim.tick(&mut schedule, &[]);
         }
+    }
+
+    #[test]
+    fn z3_accounting_capped_upgrade_taxes_live_level_with_unchanged_openings() {
+        use crate::economy::Market;
+        use crate::map::{GrowableBusinessState, PreparedGrowableAppearance};
+        use crate::map_dynamic::accounting_site;
+        use crate::HumanID;
+        use prototypes::ItemID;
+
+        let (mut ctx, building, company) = accounting_site(false);
+        ctx.g.world.companies[company]
+            .workers
+            .0
+            .push(HumanID::default());
+        let seller = SoulID::GoodsCompany(company);
+        let jobs = ItemID::new("job-opening");
+        ctx.g.write::<Market>().produce(seller, jobs, -1);
+        let (door, base_z) = {
+            let map = ctx.g.map();
+            let site = map.get(building).unwrap();
+            let infos = ctx.g.read::<BuildingInfos>();
+            let business = active_business(site, &infos, ctx.g.world()).unwrap();
+            assert_eq!(
+                business.job_slot_increase(prototypes::MAX_PROFILED_SLOTS),
+                Some(0)
+            );
+            assert_eq!(
+                business.job_slot_increase(prototypes::MAX_PROFILED_SLOTS - 1),
+                None
+            );
+            assert_eq!(
+                business.job_slot_increase(prototypes::MAX_PROFILED_SLOTS + 1),
+                None
+            );
+            (site.door_pos, site.height)
+        };
+        ctx.g.write::<Market>().sell_all(seller, door.xy(), jobs, 0);
+        let openings = prototypes::MAX_PROFILED_SLOTS - 1;
+        let tax_for_hour = |sim: &mut Simulation| {
+            let category = BudgetCategory::Tax(ZoneKind::Commercial);
+            let before = sim.read::<Budget>().total(category);
+            sim.write::<GameTime>().tick.0 += TICKS_PER_HOUR;
+            let (world, res) = sim.world_res();
+            budget_update(world, res);
+            sim.read::<Budget>().total(category) - before
+        };
+        let level_one = tax_for_hour(&mut ctx.g);
+        assert!(level_one > 0);
+
+        {
+            let mut map = ctx.g.map_mut();
+            let mut development = map.get(building).unwrap().development().unwrap().clone();
+            development.level += 1;
+            development.roof_z += 0.25;
+            assert!(map.update_growable_appearance(
+                building,
+                PreparedGrowableAppearance {
+                    development,
+                    base_z,
+                    door,
+                    mesh: Default::default(),
+                }
+            ));
+        }
+        assert!((tax_for_hour(&mut ctx.g) - 2 * level_one).abs() <= 2);
+        let company_ent = &ctx.g.world.companies[company];
+        assert_eq!(company_ent.workers.0.len(), 1);
+        assert_eq!(company_ent.comp.max_workers, prototypes::MAX_PROFILED_SLOTS);
+        assert_eq!(
+            ctx.g.read::<Market>().inner()[&jobs]
+                .sell_order(seller)
+                .unwrap()
+                .qty,
+            openings
+        );
+
+        ctx.g.map_mut().set_growable_business_state(
+            building,
+            GrowableBusinessState::ClosedUntil {
+                retry_elapsed_tick: u64::MAX,
+            },
+        );
+        assert_eq!(tax_for_hour(&mut ctx.g), 0);
     }
 
     #[test]

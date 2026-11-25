@@ -34,7 +34,9 @@ use super::{
 };
 use crate::map::{BuildingID, LaneKind, Map, PathKind, RoadID};
 use crate::map_dynamic::transit::elapsed_ticks;
-use crate::map_dynamic::{BuildingInfos, Destination, Itinerary, ParkingManagement};
+use crate::map_dynamic::{
+    active_business, BuildingInfos, Destination, Itinerary, ParkingManagement,
+};
 use crate::souls::desire::WorkKind;
 use crate::souls::freight_station::train_stop;
 use crate::souls::household::household_items;
@@ -102,19 +104,21 @@ struct Endpoint {
 
 impl Endpoint {
     fn live(self, world: &World, map: &Map, infos: &BuildingInfos) -> bool {
-        infos.owner(self.building) == Some(self.soul)
-            && map.get(self.building).is_some()
-            && match self.soul {
-                SoulID::GoodsCompany(id) => world
-                    .companies
-                    .get(id)
-                    .is_some_and(|entity| entity.comp.building == self.building),
-                SoulID::FreightStation(id) => world
-                    .freight_stations
-                    .get(id)
-                    .is_some_and(|entity| entity.f.building == self.building),
-                SoulID::Human(_) => false,
+        let Some(building) = map.get(self.building) else {
+            return false;
+        };
+        match self.soul {
+            SoulID::GoodsCompany(id) => active_business(building, infos, world)
+                .is_some_and(|business| business.company == id),
+            SoulID::FreightStation(id) => {
+                infos.owner(self.building) == Some(self.soul)
+                    && world
+                        .freight_stations
+                        .get(id)
+                        .is_some_and(|entity| entity.f.building == self.building)
             }
+            SoulID::Human(_) => false,
+        }
     }
 }
 
@@ -948,11 +952,11 @@ struct Input {
 }
 
 impl Input {
-    fn new(destination: Endpoint, amount: i32, recipe: &prototypes::Recipe) -> Self {
+    fn new(destination: Endpoint, amount: i32, full_speed_batch_ticks: f64) -> Self {
         Self {
             destination,
             amount: amount as u32,
-            recipe_ticks: recipe.batch_ticks().ceil() as u64,
+            recipe_ticks: full_speed_batch_ticks.ceil() as u64,
         }
     }
 
@@ -1481,18 +1485,24 @@ fn match_shipments(
             soul: SoulID::GoodsCompany(id),
             building: company.comp.building,
         };
-        if !destination.live(world, map, infos) {
+        let Some(batch_ticks) = map
+            .get(destination.building)
+            .and_then(|building| active_business(building, infos, world))
+            .filter(|business| business.company == id)
+            .and_then(|business| business.rates().full_speed_batch_ticks)
+        else {
             continue;
-        }
+        };
         for item in recipe
             .consumption
             .iter()
             .filter(|item| items.contains(&item.id))
         {
-            inputs
-                .entry(item.id)
-                .or_default()
-                .push(Input::new(destination, item.amount, recipe));
+            inputs.entry(item.id).or_default().push(Input::new(
+                destination,
+                item.amount,
+                batch_ticks,
+            ));
         }
     }
     let stations: Vec<_> = world
@@ -1689,6 +1699,7 @@ fn dispatch(
 ) {
     let market = resources.read::<Market>();
     let time = resources.read::<prototypes::GameTime>();
+    let infos = resources.read::<BuildingInfos>();
     // Warehouses may dispatch more than one truck. An earlier ineligible route does not
     // hold a later ready route. A destination that cannot run its recipe goes
     // first, then the oldest shipment, and shipment IDs break all ties.
@@ -1704,7 +1715,7 @@ fn dispatch(
         .map(|((source, destination), ids)| {
             let stocked_out = ids.iter().any(|id| {
                 let item = book.shipments[id].quantity.item;
-                destination_input(world, destination, item)
+                destination_input(world, map, &infos, destination, item)
                     .is_some_and(|input| on_hand(&market, destination, item) < input.amount)
             });
             ((!stocked_out, ids[0]), source, destination, ids)
@@ -1757,7 +1768,8 @@ fn dispatch(
             for id in ids {
                 let ItemQuantity { item, units } = book.shipments[id].quantity;
                 room.entry(item).or_insert_with(|| {
-                    let Some(input) = destination_input(world, destination, item) else {
+                    let Some(input) = destination_input(world, map, &infos, destination, item)
+                    else {
                         // Warehouses reserve shared capacity at match time, and
                         // stations have no per-item unloading limit.
                         return u32::MAX;
@@ -1845,20 +1857,26 @@ fn dispatch(
     }
 }
 
-fn destination_input(world: &World, destination: Endpoint, item: ItemID) -> Option<Input> {
+fn destination_input(
+    world: &World,
+    map: &Map,
+    infos: &BuildingInfos,
+    destination: Endpoint,
+    item: ItemID,
+) -> Option<Input> {
     let SoulID::GoodsCompany(id) = destination.soul else {
         return None;
     };
-    let recipe = world
-        .companies
-        .get(id)?
-        .comp
-        .proto
-        .prototype()
-        .recipe
-        .as_ref()?;
+    let building = map.get(destination.building)?;
+    let business =
+        active_business(building, infos, world).filter(|business| business.company == id)?;
+    let recipe = business.prototype.recipe.as_ref()?;
     let input = recipe.consumption.iter().find(|input| input.id == item)?;
-    Some(Input::new(destination, input.amount, recipe))
+    Some(Input::new(
+        destination,
+        input.amount,
+        business.rates().full_speed_batch_ticks?,
+    ))
 }
 
 /// Records the station side of a virtual export. The ordinary market still
@@ -2461,9 +2479,9 @@ fn import_target(input: Input) -> u32 {
 /// reorder fills at least a quarter of the target, so trucks run well loaded.
 fn import_reorder_point(input: Input) -> u32 {
     let target = import_target(input);
-    (input.amount + lead_demand(input).min(u64::from(u32::MAX)) as u32)
-        .min(target * 3 / 4)
-        .max(input.amount)
+    (u64::from(input.amount) + lead_demand(input))
+        .min(u64::from(target) * 3 / 4)
+        .max(u64::from(input.amount)) as u32
 }
 
 /// Imports what local freight leaves short, from the nearest station with
@@ -2498,7 +2516,7 @@ fn order_imports(
     for desk in book.imports.values_mut() {
         desk.orders.retain(|order| {
             let (buyer, item) = (order.buyer, order.quantity.item);
-            destination_input(world, buyer, item).is_none_or(|input| {
+            destination_input(world, map, infos, buyer, item).is_none_or(|input| {
                 on_hand(&market, buyer, item) + local((buyer, item)) < import_target(input)
             })
         });
@@ -2535,7 +2553,7 @@ fn order_imports(
         wants.entry(key).or_insert(None);
     }
     for ((buyer, item), ordered) in wants {
-        let Some(input) = destination_input(world, buyer, item) else {
+        let Some(input) = destination_input(world, map, infos, buyer, item) else {
             continue;
         };
         let key = (buyer, item);
@@ -2930,6 +2948,39 @@ mod tests {
     use super::*;
 
     #[test]
+    fn z3_accounting_large_batch_keeps_station_reorder_bounded() {
+        let input = Input {
+            destination: Endpoint {
+                soul: SoulID::GoodsCompany(CompanyID::default()),
+                building: BuildingID::default(),
+            },
+            amount: i32::MAX as u32,
+            recipe_ticks: 1,
+        };
+        assert_eq!(import_target(input), input.amount);
+        assert_eq!(import_reorder_point(input), input.amount);
+    }
+
+    #[test]
+    fn z3_accounting_faster_batches_raise_road_and_station_targets() {
+        let endpoint = Endpoint {
+            soul: SoulID::GoodsCompany(CompanyID::default()),
+            building: BuildingID::default(),
+        };
+        let policy = DispatchPolicy {
+            capacity: 16,
+            minimum: 8,
+            max_wait: 2 * TICKS_PER_HOUR,
+        };
+        let normal = Input::new(endpoint, 2, 6.0 * TICKS_PER_HOUR as f64);
+        let faster = Input::new(endpoint, 2, 3.0 * TICKS_PER_HOUR as f64);
+        assert!(faster.target(policy) > normal.target(policy));
+        assert!(import_target(faster) > import_target(normal));
+        assert!(import_reorder_point(faster) > import_reorder_point(normal));
+        assert!(import_target(faster) <= STATION_TRUCK_CAPACITY);
+    }
+
+    #[test]
     fn e2a_dispatch_full_partial_aged_and_urgent() {
         let policy = DispatchPolicy {
             capacity: 16,
@@ -2959,6 +3010,16 @@ mod lifecycle_tests {
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Vec2, OBB};
     use prototypes::{BuildingGen, GameTime, GoodsCompanyID, RecTimeInterval};
+
+    fn fixture_input(sim: &Simulation, destination: Endpoint, item: ItemID) -> Option<Input> {
+        destination_input(
+            sim.world(),
+            &sim.map(),
+            &sim.read::<BuildingInfos>(),
+            destination,
+            item,
+        )
+    }
 
     struct Fixture {
         ctx: TestCtx,
@@ -3212,7 +3273,7 @@ mod lifecycle_tests {
             let spec = proto.storage.as_ref().unwrap();
             assert_eq!((spec.capacity_units, proto.n_trucks), (capacity, fleet));
             let (driver, truck) = warehouse_driver(&mut f, depot);
-            let input = destination_input(f.ctx.g.world(), f.destination, Fixture::coal()).unwrap();
+            let input = fixture_input(&f.ctx.g, f.destination, Fixture::coal()).unwrap();
             let policy =
                 DispatchPolicy::for_prototype(GoodsCompanyID::new("coal-mine").prototype())
                     .unwrap();
@@ -3328,7 +3389,7 @@ mod lifecycle_tests {
         let capacity = 64;
         let policy =
             DispatchPolicy::for_prototype(GoodsCompanyID::new("coal-mine").prototype()).unwrap();
-        let input = destination_input(f.ctx.g.world(), f.destination, Fixture::coal()).unwrap();
+        let input = fixture_input(&f.ctx.g, f.destination, Fixture::coal()).unwrap();
         f.seed(100, input.target(policy) as i32);
         f.ctx
             .g
@@ -3523,7 +3584,7 @@ mod lifecycle_tests {
     #[test]
     fn e2a_destination_reorder_and_aged_partial_dispatch_are_bounded() {
         let mut f = Fixture::new();
-        let input = destination_input(f.ctx.g.world(), f.destination, Fixture::coal()).unwrap();
+        let input = fixture_input(&f.ctx.g, f.destination, Fixture::coal()).unwrap();
         let policy =
             DispatchPolicy::for_prototype(GoodsCompanyID::new("coal-mine").prototype()).unwrap();
         f.seed(5, (input.target(policy) - policy.minimum) as i32);
@@ -3819,7 +3880,7 @@ mod lifecycle_tests {
     }
 
     fn plant_target(f: &Fixture) -> i32 {
-        destination_input(f.ctx.g.world(), f.destination, Fixture::coal())
+        fixture_input(&f.ctx.g, f.destination, Fixture::coal())
             .unwrap()
             .target(mine_policy()) as i32
     }
@@ -4099,7 +4160,7 @@ mod lifecycle_tests {
             .g
             .write::<Market>()
             .produce(depot.soul, Fixture::coal(), 48);
-        let amount = destination_input(f.ctx.g.world(), f.destination, Fixture::coal())
+        let amount = fixture_input(&f.ctx.g, f.destination, Fixture::coal())
             .unwrap()
             .amount;
         f.seed(0, amount as i32);
@@ -4480,7 +4541,7 @@ mod lifecycle_tests {
         // The factory stops producing at this stock.
         let full = output.amount * (recipe.storage_multiplier + 1);
         let policy = DispatchPolicy::for_prototype(proto).unwrap();
-        let input = destination_input(f.ctx.g.world(), f.destination, goods).unwrap();
+        let input = fixture_input(&f.ctx.g, f.destination, goods).unwrap();
         {
             let mut market = f.ctx.g.write::<Market>();
             market.produce(f.source.soul, goods, full);
@@ -5356,7 +5417,7 @@ mod lifecycle_tests {
             f.ctx.tick_fast();
         }
         let wanted = f.ctx.g.get(station).unwrap().f.wanted_cargo;
-        let input = destination_input(f.ctx.g.world(), store, goods).unwrap();
+        let input = fixture_input(&f.ctx.g, store, goods).unwrap();
         assert_eq!(wanted, import_target(input));
         assert!(wanted > input.amount, "a reorder covers the lead time");
         assert!(matches!(
@@ -5433,7 +5494,7 @@ mod lifecycle_tests {
             };
             let goods = ItemID::new("goods");
             let store = f.destination;
-            let input = destination_input(f.ctx.g.world(), store, goods).unwrap();
+            let input = fixture_input(&f.ctx.g, store, goods).unwrap();
             let reorder = import_reorder_point(input);
             assert!(reorder > input.amount && reorder < import_target(input));
             // An earlier import left the store with stock on hand and no buy order.
