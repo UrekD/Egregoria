@@ -187,9 +187,14 @@ pub fn commission(
     sites.insert("coal-power-plant".into(), plant);
     let plant_door = sim.map().buildings()[plant].door_pos.xy();
     let mine_frontage = BTreeSet::from([plant_road]);
-    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)]
-        .into_iter()
-        .enumerate()
+    for (index, offset) in [
+        vec2(-70.0, 0.0),
+        vec2(70.0, 0.0),
+        vec2(0.0, 60.0),
+        vec2(0.0, -65.0),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
         verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
@@ -1449,7 +1454,7 @@ fn install_bus_loops(
     ];
     let routes = [
         ("neighbourhood", [0, 1, 2], 3),
-        ("employment", [0, 3, 4], 4),
+        ("employment", [0, 3, 4], 6),
     ];
     let berths = {
         let map = sim.map();
@@ -2064,6 +2069,22 @@ fn verify_infill(
     let startup_state = snapshot(sim, plan, manifest);
     let road = {
         let map = sim.map();
+        let mut painted = sim.read::<ZoneGrid>().clone();
+        for parcel in &manifest.reserves {
+            painted.paint_on_map(
+                &map,
+                &parcel.footprint,
+                Some(parcel.zoning.kind),
+                parcel.zoning.density,
+            )
+            .map_err(|error| format!("infill paint on {:?}: {error:?}", parcel.lot))?;
+        }
+        let planned_votes = manifest
+            .parcels
+            .iter()
+            .chain(&manifest.reserves)
+            .map(|parcel| (parcel.lot, parcel.zoning))
+            .collect();
         let mut junctions = BTreeMap::new();
         for parcel in &manifest.reserves {
             let road = &map.roads()[parcel.road];
@@ -2094,14 +2115,29 @@ fn verify_infill(
                     }
                     let from = MapProject { pos, kind: ProjectKind::Intersection(id) };
                     let to = MapProject::ground(pos + (direction * length).z(0.0));
-                    map.preview_connection(from, to, None, &pattern).ok()?;
+                    // Extending a junction can create frontage outside the road corridor.
+                    // Test the resulting lot votes before committing to this extension.
+                    let mut extended = (*map).clone();
+                    extended.make_connection(from, to, None, &pattern)?;
+                    if manifest.reserves.iter().any(|parcel| {
+                        extended.get(parcel.lot).is_none_or(|lot| {
+                            lot.parent != parcel.road
+                                || check_growable_lot(&extended, lot, parcel.zoning).is_err()
+                        })
+                    }) {
+                        return None;
+                    }
+                    audit_votes(
+                        extended.lots().values().map(|lot| (lot.id, painted.lot_zone(&lot.shape))),
+                        &planned_votes,
+                    ).ok()?;
                     Some((parcel.district, WorldCommand::MapMakeConnection {
                         from, to, inter: None, pat: pattern.clone(),
                     }))
                 })
         })
     };
-    let (district, road) = road.ok_or("no clear adjacent road extension for infill")?;
+    let (district, road) = road.ok_or("no clear adjacent road extension preserving infill zoning")?;
     apply(sim, &format!("{district} infill road"), &[road])?;
     {
         let map = sim.map();
