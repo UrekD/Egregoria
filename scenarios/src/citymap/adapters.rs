@@ -1,5 +1,4 @@
-use super::contains;
-use geom::{Polygon, Vec2, OBB};
+use geom::{Intersect, Polygon, Segment, Vec2, OBB};
 use prototypes::{try_prototype, BuildingGen, GoodsCompanyID};
 use simulation::map::{
     river_site_summary, water_provider_site, water_service_site, BuildingID, BuildingKind,
@@ -178,26 +177,16 @@ pub(super) fn site_clear(
 }
 
 pub(super) fn crosses_reserved_bank(plan: &TownPlan, footprint: OBB) -> bool {
+    let edges = footprint.segments();
     plan.river.iter().any(|reach| {
+        let shore = reach.source_width_scaled.unwrap_or(88.0) * 0.5 + 6.0;
         reach.downstream.windows(2).any(|pair| {
-            let shore = reach.source_width_scaled.unwrap_or(88.0) * 0.5 + 6.0;
-            footprint
-                .corners
-                .iter()
-                .chain([footprint.center()].iter())
-                .any(|&p| {
-                    super::network::project_on_segment(p, pair[0], pair[1]).distance(p) < shore
-                })
+            let centerline = Segment::new(pair[0], pair[1]);
+            footprint.intersects(&centerline)
+                || edges.iter().any(|edge| edge.distance(&centerline) <= shore)
         })
     }) || plan.riverside_park.as_ref().is_some_and(|park| {
-        footprint
-            .corners
-            .iter()
-            .any(|&p| contains(&park.bank_strip, p))
-            || park
-                .bank_strip
-                .iter()
-                .any(|&p| contains(&footprint.corners, p))
+        Polygon(park.bank_strip.clone()).intersects(&footprint)
     })
 }
 
@@ -245,6 +234,40 @@ mod tests {
         DEFAULT_LESCE, DEFAULT_SAVA,
     };
     use std::path::Path;
+
+    #[test]
+    fn cm2_adapter_reserves_edge_only_bank_and_park_overlaps() {
+        use crate::citymap::layout::{RiverReach, RiversidePark};
+        use crate::citymap::SourceKey;
+        use geom::vec2;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let footprint = OBB::new(Vec2::ZERO, vec2(1.0, 0.0), 200.0, 20.0);
+        plan.river = vec![RiverReach {
+            way: 1,
+            downstream: vec![vec2(55.0, 14.0), vec2(65.0, 14.0)],
+            source_width_scaled: Some(2.0),
+        }];
+        plan.riverside_park = None;
+        assert!(crosses_reserved_bank(&plan, footprint));
+
+        plan.river.clear();
+        plan.riverside_park = Some(RiversidePark {
+            bank_strip: vec![
+                vec2(55.0, -35.0), vec2(65.0, -35.0),
+                vec2(65.0, 35.0), vec2(55.0, 35.0),
+            ],
+            far_bank_access: SourceKey::Authored("test"),
+        });
+        assert!(crosses_reserved_bank(&plan, footprint));
+        let outside = OBB::new(vec2(0.0, 60.0), vec2(1.0, 0.0), 200.0, 20.0);
+        assert!(!crosses_reserved_bank(&plan, outside));
+    }
 
     #[test]
     fn cm2_adapter_places_coal_on_truck_frontage() {
