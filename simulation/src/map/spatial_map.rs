@@ -1,6 +1,6 @@
 use crate::map::{
-    Building, BuildingID, CanonicalPosition, Intersection, IntersectionID, Lot, LotID, Map, Road,
-    RoadID,
+    spend_water_work, Building, BuildingID, CanonicalPosition, Intersection, IntersectionID, Lot,
+    LotID, Map, Road, RoadID, WaterEditError,
 };
 use derive_more::From;
 use flat_spatial::aabbgrid::AABBGridHandle;
@@ -215,6 +215,44 @@ impl SpatialMap {
             .query(shape.bbox())
             .filter(move |&(_, _, p)| filter.test(p))
             .filter_map(move |(_, _, p)| shape.intersects(self.near.get(p)?).then_some(*p))
+    }
+
+    pub(super) fn reserve_lot_query(
+        &self,
+        bounds: AABB,
+        per_lot: usize,
+        changed_objects: usize,
+        new_lots: usize,
+        work: &mut usize,
+    ) -> Result<(), WaterEditError> {
+        let storage = self.broad.storage();
+        let (left, bottom) = storage.cell_id(bounds.ll);
+        let (right, top) = storage.cell_id(bounds.ur);
+        let cells = (right.abs_diff(left) as usize + 1)
+            .saturating_mul(top.abs_diff(bottom) as usize + 1);
+        // Pay for the cell count and both queries, including empty cells and
+        // repeated grid entries.
+        // An added or updated road/junction can contribute one entry per cell.
+        // Generated lots are at most 40 m square and span at most 3x3 cells.
+        spend_water_work(
+            work,
+            cells
+                .saturating_mul(changed_objects.saturating_add(3))
+                .saturating_add(new_lots.saturating_mul(per_lot.saturating_add(9))),
+        )?;
+        for y in bottom..=top {
+            for x in left..=right {
+                if let Some(cell) = storage.cell((x, y)) {
+                    spend_water_work(work, cell.objs.len().saturating_mul(2))?;
+                }
+            }
+        }
+        for (_, _, object) in self.broad.query(bounds) {
+            if object.to_lot().is_some() {
+                spend_water_work(work, per_lot)?;
+            }
+        }
+        Ok(())
     }
 
     /// A zoned building has separate bounds for its polygon and physical footprint.

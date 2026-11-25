@@ -118,7 +118,9 @@ pub(crate) struct PreparedTopologyEdit {
     revision: (u64, u64, u64, u64, usize),
     pub(crate) profile: PolyLine3,
     pub(crate) elevated: bool,
-    pub(crate) preview: RoadPreview,
+    pub(crate) check_water: bool,
+    profile_error: Option<PointGenerateError>,
+    preview: RoadPreview,
     pub(crate) merges: Option<[bool; 2]>,
 }
 
@@ -163,6 +165,7 @@ impl Map {
             .then(WaterTopologyWork::new);
         let (a, b, prepared) = self.prepare_connection(from, to, elbow, pattern, work.as_mut())?;
         if let Some(prepared) = prepared {
+            check_profile_error(prepared.profile_error)?;
             return Ok(prepared.preview);
         }
         let bounds = self.environment().bounds();
@@ -188,8 +191,8 @@ impl Map {
     }
 }
 
-/// Prove that the new deck and every affected road clip and junction are
-/// outside wet chunks before calling the legacy dry builder.
+/// Prove that the new deck and every affected road clip and junction can
+/// use the dry connection path.
 pub(crate) fn connection_is_dry(
     map: &Map,
     from: CrossingEndpoint,
@@ -319,6 +322,7 @@ pub(crate) fn prepare_topology(
     to: CrossingEndpoint,
     elbow: Option<Vec2>,
     pattern: &LanePattern,
+    check_water: bool,
     stage_merges: bool,
     work: &mut CrossingWork<'_>,
 ) -> Result<PreparedTopologyEdit, ConnectionError> {
@@ -332,18 +336,20 @@ pub(crate) fn prepare_topology(
             return Err(ConnectionError::OutOfBounds);
         }
     }
-    for endpoint in [from, to] {
-        if endpoint.kind == ProjectKind::Ground && env.is_water(endpoint.pos.xy()) {
-            return Err(ConnectionError::WetAnchor(tile_at(endpoint.pos.xy())));
+    if check_water {
+        for endpoint in [from, to] {
+            if endpoint.kind == ProjectKind::Ground && env.is_water(endpoint.pos.xy()) {
+                return Err(ConnectionError::WetAnchor(tile_at(endpoint.pos.xy())));
+            }
         }
+        let a = from.pos.xy();
+        let b = to.pos.xy();
+        let length = elbow.map_or(a.distance(b), |p| {
+            a.distance(b)
+                + (a.distance(p) + b.distance(p)) * (2.0 * std::f32::consts::FRAC_1_SQRT_2 / 3.0)
+        });
+        work.profile(length)?;
     }
-    let a = from.pos.xy();
-    let b = to.pos.xy();
-    let length = elbow.map_or(a.distance(b), |p| {
-        a.distance(b)
-            + (a.distance(p) + b.distance(p)) * (2.0 * std::f32::consts::FRAC_1_SQRT_2 / 3.0)
-    });
-    work.profile(length)?;
     let elevated = Road::is_elevated_span(from.pos, to.pos, env);
     let (profile, error) = Road::generate_points_with_span(
         from.pos,
@@ -353,22 +359,31 @@ pub(crate) fn prepare_topology(
         env,
         elevated,
     );
-    if error == Some(PointGenerateError::OutsideOfMap) {
+    if check_water && error == Some(PointGenerateError::OutsideOfMap) {
         return Err(ConnectionError::OutOfBounds);
     }
 
-    let (profile, lifted) = raise_crossing(profile, pattern.width(), env, work)?;
-    let elevated = elevated || lifted;
-    stage_connection(
+    let (profile, lifted) = if check_water {
+        raise_crossing(profile, pattern.width(), env, work)?
+    } else {
+        (profile, false)
+    };
+    let elevated = (elevated || lifted) && error != Some(PointGenerateError::OutsideOfMap);
+    let mut prepared = stage_connection(
         map,
         from,
         to,
         profile,
         pattern,
         elevated,
+        check_water,
         stage_merges,
         work,
-    )
+    )?;
+    if !check_water {
+        prepared.profile_error = error;
+    }
+    Ok(prepared)
 }
 
 fn stage_connection(
@@ -378,19 +393,47 @@ fn stage_connection(
     profile: PolyLine3,
     pattern: &LanePattern,
     elevated: bool,
+    check_water: bool,
     stage_merges: bool,
     work: &mut CrossingWork<'_>,
 ) -> Result<PreparedTopologyEdit, ConnectionError> {
     let mut graph = LocalTopology::new(map, work);
     let src = graph.resolve(from)?;
     let dst = graph.resolve(to)?;
-    let mut id = graph.add_road(src, dst, profile.clone(), pattern, elevated)?;
-    graph.invalidate(src)?;
-    graph.invalidate(dst)?;
-    let (mut wet, mut junctions) = graph.validate()?;
+    let mut id = graph.add_road(src, dst, profile.clone(), pattern, elevated, 0)?;
+    let (mut wet, mut junctions) = if check_water {
+        graph.invalidate(src)?;
+        graph.invalidate(dst)?;
+        graph.validate()?
+    } else {
+        (BTreeSet::new(), Vec::new())
+    };
     let merges = stage_merges.then(|| {
+        if !check_water
+            && (![src, dst].into_iter().any(|joint| graph.shallow_merge_roads(joint).is_some())
+                || graph.invalidate(src).and_then(|_| graph.invalidate(dst)).is_err())
+        {
+            return [false; 2];
+        }
+        // The live connection can generate new frontage before applying either merge.
+        let new_lots = if pattern
+            .lanes()
+            .any(|(kind, _, _)| kind == crate::map::LaneKind::Walking)
+        {
+            let road = &graph.roads[id];
+            let length = if map.environment().strict_water_siting() {
+                road.interfaced_points().length()
+            } else {
+                road.length()
+            };
+            // Each successful frontage station advances at least 22 m per side.
+            (length / 22.0).ceil() as usize * 2
+        } else {
+            0
+        };
         [src, dst].map(|junction| {
-            if let Some((merged, (next_wet, next_junctions))) = graph.stage_shallow_merge(junction)
+            if let Some((merged, (next_wet, next_junctions))) =
+                graph.stage_shallow_merge(junction, new_lots)
             {
                 id = merged;
                 wet = next_wet;
@@ -401,13 +444,20 @@ fn stage_connection(
             }
         })
     });
+    let deck = if check_water || merges.is_some_and(|ends| ends.contains(&true)) {
+        graph.roads[id].interfaced_points().clone()
+    } else {
+        profile.clone()
+    };
     Ok(PreparedTopologyEdit {
         revision: topology_revision(map),
         profile,
         elevated,
+        check_water,
+        profile_error: None,
         merges,
         preview: RoadPreview {
-            deck: graph.roads[id].interfaced_points().clone(),
+            deck,
             junctions,
             crosses_water: wet.contains(&id),
         },
@@ -765,8 +815,8 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                 if road.elevated_span() {
                     self.wet_splits.insert(junction);
                 }
-                self.add_road(src, junction, before, &pattern, road.elevated_span())?;
-                self.add_road(junction, dst, after, &pattern, road.elevated_span())?;
+                self.add_road(src, junction, before, &pattern, road.elevated_span(), 0)?;
+                self.add_road(junction, dst, after, &pattern, road.elevated_span(), 0)?;
                 self.invalidate(src)?;
                 self.invalidate(dst)?;
                 self.invalidate(junction)?;
@@ -783,19 +833,48 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         points: PolyLine3,
         pattern: &LanePattern,
         elevated: bool,
+        new_lots: usize,
     ) -> Result<RoadID, ConnectionError> {
         self.work.charge(
             points.len() + self.junctions[src].roads.len() + self.junctions[dst].roads.len(),
         )?;
         let id = Road::insert_profile(&mut self.roads, src, dst, points, pattern.width(), elevated);
         self.patterns.insert(id, pattern.clone());
-        self.rebuild_clip(id)?;
         self.junctions[src].add_road(&self.roads, &self.roads[id]);
         self.junctions[dst].add_road(&self.roads, &self.roads[id]);
         // The live lot-clear pass computes interfaces before invalidation.
         self.update_interfaces(src)?;
         self.update_interfaces(dst)?;
+        self.reserve_lot_clearance(id, new_lots)?;
         Ok(id)
+    }
+
+    fn reserve_lot_clearance(
+        &mut self,
+        id: RoadID,
+        new_lots: usize,
+    ) -> Result<(), ConnectionError> {
+        let road = &self.roads[id];
+        let points = road.points();
+        // The raw road tests each candidate's four edges against its segments.
+        // The endpoint queries perform a constant-cost circle/lot test.
+        let per_lot = 4_usize.saturating_add(points.len().saturating_sub(1).saturating_mul(5));
+        let changed_objects = self.changed_junctions.len() + self.patterns.len();
+        let bounds = points.bbox().flatten().expand(road.width * 0.5);
+        let mut reserve = |bounds, per_lot| {
+            self.map.spatial_map.reserve_lot_query(
+                bounds,
+                per_lot,
+                changed_objects,
+                new_lots,
+                self.work.remaining,
+            )
+        };
+        reserve(bounds, per_lot)?;
+        for junction in [road.src, road.dst] {
+            reserve(self.junctions[junction].bcircle().bbox(), 4)?;
+        }
+        Ok(())
     }
 
     fn remove_road(&mut self, id: RoadID) -> Road {
@@ -894,19 +973,26 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             .unwrap_or_else(|| self.map.roads[self.live_roads[&id]].pattern(&self.map.lanes))
     }
 
-    fn stage_shallow_merge(
-        &mut self,
-        joint: IntersectionID,
-    ) -> Option<(RoadID, (BTreeSet<RoadID>, Vec<Vec<Vec3>>))> {
+    fn shallow_merge_roads(&self, joint: IntersectionID) -> Option<[RoadID; 2]> {
         let [first, second] = *self.junctions.get(joint)?.roads else {
             return None;
         };
         let a = &self.roads[first];
         let b = &self.roads[second];
+        (a.other_end(joint)? != b.other_end(joint)?
+            && a.dir_from(joint).dot(b.dir_from(joint)) < -0.9)
+            .then_some([first, second])
+    }
+
+    fn stage_shallow_merge(
+        &mut self,
+        joint: IntersectionID,
+        new_lots: usize,
+    ) -> Option<(RoadID, (BTreeSet<RoadID>, Vec<Vec<Vec3>>))> {
+        let [first, second] = self.shallow_merge_roads(joint)?;
+        let a = &self.roads[first];
+        let b = &self.roads[second];
         let (src, dst) = (a.other_end(joint)?, b.other_end(joint)?);
-        if src == dst || a.dir_from(joint).dot(b.dir_from(joint)) >= -0.9 {
-            return None;
-        }
         let mut pattern = self.pattern(first);
         let mut other = self.pattern(second);
         if a.src == joint {
@@ -931,7 +1017,13 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                     .saturating_add(self.map.lots.len().saturating_mul(2)),
             )
             .ok()?;
-        let elevated = a.elevated_span() || b.elevated_span();
+        let elevated = a.elevated_span()
+            || b.elevated_span()
+            || Road::is_elevated_span(
+                self.junctions[src].pos,
+                self.junctions[dst].pos,
+                self.map.environment(),
+            );
         let points = if elevated {
             a.points().len() + b.points().len()
         } else {
@@ -992,7 +1084,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             trial.remove_road(first);
             trial.remove_road(second);
             trial.changed_junctions.remove(&joint);
-            let id = trial.add_road(src, dst, points, &pattern, elevated)?;
+            let id = trial.add_road(src, dst, points, &pattern, elevated, new_lots)?;
             trial.invalidate(src)?;
             trial.invalidate(dst)?;
             Ok::<_, ConnectionError>((id, trial.validate()?))
@@ -1309,6 +1401,7 @@ pub(crate) fn prepare_merge(
     pattern: &LanePattern,
     profile: &PolyLine3,
     elevated: bool,
+    check_water: bool,
     work: &mut CrossingWork<'_>,
 ) -> Result<(), ConnectionError> {
     let mut graph = LocalTopology::new(map, work);
@@ -1318,10 +1411,12 @@ pub(crate) fn prepare_merge(
     let second = graph.road_keys[&second];
     graph.remove_road(first);
     graph.remove_road(second);
-    graph.add_road(src, dst, profile.clone(), pattern, elevated)?;
-    graph.invalidate(src)?;
-    graph.invalidate(dst)?;
-    graph.validate()?;
+    graph.add_road(src, dst, profile.clone(), pattern, elevated, 0)?;
+    if check_water {
+        graph.invalidate(src)?;
+        graph.invalidate(dst)?;
+        graph.validate()?;
+    }
     Ok(())
 }
 
@@ -1365,7 +1460,7 @@ pub(crate) fn prepare_direct_road(
                 pos: b,
                 split: None,
             };
-            prepare_topology(map, from, to, None, pattern, false, work)
+            prepare_topology(map, from, to, None, pattern, true, false, work)
         }
         explicit => {
             let length = match &explicit {
@@ -1416,7 +1511,7 @@ pub(crate) fn prepare_direct_road(
                 pos: b,
                 split: None,
             };
-            stage_connection(map, from, to, profile, pattern, elevated, false, work)
+            stage_connection(map, from, to, profile, pattern, elevated, true, false, work)
         }
     }
 }

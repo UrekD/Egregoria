@@ -656,22 +656,18 @@ impl Map {
             )?;
         }
         work.spend_profile_samples(profile_samples);
-        let prepared = if check_geometry {
-            super::prepare_topology(
-                self,
-                endpoint(from),
-                endpoint(to),
-                elbow,
-                pattern,
-                stage_merges,
-                &mut work.geometry(),
-            )
-            .map(Some)
-        } else {
-            Ok(None)
-        };
+        let prepared = super::prepare_topology(
+            self,
+            endpoint(from),
+            endpoint(to),
+            elbow,
+            pattern,
+            check_geometry,
+            stage_merges,
+            &mut work.geometry(),
+        );
         work.profile_samples += profile_samples;
-        Ok((profile_samples, prepared?))
+        Ok((profile_samples, Some(prepared?)))
     }
 
     pub(crate) fn make_resolved_connection(
@@ -789,7 +785,7 @@ impl Map {
 
         let (src, from_split) = mk_inter(from);
         let (dst, to_split) = mk_inter(to);
-        let check_water = prepared.is_some();
+        let check_water = prepared.as_ref().is_some_and(|edit| edit.check_water);
         let frontage_work = self.environment.has_water_configuration().then(|| {
             let length = connection_profile_length_bound(from.pos.xy(), to.pos.xy(), interpoint);
             super::generated_frontage_work(length, pattern, check_water)
@@ -1925,9 +1921,16 @@ impl Map {
         }
 
         let new_polyline = r1.merged_profile(r2, same_inter);
-        let elevated = r1.elevated_span() || r2.elevated_span();
+        let elevated = r1.elevated_span()
+            || r2.elevated_span()
+            || Road::is_elevated_span(
+                self.intersections[r1_extremity].pos,
+                self.intersections[r2_extremity].pos,
+                &self.environment,
+            );
 
-        if self.environment.strict_water_siting() && !validated {
+        let check_water = self.environment.strict_water_siting();
+        if !validated && (check_water || work.is_some()) {
             if self.intersections[same_inter].roads.len() != 2 {
                 return Ok(None);
             }
@@ -1941,6 +1944,7 @@ impl Map {
                 &pat1,
                 &new_polyline,
                 elevated,
+                check_water,
                 &mut work.geometry(),
             )?;
         }
@@ -1961,7 +1965,7 @@ impl Map {
                 r2_extremity,
                 &pat1,
                 RoadSegmentKind::Arbitrary(new_polyline),
-                elevated.then_some(true),
+                Some(elevated),
                 None,
             )
             .expect("validated merge endpoints");

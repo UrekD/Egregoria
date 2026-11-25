@@ -832,6 +832,99 @@ fn w2a_fix_preview_and_legacy_destination_follow_shallow_merges() {
 }
 
 #[test]
+fn w2a_fix2_dry_shallow_merge_previews_the_surviving_clip() {
+    let mut terrain = Environment::new(2, 2);
+    terrain.terrain_apply(terrain.bounds(), |_| 4.0);
+    terrain
+        .fill_lake(
+            &geom::Polygon::centered_rect(vec2(768.0, 768.0), 48.0, 48.0),
+            30,
+            5.0,
+        )
+        .unwrap();
+    let mut map = Map::empty();
+    assert!(map.install_environment(terrain));
+    let pattern = LanePatternBuilder::default().build();
+    let [from, joint, far] = [96.0, 256.0, 432.0]
+        .map(|x| MapProject::ground(vec3(x, 128.0, 4.0)));
+    let (joint_id, _) = map.make_connection(far, joint, None, &pattern).unwrap();
+    let joint = MapProject {
+        kind: ProjectKind::Intersection(joint_id),
+        ..joint
+    };
+
+    let preview = map.preview_connection(from, joint, None, &pattern).unwrap();
+    let result = map.try_connect(from, joint, None, &pattern).unwrap();
+
+    assert!(!map.intersections.contains_key(joint_id));
+    assert_eq!(map.intersections[result.destination].pos, far.pos);
+    assert_eq!(
+        point_bits(&preview.deck),
+        point_bits(map.roads[result.road].interfaced_points())
+    );
+    assert_eq!(preview.junctions.len(), 2);
+    assert!(!preview.crosses_water);
+}
+
+#[test]
+fn w2a_fix2_dense_diagonal_lot_clearance_shares_the_connection_budget() {
+    use crate::map::{ConnectionError, Lot, MAX_WATER_BATCH_WORK};
+    use geom::OBB;
+
+    let mut terrain = Environment::new(11, 11);
+    terrain.terrain_apply(terrain.bounds(), |p| {
+        4.0 + (p.x / 16.0).rem_euclid(2.0) * 1.5
+    });
+    terrain
+        .fill_lake(
+            &geom::Polygon::centered_rect(vec2(5376.0, 5376.0), 48.0, 48.0),
+            30,
+            5.0,
+        )
+        .unwrap();
+    let mut map = Map::empty();
+    assert!(map.install_environment(terrain));
+    let pattern = LanePatternBuilder {
+        rail: true,
+        ..Default::default()
+    }
+    .build();
+    let ground = |x, y| {
+        let pos = vec2(x, y);
+        MapProject::ground(pos.z(map.environment().height(pos).unwrap()))
+    };
+    let [parent_start, parent_end, from, to] = [
+        ground(64.0, 5200.0),
+        ground(192.0, 5200.0),
+        ground(64.0, 64.0),
+        ground(4832.0, 4832.0),
+    ];
+    let (_, parent) = map.make_connection(parent_start, parent_end, None, &pattern).unwrap();
+    let sparse = map.preview_connection(from, to, None, &pattern).unwrap();
+    for y in (96..4800).step_by(24) {
+        for x in (96..4800).step_by(24) {
+            Lot::insert(
+                &mut map,
+                parent,
+                OBB::new(vec2(x as f32, y as f32), Vec2::X, 20.0, 20.0),
+                4.0,
+            );
+        }
+    }
+    assert!(map.lots.len() * (sparse.deck.len() - 1) > MAX_WATER_BATCH_WORK);
+    let before = Bincode::encode(&map).unwrap();
+    assert!(matches!(
+        map.try_connect(from, to, None, &pattern),
+        Err(ConnectionError::WorkLimit)
+    ));
+    assert_eq!(Bincode::encode(&map).unwrap(), before);
+    assert!(matches!(
+        map.preview_connection(from, to, None, &pattern),
+        Err(ConnectionError::WorkLimit)
+    ));
+}
+
+#[test]
 fn w2a_fix_dry_preview_shares_live_work_limit() {
     use crate::map::ConnectionError;
 
