@@ -242,22 +242,26 @@ pub(crate) fn entry_boundary(
     travel: f32,
     half_extent: f32,
 ) -> Option<EntryBoundary> {
+    if !map.has_junction_rules() {
+        return None;
+    }
     let route = it.get_route()?;
     let next = *route.reversed_route.last()?;
     let crossing = Crossing::from_traversal(next)?;
+    let rules = map.junction_rules(crossing.turn.parent)?;
+    let controlled = configured(map, crossing.turn.parent).is_some();
+    if !controlled && rules.allows(crossing.turn) {
+        return None;
+    }
     // Endpoint proximity is a lower bound even for curved approach paths.
     let terminal = it.local_path().first().copied()?;
     if position.distance(terminal) > travel + half_extent + HOLD_TOLERANCE {
         return None;
     }
-    let controlled = configured(map, crossing.turn.parent).is_some();
     let valid = map.allows_turn(crossing.turn)
         && route.cur.destination_lane() == crossing.from_lane()
         && route.cur.destination_intersection(map.lanes()) == Some(crossing.turn.parent)
         && (!crossing.backwards || crossing.turn.bidirectional);
-    if valid && !controlled {
-        return None;
-    }
     let distance = remaining_distance(it, position).map(|distance| distance - half_extent);
     Some(EntryBoundary {
         crossing,

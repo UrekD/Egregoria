@@ -951,8 +951,18 @@ impl Itinerary {
         matches!(self.kind, ItineraryKind::PedestrianEgress(_))
     }
 
+    fn requires_pedestrian_egress(&self) -> bool {
+        matches!(
+            self.kind,
+            ItineraryKind::None
+                | ItineraryKind::WaitForReroute { kind: PathKind::Pedestrian, .. }
+                | ItineraryKind::PedestrianEgress(_)
+        )
+    }
+
     fn needs_clearance_check(&self, tick: u64) -> bool {
-        self.get_point().is_none()
+        self.requires_pedestrian_egress()
+            && self.get_point().is_none()
             && match self.kind {
                 ItineraryKind::PedestrianEgress(egress) => tick >= egress.check_at.0,
                 _ => true,
@@ -1286,7 +1296,10 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         }
         // Keep the collider through a lost route until the person reaches a
         // sidewalk or the local geometry confirms they are clear of traffic.
-        safe_to_remove |= clearing && !human.it.is_pedestrian_egress();
+        // An ordinary completed walk still hands off to its router step.
+        // Route loss and deferred replanning use the physical clearance path.
+        safe_to_remove |= !human.it.requires_pedestrian_egress()
+            || (clearing && !human.it.is_pedestrian_egress());
         match (human.it.get_point(), human.collider) {
             (None, Some(collider)) if safe_to_remove => {
                 resources.write::<TransportGrid>().remove_maintain(collider.0);
@@ -1602,6 +1615,14 @@ mod tests {
         assert_eq!(human.trans.pos, position);
         assert_eq!(human.speed.0, 0.0);
         assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_some());
+
+        // A valid routed handoff at the same pose can finish normally.
+        ctx.g.world.edit_human(id, |human| {
+            human.it = Itinerary::simple(vec![position]);
+        });
+        let next_tick = ctx.g.get_tick() + 1;
+        update_at(&mut ctx.g, next_tick);
+        assert!(ctx.g.world.humans[id].collider.is_none());
     }
 
     #[test]

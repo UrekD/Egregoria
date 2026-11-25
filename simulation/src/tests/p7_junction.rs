@@ -32,16 +32,11 @@ fn p7_junction_mask_stale_clamps_a_bus_before_its_nose_enters() {
             .collect::<Vec<_>>();
         (junction.id, turns)
     };
-    ctx.g.map_mut().update_intersection(junction, |inter| {
-        inter.turn_policy.left_turns = false;
-        inter.light_policy = crate::map::LightPolicy::NoLights;
-    });
+    let turn = turns[0];
+    let rules = JunctionRules::new(Vec::new(), vec![turn]).unwrap();
+    ctx.g.map_mut().install_junction_rules(junction, rules);
     let (entry, transform, itinerary) = {
         let map = ctx.g.map();
-        let turn = turns
-            .into_iter()
-            .find(|&turn| map.get(junction).unwrap().find_turn(turn).is_none())
-            .unwrap();
         let lane = map.get(turn.src).unwrap();
         let entry = lane.points.last();
         let start = lane.points.point_along(lane.points.length() - 12.0);
