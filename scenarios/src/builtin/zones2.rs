@@ -300,7 +300,7 @@ fn grow_city_with_health(
     } else {
         if !mixed {
             advance_to(ctx, COMMISSION_END - TICKS_PER_DAY)?;
-            paint_pure_control_office(ctx)?;
+            paint_pure_control_offices(ctx)?;
         }
         advance_to(ctx, COMMISSION_END)
     }
@@ -341,7 +341,8 @@ fn paint_core(ctx: &mut ScenarioCtx, mixed: bool) {
     let infill = if mixed {
         [(2, 3, MixedUse, Medium), (3, 3, MixedUse, High)]
     } else {
-        [(2, 3, Residential, High), (3, 3, Residential, High)]
+        // Match housing capacity across the districts under the current food supply.
+        [(2, 3, Residential, Medium), (3, 3, Residential, High)]
     };
     paint_zone_blocks(ctx, ORIGIN, BLOCK, infill);
     if !mixed {
@@ -360,30 +361,37 @@ fn paint_core(ctx: &mut ScenarioCtx, mixed: bool) {
     }
 }
 
-fn paint_pure_control_office(ctx: &mut ScenarioCtx) -> Result<(), String> {
-    // Add one office during commissioning after the core housing has grown.
+fn paint_pure_control_offices(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    // Add offices during commissioning after the core housing has grown.
     let office = zone(Office, High);
     let center = ORIGIN + vec2(2.5, 4.5) * BLOCK;
-    let area = {
+    let commands = {
         let map = ctx.sim.map();
-        map.lots()
+        let mut lots: Vec<_> = map
+            .lots()
             .values()
             .filter(|lot| lot.shape.center().distance2(center) < (BLOCK / 2.0).powi(2))
             .filter(|lot| check_growable_lot(&map, lot, office).is_ok())
-            .min_by(|a, b| {
-                let distance = |lot: &simulation::map::Lot| lot.shape.center().distance2(center);
-                distance(a)
-                    .total_cmp(&distance(b))
-                    .then_with(|| a.id.cmp(&b.id))
+            .collect();
+        lots.sort_by(|a, b| {
+            let distance = |lot: &simulation::map::Lot| lot.shape.center().distance2(center);
+            distance(a)
+                .total_cmp(&distance(b))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        lots.into_iter()
+            .take(2)
+            .map(|lot| WorldCommand::ZonePaint {
+                area: lot.shape,
+                kind: Some(office.kind),
+                density: office.density,
             })
-            .map(|lot| lot.shape)
-            .ok_or("pure control has no room for the additional office")?
+            .collect::<Vec<_>>()
     };
-    ctx.submit(&[WorldCommand::ZonePaint {
-        area,
-        kind: Some(office.kind),
-        density: office.density,
-    }]);
+    if commands.len() != 2 {
+        return Err("pure control needs room for two additional offices".into());
+    }
+    ctx.submit(&commands);
     ctx.flush();
     Ok(())
 }
@@ -692,7 +700,9 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
         })
         .collect();
     for run in [&mut *live, &mut resumed] {
-        run_teardown_batch(run, &repaint, TICKS_PER_DAY)?;
+        run_teardown_batch(run, &repaint, 1)?;
+        prepare_regrowth_demand(run)?;
+        run.run_ticks(TICKS_PER_DAY);
         let map = run.sim.map();
         if !parcels.iter().any(|&(_, origin, zone)| {
             map.buildings().values().any(|building| {
@@ -707,6 +717,50 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     }
     let regrown = resumed_checkpoint(live, &resumed, root, "zones2_staffed_regrown")?;
     verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
+}
+
+fn prepare_regrowth_demand(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    // Open a new street with jobs near the district and homes beyond its existing
+    // retail catchment. The restored storefronts can grow when both roles are needed.
+    const OFFICE_LOTS: usize = 12;
+    const HOMES: usize = 2;
+    let start = ORIGIN + vec2(5.0 * BLOCK, 0.0);
+    let length = 1_500.0;
+    let grid = grid_city(ctx, start, 2, 1, length);
+    let [road] = grid.roads.as_slice() else {
+        return Err("could not connect the frontage expansion street".into());
+    };
+    let mut commands = vec![WorldCommand::SetTaxRate {
+        zone: Residential,
+        rate_permille: 0,
+    }];
+    {
+        let map = ctx.sim.map();
+        let lots = map.lots().values().filter(|lot| lot.parent == *road);
+        let office = zone(Office, High);
+        let offices = lots
+            .clone()
+            .filter(|lot| lot.shape.center().x < start.x + 600.0)
+            .filter(|lot| check_growable_lot(&map, lot, office).is_ok())
+            .take(OFFICE_LOTS)
+            .map(|lot| WorldCommand::ZonePaint {
+                area: lot.shape,
+                kind: Some(office.kind),
+                density: office.density,
+            });
+        commands.extend(offices);
+        let residential = zone(Residential, Low);
+        let houses = lots
+            .filter(|lot| lot.shape.center().x > start.x + length - 100.0)
+            .filter(|lot| check_growable_lot(&map, lot, residential).is_ok())
+            .take(HOMES)
+            .map(|lot| WorldCommand::MapBuildHouse(lot.id));
+        commands.extend(houses);
+    }
+    if commands.len() != 1 + OFFICE_LOTS + HOMES {
+        return Err("frontage expansion needs room for twelve offices and two homes".into());
+    }
+    run_teardown_batch(ctx, &commands, 1)
 }
 
 fn run_teardown_batch(
