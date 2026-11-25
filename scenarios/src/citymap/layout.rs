@@ -1222,7 +1222,9 @@ pub(crate) fn design_point(point: Vec2, config: TownConfig) -> Vec2 {
 }
 
 pub(super) fn fit_wet_frontage(plan: &mut TownPlan) {
-    // Extend the reserve envelopes along existing streets on the town bank.
+    // Use existing town-bank frontage for the northern and western reserves.
+    // In South, exchange the isolated river fringe for the streets closer to
+    // the town's jobs and suppliers on the east side.
     for (district, edge, points) in [
         (
             "hraska",
@@ -1233,6 +1235,22 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) {
             "west",
             7..8,
             &[(690., 2210.), (535., 2090.), (550., 1730.)][..],
+        ),
+        (
+            "south",
+            0..9,
+            &[
+                (1370., 790.),
+                (1750., 760.),
+                (2245., 770.),
+                (2610., 820.),
+                (2960., 1050.),
+                (3040., 1650.),
+                (2660., 1660.),
+                (2340., 1470.),
+                (1840., 1330.),
+                (1480., 1190.),
+            ][..],
         ),
     ] {
         let area = plan

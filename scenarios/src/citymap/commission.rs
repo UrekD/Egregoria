@@ -248,8 +248,8 @@ fn prepare_opening(
             anchor: at(2060.0, 1180.0),
             houses: 98,
             infill: if wet { 14 } else { 10 },
-            retail: 16,
-            industry: 8,
+            retail: if wet { 24 } else { 16 },
+            industry: if wet { 12 } else { 8 },
         },
         Cohort {
             district: "west",
@@ -504,6 +504,11 @@ fn prepare_opening(
     ] {
         let store = place_company_around_parcels(sim, "supermarket", at(x, y), Some(district))?;
         sites.insert(format!("{district}/supermarket"), store);
+    }
+    if wet {
+        let store =
+            place_company_around_parcels(sim, "supermarket", at(2660.0, 1325.0), Some("south"))?;
+        sites.insert("south/east-supermarket".into(), store);
     }
     place_walkable_bakeries(sim, plan, &roads, &parcels, &reserves, &mut sites)?;
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
@@ -3989,12 +3994,18 @@ mod tests {
         let mut housing = 0;
         let mut near_bakeries = 0;
         let mut by_district = BTreeMap::new();
+        let mut isolated_south = 0;
         for parcel in opening.parcels.iter().filter(|parcel| parcel.capacity > 0) {
             let home = reach
                 .position(parcel.road, parcel.footprint.center())
                 .unwrap();
             housing += parcel.capacity;
             *by_district.entry(parcel.district).or_insert(0) += parcel.capacity;
+            if parcel.district == "south"
+                && parcel.footprint.center().y < plan.config.owned_min.y + 600.0
+            {
+                isolated_south += parcel.capacity;
+            }
             if bakeries
                 .iter()
                 .any(|&shop| reach.distance(home, shop) <= WET_BAKERY_WALK_M)
@@ -4011,6 +4022,10 @@ mod tests {
         eprintln!("Wet frontage: {near_bakeries}/{housing} housing places near {} bakeries, {reserve} reserve places, {reserve_shops} reserve shops, housing by district {by_district:?}", bakeries.len());
         assert!(near_bakeries * 100 >= housing * 95 && reserve >= 260 && reserve_shops >= 3,
             "{near_bakeries}/{housing} housing places within a 180 m walk of a bakery, {reserve} reserve housing places and {reserve_shops} reserve shops");
+        assert!(
+            housing >= 950 && isolated_south == 0,
+            "{housing} opening housing places, with {isolated_south} on the remote South fringe"
+        );
         drop(map);
         paint(&mut sim, opening.parcels.iter()).unwrap();
         verify_votes(&sim, opening.parcels.iter()).unwrap();
