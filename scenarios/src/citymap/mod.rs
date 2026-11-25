@@ -149,7 +149,7 @@ fn build_wet_town(
 ) -> Result<(Simulation, BuiltNetwork, commission::FreightSetup), String> {
     layout::extend_gateways(plan)?;
     layout::fit_wet_approaches(plan)?;
-    layout::fit_wet_frontage(plan);
+    layout::fit_wet_frontage(plan)?;
     crate::ensure_repo_root_cwd();
     simulation::init::init();
     let base = AuthoredTownOptions::default();

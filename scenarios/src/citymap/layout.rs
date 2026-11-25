@@ -8,6 +8,7 @@ use super::source::{
 };
 use geom::{vec2, Vec2};
 use serde::Serialize;
+use simulation::map::LightPolicy;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize)]
@@ -1221,7 +1222,7 @@ pub(crate) fn design_point(point: Vec2, config: TownConfig) -> Vec2 {
     point + (config.project(lat, lon) - baseline.project(lat, lon))
 }
 
-pub(super) fn fit_wet_frontage(plan: &mut TownPlan) {
+pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
     // Use existing town-bank frontage for the northern and western reserves.
     // In South, exchange the isolated river fringe for the streets closer to
     // the town's jobs and suppliers on the east side.
@@ -1292,6 +1293,74 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) {
             plan.graph.record(reason, &[key]);
         }
     }
+    connect_south_walk(&mut plan.graph)
+}
+
+fn connect_south_walk(graph: &mut Graph) -> Result<(), String> {
+    let west = SourceKey::Node {
+        id: 4193639611,
+        rail: false,
+    };
+    let avenue = SourceKey::Way {
+        id: 64047075,
+        span: 1,
+    };
+    let crossing = SourceKey::Authored("south-alpska-crossing");
+    let walk = SourceKey::Authored("south-alpska-walk");
+    let local = graph
+        .junctions
+        .get_mut(&west)
+        .ok_or("South footpath is missing its local street junction")?;
+    // Allow for the wider junction curb while retaining 65 m of driving lane
+    // on the local street. The source alignment is within the 8 m tolerance.
+    local.position.x += 4.0;
+    for link in graph
+        .links
+        .values_mut()
+        .filter(|link| link.endpoints.contains(&west))
+    {
+        let endpoint = if link.endpoints[0] == west {
+            0
+        } else {
+            link.points.len() - 1
+        };
+        link.points[endpoint] = local.position.xy();
+        link.realigned = true;
+    }
+    let north = graph.links.get_mut(&avenue).ok_or("missing South Alpska avenue")?;
+    let [start, end] = north.points.as_slice() else {
+        return Err("South Alpska footpath needs the straight avenue alignment".into());
+    };
+    let point = (*start + *end) * 0.5;
+    let direction = *end - *start;
+    let along = |sample: Vec2| (sample - point).dot(direction);
+    let cut = north.samples.partition_point(|&sample| along(sample) < 0.0);
+    let (Some(&before), Some(&after)) = (
+        cut.checked_sub(1).and_then(|i| north.samples.get(i)),
+        north.samples.get(cut),
+    ) else {
+        return Err("South Alpska source samples do not span the new crossing".into());
+    };
+    let seam = before + (after - before) * (along(before) / (along(before) - along(after)));
+    let mut south = north.clone();
+    south.key = SourceKey::Authored("south-alpska-avenue");
+    south.samples = north.samples.split_off(cut);
+    south.samples.insert(0, seam);
+    south.points[0] = point;
+    south.endpoints[0] = crossing;
+    north.samples.push(seam);
+    north.points[1] = point;
+    north.endpoints[1] = crossing;
+    let mut junction = JunctionSpec::new(crossing, point);
+    junction.light = LightPolicy::NoLights;
+    graph.junctions.insert(crossing, junction);
+    graph.links.insert(south.key, south);
+    add_authored_road(graph, walk, [west, crossing], RoadClass::Walk, None, 0);
+    graph.record(
+        "connect South homes and shops to the Alpska sidewalks",
+        &[west, crossing, avenue, walk],
+    );
+    Ok(())
 }
 
 fn districts(config: TownConfig) -> Vec<District> {

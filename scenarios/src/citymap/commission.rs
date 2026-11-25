@@ -4175,6 +4175,16 @@ mod tests {
             .fold(f32::INFINITY, f32::min);
         assert!(nearest_fire <= 140.0,
             "the nearest fire station is {nearest_fire:.1} m from uncovered South frontage");
+        let local_road = built.links[&SourceKey::Way { id: 1465713103, span: 1 }].road;
+        let avenue = built.links[&SourceKey::Way { id: 64047075, span: 1 }].road;
+        let west = super::super::layout::design_point(vec2(2446.6, 1255.7), plan.config);
+        let east = super::super::layout::design_point(vec2(2569.0, 1282.0), plan.config);
+        let distance = reach.distance(
+            reach.position(local_road, west).unwrap(),
+            reach.position(avenue, east).unwrap(),
+        );
+        assert!(distance <= 170.0,
+            "the walk from South homes to the Alpska shops is {distance:.1} m");
         drop(map);
         paint(&mut sim, opening.parcels.iter()).unwrap();
         verify_votes(&sim, opening.parcels.iter()).unwrap();
