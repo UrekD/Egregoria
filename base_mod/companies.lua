@@ -661,8 +661,10 @@ data:extend {
         label = "Vegetable Farm",
         bgen = "farm",
         kind = "factory",
-        n_trucks = 1,
-        cargo_capacity_units = 2160,
+        -- Two drivers stage up to four loads, covering the 5,040 units
+        -- produced between shifts. Four trips per truck can haul 11,520/day.
+        n_trucks = 2,
+        cargo_capacity_units = 1440,
         dispatch_min_units = 8,
         dispatch_max_wait_ticks = 12000, -- two game hours
         recipe = {
