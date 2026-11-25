@@ -104,3 +104,40 @@ pub use ::pathfinding as pathfinding_crate;
 pub const CROSSWALK_WIDTH: f32 = 2.0;
 pub const ROAD_Z_OFFSET: f32 = 0.3;
 pub const MAX_SLOPE: f32 = 0.25; // 25% grade
+
+/// Checks the scalar fields that the wire decoder validates for water edits.
+/// WaterStroke and WaterBasin can only be constructed with checked geometry.
+pub(crate) fn validate_water_edit_wire(edit: &WaterEdit) -> Result<(), WaterEditError> {
+    let (level, depth) = match *edit {
+        WaterEdit::SetSeaLevel { level_dm } => (level_dm, None),
+        WaterEdit::CarveRiver {
+            width_m,
+            depth_m,
+            level_dm,
+            ..
+        } => {
+            if !water::valid_river_width(width_m) {
+                return Err(WaterEditError::InvalidInput);
+            }
+            (level_dm, Some(depth_m))
+        }
+        WaterEdit::FillLake {
+            level_dm, depth_m, ..
+        } => (Some(level_dm), Some(depth_m)),
+        WaterEdit::RemoveFreshWater { .. } => return Ok(()),
+    };
+    if depth.is_some_and(|depth| !water::valid_water_depth(f64::from(depth))) {
+        return Err(WaterEditError::InvalidInput);
+    }
+    if let Some(level) = level {
+        water::packed_bed_limit(level, water::MIN_DEPTH)?;
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_loaded_land(sim: &crate::Simulation) -> Result<(), String> {
+    land_ownership::validate_loaded_land(sim)?;
+    sim.map()
+        .validate_commissioned_reserves(sim.read::<crate::SimulationOptions>().land_recipe)
+        .map_err(|error| format!("Invalid commissioned land: {error:?}"))
+}

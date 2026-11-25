@@ -817,7 +817,7 @@ mod tests {
         let profiled_sites = profiled_sites(&sim.map()).collect::<Vec<_>>();
         assert_eq!(profiled_sites, [store]);
         let sample = |sim: &mut Simulation| {
-            let (world, resources) = sim.world_res();
+            let (world, resources) = sim.unrestricted_world_res().unwrap();
             electricity_flow_system(world, resources);
             let map = sim.map();
             let stats = sim.read::<ElectricityFlow>().network_stats(net);

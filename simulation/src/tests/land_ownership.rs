@@ -40,8 +40,11 @@ fn lake(x: f32, y: f32) -> WaterEdit {
 fn land_ownership_c1_keeps_paused_batches_and_water_prepass_inputs() {
     let mut sim = Simulation::new_game_with_replay(&options()).unwrap();
     let opening = sim.read::<Replay>().command_count();
-    let bad = WorldCommand::EditWater(WaterEdit::SetSeaLevel {
-        level_dm: Some(i16::MIN),
+    let bad = WorldCommand::EditWater(WaterEdit::RemoveFreshWater {
+        body: crate::map::WaterBodyId(1),
+    });
+    let sea = WorldCommand::EditWater(WaterEdit::SetSeaLevel {
+        level_dm: Some(-100),
     });
     let absent = WorldCommand::EditWater(WaterEdit::SetSeaLevel { level_dm: None });
     let raise = WorldCommand::Terraform {
@@ -57,7 +60,7 @@ fn land_ownership_c1_keeps_paused_batches_and_water_prepass_inputs() {
     sim.apply_commands([&absent]);
     assert!(sim.read::<CommandOutcomes>().rejections_for(0).is_empty());
     let before = gameplay_hashes(&sim);
-    sim.apply_commands([&bad, &raise]);
+    sim.apply_commands([&sea, &raise]);
     assert_eq!(
         sim.read::<CommandOutcomes>().rejections_for(1),
         [("Terraform", Rejection::WaterWorkLimit)]
@@ -513,6 +516,20 @@ fn land_ownership_authored_rectangle_is_snapshot_only() {
             )
             .ok_or(LandSetupError::MissingGateway(GatewayRole::Freight))?;
         roots.insert(ProtectedRoot::Building(GatewayRole::Freight, market));
+        let station = map
+            .build_special_building(
+                &OBB::new(vec2(1100.0, 1768.0), Vec2::X, 100.0, 38.0),
+                BuildingKind::RailFreightStation(prototypes::FreightStationPrototypeID::new(
+                    "freight-station",
+                )),
+                BuildingGen::NoWalkway {
+                    door_pos: Vec2::ZERO,
+                },
+                None,
+                None,
+            )
+            .ok_or(LandSetupError::MissingGateway(GatewayRole::Freight))?;
+        roots.insert(ProtectedRoot::Building(GatewayRole::Freight, station));
         Ok(((), roots))
     })
     .unwrap();

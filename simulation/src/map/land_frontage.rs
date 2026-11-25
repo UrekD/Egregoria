@@ -5,7 +5,7 @@ use slotmapd::Key;
 
 use super::{
     candidate_tiles, spend_water_work, Building, LandDenial, LandTileId, Lot, LotLayout, Map,
-    RoadID, UpdateType, WaterFootprint, FRONTAGE_HEIGHT_TOLERANCE_M, MAX_WATER_BATCH_WORK,
+    RoadID, UpdateType, WaterFootprint, FRONTAGE_HEIGHT_TOLERANCE_M,
 };
 use crate::world_command::Rejection;
 
@@ -68,6 +68,9 @@ impl Map {
             }
             let mut stations = road.points().points_dirs_manual();
             spend_water_work(remaining, road.points().len())?;
+            let candidate_count = (road.length() / PITCH) as usize * 2;
+            let per_candidate = road.points().len().saturating_mul(12) + candidate_count + 1;
+            spend_water_work(remaining, candidate_count.saturating_mul(per_candidate))?;
             for station in 1..=(road.length() / PITCH) as u16 {
                 let Some((point, dir)) = stations.next(f32::from(station) * PITCH) else {
                     break;
@@ -181,11 +184,13 @@ impl Map {
         Ok(())
     }
 
-    pub(super) fn generate_land_frontage(&mut self, road: RoadID) {
+    pub(super) fn generate_land_frontage(
+        &mut self,
+        road: RoadID,
+        remaining: &mut usize,
+    ) -> Result<(), Rejection> {
         self.retire_land_frontage(road);
-        if self.index_land_frontage(road).is_err() {
-            return;
-        }
+        self.index_land_frontage(road)?;
         let mut sites = BTreeMap::new();
         for tile in self.land_frontage.roads.get(&road).into_iter().flatten() {
             for (&key, &site) in self.land_frontage.sites[tile]
@@ -194,10 +199,9 @@ impl Map {
                 sites.insert(key, site);
             }
         }
-        let mut remaining = MAX_WATER_BATCH_WORK;
-        if let Ok(prepared) = self.prepare_land_frontage(sites, None, &mut remaining) {
-            self.commit_land_frontage(prepared);
-        }
+        let prepared = self.prepare_land_frontage(sites, None, remaining)?;
+        self.commit_land_frontage(prepared);
+        Ok(())
     }
 
     pub(super) fn indexed_land_sites(

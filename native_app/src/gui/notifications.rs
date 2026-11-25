@@ -685,6 +685,10 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         }
     }
     let message = match (command, reason) {
+        (_, Rejection::InvalidCommandEncoding) => {
+            "This action contains invalid or oversized input."
+        }
+        (_, Rejection::BuildingOverlap) => "Another building already occupies this site.",
         ("TransitAddStop", MissingReference | InvalidConnection) => {
             "Choose a driving lane beside a sidewalk and away from junctions"
         }
@@ -846,7 +850,7 @@ mod tests {
         let mut center = NotificationCenter::default();
         let mut sample = |test: &mut ScenarioCtx, tick| {
             *test.sim.write::<GameTime>() = GameTime::new(Tick(tick));
-            let (world, resources) = test.sim.world_res();
+            let (world, resources) = test.sim.unrestricted_world_res().unwrap();
             electricity_flow_system(world, resources);
             utility_flow_update(&mut test.sim);
             sampler.observe(&test.sim);
@@ -894,7 +898,7 @@ mod tests {
 
         let sample = |test: &mut ScenarioCtx, sampler: &mut NotificationSampler, tick| {
             *test.sim.write::<GameTime>() = GameTime::new(Tick(tick));
-            let (world, resources) = test.sim.world_res();
+            let (world, resources) = test.sim.unrestricted_world_res().unwrap();
             electricity_flow_system(world, resources);
             utility_flow_update(&mut test.sim);
             let status = test

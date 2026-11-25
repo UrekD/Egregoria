@@ -189,6 +189,7 @@ impl Lot {
             height,
         });
         map.spatial_map.insert(&map.lots[id]);
+        map.track_road_lot(parent, id);
         id
     }
 
@@ -337,7 +338,7 @@ impl Lot {
         mut reserved: Option<usize>,
     ) {
         if map.land_ownership().is_tiled() {
-            map.generate_land_frontage(road);
+            // Tiled topology provisions frontage through the prepared reducer.
             return;
         }
         let Some(r) = map.roads.get(road) else {
@@ -513,7 +514,7 @@ impl Lot {
 
         for lot in to_remove {
             if let ProjectKind::Lot(lot) = lot {
-                map.lots.remove(lot);
+                map.remove_lot_record(lot);
                 map.spatial_map.remove(lot);
             }
         }
@@ -689,7 +690,7 @@ mod water_tests {
         let curb_y = 109.0 + map.roads[road].width * 0.5 + 1.0;
         let shape = OBB::new(vec2(164.0, curb_y + 10.0), Vec2::Y, 20.0, 20.0);
         for id in map.lots.keys().collect::<Vec<_>>() {
-            map.lots.remove(id);
+            map.remove_lot_record(id);
             map.spatial_map.remove(id);
         }
         let lot = Lot::insert(&mut map, road, shape, 0.0);
@@ -727,7 +728,7 @@ mod water_tests {
         let curb_y = 109.0 + map.roads[road].width * 0.5 + 1.0;
         let lots = map.lots.keys().collect::<Vec<_>>();
         for id in lots {
-            map.lots.remove(id);
+            map.remove_lot_record(id);
             map.spatial_map.remove(id);
         }
         let env = map.environment_mut_for_test();

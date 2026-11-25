@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
+use crate::map::height_override::ConstructionCut;
 use crate::map::terrain::CELL_SIZE;
 use geom::{Intersect, PolyLine3, Polygon, Shape, Vec2, Vec3, AABB};
 
@@ -130,6 +131,8 @@ pub(crate) struct PreparedTopologyEdit {
     profile_error: Option<PointGenerateError>,
     pub(crate) preview: RoadPreview,
     pub(crate) merges: Option<[bool; 2]>,
+    pub(crate) frontage_work: usize,
+    pub(crate) merge_frontage_work: [usize; 2],
 }
 
 impl PreparedTopologyEdit {
@@ -429,6 +432,8 @@ fn stage_connection(
         graph.invalidate(dst)?;
     }
     let land_outlines = graph.validate_land()?;
+    let frontage_work = graph.frontage_work;
+    let mut merge_frontage_work = [0; 2];
     let (mut wet, mut junctions) = if check_water {
         graph.validate()?
     } else {
@@ -457,13 +462,15 @@ fn stage_connection(
         } else {
             0
         };
-        [src, dst].map(|junction| {
+        [0, 1].map(|end| {
+            let junction = [src, dst][end];
             if let Some((merged, (next_wet, next_junctions))) =
                 graph.stage_shallow_merge(junction, new_lots)
             {
                 id = merged;
                 wet = next_wet;
                 junctions = next_junctions;
+                merge_frontage_work[end] = graph.frontage_work;
                 true
             } else {
                 false
@@ -482,6 +489,8 @@ fn stage_connection(
         check_water,
         profile_error: None,
         merges,
+        frontage_work,
+        merge_frontage_work,
         preview: RoadPreview {
             deck,
             junctions,
@@ -738,6 +747,8 @@ struct LocalTopology<'map, 'work, 'budget> {
     loaded_junctions: BTreeSet<IntersectionID>,
     changed_roads: BTreeSet<RoadID>,
     changed_junctions: BTreeSet<IntersectionID>,
+    removed_junctions: BTreeSet<IntersectionID>,
+    frontage_work: usize,
     wet_splits: BTreeSet<IntersectionID>,
     spatial: SpatialMap,
 }
@@ -757,6 +768,8 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             loaded_junctions: BTreeSet::new(),
             changed_roads: BTreeSet::new(),
             changed_junctions: BTreeSet::new(),
+            removed_junctions: BTreeSet::new(),
+            frontage_work: 0,
             wet_splits: BTreeSet::new(),
             spatial: SpatialMap::default(),
         }
@@ -1046,7 +1059,11 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             .charge(
                 samples
                     .saturating_mul((pattern.lanes().count() + 1) * 8)
-                    .saturating_add(self.map.lots.len().saturating_mul(2)),
+                    .saturating_add(if self.map.land_ownership().is_tiled() {
+                        0
+                    } else {
+                        self.map.lots.len().saturating_mul(2)
+                    }),
             )
             .ok()?;
         let elevated = a.elevated_span()
@@ -1106,6 +1123,8 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             loaded_junctions: self.loaded_junctions.clone(),
             changed_roads: self.changed_roads.clone(),
             changed_junctions: self.changed_junctions.clone(),
+            removed_junctions: self.removed_junctions.clone(),
+            frontage_work: 0,
             wet_splits: self.wet_splits.clone(),
             spatial: SpatialMap::default(),
         };
@@ -1139,6 +1158,8 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         self.loaded_junctions = trial.loaded_junctions;
         self.changed_roads = trial.changed_roads;
         self.changed_junctions = trial.changed_junctions;
+        self.removed_junctions = trial.removed_junctions;
+        self.frontage_work = trial.frontage_work;
         self.wet_splits = trial.wet_splits;
         Some(result)
     }
@@ -1149,11 +1170,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             if let Some(&live) = self.live_junctions.get(&id) {
                 self.map
                     .authorize_land_effects(PreparedEffects::Junction(live))?;
-                Self::check_junction_cut(
-                    self.map,
-                    &self.map.intersections[live],
-                    self.work.remaining,
-                )?;
+                self.removed_junctions.insert(live);
             }
         }
         Ok(())
@@ -1164,6 +1181,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         if !self.map.land_ownership().is_tiled() {
             return Ok(Vec::new());
         }
+        let before = *self.work.remaining;
         self.map.check_land_frontage_capacity(
             self.patterns.iter().filter_map(|(&id, pattern)| {
                 pattern
@@ -1174,29 +1192,27 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             }),
             self.work.remaining,
         )?;
+        self.frontage_work = before - *self.work.remaining;
+        let mut removed: BTreeSet<_> = self
+            .removed_junctions
+            .iter()
+            .copied()
+            .map(ProjectKind::Intersection)
+            .collect();
+        let mut added = Vec::new();
         for (&local, &live) in &self.live_roads {
             if !self.roads.contains_key(local) {
                 self.map
                     .authorize_land_effects(PreparedEffects::Road(live))?;
                 let old = &self.map.roads[live];
-                Self::check_road_cut(self.map, old, self.work.remaining)?;
+                removed.insert(live.into());
                 for &building in &old.connected_buildings {
                     self.map
                         .authorize_land_effects(PreparedEffects::Building(building))?;
                 }
-                for object in self.map.spatial_map.construction_candidates(
-                    old.points()
-                        .bbox()
-                        .flatten()
-                        .expand(crate::map::MAX_LOT_SIZE * 2.0),
-                    crate::map::ProjectFilter::LOT,
-                ) {
+                for id in self.map.road_lot_ids(live) {
                     self.work.charge(1)?;
-                    if let Some(id) = object.to_lot() {
-                        if self.map.lots[id].parent == live {
-                            self.map.authorize_land_effects(PreparedEffects::Lot(id))?;
-                        }
-                    }
+                    self.map.authorize_land_effects(PreparedEffects::Lot(id))?;
                 }
             }
         }
@@ -1213,11 +1229,11 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                     .authorize_land_effects(PreparedEffects::Road(live))?;
                 let old = &self.map.roads[live];
                 if old.points().as_slice() != road.points().as_slice() {
-                    Self::check_road_cut(self.map, old, self.work.remaining)?;
-                    Self::check_road_cut(self.map, road, self.work.remaining)?;
+                    removed.insert(live.into());
+                    added.push(ConstructionCut::Road(road));
                 }
             } else {
-                Self::check_road_cut(self.map, road, self.work.remaining)?;
+                added.push(ConstructionCut::Road(road));
                 let strip = road.boldline();
                 self.map.authorize_displaced_lots(strip)?;
             }
@@ -1234,14 +1250,16 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                     self.map
                         .authorize_land_effects(PreparedEffects::Footprint(outline.as_slice()))?;
                 }
-                if joint.pos != old.pos || joint.radius != old.radius {
-                    Self::check_junction_cut(self.map, old, self.work.remaining)?;
-                    Self::check_junction_cut(self.map, joint, self.work.remaining)?;
+                if !self.removed_junctions.contains(&live)
+                    && (joint.pos != old.pos || joint.radius != old.radius)
+                {
+                    removed.insert(live.into());
+                    added.push(ConstructionCut::Junction(joint));
                 }
             } else {
                 self.map
                     .authorize_land_effects(PreparedEffects::Point(joint.pos.xy()))?;
-                Self::check_junction_cut(self.map, joint, self.work.remaining)?;
+                added.push(ConstructionCut::Junction(joint));
             }
             self.map.authorize_displaced_lots(joint.bcircle())?;
             let outline = junction_outline(joint, &self.roads, self.work)?;
@@ -1256,34 +1274,9 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                 );
             }
         }
+        self.map
+            .authorize_projected_construction_cuts(&removed, &added, self.work.remaining)?;
         Ok(outlines)
-    }
-
-    fn check_road_cut(
-        map: &Map,
-        road: &Road,
-        remaining: &mut usize,
-    ) -> Result<(), ConnectionError> {
-        use crate::map::SpatialMapObject;
-        let radius = 10.0 + road.width * 3.0;
-        map.authorize_cut_nodes(
-            road.cut_influence().unwrap(),
-            road.points().len(),
-            remaining,
-            |point| road.points().project_2d(point).xy().is_close(point, radius),
-        )?;
-        Ok(())
-    }
-
-    fn check_junction_cut(
-        map: &Map,
-        joint: &Intersection,
-        remaining: &mut usize,
-    ) -> Result<(), ConnectionError> {
-        let mut circle = joint.bcircle();
-        circle.radius *= 2.0;
-        map.authorize_cut_nodes(circle.bbox(), 1, remaining, |point| circle.contains(point))?;
-        Ok(())
     }
 
     fn validate(&mut self) -> Result<(BTreeSet<RoadID>, Vec<Vec<Vec3>>), ConnectionError> {
@@ -1607,7 +1600,7 @@ pub(crate) fn prepare_merge(
     elevated: bool,
     check_water: bool,
     work: &mut CrossingWork<'_>,
-) -> Result<(), ConnectionError> {
+) -> Result<usize, ConnectionError> {
     let mut graph = LocalTopology::new(map, work);
     let src = graph.load_junction(src)?;
     let dst = graph.load_junction(dst)?;
@@ -1629,7 +1622,7 @@ pub(crate) fn prepare_merge(
             graph.validate()?;
         }
     }
-    Ok(())
+    Ok(graph.frontage_work)
 }
 
 pub(crate) fn prepare_direct_road(
@@ -1926,14 +1919,14 @@ fn frontage_samples(shape: &geom::OBB) -> usize {
         .clamp(1.0, 256.0) as usize
 }
 
-/// The global scan is reserved by the caller. Only lots on this road need the
-/// split projection and the subsequent sample-by-sample frontage check.
+/// Only lots on this road need the split projection and the subsequent
+/// sample-by-sample frontage check.
 pub(crate) fn reassigned_frontage_work(map: &Map, id: RoadID, points: usize) -> usize {
     let tile_work = frontage_attempt_work(map.roads[id].width, true);
-    map.lots
-        .values()
-        .filter(|lot| lot.parent == id)
-        .map(|lot| {
+    map.road_lot_ids(id)
+        .into_iter()
+        .map(|id| {
+            let lot = &map.lots[id];
             let samples = frontage_samples(&lot.shape);
             points
                 .saturating_mul(samples + 3)

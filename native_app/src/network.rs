@@ -162,12 +162,11 @@ mod inner {
             let generation = state.uiw.read::<crate::session::SessionState>().generation;
             for frame_commands in inputs {
                 assert_eq!(frame_commands.frame.0, sim.get_tick() + 1);
-                let commands: WorldCommands = frame_commands
-                    .inputs
-                    .iter()
-                    .map(|x| x.inp.clone())
-                    .collect();
-                let t = sim.tick(&mut state.game_schedule, commands.as_ref());
+                let inputs = &frame_commands.inputs;
+                let t = sim.tick(
+                    &mut state.game_schedule,
+                    inputs.iter().flat_map(|input| input.inp.iter()),
+                );
                 state
                     .uiw
                     .write::<Timings>()
@@ -176,10 +175,7 @@ mod inner {
                 let outcomes = sim.read::<CommandOutcomes>();
                 let local = || {
                     super::local_frame_commands(
-                        frame_commands
-                            .inputs
-                            .iter()
-                            .map(|input| (input.sent_by_me, &input.inp)),
+                        inputs.iter().map(|input| (input.sent_by_me, &input.inp)),
                     )
                 };
                 purchases.extend(super::tile_receipts(
@@ -231,7 +227,10 @@ mod inner {
     pub(crate) fn poll_bootstrap(client: &mut Client) -> Bootstrap {
         match client.get_mut().unwrap().poll(WorldCommands::default()) {
             PollResult::Wait(_) => Bootstrap::Waiting,
-            PollResult::GameWorld(_, sim) => Bootstrap::Ready(sim),
+            PollResult::GameWorld(_, sim) => match crate::session::validate_native_world(&sim) {
+                Ok(()) => Bootstrap::Ready(sim),
+                Err(error) => Bootstrap::Failed(error),
+            },
             PollResult::Disconnect(message) => Bootstrap::Failed(message),
             PollResult::Input(_) => {
                 Bootstrap::Failed("Server sent input before the initial world.".into())
@@ -283,10 +282,10 @@ mod inner {
 fn land_receipts_keep_local_command_indices_across_catch_up_frames() {
     use simulation::map::{LandMode, LandTileId};
     use simulation::world_command::Rejection;
-    use simulation::{MapPreset, NewGameOptions};
+    use simulation::{MapPreset, NewGameOptions, Simulation};
     scenarios::ensure_repo_root_cwd();
     simulation::init::init();
-    let mut sim = simulation::Simulation::new_game(&NewGameOptions {
+    let mut sim = Simulation::new_game(&NewGameOptions {
         preset: MapPreset::Flat,
         terrain_chunks: 16,
         land_mode: LandMode::Tiled,
@@ -306,7 +305,7 @@ fn land_receipts_keep_local_command_indices_across_catch_up_frames() {
     for (frame, tile) in [(2, denied), (3, paid)] {
         let local = WorldCommands::from(vec![WorldCommand::BuyTile { tile }]);
         sim.tick(
-            &mut simulation::Simulation::schedule(),
+            &mut Simulation::schedule(),
             remote.iter().chain(local.iter()),
         );
         receipts.extend(tile_receipts(
@@ -316,6 +315,33 @@ fn land_receipts_keep_local_command_indices_across_catch_up_frames() {
             local_frame_commands([(false, &remote), (true, &local)]),
         ));
     }
+    let oversized = WorldCommands::from(vec![
+        WorldCommand::BuyTile { tile: paid };
+        sim.command_batch_limit()
+    ]);
+    sim.tick(
+        &mut Simulation::schedule(),
+        remote.iter().chain(oversized.iter()),
+    );
+    let outcomes = sim.read::<CommandOutcomes>();
+    let rejected = tile_receipts(
+        4,
+        4,
+        &outcomes,
+        local_frame_commands([(false, &remote), (true, &oversized)]),
+    )
+    .collect::<Vec<_>>();
+    assert_eq!(rejected.len(), sim.command_batch_limit());
+    assert_eq!(
+        rejected.last().unwrap().command_index,
+        sim.command_batch_limit() + 1
+    );
+    assert_eq!(
+        rejected.last().unwrap().result,
+        Err(Rejection::LandDenied(
+            simulation::map::LandDenial::WorkLimit
+        ))
+    );
     assert_eq!(receipts.len(), 2);
     assert_eq!(receipts[0].result, Err(Rejection::TileNotAdjacent));
     assert_eq!(receipts[1].result.unwrap().tile, paid);

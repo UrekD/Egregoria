@@ -731,7 +731,10 @@ impl State {
 
         let replacement = self.uiw.write::<SaveLoadState>().pending.take();
         if let Some(replacement) = replacement {
-            self.install = Some(Install::Replacement(replacement));
+            match replacement.validate_native_size() {
+                Ok(()) => self.install = Some(Install::Replacement(replacement)),
+                Err(error) => session::notify(&self.uiw, error),
+            }
             return true;
         }
 
@@ -1342,8 +1345,14 @@ impl State {
         let mut io = self.uiw.write::<SaveLoadState>();
         match result {
             Ok(WorldJobOutcome::Replace(world)) if crate::network::is_singleplayer(&self.uiw) => {
-                drop(io);
-                self.install = Some(Install::Job(world, job.kind));
+                match world.replacement.validate_native_size() {
+                    Ok(()) => self.install = Some(Install::Job(world, job.kind)),
+                    Err(error) if matches!(job.kind, WorldJobKind::Replay) => {
+                        drop(io);
+                        session::notify(&self.uiw, format!("Could not load replay. {error}"));
+                    }
+                    Err(error) => io.world_error = Some(error),
+                }
             }
             Ok(WorldJobOutcome::ResumeDormant) if crate::network::is_singleplayer(&self.uiw) => {
                 drop(io);
@@ -2182,6 +2191,11 @@ fn startup_world() -> Result<StartupWorld, String> {
             }
             match Simulation::load_listed_snapshot(root, entry) {
                 Ok(sim) => {
+                    if let Err(error) = session::validate_native_world(&sim) {
+                        log::warn!("Could not load {} at startup: {error}", entry.id);
+                        message.get_or_insert(error);
+                        continue;
+                    }
                     let world = PreparedWorld {
                         replacement: WorldReplacement::from_slot(sim, entry),
                         name: session::display_name(entry).to_owned(),
@@ -2213,7 +2227,11 @@ fn startup_world() -> Result<StartupWorld, String> {
         slots = session::discover_slots(root);
     }
 
-    let (sim, recovery) = Simulation::load_or_new("world")?;
+    let (mut sim, recovery) = Simulation::load_or_new("world")?;
+    if let Err(error) = session::validate_native_world(&sim) {
+        message.get_or_insert(error);
+        sim = Simulation::new(true);
+    }
     if recovery.is_some() {
         slots = session::discover_slots(root);
     }

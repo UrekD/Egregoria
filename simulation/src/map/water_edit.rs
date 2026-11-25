@@ -1172,7 +1172,7 @@ mod tests {
                 .environment
                 .prepare_water_edit(&WaterEdit::RemoveFreshWater { body })
                 .unwrap();
-            let mut zones = sim.write::<ZoneGrid>();
+            let mut zones = sim.zone_grid_mut();
             let mut remaining = MAX_WATER_BATCH_WORK;
             map.prepare_water_effects(&prepared, &zones, &mut remaining)
                 .unwrap();

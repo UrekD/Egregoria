@@ -113,7 +113,7 @@ pub fn growth_update(sim: &mut Simulation) {
     }
     profiling::scope!("souls::growth_pass");
     let cursor = {
-        let mut zones = sim.write::<ZoneGrid>();
+        let mut zones = sim.zone_grid_mut();
         let cursor = zones.growth_cohort();
         zones.advance_growth_cohort();
         cursor

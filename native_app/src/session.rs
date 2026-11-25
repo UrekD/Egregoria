@@ -63,6 +63,18 @@ impl WorldReplacement {
             None => Self::Snapshot(sim, entry.id.clone()),
         }
     }
+
+    pub(crate) fn validate_native_size(&self) -> Result<(), String> {
+        let sim = match self {
+            Self::Snapshot(sim, _)
+            | Self::SnapshotWithCamera(sim, ..)
+            | Self::NewGame(sim, _)
+            | Self::ReplayDebug(sim, _) => sim,
+            #[cfg(feature = "multiplayer")]
+            Self::Network(sim) => sim,
+        };
+        validate_native_world(sim)
+    }
 }
 
 fn slot_camera(entry: &SlotEntry) -> Option<SlotCamera> {
@@ -911,6 +923,17 @@ pub fn request_world_replacement(uiw: &UiWorld, replacement: WorldReplacement) -
     true
 }
 
+pub(crate) fn validate_native_world(sim: &Simulation) -> Result<(), String> {
+    let (width, height) = sim.map().environment().size();
+    let limit = simulation::map::MAX_NATIVE_LAND_SIDE;
+    if width > limit || height > limit {
+        return Err(format!(
+            "This city is {width} × {height} terrain chunks. The native renderer supports up to {limit} chunks per axis."
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub fn apply_world_replacement(
     uiw: &UiWorld,
@@ -1275,6 +1298,22 @@ mod p4_fix_ac_tests {
         uiw.insert(camera);
         uiw.insert(OrbitCamera::from_camera(camera));
         uiw
+    }
+
+    #[test]
+    fn tiles_fix_rejects_oversize_native_world_during_preflight() {
+        use simulation::map::{Environment, Map};
+
+        drop(ui_with_camera());
+        for (width, height) in [(51, 1), (1, 51)] {
+            let oversized = Simulation::new(false);
+            let mut map = Map::empty();
+            assert!(map.install_environment(Environment::new(width, height)));
+            *oversized.write::<Map>() = map;
+            let replacement = WorldReplacement::Snapshot(oversized, SlotId::legacy());
+            let result = replacement.validate_native_size();
+            assert!(result.unwrap_err().contains("50 chunks per axis"));
+        }
     }
 
     #[test]

@@ -521,8 +521,16 @@ impl Simulation {
 
     /// Splits the world from its resources. Raw human storage edits through
     /// the returned world invalidate its work sets automatically.
-    pub fn world_res(&mut self) -> (&mut World, &mut Resources) {
+    pub(crate) fn world_res(&mut self) -> (&mut World, &mut Resources) {
         (&mut self.world, &mut self.resources)
+    }
+
+    /// Raw resource access for unrestricted authoring and fixtures.
+    pub fn unrestricted_world_res(&mut self) -> Option<(&mut World, &mut Resources)> {
+        if self.map().land_ownership().is_tiled() {
+            return None;
+        }
+        Some(self.world_res())
     }
 
     pub fn world(&self) -> &World {
@@ -635,54 +643,70 @@ impl Simulation {
         steps_systems: bool,
         construction: BudgetCategory,
     ) {
-        let tiled = self.map().land_ownership().is_tiled();
+        let limit = self.command_batch_limit();
+        let tiled = limit == world_command::MAX_TILED_COMMANDS;
         let mut commands = commands.into_iter();
         let Some(first) = commands.next() else {
             utils::scheduler::drain_commands(self);
             return;
         };
-        let mut batch_commands = Vec::new();
-        let commands = if let Some(second) = commands.next() {
-            batch_commands.extend([first, second]);
-            if tiled {
-                batch_commands.extend(commands.take(255));
-            } else {
-                batch_commands.extend(commands);
-            }
-            batch_commands.as_slice()
+        let mut batch = Vec::new();
+        let remaining = &mut commands;
+        let commands = if let Some(second) = remaining.next() {
+            batch.extend([first, second]);
+            batch.extend(remaining.take(limit - 1));
+            batch.as_slice()
         } else {
             std::slice::from_ref(&first)
         };
-        let mut water = PrepareBudget::new(commands, self.map().environment());
-        let admission = if tiled && commands.len() > 256 {
-            Err(Rejection::LandDenied(map::LandDenial::WorkLimit))
-        } else {
-            commands
-                .iter()
-                .try_for_each(|command| command.admitted(tiled, &water))
-        };
-        if let Err(reason) = admission {
-            let parent = self.write::<CommandOutcomes>().begin_batch();
-            for (index, command) in commands.iter().enumerate() {
-                let start = self.read::<CommandOutcomes>().command_start();
-                command.reject_unadmitted(self, reason);
-                self.write::<CommandOutcomes>().record_command(index, start);
-            }
-            utils::scheduler::drain_commands(self);
-            self.write::<CommandOutcomes>().finish_batch(parent);
+        if commands.len() > limit {
+            self.reject_command_batch(commands, remaining, tiled);
             return;
         }
+        let wire_errors: Vec<_> = commands
+            .iter()
+            .map(|command| command.wire_error())
+            .collect();
+        let wire_commands;
+        let admitted = if wire_errors.iter().all(Option::is_none) {
+            commands
+        } else {
+            wire_commands = commands
+                .iter()
+                .copied()
+                .zip(&wire_errors)
+                .filter_map(|(command, error)| error.is_none().then_some(command))
+                .collect::<Vec<_>>();
+            &wire_commands
+        };
+        if admitted
+            .iter()
+            .map(|command| command.wire_descriptors())
+            .fold(0usize, usize::saturating_add)
+            > map::MAX_WATER_BATCH_WORK
+        {
+            self.reject_command_batch(commands, std::iter::empty(), tiled);
+            return;
+        }
+        let mut water = PrepareBudget::new(admitted, self.map().environment());
         let topology_generation = self.map().walking_topology_generation;
         let recording_start = self.read::<Replay>().command_count();
         let parent = self.write::<CommandOutcomes>().begin_batch();
         let record = parent.is_none() && self.read::<Replay>().enabled;
-        for (index, command) in commands.iter().enumerate() {
+        for (index, (command, wire_error)) in commands.iter().zip(wire_errors).enumerate() {
             let start = self.read::<CommandOutcomes>().command_start();
-            if record {
-                let tick = self.read::<GameTime>().tick;
-                self.write::<Replay>().push(tick, (*command).clone());
+            if let Some(error) = wire_error {
+                command.reject_wire(self, error);
+            } else {
+                if record {
+                    let tick = self.read::<GameTime>().tick;
+                    self.write::<Replay>().push(tick, (*command).clone());
+                }
+                match command.admitted(tiled, &water) {
+                    Ok(()) => command.apply_in_batch(self, construction, &mut water),
+                    Err(reason) => command.reject_unadmitted(self, reason),
+                }
             }
-            command.apply_in_batch(self, construction, &mut water);
             utils::scheduler::drain_commands(self);
             self.write::<CommandOutcomes>().record_command(index, start);
         }
@@ -698,6 +722,44 @@ impl Simulation {
             );
         }
         self.write::<CommandOutcomes>().finish_batch(parent);
+    }
+
+    fn reject_command_batch<'a>(
+        &mut self,
+        commands: &[&WorldCommand],
+        excess: impl Iterator<Item = &'a WorldCommand>,
+        tiled: bool,
+    ) {
+        let reason = if tiled {
+            Rejection::LandDenied(map::LandDenial::WorkLimit)
+        } else {
+            Rejection::WaterWorkLimit
+        };
+        let parent = self.write::<CommandOutcomes>().begin_batch();
+        for (index, command) in commands.iter().enumerate() {
+            let start = self.read::<CommandOutcomes>().command_start();
+            command.reject_unadmitted(self, reason);
+            self.write::<CommandOutcomes>().record_command(index, start);
+        }
+        {
+            let mut outcomes = self.write::<CommandOutcomes>();
+            outcomes.reject_batch(reason);
+            for (offset, command) in excess.enumerate() {
+                if matches!(command, WorldCommand::BuyTile { .. }) {
+                    outcomes.reject_excess_purchase(commands.len() + offset, reason);
+                }
+            }
+        }
+        utils::scheduler::drain_commands(self);
+        self.write::<CommandOutcomes>().finish_batch(parent);
+    }
+
+    pub fn command_batch_limit(&self) -> usize {
+        if self.map().land_ownership().is_tiled() {
+            world_command::MAX_TILED_COMMANDS
+        } else {
+            world_command::MAX_WIRE_COMMANDS
+        }
     }
 
     pub fn get_tick(&self) -> u64 {
@@ -926,15 +988,42 @@ impl Simulation {
         self.world.contains(id)
     }
 
+    fn allows_resource_write<T: Any>(&self) -> bool {
+        use std::any::TypeId;
+        let protected = [
+            TypeId::of::<Map>(),
+            TypeId::of::<map::ZoneGrid>(),
+            TypeId::of::<map::Environment>(),
+            TypeId::of::<SimulationOptions>(),
+        ];
+        !protected.contains(&TypeId::of::<T>())
+            || !self.resources.contains::<Map>()
+            || self
+                .resources
+                .try_read::<Map>()
+                .is_ok_and(|map| !map.land_ownership().is_tiled())
+    }
+
     pub fn write_or_default<T: Any + Send + Sync + Default>(&mut self) -> RefMut<T> {
+        assert!(
+            self.allows_resource_write::<T>(),
+            "live land resources require a checked command"
+        );
         self.resources.write_or_default::<T>()
     }
 
     pub fn try_write<T: Any + Send + Sync>(&self) -> Option<RefMut<T>> {
+        if !self.allows_resource_write::<T>() {
+            return None;
+        }
         self.resources.try_write().ok()
     }
 
     pub fn write<T: Any + Send + Sync>(&self) -> RefMut<T> {
+        assert!(
+            self.allows_resource_write::<T>(),
+            "live land resources require a checked command"
+        );
         self.resources.write()
     }
 
@@ -950,7 +1039,15 @@ impl Simulation {
         self.resources.write()
     }
 
+    pub(crate) fn zone_grid_mut(&self) -> RefMut<'_, map::ZoneGrid> {
+        self.resources.write()
+    }
+
     pub fn insert<T: Any + Send + Sync>(&mut self, res: T) {
+        assert!(
+            self.allows_resource_write::<T>(),
+            "live land resources require a checked command"
+        );
         self.resources.insert(res);
     }
 }

@@ -32,10 +32,15 @@ use crate::transportation::{spawn_parked_vehicle_with_spot, unpark, VehicleKind}
 use crate::utils::rand_provider::RandProvider;
 use crate::{CompanyID, MapPreset, Replay, Simulation, SimulationOptions, SoulID};
 
+pub(crate) const MAX_TILED_COMMANDS: usize = 256;
+pub(crate) const MAX_WIRE_COMMANDS: usize = 65_536;
+const MAX_WAGONS: usize = 256;
+const MAX_LINE_STOPS: usize = 30;
+
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct WorldCommands {
-    #[serde(deserialize_with = "bounded_batch_wire")]
+    #[serde(deserialize_with = "bounded_frame_wire")]
     pub(crate) commands: Vec<WorldCommand>,
 }
 
@@ -46,7 +51,7 @@ where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    bounded_command_vec::<_, _, 65_536>(deserializer)
+    bounded_command_vec::<_, _, MAX_WIRE_COMMANDS>(deserializer)
 }
 
 pub(crate) fn bounded_command_vec<'de, D, T, const LIMIT: usize>(
@@ -56,7 +61,15 @@ where
     D: serde::Deserializer<'de>,
     T: Deserialize<'de>,
 {
-    use serde::de::{Error, IgnoredAny, SeqAccess, Visitor};
+    use serde::de::{DeserializeSeed, Error, SeqAccess, Visitor};
+    struct RejectExtra;
+    impl<'de> DeserializeSeed<'de> for RejectExtra {
+        type Value = ();
+
+        fn deserialize<D: serde::Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
+            Err(D::Error::custom("command sequence exceeds its limit"))
+        }
+    }
     struct Bounded<T, const LIMIT: usize>(std::marker::PhantomData<T>);
     impl<'de, T: Deserialize<'de>, const LIMIT: usize> Visitor<'de> for Bounded<T, LIMIT> {
         type Value = Vec<T>;
@@ -70,20 +83,65 @@ where
             if hint > LIMIT {
                 return Err(A::Error::invalid_length(hint, &self));
             }
-            let mut entries = Vec::with_capacity(hint);
+            let mut entries = Vec::with_capacity(hint.min(256));
             while entries.len() < LIMIT {
                 let Some(entry) = input.next_element()? else {
                     return Ok(entries);
                 };
                 entries.push(entry);
             }
-            if input.next_element::<IgnoredAny>()?.is_some() {
-                return Err(A::Error::invalid_length(LIMIT + 1, &self));
-            }
+            input.next_element_seed(RejectExtra)?;
             Ok(entries)
         }
     }
     deserializer.deserialize_seq(Bounded::<T, LIMIT>(std::marker::PhantomData))
+}
+
+fn bounded_frame_wire<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<WorldCommand>, D::Error> {
+    use serde::de::{DeserializeSeed, Error, SeqAccess, Visitor};
+
+    struct Frame;
+    impl<'de> Visitor<'de> for Frame {
+        type Value = Vec<WorldCommand>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("a command frame within the wire descriptor budget")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
+            if let Some(count) = input.size_hint().filter(|&count| count > MAX_WIRE_COMMANDS) {
+                return Err(A::Error::invalid_length(count, &self));
+            }
+            let mut commands = Vec::new();
+            let mut remaining = MAX_WATER_BATCH_WORK;
+            while commands.len() < MAX_WIRE_COMMANDS && remaining > 0 {
+                let Some(command): Option<WorldCommand> = input.next_element()? else {
+                    return Ok(commands);
+                };
+                remaining = remaining
+                    .checked_sub(command.wire_descriptors())
+                    .ok_or_else(|| {
+                        A::Error::custom("command frame exceeds its descriptor budget")
+                    })?;
+                commands.push(command);
+            }
+            struct Extra;
+            impl<'de> DeserializeSeed<'de> for Extra {
+                type Value = ();
+
+                fn deserialize<D: serde::Deserializer<'de>>(self, _: D) -> Result<(), D::Error> {
+                    Err(D::Error::custom(
+                        "command frame exceeds its descriptor budget",
+                    ))
+                }
+            }
+            input.next_element_seed(Extra)?;
+            Ok(commands)
+        }
+    }
+    deserializer.deserialize_seq(Frame)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -113,6 +171,7 @@ pub enum WorldCommand {
         lane: LaneID,
     },
     SpawnTrain {
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_WAGONS>")]
         wagons: Vec<RollingStockID>,
         lane: LaneID,
         dist: f32,
@@ -170,10 +229,12 @@ pub enum WorldCommand {
         stop: StopID,
     },
     TransitCreateLine {
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_LINE_STOPS>")]
         stops: Vec<StopID>,
     },
     TransitEditLine {
         line: LineID,
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_LINE_STOPS>")]
         stops: Vec<StopID>,
     },
     TransitRemoveLine {
@@ -233,6 +294,8 @@ pub enum Rejection {
     TileUnavailable,
     TileAlreadyOwned,
     TileNotAdjacent,
+    InvalidCommandEncoding,
+    BuildingOverlap,
 }
 
 impl From<LandDenial> for Rejection {
@@ -423,6 +486,7 @@ pub(crate) enum PreparedAction<'a> {
         work: Option<WaterTopologyWork>,
         cost: Money,
     },
+    SpecialBuilding(crate::map::PreparedSpecialBuilding, Money),
     Command(&'a WorldCommand, Money),
 }
 
@@ -434,7 +498,7 @@ impl PreparedAction<'_> {
                 WorldCommand::charge_construction(sim, purchase.paid, BudgetCategory::LandPurchase);
                 sim.map_mut().commit_land_frontage(frontage);
             }
-            Self::Paint(cells) => sim.write::<ZoneGrid>().paint_prepared(cells),
+            Self::Paint(cells) => sim.zone_grid_mut().paint_prepared(cells),
             Self::Connection {
                 from,
                 to,
@@ -447,6 +511,11 @@ impl PreparedAction<'_> {
                 sim.map_mut()
                     .make_resolved_connection(from, to, elbow, pattern, topology, work.as_mut())
                     .map_err(Rejection::water_connection_error)?;
+                WorldCommand::charge_construction(sim, cost, construction);
+            }
+            Self::SpecialBuilding(prepared, cost) => {
+                let id = sim.map_mut().commit_special_building(prepared);
+                sim.write::<BuildingInfos>().insert(id);
                 WorldCommand::charge_construction(sim, cost, construction);
             }
             Self::Command(command, cost) => command.apply_one(sim, construction, cost)?,
@@ -482,12 +551,25 @@ pub struct CommandOutcomes {
     command_ranges: Vec<CommandOutcomeRanges>,
     links: Vec<LinkOutcome>,
     batch_in_progress: bool,
+    batch_rejection: Option<Rejection>,
     connections: BTreeMap<usize, ConnectionBatchOutcome>,
     tile_purchases: BTreeMap<usize, Result<TilePurchased, Rejection>>,
     water_edits: BTreeMap<usize, Result<WaterEditOutcome, WaterEditError>>,
 }
 
 impl CommandOutcomes {
+    pub(crate) fn reject_excess_purchase(&mut self, index: usize, reason: Rejection) {
+        self.tile_purchases.insert(index, Err(reason));
+    }
+
+    pub(crate) fn reject_batch(&mut self, reason: Rejection) {
+        self.batch_rejection = Some(reason);
+    }
+
+    pub fn batch_rejection(&self) -> Option<Rejection> {
+        self.batch_rejection
+    }
+
     pub fn batch_seq(&self) -> u64 {
         self.sequence
     }
@@ -528,6 +610,7 @@ impl CommandOutcomes {
     pub fn clear(&mut self) {
         self.last.clear();
         self.accepted.clear();
+        self.batch_rejection = None;
         self.command_ranges.clear();
         self.links.clear();
         self.connections.clear();
@@ -747,6 +830,10 @@ impl WorldCommands {
         self.commands.extend(cmds);
     }
 
+    pub fn append(&mut self, mut src: WorldCommands) {
+        self.commands.append(&mut src.commands);
+    }
+
     pub fn merge(&mut self, src: &WorldCommands) {
         self.commands.extend_from_slice(&src.commands);
     }
@@ -880,11 +967,8 @@ impl WorldCommand {
             let outcome = if water.reject_surface {
                 Err(WaterEditError::Limit)
             } else {
-                sim.map_mut().apply_water_edit(
-                    edit,
-                    &mut sim.write::<ZoneGrid>(),
-                    &mut water.remaining,
-                )
+                sim.map_mut()
+                    .apply_water_edit(edit, &mut sim.zone_grid_mut(), &mut water.remaining)
             };
             if let Err(error) = &outcome {
                 self.reject(sim, Rejection::water_error(error));
@@ -917,7 +1001,7 @@ impl WorldCommand {
                     .and_then(|prepared| {
                         map.commit_water_edit(
                             prepared,
-                            &mut sim.write::<ZoneGrid>(),
+                            &mut sim.zone_grid_mut(),
                             &mut water.remaining,
                         )
                     });
@@ -968,6 +1052,146 @@ impl WorldCommand {
         }
     }
 
+    pub(crate) fn wire_descriptors(&self) -> usize {
+        let lanes =
+            |pattern: &LanePattern| pattern.lanes_forward.len() + pattern.lanes_backward.len();
+        let nested = match self {
+            MapMakeConnection { pat, .. } => lanes(pat),
+            MapMakeMultipleConnections(projects, links) => {
+                projects.len()
+                    + links.len()
+                    + links.iter().map(|link| lanes(&link.3)).sum::<usize>()
+            }
+            MapBuildSpecialBuilding {
+                zone: Some(zone), ..
+            }
+            | UpdateZone { zone, .. } => zone.poly.len(),
+            SpawnTrain { wagons, .. } => wagons.len(),
+            TransitCreateLine { stops } | TransitEditLine { stops, .. } => stops.len(),
+            EditWater(WaterEdit::CarveRiver { polyline, .. }) => polyline.points().len(),
+            EditWater(WaterEdit::FillLake { basin, .. }) => basin.points().len(),
+            _ => 0,
+        };
+        1 + nested
+    }
+
+    pub(crate) fn wire_error(&self) -> Option<Result<Rejection, WaterEditError>> {
+        if let EditWater(edit) = self {
+            return crate::map::validate_water_edit_wire(edit).err().map(Err);
+        }
+        if matches!(self, MapMakeMultipleConnections(projects, links)
+            if projects.len() > MAX_WIRE_COMMANDS || links.len() > MAX_WIRE_COMMANDS)
+        {
+            return Some(Ok(Rejection::WaterWorkLimit));
+        }
+        let finite_pattern = |pattern: &LanePattern| {
+            pattern.lanes_forward.len() <= 32
+                && pattern.lanes_backward.len() <= 32
+                && pattern
+                    .lanes_forward
+                    .iter()
+                    .chain(&pattern.lanes_backward)
+                    .all(|(_, speed)| speed.is_finite())
+        };
+        let finite_zone = |zone: &Zone| {
+            zone.poly.len() <= 256
+                && zone.poly.as_slice().iter().all(|point| point.is_finite())
+                && zone.area.is_finite()
+                && zone.filldir.is_finite()
+        };
+        let fits = match self {
+            Terraform {
+                center,
+                radius,
+                amount,
+                level,
+                slope,
+                ..
+            } => {
+                center.is_finite()
+                    && radius.is_finite()
+                    && amount.is_finite()
+                    && level.is_finite()
+                    && slope.is_none_or(|(from, to)| from.is_finite() && to.is_finite())
+            }
+            MapMakeConnection {
+                from,
+                to,
+                inter,
+                pat,
+            } => {
+                from.pos.is_finite()
+                    && to.pos.is_finite()
+                    && inter.is_none_or(Vec2::is_finite)
+                    && finite_pattern(pat)
+            }
+            MapMakeMultipleConnections(projects, links) => {
+                projects.iter().all(|project| project.pos.is_finite())
+                    && links.iter().all(|(_, _, elbow, pattern)| {
+                        elbow.is_none_or(Vec2::is_finite) && finite_pattern(pattern)
+                    })
+            }
+            MapUpdateIntersectionPolicy { turn, .. } => turn
+                .roundabout
+                .is_none_or(|policy| policy.radius.is_finite()),
+            MapBuildSpecialBuilding { pos, gen, zone, .. } => {
+                let finite_gen = match gen {
+                    BuildingGen::House | BuildingGen::Farm => true,
+                    BuildingGen::CenteredDoor { vertical_factor } => vertical_factor.is_finite(),
+                    BuildingGen::NoWalkway { door_pos } => door_pos.is_finite(),
+                };
+                finite_gen
+                    && pos.corners.iter().all(|point| point.is_finite())
+                    && zone.as_ref().is_none_or(finite_zone)
+            }
+            MapLoadTestField { pos, spacing, .. } => pos.is_finite() && spacing.is_finite(),
+            UpdateZone { zone, .. } => finite_zone(zone),
+            SetGameTime(time) => time.timestamp.is_finite(),
+            ZonePaint { area, .. } => area.corners.iter().all(|point| point.is_finite()),
+            AddTrain { dist, .. } => dist.is_finite(),
+            SpawnTrain { dist, wagons, .. } => dist.is_finite() && wagons.len() <= MAX_WAGONS,
+            TransitAddStop { pos, dir } => pos.is_finite() && dir.is_finite(),
+            TransitCreateLine { stops } | TransitEditLine { stops, .. } => {
+                stops.len() <= MAX_LINE_STOPS
+            }
+            SendMessage { message } => {
+                let color = message.color;
+                [color.r, color.g, color.b, color.a]
+                    .into_iter()
+                    .all(f32::is_finite)
+            }
+            Init(_)
+            | MapRemoveIntersection(_)
+            | MapRemoveRoad(_)
+            | MapRemoveBuilding(_)
+            | MapBuildHouse(_)
+            | SpawnRandomCars { .. }
+            | MapLoadParis
+            | SetTaxRate { .. }
+            | TransitRemoveStop { .. }
+            | TransitRemoveLine { .. }
+            | TransitSetVehicles { .. }
+            | TransitSetFare { .. }
+            | SetWarehousePolicy { .. }
+            | SetLotLayout(_)
+            | BuyTile { .. } => true,
+            EditWater(_) => unreachable!(),
+        };
+        (!fits).then_some(Ok(Rejection::InvalidCommandEncoding))
+    }
+
+    pub(crate) fn reject_wire(&self, sim: &Simulation, error: Result<Rejection, WaterEditError>) {
+        match error {
+            Ok(reason) => self.reject_unadmitted(sim, reason),
+            Err(error) => {
+                self.reject(sim, Rejection::water_error(&error));
+                let mut outcomes = sim.write::<CommandOutcomes>();
+                let index = outcomes.command_ranges.len();
+                outcomes.water_edits.insert(index, Err(error));
+            }
+        }
+    }
+
     pub(crate) fn admitted(&self, tiled: bool, water: &PrepareBudget) -> Result<(), Rejection> {
         if tiled {
             let fits = match self {
@@ -983,8 +1207,10 @@ impl WorldCommand {
                     zone: Some(zone), ..
                 }
                 | UpdateZone { zone, .. } => zone.poly.len() <= 256,
-                SpawnTrain { wagons, .. } => wagons.len() <= 256,
-                TransitCreateLine { stops } | TransitEditLine { stops, .. } => stops.len() <= 30,
+                SpawnTrain { wagons, .. } => wagons.len() <= MAX_WAGONS,
+                TransitCreateLine { stops } | TransitEditLine { stops, .. } => {
+                    stops.len() <= MAX_LINE_STOPS
+                }
                 _ => true,
             };
             return if fits {
@@ -1129,7 +1355,7 @@ impl WorldCommand {
                     return Err(Rejection::MissingReference);
                 }
                 map.authorize_land_effects(PreparedEffects::Building(*id))?;
-                map.authorize_building_cut(&map.get(*id).unwrap().obb)?;
+                map.authorize_building_removal(*id)?;
                 true
             }
             MapLoadParis | MapLoadTestField { .. } | SpawnRandomCars { .. }
@@ -1158,6 +1384,8 @@ impl WorldCommand {
                 let lot = map.get(*id).ok_or(Rejection::MissingReference)?;
                 map.authorize_land_effects(PreparedEffects::Lot(*id))?;
                 map.authorize_new_building(&lot.shape, BuildingGen::House, None, Some(lot.parent))?;
+                let height = map.environment().height(lot.shape.center()).unwrap_or(0.0);
+                map.authorize_building_grade(lot.shape, height)?;
                 if !Building::dry_footprint(map.environment(), &lot.shape, None) {
                     return Err(Rejection::WetFootprint);
                 }
@@ -1256,13 +1484,7 @@ impl WorldCommand {
                 {
                     return Err(Rejection::InvalidZone);
                 }
-                map.authorize_new_building(pos, *gen, zone.as_ref(), *connected_road)?;
-                if !Building::dry_footprint(map.environment(), pos, zone.as_ref()) {
-                    return Err(Rejection::WetFootprint);
-                }
-                crate::map::validate_water_service_placement(map, *kind, *pos, *connected_road)
-                    .map_err(Rejection::WaterServiceSite)?;
-                connected_road.is_none_or(|id| map.get(id).is_some())
+                true
             }
             UpdateZone { building, zone } => {
                 let b = map.get(*building).ok_or(Rejection::MissingReference)?;
@@ -1334,7 +1556,13 @@ impl WorldCommand {
     }
 
     pub fn preview(&self, sim: &Simulation) -> Result<ActionPreview, Rejection> {
-        let mut budget = PrepareBudget::new(&[self], sim.map().environment());
+        if let Some(error) = self.wire_error() {
+            return Err(error.unwrap_or_else(|error| Rejection::water_error(&error)));
+        }
+        let map = sim.map();
+        let mut budget = PrepareBudget::new(&[self], map.environment());
+        self.admitted(map.land_ownership().is_tiled(), &budget)?;
+        drop(map);
         match self {
             EditWater(edit) => {
                 let water = sim
@@ -1408,7 +1636,9 @@ impl WorldCommand {
                         ..ActionPreview::priced(cost)
                     })
                 }
-                PreparedAction::Command(_, cost) => Ok(ActionPreview::priced(cost)),
+                PreparedAction::SpecialBuilding(_, cost) | PreparedAction::Command(_, cost) => {
+                    Ok(ActionPreview::priced(cost))
+                }
             },
         }
     }
@@ -1475,6 +1705,19 @@ impl WorldCommand {
         }
         let map = sim.map();
         self.validate(&map)?;
+        if let MapBuildSpecialBuilding {
+            pos,
+            kind,
+            gen,
+            zone,
+            connected_road,
+        } = self
+        {
+            let building =
+                map.prepare_special_building(*pos, *kind, *gen, zone.clone(), *connected_road)?;
+            let cost = Self::affordable_cost(sim, Government::checked_action_cost(self, sim))?;
+            return Ok(PreparedAction::SpecialBuilding(building, cost));
+        }
         match self {
             MapRemoveRoad(id) => map
                 .prepare_remove_road(*id)
@@ -1523,7 +1766,7 @@ impl WorldCommand {
         density: Density,
         owns: impl FnMut(crate::map::ZoneCellCoord) -> bool,
     ) -> Result<(), Rejection> {
-        sim.write::<ZoneGrid>()
+        sim.zone_grid_mut()
             .paint_on_map_with_land(&sim.map(), area, kind, density, owns)
             .map_err(Rejection::from)
     }
@@ -1774,19 +2017,7 @@ impl WorldCommand {
                     i.turn_policy = tp;
                 })
                 .map_err(Rejection::water_connection_error)?,
-            MapBuildSpecialBuilding {
-                pos: obb,
-                kind,
-                gen,
-                ref zone,
-                connected_road,
-            } => {
-                let id = sim
-                    .write::<Map>()
-                    .build_special_building(&obb, kind, gen, zone.clone(), connected_road)
-                    .ok_or(Rejection::MutationFailed)?;
-                sim.write::<BuildingInfos>().insert(id);
-            }
+            MapBuildSpecialBuilding { .. } => unreachable!(),
             SetGameTime(gt) => {
                 let mut time = sim.write::<GameTime>();
                 sim.write::<Budget>().shift_clock(time.tick, gt.tick);
@@ -1948,6 +2179,9 @@ impl WorldCommand {
             generate_terrain(sim, options)?;
             if let crate::map::LandRecipe::NativeFlatV1 { .. } = options.land_recipe {
                 crate::map::procgen::commission_native_land(sim, options)
+                    .map_err(Rejection::LandSetup)?;
+                sim.map()
+                    .validate_commissioned_reserves(options.land_recipe)
                     .map_err(Rejection::LandSetup)?;
             } else if kind == BootstrapKind::Normal {
                 let starter_built = build_starting_external_trading(sim);

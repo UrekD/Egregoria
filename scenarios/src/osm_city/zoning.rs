@@ -406,11 +406,17 @@ fn mapped_site(map: &Map, plant: BuildingID, ring: &[Vec2], center: Vec2) -> Opt
     Some((road, shape))
 }
 
-fn paint(sim: &Simulation, shape: OBB, kind: ZoneKind, density: Density) -> Result<(), String> {
-    let map = sim.map();
-    sim.write::<ZoneGrid>()
-        .paint_on_map(&map, &shape, Some(kind), density)
-        .map_err(|error| format!("imported zoning stamp was rejected ({error:?})"))
+fn paint(sim: &mut Simulation, shape: OBB, kind: ZoneKind, density: Density) -> Result<(), String> {
+    sim.apply_commands([&simulation::world_command::WorldCommand::ZonePaint {
+        area: shape,
+        kind: Some(kind),
+        density,
+    }]);
+    let outcomes = sim.read::<simulation::world_command::CommandOutcomes>();
+    if let Some((_, error)) = outcomes.rejections_for(0).first() {
+        return Err(format!("imported zoning stamp was rejected ({error:?})"));
+    }
+    Ok(())
 }
 
 fn seed_job(sim: &mut Simulation, id: LotID, kind: ZoneKind) -> Option<usize> {

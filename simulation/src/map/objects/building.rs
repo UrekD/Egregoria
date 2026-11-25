@@ -222,6 +222,10 @@ impl PreparedGrowableAppearance {
 pub(in crate::map) struct PreparedBuilding(Building);
 
 impl PreparedBuilding {
+    pub(in crate::map) fn base_height(&self) -> f32 {
+        self.0.height
+    }
+
     pub(in crate::map) fn insert(
         self,
         buildings: &mut Buildings,

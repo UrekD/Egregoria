@@ -218,7 +218,7 @@ fn register_systems_and_resources() {
             f: Box::new(|sim| sim.insert(HouseholdClaims::from_world(sim.world()))),
         });
     }
-    register_resource_noinit::<SimulationOptions, Bincode>("simoptions");
+    register_simulation_options();
 
     register_resource_default::<ElectricityFlow, Bincode>("electricity_flow");
     register_resource_default::<CoverageGrid, Bincode>("coverage_grid");
@@ -296,11 +296,57 @@ fn register_utility_water_sample() {
     }
 }
 
+fn register_simulation_options() {
+    // Pre-TILES saves used the same release header and this exact six-field
+    // payload. Bincode is positional and checks that the record ends here.
+    type LegacyOptions = (
+        u16,
+        bool,
+        crate::MapPreset,
+        u64,
+        u32,
+        crate::economy::progression::ProgressionMode,
+    );
+
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "simoptions",
+            optional: false,
+            save: Box::new(|sim| Bincode::encode(&*sim.read::<SimulationOptions>()).unwrap()),
+            load: Box::new(|sim, data| {
+                let options = Bincode::decode::<SimulationOptions>(data).or_else(|new_error| {
+                    let (
+                        terrain_size,
+                        save_replay,
+                        preset,
+                        seed,
+                        starting_money_bucks,
+                        progression,
+                    ) = Bincode::decode::<LegacyOptions>(data).map_err(|_| new_error)?;
+                    Ok::<_, std::io::Error>(SimulationOptions {
+                        terrain_size,
+                        save_replay,
+                        preset,
+                        seed,
+                        starting_money_bucks,
+                        progression,
+                        ..SimulationOptions::LEGACY
+                    })
+                })?;
+                sim.resources.insert(options);
+                Ok(())
+            }),
+        });
+    }
+}
+
 fn register_land_ownership() {
     unsafe {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "land_ownership",
-            optional: false,
+            // A legacy world defaults to unrestricted. Tiled provenance still
+            // requires a matching mask in the post-load validator.
+            optional: true,
             save: Box::new(|sim| crate::map::encode_land(sim.map().land_ownership()).unwrap()),
             load: Box::new(|sim, data| {
                 sim.map_mut()
@@ -530,7 +576,7 @@ fn register_resource_noinit<T: 'static + Send + Sync + Serialize + DeserializeOw
             optional: false,
             save: Box::new(move |uiworld| E::encode(&*uiworld.read::<T>()).unwrap()),
             load: Box::new(move |sim, data| {
-                sim.insert(E::decode::<T>(data)?);
+                sim.resources.insert(E::decode::<T>(data)?);
                 Ok(())
             }),
         });

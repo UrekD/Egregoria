@@ -503,7 +503,7 @@ fn fast_tick_skips_serde() {
 }
 
 #[test]
-fn w0_water_rejects_excess_lanes_before_topology_and_replay() {
+fn w0_water_rejects_excess_lanes_before_topology_and_c1_keeps_the_inputs() {
     use crate::map::{LaneKind, LanePattern, MapProject, WaterEdit};
     use crate::world_command::{CommandOutcomes, Rejection};
     use crate::Replay;
@@ -529,14 +529,14 @@ fn w0_water_rejects_excess_lanes_before_topology_and_replay() {
         pat: pat.clone(),
     };
     let indexed = WorldCommand::MapMakeMultipleConnections(vec![from, to], vec![(0, 1, None, pat)]);
-    for command in [single, indexed] {
+    for (index, command) in [single, indexed].into_iter().enumerate() {
         sim.apply_commands([&command]);
         assert_eq!(
             sim.read::<CommandOutcomes>().last[0].1,
             Rejection::WaterWorkLimit
         );
         assert_eq!(sim.map().roads().len(), 0);
-        assert_eq!(sim.read::<Replay>().command_count(), 0);
+        assert_eq!(sim.read::<Replay>().command_count(), index + 1);
     }
 }
 
@@ -1576,3 +1576,385 @@ fn zones2_fix_scrubs_departing_company_trades_at_the_drain() {
 }
 
 mod land_ownership;
+
+#[cfg(test)]
+mod tiles_fix_regressions {
+    use super::init_test_simulation;
+    use crate::map::{
+        BuildingKind, LandMode, LandTileId, LanePatternBuilder, Map, MapProject, WaterEdit,
+        ZoneGrid, ZoneKind,
+    };
+    use crate::world_command::{CommandOutcomes, Rejection};
+    use crate::{
+        MapPreset, NewGameOptions, Replay, Simulation, SlotId, SnapshotRevision, WorldCommand,
+    };
+    use common::saveload::{Bincode, Encoder};
+    use geom::{vec2, vec3, Vec2, OBB};
+    use prototypes::{BuildingGen, FreightStationPrototypeID};
+
+    fn game(land_mode: LandMode) -> Simulation {
+        init_test_simulation();
+        Simulation::new_game_with_replay(&NewGameOptions {
+            preset: MapPreset::Flat,
+            terrain_chunks: 16,
+            land_mode,
+            ..NewGameOptions::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn tiles_fix_protects_live_resources() {
+        let mut sim = game(LandMode::Tiled);
+        assert!(sim.try_write::<Map>().is_none());
+        assert!(sim.try_write::<ZoneGrid>().is_none());
+        assert!(sim.unrestricted_world_res().is_none());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sim.insert(Map::default());
+        }))
+        .is_err());
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(sim.write_or_default::<ZoneGrid>());
+        }))
+        .is_err());
+        assert!(game(LandMode::Unrestricted).try_write::<Map>().is_some());
+    }
+
+    #[test]
+    fn tiles_fix_admits_unrestricted_commands_individually() {
+        let mut sim = game(LandMode::Unrestricted);
+        let opening = sim.read::<Replay>().command_count();
+        let mut pat = LanePatternBuilder::default().build();
+        pat.lanes_forward.resize(17, pat.lanes_forward[0]);
+        pat.lanes_backward.resize(16, pat.lanes_forward[0]);
+        let road = WorldCommand::MapMakeConnection {
+            from: MapProject::ground(vec3(500., 500., 0.)),
+            to: MapProject::ground(vec3(600., 500., 0.)),
+            inter: None,
+            pat,
+        };
+        let water = WorldCommand::EditWater(WaterEdit::SetSeaLevel {
+            level_dm: Some(-100),
+        });
+        let tax = WorldCommand::SetTaxRate {
+            zone: ZoneKind::Residential,
+            rate_permille: 200,
+        };
+        sim.apply_commands([&water, &road, &tax]);
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert_eq!(
+            outcomes.rejections_for(1),
+            [("MapMakeConnection", Rejection::WaterWorkLimit)]
+        );
+        assert!(outcomes.accepted.contains(&2));
+        assert_eq!(sim.read::<Replay>().command_count(), opening + 3);
+    }
+
+    #[test]
+    fn tiles_fix_reports_excess_purchase_indices() {
+        let mut sim = game(LandMode::Tiled);
+        let buy = WorldCommand::BuyTile {
+            tile: LandTileId { x: 9, y: 7 },
+        };
+        sim.apply_commands(std::iter::repeat_n(&buy, 258));
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert!(outcomes.accepted.is_empty());
+        assert_eq!(outcomes.tile_purchase(257), outcomes.tile_purchase(256));
+        assert!(outcomes.tile_purchase(257).unwrap().is_err());
+        assert_eq!(outcomes.tile_purchase(258), None);
+    }
+
+    #[test]
+    fn tiles_fix_preview_rejects_occupied_special_site() {
+        let mut sim = game(LandMode::Unrestricted);
+        let build = WorldCommand::MapBuildSpecialBuilding {
+            pos: OBB::new(vec2(1600., 1600.), Vec2::X, 60., 40.),
+            kind: BuildingKind::RailFreightStation(FreightStationPrototypeID::new(
+                "freight-station",
+            )),
+            gen: BuildingGen::NoWalkway {
+                door_pos: Vec2::ZERO,
+            },
+            zone: None,
+            connected_road: None,
+        };
+        assert!(build.preview(&sim).is_ok());
+        sim.apply_commands([&build]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let rejection = build.preview(&sim).unwrap_err();
+        sim.apply_commands([&build]);
+        assert_eq!(
+            sim.read::<CommandOutcomes>().rejections_for(0),
+            [("MapBuildSpecialBuilding", rejection)]
+        );
+    }
+
+    #[test]
+    fn tiles_fix_bounds_nested_command_decode() {
+        let commands = [
+            WorldCommand::SpawnTrain {
+                wagons: vec![prototypes::RollingStockID::new("bogus"); 257],
+                lane: Default::default(),
+                dist: 0.,
+            },
+            WorldCommand::TransitCreateLine {
+                stops: vec![Default::default(); 31],
+            },
+        ];
+        for command in commands {
+            assert!(Bincode::decode::<WorldCommand>(&Bincode::encode(&command).unwrap()).is_err());
+        }
+    }
+
+    #[test]
+    fn tiles_fix_removes_a_building_when_its_locked_cut_is_masked() {
+        use crate::map::{LandOwnership, OwnedTileRect, TileExtent};
+
+        init_test_simulation();
+        let sim = Simulation::new_authored_flat(4, 0).unwrap();
+        let mut map = sim.map_mut();
+        let gen = BuildingGen::NoWalkway {
+            door_pos: Vec2::ZERO,
+        };
+        let place = |map: &mut Map, x, size| {
+            map.build_special_building(
+                &OBB::new(vec2(x, 736.), Vec2::X, size, size),
+                BuildingKind::ExternalTrading,
+                gen,
+                None,
+                None,
+            )
+            .unwrap()
+        };
+        let first = place(&mut map, 995., 10.);
+        let second = place(&mut map, 1011., 20.);
+        map.install_land_ownership(
+            LandOwnership::tiled(
+                TileExtent {
+                    width: 4,
+                    height: 4,
+                },
+                OwnedTileRect {
+                    origin: LandTileId { x: 1, y: 1 },
+                    width: 1,
+                    height: 1,
+                },
+                Default::default(),
+            )
+            .unwrap(),
+        );
+        assert!(map.remove_building(first).is_some());
+        assert!(map.remove_building(second).is_none());
+    }
+
+    #[test]
+    fn tiles_fix_indexed_split_keeps_local_lot_parents_live() {
+        let mut sim = game(LandMode::Tiled);
+        let (original, points) = {
+            let map = sim.map();
+            let road = map
+                .roads()
+                .values()
+                .find(|road| road.has_sidewalks() && road.length() > 500.)
+                .unwrap();
+            (
+                road.id,
+                [0.35, 0.72].map(|t| road.points().point_along(road.length() * t)),
+            )
+        };
+        let projects: Vec<_> = points
+            .into_iter()
+            .flat_map(|pos| {
+                [
+                    MapProject {
+                        pos,
+                        kind: original.into(),
+                    },
+                    MapProject::ground(pos + vec3(0., -125., 0.)),
+                ]
+            })
+            .collect();
+        let pat = LanePatternBuilder::default().build();
+        let command = WorldCommand::MapMakeMultipleConnections(
+            projects,
+            vec![(0, 1, None, pat.clone()), (2, 3, None, pat)],
+        );
+        sim.apply_commands([&command]);
+        let outcomes = sim.read::<CommandOutcomes>();
+        assert_eq!(outcomes.accepted, [0], "{:?}", outcomes.last);
+        assert_eq!(outcomes.link_outcomes(0).len(), 2);
+        let map = sim.map();
+        assert!(map.get(original).is_none());
+        assert!(!map.lots().is_empty());
+        assert!(map.lots().values().all(|lot| map.get(lot.parent).is_some()));
+        drop(map);
+        drop(outcomes);
+        let replay = sim.read::<Replay>().clone();
+        let (mut replayed, mut loader) = Simulation::try_from_replay(replay).unwrap();
+        assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
+        assert_eq!(sim.hashes(), replayed.hashes());
+    }
+
+    #[test]
+    fn tiles_fix_train_tail_must_fit_on_owned_rail() {
+        let mut sim = game(LandMode::Tiled);
+        let road = sim
+            .map_mut()
+            .make_connection(
+                MapProject::ground(vec3(3800., 3940., 0.)),
+                MapProject::ground(vec3(4280., 3940., 0.)),
+                None,
+                &LanePatternBuilder::new().rail(true).build(),
+            )
+            .unwrap()
+            .1;
+        let lane = sim
+            .map()
+            .get(road)
+            .unwrap()
+            .lanes_iter()
+            .find(|(_, kind)| kind.is_rail())
+            .unwrap()
+            .0;
+        let spawn = WorldCommand::SpawnTrain {
+            wagons: vec![
+                prototypes::RollingStockID::new("locomotive"),
+                prototypes::RollingStockID::new("freight-wagon"),
+            ],
+            lane,
+            dist: 5.0,
+        };
+        assert_eq!(spawn.preview(&sim).unwrap_err(), Rejection::InvalidTrain);
+        sim.apply_commands([&spawn]);
+        assert_eq!(
+            sim.read::<CommandOutcomes>().rejections_for(0),
+            [("SpawnTrain", Rejection::InvalidTrain)]
+        );
+        assert!(sim.world().trains.is_empty());
+    }
+
+    #[test]
+    fn tiles_fix_frontage_preparation_charges_candidate_work() {
+        let sim = game(LandMode::Tiled);
+        let map = sim.map();
+        let road = map
+            .roads()
+            .values()
+            .find(|road| road.has_sidewalks() && road.length() < 500.)
+            .unwrap();
+        assert!(map.check_land_frontage_capacity([road], &mut 256).is_err());
+    }
+
+    #[test]
+    fn tiles_fix_decodes_pre_tiles_snapshot_options() {
+        use crate::{SimulationDeser, SimulationSer};
+
+        let sim = game(LandMode::Unrestricted);
+        let bytes = Bincode::encode(&sim).unwrap();
+        let mut legacy: SimulationDeser = Bincode::decode(&bytes).unwrap();
+        legacy.res.remove("land_ownership").unwrap();
+        let opts = *sim.read::<crate::SimulationOptions>();
+        legacy.res.insert(
+            "simoptions".into(),
+            Bincode::encode(&(
+                opts.terrain_size,
+                opts.save_replay,
+                opts.preset,
+                opts.seed,
+                opts.starting_money_bucks,
+                opts.progression,
+            ))
+            .unwrap(),
+        );
+        let bytes = Bincode::encode(&SimulationSer {
+            header: legacy._header,
+            world: &legacy.world,
+            res: legacy.res,
+        })
+        .unwrap();
+        let loaded = Bincode::decode::<Simulation>(&bytes).unwrap();
+        assert_eq!(sim.hashes(), loaded.hashes());
+        assert!(!loaded.map().land_ownership().is_tiled());
+    }
+
+    #[test]
+    fn tiles_fix_rejects_outside_protected_deck() {
+        let sim = game(LandMode::Tiled);
+        let road = sim
+            .map()
+            .land_ownership()
+            .reserves()
+            .find_map(|root| match root {
+                crate::map::ProtectedRoot::Road(crate::map::GatewayRole::Highway, id) => Some(id),
+                _ => None,
+            })
+            .unwrap();
+        sim.map_mut().roads[road].width = 10_000.0;
+        assert!(crate::map::validate_loaded_land(&sim).is_err());
+    }
+
+    #[test]
+    fn tiles_fix_requires_external_and_local_freight_on_the_protected_rail() {
+        let sim = game(LandMode::Tiled);
+        let (id, station) = {
+            let map = sim.map();
+            let external = map.external_train_stations[0];
+            let local = map
+                .buildings()
+                .values()
+                .find(|building| matches!(building.kind, BuildingKind::RailFreightStation(_)))
+                .unwrap();
+            (external, local.kind)
+        };
+        sim.map_mut().buildings[id].kind = station;
+        assert!(crate::map::validate_loaded_land(&sim).is_err());
+    }
+
+    #[test]
+    fn tiles_fix_wire_invalid_edit_cannot_poison_snapshot_or_sidecar() {
+        let mut sim = game(LandMode::Unrestricted);
+        let malformed = WorldCommand::EditWater(WaterEdit::SetSeaLevel {
+            level_dm: Some(i16::MIN),
+        });
+        let tax = WorldCommand::SetTaxRate {
+            zone: ZoneKind::Residential,
+            rate_permille: 200,
+        };
+        sim.apply_commands([&malformed, &tax]);
+        let missing = WorldCommand::EditWater(WaterEdit::RemoveFreshWater {
+            body: crate::map::WaterBodyId(1),
+        });
+        let sea = WorldCommand::EditWater(WaterEdit::SetSeaLevel {
+            level_dm: Some(-100),
+        });
+        let raise = WorldCommand::Terraform {
+            kind: crate::map::TerraformKind::Elevation,
+            center: vec2(7072., 3072.),
+            radius: 48.,
+            amount: 100.,
+            level: 0.,
+            slope: None,
+        };
+        let opening = sim.read::<Replay>().command_count();
+        sim.apply_commands([&missing]);
+        assert!(!sim.read::<CommandOutcomes>().rejections_for(0).is_empty());
+        sim.apply_commands([&sea, &raise]);
+        assert_eq!(
+            sim.read::<CommandOutcomes>().rejections_for(1),
+            [("Terraform", Rejection::WaterWorkLimit)]
+        );
+        assert_eq!(sim.read::<Replay>().command_count(), opening + 3);
+        let root = std::env::temp_dir().join(format!("egregoria-tiles-fix-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let slot = SlotId::new("tiles_fix").unwrap();
+        sim.save_to_slot(&root, &slot, SnapshotRevision::new(1))
+            .unwrap();
+        let snapshot = Simulation::load_from_slot(&root, &slot);
+        let sidecar = Simulation::load_replay_from_slot(&root, &slot);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(sim.hashes(), snapshot.unwrap().hashes());
+        let (mut replayed, mut loader) = Simulation::try_from_replay(sidecar.unwrap()).unwrap();
+        assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
+        assert_eq!(sim.hashes(), replayed.hashes());
+    }
+}

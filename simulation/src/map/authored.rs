@@ -201,8 +201,10 @@ impl Simulation {
             // inputs. Vacant legacy lots are regenerated at fixed frontage stations.
             let roads: Vec<_> = map.roads().keys().collect();
             map.clear_authored_vacant_lots();
+            let mut remaining = super::MAX_WATER_BATCH_WORK;
             for road in roads {
-                map.generate_land_frontage(road);
+                map.generate_land_frontage(road, &mut remaining)
+                    .map_err(|_| LandSetupError::NoBuildableFrontage(spec.owned_rect.origin))?;
             }
             map.rebuild_land_frontage()
                 .map_err(|_| LandSetupError::NoBuildableFrontage(spec.owned_rect.origin))?;

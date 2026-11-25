@@ -213,7 +213,6 @@ impl Map {
         }
         let door = Building::door_position(shape, gen, self.environment());
         self.authorize_site(shape, zone, road, door.xy(), None)?;
-        self.authorize_building_cut(shape)?;
         if let Some(zone) = zone {
             self.authorize_displaced_lots(zone.poly.clone())?;
         } else {
@@ -243,48 +242,6 @@ impl Map {
             for object in self.spatial_map.query(shape, ProjectFilter::LOT) {
                 if let ProjectKind::Lot(id) = object {
                     self.authorize_land_effects(PreparedEffects::Lot(id))?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub(crate) fn authorize_building_cut(&self, shape: &OBB) -> Result<(), LandDenial> {
-        if self.land_ownership().is_tiled() {
-            let cut = shape.expand(25.0);
-            let mut remaining = super::MAX_WATER_BATCH_WORK;
-            self.authorize_cut_nodes(cut.bbox(), 1, &mut remaining, |point| cut.contains(point))?;
-        }
-        Ok(())
-    }
-
-    pub(super) fn authorize_cut_nodes(
-        &self,
-        bounds: AABB,
-        units_per_node: usize,
-        remaining: &mut usize,
-        changes: impl Fn(Vec2) -> bool,
-    ) -> Result<(), LandDenial> {
-        let pitch = super::terrain::CELL_SIZE;
-        let (width, height) = self.environment().size();
-        let resolution = super::TERRAIN_CHUNK_RESOLUTION;
-        let min = (bounds.ll / pitch).ceil().max(Vec2::ZERO);
-        let max = (bounds.ur / pitch).floor().min(vec2(
-            (usize::from(width) * resolution - 1) as f32,
-            (usize::from(height) * resolution - 1) as f32,
-        ));
-        if min.x > max.x || min.y > max.y {
-            return Ok(());
-        }
-        let work = (1 + (max.x - min.x) as usize)
-            .saturating_mul(1 + (max.y - min.y) as usize)
-            .saturating_mul(units_per_node);
-        super::spend_water_work(remaining, work).map_err(|_| LandDenial::WorkLimit)?;
-        for y in min.y as usize..=max.y as usize {
-            for x in min.x as usize..=max.x as usize {
-                let point = vec2(x as f32, y as f32) * pitch;
-                if !self.environment().is_wet_base_node((x, y)) && changes(point) {
-                    self.authorize_land_effects(PreparedEffects::BaseNode((x, y)))?;
                 }
             }
         }

@@ -1,4 +1,4 @@
-use super::height_override::CutHeights;
+use super::height_override::{ConstructionCut, CutHeights};
 use super::terrain::TERRAIN_CHUNK_RESOLUTION;
 use crate::map::electricity_cache::ElectricityCache;
 use crate::map::procgen::gen_exterior_house;
@@ -65,6 +65,12 @@ pub(crate) struct ConnectedRoad {
     pub splits: [Option<RoadSplit>; 2],
 }
 
+pub(crate) struct PreparedSpecialBuilding {
+    building: super::PreparedBuilding,
+    shape: OBB,
+    kind: BuildingKind,
+}
+
 /// Map-side placement validated against a specific live lot and frontage.
 pub(crate) struct PreparedGrowable {
     lot: LotID,
@@ -85,6 +91,7 @@ pub struct Map {
     pub(crate) intersections: Intersections,
     pub(crate) buildings: Buildings,
     pub(crate) lots: Lots,
+    pub(super) lots_by_road: BTreeMap<RoadID, BTreeSet<LotID>>,
     pub(crate) spatial_map: SpatialMap,
     pub(crate) external_train_stations: Vec<BuildingID>,
     pub(crate) lot_origins: BTreeMap<BuildingID, LotOrigin>,
@@ -140,6 +147,7 @@ impl Clone for Map {
         Self {
             land_ownership: self.land_ownership.clone(),
             land_frontage: self.land_frontage.clone(),
+            lots_by_road: self.lots_by_road.clone(),
             roads: self.roads.clone(),
             lanes: self.lanes.clone(),
             intersections: self.intersections.clone(),
@@ -169,6 +177,7 @@ impl Map {
         Self {
             land_ownership: super::LandOwnership::Unrestricted,
             land_frontage: Default::default(),
+            lots_by_road: BTreeMap::new(),
             roads: Roads::default(),
             lanes: Lanes::default(),
             intersections: Intersections::default(),
@@ -214,6 +223,176 @@ impl Map {
     pub(crate) fn install_land_ownership(&mut self, ownership: super::LandOwnership) {
         assert!(!self.land_ownership.is_tiled());
         self.land_ownership = ownership;
+        if self.land_ownership.is_tiled() {
+            for lot in self.lots.values() {
+                self.lots_by_road
+                    .entry(lot.parent)
+                    .or_default()
+                    .insert(lot.id);
+            }
+        }
+    }
+
+    /// Check the commissioned roots against their live geometry and relationships.
+    pub(crate) fn validate_commissioned_reserves(
+        &self,
+        recipe: super::LandRecipe,
+    ) -> Result<(), super::LandSetupError> {
+        use super::{GatewayRole, LandRecipe, LandSetupError, Pathfinder, ProtectedRoot};
+        let land = self.land_ownership();
+        let Some(extent) = land.extent() else {
+            return Ok(());
+        };
+        let bounds = extent.bounds();
+        let contained = |point: Vec3| point.is_finite() && bounds.contains(point.xy());
+        let roots: BTreeSet<_> = land.reserves().collect();
+        for role in [GatewayRole::Highway, GatewayRole::Rail] {
+            let invalid = LandSetupError::InvalidGateway(role);
+            let mut graph = BTreeMap::<_, BTreeSet<_>>::new();
+            for &root in &roots {
+                let ProtectedRoot::Road(root_role, id) = root else {
+                    continue;
+                };
+                if root_role != role {
+                    continue;
+                }
+                let road = self.get(id).ok_or(invalid)?;
+                if !road.width.is_finite()
+                    || road.width <= 0.0
+                    || !road.points().iter().copied().all(contained)
+                    || !super::land_deck_triangles(road).flatten().all(contained)
+                {
+                    return Err(invalid);
+                }
+                let mut has_role_lane = false;
+                for (id, kind) in road.lanes_iter() {
+                    let lane = self.get(id).ok_or(invalid)?;
+                    if lane.parent != road.id
+                        || lane.kind != kind
+                        || !lane.points.iter().copied().all(contained)
+                        || (role == GatewayRole::Rail && !kind.is_rail())
+                        || (role == GatewayRole::Highway && kind.is_rail())
+                    {
+                        return Err(invalid);
+                    }
+                    has_role_lane |= if role == GatewayRole::Rail {
+                        kind.is_rail()
+                    } else {
+                        kind == LaneKind::Driving
+                    };
+                }
+                if !has_role_lane {
+                    return Err(invalid);
+                }
+                for (end, other) in [(road.src, road.dst), (road.dst, road.src)] {
+                    if !roots.contains(&ProtectedRoot::Junction(role, end))
+                        || !self
+                            .get(end)
+                            .is_some_and(|junction| junction.roads.contains(&road.id))
+                    {
+                        return Err(invalid);
+                    }
+                    graph.entry(end).or_default().insert(other);
+                }
+            }
+            let Some((&first, _)) = graph.first_key_value() else {
+                return Err(LandSetupError::MissingGateway(role));
+            };
+            let mut visited = BTreeSet::new();
+            let mut queue = vec![first];
+            while let Some(id) = queue.pop() {
+                if visited.insert(id) {
+                    queue.extend(graph[&id].iter().copied());
+                }
+            }
+            if visited.len() != graph.len() {
+                return Err(invalid);
+            }
+            let mut terminals = Vec::new();
+            for (id, adjacent) in graph {
+                let junction = self.get(id).ok_or(invalid)?;
+                let outline = self.land_junction_outline(id).map_err(|_| invalid)?;
+                if !contained(junction.pos) || outline.iter().any(|&point| !bounds.contains(point))
+                {
+                    return Err(invalid);
+                }
+                if adjacent.len() == 1 {
+                    terminals.push(junction.pos.xy());
+                }
+            }
+            // Native V1 commissions the road and rail end interfaces eight
+            // metres inside the edge. Authored V1 also supports flush ends.
+            const TERMINAL_INSET: f32 = 8.01;
+            let west = terminals.iter().any(|point| point.x <= TERMINAL_INSET);
+            let east = terminals
+                .iter()
+                .any(|point| point.x >= bounds.ur.x - TERMINAL_INSET);
+            let south = terminals.iter().any(|point| point.y <= TERMINAL_INSET);
+            let north = terminals
+                .iter()
+                .any(|point| point.y >= bounds.ur.y - TERMINAL_INSET);
+            if !(west && east || matches!(recipe, LandRecipe::AuthoredV1 { .. }) && south && north)
+            {
+                return Err(invalid);
+            }
+        }
+
+        let role = GatewayRole::Freight;
+        let invalid = LandSetupError::InvalidGateway(role);
+        let mut external = false;
+        let mut local = false;
+        for root in roots {
+            let ProtectedRoot::Building(GatewayRole::Freight, id) = root else {
+                continue;
+            };
+            let building = self.get(id).ok_or(invalid)?;
+            if !contained(building.door_pos)
+                || !building.height.is_finite()
+                || building
+                    .obb
+                    .corners
+                    .iter()
+                    .any(|&point| !bounds.contains(point))
+                || building
+                    .zone
+                    .as_ref()
+                    .is_some_and(|zone| zone.poly.iter().any(|&point| !bounds.contains(point)))
+            {
+                return Err(invalid);
+            }
+            let center = building.obb.center().z(building.height);
+            let boarding = match building.kind {
+                BuildingKind::ExternalTrading if self.external_train_stations.contains(&id) => {
+                    center
+                }
+                BuildingKind::RailFreightStation(_) => crate::souls::freight_station::train_stop(
+                    &geom::Transform::new_dir(center, building.obb.axis()[1].z(0.0).normalize()),
+                ),
+                _ => return Err(invalid),
+            };
+            let lane = super::PathKind::Rail
+                .nearest_lane(self, boarding)
+                .and_then(|id| self.get(id))
+                .filter(|lane| {
+                    land.reserves()
+                        .any(|root| root == ProtectedRoot::Road(GatewayRole::Rail, lane.parent))
+                })
+                .ok_or(invalid)?;
+            let rail = lane.points.project(boarding);
+            match building.kind {
+                BuildingKind::ExternalTrading if building.obb.contains(rail.xy()) => {
+                    external = true
+                }
+                BuildingKind::RailFreightStation(_) if rail.is_close(boarding, 120.0) => {
+                    local = true
+                }
+                _ => return Err(invalid),
+            }
+        }
+        if !external || !local {
+            return Err(LandSetupError::MissingGateway(role));
+        }
+        Ok(())
     }
 
     pub(crate) fn buy_prepared_tile(&mut self, tile: super::LandTileId) {
@@ -378,13 +557,44 @@ impl Map {
             .dispatch_all_terrain(self.environment.chunks().map(|(id, _)| id));
     }
 
+    pub(crate) fn authorize_building_removal(
+        &self,
+        id: BuildingID,
+    ) -> Result<(), super::LandDenial> {
+        self.authorize_land_effects(super::PreparedEffects::Building(id))?;
+        let mut remaining = super::MAX_WATER_BATCH_WORK;
+        self.authorize_projected_construction_cuts(
+            &BTreeSet::from([id.into()]),
+            &[],
+            &mut remaining,
+        )
+        .map_err(|error| match error {
+            WaterEditError::LandDenied(reason) => reason,
+            _ => super::LandDenial::WorkLimit,
+        })
+    }
+
+    pub(crate) fn authorize_building_grade(
+        &self,
+        shape: OBB,
+        height: f32,
+    ) -> Result<(), super::LandDenial> {
+        let mut remaining = super::MAX_WATER_BATCH_WORK;
+        self.authorize_projected_construction_cuts(
+            &BTreeSet::new(),
+            &[ConstructionCut::Building(shape, height)],
+            &mut remaining,
+        )
+        .map_err(|error| match error {
+            WaterEditError::LandDenied(reason) => reason,
+            _ => super::LandDenial::WorkLimit,
+        })
+    }
+
     pub fn remove_building(&mut self, b: BuildingID) -> Option<Building> {
         info!("remove_building {:?}", b);
 
-        self.authorize_land_effects(super::PreparedEffects::Building(b))
-            .ok()?;
-        self.authorize_building_cut(&self.buildings.get(b)?.obb)
-            .ok()?;
+        self.authorize_building_removal(b).ok()?;
         let b = self.buildings.remove(b)?;
         self.water_services.building_removed(&self.environment, b.id);
         queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &b);
@@ -741,7 +951,10 @@ impl Map {
         prepared: Option<PreparedTopologyEdit>,
         mut work: Option<&mut WaterTopologyWork>,
     ) -> Result<ConnectionOutcome, ConnectionError> {
-        let merges = prepared.as_ref().and_then(|edit| edit.merges);
+        let merges = prepared.as_ref().and_then(|edit| {
+            edit.merges
+                .map(|ends| [0, 1].map(|end| ends[end].then_some(edit.merge_frontage_work[end])))
+        });
         let connected = self.commit_prepared_connection(from, to, interpoint, pattern, prepared)?;
         let mut road = connected.road;
         let mut source_side = connected.src;
@@ -752,11 +965,11 @@ impl Map {
         }
         for (end, junction) in [connected.src, connected.dst].into_iter().enumerate() {
             let merged = if let Some(merges) = merges {
-                if merges[end] {
+                if let Some(frontage_work) = merges[end] {
                     let [first, second] = *self.intersections[junction].roads else {
                         unreachable!("prepared merge has two arms");
                     };
-                    self.merge_road_checked(first, second, None, true)
+                    self.merge_road_checked(first, second, None, Some(frontage_work))
                         .map(|road| road.map(|road| ([first, second], road)))
                 } else {
                     continue;
@@ -855,6 +1068,7 @@ impl Map {
             let length = connection_profile_length_bound(from.pos.xy(), to.pos.xy(), interpoint);
             super::generated_frontage_work(length, pattern, check_water)
         });
+        let mut tiled_frontage = prepared.as_ref().map_or(0, |edit| edit.frontage_work);
         let profile = prepared.map(|prepared| (prepared.profile, prepared.elevated));
         let road = self
             .connect_with_span(src, dst, pattern, connection_segment, None, profile)
@@ -863,7 +1077,18 @@ impl Map {
         self.invalidate(src);
         self.invalidate(dst);
         // Frontage checks use the deck clipped by the finalized junction interfaces.
-        Lot::generate_along_final_road(self, road, frontage_work);
+        if self.land_ownership.is_tiled() {
+            let children = [&from_split, &to_split]
+                .into_iter()
+                .filter_map(Option::as_ref)
+                .flat_map(|split| split.roads);
+            for road in children.chain(std::iter::once(road)) {
+                self.generate_land_frontage(road, &mut tiled_frontage)
+                    .expect("prepared connection reserved its frontage");
+            }
+        } else {
+            Lot::generate_along_final_road(self, road, frontage_work);
+        }
 
         info!("connected {:?} {:?}: {:?}", src, dst, road);
         Ok(ConnectedRoad {
@@ -906,7 +1131,7 @@ impl Map {
                     work.spend_profile_samples(samples);
                 }
                 return self
-                    .merge_road_checked(first, second, work, false)
+                    .merge_road_checked(first, second, work, None)
                     .map(|merged| merged.map(|new| ([first, second], new)));
             }
         }
@@ -946,7 +1171,9 @@ impl Map {
         for &id in replaced_roads {
             let road = &self.roads[id];
             added_lanes = added_lanes.saturating_add(road.n_lanes());
-            spend_water_work(remaining, self.lots.len().saturating_mul(3))?;
+            if !self.land_ownership.is_tiled() {
+                spend_water_work(remaining, self.lots.len().saturating_mul(3))?;
+            }
             if self.environment.strict_water_siting() {
                 points = points.max(profile_sample_bound(road.length() + new_length));
                 spend_water_work(remaining, super::reassigned_frontage_work(self, id, points))?;
@@ -1080,48 +1307,74 @@ impl Map {
         zone: Option<Zone>,
         connected_road: Option<RoadID>,
     ) -> Option<BuildingID> {
-        let zone = match zone {
-            Some(zone) => Some(zone.normalized()?),
-            None => None,
-        };
-        if !Building::valid_footprint(obb, gen) {
-            return None;
-        }
-        self.authorize_new_building(obb, gen, zone.as_ref(), connected_road)
+        let prepared = self
+            .prepare_special_building(*obb, kind, gen, zone, connected_road)
             .ok()?;
-        super::validate_water_service_placement(self, kind, *obb, connected_road).ok()?;
-        if self.building_overlaps(*obb) {
-            log::warn!("did not build {:?}: building overlaps", kind);
-            return None;
-        }
-        log::info!(
-            "build special {:?} with shape {:?} and gen {:?} and zone {:?}",
-            kind,
-            obb,
-            gen,
-            zone
-        );
+        Some(self.commit_special_building(prepared))
+    }
 
-        let Some(id) = Building::make(
-            &mut self.buildings,
-            &mut self.spatial_map,
-            &mut self.electricity,
-            &mut self.roads,
+    pub(crate) fn prepare_special_building(
+        &self,
+        obb: OBB,
+        kind: BuildingKind,
+        gen: BuildingGen,
+        zone: Option<Zone>,
+        connected_road: Option<RoadID>,
+    ) -> Result<PreparedSpecialBuilding, crate::world_command::Rejection> {
+        use crate::world_command::Rejection;
+        let zone = zone
+            .map(|zone| zone.normalized().ok_or(Rejection::InvalidZone))
+            .transpose()?;
+        if !Building::valid_footprint(&obb, gen) {
+            return Err(Rejection::InvalidBuilding);
+        }
+        self.authorize_new_building(&obb, gen, zone.as_ref(), connected_road)?;
+        if !Building::dry_footprint(&self.environment, &obb, zone.as_ref()) {
+            return Err(Rejection::WetFootprint);
+        }
+        super::validate_water_service_placement(self, kind, obb, connected_road)
+            .map_err(Rejection::WaterServiceSite)?;
+        if connected_road.is_some_and(|road| !self.roads.contains_key(road)) {
+            return Err(Rejection::MissingReference);
+        }
+        if self.building_overlaps(obb) {
+            return Err(Rejection::BuildingOverlap);
+        }
+        let building = Building::prepare(
             &self.environment,
-            *obb,
+            obb,
             kind,
             gen,
             zone,
             connected_road,
-        ) else {
-            self.check_invariants();
-            return None;
-        };
+            None,
+        )
+        .ok_or(Rejection::InvalidBuilding)?;
+        self.authorize_building_grade(obb, building.base_height())?;
+        Ok(PreparedSpecialBuilding {
+            building,
+            shape: obb,
+            kind,
+        })
+    }
 
-        self.clean_lots_inner(self.spatial_map.query(obb, ProjectFilter::LOT).collect());
-
-        self.clear_construction_trees(obb.expand(10.0));
-
+    pub(crate) fn commit_special_building(
+        &mut self,
+        prepared: PreparedSpecialBuilding,
+    ) -> BuildingID {
+        let PreparedSpecialBuilding {
+            building,
+            shape,
+            kind,
+        } = prepared;
+        let id = building.insert(
+            &mut self.buildings,
+            &mut self.spatial_map,
+            &mut self.electricity,
+            &mut self.roads,
+        );
+        self.clean_lots_inner(self.spatial_map.query(shape, ProjectFilter::LOT).collect());
+        self.clear_construction_trees(shape.expand(10.0));
         queue_construction_cut(
             &mut self.pending_construction_cuts,
             &self.environment,
@@ -1137,7 +1390,7 @@ impl Map {
         }
 
         self.check_invariants();
-        Some(id)
+        id
     }
 
     pub fn build_house(&mut self, lot_id: LotID) -> Option<BuildingID> {
@@ -1201,6 +1454,8 @@ impl Map {
             appearance,
         )
         .ok_or(GrowableLotError::InfeasibleGrade)?;
+        self.authorize_building_grade(lot.shape, building.base_height())
+            .map_err(GrowableLotError::LandDenied)?;
         Ok(PreparedGrowable {
             lot: lot.id,
             frontage: lot.parent,
@@ -1227,6 +1482,8 @@ impl Map {
         }
         lot.check_growable_footprint(self, prepared.generator)?;
         self.authorize_new_building(&lot.shape, prepared.generator, None, Some(lot.parent))
+            .map_err(GrowableLotError::LandDenied)?;
+        self.authorize_building_grade(lot.shape, prepared.building.base_height())
             .map_err(GrowableLotError::LandDenied)?;
         if self.construction_grade_revision() != prepared.grade_revision {
             return Err(GrowableLotError::InfeasibleGrade);
@@ -1378,25 +1635,37 @@ impl Map {
         {
             return None;
         }
-        let id = Building::make(
-            &mut self.buildings,
-            &mut self.spatial_map,
-            &mut self.electricity,
-            &mut self.roads,
+        if !Building::valid_footprint(&lot.shape, gen)
+            || !Building::dry_footprint(&self.environment, &lot.shape, None)
+        {
+            return None;
+        }
+        let building = Building::prepare(
             &self.environment,
             lot.shape,
             kind,
             gen,
             None,
             Some(lot.parent),
+            None,
         )?;
+        self.authorize_building_grade(lot.shape, building.base_height())
+            .ok()?;
+        let id = building.insert(
+            &mut self.buildings,
+            &mut self.spatial_map,
+            &mut self.electricity,
+            &mut self.roads,
+        );
 
         self.consume_building_lot(lot_id, id, growable);
         Some(id)
     }
 
     fn consume_building_lot(&mut self, lot_id: LotID, id: BuildingID, growable: bool) {
-        let lot = self.lots.remove(lot_id).expect("building lot still exists");
+        let lot = self
+            .remove_lot_record(lot_id)
+            .expect("building lot still exists");
         self.subscribers.dispatch(UpdateType::Road, &lot);
         self.spatial_map.remove(lot_id);
         queue_construction_cut(
@@ -1452,6 +1721,51 @@ impl Map {
         self.clean_lots_inner(self.lots.keys().map(ProjectKind::Lot).collect());
     }
 
+    pub(super) fn road_lot_ids(&self, road: RoadID) -> Vec<LotID> {
+        if self.land_ownership.is_tiled() {
+            self.lots_by_road
+                .get(&road)
+                .into_iter()
+                .flatten()
+                .copied()
+                .collect()
+        } else {
+            self.lots
+                .values()
+                .filter(|lot| lot.parent == road)
+                .map(|lot| lot.id)
+                .collect()
+        }
+    }
+
+    pub(super) fn track_road_lot(&mut self, road: RoadID, id: LotID) {
+        if self.land_ownership.is_tiled() {
+            self.lots_by_road.entry(road).or_default().insert(id);
+        }
+    }
+
+    fn untrack_road_lot(&mut self, road: RoadID, id: LotID) {
+        if let Some(lots) = self.lots_by_road.get_mut(&road) {
+            lots.remove(&id);
+            if lots.is_empty() {
+                self.lots_by_road.remove(&road);
+            }
+        }
+    }
+
+    fn reparent_lot(&mut self, id: LotID, road: RoadID) {
+        let previous = self.lots[id].parent;
+        self.lots[id].parent = road;
+        self.untrack_road_lot(previous, id);
+        self.track_road_lot(road, id);
+    }
+
+    pub(super) fn remove_lot_record(&mut self, id: LotID) -> Option<Lot> {
+        let lot = self.lots.remove(id)?;
+        self.untrack_road_lot(lot.parent, id);
+        Some(lot)
+    }
+
     fn clean_lots_inner(&mut self, mut to_clean: Vec<ProjectKind>) {
         // Slot reuse depends on removal order, but the spatial index is rebuilt on load.
         to_clean.sort_unstable();
@@ -1461,7 +1775,7 @@ impl Map {
                 self.subscribers.dispatch(UpdateType::Road, &self.lots[id]);
 
                 unwrap_contlog!(
-                    &self.lots.remove(id),
+                    &self.remove_lot_record(id),
                     "Lot was present in spatial map but not in Lots struct"
                 );
             }
@@ -1482,15 +1796,12 @@ impl Map {
             self.parking.remove_spots(id);
         }
 
-        let smap = &mut self.spatial_map;
-        self.lots.retain(|_, lot| {
-            let to_remove = lot.parent == road_id;
-            if to_remove {
-                self.subscribers.dispatch(UpdateType::Road, lot);
-                smap.remove(lot.id);
-            }
-            !to_remove
-        });
+        let lots = self
+            .road_lot_ids(road_id)
+            .into_iter()
+            .map(ProjectKind::Lot)
+            .collect();
+        self.clean_lots_inner(lots);
 
         self.invalidate(road.src);
         self.invalidate(road.dst);
@@ -1882,8 +2193,6 @@ impl Map {
         let r1 = self.roads.get(r1)?;
         let r2 = self.roads.get(r2)?;
 
-        let spatial = &mut self.spatial_map;
-
         for b in &r.connected_buildings {
             let b = self.buildings.get_mut(*b)?;
 
@@ -1901,25 +2210,26 @@ impl Map {
                 .building_changed(&self.environment, &self.roads, b);
         }
 
-        self.lots.retain(|_, lot| {
-            if lot.parent != split_road_id {
-                return true;
-            }
+        for id in self.road_lot_ids(split_road_id) {
+            let lot = &self.lots[id];
             let p = lot.shape.corners[0].z(lot.height);
-            let d1 = r1.points.project(p).distance(p);
-            let d2 = r2.points.project(p).distance(p);
-            let (road, distance) = if d1 < d2 { (r1, d1) } else { (r2, d2) };
+            let d1 = self.roads[roads[0]].points.project(p).distance(p);
+            let d2 = self.roads[roads[1]].points.project(p).distance(p);
+            let (parent, distance) = if d1 < d2 {
+                (roads[0], d1)
+            } else {
+                (roads[1], d2)
+            };
+            let road = &self.roads[parent];
             if frontage_blocked
                 || distance >= road.width * 0.5 + 1.5
                 || !Lot::has_dry_frontage(&self.environment, road, &lot.shape)
             {
-                self.subscribers.dispatch(UpdateType::Road, lot);
-                spatial.remove(lot.id);
-                return false;
+                self.clean_lots_inner(vec![id.into()]);
+            } else {
+                self.reparent_lot(id, parent);
             }
-            lot.parent = road.id;
-            true
-        });
+        }
 
         for b in r.connected_buildings {
             let b = &self.buildings[b];
@@ -1929,11 +2239,6 @@ impl Map {
             self.electricity.add_edge(b.id, road_id);
         }
 
-        if self.land_ownership.is_tiled() {
-            for road in roads {
-                self.generate_land_frontage(road);
-            }
-        }
         Some(RoadSplit {
             original: split_road_id,
             junction: id,
@@ -1945,7 +2250,7 @@ impl Map {
         let mut work = self
             .needs_topology_preparation()
             .then(WaterTopologyWork::new);
-        self.merge_road_checked(road1, road2, work.as_mut(), false)
+        self.merge_road_checked(road1, road2, work.as_mut(), None)
             .ok()
             .flatten()
     }
@@ -1955,7 +2260,7 @@ impl Map {
         road1: RoadID,
         road2: RoadID,
         work: Option<&mut WaterTopologyWork>,
-        validated: bool,
+        prepared_frontage: Option<usize>,
     ) -> Result<Option<RoadID>, ConnectionError> {
         let r1 = self
             .roads
@@ -2013,12 +2318,15 @@ impl Map {
             );
 
         let check_water = self.environment.strict_water_siting();
-        if !validated && (self.land_ownership.is_tiled() || check_water || work.is_some()) {
+        let mut frontage_work = prepared_frontage.unwrap_or_default();
+        if prepared_frontage.is_none()
+            && (self.land_ownership.is_tiled() || check_water || work.is_some())
+        {
             if self.intersections[same_inter].roads.len() != 2 {
                 return Ok(None);
             }
             let work = work.ok_or(ConnectionError::WorkLimit)?;
-            super::prepare_merge(
+            frontage_work = super::prepare_merge(
                 self,
                 road1,
                 road2,
@@ -2085,28 +2393,31 @@ impl Map {
         self.invalidate(r1_extremity);
         self.invalidate(r2_extremity);
 
-        let new_r = &self.roads[new_id];
-        self.lots.retain(|_, lot| {
-            if lot.parent != road1 && lot.parent != road2 {
-                return true;
-            }
+        let mut reassigned = self.road_lot_ids(road1);
+        reassigned.extend(self.road_lot_ids(road2));
+        reassigned.sort_unstable();
+        for id in reassigned {
             if frontage_blocked
-                || !Lot::has_dry_frontage(&self.environment, new_r, &lot.shape)
+                || !Lot::has_dry_frontage(
+                    &self.environment,
+                    &self.roads[new_id],
+                    &self.lots[id].shape,
+                )
             {
-                self.subscribers.dispatch(UpdateType::Road, lot);
-                self.spatial_map.remove(lot.id);
-                return false;
+                self.clean_lots_inner(vec![id.into()]);
+            } else {
+                self.reparent_lot(id, new_id);
             }
-            lot.parent = new_id;
-            true
-        });
+        }
+        let new_r = &self.roads[new_id];
         for &id in &new_r.connected_buildings {
             self.water_services
                 .building_changed(&self.environment, &self.roads, &self.buildings[id]);
         }
 
         if self.land_ownership.is_tiled() {
-            self.generate_land_frontage(new_id);
+            self.generate_land_frontage(new_id, &mut frontage_work)
+                .expect("prepared merge reserved its frontage");
         }
         Ok(Some(new_id))
     }
@@ -2158,6 +2469,7 @@ impl Map {
             &mut work.geometry(),
         )
         .ok()?;
+        let mut tiled_frontage = prepared.frontage_work;
         let id = self.connect_with_span(
             src_id,
             dst_id,
@@ -2169,7 +2481,12 @@ impl Map {
         self.invalidate(src_id);
         self.invalidate(dst_id);
         if gen_lots {
-            Lot::generate_along_final_road(self, id, frontage_work);
+            if self.land_ownership.is_tiled() {
+                self.generate_land_frontage(id, &mut tiled_frontage)
+                    .expect("prepared road reserved its frontage");
+            } else {
+                Lot::generate_along_final_road(self, id, frontage_work);
+            }
         }
         Some(id)
     }

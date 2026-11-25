@@ -178,7 +178,7 @@ fn compare_branches(ctx: &mut ScenarioCtx) -> Result<Simulation, String> {
 }
 
 fn elapsed_tick(sim: &mut Simulation) -> u64 {
-    let (_, resources) = sim.world_res();
+    let (_, resources) = sim.unrestricted_world_res().unwrap();
     simulation::map_dynamic::transit::elapsed_ticks(resources).0
 }
 

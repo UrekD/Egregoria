@@ -68,7 +68,10 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         ctx.run_ticks(2 * TICKS_PER_BUDGET_DAY);
     }
 
-    let now = simulation::map_dynamic::transit::elapsed_ticks(ctx.sim.world_res().1).0;
+    let now = simulation::map_dynamic::transit::elapsed_ticks(
+        ctx.sim.unrestricted_world_res().unwrap().1,
+    )
+    .0;
     let offset = now % TICKS_PER_BUDGET_DAY;
     if offset != 0 {
         ctx.run_ticks(TICKS_PER_BUDGET_DAY - offset);
