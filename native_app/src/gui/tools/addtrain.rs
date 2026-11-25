@@ -1,4 +1,4 @@
-use crate::gui::{PotentialCommands, Tool};
+use crate::gui::{overlays::land_tiles::preview_edit, PotentialCommands, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
@@ -64,6 +64,12 @@ pub fn addtrain(sim: &Simulation, uiworld: &UiWorld) {
     let dist = nearbylane.points.length_at_proj(proj);
 
     let trainlength = state.total_lenght + 1.0;
+    let tiled = map.land_ownership().extent().is_some();
+    let cmd = WorldCommand::SpawnTrain {
+        wagons: state.wagons.clone(),
+        lane: nearbylane.id,
+        dist,
+    };
 
     let mut drawtrain = |col: Color| {
         wagons_positions_for_render(&state.wagons, &nearbylane.points, dist).for_each(
@@ -74,18 +80,12 @@ pub fn addtrain(sim: &Simulation, uiworld: &UiWorld) {
         );
     };
 
-    if dist <= trainlength {
+    if (!tiled && dist <= trainlength) || !preview_edit(sim, uiworld, &cmd) {
         drawtrain(simulation::colors().gui_danger);
         return;
     }
 
     drawtrain(simulation::colors().gui_primary);
-
-    let cmd = WorldCommand::SpawnTrain {
-        wagons: state.wagons.clone(),
-        lane: nearbylane.id,
-        dist,
-    };
 
     if inp.just_act.contains(&InputAction::Select) {
         commands.push(cmd);

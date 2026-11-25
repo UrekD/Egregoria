@@ -384,6 +384,13 @@ impl State {
             &ctx.input,
         );
         let view_input = session::view_input(&self.uiw) && !session::modal(&self.uiw);
+        let land_tiles_enabled = !ctx.keybind_mode && session::world_interaction(&self.uiw);
+        let land_tiles_pressed = self.uiw.write::<InputMap>().land_tiles_pressed(
+            &ctx.input,
+            land_tiles_enabled && !ctx.egui.last_kb_captured,
+            land_tiles_enabled && !ctx.egui.last_mouse_captured,
+        );
+        land_tiles::latch_shortcut(&self.uiw, land_tiles_enabled, land_tiles_pressed);
         if view_input {
             let replaying = self.uiw.read::<SaveLoadState>().is_replaying();
             self.uiw.write::<InputMap>().prepare_frame(
@@ -438,6 +445,7 @@ impl State {
         let interaction = view_input && session::world_interaction(&self.uiw);
         if interaction && land_tiles::shortcut(&self.uiw, sim) {
             self.deferred_input.clear();
+            self.bulldozer_view = None;
         }
         if interaction {
             let mut sample = self.sample_world_input(ctx);

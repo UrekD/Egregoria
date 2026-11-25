@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use geom::{Intersect, Vec3, OBB};
+use geom::{Intersect, Vec2, Vec3, OBB};
 use slotmapd::Key;
 
 use super::{
     candidate_tiles, spend_water_work, Building, LandDenial, LandTileId, Lot, LotLayout, Map,
-    RoadID, UpdateType, WaterFootprint, FRONTAGE_HEIGHT_TOLERANCE_M,
+    ProjectFilter, ProjectKind, RoadID, UpdateType, WaterFootprint, FRONTAGE_HEIGHT_TOLERANCE_M,
 };
 use crate::world_command::Rejection;
 
@@ -219,6 +219,66 @@ impl Map {
         Ok(selected
             .into_iter()
             .map(|(key, site)| (key.0, site.shape, site.shoulder)))
+    }
+
+    /// The access edge of each newly prepared frontage site, plus nearby mutable
+    /// street ends facing the tile across a dry, owned-or-purchased corridor.
+    pub fn preview_land_approaches(&self, tile: LandTileId) -> Result<Vec<Vec2>, Rejection> {
+        let land = self.land_ownership();
+        let Some(bounds) = land.tile_bounds(tile).filter(|_| !land.owns(tile)) else {
+            return Ok(Vec::new());
+        };
+        let mut remaining = super::MAX_WATER_BATCH_WORK;
+        let PreparedFrontage(sites) = self.prepare_purchase_frontage(tile, &mut remaining)?;
+        let mut markers: Vec<_> = sites
+            .into_iter()
+            .map(|(_, shape, _)| (shape.corners[0] + shape.corners[1]) * 0.5)
+            .collect();
+
+        const STREET_END_REACH: f32 = 128.0;
+        let mut sockets = BTreeSet::new();
+        for object in self
+            .spatial_map
+            .construction_candidates(bounds.expand(STREET_END_REACH), ProjectFilter::INTER)
+        {
+            spend_water_work(&mut remaining, 1).map_err(|_| LandDenial::WorkLimit)?;
+            if let ProjectKind::Intersection(id) = object {
+                sockets.insert(id);
+            }
+        }
+        for id in sockets {
+            let Some(junction) = self.get(id) else {
+                continue;
+            };
+            let [road] = junction.roads.as_slice() else {
+                continue;
+            };
+            let Some(road) = self.get(*road) else {
+                continue;
+            };
+            let start = junction.pos.xy();
+            if !land.tile_at(start).is_some_and(|start| land.owns(start))
+                || self.mutable_object(id.into()).is_err()
+                || !Lot::allows_frontage(self, road)
+                || road.elevated_span()
+            {
+                continue;
+            }
+            let axis = -road.dir_from(id);
+            let end = start + axis * STREET_END_REACH;
+            if land.tile_at(end) != Some(tile) {
+                continue;
+            }
+            let corridor = OBB::new((start + end) * 0.5, axis, STREET_END_REACH, road.width);
+            if self
+                .authorize_land_footprint(&corridor.corners, Some(tile))
+                .is_ok()
+                && Building::dry_footprint(self.environment(), &corridor, None)
+            {
+                markers.push(start);
+            }
+        }
+        Ok(markers)
     }
 
     pub(crate) fn prepare_purchase_frontage(

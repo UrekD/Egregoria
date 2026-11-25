@@ -159,17 +159,41 @@ impl ZoneGrid {
         areas: &[OBB],
         kind: Option<ZoneKind>,
         density: Density,
-        mut owns: impl FnMut(ZoneCellCoord) -> bool,
+        owns: impl FnMut(ZoneCellCoord) -> bool,
     ) -> Result<EligiblePaintCells, ZonePaintError> {
+        Self::prepare_paint_stroke(map, areas, kind, density, owns).map(|(cells, _)| cells)
+    }
+
+    pub fn preview_paint_stroke(
+        map: &Map,
+        areas: &[OBB],
+        kind: Option<ZoneKind>,
+        density: Density,
+    ) -> Result<(EligiblePaintCells, Option<ZonePaintError>), ZonePaintError> {
+        Self::prepare_paint_stroke(map, areas, kind, density, |_| true)
+    }
+
+    fn prepare_paint_stroke(
+        map: &Map,
+        areas: &[OBB],
+        kind: Option<ZoneKind>,
+        density: Density,
+        mut owns: impl FnMut(ZoneCellCoord) -> bool,
+    ) -> Result<(EligiblePaintCells, Option<ZonePaintError>), ZonePaintError> {
         let replacement = Self::paint_replacement(kind, density)?;
-        let mut cells: Vec<_> = areas
-            .iter()
-            .filter_map(|area| Self::prepare_cells(map, area, replacement, &mut owns).ok())
-            .flat_map(|stamp| stamp.cells)
-            .collect();
+        let mut cells = Vec::new();
+        let mut first_denial = None;
+        for area in areas {
+            match Self::prepare_cells(map, area, replacement, &mut owns) {
+                Ok(stamp) => cells.extend(stamp.cells),
+                Err(denial) => {
+                    first_denial.get_or_insert(denial);
+                }
+            }
+        }
         cells.sort_unstable();
         cells.dedup();
-        Ok(EligiblePaintCells { cells, replacement })
+        Ok((EligiblePaintCells { cells, replacement }, first_denial))
     }
 
     pub fn bounded_paint_cells(

@@ -1,9 +1,9 @@
 use geom::Color;
-use simulation::map_dynamic::transit::validate;
 use simulation::map_dynamic::{LineID, StopID, Transit};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 
+use crate::gui::overlays::land_tiles::preview_edit;
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
@@ -38,17 +38,23 @@ impl LineDraft {
     }
 
     pub(super) fn select_stop(&mut self, stop: StopID) -> Option<WorldCommand> {
-        if self.stops.first() == Some(&stop) && self.stops.len() >= 2 {
-            let stops = self.stops.clone();
-            return Some(match self.editing {
-                Some(line) => WorldCommand::TransitEditLine { line, stops },
-                None => WorldCommand::TransitCreateLine { stops },
-            });
+        if let Some(command) = self.close_command(stop) {
+            return Some(command);
         }
         if self.stops.len() < MAX_STOPS && !self.stops.contains(&stop) {
             self.stops.push(stop);
         }
         None
+    }
+    fn close_command(&self, stop: StopID) -> Option<WorldCommand> {
+        if self.stops.first() != Some(&stop) || self.stops.len() < 2 {
+            return None;
+        }
+        let stops = self.stops.clone();
+        Some(match self.editing {
+            Some(line) => WorldCommand::TransitEditLine { line, stops },
+            None => WorldCommand::TransitCreateLine { stops },
+        })
     }
 }
 
@@ -68,13 +74,18 @@ pub(super) fn update(sim: &Simulation, uiworld: &UiWorld, draft: &mut LineDraft)
     let input = uiworld.read::<InputMap>();
     let hovered = input.unprojected.and_then(|pos| stop_at(&transit, pos));
 
+    let closing = hovered.and_then(|stop| draft.close_command(stop));
+    let colors = simulation::colors();
+    let valid = closing
+        .as_ref()
+        .is_none_or(|command| preview_edit(sim, uiworld, command));
+    let color = if valid {
+        colors.gui_primary
+    } else {
+        colors.gui_danger
+    };
     let mut draw = uiworld.write::<ImmediateDraw>();
-    draw_stops(
-        &transit,
-        &mut draw,
-        hovered,
-        simulation::colors().gui_primary,
-    );
+    draw_stops(&transit, &mut draw, hovered, color);
 
     let point = |stop| transit.stops.get(stop).map(|stop| stop.walk_pos.up(1.0));
     let points: Vec<_> = draft.stops.iter().copied().filter_map(point).collect();
@@ -96,16 +107,13 @@ pub(super) fn update(sim: &Simulation, uiworld: &UiWorld, draft: &mut LineDraft)
     };
     if let (Some(&last), Some(next)) = (points.last(), point(stop)) {
         if last.distance2(next) > 0.01 {
-            draw.line(last, next, 1.5)
-                .color(simulation::colors().gui_primary.a(0.65));
+            draw.line(last, next, 1.5).color(color.a(0.65));
         }
     }
 
-    if input.just_act.contains(&InputAction::Select) {
+    if valid && input.just_act.contains(&InputAction::Select) {
         if let Some(command) = draft.select_stop(stop) {
-            if validate(sim, &command).is_ok() {
-                draft.cancel();
-            }
+            draft.cancel();
             uiworld.commands().push(command);
         }
     }

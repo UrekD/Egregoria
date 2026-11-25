@@ -1,11 +1,12 @@
 use geom::{Color, Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use simulation::map::{LaneKind, Map, ProjectFilter, ProjectKind};
-use simulation::map_dynamic::transit::validate;
+use simulation::map_dynamic::transit::preview_stop;
 use simulation::map_dynamic::{StopID, Transit};
 use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 
+use crate::gui::overlays::land_tiles::{preview_edit, show_edit_error};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
@@ -119,14 +120,21 @@ pub(super) fn update(sim: &Simulation, uiworld: &UiWorld, removing: bool) {
         .filter(|_| removing)
         .and_then(|pos| stop_at(&transit, pos));
     let colors = simulation::colors();
-    draw_stops(&transit, &mut draw, hovered, colors.gui_danger);
-
     let selected = input.just_act.contains(&InputAction::Select);
+    let removal = hovered.map(|stop| WorldCommand::TransitRemoveStop { stop });
+    let can_remove = removal
+        .as_ref()
+        .is_some_and(|command| preview_edit(sim, uiworld, command));
+    let hover_color = if can_remove {
+        colors.gui_danger
+    } else {
+        colors.gui_disabled
+    };
+    draw_stops(&transit, &mut draw, hovered, hover_color);
+
     if removing {
-        if let Some(stop) = hovered.filter(|_| selected) {
-            uiworld
-                .commands()
-                .push(WorldCommand::TransitRemoveStop { stop });
+        if let Some(command) = removal.filter(|_| selected && can_remove) {
+            uiworld.commands().push(command);
         }
         return;
     }
@@ -143,13 +151,21 @@ pub(super) fn update(sim: &Simulation, uiworld: &UiWorld, removing: bool) {
         pos: preview.berth,
         dir: preview.dir,
     };
-    let color = if validate(sim, &command).is_ok() {
-        colors.gui_primary
-    } else {
-        colors.gui_danger
-    };
-    preview.draw(&mut draw, color);
-    if selected {
-        uiworld.commands().push(command);
+    match preview_stop(sim, preview.berth, preview.dir) {
+        Ok((walk, berth, dir)) => {
+            StopPreview {
+                berth,
+                dir,
+                walk_pos: Some(walk),
+            }
+            .draw(&mut draw, colors.gui_primary);
+            if selected {
+                uiworld.commands().push(command);
+            }
+        }
+        Err(reason) => {
+            preview.draw(&mut draw, colors.gui_danger);
+            show_edit_error(uiworld, "TransitAddStop", reason);
+        }
     }
 }

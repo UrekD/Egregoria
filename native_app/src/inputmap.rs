@@ -97,6 +97,7 @@ pub struct InputMap {
     mouse_allowed: bool,
     require_pointer_release: bool,
     close_down: bool,
+    land_tiles_down: bool,
     cancel_held: bool,
     /// Where the Cancel press started, until the pointer moves far enough to make it a drag.
     cancel_origin: Option<Vec2>,
@@ -750,6 +751,26 @@ impl InputMap {
                     .any(|(_, action)| action == Close))
     }
 
+    // Track the physical binding even when a menu or the keybind recorder
+    // captures it. A held binding must not become a fresh action on release.
+    pub(crate) fn land_tiles_pressed(
+        &mut self,
+        input: &InputContext,
+        kb: bool,
+        mouse: bool,
+    ) -> bool {
+        let mouse = mouse && !self.require_pointer_release;
+        let down = self
+            .matched_actions(input, true, true)
+            .any(|(_, action)| action == OpenLandTiles);
+        let was_down = std::mem::replace(&mut self.land_tiles_down, down);
+        down && !was_down
+            && ((kb && mouse)
+                || self
+                    .matched_actions(input, kb, mouse)
+                    .any(|(_, action)| action == OpenLandTiles))
+    }
+
     pub fn prepare_frame(&mut self, input: &InputContext, kb: bool, mouse: bool) {
         let mouse = mouse && !self.require_pointer_release;
         self.just_act.clear();
@@ -767,7 +788,7 @@ impl InputMap {
             .collect();
         let pointer = input.pointer_frame(false);
         for (primary, action) in self.matched_actions(input, kb, mouse) {
-            if action == Close {
+            if matches!(action, Close | OpenLandTiles) {
                 continue;
             }
             if action == Select {
@@ -1236,6 +1257,29 @@ mod tests {
         right_button(&mut input_map, true, Vec2::ZERO);
         right_button(&mut input_map, false, Vec2::ZERO);
         assert!(input_map.just_act.contains(&Cancel));
+    }
+
+    #[test]
+    fn land_tiles_keybind_capture_does_not_dispatch_a_held_binding() {
+        let mut input_map = InputMap::default();
+        let mut bindings = Bindings::default();
+        input_map.build_input_tree(&mut bindings);
+        let mut key = InputContext::default();
+        key.keyboard.pressed.insert(K::c("J"));
+
+        let mut binding = InputCombination::default();
+        binding.push_unique(UnitInput::Key(K::c("J")));
+        bindings
+            .0
+            .insert(OpenLandTiles, InputCombinations(vec![binding]));
+        input_map.build_input_tree(&mut bindings);
+
+        assert!(!input_map.land_tiles_pressed(&key, false, false));
+        assert!(!input_map.land_tiles_pressed(&key, true, true));
+        assert!(!input_map.land_tiles_pressed(&InputContext::default(), true, true));
+        assert!(input_map.land_tiles_pressed(&key, true, true));
+        input_map.reset_world_input();
+        assert!(!input_map.land_tiles_pressed(&key, true, true));
     }
 
     #[test]

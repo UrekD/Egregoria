@@ -1,9 +1,10 @@
-use crate::gui::Tool;
+use crate::gui::{overlays::land_tiles::preview_edit, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 use serde::{Deserialize, Serialize};
 use simulation::map::{LotKind, ProjectFilter, ProjectKind};
+use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 
 #[derive(Serialize, Deserialize)]
@@ -45,18 +46,25 @@ pub fn lotbrush(sim: &Simulation, uiworld: &UiWorld) {
     col.a = 0.2;
 
     let mpos = unwrap_ret!(inp.unprojected);
-    draw.circle(mpos.up(0.8), res.radius).color(col);
-
-    if inp.act.contains(&InputAction::Select) {
-        for v in map
+    let selecting = inp.act.contains(&InputAction::Select);
+    if selecting || map.land_ownership().extent().is_some() {
+        for project in map
             .spatial_map()
             .query_around(mpos.xy(), res.radius, ProjectFilter::LOT)
         {
-            if let ProjectKind::Lot(id) = v {
-                commands.map_build_house(id);
+            if let ProjectKind::Lot(id) = project {
+                let command = WorldCommand::MapBuildHouse(id);
+                if preview_edit(sim, uiworld, &command) {
+                    if selecting {
+                        commands.push(command);
+                    }
+                } else {
+                    col = simulation::colors().gui_danger.a(0.28);
+                }
             }
         }
     }
+    draw.circle(mpos.up(0.8), res.radius).color(col);
 }
 
 impl Default for LotBrushResource {

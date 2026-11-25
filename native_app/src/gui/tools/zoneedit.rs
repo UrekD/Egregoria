@@ -1,4 +1,6 @@
-use crate::gui::{ErrorTooltip, InspectedBuilding, PotentialCommands};
+use crate::gui::{
+    overlays::land_tiles::preview_edit, ErrorTooltip, InspectedBuilding, PotentialCommands,
+};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
@@ -84,14 +86,20 @@ pub fn zoneedit(sim: &Simulation, uiworld: &UiWorld) {
         invalidmsg = format!("Zone intersects with {v:?}");
     }
 
-    let isvalid = invalidmsg.is_empty();
-
-    let base_col = if !isvalid {
-        uiworld.write::<ErrorTooltip>().msg = Some(Cow::Owned(invalidmsg));
-        uiworld.write::<ErrorTooltip>().isworld = true;
-        simulation::colors().gui_danger
+    let command = WorldCommand::UpdateZone {
+        building: bid,
+        zone: Zone::new(newpoly.clone(), filldir),
+    };
+    let authoritative = state.offset.is_none() || preview_edit(sim, uiworld, &command);
+    let isvalid = authoritative && invalidmsg.is_empty();
+    let colors = simulation::colors();
+    let base_col = if isvalid {
+        colors.gui_primary
     } else {
-        simulation::colors().gui_primary
+        if authoritative {
+            *uiworld.write::<ErrorTooltip>() = ErrorTooltip::new(Cow::Owned(invalidmsg));
+        }
+        colors.gui_danger
     };
 
     for (p1, p2) in newpoly.iter().zip(newpoly.iter().cycle().skip(1)) {
@@ -128,8 +136,11 @@ pub fn zoneedit(sim: &Simulation, uiworld: &UiWorld) {
 
     for (i, &p) in newpoly.iter().enumerate() {
         if Some((i, p, false)) == closest {
-            draw.circle(p.z(1.1), 6.0)
-                .color(simulation::colors().gui_success);
+            draw.circle(p.z(1.1), 6.0).color(if isvalid {
+                colors.gui_success
+            } else {
+                base_col
+            });
             continue;
         }
 
@@ -138,8 +149,11 @@ pub fn zoneedit(sim: &Simulation, uiworld: &UiWorld) {
 
     for (i, p) in newpoly.segments().map(|s| s.center()).enumerate() {
         if Some((i, p, true)) == closest {
-            draw.circle(p.z(1.1), 3.0)
-                .color(simulation::colors().gui_success);
+            draw.circle(p.z(1.1), 3.0).color(if isvalid {
+                colors.gui_success
+            } else {
+                base_col
+            });
             continue;
         }
 
@@ -147,18 +161,14 @@ pub fn zoneedit(sim: &Simulation, uiworld: &UiWorld) {
     }
 
     if state.offset.is_some() {
-        let cmd = WorldCommand::UpdateZone {
-            building: bid,
-            zone: Zone::new(newpoly, filldir),
-        };
         if inp.act.contains(&InputAction::Select) {
             inspected_b.dontclear = true;
             if isvalid {
-                potentialcommand.set(cmd);
+                potentialcommand.set(command);
             }
         } else {
             if isvalid {
-                commands.push(cmd);
+                commands.push(command);
             }
             state.offset = None;
         }

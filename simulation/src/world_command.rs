@@ -1339,7 +1339,7 @@ impl WorldCommand {
             .push((self.kind(), reason));
     }
 
-    fn kind(&self) -> &'static str {
+    pub fn kind(&self) -> &'static str {
         match self {
             Init(_) => "Init",
             MapRemoveIntersection(_) => "MapRemoveIntersection",

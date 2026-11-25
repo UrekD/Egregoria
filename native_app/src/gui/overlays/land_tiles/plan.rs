@@ -1,4 +1,4 @@
-use std::{collections::BTreeSet, rc::Rc};
+use std::rc::Rc;
 
 use simulation::map::{
     LandTileId, LaneKind, Map, ProjectKind, Road, TileExtent, TileStatus, LAND_TILE_SIZE,
@@ -60,7 +60,6 @@ pub(super) struct MapGeometry {
     extent: TileExtent,
     water: Vec<(Vec2, Vec2)>,
     routes: Vec<RouteSegment>,
-    approaches: Vec<Vec2>,
 }
 
 #[derive(Debug)]
@@ -126,8 +125,6 @@ impl MapGeometry {
         let mut roads = Vec::new();
         let mut rail = Vec::new();
         let mut protected_routes = Vec::new();
-        let mut approaches = Vec::new();
-        let mut marked = BTreeSet::new();
         for road in map.roads().values() {
             let protected = land.is_protected(ProjectKind::Road(road.id));
             let is_rail = road.lanes_iter().any(|(_, kind)| kind == LaneKind::Rail);
@@ -137,17 +134,6 @@ impl MapGeometry {
                 rail.push((road, false));
             } else {
                 roads.push((road, false));
-            }
-            if !protected && road.has_sidewalks() && approaches.len() < MAX_APPROACH_MARKERS {
-                for junction in [road.src, road.dst] {
-                    if !land.is_protected(ProjectKind::Intersection(junction))
-                        && marked.insert(junction)
-                    {
-                        if let Some(point) = map.get(junction) {
-                            approaches.push(world_point(point.pos.xy()));
-                        }
-                    }
-                }
             }
         }
         // Draw the protected trunk above intersecting routes. Its share includes
@@ -167,17 +153,18 @@ impl MapGeometry {
             extent,
             water,
             routes,
-            approaches,
         }
     }
+}
 
-    pub fn approaches_in(&self, tile: LandTileId) -> usize {
-        let corner = Vec2::new(f32::from(tile.x), f32::from(tile.y));
-        self.approaches
-            .iter()
-            .filter(|point| point.cmpge(corner).all() && point.cmplt(corner + Vec2::ONE).all())
-            .count()
-    }
+pub(super) fn approach_markers(sites: Vec<geom::Vec2>) -> Vec<Vec2> {
+    let count = sites.len().min(MAX_APPROACH_MARKERS);
+    (0..count)
+        .map(|i| {
+            let point = sites[i * sites.len() / count];
+            Vec2::new(point.x, point.y) / LAND_TILE_SIZE
+        })
+        .collect()
 }
 
 fn append_routes(
@@ -232,6 +219,7 @@ pub(super) struct Plan {
     pub geometry: Rc<MapGeometry>,
     pub statuses: Rc<Vec<TileStatus>>,
     pub selected: Option<LandTileId>,
+    pub approaches: Option<Rc<Vec<Vec2>>>,
 }
 
 #[derive(Debug, Default)]
@@ -333,7 +321,7 @@ impl Widget for PlanWidget {
                 paint_route(ctx.paint, from, to, 1.1, RAIL);
             }
         }
-        for &point in &geometry.approaches {
+        for &point in props.approaches.iter().flat_map(|markers| markers.iter()) {
             paint_rect(
                 ctx.paint,
                 rect.pos() + plan.point(point) - Vec2::splat(1.5),

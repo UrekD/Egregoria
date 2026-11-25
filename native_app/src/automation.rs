@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, SystemTime};
 
-use common::saveload::{self, Encoder, JSONPretty, JSON};
+use common::saveload::{self, Bincode, Encoder, JSONPretty, JSON};
 use engine::{Context, InputContext, Key, MouseButton};
 use geom::{vec2, vec3, Radians, Vec2, Vec3, OBB};
 use prototypes::{BuildingGen, GoodsCompanyID};
@@ -16,8 +16,8 @@ use serde::{Deserialize, Serialize};
 use simulation::economy::cargo::CargoBook;
 use simulation::economy::{Budget, CityStats, Government, ZoneDemand};
 use simulation::map::{
-    BuildingKind, LandMode, LandTileId, Map, ProjectFilter, ProjectKind, RoadID, TraverseKind, Zone,
-    ZoneGrid, ZoneKind,
+    BuildingKind, LandMode, LandTileId, Map, ProjectFilter, ProjectKind, RoadID, TraverseKind,
+    Zone, ZoneGrid, ZoneKind,
 };
 use simulation::transportation::traffic_metrics::{sample_road_users, TruckCargo};
 use simulation::transportation::{Location, VehicleKind};
@@ -64,6 +64,11 @@ enum Step {
         down: bool,
     },
     EmptyTreasury,
+    ConfirmLandPurchase {
+        #[serde(default)]
+        empty_treasury: bool,
+        replace_with: Option<simulation::economy::progression::ProgressionMode>,
+    },
     Camera {
         x: f32,
         y: f32,
@@ -96,6 +101,8 @@ enum Step {
     NewTiledGame {
         side: u16,
         progression: simulation::economy::progression::ProgressionMode,
+        #[serde(default)]
+        round_trip: bool,
     },
     NewWetTiledFixture,
     LoadSlot(String),
@@ -125,8 +132,10 @@ enum Assertion {
         selected: Option<LandTileId>,
         quote: Option<String>,
         confirming: bool,
-        paid: Option<u32>,
+        pending: bool,
+        receipt: Option<LandReceipt>,
         treasury: u32,
+        extent: Option<[u16; 2]>,
     },
     BuildingCount {
         prototype: String,
@@ -139,6 +148,21 @@ enum Assertion {
     },
     /// The followed human is still inspected and the camera is on whatever carries them.
     CameraOnFollowed,
+}
+
+#[derive(Deserialize)]
+enum LandReceipt {
+    Paid(i64),
+    InsufficientFunds,
+}
+
+impl LandReceipt {
+    fn outcome(self) -> Result<i64, Rejection> {
+        match self {
+            Self::Paid(price) => Ok(price),
+            Self::InsufficientFunds => Err(Rejection::InsufficientFunds),
+        }
+    }
 }
 
 #[derive(Deserialize, Clone, Copy)]
@@ -533,6 +557,7 @@ impl Automation {
                     | Step::Commands(_)
                     | Step::BuildSpecialBuildings(_)
                     | Step::EmptyTreasury
+                    | Step::ConfirmLandPurchase { .. }
                     | Step::Builder(_)
                     | Step::FollowHuman { .. }
                     | Step::RunFollowing { .. }
@@ -605,6 +630,24 @@ impl Automation {
             Step::EmptyTreasury => {
                 self.submit(driver, Request::PausedFixtureOp(FixtureOp::EmptyTreasury))?
             }
+            Step::ConfirmLandPurchase {
+                empty_treasury,
+                replace_with,
+            } => {
+                use crate::gui::overlays::land_tiles::LandTilesUi;
+                uiw.write::<LandTilesUi>()
+                    .confirm_script_purchase(uiw, sim)?;
+                if empty_treasury {
+                    // The fixture reaches the worker before this frame seals its queued purchase.
+                    self.submit(driver, Request::PausedFixtureOp(FixtureOp::EmptyTreasury))?;
+                }
+                if let Some(progression) = replace_with {
+                    // Leave this confirmation pending across replacement and let the regular
+                    // world reset discard it. The exit path still drains accepted worker batches.
+                    let _ = std::mem::take(&mut *uiw.commands());
+                    replace_land_fixture(uiw, new_tiled_fixture(17, progression, false)?)?;
+                }
+            }
             Step::Builder(builder) => self.submit(
                 driver,
                 Request::PausedFixtureOp(FixtureOp::Builder(builder)),
@@ -673,17 +716,12 @@ impl Automation {
                     return Err("session screens are unavailable during multiplayer".into());
                 }
             }
-            Step::NewTiledGame { side, progression } => {
-                let sim = Simulation::new_game(&simulation::NewGameOptions {
-                    preset: simulation::MapPreset::Flat,
-                    land_mode: LandMode::Tiled,
-                    terrain_chunks: side,
-                    progression,
-                    starting_money_bucks: 150_000,
-                    ..simulation::NewGameOptions::default()
-                })
-                .map_err(|err| err.to_string())?;
-                replace_land_fixture(uiw, sim)?;
+            Step::NewTiledGame {
+                side,
+                progression,
+                round_trip,
+            } => {
+                replace_land_fixture(uiw, new_tiled_fixture(side, progression, round_trip)?)?;
             }
             Step::NewWetTiledFixture => replace_land_fixture(uiw, land_fixture::wet_rectangle()?)?,
             Step::OpenWindow(name) => {
@@ -872,6 +910,33 @@ impl Automation {
     }
 }
 
+fn new_tiled_fixture(
+    side: u16,
+    progression: simulation::economy::progression::ProgressionMode,
+    round_trip: bool,
+) -> Result<Simulation, String> {
+    let sim = Simulation::new_game(&simulation::NewGameOptions {
+        preset: simulation::MapPreset::Flat,
+        land_mode: LandMode::Tiled,
+        terrain_chunks: side,
+        progression,
+        starting_money_bucks: 150_000,
+        ..simulation::NewGameOptions::default()
+    })
+    .map_err(|err| err.to_string())?;
+    if !round_trip {
+        return Ok(sim);
+    }
+    let snapshot = Bincode::encode(&sim).map_err(|err| err.to_string())?;
+    if snapshot.len() >= 256 * 1024 * 1024 {
+        return Err(format!(
+            "tiled fixture snapshot exceeds its raw size cap: {}",
+            snapshot.len()
+        ));
+    }
+    Bincode::decode(&snapshot).map_err(|err| err.to_string())
+}
+
 fn replace_land_fixture(uiw: &UiWorld, sim: Simulation) -> Result<(), String> {
     session::request_world_replacement(
         uiw,
@@ -941,20 +1006,23 @@ impl Assertion {
                 selected,
                 quote,
                 confirming,
-                paid,
+                pending,
+                receipt,
                 treasury,
+                extent,
             } => {
-                use crate::gui::overlays::land_tiles::LandTilesUi;
+                use crate::gui::overlays::land_tiles::{LandTilesScriptState, LandTilesUi};
                 let map = sim.map();
                 let land = map.land_ownership();
-                let actual_owned: BTreeSet<_> = land.tiles().filter(|&tile| land.owns(tile)).collect();
+                let actual_owned: BTreeSet<_> =
+                    land.tiles().filter(|&tile| land.owns(tile)).collect();
+                let actual_extent = land.extent().map(|extent| [extent.width, extent.height]);
                 let (_, _, water, terrain, _) = map.road_preview_revision();
                 drop(map);
                 let generation = uiw.read::<SessionState>().generation;
-                if let Some((previous_generation, previous_water, previous_terrain)) =
-                    automation
-                        .land_terrain_revision
-                        .replace(Some((generation, water, terrain)))
+                if let Some((previous_generation, previous_water, previous_terrain)) = automation
+                    .land_terrain_revision
+                    .replace(Some((generation, water, terrain)))
                 {
                     if generation == previous_generation
                         && (water, terrain) != (previous_water, previous_terrain)
@@ -964,15 +1032,22 @@ impl Assertion {
                 }
                 let actual_treasury = sim.read::<Government>().money.bucks();
                 let actual = uiw.read::<LandTilesUi>().script_state(sim);
-                let expected = (selected, quote, confirming, paid);
+                let expected = LandTilesScriptState {
+                    selected,
+                    quote,
+                    confirming,
+                    pending,
+                    receipt: receipt.map(LandReceipt::outcome),
+                };
                 if !uiw.read::<GuiState>().windows.land_tiles_open
                     || sim.get_tick() != tick
                     || actual_owned != owned
+                    || extent.is_some_and(|extent| Some(extent) != actual_extent)
                     || actual != expected
                     || actual_treasury != i64::from(treasury)
                 {
                     return Err(format!(
-                        "land UI at tick {} with treasury {actual_treasury} and owned {actual_owned:?}: expected {expected:?}, got {actual:?}",
+                        "land UI at tick {} with treasury {actual_treasury} and owned {actual_owned:?} on {actual_extent:?}: expected {expected:?}, got {actual:?}",
                         sim.get_tick(),
                     ));
                 }

@@ -4,14 +4,14 @@ use common::FastSet;
 
 use crate::gui::specialbuilding::SpecialBuildingResource;
 use crate::gui::windows::settings::Settings;
-use crate::gui::Tool;
+use crate::gui::{overlays::land_tiles::preview_edit, Tool};
 use crate::inputmap::{Bindings, DeckPicker, InputAction, InputMap, SurfaceHits, UnitInput};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 use engine::MouseButton;
 use geom::{Camera, Ray3, Vec2};
 use simulation::map::{BuildingKind, Map, MapProject, ProjectFilter, ProjectKind};
-use simulation::world_command::WorldCommands;
+use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::Simulation;
 
 #[derive(Default)]
@@ -240,19 +240,24 @@ fn project_target(
     ))
 }
 
-fn queue_target(map: &Map, target: ProjectKind, commands: &mut WorldCommands) {
-    match target {
-        ProjectKind::Intersection(id) => commands.map_remove_intersection(id),
-        ProjectKind::Road(id) => commands.map_remove_road(id),
-        ProjectKind::Building(id) => {
-            if map
-                .get(id)
-                .is_some_and(|building| !matches!(building.kind, BuildingKind::ExternalTrading))
-            {
-                commands.map_remove_building(id);
-            }
+fn removal_candidate(map: &Map, target: ProjectKind) -> Option<WorldCommand> {
+    Some(match target {
+        ProjectKind::Intersection(id) => WorldCommand::MapRemoveIntersection(id),
+        ProjectKind::Road(id) => WorldCommand::MapRemoveRoad(id),
+        ProjectKind::Building(id)
+            if map.get(id).is_some_and(|building| {
+                !matches!(building.kind, BuildingKind::ExternalTrading)
+            }) =>
+        {
+            WorldCommand::MapRemoveBuilding(id)
         }
-        ProjectKind::Ground | ProjectKind::Lot(_) => {}
+        _ => return None,
+    })
+}
+
+fn queue_target(map: &Map, target: ProjectKind, commands: &mut WorldCommands) {
+    if let Some(command) = removal_candidate(map, target) {
+        commands.push(command);
     }
 }
 
@@ -302,8 +307,7 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
     }
 
     let map = sim.map();
-    let mut commands = uiworld.commands();
-    let before = commands.as_ref().len();
+    let mut candidates = WorldCommands::default();
     let mut picker = DeckPicker::new(&map);
     let projection = if drag_enabled {
         let camera = &uiworld.camera().camera;
@@ -319,7 +323,7 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
                 input.screen,
                 &map,
                 project,
-                &mut commands,
+                &mut candidates,
             );
         }
         current
@@ -333,22 +337,27 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
         };
         if pressed && !pointer.interrupted {
             if let Some(current) = current {
-                queue_target(&map, current.kind, &mut commands);
+                queue_target(&map, current.kind, &mut candidates);
             }
         }
         current
     };
 
+    let accepted = candidates
+        .iter()
+        .filter(|command| preview_edit(sim, uiworld, command));
+    let mut commands = uiworld.commands();
+    let before = commands.as_ref().len();
+    commands.extend(accepted.cloned());
     if commands.as_ref().len() != before {
         uiworld.write::<SpecialBuildingResource>().last_obb = None;
     }
 
     if let Some(project) = projection {
-        let color = match project.kind {
-            ProjectKind::Intersection(_) | ProjectKind::Road(_) | ProjectKind::Building(_) => {
-                simulation::colors().gui_danger
-            }
-            _ => simulation::colors().gui_disabled,
+        let colors = simulation::colors();
+        let color = match removal_candidate(&map, project.kind) {
+            Some(command) if preview_edit(sim, uiworld, &command) => colors.gui_danger,
+            _ => colors.gui_disabled,
         };
         uiworld
             .write::<ImmediateDraw>()

@@ -83,7 +83,7 @@ pub(super) fn properties(uiworld: &UiWorld, tool: Tool) {
     });
 }
 
-pub(super) fn update_tool(uiworld: &UiWorld, sim: &Simulation) {
+pub(crate) fn update_tool(uiworld: &UiWorld, sim: &Simulation) {
     let mut state = uiworld.write::<TransitTools>();
     let tool = *uiworld.read::<Tool>();
     if tool != Tool::TransitLine {

@@ -70,7 +70,6 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation) {
             });
         });
     });
-    transit::update_tool(uiworld, sim);
 }
 
 fn tool_properties(uiw: &UiWorld, sim: &Simulation) -> bool {

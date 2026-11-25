@@ -1,10 +1,11 @@
-use crate::gui::Tool;
+use crate::gui::{overlays::land_tiles::preview_edit, Tool};
 use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 use geom::Color;
 use simulation::map::{IntersectionID, LightPolicy, TurnPolicy};
 use simulation::map::{ProjectFilter, ProjectKind};
+use simulation::world_command::WorldCommand;
 use simulation::Simulation;
 
 #[derive(Clone)]
@@ -90,12 +91,18 @@ pub fn roadeditor(sim: &Simulation, uiworld: &UiWorld) {
     imm_draw.circle(proj_pos.up(0.5), 10.0).color(proj_col);
 
     if state.dirty {
-        if let Some(interc) = &state.inspect {
-            commands.map_update_intersection_policy(
-                interc.id,
-                interc.turn_policy,
-                interc.light_policy,
-            );
+        if let Some(interc) = &mut state.inspect {
+            let command = WorldCommand::MapUpdateIntersectionPolicy {
+                inter: interc.id,
+                turn: interc.turn_policy,
+                light: interc.light_policy,
+            };
+            if preview_edit(sim, uiworld, &command) {
+                commands.push(command);
+            } else if let Some(inter) = map.get(interc.id) {
+                interc.turn_policy = inter.turn_policy;
+                interc.light_policy = inter.light_policy;
+            }
         }
         state.dirty = false;
     }

@@ -323,7 +323,7 @@ fn prepare_command(sim: &Simulation, command: &WorldCommand) -> Result<Prepared,
             sim.map()
                 .authorize_land_effects(crate::map::PreparedEffects::Point(pos.xy()))?;
             let (walk, berth) =
-                resolve_stop(&sim.map(), *pos, dir).ok_or(Rejection::MissingReference)?;
+                resolve_stop_checked(&sim.map(), *pos, dir)?.ok_or(Rejection::MissingReference)?;
             Prepared::Stop(dir, walk, berth)
         }
         TransitRemoveStop { stop } => {
@@ -365,7 +365,7 @@ fn prepare_command(sim: &Simulation, command: &WorldCommand) -> Result<Prepared,
                 .iter()
                 .map(|id| {
                     let stop = transit.stops.get(*id).ok_or(Rejection::MissingReference)?;
-                    resolve_stop(&map, stop.pos, stop.dir)
+                    resolve_stop_checked(&map, stop.pos, stop.dir)?
                         .map(|(_, berth)| berth)
                         .ok_or(Rejection::InvalidConnection)
                 })
@@ -401,6 +401,28 @@ fn stop_direction(dir: Vec2) -> Option<Vec2> {
 }
 
 fn resolve_stop(map: &Map, pos: Vec3, dir: Vec2) -> Option<(Vec3, Berth)> {
+    resolve_stop_checked(map, pos, dir).ok().flatten()
+}
+
+/// Preview the same walking point and vehicle berth resolved for a placed stop.
+pub fn preview_stop(
+    sim: &Simulation,
+    pos: Vec3,
+    dir: Vec2,
+) -> Result<(Vec3, Vec3, Vec2), Rejection> {
+    let Prepared::Stop(_, walk, berth) =
+        prepare_command(sim, &WorldCommand::TransitAddStop { pos, dir })?
+    else {
+        return Err(Rejection::InvalidConnection);
+    };
+    Ok((walk, berth.pos, berth.dir.xy()))
+}
+
+fn resolve_stop_checked(
+    map: &Map,
+    pos: Vec3,
+    dir: Vec2,
+) -> Result<Option<(Vec3, Berth)>, crate::map::LandDenial> {
     map.spatial_map()
         .query_around(pos.xy(), 4.0, ProjectFilter::ROAD)
         .filter_map(|project| match project {
@@ -448,12 +470,14 @@ fn resolve_stop(map: &Map, pos: Vec3, dir: Vec2) -> Option<(Vec3, Berth)> {
                 pos: vehicle_pos,
                 dir,
             };
-            map.authorize_transit_site(pos, walk, berth.pos, berth.dir.xy(), lane.parent)
-                .ok()?;
-            Some(((OrderedFloat(distance), id), (walk, berth)))
+            let resolved = map
+                .authorize_transit_site(pos, walk, berth.pos, berth.dir.xy(), lane.parent)
+                .map(|()| (walk, berth));
+            Some(((resolved.is_err(), OrderedFloat(distance), id), resolved))
         })
         .min_by_key(|(key, _)| *key)
         .map(|(_, resolved)| resolved)
+        .transpose()
 }
 
 pub(crate) fn validate_saved_land_stops(sim: &Simulation) -> Result<(), String> {

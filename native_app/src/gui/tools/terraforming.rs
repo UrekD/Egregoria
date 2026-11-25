@@ -5,10 +5,10 @@ use simulation::map::{
     TerraformKind, WaterBasin, WaterBodyId, WaterEdit, WaterEditError, WaterEditOutcome, WaterKind,
     WaterProviderImpact, WaterProviderImpactSample, WaterStroke, MAX_WATER_VERTICES,
 };
-use simulation::world_command::{CommandOutcomes, WorldCommand};
+use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand};
 use simulation::Simulation;
 
-use crate::gui::Tool;
+use crate::gui::{overlays::land_tiles::show_edit_error, Tool};
 use crate::inputmap::{InputAction, InputMap, UnitInput};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::{water_color, WATER_TILE_PITCH};
@@ -22,15 +22,77 @@ pub struct TerraformingResource {
     slope_start: Option<Vec3>,
     slope_end: Option<Vec3>,
     ground_radius: Option<f32>,
+    terrain_preview: Option<CachedTerrainPreview>,
     pub(crate) water: WaterTools,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct TerrainBrush {
+    kind: TerraformKind,
+    center: Vec2,
+    radius: f32,
+    amount: f32,
+    level: f32,
+    slope: Option<(Vec3, Vec3)>,
+}
+
+impl TerrainBrush {
+    fn command(self) -> WorldCommand {
+        WorldCommand::Terraform {
+            kind: self.kind,
+            center: self.center,
+            radius: self.radius,
+            amount: self.amount,
+            level: self.level,
+            slope: self.slope,
+        }
+    }
+}
+
+struct CachedTerrainPreview {
+    brush: TerrainBrush,
+    revision: (u64, u64, u64, u64, usize),
+    tick: u64,
+    sequence: u64,
+    result: Result<(), Rejection>,
 }
 
 impl TerraformingResource {
     pub(crate) fn cancel_gesture(&mut self) {
         self.level = None;
+        self.terrain_preview = None;
         self.slope_start = None;
         self.slope_end = None;
         self.water.cancel();
+    }
+
+    fn preview_brush(&mut self, sim: &Simulation, brush: TerrainBrush) -> Result<(), Rejection> {
+        let map = sim.map();
+        if map.land_ownership().extent().is_none() && !map.environment().has_water_configuration() {
+            return Ok(());
+        }
+        let revision = map.road_preview_revision();
+        drop(map);
+        let tick = sim.get_tick();
+        let sequence = sim.read::<CommandOutcomes>().batch_seq();
+        if let Some(preview) = &self.terrain_preview {
+            if preview.brush == brush
+                && preview.revision == revision
+                && preview.tick == tick
+                && preview.sequence == sequence
+            {
+                return preview.result;
+            }
+        }
+        let result = brush.command().preview(sim).map(|_| ());
+        self.terrain_preview = Some(CachedTerrainPreview {
+            brush,
+            revision,
+            tick,
+            sequence,
+            result,
+        });
+        result
     }
 
     pub(crate) fn water_active(&self) -> bool {
@@ -123,21 +185,46 @@ pub fn terraforming(sim: &Simulation, uiworld: &UiWorld) {
         TerraformKind::Erode => {}
     }
 
-    if inp.act.contains(&InputAction::Select) || inp.act.contains(&InputAction::SecondarySelect) {
-        if res.kind == TerraformKind::Level && res.level.is_none() {
-            return;
+    let slope = res.slope_start.zip(res.slope_end);
+    let preview_slope = slope.or_else(|| {
+        res.slope_start
+            .filter(|start| !start.is_close(mpos, 5.0))
+            .map(|start| (start, mpos))
+    });
+    let brush = TerrainBrush {
+        kind: res.kind,
+        center: mpos.xy(),
+        radius: res.radius,
+        amount: res.amount * amount_multiplier,
+        level: res.level.unwrap_or(mpos.z),
+        slope: preview_slope,
+    };
+    let result = if res.kind != TerraformKind::Slope || preview_slope.is_some() {
+        res.preview_brush(sim, brush)
+    } else {
+        Ok(())
+    };
+    let colors = simulation::colors();
+    let color = match result {
+        Ok(()) => colors.gui_primary,
+        Err(reason) => {
+            show_edit_error(uiworld, "Terraform", reason);
+            draw.stroke_circle(mpos.up(0.8), res.radius, 1.5)
+                .color(colors.gui_danger);
+            colors.gui_danger
         }
-        if res.kind == TerraformKind::Slope && res.slope_end.is_none() {
-            return;
-        }
-        uiworld.commands().push(WorldCommand::Terraform {
-            center: mpos.xy(),
-            radius: res.radius,
-            amount: res.amount * amount_multiplier,
-            level: res.level.unwrap_or(0.0),
-            kind: res.kind,
-            slope: res.slope_start.zip(res.slope_end),
-        })
+    };
+    let ready = match res.kind {
+        TerraformKind::Slope => slope.is_some(),
+        TerraformKind::Level => res.level.is_some(),
+        _ => true,
+    };
+    if ready
+        && result.is_ok()
+        && (inp.act.contains(&InputAction::Select)
+            || inp.act.contains(&InputAction::SecondarySelect))
+    {
+        uiworld.commands().push(brush.command());
     }
 
     // Draw the state
@@ -155,7 +242,7 @@ pub fn terraforming(sim: &Simulation, uiworld: &UiWorld) {
                     ),
                     res.level.unwrap_or(mpos.z) - 0.5,
                 )
-                .color(simulation::colors().gui_primary.a(0.2));
+                .color(color.a(0.2));
             }
         }
         TerraformKind::Slope => {
@@ -166,7 +253,7 @@ pub fn terraforming(sim: &Simulation, uiworld: &UiWorld) {
             } else {
                 draw.line(res.slope_start.unwrap(), res.slope_end.unwrap(), res.radius)
             }
-            .color(simulation::colors().gui_primary.a(0.2));
+            .color(color.a(0.2));
         }
         TerraformKind::Erode => {}
     }
@@ -182,6 +269,7 @@ impl Default for TerraformingResource {
             slope_start: None,
             slope_end: None,
             ground_radius: None,
+            terrain_preview: None,
             water: WaterTools::default(),
         }
     }

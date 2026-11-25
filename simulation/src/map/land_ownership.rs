@@ -258,11 +258,15 @@ impl LandOwnership {
         reserves.into_iter().flatten().copied()
     }
 
-    pub(crate) fn revision(&self) -> usize {
+    pub fn owned_count(&self) -> u16 {
         match self {
             Self::Unrestricted => 0,
-            Self::Tiled(land) => usize::from(land.owned_count()),
+            Self::Tiled(land) => land.owned_count(),
         }
+    }
+
+    pub(crate) fn revision(&self) -> usize {
+        usize::from(self.owned_count())
     }
 
     pub(crate) fn is_tiled(&self) -> bool {
@@ -482,64 +486,112 @@ pub struct TilePurchased {
 }
 
 pub fn quote_tile(sim: &Simulation, tile: LandTileId) -> Result<TileQuote, Rejection> {
-    let mut quote = TileQuote {
+    let map = sim.map();
+    let LandOwnership::Tiled(land) = map.land_ownership() else {
+        return Ok(unavailable_quote(tile));
+    };
+    if land.extent.index(tile).is_none() {
+        return Ok(unavailable_quote(tile));
+    }
+    TileQuoteContext::new(sim, land).quote(land, tile)
+}
+
+/// Statuses in extent order, with purchase terms shared across the whole plan.
+pub fn quote_tile_statuses(sim: &Simulation) -> Vec<TileStatus> {
+    let map = sim.map();
+    let LandOwnership::Tiled(land) = map.land_ownership() else {
+        return Vec::new();
+    };
+    let context = TileQuoteContext::new(sim, land);
+    land.extent
+        .tiles()
+        .map(|tile| {
+            context
+                .quote(land, tile)
+                .map_or(TileStatus::Unavailable, |quote| quote.status)
+        })
+        .collect()
+}
+
+fn unavailable_quote(tile: LandTileId) -> TileQuote {
+    TileQuote {
         tile,
         price: None,
         status: TileStatus::Unavailable,
         quota_remaining: None,
         treasury_shortfall: None,
-    };
-    let map = sim.map();
-    let LandOwnership::Tiled(land) = map.land_ownership() else {
-        return Ok(quote);
-    };
-    if land.extent.index(tile).is_none() {
-        return Ok(quote);
     }
-    let purchases = land.owned_count() - land.initial_owned;
-    let progression = sim.read::<ProgressionState>();
-    let tier = progression.highest_milestone;
-    if progression.mode == ProgressionMode::Guided {
-        quote.quota_remaining = [0u16, 2, 6]
-            .get(usize::from(tier))
-            .map(|limit| limit.saturating_sub(purchases));
-    }
-    if land.owns(tile) {
-        quote.status = TileStatus::Owned;
-        return Ok(quote);
-    }
-    let base = Money::new_bucks(10_000).inner();
-    let increase = Money::new_bucks(500)
-        .inner()
-        .checked_mul(i64::from(purchases));
-    let price = base
-        .checked_add(increase.ok_or(Rejection::CostOverflow)?)
-        .map(Money::new_inner)
-        .ok_or(Rejection::CostOverflow)?;
-    quote.price = Some(price);
-    quote.status = if !neighbors(tile).any(|neighbor| land.owns(neighbor)) {
-        TileStatus::NeedsAdjacent
-    } else if quote.quota_remaining == Some(0) {
-        let milestone = tier + 1;
-        TileStatus::Locked {
-            milestone,
-            agents: milestone_population(milestone).unwrap(),
-        }
-    } else {
+}
+
+struct TileQuoteContext {
+    quota_remaining: Option<u16>,
+    tier: u8,
+    price: Result<Money, Rejection>,
+    shortfall: Result<Option<Money>, Rejection>,
+}
+
+impl TileQuoteContext {
+    fn new(sim: &Simulation, land: &TiledLand) -> Self {
+        let purchases = land.owned_count() - land.initial_owned;
+        let progression = sim.read::<ProgressionState>();
+        let tier = progression.highest_milestone;
+        let quota_remaining = if progression.mode == ProgressionMode::Guided {
+            [0u16, 2, 6]
+                .get(usize::from(tier))
+                .map(|limit| limit.saturating_sub(purchases))
+        } else {
+            None
+        };
+        let price = Money::new_bucks(500)
+            .inner()
+            .checked_mul(i64::from(purchases))
+            .and_then(|increase| Money::new_bucks(10_000).inner().checked_add(increase))
+            .map(Money::new_inner)
+            .ok_or(Rejection::CostOverflow);
         let balance = sim.read::<Government>().money;
-        if balance < price {
-            quote.treasury_shortfall = Some(Money::new_inner(
+        let shortfall = price.and_then(|price| {
+            if balance < price {
                 price
                     .inner()
                     .checked_sub(balance.inner())
-                    .ok_or(Rejection::CostOverflow)?,
-            ));
+                    .map(|difference| Some(Money::new_inner(difference)))
+                    .ok_or(Rejection::CostOverflow)
+            } else {
+                Ok(None)
+            }
+        });
+        Self {
+            quota_remaining,
+            tier,
+            price,
+            shortfall,
+        }
+    }
+
+    fn quote(&self, land: &TiledLand, tile: LandTileId) -> Result<TileQuote, Rejection> {
+        let mut quote = unavailable_quote(tile);
+        quote.quota_remaining = self.quota_remaining;
+        if land.owns(tile) {
+            quote.status = TileStatus::Owned;
+            return Ok(quote);
+        }
+        quote.price = Some(self.price?);
+        quote.status = if !neighbors(tile).any(|neighbor| land.owns(neighbor)) {
+            TileStatus::NeedsAdjacent
+        } else if self.quota_remaining == Some(0) {
+            let milestone = self.tier + 1;
+            TileStatus::Locked {
+                milestone,
+                agents: milestone_population(milestone).unwrap(),
+            }
+        } else if let Some(shortfall) = self.shortfall? {
+            quote.treasury_shortfall = Some(shortfall);
             TileStatus::InsufficientFunds
         } else {
             TileStatus::Buyable
-        }
-    };
-    Ok(quote)
+        };
+        Ok(quote)
+    }
 }
 
 pub(crate) fn prepare_purchase(

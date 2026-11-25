@@ -13,7 +13,7 @@ use simulation::economy::{
     progression::{milestone_population, ProgressionMode, ProgressionState},
     Government,
 };
-use simulation::map::{quote_tile, LandTileId, TileQuote, TileStatus};
+use simulation::map::{quote_tile, quote_tile_statuses, LandTileId, TileQuote, TileStatus};
 use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand, WorldCommands};
 use simulation::Simulation;
 use yakui::{colored_box_container, constrained, widgets::Pad, Constraints, Vec2};
@@ -40,8 +40,18 @@ pub(crate) struct LandTilesUi {
     pending: Option<PendingPurchase>,
     receipt: Option<TilePurchaseReceipt>,
     busy: bool,
+    shortcut_pending: bool,
+    approaches: Option<SelectedApproaches>,
     geometry: Option<((u64, u64, u64, u64), Rc<MapGeometry>)>,
     statuses: Option<((usize, ProgressionMode, u8, Money), Rc<Vec<TileStatus>>)>,
+}
+
+struct SelectedApproaches {
+    tile: LandTileId,
+    revision: (u64, u64, u64, u64, usize),
+    command_sequence: u64,
+    site_count: Option<usize>,
+    markers: Rc<Vec<Vec2>>,
 }
 
 #[derive(Clone, Copy)]
@@ -70,6 +80,15 @@ impl PendingPurchase {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct LandTilesScriptState {
+    pub selected: Option<LandTileId>,
+    pub quote: Option<String>,
+    pub confirming: bool,
+    pub pending: bool,
+    pub receipt: Option<Result<i64, Rejection>>,
+}
+
 impl LandTilesUi {
     fn sync_generation(&mut self, generation: u64) {
         if self.generation != generation {
@@ -80,10 +99,7 @@ impl LandTilesUi {
         }
     }
 
-    pub(crate) fn script_state(
-        &self,
-        sim: &Simulation,
-    ) -> (Option<LandTileId>, Option<String>, bool, Option<u32>) {
+    pub(crate) fn script_state(&self, sim: &Simulation) -> LandTilesScriptState {
         let quote = self
             .selected
             .and_then(|tile| quote_tile(sim, tile).ok())
@@ -94,11 +110,33 @@ impl LandTilesUi {
                     quote.price.map_or(0, |price| price.bucks())
                 )
             });
-        let paid = self
-            .receipt
-            .and_then(|receipt| receipt.result.ok())
-            .and_then(|purchase| u32::try_from(purchase.paid.bucks()).ok());
-        (self.selected, quote, self.confirmation.is_some(), paid)
+        LandTilesScriptState {
+            selected: self.selected,
+            quote,
+            confirming: self.confirmation.is_some(),
+            pending: self.pending.is_some(),
+            receipt: self
+                .receipt
+                .map(|receipt| receipt.result.map(|purchase| purchase.paid.bucks())),
+        }
+    }
+
+    pub(crate) fn confirm_script_purchase(
+        &mut self,
+        uiw: &UiWorld,
+        sim: &Simulation,
+    ) -> Result<(), String> {
+        let (Some(tile), Some(price)) = (self.selected, self.confirmation) else {
+            return Err("no Land Tiles purchase to confirm".into());
+        };
+        if self.pending.is_some() {
+            return Err("a Land Tiles purchase is already pending".into());
+        }
+        self.submit(uiw, sim, tile, price);
+        self.pending
+            .is_some()
+            .then_some(())
+            .ok_or_else(|| "confirmed purchase did not enter pending state".into())
     }
 
     fn receive(&mut self, receipts: &[TilePurchaseReceipt], batch: Option<BatchId>) {
@@ -117,6 +155,7 @@ impl LandTilesUi {
     fn select(&mut self, tile: LandTileId) {
         if self.selected != Some(tile) {
             self.selected = Some(tile);
+            self.approaches = None;
             self.confirmation = None;
         }
     }
@@ -210,12 +249,7 @@ pub(crate) fn open(uiw: &UiWorld) {
     *uiw.write::<PlacementPreview>() = PlacementPreview::default();
     *uiw.write::<crate::gui::toolbox::transit::TransitTools>() = Default::default();
     *uiw.write::<crate::gui::zoneedit::ZoneEditState>() = Default::default();
-    let mut input = uiw.write::<InputMap>();
-    let shortcut_held = input.act.contains(&InputAction::OpenLandTiles);
-    input.reset_world_input();
-    if shortcut_held {
-        input.act.insert(InputAction::OpenLandTiles);
-    }
+    uiw.write::<InputMap>().reset_world_input();
 }
 
 pub(crate) fn toolbar(uiw: &UiWorld, sim: &Simulation) {
@@ -236,17 +270,34 @@ pub(crate) fn toolbar(uiw: &UiWorld, sim: &Simulation) {
     }
 }
 
+pub(crate) fn latch_shortcut(uiw: &UiWorld, enabled: bool, pressed: bool) {
+    let mut state = uiw.write::<LandTilesUi>();
+    state.shortcut_pending = enabled && (state.shortcut_pending ^ pressed);
+}
+
 pub(crate) fn shortcut(uiw: &UiWorld, sim: &Simulation) -> bool {
-    if sim.map().land_ownership().extent().is_none()
-        || !uiw
-            .write::<InputMap>()
-            .just_act
-            .remove(&InputAction::OpenLandTiles)
+    if !std::mem::take(&mut uiw.write::<LandTilesUi>().shortcut_pending)
+        || sim.map().land_ownership().extent().is_none()
     {
         return false;
     }
     toggle(uiw);
     true
+}
+
+pub(crate) fn show_edit_error(uiw: &UiWorld, action: &'static str, reason: Rejection) {
+    *uiw.write::<ErrorTooltip>() =
+        ErrorTooltip::new(crate::gui::notifications::command_message(action, reason));
+}
+
+pub(crate) fn preview_edit(sim: &Simulation, uiw: &UiWorld, command: &WorldCommand) -> bool {
+    match command.preview(sim) {
+        Ok(_) => true,
+        Err(reason) => {
+            show_edit_error(uiw, command.kind(), reason);
+            false
+        }
+    }
 }
 
 pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
@@ -263,7 +314,8 @@ pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
         *opened = false;
         return;
     };
-    let (identity, topology, water, terrain, _) = map.road_preview_revision();
+    let revision = map.road_preview_revision();
+    let (identity, topology, water, terrain, _) = revision;
     let geometry_key = (identity, topology, water, terrain);
     let geometry = match &state.geometry {
         Some((key, geometry)) if *key == geometry_key => Rc::clone(geometry),
@@ -279,20 +331,36 @@ pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
         let progression = sim.read::<ProgressionState>();
         (progression.mode, progression.highest_milestone)
     };
-    let owned = land.tiles().filter(|&tile| land.owns(tile)).count();
+    let owned = usize::from(land.owned_count());
     let key = (owned, mode, milestone, treasury);
+    let sequence = sim.read::<CommandOutcomes>().batch_seq();
+    if let Some(tile) = state.selected {
+        if state.approaches.as_ref().is_none_or(|approaches| {
+            approaches.tile != tile
+                || approaches.revision != revision
+                || approaches.command_sequence != sequence
+        }) {
+            let (site_count, markers) = match map.preview_land_approaches(tile) {
+                Ok(sites) => {
+                    let count = sites.len();
+                    (Some(count), plan::approach_markers(sites))
+                }
+                Err(_) => (None, Vec::new()),
+            };
+            state.approaches = Some(SelectedApproaches {
+                tile,
+                revision,
+                command_sequence: sequence,
+                site_count,
+                markers: Rc::new(markers),
+            });
+        }
+    }
     drop(map);
     let statuses = match &state.statuses {
         Some((cached, statuses)) if *cached == key => Rc::clone(statuses),
         _ => {
-            let statuses = Rc::new(
-                extent
-                    .tiles()
-                    .map(|tile| {
-                        quote_tile(sim, tile).map_or(TileStatus::Unavailable, |quote| quote.status)
-                    })
-                    .collect(),
-            );
+            let statuses = Rc::new(quote_tile_statuses(sim));
             state.statuses = Some((key, Rc::clone(&statuses)));
             statuses
         }
@@ -321,6 +389,10 @@ pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
                 geometry: Rc::clone(&geometry),
                 statuses,
                 selected: state.selected,
+                approaches: state
+                    .approaches
+                    .as_ref()
+                    .map(|approaches| Rc::clone(&approaches.markers)),
             };
             if let Some(tile) = yakui::util::widget::<PlanWidget>(plan).into_inner() {
                 state.select(tile);
@@ -345,9 +417,7 @@ pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
                         if let Some(tile) = state.selected {
                             titlec(color, tile_name(tile));
                             match quote_tile(sim, tile) {
-                                Ok(quote) => {
-                                    tile_details(uiw, sim, &mut state, &geometry, quote, color)
-                                }
+                                Ok(quote) => tile_details(uiw, sim, &mut state, quote, color),
                                 Err(reason) => {
                                     textc(error(), purchase_error(reason));
                                 }
@@ -396,7 +466,6 @@ fn tile_details(
     uiw: &UiWorld,
     sim: &Simulation,
     state: &mut LandTilesUi,
-    geometry: &MapGeometry,
     quote: TileQuote,
     color: yakui::Color,
 ) {
@@ -421,8 +490,16 @@ fn tile_details(
     if let Some(shortfall) = quote.treasury_shortfall {
         textc(color, format!("Additional funds needed  {shortfall}"));
     }
-    let approaches = geometry.approaches_in(quote.tile);
-    textc(color, format!("Sidewalk approaches  {approaches}"));
+    if let Some(approaches) = state
+        .approaches
+        .as_ref()
+        .filter(|approaches| approaches.tile == quote.tile)
+    {
+        let sites = approaches
+            .site_count
+            .map_or_else(|| "Unavailable".to_owned(), |count| count.to_string());
+        textc(color, format!("Sidewalk approaches  {sites}"));
+    }
 
     let price = quote.price.filter(|_| quote.status == TileStatus::Buyable);
     if state.confirmation.is_some() && state.confirmation != price {
