@@ -1542,7 +1542,7 @@ impl SimulationDeser {
         let elapsed = transit::elapsed_ticks(&sim.resources).0;
         sim.write::<crate::transportation::junction_admission::JunctionAdmission>()
             .validate_loaded(&sim.map(), sim.world(), elapsed)
-            .map_err(&corrupt)?;
+            .map_err(|reason| corrupt(reason.to_owned()))?;
         if sim
             .map()
             .lane_scoring_pilot()

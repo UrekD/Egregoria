@@ -320,6 +320,8 @@ struct ReplayHeader {
     #[serde(default)]
     version: String,
     #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
     revision: Option<u128>,
     #[serde(default)]
     registry: Option<u64>,
