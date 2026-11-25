@@ -1500,14 +1500,15 @@ fn l1_activity_ordered_roster_basket_and_route_boundaries() {
 fn l1_roster_basket_and_route_trace(
     full_scan: bool,
 ) -> Vec<(&'static str, std::collections::BTreeMap<String, u64>)> {
-    use crate::economy::BasketRequest;
-    use crate::economy::{market_update, TripPurpose};
-    use crate::map_dynamic::{itinerary_update, routing_changed_system, routing_update_system};
+    use crate::economy::{market_update, BasketFailure, BasketRequest, TripPurpose};
+    use crate::map_dynamic::{
+        itinerary_update, routing_changed_system, routing_update_system, RoutingStep,
+    };
     use crate::souls::goods_company::{company_soul, company_system};
     use crate::souls::household::BasketId;
     use crate::souls::human::{spawn_human, update_decision_system};
     use crate::souls::residence::Residences;
-    use crate::utils::scheduler::drain_commands;
+    use crate::utils::scheduler::{drain_commands, SeqSchedule};
     use crate::{HumanEnt, HumanWork, ParCommandBuffer, INITIAL_TICK};
     use prototypes::TICKS_PER_HOUR;
 
@@ -1569,6 +1570,22 @@ fn l1_roster_basket_and_route_trace(
         human.router.go_to_for(destination, TripPurpose::Work);
     }
     *sim.write::<GameTime>() = GameTime::new(Tick(INITIAL_TICK + TICKS_PER_HOUR + 1));
+    let seller = SoulID::GoodsCompany(donor);
+    let item = ItemID::new("retail-goods");
+    let groceries = ItemID::new("groceries");
+    let purchases = [(workers[3], 1), (workers[4], 2)];
+    let shop_pos = sim.map().get(shop).unwrap().door_pos.xy();
+    {
+        let mut market = sim.write::<Market>();
+        market.produce(seller, item, 8);
+        market.sell_all(seller, shop_pos, item, 0);
+        market.produce(seller, groceries, 8);
+        market.sell_all(seller, shop_pos, groceries, 0);
+        for (buyer, units) in purchases.into_iter().rev() {
+            let pos = sim.get(buyer).unwrap().trans.pos.xy();
+            market.buy(SoulID::Human(buyer), pos, item, units as u32);
+        }
+    }
     let mut trace = Vec::new();
     let mut record = |phase, sim: &Simulation| trace.push((phase, sim.hashes()));
     let (world, resources) = sim.world_res();
@@ -1585,29 +1602,43 @@ fn l1_roster_basket_and_route_trace(
         sim.get(moved).unwrap().router.target_dest,
         Some(Destination::Building(school))
     );
-    record("market and roster transfer", sim);
+    for (buyer, units) in purchases {
+        let trades = sim
+            .get(buyer)
+            .unwrap()
+            .bought
+            .0
+            .get(&item)
+            .expect("market must hand the retail purchase to the buyer");
+        assert_eq!(trades.len(), 1);
+        assert_eq!(trades[0].buyer, TradeTarget(SoulID::Human(buyer)));
+        assert_eq!(trades[0].seller, TradeTarget(seller));
+        assert_eq!(trades[0].kind, item);
+        assert_eq!(trades[0].qty, units);
+    }
+    let sold = &sim.world.companies[donor].sold.0;
+    assert_eq!(
+        sold.iter()
+            .map(|trade| (trade.buyer, trade.qty))
+            .collect::<Vec<_>>(),
+        purchases.map(|(buyer, units)| (TradeTarget(SoulID::Human(buyer)), units))
+    );
+    record("market purchases and roster transfer", sim);
 
-    // Two purchases are ready for collection during the same decision pass.
+    // Two baskets are ready for collection during the same decision pass.
     // Leave their route planning and the subsequent building exits to the real systems.
     let buyers = [remaining[0], remaining[1]];
-    let seller = SoulID::GoodsCompany(donor);
-    let item = ItemID::new("retail-goods");
-    let pos = sim.map().get(shop).unwrap().door_pos.xy();
-    {
-        let mut market = sim.write::<Market>();
-        market.produce(seller, item, 5);
-        market.sell_all(seller, pos, item, 0);
-    }
     let now = crate::map_dynamic::transit::elapsed_ticks(&sim.resources).0;
     let mut expected_pickups = Vec::new();
     for ((id, units), reserved_at) in buyers.into_iter().zip([2, 3]).zip([now - 1, now]) {
         let request = BasketRequest {
-            fallback: units,
+            staples: 1,
+            fallback: units + 1,
             ..Default::default()
         };
         let (basket, _) = sim
             .write::<Market>()
-            .reserve_basket(id, pos, 600.0, request, reserved_at, |_| Some(shop))
+            .reserve_basket(id, shop_pos, 600.0, request, reserved_at, |_| Some(shop))
             .unwrap();
         let basket_id = basket.id;
         expected_pickups.push(basket_id);
@@ -1622,6 +1653,7 @@ fn l1_roster_basket_and_route_trace(
         human.location = Location::Building(shop);
         human.decision.kind = HumanDecisionKind::PickupBasket(basket_id);
         human.decision.wait = 0;
+        human.router.use_vehicle(None);
         assert!(human.household.reserve(basket, resources));
     }
     sim.insert(Vec::<BasketId>::new());
@@ -1667,6 +1699,67 @@ fn l1_roster_basket_and_route_trace(
     let (world, resources) = sim.world_res();
     itinerary_update(world, resources);
     record("itinerary phase", sim);
+
+    let (world, resources) = sim.world_res();
+    routing_update_system(world, resources);
+    let home_door = sim.map().get(home).unwrap().door_pos;
+    // Complete both walks at the same time and let routing handle building entry.
+    for id in buyers {
+        let human = &mut sim.world.humans[id];
+        assert!(matches!(
+            human.router.cur_step(),
+            Some(RoutingStep::WalkTo(pos)) if *pos == home_door
+        ));
+        human.trans.pos = home_door;
+        human.it = Itinerary::NONE;
+    }
+    let off_shift = GameTime::new(Tick(sim.get_tick() + 12 * TICKS_PER_HOUR));
+    sim.tick(
+        &mut SeqSchedule::default(),
+        [&WorldCommand::SetGameTime(off_shift)],
+    );
+    let (world, resources) = sim.world_res();
+    routing_update_system(world, resources);
+    drain_commands(sim);
+    record("basket buyers arrived home", sim);
+
+    // Both households can shop again only after depositing their carried stock.
+    // The shelf has stock for both, but only the first depositor can reserve
+    // a new basket from this seller during this decision pass.
+    let now = crate::map_dynamic::transit::elapsed_ticks(&sim.resources).0;
+    for ((id, units), picked_up) in buyers.into_iter().zip([2, 3]).zip(expected_pickups) {
+        let human = &mut sim.world.humans[id];
+        assert_eq!(human.location, Location::Building(home));
+        assert!(matches!(
+            human.decision.kind,
+            HumanDecisionKind::DepositAtHome
+        ));
+        assert_eq!(human.decision.wait, 0);
+        assert_eq!(human.household.basket, Some(picked_up));
+        assert_eq!(human.household.carried[&item], units);
+        assert!(human.household.on_hand.is_empty());
+        human.household.next_shop = now;
+    }
+    let (world, resources) = sim.world_res();
+    update_decision_system(world, resources);
+    assert_eq!(
+        buyers.map(|id| sim.get(id).unwrap().household.reservation.is_some()),
+        [true, false],
+        "the first depositor should claim the seller's basket for this tick"
+    );
+    assert_eq!(
+        sim.read::<Market>()
+            .basket_failures()
+            .get(&BasketFailure::Throttled),
+        Some(&1)
+    );
+    for (id, units) in buyers.into_iter().zip([2, 3]) {
+        let stock = &sim.get(id).unwrap().household;
+        assert!(stock.carried.is_empty());
+        assert_eq!(stock.on_hand[&item], units);
+        assert_eq!(stock.on_hand[&groceries], 1);
+    }
+    record("ordered basket deposits at home", sim);
 
     trace
 }
