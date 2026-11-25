@@ -719,7 +719,7 @@ fn sample_capacity(sim: &Simulation, result: &mut Observation) {
 fn mixed_sellers(sim: &Simulation) -> impl Iterator<Item = SoulID> + '_ {
     sim.world().companies.iter().filter_map(|(id, company)| {
         try_prototype(prototypes::GrowableCompanyID::from(company.comp.proto))
-            .filter(|proto| proto.zone_kind == MixedUse)
+            .filter(|proto| proto.chain_key().zone_kind == prototypes::GrowableZoneKind::MixedUse)
             .map(|_| SoulID::GoodsCompany(id))
     })
 }
@@ -865,6 +865,9 @@ fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {
             .unwrap();
         company_soul(&mut ctx.sim, storefront, proto).ok_or("controlled storefront did not open")?
     };
+    if !mixed_sellers(&ctx.sim).any(|seller| seller == business) {
+        return Err("the Mixed Use storefront is missing from seller accounting".into());
+    }
     if let Some(root) = &shots_root {
         fill_skyline(&mut ctx.sim)?;
         // Let the first hourly environment pass populate the value overlay.
