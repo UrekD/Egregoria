@@ -1293,6 +1293,18 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
             plan.graph.record(reason, &[key]);
         }
     }
+    let hraska_egress = SourceKey::Node {
+        id: 4193639666,
+        rail: false,
+    };
+    if let Some(junction) = plan.graph.junctions.get_mut(&hraska_egress) {
+        junction.light = LightPolicy::Lights;
+        junction.turn.left_turns = false;
+        plan.graph.record(
+            "keep Hraška egress turns clear of the opposing green phase",
+            &[hraska_egress],
+        );
+    }
     connect_south_walk(&mut plan.graph)
 }
 

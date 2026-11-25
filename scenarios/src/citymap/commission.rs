@@ -4183,8 +4183,16 @@ mod tests {
             reach.position(local_road, west).unwrap(),
             reach.position(avenue, east).unwrap(),
         );
+        eprintln!("South frontage to Alpska walk: {distance:.1} m");
         assert!(distance <= 170.0,
             "the walk from South homes to the Alpska shops is {distance:.1} m");
+        let hraska_egress = built.junctions[&SourceKey::Node {
+            id: 4193639666,
+            rail: false,
+        }];
+        let junction = &map.intersections()[hraska_egress];
+        assert_eq!(junction.light_policy, simulation::map::LightPolicy::Lights);
+        assert!(!junction.turn_policy.left_turns);
         drop(map);
         paint(&mut sim, opening.parcels.iter()).unwrap();
         verify_votes(&sim, opening.parcels.iter()).unwrap();
