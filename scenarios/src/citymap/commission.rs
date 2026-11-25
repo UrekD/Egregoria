@@ -282,7 +282,8 @@ fn prepare_opening(
     // Give the utilities access to the same labour pool as the shops.
     // A sixth pair covers the utility margin after the reserves are built.
     let wet_intake = at(760.0, 940.0);
-    let wet_outlet = at(1630.0, 510.0);
+    // Keep the outfalls on the downstream bend nearest occupied frontage.
+    let wet_outlet = at(1410.0, 750.0);
     let mut utilities: Vec<_> = cohorts
         .iter()
         .map(|cohort| cohort.anchor)
@@ -452,12 +453,23 @@ fn prepare_opening(
     }
     // These outlying streets had residents short of park coverage after
     // reload. Give their service sites priority over nearby buildable lots.
+    let [meadow, outer] = if wet {
+        [
+            ("south/east-frontage-park", 2598.0, 1118.0),
+            ("south/east-junction-park", 2628.0, 1238.0),
+        ]
+    } else {
+        [
+            ("south/meadow-park", 1800.0, 685.0),
+            ("south/outer-park", 2055.0, 730.0),
+        ]
+    };
     for (name, x, y) in [
         ("hraska/ridge-park", 1940.0, 2647.0),
         ("hraska/north-frontage-park", 2040.0, 2755.0),
         ("south/southwest-park", 1695.0, 885.0),
-        ("south/meadow-park", 1800.0, 685.0),
-        ("south/outer-park", 2055.0, 730.0),
+        meadow,
+        outer,
         ("west/walkway-park", 1220.0, 1945.0),
         ("west/frontage-park", 1370.0, 1560.0),
     ] {
