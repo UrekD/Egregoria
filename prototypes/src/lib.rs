@@ -5,6 +5,7 @@ use geom::Vec2;
 use mlua::{FromLua, Table};
 use std::fmt::Debug;
 use std::hash::Hash;
+use std::sync::atomic::{AtomicPtr, Ordering};
 
 mod macros;
 
@@ -102,21 +103,17 @@ impl ConcretePrototype for NoParent {
     fn insert_parents(&self, _prototypes: &mut Prototypes) {}
 }
 
-static mut PROTOTYPES: Option<&'static Prototypes> = None;
+static PROTOTYPES: AtomicPtr<Prototypes> = AtomicPtr::new(std::ptr::null_mut());
 
 #[inline]
 pub fn prototypes() -> &'static Prototypes {
-    #[cfg(debug_assertions)]
-    {
-        assert!(unsafe { PROTOTYPES.is_some() });
-    }
-
-    // Safety: Please just don't use prototypes before they were loaded... We can allow this footgun
-    unsafe { PROTOTYPES.unwrap_unchecked() }
+    try_prototypes().expect("prototypes must be loaded before use")
 }
 
+#[inline]
 pub fn try_prototypes() -> Option<&'static Prototypes> {
-    unsafe { PROTOTYPES }
+    // SAFETY: Each published registry is immutable and kept alive for the process lifetime.
+    unsafe { PROTOTYPES.load(Ordering::Acquire).as_ref() }
 }
 
 #[inline]

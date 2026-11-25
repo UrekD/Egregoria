@@ -9,7 +9,7 @@ use crate::{Simulation, SimulationOptions};
 use common::logger::MyLog;
 use common::saveload::Encoder;
 use geom::{Vec2, Vec3};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 
 mod citymap_bootstrap;
 mod lifecycle;
@@ -374,9 +374,31 @@ fn w0_water_guarded_terraform_survives_slot_and_replay_boundaries() {
 }
 
 fn init_test_simulation() {
-    // SAFETY: Simulation unit tests run serially because they replace the global registry.
-    unsafe { crate::init::load_prototypes() };
+    static BASE_PROTOTYPES: Mutex<Option<&'static prototypes::Prototypes>> = Mutex::new(None);
+    let mut base = BASE_PROTOTYPES.lock().unwrap();
+    let base_is_loaded = base
+        .zip(prototypes::try_prototypes())
+        .is_some_and(|(base, current)| std::ptr::eq(base, current));
+    if !base_is_loaded {
+        // Default fixtures share one registry. Custom prototype fixtures run serially,
+        // and the next default fixture restores the base data.
+        // SAFETY: The mutex serializes default initialization. Initial publication
+        // is atomic, and custom replacement only occurs in serial runs.
+        unsafe { crate::init::load_prototypes() };
+        *base = Some(prototypes::prototypes());
+    }
     crate::init::register_simulation();
+}
+
+#[test]
+fn w3_water_test_context_reuses_base_prototypes() {
+    let _first = TestCtx::new();
+    let registry = prototypes::prototypes();
+    let _second = TestCtx::new();
+    assert!(
+        std::ptr::eq(registry, prototypes::prototypes()),
+        "creating another test context replaced the base prototype registry"
+    );
 }
 
 pub(crate) struct TestCtx {

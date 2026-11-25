@@ -3,6 +3,7 @@ use crate::{validation, Prototypes, PROTOTYPES};
 use common::error::MultiError;
 use mlua::{Lua, Table};
 use std::io;
+use std::sync::atomic::Ordering;
 use thiserror::Error;
 
 pub fn test_prototypes(lua: &str) {
@@ -58,9 +59,7 @@ unsafe fn load_prototypes_str(l: Lua, main: &str) -> Result<(), PrototypeLoadErr
     p.compute_orderings();
     p.print_stats();
 
-    unsafe {
-        PROTOTYPES = Some(Box::leak(p));
-    }
+    PROTOTYPES.store(Box::into_raw(p), Ordering::Release);
 
     Ok(())
 }
