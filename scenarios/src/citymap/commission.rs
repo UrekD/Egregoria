@@ -631,6 +631,15 @@ fn prepare_opening(
         )?;
         sites.insert("south/east-fire-station".into(), station);
     }
+    if profiled_wet {
+        let depot = place_company_around_parcels(
+            sim,
+            "garbage-depot",
+            at(2390.0, 1125.0),
+            Some("south"),
+        )?;
+        sites.insert("south/east-garbage-depot".into(), depot);
+    }
 
     Ok(OpeningLayout {
         cohorts,
@@ -4273,6 +4282,9 @@ mod tests {
             let rim = super::super::layout::design_point(vec2(718.0, 1948.0), plan.config);
             let bakery = &map.buildings()[opening.sites["west/northwest-bakery"]];
             assert!(bakery.door_pos.xy().distance(rim) <= 150.0);
+            let south = super::super::layout::design_point(vec2(2390.0, 1125.0), plan.config);
+            let depot = &map.buildings()[opening.sites["south/east-garbage-depot"]];
+            assert!(depot.door_pos.xy().distance(south) <= 150.0);
             assert_eq!(opening.intake_homes.len(), 12);
             assert!(opening.parcels.iter()
                 .filter(|parcel| opening.intake_homes.contains(&parcel.lot))
