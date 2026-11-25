@@ -8,6 +8,7 @@ use super::source::{
 };
 use geom::{vec2, Vec2};
 use serde::Serialize;
+use simulation::map::LightPolicy;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize)]
@@ -253,6 +254,18 @@ pub fn plan_town(
         graph.record(
             "keep the west–south infill shortcut for walking",
             &[west_south_shortcut],
+        );
+    }
+    let west_local_junction = SourceKey::Node {
+        id: 3567122171,
+        rail: false,
+    };
+    if let Some(junction) = graph.junctions.get_mut(&west_local_junction) {
+        // The automatic signal backed traffic through the short approach from the north.
+        junction.light = LightPolicy::StopSigns;
+        graph.record(
+            "use an all-way stop to keep the short West approach flowing",
+            &[west_local_junction],
         );
     }
 

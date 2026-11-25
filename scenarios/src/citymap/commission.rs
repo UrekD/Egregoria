@@ -1472,7 +1472,8 @@ fn install_bus_loops(
         super::layout::design_point(vec2(2390.0, 2540.0), plan.config), // Employment frontage.
     ];
     let routes = [
-        ("neighbourhood", [0, 1, 2], 3),
+        // South to West has a long detour around the walking-only link.
+        ("neighbourhood", [0, 1, 2], 7),
         ("employment", [0, 3, 4], 6),
     ];
     let berths = {
@@ -2090,6 +2091,9 @@ fn verify_infill(
     manifest: &OpeningManifest,
 ) -> Result<(), String> {
     let startup_state = snapshot(sim, plan, manifest);
+    let mut opening_parcels = manifest.parcels.clone();
+    record_development(&sim.map(), &mut opening_parcels);
+    verify_votes(sim, opening_parcels.iter())?;
     let road = {
         let map = sim.map();
         let mut painted = sim.read::<ZoneGrid>().clone();
@@ -2102,8 +2106,7 @@ fn verify_infill(
             )
             .map_err(|error| format!("infill paint on {:?}: {error:?}", parcel.lot))?;
         }
-        let planned_votes = manifest
-            .parcels
+        let planned_votes = opening_parcels
             .iter()
             .chain(&manifest.reserves)
             .map(|parcel| (parcel.lot, parcel.zoning))
@@ -2234,7 +2237,7 @@ fn verify_infill(
     }
 
     paint(sim, manifest.reserves.iter())?;
-    verify_votes(sim, manifest.parcels.iter().chain(&manifest.reserves))?;
+    verify_votes(sim, opening_parcels.iter().chain(&manifest.reserves))?;
     advance(sim, &mut Simulation::schedule(), TICKS_PER_BUDGET_DAY);
 
     let mut developed = manifest.reserves.clone();
