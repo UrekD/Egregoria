@@ -563,6 +563,17 @@ fn prepare_opening(
     )?;
     verify_parking_pair(&sim.map(), backup_mine, plant, Tick(sim.get_tick()))?;
     sites.insert("coal-mine-4".into(), backup_mine);
+    if wet {
+        // The existing stations serve the eastern blocks to capacity before
+        // reaching this South frontage. Give it local fire service.
+        let station = place_company_around_parcels(
+            sim,
+            "fire-station",
+            at(2438.0, 938.0),
+            Some("south"),
+        )?;
+        sites.insert("south/east-fire-station".into(), station);
+    }
 
     Ok(OpeningLayout {
         cohorts,
@@ -608,6 +619,10 @@ pub(super) fn commission_opening(
             && local.x >= 2700.0
             && local.y >= 950.0
     };
+    let early_retail = |parcel: &Parcel| {
+        parcel.zoning.kind == ZoneKind::Commercial
+            && matches!(parcel.district, "hraska" | "south")
+    };
     let mut schedule = Simulation::schedule();
     if wet {
         // Settle the houses by the outfalls first so the shoreline services
@@ -623,8 +638,8 @@ pub(super) fn commission_opening(
         advance(sim, &mut schedule, 2 * TICKS_PER_HOUR);
         record_development(&sim.map(), &mut parcels);
     }
-    // Ordinary housing opens before the shops/factories. This gives civic and
-    // utility sites a chance to hire while the first households arrive.
+    // Ordinary housing opens first so civic and utility sites can hire while
+    // the first households arrive.
     let housing = parcels.iter().filter(|parcel| {
         parcel.zoning.kind == ZoneKind::Residential
             && !(wet && (near_outfalls(parcel) || near_east_market(parcel)))
@@ -636,6 +651,11 @@ pub(super) fn commission_opening(
             .iter()
             .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential),
     )?;
+    if wet {
+        // Open local retail while these districts are settling so shops can
+        // hire from the neighbourhood before the industrial parcels open.
+        paint(sim, parcels.iter().filter(|parcel| early_retail(parcel)))?;
+    }
     advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
     apply(sim, "district depot policies", &depots)?;
     let (station, ent) = sim
@@ -660,7 +680,9 @@ pub(super) fn commission_opening(
         sim,
         parcels
             .iter()
-            .filter(|parcel| parcel.zoning.kind == ZoneKind::Commercial),
+            .filter(|parcel| {
+                parcel.zoning.kind == ZoneKind::Commercial && !(wet && early_retail(parcel))
+            }),
     )?;
     record_development(&sim.map(), &mut parcels);
     verify_votes(sim, parcels.iter())?;
@@ -4145,6 +4167,14 @@ mod tests {
         let entry = super::super::layout::design_point(vec2(2350.0, 1960.0), plan.config);
         assert!(store.obb.center().distance(entry) <= 100.0,
             "the employment supermarket should fit within 100 m of the staffed town-facing frontage");
+        let east_homes = super::super::layout::design_point(vec2(2438.0, 938.0), plan.config);
+        let fire_station = prototypes::GoodsCompanyID::new("fire-station");
+        let nearest_fire = map.buildings().values()
+            .filter(|building| building.kind.as_goods_company() == Some(fire_station))
+            .map(|building| building.obb.center().distance(east_homes))
+            .fold(f32::INFINITY, f32::min);
+        assert!(nearest_fire <= 140.0,
+            "the nearest fire station is {nearest_fire:.1} m from uncovered South frontage");
         drop(map);
         paint(&mut sim, opening.parcels.iter()).unwrap();
         verify_votes(&sim, opening.parcels.iter()).unwrap();
