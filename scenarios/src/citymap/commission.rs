@@ -76,6 +76,7 @@ struct BusLine {
     id: LineID,
     stops: Vec<StopID>,
     lanes: Vec<LaneID>,
+    vehicles: u8,
 }
 
 #[derive(Serialize)]
@@ -110,33 +111,33 @@ pub fn commission(
         Cohort {
             district: "station",
             anchor: at(2100.0, 1635.0),
-            houses: 43,
+            houses: 40,
             infill: 11,
-            retail: 15,
+            retail: 10,
             industry: 0,
         },
         Cohort {
             district: "hraska",
             anchor: at(1950.0, 2200.0),
-            houses: 74,
+            houses: 75,
             infill: 20,
-            retail: 24,
+            retail: 14,
             industry: 0,
         },
         Cohort {
             district: "south",
             anchor: at(2060.0, 1180.0),
-            houses: 85,
+            houses: 88,
             infill: 22,
-            retail: 27,
+            retail: 16,
             industry: 0,
         },
         Cohort {
             district: "west",
             anchor: at(1415.0, 1690.0),
-            houses: 80,
+            houses: 82,
             infill: 22,
-            retail: 25,
+            retail: 14,
             industry: 0,
         },
         Cohort {
@@ -144,8 +145,8 @@ pub fn commission(
             anchor: at(2530.0, 2375.0),
             houses: 0,
             infill: 5,
-            retail: 4,
-            industry: 37,
+            retail: 8,
+            industry: 44,
         },
     ];
     let mut sites = BTreeMap::new();
@@ -157,23 +158,14 @@ pub fn commission(
     verify_parking_pair(&sim.map(), terminal, buyer, Tick(sim.get_tick()))?;
 
     let utilities = at(2630.0, 2440.0);
-    // Each fully staffed pair contributes 2,000 units. Plan for the occupied
-    // town, commercial/industrial draw and unpainted infill on the same network.
-    for (index, shift) in [
-        vec2(0.0, 0.0),
-        vec2(-140.0, 210.0),
-        vec2(160.0, -180.0),
-        vec2(-170.0, -260.0),
-        vec2(110.0, 290.0),
-    ]
-    .into_iter()
-    .enumerate()
-    {
+    // Give the utilities access to the same labour pool as the shops.
+    // All five pairs feed the town network.
+    for (index, cohort) in cohorts.iter().enumerate() {
         for (name, building) in ["water-pump", "sewage-outlet"].into_iter().zip(water_sites(
             sim,
             plan,
             &roads,
-            utilities + shift,
+            cohort.anchor,
         )?) {
             sites.insert(format!("{name}-{}", index + 1), building);
         }
@@ -186,15 +178,89 @@ pub fn commission(
         let building = place_company(sim, plan, &roads, name, anchor)?.0;
         sites.insert(format!("{name}-{}", sites.len()), building);
     }
-    for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
-        let bakery = place_company(sim, plan, &roads, "bakery", cohort.anchor)?.0;
-        sites.insert(format!("{}/bakery", cohort.district), bakery);
+    // Stock flour and bread through short production and delivery routes.
+    // Place the mills on the outskirts to leave the terminal bakery its
+    // natural rail supplier.
+    for (i, (x, y)) in [
+        (1110.0, 1550.0),
+        (1320.0, 1310.0),
+        (1490.0, 1010.0),
+        (1850.0, 810.0),
+        (2250.0, 1020.0),
+        (2500.0, 1370.0),
+        (1710.0, 2460.0),
+        (1940.0, 2620.0),
+        (2250.0, 2450.0),
+        (2560.0, 2100.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (building, _) = place_company(sim, plan, &roads, "flour-factory", at(x, y))?;
+        sites.insert(format!("flour-mill-{}", i + 1), building);
     }
-
-    // A local mill expands the ordinary flour supply for the neighbourhood
-    // bakeries. Freight acceptance still uses the terminal bakery's receipts.
-    let mill = place_company(sim, plan, &roads, "flour-factory", at(1130.0, 1570.0))?.0;
-    sites.insert("west/flour-mill".into(), mill);
+    for (i, (x, y)) in [
+        (1030.0, 1460.0),
+        (1730.0, 800.0),
+        (2180.0, 2760.0),
+        (2680.0, 2150.0),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (building, _) = place_company(sim, plan, &roads, "cereal-farm", at(x, y))?;
+        sites.insert(format!("cereal-farm-{}", i + 1), building);
+    }
+    for cohort in &cohorts {
+        for (i, (x, y)) in [
+            (-180., -180.),
+            (-165., 110.),
+            (-35., -95.),
+            (-30., 180.),
+            (100., -210.),
+            (155., -60.),
+            (160., 130.),
+            (35., 50.),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let anchor = cohort.anchor + vec2(x, y);
+            let (building, _) = place_company(sim, plan, &roads, "bakery", anchor)?;
+            sites.insert(format!("{}/bakery-{}", cohort.district, i + 1), building);
+        }
+    }
+    // Leave a park site within the dense blocks before assigning their frontage
+    // to housing, in places where fitting a park afterwards would displace a lot.
+    for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
+        let polygon = &plan
+            .districts
+            .iter()
+            .find(|d| d.key == cohort.district)
+            .unwrap()
+            .polygon;
+        let mut parks: Vec<Vec2> = Vec::new();
+        for index in 1..=6 {
+            let Some((building, _)) =
+                place_scored_company(sim, plan, &roads, "park", |_, _, footprint| {
+                    let center = footprint.center();
+                    if !contains(polygon, center) {
+                        return None;
+                    }
+                    let dist = center.distance(cohort.anchor);
+                    let separation = parks
+                        .iter()
+                        .map(|&park| park.distance(center))
+                        .fold(200.0, f32::min);
+                    Some(dist - 4.0 * separation)
+                })?
+            else {
+                break;
+            };
+            parks.push(sim.map().buildings()[building].obb.center());
+            sites.insert(format!("{}/pocket-park-{index}", cohort.district), building);
+        }
+    }
 
     // Ordinary housing opens before the shops/factories. This gives civic and
     // utility sites a chance to hire while the first households arrive.
@@ -225,12 +291,16 @@ pub fn commission(
     }
     paint(
         sim,
-        parcels.iter().filter(|parcel| {
-            matches!(
-                parcel.zoning.kind,
-                ZoneKind::Industrial | ZoneKind::Commercial
-            )
-        }),
+        parcels
+            .iter()
+            .filter(|parcel| parcel.zoning.kind == ZoneKind::Industrial),
+    )?;
+    advance(sim, &mut schedule, 4 * TICKS_PER_HOUR);
+    paint(
+        sim,
+        parcels
+            .iter()
+            .filter(|parcel| parcel.zoning.kind == ZoneKind::Commercial),
     )?;
     verify_votes(sim, parcels.iter())?;
 
@@ -1085,7 +1155,10 @@ fn install_bus_loops(
         super::layout::design_point(vec2(1920.0, 2400.0), plan.config),
         cohorts[4].anchor, // Employment edge.
     ];
-    let routes = [("neighbourhood", [0, 1, 2]), ("employment", [0, 3, 4])];
+    let routes = [
+        ("neighbourhood", [0, 1, 2], 5),
+        ("employment", [0, 3, 4], 3),
+    ];
     let berths = {
         let map = sim.map();
         let mut options = Vec::new();
@@ -1171,7 +1244,7 @@ fn install_bus_loops(
                 .enumerate()
                 .map(|(i, berths)| berths[(mask >> i) & 1])
                 .collect();
-            let legs = routes.map(|(_, indices)| {
+            let legs = routes.map(|(_, indices, _)| {
                 let a = indices.map(|i| candidate[i]);
                 let b = [a[0], a[2], a[1]];
                 [a, b]
@@ -1192,7 +1265,7 @@ fn install_bus_loops(
 
     let mut lines = BTreeMap::new();
     let mut stops_by_lane = BTreeMap::new();
-    for ((key, _), berths) in routes.into_iter().zip(berths) {
+    for ((key, _, vehicles), berths) in routes.into_iter().zip(berths) {
         let mut stops = Vec::new();
         let mut lanes = Vec::new();
         for berth in berths {
@@ -1238,14 +1311,25 @@ fn install_bus_loops(
             sim,
             key,
             &[
-                WorldCommand::TransitSetVehicles { line: id, n: 3 },
+                WorldCommand::TransitSetVehicles {
+                    line: id,
+                    n: vehicles,
+                },
                 WorldCommand::TransitSetFare {
                     line: id,
                     fare: Money::ZERO,
                 },
             ],
         )?;
-        lines.insert(key, BusLine { id, stops, lanes });
+        lines.insert(
+            key,
+            BusLine {
+                id,
+                stops,
+                lanes,
+                vehicles,
+            },
+        );
     }
     Ok(lines)
 }
@@ -1610,7 +1694,9 @@ fn verify_opening_ids(sim: &Simulation, manifest: &OpeningManifest) -> Result<u3
     }
     for (key, line) in &manifest.lines {
         if !transit.lines.get(line.id).is_some_and(|actual| {
-            actual.stops == line.stops && !actual.suspended && actual.target_vehicles == 3
+            actual.stops == line.stops
+                && !actual.suspended
+                && actual.target_vehicles == line.vehicles
         }) || transit.directed_leg_times(line.id).is_none()
         {
             return Err(format!("line {key} suspended or missing after reload"));
