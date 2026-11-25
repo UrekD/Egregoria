@@ -1,6 +1,7 @@
 use crate::gui::TimeAlways;
 use crate::init::{INIT_FUNCS, SAVELOAD_FUNCS};
 use crate::session::{CityProgress, SaveInFlight, SaveRequest, WorldJob, WorldReplacement};
+pub use crate::sim_thread::TilePurchaseReceipt;
 use common::saveload::Encoder;
 use simulation::utils::resources::{RefMutSingle, RefSingle, ResourcesSingleThread};
 use simulation::world_command::{Rejection, WorldCommand, WorldCommands};
@@ -161,16 +162,6 @@ impl UiWorld {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TilePurchaseReceipt {
-    pub generation: u64,
-    pub frame: u64,
-    pub batch_sequence: u64,
-    pub command_index: usize,
-    pub tile: simulation::map::LandTileId,
-    pub result: Result<simulation::map::TilePurchased, simulation::world_command::Rejection>,
-}
-
 #[derive(Default)]
 pub struct ReceivedCommands {
     commands: WorldCommands,
@@ -196,6 +187,7 @@ impl ReceivedCommands {
 
     pub(crate) fn receive(&mut self, batch: &crate::sim_thread::AppliedBatch) {
         self.commands.merge(&batch.accepted_commands());
+        self.tile_purchases.extend_from_slice(&batch.tile_purchases);
         self.placements
             .extend(
                 batch

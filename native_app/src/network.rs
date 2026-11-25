@@ -1,11 +1,11 @@
 #[cfg(feature = "multiplayer")]
 pub use self::inner::*;
-use crate::uiworld::UiWorld;
 #[cfg(any(feature = "multiplayer", test))]
 use crate::uiworld::TilePurchaseReceipt;
+use crate::uiworld::UiWorld;
+use common::timestep::Timestep;
 #[cfg(any(feature = "multiplayer", test))]
 use simulation::world_command::{CommandOutcomes, WorldCommand, WorldCommands};
-use common::timestep::Timestep;
 
 #[cfg(feature = "multiplayer")]
 #[derive(Clone, Copy)]
@@ -46,36 +46,13 @@ fn local_frame_commands<'a>(
         .filter_map(|(index, (local, command))| local.then_some((index, command)))
 }
 
-#[cfg(any(feature = "multiplayer", test))]
-fn tile_receipts<'a>(
-    generation: u64,
-    frame: u64,
-    outcomes: &'a CommandOutcomes,
-    commands: impl IntoIterator<Item = (usize, &'a WorldCommand)> + 'a,
-) -> impl Iterator<Item = TilePurchaseReceipt> + 'a {
-    commands
-        .into_iter()
-        .filter_map(move |(command_index, command)| {
-            let WorldCommand::BuyTile { tile } = *command else {
-                return None;
-            };
-            Some(TilePurchaseReceipt {
-                generation,
-                frame,
-                command_index,
-                tile,
-                batch_sequence: outcomes.batch_seq(),
-                result: outcomes.tile_purchase(command_index)?,
-            })
-        })
-}
-
 pub fn is_singleplayer(uiw: &UiWorld) -> bool {
     matches!(*uiw.read::<NetworkState>(), NetworkState::Singleplayer(_))
 }
 
 #[cfg(feature = "multiplayer")]
 mod inner {
+    use super::{CommandOutcomes, TilePurchaseReceipt, WorldCommands};
     use crate::game_loop::{State, Timings, VERSION};
     use crate::gui::windows::network::NetworkConnectionInfo;
     use crate::uiworld::ReceivedCommands;
@@ -84,7 +61,6 @@ mod inner {
         ConnectConf, Frame, PollResult, ServerConfiguration, ServerPollResult, VirtualClientConf,
     };
     use prototypes::DELTA_F64;
-    use super::{CommandOutcomes, WorldCommands};
     use simulation::Simulation;
     use std::net::ToSocketAddrs;
     use std::sync::Mutex;
@@ -178,7 +154,7 @@ mod inner {
                         inputs.iter().map(|input| (input.sent_by_me, &input.inp)),
                     )
                 };
-                purchases.extend(super::tile_receipts(
+                purchases.extend(TilePurchaseReceipt::from_outcomes(
                     generation,
                     frame_commands.frame.0,
                     &outcomes,
@@ -308,7 +284,7 @@ fn land_receipts_keep_local_command_indices_across_catch_up_frames() {
             &mut Simulation::schedule(),
             remote.iter().chain(local.iter()),
         );
-        receipts.extend(tile_receipts(
+        receipts.extend(TilePurchaseReceipt::from_outcomes(
             4,
             frame,
             &sim.read::<CommandOutcomes>(),
@@ -324,7 +300,7 @@ fn land_receipts_keep_local_command_indices_across_catch_up_frames() {
         remote.iter().chain(oversized.iter()),
     );
     let outcomes = sim.read::<CommandOutcomes>();
-    let rejected = tile_receipts(
+    let rejected = TilePurchaseReceipt::from_outcomes(
         4,
         4,
         &outcomes,

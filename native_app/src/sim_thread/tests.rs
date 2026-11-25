@@ -418,6 +418,88 @@ fn scale_t1_fix_editor_budgets_expanded_work() {
 }
 
 #[test]
+fn tiles_worker_delivers_purchase_receipts_to_ui() {
+    use crate::uiworld::ReceivedCommands;
+    use simulation::map::{LandMode, LandTileId, ZoneKind};
+    use simulation::{MapPreset, NewGameOptions};
+
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let sim = Simulation::new_game(&NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: 16,
+        land_mode: LandMode::Tiled,
+        ..NewGameOptions::default()
+    })
+    .unwrap();
+    let tick = sim.get_tick();
+    let mut driver = SimThread::start(sim, Simulation::schedule(), 7, None);
+    let denied = LandTileId { x: 10, y: 7 };
+    let paid = LandTileId { x: 9, y: 7 };
+    let mut received = ReceivedCommands::default();
+    for tile in [denied, paid] {
+        let commands = WorldCommands::from(vec![
+            WorldCommand::SetTaxRate {
+                zone: ZoneKind::Residential,
+                rate_permille: 120,
+            },
+            WorldCommand::BuyTile { tile },
+        ]);
+        assert!(driver.submit(Request::Batch(commands)).is_ok());
+        let ReplyKind::Applied(batch) = receive(&mut driver).kind else {
+            panic!("missing applied batch");
+        };
+        assert!(!batch.advanced);
+        received.receive(&batch);
+    }
+    let [first, second] = received.tile_purchases.as_slice() else {
+        panic!("expected two purchase receipts");
+    };
+    assert_eq!(first.tile, denied);
+    assert_eq!(first.result, Err(Rejection::TileNotAdjacent));
+    assert_eq!(second.tile, paid);
+    assert_eq!(second.result.unwrap().tile, paid);
+    assert!(first.batch_sequence < second.batch_sequence);
+    for receipt in [first, second] {
+        assert_eq!(
+            (receipt.generation, receipt.frame, receipt.command_index),
+            (7, tick, 1)
+        );
+    }
+}
+
+#[test]
+fn tiles_worker_replay_accepts_recorded_rejected_init() {
+    use simulation::{MapPreset, NewGameOptions, Replay, SimulationOptions};
+
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let mut recorded = Simulation::new_with_options(SimulationOptions {
+        terrain_size: NewGameOptions::MIN_TERRAIN_CHUNKS,
+        preset: MapPreset::Flat,
+        ..SimulationOptions::LEGACY
+    });
+    let init = WorldCommand::Init(Box::new(SimulationOptions::LEGACY));
+    assert!(!fits(&WorldCommands::from(vec![init.clone()])));
+    recorded.apply_commands([&init]);
+    let (sim, cursor) = Simulation::try_from_replay(recorded.read::<Replay>().clone()).unwrap();
+    cursor.validate_batches(fits_replay_batch).unwrap();
+
+    let mut driver = SimThread::start(sim, Simulation::schedule(), 7, Some(cursor));
+    assert!(driver
+        .submit(Request::ReplayControl(ReplayControl::Step(1)))
+        .is_ok());
+    assert!(matches!(
+        receive(&mut driver).kind,
+        ReplyKind::ReplayStepped(boundary) if boundary.completed_step == 0
+    ));
+    assert_eq!(
+        driver.view().try_read().unwrap().hashes(),
+        recorded.hashes()
+    );
+}
+
+#[test]
 fn scale_t1_fix_replay_allows_historical_group_over_editor_limit() {
     let (_, mut schedule) = world();
     let tick = prototypes::Tick(1);

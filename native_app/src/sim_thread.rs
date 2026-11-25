@@ -9,7 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::saveload::{Bincode, Encoder, SnapshotRevision};
 use common::timestep::{debug_up_dt, MAX_WARP};
-use simulation::map::{WaterEditError, WaterEditOutcome};
+use simulation::map::{LandTileId, TilePurchased, WaterEditError, WaterEditOutcome};
 use simulation::transportation::RoadThroughput;
 use simulation::utils::replay::{ReplayAdvance, ReplayBudget, ReplayNext, ReplayOperation};
 use simulation::utils::scheduler::SeqSchedule;
@@ -56,6 +56,41 @@ pub(crate) struct Boundary {
     pub tick: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TilePurchaseReceipt {
+    pub generation: u64,
+    pub frame: u64,
+    pub batch_sequence: u64,
+    pub command_index: usize,
+    pub tile: LandTileId,
+    pub result: Result<TilePurchased, Rejection>,
+}
+
+impl TilePurchaseReceipt {
+    pub(crate) fn from_outcomes<'a>(
+        generation: u64,
+        frame: u64,
+        outcomes: &'a CommandOutcomes,
+        commands: impl IntoIterator<Item = (usize, &'a WorldCommand)> + 'a,
+    ) -> impl Iterator<Item = Self> + 'a {
+        commands
+            .into_iter()
+            .filter_map(move |(command_index, command)| {
+                let WorldCommand::BuyTile { tile } = *command else {
+                    return None;
+                };
+                Some(Self {
+                    generation,
+                    frame,
+                    command_index,
+                    tile,
+                    batch_sequence: outcomes.batch_seq(),
+                    result: outcomes.tile_purchase(command_index)?,
+                })
+            })
+    }
+}
+
 pub(crate) struct AppliedBatch {
     pub id: BatchId,
     pub boundary: Boundary,
@@ -65,6 +100,7 @@ pub(crate) struct AppliedBatch {
     pub rejections: Vec<(usize, &'static str, Rejection)>,
     pub link_outcomes: Vec<(usize, LinkOutcome)>,
     pub water_edits: Vec<(usize, Result<WaterEditOutcome, WaterEditError>)>,
+    pub tile_purchases: Vec<TilePurchaseReceipt>,
     pub commands: WorldCommands,
 }
 
@@ -652,7 +688,8 @@ fn work_fits<'a>(
     for command in commands {
         use WorldCommand::*;
         let expanded = match command {
-            Init(_) => return false,
+            // An Init in a playback batch is rejected without bootstrapping.
+            Init(_) if !replay => return false,
             SpawnRandomCars { n_cars } if replay || *n_cars <= 512 => *n_cars,
             AddTrain { n_wagons, .. } if replay || *n_wagons <= 128 => *n_wagons as usize,
             SpawnTrain { wagons, .. } if replay || wagons.len() <= 128 => wagons.len(),
@@ -1279,6 +1316,13 @@ impl Worker {
             water_edits: (0..commands.as_ref().len())
                 .filter_map(|i| outcomes.water_edit(i).cloned().map(|result| (i, result)))
                 .collect(),
+            tile_purchases: TilePurchaseReceipt::from_outcomes(
+                id.generation,
+                self.status.boundary.tick,
+                &outcomes,
+                commands.iter().enumerate(),
+            )
+            .collect(),
             commands,
         })
     }
