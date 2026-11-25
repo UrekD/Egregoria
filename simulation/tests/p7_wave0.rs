@@ -9,7 +9,6 @@ use simulation::transportation::{
 use simulation::VehicleID;
 
 #[test]
-#[ignore = "P7-J: stock panic bypasses perpendicular conflict braking"]
 fn p7_junction_receiving() {
     let now = GameTime::new(Tick(1));
     let car_position = Transform::new(vec3(0.0, 0.0, 0.0));
@@ -54,5 +53,22 @@ fn p7_junction_receiving() {
         decide(VehicleState::Panicking(now.instant()), &conflict),
         0.0,
         "panic must hold the approach while the conflict is occupied",
+    );
+    let leader = [(vec2(1.5, 0.0), &car)];
+    assert!(decide(VehicleState::Panicking(now.instant()), &leader) > 0.0);
+    let blocked_view = [leader[0], conflict[0]];
+    assert_eq!(
+        decide(VehicleState::Panicking(now.instant()), &blocked_view),
+        0.0
+    );
+    let different_deck = TransportState {
+        height: 10.0,
+        ..crossing
+    };
+    assert!(
+        decide(
+            VehicleState::Panicking(now.instant()),
+            &[(conflict[0].0, &different_deck)]
+        ) > 0.0
     );
 }

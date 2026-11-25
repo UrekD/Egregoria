@@ -5,7 +5,7 @@ use std::ops::Deref;
 use super::*;
 
 /// FreightStationPrototype is a freight station
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct FreightStationPrototype {
     pub base: PrototypeBase,
     pub id: FreightStationPrototypeID,

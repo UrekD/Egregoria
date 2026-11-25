@@ -11,7 +11,6 @@ use crate::{
 #[test]
 fn test_base() {
     unsafe {
-        zones2_check_live_loader_rejects_mixed();
         match load_prototypes("../") {
             Ok(_) => {}
             Err(e) => {
@@ -32,6 +31,10 @@ fn test_base() {
         println!("{:?}", try_prototype(GoodsCompanyID::new("solar-panel")));
         println!("{:?}", try_prototype(SolarPanelID::new("solar-panel")));
 
+        let profiles_enabled = try_prototype(GrowableCompanyID::new("commercial-l1"))
+            .unwrap()
+            .massing
+            .is_some();
         for (name, zone) in [
             ("industrial-l1", ZoneKind::Industrial),
             ("commercial-l1", ZoneKind::Commercial),
@@ -42,17 +45,14 @@ fn test_base() {
             assert!(growable.growable);
             assert_eq!(growable.zone_kind, zone);
             assert_eq!(growable.level, 1);
-            assert!(growable.massing.is_none());
+            assert_eq!(growable.massing.is_some(), profiles_enabled);
         }
 
         let residences: Vec<_> = ResidencePrototype::iter().collect();
-        assert_eq!(residences.len(), 9);
+        assert_eq!(residences.len(), if profiles_enabled { 34 } else { 9 });
         for density in [Density::Low, Density::Medium, Density::High] {
             for level in 1..=3 {
-                let residence = residences
-                    .iter()
-                    .find(|r| r.density == density && r.level == level)
-                    .unwrap();
+                let residence = crate::prototypes().legacy_residence(density, level).unwrap();
                 assert!(matches!(residence.bgen, BuildingGen::House));
                 assert_eq!(
                     residence.zone_kind,
@@ -63,10 +63,13 @@ fn test_base() {
                 assert!(residence.water_consumption.is_some_and(|rate| rate > 0.0));
             }
         }
-        assert!(crate::prototypes()
-            .mixed_use_pair(Density::Medium)
-            .is_none());
-        assert!(try_prototype(GoodsCompanyID::new("mixed-medium-l1")).is_none());
+        for density in [Density::Medium, Density::High] {
+            assert_eq!(
+                crate::prototypes().mixed_use_pair(density).is_some(),
+                profiles_enabled
+            );
+        }
+        assert!(crate::prototypes().mixed_use_pair(Density::Low).is_none());
         let services: Vec<_> = ServicePrototype::iter().collect();
         assert_eq!(services.len(), 8);
         for kind in [
@@ -114,49 +117,10 @@ fn test_base() {
     }
 }
 
-unsafe fn zones2_check_live_loader_rejects_mixed() {
-    let fixture = std::env::temp_dir().join(format!("egregoria-zones2-{}", std::process::id()));
-    let mod_dir = fixture.join("base_mod");
-    std::fs::create_dir_all(&mod_dir).unwrap();
-    let mut outcomes = Vec::new();
-    for (lua_prelude, kind, density) in [
-        ("", "growable-company", "low"),
-        (
-            "zones2_profiles_enabled = true",
-            "growable-company",
-            "medium",
-        ),
-        ("zones2_profiles_enabled = true", "residence", "high"),
-    ] {
-        let script = format!(
-            r#"{lua_prelude}
-            data:extend {{
-                type = "{kind}", name = "staged-mixed", label = "Staged Mixed Use",
-                size = 20, bgen = "house", asset = "bakery.glb", price = 0,
-                zone_kind = "mixed-use", density = "{density}", level = 1,
-                lot_size_min = 400, capacity = 4, growable = true, kind = "store",
-                n_workers = 12,
-            }}"#
-        );
-        std::fs::write(mod_dir.join("data.lua"), script).unwrap();
-        outcomes.push(unsafe { load_prototypes(&format!("{}/", fixture.display())) });
-    }
-    std::fs::remove_dir_all(fixture).unwrap();
-    for outcome in outcomes {
-        let error = outcome
-            .expect_err("live loader accepted staged Mixed Use")
-            .to_string();
-        assert!(
-            error.contains("Mixed Use requires checked placement"),
-            "{error}"
-        );
-    }
-}
-
 #[test]
 fn zones2_profiled_base_registers_mixed_pairs() {
     let registry = zones2_base();
-    assert_eq!(registry.residence.len(), 25);
+    assert_eq!(registry.residence.len(), 34);
     assert_eq!(registry.growable_company.len(), 11);
     assert!(registry.mixed_use_pair(Density::Low).is_none());
 
@@ -330,6 +294,33 @@ fn zones2_pure_chains_keep_ids_and_profile_each_density() {
 }
 
 #[test]
+fn zones2_z1_staged_registry_keeps_legacy_capacity_and_utilities() {
+    let registry = zones2_base();
+    for (density, density_name, capacities) in [
+        (Density::Low, "low", [2, 4, 6]),
+        (Density::Medium, "medium", [3, 6, 9]),
+        (Density::High, "high", [4, 8, 12]),
+    ] {
+        for (level, capacity) in (1..=3).zip(capacities) {
+            let home = registry
+                .legacy_residence(density, level)
+                .expect("the staged registry must still supply manual homes");
+            assert_eq!(
+                home.name,
+                format!("residence-legacy-{density_name}-l{level}")
+            );
+            assert!(home.massing.is_none());
+            assert_eq!(home.capacity, capacity);
+            assert_eq!(
+                home.power_consumption,
+                Some(crate::Power::new(i64::from(capacity) * 100))
+            );
+            assert_eq!(home.water_consumption, Some(capacity as f32));
+        }
+    }
+}
+
+#[test]
 fn zones2_named_legacy_home_does_not_shadow_profiled_chain() {
     let registry = zones2_base_with(
         r#"data:extend {
@@ -456,7 +447,6 @@ fn zones2_base_with(extra_lua: &str) -> crate::Prototypes {
 
 fn zones2_lua() -> mlua::Lua {
     let lua = mlua::Lua::new();
-    lua.set_app_data(crate::AllowStagedMixedUse);
     let globals = lua.globals();
     globals
         .get::<_, mlua::Table>("package")

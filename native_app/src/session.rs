@@ -14,6 +14,7 @@ use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::CommandOutcomes;
 use simulation::{SaveLoadError, Simulation, SimulationReplayLoader};
 
+#[cfg(test)]
 use crate::game_loop::VERSION;
 use crate::gui::{ExitState, GuiState};
 use crate::inputmap::InputMap;
@@ -106,7 +107,19 @@ pub struct SessionState {
 pub(crate) enum SlotCompatibility {
     Compatible,
     Incompatible,
+    IncompatibleRegistry,
     Unreadable,
+}
+
+impl SlotCompatibility {
+    pub(crate) fn unavailable_reason(self) -> Option<&'static str> {
+        match self {
+            Self::Compatible => None,
+            Self::Incompatible => Some("incompatible version"),
+            Self::IncompatibleRegistry => Some("incompatible prototype registry"),
+            Self::Unreadable => Some("unreadable snapshot"),
+        }
+    }
 }
 
 pub(crate) type DiscoveredSlots = Vec<(SlotEntry, SlotCompatibility)>;
@@ -218,10 +231,16 @@ pub(crate) fn discover_slots(root: &Path) -> io::Result<DiscoveredSlots> {
     let mut compatibility = BTreeMap::new();
     let slots = saveload::list_slots_with_revisions(root, |path, kind| {
         let (status, revision) = match Simulation::read_slot_snapshot_header(path, kind) {
-            Ok(header) if header.version == VERSION => {
-                (SlotCompatibility::Compatible, header.revision)
+            Ok(header) => {
+                let status = match header.check_compatibility() {
+                    Ok(()) => SlotCompatibility::Compatible,
+                    Err(SaveLoadError::PrototypeRegistry) => {
+                        SlotCompatibility::IncompatibleRegistry
+                    }
+                    Err(_) => SlotCompatibility::Incompatible,
+                };
+                (status, header.revision)
             }
-            Ok(header) => (SlotCompatibility::Incompatible, header.revision),
             Err(_) => (SlotCompatibility::Unreadable, None),
         };
         compatibility.insert(path.to_owned(), status);
@@ -1616,17 +1635,43 @@ mod p4_fix_ac_tests {
     }
 
     #[test]
-    fn p6_save_cut_marks_pre_zs_slots_incompatible() {
+    fn p6_save_cut_marks_a_same_version_registry_mismatch() {
+        use common::saveload::{Bincode, Encoder};
+
+        let root = std::env::temp_dir().join(format!("p6-registry-cut-{}", random_seed()));
+        std::fs::create_dir(&root).unwrap();
+        let id = SlotId::new("staged").unwrap();
+        let paths = saveload::slot_paths(&root, &id).unwrap();
+        let other_registry = prototypes::try_prototypes()
+            .map_or(0, |registry| registry.fingerprint().wrapping_add(1));
+        let revision = SnapshotRevision::new(42);
+        let header = (*b"\xffEGREGORIA\0\x02", VERSION, revision, other_registry);
+        std::fs::write(paths.bc, Bincode::encode(&header).unwrap()).unwrap();
+
+        let catalog = discover_slots(&root).unwrap();
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].0.revision, Some(revision));
+        assert_eq!(catalog[0].1, SlotCompatibility::IncompatibleRegistry);
+        assert_eq!(
+            catalog[0].1.unavailable_reason(),
+            Some("incompatible prototype registry")
+        );
+        assert!(continue_slot(&catalog).is_none());
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn p6_save_cut_marks_wave_b_slots_incompatible() {
         let root = std::env::temp_dir().join(format!("p6-save-cut-{}", random_seed()));
         std::fs::create_dir(&root).unwrap();
-        let id = SlotId::new("pre-zs-09").unwrap();
+        let id = SlotId::new("wave-b-010").unwrap();
         let paths = saveload::slot_paths(&root, &id).unwrap();
         // A legacy Bincode header with no world and a replay with an unknown command
         // show whether the version is checked before either payload is decoded.
-        std::fs::write(&paths.bc, b"\x050.9.0").unwrap();
+        std::fs::write(&paths.bc, b"\x060.10.0").unwrap();
         std::fs::write(
             &paths.replay,
-            br#"{"commands":[[1,"UnknownCommand"]],"version":"0.9.0"}"#,
+            br#"{"commands":[[1,"UnknownCommand"]],"version":"0.10.0"}"#,
         )
         .unwrap();
 
@@ -1647,11 +1692,11 @@ mod p4_fix_ac_tests {
         ));
         assert!(matches!(
             Simulation::load_from_slot(&root, &id),
-            Err(SaveLoadError::Incompatible { version }) if version == "0.9.0"
+            Err(SaveLoadError::Incompatible { version }) if version == "0.10.0"
         ));
         assert!(matches!(
             Simulation::load_replay_from_slot(&root, &id),
-            Err(SaveLoadError::Incompatible { version }) if version == "0.9.0"
+            Err(SaveLoadError::Incompatible { version }) if version == "0.10.0"
         ));
         std::fs::remove_dir_all(root).unwrap();
     }

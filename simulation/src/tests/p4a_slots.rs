@@ -39,6 +39,28 @@ fn options() -> NewGameOptions {
 }
 
 #[test]
+fn p7_snapshot_loads_p6_slot_with_disabled_replay() {
+    crate::tests::init_test_simulation();
+    let root = TestRoot::new();
+    let id = SlotId::new("floor").unwrap();
+    let paths = slot_paths(&root.0, &id).unwrap();
+    // Published by P6 (c0041a8d) from new_authored_flat(2, 6042), revision 1.
+    fs::write(
+        &paths.zip,
+        include_bytes!("fixtures/p6-disabled-replay.zip"),
+    )
+    .unwrap();
+
+    let city = Simulation::load_from_slot(&root.0, &id).unwrap();
+    assert_eq!(city.get_tick(), 1);
+    let replay = city.read::<crate::Replay>();
+    assert!(!replay.enabled);
+    assert_eq!(replay.command_count(), 0);
+    assert_eq!(replay.version, crate::utils::replay::replay_version());
+    assert!(!paths.replay.exists());
+}
+
+#[test]
 fn p4a_slot_round_trip_tracks_revision_and_removes_an_old_replay() {
     let options = options();
     let root = TestRoot::new();
@@ -57,7 +79,8 @@ fn p4a_slot_round_trip_tracks_revision_and_removes_an_old_replay() {
         Simulation::read_slot_snapshot_header(&paths.zip, SnapshotKind::Zip).unwrap(),
         SnapshotHeader {
             version: crate::VERSION.into(),
-            revision: Some(revision)
+            revision: Some(revision),
+            registry: Some(prototypes::prototypes().fingerprint()),
         },
     );
     let meta = read_slot_meta(&root.0, &id).unwrap();

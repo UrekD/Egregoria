@@ -42,7 +42,7 @@ impl<'lua> FromLua<'lua> for ServiceKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ServicePrototype {
     pub base: GoodsCompanyPrototype,
     pub id: ServiceID,

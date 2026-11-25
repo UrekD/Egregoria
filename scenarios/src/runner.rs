@@ -137,6 +137,7 @@ pub struct ScenarioCtx {
     checkpoints: Option<Vec<Checkpoint>>,
     hash_dump: Option<CheckpointDump>,
     perf_timings: Option<PerfTimingRecorder>,
+    pub(crate) determinism_pass: Option<u8>,
 }
 
 /// Set the process working directory to the repository root for prototype loading.
@@ -170,6 +171,7 @@ impl ScenarioCtx {
             checkpoints: None,
             hash_dump: None,
             perf_timings: None,
+            determinism_pass: None,
         }
     }
 
@@ -373,8 +375,13 @@ impl ScenarioCtx {
         mut run: impl FnMut(&mut Self) -> Result<(), String>,
     ) -> Result<(), String> {
         let opts = *self.sim.read::<SimulationOptions>();
-        let first = self.record_checkpoints(&mut run)?;
-        let second = Self::new(opts).record_checkpoints(&mut run)?;
+        self.determinism_pass = Some(1);
+        let first = self.record_checkpoints(&mut run);
+        self.determinism_pass = None;
+        let first = first?;
+        let mut second_ctx = Self::new(opts);
+        second_ctx.determinism_pass = Some(2);
+        let second = second_ctx.record_checkpoints(&mut run)?;
 
         for (first, second) in first.iter().zip(&second) {
             compare_checkpoint(first, second)?;

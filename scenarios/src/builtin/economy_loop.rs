@@ -282,7 +282,9 @@ fn build_fixture(ctx: &mut ScenarioCtx) -> Result<(), String> {
     )
     .ok_or("could not place the economy loop freight station")?;
     place_grid_power_plant(ctx, origin)?;
-    place_company(ctx, "coal-mine", origin + vec2(275.0, 330.0))
+    // The local mine uses the plant's westbound approach, shortening the
+    // delivery without changing the truck, dispatch policy or on-time floor.
+    place_company(ctx, "coal-mine", origin + vec2(-65.0, 240.0))
         .ok_or("could not place the economy loop coal mine")?;
     place_service_sites(ctx, origin, UTILITY_SITES)?;
 

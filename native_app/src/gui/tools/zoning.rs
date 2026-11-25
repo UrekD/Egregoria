@@ -20,7 +20,6 @@ use yakui::{colored_box_container, Color};
 mod zone_color;
 pub use zone_color::{zone_cell_color, zone_color};
 
-// Wave C exposes the Mixed Use swatch once the simulation can commission both roles.
 pub const ZONES: [ZoneKind; 4] = ZoneKind::TAXABLE;
 
 const MAX_BRUSH_RADIUS: u8 = 5;
@@ -112,7 +111,7 @@ impl ZoningState {
         (2.0 * f32::from(self.brush_radius) + 1.0) * self.pitch()
     }
 
-    fn select_kind(&mut self, kind: Option<ZoneKind>) {
+    pub(crate) fn select_kind(&mut self, kind: Option<ZoneKind>) {
         if self.kind == kind {
             return;
         }
@@ -224,7 +223,14 @@ pub fn properties(uiworld: &UiWorld) {
         padxy(12.0, 8.0, || {
             mincolumn(3.0, || {
                 minrow(5.0, || {
-                    for kind in ZONES.into_iter().map(Some).chain([None]) {
+                    let registry = prototypes::prototypes();
+                    let mixed_ready = [Density::Medium, Density::High]
+                        .into_iter()
+                        .all(|density| registry.mixed_use_pair(density).is_some());
+                    let palette = ZoneKind::ALL
+                        .into_iter()
+                        .filter(|&kind| kind != ZoneKind::MixedUse || mixed_ready);
+                    for kind in palette.map(Some).chain([None]) {
                         if selectable_label_primary(
                             state.kind == kind,
                             kind.map_or("Unzone", zone_name),

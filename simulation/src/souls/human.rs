@@ -842,7 +842,7 @@ pub fn spawn_human(sim: &mut Simulation, house: BuildingID) -> Option<HumanID> {
     let map = sim.map();
     let housepos = map
         .get(house)
-        .filter(|house| !house.is_orphaned())?
+        .filter(|house| !house.is_orphaned() && !house.is_abandoned_growable())?
         .door_pos;
     drop(map);
     {

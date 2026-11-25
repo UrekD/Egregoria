@@ -432,6 +432,7 @@ mod tests {
                         floors: 1,
                         roof_z: 4.0,
                         approved_value_band: 0,
+                        frozen_shell: None,
                         home: None,
                         planned_jobs: jobs,
                         site: GrowableSiteState::Active,
@@ -721,6 +722,7 @@ mod tests {
     fn z3_fix_inspector_rejects_sample_after_split_retains_network_id() {
         use crate::diagnostics::building_diagnostics;
         use crate::map_dynamic::{utility_flow_update, UtilityStatus};
+        use common::saveload::{Bincode, Encoder};
 
         let (mut test, home, _) = accounting_site(true);
         test.build_roads(&[vec3(100.0, 300.0, 0.0), vec3(400.0, 300.0, 0.0)]);
@@ -756,11 +758,26 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(status(&test).water, UtilityStatus::Served);
+        assert_eq!(
+            crate::economy::progression::utility_served_fraction(&test.g),
+            Some(1.0)
+        );
+        let saved = Bincode::encode(&test.g).unwrap();
+        let loaded = Bincode::decode(&saved).unwrap();
+        assert_eq!(
+            building_diagnostics(&loaded, home).unwrap().utilities.unwrap().water,
+            UtilityStatus::Served,
+            "loading a dry map must preserve the sampled service of unchanged network members"
+        );
         test.g.map_mut().remove_road(bridge).unwrap();
         assert_eq!(test.g.map().electricity.net_id(home), Some(network));
         assert_ne!(test.g.map().electricity.net_id(other), Some(network));
         assert_eq!(status(&test).water, UtilityStatus::Unknown);
         assert_eq!(status(&test).sewage, UtilityStatus::Unknown);
+        assert_eq!(
+            crate::economy::progression::utility_served_fraction(&test.g),
+            Some(0.0)
+        );
     }
 
     #[test]
@@ -805,7 +822,7 @@ mod tests {
             );
             let flow = test.g.read::<UtilityFlow>();
             let status =
-                live_site_utility_status(&map, &homes, &infos, world, &electricity, &flow, first)
+                live_site_utility_status(&map, &homes, &infos, world, &flow, first)
                     .unwrap();
             assert_eq!(status.totals, Some(live.pipes));
             let add = (live.pipes.water_production - live.pipes.water_demand) * 0.75;

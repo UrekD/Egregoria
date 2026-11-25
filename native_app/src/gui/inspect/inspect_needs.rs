@@ -2,7 +2,7 @@ use goryak::{error, fixed_spacer, on_secondary_container, textc};
 use prototypes::ServiceKind;
 use simulation::diagnostics::{BuildingDiagnostics, PowerStatus};
 use simulation::map::{BuildingID, BuildingKind};
-use simulation::map_dynamic::{CoverageGrid, EnvGrid, UtilityStatus};
+use simulation::map_dynamic::{CoverageGrid, EnvGrid, UtilityAdmission, UtilityStatus};
 use simulation::souls::residence::Residences;
 use simulation::Simulation;
 
@@ -10,32 +10,49 @@ use crate::gui::overlays::is_coverage_receiver;
 
 pub(super) fn render(sim: &Simulation, building: BuildingID, diagnostics: &BuildingDiagnostics) {
     let list = needs(sim, building, diagnostics);
-    if list.is_empty() {
-        return;
-    }
-
-    fixed_spacer((0.0, 5.0));
-    textc(on_secondary_container(), "Needs");
-    for need in list {
-        match need.met {
-            Some(true) => textc(
-                on_secondary_container(),
-                format!("{} · Met · {}", need.label, need.detail),
-            ),
-            Some(false) => textc(error(), format!("{} · Unmet · {}", need.label, need.detail)),
-            None => textc(
-                on_secondary_container(),
-                format!("{} · {}", need.label, need.detail),
-            ),
+    if !list.is_empty() {
+        fixed_spacer((0.0, 5.0));
+        textc(on_secondary_container(), "Needs");
+        for need in list {
+            match need.met {
+                Some(true) => textc(
+                    on_secondary_container(),
+                    format!("{} · Met · {}", need.label, need.detail),
+                ),
+                Some(false) => textc(error(), format!("{} · Unmet · {}", need.label, need.detail)),
+                None => textc(
+                    on_secondary_container(),
+                    format!("{} · {}", need.label, need.detail),
+                ),
+            }
         }
     }
-    let requirements = &diagnostics.upgrade_requirements;
-    let progress = upgrade_progress_label(sim, building);
-    if !requirements.is_empty() || progress.is_some() {
+
+    let requirements = diagnostics.upgrade_requirements();
+    let (progress, blocker) = if let Some(status) = &diagnostics.profiled_upgrade {
+        let progress = status.next_level.map(|_| {
+            let (completed, required) = (status.eligible_hours, status.required_hours);
+            format!("Consecutive eligible hours · {completed} / {required}")
+        });
+        (progress, status.admission_blocker)
+    } else {
+        (upgrade_progress_label(sim, building), None)
+    };
+    if !requirements.is_empty() || progress.is_some() || blocker.is_some() {
         fixed_spacer((0.0, 5.0));
         textc(on_secondary_container(), "Upgrade requirements");
         if let Some(progress) = progress {
             textc(on_secondary_container(), progress);
+        }
+        if let Some(blocker) = blocker {
+            let detail = match blocker {
+                UtilityAdmission::Disconnected => "Network disconnected",
+                UtilityAdmission::StaleTopology => "Network updating",
+                UtilityAdmission::Power => "Insufficient power capacity",
+                UtilityAdmission::Water => "Insufficient water capacity",
+                UtilityAdmission::Sewage => "Insufficient sewage capacity",
+            };
+            textc(error(), detail);
         }
         for requirement in requirements {
             let (color, status) = if requirement.met {

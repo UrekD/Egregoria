@@ -244,6 +244,7 @@ mod tests {
             floors,
             roof_z: f32::from(floors) * GROWABLE_FLOOR_HEIGHT_M + 0.6,
             approved_value_band: 0,
+            frozen_shell: None,
             home: None,
             planned_jobs: 12,
             site: GrowableSiteState::Active,

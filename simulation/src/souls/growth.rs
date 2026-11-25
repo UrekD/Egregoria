@@ -1,7 +1,9 @@
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::{Budget, ZoneDemand};
 use crate::map::import::growable_shell::{self, housing_slots, job_slots, realized_floors};
-pub use crate::map::import::growable_shell::{GrowableForm, GrowableFormFit, ShellGeometry};
+pub use crate::map::import::growable_shell::{
+    FrozenGrowableShell, GrowableForm, GrowableFormFit, ShellGeometry,
+};
 pub use crate::map::GrowableLotError;
 use crate::map::{
     Building, BuildingID, BuildingKind, Density, GrowableBusinessState, GrowableDevelopment,
@@ -130,9 +132,7 @@ pub fn growth_update(sim: &mut Simulation) {
             }
             if building.development().is_some() {
                 orphaned_profiled.push(id);
-                if building.has_residential_use() {
-                    orphaned_homes.push((id, building.door_pos));
-                }
+                orphaned_homes.push((id, building.door_pos));
                 continue;
             }
             match building.kind {
@@ -470,7 +470,14 @@ fn resolve_site(
     let registry = prototypes::prototypes();
     let (home, company) = match zone.kind {
         ZoneKind::Residential => (
-            Some(residence::prototype(zone.density, 1).ok_or(GrowableLotError::MissingPrototype)?),
+            Some(
+                if requested_kind == Some(BuildingKind::House) {
+                    residence::legacy_prototype(zone.density, 1)
+                } else {
+                    residence::prototype(zone.density, 1)
+                }
+                .ok_or(GrowableLotError::MissingPrototype)?,
+            ),
             None,
         ),
         ZoneKind::MixedUse => {
@@ -673,8 +680,11 @@ fn prepare_site(
             jobs = job_slots(site.zone.kind, jobs, floors, nominal)
                 .ok_or(GrowableLotError::MissingPrototype)?;
         }
-        let (mesh, roof_z) = fit
-            .mesh(map.environment(), site.zone, profile.style, floors, 1)
+        let frozen_shell = fit
+            .freeze(map.environment(), profile.style)
+            .ok_or(GrowableLotError::InfeasibleGrade)?;
+        let (mesh, roof_z) = frozen_shell
+            .mesh(site.zone, floors, 1)
             .ok_or(GrowableLotError::InfeasibleGrade)?;
         Some(PreparedGrowableAppearance {
             development: GrowableDevelopment {
@@ -687,6 +697,7 @@ fn prepare_site(
                 planned_jobs: jobs,
                 site: GrowableSiteState::Active,
                 business: site.company.map(|_| GrowableBusinessState::AwaitingSpawn),
+                frozen_shell: Some(frozen_shell),
             },
             base_z: fit.base_z(),
             door: fit.door(),
@@ -1024,7 +1035,7 @@ mod tests {
             kind: ZoneKind::Residential,
             density: Density::High,
         };
-        let (plan, parcel) = {
+        let (plan, parcel, nominal_capacity) = {
             let map = test.g.map();
             let mut site =
                 check_growable_lot(&map, map.get(front_lot(&test.g)).unwrap(), zone).unwrap();
@@ -1038,16 +1049,47 @@ mod tests {
             };
             site.profile = Some(profile);
             site.initial_form = Some(initial_form(&map, site, profile, 0).unwrap());
-            (prepare_site(&map, site, 85).unwrap(), site.shape)
+            (
+                prepare_site(&map, site, 85).unwrap(),
+                site.shape,
+                site.home.unwrap().capacity,
+            )
         };
         let placed = test.g.commit_prepared_growable(plan).unwrap();
+        let hashes = test.g.hashes();
+        let original = std::mem::take(&mut test.g.map_mut().buildings[placed.building].mesh.faces);
+        assert_eq!(
+            test.g.hashes(),
+            hashes,
+            "derived shell faces affected the simulation hash"
+        );
+        let reloaded: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        {
+            let map = reloaded.map();
+            let building = map.get(placed.building).unwrap();
+            assert_eq!(
+                Bincode::encode(&building.mesh.faces).unwrap(),
+                Bincode::encode(&original).unwrap(),
+                "load must rebuild the frozen appearance",
+            );
+            let development = building.development().unwrap();
+            let frozen = development.frozen_shell.as_ref().unwrap();
+            assert_eq!(frozen.fit().door(), building.door_pos);
+            assert_eq!(frozen.fit().base_z(), building.height);
+            let (_, upgraded_roof) = frozen
+                .mesh(development.zone, development.floors, 2)
+                .unwrap();
+            assert!(upgraded_roof > development.roof_z);
+        }
+        test.g.map_mut().buildings[placed.building].mesh.faces = original;
+
         let summary = test.g.growable_summary(placed.building).unwrap();
         assert!(summary.floors >= 14);
         assert!(summary.height_above_base > 40.0);
         assert_eq!(summary.housing_slots, placed.housing_slots);
         assert_eq!(
             placed.housing_slots,
-            (4 * u32::from(summary.floors) + 6) / 12
+            (nominal_capacity * u32::from(summary.floors) + 6) / 12
         );
         assert!(test
             .g
@@ -1081,7 +1123,14 @@ mod tests {
 
     #[test]
     fn zones2_z1_import_reports_committed_jobs_and_checks_density() {
+        if !crate::tests::in_prototype_fixture_process(
+            module_path!(),
+            "zones2_z1_import_reports_committed_jobs_and_checks_density",
+        ) {
+            return;
+        }
         let mut test = street();
+        crate::tests::load_staged_prototypes();
         let lot = front_lot(&test.g);
         let shop = BuildingKind::GoodsCompany(GoodsCompanyID::new("commercial-medium-l1"));
         assert!(test
@@ -1093,7 +1142,7 @@ mod tests {
             .g
             .seed_imported_growable_with_slots(lot, shop, Density::Medium)
             .unwrap();
-        assert_eq!((placed.housing_slots, placed.job_slots), (0, 18));
+        assert_eq!((placed.housing_slots, placed.job_slots), (0, 27));
         add_souls_to_empty_buildings(&mut test.g);
         let Some(SoulID::GoodsCompany(company)) =
             test.g.read::<BuildingInfos>().owner(placed.building)
@@ -1182,6 +1231,31 @@ mod tests {
         let building = sim.map_mut().place_growable(lot, kind).unwrap();
         on_growable_placed(sim, building, kind);
         building
+    }
+
+    fn staff_store(sim: &mut Simulation, store: BuildingID) {
+        let proto = sim
+            .map()
+            .get(store)
+            .unwrap()
+            .kind
+            .as_goods_company()
+            .unwrap();
+        let owner = sim.read::<BuildingInfos>().owner(store);
+        let Some(SoulID::GoodsCompany(company)) =
+            owner.or_else(|| crate::souls::goods_company::company_soul(sim, store, proto))
+        else {
+            panic!("test store has no company");
+        };
+        let workers: Vec<_> = sim.world().humans.keys().collect();
+        for &id in &workers {
+            sim.world.edit_human(id, |human| {
+                let mut work = Work::new(store, WorkKind::Worker, 0.0);
+                work.employer = Some(company);
+                human.work = Some(work);
+            });
+        }
+        sim.world.companies[company].workers.0 = workers;
     }
 
     #[test]
@@ -1312,9 +1386,7 @@ mod tests {
             while test.g.world().humans.len() < capacity {
                 crate::souls::human::spawn_human(&mut test.g, house).unwrap();
             }
-            for human in test.g.world_mut_unchecked().humans.values_mut() {
-                human.work = Some(Work::new(store, WorkKind::Worker, 0.0));
-            }
+            staff_store(&mut test.g, store);
             for _ in 0..6 {
                 hourly_check(&mut test.g);
             }
@@ -1458,9 +1530,7 @@ mod tests {
         let lot = test.g.map().lots().keys().next().unwrap();
         let store = place_store(&test.g, lot);
 
-        for human in test.g.world_mut_unchecked().humans.values_mut() {
-            human.work = Some(Work::new(store, WorkKind::Worker, 0.0));
-        }
+        staff_store(&mut test.g, store);
         test.g.write::<GameTime>().tick.0 = 0;
         serve_house(&mut test.g, house);
         test.g

@@ -284,6 +284,10 @@ impl Road {
         self.lanes_backward.len() + self.lanes_forward.len()
     }
 
+    pub(crate) fn directed_lanes(&self) -> [&[(LaneID, LaneKind)]; 2] {
+        [&self.lanes_forward, &self.lanes_backward]
+    }
+
     /// Returns lanes in left to right order from the source
     pub fn lanes_iter(&self) -> impl DoubleEndedIterator<Item = (LaneID, LaneKind)> + Clone + '_ {
         self.lanes_forward

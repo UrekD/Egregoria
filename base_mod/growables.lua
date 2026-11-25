@@ -238,7 +238,7 @@ local growables = {
     },
 }
 
--- Select the staged data when the engine's Mixed Use placement gate is open.
+-- The profiled registry includes both Mixed Use storefronts.
 if zones2_profiles_enabled == true then
     local floors = {
         low = {1, 2, 2, 2, 2},

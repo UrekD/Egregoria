@@ -4,7 +4,7 @@ use mlua::Table;
 use std::ops::Deref;
 
 /// Item is the runtime representation of an item, such as meat, wood, etc.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ItemPrototype {
     pub base: PrototypeBase,
     pub id: ItemID,

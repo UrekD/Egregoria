@@ -1,6 +1,6 @@
 # P7 Wave 0 test inventory
 
-The stock floor is `88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7`, save version 0.10.0. The fixture and workload pins are in [p7_wave0.json](p7_wave0.json). Test names below are reserved for P7 §6. Each pending test needs its production seam or compatible fixture before it can assert its repair oracle.
+The Wave 1 floor is `c0041a8d5faba1513ddfaa7f2b4d04758ff663ae`, save version 0.11.0. The fixture and workload pins retain their producer revisions in [p7_wave0.json](p7_wave0.json). Test names below are reserved for P7 §6.
 
 ## Simulation
 
@@ -18,7 +18,7 @@ The stock floor is `88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7`, save version 0.10
 | `p7_spatial_allocator` | Compare split, merge, bulldoze and wet cleanup with stock for allocation/reuse, cut and occupancy state, and untouched entries. |
 | `p7_junction_mask_stale` | Mask an exact turn and exclude it from routes and live entry with residual speed, including multiple boundaries in one step. Retain the unmasked control and reject stale geometry. |
 | `p7_junction_long_nose` | Cover nose and rear behavior for cars, trucks and buses at the physical boundary. |
-| `p7_junction_receiving` | **Compiled, ignored, stock red.** The decision-level fixture holds for ordinary driving and advances in panic with the same occupied perpendicular conflict. Extend to two arrivals competing for one receiving interval and a nonconflicting pair admitted together. |
+| `p7_junction_receiving` | The decision-level regression checks ordinary and panic braking against the same perpendicular conflict, with a stopped-leader control and separate deck. Two arrivals competing for one receiving interval and a nonconflicting pair admitted together remain scheduler-barrier tests. |
 | `p7_junction_same_tick_walk` | Exercise a same-tick pedestrian entry and the road request at the actual scheduler boundary. |
 | `p7_junction_rail_decks` | Cover rail/road conflict on the same deck and a separable grade-crossing control. |
 | `p7_junction_rear_resume` | Save halfway through a turn. Retain conflict ownership until the qualifying rear clears after load. |

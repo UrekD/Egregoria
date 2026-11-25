@@ -191,9 +191,7 @@ impl Simulation {
         road: RoadID,
         density: Density,
     ) -> Option<BuildingID> {
-        let home = prototypes::prototypes()
-            .legacy_residence(density, 1)
-            .or_else(|| residence::prototype(density, 1))?;
+        let home = residence::legacy_prototype(density, 1)?;
         let id = self.map_mut().build_special_building(
             &shape,
             BuildingKind::House,

@@ -1,7 +1,7 @@
 use mlua::{FromLua, Value};
 use std::path::PathBuf;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub enum RenderAsset {
     Mesh { path: PathBuf },
     Sprite { path: PathBuf },

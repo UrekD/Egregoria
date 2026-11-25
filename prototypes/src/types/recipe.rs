@@ -2,7 +2,7 @@ use crate::{get_lua, GameDuration, ItemID, TICKS_PER_SECOND_F64};
 use egui_inspect::Inspect;
 use mlua::{FromLua, Lua, Table, Value};
 
-#[derive(Debug, Clone, Inspect)]
+#[derive(Debug, Clone, Inspect, serde::Serialize)]
 pub struct RecipeItem {
     pub id: ItemID,
     pub amount: i32,
@@ -32,7 +32,7 @@ impl<'lua> FromLua<'lua> for RecipeItem {
     }
 }
 
-#[derive(Debug, Clone, Inspect)]
+#[derive(Debug, Clone, Inspect, serde::Serialize)]
 pub struct Recipe {
     pub consumption: Vec<RecipeItem>,
     pub production: Vec<RecipeItem>,

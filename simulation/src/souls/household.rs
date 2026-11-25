@@ -37,6 +37,7 @@ pub struct HouseholdStock {
     pub(crate) reservation: Option<Box<BasketReservation>>,
     pub(crate) next_shop: u64,
     pub(crate) next_leisure: u64,
+    education_hours: u8,
     pub(crate) leisure_visit: Option<BuildingID>,
     pub(crate) leisure_started: u64,
     pub(crate) leisure_until: Option<u64>,
@@ -127,6 +128,20 @@ fn remove_claim<K: Ord, V: Ord>(claims: &mut BTreeMap<K, BTreeSet<V>>, key: K, i
 }
 
 impl HouseholdStock {
+    /// Seller responsible for a basket that is still awaiting pickup.
+    pub fn basket_seller(&self) -> Option<SoulID> {
+        self.reservation.as_ref().map(|basket| basket.seller)
+    }
+
+    /// Elapsed hours earned through school access at the resident's registered home.
+    pub fn education_hours(&self) -> u8 {
+        self.education_hours
+    }
+
+    pub(super) fn earn_education_hour(&mut self) {
+        self.education_hours = self.education_hours.saturating_add(1).min(48);
+    }
+
     /// A basket pickup, park visit or trip home with groceries is under way.
     pub(crate) fn on_errand(&self) -> bool {
         self.basket.is_some() || self.leisure_visit.is_some() || !self.carried.is_empty()

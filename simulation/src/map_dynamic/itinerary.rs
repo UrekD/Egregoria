@@ -979,6 +979,14 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     let tick = elapsed_ticks(resources).0;
     throughput.begin_tick(map, tick);
 
+    use crate::transportation::TraversalOwner;
+
+    // Observe transitions during the ordinary movement pass. Indoor idle
+    // humans are already excluded by the itinerary activity set.
+    let mut observed = resources
+        .write::<TransportGrid>()
+        .begin_traversal_update(map, tick);
+
     let mut update =
         |it: &mut Itinerary, pos: &mut Vec3, speed: f32, kind: Option<RoadUserKind>| {
             if it.is_inert() {
@@ -1005,7 +1013,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                 record,
             );
         };
-    world.humans.edit_active(HumanWork::Itinerary, |_, human| {
+    world.humans.edit_active(HumanWork::Itinerary, |id, human| {
         let outside = human.location == Location::Outside;
         let kind = outside.then_some(RoadUserKind::Pedestrian);
         let speed = human.speed.0;
@@ -1013,6 +1021,9 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         update(itinerary, pos, speed, kind);
         if !outside {
             return;
+        }
+        if let Some(index) = &mut observed {
+            index.record(map, TraversalOwner::Human(id), itinerary);
         }
         // A cancelled walk or a pending reroute can leave a pedestrian in a crosswalk.
         // Release its obstruction until the itinerary has a point to walk toward again.
@@ -1032,10 +1043,13 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             _ => {}
         }
     });
-    for train in world.trains.values_mut() {
+    for (id, train) in &mut world.trains {
         update(&mut train.it, &mut train.trans.pos, train.speed.0, None);
+        if let Some(index) = &mut observed {
+            index.record(map, TraversalOwner::Train(id), &train.it);
+        }
     }
-    for vehicle in world.vehicles.values_mut() {
+    for (id, vehicle) in &mut world.vehicles {
         let kind = match vehicle.vehicle.kind {
             VehicleKind::Car => RoadUserKind::Car,
             VehicleKind::Truck => RoadUserKind::Truck,
@@ -1047,6 +1061,14 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             vehicle.speed.0,
             Some(kind),
         );
+        if let Some(index) = &mut observed {
+            index.record(map, TraversalOwner::Vehicle(id), &vehicle.it);
+        }
+    }
+    if let Some(snapshot) = observed {
+        resources
+            .write::<TransportGrid>()
+            .publish_traversal_users(snapshot);
     }
 
     world.trains.values_mut().for_each(|train| {

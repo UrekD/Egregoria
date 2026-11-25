@@ -9,10 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::economy::{
     Budget, BudgetCategory, DailyEconomyMetrics, EconomyDayMetrics, TICKS_PER_BUDGET_DAY,
 };
-use crate::map_dynamic::{
-    active_business, effective_load, BuildingInfos, ElectricityFlow, UtilityFlow, UtilityStatus,
-};
-use crate::souls::residence::Residences;
+use crate::map_dynamic::{SiteUtilityReader, UtilityStatus};
 use crate::Simulation;
 
 const MILESTONES: [(u32, Money); 3] = [
@@ -340,21 +337,19 @@ fn sample_daily_utilities(sim: &Simulation, day: u64) {
     }
 }
 
-fn utility_served_fraction(sim: &Simulation) -> Option<f64> {
+pub fn utility_served_fraction(sim: &Simulation) -> Option<f64> {
     let map = sim.map();
-    let power = sim.read::<ElectricityFlow>();
-    let water = sim.read::<UtilityFlow>();
-    let residences = sim.read::<Residences>();
-    let infos = sim.read::<BuildingInfos>();
+    let mut utilities = SiteUtilityReader::new(sim);
 
     let mut power_demand = 0.0;
     let mut powered = 0.0;
     for network in map.electricity.networks() {
-        let flow = power.network_stats(network.id);
-        let demand = flow.consumed_power.watts().max(0) as f64;
-        power_demand += demand;
-        if !flow.blackout {
-            powered += demand;
+        if let Some((load, _)) = utilities.network_load(network.id) {
+            let demand = load.power_demand_watts as f64;
+            power_demand += demand;
+            if load.has_power() {
+                powered += demand;
+            }
         }
     }
 
@@ -362,16 +357,12 @@ fn utility_served_fraction(sim: &Simulation) -> Option<f64> {
     let mut water_served = 0.0;
     let mut sewage_served = 0.0;
     for building in map.buildings().values() {
-        let business = building
-            .development()
-            .and_then(|_| active_business(building, &infos, sim.world()));
-        let demand = effective_load(building, residences.by_building.get(&building.id), business)
-            .water_demand();
+        let demand = utilities.load(building).water_demand();
         if demand == 0.0 {
             continue;
         }
         water_demand += demand;
-        if let Some(status) = water.status_with_demand(&map, building.id, demand) {
+        if let Some(status) = utilities.status(building.id) {
             if status.water == UtilityStatus::Served {
                 water_served += demand;
             }
@@ -401,6 +392,7 @@ mod tests {
     use crate::map::{BuildingKind, LaneKind, ZoneKind};
     use crate::map_dynamic::Transit;
     use crate::souls::human::spawn_human;
+    use crate::souls::residence::Residences;
     use crate::tests::TestCtx;
     use crate::world_command::{CommandOutcomes, Rejection, WorldCommand};
     use crate::{NewGameOptions, INITIAL_TICK};

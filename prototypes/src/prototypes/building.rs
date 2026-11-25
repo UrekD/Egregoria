@@ -23,7 +23,7 @@ pub enum BuildingGen {
 debug_inspect_impl!(BuildingGen);
 
 /// BuildingPrototype is a building
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct BuildingPrototype {
     pub base: PrototypeBase,
     pub id: BuildingPrototypeID,

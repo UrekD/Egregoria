@@ -9,7 +9,7 @@ use simulation::economy::{
     Budget, Government, ZoneDemand,
 };
 use simulation::map::{BuildingID, ZoneKind};
-use simulation::map_dynamic::{ElectricityFlow, LineID, Transit, UtilityFlow, UtilityStatus};
+use simulation::map_dynamic::{ElectricityFlow, LineID, SiteUtilityReader, Transit, UtilityStatus};
 use simulation::souls::events::{FireEventKind, Fires};
 use simulation::souls::residence::Residences;
 use simulation::world_command::{CommandOutcomes, Rejection};
@@ -591,8 +591,7 @@ impl NotificationSampler {
 
         let map = sim.map();
         let power = sim.read::<ElectricityFlow>();
-        let utilities = sim.read::<UtilityFlow>();
-        let residences = sim.read::<Residences>();
+        let mut utilities = SiteUtilityReader::new(sim);
         let mut blackout = NetworkAlert::default();
         let mut water = NetworkAlert::default();
         let mut sewage = NetworkAlert::default();
@@ -605,7 +604,7 @@ impl NotificationSampler {
                 if in_blackout {
                     blackout.add_affected(id);
                 }
-                if let Some(status) = utilities.status(&map, &residences, id) {
+                if let Some(status) = utilities.status(id) {
                     water.record_status(id, status.water);
                     sewage.record_status(id, status.sewage);
                 }
@@ -697,10 +696,17 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         }
         (_, MissingReference) => "Object no longer exists",
         (_, InvalidConnection) => "Invalid connection",
+        (_, InvalidRoadPattern) => "Choose a supported road lane pattern",
+        (_, RoadWorkLimit) => "The road edit exceeds the work limit",
+        (_, StaleRoadEdit | StaleRoadQuote) => {
+            "The road or its quote changed. Preview the edit again."
+        }
+        (_, RoadTopologyUnavailable) => "This road topology change is unavailable in this session",
         (_, InvalidBatchIndex) => "Invalid connection group",
         (_, InvalidBuilding) => "Building cannot be placed here",
         (_, InvalidZone) => "Zoning area is outside the map or too large",
         (_, UnsupportedDensity { .. }) => "Mixed Use requires Medium or High density",
+        (_, MixedUseUnavailable) => "Mixed Use is unavailable in this city",
         (_, UnsupportedTax(_)) => "Mixed Use has no separate tax rate",
         (_, InvalidTaxRate) => "Tax rate is outside the allowed range",
         (_, InvalidTerraform) => "Terrain edit is outside the allowed range",
@@ -903,7 +909,7 @@ mod tests {
             utility_flow_update(&mut test.sim);
             let status = test
                 .sim
-                .read::<UtilityFlow>()
+                .read::<simulation::map_dynamic::UtilityFlow>()
                 .status(&test.sim.map(), &test.sim.read::<Residences>(), other_house)
                 .unwrap();
             assert_eq!(status.water, UtilityStatus::Shortage);

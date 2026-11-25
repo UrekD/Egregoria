@@ -56,6 +56,9 @@ unsafe fn load_prototypes_str(l: Lua, main: &str) -> Result<(), PrototypeLoadErr
 
     validation::validate(&p)?;
 
+    p.fingerprint = p
+        .compute_fingerprint()
+        .map_err(PrototypeLoadError::Fingerprint)?;
     p.compute_orderings();
     p.print_stats();
 
@@ -64,10 +67,19 @@ unsafe fn load_prototypes_str(l: Lua, main: &str) -> Result<(), PrototypeLoadErr
     Ok(())
 }
 
+impl Prototypes {
+    /// Identifies the effective prototype data in this registry.
+    pub fn fingerprint(&self) -> u64 {
+        self.fingerprint
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum PrototypeLoadError {
     #[error("loading data.lua: {0}")]
     LoadingDataLua(#[from] io::Error),
+    #[error("encoding prototype fingerprint: {0}")]
+    Fingerprint(io::Error),
     #[error("lua error: {0}")]
     LuaError(#[from] mlua::Error),
     #[error("lua error for {0} {1}: {2}")]

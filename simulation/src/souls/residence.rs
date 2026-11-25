@@ -1,9 +1,12 @@
 use crate::economy::balance::{periodic_tick, RETAIL_ACCESS_RADIUS_M};
 use crate::economy::Budget;
 use crate::map::{BuildingID, BuildingKind, Density, Map};
-use crate::map_dynamic::{BuildingInfos, CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow};
+use crate::map_dynamic::{
+    connected_site_network, ActiveRetailIndex, BuildingInfos, CoverageGrid, ElectricityFlow,
+    EnvGrid, NetworkLoad, SiteUtilityReader, UtilityFlow, UtilityTotals,
+};
 use crate::souls::happiness::Happiness;
-use crate::souls::lifecycle;
+use crate::souls::{development, lifecycle};
 use crate::{Simulation, SoulID};
 use geom::{Vec2, Vec3};
 use ordered_float::OrderedFloat;
@@ -16,10 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const UPGRADE_CHECKS: u8 = 6;
+pub(crate) const UPGRADE_CHECKS: u8 = 6;
 const UPGRADE_COVERAGE: f32 = 30.0;
 const UPGRADE_LAND_VALUE: f32 = 50.0;
-const UNSERVED_CHECKS: u8 = 12;
+pub(crate) const UNSERVED_CHECKS: u8 = 12;
 pub(crate) const UPDATE_OFFSET: u64 = TICKS_PER_HOUR - 2;
 
 #[derive(Serialize, Deserialize)]
@@ -41,19 +44,23 @@ impl From<&ResidencePrototype> for Residence {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
-struct ResidenceChecks {
-    upgrade_streak: u8,
-    outage_streak: u8,
-    poor: u8,
+#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+pub(super) struct ResidenceChecks {
+    pub(super) upgrade_streak: u8,
+    pub(super) outage_streak: u8,
+    pub(super) poor: u8,
     abandoned_hours: Option<u8>,
+    pub(super) staffing_company: Option<crate::CompanyID>,
+    pub(super) was_staffed: bool,
+    pub(super) low_staffing_hours: u8,
 }
 
 #[derive(Default, Serialize, Deserialize)]
 pub struct Residences {
     #[serde(rename = "by_building")]
     entries: ResidenceEntries,
-    checks: BTreeMap<BuildingID, ResidenceChecks>,
+    pub(super) checks: BTreeMap<BuildingID, ResidenceChecks>,
+    pub(super) last_profile_hour: Option<u64>,
     #[serde(skip, default = "next_residence_generation")]
     residence_generation: u64,
 }
@@ -105,12 +112,16 @@ impl Residences {
     }
 
     pub(crate) fn upgrade(&mut self, building: BuildingID, proto: &ResidencePrototype) {
+        self.replace(building, proto.into());
+    }
+
+    pub(super) fn replace(&mut self, building: BuildingID, next: Residence) {
         let residence = self
             .entries
             .by_building
             .get_mut(&building)
             .expect("registered residence");
-        *residence = proto.into();
+        *residence = next;
         self.residence_generation = next_residence_generation();
     }
 
@@ -126,7 +137,18 @@ impl Residences {
         if self.is_abandoned(building) {
             return None;
         }
-        next_prototype(residence)?;
+        let proto = try_prototype(residence.prototype)?;
+        if proto.massing.is_some() {
+            if residence.level >= development::MAX_HOUSING_LEVEL {
+                return None;
+            }
+            prototypes::prototypes().residence_for_chain(GrowableChainKey {
+                level: residence.level.checked_add(1)?,
+                ..proto.chain_key()
+            })?;
+        } else {
+            next_prototype(residence)?;
+        }
         let completed = self
             .checks
             .get(&building)
@@ -146,8 +168,14 @@ pub(crate) fn prototype(density: Density, level: u8) -> Option<&'static Residenc
         .or_else(|| registry.legacy_residence(density, level))
 }
 
+pub(crate) fn legacy_prototype(density: Density, level: u8) -> Option<&'static ResidencePrototype> {
+    prototypes::prototypes()
+        .legacy_residence(density, level)
+        .or_else(|| prototype(density, level))
+}
+
 pub fn on_house_built(sim: &Simulation, building: BuildingID) {
-    if let Some(proto) = prototype(Density::Low, 1) {
+    if let Some(proto) = legacy_prototype(Density::Low, 1) {
         register(sim, building, proto);
     }
 }
@@ -170,9 +198,17 @@ pub(crate) fn abandon_orphaned_growables(sim: &mut Simulation, mut homes: Vec<(B
     if homes.is_empty() {
         return;
     }
+    settle_abandonment(sim, &mut homes, Vec::new());
+}
+
+pub(super) fn settle_abandonment(
+    sim: &mut Simulation,
+    profiled: &mut Vec<(BuildingID, Vec3)>,
+    mut legacy: Vec<(BuildingID, Vec3)>,
+) {
     {
         let mut residences = sim.write::<Residences>();
-        homes.retain(|&(id, _)| {
+        profiled.retain(|&(id, _)| {
             let hours = &mut residences.checks.entry(id).or_default().abandoned_hours;
             if hours.is_some() {
                 return false;
@@ -181,15 +217,11 @@ pub(crate) fn abandon_orphaned_growables(sim: &mut Simulation, mut homes: Vec<(B
             true
         });
     }
-    homes.sort_unstable_by_key(|&(id, _)| id);
-    evict_abandoned_homes(sim, &homes);
-}
-
-fn evict_abandoned_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
-    // Mark every home before looking for vacancies.
-    if !homes.is_empty() {
-        evict_from_homes(sim, homes);
-        lifecycle::clear_abandoned_home_references(sim, homes);
+    legacy.extend(profiled.iter().copied());
+    legacy.sort_unstable_by_key(|&(id, _)| id);
+    if !legacy.is_empty() {
+        evict_from_homes(sim, &legacy);
+        lifecycle::clear_abandoned_home_references(sim, &legacy);
     }
 }
 
@@ -198,15 +230,8 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
         let mut infos = sim.write::<BuildingInfos>();
         let mut displaced = Vec::new();
         for &(building, door) in homes {
-            infos.mark_vacancy_changed(building);
-            if let Some(info) = infos
-                .get(building)
-                .filter(|info| !info.residents.is_empty())
-            {
-                let residents = info.residents.clone();
-                for &soul in &residents {
-                    infos.remove_resident(soul);
-                }
+            let residents = infos.take_residents(building);
+            if !residents.is_empty() {
                 displaced.push((door, residents));
             }
         }
@@ -226,7 +251,10 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
             {
                 continue;
             }
-            let Some(home) = map.get(id).filter(|home| !home.is_orphaned()) else {
+            let Some(home) = map
+                .get(id)
+                .filter(|home| !home.is_orphaned() && !home.is_abandoned_growable())
+            else {
                 continue;
             };
             let Some(info) = infos.get(id) else {
@@ -234,7 +262,7 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
             };
             let free = (residence.capacity as usize).saturating_sub(info.residents.len());
             if free > 0 {
-                vacancies.insert(id, (home.door_pos, free));
+                vacancies.insert(id, (home.door_pos, free, home.is_mixed_use()));
             }
         }
         vacancies
@@ -251,7 +279,7 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
         nearest.extend(
             vacancies
                 .iter()
-                .map(|(&id, &(position, _))| (OrderedFloat(position.distance2(door)), id)),
+                .map(|(&id, &(position, _, _))| (OrderedFloat(position.distance2(door)), id)),
         );
         nearest.sort_unstable();
         let mut destinations = nearest.iter().map(|&(_, id)| id).peekable();
@@ -262,8 +290,11 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
             }
             if let Some(&home) = destinations.peek() {
                 world.edit_human(id, |human| human.home.house = home);
+                let (_, free, mixed) = vacancies.get_mut(&home).unwrap();
+                if *mixed {
+                    infos.mark_business_address(home);
+                }
                 infos.add_resident(home, soul);
-                let (_, free) = vacancies.get_mut(&home).unwrap();
                 *free -= 1;
                 if *free == 0 {
                     vacancies.remove(&home);
@@ -290,14 +321,6 @@ pub fn is_retail_store(kind: BuildingKind) -> bool {
                     .any(|item| item.id == retail_goods && item.amount > 0)
             })
     })
-}
-
-pub fn retail_store_positions(map: &Map) -> Vec<Vec2> {
-    map.buildings()
-        .values()
-        .filter(|building| is_retail_store(building.kind))
-        .map(|building| building.door_pos.xy())
-        .collect()
 }
 
 pub fn has_retail_access(stores: &[Vec2], door: Vec2) -> bool {
@@ -336,7 +359,7 @@ pub struct Requirement {
 }
 
 impl Requirement {
-    fn available(name: &'static str, met: bool) -> Self {
+    pub(super) fn available(name: &'static str, met: bool) -> Self {
         Self {
             name,
             met,
@@ -354,7 +377,12 @@ impl Requirement {
         }
     }
 
-    fn percent(name: &'static str, count: usize, total: usize, threshold: usize) -> Self {
+    pub(super) fn percent(
+        name: &'static str,
+        count: usize,
+        total: usize,
+        threshold: usize,
+    ) -> Self {
         Self {
             name,
             met: total > 0 && count * 100 >= total * threshold,
@@ -367,10 +395,49 @@ impl Requirement {
 struct Progression<'a> {
     map: &'a Map,
     electricity: &'a ElectricityFlow,
-    utilities: &'a UtilityFlow,
     coverage: &'a CoverageGrid,
     environment: &'a EnvGrid,
-    stores: &'a [Vec2],
+}
+
+pub(super) fn amenity_requirements(
+    coverage: &CoverageGrid,
+    environment: &EnvGrid,
+    id: BuildingID,
+    next_level: u8,
+    coverage_threshold: f32,
+    value_threshold: f32,
+) -> [Option<Requirement>; 3] {
+    let service =
+        |name, kind| Requirement::minimum(name, coverage.coverage(id, kind), coverage_threshold);
+    let school = service("School coverage", ServiceKind::School);
+    let health = service("Health coverage", ServiceKind::Health);
+    let land_value = Requirement::minimum(
+        "Land value",
+        f32::from(environment.land_value(id)),
+        value_threshold,
+    );
+    if next_level >= 3 {
+        [Some(school), Some(health), Some(land_value)]
+    } else {
+        let park = service("Park coverage", ServiceKind::Park);
+        let closest = [health, park, land_value]
+            .into_iter()
+            .fold(school, |best, option| {
+                if option.value / option.threshold > best.value / best.threshold {
+                    option
+                } else {
+                    best
+                }
+            });
+        [
+            Some(Requirement::available(
+                "Level 2 needs 30% school, health or park coverage, or 50 land value",
+                closest.met,
+            )),
+            Some(closest),
+            None,
+        ]
+    }
 }
 
 impl Progression<'_> {
@@ -381,49 +448,25 @@ impl Progression<'_> {
         occupied: usize,
         employed: usize,
         capacity: usize,
+        retail_access: bool,
+        pipes: UtilityTotals,
     ) -> impl Iterator<Item = Requirement> {
         let id = building.id;
-        let coverage = |name, kind| {
-            Requirement::minimum(name, self.coverage.coverage(id, kind), UPGRADE_COVERAGE)
-        };
-        let school = coverage("School coverage", ServiceKind::School);
-        let health = coverage("Health coverage", ServiceKind::Health);
-        let land_value = Requirement::minimum(
-            "Land value",
-            f32::from(self.environment.land_value(id)),
+        let amenities = amenity_requirements(
+            self.coverage,
+            self.environment,
+            id,
+            next_level,
+            UPGRADE_COVERAGE,
             UPGRADE_LAND_VALUE,
         );
-        let amenities = if next_level >= 3 {
-            [Some(school), Some(health), Some(land_value)]
-        } else {
-            let park = coverage("Park coverage", ServiceKind::Park);
-            // Show the closest option and its actual score alongside the list of alternatives.
-            let closest = [health, park, land_value].into_iter().fold(school, |best, option| {
-                if option.value / option.threshold > best.value / best.threshold {
-                    option
-                } else {
-                    best
-                }
-            });
-            [
-                Some(Requirement::available(
-                    "Level 2 needs 30% school, health or park coverage, or 50 land value",
-                    closest.met,
-                )),
-                Some(closest),
-                None,
-            ]
-        };
         [
             Requirement::available("Power", has_power(self.map, self.electricity, id)),
-            Requirement::available("Water", self.utilities.has_water(id)),
-            Requirement::available("Sewage", self.utilities.has_sewage(id)),
+            Requirement::available("Water", pipes.has_water()),
+            Requirement::available("Sewage", pipes.has_site_sewage()),
             Requirement::percent("Occupancy", occupied, capacity, 80),
             Requirement::percent("Employment", employed, occupied, 70),
-            Requirement::available(
-                "Retail access",
-                has_retail_access(self.stores, building.door_pos.xy()),
-            ),
+            Requirement::available("Retail access", retail_access),
         ]
         .into_iter()
         .chain(amenities.into_iter().flatten())
@@ -443,7 +486,8 @@ fn next_prototype(residence: &Residence) -> Option<&'static ResidencePrototype> 
     residence
         .level
         .checked_add(1)
-        .and_then(|level| prototype(residence.density, level))
+        .filter(|&level| level <= 3)
+        .and_then(|level| legacy_prototype(residence.density, level))
 }
 
 /// Requirements for a residence's next level. Coverage and resident ratios are
@@ -457,6 +501,15 @@ pub(crate) fn requirements_with_stores(
     building: BuildingID,
     stores: Option<&[Vec2]>,
 ) -> Vec<Requirement> {
+    if sim
+        .map()
+        .get(building)
+        .is_some_and(|site| site.development().is_some())
+    {
+        let access = stores.map(|stores| !stores.is_empty());
+        return development::requirements_with_retail(sim, building, access)
+            .map_or_else(Vec::new, |status| status.requirements);
+    }
     let residences = sim.read::<Residences>();
     let Some(residence) = residences.by_building.get(&building) else {
         return Vec::new();
@@ -469,21 +522,19 @@ pub(crate) fn requirements_with_stores(
     let Some((building, info)) = map.get(building).zip(infos.get(building)) else {
         return Vec::new();
     };
-    let positions;
-    let stores = match stores {
-        Some(stores) => stores,
-        None => {
-            positions = retail_store_positions(&map);
-            &positions
-        }
-    };
+    let door = building.door_pos.xy();
+    let retail_access = stores.map_or_else(
+        || ActiveRetailIndex::build(&map, &infos, sim.world()).has_access(door),
+        |stores| has_retail_access(stores, door),
+    );
+    let pipes = connected_site_network(&map, building)
+        .and_then(|network| SiteUtilityReader::new(sim).network_pipes(network))
+        .unwrap_or_default();
     Progression {
         map: &map,
         electricity: &sim.read::<ElectricityFlow>(),
-        utilities: &sim.read::<UtilityFlow>(),
         coverage: &sim.read::<CoverageGrid>(),
         environment: &sim.read::<EnvGrid>(),
-        stores,
     }
     .requirements(
         building,
@@ -491,6 +542,8 @@ pub(crate) fn requirements_with_stores(
         info.residents.len(),
         employed_residents(sim, &info.residents),
         residence.capacity as usize,
+        retail_access,
+        pipes,
     )
     .collect()
 }
@@ -511,31 +564,27 @@ pub(crate) const fn due(tick: u64) -> bool {
 
 pub fn residence_update(sim: &mut Simulation) {
     // Use the preceding elapsed-time utility and environment snapshots.
-    if !due(periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()))) {
+    let phase = periodic_tick(&sim.read::<Budget>(), Tick(sim.get_tick()));
+    if !due(phase) {
         return;
     }
-
     let mut abandon = Vec::new();
     let mut collapse = Vec::new();
-    let mut upgrades = Vec::new();
+    let mut candidates = Vec::new();
     {
         let map = sim.map();
         let infos = sim.read::<BuildingInfos>();
+        let utilities = sim.read::<UtilityFlow>();
+        let mut network_pipes = BTreeMap::new();
         let mut residences = sim.write::<Residences>();
-        let progression = Progression {
-            map: &map,
-            electricity: &sim.read::<ElectricityFlow>(),
-            utilities: &sim.read::<UtilityFlow>(),
-            coverage: &sim.read::<CoverageGrid>(),
-            environment: &sim.read::<EnvGrid>(),
-            stores: &retail_store_positions(&map),
-        };
         let Residences {
             entries, checks, ..
         } = &mut *residences;
-
         for (&id, residence) in &entries.by_building {
-            let Some(building) = map.get(id) else {
+            let Some(building) = map
+                .get(id)
+                .filter(|building| building.development().is_none())
+            else {
                 continue;
             };
             let Some(info) = infos.get(id) else { continue };
@@ -559,8 +608,23 @@ pub fn residence_update(sim: &mut Simulation) {
             } else {
                 0
             };
-            let utilities_ok =
-                progression.utilities.has_water(id) && progression.utilities.has_sewage(id);
+            let pipes = connected_site_network(&map, building)
+                .map(|network| {
+                    *network_pipes.entry(network).or_insert_with(|| {
+                        NetworkLoad::live_with_pipe_sample(
+                            &map,
+                            entries,
+                            &infos,
+                            sim.world(),
+                            &utilities,
+                            network,
+                        )
+                        .and_then(|(load, sampled)| sampled.then_some(load.pipes))
+                        .unwrap_or_default()
+                    })
+                })
+                .unwrap_or_default();
+            let utilities_ok = pipes.has_site_sewage();
             checks.outage_streak = if utilities_ok {
                 0
             } else {
@@ -572,15 +636,42 @@ pub fn residence_update(sim: &mut Simulation) {
             {
                 checks.abandoned_hours = Some(0);
                 abandon.push((id, building.door_pos));
-                continue;
-            }
-            let Some(next) = next_prototype(residence).filter(|_| utilities_ok) else {
+            } else if let Some(next) = next_prototype(residence).filter(|_| utilities_ok) {
+                candidates.push((id, next, pipes));
+            } else {
                 checks.upgrade_streak = 0;
+            }
+        }
+    }
+
+    let retail = development::update(sim, phase, abandon, collapse);
+    let mut upgrades = Vec::new();
+    {
+        let map = sim.map();
+        let infos = sim.read::<BuildingInfos>();
+        let mut residences = sim.write::<Residences>();
+        let progression = Progression {
+            map: &map,
+            electricity: &sim.read::<ElectricityFlow>(),
+            coverage: &sim.read::<CoverageGrid>(),
+            environment: &sim.read::<EnvGrid>(),
+        };
+        for (id, next, pipes) in candidates {
+            let Some((building, info)) = map.get(id).zip(infos.get(id)) else {
                 continue;
             };
             let good = progression
-                .requirements(building, next.level, occupied, employed, capacity)
+                .requirements(
+                    building,
+                    next.level,
+                    info.residents.len(),
+                    employed_residents(sim, &info.residents),
+                    residences.by_building[&id].capacity as usize,
+                    retail.has_access(building.door_pos.xy()),
+                    pipes,
+                )
                 .all(|requirement| requirement.met);
+            let checks = residences.checks.entry(id).or_default();
             checks.upgrade_streak = if good {
                 checks.upgrade_streak.saturating_add(1)
             } else {
@@ -588,17 +679,10 @@ pub fn residence_update(sim: &mut Simulation) {
             };
             if checks.upgrade_streak >= UPGRADE_CHECKS {
                 checks.upgrade_streak = 0;
+                residences.upgrade(id, next);
                 upgrades.push((id, next));
             }
         }
-        for &(id, proto) in &upgrades {
-            residences.upgrade(id, proto);
-        }
-    }
-
-    evict_abandoned_homes(sim, &abandon);
-    for building in collapse {
-        super::growth::remove_growable(sim, building);
     }
     if !upgrades.is_empty() {
         let mut map = sim.map_mut();

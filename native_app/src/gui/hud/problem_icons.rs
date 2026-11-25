@@ -1,12 +1,9 @@
 use geom::{vec2, Intersect, Vec2, AABB};
 use goryak::{minrow, padxy, pass_pointer, round_rect, secondary_container};
 use ordered_float::OrderedFloat;
-use simulation::map::{BuildingID, BuildingKind, ProjectFilter};
-use simulation::map_dynamic::{ElectricityFlow, UtilityFlow, UtilityStatus};
-use simulation::souls::{
-    events::Fires,
-    residence::{self, Residences},
-};
+use simulation::map::{BuildingID, ProjectFilter};
+use simulation::map_dynamic::{ElectricityFlow, SiteUtilityReader, UtilityStatus};
+use simulation::souls::events::Fires;
 use simulation::Simulation;
 use yakui::event::{EventInterest, EventResponse, WidgetEvent};
 use yakui::input::MouseButton;
@@ -105,8 +102,7 @@ struct PlacedBadge {
 
 pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
     let map = sim.map();
-    let utilities = sim.read::<UtilityFlow>();
-    let residences = sim.read::<Residences>();
+    let mut utilities = SiteUtilityReader::for_display(sim);
     let fires = sim.read::<Fires>();
     let power = sim.read::<ElectricityFlow>();
     let camera = uiworld.camera().camera;
@@ -151,10 +147,7 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
             });
         }
 
-        if building.kind == BuildingKind::House && !residence::uses_water(sim, id) {
-            continue;
-        }
-        let Some(status) = utilities.status(&map, &residences, id) else {
+        let Some(status) = utilities.status(id) else {
             continue;
         };
         let kind = match (status.water, status.sewage) {

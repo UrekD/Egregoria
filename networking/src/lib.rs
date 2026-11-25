@@ -1,7 +1,7 @@
 #![allow(clippy::uninlined_format_args)]
 
 use crate::authent::AuthentID;
-use common::saveload::{CompressedBincode, Encoder};
+use common::saveload::{CompressedBincode, Encoder, COMMAND_PROTOCOL_REVISION};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -25,6 +25,11 @@ pub use server::{Server, ServerConfiguration, ServerPollResult, VirtualClientCon
 
 pub(crate) const MAX_WORLDSEND_PACKET_SIZE: usize = 262144; //32 ko at least 1.3Mo per s at 50FPS
 pub(crate) const DEFAULT_PORT: u16 = 23019;
+const MAX_PLAYER_INPUT_BYTES: usize = 512 * 1024;
+
+pub(crate) fn wire_version(release: &str) -> String {
+    format!("{release}+{COMMAND_PROTOCOL_REVISION}")
+}
 
 #[derive(PartialEq, Eq, PartialOrd, Ord, Copy, Clone, Hash, Debug, Serialize, Deserialize)]
 #[repr(transparent)]
@@ -77,6 +82,14 @@ pub(crate) fn decode<T: DeserializeOwned>(x: &[u8]) -> Option<T> {
     Enc::decode(x).ok()
 }
 
+pub(crate) fn decode_player_input<T: DeserializeOwned>(input: &PlayerInput) -> Option<T> {
+    let bytes = &input.0;
+    if bytes.len() > MAX_PLAYER_INPUT_BYTES {
+        return None;
+    }
+    Enc::decode_limited(bytes, MAX_PLAYER_INPUT_BYTES).ok()
+}
+
 pub(crate) struct PhantomSendSync<T>(PhantomData<T>);
 
 unsafe impl<T> Send for PhantomSendSync<T> {}
@@ -106,9 +119,22 @@ fn decode_merged<I: DeserializeOwned>(
             .flat_map(|(id, x)| {
                 Some(ServerInput {
                     sent_by_me: id == me,
-                    inp: decode(&x.0)?,
+                    inp: decode_player_input(&x)?,
                 })
             })
             .collect(),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn p7_ingress_limits_inflated_player_input() {
+    let permitted = vec![0u8; MAX_PLAYER_INPUT_BYTES / 2];
+    assert_eq!(
+        decode_player_input::<Vec<u8>>(&PlayerInput(encode(&permitted))),
+        Some(permitted),
+    );
+    let excessive = PlayerInput(encode(&vec![0u8; MAX_PLAYER_INPUT_BYTES]));
+    assert!(excessive.0.len() < MAX_PLAYER_INPUT_BYTES);
+    assert!(decode_player_input::<Vec<u8>>(&excessive).is_none());
 }

@@ -6,15 +6,8 @@ pub const MIXED_USE_SHOP_FLOOR_HEIGHT_M: f32 = 4.5;
 pub const MAX_PROFILED_SLOTS: u32 = 1_024;
 const MAX_GROWABLE_FLOORS: u8 = 28;
 
-// Wave C owns this switch. Lua globals can select staged data but cannot open this gate.
-const MIXED_USE_PLACEMENT_READY: bool = false;
-
-#[cfg(test)]
-pub(crate) struct AllowStagedMixedUse;
-
-/// Land use in the prototype registry. The command enum stays four-kind until the
-/// spine can wire Mixed Use through paint, placement and serialization together.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+/// Land use in the prototype registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum GrowableZoneKind {
     Pure(ZoneKind),
     MixedUse,
@@ -45,17 +38,7 @@ impl Default for GrowableZoneKind {
 impl<'lua> FromLua<'lua> for GrowableZoneKind {
     fn from_lua(value: Value<'lua>, lua: &'lua Lua) -> mlua::Result<Self> {
         if matches!(&value, Value::String(kind) if kind.as_bytes() == b"mixed-use") {
-            #[cfg(test)]
-            if lua.app_data_ref::<AllowStagedMixedUse>().is_some() {
-                return Ok(Self::MixedUse);
-            }
-            return if MIXED_USE_PLACEMENT_READY {
-                Ok(Self::MixedUse)
-            } else {
-                Err(mlua::Error::external(
-                    "Mixed Use requires checked placement",
-                ))
-            };
+            return Ok(Self::MixedUse);
         }
         ZoneKind::from_lua(value, lua).map(Self::Pure)
     }
@@ -68,7 +51,7 @@ pub struct GrowableChainKey {
     pub level: u8,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum GrowableMassingStyle {
     House,
     Block,
@@ -90,7 +73,7 @@ impl<'lua> FromLua<'lua> for GrowableMassingStyle {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct GrowableMassing {
     pub style: GrowableMassingStyle,
     pub floors_by_level: [u8; 5],

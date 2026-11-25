@@ -1,4 +1,4 @@
-#[derive(Debug, Clone, egui_inspect::Inspect)]
+#[derive(Debug, Clone, egui_inspect::Inspect, serde::Serialize)]
 pub struct PrototypeBase {
     pub name: String,
     pub order: String,

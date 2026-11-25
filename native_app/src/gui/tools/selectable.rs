@@ -267,11 +267,46 @@ impl<'a> PreparedShell<'a> {
     }
 
     fn ray_depth(&self, ray: Ray3, depth: RangeInclusive<f32>) -> Option<f32> {
+        self.ray_hit(ray, depth).map(|(hit, _)| hit)
+    }
+
+    fn ray_hit(&self, ray: Ray3, depth: RangeInclusive<f32>) -> Option<(f32, Vec3)> {
         self.faces()
-            .flat_map(|(face, _, _)| face_fan(face.len()).map(|tri| tri.map(|index| face[index])))
-            .filter_map(|[a, b, c]| triangle_hit(ray, a, b, c, true))
-            .filter(|hit| depth.contains(hit))
-            .min_by(f32::total_cmp)
+            .flat_map(|(face, normal, _)| {
+                face_fan(face.len()).map(move |tri| (tri.map(|index| face[index]), normal))
+            })
+            .filter_map(|([a, b, c], normal)| {
+                triangle_hit(ray, a, b, c, true).map(|hit| (hit, normal))
+            })
+            .filter(|(hit, _)| depth.contains(hit))
+            .min_by(|(a, _), (b, _)| a.total_cmp(b))
+    }
+}
+
+/// Verify the camera ray used by the scripted tower selection.
+pub(crate) fn tower_pick_geometry(
+    map: &Map,
+    ray: Ray3,
+    selected: &Building,
+    background: Option<&Building>,
+) -> bool {
+    let hits = SurfaceHits::cast(map.environment(), ray);
+    let Some((start, end)) = visible_pick_depth(map.environment().bounds(), ray, hits) else {
+        return false;
+    };
+    let Some((depth, normal)) =
+        PreparedShell::new(selected).and_then(|shell| shell.ray_hit(ray, start..=end))
+    else {
+        return false;
+    };
+    match background {
+        Some(building) => {
+            normal.z > 0.95
+                && PreparedShell::new(building)
+                    .and_then(|shell| shell.ray_depth(ray, start..=end))
+                    .is_some_and(|hit| hit > depth)
+        }
+        None => hits.nearest().is_none() && normal.z.abs() < 0.1,
     }
 }
 
@@ -377,6 +412,7 @@ pub(crate) mod tests {
             floors: 10,
             roof_z,
             approved_value_band: 0,
+            frozen_shell: None,
             home: None,
             planned_jobs: 0,
             site: GrowableSiteState::Active,

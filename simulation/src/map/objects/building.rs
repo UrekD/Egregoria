@@ -1,3 +1,4 @@
+use crate::map::import::growable_shell::FrozenGrowableShell;
 use crate::map::procgen::{gen_exterior_farm, gen_exterior_house, ColoredMesh};
 use crate::map::{
     Buildings, ElectricityCache, Environment, LanePattern, RoadID, Roads, SpatialMap, ZoneCell,
@@ -171,6 +172,8 @@ pub struct GrowableDevelopment {
     pub planned_jobs: u32,
     pub site: GrowableSiteState,
     pub business: Option<GrowableBusinessState>,
+    #[serde(default)]
+    pub frozen_shell: Option<FrozenGrowableShell>,
 }
 
 impl GrowableDevelopment {
@@ -202,6 +205,11 @@ impl PreparedGrowableAppearance {
             && self.development.roof_z > self.base_z
             && self.door.is_finite()
             && parcel.contains(self.door.xy())
+            && self.development.frozen_shell.as_ref().is_none_or(|shell| {
+                shell.valid_for(parcel)
+                    && shell.fit().base_z() == self.base_z
+                    && shell.fit().door() == self.door
+            })
             && self
                 .mesh
                 .faces
@@ -242,7 +250,7 @@ impl PreparedBuilding {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Building {
     pub id: BuildingID,
     pub door_pos: Vec3,
@@ -254,6 +262,33 @@ pub struct Building {
     pub connected_road: Option<RoadID>,
     #[serde(default)]
     pub(in crate::map) development: Option<GrowableDevelopment>,
+}
+
+impl Serialize for Building {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let empty_mesh = ColoredMesh::default();
+        let mesh = if self
+            .development()
+            .is_some_and(|site| site.frozen_shell.is_some())
+        {
+            &empty_mesh
+        } else {
+            &self.mesh
+        };
+        let mut building = serializer.serialize_struct("Building", 9)?;
+        building.serialize_field("id", &self.id)?;
+        building.serialize_field("door_pos", &self.door_pos)?;
+        building.serialize_field("kind", &self.kind)?;
+        building.serialize_field("mesh", mesh)?;
+        building.serialize_field("obb", &self.obb)?;
+        building.serialize_field("height", &self.height)?;
+        building.serialize_field("zone", &self.zone)?;
+        building.serialize_field("connected_road", &self.connected_road)?;
+        building.serialize_field("development", &self.development)?;
+        building.end()
+    }
 }
 
 impl Building {

@@ -7,9 +7,11 @@ pub mod perf;
 pub mod services_basic;
 pub mod services_neglect;
 pub mod smoke;
+pub(crate) mod traffic_repair;
 mod transit_basic;
 mod water_basic;
 pub mod water_fixtures;
+mod zones2;
 
 use crate::builders::{grid_city, place_company, place_grid_power_plant, place_service_sites};
 use crate::{Scenario, ScenarioCtx};
@@ -23,6 +25,11 @@ pub const PERF_10K: (Scenario, SimulationOptions) = (
     },
     perf::OPTIONS,
 );
+
+pub const ZONES2_L3: (Scenario, SimulationOptions) = zones2::ATTAINMENT;
+
+pub const ZONES2_STAGED: &[(Scenario, SimulationOptions)] =
+    &[zones2::CITY, zones2::CONTROLLED, ZONES2_L3];
 
 pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     (

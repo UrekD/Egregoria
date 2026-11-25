@@ -31,10 +31,10 @@ use crate::gui::{
     toolbox,
     toolbox::building::BuildingTab,
     top_demand_driver,
-    zoning::ZONES,
+    zoning::{ZoningState, ZONES},
     GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool, ToolSelection,
 };
-use crate::session::{self, SessionScreen, SessionState, SlotCompatibility};
+use crate::session::{self, SessionScreen, SessionState};
 use crate::sim_thread::{AppliedBatch, BatchId, Boundary, Reply, ReplyKind, Request, SimThread};
 use crate::uiworld::{SaveLoadState, UiWorld};
 
@@ -98,6 +98,7 @@ enum Step {
     },
     /// `"hand"`, a toolbar category (`"zoning"`) or a mode (`"roads/curved"`).
     SelectTool(ToolSelection),
+    SelectZone(ZoneKind),
     SetOverlay(OverlayMode),
     SetSession(SessionScreen),
     OpenWindow(String),
@@ -108,6 +109,7 @@ enum Step {
         round_trip: bool,
     },
     NewWetTiledFixture,
+    ClearBuildingInspector,
     LoadSlot(String),
     Assert(Assertion),
     Screenshot(String),
@@ -152,6 +154,13 @@ enum Assertion {
         receipt: Option<LandReceipt>,
         treasury: u32,
         extent: Option<[u16; 2]>,
+    },
+    MixedUseInspector {
+        business_open: bool,
+    },
+    TowerSelection {
+        parcel_center: [f32; 2],
+        background_tower: Option<[f32; 2]>,
     },
     BuildingCount {
         prototype: String,
@@ -508,14 +517,8 @@ impl Automation {
                 .find(|(entry, _)| entry.id.as_str() == id)
                 .cloned()
                 .ok_or_else(|| format!("save slot {id:?} was not found"))?;
-            match compatibility {
-                SlotCompatibility::Compatible => {}
-                SlotCompatibility::Incompatible => {
-                    return Err(format!("save slot {id:?} has an incompatible version"));
-                }
-                SlotCompatibility::Unreadable => {
-                    return Err(format!("save slot {id:?} has an unreadable snapshot"));
-                }
+            if let Some(reason) = compatibility.unavailable_reason() {
+                return Err(format!("save slot {id:?} ({reason})"));
             }
             drop(session);
             session::load_slot(uiw, entry);
@@ -580,6 +583,7 @@ impl Automation {
                     | Step::InspectCargoRoad { .. }
                     | Step::Camera { .. }
                     | Step::SelectTool(_)
+                    | Step::SelectZone(_)
             )
         {
             return Err("world interactions require the Playing session".into());
@@ -726,6 +730,12 @@ impl Automation {
             Step::SelectTool(selection) => {
                 toolbox::select_tool(uiw, sim, selection);
             }
+            Step::SelectZone(kind) => {
+                if *uiw.read::<Tool>() != Tool::Zoning {
+                    return Err("selecting a zone requires the zoning tool".into());
+                }
+                uiw.write::<ZoningState>().select_kind(Some(kind));
+            }
             Step::SetOverlay(mode) => *uiw.write::<OverlayMode>() = mode,
             Step::SetSession(screen) => {
                 if !session::set_screen(uiw, screen) {
@@ -740,6 +750,9 @@ impl Automation {
                 replace_land_fixture(uiw, new_tiled_fixture(side, progression, round_trip)?)?;
             }
             Step::NewWetTiledFixture => replace_land_fixture(uiw, land_fixture::wet_rectangle()?)?,
+            Step::ClearBuildingInspector => {
+                uiw.write::<InspectedBuilding>().e = None;
+            }
             Step::OpenWindow(name) => {
                 if name == "Land Tiles" && !uiw.read::<GuiState>().windows.land_tiles_open {
                     crate::gui::overlays::land_tiles::toggle(uiw);
@@ -1135,6 +1148,71 @@ impl Assertion {
                     return Err(format!(
                         "land UI at tick {} with treasury {actual_treasury} and owned {actual_owned:?} on {actual_extent:?}: expected {expected:?}, got {actual:?}",
                         sim.get_tick(),
+                    ));
+                }
+            }
+            Self::MixedUseInspector { business_open } => {
+                use simulation::map::GrowableBusinessState;
+                let expected = if business_open { "open" } else { "shuttered" };
+                let matches = uiw
+                    .read::<InspectedBuilding>()
+                    .e
+                    .and_then(|id| sim.growable_summary(id))
+                    .is_some_and(|site| {
+                        site.zone.kind == ZoneKind::MixedUse
+                            && site.occupants > 0
+                            && if business_open {
+                                site.business == Some(GrowableBusinessState::Open)
+                            } else {
+                                matches!(
+                                    site.business,
+                                    Some(GrowableBusinessState::ClosedUntil { .. })
+                                )
+                            }
+                    });
+                if !matches || uiw.read::<GuiState>().hidden {
+                    return Err(format!(
+                        "expected an occupied Mixed Use inspector with a {expected} business"
+                    ));
+                }
+            }
+            Self::TowerSelection {
+                parcel_center,
+                background_tower,
+            } => {
+                use crate::gui::selectable::tower_pick_geometry;
+                let map = sim.map();
+                let matches_tower = |building: &simulation::map::Building, [x, y]: [f32; 2]| {
+                    building.obb.center().distance2(vec2(x, y)) < 0.01
+                        && building.development().is_some_and(|site| site.floors >= 12)
+                };
+                let selected = uiw.read::<InspectedBuilding>().e;
+                let building = selected
+                    .and_then(|id| map.get(id))
+                    .filter(|building| matches_tower(building, parcel_center))
+                    .ok_or_else(|| {
+                        format!("expected tower at {parcel_center:?}, selected {selected:?}")
+                    })?;
+                let background = background_tower
+                    .map(|at| {
+                        map.buildings()
+                            .values()
+                            .find(|building| matches_tower(building, at))
+                            .ok_or_else(|| format!("missing background tower at {at:?}"))
+                    })
+                    .transpose()?;
+                let ray = uiw
+                    .read::<crate::inputmap::InputMap>()
+                    .ray
+                    .ok_or("missing tower pointer ray")?;
+                if !tower_pick_geometry(&map, ray, building, background) {
+                    return Err(format!(
+                        "tower at {parcel_center:?} did not present the expected {}",
+                        if background.is_some() {
+                            "overlapping roof"
+                        } else {
+                            "sky-backed facade"
+                        }
                     ));
                 }
             }

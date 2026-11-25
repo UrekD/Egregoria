@@ -14,7 +14,7 @@ use crate::map::{
     Building, BuildingID, BuildingKind, GrowableBusinessState, Map, Zone, MAX_ZONE_AREA,
 };
 use crate::map_dynamic::transit::elapsed_ticks;
-use crate::map_dynamic::{BuildingInfos, ElectricityFlow};
+use crate::map_dynamic::{site_power_status, BuildingInfos, ElectricityFlow};
 use crate::souls::desire::WorkKind;
 use crate::transportation::{spawn_parked_vehicle, spawn_truck_at_depot, VehicleKind};
 use crate::utils::resources::Resources;
@@ -127,10 +127,10 @@ pub struct GoodsCompanyState {
 
 impl CompanyEnt {
     /// Returns the productivity of the company, in [0; 1] range _before_ taking electricity into account
-    pub fn raw_productivity(&self, proto: &GoodsCompanyPrototype, zone: Option<&Zone>) -> f32 {
+    pub fn raw_productivity(&self, _proto: &GoodsCompanyPrototype, zone: Option<&Zone>) -> f32 {
         let mut p = 1.0;
-        if proto.n_workers > 0 {
-            p = self.workers.0.len() as f32 / proto.n_workers as f32;
+        if self.comp.max_workers > 0 {
+            p = self.workers.0.len() as f32 / self.comp.max_workers as f32;
         }
         if let Some(z) = zone {
             p *= z.area / MAX_ZONE_AREA
@@ -166,6 +166,11 @@ pub fn company_soul(
 ) -> Option<SoulID> {
     let map = sim.map();
     let b = map.buildings().get(build_id)?;
+    if b.kind != BuildingKind::GoodsCompany(proto)
+        || sim.read::<BuildingInfos>().owner(build_id).is_some()
+    {
+        return None;
+    }
     let planned = b.development().map(|site| site.planned_jobs);
     if (planned.is_some() || BuildingKind::GoodsCompany(proto).is_mixed_growable())
         && !sim.profiled_business_can_spawn(build_id, proto)
@@ -221,8 +226,14 @@ pub fn company_soul(
         }
     }
 
-    sim.write::<BuildingInfos>()
-        .set_owner(company.building, soul);
+    let mut infos = sim.write::<BuildingInfos>();
+    // Legacy callers can place a pure building directly on the map.
+    infos.insert(build_id);
+    if BuildingKind::GoodsCompany(proto.id).is_mixed_growable() {
+        infos.mark_business_address(build_id);
+    }
+    infos.set_owner(company.building, soul);
+    drop(infos);
 
     if planned.is_some() {
         sim.map_mut()
@@ -270,6 +281,7 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
     let market: &Market = &market;
     let map: &Map = &res.read();
     let elec_flow: &ElectricityFlow = &res.read();
+    let infos: &BuildingInfos = &res.read();
     let job_opening = ItemID::new("job-opening");
     let coal_plant = GoodsCompanyID::new("coal-power-plant");
     let coal = ItemID::new("coal");
@@ -286,6 +298,15 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
         });
 
         let proto = c.comp.proto.prototype();
+        if b.development().is_some()
+            && (b.is_abandoned_growable()
+                || b.is_orphaned()
+                || b.development().unwrap().business != Some(GrowableBusinessState::Open)
+                || infos.owner(b.id) != Some(soul))
+        {
+            return;
+        }
+
         if proto.storage.is_none()
             && !c.comp.trucks.is_empty()
             && (c.comp.trucks.len() as u32) < proto.n_trucks
@@ -315,9 +336,29 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
 
         if let Some(recipe) = proto.recipe.as_ref().filter(|_| proto.storage.is_none()) {
             if recipe_should_produce(recipe, soul, market) {
-                let productivity = c.productivity(proto, b.zone.as_ref(), map, elec_flow);
-
-                c.comp.progress += productivity / recipe.batch_ticks() as f32;
+                let (productivity, batch_ticks) = if b.development().is_some() {
+                    let role = crate::map_dynamic::ActiveBusiness {
+                        company: me,
+                        prototype: proto,
+                        slots: b.development().unwrap().planned_jobs,
+                        filled: c.workers.0.len(),
+                    };
+                    let rates = role.rates();
+                    let powered = proto.power_consumption.unwrap_or(Power::ZERO) <= Power::ZERO
+                        || site_power_status(map, elec_flow, b) == PowerStatus::Available;
+                    (
+                        rates.staffed_fraction as f32 * f32::from(powered),
+                        rates
+                            .full_speed_batch_ticks
+                            .unwrap_or_else(|| recipe.batch_ticks()),
+                    )
+                } else {
+                    (
+                        c.productivity(proto, b.zone.as_ref(), map, elec_flow),
+                        recipe.batch_ticks(),
+                    )
+                };
+                c.comp.progress += productivity / batch_ticks as f32;
             } else {
                 if proto.id == coal_plant && market.capital(soul, coal) == 0 {
                     record_coal_stockout(res, coal);

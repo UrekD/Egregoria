@@ -1,4 +1,6 @@
-use scenarios::builtin::{demo_cities, growth_basic, perf, water_fixtures, PERF_10K, SCENARIOS};
+use scenarios::builtin::{
+    demo_cities, growth_basic, perf, water_fixtures, PERF_10K, SCENARIOS, ZONES2_STAGED,
+};
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
 use serde::Serialize;
@@ -21,8 +23,9 @@ struct JsonSample {
 fn usage() -> String {
     let names = SCENARIOS
         .iter()
+        .chain(ZONES2_STAGED)
         .map(|(scenario, _)| scenario.name)
-        .chain([PERF_10K.0.name, "all"])
+        .chain([PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
         .collect::<Vec<_>>()
         .join("|");
     format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
@@ -165,6 +168,7 @@ fn run() -> Result<(), String> {
         println!("{}", usage());
         return Ok(());
     }
+    let name = if name == "zones2" { "zones2_city".into() } else { name };
     if matches!(name.as_str(), "perf_scale" | "perf-scale" | "bench-slot") {
         return run_benchmark(&name, args);
     }
@@ -224,12 +228,18 @@ fn run() -> Result<(), String> {
             demo_cities::generate(&root)
         };
     }
-    let available = if name == PERF_10K.0.name {
-        std::slice::from_ref(&PERF_10K)
-    } else {
-        SCENARIOS
+    let available: Vec<_> = match name.as_str() {
+        "all" => SCENARIOS.iter().collect(),
+        "all_staged" => SCENARIOS.iter().chain(ZONES2_STAGED).collect(),
+        "zones2_staged" => ZONES2_STAGED.iter().collect(),
+        _ => SCENARIOS
+            .iter()
+            .chain(ZONES2_STAGED)
+            .chain(std::iter::once(&PERF_10K))
+            .filter(|(scenario, _)| scenario.name == name)
+            .collect(),
     };
-    if name != "all" && !available.iter().any(|(scenario, _)| scenario.name == name) {
+    if available.is_empty() {
         return Err(format!("unknown scenario {name:?}\n{}", usage()));
     }
 
@@ -291,9 +301,6 @@ fn run() -> Result<(), String> {
         .transpose()?;
     let mut results = BTreeMap::new();
     for (scenario, options) in available {
-        if name != "all" && name != scenario.name {
-            continue;
-        }
         let expected = match &baseline {
             Some(baseline) => Some(baseline.get(scenario.name).map(Vec::as_slice).ok_or_else(
                 || {

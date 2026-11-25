@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use geom::{Shape, Vec2};
@@ -10,9 +11,9 @@ use crate::map::{
 };
 
 #[derive(Serialize, Deserialize)]
-struct MapWithLotOrigins<T> {
+struct MapWithLotOrigins<T, Origins = BTreeMap<BuildingID, LotOrigin>> {
     map: T,
-    lot_origins: BTreeMap<BuildingID, LotOrigin>,
+    lot_origins: Origins,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -30,20 +31,6 @@ struct ReadableMap {
 }
 
 impl ReadableMap {
-    fn from_serialized(map: SerializedMap, import_lane_reserve: bool) -> Self {
-        Self {
-            roads: map.roads,
-            intersections: map.intersections,
-            buildings: map.buildings,
-            lanes: map.lanes,
-            parking: map.parking,
-            lots: map.lots,
-            environment: map.environment,
-            external_train_stations: map.external_train_stations,
-            import_lane_reserve,
-        }
-    }
-
     fn into_serialized(self) -> SerializedMap {
         SerializedMap {
             roads: self.roads,
@@ -70,44 +57,51 @@ struct SerializedMap {
     pub external_train_stations: Vec<BuildingID>,
 }
 
-impl From<&Map> for SerializedMap {
-    fn from(m: &Map) -> Self {
-        Self {
-            roads: m.roads.clone(),
-            intersections: m.intersections.clone(),
-            buildings: m.buildings.clone(),
-            lanes: m.lanes.clone(),
-            parking: m.parking.clone(),
-            lots: m.lots.clone(),
-            environment: m.environment.clone(),
-            external_train_stations: m.external_train_stations.clone(),
-        }
-    }
+#[derive(Serialize)]
+struct BorrowedMap<'a> {
+    roads: &'a Roads,
+    intersections: &'a Intersections,
+    buildings: &'a Buildings,
+    lanes: &'a Lanes,
+    parking: &'a ParkingSpots,
+    lots: &'a Lots,
+    environment: &'a Environment,
+    external_train_stations: Cow<'a, [BuildingID]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    import_lane_reserve: Option<bool>,
 }
 
 impl Serialize for Map {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = SerializedMap::from(self);
-        let lot_origins = self.lot_origins.clone();
-        if serializer.is_human_readable() {
-            return MapWithLotOrigins {
-                map: ReadableMap::from_serialized(map, self.import_lane_reserve),
-                lot_origins,
-            }
-            .serialize(serializer);
+        let import_lane_reserve = serializer
+            .is_human_readable()
+            .then_some(self.import_lane_reserve);
+        let mut external_train_stations = Cow::Borrowed(self.external_train_stations.as_slice());
+        // Keep the existing positional encoding for imported Bincode maps.
+        if import_lane_reserve.is_none() && self.import_lane_reserve {
+            external_train_stations.to_mut().push(BuildingID::null());
         }
-        // Bincode uses positional fields. A trailing null station key explicitly
-        // marks an import and preserves the byte layout of ordinary maps.
-        if self.import_lane_reserve {
-            map.external_train_stations.push(BuildingID::null());
+        MapWithLotOrigins {
+            map: BorrowedMap {
+                roads: &self.roads,
+                intersections: &self.intersections,
+                buildings: &self.buildings,
+                lanes: &self.lanes,
+                parking: &self.parking,
+                lots: &self.lots,
+                environment: &self.environment,
+                external_train_stations,
+                import_lane_reserve,
+            },
+            lot_origins: &self.lot_origins,
         }
-        MapWithLotOrigins { map, lot_origins }.serialize(serializer)
+        .serialize(serializer)
     }
 }
 
 impl<'de> Deserialize<'de> for Map {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (map, lot_origins, import_lane_reserve) = if deserializer.is_human_readable() {
+        let (mut map, lot_origins, import_lane_reserve) = if deserializer.is_human_readable() {
             let MapWithLotOrigins { map, lot_origins } =
                 MapWithLotOrigins::<ReadableMap>::deserialize(deserializer)?;
             let imported = map.import_lane_reserve;
@@ -127,11 +121,45 @@ impl<'de> Deserialize<'de> for Map {
             .map_err(serde::de::Error::custom)?;
         map.validate_spatial_geometry()
             .map_err(serde::de::Error::custom)?;
+        map.rebuild_growable_shells()
+            .map_err(serde::de::Error::custom)?;
         Ok(map.into_map(lot_origins, import_lane_reserve))
     }
 }
 
 impl SerializedMap {
+    fn rebuild_growable_shells(&mut self) -> Result<(), String> {
+        for (id, building) in self.buildings.iter_mut() {
+            let Some(site) = building.development() else {
+                continue;
+            };
+            let Some(shell) = site.frozen_shell.as_ref() else {
+                continue;
+            };
+            let invalid = || format!("building {id:?} has invalid frozen shell geometry");
+            if !shell.valid_for(&building.obb)
+                || shell.fit().base_z() != building.height
+                || shell.fit().door() != building.door_pos
+            {
+                return Err(invalid());
+            }
+            let (mesh, roof_z) = shell
+                .mesh(site.zone, site.floors, site.level)
+                .ok_or_else(invalid)?;
+            if roof_z != site.roof_z
+                || mesh
+                    .faces
+                    .iter()
+                    .flat_map(|(face, _)| face)
+                    .any(|p| !p.is_finite())
+            {
+                return Err(invalid());
+            }
+            building.mesh = mesh;
+        }
+        Ok(())
+    }
+
     fn validate_references(&self) -> Result<(), String> {
         for (id, road) in self.roads.iter() {
             for junction in [road.src, road.dst] {
@@ -252,9 +280,18 @@ impl SerializedMap {
                 return Err(format!("building {id:?} has invalid spatial bounds"));
             }
         }
+        let mut lot_memberships = 0;
         for (id, lot) in self.lots.iter() {
-            if lot.shape.corners.iter().any(|point| !point.is_finite()) {
-                return Err(format!("lot {id:?} has invalid spatial bounds"));
+            let bad_bounds = || format!("lot {id:?} has invalid spatial bounds");
+            if lot.shape.corners.iter().any(|point| {
+                !point.is_finite() || point.x.abs() > index_limit || point.y.abs() > index_limit
+            }) {
+                return Err(bad_bounds());
+            }
+            lot_memberships += super::spatial_map::validated_lot_memberships(lot.shape.bbox())
+                .ok_or_else(bad_bounds)?;
+            if lot_memberships > super::spatial_map::MAX_LOT_MEMBERSHIPS {
+                return Err("lot spatial membership limit exceeded".to_owned());
             }
         }
         Ok(())
@@ -266,6 +303,10 @@ impl SerializedMap {
         import_lane_reserve: bool,
     ) -> Map {
         let spatial_map = mk_spatial_map(&self);
+        let mut lots_by_road = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
+        for (id, lot) in self.lots.iter() {
+            lots_by_road.entry(lot.parent).or_default().insert(id);
+        }
         let mut m = Map {
             roads: self.roads,
             lanes: self.lanes,
@@ -273,6 +314,7 @@ impl SerializedMap {
             buildings: self.buildings,
             spatial_map,
             lots: self.lots,
+            lots_by_road,
             parking: self.parking,
             environment: self.environment,
             external_train_stations: self.external_train_stations,
@@ -307,7 +349,7 @@ fn mk_spatial_map(m: &SerializedMap) -> SpatialMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{LanePatternBuilder, MapProject, RoadID};
+    use crate::map::{LanePatternBuilder, Lot, LotKind, MapProject, RoadID};
     use common::saveload::{Bincode, Encoder, JSON};
     use geom::{vec3, PolyLine3, Vec3};
 
@@ -324,11 +366,28 @@ mod tests {
 
         (
             MapWithLotOrigins {
-                map: (&map).into(),
+                map: Bincode::decode(&Bincode::encode(&map).unwrap())
+                    .map(|data: MapWithLotOrigins<SerializedMap>| data.map)
+                    .unwrap(),
                 lot_origins: BTreeMap::new(),
             },
             road,
         )
+    }
+
+    #[test]
+    fn p7_spatial_load_bounds() {
+        let (mut serialized, road) = serialized_map_with_road();
+        serialized.map.lots.insert_with_key(|id| Lot {
+            id,
+            parent: road,
+            shape: geom::OBB::new(Vec2::ZERO, Vec2::X, 50_000.0, 1.0),
+            height: 0.0,
+            kind: LotKind::Unassigned,
+        });
+        let bytes = Bincode::encode(&serialized).unwrap();
+        let error = Bincode::decode::<Map>(&bytes).err().expect("oversized lot");
+        assert!(error.to_string().contains("lot"), "{error}");
     }
 
     #[test]
@@ -355,7 +414,7 @@ mod tests {
 
     #[test]
     fn osm_trim_mode_round_trips_and_defaults_to_ordinary() {
-        let legacy = MapWithLotOrigins {
+        let legacy = MapWithLotOrigins::<SerializedMap> {
             map: SerializedMap::default(),
             lot_origins: BTreeMap::new(),
         };

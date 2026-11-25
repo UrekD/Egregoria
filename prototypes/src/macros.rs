@@ -38,6 +38,7 @@ macro_rules! gen_prototypes {
                 pub(crate) $name: common::TransparentMap<$id, $t>,
             )+
             pub(crate) orderings: Orderings,
+            pub(crate) fingerprint: u64,
             declared_types: std::collections::BTreeMap<String, &'static str>,
             conflicting_declarations: std::collections::BTreeSet<String>,
         }
@@ -83,6 +84,24 @@ macro_rules! gen_prototypes {
                         log::info!("loaded {} {}", <$t as $crate::ConcretePrototype>::storage(self).len(), <$t as $crate::Prototype>::NAME);
                     }
                 )+
+            }
+
+            pub(crate) fn compute_fingerprint(&self) -> std::io::Result<u64> {
+                use common::saveload::{Bincode, Encoder};
+                use std::hash::Hasher;
+
+                // The tuple fixes the prototype kind order and the BTreeMaps fix the
+                // order within each kind. Serialize the effective Rust fields, including
+                // inherited fields and defaults, once Lua parsing has finished.
+                let encoded = Bincode::encode(&(
+                    $(
+                        self.$name.iter().collect::<std::collections::BTreeMap<_, _>>(),
+                    )+
+                ))?;
+                #[allow(deprecated)] // Fixed SipHash-2-4 keys and byte-oriented input.
+                let mut hash = std::hash::SipHasher::new_with_keys(0, 0);
+                hash.write(&encoded);
+                Ok(hash.finish())
             }
 
             pub(crate) fn compute_orderings(&mut self) {

@@ -695,10 +695,17 @@ impl P2dProgression {
         let residents: Vec<_> = (0..2)
             .map(|_| spawn_human(&mut test.g, house).unwrap())
             .collect();
+        let Some(SoulID::GoodsCompany(shop)) =
+            company_soul(&mut test.g, retailer, kind.as_goods_company().unwrap())
+        else {
+            panic!("expected a live retail company");
+        };
         for &human in &residents {
-            test.g.world.humans[human].work = Some(Work::new(retailer, WorkKind::Worker, 0.0));
+            test.g.world.edit_human(human, |resident| {
+                resident.work = Some(Work::new(retailer, WorkKind::Worker, 0.0));
+            });
         }
-        for company in [plant, pump, outlet] {
+        for company in [plant, pump, outlet, shop] {
             test.g.world.companies[company].workers.0.push(residents[0]);
         }
         Self {

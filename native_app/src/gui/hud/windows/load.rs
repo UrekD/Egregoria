@@ -96,7 +96,7 @@ pub(crate) fn debug_replay(ui: &mut egui::Ui, uiw: &UiWorld) {
 }
 
 pub(crate) fn render_slots(uiw: &UiWorld) {
-    use crate::session::{SessionState, SessionUi, SlotCompatibility};
+    use crate::session::{SessionState, SessionUi};
     use goryak::{
         button_primary, button_secondary, error, minrow, on_secondary_container, textc,
         VertScrollSize,
@@ -118,20 +118,13 @@ pub(crate) fn render_slots(uiw: &UiWorld) {
                     let name = session::display_name(entry);
                     goryak::mincolumn(3.0, || {
                         minrow(12.0, || {
-                            if *compatibility == SlotCompatibility::Compatible {
-                                if button_primary(name).show().clicked {
-                                    load = Some(entry.clone());
-                                }
-                            } else {
-                                let reason = if *compatibility == SlotCompatibility::Incompatible {
-                                    "incompatible version"
-                                } else {
-                                    "unreadable snapshot"
-                                };
+                            if let Some(reason) = compatibility.unavailable_reason() {
                                 textc(
                                     on_secondary_container().adjust(0.6),
                                     format!("{name} ({reason})"),
                                 );
+                            } else if button_primary(name).show().clicked {
+                                load = Some(entry.clone());
                             }
                             if button_secondary("Delete").show().clicked {
                                 delete = Some(entry.id.clone());

@@ -8,13 +8,15 @@ use prototypes::{
     MIXED_USE_SHOP_FLOOR_HEIGHT_M,
 };
 
+use serde::{Deserialize, Serialize};
+
 const SETBACK_M: f32 = 1.0;
 const WALK_HALF_WIDTH_M: f32 = 1.2;
 const WALK_MAX_GRADE: f32 = 0.20;
 const MAX_PLOT_AXIS_M: f32 = u16::MAX as f32 / 10.0;
 const FOUNDATION_CLEARANCE_M: f32 = 0.025;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum GrowableForm {
     Stepped,
     BroadBase,
@@ -65,7 +67,7 @@ pub(crate) fn grade_nodes(env: &Environment, parcel: OBB) -> impl Iterator<Item 
 }
 
 /// An inset feasible at construction grade. The lot remains the reserved map footprint.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct GrowableFormFit {
     form: GrowableForm,
     ground: OBB,
@@ -74,6 +76,18 @@ pub struct GrowableFormFit {
     door: Vec3,
     walk: [Vec3; 4],
     frontage_landing: Vec3,
+}
+
+impl PartialEq for GrowableFormFit {
+    fn eq(&self, other: &Self) -> bool {
+        self.form == other.form
+            && self.ground.corners == other.ground.corners
+            && self.shaft.corners == other.shaft.corners
+            && self.base_z == other.base_z
+            && self.door == other.door
+            && self.walk == other.walk
+            && self.frontage_landing == other.frontage_landing
+    }
 }
 
 impl GrowableFormFit {
@@ -218,14 +232,108 @@ impl GrowableFormFit {
         ]
     }
 
-    pub(crate) fn mesh(
+    fn skirt_edges(self) -> impl Iterator<Item = (Vec3, Vec3)> {
+        let ground = self.ground.segments().into_iter().flat_map(move |edge| {
+            let mut previous = 0.0;
+            cell_crossings(edge.src, edge.dst)
+                .into_iter()
+                .skip(1)
+                .map(move |hi| {
+                    let lo = std::mem::replace(&mut previous, hi);
+                    (
+                        point_along(edge.src, edge.dst, lo).z(self.base_z),
+                        point_along(edge.src, edge.dst, hi).z(self.base_z),
+                    )
+                })
+        });
+        let [a, b, c, d] = self.walk;
+        let walkway = [(d, a), (b, c)].into_iter().flat_map(|(from, to)| {
+            // Limit mesh size on deep parcels. Each panel still samples the
+            // lowest grade along the full interval when the shell is frozen.
+            let panels = (from.xy().distance(to.xy()) / CELL_SIZE)
+                .ceil()
+                .clamp(1.0, 16.0) as u16;
+            let step = (to - from) / f32::from(panels);
+            (0..panels).map(move |i| (from + step * f32::from(i), from + step * f32::from(i + 1)))
+        });
+        ground.chain(walkway)
+    }
+
+    pub(crate) fn freeze(
         self,
         env: &Environment,
-        zone: ZoneCell,
         style: GrowableMassingStyle,
-        floors: u8,
-        level: u8,
-    ) -> Option<(ColoredMesh, f32)> {
+    ) -> Option<FrozenGrowableShell> {
+        let terrain = |point| env.true_height(point);
+        let skirt_bottoms = self
+            .skirt_edges()
+            .map(|(a, b)| {
+                let grade = segment_grade(a.xy(), b.xy(), &terrain)?.0.max(0.0);
+                Some(grade.min(a.z).min(b.z) - 0.05)
+            })
+            .collect::<Option<Vec<_>>>()?;
+        Some(FrozenGrowableShell {
+            fit: self,
+            style,
+            skirt_bottoms,
+        })
+    }
+}
+
+/// The placement geometry and grade anchors required to rebuild the shell at any level.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FrozenGrowableShell {
+    fit: GrowableFormFit,
+    style: GrowableMassingStyle,
+    skirt_bottoms: Vec<f32>,
+}
+
+impl FrozenGrowableShell {
+    pub fn fit(&self) -> GrowableFormFit {
+        self.fit
+    }
+
+    pub fn style(&self) -> GrowableMassingStyle {
+        self.style
+    }
+
+    pub(crate) fn valid_for(&self, parcel: &OBB) -> bool {
+        let fit = self.fit;
+        let bounds = parcel.expand(0.01);
+        let inside = |point: Vec2| point.is_finite() && bounds.contains(point);
+        let valid_inset = |shape: OBB| {
+            shape.corners.into_iter().all(inside)
+                && shape
+                    .axis()
+                    .iter()
+                    .all(|axis| (3.98..=31.0).contains(&axis.mag()))
+        };
+        fit.base_z.is_finite()
+            && fit.base_z >= 0.0
+            && fit.door.is_finite()
+            && fit.door.z == fit.base_z
+            && inside(fit.door.xy())
+            && valid_inset(fit.ground)
+            && valid_inset(fit.shaft)
+            && fit
+                .walk
+                .iter()
+                .chain(std::iter::once(&fit.frontage_landing))
+                .all(|p| p.is_finite() && inside(p.xy()))
+            && self.skirt_bottoms.len() <= 56
+            && fit.skirt_edges().count() == self.skirt_bottoms.len()
+            && fit
+                .skirt_edges()
+                .zip(&self.skirt_bottoms)
+                .all(|((a, b), &bottom)| bottom.is_finite() && bottom < a.z.min(b.z))
+    }
+
+    pub(crate) fn mesh(&self, zone: ZoneCell, floors: u8, level: u8) -> Option<(ColoredMesh, f32)> {
+        if !(1..=28).contains(&floors) || !(1..=5).contains(&level) {
+            return None;
+        }
+        let fit = self.fit;
+        let style = self.style;
         use GrowableMassingStyle::{House, Industrial};
 
         let mixed = zone.kind == ZoneKind::MixedUse;
@@ -234,7 +342,7 @@ impl GrowableFormFit {
         } else {
             GROWABLE_FLOOR_HEIGHT_M
         };
-        let base = self.base_z;
+        let base = fit.base_z;
         let eaves = base + ground_floor + f32::from(floors - 1) * GROWABLE_FLOOR_HEIGHT_M;
         let colors = match zone.kind {
             ZoneKind::Residential => [rgb(0.76, 0.72, 0.61), rgb(0.42, 0.54, 0.44)],
@@ -245,20 +353,20 @@ impl GrowableFormFit {
         };
 
         let mut mesh = ColoredMesh::default();
-        let has_podium = style != House && self.ground.corners != self.shaft.corners && floors > 1;
+        let has_podium = style != House && fit.ground.corners != fit.shaft.corners && floors > 1;
         let shaft_bottom = if has_podium {
             let top = base + ground_floor;
-            walls(&mut mesh, self.ground, base, top, colors[1]);
-            ledge(&mut mesh, self.ground, self.shaft, top, colors[1]);
+            walls(&mut mesh, fit.ground, base, top, colors[1]);
+            ledge(&mut mesh, fit.ground, fit.shaft, top, colors[1]);
             top
         } else {
             base
         };
 
         let (roof_z, facade_top) = if style == House {
-            walls(&mut mesh, self.ground, base, eaves, colors[0]);
-            let [a, b, c, d] = self.ground.corners.map(|p| p.z(eaves));
-            let height = 1.2 + self.form.index() as f32 * 0.35 + f32::from(level - 1) * 0.2;
+            walls(&mut mesh, fit.ground, base, eaves, colors[0]);
+            let [a, b, c, d] = fit.ground.corners.map(|p| p.z(eaves));
+            let height = 1.2 + fit.form.index() as f32 * 0.35 + f32::from(level - 1) * 0.2;
             let roof_z = eaves + height;
             let left = ((a + d) * 0.5).xy().z(roof_z);
             let right = ((b + c) * 0.5).xy().z(roof_z);
@@ -270,8 +378,8 @@ impl GrowableFormFit {
             ]);
             (roof_z, eaves)
         } else {
-            let body = if has_podium { self.shaft } else { self.ground };
-            let (main_top, crown, crown_height) = match self.form {
+            let body = if has_podium { fit.shaft } else { fit.ground };
+            let (main_top, crown, crown_height) = match fit.form {
                 GrowableForm::Stepped => (eaves - 0.7, body.expand(-0.8), 1.1),
                 GrowableForm::BroadBase => (eaves, body.expand(-1.2), 0.8),
                 GrowableForm::FlatCap => (eaves, body, 0.35),
@@ -295,10 +403,10 @@ impl GrowableFormFit {
             (roof_z, if has_podium { shaft_bottom } else { main_top })
         };
 
-        let [left, right, _, _] = self.ground.corners;
+        let [left, right, _, _] = fit.ground.corners;
         let across = (right - left).normalize();
-        let outward = (self.door.xy() - self.ground.center()).normalize();
-        let door = self.door + outward.z0() * 0.025;
+        let outward = (fit.door.xy() - fit.ground.center()).normalize();
+        let door = fit.door + outward.z0() * 0.025;
         facade_panel(
             &mut mesh,
             door,
@@ -343,33 +451,14 @@ impl GrowableFormFit {
         }
 
         let concrete = LinearColor::gray(0.37);
-        let terrain = |point| env.true_height(point);
-        for edge in self.ground.segments() {
-            let cuts = cell_crossings(edge.src, edge.dst);
-            for pair in cuts.windows(2) {
-                let a = point_along(edge.src, edge.dst, pair[0]).z(base);
-                let b = point_along(edge.src, edge.dst, pair[1]).z(base);
-                skirt(&mut mesh, a, b, concrete, &terrain)?;
-            }
-        }
         mesh.faces.extend(
-            self.walkway_triangles()
+            fit.walkway_triangles()
                 .into_iter()
                 .map(|triangle| (triangle.to_vec(), concrete)),
         );
-        let [a, b, c, d] = self.walk;
-        for (from, to) in [(d, a), (b, c)] {
-            // Limit mesh size on deep parcels. Each panel still samples the exact
-            // lowest grade along the full interval so its bottom stays buried.
-            let panels = (from.xy().distance(to.xy()) / CELL_SIZE)
-                .ceil()
-                .clamp(1.0, 16.0) as u16;
-            let step = (to - from) / f32::from(panels);
-            for i in 0..panels {
-                let a = from + step * f32::from(i);
-                let b = from + step * f32::from(i + 1);
-                skirt(&mut mesh, a, b, concrete, &terrain)?;
-            }
+        for ((a, b), &bottom) in fit.skirt_edges().zip(&self.skirt_bottoms) {
+            mesh.faces
+                .push((vec![a.xy().z(bottom), b.xy().z(bottom), b, a], concrete));
         }
         Some((mesh, roof_z))
     }
@@ -514,20 +603,6 @@ fn segment_cell_grade(
         }
     }
     Some((min, max))
-}
-
-fn skirt(
-    mesh: &mut ColoredMesh,
-    a: Vec3,
-    b: Vec3,
-    color: LinearColor,
-    terrain: &impl Fn(Vec2) -> Option<f32>,
-) -> Option<()> {
-    let ground = segment_grade(a.xy(), b.xy(), terrain)?.0.max(0.0);
-    let bottom = ground.min(a.z).min(b.z) - 0.05;
-    mesh.faces
-        .push((vec![a.xy().z(bottom), b.xy().z(bottom), b, a], color));
-    Some(())
 }
 
 fn rgb(r: f32, g: f32, b: f32) -> LinearColor {
@@ -873,7 +948,7 @@ mod tests {
         let style = GrowableMassingStyle::Industrial;
         let mut fit = GrowableFormFit::check(&env, parcel, cell, style, 0).unwrap();
         fit.form = GrowableForm::Stepped;
-        let (mesh, _) = fit.mesh(&env, cell, style, 1, 1).unwrap();
+        let (mesh, _) = fit.freeze(&env, style).unwrap().mesh(cell, 1, 1).unwrap();
         let facade_y = fit.door().y;
         let panels = mesh.faces.iter().filter(|(vertices, _)| {
             vertices

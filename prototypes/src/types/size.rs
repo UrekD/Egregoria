@@ -1,7 +1,7 @@
 use crate::{get_lua, LuaVec2};
 use mlua::{FromLua, Lua, Value};
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct Size2D {
     pub w: f32,
     pub h: f32,

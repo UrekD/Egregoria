@@ -163,7 +163,7 @@ pub fn events_update(sim: &mut Simulation) {
         }
     }
     for id in collapse {
-        super::growth::remove_growable(sim, id);
+        super::development::remove_site(sim, id, super::development::RemovalCause::Fire);
     }
 }
 
