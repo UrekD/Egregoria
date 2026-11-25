@@ -35,7 +35,7 @@ use super::{
 use crate::map::{BuildingID, LaneKind, Map, PathKind, RoadID};
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{
-    active_business, BuildingInfos, Destination, Itinerary, ParkingManagement,
+    active_business, ActiveBusiness, BuildingInfos, Destination, Itinerary, ParkingManagement,
 };
 use crate::souls::desire::WorkKind;
 use crate::souls::freight_station::train_stop;
@@ -186,20 +186,21 @@ pub(crate) struct LoadProgress {
 /// Import stock and open orders at one freight station.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct ImportDesk {
+    // Saves use Bincode varints. Values that fit in u32 retain their encoding.
     /// Units unloaded from trains that wait for a station truck.
-    stock: BTreeMap<ItemID, u32>,
+    stock: BTreeMap<ItemID, u64>,
     /// Units ordered by rail that no train has unloaded yet.
-    on_rail: BTreeMap<ItemID, u32>,
+    on_rail: BTreeMap<ItemID, u64>,
     /// Open orders, oldest first.
     orders: Vec<ImportOrder>,
 }
 
 impl ImportDesk {
-    fn ordered(&self, item: ItemID) -> u32 {
+    fn ordered(&self, item: ItemID) -> u64 {
         self.orders
             .iter()
             .filter(|order| order.quantity.item == item)
-            .map(|order| order.quantity.units)
+            .map(|order| u64::from(order.quantity.units))
             .sum()
     }
 
@@ -215,15 +216,24 @@ impl ImportDesk {
         }
     }
 
-    fn on_rail_units(&self) -> u32 {
+    fn on_rail_units(&self) -> u64 {
         self.on_rail.values().sum()
+    }
+
+    fn wanted_cargo(&self) -> u32 {
+        // FreightStation uses this as a dispatch hint. The desk owns the full backlog.
+        bounded_transfer(self.on_rail_units(), u32::MAX)
     }
 
     fn restock(&mut self, items: &[ItemQuantity]) {
         for line in items {
-            *self.stock.entry(line.item).or_default() += line.units;
+            *self.stock.entry(line.item).or_default() += u64::from(line.units);
         }
     }
+}
+
+fn bounded_transfer(available: u64, capacity: u32) -> u32 {
+    u32::try_from(available.min(u64::from(capacity))).unwrap()
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -491,10 +501,11 @@ impl CargoBook {
     }
 
     /// Units imported for `(buyer, item)` that are on order or on a station truck.
-    fn imports_pending(&self) -> BTreeMap<(Endpoint, ItemID), u32> {
+    fn imports_pending(&self) -> BTreeMap<(Endpoint, ItemID), u64> {
         let mut units = BTreeMap::new();
         for order in self.imports.values().flat_map(|desk| &desk.orders) {
-            *units.entry((order.buyer, order.quantity.item)).or_default() += order.quantity.units;
+            *units.entry((order.buyer, order.quantity.item)).or_default() +=
+                u64::from(order.quantity.units);
         }
         for trip in self
             .station_trucks
@@ -502,14 +513,14 @@ impl CargoBook {
             .filter_map(|truck| truck.trip.as_ref())
         {
             for line in &trip.items {
-                *units.entry((trip.buyer, line.item)).or_default() += line.units;
+                *units.entry((trip.buyer, line.item)).or_default() += u64::from(line.units);
             }
         }
         units
     }
 
     /// A train call at the station: units on order by rail join its stock, up
-    /// to `capacity`. Returns the units still on order by rail.
+    /// to `capacity`. Returns the remaining rail backlog capped for dispatch.
     pub(crate) fn unload_train(&mut self, station: SoulID, capacity: u32) -> u32 {
         let Some(desk) = self
             .imports
@@ -520,21 +531,21 @@ impl CargoBook {
         };
         let mut room = capacity;
         for (&item, units) in &mut desk.on_rail {
-            let unloaded = (*units).min(room);
-            *units -= unloaded;
+            let unloaded = bounded_transfer(*units, room);
+            *units -= u64::from(unloaded);
             room -= unloaded;
-            *desk.stock.entry(item).or_default() += unloaded;
+            *desk.stock.entry(item).or_default() += u64::from(unloaded);
             if room == 0 {
                 break;
             }
         }
         desk.on_rail.retain(|_, units| *units > 0);
         desk.stock.retain(|_, units| *units > 0);
-        desk.on_rail_units()
+        desk.wanted_cargo()
     }
 
     /// Import stock waiting at a station for its trucks.
-    pub fn import_stock(&self, station: BuildingID) -> BTreeMap<ItemID, u32> {
+    pub fn import_stock(&self, station: BuildingID) -> BTreeMap<ItemID, u64> {
         self.imports
             .iter()
             .find_map(|(end, desk)| (end.building == station).then(|| desk.stock.clone()))
@@ -980,6 +991,18 @@ impl Input {
             .saturating_add(policy.capacity)
             .min(i32::MAX as u32)
     }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static TEST_BATCH_TICKS_SCALE: std::cell::Cell<f64> = const { std::cell::Cell::new(1.0) };
+}
+
+fn freight_batch_ticks(business: ActiveBusiness) -> Option<f64> {
+    let ticks = business.rates().full_speed_batch_ticks;
+    #[cfg(test)]
+    let ticks = ticks.map(|ticks| ticks * TEST_BATCH_TICKS_SCALE.get());
+    ticks
 }
 
 fn on_hand(market: &Market, endpoint: Endpoint, item: ItemID) -> u32 {
@@ -1489,7 +1512,7 @@ fn match_shipments(
             .get(destination.building)
             .and_then(|building| active_business(building, infos, world))
             .filter(|business| business.company == id)
-            .and_then(|business| business.rates().full_speed_batch_ticks)
+            .and_then(freight_batch_ticks)
         else {
             continue;
         };
@@ -1875,7 +1898,7 @@ fn destination_input(
     Some(Input::new(
         destination,
         input.amount,
-        business.rates().full_speed_batch_ticks?,
+        freight_batch_ticks(business)?,
     ))
 }
 
@@ -2138,8 +2161,12 @@ fn cancel_removed_imports(
         .collect();
     for station in removed {
         let desk = book.imports.remove(&station).unwrap();
-        for (item, units) in desk.stock {
-            market.record_freight_loss(item, units);
+        for (item, mut units) in desk.stock {
+            while units > 0 {
+                let loss = bounded_transfer(units, u32::MAX);
+                market.record_freight_loss(item, loss);
+                units -= u64::from(loss);
+            }
         }
     }
     let commands = resources.read::<ParCommandBuffer<VehicleEnt>>();
@@ -2468,7 +2495,7 @@ fn lead_demand(input: Input) -> u64 {
 }
 
 /// Stock an import reorder fills up to: one batch plus two lead times of
-/// recipe runs, at most one truckload.
+/// recipe runs. One truckload limits the lead-time buffer.
 fn import_target(input: Input) -> u32 {
     (u64::from(input.amount) + 2 * lead_demand(input))
         .min(u64::from(STATION_TRUCK_CAPACITY))
@@ -2517,7 +2544,8 @@ fn order_imports(
         desk.orders.retain(|order| {
             let (buyer, item) = (order.buyer, order.quantity.item);
             destination_input(world, map, infos, buyer, item).is_none_or(|input| {
-                on_hand(&market, buyer, item) + local((buyer, item)) < import_target(input)
+                u64::from(on_hand(&market, buyer, item)) + u64::from(local((buyer, item)))
+                    < u64::from(import_target(input))
             })
         });
     }
@@ -2557,16 +2585,18 @@ fn order_imports(
             continue;
         };
         let key = (buyer, item);
-        let stock = on_hand(&market, buyer, item);
+        let stock = u64::from(on_hand(&market, buyer, item));
         let imported = pending.get(&key).copied().unwrap_or(0);
         let short = ordered.is_some_and(|qty| local(key) < qty);
         let running_low = book.import_customers.contains_key(&key)
             && local(key) == 0
-            && stock + imported < import_reorder_point(input);
+            && stock + imported < u64::from(import_reorder_point(input));
         if !short && !running_low {
             continue;
         }
-        let units = import_target(input).saturating_sub(stock + local(key) + imported);
+        let target = import_target(input);
+        let covered = stock + u64::from(local(key)) + imported;
+        let units = bounded_transfer(u64::from(target).saturating_sub(covered), target);
         if units == 0 {
             continue;
         }
@@ -2584,7 +2614,7 @@ fn order_imports(
             quantity: ItemQuantity { item, units },
             ordered_at: now,
         });
-        *pending.entry(key).or_default() += units;
+        *pending.entry(key).or_default() += u64::from(units);
     }
     drop(market);
     let spawn = resources.read::<ParCommandBuffer<FreightStationEnt>>();
@@ -2593,7 +2623,7 @@ fn order_imports(
             continue;
         };
         if let Some(entity) = world.freight_stations.get_mut(id) {
-            entity.f.wanted_cargo = desk.on_rail_units();
+            entity.f.wanted_cargo = desk.wanted_cargo();
         }
         let fleet = book
             .station_trucks
@@ -2678,12 +2708,12 @@ fn dispatch_station_trucks(
             let Some(held) = stock.get_mut(&item) else {
                 continue;
             };
-            let loaded = units.min(*held).min(room);
+            let loaded = bounded_transfer(*held, units.min(room));
             if loaded == 0 {
                 continue;
             }
             order.quantity.units -= loaded;
-            *held -= loaded;
+            *held -= u64::from(loaded);
             room -= loaded;
             *items.entry(item).or_default() += loaded;
             ordered_at = ordered_at.min(order.ordered_at);
@@ -2946,6 +2976,25 @@ fn record_warehouse_activity(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn z3_fix_wide_import_desk_preserves_legacy_bincode() {
+        use common::saveload::{Bincode, Encoder};
+
+        let item = ItemID::new("goods");
+        let legacy = (
+            BTreeMap::from([(item, u32::MAX)]),
+            BTreeMap::from([(item, 1_u32)]),
+            Vec::<ImportOrder>::new(),
+        );
+        let bytes = Bincode::encode(&legacy).unwrap();
+        let mut desk: ImportDesk = Bincode::decode(&bytes).unwrap();
+        assert_eq!(Bincode::encode(&desk).unwrap(), bytes);
+        *desk.stock.get_mut(&item).unwrap() += 2;
+        let bytes = Bincode::encode(&desk).unwrap();
+        let restored: ImportDesk = Bincode::decode(&bytes).unwrap();
+        assert_eq!(restored.stock[&item], u64::from(u32::MAX) + 2);
+    }
 
     #[test]
     fn z3_accounting_large_batch_keeps_station_reorder_bounded() {
@@ -5224,6 +5273,122 @@ mod lifecycle_tests {
     }
 
     #[test]
+    fn z3_fix_station_aggregates_and_bounds_transfers() {
+        let mut f = Fixture::with_companies("industrial-l1", "commercial-l1");
+        let station = import_station(&mut f);
+        let buyer = f.destination;
+        let item = ItemID::new("goods");
+        let other = ItemID::new("flour");
+        let mut buyers = slotmapd::SlotMap::<CompanyID, ()>::with_key();
+        let mut book = CargoBook::default();
+        let desk = book.imports.entry(station).or_default();
+        for buyer in std::iter::once(buyer).chain((0..4).map(|_| Endpoint {
+            soul: SoulID::GoodsCompany(buyers.insert(())),
+            building: BuildingID::default(),
+        })) {
+            desk.place(ImportOrder {
+                buyer,
+                quantity: ItemQuantity {
+                    item,
+                    units: 1_073_741_823,
+                },
+                ordered_at: 0,
+            });
+        }
+        let order = desk.orders[0];
+        desk.place(ImportOrder {
+            quantity: ItemQuantity {
+                item: other,
+                units: 1_000_000_000,
+            },
+            ..order
+        });
+        assert_eq!(desk.ordered(item), 5_368_709_115);
+        assert_eq!(desk.on_rail_units(), 6_368_709_115);
+        assert_eq!(desk.wanted_cargo(), u32::MAX);
+        assert_eq!(book.unload_train(station.soul, TRAIN_CAPACITY), u32::MAX);
+        assert_eq!(
+            book.import_stock(station.building).values().sum::<u64>(),
+            100
+        );
+        assert_eq!(book.unload_train(station.soul, u32::MAX), 2_073_741_720);
+        assert_eq!(book.unload_train(station.soul, u32::MAX), 0);
+        let stock = book.import_stock(station.building);
+        assert_eq!(stock[&item], 5_368_709_115);
+        assert_eq!(stock[&other], 1_000_000_000);
+
+        let door = f.ctx.g.map().get(station.building).unwrap().door_pos;
+        let truck = spawn_truck_at_depot(&mut f.ctx.g, door);
+        book.station_trucks.insert(
+            truck,
+            StationTruck {
+                station,
+                trip: None,
+            },
+        );
+        let (world, resources) = f.ctx.g.world_res();
+        let map = resources.read::<Map>();
+        book.routes.refresh(&map);
+        dispatch_station_trucks(&mut book, world, resources, &map, 1);
+        let trip = book.station_trucks[&truck].trip.as_ref().unwrap();
+        assert_eq!(trip.buyer, buyer);
+        assert_eq!(trip.items.len(), 1);
+        assert_eq!(trip.items[0].item, item);
+        assert_eq!(trip.items[0].units, STATION_TRUCK_CAPACITY);
+        let stock = book.import_stock(station.building);
+        assert_eq!(
+            stock[&item],
+            5_368_709_115 - u64::from(STATION_TRUCK_CAPACITY)
+        );
+    }
+
+    #[test]
+    fn z3_fix_live_road_and_station_reorders_follow_effective_cadence() {
+        let goods = ItemID::new("goods");
+        let run = |scale| {
+            TEST_BATCH_TICKS_SCALE.set(scale);
+            let mut road = Fixture::with_companies("industrial-l1", "commercial-l1");
+            road.ctx
+                .g
+                .write::<Market>()
+                .produce(road.source.soul, goods, 120);
+            let (world, resources) = road.ctx.g.world_res();
+            let map = resources.read::<Map>();
+            let infos = resources.read::<BuildingInfos>();
+            let mut book = resources.write::<CargoBook>();
+            match_shipments(
+                &mut book,
+                world,
+                resources,
+                &map,
+                &infos,
+                0,
+                &BTreeSet::new(),
+            );
+            let road_order = book.queued()[&(road.destination, goods)];
+
+            let mut rail = Fixture::with_companies("industrial-l1", "commercial-l1");
+            let station = import_station(&mut rail);
+            let buyer = rail.destination;
+            let door = rail.ctx.g.map().get(buyer.building).unwrap().door_pos;
+            rail.ctx
+                .g
+                .write::<Market>()
+                .buy(buyer.soul, door.xy(), goods, 2);
+            rail.update(FREIGHT_MATCH_INTERVAL);
+            let station_order = rail.ctx.g.read::<CargoBook>().imports[&station].ordered(goods);
+            TEST_BATCH_TICKS_SCALE.set(1.0);
+            (road_order, station_order)
+        };
+        // Keep both station targets below the truck limit so the rate can affect them.
+        let (road, station) = run(4.0);
+        let (faster_road, faster_station) = run(2.0);
+        assert!(faster_road > road, "{faster_road} vs {road}");
+        assert!(faster_station > station, "{faster_station} vs {station}");
+        assert!(faster_station <= u64::from(STATION_TRUCK_CAPACITY));
+    }
+
+    #[test]
     fn imports_need_platform_track_with_a_rail_route_outside() {
         let mut f = Fixture::new();
         let road = road_along(&f, None, Some(500.0));
@@ -5436,7 +5601,7 @@ mod lifecycle_tests {
         assert_eq!(left, 0);
         assert_eq!(
             f.ctx.g.read::<CargoBook>().import_stock(terminal.building)[&goods],
-            wanted
+            u64::from(wanted)
         );
         let door = f.ctx.g.map().buildings()[terminal.building].door_pos;
         let mut drove = false;
@@ -5630,7 +5795,7 @@ mod lifecycle_tests {
         ));
         assert_eq!(
             stock(&f),
-            before + loaded,
+            before + u64::from(loaded),
             "the cargo is back in station stock"
         );
         assert_eq!(f.hand(f.destination), 0);

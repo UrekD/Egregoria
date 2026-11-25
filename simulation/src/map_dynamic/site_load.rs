@@ -7,7 +7,8 @@ use crate::economy::balance::RETAIL_ACCESS_RADIUS_M;
 use crate::map::{river_site_summary, Building, BuildingID, ElectricityNetworkID, Map};
 use crate::map_dynamic::{
     active_business, effective_load, utility_network_readout, ActiveBusiness, BuildingInfos,
-    BusinessRates, ElectricityFlow, SiteLoad, UtilityFlow, UtilityTotals,
+    BuildingUtilityStatus, BusinessRates, ElectricityFlow, SiteLoad, UtilityFlow, UtilityStatus,
+    UtilityTotals,
 };
 use crate::souls::residence::{self, PowerStatus, Residence, Residences};
 use crate::{Simulation, World};
@@ -91,6 +92,19 @@ impl NetworkLoad {
         world: &World,
         network: ElectricityNetworkID,
     ) -> Option<Self> {
+        let mut total = Self::rated(map, residences, infos, world, network)?;
+        // Leave potential provider capacity available for forecasts that add power.
+        total.update_sewage_demand();
+        Some(total)
+    }
+
+    fn rated(
+        map: &Map,
+        residences: &Residences,
+        infos: &BuildingInfos,
+        world: &World,
+        network: ElectricityNetworkID,
+    ) -> Option<Self> {
         let network = map.electricity.networks.get(&network)?;
         let water_sites = map
             .environment()
@@ -125,16 +139,30 @@ impl NetworkLoad {
                 }
             }
         }
-        // Supply here is the provider capacity with power available. Keep
-        // sewage demand conditional on delivered water, as in UtilityFlow.
-        if !total.has_power() || !total.pipes.has_water() {
-            total.pipes.sewage_demand = 0.0;
-        }
         Some(total)
     }
 
+    fn cap_pipe_supply(&mut self, sampled: UtilityTotals) {
+        self.pipes.water_production = self.pipes.water_production.min(sampled.water_production);
+        self.pipes.sewage_capacity = self.pipes.sewage_capacity.min(sampled.sewage_capacity);
+        if self.blackout() {
+            self.pipes.water_production = 0.0;
+        }
+        self.update_sewage_demand();
+    }
+
+    fn update_sewage_demand(&mut self) {
+        if self.blackout() || !self.pipes.has_water() {
+            self.pipes.sewage_demand = 0.0;
+        }
+    }
+
+    fn blackout(self) -> bool {
+        self.power_demand_watts > self.power_supply_watts
+    }
+
     pub fn has_power(self) -> bool {
-        self.power_supply_watts > 0 && self.power_supply_watts >= self.power_demand_watts
+        self.power_supply_watts > 0 && !self.blackout()
     }
 
     fn reserve(&mut self, current: SiteLoad, projected: SiteLoad) -> Result<(), UtilityAdmission> {
@@ -149,7 +177,7 @@ impl NetworkLoad {
         if power > 0 && !next.has_power() {
             return Err(UtilityAdmission::Power);
         }
-        if water > 0.0 && (!next.has_power() || !next.pipes.has_water()) {
+        if water > 0.0 && (next.blackout() || !next.pipes.has_water()) {
             return Err(UtilityAdmission::Water);
         }
         if sewage > 0.0 && !next.pipes.has_sewage() {
@@ -157,6 +185,85 @@ impl NetworkLoad {
         }
         *self = next;
         Ok(())
+    }
+}
+
+fn sampled_pipes(
+    map: &Map,
+    power: &ElectricityFlow,
+    flow: &UtilityFlow,
+    network: ElectricityNetworkID,
+) -> Option<UtilityTotals> {
+    if flow.water_pending(map) {
+        return None;
+    }
+    utility_network_readout(map, power, flow, Some(network)).utility_totals
+}
+
+/// Read service using current network roles and the latest valid provider sample.
+pub(crate) fn live_site_utility_status(
+    map: &Map,
+    residences: &Residences,
+    infos: &BuildingInfos,
+    world: &World,
+    power: &ElectricityFlow,
+    flow: &UtilityFlow,
+    id: BuildingID,
+) -> Option<BuildingUtilityStatus> {
+    use UtilityStatus::*;
+
+    let building = map.get(id)?;
+    let load = effective_load(
+        building,
+        residences.by_building.get(&id),
+        active_business(building, infos, world),
+    );
+    if load.water_demand() == 0.0 && load.sewage_demand() == 0.0 {
+        return None;
+    }
+
+    let unavailable = |status| BuildingUtilityStatus {
+        water: status,
+        sewage: status,
+        totals: None,
+    };
+    let Some(network) = connected_site_network(map, building) else {
+        return Some(unavailable(Disconnected));
+    };
+    let Some(sampled) = sampled_pipes(map, power, flow, network) else {
+        return Some(unavailable(Unknown));
+    };
+    let mut totals = NetworkLoad::rated(map, residences, infos, world, network)?;
+    totals.cap_pipe_supply(sampled);
+    let pipes = totals.pipes;
+    Some(BuildingUtilityStatus {
+        water: if pipes.has_water() { Served } else { Shortage },
+        sewage: if pipes.has_sewage() { Served } else { Shortage },
+        totals: Some(pipes),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn z3_fix_idle_network_delivers_water_from_a_zero_watt_pump() {
+        let mut network = NetworkLoad {
+            pipes: UtilityTotals {
+                water_production: 10.0,
+                water_demand: 4.0,
+                sewage_capacity: 10.0,
+                sewage_demand: 4.0,
+            },
+            ..Default::default()
+        };
+        assert!(!network.has_power());
+        network.update_sewage_demand();
+        assert_eq!(network.pipes.sewage_demand, 4.0);
+        network.power_demand_watts = 1;
+        network.update_sewage_demand();
+        assert_eq!(network.pipes.sewage_demand, 0.0);
     }
 }
 
@@ -218,20 +325,11 @@ impl NetworkReservations {
             Entry::Vacant(entry) => {
                 let power = sim.read::<ElectricityFlow>();
                 let water = sim.read::<UtilityFlow>();
-                let mut load = NetworkLoad::live(&map, &residences, &infos, world, network)
+                let mut load = NetworkLoad::rated(&map, &residences, &infos, world, network)
                     .ok_or(UtilityAdmission::Disconnected)?;
-                let sampled = utility_network_readout(&map, &power, &water, Some(network));
-                let pipes = sampled
-                    .utility_totals
-                    .filter(|_| !water.water_pending(&map));
-                load.pipes.water_production = load
-                    .pipes
-                    .water_production
-                    .min(pipes.map_or(0.0, |pipes| pipes.water_production));
-                load.pipes.sewage_capacity = load
-                    .pipes
-                    .sewage_capacity
-                    .min(pipes.map_or(0.0, |pipes| pipes.sewage_capacity));
+                load.cap_pipe_supply(
+                    sampled_pipes(&map, &power, &water, network).unwrap_or_default(),
+                );
                 entry.insert(load)
             }
         };
@@ -257,6 +355,9 @@ impl ActiveRetailIndex {
                 continue;
             };
             if residence::is_retail_store(building.kind)
+                && building
+                    .connected_road
+                    .is_some_and(|road| map.get(road).is_some())
                 && active_business(building, infos, world)
                     .is_some_and(|business| business.company == id)
             {

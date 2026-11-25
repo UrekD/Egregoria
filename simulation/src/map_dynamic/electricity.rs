@@ -1,9 +1,11 @@
 use super::{active_business, effective_load, BuildingInfos};
-use crate::map::{BuildingID, BuildingKind, ElectricityNetwork, ElectricityNetworkID, Map};
+use crate::map::{
+    Building, BuildingID, BuildingKind, ElectricityNetwork, ElectricityNetworkID, Map, RoadID,
+};
 use crate::souls::residence::Residences;
 use crate::utils::resources::Resources;
-use crate::World;
-use prototypes::{prototypes, Power};
+use crate::{CompanyID, SoulID, World};
+use prototypes::{prototypes, Power, ResidencePrototypeID};
 use serde::Deserialize;
 use slotmapd::__impl::Serialize;
 use std::collections::BTreeMap;
@@ -74,13 +76,125 @@ impl PowerCacheKey {
 struct PowerCache {
     key: Option<PowerCacheKey>,
     networks: Vec<NetworkLoads>,
+    #[cfg(test)]
+    recalculated_networks: usize,
 }
 
 struct NetworkLoads {
     id: ElectricityNetworkID,
     houses: Vec<BuildingID>,
-    live_sites: Vec<BuildingID>,
+    live_sites: Vec<CachedSitePower>,
     residential_watts: i64,
+    dirty: bool,
+}
+
+struct CachedSitePower {
+    id: BuildingID,
+    inputs: Option<SitePowerInputs>,
+    consumed_watts: i64,
+    produced_power: Power,
+}
+
+#[derive(PartialEq, Eq)]
+struct SitePowerInputs {
+    kind: BuildingKind,
+    staffing: Option<(CompanyID, usize)>,
+    legacy_area: Option<u32>,
+    profile: Option<ProfilePowerInputs>,
+}
+
+#[derive(PartialEq, Eq)]
+struct ProfilePowerInputs {
+    road: Option<RoadID>,
+    home: Option<(ResidencePrototypeID, u32)>,
+    abandoned: bool,
+    open: bool,
+    level: u8,
+    slots: u32,
+}
+
+impl SitePowerInputs {
+    fn new(
+        building: &Building,
+        infos: &BuildingInfos,
+        residences: &Residences,
+        world: &World,
+    ) -> Self {
+        let profile = building.development().map(|site| ProfilePowerInputs {
+            road: building.connected_road,
+            home: residences
+                .by_building
+                .get(&building.id)
+                .map(|home| (home.prototype, home.capacity)),
+            abandoned: building.is_abandoned_growable(),
+            open: site.business == Some(crate::map::GrowableBusinessState::Open),
+            level: site.level,
+            slots: site.planned_jobs,
+        });
+        let mut staffing = None;
+        if profile
+            .as_ref()
+            .is_none_or(|site| site.open && !site.abandoned)
+        {
+            if let (Some(proto), Some(SoulID::GoodsCompany(owner))) =
+                (building.kind.as_goods_company(), infos.owner(building.id))
+            {
+                staffing = world.companies.get(owner).and_then(|company| {
+                    (company.comp.building == building.id && company.comp.proto == proto)
+                        .then_some((owner, company.workers.0.len()))
+                });
+            }
+        }
+        let legacy_area = building
+            .zone
+            .as_ref()
+            .filter(|_| profile.is_none())
+            .map(|zone| zone.area.to_bits());
+        Self {
+            kind: building.kind,
+            staffing,
+            legacy_area,
+            profile,
+        }
+    }
+}
+
+impl CachedSitePower {
+    fn refresh(
+        &mut self,
+        map: &Map,
+        infos: &BuildingInfos,
+        residences: &Residences,
+        world: &World,
+    ) -> bool {
+        let building = &map.buildings[self.id];
+        let inputs = SitePowerInputs::new(building, infos, residences, world);
+        if self.inputs.as_ref() == Some(&inputs) {
+            return false;
+        }
+        self.inputs = Some(inputs);
+        let (consumed, produced) = if building.development().is_some()
+            && connected_site_network(map, building).is_none()
+        {
+            (0, Power::ZERO)
+        } else {
+            let load = effective_load(
+                building,
+                residences.by_building.get(&self.id),
+                active_business(building, infos, world),
+            );
+            (
+                load.residential_power
+                    .watts()
+                    .wrapping_add(load.business_power.watts()),
+                load.power_production,
+            )
+        };
+        let changed = self.consumed_watts != consumed || self.produced_power != produced;
+        self.consumed_watts = consumed;
+        self.produced_power = produced;
+        changed
+    }
 }
 
 impl NetworkLoads {
@@ -90,11 +204,17 @@ impl NetworkLoads {
             houses: Vec::new(),
             live_sites: Vec::new(),
             residential_watts: 0,
+            dirty: true,
         };
         for &building in &network.buildings {
             let site = &map.buildings[building];
             if site.development().is_some() || site.kind.as_goods_company().is_some() {
-                loads.live_sites.push(building);
+                loads.live_sites.push(CachedSitePower {
+                    id: building,
+                    inputs: None,
+                    consumed_watts: 0,
+                    produced_power: Power::ZERO,
+                });
             } else if site.kind == BuildingKind::House {
                 loads.houses.push(building);
             }
@@ -129,12 +249,22 @@ impl PowerCache {
                 .map(|loads| (loads.id, NetworkFlow::default()))
                 .collect();
         }
+        let registry_changed = self
+            .key
+            .is_none_or(|previous| previous.prototype_registry != key.prototype_registry);
         for loads in &mut self.networks {
-            loads.residential_watts = loads.houses.iter().fold(0i64, |watts, &id| {
+            if registry_changed {
+                for site in &mut loads.live_sites {
+                    site.inputs = None;
+                }
+            }
+            let residential_watts = loads.houses.iter().fold(0i64, |watts, &id| {
                 let load =
                     effective_load(&map.buildings[id], residences.by_building.get(&id), None);
                 watts.wrapping_add(load.residential_power.watts())
             });
+            loads.dirty |= loads.residential_watts != residential_watts;
+            loads.residential_watts = residential_watts;
         }
         self.key = Some(key);
     }
@@ -173,26 +303,24 @@ fn update_electricity_flow(world: &World, resources: &Resources) {
         flowmap,
     );
 
-    for loads in &power_cache.networks {
+    for loads in &mut power_cache.networks {
+        // Compare live inputs without resolving prototypes or recomputing loads.
+        // Between the two power passes the market can change staffing directly.
+        for site in &mut loads.live_sites {
+            loads.dirty |= site.refresh(&map, &infos, &residences, world);
+        }
+        if !std::mem::take(&mut loads.dirty) {
+            continue;
+        }
+        #[cfg(test)]
+        {
+            power_cache.recalculated_networks += 1;
+        }
         let mut consumed_watts = loads.residential_watts;
         let mut produced_power = Power::ZERO;
-        // Profiled housing and companies can change role, owner or capacity
-        // between passes without a topology edit or a different worker count.
-        for &id in &loads.live_sites {
-            let building = &map.buildings[id];
-            if building.development().is_some() && connected_site_network(&map, building).is_none()
-            {
-                continue;
-            }
-            let load = effective_load(
-                building,
-                residences.by_building.get(&id),
-                active_business(building, &infos, world),
-            );
-            consumed_watts = consumed_watts
-                .wrapping_add(load.residential_power.watts())
-                .wrapping_add(load.business_power.watts());
-            produced_power += load.power_production;
+        for site in &loads.live_sites {
+            consumed_watts = consumed_watts.wrapping_add(site.consumed_watts);
+            produced_power += site.produced_power;
         }
         let consumed_power = Power::new(consumed_watts);
         *flowmap.get_mut(&loads.id).unwrap() = NetworkFlow {
@@ -267,11 +395,7 @@ mod tests {
     };
 
     pub(crate) fn accounting_site(mixed: bool) -> (TestCtx, BuildingID, CompanyID) {
-        let jobs = if mixed {
-            12
-        } else {
-            prototypes::MAX_PROFILED_SLOTS
-        };
+        let jobs = if mixed { 12 } else { 24 };
         accounting_site_with_jobs(mixed, jobs)
     }
 
@@ -479,6 +603,167 @@ mod tests {
     }
 
     #[test]
+    fn z3_fix_late_power_skips_clean_networks() {
+        let (mut test, first, shop) = accounting_site(true);
+        let ends = [vec3(100.0, 300.0, 0.0), vec3(400.0, 300.0, 0.0)];
+        test.build_roads(&ends);
+        let second = test.build_house_near(vec2(150.0, 325.0));
+        assert_ne!(
+            test.g.map().electricity.net_id(first),
+            test.g.map().electricity.net_id(second)
+        );
+        let (world, res) = test.g.world_res();
+        electricity_flow_system(world, res);
+        let count = |res: &Resources| {
+            res.read::<ElectricityFlow>()
+                .power_cache
+                .recalculated_networks
+        };
+        let initial = count(res);
+        refresh_electricity_flow_system(world, res);
+        assert_eq!(count(res), initial);
+        world.companies[shop].workers.0.push(HumanID::default());
+        refresh_electricity_flow_system(world, res);
+        assert_eq!(count(res), initial + 1);
+        res.write::<BuildingInfos>()
+            .set_owner(first, SoulID::Human(HumanID::default()));
+        refresh_electricity_flow_system(world, res);
+        assert_eq!(count(res), initial + 2);
+        assert_matches_full_recompute(
+            world,
+            &res.read::<Map>(),
+            &res.read::<BuildingInfos>(),
+            &res.read::<Residences>(),
+            &res.read::<ElectricityFlow>().flowmap,
+        );
+    }
+
+    #[test]
+    fn z3_fix_inspector_follows_shop_closure_and_provider_capacity_between_samples() {
+        use crate::diagnostics::building_diagnostics;
+        use crate::map::{GrowableBusinessState, Zone, MAX_ZONE_AREA};
+        use crate::map_dynamic::{utility_flow_update, UtilityStatus};
+
+        let (mut test, home, _) = accounting_site(true);
+        let plant = company(&mut test, home, "coal-power-plant", 220.0);
+        let pump = company(&mut test, home, "water-pump", 270.0);
+        let outlet = company(&mut test, home, "sewage-outlet", 320.0);
+        let pump_building = test.g.world.companies[pump].comp.building;
+        let water_status = |test: &TestCtx| {
+            building_diagnostics(&test.g, home)
+                .unwrap()
+                .utilities
+                .unwrap()
+        };
+        for id in [plant, pump, outlet] {
+            let provider = &mut test.g.world.companies[id];
+            provider.workers.0 = vec![HumanID::default(); provider.comp.max_workers as usize];
+        }
+        let water_between_roles = {
+            let map = test.g.map();
+            let homes = test.g.read::<Residences>();
+            let infos = test.g.read::<BuildingInfos>();
+            let network = connected_site_network(&map, map.get(home).unwrap()).unwrap();
+            let live = NetworkLoad::live(&map, &homes, &infos, test.g.world(), network).unwrap();
+            let shop = building_diagnostics(&test.g, home).unwrap().load.business_water;
+            live.pipes.water_demand - shop / 2.0
+        };
+        let pump_output = f64::from(
+            GoodsCompanyID::new("water-pump")
+                .prototype()
+                .water_production
+                .unwrap(),
+        );
+        test.g.map_mut().buildings[pump_building].zone = Some(Zone {
+            poly: Default::default(),
+            area: (water_between_roles / pump_output) as f32 * MAX_ZONE_AREA,
+            filldir: Vec2::X,
+        });
+        test.g.write::<GameTime>().tick = Tick(3001);
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+        utility_flow_update(&mut test.g);
+        assert_eq!(water_status(&test).water, UtilityStatus::Shortage);
+
+        test.g.map_mut().buildings[pump_building]
+            .zone
+            .as_mut()
+            .unwrap()
+            .area = MAX_ZONE_AREA;
+        assert_eq!(water_status(&test).water, UtilityStatus::Shortage);
+
+        test.g.map_mut().set_growable_business_state(
+            home,
+            GrowableBusinessState::ClosedUntil {
+                retry_elapsed_tick: u64::MAX,
+            },
+        );
+        let closed = water_status(&test);
+        test.g.world.companies[pump].workers.0.clear();
+        let reduced = water_status(&test);
+        assert_eq!(
+            (closed.water, closed.sewage, reduced.water),
+            (
+                UtilityStatus::Served,
+                UtilityStatus::Served,
+                UtilityStatus::Shortage
+            )
+        );
+        assert_eq!(reduced.totals.unwrap().sewage_demand, 0.0);
+        let projected = building_diagnostics(&test.g, home).unwrap().load;
+        assert_eq!(
+            NetworkReservations::new(&test.g.map()).try_reserve(&test.g, home, projected),
+            Err(UtilityAdmission::Water)
+        );
+    }
+
+    #[test]
+    fn z3_fix_inspector_rejects_sample_after_split_retains_network_id() {
+        use crate::diagnostics::building_diagnostics;
+        use crate::map_dynamic::{utility_flow_update, UtilityStatus};
+
+        let (mut test, home, _) = accounting_site(true);
+        test.build_roads(&[vec3(100.0, 300.0, 0.0), vec3(400.0, 300.0, 0.0)]);
+        let other = test.build_house_near(vec2(150.0, 325.0));
+        let original = test.g.map().roads().keys().collect::<Vec<_>>();
+        test.build_roads(&[vec3(400.0, 100.0, 0.0), vec3(400.0, 300.0, 0.0)]);
+        let bridge = test
+            .g
+            .map()
+            .roads()
+            .keys()
+            .find(|road| !original.contains(road))
+            .unwrap();
+        for (name, x) in [
+            ("coal-power-plant", 220.0),
+            ("water-pump", 270.0),
+            ("sewage-outlet", 320.0),
+        ] {
+            let id = company(&mut test, other, name, x);
+            let provider = &mut test.g.world.companies[id];
+            provider.workers.0 = vec![HumanID::default(); provider.comp.max_workers as usize];
+        }
+        let network = test.g.map().electricity.net_id(home).unwrap();
+        assert_eq!(test.g.map().electricity.net_id(other), Some(network));
+        test.g.write::<GameTime>().tick = Tick(3001);
+        let (world, resources) = test.g.world_res();
+        electricity_flow_system(world, resources);
+        utility_flow_update(&mut test.g);
+        let status = |test: &TestCtx| {
+            building_diagnostics(&test.g, home)
+                .unwrap()
+                .utilities
+                .unwrap()
+        };
+        assert_eq!(status(&test).water, UtilityStatus::Served);
+        test.g.map_mut().remove_road(bridge).unwrap();
+        assert_eq!(test.g.map().electricity.net_id(home), Some(network));
+        assert_ne!(test.g.map().electricity.net_id(other), Some(network));
+        assert_eq!(status(&test).water, UtilityStatus::Unknown);
+        assert_eq!(status(&test).sewage, UtilityStatus::Unknown);
+    }
+
+    #[test]
     fn z3_accounting_network_reservations_share_live_headroom() {
         use crate::map_dynamic::{utility_flow_update, UtilityFlow};
 
@@ -508,7 +793,8 @@ mod tests {
             let network = map.electricity.net_id(first).unwrap();
             assert_eq!(map.electricity.net_id(second), Some(network));
             let live = NetworkLoad::live(&map, &homes, &infos, world, network).unwrap();
-            let power = test.g.read::<ElectricityFlow>().network_stats(network);
+            let electricity = test.g.read::<ElectricityFlow>();
+            let power = electricity.network_stats(network);
             assert_eq!(
                 live.power_demand_watts,
                 i128::from(power.consumed_power.watts())
@@ -518,9 +804,9 @@ mod tests {
                 i128::from(power.produced_power.watts())
             );
             let flow = test.g.read::<UtilityFlow>();
-            let status = flow
-                .status_for_site(&map, &homes, &infos, world, first)
-                .unwrap();
+            let status =
+                live_site_utility_status(&map, &homes, &infos, world, &electricity, &flow, first)
+                    .unwrap();
             assert_eq!(status.totals, Some(live.pipes));
             let add = (live.pipes.water_production - live.pipes.water_demand) * 0.75;
             assert!(add > 0.0);

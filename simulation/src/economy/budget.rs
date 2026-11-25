@@ -363,7 +363,7 @@ mod tests {
     }
 
     #[test]
-    fn z3_accounting_capped_upgrade_taxes_live_level_with_unchanged_openings() {
+    fn z3_accounting_tax_at_the_low_commercial_slot_cap() {
         use crate::economy::Market;
         use crate::map::{GrowableBusinessState, PreparedGrowableAppearance};
         use crate::map_dynamic::accounting_site;
@@ -378,27 +378,23 @@ mod tests {
         let seller = SoulID::GoodsCompany(company);
         let jobs = ItemID::new("job-opening");
         ctx.g.write::<Market>().produce(seller, jobs, -1);
-        let (door, base_z) = {
+        let (door, base_z, cap) = {
             let map = ctx.g.map();
             let site = map.get(building).unwrap();
             let infos = ctx.g.read::<BuildingInfos>();
             let business = active_business(site, &infos, ctx.g.world()).unwrap();
-            assert_eq!(
-                business.job_slot_increase(prototypes::MAX_PROFILED_SLOTS),
-                Some(0)
-            );
-            assert_eq!(
-                business.job_slot_increase(prototypes::MAX_PROFILED_SLOTS - 1),
-                None
-            );
+            let cap = 2 * business.prototype.n_workers;
+            assert_eq!(business.slots, cap);
+            assert_eq!(business.job_slot_increase(cap), Some(0));
+            assert_eq!(business.job_slot_increase(cap - 1), None);
             assert_eq!(
                 business.job_slot_increase(prototypes::MAX_PROFILED_SLOTS + 1),
                 None
             );
-            (site.door_pos, site.height)
+            (site.door_pos, site.height, cap)
         };
         ctx.g.write::<Market>().sell_all(seller, door.xy(), jobs, 0);
-        let openings = prototypes::MAX_PROFILED_SLOTS - 1;
+        let openings = cap - 1;
         let tax_for_hour = |sim: &mut Simulation| {
             let category = BudgetCategory::Tax(ZoneKind::Commercial);
             let before = sim.read::<Budget>().total(category);
@@ -428,7 +424,7 @@ mod tests {
         assert!((tax_for_hour(&mut ctx.g) - 2 * level_one).abs() <= 2);
         let company_ent = &ctx.g.world.companies[company];
         assert_eq!(company_ent.workers.0.len(), 1);
-        assert_eq!(company_ent.comp.max_workers, prototypes::MAX_PROFILED_SLOTS);
+        assert_eq!(company_ent.comp.max_workers, cap);
         assert_eq!(
             ctx.g.read::<Market>().inner()[&jobs]
                 .sell_order(seller)

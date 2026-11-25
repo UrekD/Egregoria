@@ -6,9 +6,9 @@ use crate::economy::cargo::CargoBook;
 use crate::economy::Market;
 use crate::map::{BuildingID, BuildingKind};
 use crate::map_dynamic::{
-    active_business, effective_load, site_power_status, transit, ActiveRetailIndex, BuildingInfos,
-    BuildingUtilityStatus, Destination, ElectricityFlow, RouterError, SiteLoad, UtilityFlow,
-    UtilityStatus,
+    active_business, effective_load, live_site_utility_status, site_power_status, transit,
+    ActiveRetailIndex, BuildingInfos, BuildingUtilityStatus, Destination, ElectricityFlow,
+    RouterError, SiteLoad, UtilityFlow, UtilityStatus,
 };
 use crate::souls::events::Fires;
 use crate::souls::goods_company::recipe_blockers;
@@ -57,10 +57,17 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
     let infos = sim.read::<BuildingInfos>();
     let business = active_business(building, &infos, sim.world());
     let load = effective_load(building, residences.by_building.get(&id), business);
-    let utilities =
-        sim.read::<UtilityFlow>()
-            .status_for_site(&map, &residences, &infos, sim.world(), id);
-    let power = site_power_status(&map, &sim.read::<ElectricityFlow>(), building);
+    let power_flow = sim.read::<ElectricityFlow>();
+    let utilities = live_site_utility_status(
+        &map,
+        &residences,
+        &infos,
+        sim.world(),
+        &power_flow,
+        &sim.read::<UtilityFlow>(),
+        id,
+    );
+    let power = site_power_status(&map, &power_flow, building);
     let mut blockers = Vec::new();
     if building.is_orphaned() {
         blockers.push(BuildingBlocker::RoadDisconnected);
@@ -334,6 +341,19 @@ mod tests {
         let home_door = test.g.map().get(house).unwrap().door_pos.xy();
         let store = GoodsCompanyID::new("commercial-high-l1");
         let footprint = OBB::new(home_door + Vec2::x(1540.0), Vec2::Y, 50.0, 50.0);
+        let store_endpoints = [
+            (footprint.center() - Vec2::x(100.0)).z(0.0),
+            (footprint.center() + Vec2::x(100.0)).z(0.0),
+        ];
+        let old_roads = test.g.map().roads().keys().collect::<Vec<_>>();
+        test.build_roads(&store_endpoints);
+        let road = test
+            .g
+            .map()
+            .roads()
+            .keys()
+            .find(|id| !old_roads.contains(id))
+            .unwrap();
         let worker = spawn_human(&mut test.g, house).unwrap();
         for (offset, met) in [(-41.0, true), (-39.0, false)] {
             let building = test
@@ -346,7 +366,7 @@ mod tests {
                         door_pos: Vec2::x(offset),
                     },
                     None,
-                    None,
+                    Some(road),
                 )
                 .unwrap();
             test.g.write::<BuildingInfos>().insert(building);
@@ -371,6 +391,25 @@ mod tests {
             test.g.map_mut().remove_building(building);
             assert!(building_diagnostics(&test.g, building).is_none());
         }
+    }
+
+    #[test]
+    fn z3_fix_road_cut_hides_staffed_retail_before_cleanup() {
+        let (mut test, site, shop) = crate::map_dynamic::accounting_site(true);
+        let worker = spawn_human(&mut test.g, site).unwrap();
+        test.g.world.companies[shop].workers.0.push(worker);
+        assert_eq!(
+            building_diagnostics(&test.g, site).unwrap().retail_access,
+            Some(true)
+        );
+        let road = test.g.map().get(site).unwrap().connected_road.unwrap();
+        test.g.map_mut().remove_road(road).unwrap();
+        assert!(test.g.map().get(site).unwrap().is_orphaned());
+        assert_eq!(test.g.world.companies[shop].workers.0.as_slice(), &[worker]);
+        assert_eq!(
+            building_diagnostics(&test.g, site).unwrap().retail_access,
+            Some(false)
+        );
     }
 
     #[test]
