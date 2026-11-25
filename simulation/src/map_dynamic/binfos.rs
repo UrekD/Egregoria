@@ -1,6 +1,7 @@
 use crate::map::{BuildingID, BuildingKind, Map};
 use crate::souls::residence::Residences;
 use crate::SoulID;
+use prototypes::{FreightStationPrototypeID, GoodsCompanyID};
 use serde::{Deserialize, Serialize};
 use slotmapd::SecondaryMap;
 use std::collections::{BTreeMap, BTreeSet};
@@ -17,6 +18,7 @@ pub struct BuildingInfos {
     assignment: SecondaryMap<BuildingID, BuildingInfo>,
     owners: BTreeMap<SoulID, BuildingID>,
     residences: BTreeMap<SoulID, BuildingID>,
+    business_addresses: BTreeSet<BuildingID>,
     #[serde(skip)]
     vacancies: Option<Vacancies>,
     #[serde(skip)]
@@ -29,14 +31,43 @@ struct Vacancies {
     unowned: BTreeSet<BuildingID>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum VacancyTarget {
+    Business(BuildingID, GoodsCompanyID),
+    Residence(BuildingID),
+    Freight(BuildingID, FreightStationPrototypeID),
+}
+
+impl VacancyTarget {
+    fn order(self) -> (BuildingID, u8) {
+        match self {
+            Self::Business(id, _) => (id, 0),
+            Self::Residence(id) => (id, 1),
+            Self::Freight(id, _) => (id, 2),
+        }
+    }
+}
+
 impl BuildingInfos {
     pub fn insert(&mut self, building: BuildingID) {
-        self.assignment.insert(building, BuildingInfo::default());
-        self.mark_vacancy_changed(building);
+        if self.assignment.get(building).is_none() {
+            self.assignment.insert(building, BuildingInfo::default());
+            self.mark_vacancy_changed(building);
+        }
+    }
+
+    /// Register a shared address before the first resident can claim legacy ownership.
+    pub(crate) fn mark_business_address(&mut self, building: BuildingID) {
+        if self.business_addresses.insert(building)
+            && matches!(self.owner(building), Some(SoulID::Human(_)))
+        {
+            self.clear_owner(building);
+        }
     }
 
     pub fn remove(&mut self, building: BuildingID) -> Option<BuildingInfo> {
         let info = self.assignment.remove(building)?;
+        self.business_addresses.remove(&building);
         self.mark_vacancy_changed(building);
         if let Some(owner) = info.owner {
             if self.owners.get(&owner) == Some(&building) {
@@ -101,10 +132,25 @@ impl BuildingInfos {
         self.residences.insert(soul, building);
         let info = self.get_mut(building).expect("registered residence");
         info.residents.insert(soul);
-        if info.owner.is_none() {
+        if info.owner.is_none() && !self.business_addresses.contains(&building) {
             self.set_owner(building, soul);
         }
         self.mark_vacancy_changed(building);
+    }
+
+    pub(crate) fn take_residents(&mut self, building: BuildingID) -> BTreeSet<SoulID> {
+        let Some(info) = self.assignment.get_mut(building) else {
+            return BTreeSet::new();
+        };
+        let residents = std::mem::take(&mut info.residents);
+        if info.owner.is_some_and(|owner| residents.contains(&owner)) {
+            self.clear_owner(building);
+        }
+        for &resident in &residents {
+            self.residences.remove(&resident);
+        }
+        self.mark_vacancy_changed(building);
+        residents
     }
 
     pub(crate) fn remove_resident(&mut self, soul: SoulID) {
@@ -126,7 +172,17 @@ impl BuildingInfos {
         self.mark_vacancy_changed(building);
     }
 
+    pub(crate) fn clear_owner(&mut self, building: BuildingID) {
+        if let Some(owner) = self.get_mut(building).and_then(|info| info.owner.take()) {
+            self.owners.remove(&owner);
+            self.mark_vacancy_changed(building);
+        }
+    }
+
     pub fn set_owner(&mut self, building: BuildingID, soul: SoulID) {
+        if matches!(soul, SoulID::Human(_)) && self.business_addresses.contains(&building) {
+            return;
+        }
         let Some(info) = self.get_mut(building) else {
             return;
         };
@@ -146,54 +202,77 @@ impl BuildingInfos {
         map: &Map,
         residences: &Residences,
         immigrating: bool,
-    ) -> Vec<(BuildingKind, BuildingID)> {
-        let vacancies = self.vacancies.get_or_insert_with(|| {
-            // Rebuild the derived index from loaded building and residence state.
+        now: u64,
+    ) -> Vec<VacancyTarget> {
+        if self.vacancies.is_none() {
             self.vacancy_changes.extend(self.assignment.keys());
-            Vacancies::default()
-        });
+        }
         for id in std::mem::take(&mut self.vacancy_changes) {
+            if map.get(id).is_some_and(|building| building.is_mixed_use())
+                && self.assignment.get(id).is_some()
+            {
+                self.mark_business_address(id);
+            }
+            let vacancies = self.vacancies.get_or_insert_with(Vacancies::default);
             vacancies.homes.remove(&id);
             vacancies.unowned.remove(&id);
             let Some((building, info)) = map.get(id).zip(self.assignment.get(id)) else {
                 continue;
             };
-            match building.kind {
-                BuildingKind::House
-                    if !residences.is_abandoned(id)
-                        && residences
-                            .by_building
-                            .get(&id)
-                            .is_some_and(|home| info.residents.len() < home.capacity as usize) =>
-                {
-                    vacancies.homes.insert(id);
-                }
+            if building.has_residential_use()
+                && residences
+                    .by_building
+                    .get(&id)
+                    .is_some_and(|home| info.residents.len() < home.capacity as usize)
+            {
+                vacancies.homes.insert(id);
+            }
+            if matches!(
+                building.kind,
                 BuildingKind::GoodsCompany(_) | BuildingKind::RailFreightStation(_)
-                    if info.owner.is_none() =>
-                {
-                    vacancies.unowned.insert(id);
-                }
-                _ => {}
+            ) && info.owner.is_none()
+            {
+                vacancies.unowned.insert(id);
             }
         }
-
-        let homes = immigrating
-            .then_some(&vacancies.homes)
-            .into_iter()
-            .flatten();
-        let mut buildings: Vec<_> = vacancies
+        let Some(vacancies) = &self.vacancies else {
+            return Vec::new();
+        };
+        let mut targets: Vec<_> = vacancies
             .unowned
             .iter()
-            .chain(homes)
             .filter_map(|&id| {
                 let building = map.get(id)?;
-                // A house can lose or regain its road without changing its vacancy.
-                (building.kind != BuildingKind::House || !building.is_orphaned())
-                    .then_some((building.kind, id))
+                match building.kind {
+                    BuildingKind::GoodsCompany(proto)
+                        if building.development().is_none_or(|site| {
+                            !building.is_abandoned_growable()
+                                && building
+                                    .connected_road
+                                    .is_some_and(|road| map.get(road).is_some())
+                                && site.business.is_some_and(|role| role.can_open(now))
+                        }) =>
+                    {
+                        Some(VacancyTarget::Business(id, proto))
+                    }
+                    BuildingKind::RailFreightStation(proto) => {
+                        Some(VacancyTarget::Freight(id, proto))
+                    }
+                    _ => None,
+                }
             })
             .collect();
-        buildings.sort_unstable_by_key(|&(_, id)| id);
-        buildings
+        if immigrating {
+            targets.extend(vacancies.homes.iter().filter_map(|&id| {
+                let building = map.get(id)?;
+                (!building.is_orphaned()
+                    && !building.is_abandoned_growable()
+                    && !residences.is_abandoned(id))
+                .then_some(VacancyTarget::Residence(id))
+            }));
+        }
+        targets.sort_unstable_by_key(|target| target.order());
+        targets
     }
 
     pub fn owner(&self, building: BuildingID) -> Option<SoulID> {
