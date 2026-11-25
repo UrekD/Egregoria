@@ -907,8 +907,13 @@ mod tests {
 
     #[cfg(debug_assertions)]
     #[test]
-    #[should_panic(expected = "attempt to add with overflow")]
     fn pfb2a3_power_consumption_overflow_panics_in_debug() {
+        if !crate::tests::in_prototype_fixture_process(
+            module_path!(),
+            "pfb2a3_power_consumption_overflow_panics_in_debug",
+        ) {
+            return;
+        }
         let mut test = TestCtx::new();
         prototypes::test_prototypes(
             r#"
@@ -929,7 +934,15 @@ mod tests {
         assert_eq!(map.electricity.net_id(a), map.electricity.net_id(b));
         drop(map);
         let (world, resources) = test.g.world_res();
-        electricity_flow_system(world, resources);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            electricity_flow_system(world, resources);
+        }))
+        .expect_err("expected electricity consumption overflow");
+        let message = panic
+            .downcast_ref::<&str>()
+            .copied()
+            .or_else(|| panic.downcast_ref::<String>().map(String::as_str));
+        assert_eq!(message, Some("attempt to add with overflow"));
     }
 
     #[test]

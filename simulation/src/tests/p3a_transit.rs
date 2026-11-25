@@ -367,11 +367,13 @@ fn p3a_wait_gives_up_once_after_the_give_up_window() {
 }
 
 #[test]
-fn p3a_invalid_commands_leave_all_simulation_hashes_unchanged() {
+fn p3a_invalid_commands_record_wire_valid_inputs_and_leave_world_unchanged() {
     let (mut ctx, line) = loop_fixture();
     let [first, second] = two_stops(&ctx.g, line);
     ctx.g.write::<crate::Replay>().enabled = true;
-    let before = ctx.g.hashes();
+    let mut before = ctx.g.hashes();
+    before.remove("replay");
+    let recorded = ctx.g.read::<crate::Replay>().command_count();
     ctx.g.apply_commands(&[
         WorldCommand::TransitAddStop {
             pos: vec3(f32::NAN, 0.0, 0.0),
@@ -398,6 +400,11 @@ fn p3a_invalid_commands_leave_all_simulation_hashes_unchanged() {
     let outcomes = ctx.g.read::<CommandOutcomes>();
     assert!(outcomes.accepted.is_empty());
     assert_eq!(outcomes.last.len(), 6);
+    assert_eq!(outcomes.last[0].1, Rejection::InvalidCommandEncoding);
+    assert_eq!(outcomes.last[2].1, Rejection::InvalidCommandEncoding);
     assert_eq!(outcomes.last[3].1, Rejection::MissingReference);
-    assert_eq!(ctx.g.hashes(), before);
+    assert_eq!(ctx.g.read::<crate::Replay>().command_count(), recorded + 4);
+    let mut after = ctx.g.hashes();
+    after.remove("replay");
+    assert_eq!(after, before);
 }

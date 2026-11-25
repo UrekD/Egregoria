@@ -55,7 +55,7 @@ fn daily_metrics_keep_fourteen_closed_days_and_the_open_day() {
 }
 
 #[test]
-fn guided_build_locks_leave_treasury_and_replay_unchanged() {
+fn guided_build_locks_leave_world_unchanged_and_record_rejections() {
     let (mut ctx, line) = loop_fixture();
     let sim = &mut ctx.g;
     let mut stops = sim.read::<Transit>().lines[line].stops.clone();
@@ -106,7 +106,8 @@ fn guided_build_locks_leave_treasury_and_replay_unchanged() {
             1,
         ),
     ] {
-        let before = sim.hashes();
+        let mut before = sim.hashes();
+        before.remove("replay");
         let money = sim.read::<Government>().money;
         let recorded = sim.read::<Replay>().command_count();
         sim.apply_commands([&command]);
@@ -114,8 +115,10 @@ fn guided_build_locks_leave_treasury_and_replay_unchanged() {
         assert_eq!(outcomes.last, [(name, Rejection::Locked { milestone })]);
         assert!(outcomes.accepted.is_empty());
         assert_eq!(sim.read::<Government>().money, money);
-        assert_eq!(sim.read::<Replay>().command_count(), recorded);
-        assert_eq!(sim.hashes(), before);
+        assert_eq!(sim.read::<Replay>().command_count(), recorded + 1);
+        let mut after = sim.hashes();
+        after.remove("replay");
+        assert_eq!(after, before);
     }
 
     let exemptions = [

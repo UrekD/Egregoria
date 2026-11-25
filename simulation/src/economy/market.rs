@@ -1631,6 +1631,7 @@ mod tests {
     use prototypes::ItemID;
 
     use crate::economy::WORKER_CONSUMPTION_PER_MINUTE;
+    use crate::tests::in_prototype_fixture_process;
     use crate::world::CompanyID;
     use crate::{FreightStationID, SoulID};
 
@@ -1642,6 +1643,9 @@ mod tests {
 
     #[test]
     fn test_match_orders() {
+        if !in_prototype_fixture_process(module_path!(), "test_match_orders") {
+            return;
+        }
         let seller = SoulID::GoodsCompany(mk_ent((1 << 32) | 1));
         let seller_far = SoulID::GoodsCompany(mk_ent((1 << 32) | 2));
         let buyer = SoulID::GoodsCompany(mk_ent((1 << 32) | 3));
@@ -1688,6 +1692,9 @@ mod tests {
 
     #[test]
     fn calculate_prices() {
+        if !in_prototype_fixture_process(module_path!(), "calculate_prices") {
+            return;
+        }
         test_prototypes(
             r#"
         data:extend {
@@ -1764,6 +1771,9 @@ mod tests {
 
     #[test]
     fn p1c_price_graph_cycles() {
+        if !in_prototype_fixture_process(module_path!(), "p1c_price_graph_cycles") {
+            return;
+        }
         test_prototypes(
             r#"
             local function item(name)

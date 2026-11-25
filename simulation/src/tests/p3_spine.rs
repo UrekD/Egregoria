@@ -52,7 +52,9 @@ fn p3_spine_rejects_invalid_transit_commands_atomically() {
         "TransitSetVehicles",
         "TransitSetFare",
     ];
-    let before = ctx.g.hashes();
+    let mut before = ctx.g.hashes();
+    before.remove("replay");
+    let recorded = ctx.g.read::<crate::Replay>().command_count();
 
     ctx.g.apply_commands(&commands);
 
@@ -62,7 +64,13 @@ fn p3_spine_rejects_invalid_transit_commands_atomically() {
         names.map(|name| (name, Rejection::MissingReference))
     );
     assert!(outcomes.accepted.is_empty());
-    assert_eq!(ctx.g.hashes(), before);
+    assert_eq!(
+        ctx.g.read::<crate::Replay>().command_count(),
+        recorded + commands.len()
+    );
+    let mut after = ctx.g.hashes();
+    after.remove("replay");
+    assert_eq!(after, before);
 }
 
 #[test]

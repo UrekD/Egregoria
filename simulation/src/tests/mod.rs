@@ -373,6 +373,29 @@ fn w0_water_guarded_terraform_survives_slot_and_replay_boundaries() {
     assert_eq!(loaded.hashes(), replayed.hashes());
 }
 
+/// Run tests that replace the process-wide prototype registry in their own process.
+pub(crate) fn in_prototype_fixture_process(module: &str, name: &str) -> bool {
+    const FIXTURE: &str = "EGR_TEST_PROTOTYPE_FIXTURE";
+    let (_, module) = module.split_once("::").unwrap();
+    let test = format!("{module}::{name}");
+    if std::env::var(FIXTURE).is_ok_and(|running| running == test) {
+        return true;
+    }
+
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", &test])
+        .env(FIXTURE, &test)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("running 1 test"),
+        "{test}\n{stdout}\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 fn init_test_simulation() {
     static BASE_PROTOTYPES: Mutex<Option<&'static prototypes::Prototypes>> = Mutex::new(None);
     let mut base = BASE_PROTOTYPES.lock().unwrap();
@@ -380,10 +403,8 @@ fn init_test_simulation() {
         .zip(prototypes::try_prototypes())
         .is_some_and(|(base, current)| std::ptr::eq(base, current));
     if !base_is_loaded {
-        // Default fixtures share one registry. Custom prototype fixtures run serially,
-        // and the next default fixture restores the base data.
-        // SAFETY: The mutex serializes default initialization. Initial publication
-        // is atomic, and custom replacement only occurs in serial runs.
+        // SAFETY: The mutex serializes default initialization, and custom
+        // fixtures replace the registry only in their own subprocess.
         unsafe { crate::init::load_prototypes() };
         *base = Some(prototypes::prototypes());
     }

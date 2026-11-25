@@ -476,6 +476,12 @@ fn p2b_utility_supply_is_equal_after_reload() {
 
 #[test]
 fn p2c_emitter_adds_pollution_with_linear_falloff() {
+    if !super::in_prototype_fixture_process(
+        module_path!(),
+        "p2c_emitter_adds_pollution_with_linear_falloff",
+    ) {
+        return;
+    }
     use crate::map_dynamic::EnvGrid;
     use prototypes::GameTime;
 
@@ -497,6 +503,12 @@ fn p2c_emitter_adds_pollution_with_linear_falloff() {
 
 #[test]
 fn p2c_pollution_decays_to_zero_after_emitter_removal() {
+    if !super::in_prototype_fixture_process(
+        module_path!(),
+        "p2c_pollution_decays_to_zero_after_emitter_removal",
+    ) {
+        return;
+    }
     use crate::map_dynamic::EnvGrid;
 
     let mut test = TestCtx::new_fast();
@@ -521,6 +533,12 @@ fn p2c_pollution_decays_to_zero_after_emitter_removal() {
 
 #[test]
 fn p2c_pollution_lowers_nearby_land_value() {
+    if !super::in_prototype_fixture_process(
+        module_path!(),
+        "p2c_pollution_lowers_nearby_land_value",
+    ) {
+        return;
+    }
     use crate::map_dynamic::EnvGrid;
 
     let mut test = TestCtx::new_fast();
@@ -548,6 +566,9 @@ fn p2c_pollution_lowers_nearby_land_value() {
 
 #[test]
 fn p2c_environment_survives_save_load() {
+    if !super::in_prototype_fixture_process(module_path!(), "p2c_environment_survives_save_load") {
+        return;
+    }
     use crate::map_dynamic::EnvGrid;
 
     let mut test = TestCtx::new_fast();
@@ -581,7 +602,6 @@ fn p2c_environment_survives_save_load() {
 }
 
 fn p2c_place_polluter(test: &mut TestCtx, center: geom::Vec2) -> crate::map::BuildingID {
-    // Unit tests run serially because their fixtures replace the global prototype registry.
     prototypes::test_prototypes(
         r#"
         package.path = "../base_mod/?.lua"

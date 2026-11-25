@@ -1213,7 +1213,10 @@ impl WorldCommand {
             MapLoadTestField { pos, spacing, .. } => pos.is_finite() && spacing.is_finite(),
             UpdateZone { zone, .. } => finite_zone(zone),
             SetGameTime(time) => time.timestamp.is_finite(),
-            ZonePaint { area, .. } => area.corners.iter().all(|point| point.is_finite()),
+            ZonePaint { area, .. } => {
+                let finite = area.corners.iter().all(|point| point.is_finite());
+                return (!finite).then_some(Ok(Rejection::InvalidZone));
+            }
             AddTrain { dist, .. } => dist.is_finite(),
             SpawnTrain { dist, wagons, .. } => dist.is_finite() && wagons.len() <= MAX_WAGONS,
             TransitAddStop { pos, dir } => pos.is_finite() && dir.is_finite(),

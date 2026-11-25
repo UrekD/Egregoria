@@ -235,6 +235,12 @@ fn p2abc_rail_bridge_pipes_and_land_value_follow_refresh_offsets() {
 
 #[test]
 fn p2abc_exact_fractional_staffing_meets_utility_demand() {
+    if !super::in_prototype_fixture_process(
+        module_path!(),
+        "p2abc_exact_fractional_staffing_meets_utility_demand",
+    ) {
+        return;
+    }
     let mut test = TestCtx::new_fast();
     prototypes::test_prototypes(
         r#"
@@ -287,6 +293,12 @@ fn p2abc_exact_fractional_staffing_meets_utility_demand() {
 
 #[test]
 fn p2abc_company_pollution_scales_with_staffing() {
+    if !super::in_prototype_fixture_process(
+        module_path!(),
+        "p2abc_company_pollution_scales_with_staffing",
+    ) {
+        return;
+    }
     let mut test = TestCtx::new_fast();
     prototypes::test_prototypes(
         r#"
