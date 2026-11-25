@@ -1102,6 +1102,7 @@ struct Observation {
     food_stockout_hours: f64,
     road_loads: u64,
     late_road_loads: u64,
+    cancelled_road_loads: u64,
     mixed_receipt_units: u64,
     mixed_shelf_peak: i32,
     productive_recipients: usize,
@@ -1200,7 +1201,7 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
         if let Some(freight) = ctx.sim.read::<CargoBook>().freight_day(day) {
             result.road_loads += freight.delivered_loads;
             result.late_road_loads += freight.late_loads;
-            *totals.entry("cancelled_loads".into()).or_default() += freight.cancelled_loads as f64;
+            result.cancelled_road_loads += freight.cancelled_loads;
             *totals.entry("road_delivered_units".into()).or_default() +=
                 freight.delivered_units as f64;
             for &seller in &known_sellers {
@@ -1232,6 +1233,7 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
         ));
     }
     totals.extend([
+        ("cancelled_loads".into(), result.cancelled_road_loads as f64),
         ("road_delivered_loads".into(), result.road_loads as f64),
         ("road_late_loads".into(), result.late_road_loads as f64),
         ("housing_slots_hourly_mean".into(), result.housing_slots),
@@ -1303,11 +1305,11 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
     );
     println!("{evidence}");
     let on_time = mixed.road_loads.saturating_sub(mixed.late_road_loads);
-    println!("MX road freight: {on_time}/{} loads on time", mixed.road_loads);
-    if mixed.road_loads == 0 || on_time as f64 / (mixed.road_loads as f64) < 0.9 {
+    let attempts = mixed.road_loads + mixed.cancelled_road_loads;
+    println!("MX road freight: {on_time}/{attempts} loads on time");
+    if on_time as f64 / (attempts.max(1) as f64) < 0.9 {
         return Err(format!(
-            "MX road freight needs 90% on-time deliveries, got {on_time}/{}",
-            mixed.road_loads
+            "MX road freight needs 90% on-time deliveries, got {on_time}/{attempts}"
         ));
     }
     let matched = |a: f64, b: f64| a > 0.0 && b > 0.0 && (a - b).abs() <= 0.05 * b;
@@ -1334,6 +1336,33 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
         return Err(evidence);
     }
     Ok(())
+}
+
+#[test]
+fn zones2_freight_gate_counts_cancelled_loads() {
+    let pure = Observation {
+        resident_days: 10.0,
+        external_shops: 10,
+        baskets_due: 10,
+        baskets_filled: 10,
+        housing_slots: 10.0,
+        available_jobs: 10.0,
+        filled_jobs: 10.0,
+        ..Observation::default()
+    };
+    let mut mixed = Observation {
+        external_shops: 6,
+        local_pickups: 4,
+        road_loads: 9,
+        cancelled_road_loads: 1,
+        mixed_receipt_units: 10,
+        productive_recipients: 1,
+        ..pure
+    };
+    compare_economies(&mixed, &pure).unwrap();
+    mixed.cancelled_road_loads = 2;
+    let error = compare_economies(&mixed, &pure).unwrap_err();
+    assert!(error.contains("road freight needs 90%"));
 }
 
 fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {
