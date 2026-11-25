@@ -101,6 +101,11 @@ pub struct CrossingSpec {
     pub without_bridge_check: &'static str,
 }
 
+const ALPSKA_WEST_JUNCTION: SourceKey = SourceKey::Node {
+    id: 862116385,
+    rail: false,
+};
+
 pub fn plan_town(
     inputs: &PinnedInputs,
     config: TownConfig,
@@ -186,6 +191,22 @@ pub fn plan_town(
         retire_outer_road_fragments(&mut graph, &infill)?;
         prioritize_east_connector(&mut graph);
         calibrate_storage(&mut graph, config, limits, map.environment())?;
+    }
+
+    if graph
+        .links
+        .contains_key(&SourceKey::Authored("alpska-rail-underpass"))
+    {
+        if let Some(junction) = graph.junctions.get_mut(&ALPSKA_WEST_JUNCTION) {
+            // A timed-out walking trip can leave its pedestrian in the crossing
+            // across the underpass approach. Keep the sidewalk corners and use
+            // crossings at the surrounding junctions.
+            junction.turn.crosswalks = false;
+            graph.record(
+                "use surrounding crossings for the Alpska underpass west approach",
+                &[ALPSKA_WEST_JUNCTION],
+            );
+        }
     }
 
     Ok(TownPlan {
@@ -1202,6 +1223,55 @@ fn districts(config: TownConfig) -> Vec<District> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cm2_layout_routes_around_alpska_crosswalk() {
+        use crate::citymap::{
+            build_dry_town, read_inputs, SourcePaths, DEFAULT_LESCE, DEFAULT_SAVA,
+        };
+        use simulation::map::{LaneKind, PathKind};
+        use simulation::map_dynamic::Itinerary;
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let (sim, built) = build_dry_town(&plan).unwrap();
+        let map = sim.map();
+        let junction = &map.intersections()[built.junctions[&ALPSKA_WEST_JUNCTION]];
+        assert!(!junction.turn_policy.crosswalks);
+        let sidewalks: Vec<_> = junction
+            .roads
+            .iter()
+            .flat_map(|&road| {
+                map.roads()[road].lanes_iter().filter_map(|(lane, kind)| {
+                    let lane = &map.lanes()[lane];
+                    (kind == LaneKind::Walking).then(|| {
+                        let points = &lane.points;
+                        let offset = points.length().min(40.0) * 0.5;
+                        points.point_along(if lane.src == junction.id {
+                            offset
+                        } else {
+                            points.length() - offset
+                        })
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(sidewalks.len(), 6);
+        for &from in &sidewalks {
+            for &to in &sidewalks {
+                assert!(
+                    Itinerary::route(prototypes::Tick(0), from, to, &map, PathKind::Pedestrian)
+                        .is_some(),
+                    "missing walking route from {from:?} to {to:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn citymap_clip_preserves_entry_and_exit_of_an_outside_segment() {

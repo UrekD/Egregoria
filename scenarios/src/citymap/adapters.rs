@@ -37,11 +37,13 @@ pub(super) fn water_sites(
 ) -> Result<[BuildingID; 2], String> {
     let place = |sim: &mut Simulation, name: &str| {
         let kind = BuildingKind::GoodsCompany(GoodsCompanyID::new(name));
-        let (building, _) = place_checked_company(sim, plan, roads, name, |map, road, footprint| {
-            let request = WaterSiteRequest::for_placement(kind, footprint, Some(road))?;
-            water_service_site(map, request, &river_site_summary(map)).ok()?;
-            Some(footprint.center().distance2(anchor))
-        })?;
+        let (building, _) =
+            place_scored_company(sim, plan, roads, name, |map, road, footprint| {
+                let request = WaterSiteRequest::for_placement(kind, footprint, Some(road))?;
+                water_service_site(map, request, &river_site_summary(map)).ok()?;
+                Some(footprint.center().distance2(anchor))
+            })?
+            .ok_or_else(|| format!("no clear W3 site for {name}"))?;
         water_provider_site(&sim.map(), building)
             .ok_or_else(|| format!("missing W3 provider site for {name}"))?
             .map_err(|error| format!("invalid W3 provider site for {name}: {error}"))?;
@@ -87,9 +89,10 @@ pub(super) fn place_company(
     name: &str,
     anchor: Vec2,
 ) -> Result<(BuildingID, RoadID), String> {
-    place_scored_company(sim, plan, roads, name, |_, footprint| {
+    place_scored_company(sim, plan, roads, name, |_, _, footprint| {
         Some(footprint.center().distance2(anchor))
-    })
+    })?
+    .ok_or_else(|| format!("no clear fitting site for {name}"))
 }
 
 pub(super) fn place_scored_company(
@@ -97,18 +100,8 @@ pub(super) fn place_scored_company(
     plan: &TownPlan,
     roads: &BTreeSet<RoadID>,
     name: &str,
-    mut score: impl FnMut(RoadID, OBB) -> Option<f32>,
-) -> Result<(BuildingID, RoadID), String> {
-    place_checked_company(sim, plan, roads, name, |_, road, footprint| score(road, footprint))
-}
-
-fn place_checked_company(
-    sim: &mut Simulation,
-    plan: &TownPlan,
-    roads: &BTreeSet<RoadID>,
-    name: &str,
     mut score: impl FnMut(&Map, RoadID, OBB) -> Option<f32>,
-) -> Result<(BuildingID, RoadID), String> {
+) -> Result<Option<(BuildingID, RoadID)>, String> {
     let id = GoodsCompanyID::new(name);
     let proto = try_prototype(id).ok_or_else(|| format!("missing CITYMAP prototype {name}"))?;
     let kind = BuildingKind::GoodsCompany(id);
@@ -145,8 +138,9 @@ fn place_checked_company(
                 }
             }
         }
-        let (_, footprint, road) =
-            best.ok_or_else(|| format!("no clear fitting site for {name}"))?;
+        let Some((_, footprint, road)) = best else {
+            return Ok(None);
+        };
         (footprint, road)
     };
     let gen = BuildingGen::NoWalkway {
@@ -155,7 +149,7 @@ fn place_checked_company(
     // A road-facing door is also the search anchor for the real parking and
     // delivery paths, including for the large power plant.
     let building = place_special(sim, name, kind, obb, gen, road)?;
-    Ok((building, road))
+    Ok(Some((building, road)))
 }
 
 pub(super) fn site_clear(map: &Map, plan: &TownPlan, footprint: OBB) -> bool {
