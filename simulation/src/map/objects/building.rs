@@ -7,7 +7,7 @@ use egui_inspect::debug_inspect_impl;
 use geom::{Color, Polygon, Shape, Vec2, Vec3, AABB, OBB};
 use prototypes::{
     BuildingGen, FreightStationPrototypeID, GoodsCompanyID, GrowableCompanyID, GrowableZoneKind,
-    ResidencePrototypeID,
+    ResidencePrototypeID, MAX_PROFILED_SLOTS,
 };
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
@@ -41,6 +41,14 @@ impl BuildingKind {
                 && prototypes::try_prototype(GrowableCompanyID::from(company)).is_some_and(
                     |growable| growable.chain_key().zone_kind == GrowableZoneKind::MixedUse,
                 )
+        })
+    }
+
+    fn allows_raw_placement(self) -> bool {
+        self.as_goods_company().is_none_or(|company| {
+            prototypes::try_prototypes().is_some()
+                && prototypes::try_prototype(company).is_some()
+                && !self.is_mixed_growable()
         })
     }
 
@@ -165,6 +173,19 @@ pub struct GrowableDevelopment {
     pub business: Option<GrowableBusinessState>,
 }
 
+impl GrowableDevelopment {
+    fn valid_job_slots(&self) -> bool {
+        match (self.zone.kind, self.business) {
+            (ZoneKind::Residential, None) => self.planned_jobs == 0,
+            (ZoneKind::MixedUse, Some(_)) => self.planned_jobs == 12,
+            (ZoneKind::Commercial | ZoneKind::Industrial | ZoneKind::Office, Some(_)) => {
+                (1..=MAX_PROFILED_SLOTS).contains(&self.planned_jobs)
+            }
+            _ => false,
+        }
+    }
+}
+
 /// World-space appearance prepared by parcel fit before map insertion.
 pub(crate) struct PreparedGrowableAppearance {
     pub development: GrowableDevelopment,
@@ -175,7 +196,8 @@ pub(crate) struct PreparedGrowableAppearance {
 
 impl PreparedGrowableAppearance {
     pub(in crate::map) fn is_valid(&self, parcel: &OBB) -> bool {
-        self.base_z.is_finite()
+        self.development.valid_job_slots()
+            && self.base_z.is_finite()
             && self.development.roof_z.is_finite()
             && self.development.roof_z > self.base_z
             && self.door.is_finite()
@@ -337,7 +359,12 @@ impl Building {
         zone: Option<Zone>,
         connected_road: Option<RoadID>,
     ) -> Option<BuildingID> {
-        if kind.is_mixed_growable() || connected_road.is_some_and(|road| !roads.contains_key(road))
+        if connected_road.is_some_and(|road| !roads.contains_key(road))
+            || !Self::valid_footprint(&obb, gen)
+            || zone
+                .as_ref()
+                .is_some_and(|zone| zone.validated_area().is_none())
+            || !Self::dry_footprint(env, &obb, zone.as_ref())
         {
             return None;
         }
@@ -345,6 +372,7 @@ impl Building {
         Some(prepared.insert(buildings, spatial_map, electricity, roads))
     }
 
+    /// Build geometry for an already checked footprint.
     pub(in crate::map) fn prepare(
         env: &Environment,
         obb: OBB,
@@ -354,15 +382,6 @@ impl Building {
         connected_road: Option<RoadID>,
         appearance: Option<PreparedGrowableAppearance>,
     ) -> Option<PreparedBuilding> {
-        if !Self::valid_footprint(&obb, gen)
-            || zone
-                .as_ref()
-                .is_some_and(|zone| zone.validated_area().is_none())
-            || !Self::dry_footprint(env, &obb, zone.as_ref())
-        {
-            return None;
-        }
-
         let (mesh, door_pos, height, development) = match appearance {
             Some(appearance) if appearance.is_valid(&obb) => (
                 appearance.mesh,
@@ -371,7 +390,7 @@ impl Building {
                 Some(appearance.development),
             ),
             Some(_) => return None,
-            None if kind.is_mixed_growable() => return None,
+            None if !kind.allows_raw_placement() => return None,
             None => {
                 let (mesh, door, height) = Self::legacy_appearance(&obb, gen, env);
                 (mesh, door, height, None)

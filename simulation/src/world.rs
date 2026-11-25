@@ -192,6 +192,8 @@ pub struct World {
     pub wagons: HopSlotMap<WagonID, WagonEnt>,
     pub freight_stations: HopSlotMap<FreightStationID, FreightStationEnt>,
     pub companies: HopSlotMap<CompanyID, CompanyEnt>,
+    #[serde(default)]
+    pub(crate) company_departures: lifecycle::CompanyDepartures,
     #[serde(skip)]
     pub(crate) parking_validation: crate::transportation::road::ParkingValidation,
     #[serde(skip)]
@@ -362,7 +364,7 @@ impl GrowablePlan {
             }
         }
 
-        let placement = map.prepare_growable(site.lot, site.kind, site.generator, appearance)?;
+        let placement = map.prepare_checked_growable(lot, site.kind, site.generator, appearance)?;
         Ok(Self {
             placement,
             home,

@@ -67,6 +67,9 @@ pub(crate) struct PreparedGrowable {
     frontage: RoadID,
     shape: OBB,
     generator: BuildingGen,
+    attachment: Vec3,
+    map_identity: u64,
+    grade_revision: (u64, u64, u64),
     building: PreparedBuilding,
 }
 
@@ -97,6 +100,7 @@ pub struct Map {
     pub parking: ParkingSpots,
     pub subscribers: MapSubscribers,
     pub(crate) pending_construction_cuts: BTreeSet<TerrainChunkID>,
+    pub(super) construction_cut_revision: u64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -194,6 +198,7 @@ impl Map {
             no_frontage: BTreeSet::new(),
             electricity: Default::default(),
             pending_construction_cuts: BTreeSet::new(),
+            construction_cut_revision: 0,
             subscribers: MapSubscribers::default(),
         }
     }
@@ -236,6 +241,9 @@ impl Map {
     /// Perform cleanups potentially required every frame
     pub fn update(&mut self) {
         profiling::scope!("map::update");
+        if !self.pending_construction_cuts.is_empty() {
+            self.construction_cut_revision += 1;
+        }
         for chunk in std::mem::take(&mut self.pending_construction_cuts) {
             let mut work = None;
             let heights = self
@@ -966,9 +974,6 @@ impl Map {
         zone: Option<Zone>,
         connected_road: Option<RoadID>,
     ) -> Option<BuildingID> {
-        if kind.is_mixed_growable() {
-            return None;
-        }
         let zone = match zone {
             Some(zone) => Some(zone.normalized()?),
             None => None,
@@ -1048,19 +1053,35 @@ impl Map {
             }
             _ => return None,
         };
-        let prepared = self.prepare_growable(lot_id, kind, gen, None).ok()?;
+        let lot = self.get(lot_id)?;
+        lot.check_growable_footprint(self, gen).ok()?;
+        let prepared = self.prepare_checked_growable(lot, kind, gen, None).ok()?;
         self.commit_prepared_growable(prepared).ok()
     }
 
-    pub(crate) fn prepare_growable(
+    fn construction_grade_revision(&self) -> (u64, u64, u64) {
+        (
+            self.environment.base_revision,
+            self.environment.water_revision(),
+            self.construction_cut_revision,
+        )
+    }
+
+    fn growable_attachment(&self, lot: &Lot) -> Result<Vec3, GrowableLotError> {
+        let road = self.get(lot.parent).ok_or(GrowableLotError::MissingRoad)?;
+        let front = (lot.shape.corners[0] + lot.shape.corners[1]) * 0.5;
+        Ok(road.points.project_2d(front))
+    }
+
+    /// The caller supplies a checked footprint. Commit validates live fit again.
+    pub(crate) fn prepare_checked_growable(
         &self,
-        lot_id: LotID,
+        lot: &Lot,
         kind: BuildingKind,
         generator: BuildingGen,
         appearance: Option<PreparedGrowableAppearance>,
     ) -> Result<PreparedGrowable, GrowableLotError> {
-        let lot = self.get(lot_id).ok_or(GrowableLotError::MissingLot)?;
-        lot.check_growable_footprint(self, generator)?;
+        let attachment = self.growable_attachment(lot)?;
         let building = Building::prepare(
             &self.environment,
             lot.shape,
@@ -1072,10 +1093,13 @@ impl Map {
         )
         .ok_or(GrowableLotError::InfeasibleGrade)?;
         Ok(PreparedGrowable {
-            lot: lot_id,
+            lot: lot.id,
             frontage: lot.parent,
             shape: lot.shape,
             generator,
+            attachment,
+            map_identity: self.identity(),
+            grade_revision: self.construction_grade_revision(),
             building,
         })
     }
@@ -1085,10 +1109,17 @@ impl Map {
         prepared: PreparedGrowable,
     ) -> Result<BuildingID, GrowableLotError> {
         let lot = self.get(prepared.lot).ok_or(GrowableLotError::MissingLot)?;
-        if lot.parent != prepared.frontage || lot.shape.corners != prepared.shape.corners {
+        if self.identity() != prepared.map_identity
+            || lot.parent != prepared.frontage
+            || lot.shape.corners != prepared.shape.corners
+            || self.growable_attachment(lot)? != prepared.attachment
+        {
             return Err(GrowableLotError::MissingRoad);
         }
         lot.check_growable_footprint(self, prepared.generator)?;
+        if self.construction_grade_revision() != prepared.grade_revision {
+            return Err(GrowableLotError::InfeasibleGrade);
+        }
 
         let id = prepared.building.insert(
             &mut self.buildings,
@@ -1440,6 +1471,9 @@ impl Map {
         zones.clear_prepared_cells(effects.covered_zones);
         for (_, _, _, tree) in effects.wet_trees {
             self.environment.trees.remove_maintain(tree);
+        }
+        if !effects.cuts.is_empty() {
+            self.construction_cut_revision += 1;
         }
         for (chunk, cuts) in effects.cuts {
             self.environment.set_overrides(chunk, cuts);

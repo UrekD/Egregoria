@@ -13,7 +13,7 @@ use crate::transportation::{
     put_pedestrian_in_transport_grid, unpark, Location, VehicleKind, VehicleState,
 };
 use crate::utils::resources::Resources;
-use crate::world::{HumanEnt, HumanID, VehicleEnt, VehicleID};
+use crate::world::{CompanyID, HumanEnt, HumanID, VehicleEnt, VehicleID};
 use crate::{ParCommandBuffer, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
@@ -45,6 +45,9 @@ pub struct Router {
     #[serde(default)]
     #[inspect(skip)]
     pub trip_purpose: TripPurpose,
+    #[inspect(skip)]
+    #[serde(default)]
+    trip_employer: Option<CompanyID>,
     #[inspect(skip)]
     #[serde(skip)]
     transit_walks: Option<Box<[Option<ValidatedWalk>; 2]>>,
@@ -865,6 +868,7 @@ impl Router {
             trip_start: None,
             trip_mode: TripProgress::Walk,
             trip_purpose: TripPurpose::Other,
+            trip_employer: None,
             walk_only_pickup: false,
             replan_at_alight: false,
             transit_walks: None,
@@ -961,6 +965,7 @@ impl Router {
     pub(crate) fn cancel_at_alight(&mut self) {
         on_cancel(self);
         self.target_dest = None;
+        self.trip_employer = None;
         self.defer_replan();
     }
 
@@ -1055,16 +1060,23 @@ impl Router {
         }
     }
 
-    pub(crate) fn commutes_to(&self, building: BuildingID) -> bool {
-        self.trip_purpose == TripPurpose::Work && self.references_building(building)
+    pub(crate) fn commutes_for(&self, employer: CompanyID) -> bool {
+        self.target_dest.is_some()
+            && self.trip_purpose == TripPurpose::Work
+            && self.trip_employer == Some(employer)
     }
 
+    #[cfg(test)]
     pub(crate) fn references_building(&self, building: BuildingID) -> bool {
-        self.target_dest == Some(Destination::Building(building))
-            || self.cur_dest == Some(Destination::Building(building))
-            || self.steps.iter().chain(self.cur_step.iter()).any(|step| {
-                matches!(step, RoutingStep::GetInBuilding(id) | RoutingStep::GetOutBuilding(id) if *id == building)
-            })
+        self.references_any_building(|id| id == building)
+    }
+
+    pub(crate) fn references_any_building(&self, includes: impl Fn(BuildingID) -> bool) -> bool {
+        self.target_dest.into_iter().chain(self.cur_dest).any(|dest| {
+            matches!(dest, Destination::Building(id) if includes(id))
+        }) || self.steps.iter().chain(self.cur_step.iter()).any(|step| {
+            matches!(step, RoutingStep::GetInBuilding(id) | RoutingStep::GetOutBuilding(id) if includes(*id))
+        })
     }
 
     /// Whether a planned or current step uses the vehicle.
@@ -1102,6 +1114,7 @@ impl Router {
         self.clear_steps(parking);
         self.cur_dest = None;
         self.target_dest = None;
+        self.trip_employer = None;
         self.last_error = None;
         self.replan_at_alight = false;
     }
@@ -1115,13 +1128,23 @@ impl Router {
         self.go_to_for(dest, TripPurpose::Other)
     }
 
+    pub(crate) fn go_to_work(
+        &mut self,
+        workplace: BuildingID,
+        employer: Option<CompanyID>,
+    ) -> bool {
+        let arrived = self.go_to_for(Destination::Building(workplace), TripPurpose::Work);
+        self.trip_employer = employer;
+        arrived
+    }
+
     pub(crate) fn go_to_for(&mut self, dest: Destination, purpose: TripPurpose) -> bool {
         if self.target_dest == Some(dest) {
-            if matches!(
-                (self.trip_purpose, purpose),
-                (TripPurpose::Work, TripPurpose::Home) | (TripPurpose::Home, TripPurpose::Work)
-            ) {
+            if self.trip_purpose != purpose
+                && matches!(purpose, TripPurpose::Home | TripPurpose::Work)
+            {
                 self.trip_purpose = purpose;
+                self.trip_employer = None;
             }
             return self.cur_dest == Some(dest) && self.steps.is_empty() && self.cur_step.is_none();
         }
@@ -1130,6 +1153,7 @@ impl Router {
         }
         self.target_dest = Some(dest);
         self.trip_purpose = purpose;
+        self.trip_employer = None;
         on_start(self);
         false
     }

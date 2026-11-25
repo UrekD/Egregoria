@@ -51,18 +51,19 @@ impl Work {
 
     pub fn apply(&mut self, loc: &Location, router: &Router) -> HumanDecisionKind {
         use HumanDecisionKind::*;
+        let commute = GoWork {
+            workplace: self.workplace,
+            employer: self.employer,
+        };
         match self.kind {
-            WorkKind::Worker => GoTo(Destination::Building(self.workplace)),
+            WorkKind::Worker => commute,
             WorkKind::Driver {
                 deliver_order,
                 truck,
                 load,
             } => {
                 if &Location::Building(self.workplace) != loc {
-                    MultiStack(vec![
-                        GoTo(Destination::Building(self.workplace)),
-                        SetVehicle(router.personal_car),
-                    ])
+                    MultiStack(vec![commute, SetVehicle(router.personal_car)])
                 } else if let Some(b) = deliver_order {
                     MultiStack(vec![
                         SetVehicle(router.personal_car),

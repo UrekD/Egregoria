@@ -21,9 +21,8 @@ use crate::transportation::{
 };
 use crate::utils::rand_provider::RandProvider;
 use crate::utils::resources::Resources;
-use crate::world::{FreightStationEnt, HumanEnt, HumanID, VehicleEnt, VehicleID};
-use crate::World;
-use crate::{BuildingKind, Map, ParCommandBuffer, Simulation, SoulID};
+use crate::world::{CompanyID, FreightStationEnt, HumanEnt, HumanID, VehicleEnt, VehicleID};
+use crate::{BuildingKind, Map, ParCommandBuffer, Simulation, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
 use lazy_static::lazy_static;
@@ -55,6 +54,10 @@ pub enum HumanDecisionKind {
         load: LoadId,
     },
     GoHome(BuildingID),
+    GoWork {
+        workplace: BuildingID,
+        employer: Option<CompanyID>,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize, Inspect)]
@@ -105,16 +108,32 @@ impl Default for HumanDecisionKind {
 }
 
 impl HumanDecisionKind {
-    pub(crate) fn references_building(&self, building: BuildingID) -> bool {
+    pub(crate) fn references_any_building(
+        &self,
+        includes: impl Fn(BuildingID) -> bool + Copy,
+    ) -> bool {
         match self {
             Self::GoTo(Destination::Building(id))
             | Self::GoHome(id)
+            | Self::GoWork { workplace: id, .. }
             | Self::DeliverAtBuilding(id)
             | Self::DeliverLoad {
                 destination: id, ..
             }
-            | Self::VisitLeisure(id) => *id == building,
-            Self::MultiStack(steps) => steps.iter().any(|step| step.references_building(building)),
+            | Self::VisitLeisure(id) => includes(*id),
+            Self::MultiStack(steps) => steps
+                .iter()
+                .any(|step| step.references_any_building(includes)),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn references_employer(&self, employer: CompanyID) -> bool {
+        match self {
+            Self::GoWork {
+                employer: Some(id), ..
+            } => *id == employer,
+            Self::MultiStack(steps) => steps.iter().any(|step| step.references_employer(employer)),
             _ => false,
         }
     }
@@ -143,29 +162,30 @@ impl HumanDecisionKind {
         cbuf_freight: &ParCommandBuffer<FreightStationEnt>,
         cbuf: &ParCommandBuffer<HumanEnt>,
         driver: HumanID,
-        home: BuildingID,
         work: Option<&mut Work>,
     ) -> bool {
         match *self {
             HumanDecisionKind::GoTo(dest) => {
-                let purpose = trip_purpose(dest, home, work.as_deref(), router);
+                let purpose = trip_purpose(dest, work.as_deref(), router);
                 router.go_to_for(dest, purpose)
             }
             HumanDecisionKind::GoHome(home) => {
                 router.go_to_for(Destination::Building(home), TripPurpose::Home)
             }
+            HumanDecisionKind::GoWork {
+                workplace,
+                employer,
+            } => {
+                if work.is_some_and(|work| work.workplace == workplace && work.employer == employer)
+                {
+                    router.go_to_work(workplace, employer)
+                } else {
+                    true
+                }
+            }
             HumanDecisionKind::MultiStack(ref mut decisions) => {
                 if let Some(d) = decisions.last_mut() {
-                    if d.update(
-                        router,
-                        binfos,
-                        map,
-                        cbuf_freight,
-                        cbuf,
-                        driver,
-                        home,
-                        work,
-                    ) {
+                    if d.update(router, binfos, map, cbuf_freight, cbuf, driver, work) {
                         decisions.pop();
                     }
                     false
@@ -234,12 +254,7 @@ impl HumanDecision {
     }
 }
 
-fn trip_purpose(
-    dest: Destination,
-    home: BuildingID,
-    work: Option<&Work>,
-    router: &Router,
-) -> TripPurpose {
+fn trip_purpose(dest: Destination, work: Option<&Work>, router: &Router) -> TripPurpose {
     if router.walk_only_pickup {
         return TripPurpose::Shopping;
     }
@@ -256,15 +271,8 @@ fn trip_purpose(
                 };
             }
         }
-        if building == work.workplace {
-            return TripPurpose::Work;
-        }
     }
-    if building == home {
-        TripPurpose::Home
-    } else {
-        TripPurpose::Other
-    }
+    TripPurpose::Other
 }
 
 impl HumanEnt {
@@ -308,17 +316,11 @@ impl HumanEnt {
         })
     }
 
-    fn go_home(&mut self) -> HumanDecisionKind {
+    pub(crate) fn go_home(&self) -> HumanDecisionKind {
         if self.location == Location::Building(self.home.house) {
             HumanDecisionKind::Yield
-        } else if self
-            .work
-            .as_ref()
-            .is_some_and(|work| work.workplace == self.home.house)
-        {
-            HumanDecisionKind::GoHome(self.home.house)
         } else {
-            self.home.apply()
+            HumanDecisionKind::GoHome(self.home.house)
         }
     }
 
@@ -580,7 +582,6 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             freight,
             cbuf,
             id,
-            h.home.house,
             h.work.as_mut(),
         ) {
             continue;
