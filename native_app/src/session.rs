@@ -1616,17 +1616,17 @@ mod p4_fix_ac_tests {
     }
 
     #[test]
-    fn p6_save_cut_marks_pre_zs_slots_incompatible() {
+    fn p6_save_cut_marks_wave_b_slots_incompatible() {
         let root = std::env::temp_dir().join(format!("p6-save-cut-{}", random_seed()));
         std::fs::create_dir(&root).unwrap();
-        let id = SlotId::new("pre-zs-09").unwrap();
+        let id = SlotId::new("wave-b-010").unwrap();
         let paths = saveload::slot_paths(&root, &id).unwrap();
         // A legacy Bincode header with no world and a replay with an unknown command
         // show whether the version is checked before either payload is decoded.
-        std::fs::write(&paths.bc, b"\x050.9.0").unwrap();
+        std::fs::write(&paths.bc, b"\x060.10.0").unwrap();
         std::fs::write(
             &paths.replay,
-            br#"{"commands":[[1,"UnknownCommand"]],"version":"0.9.0"}"#,
+            br#"{"commands":[[1,"UnknownCommand"]],"version":"0.10.0"}"#,
         )
         .unwrap();
 
@@ -1647,11 +1647,11 @@ mod p4_fix_ac_tests {
         ));
         assert!(matches!(
             Simulation::load_from_slot(&root, &id),
-            Err(SaveLoadError::Incompatible { version }) if version == "0.9.0"
+            Err(SaveLoadError::Incompatible { version }) if version == "0.10.0"
         ));
         assert!(matches!(
             Simulation::load_replay_from_slot(&root, &id),
-            Err(SaveLoadError::Incompatible { version }) if version == "0.9.0"
+            Err(SaveLoadError::Incompatible { version }) if version == "0.10.0"
         ));
         std::fs::remove_dir_all(root).unwrap();
     }

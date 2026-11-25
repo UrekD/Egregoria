@@ -438,8 +438,7 @@ fn test_world_survives_serde() {
     init_test_simulation();
     //common::logger::MyLog::init();
 
-    let mut replay: Replay = JSON::decode(REPLAY).unwrap();
-    replay.version = crate::VERSION.to_owned();
+    let replay: Replay = JSON::decode(REPLAY).unwrap();
     let mut s = SeqSchedule::default();
 
     let mut check_size = 1024;
