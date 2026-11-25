@@ -71,6 +71,11 @@ pub(crate) fn prepare_ground(
     world_generation: u64,
 ) {
     let mode = current_overlay(*uiw.read::<OverlayMode>(), uiw);
+    renderer.set_water_overview(if mode == OverlayMode::WaterBodies {
+        super::water_bodies::prepare(&sim.map(), world_generation)
+    } else {
+        None
+    });
     let preview = (*uiw.read::<Tool>() == Tool::SpecialBuilding && !crate::session::modal(uiw))
         .then(|| uiw.read::<PlacementPreview>());
     let preview = preview.as_deref();
@@ -185,7 +190,10 @@ pub(crate) fn prepare_ground(
             OverlayMode::Power | OverlayMode::Water | OverlayMode::Sewage => {
                 atlas.paint_roads(sim, &map, mode, focus);
             }
-            OverlayMode::Off | OverlayMode::Traffic | OverlayMode::Transit => unreachable!(),
+            OverlayMode::Off
+            | OverlayMode::Traffic
+            | OverlayMode::Transit
+            | OverlayMode::WaterBodies => unreachable!(),
         }
         cache.revision = cache.revision.wrapping_add(1);
         if renderer.set_ground_overlay(gfx, Some(atlas.image(cache.revision)), mode_changed) {

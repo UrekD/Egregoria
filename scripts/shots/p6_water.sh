@@ -56,7 +56,7 @@ for after in (wet, protected):
     require(after["zone_coordinates"] == mixed["zone_coordinates"], "Rejected action changed zones")
     require(after["water_revision"] == mixed["water_revision"], "Rejected action changed the water revision")
 require(
-    protected["freight_stations"] == 1 and protected["water_samples"][3] is None,
+    protected["freight_stations"] == 1 and protected["water_samples"] == [None],
     "Protected freight station is missing or wet",
 )
 
@@ -76,7 +76,7 @@ zone = load("waters-bank-zone")
 require(
     starters["preset"] == "Waters"
     and starters["water_tiles"] > 0
-    and starters["water_samples"][4] == "Sea"
+    and starters["water_samples"] == ["Sea"]
     and starters["overlay"] == "WaterBodies",
     "New Game did not open the Waters preset with a wet coastline and active overlay",
 )

@@ -6,6 +6,7 @@ pub(crate) use legend::UTILITY_EXPLANATION;
 mod traffic;
 mod transit;
 pub(crate) mod view;
+mod water_bodies;
 
 use std::cell::RefCell;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -14,7 +15,7 @@ use common::{ChunkID_256, FastMap};
 use geom::{InfiniteFrustrum, Intersect3, LinearColor, Radians, Shape, AABB, AABB3, OBB};
 use goryak::{combo_box, tooltip};
 use prototypes::{try_prototype, GoodsCompanyID, Power, ServiceID, ServiceKind, TICKS_PER_HOUR};
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
 use simulation::map::{Building, BuildingID, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
@@ -30,13 +31,14 @@ use crate::rendering::immediate::ImmediateDraw;
 
 use crate::uiworld::UiWorld;
 
-#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) enum OverlayMode {
     #[default]
     Off,
     Power,
     Water,
     Sewage,
+    WaterBodies,
     Coverage(#[serde(deserialize_with = "deserialize_coverage")] ServiceKind),
     Pollution,
     LandValue,
@@ -79,7 +81,7 @@ fn placement_overlay(company: GoodsCompanyID) -> Option<OverlayMode> {
     }
 }
 
-fn current_overlay(manual: OverlayMode, uiworld: &UiWorld) -> OverlayMode {
+pub(crate) fn current_overlay(manual: OverlayMode, uiworld: &UiWorld) -> OverlayMode {
     let tool = *uiworld.read::<Tool>();
     let preview = (tool == Tool::SpecialBuilding).then(|| uiworld.read::<PlacementPreview>());
     effective_overlay(
@@ -178,6 +180,7 @@ pub(crate) fn reset_world_cache() {
     CACHE.with_borrow_mut(|cache| *cache = OverlayCache::default());
     view::reset_world_cache();
     ground::reset_world_cache();
+    water_bodies::reset();
 }
 
 #[cfg(test)]
@@ -185,6 +188,7 @@ pub(crate) fn world_cache_is_clear() -> bool {
     CACHE.with_borrow(|cache| cache.changes.is_none() && cache.tiles.chunks.is_empty())
         && view::world_cache_is_clear()
         && ground::world_cache_is_clear()
+        && water_bodies::world_cache_is_clear()
 }
 
 const FOOTPRINT_PADDING: f32 = 6.0;
@@ -192,7 +196,7 @@ const FOOTPRINT_PADDING: f32 = 6.0;
 impl OverlayMode {
     fn data_version(self, sim: &Simulation, map: &Map) -> u64 {
         match self {
-            Self::Off | Self::Traffic => 0,
+            Self::Off | Self::Traffic | Self::WaterBodies => 0,
             Self::Power => power_version(map, &sim.read::<ElectricityFlow>()),
             Self::Transit => transit::invalidation_key(&sim.read::<Transit>()),
             Self::Coverage(kind) => service_reach_version(sim, kind),
@@ -265,6 +269,17 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
     let mut draw = uiworld.write::<ImmediateDraw>();
 
     CACHE.with_borrow_mut(|cache| {
+        if mode == OverlayMode::WaterBodies {
+            if cache.mode != mode {
+                draw.clear_persistent();
+                cache.tiles.clear();
+                cache.mode = mode;
+                cache.changes = None;
+            }
+            water_bodies::draw(&uiworld.camera().camera, &mut draw);
+            return;
+        }
+
         if mode == OverlayMode::Off {
             if cache.mode != mode {
                 draw.clear_persistent();
@@ -540,11 +555,12 @@ pub(crate) fn is_coverage_receiver(kind: BuildingKind) -> bool {
 pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
     use OverlayMode::*;
 
-    const MODES: [(OverlayMode, &str); 15] = [
+    const MODES: [(OverlayMode, &str); 16] = [
         (Off, "Overlay off"),
         (Power, "Power"),
         (Water, "Water"),
         (Sewage, "Sewage"),
+        (WaterBodies, "Water Bodies"),
         (Coverage(ServiceKind::Health), "Health coverage"),
         (Coverage(ServiceKind::Fire), "Fire coverage"),
         (Coverage(ServiceKind::Police), "Police coverage"),
@@ -576,6 +592,7 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
     let mode = current_overlay(*manual, uiworld);
     let empty = ground::is_empty(mode);
     match mode {
+        WaterBodies => water_bodies::legend(),
         Transit => {
             let empty = uiworld.read::<ImmediateDraw>().persistent_orders.is_empty();
             transit::legend(empty);

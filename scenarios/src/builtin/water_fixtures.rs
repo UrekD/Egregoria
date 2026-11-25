@@ -1,4 +1,4 @@
-use crate::builders::{fill_houses, grant_money, place_company, seed_households};
+use crate::builders::{grant_money, place_company, seed_households};
 use crate::ScenarioCtx;
 use geom::{vec2, vec3, Vec2, OBB};
 use prototypes::{BuildingGen, FreightStationPrototypeID, GoodsCompanyID, Money};
@@ -429,6 +429,31 @@ fn build_perf_fixture(
             WorldCommand::MapBuildHouse(north),
         ],
     )?;
+    // The debug grid was created without water. Its end lots can extend beyond the
+    // usable sidewalk once strict water siting checks the finalized junctions.
+    let housing = {
+        let map = ctx.sim.map();
+        let mut candidates: Vec<_> = map
+            .lots()
+            .values()
+            .filter(|lot| map.has_dry_frontage(lot.parent, &lot.shape))
+            .map(|lot| lot.id)
+            .collect();
+        candidates.sort_unstable();
+        let needed = agents - 2;
+        if candidates.len() < needed {
+            return Err(format!(
+                "only {} lots with dry frontage for {needed} additional perf houses",
+                candidates.len()
+            ));
+        }
+        candidates.truncate(needed);
+        candidates
+            .into_iter()
+            .map(WorldCommand::MapBuildHouse)
+            .collect::<Vec<_>>()
+    };
+    apply_all(&mut ctx.sim, &housing)?;
     let mut houses: Vec<_> = ctx
         .sim
         .map()
@@ -437,7 +462,7 @@ fn build_perf_fixture(
         .filter(|building| building.kind == BuildingKind::House)
         .map(|building| building.id)
         .collect();
-    houses.extend(fill_houses(&mut ctx, agents - houses.len()));
+    houses.sort_unstable();
     if houses.len() != agents {
         return Err(format!("built {} of {agents} perf houses", houses.len()));
     }

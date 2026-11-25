@@ -17,19 +17,22 @@ use simulation::economy::cargo::CargoBook;
 use simulation::economy::{Budget, CityStats, Government, ZoneDemand};
 use simulation::map::{
     BuildingKind, LandMode, LandTileId, Map, ProjectFilter, ProjectKind, RoadID, TraverseKind,
-    Zone, ZoneGrid, ZoneKind,
+    WaterKind, Zone, ZoneGrid, ZoneKind,
 };
 use simulation::transportation::traffic_metrics::{sample_road_users, TruckCargo};
 use simulation::transportation::{Location, VehicleKind};
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand, WorldCommands};
-use simulation::{AnyEntity, HumanID, Simulation};
+use simulation::{AnyEntity, HumanID, MapPreset, Simulation, SimulationOptions};
 
 use crate::gui::follow::{follow_pos, FollowEntity};
 use crate::gui::{
-    overlays::OverlayMode, toolbox, toolbox::building::BuildingTab, top_demand_driver,
-    zoning::ZONES, GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool,
-    ToolSelection,
+    overlays::{current_overlay, OverlayMode},
+    toolbox,
+    toolbox::building::BuildingTab,
+    top_demand_driver,
+    zoning::ZONES,
+    GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool, ToolSelection,
 };
 use crate::session::{self, SessionScreen, SessionState, SlotCompatibility};
 use crate::sim_thread::{AppliedBatch, BatchId, Boundary, Reply, ReplyKind, Request, SimThread};
@@ -108,8 +111,18 @@ enum Step {
     LoadSlot(String),
     Assert(Assertion),
     Screenshot(String),
-    DumpState(String),
+    DumpState(StateDump),
     Exit,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum StateDump {
+    Name(String),
+    WithWaterSamples {
+        name: String,
+        water_samples: Vec<[f32; 2]>,
+    },
 }
 
 #[derive(Deserialize)]
@@ -762,8 +775,15 @@ impl Automation {
                 ctx.request_screenshot(self.output_path(&name, "png")?)?;
                 self.wait = Some(Wait::Screenshot);
             }
-            Step::DumpState(name) => {
-                self.dump_state(&self.output_path(&name, "json")?, uiw, sim)?;
+            Step::DumpState(dump) => {
+                let (name, samples) = match &dump {
+                    StateDump::Name(name) => (name, &[][..]),
+                    StateDump::WithWaterSamples {
+                        name,
+                        water_samples,
+                    } => (name, water_samples.as_slice()),
+                };
+                self.dump_state(&self.output_path(name, "json")?, uiw, sim, samples)?;
             }
             Step::Exit => {
                 ctx.request_exit();
@@ -844,15 +864,31 @@ impl Automation {
         Ok(self.dir.join(format!("{name}.{extension}")))
     }
 
-    fn dump_state(&self, path: &Path, uiw: &UiWorld, sim: &Simulation) -> Result<(), String> {
+    fn dump_state(
+        &self,
+        path: &Path,
+        uiw: &UiWorld,
+        sim: &Simulation,
+        water_samples: &[[f32; 2]],
+    ) -> Result<(), String> {
         #[derive(Serialize)]
         struct Snapshot<'a> {
             tick: u64,
             active_tool: Tool,
+            overlay: OverlayMode,
+            preset: MapPreset,
+            map_hash: u64,
             road_ids: BTreeSet<RoadID>,
+            rail_lanes: usize,
+            external_markets: usize,
+            freight_stations: usize,
+            water_revision: u64,
+            water_tiles: usize,
+            water_samples: Vec<Option<WaterKind>>,
             open_windows: Vec<&'static str>,
             city_stats: &'a CityStats,
             zone_cells: usize,
+            zone_coordinates: Vec<(i32, i32)>,
             zone_demand: &'a ZoneDemand,
             demand_drivers: BTreeMap<ZoneKind, (&'static str, f32)>,
             tax_rates: [u16; 4],
@@ -867,13 +903,48 @@ impl Automation {
             .collect();
         let demand = sim.read::<ZoneDemand>();
         let budget = sim.read::<Budget>();
+        let map = sim.map();
+        let env = map.environment();
+        let zones = sim.read::<ZoneGrid>();
+        let map_hash = Bincode::encode(&*map)
+            .map(|bytes| common::hash_u64(&bytes[..]))
+            .map_err(|error| format!("hashing map for state dump: {error}"))?;
+        let buildings = map.buildings().values();
         let state = Snapshot {
             tick: sim.get_tick(),
             active_tool: *uiw.read::<Tool>(),
-            road_ids: sim.map().roads().keys().collect(),
+            overlay: current_overlay(*uiw.read::<OverlayMode>(), uiw),
+            preset: sim.read::<SimulationOptions>().preset,
+            map_hash,
+            road_ids: map.roads().keys().collect(),
+            rail_lanes: map
+                .lanes()
+                .values()
+                .filter(|lane| lane.kind.is_rail())
+                .count(),
+            external_markets: buildings
+                .clone()
+                .filter(|building| building.kind == BuildingKind::ExternalTrading)
+                .count(),
+            freight_stations: buildings
+                .filter(|building| matches!(building.kind, BuildingKind::RailFreightStation(_)))
+                .count(),
+            water_revision: env.water_revision(),
+            water_tiles: if env.has_water_configuration() {
+                env.chunks()
+                    .map(|(chunk, _)| env.water_tiles(chunk).count())
+                    .sum()
+            } else {
+                0
+            },
+            water_samples: water_samples
+                .iter()
+                .map(|&[x, y]| env.water_body_kind(vec2(x, y)))
+                .collect(),
             open_windows,
             city_stats: &sim.read::<CityStats>(),
-            zone_cells: sim.read::<ZoneGrid>().cells().len(),
+            zone_cells: zones.cells().len(),
+            zone_coordinates: zones.cells().keys().copied().collect(),
             zone_demand: &demand,
             demand_drivers: demand
                 .values
@@ -1569,7 +1640,7 @@ mod tests {
                 .any(|s| matches!(s, Step::Screenshot(label) if label == name)));
             assert!(steps
                 .iter()
-                .any(|s| matches!(s, Step::DumpState(label) if label == name)));
+                .any(|s| matches!(s, Step::DumpState(StateDump::Name(label)) if label == name)));
             if name == "grown-city" {
                 assert!(steps.iter().any(|s| matches!(s, Step::RunTicks(300_000))));
             }

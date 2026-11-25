@@ -1087,26 +1087,37 @@ mod zoning_tests {
 
     #[test]
     fn u1_zoning_cross_chunk_lot_and_erase_preview() {
-        use simulation::map::{Lot, RoadID};
+        use simulation::map::{LanePatternBuilder, LotLayout, MapProject};
 
         let mut map = Map::default();
         assert!(map.install_environment(Environment::new(1, 1)));
-        let at = vec2(59.0, 52.0);
-        let height = map.environment().height(at).unwrap();
-        let id = Lot::try_make(&mut map, RoadID::default(), at.z(height), Vec2::X, 20.0).unwrap();
-        let lot = &map.lots()[id];
-        let owner = ZoningChunk::new(lot.shape.center());
+        map.set_lot_layout(LotLayout::Uniform);
+        let ground = |y| {
+            let point = vec2(49.0, y);
+            MapProject::ground(point.z(map.environment().height(point).unwrap()))
+        };
+        let (from, to) = (ground(16.0), ground(176.0));
+        let (_, road) = map
+            .make_connection(from, to, None, &LanePatternBuilder::new().build())
+            .unwrap();
         let area = OBB::new(vec2(60.0, 52.0), Vec2::X, 8.0, 8.0);
+        let lot = map
+            .lots()
+            .values()
+            .find(|lot| lot.parent == road && lot.shape.contains(area.center()))
+            .expect("the road provides frontage across the chunk boundary");
+        let owner = ZoningChunk::new(lot.shape.center());
         let painted = ZoningChunk::new(area.center());
         assert_ne!(painted, owner);
 
         let mut grid = ZoneGrid::default();
         grid.paint_on_map(&map, &lot.shape, Some(ZoneKind::Commercial), Density::High)
             .unwrap();
+        assert!(grid.lot_zone(&lot.shape).is_some());
         let stamp =
             ZoneGrid::eligible_paint_stroke(&map, &[lot.shape], None, Density::High).unwrap();
-        let (preview, _) = preview_lots(&map, &grid, &stamp, lot.shape.center(), 20.0, false);
-        assert!(preview.replaced.contains(&id));
+        let (preview, _) = preview_lots(&map, &grid, &stamp, lot.shape.center(), 2.0, false);
+        assert!(preview.replaced.contains(&lot.id));
         assert_eq!(preview.outlines.len(), 1);
         assert_eq!(preview.outlines[0].width, 0.3);
 
