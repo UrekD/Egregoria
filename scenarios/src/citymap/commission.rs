@@ -3060,61 +3060,75 @@ pub(super) fn verify_cross_bank_trip(
         .cross_bank
         .as_ref()
         .ok_or("wet opening has no far-bank destination")?;
-    let line = &manifest.lines["neighbourhood"];
-    let riders = {
+    let line = manifest.lines["neighbourhood"].id;
+    let (riders, trip_limit) = {
         let map = sim.map();
         let transit = sim.read::<Transit>();
-        let stops: Vec<_> = line
-            .stops
-            .iter()
-            .filter(|&&stop| stop != bank.stop)
-            .map(|&stop| transit.stops[stop].walk_pos)
-            .collect();
-        let mut candidates: Vec<_> = sim
+        let (legs, dwell) = transit
+            .directed_leg_times(line)
+            .ok_or("neighbourhood bus has no directed trip times")?;
+        // Give a rider one scheduled circuit, plus time to walk to and from it.
+        let limit = legs.iter().sum::<u64>() + dwell * legs.len() as u64 + 2 * TICKS_PER_HOUR;
+        let candidates: Vec<_> = sim
             .world()
             .humans
             .iter()
             .filter_map(|(id, human)| {
                 if human.router.personal_car.is_some()
                     || human.location != Location::Building(human.home.house)
+                    || human.router.trip_start.is_some()
                 {
                     return None;
                 }
-                let door = map.get(human.home.house)?.door_pos;
-                let access = stops
-                    .iter()
-                    .map(|stop| stop.distance2(door))
-                    .fold(f32::INFINITY, f32::min);
-                Some((access, id))
+                Some((id, human.home.house, map.get(human.home.house)?.door_pos))
             })
             .collect();
-        candidates.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-        candidates
-            .into_iter()
-            .take(12)
-            .map(|(_, id)| id)
-            .collect::<BTreeSet<_>>()
+        let mut riders = BTreeSet::new();
+        for &stop in transit.lines[line]
+            .stops
+            .iter()
+            .filter(|&&stop| stop != bank.stop)
+        {
+            let walk = transit.stops[stop].walk_pos;
+            let mut nearby: Vec<_> = candidates
+                .iter()
+                .map(|&(id, home, door)| (walk.distance2(door), id, home))
+                .collect();
+            nearby.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let mut homes = BTreeSet::new();
+            riders.extend(
+                nearby
+                    .into_iter()
+                    .filter(|&(_, _, home)| homes.insert(home))
+                    .take(8)
+                    .map(|(_, id, _)| id),
+            );
+        }
+        (riders, limit)
     };
     if riders.is_empty() {
         return Err("no carless residents at home for the cross-Sava bus fixture".into());
     }
     // Give existing carless residents an ordinary destination in this disposable reload.
     // The router chooses the mode and the scheduled service must carry them there.
-    for &id in &riders {
-        let human = &mut sim.world_mut_unchecked().humans[id];
-        human.router.use_vehicle(None);
-        human.decision.kind = HumanDecisionKind::GoTo(Destination::Building(bank.park));
-        human.decision.wait = 0;
+    {
+        let humans = &mut sim.world_mut_unchecked().humans;
+        for &id in &riders {
+            let human = &mut humans[id];
+            human.router.use_vehicle(None);
+            human.decision.kind = HumanDecisionKind::GoTo(Destination::Building(bank.park));
+            human.decision.wait = 0;
+        }
     }
     let mut schedule = Simulation::schedule();
     let mut passengers = PassengerEvidence::new(&sim);
-    for _ in 0..4 * TICKS_PER_HOUR {
+    for _ in 0..trip_limit {
         sim.tick(&mut schedule, []);
         passengers.observe(
             &sim,
             &sim.read::<Transit>(),
             elapsed_tick(&sim).0,
-            Some((bank, line.id, &riders)),
+            Some((bank, line, &riders)),
         );
         if let Some(arrival) = passengers.cross_bank_arrival {
             return serde_json::to_value(arrival).map_err(|error| error.to_string());
