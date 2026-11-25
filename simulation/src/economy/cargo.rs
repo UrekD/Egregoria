@@ -62,6 +62,8 @@ const DELIVERY_EXPIRY: u64 = 6 * TICKS_PER_HOUR;
 const FREIGHT_PACE_METERS_PER_SECOND: f32 = 8.0;
 const HANDLING_TICKS: u64 = 30 * TICKS_PER_REALTIME_SECOND;
 const DEPARTURES_PER_DRIVER: u32 = 2;
+const DEPARTURE_CUTOFF_MINUTES: i32 = 5;
+const DEPARTURE_CUTOFF: u64 = DEPARTURE_CUTOFF_MINUTES as u64 * TICKS_PER_MINUTE;
 // Router errors such as a full car park clear on their own. Give up on a leg
 // only after it has failed continuously for this long.
 const ROUTING_RETRY_WINDOW: u64 = 10 * TICKS_PER_MINUTE;
@@ -1138,6 +1140,10 @@ struct DriverWindow {
 }
 
 impl DriverWindow {
+    fn can_depart(&self) -> bool {
+        self.departures > 0 && self.ticks >= DEPARTURE_CUTOFF
+    }
+
     // Start with the current shift, or the next one if the driver is off duty.
     // Ten hours also bounds the planning horizon for an always-active roster.
     fn new(work: &crate::souls::desire::Work, time: &GameTime, busy_ticks: u64) -> Self {
@@ -1174,22 +1180,21 @@ impl DepartureQueue {
             return false;
         }
         (queued % self.capacity != 0 && self.fits.contains(&destination))
-            || self
-                .windows
-                .iter()
-                .any(|window| window.departures > 0 && window.ticks >= HANDLING_TICKS)
+            || self.windows.iter().any(DriverWindow::can_depart)
     }
 
     fn plan(&mut self, ticks: u64) -> bool {
         let Some(window) = self
             .windows
             .iter_mut()
-            .filter(|window| window.departures > 0 && window.ticks >= ticks)
+            .filter(|window| window.can_depart())
             .min_by_key(|window| window.ticks)
         else {
             return false;
         };
-        window.ticks -= ticks;
+        // The last haul may return after the shift. Each earlier haul must
+        // get its truck and driver back before another departure can fit.
+        window.ticks = window.ticks.saturating_sub(ticks);
         window.departures -= 1;
         true
     }
@@ -2030,7 +2035,7 @@ fn dispatch(
                         ..
                     }
                 ) && work.work_inter.is_active(&time.daytime)
-                    && !work.shift_ending(&time, 5)
+                    && !work.shift_ending(&time, DEPARTURE_CUTOFF_MINUTES)
                     && human.location == Location::Building(source.building)
                     && world.vehicles[truck].vehicle.state.is_parked()
             })
@@ -4301,7 +4306,7 @@ mod lifecycle_tests {
     fn freight2_replenishment_respects_the_shift_and_departure_limit() {
         let mut f = Fixture::new();
         f.ctx.g.world_mut_unchecked().edit_human(f.driver, |human| {
-            human.work.as_mut().unwrap().work_inter = RecTimeInterval::new((8, 0), (8, 10));
+            human.work.as_mut().unwrap().work_inter = RecTimeInterval::new((8, 0), (8, 5));
         });
         f.seed(1_000, 1);
         f.update(FREIGHT_MATCH_INTERVAL);
@@ -4309,13 +4314,20 @@ mod lifecycle_tests {
         assert_eq!(f.hand(f.source), 1_000);
 
         f.ctx.g.world_mut_unchecked().edit_human(f.driver, |human| {
-            human.work.as_mut().unwrap().work_inter = RecTimeInterval::new((8, 0), (18, 0));
+            human.work.as_mut().unwrap().work_inter = RecTimeInterval::new((8, 0), (8, 10));
             human.location = Location::Outside;
         });
         f.update(2 * FREIGHT_MATCH_INTERVAL);
         assert_eq!(f.manifest_units(), 0);
-        assert_eq!(f.reserved(), DEPARTURES_PER_DRIVER * mine_policy().capacity);
+        assert_eq!(f.reserved(), mine_policy().capacity, "one departure fits");
+
+        f.ctx.g.world_mut_unchecked().edit_human(f.driver, |human| {
+            human.work.as_mut().unwrap().work_inter = RecTimeInterval::new((8, 0), (18, 0));
+        });
         f.update(3 * FREIGHT_MATCH_INTERVAL);
+        assert_eq!(f.manifest_units(), 0);
+        assert_eq!(f.reserved(), DEPARTURES_PER_DRIVER * mine_policy().capacity);
+        f.update(4 * FREIGHT_MATCH_INTERVAL);
         assert_eq!(f.reserved(), DEPARTURES_PER_DRIVER * mine_policy().capacity);
     }
 
