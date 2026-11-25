@@ -778,7 +778,7 @@ fn removing_a_driver_mid_drive_clears_the_truck_from_the_lane() {
     for &id in &company.comp.trucks {
         let vehicle = test.g.get(id).unwrap();
         assert!(
-            matches!(vehicle.vehicle.state, VehicleState::Parked(_)),
+            vehicle.vehicle.state.is_parked(),
             "truck {id:?} at {:?}, speed {}, state {:?}, destination {:?}, next {:?}",
             vehicle.trans.pos,
             vehicle.speed.0,
@@ -794,6 +794,7 @@ fn removing_a_driver_mid_drive_clears_the_truck_from_the_lane() {
 fn a_truck_without_a_return_route_is_replaced_at_its_depot() {
     let mut test = TestCtx::new();
     let (company, driver, worker, truck, _) = staffed_factory(&mut test);
+    let original_fleet = test.g.get(company).unwrap().comp.trucks.clone();
     unpark(&mut test.g, truck);
     let roads: Vec<_> = test
         .g
@@ -812,10 +813,18 @@ fn a_truck_without_a_return_route_is_replaced_at_its_depot() {
 
     assert!(test.g.get(truck).is_none());
     let company = test.g.get(company).unwrap();
-    let [replacement] = company.comp.trucks.as_slice() else {
-        panic!("expected one replacement truck");
-    };
-    let vehicle = test.g.get(*replacement).unwrap();
+    assert_eq!(company.comp.trucks.len(), original_fleet.len());
+    let replacement = company
+        .comp
+        .trucks
+        .iter()
+        .copied()
+        .find(|id| !original_fleet.contains(id))
+        .expect("a replacement for the stranded truck");
+    assert!(original_fleet
+        .iter()
+        .all(|&id| id == truck || company.comp.trucks.contains(&id)));
+    let vehicle = test.g.get(replacement).unwrap();
     assert!(matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot));
     assert!(vehicle.collider.is_none());
     assert_eq!(
