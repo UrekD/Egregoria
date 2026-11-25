@@ -95,13 +95,7 @@ pub(crate) fn requirements_with_retail(
     let mut admission_blocker = None;
     if let Some(level) = next_level {
         let business = active_business(building, &infos, sim.world());
-        let services = network_services(
-            building,
-            &context,
-            &sim.read::<ElectricityFlow>(),
-            &sim.read::<UtilityFlow>(),
-            &mut BTreeMap::new(),
-        );
+        let services = network_services(sim, &map, building, &mut BTreeMap::new());
         requirements = context.requirements(
             building,
             business,
@@ -134,28 +128,27 @@ pub(crate) fn requirements_with_retail(
 }
 
 #[derive(Clone, Copy, Default)]
-struct Services {
+pub(super) struct Services {
     power: bool,
-    water: bool,
-    sewage: bool,
+    pub(super) water: bool,
+    pub(super) sewage: bool,
 }
 
-fn network_services(
+pub(super) fn network_services(
+    sim: &Simulation,
+    map: &Map,
     building: &Building,
-    context: &Assessment<'_>,
-    electricity: &ElectricityFlow,
-    utilities: &UtilityFlow,
     cache: &mut BTreeMap<ElectricityNetworkID, Services>,
 ) -> Services {
-    let Some(network) = connected_site_network(context.map, building) else {
+    let Some(network) = connected_site_network(map, building) else {
         return Services::default();
     };
     *cache.entry(network).or_insert_with(|| {
         let Some(live) = NetworkLoad::live(
-            context.map,
-            context.residences,
-            context.infos,
-            context.world,
+            map,
+            &sim.read::<Residences>(),
+            &sim.read::<BuildingInfos>(),
+            sim.world(),
             network,
         ) else {
             return Services::default();
@@ -164,15 +157,22 @@ fn network_services(
             power: live.has_power(),
             ..Services::default()
         };
-        if !utilities.water_pending(context.map) {
-            if let Some(sample) =
-                utility_network_readout(context.map, electricity, utilities, Some(network))
-                    .utility_totals
+        let utilities = sim.read::<UtilityFlow>();
+        if !utilities.water_pending(map) {
+            if let Some(sample) = utility_network_readout(
+                map,
+                &sim.read::<ElectricityFlow>(),
+                &utilities,
+                Some(network),
+            )
+            .utility_totals
             {
                 let mut pipes = live.pipes;
                 pipes.water_production = pipes.water_production.min(sample.water_production);
                 pipes.sewage_capacity = pipes.sewage_capacity.min(sample.sewage_capacity);
-                services.water = services.power && pipes.has_water();
+                // A zero-draw network can serve pipes through a zero-watt pump.
+                services.water =
+                    live.power_demand_watts <= live.power_supply_watts && pipes.has_water();
                 services.sewage = services.water && pipes.has_sewage();
             }
         }
@@ -547,8 +547,6 @@ fn update_with_limits(
             coverage: &sim.read::<CoverageGrid>(),
             environment: &sim.read::<EnvGrid>(),
         };
-        let electricity = sim.read::<ElectricityFlow>();
-        let utilities = sim.read::<UtilityFlow>();
         let mut services = BTreeMap::new();
         let mut checks_by_id = Vec::new();
         for building in map
@@ -571,8 +569,7 @@ fn update_with_limits(
                 checks.low_staffing_hours = 0;
                 checks.upgrade_streak = 0;
             }
-            let utility =
-                network_services(building, &context, &electricity, &utilities, &mut services);
+            let utility = network_services(sim, &map, building, &mut services);
             let residence = homes.by_building.get(&id);
             let served = utility.water && utility.sewage && (residence.is_some() || utility.power);
             checks.outage_streak = if served {
@@ -679,8 +676,6 @@ fn update_with_limits(
             coverage: &sim.read::<CoverageGrid>(),
             environment: &sim.read::<EnvGrid>(),
         };
-        let electricity = sim.read::<ElectricityFlow>();
-        let utilities = sim.read::<UtilityFlow>();
         let mut services = BTreeMap::new();
         let mut streaks = Vec::new();
         let mut ready = Vec::new();
@@ -694,8 +689,7 @@ fn update_with_limits(
             }
             let next = level + 1;
             let business = active_business(building, &infos, sim.world());
-            let services =
-                network_services(building, &context, &electricity, &utilities, &mut services);
+            let services = network_services(sim, &map, building, &mut services);
             let eligible = context
                 .requirements(
                     building,
@@ -780,6 +774,10 @@ mod tests {
     }
 
     fn street() -> (TestCtx, RoadID) {
+        street_with_prototypes("")
+    }
+
+    fn street_with_prototypes(overrides: &str) -> (TestCtx, RoadID) {
         let test = TestCtx::new_fast();
         let mut lua = String::from(
             r#"
@@ -799,6 +797,7 @@ mod tests {
             "#,
             );
         }
+        lua.push_str(overrides);
         prototypes::test_prototypes(&lua);
         test.build_roads(&[vec3(70.0, 100.0, 0.0), vec3(830.0, 100.0, 0.0)]);
         let road = test
@@ -869,6 +868,73 @@ mod tests {
             panic!("could not spawn {name}");
         };
         company
+    }
+
+    #[test]
+    fn zones2_z2_idle_grid_serves_homes_until_the_live_pump_closes() {
+        use crate::souls::happiness::{happiness_update, Happiness, UPDATE_OFFSET};
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_idle_grid_serves_homes_until_the_live_pump_closes"
+            ),
+            || {
+                let (mut test, road) = street_with_prototypes(
+                    r#"
+                    for _, proto in ipairs(data) do
+                        if proto.type == "residence" or proto.name == "water-pump" then
+                            proto.power_consumption = 0
+                        end
+                    end
+                    "#,
+                );
+                let sim = &mut test.g;
+                let home = place(sim, ZoneKind::Residential, 240.0);
+                let worker = spawn_human(sim, home).unwrap();
+                let pump = provider(sim, road, "water-pump", 450.0);
+                let outlet = provider(sim, road, "sewage-outlet", 510.0);
+                for company in [pump, outlet] {
+                    sim.world.companies[company].workers.0.push(worker);
+                }
+                sim.write::<GameTime>().tick.0 = TICKS_PER_HOUR + UtilityFlow::UPDATE_OFFSET;
+                let (world, resources) = sim.world_res();
+                electricity_flow_system(world, resources);
+                utility_flow_update(sim);
+                assert!(sim.read::<UtilityFlow>().has_water(home));
+                assert!(sim.read::<UtilityFlow>().has_sewage(home));
+
+                let status = super::requirements(sim, home).unwrap();
+                for (name, met) in [("Power", false), ("Water", true), ("Sewage", true)] {
+                    assert_eq!(
+                        status
+                            .requirements
+                            .iter()
+                            .find(|r| r.name == name)
+                            .unwrap()
+                            .met,
+                        met,
+                        "{name} requirement on an idle grid"
+                    );
+                }
+                sim.write::<GameTime>().tick.0 = TICKS_PER_HOUR + UPDATE_OFFSET;
+                happiness_update(sim);
+                let served = sim.read::<Happiness>().score(home).unwrap();
+                for hour in 2..=13 {
+                    sim.write::<GameTime>().tick.0 = hour * TICKS_PER_HOUR - 2;
+                    residence::residence_update(sim);
+                }
+                assert!(!sim.map().get(home).unwrap().is_abandoned_growable());
+
+                crate::souls::lifecycle::despawn_company(sim, pump);
+                sim.apply_commands([]);
+                assert!(sim.get(pump).is_none());
+                assert!(sim.read::<UtilityFlow>().has_water(home));
+                sim.write::<GameTime>().tick.0 = 13 * TICKS_PER_HOUR + UPDATE_OFFSET;
+                happiness_update(sim);
+                assert_eq!(sim.read::<Happiness>().score(home).unwrap(), served - 10);
+            },
+        );
     }
 
     #[test]
