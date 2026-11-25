@@ -15,8 +15,8 @@ use common::FastMap;
 use geom::{Vec2, OBB};
 use ordered_float::OrderedFloat;
 use prototypes::{
-    BuildingGen, GrowableChainKey, GrowableCompanyPrototype, GrowableMassing, GrowableZoneKind,
-    Prototype, ResidencePrototype, Tick,
+    BuildingGen, GrowableChainKey, GrowableCompanyPrototype, GrowableMassing, GrowableMassingStyle,
+    GrowableZoneKind, ResidencePrototype, Tick,
 };
 
 pub(crate) const GROWTH_INTERVAL: u64 = CITY_UPDATE_INTERVAL_TICKS;
@@ -24,15 +24,75 @@ const COHORTS: u8 = 14;
 
 #[derive(Default)]
 pub(crate) struct GrowthCache {
+    map_identity: u64,
     zone_generation: u64,
     zones: FastMap<LotID, Option<ZoneCell>>,
     buildings: Vec<(BuildingID, Vec2)>,
     distances: FastMap<LotID, OrderedFloat<f32>>,
     zoned_lots: Vec<(LotID, ZoneCell)>,
     center_index: Vec<(BuildingID, Vec2)>,
-    grade_revision: (u64, u64, u64, u64, u64),
-    forms: FastMap<LotID, (ZoneCell, RoadID, Result<GrowableFormFit, GrowableLotError>)>,
+    forms: FastMap<LotID, CachedForm>,
     candidates: Vec<GrowthCandidate>,
+}
+
+impl GrowthCache {
+    fn bind_map(&mut self, map: &Map) {
+        if self.map_identity != map.identity() {
+            self.map_identity = map.identity();
+            self.zones.clear();
+            self.distances.clear();
+            self.forms.clear();
+        }
+    }
+}
+
+struct CachedForm {
+    zone: ZoneCell,
+    frontage: RoadID,
+    style: GrowableMassingStyle,
+    revision: (u64, u64, u64),
+    nodes: Vec<u32>,
+    fit: Result<GrowableFormFit, GrowableLotError>,
+}
+
+impl CachedForm {
+    fn new(
+        map: &Map,
+        site: GrowableSite,
+        profile: GrowableMassing,
+        revision: (u64, u64, u64),
+    ) -> Self {
+        Self {
+            zone: site.zone,
+            frontage: site.frontage,
+            style: profile.style,
+            revision,
+            nodes: growable_shell::grade_nodes(map.environment(), site.shape).collect(),
+            fit: initial_form(map, site, profile, 0),
+        }
+    }
+
+    fn check(
+        &mut self,
+        map: &Map,
+        site: GrowableSite,
+        profile: GrowableMassing,
+        revision: (u64, u64, u64),
+    ) -> Result<GrowableFormFit, GrowableLotError> {
+        if (self.zone, self.frontage, self.style) != (site.zone, site.frontage, profile.style) {
+            *self = Self::new(map, site, profile, revision);
+        } else if self.revision != revision {
+            self.revision = revision;
+            let nodes = growable_shell::grade_nodes(map.environment(), site.shape);
+            if !nodes.eq(self.nodes.iter().copied()) {
+                self.nodes.clear();
+                self.nodes
+                    .extend(growable_shell::grade_nodes(map.environment(), site.shape));
+                self.fit = initial_form(map, site, profile, 0);
+            }
+        }
+        self.fit
+    }
 }
 
 struct GrowthCandidate {
@@ -105,7 +165,8 @@ pub fn growth_update(sim: &mut Simulation) {
         let map = resources.read::<Map>();
         let zones = resources.read::<ZoneGrid>();
         let mut cache = resources.write::<GrowthCache>();
-        if cache.zone_generation != zones.generation() || cache.grade_revision.0 != map.identity() {
+        cache.bind_map(&map);
+        if cache.zone_generation != zones.generation() {
             cache.zone_generation = zones.generation();
             cache.zones.clear();
         }
@@ -138,6 +199,7 @@ fn grow_zoned_lots(
     let mut candidates = {
         let map = sim.map();
         let mut cache = sim.write::<GrowthCache>();
+        cache.bind_map(&map);
         let building_centers = || map.buildings().iter().map(|(id, b)| (id, b.obb.center()));
         if !building_centers().eq(cache.buildings.iter().copied()) {
             cache.buildings.clear();
@@ -148,10 +210,6 @@ fn grow_zoned_lots(
             cache.distances.clear();
         }
         let revision = growable_shell::grade_revision(&map);
-        if cache.grade_revision != revision {
-            cache.grade_revision = revision;
-            cache.forms.clear();
-        }
         let GrowthCache {
             distances,
             center_index,
@@ -175,13 +233,10 @@ fn grow_zoned_lots(
                 continue;
             };
             if let Some(profile) = site.profile {
-                let entry = forms
+                let form = forms
                     .entry(id)
-                    .or_insert_with(|| (cell, lot.parent, initial_form(&map, site, profile, 0)));
-                if (entry.0, entry.1) != (cell, lot.parent) {
-                    *entry = (cell, lot.parent, initial_form(&map, site, profile, 0));
-                }
-                if entry.2.is_err() {
+                    .or_insert_with(|| CachedForm::new(&map, site, profile, revision));
+                if form.check(&map, site, profile, revision).is_err() {
                     continue;
                 }
             }
@@ -369,7 +424,10 @@ pub fn check_growable_lot(
     lot: &Lot,
     zone: ZoneCell,
 ) -> Result<GrowableSite, GrowableLotError> {
-    let mut site = check_site(map, lot, zone)?;
+    with_initial_form(map, check_site(map, lot, zone)?)
+}
+
+fn with_initial_form(map: &Map, mut site: GrowableSite) -> Result<GrowableSite, GrowableLotError> {
     if let Some(profile) = site.profile {
         site.initial_form = Some(initial_form(map, site, profile, 0)?);
     }
@@ -383,7 +441,14 @@ fn check_site(map: &Map, lot: &Lot, zone: ZoneCell) -> Result<GrowableSite, Grow
     if map.get(lot.parent).is_none() {
         return Err(GrowableLotError::MissingRoad);
     }
-    let site = growable_that_fits(lot, zone)?;
+    check_site_footprint(map, lot, growable_that_fits(lot, zone)?)
+}
+
+fn check_site_footprint(
+    map: &Map,
+    lot: &Lot,
+    site: GrowableSite,
+) -> Result<GrowableSite, GrowableLotError> {
     lot.check_growable_footprint(map, site.generator)?;
     if let Some(home) = site.home.filter(|_| site.company.is_some()) {
         if !Building::valid_footprint(&lot.shape, home.base.bgen) {
@@ -393,9 +458,14 @@ fn check_site(map: &Map, lot: &Lot, zone: ZoneCell) -> Result<GrowableSite, Grow
     Ok(site)
 }
 
-pub(crate) fn growable_that_fits(
+fn growable_that_fits(lot: &Lot, zone: ZoneCell) -> Result<GrowableSite, GrowableLotError> {
+    check_dimensions(resolve_site(lot, zone, None)?)
+}
+
+fn resolve_site(
     lot: &Lot,
     zone: ZoneCell,
+    requested_kind: Option<BuildingKind>,
 ) -> Result<GrowableSite, GrowableLotError> {
     let registry = prototypes::prototypes();
     let (home, company) = match zone.kind {
@@ -415,14 +485,21 @@ pub(crate) fn growable_that_fits(
                 density: zone.density,
                 level: 1,
             };
-            let company = registry
-                .growable_company_for_chain(key)
-                .or_else(|| {
+            let company = if let Some(requested) = requested_kind {
+                requested
+                    .as_goods_company()
+                    .and_then(|id| {
+                        prototypes::try_prototype(prototypes::GrowableCompanyID::from(id))
+                    })
+                    .filter(|proto| proto.growable && proto.chain_key() == key)
+            } else {
+                registry.growable_company_for_chain(key).or_else(|| {
                     GrowableCompanyPrototype::iter().find(|proto| {
                         proto.growable && proto.massing.is_none() && proto.chain_key() == key
                     })
                 })
-                .ok_or(GrowableLotError::MissingPrototype)?;
+            }
+            .ok_or(GrowableLotError::MissingPrototype)?;
             (None, Some(company))
         }
     };
@@ -431,25 +508,8 @@ pub(crate) fn growable_that_fits(
         (BuildingKind::GoodsCompany(proto.base.id), proto.base.bgen)
     });
 
-    let [width, depth] = lot.shape.axis().map(Vec2::mag);
-    let fits = |minimum: f32, profile: Option<GrowableMassing>| {
-        if let Some(profile) = profile {
-            let quantize = |v: f32| (v * 10.0).round() / 10.0;
-            let (width, depth) = (quantize(width), quantize(depth));
-            let axis_range = 0.1..=f32::from(u16::MAX) / 10.0;
-            axis_range.contains(&width)
-                && axis_range.contains(&depth)
-                && width * depth + 0.001 >= minimum
-                && width >= profile.min_plot_width_m
-                && depth >= profile.min_plot_depth_m
-        } else {
-            width * depth + 0.001 >= minimum
-        }
-    };
-    if home.is_some_and(|proto| !fits(proto.lot_size_min, proto.massing))
-        || company.is_some_and(|proto| !fits(proto.lot_size_min, proto.massing))
-    {
-        return Err(GrowableLotError::TooSmall);
+    if requested_kind.is_some_and(|requested| requested != kind) {
+        return Err(GrowableLotError::MissingPrototype);
     }
     Ok(GrowableSite {
         lot: lot.id,
@@ -465,6 +525,41 @@ pub(crate) fn growable_that_fits(
             .or_else(|| company.and_then(|firm| firm.massing)),
         initial_form: None,
     })
+}
+
+fn check_dimensions(site: GrowableSite) -> Result<GrowableSite, GrowableLotError> {
+    let fits = |minimum, profile| parcel_fits(site.shape, minimum, profile);
+    if site
+        .home
+        .is_some_and(|proto| !fits(proto.lot_size_min, proto.massing))
+        || site
+            .company
+            .is_some_and(|proto| !fits(proto.lot_size_min, proto.massing))
+    {
+        return Err(GrowableLotError::TooSmall);
+    }
+    Ok(site)
+}
+
+fn parcel_fits(shape: OBB, minimum: f32, profile: Option<GrowableMassing>) -> bool {
+    let [frontage, depth_axis] = shape.axis();
+    let (width, depth) = (frontage.mag(), depth_axis.mag());
+    let area = frontage.cross(depth_axis).abs();
+    // Stored corners have already been rounded by the stock parcel builder.
+    // Bound that error in world coordinates, keeping the actual axes for fit.
+    let coordinate = shape.corners.iter().fold(1.0_f32, |maximum, point| {
+        maximum.max(point.x.abs()).max(point.y.abs())
+    });
+    let axis_epsilon = 2.0 * f32::EPSILON * coordinate;
+    let area_epsilon = axis_epsilon * (width + depth + axis_epsilon);
+    area + area_epsilon >= minimum
+        && profile.is_none_or(|profile| {
+            let axis_range = 0.1..=f32::from(u16::MAX) / 10.0;
+            axis_range.contains(&width)
+                && axis_range.contains(&depth)
+                && width + axis_epsilon >= profile.min_plot_width_m
+                && depth + axis_epsilon >= profile.min_plot_depth_m
+        })
 }
 
 fn initial_form(
@@ -501,10 +596,42 @@ pub(crate) fn plan_growable(
     let map = sim.map();
     let lot = map.get(lot).ok_or(GrowableLotError::MissingLot)?;
     let site = check_growable_lot(&map, lot, zone)?;
+    sample_and_prepare(sim, &map, lot, site)
+}
+
+pub(crate) fn plan_imported_growable(
+    sim: &Simulation,
+    lot: LotID,
+    zone: ZoneCell,
+    kind: BuildingKind,
+) -> Result<GrowablePlan, GrowableLotError> {
+    if zone.kind == ZoneKind::MixedUse || !zone.kind.supports_density(zone.density) {
+        return Err(GrowableLotError::UnsupportedDensity);
+    }
+    let map = sim.map();
+    let lot = map.get(lot).ok_or(GrowableLotError::MissingLot)?;
+    let site = resolve_site(lot, zone, Some(kind))?;
+    // Explicit legacy seeds use the established generator fit. Profiled seeds
+    // reserve the same minimum plot and checked shell as zoned growth.
+    let site = if site.profile.is_some() {
+        check_dimensions(site)?
+    } else {
+        site
+    };
+    let site = with_initial_form(&map, check_site_footprint(&map, lot, site)?)?;
+    sample_and_prepare(sim, &map, lot, site)
+}
+
+fn sample_and_prepare(
+    sim: &Simulation,
+    map: &Map,
+    lot: &Lot,
+    site: GrowableSite,
+) -> Result<GrowablePlan, GrowableLotError> {
     let value = site
         .profile
-        .map_or(0, |_| sim.read::<EnvGrid>().initial_lot_value(&map, lot));
-    prepare_site(&map, site, value)
+        .map_or(0, |_| sim.read::<EnvGrid>().initial_lot_value(map, lot));
+    prepare_site(map, site, value)
 }
 
 fn prepare_site(
@@ -625,6 +752,167 @@ mod tests {
         let test = TestCtx::new();
         test.build_roads(&[vec3(100.0, 100.0, 0.0), vec3(400.0, 100.0, 0.0)]);
         test
+    }
+
+    #[test]
+    fn zones2_z1_fix_profiled_area_and_frontage_use_measured_axes() {
+        let profile = GrowableMassing {
+            style: prototypes::GrowableMassingStyle::Tower,
+            floors_by_level: [12, 15, 18, 21, 24],
+            max_floors: 28,
+            min_plot_width_m: 20.0,
+            min_plot_depth_m: 20.0,
+        };
+        let center = vec2(278.1, 349.4);
+        let axis = vec2(1.0, 0.4).normalize();
+        let stock = OBB::new(center, axis, 30.0, 30.0);
+        assert!(parcel_fits(stock, 900.0, Some(profile)));
+
+        let undersized = OBB::new(center, axis, 29.96, 29.96);
+        assert!(!parcel_fits(undersized, 900.0, Some(profile)));
+        let narrow = OBB::new(center, axis, 35.0, 19.96);
+        assert!(!parcel_fits(narrow, 400.0, Some(profile)));
+    }
+
+    #[test]
+    fn zones2_z1_fix_replacement_ranks_lots_again_with_identical_buildings() {
+        let _test = TestCtx::new();
+        let street_map = |ys: [f32; 2]| {
+            let sim = Simulation::new_authored_flat(1, 0).unwrap();
+            {
+                let mut map = sim.map_mut();
+                map.lot_layout = crate::map::LotLayout::Uniform;
+                for y in ys {
+                    map.make_connection(
+                        MapProject::ground(vec3(100.0, y, 0.0)),
+                        MapProject::ground(vec3(400.0, y, 0.0)),
+                        None,
+                        &LanePatternBuilder::default().build(),
+                    )
+                    .unwrap();
+                }
+                let anchor = OBB::new(vec2(200.0, 40.0), Vec2::Y, 12.0, 12.0);
+                map.build_special_building(
+                    &anchor,
+                    BuildingKind::House,
+                    BuildingGen::House,
+                    None,
+                    None,
+                )
+                .unwrap();
+            }
+            sim
+        };
+        let mut sim = street_map([300.0, 100.0]);
+        let replacement = street_map([100.0, 300.0]);
+        let zone = ZoneCell {
+            kind: ZoneKind::Residential,
+            density: Density::Low,
+        };
+        residential_demand(&sim, 10.0);
+        let shortlist = |map: &Map| {
+            map.roads()
+                .keys()
+                .map(|road| {
+                    map.lots()
+                        .values()
+                        .find(|lot| lot.parent == road)
+                        .unwrap()
+                        .id
+                })
+                .map(|id| (id, zone))
+                .collect::<Vec<_>>()
+        };
+        let before = shortlist(&sim.map());
+        let after = shortlist(&replacement.map());
+        assert_eq!(before, after, "fixture must reuse the same lot keys");
+        assert!(sim.map().get(before[0].0).unwrap().shape.center().y > 200.0);
+        assert!(replacement.map().get(after[0].0).unwrap().shape.center().y < 200.0);
+
+        // With no live vote, the first pass fills the rank cache without consuming lots.
+        grow_zoned_lots(&mut sim, cohort(zone), before);
+        *sim.map_mut() = replacement.map().clone();
+        let near = after[0].0;
+        let far = after[1].0;
+        {
+            let map = sim.map();
+            let mut grid = sim.write::<ZoneGrid>();
+            for (id, _) in &after {
+                grid.paint_on_map(
+                    &map,
+                    &map.get(*id).unwrap().shape,
+                    Some(zone.kind),
+                    zone.density,
+                )
+                .unwrap();
+            }
+        }
+        grow_zoned_lots(&mut sim, cohort(zone), after);
+        let map = sim.map();
+        assert!(
+            map.get(near).is_none(),
+            "the nearer lot must win after map replacement"
+        );
+        assert!(map.get(far).is_some());
+    }
+
+    #[test]
+    fn zones2_z1_fix_remote_construction_cut_preserves_cached_forms() {
+        let test = street();
+        test.g.map_mut().update();
+        let zone = ZoneCell {
+            kind: ZoneKind::Residential,
+            density: Density::High,
+        };
+        let id = front_lot(&test.g);
+        let profile = GrowableMassing {
+            style: GrowableMassingStyle::Tower,
+            floors_by_level: [12, 15, 18, 21, 24],
+            max_floors: 28,
+            min_plot_width_m: 20.0,
+            min_plot_depth_m: 20.0,
+        };
+        let (site, revision, mut cached) = {
+            let map = test.g.map();
+            let lot = map.get(id).unwrap();
+            let site = check_site(&map, lot, zone).unwrap();
+            let revision = growable_shell::grade_revision(&map);
+            let cached = CachedForm::new(&map, site, profile, revision);
+            assert!(cached.fit.is_ok());
+            (site, revision, cached)
+        };
+        {
+            let mut map = test.g.map_mut();
+            let distant = OBB::new(vec2(400.0, 400.0), Vec2::Y, 12.0, 12.0);
+            map.build_special_building(
+                &distant,
+                BuildingKind::House,
+                BuildingGen::House,
+                None,
+                None,
+            )
+            .unwrap();
+            map.update();
+        }
+
+        // A sentinel makes a redundant fit visible even if it returns the same shape.
+        cached.fit = Err(GrowableLotError::InfeasibleGrade);
+        {
+            let map = test.g.map();
+            let next_revision = growable_shell::grade_revision(&map);
+            assert_ne!(next_revision, revision);
+            assert!(cached.check(&map, site, profile, next_revision).is_err());
+            assert_eq!(cached.revision, next_revision);
+        }
+
+        {
+            let mut map = test.g.map_mut();
+            use geom::Shape;
+            map.environment_mut_for_test()
+                .terrain_apply(site.shape.bbox().expand(32.0), |_| -1.0);
+            let next_revision = growable_shell::grade_revision(&map);
+            assert!(cached.check(&map, site, profile, next_revision).is_ok());
+        }
     }
 
     #[test]

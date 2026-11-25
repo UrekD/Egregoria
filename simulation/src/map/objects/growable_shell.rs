@@ -2,7 +2,7 @@
 use crate::map::procgen::ColoredMesh;
 use crate::map::terrain::CELL_SIZE;
 use crate::map::{Building, Density, Environment, Map, ZoneCell, ZoneKind};
-use geom::{vec2, LinearColor, Ray3, Shape, Vec2, Vec3, AABB3, OBB};
+use geom::{vec2, LinearColor, Ray3, Shape, Vec2, Vec3, AABB, AABB3, OBB};
 use prototypes::{
     GrowableMassing, GrowableMassingStyle, GROWABLE_FLOOR_HEIGHT_M, MAX_PROFILED_SLOTS,
     MIXED_USE_SHOP_FLOOR_HEIGHT_M,
@@ -42,15 +42,26 @@ impl GrowableForm {
     }
 }
 
-pub(crate) fn grade_revision(map: &Map) -> (u64, u64, u64, u64, u64) {
+pub(crate) fn grade_revision(map: &Map) -> (u64, u64, u64) {
     let env = map.environment();
     (
-        map.identity(),
         env.base_revision,
         env.water_revision(),
         map.construction_cut_revision,
-        map.walking_topology_generation,
     )
+}
+
+pub(crate) fn grade_nodes(env: &Environment, parcel: OBB) -> impl Iterator<Item = u32> + '_ {
+    let bounds = parcel.bbox();
+    // Include the next node on each axis. Bilinear cells along the plot edge,
+    // including the frontage landing, also depend on nodes outside the plot.
+    let ll = (bounds.ll / CELL_SIZE).floor();
+    let ur = (bounds.ur / CELL_SIZE).floor() + Vec2::splat(1.0);
+    grid_points(ll, ur).map(|point| {
+        env.heightmap
+            .height_nearest(point)
+            .map_or(f32::NAN.to_bits(), f32::to_bits)
+    })
 }
 
 /// An inset feasible at construction grade. The lot remains the reserved map footprint.
@@ -172,23 +183,10 @@ impl GrowableFormFit {
                 let ground = shape(ground);
                 let base_z = maximum_grade(ground, &terrain)?.max(0.0) + FOUNDATION_CLEARANCE_M;
                 let door_xy = (ground.corners[0] + ground.corners[1]) * 0.5;
-                let length = door_xy.distance(front);
                 let offset = across * WALK_HALF_WIDTH_M;
                 let a = front - offset;
                 let b = front + offset;
-                let (min, max) = segment_grade(a, b, &terrain)?;
-                if [min.max(0.0), max.max(0.0)]
-                    .into_iter()
-                    .any(|z| (base_z - z).abs() > WALK_MAX_GRADE * length)
-                {
-                    return None;
-                }
-                let door_left = door_xy - offset;
-                let door_right = door_xy + offset;
-                // Validate the full connector even though its high end is on the platform.
-                segment_grade(a, door_left, &terrain)?;
-                segment_grade(b, door_right, &terrain)?;
-                Some(Self {
+                let fit = Self {
                     form,
                     ground,
                     shaft,
@@ -197,12 +195,27 @@ impl GrowableFormFit {
                     walk: [
                         a.z(terrain(a)?.max(0.0)),
                         b.z(terrain(b)?.max(0.0)),
-                        door_right.z(base_z),
-                        door_left.z(base_z),
+                        (door_xy + offset).z(base_z),
+                        (door_xy - offset).z(base_z),
                     ],
                     frontage_landing: front.z(terrain(front)?.max(0.0)),
-                })
+                };
+                for triangle in fit.walkway_triangles() {
+                    check_walkway_triangle(triangle, &terrain)?;
+                }
+                Some(fit)
             })
+    }
+
+    fn walkway_triangles(self) -> [[Vec3; 3]; 4] {
+        let [a, b, c, d] = self.walk;
+        let front = self.frontage_landing;
+        [
+            [a, front, d],
+            [front, self.door, d],
+            [front, b, c],
+            [front, c, self.door],
+        ]
     }
 
     pub(crate) fn mesh(
@@ -242,7 +255,7 @@ impl GrowableFormFit {
             base
         };
 
-        let roof_z = if style == House {
+        let (roof_z, facade_top) = if style == House {
             walls(&mut mesh, self.ground, base, eaves, colors[0]);
             let [a, b, c, d] = self.ground.corners.map(|p| p.z(eaves));
             let height = 1.2 + self.form.index() as f32 * 0.35 + f32::from(level - 1) * 0.2;
@@ -255,7 +268,7 @@ impl GrowableFormFit {
                 (vec![a, left, d], colors[1]),
                 (vec![b, c, right], colors[1]),
             ]);
-            roof_z
+            (roof_z, eaves)
         } else {
             let body = if has_podium { self.shaft } else { self.ground };
             let (main_top, crown, crown_height) = match self.form {
@@ -279,7 +292,7 @@ impl GrowableFormFit {
             walls(&mut mesh, crown, main_top, roof_z, colors[1]);
             mesh.faces
                 .push((crown.corners.map(|p| p.z(roof_z)).to_vec(), colors[1]));
-            roof_z
+            (roof_z, if has_podium { shaft_bottom } else { main_top })
         };
 
         let [left, right, _, _] = self.ground.corners;
@@ -302,6 +315,9 @@ impl GrowableFormFit {
             } else {
                 rgb(0.38, 0.40, 0.41)
             };
+            let band_top = (facade_top - base).min(3.4);
+            let band_bottom = (band_top - 0.35).max(2.4);
+            let glass_top = (band_bottom - 0.05).min(3.0);
             let offset = across.z0() * (half_width + 1.15) * 0.5;
             let half_panel = (half_width - 1.15) * 0.5;
             for side in [-1.0, 1.0] {
@@ -311,11 +327,19 @@ impl GrowableFormFit {
                     across,
                     half_panel,
                     0.35,
-                    3.0,
+                    glass_top,
                     glass,
                 );
             }
-            facade_panel(&mut mesh, door, across, half_width, 3.05, 3.4, colors[1]);
+            facade_panel(
+                &mut mesh,
+                door,
+                across,
+                half_width,
+                band_bottom,
+                band_top,
+                colors[1],
+            );
         }
 
         let concrete = LinearColor::gray(0.37);
@@ -328,14 +352,12 @@ impl GrowableFormFit {
                 skirt(&mut mesh, a, b, concrete, &terrain)?;
             }
         }
+        mesh.faces.extend(
+            self.walkway_triangles()
+                .into_iter()
+                .map(|triangle| (triangle.to_vec(), concrete)),
+        );
         let [a, b, c, d] = self.walk;
-        let front = self.frontage_landing;
-        mesh.faces.extend([
-            (vec![a, front, d], concrete),
-            (vec![front, self.door, d], concrete),
-            (vec![front, b, c], concrete),
-            (vec![front, c, self.door], concrete),
-        ]);
         for (from, to) in [(d, a), (b, c)] {
             // Limit mesh size on deep parcels. Each panel still samples the exact
             // lowest grade along the full interval so its bottom stays buried.
@@ -380,35 +402,106 @@ fn cell_crossings(a: Vec2, b: Vec2) -> Vec<f32> {
     cuts
 }
 
-/// A bilinear patch has no strict interior maximum. Its vertices and the
-/// quadratic extrema of footprint edges inside each terrain cell suffice.
-fn maximum_grade(shape: OBB, height: &impl Fn(Vec2) -> Option<f32>) -> Option<f32> {
-    let mut max_z = f32::NEG_INFINITY;
-    let bounds = shape.bbox();
+fn grid_points(ll: Vec2, ur: Vec2) -> impl Iterator<Item = Vec2> {
+    (ll.y as i32..=ur.y as i32).flat_map(move |y| {
+        (ll.x as i32..=ur.x as i32).map(move |x| vec2(x as f32, y as f32) * CELL_SIZE)
+    })
+}
+
+fn maximum_grid_grade(
+    bounds: AABB,
+    contains: impl Fn(Vec2) -> bool,
+    height: &impl Fn(Vec2) -> Option<f32>,
+) -> Option<f32> {
     let ll = (bounds.ll / CELL_SIZE).ceil();
     let ur = (bounds.ur / CELL_SIZE).floor();
-    for y in ll.y as i32..=ur.y as i32 {
-        for x in ll.x as i32..=ur.x as i32 {
-            let p = vec2(x as f32, y as f32) * CELL_SIZE;
-            if shape.contains(p) {
-                max_z = max_z.max(height(p).filter(|z| z.is_finite())?);
-            }
-        }
+    let mut maximum = f32::NEG_INFINITY;
+    for point in grid_points(ll, ur).filter(|&point| contains(point)) {
+        maximum = maximum.max(height(point).filter(|z| z.is_finite())?);
     }
+    Some(maximum)
+}
+
+/// A bilinear patch has no strict interior maximum. Its grid nodes and the
+/// quadratic extrema of footprint edges inside each terrain cell suffice.
+fn maximum_grade(shape: OBB, height: &impl Fn(Vec2) -> Option<f32>) -> Option<f32> {
+    let mut max_z = maximum_grid_grade(shape.bbox(), |point| shape.contains(point), height)?;
     for edge in shape.segments() {
         max_z = max_z.max(segment_grade(edge.src, edge.dst, height)?.1);
     }
     Some(max_z)
 }
 
+fn check_walkway_triangle(
+    [a, b, c]: [Vec3; 3],
+    height: &impl Fn(Vec2) -> Option<f32>,
+) -> Option<()> {
+    const CLEARANCE_EPSILON_M: f32 = 0.001;
+    let normal = (b - a).cross(c - a);
+    let slope = -normal.xy() / normal.z;
+    if !slope.is_finite() || slope.mag2() > WALK_MAX_GRADE.powi(2) {
+        return None;
+    }
+
+    // Subtracting the ramp plane leaves a bilinear surface in every terrain
+    // cell. Interior grid nodes and the extrema along the triangle boundary
+    // include the maximum on each clipped cell, including across the ramp.
+    let plane = |point| a.z + slope.dot(point - a.xy());
+    let residual = |point| Some(height(point)? - plane(point));
+    let [a, b, c] = [a.xy(), b.xy(), c.xy()];
+    let edges = [(a, b), (b, c), (c, a)];
+    let bounds = AABB::new_ll_ur(a.min(b).min(c), a.max(b).max(c));
+    let contains = |point| {
+        edges
+            .into_iter()
+            .all(|(from, to)| (to - from).cross(point - from) * normal.z.signum() >= 0.0)
+    };
+    let mut maximum = maximum_grid_grade(bounds, contains, &residual)?;
+    for (from, to) in edges {
+        let (_, peak) = segment_cell_grade(from, to, |points| {
+            // Sample both ends in the interval's own cell. At the outer
+            // row or column the heightmap falls back to the lower-left node.
+            let origin = (points[1] / CELL_SIZE).floor() * CELL_SIZE;
+            let ll = height(origin)?;
+            let [lr, ul, ur] = [Vec2::X, Vec2::Y, Vec2::splat(1.0)]
+                .map(|offset| height(origin + CELL_SIZE * offset));
+            Some(points.map(|point| {
+                let grade = if let [Some(lr), Some(ul), Some(ur)] = [lr, ul, ur] {
+                    let local = (point - origin) / CELL_SIZE;
+                    let low = ll + local.x * (lr - ll);
+                    let high = ul + local.x * (ur - ul);
+                    low + local.y * (high - low)
+                } else {
+                    ll
+                };
+                grade - plane(point)
+            }))
+        })?;
+        maximum = maximum.max(peak);
+    }
+    (maximum <= CLEARANCE_EPSILON_M).then_some(())
+}
+
 fn segment_grade(a: Vec2, b: Vec2, height: &impl Fn(Vec2) -> Option<f32>) -> Option<(f32, f32)> {
+    segment_cell_grade(a, b, |[start, mid, end]| {
+        Some([height(start)?, height(mid)?, height(end)?])
+    })
+}
+
+fn segment_cell_grade(
+    a: Vec2,
+    b: Vec2,
+    sample: impl Fn([Vec2; 3]) -> Option<[f32; 3]>,
+) -> Option<(f32, f32)> {
     let mut min = f32::INFINITY;
     let mut max = f32::NEG_INFINITY;
     let cuts = cell_crossings(a, b);
     for pair in cuts.windows(2) {
         let (lo, hi) = (pair[0], pair[1]);
-        let sample = |t| height(point_along(a, b, t)).filter(|z| z.is_finite());
-        let [start, mid, end] = [sample(lo)?, sample((lo + hi) * 0.5)?, sample(hi)?];
+        let [start, mid, end] = sample([lo, (lo + hi) * 0.5, hi].map(|t| point_along(a, b, t)))?;
+        if ![start, mid, end].into_iter().all(f32::is_finite) {
+            return None;
+        }
         min = min.min(start).min(mid).min(end);
         max = max.max(start).max(mid).max(end);
         let square = 2.0 * (start + end - 2.0 * mid);
@@ -743,6 +836,59 @@ mod tests {
         })
         .unwrap();
         assert_eq!(peak, 4.5);
+    }
+
+    #[test]
+    fn zones2_z1_fix_connector_rejects_bilinear_ridge() {
+        let mut env = Environment::new(1, 1);
+        let center = vec2(112.6, 126.0);
+        let parcel = OBB::new(center, Vec2::Y, 40.0, 40.0);
+        env.terrain_apply(parcel.bbox().expand(2.0 * CELL_SIZE), |p| {
+            if p.xy() == vec2(112.0, 112.0) {
+                3.0
+            } else {
+                0.0
+            }
+        });
+        assert!(env.true_height(vec2(112.0, 112.0)).unwrap() > 2.98);
+        let fit = GrowableFormFit::check(
+            &env,
+            parcel,
+            zone(ZoneKind::Residential, Density::High),
+            GrowableMassingStyle::Tower,
+            0,
+        );
+        assert!(
+            fit.is_none(),
+            "the connector crosses the ridge for all three forms: {fit:?}"
+        );
+    }
+
+    #[test]
+    fn zones2_z1_fix_one_floor_industrial_panels_stay_on_the_ground_facade() {
+        let mut env = Environment::new(1, 1);
+        let parcel = OBB::new(vec2(112.0, 126.0), Vec2::Y, 30.0, 30.0);
+        env.terrain_apply(parcel.bbox().expand(2.0 * CELL_SIZE), |_| 0.0);
+        let cell = zone(ZoneKind::Industrial, Density::Low);
+        let style = GrowableMassingStyle::Industrial;
+        let mut fit = GrowableFormFit::check(&env, parcel, cell, style, 0).unwrap();
+        fit.form = GrowableForm::Stepped;
+        let (mesh, _) = fit.mesh(&env, cell, style, 1, 1).unwrap();
+        let facade_y = fit.door().y;
+        let panels = mesh.faces.iter().filter(|(vertices, _)| {
+            vertices
+                .iter()
+                .all(|p| (p.y - (facade_y - 0.025)).abs() < 0.001)
+        });
+        let mut count = 0;
+        for (vertices, _) in panels {
+            count += 1;
+            assert!(
+                vertices.iter().all(|p| p.z <= fit.base_z() + 2.5),
+                "panel extends above the first setback: {vertices:?}"
+            );
+        }
+        assert_eq!(count, 4);
     }
 
     #[test]

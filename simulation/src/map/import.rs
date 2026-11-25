@@ -171,13 +171,8 @@ impl Simulation {
             kind: zone,
             density,
         };
-        {
-            let map = self.map();
-            if growth::growable_that_fits(map.get(lot)?, cell).ok()?.kind != kind {
-                return None;
-            }
-        }
-        self.place_zoned_growable(lot, cell).ok()
+        let plan = growth::plan_imported_growable(self, lot, cell, kind).ok()?;
+        self.commit_prepared_growable(plan).ok()
     }
 
     /// Seed a mapped residence whose parcel is outside the generated frontage lots.
@@ -407,6 +402,82 @@ mod tests {
     use crate::{MapPreset, NewGameOptions, Simulation};
     use common::saveload::{Bincode, Encoder};
     use geom::vec2;
+
+    #[test]
+    fn zones2_z1_fix_rotated_legacy_frontage_import_keeps_legacy_fit() {
+        let _test = TestCtx::new();
+        let start = vec2(620.0, 700.0);
+        let end = vec2(1020.0, 820.0);
+        let city = ImportedCity {
+            junctions: [start, end]
+                .into_iter()
+                .enumerate()
+                .map(|(id, position)| ImportedJunction {
+                    id,
+                    position,
+                    roundabout_radius: None,
+                    light_policy: LightPolicy::Auto,
+                })
+                .collect(),
+            links: vec![ImportedLink {
+                source_way_ids: vec![1],
+                from: 0,
+                to: 1,
+                points: vec![start, end],
+                pattern: LanePatternBuilder::new().build(),
+                frontage: true,
+            }],
+            boundary_stubs: vec![],
+        };
+        let (mut sim, _) = Simulation::from_imported_city(&city, &flat_options()).unwrap();
+        let lot = {
+            let map = sim.map();
+            map.lots()
+                .values()
+                .find(|lot| {
+                    let [width, depth] = lot.shape.axis().map(Vec2::mag);
+                    (399.98..399.999).contains(&(width * depth))
+                })
+                .expect("rotated stock 20 m lot with floating-point area loss")
+                .id
+        };
+        let placed = sim
+            .seed_imported_growable_with_slots(lot, BuildingKind::House, Density::High)
+            .expect("legacy frontage house should fit");
+        assert_eq!(placed.housing_slots, 4);
+        assert!(sim.map().get(lot).is_none());
+    }
+
+    #[test]
+    fn zones2_z1_off_lot_import_uses_legacy_capacity_and_utilities() {
+        let _init = TestCtx::new();
+        let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let road = {
+            let mut map = sim.map_mut();
+            map.make_connection(
+                crate::map::MapProject::ground(vec2(100.0, 100.0).z(0.0)),
+                crate::map::MapProject::ground(vec2(400.0, 100.0).z(0.0)),
+                None,
+                &LanePatternBuilder::default().build(),
+            )
+            .unwrap();
+            map.roads().keys().next().unwrap()
+        };
+        let shape = OBB::new(vec2(250.0, 35.0), Vec2::Y, 12.0, 12.0);
+        let id = sim
+            .seed_imported_residence(shape, road, Density::High)
+            .unwrap();
+        let map = sim.map();
+        let building = map.get(id).unwrap();
+        assert!(map.lot_origin(id).is_none());
+        assert!(building.development().is_none());
+        let residences = sim.read::<residence::Residences>();
+        let home = &residences.by_building[&id];
+        assert_eq!(home.capacity, 4);
+        let load = crate::map_dynamic::effective_load(building, Some(home), None);
+        assert_eq!(load.residential_power.watts(), 400);
+        assert_eq!(load.residential_water, 4.0);
+    }
 
     #[test]
     fn osm_ordinary_junction_edits_continue_after_reload() {
