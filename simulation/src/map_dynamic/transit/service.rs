@@ -180,8 +180,8 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
                     .get_mut(&line_id)
                     .and_then(|times| times.learned.get_mut(previous))
                 {
-                    // Smooth travel observations from completed legs. The skip
-                    // watchdog uses nominal travel times.
+                    // Smooth travel observations from completed legs, including
+                    // delays from traffic.
                     *expected = (7 * u128::from(*expected) + u128::from(actual)).div_ceil(8) as u64;
                 }
             }
@@ -198,7 +198,17 @@ pub fn transit_dispatch_update(world: &mut World, resources: &mut Resources) {
                     || nominal_leg_ticks(&transit, run, vehicle.trans.pos, stop.berth),
                     |leg| leg.expected_ticks,
                 );
-            if now.0.saturating_sub(run.leg_started.0) <= expected.saturating_mul(3) {
+            let nominal_timeout = expected.saturating_mul(3);
+            // A routed bus can be delayed by traffic or still braking at its
+            // berth. Give it the passenger wait window to finish the stop.
+            let can_serve_stop = vehicle.it.get_route().is_some()
+                && (!vehicle.it.has_ended(0.0) || at_berth(vehicle, stop));
+            let timeout = if can_serve_stop && !line.suspended {
+                nominal_timeout.max(GIVE_UP_TICKS)
+            } else {
+                nominal_timeout
+            };
+            if now.0.saturating_sub(run.leg_started.0) <= timeout {
                 continue;
             }
             if line.suspended {
@@ -610,6 +620,81 @@ mod tests {
         assert_eq!(times.learned, [150, 401]);
         times.refresh(vec![120, 200]);
         assert_eq!(times.learned, [180, 401]);
+    }
+
+    #[test]
+    fn p3_watchdog_keeps_a_delayed_routable_stop() {
+        let (mut ctx, line) = loop_fixture();
+        let (from, start) = {
+            let transit = ctx.g.read::<Transit>();
+            let first = transit.lines[line].stops[0];
+            (first, transit.berth(&ctx.g.map(), first).unwrap())
+        };
+        let bus = spawn_driving_vehicle(
+            &mut ctx.g,
+            VehicleKind::Bus,
+            Transform {
+                pos: start.pos,
+                dir: start.dir,
+            },
+        )
+        .unwrap();
+        let (world, resources) = ctx.g.world_res();
+        let nominal = {
+            let mut transit = resources.write::<Transit>();
+            let map = resources.read::<Map>();
+            transit.lines[line].target_vehicles = 1;
+            transit.runs.insert(
+                bus,
+                BusRun {
+                    line,
+                    next_stop_idx: 1,
+                    dwell_until: None,
+                    leg_started: Tick(0),
+                    failures: 0,
+                },
+            );
+            let vehicle = &mut world.vehicles[bus];
+            begin_leg(&mut transit, &map, bus, vehicle, Tick(0), Some(from));
+            assert!(vehicle.it.get_route().is_some());
+            transit.legs[&bus].expected_ticks
+        };
+
+        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + nominal * 3 + 1);
+        transit_dispatch_update(world, resources);
+        let transit = resources.read::<Transit>();
+        assert_eq!(transit.runs[&bus].next_stop_idx, 1);
+        assert_eq!(transit.runs[&bus].failures, 0);
+        drop(transit);
+
+        let arrival_tick = Tick(nominal * 3 + 2);
+        let vehicle = &mut world.vehicles[bus];
+        vehicle.trans.pos = vehicle.it.update(
+            vehicle.trans.pos,
+            1_000.0,
+            arrival_tick,
+            0,
+            &resources.read::<Map>(),
+        );
+        assert!(vehicle.it.has_ended(0.0));
+        vehicle.speed.0 = ARRIVAL_SPEED;
+        resources.write::<GameTime>().tick = Tick(crate::INITIAL_TICK + arrival_tick.0);
+        transit_dispatch_update(world, resources);
+        {
+            let transit = resources.read::<Transit>();
+            assert_eq!(transit.runs[&bus].next_stop_idx, 1);
+            assert_eq!(transit.runs[&bus].failures, 0);
+            assert!(transit.runs[&bus].dwell_until.is_none());
+        }
+
+        world.vehicles[bus].speed.0 = 0.0;
+        resources.write::<GameTime>().tick.0 += 1;
+        transit_dispatch_update(world, resources);
+        let transit = resources.read::<Transit>();
+        assert_eq!(
+            transit.runs[&bus].dwell_until,
+            Some(Tick(arrival_tick.0 + 1 + DWELL_TICKS))
+        );
     }
 
     #[test]

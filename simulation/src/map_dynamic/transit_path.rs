@@ -57,17 +57,22 @@ impl<'a> TransitPaths<'a> {
                 continue;
             };
             let (leg_ticks, dwell_ticks, departures) = match transit.directed_leg_times(id) {
-                Some((times, dwell)) => (
-                    times.iter().map(|&ticks| ticks as f64).collect(),
-                    dwell,
-                    Departures::new(
+                Some((times, dwell)) => {
+                    let Some(departures) = Departures::new(
                         now,
                         times,
                         dwell,
                         runs.get(&id).map_or(&[][..], Vec::as_slice),
                         line.target_vehicles,
-                    ),
-                ),
+                    ) else {
+                        continue;
+                    };
+                    (
+                        times.iter().map(|&ticks| ticks as f64).collect(),
+                        dwell,
+                        Some(departures),
+                    )
+                }
                 None => (
                     stops
                         .iter()
@@ -287,13 +292,14 @@ impl Departures {
                 let index = run.next_stop_idx;
                 let offset = *stop_offsets.get(index)?;
                 let previous = (index + leg_ticks.len() - 1) % leg_ticks.len();
-                let until_departure = run.dwell_until.map_or_else(
-                    || {
-                        leg_ticks[previous].saturating_sub(now.0.saturating_sub(run.leg_started.0))
-                            + dwell
-                    },
-                    |until| until.0.saturating_sub(now.0),
-                );
+                let until_departure = if let Some(until) = run.dwell_until {
+                    until.0.saturating_sub(now.0)
+                } else {
+                    let elapsed = now.0.saturating_sub(run.leg_started.0);
+                    // An overdue bus has no reliable arrival forecast until it
+                    // reaches a berth. Counting it as imminent hides the wait.
+                    leg_ticks[previous].checked_sub(elapsed)? + dwell
+                };
                 Some((until_departure + loop_ticks - offset) % loop_ticks)
             })
             .collect();
@@ -440,6 +446,27 @@ mod tests {
         assert_eq!(departures.wait_ticks(0, 8.0), 2.0);
         assert_eq!(departures.wait_ticks(0, 12.0), 318.0);
         assert_eq!(departures.wait_ticks(1, 110.0), 10.0);
+    }
+
+    #[test]
+    fn p3b_wait_prediction_excludes_overdue_departures() {
+        let late = BusRun {
+            line: LineID::default(),
+            next_stop_idx: 1,
+            dwell_until: None,
+            leg_started: Tick(0),
+            failures: 0,
+        };
+        let dwelling = BusRun {
+            dwell_until: Some(Tick(170)),
+            ..late.clone()
+        };
+        let now = Tick(120);
+        let legs = [100, 200];
+        let departures = Departures::new(now, &legs, 10, &[&late, &dwelling], 2).unwrap();
+        assert_eq!(departures.wait_ticks(1, 0.0), 50.0);
+
+        assert!(Departures::new(now, &legs, 10, &[&late], 1).is_none());
     }
 
     #[test]
