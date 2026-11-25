@@ -64,7 +64,7 @@ impl<WORLD: 'static + Serialize, INPUT: Serialize + DeserializeOwned> Server<WOR
         let port = conf.port.unwrap_or(DEFAULT_PORT);
         let net = Connections::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)), port))?;
 
-        let mut authent = Authent::new(conf.version);
+        let mut authent = Authent::new(crate::wire_version(&conf.version));
         let v_client = conf.virtual_client.map(|c| VirtualClient { name: c.name });
         if let Some(ref v_client) = v_client {
             authent.register(v_client.name.clone());
@@ -126,11 +126,16 @@ impl<WORLD: 'static + Serialize, INPUT: Serialize + DeserializeOwned> Server<WOR
         if !self.next_inputs.is_empty() {
             if self.v_client.is_some() {
                 if let Some(inp) = local_inputs {
-                    self.buffer.insert_input(
-                        AuthentID::VIRTUAL_ID,
-                        self.buffer.consumed_frame.incred(),
-                        PlayerInput(encode(&inp)),
-                    );
+                    let input = PlayerInput(encode(&inp));
+                    if crate::decode_player_input::<INPUT>(&input).is_some() {
+                        self.buffer.insert_input(
+                            AuthentID::VIRTUAL_ID,
+                            self.buffer.consumed_frame.incred(),
+                            input,
+                        );
+                    } else {
+                        log::warn!("local input exceeds the command frame envelope");
+                    }
                 }
             }
             return ServerPollResult::Input(std::mem::take(&mut self.next_inputs));
@@ -215,7 +220,11 @@ impl<WORLD: 'static + Serialize, INPUT: Serialize + DeserializeOwned> Server<WOR
 
                 for (frame, input) in input {
                     client.ack = client.ack.max(frame);
-                    self.buffer.insert_input(client.id, frame, input);
+                    if crate::decode_player_input::<INPUT>(&input).is_some() {
+                        self.buffer.insert_input(client.id, frame, input);
+                    } else {
+                        log::warn!("client sent input outside the command frame envelope");
+                    }
                 }
             }
             ClientUnreliablePacket::Connection(id) => {

@@ -1,10 +1,11 @@
 use crate::economy::Government;
 use crate::map::{
-    ConnectionError, LaneID, LaneKind, LanePattern, LanePatternBuilder, Map, Road, RoadID,
+    ConnectionError, LaneID, LaneKind, LanePattern, LanePatternBuilder, Map, PreparedEffects,
+    ProjectFilter, ProjectKind, Road, RoadID,
 };
 use crate::world_command::{PrepareBudget, Rejection};
 use crate::Simulation;
-use geom::PolyLine3;
+use geom::{PolyLine3, AABB};
 use prototypes::Money;
 use serde::{Deserialize, Serialize};
 use slotmapd::Key;
@@ -165,36 +166,25 @@ pub(crate) fn prepare_upgrade(
     if current != expected {
         return Err(Rejection::StaleRoadEdit);
     }
+    let mut existing = road.pattern(map.lanes());
+    validate_pattern_layout(&existing)?;
     if map.land_ownership().is_tiled() {
-        for triangle in super::land_deck_triangles(road) {
-            let [a, b, c] = triangle.map(|p| p.xy());
-            let span = (a.max(b).max(c) - a.min(b).min(c)) / super::LAND_TILE_SIZE;
-            budget.spend_road_work(
-                (span.x.ceil() as usize)
-                    .saturating_add(2)
-                    .saturating_mul((span.y.ceil() as usize).saturating_add(2)),
-            )?;
-            map.land_ownership()
-                .check_polygon(&triangle.map(|p| p.xy()), None)?;
-        }
-        map.mutable_object(id.into())?;
+        authorize_road_deck(&map, road, budget)?;
     }
-    let reversed;
     let pattern = match change {
         RoadUpgrade::Replace(pattern) => pattern,
         RoadUpgrade::ReverseOneWay => {
-            let mut pattern = road.pattern(map.lanes());
             let carries_vehicles = |lanes: &[(LaneKind, f32)]| {
                 lanes.iter().any(|&(kind, _)| kind == LaneKind::Driving)
             };
-            if carries_vehicles(&pattern.lanes_forward) == carries_vehicles(&pattern.lanes_backward)
+            if carries_vehicles(&existing.lanes_forward)
+                == carries_vehicles(&existing.lanes_backward)
             {
                 return Err(Rejection::InvalidRoadPattern);
             }
-            std::mem::swap(&mut pattern.lanes_forward, &mut pattern.lanes_backward);
-            validate_pattern(&pattern)?;
-            reversed = pattern;
-            &reversed
+            std::mem::swap(&mut existing.lanes_forward, &mut existing.lanes_backward);
+            validate_pattern(&existing)?;
+            &existing
         }
     };
     let pattern_matches = |lanes: &[(LaneID, LaneKind)], requested: &[(LaneKind, f32)]| {
@@ -290,6 +280,52 @@ pub(crate) fn prepare_upgrade(
     })
 }
 
+fn authorize_road_deck(
+    map: &Map,
+    road: &Road,
+    budget: &mut PrepareBudget,
+) -> Result<(), Rejection> {
+    map.mutable_object(road.id.into())?;
+    for triangle in super::land_deck_triangles(road) {
+        let points = triangle.map(|p| p.xy());
+        let [a, b, c] = points;
+        let bounds = AABB::new_ll_ur(a.min(b).min(c), a.max(b).max(c));
+        let span = (bounds.ur - bounds.ll) / super::LAND_TILE_SIZE;
+        budget.spend_road_work(
+            (span.x.ceil() as usize)
+                .saturating_add(2)
+                .saturating_mul((span.y.ceil() as usize).saturating_add(2)),
+        )?;
+        // Pay for both the reservation pass and the authority's visit to the
+        // same broad-phase cells, including candidates its filter rejects.
+        let spatial = &map.spatial_map;
+        spatial
+            .reserve_construction_query(bounds, budget.road_work_remaining())
+            .map_err(|_| Rejection::RoadWorkLimit)?;
+        for candidate in spatial.construction_candidates(
+            bounds,
+            ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING,
+        ) {
+            if !map.land_ownership().is_protected(candidate) {
+                continue;
+            }
+            let geometry = match candidate {
+                ProjectKind::Road(id) => {
+                    map.roads()[id].interfaced_points().len().saturating_mul(2)
+                }
+                ProjectKind::Intersection(id) => map.intersections()[id].roads.len(),
+                ProjectKind::Building(id) => map.buildings()[id].zone.as_ref().map_or(4, |zone| {
+                    4usize.saturating_add(zone.poly.len().saturating_pow(2))
+                }),
+                _ => unreachable!("construction filter"),
+            };
+            budget.spend_road_work(geometry)?;
+        }
+        map.authorize_land_effects(PreparedEffects::Footprint(&points))?;
+    }
+    Ok(())
+}
+
 fn reserve_target(road: &Road, budget: &mut PrepareBudget) -> Result<(), Rejection> {
     let points = road
         .points()
@@ -351,6 +387,12 @@ fn validate_pattern(pattern: &LanePattern) -> Result<(), Rejection> {
     {
         return Err(Rejection::InvalidRoadPattern);
     }
+    validate_pattern_layout(pattern)
+}
+
+// Legacy roads may have speeds outside the live knob range. A replacement
+// can bring a supported road layout into range without converting its type.
+fn validate_pattern_layout(pattern: &LanePattern) -> Result<(), Rejection> {
     let matches = |a: &[(LaneKind, f32)], b: &[(LaneKind, f32)]| {
         a.iter()
             .map(|&(kind, _)| kind)

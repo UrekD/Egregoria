@@ -2306,6 +2306,60 @@ fn destination_input(
     ))
 }
 
+/// Reserves an authored road shipment against real source inventory. Normal
+/// dispatch still chooses a truck and driver and validates the physical unload.
+pub fn reserve_road_freight(
+    sim: &mut Simulation,
+    sender: BuildingID,
+    receiver: BuildingID,
+    quantity: ItemQuantity,
+) -> bool {
+    if sender == receiver
+        || !(1..=i32::MAX as u32).contains(&quantity.units)
+        || prototypes::try_prototype(quantity.item).is_none()
+    {
+        return false;
+    }
+    let (world, resources) = sim.world_res();
+    let map = resources.read::<Map>();
+    let infos = resources.read::<BuildingInfos>();
+    let now = elapsed_ticks(resources).0;
+    let Some((source, destination)) = infos.owner(sender).zip(infos.owner(receiver)) else {
+        return false;
+    };
+    let source = Endpoint {
+        soul: source,
+        building: sender,
+    };
+    let destination = Endpoint {
+        soul: destination,
+        building: receiver,
+    };
+    let SoulID::GoodsCompany(company) = source.soul else {
+        return false;
+    };
+    let mut book = resources.write::<CargoBook>();
+    let mut market = resources.write::<Market>();
+    if !source.live(world, &map, &infos)
+        || !destination.live(world, &map, &infos)
+        || assigned_driver(world, source, company).is_none()
+        || on_hand(&market, source, quantity.item) < quantity.units
+        || !book.physical_route(&map, source, destination, now)
+    {
+        return false;
+    }
+    book.reserve(
+        &mut market,
+        Shipment {
+            source,
+            destination,
+            quantity,
+            reserved_at: now,
+        },
+    );
+    true
+}
+
 /// Records the station side of a virtual export. The ordinary market still
 /// owns its budget, stock and trade history. Imports never match at the market.
 pub fn settle_physical_match(world: &mut World, _resources: &Resources, trade: Trade) -> bool {

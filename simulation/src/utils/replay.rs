@@ -1,7 +1,7 @@
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::{ReplayWorldCommand, WorldCommand};
 use crate::{SaveLoadError, Simulation, SimulationOptions, INITIAL_TICK, START_COMMANDS};
-use common::saveload::{Encoder, JSONPretty, SnapshotRevision, JSON};
+use common::saveload::{Encoder, JSONPretty, SnapshotRevision, COMMAND_PROTOCOL_REVISION, JSON};
 use prototypes::Tick;
 use serde::{Deserialize, Serialize};
 use std::io;
@@ -55,7 +55,7 @@ struct ReplayBatch {
 impl Default for Replay {
     fn default() -> Self {
         Self {
-            version: crate::VERSION.to_owned(),
+            version: replay_version(),
             enabled: false,
             registry: None,
             commands: Vec::new(),
@@ -268,12 +268,16 @@ fn invalid_replay(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+pub(crate) fn replay_version() -> String {
+    format!("{}+{COMMAND_PROTOCOL_REVISION}", crate::VERSION)
+}
+
 pub(crate) fn replay_version_error(version: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
             "Replay has version {version:?}, expected {:?}",
-            crate::VERSION
+            replay_version()
         ),
     )
 }
@@ -301,9 +305,15 @@ impl ReplayHeader {
     fn decode(bytes: &[u8]) -> Result<Self, SaveLoadError> {
         // Read the header before decoding commands, regardless of JSON field order.
         let header: Self = JSON::decode(bytes).map_err(replay_corrupt)?;
-        if header.version != crate::VERSION {
-            return Err(SaveLoadError::Incompatible {
-                version: header.version,
+        if header.version != replay_version() {
+            let version = header.version;
+            let release = version
+                .split_once('+')
+                .map_or(version.as_str(), |(release, _)| release);
+            return Err(if release == crate::VERSION {
+                SaveLoadError::IncompatibleReplay { version }
+            } else {
+                SaveLoadError::Incompatible { version }
             });
         }
         crate::check_prototype_registry(header.registry)?;
@@ -354,7 +364,8 @@ impl Encoder for ReplayJson {
 
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
         ReplayHeader::decode(bytes).map_err(|error| match error {
-            SaveLoadError::Incompatible { version } => replay_version_error(&version),
+            SaveLoadError::Incompatible { version }
+            | SaveLoadError::IncompatibleReplay { version } => replay_version_error(&version),
             error => io::Error::new(io::ErrorKind::InvalidData, error),
         })?;
         JSON::decode(bytes)
@@ -653,4 +664,57 @@ fn scale_t1_fix_rejects_import_in_replay_constructor() {
         Simulation::try_from_replay(replay),
         Err(err) if err.to_string() == "Invalid replay constructor batch"
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn p7_replay_rejects_floor_identity_before_decoding_commands() {
+    use crate::map::road_edit::{RoadEditStamp, RoadQuote, RoadUpgrade};
+    use crate::map::{LanePatternBuilder, RoadID};
+    use common::saveload::Bincode;
+
+    let zero = Bincode::encode(&0u64).unwrap();
+    let make = |version: &str| {
+        let mut replay = Replay::default();
+        replay.version = version.to_owned();
+        replay.push(
+            Tick(1),
+            WorldCommand::MapUpgradeRoad {
+                road: RoadID::default(),
+                expected: Bincode::decode::<RoadEditStamp>(&zero).unwrap(),
+                change: RoadUpgrade::Replace(LanePatternBuilder::new().build()),
+                quote: Bincode::decode::<RoadQuote>(&zero).unwrap(),
+            },
+        );
+        replay
+    };
+    let floor = crate::VERSION;
+    #[derive(Serialize)]
+    struct InvalidPayload<'a> {
+        version: &'a str,
+        commands: &'static str,
+    }
+    let bytes = JSON::encode(&InvalidPayload {
+        version: floor,
+        commands: "not a command list",
+    })
+    .unwrap();
+    assert!(matches!(
+        ReplayJson::decode_sidecar(&bytes, None),
+        Err(SaveLoadError::IncompatibleReplay { version }) if version == floor
+    ));
+    let current = Replay::default().version;
+    assert_ne!(current, floor);
+    let revision = SnapshotRevision::new(12);
+    let bytes = ReplayJson::encode_sidecar(&make(&current), revision).unwrap();
+    let sidecar = ReplayJson::decode_sidecar(&bytes, Some(revision)).unwrap();
+    assert!(matches!(
+        sidecar.commands[0].1,
+        WorldCommand::MapUpgradeRoad { .. }
+    ));
+    let old_header: ReplayHeader = JSON::decode(&bytes).unwrap();
+    assert_ne!(
+        old_header.version, floor,
+        "a floor reader must reject the header"
+    );
 }

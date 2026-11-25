@@ -1736,7 +1736,7 @@ impl Map {
         }
     }
 
-    fn reparent_lot(&mut self, id: LotID, road: RoadID) {
+    pub(crate) fn reparent_lot(&mut self, id: LotID, road: RoadID) {
         let previous = self.lots[id].parent;
         self.lots[id].parent = road;
         self.untrack_road_lot(previous, id);

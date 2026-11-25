@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 pub use crate::builtin::traffic_repair::{
-    prepare_repair_fixture, FixtureArm, FixtureOffer, RepairFixture, ScheduledOffer,
+    prepare_repair_fixture, run_no_loss_arm, FixtureArm, FixtureOffer, RepairFixture,
+    ScheduledOffer,
 };
 
 pub const OD_DELAY_LIMIT_TICKS: u64 = 35 * TICKS_PER_MINUTE;
@@ -308,9 +309,11 @@ fn sample(offer: &Offer, row: &Observation, cutoff: u64) -> Result<Sample, Score
             }
             if *tick <= cutoff {
                 sample.credit = *units;
-                sample.delay = tick
-                    .saturating_sub(offer.tick)
-                    .saturating_sub(offer.free_flow_ticks);
+                if *units == offer.units {
+                    sample.delay = tick
+                        .saturating_sub(offer.tick)
+                        .saturating_sub(offer.free_flow_ticks);
+                }
             }
             *tick
         }

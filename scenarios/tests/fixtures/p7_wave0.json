@@ -1138,7 +1138,7 @@
       "repair-cohort",
       "repair-no-loss"
     ],
-    "status": "populated synthetic checkpoints and offer keys; physical comparison pending",
+    "status": "populated synthetic checkpoints and offer keys; no-loss physical comparison; causal improvement pending",
     "producer": "scenarios::traffic_repair::prepare_repair_fixture",
     "seed": 6042,
     "initial_elapsed_tick": 23,
@@ -1153,7 +1153,8 @@
       "variant": "MapUpgradeRoad",
       "opening_speed_m_per_s": 4,
       "no_loss_opening_speed_m_per_s": 13,
-      "requested_speed_m_per_s": 13
+      "requested_speed_m_per_s": 13,
+      "no_loss_requested_speed_m_per_s": 15
     },
     "repair_offset_ticks": 1,
     "primary_offset_ticks": 10600,
@@ -1465,7 +1466,9 @@
         },
         "sha256": "ac33c4289dddb76f53bb8370eed3b43d9829ffffa69acfcf98787e72fffc3dfe"
       },
-      "role": "published demo control on compatible schema, pre-floor producer; frozen bytes",
+      "role": "historical published demo control; frozen bytes",
+      "release_eligible": false,
+      "release_pending": "schema-matched Showcase slot",
       "source_root": "/var/tmp/egr/freight2-confirm.7ZTsvN/demo-slots",
       "opening_report_sha256": "83e7c7daa6d1afaad1c1f52ce077d0dd5a4cc4de8fc9970442724cf829771b53",
       "commissioning": {

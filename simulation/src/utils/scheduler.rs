@@ -35,6 +35,11 @@ impl SeqSchedule {
         self
     }
 
+    /// Keep the selected stock phases in their original order for an authored workload.
+    pub fn retain_systems(&mut self, mut keep: impl FnMut(&str) -> bool) {
+        self.systems.retain(|(system, _)| keep(system.name()));
+    }
+
     #[inline(never)]
     pub fn execute(&mut self, sim: &mut Simulation) {
         profiling::scope!("scheduler::execute");

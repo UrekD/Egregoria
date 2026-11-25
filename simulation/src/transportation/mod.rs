@@ -11,7 +11,7 @@ pub use pedestrian::*;
 pub use vehicle::*;
 
 use crate::map::{BuildingID, Map, Traversable, TraverseDirection, TraverseKind};
-use crate::map_dynamic::{transit::elapsed_ticks, Itinerary};
+use crate::map_dynamic::Itinerary;
 use crate::utils::resources::Resources;
 use crate::world::{HumanID, TrainID, VehicleID};
 use crate::{Simulation, World};
@@ -265,7 +265,8 @@ impl TransportGrid {
         owner.map_or(ColliderOwnerLookup::Deferred, ColliderOwnerLookup::Owned)
     }
 
-    /// Enables a bounded snapshot of current uses at the next collider synchronization.
+    /// Enables current directed-use observations at the next itinerary update.
+    /// This derived index is cold after cloning, loading or a topology change.
     pub fn watch_traversal_users(&mut self) {
         self.traversal_users
             .get_or_insert_with(TraversalUsers::default);
@@ -284,8 +285,32 @@ impl TransportGrid {
         Some(TraversalUserSnapshot {
             users: index.by_traversal.get(&traversal_key(traversal)),
             elapsed_tick,
-            truncated: index.truncated,
+            truncated: false,
         })
+    }
+
+    pub(crate) fn begin_traversal_update(
+        &mut self,
+        map: &Map,
+        elapsed_tick: u64,
+    ) -> Option<TraversalUsers> {
+        let mut index = self.traversal_users.take()?;
+        let map_revision = (map.identity(), map.walking_topology_generation);
+        if index.epoch == u64::MAX
+            || index
+                .revision
+                .is_some_and(|(identity, topology, _)| (identity, topology) != map_revision)
+        {
+            index = TraversalUsers::default();
+        }
+        index.epoch += 1;
+        index.revision = Some((map_revision.0, map_revision.1, elapsed_tick));
+        Some(index)
+    }
+
+    pub(crate) fn publish_traversal_users(&mut self, mut snapshot: TraversalUsers) {
+        snapshot.remove_departed();
+        self.traversal_users = Some(snapshot);
     }
 
     fn synchronize_owners(&mut self, world: &World) {
@@ -362,52 +387,59 @@ impl TraversalUserSnapshot<'_> {
     }
 }
 
+type TraversalKey = (TraverseKind, bool);
+type TraversalIndex = BTreeMap<TraversalKey, BTreeSet<TraversalOwner>>;
+
 #[derive(Default)]
-struct TraversalUsers {
+pub(crate) struct TraversalUsers {
     revision: Option<(u64, u64, u64)>,
-    by_traversal: BTreeMap<(TraverseKind, bool), BTreeSet<TraversalOwner>>,
-    truncated: bool,
+    epoch: u64,
+    by_traversal: TraversalIndex,
+    // Last movement pass that observed the owner, including moves that kept
+    // the same directed traversal.
+    by_owner: BTreeMap<TraversalOwner, (TraversalKey, u64)>,
 }
 
 impl TraversalUsers {
-    fn refresh(&mut self, world: &World, map: &Map, elapsed_tick: u64) {
-        const MAX_VISITS: usize = 65_536;
-        self.by_traversal.clear();
-        self.revision = Some((
-            map.identity(),
-            map.walking_topology_generation,
-            elapsed_tick,
-        ));
-        let humans = world.humans.iter().map(|(id, human)| {
-            (
-                TraversalOwner::Human(id),
-                (human.location == Location::Outside).then_some(&human.it),
-            )
+    pub(crate) fn record(&mut self, map: &Map, owner: TraversalOwner, itinerary: &Itinerary) {
+        let Some(&traversal) = itinerary.get_travers() else {
+            return;
+        };
+        if traversal.raw_points(map).is_none() {
+            return;
+        }
+        let key = traversal_key(traversal);
+        if let Some((previous, _)) = self.by_owner.insert(owner, (key, self.epoch)) {
+            if previous == key {
+                return;
+            }
+            Self::remove_owner(&mut self.by_traversal, previous, owner);
+        }
+        self.by_traversal.entry(key).or_default().insert(owner);
+    }
+
+    fn remove_departed(&mut self) {
+        let index = &mut self.by_traversal;
+        self.by_owner.retain(|&owner, &mut (key, seen)| {
+            if seen != self.epoch {
+                Self::remove_owner(index, key, owner);
+                return false;
+            }
+            true
         });
-        let vehicles = world
-            .vehicles
-            .iter()
-            .map(|(id, vehicle)| (TraversalOwner::Vehicle(id), Some(&vehicle.it)));
-        let trains = world
-            .trains
-            .iter()
-            .map(|(id, train)| (TraversalOwner::Train(id), Some(&train.it)));
-        let mut visits = humans.chain(vehicles).chain(trains);
-        for (owner, itinerary) in visits.by_ref().take(MAX_VISITS) {
-            if let Some(&traversal) = itinerary.and_then(Itinerary::get_travers) {
-                if traversal.raw_points(map).is_some() {
-                    self.by_traversal
-                        .entry(traversal_key(traversal))
-                        .or_default()
-                        .insert(owner);
-                }
+    }
+
+    fn remove_owner(index: &mut TraversalIndex, key: TraversalKey, owner: TraversalOwner) {
+        if let Some(users) = index.get_mut(&key) {
+            users.remove(&owner);
+            if users.is_empty() {
+                index.remove(&key);
             }
         }
-        self.truncated = visits.next().is_some();
     }
 }
 
-fn traversal_key(traversal: Traversable) -> (TraverseKind, bool) {
+fn traversal_key(traversal: Traversable) -> TraversalKey {
     (traversal.kind, traversal.dir == TraverseDirection::Backward)
 }
 
@@ -439,10 +471,6 @@ pub fn transport_grid_synchronize(world: &mut World, resources: &mut Resources) 
         transport_grid.humans.refresh = true;
         transport_grid.vehicles.refresh = true;
         transport_grid.synchronize_owners(world);
-    }
-
-    if let Some(index) = &mut transport_grid.traversal_users {
-        index.refresh(world, &resources.read::<Map>(), elapsed_ticks(resources).0);
     }
 
     transport_grid.maintain_deterministic();

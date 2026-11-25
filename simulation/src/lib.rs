@@ -32,7 +32,7 @@ use std::ptr::addr_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 use utils::rand_provider::RandProvider;
-use utils::replay::{replay_version_error, ReplayJson};
+use utils::replay::{replay_version, replay_version_error, ReplayJson};
 use utils::scheduler::SeqSchedule;
 
 #[macro_use]
@@ -390,7 +390,7 @@ impl Simulation {
     }
 
     pub fn try_from_replay(replay: Replay) -> io::Result<(Simulation, SimulationReplayLoader)> {
-        if replay.version != VERSION {
+        if replay.version != replay_version() {
             return Err(replay_version_error(&replay.version));
         }
         replay.check_registry()?;
@@ -1211,6 +1211,9 @@ pub enum SaveLoadError {
     Incompatible {
         version: String,
     },
+    IncompatibleReplay {
+        version: String,
+    },
     PrototypeRegistry,
     Corrupt {
         version: Option<String>,
@@ -1236,6 +1239,9 @@ impl Display for SaveLoadError {
                     version.trim(),
                     VERSION.trim()
                 )
+            }
+            Self::IncompatibleReplay { version } => {
+                write!(f, "{}", replay_version_error(version))
             }
             Self::PrototypeRegistry => {
                 f.write_str("Save or replay requires a different prototype registry")

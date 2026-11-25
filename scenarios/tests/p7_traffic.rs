@@ -64,6 +64,19 @@ fn cutoff_and_manifest_credit() {
     assert!(!tail.passes_improvement);
     assert!(tail.preserves_credit);
 
+    let mut partial = repaired.clone();
+    for row in &mut partial[38..] {
+        let Some(Terminal::Completed { units, .. }) = &mut row.terminal else {
+            unreachable!()
+        };
+        *units = 2;
+    }
+    let partial = score_matched_offers(&offers, &control, &partial, 7_000).unwrap();
+    let freight = &partial.treatment[&Cohort::Freight];
+    assert_eq!(freight.credited, 58);
+    assert_eq!(freight.p95_delay_ticks, 35 * TICKS_PER_MINUTE + 1);
+    assert!(!partial.passes_improvement);
+
     let mut wrong_receiver = repaired.clone();
     let Some(Terminal::Completed { destination, .. }) = &mut wrong_receiver[39].terminal else {
         unreachable!()
@@ -437,6 +450,35 @@ fn repair_cohort_and_no_loss_fixtures_stage_the_same_offers() {
     assert_eq!(repair.repair_at, repair.checkpoint + 1);
     assert_eq!(repair.primary_cutoff, repair.checkpoint + 10_600);
     assert_eq!(repair.tail_cutoff, repair.checkpoint + 144_000);
+    let manifest = wave0_manifest();
+    let pinned = &manifest["matched_cohort"]["repair_command"];
+    for (fixture, start, requested) in [
+        (&repair, "opening_speed_m_per_s", "requested_speed_m_per_s"),
+        (
+            &no_loss,
+            "no_loss_opening_speed_m_per_s",
+            "no_loss_requested_speed_m_per_s",
+        ),
+    ] {
+        use simulation::map::road_edit::RoadUpgrade;
+        use simulation::world_command::WorldCommand;
+
+        let map = fixture.simulation.map();
+        let opening = map.roads()[fixture.road].pattern(map.lanes());
+        assert!(opening
+            .lanes()
+            .all(|(_, _, speed)| f64::from(speed) == pinned[start].as_f64().unwrap()));
+        let WorldCommand::MapUpgradeRoad {
+            change: RoadUpgrade::Replace(pattern),
+            ..
+        } = &fixture.repair
+        else {
+            panic!("fixture requires a priced road replacement");
+        };
+        assert!(pattern
+            .lanes()
+            .all(|(_, _, speed)| f64::from(speed) == pinned[requested].as_f64().unwrap()));
+    }
     let mut groups = BTreeMap::new();
     let mut people = BTreeSet::new();
     for entry in &repair.schedule {
@@ -480,7 +522,7 @@ fn repair_cohort_and_no_loss_fixtures_stage_the_same_offers() {
 
     for (fixture, expected) in [
         (&mut repair, RoadEditStatus::Applied),
-        (&mut no_loss, RoadEditStatus::NoChange),
+        (&mut no_loss, RoadEditStatus::Applied),
     ] {
         fixture
             .simulation
@@ -495,4 +537,81 @@ fn repair_cohort_and_no_loss_fixtures_stage_the_same_offers() {
             expected
         );
     }
+}
+
+#[test]
+fn showcase_archive_is_historical() {
+    let manifest = wave0_manifest();
+    let showcase = &manifest["stock_slots"]["showcase-release"];
+    assert_eq!(showcase["snapshot_schema"], "0.10.0");
+    assert_eq!(showcase["release_eligible"], false);
+}
+
+#[test]
+fn repair_cohort_and_no_loss_preserves_physical_arrivals_and_unloads() {
+    use scenarios::traffic_repair::{
+        prepare_repair_fixture, run_no_loss_arm, FixtureArm, FixtureOffer,
+    };
+    use simulation::{SavePhase, Simulation, SlotId, SnapshotRevision};
+
+    let fixture = prepare_repair_fixture(FixtureArm::NoLoss).unwrap();
+    let root = std::env::temp_dir().join(format!("p7-no-loss-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    struct PrivateSlot(std::path::PathBuf);
+    impl Drop for PrivateSlot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let root = PrivateSlot(root);
+    let slot = SlotId::new("no-loss").unwrap();
+    assert!(matches!(
+        fixture
+            .simulation
+            .save_to_slot(&root.0, &slot, SnapshotRevision::new(1))
+            .unwrap(),
+        SavePhase::Complete,
+    ));
+    let run = |treatment| {
+        let snapshot = Simulation::load_from_slot(&root.0, &slot).unwrap();
+        run_no_loss_arm(snapshot, &fixture, treatment).unwrap_or_else(|error| {
+            eprintln!("physical no-loss arm (edited={treatment}): {error}");
+            panic!("physical no-loss run failed")
+        })
+    };
+    let stock = run(false);
+    let edit = run(true);
+    let mut persons = 0;
+    let mut freight = 0;
+    for ((offer, stock), edit) in fixture.schedule.iter().zip(&stock).zip(&edit) {
+        assert_eq!(stock.tag, offer.tag);
+        assert_eq!(edit.tag, offer.tag);
+        assert_eq!(stock.admitted_at, Some(offer.tick));
+        assert_eq!(edit.admitted_at, stock.admitted_at);
+        let destination = match offer.offer {
+            FixtureOffer::Person { destination, .. } => {
+                persons += 1;
+                destination
+            }
+            FixtureOffer::Freight { receiver, .. } => {
+                freight += 1;
+                receiver
+            }
+        };
+        let accepted = |row: &Observation| {
+            matches!(
+                &row.terminal,
+                Some(Terminal::Completed { tick, units: 1, destination: at })
+                    if (offer.tick..=fixture.tail_cutoff).contains(tick) && at == &format!("{destination:?}")
+            )
+        };
+        if !accepted(stock) || !accepted(edit) {
+            eprintln!(
+                "tag {} at {destination:?}, stock {:?}, edit {:?}",
+                offer.tag, stock.terminal, edit.terminal
+            );
+            panic!("no-loss arm is missing a physical completion");
+        }
+    }
+    assert_eq!((persons, freight), (120, 24));
 }

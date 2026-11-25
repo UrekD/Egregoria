@@ -528,6 +528,37 @@ impl SpatialMap {
         Ok(())
     }
 
+    pub(super) fn reserve_construction_query(
+        &self,
+        bounds: AABB,
+        work: &mut usize,
+    ) -> Result<(), WaterEditError> {
+        let cells = CellRange::checked(bounds).ok_or(WaterEditError::Limit)?;
+        let occupancy = self.occupancy.storage();
+        let occupied_cells = CellRange {
+            first: occupancy.cell_id(bounds.ll),
+            last: occupancy.cell_id(bounds.ur),
+        };
+        spend_water_work(
+            work,
+            cells
+                .len()
+                .saturating_add(occupied_cells.len())
+                .saturating_mul(3),
+        )?;
+        for key in cells.iter() {
+            if let Some(cell) = self.broad.storage.cell(key) {
+                spend_water_work(work, cell.entries.len().saturating_mul(2))?;
+            }
+        }
+        for key in occupied_cells.iter() {
+            if let Some(cell) = occupancy.cell(key) {
+                spend_water_work(work, cell.objs.len().saturating_mul(2))?;
+            }
+        }
+        Ok(())
+    }
+
     /// A zoned building has separate bounds for its polygon and physical footprint.
     pub(crate) fn construction_candidates(
         &self,

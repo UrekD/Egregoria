@@ -48,8 +48,7 @@ pub struct WorldCommands {
     pub(crate) commands: Vec<WorldCommand>,
 }
 
-// The wire format is shared with legacy unrestricted worlds. Tiled runtime
-// admission enforces its smaller descriptor caps before cloning a batch.
+// Legacy construction DTOs retain their separate descriptor capacity.
 fn bounded_batch_wire<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -115,12 +114,15 @@ fn bounded_frame_wire<'de, D: serde::Deserializer<'de>>(
         }
 
         fn visit_seq<A: SeqAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
-            if let Some(count) = input.size_hint().filter(|&count| count > MAX_WIRE_COMMANDS) {
+            if let Some(count) = input
+                .size_hint()
+                .filter(|&count| count > MAX_TILED_COMMANDS)
+            {
                 return Err(A::Error::invalid_length(count, &self));
             }
             let mut commands = Vec::new();
             let mut remaining = MAX_WATER_BATCH_WORK;
-            while commands.len() < MAX_WIRE_COMMANDS && remaining > 0 {
+            while commands.len() < MAX_TILED_COMMANDS && remaining > 0 {
                 let Some(command): Option<WorldCommand> = input.next_element()? else {
                     return Ok(commands);
                 };
@@ -1864,8 +1866,7 @@ impl WorldCommand {
             } => {
                 let map = sim.map();
                 let shared_topology = map.land_ownership().is_tiled() || budget.shared_topology;
-                let mut work = map
-                    .needs_topology_preparation()
+                let mut work = (shared_topology || map.needs_topology_preparation())
                     .then(WaterTopologyWork::new);
                 if let Some(work) = &mut work {
                     if shared_topology {
@@ -1981,10 +1982,9 @@ impl WorldCommand {
         }
 
         let mut map = sim.map_mut();
-        let mut water_work = map
-            .needs_topology_preparation()
-            .then(WaterTopologyWork::new);
         let shared_topology = tiled || batch.shared_topology;
+        let mut water_work =
+            (shared_topology || map.needs_topology_preparation()).then(WaterTopologyWork::new);
         if shared_topology {
             if let Some(work) = &mut water_work {
                 work.remaining = batch.remaining;
@@ -2484,4 +2484,65 @@ impl From<&WorldCommands> for Vec<WorldCommand> {
     fn from(x: &WorldCommands) -> Self {
         x.commands.clone()
     }
+}
+
+#[cfg(test)]
+#[test]
+fn p7_mixed_dry_connections_share_remaining_work_at_each_index() {
+    use crate::map::road_edit::road_edit_stamp;
+    use common::saveload::{Bincode, Encoder};
+    drop(crate::tests::TestCtx::new());
+    let mut sim = Simulation::new_authored_flat(2, 6042).unwrap();
+    let project = |x, y| MapProject::ground(vec3(x, y, 0.0));
+    let pattern = LanePatternBuilder::new().build();
+    let single = MapMakeConnection {
+        from: project(100.0, 200.0),
+        to: project(600.0, 200.0),
+        inter: None,
+        pat: pattern.clone(),
+    };
+    sim.apply_commands([&single]);
+    let road = sim.map().roads().keys().next().unwrap();
+    let edit = MapUpgradeRoad {
+        road,
+        expected: road_edit_stamp(&sim, road, &mut PrepareBudget::for_preview(1_000)).unwrap(),
+        change: RoadUpgrade::Replace(pattern.clone()),
+        quote: Bincode::decode(&Bincode::encode(&0u64).unwrap()).unwrap(),
+    };
+    let single = MapMakeConnection {
+        from: project(100.0, 400.0),
+        to: project(600.0, 400.0),
+        inter: None,
+        pat: pattern.clone(),
+    };
+    let projects = [project(100.0, 500.0), project(600.0, 500.0)];
+    let links = [(0, 1, None, pattern.clone()), (0, 1, None, pattern)];
+    let multiple = MapMakeMultipleConnections(projects.to_vec(), links.to_vec());
+    let mut budget = PrepareBudget::new(&[&edit, &single, &multiple], sim.map().environment());
+    assert!(!sim.map().needs_topology_preparation());
+    budget.remaining = 1;
+    let before = sim.hashes();
+    let single_result = single.prepare_single(&sim, &mut budget).err();
+    sim.write::<CommandOutcomes>().clear();
+    multiple
+        .apply_connections(
+            &mut sim,
+            &projects,
+            &links,
+            BudgetCategory::Construction,
+            &mut budget,
+        )
+        .unwrap();
+    assert_eq!(single_result, Some(Rejection::WaterWorkLimit));
+    assert_eq!(
+        sim.read::<CommandOutcomes>()
+            .connection_batch(0)
+            .unwrap()
+            .links,
+        [
+            Err(Rejection::WaterWorkLimit),
+            Err(Rejection::WaterWorkLimit)
+        ]
+    );
+    assert_eq!(sim.hashes(), before);
 }
