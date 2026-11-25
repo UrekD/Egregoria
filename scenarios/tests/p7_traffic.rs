@@ -118,7 +118,7 @@ fn repair_cohort_and_no_loss() {
 #[test]
 fn snapshot_and_sidecar_parity() {
     use simulation::diagnostics::elapsed_tick;
-    use simulation::map::{LotLayout, TerraformKind, WaterBodyId, WaterEdit};
+    use simulation::map::{Density, LotLayout, TerraformKind, WaterBodyId, WaterEdit, ZoneKind};
     use simulation::utils::replay::{ReplayBudget, ReplayNext};
     use simulation::world_command::{CommandOutcomes, WorldCommand};
     use simulation::{MapPreset, NewGameOptions, SavePhase, Simulation, SlotId, SnapshotRevision};
@@ -139,9 +139,16 @@ fn snapshot_and_sidecar_parity() {
         body: WaterBodyId(1),
     });
     let no_op = WorldCommand::EditWater(WaterEdit::SetSeaLevel { level_dm: None });
+    let rejected_paint = WorldCommand::ZonePaint {
+        area: geom::OBB::new(geom::vec2(-100.0, -100.0), geom::Vec2::X, 10.0, 10.0),
+        kind: Some(ZoneKind::Residential),
+        density: Density::Low,
+    };
     sim.apply_commands([&rejected]);
     assert_eq!(sim.read::<CommandOutcomes>().rejections_for(0).len(), 1);
     sim.apply_commands([&no_op]);
+    sim.apply_commands([&rejected_paint]);
+    assert_eq!(sim.read::<CommandOutcomes>().rejections_for(0).len(), 1);
 
     let root = std::env::temp_dir().join(format!("p7-replay-{}", std::process::id()));
     std::fs::create_dir(&root).unwrap();
@@ -198,6 +205,7 @@ fn snapshot_and_sidecar_parity() {
     for (expected, advancing) in [
         (&[&rejected][..], false),
         (&[&no_op][..], false),
+        (&[&rejected_paint][..], false),
         (&later[..], true),
     ] {
         let tick = prototypes::Tick(restored.get_tick());
@@ -410,5 +418,81 @@ fn worker_and_native_comparator_parity() {
         ] {
             assert_eq!(serial[field], parallel[field], "{workers} workers: {field}");
         }
+    }
+}
+#[test]
+fn repair_cohort_and_no_loss_fixtures_stage_the_same_offers() {
+    use scenarios::traffic_repair::{prepare_repair_fixture, FixtureArm, FixtureOffer};
+    use simulation::map::road_edit::RoadEditStatus;
+    use simulation::world_command::CommandOutcomes;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let mut repair = prepare_repair_fixture(FixtureArm::Repair).unwrap();
+    let mut no_loss = prepare_repair_fixture(FixtureArm::NoLoss).unwrap();
+    assert_eq!(repair.checkpoint, no_loss.checkpoint);
+    assert_eq!(
+        serde_json::to_value(&repair.schedule).unwrap(),
+        serde_json::to_value(&no_loss.schedule).unwrap()
+    );
+    assert_eq!(repair.repair_at, repair.checkpoint + 1);
+    assert_eq!(repair.primary_cutoff, repair.checkpoint + 10_600);
+    assert_eq!(repair.tail_cutoff, repair.checkpoint + 144_000);
+    let mut groups = BTreeMap::new();
+    let mut people = BTreeSet::new();
+    for entry in &repair.schedule {
+        *groups.entry(entry.group).or_insert(0) += 1;
+        match entry.offer {
+            FixtureOffer::Person {
+                human,
+                home,
+                destination,
+            } => {
+                assert!(people.insert(human));
+                assert!(repair.simulation.world().humans.contains_key(human));
+                assert!(repair.simulation.map().get(home).is_some());
+                assert!(repair.simulation.map().get(destination).is_some());
+                assert_eq!(
+                    entry.tick - repair.checkpoint,
+                    100 + u64::from(entry.tag - 1) * 50
+                );
+            }
+            FixtureOffer::Freight {
+                sender,
+                receiver,
+                units,
+                ..
+            } => {
+                assert_ne!(sender, receiver);
+                assert_eq!(units, 1);
+                assert!(repair.simulation.map().get(sender).is_some());
+                assert!(repair.simulation.map().get(receiver).is_some());
+                assert_eq!(
+                    entry.tick - repair.checkpoint,
+                    100 + u64::from(entry.tag - 121) * 250
+                );
+            }
+        }
+    }
+    assert_eq!(people.len(), 120);
+    assert_eq!(groups.len(), 8);
+    assert_eq!(groups.values().filter(|&&offers| offers == 20).count(), 6);
+    assert_eq!(groups.values().filter(|&&offers| offers == 12).count(), 2);
+
+    for (fixture, expected) in [
+        (&mut repair, RoadEditStatus::Applied),
+        (&mut no_loss, RoadEditStatus::NoChange),
+    ] {
+        fixture
+            .simulation
+            .tick(&mut simulation::Simulation::schedule(), [&fixture.repair]);
+        assert_eq!(
+            simulation::diagnostics::elapsed_tick(&fixture.simulation).0,
+            fixture.repair_at
+        );
+        let last = fixture.simulation.read::<CommandOutcomes>();
+        assert_eq!(
+            last.road_edit(0).unwrap().as_ref().unwrap().status,
+            expected
+        );
     }
 }

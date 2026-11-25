@@ -84,7 +84,10 @@ impl Government {
     }
 
     pub(crate) fn connection_cost(p1: Vec3, p2: Vec3, pat: &LanePattern) -> Option<Money> {
-        let dist = p1.distance(p2);
+        Self::connection_cost_at_length(p1.distance(p2), pat)
+    }
+
+    pub(crate) fn connection_cost_at_length(dist: f32, pat: &LanePattern) -> Option<Money> {
         let lanes = i64::try_from(
             pat.lanes_forward
                 .len()

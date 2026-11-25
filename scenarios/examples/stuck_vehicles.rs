@@ -172,7 +172,7 @@ fn braking_evidence(sim: &Simulation, id: VehicleID) -> Option<(f32, f32, Vec<St
     let radius = 12.0 + (own.speed.powi(2) / (2.0 * car.vehicle.kind.deceleration())).min(100.0);
     let neighbours: Vec<_> = grid
         .query_around(car.trans.pos.xy(), radius)
-        .filter_map(|(handle, pos)| Some((pos, grid.get(handle)?.1)))
+        .filter_map(|(handle, pos)| Some((handle, pos, grid.get(handle)?.1)))
         .collect();
     let decide = |neighbours: &[_]| {
         // Evaluate a copy of the ordinary braking decision at this tick.
@@ -193,7 +193,7 @@ fn braking_evidence(sim: &Simulation, id: VehicleID) -> Option<(f32, f32, Vec<St
             &car.trans,
             own,
             &car.it,
-            neighbours.iter().copied(),
+            neighbours.iter().map(|&(_, pos, state)| (pos, state)),
         )
         .0
     };
@@ -203,7 +203,10 @@ fn braking_evidence(sim: &Simulation, id: VehicleID) -> Option<(f32, f32, Vec<St
         neighbours
             .iter()
             .filter(|neighbour| decide(std::slice::from_ref(*neighbour)) == 0.0)
-            .map(|(pos, state)| format!("{:?}@{pos:?}/z={:.2}", state.group, state.height))
+            .map(|&(handle, pos, state)| {
+                let owner = grid.collider_owner(sim.world(), handle);
+                format!("{owner:?}/{:?}@{pos:?}/z={:.2}", state.group, state.height)
+            })
             .collect()
     } else {
         Vec::new()

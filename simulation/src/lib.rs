@@ -666,6 +666,14 @@ impl Simulation {
             self.reject_command_batch(commands, remaining, tiled);
             return;
         }
+        if commands.len() > world_command::MAX_TILED_COMMANDS
+            && commands
+                .iter()
+                .any(|command| matches!(command, WorldCommand::MapUpgradeRoad { .. }))
+        {
+            self.reject_command_batch(commands, std::iter::empty(), tiled);
+            return;
+        }
         let wire_errors: Vec<_> = commands
             .iter()
             .map(|command| command.wire_error())
@@ -701,22 +709,16 @@ impl Simulation {
             if let Some(error) = wire_error {
                 command.reject_wire(self, error);
             } else {
-                // Paint preparation also validates map bounds and registry availability.
-                let record_paint = record && matches!(command, WorldCommand::ZonePaint { .. });
-                if record && !record_paint {
+                // Preserve admitted positions, including preparation rejections and no-ops.
+                if record {
                     let tick = self.read::<GameTime>().tick;
                     self.write::<Replay>().push(tick, (*command).clone());
                 }
-                let tick = record_paint.then(|| self.read::<GameTime>().tick);
-                let rejection = match command.admitted(tiled, &water) {
-                    Ok(()) => command.apply_in_batch(self, construction, &mut water),
-                    Err(reason) => {
-                        command.reject_unadmitted(self, reason);
-                        Some(reason)
+                match command.admitted(tiled, &water) {
+                    Ok(()) => {
+                        command.apply_in_batch(self, construction, &mut water);
                     }
-                };
-                if let Some(tick) = tick.filter(|_| rejection.is_none()) {
-                    self.write::<Replay>().push(tick, (*command).clone());
+                    Err(reason) => command.reject_unadmitted(self, reason),
                 }
             }
             utils::scheduler::drain_commands(self);

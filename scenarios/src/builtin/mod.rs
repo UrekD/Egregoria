@@ -7,6 +7,7 @@ pub mod perf;
 pub mod services_basic;
 pub mod services_neglect;
 pub mod smoke;
+pub(crate) mod traffic_repair;
 mod transit_basic;
 mod water_basic;
 pub mod water_fixtures;

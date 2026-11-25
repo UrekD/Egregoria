@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::{Debug, Formatter};
 use std::ops::Deref;
 
@@ -9,10 +10,12 @@ use geom::{Transform, Vec2};
 pub use pedestrian::*;
 pub use vehicle::*;
 
-use crate::map::BuildingID;
+use crate::map::{BuildingID, Map, Traversable, TraverseDirection, TraverseKind};
+use crate::map_dynamic::{transit::elapsed_ticks, Itinerary};
 use crate::utils::resources::Resources;
-use crate::world::{HumanID, VehicleID};
+use crate::world::{HumanID, TrainID, VehicleID};
 use crate::{Simulation, World};
+use common::FastMap;
 
 pub mod pedestrian;
 pub mod road;
@@ -84,6 +87,8 @@ pub struct TransportGrid {
     humans: ActiveColliders<HumanID>,
     #[serde(skip)]
     vehicles: ActiveColliders<VehicleID>,
+    #[serde(skip)]
+    traversal_users: Option<TraversalUsers>,
     #[serde(skip, default = "positions_may_be_pending")]
     pending_positions: bool,
 }
@@ -96,6 +101,7 @@ fn positions_may_be_pending() -> bool {
 struct ActiveColliders<I> {
     refresh: bool,
     entries: Vec<(I, Transporter)>,
+    by_handle: FastMap<GridHandle, I>,
 }
 
 impl<I> Default for ActiveColliders<I> {
@@ -103,15 +109,22 @@ impl<I> Default for ActiveColliders<I> {
         Self {
             refresh: true,
             entries: Vec::new(),
+            by_handle: FastMap::default(),
         }
     }
 }
 
-impl<I> ActiveColliders<I> {
+impl<I: Copy> ActiveColliders<I> {
     fn refresh_from(&mut self, entries: impl Iterator<Item = (I, Transporter)>) {
         if std::mem::take(&mut self.refresh) {
             self.entries.clear();
             self.entries.extend(entries);
+            self.by_handle.clear();
+            self.by_handle.extend(
+                self.entries
+                    .iter()
+                    .map(|&(owner, collider)| (collider.0, owner)),
+            );
         }
     }
 }
@@ -130,6 +143,10 @@ impl Clone for TransportGrid {
             grid: self.grid.clone(),
             humans: ActiveColliders::default(),
             vehicles: ActiveColliders::default(),
+            traversal_users: self
+                .traversal_users
+                .as_ref()
+                .map(|_| TraversalUsers::default()),
             pending_positions: self.pending_positions,
         }
     }
@@ -141,6 +158,7 @@ impl TransportGrid {
             grid: SpatialGrid::new(cell_size),
             humans: ActiveColliders::default(),
             vehicles: ActiveColliders::default(),
+            traversal_users: None,
             pending_positions: false,
         }
     }
@@ -167,16 +185,24 @@ impl TransportGrid {
     }
 
     pub fn remove(&mut self, handle: GridHandle) -> Option<TransportState> {
+        self.forget_collider(handle);
         self.grid.remove(handle)
     }
 
     pub fn remove_maintain(&mut self, handle: GridHandle) -> Option<TransportState> {
+        self.forget_collider(handle);
         self.grid.remove_maintain(handle)
     }
 
     pub fn clear(&mut self) -> impl Iterator<Item = (Vec2, TransportState)> {
         self.humans.refresh = true;
         self.vehicles.refresh = true;
+        self.humans.by_handle.clear();
+        self.vehicles.by_handle.clear();
+        self.traversal_users = self
+            .traversal_users
+            .as_ref()
+            .map(|_| TraversalUsers::default());
         self.pending_positions = false;
         self.grid.clear()
     }
@@ -191,12 +217,84 @@ impl TransportGrid {
         self.grid.maintain_deterministic();
     }
 
+    fn forget_collider(&mut self, handle: GridHandle) {
+        self.humans.by_handle.remove(&handle);
+        self.vehicles.by_handle.remove(&handle);
+    }
+
+    /// Looks up a generation-bearing handle at the last collider synchronization.
+    pub fn collider_owner(&self, world: &World, collider: GridHandle) -> ColliderOwnerLookup {
+        let Some((_, state)) = self.grid.get(collider) else {
+            return ColliderOwnerLookup::Missing;
+        };
+        let owner = match state.group {
+            TransportationGroup::Vehicles => {
+                if self.vehicles.refresh {
+                    return ColliderOwnerLookup::Deferred;
+                }
+                self.vehicles
+                    .by_handle
+                    .get(&collider)
+                    .copied()
+                    .filter(|&id| {
+                        world
+                            .vehicles
+                            .get(id)
+                            .is_some_and(|v| v.collider == Some(Transporter(collider)))
+                    })
+                    .map(TraversalOwner::Vehicle)
+            }
+            TransportationGroup::Pedestrians => {
+                if self.humans.refresh {
+                    return ColliderOwnerLookup::Deferred;
+                }
+                self.humans
+                    .by_handle
+                    .get(&collider)
+                    .copied()
+                    .filter(|&id| {
+                        world
+                            .humans
+                            .get(id)
+                            .is_some_and(|h| h.collider == Some(Transporter(collider)))
+                    })
+                    .map(TraversalOwner::Human)
+            }
+            TransportationGroup::Unknown => return ColliderOwnerLookup::Missing,
+        };
+        owner.map_or(ColliderOwnerLookup::Deferred, ColliderOwnerLookup::Owned)
+    }
+
+    /// Enables a bounded snapshot of current uses at the next collider synchronization.
+    pub fn watch_traversal_users(&mut self) {
+        self.traversal_users
+            .get_or_insert_with(TraversalUsers::default);
+    }
+
+    pub fn traversal_users(
+        &self,
+        map: &Map,
+        traversal: Traversable,
+    ) -> Option<TraversalUserSnapshot<'_>> {
+        let index = self.traversal_users.as_ref()?;
+        let (identity, topology, elapsed_tick) = index.revision?;
+        if (identity, topology) != (map.identity(), map.walking_topology_generation) {
+            return None;
+        }
+        Some(TraversalUserSnapshot {
+            users: index.by_traversal.get(&traversal_key(traversal)),
+            elapsed_tick,
+            truncated: index.truncated,
+        })
+    }
+
     fn synchronize_owners(&mut self, world: &World) {
         let Self {
             grid,
             humans,
             vehicles,
             pending_positions,
+            ..
         } = self;
         vehicles.refresh_from(
             world
@@ -214,6 +312,7 @@ impl TransportGrid {
         // Cell maintenance sorts relocations by handle independently of the owner index.
         vehicles.entries.retain(|&(id, coll)| {
             let Some(v) = world.vehicles.get(id).filter(|v| v.collider == Some(coll)) else {
+                vehicles.by_handle.remove(&coll.0);
                 return false;
             };
             synchronize_collider(
@@ -228,12 +327,88 @@ impl TransportGrid {
         });
         humans.entries.retain(|&(id, coll)| {
             let Some(h) = world.humans.get(id).filter(|h| h.collider == Some(coll)) else {
+                humans.by_handle.remove(&coll.0);
                 return false;
             };
             synchronize_collider(grid, coll, &h.trans, &h.speed, None, *pending_positions);
             true
         });
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum TraversalOwner {
+    Human(HumanID),
+    Vehicle(VehicleID),
+    Train(TrainID),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ColliderOwnerLookup {
+    Owned(TraversalOwner),
+    Missing,
+    Deferred,
+}
+
+pub struct TraversalUserSnapshot<'a> {
+    users: Option<&'a BTreeSet<TraversalOwner>>,
+    pub elapsed_tick: u64,
+    pub truncated: bool,
+}
+
+impl TraversalUserSnapshot<'_> {
+    pub fn users(&self) -> impl Iterator<Item = TraversalOwner> + '_ {
+        self.users.into_iter().flatten().copied()
+    }
+}
+
+#[derive(Default)]
+struct TraversalUsers {
+    revision: Option<(u64, u64, u64)>,
+    by_traversal: BTreeMap<(TraverseKind, bool), BTreeSet<TraversalOwner>>,
+    truncated: bool,
+}
+
+impl TraversalUsers {
+    fn refresh(&mut self, world: &World, map: &Map, elapsed_tick: u64) {
+        const MAX_VISITS: usize = 65_536;
+        self.by_traversal.clear();
+        self.revision = Some((
+            map.identity(),
+            map.walking_topology_generation,
+            elapsed_tick,
+        ));
+        let humans = world.humans.iter().map(|(id, human)| {
+            (
+                TraversalOwner::Human(id),
+                (human.location == Location::Outside).then_some(&human.it),
+            )
+        });
+        let vehicles = world
+            .vehicles
+            .iter()
+            .map(|(id, vehicle)| (TraversalOwner::Vehicle(id), Some(&vehicle.it)));
+        let trains = world
+            .trains
+            .iter()
+            .map(|(id, train)| (TraversalOwner::Train(id), Some(&train.it)));
+        let mut visits = humans.chain(vehicles).chain(trains);
+        for (owner, itinerary) in visits.by_ref().take(MAX_VISITS) {
+            if let Some(&traversal) = itinerary.and_then(Itinerary::get_travers) {
+                if traversal.raw_points(map).is_some() {
+                    self.by_traversal
+                        .entry(traversal_key(traversal))
+                        .or_default()
+                        .insert(owner);
+                }
+            }
+        }
+        self.truncated = visits.next().is_some();
+    }
+}
+
+fn traversal_key(traversal: Traversable) -> (TraverseKind, bool) {
+    (traversal.kind, traversal.dir == TraverseDirection::Backward)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -264,6 +439,10 @@ pub fn transport_grid_synchronize(world: &mut World, resources: &mut Resources) 
         transport_grid.humans.refresh = true;
         transport_grid.vehicles.refresh = true;
         transport_grid.synchronize_owners(world);
+    }
+
+    if let Some(index) = &mut transport_grid.traversal_users {
+        index.refresh(world, &resources.read::<Map>(), elapsed_ticks(resources).0);
     }
 
     transport_grid.maintain_deterministic();

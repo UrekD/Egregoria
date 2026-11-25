@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "floor": {
-    "commit": "88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7",
-    "snapshot_schema": "0.10.0",
-    "base_mod_tree": "33720a58d86c004c29007c1b5b251c2d5eaaaa52",
-    "prototype_tree": "551dc343da61015dd0153d850a822683eb0a8592",
+    "commit": "c0041a8d5faba1513ddfaa7f2b4d04758ff663ae",
+    "snapshot_schema": "0.11.0",
+    "base_mod_tree": "b3dcee98b890c14a9d150f2d1f856c68a5a08305",
+    "prototype_tree": "815484df58b9393efe0d5c7d8d827c0130618647",
     "asset_tree": "ad24a68a1c6daa25efc494b1fe299a2f05c43ee5"
   },
   "integration_parents": {
@@ -121,7 +121,7 @@
       },
       {
         "commit": "7c418197563b54a951aa1cd136f8d4d7ec46d747",
-        "status": "candidate; awaiting reviewed 0.11.0 integration",
+        "status": "landed; reviewed 0.11.0 integration",
         "hooks": [
           "transit_path",
           "router",
@@ -1138,19 +1138,46 @@
       "repair-cohort",
       "repair-no-loss"
     ],
-    "status": "schedule contract; populated fixtures and semantic facility keys pending Wave 1",
+    "status": "populated synthetic checkpoints and offer keys; physical comparison pending",
+    "producer": "scenarios::traffic_repair::prepare_repair_fixture",
+    "seed": 6042,
+    "initial_elapsed_tick": 23,
+    "road_grid": {
+      "origin_xy": [400, 520],
+      "columns": 4,
+      "rows": 3,
+      "spacing_m": 260,
+      "repair_link_endpoints_xy": [[660, 780], [920, 780]]
+    },
+    "repair_command": {
+      "variant": "MapUpgradeRoad",
+      "opening_speed_m_per_s": 4,
+      "no_loss_opening_speed_m_per_s": 13,
+      "requested_speed_m_per_s": 13
+    },
     "repair_offset_ticks": 1,
     "primary_offset_ticks": 10600,
     "tail_offset_ticks": 144000,
     "person": {
       "count": 120,
       "directed_groups": 6,
+      "group_order": [
+        "west_to_center",
+        "west_to_east",
+        "center_to_west",
+        "center_to_east",
+        "east_to_west",
+        "east_to_center"
+      ],
       "first_offset_ticks": 100,
       "interval_ticks": 50
     },
     "freight": {
       "count": 24,
       "directed_groups": 2,
+      "group_order": ["west_mine_to_east_plant", "east_mine_to_west_plant"],
+      "sku": "coal",
+      "units_per_offer": 1,
       "first_offset_ticks": 100,
       "interval_ticks": 250
     },

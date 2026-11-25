@@ -223,14 +223,6 @@ impl Map {
     pub(crate) fn install_land_ownership(&mut self, ownership: super::LandOwnership) {
         assert!(!self.land_ownership.is_tiled());
         self.land_ownership = ownership;
-        if self.land_ownership.is_tiled() {
-            for lot in self.lots.values() {
-                self.lots_by_road
-                    .entry(lot.parent)
-                    .or_default()
-                    .insert(lot.id);
-            }
-        }
     }
 
     /// Check the commissioned roots against their live geometry and relationships.
@@ -1171,12 +1163,9 @@ impl Map {
         for &id in replaced_roads {
             let road = &self.roads[id];
             added_lanes = added_lanes.saturating_add(road.n_lanes());
-            if !self.land_ownership.is_tiled() {
-                spend_water_work(remaining, self.lots.len().saturating_mul(3))?;
-            }
             if self.environment.strict_water_siting() {
                 points = points.max(profile_sample_bound(road.length() + new_length));
-                spend_water_work(remaining, super::reassigned_frontage_work(self, id, points))?;
+                super::reserve_reassigned_frontage(self, id, points, remaining)?;
             }
             spend_water_work(
                 remaining,
@@ -1723,26 +1712,19 @@ impl Map {
     }
 
     pub(super) fn road_lot_ids(&self, road: RoadID) -> Vec<LotID> {
-        if self.land_ownership.is_tiled() {
-            self.lots_by_road
-                .get(&road)
-                .into_iter()
-                .flatten()
-                .copied()
-                .collect()
-        } else {
-            self.lots
-                .values()
-                .filter(|lot| lot.parent == road)
-                .map(|lot| lot.id)
-                .collect()
-        }
+        self.road_lots(road).collect()
+    }
+
+    pub(super) fn road_lots(&self, road: RoadID) -> impl Iterator<Item = LotID> + '_ {
+        self.lots_by_road.get(&road).into_iter().flatten().copied()
+    }
+
+    pub(super) fn road_lot_count(&self, road: RoadID) -> usize {
+        self.lots_by_road.get(&road).map_or(0, BTreeSet::len)
     }
 
     pub(super) fn track_road_lot(&mut self, road: RoadID, id: LotID) {
-        if self.land_ownership.is_tiled() {
-            self.lots_by_road.entry(road).or_default().insert(id);
-        }
+        self.lots_by_road.entry(road).or_default().insert(id);
     }
 
     fn untrack_road_lot(&mut self, road: RoadID, id: LotID) {

@@ -5,6 +5,10 @@ use prototypes::TICKS_PER_MINUTE;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub use crate::builtin::traffic_repair::{
+    prepare_repair_fixture, FixtureArm, FixtureOffer, RepairFixture, ScheduledOffer,
+};
+
 pub const OD_DELAY_LIMIT_TICKS: u64 = 35 * TICKS_PER_MINUTE;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

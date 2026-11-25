@@ -265,7 +265,9 @@ pub fn calc_decision<'a>(
 
     let cutoff = (0.8 + stop_dist).min(1.5);
 
-    let (front_dist, flag) = calc_front_dist(vehicle, trans, self_obj, it, neighs, cutoff);
+    let panicking = matches!(vehicle.state, VehicleState::Panicking(_));
+    let (front_dist, flag, crossing) =
+        calc_front_dist(vehicle, trans, self_obj, it, neighs, cutoff, panicking);
 
     let position = trans.pos;
     let dir_to_pos = unwrap_or!(
@@ -277,6 +279,10 @@ pub fn calc_decision<'a>(
         // Gridlock recovery is agent physics: 20 real seconds.
         if since.elapsed(time).0 .0 > 20 * TICKS_PER_REALTIME_SECOND {
             vehicle.state = VehicleState::Driving;
+        }
+        // Breaking a stationary leader cycle must still yield to a crossing vehicle.
+        if crossing {
+            return (0.0, dir_to_pos);
         }
     } else if speed.abs() < 0.2 && front_dist < 1.5 {
         let me_u64: u64 = me.data().as_ffi();
@@ -360,13 +366,14 @@ pub fn calc_decision<'a>(
 /// It can be another car or a pedestrian, or it can be a potential collision point from a
 /// car coming perpendicularly.
 fn calc_front_dist<'a>(
-    vehicle: &mut Vehicle,
+    vehicle: &Vehicle,
     trans: &Transform,
     self_obj: &TransportState,
     it: &Itinerary,
     neighs: impl Iterator<Item = (Vec2, &'a TransportState)>,
     cutoff: f32,
-) -> (f32, u64) {
+    check_crossing: bool,
+) -> (f32, u64, bool) {
     let position = trans.pos;
     let direction = trans.dir;
     let pos2 = position.xy();
@@ -424,8 +431,8 @@ fn calc_front_dist<'a>(
                 min_front_dist = dist_to_obj;
                 flag = nei_physics_obj.flag;
             }
-            if min_front_dist < cutoff {
-                return (min_front_dist, flag);
+            if min_front_dist < cutoff && !check_crossing {
+                return (min_front_dist, flag, false);
             }
             continue;
         }
@@ -458,10 +465,13 @@ fn calc_front_dist<'a>(
         }
 
         let final_dist = dist - my_radius - nei_physics_obj.radius - 5.0;
+        if check_crossing && final_dist < cutoff {
+            return (final_dist, nei_physics_obj.flag, true);
+        }
         if final_dist < min_front_dist {
             min_front_dist = final_dist;
             flag = nei_physics_obj.flag;
         }
     }
-    (min_front_dist, flag)
+    (min_front_dist, flag, false)
 }
