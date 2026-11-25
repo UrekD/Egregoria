@@ -167,13 +167,15 @@ pub fn commission(
     verify_parking_pair(&sim.map(), terminal, buyer, Tick(sim.get_tick()))?;
 
     // Give the utilities access to the same labour pool as the shops.
-    // All five pairs feed the town network.
-    for (index, cohort) in cohorts.iter().enumerate() {
+    // A sixth pair covers the utility margin after the reserves are built.
+    let utility_anchors = cohorts.iter().map(|cohort| cohort.anchor)
+        .chain([at(1735.0, 1050.0)]);
+    for (index, anchor) in utility_anchors.enumerate() {
         for (name, building) in ["water-pump", "sewage-outlet"].into_iter().zip(water_sites(
             sim,
             plan,
             &roads,
-            cohort.anchor,
+            anchor,
         )?) {
             sites.insert(format!("{name}-{}", index + 1), building);
         }
@@ -1113,16 +1115,23 @@ fn plan_parcels(
         if chosen_blocks.len() != 2 {
             return Err(format!("{}: fewer than two fitting blocks", district.key));
         }
+        let mut starting_industry = 0;
         for block in chosen_blocks {
             candidates.sort_by_key(|(_, candidate)| *candidate != Some(block));
+            let count = if cohort.district == "employment" {
+                block_count[&block].min(3)
+            } else {
+                2
+            };
             take_parcels(
                 &map,
                 district.key,
                 &mut candidates,
                 starter_zone,
-                2,
+                count,
                 &mut painted,
             )?;
+            starting_industry += count;
         }
         candidates.sort_by(|(a, _), (b, _)| {
             a.shape
@@ -1169,7 +1178,7 @@ fn plan_parcels(
                 kind: Industrial,
                 density: High,
             };
-            let remaining = cohort.industry - 4;
+            let remaining = cohort.industry - starting_industry;
             let works = remaining.min(fitting(&candidates, high));
             take_parcels(
                 &map,
@@ -1268,7 +1277,7 @@ fn plan_parcels(
                     .total_cmp(&b.shape.center().distance2(reserve_anchor))
                     .then_with(|| a.id.cmp(&b.id))
             });
-            let additional = 14.min(fitting(&candidates, high_house));
+            let additional = 22.min(fitting(&candidates, high_house));
             take_parcels(&map, district.key, &mut candidates, high_house, additional, &mut reserves)?;
         }
         let mut counts = BTreeMap::new();

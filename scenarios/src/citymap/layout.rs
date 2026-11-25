@@ -237,6 +237,24 @@ pub fn plan_town(
             );
         }
     }
+    let west_south_shortcut = SourceKey::Infill { number: 7, part: 4 };
+    if let Some(link) = graph.links.get_mut(&west_south_shortcut) {
+        // Opposing turns queued through both junctions and blocked this short
+        // link. Keep the direct walk between neighbourhoods.
+        link.class = RoadClass::Walk;
+        for end in link.endpoints {
+            let driving = graph.links.values().filter(|link| {
+                link.class.driving() && link.endpoints.contains(&end)
+            }).count();
+            if driving == 1 {
+                graph.junctions.get_mut(&end).unwrap().turn.back_turns = true;
+            }
+        }
+        graph.record(
+            "keep the west–south infill shortcut for walking",
+            &[west_south_shortcut],
+        );
+    }
 
     Ok(TownPlan {
         config,
@@ -1252,6 +1270,26 @@ fn districts(config: TownConfig) -> Vec<District> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cm2_publish_keeps_the_west_south_shortcut_walkable() {
+        use crate::citymap::{build_dry_town, read_inputs, SourcePaths, DEFAULT_LESCE, DEFAULT_SAVA};
+        use simulation::map::LaneKind;
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let shortcut = SourceKey::Infill { number: 7, part: 4 };
+        assert_eq!(plan.graph.links[&shortcut].class, RoadClass::Walk);
+        let (sim, network) = build_dry_town(&plan).unwrap();
+        let map = sim.map();
+        let road = &map.roads()[network.links[&shortcut].road];
+        assert!(road.lanes_iter().all(|(_, kind)| kind == LaneKind::Walking));
+    }
 
     #[test]
     fn cm2_layout_keeps_the_southeast_stub_walkable_without_vehicle_egress() {
