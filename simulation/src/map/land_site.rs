@@ -391,28 +391,54 @@ fn polygons_overlap(a: &[Vec2], b: &[Vec2]) -> bool {
     // Proper crossings and interior vertices miss chords of an inscribed
     // polygon. Between consecutive boundary contacts, each open edge segment
     // lies on one side of the boundary (or lies along it).
-    let has_interior_edge = |edges: &[(Vec2, Vec2)], other: &[Vec2], boundary: &[(Vec2, Vec2)]| {
+    let has_interior_edge = |edges: &[(Vec2, Vec2)], boundary: &[(Vec2, Vec2)]| {
         edges.iter().any(|&(start, end)| {
-            let start = point(start);
-            let direction = point(end) - start;
-            let length2 = direction.dot(direction);
-            if length2 == 0.0 {
+            let (start, end) = (point(start), point(end));
+            let direction = end - start;
+            if direction == Vec2d::ZERO {
                 return false;
             }
-            let mut contacts = vec![0.0, 1.0];
-            contacts.extend(other.iter().filter_map(|&vertex| {
-                let offset = point(vertex) - start;
-                let t = direction.dot(offset) / length2;
-                (direction.perp_dot(offset) == 0.0 && t > 0.0 && t < 1.0).then_some(t)
-            }));
-            contacts.sort_unstable_by(f64::total_cmp);
+            let axis = |vertex: Vec2d| {
+                if direction.x == 0.0 {
+                    vertex.y
+                } else {
+                    vertex.x
+                }
+            };
+            let edge_min = axis(start).min(axis(end));
+            let edge_max = axis(start).max(axis(end));
+            let mut contacts = vec![start, end];
+            let mut shared_spans = Vec::new();
+            for &(other_start, other_end) in boundary {
+                let (other_start, other_end) = (point(other_start), point(other_end));
+                if direction.perp_dot(other_start - start) != 0.0 {
+                    continue;
+                }
+                let first = axis(other_start);
+                if edge_min < first && first < edge_max {
+                    contacts.push(other_start);
+                }
+                if direction.perp_dot(other_end - start) == 0.0 {
+                    let second = axis(other_end);
+                    let span_min = first.min(second).max(edge_min);
+                    let span_max = first.max(second).min(edge_max);
+                    if span_min < span_max {
+                        shared_spans.push((span_min, span_max));
+                    }
+                }
+            }
+            contacts.sort_unstable_by(|a, b| axis(*a).total_cmp(&axis(*b)));
             contacts.windows(2).any(|range| {
-                range[0] < range[1]
-                    && strictly_inside(start + direction * ((range[0] + range[1]) * 0.5), boundary)
+                let (low, high) = (axis(range[0]), axis(range[1]));
+                // Classify shared spans from the original endpoints. A reconstructed
+                // midpoint can round off a sloped boundary.
+                low < high
+                    && !shared_spans.iter().any(|&(a, b)| a <= low && high <= b)
+                    && strictly_inside((range[0] + range[1]) * 0.5, boundary)
             })
         })
     };
-    has_interior_edge(&a_edges, b, &b_edges) || has_interior_edge(&b_edges, a, &a_edges)
+    has_interior_edge(&a_edges, &b_edges) || has_interior_edge(&b_edges, &a_edges)
 }
 
 #[cfg(test)]
@@ -427,5 +453,15 @@ mod tests {
         assert!(!polygons_overlap(&reserve, &contact));
         assert!(polygons_overlap(&reserve, &inscribed));
         assert!(polygons_overlap(&inscribed, &reserve));
+    }
+
+    #[test]
+    fn tiles_fix_sloped_partial_edge_contact() {
+        let a = [vec2(72.0, 43.0), vec2(69.0, 16.0), vec2(77.0, 43.0)];
+        let b = [vec2(69.0, 16.0), vec2(70.0, 25.0), vec2(62.0, 16.0)];
+        assert_eq!(
+            [polygons_overlap(&a, &b), polygons_overlap(&b, &a)],
+            [false; 2]
+        );
     }
 }

@@ -1,5 +1,5 @@
 use crate::utils::scheduler::SeqSchedule;
-use crate::world_command::WorldCommand;
+use crate::world_command::{ReplayWorldCommand, WorldCommand};
 use crate::{SaveLoadError, Simulation, SimulationOptions, INITIAL_TICK, START_COMMANDS};
 use common::saveload::{Encoder, JSONPretty, SnapshotRevision, JSON};
 use prototypes::Tick;
@@ -12,10 +12,27 @@ pub struct Replay {
     #[serde(default)]
     pub version: String,
     pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_replay_commands")]
     commands: Vec<(Tick, WorldCommand)>,
     pub last_tick_recorded: Tick,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeline: Option<ReplayTimeline>,
+}
+
+fn deserialize_replay_commands<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<(Tick, WorldCommand)>, D::Error> {
+    // Recorded 0.10.0 entries can contain zones larger than the live command limit.
+    #[derive(Deserialize)]
+    struct ReplayEntry(
+        Tick,
+        #[serde(deserialize_with = "ReplayWorldCommand::deserialize")] WorldCommand,
+    );
+
+    Ok(Vec::<ReplayEntry>::deserialize(deserializer)?
+        .into_iter()
+        .map(|ReplayEntry(tick, command)| (tick, command))
+        .collect())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

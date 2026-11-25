@@ -1927,10 +1927,28 @@ mod tiles_fix_regressions {
     }
 
     #[test]
-    fn tiles_fix_decodes_pre_tiles_snapshot_options() {
-        use crate::{SimulationDeser, SimulationSer};
+    fn tiles_fix_reloads_pre_tiles_slot_with_oversized_zone_command() {
+        use crate::utils::replay::ReplayJson;
+        use crate::{SimulationDeser, SimulationSer, SlotSnapshotHeader, SLOT_SNAPSHOT_MAGIC};
+        use common::saveload::{slot_paths, CompressedBincode};
+        use prototypes::Tick;
 
-        let sim = game(LandMode::Unrestricted);
+        let mut sim = game(LandMode::Unrestricted);
+        let zone = zone_with_vertices(257);
+        let command = WorldCommand::UpdateZone {
+            building: Default::default(),
+            zone: zone.clone(),
+        };
+        let tick = Tick(sim.get_tick());
+        let start = sim.read::<Replay>().command_count();
+        sim.apply_commands([&command]);
+        assert_eq!(sim.read::<Replay>().command_count(), start);
+        {
+            // The pre-TILES dispatcher recorded the command before checking the building ID.
+            let mut replay = sim.write::<Replay>();
+            replay.push(tick, command);
+            replay.record_batch(start, false, tick);
+        }
         let bytes = Bincode::encode(&sim).unwrap();
         let mut legacy: SimulationDeser = Bincode::decode(&bytes).unwrap();
         legacy.res.remove("land_ownership").unwrap();
@@ -1947,15 +1965,52 @@ mod tiles_fix_regressions {
             ))
             .unwrap(),
         );
-        let bytes = Bincode::encode(&SimulationSer {
-            header: legacy._header,
-            world: &legacy.world,
-            res: legacy.res,
-        })
+        let revision = SnapshotRevision::new(1);
+        let bytes = CompressedBincode::encode(&(
+            SlotSnapshotHeader {
+                magic: SLOT_SNAPSHOT_MAGIC,
+                version: legacy._header.version.clone(),
+                revision,
+            },
+            SimulationSer {
+                header: legacy._header,
+                world: &legacy.world,
+                res: legacy.res,
+            },
+        ))
         .unwrap();
-        let loaded = Bincode::decode::<Simulation>(&bytes).unwrap();
+        let root =
+            std::env::temp_dir().join(format!("egregoria-tiles-legacy-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let slot = SlotId::new("tiles_legacy").unwrap();
+        let paths = slot_paths(&root, &slot).unwrap();
+        std::fs::write(paths.zip, bytes).unwrap();
+        std::fs::write(
+            paths.replay,
+            ReplayJson::encode_sidecar(&sim.read::<Replay>(), revision).unwrap(),
+        )
+        .unwrap();
+        let loaded = Simulation::load_from_slot(&root, &slot);
+        let sidecar = Simulation::load_replay_from_slot(&root, &slot);
+        std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            loaded.is_ok() && sidecar.is_ok(),
+            "snapshot: {:?}, sidecar: {:?}",
+            loaded.as_ref().err(),
+            sidecar.as_ref().err()
+        );
+        let loaded = loaded.unwrap();
         assert_eq!(sim.hashes(), loaded.hashes());
         assert!(!loaded.map().land_ownership().is_tiled());
+        let sidecar = sidecar.unwrap();
+        assert_eq!(sidecar.command_count(), start + 1);
+        let Some(WorldCommand::UpdateZone {
+            zone: loaded_zone, ..
+        }) = sidecar.commands(start..start + 1).next()
+        else {
+            panic!("legacy zone command missing from the sidecar");
+        };
+        assert_eq!(loaded_zone.poly.as_slice(), zone.poly.as_slice());
     }
 
     #[test]

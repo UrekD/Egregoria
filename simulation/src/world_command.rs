@@ -176,121 +176,146 @@ impl CommandZone {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum WorldCommand {
-    Init(Box<SimulationOptions>),
-    MapRemoveIntersection(IntersectionID),
-    MapRemoveRoad(RoadID),
-    MapRemoveBuilding(BuildingID),
-    MapBuildHouse(LotID),
-    Terraform {
-        kind: TerraformKind,
-        center: Vec2,
-        radius: f32,
-        amount: f32,
-        level: f32,                  // only for flatten
-        slope: Option<(Vec3, Vec3)>, // start and end of slope
-    },
-    SendMessage {
-        message: Message,
-    },
-    SpawnRandomCars {
-        n_cars: usize,
-    },
-    AddTrain {
-        dist: f32,
-        n_wagons: u32,
-        lane: LaneID,
-    },
-    SpawnTrain {
-        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_WAGONS>")]
-        wagons: Vec<RollingStockID>,
-        lane: LaneID,
-        dist: f32,
-    },
-    MapMakeConnection {
-        from: MapProject,
-        to: MapProject,
-        inter: Option<Vec2>,
-        pat: LanePattern,
-    }, // todo: allow lane pattern builder
-    MapMakeMultipleConnections(
-        #[serde(deserialize_with = "bounded_batch_wire")] Vec<MapProject>,
-        #[serde(deserialize_with = "bounded_batch_wire")]
-        Vec<(usize, usize, Option<Vec2>, LanePattern)>,
-    ),
-    MapUpdateIntersectionPolicy {
-        inter: IntersectionID,
-        turn: TurnPolicy,
-        light: LightPolicy,
-    },
-    MapBuildSpecialBuilding {
-        pos: OBB,
-        kind: BuildingKind,
-        gen: BuildingGen,
-        #[serde(default, deserialize_with = "CommandZone::decode_optional")]
-        zone: Option<Zone>,
-        #[serde(default)]
-        connected_road: Option<RoadID>,
-    },
-    MapLoadParis,
-    MapLoadTestField {
-        pos: Vec2,
-        size: u32,
-        spacing: f32,
-    },
-    UpdateZone {
-        building: BuildingID,
-        #[serde(deserialize_with = "CommandZone::decode")]
-        zone: Zone,
-    },
-    SetGameTime(GameTime),
-    ZonePaint {
-        area: OBB,
-        kind: Option<ZoneKind>,
-        density: Density,
-    },
-    SetTaxRate {
-        zone: ZoneKind,
-        rate_permille: u16,
-    },
-    TransitAddStop {
-        pos: Vec3,
-        dir: Vec2,
-    },
-    TransitRemoveStop {
-        stop: StopID,
-    },
-    TransitCreateLine {
-        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_LINE_STOPS>")]
-        stops: Vec<StopID>,
-    },
-    TransitEditLine {
-        line: LineID,
-        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_LINE_STOPS>")]
-        stops: Vec<StopID>,
-    },
-    TransitRemoveLine {
-        line: LineID,
-    },
-    TransitSetVehicles {
-        line: LineID,
-        n: u8,
-    },
-    TransitSetFare {
-        line: LineID,
-        fare: Money,
-    },
-    SetWarehousePolicy {
-        building: BuildingID,
-        policy: WarehousePolicy,
-    },
-    /// Sizes new lots and regenerates the empty lots along every frontage road.
-    SetLotLayout(LotLayout),
-    EditWater(WaterEdit),
-    BuyTile {
-        tile: LandTileId,
-    },
+// Keep the variant names, order, and fields shared by the live and replay decoders.
+macro_rules! define_world_command {
+    (
+        $(#[$attr:meta])*
+        $vis:vis enum $name:ident;
+        zone = $zone:literal,
+        optional_zone = $optional_zone:literal,
+    ) => {
+        $(#[$attr])*
+        $vis enum $name {
+            Init(Box<SimulationOptions>),
+            MapRemoveIntersection(IntersectionID),
+            MapRemoveRoad(RoadID),
+            MapRemoveBuilding(BuildingID),
+            MapBuildHouse(LotID),
+            Terraform {
+                kind: TerraformKind,
+                center: Vec2,
+                radius: f32,
+                amount: f32,
+                level: f32,                  // only for flatten
+                slope: Option<(Vec3, Vec3)>, // start and end of slope
+            },
+            SendMessage {
+                message: Message,
+            },
+            SpawnRandomCars {
+                n_cars: usize,
+            },
+            AddTrain {
+                dist: f32,
+                n_wagons: u32,
+                lane: LaneID,
+            },
+            SpawnTrain {
+                #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_WAGONS>")]
+                wagons: Vec<RollingStockID>,
+                lane: LaneID,
+                dist: f32,
+            },
+            MapMakeConnection {
+                from: MapProject,
+                to: MapProject,
+                inter: Option<Vec2>,
+                pat: LanePattern,
+            }, // todo: allow lane pattern builder
+            MapMakeMultipleConnections(
+                #[serde(deserialize_with = "bounded_batch_wire")] Vec<MapProject>,
+                #[serde(deserialize_with = "bounded_batch_wire")]
+                Vec<(usize, usize, Option<Vec2>, LanePattern)>,
+            ),
+            MapUpdateIntersectionPolicy {
+                inter: IntersectionID,
+                turn: TurnPolicy,
+                light: LightPolicy,
+            },
+            MapBuildSpecialBuilding {
+                pos: OBB,
+                kind: BuildingKind,
+                gen: BuildingGen,
+                #[serde(default, deserialize_with = $optional_zone)]
+                zone: Option<Zone>,
+                #[serde(default)]
+                connected_road: Option<RoadID>,
+            },
+            MapLoadParis,
+            MapLoadTestField {
+                pos: Vec2,
+                size: u32,
+                spacing: f32,
+            },
+            UpdateZone {
+                building: BuildingID,
+                #[serde(deserialize_with = $zone)]
+                zone: Zone,
+            },
+            SetGameTime(GameTime),
+            ZonePaint {
+                area: OBB,
+                kind: Option<ZoneKind>,
+                density: Density,
+            },
+            SetTaxRate {
+                zone: ZoneKind,
+                rate_permille: u16,
+            },
+            TransitAddStop {
+                pos: Vec3,
+                dir: Vec2,
+            },
+            TransitRemoveStop {
+                stop: StopID,
+            },
+            TransitCreateLine {
+                #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_LINE_STOPS>")]
+                stops: Vec<StopID>,
+            },
+            TransitEditLine {
+                line: LineID,
+                #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_LINE_STOPS>")]
+                stops: Vec<StopID>,
+            },
+            TransitRemoveLine {
+                line: LineID,
+            },
+            TransitSetVehicles {
+                line: LineID,
+                n: u8,
+            },
+            TransitSetFare {
+                line: LineID,
+                fare: Money,
+            },
+            SetWarehousePolicy {
+                building: BuildingID,
+                policy: WarehousePolicy,
+            },
+            /// Sizes new lots and regenerates the empty lots along every frontage road.
+            SetLotLayout(LotLayout),
+            EditWater(WaterEdit),
+            BuyTile {
+                tile: LandTileId,
+            },
+        }
+    };
+}
+
+define_world_command! {
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub enum WorldCommand;
+    zone = "CommandZone::decode",
+    optional_zone = "CommandZone::decode_optional",
+}
+
+define_world_command! {
+    #[derive(Deserialize)]
+    #[serde(remote = "WorldCommand")]
+    pub(crate) enum ReplayWorldCommand;
+    zone = "Deserialize::deserialize",
+    optional_zone = "Deserialize::deserialize",
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
