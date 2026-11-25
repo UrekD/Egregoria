@@ -265,7 +265,9 @@ pub fn is_special_building_company(proto: GoodsCompanyID) -> bool {
 pub fn company_system(world: &mut World, res: &mut Resources) {
     profiling::scope!("souls::company_system");
     let cbuf: &ParCommandBuffer<CompanyEnt> = &res.read();
-    let market: &Market = &res.read();
+    let mut market = res.write::<Market>();
+    market.reconcile_loaded_shelf_limits(world);
+    let market: &Market = &market;
     let map: &Map = &res.read();
     let elec_flow: &ElectricityFlow = &res.read();
     let job_opening = ItemID::new("job-opening");

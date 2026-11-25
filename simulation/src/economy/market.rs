@@ -181,6 +181,8 @@ pub struct Market {
     #[serde(skip)]
     shelves: Option<ShelfIndex>,
     #[serde(skip)]
+    shelf_limits_current: bool,
+    #[serde(skip)]
     reservation_tick: u64,
     #[serde(skip)]
     reserved_this_tick: BTreeSet<SoulID>,
@@ -329,6 +331,7 @@ impl Default for Market {
             shelf_refills: Default::default(),
             reserved_stock: Default::default(),
             shelves: None,
+            shelf_limits_current: true,
             reservation_tick: 0,
             reserved_this_tick: Default::default(),
             human_buyers: None,
@@ -422,6 +425,50 @@ impl Market {
             .sell_order(seller)
             .filter(|order| order.stock > 0)
             .map_or(default, |order| order.stock)
+    }
+
+    pub(crate) fn reconcile_loaded_shelf_limits(&mut self, world: &World) {
+        // Snapshots store advertised allowances. Refresh them before the first
+        // refill without rewriting on-hand capital or in-flight reservations.
+        if std::mem::replace(&mut self.shelf_limits_current, true) {
+            return;
+        }
+        let delivery = shelf_delivery_item();
+        for (id, company) in world.companies.iter() {
+            let Some(recipe) = try_prototype(company.comp.proto).and_then(|p| p.recipe.as_ref())
+            else {
+                continue;
+            };
+            let capacity = |item| {
+                recipe
+                    .production
+                    .iter()
+                    .find(|output| output.id == item)
+                    .map(|output| output.amount * recipe.storage_multiplier)
+            };
+            let Some(stockroom) = capacity(delivery) else {
+                continue;
+            };
+            let seller = SoulID::GoodsCompany(id);
+            let mut changed = false;
+            let shelves = household_items()
+                .into_iter()
+                .zip(shelf_delivery_units(stockroom));
+            for (item, limit) in shelves.chain([(delivery, stockroom)]) {
+                let limit = capacity(item).unwrap_or(limit) as u32;
+                if let Some(order) = self
+                    .markets
+                    .get_mut(&item)
+                    .and_then(|market| market.sell_orders.get_mut(&seller))
+                {
+                    changed |= order.stock != limit;
+                    order.stock = limit;
+                }
+            }
+            if changed && self.capital(seller, delivery) > 0 {
+                self.shelf_refills.insert(seller);
+            }
+        }
     }
 
     fn discard_shelf_overflow(
@@ -1639,6 +1686,82 @@ mod tests {
 
     fn mk_ent(id: u64) -> CompanyID {
         CompanyID::from(slotmapd::KeyData::from_ffi(id))
+    }
+
+    #[test]
+    fn econ_food_loaded_shop_refills_to_current_limits_with_a_reserved_basket() {
+        use super::BasketRequest;
+        use crate::economy::balance::shelf_delivery_item;
+        use crate::map::BuildingKind;
+        use crate::souls::{add_souls_to_empty_buildings, growth::on_growable_placed};
+        use crate::tests::TestCtx;
+        use common::saveload::{Bincode, Encoder};
+        use geom::OBB;
+        use prototypes::GoodsCompanyID;
+
+        let mut test = TestCtx::new_fast();
+        let proto = GoodsCompanyID::new("commercial-l1").prototype();
+        let kind = BuildingKind::GoodsCompany(proto.id);
+        let pos = vec2(240.0, 200.0);
+        let building = test
+            .g
+            .map_mut()
+            .build_special_building(
+                &OBB::new(pos, Vec2::X, 20.0, 20.0),
+                kind,
+                proto.bgen,
+                None,
+                None,
+            )
+            .unwrap();
+        on_growable_placed(&test.g, building, kind);
+        add_souls_to_empty_buildings(&mut test.g);
+        let seller = test
+            .g
+            .read::<crate::map_dynamic::BuildingInfos>()
+            .owner(building)
+            .unwrap();
+        let groceries = ItemID::new("groceries");
+        let delivery = shelf_delivery_item();
+        let mut market = test.g.write::<Market>();
+        market.produce(seller, groceries, 36);
+        market.sell(seller, pos, groceries, 36, 36);
+        market.produce(seller, delivery, 200);
+        market.sell(seller, pos, delivery, 200, 12);
+        let (basket, _) = market
+            .reserve_basket(
+                crate::HumanID::default(),
+                pos,
+                50.0,
+                BasketRequest {
+                    staples: 4,
+                    ..Default::default()
+                },
+                1,
+                |_| Some(building),
+            )
+            .unwrap();
+        market.shelf_refills.insert(seller);
+        *market = Bincode::decode(&Bincode::encode(&*market).unwrap()).unwrap();
+        drop(market);
+        let (world, resources) = test.g.world_res();
+        crate::souls::goods_company::company_system(world, resources);
+        assert_eq!(
+            resources.read::<Market>().inner()[&groceries]
+                .sell_order(seller)
+                .unwrap()
+                .stock,
+            432,
+            "the shelf limit must be current before the first production batch"
+        );
+        crate::economy::market_update(world, resources);
+        let mut market = resources.write::<Market>();
+        let order = market.inner()[&groceries].sell_order(seller).unwrap();
+        assert_eq!((order.qty, order.stock), (428, 432));
+        assert_eq!(market.reserved_stock[&(seller, groceries)], 4);
+        market.release_basket(basket, true);
+        assert_eq!(market.capital(seller, groceries), 432);
+        assert!(!market.reserved_stock.contains_key(&(seller, groceries)));
     }
 
     #[test]

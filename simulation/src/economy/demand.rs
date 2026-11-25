@@ -5,15 +5,20 @@ use crate::economy::balance::{
     K_UNEMP, K_VAC, MIN_DEMAND_POPULATION, NEUTRAL_HAPPINESS, R_BASE, R_BOOTSTRAP_POPULATION,
     SHELF_TARGET_UTILIZATION,
 };
-use crate::economy::{Budget, Market};
-use crate::map::{BuildingID, Map, ZoneKind};
+use crate::economy::{Budget, Market, WalkingComponents};
+use crate::map::{BuildingID, LaneID, Map, ZoneKind};
 use crate::map_dynamic::{active_business, BuildingInfos};
 use crate::souls::happiness::Happiness;
+use crate::souls::household::BASKET_TRAVEL_LIMIT;
 use crate::souls::residence::Residences;
 use crate::utils::resources::Resources;
 use crate::{SoulID, World};
 use common::FastMap;
-use prototypes::{try_prototype, GrowableCompanyID, ItemID, RecipeItem, TICKS_PER_HOUR};
+use geom::Vec3;
+use prototypes::{
+    try_prototype, GrowableCompanyID, ItemID, RecipeItem, HOURS_PER_DAY, TICKS_PER_HOUR,
+    TICKS_PER_REALTIME_SECOND,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -128,7 +133,8 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     let market = resources.read::<Market>();
     let map = resources.read::<Map>();
     let infos = resources.read::<BuildingInfos>();
-    let rates = company_rates(world, &map, &infos, &market);
+    let mut walking = resources.write::<WalkingComponents>();
+    let rates = company_rates(world, &map, &infos, &market, &mut walking);
 
     let residences = resources.read::<Residences>();
     let mut demand = resources.write::<ZoneDemand>();
@@ -136,9 +142,27 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     occupants.clear();
     let mut unemployed = 0;
     let mut unmet = [0_u64; 2];
+    let mut nearest_store = FastMap::default();
+    let mut uncovered = 0;
     let now = budget.elapsed_ticks(resources.tick());
     for human in world.humans.values() {
         *occupants.entry(human.home.house).or_insert(0u32) += 1;
+        let distance2 = *nearest_store.entry(human.home.house).or_insert_with(|| {
+            map.get(human.home.house)
+                .and_then(|home| {
+                    let component = walking.component_at(&map, home.door_pos)?;
+                    rates.shop_doors.get(&component).map(|doors| {
+                        doors
+                            .iter()
+                            .map(|door| door.distance2(home.door_pos))
+                            .fold(f32::INFINITY, f32::min)
+                    })
+                })
+                .unwrap_or(f32::INFINITY)
+        });
+        let radius = human.pedestrian.walking_speed
+            * (BASKET_TRAVEL_LIMIT / TICKS_PER_REALTIME_SECOND - 60) as f32;
+        uncovered += usize::from(distance2 > radius.powi(2));
         for (total, request) in unmet
             .iter_mut()
             .zip(human.household.unmet_shelf_demand(now))
@@ -172,6 +196,13 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
     let population = world.humans.len();
     let per_capita = 100.0 / population.max(MIN_DEMAND_POPULATION) as f32;
     let unemployed_norm = unemployed as f32 * per_capita;
+    // Keep a retail signal for small disconnected neighbourhoods as well as large
+    // gaps. The floor clears the commercial placement threshold after smoothing.
+    let coverage_shortfall = if uncovered > 0 {
+        (uncovered as f32 * per_capita).max(10.0)
+    } else {
+        -100.0
+    };
     let r_base = if population < R_BOOTSTRAP_POPULATION {
         R_BASE
     } else {
@@ -198,7 +229,10 @@ pub fn demand_update(world: &mut World, resources: &mut Resources) {
         (
             ZoneKind::Commercial,
             DemandDrivers {
-                shortfall: K_RET * rates.retail_shortfall(population, unmet),
+                shortfall: K_RET
+                    * rates
+                        .retail_shortfall(population, unmet)
+                        .max(coverage_shortfall),
                 ..Default::default()
             },
         ),
@@ -254,12 +288,17 @@ struct CompanyRates {
     groceries_supply: f64,
     shelf_packages_supply: f64,
     industrial_growables: usize,
+    shop_doors: BTreeMap<LaneID, Vec<Vec3>>,
 }
 
 impl CompanyRates {
+    fn household_need(population: usize) -> [f64; 2] {
+        [FOOD_UNIT_TICKS, GOODS_UNIT_TICKS]
+            .map(|cadence| population as f64 * TICKS_PER_HOUR as f64 / cadence as f64)
+    }
+
     fn retail_shortfall(&self, population: usize, unmet: [u64; 2]) -> f32 {
-        let staples_need = population as f64 * TICKS_PER_HOUR as f64 / FOOD_UNIT_TICKS as f64;
-        let retail_need = population as f64 * TICKS_PER_HOUR as f64 / GOODS_UNIT_TICKS as f64;
+        let [staples_need, retail_need] = Self::household_need(population);
         let [staples_per_package, retail_per_package] = shelf_delivery_units(1).map(f64::from);
         // Count live unmet lines by SKU. They can reveal empty or unevenly
         // distributed shelves even when nominal staffed production is high.
@@ -301,10 +340,22 @@ impl CompanyRates {
     }
 }
 
-fn company_rates(world: &World, map: &Map, infos: &BuildingInfos, market: &Market) -> CompanyRates {
+fn company_rates(
+    world: &World,
+    map: &Map,
+    infos: &BuildingInfos,
+    market: &Market,
+    walking: &mut WalkingComponents,
+) -> CompanyRates {
     let goods = ItemID::new("goods");
     let [groceries, retail_goods] = crate::souls::household::household_items();
     let mut rates = CompanyRates::default();
+    let [staples_per_package, _] = shelf_delivery_units(1).map(f64::from);
+    let mut wholesale_inputs = 0.0;
+    let mut wholesale_output = 0.0;
+    let mut other_packages = 0.0;
+    let mut other_retail = 0.0;
+    let mut other_groceries = 0.0;
     let amount = |items: &[RecipeItem], kind| {
         items
             .iter()
@@ -348,27 +399,73 @@ fn company_rates(world: &World, map: &Map, infos: &BuildingInfos, market: &Marke
         else {
             continue;
         };
-        let full_batches = TICKS_PER_HOUR as f64 / batch_ticks;
-        let staffed_batches = full_batches * business_rates.staffed_fraction;
-        let delivery = amount(&recipe.production, shelf_delivery_item());
-        rates.shelf_packages_supply += delivery * SHELF_TARGET_UTILIZATION * staffed_batches;
-        rates.groceries_supply += amount(&recipe.production, groceries) * staffed_batches;
-        let retail_output = amount(&recipe.production, retail_goods);
-        let retail_utilization = if delivery > 0.0 {
+        let staffed_batches = TICKS_PER_HOUR as f64 / batch_ticks * business_rates.staffed_fraction;
+        let packages = amount(&recipe.production, shelf_delivery_item());
+        let staples = amount(&recipe.production, groceries);
+        let retail = amount(&recipe.production, retail_goods);
+        let shelf_utilization = if packages > 0.0 {
             SHELF_TARGET_UTILIZATION
         } else {
             1.0
         };
-        rates.retail_supply += retail_output * retail_utilization * staffed_batches;
-        match zone {
-            Some(ZoneKind::Commercial | ZoneKind::MixedUse) => {
-                rates.goods_need += amount(&recipe.consumption, goods) * full_batches;
+        let package_rate = packages * staffed_batches * shelf_utilization;
+        let grocery_rate = staples * staffed_batches;
+        let retail_rate = retail * staffed_batches * shelf_utilization;
+        rates.shelf_packages_supply += package_rate;
+        rates.groceries_supply += grocery_rate;
+        rates.retail_supply += retail_rate;
+        if packages > 0.0 || staples > 0.0 || retail > 0.0 {
+            if let Some(component) = walking.component_at(map, building.door_pos) {
+                if walking.reaches_building(map, component, building) {
+                    rates
+                        .shop_doors
+                        .entry(component)
+                        .or_default()
+                        .push(building.door_pos);
+                }
             }
-            Some(ZoneKind::Industrial) => {
-                rates.goods_supply += amount(&recipe.production, goods) * staffed_batches;
-            }
-            _ => {}
         }
+
+        let wholesale = amount(&recipe.consumption, goods);
+        match zone {
+            Some(ZoneKind::Commercial | ZoneKind::MixedUse) if wholesale > 0.0 => {
+                if packages > 0.0 || staples > 0.0 || retail > 0.0 {
+                    wholesale_inputs += wholesale * staffed_batches * shelf_utilization;
+                    wholesale_output +=
+                        package_rate + grocery_rate / staples_per_package + retail_rate;
+                    // A new shop may need its first delivery before it has workers or sales.
+                    let seller = SoulID::GoodsCompany(id);
+                    let has_opened = [groceries, retail_goods].into_iter().any(|item| {
+                        market
+                            .inner()
+                            .get(&item)
+                            .is_some_and(|m| m.sell_order(seller).is_some())
+                    });
+                    if !has_opened {
+                        rates.goods_need += wholesale / f64::from(HOURS_PER_DAY);
+                    }
+                } else {
+                    rates.goods_need += wholesale * staffed_batches;
+                }
+            }
+            zone => {
+                other_packages += package_rate;
+                other_groceries += grocery_rate;
+                other_retail += retail_rate;
+                if zone == Some(ZoneKind::Industrial) {
+                    rates.goods_supply += amount(&recipe.production, goods) * staffed_batches;
+                }
+            }
+        }
+    }
+    // Estimate sell-through in package equivalents, crediting each unit of
+    // direct output against its own SKU before allocating shared packages.
+    if wholesale_output > 0.0 {
+        let [groceries, retail] = CompanyRates::household_need(world.humans.len());
+        let remaining = (groceries - other_groceries).max(0.0) / staples_per_package
+            + (retail - other_retail).max(0.0);
+        let utilization = ((remaining - other_packages).max(0.0) / wholesale_output).min(1.0);
+        rates.goods_need += wholesale_inputs * utilization;
     }
     rates
 }
@@ -377,7 +474,7 @@ fn company_rates(world: &World, map: &Map, infos: &BuildingInfos, market: &Marke
 mod tests {
     use super::*;
     use crate::economy::market_update;
-    use crate::map::{BuildingID, BuildingKind};
+    use crate::map::{BuildingID, BuildingKind, ProjectFilter, ProjectKind, RoadID};
     use crate::souls::goods_company::GoodsCompanyState;
     use crate::souls::human::spawn_human;
     use crate::souls::residence::Residence;
@@ -443,11 +540,12 @@ mod tests {
                 &ctx.g.map(),
                 &ctx.g.read::<BuildingInfos>(),
                 &ctx.g.read::<Market>(),
+                &mut WalkingComponents::default(),
             )
         };
         let open = rates(&ctx);
         assert_eq!(open.open_jobs, 12);
-        assert_eq!(open.goods_need, 2.0 * full_batches);
+        assert_eq!(open.goods_need, 2.0 / f64::from(HOURS_PER_DAY));
         assert_eq!(
             open.retail_supply,
             SHELF_TARGET_UTILIZATION * full_batches * 0.5
@@ -495,17 +593,33 @@ mod tests {
     }
 
     fn company(ctx: &mut TestCtx, name: &str, max_workers: u32) -> CompanyID {
-        let proto = GoodsCompanyID::new(name).prototype();
         let index = ctx.g.world.companies.len();
+        company_at(
+            ctx,
+            name,
+            max_workers,
+            vec2(120.0 + 24.0 * index as f32, 60.0),
+            None,
+        )
+    }
+
+    fn company_at(
+        ctx: &mut TestCtx,
+        name: &str,
+        max_workers: u32,
+        center: Vec2,
+        road: Option<RoadID>,
+    ) -> CompanyID {
+        let proto = GoodsCompanyID::new(name).prototype();
         let building = ctx
             .g
             .map_mut()
             .build_special_building(
-                &OBB::new(vec2(120.0 + 24.0 * index as f32, 60.0), Vec2::X, 20.0, 20.0),
+                &OBB::new(center, Vec2::X, 20.0, 20.0),
                 BuildingKind::GoodsCompany(proto.id),
                 proto.bgen,
                 None,
-                None,
+                road,
             )
             .unwrap();
         let company = ctx.g.world_mut_unchecked().insert(CompanyEnt {
@@ -526,6 +640,14 @@ mod tests {
         infos.insert(building);
         infos.set_owner(building, SoulID::GoodsCompany(company));
         company
+    }
+
+    fn road_at(ctx: &TestCtx, pos: Vec3) -> RoadID {
+        let ProjectKind::Road(road) = ctx.g.map().project(pos, 2.0, ProjectFilter::ROAD).kind
+        else {
+            panic!("no fixture road at {pos:?}");
+        };
+        road
     }
 
     #[test]
@@ -572,7 +694,7 @@ mod tests {
         company(&mut ctx, "bakery", 5);
         company(&mut ctx, "commercial-l1", 4);
         company(&mut ctx, "office-l1", 6);
-        let goods_shortfall = K_GOODS * 100.0;
+        let goods_shortfall = K_GOODS * shortfall_norm(2.0 / f64::from(HOURS_PER_DAY), 0.0);
         assert_eq!(
             sample(&mut ctx.g, 1)[&ZoneKind::Industrial],
             I_BASE + goods_shortfall
@@ -641,7 +763,9 @@ mod tests {
             let house = home(&ctx, 1);
             let human = spawn_human(&mut ctx.g, house).unwrap();
             let industrial = company(&mut ctx, "industrial-l1", 6);
-            let commercial = company(&mut ctx, "commercial-l1", 4);
+            let road = road_at(&ctx, vec3(220.0, 100.0, 0.0));
+            let commercial =
+                company_at(&mut ctx, "commercial-l1", 4, vec2(220.0, 130.0), Some(road));
             company(&mut ctx, "office-l1", 6);
             let jobs = ItemID::new("job-opening");
             let seller = SoulID::GoodsCompany(industrial);
@@ -740,6 +864,78 @@ mod tests {
         assert!(rates.retail_shortfall(240, [0, 0]) > 0.0);
         rates.retail_supply = 10.0;
         assert!(rates.retail_shortfall(240, [0, 0]) < 0.0);
+    }
+
+    #[test]
+    fn econ_food_stocked_shops_budget_wholesale_for_expected_sales() {
+        let mut ctx = TestCtx::new_fast();
+        let house = home(&ctx, 12);
+        for _ in 0..12 {
+            spawn_human(&mut ctx.g, house).unwrap();
+        }
+        let shop = company(&mut ctx, "commercial-l1", 12);
+        let industry = company(&mut ctx, "industrial-l1", 18);
+        for (id, staff) in [(shop, 12), (industry, 6)] {
+            ctx.g.world.companies[id].workers.0 = vec![crate::HumanID::default(); staff];
+        }
+        let seller = SoulID::GoodsCompany(shop);
+        let mut market = ctx.g.write::<Market>();
+        for (item, capacity) in crate::souls::household::household_items()
+            .into_iter()
+            .zip([432, 12])
+        {
+            market.produce(seller, item, capacity as i32);
+            market.sell(seller, Vec2::ZERO, item, capacity, capacity);
+        }
+        drop(market);
+        sample(&mut ctx.g, 1);
+        let demand = ctx.g.read::<ZoneDemand>();
+        assert!(demand.drivers(ZoneKind::Industrial).unwrap().shortfall < 0.0);
+    }
+
+    #[test]
+    fn econ_food_stocked_shop_across_a_walk_break_does_not_cover_homes() {
+        let mut ctx = TestCtx::new_fast();
+        let house = home(&ctx, 6);
+        for _ in 0..6 {
+            spawn_human(&mut ctx.g, house).unwrap();
+        }
+        ctx.build_roads(&[vec3(100.0, 260.0, 0.0), vec3(300.0, 260.0, 0.0)]);
+        let road = road_at(&ctx, vec3(200.0, 260.0, 0.0));
+        let shop = company_at(
+            &mut ctx,
+            "commercial-l1",
+            12,
+            vec2(200.0, 280.0),
+            Some(road),
+        );
+        ctx.g.world.companies[shop].workers.0 = vec![crate::HumanID::default(); 12];
+        let seller = SoulID::GoodsCompany(shop);
+        let groceries = ItemID::new("groceries");
+        let mut market = ctx.g.write::<Market>();
+        market.produce(seller, groceries, 432);
+        market.sell(seller, vec2(200.0, 280.0), groceries, 432, 432);
+        drop(market);
+
+        sample(&mut ctx.g, 1);
+        assert!(
+            ctx.g
+                .read::<ZoneDemand>()
+                .drivers(ZoneKind::Commercial)
+                .unwrap()
+                .shortfall
+                > 5.0
+        );
+        ctx.build_roads(&[vec3(300.0, 100.0, 0.0), vec3(300.0, 260.0, 0.0)]);
+        sample(&mut ctx.g, 2);
+        assert!(
+            ctx.g
+                .read::<ZoneDemand>()
+                .drivers(ZoneKind::Commercial)
+                .unwrap()
+                .shortfall
+                < 0.0
+        );
     }
 
     #[test]
