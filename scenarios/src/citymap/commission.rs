@@ -20,7 +20,8 @@ use simulation::map::{
 };
 use simulation::map::{RailMarketError, RailMarketSite};
 use simulation::map_dynamic::service_reach_sources;
-use simulation::map_dynamic::transit::{elapsed_ticks, LineID, StopID};
+use simulation::diagnostics::elapsed_tick;
+use simulation::map_dynamic::transit::{LineID, StopID};
 use simulation::map_dynamic::{
     BuildingInfos, CoverageGrid, ElectricityFlow, Itinerary, ParkingManagement, RoutingStep,
     Transit, UtilityFlow, UtilityStatus,
@@ -375,7 +376,7 @@ pub fn commission(
     // morning, so a whole elapsed day returns to the same commute phase.
     for day in 1..=4 {
         let target = day * TICKS_PER_BUDGET_DAY;
-        let now = elapsed_ticks(sim.world_res().1).0;
+        let now = elapsed_tick(sim).0;
         advance(sim, &mut schedule, target - now);
         eprintln!(
             "CITYMAP warm-up day {day}: {} residents, {} completed transit trips, treasury {}",
@@ -1531,19 +1532,8 @@ fn traffic_clear(car_arrivals: u64, standing: u64, blocking: u64, stranded: u64)
 }
 
 fn recurring_balance(day: &BTreeMap<BudgetCategory, i128>) -> i128 {
-    use BudgetCategory::*;
     day.iter()
-        .filter_map(|(category, amount)| match category {
-            TradeImport
-            | TradeExport
-            | Tax(_)
-            | RoadUpkeep
-            | SpecialBuildingUpkeep
-            | ServiceUpkeep
-            | TransitFares
-            | TransitUpkeep => Some(amount),
-            Construction | StarterInfrastructure | MilestoneGrant => None,
-        })
+        .filter_map(|(category, amount)| category.is_operating().then_some(amount))
         .sum()
 }
 
@@ -2326,7 +2316,7 @@ pub fn check_loaded_opening(
             ));
         }
     }
-    let load = elapsed_ticks(sim.world_res().1).0;
+    let load = elapsed_tick(&sim).0;
     let start = load.div_ceil(TICKS_PER_BUDGET_DAY) * TICKS_PER_BUDGET_DAY;
     let end = start + SOAK_DAYS * TICKS_PER_BUDGET_DAY;
     let mut schedule = Simulation::schedule();
@@ -2407,7 +2397,7 @@ pub fn check_loaded_opening(
                 }
             }
         }
-        let close = elapsed_ticks(sim.world_res().1).0;
+        let close = elapsed_tick(&sim).0;
         freight.buyer_station_receipts += prior_receipts
             .max(item_receipts(&sim))
             .saturating_sub(initial_receipts);
