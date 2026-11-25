@@ -1604,7 +1604,10 @@ fn paint<'a>(
             density: parcel.zoning.density,
         })
         .collect();
-    apply(sim, "parcel paint", &commands)
+    for batch in commands.chunks(sim.command_batch_limit()) {
+        apply(sim, "parcel paint", batch)?;
+    }
+    Ok(())
 }
 
 fn verify_votes<'a>(
@@ -4008,6 +4011,9 @@ mod tests {
         eprintln!("Wet frontage: {near_bakeries}/{housing} housing places near {} bakeries, {reserve} reserve places, {reserve_shops} reserve shops, housing by district {by_district:?}", bakeries.len());
         assert!(near_bakeries * 100 >= housing * 95 && reserve >= 260 && reserve_shops >= 3,
             "{near_bakeries}/{housing} housing places within a 180 m walk of a bakery, {reserve} reserve housing places and {reserve_shops} reserve shops");
+        drop(map);
+        paint(&mut sim, opening.parcels.iter()).unwrap();
+        verify_votes(&sim, opening.parcels.iter()).unwrap();
     }
 
     #[test]
