@@ -2,7 +2,9 @@ use goryak::{
     blur_bg, fixed_spacer, mincolumn, minrow, on_secondary_container, padxy, secondary_container,
     textc,
 };
-use prototypes::{try_prototype, GoodsCompanyID, Power};
+use prototypes::{
+    try_prototype, GoodsCompanyID, Power, ServiceID, DEFAULT_WATER_SERVICE_DISTANCE_M,
+};
 use simulation::map_dynamic::UtilityNetworkState;
 use yakui::{
     colored_box_container, constrained, reflow, Alignment, Color, Constraints, Dim2, Pivot, Vec2,
@@ -180,6 +182,22 @@ fn utility_legend(mode: OverlayMode, company: Option<GoodsCompanyID>) {
     let Some(prototype) = company.and_then(try_prototype) else {
         return;
     };
+    let shore = match mode {
+        OverlayMode::Water => Some("River or lake shore"),
+        OverlayMode::Sewage => Some("Downstream river bank or coast"),
+        _ => None,
+    };
+    if let Some((shore, service)) =
+        shore.zip(company.and_then(|id| try_prototype(ServiceID::from(id))))
+    {
+        let reach = service
+            .max_water_distance_m
+            .unwrap_or(DEFAULT_WATER_SERVICE_DISTANCE_M);
+        textc(
+            on_secondary_container(),
+            format!("{shore} · {reach} m reach on water maps"),
+        );
+    }
     let network = ground::placement_network();
     if let Some(network) = network.as_ref() {
         let state = mode.utility_state(network);
@@ -248,7 +266,7 @@ fn utility_legend(mode: OverlayMode, company: Option<GoodsCompanyID>) {
     textc(on_secondary_container(), output);
 }
 
-fn legend_item(color: [f32; 4], label: &'static str) {
+pub(super) fn legend_item(color: [f32; 4], label: &'static str) {
     minrow(4.0, || {
         color_swatch(color, 12.0);
         textc(on_secondary_container(), label);

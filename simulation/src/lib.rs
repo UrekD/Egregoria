@@ -65,6 +65,7 @@ mod world;
 pub mod world_command;
 
 pub use common::saveload::{list_slots_with_revisions, save_dir, SlotCamera, SlotId, SnapshotRevision};
+pub use map::{AuthoredTownError, AuthoredTownOptions};
 pub use world::*;
 
 pub use utils::par_command_buffer::ParCommandBuffer;
@@ -323,6 +324,7 @@ impl Simulation {
                 seed,
                 ..SimulationOptions::LEGACY
             },
+            LotLayout::default(),
         )
         .map_err(NewGameError::Bootstrap)?;
         Ok(sim)

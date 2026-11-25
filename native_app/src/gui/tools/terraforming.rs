@@ -3,7 +3,7 @@ use std::collections::VecDeque;
 use geom::{Vec2, Vec3, OBB};
 use simulation::map::{
     TerraformKind, WaterBasin, WaterBodyId, WaterEdit, WaterEditError, WaterEditOutcome, WaterKind,
-    WaterStroke, MAX_WATER_VERTICES,
+    WaterProviderImpact, WaterProviderImpactSample, WaterStroke, MAX_WATER_VERTICES,
 };
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::Simulation;
@@ -205,6 +205,8 @@ pub(crate) struct WaterTools {
     pub current_sea_dm: Option<i16>,
     pub sea_action: Option<Option<i16>>,
     pub status: Option<String>,
+    pub(crate) confirmation: Option<WaterProviderImpact>,
+    pub(crate) confirm_action: bool,
     stroke: Option<WaterGesture>,
     preview: Option<CachedWaterPreview>,
     pending: VecDeque<WaterEdit>,
@@ -222,6 +224,8 @@ impl Default for WaterTools {
             current_sea_dm: None,
             sea_action: None,
             status: None,
+            confirmation: None,
+            confirm_action: false,
             stroke: None,
             preview: None,
             pending: VecDeque::new(),
@@ -241,9 +245,15 @@ impl WaterTools {
     fn cancel(&mut self) {
         self.stroke = None;
         self.sea_action = None;
-        self.status = None;
-        self.preview = None;
+        self.dismiss_confirmation();
         self.submitted_summary = None;
+    }
+
+    pub(crate) fn dismiss_confirmation(&mut self) {
+        self.confirmation = None;
+        self.confirm_action = false;
+        self.preview = None;
+        self.status = None;
     }
 
     fn update(
@@ -262,7 +272,16 @@ impl WaterTools {
         }
         let revision = env.water_revision();
 
-        // Toolbox clicks are explicit confirmations, even when they capture the pointer.
+        if self.confirmation.is_some() {
+            drop(map);
+            if std::mem::take(&mut self.confirm_action) {
+                let edit = self.preview.as_ref().unwrap().edit.clone();
+                self.submit(sim, uiworld, revision, Ok(edit));
+            }
+            return;
+        }
+
+        // Sea controls stage edits even when they capture the pointer.
         if self.mode == WaterMode::Sea {
             drop(map);
             if let Some(level_dm) = self.sea_action.take() {
@@ -385,6 +404,7 @@ impl WaterTools {
         edit: Result<WaterEdit, WaterEditError>,
     ) {
         self.submitted_summary = None;
+        let shown_impact = self.confirmation.take();
         let edit = match edit {
             Ok(edit) => edit,
             Err(error) => {
@@ -407,7 +427,7 @@ impl WaterTools {
                 if !preview.strict_before && preview.strict_after {
                     text.push_str(" · Enables strict water siting");
                 }
-                text
+                (text, preview.provider_impact)
             });
             self.preview = Some(CachedWaterPreview {
                 snapshot,
@@ -415,13 +435,21 @@ impl WaterTools {
                 result,
             });
         }
-        let summary = match &self.preview.as_ref().unwrap().result {
-            Ok(summary) => summary.clone(),
+        let (summary, impact) = match &self.preview.as_ref().unwrap().result {
+            Ok((summary, impact)) => (summary.clone(), impact.clone()),
             Err(error) => {
                 self.status = Some(error.to_string());
                 return;
             }
         };
+        // Revalidate using the current snapshot on confirmation. Let the player
+        // review again if the edit would now produce a different provider impact.
+        if impact.count != 0 && shown_impact.as_ref() != Some(&impact) {
+            self.status = Some(summary);
+            self.confirmation = Some(impact);
+            return;
+        }
+
         self.status = Some(format!("{summary} · Submitted"));
         self.submitted_summary = Some(summary);
         self.pending.push_back(edit.clone());
@@ -536,7 +564,14 @@ impl WaterGesture {
 struct CachedWaterPreview {
     snapshot: (u64, u64, u64),
     edit: WaterEdit,
-    result: Result<String, WaterEditError>,
+    result: Result<(String, WaterProviderImpact), WaterEditError>,
+}
+
+pub(crate) fn provider_preview_line(sample: &WaterProviderImpactSample) -> String {
+    match sample.proposed_site {
+        Ok(_) => format!("{:?} will be eligible for service", sample.building),
+        Err(reason) => format!("{:?} · {reason}", sample.building),
+    }
 }
 
 #[cfg(test)]
@@ -544,6 +579,75 @@ mod water_w4_tests {
     use super::*;
     use common::saveload::{Encoder, JSON};
     use geom::vec3;
+
+    #[test]
+    fn water_w4_provider_impact_is_shown_before_submission() {
+        use geom::{Polygon, Vec2, OBB};
+        use prototypes::{try_prototype, GoodsCompanyID};
+        use simulation::map::{BuildingKind, LanePatternBuilder, Map, MapProject};
+
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        crate::init::init();
+        let sim = Simulation::new_authored_flat(2, 0).unwrap();
+        let pump = {
+            let mut map = sim.write::<Map>();
+            let (_, road) = map
+                .make_connection(
+                    MapProject::ground(vec3(32.0, 176.0, 0.0)),
+                    MapProject::ground(vec3(432.0, 176.0, 0.0)),
+                    None,
+                    &LanePatternBuilder::default().build(),
+                )
+                .unwrap();
+            let id = GoodsCompanyID::new("water-pump");
+            map.build_special_building(
+                &OBB::new(Vec2::new(128.0, 212.0), Vec2::X, 20.0, 20.0),
+                BuildingKind::GoodsCompany(id),
+                try_prototype(id).unwrap().bgen,
+                None,
+                Some(road),
+            )
+            .unwrap()
+        };
+        let ui = UiWorld::with_defaults();
+        let mut tools = WaterTools::default();
+        let edit = WaterEdit::FillLake {
+            basin: WaterBasin::new(
+                Polygon::centered_rect(Vec2::new(704.0, 320.0), 32.0, 32.0).as_slice(),
+            )
+            .unwrap(),
+            level_dm: -10,
+            depth_m: 2.0,
+        };
+        assert_eq!(
+            sim.preview_water_edit(&edit).unwrap().provider_impact.count,
+            1
+        );
+        tools.submit(&sim, &ui, 0, Ok(edit.clone()));
+        assert!(
+            ui.commands().is_empty(),
+            "submitted before warning about {pump:?}"
+        );
+        let impact = tools.confirmation.as_ref().unwrap();
+        assert_eq!(impact.count, 1);
+        let [sample] = impact.sample.as_slice() else {
+            panic!("expected one provider warning");
+        };
+        assert_eq!(sample.building, pump);
+        assert!(provider_preview_line(sample).contains("Pump needs a river or lake shore"));
+
+        tools.confirm_action = true;
+        tools.update(
+            &sim,
+            &ui,
+            &InputMap::default(),
+            &mut ImmediateDraw::default(),
+        );
+        assert!(tools.confirmation.is_none());
+        let commands = ui.commands();
+        assert!(matches!(commands.as_ref(), [WorldCommand::EditWater(queued)] if queued == &edit));
+    }
 
     #[test]
     fn water_w4_control_does_not_release_a_stroke() {

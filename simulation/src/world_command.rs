@@ -174,6 +174,7 @@ pub enum Rejection {
     WaterWorkLimit,
     WaterConfigured,
     WaterTerrainConflict,
+    WaterServiceSite(crate::map::WaterSiteError),
 }
 
 impl From<ZonePaintError> for Rejection {
@@ -1113,6 +1114,8 @@ impl WorldCommand {
                 if !Building::dry_footprint(map.environment(), pos, zone.as_ref()) {
                     return Err(Rejection::WetFootprint);
                 }
+                crate::map::validate_water_service_placement(map, *kind, *pos, *connected_road)
+                    .map_err(Rejection::WaterServiceSite)?;
                 connected_road.is_none_or(|id| map.get(id).is_some())
             }
             UpdateZone { building, zone } => {
@@ -1524,8 +1527,11 @@ impl WorldCommand {
     pub(crate) fn bootstrap_authored(
         sim: &mut Simulation,
         options: SimulationOptions,
+        lot_layout: LotLayout,
     ) -> Result<(), Rejection> {
-        Self::bootstrap_world(sim, options, BootstrapKind::AuthoredFlat)
+        Self::bootstrap_world(sim, options, BootstrapKind::AuthoredFlat)?;
+        sim.map_mut().set_lot_layout(lot_layout);
+        Ok(())
     }
 
     fn bootstrap_world(

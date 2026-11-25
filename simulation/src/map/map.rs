@@ -101,6 +101,7 @@ pub struct Map {
     pub subscribers: MapSubscribers,
     pub(crate) pending_construction_cuts: BTreeSet<TerrainChunkID>,
     pub(super) construction_cut_revision: u64,
+    pub(super) water_services: super::WaterServiceCache,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -109,6 +110,7 @@ pub struct WaterEditPreview {
     pub dirty: WaterDirtyChunks,
     pub strict_before: bool,
     pub strict_after: bool,
+    pub provider_impact: super::WaterProviderImpact,
     pub proposed_surface_dm: Option<i16>,
     pub candidate_extent: Option<AABB>,
 }
@@ -124,6 +126,7 @@ struct WaterEditEffects {
     )>,
     dirty: WaterDirtyChunks,
     cuts: Vec<(TerrainChunkID, CutHeights)>,
+    water_providers: super::PreparedWaterProviders,
 }
 
 type CutHeights = [[u16; TERRAIN_CHUNK_RESOLUTION]; TERRAIN_CHUNK_RESOLUTION];
@@ -168,6 +171,7 @@ impl Clone for Map {
             electricity: self.electricity.clone(),
             environment: self.environment.clone(),
             parking: self.parking.clone(),
+            water_services: self.water_services.clone(),
             ..Self::empty()
         }
     }
@@ -199,6 +203,7 @@ impl Map {
             electricity: Default::default(),
             pending_construction_cuts: BTreeSet::new(),
             construction_cut_revision: 0,
+            water_services: super::WaterServiceCache::default(),
             subscribers: MapSubscribers::default(),
         }
     }
@@ -395,6 +400,7 @@ impl Map {
         info!("remove_building {:?}", b);
 
         let b = self.buildings.remove(b)?;
+        self.water_services.building_removed(&self.environment, b.id);
         queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &b);
         self.subscribers.dispatch(UpdateType::Building, &b);
 
@@ -981,6 +987,7 @@ impl Map {
         if !Building::valid_footprint(obb, gen) {
             return None;
         }
+        super::validate_water_service_placement(self, kind, *obb, connected_road).ok()?;
         if self.building_overlaps(*obb) {
             log::warn!("did not build {:?}: building overlaps", kind);
             return None;
@@ -1022,6 +1029,8 @@ impl Map {
             &self.environment,
             &self.buildings[id],
         );
+        self.water_services
+            .building_changed(&self.environment, &self.roads, &self.buildings[id]);
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
 
@@ -1279,6 +1288,8 @@ impl Map {
             &self.environment,
             &self.buildings[id],
         );
+        self.water_services
+            .building_changed(&self.environment, &self.roads, &self.buildings[id]);
         self.subscribers
             .dispatch(UpdateType::Building, &self.buildings[id]);
         self.lot_origins.insert(
@@ -1347,7 +1358,10 @@ impl Map {
         self.invalidate(road.dst);
 
         for &building_id in &road.connected_buildings {
-            self.buildings[building_id].connected_road = None;
+            let building = &mut self.buildings[building_id];
+            building.connected_road = None;
+            self.water_services
+                .building_changed(&self.environment, &self.roads, building);
         }
 
         Some(road)
@@ -1439,6 +1453,7 @@ impl Map {
             dirty: prepared.dirty().clone().union(effects.dirty),
             strict_before: self.environment.strict_water_siting(),
             strict_after: prepared.strict_water_siting(),
+            provider_impact: effects.water_providers.impact,
             proposed_surface_dm: prepared.proposed_surface_dm(),
             candidate_extent: prepared
                 .dirty()
@@ -1480,6 +1495,10 @@ impl Map {
             self.pending_construction_cuts.remove(&chunk);
         }
         outcome.dirty = outcome.dirty.union(effects.dirty);
+        if outcome.changed {
+            self.water_services
+                .water_edited(&self.environment, &outcome.dirty, effects.water_providers);
+        }
         self.subscribers.dispatch_water(&outcome.dirty);
         Ok(outcome)
     }
@@ -1497,6 +1516,7 @@ impl Map {
             wet_trees: Vec::new(),
             dirty: WaterDirtyChunks::default(),
             cuts: Vec::new(),
+            water_providers: super::PreparedWaterProviders::default(),
         };
         let mut road_support = BTreeSet::new();
 
@@ -1627,6 +1647,7 @@ impl Map {
             terrain.insert(chunk);
         }
         effects.dirty = WaterDirtyChunks::new(BTreeSet::new(), terrain, road_support);
+        effects.water_providers = super::prepare_water_providers(self, prepared, remaining)?;
         Ok(effects)
     }
 
@@ -1945,6 +1966,8 @@ impl Map {
                 true => r1.id,
                 false => r2.id,
             });
+            self.water_services
+                .building_changed(&self.environment, &self.roads, b);
         }
 
         self.lots.retain(|_, lot| {
@@ -2085,6 +2108,10 @@ impl Map {
         }
 
         let new_id = new_r.id;
+        for &id in &self.roads[new_id].connected_buildings {
+            self.water_services
+                .building_changed(&self.environment, &self.roads, &self.buildings[id]);
+        }
 
         self.invalidate(r1_extremity);
         self.invalidate(r2_extremity);

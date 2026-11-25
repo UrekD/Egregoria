@@ -264,10 +264,31 @@ fn register_utility_water_sample() {
             name: "utility_water_sample",
             optional: true,
             save: Box::new(|sim| {
-                Bincode::encode(&sim.read::<UtilityFlow>().sampled_water_revision).unwrap()
+                let map = sim.map();
+                let env = map.environment();
+                let flow = sim.read::<UtilityFlow>();
+                let revision = flow.sampled_water_revision;
+                if env.strict_water_siting()
+                    || env.has_water_configuration()
+                    || flow.water_pending(&map)
+                {
+                    Bincode::encode(&(revision, &flow.sampled_members)).unwrap()
+                } else {
+                    // Preserve the legacy payload and resource hash for dry maps.
+                    Bincode::encode(&revision).unwrap()
+                }
             }),
             load: Box::new(|sim, data| {
-                sim.write::<UtilityFlow>().sampled_water_revision = Bincode::decode(data)?;
+                let mut input = data;
+                let revision = Bincode::decode_reader(&mut input)?;
+                let members = if input.is_empty() {
+                    BTreeMap::new()
+                } else {
+                    Bincode::decode(input)?
+                };
+                let mut flow = sim.write::<UtilityFlow>();
+                flow.sampled_water_revision = revision;
+                flow.sampled_members = members;
                 Ok(())
             }),
         });

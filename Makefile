@@ -50,6 +50,17 @@ osm-lesce:
 	fi; \
 	cargo run --locked --release -p scenarios -- osm-city --input "$$input" --save-root "$$EGR_OSM_SAVE_ROOT" $$EGR_OSM_FLAGS
 
+export EGR_CITYMAP_OUT ?= /var/tmp/egr/citymap-build
+export EGR_CITYMAP_LESCE ?=
+export EGR_CITYMAP_SAVA ?=
+.PHONY: citymap-build
+citymap-build:
+	@set -eu; \
+	set -- --out "$$EGR_CITYMAP_OUT"; \
+	if [ -n "$$EGR_CITYMAP_LESCE" ]; then set -- "$$@" --input "$$EGR_CITYMAP_LESCE"; fi; \
+	if [ -n "$$EGR_CITYMAP_SAVA" ]; then set -- "$$@" --sava-input "$$EGR_CITYMAP_SAVA"; fi; \
+	cargo run --locked --release -p scenarios -- citymap-build "$$@"
+
 # Install the fixture after native accepts the empty directory and before the
 # private Xvfb display allows the script to enter its render loop.
 .PHONY: osm-lesce-shots

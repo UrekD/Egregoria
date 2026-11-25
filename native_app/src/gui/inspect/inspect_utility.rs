@@ -1,6 +1,6 @@
 use goryak::{mincolumn, on_secondary_container, textc, tooltip};
-use simulation::map::{BuildingID, RoadID};
-use simulation::map_dynamic::{utility_network_at_road, UtilityNetworkState};
+use simulation::map::{water_provider_site, BuildingID, RoadID, WaterKind, WaterSite};
+use simulation::map_dynamic::{utility_network_at_road, UtilityFlow, UtilityNetworkState};
 
 use crate::gui::overlays::UTILITY_EXPLANATION;
 use simulation::Simulation;
@@ -49,19 +49,45 @@ pub(crate) fn render(sim: &Simulation, road: RoadID) {
                 )
             }),
         );
+        if network.network.is_some() && sim.read::<UtilityFlow>().water_pending(&sim.map()) {
+            textc(
+                on_secondary_container(),
+                "Water and sewage totals update on the next utility pass",
+            );
+        }
     });
 }
 
 pub(crate) fn section(sim: &Simulation, building: BuildingID) {
-    let road = {
+    let (road, site) = {
         let map = sim.map();
         let Some(building) = map.get(building) else {
             return;
         };
-        building
+        let road = building
             .connected_road
-            .filter(|&road| !building.is_orphaned() && map.get(road).is_some())
+            .filter(|&road| map.get(road).is_some());
+        (road, water_provider_site(&map, building.id))
     };
+    if let Some(site) = site {
+        let line = match site {
+            Ok(WaterSite::Legacy { .. }) => "Site valid · legacy dry siting".to_owned(),
+            Ok(WaterSite::Shore {
+                contact,
+                distance_m,
+                ..
+            }) => {
+                let shore = match contact.kind {
+                    WaterKind::River => "river bank",
+                    WaterKind::Lake => "lake shore",
+                    WaterKind::Sea => "coast",
+                };
+                format!("Site valid · {shore} {distance_m:.1} m away")
+            }
+            Err(reason) => format!("Site invalid · {reason}"),
+        };
+        textc(on_secondary_container(), line);
+    }
     if let Some(road) = road {
         render(sim, road);
     } else {

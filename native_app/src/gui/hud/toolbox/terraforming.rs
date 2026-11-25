@@ -8,7 +8,9 @@ use goryak::{
 use simulation::map::TerraformKind;
 
 use crate::gui::hud::toolbox::{select_triangle, updown_value};
-use crate::gui::terraforming::{TerraformingResource, WaterMode, WaterTools};
+use crate::gui::terraforming::{
+    provider_preview_line, TerraformingResource, WaterMode, WaterTools,
+};
 use crate::gui::textures::UiTextures;
 use crate::uiworld::UiWorld;
 
@@ -146,6 +148,27 @@ fn water_properties(state: &mut WaterTools) {
             }
         }
     });
+    if let Some(impact) = &state.confirmation {
+        if let Some(status) = &state.status {
+            textc(on_secondary_container(), status.clone());
+        }
+        textc(
+            on_secondary_container(),
+            format!("Providers affected · {}", impact.count),
+        );
+        for sample in &impact.sample {
+            textc(on_secondary_container(), provider_preview_line(sample));
+        }
+        minrow(8.0, || {
+            if button_primary("Apply water edit").show().clicked {
+                state.confirm_action = true;
+            }
+            if button_secondary("Cancel").show().clicked {
+                state.dismiss_confirmation();
+            }
+        });
+        return;
+    }
     match state.mode {
         River | Lake => {
             minrow(8.0, || {
