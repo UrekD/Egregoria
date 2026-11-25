@@ -320,6 +320,26 @@ fn prepare_opening(
         )?
         .ok_or("no dry park site on the far-bank parkway")?;
         sites.insert("sava/far-bank-park".into(), park);
+
+        // Claim real retail frontage inside the employment district before
+        // other facilities and parcel reservations occupy its large sites.
+        let employment = plan
+            .districts
+            .iter()
+            .find(|district| district.key == "employment")
+            .unwrap();
+        let anchor = at(2530.0, 2400.0);
+        let (store, _) =
+            place_scored_company(sim, plan, &roads, "supermarket", |map, road, footprint| {
+                let center = footprint.center();
+                (contains(&employment.polygon, center)
+                    && map.roads()[road]
+                        .lanes_iter()
+                        .any(|(_, kind)| kind == LaneKind::Parking))
+                .then(|| center.distance2(anchor))
+            })?
+            .ok_or("no supermarket frontage in the employment district")?;
+        sites.insert("employment/supermarket".into(), store);
     }
     // Use the frontage between South and West so mine drivers can reach work
     // and deliver fuel without competing for the terminal's delivery fleet.
@@ -502,6 +522,9 @@ fn prepare_opening(
         ("west", 1350.0, 1840.0),
         ("employment", 2530.0, 2400.0),
     ] {
+        if wet && district == "employment" {
+            continue;
+        }
         let store = place_company_around_parcels(sim, "supermarket", at(x, y), Some(district))?;
         sites.insert(format!("{district}/supermarket"), store);
     }
@@ -4026,6 +4049,13 @@ mod tests {
             housing >= 950 && isolated_south == 0,
             "{housing} opening housing places, with {isolated_south} on the remote South fringe"
         );
+        let employment = plan
+            .districts
+            .iter()
+            .find(|district| district.key == "employment")
+            .unwrap();
+        let store = &map.buildings()[opening.sites["employment/supermarket"]];
+        assert!(contains(&employment.polygon, store.obb.center()));
         drop(map);
         paint(&mut sim, opening.parcels.iter()).unwrap();
         verify_votes(&sim, opening.parcels.iter()).unwrap();

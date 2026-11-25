@@ -1266,18 +1266,23 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) {
         );
     }
 
-    // Keep parking maneuvers off the through link between the coal frontage
-    // and the southern crossroads, where an occupied egress backed up traffic.
-    let south_link = SourceKey::Way {
-        id: 350992954,
-        span: 0,
-    };
-    if let Some(link) = plan.graph.links.get_mut(&south_link) {
-        link.class = RoadClass::Collector;
-        plan.graph.record(
+    // Keep curb maneuvers off the two through links where the wet trace
+    // found a stopped tail and an upstream conflict.
+    for (id, reason) in [
+        (
+            350992954,
             "keep the South through link clear of curb parking",
-            &[south_link],
-        );
+        ),
+        (
+            1426155807,
+            "keep the Hraška through link clear of curb parking",
+        ),
+    ] {
+        let key = SourceKey::Way { id, span: 0 };
+        if let Some(link) = plan.graph.links.get_mut(&key) {
+            link.class = RoadClass::Collector;
+            plan.graph.record(reason, &[key]);
+        }
     }
 }
 
