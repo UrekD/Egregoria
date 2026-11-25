@@ -8,7 +8,6 @@ use super::source::{
 };
 use geom::{vec2, Vec2};
 use serde::Serialize;
-use simulation::map::LightPolicy;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize)]
@@ -236,24 +235,6 @@ pub fn plan_town(
                 "keep the southeast turnaround as a walking path",
                 &[SOUTHEAST_STUB],
             );
-        }
-    }
-    for id in [4910799321, 4193639601] {
-        let key = SourceKey::Node { id, rail: false };
-        let mut approaches = graph
-            .links
-            .values()
-            .filter(|link| link.endpoints.contains(&key) && link.class.driving());
-        if approaches.clone().count() == 3
-            && approaches.all(|link| link.class == RoadClass::Local && !link.one_way)
-        {
-            if let Some(junction) = graph.junctions.get_mut(&key) {
-                junction.light = LightPolicy::NoLights;
-                graph.record(
-                    "use uncontrolled local turns at the three-way approach with a measured long stop",
-                    &[key],
-                );
-            }
         }
     }
 
@@ -1271,40 +1252,6 @@ fn districts(config: TownConfig) -> Vec<District> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cm2_layout_uses_uncontrolled_three_way_junctions_at_observed_stalls() {
-        use crate::citymap::{build_dry_town, read_inputs, SourcePaths, DEFAULT_LESCE, DEFAULT_SAVA};
-        use simulation::map::{LaneKind, TrafficControl};
-        use std::path::Path;
-
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
-        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
-        let (sim, built) = build_dry_town(&plan).unwrap();
-        let map = sim.map();
-        for id in [4910799321, 4193639601] {
-            let key = SourceKey::Node { id, rail: false };
-            let junction = &map.intersections()[built.junctions[&key]];
-            let approaches: Vec<_> = junction
-                .roads
-                .iter()
-                .flat_map(|&road| map.roads()[road].incoming_lanes_to(junction.id))
-                .filter(|(_, kind)| *kind == LaneKind::Driving)
-                .collect();
-            assert_eq!(approaches.len(), 3);
-            for &(lane, _) in approaches {
-                assert!(
-                    matches!(map.lanes()[lane].control, TrafficControl::Always),
-                    "node {id}, lane {lane:?}"
-                );
-            }
-            assert!(junction.turn_policy.crosswalks);
-        }
-    }
 
     #[test]
     fn cm2_layout_keeps_the_southeast_stub_walkable_without_vehicle_egress() {
