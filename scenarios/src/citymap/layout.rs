@@ -8,7 +8,6 @@ use super::source::{
 };
 use geom::{vec2, Vec2};
 use serde::Serialize;
-use simulation::map::LightPolicy;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize)]
@@ -102,19 +101,6 @@ pub struct CrossingSpec {
     pub without_bridge_check: &'static str,
 }
 
-const ALPSKA_WEST_JUNCTION: SourceKey = SourceKey::Node {
-    id: 862116385,
-    rail: false,
-};
-const SOUTHEAST_STUB: SourceKey = SourceKey::Way {
-    id: 168886779,
-    span: 0,
-};
-const SOUTHEAST_DEAD_END: SourceKey = SourceKey::Node {
-    id: 11951438144,
-    rail: false,
-};
-
 pub fn plan_town(
     inputs: &PinnedInputs,
     config: TownConfig,
@@ -200,89 +186,6 @@ pub fn plan_town(
         retire_outer_road_fragments(&mut graph, &infill)?;
         prioritize_east_connector(&mut graph);
         calibrate_storage(&mut graph, config, limits, map.environment())?;
-    }
-
-    if graph
-        .links
-        .contains_key(&SourceKey::Authored("alpska-rail-underpass"))
-    {
-        if let Some(junction) = graph.junctions.get_mut(&ALPSKA_WEST_JUNCTION) {
-            // A timed-out walking trip can leave its pedestrian in the crossing
-            // across the underpass approach. Keep the sidewalk corners and use
-            // crossings at the surrounding junctions.
-            junction.turn.crosswalks = false;
-            graph.record(
-                "use surrounding crossings for the Alpska underpass west approach",
-                &[ALPSKA_WEST_JUNCTION],
-            );
-        }
-    }
-    if graph
-        .links
-        .values()
-        .filter(|link| link.endpoints.contains(&SOUTHEAST_DEAD_END))
-        .count()
-        == 1
-    {
-        if let Some(stub) = graph
-            .links
-            .get_mut(&SOUTHEAST_STUB)
-            .filter(|link| link.endpoints.contains(&SOUTHEAST_DEAD_END))
-        {
-            // Commuters were using the stub as a U-turn, spilling back into
-            // its junction and trapping cars that parked on the short road.
-            stub.class = RoadClass::Walk;
-            graph.record(
-                "keep the southeast turnaround as a walking path",
-                &[SOUTHEAST_STUB],
-            );
-        }
-    }
-    let west_south_shortcut = SourceKey::Infill { number: 7, part: 4 };
-    if let Some(link) = graph.links.get_mut(&west_south_shortcut) {
-        // Opposing turns queued through both junctions and blocked this short
-        // link. Keep the direct walk between neighbourhoods.
-        link.class = RoadClass::Walk;
-        for end in link.endpoints {
-            let driving = graph.links.values().filter(|link| {
-                link.class.driving() && link.endpoints.contains(&end)
-            }).count();
-            if driving == 1 {
-                graph.junctions.get_mut(&end).unwrap().turn.back_turns = true;
-            }
-        }
-        graph.record(
-            "keep the west–south infill shortcut for walking",
-            &[west_south_shortcut],
-        );
-    }
-    let west_local_junction = SourceKey::Node {
-        id: 3567122171,
-        rail: false,
-    };
-    if let Some(junction) = graph.junctions.get_mut(&west_local_junction) {
-        // The automatic signal backed traffic through the short approach from the north.
-        junction.light = LightPolicy::StopSigns;
-        graph.record(
-            "use an all-way stop to keep the short West approach flowing",
-            &[west_local_junction],
-        );
-    }
-    let fuel_frontage = SourceKey::Way {
-        id: 72625754,
-        span: 0,
-    };
-    if let Some(link) = graph.links.get(&fuel_frontage) {
-        for endpoint in link.endpoints {
-            if let Some(junction) = graph.junctions.get_mut(&endpoint) {
-                // Plant and mine loading sides share this road in opposite directions.
-                junction.turn.back_turns = true;
-            }
-        }
-        graph.record(
-            "provide turnarounds at both ends of the coal delivery road",
-            &[fuel_frontage],
-        );
     }
 
     Ok(TownPlan {
@@ -1299,98 +1202,6 @@ fn districts(config: TownConfig) -> Vec<District> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn cm2_publish_keeps_the_west_south_shortcut_walkable() {
-        use crate::citymap::{build_dry_town, read_inputs, SourcePaths, DEFAULT_LESCE, DEFAULT_SAVA};
-        use simulation::map::LaneKind;
-        use std::path::Path;
-
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
-        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
-        let shortcut = SourceKey::Infill { number: 7, part: 4 };
-        assert_eq!(plan.graph.links[&shortcut].class, RoadClass::Walk);
-        let (sim, network) = build_dry_town(&plan).unwrap();
-        let map = sim.map();
-        let road = &map.roads()[network.links[&shortcut].road];
-        assert!(road.lanes_iter().all(|(_, kind)| kind == LaneKind::Walking));
-    }
-
-    #[test]
-    fn cm2_layout_keeps_the_southeast_stub_walkable_without_vehicle_egress() {
-        use crate::citymap::{
-            build_dry_town, read_inputs, SourcePaths, DEFAULT_LESCE, DEFAULT_SAVA,
-        };
-        use simulation::map::LaneKind;
-        use std::path::Path;
-
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
-        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
-        let (sim, built) = build_dry_town(&plan).unwrap();
-        let map = sim.map();
-        let lanes: Vec<_> = map.roads()[built.links[&SOUTHEAST_STUB].road]
-            .lanes_iter()
-            .collect();
-        assert!(lanes.iter().any(|(_, kind)| *kind == LaneKind::Walking));
-        assert!(lanes.iter().all(|(_, kind)| *kind == LaneKind::Walking));
-    }
-
-    #[test]
-    fn cm2_layout_routes_around_alpska_crosswalk() {
-        use crate::citymap::{
-            build_dry_town, read_inputs, SourcePaths, DEFAULT_LESCE, DEFAULT_SAVA,
-        };
-        use simulation::map::{LaneKind, PathKind};
-        use simulation::map_dynamic::Itinerary;
-        use std::path::Path;
-
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
-        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
-        let (sim, built) = build_dry_town(&plan).unwrap();
-        let map = sim.map();
-        let junction = &map.intersections()[built.junctions[&ALPSKA_WEST_JUNCTION]];
-        assert!(!junction.turn_policy.crosswalks);
-        let sidewalks: Vec<_> = junction
-            .roads
-            .iter()
-            .flat_map(|&road| {
-                map.roads()[road].lanes_iter().filter_map(|(lane, kind)| {
-                    let lane = &map.lanes()[lane];
-                    (kind == LaneKind::Walking).then(|| {
-                        let points = &lane.points;
-                        let offset = points.length().min(40.0) * 0.5;
-                        points.point_along(if lane.src == junction.id {
-                            offset
-                        } else {
-                            points.length() - offset
-                        })
-                    })
-                })
-            })
-            .collect();
-        assert_eq!(sidewalks.len(), 6);
-        for &from in &sidewalks {
-            for &to in &sidewalks {
-                assert!(
-                    Itinerary::route(prototypes::Tick(0), from, to, &map, PathKind::Pedestrian)
-                        .is_some(),
-                    "missing walking route from {from:?} to {to:?}"
-                );
-            }
-        }
-    }
 
     #[test]
     fn citymap_clip_preserves_entry_and_exit_of_an_outside_segment() {

@@ -2,6 +2,7 @@ use super::adapters::{
     apply, crosses_reserved_bank, downtown_cells, frontage_roads, place_company,
     place_scored_company, place_special, site_clear, water_sites,
 };
+use super::network::close_pairs;
 use super::{blocks, contains, BuiltNetwork, RoadClass, SourceKey, TownPlan};
 use geom::{vec2, Intersect, Polygon, Transform, Vec2, Vec3, OBB};
 use prototypes::{
@@ -16,17 +17,17 @@ use simulation::economy::{
 };
 use simulation::map::{
     water_provider_site, BuildingID, BuildingKind, Density, LaneID, LaneKind, LanePatternBuilder, LotID, Map, MapProject, PathKind, ProjectKind,
-    RoadID, TrafficBehavior, TraverseKind, TurnID, Zone, ZoneCell, ZoneGrid, ZoneKind,
+    LightPolicy, RoadID, TrafficBehavior, TraverseKind, TurnID, Zone, ZoneCell, ZoneGrid, ZoneKind,
 };
 use simulation::map::{RailMarketError, RailMarketSite};
 use simulation::map_dynamic::service_reach_sources;
 use simulation::diagnostics::elapsed_tick;
 use simulation::map_dynamic::transit::{LineID, StopID};
 use simulation::map_dynamic::{
-    BuildingInfos, CoverageGrid, Destination, ElectricityFlow, Itinerary, ParkingManagement, RoutingStep,
+    BuildingInfos, CoverageGrid, Destination, ElectricityFlow, Itinerary, ItineraryTarget, ParkingManagement, RoutingStep,
     Transit, UtilityFlow, UtilityStatus,
 };
-use simulation::souls::freight_station::train_stop;
+use simulation::souls::freight_station::{train_stop, FreightTrainState};
 use simulation::souls::{
     growth::check_growable_lot,
     residence::{is_retail_store, Residences},
@@ -96,8 +97,7 @@ struct Freight {
     train: TrainID,
     market_lane: LaneID,
     market_offset: f32,
-    buyer: BuildingID,
-    item: &'static str,
+    bakery: BuildingID,
 }
 
 struct Cohort {
@@ -107,6 +107,86 @@ struct Cohort {
     infill: usize,
     retail: usize,
     industry: usize,
+}
+
+const SOUTHEAST_STUB: SourceKey = SourceKey::Way {
+    id: 168886779,
+    span: 0,
+};
+const SOUTHEAST_DEAD_END: SourceKey = SourceKey::Node {
+    id: 11951438144,
+    rail: false,
+};
+
+pub(super) fn configure_commissioned_network(plan: &mut TownPlan) {
+    let graph = &mut plan.graph;
+    if graph
+        .links
+        .values()
+        .filter(|link| link.endpoints.contains(&SOUTHEAST_DEAD_END))
+        .count()
+        == 1
+    {
+        if let Some(stub) = graph
+            .links
+            .get_mut(&SOUTHEAST_STUB)
+            .filter(|link| link.endpoints.contains(&SOUTHEAST_DEAD_END))
+        {
+            // Commuters were using the stub as a U-turn, spilling back into
+            // its junction and trapping cars that parked on the short road.
+            stub.class = RoadClass::Walk;
+            graph.record(
+                "keep the southeast turnaround as a walking path",
+                &[SOUTHEAST_STUB],
+            );
+        }
+    }
+    let west_south_shortcut = SourceKey::Infill { number: 7, part: 4 };
+    if let Some(link) = graph.links.get_mut(&west_south_shortcut) {
+        // Opposing turns queued through both junctions and blocked this short
+        // link. Keep the direct walk between neighbourhoods.
+        link.class = RoadClass::Walk;
+        for end in link.endpoints {
+            let driving = graph.links.values().filter(|link| {
+                link.class.driving() && link.endpoints.contains(&end)
+            }).count();
+            if driving == 1 {
+                graph.junctions.get_mut(&end).unwrap().turn.back_turns = true;
+            }
+        }
+        graph.record(
+            "keep the west–south infill shortcut for walking",
+            &[west_south_shortcut],
+        );
+    }
+    let west_local_junction = SourceKey::Node {
+        id: 3567122171,
+        rail: false,
+    };
+    if let Some(junction) = graph.junctions.get_mut(&west_local_junction) {
+        // The automatic signal backed traffic through the short approach from the north.
+        junction.light = LightPolicy::StopSigns;
+        graph.record(
+            "use an all-way stop to keep the short West approach flowing",
+            &[west_local_junction],
+        );
+    }
+    let fuel_frontage = SourceKey::Way {
+        id: 72625754,
+        span: 0,
+    };
+    if let Some(link) = graph.links.get(&fuel_frontage) {
+        for endpoint in link.endpoints {
+            if let Some(junction) = graph.junctions.get_mut(&endpoint) {
+                // Plant and mine loading sides share this road in opposite directions.
+                junction.turn.back_turns = true;
+            }
+        }
+        graph.record(
+            "provide turnarounds at both ends of the coal delivery road",
+            &[fuel_frontage],
+        );
+    }
 }
 
 pub fn commission(
@@ -415,6 +495,7 @@ pub fn commission(
             .iter()
             .filter(|parcel| parcel.zoning.kind == ZoneKind::Commercial),
     )?;
+    record_development(&sim.map(), &mut parcels);
     verify_votes(sim, parcels.iter())?;
 
     let lines = install_bus_loops(sim, built, plan, &cohorts, &parcels)?;
@@ -425,8 +506,7 @@ pub fn commission(
         train,
         market_lane,
         market_offset,
-        buyer,
-        item: "flour",
+        bakery: buyer,
     };
     // Use elapsed time for settling periods. The authored clock starts in the
     // morning, so a whole elapsed day returns to the same commute phase.
@@ -1387,7 +1467,13 @@ fn verify_votes<'a>(
 ) -> Result<(), String> {
     let map = sim.map();
     let grid = sim.read::<ZoneGrid>();
-    let expected: BTreeMap<_, _> = parcels.map(|parcel| (parcel.lot, parcel.zoning)).collect();
+    let mut expected = BTreeMap::new();
+    for parcel in parcels {
+        verify_parcel_frontage(&map, &grid, parcel)?;
+        if parcel.building.is_none() {
+            expected.insert(parcel.lot, parcel.zoning);
+        }
+    }
     audit_votes(
         map.lots()
             .values()
@@ -1400,6 +1486,7 @@ fn audit_votes(
     votes: impl Iterator<Item = (LotID, Option<ZoneCell>)>,
     expected: &BTreeMap<LotID, ZoneCell>,
 ) -> Result<(), String> {
+    let mut surviving_votes = 0;
     for (lot, actual) in votes {
         let intended = expected.get(&lot).copied();
         if actual != intended {
@@ -1407,6 +1494,40 @@ fn audit_votes(
                 "parcel {lot:?}: zone vote {actual:?} differs from intended {intended:?}"
             ));
         }
+        surviving_votes += usize::from(intended.is_some());
+    }
+    if surviving_votes != expected.len() {
+        return Err(format!(
+            "only {surviving_votes} of {} planned vacant lots survive",
+            expected.len()
+        ));
+    }
+    Ok(())
+}
+
+fn same_footprint(actual: &OBB, expected: &OBB) -> bool {
+    actual
+        .corners
+        .iter()
+        .zip(expected.corners)
+        .all(|(actual, expected)| actual.is_close(expected, 0.001))
+}
+
+fn verify_parcel_frontage(map: &Map, zones: &ZoneGrid, parcel: &Parcel) -> Result<(), String> {
+    let (shape, road) = if let Some(id) = parcel.building {
+        let origin = map.lot_origin(id).ok_or_else(|| format!("missing parcel origin for {id:?}"))?;
+        if map.get(id).and_then(|building| building.connected_road) != Some(parcel.road) {
+            return Err(format!("developed parcel {id:?} lost its road connection"));
+        }
+        (&origin.shape, origin.parent_road)
+    } else {
+        let lot = map.get(parcel.lot).ok_or_else(|| format!("missing opening lot {:?}", parcel.lot))?;
+        (&lot.shape, lot.parent)
+    };
+    if road != parcel.road || !same_footprint(shape, &parcel.footprint)
+        || zones.lot_zone(shape) != Some(parcel.zoning)
+    {
+        return Err(format!("parcel {:?} changed footprint, frontage or zoning", parcel.lot));
     }
     Ok(())
 }
@@ -1415,24 +1536,18 @@ fn record_development(map: &Map, parcels: &mut [Parcel]) {
     let developed: Vec<_> = map
         .buildings()
         .values()
-        .filter_map(|building| Some((building.id, map.lot_origin(building.id)?.shape.center())))
+        .filter_map(|building| Some((building.id, map.lot_origin(building.id)?)))
         .collect();
     for parcel in parcels {
-        parcel.building = developed.iter().find_map(|&(id, center)| {
-            (center.distance2(parcel.footprint.center()) < 0.01).then_some(id)
+        parcel.building = developed.iter().find_map(|&(id, origin)| {
+            same_footprint(&origin.shape, &parcel.footprint).then_some(id)
         });
         if parcel.building.is_some() || map.get(parcel.lot).is_some() {
             continue;
         }
         // A collapsed growable can restore the same parcel under a new lot ID.
         if let Some(restored) = map.lots().values().find(|lot| {
-            lot.parent == parcel.road
-                && lot
-                    .shape
-                    .corners
-                    .iter()
-                    .zip(parcel.footprint.corners)
-                    .all(|(actual, expected)| actual.is_close(expected, 0.001))
+            lot.parent == parcel.road && same_footprint(&lot.shape, &parcel.footprint)
         }) {
             parcel.lot = restored.id;
         }
@@ -1719,12 +1834,8 @@ fn spare_capacity(supply: f64, demand: f64) -> bool {
 }
 
 fn line_operating(line: &str, boardings: u64, loops: u64, completed: u64) -> bool {
-    loops > 0
-        && if line == "employment" {
-            boardings >= 5
-        } else {
-            boardings >= 10 && completed > 0
-        }
+    let boarding_floor = if line == "employment" { 5 } else { 10 };
+    boardings >= boarding_floor && loops > 0 && completed > 0
 }
 
 fn traffic_clear(car_arrivals: u64, standing: u64, blocking: u64, stranded: u64) -> bool {
@@ -2022,29 +2133,7 @@ fn verify_opening_ids(sim: &Simulation, manifest: &OpeningManifest) -> Result<u3
         }
     }
     for parcel in &manifest.parcels {
-        if let Some(id) = parcel.building {
-            if map.lot_origin(id).is_none_or(|origin| {
-                origin.parent_road != parcel.road
-                    || origin.shape.center().distance2(parcel.footprint.center()) >= 0.01
-            }) || map.get(id).and_then(|building| building.connected_road) != Some(parcel.road)
-                || zones.lot_zone(&parcel.footprint) != Some(parcel.zoning)
-            {
-                return Err(format!(
-                    "developed parcel {id:?} lost its origin, zoning or frontage"
-                ));
-            }
-        } else {
-            let lot = map.get(parcel.lot).ok_or_else(|| {
-                format!("undeveloped parcel {:?} disappeared at {:?}", parcel.lot, parcel.footprint.center())
-            })?;
-            let actual = zones.lot_zone(&lot.shape);
-            if lot.parent != parcel.road || actual != Some(parcel.zoning) {
-                return Err(format!(
-                    "undeveloped parcel {:?} has frontage {:?} and zone {actual:?}, expected {:?} and {:?}",
-                    parcel.lot, lot.parent, parcel.road, parcel.zoning
-                ));
-            }
-        }
+        verify_parcel_frontage(&map, &zones, parcel)?;
     }
     let mut capacity = 0;
     for parcel in &manifest.reserves {
@@ -2052,6 +2141,7 @@ fn verify_opening_ids(sim: &Simulation, manifest: &OpeningManifest) -> Result<u3
         if zones.lot_zone(&lot.shape).is_some()
             || check_growable_lot(&map, lot, parcel.zoning).is_err()
             || lot.parent != parcel.road
+            || !same_footprint(&lot.shape, &parcel.footprint)
         {
             return Err(format!("invalid unpainted infill reserve {:?}", parcel.lot));
         }
@@ -2078,7 +2168,7 @@ fn verify_opening_ids(sim: &Simulation, manifest: &OpeningManifest) -> Result<u3
         }
     }
     let freight = &manifest.freight;
-    if !sim
+    if sim.world().freight_stations.len() != 1 || !sim
         .world()
         .freight_stations
         .get(freight.station)
@@ -2094,8 +2184,16 @@ fn verify_opening_ids(sim: &Simulation, manifest: &OpeningManifest) -> Result<u3
     {
         return Err("freight IDs did not survive opening reload".into());
     }
-    verify_parking_pair(&map, freight.terminal, freight.buyer, Tick(sim.get_tick()))?;
+    verify_parking_pair(&map, freight.terminal, freight.bakery, Tick(sim.get_tick()))?;
     Ok(capacity)
+}
+
+fn verify_infill_spacing(map: &Map, floor: f32) -> Result<(), String> {
+    let junctions = map.intersections().values().map(|junction| (junction.id, junction.pos.xy()));
+    if let Some((gap, a, b)) = close_pairs(junctions, floor).first() {
+        return Err(format!("infill junctions {a:?}/{b:?} are {gap:.3} m apart, require {floor:.1} m"));
+    }
+    Ok(())
 }
 
 // Exercise an ordinary network and zoning edit after the untouched soak, on
@@ -2124,6 +2222,7 @@ fn verify_infill(
         let planned_votes = opening_parcels
             .iter()
             .chain(&manifest.reserves)
+            .filter(|parcel| parcel.building.is_none())
             .map(|parcel| (parcel.lot, parcel.zoning))
             .collect();
         let mut junctions = BTreeMap::new();
@@ -2160,13 +2259,12 @@ fn verify_infill(
                     // Test the resulting lot votes before committing to this extension.
                     let mut extended = (*map).clone();
                     extended.make_connection(from, to, None, &pattern)?;
-                    if manifest.reserves.iter().any(|parcel| {
-                        extended.get(parcel.lot).is_none_or(|lot| {
-                            lot.parent != parcel.road
-                                || check_growable_lot(&extended, lot, parcel.zoning).is_err()
-                        })
-                    }) {
-                        return None;
+                    verify_infill_spacing(&extended, plan.limits.junction).ok()?;
+                    for parcel in opening_parcels.iter().chain(&manifest.reserves) {
+                        verify_parcel_frontage(&extended, &painted, parcel).ok()?;
+                    }
+                    for parcel in &manifest.reserves {
+                        check_growable_lot(&extended, extended.get(parcel.lot)?, parcel.zoning).ok()?;
                     }
                     audit_votes(
                         extended.lots().values().map(|lot| (lot.id, painted.lot_zone(&lot.shape))),
@@ -2178,10 +2276,12 @@ fn verify_infill(
                 })
         })
     };
-    let (district, road) = road.ok_or("no clear adjacent road extension preserving infill zoning")?;
+    let (district, road) = road.ok_or("no adjacent extension preserving opening parcels, reserves and junction spacing")?;
     apply(sim, &format!("{district} infill road"), &[road])?;
+    verify_votes(sim, opening_parcels.iter())?;
     {
         let map = sim.map();
+        verify_infill_spacing(&map, plan.limits.junction)?;
         let transit = sim.read::<Transit>();
         for (&name, line) in &manifest.lines {
             let berths: Vec<_> = line.stops.iter().zip(&line.lanes)
@@ -2323,11 +2423,24 @@ struct Traffic {
     blocked_egresses: BTreeMap<LaneID, BlockedEgress>,
     #[serde(skip)]
     directional_entries: BTreeMap<LaneID, u64>,
+    #[serde(skip)]
+    egress_probes: Vec<EgressProbe>,
+    #[serde(skip)]
+    recent_crossings: BTreeSet<LaneID>,
+}
+
+struct EgressProbe {
+    vehicle: VehicleID,
+    turn: TurnID,
+    previous: TraverseKind,
+    entrance: Vec3,
+    radius_squared: f32,
 }
 
 struct VehicleProgress {
     position: Vec3,
     moved_at: u64,
+    standing_ticks: u64,
     path: Option<TraverseKind>,
     sample: u64,
     panicking: bool,
@@ -2427,6 +2540,33 @@ impl StandingDecision {
 }
 
 impl Traffic {
+    // Between samples, inspect only vehicles whose current or next turn
+    // leads into an egress that the occupancy scan found blocked.
+    fn probe_egresses(&mut self, sim: &Simulation) {
+        self.egress_probes.retain_mut(|probe| {
+            let Some(car) = sim.world().vehicles.get(probe.vehicle) else {
+                return false;
+            };
+            let Some(path) = car.it.get_travers().map(|path| path.kind) else {
+                return false;
+            };
+            let destination = TraverseKind::Lane(probe.turn.dst);
+            let was_entering = match probe.previous {
+                TraverseKind::Turn(turn) => turn == probe.turn,
+                TraverseKind::Lane(lane) => lane == probe.turn.src || lane == probe.turn.dst,
+            };
+            if was_entering && path == destination
+                && !car.vehicle.state.is_parked()
+                && probe.entrance.distance2(car.trans.pos) > probe.radius_squared
+            {
+                self.recent_crossings.insert(probe.turn.dst);
+                return false;
+            }
+            probe.previous = path;
+            true
+        });
+    }
+
     fn observe(&mut self, sim: &Simulation, tick: u64) {
         let transit = sim.read::<Transit>();
         let world = sim.world();
@@ -2434,7 +2574,8 @@ impl Traffic {
         let seconds = sim.read::<GameTime>().seconds;
         let mut upstream = Vec::new();
         let mut stopped_egresses = BTreeMap::new();
-        let mut crossed = BTreeSet::new();
+        let mut crossed = std::mem::take(&mut self.recent_crossings);
+        let mut turn_candidates = Vec::new();
         for (id, car) in world.vehicles.iter() {
             if car.vehicle.state.is_parked()
                 || transit
@@ -2457,6 +2598,7 @@ impl Traffic {
             let progress = self.observed.entry(id).or_insert(VehicleProgress {
                 position: car.trans.pos,
                 moved_at: tick,
+                standing_ticks: 0,
                 path: None,
                 sample: tick,
                 panicking: false,
@@ -2466,6 +2608,7 @@ impl Traffic {
                 self.panicking += 1;
             }
             progress.panicking = panicking;
+            let sample_ticks = tick - progress.sample;
             progress.sample = tick;
             let waiting_at_signal = path.is_some_and(|path| {
                 let TraverseKind::Lane(id) = path else { return false };
@@ -2474,17 +2617,20 @@ impl Traffic {
                         && lane.points.last().distance2(car.trans.pos) <= 8.0_f32.powi(2)
                 })
             });
-            if waiting_at_signal {
+            if progress.position.distance2(car.trans.pos) > 1.0 {
                 progress.moved_at = tick;
-                progress.position = car.trans.pos;
-            } else if progress.position.distance2(car.trans.pos) > 1.0 {
-                progress.moved_at = tick;
+                progress.standing_ticks = 0;
                 progress.position = car.trans.pos;
                 if let Some(TraverseKind::Lane(lane)) =
                     path.filter(|path| Some(*path) != progress.path)
                 {
                     *self.directional_entries.entry(lane).or_default() += 1;
                 }
+            } else if !waiting_at_signal {
+                if progress.standing_ticks == 0 {
+                    progress.moved_at = tick - sample_ticks;
+                }
+                progress.standing_ticks += sample_ticks;
             }
             if let Some(TraverseKind::Turn(turn)) = path {
                 progress.incoming_turn = Some(turn);
@@ -2500,8 +2646,19 @@ impl Traffic {
                     }
                 }
             }
+            if let Some(current) = car.it.get_travers().map(|path| path.kind) {
+                let next_turn = progress.incoming_turn.or_else(|| {
+                    car.it.get_route()?.reversed_route.last().and_then(|step| match step.kind {
+                        TraverseKind::Turn(turn) => Some(turn),
+                        TraverseKind::Lane(_) => None,
+                    })
+                });
+                if let Some(turn) = next_turn {
+                    turn_candidates.push((id, turn, current, radius));
+                }
+            }
             progress.path = path;
-            let duration = tick - progress.moved_at;
+            let duration = progress.standing_ticks;
             if duration > self.max_standing_ticks {
                 self.max_standing_ticks = duration;
                 self.longest_standing = Some((id, car.vehicle.kind, car.trans.pos.into(), path));
@@ -2552,6 +2709,21 @@ impl Traffic {
                 *conflicts.entry(turn.dst).or_default() |= permissive;
             }
         }
+        self.egress_probes.clear();
+        self.egress_probes.extend(turn_candidates.into_iter().filter_map(
+            |(vehicle, turn, previous, radius)| {
+                if !conflicts.contains_key(&turn.dst) {
+                    return None;
+                }
+                Some(EgressProbe {
+                    vehicle,
+                    turn,
+                    previous,
+                    entrance: map.get(turn.dst)?.points.first(),
+                    radius_squared: radius.powi(2),
+                })
+            },
+        ));
         self.observe_egresses(tick, conflicts, &crossed);
         self.directed_lanes_entered = self.directional_entries.len();
         let stranded = world
@@ -2755,6 +2927,10 @@ impl PassengerEvidence {
 #[derive(Default, Serialize)]
 struct FreightEvidence {
     station_receipts: BTreeMap<String, u64>,
+    observed_unloads: BTreeMap<String, u64>,
+    train_returns_after_unload: u64,
+    tracked_dispatches: u64,
+    proven_delivery: Option<FreightDelivery>,
 }
 
 impl FreightEvidence {
@@ -2763,9 +2939,6 @@ impl FreightEvidence {
         let Some(day) = book.freight_day(day) else {
             return;
         };
-        // The only import terminal is served by the commissioned train.
-        // The station ledger credits the buyer only when a truck unloads
-        // stock that entered the town by rail.
         let market = sim.read::<Market>();
         for (&item, _) in market.iter() {
             let units = sim.world().companies.keys()
@@ -2778,7 +2951,308 @@ impl FreightEvidence {
     }
 
     fn has_delivery(&self) -> bool {
-        self.station_receipts.values().any(|&units| units > 0)
+        self.proven_delivery.as_ref().is_some_and(|delivery| {
+            delivery.units_from_train > 0
+                && delivery.unload_tick < delivery.dispatch_tick
+                && delivery.dispatch_tick < delivery.receipt_tick.unwrap_or(0)
+                && delivery.unload_tick < delivery.return_tick.unwrap_or(0)
+        })
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct FreightDelivery {
+    train: TrainID,
+    station: BuildingID,
+    buyer: BuildingID,
+    truck: VehicleID,
+    item: String,
+    unload_tick: u64,
+    dispatch_tick: u64,
+    receipt_tick: Option<u64>,
+    return_tick: Option<u64>,
+    observed_unload_units: u64,
+    loaded_units: u64,
+    units_from_train: u64,
+}
+
+#[derive(Clone, Copy)]
+struct RailStock {
+    unload_tick: u64,
+    unloaded: u64,
+    may_predate_unload: u64,
+    return_tick: Option<u64>,
+}
+
+impl RailStock {
+    fn attributable_units(self, draw: u64) -> u64 {
+        draw.saturating_sub(self.may_predate_unload).min(self.unloaded)
+    }
+}
+
+struct TrackedDelivery {
+    delivery: FreightDelivery,
+    buyer: SoulID,
+    item: ItemID,
+    target: Option<ItineraryTarget>,
+    receipt_day: u64,
+    previous_receipts: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+struct StationTruck {
+    parked: bool,
+    target: Option<ItineraryTarget>,
+}
+
+struct FreightMonitor {
+    terminal_door: Vec3,
+    market_position: Vec2,
+    train_state: Option<FreightTrainState>,
+    latest_unload: Option<u64>,
+    stock: BTreeMap<ItemID, u64>,
+    credited_stock: BTreeMap<ItemID, RailStock>,
+    trucks: BTreeMap<VehicleID, StationTruck>,
+    deliveries: BTreeMap<VehicleID, TrackedDelivery>,
+    awaiting_return: Option<FreightDelivery>,
+    evidence: FreightEvidence,
+}
+
+impl FreightMonitor {
+    fn new(sim: &Simulation, freight: &Freight) -> Self {
+        let map = sim.map();
+        Self {
+            terminal_door: map.buildings()[freight.terminal].door_pos,
+            market_position: map.buildings()[freight.market].obb.center(),
+            train_state: Self::train_state(sim, freight),
+            latest_unload: None,
+            stock: sim.read::<CargoBook>().import_stock(freight.terminal),
+            credited_stock: BTreeMap::new(),
+            trucks: BTreeMap::new(),
+            deliveries: BTreeMap::new(),
+            awaiting_return: None,
+            evidence: FreightEvidence::default(),
+        }
+    }
+
+    fn train_state(sim: &Simulation, freight: &Freight) -> Option<FreightTrainState> {
+        sim.get(freight.station)?
+            .f.trains.iter()
+            .find_map(|&(id, state)| (id == freight.train).then_some(state))
+    }
+
+    fn observe(&mut self, sim: &Simulation, freight: &Freight, tick: u64) {
+        if self.evidence.has_delivery() {
+            return;
+        }
+
+        let state = Self::train_state(sim, freight);
+        let unloading = matches!(self.train_state, Some(FreightTrainState::Arriving))
+            && matches!(state, Some(FreightTrainState::Loading));
+        let returned = matches!(self.train_state, Some(FreightTrainState::Moving))
+            && matches!(state, None | Some(FreightTrainState::Arriving))
+            && sim.get(freight.train).is_some_and(|train| {
+                train.trans.pos.xy().distance2(self.market_position) < 10.0_f32.powi(2)
+            });
+        self.train_state = state;
+        if returned {
+            self.record_train_return(tick);
+        }
+
+        // The terminal is the only station and its six trucks spawn and park
+        // at its door. Observe stock draws only with the entire fleet visible.
+        const FLEET_SIZE: usize = 6;
+        let vehicles = &sim.world().vehicles;
+        if self.trucks.len() < FLEET_SIZE && tick % SAMPLE_TICKS == 0 {
+            for (id, vehicle) in vehicles.iter() {
+                if matches!(vehicle.vehicle.kind, VehicleKind::Truck)
+                    && matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot)
+                    && vehicle.trans.pos == self.terminal_door
+                {
+                    self.trucks.entry(id).or_insert(StationTruck { parked: true, target: None });
+                }
+            }
+        }
+
+        let full_fleet = self.trucks.len() == FLEET_SIZE
+            && self.trucks.keys().all(|&id| vehicles.contains_key(id));
+        let mut departure = None;
+        let mut departures = 0;
+        let mut route_changes = 0;
+        for (&id, previous) in &mut self.trucks {
+            let Some(truck) = vehicles.get(id) else { continue };
+            let current = StationTruck {
+                parked: matches!(truck.vehicle.state, VehicleState::ParkedAtDepot),
+                target: truck.it.target(),
+            };
+            if previous.parked && !current.parked {
+                departures += 1;
+                if let Some(ItineraryTarget::Position(destination)) = current.target {
+                    departure = Some((id, destination));
+                }
+            } else if !previous.parked && *previous != current {
+                route_changes += 1;
+            }
+            *previous = current;
+        }
+
+        if !full_fleet || unloading || departures > 0 || route_changes > 0 {
+            let book = sim.read::<CargoBook>();
+            let stock = book.import_stock(freight.terminal);
+            if full_fleet && !unloading && departures == 1 && route_changes == 0 {
+                if let Some((truck, destination)) = departure {
+                    self.record_dispatch(sim, &book, freight, tick, &stock, truck, destination);
+                }
+            }
+            self.update_stock(stock, tick, full_fleet && unloading && route_changes == 0,
+                !full_fleet || (route_changes > 0 && (departures > 0 || unloading)));
+        }
+
+        if !self.deliveries.is_empty() {
+            self.record_receipts(sim, tick, route_changes);
+        }
+    }
+
+    fn update_stock(
+        &mut self,
+        next: BTreeMap<ItemID, u64>,
+        tick: u64,
+        train_unload: bool,
+        ambiguous: bool,
+    ) {
+        self.credited_stock.retain(|item, _| next.contains_key(item));
+        for (&item, &units) in &next {
+            let previous = self.stock.get(&item).copied().unwrap_or(0);
+            if train_unload && units > previous {
+                self.latest_unload = Some(tick);
+                // Any dispatch in the same tick ran before the call, so the
+                // observed stock increase is a lower bound on the train unload.
+                let unloaded = units - previous;
+                *self.evidence.observed_unloads.entry(item.prototype().name.clone()).or_default() += unloaded;
+                self.credited_stock.insert(item, RailStock {
+                    unload_tick: tick,
+                    unloaded,
+                    may_predate_unload: previous,
+                    return_tick: None,
+                });
+            } else if let Some(batch) = self.credited_stock.get_mut(&item) {
+                // An aborted truck can return older units. If an addition may
+                // have coincided with a draw, discard attribution for this stock.
+                batch.may_predate_unload = if ambiguous {
+                    units
+                } else {
+                    batch.may_predate_unload.saturating_add(units.saturating_sub(previous)).min(units)
+                };
+            }
+        }
+        self.stock = next;
+    }
+
+    fn record_dispatch(
+        &mut self,
+        sim: &Simulation,
+        book: &CargoBook,
+        freight: &Freight,
+        tick: u64,
+        stock: &BTreeMap<ItemID, u64>,
+        truck: VehicleID,
+        destination: Vec3,
+    ) {
+        let candidate = self.credited_stock.iter().find_map(|(&item, batch)| {
+            let draw = self.stock[&item].saturating_sub(stock.get(&item).copied().unwrap_or(0));
+            let fresh = batch.attributable_units(draw);
+            (fresh > 0).then_some((item, *batch, draw, fresh))
+        });
+        let Some((item, batch, loaded, fresh)) = candidate else { return };
+        let map = sim.map();
+        let mut matching_buyers = sim.world().companies.iter().filter_map(|(id, company)| {
+            let building = company.comp.building;
+            let berth = ParkingManagement::default()
+                .reserve_near(map.get(building)?.door_pos, &map).ok()?.park_pos(&map)?;
+            (berth == destination).then_some((SoulID::GoodsCompany(id), building))
+        });
+        let Some((buyer, building)) = matching_buyers.next() else { return };
+        if matching_buyers.next().is_some() {
+            return;
+        }
+
+        let day = tick / TICKS_PER_BUDGET_DAY;
+        self.evidence.tracked_dispatches += 1;
+        self.deliveries.insert(truck, TrackedDelivery {
+            delivery: FreightDelivery {
+                train: freight.train,
+                station: freight.terminal,
+                buyer: building,
+                truck,
+                item: item.prototype().name.clone(),
+                unload_tick: batch.unload_tick,
+                dispatch_tick: tick,
+                loaded_units: loaded,
+                units_from_train: fresh,
+                observed_unload_units: batch.unloaded,
+                receipt_tick: None,
+                return_tick: batch.return_tick,
+            },
+            buyer,
+            item,
+            target: Some(ItineraryTarget::Position(destination)),
+            receipt_day: day,
+            previous_receipts: book.freight_day(day).map_or(0, |record| {
+                record.receipt(buyer, item).station_units
+            }),
+        });
+    }
+
+    fn record_receipts(&mut self, sim: &Simulation, tick: u64, route_changes: usize) {
+        let book = sim.read::<CargoBook>();
+        let day = tick / TICKS_PER_BUDGET_DAY;
+        let mut arrived = None;
+        self.deliveries.retain(|&id, tracked| {
+            let Some(truck) = sim.get(id) else { return false };
+            let receipts = book.freight_day(day)
+                .map_or(0, |record| record.receipt(tracked.buyer, tracked.item).station_units);
+            let delta = receipts.saturating_sub(if day == tracked.receipt_day {
+                tracked.previous_receipts
+            } else {
+                0
+            });
+            tracked.receipt_day = day;
+            tracked.previous_receipts = receipts;
+            // The truck leaves its buyer itinerary on the same tick the ledger
+            // credits its cargo. A reroute or abort alone supplies no proof.
+            let target = self.trucks[&id].target;
+            if target == tracked.target && !truck.vehicle.state.is_parked() {
+                return true;
+            }
+            if route_changes == 1 && delta == tracked.delivery.loaded_units {
+                let mut delivery = tracked.delivery.clone();
+                delivery.receipt_tick = Some(tick);
+                arrived = Some(delivery);
+            }
+            false
+        });
+        if let Some(delivery) = arrived {
+            if delivery.return_tick.is_some() {
+                self.evidence.proven_delivery = Some(delivery);
+            } else if self.latest_unload == Some(delivery.unload_tick) {
+                self.awaiting_return = Some(delivery);
+            }
+        }
+    }
+
+    fn record_train_return(&mut self, tick: u64) {
+        let Some(unload_tick) = self.latest_unload.take() else { return };
+        self.evidence.train_returns_after_unload += 1;
+        for stock in self.credited_stock.values_mut().filter(|stock| stock.unload_tick == unload_tick) {
+            stock.return_tick = Some(tick);
+        }
+        for tracked in self.deliveries.values_mut().filter(|trip| trip.delivery.unload_tick == unload_tick) {
+            tracked.delivery.return_tick = Some(tick);
+        }
+        if let Some(mut delivery) = self.awaiting_return.take().filter(|delivery| delivery.unload_tick == unload_tick) {
+            delivery.return_tick = Some(tick);
+            self.evidence.proven_delivery = Some(delivery);
+        }
     }
 }
 
@@ -2862,13 +3336,13 @@ pub fn check_loaded_opening(
     let mut schedule = Simulation::schedule();
     let mut traffic = Traffic::default();
     let mut loops = LoopEvidence::default();
-    let mut freight = FreightEvidence::default();
     let mut days = Vec::new();
     let mut minimum_cash = sim.read::<Government>().money;
     for _ in load..start {
         sim.tick(&mut schedule, []);
         minimum_cash = minimum_cash.min(sim.read::<Government>().money);
     }
+    let mut freight = FreightMonitor::new(&sim, &manifest.freight);
     let mut passengers = PassengerEvidence::new(&sim);
     let initial_car_trips = sim.read::<TripStats>().car.completed;
     let plant = manifest
@@ -2901,6 +3375,10 @@ pub fn check_loaded_opening(
                 loops.observe(&transit);
                 passengers.observe(&sim, &transit, tick);
             }
+            if tick < end {
+                freight.observe(&sim, &manifest.freight, tick);
+            }
+            traffic.probe_egresses(&sim);
             if dt % SAMPLE_TICKS == 0 {
                 traffic.observe(&sim, tick);
             }
@@ -2927,7 +3405,7 @@ pub fn check_loaded_opening(
             }
         }
         let close = elapsed_tick(&sim).0;
-        freight.record_day(&sim, day);
+        freight.evidence.record_day(&sim, day);
         let economy = sim.read::<DailyEconomyMetrics>();
         let empty_day = Default::default();
         let daily = economy.closed_day(day, close).unwrap_or(&empty_day);
@@ -3074,8 +3552,8 @@ pub fn check_loaded_opening(
                 .into(),
         );
     }
-    if !freight.has_delivery() {
-        failures.push("freight recorded no positive rail delivery to a town buyer".into());
+    if !freight.evidence.has_delivery() {
+        failures.push("freight recorded no attributable in-window train unload, truck receipt and market return".into());
     }
     if minimum_cash <= Money::ZERO {
         failures.push(format!("treasury reached {minimum_cash}"));
@@ -3095,7 +3573,7 @@ pub fn check_loaded_opening(
         passenger_examples: manifest.lines.iter().filter_map(|(&name, line)| {
             Some((name, passengers.examples.remove(&line.id)?))
         }).collect(),
-        freight,
+        freight: freight.evidence,
         failures,
     })
 }
@@ -3114,6 +3592,103 @@ impl OpeningReport {
 mod tests {
     use super::*;
     use prototypes::TICKS_PER_HOUR;
+
+    #[test]
+    fn cm2_publish_keeps_the_west_south_shortcut_walkable() {
+        use crate::citymap::{build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig, DEFAULT_LESCE, DEFAULT_SAVA};
+        use simulation::map::LaneKind;
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        configure_commissioned_network(&mut plan);
+        let shortcut = SourceKey::Infill { number: 7, part: 4 };
+        assert_eq!(plan.graph.links[&shortcut].class, RoadClass::Walk);
+        let (sim, network) = build_dry_town(&plan).unwrap();
+        let map = sim.map();
+        let road = &map.roads()[network.links[&shortcut].road];
+        assert!(road.lanes_iter().all(|(_, kind)| kind == LaneKind::Walking));
+    }
+
+    #[test]
+    fn cm2_layout_keeps_the_southeast_stub_walkable_without_vehicle_egress() {
+        use crate::citymap::{
+            build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig, DEFAULT_LESCE, DEFAULT_SAVA,
+        };
+        use simulation::map::LaneKind;
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        configure_commissioned_network(&mut plan);
+        let (sim, built) = build_dry_town(&plan).unwrap();
+        let map = sim.map();
+        let lanes: Vec<_> = map.roads()[built.links[&SOUTHEAST_STUB].road]
+            .lanes_iter()
+            .collect();
+        assert!(lanes.iter().any(|(_, kind)| *kind == LaneKind::Walking));
+        assert!(lanes.iter().all(|(_, kind)| *kind == LaneKind::Walking));
+    }
+
+    #[test]
+    fn cm2_layout_restores_alpska_crosswalk() {
+        use crate::citymap::{
+            build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig, DEFAULT_LESCE, DEFAULT_SAVA,
+        };
+        use simulation::map::{LaneKind, PathKind, TurnKind};
+        use simulation::map_dynamic::Itinerary;
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        configure_commissioned_network(&mut plan);
+        let (sim, built) = build_dry_town(&plan).unwrap();
+        let map = sim.map();
+        let alpska = SourceKey::Node { id: 862116385, rail: false };
+        let junction = &map.intersections()[built.junctions[&alpska]];
+        assert!(junction.turn_policy.crosswalks);
+        assert!(junction.turns().any(|turn| turn.kind == TurnKind::Crosswalk));
+        let sidewalks: Vec<_> = junction
+            .roads
+            .iter()
+            .flat_map(|&road| {
+                map.roads()[road].lanes_iter().filter_map(|(lane, kind)| {
+                    let lane = &map.lanes()[lane];
+                    (kind == LaneKind::Walking).then(|| {
+                        let points = &lane.points;
+                        let offset = points.length().min(40.0) * 0.5;
+                        points.point_along(if lane.src == junction.id {
+                            offset
+                        } else {
+                            points.length() - offset
+                        })
+                    })
+                })
+            })
+            .collect();
+        assert_eq!(sidewalks.len(), 6);
+        for &from in &sidewalks {
+            for &to in &sidewalks {
+                assert!(
+                    Itinerary::route(prototypes::Tick(0), from, to, &map, PathKind::Pedestrian)
+                        .is_some(),
+                    "missing walking route from {from:?} to {to:?}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn cm2_publish_tracks_the_same_parcel_after_demolition() {
@@ -3211,21 +3786,91 @@ mod tests {
     }
 
     #[test]
-    fn cm2_publish_accepts_any_positive_station_receipt() {
+    fn cm2_freight_rejects_unattributed_station_receipts() {
         let mut freight = FreightEvidence::default();
-        assert!(!freight.has_delivery());
-        freight.station_receipts.insert("goods".into(), 0);
         assert!(!freight.has_delivery());
         for item in ["goods", "coal", "flour"] {
             freight.station_receipts.insert(item.into(), 1);
-            assert!(freight.has_delivery(), "missing credit for {item}");
-            freight.station_receipts.clear();
+            assert!(!freight.has_delivery(), "credited an unrelated receipt for {item}");
         }
     }
 
     #[test]
+    fn cm2_freight_requires_loaded_units_a_buyer_receipt_and_train_return() {
+        let mut stock = RailStock {
+            unload_tick: 10,
+            unloaded: 12,
+            may_predate_unload: 20,
+            return_tick: None,
+        };
+        assert_eq!(stock.attributable_units(20), 0);
+        assert_eq!(stock.attributable_units(25), 5);
+        stock.may_predate_unload = 25;
+        assert_eq!(stock.attributable_units(25), 0);
+
+        for item in ["goods", "coal", "flour"] {
+            let mut proof = FreightDelivery {
+                train: TrainID::default(),
+                station: BuildingID::default(),
+                buyer: BuildingID::default(),
+                truck: VehicleID::default(),
+                item: item.into(),
+                unload_tick: 10,
+                dispatch_tick: 11,
+                receipt_tick: None,
+                return_tick: None,
+                observed_unload_units: 12,
+                loaded_units: 25,
+                units_from_train: 5,
+            };
+            let check = |delivery| FreightEvidence {
+                proven_delivery: Some(delivery),
+                ..Default::default()
+            }.has_delivery();
+            assert!(!check(proof.clone()));
+            proof.receipt_tick = Some(12);
+            assert!(!check(proof.clone()));
+            proof.return_tick = Some(13);
+            assert!(check(proof.clone()));
+            proof.units_from_train = 0;
+            assert!(!check(proof));
+        }
+    }
+
+    #[test]
+    fn cm2_infill_rejects_a_new_junction_inside_the_spacing_floor() {
+        crate::ensure_repo_root_cwd();
+        simulation::init::init();
+        let sim = Simulation::new_authored_flat(1, 1).unwrap();
+        let mut map = sim.write::<Map>();
+        map.make_connection(
+            MapProject::ground(Vec3::new(40.0, 80.0, 0.0)),
+            MapProject::ground(Vec3::new(120.0, 80.0, 0.0)),
+            None,
+            &LanePatternBuilder::new().build(),
+        ).unwrap();
+        assert!(verify_infill_spacing(&map, 40.0).is_ok());
+        map.make_connection(
+            MapProject::ground(Vec3::new(100.0, 110.0, 0.0)),
+            MapProject::ground(Vec3::new(190.0, 110.0, 0.0)),
+            None,
+            &LanePatternBuilder::new().build(),
+        ).unwrap();
+        assert!(verify_infill_spacing(&map, 40.0).is_err());
+    }
+
+    #[test]
+    fn cm2_infill_rejects_missing_opening_frontage() {
+        let lot = LotID::default();
+        let (_, commercial) = downtown_cells();
+        let approved = BTreeMap::from([(lot, commercial)]);
+        assert!(audit_votes(std::iter::empty(), &approved).is_err());
+    }
+
+    #[test]
     fn cm2_gate_transit_requires_new_boardings_and_real_loop() {
-        assert!(line_operating("employment", 5, 1, 0));
+        assert!(line_operating("employment", 5, 1, 1));
+        assert!(!line_operating("employment", 5, 1, 0));
         assert!(!line_operating("employment", 4, 1, 1));
         assert!(!line_operating("employment", 5, 0, 1));
         assert!(line_operating("neighbourhood", 10, 1, 1));
@@ -3330,8 +3975,29 @@ mod tests {
         }
         traffic.observe(&sim, 20 * minute);
         assert_eq!(traffic.max_blocking_ticks, 20 * minute);
-        sim.world_mut_unchecked().vehicles[blocker].vehicle.state = VehicleState::ParkedAtDepot;
+
+        // One car clears the turn entirely between traffic samples while
+        // another takes its place in the upstream conflict.
+        let replacement = spawn(&mut sim, approach, Some(25.0));
+        {
+            let vehicles = &mut sim.world_mut_unchecked().vehicles;
+            vehicles[replacement].trans.pos = vehicles[second].trans.pos;
+        }
+        let map = (*sim.map()).clone();
+        let car = &mut sim.world_mut_unchecked().vehicles[second];
+        car.it = Itinerary::route_to_lane(Tick(0), car.trans.pos, &map, egress, 38.0).unwrap();
+        let start = car.trans.pos;
+        car.trans.pos = car.it.update(start, 100.0, Tick(0), 0, &map);
+        assert_eq!(car.it.get_travers().unwrap().kind, TraverseKind::Lane(egress));
+        assert!(map.lanes()[egress].points.first().distance2(car.trans.pos) > 30.0_f32.powi(2));
+        car.speed.0 = 1.0;
+        traffic.probe_egresses(&sim);
         traffic.observe(&sim, 21 * minute);
+        assert_eq!(traffic.blocked_egresses[&egress].start, 21 * minute);
+
+        sim.world_mut_unchecked().vehicles[blocker].vehicle.state = VehicleState::ParkedAtDepot;
+        sim.world_mut_unchecked().vehicles[replacement].vehicle.state = VehicleState::ParkedAtDepot;
+        traffic.observe(&sim, 22 * minute);
         assert!(traffic.blocked_egresses.is_empty());
     }
 

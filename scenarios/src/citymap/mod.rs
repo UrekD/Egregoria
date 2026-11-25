@@ -159,7 +159,10 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, commissioned: bool) -> Result
     require_absent_delivery(&out).map_err(path_error)?;
 
     let inputs = read_inputs(paths)?;
-    let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default())?;
+    let mut plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default())?;
+    if commissioned {
+        commission::configure_commissioned_network(&mut plan);
+    }
     let (mut sim, built) = build_dry_town(&plan)?;
     let opening = commissioned.then(|| commission(&mut sim, &plan, &built)).transpose()?;
     let variant = if commissioned { "dry-split-high" } else { DRY_VARIANT };
