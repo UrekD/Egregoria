@@ -169,8 +169,9 @@ pub fn commission(
             sites.insert(format!("{name}-{}", index + 1), building);
         }
     }
+    // Keep the fuel employers within reach of the South and West labour pools.
     let (plant, plant_road) =
-        place_company(sim, plan, &roads, "coal-power-plant", at(2580.0, 2525.0))?;
+        place_company(sim, plan, &roads, "coal-power-plant", at(1740.0, 1430.0))?;
     sites.insert("coal-power-plant".into(), plant);
     let plant_door = sim.map().buildings()[plant].door_pos.xy();
     let mine_frontage = BTreeSet::from([plant_road]);
