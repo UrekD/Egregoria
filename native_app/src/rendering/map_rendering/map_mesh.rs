@@ -35,6 +35,17 @@ use std::time::{Duration, Instant};
 #[path = "growable_mesh.rs"]
 mod growable_mesh;
 
+// A true result consumes the building before the legacy renderer.
+fn append_profiled_building(mesh: &mut MeshBuilder<false>, building: &Building) -> bool {
+    let Some(site) = building.development() else {
+        return false;
+    };
+    if let Some(shell) = crate::gui::selectable::PreparedShell::new(building) {
+        growable_mesh::append(mesh, &shell, site);
+    }
+    true
+}
+
 /// This is the main struct that handles the map rendering.
 /// It is responsible for generating the meshes and sprites for the map
 /// That is, the mostly static things (roads, intersections, lights, buildings).
@@ -1560,7 +1571,7 @@ impl MapBuilders {
             if SubscriberChunkID::new(building.canonical_position()) != chunk {
                 continue;
             }
-            if growable_mesh::append(&mut self.houses_mesh, building) {
+            if append_profiled_building(&mut self.houses_mesh, building) {
                 continue;
             }
             let mut sprite_z = building.height;

@@ -1,12 +1,14 @@
 use crate::gui::follow::FollowEntity;
 use crate::gui::{InspectedBuilding, InspectedEntity, InspectedRoad, Tool};
-use crate::inputmap::{InputAction, InputMap};
+use crate::inputmap::{InputAction, InputMap, SurfaceHits};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 use engine::Tesselator;
-use geom::{Intersect, Ray3, Segment, Shape, Vec2, Vec3, AABB};
-use simulation::map::{BuildingID, Environment, Map, ProjectFilter, ProjectKind, Road, RoadID};
+use geom::{Intersect, LinearColor, Ray3, Segment, Shape, Vec2, Vec3, AABB};
+use simulation::map::{Building, BuildingID, Map, ProjectFilter, ProjectKind, Road, RoadID};
 use simulation::{AnyEntity, Simulation};
+use std::collections::BTreeSet;
+use std::ops::RangeInclusive;
 
 pub fn select_radius(id: AnyEntity) -> f32 {
     match id {
@@ -53,7 +55,7 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
             let map = sim.map();
             inspected_b.e = inp
                 .ray
-                .and_then(|ray| pick_growable(&map, ray))
+                .and_then(|ray| pick_growable(&map, ray, inp.surface_hits(map.environment())))
                 .or_else(|| {
                     map.spatial_map()
                         .query(inp.unprojected?.xy(), ProjectFilter::BUILDING)
@@ -118,7 +120,7 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
 // The orbit camera's maximum normal eye offset is about 1.7 km.
 const GROWABLE_PICK_RANGE_M: f32 = 4096.0;
 
-fn pick_growable(map: &Map, ray: Ray3) -> Option<BuildingID> {
+fn pick_growable(map: &Map, ray: Ray3, hits: SurfaceHits) -> Option<BuildingID> {
     if !ray.from.is_finite() || !ray.dir.is_finite() {
         return None;
     }
@@ -127,35 +129,49 @@ fn pick_growable(map: &Map, ray: Ray3) -> Option<BuildingID> {
         return None;
     }
     let ray = Ray3::new(ray.from, ray.dir / length);
-    let (start, end) = visible_pick_depth(map.environment(), ray)?;
+    let (start, end) = visible_pick_depth(map.environment().bounds(), ray, hits)?;
 
     let first = (ray.from + start * ray.dir).xy();
     let last = (ray.from + end * ray.dir).xy();
     let footprint_ray = Segment::new(first, last);
-    map.spatial_map()
-        .query(footprint_ray.bbox(), ProjectFilter::BUILDING)
-        .filter_map(|project| {
-            let id = project.as_building()?;
+    let candidates: BTreeSet<_> = pick_query_bounds(footprint_ray)
+        .flat_map(|bounds| map.spatial_map().query(bounds, ProjectFilter::BUILDING))
+        .filter_map(|project| project.as_building())
+        .collect();
+    candidates
+        .into_iter()
+        .filter_map(|id| {
             let building = map.get(id)?;
-            building.development()?;
             if !building.obb.intersects(&footprint_ray) {
                 return None;
             }
-            shell_hit(&building.mesh.faces, ray, start..=end).map(|depth| (depth, id))
+            PreparedShell::new(building)?
+                .ray_depth(ray, start..=end)
+                .map(|depth| (depth, id))
         })
         .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
         .map(|(_, id)| id)
 }
 
-fn visible_pick_depth(env: &Environment, ray: Ray3) -> Option<(f32, f32)> {
-    let (start, mut end) = clip_pick_ray(ray, env.bounds(), GROWABLE_PICK_RANGE_M)?;
-    if let Some((point, _)) = env.raycast(ray) {
-        end = end.min((point - ray.from).dot(ray.dir));
-    }
-    if let Some(water) = env.raycast_water(ray, end) {
-        end = water.t;
-    }
-    (start <= end).then_some((start, end))
+fn pick_query_bounds(segment: Segment) -> impl Iterator<Item = AABB> {
+    // One spatial-grid cell width per query. Each box touches a fixed number
+    // of cells, so diagonal work grows with the length of the segment.
+    const STEP_M: f32 = 50.0;
+    let steps = (segment.src.distance(segment.dst) / STEP_M).ceil().max(1.0) as u32;
+    (0..steps).map(move |step| {
+        let first = segment.src.lerp(segment.dst, step as f32 / steps as f32);
+        let last = segment
+            .src
+            .lerp(segment.dst, (step + 1) as f32 / steps as f32);
+        Segment::new(first, last).bbox()
+    })
+}
+
+fn visible_pick_depth(bounds: AABB, ray: Ray3, hits: SurfaceHits) -> Option<(f32, f32)> {
+    let limit = hits.nearest().map_or(GROWABLE_PICK_RANGE_M, |point| {
+        ((point - ray.from).dot(ray.dir)).min(GROWABLE_PICK_RANGE_M)
+    });
+    clip_pick_ray(ray, bounds, limit)
 }
 
 fn clip_pick_ray(ray: Ray3, bounds: AABB, limit: f32) -> Option<(f32, f32)> {
@@ -179,21 +195,88 @@ fn clip_pick_ray(ray: Ray3, bounds: AABB, limit: f32) -> Option<(f32, f32)> {
     (start <= end).then_some((start, end))
 }
 
-fn shell_hit(
-    faces: &[(Vec<Vec3>, geom::LinearColor)],
-    ray: Ray3,
-    depth: std::ops::RangeInclusive<f32>,
-) -> Option<f32> {
-    // Prepared growable faces are convex and use the same triangle fan in the renderer.
-    faces
-        .iter()
-        .filter_map(|(face, _)| face.split_first())
-        .flat_map(|(&a, tail)| {
-            tail.windows(2)
-                .filter_map(move |pair| triangle_hit(ray, a, pair[0], pair[1]))
+const MAX_SHELL_VERTICES: usize = 1_536;
+const MAX_SHELL_INDICES: usize = 2_304;
+
+/// The bounded, world-space surface view shared by the renderer and hand tool.
+pub(crate) struct PreparedShell<'a> {
+    building: &'a Building,
+    pub(crate) panel_budget: usize,
+}
+
+impl<'a> PreparedShell<'a> {
+    pub(crate) fn new(building: &'a Building) -> Option<Self> {
+        building.development()?;
+        if !building.height.is_finite() || !building.door_pos.is_finite() {
+            return None;
+        }
+        let mut shell = Self {
+            building,
+            panel_budget: 0,
+        };
+        let mut vertices = 0;
+        let mut indices = 0;
+        for (face, color) in shell.raw_faces() {
+            if !(3..=MAX_SHELL_VERTICES).contains(&face.len()) {
+                return None;
+            }
+            vertices += face.len();
+            indices += 3 * (face.len() - 2);
+            if vertices > MAX_SHELL_VERTICES
+                || indices > MAX_SHELL_INDICES
+                || !face.iter().all(|p| p.is_finite())
+                || !<[f32; 4]>::from(color).into_iter().all(f32::is_finite)
+            {
+                return None;
+            }
+        }
+        if vertices == 0 {
+            return None;
+        }
+        shell.panel_budget =
+            ((MAX_SHELL_VERTICES - vertices) / 4).min((MAX_SHELL_INDICES - indices) / 6);
+        Some(shell)
+    }
+
+    fn raw_faces(&self) -> impl Iterator<Item = (&[Vec3], LinearColor)> {
+        self.building
+            .mesh
+            .faces
+            .iter()
+            .map(|(face, color)| (face.as_slice(), *color))
+    }
+
+    pub(crate) fn base_z(&self) -> f32 {
+        self.building.height
+    }
+
+    pub(crate) fn door(&self) -> Vec3 {
+        self.building.door_pos
+    }
+
+    pub(crate) fn faces(&self) -> impl Iterator<Item = (&[Vec3], Vec3, LinearColor)> {
+        self.raw_faces().filter_map(|(face, color)| {
+            let normal = face_fan(face.len()).find_map(|[a, b, c]| {
+                (face[b] - face[a])
+                    .cross(face[c] - face[a])
+                    .try_normalize()
+                    .filter(|normal| normal.is_finite() && normal.mag2() > 0.0)
+            })?;
+            Some((face, normal, color))
         })
-        .filter(|hit| depth.contains(hit))
-        .min_by(f32::total_cmp)
+    }
+
+    fn ray_depth(&self, ray: Ray3, depth: RangeInclusive<f32>) -> Option<f32> {
+        self.faces()
+            .flat_map(|(face, _, _)| face_fan(face.len()).map(|tri| tri.map(|index| face[index])))
+            .filter_map(|[a, b, c]| triangle_hit(ray, a, b, c, true))
+            .filter(|hit| depth.contains(hit))
+            .min_by(f32::total_cmp)
+    }
+}
+
+pub(crate) fn face_fan(vertices: usize) -> impl Iterator<Item = [usize; 3]> {
+    (1..vertices.saturating_sub(1)).map(|i| [0, i, i + 1])
 }
 
 fn pick_road(map: &Map, ray: Ray3, terrain: Option<Vec3>) -> Option<RoadID> {
@@ -236,18 +319,20 @@ fn road_hit(road: &Road, ray: Ray3, limit: f32, mesh: &mut Tesselator<'_>) -> Op
         .chunks_exact(3)
         .filter_map(|indices| {
             let point = |i: usize| Vec3::from(mesh.vertices[indices[i] as usize].position);
-            triangle_hit(ray, point(0), point(1), point(2))
+            triangle_hit(ray, point(0), point(1), point(2), false)
                 .filter(|depth| (0.0..=limit).contains(depth))
         })
         .min_by(f32::total_cmp)
 }
 
-fn triangle_hit(ray: Ray3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
+fn triangle_hit(ray: Ray3, a: Vec3, b: Vec3, c: Vec3, cull_backface: bool) -> Option<f32> {
     let ab = b - a;
     let ac = c - a;
     let cross = ray.dir.cross(ac);
     let det = ab.dot(cross);
-    if det.abs() <= f32::EPSILON {
+    // The lit mesh pipeline treats counter-clockwise winding as front-facing.
+    let facing = if cull_backface { det } else { det.abs() };
+    if facing <= f32::EPSILON {
         return None;
     }
     let origin = ray.from - a;
@@ -258,13 +343,216 @@ fn triangle_hit(ray: Ray3, a: Vec3, b: Vec3, c: Vec3) -> Option<f32> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use geom::vec3;
     use scenarios::ScenarioCtx;
     use simulation::map::{LanePatternBuilder, MapProject};
     use simulation::transportation::{spawn_driving_vehicle, VehicleKind};
     use simulation::SimulationOptions;
+
+    use common::saveload::{Bincode, Encoder};
+    use geom::{vec2, LinearColor, OBB};
+    use simulation::map::{
+        procgen::ColoredMesh, Building, BuildingKind, Buildings, Density, Environment,
+        GrowableDevelopment, GrowableSiteState, Intersections, Lanes, LotOrigin, Lots,
+        ParkingSpots, Roads, ZoneCell, ZoneKind,
+    };
+    use std::collections::BTreeMap;
+
+    // Exercise deserialized shell faces with the live map's rebuilt spatial index.
+    pub(crate) fn profiled_house(
+        id: BuildingID,
+        obb: OBB,
+        mesh: ColoredMesh,
+        height: f32,
+        roof_z: f32,
+    ) -> Building {
+        let development = GrowableDevelopment {
+            zone: ZoneCell {
+                kind: ZoneKind::Residential,
+                density: Density::High,
+            },
+            level: 1,
+            floors: 10,
+            roof_z,
+            approved_value_band: 0,
+            home: None,
+            planned_jobs: 0,
+            site: GrowableSiteState::Active,
+            business: None,
+        };
+        let door = ((obb.corners[0] + obb.corners[1]) * 0.5).z(height);
+        Bincode::decode(
+            &Bincode::encode(&(
+                id,
+                door,
+                BuildingKind::House,
+                mesh,
+                obb,
+                height,
+                None::<simulation::map::Zone>,
+                None::<RoadID>,
+                Some(development),
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn map_with_buildings(environment: Environment, buildings: Buildings) -> Map {
+        #[derive(serde::Serialize)]
+        struct MapSnapshot {
+            roads: Roads,
+            intersections: Intersections,
+            buildings: Buildings,
+            lanes: Lanes,
+            parking: ParkingSpots,
+            lots: Lots,
+            environment: Environment,
+            external_train_stations: Vec<BuildingID>,
+        }
+        let snapshot = MapSnapshot {
+            roads: Default::default(),
+            intersections: Default::default(),
+            buildings,
+            lanes: Default::default(),
+            parking: Default::default(),
+            lots: Default::default(),
+            environment,
+            external_train_stations: Vec::new(),
+        };
+        Bincode::decode(
+            &Bincode::encode(&(snapshot, BTreeMap::<BuildingID, LotOrigin>::new())).unwrap(),
+        )
+        .unwrap()
+    }
+
+    fn tower(id: BuildingID, x: f32, roof_z: f32) -> Building {
+        let footprint = OBB::from(&AABB::new_ll_ur(vec2(x, 90.0), vec2(x + 20.0, 110.0)));
+        let ground = footprint.corners.map(|p| p.z(-4.0));
+        let roof = footprint.corners.map(|p| p.z(roof_z));
+        let mut faces = vec![(roof.to_vec(), LinearColor::WHITE)];
+        for i in 0..4 {
+            let j = (i + 1) % 4;
+            faces.push((
+                vec![ground[i], ground[j], roof[j], roof[i]],
+                LinearColor::WHITE,
+            ));
+        }
+        profiled_house(id, footprint, ColoredMesh { faces }, -4.0, roof_z)
+    }
+
+    fn dry_environment() -> Environment {
+        let mut env = Environment::new(1, 1);
+        env.terrain_apply(env.bounds(), |_| -4.0);
+        env
+    }
+
+    fn click_building(sim: &Simulation, ray: Ray3, input_map: &Map) -> Option<BuildingID> {
+        crate::init::init();
+        let ui = UiWorld::with_defaults();
+        let mut input = ui.write::<InputMap>();
+        input.just_act.insert(InputAction::Select);
+        input.set_world_ray(Some(ray), input_map, false);
+        drop(input);
+        selectable(sim, &ui);
+        let selected = ui.read::<InspectedBuilding>().e;
+        selected
+    }
+
+    #[test]
+    fn zones2_native_hand_tool_ignores_exit_faces_and_orders_sky_hits() {
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        let mut buildings = Buildings::default();
+        let far = buildings.insert_with_key(|id| tower(id, 150.0, 80.0));
+        let near = buildings.insert_with_key(|id| tower(id, 50.0, 60.0));
+        ctx.sim
+            .insert(map_with_buildings(dry_environment(), buildings));
+        let map = ctx.sim.map();
+        let direction = vec3(1.0, 0.02, 0.1).normalize();
+        let sky = Ray3::new(vec3(-10.0, 98.0, 25.0), direction);
+        assert!(map.environment().raycast(sky).is_none());
+        assert_eq!(click_building(&ctx.sim, sky, &map), Some(near));
+        let inside = Ray3::new(vec3(60.0, 100.0, 30.0), direction);
+        assert_eq!(click_building(&ctx.sim, inside, &map), Some(far));
+    }
+
+    #[test]
+    fn zones2_native_hand_tool_orders_tied_roof_hits_by_id() {
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        let mut buildings = Buildings::default();
+        let first = buildings.insert_with_key(|id| tower(id, 50.0, 60.0));
+        let second = buildings.insert_with_key(|id| tower(id, 55.0, 60.0));
+        ctx.sim
+            .insert(map_with_buildings(dry_environment(), buildings));
+        let map = ctx.sim.map();
+        let roof = Ray3::new(vec3(62.0, 100.0, 75.0), -Vec3::Z);
+        assert_eq!(
+            click_building(&ctx.sim, roof, &map),
+            Some(first.min(second))
+        );
+    }
+
+    #[test]
+    fn zones2_native_hand_tool_skips_rejected_shells() {
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        let mut buildings = Buildings::default();
+        buildings.insert_with_key(|id| {
+            let mut b = tower(id, 50.0, 60.0);
+            b.mesh.faces.push((vec![Vec3::ZERO], LinearColor::WHITE));
+            b
+        });
+        let far = buildings.insert_with_key(|id| tower(id, 150.0, 70.0));
+        ctx.sim
+            .insert(map_with_buildings(dry_environment(), buildings));
+        let map = ctx.sim.map();
+        let sky = Ray3::new(vec3(0.0, 100.0, 25.0), Vec3::X);
+        assert_eq!(click_building(&ctx.sim, sky, &map), Some(far));
+    }
+
+    #[test]
+    fn zones2_native_hand_tool_uses_the_supplied_pointer_depth() {
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        let mut buildings = Buildings::default();
+        let target = buildings.insert_with_key(|id| tower(id, 60.0, -2.0));
+        ctx.sim
+            .insert(map_with_buildings(dry_environment(), buildings));
+        let dry = ctx.sim.map();
+        let mut wet_env = dry_environment();
+        wet_env.set_sea_level(Some(0)).unwrap();
+        let wet = map_with_buildings(wet_env, Buildings::default());
+        let ray = Ray3::new(vec3(70.0, 100.0, 20.0), -Vec3::Z);
+
+        assert_eq!(click_building(&ctx.sim, ray, &dry), Some(target));
+        assert_eq!(click_building(&ctx.sim, ray, &wet), None);
+    }
+
+    #[test]
+    fn zones2_native_pick_queries_follow_the_diagonal() {
+        let diagonal = Segment::new(Vec2::ZERO, vec2(2896.0, 2896.0));
+        let bounds: Vec<_> = pick_query_bounds(diagonal).collect();
+        assert!(!bounds.iter().any(|aabb| aabb.contains(vec2(30.0, 2800.0))));
+        assert!(bounds
+            .iter()
+            .all(|aabb| (aabb.ur.x - aabb.ll.x).max(aabb.ur.y - aabb.ll.y) <= 51.0));
+        for i in 0..=100 {
+            let point = diagonal.src.lerp(diagonal.dst, i as f32 / 100.0);
+            assert!(bounds.iter().any(|aabb| aabb.contains(point)));
+        }
+    }
 
     #[test]
     fn zones2_native_pick_segment_clips_vertical_and_world_edge_rays() {
@@ -281,35 +569,18 @@ mod tests {
     }
 
     #[test]
-    fn zones2_native_pick_hits_visible_surfaces_at_their_actual_depth() {
-        let near = vec![
-            vec3(10.0, 10.0, 30.0),
-            vec3(10.0, 20.0, 30.0),
-            vec3(10.0, 20.0, 46.0),
-        ];
-        let far = vec![
-            vec3(20.0, 10.0, 30.0),
-            vec3(20.0, 20.0, 30.0),
-            vec3(20.0, 20.0, 50.0),
-            vec3(20.0, 10.0, 50.0),
-        ];
-        let faces = [far, near].map(|face| (face, geom::LinearColor::WHITE));
-        let sky = Ray3::new(vec3(0.0, 15.0, 36.0), Vec3::X);
-        assert_eq!(shell_hit(&faces, sky, 0.0..=100.0), Some(10.0));
-        assert_eq!(shell_hit(&faces, sky, 0.0..=9.0), None);
-        let above_near_face = Ray3::new(sky.from.up(5.0), sky.dir);
-        assert_eq!(shell_hit(&faces, above_near_face, 0.0..=100.0), Some(20.0));
-    }
-
-    #[test]
     fn zones2_native_pick_depth_stops_at_the_nearer_water_surface() {
         let mut env = Environment::new(1, 1);
         env.terrain_apply(env.bounds(), |_| -4.0);
         let ray = Ray3::new(vec3(250.0, 250.0, 20.0), -Vec3::Z);
-        let (_, dry_depth) = visible_pick_depth(&env, ray).unwrap();
+        let (_, dry_depth) =
+            visible_pick_depth(env.bounds(), ray, SurfaceHits::cast(&env, ray)).unwrap();
         assert!(dry_depth > 21.0);
         env.set_sea_level(Some(0)).unwrap();
-        assert_eq!(visible_pick_depth(&env, ray), Some((0.0, 20.0)));
+        assert_eq!(
+            visible_pick_depth(env.bounds(), ray, SurfaceHits::cast(&env, ray)),
+            Some((0.0, 20.0))
+        );
     }
 
     #[test]

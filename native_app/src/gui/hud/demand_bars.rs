@@ -80,13 +80,12 @@ fn demand_details(sim: &Simulation, demand: &ZoneDemand, zone: ZoneKind) {
     if zone == ZoneKind::MixedUse {
         let residential = demand_value(demand, ZoneKind::Residential);
         let commercial = demand_value(demand, ZoneKind::Commercial);
-        let source = |value: Option<f32>| value.map_or_else(|| "—".into(), |v| format!("{v:+.1}"));
         textc(
             color,
             format!(
                 "Residential {} · Commercial {}",
-                source(residential),
-                source(commercial)
+                mixed_source_label(residential),
+                mixed_source_label(commercial)
             ),
         );
         if let Some((residential, commercial)) = residential.zip(commercial) {
@@ -105,6 +104,20 @@ fn demand_details(sim: &Simulation, demand: &ZoneDemand, zone: ZoneKind) {
         };
         textc(color, driver);
     }
+}
+
+fn mixed_source_label(value: Option<f32>) -> String {
+    let Some(value) = value else {
+        return "—".into();
+    };
+    let threshold = if value > 5.0 {
+        "above +5"
+    } else if value < 5.0 {
+        "below +5"
+    } else {
+        "at +5"
+    };
+    format!("{value:+.1} ({threshold})")
 }
 
 fn mixed_demand_status(residential: f32, commercial: f32) -> (&'static str, &'static str) {
@@ -160,6 +173,14 @@ pub(crate) fn top_driver(sim: &Simulation, zone: ZoneKind) -> Option<(&'static s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zones2_native_mixed_source_qualifies_rounded_threshold_values() {
+        assert_eq!(mixed_source_label(Some(5.01)), "+5.0 (above +5)");
+        assert_eq!(mixed_source_label(Some(5.0)), "+5.0 (at +5)");
+        assert_eq!(mixed_source_label(Some(4.99)), "+5.0 (below +5)");
+        assert_eq!(mixed_source_label(None), "—");
+    }
 
     #[test]
     fn zones2_native_mixed_demand_uses_both_smoothed_sources() {
