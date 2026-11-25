@@ -1100,15 +1100,18 @@ fn plan_parcels(
             }
         }
         let mut chosen_blocks = BTreeSet::new();
+        // The employment district has a spare starter block in case one
+        // of the first two opens with an inactive lot.
+        let starter_blocks = if cohort.district == "employment" { 3 } else { 2 };
         for block in candidates.iter().filter_map(|(_, block)| *block) {
             if block_count.get(&block).copied().unwrap_or(0) >= 2 {
                 chosen_blocks.insert(block);
-                if chosen_blocks.len() == 2 {
+                if chosen_blocks.len() == starter_blocks {
                     break;
                 }
             }
         }
-        if chosen_blocks.len() != 2 {
+        if chosen_blocks.len() < 2 {
             return Err(format!("{}: fewer than two fitting blocks", district.key));
         }
         let mut starting_industry = 0;
