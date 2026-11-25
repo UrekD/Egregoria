@@ -2,7 +2,7 @@ use super::adapters::{
     apply, crosses_reserved_bank, downtown_cells, frontage_roads, place_company,
     place_scored_company, place_special, site_clear, water_sites,
 };
-use super::{blocks, contains, BuiltNetwork, RoadClass, TownPlan};
+use super::{blocks, contains, BuiltNetwork, RoadClass, SourceKey, TownPlan};
 use geom::{vec2, Intersect, Polygon, Transform, Vec2, Vec3, OBB};
 use prototypes::{
     try_prototype, BuildingGen, FreightStationPrototypeID, GameTime, ItemID, Money, ResidencePrototype,
@@ -180,21 +180,11 @@ pub fn commission(
             sites.insert(format!("{name}-{}", index + 1), building);
         }
     }
-    // Give the fuel employers short commutes from the West neighbourhood and
-    // keep their shipments on its local frontage.
-    let (plant, plant_road) =
-        place_company(sim, plan, &roads, "coal-power-plant", at(1260.0, 1675.0))?;
+    // Use the terminal for coal. In the road-supplied opening, mines reserved
+    // the plant's orders while their drivers were away from the depot.
+    let (plant, _) = place_company(sim, plan, &roads, "coal-power-plant", bakery_anchor)?;
     sites.insert("coal-power-plant".into(), plant);
-    let plant_door = sim.map().buildings()[plant].door_pos.xy();
-    let mine_frontage = BTreeSet::from([plant_road]);
-    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)]
-        .into_iter()
-        .enumerate()
-    {
-        let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
-        verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
-        sites.insert(format!("coal-mine-{}", index + 1), mine);
-    }
+    verify_parking_pair(&sim.map(), terminal, plant, Tick(sim.get_tick()))?;
     // Use parking frontage near both the field clusters and the shops.
     for (i, (x, y)) in [
         (1110.0, 1550.0),
@@ -312,7 +302,13 @@ pub fn commission(
         sites.insert(name.into(), building);
     }
 
-    let (mut parcels, reserves) = plan_parcels(sim, plan, &roads, &cohorts)?;
+    let mut zoning_roads = roads.clone();
+    if let Some(avenue) = built.links.get(&SourceKey::Authored("hraska-west")) {
+        // This through avenue has no loading frontage. Its nearest stocked
+        // shop required a walk of almost 2.5 km from the approved housing.
+        zoning_roads.remove(&avenue.road);
+    }
+    let (mut parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts)?;
     place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
 
     // Keep the food facilities clear of approved housing and future infill.
@@ -1512,7 +1508,10 @@ fn install_bus_loops(
                     let berths: [CurbBerth; 2] = berths.try_into().ok()?;
                     Some((span.road, berths))
                 })
-                .filter(|(_, berths)| berths[0].pos.xy().distance(anchor) < 430.0)
+                .filter(|(_, berths)| {
+                    let radius = if district == 4 { 350.0 } else { 430.0 };
+                    berths[0].pos.xy().distance(anchor) < radius
+                })
                 .map(|(road, berths)| {
                     let lanes = map.roads()[road]
                         .outgoing_lanes_from(map.roads()[road].src)
