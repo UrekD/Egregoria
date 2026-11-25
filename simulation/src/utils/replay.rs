@@ -289,6 +289,15 @@ fn replay_corrupt(error: io::Error) -> SaveLoadError {
     }
 }
 
+fn replay_decode_error(error: SaveLoadError) -> io::Error {
+    match error {
+        SaveLoadError::Incompatible { version } | SaveLoadError::IncompatibleReplay { version } => {
+            replay_version_error(&version)
+        }
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
+    }
+}
+
 pub(crate) struct ReplayJson;
 
 #[derive(Deserialize)]
@@ -322,6 +331,25 @@ impl ReplayHeader {
 }
 
 impl ReplayJson {
+    pub(crate) fn decode_snapshot(bytes: &[u8]) -> io::Result<Replay> {
+        let mut replay: Replay = match ReplayHeader::decode(bytes) {
+            Ok(_) => return JSON::decode(bytes),
+            Err(SaveLoadError::IncompatibleReplay { version }) if version == crate::VERSION => {
+                JSON::decode(bytes)?
+            }
+            Err(error) => return Err(replay_decode_error(error)),
+        };
+
+        // Same-schema snapshots saved before the command protocol revision
+        // still carry the required Replay resource when recording is disabled.
+        if replay.enabled || replay.command_count() != 0 || replay.has_timeline() {
+            return Err(replay_version_error(&replay.version));
+        }
+        replay.check_registry()?;
+        replay.version = replay_version();
+        Ok(replay)
+    }
+
     pub(crate) fn encode_sidecar(
         replay: &Replay,
         revision: SnapshotRevision,
@@ -363,11 +391,7 @@ impl Encoder for ReplayJson {
     }
 
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
-        ReplayHeader::decode(bytes).map_err(|error| match error {
-            SaveLoadError::Incompatible { version }
-            | SaveLoadError::IncompatibleReplay { version } => replay_version_error(&version),
-            error => io::Error::new(io::ErrorKind::InvalidData, error),
-        })?;
+        ReplayHeader::decode(bytes).map_err(replay_decode_error)?;
         JSON::decode(bytes)
     }
 }
@@ -664,6 +688,29 @@ fn scale_t1_fix_rejects_import_in_replay_constructor() {
         Simulation::try_from_replay(replay),
         Err(err) if err.to_string() == "Invalid replay constructor batch"
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn p7_snapshot_rejects_active_or_nonempty_p6_replay() {
+    let mut replay = Replay {
+        version: crate::VERSION.to_owned(),
+        enabled: true,
+        ..Replay::default()
+    };
+    let assert_incompatible = |replay: &Replay| {
+        let bytes = JSON::encode(replay).unwrap();
+        let error = ReplayJson::decode_snapshot(&bytes).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            replay_version_error(crate::VERSION).to_string()
+        );
+    };
+    assert_incompatible(&replay);
+
+    replay.enabled = false;
+    replay.push(Tick(INITIAL_TICK), WorldCommand::MapLoadParis);
+    assert_incompatible(&replay);
 }
 
 #[cfg(test)]
