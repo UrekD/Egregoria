@@ -3912,6 +3912,35 @@ mod tests {
     }
 
     #[test]
+    fn cm2_stationary_vehicle_keeps_permissive_time_across_a_red() {
+        use simulation::transportation::spawn_driving_vehicle;
+
+        let (mut sim, approach, _) = super::super::spacing::cm0_boundary_fixture();
+        let junction = sim.map().lanes()[approach].dst;
+        sim.write::<Map>()
+            .update_intersection(junction, |junction| junction.light_policy = LightPolicy::Lights);
+        let (pos, dir, green, red) = {
+            let map = sim.map();
+            let lane = &map.lanes()[approach];
+            let (pos, dir) = lane.points.point_dir_along(lane.points.length() - 3.5);
+            let green = (0..3600).find(|&seconds|
+                matches!(lane.control.get_behavior(seconds), TrafficBehavior::GREEN)
+            ).unwrap();
+            let red = (0..3600).find(|&seconds|
+                matches!(lane.control.get_behavior(seconds), TrafficBehavior::RED)
+            ).unwrap();
+            (pos, dir, green, red)
+        };
+        spawn_driving_vehicle(&mut sim, VehicleKind::Car, Transform::new_dir(pos, dir)).unwrap();
+        let mut traffic = Traffic::default();
+        for (sample, seconds) in [green, green, red, green].into_iter().enumerate() {
+            sim.write::<GameTime>().seconds = seconds;
+            traffic.observe(&sim, sample as u64 * SAMPLE_TICKS);
+        }
+        assert_eq!(traffic.max_standing_ticks, 2 * SAMPLE_TICKS);
+    }
+
+    #[test]
     fn cm2_egress_continuity_uses_permissive_phase_and_crossing_progress() {
         let lane = LaneID::default();
         let empty = BTreeSet::new();
