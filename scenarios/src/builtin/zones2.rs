@@ -257,8 +257,17 @@ fn grow_city_with_health(
     if let Some((root, resumed)) = replay_root.zip(resumed) {
         let mut resumed = ScenarioCtx::from_sim(resumed);
         paint_core(&mut resumed, mixed);
-        if resumed.sim.hashes() != ctx.sim.hashes() {
-            return Err("resumed city diverged during the core paint wave".into());
+        let uninterrupted = ctx.sim.hashes();
+        let resumed_hashes = resumed.sim.hashes();
+        if resumed_hashes != uninterrupted {
+            let changed: BTreeSet<_> = uninterrupted
+                .keys()
+                .chain(resumed_hashes.keys())
+                .filter(|key| uninterrupted.get(*key) != resumed_hashes.get(*key))
+                .collect();
+            return Err(format!(
+                "resumed city diverged during the core paint wave: {changed:?}"
+            ));
         }
         verify_checkpoint(&ctx.sim, root, "zones2_after_core")?;
     }

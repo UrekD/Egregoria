@@ -265,19 +265,9 @@ fn register_utility_water_sample() {
             name: "utility_water_sample",
             optional: true,
             save: Box::new(|sim| {
-                let map = sim.map();
-                let env = map.environment();
                 let flow = sim.read::<UtilityFlow>();
-                let revision = flow.sampled_water_revision;
-                if env.strict_water_siting()
-                    || env.has_water_configuration()
-                    || flow.water_pending(&map)
-                {
-                    Bincode::encode(&(revision, &flow.sampled_members)).unwrap()
-                } else {
-                    // Preserve the legacy payload and resource hash for dry maps.
-                    Bincode::encode(&revision).unwrap()
-                }
+                // The live reader validates membership after reload on dry maps as well.
+                Bincode::encode(&(flow.sampled_water_revision, &flow.sampled_members)).unwrap()
             }),
             load: Box::new(|sim, data| {
                 let mut input = data;
