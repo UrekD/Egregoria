@@ -1106,7 +1106,7 @@ fn take_parcels(
         if selected.len() - first == count {
             return true;
         }
-        let Ok((kind, house)) = check_growable_lot(map, lot, zoning) else {
+        let Ok(site) = check_growable_lot(map, lot, zoning) else {
             return true;
         };
         selected.push(Parcel {
@@ -1116,11 +1116,8 @@ fn take_parcels(
             block,
             footprint: lot.shape,
             zoning,
-            capacity: house.map_or(0, |home| home.capacity),
-            workers: kind
-                .as_goods_company()
-                .and_then(try_prototype)
-                .map_or(0, |company| company.n_workers),
+            capacity: site.home.map_or(0, |home| home.capacity),
+            workers: site.company.map_or(0, |company| company.base.n_workers),
             building: None,
         });
         false
@@ -1458,7 +1455,7 @@ fn line_operating(before: u64, after: u64, loops: u64, completed: u64) -> bool {
     after.saturating_sub(before) >= 10 && loops > 0 && completed > 0
 }
 
-fn freight_delivered(unloaded: u32, manifested: u32, received: u64, returned: bool) -> bool {
+fn freight_delivered(unloaded: u64, manifested: u64, received: u64, returned: bool) -> bool {
     unloaded > 0 && manifested > 0 && received > 0 && returned
 }
 
@@ -1524,6 +1521,16 @@ struct NetworkState {
     sewage_capacity: f64,
     sewage_demand: f64,
     adequate: bool,
+}
+
+fn has_retail_stock(market: &Market, soul: SoulID) -> bool {
+    ["groceries", "retail-goods"]
+        .into_iter()
+        .filter_map(|item| market.inner().get(&ItemID::new(item)))
+        .any(|shelf| {
+            shelf.sell_order(soul).is_some_and(|order| order.qty > 0)
+                && shelf.capital(soul).is_some_and(|stock| stock > 0)
+        })
 }
 
 fn snapshot(sim: &Simulation, plan: &TownPlan, manifest: &OpeningManifest) -> TownState {
@@ -1624,11 +1631,7 @@ fn snapshot(sim: &Simulation, plan: &TownPlan, manifest: &OpeningManifest) -> To
         state.jobs += workers;
         let stocked = staffed
             && is_retail_store(building.kind)
-            && infos.owner(id).is_some_and(|soul| {
-                ["groceries", "retail-goods"]
-                    .into_iter()
-                    .any(|item| market.capital(soul, ItemID::new(item)) > 0)
-            });
+            && infos.owner(id).is_some_and(|soul| has_retail_stock(&market, soul));
         state.stocked_shops += u64::from(stocked);
         if let Some(parcel) = parcel {
             if people > 0 {
@@ -1832,18 +1835,16 @@ fn verify_infill(sim: &mut Simulation, manifest: &OpeningManifest) -> Result<(),
                 .electricity
                 .net_id(lot.parent)
                 .ok_or("reserved lot has no utility network")?;
-            let (kind, home) = check_growable_lot(&map, lot, parcel.zoning)
+            let site = check_growable_lot(&map, lot, parcel.zoning)
                 .map_err(|error| format!("infill {:?}: {error:?}", parcel.lot))?;
-            let (power, water) = if let Some(home) = home {
+            let (power, water) = if let Some(home) = site.home {
                 (
                     home.power_consumption.map_or(100, |power| power.0),
                     home.water_consumption,
                 )
             } else {
-                let company = kind
-                    .as_goods_company()
-                    .and_then(try_prototype)
-                    .ok_or("missing infill prototype")?;
+                let company = site.company.ok_or("missing infill prototype")?;
+                let company = &company.base;
                 (
                     company.power_consumption.map_or(0, |power| power.0),
                     company.water_consumption,
@@ -2051,13 +2052,13 @@ fn track_arrival(
 
 #[derive(Default, Serialize)]
 struct FreightEvidence {
-    unloaded: u32,
-    dispatched_units_lower_bound: u32,
+    unloaded: u64,
+    dispatched_units_lower_bound: u64,
     buyer_station_receipts: u64,
     train_returns_after_unload: u64,
     last_import_status: String,
     #[serde(skip)]
-    previous_stock: u32,
+    previous_stock: u64,
     #[serde(skip)]
     observed_unload: bool,
     #[serde(skip)]
@@ -2419,7 +2420,7 @@ pub fn check_loaded_opening(
     }
     freight.dispatched_units_lower_bound = freight
         .dispatched_units_lower_bound
-        .max(u32::try_from(freight.buyer_station_receipts).unwrap_or(u32::MAX));
+        .max(freight.buyer_station_receipts);
     if !freight_delivered(
         freight.unloaded,
         freight.dispatched_units_lower_bound,
@@ -2462,6 +2463,21 @@ impl OpeningReport {
 mod tests {
     use super::*;
     use prototypes::TICKS_PER_HOUR;
+
+    #[test]
+    fn cm2_gate_retail_stock_requires_an_available_shelf_offer() {
+        crate::ensure_repo_root_cwd();
+        simulation::init::init();
+        let sim = Simulation::new_authored_flat(1, 1).unwrap();
+        let mut market = sim.write::<Market>();
+        let seller = SoulID::GoodsCompany(Default::default());
+        let groceries = ItemID::new("groceries");
+        market.produce(seller, groceries, 3);
+        market.sell(seller, Vec2::ZERO, groceries, 0, 3);
+        assert!(!has_retail_stock(&market, seller));
+        market.sell(seller, Vec2::ZERO, groceries, 3, 3);
+        assert!(has_retail_stock(&market, seller));
+    }
 
     #[test]
     fn cm2_gate_employment_and_population() {
