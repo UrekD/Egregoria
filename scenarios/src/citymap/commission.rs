@@ -226,6 +226,7 @@ fn prepare_opening(
 ) -> Result<OpeningLayout, String> {
     let roads = frontage_roads(plan, built);
     let wet = sim.map().environment().has_water_configuration();
+    let profiled_wet = wet && ResidencePrototype::iter().any(|home| home.massing.is_some());
     let at = |x, y| super::layout::design_point(vec2(x, y), plan.config);
     let cohorts = [
         Cohort {
@@ -356,7 +357,7 @@ fn prepare_opening(
         verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
         sites.insert(format!("coal-mine-{}", index + 1), mine);
     }
-    let intake_parcels = if wet && ResidencePrototype::iter().any(|home| home.massing.is_some()) {
+    let intake_parcels = if profiled_wet {
         commission_intake_frontage(sim, plan, &roads)?
     } else {
         Vec::new()
@@ -558,6 +559,39 @@ fn prepare_opening(
         let store =
             place_company_around_parcels(sim, "supermarket", at(2660.0, 1325.0), Some("south"))?;
         sites.insert("south/east-supermarket".into(), store);
+    }
+    if profiled_wet {
+        // Add stocked frontage on the streets where the denser opening still
+        // sends shoppers on the longest walks home.
+        for (name, district, x, y) in [
+            ("west/rim-bakery", "west", 570.0, 1788.0),
+            ("west/northwest-bakery", "west", 718.0, 1948.0),
+            ("south/alpska-bakery", "south", 2613.0, 1288.0),
+            ("station/east-bakery", "station", 2070.0, 1775.0),
+        ] {
+            let bakery = place_company_around_parcels(sim, "bakery", at(x, y), Some(district))?;
+            sites.insert(name.into(), bakery);
+        }
+        // Use the stock meat and vegetable recipes to supply local shelves
+        // when the freight terminal is also handling industrial imports.
+        for (name, x, y) in [
+            ("animal-farm", 2780.0, 2340.0),
+            ("slaughterhouse", 2660.0, 2330.0),
+            ("meat-facility", 2540.0, 2260.0),
+            ("vegetable-farm", 2440.0, 2440.0),
+        ] {
+            let supplier = place_company_around_parcels(sim, name, at(x, y), Some("employment"))?;
+            sites.insert(name.into(), supplier);
+        }
+        let map = sim.map();
+        for (from, to) in [
+            ("animal-farm", "slaughterhouse"),
+            ("slaughterhouse", "meat-facility"),
+            ("meat-facility", "employment/supermarket"),
+            ("vegetable-farm", "employment/supermarket"),
+        ] {
+            verify_parking_pair(&map, sites[from], sites[to], Tick(sim.get_tick()))?;
+        }
     }
     place_walkable_bakeries(sim, plan, &roads, &parcels, &reserves, &mut sites)?;
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
@@ -4219,6 +4253,9 @@ mod tests {
             "{housing} opening housing places, with {isolated_south} on the remote South fringe"
         );
         if ResidencePrototype::iter().any(|home| home.massing.is_some()) {
+            let rim = super::super::layout::design_point(vec2(718.0, 1948.0), plan.config);
+            let bakery = &map.buildings()[opening.sites["west/northwest-bakery"]];
+            assert!(bakery.door_pos.xy().distance(rim) <= 150.0);
             assert_eq!(opening.intake_homes.len(), 12);
             assert!(opening.parcels.iter()
                 .filter(|parcel| opening.intake_homes.contains(&parcel.lot))
