@@ -12,6 +12,11 @@ use crate::world_command::Rejection;
 const PITCH: f32 = 42.0;
 const MAX_TILE_SITES: usize = 4096;
 
+/// Maximum sites indexed by one road, counting both sides of each station.
+pub(super) fn max_tiled_frontage_lots(road: &super::Road) -> usize {
+    2 * usize::from((road.length() / PITCH) as u16)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct SiteKey(RoadID, u8, u16);
 
@@ -68,7 +73,7 @@ impl Map {
             }
             let mut stations = road.points().points_dirs_manual();
             spend_water_work(remaining, road.points().len())?;
-            let candidate_count = (road.length() / PITCH) as usize * 2;
+            let candidate_count = max_tiled_frontage_lots(road);
             let per_candidate = road.points().len().saturating_mul(12) + candidate_count + 1;
             spend_water_work(remaining, candidate_count.saturating_mul(per_candidate))?;
             for station in 1..=(road.length() / PITCH) as u16 {

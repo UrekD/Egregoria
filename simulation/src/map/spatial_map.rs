@@ -13,6 +13,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::{BitOr, Neg, Sub};
 
+// A generated lot is at most 40 m square and can span at most 3x3 cells.
+const GENERATED_LOT_CELLS: usize = 9;
+
 #[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, From)]
 pub enum ProjectKind {
     Intersection(IntersectionID),
@@ -408,7 +411,7 @@ impl SpatialMap {
             cells
                 .len()
                 .saturating_mul(changed_objects.saturating_add(3))
-                .saturating_add(new_lots.saturating_mul(per_lot.saturating_add(27))),
+                .saturating_add(new_lots.saturating_mul(per_lot.saturating_add(3 * GENERATED_LOT_CELLS))),
         )?;
         for cell in cells.iter() {
             if let Some(cell) = storage.cell(cell) {
@@ -416,33 +419,79 @@ impl SpatialMap {
             }
         }
         let mut removal_cells = FastSet::default();
-        let mut reserve_removal_cell = |cell, work: &mut usize| -> Result<(), WaterEditError> {
-            if removal_cells.insert(cell) {
-                let entries = storage.cell(cell).map_or(0, |cell| cell.objs.len());
-                spend_water_work(work, entries.saturating_add(changed_objects))?;
-            }
-            Ok(())
-        };
         // Lots can straddle cells outside the query. Budget the batch's
         // bookkeeping per membership and one scan per affected cell.
         for (_, lot_bounds, object) in self.broad.query(bounds) {
             if object.to_lot().is_some() {
-                let occupied = self.broad.cell_range(*lot_bounds);
-                spend_water_work(work, per_lot.saturating_add(occupied.len()))?;
-                for cell in occupied.iter() {
-                    reserve_removal_cell(cell, work)?;
-                }
+                spend_water_work(work, per_lot)?;
+                self.reserve_lot_removal_cells(
+                    self.broad.cell_range(*lot_bounds),
+                    changed_objects,
+                    &mut removal_cells,
+                    work,
+                )?;
             }
         }
         if new_lots > 0 {
             // A merge can clear lots generated during the live connection.
             // Allow a rounded-up lot diagonal beyond the query for those lots.
-            let possible = self
-                .broad
-                .cell_range(bounds.expand(super::MAX_LOT_SIZE * 1.5));
-            spend_water_work(work, possible.len())?;
-            for cell in possible.iter() {
-                reserve_removal_cell(cell, work)?;
+            let possible = bounds.expand(super::MAX_LOT_SIZE * 1.5);
+            self.reserve_lot_removal_cells(
+                self.broad.cell_range(possible),
+                changed_objects,
+                &mut removal_cells,
+                work,
+            )?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn reserve_lot_removals(
+        &self,
+        ids: impl IntoIterator<Item = LotID>,
+        generated_regions: impl IntoIterator<Item = AABB>,
+        new_lots: usize,
+        changed_objects: usize,
+        work: &mut usize,
+    ) -> Result<(), WaterEditError> {
+        let mut removal_cells = FastSet::default();
+        // Newly inserted handles add memberships to both the removal lists
+        // and the affected cell scans.
+        spend_water_work(work, new_lots.saturating_mul(1 + 2 * GENERATED_LOT_CELLS))?;
+        for id in ids {
+            spend_water_work(work, 1)?;
+            if let Some(&handle) = self.ids.get(&ProjectKind::Lot(id)) {
+                self.reserve_lot_removal_cells(
+                    self.broad.cell_range(self.broad.objects[handle].aabb),
+                    changed_objects,
+                    &mut removal_cells,
+                    work,
+                )?;
+            }
+        }
+        for bounds in generated_regions {
+            self.reserve_lot_removal_cells(
+                self.broad.cell_range(bounds),
+                changed_objects,
+                &mut removal_cells,
+                work,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn reserve_lot_removal_cells(
+        &self,
+        range: CellRange,
+        changed_objects: usize,
+        seen: &mut FastSet<CellIdx>,
+        work: &mut usize,
+    ) -> Result<(), WaterEditError> {
+        spend_water_work(work, range.len())?;
+        for cell in range.iter() {
+            if seen.insert(cell) {
+                let entries = self.broad.storage.cell(cell).map_or(0, |cell| cell.objs.len());
+                spend_water_work(work, entries.saturating_add(changed_objects))?;
             }
         }
         Ok(())

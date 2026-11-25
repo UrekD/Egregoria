@@ -133,6 +133,8 @@ pub(crate) struct PreparedTopologyEdit {
     pub(crate) merges: Option<[bool; 2]>,
     pub(crate) frontage_work: usize,
     pub(crate) merge_frontage_work: [usize; 2],
+    #[cfg(test)]
+    merge_lot_allowances: [usize; 2],
 }
 
 impl PreparedTopologyEdit {
@@ -434,6 +436,8 @@ fn stage_connection(
     let land_outlines = graph.validate_land()?;
     let frontage_work = graph.frontage_work;
     let mut merge_frontage_work = [0; 2];
+    #[cfg(test)]
+    let mut merge_lot_allowances = [0; 2];
     let (mut wet, mut junctions) = if check_water {
         graph.validate()?
     } else {
@@ -446,31 +450,39 @@ fn stage_connection(
         {
             return [false; 2];
         }
-        // The live connection can generate new frontage before applying either merge.
-        let new_lots = if pattern
-            .lanes()
-            .any(|(kind, _, _)| kind == crate::map::LaneKind::Walking)
-        {
-            let road = &graph.roads[id];
-            let length = if map.environment().strict_water_siting() {
-                road.interfaced_points().length()
-            } else {
-                road.length()
-            };
-            // Each successful frontage station advances at least 22 m per side.
-            (length / 22.0).ceil() as usize * 2
-        } else {
-            0
-        };
+        // Tiled commit generates the split children and the connecting road
+        // before the first merge. Unrestricted commit generates only the link.
+        let mut frontage: Vec<_> = graph
+            .patterns
+            .iter()
+            .filter(|(road, _)| tiled || **road == id)
+            .filter_map(|(&road, pattern)| {
+                FrontageGeneration::bound(&graph.roads[road], pattern, tiled)
+            })
+            .collect();
         [0, 1].map(|end| {
             let junction = [src, dst][end];
+            let new_lots = frontage.iter().map(|generation| generation.count).sum();
             if let Some((merged, (next_wet, next_junctions))) =
-                graph.stage_shallow_merge(junction, new_lots)
+                graph.stage_shallow_merge(junction, &frontage, new_lots)
             {
                 id = merged;
                 wet = next_wet;
                 junctions = next_junctions;
                 merge_frontage_work[end] = graph.frontage_work;
+                #[cfg(test)]
+                {
+                    merge_lot_allowances[end] = new_lots;
+                }
+                if tiled {
+                    // The first successful merge can generate more frontage
+                    // before the second clearance and reassignment.
+                    frontage.extend(FrontageGeneration::bound(
+                        &graph.roads[merged],
+                        &graph.patterns[&merged],
+                        true,
+                    ));
+                }
                 true
             } else {
                 false
@@ -491,6 +503,8 @@ fn stage_connection(
         merges,
         frontage_work,
         merge_frontage_work,
+        #[cfg(test)]
+        merge_lot_allowances,
         preview: RoadPreview {
             deck,
             junctions,
@@ -734,6 +748,36 @@ fn bounds_of(points: &[Vec2]) -> AABB {
     AABB::new_ll_ur(min, max)
 }
 
+struct FrontageGeneration {
+    count: usize,
+    bounds: AABB,
+}
+
+impl FrontageGeneration {
+    fn bound(road: &Road, pattern: &LanePattern, tiled: bool) -> Option<Self> {
+        if (tiled && road.elevated_span())
+            || !pattern.lanes().any(|(kind, _, _)| kind == crate::map::LaneKind::Walking)
+        {
+            return None;
+        }
+        let count = if tiled {
+            crate::map::land_frontage::max_tiled_frontage_lots(road)
+        } else {
+            // Each successful legacy frontage station advances at least 22 m
+            // per side. Wet maps place it along the clipped road.
+            let length = road.length().max(road.interfaced_points().length());
+            (length / 22.0).ceil() as usize * 2
+        };
+        let bounds = road
+            .points()
+            .bbox()
+            .flatten()
+            .union(road.interfaced_points().bbox().flatten())
+            .expand(road.width * 0.5 + 1.0 + crate::map::MAX_LOT_SIZE * 1.5);
+        (count > 0).then_some(Self { count, bounds })
+    }
+}
+
 struct LocalTopology<'map, 'work, 'budget> {
     map: &'map Map,
     work: &'work mut CrossingWork<'budget>,
@@ -743,6 +787,8 @@ struct LocalTopology<'map, 'work, 'budget> {
     live_junctions: BTreeMap<IntersectionID, IntersectionID>,
     road_keys: BTreeMap<RoadID, RoadID>,
     live_roads: BTreeMap<RoadID, RoadID>,
+    // Original road lots can survive a split and either staged merge.
+    lot_sources: BTreeMap<RoadID, BTreeSet<RoadID>>,
     patterns: BTreeMap<RoadID, LanePattern>,
     loaded_junctions: BTreeSet<IntersectionID>,
     changed_roads: BTreeSet<RoadID>,
@@ -764,6 +810,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             live_junctions: BTreeMap::new(),
             road_keys: BTreeMap::new(),
             live_roads: BTreeMap::new(),
+            lot_sources: BTreeMap::new(),
             patterns: BTreeMap::new(),
             loaded_junctions: BTreeSet::new(),
             changed_roads: BTreeSet::new(),
@@ -854,11 +901,17 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                 if road.elevated_span() {
                     self.wet_splits.insert(junction);
                 }
-                self.add_road(src, junction, before, &pattern, road.elevated_span(), 0)?;
-                self.add_road(junction, dst, after, &pattern, road.elevated_span(), 0)?;
+                let before =
+                    self.add_road(src, junction, before, &pattern, road.elevated_span(), 0)?;
+                let after =
+                    self.add_road(junction, dst, after, &pattern, road.elevated_span(), 0)?;
+                let live = self.live_roads[&original];
+                self.lot_sources.insert(before, BTreeSet::from([live]));
+                self.lot_sources.insert(after, BTreeSet::from([live]));
                 self.invalidate(src)?;
                 self.invalidate(dst)?;
                 self.invalidate(junction)?;
+                self.reserve_reassigned_lots([live], None, &[])?;
                 Ok(junction)
             }
             _ => Err(ConnectionError::InvalidEndpoint),
@@ -913,6 +966,38 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         for junction in [road.src, road.dst] {
             reserve(self.junctions[junction].bcircle().bbox(), 4)?;
         }
+        Ok(())
+    }
+
+    fn reserve_reassigned_lots(
+        &mut self,
+        originals: impl IntoIterator<Item = RoadID>,
+        profile_points: Option<usize>,
+        frontage: &[FrontageGeneration],
+    ) -> Result<(), ConnectionError> {
+        let mut lots = Vec::new();
+        for road in originals {
+            if !self.map.land_ownership().is_tiled() {
+                self.work.charge(self.map.lots.len())?;
+            }
+            let ids = self.map.road_lot_ids(road);
+            if let Some(points) = profile_points {
+                let tile_work = frontage_attempt_work(self.map.roads[road].width, true);
+                for &id in &ids {
+                    let samples = frontage_samples(&self.map.lots[id].shape);
+                    self.work.charge(reassigned_lot_work(points, samples, tile_work))?;
+                }
+            }
+            lots.extend(ids);
+        }
+        let changed_objects = self.changed_junctions.len() + self.patterns.len();
+        self.map.spatial_map.reserve_lot_removals(
+            lots,
+            frontage.iter().map(|generation| generation.bounds),
+            frontage.iter().map(|generation| generation.count).sum(),
+            changed_objects,
+            self.work.remaining,
+        )?;
         Ok(())
     }
 
@@ -1032,6 +1117,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
     fn stage_shallow_merge(
         &mut self,
         joint: IntersectionID,
+        frontage: &[FrontageGeneration],
         new_lots: usize,
     ) -> Option<(RoadID, (BTreeSet<RoadID>, Vec<Vec<Vec3>>))> {
         let [first, second] = self.shallow_merge_roads(joint)?;
@@ -1062,7 +1148,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                     .saturating_add(if self.map.land_ownership().is_tiled() {
                         0
                     } else {
-                        self.map.lots.len().saturating_mul(2)
+                        self.map.lots.len().saturating_add(new_lots).saturating_mul(2)
                     }),
             )
             .ok()?;
@@ -1073,26 +1159,27 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                 self.junctions[dst].pos,
                 self.map.environment(),
             );
-        let points = if elevated {
+        let profile_points = if elevated {
             a.points().len() + b.points().len()
         } else {
             samples.max(a.points().len() + b.points().len())
         };
+        let mut lot_sources = BTreeSet::new();
         for id in [first, second] {
-            if let Some(&live) = self.live_roads.get(&id) {
-                self.work
-                    .charge(reassigned_frontage_work(self.map, live, points))
-                    .ok()?;
-            } else if pattern
-                .lanes()
-                .any(|(kind, _, _)| kind == crate::map::LaneKind::Walking)
-            {
-                // Newly generated vacant lots take at least 22 m of station spacing.
-                let lots = (self.roads[id].length() / 22.0).ceil() as usize * 2;
-                let per_lot = points.saturating_mul(13) + frontage_attempt_work(a.width, true);
-                self.work.charge(lots.saturating_mul(per_lot)).ok()?;
+            lot_sources.extend(self.live_roads.get(&id).copied());
+            if let Some(sources) = self.lot_sources.get(&id) {
+                lot_sources.extend(sources.iter().copied());
             }
         }
+        // Frontage generated earlier in the live edit can also be reassigned.
+        // Round up once more for the generated corners' f32 rounding.
+        let generated_samples = (crate::map::MAX_LOT_SIZE / (CELL_SIZE * 0.25)).ceil() as usize + 1;
+        let per_lot = reassigned_lot_work(
+            profile_points,
+            generated_samples,
+            frontage_attempt_work(a.width, true),
+        );
+        self.work.charge(new_lots.saturating_mul(per_lot)).ok()?;
         let snapshot_cost = self
             .roads
             .values()
@@ -1119,6 +1206,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             live_junctions: self.live_junctions.clone(),
             road_keys: self.road_keys.clone(),
             live_roads: self.live_roads.clone(),
+            lot_sources: self.lot_sources.clone(),
             patterns: self.patterns.clone(),
             loaded_junctions: self.loaded_junctions.clone(),
             changed_roads: self.changed_roads.clone(),
@@ -1139,6 +1227,12 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             let id = trial.add_road(src, dst, points, &pattern, elevated, new_lots)?;
             trial.invalidate(src)?;
             trial.invalidate(dst)?;
+            trial.reserve_reassigned_lots(
+                lot_sources.iter().copied(),
+                Some(profile_points),
+                frontage,
+            )?;
+            trial.lot_sources.insert(id, lot_sources);
             let outlines = trial.validate_land()?;
             let validation = if trial.map.environment().strict_water_siting() {
                 trial.validate()?
@@ -1154,6 +1248,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         self.live_junctions = trial.live_junctions;
         self.road_keys = trial.road_keys;
         self.live_roads = trial.live_roads;
+        self.lot_sources = trial.lot_sources;
         self.patterns = trial.patterns;
         self.loaded_junctions = trial.loaded_junctions;
         self.changed_roads = trial.changed_roads;
@@ -1604,8 +1699,8 @@ pub(crate) fn prepare_merge(
     let mut graph = LocalTopology::new(map, work);
     let src = graph.load_junction(src)?;
     let dst = graph.load_junction(dst)?;
-    let first = graph.road_keys[&first];
-    let second = graph.road_keys[&second];
+    let originals = [first, second];
+    let [first, second] = originals.map(|road| graph.road_keys[&road]);
     let joint = [graph.roads[first].src, graph.roads[first].dst]
         .into_iter()
         .find(|&id| id == graph.roads[second].src || id == graph.roads[second].dst)
@@ -1613,7 +1708,7 @@ pub(crate) fn prepare_merge(
     graph.validate_removed_junction(joint)?;
     graph.remove_road(first);
     graph.remove_road(second);
-    graph.add_road(src, dst, profile.clone(), pattern, elevated, 0)?;
+    let merged = graph.add_road(src, dst, profile.clone(), pattern, elevated, 0)?;
     if check_water || map.land_ownership().is_tiled() {
         graph.invalidate(src)?;
         graph.invalidate(dst)?;
@@ -1622,6 +1717,8 @@ pub(crate) fn prepare_merge(
             graph.validate()?;
         }
     }
+    let profile_points = check_water.then(|| graph.roads[merged].interfaced_points().len());
+    graph.reserve_reassigned_lots(originals, profile_points, &[])?;
     Ok(graph.frontage_work)
 }
 
@@ -1928,11 +2025,15 @@ pub(crate) fn reassigned_frontage_work(map: &Map, id: RoadID, points: usize) -> 
         .map(|id| {
             let lot = &map.lots[id];
             let samples = frontage_samples(&lot.shape);
-            points
-                .saturating_mul(samples + 3)
-                .saturating_add(tile_work.saturating_mul(samples.div_ceil(10)))
+            reassigned_lot_work(points, samples, tile_work)
         })
         .fold(0, usize::saturating_add)
+}
+
+fn reassigned_lot_work(points: usize, samples: usize, tile_work: usize) -> usize {
+    points
+        .saturating_mul(samples + 3)
+        .saturating_add(tile_work.saturating_mul(samples.div_ceil(10)))
 }
 
 pub(crate) fn generated_frontage_work(length: f32, pattern: &LanePattern, wet: bool) -> usize {
@@ -2015,4 +2116,133 @@ pub(crate) fn remap_merged_roads(
         roads.dedup();
     }
     replacements.extend(old.into_iter().map(|id| (id, vec![new])));
+}
+
+#[cfg(test)]
+mod harden1_tests {
+    use super::*;
+    use crate::map::{LandOwnership, LandTileId, LanePatternBuilder, OwnedTileRect, TileExtent};
+    use geom::{vec2, OBB};
+
+    fn ground(x: f32, y: f32) -> MapProject {
+        MapProject::ground(vec2(x, y).z0())
+    }
+
+    fn tiled(map: &mut Map) {
+        map.install_land_ownership(
+            LandOwnership::tiled(
+                TileExtent {
+                    width: 5,
+                    height: 5,
+                },
+                OwnedTileRect {
+                    origin: LandTileId { x: 1, y: 1 },
+                    width: 3,
+                    height: 3,
+                },
+                Default::default(),
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn harden1_split_reassignment_reserves_and_batches_dense_stale_lots() {
+        const LOTS: usize = 10_000;
+        let mut environment = Environment::new(1, 1);
+        environment.set_sea_level(Some(-10)).unwrap();
+        assert!(!environment.strict_water_siting());
+        let mut map = Map::empty();
+        assert!(map.install_environment(environment));
+        let pattern = LanePatternBuilder {
+            rail: true,
+            ..Default::default()
+        }
+        .build();
+        let (_, parent) = map
+            .make_connection(ground(70.0, 100.0), ground(370.0, 100.0), None, &pattern)
+            .unwrap();
+        let from = MapProject {
+            kind: parent.into(),
+            pos: ground(220.0, 100.0).pos,
+        };
+        let to = ground(220.0, 200.0);
+        let cost = |map: &Map| {
+            let mut work = WaterTopologyWork::new();
+            let initial = work.remaining;
+            map.prepare_connection(from, to, None, &pattern, Some(&mut work))
+                .unwrap();
+            initial - work.remaining
+        };
+        let empty_cost = cost(&map);
+        let shape = OBB::new(vec2(400.0, 350.0), Vec2::X, 4.0, 4.0);
+        for _ in 0..LOTS {
+            Lot::insert(&mut map, parent, shape, 0.0);
+        }
+        let added_cost = cost(&map) - empty_cost;
+        assert!(added_cost >= 8 * LOTS, "reserved {added_cost} additional work units");
+        let mut work = WaterTopologyWork::new();
+        work.remaining = empty_cost + 7 * LOTS;
+        assert!(matches!(
+            map.prepare_connection(from, to, None, &pattern, Some(&mut work)),
+            Err(ConnectionError::WorkLimit),
+        ));
+        assert_eq!(map.lots.len(), LOTS);
+
+        let before = map.spatial_map.removal_scan_entries();
+        map.try_connect(from, to, None, &pattern).unwrap();
+        let scanned = map.spatial_map.removal_scan_entries() - before;
+        assert!(scanned <= 4 * LOTS + 100, "scanned {scanned} entries");
+        assert!(map.lots.is_empty());
+    }
+
+    #[test]
+    fn harden1_first_merge_reserves_split_child_frontage() {
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::generate(5, 5, crate::MapPreset::Flat, 0, 0.0)));
+        tiled(&mut map);
+        let ground = |x: f32, y: f32| ground(x + 1024.0, y + 1024.0);
+        let pattern = LanePatternBuilder::new().build();
+        let parent = map
+            .try_connect(ground(45.0, 150.0), ground(255.0, 150.0), None, &pattern)
+            .unwrap()
+            .road;
+        let arm = map
+            .try_connect(ground(150.0, 250.0), ground(150.0, 390.0), None, &pattern)
+            .unwrap()
+            .road;
+        let from = MapProject { kind: parent.into(), pos: ground(150.0, 150.0).pos };
+        let to = MapProject { kind: map.roads[arm].src.into(), pos: ground(150.0, 250.0).pos };
+        let (_, _, prepared) = map.prepare_connection(from, to, None, &pattern, None).unwrap();
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.merges, Some([false, true]));
+        assert!(prepared.merge_lot_allowances[1] >= 12, "{:?}", prepared.merge_lot_allowances);
+        assert!(map.try_connect(from, to, None, &pattern).unwrap().dst.is_none());
+    }
+
+    #[test]
+    fn harden1_second_merge_reserves_first_merge_frontage() {
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::generate(5, 5, crate::MapPreset::Flat, 0, 0.0)));
+        tiled(&mut map);
+        let ground = |x: f32, y: f32| ground(x + 1024.0, y + 1024.0);
+        let pattern = LanePatternBuilder::new().build();
+        let left = map
+            .try_connect(ground(62.0, 250.0), ground(201.0, 250.0), None, &pattern)
+            .unwrap()
+            .road;
+        let right = map
+            .try_connect(ground(301.0, 250.0), ground(440.0, 250.0), None, &pattern)
+            .unwrap()
+            .road;
+        let from = MapProject { kind: map.roads[left].dst.into(), pos: ground(201.0, 250.0).pos };
+        let to = MapProject { kind: map.roads[right].src.into(), pos: ground(301.0, 250.0).pos };
+        let (_, _, prepared) = map.prepare_connection(from, to, None, &pattern, None).unwrap();
+        let prepared = prepared.unwrap();
+        assert_eq!(prepared.merges, Some([true, true]));
+        let [first, second] = prepared.merge_lot_allowances;
+        assert!(second >= first + 10, "{:?}", prepared.merge_lot_allowances);
+        let connected = map.try_connect(from, to, None, &pattern).unwrap();
+        assert!(connected.src.is_none() && connected.dst.is_none());
+    }
 }

@@ -1782,6 +1782,15 @@ impl Map {
         }
     }
 
+    fn clean_reassigned_lots(&mut self, lots: Vec<LotID>) {
+        self.spatial_map.remove_lots(lots.iter().copied());
+        // Keep the original subscriber and slot-reuse order.
+        for id in lots {
+            self.subscribers.dispatch(UpdateType::Road, &self.lots[id]);
+            self.remove_lot_record(id);
+        }
+    }
+
     fn remove_road_inner(&mut self, road_id: RoadID) -> Option<Road> {
         let road = self.remove_raw_road(road_id)?;
         self.no_frontage.remove(&road_id);
@@ -2210,6 +2219,7 @@ impl Map {
                 .building_changed(&self.environment, &self.roads, b);
         }
 
+        let mut rejected_lots = Vec::new();
         for id in self.road_lot_ids(split_road_id) {
             let lot = &self.lots[id];
             let p = lot.shape.corners[0].z(lot.height);
@@ -2225,11 +2235,12 @@ impl Map {
                 || distance >= road.width * 0.5 + 1.5
                 || !Lot::has_dry_frontage(&self.environment, road, &lot.shape)
             {
-                self.clean_lots_inner(vec![id.into()]);
+                rejected_lots.push(id);
             } else {
                 self.reparent_lot(id, parent);
             }
         }
+        self.clean_reassigned_lots(rejected_lots);
 
         for b in r.connected_buildings {
             let b = &self.buildings[b];
@@ -2396,6 +2407,7 @@ impl Map {
         let mut reassigned = self.road_lot_ids(road1);
         reassigned.extend(self.road_lot_ids(road2));
         reassigned.sort_unstable();
+        let mut rejected_lots = Vec::new();
         for id in reassigned {
             if frontage_blocked
                 || !Lot::has_dry_frontage(
@@ -2404,11 +2416,12 @@ impl Map {
                     &self.lots[id].shape,
                 )
             {
-                self.clean_lots_inner(vec![id.into()]);
+                rejected_lots.push(id);
             } else {
                 self.reparent_lot(id, new_id);
             }
         }
+        self.clean_reassigned_lots(rejected_lots);
         let new_r = &self.roads[new_id];
         for &id in &new_r.connected_buildings {
             self.water_services
