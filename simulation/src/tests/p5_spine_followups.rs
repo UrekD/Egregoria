@@ -55,7 +55,7 @@ fn daily_metrics_keep_fourteen_closed_days_and_the_open_day() {
 }
 
 #[test]
-fn guided_build_locks_leave_world_unchanged_and_record_rejections() {
+fn guided_build_locks_leave_world_unchanged_and_record_non_paint_rejections() {
     let (mut ctx, line) = loop_fixture();
     let sim = &mut ctx.g;
     let mut stops = sim.read::<Transit>().lines[line].stops.clone();
@@ -115,7 +115,13 @@ fn guided_build_locks_leave_world_unchanged_and_record_rejections() {
         assert_eq!(outcomes.last, [(name, Rejection::Locked { milestone })]);
         assert!(outcomes.accepted.is_empty());
         assert_eq!(sim.read::<Government>().money, money);
-        assert_eq!(sim.read::<Replay>().command_count(), recorded + 1);
+        // Replay records zoning paint only after the command succeeds.
+        let recorded_count = usize::from(!matches!(command, WorldCommand::ZonePaint { .. }));
+        assert_eq!(
+            sim.read::<Replay>().command_count(),
+            recorded + recorded_count,
+            "{name}"
+        );
         let mut after = sim.hashes();
         after.remove("replay");
         assert_eq!(after, before);
