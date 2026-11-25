@@ -85,6 +85,20 @@ Main menu with Continue/New Game/Load, new-game options (terrain preset, seed, m
 
 On Linux, `make p5-shots` regenerates the P5 screenshots under Xvfb from freshly generated demo and Lesce slots.
 
+### Milestone P6 — water, zoning and city expansion
+
+- **Water and bridges.** Rivers, lakes and seas shape where you can build. Use the water brush to edit rivers and lakes, and build road or rail bridges across water. Pumps need a river or lake shore, while sewage outlets need a river bank or coast. On rivers, outlets sit downstream of pumps. Shorelines raise nearby land value.
+- **Zoning and building height.** The staged zoning update adds levels 1–5 across low, medium and high density, with placeholder houses, blocks and high-density towers that change height as they grow. Mixed-use buildings pair homes with shops. The new profiles and mixed-use placement are staged for activation once the release checks pass.
+- **Buyable land tiles.** Expand a tiled city Cities: Skylines-style by buying adjacent 512 m × 512 m tiles from the land map. Guided mode ties purchases to population milestones. The first tile costs $10,000 and each purchase raises the next price by $500.
+- **Lesce Town.** The authored map uses an organic street network based on OpenStreetMap at 2× source scale. The dry layout is in place. The playable Sava river-town save, with a target of about 2,600 residents, is pending validation and publication.
+- **Freight and food.** Fairer order matching and better truck haulage help stock reach buyers, with priority for fuel and other inputs that have run out. Food balancing improves shop supply, with about 94–99% of due grocery baskets filled in test towns.
+- **Performance.** Skipping idle citizens improved benchmark throughput by 11%, and the single-player simulation runs on its own thread. Use `perf_scale` for scale benchmarks and `bench-slot` for saved cities. The 10,000-resident benchmark ran at 213 ticks/s, about 4× real time on the test host.
+- **Replays and saves.** Replay checks verify that repeated runs produce identical simulation results. The snapshot and replay format moved to 0.10.0, with the 0.11.0 cut pending.
+
+| Water and bridges | Zoning and towers | Land tiles | Lesce Town |
+|---|---|---|---|
+| [TODO: water and bridges screenshot](docs/screenshots/p6-water-bridges.png) | [TODO: zoning and towers screenshot](docs/screenshots/p6-zoning-towers.png) | [TODO: land tiles screenshot](docs/screenshots/p6-land-tiles.png) | [TODO: Lesce Town screenshot](docs/screenshots/p6-lesce-town.png) |
+
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
 ### Try the demo cities
