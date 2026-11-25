@@ -160,7 +160,7 @@ enum Assertion {
     },
     ZonePainted {
         center: [f32; 2],
-        cell: simulation::map::ZoneCell,
+        cell: Option<simulation::map::ZoneCell>,
     },
     TowerSelection {
         parcel_center: [f32; 2],
@@ -1183,7 +1183,7 @@ impl Assertion {
             Self::ZonePainted { center: [x, y], cell } => {
                 let sample = OBB::new(vec2(x, y), Vec2::X, 8.0, 8.0);
                 let actual = sim.read::<ZoneGrid>().lot_zone(&sample);
-                if actual != Some(cell) {
+                if actual != cell {
                     return Err(format!("expected {cell:?} at ({x}, {y}), got {actual:?}"));
                 }
             }
