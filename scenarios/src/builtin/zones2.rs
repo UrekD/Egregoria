@@ -8,7 +8,7 @@ use prototypes::{
     try_prototype, ItemID, ResidencePrototypeID, Size2D, Tick, TICKS_PER_DAY, TICKS_PER_HOUR,
 };
 use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
-use simulation::economy::cargo::CargoBook;
+use simulation::economy::cargo::{CargoBook, RoadDeadlineCounts};
 use simulation::economy::progression::{utility_served_fraction, ProgressionMode};
 use simulation::economy::{Budget, DailyEconomyMetrics, Market, TripPurpose, ZoneDemand};
 use simulation::map::Density::{self, High, Low, Medium};
@@ -476,6 +476,8 @@ fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
         scratch = ReplayScratch::new()?;
         scratch.0.as_path()
     };
+    let deadline_window = COMMISSION_END..COMMISSION_END + OBSERVATION_DAYS * TICKS_PER_DAY;
+    ctx.sim.write::<CargoBook>().observe_road_deadlines(deadline_window.clone());
     let terminal = grow_city(ctx, true, Some(replay_root))?;
     check_commissioning(ctx, true)?;
     let mixed_freight = mean_retail_freight_distance(&ctx.sim, terminal)?;
@@ -483,6 +485,7 @@ fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mixed = observe_days(ctx)?;
 
     let mut control = ScenarioCtx::new(OPTIONS);
+    control.sim.write::<CargoBook>().observe_road_deadlines(deadline_window);
     let terminal = grow_city(&mut control, false, None)?;
     check_commissioning(&control, false)?;
     let pure_freight = mean_retail_freight_distance(&control.sim, terminal)?;
@@ -1103,6 +1106,7 @@ struct Observation {
     road_loads: u64,
     late_road_loads: u64,
     cancelled_road_loads: u64,
+    road_deadlines: RoadDeadlineCounts,
     mixed_receipt_units: u64,
     mixed_shelf_peak: i32,
     productive_recipients: usize,
@@ -1217,6 +1221,7 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
             }
         }
     }
+    result.road_deadlines = ctx.sim.read::<CargoBook>().road_deadline_counts();
     result.productive_recipients = productive_recipients.len();
     let hours = (OBSERVATION_DAYS * 24) as f64;
     result.housing_slots /= hours;
@@ -1236,6 +1241,8 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
         ("cancelled_loads".into(), result.cancelled_road_loads as f64),
         ("road_delivered_loads".into(), result.road_loads as f64),
         ("road_late_loads".into(), result.late_road_loads as f64),
+        ("road_due_loads".into(), result.road_deadlines.due as f64),
+        ("road_on_time_loads".into(), result.road_deadlines.on_time as f64),
         ("housing_slots_hourly_mean".into(), result.housing_slots),
         ("available_jobs_hourly_mean".into(), result.available_jobs),
         ("filled_jobs_hourly_mean".into(), result.filled_jobs),
@@ -1304,12 +1311,11 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
         filled(mixed), filled(pure), stockout(mixed), stockout(pure)
     );
     println!("{evidence}");
-    let on_time = mixed.road_loads.saturating_sub(mixed.late_road_loads);
-    let attempts = mixed.road_loads + mixed.cancelled_road_loads;
-    println!("MX road freight: {on_time}/{attempts} loads on time");
-    if on_time as f64 / (attempts.max(1) as f64) < 0.9 {
+    let RoadDeadlineCounts { due, on_time } = mixed.road_deadlines;
+    println!("MX road freight: {on_time}/{due} due loads on time");
+    if on_time as f64 / (due.max(1) as f64) < 0.9 {
         return Err(format!(
-            "MX road freight needs 90% on-time deliveries, got {on_time}/{attempts}"
+            "MX road freight needs 90% on-time deliveries, got {on_time}/{due}"
         ));
     }
     let matched = |a: f64, b: f64| a > 0.0 && b > 0.0 && (a - b).abs() <= 0.05 * b;
@@ -1353,16 +1359,42 @@ fn zones2_freight_gate_counts_cancelled_loads() {
     let mut mixed = Observation {
         external_shops: 6,
         local_pickups: 4,
-        road_loads: 9,
-        cancelled_road_loads: 1,
+        road_deadlines: RoadDeadlineCounts { due: 10, on_time: 9 },
         mixed_receipt_units: 10,
         productive_recipients: 1,
         ..pure
     };
     compare_economies(&mixed, &pure).unwrap();
-    mixed.cancelled_road_loads = 2;
+    mixed.road_deadlines.due = 11;
     let error = compare_economies(&mixed, &pure).unwrap_err();
     assert!(error.contains("road freight needs 90%"));
+}
+
+#[test]
+fn zones2_freight_gate_counts_an_overdue_final_day_load() {
+    let pure = Observation {
+        resident_days: 10.0,
+        external_shops: 10,
+        baskets_due: 10,
+        baskets_filled: 10,
+        housing_slots: 10.0,
+        available_jobs: 10.0,
+        filled_jobs: 10.0,
+        ..Observation::default()
+    };
+    let mixed = Observation {
+        external_shops: 6,
+        local_pickups: 4,
+        road_loads: 10,
+        late_road_loads: 1,
+        road_deadlines: RoadDeadlineCounts { due: 11, on_time: 9 },
+        mixed_receipt_units: 10,
+        productive_recipients: 1,
+        ..pure
+    };
+    // Nine on-time loads, one settled miss and one load still overdue at closing.
+    let error = compare_economies(&mixed, &pure).unwrap_err();
+    assert!(error.contains("got 9/11"), "{error}");
 }
 
 fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {

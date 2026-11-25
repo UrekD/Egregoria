@@ -303,6 +303,17 @@ pub enum WarehouseActivity {
     NothingBelowWatermark,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RoadDeadlineCounts {
+    pub due: u64,
+    pub on_time: u64,
+}
+
+struct RoadDeadlineWindow {
+    ticks: std::ops::Range<u64>,
+    settled: RoadDeadlineCounts,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct CargoBook {
     next_id: u64,
@@ -331,6 +342,9 @@ pub struct CargoBook {
     topology_edited: bool,
     #[serde(skip)]
     no_import_route: BTreeSet<Endpoint>,
+    // Opt-in observation for acceptance scenarios. It does not affect freight or saves.
+    #[serde(skip)]
+    road_deadlines: Option<RoadDeadlineWindow>,
 }
 
 impl Default for CargoBook {
@@ -354,6 +368,7 @@ impl Default for CargoBook {
             progress: BTreeMap::new(),
             topology_edited: false,
             no_import_route: BTreeSet::new(),
+            road_deadlines: None,
         }
     }
 }
@@ -406,6 +421,41 @@ impl CargoBook {
     /// Delivery outcomes and per-recipient receipts for an elapsed budget day.
     pub fn freight_day(&self, elapsed_day: u64) -> Option<&FreightDay> {
         self.days.get(&elapsed_day)
+    }
+
+    /// Begin tracking road loads due in this elapsed tick range. Begin before
+    /// any of those loads can settle so early arrivals are included.
+    pub fn observe_road_deadlines(&mut self, ticks: std::ops::Range<u64>) {
+        self.road_deadlines = Some(RoadDeadlineWindow {
+            ticks,
+            settled: RoadDeadlineCounts::default(),
+        });
+    }
+
+    /// Read after the window closes. A due load still in transit counts as a
+    /// miss. Later settlement moves that same load to the settled counts.
+    pub fn road_deadline_counts(&self) -> RoadDeadlineCounts {
+        let Some(window) = &self.road_deadlines else {
+            return RoadDeadlineCounts::default();
+        };
+        let outstanding = self
+            .loads
+            .values()
+            .filter(|load| window.ticks.contains(&load.due_at))
+            .count() as u64;
+        RoadDeadlineCounts {
+            due: window.settled.due + outstanding,
+            on_time: window.settled.on_time,
+        }
+    }
+
+    fn record_road_deadline(&mut self, due_at: u64, on_time: bool) {
+        if let Some(window) = &mut self.road_deadlines {
+            if window.ticks.contains(&due_at) {
+                window.settled.due += 1;
+                window.settled.on_time += u64::from(on_time);
+            }
+        }
     }
 
     fn day_mut(&mut self, now: u64) -> &mut FreightDay {
@@ -2438,6 +2488,7 @@ pub fn complete_delivery(
         };
         post_freight_trade(world, resources, trade);
     }
+    book.record_road_deadline(manifest.due_at, !late);
     book.day_mut(now).record_delivery(units, late);
     super::record_freight_outcome(resources, now, units, late);
     Ok(())
@@ -2646,6 +2697,10 @@ fn release(
             .exec_ent(driver, move |sim| {
                 crate::souls::lifecycle::abort_freight_trip(sim, driver, truck, id, used_truck);
             });
+        // A voluntary recall only excuses a load that has yet to miss its deadline.
+        if matches!(reason, Release::Cancelled) || now > load.due_at {
+            book.record_road_deadline(load.due_at, false);
+        }
         let day = book.day_mut(now);
         match reason {
             Release::Cancelled => day.record_cancellation(load.units()),
@@ -4105,6 +4160,31 @@ mod lifecycle_tests {
         assert_eq!(metrics.days[&0].loads, Some(1));
         assert_eq!(metrics.days[&0].load_units, Some(u64::from(capacity)));
         assert_eq!(metrics.days[&0].late_loads, Some(0));
+    }
+
+    #[test]
+    fn zones2_road_deadline_counts_follow_the_due_day_across_settlement() {
+        for late in [false, true] {
+            let mut f = Fixture::new();
+            f.seed(16, 1);
+            f.update(FREIGHT_MATCH_INTERVAL);
+            let due = f.ctx.g.read::<CargoBook>().loads[&f.token()].due_at;
+            let close = due + 1;
+            f.ctx.g.write::<CargoBook>().observe_road_deadlines(due..close);
+            let expected = RoadDeadlineCounts {
+                due: 1,
+                on_time: u64::from(!late),
+            };
+            f.at_tick(if late { close } else { due - 1 });
+            if late {
+                assert_eq!(f.ctx.g.read::<CargoBook>().road_deadline_counts(), expected);
+                f.at_tick(close + 1);
+            }
+            let (driver, truck, destination) = (f.driver, f.truck, f.destination.building);
+            unload_fixture(&mut f, driver, truck, destination);
+            assert_eq!(f.manifest_units(), 0);
+            assert_eq!(f.ctx.g.read::<CargoBook>().road_deadline_counts(), expected);
+        }
     }
 
     #[test]
