@@ -201,8 +201,11 @@ pub fn commission(
     }
     for (i, (x, y)) in [
         (1030.0, 1460.0),
+        (1330.0, 1190.0),
         (1730.0, 800.0),
         (2180.0, 2760.0),
+        (1800.0, 2790.0),
+        (2560.0, 2700.0),
         (2680.0, 2150.0),
     ]
     .into_iter()
@@ -940,35 +943,57 @@ fn plan_parcels(
             cohort.retail,
             &mut painted,
         )?;
+        let fitting = |candidates: &[(&simulation::map::Lot, Option<usize>)], zoning| {
+            candidates
+                .iter()
+                .filter(|(lot, _)| check_growable_lot(&map, lot, zoning).is_ok())
+                .count()
+        };
         if cohort.district == "employment" {
+            let high = ZoneCell {
+                kind: Industrial,
+                density: High,
+            };
+            let remaining = cohort.industry - 4;
+            let works = remaining.min(fitting(&candidates, high));
             take_parcels(
                 &map,
                 district.key,
                 &mut candidates,
-                ZoneCell {
-                    kind: Industrial,
-                    density: High,
-                },
-                cohort.industry - 4,
+                high,
+                works,
+                &mut painted,
+            )?;
+            take_parcels(
+                &map,
+                district.key,
+                &mut candidates,
+                starter_zone,
+                remaining - works,
                 &mut painted,
             )?;
         }
+        let houses = if cohort.houses > 0 {
+            cohort.houses.min(fitting(&candidates, high_house) + 4)
+        } else {
+            0
+        };
         let low = if cohort.district == "station" {
             0
         } else {
-            cohort.houses / 15
+            houses / 15
         };
         let medium = if cohort.district == "station" {
             0
         } else {
-            cohort.houses / 8
+            houses / 8
         };
         take_parcels(
             &map,
             district.key,
             &mut candidates,
             high_house,
-            cohort.houses.saturating_sub(low + medium + 4),
+            houses.saturating_sub(low + medium + 4),
             &mut painted,
         )?;
 

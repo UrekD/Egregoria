@@ -3,7 +3,7 @@ use geom::{Polygon, Vec2, OBB};
 use prototypes::{try_prototype, BuildingGen, GoodsCompanyID};
 use simulation::map::{
     river_site_summary, water_provider_site, water_service_site, BuildingID, BuildingKind, Map,
-    ProjectFilter, RoadID, WaterSiteRequest, ZoneCell,
+    ProjectFilter, RoadID, WaterSiteRequest, Zone, ZoneCell,
 };
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::Simulation;
@@ -202,6 +202,11 @@ pub(super) fn place_special(
     gen: BuildingGen,
     road: RoadID,
 ) -> Result<BuildingID, String> {
+    let zone = kind
+        .as_goods_company()
+        .and_then(try_prototype)
+        .and_then(|company| company.zone.as_ref())
+        .map(|_| Zone::new(Polygon(footprint.corners.to_vec()), footprint.axis()[0]));
     apply(
         sim,
         key,
@@ -209,7 +214,7 @@ pub(super) fn place_special(
             pos: footprint,
             kind,
             gen,
-            zone: None,
+            zone,
             connected_road: Some(road),
         }],
     )?;
@@ -223,4 +228,38 @@ pub(super) fn place_special(
         })
         .map(|building| building.id)
         .ok_or_else(|| format!("{key}: placed building did not resolve"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::citymap::{
+        build_dry_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,
+        DEFAULT_LESCE, DEFAULT_SAVA,
+    };
+    use std::path::Path;
+
+    #[test]
+    fn cm2_adapter_places_a_cereal_farm_with_a_field() {
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
+        let (mut sim, built) = build_dry_town(&plan).unwrap();
+        let roads = frontage_roads(&plan, &built);
+        let (farm, road) = place_company(
+            &mut sim,
+            &plan,
+            &roads,
+            "cereal-farm",
+            geom::vec2(1030.0, 1460.0),
+        )
+        .unwrap();
+        let map = sim.map();
+        let farm = &map.buildings()[farm];
+        assert_eq!(farm.connected_road, Some(road));
+        assert!(farm.zone.as_ref().is_some_and(|field| field.area > 0.0));
+    }
 }
