@@ -1221,6 +1221,48 @@ pub(crate) fn design_point(point: Vec2, config: TownConfig) -> Vec2 {
     point + (config.project(lat, lon) - baseline.project(lat, lon))
 }
 
+pub(super) fn fit_wet_frontage(plan: &mut TownPlan) {
+    // Extend the reserve envelopes along existing streets on the town bank.
+    for (district, edge, points) in [
+        (
+            "hraska",
+            0..1,
+            &[(1050., 2840.), (950., 2380.), (1500., 2340.)][..],
+        ),
+        (
+            "west",
+            7..8,
+            &[(690., 2210.), (535., 2090.), (550., 1730.)][..],
+        ),
+    ] {
+        let area = plan
+            .districts
+            .iter_mut()
+            .find(|area| area.key == district)
+            .unwrap();
+        area.polygon.splice(
+            edge,
+            points
+                .iter()
+                .map(|&(x, y)| design_point(vec2(x, y), plan.config)),
+        );
+    }
+
+    // Keep parking maneuvers off the through link between the coal frontage
+    // and the southern crossroads, where an occupied egress backed up traffic.
+    let south_link = SourceKey::Way {
+        id: 350992954,
+        span: 0,
+    };
+    if let Some(link) = plan.graph.links.get_mut(&south_link) {
+        link.class = RoadClass::Collector;
+        plan.graph.record(
+            "keep the South through link clear of curb parking",
+            &[south_link],
+        );
+    }
+}
+
 fn districts(config: TownConfig) -> Vec<District> {
     [
         (

@@ -126,6 +126,7 @@ const SOUTHEAST_DEAD_END: SourceKey = SourceKey::Node {
     id: 11951438144,
     rail: false,
 };
+const WET_BAKERY_WALK_M: f32 = 180.0;
 
 pub(super) fn configure_commissioned_network(plan: &mut TownPlan) {
     let graph = &mut plan.graph;
@@ -206,13 +207,24 @@ pub fn commission(
     commission_opening(sim, plan, built, None)
 }
 
-pub(super) fn commission_opening(
+struct OpeningLayout {
+    cohorts: [Cohort; 5],
+    parcels: Vec<Parcel>,
+    reserves: Vec<Parcel>,
+    sites: BTreeMap<String, BuildingID>,
+    depots: Vec<WorldCommand>,
+    freight: FreightSetup,
+    bakery: BuildingID,
+}
+
+fn prepare_opening(
     sim: &mut Simulation,
     plan: &TownPlan,
     built: &BuiltNetwork,
     freight: Option<FreightSetup>,
-) -> Result<OpeningManifest, String> {
+) -> Result<OpeningLayout, String> {
     let roads = frontage_roads(plan, built);
+    let wet = sim.map().environment().has_water_configuration();
     let at = |x, y| super::layout::design_point(vec2(x, y), plan.config);
     let cohorts = [
         Cohort {
@@ -227,7 +239,7 @@ pub(super) fn commission_opening(
             district: "hraska",
             anchor: at(1950.0, 2200.0),
             houses: 85,
-            infill: 10,
+            infill: if wet { 24 } else { 10 },
             retail: 14,
             industry: 6,
         },
@@ -235,7 +247,7 @@ pub(super) fn commission_opening(
             district: "south",
             anchor: at(2060.0, 1180.0),
             houses: 98,
-            infill: 10,
+            infill: if wet { 14 } else { 10 },
             retail: 16,
             industry: 8,
         },
@@ -243,7 +255,7 @@ pub(super) fn commission_opening(
             district: "west",
             anchor: at(1415.0, 1690.0),
             houses: 92,
-            infill: 10,
+            infill: if wet { 20 } else { 10 },
             retail: 14,
             industry: 8,
         },
@@ -257,17 +269,11 @@ pub(super) fn commission_opening(
         },
     ];
     let mut sites = BTreeMap::new();
-    let FreightSetup {
-        terminal,
-        market,
-        train,
-        market_lane,
-        market_offset,
-        platform,
-    } = match freight {
+    let freight = match freight {
         Some(freight) => freight,
         None => prepare_freight(sim, plan, built)?,
     };
+    let terminal = freight.terminal;
     let bakery_anchor = sim.map().buildings()[terminal].door_pos.xy();
     let buyer = place_company(sim, plan, &roads, "bakery", bakery_anchor)?.0;
     sites.insert("rail-bakery".into(), buyer);
@@ -275,7 +281,6 @@ pub(super) fn commission_opening(
 
     // Give the utilities access to the same labour pool as the shops.
     // A sixth pair covers the utility margin after the reserves are built.
-    let wet = sim.map().environment().has_water_configuration();
     let wet_intake = at(760.0, 940.0);
     let wet_outlet = at(1630.0, 510.0);
     let mut utilities: Vec<_> = cohorts
@@ -454,7 +459,7 @@ pub(super) fn commission_opening(
         // shop required a walk of almost 2.5 km from the approved housing.
         zoning_roads.remove(&avenue.road);
     }
-    let (mut parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts)?;
+    let (parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts)?;
     place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
 
     // Keep the food facilities clear of approved housing and future infill.
@@ -511,6 +516,41 @@ pub(super) fn commission_opening(
     )?;
     verify_parking_pair(&sim.map(), backup_mine, plant, Tick(sim.get_tick()))?;
     sites.insert("coal-mine-4".into(), backup_mine);
+
+    Ok(OpeningLayout {
+        cohorts,
+        parcels,
+        reserves,
+        sites,
+        depots,
+        freight,
+        bakery: buyer,
+    })
+}
+
+pub(super) fn commission_opening(
+    sim: &mut Simulation,
+    plan: &TownPlan,
+    built: &BuiltNetwork,
+    freight: Option<FreightSetup>,
+) -> Result<OpeningManifest, String> {
+    let OpeningLayout {
+        cohorts,
+        mut parcels,
+        reserves,
+        sites,
+        depots,
+        freight:
+            FreightSetup {
+                terminal,
+                market,
+                train,
+                market_lane,
+                market_offset,
+                platform,
+            },
+        bakery,
+    } = prepare_opening(sim, plan, built, freight)?;
 
     // Ordinary housing opens before the shops/factories. This gives civic and
     // utility sites a chance to hire while the first households arrive.
@@ -569,7 +609,7 @@ pub(super) fn commission_opening(
         train,
         market_lane,
         market_offset,
-        bakery: buyer,
+        bakery,
     };
     // Use elapsed time for settling periods. The authored clock starts in the
     // morning, so a whole elapsed day returns to the same commute phase.
@@ -1145,8 +1185,7 @@ fn place_walkable_bakeries(
     reserves: &[Parcel],
     sites: &mut BTreeMap<String, BuildingID>,
 ) -> Result<(), String> {
-    const NEARBY_BAKERY_M: f32 = 240.0;
-    let (reach, existing) = {
+    let (reach, existing, wet) = {
         let map = sim.map();
         let reach = ServiceReach::new(&map, true);
         let bakery = prototypes::GoodsCompanyID::new("bakery");
@@ -1154,35 +1193,40 @@ fn place_walkable_bakeries(
             .filter(|building| building.kind.as_goods_company() == Some(bakery))
             .filter_map(|building| reach.position(building.connected_road?, building.door_pos.xy()))
             .collect();
-        (reach, existing)
+        (reach, existing, map.environment().has_water_configuration())
     };
+    let (distance_limit, site_limit) = if wet { (WET_BAKERY_WALK_M, 48) } else { (240.0, 4) };
     let mut underserved: Vec<_> = parcels.iter()
         .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential)
         .filter_map(|parcel| {
             let home = reach.position(parcel.road, parcel.footprint.center())?;
-            existing.iter().all(|&shop| reach.distance(shop, home) > NEARBY_BAKERY_M)
+            existing
+                .iter()
+                .all(|&shop| reach.distance(shop, home) > distance_limit)
                 .then_some((home, parcel.capacity))
         })
         .collect();
-    for serial in 1..=4 {
+    for serial in 1..=site_limit {
         let Some((building, road)) = place_scored_company(sim, plan, roads, "bakery", |map, road, footprint| {
-            if !map.roads()[road].lanes_iter().any(|(_, kind)| kind == LaneKind::Parking) {
-                return None;
-            }
             let front = (footprint.corners[0] + footprint.corners[1]) * 0.5;
             let shop = reach.position(road, front)?;
             let score: f32 = underserved.iter().map(|&(home, residents)| {
-                residents as f32 * (NEARBY_BAKERY_M - reach.distance(shop, home)).max(0.0)
+                residents as f32 * (distance_limit - reach.distance(shop, home)).max(0.0)
             }).sum();
-            (score > 0.0 && parcels.iter().chain(reserves)
-                .all(|parcel| !parcel.footprint.intersects(&footprint)))
+            if score <= 0.0 || parcels.iter().chain(reserves)
+                .any(|parcel| parcel.footprint.intersects(&footprint)) {
+                return None;
+            }
+            let curb_parking = map.roads()[road].lanes_iter().any(|(_, kind)| kind == LaneKind::Parking);
+            (curb_parking || wet && ParkingManagement::default()
+                .reserve_near_radius(front.z(10.0), map, 100.0).is_ok())
                 .then_some(-score)
         })? else {
             break;
         };
         let door = sim.map().buildings()[building].door_pos.xy();
         let shop = reach.position(road, door).unwrap();
-        underserved.retain(|&(home, _)| reach.distance(shop, home) > NEARBY_BAKERY_M);
+        underserved.retain(|&(home, _)| reach.distance(shop, home) > distance_limit);
         sites.insert(format!("walkable-bakery-{serial}"), building);
     }
     Ok(())
@@ -1197,6 +1241,7 @@ fn plan_parcels(
     use Density::{High, Low, Medium};
     use ZoneKind::{Commercial, Industrial, Residential};
     let map = sim.map();
+    let wet = map.environment().has_water_configuration();
     let rings = blocks(&plan.graph);
     let (high_house, high_shop) = downtown_cells();
     let mut painted = Vec::new();
@@ -1261,6 +1306,22 @@ fn plan_parcels(
             reserve_count,
             &mut reserves,
         )?;
+        let retail_reserve = ZoneCell {
+            kind: Commercial,
+            density: Medium,
+        };
+        if wet && cohort.houses > 0 {
+            // Reserve neighbouring shops before housing uses the remaining
+            // frontage on these narrower wet neighbourhoods.
+            take_parcels(
+                &map,
+                district.key,
+                &mut candidates,
+                retail_reserve,
+                2,
+                &mut reserves,
+            )?;
+        }
         candidates.sort_by(|(a, _), (b, _)| {
             a.shape
                 .center()
@@ -1466,19 +1527,17 @@ fn plan_parcels(
             take_parcels(&map, district.key, &mut candidates, high_house, additional, &mut reserves)?;
             // Put future shops beside the new homes so they can hire from the
             // same neighbourhood during the infill trial.
-            let retail_reserve = ZoneCell {
-                kind: Commercial,
-                density: Medium,
-            };
-            let shops = 2.min(fitting(&candidates, retail_reserve));
-            take_parcels(
-                &map,
-                district.key,
-                &mut candidates,
-                retail_reserve,
-                shops,
-                &mut reserves,
-            )?;
+            if !wet {
+                let shops = 2.min(fitting(&candidates, retail_reserve));
+                take_parcels(
+                    &map,
+                    district.key,
+                    &mut candidates,
+                    retail_reserve,
+                    shops,
+                    &mut reserves,
+                )?;
+            }
         }
         let mut counts = BTreeMap::new();
         for parcel in &painted[base..] {
@@ -3896,6 +3955,60 @@ impl OpeningReport {
 mod tests {
     use super::*;
     use prototypes::TICKS_PER_HOUR;
+
+    #[test]
+    fn citymap_wet_frontage_serves_homes_and_leaves_infill() {
+        use crate::citymap::{
+            build_wet_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,
+            DEFAULT_LESCE, DEFAULT_SAVA,
+        };
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let mut plan = plan_town(&inputs, TownConfig::wet(), SpacingLimits::default()).unwrap();
+        configure_commissioned_network(&mut plan);
+        let (mut sim, built, freight) = build_wet_town(&mut plan).unwrap();
+        let opening = prepare_opening(&mut sim, &plan, &built, Some(freight)).unwrap();
+        let map = sim.map();
+        let reach = ServiceReach::new(&map, true);
+        let bakeries: Vec<_> = map
+            .buildings()
+            .values()
+            .filter(|building| {
+                building.kind.as_goods_company() == Some(prototypes::GoodsCompanyID::new("bakery"))
+            })
+            .filter_map(|building| reach.position(building.connected_road?, building.door_pos.xy()))
+            .collect();
+        let mut housing = 0;
+        let mut near_bakeries = 0;
+        let mut by_district = BTreeMap::new();
+        for parcel in opening.parcels.iter().filter(|parcel| parcel.capacity > 0) {
+            let home = reach
+                .position(parcel.road, parcel.footprint.center())
+                .unwrap();
+            housing += parcel.capacity;
+            *by_district.entry(parcel.district).or_insert(0) += parcel.capacity;
+            if bakeries
+                .iter()
+                .any(|&shop| reach.distance(home, shop) <= WET_BAKERY_WALK_M)
+            {
+                near_bakeries += parcel.capacity;
+            }
+        }
+        let reserve: u32 = opening.reserves.iter().map(|parcel| parcel.capacity).sum();
+        let reserve_shops = opening
+            .reserves
+            .iter()
+            .filter(|parcel| parcel.zoning.kind == ZoneKind::Commercial)
+            .count();
+        eprintln!("Wet frontage: {near_bakeries}/{housing} housing places near {} bakeries, {reserve} reserve places, {reserve_shops} reserve shops, housing by district {by_district:?}", bakeries.len());
+        assert!(near_bakeries * 100 >= housing * 95 && reserve >= 260 && reserve_shops >= 3,
+            "{near_bakeries}/{housing} housing places within a 180 m walk of a bakery, {reserve} reserve housing places and {reserve_shops} reserve shops");
+    }
 
     #[test]
     fn cm2_publish_keeps_the_west_south_shortcut_walkable() {
