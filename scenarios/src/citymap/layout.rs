@@ -268,6 +268,22 @@ pub fn plan_town(
             &[west_local_junction],
         );
     }
+    let fuel_frontage = SourceKey::Way {
+        id: 72625754,
+        span: 0,
+    };
+    if let Some(link) = graph.links.get(&fuel_frontage) {
+        for endpoint in link.endpoints {
+            if let Some(junction) = graph.junctions.get_mut(&endpoint) {
+                // Plant and mine loading sides share this road in opposite directions.
+                junction.turn.back_turns = true;
+            }
+        }
+        graph.record(
+            "provide turnarounds at both ends of the coal delivery road",
+            &[fuel_frontage],
+        );
+    }
 
     Ok(TownPlan {
         config,
