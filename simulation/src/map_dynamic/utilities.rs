@@ -544,6 +544,9 @@ mod tests {
 
     #[test]
     fn u3_utility_readout_updates_across_connect_and_sever() {
+        use crate::souls::{goods_company::company_soul, human::spawn_human};
+        use crate::SoulID;
+        use prototypes::GoodsCompanyID;
         use UtilityNetworkState::*;
 
         let mut test = TestCtx::new();
@@ -595,14 +598,34 @@ mod tests {
         assert!(read(&test.g, a).utility_totals.unwrap().water_demand > 0.0);
         assert_eq!(read(&test.g, b).utility_totals.unwrap().water_demand, 0.0);
 
-        // Seed the latest supply totals so this fixture can isolate topology behavior.
-        let a_net = read(&test.g, a).network.unwrap();
-        {
-            let mut flow = test.g.write::<UtilityFlow>();
-            let totals = flow.by_network.get_mut(&a_net).unwrap();
-            totals.water_production = totals.water_demand;
-            totals.sewage_capacity = 500.0;
+        let worker = spawn_human(&mut test.g, house).unwrap();
+        for (name, center) in [
+            ("water-pump", vec2(220.0, 75.0)),
+            ("sewage-outlet", vec2(270.0, 75.0)),
+            ("solar-panel", vec2(350.0, 195.0)),
+        ] {
+            let proto = GoodsCompanyID::new(name).prototype();
+            let site = test
+                .g
+                .map_mut()
+                .build_special_building(
+                    &OBB::new(center, Vec2::X, proto.size.w, proto.size.h),
+                    BuildingKind::GoodsCompany(proto.id),
+                    proto.bgen,
+                    None,
+                    Some(a),
+                )
+                .unwrap();
+            test.g.write::<BuildingInfos>().insert(site);
+            let Some(SoulID::GoodsCompany(company)) = company_soul(&mut test.g, site, proto.id)
+            else {
+                panic!("failed to spawn {name}");
+            };
+            if proto.n_workers > 0 {
+                test.g.world.companies[company].workers.0.push(worker);
+            }
         }
+        refresh(&mut test.g, 3001);
         assert_eq!(read(&test.g, a).water, Ok);
         assert_eq!(read(&test.g, a).sewage, Ok);
         let previous = read(&test.g, a);
@@ -623,7 +646,7 @@ mod tests {
         assert_eq!(read(&test.g, b).utility_totals, None);
         let (world, resources) = test.g.world_res();
         electricity_flow_system(world, resources);
-        assert_eq!(read(&test.g, a).electricity, Shortage);
+        assert_eq!(read(&test.g, a).electricity, Ok);
         assert!(read(&test.g, a).power_totals.is_some());
         assert_eq!(read(&test.g, a).water, Updating);
         assert_eq!(read(&test.g, a).sewage, Updating);

@@ -247,7 +247,7 @@ fn p2abc_exact_fractional_staffing_meets_utility_demand() {
         package.path = "../base_mod/?.lua"
         require("data")
         for _, prototype in ipairs(data) do
-            if prototype.name == "residence-low-l1" then
+            if prototype.name == "residence-legacy-low-l1" then
                 prototype.water_consumption = 70
             elseif prototype.name == "water-pump" then
                 prototype.n_workers = 10

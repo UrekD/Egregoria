@@ -652,6 +652,75 @@ fn zones2_save_and_replay_reject_a_different_prototype_registry() {
 }
 
 #[test]
+fn zones2_refuses_pre_fingerprint_snapshot() {
+    use crate::{RegistrySlotSnapshotHeader, SimulationDeser, SimulationSer, SlotSnapshotHeader};
+
+    super::init_test_simulation();
+    let sim = flat_city();
+    let root = SlotRoot::new();
+    let id = SlotId::new("pre_fingerprint").unwrap();
+    let path = slot_paths(&root.0, &id).unwrap().bc;
+    let mut legacy: SimulationDeser = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+    legacy.res.remove("prototype_registry").unwrap();
+    let payload = SimulationSer {
+        header: legacy._header,
+        world: &legacy.world,
+        res: legacy.res,
+    };
+    fs::write(&path, Bincode::encode(&payload).unwrap()).unwrap();
+    let header = Simulation::read_slot_snapshot_header(&path, SnapshotKind::Bc).unwrap();
+    assert!(matches!(header.check_compatibility(), Err(SaveLoadError::PrototypeRegistry)));
+    assert!(matches!(
+        Simulation::load_from_slot(&root.0, &id),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+
+    let slot_header = |magic| SlotSnapshotHeader {
+        magic,
+        version: crate::VERSION.into(),
+        revision: SnapshotRevision::new(1),
+    };
+    fs::write(&path, Bincode::encode(&(slot_header(crate::SLOT_SNAPSHOT_MAGIC), &payload)).unwrap())
+        .unwrap();
+    assert!(matches!(
+        Simulation::load_from_slot(&root.0, &id),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+
+    let header = RegistrySlotSnapshotHeader {
+        slot: slot_header(crate::REGISTRY_SLOT_MAGIC),
+        registry: prototypes::prototypes().fingerprint(),
+    };
+    fs::write(&path, Bincode::encode(&(header, &payload)).unwrap()).unwrap();
+    assert!(matches!(
+        Simulation::load_from_slot(&root.0, &id),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+}
+
+#[test]
+fn zones2_refuses_pre_fingerprint_replay() {
+    super::init_test_simulation();
+    let sim = flat_city();
+    let root = SlotRoot::new();
+    let id = SlotId::new("pre_fingerprint").unwrap();
+    let revision = SnapshotRevision::new(1);
+    sim.save_to_slot(&root.0, &id, revision).unwrap();
+    let mut replay = Simulation::load_replay_from_slot(&root.0, &id).unwrap();
+    replay.registry = None;
+    let path = slot_paths(&root.0, &id).unwrap().replay;
+    fs::write(&path, crate::ReplayJson::encode_sidecar(&replay, revision).unwrap()).unwrap();
+
+    assert!(matches!(
+        Simulation::load_replay_from_slot(&root.0, &id),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+    let error = Simulation::try_from_replay(replay).err().unwrap();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(error.to_string(), SaveLoadError::PrototypeRegistry.to_string());
+}
+
+#[test]
 fn zones2_save_and_replay_check_inherited_prototype_fields() {
     if !in_prototype_fixture_process(
         module_path!(),

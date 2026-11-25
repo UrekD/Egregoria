@@ -1242,28 +1242,26 @@ fn p1_spine_replay_rejects_wrong_version_before_command_decode() {
 #[test]
 fn disk_load_rejects_wrong_version_missing_resources_and_bad_resource_bytes() {
     let test = TestCtx::new();
+    let bytes = Bincode::encode(&test.g).unwrap();
     for variant in ["current", "version", "patch", "missing", "corrupt"] {
-        let mut resources = common::FastMap::default();
-        for handler in unsafe { &*std::ptr::addr_of!(crate::SAVELOAD_FUNCS) } {
-            resources.insert(handler.name.to_string(), (handler.save)(&test.g));
-        }
+        let mut data: crate::SimulationDeser = Bincode::decode(&bytes).unwrap();
         let version = match variant {
             "version" => "0.0".to_owned(),
             "patch" => format!("{}.99", VERSION.rsplit_once('.').unwrap().0),
             _ => VERSION.to_owned(),
         };
         if variant == "missing" {
-            resources.remove("government");
+            data.res.remove("government");
         }
         if variant == "corrupt" {
-            resources.insert("government".to_string(), Vec::new());
+            data.res.insert("government".to_string(), Vec::new());
         }
         let name = save_fixture(variant);
         CompressedBincode::save(
             &SimulationSer {
                 header: SaveHeader { version },
-                world: test.g.world(),
-                res: resources,
+                world: &data.world,
+                res: data.res,
             },
             &name,
         )
@@ -1289,6 +1287,8 @@ fn disk_load_rejects_wrong_version_missing_resources_and_bad_resource_bytes() {
 
 #[test]
 fn replay_load_rejects_missing_or_mismatched_version() {
+    drop(TestCtx::new());
+    let registry = prototypes::prototypes().fingerprint();
     for (variant, bytes) in [
         (
             "legacy",
@@ -1301,7 +1301,7 @@ fn replay_load_rejects_missing_or_mismatched_version() {
         (
             "current",
             format!(
-                r#"{{"version":{VERSION:?},"enabled":true,"commands":[],"last_tick_recorded":0}}"#
+                r#"{{"version":{VERSION:?},"registry":{registry},"enabled":true,"commands":[],"last_tick_recorded":0}}"#
             ),
         ),
     ] {

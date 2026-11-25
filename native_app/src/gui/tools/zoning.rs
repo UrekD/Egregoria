@@ -210,8 +210,44 @@ pub(crate) fn lot_layout_picker(current: LotLayout, mut select: impl FnMut(LotLa
     });
 }
 
+fn zone_row(state: &mut ZoningState, kinds: &[ZoneKind], unzone: bool) {
+    minrow(5.0, || {
+        for &kind in kinds {
+            minrow(4.0, || {
+                zone_swatch(zone_color(kind));
+                if selectable_label_primary(state.kind == Some(kind), zone_name(kind)).clicked {
+                    state.select_kind(Some(kind));
+                }
+            });
+        }
+        if unzone && selectable_label_primary(state.kind.is_none(), "Unzone").clicked {
+            state.select_kind(None);
+        }
+    });
+}
+
+fn zone_picker(state: &mut ZoningState, width: f32) {
+    let registry = prototypes::prototypes();
+    let mixed_ready = [Density::Medium, Density::High]
+        .into_iter()
+        .all(|density| registry.mixed_use_pair(density).is_some());
+    let standard = ZoneKind::TAXABLE.as_slice();
+    let palette = if mixed_ready { &ZoneKind::ALL } else { standard };
+
+    if width >= 740.0 {
+        zone_row(state, palette, true);
+    } else {
+        let per_row = if width >= 520.0 { standard.len() } else { 2 };
+        for row in standard.chunks(per_row) {
+            zone_row(state, row, false);
+        }
+        zone_row(state, &palette[standard.len()..], true);
+    }
+}
+
 pub fn properties(uiworld: &UiWorld) {
-    let narrow = uiworld.camera().camera.viewport_w < 830.0 * uiworld.read::<Settings>().gui_scale;
+    let width = uiworld.camera().camera.viewport_w / uiworld.read::<Settings>().gui_scale;
+    let narrow = width < 830.0;
     let brush_hint = |state: &ZoningState| {
         let side = state.brush_side() as u32;
         textc(
@@ -223,28 +259,7 @@ pub fn properties(uiworld: &UiWorld) {
     state.over_controls = is_hovered(|| {
         padxy(12.0, 8.0, || {
             mincolumn(3.0, || {
-                minrow(5.0, || {
-                    let registry = prototypes::prototypes();
-                    let mixed_ready = [Density::Medium, Density::High]
-                        .into_iter()
-                        .all(|density| registry.mixed_use_pair(density).is_some());
-                    let palette = ZoneKind::ALL
-                        .into_iter()
-                        .filter(|&kind| kind != ZoneKind::MixedUse || mixed_ready);
-                    for kind in palette {
-                        minrow(4.0, || {
-                            zone_swatch(zone_color(kind));
-                            if selectable_label_primary(state.kind == Some(kind), zone_name(kind))
-                                .clicked
-                            {
-                                state.select_kind(Some(kind));
-                            }
-                        });
-                    }
-                    if selectable_label_primary(state.kind.is_none(), "Unzone").clicked {
-                        state.select_kind(None);
-                    }
-                });
+                zone_picker(&mut state, width);
                 minrow(5.0, || {
                     if let Some(kind) = state.kind {
                         density_picker(&mut state, kind);

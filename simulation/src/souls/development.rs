@@ -1579,7 +1579,11 @@ mod tests {
                         let root = std::env::temp_dir()
                             .join(format!("z2-close-slot-{}", std::process::id()));
                         let slot = SlotId::new("closure").unwrap();
-                        sim.write::<Replay>().enabled = true;
+                        {
+                            let mut replay = sim.write::<Replay>();
+                            replay.enabled = true;
+                            replay.registry = Some(prototypes::prototypes().fingerprint());
+                        }
                         assert!(matches!(
                             sim.save_to_slot(&root, &slot, SnapshotRevision::new(94))
                                 .unwrap(),

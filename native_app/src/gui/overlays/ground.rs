@@ -8,8 +8,8 @@ use geom::{vec2, LinearColor, Vec2};
 use prototypes::{try_prototype, ServiceID};
 use simulation::map::{ElectricityNetworkID, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
-    service_reach_sources, utility_network_at_road, utility_network_readout, ElectricityFlow,
-    EnvGrid, ServiceReachSource, UtilityFlow, UtilityNetworkReadout, POLLUTION_RADIUS,
+    service_reach_sources, utility_network_at_road, EnvGrid, ServiceReachSource,
+    SiteUtilityReader, UtilityFlow, UtilityNetworkReadout, POLLUTION_RADIUS,
 };
 use simulation::souls::happiness::Happiness;
 use simulation::Simulation;
@@ -298,13 +298,12 @@ impl Atlas {
         mode: OverlayMode,
         focus: Option<ElectricityNetworkID>,
     ) {
-        let power = sim.read::<ElectricityFlow>();
-        let flow = sim.read::<UtilityFlow>();
+        let mut utilities = SiteUtilityReader::for_display(sim);
         let mut colors = BTreeMap::new();
         for (id, road) in map.roads() {
             let network = map.electricity.net_id(id);
             let color = *colors.entry(network).or_insert_with(|| {
-                let readout = utility_network_readout(map, &power, &flow, network);
+                let readout = utilities.network_readout(network);
                 legend::utility_color(mode.utility_state(&readout))
             });
             let focused = focus.is_some() && focus == network;
@@ -489,6 +488,99 @@ mod tests {
         let samples: Vec<_> =
             land_value_samples(&fixture.sim.map(), &fixture.sim.read::<EnvGrid>()).collect();
         assert_eq!(samples, [(measured, 0.0)]);
+    }
+
+    #[test]
+    fn zones2_ground_water_tint_updates_when_a_pump_closes() {
+        use prototypes::{GameTime, Tick, TICKS_PER_HOUR, TICKS_PER_REALTIME_SECOND};
+        use scenarios::builders::{grid_city, place_company};
+        use scenarios::ScenarioCtx;
+        use simulation::map::BuildingKind;
+        use simulation::map_dynamic::{
+            electricity_flow_system, utility_flow_update, UtilityNetworkState,
+        };
+        use simulation::souls::{human::spawn_human, lifecycle::despawn_company};
+        use simulation::world_command::WorldCommand;
+        use simulation::SimulationOptions;
+
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        let road = grid_city(&mut ctx, vec2(580.0, 720.0), 2, 1, 440.0).roads[0];
+        let lot = ctx
+            .sim
+            .map()
+            .lots()
+            .values()
+            .find(|lot| lot.parent == road)
+            .unwrap()
+            .id;
+        ctx.sim.apply_commands([&WorldCommand::MapBuildHouse(lot)]);
+        let pump_site = place_company(&mut ctx, "water-pump", vec2(850.0, 685.0)).unwrap();
+        place_company(&mut ctx, "solar-panel", vec2(900.0, 815.0)).unwrap();
+        let sim = &mut ctx.sim;
+        let home = sim
+            .map()
+            .buildings()
+            .values()
+            .find(|building| building.kind == BuildingKind::House)
+            .unwrap()
+            .id;
+        let worker = spawn_human(sim, home).unwrap();
+        let pump = sim
+            .world()
+            .companies
+            .iter()
+            .find(|(_, company)| company.comp.building == pump_site)
+            .unwrap()
+            .0;
+        sim.world_mut_unchecked().companies[pump].workers.0.push(worker);
+        *sim.write::<GameTime>() = GameTime::new(Tick(TICKS_PER_HOUR + 1));
+        let (world, resources) = sim.unrestricted_world_res().unwrap();
+        electricity_flow_system(world, resources);
+        utility_flow_update(sim);
+
+        let mode = OverlayMode::Water;
+        let tint = |sim: &Simulation, state| {
+            let map = sim.map();
+            let mut atlas = Atlas::new(vec2(768.0, 704.0), vec2(64.0, 32.0));
+            atlas.paint_roads(sim, &map, mode, None);
+            let mut expected = [0; 4];
+            encode(&mut expected, legend::utility_color(state), 0.75);
+            assert_eq!(&atlas.rgba[..4], &expected);
+        };
+        let stamp = |sim: &Simulation| {
+            let map = sim.map();
+            (
+                map.electricity.net_id(road).unwrap(),
+                UtilityFlow::topology_revision(&map),
+                map.environment().water_revision(),
+            )
+        };
+        let before = stamp(sim);
+        let before_data = mode.data_version(sim, &sim.map());
+        assert_eq!(
+            utility_network_at_road(sim, road).unwrap().water,
+            UtilityNetworkState::Ok
+        );
+        tint(sim, UtilityNetworkState::Ok);
+
+        despawn_company(sim, pump);
+        sim.apply_commands([]);
+        assert!(sim.get(pump).is_none());
+        assert_eq!(stamp(sim), before);
+        // Advance the overlay refresh key while retaining the same hourly sample.
+        let tick = sim.get_tick() + TICKS_PER_REALTIME_SECOND / 2;
+        *sim.write::<GameTime>() = GameTime::new(Tick(tick));
+        assert_ne!(mode.data_version(sim, &sim.map()), before_data);
+        assert!(sim.read::<UtilityFlow>().has_water(home));
+        assert_eq!(
+            utility_network_at_road(sim, road).unwrap().water,
+            UtilityNetworkState::Shortage
+        );
+        tint(sim, UtilityNetworkState::Shortage);
     }
 
     #[test]

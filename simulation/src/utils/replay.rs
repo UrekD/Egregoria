@@ -68,38 +68,7 @@ impl Default for Replay {
 impl Replay {
     pub(crate) fn check_registry(&self) -> io::Result<()> {
         crate::check_prototype_registry(self.registry)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-        if self.registry.is_some() {
-            return Ok(());
-        }
-
-        // Older recordings do not have a fingerprint. Check their explicit
-        // prototype references before starting playback.
-        use crate::map::ZoneKind::MixedUse;
-        for (_, command) in &self.commands {
-            let available = match command {
-                WorldCommand::ZonePaint {
-                    kind: Some(MixedUse),
-                    density,
-                    ..
-                } => {
-                    *density == crate::map::Density::Low
-                        || prototypes::try_prototypes()
-                            .is_some_and(|registry| registry.mixed_use_pair(*density).is_some())
-                }
-                WorldCommand::MapBuildSpecialBuilding { kind, .. } => {
-                    crate::building_kind_prototype_exists(*kind)
-                }
-                WorldCommand::SpawnTrain { wagons, .. } => wagons
-                    .iter()
-                    .all(|&id| prototypes::try_prototype(id).is_some()),
-                _ => true,
-            };
-            if !available {
-                return Err(invalid_replay("Replay requires a missing prototype"));
-            }
-        }
-        Ok(())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
 
     pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
@@ -292,6 +261,8 @@ struct ReplayHeader {
     #[serde(default)]
     version: String,
     #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
     revision: Option<u128>,
     #[serde(default)]
     registry: Option<u64>,
@@ -306,7 +277,6 @@ impl ReplayHeader {
                 version: header.version,
             });
         }
-        crate::check_prototype_registry(header.registry)?;
         Ok(header)
     }
 }
@@ -334,14 +304,13 @@ impl ReplayJson {
         revision: Option<SnapshotRevision>,
     ) -> Result<Replay, SaveLoadError> {
         let header = ReplayHeader::decode(bytes)?;
+        crate::check_prototype_registry(header.registry)?;
         if header.revision != revision.map(SnapshotRevision::get) {
             return Err(replay_corrupt(invalid_replay(
                 "Replay revision does not match the snapshot",
             )));
         }
-        let replay: Replay = JSON::decode(bytes).map_err(replay_corrupt)?;
-        replay.check_registry().map_err(replay_corrupt)?;
-        Ok(replay)
+        JSON::decode(bytes).map_err(replay_corrupt)
     }
 }
 
@@ -353,10 +322,15 @@ impl Encoder for ReplayJson {
     }
 
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
-        ReplayHeader::decode(bytes).map_err(|error| match error {
+        let header = ReplayHeader::decode(bytes).map_err(|error| match error {
             SaveLoadError::Incompatible { version } => replay_version_error(&version),
             error => io::Error::new(io::ErrorKind::InvalidData, error),
         })?;
+        // Snapshots may embed a disabled replay that was never started.
+        if header.enabled || header.registry.is_some() {
+            crate::check_prototype_registry(header.registry)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        }
         JSON::decode(bytes)
     }
 }
@@ -639,6 +613,7 @@ fn scale_t1_replay_boundary_keeps_legacy_edit_pending() {
 #[cfg(test)]
 #[test]
 fn scale_t1_fix_rejects_import_in_replay_constructor() {
+    drop(crate::tests::TestCtx::new());
     let mut replay = Replay::default();
     let options = SimulationOptions {
         terrain_size: crate::NewGameOptions::MIN_TERRAIN_CHUNKS,

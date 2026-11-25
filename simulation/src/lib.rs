@@ -834,7 +834,7 @@ impl Simulation {
         // A readable old header is enough to reject the save. If the prefix is
         // unreadable, the normal load still distinguishes oversized and corrupt files.
         if let Ok(header) = read_snapshot_header(&mut file, kind) {
-            header.check_compatibility()?;
+            header.check_load_compatibility()?;
         }
         file.rewind().map_err(SaveLoadError::Io)?;
         Self::decode_snapshot(&read_snapshot(file, kind)?)
@@ -874,17 +874,14 @@ impl Simulation {
 
     fn decode_snapshot(bytes: &[u8]) -> Result<Self, SaveLoadError> {
         let (header, payload) = snapshot_header(bytes)?;
-        header.check_compatibility()?;
+        header.check_load_compatibility()?;
         let version = header.version;
         let data: SimulationDeser =
             Bincode::decode(payload).map_err(|error| SaveLoadError::Corrupt {
                 version: Some(version.clone()),
                 reason: error.to_string(),
             })?;
-        let sim = data.into_sim().map_err(|reason| SaveLoadError::Corrupt {
-            version: Some(version.clone()),
-            reason,
-        })?;
+        let sim = data.into_sim()?;
         if sim
             .resources
             .try_read::<Map>()
@@ -1135,19 +1132,32 @@ pub struct SnapshotHeader {
 
 impl SnapshotHeader {
     pub fn check_compatibility(&self) -> Result<(), SaveLoadError> {
+        self.check_version()?;
+        check_prototype_registry(self.registry)
+    }
+
+    fn check_load_compatibility(&self) -> Result<(), SaveLoadError> {
+        if self.revision.is_none() {
+            // Unenveloped debug snapshots carry the fingerprint in the payload.
+            return self.check_version();
+        }
+        self.check_compatibility()
+    }
+
+    fn check_version(&self) -> Result<(), SaveLoadError> {
         if self.version != VERSION {
             return Err(SaveLoadError::Incompatible {
                 version: self.version.clone(),
             });
         }
-        check_prototype_registry(self.registry)
+        Ok(())
     }
 }
 
 fn check_prototype_registry(fingerprint: Option<u64>) -> Result<(), SaveLoadError> {
-    if fingerprint.is_some_and(|saved| {
-        prototypes::try_prototypes().is_none_or(|current| current.fingerprint() != saved)
-    }) {
+    if !prototypes::try_prototypes()
+        .is_some_and(|current| fingerprint == Some(current.fingerprint()))
+    {
         return Err(SaveLoadError::PrototypeRegistry);
     }
     Ok(())
@@ -1475,15 +1485,19 @@ impl<'de> Deserialize<'de> for Simulation {
 }
 
 impl SimulationDeser {
-    fn into_sim(self) -> Result<Simulation, String> {
+    fn into_sim(self) -> Result<Simulation, SaveLoadError> {
         let t = Instant::now();
+        let corrupt = |reason| SaveLoadError::Corrupt {
+            version: Some(self._header.version.clone()),
+            reason,
+        };
         let registry = self
             .res
             .get("prototype_registry")
             .map(|bytes| Bincode::decode(bytes))
             .transpose()
-            .map_err(|error| error.to_string())?;
-        check_prototype_registry(registry).map_err(|error| error.to_string())?;
+            .map_err(|error| corrupt(error.to_string()))?;
+        check_prototype_registry(registry)?;
         let mut sim = Simulation {
             // Resource initializers can rebuild derived indexes from the loaded world.
             world: self.world,
@@ -1502,18 +1516,18 @@ impl SimulationDeser {
                     if l.optional {
                         continue;
                     }
-                    return Err(format!("Missing resource {}", l.name));
+                    return Err(corrupt(format!("Missing resource {}", l.name)));
                 };
                 (l.load)(&mut sim, data)
-                    .map_err(|error| format!("Could not decode resource {}: {error}", l.name))?;
+                    .map_err(|error| corrupt(format!("Could not decode resource {}: {error}", l.name)))?;
             }
         }
 
-        validate_loaded_prototypes(&sim)?;
-        crate::map::validate_loaded_land(&sim)?;
+        validate_loaded_prototypes(&sim).map_err(&corrupt)?;
+        crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
         sim.map_mut()
             .rebuild_land_frontage()
-            .map_err(|reason| format!("Invalid land frontage: {reason:?}"))?;
+            .map_err(|reason| corrupt(format!("Invalid land frontage: {reason:?}")))?;
         crate::souls::lifecycle::restore_company_departures(&mut sim);
         sim.world.reconcile_derived("after resource decode");
 
@@ -1680,7 +1694,9 @@ mod p4_fix_ac_tests {
         let root = save_root();
         let slot = SlotId::legacy();
         let paths = saveload::slot_paths(&root, &slot).unwrap();
-        let replay = Replay::default();
+        drop(crate::tests::TestCtx::new());
+        let mut replay = Replay::default();
+        replay.registry = Some(prototypes::prototypes().fingerprint());
         fs::write(&paths.replay, ReplayJson::encode(&replay).unwrap()).unwrap();
         fs::write(&paths.zip, b"corrupt snapshot").unwrap();
         let recovered = Simulation::load_replay_from_slot(&root, &slot);
@@ -1690,10 +1706,13 @@ mod p4_fix_ac_tests {
 
         let revision = SnapshotRevision::new(42);
         let write_snapshot = |version: &str| {
-            let header = SlotSnapshotHeader {
-                magic: SLOT_SNAPSHOT_MAGIC,
-                version: version.to_owned(),
-                revision,
+            let header = RegistrySlotSnapshotHeader {
+                slot: SlotSnapshotHeader {
+                    magic: REGISTRY_SLOT_MAGIC,
+                    version: version.to_owned(),
+                    revision,
+                },
+                registry: prototypes::prototypes().fingerprint(),
             };
             fs::write(&paths.zip, CompressedBincode::encode(&header).unwrap()).unwrap();
         };

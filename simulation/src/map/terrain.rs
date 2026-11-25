@@ -690,8 +690,8 @@ mod water_w1_tests {
     #[test]
     fn w1_water_slot_rejects_mismatched_heightmap_chunk_count() {
         use crate::{
-            SaveHeader, SaveLoadError, Simulation, SimulationDeser, SimulationSer,
-            SlotSnapshotHeader,
+            RegistrySlotSnapshotHeader, SaveHeader, SaveLoadError, Simulation, SimulationDeser,
+            SimulationSer, SlotSnapshotHeader,
         };
         use common::saveload::{slot_paths, SlotId, SnapshotRevision};
 
@@ -712,10 +712,13 @@ mod water_w1_tests {
             .unwrap();
         map.splice(offset..offset + original.len(), malformed);
 
-        let header = SlotSnapshotHeader {
-            magic: crate::SLOT_SNAPSHOT_MAGIC,
-            version: crate::VERSION.into(),
-            revision: SnapshotRevision::new(1),
+        let header = RegistrySlotSnapshotHeader {
+            slot: SlotSnapshotHeader {
+                magic: crate::REGISTRY_SLOT_MAGIC,
+                version: crate::VERSION.into(),
+                revision: SnapshotRevision::new(1),
+            },
+            registry: prototypes::prototypes().fingerprint(),
         };
         let payload = SimulationSer {
             header: SaveHeader {

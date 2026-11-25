@@ -405,7 +405,7 @@ pub(crate) fn load_staged_prototypes() {
     crate::init::register_simulation();
 }
 
-fn load_unprofiled_prototypes() {
+pub(crate) fn load_unprofiled_prototypes() {
     prototypes::test_prototypes(concat!(
         "package.path = '../base_mod/?.lua'\nzones2_profiles_enabled = false\n",
         include_str!("../../../base_mod/data.lua")
@@ -2055,7 +2055,10 @@ mod tiles_fix_regressions {
     #[test]
     fn tiles_fix_reloads_pre_tiles_slot_with_oversized_zone_command() {
         use crate::utils::replay::ReplayJson;
-        use crate::{SimulationDeser, SimulationSer, SlotSnapshotHeader, SLOT_SNAPSHOT_MAGIC};
+        use crate::{
+            RegistrySlotSnapshotHeader, SimulationDeser, SimulationSer, SlotSnapshotHeader,
+            REGISTRY_SLOT_MAGIC,
+        };
         use common::saveload::{slot_paths, CompressedBincode};
         use prototypes::Tick;
 
@@ -2093,10 +2096,13 @@ mod tiles_fix_regressions {
         );
         let revision = SnapshotRevision::new(1);
         let bytes = CompressedBincode::encode(&(
-            SlotSnapshotHeader {
-                magic: SLOT_SNAPSHOT_MAGIC,
-                version: legacy._header.version.clone(),
-                revision,
+            RegistrySlotSnapshotHeader {
+                slot: SlotSnapshotHeader {
+                    magic: REGISTRY_SLOT_MAGIC,
+                    version: legacy._header.version.clone(),
+                    revision,
+                },
+                registry: prototypes::prototypes().fingerprint(),
             },
             SimulationSer {
                 header: legacy._header,

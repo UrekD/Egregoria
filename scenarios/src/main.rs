@@ -1,5 +1,5 @@
 use scenarios::builtin::{
-    demo_cities, growth_basic, perf, water_fixtures, PERF_10K, SCENARIOS, ZONES2_SCENARIOS,
+    demo_cities, growth_basic, perf, water_fixtures, zones2_scenarios, PERF_10K, SCENARIOS,
 };
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
@@ -229,7 +229,7 @@ fn run() -> Result<(), String> {
     }
     let available: Vec<_> = match name.as_str() {
         "all" | "all_staged" => SCENARIOS.iter().collect(),
-        "zones2_staged" => ZONES2_SCENARIOS.iter().collect(),
+        "zones2_staged" => zones2_scenarios().collect(),
         _ => SCENARIOS
             .iter()
             .chain(std::iter::once(&PERF_10K))

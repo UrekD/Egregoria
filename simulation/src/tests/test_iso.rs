@@ -438,7 +438,9 @@ fn test_world_survives_serde() {
     init_test_simulation();
     //common::logger::MyLog::init();
 
-    let replay: Replay = JSON::decode(REPLAY).unwrap();
+    // Use the archived commands as input for this current-registry trajectory.
+    let mut replay: Replay = JSON::decode(REPLAY).unwrap();
+    replay.registry = Some(prototypes::prototypes().fingerprint());
     let mut s = SeqSchedule::default();
 
     let mut check_size = 1024;

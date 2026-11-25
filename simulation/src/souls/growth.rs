@@ -765,6 +765,15 @@ mod tests {
         test
     }
 
+    fn legacy_street(test_name: &str) -> Option<TestCtx> {
+        if !crate::tests::in_prototype_fixture_process(module_path!(), test_name) {
+            return None;
+        }
+        let test = street();
+        crate::tests::load_unprofiled_prototypes();
+        Some(test)
+    }
+
     #[test]
     fn zones2_z1_fix_profiled_area_and_frontage_use_measured_axes() {
         let profile = GrowableMassing {
@@ -1331,7 +1340,9 @@ mod tests {
             (ZoneKind::Industrial, "industrial-medium-l1"),
             (ZoneKind::Office, "office-medium-l1"),
         ] {
-            let mut test = street();
+            let Some(mut test) = legacy_street("u1_zone_growth_uses_medium_prototypes_for_all_kinds") else {
+                return;
+            };
             grow_medium_zone(&mut test, kind);
             let map = test.g.map();
             let building = map
@@ -1358,7 +1369,9 @@ mod tests {
 
     #[test]
     fn u1_zone_medium_residence_upgrades_at_same_density() {
-        let mut test = street();
+        let Some(mut test) = legacy_street("u1_zone_medium_residence_upgrades_at_same_density") else {
+            return;
+        };
         grow_medium_zone(&mut test, ZoneKind::Residential);
         let house = *test
             .g
@@ -1857,7 +1870,9 @@ mod tests {
 
     #[test]
     fn p1b_zoned_growth_obeys_demand_quota_and_clusters() {
-        let mut test = street();
+        let Some(mut test) = legacy_street("p1b_zoned_growth_obeys_demand_quota_and_clusters") else {
+            return;
+        };
         let anchor = test.build_house_near(vec2(175.0, 125.0));
         let (nearest, total, zones) = {
             let map = test.g.map();

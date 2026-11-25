@@ -27,9 +27,6 @@ pub const PERF_10K: (Scenario, SimulationOptions) = (
 
 pub const ZONES2_L3: (Scenario, SimulationOptions) = zones2::ATTAINMENT;
 
-pub const ZONES2_SCENARIOS: &[(Scenario, SimulationOptions)] =
-    &[zones2::CITY, zones2::CONTROLLED, ZONES2_L3];
-
 pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     (
         Scenario {
@@ -69,6 +66,10 @@ pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     zones2::CONTROLLED,
     ZONES2_L3,
 ];
+
+pub fn zones2_scenarios() -> impl Iterator<Item = &'static (Scenario, SimulationOptions)> {
+    SCENARIOS.iter().filter(|(scenario, _)| scenario.name.starts_with("zones2_"))
+}
 
 fn run_served_budget_day(ctx: &mut ScenarioCtx) -> Result<(), String> {
     // An approach from the north keeps the power spur connected at the
