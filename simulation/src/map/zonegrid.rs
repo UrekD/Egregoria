@@ -14,14 +14,15 @@ pub type ZoneCellCoord = (i32, i32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ZonePaintError {
     InvalidArea,
+    UnsupportedDensity { kind: ZoneKind, density: Density },
     TileLocked(ZoneCellCoord),
     WetFootprint,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 pub struct EligiblePaintCells {
     cells: Vec<ZoneCellCoord>,
-    kind: Option<ZoneKind>,
+    replacement: Option<ZoneCell>,
 }
 
 impl EligiblePaintCells {
@@ -29,8 +30,8 @@ impl EligiblePaintCells {
         &self.cells
     }
 
-    pub fn kind(&self) -> Option<ZoneKind> {
-        self.kind
+    pub fn replacement(&self) -> Option<ZoneCell> {
+        self.replacement
     }
 }
 
@@ -53,10 +54,23 @@ pub struct ZoneGrid {
     cells: BTreeMap<ZoneCellCoord, ZoneCell>,
     /// Changes once for each paint or unzone that changes the grid.
     generation: u64,
+    #[serde(default)]
+    growth_cohort: u8,
 }
 
 impl ZoneGrid {
     pub const MAX_PAINT_SIDE: f32 = 400.0;
+
+    pub fn growth_cohort(&self) -> u8 {
+        self.growth_cohort % Self::GROWTH_COHORTS
+    }
+
+    /// Advance at the end of a due growth pass, without invalidating painted cells.
+    pub fn advance_growth_cohort(&mut self) {
+        self.growth_cohort = (self.growth_cohort() + 1) % Self::GROWTH_COHORTS;
+    }
+
+    const GROWTH_COHORTS: u8 = 14;
 
     pub fn cells(&self) -> &BTreeMap<ZoneCellCoord, ZoneCell> {
         &self.cells
@@ -66,18 +80,43 @@ impl ZoneGrid {
         self.generation
     }
 
+    pub(crate) fn paint_replacement(
+        kind: Option<ZoneKind>,
+        density: Density,
+    ) -> Result<Option<ZoneCell>, ZonePaintError> {
+        match kind {
+            Some(kind) if !kind.supports_density(density) => {
+                Err(ZonePaintError::UnsupportedDensity { kind, density })
+            }
+            Some(kind) => Ok(Some(ZoneCell { kind, density })),
+            None => Ok(None),
+        }
+    }
+
     pub fn eligible_paint_cells(
         map: &Map,
         area: &OBB,
         kind: Option<ZoneKind>,
+        density: Density,
     ) -> Result<EligiblePaintCells, ZonePaintError> {
-        Self::eligible_paint_cells_with_land(map, area, kind, |_| true)
+        Self::eligible_paint_cells_with_land(map, area, kind, density, |_| true)
     }
 
     pub fn eligible_paint_cells_with_land(
         map: &Map,
         area: &OBB,
         kind: Option<ZoneKind>,
+        density: Density,
+        owns: impl FnMut(ZoneCellCoord) -> bool,
+    ) -> Result<EligiblePaintCells, ZonePaintError> {
+        let replacement = Self::paint_replacement(kind, density)?;
+        Self::prepare_cells(map, area, replacement, owns)
+    }
+
+    fn prepare_cells(
+        map: &Map,
+        area: &OBB,
+        replacement: Option<ZoneCell>,
         mut owns: impl FnMut(ZoneCellCoord) -> bool,
     ) -> Result<EligiblePaintCells, ZonePaintError> {
         let env = map.environment();
@@ -85,14 +124,14 @@ impl ZoneGrid {
         if let Some(&key) = cells.iter().find(|&&key| !owns(key)) {
             return Err(ZonePaintError::TileLocked(key));
         }
-        if kind.is_some() && env.has_water_configuration() && !cells.is_empty() {
+        if replacement.is_some() && env.has_water_configuration() && !cells.is_empty() {
             // Each 8 m cell lies entirely inside one aligned 16 m water tile.
             cells.retain(|&key| !env.is_water(cell_center(key)));
             if cells.is_empty() {
                 return Err(ZonePaintError::WetFootprint);
             }
         }
-        Ok(EligiblePaintCells { cells, kind })
+        Ok(EligiblePaintCells { cells, replacement })
     }
 
     /// Prepare the union of independently submitted editor stamps.
@@ -100,15 +139,27 @@ impl ZoneGrid {
         map: &Map,
         areas: &[OBB],
         kind: Option<ZoneKind>,
-    ) -> EligiblePaintCells {
+        density: Density,
+    ) -> Result<EligiblePaintCells, ZonePaintError> {
+        Self::eligible_paint_stroke_with_land(map, areas, kind, density, |_| true)
+    }
+
+    pub fn eligible_paint_stroke_with_land(
+        map: &Map,
+        areas: &[OBB],
+        kind: Option<ZoneKind>,
+        density: Density,
+        mut owns: impl FnMut(ZoneCellCoord) -> bool,
+    ) -> Result<EligiblePaintCells, ZonePaintError> {
+        let replacement = Self::paint_replacement(kind, density)?;
         let mut cells: Vec<_> = areas
             .iter()
-            .filter_map(|area| Self::eligible_paint_cells(map, area, kind).ok())
+            .filter_map(|area| Self::prepare_cells(map, area, replacement, &mut owns).ok())
             .flat_map(|stamp| stamp.cells)
             .collect();
         cells.sort_unstable();
         cells.dedup();
-        EligiblePaintCells { cells, kind }
+        Ok(EligiblePaintCells { cells, replacement })
     }
 
     pub fn bounded_paint_cells(
@@ -145,10 +196,9 @@ impl ZoneGrid {
         density: Density,
         owns: impl FnMut(ZoneCellCoord) -> bool,
     ) -> Result<(), ZonePaintError> {
-        self.paint_prepared(
-            Self::eligible_paint_cells_with_land(map, area, kind, owns)?,
-            density,
-        );
+        self.paint_prepared(Self::eligible_paint_cells_with_land(
+            map, area, kind, density, owns,
+        )?);
         Ok(())
     }
 
@@ -163,18 +213,17 @@ impl ZoneGrid {
             return;
         }
 
-        self.paint_prepared(EligiblePaintCells { cells, kind }, density);
+        if let Ok(replacement) = Self::paint_replacement(kind, density) {
+            self.paint_prepared(EligiblePaintCells { cells, replacement });
+        }
     }
 
-    pub(crate) fn paint_prepared(&mut self, prepared: EligiblePaintCells, density: Density) {
-        let EligiblePaintCells { cells, kind } = prepared;
+    fn paint_prepared(&mut self, prepared: EligiblePaintCells) {
+        let EligiblePaintCells { cells, replacement } = prepared;
         let mut changed = false;
         for key in cells {
-            changed |= match kind {
-                Some(kind) => {
-                    let cell = ZoneCell { kind, density };
-                    self.cells.insert(key, cell) != Some(cell)
-                }
+            changed |= match replacement {
+                Some(cell) => self.cells.insert(key, cell) != Some(cell),
                 None => self.cells.remove(&key).is_some(),
             };
         }
@@ -222,7 +271,10 @@ impl ZoneGrid {
     }
 
     pub(super) fn clear_prepared_cells(&mut self, cells: Vec<ZoneCellCoord>) {
-        self.paint_prepared(EligiblePaintCells { cells, kind: None }, Density::Low);
+        self.paint_prepared(EligiblePaintCells {
+            cells,
+            replacement: None,
+        });
     }
 
     pub fn lot_zone(&self, area: &OBB) -> Option<ZoneCell> {
@@ -232,9 +284,10 @@ impl ZoneGrid {
         lot_vote(area, |key| self.cells.get(&key).copied())
     }
 
-    /// Vote as if the already clipped paint rectangles had been applied. The first return
+    #[cfg(test)]
+    /// Vote as if the fixture's detached paint rectangles had been applied. The first return
     /// value says whether the stroke touched any of the lot's storage cell centres.
-    pub fn lot_zone_after_paint(
+    fn lot_zone_after_paint(
         &self,
         lot: &OBB,
         paints: &[OBB],
@@ -256,13 +309,12 @@ impl ZoneGrid {
         &self,
         area: &OBB,
         prepared: &EligiblePaintCells,
-        density: Density,
     ) -> (bool, Option<ZoneCell>) {
         let mut touched = false;
         let vote = lot_vote(area, |key| {
             if prepared.cells.binary_search(&key).is_ok() {
                 touched = true;
-                prepared.kind.map(|kind| ZoneCell { kind, density })
+                prepared.replacement
             } else {
                 self.cells.get(&key).copied()
             }
@@ -275,19 +327,13 @@ fn lot_vote(
     area: &OBB,
     mut cell_at: impl FnMut((i32, i32)) -> Option<ZoneCell>,
 ) -> Option<ZoneCell> {
-    const KINDS: [ZoneKind; 4] = [
-        ZoneKind::Residential,
-        ZoneKind::Commercial,
-        ZoneKind::Industrial,
-        ZoneKind::Office,
-    ];
-    let mut counts = [[0usize; 3]; KINDS.len()];
+    let mut counts = [[0usize; 3]; ZoneKind::ALL.len()];
     let mut total = 0;
     let mut zoned = 0;
     for key in cells_under(area) {
         total += 1;
-        if let Some(cell) = cell_at(key) {
-            counts[cell.kind as usize][usize::from(cell.density.ordinal())] += 1;
+        if let Some(cell) = cell_at(key).filter(|cell| cell.kind.supports_density(cell.density)) {
+            counts[usize::from(cell.kind.ordinal())][usize::from(cell.density.ordinal())] += 1;
             zoned += 1;
         }
     }
@@ -295,7 +341,7 @@ fn lot_vote(
         return None;
     }
 
-    let (kind, densities) = KINDS
+    let (kind, densities) = ZoneKind::ALL
         .into_iter()
         .zip(counts)
         .max_by_key(|(kind, counts)| (counts.iter().sum::<usize>(), Reverse(*kind)))?;
@@ -603,6 +649,43 @@ mod tests {
         ctx.apply(&[paint(None, Density::Medium)]);
         assert!(ctx.g.read::<ZoneGrid>().cells.is_empty());
         assert!(ctx.g.read::<CommandOutcomes>().last.is_empty());
+    }
+
+    #[test]
+    fn zones2_mixed_votes_use_kind_and_density_ties() {
+        let lot = OBB::new(vec2(20.0, 4.0), Vec2::X, 40.0, 8.0);
+        let stamp = |x| OBB::new(vec2(4.0 + 8.0 * x, 4.0), Vec2::X, 8.0, 8.0);
+        let mut grid = ZoneGrid::default();
+        for (x, kind) in ZoneKind::ALL.into_iter().enumerate() {
+            grid.paint(stamp(x as f32), Some(kind), Density::High);
+        }
+        assert_eq!(grid.lot_zone(&lot).unwrap().kind, ZoneKind::Residential);
+        grid.paint(stamp(1.0), Some(ZoneKind::MixedUse), Density::Medium);
+        assert_eq!(
+            grid.lot_zone(&lot),
+            Some(ZoneCell {
+                kind: ZoneKind::MixedUse,
+                density: Density::Medium
+            }),
+        );
+        grid.paint(stamp(1.0), Some(ZoneKind::MixedUse), Density::Low);
+        assert_eq!(grid.lot_zone(&lot).unwrap().density, Density::Medium);
+    }
+
+    #[test]
+    fn zones2_growth_cursor_survives_reload_without_revising_paint() {
+        use common::saveload::{Bincode, Encoder};
+
+        let mut grid = ZoneGrid::default();
+        for cursor in 0..13 {
+            assert_eq!(grid.growth_cohort(), cursor);
+            grid.advance_growth_cohort();
+        }
+        let mut loaded: ZoneGrid = Bincode::decode(&Bincode::encode(&grid).unwrap()).unwrap();
+        assert_eq!(loaded.growth_cohort(), 13);
+        loaded.advance_growth_cohort();
+        assert_eq!(loaded.growth_cohort(), 0);
+        assert_eq!(loaded.generation(), 0);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::map::{
 };
 use geom::{Intersect, Polygon, Segment, Shape, Vec2, Vec3, AABB, OBB};
 use ordered_float::OrderedFloat;
+use prototypes::BuildingGen;
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
 use std::collections::BTreeSet;
@@ -45,14 +46,49 @@ pub struct Lot {
     pub height: f32,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GrowableLotError {
+    MissingLot,
+    MissingRoad,
+    UnsupportedDensity,
+    MissingPrototype,
+    TooSmall,
+    Obstructed,
+    Wet,
+    InfeasibleGrade,
+    MixedUseDisabled,
+}
+
 impl Lot {
+    pub(crate) fn check_growable_footprint(
+        &self,
+        map: &Map,
+        generator: BuildingGen,
+    ) -> Result<(), GrowableLotError> {
+        let road = map.get(self.parent).ok_or(GrowableLotError::MissingRoad)?;
+        if !Self::allows_frontage(map, road) {
+            return Err(GrowableLotError::MissingRoad);
+        }
+        if !Building::valid_footprint(&self.shape, generator) {
+            return Err(GrowableLotError::Obstructed);
+        }
+        if !Building::dry_footprint(map.environment(), &self.shape, None)
+            || !Self::has_dry_frontage(map.environment(), road, &self.shape)
+        {
+            return Err(GrowableLotError::Wet);
+        }
+        if Self::footprint_obstructed(map, self.shape, false) {
+            return Err(GrowableLotError::Obstructed);
+        }
+        Ok(())
+    }
+
     pub(crate) fn footprint_obstructed(map: &Map, shape: OBB, include_lots: bool) -> bool {
         let mut filter = ProjectFilter::INTER | ProjectFilter::BUILDING;
         if include_lots {
             filter = filter | ProjectFilter::LOT;
         }
-        !Building::dry_footprint(map.environment(), &shape, None)
-            || map.spatial_map.query(shape, filter).next().is_some()
+        map.spatial_map.query(shape, filter).next().is_some()
             || map
                 .spatial_map
                 .query(Polygon::from(shape.corners.as_slice()), ProjectFilter::ROAD)
@@ -64,7 +100,9 @@ impl Lot {
         const FRONTAGE_RADIUS: f32 = 15.0;
 
         let shape = origin.shape;
-        if Self::footprint_obstructed(map, shape, true) {
+        if !Building::dry_footprint(map.environment(), &shape, None)
+            || Self::footprint_obstructed(map, shape, true)
+        {
             return None;
         }
 
@@ -126,6 +164,7 @@ impl Lot {
         }
         let road = map.roads.get(parent)?;
         if !Self::allows_frontage(map, road)
+            || !Building::dry_footprint(&map.environment, &shape, None)
             || Self::footprint_obstructed(map, shape, true)
             || !Self::has_dry_frontage(map.environment(), road, &shape)
         {
@@ -522,6 +561,47 @@ mod water_tests {
     use super::*;
     use crate::map::{Environment, LanePatternBuilder, MapProject};
     use geom::vec2;
+
+    #[test]
+    fn w2b_zs_prepared_growable_rechecks_dry_frontage() {
+        use crate::map::BuildingKind;
+
+        drop(crate::tests::TestCtx::new_fast());
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        let (_, road) = map
+            .make_connection(
+                MapProject::ground(vec2(48.0, 109.0).z0()),
+                MapProject::ground(vec2(448.0, 109.0).z0()),
+                None,
+                &LanePatternBuilder::new().build(),
+            )
+            .unwrap();
+        let curb_y = 109.0 + map.roads[road].width * 0.5 + 1.0;
+        let shape = OBB::new(vec2(164.0, curb_y + 10.0), Vec2::Y, 20.0, 20.0);
+        for id in map.lots.keys().collect::<Vec<_>>() {
+            map.lots.remove(id);
+            map.spatial_map.remove(id);
+        }
+        let lot = Lot::insert(&mut map, road, shape, 0.0);
+        let prepared = map
+            .prepare_checked_growable(&map.lots[lot], BuildingKind::House, BuildingGen::House, None)
+            .unwrap();
+
+        // Change only the frontage so commit must check the live lot before using its plan.
+        map.environment_mut_for_test()
+            .fill_lake(&Polygon::centered_rect(vec2(152.0, 104.0), 8.0, 8.0), 0, 1.0)
+            .unwrap();
+        assert!(Building::dry_footprint(map.environment(), &shape, None));
+        assert!(!Lot::has_dry_frontage(map.environment(), &map.roads[road], &shape));
+        assert_eq!(
+            map.commit_prepared_growable(prepared),
+            Err(GrowableLotError::Wet),
+        );
+        assert!(map.lots.contains_key(lot));
+        assert!(map.buildings.is_empty());
+        assert!(map.place_growable(lot, BuildingKind::House).is_none());
+    }
 
     #[test]
     fn w2b_water_lot_rejects_wet_footprint_and_wet_frontage() {

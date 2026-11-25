@@ -536,7 +536,6 @@ impl super::MapRenderer {
             pointer,
             hover_radius,
             pitch,
-            density,
             held,
         } = stroke;
         profiling::scope!("zoning_preview");
@@ -544,18 +543,18 @@ impl super::MapRenderer {
         let overview = mode == ZoningMode::Overview;
         let view = ZoningView::new(center, distance, map.environment().bounds(), mode);
         let fill = (!stamp.cells().is_empty()).then(|| ZoningPreviewFill {
-            tiles: preview_tiles(stamp, mode, density),
+            tiles: preview_tiles(stamp, mode),
             color: stamp
-                .kind()
-                .map_or(LinearColor::new(0.96, 0.28, 0.28, 1.0), |kind| {
-                    zone_cell_color(kind, density)
+                .replacement()
+                .map_or(LinearColor::new(0.96, 0.28, 0.28, 1.0), |zone| {
+                    zone_cell_color(zone.kind, zone.density)
                 })
                 .a(if held { 0.66 } else { 0.50 })
                 .into(),
         });
         let (lots, warning) = pointer.map_or_else(
             || (PreviewLots::default(), None),
-            |pointer| preview_lots(map, &grid, stamp, density, pointer, hover_radius, overview),
+            |pointer| preview_lots(map, &grid, stamp, pointer, hover_radius, overview),
         );
         ZONING_FRAME.replace(Some(ZoningFrame {
             world,
@@ -600,7 +599,6 @@ fn preview_lots(
     map: &Map,
     grid: &ZoneGrid,
     stamp: &EligiblePaintCells,
-    density: Density,
     pointer: Vec2,
     hover_radius: f32,
     overview: bool,
@@ -641,7 +639,7 @@ fn preview_lots(
         }
         let before = grid.lot_zone(&lot.shape);
         let (touched, zone) = if intersects_paint {
-            grid.lot_zone_after_prepared_paint(&lot.shape, stamp, density)
+            grid.lot_zone_after_prepared_paint(&lot.shape, stamp)
         } else {
             (false, before)
         };
@@ -672,7 +670,7 @@ fn preview_lots(
         }
     }
     let warning = hovered.map(lot_warning).or_else(|| {
-        if stamp.kind().is_none() || stamp.cells().is_empty() || eligible {
+        if stamp.replacement().is_none() || stamp.cells().is_empty() || eligible {
             return None;
         }
         if let Some(blocked) = blocked {
@@ -689,7 +687,12 @@ fn preview_lots(
 
 fn lot_warning((zone, status): ZonedLot) -> String {
     match status.expect_err("only blocked lots produce warnings") {
+        GrowableLotError::MissingLot => "Lot is no longer available".into(),
         GrowableLotError::MissingRoad => "Lot needs road frontage to grow".into(),
+        GrowableLotError::UnsupportedDensity => "Mixed Use requires Medium or High density".into(),
+        GrowableLotError::MixedUseDisabled => "Mixed Use development is unavailable".into(),
+        GrowableLotError::Wet => "Lot must be dry to grow".into(),
+        GrowableLotError::InfeasibleGrade => "Lot grade is too steep to grow".into(),
         GrowableLotError::TooSmall => format!(
             "Lot too small for {} {}",
             density_name(zone.density),
@@ -768,8 +771,11 @@ fn uniform_block(zones: &ZoneGrid, x: i32, y: i32, zone: ZoneCell) -> bool {
         .all(|key| zones.cells().get(key) == Some(&zone))
 }
 
-fn preview_tiles(stamp: &EligiblePaintCells, mode: ZoningMode, density: Density) -> Vec<AABB> {
+fn preview_tiles(stamp: &EligiblePaintCells, mode: ZoningMode) -> Vec<AABB> {
     let cells = stamp.cells();
+    let density = stamp
+        .replacement()
+        .map_or(Density::Low, |zone| zone.density);
     let inset = if mode == ZoningMode::Overview {
         0.0
     } else {
@@ -931,11 +937,12 @@ mod zoning_tests {
         simulation::init::init();
         let mut sim = simulation::Simulation::new_authored_flat(1, 0).unwrap();
         *sim.write::<Map>() = map;
-        for (kind, expected) in [(Some(ZoneKind::Residential), 4), (None, 8)] {
+        for (kind, expected) in [(Some(ZoneKind::MixedUse), 4), (None, 8)] {
             let map = sim.map();
             let grid = sim.read::<ZoneGrid>();
-            let stamp = ZoneGrid::eligible_paint_stroke(&map, &[area], kind);
-            let vote = grid.lot_zone_after_prepared_paint(&area, &stamp, Density::Low);
+            let stamp =
+                ZoneGrid::eligible_paint_stroke(&map, &[area], kind, Density::Medium).unwrap();
+            let vote = grid.lot_zone_after_prepared_paint(&area, &stamp);
             super::super::MapRenderer::queue_zoning_overlay(
                 &map,
                 Arc::new((*grid).clone()),
@@ -947,7 +954,6 @@ mod zoning_tests {
                     pointer: None,
                     hover_radius: 32.0,
                     pitch: 16.0,
-                    density: Density::Low,
                     held: true,
                 },
             );
@@ -968,7 +974,7 @@ mod zoning_tests {
             sim.apply_commands([&simulation::world_command::WorldCommand::ZonePaint {
                 area,
                 kind,
-                density: Density::Low,
+                density: Density::Medium,
             }]);
             let grid = sim.read::<ZoneGrid>();
             assert_eq!(grid.lot_zone(&area), vote.1);
@@ -985,7 +991,13 @@ mod zoning_tests {
         ];
         let mut map = Map::default();
         assert!(map.install_environment(Environment::new(1, 1)));
-        let stamp = ZoneGrid::eligible_paint_stroke(&map, &paints, Some(ZoneKind::Residential));
+        let stamp = ZoneGrid::eligible_paint_stroke(
+            &map,
+            &paints,
+            Some(ZoneKind::Residential),
+            Density::Low,
+        )
+        .unwrap();
         super::super::MapRenderer::queue_zoning_overlay(
             &map,
             Arc::new(ZoneGrid::default()),
@@ -997,7 +1009,6 @@ mod zoning_tests {
                 pointer: None,
                 hover_radius: 32.0,
                 pitch: 16.0,
-                density: Density::Low,
                 held: true,
             },
         );
@@ -1008,7 +1019,8 @@ mod zoning_tests {
         assert!(covers(vec2(40.0, 40.0)));
         assert!(!covers(vec2(24.0, 40.0)));
         assert_eq!(
-            ZoneGrid::eligible_paint_stroke(&map, &[paints[0]; 2], None)
+            ZoneGrid::eligible_paint_stroke(&map, &[paints[0]; 2], None, Density::Low)
+                .unwrap()
                 .cells()
                 .len(),
             4
@@ -1076,16 +1088,9 @@ mod zoning_tests {
         let mut grid = ZoneGrid::default();
         grid.paint_on_map(&map, &lot.shape, Some(ZoneKind::Commercial), Density::High)
             .unwrap();
-        let stamp = ZoneGrid::eligible_paint_stroke(&map, &[lot.shape], None);
-        let (preview, _) = preview_lots(
-            &map,
-            &grid,
-            &stamp,
-            Density::High,
-            lot.shape.center(),
-            20.0,
-            false,
-        );
+        let stamp =
+            ZoneGrid::eligible_paint_stroke(&map, &[lot.shape], None, Density::High).unwrap();
+        let (preview, _) = preview_lots(&map, &grid, &stamp, lot.shape.center(), 20.0, false);
         assert!(preview.replaced.contains(&id));
         assert_eq!(preview.outlines.len(), 1);
         assert_eq!(preview.outlines[0].width, 0.3);

@@ -1,5 +1,5 @@
 use crate::economy::cargo::{deliver_load, LoadId};
-use crate::economy::{BasketFailure, Bought, Market, TripPurpose};
+use crate::economy::{BasketFailure, Bought, DailyEconomyMetrics, Market, TripPurpose};
 use crate::map::BuildingID;
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{
@@ -21,9 +21,8 @@ use crate::transportation::{
 };
 use crate::utils::rand_provider::RandProvider;
 use crate::utils::resources::Resources;
-use crate::world::{FreightStationEnt, HumanEnt, HumanID, VehicleEnt, VehicleID};
-use crate::World;
-use crate::{BuildingKind, Map, ParCommandBuffer, Simulation, SoulID};
+use crate::world::{CompanyID, FreightStationEnt, HumanEnt, HumanID, VehicleEnt, VehicleID};
+use crate::{BuildingKind, Map, ParCommandBuffer, Simulation, SoulID, World};
 use egui_inspect::Inspect;
 use geom::{Transform, Vec3};
 use lazy_static::lazy_static;
@@ -53,6 +52,11 @@ pub enum HumanDecisionKind {
     DeliverLoad {
         destination: BuildingID,
         load: LoadId,
+    },
+    GoHome(BuildingID),
+    GoWork {
+        workplace: BuildingID,
+        employer: Option<CompanyID>,
     },
 }
 
@@ -104,15 +108,32 @@ impl Default for HumanDecisionKind {
 }
 
 impl HumanDecisionKind {
-    pub(crate) fn references_building(&self, building: BuildingID) -> bool {
+    pub(crate) fn references_any_building(
+        &self,
+        includes: impl Fn(BuildingID) -> bool + Copy,
+    ) -> bool {
         match self {
             Self::GoTo(Destination::Building(id))
+            | Self::GoHome(id)
+            | Self::GoWork { workplace: id, .. }
             | Self::DeliverAtBuilding(id)
             | Self::DeliverLoad {
                 destination: id, ..
             }
-            | Self::VisitLeisure(id) => *id == building,
-            Self::MultiStack(steps) => steps.iter().any(|step| step.references_building(building)),
+            | Self::VisitLeisure(id) => includes(*id),
+            Self::MultiStack(steps) => steps
+                .iter()
+                .any(|step| step.references_any_building(includes)),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn references_employer(&self, employer: CompanyID) -> bool {
+        match self {
+            Self::GoWork {
+                employer: Some(id), ..
+            } => *id == employer,
+            Self::MultiStack(steps) => steps.iter().any(|step| step.references_employer(employer)),
             _ => false,
         }
     }
@@ -141,26 +162,30 @@ impl HumanDecisionKind {
         cbuf_freight: &ParCommandBuffer<FreightStationEnt>,
         cbuf: &ParCommandBuffer<HumanEnt>,
         driver: HumanID,
-        home: BuildingID,
         work: Option<&mut Work>,
     ) -> bool {
         match *self {
             HumanDecisionKind::GoTo(dest) => {
-                let purpose = trip_purpose(dest, home, work.as_deref(), router);
+                let purpose = trip_purpose(dest, work.as_deref(), router);
                 router.go_to_for(dest, purpose)
+            }
+            HumanDecisionKind::GoHome(home) => {
+                router.go_to_for(Destination::Building(home), TripPurpose::Home)
+            }
+            HumanDecisionKind::GoWork {
+                workplace,
+                employer,
+            } => {
+                if work.is_some_and(|work| work.workplace == workplace && work.employer == employer)
+                {
+                    router.go_to_work(workplace, employer)
+                } else {
+                    true
+                }
             }
             HumanDecisionKind::MultiStack(ref mut decisions) => {
                 if let Some(d) = decisions.last_mut() {
-                    if d.update(
-                        router,
-                        binfos,
-                        map,
-                        cbuf_freight,
-                        cbuf,
-                        driver,
-                        home,
-                        work,
-                    ) {
+                    if d.update(router, binfos, map, cbuf_freight, cbuf, driver, work) {
                         decisions.pop();
                     }
                     false
@@ -229,12 +254,7 @@ impl HumanDecision {
     }
 }
 
-fn trip_purpose(
-    dest: Destination,
-    home: BuildingID,
-    work: Option<&Work>,
-    router: &Router,
-) -> TripPurpose {
+fn trip_purpose(dest: Destination, work: Option<&Work>, router: &Router) -> TripPurpose {
     if router.walk_only_pickup {
         return TripPurpose::Shopping;
     }
@@ -251,15 +271,8 @@ fn trip_purpose(
                 };
             }
         }
-        if building == work.workplace {
-            return TripPurpose::Work;
-        }
     }
-    if building == home {
-        TripPurpose::Home
-    } else {
-        TripPurpose::Other
-    }
+    TripPurpose::Other
 }
 
 impl HumanEnt {
@@ -271,17 +284,43 @@ impl HumanEnt {
         }
     }
 
-    fn at_work(&self) -> bool {
-        self.work
-            .as_ref()
-            .is_some_and(|work| self.location == Location::Building(work.workplace))
+    pub(crate) fn attend_work_for(
+        &mut self,
+        time: &GameTime,
+        building: BuildingID,
+        infos: &BuildingInfos,
+    ) {
+        let Some(work) = self.work.as_mut().filter(|work| work.workplace == building) else {
+            return;
+        };
+        if work.employer.is_some() {
+            if let Some(SoulID::GoodsCompany(employer)) = infos.owner(building) {
+                work.record_attendance(time, employer);
+            }
+        } else {
+            self.attend_work(time, building);
+        }
     }
 
-    fn go_home(&mut self) -> HumanDecisionKind {
+    fn attended_work_here(&self, time: &GameTime, infos: &BuildingInfos) -> bool {
+        self.work.as_ref().is_some_and(|work| {
+            self.location == Location::Building(work.workplace)
+                && (work.employer.is_none()
+                    || work.attended_today(
+                        time,
+                        match infos.owner(work.workplace) {
+                            Some(SoulID::GoodsCompany(employer)) => Some(employer),
+                            _ => None,
+                        },
+                    ))
+        })
+    }
+
+    pub(crate) fn go_home(&self) -> HumanDecisionKind {
         if self.location == Location::Building(self.home.house) {
             HumanDecisionKind::Yield
         } else {
-            self.home.apply()
+            HumanDecisionKind::GoHome(self.home.house)
         }
     }
 
@@ -319,7 +358,12 @@ impl HumanEnt {
                 };
                 let arrived = self.location == Location::Building(basket.building);
                 let failure = if parks.infos.owner(basket.building) != Some(basket.seller)
-                    || map.get(basket.building).is_none()
+                    || map.get(basket.building).is_none_or(|store| {
+                        store.development().is_some_and(|site| {
+                            site.business != Some(crate::map::GrowableBusinessState::Open)
+                                || store.is_abandoned_growable()
+                        })
+                    })
                 {
                     Some(BasketFailure::SellerRemoved)
                 } else if now >= basket.expires {
@@ -327,10 +371,10 @@ impl HumanEnt {
                 } else if map
                     .get(basket.building)
                     .is_some_and(|store| store.is_orphaned())
-                    || self.router.last_error.is_some()
                     || (!arrived
-                        && (self.router.target_dest
-                            != Some(Destination::Building(basket.building))
+                        && (self.router.last_error.is_some()
+                            || self.router.target_dest
+                                != Some(Destination::Building(basket.building))
                             || self.it.is_wait_for_reroute().is_some()))
                 {
                     Some(BasketFailure::RouteInterrupted)
@@ -343,9 +387,23 @@ impl HumanEnt {
                     self.stop_route(resources);
                     true
                 } else if arrived {
+                    let local = self.home.house == basket.building
+                        && parks.infos.residence_of(SoulID::Human(basket.shopper))
+                            == Some(basket.building)
+                        && map
+                            .get(basket.building)
+                            .is_some_and(|building| building.is_mixed_use());
                     self.household.collect(id, now, resources);
                     self.router.walk_only_pickup = false;
                     self.stop_route(resources);
+                    if local && !self.household.carried.is_empty() {
+                        self.household.deposit(now, resources);
+                        resources
+                            .write::<DailyEconomyMetrics>()
+                            .record_local_pickup(now);
+                        self.decision.kind = HumanDecisionKind::Yield;
+                        return true;
+                    }
                     self.decision.kind = HumanDecisionKind::DepositAtHome;
                     false
                 } else {
@@ -524,7 +582,6 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
             freight,
             cbuf,
             id,
-            h.home.house,
             h.work.as_mut(),
         ) {
             continue;
@@ -540,7 +597,8 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
 
         let home_score = h.home.score(h.household.needs.rest);
         h.home.last_score = home_score;
-        let after_work = h.at_work()
+        let at_work = h.attended_work_here(time, infos);
+        let after_work = at_work
             && h.work
                 .as_ref()
                 .is_some_and(|work| !work.work_inter.is_active(&time.daytime));
@@ -559,7 +617,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
         // times so all workers at a site do not request the same shelves.
         let shopping_break = shopping > 0.0
             && food > 0.0
-            && h.at_work()
+            && at_work
             && h.work.as_ref().is_some_and(|work| {
                 matches!(work.kind, WorkKind::Worker)
                     && work.shift_ending(time, 10 + (common::hash_u64(id) % 20) as i32)
@@ -580,7 +638,14 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
         }
 
         if let Some(work) = h.work.as_mut() {
-            let score = work.shift_score(time, &h.location, h.household.attended_shift);
+            let attended = match (work.employer, infos.owner(work.workplace)) {
+                (None, _) => h.household.attended_shift,
+                (Some(_), Some(SoulID::GoodsCompany(employer))) => work
+                    .attended_today(time, Some(employer))
+                    .then_some((work.workplace, time.daytime.day)),
+                _ => None,
+            };
+            let score = work.shift_score(time, &h.location, attended);
             work.last_score = score;
             if score > home_score {
                 h.decision.kind = if h.location == Location::Building(work.workplace) {
@@ -599,7 +664,7 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
                     work.apply(&h.location, &h.router)
                 };
                 if let Location::Building(building) = h.location {
-                    h.attend_work(time, building);
+                    h.attend_work_for(time, building, infos);
                 }
                 continue;
             }
@@ -685,35 +750,59 @@ fn start_basket(
     let travel_budget = BASKET_TRAVEL_LIMIT - 60 * TICKS_PER_REALTIME_SECOND;
     let walk_radius =
         h.pedestrian.walking_speed * travel_budget as f32 / TICKS_PER_REALTIME_SECOND as f32;
-    let radius = if h.at_work() {
+    let radius = if h.attended_work_here(&resources.read::<GameTime>(), parks.infos) {
         walk_radius.min(AFTER_WORK_RADIUS)
     } else {
         walk_radius
     };
     let mut component = None;
     let map = parks.map;
-    let basket = resources.write::<Market>().reserve_basket(
-        shopper,
-        origin.xy(),
-        radius,
-        request,
-        now,
-        |seller| {
-            let store = map.get(parks.infos.building_owned_by(seller)?)?;
-            if store.is_orphaned() {
+    let preferred = map
+        .get(h.home.house)
+        .filter(|home| {
+            home.is_mixed_use()
+                && !home.is_abandoned_growable()
+                && home.development().is_some_and(|site| {
+                    site.business == Some(crate::map::GrowableBusinessState::Open)
+                })
+                && parks.infos.residence_of(SoulID::Human(shopper)) == Some(home.id)
+        })
+        .and_then(|home| parks.infos.owner(home.id));
+    let mut market = resources.write::<Market>();
+    let reachable = |seller| {
+        let store = map.get(parks.infos.building_owned_by(seller)?)?;
+        if store.is_orphaned()
+            || store.development().is_some_and(|site| {
+                site.business != Some(crate::map::GrowableBusinessState::Open)
+                    || store.is_abandoned_growable()
+            })
+        {
+            return None;
+        }
+        if h.location != Location::Building(store.id) {
+            let start = *component.get_or_insert_with(|| walking.component_at(map, origin));
+            if !start.is_some_and(|start| walking.reaches_building(map, start, store))
+                || !parks.walk_fits(origin, store, h.pedestrian.walking_speed, travel_budget)
+            {
                 return None;
             }
-            if h.location != Location::Building(store.id) {
-                let start = *component.get_or_insert_with(|| walking.component_at(map, origin));
-                if !start.is_some_and(|start| walking.reaches_building(map, start, store))
-                    || !parks.walk_fits(origin, store, h.pedestrian.walking_speed, travel_budget)
-                {
-                    return None;
-                }
-            }
-            Some(store.id)
-        },
-    );
+        }
+        Some(store.id)
+    };
+    let basket = if preferred.is_some() {
+        market.reserve_basket_preferred(
+            shopper,
+            origin.xy(),
+            radius,
+            request,
+            now,
+            preferred,
+            reachable,
+        )
+    } else {
+        market.reserve_basket(shopper, origin.xy(), radius, request, now, reachable)
+    };
+    drop(market);
     let (basket, missing) = match basket {
         Ok(selection) => selection,
         Err(reason) => {
@@ -730,7 +819,9 @@ fn start_basket(
         return false;
     }
     h.household.note_shelf_shortfall(now, missing);
-    h.start_walk(store, TripPurpose::Shopping, resources);
+    if h.location != Location::Building(store) {
+        h.start_walk(store, TripPurpose::Shopping, resources);
+    }
     h.decision.kind = HumanDecisionKind::PickupBasket(id);
     // A resident may already be inside the selected store.
     h.update_household_action(shopper, now, parks, vehicles, walking, resources);

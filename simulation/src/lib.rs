@@ -1259,6 +1259,8 @@ impl SimulationDeser {
             }
         }
 
+        crate::souls::lifecycle::restore_company_departures(&mut sim);
+
         log::info!(
             "took {}s to deserialize in total",
             t.elapsed().as_secs_f32()

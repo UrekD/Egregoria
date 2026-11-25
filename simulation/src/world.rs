@@ -1,14 +1,20 @@
 use crate::economy::{Bought, Sold, Workers};
+use crate::map::{
+    BuildingID, BuildingKind, GrowableBusinessState, GrowableLotError, GrowableSiteState, LotID,
+    Map, PreparedGrowable, PreparedGrowableAppearance, ZoneCell,
+};
 use crate::map_dynamic::{
-    DispatchID, Dispatcher, Itinerary, ItineraryFollower, ItineraryLeader, ParkingManagement,
-    Router,
+    BuildingInfos, DispatchID, Dispatcher, Itinerary, ItineraryFollower, ItineraryLeader,
+    ParkingManagement, Router,
 };
 use crate::souls::desire::{BuyFood, BuyGoods, Home, Work};
 use crate::souls::freight_station::FreightStation;
 use crate::souls::goods_company::GoodsCompanyState;
+use crate::souls::growth::{self, GrowableSite};
 use crate::souls::household::HouseholdStock;
 use crate::souls::human::{HumanDecision, PersonalInfo};
 use crate::souls::lifecycle;
+use crate::souls::residence::{Residence, Residences};
 use crate::transportation::road_throughput::RoadUserKind;
 use crate::transportation::train::{Locomotive, LocomotiveReservation, RailWagon};
 use crate::transportation::{
@@ -19,6 +25,7 @@ use crate::{impl_entity, impl_trans, Simulation};
 use common::iter::chain;
 use derive_more::{From, TryInto};
 use geom::{Transform, Vec2, Vec3};
+use prototypes::{GoodsCompanyID, MAX_PROFILED_SLOTS};
 use serde::Deserialize;
 use slotmapd::__impl::Serialize;
 use slotmapd::{new_key_type, HopSlotMap};
@@ -185,6 +192,8 @@ pub struct World {
     pub wagons: HopSlotMap<WagonID, WagonEnt>,
     pub freight_stations: HopSlotMap<FreightStationID, FreightStationEnt>,
     pub companies: HopSlotMap<CompanyID, CompanyEnt>,
+    #[serde(default)]
+    pub(crate) company_departures: lifecycle::CompanyDepartures,
     #[serde(skip)]
     pub(crate) parking_validation: crate::transportation::road::ParkingValidation,
     #[serde(skip)]
@@ -314,6 +323,172 @@ impl World {
                 self.companies.keys().map(AnyEntity::CompanyID),
             )),
         ))
+    }
+}
+
+pub(crate) struct GrowablePlan {
+    placement: PreparedGrowable,
+    home: Option<Residence>,
+    job_slots: u32,
+}
+
+impl GrowablePlan {
+    pub(crate) fn prepare(
+        map: &Map,
+        site: GrowableSite,
+        appearance: Option<PreparedGrowableAppearance>,
+        home: Option<Residence>,
+        job_slots: u32,
+    ) -> Result<Self, GrowableLotError> {
+        let lot = map.get(site.lot).ok_or(GrowableLotError::MissingLot)?;
+        if lot.parent != site.frontage || lot.shape.corners != site.shape.corners {
+            return Err(GrowableLotError::MissingRoad);
+        }
+        if let Some(appearance) = &appearance {
+            let development = &appearance.development;
+            if development.zone != site.zone
+                || development.level != 1
+                || development.floors == 0
+                || development.site != GrowableSiteState::Active
+                || development.business
+                    != site.company.map(|_| GrowableBusinessState::AwaitingSpawn)
+                || development.planned_jobs != job_slots
+                || development.home != home.as_ref().map(|home| home.prototype)
+                || home.as_ref().map(|home| home.prototype) != site.home.map(|proto| proto.id)
+                || home
+                    .as_ref()
+                    .is_some_and(|home| !(1..=MAX_PROFILED_SLOTS).contains(&home.capacity))
+                || (site.company.is_some() && !(1..=MAX_PROFILED_SLOTS).contains(&job_slots))
+            {
+                return Err(GrowableLotError::MissingPrototype);
+            }
+        }
+
+        let placement = map.prepare_checked_growable(lot, site.kind, site.generator, appearance)?;
+        Ok(Self {
+            placement,
+            home,
+            job_slots,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlacedGrowable {
+    pub building: BuildingID,
+    pub housing_slots: u32,
+    pub job_slots: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct GrowableSummary {
+    pub zone: ZoneCell,
+    pub level: u8,
+    pub floors: u8,
+    pub roof_z: f32,
+    pub height_above_base: f32,
+    pub housing_slots: u32,
+    pub occupants: usize,
+    pub planned_jobs: u32,
+    pub active_job_slots: u32,
+    pub filled_jobs: usize,
+    pub site: GrowableSiteState,
+    pub business: Option<GrowableBusinessState>,
+}
+
+impl Simulation {
+    /// Place a checked growable without spending automatic growth credits.
+    pub fn place_zoned_growable(
+        &mut self,
+        lot: LotID,
+        zone: ZoneCell,
+    ) -> Result<PlacedGrowable, GrowableLotError> {
+        let plan = growth::plan_growable(self, lot, zone)?;
+        self.commit_prepared_growable(plan)
+    }
+
+    pub(crate) fn commit_prepared_growable(
+        &mut self,
+        plan: GrowablePlan,
+    ) -> Result<PlacedGrowable, GrowableLotError> {
+        let GrowablePlan {
+            placement,
+            home,
+            job_slots,
+        } = plan;
+        let building = self.map_mut().commit_prepared_growable(placement)?;
+        self.write::<BuildingInfos>().insert(building);
+        let housing_slots = home.as_ref().map_or(0, |home| home.capacity);
+        if let Some(home) = home {
+            self.write::<Residences>().insert(building, home);
+        }
+        Ok(PlacedGrowable {
+            building,
+            housing_slots,
+            job_slots,
+        })
+    }
+
+    /// Committed development and live role counts for a profiled parcel.
+    pub fn growable_summary(&self, id: BuildingID) -> Option<GrowableSummary> {
+        let map = self.map();
+        let building = map.get(id)?;
+        let development = building.development()?;
+        let infos = self.read::<BuildingInfos>();
+        let residences = self.read::<Residences>();
+        let business = crate::map_dynamic::active_business(building, &infos, self.world());
+        Some(GrowableSummary {
+            zone: development.zone,
+            level: development.level,
+            floors: development.floors,
+            roof_z: development.roof_z,
+            height_above_base: development.roof_z - building.height,
+            housing_slots: residences
+                .by_building
+                .get(&id)
+                .map_or(0, |home| home.capacity),
+            occupants: infos.get(id).map_or(0, |info| info.residents.len()),
+            planned_jobs: development.planned_jobs,
+            active_job_slots: business.map_or(0, |business| business.slots),
+            filled_jobs: business.map_or(0, |business| business.filled),
+            site: development.site,
+            business: development.business,
+        })
+    }
+
+    pub(crate) fn profiled_business_can_spawn(
+        &self,
+        id: BuildingID,
+        proto: GoodsCompanyID,
+    ) -> bool {
+        let map = self.map();
+        let Some(building) = map.get(id).filter(|building| {
+            building.development().is_some()
+                && !building.is_orphaned()
+                && building.kind == BuildingKind::GoodsCompany(proto)
+                && map.lot_origin(id).is_some()
+        }) else {
+            return false;
+        };
+        let site = building.development().expect("profiled development");
+        if BuildingKind::GoodsCompany(proto).is_mixed_growable() != building.is_mixed_use() {
+            return false;
+        }
+        site.site == GrowableSiteState::Active
+            && (!building.is_mixed_use() || site.home.is_some())
+            && site.business.is_some_and(|business| {
+                business.can_open(crate::map_dynamic::transit::elapsed_ticks(&self.resources).0)
+            })
+            && self
+                .read::<BuildingInfos>()
+                .get(id)
+                .is_some_and(|info| info.owner.is_none())
+            && site.home.is_none_or(|proto| {
+                self.read::<Residences>()
+                    .by_building
+                    .get(&id)
+                    .is_some_and(|home| home.prototype == proto && home.capacity > 0)
+            })
     }
 }
 

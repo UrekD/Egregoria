@@ -1,10 +1,14 @@
 use crate::map::procgen::{gen_exterior_farm, gen_exterior_house, ColoredMesh};
 use crate::map::{
-    Buildings, ElectricityCache, Environment, LanePattern, RoadID, Roads, SpatialMap,
+    Buildings, ElectricityCache, Environment, LanePattern, RoadID, Roads, SpatialMap, ZoneCell,
+    ZoneKind,
 };
 use egui_inspect::debug_inspect_impl;
 use geom::{Color, Polygon, Shape, Vec2, Vec3, AABB, OBB};
-use prototypes::{BuildingGen, FreightStationPrototypeID, GoodsCompanyID};
+use prototypes::{
+    BuildingGen, FreightStationPrototypeID, GoodsCompanyID, GrowableCompanyID, GrowableZoneKind,
+    ResidencePrototypeID, MAX_PROFILED_SLOTS,
+};
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
 
@@ -29,6 +33,23 @@ impl BuildingKind {
             BuildingKind::GoodsCompany(id) => Some(*id),
             _ => None,
         }
+    }
+
+    pub(crate) fn is_mixed_growable(self) -> bool {
+        self.as_goods_company().is_some_and(|company| {
+            prototypes::try_prototypes().is_some()
+                && prototypes::try_prototype(GrowableCompanyID::from(company)).is_some_and(
+                    |growable| growable.chain_key().zone_kind == GrowableZoneKind::MixedUse,
+                )
+        })
+    }
+
+    fn allows_raw_placement(self) -> bool {
+        self.as_goods_company().is_none_or(|company| {
+            prototypes::try_prototypes().is_some()
+                && prototypes::try_prototype(company).is_some()
+                && !self.is_mixed_growable()
+        })
     }
 
     pub fn is_cached_in_bkinds(&self) -> bool {
@@ -115,6 +136,108 @@ impl Zone {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GrowableSiteState {
+    Active,
+    Abandoned { since_elapsed_tick: u64 },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub enum GrowableBusinessState {
+    AwaitingSpawn,
+    Open,
+    ClosedUntil { retry_elapsed_tick: u64 },
+}
+
+impl GrowableBusinessState {
+    pub fn can_open(self, elapsed_tick: u64) -> bool {
+        match self {
+            Self::AwaitingSpawn => true,
+            Self::Open => false,
+            Self::ClosedUntil { retry_elapsed_tick } => elapsed_tick >= retry_elapsed_tick,
+        }
+    }
+}
+
+/// Latched development and role state of a checked, profiled parcel.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct GrowableDevelopment {
+    pub zone: ZoneCell,
+    pub level: u8,
+    pub floors: u8,
+    pub roof_z: f32,
+    pub approved_value_band: u8,
+    pub home: Option<ResidencePrototypeID>,
+    pub planned_jobs: u32,
+    pub site: GrowableSiteState,
+    pub business: Option<GrowableBusinessState>,
+}
+
+impl GrowableDevelopment {
+    fn valid_job_slots(&self) -> bool {
+        match (self.zone.kind, self.business) {
+            (ZoneKind::Residential, None) => self.planned_jobs == 0,
+            (ZoneKind::MixedUse, Some(_)) => self.planned_jobs == 12,
+            (ZoneKind::Commercial | ZoneKind::Industrial | ZoneKind::Office, Some(_)) => {
+                (1..=MAX_PROFILED_SLOTS).contains(&self.planned_jobs)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// World-space appearance prepared by parcel fit before map insertion.
+pub(crate) struct PreparedGrowableAppearance {
+    pub development: GrowableDevelopment,
+    pub base_z: f32,
+    pub door: Vec3,
+    pub mesh: ColoredMesh,
+}
+
+impl PreparedGrowableAppearance {
+    pub(in crate::map) fn is_valid(&self, parcel: &OBB) -> bool {
+        self.development.valid_job_slots()
+            && self.base_z.is_finite()
+            && self.development.roof_z.is_finite()
+            && self.development.roof_z > self.base_z
+            && self.door.is_finite()
+            && parcel.contains(self.door.xy())
+            && self
+                .mesh
+                .faces
+                .iter()
+                .flat_map(|(vertices, _)| vertices)
+                .all(|v| v.is_finite())
+    }
+}
+
+/// A checked building without a building ID or external indexes.
+pub(in crate::map) struct PreparedBuilding(Building);
+
+impl PreparedBuilding {
+    pub(in crate::map) fn insert(
+        self,
+        buildings: &mut Buildings,
+        spatial_map: &mut SpatialMap,
+        electricity: &mut ElectricityCache,
+        roads: &mut Roads,
+    ) -> BuildingID {
+        let mut building = self.0;
+        let id = buildings.insert_with_key(|id| {
+            building.id = id;
+            building
+        });
+        electricity.add_object(id);
+        let building = &buildings[id];
+        if let Some(road) = building.connected_road {
+            electricity.add_edge(id, road);
+            roads[road].connected_buildings.push(id);
+        }
+        spatial_map.insert(building);
+        id
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Building {
     pub id: BuildingID,
@@ -125,9 +248,30 @@ pub struct Building {
     pub height: f32,
     pub zone: Option<Zone>,
     pub connected_road: Option<RoadID>,
+    #[serde(default)]
+    pub(in crate::map) development: Option<GrowableDevelopment>,
 }
 
 impl Building {
+    pub fn development(&self) -> Option<&GrowableDevelopment> {
+        self.development.as_ref()
+    }
+
+    pub fn has_residential_use(&self) -> bool {
+        self.kind == BuildingKind::House
+            || self.development().is_some_and(|site| site.home.is_some())
+    }
+
+    pub fn is_mixed_use(&self) -> bool {
+        self.development()
+            .is_some_and(|site| site.zone.kind == ZoneKind::MixedUse)
+    }
+
+    pub fn is_abandoned_growable(&self) -> bool {
+        self.development()
+            .is_some_and(|site| matches!(site.site, GrowableSiteState::Abandoned { .. }))
+    }
+
     pub fn is_orphaned(&self) -> bool {
         self.connected_road.is_none()
     }
@@ -215,8 +359,8 @@ impl Building {
         zone: Option<Zone>,
         connected_road: Option<RoadID>,
     ) -> Option<BuildingID> {
-        if !Self::valid_footprint(&obb, gen)
-            || connected_road.is_some_and(|road| !roads.contains_key(road))
+        if connected_road.is_some_and(|road| !roads.contains_key(road))
+            || !Self::valid_footprint(&obb, gen)
             || zone
                 .as_ref()
                 .is_some_and(|zone| zone.validated_area().is_none())
@@ -224,9 +368,55 @@ impl Building {
         {
             return None;
         }
+        let prepared = Self::prepare(env, obb, kind, gen, zone, connected_road, None)?;
+        Some(prepared.insert(buildings, spatial_map, electricity, roads))
+    }
 
-        let at = Self::origin(&obb, env);
-        let (mut mesh, axis, door_pos) = Self::geometry(&obb, gen, at);
+    /// Build geometry for an already checked footprint.
+    pub(in crate::map) fn prepare(
+        env: &Environment,
+        obb: OBB,
+        kind: BuildingKind,
+        gen: BuildingGen,
+        zone: Option<Zone>,
+        connected_road: Option<RoadID>,
+        appearance: Option<PreparedGrowableAppearance>,
+    ) -> Option<PreparedBuilding> {
+        let (mesh, door_pos, height, development) = match appearance {
+            Some(appearance) if appearance.is_valid(&obb) => (
+                appearance.mesh,
+                appearance.door,
+                appearance.base_z,
+                Some(appearance.development),
+            ),
+            Some(_) => return None,
+            None if !kind.allows_raw_placement() => return None,
+            None => {
+                let (mesh, door, height) = Self::legacy_appearance(&obb, gen, env);
+                (mesh, door, height, None)
+            }
+        };
+
+        Some(PreparedBuilding(Self {
+            id: BuildingID::default(),
+            mesh,
+            kind,
+            door_pos,
+            obb,
+            height,
+            zone,
+            connected_road,
+            development,
+        }))
+    }
+
+    fn legacy_appearance(
+        obb: &OBB,
+        gen: BuildingGen,
+        env: &Environment,
+    ) -> (ColoredMesh, Vec3, f32) {
+        let at = Self::origin(obb, env);
+        let (mut mesh, axis, door_pos) = Self::geometry(obb, gen, at);
 
         for (poly, _) in &mut mesh.faces {
             for v in poly {
@@ -248,29 +438,7 @@ impl Building {
             mesh.faces.push((walkway, Color::gray(0.4).into()));
         }
 
-        let b = buildings.insert_with_key(move |id| {
-            electricity.add_object(id);
-            if let Some(r) = connected_road {
-                electricity.add_edge(id, r);
-
-                roads[r].connected_buildings.push(id);
-            }
-
-            Self {
-                id,
-                mesh,
-                kind,
-                door_pos,
-                obb,
-                height: at.z,
-                zone,
-                connected_road,
-            }
-        });
-
-        spatial_map.insert(&buildings[b]);
-
-        Some(b)
+        (mesh, door_pos, at.z)
     }
 }
 

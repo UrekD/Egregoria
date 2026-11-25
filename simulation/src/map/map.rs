@@ -3,12 +3,12 @@ use crate::map::electricity_cache::ElectricityCache;
 use crate::map::procgen::gen_exterior_house;
 use crate::map::reachability::DrivingReachability;
 use crate::map::{
-    Building, BuildingID, BuildingKind, Environment, Intersection,
-    IntersectionID, Lane, LaneID, LaneKind, LanePattern, Lot, LotID, LotKind, LotLayout,
-    MapSubscriber, MapSubscribers, ParkingSpotID, ParkingSpots, ProjectFilter,
-    ProjectKind, Road, RoadID, RoadSegmentKind, SpatialMap, SpatialMapObject, TerraformKind,
-    TerrainChunkID, UpdateType, WaterEditError,
-    WaterFootprint, WaterTileCoord, Zone, ROAD_Z_OFFSET,
+    Building, BuildingID, BuildingKind, Environment, GrowableBusinessState, GrowableLotError,
+    GrowableSiteState, Intersection, IntersectionID, Lane, LaneID, LaneKind, LanePattern, Lot,
+    LotID, LotKind, LotLayout, MapSubscriber, MapSubscribers, ParkingSpotID, ParkingSpots,
+    PreparedBuilding, PreparedGrowableAppearance, ProjectFilter, ProjectKind, Road, RoadID,
+    RoadSegmentKind, SpatialMap, SpatialMapObject, TerraformKind, TerrainChunkID, UpdateType,
+    WaterEditError, WaterFootprint, WaterTileCoord, Zone, ROAD_Z_OFFSET,
 };
 use geom::OBB;
 use geom::{pack_height, BaseNode, PolyLine3, Shape, Vec2, Vec3, AABB, NO_OVERRIDE};
@@ -63,6 +63,18 @@ pub(crate) struct ConnectedRoad {
     pub splits: [Option<RoadSplit>; 2],
 }
 
+/// Map-side placement validated against a specific live lot and frontage.
+pub(crate) struct PreparedGrowable {
+    lot: LotID,
+    frontage: RoadID,
+    shape: OBB,
+    generator: BuildingGen,
+    attachment: Vec3,
+    map_identity: u64,
+    grade_revision: (u64, u64, u64),
+    building: PreparedBuilding,
+}
+
 pub struct Map {
     pub(crate) roads: Roads,
     pub(crate) lanes: Lanes,
@@ -90,6 +102,7 @@ pub struct Map {
     pub parking: ParkingSpots,
     pub subscribers: MapSubscribers,
     pub(crate) pending_construction_cuts: BTreeSet<TerrainChunkID>,
+    pub(super) construction_cut_revision: u64,
     pub(super) water_services: super::WaterServiceCache,
 }
 
@@ -166,6 +179,7 @@ impl Map {
             no_frontage: BTreeSet::new(),
             electricity: Default::default(),
             pending_construction_cuts: BTreeSet::new(),
+            construction_cut_revision: 0,
             water_services: super::WaterServiceCache::default(),
             subscribers: MapSubscribers::default(),
         }
@@ -209,6 +223,9 @@ impl Map {
     /// Perform cleanups potentially required every frame
     pub fn update(&mut self) {
         profiling::scope!("map::update");
+        if !self.pending_construction_cuts.is_empty() {
+            self.construction_cut_revision += 1;
+        }
         for chunk in std::mem::take(&mut self.pending_construction_cuts) {
             let mut work = None;
             let heights = self
@@ -376,9 +393,7 @@ impl Map {
         self.spatial_map.remove(b.id);
 
         if let Some(origin) = self.lot_origins.remove(&b.id) {
-            if Building::dry_footprint(&self.environment, &origin.shape, None) {
-                Lot::try_restore(self, origin);
-            }
+            Lot::try_restore(self, origin);
         }
         self.check_invariants();
 
@@ -1013,9 +1028,7 @@ impl Map {
     }
 
     pub fn place_growable(&mut self, lot_id: LotID, kind: BuildingKind) -> Option<BuildingID> {
-        let lot = self.lots.get(lot_id)?;
-        if !self.roads.contains_key(lot.parent) || Lot::footprint_obstructed(self, lot.shape, false)
-        {
+        if kind.is_mixed_growable() {
             return None;
         }
         let gen = match kind {
@@ -1029,11 +1042,162 @@ impl Map {
             }
             _ => return None,
         };
-        let shape = lot.shape;
-        let id = self.build_on_lot(lot_id, kind, gen, true)?;
+        let lot = self.get(lot_id)?;
+        lot.check_growable_footprint(self, gen).ok()?;
+        let prepared = self.prepare_checked_growable(lot, kind, gen, None).ok()?;
+        self.commit_prepared_growable(prepared).ok()
+    }
+
+    fn construction_grade_revision(&self) -> (u64, u64, u64) {
+        (
+            self.environment.base_revision,
+            self.environment.water_revision(),
+            self.construction_cut_revision,
+        )
+    }
+
+    fn growable_attachment(&self, lot: &Lot) -> Result<Vec3, GrowableLotError> {
+        let road = self.get(lot.parent).ok_or(GrowableLotError::MissingRoad)?;
+        let front = (lot.shape.corners[0] + lot.shape.corners[1]) * 0.5;
+        Ok(road.points.project_2d(front))
+    }
+
+    /// The caller supplies a checked footprint. Commit validates live fit again.
+    pub(crate) fn prepare_checked_growable(
+        &self,
+        lot: &Lot,
+        kind: BuildingKind,
+        generator: BuildingGen,
+        appearance: Option<PreparedGrowableAppearance>,
+    ) -> Result<PreparedGrowable, GrowableLotError> {
+        let attachment = self.growable_attachment(lot)?;
+        let building = Building::prepare(
+            &self.environment,
+            lot.shape,
+            kind,
+            generator,
+            None,
+            Some(lot.parent),
+            appearance,
+        )
+        .ok_or(GrowableLotError::InfeasibleGrade)?;
+        Ok(PreparedGrowable {
+            lot: lot.id,
+            frontage: lot.parent,
+            shape: lot.shape,
+            generator,
+            attachment,
+            map_identity: self.identity(),
+            grade_revision: self.construction_grade_revision(),
+            building,
+        })
+    }
+
+    pub(crate) fn commit_prepared_growable(
+        &mut self,
+        prepared: PreparedGrowable,
+    ) -> Result<BuildingID, GrowableLotError> {
+        let lot = self.get(prepared.lot).ok_or(GrowableLotError::MissingLot)?;
+        if self.identity() != prepared.map_identity
+            || lot.parent != prepared.frontage
+            || lot.shape.corners != prepared.shape.corners
+            || self.growable_attachment(lot)? != prepared.attachment
+        {
+            return Err(GrowableLotError::MissingRoad);
+        }
+        lot.check_growable_footprint(self, prepared.generator)?;
+        if self.construction_grade_revision() != prepared.grade_revision {
+            return Err(GrowableLotError::InfeasibleGrade);
+        }
+
+        let id = prepared.building.insert(
+            &mut self.buildings,
+            &mut self.spatial_map,
+            &mut self.electricity,
+            &mut self.roads,
+        );
+        self.consume_building_lot(prepared.lot, id, true);
         // Older maps can contain overlapping lots. Consume those replaced by this footprint.
-        self.clean_lots_inner(self.spatial_map.query(shape, ProjectFilter::LOT).collect());
-        Some(id)
+        self.clean_lots_inner(
+            self.spatial_map
+                .query(prepared.shape, ProjectFilter::LOT)
+                .collect(),
+        );
+        Ok(id)
+    }
+
+    /// Apply checked appearance and level changes without moving either role or the frontage.
+    /// The simulation's upgrade commit owns the corresponding capacity and job changes.
+    pub(crate) fn update_growable_appearance(
+        &mut self,
+        id: BuildingID,
+        appearance: PreparedGrowableAppearance,
+    ) -> bool {
+        let Some(building) = self.buildings.get_mut(id) else {
+            return false;
+        };
+        let Some(previous) = building.development.as_ref() else {
+            return false;
+        };
+        let next = &appearance.development;
+        if appearance.base_z != building.height
+            || appearance.door != building.door_pos
+            || !appearance.is_valid(&building.obb)
+            || next.zone != previous.zone
+            || next.site != previous.site
+            || next.business != previous.business
+            || next.home.is_some() != previous.home.is_some()
+            || next.level != previous.level.saturating_add(1)
+            || next.level > 5
+            || next.floors < previous.floors
+            || next.roof_z < previous.roof_z
+            || next.planned_jobs < previous.planned_jobs
+            || next.approved_value_band < previous.approved_value_band
+        {
+            return false;
+        }
+        building.mesh = appearance.mesh;
+        building.development = Some(appearance.development);
+        self.subscribers.dispatch(UpdateType::Building, building);
+        true
+    }
+
+    pub(crate) fn set_growable_business_state(
+        &mut self,
+        id: BuildingID,
+        state: GrowableBusinessState,
+    ) {
+        let Some(building) = self.buildings.get_mut(id) else {
+            return;
+        };
+        if let Some(business) = building
+            .development
+            .as_mut()
+            .and_then(|site| site.business.as_mut())
+        {
+            if *business != state {
+                *business = state;
+                self.subscribers.dispatch(UpdateType::Building, building);
+            }
+        }
+    }
+
+    pub(crate) fn mark_growable_abandoned(&mut self, id: BuildingID, elapsed_tick: u64) -> bool {
+        let Some(building) = self.buildings.get_mut(id) else {
+            return false;
+        };
+        let Some(site) = building
+            .development
+            .as_mut()
+            .filter(|site| site.site == GrowableSiteState::Active)
+        else {
+            return false;
+        };
+        site.site = GrowableSiteState::Abandoned {
+            since_elapsed_tick: elapsed_tick,
+        };
+        self.subscribers.dispatch(UpdateType::Building, building);
+        true
     }
 
     /// Returns the lot origin of a growable. Player builds record an origin for demolition too.
@@ -1097,6 +1261,11 @@ impl Map {
             Some(lot.parent),
         )?;
 
+        self.consume_building_lot(lot_id, id, growable);
+        Some(id)
+    }
+
+    fn consume_building_lot(&mut self, lot_id: LotID, id: BuildingID, growable: bool) {
         let lot = self.lots.remove(lot_id).expect("building lot still exists");
         self.subscribers.dispatch(UpdateType::Road, &lot);
         self.spatial_map.remove(lot_id);
@@ -1118,7 +1287,6 @@ impl Map {
             },
         );
         self.check_invariants();
-        Some(id)
     }
 
     pub fn remove_road(&mut self, road_id: RoadID) -> Option<Road> {

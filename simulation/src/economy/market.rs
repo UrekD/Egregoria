@@ -1278,6 +1278,19 @@ impl Market {
         radius: f32,
         request: BasketRequest,
         now: u64,
+        reachable: impl FnMut(SoulID) -> Option<BuildingID>,
+    ) -> Result<(BasketReservation, [u32; 2]), BasketFailure> {
+        self.reserve_basket_preferred(shopper, origin, radius, request, now, None, reachable)
+    }
+
+    pub(crate) fn reserve_basket_preferred(
+        &mut self,
+        shopper: HumanID,
+        origin: Vec2,
+        radius: f32,
+        request: BasketRequest,
+        now: u64,
+        preferred: Option<SoulID>,
         mut reachable: impl FnMut(SoulID) -> Option<BuildingID>,
     ) -> Result<(BasketReservation, [u32; 2]), BasketFailure> {
         struct Candidate {
@@ -1380,6 +1393,7 @@ impl Market {
                 candidate.throttled,
                 Reverse(candidate.food),
                 Reverse(candidate.food + candidate.goods),
+                preferred != Some(candidate.seller),
                 candidate.distance,
                 candidate.seller,
             )

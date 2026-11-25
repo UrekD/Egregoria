@@ -10,7 +10,9 @@ use crate::economy::{
     cargo::{uses_road_freight, CargoBook},
     find_trade_place, record_coal_stockout, Market,
 };
-use crate::map::{Building, BuildingID, Map, Zone, MAX_ZONE_AREA};
+use crate::map::{
+    Building, BuildingID, BuildingKind, GrowableBusinessState, Map, Zone, MAX_ZONE_AREA,
+};
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{BuildingInfos, ElectricityFlow};
 use crate::souls::desire::WorkKind;
@@ -162,10 +164,15 @@ pub fn company_soul(
     build_id: BuildingID,
     proto: GoodsCompanyID,
 ) -> Option<SoulID> {
-    let proto = proto.prototype();
-
     let map = sim.map();
     let b = map.buildings().get(build_id)?;
+    let planned = b.development().map(|site| site.planned_jobs);
+    if (planned.is_some() || BuildingKind::GoodsCompany(proto).is_mixed_growable())
+        && !sim.profiled_business_can_spawn(build_id, proto)
+    {
+        return None;
+    }
+    let proto = prototypes::try_prototype(proto)?;
     let door_pos = b.door_pos;
     let obb = b.obb;
     let height = b.height;
@@ -191,7 +198,7 @@ pub fn company_soul(
     let comp = GoodsCompanyState {
         proto: proto.id,
         building: build_id,
-        max_workers: proto.n_workers,
+        max_workers: planned.unwrap_or(proto.n_workers),
         progress: 0.0,
         driver: None,
         trucks,
@@ -224,6 +231,10 @@ pub fn company_soul(
     sim.write::<BuildingInfos>()
         .set_owner(company.building, soul);
 
+    if planned.is_some() {
+        sim.map_mut()
+            .set_growable_business_state(build_id, GrowableBusinessState::Open);
+    }
     Some(soul)
 }
 
@@ -353,7 +364,11 @@ pub fn company_system(world: &mut World, res: &mut Resources) {
             };
             if human.work.is_none() {
                 let offset = common::rand::randu(common::hash_u64(worker) as u32);
-                human.work = Some(Work::new(c.comp.building, WorkKind::Worker, offset));
+                let mut work = Work::new(c.comp.building, WorkKind::Worker, offset);
+                if b.development().is_some() {
+                    work.employer = Some(me);
+                }
+                human.work = Some(work);
                 human.bought.0.remove(&job_opening);
             }
         }

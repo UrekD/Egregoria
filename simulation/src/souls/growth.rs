@@ -1,15 +1,19 @@
 use crate::economy::balance::{periodic_tick, CITY_UPDATE_INTERVAL_TICKS};
 use crate::economy::{Budget, ZoneDemand};
+pub use crate::map::GrowableLotError;
 use crate::map::{
-    Building, BuildingID, BuildingKind, Lot, LotID, Map, ProjectFilter, ZoneCell, ZoneGrid, ZoneKind,
+    BuildingID, BuildingKind, Lot, LotID, Map, ProjectFilter, RoadID, ZoneCell, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{lifecycle, residence};
-use crate::Simulation;
+use crate::{GrowablePlan, Simulation};
 use common::FastMap;
-use geom::Vec2;
+use geom::{Vec2, OBB};
 use ordered_float::OrderedFloat;
-use prototypes::{BuildingGen, GrowableCompanyPrototype, ResidencePrototype, Tick};
+use prototypes::{
+    BuildingGen, GrowableCompanyPrototype, GrowableMassing, GrowableZoneKind, ResidencePrototype,
+    Tick,
+};
 
 pub(crate) const GROWTH_INTERVAL: u64 = CITY_UPDATE_INTERVAL_TICKS;
 const MAX_BUILDING_SEARCH_RADIUS: f32 = 2_048.0;
@@ -29,8 +33,7 @@ struct GrowthCandidate {
     zone: ZoneKind,
     distance: OrderedFloat<f32>,
     lot: LotID,
-    kind: BuildingKind,
-    home: Option<&'static ResidencePrototype>,
+    cell: ZoneCell,
     quota: u8,
 }
 
@@ -130,9 +133,9 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: impl IntoIterator<Item = (L
             let Some(lot) = map.get(id) else {
                 continue;
             };
-            let Some((kind, home)) = growable_for_lot(&map, lot, cell) else {
+            if cell.kind == ZoneKind::MixedUse || check_growable_lot(&map, lot, cell).is_err() {
                 continue;
-            };
+            }
             let center = lot.shape.center();
             let distance = *distances.entry(id).or_insert_with(|| {
                 if !scanned_off_center_buildings {
@@ -155,8 +158,7 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: impl IntoIterator<Item = (L
                 zone: cell.kind,
                 distance,
                 lot: id,
-                kind,
-                home,
+                cell,
                 quota,
             });
         }
@@ -170,8 +172,7 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: impl IntoIterator<Item = (L
     for GrowthCandidate {
         zone,
         lot,
-        kind,
-        home,
+        cell,
         quota,
         ..
     } in candidates.drain(..)
@@ -183,24 +184,25 @@ fn grow_zoned_lots(sim: &mut Simulation, zoned_lots: impl IntoIterator<Item = (L
         if remaining == 0 {
             continue;
         }
-        let building = sim.map_mut().place_growable(lot, kind);
-        if let Some(building) = building {
-            on_growable_placed(sim, building, kind);
-            if let Some(proto) = home.filter(|proto| proto.density != crate::map::Density::Low) {
-                residence::register(sim, building, proto);
-            }
+        if sim.place_zoned_growable(lot, cell).is_ok() {
             remaining -= 1;
         }
     }
     sim.write::<GrowthCache>().candidates = candidates;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum GrowableLotError {
-    MissingRoad,
-    MissingPrototype,
-    TooSmall,
-    Obstructed,
+/// Resolved roles and frontage for an existing lot.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug)]
+pub struct GrowableSite {
+    pub lot: LotID,
+    pub shape: OBB,
+    pub frontage: RoadID,
+    pub zone: ZoneCell,
+    pub kind: BuildingKind,
+    pub home: Option<&'static ResidencePrototype>,
+    pub company: Option<&'static GrowableCompanyPrototype>,
+    pub generator: BuildingGen,
 }
 
 pub fn growable_for_lot(
@@ -208,66 +210,104 @@ pub fn growable_for_lot(
     lot: &Lot,
     cell: ZoneCell,
 ) -> Option<(BuildingKind, Option<&'static ResidencePrototype>)> {
-    check_growable_lot(map, lot, cell).ok()
+    if cell.kind == ZoneKind::MixedUse {
+        return None;
+    }
+    let site = check_growable_lot(map, lot, cell).ok()?;
+    Some((site.kind, site.home))
 }
 
-/// Find the level-one growable and apply the same footprint checks as growable placement.
+/// Resolve the level-one roles and check the reserved parcel against live frontage and water.
 pub fn check_growable_lot(
     map: &Map,
     lot: &Lot,
-    cell: ZoneCell,
-) -> Result<(BuildingKind, Option<&'static ResidencePrototype>), GrowableLotError> {
+    zone: ZoneCell,
+) -> Result<GrowableSite, GrowableLotError> {
+    if !zone.kind.supports_density(zone.density) {
+        return Err(GrowableLotError::UnsupportedDensity);
+    }
     if map.get(lot.parent).is_none() {
         return Err(GrowableLotError::MissingRoad);
     }
-    let (kind, home, generator) = growable_that_fits(lot, cell)?;
-    if !Building::valid_footprint(&lot.shape, generator)
-        || !Building::dry_footprint(map.environment(), &lot.shape, None)
-        || Lot::footprint_obstructed(map, lot.shape, false)
-    {
-        return Err(GrowableLotError::Obstructed);
+    let site = growable_that_fits(lot, zone)?;
+    lot.check_growable_footprint(map, site.generator)?;
+    if site.home.is_some() && site.company.is_some() {
+        lot.check_growable_footprint(map, BuildingGen::House)?;
     }
-    Ok((kind, home))
+    Ok(site)
 }
 
-fn growable_that_fits(
-    lot: &Lot,
-    cell: ZoneCell,
-) -> Result<
-    (
-        BuildingKind,
-        Option<&'static ResidencePrototype>,
-        BuildingGen,
-    ),
-    GrowableLotError,
-> {
-    let home = if cell.kind == ZoneKind::Residential {
-        residence::prototype(cell.density, 1)
-    } else {
-        None
+fn growable_that_fits(lot: &Lot, zone: ZoneCell) -> Result<GrowableSite, GrowableLotError> {
+    let (home, company) = match zone.kind {
+        ZoneKind::Residential => (
+            Some(residence::prototype(zone.density, 1).ok_or(GrowableLotError::MissingPrototype)?),
+            None,
+        ),
+        ZoneKind::MixedUse => {
+            let pair = prototypes::prototypes()
+                .mixed_use_pair(zone.density)
+                .ok_or(GrowableLotError::MissingPrototype)?;
+            (Some(pair.home), Some(pair.shop))
+        }
+        pure => {
+            let company = GrowableCompanyPrototype::iter()
+                .find(|proto| {
+                    proto.growable
+                        && proto.chain_key().zone_kind == GrowableZoneKind::Pure(pure)
+                        && proto.density == zone.density
+                        && proto.level == 1
+                })
+                .ok_or(GrowableLotError::MissingPrototype)?;
+            (None, Some(company))
+        }
     };
-    let (kind, generator, lot_size_min) = if let Some(proto) = home {
-        (BuildingKind::House, BuildingGen::House, proto.lot_size_min)
-    } else {
-        let proto = GrowableCompanyPrototype::iter()
-            .find(|proto| {
-                proto.growable
-                    && proto.zone_kind == cell.kind
-                    && proto.density == cell.density
-                    && proto.level == 1
+    let (kind, generator) = company.map_or((BuildingKind::House, BuildingGen::House), |proto| {
+        (BuildingKind::GoodsCompany(proto.base.id), proto.base.bgen)
+    });
+
+    let [width, depth] = lot.shape.axis().map(|axis| axis.mag());
+    let fits = |minimum: f32, profile: Option<GrowableMassing>| {
+        width * depth + 0.001 >= minimum
+            && profile.is_none_or(|profile| {
+                width + 0.001 >= profile.min_plot_width_m
+                    && depth + 0.001 >= profile.min_plot_depth_m
             })
-            .ok_or(GrowableLotError::MissingPrototype)?;
-        (
-            BuildingKind::GoodsCompany(proto.base.id),
-            proto.base.bgen,
-            proto.lot_size_min,
-        )
     };
-    let [width, depth] = lot.shape.axis();
-    if width.mag() * depth.mag() + 0.001 < lot_size_min {
+    if home.is_some_and(|proto| !fits(proto.lot_size_min, proto.massing))
+        || company.is_some_and(|proto| !fits(proto.lot_size_min, proto.massing))
+    {
         return Err(GrowableLotError::TooSmall);
     }
-    Ok((kind, home, generator))
+    Ok(GrowableSite {
+        lot: lot.id,
+        shape: lot.shape,
+        frontage: lot.parent,
+        zone,
+        kind,
+        home,
+        company,
+        generator,
+    })
+}
+
+pub(crate) fn plan_growable(
+    sim: &Simulation,
+    lot: LotID,
+    zone: ZoneCell,
+) -> Result<GrowablePlan, GrowableLotError> {
+    if zone.kind == ZoneKind::MixedUse {
+        return Err(if zone.kind.supports_density(zone.density) {
+            GrowableLotError::MixedUseDisabled
+        } else {
+            GrowableLotError::UnsupportedDensity
+        });
+    }
+    let map = sim.map();
+    let lot = map.get(lot).ok_or(GrowableLotError::MissingLot)?;
+    let site = check_growable_lot(&map, lot, zone)?;
+    let home = site.home.map(residence::Residence::from);
+    let job_slots = site.company.map_or(0, |company| company.n_workers);
+    GrowablePlan::prepare(&map, site, None, home, job_slots)
 }
 
 fn nearest_building_distance(
@@ -324,11 +364,7 @@ pub fn on_growable_removed(sim: &mut Simulation, building: BuildingID) {
 }
 
 pub(crate) fn remove_growable(sim: &mut Simulation, id: BuildingID) {
-    let building = sim.map_mut().remove_building(id);
-    if let Some(building) = building {
-        on_growable_removed(sim, id);
-        lifecycle::remove_building(sim, building, false);
-    }
+    lifecycle::remove_site(sim, id);
 }
 
 #[cfg(test)]
@@ -1173,11 +1209,18 @@ mod tests {
                 MapProject::ground(vec3(100.0, 100.0, 0.0)),
                 MapProject::ground(vec3(400.0, 100.0, 0.0)),
                 None,
-                &LanePatternBuilder::default().sidewalks(false).build(),
+                &LanePatternBuilder::default().build(),
             )
             .unwrap()
             .1;
         assert_ne!(replacement, origin.parent);
+        assert!(test.g.map().lots().values().all(|lot| {
+            !lot.shape
+                .corners
+                .iter()
+                .zip(origin.shape.corners)
+                .all(|(actual, expected)| actual.is_close(expected, 0.001))
+        }));
         assert!(test.g.read::<ZoneGrid>().cells().is_empty());
         assert!(due(GROWTH_INTERVAL));
         test.g.write::<GameTime>().tick.0 = GROWTH_INTERVAL;

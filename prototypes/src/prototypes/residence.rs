@@ -84,6 +84,7 @@ impl Prototype for ResidencePrototype {
             get_lua::<Option<GrowableZoneKind>>(table, "zone_kind")?.unwrap_or_default();
         let massing = get_lua::<Option<GrowableMassing>>(table, "massing")?;
         let (level, capacity) = if massing.is_some() || zone_kind == GrowableZoneKind::MixedUse {
+            crate::validation::validate_profile_power_fields(table)?;
             (
                 profile_integer(table.get("level")?, 5, "level")? as u8,
                 profile_integer(table.get("capacity")?, MAX_PROFILED_SLOTS, "capacity")?,

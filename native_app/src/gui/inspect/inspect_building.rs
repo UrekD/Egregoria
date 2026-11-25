@@ -10,8 +10,10 @@ use simulation::diagnostics::{
 };
 use simulation::economy::cargo::CargoBook;
 use simulation::economy::Market;
-use simulation::map::{Building, BuildingID, BuildingKind, Density, Zone, MAX_ZONE_AREA};
-use simulation::map_dynamic::{BuildingInfos, ElectricityFlow, UtilityStatus};
+use simulation::map::{
+    Building, BuildingID, BuildingKind, Density, GrowableBusinessState, Zone, MAX_ZONE_AREA,
+};
+use simulation::map_dynamic::{active_business, BuildingInfos, ElectricityFlow, UtilityStatus};
 use simulation::souls::freight_station::FreightTrainState;
 use simulation::souls::residence::Residences;
 use simulation::transportation::Location;
@@ -67,7 +69,31 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                 match building.kind {
                     BuildingKind::House => render_house(uiworld, sim, building),
                     BuildingKind::GoodsCompany(id) => {
-                        if let Some(proto) = try_prototype(GrowableCompanyID::from(id))
+                        if let Some(site) = sim.growable_summary(building.id) {
+                            if building.has_residential_use() {
+                                render_house(uiworld, sim, building);
+                            }
+                            label(format!(
+                                "{} · {} density · Level {} · {} floors",
+                                zone_name(site.zone.kind),
+                                density_name(site.zone.density),
+                                site.level,
+                                site.floors,
+                            ));
+                            label(format!(
+                                "Jobs  {} / {}",
+                                site.filled_jobs, site.planned_jobs
+                            ));
+                            match site.business {
+                                Some(GrowableBusinessState::AwaitingSpawn) => {
+                                    label("Awaiting business")
+                                }
+                                Some(GrowableBusinessState::ClosedUntil { .. }) => {
+                                    label("Business closed")
+                                }
+                                _ => {}
+                            }
+                        } else if let Some(proto) = try_prototype(GrowableCompanyID::from(id))
                             .filter(|proto| proto.growable)
                         {
                             label(format!(
@@ -312,14 +338,11 @@ fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
 }
 
 fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
-    let owner = sim.read::<BuildingInfos>().owner(b.id);
-
-    let Some(SoulID::GoodsCompany(c_id)) = owner else {
+    let Some(business) = active_business(b, &sim.read::<BuildingInfos>(), sim.world()) else {
         return;
     };
-    let Some(c) = sim.world().companies.get(c_id) else {
-        return;
-    };
+    let c_id = business.company;
+    let c = &sim.world().companies[c_id];
     let goods = &c.comp;
     let workers = &c.workers;
     let proto = c.comp.proto.prototype();
