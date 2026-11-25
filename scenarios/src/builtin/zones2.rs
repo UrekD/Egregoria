@@ -7,14 +7,15 @@ use geom::{vec2, vec3, Vec2};
 use prototypes::{
     try_prototype, ItemID, ResidencePrototypeID, Size2D, Tick, TICKS_PER_DAY, TICKS_PER_HOUR,
 };
+use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
 use simulation::economy::cargo::CargoBook;
 use simulation::economy::progression::{utility_served_fraction, ProgressionMode};
 use simulation::economy::{Budget, DailyEconomyMetrics, Market, TripPurpose, ZoneDemand};
 use simulation::map::Density::{self, High, Low, Medium};
 use simulation::map::ZoneKind::{self, Commercial, Industrial, MixedUse, Office, Residential};
 use simulation::map::{
-    BuildingID, BuildingKind, GrowableBusinessState, LaneKind, LanePatternBuilder, PathKind,
-    ProjectFilter, ProjectKind, TerraformKind, ZoneCell,
+    BuildingID, BuildingKind, GrowableBusinessState, GrowableSiteState, LaneKind,
+    LanePatternBuilder, PathKind, ProjectFilter, ProjectKind, RoadID, TerraformKind, ZoneCell,
 };
 use simulation::map_dynamic::{BuildingInfos, EnvGrid, Itinerary};
 use simulation::souls::{
@@ -23,8 +24,8 @@ use simulation::souls::{
 };
 use simulation::world_command::{CommandOutcomes, WorldCommand};
 use simulation::{
-    GrowableSummary, MapPreset, SavePhase, Simulation, SimulationOptions, SlotId, SnapshotRevision,
-    SoulID,
+    CompanyID, GrowableSummary, MapPreset, SavePhase, Simulation, SimulationOptions, SlotId,
+    SnapshotRevision, SoulID,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -297,6 +298,10 @@ fn grow_city_with_health(
         verify_checkpoint(&ctx.sim, root, "zones2_core_l3")?;
         Ok(())
     } else {
+        if !mixed {
+            advance_to(ctx, COMMISSION_END - TICKS_PER_DAY)?;
+            paint_pure_control_office(ctx)?;
+        }
         advance_to(ctx, COMMISSION_END)
     }
 }
@@ -336,12 +341,51 @@ fn paint_core(ctx: &mut ScenarioCtx, mixed: bool) {
     let infill = if mixed {
         [(2, 3, MixedUse, Medium), (3, 3, MixedUse, High)]
     } else {
-        [(2, 3, Residential, Medium), (3, 3, Residential, High)]
+        [(2, 3, Residential, High), (3, 3, Residential, High)]
     };
     paint_zone_blocks(ctx, ORIGIN, BLOCK, infill);
     if !mixed {
-        paint_zone_blocks(ctx, ORIGIN, BLOCK, [(3, 4, Commercial, Low)]);
+        paint_zone_blocks(
+            ctx,
+            ORIGIN,
+            BLOCK,
+            [
+                (3, 4, Commercial, Medium),
+                (4, 2, Office, High),
+                (5, 3, Industrial, Medium),
+                (0, 4, Residential, Low),
+                (3, 5, Commercial, Low),
+            ],
+        );
     }
+}
+
+fn paint_pure_control_office(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    // Add one office during commissioning after the core housing has grown.
+    let office = zone(Office, High);
+    let center = ORIGIN + vec2(2.5, 4.5) * BLOCK;
+    let area = {
+        let map = ctx.sim.map();
+        map.lots()
+            .values()
+            .filter(|lot| lot.shape.center().distance2(center) < (BLOCK / 2.0).powi(2))
+            .filter(|lot| check_growable_lot(&map, lot, office).is_ok())
+            .min_by(|a, b| {
+                let distance = |lot: &simulation::map::Lot| lot.shape.center().distance2(center);
+                distance(a)
+                    .total_cmp(&distance(b))
+                    .then_with(|| a.id.cmp(&b.id))
+            })
+            .map(|lot| lot.shape)
+            .ok_or("pure control has no room for the additional office")?
+    };
+    ctx.submit(&[WorldCommand::ZonePaint {
+        area,
+        kind: Some(office.kind),
+        density: office.density,
+    }]);
+    ctx.flush();
+    Ok(())
 }
 
 fn run_attainment(ctx: &mut ScenarioCtx) -> Result<(), String> {
@@ -410,50 +454,460 @@ fn run_attainment(ctx: &mut ScenarioCtx) -> Result<(), String> {
 
 fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
     require_profiles()?;
-    let replay_root = export_root("EGR_ZONES2_REPLAY_ROOT")?;
-    grow_city(ctx, true, replay_root.as_deref())?;
+    let export = export_root(ctx, "EGR_ZONES2_REPLAY_ROOT")?;
+    let scratch;
+    let replay_root = if let Some(path) = export.as_deref() {
+        path
+    } else {
+        scratch = ReplayScratch::new()?;
+        scratch.0.as_path()
+    };
+    grow_city(ctx, true, Some(replay_root))?;
     check_commissioning(ctx, true)?;
+    check_retail_freight_access(&ctx.sim)?;
     ctx.sample("commissioned");
     let mixed = observe_days(ctx)?;
 
     let mut control = ScenarioCtx::new(OPTIONS);
     grow_city(&mut control, false, None)?;
     check_commissioning(&control, false)?;
+    check_retail_freight_access(&control.sim)?;
     let pure = observe_days(&mut control)?;
     ctx.samples
         .extend(control.samples.into_iter().map(|mut sample| {
             sample.label = format!("pure_control_{}", sample.label);
             sample
         }));
-    compare_economies(&mixed, &pure)
+    let match_result = compare_economies(&mixed, &pure);
+    let after_paint = SlotId::new("zones2_after_core").map_err(|err| err.to_string())?;
+    let commissioning =
+        Simulation::load_from_slot(replay_root, &after_paint).map_err(|err| err.to_string())?;
+    verify_mixed_frontage_replay(&mut ScenarioCtx::from_sim(commissioning), replay_root)?;
+    match_result
 }
 
-fn verify_checkpoint(sim: &Simulation, root: &Path, label: &str) -> Result<Simulation, String> {
+fn check_retail_freight_access(sim: &Simulation) -> Result<(), String> {
+    use prototypes::CompanyKind;
+    let map = sim.map();
+    let terminal = map
+        .buildings()
+        .values()
+        .find(|site| matches!(site.kind, BuildingKind::RailFreightStation(_)))
+        .ok_or("the district has no rail freight terminal")?;
+    let mut count = 0;
+    for company in sim.world().companies.values().filter(|company| {
+        company.comp.proto.prototype().kind == CompanyKind::Store
+            && try_prototype(prototypes::GrowableCompanyID::from(company.comp.proto))
+                .is_some_and(|proto| proto.growable)
+    }) {
+        let store = map
+            .get(company.comp.building)
+            .ok_or("retailer has no building")?;
+        for (source, destination) in [(terminal, store), (store, terminal)] {
+            if Itinerary::route(
+                Tick(sim.get_tick()),
+                source.door_pos,
+                destination.door_pos,
+                &map,
+                PathKind::Vehicle,
+            )
+            .is_none()
+            {
+                return Err(format!(
+                    "retailer {:?} has no round-trip terminal route",
+                    store.id
+                ));
+            }
+        }
+        count += 1;
+    }
+    println!("verified terminal road access for {count} zoned retailers");
+    Ok(())
+}
+
+fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(), String> {
+    // Branch from the commission paint wave while new shops are still hiring
+    // and the first storefronts are taking baskets and deliveries.
+    let (roads, affected) = find_teardown_frontage(live)?;
+    let (endpoints, parcels) = {
+        let map = live.sim.map();
+        let endpoints: Vec<_> = roads
+            .iter()
+            .map(|&road| {
+                let link = &map.roads()[road];
+                [
+                    map.intersections()[link.src].pos,
+                    map.intersections()[link.dst].pos,
+                ]
+            })
+            .collect();
+        let parcels = affected
+            .iter()
+            .map(|&(id, _)| {
+                let origin = map
+                    .lot_origin(id)
+                    .ok_or("Mixed Use fixture lacks parcel origin")?;
+                let zone = live
+                    .sim
+                    .growable_summary(id)
+                    .ok_or("Mixed Use fixture lacks roles")?
+                    .zone;
+                Ok((id, *origin, zone))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        (endpoints, parcels)
+    };
+    let tenants: BTreeSet<_> = {
+        let infos = live.sim.read::<BuildingInfos>();
+        affected
+            .iter()
+            .filter_map(|&(id, _)| infos.get(id))
+            .flat_map(|info| info.residents.iter().copied())
+            .collect()
+    };
+    let (loaded, before_cut) = snapshot_checkpoint(&live.sim, root, "zones2_staffed_cut")?;
+    let mut resumed = ScenarioCtx::from_sim(loaded);
+
+    let cuts: Vec<_> = roads.into_iter().map(WorldCommand::MapRemoveRoad).collect();
+    let before_growth = DEMAND_INTERVAL_TICKS - (live.sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS;
+    for run in [&mut *live, &mut resumed] {
+        run_teardown_batch(run, &cuts, 1)?;
+        run.run_ticks(before_growth - 1);
+    }
+
+    // Provide replacement homes in the command batch immediately before growth
+    // settles the disconnection. This gives displaced tenants the vacancies.
+    let replacement_homes = {
+        let map = live.sim.map();
+        let center = parcels[0].1.shape.center();
+        let mut lots: Vec<_> = map
+            .lots()
+            .values()
+            .filter(|lot| check_growable_lot(&map, lot, zone(Residential, Low)).is_ok())
+            .collect();
+        lots.sort_by(|a, b| {
+            let distance = |lot: &simulation::map::Lot| lot.shape.center().distance2(center);
+            distance(a)
+                .total_cmp(&distance(b))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        lots.into_iter()
+            .take(8)
+            .map(|lot| WorldCommand::MapBuildHouse(lot.id))
+            .collect::<Vec<_>>()
+    };
+    if replacement_homes.is_empty() {
+        return Err("frontage fixture has no buildable rehousing lots".into());
+    }
+    for run in [&mut *live, &mut resumed] {
+        run_teardown_batch(run, &replacement_homes, TICKS_PER_HOUR - before_growth)?;
+        let map = run.sim.map();
+        let infos = run.sim.read::<BuildingInfos>();
+        let cargo = run.sim.read::<CargoBook>();
+        for &(id, company) in &affected {
+            let removed = SoulID::GoodsCompany(company);
+            if !map.get(id).is_some_and(|site| site.is_abandoned_growable())
+                || infos.owner(id).is_some()
+                || run.sim.get(company).is_some()
+                || cargo
+                    .stock_for(id)
+                    .values()
+                    .any(|stock| stock.incoming > 0 || stock.reserved > 0)
+                || run.sim.world().humans.values().any(|human| {
+                    human.household.basket_seller() == Some(removed)
+                        || human.work.as_ref().is_some_and(|work| work.workplace == id)
+                        || human
+                            .bought
+                            .0
+                            .values()
+                            .flatten()
+                            .any(|trade| trade.seller.0 == removed)
+                })
+            {
+                return Err(format!(
+                    "frontage loss left an active role or claim on {id:?}"
+                ));
+            }
+        }
+        let rehoused = tenants
+            .iter()
+            .filter_map(|&id| infos.residence_of(id))
+            .any(|home| {
+                !affected.iter().any(|&(id, _)| id == home)
+                    && map.get(home).is_some_and(|site| {
+                        site.has_residential_use() && !site.is_abandoned_growable()
+                    })
+            });
+        if !rehoused {
+            return Err("frontage loss did not rehouse a Mixed Use tenant".into());
+        }
+    }
+    let abandoned = resumed_checkpoint(live, &resumed, root, "zones2_staffed_abandoned")?;
+
+    let mut repairs: Vec<_> = parcels
+        .iter()
+        .map(|&(_, origin, _)| WorldCommand::ZonePaint {
+            area: origin.shape,
+            kind: None,
+            density: Low,
+        })
+        .collect();
+    {
+        let map = live.sim.map();
+        repairs.extend(endpoints.into_iter().map(|pair| {
+            let [from, to] = pair.map(|pos| map.project(pos, 1.0, ProjectFilter::INTER));
+            WorldCommand::MapMakeConnection {
+                from,
+                to,
+                inter: None,
+                pat: LanePatternBuilder::default().build(),
+            }
+        }));
+    }
+    for run in [&mut *live, &mut resumed] {
+        run_teardown_batch(run, &repairs, 13 * TICKS_PER_HOUR)?;
+        let map = run.sim.map();
+        for &(id, origin, zone) in &parcels {
+            if map.get(id).is_some()
+                || !map.lots().values().any(|lot| {
+                    lot.parent != origin.parent_road
+                        && lot.shape.center().distance2(origin.shape.center()) < 0.01
+                        && check_growable_lot(&map, lot, zone).is_ok()
+                })
+            {
+                return Err(format!(
+                    "timed collapse did not restore usable frontage for {id:?}"
+                ));
+            }
+        }
+    }
+    let collapsed = resumed_checkpoint(live, &resumed, root, "zones2_staffed_collapsed")?;
+
+    let repaint: Vec<_> = parcels
+        .iter()
+        .map(|&(_, origin, zone)| WorldCommand::ZonePaint {
+            area: origin.shape,
+            kind: Some(zone.kind),
+            density: zone.density,
+        })
+        .collect();
+    for run in [&mut *live, &mut resumed] {
+        run_teardown_batch(run, &repaint, TICKS_PER_DAY)?;
+        let map = run.sim.map();
+        if !parcels.iter().any(|&(_, origin, zone)| {
+            map.buildings().values().any(|building| {
+                building.obb.center().distance2(origin.shape.center()) < 0.01
+                    && run.sim.growable_summary(building.id).is_some_and(|site| {
+                        site.zone == zone && site.site == GrowableSiteState::Active
+                    })
+            })
+        }) {
+            return Err("repainting the restored frontage produced no Mixed Use regrowth".into());
+        }
+    }
+    let regrown = resumed_checkpoint(live, &resumed, root, "zones2_staffed_regrown")?;
+    verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
+}
+
+fn run_teardown_batch(
+    ctx: &mut ScenarioCtx,
+    commands: &[WorldCommand],
+    steps: u64,
+) -> Result<(), String> {
+    ctx.submit(commands);
+    ctx.run_ticks(1);
+    {
+        let result = ctx.sim.read::<CommandOutcomes>();
+        if result.accepted.len() != commands.len() || !result.last.is_empty() {
+            return Err(format!("teardown command batch failed: {:?}", result.last));
+        }
+    }
+    ctx.run_ticks(steps - 1);
+    Ok(())
+}
+
+type StaffedFrontage = (BTreeSet<RoadID>, Vec<(BuildingID, CompanyID)>);
+
+fn find_teardown_frontage(ctx: &mut ScenarioCtx) -> Result<StaffedFrontage, String> {
+    let job = ItemID::new("job-opening");
+    let mut hire_steps = 0;
+    let mut freight_steps_with_hires = 0;
+    while elapsed(&ctx.sim) < COMMISSION_END {
+        let sim = &ctx.sim;
+        let hires: BTreeSet<_> = sim
+            .world()
+            .humans
+            .values()
+            .filter_map(|human| {
+                human
+                    .bought
+                    .0
+                    .get(&job)?
+                    .first()
+                    .map(|trade| trade.seller.0)
+            })
+            .collect();
+        if !hires.is_empty() && (sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS != 0 {
+            let map = sim.map();
+            let mut sites = Vec::new();
+            for seller in mixed_sellers(sim) {
+                let SoulID::GoodsCompany(company) = seller else {
+                    continue;
+                };
+                let id = sim.world().companies[company].comp.building;
+                if let Some(road) = map.get(id).and_then(|site| site.connected_road) {
+                    sites.push((id, company, road));
+                }
+            }
+            if let Some(job_road) = sites.iter().find_map(|&(_, company, road)| {
+                hires
+                    .contains(&SoulID::GoodsCompany(company))
+                    .then_some(road)
+            }) {
+                hire_steps += 1;
+                let cargo = sim.read::<CargoBook>();
+                let freight_road = sites
+                    .iter()
+                    .filter(|&&(id, _, _)| {
+                        cargo.stock_for(id).values().any(|stock| stock.incoming > 0)
+                    })
+                    .min_by_key(|&&(_, _, road)| (road != job_road, road))
+                    .map(|&(_, _, road)| road);
+                if let Some(freight_road) = freight_road {
+                    freight_steps_with_hires += 1;
+                    let baskets: BTreeSet<_> = sim
+                        .world()
+                        .humans
+                        .values()
+                        .filter_map(|human| human.household.basket_seller())
+                        .collect();
+                    let basket_road = sites
+                        .iter()
+                        .filter(|&&(_, company, _)| {
+                            baskets.contains(&SoulID::GoodsCompany(company))
+                        })
+                        .min_by_key(|&&(_, _, road)| {
+                            (road != job_road && road != freight_road, road)
+                        })
+                        .map(|&(_, _, road)| road);
+                    if let Some(basket_road) = basket_road {
+                        let roads = BTreeSet::from([job_road, freight_road, basket_road]);
+                        let affected: Vec<_> = sites
+                            .into_iter()
+                            .filter(|&(_, _, road)| roads.contains(&road))
+                            .map(|(id, company, _)| (id, company))
+                            .collect();
+                        if affected.iter().any(|&(id, _)| {
+                            sim.growable_summary(id)
+                                .is_some_and(|site| site.filled_jobs > 1 && site.occupants > 0)
+                        }) {
+                            println!("staffed frontage cut across {} links at elapsed step {} with hire, basket and freight claims", roads.len(), elapsed(sim));
+                            return Ok((roads, affected));
+                        }
+                    }
+                }
+            }
+        }
+        ctx.run_ticks(1);
+    }
+    Err(format!("no staffed Mixed Use frontage cut with hire, basket and freight claims ({hire_steps} steps with Mixed Use hires, {freight_steps_with_hires} also with freight)"))
+}
+
+struct ReplayCheckpoint {
+    label: &'static str,
+    steps: u64,
+    hashes: BTreeMap<String, u64>,
+}
+
+fn resumed_checkpoint(
+    live: &ScenarioCtx,
+    resumed: &ScenarioCtx,
+    root: &Path,
+    label: &'static str,
+) -> Result<ReplayCheckpoint, String> {
+    let (_, checkpoint) = snapshot_checkpoint(&live.sim, root, label)?;
+    if resumed.sim.hashes() != checkpoint.hashes {
+        return Err(format!(
+            "{label}: resumed world diverged from uninterrupted play"
+        ));
+    }
+    Ok(checkpoint)
+}
+
+fn snapshot_checkpoint(
+    sim: &Simulation,
+    root: &Path,
+    label: &'static str,
+) -> Result<(Simulation, ReplayCheckpoint), String> {
     publish(sim, root, label, label)?;
     let id = SlotId::new(label).map_err(|err| err.to_string())?;
     let loaded = Simulation::load_from_slot(root, &id).map_err(|err| err.to_string())?;
-    let expected = sim.hashes();
-    if loaded.hashes() != expected {
+    let hashes = sim.hashes();
+    if loaded.hashes() != hashes {
         return Err(format!(
-            "{label}: snapshot diverged from the uninterrupted city"
+            "{label}: snapshot diverged from uninterrupted play"
         ));
     }
+    Ok((
+        loaded,
+        ReplayCheckpoint {
+            label,
+            steps: elapsed(sim),
+            hashes,
+        },
+    ))
+}
+
+fn verify_checkpoint(
+    sim: &Simulation,
+    root: &Path,
+    label: &'static str,
+) -> Result<Simulation, String> {
+    let (loaded, checkpoint) = snapshot_checkpoint(sim, root, label)?;
+    verify_decoded(root, &[checkpoint])?;
+    Ok(loaded)
+}
+
+fn verify_decoded(root: &Path, checkpoints: &[ReplayCheckpoint]) -> Result<(), String> {
+    let last = checkpoints.last().expect("at least one replay checkpoint");
+    let id = SlotId::new(last.label).map_err(|err| err.to_string())?;
     let replay = Simulation::load_replay_from_slot(root, &id).map_err(|err| err.to_string())?;
     let (mut playback, mut loader) =
         Simulation::try_from_replay(replay).map_err(|err| err.to_string())?;
-    let (_, steps) = loader
+    let (mut current, steps) = loader
         .step_progress()
         .ok_or("city replay has no stepped timeline")?;
-    let mut schedule = Simulation::schedule();
-    let finished = (0..=steps).any(|_| loader.advance_tick(&mut playback, &mut schedule));
-    if !finished || loader.step_progress() != Some((steps, steps)) || playback.hashes() != expected
-    {
+    if steps != last.steps {
         return Err(format!(
-            "{label}: decoded sidecar diverged from the uninterrupted city"
+            "{}: expected {} replay steps, found {steps}",
+            last.label, last.steps
         ));
     }
-    println!("{label}: snapshot and sidecar matched after {steps} steps");
-    Ok(loaded)
+    let mut schedule = Simulation::schedule();
+    for point in checkpoints {
+        while current < point.steps {
+            let finished = loader.advance_tick(&mut playback, &mut schedule);
+            let (next, _) = loader.step_progress().unwrap();
+            if next <= current || next > point.steps || (finished && next < point.steps) {
+                return Err(format!(
+                    "{}: decoded sidecar missed step {}",
+                    point.label, point.steps
+                ));
+            }
+            current = next;
+        }
+        if playback.hashes() != point.hashes {
+            return Err(format!(
+                "{}: decoded sidecar diverged from uninterrupted play",
+                point.label
+            ));
+        }
+        println!(
+            "{}: snapshot and sidecar matched after {current} steps",
+            point.label
+        );
+    }
+    Ok(())
 }
 
 fn summaries(sim: &Simulation) -> impl Iterator<Item = GrowableSummary> + '_ {
@@ -762,8 +1216,8 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
 
 fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {
     require_profiles()?;
-    let shots_root = export_root("EGR_ZONES2_SHOTS_ROOT")?;
-    let perf_root = export_root("EGR_ZONES2_PERF_ROOT")?;
+    let shots_root = export_root(ctx, "EGR_ZONES2_SHOTS_ROOT")?;
+    let perf_root = export_root(ctx, "EGR_ZONES2_PERF_ROOT")?;
     build_district(ctx, true, &[])?;
     let parcels = [
         (vec2(754.0, 790.0), zone(Residential, Low)),
@@ -1027,14 +1481,46 @@ fn fill_skyline(sim: &mut Simulation) -> Result<(), String> {
     ))
 }
 
-fn export_root(var: &str) -> Result<Option<PathBuf>, String> {
+fn export_root(ctx: &ScenarioCtx, var: &str) -> Result<Option<PathBuf>, String> {
     std::env::var_os(var)
         .map(PathBuf::from)
         .map(|root| {
-            reserve_export_root(&root)?;
-            Ok(root)
+            if ctx.determinism_pass != Some(2) {
+                reserve_export_root(&root)?;
+            }
+            let Some(pass) = ctx.determinism_pass else {
+                return Ok(root);
+            };
+            let path = root.join(format!("run-{pass}"));
+            reserve_export_root(&path)?;
+            Ok(path)
         })
         .transpose()
+}
+
+struct ReplayScratch(PathBuf);
+
+impl ReplayScratch {
+    fn new() -> Result<Self, String> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        loop {
+            let serial = NEXT.fetch_add(1, Ordering::Relaxed);
+            let root =
+                std::env::temp_dir().join(format!("zones2-replay-{}-{serial}", std::process::id()));
+            match std::fs::create_dir(&root) {
+                Ok(()) => return Ok(Self(root)),
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(format!("could not create {}: {err}", root.display())),
+            }
+        }
+    }
+}
+
+impl Drop for ReplayScratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn reserve_export_root(root: &Path) -> Result<(), String> {

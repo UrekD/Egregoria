@@ -128,6 +128,11 @@ fn remove_claim<K: Ord, V: Ord>(claims: &mut BTreeMap<K, BTreeSet<V>>, key: K, i
 }
 
 impl HouseholdStock {
+    /// Seller responsible for a basket that is still awaiting pickup.
+    pub fn basket_seller(&self) -> Option<SoulID> {
+        self.reservation.as_ref().map(|basket| basket.seller)
+    }
+
     /// Elapsed hours earned through school access at the resident's registered home.
     pub fn education_hours(&self) -> u8 {
         self.education_hours

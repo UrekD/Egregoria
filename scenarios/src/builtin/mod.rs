@@ -27,6 +27,9 @@ pub const PERF_10K: (Scenario, SimulationOptions) = (
 
 pub const ZONES2_L3: (Scenario, SimulationOptions) = zones2::ATTAINMENT;
 
+pub const ZONES2_STAGED: &[(Scenario, SimulationOptions)] =
+    &[zones2::CITY, zones2::CONTROLLED, ZONES2_L3];
+
 pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     (
         Scenario {
@@ -41,8 +44,6 @@ pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     services_neglect::SCENARIO,
     transit_basic::SCENARIO,
     water_basic::SCENARIO,
-    zones2::CITY,
-    zones2::CONTROLLED,
     (
         Scenario {
             name: "smoke",
