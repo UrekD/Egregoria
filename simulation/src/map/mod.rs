@@ -22,6 +22,8 @@ pub mod procgen {
     mod building;
     pub mod heightmap;
     mod presets;
+    mod tiled_start;
+    pub(crate) use tiled_start::commission_native_land;
     mod water;
 
     pub use building::*;
@@ -34,7 +36,7 @@ pub mod procgen {
     }
 
     pub fn load_parismap(map: &mut super::Map) -> Result<(), PresetImportError> {
-        if map.environment().has_water_configuration() {
+        if map.needs_topology_preparation() {
             return Err(PresetImportError::WaterConfigured);
         }
         presets::load_parismap(map);
@@ -47,7 +49,7 @@ pub mod procgen {
         size: u32,
         spacing: f32,
     ) -> Result<(), PresetImportError> {
-        if map.environment().has_water_configuration() {
+        if map.needs_topology_preparation() {
             return Err(PresetImportError::WaterConfigured);
         }
         presets::load_testfield(map, pos, size, spacing);
@@ -60,6 +62,9 @@ mod change_detection;
 mod electricity_cache;
 mod height_override;
 pub mod import;
+pub(crate) mod land_frontage;
+mod land_ownership;
+mod land_site;
 mod light_policy;
 #[allow(clippy::module_inception)]
 mod map;
@@ -81,6 +86,8 @@ pub use self::pathfinding::*;
 pub use authored::*;
 pub use change_detection::*;
 pub use electricity_cache::*;
+pub use land_ownership::*;
+pub(crate) use land_site::PreparedEffects;
 pub use light_policy::*;
 pub use map::*;
 pub use spatial_map::*;

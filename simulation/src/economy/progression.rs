@@ -285,14 +285,7 @@ fn evaluate_objectives(sim: &Simulation, day: u64, elapsed: u64) -> usize {
         .get(&day)
         .into_iter()
         .flatten()
-        .filter(|(category, _)| {
-            !matches!(
-                category,
-                BudgetCategory::Construction
-                    | BudgetCategory::StarterInfrastructure
-                    | BudgetCategory::MilestoneGrant
-            )
-        })
+        .filter(|(category, _)| category.is_operating())
         .map(|(_, change)| *change)
         .sum();
     let mut state = sim.write::<ProgressionState>();
@@ -499,6 +492,7 @@ mod tests {
                 (BudgetCategory::Construction, -500),
                 (BudgetCategory::StarterInfrastructure, 500),
                 (BudgetCategory::MilestoneGrant, 500),
+                (BudgetCategory::LandPurchase, -10_000),
             ] {
                 Budget::apply(resources, category, Money::new_bucks(amount));
             }

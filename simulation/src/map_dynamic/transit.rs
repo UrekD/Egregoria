@@ -307,12 +307,33 @@ fn prepare_command(sim: &Simulation, command: &WorldCommand) -> Result<Prepared,
                 return Err(Rejection::InvalidConnection);
             }
             let dir = stop_direction(*dir).ok_or(Rejection::InvalidConnection)?;
+            sim.map()
+                .authorize_land_effects(crate::map::PreparedEffects::Point(pos.xy()))?;
             let (walk, berth) =
                 resolve_stop(&sim.map(), *pos, dir).ok_or(Rejection::MissingReference)?;
             Prepared::Stop(dir, walk, berth)
         }
-        TransitRemoveStop { stop } if !transit.stops.contains_key(*stop) => {
-            return Err(Rejection::MissingReference);
+        TransitRemoveStop { stop } => {
+            let site = transit
+                .stops
+                .get(*stop)
+                .ok_or(Rejection::MissingReference)?;
+            let map = sim.map();
+            if map.land_ownership().is_tiled() {
+                let berth = transit
+                    .berths
+                    .get(stop)
+                    .ok_or(Rejection::MissingReference)?;
+                let lane = map.get(berth.lane).ok_or(Rejection::MissingReference)?;
+                map.authorize_transit_site(
+                    site.pos,
+                    site.walk_pos,
+                    berth.pos,
+                    berth.dir.xy(),
+                    lane.parent,
+                )?;
+            }
+            Prepared::Edit
         }
         TransitEditLine { line, .. }
         | TransitRemoveLine { line }
@@ -407,17 +428,40 @@ fn resolve_stop(map: &Map, pos: Vec3, dir: Vec2) -> Option<(Vec3, Berth)> {
             if walk.distance2(pos) > 10.0 * 10.0 {
                 return None;
             }
-            let (pos, dir) = lane.points.point_dir_along(offset);
+            let (vehicle_pos, dir) = lane.points.point_dir_along(offset);
             let berth = Berth {
                 lane: id,
                 offset,
-                pos,
+                pos: vehicle_pos,
                 dir,
             };
+            map.authorize_transit_site(pos, walk, berth.pos, berth.dir.xy(), lane.parent)
+                .ok()?;
             Some(((OrderedFloat(distance), id), (walk, berth)))
         })
         .min_by_key(|(key, _)| *key)
         .map(|(_, resolved)| resolved)
+}
+
+pub(crate) fn validate_saved_land_stops(sim: &Simulation) -> Result<(), String> {
+    let map = sim.map();
+    let transit = sim.read::<Transit>();
+    for (id, stop) in transit.stops.iter() {
+        let berth = transit
+            .berths
+            .get(&id)
+            .ok_or("Missing saved transit berth")?;
+        let lane = map.get(berth.lane).ok_or("Missing saved transit lane")?;
+        map.authorize_transit_site(
+            stop.pos,
+            stop.walk_pos,
+            berth.pos,
+            berth.dir.xy(),
+            lane.parent,
+        )
+        .map_err(|error| format!("Invalid saved transit stop: {error:?}"))?;
+    }
+    Ok(())
 }
 
 fn line_times<'a>(map: &'a Map, berths: &'a [Berth]) -> impl Iterator<Item = Option<u64>> + 'a {

@@ -83,10 +83,17 @@ pub(crate) fn valid_building_index_bounds(bounds: AABB) -> bool {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Zone {
+    #[serde(deserialize_with = "decode_zone_polygon")]
     pub poly: Polygon,
     pub area: f32,
     #[serde(default = "unit_x")]
     pub filldir: Vec2,
+}
+
+fn decode_zone_polygon<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Polygon, D::Error> {
+    crate::world_command::bounded_command_vec::<_, _, 256>(deserializer).map(Polygon)
 }
 
 fn unit_x() -> Vec2 {

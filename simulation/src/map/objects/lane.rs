@@ -81,8 +81,16 @@ pub struct Lane {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct LanePattern {
+    #[serde(deserialize_with = "decode_lane_pattern_side")]
     pub lanes_forward: Vec<(LaneKind, f32)>,
+    #[serde(deserialize_with = "decode_lane_pattern_side")]
     pub lanes_backward: Vec<(LaneKind, f32)>,
+}
+
+fn decode_lane_pattern_side<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Vec<(LaneKind, f32)>, D::Error> {
+    crate::world_command::bounded_command_vec::<_, _, 32>(deserializer)
 }
 
 impl LanePattern {

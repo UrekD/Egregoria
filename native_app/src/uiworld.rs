@@ -161,10 +161,21 @@ impl UiWorld {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TilePurchaseReceipt {
+    pub generation: u64,
+    pub frame: u64,
+    pub batch_sequence: u64,
+    pub command_index: usize,
+    pub tile: simulation::map::LandTileId,
+    pub result: Result<simulation::map::TilePurchased, simulation::world_command::Rejection>,
+}
+
 #[derive(Default)]
 pub struct ReceivedCommands {
     commands: WorldCommands,
     placements: Vec<PlacementResult>,
+    pub tile_purchases: Vec<TilePurchaseReceipt>,
     pub(crate) rejections: Vec<(u64, Vec<(usize, &'static str, Rejection)>)>,
 }
 

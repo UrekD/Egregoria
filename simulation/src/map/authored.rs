@@ -114,6 +114,110 @@ impl AuthoredTownOptions {
     }
 }
 
+/// A private commissioning run publishes a replay-disabled tiled snapshot only
+/// after the terrain, sites and typed gateway IDs pass the land finalizer.
+#[derive(Clone, Copy, Debug)]
+pub struct AuthoredTilesSpec {
+    pub recipe_id: u64,
+    pub source_crop: AABB,
+    /// Destination of the source crop's lower-left corner and metres per source unit.
+    pub town_origin: Vec2,
+    pub town_scale: f32,
+    pub terrain_extent: super::TileExtent,
+    pub owned_rect: super::OwnedTileRect,
+    pub seed: u64,
+    pub lot_layout: LotLayout,
+    pub starting_money_bucks: u32,
+    pub progression: ProgressionMode,
+}
+
+impl Simulation {
+    pub fn build_authored_tiled<T>(
+        spec: AuthoredTilesSpec,
+        assemble: impl FnOnce(
+            &mut Simulation,
+        ) -> Result<
+            (T, std::collections::BTreeSet<super::ProtectedRoot>),
+            super::LandSetupError,
+        >,
+    ) -> Result<(Simulation, T), super::LandSetupError> {
+        use super::{LandMode, LandOwnership, LandRecipe, LandSetupError};
+        let extent = spec.terrain_extent;
+        if extent.area().is_none() {
+            return Err(LandSetupError::InvalidExtent(extent));
+        }
+        if !spec.owned_rect.valid(extent) {
+            return Err(LandSetupError::InvalidOwnedRect(spec.owned_rect));
+        }
+        if spec.recipe_id == 0
+            || !spec.source_crop.ll.is_finite()
+            || !spec.source_crop.ur.is_finite()
+            || spec.source_crop.w() <= 0.0
+            || spec.source_crop.h() <= 0.0
+            || !spec.town_origin.is_finite()
+            || !spec.town_scale.is_finite()
+            || spec.town_scale <= 0.0
+        {
+            return Err(LandSetupError::InvalidMode(LandMode::Tiled));
+        }
+        let minimum = if spec.progression == ProgressionMode::Guided {
+            150_000
+        } else {
+            10_000
+        };
+        if !(minimum..=NewGameOptions::MAX_STARTING_MONEY_BUCKS)
+            .contains(&spec.starting_money_bucks)
+        {
+            return Err(LandSetupError::InvalidOpeningBudget(
+                spec.starting_money_bucks,
+            ));
+        }
+        let options = SimulationOptions {
+            terrain_size: extent.width,
+            preset: MapPreset::Flat,
+            seed: spec.seed,
+            starting_money_bucks: spec.starting_money_bucks,
+            progression: spec.progression,
+            save_replay: false,
+            land_mode: LandMode::Tiled,
+            land_recipe: LandRecipe::AuthoredV1 {
+                recipe_id: spec.recipe_id,
+                extent,
+                owned_rect: spec.owned_rect,
+                lot_layout: spec.lot_layout,
+            },
+        };
+        let mut sim = Self::with_initial_resources();
+        WorldCommand::bootstrap_authored(&mut sim, options, spec.lot_layout)
+            .map_err(|_| LandSetupError::InvalidMode(LandMode::Tiled))?;
+        let (result, reserves) = assemble(&mut sim)?;
+        if sim.get_tick() != crate::INITIAL_TICK || sim.read::<Replay>().enabled {
+            return Err(LandSetupError::InvalidMode(LandMode::Tiled));
+        }
+        {
+            let mut map = sim.map_mut();
+            map.install_land_ownership(LandOwnership::tiled(extent, spec.owned_rect, reserves)?);
+            // Transit and property placement during assembly initially use trusted
+            // inputs. Vacant legacy lots are regenerated at fixed frontage stations.
+            let roads: Vec<_> = map.roads().keys().collect();
+            map.clear_authored_vacant_lots();
+            for road in roads {
+                map.generate_land_frontage(road);
+            }
+            map.rebuild_land_frontage()
+                .map_err(|_| LandSetupError::NoBuildableFrontage(spec.owned_rect.origin))?;
+            if map.lots().is_empty() {
+                return Err(LandSetupError::NoBuildableFrontage(spec.owned_rect.origin));
+            }
+            map.update();
+        }
+        super::validate_loaded_land(&sim)
+            .map_err(|_| LandSetupError::InvalidOwnedRect(spec.owned_rect))?;
+        sim.world.reconcile_derived("authored tiled world");
+        Ok((sim, result))
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct RailMarketSite {
     pub footprint: OBB,
@@ -176,6 +280,8 @@ impl Simulation {
                 seed: options.seed,
                 starting_money_bucks: options.starting_money_bucks,
                 progression: options.progression,
+                land_mode: crate::map::LandMode::Unrestricted,
+                land_recipe: crate::map::LandRecipe::Unrestricted,
             },
             options.lot_layout,
         )
@@ -189,7 +295,7 @@ impl Simulation {
         &mut self,
         site: RailMarketSite,
     ) -> Result<BuildingID, RailMarketError> {
-        if self.read::<Replay>().enabled {
+        if self.read::<Replay>().enabled || self.map().land_ownership().is_tiled() {
             return Err(RailMarketError::Replay);
         }
         let RailMarketSite {

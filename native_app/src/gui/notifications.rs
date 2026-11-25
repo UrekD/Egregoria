@@ -6,7 +6,7 @@ use simulation::economy::cargo::{CargoBook, IMPORT_WAIT_WARNING};
 use simulation::economy::progression::{milestone_population, milestone_reward, ProgressionState};
 use simulation::economy::{
     balance::{DEMAND_INTERVAL_TICKS, MIN_DEMAND_POPULATION},
-    Budget, BudgetCategory, Government, ZoneDemand,
+    Budget, Government, ZoneDemand,
 };
 use simulation::map::{BuildingID, ZoneKind};
 use simulation::map_dynamic::{ElectricityFlow, LineID, Transit, UtilityFlow, UtilityStatus};
@@ -442,7 +442,7 @@ impl NotificationSampler {
             .days()
             .values()
             .flat_map(|day| day.iter())
-            .filter(|(category, _)| **category != BudgetCategory::Construction)
+            .filter(|(category, _)| category.is_operating())
             .map(|(_, delta)| *delta)
             .sum::<i128>();
         if let Some(previous) = self.operating_balance.replace(operating_balance) {
@@ -652,6 +652,7 @@ fn command_label(command: &str) -> &'static str {
         "MapBuildHouse" => "Build house",
         "Terraform" => "Edit terrain",
         "EditWater" => "Edit water",
+        "BuyTile" => "Buy land",
         "SendMessage" => "Send message",
         "SpawnRandomCars" => "Spawn cars",
         "AddTrain" | "SpawnTrain" => "Place train",
@@ -717,6 +718,22 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         (_, WaterConfigured) => "This map already has configured water",
         (_, WaterTerrainConflict) => "The terrain edit conflicts with water or nearby structures",
         (_, WaterServiceSite(site)) => return site.to_string().into(),
+        (_, TileUnavailable) => "Land tile is unavailable",
+        (_, TileAlreadyOwned) => "The city already owns this tile",
+        (_, TileNotAdjacent) => "Choose a tile next to land the city owns",
+        (_, LandSetup(_)) => "The tiled city could not be initialized",
+        (_, LandDenied(denial)) => match denial {
+            simulation::map::LandDenial::OutsideMap => "Construction extends outside the map",
+            simulation::map::LandDenial::Unowned(tile) => {
+                return format!("The city does not own tile ({}, {})", tile.x, tile.y).into();
+            }
+            simulation::map::LandDenial::ProtectedGateway => "The external corridor is protected",
+            simulation::map::LandDenial::RequiresMutableAccess => "Choose an editable access road",
+            simulation::map::LandDenial::ForbiddenOperation => {
+                "This action is unavailable on a tiled map"
+            }
+            simulation::map::LandDenial::WorkLimit => "The edit exceeds the land work limit",
+        },
     };
     message.into()
 }

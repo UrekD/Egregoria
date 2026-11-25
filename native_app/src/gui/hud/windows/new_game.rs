@@ -47,10 +47,10 @@ impl NewGameForm {
             .parse()
             .ok()
             .filter(|size| {
-                (NewGameOptions::MIN_TERRAIN_CHUNKS..=NewGameOptions::MAX_TERRAIN_CHUNKS)
+                (NewGameOptions::MIN_TERRAIN_CHUNKS..=simulation::map::MAX_NATIVE_LAND_SIDE)
                     .contains(size)
             })
-            .ok_or("Enter a map size from 16 to 80 chunks.")?;
+            .ok_or("Enter a map size from 16 to 50 chunks.")?;
         let starting_money_bucks = self
             .money
             .trim()
@@ -69,6 +69,7 @@ impl NewGameForm {
             starting_money_bucks,
             progression: self.progression,
             lot_layout: self.lot_layout,
+            land_mode: Default::default(),
         })
     }
 }

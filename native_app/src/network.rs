@@ -1,6 +1,10 @@
 #[cfg(feature = "multiplayer")]
 pub use self::inner::*;
 use crate::uiworld::UiWorld;
+#[cfg(any(feature = "multiplayer", test))]
+use crate::uiworld::TilePurchaseReceipt;
+#[cfg(any(feature = "multiplayer", test))]
+use simulation::world_command::{CommandOutcomes, WorldCommand, WorldCommands};
 use common::timestep::Timestep;
 
 #[cfg(feature = "multiplayer")]
@@ -31,6 +35,41 @@ pub enum NetworkState {
     Singleplayer(Timestep),
 }
 
+#[cfg(any(feature = "multiplayer", test))]
+fn local_frame_commands<'a>(
+    inputs: impl IntoIterator<Item = (bool, &'a WorldCommands)> + 'a,
+) -> impl Iterator<Item = (usize, &'a WorldCommand)> + 'a {
+    inputs
+        .into_iter()
+        .flat_map(|(local, commands)| commands.iter().map(move |command| (local, command)))
+        .enumerate()
+        .filter_map(|(index, (local, command))| local.then_some((index, command)))
+}
+
+#[cfg(any(feature = "multiplayer", test))]
+fn tile_receipts<'a>(
+    generation: u64,
+    frame: u64,
+    outcomes: &'a CommandOutcomes,
+    commands: impl IntoIterator<Item = (usize, &'a WorldCommand)> + 'a,
+) -> impl Iterator<Item = TilePurchaseReceipt> + 'a {
+    commands
+        .into_iter()
+        .filter_map(move |(command_index, command)| {
+            let WorldCommand::BuyTile { tile } = *command else {
+                return None;
+            };
+            Some(TilePurchaseReceipt {
+                generation,
+                frame,
+                command_index,
+                tile,
+                batch_sequence: outcomes.batch_seq(),
+                result: outcomes.tile_purchase(command_index)?,
+            })
+        })
+}
+
 pub fn is_singleplayer(uiw: &UiWorld) -> bool {
     matches!(*uiw.read::<NetworkState>(), NetworkState::Singleplayer(_))
 }
@@ -45,7 +84,7 @@ mod inner {
         ConnectConf, Frame, PollResult, ServerConfiguration, ServerPollResult, VirtualClientConf,
     };
     use prototypes::DELTA_F64;
-    use simulation::world_command::{CommandOutcomes, WorldCommands};
+    use super::{CommandOutcomes, WorldCommands};
     use simulation::Simulation;
     use std::net::ToSocketAddrs;
     use std::sync::Mutex;
@@ -119,6 +158,8 @@ mod inner {
 
         if let Some(inputs) = inputs_to_apply {
             let mut merged = WorldCommands::default();
+            let mut purchases = Vec::new();
+            let generation = state.uiw.read::<crate::session::SessionState>().generation;
             for frame_commands in inputs {
                 assert_eq!(frame_commands.frame.0, sim.get_tick() + 1);
                 let commands: WorldCommands = frame_commands
@@ -132,18 +173,30 @@ mod inner {
                     .write::<Timings>()
                     .world_update
                     .add_value(t.as_secs_f32());
-                let accepted = sim.read::<CommandOutcomes>();
-                let mut offset = 0;
-                for input in frame_commands.inputs {
-                    for (index, command) in input.inp.as_ref().iter().enumerate() {
-                        if input.sent_by_me && accepted.accepted.contains(&(offset + index)) {
-                            merged.push(command.clone());
-                        }
+                let outcomes = sim.read::<CommandOutcomes>();
+                let local = || {
+                    super::local_frame_commands(
+                        frame_commands
+                            .inputs
+                            .iter()
+                            .map(|input| (input.sent_by_me, &input.inp)),
+                    )
+                };
+                purchases.extend(super::tile_receipts(
+                    generation,
+                    frame_commands.frame.0,
+                    &outcomes,
+                    local(),
+                ));
+                for (index, command) in local() {
+                    if outcomes.accepted.contains(&index) {
+                        merged.push(command.clone());
                     }
-                    offset += input.inp.as_ref().len();
                 }
             }
-            *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::new(merged);
+            let mut received = ReceivedCommands::new(merged);
+            received.tile_purchases = purchases;
+            *state.uiw.write::<ReceivedCommands>() = received;
         }
         false
     }
@@ -223,4 +276,55 @@ mod inner {
 
         Some(Mutex::new(client))
     }
+}
+
+#[cfg(test)]
+#[test]
+fn land_receipts_keep_local_command_indices_across_catch_up_frames() {
+    use simulation::map::{LandMode, LandTileId};
+    use simulation::world_command::Rejection;
+    use simulation::{MapPreset, NewGameOptions};
+    scenarios::ensure_repo_root_cwd();
+    simulation::init::init();
+    let mut sim = simulation::Simulation::new_game(&NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: 16,
+        land_mode: LandMode::Tiled,
+        ..NewGameOptions::default()
+    })
+    .unwrap();
+    let remote = WorldCommands::from(vec![
+        WorldCommand::SetTaxRate {
+            zone: simulation::map::ZoneKind::Residential,
+            rate_permille: 120,
+        };
+        2
+    ]);
+    let denied = LandTileId { x: 10, y: 7 };
+    let paid = LandTileId { x: 9, y: 7 };
+    let mut receipts = Vec::new();
+    for (frame, tile) in [(2, denied), (3, paid)] {
+        let local = WorldCommands::from(vec![WorldCommand::BuyTile { tile }]);
+        sim.tick(
+            &mut simulation::Simulation::schedule(),
+            remote.iter().chain(local.iter()),
+        );
+        receipts.extend(tile_receipts(
+            4,
+            frame,
+            &sim.read::<CommandOutcomes>(),
+            local_frame_commands([(false, &remote), (true, &local)]),
+        ));
+    }
+    assert_eq!(receipts.len(), 2);
+    assert_eq!(receipts[0].result, Err(Rejection::TileNotAdjacent));
+    assert_eq!(receipts[1].result.unwrap().tile, paid);
+    assert!(receipts[0].batch_sequence < receipts[1].batch_sequence);
+    assert_eq!(
+        receipts
+            .iter()
+            .map(|receipt| (receipt.generation, receipt.frame, receipt.command_index))
+            .collect::<Vec<_>>(),
+        [(4, 2, 2), (4, 3, 2)]
+    );
 }

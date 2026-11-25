@@ -67,6 +67,9 @@ impl Simulation {
         options: &NewGameOptions,
     ) -> Result<(Self, ImportedNetwork), String> {
         options.validate().map_err(|error| error.to_string())?;
+        if options.land_mode != crate::map::LandMode::Unrestricted {
+            return Err("legacy import requires unrestricted land".to_owned());
+        }
         if options.preset == MapPreset::Waters {
             return Err("import requires a dry map preset".to_owned());
         }
@@ -88,6 +91,8 @@ impl Simulation {
                 seed: options.seed,
                 starting_money_bucks: options.starting_money_bucks,
                 progression: options.progression,
+                land_mode: crate::map::LandMode::Unrestricted,
+                land_recipe: crate::map::LandRecipe::Unrestricted,
             },
         )
         .map_err(|error| format!("import bootstrap: {error:?}"))?;
@@ -101,7 +106,7 @@ impl Simulation {
 impl Simulation {
     /// Set the handoff treasury after commissioning and post the adjustment to the ledger.
     pub fn fund_imported_opening(&self, balance: Money) -> Result<(), &'static str> {
-        if !self.map().import_lane_reserve {
+        if !self.map().import_lane_reserve || self.map().land_ownership().is_tiled() {
             return Err("opening funding requires an imported map");
         }
         let current = self.read::<Government>().money;
@@ -123,7 +128,11 @@ impl Simulation {
         mut retain: impl FnMut(Vec2) -> Result<bool, E>,
     ) -> Result<(), E> {
         let mut error = None;
-        self.map_mut().environment.retain_imported_trees(|pos| {
+        let mut map = self.map_mut();
+        if map.land_ownership().is_tiled() {
+            return Ok(());
+        }
+        map.environment.retain_imported_trees(|pos| {
             if error.is_some() {
                 return true;
             }
@@ -724,6 +733,7 @@ mod tests {
             starting_money_bucks: 1_000_000,
             progression: crate::economy::progression::ProgressionMode::FreeBuild,
             lot_layout: crate::map::LotLayout::Varied,
+            land_mode: Default::default(),
         };
         let (sim, report) = Simulation::from_imported_city(&city, &options).unwrap();
         let map = sim.map();
@@ -754,6 +764,7 @@ mod tests {
             starting_money_bucks: 1_000_000,
             progression: crate::economy::progression::ProgressionMode::FreeBuild,
             lot_layout: crate::map::LotLayout::Varied,
+            land_mode: Default::default(),
         }
     }
 

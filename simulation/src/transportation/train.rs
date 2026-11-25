@@ -117,7 +117,7 @@ pub fn train_length(wagons: &[RollingStockID]) -> f32 {
         .sum::<f32>()
 }
 
-pub fn spawn_train(
+pub(crate) fn spawn_train(
     sim: &mut Simulation,
     wagons: &[RollingStockID],
     kind: RailWagonKind,

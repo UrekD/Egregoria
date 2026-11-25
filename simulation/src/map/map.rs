@@ -78,6 +78,8 @@ pub(crate) struct PreparedGrowable {
 }
 
 pub struct Map {
+    pub(super) land_ownership: super::LandOwnership,
+    pub(super) land_frontage: super::land_frontage::LandFrontage,
     pub(crate) roads: Roads,
     pub(crate) lanes: Lanes,
     pub(crate) intersections: Intersections,
@@ -136,6 +138,8 @@ impl Clone for Map {
 
         // Like a loaded map, the clone starts with its own subscriptions and identity.
         Self {
+            land_ownership: self.land_ownership.clone(),
+            land_frontage: self.land_frontage.clone(),
             roads: self.roads.clone(),
             lanes: self.lanes.clone(),
             intersections: self.intersections.clone(),
@@ -163,6 +167,8 @@ impl Map {
     pub fn empty() -> Self {
         static NEXT_IDENTITY: AtomicU64 = AtomicU64::new(1);
         Self {
+            land_ownership: super::LandOwnership::Unrestricted,
+            land_frontage: Default::default(),
             roads: Roads::default(),
             lanes: Lanes::default(),
             intersections: Intersections::default(),
@@ -201,6 +207,23 @@ impl Map {
     ///     let _ = sim.write::<Map>().environment.set_sea_level(Some(-100));
     /// }
     /// ```
+    pub fn land_ownership(&self) -> &super::LandOwnership {
+        &self.land_ownership
+    }
+
+    pub(crate) fn install_land_ownership(&mut self, ownership: super::LandOwnership) {
+        assert!(!self.land_ownership.is_tiled());
+        self.land_ownership = ownership;
+    }
+
+    pub(crate) fn buy_prepared_tile(&mut self, tile: super::LandTileId) {
+        self.land_ownership.purchase(tile);
+    }
+
+    pub(crate) fn needs_topology_preparation(&self) -> bool {
+        self.land_ownership.is_tiled() || self.environment.has_water_configuration()
+    }
+
     pub fn environment(&self) -> &Environment {
         &self.environment
     }
@@ -212,6 +235,9 @@ impl Map {
 
     /// Install authored terrain into a new, empty map.
     pub fn install_environment(&mut self, environment: Environment) -> bool {
+        if self.land_ownership.is_tiled() {
+            return false;
+        }
         let (width, height) = environment.size();
         if width.max(height) > super::MAX_WATER_CHUNKS_PER_AXIS
             || self.environment.size() != (0, 0)
@@ -260,7 +286,7 @@ impl Map {
             .intersections
             .get(id)
             .ok_or(ConnectionError::InvalidEndpoint)?;
-        if self.environment.strict_water_siting() {
+        if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
             let mut next = inter.clone();
             f(&mut next);
             if next.id != id {
@@ -281,20 +307,46 @@ impl Map {
         Ok(())
     }
 
+    pub(crate) fn prepare_intersection_policy(
+        &self,
+        id: IntersectionID,
+        turn: super::TurnPolicy,
+        light: super::LightPolicy,
+    ) -> Result<(), ConnectionError> {
+        let mut next = self
+            .get(id)
+            .ok_or(ConnectionError::InvalidEndpoint)?
+            .clone();
+        if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
+            next.turn_policy = turn;
+            next.light_policy = light;
+            super::prepare_junction_update(self, &next, &mut WaterTopologyWork::new().geometry())?;
+        }
+        Ok(())
+    }
+
     pub fn remove_intersection(&mut self, src: IntersectionID) {
         let _ = self.try_remove_intersection(src);
+    }
+
+    pub(crate) fn prepare_remove_intersection(
+        &self,
+        src: IntersectionID,
+    ) -> Result<(), ConnectionError> {
+        if !self.intersections.contains_key(src) {
+            return Err(ConnectionError::InvalidEndpoint);
+        }
+        if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
+            super::prepare_junction_removal(self, src, &mut WaterTopologyWork::new().geometry())?;
+        }
+        Ok(())
     }
 
     pub(crate) fn try_remove_intersection(
         &mut self,
         src: IntersectionID,
     ) -> Result<(), ConnectionError> {
-        if !self.intersections.contains_key(src) {
-            return Err(ConnectionError::InvalidEndpoint);
-        }
-        if self.environment.strict_water_siting() {
-            super::prepare_junction_removal(self, src, &mut WaterTopologyWork::new().geometry())?;
-        }
+        self.prepare_remove_intersection(src)?;
         self.remove_intersection_inner(src);
         self.check_invariants();
         Ok(())
@@ -329,6 +381,10 @@ impl Map {
     pub fn remove_building(&mut self, b: BuildingID) -> Option<Building> {
         info!("remove_building {:?}", b);
 
+        self.authorize_land_effects(super::PreparedEffects::Building(b))
+            .ok()?;
+        self.authorize_building_cut(&self.buildings.get(b)?.obb)
+            .ok()?;
         let b = self.buildings.remove(b)?;
         self.water_services.building_removed(&self.environment, b.id);
         queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &b);
@@ -499,8 +555,7 @@ impl Map {
         pattern: &LanePattern,
     ) -> Result<ConnectionOutcome, ConnectionError> {
         let mut work = self
-            .environment
-            .has_water_configuration()
+            .needs_topology_preparation()
             .then(WaterTopologyWork::new);
         let (from, to, prepared) =
             self.prepare_connection(from, to, elbow, pattern, work.as_mut())?;
@@ -535,6 +590,13 @@ impl Map {
         ),
         ConnectionError,
     > {
+        let mut local;
+        if work.is_none() && self.land_ownership.is_tiled() {
+            local = WaterTopologyWork::new();
+            let (from, to, prepared) =
+                self.prepare_connection(from, to, elbow, pattern, Some(&mut local))?;
+            return Ok((from, to, prepared));
+        }
         let endpoints = if let Some(work) = work.as_deref_mut() {
             if !wet_lane_count_fits(pattern) {
                 return Err(ConnectionError::WorkLimit);
@@ -759,6 +821,9 @@ impl Map {
         pattern: &LanePattern,
         prepared: Option<PreparedTopologyEdit>,
     ) -> Result<ConnectedRoad, ConnectionError> {
+        if prepared.is_none() && self.land_ownership.is_tiled() {
+            return Err(ConnectionError::Stale);
+        }
         if prepared
             .as_ref()
             .is_some_and(|prepared| !prepared.matches(self))
@@ -987,6 +1052,7 @@ impl Map {
 
     pub fn update_zone(&mut self, id: BuildingID, zone: Zone) -> Option<()> {
         let zone = zone.normalized()?;
+        self.authorize_zone_change(id, &zone).ok()?;
         let b = self.buildings.get_mut(id)?;
         if !Building::dry_footprint(&self.environment, &b.obb, Some(&zone)) {
             return None;
@@ -996,18 +1062,10 @@ impl Map {
         self.subscribers.dispatch(UpdateType::Building, b);
 
         let z = b.zone.as_ref().unwrap();
-        self.environment.remove_trees_near(&z.poly, |tree_chunk| {
-            self.subscribers
-                .dispatch_chunk(UpdateType::Terrain, tree_chunk)
-        });
-
-        let toclean = self
-            .spatial_map
-            .query(&z.poly, ProjectFilter::LOT)
-            .collect();
-
+        let trees = z.poly.clone();
+        let toclean = self.spatial_map.query(&trees, ProjectFilter::LOT).collect();
         self.spatial_map.update(b);
-
+        self.clear_construction_trees(&trees);
         self.clean_lots_inner(toclean);
 
         self.check_invariants();
@@ -1029,6 +1087,8 @@ impl Map {
         if !Building::valid_footprint(obb, gen) {
             return None;
         }
+        self.authorize_new_building(obb, gen, zone.as_ref(), connected_road)
+            .ok()?;
         super::validate_water_service_placement(self, kind, *obb, connected_road).ok()?;
         if self.building_overlaps(*obb) {
             log::warn!("did not build {:?}: building overlaps", kind);
@@ -1060,11 +1120,7 @@ impl Map {
 
         self.clean_lots_inner(self.spatial_map.query(obb, ProjectFilter::LOT).collect());
 
-        self.environment
-            .remove_trees_near(obb.expand(10.0), |tree_chunk| {
-                self.subscribers
-                    .dispatch_chunk(UpdateType::Terrain, tree_chunk)
-            });
+        self.clear_construction_trees(obb.expand(10.0));
 
         queue_construction_cut(
             &mut self.pending_construction_cuts,
@@ -1133,6 +1189,8 @@ impl Map {
         appearance: Option<PreparedGrowableAppearance>,
     ) -> Result<PreparedGrowable, GrowableLotError> {
         let attachment = self.growable_attachment(lot)?;
+        self.authorize_new_building(&lot.shape, generator, None, Some(lot.parent))
+            .map_err(GrowableLotError::LandDenied)?;
         let building = Building::prepare(
             &self.environment,
             lot.shape,
@@ -1168,6 +1226,8 @@ impl Map {
             return Err(GrowableLotError::MissingRoad);
         }
         lot.check_growable_footprint(self, prepared.generator)?;
+        self.authorize_new_building(&lot.shape, prepared.generator, None, Some(lot.parent))
+            .map_err(GrowableLotError::LandDenied)?;
         if self.construction_grade_revision() != prepared.grade_revision {
             return Err(GrowableLotError::InfeasibleGrade);
         }
@@ -1195,6 +1255,12 @@ impl Map {
         id: BuildingID,
         appearance: PreparedGrowableAppearance,
     ) -> bool {
+        if self
+            .authorize_land_effects(super::PreparedEffects::Building(id))
+            .is_err()
+        {
+            return false;
+        }
         let Some(building) = self.buildings.get_mut(id) else {
             return false;
         };
@@ -1304,6 +1370,8 @@ impl Map {
         growable: bool,
     ) -> Option<BuildingID> {
         let lot = self.lots.get(lot_id)?;
+        self.authorize_new_building(&lot.shape, gen, None, Some(lot.parent))
+            .ok()?;
         let road = self.roads.get(lot.parent)?;
         if !Lot::allows_frontage(self, road)
             || !Lot::has_dry_frontage(&self.environment, road, &lot.shape)
@@ -1357,13 +1425,18 @@ impl Map {
         self.try_remove_road(road_id).ok()
     }
 
-    pub(crate) fn try_remove_road(&mut self, road_id: RoadID) -> Result<Road, ConnectionError> {
+    pub(crate) fn prepare_remove_road(&self, road_id: RoadID) -> Result<(), ConnectionError> {
         if !self.roads.contains_key(road_id) {
             return Err(ConnectionError::InvalidEndpoint);
         }
-        if self.environment.strict_water_siting() {
+        if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
             super::prepare_road_removal(self, road_id, &mut WaterTopologyWork::new().geometry())?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn try_remove_road(&mut self, road_id: RoadID) -> Result<Road, ConnectionError> {
+        self.prepare_remove_road(road_id)?;
         let removed = self
             .remove_road_inner(road_id)
             .expect("road preflight checked reference");
@@ -1373,6 +1446,10 @@ impl Map {
 
     pub fn subscribe(&self, filter: UpdateType) -> MapSubscriber {
         self.subscribers.subscribe(filter)
+    }
+
+    pub(super) fn clear_authored_vacant_lots(&mut self) {
+        self.clean_lots_inner(self.lots.keys().map(ProjectKind::Lot).collect());
     }
 
     fn clean_lots_inner(&mut self, mut to_clean: Vec<ProjectKind>) {
@@ -1440,7 +1517,7 @@ impl Map {
     /// It all happens within the command: about 50 ms for the ~1000 roads of the Lesce
     /// import in a release build, a one-off hitch for an occasional settings change.
     pub fn set_lot_layout(&mut self, layout: LotLayout) {
-        if self.lot_layout == layout {
+        if self.lot_layout == layout || self.land_ownership.is_tiled() {
             return;
         }
         info!("set_lot_layout {:?}", layout);
@@ -1473,6 +1550,12 @@ impl Map {
     }
 
     pub fn set_lot_kind(&mut self, lot: LotID, kind: LotKind) {
+        if self
+            .authorize_land_effects(super::PreparedEffects::Lot(lot))
+            .is_err()
+        {
+            return;
+        }
         match self.lots.get_mut(lot) {
             Some(lot) => {
                 lot.kind = kind;
@@ -1721,6 +1804,7 @@ impl Map {
     /// and potentially empty intersections.
     fn remove_raw_road(&mut self, road_id: RoadID) -> Option<Road> {
         let road = self.roads.remove(road_id)?;
+        self.retire_land_frontage(road_id);
         self.lane_topology_changed();
 
         self.spatial_map.remove(road_id);
@@ -1845,6 +1929,11 @@ impl Map {
             self.electricity.add_edge(b.id, road_id);
         }
 
+        if self.land_ownership.is_tiled() {
+            for road in roads {
+                self.generate_land_frontage(road);
+            }
+        }
         Some(RoadSplit {
             original: split_road_id,
             junction: id,
@@ -1854,8 +1943,7 @@ impl Map {
 
     pub(crate) fn merge_road(&mut self, road1: RoadID, road2: RoadID) -> Option<RoadID> {
         let mut work = self
-            .environment
-            .has_water_configuration()
+            .needs_topology_preparation()
             .then(WaterTopologyWork::new);
         self.merge_road_checked(road1, road2, work.as_mut(), false)
             .ok()
@@ -1925,7 +2013,7 @@ impl Map {
             );
 
         let check_water = self.environment.strict_water_siting();
-        if !validated && (check_water || work.is_some()) {
+        if !validated && (self.land_ownership.is_tiled() || check_water || work.is_some()) {
             if self.intersections[same_inter].roads.len() != 2 {
                 return Ok(None);
             }
@@ -2017,6 +2105,9 @@ impl Map {
                 .building_changed(&self.environment, &self.roads, &self.buildings[id]);
         }
 
+        if self.land_ownership.is_tiled() {
+            self.generate_land_frontage(new_id);
+        }
         Ok(Some(new_id))
     }
 
@@ -2028,7 +2119,7 @@ impl Map {
         pattern: &LanePattern,
         segment: RoadSegmentKind,
     ) -> Option<RoadID> {
-        if !self.environment.strict_water_siting() {
+        if !self.environment.strict_water_siting() && !self.land_ownership.is_tiled() {
             let gen_lots = !matches!(segment, RoadSegmentKind::Arbitrary(_));
             let road = self.connect_with_span(src_id, dst_id, pattern, segment, None, None)?;
             if gen_lots {
@@ -2136,12 +2227,30 @@ impl Map {
         let r = &self.roads[rid];
         let mut b = r.boldline();
         b.expand(40.0);
-        self.environment.remove_trees_near(&b, |tree_chunk| {
-            self.subscribers
-                .dispatch_chunk(UpdateType::Terrain, tree_chunk)
-        });
+        self.clear_construction_trees(&b);
 
         Some(rid)
+    }
+
+    fn clear_construction_trees(&mut self, shape: impl geom::Intersect<Vec2>) {
+        let land = &self.land_ownership;
+        let spatial = &self.spatial_map;
+        self.environment.remove_trees_near_filtered(
+            shape,
+            |point| {
+                land.check_point(point).is_ok()
+                    && (!land.is_tiled()
+                        || !spatial
+                            .query(
+                                point,
+                                ProjectFilter::ROAD
+                                    | ProjectFilter::INTER
+                                    | ProjectFilter::BUILDING,
+                            )
+                            .any(|object| land.is_protected(object)))
+            },
+            |chunk| self.subscribers.dispatch_chunk(UpdateType::Terrain, chunk),
+        );
     }
 
     // Public helpers
@@ -2487,7 +2596,7 @@ impl WaterTopologyWork {
         }
     }
 
-    fn geometry(&mut self) -> CrossingWork<'_> {
+    pub(crate) fn geometry(&mut self) -> CrossingWork<'_> {
         CrossingWork::new(
             &mut self.remaining,
             &mut self.deck_tiles,

@@ -82,7 +82,11 @@ impl Environment {
         if size >= NewGameOptions::MIN_TERRAIN_CHUNKS {
             valley_axis *= f32::from(size) / f32::from(SimulationOptions::LEGACY.terrain_size);
         }
-        Self::generate(size, size, options.preset, options.seed, valley_axis)
+        let height = match options.land_recipe {
+            crate::map::LandRecipe::AuthoredV1 { extent, .. } => extent.height,
+            _ => size,
+        };
+        Self::generate(size, height, options.preset, options.seed, valley_axis)
     }
 
     pub(super) fn generate(w: u16, h: u16, preset: MapPreset, seed: u64, valley_axis: f32) -> Self {
@@ -124,16 +128,21 @@ impl Environment {
         self.heightmap.height(pos)
     }
 
-    pub fn remove_trees_near(
+    pub fn remove_trees_near(&mut self, obj: impl Intersect<Vec2>, f: impl FnMut(TerrainChunkID)) {
+        self.remove_trees_near_filtered(obj, |_| true, f);
+    }
+
+    pub(super) fn remove_trees_near_filtered(
         &mut self,
         obj: impl Intersect<Vec2>,
+        keep_change: impl Fn(Vec2) -> bool,
         mut f: impl FnMut(TerrainChunkID),
     ) {
         let mut to_remove = vec![];
 
         let bbox = obj.bbox();
         self.trees.query_aabb_visitor(bbox.ll, bbox.ur, |(h, pos)| {
-            if obj.intersects(&pos) {
+            if obj.intersects(&pos) && keep_change(pos) {
                 to_remove.push(h);
             }
         });

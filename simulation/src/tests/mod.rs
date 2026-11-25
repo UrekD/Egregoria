@@ -28,7 +28,7 @@ mod vehicles;
 mod zone2_lot_layout;
 
 #[test]
-fn w0_water_height_free_change_records_once_and_retry_is_clean() {
+fn w0_water_height_free_change_records_retry_without_mutation() {
     use crate::map::{WaterDirtyChunks, WaterEdit};
     use crate::{MapPreset, NewGameOptions, Replay};
 
@@ -73,7 +73,7 @@ fn w0_water_height_free_change_records_once_and_retry_is_clean() {
         sim.map().environment().water_revision(),
         initial_revision + 1
     );
-    assert_eq!(sim.read::<Replay>().command_count(), initial_commands + 1);
+    assert_eq!(sim.read::<Replay>().command_count(), initial_commands + 2);
 
     let replay = sim.read::<Replay>().clone();
     let (mut replayed, mut loader) = Simulation::try_from_replay(replay).unwrap();
@@ -359,7 +359,7 @@ fn w0_water_guarded_terraform_survives_slot_and_replay_boundaries() {
     assert_eq!(loaded.get_tick(), before_tick + 1);
     assert_eq!(
         loaded.read::<Replay>().command_count(),
-        previous_commands + 1
+        previous_commands + 2
     );
     let after_height = loaded.map().environment().base_height(vec2(160.0, 160.0));
     assert!(after_height < before_height);
@@ -962,7 +962,7 @@ fn zones2_mix_payload_rejections_leave_replay_and_paint_unchanged() {
         Bincode::encode(&*sim.read::<Budget>()).unwrap(),
         budget_before
     );
-    assert_eq!(sim.read::<Replay>().command_count(), before);
+    assert_eq!(sim.read::<Replay>().command_count(), before + 5);
     assert_eq!(sim.read::<ZoneGrid>().generation(), 0);
     assert!(sim.read::<ZoneGrid>().cells().is_empty());
 
@@ -989,7 +989,7 @@ fn zones2_mix_payload_rejections_leave_replay_and_paint_unchanged() {
 
     paint(area, None, Density::High).apply(&mut sim);
     assert!(sim.read::<ZoneGrid>().cells().is_empty());
-    assert_eq!(sim.read::<Replay>().command_count(), before + 3);
+    assert_eq!(sim.read::<Replay>().command_count(), before + 8);
 }
 
 #[test]
@@ -1574,3 +1574,5 @@ fn zones2_fix_scrubs_departing_company_trades_at_the_drain() {
         SoulID::GoodsCompany(remaining)
     );
 }
+
+mod land_ownership;

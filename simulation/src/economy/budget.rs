@@ -30,6 +30,19 @@ pub enum BudgetCategory {
     TransitUpkeep,
     StarterInfrastructure,
     MilestoneGrant,
+    LandPurchase,
+}
+
+impl BudgetCategory {
+    pub fn is_operating(self) -> bool {
+        !matches!(
+            self,
+            Self::Construction
+                | Self::StarterInfrastructure
+                | Self::MilestoneGrant
+                | Self::LandPurchase
+        )
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]

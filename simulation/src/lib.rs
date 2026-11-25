@@ -11,7 +11,7 @@ use crate::map_dynamic::{transit, Itinerary, ItineraryLeader};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
-use crate::world_command::{CommandOutcomes, Rejection, WaterBatch, WorldCommand};
+use crate::world_command::{CommandOutcomes, PrepareBudget, Rejection, WorldCommand};
 use common::saveload::{
     self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry, SlotMeta,
     SnapshotKind,
@@ -144,6 +144,7 @@ pub struct NewGameOptions {
     pub starting_money_bucks: u32,
     pub progression: ProgressionMode,
     pub lot_layout: LotLayout,
+    pub land_mode: map::LandMode,
 }
 
 impl NewGameOptions {
@@ -165,6 +166,26 @@ impl NewGameOptions {
         {
             return Err(NewGameError::StartingMoneyBucks(self.starting_money_bucks));
         }
+        if self.land_mode == map::LandMode::Tiled {
+            if self.preset != MapPreset::Flat {
+                return Err(NewGameError::Land(map::LandSetupError::InvalidMode(
+                    self.land_mode,
+                )));
+            }
+            if self.terrain_chunks > map::MAX_NATIVE_TILED_SIDE {
+                return Err(NewGameError::Land(map::LandSetupError::InvalidExtent(
+                    map::TileExtent {
+                        width: self.terrain_chunks,
+                        height: self.terrain_chunks,
+                    },
+                )));
+            }
+            if self.progression == ProgressionMode::Guided && self.starting_money_bucks < 150_000 {
+                return Err(NewGameError::Land(
+                    map::LandSetupError::InvalidOpeningBudget(self.starting_money_bucks),
+                ));
+            }
+        }
         Ok(())
     }
 }
@@ -174,6 +195,7 @@ pub enum NewGameError {
     TerrainChunks(u16),
     StartingMoneyBucks(u32),
     Bootstrap(Rejection),
+    Land(map::LandSetupError),
 }
 
 impl Display for NewGameError {
@@ -191,6 +213,7 @@ impl Display for NewGameError {
                 NewGameOptions::MIN_STARTING_MONEY_BUCKS,
                 NewGameOptions::MAX_STARTING_MONEY_BUCKS
             ),
+            Self::Land(reason) => write!(f, "Could not initialize tiled land ({reason:?})"),
             Self::Bootstrap(reason) => write!(f, "Could not initialize the map ({reason:?})"),
         }
     }
@@ -208,6 +231,7 @@ impl Default for NewGameOptions {
             starting_money_bucks: legacy.starting_money_bucks,
             progression: legacy.progression,
             lot_layout: LotLayout::Varied,
+            land_mode: map::LandMode::Unrestricted,
         }
     }
 }
@@ -221,6 +245,8 @@ pub struct SimulationOptions {
     pub seed: u64,
     pub starting_money_bucks: u32,
     pub progression: ProgressionMode,
+    pub land_mode: map::LandMode,
+    pub land_recipe: map::LandRecipe,
 }
 
 impl SimulationOptions {
@@ -231,6 +257,8 @@ impl SimulationOptions {
         seed: 0,
         starting_money_bucks: 150_000,
         progression: ProgressionMode::FreeBuild,
+        land_mode: map::LandMode::Unrestricted,
+        land_recipe: map::LandRecipe::Unrestricted,
     };
 
     fn new_game_options(self) -> NewGameOptions {
@@ -240,12 +268,24 @@ impl SimulationOptions {
             terrain_chunks: self.terrain_size,
             starting_money_bucks: self.starting_money_bucks,
             progression: self.progression,
-            lot_layout: LotLayout::Varied,
+            lot_layout: match self.land_recipe {
+                map::LandRecipe::Unrestricted => LotLayout::Varied,
+                map::LandRecipe::NativeFlatV1 { lot_layout }
+                | map::LandRecipe::AuthoredV1 { lot_layout, .. } => lot_layout,
+            },
+            land_mode: self.land_mode,
         }
     }
 
     fn valid_for_bootstrap(self) -> bool {
         // Legacy scenarios and tests can start with a small or empty map.
+        match (self.land_mode, self.land_recipe) {
+            (map::LandMode::Tiled, map::LandRecipe::NativeFlatV1 { .. }) => {
+                return self.new_game_options().is_valid();
+            }
+            (map::LandMode::Unrestricted, map::LandRecipe::Unrestricted) => {}
+            _ => return false,
+        }
         self.new_game_options().is_valid()
             || (self.terrain_size < NewGameOptions::MIN_TERRAIN_CHUNKS
                 && self.preset == Self::LEGACY.preset
@@ -303,10 +343,20 @@ impl Simulation {
                 seed: options.seed,
                 starting_money_bucks: options.starting_money_bucks,
                 progression: options.progression,
+                land_mode: options.land_mode,
+                land_recipe: match options.land_mode {
+                    map::LandMode::Unrestricted => map::LandRecipe::Unrestricted,
+                    map::LandMode::Tiled => map::LandRecipe::NativeFlatV1 {
+                        lot_layout: options.lot_layout,
+                    },
+                },
             },
             options.lot_layout,
         )
-        .map_err(NewGameError::Bootstrap)
+        .map_err(|reason| match reason {
+            Rejection::LandSetup(error) => NewGameError::Land(error),
+            reason => NewGameError::Bootstrap(reason),
+        })
     }
 
     /// Creates a blank, replay-disabled Flat world for an authored layout.
@@ -397,9 +447,14 @@ impl Simulation {
         lot_layout: LotLayout,
     ) -> Result<Self, Rejection> {
         let mut sim = Self::with_initial_resources();
+        WorldCommand::bootstrap(&mut sim, opts)?;
+        if opts.land_mode == map::LandMode::Tiled {
+            sim.record_constructor_end();
+            sim.world.reconcile_derived("new tiled world");
+            return Ok(sim);
+        }
         let mut start_commands: Vec<(u32, WorldCommand)> =
             common::saveload::JSON::decode(START_COMMANDS.as_bytes()).unwrap();
-        WorldCommand::bootstrap(&mut sim, opts)?;
         {
             let map = sim.map();
             for (_, command) in &mut start_commands {
@@ -580,6 +635,7 @@ impl Simulation {
         steps_systems: bool,
         construction: BudgetCategory,
     ) {
+        let tiled = self.map().land_ownership().is_tiled();
         let mut commands = commands.into_iter();
         let Some(first) = commands.next() else {
             utils::scheduler::drain_commands(self);
@@ -588,17 +644,44 @@ impl Simulation {
         let mut batch_commands = Vec::new();
         let commands = if let Some(second) = commands.next() {
             batch_commands.extend([first, second]);
-            batch_commands.extend(commands);
+            if tiled {
+                batch_commands.extend(commands.take(255));
+            } else {
+                batch_commands.extend(commands);
+            }
             batch_commands.as_slice()
         } else {
             std::slice::from_ref(&first)
         };
-        let mut water = WaterBatch::new(commands, self.map().environment());
+        let mut water = PrepareBudget::new(commands, self.map().environment());
+        let admission = if tiled && commands.len() > 256 {
+            Err(Rejection::LandDenied(map::LandDenial::WorkLimit))
+        } else {
+            commands
+                .iter()
+                .try_for_each(|command| command.admitted(tiled, &water))
+        };
+        if let Err(reason) = admission {
+            let parent = self.write::<CommandOutcomes>().begin_batch();
+            for (index, command) in commands.iter().enumerate() {
+                let start = self.read::<CommandOutcomes>().command_start();
+                command.reject_unadmitted(self, reason);
+                self.write::<CommandOutcomes>().record_command(index, start);
+            }
+            utils::scheduler::drain_commands(self);
+            self.write::<CommandOutcomes>().finish_batch(parent);
+            return;
+        }
         let topology_generation = self.map().walking_topology_generation;
         let recording_start = self.read::<Replay>().command_count();
         let parent = self.write::<CommandOutcomes>().begin_batch();
+        let record = parent.is_none() && self.read::<Replay>().enabled;
         for (index, command) in commands.iter().enumerate() {
             let start = self.read::<CommandOutcomes>().command_start();
+            if record {
+                let tick = self.read::<GameTime>().tick;
+                self.write::<Replay>().push(tick, (*command).clone());
+            }
             command.apply_in_batch(self, construction, &mut water);
             utils::scheduler::drain_commands(self);
             self.write::<CommandOutcomes>().record_command(index, start);
@@ -607,8 +690,13 @@ impl Simulation {
             transit::on_topology_changed(self);
             economy::cargo::on_topology_changed(self);
         }
-        self.write::<Replay>()
-            .record_batch(recording_start, steps_systems, Tick(self.get_tick()));
+        if record {
+            self.write::<Replay>().record_batch(
+                recording_start,
+                steps_systems,
+                Tick(self.get_tick()),
+            );
+        }
         self.write::<CommandOutcomes>().finish_batch(parent);
     }
 
@@ -1264,6 +1352,10 @@ impl SimulationDeser {
             }
         }
 
+        crate::map::validate_loaded_land(&sim)?;
+        sim.map_mut()
+            .rebuild_land_frontage()
+            .map_err(|reason| format!("Invalid land frontage: {reason:?}"))?;
         crate::souls::lifecycle::restore_company_departures(&mut sim);
         sim.world.reconcile_derived("after resource decode");
 

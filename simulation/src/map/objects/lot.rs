@@ -58,6 +58,7 @@ pub enum GrowableLotError {
     Wet,
     InfeasibleGrade,
     MixedUseDisabled,
+    LandDenied(crate::map::LandDenial),
 }
 
 impl Lot {
@@ -67,6 +68,8 @@ impl Lot {
         generator: BuildingGen,
     ) -> Result<(), GrowableLotError> {
         let road = map.get(self.parent).ok_or(GrowableLotError::MissingRoad)?;
+        map.authorize_frontage(self.parent, &self.shape, None)
+            .map_err(GrowableLotError::LandDenied)?;
         if !Self::allows_frontage(map, road) {
             return Err(GrowableLotError::MissingRoad);
         }
@@ -117,6 +120,7 @@ impl Lot {
                 };
                 let road = map.roads.get(id)?;
                 if !Self::allows_frontage(map, road)
+                    || map.authorize_frontage(id, &shape, None).is_err()
                     || !Self::has_dry_frontage(map.environment(), road, &shape)
                 {
                     return None;
@@ -159,6 +163,7 @@ impl Lot {
     }
 
     fn make_if_clear(map: &mut Map, parent: RoadID, at: Vec3, shape: OBB) -> Option<LotID> {
+        map.authorize_frontage(parent, &shape, None).ok()?;
         let height = map.environment.height(at.xy())?;
         if (height - at.z).abs() > FRONTAGE_HEIGHT_TOLERANCE_M {
             return None;
@@ -188,7 +193,9 @@ impl Lot {
     }
 
     pub(crate) fn allows_frontage(map: &Map, road: &Road) -> bool {
-        !map.no_frontage.contains(&road.id) && road.has_sidewalks()
+        !map.no_frontage.contains(&road.id)
+            && !map.land_ownership().is_protected(road.id.into())
+            && road.has_sidewalks()
     }
 
     /// Check the lot, its adjoining deck and ground-level access.
@@ -329,6 +336,10 @@ impl Lot {
         road: RoadID,
         mut reserved: Option<usize>,
     ) {
+        if map.land_ownership().is_tiled() {
+            map.generate_land_frontage(road);
+            return;
+        }
         let Some(r) = map.roads.get(road) else {
             log::error!("trying to generate along invalid road");
             return;
@@ -473,7 +484,7 @@ impl Lot {
         Ok(false)
     }
 
-    pub fn remove_intersecting_lots(map: &mut Map, road: RoadID) {
+    pub(crate) fn remove_intersecting_lots(map: &mut Map, road: RoadID) {
         let r = unwrap_retlog!(map.roads.get(road), "{:?} does not exist", road);
         let road_shape = r.boldline();
         let mut to_remove: BTreeSet<_> = map

@@ -17,10 +17,10 @@ use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
 use crate::map::{
     Building, BuildingID, BuildingKind, ConnectionError, Density, Environment, IntersectionID,
-    LaneID, LaneKind, LanePattern, LanePatternBuilder, LightPolicy, LotID, LotLayout, Map,
-    MapProject, ProjectKind, RoadID, TerraformKind, TurnPolicy, WaterEdit, WaterEditError,
-    WaterEditOutcome, WaterTopologyWork, Zone, ZoneCellCoord, ZoneGrid, ZoneKind, ZonePaintError,
-    MAX_WATER_BATCH_WORK,
+    LandDenial, LandTileId, LaneID, LaneKind, LanePattern, LanePatternBuilder, LightPolicy, LotID,
+    LotLayout, Map, MapProject, PreparedEffects, ProjectKind, RoadID, TerraformKind, TilePurchased,
+    TurnPolicy, WaterEdit, WaterEditError, WaterEditOutcome, WaterTopologyWork, Zone,
+    ZoneGrid, ZoneKind, ZonePaintError, MAX_WATER_BATCH_WORK,
 };
 use crate::map_dynamic::{transit, BuildingInfos, LineID, ParkingManagement, StopID};
 use crate::multiplayer::chat::Message;
@@ -32,12 +32,59 @@ use crate::transportation::{spawn_parked_vehicle_with_spot, unpark, VehicleKind}
 use crate::utils::rand_provider::RandProvider;
 use crate::{CompanyID, MapPreset, Replay, Simulation, SimulationOptions, SoulID};
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct WorldCommands {
+    #[serde(deserialize_with = "bounded_batch_wire")]
     pub(crate) commands: Vec<WorldCommand>,
 }
 
-defer_serialize!(WorldCommands, Vec<WorldCommand>);
+// The wire format is shared with legacy unrestricted worlds. Tiled runtime
+// admission enforces its smaller descriptor caps before cloning a batch.
+fn bounded_batch_wire<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    bounded_command_vec::<_, _, 65_536>(deserializer)
+}
+
+pub(crate) fn bounded_command_vec<'de, D, T, const LIMIT: usize>(
+    deserializer: D,
+) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    use serde::de::{Error, IgnoredAny, SeqAccess, Visitor};
+    struct Bounded<T, const LIMIT: usize>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>, const LIMIT: usize> Visitor<'de> for Bounded<T, LIMIT> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "a sequence with at most {LIMIT} entries")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut input: A) -> Result<Self::Value, A::Error> {
+            let hint = input.size_hint().unwrap_or(0);
+            if hint > LIMIT {
+                return Err(A::Error::invalid_length(hint, &self));
+            }
+            let mut entries = Vec::with_capacity(hint);
+            while entries.len() < LIMIT {
+                let Some(entry) = input.next_element()? else {
+                    return Ok(entries);
+                };
+                entries.push(entry);
+            }
+            if input.next_element::<IgnoredAny>()?.is_some() {
+                return Err(A::Error::invalid_length(LIMIT + 1, &self));
+            }
+            Ok(entries)
+        }
+    }
+    deserializer.deserialize_seq(Bounded::<T, LIMIT>(std::marker::PhantomData))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorldCommand {
@@ -77,7 +124,8 @@ pub enum WorldCommand {
         pat: LanePattern,
     }, // todo: allow lane pattern builder
     MapMakeMultipleConnections(
-        Vec<MapProject>,
+        #[serde(deserialize_with = "bounded_batch_wire")] Vec<MapProject>,
+        #[serde(deserialize_with = "bounded_batch_wire")]
         Vec<(usize, usize, Option<Vec2>, LanePattern)>,
     ),
     MapUpdateIntersectionPolicy {
@@ -146,6 +194,9 @@ pub enum WorldCommand {
     /// Sizes new lots and regenerates the empty lots along every frontage road.
     SetLotLayout(LotLayout),
     EditWater(WaterEdit),
+    BuyTile {
+        tile: LandTileId,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -177,6 +228,17 @@ pub enum Rejection {
     WaterConfigured,
     WaterTerrainConflict,
     WaterServiceSite(crate::map::WaterSiteError),
+    LandDenied(LandDenial),
+    LandSetup(crate::map::LandSetupError),
+    TileUnavailable,
+    TileAlreadyOwned,
+    TileNotAdjacent,
+}
+
+impl From<LandDenial> for Rejection {
+    fn from(reason: LandDenial) -> Self {
+        Self::LandDenied(reason)
+    }
 }
 
 impl From<ZonePaintError> for Rejection {
@@ -196,6 +258,7 @@ impl Rejection {
     fn water_error(error: &WaterEditError) -> Self {
         match error {
             WaterEditError::Limit => Self::WaterWorkLimit,
+            WaterEditError::LandDenied(reason) => Self::LandDenied(*reason),
             WaterEditError::OccupiedFootprint { .. } => Self::WetFootprint,
             _ => Self::WaterEditFailed,
         }
@@ -204,19 +267,20 @@ impl Rejection {
     fn water_connection_error(error: ConnectionError) -> Self {
         match error {
             ConnectionError::WorkLimit => Self::WaterWorkLimit,
+            ConnectionError::LandDenied(reason) => Self::LandDenied(reason),
             ConnectionError::InvalidEndpoint => Self::InvalidConnection,
             other => Self::WaterConnection(other),
         }
     }
 }
 
-pub(crate) struct WaterBatch {
+pub(crate) struct PrepareBudget {
     guard_terraform: bool,
     reject_surface: bool,
     remaining: usize,
 }
 
-impl WaterBatch {
+impl PrepareBudget {
     pub(crate) fn new(commands: &[&WorldCommand], environment: &Environment) -> Self {
         let guard_terraform = environment.has_water_configuration()
             || commands.iter().any(|command| {
@@ -328,6 +392,69 @@ fn dry_water_edit_reservation(edit: &WaterEdit) -> usize {
         .min(MAX_WATER_BATCH_WORK)
 }
 
+#[derive(Clone, Debug)]
+pub struct ActionPreview {
+    pub cost: Money,
+    pub road: Option<crate::map::RoadPreview>,
+    pub paint: Option<crate::map::EligiblePaintCells>,
+    pub water: Option<crate::map::WaterEditPreview>,
+}
+
+impl ActionPreview {
+    fn priced(cost: Money) -> Self {
+        Self {
+            cost,
+            road: None,
+            paint: None,
+            water: None,
+        }
+    }
+}
+
+pub(crate) enum PreparedAction<'a> {
+    Purchase(TilePurchased, crate::map::land_frontage::PreparedFrontage),
+    Paint(crate::map::EligiblePaintCells),
+    Connection {
+        from: crate::map::ConnectionEndpoint,
+        to: crate::map::ConnectionEndpoint,
+        elbow: Option<Vec2>,
+        pattern: &'a LanePattern,
+        topology: Option<crate::map::PreparedTopologyEdit>,
+        work: Option<WaterTopologyWork>,
+        cost: Money,
+    },
+    Command(&'a WorldCommand, Money),
+}
+
+impl PreparedAction<'_> {
+    fn commit(self, sim: &mut Simulation, construction: BudgetCategory) -> Result<(), Rejection> {
+        match self {
+            Self::Purchase(purchase, frontage) => {
+                sim.map_mut().buy_prepared_tile(purchase.tile);
+                WorldCommand::charge_construction(sim, purchase.paid, BudgetCategory::LandPurchase);
+                sim.map_mut().commit_land_frontage(frontage);
+            }
+            Self::Paint(cells) => sim.write::<ZoneGrid>().paint_prepared(cells),
+            Self::Connection {
+                from,
+                to,
+                elbow,
+                pattern,
+                topology,
+                mut work,
+                cost,
+            } => {
+                sim.map_mut()
+                    .make_resolved_connection(from, to, elbow, pattern, topology, work.as_mut())
+                    .map_err(Rejection::water_connection_error)?;
+                WorldCommand::charge_construction(sim, cost, construction);
+            }
+            Self::Command(command, cost) => command.apply_one(sim, construction, cost)?,
+        }
+        Ok(())
+    }
+}
+
 pub type LinkOutcome = (usize, Result<(), (&'static str, Rejection)>);
 
 /// Final live roads for each indexed link, and resolved project junctions.
@@ -356,6 +483,7 @@ pub struct CommandOutcomes {
     links: Vec<LinkOutcome>,
     batch_in_progress: bool,
     connections: BTreeMap<usize, ConnectionBatchOutcome>,
+    tile_purchases: BTreeMap<usize, Result<TilePurchased, Rejection>>,
     water_edits: BTreeMap<usize, Result<WaterEditOutcome, WaterEditError>>,
 }
 
@@ -392,6 +520,10 @@ impl CommandOutcomes {
         self.water_edits.get(&index)
     }
 
+    pub fn tile_purchase(&self, index: usize) -> Option<Result<TilePurchased, Rejection>> {
+        self.tile_purchases.get(&index).copied()
+    }
+
     /// Discards the completed batch's outcomes while preserving its sequence.
     pub fn clear(&mut self) {
         self.last.clear();
@@ -400,6 +532,7 @@ impl CommandOutcomes {
         self.links.clear();
         self.connections.clear();
         self.water_edits.clear();
+        self.tile_purchases.clear();
     }
 
     pub(crate) fn begin_batch(&mut self) -> Option<Self> {
@@ -729,6 +862,7 @@ impl WorldCommand {
                 | SetWarehousePolicy { .. }
                 | SetLotLayout(_)
                 | EditWater(_)
+                | BuyTile { .. }
         )
     }
 
@@ -740,7 +874,7 @@ impl WorldCommand {
         &self,
         sim: &mut Simulation,
         construction: BudgetCategory,
-        water: &mut WaterBatch,
+        water: &mut PrepareBudget,
     ) {
         if let EditWater(edit) = self {
             let outcome = if water.reject_surface {
@@ -752,10 +886,8 @@ impl WorldCommand {
                     &mut water.remaining,
                 )
             };
-            match &outcome {
-                Ok(result) if result.changed => self.record_for_replay(sim),
-                Err(error) => self.reject(sim, Rejection::water_error(error)),
-                Ok(_) => {}
+            if let Err(error) = &outcome {
+                self.reject(sim, Rejection::water_error(error));
             }
             let mut outcomes = sim.write::<CommandOutcomes>();
             let index = outcomes.command_ranges.len();
@@ -776,39 +908,91 @@ impl WorldCommand {
                 self.reject(sim, Rejection::WaterWorkLimit);
                 return;
             }
-            if sim.map().environment().has_water_configuration() {
-                let tick = sim.read::<GameTime>().tick;
-                let result = {
-                    let mut map = sim.map_mut();
-                    map.environment()
-                        .prepare_water_terraform(tick, kind, center, radius, amount, level, slope)
-                        .and_then(|prepared| {
-                            map.commit_water_edit(
-                                prepared,
-                                &mut sim.write::<ZoneGrid>(),
-                                &mut water.remaining,
-                            )
-                        })
-                };
-                match result {
-                    Ok(outcome) if outcome.changed => self.record_for_replay(sim),
-                    Ok(_) => {}
-                    Err(error) => self.reject(
-                        sim,
-                        match error {
-                            WaterEditError::InvalidInput | WaterEditError::OutOfBounds => {
-                                Rejection::InvalidTerraform
-                            }
-                            WaterEditError::Limit => Rejection::WaterWorkLimit,
-                            WaterEditError::OccupiedFootprint { .. } => Rejection::WetFootprint,
-                            _ => Rejection::WaterTerrainConflict,
-                        },
-                    ),
+            let tick = sim.read::<GameTime>().tick;
+            let mut map = sim.map_mut();
+            if map.needs_topology_preparation() {
+                let result = map
+                    .environment()
+                    .prepare_water_terraform(tick, kind, center, radius, amount, level, slope)
+                    .and_then(|prepared| {
+                        map.commit_water_edit(
+                            prepared,
+                            &mut sim.write::<ZoneGrid>(),
+                            &mut water.remaining,
+                        )
+                    });
+                if let Err(error) = result {
+                    self.reject(sim, Self::terraform_error(error));
                 }
                 return;
             }
         }
 
+        let result = if let MapMakeMultipleConnections(projects, links) = self {
+            self.apply_connections(sim, projects, links, construction, water)
+                .map(|_| ())
+        } else {
+            self.prepare_single(sim, water).and_then(|prepared| {
+                let purchase = match &prepared {
+                    PreparedAction::Purchase(purchase, _) => Some(*purchase),
+                    _ => None,
+                };
+                prepared.commit(sim, construction)?;
+                if let Some(purchase) = purchase {
+                    let mut outcomes = sim.write::<CommandOutcomes>();
+                    let index = outcomes.command_ranges.len();
+                    outcomes.tile_purchases.insert(index, Ok(purchase));
+                }
+                Ok(())
+            })
+        };
+        if let Err(reason) = result {
+            self.reject(sim, reason);
+            if matches!(self, BuyTile { .. }) {
+                let mut outcomes = sim.write::<CommandOutcomes>();
+                let index = outcomes.command_ranges.len();
+                outcomes.tile_purchases.insert(index, Err(reason));
+            }
+        }
+    }
+
+    fn terraform_error(error: WaterEditError) -> Rejection {
+        match error {
+            WaterEditError::InvalidInput | WaterEditError::OutOfBounds => {
+                Rejection::InvalidTerraform
+            }
+            WaterEditError::Limit => Rejection::WaterWorkLimit,
+            WaterEditError::OccupiedFootprint { .. } => Rejection::WetFootprint,
+            WaterEditError::LandDenied(reason) => Rejection::LandDenied(reason),
+            _ => Rejection::WaterTerrainConflict,
+        }
+    }
+
+    pub(crate) fn admitted(&self, tiled: bool, water: &PrepareBudget) -> Result<(), Rejection> {
+        if tiled {
+            let fits = match self {
+                MapMakeConnection { pat, .. } => crate::map::wet_lane_count_fits(pat),
+                MapMakeMultipleConnections(projects, links) => {
+                    projects.len() <= 512
+                        && links.len() <= 256
+                        && links
+                            .iter()
+                            .all(|(_, _, _, pattern)| crate::map::wet_lane_count_fits(pattern))
+                }
+                MapBuildSpecialBuilding {
+                    zone: Some(zone), ..
+                }
+                | UpdateZone { zone, .. } => zone.poly.len() <= 256,
+                SpawnTrain { wagons, .. } => wagons.len() <= 256,
+                TransitCreateLine { stops } | TransitEditLine { stops, .. } => stops.len() <= 30,
+                _ => true,
+            };
+            return if fits {
+                Ok(())
+            } else {
+                Err(LandDenial::WorkLimit.into())
+            };
+        }
         if water.guard_terraform {
             const MAX_WET_DESCRIPTORS: usize = 65_536;
             let fits = match self {
@@ -831,126 +1015,30 @@ impl WorldCommand {
                 _ => true,
             };
             if !fits {
-                self.reject(sim, Rejection::WaterWorkLimit);
-                return;
+                return Err(Rejection::WaterWorkLimit);
             }
         }
 
-        if matches!(self, Init(_)) {
-            self.reject(sim, Rejection::UnexpectedInit);
-            return;
-        }
+        Ok(())
+    }
 
-        if matches!(self, MapBuildSpecialBuilding { kind, .. } if kind.is_mixed_growable()) {
-            self.reject(sim, Rejection::InvalidBuilding);
-            return;
+    pub(crate) fn reject_unadmitted(&self, sim: &Simulation, reason: Rejection) {
+        self.reject(sim, reason);
+        if matches!(self, BuyTile { .. }) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes.tile_purchases.insert(index, Err(reason));
         }
-
-        if let Err(reason) = self.validate_progression(sim) {
-            self.reject(sim, reason);
-            return;
-        }
-
-        let zoning_result = match self {
-            ZonePaint {
-                area,
-                kind,
-                density,
-            } => Some(Self::apply_zone_paint(sim, area, *kind, *density, |_| true)),
-            SetTaxRate { .. } => Some(self.apply_one(sim, construction)),
-            _ => None,
-        };
-        if let Some(result) = zoning_result {
-            match result {
-                Ok(()) => self.record_for_replay(sim),
-                Err(reason) => self.reject(sim, reason),
-            }
-            return;
-        }
-
-        let is_transit = transit::is_command(self);
-        if is_transit {
-            // Record transit commands only after validation and application succeed.
-            if let Err(reason) =
-                transit::validate(sim, self).and_then(|()| self.apply_one(sim, construction))
-            {
-                self.reject(sim, reason);
-                return;
-            }
-        }
-
-        if matches!(
-            self,
-            MapMakeConnection { .. } | MapMakeMultipleConnections(..)
-        ) && sim.map().environment().has_water_configuration()
-        {
-            let result = match self {
-                MapMakeMultipleConnections(projects, links) => {
-                    Some(self.apply_connections(sim, projects, links, construction))
-                }
-                MapMakeConnection {
-                    from,
-                    to,
-                    inter,
-                    pat,
-                } => Some(
-                    Self::apply_connection(sim, *from, *to, *inter, pat, construction)
-                        .map(|()| true),
-                ),
-                _ => None,
-            };
-            if let Some(result) = result {
-                match result {
-                    Ok(true) => self.record_for_replay(sim),
-                    Ok(false) => {}
-                    Err(reason) => self.reject(sim, reason),
-                }
-                return;
-            }
-        }
-
-        if matches!(
-            self,
-            MapRemoveRoad(_) | MapRemoveIntersection(_) | MapUpdateIntersectionPolicy { .. }
-        ) && sim.map().environment().strict_water_siting()
-        {
-            match self.apply_one(sim, construction) {
-                Ok(()) => self.record_for_replay(sim),
-                Err(reason) => self.reject(sim, reason),
-            }
-            return;
-        }
-
-        self.record_for_replay(sim);
-        if is_transit {
-            return;
-        }
-
-        let result = match self {
-            MapMakeMultipleConnections(projects, links) => self
-                .apply_connections(sim, projects, links, construction)
-                .map(|_| ()),
-            MapMakeConnection {
-                from,
-                to,
-                inter,
-                pat,
-            } => Self::apply_connection(sim, *from, *to, *inter, pat, construction),
-            _ => self.apply_one(sim, construction),
-        };
-        if let Err(reason) = result {
-            self.reject(sim, reason);
+        if matches!(self, EditWater(_)) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes
+                .water_edits
+                .insert(index, Err(WaterEditError::Limit));
         }
     }
 
-    fn record_for_replay(&self, sim: &Simulation) {
-        let mut replay = sim.write::<Replay>();
-        if replay.enabled {
-            replay.push(sim.read::<GameTime>().tick, self.clone());
-        }
-    }
-
-    fn reject(&self, sim: &Simulation, reason: Rejection) {
+    pub(crate) fn reject(&self, sim: &Simulation, reason: Rejection) {
         sim.write::<CommandOutcomes>()
             .last
             .push((self.kind(), reason));
@@ -988,6 +1076,7 @@ impl WorldCommand {
             SetWarehousePolicy { .. } => "SetWarehousePolicy",
             SetLotLayout(_) => "SetLotLayout",
             EditWater(_) => "EditWater",
+            BuyTile { .. } => "BuyTile",
         }
     }
 
@@ -1035,7 +1124,31 @@ impl WorldCommand {
                 map.get(*id).is_some()
             }
             MapRemoveRoad(id) => map.get(*id).is_some(),
-            MapRemoveBuilding(id) => map.get(*id).is_some(),
+            MapRemoveBuilding(id) => {
+                if map.get(*id).is_none() {
+                    return Err(Rejection::MissingReference);
+                }
+                map.authorize_land_effects(PreparedEffects::Building(*id))?;
+                map.authorize_building_cut(&map.get(*id).unwrap().obb)?;
+                true
+            }
+            MapLoadParis | MapLoadTestField { .. } | SpawnRandomCars { .. }
+                if map.land_ownership().is_tiled() =>
+            {
+                return Err(LandDenial::ForbiddenOperation.into());
+            }
+            SetLotLayout(layout)
+                if map.land_ownership().is_tiled() && *layout != map.lot_layout() =>
+            {
+                return Err(LandDenial::ForbiddenOperation.into());
+            }
+            SetWarehousePolicy { building, .. } => {
+                if map.get(*building).is_none() {
+                    return Err(Rejection::MissingReference);
+                }
+                map.authorize_land_effects(PreparedEffects::Building(*building))?;
+                true
+            }
             MapLoadParis | MapLoadTestField { .. }
                 if map.environment().has_water_configuration() =>
             {
@@ -1043,6 +1156,8 @@ impl WorldCommand {
             }
             MapBuildHouse(id) => {
                 let lot = map.get(*id).ok_or(Rejection::MissingReference)?;
+                map.authorize_land_effects(PreparedEffects::Lot(*id))?;
+                map.authorize_new_building(&lot.shape, BuildingGen::House, None, Some(lot.parent))?;
                 if !Building::dry_footprint(map.environment(), &lot.shape, None) {
                     return Err(Rejection::WetFootprint);
                 }
@@ -1089,6 +1204,9 @@ impl WorldCommand {
                         .is_none_or(|mass| mass == 0)
                 {
                     return Err(Rejection::InvalidTrain);
+                }
+                if map.land_ownership().is_tiled() {
+                    map.authorize_player_train(wagons, lane, *dist)?;
                 }
                 true
             }
@@ -1138,6 +1256,7 @@ impl WorldCommand {
                 {
                     return Err(Rejection::InvalidZone);
                 }
+                map.authorize_new_building(pos, *gen, zone.as_ref(), *connected_road)?;
                 if !Building::dry_footprint(map.environment(), pos, zone.as_ref()) {
                     return Err(Rejection::WetFootprint);
                 }
@@ -1156,6 +1275,7 @@ impl WorldCommand {
                 {
                     return Err(Rejection::InvalidZone);
                 }
+                map.authorize_zone_change(*building, zone)?;
                 if !Building::dry_footprint(map.environment(), &b.obb, Some(zone)) {
                     return Err(Rejection::WetFootprint);
                 }
@@ -1181,7 +1301,25 @@ impl WorldCommand {
                 }
                 true
             }
-            _ => true,
+            Init(_)
+            | BuyTile { .. }
+            | MapMakeConnection { .. }
+            | MapMakeMultipleConnections(..)
+            | EditWater(_)
+            | SendMessage { .. }
+            | SpawnRandomCars { .. }
+            | AddTrain { .. }
+            | MapLoadParis
+            | MapLoadTestField { .. }
+            | SetGameTime(_)
+            | SetLotLayout(_)
+            | TransitAddStop { .. }
+            | TransitRemoveStop { .. }
+            | TransitCreateLine { .. }
+            | TransitEditLine { .. }
+            | TransitRemoveLine { .. }
+            | TransitSetVehicles { .. }
+            | TransitSetFare { .. } => true,
         };
         if exists {
             Ok(())
@@ -1192,8 +1330,166 @@ impl WorldCommand {
 
     /// Run the validation and cost checks used before applying a special building.
     pub fn validate_and_price(&self, sim: &Simulation) -> Result<Money, Rejection> {
-        self.validate(&sim.map())?;
-        Self::affordable_cost(sim, Government::checked_action_cost(self, sim))
+        Ok(self.preview(sim)?.cost)
+    }
+
+    pub fn preview(&self, sim: &Simulation) -> Result<ActionPreview, Rejection> {
+        let mut budget = PrepareBudget::new(&[self], sim.map().environment());
+        match self {
+            EditWater(edit) => {
+                let water = sim
+                    .preview_water_edit(edit)
+                    .map_err(|error| Rejection::water_error(&error))?;
+                Ok(ActionPreview {
+                    water: Some(water),
+                    ..ActionPreview::priced(Money::ZERO)
+                })
+            }
+            Terraform {
+                kind,
+                center,
+                radius,
+                amount,
+                level,
+                slope,
+            } if sim.map().needs_topology_preparation() => {
+                let map = sim.map();
+                let prepared = map
+                    .environment()
+                    .prepare_water_terraform(
+                        sim.read::<GameTime>().tick,
+                        *kind,
+                        *center,
+                        *radius,
+                        *amount,
+                        *level,
+                        *slope,
+                    )
+                    .map_err(Self::terraform_error)?;
+                let water = map
+                    .preview_prepared_water(&prepared, &sim.read::<ZoneGrid>())
+                    .map_err(Self::terraform_error)?;
+                Ok(ActionPreview {
+                    water: Some(water),
+                    ..ActionPreview::priced(Money::ZERO)
+                })
+            }
+            MapMakeMultipleConnections(..) => Err(Rejection::InvalidConnection),
+            _ => match self.prepare_single(sim, &mut budget)? {
+                PreparedAction::Purchase(purchase, _) => Ok(ActionPreview::priced(purchase.paid)),
+                PreparedAction::Paint(paint) => Ok(ActionPreview {
+                    paint: Some(paint),
+                    ..ActionPreview::priced(Money::ZERO)
+                }),
+                PreparedAction::Connection {
+                    topology: Some(topology),
+                    cost,
+                    ..
+                } => Ok(ActionPreview {
+                    road: Some(topology.preview),
+                    ..ActionPreview::priced(cost)
+                }),
+                PreparedAction::Connection { cost, .. } => {
+                    let MapMakeConnection {
+                        from,
+                        to,
+                        inter,
+                        pat,
+                    } = self
+                    else {
+                        unreachable!()
+                    };
+                    let road = sim
+                        .map()
+                        .preview_connection(*from, *to, *inter, pat)
+                        .map_err(Rejection::water_connection_error)?;
+                    Ok(ActionPreview {
+                        road: Some(road),
+                        ..ActionPreview::priced(cost)
+                    })
+                }
+                PreparedAction::Command(_, cost) => Ok(ActionPreview::priced(cost)),
+            },
+        }
+    }
+
+    pub(crate) fn prepare_single<'a>(
+        &'a self,
+        sim: &Simulation,
+        budget: &mut PrepareBudget,
+    ) -> Result<PreparedAction<'a>, Rejection> {
+        self.validate_progression(sim)?;
+        match self {
+            Init(_) => return Err(Rejection::UnexpectedInit),
+            BuyTile { tile } => {
+                let purchase = crate::map::prepare_purchase(sim, *tile)?;
+                let frontage = sim
+                    .map()
+                    .prepare_purchase_frontage(*tile, &mut budget.remaining)?;
+                return Ok(PreparedAction::Purchase(purchase, frontage));
+            }
+            ZonePaint {
+                area,
+                kind,
+                density,
+            } => {
+                let cells = ZoneGrid::eligible_paint_cells(&sim.map(), area, *kind, *density)?;
+                return Ok(PreparedAction::Paint(cells));
+            }
+            MapMakeConnection {
+                from,
+                to,
+                inter,
+                pat,
+            } => {
+                let map = sim.map();
+                let tiled = map.land_ownership().is_tiled();
+                let mut work = map
+                    .needs_topology_preparation()
+                    .then(WaterTopologyWork::new);
+                if let Some(work) = &mut work {
+                    if tiled {
+                        work.remaining = budget.remaining;
+                    }
+                }
+                let prepared = map.prepare_connection(*from, *to, *inter, pat, work.as_mut());
+                if let Some(work) = &work {
+                    if tiled {
+                        budget.remaining = work.remaining;
+                    }
+                }
+                let (from, to, topology) = prepared.map_err(Rejection::water_connection_error)?;
+                let cost =
+                    Self::affordable_cost(sim, Government::connection_cost(from.pos, to.pos, pat))?;
+                return Ok(PreparedAction::Connection {
+                    from,
+                    to,
+                    elbow: *inter,
+                    pattern: pat,
+                    topology,
+                    work,
+                    cost,
+                });
+            }
+            _ => {}
+        }
+        let map = sim.map();
+        self.validate(&map)?;
+        match self {
+            MapRemoveRoad(id) => map
+                .prepare_remove_road(*id)
+                .map_err(Rejection::water_connection_error)?,
+            MapRemoveIntersection(id) => map
+                .prepare_remove_intersection(*id)
+                .map_err(Rejection::water_connection_error)?,
+            MapUpdateIntersectionPolicy { inter, turn, light } => map
+                .prepare_intersection_policy(*inter, *turn, *light)
+                .map_err(Rejection::water_connection_error)?,
+            _ if transit::is_command(self) => transit::validate(sim, self)?,
+            _ => {}
+        }
+        let cost = Self::affordable_cost(sim, Government::checked_action_cost(self, sim))?;
+        Ok(PreparedAction::Command(self, cost))
     }
 
     fn affordable_cost(sim: &Simulation, cost: Option<Money>) -> Result<Money, Rejection> {
@@ -1219,40 +1515,17 @@ impl WorldCommand {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn apply_zone_paint(
         sim: &Simulation,
         area: &OBB,
         kind: Option<ZoneKind>,
         density: Density,
-        owns: impl FnMut(ZoneCellCoord) -> bool,
+        owns: impl FnMut(crate::map::ZoneCellCoord) -> bool,
     ) -> Result<(), Rejection> {
         sim.write::<ZoneGrid>()
             .paint_on_map_with_land(&sim.map(), area, kind, density, owns)
             .map_err(Rejection::from)
-    }
-
-    fn apply_connection(
-        sim: &Simulation,
-        from: MapProject,
-        to: MapProject,
-        inter: Option<Vec2>,
-        pattern: &LanePattern,
-        construction: BudgetCategory,
-    ) -> Result<(), Rejection> {
-        let mut map = sim.map_mut();
-        let mut work = map
-            .environment()
-            .has_water_configuration()
-            .then(WaterTopologyWork::new);
-        let (from, to, prepared) = map
-            .prepare_connection(from, to, inter, pattern, work.as_mut())
-            .map_err(Rejection::water_connection_error)?;
-        let cost =
-            Self::affordable_cost(sim, Government::connection_cost(from.pos, to.pos, pattern))?;
-        map.make_resolved_connection(from, to, inter, pattern, prepared, work.as_mut())
-            .map_err(Rejection::water_connection_error)?;
-        Self::charge_construction(sim, cost, construction);
-        Ok(())
     }
 
     fn apply_connections(
@@ -1261,7 +1534,12 @@ impl WorldCommand {
         projects: &[MapProject],
         links: &[(usize, usize, Option<Vec2>, LanePattern)],
         construction: BudgetCategory,
+        batch: &mut PrepareBudget,
     ) -> Result<bool, Rejection> {
+        let tiled = sim.map().land_ownership().is_tiled();
+        if tiled && (projects.len() > 512 || links.len() > 256) {
+            return Err(LandDenial::WorkLimit.into());
+        }
         if links
             .iter()
             .any(|&(from, to, _, _)| from >= projects.len() || to >= projects.len())
@@ -1271,9 +1549,13 @@ impl WorldCommand {
 
         let mut map = sim.map_mut();
         let mut water_work = map
-            .environment()
-            .has_water_configuration()
+            .needs_topology_preparation()
             .then(WaterTopologyWork::new);
+        if tiled {
+            if let Some(work) = &mut water_work {
+                work.remaining = batch.remaining;
+            }
+        }
         let mut endpoints: Vec<_> = projects
             .iter()
             .map(|&project| project.kind.check_valid(&map).then_some(project))
@@ -1437,6 +1719,11 @@ impl WorldCommand {
             .connections
             .insert(index, ConnectionBatchOutcome { links, projects });
         map.check_invariants();
+        if tiled {
+            if let Some(work) = water_work {
+                batch.remaining = work.remaining;
+            }
+        }
         Ok(connected_any)
     }
 
@@ -1444,9 +1731,8 @@ impl WorldCommand {
         &self,
         sim: &mut Simulation,
         construction: BudgetCategory,
+        cost: Money,
     ) -> Result<(), Rejection> {
-        let cost = self.validate_and_price(sim)?;
-
         match *self {
             MapRemoveIntersection(id) => sim
                 .map_mut()
@@ -1473,6 +1759,7 @@ impl WorldCommand {
             MapMakeConnection { .. }
             | MapMakeMultipleConnections(..)
             | EditWater(_)
+            | BuyTile { .. }
             | ZonePaint { .. } => {
                 unreachable!()
             }
@@ -1643,6 +1930,7 @@ impl WorldCommand {
             BootstrapKind::Import => {
                 !options.save_replay
                     && options.preset != MapPreset::Waters
+                    && options.land_mode == crate::map::LandMode::Unrestricted
                     && options.valid_for_bootstrap()
             }
             BootstrapKind::AuthoredFlat => {
@@ -1658,7 +1946,10 @@ impl WorldCommand {
         info!("Initializing world with {options:?}");
         if options.terrain_size > 0 {
             generate_terrain(sim, options)?;
-            if kind == BootstrapKind::Normal {
+            if let crate::map::LandRecipe::NativeFlatV1 { .. } = options.land_recipe {
+                crate::map::procgen::commission_native_land(sim, options)
+                    .map_err(Rejection::LandSetup)?;
+            } else if kind == BootstrapKind::Normal {
                 let starter_built = build_starting_external_trading(sim);
                 if options.preset == MapPreset::Waters && !starter_built {
                     return Err(Rejection::MutationFailed);

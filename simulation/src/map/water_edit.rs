@@ -53,8 +53,16 @@ impl Map {
         zones: &ZoneGrid,
     ) -> Result<WaterEditPreview, WaterEditError> {
         let prepared = self.environment.prepare_water_edit(edit)?;
+        self.preview_prepared_water(&prepared, zones)
+    }
+
+    pub(crate) fn preview_prepared_water(
+        &self,
+        prepared: &PreparedWaterEdit,
+        zones: &ZoneGrid,
+    ) -> Result<WaterEditPreview, WaterEditError> {
         let mut remaining = MAX_WATER_BATCH_WORK;
-        let effects = self.prepare_water_effects(&prepared, zones, &mut remaining)?;
+        let effects = self.prepare_water_effects(prepared, zones, &mut remaining)?;
         Ok(WaterEditPreview {
             changed: prepared.changed(),
             dirty: prepared.dirty().clone().union(effects.dirty),
@@ -125,7 +133,23 @@ impl Map {
         zones: &ZoneGrid,
         remaining: &mut usize,
     ) -> Result<WaterEditEffects, WaterEditError> {
+        use crate::map::PreparedEffects;
         spend_water_work(remaining, prepared.work())?;
+        let tiled = self.land_ownership().is_tiled();
+        if tiled {
+            for node in prepared.changed_base_nodes() {
+                spend_water_work(remaining, 1)?;
+                self.authorize_land_effects(PreparedEffects::BaseNode(node))?;
+            }
+            for tile in prepared.surface_changed_tiles() {
+                spend_water_work(remaining, 1)?;
+                let corner = tile.corner();
+                let bounds = AABB::new_ll_ur(corner, corner + Vec2::splat(CELL_SIZE));
+                self.authorize_land_effects(PreparedEffects::Footprint(
+                    &super::super::land_site::rect_corners(bounds),
+                ))?;
+            }
+        }
         let mut effects = WaterEditEffects::default();
         let mut terrain = BTreeSet::new();
         let mut road_support = BTreeSet::new();
@@ -286,6 +310,17 @@ impl Map {
                 }
             }
         }
+        if tiled {
+            for &object in &effects.wet_lots {
+                if let ProjectKind::Lot(id) = object {
+                    self.authorize_land_effects(PreparedEffects::Lot(id))?;
+                }
+            }
+            effects.wet_trees.retain(|&(_, y, x, _)| {
+                self.authorize_land_effects(PreparedEffects::Point(Vec2::new(x.0, y.0)))
+                    .is_ok()
+            });
+        }
         effects.wet_trees.sort_unstable();
         for &chunk in prepared.dirty().road_support() {
             spend_water_work(remaining, 1)?;
@@ -307,6 +342,23 @@ impl Map {
                 |node| prepared.is_wet_base_node(&self.environment, node),
                 &mut Some(remaining),
             )?;
+            if tiled {
+                let previous = self.rebuild_construction_cuts(
+                    chunk,
+                    |node| self.environment.is_wet_base_node(node),
+                    &mut Some(remaining),
+                )?;
+                for (y, row) in cuts.iter().enumerate() {
+                    for (x, &value) in row.iter().enumerate() {
+                        if value != previous[y][x] {
+                            self.authorize_land_effects(PreparedEffects::BaseNode((
+                                chunk.0 as usize * TERRAIN_CHUNK_RESOLUTION + x,
+                                chunk.1 as usize * TERRAIN_CHUNK_RESOLUTION + y,
+                            )))?;
+                        }
+                    }
+                }
+            }
             effects.cuts.insert(chunk, cuts);
             terrain.insert(chunk);
         }
@@ -319,6 +371,11 @@ impl Map {
                 dried: &dried,
             }
             .stage(drying_roads, remaining)?;
+            if tiled {
+                effects
+                    .new_lots
+                    .retain(|lot| self.authorize_frontage(lot.road, &lot.shape, None).is_ok());
+            }
         }
         effects.dirty = WaterDirtyChunks::new(BTreeSet::new(), terrain, road_support);
         effects.water_providers = prepare_water_providers(self, prepared, remaining)?;
@@ -483,6 +540,9 @@ impl DryingFrontage<'_> {
         roads: BTreeSet<RoadID>,
         remaining: &mut usize,
     ) -> Result<Vec<StagedLot>, WaterEditError> {
+        if self.map.land_ownership().is_tiled() {
+            return self.stage_tiled(roads, remaining);
+        }
         let mut lots: Vec<StagedLot> = Vec::new();
         let mut staged: AABBGrid<usize, AABB> = AABBGrid::new(50);
         for id in roads {
@@ -577,6 +637,66 @@ impl DryingFrontage<'_> {
                         distance += step;
                     }
                 }
+            }
+        }
+        Ok(lots)
+    }
+
+    fn stage_tiled(
+        &self,
+        roads: BTreeSet<RoadID>,
+        remaining: &mut usize,
+    ) -> Result<Vec<StagedLot>, WaterEditError> {
+        let tiles = self.dried.0.keys().map(|chunk| crate::map::LandTileId {
+            x: chunk.0 as u16,
+            y: chunk.1 as u16,
+        });
+        let candidates = self.map.indexed_land_sites(tiles, remaining)?;
+        let mut lots: Vec<StagedLot> = Vec::new();
+        let mut staged: AABBGrid<usize, AABB> = AABBGrid::new(50);
+        for (id, shape, shoulder) in candidates {
+            if !roads.contains(&id) || self.map.authorize_frontage(id, &shape, None).is_err() {
+                continue;
+            }
+            let road = &self.map.roads[id];
+            let Some(height) = self
+                .height(shoulder.xy())
+                .filter(|height| (height - shoulder.z).abs() <= FRONTAGE_HEIGHT_TOLERANCE_M)
+            else {
+                continue;
+            };
+            let mut touches = self.touches_dried_frontage(shape, road.width, remaining)?;
+            let usable = Lot::check_dry_frontage(
+                road,
+                &shape,
+                |point, remaining| {
+                    spend_water_work(remaining, road.interfaced_points().len())?;
+                    Ok(Some(road.interfaced_points().project_segment_2d(point)))
+                },
+                |point| self.height(point),
+                |tile| {
+                    touches |= self.dried.contains(tile);
+                    self.prepared
+                        .water_at_tile(&self.map.environment, tile)
+                        .is_some()
+                },
+                remaining,
+            )?;
+            if !usable || !touches || self.obstructed(shape, remaining)? {
+                continue;
+            }
+            let mut conflicts = false;
+            for (_, _, &index) in staged.query(shape.bbox()) {
+                spend_water_work(remaining, 1)?;
+                conflicts |= shape.intersects(&lots[index].shape);
+            }
+            if !conflicts {
+                staged.insert(shape.bbox(), lots.len());
+                lots.push(StagedLot {
+                    road: id,
+                    shape,
+                    height,
+                });
             }
         }
         Ok(lots)

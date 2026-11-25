@@ -19,7 +19,7 @@ pub enum ZonePaintError {
     WetFootprint,
 }
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct EligiblePaintCells {
     cells: Vec<ZoneCellCoord>,
     replacement: Option<ZoneCell>,
@@ -121,7 +121,17 @@ impl ZoneGrid {
     ) -> Result<EligiblePaintCells, ZonePaintError> {
         let env = map.environment();
         let mut cells = Self::bounded_paint_cells(area, env.bounds())?;
-        if let Some(&key) = cells.iter().find(|&&key| !owns(key)) {
+        if let Some(&key) = cells.iter().find(|&&key| {
+            !owns(key)
+                || map
+                    .authorize_land_effects(crate::map::PreparedEffects::Footprint(
+                        &super::land_site::rect_corners(AABB::centered(
+                            cell_center(key),
+                            Vec2::splat(ZONE_CELL_SIZE),
+                        )),
+                    ))
+                    .is_err()
+        }) {
             return Err(ZonePaintError::TileLocked(key));
         }
         if replacement.is_some() && env.has_water_configuration() && !cells.is_empty() {
@@ -218,7 +228,7 @@ impl ZoneGrid {
         }
     }
 
-    fn paint_prepared(&mut self, prepared: EligiblePaintCells) {
+    pub(crate) fn paint_prepared(&mut self, prepared: EligiblePaintCells) {
         let EligiblePaintCells { cells, replacement } = prepared;
         let mut changed = false;
         for key in cells {
@@ -354,7 +364,7 @@ fn lot_vote(
     Some(ZoneCell { kind, density })
 }
 
-fn cell_center((x, y): (i32, i32)) -> Vec2 {
+pub(super) fn cell_center((x, y): (i32, i32)) -> Vec2 {
     (vec2(x as f32, y as f32) + Vec2::splat(0.5)) * ZONE_CELL_SIZE
 }
 

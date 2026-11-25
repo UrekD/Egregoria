@@ -233,6 +233,7 @@ fn register_systems_and_resources() {
     register_resource_default::<MultiplayerState, Bincode>("multiplayer_state");
     register_resource_default::<RandomVehicles, Bincode>("random_vehicles");
     register_resource_default::<Map, Bincode>("map");
+    register_land_ownership();
     register_pending_construction_cuts();
     register_resource_default::<TrainReservations, Bincode>("train_reservations");
     register_resource_noinit::<Government, Bincode>("government");
@@ -289,6 +290,21 @@ fn register_utility_water_sample() {
                 let mut flow = sim.write::<UtilityFlow>();
                 flow.sampled_water_revision = revision;
                 flow.sampled_members = members;
+                Ok(())
+            }),
+        });
+    }
+}
+
+fn register_land_ownership() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "land_ownership",
+            optional: false,
+            save: Box::new(|sim| crate::map::encode_land(sim.map().land_ownership()).unwrap()),
+            load: Box::new(|sim, data| {
+                sim.map_mut()
+                    .install_land_ownership(crate::map::decode_land(data)?);
                 Ok(())
             }),
         });

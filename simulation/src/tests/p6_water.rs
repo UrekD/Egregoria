@@ -299,8 +299,7 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
         assert_eq!(outcome.dirty, preview.dirty);
     }
     assert_eq!(sim.read::<Replay>().command_count(), initial_commands + 1);
-    let before = sim.hashes();
-    let recorded = replay_bytes(&sim);
+    let before = gameplay_hashes(&sim);
     let sequence = sim.read::<CommandOutcomes>().batch_seq();
     let mut dirty = sim
         .map()
@@ -311,8 +310,8 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
         sim.read::<CommandOutcomes>().water_edit(0),
         Some(&Err(WaterEditError::BodyUnavailable(WaterBodyId(99))))
     );
-    assert_eq!(sim.hashes(), before);
-    assert_eq!(replay_bytes(&sim), recorded);
+    assert_eq!(gameplay_hashes(&sim), before);
+    assert_eq!(sim.read::<Replay>().command_count(), initial_commands + 2);
     assert_eq!(dirty.take_updated_chunks().count(), 0);
 
     sim.apply_commands([&sea]);
@@ -326,7 +325,7 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
     assert!(!retry.changed);
     assert_eq!(retry.dirty, WaterDirtyChunks::default());
     assert_eq!(sim.map().environment().water_revision(), initial_revision);
-    assert_eq!(replay_bytes(&sim), recorded);
+    assert_eq!(sim.read::<Replay>().command_count(), initial_commands + 3);
     // Clearing the empty sea keeps both freshwater commands in a local batch.
     sim.edit_water(WaterEdit::SetSeaLevel { level_dm: None })
         .unwrap();
@@ -364,8 +363,21 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
             .map(|command| JSON::encode(command).unwrap())
             .collect::<Vec<_>>()
     };
-    assert_eq!(commands(&sim), commands(&helper));
-    assert_eq!(commands(&sim).len(), 4);
+    assert_eq!(commands(&sim).len(), 7);
+    let retained = commands(&sim);
+    assert_eq!(
+        [
+            retained[0].clone(),
+            retained[3].clone(),
+            retained[4].clone(),
+            retained[6].clone()
+        ]
+        .as_slice(),
+        commands(&helper)
+    );
+    assert_eq!(retained[1], JSON::encode(&absent).unwrap());
+    assert_eq!(retained[2], JSON::encode(&sea).unwrap());
+    assert_eq!(retained[5], JSON::encode(&out_of_bounds).unwrap());
     assert_eq!(gameplay_hashes(&sim), gameplay_hashes(&helper));
     assert_eq!(sim.get_tick(), start_tick);
 
@@ -534,7 +546,7 @@ fn p6_water_edit_replays_across_a_published_slot_boundary() {
         Some(WaterBodyId(4))
     );
     let recorded = commands(&restored);
-    assert_eq!(recorded.len(), 12);
+    assert_eq!(recorded.len(), 15);
     assert_eq!(recorded.last(), Some(&JSON::encode(&indexed).unwrap()));
     let loaded = publish_and_check(&restored, &root, "water_final", steps_to_refresh + 1);
     let new_road = |sim: &Simulation| {

@@ -714,6 +714,7 @@ fn lot_warning((zone, status): ZonedLot) -> String {
         ),
         GrowableLotError::Obstructed => "Lot is obstructed".into(),
         GrowableLotError::MissingPrototype => "No growable for this zone and density".into(),
+        GrowableLotError::LandDenied(_) => "This lot requires editable land and access".into(),
     }
 }
 

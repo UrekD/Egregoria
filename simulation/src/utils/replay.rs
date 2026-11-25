@@ -49,7 +49,7 @@ impl Replay {
     pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
         match self.commands.first() {
             Some((Tick(INITIAL_TICK), WorldCommand::Init(options)))
-                if !options.new_game_options().is_valid() =>
+                if !options.new_game_options().is_valid() || !options.valid_for_bootstrap() =>
             {
                 Err(invalid_replay(
                     "Replay Init contains invalid new-game options",
@@ -63,7 +63,11 @@ impl Replay {
     }
 
     pub(crate) fn bootstrap_end(&self) -> io::Result<usize> {
+        let tiled = self.bootstrap_options()?.land_mode == crate::map::LandMode::Tiled;
         let Some(timeline) = &self.timeline else {
+            if tiled {
+                return Err(invalid_replay("A tiled replay requires a batch timeline"));
+            }
             // Older recordings include the commands but no constructor boundary.
             let starters: Vec<(u32, WorldCommand)> = JSON::decode(START_COMMANDS.as_bytes())?;
             let end = 1 + starters.len();
@@ -114,7 +118,7 @@ impl Replay {
                 _ => false,
             }
         });
-        if !valid {
+        if !valid || (tiled && end != 1) {
             return Err(invalid_replay("Invalid replay constructor batch"));
         }
 
@@ -122,6 +126,7 @@ impl Replay {
         let mut first_step = 0;
         for batch in &timeline.batches {
             if batch.end <= previous_end
+                || (tiled && batch.end - previous_end > 256)
                 || batch.end > self.commands.len()
                 || batch.step < first_step
                 || batch.step > timeline.steps
@@ -146,6 +151,17 @@ impl Replay {
 
     pub(crate) fn commands(&self, range: Range<usize>) -> impl Iterator<Item = &WorldCommand> {
         self.commands[range].iter().map(|(_, command)| command)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn batch_boundaries(&self) -> Vec<(u64, usize, bool)> {
+        self.timeline
+            .as_ref()
+            .unwrap()
+            .batches
+            .iter()
+            .map(|batch| (batch.step, batch.end, batch.steps_systems))
+            .collect()
     }
 
     pub(crate) fn command_count(&self) -> usize {

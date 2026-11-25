@@ -27,10 +27,14 @@ pub enum ConnectionError {
     WetJunction(WaterTileCoord),
     WorkLimit,
     Stale,
+    LandDenied(crate::map::LandDenial),
 }
 
 impl fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Self::LandDenied(reason) = self {
+            return write!(f, "Land edit denied: {reason:?}");
+        }
         f.write_str(match self {
             Self::InvalidEndpoint => "Invalid road or rail endpoint",
             Self::OutOfBounds => "The crossing leaves the map",
@@ -41,11 +45,18 @@ impl fmt::Display for ConnectionError {
             Self::WetJunction(_) => "The junction extends over water without enough clearance",
             Self::WorkLimit => "The crossing exceeds the water work limit",
             Self::Stale => "The road network or water changed during placement",
+            Self::LandDenied(_) => unreachable!(),
         })
     }
 }
 
 impl std::error::Error for ConnectionError {}
+
+impl From<crate::map::LandDenial> for ConnectionError {
+    fn from(reason: crate::map::LandDenial) -> Self {
+        Self::LandDenied(reason)
+    }
+}
 
 impl From<WaterEditError> for ConnectionError {
     fn from(error: WaterEditError) -> Self {
@@ -53,6 +64,7 @@ impl From<WaterEditError> for ConnectionError {
             WaterEditError::OutOfBounds => Self::OutOfBounds,
             WaterEditError::Limit => Self::WorkLimit,
             WaterEditError::Stale => Self::Stale,
+            WaterEditError::LandDenied(reason) => Self::LandDenied(reason),
             _ => Self::InvalidEndpoint,
         }
     }
@@ -116,7 +128,7 @@ pub(crate) struct PreparedTopologyEdit {
     pub(crate) elevated: bool,
     pub(crate) check_water: bool,
     profile_error: Option<PointGenerateError>,
-    preview: RoadPreview,
+    pub(crate) preview: RoadPreview,
     pub(crate) merges: Option<[bool; 2]>,
 }
 
@@ -132,7 +144,7 @@ fn topology_revision(map: &Map) -> (u64, u64, u64, u64, usize) {
         map.walking_topology_generation,
         map.environment().water_revision(),
         map.environment().base_revision,
-        map.pending_construction_cuts.len(),
+        (map.land_ownership().revision() << 16) | map.pending_construction_cuts.len(),
     )
 }
 
@@ -148,6 +160,18 @@ impl Map {
         topology_revision(self)
     }
 
+    pub(crate) fn land_junction_outline(
+        &self,
+        id: IntersectionID,
+    ) -> Result<Polygon, ConnectionError> {
+        let junction = self.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
+        junction_outline(
+            junction,
+            &self.roads,
+            &mut WaterTopologyWork::new().geometry(),
+        )
+    }
+
     pub fn preview_connection(
         &self,
         from: MapProject,
@@ -156,8 +180,7 @@ impl Map {
         pattern: &LanePattern,
     ) -> Result<RoadPreview, ConnectionError> {
         let mut work = self
-            .environment()
-            .has_water_configuration()
+            .needs_topology_preparation()
             .then(WaterTopologyWork::new);
         let (a, b, prepared) = self.prepare_connection(from, to, elbow, pattern, work.as_mut())?;
         if let Some(prepared) = prepared {
@@ -355,6 +378,9 @@ pub(crate) fn prepare_topology(
         env,
         elevated,
     );
+    if map.land_ownership().is_tiled() {
+        check_profile_error(error)?;
+    }
     if check_water && error == Some(PointGenerateError::OutsideOfMap) {
         return Err(ConnectionError::OutOfBounds);
     }
@@ -397,12 +423,16 @@ fn stage_connection(
     let src = graph.resolve(from)?;
     let dst = graph.resolve(to)?;
     let mut id = graph.add_road(src, dst, profile.clone(), pattern, elevated, 0)?;
-    let (mut wet, mut junctions) = if check_water {
+    let tiled = map.land_ownership().is_tiled();
+    if check_water || tiled {
         graph.invalidate(src)?;
         graph.invalidate(dst)?;
+    }
+    let land_outlines = graph.validate_land()?;
+    let (mut wet, mut junctions) = if check_water {
         graph.validate()?
     } else {
-        (BTreeSet::new(), Vec::new())
+        (BTreeSet::new(), land_outlines)
     };
     let merges = stage_merges.then(|| {
         if !check_water
@@ -440,7 +470,7 @@ fn stage_connection(
             }
         })
     });
-    let deck = if check_water || merges.is_some_and(|ends| ends.contains(&true)) {
+    let deck = if check_water || tiled || merges.is_some_and(|ends| ends.contains(&true)) {
         graph.roads[id].interfaced_points().clone()
     } else {
         profile.clone()
@@ -596,7 +626,7 @@ fn deck_normal(points: &[Vec3], i: usize) -> Vec2 {
     normal / a.perp_dot(normal).max(0.1)
 }
 
-fn deck_triangles(road: &Road) -> impl Iterator<Item = [Vec3; 3]> + '_ {
+pub(crate) fn land_deck_triangles(road: &Road) -> impl Iterator<Item = [Vec3; 3]> + '_ {
     let points = road.interfaced_points().as_slice();
     let edge = |i| {
         let offset = (deck_normal(points, i) * (road.width * 0.5)).z0();
@@ -1085,11 +1115,18 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             trial.ensure_arms(dst)?;
             trial.remove_road(first);
             trial.remove_road(second);
+            trial.validate_removed_junction(joint)?;
             trial.changed_junctions.remove(&joint);
             let id = trial.add_road(src, dst, points, &pattern, elevated, new_lots)?;
             trial.invalidate(src)?;
             trial.invalidate(dst)?;
-            Ok::<_, ConnectionError>((id, trial.validate()?))
+            let outlines = trial.validate_land()?;
+            let validation = if trial.map.environment().strict_water_siting() {
+                trial.validate()?
+            } else {
+                (BTreeSet::new(), outlines)
+            };
+            Ok::<_, ConnectionError>((id, validation))
         })()
         .ok()?;
         self.roads = trial.roads;
@@ -1104,6 +1141,149 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         self.changed_junctions = trial.changed_junctions;
         self.wet_splits = trial.wet_splits;
         Some(result)
+    }
+
+    fn validate_removed_junction(&mut self, id: IntersectionID) -> Result<(), ConnectionError> {
+        use crate::map::PreparedEffects;
+        if self.map.land_ownership().is_tiled() {
+            if let Some(&live) = self.live_junctions.get(&id) {
+                self.map
+                    .authorize_land_effects(PreparedEffects::Junction(live))?;
+                Self::check_junction_cut(
+                    self.map,
+                    &self.map.intersections[live],
+                    self.work.remaining,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_land(&mut self) -> Result<Vec<Vec<Vec3>>, ConnectionError> {
+        use crate::map::PreparedEffects;
+        if !self.map.land_ownership().is_tiled() {
+            return Ok(Vec::new());
+        }
+        self.map.check_land_frontage_capacity(
+            self.patterns.iter().filter_map(|(&id, pattern)| {
+                pattern
+                    .lanes()
+                    .any(|(kind, _, _)| kind == crate::map::LaneKind::Walking)
+                    .then(|| self.roads.get(id))
+                    .flatten()
+            }),
+            self.work.remaining,
+        )?;
+        for (&local, &live) in &self.live_roads {
+            if !self.roads.contains_key(local) {
+                self.map
+                    .authorize_land_effects(PreparedEffects::Road(live))?;
+                let old = &self.map.roads[live];
+                Self::check_road_cut(self.map, old, self.work.remaining)?;
+                for &building in &old.connected_buildings {
+                    self.map
+                        .authorize_land_effects(PreparedEffects::Building(building))?;
+                }
+                for object in self.map.spatial_map.construction_candidates(
+                    old.points()
+                        .bbox()
+                        .flatten()
+                        .expand(crate::map::MAX_LOT_SIZE * 2.0),
+                    crate::map::ProjectFilter::LOT,
+                ) {
+                    self.work.charge(1)?;
+                    if let Some(id) = object.to_lot() {
+                        if self.map.lots[id].parent == live {
+                            self.map.authorize_land_effects(PreparedEffects::Lot(id))?;
+                        }
+                    }
+                }
+            }
+        }
+        for &id in &self.changed_roads {
+            let road = &self.roads[id];
+            for triangle in land_deck_triangles(road) {
+                self.work.charge(1)?;
+                self.map.authorize_land_effects(PreparedEffects::Footprint(
+                    &triangle.map(|p| p.xy()),
+                ))?;
+            }
+            if let Some(&live) = self.live_roads.get(&id) {
+                self.map
+                    .authorize_land_effects(PreparedEffects::Road(live))?;
+                let old = &self.map.roads[live];
+                if old.points().as_slice() != road.points().as_slice() {
+                    Self::check_road_cut(self.map, old, self.work.remaining)?;
+                    Self::check_road_cut(self.map, road, self.work.remaining)?;
+                }
+            } else {
+                Self::check_road_cut(self.map, road, self.work.remaining)?;
+                let strip = road.boldline();
+                self.map.authorize_displaced_lots(strip)?;
+            }
+        }
+        let mut outlines = Vec::new();
+        for &id in &self.changed_junctions {
+            let joint = &self.junctions[id];
+            if let Some(&live) = self.live_junctions.get(&id) {
+                self.map
+                    .authorize_land_effects(PreparedEffects::Junction(live))?;
+                let old = &self.map.intersections[live];
+                let outline = junction_outline(old, &self.map.roads, self.work)?;
+                if outline.len() >= 3 {
+                    self.map
+                        .authorize_land_effects(PreparedEffects::Footprint(outline.as_slice()))?;
+                }
+                if joint.pos != old.pos || joint.radius != old.radius {
+                    Self::check_junction_cut(self.map, old, self.work.remaining)?;
+                    Self::check_junction_cut(self.map, joint, self.work.remaining)?;
+                }
+            } else {
+                self.map
+                    .authorize_land_effects(PreparedEffects::Point(joint.pos.xy()))?;
+                Self::check_junction_cut(self.map, joint, self.work.remaining)?;
+            }
+            self.map.authorize_displaced_lots(joint.bcircle())?;
+            let outline = junction_outline(joint, &self.roads, self.work)?;
+            if outline.len() >= 3 {
+                self.map
+                    .authorize_land_effects(PreparedEffects::Footprint(outline.as_slice()))?;
+                outlines.push(
+                    outline
+                        .iter()
+                        .map(|point| point.z(joint.pos.z + ROAD_Z_OFFSET))
+                        .collect(),
+                );
+            }
+        }
+        Ok(outlines)
+    }
+
+    fn check_road_cut(
+        map: &Map,
+        road: &Road,
+        remaining: &mut usize,
+    ) -> Result<(), ConnectionError> {
+        use crate::map::SpatialMapObject;
+        let radius = 10.0 + road.width * 3.0;
+        map.authorize_cut_nodes(
+            road.cut_influence().unwrap(),
+            road.points().len(),
+            remaining,
+            |point| road.points().project_2d(point).xy().is_close(point, radius),
+        )?;
+        Ok(())
+    }
+
+    fn check_junction_cut(
+        map: &Map,
+        joint: &Intersection,
+        remaining: &mut usize,
+    ) -> Result<(), ConnectionError> {
+        let mut circle = joint.bcircle();
+        circle.radius *= 2.0;
+        map.authorize_cut_nodes(circle.bbox(), 1, remaining, |point| circle.contains(point))?;
+        Ok(())
     }
 
     fn validate(&mut self) -> Result<(BTreeSet<RoadID>, Vec<Vec<Vec3>>), ConnectionError> {
@@ -1199,7 +1379,7 @@ fn validate_deck(
     work: &mut CrossingWork<'_>,
 ) -> Result<bool, ConnectionError> {
     let mut wet = false;
-    for triangle in deck_triangles(road) {
+    for triangle in land_deck_triangles(road) {
         let footprint = triangle.map(Vec3::xy);
         wet_tiles(env, &footprint, work, |tile, surface| {
             if let Some(z) = clipped_deck_height(triangle, tile_bounds(tile)) {
@@ -1433,13 +1613,21 @@ pub(crate) fn prepare_merge(
     let dst = graph.load_junction(dst)?;
     let first = graph.road_keys[&first];
     let second = graph.road_keys[&second];
+    let joint = [graph.roads[first].src, graph.roads[first].dst]
+        .into_iter()
+        .find(|&id| id == graph.roads[second].src || id == graph.roads[second].dst)
+        .ok_or(ConnectionError::InvalidEndpoint)?;
+    graph.validate_removed_junction(joint)?;
     graph.remove_road(first);
     graph.remove_road(second);
     graph.add_road(src, dst, profile.clone(), pattern, elevated, 0)?;
-    if check_water {
+    if check_water || map.land_ownership().is_tiled() {
         graph.invalidate(src)?;
         graph.invalidate(dst)?;
-        graph.validate()?;
+        graph.validate_land()?;
+        if check_water {
+            graph.validate()?;
+        }
     }
     Ok(())
 }
@@ -1552,7 +1740,16 @@ pub(crate) fn prepare_road_removal(
     graph.remove_road(id);
     graph.invalidate(src)?;
     graph.invalidate(dst)?;
-    graph.validate()?;
+    if graph.junctions[src].roads.is_empty() {
+        graph.validate_removed_junction(src)?;
+    }
+    if graph.junctions[dst].roads.is_empty() {
+        graph.validate_removed_junction(dst)?;
+    }
+    graph.validate_land()?;
+    if map.environment().strict_water_siting() {
+        graph.validate()?;
+    }
     Ok(())
 }
 
@@ -1563,6 +1760,7 @@ pub(crate) fn prepare_junction_removal(
 ) -> Result<(), ConnectionError> {
     let mut graph = LocalTopology::new(map, work);
     let junction = graph.load_junction(id)?;
+    graph.validate_removed_junction(junction)?;
     for id in graph.junctions[junction].roads.clone() {
         let src = graph.roads[id].src;
         let dst = graph.roads[id].dst;
@@ -1572,9 +1770,15 @@ pub(crate) fn prepare_junction_removal(
         let other = if src == junction { dst } else { src };
         graph.invalidate(other)?;
         graph.invalidate(other)?;
+        if graph.junctions[other].roads.is_empty() {
+            graph.validate_removed_junction(other)?;
+        }
     }
     graph.changed_junctions.remove(&junction);
-    graph.validate()?;
+    graph.validate_land()?;
+    if map.environment().strict_water_siting() {
+        graph.validate()?;
+    }
     Ok(())
 }
 
@@ -1597,7 +1801,10 @@ pub(crate) fn prepare_junction_update(
     graph.junctions[id].turn_policy = next.turn_policy;
     graph.junctions[id].light_policy = next.light_policy;
     graph.invalidate(id)?;
-    graph.validate()?;
+    graph.validate_land()?;
+    if map.environment().strict_water_siting() {
+        graph.validate()?;
+    }
     Ok(())
 }
 

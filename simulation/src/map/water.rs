@@ -226,11 +226,19 @@ pub enum WaterEditError {
     },
     UnrepresentableLevel,
     Stale,
+    LandDenied(super::LandDenial),
+}
+
+impl From<super::LandDenial> for WaterEditError {
+    fn from(reason: super::LandDenial) -> Self {
+        Self::LandDenied(reason)
+    }
 }
 
 impl fmt::Display for WaterEditError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::LandDenied(reason) => write!(f, "land edit denied: {reason:?}"),
             Self::InvalidInput => f.write_str("invalid water level, depth or shape"),
             Self::OutOfBounds => f.write_str("water coordinates are outside the map"),
             Self::Limit => f.write_str("water work or storage limit exceeded"),
@@ -971,9 +979,14 @@ impl WaterFootprint {
     }
 
     pub fn overlaps_tile(&self, tile: WaterTileCoord) -> bool {
-        let min = point(tile.corner());
-        let max = Vec2d::new(min.x + PITCH, min.y + PITCH);
-        let center = point(tile.center());
+        self.overlaps_square(tile.corner(), CELL_SIZE)
+    }
+
+    pub(super) fn overlaps_square(&self, origin: Vec2, side: f32) -> bool {
+        let min = point(origin);
+        let side = f64::from(side);
+        let max = Vec2d::new(min.x + side, min.y + side);
+        let center = Vec2d::new(min.x + side / 2.0, min.y + side / 2.0);
         let mut inside = false;
         for &edge in &self.edges {
             if edge.enters(min, max, true) && edge.a.distance2(edge.b) > 0.0 {
@@ -1640,6 +1653,10 @@ impl PreparedWaterEdit {
             return self.sea_level_dm.map(Occupant::sea);
         }
         None
+    }
+
+    pub(super) fn changed_base_nodes(&self) -> impl Iterator<Item = BaseNode> + '_ {
+        self.patch.changes().map(|(node, _, _)| node)
     }
 
     pub fn affected_tiles(&self) -> impl Iterator<Item = WaterTileCoord> + '_ {
