@@ -4496,13 +4496,13 @@ mod lifecycle_tests {
     }
 
     fn assert_freight2_cutoff_order(urgent_is_booked: bool) {
+        let mut f = Fixture::with_companies("flour-factory", "bakery");
         let flour = ItemID::new("flour");
         let bakery = GoodsCompanyID::new("bakery").prototype();
         let capacity =
             DispatchPolicy::for_prototype(GoodsCompanyID::new("flour-factory").prototype())
                 .unwrap()
                 .capacity;
-        let mut f = Fixture::with_companies("flour-factory", "bakery");
         let north = road_along(&f, None, Some(100.0));
         let south = road_along(&f, None, Some(500.0));
         let near = place_warehouse_on(&mut f, bakery, vec2(245.0, 157.0), Some(north));
@@ -4781,10 +4781,10 @@ mod lifecycle_tests {
     }
 
     fn assert_freight2_station_claims(routine_bundle: bool) {
+        let mut f = Fixture::with_companies("coal-mine", "supermarket");
         let cereal = ItemID::new("cereal");
         let meat = ItemID::new("meat");
         let mill_proto = GoodsCompanyID::new("flour-factory").prototype();
-        let mut f = Fixture::with_companies("coal-mine", "supermarket");
         let terminal = station(&mut f, true);
         let store = f.destination;
         let mill = place_warehouse(&mut f, mill_proto, vec2(435.0, 467.0));
