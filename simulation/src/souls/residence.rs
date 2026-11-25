@@ -167,7 +167,7 @@ pub(crate) fn prototype(density: Density, level: u8) -> Option<&'static Residenc
         .or_else(|| registry.legacy_residence(density, level))
 }
 
-fn legacy_prototype(density: Density, level: u8) -> Option<&'static ResidencePrototype> {
+pub(crate) fn legacy_prototype(density: Density, level: u8) -> Option<&'static ResidencePrototype> {
     prototypes::prototypes()
         .legacy_residence(density, level)
         .or_else(|| prototype(density, level))
@@ -623,10 +623,7 @@ pub fn residence_update(sim: &mut Simulation) {
         }
     }
 
-    let retail = development::update(sim, phase, abandon);
-    for building in collapse {
-        development::remove_site(sim, building, development::RemovalCause::Collapse);
-    }
+    let retail = development::update(sim, phase, abandon, collapse);
     let mut upgrades = Vec::new();
     {
         let map = sim.map();

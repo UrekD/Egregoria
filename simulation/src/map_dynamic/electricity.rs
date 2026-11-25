@@ -432,6 +432,7 @@ mod tests {
                         floors: 1,
                         roof_z: 4.0,
                         approved_value_band: 0,
+                        frozen_shell: None,
                         home: None,
                         planned_jobs: jobs,
                         site: GrowableSiteState::Active,
@@ -756,11 +757,19 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(status(&test).water, UtilityStatus::Served);
+        assert_eq!(
+            crate::economy::progression::utility_served_fraction(&test.g),
+            Some(1.0)
+        );
         test.g.map_mut().remove_road(bridge).unwrap();
         assert_eq!(test.g.map().electricity.net_id(home), Some(network));
         assert_ne!(test.g.map().electricity.net_id(other), Some(network));
         assert_eq!(status(&test).water, UtilityStatus::Unknown);
         assert_eq!(status(&test).sewage, UtilityStatus::Unknown);
+        assert_eq!(
+            crate::economy::progression::utility_served_fraction(&test.g),
+            Some(0.0)
+        );
     }
 
     #[test]

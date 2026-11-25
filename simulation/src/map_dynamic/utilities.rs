@@ -214,19 +214,10 @@ impl UtilityFlow {
         residences: &Residences,
         infos: &BuildingInfos,
         world: &World,
+        electricity: &ElectricityFlow,
         id: BuildingID,
     ) -> Option<BuildingUtilityStatus> {
-        let building = map.get(id)?;
-        if building.development().is_none() {
-            return self.status(map, residences, id);
-        }
-        let demand = effective_load(
-            building,
-            residences.by_building.get(&id),
-            active_business(building, infos, world),
-        )
-        .water_demand();
-        self.status_with_demand(map, id, demand)
+        super::live_site_utility_status(map, residences, infos, world, electricity, self, id)
     }
 
     pub(crate) fn status_with_demand(

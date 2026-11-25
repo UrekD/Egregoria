@@ -844,6 +844,7 @@ mod tests {
                 planned_jobs: 12,
                 site: GrowableSiteState::Active,
                 business: Some(GrowableBusinessState::AwaitingSpawn),
+                frozen_shell: None,
             };
             let mut encoded = Bincode::encode(&*map).unwrap();
             let start = encoded

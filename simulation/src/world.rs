@@ -830,7 +830,17 @@ impl Simulation {
             job_slots,
         } = plan;
         let building = self.map_mut().commit_prepared_growable(placement)?;
-        self.write::<BuildingInfos>().insert(building);
+        let mixed = self
+            .map()
+            .get(building)
+            .is_some_and(|site| site.is_mixed_use());
+        {
+            let mut infos = self.write::<BuildingInfos>();
+            infos.insert(building);
+            if mixed {
+                infos.mark_business_address(building);
+            }
+        }
         let housing_slots = home.as_ref().map_or(0, |home| home.capacity);
         if let Some(home) = home {
             self.write::<Residences>().insert(building, home);

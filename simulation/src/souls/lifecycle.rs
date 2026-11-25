@@ -116,17 +116,33 @@ fn finish_company_departures(sim: &mut Simulation) {
 
 /// Remove a site and settle all uses using the captured building record.
 pub(crate) fn remove_site(sim: &mut Simulation, id: BuildingID) -> bool {
+    remove_site_inner(sim, id, false)
+}
+
+/// Remove timed collapses in stable ID order and defer their shared address scrub.
+pub(crate) fn remove_collapsed_sites(sim: &mut Simulation, ids: Vec<BuildingID>) {
+    for id in ids {
+        remove_site_inner(sim, id, true);
+    }
+}
+
+fn remove_site_inner(sim: &mut Simulation, id: BuildingID, defer_references: bool) -> bool {
     let was_external_target = sim.map().external_train_stations.first() == Some(&id);
     let removed = sim.map_mut().remove_building(id);
     let Some(building) = removed else {
         return false;
     };
     residence::on_building_removed(sim, id);
-    remove_building(sim, building, was_external_target);
+    remove_building(sim, building, was_external_target, defer_references);
     true
 }
 
-fn remove_building(sim: &mut Simulation, building: Building, was_external_target: bool) {
+fn remove_building(
+    sim: &mut Simulation,
+    building: Building,
+    was_external_target: bool,
+    defer_references: bool,
+) {
     let id = building.id;
     cancel_removed(sim, CargoRemoval::Building(id));
     if building.has_residential_use() {
@@ -147,15 +163,17 @@ fn remove_building(sim: &mut Simulation, building: Building, was_external_target
         residence::evict_residents(sim, id, building.door_pos);
     }
     sim.write::<BuildingInfos>().remove(id);
+    if matches!(building.kind, BuildingKind::GoodsCompany(_))
+        || (defer_references && building.has_residential_use())
+    {
+        sim.world
+            .company_departures
+            .removed_sites
+            .insert(id, building.door_pos);
+        schedule_company_cleanup(sim);
+        return;
+    }
     match building.kind {
-        BuildingKind::GoodsCompany(_) => {
-            sim.world
-                .company_departures
-                .removed_sites
-                .insert(id, building.door_pos);
-            schedule_company_cleanup(sim);
-            return;
-        }
         BuildingKind::RailFreightStation(_) => {
             let buffer = sim.read::<ParCommandBuffer<FreightStationEnt>>();
             for (station, entity) in sim.world.freight_stations.iter() {
@@ -321,12 +339,16 @@ pub fn mark_site_abandoned(sim: &mut Simulation, building: BuildingID) -> bool {
 
 pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: CompanyEnt) {
     let building = company.comp.building;
-    let (profiled, shared_address, site_survives) = sim
-        .map()
-        .get(building)
-        .map_or((false, false, false), |site| {
-            (site.development().is_some(), site.is_mixed_use(), true)
-        });
+    let (profiled, shared_address, needs_address_cleanup) =
+        sim.map()
+            .get(building)
+            .map_or((false, false, false), |site| {
+                (
+                    site.development().is_some(),
+                    site.is_mixed_use(),
+                    !site.is_abandoned_growable(),
+                )
+            });
     sim.world.company_departures.queued.remove(&id);
     if profiled {
         mark_business_closed(sim, id, building);
@@ -361,7 +383,7 @@ pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: Comp
     clear_soul_references(sim, SoulID::GoodsCompany(id));
     if shared_address {
         clear_company_workers(sim, id, &company);
-    } else if site_survives {
+    } else if needs_address_cleanup {
         sim.world.company_departures.vacated_sites.insert(building);
     }
     schedule_company_cleanup(sim);
@@ -847,9 +869,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
             Location::Building(id) => buildings.get(&id).copied().flatten(),
             _ => None,
         };
-        for &id in buildings.keys() {
-            human.food.forget_building(id);
-        }
+        human.food.forget_if(|id| buildings.contains_key(&id));
 
         let seller_removed = human
             .household

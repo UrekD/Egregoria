@@ -118,9 +118,13 @@ fn build_showcase() -> Result<ScenarioCtx, String> {
         &mut ctx,
         SHOWCASE_ORIGIN,
         [
-            ("coal-mine", vec2(780.0, 830.0)),
+            // Keep the power plant's coal haul inside the working shift as core traffic grows.
+            ("coal-mine", vec2(-30.0, 145.0)),
             ("water-pump", vec2(-30.0, 50.0)),
             ("sewage-outlet", vec2(-30.0, 750.0)),
+            // Profiled towers and their upper levels need additional pipe capacity.
+            ("water-pump", vec2(-30.0, 450.0)),
+            ("sewage-outlet", vec2(-30.0, 550.0)),
             ("school", vec2(225.0, 375.0)),
             ("clinic", vec2(325.0, 225.0)),
             ("fire-station", vec2(125.0, 250.0)),

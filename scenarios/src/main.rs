@@ -1,4 +1,4 @@
-use scenarios::builtin::{demo_cities, growth_basic, perf, water_fixtures, PERF_10K, SCENARIOS};
+use scenarios::builtin::{demo_cities, growth_basic, perf, water_fixtures, PERF_10K, SCENARIOS, ZONES2_L3};
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
 use serde::Serialize;
@@ -22,7 +22,7 @@ fn usage() -> String {
     let names = SCENARIOS
         .iter()
         .map(|(scenario, _)| scenario.name)
-        .chain([PERF_10K.0.name, "all"])
+        .chain([PERF_10K.0.name, ZONES2_L3.0.name, "all"])
         .collect::<Vec<_>>()
         .join("|");
     format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
@@ -227,6 +227,8 @@ fn run() -> Result<(), String> {
     }
     let available = if name == PERF_10K.0.name {
         std::slice::from_ref(&PERF_10K)
+    } else if name == ZONES2_L3.0.name {
+        std::slice::from_ref(&ZONES2_L3)
     } else {
         SCENARIOS
     };

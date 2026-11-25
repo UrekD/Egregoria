@@ -47,8 +47,8 @@ impl BuyFood {
         }
     }
 
-    pub(crate) fn forget_building(&mut self, building: BuildingID) {
-        if matches!(self.state, BuyFoodState::BoughtAt(id) if id == building) {
+    pub(crate) fn forget_if(&mut self, removed: impl FnOnce(BuildingID) -> bool) {
+        if matches!(self.state, BuyFoodState::BoughtAt(id) if removed(id)) {
             self.state = BuyFoodState::Empty;
         }
     }

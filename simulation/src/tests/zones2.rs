@@ -1,8 +1,8 @@
 use super::init_test_simulation;
 use crate::economy::{progression::ProgressionMode, Market};
 use crate::map::{
-    BuildingID, Density, GrowableBusinessState, LanePatternBuilder, LotLayout, MapProject,
-    ZoneCell, ZoneGrid, ZoneKind,
+    BuildingID, Density, GrowableBusinessState, GrowableSiteState, LanePatternBuilder, LotLayout,
+    MapProject, ZoneCell, ZoneGrid, ZoneKind,
 };
 use crate::map_dynamic::{active_business, effective_load, BuildingInfos, EnvCell, EnvGrid};
 use crate::souls::growth::check_growable_lot;
@@ -69,13 +69,6 @@ fn zone(kind: ZoneKind, density: Density) -> ZoneCell {
 #[test]
 fn zones2_acceptance_high_residential_placement_has_a_tower_shell() {
     let mut sim = flat_city();
-    // The release switch stages pure profiles with MX. While gated, use only
-    // the authored pure prototypes in this serial test and restore the registry on exit.
-    let Some(_registry) =
-        stage_pure_profiles("zones2_acceptance_high_residential_placement_has_a_tower_shell")
-    else {
-        return;
-    };
     sim.apply_commands([&road(vec3(100.0, 180.0, 0.0), vec3(820.0, 180.0, 0.0))]);
     let kinds = [
         ZoneKind::Residential,
@@ -151,11 +144,6 @@ fn zones2_acceptance_high_residential_placement_has_a_tower_shell() {
 #[test]
 fn zones2_acceptance_same_parcel_value_changes_the_tower_capacity() {
     let mut low_value = flat_city();
-    let Some(_registry) =
-        stage_pure_profiles("zones2_acceptance_same_parcel_value_changes_the_tower_capacity")
-    else {
-        return;
-    };
     low_value.apply_commands([&road(vec3(100.0, 180.0, 0.0), vec3(680.0, 180.0, 0.0))]);
     let home = zone(ZoneKind::Residential, Density::High);
     let neighbor_lot = {
@@ -235,66 +223,27 @@ fn zones2_acceptance_same_parcel_value_changes_the_tower_capacity() {
     assert_eq!(high_tower.floors, low_tower.floors + 2);
     assert!(high_tower.housing_slots > low_tower.housing_slots);
     assert!(high_tower.roof_z > low_tower.roof_z);
-}
-
-struct RestoreProfiles(bool);
-
-impl Drop for RestoreProfiles {
-    fn drop(&mut self) {
-        if self.0 {
-            init_test_simulation();
-        }
-    }
-}
-
-fn stage_pure_profiles(test: &str) -> Option<RestoreProfiles> {
-    let staged = prototypes::prototype(prototypes::ResidencePrototypeID::new("residence-high-l1"))
-        .massing
-        .is_none();
-    if staged {
-        const CHILD: &str = "EGR_ZONES2_PURE_PROFILE_TEST";
-        if std::env::var(CHILD).as_deref() != Ok(test) {
-            let result = std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    &format!("tests::zones2::{test}"),
-                    "--test-threads=1",
-                ])
-                .env(CHILD, test)
-                .output()
-                .expect("start an isolated prototype test process");
-            assert!(
-                result.status.success(),
-                "{}
-{}",
-                String::from_utf8_lossy(&result.stdout),
-                String::from_utf8_lossy(&result.stderr)
-            );
-            return None;
-        }
-        prototypes::test_prototypes(&format!(
-            r#"
-                package.path = "../base_mod/?.lua"
-                zones2_profiles_enabled = true
-                {}
-                for i = #data, 1, -1 do
-                    if data[i].zone_kind == "mixed-use" then table.remove(data, i) end
-                end
-            "#,
-            include_str!("../../../base_mod/data.lua")
-        ));
-    }
-    Some(RestoreProfiles(staged))
+    let footprint = |sim: &Simulation, id: BuildingID| {
+        let map = sim.map();
+        map.get(id)
+            .unwrap()
+            .development()
+            .unwrap()
+            .frozen_shell
+            .as_ref()
+            .unwrap()
+            .fit()
+            .footprint()
+    };
+    assert_ne!(
+        footprint(&low_value, low.building).corners,
+        footprint(&high_value, high.building).corners
+    );
 }
 
 #[test]
 fn zones2_acceptance_profiled_home_and_business_loads_match_their_slots() {
     let mut sim = flat_city();
-    let Some(_registry) =
-        stage_pure_profiles("zones2_acceptance_profiled_home_and_business_loads_match_their_slots")
-    else {
-        return;
-    };
     sim.apply_commands([&road(vec3(100.0, 260.0, 0.0), vec3(680.0, 260.0, 0.0))]);
     let work_zone = zone(ZoneKind::Commercial, Density::High);
     let home_zone = zone(ZoneKind::Residential, Density::High);
@@ -396,7 +345,6 @@ fn zones2_acceptance_profiled_home_and_business_loads_match_their_slots() {
 }
 
 #[test]
-#[ignore = "requires Wave C MX prototypes and Z2 lifecycle integration"]
 fn zones2_acceptance_mixed_shop_closure_keeps_occupied_apartments() {
     let mut sim = flat_city();
     sim.apply_commands([&road(vec3(100.0, 260.0, 0.0), vec3(680.0, 260.0, 0.0))]);
@@ -446,11 +394,6 @@ fn zones2_acceptance_mixed_shop_closure_keeps_occupied_apartments() {
 #[test]
 fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
     let mut sim = flat_city();
-    let Some(_registry) =
-        stage_pure_profiles("zones2_acceptance_replay_reconstructs_growth_and_bulldozing")
-    else {
-        return;
-    };
     let mut sched = Simulation::schedule();
     let root = SlotRoot::new();
     sim.apply_commands([&road(vec3(100.0, 380.0, 0.0), vec3(640.0, 380.0, 0.0))]);
@@ -480,6 +423,7 @@ fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
                 .is_some_and(|summary| summary.floors >= 12)
         })
         .expect("residential demand must grow at least one tower");
+    let origin = *sim.map().lot_origin(building).unwrap();
     let mut resumed = round_trip_and_play(&sim, &root.0, "zones2_before_bulldoze");
     let mut resumed_sched = Simulation::schedule();
     let erase = WorldCommand::ZonePaint {
@@ -493,7 +437,75 @@ fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
     assert_eq!(resumed.hashes(), sim.hashes(), "first step after resume");
     assert!(sim.map().get(building).is_none());
     assert!(sim.read::<ZoneGrid>().cells().is_empty());
-    round_trip_and_play(&sim, &root.0, "zones2_after_bulldoze");
+    {
+        let map = sim.map();
+        assert!(map
+            .lots()
+            .values()
+            .any(|lot| lot.parent == origin.parent_road
+                && lot.shape.center().distance2(origin.shape.center()) < 0.01));
+    }
+    let mut resumed = round_trip_and_play(&sim, &root.0, "zones2_after_bulldoze");
+    sim.apply_commands([&valid]);
+    resumed.apply_commands([&valid]);
+    for _ in 0..TICKS_PER_HOUR {
+        sim.tick(&mut sched, []);
+        resumed.tick(&mut resumed_sched, []);
+    }
+    assert!(sim
+        .map()
+        .buildings()
+        .keys()
+        .any(|id| sim.growable_summary(id).is_some()));
+    assert_eq!(
+        resumed.hashes(),
+        sim.hashes(),
+        "first regrowth after resume"
+    );
+    let mut resumed = round_trip_and_play(&sim, &root.0, "zones2_after_regrowth");
+    let (regrown, origin) = {
+        let map = sim.map();
+        let id = map
+            .buildings()
+            .keys()
+            .find(|&id| {
+                sim.growable_summary(id)
+                    .is_some_and(|site| site.occupants > 0)
+            })
+            .expect("the repainted frontage must grow occupied housing");
+        (id, *map.lot_origin(id).unwrap())
+    };
+    let cut = WorldCommand::MapRemoveRoad(origin.parent_road);
+    sim.apply_commands([&cut]);
+    resumed.apply_commands([&cut]);
+    assert_eq!(sim.hashes(), resumed.hashes());
+    for _ in 0..TICKS_PER_HOUR {
+        sim.tick(&mut sched, []);
+        resumed.tick(&mut resumed_sched, []);
+    }
+    assert_eq!(sim.hashes(), resumed.hashes());
+    assert!(matches!(
+        sim.growable_summary(regrown).unwrap().site,
+        GrowableSiteState::Abandoned { .. }
+    ));
+    assert_eq!(sim.growable_summary(regrown).unwrap().occupants, 0);
+    let mut resumed = round_trip_and_play(&sim, &root.0, "zones2_after_frontage_loss");
+    for _ in 0..(13 * TICKS_PER_HOUR) {
+        sim.tick(&mut sched, []);
+        resumed.tick(&mut resumed_sched, []);
+    }
+    assert_eq!(sim.hashes(), resumed.hashes());
+    {
+        let map = sim.map();
+        assert!(map.get(regrown).is_none());
+        assert!(
+            map.lots()
+                .values()
+                .all(|lot| { lot.shape.center().distance2(origin.shape.center()) >= 0.01 }),
+            "collapse must not restore a parcel without frontage"
+        );
+    }
+    round_trip_and_play(&sim, &root.0, "zones2_after_timed_collapse");
 }
 
 fn round_trip_and_play(sim: &Simulation, root: &Path, label: &str) -> Simulation {
@@ -514,26 +526,26 @@ fn round_trip_and_play(sim: &Simulation, root: &Path, label: &str) -> Simulation
 
 #[test]
 fn zones2_acceptance_save_cut_checks_versions_before_payloads() {
-    assert_eq!(crate::VERSION, "0.10.0");
+    assert_eq!(crate::VERSION, "0.11.0");
     let root = SlotRoot::new();
-    let id = SlotId::new("zones2_p5").unwrap();
+    let id = SlotId::new("zones2_p6").unwrap();
     let paths = slot_paths(&root.0, &id).unwrap();
     let obsolete = crate::SlotSnapshotHeader {
         magic: crate::SLOT_SNAPSHOT_MAGIC,
-        version: "0.9.0".into(),
+        version: "0.10.0".into(),
         revision: SnapshotRevision::new(5),
     };
     // Both payloads are deliberately undecodable as current simulation data.
     fs::write(&paths.bc, Bincode::encode(&obsolete).unwrap()).unwrap();
-    let replay = br#"{"commands":[{"UnknownP5Command":[]}],"version":"0.9.0","revision":5}"#;
+    let replay = br#"{"commands":[{"UnknownP6Command":[]}],"version":"0.10.0","revision":5}"#;
     fs::write(&paths.replay, replay).unwrap();
-    assert_p5_refused(&root.0, &id);
+    assert_incompatible(&root.0, &id, "0.10.0");
     let error = crate::ReplayJson::decode::<Replay>(replay).unwrap_err();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("Replay has version"));
-    assert!(error.to_string().contains("0.9.0"));
+    assert!(error.to_string().contains("0.10.0"));
     let mut replay = Replay::default();
-    replay.version = "0.9.0".into();
+    replay.version = "0.10.0".into();
     let error = Simulation::try_from_replay(replay).err().unwrap();
     assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
     assert!(error.to_string().contains("Replay has version"));
@@ -543,10 +555,10 @@ fn zones2_acceptance_save_cut_checks_versions_before_payloads() {
 #[ignore = "requires a production P5 snapshot and replay pair in EGR_ZONES2_P5_ROOT"]
 fn zones2_acceptance_real_p5_save_and_replay_are_refused() {
     let root = PathBuf::from(std::env::var_os("EGR_ZONES2_P5_ROOT").expect("EGR_ZONES2_P5_ROOT"));
-    assert_p5_refused(&root, &SlotId::new("zones2_p5").unwrap());
+    assert_incompatible(&root, &SlotId::new("zones2_p5").unwrap(), "0.9.0");
 }
 
-fn assert_p5_refused(root: &Path, id: &SlotId) {
+fn assert_incompatible(root: &Path, id: &SlotId, expected_version: &str) {
     let listed = crate::list_slots_with_revisions(root, |path, kind| {
         Simulation::read_slot_snapshot_header(path, kind)
             .unwrap()
@@ -554,12 +566,11 @@ fn assert_p5_refused(root: &Path, id: &SlotId) {
     })
     .unwrap();
     let entry = listed.iter().find(|entry| entry.id == *id).unwrap();
-    let is_old =
-        |error| matches!(error, SaveLoadError::Incompatible { version } if version == "0.9.0");
+    let is_old = |error| matches!(error, SaveLoadError::Incompatible { version } if version == expected_version);
     assert!(is_old(Simulation::load_from_slot(root, id).err().unwrap()));
     let header =
         Simulation::read_slot_snapshot_header(entry.snapshot_path(), entry.snapshot).unwrap();
-    assert_eq!(header.version, "0.9.0");
+    assert_eq!(header.version, expected_version);
     assert!(matches!(
         Simulation::validate_listed_snapshot(root, entry),
         Err(SaveLoadError::SnapshotChanged)

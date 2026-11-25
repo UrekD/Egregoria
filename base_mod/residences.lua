@@ -1,11 +1,14 @@
-local function residences(density, capacities, lot_size_min, massing, mixed)
-    local prefix = mixed and "residence-mixed-" or "residence-"
+local function residences(density, capacities, lot_size_min, massing, mixed, legacy_name)
+    local prefix = mixed and "residence-mixed-"
+        or legacy_name and "residence-legacy-"
+        or "residence-"
     local label = mixed and "Mixed-use residence" or "Residence"
     for level, capacity in ipairs(capacities) do
         data:extend {
             type = "residence",
             name = prefix .. density .. "-l" .. level,
             label = label .. " (" .. density .. ", level " .. level .. ")",
+            order = legacy_name and "base-legacy-residence" or nil,
             zone_kind = mixed and "mixed-use" or nil,
             density = density,
             level = level,
@@ -22,7 +25,13 @@ local function residences(density, capacities, lot_size_min, massing, mixed)
     end
 end
 
--- Select the staged data when the engine's Mixed Use placement gate is open.
+local function legacy_residences(legacy_name)
+    residences("low", {2, 4, 6}, 300, nil, nil, legacy_name)
+    residences("medium", {3, 6, 9}, 400, nil, nil, legacy_name)
+    residences("high", {4, 8, 12}, 400, nil, nil, legacy_name)
+end
+
+-- Profiled zoning and legacy manual residences share the base registry.
 if zones2_profiles_enabled == true then
     local low = {
         style = "house",
@@ -51,8 +60,7 @@ if zones2_profiles_enabled == true then
     residences("high", {12, 15, 18, 21, 24}, 400, high)
     residences("medium", {4, 6, 8, 10, 12}, 400, medium, true)
     residences("high", {11, 14, 17, 20, 23}, 400, high, true)
+    legacy_residences(true)
 else
-    residences("low", {2, 4, 6}, 300)
-    residences("medium", {3, 6, 9}, 400)
-    residences("high", {4, 8, 12}, 400)
+    legacy_residences(false)
 end

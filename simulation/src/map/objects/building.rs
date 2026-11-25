@@ -1,3 +1,4 @@
+use crate::map::import::growable_shell::FrozenGrowableShell;
 use crate::map::procgen::{gen_exterior_farm, gen_exterior_house, ColoredMesh};
 use crate::map::{
     Buildings, ElectricityCache, Environment, LanePattern, RoadID, Roads, SpatialMap, ZoneCell,
@@ -171,6 +172,8 @@ pub struct GrowableDevelopment {
     pub planned_jobs: u32,
     pub site: GrowableSiteState,
     pub business: Option<GrowableBusinessState>,
+    #[serde(default)]
+    pub frozen_shell: Option<FrozenGrowableShell>,
 }
 
 impl GrowableDevelopment {
@@ -202,6 +205,11 @@ impl PreparedGrowableAppearance {
             && self.development.roof_z > self.base_z
             && self.door.is_finite()
             && parcel.contains(self.door.xy())
+            && self.development.frozen_shell.as_ref().is_none_or(|shell| {
+                shell.valid_for(parcel)
+                    && shell.fit().base_z() == self.base_z
+                    && shell.fit().door() == self.door
+            })
             && self
                 .mesh
                 .faces

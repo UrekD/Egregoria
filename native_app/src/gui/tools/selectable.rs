@@ -377,6 +377,7 @@ pub(crate) mod tests {
             floors: 10,
             roof_z,
             approved_value_band: 0,
+            frozen_shell: None,
             home: None,
             planned_jobs: 0,
             site: GrowableSiteState::Active,

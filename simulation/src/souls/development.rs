@@ -8,17 +8,15 @@ use prototypes::{
 };
 
 use crate::economy::Market;
-use crate::map::import::growable_shell::{
-    housing_slots, job_slots, realized_floors, GrowableFormFit,
-};
+use crate::map::import::growable_shell::{housing_slots, job_slots, realized_floors};
 use crate::map::{
     Building, BuildingID, ElectricityNetworkID, GrowableBusinessState, GrowableSiteState, Map,
     PreparedGrowableAppearance,
 };
 use crate::map_dynamic::{
-    active_business, connected_site_network, projected_site_load, utility_network_readout,
-    ActiveBusiness, ActiveRetailIndex, BuildingInfos, CoverageGrid, ElectricityFlow, EnvGrid,
-    NetworkLoad, NetworkReservations, SiteLoad, UtilityAdmission, UtilityFlow,
+    active_business, connected_site_network, projected_site_load, ActiveBusiness,
+    ActiveRetailIndex, BuildingInfos, CoverageGrid, ElectricityFlow, EnvGrid, NetworkLoad,
+    NetworkReservations, SiteLoad, UtilityAdmission, UtilityFlow,
 };
 use crate::{CompanyID, Simulation, SoulID, World};
 
@@ -144,39 +142,23 @@ pub(super) fn network_services(
         return Services::default();
     };
     *cache.entry(network).or_insert_with(|| {
-        let Some(live) = NetworkLoad::live(
+        let Some((live, sampled)) = NetworkLoad::live_with_pipe_sample(
             map,
             &sim.read::<Residences>(),
             &sim.read::<BuildingInfos>(),
             sim.world(),
+            &sim.read::<ElectricityFlow>(),
+            &sim.read::<UtilityFlow>(),
             network,
         ) else {
             return Services::default();
         };
-        let mut services = Services {
+        let water = sampled && live.pipes.has_water();
+        Services {
             power: live.has_power(),
-            ..Services::default()
-        };
-        let utilities = sim.read::<UtilityFlow>();
-        if !utilities.water_pending(map) {
-            if let Some(sample) = utility_network_readout(
-                map,
-                &sim.read::<ElectricityFlow>(),
-                &utilities,
-                Some(network),
-            )
-            .utility_totals
-            {
-                let mut pipes = live.pipes;
-                pipes.water_production = pipes.water_production.min(sample.water_production);
-                pipes.sewage_capacity = pipes.sewage_capacity.min(sample.sewage_capacity);
-                // A zero-draw network can serve pipes through a zero-watt pump.
-                services.water =
-                    live.power_demand_watts <= live.power_supply_watts && pipes.has_water();
-                services.sewage = services.water && pipes.has_sewage();
-            }
+            water,
+            sewage: water && live.pipes.has_sewage(),
         }
-        services
     })
 }
 
@@ -353,24 +335,8 @@ fn prepare_upgrade(
     } else {
         try_prototype(GrowableCompanyID::from(business?.prototype.id))?.massing?
     };
-    let env = context.map.environment();
-    let parcel = context.map.lot_origin(building.id)?.shape;
-    // Recover the chosen inset from the existing, authoritative geometry.
-    // The initial fit can use a lower band than the approved floors.
-    let fit = (0..=site.approved_value_band).find_map(|band| {
-        let fit = GrowableFormFit::check(env, parcel, site.zone, profile.style, band)?;
-        if fit.base_z() != building.height || fit.door() != building.door_pos {
-            return None;
-        }
-        let (mesh, roof) = fit.mesh(env, site.zone, profile.style, site.floors, site.level)?;
-        let same_vertices = mesh.faces.len() == building.mesh.faces.len()
-            && mesh
-                .faces
-                .iter()
-                .zip(&building.mesh.faces)
-                .all(|(a, b)| a.0 == b.0);
-        (roof == site.roof_z && same_vertices).then_some(fit)
-    })?;
+    let shell = site.frozen_shell.as_ref()?;
+    let fit = shell.fit();
     let band = site
         .approved_value_band
         .max(match context.environment.land_value(building.id) {
@@ -414,7 +380,7 @@ fn prepare_upgrade(
         });
     }
     let load = projected_site_load(building, home.as_ref(), projected_business);
-    let (mesh, roof_z) = fit.mesh(env, site.zone, profile.style, floors, level)?;
+    let (mesh, roof_z) = shell.mesh(site.zone, floors, level)?;
     let mut next = site.clone();
     next.level = level;
     next.floors = floors;
@@ -491,11 +457,13 @@ pub(crate) fn update(
     sim: &mut Simulation,
     phase: u64,
     legacy_abandoned: Vec<(BuildingID, Vec3)>,
+    legacy_collapse: Vec<BuildingID>,
 ) -> ActiveRetailIndex {
     update_with_limits(
         sim,
         phase,
         legacy_abandoned,
+        legacy_collapse,
         MAX_HOUSING_LEVEL,
         MAX_FIRM_LEVEL,
     )
@@ -505,6 +473,7 @@ fn update_with_limits(
     sim: &mut Simulation,
     phase: u64,
     legacy_abandoned: Vec<(BuildingID, Vec3)>,
+    mut collapse: Vec<BuildingID>,
     housing_limit: u8,
     firm_limit: u8,
 ) -> ActiveRetailIndex {
@@ -520,6 +489,8 @@ fn update_with_limits(
         {
             drop(residences);
             residence::settle_abandonment(sim, &mut Vec::new(), legacy_abandoned);
+            collapse.sort_unstable();
+            lifecycle::remove_collapsed_sites(sim, collapse);
             return retail_index(sim);
         }
         residences
@@ -532,7 +503,6 @@ fn update_with_limits(
     }
     let now = crate::map_dynamic::transit::elapsed_ticks(&sim.resources).0;
     let mut abandoned = Vec::new();
-    let mut collapse = Vec::new();
     let mut close = Vec::new();
 
     {
@@ -659,9 +629,7 @@ fn update_with_limits(
     }
     residence::settle_abandonment(sim, &mut abandoned, legacy_abandoned);
     collapse.sort_unstable();
-    for id in collapse {
-        remove_site(sim, id, RemovalCause::Collapse);
-    }
+    lifecycle::remove_collapsed_sites(sim, collapse);
 
     let retail = retail_index(sim);
     let ready = {
@@ -786,17 +754,6 @@ mod tests {
             require("data")
         "#,
         );
-        if !mixed_enabled() {
-            lua.push_str(
-                r#"
-                for i = #data, 1, -1 do
-                    if data[i].zone_kind == "mixed-use" then
-                        table.remove(data, i)
-                    end
-                end
-            "#,
-            );
-        }
         lua.push_str(overrides);
         prototypes::test_prototypes(&lua);
         test.build_roads(&[vec3(70.0, 100.0, 0.0), vec3(830.0, 100.0, 0.0)]);
@@ -815,10 +772,6 @@ mod tests {
             .unwrap()
             .id;
         (test, road)
-    }
-
-    fn mixed_enabled() -> bool {
-        std::env::var_os("EGREGORIA_Z2_STAGED_MIXED_USE").is_some()
     }
 
     fn place(sim: &mut Simulation, zone: ZoneKind, x: f32) -> BuildingID {
@@ -942,14 +895,8 @@ mod tests {
         with_profiles(
             concat!(module_path!(), "::zones2_z2_vacancy_admits_both_roles_once"),
             || {
-                let (mut test, mixed) = if mixed_enabled() {
-                    let (mut test, _) = street();
-                    let mixed = place(&mut test.g, ZoneKind::MixedUse, 280.0);
-                    (test, mixed)
-                } else {
-                    let (test, mixed, _) = crate::map_dynamic::accounting_site(true);
-                    (test, mixed)
-                };
+                let (mut test, _) = street();
+                let mixed = place(&mut test.g, ZoneKind::MixedUse, 280.0);
                 test.set_residential_demand(50.0);
                 add_souls_to_empty_buildings(&mut test.g);
                 let first = test.g.growable_summary(mixed).unwrap();
@@ -975,28 +922,26 @@ mod tests {
                     .as_goods_company()
                     .unwrap();
                 assert!(company_soul(&mut test.g, mixed, proto).is_none());
-                if mixed_enabled() {
-                    let other = place(&mut test.g, ZoneKind::MixedUse, 345.0);
-                    test.g.map_mut().set_growable_business_state(
-                        other,
-                        super::GrowableBusinessState::ClosedUntil {
-                            retry_elapsed_tick: u64::MAX,
-                        },
-                    );
-                    add_souls_to_empty_buildings(&mut test.g);
-                    assert_eq!(test.g.growable_summary(other).unwrap().occupants, 1);
-                    assert_eq!(test.g.read::<BuildingInfos>().owner(other), None);
-                    test.g.map_mut().set_growable_business_state(
-                        other,
-                        super::GrowableBusinessState::AwaitingSpawn,
-                    );
-                    add_souls_to_empty_buildings(&mut test.g);
-                    assert!(matches!(
-                        test.g.read::<BuildingInfos>().owner(other),
-                        Some(SoulID::GoodsCompany(_))
-                    ));
-                    assert_eq!(test.g.growable_summary(other).unwrap().occupants, 2);
-                }
+                let other = place(&mut test.g, ZoneKind::MixedUse, 345.0);
+                test.g.map_mut().set_growable_business_state(
+                    other,
+                    super::GrowableBusinessState::ClosedUntil {
+                        retry_elapsed_tick: u64::MAX,
+                    },
+                );
+                add_souls_to_empty_buildings(&mut test.g);
+                assert_eq!(test.g.growable_summary(other).unwrap().occupants, 1);
+                assert_eq!(test.g.read::<BuildingInfos>().owner(other), None);
+                test.g.map_mut().set_growable_business_state(
+                    other,
+                    super::GrowableBusinessState::AwaitingSpawn,
+                );
+                add_souls_to_empty_buildings(&mut test.g);
+                assert!(matches!(
+                    test.g.read::<BuildingInfos>().owner(other),
+                    Some(SoulID::GoodsCompany(_))
+                ));
+                assert_eq!(test.g.growable_summary(other).unwrap().occupants, 2);
             },
         );
     }
@@ -1015,18 +960,13 @@ mod tests {
                 "::zones2_z2_downstairs_deposit_is_local_and_the_closed_shop_leaves_housing"
             ),
             || {
-                let (mut test, mixed, company) = if mixed_enabled() {
-                    let (mut test, _) = street();
-                    let mixed = place(&mut test.g, ZoneKind::MixedUse, 280.0);
-                    add_souls_to_empty_buildings(&mut test.g);
-                    let Some(SoulID::GoodsCompany(company)) =
-                        test.g.read::<BuildingInfos>().owner(mixed)
-                    else {
-                        panic!("expected an open storefront");
-                    };
-                    (test, mixed, company)
-                } else {
-                    crate::map_dynamic::accounting_site(true)
+                let (mut test, _) = street();
+                let mixed = place(&mut test.g, ZoneKind::MixedUse, 280.0);
+                add_souls_to_empty_buildings(&mut test.g);
+                let Some(SoulID::GoodsCompany(company)) =
+                    test.g.read::<BuildingInfos>().owner(mixed)
+                else {
+                    panic!("expected an open storefront");
                 };
                 let shopper = spawn_human(&mut test.g, mixed).unwrap();
                 let door = test.g.map().get(mixed).unwrap().door_pos.xy();
@@ -1081,26 +1021,115 @@ mod tests {
                         .get(&groceries),
                     Some(&3)
                 );
-                if mixed_enabled() {
-                    let Some(GrowableBusinessState::ClosedUntil { retry_elapsed_tick }) =
-                        unowned.business
-                    else {
-                        panic!("expected a retry timer");
-                    };
-                    test.g.write::<GameTime>().tick.0 =
-                        retry_elapsed_tick + crate::INITIAL_TICK - 1;
-                    add_souls_to_empty_buildings(&mut test.g);
-                    assert_eq!(test.g.read::<BuildingInfos>().owner(mixed), None);
-                    test.g.write::<GameTime>().tick.0 += 1;
-                    add_souls_to_empty_buildings(&mut test.g);
-                    let Some(SoulID::GoodsCompany(reopened)) =
-                        test.g.read::<BuildingInfos>().owner(mixed)
-                    else {
-                        panic!("expected the vacancy pass to reopen the storefront");
-                    };
-                    assert_ne!(reopened, company);
-                    assert_eq!(test.g.growable_summary(mixed).unwrap().active_job_slots, 12);
+                let Some(GrowableBusinessState::ClosedUntil { retry_elapsed_tick }) =
+                    unowned.business
+                else {
+                    panic!("expected a retry timer");
+                };
+                test.g.write::<GameTime>().tick.0 = retry_elapsed_tick + crate::INITIAL_TICK - 1;
+                add_souls_to_empty_buildings(&mut test.g);
+                assert_eq!(test.g.read::<BuildingInfos>().owner(mixed), None);
+                test.g.write::<GameTime>().tick.0 += 1;
+                add_souls_to_empty_buildings(&mut test.g);
+                let Some(SoulID::GoodsCompany(reopened)) =
+                    test.g.read::<BuildingInfos>().owner(mixed)
+                else {
+                    panic!("expected the vacancy pass to reopen the storefront");
+                };
+                assert_ne!(reopened, company);
+                assert_eq!(test.g.growable_summary(mixed).unwrap().active_job_slots, 12);
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_staffing_loss_closes_only_the_shop_and_resume_reopens_it() {
+        use super::{GrowableBusinessState, STAFFING_LOSS_HOURS};
+        use common::saveload::{Bincode, Encoder};
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_staffing_loss_closes_only_the_shop_and_resume_reopens_it"
+            ),
+            || {
+                let (mut test, road) = street_with_prototypes(
+                    r#"
+                    for _, proto in ipairs(data) do
+                        if proto.name == "solar-panel" then proto.max_power = "100kW" end
+                    end
+                "#,
+                );
+                let sim = &mut test.g;
+                let site = place(sim, ZoneKind::MixedUse, 280.0);
+                let tenant = spawn_human(sim, site).unwrap();
+                spawn_human(sim, site).unwrap();
+                let pump = provider(sim, road, "water-pump", 450.0);
+                let sewage = provider(sim, road, "sewage-outlet", 510.0);
+                provider(sim, road, "solar-panel", 570.0);
+                add_souls_to_empty_buildings(sim);
+                let Some(SoulID::GoodsCompany(shop)) = sim.read::<BuildingInfos>().owner(site)
+                else {
+                    panic!("the shop must open");
+                };
+                for id in [pump, sewage, shop] {
+                    let company = &mut sim.world.companies[id];
+                    company
+                        .workers
+                        .0
+                        .resize(company.comp.max_workers as usize, tenant);
                 }
+                let run_hour = |sim: &mut Simulation, hour: u64| {
+                    let boundary = hour * TICKS_PER_HOUR - CITY_UPDATE_INTERVAL_TICKS;
+                    sim.write::<GameTime>().tick.0 = boundary + UtilityFlow::UPDATE_OFFSET;
+                    let (world, resources) = sim.world_res();
+                    electricity_flow_system(world, resources);
+                    utility_flow_update(sim);
+                    sim.write::<GameTime>().tick.0 = hour * TICKS_PER_HOUR - 2;
+                    residence::residence_update(sim);
+                    sim.apply_commands([]);
+                };
+                run_hour(sim, 1);
+                sim.world.companies[shop].workers.0.clear();
+                for hour in 2..=u64::from(STAFFING_LOSS_HOURS) {
+                    run_hour(sim, hour);
+                }
+                assert_eq!(
+                    sim.growable_summary(site).unwrap().business,
+                    Some(GrowableBusinessState::Open)
+                );
+                run_hour(sim, u64::from(STAFFING_LOSS_HOURS) + 1);
+                let closed = sim.growable_summary(site).unwrap();
+                let Some(GrowableBusinessState::ClosedUntil { retry_elapsed_tick }) =
+                    closed.business
+                else {
+                    panic!("sustained loss of staff must close the shop");
+                };
+                assert!(closed.occupants > 0);
+                assert_eq!(closed.active_job_slots, 0);
+                assert!(sim.get(shop).is_none());
+
+                let bytes = Bincode::encode(sim).unwrap();
+                let mut resumed: Simulation = Bincode::decode(&bytes).unwrap();
+                for sim in [&mut *sim, &mut resumed] {
+                    sim.write::<GameTime>().tick.0 = crate::INITIAL_TICK + retry_elapsed_tick - 1;
+                    add_souls_to_empty_buildings(sim);
+                    assert!(sim.read::<BuildingInfos>().owner(site).is_none());
+                    sim.write::<GameTime>().tick.0 += 1;
+                    add_souls_to_empty_buildings(sim);
+                    let Some(SoulID::GoodsCompany(reopened)) =
+                        sim.read::<BuildingInfos>().owner(site)
+                    else {
+                        panic!("first eligible vacancy pass must reopen the shop");
+                    };
+                    assert_ne!(reopened, shop);
+                    assert_eq!(
+                        sim.read::<BuildingInfos>()
+                            .residence_of(SoulID::Human(tenant)),
+                        Some(site)
+                    );
+                }
+                assert_eq!(sim.hashes(), resumed.hashes());
             },
         );
     }
@@ -1116,12 +1145,7 @@ mod tests {
             ),
             || {
                 let (mut test, _) = street();
-                let use_kind = if mixed_enabled() {
-                    ZoneKind::MixedUse
-                } else {
-                    ZoneKind::Residential
-                };
-                let id = place(&mut test.g, use_kind, 280.0);
+                let id = place(&mut test.g, ZoneKind::MixedUse, 280.0);
                 add_souls_to_empty_buildings(&mut test.g);
                 let occupant = spawn_human(&mut test.g, id).unwrap();
                 let parcel = test.g.map().get(id).unwrap().obb;
@@ -1274,21 +1298,9 @@ mod tests {
                 let (mut test, road) = street();
                 let sim = &mut test.g;
                 let pure = place(sim, ZoneKind::Residential, 240.0);
-                let mixed = mixed_enabled().then(|| place(sim, ZoneKind::MixedUse, 285.0));
-                let control = place(
-                    sim,
-                    if mixed_enabled() {
-                        ZoneKind::MixedUse
-                    } else {
-                        ZoneKind::Residential
-                    },
-                    330.0,
-                );
-                let retailer = mixed.unwrap_or_else(|| place(sim, ZoneKind::Commercial, 285.0));
-                let homes: Vec<_> = [Some(pure), mixed, Some(control)]
-                    .into_iter()
-                    .flatten()
-                    .collect();
+                let mixed = place(sim, ZoneKind::MixedUse, 285.0);
+                let control = place(sim, ZoneKind::MixedUse, 330.0);
+                let homes = [pure, mixed, control];
                 let pump = provider(sim, road, "water-pump", 450.0);
                 let sewage = provider(sim, road, "sewage-outlet", 510.0);
                 provider(sim, road, "solar-panel", 570.0);
@@ -1300,12 +1312,8 @@ mod tests {
                     };
                     company
                 };
-                let shop = owner(sim, retailer);
-                let control_shop = if mixed_enabled() {
-                    owner(sim, control)
-                } else {
-                    shop
-                };
+                let shop = owner(sim, mixed);
+                let control_shop = owner(sim, control);
                 for &id in &homes {
                     let mut coverage = sim.write::<CoverageGrid>();
                     for kind in [ServiceKind::School, ServiceKind::Health, ServiceKind::Park] {
@@ -1349,8 +1357,8 @@ mod tests {
                     *sim.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR - 2));
                     if late {
                         let phase = hour * TICKS_PER_HOUR - 2;
-                        super::update_with_limits(sim, phase, Vec::new(), 5, 1);
-                        super::update_with_limits(sim, phase, Vec::new(), 5, 1);
+                        super::update_with_limits(sim, phase, Vec::new(), Vec::new(), 5, 1);
+                        super::update_with_limits(sim, phase, Vec::new(), Vec::new(), 5, 1);
                     } else {
                         residence::residence_update(sim);
                     }
@@ -1361,12 +1369,10 @@ mod tests {
                 assert_eq!(sim.growable_summary(pure).unwrap().level, 3);
                 assert!(sim.growable_summary(pure).unwrap().roof_z > initial_roof);
                 assert_eq!(sim.map().get(pure).unwrap().door_pos, entry);
-                if let Some(mixed) = mixed {
-                    let upgraded = sim.growable_summary(mixed).unwrap();
-                    assert_eq!(upgraded.level, 3);
-                    assert_eq!(upgraded.planned_jobs, 12);
-                    assert_eq!(owner(sim, mixed), shop);
-                }
+                let upgraded = sim.growable_summary(mixed).unwrap();
+                assert_eq!(upgraded.level, 3);
+                assert_eq!(upgraded.planned_jobs, 12);
+                assert_eq!(owner(sim, mixed), shop);
                 assert_eq!(sim.growable_summary(control).unwrap().level, 2);
                 let unmet: Vec<_> = residence::requirements(sim, control)
                     .into_iter()
@@ -1395,10 +1401,430 @@ mod tests {
                 }
                 assert_eq!(sim.growable_summary(pure).unwrap().level, 5);
                 assert_eq!(sim.growable_summary(control).unwrap().level, 2);
-                if let Some(mixed) = mixed {
-                    assert_eq!(sim.growable_summary(mixed).unwrap().level, 5);
-                    assert_eq!(sim.growable_summary(mixed).unwrap().planned_jobs, 12);
+                assert_eq!(sim.growable_summary(mixed).unwrap().level, 5);
+                assert_eq!(sim.growable_summary(mixed).unwrap().planned_jobs, 12);
+            },
+        );
+    }
+    #[test]
+    fn zones2_z2_handoff_firm_frontage_ejects_visitors_before_hourly_check() {
+        use crate::transportation::Location;
+        use crate::world_command::WorldCommand;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_handoff_firm_frontage_ejects_visitors_before_hourly_check"
+            ),
+            || {
+                let (mut test, cut) = street();
+                test.build_roads(&[vec3(70.0, 300.0, 0.0), vec3(830.0, 300.0, 0.0)]);
+                let home = test.build_house_near(vec2(240.0, 325.0));
+                let sim = &mut test.g;
+                let shop = place(sim, ZoneKind::Commercial, 240.0);
+                let proto = sim
+                    .map()
+                    .get(shop)
+                    .unwrap()
+                    .kind
+                    .as_goods_company()
+                    .unwrap();
+                let Some(SoulID::GoodsCompany(company)) = company_soul(sim, shop, proto) else {
+                    panic!("expected a live shop");
+                };
+                let visitor = spawn_human(sim, home).unwrap();
+                let soul = SoulID::Human(visitor);
+                sim.world
+                    .edit_human(visitor, |human| human.location = Location::Building(shop));
+                {
+                    let mut infos = sim.write::<BuildingInfos>();
+                    infos.get_out(home, soul);
+                    infos.get_in(shop, soul);
                 }
+                sim.apply_commands([&WorldCommand::MapRemoveRoad(cut)]);
+                sim.write::<GameTime>().tick.0 = CITY_UPDATE_INTERVAL_TICKS;
+                crate::souls::growth::growth_update(sim);
+                sim.apply_commands([]);
+                assert!(sim.get(company).is_none());
+                assert!(sim.map().get(shop).unwrap().is_abandoned_growable());
+                assert_eq!(sim.get(visitor).unwrap().home.house, home);
+                assert!(matches!(
+                    sim.get(visitor).unwrap().location,
+                    Location::Outside
+                ));
+                assert!(sim
+                    .read::<BuildingInfos>()
+                    .get(shop)
+                    .unwrap()
+                    .inside
+                    .is_empty());
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_handoff_mixed_direct_spawn_and_closed_site_resume() {
+        use crate::economy::{Trade, TradeTarget, TripPurpose};
+        use crate::map::GrowableBusinessState;
+        use crate::map_dynamic::Destination;
+        use crate::{Replay, SavePhase, SlotId, SnapshotRevision};
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_handoff_mixed_direct_spawn_and_closed_site_resume"
+            ),
+            || {
+                let (mut test, _) = street();
+                let sim = &mut test.g;
+                for (x, home_first) in [(240.0, true), (285.0, false)] {
+                    let id = place(sim, ZoneKind::MixedUse, x);
+                    let proto = sim.map().get(id).unwrap().kind.as_goods_company().unwrap();
+                    let mut tenant = home_first.then(|| spawn_human(sim, id).unwrap());
+                    let Some(SoulID::GoodsCompany(company)) = company_soul(sim, id, proto) else {
+                        panic!("shop must open regardless of direct spawn order");
+                    };
+                    let tenant = tenant
+                        .take()
+                        .unwrap_or_else(|| spawn_human(sim, id).unwrap());
+                    let infos = sim.read::<BuildingInfos>();
+                    assert_eq!(infos.owner(id), Some(SoulID::GoodsCompany(company)));
+                    assert_eq!(infos.residence_of(SoulID::Human(tenant)), Some(id));
+                    drop(infos);
+                    if home_first {
+                        let pending = spawn_human(sim, id).unwrap();
+                        let item = prototypes::ItemID::new("retail-goods");
+                        let job = prototypes::ItemID::new("job-opening");
+                        sim.world.companies[company].workers.0.push(pending);
+                        sim.world.edit_human(pending, |human| {
+                            human.bought.0.insert(
+                                job,
+                                vec![Trade {
+                                    buyer: TradeTarget(SoulID::Human(pending)),
+                                    seller: TradeTarget(SoulID::GoodsCompany(company)),
+                                    qty: 1,
+                                    kind: job,
+                                    money_delta: prototypes::Money::ZERO,
+                                }],
+                            );
+                        });
+                        sim.world.edit_human(tenant, |human| {
+                            human.household.carried.insert(item, 2);
+                            human
+                                .router
+                                .go_to_for(Destination::Building(id), TripPurpose::Home);
+                        });
+                        assert!(super::close_business(sim, company));
+                        sim.apply_commands([]);
+                        assert!(!sim.get(pending).unwrap().bought.0.contains_key(&job));
+                        let resident = sim.get(tenant).unwrap();
+                        assert_eq!(resident.household.carried[&item], 2);
+                        assert_eq!(resident.router.trip_purpose, TripPurpose::Home);
+                        assert!(resident.router.references_building(id));
+                        let root = std::env::temp_dir()
+                            .join(format!("z2-close-slot-{}", std::process::id()));
+                        let slot = SlotId::new("closure").unwrap();
+                        sim.write::<Replay>().enabled = true;
+                        assert!(matches!(
+                            sim.save_to_slot(&root, &slot, SnapshotRevision::new(94))
+                                .unwrap(),
+                            SavePhase::Complete
+                        ));
+                        let mut resumed = Simulation::load_from_slot(&root, &slot).unwrap();
+                        assert!(
+                            Simulation::load_replay_from_slot(&root, &slot)
+                                .unwrap()
+                                .enabled
+                        );
+                        std::fs::remove_dir_all(root).unwrap();
+                        assert_eq!(sim.hashes(), resumed.hashes());
+                        assert_eq!(
+                            resumed
+                                .read::<BuildingInfos>()
+                                .residence_of(SoulID::Human(tenant)),
+                            Some(id)
+                        );
+                        let Some(GrowableBusinessState::ClosedUntil { retry_elapsed_tick }) =
+                            resumed.growable_summary(id).unwrap().business
+                        else {
+                            panic!("shop lost its closure timer");
+                        };
+                        resumed.write::<GameTime>().tick.0 =
+                            crate::INITIAL_TICK + retry_elapsed_tick - 1;
+                        assert!(company_soul(&mut resumed, id, proto).is_none());
+                        resumed.write::<GameTime>().tick.0 += 1;
+                        assert!(
+                            matches!(company_soul(&mut resumed, id, proto), Some(SoulID::GoodsCompany(reopened)) if reopened != company)
+                        );
+
+                        let diagnostics =
+                            crate::diagnostics::building_diagnostics(sim, id).unwrap();
+                        assert_eq!(
+                            diagnostics
+                                .upgrade_requirements()
+                                .iter()
+                                .filter(|r| r.name == "Staffed storefront")
+                                .count(),
+                            1
+                        );
+                    }
+                }
+                let abandoned = place(sim, ZoneKind::MixedUse, 330.0);
+                assert!(sim.map_mut().mark_growable_abandoned(abandoned, 0));
+                assert!(spawn_human(sim, abandoned).is_none());
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_handoff_dry_terrain_edit_preserves_upgrade_fit() {
+        use crate::map::TerraformKind;
+        use crate::world_command::WorldCommand;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_handoff_dry_terrain_edit_preserves_upgrade_fit"
+            ),
+            || {
+                let (mut test, _) = street();
+                let sim = &mut test.g;
+                let id = place(sim, ZoneKind::Residential, 240.0);
+                let (center, grade, door, roof) = {
+                    let map = sim.map();
+                    let home = map.get(id).unwrap();
+                    let center = home.obb.center();
+                    (
+                        center,
+                        map.environment().height(center),
+                        home.door_pos,
+                        home.development().unwrap().roof_z,
+                    )
+                };
+                sim.apply_commands([&WorldCommand::Terraform {
+                    kind: TerraformKind::Elevation,
+                    center,
+                    radius: 24.0,
+                    amount: 200.0,
+                    level: 0.0,
+                    slope: None,
+                }]);
+                let upgrade = {
+                    let map = sim.map();
+                    assert_ne!(map.environment().height(center), grade);
+                    let context = super::Assessment {
+                        map: &map,
+                        infos: &sim.read::<BuildingInfos>(),
+                        residences: &sim.read::<super::Residences>(),
+                        world: sim.world(),
+                        coverage: &sim.read::<CoverageGrid>(),
+                        environment: &sim.read::<EnvGrid>(),
+                    };
+                    super::prepare_upgrade(&context, map.get(id).unwrap(), None, 2)
+                        .expect("existing fit survives a dry terrain edit")
+                };
+                upgrade.commit(sim, id);
+                let map = sim.map();
+                let home = map.get(id).unwrap();
+                assert_eq!(home.door_pos, door);
+                assert_eq!(home.development().unwrap().level, 2);
+                assert!(home.development().unwrap().roof_z > roof);
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_handoff_old_slot_is_incompatible() {
+        let Some(root) = std::env::var_os("EGREGORIA_Z2_OLD_SLOT_ROOT") else {
+            return;
+        };
+        let _test = TestCtx::new_fast();
+        let root = std::path::Path::new(&root);
+        for name in ["starter_town", "p6-010"] {
+            let slot = crate::SlotId::new(name).unwrap();
+            assert!(
+                matches!(
+                    Simulation::load_from_slot(root, &slot),
+                    Err(crate::SaveLoadError::Incompatible { .. })
+                ),
+                "{name} must fail its header check"
+            );
+        }
+        let slot = crate::SlotId::new("p6-010").unwrap();
+        let error = Simulation::load_replay_from_slot(root, &slot).unwrap_err();
+        assert!(error.to_string().contains("version"), "{error}");
+    }
+
+    #[test]
+    fn zones2_z2_handoff_regenerated_slot_replays() {
+        use crate::world_command::WorldCommand;
+        use crate::{MapPreset, NewGameOptions, SavePhase, SlotId, SnapshotRevision};
+
+        let _test = TestCtx::new_fast();
+        let mut sim = Simulation::new_game_with_replay(&NewGameOptions {
+            preset: MapPreset::Flat,
+            terrain_chunks: NewGameOptions::MIN_TERRAIN_CHUNKS,
+            ..NewGameOptions::default()
+        })
+        .unwrap();
+        let mut schedule = Simulation::schedule();
+        let time = *sim.read::<GameTime>();
+        sim.tick(&mut schedule, [&WorldCommand::SetGameTime(time)]);
+
+        let root = std::env::temp_dir().join(format!("z2-paired-slot-{}", std::process::id()));
+        let slot = SlotId::new("paired").unwrap();
+        assert!(matches!(
+            sim.save_to_slot(&root, &slot, SnapshotRevision::new(95))
+                .unwrap(),
+            SavePhase::Complete
+        ));
+        let loaded = Simulation::load_from_slot(&root, &slot).unwrap();
+        let replay = Simulation::load_replay_from_slot(&root, &slot).unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+        let gameplay_hashes = |sim: &Simulation| {
+            let mut hashes = sim.hashes();
+            hashes.remove("replay");
+            hashes
+        };
+        assert_eq!(gameplay_hashes(&loaded), gameplay_hashes(&sim));
+        assert_eq!(
+            replay.command_count(),
+            sim.read::<crate::Replay>().command_count()
+        );
+        let (mut replayed, mut loader) = Simulation::try_from_replay(replay).unwrap();
+        let steps = loader.step_progress().unwrap().1;
+        assert!((0..=steps).any(|_| loader.advance_tick(&mut replayed, &mut schedule)));
+        assert_eq!(gameplay_hashes(&replayed), gameplay_hashes(&sim));
+    }
+
+    #[test]
+    fn zones2_z2_handoff_simultaneous_outage_and_collapse() {
+        use crate::map::GrowableSiteState;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_handoff_simultaneous_outage_and_collapse"
+            ),
+            || {
+                let (mut test, road) = street();
+                let zone = ZoneCell {
+                    kind: ZoneKind::Residential,
+                    density: Density::Medium,
+                };
+                let lots: Vec<_> = test
+                    .g
+                    .map()
+                    .lots()
+                    .values()
+                    .filter(|lot| lot.parent == road)
+                    .map(|lot| lot.id)
+                    .collect();
+                let ids: Vec<_> = lots
+                    .into_iter()
+                    .filter_map(|lot| test.g.place_zoned_growable(lot, zone).ok())
+                    .take(12)
+                    .map(|site| site.building)
+                    .collect();
+                assert_eq!(ids.len(), 12);
+                for &id in &ids {
+                    assert!(spawn_human(&mut test.g, id).is_some());
+                }
+                for hour in 1..=24 {
+                    test.g.write::<GameTime>().tick.0 = hour * TICKS_PER_HOUR - 2;
+                    residence::residence_update(&mut test.g);
+                    test.g.apply_commands([]);
+                    if hour == 12 {
+                        for &id in &ids {
+                            let summary = test.g.growable_summary(id).unwrap();
+                            assert!(matches!(summary.site, GrowableSiteState::Abandoned { .. }));
+                            assert_eq!(summary.occupants, 0);
+                        }
+                    } else if hour == 23 {
+                        assert!(ids.iter().all(|&id| test.g.map().get(id).is_some()));
+                    }
+                }
+                assert!(ids.iter().all(|&id| test.g.map().get(id).is_none()));
+                assert!(ids
+                    .iter()
+                    .all(|&id| test.g.read::<BuildingInfos>().get(id).is_none()));
+            },
+        );
+    }
+
+    #[test]
+    fn zones2_z2_handoff_mixed_closure_cancels_inbound_freight() {
+        use crate::economy::cargo::{cargo_update, CargoBook};
+        use crate::economy::Market;
+        use crate::transportation::Location;
+        use prototypes::{ItemID, RecTimeInterval, TICKS_PER_MINUTE};
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_handoff_mixed_closure_cancels_inbound_freight"
+            ),
+            || {
+                let (mut test, _) = street();
+                let sim = &mut test.g;
+                let mixed = place(sim, ZoneKind::MixedUse, 240.0);
+                let source = place_at_density(sim, ZoneKind::Industrial, Density::Low, 450.0);
+                let open = |sim: &mut Simulation, site: BuildingID| {
+                    let proto = sim
+                        .map()
+                        .get(site)
+                        .unwrap()
+                        .kind
+                        .as_goods_company()
+                        .unwrap();
+                    let Some(SoulID::GoodsCompany(company)) = company_soul(sim, site, proto) else {
+                        panic!("expected an open company");
+                    };
+                    company
+                };
+                let supplier = open(sim, source);
+                let shop = open(sim, mixed);
+                let driver = spawn_human(sim, mixed).unwrap();
+                let truck = sim.world.companies[supplier].comp.trucks[0];
+                sim.world.companies[supplier].workers.0.push(driver);
+                sim.world.companies[supplier].comp.driver = Some(driver);
+                sim.world.edit_human(driver, |human| {
+                    human.location = Location::Building(source);
+                    let mut work = Work::new(
+                        source,
+                        WorkKind::Driver {
+                            truck,
+                            deliver_order: None,
+                            load: None,
+                        },
+                        0.0,
+                    );
+                    work.work_inter = RecTimeInterval::always();
+                    work.employer = Some(supplier);
+                    human.work = Some(work);
+                });
+                {
+                    let driver = SoulID::Human(driver);
+                    let mut infos = sim.write::<BuildingInfos>();
+                    infos.get_out(mixed, driver);
+                    infos.get_in(source, driver);
+                }
+                let item = ItemID::new("goods");
+                let seller = SoulID::GoodsCompany(supplier);
+                sim.write::<Market>().produce(seller, item, 16);
+                sim.write::<GameTime>().tick.0 = crate::INITIAL_TICK + TICKS_PER_MINUTE;
+                let (world, resources) = sim.world_res();
+                cargo_update(world, resources);
+                assert_eq!(sim.read::<CargoBook>().incoming_loads(mixed).count(), 1);
+                assert!(super::close_business(sim, shop));
+                sim.apply_commands([]);
+                assert_eq!(sim.read::<CargoBook>().incoming_loads(mixed).count(), 0);
+                assert_eq!(sim.read::<Market>().capital(seller, item), 16);
+                assert_eq!(
+                    sim.read::<BuildingInfos>()
+                        .residence_of(SoulID::Human(driver)),
+                    Some(mixed)
+                );
             },
         );
     }

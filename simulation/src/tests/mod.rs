@@ -404,9 +404,12 @@ fn init_test_simulation() {
         .zip(prototypes::try_prototypes())
         .is_some_and(|(base, current)| std::ptr::eq(base, current));
     if !base_is_loaded {
-        // SAFETY: The mutex serializes default initialization, and custom
-        // fixtures replace the registry only in their own subprocess.
-        unsafe { crate::init::load_prototypes() };
+        // Regression fixtures exercise the profiled registry even while the live
+        // palette is gated. Custom replacements remain isolated in subprocesses.
+        prototypes::test_prototypes(concat!(
+            "package.path = '../base_mod/?.lua'\nzones2_profiles_enabled = true\n",
+            include_str!("../../../base_mod/data.lua")
+        ));
         *base = Some(prototypes::prototypes());
     }
     crate::init::register_simulation();
@@ -1032,12 +1035,12 @@ fn zones2_checked_placement_registers_one_home_and_preserves_a_rejected_parcel()
     };
     let mixed = ZoneCell {
         kind: ZoneKind::MixedUse,
-        density: Density::Medium,
+        density: Density::Low,
     };
     let before = test.g.hashes();
     assert_eq!(
         test.g.place_zoned_growable(lot, mixed),
-        Err(GrowableLotError::MixedUseDisabled)
+        Err(GrowableLotError::UnsupportedDensity)
     );
     assert_eq!(test.g.hashes(), before);
 
@@ -1124,6 +1127,7 @@ fn zones2_profiled_company() -> (TestCtx, BuildingID, crate::CompanyID) {
                     planned_jobs: 18,
                     site: GrowableSiteState::Active,
                     business: Some(GrowableBusinessState::AwaitingSpawn),
+                    frozen_shell: None,
                 },
                 base_z: 0.0,
                 door,
@@ -1259,7 +1263,7 @@ fn zones2_profiled_business_slots_and_closure_are_authoritative() {
 }
 
 #[test]
-fn zones2_fix_rejects_gated_and_unregistered_raw_companies() {
+fn zones2_fix_rejects_mixed_and_unregistered_raw_companies() {
     use crate::map::{Building, BuildingKind, Map};
     use geom::{vec2, OBB};
     use prototypes::{BuildingGen, GoodsCompanyID};
@@ -1272,7 +1276,10 @@ fn zones2_fix_rejects_gated_and_unregistered_raw_companies() {
     };
     for name in ["mixed-medium-l1", "mixed-high-l1", "unregistered-company"] {
         let proto = GoodsCompanyID::new(name);
-        assert!(prototypes::try_prototype(proto).is_none());
+        assert_eq!(
+            prototypes::try_prototype(proto).is_some(),
+            name != "unregistered-company"
+        );
         let kind = BuildingKind::GoodsCompany(proto);
         let special = map.build_special_building(&obb, kind, gen, None, None);
         let raw = Building::make(

@@ -1528,6 +1528,7 @@ impl Map {
         if appearance.base_z != building.height
             || appearance.door != building.door_pos
             || !appearance.is_valid(&building.obb)
+            || next.frozen_shell != previous.frozen_shell
             || next.zone != previous.zone
             || next.site != previous.site
             || next.business != previous.business

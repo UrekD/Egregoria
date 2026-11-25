@@ -31,7 +31,7 @@ use crate::gui::{
     toolbox,
     toolbox::building::BuildingTab,
     top_demand_driver,
-    zoning::ZONES,
+    zoning::{ZoningState, ZONES},
     GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool, ToolSelection,
 };
 use crate::session::{self, SessionScreen, SessionState, SlotCompatibility};
@@ -98,6 +98,7 @@ enum Step {
     },
     /// `"hand"`, a toolbar category (`"zoning"`) or a mode (`"roads/curved"`).
     SelectTool(ToolSelection),
+    SelectZone(ZoneKind),
     SetOverlay(OverlayMode),
     SetSession(SessionScreen),
     OpenWindow(String),
@@ -153,6 +154,7 @@ enum Assertion {
         treasury: u32,
         extent: Option<[u16; 2]>,
     },
+    MixedUseInspector,
     BuildingCount {
         prototype: String,
         count: usize,
@@ -580,6 +582,7 @@ impl Automation {
                     | Step::InspectCargoRoad { .. }
                     | Step::Camera { .. }
                     | Step::SelectTool(_)
+                    | Step::SelectZone(_)
             )
         {
             return Err("world interactions require the Playing session".into());
@@ -725,6 +728,12 @@ impl Automation {
             }
             Step::SelectTool(selection) => {
                 toolbox::select_tool(uiw, sim, selection);
+            }
+            Step::SelectZone(kind) => {
+                if *uiw.read::<Tool>() != Tool::Zoning {
+                    return Err("selecting a zone requires the zoning tool".into());
+                }
+                uiw.write::<ZoningState>().select_kind(Some(kind));
             }
             Step::SetOverlay(mode) => *uiw.write::<OverlayMode>() = mode,
             Step::SetSession(screen) => {
@@ -1136,6 +1145,16 @@ impl Assertion {
                         "land UI at tick {} with treasury {actual_treasury} and owned {actual_owned:?} on {actual_extent:?}: expected {expected:?}, got {actual:?}",
                         sim.get_tick(),
                     ));
+                }
+            }
+            Self::MixedUseInspector => {
+                if !uiw
+                    .read::<InspectedBuilding>()
+                    .e
+                    .and_then(|id| sim.growable_summary(id))
+                    .is_some_and(|site| site.zone.kind == ZoneKind::MixedUse && site.occupants > 0)
+                {
+                    return Err("the inspector is not showing an occupied Mixed Use site".into());
                 }
             }
             Self::BuildingCount { prototype, count } => {

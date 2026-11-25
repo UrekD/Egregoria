@@ -6,10 +6,11 @@ use crate::economy::cargo::CargoBook;
 use crate::economy::Market;
 use crate::map::{BuildingID, BuildingKind};
 use crate::map_dynamic::{
-    active_business, effective_load, live_site_utility_status, site_power_status, transit,
+    active_business, effective_load, site_power_status, transit,
     ActiveRetailIndex, BuildingInfos, BuildingUtilityStatus, Destination, ElectricityFlow,
     RouterError, SiteLoad, UtilityFlow, UtilityStatus,
 };
+use crate::souls::development::{self, UpgradeStatus};
 use crate::souls::events::Fires;
 use crate::souls::goods_company::recipe_blockers;
 use crate::souls::happiness::Happiness;
@@ -29,8 +30,19 @@ pub struct BuildingDiagnostics {
     pub utilities: Option<BuildingUtilityStatus>,
     pub retail_access: Option<bool>,
     pub happiness: Option<u8>,
-    pub upgrade_requirements: Vec<Requirement>,
+    pub profiled_upgrade: Option<UpgradeStatus>,
+    legacy_upgrade_requirements: Vec<Requirement>,
     pub blockers: Vec<BuildingBlocker>,
+}
+
+impl BuildingDiagnostics {
+    pub fn upgrade_requirements(&self) -> &[Requirement] {
+        self.profiled_upgrade
+            .as_ref()
+            .map_or(&self.legacy_upgrade_requirements, |status| {
+                &status.requirements
+            })
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,14 +70,8 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
     let business = active_business(building, &infos, sim.world());
     let load = effective_load(building, residences.by_building.get(&id), business);
     let power_flow = sim.read::<ElectricityFlow>();
-    let utilities = live_site_utility_status(
-        &map,
-        &residences,
-        &infos,
-        sim.world(),
-        &power_flow,
-        &sim.read::<UtilityFlow>(),
-        id,
+    let utilities = sim.read::<UtilityFlow>().status_for_site(
+        &map, &residences, &infos, sim.world(), &power_flow, id,
     );
     let power = site_power_status(&map, &power_flow, building);
     let mut blockers = Vec::new();
@@ -127,42 +133,19 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
         }
     }
 
-    let (retail_access, upgrade_requirements) = if house {
+    let retail = house.then(|| {
         let index = ActiveRetailIndex::build(&map, &infos, sim.world());
-        let nearby: Vec<_> = index.nearby(building.door_pos.xy()).collect();
-        let has_retail = !nearby.is_empty();
-        if !has_retail {
-            blockers.push(BuildingBlocker::NoRetailAccess);
-        }
-        let mut requirements = residence::requirements_with_stores(sim, id, Some(&nearby));
-        if building.development().is_some() {
-            for requirement in &mut requirements {
-                let met = match requirement.name {
-                    "Power" => power == PowerStatus::Available,
-                    "Water" => {
-                        utilities.is_some_and(|status| status.water == UtilityStatus::Served)
-                    }
-                    "Sewage" => {
-                        utilities.is_some_and(|status| status.sewage == UtilityStatus::Served)
-                    }
-                    _ => continue,
-                };
-                requirement.met = met;
-                requirement.value = f32::from(met);
-            }
-            if building.is_mixed_use() {
-                let staffed = business.is_some_and(|business| business.filled > 0);
-                requirements.push(Requirement {
-                    name: "Staffed storefront",
-                    met: staffed,
-                    value: f32::from(staffed),
-                    threshold: 1.0,
-                });
-            }
-        }
-        (Some(has_retail), requirements)
+        index.nearby(building.door_pos.xy()).collect::<Vec<_>>()
+    });
+    let retail_access = retail.as_ref().map(|nearby| !nearby.is_empty());
+    if retail_access == Some(false) {
+        blockers.push(BuildingBlocker::NoRetailAccess);
+    }
+    let profiled_upgrade = development::requirements_with_retail(sim, id, retail_access);
+    let legacy_upgrade_requirements = if house && profiled_upgrade.is_none() {
+        residence::requirements_with_stores(sim, id, retail.as_deref())
     } else {
-        (None, Vec::new())
+        Vec::new()
     };
     Some(BuildingDiagnostics {
         load,
@@ -170,7 +153,8 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
         utilities,
         retail_access,
         happiness: sim.read::<Happiness>().score(id),
-        upgrade_requirements,
+        profiled_upgrade,
+        legacy_upgrade_requirements,
         blockers,
     })
 }
@@ -380,7 +364,7 @@ mod tests {
             assert_eq!(diagnostics.retail_access, Some(met));
             assert_eq!(
                 diagnostics
-                    .upgrade_requirements
+                    .upgrade_requirements()
                     .iter()
                     .find(|requirement| requirement.name == "Retail access")
                     .unwrap()

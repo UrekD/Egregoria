@@ -88,6 +88,16 @@ impl From<&Map> for SerializedMap {
 impl Serialize for Map {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let mut map = SerializedMap::from(self);
+        // The stored placement geometry is authoritative. Generated faces
+        // are rebuilt on load and do not participate in map hashes.
+        for building in map.buildings.values_mut() {
+            if building
+                .development()
+                .is_some_and(|site| site.frozen_shell.is_some())
+            {
+                building.mesh = Default::default();
+            }
+        }
         let lot_origins = self.lot_origins.clone();
         if serializer.is_human_readable() {
             return MapWithLotOrigins {
@@ -107,7 +117,7 @@ impl Serialize for Map {
 
 impl<'de> Deserialize<'de> for Map {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let (map, lot_origins, import_lane_reserve) = if deserializer.is_human_readable() {
+        let (mut map, lot_origins, import_lane_reserve) = if deserializer.is_human_readable() {
             let MapWithLotOrigins { map, lot_origins } =
                 MapWithLotOrigins::<ReadableMap>::deserialize(deserializer)?;
             let imported = map.import_lane_reserve;
@@ -127,11 +137,45 @@ impl<'de> Deserialize<'de> for Map {
             .map_err(serde::de::Error::custom)?;
         map.validate_spatial_geometry()
             .map_err(serde::de::Error::custom)?;
+        map.rebuild_growable_shells()
+            .map_err(serde::de::Error::custom)?;
         Ok(map.into_map(lot_origins, import_lane_reserve))
     }
 }
 
 impl SerializedMap {
+    fn rebuild_growable_shells(&mut self) -> Result<(), String> {
+        for (id, building) in self.buildings.iter_mut() {
+            let Some(site) = building.development() else {
+                continue;
+            };
+            let Some(shell) = site.frozen_shell.as_ref() else {
+                continue;
+            };
+            let invalid = || format!("building {id:?} has invalid frozen shell geometry");
+            if !shell.valid_for(&building.obb)
+                || shell.fit().base_z() != building.height
+                || shell.fit().door() != building.door_pos
+            {
+                return Err(invalid());
+            }
+            let (mesh, roof_z) = shell
+                .mesh(site.zone, site.floors, site.level)
+                .ok_or_else(invalid)?;
+            if roof_z != site.roof_z
+                || mesh
+                    .faces
+                    .iter()
+                    .flat_map(|(face, _)| face)
+                    .any(|p| !p.is_finite())
+            {
+                return Err(invalid());
+            }
+            building.mesh = mesh;
+        }
+        Ok(())
+    }
+
     fn validate_references(&self) -> Result<(), String> {
         for (id, road) in self.roads.iter() {
             for junction in [road.src, road.dst] {

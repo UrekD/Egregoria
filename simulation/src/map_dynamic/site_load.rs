@@ -11,6 +11,7 @@ use crate::map_dynamic::{
     UtilityTotals,
 };
 use crate::souls::residence::{self, PowerStatus, Residence, Residences};
+use crate::utils::resources::Ref;
 use crate::{Simulation, World};
 
 impl ActiveBusiness {
@@ -96,6 +97,21 @@ impl NetworkLoad {
         // Leave potential provider capacity available for forecasts that add power.
         total.update_sewage_demand();
         Some(total)
+    }
+
+    pub(crate) fn live_with_pipe_sample(
+        map: &Map,
+        residences: &Residences,
+        infos: &BuildingInfos,
+        world: &World,
+        power: &ElectricityFlow,
+        flow: &UtilityFlow,
+        network: ElectricityNetworkID,
+    ) -> Option<(Self, bool)> {
+        let mut total = Self::rated(map, residences, infos, world, network)?;
+        let sampled = sampled_pipes(map, power, flow, network);
+        total.cap_pipe_supply(sampled.unwrap_or_default());
+        Some((total, sampled.is_some()))
     }
 
     fn rated(
@@ -200,7 +216,66 @@ fn sampled_pipes(
     utility_network_readout(map, power, flow, Some(network)).utility_totals
 }
 
-/// Read service using current network roles and the latest valid provider sample.
+/// Reads current site loads and validates pipe supply against the last sample.
+pub struct SiteUtilityReader<'a> {
+    map: Ref<'a, Map>,
+    residences: Ref<'a, Residences>,
+    infos: Ref<'a, BuildingInfos>,
+    power: Ref<'a, ElectricityFlow>,
+    flow: Ref<'a, UtilityFlow>,
+    world: &'a World,
+    networks: BTreeMap<ElectricityNetworkID, Option<(NetworkLoad, bool)>>,
+}
+
+impl<'a> SiteUtilityReader<'a> {
+    pub fn new(sim: &'a Simulation) -> Self {
+        Self {
+            map: sim.map(),
+            residences: sim.read(),
+            infos: sim.read(),
+            power: sim.read(),
+            flow: sim.read(),
+            world: sim.world(),
+            networks: BTreeMap::new(),
+        }
+    }
+
+    pub fn load(&self, building: &Building) -> SiteLoad {
+        effective_load(
+            building,
+            self.residences.by_building.get(&building.id),
+            active_business(building, &self.infos, self.world),
+        )
+    }
+
+    pub(crate) fn network_load(
+        &mut self,
+        network: ElectricityNetworkID,
+    ) -> Option<(NetworkLoad, bool)> {
+        *self.networks.entry(network).or_insert_with(|| {
+            NetworkLoad::live_with_pipe_sample(
+                &self.map,
+                &self.residences,
+                &self.infos,
+                self.world,
+                &self.power,
+                &self.flow,
+                network,
+            )
+        })
+    }
+
+    pub fn status(&mut self, id: BuildingID) -> Option<BuildingUtilityStatus> {
+        let building = self.map.get(id)?;
+        let load = self.load(building);
+        if load.water_demand() == 0.0 && load.sewage_demand() == 0.0 {
+            return None;
+        }
+        let network = connected_site_network(&self.map, building);
+        Some(pipe_status(network, |network| self.network_load(network)))
+    }
+}
+
 pub(crate) fn live_site_utility_status(
     map: &Map,
     residences: &Residences,
@@ -210,8 +285,6 @@ pub(crate) fn live_site_utility_status(
     flow: &UtilityFlow,
     id: BuildingID,
 ) -> Option<BuildingUtilityStatus> {
-    use UtilityStatus::*;
-
     let building = map.get(id)?;
     let load = effective_load(
         building,
@@ -221,26 +294,34 @@ pub(crate) fn live_site_utility_status(
     if load.water_demand() == 0.0 && load.sewage_demand() == 0.0 {
         return None;
     }
+    Some(pipe_status(connected_site_network(map, building), |network| {
+        NetworkLoad::live_with_pipe_sample(map, residences, infos, world, power, flow, network)
+    }))
+}
+
+fn pipe_status(
+    network: Option<ElectricityNetworkID>,
+    read: impl FnOnce(ElectricityNetworkID) -> Option<(NetworkLoad, bool)>,
+) -> BuildingUtilityStatus {
+    use UtilityStatus::*;
 
     let unavailable = |status| BuildingUtilityStatus {
         water: status,
         sewage: status,
         totals: None,
     };
-    let Some(network) = connected_site_network(map, building) else {
-        return Some(unavailable(Disconnected));
+    let Some(network) = network else {
+        return unavailable(Disconnected);
     };
-    let Some(sampled) = sampled_pipes(map, power, flow, network) else {
-        return Some(unavailable(Unknown));
+    let Some((totals, true)) = read(network) else {
+        return unavailable(Unknown);
     };
-    let mut totals = NetworkLoad::rated(map, residences, infos, world, network)?;
-    totals.cap_pipe_supply(sampled);
     let pipes = totals.pipes;
-    Some(BuildingUtilityStatus {
+    BuildingUtilityStatus {
         water: if pipes.has_water() { Served } else { Shortage },
         sewage: if pipes.has_sewage() { Served } else { Shortage },
         totals: Some(pipes),
-    })
+    }
 }
 
 #[cfg(test)]

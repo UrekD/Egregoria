@@ -25,6 +25,8 @@ pub const PERF_10K: (Scenario, SimulationOptions) = (
     perf::OPTIONS,
 );
 
+pub const ZONES2_L3: (Scenario, SimulationOptions) = zones2::ATTAINMENT;
+
 pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     (
         Scenario {
