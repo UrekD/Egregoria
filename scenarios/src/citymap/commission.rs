@@ -177,9 +177,14 @@ pub fn commission(
     sites.insert("coal-power-plant".into(), plant);
     let plant_door = sim.map().buildings()[plant].door_pos.xy();
     let mine_frontage = BTreeSet::from([plant_road]);
-    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)]
-        .into_iter()
-        .enumerate()
+    for (index, offset) in [
+        vec2(-70.0, 0.0),
+        vec2(70.0, 0.0),
+        vec2(0.0, 60.0),
+        vec2(0.0, -65.0),
+    ]
+    .into_iter()
+    .enumerate()
     {
         let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
         verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
@@ -297,7 +302,12 @@ pub fn commission(
 
     // Keep the food facilities clear of approved housing and future infill.
     // Opening them before housing still gives them the first hiring pool.
-    let place_food_site = |sim: &mut Simulation, name: &str, anchor: Vec2, near_road: Option<RoadID>| {
+    let homes: Vec<_> = parcels
+        .iter()
+        .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential)
+        .map(|parcel| parcel.footprint.center())
+        .collect();
+    let place_protected_site = |sim: &mut Simulation, name: &str, anchor: Vec2, buyer: Option<BuildingID>| {
         place_scored_company(sim, plan, &roads, name, |map, road, footprint| {
             if !map.roads()[road]
                 .lanes_iter()
@@ -309,55 +319,72 @@ pub fn commission(
             {
                 return None;
             }
-            let access_penalty = if near_road.is_some_and(|near| road != near) {
-                120.0
-            } else {
-                0.0
+            let center = footprint.center();
+            let Some(buyer) = buyer else {
+                return Some(center.distance(anchor));
             };
-            Some(footprint.center().distance(anchor) + access_penalty)
+            let door = (footprint.corners[0] + footprint.corners[1]) * 0.5;
+            let source = parking_position(map, door.z(10.0))?;
+            let destination = parking_position(map, map.get(buyer)?.door_pos)?;
+            let length = parking_leg_distance(map, source, destination)?
+                + parking_leg_distance(map, destination, source)?;
+            let labour_distance = homes
+                .iter()
+                .map(|home| home.distance2(center))
+                .fold(f32::INFINITY, f32::min)
+                .sqrt();
+            Some(length + 4.0 * labour_distance + 0.25 * center.distance(anchor))
         })?
+        .map(|(building, _)| building)
         .ok_or_else(|| format!("no clear fitting site for {name} outside approved frontage"))
     };
+    for (key, name, anchor) in [
+        ("south/police-station", "police-station", at(2410.0, 1080.0)),
+        ("hraska/north-park", "park", at(2005.0, 2610.0)),
+    ] {
+        let building = place_protected_site(sim, name, anchor, None)?;
+        sites.insert(key.into(), building);
+    }
     let mut depots = Vec::new();
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
-        let (depot, _) = place_food_site(sim, "small-depot", cohort.anchor, None)?;
+        let depot = place_protected_site(sim, "small-depot", cohort.anchor, None)?;
         sites.insert(format!("{}/depot", cohort.district), depot);
         depots.push(WorldCommand::SetWarehousePolicy {
             building: depot,
             policy: WarehousePolicy::ReserveLocally,
         });
     }
-    let mut market_clusters = vec![("employment", employment_market)];
+    let mut market_clusters = vec![("employment", employment_market.0)];
     for (district, x, y) in [
         ("station", 2210.0, 1800.0),
         ("hraska", 1960.0, 2440.0),
         ("south", 2050.0, 1100.0),
         ("west", 1350.0, 1840.0),
     ] {
-        let (store, road) = place_food_site(sim, "supermarket", at(x, y), None)?;
+        let store = place_protected_site(sim, "supermarket", at(x, y), None)?;
         sites.insert(format!("{district}/supermarket"), store);
-        market_clusters.push((district, (store, road)));
+        market_clusters.push((district, store));
     }
-    for (district, (market, road)) in market_clusters {
+    for (district, market) in market_clusters {
         let market_door = sim.map().buildings()[market].door_pos.xy();
-        let (second, _) = place_food_site(sim, "supermarket", market_door, Some(road))?;
+        let second = place_protected_site(sim, "supermarket", market_door, Some(market))?;
         sites.insert(format!("{district}/supermarket-2"), second);
 
-        // Each pair of stores shares an ordinary local meat chain. Work
-        // upstream from the stores to keep the successive truck legs nearby.
-        let mut consumer = (market, road);
+        // Size the local supply around complete truck round trips and nearby
+        // labour, including where opposite curbs require a long turnaround.
+        let mut consumer = market;
         for name in ["meat-facility", "slaughterhouse", "animal-farm", "cereal-farm"] {
-            let door = sim.map().buildings()[consumer.0].door_pos.xy();
-            let site = place_food_site(sim, name, door, Some(consumer.1))?;
-            verify_parking_pair(&sim.map(), site.0, consumer.0, Tick(sim.get_tick()))?;
-            sites.insert(format!("{district}/local-{name}"), site.0);
+            let door = sim.map().buildings()[consumer].door_pos.xy();
+            let site = place_protected_site(sim, name, door, Some(consumer))?;
+            verify_parking_pair(&sim.map(), site, consumer, Tick(sim.get_tick()))?;
+            sites.insert(format!("{district}/local-{name}"), site);
             if name == "cereal-farm" {
-                farms.push(site.0);
+                farms.push(site);
             }
             consumer = site;
         }
         if district == "employment" || district == "south" {
-            let (farm, _) = place_food_site(sim, "vegetable-farm", market_door, Some(road))?;
+            let farm = place_protected_site(sim, "vegetable-farm", market_door, Some(market))?;
             sites.insert(format!("{district}/vegetable-farm"), farm);
         }
     }
@@ -378,6 +405,7 @@ pub fn commission(
     let mut schedule = Simulation::schedule();
     advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
     apply(sim, "district depot policies", &depots)?;
+    advance(sim, &mut schedule, 15 * TICKS_PER_HOUR);
     let (station, ent) = sim
         .world()
         .freight_stations
@@ -490,10 +518,7 @@ fn expand_cereal_fields(
 fn verify_parking_pair(map: &Map, a: BuildingID, b: BuildingID, tick: Tick) -> Result<(), String> {
     let access = |building: BuildingID| {
         let site = map.get(building)?;
-        let spot = ParkingManagement::default()
-            .reserve_near(site.door_pos, map)
-            .ok()?;
-        let pos = spot.park_pos(map)?;
+        let pos = parking_position(map, site.door_pos)?;
         let lane = map.nearest_lane(pos, LaneKind::Driving, None)?;
         let road = map.get(site.connected_road?)?;
         road.lanes_iter()
@@ -525,6 +550,29 @@ fn verify_parking_pair(map: &Map, a: BuildingID, b: BuildingID, tick: Tick) -> R
     Err(format!(
         "freight sites {a:?} and {b:?} lack bidirectional parking access"
     ))
+}
+
+fn parking_position(map: &Map, door: Vec3) -> Option<Vec3> {
+    ParkingManagement::default()
+        .reserve_near(door, map)
+        .ok()?
+        .park_pos(map)
+}
+
+fn parking_leg_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
+    let itinerary = Itinerary::route(Tick(0), start, end, map, PathKind::Vehicle)?;
+    let local = itinerary.local_path();
+    let mut distance = local.last().map_or(0.0, |point| start.distance(*point))
+        + local.windows(2).map(|pair| pair[0].distance(pair[1])).sum::<f32>();
+    if let Some((last, intermediate)) = itinerary.get_route()?.reversed_route.split_first() {
+        for span in intermediate {
+            distance += span.raw_points(map)?.length();
+        }
+        let points = last.raw_points(map)?;
+        let projected = points.project(end);
+        distance += points.length_at_proj(projected) + projected.distance(end);
+    }
+    Some(distance)
 }
 
 fn place_freight(
