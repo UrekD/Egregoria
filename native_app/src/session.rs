@@ -14,6 +14,7 @@ use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::CommandOutcomes;
 use simulation::{SaveLoadError, Simulation, SimulationReplayLoader};
 
+#[cfg(test)]
 use crate::game_loop::VERSION;
 use crate::gui::{ExitState, GuiState};
 use crate::inputmap::InputMap;
@@ -218,7 +219,7 @@ pub(crate) fn discover_slots(root: &Path) -> io::Result<DiscoveredSlots> {
     let mut compatibility = BTreeMap::new();
     let slots = saveload::list_slots_with_revisions(root, |path, kind| {
         let (status, revision) = match Simulation::read_slot_snapshot_header(path, kind) {
-            Ok(header) if header.version == VERSION => {
+            Ok(header) if header.check_compatibility().is_ok() => {
                 (SlotCompatibility::Compatible, header.revision)
             }
             Ok(header) => (SlotCompatibility::Incompatible, header.revision),

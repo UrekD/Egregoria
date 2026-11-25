@@ -38,6 +38,7 @@ macro_rules! gen_prototypes {
                 pub(crate) $name: common::TransparentMap<$id, $t>,
             )+
             pub(crate) orderings: Orderings,
+            pub(crate) fingerprint: u64,
             declared_types: std::collections::BTreeMap<String, &'static str>,
             conflicting_declarations: std::collections::BTreeSet<String>,
         }

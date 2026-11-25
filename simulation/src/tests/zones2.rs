@@ -9,7 +9,7 @@ use crate::souls::growth::check_growable_lot;
 use crate::souls::{goods_company, human, lifecycle, residence::Residences};
 use crate::world_command::WorldCommand;
 use crate::{MapPreset, NewGameOptions, Replay, SaveLoadError, Simulation, SoulID};
-use common::saveload::{slot_paths, Bincode, Encoder, SlotId, SnapshotRevision};
+use common::saveload::{slot_paths, Bincode, Encoder, SlotId, SnapshotKind, SnapshotRevision};
 use geom::{vec2, vec3, Ray3, Vec2, Vec3, OBB};
 use prototypes::{GameTime, ItemID, TICKS_PER_HOUR};
 use std::collections::{BTreeMap, BTreeSet};
@@ -582,4 +582,45 @@ fn assert_incompatible(root: &Path, id: &SlotId, expected_version: &str) {
     assert!(is_old(
         Simulation::load_replay_from_slot(root, id).unwrap_err()
     ));
+}
+
+#[test]
+fn zones2_save_and_replay_reject_a_different_prototype_registry() {
+    if !super::in_prototype_fixture_process(
+        module_path!(),
+        "zones2_save_and_replay_reject_a_different_prototype_registry",
+    ) {
+        return;
+    }
+
+    let mut sim = flat_city();
+    sim.apply_commands([&road(vec3(100.0, 180.0, 0.0), vec3(820.0, 180.0, 0.0))]);
+    let lot = sim.map().lots().keys().next().unwrap();
+    sim.place_zoned_growable(lot, zone(ZoneKind::MixedUse, Density::Medium))
+        .unwrap();
+    let root = SlotRoot::new();
+    let id = SlotId::new("staged_city").unwrap();
+    sim.save_to_slot(&root.0, &id, SnapshotRevision::new(1))
+        .unwrap();
+    let replay = Simulation::load_replay_from_slot(&root.0, &id).unwrap();
+    Simulation::load_from_slot(&root.0, &id).unwrap();
+    let zip = slot_paths(&root.0, &id).unwrap().zip;
+    let header = Simulation::read_slot_snapshot_header(&zip, SnapshotKind::Zip).unwrap();
+    assert!(header.check_compatibility().is_ok());
+
+    // The same game version ships with a different registry.
+    unsafe { crate::init::load_prototypes() };
+    assert!(matches!(
+        header.check_compatibility(),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+    assert!(matches!(
+        Simulation::load_from_slot(&root.0, &id),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+    assert!(matches!(
+        Simulation::load_replay_from_slot(&root.0, &id),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+    assert!(Simulation::try_from_replay(replay).is_err());
 }

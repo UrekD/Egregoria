@@ -57,7 +57,8 @@ fn p4a_slot_round_trip_tracks_revision_and_removes_an_old_replay() {
         Simulation::read_slot_snapshot_header(&paths.zip, SnapshotKind::Zip).unwrap(),
         SnapshotHeader {
             version: crate::VERSION.into(),
-            revision: Some(revision)
+            revision: Some(revision),
+            registry: Some(prototypes::prototypes().fingerprint()),
         },
     );
     let meta = read_slot_meta(&root.0, &id).unwrap();

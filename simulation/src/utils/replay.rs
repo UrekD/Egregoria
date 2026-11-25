@@ -12,6 +12,8 @@ pub struct Replay {
     #[serde(default)]
     pub version: String,
     pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) registry: Option<u64>,
     #[serde(deserialize_with = "deserialize_replay_commands")]
     commands: Vec<(Tick, WorldCommand)>,
     pub last_tick_recorded: Tick,
@@ -55,6 +57,7 @@ impl Default for Replay {
         Self {
             version: crate::VERSION.to_owned(),
             enabled: false,
+            registry: None,
             commands: Vec::new(),
             last_tick_recorded: Tick::default(),
             timeline: None,
@@ -63,6 +66,38 @@ impl Default for Replay {
 }
 
 impl Replay {
+    pub(crate) fn check_registry(&self) -> io::Result<()> {
+        crate::check_prototype_registry(self.registry)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if self.registry.is_some() {
+            return Ok(());
+        }
+
+        // Older recordings do not have a fingerprint. Check their explicit
+        // prototype references before starting playback.
+        use crate::map::ZoneKind::MixedUse;
+        for (_, command) in &self.commands {
+            let available = match command {
+                WorldCommand::ZonePaint {
+                    kind: Some(MixedUse),
+                    density,
+                    ..
+                } => prototypes::prototypes().mixed_use_pair(*density).is_some(),
+                WorldCommand::MapBuildSpecialBuilding { kind, .. } => {
+                    crate::building_kind_prototype_exists(*kind)
+                }
+                WorldCommand::SpawnTrain { wagons, .. } => wagons
+                    .iter()
+                    .all(|&id| prototypes::try_prototype(id).is_some()),
+                _ => true,
+            };
+            if !available {
+                return Err(invalid_replay("Replay requires a missing prototype"));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
         match self.commands.first() {
             Some((Tick(INITIAL_TICK), WorldCommand::Init(options)))
@@ -218,6 +253,9 @@ impl Replay {
     }
 
     pub fn push(&mut self, tick: Tick, command: WorldCommand) {
+        if matches!(command, WorldCommand::Init(_)) && self.commands.is_empty() {
+            self.registry = prototypes::try_prototypes().map(|p| p.fingerprint());
+        }
         self.commands.push((tick, command));
     }
 }
@@ -251,6 +289,8 @@ struct ReplayHeader {
     version: String,
     #[serde(default)]
     revision: Option<u128>,
+    #[serde(default)]
+    registry: Option<u64>,
 }
 
 impl ReplayHeader {
@@ -262,6 +302,7 @@ impl ReplayHeader {
                 version: header.version,
             });
         }
+        crate::check_prototype_registry(header.registry)?;
         Ok(header)
     }
 }
@@ -294,7 +335,9 @@ impl ReplayJson {
                 "Replay revision does not match the snapshot",
             )));
         }
-        JSON::decode(bytes).map_err(replay_corrupt)
+        let replay: Replay = JSON::decode(bytes).map_err(replay_corrupt)?;
+        replay.check_registry().map_err(replay_corrupt)?;
+        Ok(replay)
     }
 }
 

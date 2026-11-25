@@ -392,6 +392,7 @@ impl Simulation {
         if replay.version != VERSION {
             return Err(replay_version_error(&replay.version));
         }
+        replay.check_registry()?;
         let options = replay.bootstrap_options()?;
         let bootstrap_end = replay.bootstrap_end()?;
         let mut sim = Self::with_initial_resources();
@@ -418,6 +419,7 @@ impl Simulation {
         if replay.has_timeline() {
             sim.record_constructor_end();
         }
+        sim.write::<Replay>().registry = replay.registry;
         sim.world.reconcile_derived("replay bootstrap");
         let loader = SimulationReplayLoader::new(replay, Tick(sim.get_tick()), bootstrap_end);
         Ok((sim, loader))
@@ -822,7 +824,7 @@ impl Simulation {
         // A readable old header is enough to reject the save. If the prefix is
         // unreadable, the normal load still distinguishes oversized and corrupt files.
         if let Ok(header) = read_snapshot_header(&mut file, kind) {
-            header.check_version()?;
+            header.check_compatibility()?;
         }
         file.rewind().map_err(SaveLoadError::Io)?;
         Self::decode_snapshot(&read_snapshot(file, kind)?)
@@ -862,7 +864,7 @@ impl Simulation {
 
     fn decode_snapshot(bytes: &[u8]) -> Result<Self, SaveLoadError> {
         let (header, payload) = snapshot_header(bytes)?;
-        header.check_version()?;
+        header.check_compatibility()?;
         let version = header.version;
         let data: SimulationDeser =
             Bincode::decode(payload).map_err(|error| SaveLoadError::Corrupt {
@@ -903,7 +905,7 @@ impl Simulation {
         let version = match &error {
             SaveLoadError::Incompatible { version } => Some(version.as_str()),
             SaveLoadError::Corrupt { version, .. } => version.as_deref(),
-            SaveLoadError::SnapshotTooLarge { .. } => None,
+            SaveLoadError::SnapshotTooLarge { .. } | SaveLoadError::PrototypeRegistry => None,
             _ => unreachable!(),
         };
         let backups = saveload::backup_save_files(save_name, version).map_err(|backup_error| {
@@ -929,10 +931,13 @@ impl Simulation {
 
     /// Encodes a save under the caller's simulation lock so publication can happen after unlocking.
     pub fn encode_slot(&self, revision: SnapshotRevision) -> Result<EncodedSlot, SaveLoadError> {
-        let header = SlotSnapshotHeader {
-            magic: SLOT_SNAPSHOT_MAGIC,
-            version: VERSION.to_owned(),
-            revision,
+        let header = RegistrySlotSnapshotHeader {
+            slot: SlotSnapshotHeader {
+                magic: REGISTRY_SLOT_MAGIC,
+                version: VERSION.to_owned(),
+                revision,
+            },
+            registry: prototypes::prototypes().fingerprint(),
         };
         let snapshot = CompressedBincode::encode(&(header, self)).map_err(SaveLoadError::Encode)?;
         let replay = self.read::<Replay>();
@@ -1068,6 +1073,11 @@ impl Serialize for Simulation {
             }
         }
 
+        if let Some(registry) = prototypes::try_prototypes() {
+            let fingerprint =
+                Bincode::encode(&registry.fingerprint()).map_err(serde::ser::Error::custom)?;
+            m.insert("prototype_registry".into(), fingerprint);
+        }
         log::info!("took {}s to serialize resources", t.elapsed().as_secs_f32());
 
         let v = SimulationSer {
@@ -1091,6 +1101,7 @@ struct SaveHeader {
 // A legacy Bincode string length cannot start with 0xff. Keep the normal
 // Simulation serialization inside the slot envelope for legacy and network callers.
 const SLOT_SNAPSHOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x01";
+const REGISTRY_SLOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x02";
 
 #[derive(Serialize, Deserialize)]
 struct SlotSnapshotHeader {
@@ -1099,31 +1110,57 @@ struct SlotSnapshotHeader {
     revision: SnapshotRevision,
 }
 
+#[derive(Serialize, Deserialize)]
+struct RegistrySlotSnapshotHeader {
+    slot: SlotSnapshotHeader,
+    registry: u64,
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub struct SnapshotHeader {
     pub version: String,
     pub revision: Option<SnapshotRevision>,
+    registry: Option<u64>,
 }
 
 impl SnapshotHeader {
-    fn check_version(&self) -> Result<(), SaveLoadError> {
+    pub fn check_compatibility(&self) -> Result<(), SaveLoadError> {
         if self.version != VERSION {
             return Err(SaveLoadError::Incompatible {
                 version: self.version.clone(),
             });
         }
-        Ok(())
+        check_prototype_registry(self.registry)
     }
 }
 
+fn check_prototype_registry(fingerprint: Option<u64>) -> Result<(), SaveLoadError> {
+    if fingerprint.is_some_and(|saved| {
+        prototypes::try_prototypes().is_none_or(|current| current.fingerprint() != saved)
+    }) {
+        return Err(SaveLoadError::PrototypeRegistry);
+    }
+    Ok(())
+}
+
 fn snapshot_header(mut bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SaveLoadError> {
-    if bytes.starts_with(&SLOT_SNAPSHOT_MAGIC) {
+    let slot = if bytes.starts_with(&REGISTRY_SLOT_MAGIC) {
+        let header: RegistrySlotSnapshotHeader =
+            Bincode::decode_reader(&mut bytes).map_err(corrupt_header)?;
+        Some((header.slot, Some(header.registry)))
+    } else if bytes.starts_with(&SLOT_SNAPSHOT_MAGIC) {
         let header: SlotSnapshotHeader =
             Bincode::decode_reader(&mut bytes).map_err(corrupt_header)?;
+        Some((header, None))
+    } else {
+        None
+    };
+    if let Some((slot, registry)) = slot {
         return Ok((
             SnapshotHeader {
-                version: header.version,
-                revision: Some(header.revision),
+                version: slot.version,
+                revision: Some(slot.revision),
+                registry,
             },
             bytes,
         ));
@@ -1133,6 +1170,7 @@ fn snapshot_header(mut bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SaveLoad
         SnapshotHeader {
             version,
             revision: None,
+            registry: None,
         },
         bytes,
     ))
@@ -1161,6 +1199,7 @@ pub enum SaveLoadError {
     Incompatible {
         version: String,
     },
+    PrototypeRegistry,
     Corrupt {
         version: Option<String>,
         reason: String,
@@ -1185,6 +1224,9 @@ impl Display for SaveLoadError {
                     version.trim(),
                     VERSION.trim()
                 )
+            }
+            Self::PrototypeRegistry => {
+                f.write_str("Save or replay requires a different prototype registry")
             }
             Self::Corrupt { reason, .. } => write!(f, "Save is corrupt ({reason})"),
             Self::Io(error) => write!(f, "Could not read save ({error})"),
@@ -1307,6 +1349,7 @@ fn open_listed_snapshot(
     if header.version != VERSION || header.revision != entry.revision {
         return Err(SaveLoadError::SnapshotChanged);
     }
+    header.check_compatibility()?;
     Ok((file, kind))
 }
 
@@ -1355,7 +1398,7 @@ fn decode_snapshot_replay(bytes: &[u8], zip: &Path, bc: &Path) -> Result<Replay,
     // An unrevisioned debug replay can stand alone when its snapshot cannot be used.
     let revision = header
         .and_then(|header| {
-            header.check_version()?;
+            header.check_compatibility()?;
             Ok(header.revision)
         })
         .ok()
@@ -1424,6 +1467,13 @@ impl<'de> Deserialize<'de> for Simulation {
 impl SimulationDeser {
     fn into_sim(self) -> Result<Simulation, String> {
         let t = Instant::now();
+        let registry = self
+            .res
+            .get("prototype_registry")
+            .map(|bytes| Bincode::decode(bytes))
+            .transpose()
+            .map_err(|error| error.to_string())?;
+        check_prototype_registry(registry).map_err(|error| error.to_string())?;
         let mut sim = Simulation {
             // Resource initializers can rebuild derived indexes from the loaded world.
             world: self.world,
@@ -1449,6 +1499,7 @@ impl SimulationDeser {
             }
         }
 
+        validate_loaded_prototypes(&sim)?;
         crate::map::validate_loaded_land(&sim)?;
         sim.map_mut()
             .rebuild_land_frontage()
@@ -1462,6 +1513,52 @@ impl SimulationDeser {
         );
 
         Ok(sim)
+    }
+}
+
+fn validate_loaded_prototypes(sim: &Simulation) -> Result<(), String> {
+    use crate::souls::residence::Residences;
+    for (id, building) in sim.map().buildings() {
+        if !building_kind_prototype_exists(building.kind) {
+            return Err(format!(
+                "building {id:?} requires missing prototype {:?}",
+                building.kind
+            ));
+        }
+        if let Some(home) = building.development().and_then(|site| site.home) {
+            require_prototype(home)?;
+        }
+    }
+    for home in sim.read::<Residences>().by_building.values() {
+        require_prototype(home.prototype)?;
+    }
+    for company in sim.world.companies.values() {
+        require_prototype(company.comp.proto)?;
+    }
+    for station in sim.world.freight_stations.values() {
+        require_prototype(station.f.proto)?;
+    }
+    for wagon in sim.world.wagons.values() {
+        require_prototype(wagon.wagon.rolling_stock)?;
+    }
+    Ok(())
+}
+
+fn require_prototype<I>(id: I) -> Result<(), String>
+where
+    I: prototypes::PrototypeID,
+    I::Prototype: prototypes::ConcretePrototype,
+{
+    prototypes::try_prototype(id)
+        .map(|_| ())
+        .ok_or_else(|| format!("missing prototype {id:?}"))
+}
+
+fn building_kind_prototype_exists(kind: BuildingKind) -> bool {
+    match kind {
+        BuildingKind::GoodsCompany(id) => prototypes::try_prototype(id).is_some(),
+        BuildingKind::RailFreightStation(id) => prototypes::try_prototype(id).is_some(),
+        _ => true,
     }
 }
 
