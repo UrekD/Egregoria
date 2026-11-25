@@ -272,12 +272,30 @@ pub fn commission(
         }
     }
 
+    let employment = &plan
+        .districts
+        .iter()
+        .find(|district| district.key == "employment")
+        .unwrap()
+        .polygon;
+    let employment_market =
+        place_scored_company(sim, plan, &roads, "supermarket", |map, road, footprint| {
+            let center = footprint.center();
+            (contains(employment, center)
+                && map.roads()[road]
+                    .lanes_iter()
+                    .any(|(_, kind)| kind == LaneKind::Parking))
+            .then(|| center.distance2(cohorts[4].anchor))
+        })?
+        .ok_or("no parking frontage for a supermarket in the employment district")?;
+    sites.insert("employment/supermarket".into(), employment_market.0);
+
     let (mut parcels, reserves) = plan_parcels(sim, plan, &roads, &cohorts)?;
     place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
 
     // Keep the food facilities clear of approved housing and future infill.
     // Opening them before housing still gives them the first hiring pool.
-    let place_food_site = |sim: &mut Simulation, name: &str, anchor: Vec2| {
+    let place_food_site = |sim: &mut Simulation, name: &str, anchor: Vec2, near_road: Option<RoadID>| {
         place_scored_company(sim, plan, &roads, name, |map, road, footprint| {
             if !map.roads()[road]
                 .lanes_iter()
@@ -289,31 +307,57 @@ pub fn commission(
             {
                 return None;
             }
-            Some(footprint.center().distance2(anchor))
+            let access_penalty = if near_road.is_some_and(|near| road != near) {
+                120.0
+            } else {
+                0.0
+            };
+            Some(footprint.center().distance(anchor) + access_penalty)
         })?
-        .map(|(building, _)| building)
         .ok_or_else(|| format!("no clear fitting site for {name} outside approved frontage"))
     };
     let mut depots = Vec::new();
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
-        let depot = place_food_site(sim, "small-depot", cohort.anchor)?;
+        let (depot, _) = place_food_site(sim, "small-depot", cohort.anchor, None)?;
         sites.insert(format!("{}/depot", cohort.district), depot);
         depots.push(WorldCommand::SetWarehousePolicy {
             building: depot,
             policy: WarehousePolicy::ReserveLocally,
         });
     }
-    // Leave retail an alternative to goods from local workshops while limiting
-    // the number of simultaneous supermarket orders for meat, produce and cereal.
+    let mut market_clusters = vec![("employment", employment_market)];
     for (district, x, y) in [
         ("station", 2210.0, 1800.0),
         ("hraska", 1960.0, 2440.0),
         ("south", 2050.0, 1100.0),
         ("west", 1350.0, 1840.0),
-        ("employment", 2530.0, 2400.0),
     ] {
-        let store = place_food_site(sim, "supermarket", at(x, y))?;
+        let (store, road) = place_food_site(sim, "supermarket", at(x, y), None)?;
         sites.insert(format!("{district}/supermarket"), store);
+        market_clusters.push((district, (store, road)));
+    }
+    for (district, (market, road)) in market_clusters {
+        let market_door = sim.map().buildings()[market].door_pos.xy();
+        let (second, _) = place_food_site(sim, "supermarket", market_door, Some(road))?;
+        sites.insert(format!("{district}/supermarket-2"), second);
+
+        // Each pair of stores shares an ordinary local meat chain. Work
+        // upstream from the stores to keep the successive truck legs nearby.
+        let mut consumer = (market, road);
+        for name in ["meat-facility", "slaughterhouse", "animal-farm", "cereal-farm"] {
+            let door = sim.map().buildings()[consumer.0].door_pos.xy();
+            let site = place_food_site(sim, name, door, Some(consumer.1))?;
+            verify_parking_pair(&sim.map(), site.0, consumer.0, Tick(sim.get_tick()))?;
+            sites.insert(format!("{district}/local-{name}"), site.0);
+            if name == "cereal-farm" {
+                farms.push(site.0);
+            }
+            consumer = site;
+        }
+        if district == "employment" || district == "south" {
+            let (farm, _) = place_food_site(sim, "vegetable-farm", market_door, Some(road))?;
+            sites.insert(format!("{district}/vegetable-farm"), farm);
+        }
     }
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
 
@@ -2201,7 +2245,7 @@ struct DayReport {
     baskets_due: u64,
     baskets_filled: u64,
     effective_food_stockout_ticks: u64,
-    units_fulfilled_by_sku: BTreeMap<ItemID, u64>,
+    units_fulfilled_by_sku: BTreeMap<String, u64>,
     basket_failures: BTreeMap<String, u64>,
     work_visits: u64,
     park_visits: u64,
@@ -2422,7 +2466,11 @@ pub fn check_loaded_opening(
             baskets_due,
             baskets_filled,
             effective_food_stockout_ticks,
-            units_fulfilled_by_sku: daily.units_fulfilled_by_sku.clone(),
+            units_fulfilled_by_sku: daily
+                .units_fulfilled_by_sku
+                .iter()
+                .map(|(&item, &units)| (item.prototype().name.clone(), units))
+                .collect(),
             basket_failures: sim
                 .read::<Market>()
                 .basket_failures()
