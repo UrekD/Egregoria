@@ -6,7 +6,7 @@ use std::time::Instant;
 use prototypes::{try_prototype, Money, RollingStockID};
 use serde::{Deserialize, Serialize};
 
-use geom::{vec3, Vec2, Vec3, OBB};
+use geom::{vec3, Polygon, Vec2, Vec3, OBB};
 use prototypes::BuildingGen;
 use prototypes::GameTime;
 use WorldCommand::*;
@@ -36,6 +36,7 @@ pub(crate) const MAX_TILED_COMMANDS: usize = 256;
 pub(crate) const MAX_WIRE_COMMANDS: usize = 65_536;
 const MAX_WAGONS: usize = 256;
 const MAX_LINE_STOPS: usize = 30;
+const MAX_ZONE_VERTICES: usize = 256;
 
 #[derive(Clone, Default, Serialize, Deserialize)]
 #[serde(transparent)]
@@ -144,6 +145,37 @@ fn bounded_frame_wire<'de, D: serde::Deserializer<'de>>(
     deserializer.deserialize_seq(Frame)
 }
 
+// Match the serialized Zone fields while bounding the polygon in command input.
+#[derive(Deserialize)]
+#[serde(rename = "Zone")]
+struct CommandZone {
+    #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_ZONE_VERTICES>")]
+    poly: Vec<Vec2>,
+    area: f32,
+    #[serde(default = "Zone::default_fill_direction")]
+    filldir: Vec2,
+}
+
+impl CommandZone {
+    fn decode<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Zone, D::Error> {
+        Self::deserialize(deserializer).map(Self::into_zone)
+    }
+
+    fn decode_optional<'de, D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Zone>, D::Error> {
+        Option::<Self>::deserialize(deserializer).map(|zone| zone.map(Self::into_zone))
+    }
+
+    fn into_zone(self) -> Zone {
+        Zone {
+            poly: Polygon(self.poly),
+            area: self.area,
+            filldir: self.filldir,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum WorldCommand {
     Init(Box<SimulationOptions>),
@@ -196,7 +228,7 @@ pub enum WorldCommand {
         pos: OBB,
         kind: BuildingKind,
         gen: BuildingGen,
-        #[serde(default)]
+        #[serde(default, deserialize_with = "CommandZone::decode_optional")]
         zone: Option<Zone>,
         #[serde(default)]
         connected_road: Option<RoadID>,
@@ -209,6 +241,7 @@ pub enum WorldCommand {
     },
     UpdateZone {
         building: BuildingID,
+        #[serde(deserialize_with = "CommandZone::decode")]
         zone: Zone,
     },
     SetGameTime(GameTime),
@@ -1094,7 +1127,7 @@ impl WorldCommand {
                     .all(|(_, speed)| speed.is_finite())
         };
         let finite_zone = |zone: &Zone| {
-            zone.poly.len() <= 256
+            zone.poly.len() <= MAX_ZONE_VERTICES
                 && zone.poly.as_slice().iter().all(|point| point.is_finite())
                 && zone.area.is_finite()
                 && zone.filldir.is_finite()
@@ -1206,7 +1239,7 @@ impl WorldCommand {
                 MapBuildSpecialBuilding {
                     zone: Some(zone), ..
                 }
-                | UpdateZone { zone, .. } => zone.poly.len() <= 256,
+                | UpdateZone { zone, .. } => zone.poly.len() <= MAX_ZONE_VERTICES,
                 SpawnTrain { wagons, .. } => wagons.len() <= MAX_WAGONS,
                 TransitCreateLine { stops } | TransitEditLine { stops, .. } => {
                     stops.len() <= MAX_LINE_STOPS

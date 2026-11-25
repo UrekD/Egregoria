@@ -1582,14 +1582,14 @@ mod tiles_fix_regressions {
     use super::init_test_simulation;
     use crate::map::{
         BuildingKind, LandMode, LandTileId, LanePatternBuilder, Map, MapProject, WaterEdit,
-        ZoneGrid, ZoneKind,
+        Zone, ZoneGrid, ZoneKind,
     };
     use crate::world_command::{CommandOutcomes, Rejection};
     use crate::{
         MapPreset, NewGameOptions, Replay, Simulation, SlotId, SnapshotRevision, WorldCommand,
     };
-    use common::saveload::{Bincode, Encoder};
-    use geom::{vec2, vec3, Vec2, OBB};
+    use common::saveload::{Bincode, Encoder, JSON};
+    use geom::{vec2, vec3, Polygon, Radians, Vec2, OBB};
     use prototypes::{BuildingGen, FreightStationPrototypeID};
 
     fn game(land_mode: LandMode) -> Simulation {
@@ -1704,6 +1704,87 @@ mod tiles_fix_regressions {
         for command in commands {
             assert!(Bincode::decode::<WorldCommand>(&Bincode::encode(&command).unwrap()).is_err());
         }
+    }
+
+    fn zone_with_vertices(count: usize) -> Zone {
+        let center = vec2(700.0, 700.0);
+        let vertices = (0..count)
+            .map(|index| {
+                let angle = Radians(std::f32::consts::TAU * index as f32 / count as f32);
+                center + Vec2::from_angle(angle) * 20.0
+            })
+            .collect();
+        Zone::new(Polygon(vertices), Vec2::X)
+    }
+
+    #[test]
+    fn tiles_fix_bounds_zone_command_decode() {
+        for count in [256, 257] {
+            let zone = zone_with_vertices(count);
+            let commands = [
+                WorldCommand::UpdateZone {
+                    building: Default::default(),
+                    zone: zone.clone(),
+                },
+                WorldCommand::MapBuildSpecialBuilding {
+                    pos: OBB::new(vec2(1600.0, 1600.0), Vec2::X, 60.0, 40.0),
+                    kind: BuildingKind::RailFreightStation(FreightStationPrototypeID::new(
+                        "freight-station",
+                    )),
+                    gen: BuildingGen::NoWalkway {
+                        door_pos: Vec2::ZERO,
+                    },
+                    zone: Some(zone),
+                    connected_road: None,
+                },
+            ];
+            for command in commands {
+                let bytes = Bincode::encode(&command).unwrap();
+                assert_eq!(Bincode::decode::<WorldCommand>(&bytes).is_ok(), count == 256);
+                let json = JSON::encode(&command).unwrap();
+                assert_eq!(JSON::decode::<WorldCommand>(&json).is_ok(), count == 256);
+                assert_eq!(command.wire_error().is_none(), count == 256);
+            }
+        }
+    }
+
+    #[test]
+    fn tiles_fix_reloads_unrestricted_zone_with_257_vertices() {
+        init_test_simulation();
+        let sim = Simulation::new_authored_flat(5, 0).unwrap();
+        let zone = zone_with_vertices(257);
+        let building = {
+            let mut map = sim.write::<Map>();
+            let building = map
+                .build_special_building(
+                    &OBB::new(vec2(200.0, 200.0), Vec2::X, 16.0, 16.0),
+                    BuildingKind::ExternalTrading,
+                    BuildingGen::NoWalkway {
+                        door_pos: Vec2::ZERO,
+                    },
+                    Some(Zone::new(
+                        Polygon::centered_rect(vec2(700.0, 700.0), 32.0, 32.0),
+                        Vec2::X,
+                    )),
+                    None,
+                )
+                .unwrap();
+            map.update_zone(building, zone.clone()).unwrap();
+            building
+        };
+        let root = std::env::temp_dir().join(format!("egregoria-tiles-zone-{}", std::process::id()));
+        std::fs::create_dir(&root).unwrap();
+        let slot = SlotId::new("tiles_zone").unwrap();
+        sim.save_to_slot(&root, &slot, SnapshotRevision::new(1))
+            .unwrap();
+        let loaded = Simulation::load_from_slot(&root, &slot);
+        std::fs::remove_dir_all(root).unwrap();
+        let loaded = loaded.unwrap();
+        let map = loaded.map();
+        let loaded_zone = map.get(building).unwrap().zone.as_ref().unwrap();
+        assert_eq!(loaded_zone.poly.as_slice(), zone.poly.as_slice());
+        assert_eq!(loaded_zone.area, zone.area);
+        assert_eq!(loaded_zone.filldir, zone.filldir);
     }
 
     #[test]

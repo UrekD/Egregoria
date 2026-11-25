@@ -339,21 +339,30 @@ fn polygons_overlap(a: &[Vec2], b: &[Vec2]) -> bool {
     if a_area == 0.0 || b_area == 0.0 {
         return false;
     }
-    let interior_vertex = |vertices: &[Vec2], boundary: &[(Vec2, Vec2)], polygon: &[Vec2]| {
-        let polygon = Polygon::from(polygon);
-        let bounds = polygon.bbox();
-        vertices.iter().copied().any(|vertex| {
-            bounds.contains(vertex)
-                && polygon.contains(vertex)
-                && !boundary.iter().any(|&(start, end)| {
-                    let along = point(end) - point(start);
-                    let offset = point(vertex) - point(start);
-                    along.perp_dot(offset) == 0.0
-                        && (0.0..=along.dot(along)).contains(&along.dot(offset))
-                })
-        })
+    let strictly_inside = |vertex: Vec2d, boundary: &[(Vec2, Vec2)]| {
+        let mut inside = false;
+        for &(start, end) in boundary {
+            let (start, end) = (point(start), point(end));
+            let along = end - start;
+            let offset = vertex - start;
+            let cross = along.perp_dot(offset);
+            if cross == 0.0
+                && along != Vec2d::ZERO
+                && (0.0..=along.dot(along)).contains(&along.dot(offset))
+            {
+                return false;
+            }
+            if (start.y > vertex.y) != (end.y > vertex.y) && (cross > 0.0) == (along.y > 0.0) {
+                inside = !inside;
+            }
+        }
+        inside
     };
-    if interior_vertex(a, &b_edges, b) || interior_vertex(b, &a_edges, a) {
+    if a.iter()
+        .any(|&vertex| strictly_inside(point(vertex), &b_edges))
+        || b.iter()
+            .any(|&vertex| strictly_inside(point(vertex), &a_edges))
+    {
         return true;
     }
     for &(a1, a2) in &a_edges {
@@ -379,5 +388,44 @@ fn polygons_overlap(a: &[Vec2], b: &[Vec2]) -> bool {
             }
         }
     }
-    false
+    // Proper crossings and interior vertices miss chords of an inscribed
+    // polygon. Between consecutive boundary contacts, each open edge segment
+    // lies on one side of the boundary (or lies along it).
+    let has_interior_edge = |edges: &[(Vec2, Vec2)], other: &[Vec2], boundary: &[(Vec2, Vec2)]| {
+        edges.iter().any(|&(start, end)| {
+            let start = point(start);
+            let direction = point(end) - start;
+            let length2 = direction.dot(direction);
+            if length2 == 0.0 {
+                return false;
+            }
+            let mut contacts = vec![0.0, 1.0];
+            contacts.extend(other.iter().filter_map(|&vertex| {
+                let offset = point(vertex) - start;
+                let t = direction.dot(offset) / length2;
+                (direction.perp_dot(offset) == 0.0 && t > 0.0 && t < 1.0).then_some(t)
+            }));
+            contacts.sort_unstable_by(f64::total_cmp);
+            contacts.windows(2).any(|range| {
+                range[0] < range[1]
+                    && strictly_inside(start + direction * ((range[0] + range[1]) * 0.5), boundary)
+            })
+        })
+    };
+    has_interior_edge(&a_edges, b, &b_edges) || has_interior_edge(&b_edges, a, &a_edges)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tiles_fix_inscribed_reserve_overlap_and_boundary_contact() {
+        let reserve = rect_corners(AABB::new_ll_ur(Vec2::ZERO, vec2(10.0, 10.0)));
+        let inscribed = [vec2(5.0, 0.0), vec2(10.0, 5.0), vec2(0.0, 5.0)];
+        let contact = [vec2(1.0, 0.0), vec2(5.0, -5.0), vec2(9.0, 0.0)];
+        assert!(!polygons_overlap(&reserve, &contact));
+        assert!(polygons_overlap(&reserve, &inscribed));
+        assert!(polygons_overlap(&inscribed, &reserve));
+    }
 }
