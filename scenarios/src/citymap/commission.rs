@@ -2410,21 +2410,47 @@ fn track_arrival(
 struct PassengerEvidence {
     total_boardings: u64,
     active: BTreeMap<HumanID, PassengerJourney>,
+    aboard_at_start: BTreeSet<HumanID>,
     completed: BTreeMap<LineID, u64>,
+    examples: BTreeMap<LineID, PassengerArrival>,
 }
 
 struct PassengerJourney {
     bus: VehicleID,
     line: LineID,
+    board: StopID,
     alight: StopID,
     destination: BuildingID,
+    purpose: TripPurpose,
     started: Tick,
     alighted: bool,
 }
 
+#[derive(Serialize)]
+struct PassengerArrival {
+    passenger: HumanID,
+    board: StopID,
+    alight: StopID,
+    destination: BuildingID,
+    purpose: TripPurpose,
+    elapsed_tick: u64,
+}
+
 impl PassengerEvidence {
-    fn observe(&mut self, sim: &Simulation, transit: &Transit) {
+    fn new(sim: &Simulation) -> Self {
+        Self {
+            total_boardings: sim.read::<TransitStats>().boardings.values().sum(),
+            aboard_at_start: sim.world().humans.iter()
+                .filter_map(|(id, human)| matches!(human.location, Location::Transit(_)).then_some(id))
+                .collect(),
+            ..Self::default()
+        }
+    }
+
+    fn observe(&mut self, sim: &Simulation, transit: &Transit, tick: u64) {
         let world = sim.world();
+        self.aboard_at_start.retain(|&id| world.humans.get(id)
+            .is_some_and(|human| matches!(human.location, Location::Transit(_))));
         self.active.retain(|&id, journey| {
             let Some(human) = world.humans.get(id) else {
                 return false;
@@ -2454,6 +2480,14 @@ impl PassengerEvidence {
             }
             if human.location == Location::Building(journey.destination) && router.trip_start.is_none() {
                 *self.completed.entry(journey.line).or_default() += 1;
+                self.examples.entry(journey.line).or_insert(PassengerArrival {
+                    passenger: id,
+                    board: journey.board,
+                    alight: journey.alight,
+                    destination: journey.destination,
+                    purpose: journey.purpose,
+                    elapsed_tick: tick,
+                });
                 return false;
             }
             router.trip_start == Some(journey.started)
@@ -2479,15 +2513,25 @@ impl PassengerEvidence {
             ) else {
                 continue;
             };
-            if transit.runs.get(bus).is_some_and(|run| {
-                run.line == *line && run.dwell_until.is_some()
-                    && transit.lines[run.line].stops[run.next_stop_idx] != *alight
-            }) {
-                self.active.entry(id).or_insert(PassengerJourney {
+            if self.aboard_at_start.contains(&id) || self.active.contains_key(&id) {
+                continue;
+            }
+            let Some(run) = transit.runs.get(bus)
+                .filter(|run| run.line == *line && run.dwell_until.is_some())
+            else {
+                continue;
+            };
+            let board = transit.lines[run.line].stops[run.next_stop_idx];
+            if board != *alight
+                && human.trans.pos.distance2(transit.stops[board].walk_pos) <= 8.0_f32.powi(2)
+            {
+                self.active.insert(id, PassengerJourney {
                     bus: *bus,
                     line: *line,
+                    board,
                     alight: *alight,
                     destination,
+                    purpose: human.router.trip_purpose,
                     started,
                     alighted: false,
                 });
@@ -2730,6 +2774,7 @@ pub struct OpeningReport {
     infill_housing_capacity: u32,
     days: Vec<DayReport>,
     traffic: Traffic,
+    passenger_examples: BTreeMap<&'static str, PassengerArrival>,
     freight: FreightEvidence,
     failures: Vec<String>,
 }
@@ -2806,13 +2851,13 @@ pub fn check_loaded_opening(
     let mut traffic = Traffic::default();
     let mut loops = LoopEvidence::default();
     let mut freight = FreightEvidence::default();
-    let mut passengers = PassengerEvidence::default();
     let mut days = Vec::new();
     let mut minimum_cash = sim.read::<Government>().money;
     for _ in load..start {
         sim.tick(&mut schedule, []);
         minimum_cash = minimum_cash.min(sim.read::<Government>().money);
     }
+    let mut passengers = PassengerEvidence::new(&sim);
     let initial_car_trips = sim.read::<TripStats>().car.completed;
     let buyer = sim
         .read::<BuildingInfos>()
@@ -2858,7 +2903,7 @@ pub fn check_loaded_opening(
             {
                 let transit = sim.read::<Transit>();
                 loops.observe(&transit);
-                passengers.observe(&sim, &transit);
+                passengers.observe(&sim, &transit, tick);
             }
             freight.observe(&sim, &manifest.freight, &freight_route, buyer, tick);
             if dt % SAMPLE_TICKS == 0 {
@@ -3051,6 +3096,9 @@ pub fn check_loaded_opening(
         infill_housing_capacity,
         days,
         traffic,
+        passenger_examples: manifest.lines.iter().filter_map(|(&name, line)| {
+            Some((name, passengers.examples.remove(&line.id)?))
+        }).collect(),
         freight,
         failures,
     })
@@ -3209,6 +3257,55 @@ mod tests {
         traffic.observe_egresses(29 * minute, BTreeMap::from([(lane, true)]), &empty);
         assert_eq!(traffic.max_blocking_ticks, 20 * minute);
         assert_eq!(traffic.blocked_egresses[&lane].start, 21 * minute);
+    }
+
+    #[test]
+    fn cm2_live_queue_keeps_blockage_when_the_approach_vehicle_changes() {
+        use simulation::transportation::spawn_driving_vehicle;
+
+        let (mut sim, approach, _) = super::super::spacing::cm0_boundary_fixture();
+        let egress = {
+            let map = sim.map();
+            let lane = &map.lanes()[approach];
+            let egress = map.intersections()[lane.dst].turns_from(approach)
+                .map(|(turn, _)| turn.dst)
+                .find(|&id| map.lanes()[id].kind == LaneKind::Driving
+                    && map.lanes()[id].points.length() > 40.0)
+                .unwrap();
+            egress
+        };
+        let spawn = |sim: &mut Simulation, lane, from_end: Option<f32>| {
+            let (pos, dir, route) = {
+                let map = sim.map();
+                let points = &map.lanes()[lane].points;
+                let offset = from_end.map_or(9.0, |offset| points.length() - offset);
+                let (pos, dir) = points.point_dir_along(offset);
+                let route = Itinerary::route_to_lane(Tick(sim.get_tick()), pos, &map, egress, 38.0)
+                    .unwrap();
+                (pos, dir, route)
+            };
+            let id = spawn_driving_vehicle(sim, VehicleKind::Car, Transform::new_dir(pos, dir)).unwrap();
+            sim.world_mut_unchecked().vehicles[id].it = route;
+            id
+        };
+        let blocker = spawn(&mut sim, egress, None);
+        let first = spawn(&mut sim, approach, Some(3.5));
+        let second = spawn(&mut sim, approach, Some(13.0));
+        let mut traffic = Traffic::default();
+        let minute = TICKS_PER_MINUTE;
+        traffic.observe(&sim, 0);
+        traffic.observe(&sim, 10 * minute);
+        assert_eq!(traffic.max_blocking_ticks, 10 * minute);
+        {
+            let vehicles = &mut sim.world_mut_unchecked().vehicles;
+            vehicles[first].vehicle.state = VehicleState::ParkedAtDepot;
+            vehicles[second].trans.pos = vehicles[first].trans.pos;
+        }
+        traffic.observe(&sim, 20 * minute);
+        assert_eq!(traffic.max_blocking_ticks, 20 * minute);
+        sim.world_mut_unchecked().vehicles[blocker].vehicle.state = VehicleState::ParkedAtDepot;
+        traffic.observe(&sim, 21 * minute);
+        assert!(traffic.blocked_egresses.is_empty());
     }
 
     #[test]
