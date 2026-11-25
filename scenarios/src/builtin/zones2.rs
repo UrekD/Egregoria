@@ -905,9 +905,6 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
         .map(|&(_, _, road)| road)
         .ok_or_else(|| failure("a pending Mixed Use basket"))?;
     let roads = BTreeSet::from([job_road, freight_road, basket_road]);
-    if roads.len() != 1 {
-        return Err(failure("hire, freight and basket claims on the same road"));
-    }
     let affected: Vec<_> = sites
         .into_iter()
         .filter(|&(_, _, road)| roads.contains(&road))
@@ -919,7 +916,10 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
     }) {
         return Err(failure("an occupied and staffed Mixed Use site"));
     }
-    println!("staffed frontage cut at elapsed step {STAFFED_TEARDOWN_STEP} with hire, basket and freight claims");
+    println!(
+        "staffed frontage cut across {} links at elapsed step {STAFFED_TEARDOWN_STEP} with hire, basket and freight claims",
+        roads.len()
+    );
     Ok((roads, affected))
 }
 
