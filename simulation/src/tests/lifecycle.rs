@@ -52,29 +52,40 @@ fn run_systems(test: &mut TestCtx) {
 
 #[test]
 fn p4_init_is_rejected_in_ordinary_batches_even_at_the_initial_tick() {
-    let mut test = TestCtx::new();
-    test.g = Simulation::new_with_options(SimulationOptions {
-        terrain_size: 0,
-        save_replay: true,
-        ..Default::default()
-    });
-    assert!(test.g.read::<Replay>().enabled);
+    let mut sim = recorded_city();
+    let mut schedule = Simulation::schedule();
     let init = WorldCommand::Init(Box::new(SimulationOptions::LEGACY));
-    assert_eq!(test.g.get_tick(), crate::INITIAL_TICK);
-    for tick in [crate::INITIAL_TICK, crate::INITIAL_TICK + 1] {
-        assert_eq!(test.g.get_tick(), tick);
-        let before = test.g.hashes();
-        let replay = JSON::encode(&*test.g.read::<crate::utils::replay::Replay>()).unwrap();
-        init.apply(&mut test.g);
-        assert_eq!(test.g.read::<CommandOutcomes>().last[0].0, "Init");
-        assert!(test.g.read::<CommandOutcomes>().accepted.is_empty());
-        assert_eq!(test.g.hashes(), before);
-        assert_eq!(
-            JSON::encode(&*test.g.read::<crate::utils::replay::Replay>()).unwrap(),
-            replay
-        );
-        test.tick();
+    for step in 0..2 {
+        assert_eq!(sim.get_tick(), crate::INITIAL_TICK + step);
+        let mut before = sim.hashes();
+        let replay_before = before.remove("replay").unwrap();
+        let command_count = sim.read::<Replay>().command_count();
+
+        init.apply(&mut sim);
+
+        {
+            let outcomes = sim.read::<CommandOutcomes>();
+            assert_eq!(outcomes.last, [("Init", Rejection::UnexpectedInit)]);
+            assert!(outcomes.accepted.is_empty());
+        }
+        let mut after = sim.hashes();
+        assert_ne!(after.remove("replay").unwrap(), replay_before);
+        assert_eq!(after, before);
+        {
+            let replay = sim.read::<Replay>();
+            assert_eq!(replay.command_count(), command_count + 1);
+            assert_eq!(
+                replay.batch_boundaries().last(),
+                Some(&(step, command_count + 1, false))
+            );
+            assert!(matches!(
+                replay.commands(command_count..command_count + 1).next(),
+                Some(WorldCommand::Init(_))
+            ));
+        }
+        sim.tick(&mut schedule, &[]);
     }
+    assert_replay_matches(&sim);
 }
 
 fn recorded_city() -> Simulation {

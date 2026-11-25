@@ -1155,7 +1155,6 @@ impl WorldCommand {
             zone.poly.len() <= MAX_ZONE_VERTICES
                 && zone.poly.as_slice().iter().all(|point| point.is_finite())
                 && zone.area.is_finite()
-                && zone.filldir.is_finite()
         };
         let fits = match self {
             Terraform {
@@ -1166,11 +1165,12 @@ impl WorldCommand {
                 slope,
                 ..
             } => {
-                center.is_finite()
+                let finite = center.is_finite()
                     && radius.is_finite()
                     && amount.is_finite()
                     && level.is_finite()
-                    && slope.is_none_or(|(from, to)| from.is_finite() && to.is_finite())
+                    && slope.is_none_or(|(from, to)| from.is_finite() && to.is_finite());
+                return (!finite).then_some(Ok(Rejection::InvalidTerraform));
             }
             MapMakeConnection {
                 from,
@@ -1192,6 +1192,14 @@ impl WorldCommand {
             MapUpdateIntersectionPolicy { turn, .. } => turn
                 .roundabout
                 .is_none_or(|policy| policy.radius.is_finite()),
+            MapBuildSpecialBuilding {
+                zone: Some(zone), ..
+            }
+            | UpdateZone { zone, .. }
+                if !zone.filldir.is_finite() =>
+            {
+                return Some(Ok(Rejection::InvalidZone));
+            }
             MapBuildSpecialBuilding { pos, gen, zone, .. } => {
                 let finite_gen = match gen {
                     BuildingGen::House | BuildingGen::Farm => true,
