@@ -2,6 +2,8 @@ mod clearance;
 mod layout;
 mod network;
 mod source;
+pub mod spacing;
+pub mod traffic;
 
 pub use layout::*;
 pub use network::*;
