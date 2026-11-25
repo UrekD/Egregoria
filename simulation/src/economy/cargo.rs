@@ -2934,9 +2934,10 @@ fn dispatch_station_trucks(
     let tick = resources.read::<prototypes::GameTime>().tick;
     let commands = resources.read::<ParCommandBuffer<VehicleEnt>>();
     let market = resources.read::<Market>();
+    let infos = resources.read::<BuildingInfos>();
     let urgent = |order: &ImportOrder| {
         let item = order.quantity.item;
-        destination_input(world, order.buyer, item)
+        destination_input(world, map, &infos, order.buyer, item)
             .is_some_and(|input| on_hand(&market, order.buyer, item) < input.amount)
     };
     let CargoBook {
