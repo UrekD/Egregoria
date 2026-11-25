@@ -119,9 +119,12 @@ enum Step {
 #[serde(untagged)]
 enum StateDump {
     Name(String),
-    WithWaterSamples {
+    WithOptions {
         name: String,
+        #[serde(default)]
         water_samples: Vec<[f32; 2]>,
+        #[serde(default)]
+        include_map_hash: bool,
     },
 }
 
@@ -776,14 +779,21 @@ impl Automation {
                 self.wait = Some(Wait::Screenshot);
             }
             Step::DumpState(dump) => {
-                let (name, samples) = match &dump {
-                    StateDump::Name(name) => (name, &[][..]),
-                    StateDump::WithWaterSamples {
+                let (name, samples, include_map_hash) = match &dump {
+                    StateDump::Name(name) => (name, &[][..], false),
+                    StateDump::WithOptions {
                         name,
                         water_samples,
-                    } => (name, water_samples.as_slice()),
+                        include_map_hash,
+                    } => (name, water_samples.as_slice(), *include_map_hash),
                 };
-                self.dump_state(&self.output_path(name, "json")?, uiw, sim, samples)?;
+                Self::dump_state(
+                    &self.output_path(name, "json")?,
+                    uiw,
+                    sim,
+                    samples,
+                    include_map_hash,
+                )?;
             }
             Step::Exit => {
                 ctx.request_exit();
@@ -865,11 +875,11 @@ impl Automation {
     }
 
     fn dump_state(
-        &self,
         path: &Path,
         uiw: &UiWorld,
         sim: &Simulation,
         water_samples: &[[f32; 2]],
+        include_map_hash: bool,
     ) -> Result<(), String> {
         #[derive(Serialize)]
         struct Snapshot<'a> {
@@ -877,7 +887,8 @@ impl Automation {
             active_tool: Tool,
             overlay: OverlayMode,
             preset: MapPreset,
-            map_hash: u64,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            map_hash: Option<u64>,
             road_ids: BTreeSet<RoadID>,
             rail_lanes: usize,
             external_markets: usize,
@@ -906,9 +917,13 @@ impl Automation {
         let map = sim.map();
         let env = map.environment();
         let zones = sim.read::<ZoneGrid>();
-        let map_hash = Bincode::encode(&*map)
-            .map(|bytes| common::hash_u64(&bytes[..]))
-            .map_err(|error| format!("hashing map for state dump: {error}"))?;
+        let map_hash = if include_map_hash {
+            let bytes = Bincode::encode(&*map)
+                .map_err(|error| format!("hashing map for state dump: {error}"))?;
+            Some(common::hash_u64(&bytes[..]))
+        } else {
+            None
+        };
         let buildings = map.buildings().values();
         let state = Snapshot {
             tick: sim.get_tick(),
@@ -1645,5 +1660,31 @@ mod tests {
                 assert!(steps.iter().any(|s| matches!(s, Step::RunTicks(300_000))));
             }
         }
+    }
+
+    #[test]
+    fn water_gate_dump_state_hash_is_opt_in() {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let uiw = UiWorld::with_defaults();
+        let path = std::env::temp_dir().join(format!("egr-state-dump-{}.json", std::process::id()));
+        Automation::dump_state(&path, &uiw, &sim, &[], false).unwrap();
+        let default_state = fs::read(&path).unwrap();
+        Automation::dump_state(&path, &uiw, &sim, &[], true).unwrap();
+        let hashed_state = fs::read(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        let state: BTreeMap<String, serde::de::IgnoredAny> = JSON::decode(&default_state).unwrap();
+        assert!(
+            !state.contains_key("map_hash"),
+            "default dump included the map hash"
+        );
+        #[derive(Deserialize)]
+        struct MapHash {
+            map_hash: u64,
+        }
+        let state: MapHash = JSON::decode(&hashed_state).unwrap();
+        let bytes = Bincode::encode(&*sim.map()).unwrap();
+        assert_eq!(state.map_hash, common::hash_u64(&bytes[..]));
     }
 }

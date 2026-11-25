@@ -51,8 +51,9 @@ require(
     protected["rejections"] == [["EditWater", "WetFootprint"]],
     "Flooding a protected footprint did not report WetFootprint",
 )
+require(isinstance(mixed.get("map_hash"), int), "Mixed paint dump is missing the map hash")
 for after in (wet, protected):
-    require(after["map_hash"] == mixed["map_hash"], "Rejected action changed the map")
+    require(after.get("map_hash") == mixed["map_hash"], "Rejected action changed the map or its hash is missing")
     require(after["zone_coordinates"] == mixed["zone_coordinates"], "Rejected action changed zones")
     require(after["water_revision"] == mixed["water_revision"], "Rejected action changed the water revision")
 require(
@@ -130,24 +131,65 @@ def pixels(path):
         png.png_image_free(c.byref(header))
 
 
-def lake_color_fraction(width, height, rgba):
-    count = 0
-    for y in range(height // 2 - 24, height // 2 + 24):
-        for x in range(width // 2 - 32, width // 2 + 32):
+def crop(width, rgba, x0, y0, x1, y1):
+    for y in range(y0, y1):
+        for x in range(x0, x1):
             i = (y * width + x) * 4
-            red, green, blue = rgba[i:i + 3]
-            count += green > red + 40 and blue > green
-    return count / (64 * 48)
+            yield tuple(rgba[i:i + 3])
 
 
-lake_color = {}
+def is_water_pixel(rgb):
+    red, green, blue = rgb
+    return green > red + 40 and blue > green
+
+
+def matching_size(first, second):
+    require(first[:2] == second[:2], f"Camera pair has different dimensions: {first[:2]} vs {second[:2]}")
+    return first[:2]
+
+
+def lake_center(image):
+    w, h, rgba = image
+    return list(crop(w, rgba, w // 2 - 32, h // 2 - 24, w // 2 + 32, h // 2 + 24))
+
+
+views = {}
+overlay_views = {"river-overlay-off", "river-direction", "lake-oblique", "before-replacement", "dry-replacement"}
 for name in shot_names:
-    width, height, rgba = pixels(artifact(name, "png"))
-    if name in ("before-replacement", "dry-replacement"):
-        lake_color[name] = lake_color_fraction(width, height, rgba)
+    image = pixels(artifact(name, "png"))
+    if name in overlay_views:
+        views[name] = image
+
+river_off = views["river-overlay-off"]
+river_on = views["river-direction"]
+w, h = matching_size(river_off, river_on)
+# The fixture's river runs through the center of this view, away from the legend and toolbar.
+river_bounds = (w // 4, h // 3, 3 * w // 4, 3 * h // 5)
+arrow_pixels = sum(
+    is_water_pixel(off) and on[0] >= off[0] + 45 and on[0] < on[1] <= on[2] <= on[0] + 35
+    for off, on in zip(crop(w, river_off[2], *river_bounds), crop(w, river_on[2], *river_bounds))
+)
 require(
-    lake_color["before-replacement"] > 0.9 and lake_color["dry-replacement"] < 0.1,
-    f"Lake pixels did not clear after replacement: {lake_color}",
+    arrow_pixels >= max(1, w * h // 16000),
+    f"Downstream arrows did not appear over the river when enabled: {arrow_pixels} pixels",
+)
+
+lake_off = views["lake-oblique"]
+lake_on = views["before-replacement"]
+lake_dry = views["dry-replacement"]
+matching_size(lake_off, lake_on)
+matching_size(lake_on, lake_dry)
+off, on, dry = map(lake_center, (lake_off, lake_on, lake_dry))
+tinted = sum(
+    is_water_pixel(a) and is_water_pixel(b) and b[1] >= a[1] + 20 and b[2] >= a[2] + 20
+    for a, b in zip(off, on)
+) / len(on)
+require(tinted > 0.9, f"Water Bodies tint did not appear over the lake when enabled: {tinted:.1%}")
+wet_fraction = sum(map(is_water_pixel, on)) / len(on)
+dry_fraction = sum(map(is_water_pixel, dry)) / len(dry)
+require(
+    wet_fraction > 0.9 and dry_fraction < 0.1,
+    f"Lake pixels did not clear after replacement: {wet_fraction:.1%} before, {dry_fraction:.1%} after",
 )
 PY
 }

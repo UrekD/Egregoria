@@ -274,7 +274,6 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
                 draw.clear_persistent();
                 cache.tiles.clear();
                 cache.mode = mode;
-                cache.changes = None;
             }
             water_bodies::draw(&uiworld.camera().camera, &mut draw);
             return;
@@ -612,6 +611,40 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
 mod tests {
     use super::*;
     use geom::{vec2, Vec2};
+
+    #[test]
+    fn water_w4_overlay_toggles_keep_the_original_subscription() {
+        use geom::{Camera, Vec3};
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        reset_world_cache();
+        let sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let mut ui = UiWorld::with_defaults();
+        ui.insert(crate::rendering::OrbitCamera::from_camera(Camera::new(
+            Vec3::ZERO,
+            800.0,
+            600.0,
+        )));
+        *ui.write::<OverlayMode>() = OverlayMode::Power;
+        draw(&sim, &ui);
+        let mut original = CACHE.with_borrow(|cache| cache.changes.clone().unwrap());
+        for _ in 0..3 {
+            *ui.write::<OverlayMode>() = OverlayMode::WaterBodies;
+            draw(&sim, &ui);
+            sim.map().subscribers.dispatch_clear();
+            *ui.write::<OverlayMode>() = OverlayMode::Power;
+            draw(&sim, &ui);
+            assert!(
+                !original.take_cleared(),
+                "the original subscriber was never drained"
+            );
+        }
+        water_bodies::prepare(&sim.map(), 30);
+        assert!(!water_bodies::world_cache_is_clear());
+        reset_world_cache();
+        assert!(world_cache_is_clear());
+    }
 
     #[test]
     fn u3_placement_overlay_and_manual_restore() {

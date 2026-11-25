@@ -1,5 +1,6 @@
 [
   {"LoadSlot": "water_acceptance"},
+  {"SetOverlay": "Off"},
   {"Camera": {"x": 840, "y": 1024, "z": 0, "yaw": 0, "pitch": 1.56, "dist": 2070}},
   {"WaitFrames": 4},
   {"Screenshot": "p6-water-top-down"},
@@ -9,8 +10,10 @@
   {"Camera": {"x": 1048, "y": 1496, "z": 0, "yaw": -0.91, "pitch": 0.96, "dist": 570}},
   {"WaitFrames": 2},
   {"Screenshot": "p6-water-lake-oblique"},
-  {"SetOverlay": "WaterBodies"},
   {"Camera": {"x": 1024, "y": 810, "z": 0, "yaw": 0, "pitch": 1.55, "dist": 1300}},
+  {"WaitFrames": 3},
+  {"Screenshot": "p6-water-river-overlay-off"},
+  {"SetOverlay": "WaterBodies"},
   {"WaitFrames": 3},
   {"Screenshot": "p6-water-river-direction"},
   {"Commands": [{"ZonePaint": {
@@ -19,7 +22,7 @@
     "density": "Low"
   }}]},
   {"Assert": "NoRejections"},
-  {"DumpState": "p6-water-mixed-stamp"},
+  {"DumpState": {"name": "p6-water-mixed-stamp", "include_map_hash": true}},
   {"SelectTool": "zoning"},
   {"Camera": {"x": 1024, "y": 725, "z": 0, "yaw": -0.91, "pitch": 1.24, "dist": 350}},
   {"Pointer": {"action": "Move", "world_pos": [1000, 712, 0]}},
@@ -30,14 +33,14 @@
     "kind": "Residential",
     "density": "Low"
   }}]},
-  {"DumpState": "p6-water-wet-stamp"},
+  {"DumpState": {"name": "p6-water-wet-stamp", "include_map_hash": true}},
   {"SelectTool": "hand"},
   {"Commands": [{"EditWater": {"FillLake": {
     "basin": [4905545895254163456, 4907797695067848704, 4907797695068110848, 4905545895254425600],
     "level_dm": 0,
     "depth_m": 4
   }}}]},
-  {"DumpState": {"name": "p6-water-protected-footprint", "water_samples": [[608, 512]]}},
+  {"DumpState": {"name": "p6-water-protected-footprint", "water_samples": [[608, 512]], "include_map_hash": true}},
   {"Camera": {"x": 608, "y": 512, "z": 0, "yaw": -0.91, "pitch": 0.96, "dist": 330}},
   {"WaitFrames": 2},
   {"Screenshot": "p6-water-protected-footprint"},
