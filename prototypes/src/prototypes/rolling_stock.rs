@@ -4,7 +4,7 @@ use std::ops::Deref;
 
 use super::*;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct RollingStockPrototype {
     pub base: VehiclePrototype,
     pub id: RollingStockID,

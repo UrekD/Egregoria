@@ -34,7 +34,7 @@ impl<'lua> FromLua<'lua> for WarehousePolicy {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct WarehouseSpec {
     pub capacity_units: u32,
     pub accepted_items: Vec<ItemID>,
@@ -60,7 +60,7 @@ impl<'lua> FromLua<'lua> for WarehouseSpec {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct GoodsCompanyPrototype {
     pub base: BuildingPrototype,
     pub id: GoodsCompanyID,

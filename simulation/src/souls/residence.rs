@@ -2,7 +2,8 @@ use crate::economy::balance::{periodic_tick, RETAIL_ACCESS_RADIUS_M};
 use crate::economy::Budget;
 use crate::map::{BuildingID, BuildingKind, Density, Map};
 use crate::map_dynamic::{
-    ActiveRetailIndex, BuildingInfos, CoverageGrid, ElectricityFlow, EnvGrid, UtilityFlow,
+    connected_site_network, ActiveRetailIndex, BuildingInfos, CoverageGrid, ElectricityFlow,
+    EnvGrid, NetworkLoad, SiteUtilityReader, UtilityFlow, UtilityTotals,
 };
 use crate::souls::happiness::Happiness;
 use crate::souls::{development, lifecycle};
@@ -394,7 +395,6 @@ impl Requirement {
 struct Progression<'a> {
     map: &'a Map,
     electricity: &'a ElectricityFlow,
-    utilities: &'a UtilityFlow,
     coverage: &'a CoverageGrid,
     environment: &'a EnvGrid,
 }
@@ -449,6 +449,7 @@ impl Progression<'_> {
         employed: usize,
         capacity: usize,
         retail_access: bool,
+        pipes: UtilityTotals,
     ) -> impl Iterator<Item = Requirement> {
         let id = building.id;
         let amenities = amenity_requirements(
@@ -461,8 +462,8 @@ impl Progression<'_> {
         );
         [
             Requirement::available("Power", has_power(self.map, self.electricity, id)),
-            Requirement::available("Water", self.utilities.has_water(id)),
-            Requirement::available("Sewage", self.utilities.has_sewage(id)),
+            Requirement::available("Water", pipes.has_water()),
+            Requirement::available("Sewage", pipes.has_site_sewage()),
             Requirement::percent("Occupancy", occupied, capacity, 80),
             Requirement::percent("Employment", employed, occupied, 70),
             Requirement::available("Retail access", retail_access),
@@ -526,10 +527,12 @@ pub(crate) fn requirements_with_stores(
         || ActiveRetailIndex::build(&map, &infos, sim.world()).has_access(door),
         |stores| has_retail_access(stores, door),
     );
+    let pipes = connected_site_network(&map, building)
+        .and_then(|network| SiteUtilityReader::new(sim).network_pipes(network))
+        .unwrap_or_default();
     Progression {
         map: &map,
         electricity: &sim.read::<ElectricityFlow>(),
-        utilities: &sim.read::<UtilityFlow>(),
         coverage: &sim.read::<CoverageGrid>(),
         environment: &sim.read::<EnvGrid>(),
     }
@@ -540,6 +543,7 @@ pub(crate) fn requirements_with_stores(
         employed_residents(sim, &info.residents),
         residence.capacity as usize,
         retail_access,
+        pipes,
     )
     .collect()
 }
@@ -571,6 +575,7 @@ pub fn residence_update(sim: &mut Simulation) {
         let map = sim.map();
         let infos = sim.read::<BuildingInfos>();
         let utilities = sim.read::<UtilityFlow>();
+        let mut network_pipes = BTreeMap::new();
         let mut residences = sim.write::<Residences>();
         let Residences {
             entries, checks, ..
@@ -603,7 +608,23 @@ pub fn residence_update(sim: &mut Simulation) {
             } else {
                 0
             };
-            let utilities_ok = utilities.has_water(id) && utilities.has_sewage(id);
+            let pipes = connected_site_network(&map, building)
+                .map(|network| {
+                    *network_pipes.entry(network).or_insert_with(|| {
+                        NetworkLoad::live_with_pipe_sample(
+                            &map,
+                            entries,
+                            &infos,
+                            sim.world(),
+                            &utilities,
+                            network,
+                        )
+                        .and_then(|(load, sampled)| sampled.then_some(load.pipes))
+                        .unwrap_or_default()
+                    })
+                })
+                .unwrap_or_default();
+            let utilities_ok = pipes.has_site_sewage();
             checks.outage_streak = if utilities_ok {
                 0
             } else {
@@ -616,7 +637,7 @@ pub fn residence_update(sim: &mut Simulation) {
                 checks.abandoned_hours = Some(0);
                 abandon.push((id, building.door_pos));
             } else if let Some(next) = next_prototype(residence).filter(|_| utilities_ok) {
-                candidates.push((id, next));
+                candidates.push((id, next, pipes));
             } else {
                 checks.upgrade_streak = 0;
             }
@@ -632,11 +653,10 @@ pub fn residence_update(sim: &mut Simulation) {
         let progression = Progression {
             map: &map,
             electricity: &sim.read::<ElectricityFlow>(),
-            utilities: &sim.read::<UtilityFlow>(),
             coverage: &sim.read::<CoverageGrid>(),
             environment: &sim.read::<EnvGrid>(),
         };
-        for (id, next) in candidates {
+        for (id, next, pipes) in candidates {
             let Some((building, info)) = map.get(id).zip(infos.get(id)) else {
                 continue;
             };
@@ -648,6 +668,7 @@ pub fn residence_update(sim: &mut Simulation) {
                     employed_residents(sim, &info.residents),
                     residences.by_building[&id].capacity as usize,
                     retail.has_access(building.door_pos.xy()),
+                    pipes,
                 )
                 .all(|requirement| requirement.met);
             let checks = residences.checks.entry(id).or_default();

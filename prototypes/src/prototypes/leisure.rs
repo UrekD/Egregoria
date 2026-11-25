@@ -5,7 +5,7 @@ use std::ops::Deref;
 use super::*;
 
 /// LeisurePrototype is a building where people can go to relax
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct LeisurePrototype {
     pub base: BuildingPrototype,
     pub id: LeisurePrototypeID,

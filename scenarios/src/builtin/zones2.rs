@@ -3,7 +3,7 @@ use crate::builders::{
     place_service_sites, CommandSink, UTILITY_SITES,
 };
 use crate::{Scenario, ScenarioCtx};
-use geom::{vec2, vec3, Vec2};
+use geom::{vec2, vec3, Vec2, Vec3};
 use prototypes::{
     try_prototype, ItemID, ResidencePrototypeID, Size2D, Tick, TICKS_PER_DAY, TICKS_PER_HOUR,
 };
@@ -15,7 +15,8 @@ use simulation::map::Density::{self, High, Low, Medium};
 use simulation::map::ZoneKind::{self, Commercial, Industrial, MixedUse, Office, Residential};
 use simulation::map::{
     BuildingID, BuildingKind, GrowableBusinessState, GrowableSiteState, LaneKind,
-    LanePatternBuilder, PathKind, ProjectFilter, ProjectKind, RoadID, TerraformKind, ZoneCell,
+    LanePatternBuilder, Map, PathKind, Pathfinder, ProjectFilter, ProjectKind, RoadID,
+    TerraformKind, TraverseDirection, ZoneCell,
 };
 use simulation::map_dynamic::{BuildingInfos, EnvGrid, Itinerary};
 use simulation::souls::{
@@ -69,6 +70,7 @@ const ORIGIN: Vec2 = vec2(640.0, 640.0);
 const BLOCK: f32 = 120.0;
 const BOOTSTRAP_END: u64 = TICKS_PER_DAY;
 const COMMISSION_END: u64 = 5 * TICKS_PER_DAY;
+const STAFFED_TEARDOWN_STEP: u64 = 672_004;
 const OBSERVATION_DAYS: u64 = 2;
 const PERF_POPULATION: usize = 10_000;
 
@@ -472,14 +474,20 @@ fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
     };
     grow_city(ctx, true, Some(replay_root))?;
     check_commissioning(ctx, true)?;
-    check_retail_freight_access(&ctx.sim)?;
+    let mixed_freight = mean_retail_freight_distance(&ctx.sim)?;
     ctx.sample("commissioned");
     let mixed = observe_days(ctx)?;
 
     let mut control = ScenarioCtx::new(OPTIONS);
     grow_city(&mut control, false, None)?;
     check_commissioning(&control, false)?;
-    check_retail_freight_access(&control.sim)?;
+    let pure_freight = mean_retail_freight_distance(&control.sim)?;
+    // Average per-direction distance may differ by at most one fixture block.
+    if (mixed_freight - pure_freight).abs() > BLOCK {
+        return Err(format!(
+            "mean terminal road distance differs by over {BLOCK} m (mixed {mixed_freight:.1} m, pure {pure_freight:.1} m)"
+        ));
+    }
     let pure = observe_days(&mut control)?;
     ctx.samples
         .extend(control.samples.into_iter().map(|mut sample| {
@@ -494,7 +502,7 @@ fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
     match_result
 }
 
-fn check_retail_freight_access(sim: &Simulation) -> Result<(), String> {
+fn mean_retail_freight_distance(sim: &Simulation) -> Result<f32, String> {
     use prototypes::CompanyKind;
     let map = sim.map();
     let terminal = map
@@ -503,6 +511,7 @@ fn check_retail_freight_access(sim: &Simulation) -> Result<(), String> {
         .find(|site| matches!(site.kind, BuildingKind::RailFreightStation(_)))
         .ok_or("the district has no rail freight terminal")?;
     let mut count = 0;
+    let mut distance = 0.0;
     for company in sim.world().companies.values().filter(|company| {
         company.comp.proto.prototype().kind == CompanyKind::Store
             && try_prototype(prototypes::GrowableCompanyID::from(company.comp.proto))
@@ -512,31 +521,51 @@ fn check_retail_freight_access(sim: &Simulation) -> Result<(), String> {
             .get(company.comp.building)
             .ok_or("retailer has no building")?;
         for (source, destination) in [(terminal, store), (store, terminal)] {
-            if Itinerary::route(
-                Tick(sim.get_tick()),
-                source.door_pos,
-                destination.door_pos,
-                &map,
-                PathKind::Vehicle,
-            )
-            .is_none()
-            {
-                return Err(format!(
-                    "retailer {:?} has no round-trip terminal route",
-                    store.id
-                ));
-            }
+            distance += freight_route_distance(&map, source.door_pos, destination.door_pos)
+                .ok_or_else(|| {
+                    format!("retailer {:?} has no round-trip terminal route", store.id)
+                })?;
         }
         count += 1;
     }
-    println!("verified terminal road access for {count} zoned retailers");
-    Ok(())
+    if count == 0 {
+        return Err("the district has no zoned retailers to compare".into());
+    }
+    let mean = distance / (2 * count) as f32;
+    println!("mean terminal road distance for {count} zoned retailers: {mean:.1} m per direction");
+    Ok(mean)
+}
+
+fn freight_route_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
+    let itinerary = Itinerary::route(Tick(0), start, end, map, PathKind::Vehicle)?;
+    let route = itinerary.get_route()?;
+    let mut length = 0.0;
+    let mut position = start;
+    for &point in itinerary.local_path().iter().rev() {
+        length += position.distance(point);
+        position = point;
+    }
+    if let Some((last, intermediate)) = route.reversed_route.split_first() {
+        for traversal in intermediate.iter().rev() {
+            let points = traversal.raw_points(map)?;
+            let (first, last) = match traversal.dir {
+                TraverseDirection::Forward => (points.first(), points.last()),
+                TraverseDirection::Backward => (points.last(), points.first()),
+            };
+            length += position.distance(first) + points.length();
+            position = last;
+        }
+        let points = PathKind::Vehicle.local_route(map, last.destination_lane(), position, end)?;
+        length += position.distance(points.first()) + points.length() + points.last().distance(end);
+    }
+    Some(length)
 }
 
 fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(), String> {
     // Branch from the commission paint wave while new shops are still hiring
     // and the first storefronts are taking baskets and deliveries.
-    let (roads, affected) = find_teardown_frontage(live)?;
+    advance_to(live, STAFFED_TEARDOWN_STEP)?;
+    let (roads, affected) = staffed_teardown_frontage(&live.sim)?;
     let (endpoints, parcels) = {
         let map = live.sim.map();
         let endpoints: Vec<_> = roads
@@ -652,7 +681,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     }
     let abandoned = resumed_checkpoint(live, &resumed, root, "zones2_staffed_abandoned")?;
 
-    let mut repairs: Vec<_> = parcels
+    let erasures: Vec<_> = parcels
         .iter()
         .map(|&(_, origin, _)| WorldCommand::ZonePaint {
             area: origin.shape,
@@ -660,6 +689,39 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
             density: Low,
         })
         .collect();
+    let id = SlotId::new(abandoned.label).map_err(|err| err.to_string())?;
+    let reload_abandoned = || {
+        Simulation::load_from_slot(root, &id)
+            .map(ScenarioCtx::from_sim)
+            .map_err(|err| err.to_string())
+    };
+    let mut disconnected = reload_abandoned()?;
+    for run in [&mut disconnected, &mut resumed] {
+        run_teardown_batch(run, &erasures, 13 * TICKS_PER_HOUR)?;
+        let map = run.sim.map();
+        for &(id, origin, _) in &parcels {
+            if map.get(id).is_some()
+                || map
+                    .lots()
+                    .values()
+                    .any(|lot| lot.shape.center().distance2(origin.shape.center()) < 0.01)
+            {
+                return Err(format!(
+                    "collapse without frontage retained the shell or restored a parcel for {id:?}"
+                ));
+            }
+        }
+    }
+    let collapsed_disconnected = resumed_checkpoint(
+        &disconnected,
+        &resumed,
+        root,
+        "zones2_staffed_collapsed_disconnected",
+    )?;
+    verify_decoded(root, &[collapsed_disconnected])?;
+    resumed = reload_abandoned()?;
+
+    let mut repairs = erasures;
     {
         let map = live.sim.map();
         repairs.extend(endpoints.into_iter().map(|pair| {
@@ -782,89 +844,80 @@ fn run_teardown_batch(
 
 type StaffedFrontage = (BTreeSet<RoadID>, Vec<(BuildingID, CompanyID)>);
 
-fn find_teardown_frontage(ctx: &mut ScenarioCtx) -> Result<StaffedFrontage, String> {
-    let job = ItemID::new("job-opening");
-    let mut hire_steps = 0;
-    let mut freight_steps_with_hires = 0;
-    while elapsed(&ctx.sim) < COMMISSION_END {
-        let sim = &ctx.sim;
-        let hires: BTreeSet<_> = sim
-            .world()
-            .humans
-            .values()
-            .filter_map(|human| {
-                human
-                    .bought
-                    .0
-                    .get(&job)?
-                    .first()
-                    .map(|trade| trade.seller.0)
-            })
-            .collect();
-        if !hires.is_empty() && (sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS != 0 {
-            let map = sim.map();
-            let mut sites = Vec::new();
-            for seller in mixed_sellers(sim) {
-                let SoulID::GoodsCompany(company) = seller else {
-                    continue;
-                };
-                let id = sim.world().companies[company].comp.building;
-                if let Some(road) = map.get(id).and_then(|site| site.connected_road) {
-                    sites.push((id, company, road));
-                }
-            }
-            if let Some(job_road) = sites.iter().find_map(|&(_, company, road)| {
-                hires
-                    .contains(&SoulID::GoodsCompany(company))
-                    .then_some(road)
-            }) {
-                hire_steps += 1;
-                let cargo = sim.read::<CargoBook>();
-                let freight_road = sites
-                    .iter()
-                    .filter(|&&(id, _, _)| {
-                        cargo.stock_for(id).values().any(|stock| stock.incoming > 0)
-                    })
-                    .min_by_key(|&&(_, _, road)| (road != job_road, road))
-                    .map(|&(_, _, road)| road);
-                if let Some(freight_road) = freight_road {
-                    freight_steps_with_hires += 1;
-                    let baskets: BTreeSet<_> = sim
-                        .world()
-                        .humans
-                        .values()
-                        .filter_map(|human| human.household.basket_seller())
-                        .collect();
-                    let basket_road = sites
-                        .iter()
-                        .filter(|&&(_, company, _)| {
-                            baskets.contains(&SoulID::GoodsCompany(company))
-                        })
-                        .min_by_key(|&&(_, _, road)| {
-                            (road != job_road && road != freight_road, road)
-                        })
-                        .map(|&(_, _, road)| road);
-                    if let Some(basket_road) = basket_road {
-                        let roads = BTreeSet::from([job_road, freight_road, basket_road]);
-                        let affected: Vec<_> = sites
-                            .into_iter()
-                            .filter(|&(_, _, road)| roads.contains(&road))
-                            .map(|(id, company, _)| (id, company))
-                            .collect();
-                        if affected.iter().any(|&(id, _)| {
-                            sim.growable_summary(id)
-                                .is_some_and(|site| site.filled_jobs > 1 && site.occupants > 0)
-                        }) {
-                            println!("staffed frontage cut across {} links at elapsed step {} with hire, basket and freight claims", roads.len(), elapsed(sim));
-                            return Ok((roads, affected));
-                        }
-                    }
-                }
-            }
-        }
-        ctx.run_ticks(1);
+fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String> {
+    let failure =
+        |claim| format!("staffed teardown at step {STAFFED_TEARDOWN_STEP} is missing {claim}");
+    if (sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS == 0 {
+        return Err(failure("a tick between growth passes"));
     }
-    Err(format!("no staffed Mixed Use frontage cut with hire, basket and freight claims ({hire_steps} steps with Mixed Use hires, {freight_steps_with_hires} also with freight)"))
+    let job = ItemID::new("job-opening");
+    let hires: BTreeSet<_> = sim
+        .world()
+        .humans
+        .values()
+        .filter_map(|human| {
+            human
+                .bought
+                .0
+                .get(&job)?
+                .first()
+                .map(|trade| trade.seller.0)
+        })
+        .collect();
+    let map = sim.map();
+    let sites: Vec<_> = mixed_sellers(sim)
+        .filter_map(|seller| {
+            let SoulID::GoodsCompany(company) = seller else {
+                return None;
+            };
+            let id = sim.world().companies[company].comp.building;
+            Some((id, company, map.get(id)?.connected_road?))
+        })
+        .collect();
+    let job_road = sites
+        .iter()
+        .find_map(|&(_, company, road)| {
+            hires
+                .contains(&SoulID::GoodsCompany(company))
+                .then_some(road)
+        })
+        .ok_or_else(|| failure("a pending Mixed Use hire"))?;
+    let cargo = sim.read::<CargoBook>();
+    let freight_road = sites
+        .iter()
+        .filter(|&&(id, _, _)| cargo.stock_for(id).values().any(|stock| stock.incoming > 0))
+        .min_by_key(|&&(_, _, road)| (road != job_road, road))
+        .map(|&(_, _, road)| road)
+        .ok_or_else(|| failure("an incoming Mixed Use freight claim"))?;
+    let baskets: BTreeSet<_> = sim
+        .world()
+        .humans
+        .values()
+        .filter_map(|human| human.household.basket_seller())
+        .collect();
+    let basket_road = sites
+        .iter()
+        .filter(|&&(_, company, _)| baskets.contains(&SoulID::GoodsCompany(company)))
+        .min_by_key(|&&(_, _, road)| (road != job_road && road != freight_road, road))
+        .map(|&(_, _, road)| road)
+        .ok_or_else(|| failure("a pending Mixed Use basket"))?;
+    let roads = BTreeSet::from([job_road, freight_road, basket_road]);
+    if roads.len() != 1 {
+        return Err(failure("hire, freight and basket claims on the same road"));
+    }
+    let affected: Vec<_> = sites
+        .into_iter()
+        .filter(|&(_, _, road)| roads.contains(&road))
+        .map(|(id, company, _)| (id, company))
+        .collect();
+    if !affected.iter().any(|&(id, _)| {
+        sim.growable_summary(id)
+            .is_some_and(|site| site.filled_jobs > 1 && site.occupants > 0)
+    }) {
+        return Err(failure("an occupied and staffed Mixed Use site"));
+    }
+    println!("staffed frontage cut at elapsed step {STAFFED_TEARDOWN_STEP} with hire, basket and freight claims");
+    Ok((roads, affected))
 }
 
 struct ReplayCheckpoint {

@@ -434,9 +434,9 @@ fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
     };
     let before = sim.read::<Replay>().command_count();
     sim.apply_commands([&invalid, &valid]);
-    // TILES replay retains complete admitted batches, including a command
-    // whose payload is well-formed but rejected by the zoning rules.
-    assert_eq!(sim.read::<Replay>().command_count(), before + 2);
+    // The accepted stamp keeps its original outcome index while the replay omits
+    // the rejected stamp.
+    assert_eq!(sim.read::<Replay>().command_count(), before + 1);
     assert_eq!(
         sim.read::<crate::world_command::CommandOutcomes>().accepted,
         [1]
@@ -650,4 +650,65 @@ fn zones2_save_and_replay_reject_a_different_prototype_registry() {
         Err(SaveLoadError::PrototypeRegistry)
     ));
     assert!(Simulation::try_from_replay(replay).is_err());
+}
+
+#[test]
+fn zones2_save_and_replay_check_inherited_prototype_fields() {
+    if !in_prototype_fixture_process(
+        module_path!(),
+        "zones2_save_and_replay_check_inherited_prototype_fields",
+    ) {
+        return;
+    }
+
+    let load = |capacity, inherited| {
+        let fields = if inherited {
+            format!("setmetatable(home, {{ __index = function(_, key) if key == 'capacity' then return {capacity} end end }})")
+        } else {
+            format!("home.capacity = {capacity}")
+        };
+        prototypes::test_prototypes(&format!(
+            r#"
+            package.path = "../base_mod/?.lua"
+            require("data")
+            for _, home in ipairs(data) do
+                if home.name == "residence-low-l1" then
+                    home.capacity = nil
+                    {fields}
+                end
+            end
+            "#,
+        ));
+        assert_eq!(
+            prototypes::ResidencePrototypeID::new("residence-low-l1")
+                .prototype()
+                .capacity,
+            capacity
+        );
+        prototypes::prototypes().fingerprint()
+    };
+
+    let original = load(2, true);
+    crate::init::register_simulation();
+    let sim = flat_city();
+    let root = SlotRoot::new();
+    let id = SlotId::new("inherited_city").unwrap();
+    sim.save_to_slot(&root.0, &id, SnapshotRevision::new(1))
+        .unwrap();
+    let replay = Simulation::load_replay_from_slot(&root.0, &id).unwrap();
+
+    assert_ne!(original, load(3, true), "inherited capacity changed");
+    assert!(matches!(
+        Simulation::load_from_slot(&root.0, &id),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+    assert!(matches!(
+        Simulation::load_replay_from_slot(&root.0, &id),
+        Err(SaveLoadError::PrototypeRegistry)
+    ));
+    assert!(Simulation::try_from_replay(replay).is_err());
+
+    assert_eq!(original, load(2, false), "resolved capacity is identical");
+    Simulation::load_from_slot(&root.0, &id).unwrap();
+    Simulation::load_replay_from_slot(&root.0, &id).unwrap();
 }

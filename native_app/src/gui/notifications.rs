@@ -700,6 +700,7 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         (_, InvalidBuilding) => "Building cannot be placed here",
         (_, InvalidZone) => "Zoning area is outside the map or too large",
         (_, UnsupportedDensity { .. }) => "Mixed Use requires Medium or High density",
+        (_, MixedUseUnavailable) => "Mixed Use is unavailable in this city",
         (_, UnsupportedTax(_)) => "Mixed Use has no separate tax rate",
         (_, InvalidTaxRate) => "Tax rate is outside the allowed range",
         (_, InvalidTerraform) => "Terrain edit is outside the allowed range",

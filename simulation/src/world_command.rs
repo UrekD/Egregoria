@@ -354,6 +354,7 @@ pub enum Rejection {
     TileNotAdjacent,
     InvalidCommandEncoding,
     BuildingOverlap,
+    MixedUseUnavailable,
 }
 
 impl From<LandDenial> for Rejection {
@@ -1020,7 +1021,7 @@ impl WorldCommand {
         sim: &mut Simulation,
         construction: BudgetCategory,
         water: &mut PrepareBudget,
-    ) {
+    ) -> Option<Rejection> {
         if let EditWater(edit) = self {
             let outcome = if water.reject_surface {
                 Err(WaterEditError::Limit)
@@ -1028,13 +1029,14 @@ impl WorldCommand {
                 sim.map_mut()
                     .apply_water_edit(edit, &mut sim.zone_grid_mut(), &mut water.remaining)
             };
-            if let Err(error) = &outcome {
-                self.reject(sim, Rejection::water_error(error));
+            let rejection = outcome.as_ref().err().map(Rejection::water_error);
+            if let Some(reason) = rejection {
+                self.reject(sim, reason);
             }
             let mut outcomes = sim.write::<CommandOutcomes>();
             let index = outcomes.command_ranges.len();
             outcomes.water_edits.insert(index, outcome);
-            return;
+            return rejection;
         }
 
         if let Terraform {
@@ -1048,7 +1050,7 @@ impl WorldCommand {
         {
             if water.reject_surface {
                 self.reject(sim, Rejection::WaterWorkLimit);
-                return;
+                return Some(Rejection::WaterWorkLimit);
             }
             let tick = sim.read::<GameTime>().tick;
             let mut map = sim.map_mut();
@@ -1063,10 +1065,11 @@ impl WorldCommand {
                             &mut water.remaining,
                         )
                     });
-                if let Err(error) = result {
-                    self.reject(sim, Self::terraform_error(error));
+                let rejection = result.err().map(Self::terraform_error);
+                if let Some(reason) = rejection {
+                    self.reject(sim, reason);
                 }
-                return;
+                return rejection;
             }
         }
 
@@ -1088,7 +1091,8 @@ impl WorldCommand {
                 Ok(())
             })
         };
-        if let Err(reason) = result {
+        let rejection = result.err();
+        if let Some(reason) = rejection {
             self.reject(sim, reason);
             if matches!(self, BuyTile { .. }) {
                 let mut outcomes = sim.write::<CommandOutcomes>();
@@ -1096,6 +1100,7 @@ impl WorldCommand {
                 outcomes.tile_purchases.insert(index, Err(reason));
             }
         }
+        rejection
     }
 
     fn terraform_error(error: WaterEditError) -> Rejection {
@@ -1213,9 +1218,20 @@ impl WorldCommand {
             MapLoadTestField { pos, spacing, .. } => pos.is_finite() && spacing.is_finite(),
             UpdateZone { zone, .. } => finite_zone(zone),
             SetGameTime(time) => time.timestamp.is_finite(),
-            ZonePaint { area, .. } => {
-                let finite = area.corners.iter().all(|point| point.is_finite());
-                return (!finite).then_some(Ok(Rejection::InvalidZone));
+            ZonePaint {
+                area,
+                kind,
+                density,
+            } => {
+                let result = ZoneGrid::paint_replacement(*kind, *density)
+                    .and_then(|_| ZoneGrid::validate_paint_area(area));
+                return result.err().map(|error| Ok(error.into()));
+            }
+            SetTaxRate {
+                zone,
+                rate_permille,
+            } => {
+                return Self::validate_tax_rate(*zone, *rate_permille).err().map(Ok);
             }
             AddTrain { dist, .. } => dist.is_finite(),
             SpawnTrain { dist, wagons, .. } => dist.is_finite() && wagons.len() <= MAX_WAGONS,
@@ -1236,7 +1252,6 @@ impl WorldCommand {
             | MapBuildHouse(_)
             | SpawnRandomCars { .. }
             | MapLoadParis
-            | SetTaxRate { .. }
             | TransitRemoveStop { .. }
             | TransitRemoveLine { .. }
             | TransitSetVehicles { .. }
@@ -1373,6 +1388,16 @@ impl WorldCommand {
             EditWater(_) => "EditWater",
             BuyTile { .. } => "BuyTile",
         }
+    }
+
+    fn validate_tax_rate(zone: ZoneKind, rate_permille: u16) -> Result<(), Rejection> {
+        if !zone.is_taxable() {
+            return Err(Rejection::UnsupportedTax(zone));
+        }
+        if rate_permille > crate::economy::MAX_TAX_RATE_PERMILLE {
+            return Err(Rejection::InvalidTaxRate);
+        }
+        Ok(())
     }
 
     fn validate_progression(&self, sim: &Simulation) -> Result<(), Rejection> {
@@ -1584,12 +1609,7 @@ impl WorldCommand {
                 zone,
                 rate_permille,
             } => {
-                if !zone.is_taxable() {
-                    return Err(Rejection::UnsupportedTax(*zone));
-                }
-                if *rate_permille > crate::economy::MAX_TAX_RATE_PERMILLE {
-                    return Err(Rejection::InvalidTaxRate);
-                }
+                Self::validate_tax_rate(*zone, *rate_permille)?;
                 true
             }
             Init(_)
@@ -1717,6 +1737,16 @@ impl WorldCommand {
         sim: &Simulation,
         budget: &mut PrepareBudget,
     ) -> Result<PreparedAction<'a>, Rejection> {
+        if let ZonePaint {
+            kind: Some(ZoneKind::MixedUse),
+            density,
+            ..
+        } = self
+        {
+            if prototypes::prototypes().mixed_use_pair(*density).is_none() {
+                return Err(Rejection::MixedUseUnavailable);
+            }
+        }
         self.validate_progression(sim)?;
         match self {
             Init(_) => return Err(Rejection::UnexpectedInit),

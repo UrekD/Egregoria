@@ -1,7 +1,7 @@
 use crate::validation::ValidationError;
 use crate::{validation, Prototypes, PROTOTYPES};
 use common::error::MultiError;
-use mlua::{Lua, Table, Value};
+use mlua::{Lua, Table};
 use std::io;
 use std::sync::atomic::Ordering;
 use thiserror::Error;
@@ -56,7 +56,9 @@ unsafe fn load_prototypes_str(l: Lua, main: &str) -> Result<(), PrototypeLoadErr
 
     validation::validate(&p)?;
 
-    p.fingerprint = prototype_value_hash(Value::Table(data_table), 0)?;
+    p.fingerprint = p
+        .compute_fingerprint()
+        .map_err(PrototypeLoadError::Fingerprint)?;
     p.compute_orderings();
     p.print_stats();
 
@@ -66,41 +68,18 @@ unsafe fn load_prototypes_str(l: Lua, main: &str) -> Result<(), PrototypeLoadErr
 }
 
 impl Prototypes {
-    /// Identifies the Lua declarations used to build this registry.
+    /// Identifies the effective prototype data in this registry.
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }
-}
-
-fn prototype_value_hash(value: Value<'_>, depth: u32) -> mlua::Result<u64> {
-    use common::hash_u64;
-    Ok(match value {
-        Value::Boolean(value) => hash_u64((1u8, value)),
-        Value::Integer(value) => hash_u64((2u8, value)),
-        Value::Number(value) => hash_u64((3u8, value.to_bits())),
-        Value::String(value) => hash_u64((4u8, value.as_bytes())),
-        Value::Table(table) if depth < 32 => {
-            let mut entries = Vec::with_capacity(table.raw_len());
-            for pair in table.pairs::<Value, Value>() {
-                let (key, value) = pair?;
-                entries.push((
-                    prototype_value_hash(key, depth + 1)?,
-                    prototype_value_hash(value, depth + 1)?,
-                ));
-            }
-            entries.sort_unstable();
-            hash_u64((5u8, entries))
-        }
-        // Functions (such as data:extend) and other opaque Lua values are not
-        // prototype fields. Keep addresses and table traversal order out of the fingerprint.
-        other => hash_u64((6u8, other.type_name())),
-    })
 }
 
 #[derive(Error, Debug)]
 pub enum PrototypeLoadError {
     #[error("loading data.lua: {0}")]
     LoadingDataLua(#[from] io::Error),
+    #[error("encoding prototype fingerprint: {0}")]
+    Fingerprint(io::Error),
     #[error("lua error: {0}")]
     LuaError(#[from] mlua::Error),
     #[error("lua error for {0} {1}: {2}")]

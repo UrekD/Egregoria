@@ -20,6 +20,8 @@ const VALUE_OF_TIME_PER_GAME_HOUR: Money = Money::new_bucks(20);
 // Ties go to the legacy mode. Leave room for rounding in fractional tick costs.
 const COST_EPSILON: f64 = 0.01;
 
+type StopWalks<'a> = Vec<(f64, &'a TransitStop, ValidatedWalk)>;
+
 pub(super) struct TransitPaths<'a> {
     lines: BTreeMap<LineID, ServiceLine<'a>>,
     stop_lines: BTreeMap<StopID, Vec<(LineID, usize)>>,
@@ -124,26 +126,14 @@ impl<'a> TransitPaths<'a> {
     ) -> Option<(Vec<RoutingStep>, [ValidatedWalk; 2])> {
         let access = self.nearest(origin, &allows_line);
         let egress = self.nearest(destination, &allows_line);
-        if access.is_empty() || egress.is_empty() {
-            return None;
-        }
-        // A sidewalk detour can change which departure a passenger can catch.
-        // Route each shortlisted walk once, before ranking the stop pairs.
-        let route = |from, to| ValidatedWalk::route(now, from, to, map, walk_speed);
-        let access: Vec<_> = access
-            .into_iter()
-            .filter_map(|(_, stop)| {
-                let (ticks, path) = route(origin, stop.walk_pos)?;
-                Some((ticks, stop, path))
-            })
-            .collect();
-        let egress: Vec<_> = egress
-            .into_iter()
-            .filter_map(|(_, stop)| {
-                let (ticks, path) = route(stop.walk_pos, destination)?;
-                Some((ticks, stop, path))
-            })
-            .collect();
+        let (access, egress) = self.route_stop_walks(
+            access,
+            egress,
+            origin,
+            destination,
+            |from, to| ValidatedWalk::route(now, from, to, map, walk_speed),
+            &allows_line,
+        )?;
         let ride = self.best_ride(
             access.iter().map(|&(ticks, stop, _)| (ticks, stop)),
             egress.iter().map(|&(ticks, stop, _)| (ticks, stop)),
@@ -180,6 +170,50 @@ impl<'a> TransitPaths<'a> {
             RoutingStep::WalkTo(destination),
         ]);
         Some((steps, [access_path, egress_path]))
+    }
+
+    fn route_stop_walks(
+        &self,
+        mut access: Vec<(OrderedFloat<f32>, &'a TransitStop)>,
+        mut egress: Vec<(OrderedFloat<f32>, &'a TransitStop)>,
+        origin: Vec3,
+        destination: Vec3,
+        mut route: impl FnMut(Vec3, Vec3) -> Option<(f64, ValidatedWalk)>,
+        allows_line: &impl Fn(LineID) -> bool,
+    ) -> Option<(StopWalks<'a>, StopWalks<'a>)> {
+        // Check for a shared line first. Dynamic boarding times still need the
+        // real access walk because a detour can change the next departure.
+        let usable = |board: &TransitStop, alight: &TransitStop| {
+            board.id != alight.id
+                && self.stop_lines[&board.id].iter().any(|&(id, _)| {
+                    allows_line(id)
+                        && self.stop_lines[&alight.id]
+                            .iter()
+                            .any(|&(line, _)| line == id)
+                        && self.lines[&id].can_board()
+                })
+        };
+        access.retain(|&(_, board)| egress.iter().any(|&(_, alight)| usable(board, alight)));
+        if access.is_empty() {
+            return None;
+        }
+        egress.retain(|&(_, alight)| access.iter().any(|&(_, board)| usable(board, alight)));
+        // Route each remaining walk once before ranking the pairs.
+        let access: Vec<_> = access
+            .into_iter()
+            .filter_map(|(_, stop)| {
+                let (ticks, path) = route(origin, stop.walk_pos)?;
+                Some((ticks, stop, path))
+            })
+            .collect();
+        let egress: Vec<_> = egress
+            .into_iter()
+            .filter_map(|(_, stop)| {
+                let (ticks, path) = route(stop.walk_pos, destination)?;
+                Some((ticks, stop, path))
+            })
+            .collect();
+        Some((access, egress))
     }
 
     fn best_ride(
@@ -274,6 +308,11 @@ impl ServiceLine<'_> {
             ticks += self.dwell_ticks;
         }
         None
+    }
+
+    fn can_board(&self) -> bool {
+        self.departures.is_some()
+            || (self.half_headway - self.dwell_ticks).max(0.0) <= GIVE_UP_TICKS as f64
     }
 
     fn wait_ticks(&self, stop_index: usize, access_ticks: f64) -> Option<f64> {
@@ -771,6 +810,16 @@ mod tests {
                     .iter()
                     .map(|&stop| (0.0, &transit.stops[stop])),
                 |_| true,
+            )
+            .is_none());
+        assert!(index
+            .route_stop_walks(
+                index.nearest(origin, &|_| true),
+                index.nearest(destination, &|_| true),
+                origin,
+                destination,
+                |_, _| panic!("unconnected line shortlists must not route sidewalks"),
+                &|_| true,
             )
             .is_none());
         assert!(index.nearest(origin, &|id| id == second).is_empty());

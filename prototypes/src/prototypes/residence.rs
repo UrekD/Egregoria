@@ -52,7 +52,7 @@ impl<'lua> FromLua<'lua> for Density {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ResidencePrototype {
     pub base: BuildingPrototype,
     pub id: ResidencePrototypeID,

@@ -70,9 +70,9 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
     let business = active_business(building, &infos, sim.world());
     let load = effective_load(building, residences.by_building.get(&id), business);
     let power_flow = sim.read::<ElectricityFlow>();
-    let utilities = sim.read::<UtilityFlow>().status_for_site(
-        &map, &residences, &infos, sim.world(), &power_flow, id,
-    );
+    let utilities =
+        sim.read::<UtilityFlow>()
+            .status_for_site(&map, &residences, &infos, sim.world(), id);
     let power = site_power_status(&map, &power_flow, building);
     let mut blockers = Vec::new();
     if building.is_orphaned() {

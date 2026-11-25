@@ -6,7 +6,7 @@ use std::ops::Deref;
 use super::*;
 
 /// ColorsPrototype is the prototype to hold data about colors
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct ColorsPrototype {
     pub base: PrototypeBase,
     pub id: ColorsPrototypeID,

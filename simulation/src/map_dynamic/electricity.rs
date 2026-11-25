@@ -822,7 +822,7 @@ mod tests {
             );
             let flow = test.g.read::<UtilityFlow>();
             let status =
-                live_site_utility_status(&map, &homes, &infos, world, &electricity, &flow, first)
+                live_site_utility_status(&map, &homes, &infos, world, &flow, first)
                     .unwrap();
             assert_eq!(status.totals, Some(live.pipes));
             let add = (live.pipes.water_production - live.pipes.water_demand) * 0.75;

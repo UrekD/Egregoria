@@ -75,7 +75,7 @@ impl<'lua> FromLua<'lua> for ZoneKind {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct GrowableCompanyPrototype {
     pub base: GoodsCompanyPrototype,
     pub id: GrowableCompanyID,

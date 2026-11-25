@@ -20,7 +20,7 @@ use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
 use simulation::map::{Building, BuildingID, BuildingKind, Map, MapSubscriber, UpdateType};
 use simulation::map_dynamic::{
     active_business, city_field_tick, effective_load, service_reach_sources, service_reach_version,
-    utility_network_readout, BuildingInfos, CoverageGrid, ElectricityFlow, Transit, UtilityFlow,
+    BuildingInfos, CoverageGrid, ElectricityFlow, SiteUtilityReader, Transit, UtilityFlow,
     UtilityNetworkReadout, UtilityNetworkState,
 };
 use simulation::souls::residence::{self, Residences};
@@ -204,6 +204,11 @@ impl OverlayMode {
                 let mut hash = DefaultHasher::new();
                 (city_field_tick(sim).saturating_sub(1) / DEMAND_INTERVAL_TICKS).hash(&mut hash);
                 map.environment().water_revision().hash(&mut hash);
+                sim.read::<simulation::world_command::CommandOutcomes>()
+                    .sequence
+                    .hash(&mut hash);
+                // Staffing can change between utility samples.
+                (sim.get_tick() / (prototypes::TICKS_PER_REALTIME_SECOND / 2)).hash(&mut hash);
                 sim.read::<UtilityFlow>().water_pending(map).hash(&mut hash);
                 hash.finish()
             }
@@ -477,8 +482,7 @@ fn profiled_consumer(
 }
 
 fn collect_utility_markers(sim: &Simulation, map: &Map, mode: OverlayMode, tiles: &mut TileIndex) {
-    let power = sim.read::<ElectricityFlow>();
-    let flow = sim.read::<UtilityFlow>();
+    let mut utilities = SiteUtilityReader::for_display(sim);
     let mut states = FastMap::default();
     let infos = sim.read::<BuildingInfos>();
     let residences = sim.read::<Residences>();
@@ -517,9 +521,9 @@ fn collect_utility_markers(sim: &Simulation, map: &Map, mode: OverlayMode, tiles
             .electricity
             .net_id(building.id)
             .filter(|_| !building.is_orphaned());
-        let state = *states.entry(network).or_insert_with(|| {
-            mode.utility_state(&utility_network_readout(map, &power, &flow, network))
-        });
+        let state = *states
+            .entry(network)
+            .or_insert_with(|| mode.utility_state(&utilities.network_readout(network)));
         let color = legend::utility_color(state);
         let footprint = marker_footprint(building);
         tiles.push(footprint, building.height + 0.35, color);

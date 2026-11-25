@@ -196,6 +196,14 @@ impl ZoneGrid {
         Ok((EligiblePaintCells { cells, replacement }, first_denial))
     }
 
+    pub(crate) fn validate_paint_area(area: &OBB) -> Result<(), ZonePaintError> {
+        if valid_paint_rectangle(area) {
+            Ok(())
+        } else {
+            Err(ZonePaintError::InvalidArea)
+        }
+    }
+
     pub fn bounded_paint_cells(
         area: &OBB,
         bounds: AABB,
@@ -393,6 +401,13 @@ pub(super) fn cell_center((x, y): (i32, i32)) -> Vec2 {
 }
 
 fn paint_cells(area: &OBB) -> Option<impl Iterator<Item = (i32, i32)> + '_> {
+    valid_paint_rectangle(area).then(|| cells_under(area).take(MAX_PAINT_CELLS + 1))
+}
+
+fn valid_paint_rectangle(area: &OBB) -> bool {
+    if !area.corners.iter().all(|point| point.is_finite()) {
+        return false;
+    }
     let [a, b] = area.axis();
     let axis_lengths = a.mag() * b.mag();
     // Allow rounding in rotated rectangles stored as world-space f32 coordinates.
@@ -407,7 +422,7 @@ fn paint_cells(area: &OBB) -> Option<impl Iterator<Item = (i32, i32)> + '_> {
         let length_squared = (side.dst - side.src).mag2();
         length_squared <= ZoneGrid::MAX_PAINT_SIDE * ZoneGrid::MAX_PAINT_SIDE
     });
-    (valid_rectangle && valid_size).then(|| cells_under(area).take(MAX_PAINT_CELLS + 1))
+    valid_rectangle && valid_size
 }
 
 fn cells_under(area: &OBB) -> impl Iterator<Item = (i32, i32)> + '_ {

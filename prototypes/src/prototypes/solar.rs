@@ -1,7 +1,7 @@
 use crate::{GoodsCompanyPrototype, Prototype, SolarPanelID};
 use std::ops::Deref;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SolarPanelPrototype {
     pub base: GoodsCompanyPrototype,
     pub id: SolarPanelID,

@@ -158,6 +158,10 @@ enum Assertion {
     MixedUseInspector {
         business_open: bool,
     },
+    TowerSelection {
+        parcel_center: [f32; 2],
+        background_tower: Option<[f32; 2]>,
+    },
     BuildingCount {
         prototype: String,
         count: usize,
@@ -1169,6 +1173,46 @@ impl Assertion {
                 if !matches || uiw.read::<GuiState>().hidden {
                     return Err(format!(
                         "expected an occupied Mixed Use inspector with a {expected} business"
+                    ));
+                }
+            }
+            Self::TowerSelection {
+                parcel_center,
+                background_tower,
+            } => {
+                use crate::gui::selectable::tower_pick_geometry;
+                let map = sim.map();
+                let matches_tower = |building: &simulation::map::Building, [x, y]: [f32; 2]| {
+                    building.obb.center().distance2(vec2(x, y)) < 0.01
+                        && building.development().is_some_and(|site| site.floors >= 12)
+                };
+                let selected = uiw.read::<InspectedBuilding>().e;
+                let building = selected
+                    .and_then(|id| map.get(id))
+                    .filter(|building| matches_tower(building, parcel_center))
+                    .ok_or_else(|| {
+                        format!("expected tower at {parcel_center:?}, selected {selected:?}")
+                    })?;
+                let background = background_tower
+                    .map(|at| {
+                        map.buildings()
+                            .values()
+                            .find(|building| matches_tower(building, at))
+                            .ok_or_else(|| format!("missing background tower at {at:?}"))
+                    })
+                    .transpose()?;
+                let ray = uiw
+                    .read::<crate::inputmap::InputMap>()
+                    .ray
+                    .ok_or("missing tower pointer ray")?;
+                if !tower_pick_geometry(&map, ray, building, background) {
+                    return Err(format!(
+                        "tower at {parcel_center:?} did not present the expected {}",
+                        if background.is_some() {
+                            "overlapping roof"
+                        } else {
+                            "sky-backed facade"
+                        }
                     ));
                 }
             }

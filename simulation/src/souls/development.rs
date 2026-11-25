@@ -15,8 +15,8 @@ use crate::map::{
 };
 use crate::map_dynamic::{
     active_business, connected_site_network, projected_site_load, ActiveBusiness,
-    ActiveRetailIndex, BuildingInfos, CoverageGrid, ElectricityFlow, EnvGrid, NetworkLoad,
-    NetworkReservations, SiteLoad, UtilityAdmission, UtilityFlow,
+    ActiveRetailIndex, BuildingInfos, CoverageGrid, EnvGrid, NetworkLoad, NetworkReservations,
+    SiteLoad, UtilityAdmission, UtilityFlow,
 };
 use crate::{CompanyID, Simulation, SoulID, World};
 
@@ -147,7 +147,6 @@ pub(super) fn network_services(
             &sim.read::<Residences>(),
             &sim.read::<BuildingInfos>(),
             sim.world(),
-            &sim.read::<ElectricityFlow>(),
             &sim.read::<UtilityFlow>(),
             network,
         ) else {
@@ -157,7 +156,7 @@ pub(super) fn network_services(
         Services {
             power: live.has_power(),
             water,
-            sewage: water && live.pipes.has_sewage(),
+            sewage: sampled && live.pipes.has_site_sewage(),
         }
     })
 }
@@ -826,6 +825,7 @@ mod tests {
     #[test]
     fn zones2_z2_idle_grid_serves_homes_until_the_live_pump_closes() {
         use crate::souls::happiness::{happiness_update, Happiness, UPDATE_OFFSET};
+        use crate::world_command::WorldCommand;
 
         with_profiles(
             concat!(
@@ -844,6 +844,22 @@ mod tests {
                 );
                 let sim = &mut test.g;
                 let home = place(sim, ZoneKind::Residential, 240.0);
+                let legacy_lot = {
+                    let map = sim.map();
+                    map.lots()
+                        .values()
+                        .find(|lot| lot.parent == road && lot.shape.center().x < 150.0)
+                        .unwrap()
+                        .id
+                };
+                WorldCommand::MapBuildHouse(legacy_lot).apply(sim);
+                let legacy = sim
+                    .map()
+                    .buildings()
+                    .values()
+                    .find(|site| site.kind == BuildingKind::House && site.development().is_none())
+                    .unwrap()
+                    .id;
                 let worker = spawn_human(sim, home).unwrap();
                 let pump = provider(sim, road, "water-pump", 450.0);
                 let outlet = provider(sim, road, "sewage-outlet", 510.0);
@@ -879,10 +895,49 @@ mod tests {
                 }
                 assert!(!sim.map().get(home).unwrap().is_abandoned_growable());
 
+                use crate::map_dynamic::{
+                    utility_network_at_road, UtilityNetworkState, UtilityStatus,
+                };
+                assert_eq!(
+                    utility_network_at_road(sim, road).unwrap().water,
+                    UtilityNetworkState::Ok,
+                );
+                let before = {
+                    let map = sim.map();
+                    (
+                        map.electricity.generation(),
+                        map.environment().water_revision(),
+                    )
+                };
                 crate::souls::lifecycle::despawn_company(sim, pump);
                 sim.apply_commands([]);
                 assert!(sim.get(pump).is_none());
+                assert_eq!(before, {
+                    let map = sim.map();
+                    (
+                        map.electricity.generation(),
+                        map.environment().water_revision(),
+                    )
+                });
                 assert!(sim.read::<UtilityFlow>().has_water(home));
+                assert!(sim.read::<UtilityFlow>().has_water(legacy));
+
+                let road_status = utility_network_at_road(sim, road).unwrap();
+                assert_eq!(road_status.water, UtilityNetworkState::Shortage);
+                assert!(road_status.utility_totals.unwrap().sewage_capacity > 0.0);
+                for id in [home, legacy] {
+                    let pipes = crate::diagnostics::building_diagnostics(sim, id)
+                        .unwrap()
+                        .utilities
+                        .unwrap();
+                    assert_eq!(pipes.water, UtilityStatus::Shortage);
+                    assert_eq!(pipes.sewage, UtilityStatus::Shortage);
+                    assert!(pipes.totals.unwrap().sewage_capacity > 0.0);
+                    let requirements = residence::requirements(sim, id);
+                    for name in ["Water", "Sewage"] {
+                        assert!(!requirements.iter().find(|r| r.name == name).unwrap().met);
+                    }
+                }
                 sim.write::<GameTime>().tick.0 = 13 * TICKS_PER_HOUR + UPDATE_OFFSET;
                 happiness_update(sim);
                 assert_eq!(sim.read::<Happiness>().score(home).unwrap(), served - 10);

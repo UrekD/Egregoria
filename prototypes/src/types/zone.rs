@@ -1,7 +1,7 @@
 use crate::{get_lua, Money};
 use mlua::{FromLua, Lua, Table, Value};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Zone {
     pub floor: String,
     pub filler: String,

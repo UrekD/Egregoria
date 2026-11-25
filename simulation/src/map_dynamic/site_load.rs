@@ -6,11 +6,11 @@ use prototypes::MAX_PROFILED_SLOTS;
 use crate::economy::balance::RETAIL_ACCESS_RADIUS_M;
 use crate::map::{river_site_summary, Building, BuildingID, ElectricityNetworkID, Map};
 use crate::map_dynamic::{
-    active_business, effective_load, utility_network_readout, ActiveBusiness, BuildingInfos,
-    BuildingUtilityStatus, BusinessRates, ElectricityFlow, SiteLoad, UtilityFlow, UtilityStatus,
+    active_business, effective_load, ActiveBusiness, BuildingInfos, BuildingUtilityStatus,
+    BusinessRates, ElectricityFlow, SiteLoad, UtilityFlow, UtilityNetworkReadout, UtilityStatus,
     UtilityTotals,
 };
-use crate::souls::residence::{self, PowerStatus, Residence, Residences};
+use crate::souls::residence::{self, PowerStatus, Residence, ResidenceEntries, Residences};
 use crate::utils::resources::Ref;
 use crate::{Simulation, World};
 
@@ -101,22 +101,21 @@ impl NetworkLoad {
 
     pub(crate) fn live_with_pipe_sample(
         map: &Map,
-        residences: &Residences,
+        residences: &ResidenceEntries,
         infos: &BuildingInfos,
         world: &World,
-        power: &ElectricityFlow,
         flow: &UtilityFlow,
         network: ElectricityNetworkID,
     ) -> Option<(Self, bool)> {
         let mut total = Self::rated(map, residences, infos, world, network)?;
-        let sampled = sampled_pipes(map, power, flow, network);
+        let sampled = flow.sampled_pipes(map, network);
         total.cap_pipe_supply(sampled.unwrap_or_default());
         Some((total, sampled.is_some()))
     }
 
     fn rated(
         map: &Map,
-        residences: &Residences,
+        residences: &ResidenceEntries,
         infos: &BuildingInfos,
         world: &World,
         network: ElectricityNetworkID,
@@ -204,18 +203,6 @@ impl NetworkLoad {
     }
 }
 
-fn sampled_pipes(
-    map: &Map,
-    power: &ElectricityFlow,
-    flow: &UtilityFlow,
-    network: ElectricityNetworkID,
-) -> Option<UtilityTotals> {
-    if flow.water_pending(map) {
-        return None;
-    }
-    utility_network_readout(map, power, flow, Some(network)).utility_totals
-}
-
 type NetworkReadouts = BTreeMap<ElectricityNetworkID, Option<(NetworkLoad, bool)>>;
 
 #[derive(Default)]
@@ -283,7 +270,6 @@ impl<'a> SiteUtilityReader<'a> {
                 &self.residences,
                 &self.infos,
                 self.world,
-                &self.power,
                 &self.flow,
                 network,
             )
@@ -296,6 +282,25 @@ impl<'a> SiteUtilityReader<'a> {
         result
     }
 
+    pub(crate) fn network_pipes(&mut self, network: ElectricityNetworkID) -> Option<UtilityTotals> {
+        self.network_load(network)
+            .and_then(|(load, sampled)| sampled.then_some(load.pipes))
+    }
+
+    pub fn network_readout(
+        &mut self,
+        network: Option<ElectricityNetworkID>,
+    ) -> UtilityNetworkReadout {
+        let pipes = network.and_then(|id| self.network_pipes(id));
+        crate::map_dynamic::utilities::network_readout(
+            &self.map,
+            &self.power,
+            &self.flow,
+            network,
+            |_| pipes,
+        )
+    }
+
     pub fn status(&mut self, id: BuildingID) -> Option<BuildingUtilityStatus> {
         let building = self.map.get(id)?;
         let load = self.load(building);
@@ -303,7 +308,7 @@ impl<'a> SiteUtilityReader<'a> {
             return None;
         }
         let network = connected_site_network(&self.map, building);
-        Some(pipe_status(network, |network| self.network_load(network)))
+        Some(pipe_status(network, |network| self.network_pipes(network)))
     }
 }
 
@@ -312,7 +317,6 @@ pub(crate) fn live_site_utility_status(
     residences: &Residences,
     infos: &BuildingInfos,
     world: &World,
-    power: &ElectricityFlow,
     flow: &UtilityFlow,
     id: BuildingID,
 ) -> Option<BuildingUtilityStatus> {
@@ -325,9 +329,13 @@ pub(crate) fn live_site_utility_status(
     if load.water_demand() == 0.0 && load.sewage_demand() == 0.0 {
         return None;
     }
-    Some(pipe_status(connected_site_network(map, building), |network| {
-        NetworkLoad::live_with_pipe_sample(map, residences, infos, world, power, flow, network)
-    }))
+    Some(pipe_status(
+        connected_site_network(map, building),
+        |network| {
+            NetworkLoad::live_with_pipe_sample(map, residences, infos, world, flow, network)
+                .and_then(|(load, sampled)| sampled.then_some(load.pipes))
+        },
+    ))
 }
 
 impl UtilityFlow {
@@ -348,7 +356,7 @@ impl UtilityFlow {
 
 fn pipe_status(
     network: Option<ElectricityNetworkID>,
-    read: impl FnOnce(ElectricityNetworkID) -> Option<(NetworkLoad, bool)>,
+    read: impl FnOnce(ElectricityNetworkID) -> Option<UtilityTotals>,
 ) -> BuildingUtilityStatus {
     use UtilityStatus::*;
 
@@ -360,13 +368,16 @@ fn pipe_status(
     let Some(network) = network else {
         return unavailable(Disconnected);
     };
-    let Some((totals, true)) = read(network) else {
+    let Some(pipes) = read(network) else {
         return unavailable(Unknown);
     };
-    let pipes = totals.pipes;
     BuildingUtilityStatus {
         water: if pipes.has_water() { Served } else { Shortage },
-        sewage: if pipes.has_sewage() { Served } else { Shortage },
+        sewage: if pipes.has_site_sewage() {
+            Served
+        } else {
+            Shortage
+        },
         totals: Some(pipes),
     }
 }
@@ -471,13 +482,10 @@ impl NetworkReservations {
         let load = match self.networks.entry(network) {
             Entry::Occupied(entry) => entry.into_mut(),
             Entry::Vacant(entry) => {
-                let power = sim.read::<ElectricityFlow>();
                 let water = sim.read::<UtilityFlow>();
                 let mut load = NetworkLoad::rated(&map, &residences, &infos, world, network)
                     .ok_or(UtilityAdmission::Disconnected)?;
-                load.cap_pipe_supply(
-                    sampled_pipes(&map, &power, &water, network).unwrap_or_default(),
-                );
+                load.cap_pipe_supply(water.sampled_pipes(&map, network).unwrap_or_default());
                 entry.insert(load)
             }
         };

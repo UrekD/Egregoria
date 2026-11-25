@@ -13,8 +13,7 @@ use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
 use crate::world_command::{CommandOutcomes, PrepareBudget, Rejection, WorldCommand};
 use common::saveload::{
-    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry, SlotMeta,
-    SnapshotKind,
+    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry, SlotMeta, SnapshotKind,
 };
 use common::FastMap;
 use derive_more::{From, TryInto};
@@ -64,7 +63,9 @@ pub mod utils;
 mod world;
 pub mod world_command;
 
-pub use common::saveload::{list_slots_with_revisions, save_dir, SlotCamera, SlotId, SnapshotRevision};
+pub use common::saveload::{
+    list_slots_with_revisions, save_dir, SlotCamera, SlotId, SnapshotRevision,
+};
 pub use map::{AuthoredTownError, AuthoredTownOptions};
 pub use world::*;
 
@@ -700,13 +701,22 @@ impl Simulation {
             if let Some(error) = wire_error {
                 command.reject_wire(self, error);
             } else {
-                if record {
+                // Paint preparation also validates map bounds and registry availability.
+                let record_paint = record && matches!(command, WorldCommand::ZonePaint { .. });
+                if record && !record_paint {
                     let tick = self.read::<GameTime>().tick;
                     self.write::<Replay>().push(tick, (*command).clone());
                 }
-                match command.admitted(tiled, &water) {
+                let tick = record_paint.then(|| self.read::<GameTime>().tick);
+                let rejection = match command.admitted(tiled, &water) {
                     Ok(()) => command.apply_in_batch(self, construction, &mut water),
-                    Err(reason) => command.reject_unadmitted(self, reason),
+                    Err(reason) => {
+                        command.reject_unadmitted(self, reason);
+                        Some(reason)
+                    }
+                };
+                if let Some(tick) = tick.filter(|_| rejection.is_none()) {
+                    self.write::<Replay>().push(tick, (*command).clone());
                 }
             }
             utils::scheduler::drain_commands(self);
@@ -1689,7 +1699,11 @@ mod p4_fix_ac_tests {
         };
         write_snapshot("0.0.0");
         assert!(Simulation::load_replay_from_slot(&root, &slot).is_ok());
-        fs::write(&paths.replay, ReplayJson::encode_sidecar(&replay, revision).unwrap()).unwrap();
+        fs::write(
+            &paths.replay,
+            ReplayJson::encode_sidecar(&replay, revision).unwrap(),
+        )
+        .unwrap();
         assert!(Simulation::load_replay_from_slot(&root, &slot).is_err());
 
         write_snapshot(VERSION);

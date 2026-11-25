@@ -7,7 +7,7 @@ pub const MAX_PROFILED_SLOTS: u32 = 1_024;
 const MAX_GROWABLE_FLOORS: u8 = 28;
 
 /// Land use in the prototype registry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
 pub enum GrowableZoneKind {
     Pure(ZoneKind),
     MixedUse,
@@ -73,7 +73,7 @@ impl<'lua> FromLua<'lua> for GrowableMassingStyle {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize)]
 pub struct GrowableMassing {
     pub style: GrowableMassingStyle,
     pub floors_by_level: [u8; 5],

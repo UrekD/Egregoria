@@ -13,7 +13,9 @@ use crate::map::{
 use crate::souls::residence::{Residence, Residences};
 use crate::{Simulation, World};
 
-use super::{active_business, ActiveBusiness, BuildingInfos, ElectricityFlow, NetworkFlow};
+use super::{
+    active_business, ActiveBusiness, BuildingInfos, ElectricityFlow, NetworkFlow, SiteUtilityReader,
+};
 
 const RELATIVE_RATE_EPSILON: f64 = 1e-6;
 
@@ -81,20 +83,25 @@ pub struct UtilityNetworkReadout {
 pub fn utility_network_at_road(sim: &Simulation, road: RoadID) -> Option<UtilityNetworkReadout> {
     let map = sim.map();
     map.get(road)?;
-    Some(utility_network_readout(
-        &map,
-        &sim.read::<ElectricityFlow>(),
-        &sim.read::<UtilityFlow>(),
-        map.electricity.net_id(road),
-    ))
+    Some(SiteUtilityReader::new(sim).network_readout(map.electricity.net_id(road)))
 }
 
-/// Read the latest power flow and water/sewage totals for the current component.
+/// Read the last utility sample. Live displays use [SiteUtilityReader::network_readout].
 pub fn utility_network_readout(
     map: &Map,
     power: &ElectricityFlow,
     flow: &UtilityFlow,
     network: Option<ElectricityNetworkID>,
+) -> UtilityNetworkReadout {
+    network_readout(map, power, flow, network, |id| flow.current_totals(map, id))
+}
+
+pub(in crate::map_dynamic) fn network_readout(
+    map: &Map,
+    power: &ElectricityFlow,
+    flow: &UtilityFlow,
+    network: Option<ElectricityNetworkID>,
+    pipes: impl FnOnce(ElectricityNetworkID) -> Option<UtilityTotals>,
 ) -> UtilityNetworkReadout {
     use UtilityNetworkState::{Disconnected, Idle, Ok, Shortage, Updating};
 
@@ -133,7 +140,11 @@ pub fn utility_network_readout(
             Shortage
         }
     };
-    let utility_totals = flow.current_totals(map, id);
+    let utility_totals = if water_pending {
+        flow.current_totals(map, id)
+    } else {
+        pipes(id)
+    };
     UtilityNetworkReadout {
         network,
         electricity,
@@ -161,6 +172,13 @@ impl UtilityFlow {
 
     pub fn topology_revision(map: &Map) -> u64 {
         map.electricity.generation()
+    }
+
+    pub(super) fn sampled_pipes(&self, map: &Map, id: ElectricityNetworkID) -> Option<UtilityTotals> {
+        if self.water_pending(map) {
+            return None;
+        }
+        self.current_totals(map, id)
     }
 
     fn current_totals(&self, map: &Map, id: ElectricityNetworkID) -> Option<UtilityTotals> {
@@ -217,10 +235,9 @@ impl UtilityFlow {
         residences: &Residences,
         infos: &BuildingInfos,
         world: &World,
-        electricity: &ElectricityFlow,
         id: BuildingID,
     ) -> Option<BuildingUtilityStatus> {
-        super::live_site_utility_status(map, residences, infos, world, electricity, self, id)
+        super::live_site_utility_status(map, residences, infos, world, self, id)
     }
 
     pub(crate) fn status_with_demand(
@@ -257,7 +274,7 @@ impl UtilityFlow {
         };
         Some(BuildingUtilityStatus {
             water: if totals.has_water() { Served } else { Shortage },
-            sewage: if totals.has_sewage() {
+            sewage: if totals.has_site_sewage() {
                 Served
             } else {
                 Shortage
@@ -292,6 +309,11 @@ impl UtilityTotals {
 
     pub fn has_sewage(&self) -> bool {
         meets_demand(self.sewage_capacity, self.sewage_demand)
+    }
+
+    /// Site service needs delivered water even when the network has spare outlet capacity.
+    pub(crate) fn has_site_sewage(self) -> bool {
+        self.has_water() && self.has_sewage()
     }
 }
 
@@ -493,9 +515,10 @@ pub fn utility_flow_update(sim: &mut Simulation) {
             if load.water_production == 0.0 && load.sewage_capacity == 0.0 {
                 continue;
             }
-            if water_sites.as_ref().is_some_and(|sites| {
-                !sites.provider_site(id).is_some_and(|site| site.is_ok())
-            }) {
+            if water_sites
+                .as_ref()
+                .is_some_and(|sites| !sites.provider_site(id).is_some_and(|site| site.is_ok()))
+            {
                 continue;
             }
             if !blackout {

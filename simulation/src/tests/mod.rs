@@ -896,7 +896,13 @@ fn zones2_mix_payload_rejections_leave_replay_and_paint_unchanged() {
     use common::saveload::{Bincode, JSON};
     use geom::OBB;
 
-    init_test_simulation();
+    if !in_prototype_fixture_process(
+        module_path!(),
+        "zones2_mix_payload_rejections_leave_replay_and_paint_unchanged",
+    ) {
+        return;
+    }
+    load_staged_prototypes();
     let mut sim = Simulation::new_game_with_replay(&NewGameOptions {
         preset: MapPreset::Flat,
         terrain_chunks: NewGameOptions::MIN_TERRAIN_CHUNKS,
@@ -992,7 +998,7 @@ fn zones2_mix_payload_rejections_leave_replay_and_paint_unchanged() {
         Bincode::encode(&*sim.read::<Budget>()).unwrap(),
         budget_before
     );
-    assert_eq!(sim.read::<Replay>().command_count(), before + 5);
+    assert_eq!(sim.read::<Replay>().command_count(), before);
     assert_eq!(sim.read::<ZoneGrid>().generation(), 0);
     assert!(sim.read::<ZoneGrid>().cells().is_empty());
 
@@ -1008,6 +1014,11 @@ fn zones2_mix_payload_rejections_leave_replay_and_paint_unchanged() {
         );
         assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
     }
+    // A rejected-only stepped batch still advances the systems and the replay clock.
+    let tick = sim.get_tick();
+    sim.tick(&mut Simulation::schedule(), &rejected.commands);
+    assert_eq!(sim.get_tick(), tick + 1);
+    assert_eq!(sim.read::<Replay>().command_count(), before + 2);
     let replay = sim.read::<Replay>().clone();
     let (mut replayed, mut loader) = Simulation::try_from_replay(replay).unwrap();
     assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
@@ -1016,10 +1027,39 @@ fn zones2_mix_payload_rejections_leave_replay_and_paint_unchanged() {
         sim.read::<ZoneGrid>().cells()
     );
     assert_eq!(replayed.read::<ZoneGrid>().generation(), 2);
+    assert_eq!(replayed.get_tick(), sim.get_tick());
+    assert_eq!(replayed.hashes(), sim.hashes());
 
     paint(area, None, Density::High).apply(&mut sim);
     assert!(sim.read::<ZoneGrid>().cells().is_empty());
-    assert_eq!(sim.read::<Replay>().command_count(), before + 8);
+    assert_eq!(sim.read::<Replay>().command_count(), before + 3);
+}
+
+#[test]
+fn zones2_shipped_registry_rejects_inert_mixed_use_paint() {
+    use crate::map::{Density, ZoneGrid, ZoneKind};
+    use crate::world_command::CommandOutcomes;
+
+    init_test_simulation();
+    let mut sim = Simulation::new_game_with_replay(&crate::NewGameOptions {
+        preset: crate::MapPreset::Flat,
+        terrain_chunks: crate::NewGameOptions::MIN_TERRAIN_CHUNKS,
+        ..crate::NewGameOptions::default()
+    })
+    .unwrap();
+    let area = geom::OBB::new(Vec2::splat(160.0), Vec2::X, 16.0, 16.0);
+    let paint = |kind| WorldCommand::ZonePaint {
+        area,
+        kind: Some(kind),
+        density: Density::Medium,
+    };
+    paint(ZoneKind::Residential).apply(&mut sim);
+    let grid_before = sim.read::<ZoneGrid>().cells().clone();
+    let replay_before = sim.read::<crate::Replay>().command_count();
+    paint(ZoneKind::MixedUse).apply(&mut sim);
+    assert_eq!(sim.read::<ZoneGrid>().cells(), &grid_before);
+    assert_eq!(sim.read::<crate::Replay>().command_count(), replay_before);
+    assert!(sim.read::<CommandOutcomes>().accepted.is_empty());
 }
 
 #[test]
