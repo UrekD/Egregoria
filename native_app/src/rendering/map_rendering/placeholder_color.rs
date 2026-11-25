@@ -35,8 +35,8 @@ fn service_hex(kind: ServiceKind) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::gui::zoning::{zone_cell_color, zone_color, ZONES};
-    use simulation::map::Density;
+    use crate::gui::zoning::{zone_cell_color, zone_color};
+    use simulation::map::{Density, ZoneKind};
 
     fn oklab(hex: u64) -> geom::Vec3 {
         let LinearColor { r, g, b, .. } = Color::from_hex(hex).into();
@@ -70,9 +70,12 @@ mod tests {
             "grass".to_string(),
             oklab_linear(LinearColor::new(0.071, 0.155, 0.018, 1.0)),
         )];
-        for kind in ZONES {
+        for kind in ZoneKind::ALL {
             references.push((format!("{kind:?}"), oklab_linear(zone_color(kind))));
-            for density in [Density::Low, Density::Medium, Density::High] {
+            for density in [Density::Low, Density::Medium, Density::High]
+                .into_iter()
+                .filter(|&density| kind.supports_density(density))
+            {
                 references.push((
                     format!("{kind:?} {density:?}"),
                     oklab_linear(zone_cell_color(kind, density)),

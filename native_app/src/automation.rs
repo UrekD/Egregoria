@@ -31,7 +31,7 @@ use crate::gui::{
     toolbox,
     toolbox::building::BuildingTab,
     top_demand_driver,
-    zoning::{ZoningState, ZONES},
+    zoning::ZoningState,
     GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool, ToolSelection,
 };
 use crate::session::{self, SessionScreen, SessionState};
@@ -157,6 +157,10 @@ enum Assertion {
     },
     MixedUseInspector {
         business_open: bool,
+    },
+    ZonePainted {
+        center: [f32; 2],
+        cell: simulation::map::ZoneCell,
     },
     TowerSelection {
         parcel_center: [f32; 2],
@@ -979,7 +983,7 @@ impl Automation {
                 .keys()
                 .filter_map(|&zone| top_demand_driver(sim, zone).map(|driver| (zone, driver)))
                 .collect(),
-            tax_rates: ZONES.map(|zone| budget.tax_rate(zone)),
+            tax_rates: ZoneKind::TAXABLE.map(|zone| budget.tax_rate(zone)),
             rejections: sim
                 .read::<CommandOutcomes>()
                 .last
@@ -1174,6 +1178,13 @@ impl Assertion {
                     return Err(format!(
                         "expected an occupied Mixed Use inspector with a {expected} business"
                     ));
+                }
+            }
+            Self::ZonePainted { center: [x, y], cell } => {
+                let sample = OBB::new(vec2(x, y), Vec2::X, 8.0, 8.0);
+                let actual = sim.read::<ZoneGrid>().lot_zone(&sample);
+                if actual != Some(cell) {
+                    return Err(format!("expected {cell:?} at ({x}, {y}), got {actual:?}"));
                 }
             }
             Self::TowerSelection {

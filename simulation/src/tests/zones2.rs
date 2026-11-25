@@ -616,17 +616,17 @@ fn assert_incompatible(root: &Path, id: &SlotId, expected_version: &str) {
 
 #[test]
 fn zones2_save_and_replay_reject_a_different_prototype_registry() {
-    if !load_staged_prototypes("zones2_save_and_replay_reject_a_different_prototype_registry") {
+    if !in_prototype_fixture_process(
+        module_path!(),
+        "zones2_save_and_replay_reject_a_different_prototype_registry",
+    ) {
         return;
     }
 
-    let mut sim = flat_city();
-    sim.apply_commands([&road(vec3(100.0, 180.0, 0.0), vec3(820.0, 180.0, 0.0))]);
-    let lot = sim.map().lots().keys().next().unwrap();
-    sim.place_zoned_growable(lot, zone(ZoneKind::MixedUse, Density::Medium))
-        .unwrap();
+    super::load_unprofiled_prototypes();
+    let sim = flat_city();
     let root = SlotRoot::new();
-    let id = SlotId::new("staged_city").unwrap();
+    let id = SlotId::new("pre_activation").unwrap();
     sim.save_to_slot(&root.0, &id, SnapshotRevision::new(1))
         .unwrap();
     let replay = Simulation::load_replay_from_slot(&root.0, &id).unwrap();
@@ -635,12 +635,11 @@ fn zones2_save_and_replay_reject_a_different_prototype_registry() {
     let header = Simulation::read_slot_snapshot_header(&zip, SnapshotKind::Zip).unwrap();
     assert!(header.check_compatibility().is_ok());
 
-    // The same game version ships with a different registry.
+    // Load the shipping registry while keeping the same game version.
     unsafe { crate::init::load_prototypes() };
-    assert!(matches!(
-        header.check_compatibility(),
-        Err(SaveLoadError::PrototypeRegistry)
-    ));
+    let error = header.check_compatibility().unwrap_err();
+    assert!(matches!(error, SaveLoadError::PrototypeRegistry));
+    assert_eq!(error.to_string(), "Save or replay requires a different prototype registry");
     assert!(matches!(
         Simulation::load_from_slot(&root.0, &id),
         Err(SaveLoadError::PrototypeRegistry)

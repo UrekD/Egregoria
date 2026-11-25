@@ -405,6 +405,14 @@ pub(crate) fn load_staged_prototypes() {
     crate::init::register_simulation();
 }
 
+fn load_unprofiled_prototypes() {
+    prototypes::test_prototypes(concat!(
+        "package.path = '../base_mod/?.lua'\nzones2_profiles_enabled = false\n",
+        include_str!("../../../base_mod/data.lua")
+    ));
+    crate::init::register_simulation();
+}
+
 fn init_test_simulation() {
     static BASE_PROTOTYPES: Mutex<Option<&'static prototypes::Prototypes>> = Mutex::new(None);
     let mut base = BASE_PROTOTYPES.lock().unwrap();
@@ -1036,11 +1044,49 @@ fn zones2_mix_payload_rejections_leave_replay_and_paint_unchanged() {
 }
 
 #[test]
-fn zones2_shipped_registry_rejects_inert_mixed_use_paint() {
+fn zones2_stock_registry_accepts_mixed_use_paint() {
+    use crate::map::{Density, ZoneCell, ZoneGrid, ZoneKind};
+
+    init_test_simulation();
+    let mut sim = Simulation::new_game_with_replay(&crate::NewGameOptions {
+        preset: crate::MapPreset::Flat,
+        terrain_chunks: crate::NewGameOptions::MIN_TERRAIN_CHUNKS,
+        ..crate::NewGameOptions::default()
+    })
+    .unwrap();
+    let area = geom::OBB::new(Vec2::splat(160.0), Vec2::X, 16.0, 16.0);
+    let replay_before = sim.read::<crate::Replay>().command_count();
+    for density in [Density::Medium, Density::High] {
+        WorldCommand::ZonePaint {
+            area,
+            kind: Some(ZoneKind::MixedUse),
+            density,
+        }
+        .apply(&mut sim);
+        let chosen = sim.read::<ZoneGrid>().lot_zone(&area);
+        assert_eq!(
+            chosen,
+            Some(ZoneCell {
+                kind: ZoneKind::MixedUse,
+                density,
+            })
+        );
+    }
+    assert_eq!(sim.read::<crate::Replay>().command_count(), replay_before + 2);
+}
+
+#[test]
+fn zones2_unprofiled_registry_rejects_inert_mixed_use_paint() {
     use crate::map::{Density, ZoneGrid, ZoneKind};
     use crate::world_command::CommandOutcomes;
 
-    init_test_simulation();
+    if !in_prototype_fixture_process(
+        module_path!(),
+        "zones2_unprofiled_registry_rejects_inert_mixed_use_paint",
+    ) {
+        return;
+    }
+    load_unprofiled_prototypes();
     let mut sim = Simulation::new_game_with_replay(&crate::NewGameOptions {
         preset: crate::MapPreset::Flat,
         terrain_chunks: crate::NewGameOptions::MIN_TERRAIN_CHUNKS,

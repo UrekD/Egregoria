@@ -1100,6 +1100,8 @@ struct Observation {
     baskets_due: u64,
     baskets_filled: u64,
     food_stockout_hours: f64,
+    road_loads: u64,
+    late_road_loads: u64,
     mixed_receipt_units: u64,
     mixed_shelf_peak: i32,
     productive_recipients: usize,
@@ -1196,9 +1198,9 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
             }
         }
         if let Some(freight) = ctx.sim.read::<CargoBook>().freight_day(day) {
+            result.road_loads += freight.delivered_loads;
+            result.late_road_loads += freight.late_loads;
             *totals.entry("cancelled_loads".into()).or_default() += freight.cancelled_loads as f64;
-            *totals.entry("road_delivered_loads".into()).or_default() +=
-                freight.delivered_loads as f64;
             *totals.entry("road_delivered_units".into()).or_default() +=
                 freight.delivered_units as f64;
             for &seller in &known_sellers {
@@ -1230,6 +1232,8 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
         ));
     }
     totals.extend([
+        ("road_delivered_loads".into(), result.road_loads as f64),
+        ("road_late_loads".into(), result.late_road_loads as f64),
         ("housing_slots_hourly_mean".into(), result.housing_slots),
         ("available_jobs_hourly_mean".into(), result.available_jobs),
         ("filled_jobs_hourly_mean".into(), result.filled_jobs),
@@ -1298,6 +1302,14 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
         filled(mixed), filled(pure), stockout(mixed), stockout(pure)
     );
     println!("{evidence}");
+    let on_time = mixed.road_loads.saturating_sub(mixed.late_road_loads);
+    println!("MX road freight: {on_time}/{} loads on time", mixed.road_loads);
+    if mixed.road_loads == 0 || on_time as f64 / (mixed.road_loads as f64) < 0.9 {
+        return Err(format!(
+            "MX road freight needs 90% on-time deliveries, got {on_time}/{}",
+            mixed.road_loads
+        ));
+    }
     let matched = |a: f64, b: f64| a > 0.0 && b > 0.0 && (a - b).abs() <= 0.05 * b;
     if !matched(mixed.housing_slots, pure.housing_slots)
         || !matched(mixed.available_jobs, pure.available_jobs)

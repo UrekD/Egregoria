@@ -20,8 +20,6 @@ use yakui::{colored_box_container, Color};
 mod zone_color;
 pub use zone_color::{zone_cell_color, zone_color};
 
-pub const ZONES: [ZoneKind; 4] = ZoneKind::TAXABLE;
-
 const MAX_BRUSH_RADIUS: u8 = 5;
 const DENSITIES: [Density; 3] = [Density::Low, Density::Medium, Density::High];
 const LOT_LAYOUTS: [(LotLayout, &str, &str); 2] = [
@@ -151,6 +149,12 @@ impl ZoningState {
     }
 }
 
+fn zone_swatch(color: LinearColor) {
+    colored_box_container(Color::from_linear(<[f32; 4]>::from(color).into()), || {
+        fixed_spacer((12.0, 12.0));
+    });
+}
+
 fn density_picker(state: &mut ZoningState, kind: ZoneKind) {
     for density in DENSITIES
         .into_iter()
@@ -175,10 +179,7 @@ fn density_picker(state: &mut ZoningState, kind: ZoneKind) {
             });
         } else {
             minrow(4.0, || {
-                let color = <[f32; 4]>::from(zone_cell_color(kind, density));
-                colored_box_container(Color::from_linear(color.into()), || {
-                    fixed_spacer((12.0, 12.0));
-                });
+                zone_swatch(zone_cell_color(kind, density));
                 if tooltip("Density applies to new growth", || {
                     selectable_label_primary(state.density == density, label)
                 })
@@ -230,15 +231,18 @@ pub fn properties(uiworld: &UiWorld) {
                     let palette = ZoneKind::ALL
                         .into_iter()
                         .filter(|&kind| kind != ZoneKind::MixedUse || mixed_ready);
-                    for kind in palette.map(Some).chain([None]) {
-                        if selectable_label_primary(
-                            state.kind == kind,
-                            kind.map_or("Unzone", zone_name),
-                        )
-                        .clicked
-                        {
-                            state.select_kind(kind);
-                        }
+                    for kind in palette {
+                        minrow(4.0, || {
+                            zone_swatch(zone_color(kind));
+                            if selectable_label_primary(state.kind == Some(kind), zone_name(kind))
+                                .clicked
+                            {
+                                state.select_kind(Some(kind));
+                            }
+                        });
+                    }
+                    if selectable_label_primary(state.kind.is_none(), "Unzone").clicked {
+                        state.select_kind(None);
                     }
                 });
                 minrow(5.0, || {
@@ -587,16 +591,20 @@ mod tests {
             )
         };
         let grass = oklab(LinearColor::new(0.071, 0.155, 0.018, 1.0));
-        for (index, kind) in ZONES.into_iter().enumerate() {
-            let [low, medium, high] =
-                DENSITIES.map(|density| oklab(zone_cell_color(kind, density)));
-            for (lighter, deeper) in [(low, medium), (medium, high)] {
+        for (index, kind) in ZoneKind::ALL.into_iter().enumerate() {
+            let ramp: Vec<_> = DENSITIES
+                .into_iter()
+                .filter(|&density| kind.supports_density(density))
+                .map(|density| (density, oklab(zone_cell_color(kind, density))))
+                .collect();
+            for pair in ramp.windows(2) {
+                let [(_, lighter), (_, deeper)] = [pair[0], pair[1]];
                 assert!(
-                    lighter.distance(deeper) >= 0.10,
+                    lighter.x > deeper.x && lighter.distance(deeper) >= 0.10,
                     "{kind:?} adjacent densities need an OKLab distance of at least 0.10"
                 );
             }
-            for (density, color) in DENSITIES.into_iter().zip([low, medium, high]) {
+            for (density, color) in ramp {
                 assert!(
                     color.distance(grass) >= 0.12,
                     "{kind:?} {density:?} vs grass"
@@ -605,7 +613,10 @@ mod tests {
                     color.y.hypot(color.z) >= 0.07,
                     "{kind:?} {density:?} chroma"
                 );
-                for &other in &ZONES[index + 1..] {
+                for &other in ZoneKind::ALL[index + 1..]
+                    .iter()
+                    .filter(|other| other.supports_density(density))
+                {
                     let other_color = oklab(zone_cell_color(other, density));
                     assert!(
                         color.distance(other_color) >= 0.085,
@@ -613,7 +624,6 @@ mod tests {
                     );
                 }
             }
-            assert!(low.x > medium.x && medium.x > high.x, "{kind:?} ramp");
         }
     }
 }

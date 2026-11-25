@@ -70,9 +70,6 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                     BuildingKind::House => render_house(uiworld, sim, building),
                     BuildingKind::GoodsCompany(id) => {
                         if let Some(site) = sim.growable_summary(building.id) {
-                            if building.has_residential_use() {
-                                render_house(uiworld, sim, building);
-                            }
                             label(format!(
                                 "{} · {} density · Level {} · {} floors",
                                 zone_name(site.zone.kind),
@@ -91,7 +88,13 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                                 Some(GrowableBusinessState::ClosedUntil { .. }) => {
                                     label("Business closed")
                                 }
+                                Some(GrowableBusinessState::Open) if building.is_mixed_use() => {
+                                    label("Business open")
+                                }
                                 _ => {}
+                            }
+                            if building.has_residential_use() {
+                                render_house(uiworld, sim, building);
                             }
                         } else if let Some(proto) = try_prototype(GrowableCompanyID::from(id))
                             .filter(|proto| proto.growable)
@@ -178,10 +181,12 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         .iter()
         .filter(|(_, human)| human.work.is_some())
         .count();
-    label(format!(
-        "Residential · {} density · Level {level}",
-        density_name(density)
-    ));
+    if !b.is_mixed_use() {
+        label(format!(
+            "Residential · {} density · Level {level}",
+            density_name(density)
+        ));
+    }
     if let Some(capacity) = capacity {
         label(format!("Residents  {} / {capacity}", residents.len()));
     }

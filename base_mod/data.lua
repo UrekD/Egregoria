@@ -1,6 +1,10 @@
 require("items")
 require("companies")
 require("warehouses")
+-- The legacy registry remains available to compatibility fixtures.
+if zones2_profiles_enabled == nil then
+    zones2_profiles_enabled = true
+end
 require("residences")
 require("growables")
 require("services")

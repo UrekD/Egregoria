@@ -1,5 +1,5 @@
 use scenarios::builtin::{
-    demo_cities, growth_basic, perf, water_fixtures, PERF_10K, SCENARIOS, ZONES2_STAGED,
+    demo_cities, growth_basic, perf, water_fixtures, PERF_10K, SCENARIOS, ZONES2_SCENARIOS,
 };
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
@@ -23,7 +23,6 @@ struct JsonSample {
 fn usage() -> String {
     let names = SCENARIOS
         .iter()
-        .chain(ZONES2_STAGED)
         .map(|(scenario, _)| scenario.name)
         .chain([PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
         .collect::<Vec<_>>()
@@ -229,12 +228,10 @@ fn run() -> Result<(), String> {
         };
     }
     let available: Vec<_> = match name.as_str() {
-        "all" => SCENARIOS.iter().collect(),
-        "all_staged" => SCENARIOS.iter().chain(ZONES2_STAGED).collect(),
-        "zones2_staged" => ZONES2_STAGED.iter().collect(),
+        "all" | "all_staged" => SCENARIOS.iter().collect(),
+        "zones2_staged" => ZONES2_SCENARIOS.iter().collect(),
         _ => SCENARIOS
             .iter()
-            .chain(ZONES2_STAGED)
             .chain(std::iter::once(&PERF_10K))
             .filter(|(scenario, _)| scenario.name == name)
             .collect(),

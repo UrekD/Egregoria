@@ -31,10 +31,13 @@ fn test_base() {
         println!("{:?}", try_prototype(GoodsCompanyID::new("solar-panel")));
         println!("{:?}", try_prototype(SolarPanelID::new("solar-panel")));
 
-        let profiles_enabled = try_prototype(GrowableCompanyID::new("commercial-l1"))
-            .unwrap()
-            .massing
-            .is_some();
+        for density in [Density::Medium, Density::High] {
+            assert!(
+                crate::prototypes().mixed_use_pair(density).is_some(),
+                "stock registry is missing the {density:?} Mixed Use pair"
+            );
+        }
+        assert!(crate::prototypes().mixed_use_pair(Density::Low).is_none());
         for (name, zone) in [
             ("industrial-l1", ZoneKind::Industrial),
             ("commercial-l1", ZoneKind::Commercial),
@@ -45,11 +48,11 @@ fn test_base() {
             assert!(growable.growable);
             assert_eq!(growable.zone_kind, zone);
             assert_eq!(growable.level, 1);
-            assert_eq!(growable.massing.is_some(), profiles_enabled);
+            assert!(growable.massing.is_some(), "{name}");
         }
 
         let residences: Vec<_> = ResidencePrototype::iter().collect();
-        assert_eq!(residences.len(), if profiles_enabled { 34 } else { 9 });
+        assert_eq!(residences.len(), 34);
         for density in [Density::Low, Density::Medium, Density::High] {
             for level in 1..=3 {
                 let residence = crate::prototypes().legacy_residence(density, level).unwrap();
@@ -63,13 +66,6 @@ fn test_base() {
                 assert!(residence.water_consumption.is_some_and(|rate| rate > 0.0));
             }
         }
-        for density in [Density::Medium, Density::High] {
-            assert_eq!(
-                crate::prototypes().mixed_use_pair(density).is_some(),
-                profiles_enabled
-            );
-        }
-        assert!(crate::prototypes().mixed_use_pair(Density::Low).is_none());
         let services: Vec<_> = ServicePrototype::iter().collect();
         assert_eq!(services.len(), 8);
         for kind in [
