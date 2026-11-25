@@ -797,10 +797,8 @@ impl Map {
 
         self.invalidate(src);
         self.invalidate(dst);
-        Lot::generate_along_final_road(self, road, check_water, frontage_work);
-
         // Frontage checks use the deck clipped by the finalized junction interfaces.
-        Lot::generate_along_road(self, road);
+        Lot::generate_along_final_road(self, road, frontage_work);
 
         info!("connected {:?} {:?}: {:?}", src, dst, road);
         Ok(ConnectedRoad {
@@ -1797,9 +1795,6 @@ impl Map {
         );
 
         let roads = [r1, r2];
-        if self.no_frontage.remove(&split_road_id) {
-            self.no_frontage.extend(roads);
-        }
         let r1 = self.roads.get(r1)?;
         let r2 = self.roads.get(r2)?;
 
@@ -2083,7 +2078,7 @@ impl Map {
         self.invalidate(src_id);
         self.invalidate(dst_id);
         if gen_lots {
-            Lot::generate_along_final_road(self, id, true, frontage_work);
+            Lot::generate_along_final_road(self, id, frontage_work);
         }
         Some(id)
     }

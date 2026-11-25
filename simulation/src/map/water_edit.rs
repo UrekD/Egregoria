@@ -3,12 +3,12 @@ use super::{
 };
 use crate::map::terrain::CELL_SIZE;
 use crate::map::{
-    deck_triangles, footprint_tiles, prepare_water_providers, DeckTriangle, Intersection,
-    IntersectionID, Lot, LotLayout, PreparedWaterEdit, PreparedWaterProviders, Road, RoadID, Roads,
-    TerrainChunkID, Turn, UpdateType, WaterDirtyChunks, WaterEdit, WaterEditError,
+    deck_triangles, footprint_tiles, grade_fits, prepare_water_providers, CrossingWork,
+    DeckTriangle, ExistingJunctionCrossing, Lot, LotLayout, PreparedWaterEdit, PreparedWaterProviders,
+    Road, RoadID, TerrainChunkID, UpdateType, WaterDirtyChunks, WaterEdit, WaterEditError,
     WaterEditOutcome, WaterFootprint, WaterProviderImpact, WaterTileCoord, ZoneCellCoord, ZoneGrid,
-    FRONTAGE_HEIGHT_TOLERANCE_M, MAX_LOT_SIZE, MAX_SLOPE, MAX_WATER_BATCH_WORK, MIN_LOT_SIZE,
-    ROAD_Z_OFFSET, UNIFORM_LOT_SIZE,
+    FRONTAGE_HEIGHT_TOLERANCE_M, MAX_DECK_TILE_TESTS, MAX_LOT_SIZE, MAX_SLOPE, MAX_WATER_BATCH_WORK,
+    MIN_LOT_SIZE, ROAD_Z_OFFSET, UNIFORM_LOT_SIZE, WATER_BRIDGE_CLEARANCE,
 };
 use flat_spatial::grid::GridHandle;
 use flat_spatial::AABBGrid;
@@ -16,8 +16,6 @@ use geom::{unpack_height, Intersect, Polygon, Segment, Shape, Vec2, Vec3, AABB, 
 use ordered_float::OrderedFloat;
 use std::collections::{btree_map::Entry, BTreeMap, BTreeSet};
 
-const MIN_WATER_CLEARANCE_M: f32 = 2.5;
-const MAX_DECK_TILE_TESTS: usize = 2_000_000;
 const MAX_DECK_FRAGMENTS: usize = 131_072;
 const FRONTAGE_SEARCH_M: f32 = MAX_LOT_SIZE * std::f32::consts::SQRT_2 + 2.0;
 
@@ -162,6 +160,8 @@ impl Map {
         let mut decks = BTreeMap::new();
         let mut deck_tests = MAX_DECK_TILE_TESTS;
         let mut deck_fragments = MAX_DECK_FRAGMENTS;
+        // Existing geometry needs tile tests but no new road profile samples.
+        let mut profile_samples = 0;
         let mut junctions = BTreeMap::new();
         let mut drying_roads = BTreeSet::new();
         let mut dried = DriedTiles::default();
@@ -226,52 +226,39 @@ impl Map {
                             )?),
                         };
                         for &(triangle, valid_grade) in
-                            deck.0.get(&tile.chunk()).into_iter().flatten()
+                            deck.chunks.get(&tile.chunk()).into_iter().flatten()
                         {
                             spend_water_work(remaining, 1)?;
                             spend_water_work(&mut deck_tests, 1)?;
                             let Some(z) = triangle.minimum_z_in(tile) else {
                                 continue;
                             };
-                            if !road.elevated_span() || !valid_grade {
+                            if !road.elevated_span() || !valid_grade || !deck.lanes_fit {
                                 return Err(WaterEditError::TopologyConflict { object, tile });
                             }
                             let minimum_deck =
-                                water.sample.surface_z + MIN_WATER_CLEARANCE_M + ROAD_Z_OFFSET;
+                                water.sample.surface_z + WATER_BRIDGE_CLEARANCE + ROAD_Z_OFFSET;
                             if z < f64::from(minimum_deck) {
                                 return Err(WaterEditError::InsufficientClearance { object, tile });
                             }
                         }
                     }
                     ProjectKind::Intersection(id) => {
-                        spend_water_work(&mut deck_tests, 1)?;
+                        let mut work =
+                            CrossingWork::new(remaining, &mut deck_tests, &mut profile_samples);
                         let junction = match junctions.entry(id) {
                             Entry::Occupied(entry) => entry.into_mut(),
-                            Entry::Vacant(entry) => {
-                                entry.insert(JunctionFootprint::new(self, id, remaining)?)
-                            }
+                            Entry::Vacant(entry) => entry.insert(
+                                ExistingJunctionCrossing::new(self, id, &mut work)
+                                    .map_err(|_| WaterEditError::Limit)?,
+                            ),
                         };
-                        if let Some(junction) = junction {
-                            if junction.bounds.intersects(&tile_bounds(tile)) {
-                                spend_water_work(remaining, junction.vertices)?;
-                                if junction.shape.overlaps_tile(tile) {
-                                    if !junction.elevated {
-                                        return Err(WaterEditError::TopologyConflict {
-                                            object,
-                                            tile,
-                                        });
-                                    }
-                                    if junction.height
-                                        < water.sample.surface_z + MIN_WATER_CLEARANCE_M
-                                    {
-                                        return Err(WaterEditError::InsufficientClearance {
-                                            object,
-                                            tile,
-                                        });
-                                    }
-                                }
-                            }
-                        }
+                        junction.validate_tile(
+                            &self.intersections[id],
+                            tile,
+                            water.sample.surface_z,
+                            &mut work,
+                        )?;
                     }
                     ProjectKind::Lot(id) if overlaps(&self.lots[id].shape.corners, 0)? => {
                         effects.wet_lots.insert(object);
@@ -384,7 +371,10 @@ fn tile_bounds(tile: WaterTileCoord) -> AABB {
     AABB::new_ll_size(tile.corner(), Vec2::splat(CELL_SIZE))
 }
 
-struct RoadDeck(BTreeMap<TerrainChunkID, Vec<(DeckTriangle, bool)>>);
+struct RoadDeck {
+    chunks: BTreeMap<TerrainChunkID, Vec<(DeckTriangle, bool)>>,
+    lanes_fit: bool,
+}
 
 impl RoadDeck {
     fn new(
@@ -414,131 +404,14 @@ impl RoadDeck {
                 }
             }
         }
-        Ok(Self(chunks))
-    }
-}
-
-struct JunctionFootprint {
-    shape: WaterFootprint,
-    bounds: AABB,
-    vertices: usize,
-    elevated: bool,
-    height: f32,
-}
-
-impl JunctionFootprint {
-    fn new(
-        map: &Map,
-        id: IntersectionID,
-        remaining: &mut usize,
-    ) -> Result<Option<Self>, WaterEditError> {
-        let inter = &map.intersections[id];
-        let outline = Map::water_junction_outline(inter, &map.roads, remaining)?;
-        let Some(shape) = WaterFootprint::new(&outline.0) else {
-            return Ok(None);
-        };
-        let ground = map
-            .environment
-            .heightmap
-            .base_height(inter.pos.xy())
-            .unwrap_or(inter.pos.z)
-            .max(0.0);
-        let elevated = (inter.pos.z >= ground + 0.5 || map.environment.is_water(inter.pos.xy()))
-            && inter
-                .roads
-                .iter()
-                .any(|&road| map.roads[road].elevated_span());
-        Ok(Some(Self {
-            shape,
-            bounds: outline.bbox(),
-            vertices: outline.len(),
-            elevated,
-            height: inter.pos.z,
-        }))
-    }
-}
-
-impl Map {
-    /// Final full-width junction, from the same clipped arms and turn splines as
-    /// the renderer. A single arm connects to itself to form the dead-end cap.
-    pub(crate) fn water_junction_outline(
-        junction: &Intersection,
-        roads: &Roads,
-        remaining: &mut usize,
-    ) -> Result<Polygon, WaterEditError> {
-        junction_outline(junction, roads, remaining)
-    }
-}
-
-fn junction_outline(
-    junction: &Intersection,
-    roads: &Roads,
-    remaining: &mut usize,
-) -> Result<Polygon, WaterEditError> {
-    let mut arms = Vec::new();
-    for &id in &junction.roads {
-        spend_water_work(remaining, 1)?;
-        let road = &roads[id];
-        let points = road.interfaced_points();
-        let pose = if road.src == junction.id {
-            points.first_dir().map(|dir| (points.first(), dir.xy()))
-        } else {
-            points.last_dir().map(|dir| (points.last(), -dir.xy()))
-        };
-        if let Some((point, dir)) = pose {
-            let normal = dir.perpendicular() * (road.width * 0.5);
-            arms.push((point.xy() - normal, point.xy() + normal, dir));
+        let mut lanes_fit = true;
+        for (id, _) in road.lanes_iter() {
+            let points = &map.lanes[id].points;
+            spend_water_work(remaining, points.len())?;
+            lanes_fit &= grade_fits(points);
         }
+        Ok(Self { chunks, lanes_fit })
     }
-    let mut outline = Polygon::default();
-    let center = junction.pos.xy();
-    for (&(left, _, src), &(_, right, dst)) in arms.iter().zip(arms.iter().cycle().skip(1)) {
-        if junction.is_roundabout() {
-            if let Some(policy) = junction.turn_policy.roundabout {
-                let a = (left - center).try_normalize();
-                let b = (right - center).try_normalize();
-                if a.zip(b)
-                    .is_some_and(|(a, b)| a.angle(b).abs() >= 21.0_f32.to_radians())
-                {
-                    spend_water_work(remaining, (policy.radius.abs() / 10.0).ceil() as usize + 1)?;
-                    for point in Turn::gen_roundabout(
-                        left.z0(),
-                        right.z0(),
-                        -src,
-                        dst,
-                        policy.radius + 3.0,
-                        center,
-                    ) {
-                        spend_water_work(remaining, 1)?;
-                        outline.push(point);
-                    }
-                    continue;
-                }
-            }
-        }
-        let spline = Turn::spline(left, right, -src, dst);
-        for point in spline.smart_points(1.0, 0.0, 1.0) {
-            spend_water_work(remaining, 1)?;
-            outline.push(point);
-        }
-    }
-    spend_water_work(remaining, outline.len())?;
-    // Match Polygon::simplify using a linear pass over the original vertices.
-    Ok(Polygon(
-        outline
-            .iter()
-            .enumerate()
-            .filter_map(|(i, &point)| {
-                let prev = *outline.get_prev(i);
-                let next = *outline.get_next(i);
-                (!prev.approx_eq(point)
-                    && !(point - prev)
-                        .normalize()
-                        .approx_eq((next - point).normalize()))
-                .then_some(point)
-            })
-            .collect(),
-    ))
 }
 
 struct FrontageDeck(AABBGrid<usize, AABB>);

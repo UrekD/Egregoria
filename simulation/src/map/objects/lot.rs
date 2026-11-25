@@ -1,8 +1,7 @@
-use crate::map::spend_water_work;
 use crate::map::terrain::CELL_SIZE;
 use crate::map::{
-    dry_frontage, frontage_attempt_work, profile_height, Building, Environment, FrontageStations,
-    LotOrigin, Map, ProjectFilter, ProjectKind, Road, RoadID, UpdateType,
+    spend_water_work, Building, Environment, FrontageStations, LotOrigin, Map, ProjectFilter,
+    ProjectKind, Road, RoadID, UpdateType,
     WaterEditError, WaterFootprint, WaterTileCoord, MAX_WATER_BATCH_WORK,
 };
 use geom::{Intersect, Polygon, Segment, Shape, Vec2, Vec3, AABB, OBB};
@@ -316,13 +315,12 @@ impl Lot {
     }
 
     pub fn generate_along_road(map: &mut Map, road: RoadID) {
-        Self::generate_along_final_road(map, road, true, None);
+        Self::generate_along_final_road(map, road, None);
     }
 
     pub(crate) fn generate_along_final_road(
         map: &mut Map,
         road: RoadID,
-        check_water: bool,
         mut reserved: Option<usize>,
     ) {
         let Some(r) = map.roads.get(road) else {
@@ -336,7 +334,6 @@ impl Lot {
             map: &mut Map,
             road: RoadID,
             side: f32,
-            check_water: bool,
             reserved: &mut Option<usize>,
         ) -> Result<(), WaterEditError> {
             let r = &map.roads[road];
@@ -377,35 +374,31 @@ impl Lot {
             while let Some((pos, dir)) = along.next(d) {
                 let axis = side * dir.perp_up();
                 let at = pos + axis * (w + 1.0);
+                let shape = OBB::new(at.xy() + axis.xy() * size * 0.5, axis.xy(), size, size);
                 let lot = if let Some(stations) = &stations {
-                    if let Some(work) = reserved.as_mut() {
-                        spend_water_work(work, 1)?;
-                    }
-                    let shape = OBB::new(at.xy() + axis.xy() * size * 0.5, axis.xy(), size, size);
+                    let mut allowance = MAX_WATER_BATCH_WORK;
+                    let metered = reserved.is_some();
+                    let work = reserved.as_mut().unwrap_or(&mut allowance);
+                    spend_water_work(work, 1)?;
                     let env = map.environment();
                     let height = env
                         .height(at.xy())
-                        .filter(|height| (height - at.z).abs() <= 1.0);
-                    if let Some(height) = height.filter(|_| !map.no_frontage.contains(&road)) {
-                        if let Some(work) = reserved.as_mut() {
-                            spend_water_work(
-                                work,
-                                frontage_attempt_work(2.0 * w, check_water) - 1,
-                            )?;
-                        }
-                        let dry = dry_frontage(
-                            2.0 * w,
+                        .filter(|height| (height - at.z).abs() <= FRONTAGE_HEIGHT_TOLERANCE_M);
+                    if let Some(height) = height {
+                        let dry = Lot::check_dry_frontage(
+                            &map.roads[road],
                             &shape,
-                            |point, fraction| {
-                                stations.project(&points, point, d + side * (0.5 - fraction) * size)
+                            |point, work| {
+                                spend_water_work(work, 3)?;
+                                Ok(stations.project(&points, point, d))
                             },
-                            |point| profile_height(env, point),
-                            |point| check_water && env.is_water(point),
-                            |polygon| check_water && env.intersects_water(polygon),
-                        );
+                            |point| env.height(point),
+                            |tile| env.is_water(tile.center()),
+                            work,
+                        )?;
                         let clear = dry
-                            && if let Some(work) = reserved.as_mut() {
-                                !Lot::frontage_obstructed(map, shape, &BTreeSet::new(), work)?
+                            && if metered {
+                                !Lot::frontage_obstructed(map, shape, work)?
                             } else {
                                 !Lot::footprint_obstructed(map, shape, true)
                             };
@@ -414,7 +407,7 @@ impl Lot {
                         None
                     }
                 } else {
-                    Lot::try_make(map, road, at, axis.xy(), size)
+                    Lot::make_if_clear(map, road, at, shape)
                 };
                 if let Some(id) = lot {
                     map.subscribers.dispatch(UpdateType::Road, &map.lots[id]);
@@ -433,30 +426,21 @@ impl Lot {
         let pair = r.sidewalks(r.src);
         // Lot allocation is optional. Stop at the reserved limit even when
         // dense overlapping shapes make the obstruction checks expensive.
-        if pair.outgoing.is_some() && gen_side(map, road, 1.0, check_water, &mut reserved).is_err()
-        {
+        if pair.outgoing.is_some() && gen_side(map, road, 1.0, &mut reserved).is_err() {
             return;
         }
         if pair.incoming.is_some() {
-            let _ = gen_side(map, road, -1.0, check_water, &mut reserved);
+            let _ = gen_side(map, road, -1.0, &mut reserved);
         }
     }
 
-    pub(crate) fn frontage_obstructed(
-        map: &Map,
-        shape: OBB,
-        removed: &BTreeSet<ProjectKind>,
-        work: &mut usize,
-    ) -> Result<bool, WaterEditError> {
+    fn frontage_obstructed(map: &Map, shape: OBB, work: &mut usize) -> Result<bool, WaterEditError> {
         let polygon = Polygon::from(shape.corners.as_slice());
         for object in map
             .spatial_map
             .construction_candidates(shape.bbox(), ProjectFilter::ALL)
         {
             spend_water_work(work, 1)?;
-            if removed.contains(&object) {
-                continue;
-            }
             let blocked = match object {
                 ProjectKind::Road(id) => {
                     let road = &map.roads[id];
