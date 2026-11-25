@@ -1366,11 +1366,21 @@ fn plan_parcels(
     use ZoneKind::{Commercial, Industrial, Residential};
     let map = sim.map();
     let wet = map.environment().has_water_configuration();
+    let profiled_housing = wet && ResidencePrototype::iter().any(|home| home.massing.is_some());
     let rings = blocks(&plan.graph);
     let (high_house, high_shop) = downtown_cells();
+    let medium_house = ZoneCell {
+        kind: Residential,
+        density: Medium,
+    };
     let mut painted = Vec::new();
     let mut reserves = Vec::new();
     for cohort in cohorts {
+        // The profiled High residences have substantially more capacity.
+        // Use Medium for ordinary wet neighbourhood frontage, with High
+        // at the centre and the existing blocks that initiate each district.
+        let medium_neighbourhood = profiled_housing && cohort.district != "station";
+        let neighbourhood_house = if medium_neighbourhood { medium_house } else { high_house };
         let district = plan
             .districts
             .iter()
@@ -1415,7 +1425,7 @@ fn plan_parcels(
         });
         let reserve_count = cohort.infill;
         let reserve_cell = if cohort.houses > 0 {
-            high_house
+            neighbourhood_house
         } else {
             ZoneCell {
                 kind: Industrial,
@@ -1568,7 +1578,7 @@ fn plan_parcels(
             )?;
         }
         let houses = if cohort.houses > 0 {
-            cohort.houses.min(fitting(&candidates, high_house) + 4)
+            cohort.houses.min(fitting(&candidates, neighbourhood_house) + 4)
         } else {
             0
         };
@@ -1577,7 +1587,7 @@ fn plan_parcels(
         } else {
             houses / 15
         };
-        let medium = if cohort.district == "station" {
+        let medium = if cohort.district == "station" || medium_neighbourhood {
             0
         } else {
             houses / 8
@@ -1586,7 +1596,7 @@ fn plan_parcels(
             &map,
             district.key,
             &mut candidates,
-            high_house,
+            neighbourhood_house,
             houses.saturating_sub(low + medium + 4),
             &mut painted,
         )?;
@@ -1595,10 +1605,7 @@ fn plan_parcels(
             &map,
             district.key,
             &mut candidates,
-            ZoneCell {
-                kind: Residential,
-                density: Medium,
-            },
+            medium_house,
             medium,
             &mut painted,
         )?;
@@ -1647,8 +1654,15 @@ fn plan_parcels(
                     .total_cmp(&b.shape.center().distance2(reserve_anchor))
                     .then_with(|| a.id.cmp(&b.id))
             });
-            let additional = 22.min(fitting(&candidates, high_house));
-            take_parcels(&map, district.key, &mut candidates, high_house, additional, &mut reserves)?;
+            let additional = 22.min(fitting(&candidates, neighbourhood_house));
+            take_parcels(
+                &map,
+                district.key,
+                &mut candidates,
+                neighbourhood_house,
+                additional,
+                &mut reserves,
+            )?;
             // Put future shops beside the new homes so they can hire from the
             // same neighbourhood during the infill trial.
             if !wet {
@@ -4153,6 +4167,17 @@ mod tests {
             housing >= 1020 && isolated_south == 0,
             "{housing} opening housing places, with {isolated_south} on the remote South fringe"
         );
+        if ResidencePrototype::iter().any(|home| home.massing.is_some()) {
+            let outskirts: Vec<_> = opening.parcels.iter()
+                .filter(|parcel| parcel.capacity > 0 && parcel.district != "station")
+                .collect();
+            let medium = outskirts.iter().filter(|parcel| parcel.zoning.density == Density::Medium).count();
+            assert!(medium * 4 >= outskirts.len() * 3,
+                "{medium}/{} neighbourhood home parcels use Medium density under the profiled stock", outskirts.len());
+            assert!(opening.parcels.iter()
+                .filter(|parcel| parcel.capacity > 0 && parcel.district == "station")
+                .all(|parcel| parcel.zoning.density == Density::High));
+        }
         assert!(
             quay_housing >= 16,
             "{quay_housing} housing places near the outfall jobs"
