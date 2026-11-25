@@ -288,10 +288,18 @@ fn build_fixture(case: Case) -> Result<Fixture, String> {
         .sidewalks(true)
         .parking(case.road_class == RoadClass::Local)
         .build();
-    let projects = points
-        .iter()
-        .map(|p| MapProject::ground(p.z(0.0)))
-        .collect();
+    let projects = {
+        let map = sim.map();
+        points
+            .iter()
+            .map(|&p| {
+                map.environment()
+                    .height(p)
+                    .map(|height| MapProject::ground(p.z(height)))
+                    .ok_or("fixture endpoint outside the terrain")
+            })
+            .collect::<Result<Vec<_>, _>>()?
+    };
     let connections = links
         .iter()
         .enumerate()
@@ -394,8 +402,15 @@ fn build_fixture(case: Case) -> Result<Fixture, String> {
             .map(|lane| lane.length_m)
             .fold(f32::INFINITY, f32::min);
         let road = &map.roads()[spine];
+        let chord = a.distance(b);
+        if case.topology != Topology::CurvedCollector && (road.length() - chord).abs() > 0.01 {
+            return Err(format!(
+                "straight fixture spine is not level: arc {:.2} m, chord {chord:.2} m",
+                road.length()
+            ));
+        }
         let geometry = Geometry {
-            actual_junction_chord_m: a.distance(b),
+            actual_junction_chord_m: chord,
             centreline_arc_m: road.length(),
             road_width_m: pattern.width(),
             min_spine_lane_m,
@@ -1141,6 +1156,19 @@ mod tests {
             pose
         )
         .is_some());
+    }
+
+    #[test]
+    fn cm0_flat_geometry_uses_terrain_height_and_stock_trim() {
+        crate::ensure_repo_root_cwd();
+        simulation::init::init();
+        let case = Case {
+            topology: Topology::Orthogonal,
+            ..fixture_case()
+        };
+        let geometry = build_fixture(case).unwrap().geometry;
+        assert!((geometry.centreline_arc_m - 100.0).abs() < 0.01);
+        assert!((geometry.min_spine_lane_m - 64.8).abs() < 0.1);
     }
 
     #[test]
