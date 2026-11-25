@@ -17,7 +17,7 @@ use prototypes::{
 use simulation::economy::progression::{can_build, BuildCapability};
 use simulation::map::{BuildingKind, Zone, MAX_ZONE_AREA};
 use simulation::world_command::WorldCommand;
-use simulation::Simulation;
+use simulation::{PopulationScale, Simulation};
 
 use crate::gui::specialbuilding::{SpecialBuildKind, SpecialBuildingResource};
 use crate::gui::{InspectedBuilding, InspectedEntity, PlacementPreview};
@@ -65,6 +65,7 @@ pub fn special_building_properties(uiw: &UiWorld, sim: &Simulation) {
 fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
     let mut state = uiw.write::<SpecialBuildingResource>();
     let icons = uiw.read::<BuildingIcons>();
+    let scale = sim.population_scale();
 
     HorizScrollSize::Max.show(|| {
         padxy(50.0, 10.0, || {
@@ -114,7 +115,7 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
                                     Some(ServiceKind::WaterPump | ServiceKind::SewageOutlet),
                                 ) => crate::gui::overlays::UTILITY_EXPLANATION.into(),
                                 (None, Some(_)) => std::borrow::Cow::Borrowed(""),
-                                (None, None) => company_tooltip(descr).into(),
+                                (None, None) => company_tooltip(descr, scale).into(),
                             },
                         );
 
@@ -142,7 +143,10 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
                                     );
                                     textc(
                                         on_secondary_container(),
-                                        format!("{} capacity", service.capacity),
+                                        format!(
+                                            "Capacity {} people",
+                                            scale.persons(service.capacity as usize)
+                                        ),
                                     );
                                 }
                             }
@@ -159,7 +163,10 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
                                 };
                                 textc(
                                     on_secondary_container(),
-                                    format!("{} workers · {power}", descr.n_workers),
+                                    format!(
+                                        "{} workers · {power}",
+                                        scale.persons(descr.n_workers as usize)
+                                    ),
                                 );
                             }
                             textc(
@@ -273,8 +280,12 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
      */
 }
 
-fn company_tooltip(company: &GoodsCompanyPrototype) -> String {
-    let mut text = format!("{}\n{} workers", company.label, company.n_workers);
+fn company_tooltip(company: &GoodsCompanyPrototype, scale: PopulationScale) -> String {
+    let mut text = format!(
+        "{}\n{} workers",
+        company.label,
+        scale.persons(company.n_workers as usize)
+    );
     if let Some(recipe) = &company.recipe {
         for (heading, items) in [
             ("Consumes", &recipe.consumption),
@@ -391,7 +402,7 @@ mod tests {
         let _fixture = ScenarioCtx::new(SimulationOptions::LEGACY);
         let label = prototypes_iter::<GoodsCompanyPrototype>()
             .filter(|company| !company.id.is_growable() && !company.id.is_service())
-            .map(company_tooltip)
+            .map(|company| company_tooltip(company, PopulationScale::REALISTIC))
             .max_by_key(|text| text.lines().count())
             .unwrap();
         let mut ui = Yakui::new();

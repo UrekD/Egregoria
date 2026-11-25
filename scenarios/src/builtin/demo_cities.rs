@@ -5,7 +5,8 @@ use prototypes::{
     try_prototype, BuildingGen, GrowableCompanyID, Money, RollingStockID, Tick, TICKS_PER_HOUR,
 };
 use simulation::economy::{
-    Budget, BudgetCategory, Government, TripStats, DEFAULT_TAX_RATE_PERMILLE, TICKS_PER_BUDGET_DAY,
+    Budget, BudgetCategory, DailyEconomyMetrics, Government, TripStats, DEFAULT_TAX_RATE_PERMILLE,
+    TICKS_PER_BUDGET_DAY,
 };
 use simulation::map::{
     BuildingID, BuildingKind, Density, LaneKind, LanePatternBuilder, PathKind, ProjectFilter,
@@ -42,8 +43,46 @@ pub fn generate(root: &Path) -> Result<(), String> {
     publish(&starter.sim, &root, "starter_town", "Starter Town")?;
     drop(starter);
 
-    let showcase = build_showcase()?;
+    let showcase = build_showcase(OPTIONS)?;
     publish(&showcase.sim, &root, "showcase_city", "Showcase City")
+}
+
+/// Commission Showcase with four represented people per agent and check its playtest gates.
+pub fn generate_scaled_showcase(root: &Path) -> Result<(), String> {
+    let root = std::path::absolute(root).map_err(|error| error.to_string())?;
+    let ctx = build_showcase(SimulationOptions {
+        persons_per_agent: 4,
+        ..OPTIONS
+    })?;
+    let scale = ctx.sim.population_scale();
+    let agents = ctx.sim.world().humans.len();
+    let employed = ctx
+        .sim
+        .world()
+        .humans
+        .values()
+        .filter(|human| human.work.is_some())
+        .count();
+    let (filled, due) = {
+        let metrics = ctx.sim.read::<DailyEconomyMetrics>();
+        let last_day = metrics
+            .days
+            .get(&(SHOWCASE_DAYS - 1))
+            .ok_or("Missing closed Showcase day")?;
+        (
+            last_day.baskets_filled.unwrap_or_default(),
+            last_day.baskets_due.unwrap_or_default(),
+        )
+    };
+    println!(
+        "{scale} · {} residents ({agents} agents), {} employed ({employed} agents), {filled}/{due} household baskets filled on day {SHOWCASE_DAYS}",
+        scale.persons(agents),
+        scale.persons(employed),
+    );
+    if filled == 0 || filled > due {
+        return Err("Scaled Showcase did not fill a valid set of household baskets".into());
+    }
+    publish(&ctx.sim, &root, "scaled_showcase", "Scaled Showcase")
 }
 
 fn publish(sim: &Simulation, root: &Path, id: &str, name: &str) -> Result<(), String> {
@@ -108,8 +147,8 @@ fn build_starter() -> Result<ScenarioCtx, String> {
     Ok(ctx)
 }
 
-fn build_showcase() -> Result<ScenarioCtx, String> {
-    let mut ctx = ScenarioCtx::new(OPTIONS);
+fn build_showcase(options: SimulationOptions) -> Result<ScenarioCtx, String> {
+    let mut ctx = ScenarioCtx::new(options);
     let start = ctx.sim.get_tick();
     let roads = build_grid(&mut ctx, SHOWCASE_ORIGIN, 9)?;
     let freight = connect_freight(&mut ctx, SHOWCASE_ORIGIN + Vec2::splat(800.0))?;
@@ -206,7 +245,9 @@ fn build_showcase() -> Result<ScenarioCtx, String> {
         ctx.run_ticks(target - ctx.sim.get_tick());
         println!(
             "Showcase City: day {day} complete, {} residents, {} completed bus trips",
-            ctx.sim.world().humans.len(),
+            ctx.sim
+                .population_scale()
+                .persons(ctx.sim.world().humans.len()),
             ctx.sim.read::<TripStats>().transit.completed,
         );
     }
@@ -420,14 +461,15 @@ fn check_showcase(
     freight: BuildingID,
     roads: &[RoadID],
 ) -> Result<(), String> {
-    let population = sim.world().humans.len();
+    let agents = sim.world().humans.len();
+    let population = sim.population_scale().persons(agents);
     let unemployed = sim
         .world()
         .humans
         .values()
         .filter(|human| human.work.is_none())
         .count();
-    let unemployment = 100.0 * unemployed as f64 / population.max(1) as f64;
+    let unemployment = 100.0 * unemployed as f64 / agents.max(1) as f64;
     let residences = sim.read::<Residences>();
     let zone_types = [Residential, Commercial, Industrial, Office];
     let developed: BTreeSet<_> = sim
@@ -521,8 +563,8 @@ fn check_showcase(
         water.water_demand, water.sewage_capacity, water.sewage_demand, transit.runs.len(),
         Money::new_inner(imports as i64), Money::new_inner(exports as i64),
     );
-    if population < 300
-        || unemployed * 100 >= population * 35
+    if agents < 300
+        || unemployed * 100 >= agents * 35
         || l2 == 0
         || l3 == 0
         || unserved != 0

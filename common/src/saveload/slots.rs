@@ -161,13 +161,33 @@ pub struct SlotCamera {
 pub struct SlotMeta {
     pub display_name: String,
     pub game_tick: u64,
-    pub population: u32,
+    pub population: u64,
     pub money_cents: i64,
     pub saved_at_unix: u64,
     #[serde(default)]
     pub revision: Option<u128>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub camera: Option<SlotCamera>,
+    #[serde(
+        default = "realistic_ratio",
+        deserialize_with = "deserialize_population_ratio"
+    )]
+    pub persons_per_agent: u16,
+}
+
+fn realistic_ratio() -> u16 {
+    1
+}
+
+fn deserialize_population_ratio<'de, D: serde::Deserializer<'de>>(
+    input: D,
+) -> Result<u16, D::Error> {
+    let ratio = u16::deserialize(input)?;
+    if crate::population::PERSONS_PER_AGENT_PRESETS.contains(&ratio) {
+        Ok(ratio)
+    } else {
+        Err(serde::de::Error::custom("Invalid slot population ratio"))
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +422,12 @@ pub fn delete_slot(root: &Path, id: &SlotId) -> io::Result<()> {
 
 /// Replace the metadata sidecar. Write it after committing the snapshot.
 pub fn write_slot_meta(root: &Path, id: &SlotId, meta: &SlotMeta) -> Result<(), AtomicWriteError> {
+    if !crate::population::PERSONS_PER_AGENT_PRESETS.contains(&meta.persons_per_agent) {
+        return Err(AtomicWriteError::PreCommit(io::Error::new(
+            ErrorKind::InvalidData,
+            "Invalid slot population ratio",
+        )));
+    }
     let paths = slot_paths(root, id).map_err(AtomicWriteError::PreCommit)?;
     let bytes = JSONPretty::encode(meta).map_err(AtomicWriteError::PreCommit)?;
     write_atomic(&paths.meta, &bytes)

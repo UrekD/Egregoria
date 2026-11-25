@@ -7,6 +7,7 @@ pub mod history;
 pub mod iter;
 pub mod logger;
 pub mod macros;
+pub mod population;
 pub mod rand;
 pub mod saveload;
 pub mod scroll;

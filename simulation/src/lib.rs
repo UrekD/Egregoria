@@ -66,6 +66,7 @@ pub mod world_command;
 pub use common::saveload::{
     list_slots_with_revisions, save_dir, SlotCamera, SlotId, SnapshotRevision,
 };
+pub use economy::population::PopulationScale;
 pub use map::{AuthoredTownError, AuthoredTownOptions};
 pub use world::*;
 
@@ -146,6 +147,7 @@ pub struct NewGameOptions {
     pub progression: ProgressionMode,
     pub lot_layout: LotLayout,
     pub land_mode: map::LandMode,
+    pub persons_per_agent: u16,
 }
 
 impl NewGameOptions {
@@ -159,6 +161,7 @@ impl NewGameOptions {
     }
 
     fn validate(&self) -> Result<(), NewGameError> {
+        PopulationScale::try_new(self.persons_per_agent)?;
         if !(Self::MIN_TERRAIN_CHUNKS..=Self::MAX_TERRAIN_CHUNKS).contains(&self.terrain_chunks) {
             return Err(NewGameError::TerrainChunks(self.terrain_chunks));
         }
@@ -197,6 +200,7 @@ pub enum NewGameError {
     StartingMoneyBucks(u32),
     Bootstrap(Rejection),
     Land(map::LandSetupError),
+    PersonsPerAgent(u16),
 }
 
 impl Display for NewGameError {
@@ -216,6 +220,12 @@ impl Display for NewGameError {
             ),
             Self::Land(reason) => write!(f, "Could not initialize tiled land ({reason:?})"),
             Self::Bootstrap(reason) => write!(f, "Could not initialize the map ({reason:?})"),
+            Self::PersonsPerAgent(n) => {
+                write!(
+                    f,
+                    "Invalid population ratio 1:{n}. Choose 1, 2, 4, 8 or 16."
+                )
+            }
         }
     }
 }
@@ -233,6 +243,7 @@ impl Default for NewGameOptions {
             progression: legacy.progression,
             lot_layout: LotLayout::Varied,
             land_mode: map::LandMode::Unrestricted,
+            persons_per_agent: legacy.persons_per_agent,
         }
     }
 }
@@ -248,6 +259,7 @@ pub struct SimulationOptions {
     pub progression: ProgressionMode,
     pub land_mode: map::LandMode,
     pub land_recipe: map::LandRecipe,
+    pub persons_per_agent: u16,
 }
 
 impl SimulationOptions {
@@ -260,6 +272,7 @@ impl SimulationOptions {
         progression: ProgressionMode::FreeBuild,
         land_mode: map::LandMode::Unrestricted,
         land_recipe: map::LandRecipe::Unrestricted,
+        persons_per_agent: PopulationScale::REALISTIC.persons_per_agent(),
     };
 
     fn new_game_options(self) -> NewGameOptions {
@@ -275,10 +288,14 @@ impl SimulationOptions {
                 | map::LandRecipe::AuthoredV1 { lot_layout, .. } => lot_layout,
             },
             land_mode: self.land_mode,
+            persons_per_agent: self.persons_per_agent,
         }
     }
 
     fn valid_for_bootstrap(self) -> bool {
+        if self.population_scale().is_err() {
+            return false;
+        }
         // Legacy scenarios and tests can start with a small or empty map.
         match (self.land_mode, self.land_recipe) {
             (map::LandMode::Tiled, map::LandRecipe::NativeFlatV1 { .. }) => {
@@ -293,6 +310,10 @@ impl SimulationOptions {
                 && self.seed == Self::LEGACY.seed
                 && self.starting_money_bucks == Self::LEGACY.starting_money_bucks)
     }
+
+    fn population_scale(self) -> Result<PopulationScale, NewGameError> {
+        PopulationScale::try_new(self.persons_per_agent)
+    }
 }
 
 impl Default for SimulationOptions {
@@ -302,6 +323,13 @@ impl Default for SimulationOptions {
 }
 
 impl Simulation {
+    /// The immutable population ratio selected when this city was created.
+    pub fn population_scale(&self) -> PopulationScale {
+        self.read::<SimulationOptions>()
+            .population_scale()
+            .expect("validated simulation options")
+    }
+
     pub fn schedule() -> SeqSchedule {
         let mut schedule = SeqSchedule::default();
         unsafe {
@@ -351,6 +379,7 @@ impl Simulation {
                         lot_layout: options.lot_layout,
                     },
                 },
+                persons_per_agent: options.persons_per_agent,
             },
             options.lot_layout,
         )
@@ -953,6 +982,7 @@ impl Simulation {
             .then(|| ReplayJson::encode_sidecar(&replay, revision))
             .transpose()
             .map_err(AtomicWriteError::PreCommit);
+        let scale = self.population_scale();
         Ok(EncodedSlot {
             snapshot,
             replay,
@@ -960,7 +990,8 @@ impl Simulation {
             camera: None,
             revision,
             game_tick: self.get_tick(),
-            population: self.world.humans.len().try_into().unwrap_or(u32::MAX),
+            population: scale.persons(self.world.humans.len()),
+            persons_per_agent: scale.persons_per_agent(),
             money_cents: self.read::<economy::Government>().money.cents(),
         })
     }
@@ -1002,11 +1033,13 @@ impl Simulation {
 
     fn allows_resource_write<T: Any>(&self) -> bool {
         use std::any::TypeId;
+        if TypeId::of::<T>() == TypeId::of::<SimulationOptions>() {
+            return false;
+        }
         let protected = [
             TypeId::of::<Map>(),
             TypeId::of::<map::ZoneGrid>(),
             TypeId::of::<map::Environment>(),
-            TypeId::of::<SimulationOptions>(),
         ];
         !protected.contains(&TypeId::of::<T>())
             || !self.resources.contains::<Map>()
@@ -1019,7 +1052,7 @@ impl Simulation {
     pub fn write_or_default<T: Any + Send + Sync + Default>(&mut self) -> RefMut<T> {
         assert!(
             self.allows_resource_write::<T>(),
-            "live land resources require a checked command"
+            "resource cannot be updated directly"
         );
         self.resources.write_or_default::<T>()
     }
@@ -1034,7 +1067,7 @@ impl Simulation {
     pub fn write<T: Any + Send + Sync>(&self) -> RefMut<T> {
         assert!(
             self.allows_resource_write::<T>(),
-            "live land resources require a checked command"
+            "resource cannot be updated directly"
         );
         self.resources.write()
     }
@@ -1058,7 +1091,7 @@ impl Simulation {
     pub fn insert<T: Any + Send + Sync>(&mut self, res: T) {
         assert!(
             self.allows_resource_write::<T>(),
-            "live land resources require a checked command"
+            "resource cannot be updated directly"
         );
         self.resources.insert(res);
     }
@@ -1283,7 +1316,8 @@ pub struct EncodedSlot {
     camera: Option<SlotCamera>,
     revision: SnapshotRevision,
     game_tick: u64,
-    population: u32,
+    population: u64,
+    persons_per_agent: u16,
     money_cents: i64,
 }
 
@@ -1312,6 +1346,7 @@ impl EncodedSlot {
             display_name: self.display_name.unwrap_or_else(|| id.to_string()),
             game_tick: self.game_tick,
             population: self.population,
+            persons_per_agent: self.persons_per_agent,
             money_cents: self.money_cents,
             saved_at_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1523,6 +1558,13 @@ impl SimulationDeser {
             }
         }
 
+        let scale = sim
+            .read::<SimulationOptions>()
+            .population_scale()
+            .map_err(|error| corrupt(error.to_string()))?;
+        sim.read::<Replay>()
+            .validate_population_scale(scale)
+            .map_err(|error| corrupt(error.to_string()))?;
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
         crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
         sim.map_mut()

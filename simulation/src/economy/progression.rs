@@ -80,7 +80,7 @@ impl BuildCapability {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct LockedUntil {
     pub milestone: u8,
-    pub population: u32,
+    pub population: u64,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -106,15 +106,16 @@ pub enum ObjectiveProgress {
 #[derive(Debug)]
 pub struct ProgressionStatus {
     pub mode: ProgressionMode,
-    pub population: u32,
+    pub population: u64,
     pub highest_milestone: u8,
-    pub next: Option<(u8, u32, Vec<String>)>,
+    pub next: Option<(u8, u64, Vec<String>)>,
     pub objectives: Vec<(ObjectiveId, ObjectiveProgress)>,
 }
 
 pub fn progression_status(sim: &Simulation) -> ProgressionStatus {
     let state = sim.read::<ProgressionState>();
-    let population = population(sim);
+    let scale = sim.population_scale();
+    let population = scale.persons(sim.world().humans.len());
     if state.mode == ProgressionMode::FreeBuild {
         return ProgressionStatus {
             mode: state.mode,
@@ -139,7 +140,7 @@ pub fn progression_status(sim: &Simulation) -> ProgressionStatus {
                 })
                 .map(|proto| proto.label.clone()),
         );
-        (milestone, required, names)
+        (milestone, scale.persons(required as usize), names)
     });
     let metrics = sim.read::<DailyEconomyMetrics>();
     let last_day = state
@@ -225,7 +226,7 @@ pub fn can_build(sim: &Simulation, cap: BuildCapability) -> Result<(), LockedUnt
     } else {
         Err(LockedUntil {
             milestone,
-            population: population_required,
+            population: sim.population_scale().persons(population_required as usize),
         })
     }
 }

@@ -287,42 +287,32 @@ fn register_utility_water_sample() {
 }
 
 fn register_simulation_options() {
-    // Pre-TILES saves used the same release header and this exact six-field
-    // payload. Bincode is positional and checks that the record ends here.
-    type LegacyOptions = (
-        u16,
-        bool,
-        crate::MapPreset,
-        u64,
-        u32,
-        crate::economy::progression::ProgressionMode,
-    );
-
     unsafe {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "simoptions",
             optional: false,
             save: Box::new(|sim| Bincode::encode(&*sim.read::<SimulationOptions>()).unwrap()),
             load: Box::new(|sim, data| {
-                let options = Bincode::decode::<SimulationOptions>(data).or_else(|new_error| {
-                    let (
-                        terrain_size,
-                        save_replay,
-                        preset,
-                        seed,
-                        starting_money_bucks,
-                        progression,
-                    ) = Bincode::decode::<LegacyOptions>(data).map_err(|_| new_error)?;
-                    Ok::<_, std::io::Error>(SimulationOptions {
-                        terrain_size,
-                        save_replay,
-                        preset,
-                        seed,
-                        starting_money_bucks,
-                        progression,
-                        ..SimulationOptions::LEGACY
-                    })
-                })?;
+                let mut input = data;
+                let (terrain_size, save_replay, preset, seed, starting_money_bucks, progression) =
+                    Bincode::decode_reader(&mut input)?;
+                let mut options = SimulationOptions {
+                    terrain_size,
+                    save_replay,
+                    preset,
+                    seed,
+                    starting_money_bucks,
+                    progression,
+                    ..SimulationOptions::LEGACY
+                };
+                // Same-release saves can end after the original six fields or after
+                // the complete TILES suffix. A present ratio must decode in full.
+                if !input.is_empty() {
+                    (options.land_mode, options.land_recipe) = Bincode::decode_reader(&mut input)?;
+                }
+                if !input.is_empty() {
+                    options.persons_per_agent = Bincode::decode(input)?;
+                }
                 sim.resources.insert(options);
                 Ok(())
             }),

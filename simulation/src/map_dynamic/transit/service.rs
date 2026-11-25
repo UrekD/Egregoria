@@ -19,7 +19,7 @@ use crate::{
 /// Boarding is agent movement, so the dwell is in real time.
 pub(super) const DWELL_TICKS: u64 = 3 * TICKS_PER_REALTIME_SECOND;
 const MAX_CONSECUTIVE_SKIPS: u8 = 3;
-const CAPACITY: usize = 40;
+pub const BUS_CAPACITY: usize = 40;
 const BERTH_DISTANCE: f32 = 6.0;
 const BOARDING_DISTANCE: f32 = 8.0;
 const ARRIVAL_SPEED: f32 = 0.5;
@@ -475,7 +475,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         }
         let queue = queues.get_mut(&(at.line, at.stop)).unwrap();
         let mut remaining = at.remaining;
-        while remaining < CAPACITY {
+        while remaining < BUS_CAPACITY {
             let Some((since, id)) = queue.pop_front() else {
                 break;
             };

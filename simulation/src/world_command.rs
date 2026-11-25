@@ -2266,6 +2266,7 @@ impl WorldCommand {
             BootstrapKind::AuthoredFlat => {
                 !options.save_replay
                     && options.preset == MapPreset::Flat
+                    && options.population_scale().is_ok()
                     && (1..=crate::NewGameOptions::MAX_TERRAIN_CHUNKS)
                         .contains(&options.terrain_size)
             }

@@ -22,6 +22,8 @@ pub fn citystats(_: &UiWorld, sim: &Simulation, opened: &mut bool) {
     }
     .show(|| {
         let stats = sim.read::<CityStats>();
+        let scale = sim.population_scale();
+        textc(on_secondary_container(), scale.to_string());
         let level = use_state(|| 1usize);
         minrow(6.0, || {
             for (index, name) in LEVEL_NAMES.into_iter().enumerate() {
@@ -36,36 +38,74 @@ pub fn citystats(_: &UiWorld, sim: &Simulation, opened: &mut bool) {
             textc(on_secondary_container(), "Waiting for history samples");
         }
 
-        type Series = (&'static str, String, fn(&CityStatsSample) -> f64);
+        let vacant_jobs: usize = sim
+            .world()
+            .companies
+            .values()
+            .map(|c| (c.comp.max_workers as usize).saturating_sub(c.workers.0.len()))
+            .sum();
+        textc(
+            on_secondary_container(),
+            format!(
+                "{} in workforce · {} unemployed · {} vacant jobs",
+                scale.persons(stats.population as usize),
+                scale.persons(stats.population.saturating_sub(stats.employed) as usize),
+                scale.persons(vacant_jobs),
+            ),
+        );
+
+        type Series = (&'static str, String, fn(&CityStatsSample) -> f64, f64);
+        let person_multiplier = f64::from(scale.persons_per_agent());
         let series: [Series; 6] = [
-            ("Population", stats.population.to_string(), |s| {
-                f64::from(s.population)
-            }),
-            ("Employed", stats.employed.to_string(), |s| {
-                f64::from(s.employed)
-            }),
-            ("Residences", stats.residences.to_string(), |s| {
-                f64::from(s.residences)
-            }),
-            ("Companies", stats.companies.to_string(), |s| {
-                f64::from(s.companies)
-            }),
-            ("Vehicles", stats.vehicles.to_string(), |s| {
-                f64::from(s.vehicles)
-            }),
+            (
+                "Population",
+                scale.persons(stats.population as usize).to_string(),
+                |s| f64::from(s.population),
+                person_multiplier,
+            ),
+            (
+                "Employed",
+                scale.persons(stats.employed as usize).to_string(),
+                |s| f64::from(s.employed),
+                person_multiplier,
+            ),
+            (
+                "Residences",
+                stats.residences.to_string(),
+                |s| f64::from(s.residences),
+                1.0,
+            ),
+            (
+                "Companies",
+                stats.companies.to_string(),
+                |s| f64::from(s.companies),
+                1.0,
+            ),
+            (
+                "Vehicles",
+                stats.vehicles.to_string(),
+                |s| f64::from(s.vehicles),
+                1.0,
+            ),
             (
                 "Treasury",
                 money(i128::from(stats.money.inner()), false),
                 |s| s.money.inner() as f64,
+                1.0,
             ),
         ];
 
         for series_row in series.chunks(2) {
             minrow(12.0, || {
-                for (label, current, extract) in series_row {
+                for (label, current, extract, multiplier) in series_row {
                     mincolumn(4.0, || {
                         textc(on_secondary_container(), format!("{label}  {current}"));
-                        chart(samples.iter().map(|sample| extract(sample)).collect());
+                        chart(
+                            samples
+                                .iter()
+                                .map(|sample| extract(sample) * multiplier)
+                                .collect(),
+                        );
                     });
                 }
             });

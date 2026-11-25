@@ -93,6 +93,7 @@ impl Simulation {
                 progression: options.progression,
                 land_mode: crate::map::LandMode::Unrestricted,
                 land_recipe: crate::map::LandRecipe::Unrestricted,
+                persons_per_agent: options.persons_per_agent,
             },
         )
         .map_err(|error| format!("import bootstrap: {error:?}"))?;
@@ -732,6 +733,7 @@ mod tests {
             progression: crate::economy::progression::ProgressionMode::FreeBuild,
             lot_layout: crate::map::LotLayout::Varied,
             land_mode: Default::default(),
+            ..NewGameOptions::default()
         };
         let (sim, report) = Simulation::from_imported_city(&city, &options).unwrap();
         let map = sim.map();
@@ -763,6 +765,7 @@ mod tests {
             progression: crate::economy::progression::ProgressionMode::FreeBuild,
             lot_layout: crate::map::LotLayout::Varied,
             land_mode: Default::default(),
+            ..NewGameOptions::default()
         }
     }
 

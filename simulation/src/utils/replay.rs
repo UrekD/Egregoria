@@ -1,3 +1,4 @@
+use crate::economy::population::PopulationScale;
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::{ReplayWorldCommand, WorldCommand};
 use crate::{SaveLoadError, Simulation, SimulationOptions, INITIAL_TICK, START_COMMANDS};
@@ -73,17 +74,42 @@ impl Replay {
 
     pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
         match self.commands.first() {
-            Some((Tick(INITIAL_TICK), WorldCommand::Init(options)))
-                if !options.new_game_options().is_valid() || !options.valid_for_bootstrap() =>
-            {
-                Err(invalid_replay(
-                    "Replay Init contains invalid new-game options",
-                ))
+            Some((Tick(INITIAL_TICK), WorldCommand::Init(options))) => {
+                options.population_scale().map_err(|error| {
+                    io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {error}"))
+                })?;
+                if !options.valid_for_bootstrap() {
+                    return Err(invalid_replay(
+                        "Replay Init contains invalid new-game options",
+                    ));
+                }
+                Ok(**options)
             }
-            Some((Tick(INITIAL_TICK), WorldCommand::Init(options))) => Ok(**options),
             _ => Err(invalid_replay(
                 "Replay must begin with Init at the initial tick",
             )),
+        }
+    }
+
+    pub(crate) fn validate_population_scale(&self, scale: PopulationScale) -> io::Result<()> {
+        if self
+            .recorded_population_scale()?
+            .is_some_and(|recorded| recorded != scale)
+        {
+            return Err(invalid_replay(
+                "Replay Init population ratio does not match the snapshot",
+            ));
+        }
+        Ok(())
+    }
+
+    fn recorded_population_scale(&self) -> io::Result<Option<PopulationScale>> {
+        match self.commands.first() {
+            Some((_, WorldCommand::Init(options))) => options
+                .population_scale()
+                .map(Some)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            _ => Ok(None),
         }
     }
 
@@ -310,7 +336,9 @@ impl ReplayJson {
                 "Replay revision does not match the snapshot",
             )));
         }
-        JSON::decode(bytes).map_err(replay_corrupt)
+        let replay: Replay = JSON::decode(bytes).map_err(replay_corrupt)?;
+        replay.recorded_population_scale().map_err(replay_corrupt)?;
+        Ok(replay)
     }
 }
 

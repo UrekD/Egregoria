@@ -69,7 +69,8 @@ fn p4a_slot_round_trip_tracks_revision_and_removes_an_old_replay() {
         meta.money_cents,
         city.read::<crate::economy::Government>().money.cents()
     );
-    assert_eq!(meta.population, city.world().humans.len() as u32);
+    assert_eq!(meta.population, city.world().humans.len() as u64);
+    assert_eq!(meta.persons_per_agent, 1);
     assert_eq!(
         Simulation::load_from_slot(&root.0, &id).unwrap().hashes(),
         city.hashes()
@@ -96,6 +97,46 @@ fn p4a_slot_round_trip_tracks_revision_and_removes_an_old_replay() {
         Simulation::load_from_slot(&root.0, &id).unwrap().hashes(),
         city.hashes()
     );
+}
+
+#[test]
+fn population_scale_slot_round_trip_advertises_eight_before_opening() {
+    let options = NewGameOptions {
+        persons_per_agent: 8,
+        ..options()
+    };
+    let mut city = Simulation::new_game_with_replay(&options).unwrap();
+    city.tick(&mut Simulation::schedule(), &[]);
+    let root = TestRoot::new();
+    let id = SlotId::new("scaled").unwrap();
+    let revision = SnapshotRevision::new(91);
+    assert!(matches!(
+        city.save_to_slot(&root.0, &id, revision).unwrap(),
+        SavePhase::Complete
+    ));
+    let listed = crate::list_slots_with_revisions(&root.0, |path, kind| {
+        Simulation::read_slot_snapshot_header(path, kind)
+            .unwrap()
+            .revision
+    })
+    .unwrap();
+    let entry = &listed[0];
+    let meta = entry.meta.as_ref().unwrap();
+    assert_eq!(meta.revision, Some(revision.get()));
+    assert_eq!(meta.persons_per_agent, 8);
+    assert_eq!(
+        meta.population,
+        city.population_scale().persons(city.world().humans.len())
+    );
+    let restored = Simulation::load_listed_snapshot(&root.0, entry).unwrap();
+    assert_eq!(restored.population_scale(), city.population_scale());
+    assert_eq!(restored.hashes(), city.hashes());
+
+    let replay = Simulation::load_replay_from_slot(&root.0, &id).unwrap();
+    let (mut replayed, mut loader) = Simulation::try_from_replay(replay).unwrap();
+    assert_eq!(replayed.population_scale().persons_per_agent(), 8);
+    assert!(loader.advance_tick(&mut replayed, &mut Simulation::schedule()));
+    assert_eq!(replayed.hashes(), city.hashes());
 }
 
 #[test]

@@ -129,6 +129,7 @@ fn osm_fixture_builds_routes_and_round_trips_a_slot() {
         progression: simulation::economy::progression::ProgressionMode::FreeBuild,
         lot_layout: simulation::map::LotLayout::Varied,
         land_mode: Default::default(),
+        ..NewGameOptions::default()
     };
     let build = || {
         let (mut sim, network) =

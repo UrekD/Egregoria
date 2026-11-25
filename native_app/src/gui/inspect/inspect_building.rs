@@ -41,6 +41,7 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
     let Some(diagnostics) = building_diagnostics(sim, id) else {
         return false;
     };
+    let scale = sim.population_scale();
 
     let title: &str = match building.kind {
         BuildingKind::House => "House",
@@ -79,7 +80,8 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                             ));
                             label(format!(
                                 "Jobs  {} / {}",
-                                site.filled_jobs, site.planned_jobs
+                                scale.persons(site.filled_jobs),
+                                scale.persons(site.planned_jobs as usize)
                             ));
                             match site.business {
                                 Some(GrowableBusinessState::AwaitingSpawn) => {
@@ -105,7 +107,10 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                                 density_name(proto.density),
                                 proto.level
                             ));
-                            label(format!("Job capacity  {}", proto.n_workers));
+                            label(format!(
+                                "Job capacity  {}",
+                                scale.persons(proto.n_workers as usize)
+                            ));
                         }
                         render_goodscompany(uiworld, sim, building);
                     }
@@ -181,6 +186,8 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         .iter()
         .filter(|(_, human)| human.work.is_some())
         .count();
+    let scale = sim.population_scale();
+    let population = scale.persons(residents.len());
     if !b.is_mixed_use() {
         label(format!(
             "Residential · {} density · Level {level}",
@@ -188,10 +195,14 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         ));
     }
     if let Some(capacity) = capacity {
-        label(format!("Residents  {} / {capacity}", residents.len()));
+        let capacity = scale.persons(capacity as usize);
+        label(format!("Residents  {population} / {capacity}"));
     }
     if !residents.is_empty() {
-        label(format!("Employment  {employed} / {}", residents.len()));
+        label(format!(
+            "Employment  {} / {population}",
+            scale.persons(employed)
+        ));
     }
 
     if !residents.is_empty() {
@@ -357,13 +368,18 @@ fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     let elec_flow = &*sim.read::<ElectricityFlow>();
 
     let max_workers = goods.max_workers;
+    let scale = sim.population_scale();
     ProgressBar {
-        value: workers.0.len() as f32 / max_workers as f32,
+        value: workers.0.len() as f32 / max_workers.max(1) as f32,
         size: Vec2::new(200.0, 25.0),
         color: primary().adjust(0.7),
     }
     .show_children(|| {
-        label(format!("workers: {}/{}", workers.0.len(), max_workers));
+        label(format!(
+            "Workers  {} / {}",
+            scale.persons(workers.0.len()),
+            scale.persons(max_workers as usize)
+        ));
     });
 
     if let Some(driver) = goods.driver {

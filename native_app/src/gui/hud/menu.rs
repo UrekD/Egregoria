@@ -132,7 +132,9 @@ fn save_window(uiw: &UiWorld, sim: &Simulation) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::hud::demand_bars;
     use crate::gui::hud::time_controls::time_controls;
+    use simulation::PopulationScale;
     use yakui::font::{Font, FontSettings, Fonts};
     use yakui::widgets::{ButtonWidget, OpaqueWidget};
     use yakui::{Rect, WidgetId, Yakui};
@@ -147,10 +149,14 @@ mod tests {
         }
     }
 
-    fn assert_hud_fits(width: f32, height: f32) {
+    fn assert_hud_fits(width: f32, height: f32, scale: PopulationScale) {
         scenarios::ensure_repo_root_cwd();
         crate::init::init();
-        let sim = Simulation::new(false);
+        let sim = Simulation::new_with_options(simulation::SimulationOptions {
+            terrain_size: 0,
+            persons_per_agent: scale.persons_per_agent(),
+            ..simulation::SimulationOptions::LEGACY
+        });
         sim.write::<Government>().money = prototypes::Money::MAX;
         let uiworld = UiWorld::with_defaults();
         uiworld.write::<session::SessionState>().active_slot =
@@ -180,6 +186,7 @@ mod tests {
         column(|| {
             menu_bar(&uiworld, &sim);
             time_controls(&uiworld, &sim);
+            demand_bars::render(&uiworld, &sim);
         });
         ui.finish();
 
@@ -212,11 +219,16 @@ mod tests {
 
     #[test]
     fn ui1_hud_fits_at_1024() {
-        assert_hud_fits(1024.0, 768.0);
+        assert_hud_fits(1024.0, 768.0, PopulationScale::REALISTIC);
+    }
+
+    #[test]
+    fn population_scale_hud_fits_at_1024() {
+        assert_hud_fits(1024.0, 768.0, PopulationScale::try_new(8).unwrap());
     }
 
     #[test]
     fn ui1_hud_fits_at_1280() {
-        assert_hud_fits(1280.0, 720.0);
+        assert_hud_fits(1280.0, 720.0, PopulationScale::REALISTIC);
     }
 }

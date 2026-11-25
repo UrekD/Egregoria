@@ -186,6 +186,7 @@ impl Simulation {
                 owned_rect: spec.owned_rect,
                 lot_layout: spec.lot_layout,
             },
+            persons_per_agent: SimulationOptions::LEGACY.persons_per_agent,
         };
         let mut sim = Self::with_initial_resources();
         WorldCommand::bootstrap_authored(&mut sim, options, spec.lot_layout)
@@ -284,6 +285,7 @@ impl Simulation {
                 progression: options.progression,
                 land_mode: crate::map::LandMode::Unrestricted,
                 land_recipe: crate::map::LandRecipe::Unrestricted,
+                persons_per_agent: SimulationOptions::LEGACY.persons_per_agent,
             },
             options.lot_layout,
         )

@@ -43,6 +43,10 @@ pub fn inspect_human(uiworld: &UiWorld, sim: &Simulation, id: HumanID) -> bool {
         if cfg!(debug_assertions) {
             label(format!("{:?}", id));
         }
+        let scale = sim.population_scale();
+        if scale != simulation::PopulationScale::REALISTIC {
+            label(format!("Representative agent · {scale}"));
+        }
 
         match human.location {
             Location::Outside => {}
