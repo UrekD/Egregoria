@@ -17,6 +17,27 @@ pub(crate) fn render_modal(uiw: &UiWorld, sim: &Simulation) {
     if session::render_loading(uiw) {
         return;
     }
+    #[cfg(feature = "multiplayer")]
+    if uiw.read::<SaveLoadState>().network_busy {
+        let mut opened = true;
+        Window {
+            title: "Network".into(),
+            pad: Pad::all(16.0),
+            radius: 10.0,
+            opened: &mut opened,
+            child_spacing: 8.0,
+        }
+        .show(|| {
+            textc(on_secondary_container(), "Preparing multiplayer…");
+            if button_secondary("Cancel").show().clicked {
+                uiw.write::<SaveLoadState>().network_cancel = true;
+            }
+        });
+        if !opened {
+            uiw.write::<SaveLoadState>().network_cancel = true;
+        }
+        return;
+    }
     let (saving_as, settings_open) = {
         let ui = uiw.read::<SessionUi>();
         (ui.save_as.is_some(), ui.settings_open)
@@ -49,7 +70,7 @@ pub(crate) fn render_modal(uiw: &UiWorld, sim: &Simulation) {
         }
         if session::can_save(uiw) {
             let io = uiw.read::<SaveLoadState>();
-            if io.pending_save.is_some() || io.save_result.is_some() {
+            if io.saving() {
                 textc(on_secondary_container(), "Saving…");
             } else {
                 drop(io);

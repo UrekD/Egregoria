@@ -67,6 +67,15 @@ impl ToastState {
         self.sampler.details(notice)
     }
 
+    pub(crate) fn observe_applied(
+        &mut self,
+        sim: &Simulation,
+        sequence: u64,
+        rejections: &[(usize, &'static str, simulation::world_command::Rejection)],
+    ) {
+        self.sampler.observe_applied(sim, sequence, rejections);
+    }
+
     pub(super) fn observe(&mut self, sim: &Simulation, visible: bool, now: Instant) {
         self.sampler.observe(sim);
         self.observed_at = visible.then_some(now);

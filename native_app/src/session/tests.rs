@@ -279,3 +279,40 @@ fn p4_world_replacement_clears_world_identity_and_requires_fresh_input() {
     assert!(uiw.commands().is_empty());
     assert_eq!(sim.read::<Transit>().lines[line].fare, Money::new_bucks(2));
 }
+
+#[test]
+fn scale_t1_publication_gate_is_polled_for_new_generation() {
+    let coordinator = save_coordinator::SaveCoordinator::default();
+    let slot = SlotId::legacy();
+    let permit = coordinator.request(0, &slot).unwrap();
+    let (locked, ready) = std::sync::mpsc::channel();
+    let (unlock, done) = std::sync::mpsc::channel();
+    let job = std::thread::spawn({
+        let coordinator = coordinator.clone();
+        move || {
+            coordinator.publish(&permit, || {
+                locked.send(()).unwrap();
+                done.recv_timeout(Duration::from_secs(5)).unwrap()
+            })
+        }
+    });
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    assert!(!coordinator.try_swap(1));
+    assert!(coordinator.request(0, &slot).is_none());
+    unlock.send(()).unwrap();
+    assert_eq!(job.join().unwrap(), Some(()));
+    assert!(coordinator.try_swap(1));
+    assert!(coordinator.request(0, &slot).is_none());
+    assert!(coordinator.request(1, &slot).is_some());
+}
+
+#[test]
+fn scale_t1_screen_transition_retains_staged_input() {
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let uiw = UiWorld::with_defaults();
+    uiw.commands()
+        .push(WorldCommand::SpawnRandomCars { n_cars: 0 });
+    assert!(set_screen(&uiw, SessionScreen::MainMenu));
+    assert_eq!(uiw.commands().as_ref().len(), 1);
+}

@@ -170,7 +170,10 @@ fn invalid_replay(message: &'static str) -> io::Error {
 pub(crate) fn replay_version_error(version: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
-        format!("Replay has version {version:?}, expected {:?}", crate::VERSION),
+        format!(
+            "Replay has version {version:?}, expected {:?}",
+            crate::VERSION
+        ),
     )
 }
 
@@ -260,10 +263,28 @@ pub struct SimulationReplayLoader {
     pub advance_n_ticks: usize,
     steps: u64,
     batch: usize,
+    legacy_groups: Vec<usize>,
 }
 
 impl SimulationReplayLoader {
     pub(crate) fn new(replay: Replay, pastt: Tick, idx: usize) -> Self {
+        let mut legacy_groups = Vec::new();
+        if !replay.has_timeline() {
+            for (offset, pair) in replay
+                .commands
+                .get(idx..)
+                .unwrap_or_default()
+                .windows(2)
+                .enumerate()
+            {
+                if pair[0].0 != pair[1].0 {
+                    legacy_groups.push(idx + offset + 1);
+                }
+            }
+            if idx < replay.commands.len() {
+                legacy_groups.push(replay.commands.len());
+            }
+        }
         Self {
             replay,
             pastt,
@@ -272,7 +293,38 @@ impl SimulationReplayLoader {
             advance_n_ticks: 0,
             steps: 0,
             batch: 0,
+            legacy_groups,
         }
+    }
+
+    /// Check the complete playback envelope before handing the cursor to a
+    /// driver. Constructor operations have already run during bootstrap.
+    pub fn validate_batches(
+        &self,
+        mut fits: impl FnMut(&[(Tick, WorldCommand)]) -> bool,
+    ) -> io::Result<()> {
+        let mut first = self.idx;
+        let ends = self
+            .replay
+            .timeline
+            .iter()
+            .flat_map(|timeline| {
+                timeline
+                    .batches
+                    .iter()
+                    .skip(self.batch)
+                    .map(|batch| batch.end)
+            })
+            .chain(self.legacy_groups.iter().skip(self.batch).copied());
+        for end in ends {
+            if !fits(&self.replay.commands[first..end]) {
+                return Err(invalid_replay(
+                    "Replay batch exceeds the simulation admission limit",
+                ));
+            }
+            first = end;
+        }
+        Ok(())
     }
 
     pub fn step_progress(&self) -> Option<(u64, u64)> {
@@ -282,93 +334,148 @@ impl SimulationReplayLoader {
             .map(|timeline| (self.steps, timeline.steps))
     }
 
-    /// Returns true if the replay is finished
+    /// Returns true if the replay is finished.
     pub fn advance_tick(&mut self, sim: &mut Simulation, schedule: &mut SeqSchedule) -> bool {
-        let ticks_left = if self.speed == 0 {
+        let count = if self.speed == 0 {
             std::mem::take(&mut self.advance_n_ticks)
         } else {
             self.speed
         };
-        let finished = if self.replay.has_timeline() {
-            self.advance_timeline(sim, schedule, ticks_left)
-        } else {
-            self.advance_legacy(sim, schedule, ticks_left)
-        };
-        self.pastt = Tick(sim.get_tick());
-        finished
-    }
-
-    fn advance_timeline(
-        &mut self,
-        sim: &mut Simulation,
-        schedule: &mut SeqSchedule,
-        mut ticks_left: usize,
-    ) -> bool {
-        let timeline = self.replay.timeline.as_ref().unwrap();
-        // Leave paused batches pending while paused. After stepping, apply any
-        // paused edits at the reached boundary before reporting completion.
-        let playing = ticks_left != 0;
+        let mut budget = ReplayBudget::new(count);
         loop {
-            let batch = timeline.batches.get(self.batch);
-            let ready = batch.filter(|batch| batch.step == self.steps);
-            if let Some(batch) = ready.filter(|batch| playing && !batch.steps_systems) {
-                sim.apply_commands(self.replay.commands(self.idx..batch.end));
-                self.idx = batch.end;
-                self.batch += 1;
-                continue;
+            if let ReplayAdvance::Settled { complete } =
+                self.advance_one(sim, schedule, &mut budget)
+            {
+                self.pastt = Tick(sim.get_tick());
+                return complete;
             }
-            if self.steps == timeline.steps {
-                return batch.is_none();
-            }
-            if ticks_left == 0 {
-                return false;
-            }
-            if let Some(batch) = ready {
-                sim.tick(schedule, self.replay.commands(self.idx..batch.end));
-                self.idx = batch.end;
-                self.batch += 1;
-            } else {
-                sim.tick(schedule, &[]);
-            }
-            self.steps += 1;
-            ticks_left -= 1;
         }
     }
 
-    fn advance_legacy(
+    /// Apply at most one atomic batch or run one schedule step. A positive
+    /// timeline budget settles instant edits at the destination step.
+    pub fn advance_one(
         &mut self,
         sim: &mut Simulation,
         schedule: &mut SeqSchedule,
-        mut ticks_left: usize,
-    ) -> bool {
-        let mut tick = Tick(sim.get_tick());
-        while self.idx < self.replay.commands.len() && ticks_left > 0 {
-            let curt = self.replay.commands[self.idx].0;
-            while tick < curt {
-                sim.tick(schedule, &[]);
-                tick = Tick(sim.get_tick());
-                ticks_left -= 1;
-                if ticks_left == 0 {
-                    return false;
-                }
+        budget: &mut ReplayBudget,
+    ) -> ReplayAdvance {
+        let tick = Tick(sim.get_tick());
+        let (end, advanced) = if let Some(timeline) = &self.replay.timeline {
+            let next = timeline.batches.get(self.batch);
+            let ready = next.filter(|batch| batch.step == self.steps);
+            if let Some(batch) = ready.filter(|batch| budget.started && !batch.steps_systems) {
+                (Some(batch.end), false)
+            } else if self.steps == timeline.steps || budget.remaining == 0 {
+                return ReplayAdvance::Settled {
+                    complete: self.steps == timeline.steps && next.is_none(),
+                };
+            } else {
+                (ready.map(|batch| batch.end), true)
             }
-
-            let idx_start = self.idx;
-            while self.idx < self.replay.commands.len() && self.replay.commands[self.idx].0 == curt
+        } else {
+            let next = self.legacy_groups.get(self.batch).copied();
+            if budget.remaining > 0 && next.is_some() && tick >= self.replay.commands[self.idx].0 {
+                (next, false)
+            } else if budget.remaining == 0
+                || (next.is_none() && tick >= self.replay.last_tick_recorded)
             {
-                self.idx += 1;
+                return ReplayAdvance::Settled {
+                    complete: next.is_none() && tick >= self.replay.last_tick_recorded,
+                };
+            } else {
+                (None, true)
             }
-            sim.apply_commands(self.replay.commands(idx_start..self.idx));
-            tick = Tick(sim.get_tick());
+        };
+
+        let commands = self.replay.commands(self.idx..end.unwrap_or(self.idx));
+        if advanced {
+            sim.tick(schedule, commands);
+            self.steps += 1;
+            budget.remaining -= 1;
+        } else {
+            sim.apply_commands(commands);
         }
-        if self.idx < self.replay.commands.len() {
-            return false;
+        let batch = end.map(|end| {
+            self.idx = end;
+            self.batch += 1;
+            self.batch - 1
+        });
+        self.pastt = Tick(sim.get_tick());
+        ReplayAdvance::Operation {
+            step: self.steps,
+            batch,
+            tick: self.pastt,
+            advanced,
         }
-        while ticks_left > 0 && tick < self.replay.last_tick_recorded {
-            sim.tick(schedule, &[]);
-            tick = Tick(sim.get_tick());
-            ticks_left -= 1;
+    }
+}
+
+pub type ReplayCursor = SimulationReplayLoader;
+
+pub struct ReplayBudget {
+    remaining: usize,
+    started: bool,
+}
+
+impl ReplayBudget {
+    pub fn new(steps: usize) -> Self {
+        Self {
+            remaining: steps,
+            started: steps != 0,
         }
-        tick >= self.replay.last_tick_recorded
+    }
+}
+
+#[derive(Debug)]
+pub enum ReplayAdvance {
+    Operation {
+        step: u64,
+        batch: Option<usize>,
+        tick: Tick,
+        advanced: bool,
+    },
+    Settled {
+        complete: bool,
+    },
+}
+
+#[cfg(test)]
+#[test]
+fn scale_t1_replay_boundary_keeps_legacy_edit_pending() {
+    let mut sim = crate::tests::TestCtx::new().g;
+    let mut schedule = Simulation::schedule();
+    let initial = sim.get_tick();
+    let command = WorldCommand::SetGameTime(prototypes::GameTime::new(Tick(initial + 20)));
+    let mut legacy = Replay::default();
+    legacy.push(Tick(initial + 1), command.clone());
+    let mut timeline = legacy.clone();
+    timeline.timeline = Some(ReplayTimeline {
+        constructor_end: 0,
+        steps: 1,
+        batches: vec![ReplayBatch {
+            step: 1,
+            end: 1,
+            steps_systems: false,
+        }],
+    });
+    let mut legacy = SimulationReplayLoader::new(legacy, Tick(initial), 0);
+    let mut timeline = SimulationReplayLoader::new(timeline, Tick(initial), 0);
+    for (cursor, expected, pending) in [
+        (&mut legacy, initial + 1, 0),
+        (&mut timeline, initial + 20, 1),
+    ] {
+        let mut budget = ReplayBudget::new(1);
+        loop {
+            if matches!(
+                cursor.advance_one(&mut sim, &mut schedule, &mut budget),
+                ReplayAdvance::Settled { .. }
+            ) {
+                break;
+            }
+        }
+        assert_eq!(sim.get_tick(), expected);
+        assert_eq!(cursor.idx, pending);
+        *sim.write::<prototypes::GameTime>() = prototypes::GameTime::new(Tick(initial));
     }
 }

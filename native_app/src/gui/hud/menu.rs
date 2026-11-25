@@ -116,7 +116,7 @@ fn save_window(uiw: &UiWorld, sim: &Simulation) {
     if session::can_save(uiw) {
         let busy = {
             let io = uiw.read::<SaveLoadState>();
-            io.pending_save.is_some() || io.save_result.is_some()
+            io.saving()
         };
         if busy {
             textc(on_secondary_container(), "Saving…");

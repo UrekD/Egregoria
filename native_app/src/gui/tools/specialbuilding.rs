@@ -68,7 +68,26 @@ fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnO
             .received_commands()
             .iter()
             .any(|command| pending.matches(command));
-        let accepted = if is_local() {
+        let local = is_local();
+        let accepted = if local
+            && uiworld
+                .try_read::<crate::uiworld::SaveLoadState>()
+                .is_some_and(|io| io.threaded)
+        {
+            let Some(outcome) = uiworld
+                .received_commands()
+                .placement(pending.index, |input| pending.matches(input))
+            else {
+                return;
+            };
+            if let Err(Some(reason)) = outcome {
+                state.rejection = Some((
+                    command_message("MapBuildSpecialBuilding", reason),
+                    state.frame,
+                ));
+            }
+            outcome.is_ok()
+        } else if local {
             // Singleplayer applies the whole command queue as one batch, so the placement
             // keeps its queue index in that batch. While it is still queued, the latest
             // outcomes belong to some other batch.
@@ -280,18 +299,16 @@ fn specialbuilding_input(sim: &Simulation, uiworld: &UiWorld, is_local: impl FnO
     }
 }
 
-/// The outcome of the command at `index` in the latest batch. Each rejected command adds
-/// exactly one entry to `last`, in command order, so its entry follows from the accepted
-/// indices before it. The error is `None` when the entry is not a placement rejection.
+/// The most recent batch reports rejections by command index, including
+/// multi-link operations that emitted more than one rejection.
 fn placement_outcome(outcomes: &CommandOutcomes, index: usize) -> Result<(), Option<Rejection>> {
     if outcomes.accepted.contains(&index) {
         return Ok(());
     }
-    let accepted_before = outcomes.accepted.iter().filter(|&&i| i < index).count();
     Err(outcomes
-        .last
-        .get(index - accepted_before)
-        .filter(|(command, _)| *command == "MapBuildSpecialBuilding")
+        .rejections_for(index)
+        .iter()
+        .find(|(command, _)| *command == "MapBuildSpecialBuilding")
         .map(|&(_, reason)| reason))
 }
 

@@ -100,7 +100,12 @@ pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
     let depause_warp = &mut gui.depause_warp;
     let network = uiworld.read::<NetworkState>();
     let actual_warp = match &*network {
-        NetworkState::Singleplayer(step) => step.achieved_warp(*warp),
+        NetworkState::Singleplayer(step) => uiworld
+            .try_read::<crate::uiworld::SaveLoadState>()
+            .and_then(|io| io.achieved_warp)
+            .filter(|(requested, _)| *requested == *warp)
+            .map(|(_, achieved)| achieved)
+            .or_else(|| step.achieved_warp(*warp)),
         #[cfg(feature = "multiplayer")]
         NetworkState::Client(_) | NetworkState::Server(_) => None,
     };

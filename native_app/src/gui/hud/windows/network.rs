@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 use yakui::divider;
 use yakui::widgets::Pad;
 
-use common::saveload::Encoder;
 use goryak::{
     button_primary, checkbox_value, error, on_secondary_container, outline, text_edit, textc,
     Window,
@@ -15,7 +14,7 @@ use simulation::Simulation;
 use crate::network::NetworkState;
 use crate::uiworld::UiWorld;
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct NetworkConnectionInfo {
     pub name: String,
     pub ip: String,
@@ -36,6 +35,7 @@ fn label(x: impl Into<Cow<'static, str>>) {
 /// Network window
 /// Allows to connect to a server or start a server
 pub fn network(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
+    let mut target = None;
     Window {
         title: "Network".into(),
         opened,
@@ -44,9 +44,8 @@ pub fn network(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
         child_spacing: 10.0,
     }
     .show(|| {
-        let mut state = uiworld.write::<NetworkState>();
+        let state = uiworld.read::<NetworkState>();
         let mut info = uiworld.write::<NetworkConnectionInfo>();
-        common::saveload::JSONPretty::save_silent(&*info, "netinfo");
 
         match *state {
             NetworkState::Singleplayer(_) => {
@@ -63,9 +62,7 @@ pub fn network(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
                 }
 
                 if button_primary("Start server").show().clicked {
-                    if let Some(server) = crate::network::start_server(&mut info, sim) {
-                        *state = NetworkState::Server(server);
-                    }
+                    target = Some(crate::network::NetworkTarget::Host);
                 }
 
                 divider(outline(), 5.0, 1.0);
@@ -73,22 +70,33 @@ pub fn network(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
                 text_edit(200.0, &mut info.ip, "IP");
 
                 if button_primary("Connect").show().clicked {
-                    if let Some(c) = crate::network::start_client(&mut info) {
-                        *state = NetworkState::Client(c);
-                    }
+                    target = Some(crate::network::NetworkTarget::Connect);
                 }
             }
             NetworkState::Client(ref client) => {
                 label(client.lock().unwrap().describe());
                 show_hashes(sim, &mut info);
+                if button_primary("Disconnect").show().clicked {
+                    uiworld
+                        .write::<crate::uiworld::SaveLoadState>()
+                        .network_cancel = true;
+                }
             }
             NetworkState::Server(ref server) => {
                 label("Running server");
                 label(server.lock().unwrap().describe());
                 show_hashes(sim, &mut info);
+                if button_primary("Stop hosting").show().clicked {
+                    uiworld
+                        .write::<crate::uiworld::SaveLoadState>()
+                        .network_cancel = true;
+                }
             }
         }
     });
+    if let Some(target) = target {
+        crate::session::request_departure(uiworld, sim, crate::session::Departure::Network(target));
+    }
 }
 
 fn show_hashes(sim: &Simulation, info: &mut NetworkConnectionInfo) {

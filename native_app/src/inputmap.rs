@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt::{Debug, Display, Formatter};
 
 // Either combinations can work
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct InputCombinations(pub Vec<InputCombination>);
 
 #[derive(Clone, Hash, Eq, PartialEq, Ord, PartialOrd, Serialize, Deserialize)]
@@ -99,6 +99,24 @@ pub struct InputMap {
     cancel_held: bool,
     /// Where the Cancel press started, until the pointer moves far enough to make it a drag.
     cancel_origin: Option<Vec2>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorldInput {
+    just_act: FastSet<InputAction>,
+    act: FastSet<InputAction>,
+    screen: Vec2,
+    wheel: f32,
+    select_press: Option<UnitInput>,
+    held_select_inputs: FastSet<UnitInput>,
+    keyboard_allowed: bool,
+    mouse_allowed: bool,
+}
+
+impl WorldInput {
+    pub(crate) fn has_edge(&self) -> bool {
+        self.select_press.is_some() || !self.just_act.is_empty()
+    }
 }
 
 /// Separate signed terrain and half-open water intersections for the same ray.
@@ -513,6 +531,30 @@ fn same_key(unit: &UnitInput) -> UnitInput {
 }
 
 impl InputMap {
+    pub(crate) fn world_input(&self) -> WorldInput {
+        WorldInput {
+            just_act: self.just_act.clone(),
+            act: self.act.clone(),
+            screen: self.screen,
+            wheel: self.wheel,
+            select_press: self.select_press.clone(),
+            held_select_inputs: self.held_select_inputs.clone(),
+            keyboard_allowed: self.keyboard_allowed,
+            mouse_allowed: self.mouse_allowed,
+        }
+    }
+
+    pub(crate) fn set_world_input(&mut self, input: WorldInput) {
+        self.just_act = input.just_act;
+        self.act = input.act;
+        self.screen = input.screen;
+        self.wheel = input.wheel;
+        self.select_press = input.select_press;
+        self.held_select_inputs = input.held_select_inputs;
+        self.keyboard_allowed = input.keyboard_allowed;
+        self.mouse_allowed = input.mouse_allowed;
+    }
+
     pub(crate) fn set_world_ray(&mut self, ray: Option<Ray3>, map: &Map, pick_deck: bool) {
         self.ray = ray;
         self.world_projection = ray.map(|ray| {

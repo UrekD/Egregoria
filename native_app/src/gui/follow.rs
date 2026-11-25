@@ -1,4 +1,3 @@
-use crate::game_loop::State;
 use crate::inputmap::{InputAction, InputMap};
 use crate::uiworld::UiWorld;
 use geom::Vec3;
@@ -11,8 +10,8 @@ use simulation::{AnyEntity, Simulation, VehicleID};
 pub struct FollowEntity(pub Option<AnyEntity>);
 
 impl FollowEntity {
-    pub fn update_camera(state: &mut State) {
-        let just = &state.uiw.read::<InputMap>().just_act;
+    pub fn update_camera(uiw: &UiWorld, sim: &Simulation) {
+        let just = &uiw.read::<InputMap>().just_act;
         if [
             InputAction::CameraMove,
             InputAction::GoForward,
@@ -23,10 +22,10 @@ impl FollowEntity {
         .iter()
         .any(|x| just.contains(x))
         {
-            state.uiw.write::<FollowEntity>().0.take();
+            uiw.write::<FollowEntity>().0.take();
         }
 
-        Self::track(&state.uiw, &state.sim.read().unwrap());
+        Self::track(uiw, sim);
     }
 
     /// Move the camera to the followed entity, and stop following once it is despawned.

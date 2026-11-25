@@ -18,10 +18,20 @@ pub trait State: 'static {
     fn new(ctx: &mut Context) -> Self;
 
     /// Called every frame to update the game state.
-    fn update(&mut self, ctx: &mut Context);
+    fn update(&mut self, ctx: &mut Context) {}
 
     /// Called every frame to prepare the game rendering.
-    fn render(&mut self, fc: &mut FrameContext);
+    fn render(&mut self, fc: &mut FrameContext) {}
+
+    /// Pump state once, then optionally present. A custom frame can borrow one
+    /// view across scene preparation and both GUI passes.
+    fn frame(&mut self, ctx: &mut Context)
+    where
+        Self: Sized,
+    {
+        self.update(ctx);
+        ctx.present(self, Self::render, Self::render_gui, Self::render_yakui);
+    }
 
     /// Called when the window is resized.
     fn resized(&mut self, ctx: &mut Context, size: (u32, u32, f64)) {}
@@ -36,7 +46,6 @@ pub trait State: 'static {
     fn render_gui(&mut self, ui: &egui::Context) {}
 
     /// Called every frame to prepare the gui rendering.
-    #[cfg(feature = "yakui")]
     fn render_yakui(&mut self) {}
 }
 
@@ -48,9 +57,12 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
     let mut scale_factor = ctx.gfx.window.scale_factor();
     log::info!("initial scale factor: {:?}", scale_factor);
     let mut last_update = Instant::now();
+    let report_frames = std::env::var_os("EGREGORIA_FRAME_TIMINGS").is_some();
+    let mut last_present = None::<Instant>;
+    let mut retry_redraw = None;
 
     el.run(move |event, target| {
-        target.set_control_flow(ControlFlow::Poll);
+        target.set_control_flow(retry_redraw.map_or(ControlFlow::Poll, ControlFlow::WaitUntil));
 
         if let Event::WindowEvent { event, .. } = &event {
             let egui_events = ctx.egui.platform.egui_input().events.len();
@@ -88,6 +100,11 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
         }
 
         match event {
+            Event::AboutToWait if retry_redraw.is_some_and(|retry| Instant::now() >= retry) => {
+                retry_redraw = None;
+                target.set_control_flow(ControlFlow::Poll);
+                ctx.gfx.window.request_redraw();
+            }
             Event::DeviceEvent { event, .. } => {
                 ctx.input.handle_device(&event);
             }
@@ -97,6 +114,7 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                 if ctx.gfx.update_sc {
                     ctx.gfx.update_sc = false;
                     let size = (ctx.gfx.size.0, ctx.gfx.size.1, scale_factor);
+                    ctx.next_surface = None;
                     ctx.gfx.resize(size);
                     state.resized(&mut ctx, size);
                 }
@@ -105,6 +123,7 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                     WindowEvent::Resized(physical_size) => {
                         log::info!("resized: {:?}", physical_size);
                         let size = (physical_size.width, physical_size.height, scale_factor);
+                        ctx.next_surface = None;
                         ctx.gfx.resize(size);
                         state.resized(&mut ctx, size);
                     }
@@ -114,6 +133,7 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                         log::info!("scale_factor: {:?}", scale_factor);
                         scale_factor = sf;
                         let size = (ctx.gfx.size.0, ctx.gfx.size.1, scale_factor);
+                        ctx.next_surface = None;
                         ctx.gfx.resize(size);
                         state.resized(&mut ctx, size);
                     }
@@ -123,55 +143,19 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                         }
                     }
                     WindowEvent::RedrawRequested => {
-                        let sco = match ctx.gfx.surface.get_current_texture() {
-                            Ok(swapchainframe) => swapchainframe,
-                            Err(wgpu::SurfaceError::Timeout) => ctx
-                                .gfx
-                                .surface
-                                .get_current_texture()
-                                .expect("Failed to acquire next swap chain texture after timeout"),
-                            Err(wgpu::SurfaceError::Outdated)
-                            | Err(wgpu::SurfaceError::Lost)
-                            | Err(wgpu::SurfaceError::OutOfMemory) => {
-                                let size = ctx.gfx.size;
-                                ctx.gfx.resize(size);
-                                state.resized(&mut ctx, size);
-                                ctx.gfx
-                                    .surface
-                                    .get_current_texture()
-                                    .expect("Failed to acquire next swap chain texture after losing surface")
-                            }
-                        };
-
+                        retry_redraw = None;
                         profiling::finish_frame!();
                         profiling::scope!("frame");
-                        let d = last_update.elapsed();
-                        last_update = Instant::now();
-                        ctx.delta = d.as_secs_f32();
+                        let now = Instant::now();
+                        ctx.delta = now.duration_since(last_update).as_secs_f32();
+                        last_update = now;
                         ctx.input.publish_pointer_frame(&ctx.egui);
-                        state.update(&mut ctx);
+                        let before = ctx.gfx.tick;
+                        state.frame(&mut ctx);
+                        ctx.finish_present();
                         if ctx.exit_requested {
                             target.exit();
                             return;
-                        }
-
-                        let (mut enc, view) = ctx.gfx.start_frame(&sco);
-                        (ctx.times.render_time, ctx.times.gui_time) = ctx
-                            .gfx
-                            .render(&mut enc, &view, &mut state, |state, mut gctx| {
-                                #[cfg(feature = "yakui")]
-                                ctx.yakui.render(&mut gctx, || {
-                                    state.render_yakui();
-                                });
-                                ctx.egui.render(gctx, |ui| {
-                                    state.render_gui(ui);
-                                });
-                            });
-
-                        ctx.gfx.finish_frame(enc);
-                        if let Some(path) = ctx.screenshot_request.take() {
-                            ctx.screenshot_result =
-                                Some(ctx.gfx.capture_screenshot(&sco.texture, &path));
                         }
                         let (icon, changed) = get_cursor_icon();
                         if changed {
@@ -179,9 +163,30 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                         }
                         ctx.input.end_frame();
                         ctx.times.total_cpu_time = last_update.elapsed().as_secs_f32();
-
-                        sco.present();
-                        ctx.gfx.window.request_redraw();
+                        if report_frames {
+                            if ctx.gfx.tick != before {
+                                let presented = Instant::now();
+                                let interval =
+                                    last_present.replace(presented).map_or(0.0, |last| {
+                                        presented.duration_since(last).as_secs_f64() * 1000.0
+                                    });
+                                eprintln!(
+                                    "frame_ms {:.3} {:.3}",
+                                    ctx.times.total_cpu_time * 1000.0,
+                                    interval
+                                );
+                            } else {
+                                eprintln!("frame_skipped");
+                            }
+                        }
+                        if ctx.gfx.tick == before {
+                            let retry = Instant::now() + std::time::Duration::from_millis(1);
+                            retry_redraw = Some(retry);
+                            target.set_control_flow(ControlFlow::WaitUntil(retry));
+                        } else {
+                            target.set_control_flow(ControlFlow::Poll);
+                            ctx.gfx.window.request_redraw();
+                        }
                     }
                     _ => (),
                 }
@@ -327,6 +332,9 @@ pub struct EngineTimes {
 /// Context is the main struct that contains all the context of the game.
 /// It holds the necessary state for graphics, input, audio, and the window.
 pub struct Context {
+    // Drop acquired textures before the graphics context that owns the surface.
+    next_surface: Option<wgpu::SurfaceTexture>,
+    prepared_frame: Option<(wgpu::SurfaceTexture, crate::gfx::Encoders)>,
     pub gfx: GfxContext,
     pub input: InputContext,
     pub audio: AudioContext,
@@ -356,6 +364,8 @@ impl Context {
             keybind_mode: false,
             times: EngineTimes::default(),
             egui,
+            next_surface: None,
+            prepared_frame: None,
             screenshot_request: None,
             screenshot_result: None,
             exit_requested: false,
@@ -365,7 +375,72 @@ impl Context {
         }
     }
 
-    /// Capture the next rendered frame after its UI pass.
+    /// Acquire the surface after pumping input. A scoped world frame can call
+    /// this before taking its read lease so graphics backpressure does not hold it.
+    pub fn acquire_surface(&mut self) -> bool {
+        if self.exit_requested {
+            return false;
+        }
+        if self.next_surface.is_some() {
+            return true;
+        }
+        match self.gfx.surface.get_current_texture() {
+            Ok(surface) => {
+                self.next_surface = Some(surface);
+                true
+            }
+            Err(wgpu::SurfaceError::Timeout) => false,
+            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+                self.gfx.update_sc = true;
+                false
+            }
+            Err(wgpu::SurfaceError::OutOfMemory) => {
+                log::error!("Out of memory acquiring the surface");
+                self.request_exit();
+                false
+            }
+        }
+    }
+
+    /// Record scene and GUI rendering while the caller's view is borrowed.
+    pub fn present<S>(
+        &mut self,
+        state: &mut S,
+        render: impl FnOnce(&mut S, &mut FrameContext<'_>),
+        render_gui: impl FnOnce(&mut S, &egui::Context),
+        render_yakui: impl FnOnce(&mut S),
+    ) {
+        if !self.acquire_surface() {
+            return;
+        }
+        let surface = self.next_surface.take().unwrap();
+        let (mut enc, view) = self.gfx.start_frame(&surface);
+        (self.times.render_time, self.times.gui_time) =
+            self.gfx
+                .render(&mut enc, &view, state, render, |state, mut gui| {
+                    #[cfg(feature = "yakui")]
+                    self.yakui.render(&mut gui, || render_yakui(state));
+                    self.egui.render(gui, |ui| render_gui(state, ui));
+                });
+        self.prepared_frame = Some((surface, enc));
+    }
+
+    fn finish_present(&mut self) {
+        let Some((surface, enc)) = self.prepared_frame.take() else {
+            return;
+        };
+        self.gfx.finish_frame(enc);
+        let screenshot = self
+            .screenshot_request
+            .take()
+            .map(|path| self.gfx.capture_screenshot(&surface.texture, &path));
+        surface.present();
+        if screenshot.is_some() {
+            self.screenshot_result = screenshot;
+        }
+    }
+
+    /// Capture the next presented frame, including its UI.
     pub fn request_screenshot(&mut self, path: PathBuf) -> Result<(), String> {
         if self.screenshot_request.is_some() || self.screenshot_result.is_some() {
             return Err("a screenshot is already pending".into());
@@ -377,6 +452,14 @@ impl Context {
     /// Take the result once readback and PNG writing have finished.
     pub fn take_screenshot_result(&mut self) -> Option<Result<(), String>> {
         self.screenshot_result.take()
+    }
+
+    pub fn wants_exit(&self) -> bool {
+        self.exit_requested
+    }
+
+    pub fn defer_exit(&mut self) {
+        self.exit_requested = false;
     }
 
     pub fn request_exit(&mut self) {

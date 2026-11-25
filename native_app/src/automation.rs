@@ -3,7 +3,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc, Mutex, RwLock};
+use std::sync::{mpsc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use common::saveload::{self, Encoder, JSONPretty, JSON};
@@ -29,8 +29,9 @@ use crate::gui::{
     zoning::ZONES, GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool,
     ToolSelection,
 };
-use crate::session::{self, SessionScreen, SlotCompatibility};
-use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
+use crate::session::{self, SessionScreen, SessionState, SlotCompatibility};
+use crate::sim_thread::{AppliedBatch, BatchId, Boundary, Reply, ReplyKind, Request, SimThread};
+use crate::uiworld::{SaveLoadState, UiWorld};
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
 static STARTUP: Mutex<Option<Automation>> = Mutex::new(None);
@@ -46,6 +47,7 @@ struct Arguments {
 enum Step {
     WaitFrames(u64),
     RunTicks(u64),
+    SetWarp(u32),
     Commands(Vec<WorldCommand>),
     BuildSpecialBuildings(Vec<SpecialBuildingPlacement>),
     Pointer {
@@ -122,14 +124,14 @@ enum Assertion {
 }
 
 #[derive(Deserialize, Clone, Copy)]
-enum HumanPick {
+pub(crate) enum HumanPick {
     /// The human on a trip standing closest to their own parked car, within the
     /// distance the router walks to a personal car.
     BoardingCar,
 }
 
 #[derive(Deserialize, Clone, Copy, PartialEq, Debug)]
-enum FollowedLocation {
+pub(crate) enum FollowedLocation {
     Outside,
     Vehicle,
     Transit,
@@ -175,7 +177,7 @@ enum PointerEvent {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum Builder {
+pub(crate) enum Builder {
     GridCity,
     FillHouses,
     PlaceCompany,
@@ -187,6 +189,7 @@ enum Wait {
     Frames { start: u64, count: u64 },
     LoadSlot,
     Screenshot,
+    Simulation(BatchId),
 }
 
 pub(crate) struct Automation {
@@ -197,6 +200,8 @@ pub(crate) struct Automation {
     dir: PathBuf,
     exit_after_script: bool,
     wait: Option<Wait>,
+    fixture: Option<FixtureOutcome>,
+    load_slot: Option<String>,
     first_rejection: Option<(&'static str, Rejection)>,
     _watchdog: mpsc::Sender<()>,
 }
@@ -242,6 +247,8 @@ pub(crate) fn configure() -> Result<(), String> {
         dir,
         exit_after_script: args.exit_after_script,
         wait: None,
+        fixture: None,
+        load_slot: None,
         first_rejection: None,
         _watchdog: watchdog,
     });
@@ -337,14 +344,14 @@ impl Automation {
         &mut self,
         ctx: &mut Context,
         uiw: &UiWorld,
-        sim: &RwLock<Simulation>,
-        schedule: &mut SeqSchedule,
+        sim: &Simulation,
+        driver: &mut SimThread,
         rebuilt_version: Option<u64>,
     ) -> Result<bool, String> {
         // The window can still receive real cursor and focus events during a script.
         // Restore the script's cursor before Yakui handles the next queued event.
         move_yakui_pointer(ctx, self.pointer_input.mouse.screen);
-        let result = self.advance(ctx, uiw, sim, schedule, rebuilt_version);
+        let result = self.advance(ctx, uiw, sim, driver, rebuilt_version);
         match result {
             Ok(true) => {
                 ctx.input.mouse.clone_from(&self.pointer_input.mouse);
@@ -372,11 +379,10 @@ impl Automation {
         &mut self,
         ctx: &mut Context,
         uiw: &UiWorld,
-        sim: &RwLock<Simulation>,
-        schedule: &mut SeqSchedule,
+        sim: &Simulation,
+        driver: &mut SimThread,
         rebuilt_version: Option<u64>,
     ) -> Result<bool, String> {
-        *uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
         match self.wait {
             Some(Wait::Map { tick, .. }) if rebuilt_version != Some(tick) => {
                 return Ok(true);
@@ -399,6 +405,7 @@ impl Automation {
                     .clone()
                     .unwrap_or_else(|| "loading the save slot did not enter Playing".into()));
             }
+            Some(Wait::Simulation(_)) => return Ok(true),
             Some(Wait::Screenshot) => match ctx.take_screenshot_result() {
                 Some(result) => result?,
                 None => return Ok(true),
@@ -407,10 +414,63 @@ impl Automation {
         }
         self.wait = None;
 
-        let pending = std::mem::take(&mut *uiw.commands());
-        if session::world_interaction(uiw) && !pending.is_empty() {
-            self.apply_commands(uiw, &mut sim.write().unwrap(), schedule, pending);
+        if let Some(id) = &self.load_slot {
+            let session = uiw.read::<SessionState>();
+            if session.scanning_slots() {
+                return Ok(true);
+            }
+            if let Some(message) = &session.slot_error {
+                return Err(message.clone());
+            }
+            let (entry, compatibility) = session
+                .slots
+                .iter()
+                .find(|(entry, _)| entry.id.as_str() == id)
+                .cloned()
+                .ok_or_else(|| format!("save slot {id:?} was not found"))?;
+            match compatibility {
+                SlotCompatibility::Compatible => {}
+                SlotCompatibility::Incompatible => {
+                    return Err(format!("save slot {id:?} has an incompatible version"));
+                }
+                SlotCompatibility::Unreadable => {
+                    return Err(format!("save slot {id:?} has an unreadable snapshot"));
+                }
+            }
+            drop(session);
+            session::load_slot(uiw, entry);
+            self.load_slot = None;
+            self.wait = Some(Wait::LoadSlot);
             return Ok(true);
+        }
+
+        if let Some(outcome) = self.fixture.take() {
+            match outcome {
+                FixtureOutcome::Follow(human) => {
+                    *uiw.write::<InspectedEntity>() = InspectedEntity {
+                        e: Some(human.into()),
+                        ..Default::default()
+                    };
+                    uiw.write::<FollowEntity>().0 = Some(human.into());
+                    FollowEntity::track(uiw, sim);
+                }
+                FixtureOutcome::Followed => FollowEntity::track(uiw, sim),
+                FixtureOutcome::InspectCargo(road, pos) => {
+                    *uiw.write::<InspectedEntity>() = InspectedEntity::default();
+                    uiw.write::<InspectedBuilding>().e = None;
+                    uiw.write::<FollowEntity>().0 = None;
+                    uiw.write::<InspectedRoad>().0 = Some(road);
+                    let mut orbit = uiw.camera_mut();
+                    orbit.targetpos = pos;
+                    orbit.camera.pos = pos;
+                }
+                FixtureOutcome::Builder(rejection) => {
+                    if self.first_rejection.is_none() {
+                        self.first_rejection = rejection;
+                    }
+                }
+                FixtureOutcome::EmptyTreasury => {}
+            }
         }
 
         // Each event gets its own update and layout pass before the next event.
@@ -451,34 +511,31 @@ impl Automation {
                 });
             }
             Step::RunTicks(count) if count > 0 => {
-                let mut sim = sim.write().unwrap();
-                for _ in 0..count {
-                    sim.tick(schedule, []);
-                }
-                self.wait = Some(Wait::Map {
-                    tick: sim.get_tick(),
-                    settle_frames: 2,
-                });
+                self.submit(
+                    driver,
+                    Request::Step {
+                        count: usize::try_from(count).map_err(|_| "tick count is too large")?,
+                    },
+                )?;
             }
             Step::RunTicks(_) => {}
-            Step::Commands(commands) if !commands.is_empty() => {
+            Step::SetWarp(warp) => {
+                eprintln!("automation: set warp {warp} at tick {}", sim.get_tick());
+                uiw.write::<crate::gui::windows::settings::Settings>()
+                    .time_warp = warp;
+            }
+            Step::Commands(commands) => {
                 let mut batch = WorldCommands::default();
                 batch.extend(commands);
-                self.apply_commands(uiw, &mut sim.write().unwrap(), schedule, batch);
+                self.queue_commands(uiw, batch)?;
             }
-            Step::Commands(_) => {}
             Step::BuildSpecialBuildings(placements) => {
-                let mut sim = sim.write().unwrap();
                 let mut batch = WorldCommands::default();
-                {
-                    let map = sim.map();
-                    for placement in placements {
-                        batch.push(placement.command(&map)?);
-                    }
+                let map = sim.map();
+                for placement in placements {
+                    batch.push(placement.command(&map)?);
                 }
-                if !batch.is_empty() {
-                    self.apply_commands(uiw, &mut sim, schedule, batch);
-                }
+                self.queue_commands(uiw, batch)?;
             }
             Step::Pointer { action, position } => {
                 let start = position.to_screen(uiw)?;
@@ -506,28 +563,12 @@ impl Automation {
             }
             Step::Key { key, down } => key.send(ctx, down),
             Step::EmptyTreasury => {
-                // Set up the rejection fixture before submitting the real construction command.
-                sim.write().unwrap().write::<Government>().money = prototypes::Money::ZERO;
+                self.submit(driver, Request::PausedFixtureOp(FixtureOp::EmptyTreasury))?
             }
-            Step::Builder(builder) => {
-                let mut sim = sim.write().unwrap();
-                let start_tick = sim.get_tick();
-                let mut sink = LiveCommandSink {
-                    sim: &mut sim,
-                    schedule,
-                    queued: Vec::new(),
-                    first_rejection: &mut self.first_rejection,
-                };
-                builder.build(&mut sink)?;
-                let tick = sim.get_tick();
-                if start_tick == tick {
-                    return Err("builder submitted no commands".into());
-                }
-                self.wait = Some(Wait::Map {
-                    tick,
-                    settle_frames: 2,
-                });
-            }
+            Step::Builder(builder) => self.submit(
+                driver,
+                Request::PausedFixtureOp(FixtureOp::Builder(builder)),
+            )?,
             Step::Camera {
                 x,
                 y,
@@ -556,80 +597,35 @@ impl Automation {
                 orbit.camera.dist = dist;
             }
             Step::FollowHuman { pick, max_ticks } => {
-                let mut sim = sim.write().unwrap();
-                let mut ran = 0;
-                let human = loop {
-                    if let Some(human) = pick.find(&sim) {
-                        break human;
-                    }
-                    if ran == max_ticks {
-                        return Err(format!("no human matched the pick in {max_ticks} ticks"));
-                    }
-                    sim.tick(schedule, []);
-                    ran += 1;
-                };
-                *uiw.write::<InspectedEntity>() = InspectedEntity {
-                    e: Some(human.into()),
-                    ..Default::default()
-                };
-                uiw.write::<FollowEntity>().0 = Some(human.into());
-                FollowEntity::track(uiw, &sim);
-                eprintln!("automation: following {human:?} after {ran} ticks");
-                self.wait = Some(Wait::Map {
-                    tick: sim.get_tick(),
-                    settle_frames: 2,
-                });
+                self.submit(
+                    driver,
+                    Request::PausedFixtureOp(FixtureOp::Follow {
+                        pick,
+                        remaining: max_ticks,
+                    }),
+                )?;
             }
             Step::RunFollowing { ticks, until } => {
-                let mut sim = sim.write().unwrap();
-                let followed = followed_human(uiw)?;
-                let mut ran = 0;
-                while ran < ticks && until != Some(followed_location(&sim, followed)?) {
-                    sim.tick(schedule, []);
-                    ran += 1;
-                }
-                let location = followed_location(&sim, followed)?;
-                if until.is_some_and(|until| until != location) {
-                    return Err(format!(
-                        "followed human still {location:?} after {ticks} ticks"
-                    ));
-                }
-                eprintln!("automation: followed human {location:?} after {ran} ticks");
-                FollowEntity::track(uiw, &sim);
-                self.wait = Some(Wait::Map {
-                    tick: sim.get_tick(),
-                    settle_frames: 2,
-                });
+                let human = followed_human(uiw)?;
+                self.submit(
+                    driver,
+                    Request::PausedFixtureOp(FixtureOp::RunFollowing {
+                        human,
+                        remaining: ticks,
+                        until,
+                    }),
+                )?;
             }
             Step::InspectCargoRoad { max_ticks } => {
-                let mut sim = sim.write().unwrap();
-                let mut ran = 0;
-                let (road, pos) = loop {
-                    if let Some(found) = loaded_truck_road(&sim) {
-                        break found;
-                    }
-                    if ran == max_ticks {
-                        return Err(format!("no loaded truck on a road in {max_ticks} ticks"));
-                    }
-                    sim.tick(schedule, []);
-                    ran += 1;
-                };
-                *uiw.write::<InspectedEntity>() = InspectedEntity::default();
-                uiw.write::<InspectedBuilding>().e = None;
-                uiw.write::<FollowEntity>().0 = None;
-                uiw.write::<InspectedRoad>().0 = Some(road);
-                let mut orbit = uiw.camera_mut();
-                orbit.targetpos = pos;
-                orbit.camera.pos = pos;
-                drop(orbit);
-                eprintln!("automation: inspecting {road:?} after {ran} ticks");
-                self.wait = Some(Wait::Map {
-                    tick: sim.get_tick(),
-                    settle_frames: 2,
-                });
+                self.submit(
+                    driver,
+                    Request::PausedFixtureOp(FixtureOp::FindCargo {
+                        remaining: max_ticks,
+                    }),
+                )?;
             }
             Step::SelectTool(selection) => {
-                toolbox::select_tool(uiw, &sim.read().unwrap(), selection);
+                toolbox::select_tool(uiw, sim, selection);
             }
             Step::SetOverlay(mode) => *uiw.write::<OverlayMode>() = mode,
             Step::SetSession(screen) => {
@@ -663,29 +659,16 @@ impl Automation {
                 if !session::set_screen(uiw, SessionScreen::LoadGame) {
                     return Err("loading a save slot is unavailable during multiplayer".into());
                 }
-                let (entry, compatibility) = session::discover_slots(saveload::save_dir())
-                    .map_err(|error| format!("could not list saves: {error}"))?
-                    .into_iter()
-                    .find(|(entry, _)| entry.id.as_str() == id)
-                    .ok_or_else(|| format!("save slot {id:?} was not found"))?;
-                match compatibility {
-                    SlotCompatibility::Compatible => session::load_slot(uiw, entry),
-                    SlotCompatibility::Incompatible => {
-                        return Err(format!("save slot {id:?} has an incompatible version"));
-                    }
-                    SlotCompatibility::Unreadable => {
-                        return Err(format!("save slot {id:?} has an unreadable snapshot"));
-                    }
-                }
-                self.wait = Some(Wait::LoadSlot);
+                uiw.write::<SessionState>().refresh_slots = true;
+                self.load_slot = Some(id);
             }
-            Step::Assert(assertion) => assertion.check(uiw, &sim.read().unwrap(), self)?,
+            Step::Assert(assertion) => assertion.check(uiw, sim, self)?,
             Step::Screenshot(name) => {
                 ctx.request_screenshot(self.output_path(&name, "png")?)?;
                 self.wait = Some(Wait::Screenshot);
             }
             Step::DumpState(name) => {
-                self.dump_state(&self.output_path(&name, "json")?, uiw, &sim.read().unwrap())?;
+                self.dump_state(&self.output_path(&name, "json")?, uiw, sim)?;
             }
             Step::Exit => {
                 ctx.request_exit();
@@ -695,24 +678,57 @@ impl Automation {
         Ok(true)
     }
 
-    fn apply_commands(
-        &mut self,
-        uiw: &UiWorld,
-        sim: &mut Simulation,
-        schedule: &mut SeqSchedule,
-        commands: WorldCommands,
-    ) {
-        if commands.iter().all(WorldCommand::is_instant) {
-            sim.apply_commands(commands.as_ref());
-        } else {
-            sim.tick(schedule, commands.as_ref());
+    fn submit(&mut self, driver: &mut SimThread, request: Request) -> Result<(), String> {
+        let id = driver
+            .submit(request)
+            .map_err(|error| format!("could not submit simulation operation: {:?}", error.0))?;
+        self.wait = Some(Wait::Simulation(id));
+        Ok(())
+    }
+
+    fn queue_commands(&self, uiw: &UiWorld, batch: WorldCommands) -> Result<(), String> {
+        if !crate::sim_thread::fits(&batch) {
+            return Err("script command batch exceeds the simulation limit".into());
         }
-        remember_rejection(&mut self.first_rejection, sim);
-        *uiw.write::<ReceivedCommands>() = ReceivedCommands::new(commands);
-        // The next step can run as soon as this batch has been rendered.
+        *uiw.commands() = batch;
+        Ok(())
+    }
+
+    pub(crate) fn applied(&mut self, batch: &AppliedBatch) {
+        if self.first_rejection.is_none() {
+            self.first_rejection = batch
+                .rejections
+                .first()
+                .map(|&(_, label, reason)| (label, reason));
+        }
+        self.wait_for_map(batch.boundary, 0);
+    }
+
+    pub(crate) fn worker_reply(&mut self, reply: Reply) -> Result<(), String> {
+        if !matches!(self.wait, Some(Wait::Simulation(id)) if id == reply.id) {
+            return Ok(());
+        }
+        match reply.kind {
+            ReplyKind::Stepped(boundary) => self.wait_for_map(boundary, 2),
+            ReplyKind::FixtureDone(result, boundary) => {
+                let outcome = result?;
+                if matches!(outcome, FixtureOutcome::EmptyTreasury) {
+                    self.wait = None;
+                } else {
+                    self.fixture = Some(outcome);
+                    self.wait_for_map(boundary, 2);
+                }
+            }
+            ReplyKind::Rejected(error) => return Err(error.into()),
+            _ => return Err("unexpected simulation reply".into()),
+        }
+        Ok(())
+    }
+
+    fn wait_for_map(&mut self, boundary: Boundary, settle_frames: u64) {
         self.wait = Some(Wait::Map {
-            tick: sim.get_tick(),
-            settle_frames: 0,
+            tick: boundary.tick,
+            settle_frames,
         });
     }
 
@@ -1022,7 +1038,7 @@ impl ScriptKey {
 }
 
 impl Builder {
-    fn build(self, sink: &mut dyn CommandSink) -> Result<(), String> {
+    fn build(&self, sink: &mut dyn CommandSink) -> Result<(), String> {
         let origin = vec2(700.0, 700.0);
         match self {
             Self::GridCity => {
@@ -1046,11 +1062,115 @@ impl Builder {
     }
 }
 
+pub(crate) enum FixtureOp {
+    EmptyTreasury,
+    Builder(Builder),
+    Follow {
+        pick: HumanPick,
+        remaining: u64,
+    },
+    RunFollowing {
+        human: HumanID,
+        remaining: u64,
+        until: Option<FollowedLocation>,
+    },
+    FindCargo {
+        remaining: u64,
+    },
+}
+
+pub(crate) enum FixtureOutcome {
+    EmptyTreasury,
+    Builder(Option<(&'static str, Rejection)>),
+    Follow(HumanID),
+    Followed,
+    InspectCargo(RoadID, Vec3),
+}
+
+impl FixtureOp {
+    /// Probe the current boundary. A pending probe asks the driver to run one
+    /// ordinary tick before trying again.
+    pub(crate) fn run(
+        &mut self,
+        sim: &mut Simulation,
+        schedule: &mut SeqSchedule,
+        steps: &mut u64,
+    ) -> Option<Result<FixtureOutcome, String>> {
+        match self {
+            Self::EmptyTreasury => {
+                sim.write::<Government>().money = prototypes::Money::ZERO;
+                Some(Ok(FixtureOutcome::EmptyTreasury))
+            }
+            Self::Builder(builder) => {
+                let mut rejection = None;
+                let mut sink = LiveCommandSink {
+                    sim,
+                    schedule,
+                    queued: Vec::new(),
+                    first_rejection: &mut rejection,
+                    steps,
+                };
+                Some(builder.build(&mut sink).and_then(|()| {
+                    if *steps == 0 {
+                        Err("builder submitted no commands".into())
+                    } else {
+                        Ok(FixtureOutcome::Builder(rejection))
+                    }
+                }))
+            }
+            Self::Follow { pick, remaining } => {
+                if let Some(human) = pick.find(sim) {
+                    Some(Ok(FixtureOutcome::Follow(human)))
+                } else if *remaining == 0 {
+                    Some(Err(
+                        "no human matched the pick in the requested ticks".into()
+                    ))
+                } else {
+                    *remaining -= 1;
+                    None
+                }
+            }
+            Self::RunFollowing {
+                human,
+                remaining,
+                until,
+            } => match followed_location(sim, *human) {
+                Ok(location)
+                    if *until == Some(location) || (*remaining == 0 && until.is_none()) =>
+                {
+                    Some(Ok(FixtureOutcome::Followed))
+                }
+                Ok(location) if *remaining == 0 => {
+                    Some(Err(format!("followed human still {location:?}")))
+                }
+                Ok(_) => {
+                    *remaining -= 1;
+                    None
+                }
+                Err(error) => Some(Err(error)),
+            },
+            Self::FindCargo { remaining } => {
+                if let Some((road, pos)) = loaded_truck_road(sim) {
+                    Some(Ok(FixtureOutcome::InspectCargo(road, pos)))
+                } else if *remaining == 0 {
+                    Some(Err(
+                        "no loaded truck on a road in the requested ticks".into()
+                    ))
+                } else {
+                    *remaining -= 1;
+                    None
+                }
+            }
+        }
+    }
+}
+
 struct LiveCommandSink<'a> {
     sim: &'a mut Simulation,
     schedule: &'a mut SeqSchedule,
     queued: Vec<WorldCommand>,
     first_rejection: &'a mut Option<(&'static str, Rejection)>,
+    steps: &'a mut u64,
 }
 
 impl CommandSink for LiveCommandSink<'_> {
@@ -1068,6 +1188,7 @@ impl CommandSink for LiveCommandSink<'_> {
 
     fn flush(&mut self) {
         self.sim.tick(self.schedule, &self.queued);
+        *self.steps += 1;
         remember_rejection(self.first_rejection, self.sim);
         self.queued.clear();
     }

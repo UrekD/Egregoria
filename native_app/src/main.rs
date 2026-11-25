@@ -22,6 +22,7 @@ mod inputmap;
 mod network;
 mod rendering;
 mod session;
+mod sim_thread;
 
 fn main() {
     #[cfg(feature = "profile")]

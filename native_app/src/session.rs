@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 
 use common::saveload::{self, SlotCamera, SlotEntry, SlotId, SnapshotRevision};
 use serde::Deserialize;
+#[cfg(test)]
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::CommandOutcomes;
 use simulation::{SaveLoadError, Simulation, SimulationReplayLoader};
@@ -17,7 +18,9 @@ use crate::game_loop::VERSION;
 use crate::gui::{ExitState, GuiState};
 use crate::inputmap::InputMap;
 use crate::network::NetworkState;
-use crate::uiworld::{ReceivedCommands, SaveLoadState, UiWorld};
+#[cfg(test)]
+use crate::uiworld::ReceivedCommands;
+use crate::uiworld::{SaveLoadState, UiWorld};
 
 #[path = "save_coordinator.rs"]
 pub(crate) mod save_coordinator;
@@ -287,10 +290,6 @@ fn known_slot_ids(uiw: &UiWorld) -> Vec<SlotId> {
         .collect()
 }
 
-pub(crate) fn new_city_slot(uiw: &UiWorld, name: &str) -> io::Result<SlotId> {
-    choose_city_slot(saveload::save_dir(), name, known_slot_ids(uiw))
-}
-
 fn choose_city_slot(root: &Path, name: &str, mut existing: Vec<SlotId>) -> io::Result<SlotId> {
     loop {
         let slot = city_slot(name, &existing);
@@ -468,8 +467,13 @@ pub(crate) fn cancel_generation(uiw: &UiWorld) -> bool {
 }
 
 pub(crate) fn modal(uiw: &UiWorld) -> bool {
+    #[cfg(feature = "multiplayer")]
+    if uiw.read::<SaveLoadState>().network_busy {
+        return true;
+    }
     let session = uiw.read::<SessionState>();
     session.paused
+        || uiw.read::<SaveLoadState>().departure_intent.is_some()
         || session.departure.is_some()
         || session.replay_requested
         || uiw.read::<SessionUi>().save_as.is_some()
@@ -491,6 +495,20 @@ pub(crate) fn set_paused(uiw: &UiWorld, paused: bool) {
 
 /// Close the current interaction before falling back to the pause menu.
 pub(crate) fn close_modal(uiw: &UiWorld) {
+    #[cfg(feature = "multiplayer")]
+    if uiw.read::<SaveLoadState>().network_busy {
+        uiw.write::<SaveLoadState>().network_cancel = true;
+        return;
+    }
+    if uiw
+        .write::<SaveLoadState>()
+        .departure_intent
+        .take()
+        .is_some()
+    {
+        reset_interaction(uiw);
+        return;
+    }
     let mut session = uiw.write::<SessionState>();
     if let Some(departure) = session.departure {
         if matches!(
@@ -516,7 +534,7 @@ pub(crate) fn close_modal(uiw: &UiWorld) {
     };
     if closed_session_window {
         reset_interaction(uiw);
-    } else if playing(uiw) && uiw.read::<SaveLoadState>().replay.is_none() {
+    } else if playing(uiw) && !uiw.read::<SaveLoadState>().is_replaying() {
         if uiw.read::<SessionState>().paused {
             set_paused(uiw, false);
         } else if close_world_interaction(uiw) {
@@ -594,7 +612,7 @@ pub(crate) fn request_save(uiw: &UiWorld, target: Option<(SlotId, String)>) {
         return;
     }
     let mut io = uiw.write::<SaveLoadState>();
-    if io.pending_save.is_some() || io.save_result.is_some() {
+    if io.saving() {
         return;
     }
     let request = match target {
@@ -622,21 +640,78 @@ pub(crate) fn request_save(uiw: &UiWorld, target: Option<(SlotId, String)>) {
     io.pending_save = Some(request);
 }
 
-pub(crate) fn departure_save_request(uiw: &UiWorld, root: &Path) -> io::Result<SaveRequest> {
-    let state = uiw.read::<SessionState>();
-    let (slot, name) = if let Some(slot) = &state.active_slot {
-        (slot.clone(), state.city_name.clone())
-    } else {
-        let name = state.city_name.trim_end_matches(" (autosave)").to_owned();
-        drop(state);
-        let slot = choose_city_slot(root, &name, known_slot_ids(uiw))?;
-        (slot, name)
+pub(crate) fn request_named_save(uiw: &UiWorld, name: String) {
+    if !can_save(uiw) {
+        return;
+    }
+    let mut io = uiw.write::<SaveLoadState>();
+    if io.saving() {
+        return;
+    }
+    let known = known_slot_ids(uiw);
+    let (sender, receiver) = mpsc::channel();
+    io.named_save = Some(receiver);
+    std::thread::spawn(move || {
+        let result = choose_city_slot(saveload::save_dir(), &name, known).map(|slot| SaveRequest {
+            slot,
+            name,
+            kind: SaveKind::SaveAs,
+        });
+        let _ = sender.send(result);
+    });
+}
+
+pub(crate) fn poll_named_save(uiw: &UiWorld) {
+    let mut io = uiw.write::<SaveLoadState>();
+    let Some(receiver) = &io.named_save else {
+        return;
     };
-    Ok(SaveRequest {
-        slot,
-        name,
-        kind: SaveKind::Departure,
-    })
+    let result = match receiver.try_recv() {
+        Ok(result) => result,
+        Err(TryRecvError::Empty) => return,
+        Err(TryRecvError::Disconnected) => {
+            Err(io::Error::other("The save request stopped unexpectedly."))
+        }
+    };
+    io.named_save = None;
+    match result {
+        Ok(request) => io.pending_save = Some(request),
+        Err(error) => {
+            drop(io);
+            notify(uiw, format!("Could not choose a save slot. {error}"));
+        }
+    }
+}
+
+pub(crate) fn departure_save_plan(
+    uiw: &UiWorld,
+) -> impl FnOnce(&Path) -> io::Result<SaveRequest> + Send + 'static {
+    let (slot, name) = {
+        let state = uiw.read::<SessionState>();
+        let name = if state.active_slot.is_some() {
+            state.city_name.clone()
+        } else {
+            state.city_name.trim_end_matches(" (autosave)").to_owned()
+        };
+        (state.active_slot.clone(), name)
+    };
+    let known = known_slot_ids(uiw);
+    move |root| {
+        let slot = match slot {
+            Some(slot) => slot,
+            None => choose_city_slot(root, &name, known)?,
+        };
+        Ok(SaveRequest {
+            slot,
+            name,
+            kind: SaveKind::Departure,
+        })
+    }
+}
+
+#[cfg(test)]
+fn departure_save_request(uiw: &UiWorld, root: &Path) -> io::Result<SaveRequest> {
+    departure_save_plan(uiw)(root)
 }
 
 pub(crate) fn notify(uiw: &UiWorld, message: impl Into<String>) {
@@ -663,6 +738,8 @@ impl CityProgress {
 pub(crate) enum Departure {
     Screen(SessionScreen),
     ReplayDebug,
+    #[cfg(feature = "multiplayer")]
+    Network(crate::network::NetworkTarget),
     Exit,
 }
 
@@ -700,14 +777,14 @@ pub(crate) fn view_input(uiw: &UiWorld) -> bool {
 }
 
 pub fn world_interaction(uiw: &UiWorld) -> bool {
-    view_input(uiw) && !modal(uiw) && uiw.read::<SaveLoadState>().replay.is_none()
+    view_input(uiw) && !modal(uiw) && !uiw.read::<SaveLoadState>().is_replaying()
 }
 
 pub fn can_save(uiw: &UiWorld) -> bool {
     playing(uiw)
         && !uiw.read::<SessionState>().interaction_blocked
         && uiw.read::<SessionState>().snapshot_slot().is_some()
-        && uiw.read::<SaveLoadState>().replay.is_none()
+        && !uiw.read::<SaveLoadState>().is_replaying()
 }
 
 pub(crate) fn request_departure(uiw: &UiWorld, sim: &Simulation, destination: Departure) {
@@ -717,8 +794,17 @@ pub(crate) fn request_departure(uiw: &UiWorld, sim: &Simulation, destination: De
     if !matches!(destination, Departure::Exit) && !crate::network::is_singleplayer(uiw) {
         return;
     }
+    if uiw.read::<SaveLoadState>().threaded {
+        uiw.write::<SaveLoadState>().departure_intent = Some(destination);
+    } else {
+        decide_departure(uiw, CityProgress::capture(sim), destination);
+    }
+}
+
+pub(crate) fn decide_departure(uiw: &UiWorld, progress: CityProgress, destination: Departure) {
     let io = uiw.read::<SaveLoadState>();
-    let dirty = io.replay.is_none() && io.saved_progress != Some(CityProgress::capture(sim));
+    let dirty =
+        !io.is_replaying() && (io.saved_progress != Some(progress) || !uiw.commands().is_empty());
     drop(io);
     if dirty {
         reset_interaction(uiw);
@@ -750,18 +836,31 @@ pub(crate) fn finish_departure(uiw: &UiWorld, destination: Departure) {
                     .map_err(|error| error.to_string())?;
                 let (sim, loader) =
                     Simulation::try_from_replay(replay).map_err(|error| error.to_string())?;
+                loader
+                    .validate_batches(crate::sim_thread::fits_replay_batch)
+                    .map_err(|error| error.to_string())?;
                 Ok(PreparedWorld {
                     replacement: WorldReplacement::ReplayDebug(sim, loader),
                     name: String::new(),
                 })
             });
         }
+        #[cfg(feature = "multiplayer")]
+        Departure::Network(target) => {
+            uiw.write::<SessionState>().departure = None;
+            let mut io = uiw.write::<SaveLoadState>();
+            io.network_busy = true;
+            io.network_target = Some(target);
+        }
         Departure::Exit => uiw.write::<SaveLoadState>().exit_requested = true,
     }
 }
 
 pub(crate) fn end_replay(uiw: &UiWorld) {
-    uiw.write::<SaveLoadState>().replay = None;
+    let mut io = uiw.write::<SaveLoadState>();
+    io.replay = None;
+    io.replay_ui = None;
+    drop(io);
     uiw.write::<SessionState>().interaction_blocked = true;
     uiw.write::<InputMap>().reset_world_input();
 }
@@ -799,8 +898,6 @@ pub fn set_screen(uiw: &UiWorld, screen: SessionScreen) -> bool {
             uiw.write::<GuiState>().last_save = Instant::now();
         }
         reset_interaction(uiw);
-        *uiw.commands() = Default::default();
-        *uiw.write::<ReceivedCommands>() = Default::default();
         *uiw.write::<ExitState>() = ExitState::NoExit;
     }
     true
@@ -814,7 +911,7 @@ pub fn request_world_replacement(uiw: &UiWorld, replacement: WorldReplacement) -
     true
 }
 
-/// Run under the simulation write lock, before any new-world interaction for this frame.
+#[cfg(test)]
 pub fn apply_world_replacement(
     uiw: &UiWorld,
     sim: &mut Simulation,
@@ -822,6 +919,20 @@ pub fn apply_world_replacement(
     replacement: WorldReplacement,
     reset_runtime: impl FnOnce(&Simulation),
 ) {
+    let generation = uiw.read::<SessionState>().generation + 1;
+    let coordinator = uiw.read::<save_coordinator::SaveCoordinator>().clone();
+    coordinator.swap(generation, || {});
+    let next = install_world(uiw, replacement, generation);
+    *sim = next;
+    *schedule = Simulation::schedule();
+    reset_runtime(sim);
+}
+
+pub(crate) fn install_world(
+    uiw: &UiWorld,
+    replacement: WorldReplacement,
+    generation: u64,
+) -> Simulation {
     let (next, slot, replay, is_saved, camera) = match replacement {
         WorldReplacement::Snapshot(sim, slot) => (sim, Some(slot), None, true, None),
         WorldReplacement::SnapshotWithCamera(sim, slot, camera) => {
@@ -833,10 +944,7 @@ pub fn apply_world_replacement(
         WorldReplacement::Network(sim) => (sim, None, None, false, None),
     };
 
-    let generation = uiw.read::<SessionState>().generation + 1;
-    let coordinator = uiw.read::<save_coordinator::SaveCoordinator>().clone();
-    coordinator.swap(generation, || {
-        *sim = next;
+    {
         let mut session = uiw.write::<SessionState>();
         session.generation = generation;
         session.city_name = slot.as_ref().map(ToString::to_string).unwrap_or_default();
@@ -852,24 +960,23 @@ pub fn apply_world_replacement(
         *io = SaveLoadState {
             autosave_index: rotation,
             replay,
-            saved_progress: is_saved.then(|| CityProgress::capture(sim)),
+            saved_progress: is_saved.then(|| CityProgress::capture(&next)),
             ..SaveLoadState::default()
         };
-    });
-    *schedule = Simulation::schedule();
+    }
     *uiw.write::<SessionScreen>() = SessionScreen::Playing;
     *uiw.write::<SessionUi>() = SessionUi::default();
     uiw.write::<NetworkState>().reset_timestep();
 
     uiw.write::<GuiState>().last_save = Instant::now();
     uiw.write::<InputMap>().reset_world_input();
-    reset_world_camera(uiw, sim, camera);
+    reset_world_camera(uiw, &next, camera);
 
     let hooks = uiw.read::<WorldResetHooks>().0.clone();
     for reset in hooks {
         reset(uiw, generation);
     }
-    reset_runtime(sim);
+    next
 }
 
 fn reset_world_camera(uiw: &UiWorld, sim: &Simulation, camera: Option<SlotCamera>) {

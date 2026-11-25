@@ -9,6 +9,40 @@ pub struct LoadState {
 
 pub(crate) fn replay_controls(ctx: &egui::Context, uiw: &UiWorld) {
     let mut io = uiw.write::<SaveLoadState>();
+    if let Some(replay) = &mut io.replay_ui {
+        use crate::sim_thread::ReplayControl;
+        egui::TopBottomPanel::bottom("replay_controls").show(ctx, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                let progress = replay.progress;
+                if let Some((step, total)) = progress.steps {
+                    ui.label(format!("Replay {step} / {total} steps"));
+                } else {
+                    ui.label(format!(
+                        "Replay tick {} / {}",
+                        progress.tick, progress.last_tick
+                    ));
+                }
+                for (label, speed) in [("Pause", 0), ("Play", 1), ("Fast", 100), ("Max", 10_000)] {
+                    if ui.selectable_label(replay.speed == speed, label).clicked() {
+                        replay.speed = speed;
+                        replay.control = Some(ReplayControl::Speed(speed));
+                    }
+                }
+                ui.separator();
+                for ticks in [1, 10, 100, 1000] {
+                    if ui.button(format!("+{ticks}")).clicked() && replay.control.is_none() {
+                        replay.speed = 0;
+                        replay.control = Some(ReplayControl::Step(ticks));
+                    }
+                }
+                ui.separator();
+                if ui.button("End replay").clicked() {
+                    replay.control = Some(ReplayControl::End);
+                }
+            });
+        });
+        return;
+    }
     let Some(replay) = &mut io.replay else {
         return;
     };
@@ -46,7 +80,7 @@ pub(crate) fn replay_controls(ctx: &egui::Context, uiw: &UiWorld) {
 }
 
 pub(crate) fn debug_replay(ui: &mut egui::Ui, uiw: &UiWorld) {
-    if uiw.read::<SaveLoadState>().replay.is_some() {
+    if uiw.read::<SaveLoadState>().is_replaying() {
         return;
     }
 

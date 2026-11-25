@@ -20,7 +20,7 @@ pub(crate) fn open_save_as(uiw: &UiWorld) {
         return;
     }
     let io = uiw.read::<SaveLoadState>();
-    if io.pending_save.is_some() || io.save_result.is_some() {
+    if io.saving() {
         return;
     }
     uiw.write::<SessionUi>().save_as = Some(SaveAsForm {
@@ -39,6 +39,7 @@ pub(super) fn render(uiw: &UiWorld) {
     let mut opened = true;
     let mut cancel = false;
     let mut target = None;
+    let mut new_name = None;
 
     Window {
         title: if form.overwrite.is_some() {
@@ -91,24 +92,20 @@ pub(super) fn render(uiw: &UiWorld) {
                 if let Some((entry, _)) = existing {
                     form.overwrite = Some((entry.id.clone(), name));
                 } else {
-                    drop(state);
-                    match session::new_city_slot(uiw, &name) {
-                        Ok(slot) => target = Some((slot, name)),
-                        Err(error) => {
-                            session::notify(uiw, format!("Could not choose a save slot. {error}"))
-                        }
-                    }
+                    new_name = Some(name);
                 }
             }
             cancel = button_secondary("Cancel").show().clicked;
         });
     });
-    if !opened || cancel || target.is_some() {
+    if !opened || cancel || target.is_some() || new_name.is_some() {
         ui.save_as = None;
         drop(ui);
         session::reset_interaction(uiw);
         if let Some(target) = target {
             session::request_save(uiw, Some(target));
+        } else if let Some(name) = new_name {
+            session::request_named_save(uiw, name);
         }
     }
 }

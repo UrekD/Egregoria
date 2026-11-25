@@ -293,28 +293,48 @@ impl NotificationSampler {
 
     fn observe_rejections(&mut self, sim: &Simulation, now: SampleTime) {
         let outcomes = sim.read::<CommandOutcomes>();
-        let sequence = outcomes.batch_seq();
-        let previous = self.last_batch_seq.replace(sequence);
-        if previous == Some(sequence) {
+        self.record_rejections(outcomes.batch_seq(), outcomes.last.iter().copied(), now);
+    }
+
+    pub(super) fn observe_applied(
+        &mut self,
+        sim: &Simulation,
+        sequence: u64,
+        rejections: &[(usize, &'static str, Rejection)],
+    ) {
+        let now = SampleTime {
+            elapsed: elapsed_tick(sim),
+            calendar: *sim.read::<GameTime>(),
+        };
+        self.record_rejections(
+            sequence,
+            rejections.iter().map(|&(_, label, reason)| (label, reason)),
+            now,
+        );
+    }
+
+    fn record_rejections(
+        &mut self,
+        sequence: u64,
+        reasons: impl IntoIterator<Item = (&'static str, Rejection)>,
+        now: SampleTime,
+    ) {
+        if self.last_batch_seq.replace(sequence) == Some(sequence) {
             return;
         }
-        let mut reasons = Vec::new();
-        for &(command, reason) in &outcomes.last {
-            if !reasons.contains(&(command, reason)) {
-                reasons.push((command, reason));
-                self.emit(
-                    NotificationKind::CommandRejected,
-                    now.elapsed,
-                    now.calendar.daytime,
-                    None,
-                    AlertTarget::CityWide,
-                    format!(
-                        "{}: {}",
-                        command_label(command),
-                        command_message(command, reason)
-                    ),
-                );
-            }
+        for (command, reason) in reasons {
+            self.emit(
+                NotificationKind::CommandRejected,
+                now.elapsed,
+                now.calendar.daytime,
+                None,
+                AlertTarget::CityWide,
+                format!(
+                    "{}: {}",
+                    command_label(command),
+                    command_message(command, reason)
+                ),
+            );
         }
     }
 

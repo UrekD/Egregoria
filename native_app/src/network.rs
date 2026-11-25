@@ -1,10 +1,14 @@
+#[cfg(feature = "multiplayer")]
 pub use self::inner::*;
-use crate::game_loop::{State, Timings};
-use crate::gui::windows::settings::Settings;
-use crate::uiworld::{ReceivedCommands, UiWorld};
+use crate::uiworld::UiWorld;
 use common::timestep::Timestep;
-use simulation::world_command::{CommandOutcomes, WorldCommand, WorldCommands};
-use simulation::Simulation;
+
+#[cfg(feature = "multiplayer")]
+#[derive(Clone, Copy)]
+pub(crate) enum NetworkTarget {
+    Host,
+    Connect,
+}
 
 impl Default for NetworkState {
     fn default() -> Self {
@@ -23,75 +27,8 @@ impl NetworkState {
 }
 
 #[cfg(not(feature = "multiplayer"))]
-mod inner {
-    use crate::network::{State, Timestep};
-    use crate::session::WorldReplacement;
-
-    #[allow(clippy::large_enum_variant)]
-    pub enum NetworkState {
-        Singleplayer(Timestep),
-    }
-
-    pub fn sim_update(state: &mut State) -> Option<WorldReplacement> {
-        super::handle_singleplayer(state);
-        None
-    }
-}
-
-#[allow(dead_code)]
-fn handle_singleplayer(state: &mut State) {
-    let mut sim = unwrap_orr!(state.sim.try_write(), return); // mut for tick
-
-    let timewarp = state.uiw.read::<Settings>().time_warp;
-    let mut commands = std::mem::take(&mut *state.uiw.write::<WorldCommands>());
-    *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
-
-    let sched = &mut state.game_schedule;
-    let mut timings = state.uiw.write::<Timings>();
-
-    let mut has_commands = !commands.is_empty();
-
-    if has_commands && commands.iter().all(WorldCommand::is_instant) {
-        sim.apply_commands(commands.as_ref());
-        publish_accepted_commands(&state.uiw, &sim, &commands);
-        commands = WorldCommands::default();
-        has_commands = false;
-    }
-
-    let mut net_state = state.uiw.write::<NetworkState>();
-
-    #[allow(irrefutable_let_patterns)]
-    let NetworkState::Singleplayer(ref mut step) = *net_state
-    else {
-        return;
-    };
-
-    let mut commands_once = Some(commands.clone());
-    step.prepare_frame(timewarp);
-    while step.tick() || (has_commands && commands_once.is_some()) {
-        let t = sim.tick(sched, commands_once.take().unwrap_or_default().as_ref());
-        step.record_tick();
-        timings.world_update.add_value(t.as_secs_f32());
-    }
-
-    if commands_once.is_none() {
-        if has_commands {
-            publish_accepted_commands(&state.uiw, &sim, &commands);
-        }
-    } else {
-        *state.uiw.write::<WorldCommands>() = commands;
-    }
-}
-
-fn publish_accepted_commands(uiw: &UiWorld, sim: &Simulation, commands: &WorldCommands) {
-    let mut accepted = WorldCommands::default();
-    accepted.extend(
-        sim.read::<CommandOutcomes>()
-            .accepted
-            .iter()
-            .map(|&index| commands.as_ref()[index].clone()),
-    );
-    *uiw.write::<ReceivedCommands>() = ReceivedCommands::new(accepted);
+pub enum NetworkState {
+    Singleplayer(Timestep),
 }
 
 pub fn is_singleplayer(uiw: &UiWorld) -> bool {
@@ -102,14 +39,13 @@ pub fn is_singleplayer(uiw: &UiWorld) -> bool {
 mod inner {
     use crate::game_loop::{State, Timings, VERSION};
     use crate::gui::windows::network::NetworkConnectionInfo;
-    use crate::session::WorldReplacement;
     use crate::uiworld::ReceivedCommands;
     use common::timestep::Timestep;
     use networking::{
         ConnectConf, Frame, PollResult, ServerConfiguration, ServerPollResult, VirtualClientConf,
     };
     use prototypes::DELTA_F64;
-    use simulation::world_command::WorldCommands;
+    use simulation::world_command::{CommandOutcomes, WorldCommands};
     use simulation::Simulation;
     use std::net::ToSocketAddrs;
     use std::sync::Mutex;
@@ -125,13 +61,14 @@ mod inner {
         Server(Server),
     }
 
-    pub fn sim_update(state: &mut State) -> Option<WorldReplacement> {
+    pub(crate) fn sim_update(state: &mut State) -> bool {
         if super::is_singleplayer(&state.uiw) {
-            super::handle_singleplayer(state);
-            return None;
+            return false;
         }
 
-        let mut sim = state.sim.try_write().ok()?;
+        let Ok(mut sim) = state.sim.try_write() else {
+            return false;
+        };
 
         let commands = std::mem::take(&mut *state.uiw.write::<WorldCommands>());
         *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
@@ -167,17 +104,14 @@ mod inner {
                     PollResult::Input(inputs) => {
                         inputs_to_apply = Some(inputs);
                     }
-                    PollResult::GameWorld(_, prepared_sim) => {
-                        // The returned batch is local input from the old world. The
-                        // client's catch-up state holds the actual protocol inputs.
-                        return Some(WorldReplacement::Network(prepared_sim));
+                    PollResult::GameWorld(_, _) => {
+                        state.uiw.write::<NetworkConnectionInfo>().error =
+                            "The server replaced the active world.".into();
+                        return true;
                     }
                     PollResult::Disconnect(reason) => {
-                        log::error!(
-                            "got disconnected :-( continuing with server world but it's sad"
-                        );
-                        *net_state = NetworkState::Singleplayer(Timestep::default());
                         state.uiw.write::<NetworkConnectionInfo>().error = reason;
+                        return true;
                     }
                 }
             }
@@ -198,23 +132,25 @@ mod inner {
                     .write::<Timings>()
                     .world_update
                     .add_value(t.as_secs_f32());
-                merged.merge(
-                    &frame_commands
-                        .inputs
-                        .into_iter()
-                        .filter(|x| x.sent_by_me)
-                        .map(|x| x.inp)
-                        .collect::<WorldCommands>(),
-                );
+                let accepted = sim.read::<CommandOutcomes>();
+                let mut offset = 0;
+                for input in frame_commands.inputs {
+                    for (index, command) in input.inp.as_ref().iter().enumerate() {
+                        if input.sent_by_me && accepted.accepted.contains(&(offset + index)) {
+                            merged.push(command.clone());
+                        }
+                    }
+                    offset += input.inp.as_ref().len();
+                }
             }
             *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::new(merged);
         }
-        None
+        false
     }
 
-    pub fn start_server(info: &mut NetworkConnectionInfo, sim: &Simulation) -> Option<Server> {
+    pub fn start_server(info: &mut NetworkConnectionInfo, tick: u64) -> Option<Server> {
         let server = match networking::Server::start(ServerConfiguration {
-            start_frame: Frame(sim.get_tick()),
+            start_frame: Frame(tick),
             period: Duration::from_secs_f64(DELTA_F64),
             port: None,
             virtual_client: Some(VirtualClientConf {
@@ -231,6 +167,23 @@ mod inner {
         };
 
         Some(Mutex::new(server))
+    }
+
+    pub(crate) enum Bootstrap {
+        Waiting,
+        Ready(Simulation),
+        Failed(String),
+    }
+
+    pub(crate) fn poll_bootstrap(client: &mut Client) -> Bootstrap {
+        match client.get_mut().unwrap().poll(WorldCommands::default()) {
+            PollResult::Wait(_) => Bootstrap::Waiting,
+            PollResult::GameWorld(_, sim) => Bootstrap::Ready(sim),
+            PollResult::Disconnect(message) => Bootstrap::Failed(message),
+            PollResult::Input(_) => {
+                Bootstrap::Failed("Server sent input before the initial world.".into())
+            }
+        }
     }
 
     pub fn start_client(info: &mut NetworkConnectionInfo) -> Option<Client> {

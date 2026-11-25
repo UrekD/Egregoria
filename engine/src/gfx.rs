@@ -19,7 +19,6 @@ use winit::window::{Fullscreen, Window};
 use common::FastMap;
 use geom::{vec2, Camera, InfiniteFrustrum, LinearColor, Matrix4, Plane, Vec2, Vec3};
 
-use crate::framework::State;
 use crate::meshload::{load_mesh, LoadMeshError};
 use crate::passes::{BackgroundPipeline, Pbr};
 use crate::perf_counters::PerfCounters;
@@ -711,11 +710,12 @@ impl GfxContext {
         )
     }
 
-    pub fn render<S: State>(
+    pub fn render<S>(
         &mut self,
         encs: &mut Encoders,
         frame: &TextureView,
         state: &mut S,
+        render: impl FnOnce(&mut S, &mut FrameContext<'_>),
         render_gui: impl FnOnce(&mut S, GuiRenderContext<'_>),
     ) -> (f32, f32) {
         profiling::scope!("gfx::render_objs");
@@ -727,7 +727,7 @@ impl GfxContext {
             gfx: self,
         };
 
-        state.render(&mut fc);
+        render(state, &mut fc);
 
         let start_time = Instant::now();
 

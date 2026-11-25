@@ -113,7 +113,6 @@ fn auto_save(uiworld: &UiWorld) {
     if let Some(every) = every {
         if gui.last_save.elapsed() > every {
             uiworld.write::<SaveLoadState>().please_save = true;
-            uiworld.save_to_disk();
             gui.last_save = Instant::now();
         }
     }
