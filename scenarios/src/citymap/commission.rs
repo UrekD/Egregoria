@@ -54,7 +54,7 @@ const SOAK_DAYS: u64 = 3;
 const MIN_OPENING_POPULATION: u64 = 2500;
 const MIN_BASKETS_FILLED_PERCENT: u128 = 94;
 const MIN_EMPLOYED_PERCENT: u128 = 75;
-const MAX_SCHOOLS: usize = 16;
+const MAX_SCHOOLS: usize = 22;
 const MAX_STANDING_MINUTES: u64 = 120;
 
 #[derive(Serialize)]
@@ -178,9 +178,10 @@ pub fn commission(
             sites.insert(format!("{name}-{}", index + 1), building);
         }
     }
-    // Keep the fuel employers within reach of the South and West labour pools.
+    // Give the fuel employers short commutes from the West neighbourhood and
+    // keep their shipments on its local frontage.
     let (plant, plant_road) =
-        place_company(sim, plan, &roads, "coal-power-plant", at(1740.0, 1430.0))?;
+        place_company(sim, plan, &roads, "coal-power-plant", at(1260.0, 1675.0))?;
     sites.insert("coal-power-plant".into(), plant);
     let plant_door = sim.map().buildings()[plant].door_pos.xy();
     let mine_frontage = BTreeSet::from([plant_road]);
@@ -249,6 +250,15 @@ pub fn commission(
             sites.insert(format!("{}/bakery-{}", cohort.district, i + 1), building);
         }
     }
+    // The north frontage reaches the village centre by a long detour. Put
+    // groceries on both ends of the occupied roadside before assigning lots.
+    for (name, x, y) in [
+        ("hraska/ridge-bakery", 2014.0, 2776.0),
+        ("hraska/east-frontage-bakery", 2260.0, 2647.0),
+    ] {
+        let (building, _) = place_company(sim, plan, &roads, "bakery", at(x, y))?;
+        sites.insert(name.into(), building);
+    }
     // Leave a park site within the dense blocks before assigning their frontage
     // to housing, in places where fitting a park afterwards would displace a lot.
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
@@ -279,6 +289,25 @@ pub fn commission(
             parks.push(sim.map().buildings()[building].obb.center());
             sites.insert(format!("{}/pocket-park-{index}", cohort.district), building);
         }
+    }
+    // These outlying streets had residents short of park coverage after
+    // reload. Give their service sites priority over nearby buildable lots.
+    for (name, x, y) in [
+        ("hraska/ridge-park", 1940.0, 2647.0),
+        ("hraska/north-frontage-park", 2040.0, 2755.0),
+        ("south/southwest-park", 1695.0, 885.0),
+        ("south/meadow-park", 1800.0, 685.0),
+        ("south/outer-park", 2055.0, 730.0),
+        ("west/walkway-park", 1220.0, 1945.0),
+        ("west/frontage-park", 1370.0, 1560.0),
+    ] {
+        let anchor = at(x, y);
+        let (building, _) = place_scored_company(sim, plan, &roads, "park", |_, _, footprint| {
+            let distance = footprint.center().distance2(anchor);
+            (distance <= 150.0_f32.powi(2)).then_some(distance)
+        })?
+        .ok_or_else(|| format!("no clear civic site for {name}"))?;
+        sites.insert(name.into(), building);
     }
 
     let (mut parcels, reserves) = plan_parcels(sim, plan, &roads, &cohorts)?;
@@ -1398,11 +1427,11 @@ fn install_bus_loops(
         cohorts[2].anchor, // South.
         cohorts[3].anchor, // West.
         super::layout::design_point(vec2(1920.0, 2400.0), plan.config),
-        cohorts[4].anchor, // Employment edge.
+        super::layout::design_point(vec2(2390.0, 2540.0), plan.config), // Employment frontage.
     ];
     let routes = [
         ("neighbourhood", [0, 1, 2], 3),
-        ("employment", [0, 3, 4], 3),
+        ("employment", [0, 3, 4], 4),
     ];
     let berths = {
         let map = sim.map();
