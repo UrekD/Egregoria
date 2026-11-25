@@ -719,7 +719,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
         &disconnected,
         &resumed,
         root,
-        "zones2_staffed_collapsed_disconnected",
+        "zones2_disconnected_collapse",
     )?;
     verify_decoded(root, &[collapsed_disconnected])?;
     resumed = reload_abandoned()?;
