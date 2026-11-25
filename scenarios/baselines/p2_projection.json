@@ -2,308 +2,308 @@
   "growth_basic": [
     {
       "tick": 10001,
-      "projection": 12642526247443178224,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 1180710498658392348,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 20001,
-      "projection": 3483529165572957328,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 10726262049266586184,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 30001,
-      "projection": 18401692576142354006,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 11825840695153955139,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 40001,
-      "projection": 528234260792804730,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 12242645715144581482,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 50001,
-      "projection": 1061365503003627534,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 1736527545281987491,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 60001,
-      "projection": 1378704311624799700,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 13891092401212764795,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 70001,
-      "projection": 15126562389182951113,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 14331919215610353632,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 80001,
-      "projection": 16375336866261566632,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 16673617729931385255,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 90001,
-      "projection": 4547061971696500650,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 5175937474563860161,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 100001,
-      "projection": 8775658708936626537,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 17772771908763547291,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 110001,
-      "projection": 3600268783368832355,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 2095945406875943105,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 120001,
-      "projection": 6032844483222691059,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 15215774469614501150,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 130001,
-      "projection": 2838660639713649602,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 14630939256498787635,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 140001,
-      "projection": 11294404455910759877,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 9280477896747157332,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 150001,
-      "projection": 832133386331649615,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 6526869885757716789,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 160001,
-      "projection": 1317853771794453504,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 9211246532736364805,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 170001,
-      "projection": 12956490761674861233,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 9696338639733332069,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 180001,
-      "projection": 6957336015469874710,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 687405957690051858,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 190001,
-      "projection": 9510014714026428261,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 2607822483166992821,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 200001,
-      "projection": 14384636896283075678,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 7011241142269416143,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 210001,
-      "projection": 8921652154853386003,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 3501415973591098993,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 220001,
-      "projection": 15062440287191214094,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 5636838595426379963,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 230001,
-      "projection": 15735760573664422564,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 17602960575077201528,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 240001,
-      "projection": 12679531400003437096,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 7252775701815047954,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 250001,
-      "projection": 10190526893853293190,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 11798117059099227890,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 260001,
-      "projection": 8441315784447932773,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 8368036759229338828,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 270001,
-      "projection": 13996720764861347583,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 626922700364589920,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 280001,
-      "projection": 1095615903015276275,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 17571544488980994438,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 290001,
-      "projection": 202104744560398740,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 6470254264953035518,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 300001,
-      "projection": 13064544990309964302,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 15379403848505881818,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 310001,
-      "projection": 7299630049888399602,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 1175351808584903024,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 320001,
-      "projection": 6731175613582304610,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 8950270936073564535,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 330001,
-      "projection": 12736751729784860653,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 6143403761583946749,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 340001,
-      "projection": 11836781200566896958,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 7089623941717924397,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 350001,
-      "projection": 10360874417739413716,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 7493255577567182300,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 360001,
-      "projection": 5418941032333705851,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 12176443820666371725,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 370001,
-      "projection": 5711658843702888290,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 14781878762373071650,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 380001,
-      "projection": 16209082396105802219,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 12903078576933637944,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 390001,
-      "projection": 17519657261232622908,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 13438519002803103664,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 400001,
-      "projection": 7236655282902149983,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 7870884339433742113,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 410001,
-      "projection": 6722753415037056926,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 9440421474224405623,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 420001,
-      "projection": 8388288433822543306,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 16938229713532449205,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 430001,
-      "projection": 526469535339823979,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 5366100848701628764,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 440001,
-      "projection": 16217033494421605403,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 10811056972683737562,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 450001,
-      "projection": 3750449315930981731,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 10746022281177960052,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 460001,
-      "projection": 11846394662832626839,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 15741847148005953143,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 470001,
-      "projection": 6111111276082145216,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 1781102398839309110,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 480001,
-      "projection": 2809926498014616598,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 3364049164247313940,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 490001,
-      "projection": 10480448728093460113,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 15477192465022424194,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 500001,
-      "projection": 7303632545661192689,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 14506270842857512880,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 510001,
-      "projection": 14612601127330899645,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 255328876980545060,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 520001,
-      "projection": 14217765081853603937,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 5053477839787354505,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 530001,
-      "projection": 9424577658072476323,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 1463695442651343395,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 540001,
-      "projection": 6199637844653698606,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 4398593711597560321,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 550001,
-      "projection": 7592919956320526900,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 2649745079310719350,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 560001,
-      "projection": 5917514497496712365,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 10234168044628360508,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 570001,
-      "projection": 16678216591385875332,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 17451053403034099073,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 580001,
-      "projection": 5028703512987111786,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 13455694684595174593,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 590001,
-      "projection": 13526458479426894107,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 9899816508079044415,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 600001,
-      "projection": 14511087080636460972,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 12914715245523583708,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     },
     {
       "tick": 600001,
-      "projection": 14511087080636460972,
-      "source_commit": "940e6a1f0aef506ac07dce617966df21053191b1"
+      "projection": 12914715245523583708,
+      "source_commit": "9064759ef5c72cce64d3b3e0282f707622960bd5"
     }
   ],
   "smoke": [
