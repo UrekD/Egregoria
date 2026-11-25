@@ -10,9 +10,9 @@ use crate::map::{
 };
 
 #[derive(Serialize, Deserialize)]
-struct MapWithLotOrigins<T> {
+struct MapWithLotOrigins<T, Origins = BTreeMap<BuildingID, LotOrigin>> {
     map: T,
-    lot_origins: BTreeMap<BuildingID, LotOrigin>,
+    lot_origins: Origins,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -30,20 +30,6 @@ struct ReadableMap {
 }
 
 impl ReadableMap {
-    fn from_serialized(map: SerializedMap, import_lane_reserve: bool) -> Self {
-        Self {
-            roads: map.roads,
-            intersections: map.intersections,
-            buildings: map.buildings,
-            lanes: map.lanes,
-            parking: map.parking,
-            lots: map.lots,
-            environment: map.environment,
-            external_train_stations: map.external_train_stations,
-            import_lane_reserve,
-        }
-    }
-
     fn into_serialized(self) -> SerializedMap {
         SerializedMap {
             roads: self.roads,
@@ -70,48 +56,40 @@ struct SerializedMap {
     pub external_train_stations: Vec<BuildingID>,
 }
 
-impl From<&Map> for SerializedMap {
-    fn from(m: &Map) -> Self {
-        Self {
-            roads: m.roads.clone(),
-            intersections: m.intersections.clone(),
-            buildings: m.buildings.clone(),
-            lanes: m.lanes.clone(),
-            parking: m.parking.clone(),
-            lots: m.lots.clone(),
-            environment: m.environment.clone(),
-            external_train_stations: m.external_train_stations.clone(),
-        }
-    }
+#[derive(Serialize)]
+struct BorrowedMap<'a> {
+    roads: &'a Roads,
+    intersections: &'a Intersections,
+    buildings: &'a Buildings,
+    lanes: &'a Lanes,
+    parking: &'a ParkingSpots,
+    lots: &'a Lots,
+    environment: &'a Environment,
+    external_train_stations: &'a [BuildingID],
+    #[serde(skip_serializing_if = "Option::is_none")]
+    import_lane_reserve: Option<bool>,
 }
 
 impl Serialize for Map {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = SerializedMap::from(self);
-        // The stored placement geometry is authoritative. Generated faces
-        // are rebuilt on load and do not participate in map hashes.
-        for building in map.buildings.values_mut() {
-            if building
-                .development()
-                .is_some_and(|site| site.frozen_shell.is_some())
-            {
-                building.mesh = Default::default();
-            }
+        let import_lane_reserve = serializer
+            .is_human_readable()
+            .then_some(self.import_lane_reserve);
+        MapWithLotOrigins {
+            map: BorrowedMap {
+                roads: &self.roads,
+                intersections: &self.intersections,
+                buildings: &self.buildings,
+                lanes: &self.lanes,
+                parking: &self.parking,
+                lots: &self.lots,
+                environment: &self.environment,
+                external_train_stations: &self.external_train_stations,
+                import_lane_reserve,
+            },
+            lot_origins: &self.lot_origins,
         }
-        let lot_origins = self.lot_origins.clone();
-        if serializer.is_human_readable() {
-            return MapWithLotOrigins {
-                map: ReadableMap::from_serialized(map, self.import_lane_reserve),
-                lot_origins,
-            }
-            .serialize(serializer);
-        }
-        // Bincode uses positional fields. A trailing null station key explicitly
-        // marks an import and preserves the byte layout of ordinary maps.
-        if self.import_lane_reserve {
-            map.external_train_stations.push(BuildingID::null());
-        }
-        MapWithLotOrigins { map, lot_origins }.serialize(serializer)
+        .serialize(serializer)
     }
 }
 
@@ -368,7 +346,9 @@ mod tests {
 
         (
             MapWithLotOrigins {
-                map: (&map).into(),
+                map: Bincode::decode(&Bincode::encode(&map).unwrap())
+                    .map(|data: MapWithLotOrigins<SerializedMap>| data.map)
+                    .unwrap(),
                 lot_origins: BTreeMap::new(),
             },
             road,
@@ -399,7 +379,7 @@ mod tests {
 
     #[test]
     fn osm_trim_mode_round_trips_and_defaults_to_ordinary() {
-        let legacy = MapWithLotOrigins {
+        let legacy = MapWithLotOrigins::<SerializedMap> {
             map: SerializedMap::default(),
             lot_origins: BTreeMap::new(),
         };

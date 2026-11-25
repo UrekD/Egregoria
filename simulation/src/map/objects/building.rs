@@ -250,7 +250,7 @@ impl PreparedBuilding {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub struct Building {
     pub id: BuildingID,
     pub door_pos: Vec3,
@@ -262,6 +262,33 @@ pub struct Building {
     pub connected_road: Option<RoadID>,
     #[serde(default)]
     pub(in crate::map) development: Option<GrowableDevelopment>,
+}
+
+impl Serialize for Building {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+
+        let empty_mesh = ColoredMesh::default();
+        let mesh = if self
+            .development()
+            .is_some_and(|site| site.frozen_shell.is_some())
+        {
+            &empty_mesh
+        } else {
+            &self.mesh
+        };
+        let mut building = serializer.serialize_struct("Building", 9)?;
+        building.serialize_field("id", &self.id)?;
+        building.serialize_field("door_pos", &self.door_pos)?;
+        building.serialize_field("kind", &self.kind)?;
+        building.serialize_field("mesh", mesh)?;
+        building.serialize_field("obb", &self.obb)?;
+        building.serialize_field("height", &self.height)?;
+        building.serialize_field("zone", &self.zone)?;
+        building.serialize_field("connected_road", &self.connected_road)?;
+        building.serialize_field("development", &self.development)?;
+        building.end()
+    }
 }
 
 impl Building {

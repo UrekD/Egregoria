@@ -216,6 +216,14 @@ fn sampled_pipes(
     utility_network_readout(map, power, flow, Some(network)).utility_totals
 }
 
+type NetworkReadouts = BTreeMap<ElectricityNetworkID, Option<(NetworkLoad, bool)>>;
+
+#[derive(Default)]
+pub(in crate::map_dynamic) struct DisplayUtilityReadouts {
+    revision: (u64, u64, u64, u64),
+    networks: NetworkReadouts,
+}
+
 /// Reads current site loads and validates pipe supply against the last sample.
 pub struct SiteUtilityReader<'a> {
     map: Ref<'a, Map>,
@@ -224,7 +232,8 @@ pub struct SiteUtilityReader<'a> {
     power: Ref<'a, ElectricityFlow>,
     flow: Ref<'a, UtilityFlow>,
     world: &'a World,
-    networks: BTreeMap<ElectricityNetworkID, Option<(NetworkLoad, bool)>>,
+    networks: NetworkReadouts,
+    display_revision: Option<(u64, u64, u64, u64)>,
 }
 
 impl<'a> SiteUtilityReader<'a> {
@@ -237,7 +246,20 @@ impl<'a> SiteUtilityReader<'a> {
             flow: sim.read(),
             world: sim.world(),
             networks: BTreeMap::new(),
+            display_revision: None,
         }
+    }
+
+    /// Reuse validated network results while rendering the same world state.
+    pub fn for_display(sim: &'a Simulation) -> Self {
+        let mut reader = Self::new(sim);
+        reader.display_revision = Some((
+            sim.get_tick(),
+            sim.read::<crate::world_command::CommandOutcomes>().sequence,
+            reader.map.electricity.generation(),
+            reader.map.environment().water_revision(),
+        ));
+        reader
     }
 
     pub fn load(&self, building: &Building) -> SiteLoad {
@@ -252,7 +274,10 @@ impl<'a> SiteUtilityReader<'a> {
         &mut self,
         network: ElectricityNetworkID,
     ) -> Option<(NetworkLoad, bool)> {
-        *self.networks.entry(network).or_insert_with(|| {
+        if let Some(&result) = self.networks.get(&network) {
+            return result;
+        }
+        let read = || {
             NetworkLoad::live_with_pipe_sample(
                 &self.map,
                 &self.residences,
@@ -262,7 +287,13 @@ impl<'a> SiteUtilityReader<'a> {
                 &self.flow,
                 network,
             )
-        })
+        };
+        let result = match self.display_revision {
+            Some(revision) => self.flow.display_readouts(revision, network, read),
+            None => read(),
+        };
+        self.networks.insert(network, result);
+        result
     }
 
     pub fn status(&mut self, id: BuildingID) -> Option<BuildingUtilityStatus> {
@@ -299,6 +330,22 @@ pub(crate) fn live_site_utility_status(
     }))
 }
 
+impl UtilityFlow {
+    fn display_readouts(
+        &self,
+        revision: (u64, u64, u64, u64),
+        network: ElectricityNetworkID,
+        read: impl FnOnce() -> Option<(NetworkLoad, bool)>,
+    ) -> Option<(NetworkLoad, bool)> {
+        let mut display = self.display_readouts.lock().unwrap();
+        if display.revision != revision {
+            display.revision = revision;
+            display.networks.clear();
+        }
+        *display.networks.entry(network).or_insert_with(read)
+    }
+}
+
 fn pipe_status(
     network: Option<ElectricityNetworkID>,
     read: impl FnOnce(ElectricityNetworkID) -> Option<(NetworkLoad, bool)>,
@@ -327,6 +374,26 @@ fn pipe_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zones2_display_network_readouts_reuse_the_same_state_and_invalidate_edits() {
+        let flow = UtilityFlow::default();
+        let site = BuildingID::default();
+        let mut graph = crate::map::ElectricityCache::default();
+        graph.add_object(site);
+        let id = graph.net_id(site).unwrap();
+        let revision = (50, 7, 1, 0);
+        let value = Some((NetworkLoad::default(), true));
+        assert_eq!(flow.display_readouts(revision, id, || value), value);
+        assert_eq!(
+            flow.display_readouts(revision, id, || panic!(
+                "same-state render rebuilt the network"
+            )),
+            value
+        );
+        assert_eq!(flow.display_readouts((50, 8, 1, 0), id, || None), None);
+        assert_eq!(flow.display_readouts((51, 8, 1, 0), id, || value), value);
+    }
 
     #[test]
     fn z3_fix_idle_network_delivers_water_from_a_zero_watt_pump() {

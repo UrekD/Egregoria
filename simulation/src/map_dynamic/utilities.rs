@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Mutex;
 
 use prototypes::{try_prototype, Power, ServiceID, ServiceKind, Tick};
 use serde::{Deserialize, Serialize};
@@ -26,6 +27,8 @@ pub struct UtilityFlow {
     pub(crate) sampled_members: BTreeMap<ElectricityNetworkID, BTreeSet<NetworkObjectID>>,
     #[serde(skip)]
     pub(crate) sampled_water_revision: u64,
+    #[serde(skip)]
+    pub(super) display_readouts: Mutex<super::electricity::DisplayUtilityReadouts>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

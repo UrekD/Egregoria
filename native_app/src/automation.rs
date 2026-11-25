@@ -109,6 +109,7 @@ enum Step {
         round_trip: bool,
     },
     NewWetTiledFixture,
+    ClearBuildingInspector,
     LoadSlot(String),
     Assert(Assertion),
     Screenshot(String),
@@ -154,7 +155,9 @@ enum Assertion {
         treasury: u32,
         extent: Option<[u16; 2]>,
     },
-    MixedUseInspector,
+    MixedUseInspector {
+        business_open: bool,
+    },
     BuildingCount {
         prototype: String,
         count: usize,
@@ -749,6 +752,9 @@ impl Automation {
                 replace_land_fixture(uiw, new_tiled_fixture(side, progression, round_trip)?)?;
             }
             Step::NewWetTiledFixture => replace_land_fixture(uiw, land_fixture::wet_rectangle()?)?,
+            Step::ClearBuildingInspector => {
+                uiw.write::<InspectedBuilding>().e = None;
+            }
             Step::OpenWindow(name) => {
                 if name == "Land Tiles" && !uiw.read::<GuiState>().windows.land_tiles_open {
                     crate::gui::overlays::land_tiles::toggle(uiw);
@@ -1147,14 +1153,29 @@ impl Assertion {
                     ));
                 }
             }
-            Self::MixedUseInspector => {
-                if !uiw
+            Self::MixedUseInspector { business_open } => {
+                use simulation::map::GrowableBusinessState;
+                let expected = if business_open { "open" } else { "shuttered" };
+                let matches = uiw
                     .read::<InspectedBuilding>()
                     .e
                     .and_then(|id| sim.growable_summary(id))
-                    .is_some_and(|site| site.zone.kind == ZoneKind::MixedUse && site.occupants > 0)
-                {
-                    return Err("the inspector is not showing an occupied Mixed Use site".into());
+                    .is_some_and(|site| {
+                        site.zone.kind == ZoneKind::MixedUse
+                            && site.occupants > 0
+                            && if business_open {
+                                site.business == Some(GrowableBusinessState::Open)
+                            } else {
+                                matches!(
+                                    site.business,
+                                    Some(GrowableBusinessState::ClosedUntil { .. })
+                                )
+                            }
+                    });
+                if !matches || uiw.read::<GuiState>().hidden {
+                    return Err(format!(
+                        "expected an occupied Mixed Use inspector with a {expected} business"
+                    ));
                 }
             }
             Self::BuildingCount { prototype, count } => {

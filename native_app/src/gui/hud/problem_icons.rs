@@ -102,7 +102,7 @@ struct PlacedBadge {
 
 pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
     let map = sim.map();
-    let mut utilities = SiteUtilityReader::new(sim);
+    let mut utilities = SiteUtilityReader::for_display(sim);
     let fires = sim.read::<Fires>();
     let power = sim.read::<ElectricityFlow>();
     let camera = uiworld.camera().camera;
