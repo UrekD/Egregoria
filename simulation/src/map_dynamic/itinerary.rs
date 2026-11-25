@@ -951,17 +951,21 @@ impl Itinerary {
         matches!(self.kind, ItineraryKind::PedestrianEgress(_))
     }
 
-    fn requires_pedestrian_egress(&self) -> bool {
-        matches!(
-            self.kind,
-            ItineraryKind::None
-                | ItineraryKind::WaitForReroute { kind: PathKind::Pedestrian, .. }
-                | ItineraryKind::PedestrianEgress(_)
-        )
+    fn requires_pedestrian_egress(&self, has_route_step: bool) -> bool {
+        match self.kind {
+            ItineraryKind::None => !has_route_step,
+            ItineraryKind::WaitForReroute {
+                kind: PathKind::Pedestrian,
+                wait_ticks,
+                ..
+            } => wait_ticks != 0 || !has_route_step,
+            ItineraryKind::PedestrianEgress(_) => true,
+            _ => false,
+        }
     }
 
-    fn needs_clearance_check(&self, tick: u64) -> bool {
-        self.requires_pedestrian_egress()
+    fn needs_clearance_check(&self, tick: u64, has_route_step: bool) -> bool {
+        self.requires_pedestrian_egress(has_route_step)
             && self.get_point().is_none()
             && match self.kind {
                 ItineraryKind::PedestrianEgress(egress) => tick >= egress.check_at.0,
@@ -1198,7 +1202,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             if remaining_egress_checks != 0
                 && human.location == Location::Outside
                 && human.collider.is_some()
-                && human.it.needs_clearance_check(tick)
+                && human.it.needs_clearance_check(tick, human.router.has_route_step())
             {
                 remaining_egress_checks -= 1;
                 human.speed.0 = 0.0;
@@ -1262,8 +1266,12 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         };
     world.humans.edit_active(HumanWork::Itinerary, |id, human| {
         let outside = human.location == Location::Outside;
+        let has_route_step = human.router.has_route_step();
         let mut safe_to_remove = checked_clear.contains(&id);
-        if outside && human.collider.is_some() && human.it.needs_clearance_check(tick) {
+        if outside
+            && human.collider.is_some()
+            && human.it.needs_clearance_check(tick, has_route_step)
+        {
             human.speed.0 = 0.0;
             if !safe_to_remove {
                 if remaining_egress_checks == 0 {
@@ -1298,7 +1306,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         // sidewalk or the local geometry confirms they are clear of traffic.
         // An ordinary completed walk still hands off to its router step.
         // Route loss and deferred replanning use the physical clearance path.
-        safe_to_remove |= !human.it.requires_pedestrian_egress()
+        safe_to_remove |= !human.it.requires_pedestrian_egress(has_route_step)
             || (clearing && !human.it.is_pedestrian_egress());
         match (human.it.get_point(), human.collider) {
             (None, Some(collider)) if safe_to_remove => {
@@ -1623,6 +1631,56 @@ mod tests {
         let next_tick = ctx.g.get_tick() + 1;
         update_at(&mut ctx.g, next_tick);
         assert!(ctx.g.world.humans[id].collider.is_none());
+    }
+
+    #[test]
+    fn p7_life_vehicle_exit_hands_off_to_the_scheduled_walk() {
+        use crate::map_dynamic::{Destination, RoutingStep};
+        use crate::transportation::spawn_driving_vehicle;
+        use geom::Transform;
+
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), vec3(470.0, 180.0, 0.0)]);
+        let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
+        let id = spawn_human(&mut ctx.g, house).unwrap();
+        let (trans, destination) = {
+            let map = ctx.g.map();
+            let lane = map.lanes().values().find(|lane| lane.kind == LaneKind::Driving).unwrap();
+            let road = map.get(lane.parent).unwrap();
+            let sidewalk = road.lanes_iter()
+                .find_map(|(id, kind)| (kind == LaneKind::Walking).then(|| map.get(id).unwrap()))
+                .unwrap();
+            (
+                Transform::new_dir(lane.points.middle(), lane.points.last_dir().unwrap()),
+                sidewalk.points.middle(),
+            )
+        };
+        let car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, trans).unwrap();
+        ctx.g.world.edit_human(id, |human| {
+            human.location = Location::Vehicle(car);
+            human.it = Itinerary::NONE;
+            human.router.set_test_route(
+                Destination::Outside(destination),
+                vec![
+                    RoutingStep::DriveTo(car, trans.pos),
+                    RoutingStep::GetOutVehicle(car),
+                    RoutingStep::WalkTo(destination),
+                ],
+            );
+        });
+        let mut schedule = Simulation::schedule();
+        schedule.retain_systems(|name| {
+            matches!(name, "routing_update_system" | "pedestrian_decision_system" | "itinerary_update")
+        });
+        ctx.g.tick(&mut schedule, &[]);
+        let human = &ctx.g.world.humans[id];
+        assert_eq!(human.location, Location::Outside);
+        assert!(matches!(human.router.cur_step(), Some(RoutingStep::GetOutVehicle(vehicle)) if *vehicle == car));
+        assert!(!human.it.is_pedestrian_egress());
+        ctx.g.tick(&mut schedule, &[]);
+        let human = &ctx.g.world.humans[id];
+        assert!(matches!(human.router.cur_step(), Some(RoutingStep::WalkTo(point)) if *point == destination));
+        assert!(!human.it.is_pedestrian_egress());
     }
 
     #[test]
