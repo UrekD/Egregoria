@@ -269,11 +269,31 @@ pub fn commission(
         }
     }
 
-    // Place and open freight employers before housing brings the hiring pool.
-    // Depots buffer flour and general goods for the nearby recipe inputs.
+    let (mut parcels, reserves) = plan_parcels(sim, plan, &roads, &cohorts)?;
+    place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
+
+    // Keep the food facilities clear of approved housing and future infill.
+    // Opening them before housing still gives them the first hiring pool.
+    let place_food_site = |sim: &mut Simulation, name: &str, anchor: Vec2| {
+        place_scored_company(sim, plan, &roads, name, |map, road, footprint| {
+            if !map.roads()[road]
+                .lanes_iter()
+                .any(|(_, kind)| kind == LaneKind::Parking)
+                || parcels
+                    .iter()
+                    .chain(&reserves)
+                    .any(|parcel| parcel.footprint.intersects(&footprint))
+            {
+                return None;
+            }
+            Some(footprint.center().distance2(anchor))
+        })?
+        .map(|(building, _)| building)
+        .ok_or_else(|| format!("no clear fitting site for {name} outside approved frontage"))
+    };
     let mut depots = Vec::new();
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
-        let depot = place_company(sim, plan, &roads, "small-depot", cohort.anchor)?.0;
+        let depot = place_food_site(sim, "small-depot", cohort.anchor)?;
         sites.insert(format!("{}/depot", cohort.district), depot);
         depots.push(WorldCommand::SetWarehousePolicy {
             building: depot,
@@ -299,14 +319,12 @@ pub fn commission(
     .into_iter()
     .enumerate()
     {
-        let (store, _) = place_company(sim, plan, &roads, "supermarket", at(x, y))?;
+        let store = place_food_site(sim, "supermarket", at(x, y))?;
         sites.insert(format!("supermarket-{}", index + 1), store);
     }
 
     // Ordinary housing opens before the shops/factories. This gives civic and
     // utility sites a chance to hire while the first households arrive.
-    let (mut parcels, reserves) = plan_parcels(sim, plan, &roads, &cohorts)?;
-    place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
     let housing = parcels
         .iter()
         .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential);
@@ -2060,9 +2078,8 @@ impl FreightEvidence {
         let loading = matches!(state, Some(FreightTrainState::Loading));
         let book = sim.read::<CargoBook>();
         let item = ItemID::new(freight.item);
-        // Station truck manifests are private. Flour is consumed only by the
-        // named bakery in this opening, so the stock draw and the bakery's
-        // station-specific receipt bracket this ordinary truck delivery.
+        // The stock draw measures station-wide dispatch. The named bakery's
+        // receipt separately confirms that its flour reached the destination.
         let stock = book
             .import_stock(freight.terminal)
             .get(&item)
@@ -2124,6 +2141,8 @@ struct DayReport {
     coverage_at_close: Vec<String>,
     unstocked_retail_samples: BTreeMap<&'static str, u64>,
     coal_stockout_ticks: u64,
+    coal_road_units: u64,
+    coal_station_units: u64,
 }
 
 pub fn check_loaded_opening(
@@ -2153,7 +2172,8 @@ pub fn check_loaded_opening(
                 .filter(|&&active| active >= 2)
                 .count()
                 < 2
-                || (district.key != "employment" && (d.residents == 0 || d.stocked_shops == 0))
+                || d.stocked_shops == 0
+                || (district.key != "employment" && d.residents == 0)
                 || (district.key == "employment" && d.jobs == 0)
         }) {
             failures.push(format!(
@@ -2177,6 +2197,12 @@ pub fn check_loaded_opening(
         .read::<BuildingInfos>()
         .owner(manifest.freight.buyer)
         .ok_or("rail bakery has no operating company")?;
+    let plant = manifest
+        .sites
+        .get("coal-power-plant")
+        .and_then(|&building| sim.read::<BuildingInfos>().owner(building))
+        .ok_or("coal plant has no operating company")?;
+    let coal = ItemID::new("coal");
     let flour = ItemID::new(manifest.freight.item);
     freight.previous_stock = sim
         .read::<CargoBook>()
@@ -2194,6 +2220,7 @@ pub fn check_loaded_opening(
         let mut failed_coverage_samples = 0;
         let mut coverage_at_close = Vec::new();
         let mut unstocked_retail_samples = BTreeMap::new();
+        let mut coal_stockout_ticks = 0;
         let item_receipts = |sim: &Simulation| {
             sim.read::<CargoBook>()
                 .freight_day(day)
@@ -2205,6 +2232,7 @@ pub fn check_loaded_opening(
         for dt in 1..=TICKS_PER_BUDGET_DAY {
             resident_ticks += sim.world().humans.len() as u64;
             sim.tick(&mut schedule, []);
+            coal_stockout_ticks += u64::from(sim.read::<Market>().capital(plant, coal) <= 0);
             let tick = day_start + dt;
             minimum_cash = minimum_cash.min(sim.read::<Government>().money);
             loops.observe(&sim.read::<Transit>());
@@ -2224,9 +2252,13 @@ pub fn check_loaded_opening(
                 let uncovered = coverage_failures(&state);
                 failed_coverage_samples += u64::from(!uncovered.is_empty());
                 coverage_at_close = uncovered;
-                for (&district, data) in &state.districts {
-                    if data.residents > 0 && data.stocked_shops == 0 {
-                        *unstocked_retail_samples.entry(district).or_insert(0) += 1;
+                for district in &plan.districts {
+                    if state
+                        .districts
+                        .get(district.key)
+                        .is_none_or(|data| data.stocked_shops == 0)
+                    {
+                        *unstocked_retail_samples.entry(district.key).or_insert(0) += 1;
                     }
                 }
             }
@@ -2252,11 +2284,10 @@ pub fn check_loaded_opening(
             .get(&ItemID::new("effective-food"))
             .copied()
             .unwrap_or(0);
-        let coal_stockout_ticks = daily
-            .stockout_ticks_by_sku
-            .get(&ItemID::new("coal"))
-            .copied()
-            .unwrap_or(0);
+        let coal_receipt = sim
+            .read::<CargoBook>()
+            .freight_day(day)
+            .map_or_else(Default::default, |record| record.receipt(plant, coal));
         let baskets_due = daily.baskets_due.unwrap_or(0);
         let baskets_filled = daily.baskets_filled.unwrap_or(0);
         if !needs_met(
@@ -2276,7 +2307,7 @@ pub fn check_loaded_opening(
         }
         if !unstocked_retail_samples.is_empty() {
             failures.push(format!(
-                "day {day}: occupied districts lacked stocked retail at samples {unstocked_retail_samples:?}"
+                "day {day}: districts lacked stocked retail at samples {unstocked_retail_samples:?}"
             ));
         }
         if coal_stockout_ticks > 0 {
@@ -2346,6 +2377,8 @@ pub fn check_loaded_opening(
             coverage_at_close,
             unstocked_retail_samples,
             coal_stockout_ticks,
+            coal_road_units: coal_receipt.road_units,
+            coal_station_units: coal_receipt.station_units,
         };
         eprintln!(
             "CITYMAP soak: {}",
