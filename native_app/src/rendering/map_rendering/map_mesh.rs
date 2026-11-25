@@ -32,6 +32,9 @@ use std::ops::{Mul, Neg, Range};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+#[path = "growable_mesh.rs"]
+mod growable_mesh;
+
 /// This is the main struct that handles the map rendering.
 /// It is responsible for generating the meshes and sprites for the map
 /// That is, the mostly static things (roads, intersections, lights, buildings).
@@ -1555,6 +1558,9 @@ impl MapBuilders {
         {
             let building = &buildings[building];
             if SubscriberChunkID::new(building.canonical_position()) != chunk {
+                continue;
+            }
+            if growable_mesh::append(&mut self.houses_mesh, building) {
                 continue;
             }
             let mut sprite_z = building.height;

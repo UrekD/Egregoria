@@ -4,6 +4,7 @@ use goryak::{
     mincolumn, minrow, monospace, on_secondary_container, selectable_label_primary, textc, titlec,
     VertScrollSize, Window,
 };
+use simulation::diagnostics::elapsed_tick;
 use simulation::economy::{
     Budget, BudgetCategory, Government, MAX_TAX_RATE_PERMILLE, TICKS_PER_BUDGET_DAY,
 };
@@ -23,9 +24,9 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
     }
     .show(|| {
         let color = on_secondary_container();
+        let current_day = elapsed_tick(sim).0.saturating_sub(1) / TICKS_PER_BUDGET_DAY;
         let budget = sim.read::<Budget>();
         let selection = use_state(|| None::<u64>);
-        let current_day = sim.get_tick().saturating_sub(1) / TICKS_PER_BUDGET_DAY;
         let day = selection
             .get()
             .filter(|day| budget.days().contains_key(day))
@@ -49,10 +50,13 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
                     (BudgetCategory::MilestoneGrant, "Milestone grants"),
                     (BudgetCategory::TradeImport, "Imports"),
                     (BudgetCategory::TradeExport, "Exports"),
-                    (BudgetCategory::Tax(ZoneKind::TAXABLE[0]), "Residential tax"),
-                    (BudgetCategory::Tax(ZoneKind::TAXABLE[1]), "Commercial tax"),
-                    (BudgetCategory::Tax(ZoneKind::TAXABLE[2]), "Industrial tax"),
-                    (BudgetCategory::Tax(ZoneKind::TAXABLE[3]), "Office tax"),
+                    (
+                        BudgetCategory::Tax(ZoneKind::Residential),
+                        "Residential tax",
+                    ),
+                    (BudgetCategory::Tax(ZoneKind::Commercial), "Commercial tax"),
+                    (BudgetCategory::Tax(ZoneKind::Industrial), "Industrial tax"),
+                    (BudgetCategory::Tax(ZoneKind::Office), "Office tax"),
                     (BudgetCategory::RoadUpkeep, "Road upkeep"),
                     (
                         BudgetCategory::SpecialBuildingUpkeep,
@@ -90,6 +94,8 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
                         });
                     }
                 }
+                textc(color, "Mixed-use homes pay residential tax.");
+                textc(color, "Mixed-use shops pay commercial tax.");
             });
         });
         divider(color.with_alpha(0.3), 3.0, 1.0);

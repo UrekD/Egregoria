@@ -4,8 +4,8 @@ use crate::inputmap::{InputAction, InputMap};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 use engine::Tesselator;
-use geom::{Intersect, Ray3, Segment, Vec2, Vec3};
-use simulation::map::{Map, ProjectFilter, ProjectKind, Road, RoadID};
+use geom::{Intersect, Ray3, Segment, Shape, Vec2, Vec3, AABB};
+use simulation::map::{BuildingID, Environment, Map, ProjectFilter, ProjectKind, Road, RoadID};
 use simulation::{AnyEntity, Simulation};
 
 pub fn select_radius(id: AnyEntity) -> f32 {
@@ -50,13 +50,16 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
     if clicked && !inspected_b.dontclear {
         inspected_b.e = None;
         if inspected.e.is_none() {
-            if let Some(unproj) = inp.unprojected {
-                let map = sim.map();
-                inspected_b.e = map
-                    .spatial_map()
-                    .query(unproj.xy(), ProjectFilter::BUILDING)
-                    .find_map(|x| x.as_building());
-            }
+            let map = sim.map();
+            inspected_b.e = inp
+                .ray
+                .and_then(|ray| pick_growable(&map, ray))
+                .or_else(|| {
+                    map.spatial_map()
+                        .query(inp.unprojected?.xy(), ProjectFilter::BUILDING)
+                        .filter_map(|project| project.as_building())
+                        .find(|&id| map.get(id).is_some_and(|b| b.development().is_none()))
+                });
         }
     }
     if clicked && !inspected.dontclear && !inspected_b.dontclear {
@@ -110,6 +113,87 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
                 .color(simulation::colors().gui_primary);
         }
     }
+}
+
+// The orbit camera's maximum normal eye offset is about 1.7 km.
+const GROWABLE_PICK_RANGE_M: f32 = 4096.0;
+
+fn pick_growable(map: &Map, ray: Ray3) -> Option<BuildingID> {
+    if !ray.from.is_finite() || !ray.dir.is_finite() {
+        return None;
+    }
+    let length = ray.dir.mag();
+    if !length.is_finite() || length == 0.0 {
+        return None;
+    }
+    let ray = Ray3::new(ray.from, ray.dir / length);
+    let (start, end) = visible_pick_depth(map.environment(), ray)?;
+
+    let first = (ray.from + start * ray.dir).xy();
+    let last = (ray.from + end * ray.dir).xy();
+    let footprint_ray = Segment::new(first, last);
+    map.spatial_map()
+        .query(footprint_ray.bbox(), ProjectFilter::BUILDING)
+        .filter_map(|project| {
+            let id = project.as_building()?;
+            let building = map.get(id)?;
+            building.development()?;
+            if !building.obb.intersects(&footprint_ray) {
+                return None;
+            }
+            shell_hit(&building.mesh.faces, ray, start..=end).map(|depth| (depth, id))
+        })
+        .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+        .map(|(_, id)| id)
+}
+
+fn visible_pick_depth(env: &Environment, ray: Ray3) -> Option<(f32, f32)> {
+    let (start, mut end) = clip_pick_ray(ray, env.bounds(), GROWABLE_PICK_RANGE_M)?;
+    if let Some((point, _)) = env.raycast(ray) {
+        end = end.min((point - ray.from).dot(ray.dir));
+    }
+    if let Some(water) = env.raycast_water(ray, end) {
+        end = water.t;
+    }
+    (start <= end).then_some((start, end))
+}
+
+fn clip_pick_ray(ray: Ray3, bounds: AABB, limit: f32) -> Option<(f32, f32)> {
+    let mut start = 0.0_f32;
+    let mut end = limit;
+    for (origin, speed, low, high) in [
+        (ray.from.x, ray.dir.x, bounds.ll.x, bounds.ur.x),
+        (ray.from.y, ray.dir.y, bounds.ll.y, bounds.ur.y),
+    ] {
+        if speed == 0.0 {
+            if !(low..=high).contains(&origin) {
+                return None;
+            }
+        } else {
+            let a = (low - origin) / speed;
+            let b = (high - origin) / speed;
+            start = start.max(a.min(b));
+            end = end.min(a.max(b));
+        }
+    }
+    (start <= end).then_some((start, end))
+}
+
+fn shell_hit(
+    faces: &[(Vec<Vec3>, geom::LinearColor)],
+    ray: Ray3,
+    depth: std::ops::RangeInclusive<f32>,
+) -> Option<f32> {
+    // Prepared growable faces are convex and use the same triangle fan in the renderer.
+    faces
+        .iter()
+        .filter_map(|(face, _)| face.split_first())
+        .flat_map(|(&a, tail)| {
+            tail.windows(2)
+                .filter_map(move |pair| triangle_hit(ray, a, pair[0], pair[1]))
+        })
+        .filter(|hit| depth.contains(hit))
+        .min_by(f32::total_cmp)
 }
 
 fn pick_road(map: &Map, ray: Ray3, terrain: Option<Vec3>) -> Option<RoadID> {
@@ -181,6 +265,52 @@ mod tests {
     use simulation::map::{LanePatternBuilder, MapProject};
     use simulation::transportation::{spawn_driving_vehicle, VehicleKind};
     use simulation::SimulationOptions;
+
+    #[test]
+    fn zones2_native_pick_segment_clips_vertical_and_world_edge_rays() {
+        let bounds = geom::AABB::new_ll_ur(Vec2::ZERO, Vec2::splat(512.0));
+        let edge = Ray3::new(vec3(-10.0, 512.0, 40.0), Vec3::X);
+        assert_eq!(clip_pick_ray(edge, bounds, 200.0), Some((10.0, 200.0)));
+        assert_eq!(clip_pick_ray(edge, bounds, 9.0), None);
+        let vertical = Ray3::new(vec3(25.0, 25.0, 80.0), -Vec3::Z);
+        assert_eq!(clip_pick_ray(vertical, bounds, 35.0), Some((0.0, 35.0)));
+        assert_eq!(
+            clip_pick_ray(Ray3::new(edge.from, Vec3::Y), bounds, 200.0),
+            None
+        );
+    }
+
+    #[test]
+    fn zones2_native_pick_hits_visible_surfaces_at_their_actual_depth() {
+        let near = vec![
+            vec3(10.0, 10.0, 30.0),
+            vec3(10.0, 20.0, 30.0),
+            vec3(10.0, 20.0, 46.0),
+        ];
+        let far = vec![
+            vec3(20.0, 10.0, 30.0),
+            vec3(20.0, 20.0, 30.0),
+            vec3(20.0, 20.0, 50.0),
+            vec3(20.0, 10.0, 50.0),
+        ];
+        let faces = [far, near].map(|face| (face, geom::LinearColor::WHITE));
+        let sky = Ray3::new(vec3(0.0, 15.0, 36.0), Vec3::X);
+        assert_eq!(shell_hit(&faces, sky, 0.0..=100.0), Some(10.0));
+        assert_eq!(shell_hit(&faces, sky, 0.0..=9.0), None);
+        let above_near_face = Ray3::new(sky.from.up(5.0), sky.dir);
+        assert_eq!(shell_hit(&faces, above_near_face, 0.0..=100.0), Some(20.0));
+    }
+
+    #[test]
+    fn zones2_native_pick_depth_stops_at_the_nearer_water_surface() {
+        let mut env = Environment::new(1, 1);
+        env.terrain_apply(env.bounds(), |_| -4.0);
+        let ray = Ray3::new(vec3(250.0, 250.0, 20.0), -Vec3::Z);
+        let (_, dry_depth) = visible_pick_depth(&env, ray).unwrap();
+        assert!(dry_depth > 21.0);
+        env.set_sea_level(Some(0)).unwrap();
+        assert_eq!(visible_pick_depth(&env, ray), Some((0.0, 20.0)));
+    }
 
     #[test]
     fn u5_road_click_hits_the_outside_of_a_mitered_bend() {

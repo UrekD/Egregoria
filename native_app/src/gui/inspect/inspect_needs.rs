@@ -80,7 +80,8 @@ fn needs(sim: &Simulation, id: BuildingID, diagnostics: &BuildingDiagnostics) ->
     let Some(building) = map.get(id) else {
         return Vec::new();
     };
-    let receiver = is_coverage_receiver(building.kind);
+    let residential = building.has_residential_use();
+    let receiver = residential || is_coverage_receiver(building.kind);
     let utilities = diagnostics.utilities;
     if !receiver && utilities.is_none() {
         return Vec::new();
@@ -170,7 +171,10 @@ fn needs(sim: &Simulation, id: BuildingID, diagnostics: &BuildingDiagnostics) ->
             Need {
                 label: "Land value",
                 met: None,
-                detail: format!("{} / 100", env.land_value(id)),
+                detail: env.land_value_sample(id).map_or_else(
+                    || "Awaiting first sample".into(),
+                    |value| format!("{value} / 100"),
+                ),
             },
             Need {
                 label: "Pollution",
@@ -180,7 +184,31 @@ fn needs(sim: &Simulation, id: BuildingID, diagnostics: &BuildingDiagnostics) ->
         ]);
     }
 
-    if building.kind == BuildingKind::House {
+    if let Some(site) = building.development() {
+        let band = match site.approved_value_band {
+            0 => "Below 50",
+            1 => "50–69",
+            _ => "70–100",
+        };
+        list.push(Need {
+            label: "Approved land value band",
+            met: None,
+            detail: band.into(),
+        });
+        if building.kind == BuildingKind::House {
+            list.push(Need {
+                label: "Building height",
+                met: None,
+                detail: format!(
+                    "{} floors · {:.1} m",
+                    site.floors,
+                    site.roof_z - building.height
+                ),
+            });
+        }
+    }
+
+    if residential {
         list.push(Need {
             label: "Happiness",
             met: None,
