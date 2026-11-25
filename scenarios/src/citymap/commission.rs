@@ -187,14 +187,9 @@ pub fn commission(
     sites.insert("coal-power-plant".into(), plant);
     let plant_door = sim.map().buildings()[plant].door_pos.xy();
     let mine_frontage = BTreeSet::from([plant_road]);
-    for (index, offset) in [
-        vec2(-70.0, 0.0),
-        vec2(70.0, 0.0),
-        vec2(0.0, 60.0),
-        vec2(0.0, -65.0),
-    ]
-    .into_iter()
-    .enumerate()
+    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)]
+        .into_iter()
+        .enumerate()
     {
         let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
         verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
@@ -328,7 +323,7 @@ pub fn commission(
 
     // Keep the food facilities clear of approved housing and future infill.
     // Opening them before housing still gives them the first hiring pool.
-    let place_food_site = |sim: &mut Simulation, name: &str, anchor: Vec2, district: Option<&str>| {
+    let place_company_around_parcels = |sim: &mut Simulation, name: &str, anchor: Vec2, district: Option<&str>| {
         let polygon = district.and_then(|key| plan.districts.iter().find(|d| d.key == key));
         place_scored_company(sim, plan, &roads, name, |map, road, footprint| {
             if !map.roads()[road]
@@ -350,7 +345,7 @@ pub fn commission(
     };
     let mut depots = Vec::new();
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
-        let depot = place_food_site(sim, "small-depot", cohort.anchor, None)?;
+        let depot = place_company_around_parcels(sim, "small-depot", cohort.anchor, None)?;
         sites.insert(format!("{}/depot", cohort.district), depot);
         depots.push(WorldCommand::SetWarehousePolicy {
             building: depot,
@@ -366,11 +361,20 @@ pub fn commission(
         ("west", 1350.0, 1840.0),
         ("employment", 2530.0, 2400.0),
     ] {
-        let store = place_food_site(sim, "supermarket", at(x, y), Some(district))?;
+        let store = place_company_around_parcels(sim, "supermarket", at(x, y), Some(district))?;
         sites.insert(format!("{district}/supermarket"), store);
     }
     place_walkable_bakeries(sim, plan, &roads, &parcels, &reserves, &mut sites)?;
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
+    // Fit backup fuel supply around the approved opening and infill lots.
+    let backup_mine = place_company_around_parcels(
+        sim,
+        "coal-mine",
+        plant_door + vec2(0.0, -65.0),
+        None,
+    )?;
+    verify_parking_pair(&sim.map(), backup_mine, plant, Tick(sim.get_tick()))?;
+    sites.insert("coal-mine-4".into(), backup_mine);
 
     // Ordinary housing opens before the shops/factories. This gives civic and
     // utility sites a chance to hire while the first households arrive.
@@ -1998,13 +2002,17 @@ fn verify_opening_ids(sim: &Simulation, manifest: &OpeningManifest) -> Result<u3
                     "developed parcel {id:?} lost its origin, zoning or frontage"
                 ));
             }
-        } else if map.get(parcel.lot).is_none_or(|lot| {
-            lot.parent != parcel.road || zones.lot_zone(&lot.shape) != Some(parcel.zoning)
-        }) {
-            return Err(format!(
-                "undeveloped parcel {:?} lost its zoning or frontage",
-                parcel.lot
-            ));
+        } else {
+            let lot = map.get(parcel.lot).ok_or_else(|| {
+                format!("undeveloped parcel {:?} disappeared at {:?}", parcel.lot, parcel.footprint.center())
+            })?;
+            let actual = zones.lot_zone(&lot.shape);
+            if lot.parent != parcel.road || actual != Some(parcel.zoning) {
+                return Err(format!(
+                    "undeveloped parcel {:?} has frontage {:?} and zone {actual:?}, expected {:?} and {:?}",
+                    parcel.lot, lot.parent, parcel.road, parcel.zoning
+                ));
+            }
         }
     }
     let mut capacity = 0;
