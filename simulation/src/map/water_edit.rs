@@ -902,6 +902,38 @@ mod tests {
     }
 
     #[test]
+    fn w2b_water_new_street_end_lots_are_buildable() {
+        drop(TestCtx::new_fast());
+        let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+        sim.map_mut().set_lot_layout(LotLayout::Uniform);
+        sim.edit_water(lake(vec2(248.0, 392.0), 8.0, 50)).unwrap();
+
+        let mut map = sim.map_mut();
+        assert!(map.environment().strict_water_siting());
+        let (_, road) = map
+            .make_connection(
+                MapProject::ground(vec2(100.0, 128.0).z(10.0)),
+                MapProject::ground(vec2(440.0, 128.0).z(10.0)),
+                None,
+                &LanePatternBuilder::new().build(),
+            )
+            .unwrap();
+        let end_lots = [false, true].map(|north| {
+            map.lots()
+                .values()
+                .filter(|lot| lot.parent == road && (lot.shape.center().y > 128.0) == north)
+                .min_by(|a, b| a.shape.center().x.total_cmp(&b.shape.center().x))
+                .expect("a lot near the start of the street on each side")
+                .id
+        });
+        let houses = end_lots.map(|lot| map.build_house(lot));
+        assert!(
+            houses.iter().all(Option::is_some),
+            "both end lots should be buildable, got {houses:?}"
+        );
+    }
+
+    #[test]
     fn w2b_water_edit_cleans_and_restores_local_frontage() {
         drop(TestCtx::new_fast());
         let mut sim = Simulation::new_authored_flat(5, 0).unwrap();

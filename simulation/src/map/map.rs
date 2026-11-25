@@ -725,11 +725,14 @@ impl Map {
         let (src, from_split) = mk_inter(from);
         let (dst, to_split) = mk_inter(to);
         let road = self
-            .connect(src, dst, pattern, connection_segment)
+            .connect_with_span(src, dst, pattern, connection_segment, None)
             .expect("validated connection intersections");
 
         self.invalidate(src);
         self.invalidate(dst);
+
+        // Frontage checks use the deck clipped by the finalized junction interfaces.
+        Lot::generate_along_road(self, road);
 
         info!("connected {:?} {:?}: {:?}", src, dst, road);
         ConnectedRoad {
@@ -1749,7 +1752,12 @@ impl Map {
         pattern: &LanePattern,
         segment: RoadSegmentKind,
     ) -> Option<RoadID> {
-        self.connect_with_span(src_id, dst_id, pattern, segment, None)
+        let gen_lots = !matches!(segment, RoadSegmentKind::Arbitrary(_));
+        let road = self.connect_with_span(src_id, dst_id, pattern, segment, None)?;
+        if gen_lots {
+            Lot::generate_along_road(self, road);
+        }
+        Some(road)
     }
 
     fn connect_with_span(
@@ -1762,8 +1770,6 @@ impl Map {
     ) -> Option<RoadID> {
         let src = self.intersections.get(src_id)?;
         let dst = self.intersections.get(dst_id)?;
-
-        let gen_lots = !matches!(segment, RoadSegmentKind::Arbitrary(_));
 
         let rid = Road::make_with_span(
             src,
@@ -1790,9 +1796,6 @@ impl Map {
         self.intersections.get_mut(dst_id)?.add_road(&self.roads, r);
 
         Lot::remove_intersecting_lots(self, rid);
-        if gen_lots {
-            Lot::generate_along_road(self, rid);
-        }
 
         #[allow(clippy::indexing_slicing)]
         let r = &self.roads[rid];
