@@ -1297,6 +1297,21 @@ fn plan_parcels(
             });
             let additional = 22.min(fitting(&candidates, high_house));
             take_parcels(&map, district.key, &mut candidates, high_house, additional, &mut reserves)?;
+            // Put future shops beside the new homes so they can hire from the
+            // same neighbourhood during the infill trial.
+            let retail_reserve = ZoneCell {
+                kind: Commercial,
+                density: Medium,
+            };
+            let shops = 2.min(fitting(&candidates, retail_reserve));
+            take_parcels(
+                &map,
+                district.key,
+                &mut candidates,
+                retail_reserve,
+                shops,
+                &mut reserves,
+            )?;
         }
         let mut counts = BTreeMap::new();
         for parcel in &painted[base..] {
