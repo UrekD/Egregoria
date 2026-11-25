@@ -5,7 +5,7 @@ use super::{
     ProjectFilter, ProjectKind, TerrainChunkID,
 };
 use crate::economy::progression::ProgressionMode;
-use crate::map_dynamic::{BuildingInfos, Itinerary};
+use crate::map_dynamic::{BuildingInfos, Dispatcher, Itinerary};
 use crate::world_command::WorldCommand;
 use crate::{MapPreset, NewGameError, NewGameOptions, Replay, Simulation, SimulationOptions};
 use geom::{Intersect, Polygon, Vec2, Vec3, AABB, OBB};
@@ -285,7 +285,12 @@ impl Simulation {
         // rejects a train already past the stop on the target lane.
         let dispatch_start = lane.points.length_at_proj(lane.points.project(spawn));
         let dispatch_target = platform.points.length_at_proj(stop);
-        if service_lane == platform.id && dispatch_start > dispatch_target {
+        if !Dispatcher::position_is_eligible(
+            service_lane,
+            dispatch_start,
+            platform.id,
+            dispatch_target,
+        ) {
             return Err(RailMarketError::Route);
         }
 

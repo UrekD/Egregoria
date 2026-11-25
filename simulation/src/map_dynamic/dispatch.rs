@@ -79,6 +79,16 @@ pub enum DispatchQueryTarget {
 }
 
 impl Dispatcher {
+    /// A vehicle already on the target lane must be at or before the target.
+    pub(crate) fn position_is_eligible(
+        lane: LaneID,
+        offset: f32,
+        target_lane: LaneID,
+        target_offset: f32,
+    ) -> bool {
+        !(lane == target_lane && offset > target_offset)
+    }
+
     /// Updates the dispatcher cache about the dispatachable entities to know where they are relative
     /// to the map, so that queries can be answered quickly
     pub fn update(&mut self, map: &Map, world: &World) {
@@ -271,7 +281,8 @@ impl DispatchOne {
                 }
                 let pos = self.positions.get(ent).unwrap();
                 let dist = -pos.dist_along; // since dist_along is from start to end, a good dist_along is one that is big
-                if lane == target_lane && pos.dist_along > start_along {
+                if !Dispatcher::position_is_eligible(lane, pos.dist_along, target_lane, start_along)
+                {
                     continue;
                 }
                 if dist < best_dist {

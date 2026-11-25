@@ -792,6 +792,8 @@ struct RouteCache {
     // lane topology change.
     access: BTreeMap<BuildingID, (Option<RoadID>, Option<ParkingAccess>)>,
     distances: BTreeMap<(BuildingID, BuildingID), Option<OrderedFloat<f32>>>,
+    // Placing or removing the outside market does not change lane topology.
+    rail_market: Option<BuildingID>,
     /// Stations whose platform has a rail route to the outside.
     rail: BTreeMap<BuildingID, bool>,
     searches: u64,
@@ -806,6 +808,11 @@ impl RouteCache {
                 searches: self.searches,
                 ..Self::default()
             };
+        }
+        let rail_market = map.external_train_stations.first().copied();
+        if self.rail_market != rail_market {
+            self.rail_market = rail_market;
+            self.rail.clear();
         }
     }
 
@@ -5099,6 +5106,127 @@ mod lifecycle_tests {
                 .unwrap();
         }
         assert!(served(&f), "a spur to the outside track");
+    }
+
+    #[test]
+    fn imports_see_an_authored_market_placed_after_matching() {
+        use crate::map::{LanePatternBuilder, MapProject, RailMarketSite};
+        use crate::world_command::CommandOutcomes;
+        use crate::AuthoredTownOptions;
+
+        drop(TestCtx::new_fast());
+        let mut sim = Simulation::new_authored_town(AuthoredTownOptions::default()).unwrap();
+        let light_road = LanePatternBuilder::new().build();
+        let railway = LanePatternBuilder::new().rail(true).build();
+        sim.apply_commands([
+            &WorldCommand::MapMakeConnection {
+                from: MapProject::ground(vec3(100.0, 625.0, 10.0)),
+                to: MapProject::ground(vec3(1000.0, 625.0, 10.0)),
+                inter: None,
+                pat: light_road,
+            },
+            &WorldCommand::MapMakeConnection {
+                from: MapProject::ground(vec3(100.0, 700.0, 10.0)),
+                to: MapProject::ground(vec3(1000.0, 700.0, 10.0)),
+                inter: None,
+                pat: railway,
+            },
+        ]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0, 1]);
+        let (road, lane, dir, spawn, platform) = {
+            let map = sim.map();
+            let road = map
+                .lanes()
+                .values()
+                .find(|lane| lane.kind == LaneKind::Driving)
+                .unwrap()
+                .parent;
+            let rail = map
+                .lanes()
+                .values()
+                .find(|lane| {
+                    lane.kind == LaneKind::Rail && lane.points.first().x < lane.points.last().x
+                })
+                .unwrap();
+            let (spawn, dir) = rail.points.point_dir_along(200.0);
+            (road, rail.id, dir, spawn, rail.points.point_along(600.0))
+        };
+        let station_proto = prototypes::FreightStationPrototypeID::new("freight-station");
+        let store_proto = GoodsCompanyID::new("commercial-l1");
+        let station_centre = (platform - dir * 75.0 + dir.perp_up() * 40.0).xy();
+        let store_centre = vec2(350.0, 660.0);
+        let build = |centre, direction, kind| {
+            let building = sim
+                .map_mut()
+                .build_special_building(
+                    &OBB::new(centre, direction, 12.0, 12.0),
+                    kind,
+                    BuildingGen::CenteredDoor {
+                        vertical_factor: 1.0,
+                    },
+                    None,
+                    Some(road),
+                )
+                .unwrap();
+            sim.write::<BuildingInfos>().insert(building);
+            building
+        };
+        let terminal = build(
+            station_centre,
+            dir.xy(),
+            BuildingKind::RailFreightStation(station_proto),
+        );
+        let store = build(
+            store_centre,
+            Vec2::X,
+            BuildingKind::GoodsCompany(store_proto),
+        );
+        let station =
+            crate::souls::freight_station::freight_station_soul(&mut sim, terminal, station_proto)
+                .unwrap();
+        let buyer = company_soul(&mut sim, store, store_proto).unwrap();
+        sim.write::<Market>()
+            .buy(buyer, store_centre, ItemID::new("goods"), 2);
+        let stop = train_stop(&sim.get(station).unwrap().trans);
+        sim.apply_commands([&WorldCommand::SpawnTrain {
+            wagons: vec![prototypes::RollingStockID::new("locomotive")],
+            lane,
+            dist: 200.0,
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let update = |sim: &mut Simulation, elapsed| {
+            *sim.write::<GameTime>() = GameTime::new(Tick(INITIAL_TICK + elapsed));
+            let (world, resources) = sim.world_res();
+            cargo_update(world, resources);
+        };
+        update(&mut sim, FREIGHT_MATCH_INTERVAL);
+        assert_eq!(
+            sim.read::<CargoBook>().routes.rail.get(&terminal),
+            Some(&false)
+        );
+        assert!(sim.read::<CargoBook>().imports.is_empty());
+        assert!(matches!(
+            sim.read::<CargoBook>().import_status(buyer),
+            Some(ImportStatus::NoRoute)
+        ));
+
+        let topology = sim.map().walking_topology_generation;
+        sim.place_authored_rail_market(RailMarketSite {
+            footprint: OBB::new(spawn.xy(), dir.xy(), 100.0, 24.0),
+            service_lane: lane,
+            service_offset: 200.0,
+            platform_stop: stop,
+            consist_length_m: 100.0,
+        })
+        .unwrap();
+        assert_eq!(sim.map().walking_topology_generation, topology);
+        update(&mut sim, 2 * FREIGHT_MATCH_INTERVAL);
+        let book = sim.read::<CargoBook>();
+        assert_eq!(book.routes.rail.get(&terminal), Some(&true));
+        assert!(matches!(
+            book.import_status(buyer),
+            Some(ImportStatus::Waiting { .. })
+        ));
     }
 
     /// Long enough for a station truck to drive across the fixture town. Vehicles
