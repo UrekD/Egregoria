@@ -211,6 +211,7 @@ struct OpeningLayout {
     cohorts: [Cohort; 5],
     parcels: Vec<Parcel>,
     reserves: Vec<Parcel>,
+    intake_homes: BTreeSet<LotID>,
     sites: BTreeMap<String, BuildingID>,
     depots: Vec<WorldCommand>,
     freight: FreightSetup,
@@ -498,7 +499,34 @@ fn prepare_opening(
         // shop required a walk of almost 2.5 km from the approved housing.
         zoning_roads.remove(&avenue.road);
     }
-    let (parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts)?;
+    let (mut parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts)?;
+    let mut intake_homes = BTreeSet::new();
+    if wet && ResidencePrototype::iter().any(|home| home.massing.is_some()) {
+        // Settle the West frontage that supplied the Sava intake crews as
+        // the town grows. Larger homes here give the pumps a hiring pool
+        // before the rest of the Medium neighbourhood opens.
+        let home = at(1156.0, 1245.0);
+        let high = downtown_cells().0;
+        let map = sim.map();
+        let mut candidates: Vec<_> = parcels
+            .iter_mut()
+            .filter(|parcel| parcel.district == "west" && parcel.capacity > 0)
+            .filter_map(|parcel| {
+                let site = check_growable_lot(&map, &map.lots()[parcel.lot], high).ok()?;
+                Some((parcel, site.home?.capacity))
+            })
+            .collect();
+        candidates.sort_by(|(a, _), (b, _)| {
+            a.footprint.center().distance2(home)
+                .total_cmp(&b.footprint.center().distance2(home))
+                .then_with(|| a.lot.cmp(&b.lot))
+        });
+        for (parcel, capacity) in candidates.into_iter().take(8) {
+            parcel.zoning = high;
+            parcel.capacity = capacity;
+            intake_homes.insert(parcel.lot);
+        }
+    }
     place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
 
     // Keep the food facilities clear of approved housing and future infill.
@@ -579,6 +607,7 @@ fn prepare_opening(
         cohorts,
         parcels,
         reserves,
+        intake_homes,
         sites,
         depots,
         freight,
@@ -596,6 +625,7 @@ pub(super) fn commission_opening(
         cohorts,
         mut parcels,
         reserves,
+        intake_homes,
         sites,
         depots,
         freight:
@@ -611,7 +641,9 @@ pub(super) fn commission_opening(
     } = prepare_opening(sim, plan, built, freight)?;
 
     let wet = sim.map().environment().has_water_configuration();
-    let near_outfalls = |parcel: &Parcel| outfall_housing(parcel, plan.config.owned_min);
+    let near_utilities = |parcel: &Parcel| {
+        outfall_housing(parcel, plan.config.owned_min) || intake_homes.contains(&parcel.lot)
+    };
     let near_east_market = |parcel: &Parcel| {
         let local = parcel.footprint.center() - plan.config.owned_min;
         parcel.zoning.kind == ZoneKind::Residential
@@ -625,9 +657,8 @@ pub(super) fn commission_opening(
     };
     let mut schedule = Simulation::schedule();
     if wet {
-        // Settle the houses by the outfalls first so the shoreline services
-        // can recruit locally as the rest of the town opens.
-        paint(sim, parcels.iter().filter(|parcel| near_outfalls(parcel)))?;
+        // Give both sets of shoreline providers the first local hiring pool.
+        paint(sim, parcels.iter().filter(|parcel| near_utilities(parcel)))?;
         advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
         // The eastern supermarket also needs a nearby hiring pool before
         // the town's other workplaces open.
@@ -642,7 +673,7 @@ pub(super) fn commission_opening(
     // the first households arrive.
     let housing = parcels.iter().filter(|parcel| {
         parcel.zoning.kind == ZoneKind::Residential
-            && !(wet && (near_outfalls(parcel) || near_east_market(parcel)))
+            && !(wet && (near_utilities(parcel) || near_east_market(parcel)))
     });
     paint(sim, housing)?;
     verify_votes(
@@ -4168,6 +4199,10 @@ mod tests {
             "{housing} opening housing places, with {isolated_south} on the remote South fringe"
         );
         if ResidencePrototype::iter().any(|home| home.massing.is_some()) {
+            assert_eq!(opening.intake_homes.len(), 8);
+            assert!(opening.parcels.iter()
+                .filter(|parcel| opening.intake_homes.contains(&parcel.lot))
+                .all(|parcel| parcel.district == "west" && parcel.zoning.density == Density::High));
             let outskirts: Vec<_> = opening.parcels.iter()
                 .filter(|parcel| parcel.capacity > 0 && parcel.district != "station")
                 .collect();
