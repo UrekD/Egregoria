@@ -386,14 +386,31 @@ impl SimulationReplayLoader {
         schedule: &mut SeqSchedule,
         budget: &mut ReplayBudget,
     ) -> ReplayAdvance {
-        let tick = Tick(sim.get_tick());
+        let operation = match self.next_operation(Tick(sim.get_tick()), budget) {
+            ReplayNext::Run(operation) => operation,
+            ReplayNext::Settled { complete } => return ReplayAdvance::Settled { complete },
+        };
+        let commands = self
+            .commands_for(operation)
+            .iter()
+            .map(|(_, command)| command);
+        if operation.advances() {
+            sim.tick(schedule, commands);
+        } else {
+            sim.apply_commands(commands);
+        }
+        self.commit_operation(operation, Tick(sim.get_tick()), budget)
+    }
+
+    /// Plan the next operation without consuming the cursor or its step budget.
+    pub fn next_operation(&self, tick: Tick, budget: &ReplayBudget) -> ReplayNext {
         let (end, advanced) = if let Some(timeline) = &self.replay.timeline {
             let next = timeline.batches.get(self.batch);
             let ready = next.filter(|batch| batch.step == self.steps);
             if let Some(batch) = ready.filter(|batch| budget.started && !batch.steps_systems) {
                 (Some(batch.end), false)
             } else if self.steps == timeline.steps || budget.remaining == 0 {
-                return ReplayAdvance::Settled {
+                return ReplayNext::Settled {
                     complete: self.steps == timeline.steps && next.is_none(),
                 };
             } else {
@@ -406,7 +423,7 @@ impl SimulationReplayLoader {
             } else if budget.remaining == 0
                 || (next.is_none() && tick >= self.replay.last_tick_recorded)
             {
-                return ReplayAdvance::Settled {
+                return ReplayNext::Settled {
                     complete: next.is_none() && tick >= self.replay.last_tick_recorded,
                 };
             } else {
@@ -414,30 +431,63 @@ impl SimulationReplayLoader {
             }
         };
 
-        let commands = self.replay.commands(self.idx..end.unwrap_or(self.idx));
-        if advanced {
-            sim.tick(schedule, commands);
+        ReplayNext::Run(ReplayOperation {
+            start: self.idx,
+            end,
+            advanced,
+        })
+    }
+
+    pub fn commands_for(&self, operation: ReplayOperation) -> &[(Tick, WorldCommand)] {
+        &self.replay.commands[operation.start..operation.end.unwrap_or(operation.start)]
+    }
+
+    /// Consume an operation once it has been applied to the published world.
+    pub fn commit_operation(
+        &mut self,
+        operation: ReplayOperation,
+        tick: Tick,
+        budget: &mut ReplayBudget,
+    ) -> ReplayAdvance {
+        debug_assert_eq!(operation.start, self.idx);
+        if operation.advanced {
             self.steps += 1;
             budget.remaining -= 1;
-        } else {
-            sim.apply_commands(commands);
         }
-        let batch = end.map(|end| {
+        let batch = operation.end.map(|end| {
             self.idx = end;
             self.batch += 1;
             self.batch - 1
         });
-        self.pastt = Tick(sim.get_tick());
+        self.pastt = tick;
         ReplayAdvance::Operation {
             step: self.steps,
             batch,
             tick: self.pastt,
-            advanced,
+            advanced: operation.advanced,
         }
     }
 }
 
 pub type ReplayCursor = SimulationReplayLoader;
+
+pub enum ReplayNext {
+    Run(ReplayOperation),
+    Settled { complete: bool },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ReplayOperation {
+    start: usize,
+    end: Option<usize>,
+    advanced: bool,
+}
+
+impl ReplayOperation {
+    pub fn advances(self) -> bool {
+        self.advanced
+    }
+}
 
 pub struct ReplayBudget {
     remaining: usize,

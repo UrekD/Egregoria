@@ -506,8 +506,33 @@ fn scale_t1_fix_stop_interrupts_explicit_steps_and_fixture_probes() {
 
 #[test]
 fn scale_t1_fix_bulk_import_keeps_the_source_readable_and_matches_inline() {
-    let (sim, schedule) = world();
+    for water_configured in [false, true] {
+        assert_live_import_parity(water_configured);
+    }
+}
+
+fn assert_live_import_parity(water_configured: bool) {
+    use simulation::map::WaterEdit;
+    use simulation::transportation::{RoadThroughput, RoadUserKind};
+
+    let (mut sim, mut schedule) = world();
     let (mut inline, mut inline_schedule) = world();
+    let road = sim.map().roads().keys().next().unwrap();
+    for (sim, schedule) in [
+        (&mut sim, &mut schedule),
+        (&mut inline, &mut inline_schedule),
+    ] {
+        if water_configured {
+            sim.edit_water(WaterEdit::SetSeaLevel {
+                level_dm: Some(-100),
+            })
+            .unwrap();
+        }
+        sim.tick(schedule, []);
+        let tick = simulation::diagnostics::elapsed_tick(sim).0;
+        sim.write::<RoadThroughput>()
+            .record_entry(road, RoadUserKind::Car, tick);
+    }
     let mut driver = SimThread::start(sim, schedule, 9, None);
     let view = driver.view();
     let frame = view.try_read().unwrap();
@@ -534,10 +559,213 @@ fn scale_t1_fix_bulk_import_keeps_the_source_readable_and_matches_inline() {
         panic!("expected the detached import acknowledgement");
     };
     assert_eq!(applied.id, id);
-    assert_eq!(applied.accepted_indices, vec![0]);
+    if water_configured {
+        assert_eq!(
+            applied.rejections,
+            vec![(0, "MapLoadTestField", Rejection::WaterConfigured)]
+        );
+    } else {
+        assert_eq!(applied.accepted_indices, vec![0]);
+    }
     let frame = view.try_read().unwrap();
     assert!(view.take_replaced());
     assert_eq!(frame.hashes(), inline.hashes());
+    assert!(frame.map().get(road).is_some());
+    let expected = inline.read::<RoadThroughput>().current_window(road);
+    assert_eq!(expected.0[0], 1);
+    assert_eq!(
+        frame.read::<RoadThroughput>().current_window(road),
+        expected
+    );
+}
+
+#[test]
+fn scale_t1_fix2_replay_import_prepares_while_readable_and_publishes_the_group() {
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let mut recorded = Simulation::new_with_options(simulation::SimulationOptions {
+        terrain_size: simulation::NewGameOptions::MIN_TERRAIN_CHUNKS,
+        preset: simulation::MapPreset::Flat,
+        ..simulation::SimulationOptions::LEGACY
+    });
+    let start_tick = recorded.get_tick();
+    let import = WorldCommand::MapLoadTestField {
+        pos: geom::vec2(800.0, 800.0),
+        size: 28,
+        spacing: 28.0,
+    };
+    let tax = WorldCommand::SetTaxRate {
+        zone: simulation::map::ZoneKind::Residential,
+        rate_permille: 65,
+    };
+    recorded.tick(&mut Simulation::schedule(), [&import, &tax]);
+    recorded.apply_commands([&WorldCommand::SetGameTime(prototypes::GameTime::new(
+        prototypes::Tick(start_tick + 500),
+    ))]);
+    let replay = recorded.read::<simulation::utils::replay::Replay>().clone();
+    let (sim, cursor) = Simulation::try_from_replay(replay.clone()).unwrap();
+    let (mut inline, mut inline_cursor) = Simulation::try_from_replay(replay).unwrap();
+    assert!(inline_cursor.advance_tick(&mut inline, &mut Simulation::schedule()));
+
+    let view = WorldView::new(Arc::new(RwLock::new(sim)));
+    let mut worker = Worker::new(Simulation::schedule(), 7, start_tick, Some(cursor));
+    let status = Mutex::new(worker.status.clone());
+    let (submit, input) = mpsc::sync_channel(CREDITS);
+    let (output, receive) = mpsc::sync_channel(CREDITS);
+    let control = |sequence, control| {
+        submit
+            .send(Envelope {
+                id: BatchId {
+                    generation: 7,
+                    sequence,
+                },
+                request: Request::ReplayControl(control),
+            })
+            .ok()
+            .unwrap();
+    };
+    let frame = view.try_read().unwrap();
+    let old_roads = frame.map().roads().len();
+    control(1, ReplayControl::Step(1));
+    worker.run_one(&view, &status, &input, &output);
+    worker.run_one(&view, &status, &input, &output);
+    assert!(
+        worker.import.is_some(),
+        "replay did not start preparing with a frame lease held"
+    );
+
+    control(2, ReplayControl::Speed(0));
+    worker.run_one(&view, &status, &input, &output);
+    assert!(matches!(
+        receive.try_recv().unwrap().kind,
+        ReplyKind::Rejected(_)
+    ));
+    assert!(matches!(
+        receive.try_recv().unwrap().kind,
+        ReplyKind::ReplayChanged
+    ));
+    assert_eq!(frame.get_tick(), start_tick);
+    assert_eq!(frame.map().roads().len(), old_roads);
+    assert!(!view.take_replaced());
+
+    control(3, ReplayControl::Step(1));
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while worker.import.as_ref().unwrap().prepared.is_none() {
+        worker.run_one(&view, &status, &input, &output);
+        assert!(
+            Instant::now() < deadline,
+            "replay import could not prepare while a frame was reading"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(receive.try_recv().is_err());
+    assert_eq!(frame.get_tick(), start_tick);
+    assert_eq!(frame.map().roads().len(), old_roads);
+    assert_eq!(worker.status.boundary.completed_step, 0);
+    drop(frame);
+
+    worker.run_one(&view, &status, &input, &output);
+    {
+        let frame = view.try_read().unwrap();
+        assert!(view.take_replaced());
+        assert_eq!(frame.get_tick(), start_tick + 1);
+        assert!(frame.map().roads().len() > old_roads);
+        assert_eq!(
+            frame
+                .read::<simulation::economy::Budget>()
+                .tax_rate(simulation::map::ZoneKind::Residential),
+            65
+        );
+        assert!(
+            receive.try_recv().is_err(),
+            "trailing edit was still pending"
+        );
+    }
+    let reply = loop {
+        worker.run_one(&view, &status, &input, &output);
+        if let Ok(reply) = receive.try_recv() {
+            break reply;
+        }
+        assert!(Instant::now() < deadline, "replay import did not finish");
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(reply.id.sequence, 3);
+    assert!(matches!(
+        reply.kind,
+        ReplyKind::ReplayStepped(boundary)
+            if boundary.completed_step == 1 && boundary.tick == inline.get_tick()
+    ));
+    let frame = view.try_read().unwrap();
+    assert_eq!(frame.hashes(), inline.hashes());
+}
+
+#[test]
+fn scale_t1_fix2_end_and_stop_acknowledge_unpublished_legacy_import() {
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let mut replay = simulation::utils::replay::Replay::default();
+    let tick = prototypes::Tick(1);
+    replay.push(
+        tick,
+        WorldCommand::Init(Box::new(simulation::SimulationOptions {
+            terrain_size: simulation::NewGameOptions::MIN_TERRAIN_CHUNKS,
+            preset: simulation::MapPreset::Flat,
+            ..simulation::SimulationOptions::LEGACY
+        })),
+    );
+    replay.push(
+        tick,
+        WorldCommand::MapLoadTestField {
+            pos: geom::vec2(800.0, 800.0),
+            size: 2,
+            spacing: 28.0,
+        },
+    );
+
+    for request in [Request::ReplayControl(ReplayControl::End), Request::Stop] {
+        let stop = matches!(request, Request::Stop);
+        let (sim, cursor) = Simulation::try_from_replay(replay.clone()).unwrap();
+        let view = WorldView::new(Arc::new(RwLock::new(sim)));
+        let mut worker = Worker::new(Simulation::schedule(), 7, tick.0, Some(cursor));
+        let status = Mutex::new(worker.status.clone());
+        let (submit, input) = mpsc::sync_channel(CREDITS);
+        let (output, receive) = mpsc::sync_channel(CREDITS);
+        let send = |sequence, request| {
+            submit
+                .send(Envelope {
+                    id: BatchId {
+                        generation: 7,
+                        sequence,
+                    },
+                    request,
+                })
+                .ok()
+                .unwrap();
+        };
+        let frame = view.try_read().unwrap();
+        let old_roads = frame.map().roads().len();
+        send(1, Request::ReplayControl(ReplayControl::Step(1)));
+        worker.run_one(&view, &status, &input, &output);
+        worker.run_one(&view, &status, &input, &output);
+        assert!(worker.import.is_some());
+
+        send(2, request);
+        worker.run_one(&view, &status, &input, &output);
+        let cancelled = receive.try_recv().unwrap();
+        assert_eq!(cancelled.id.sequence, 1);
+        assert!(matches!(cancelled.kind, ReplyKind::Rejected(_)));
+        let terminal = receive.try_recv().unwrap();
+        assert_eq!(terminal.id.sequence, 2);
+        assert!(matches!(
+            (stop, terminal.kind),
+            (true, ReplyKind::Stopping) | (false, ReplyKind::ReplayChanged)
+        ));
+        assert_eq!(worker.exit, stop);
+        assert!(worker.import.is_none());
+        assert_eq!(frame.get_tick(), tick.0);
+        assert_eq!(frame.map().roads().len(), old_roads);
+        assert!(!view.take_replaced());
+    }
 }
 
 #[test]

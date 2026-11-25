@@ -96,7 +96,10 @@ pub fn chat(uiw: &UiWorld, sim: &Simulation) {
                         );
                     });
                     if state.chat_bar_showed {
-                        if text_edit(250.0, &mut state.cur_msg, "") && !state.cur_msg.is_empty() {
+                        if text_edit(250.0, &mut state.cur_msg, "")
+                            && !state.cur_msg.is_empty()
+                            && uiw.can_author()
+                        {
                             uiw.commands().push(WorldCommand::SendMessage {
                                 message: Message {
                                     name: "player".to_string(),

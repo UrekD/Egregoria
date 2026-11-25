@@ -16,6 +16,7 @@ pub enum RoadUserKind {
     Pedestrian,
 }
 
+#[derive(Clone)]
 struct TickEntries {
     tick: u64,
     counts: [u32; 4],
@@ -23,7 +24,7 @@ struct TickEntries {
 
 /// Counts changes of road on reaching a travel lane, including departures
 /// from roadside parking. Turns and lane changes within one road add no entry.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct RoadThroughput {
     entries: FastMap<RoadID, VecDeque<TickEntries>>,
     map_identity: Option<u64>,
@@ -32,6 +33,19 @@ pub struct RoadThroughput {
 }
 
 impl RoadThroughput {
+    /// Carry runtime history to a detached copy of the same map. The save
+    /// decoder assigns the copy a new map identity while retaining road IDs.
+    pub fn for_map_copy(&self, source: &Map) -> impl FnOnce(&Map) -> Self {
+        let mut history = self.clone();
+        let bound_to_source = self.map_identity == Some(source.identity());
+        move |copy| {
+            if bound_to_source {
+                history.map_identity = Some(copy.identity());
+            }
+            history
+        }
+    }
+
     pub(crate) fn begin_tick(&mut self, map: &Map, tick: u64) {
         let identity = Some(map.identity());
         if self.map_identity != identity {

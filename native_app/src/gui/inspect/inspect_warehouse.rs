@@ -109,7 +109,9 @@ pub(crate) fn section(uiw: &UiWorld, sim: &Simulation, building: BuildingID) {
                     (WarehousePolicy::ReserveLocally, "Reserve locally"),
                     (WarehousePolicy::ExportSurplus, "Export surplus"),
                 ] {
-                    if selectable_label_primary(policy == choice, label).clicked && policy != choice
+                    if selectable_label_primary(policy == choice, label).clicked
+                        && policy != choice
+                        && uiw.can_author()
                     {
                         uiw.commands().push(WorldCommand::SetWarehousePolicy {
                             building,

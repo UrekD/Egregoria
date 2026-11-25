@@ -3,14 +3,15 @@ use std::io::{self, Write};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
+use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use common::saveload::{Bincode, Encoder, SnapshotRevision};
 use common::timestep::{debug_up_dt, MAX_WARP};
 use simulation::map::{WaterEditError, WaterEditOutcome};
-use simulation::utils::replay::{ReplayAdvance, ReplayBudget};
+use simulation::transportation::RoadThroughput;
+use simulation::utils::replay::{ReplayAdvance, ReplayBudget, ReplayNext, ReplayOperation};
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::{
     CommandOutcomes, LinkOutcome, Rejection, WorldCommand, WorldCommands,
@@ -293,6 +294,11 @@ pub(crate) struct ReadLease<'a> {
     _turn: Turn<'a>,
 }
 
+struct WriteLease<'a> {
+    guard: RwLockWriteGuard<'a, Simulation>,
+    _turn: Turn<'a>,
+}
+
 impl Deref for ReadLease<'_> {
     type Target = Simulation;
 
@@ -323,6 +329,18 @@ impl WorldView {
         let turn = self.admission.read()?;
         let guard = self.world.try_read().ok()?;
         Some(ReadLease { guard, _turn: turn })
+    }
+
+    fn try_write(&self) -> Option<WriteLease<'_>> {
+        let turn = self.admission.write()?;
+        let guard = match self.world.try_write() {
+            Ok(guard) => guard,
+            // A detached import can still be releasing its shared capture
+            // guard after a replay ends or an owner transfer is acknowledged.
+            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::Poisoned(_)) => panic!("simulation world poisoned"),
+        };
+        Some(WriteLease { guard, _turn: turn })
     }
 }
 
@@ -604,6 +622,16 @@ fn is_background_import(commands: &WorldCommands) -> bool {
     }
 }
 
+fn is_background_replay_import(commands: &[(prototypes::Tick, WorldCommand)]) -> bool {
+    !cfg!(target_arch = "wasm32")
+        && commands.iter().any(|(_, command)| {
+            matches!(
+                command,
+                WorldCommand::MapLoadParis | WorldCommand::MapLoadTestField { .. }
+            )
+        })
+}
+
 pub(crate) fn fits_replay_batch(commands: &[(prototypes::Tick, WorldCommand)]) -> bool {
     commands.len() <= REPLAY_COMMANDS
         && work_fits(
@@ -666,12 +694,28 @@ fn work_fits<'a>(
     true
 }
 
+enum ImportKind {
+    Live {
+        id: BatchId,
+        commands: WorldCommands,
+    },
+    Replay(ReplayOperation),
+}
+
 struct PendingImport {
-    id: BatchId,
-    commands: WorldCommands,
+    kind: ImportKind,
     result: Receiver<Result<(Simulation, Duration), String>>,
     prepared: Option<(Simulation, Duration)>,
     cancelled: Arc<AtomicBool>,
+}
+
+impl PendingImport {
+    fn live_id(&self) -> Option<BatchId> {
+        match self.kind {
+            ImportKind::Live { id, .. } => Some(id),
+            ImportKind::Replay(_) => None,
+        }
+    }
 }
 
 impl Drop for PendingImport {
@@ -782,7 +826,8 @@ impl Worker {
     ) -> Duration {
         let now = Instant::now();
         self.clock.update(now);
-        if self.explicit_steps.is_some() || self.fixture.is_some() || self.import.is_some() {
+        let live_import = self.import.as_ref().and_then(PendingImport::live_id);
+        if self.explicit_steps.is_some() || self.fixture.is_some() || live_import.is_some() {
             // Reply credits also bound this buffer. Keep earlier requests in
             // FIFO order while finding a terminal request behind the long run.
             self.waiting.extend(input.try_iter());
@@ -796,7 +841,10 @@ impl Worker {
                     .take()
                     .map(|(id, _)| id)
                     .or_else(|| self.fixture.take().map(|(id, _)| id))
-                    .or_else(|| self.import.take().map(|pending| pending.id))
+                    .or_else(|| {
+                        self.import = None;
+                        live_import
+                    })
                     .unwrap();
                 view.admission.cancel_write();
                 self.send_reply(
@@ -808,7 +856,7 @@ impl Worker {
                 );
                 return Duration::ZERO;
             }
-            if self.import.is_some() {
+            if live_import.is_some() {
                 return self.poll_import(view, status, output);
             }
         } else if self.pending.is_none() {
@@ -851,8 +899,17 @@ impl Worker {
             view.admission.cancel_write();
             let Envelope { id, request } = self.pending.take().unwrap();
             let Request::Batch(commands) = request else { unreachable!() };
-            self.start_import(view, id, commands);
+            self.import = Some(Self::start_import(
+                view,
+                commands.clone(),
+                ImportKind::Live { id, commands },
+            ));
             return Duration::ZERO;
+        }
+        if self.pending.is_none() && replay_ready {
+            if let Some(delay) = self.advance_replay_import(view, status, output) {
+                return delay;
+            }
         }
 
         // Timing controls and stop/fence do not need the world. In particular,
@@ -864,17 +921,13 @@ impl Worker {
             )
         });
         let reply = if world_required {
-            let Some(_turn) = view.admission.write() else {
+            let Some(mut lease) = view.try_write() else {
                 return CONTENDED_RETRY;
             };
-            let mut sim = view
-                .world
-                .try_write()
-                .expect("world accessed outside admission");
             if let Some(envelope) = self.pending.take() {
-                self.handle(envelope, Some(&mut sim))
+                self.handle(envelope, Some(&mut lease.guard))
             } else {
-                self.advance(&mut sim, now, input)
+                self.advance(&mut lease.guard, now, input)
             }
         } else {
             view.admission.cancel_write();
@@ -904,9 +957,50 @@ impl Worker {
             .any(|envelope| matches!(envelope.request, Request::Stop | Request::ReleaseOwner))
     }
 
-    fn start_import(&mut self, view: &WorldView, id: BatchId, commands: WorldCommands) {
+    fn advance_replay_import(
+        &mut self,
+        view: &WorldView,
+        status: &Mutex<SimStatus>,
+        output: &SyncSender<Reply>,
+    ) -> Option<Duration> {
+        let replay = self.replay.as_ref().unwrap();
+        let budget = self
+            .replay_budget
+            .get_or_insert_with(|| ReplayBudget::new(self.replay_speed));
+        let ReplayNext::Run(operation) =
+            replay.next_operation(prototypes::Tick(self.status.boundary.tick), budget)
+        else {
+            return None;
+        };
+        if let Some(pending) = &self.import {
+            // Pause and other controls can change the budget while the job runs.
+            // Only publish when the current budget still wants this operation.
+            return matches!(pending.kind, ImportKind::Replay(staged) if staged == operation)
+                .then(|| self.poll_import(view, status, output));
+        }
+        let commands = replay.commands_for(operation);
+        if !is_background_replay_import(commands) {
+            return None;
+        }
+        view.admission.cancel_write();
+        let commands: Vec<_> = commands
+            .iter()
+            .map(|(_, command)| command.clone())
+            .collect();
+        self.import = Some(Self::start_import(
+            view,
+            WorldCommands::from(commands),
+            ImportKind::Replay(operation),
+        ));
+        Some(Duration::ZERO)
+    }
+
+    fn start_import(view: &WorldView, commands: WorldCommands, kind: ImportKind) -> PendingImport {
+        let advanced = match kind {
+            ImportKind::Live { .. } => true,
+            ImportKind::Replay(operation) => operation.advances(),
+        };
         let source = view.world.clone();
-        let command = commands.as_ref()[0].clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let is_cancelled = cancelled.clone();
         let (done, result) = mpsc::sync_channel(1);
@@ -916,16 +1010,33 @@ impl Worker {
                 let prepare = || -> Result<_, String> {
                     // This is an immutable capture concurrent with frame reads.
                     // Release the source before constructing or importing the copy.
-                    let snapshot = {
+                    let (snapshot, restore_traffic) = {
                         let sim = source.read().map_err(|err| err.to_string())?;
-                        Bincode::encode(&*sim).map_err(|err| err.to_string())?
+                        if is_cancelled.load(Ordering::Acquire) {
+                            return Err("Map import cancelled.".into());
+                        }
+                        let snapshot = Bincode::encode(&*sim).map_err(|err| err.to_string())?;
+                        let restore_traffic = sim.read::<RoadThroughput>().for_map_copy(&sim.map());
+                        (snapshot, restore_traffic)
                     };
+                    drop(source);
                     if is_cancelled.load(Ordering::Acquire) {
                         return Err("Map import cancelled.".into());
                     }
                     let mut sim: Simulation =
                         Bincode::decode(&snapshot).map_err(|err| err.to_string())?;
-                    let elapsed = sim.tick(&mut Simulation::schedule(), [&command]);
+                    drop(snapshot);
+                    if is_cancelled.load(Ordering::Acquire) {
+                        return Err("Map import cancelled.".into());
+                    }
+                    let traffic = restore_traffic(&sim.map());
+                    sim.insert(traffic);
+                    let elapsed = if advanced {
+                        sim.tick(&mut Simulation::schedule(), commands.as_ref())
+                    } else {
+                        sim.apply_commands(commands.as_ref());
+                        Duration::ZERO
+                    };
                     Ok((sim, elapsed))
                 };
                 let _ = done.send(prepare());
@@ -933,13 +1044,12 @@ impl Worker {
         if let Err(error) = job {
             log::error!("Could not start map import: {error}");
         }
-        self.import = Some(PendingImport {
-            id,
-            commands,
+        PendingImport {
+            kind,
             result,
             prepared: None,
             cancelled,
-        });
+        }
     }
 
     fn poll_import(
@@ -959,45 +1069,63 @@ impl Worker {
                 Ok(prepared) => pending.prepared = Some(prepared),
                 Err(error) => {
                     log::error!("Map import preparation failed: {error}");
-                    let id = self.import.take().unwrap().id;
-                    self.send_reply(
-                        output,
-                        Reply {
-                            id,
-                            kind: ReplyKind::Rejected("Map import preparation failed."),
-                        },
-                    );
+                    let import = self.import.take().unwrap();
+                    let reply_id = match import.kind {
+                        ImportKind::Live { id, .. } => Some(id),
+                        ImportKind::Replay(_) => {
+                            let step = self.replay_step.take();
+                            self.end_replay();
+                            *status.lock().unwrap() = self.status.clone();
+                            step
+                        }
+                    };
+                    if let Some(id) = reply_id {
+                        self.send_reply(
+                            output,
+                            Reply {
+                                id,
+                                kind: ReplyKind::Rejected("Map import preparation failed."),
+                            },
+                        );
+                    }
                     return Duration::ZERO;
                 }
             }
         }
-        let Some(turn) = view.admission.write() else {
+        let Some(mut published) = view.try_write() else {
             return CONTENDED_RETRY;
         };
         let mut pending = self.import.take().unwrap();
         let (sim, elapsed) = pending.prepared.take().unwrap();
-        let commands = std::mem::take(&mut pending.commands);
-        let mut published = view
-            .world
-            .try_write()
-            .expect("world accessed outside admission");
-        self.clock.clear();
-        self.status.boundary.completed_step += 1;
-        self.status.boundary.tick = sim.get_tick();
-        self.status.last_tick_duration = elapsed;
-        let reply = self.applied_batch(&sim, pending.id, commands, true);
-        let old = std::mem::replace(&mut *published, sim);
+        let reply = match &mut pending.kind {
+            ImportKind::Live { id, commands } => {
+                self.clock.clear();
+                self.status.boundary.completed_step += 1;
+                self.status.boundary.tick = sim.get_tick();
+                self.status.last_tick_duration = elapsed;
+                Some(Reply {
+                    id: *id,
+                    kind: self.applied_batch(&sim, *id, std::mem::take(commands), true),
+                })
+            }
+            ImportKind::Replay(operation) => {
+                let tick = prototypes::Tick(sim.get_tick());
+                self.replay.as_mut().unwrap().commit_operation(
+                    *operation,
+                    tick,
+                    self.replay_budget.as_mut().unwrap(),
+                );
+                self.record_replay_operation(tick.0, operation.advances(), elapsed);
+                None
+            }
+        };
+        let old = std::mem::replace(&mut *published.guard, sim);
         view.replaced.store(true, Ordering::Release);
         drop(published);
-        drop(turn);
         *status.lock().unwrap() = self.status.clone();
-        self.send_reply(
-            output,
-            Reply {
-                id: pending.id,
-                kind: reply,
-            },
-        );
+        if let Some(reply) = reply {
+            self.send_reply(output, reply);
+        }
         drop(old);
         Duration::ZERO
     }
@@ -1105,12 +1233,14 @@ impl Worker {
                 }
             }
             Request::ReleaseOwner => {
+                self.import = None;
                 self.replay_cancelled = self.replay_step.take();
                 self.exit = true;
                 self.status.owner_mode = OwnerMode::Transferring;
                 ReplyKind::Releasing(self.status.boundary)
             }
             Request::Stop => {
+                self.import = None;
                 self.replay_cancelled = self.replay_step.take();
                 self.exit = true;
                 self.status.owner_mode = OwnerMode::Stopped;
@@ -1195,23 +1325,14 @@ impl Worker {
         }
         if let Some(replay) = &mut self.replay {
             let start = Instant::now();
-            let budget = self.replay_budget.get_or_insert_with(|| {
-                // Play advances one step per 20 ms. Fast and MAX are work conserving.
-                ReplayBudget::new(if self.replay_speed == 1 {
-                    1
-                } else {
-                    self.replay_speed
-                })
-            });
+            let budget = self
+                .replay_budget
+                .get_or_insert_with(|| ReplayBudget::new(self.replay_speed));
             let advance = replay.advance_one(sim, &mut self.schedule, budget);
-            self.status.replay_progress = Some(Self::replay_progress(replay));
-            self.status.boundary.tick = sim.get_tick();
             match advance {
-                ReplayAdvance::Operation { advanced: true, .. } => {
-                    self.status.boundary.completed_step += 1;
-                    self.status.last_tick_duration = start.elapsed();
+                ReplayAdvance::Operation { tick, advanced, .. } => {
+                    self.record_replay_operation(tick.0, advanced, start.elapsed());
                 }
-                ReplayAdvance::Operation { .. } => {}
                 ReplayAdvance::Settled { complete } => {
                     self.replay_budget = None;
                     self.replay_due = now
@@ -1236,7 +1357,17 @@ impl Worker {
         None
     }
 
+    fn record_replay_operation(&mut self, tick: u64, advanced: bool, elapsed: Duration) {
+        self.status.replay_progress = self.replay.as_ref().map(Self::replay_progress);
+        self.status.boundary.tick = tick;
+        if advanced {
+            self.status.boundary.completed_step += 1;
+            self.status.last_tick_duration = elapsed;
+        }
+    }
+
     fn end_replay(&mut self) {
+        self.import = None;
         self.replay = None;
         self.replay_budget = None;
         self.status.replay_progress = None;

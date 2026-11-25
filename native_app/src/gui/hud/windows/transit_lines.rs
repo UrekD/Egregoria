@@ -40,7 +40,9 @@ impl super::GUIWindows {
             return None;
         }
         let mut state = uiworld.write::<PanelState>();
-        uiworld.commands().extend(state.commands.drain(..));
+        if uiworld.can_author() {
+            uiworld.commands().extend(state.commands.drain(..));
+        }
         let edit = state.edit.take();
         state.lines.clear();
         if self.transit_lines_open {
@@ -73,6 +75,7 @@ pub(super) fn transit_lines(uiworld: &UiWorld, opened: &mut bool) {
         ..
     } = &mut *state;
     let mut start_edit = false;
+    let can_author = uiworld.can_author();
     Window {
         title: "Transit lines".into(),
         pad: Pad::all(14.0),
@@ -91,7 +94,7 @@ pub(super) fn transit_lines(uiworld: &UiWorld, opened: &mut bool) {
                     if index != 0 {
                         divider(outline().with_alpha(0.4), 2.0, 1.0);
                     }
-                    if render_line(details, commands) {
+                    if render_line(details, commands, can_author) {
                         *edit = Some(details.line.id);
                         start_edit = true;
                     }
@@ -99,12 +102,15 @@ pub(super) fn transit_lines(uiworld: &UiWorld, opened: &mut bool) {
             });
         });
     });
+    if can_author {
+        uiworld.commands().extend(commands.drain(..));
+    }
     if start_edit {
         *opened = false;
     }
 }
 
-fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>) -> bool {
+fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>, can_author: bool) -> bool {
     let line = &details.line;
     let color = on_secondary_container();
     minrow(8.0, || {
@@ -140,7 +146,7 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>) -> bool 
             textc(color, format!("Target buses  {}", line.target_vehicles));
             let mut slider = Slider::new(f64::from(line.target_vehicles), 0.0, 10.0);
             slider.step = Some(1.0);
-            if let Some(value) = slider.show().value {
+            if let Some(value) = slider.show().value.filter(|_| can_author) {
                 commands.push(WorldCommand::TransitSetVehicles {
                     line: line.id,
                     n: value as u8,
@@ -154,7 +160,7 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>) -> bool 
                 0.0,
                 Money::new_bucks(10).cents() as f64,
             );
-            if let Some(value) = slider.show().value {
+            if let Some(value) = slider.show().value.filter(|_| can_author) {
                 let fare = Money::new_cents(value.round() as i64);
                 if fare != line.fare {
                     commands.push(WorldCommand::TransitSetFare {
@@ -168,8 +174,8 @@ fn render_line(details: &LineDetails, commands: &mut Vec<WorldCommand>) -> bool 
 
     let mut edit = false;
     minrow(8.0, || {
-        edit = button_primary("Edit route").show().clicked;
-        if button_secondary("Remove line").show().clicked {
+        edit = button_primary("Edit route").show().clicked && can_author;
+        if button_secondary("Remove line").show().clicked && can_author {
             commands.push(WorldCommand::TransitRemoveLine { line: line.id });
         }
     });

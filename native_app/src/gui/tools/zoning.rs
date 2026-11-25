@@ -260,8 +260,10 @@ pub fn properties(uiworld: &UiWorld) {
                     brush_hint(&state);
                 }
                 lot_layout_picker(state.lot_layout, |layout| {
-                    state.lot_layout = layout;
-                    uiworld.commands().push(WorldCommand::SetLotLayout(layout));
+                    if uiworld.can_author() {
+                        state.lot_layout = layout;
+                        uiworld.commands().push(WorldCommand::SetLotLayout(layout));
+                    }
                 });
             });
         });

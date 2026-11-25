@@ -122,7 +122,7 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                     minrow(5.0, || {
                         let mut ang = cpy.angle_cossin().to_degrees();
 
-                        if dragvalue().min(-180.0).max(180.0).show(&mut ang.0) {
+                        if uiworld.can_author() && dragvalue().min(-180.0).max(180.0).show(&mut ang.0) {
                             cpy = ang.to_radians().vec2();
                             uiworld.commands().push(WorldCommand::UpdateZone {
                                 building: id,

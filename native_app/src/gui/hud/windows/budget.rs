@@ -1,8 +1,8 @@
 use crate::gui::zoning::zone_name;
 use crate::uiworld::UiWorld;
 use goryak::{
-    mincolumn, minrow, monospace, on_secondary_container, selectable_label_primary, textc, titlec,
-    VertScrollSize, Window,
+    fixed_spacer, mincolumn, minrow, monospace, on_secondary_container, selectable_label_primary,
+    textc, titlec, VertScrollSize, Window,
 };
 use simulation::diagnostics::elapsed_tick;
 use simulation::economy::{
@@ -84,14 +84,18 @@ pub fn budget(uiworld: &UiWorld, sim: &Simulation, opened: &mut bool) {
                         format!("{}  {:.1}%", zone_name(zone), f32::from(rate) / 10.0),
                     );
 
-                    let mut slider =
-                        Slider::new(f64::from(rate), 0.0, f64::from(MAX_TAX_RATE_PERMILLE));
-                    slider.step = Some(1.0);
-                    if let Some(value) = slider.show().value {
-                        uiworld.commands().push(WorldCommand::SetTaxRate {
-                            zone,
-                            rate_permille: value as u16,
-                        });
+                    if uiworld.can_author() {
+                        let mut slider =
+                            Slider::new(f64::from(rate), 0.0, f64::from(MAX_TAX_RATE_PERMILLE));
+                        slider.step = Some(1.0);
+                        if let Some(value) = slider.show().value {
+                            uiworld.commands().push(WorldCommand::SetTaxRate {
+                                zone,
+                                rate_permille: value as u16,
+                            });
+                        }
+                    } else {
+                        fixed_spacer((150.0, 36.0));
                     }
                 }
                 textc(color, "Mixed-use homes pay residential tax.");
@@ -145,4 +149,74 @@ pub(super) fn money(inner: i128, signed: bool) -> String {
         ""
     };
     format!("{sign}${}.{:02}", magnitude / 100, magnitude % 100)
+}
+
+#[cfg(test)]
+#[test]
+fn scale_t1_fix2_tax_slider_respects_backpressure() {
+    use crate::uiworld::SaveLoadState;
+    use yakui::event::Event;
+    use yakui::input::MouseButton;
+    use yakui::widgets::SliderWidget;
+    use yakui::{Rect, Vec2, WidgetId, Yakui};
+
+    fn first_slider(ui: &Yakui, id: WidgetId) -> Option<WidgetId> {
+        let node = ui.dom().get(id).unwrap();
+        if node.widget.is::<SliderWidget>() {
+            return Some(id);
+        }
+        node.children.iter().find_map(|&id| first_slider(ui, id))
+    }
+
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let sim = Simulation::new(false);
+    let uiw = UiWorld::with_defaults();
+    let mut ui = Yakui::new();
+    let viewport = Vec2::new(1600.0, 900.0);
+    ui.set_surface_size(viewport);
+    ui.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, viewport));
+    let draw = |ui: &mut Yakui| {
+        ui.start();
+        budget(&uiw, &sim, &mut true);
+        ui.finish();
+        ui.paint();
+    };
+    let start_drag = |ui: &mut Yakui| {
+        let slider = first_slider(ui, ui.dom().root()).unwrap();
+        let knob = ui.dom().get(slider).unwrap().children[1];
+        let rect = ui.layout_dom().get(knob).unwrap().rect;
+        let center = rect.pos() + rect.size() * 0.5;
+        ui.handle_event(Event::CursorMoved(Some(center)));
+        ui.handle_event(Event::MouseButtonChanged {
+            button: MouseButton::One,
+            down: true,
+        });
+        ui.handle_event(Event::CursorMoved(Some(center + Vec2::new(55.0, 0.0))));
+    };
+
+    draw(&mut ui);
+    start_drag(&mut ui);
+    uiw.commands()
+        .push(WorldCommand::SpawnRandomCars { n_cars: 0 });
+    uiw.write::<SaveLoadState>().authoring_blocked = true;
+    draw(&mut ui);
+    assert!(matches!(
+        uiw.commands().as_ref(),
+        [WorldCommand::SpawnRandomCars { n_cars: 0 }]
+    ));
+
+    ui.handle_event(Event::MouseButtonChanged {
+        button: MouseButton::One,
+        down: false,
+    });
+    *uiw.commands() = Default::default();
+    uiw.write::<SaveLoadState>().authoring_blocked = false;
+    draw(&mut ui);
+    start_drag(&mut ui);
+    draw(&mut ui);
+    assert!(matches!(
+        uiw.commands().as_ref(),
+        [WorldCommand::SetTaxRate { .. }]
+    ));
 }
