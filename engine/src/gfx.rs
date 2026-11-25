@@ -170,6 +170,7 @@ pub struct Encoders {
     pub smap: Vec<CommandBuffer>,
     pub depth_prepass: Option<CommandBuffer>,
     pub main: Option<CommandBuffer>,
+    deferred_main: Option<(TextureView, Vec<Box<dyn Drawable>>)>,
     pub before_main: CommandEncoder,
     pub after_main: CommandEncoder,
     pub gui: Option<CommandBuffer>,
@@ -247,11 +248,17 @@ pub struct GuiRenderContext<'a> {
 pub struct FrameContext<'a> {
     pub gfx: &'a mut GfxContext,
     pub objs: &'a mut Vec<Box<dyn Drawable>>,
+    defer_main: bool,
 }
 
 impl<'a> FrameContext<'a> {
     pub fn draw(&mut self, v: impl Drawable + 'static) {
         self.objs.push(Box::new(v))
+    }
+
+    /// Record the color pass after the game frame returns and releases its world view.
+    pub fn defer_main_pass(&mut self) {
+        self.defer_main = true;
     }
 }
 
@@ -689,6 +696,7 @@ impl GfxContext {
                 smap: Default::default(),
                 depth_prepass: None,
                 main: None,
+                deferred_main: None,
                 before_main,
                 after_main,
                 gui: None,
@@ -713,7 +721,7 @@ impl GfxContext {
     pub fn render<S>(
         &mut self,
         encs: &mut Encoders,
-        frame: &TextureView,
+        frame: TextureView,
         state: &mut S,
         render: impl FnOnce(&mut S, &mut FrameContext<'_>),
         render_gui: impl FnOnce(&mut S, GuiRenderContext<'_>),
@@ -725,11 +733,14 @@ impl GfxContext {
         let mut fc = FrameContext {
             objs: &mut objs,
             gfx: self,
+            defer_main: false,
         };
 
         render(state, &mut fc);
+        let defer_main = fc.defer_main;
 
         let start_time = Instant::now();
+        let target = &frame;
 
         let objsref = &*objs;
 
@@ -753,15 +764,17 @@ impl GfxContext {
                     passes::render_ssao(self, &mut encs.before_main);
                     passes::render_fog(self, &mut encs.before_main);
 
-                    passes::render_background(self, &mut encs.after_main, frame);
-                    passes::gen_ui_blur(self, &mut encs.after_main, frame);
+                    passes::render_background(self, &mut encs.after_main, target);
+                    passes::gen_ui_blur(self, &mut encs.after_main, target);
                 });
 
-                scope.spawn(|_| {
-                    encs.main = Some(self.main_render_pass(frame, objsref));
-                });
+                if !defer_main {
+                    scope.spawn(|_| {
+                        encs.main = Some(self.main_render_pass(target, objsref));
+                    });
+                }
 
-                (gui_elapsed, encs.gui) = self.render_gui(frame, state, render_gui);
+                (gui_elapsed, encs.gui) = self.render_gui(target, state, render_gui);
             });
         } else {
             encs.pbr = self.pbr_prepass();
@@ -771,13 +784,28 @@ impl GfxContext {
             }
             passes::render_ssao(self, &mut encs.before_main);
             passes::render_fog(self, &mut encs.before_main);
-            encs.main = Some(self.main_render_pass(frame, objsref));
-            passes::render_background(self, &mut encs.after_main, frame);
-            passes::gen_ui_blur(self, &mut encs.after_main, frame);
-            (gui_elapsed, encs.gui) = self.render_gui(frame, state, render_gui);
+            if !defer_main {
+                encs.main = Some(self.main_render_pass(target, objsref));
+            }
+            passes::render_background(self, &mut encs.after_main, target);
+            passes::gen_ui_blur(self, &mut encs.after_main, target);
+            (gui_elapsed, encs.gui) = self.render_gui(target, state, render_gui);
+        }
+
+        if defer_main {
+            encs.deferred_main = Some((frame, objs));
         }
 
         (start_time.elapsed().as_secs_f32(), gui_elapsed)
+    }
+
+    pub(crate) fn record_deferred_main(&self, encs: &mut Encoders) -> f32 {
+        let Some((frame, drawables)) = encs.deferred_main.take() else {
+            return 0.0;
+        };
+        let start = Instant::now();
+        encs.main = Some(self.main_render_pass(&frame, &drawables));
+        start.elapsed().as_secs_f32()
     }
 
     fn render_gui<S>(

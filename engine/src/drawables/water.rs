@@ -44,6 +44,11 @@ impl WaterOverviewAtlas {
         self.pending.lock().unwrap().insert(origin, rgba);
     }
 
+    /// Whether recording a water draw can allocate or write the atlas.
+    pub fn needs_upload(&self) -> bool {
+        self.gpu.get().is_none() || !self.pending.lock().unwrap().is_empty()
+    }
+
     #[cfg(test)]
     fn pending_bytes(&self) -> usize {
         self.pending.lock().unwrap().values().map(Vec::len).sum()

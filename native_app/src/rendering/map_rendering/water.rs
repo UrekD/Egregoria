@@ -131,8 +131,16 @@ impl WaterRender {
             }
         }
 
+        let mut upload_pending = self
+            .overview
+            .as_ref()
+            .is_some_and(|atlas| atlas.needs_upload());
         for (bounds, mesh) in self.meshes.values() {
             if ctx.gfx.frustrum.intersects(bounds) {
+                if upload_pending {
+                    ctx.defer_main_pass();
+                    upload_pending = false;
+                }
                 ctx.draw(mesh.clone().with_overview(self.overview.as_ref()));
             }
         }

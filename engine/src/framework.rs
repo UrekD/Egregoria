@@ -417,7 +417,7 @@ impl Context {
         let (mut enc, view) = self.gfx.start_frame(&surface);
         (self.times.render_time, self.times.gui_time) =
             self.gfx
-                .render(&mut enc, &view, state, render, |state, mut gui| {
+                .render(&mut enc, view, state, render, |state, mut gui| {
                     #[cfg(feature = "yakui")]
                     self.yakui.render(&mut gui, || render_yakui(state));
                     self.egui.render(gui, |ui| render_gui(state, ui));
@@ -426,9 +426,11 @@ impl Context {
     }
 
     fn finish_present(&mut self) {
-        let Some((surface, enc)) = self.prepared_frame.take() else {
+        let Some((surface, mut enc)) = self.prepared_frame.take() else {
             return;
         };
+        // State::frame has returned and released any borrowed world view.
+        self.times.render_time += self.gfx.record_deferred_main(&mut enc);
         self.gfx.finish_frame(enc);
         let screenshot = self
             .screenshot_request
