@@ -786,11 +786,11 @@ fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {
         };
         let area = ctx.sim.map().get(lot).unwrap().shape;
         if cell == zone(MixedUse, Medium) {
-            let rear = (area.corners[2] + area.corners[3]) * 0.5;
+            let frontage = (area.corners[0] + area.corners[1]) * 0.5;
             ctx.sim.apply_commands([&WorldCommand::Terraform {
-                center: area.center().lerp(rear, 0.4),
+                center: frontage,
                 radius: 24.0,
-                amount: 105.0,
+                amount: -110.0,
                 level: 0.0,
                 kind: TerraformKind::Elevation,
                 slope: None,
