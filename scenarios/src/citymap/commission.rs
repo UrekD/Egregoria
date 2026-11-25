@@ -248,7 +248,9 @@ fn prepare_opening(
         Cohort {
             district: "south",
             anchor: at(2060.0, 1180.0),
-            houses: if wet { 110 } else { 98 },
+            // Keep the profiled opening near the developed town centre. Its
+            // denser fringe had the largest clusters of empty pantries.
+            houses: if profiled_wet { 94 } else if wet { 110 } else { 98 },
             infill: if wet { 14 } else { 10 },
             retail: if wet { 24 } else { 16 },
             industry: if wet { 12 } else { 8 },
@@ -256,7 +258,7 @@ fn prepare_opening(
         Cohort {
             district: "west",
             anchor: at(1415.0, 1690.0),
-            houses: 92,
+            houses: if profiled_wet { 76 } else { 92 },
             infill: if wet { 20 } else { 10 },
             retail: 14,
             industry: 8,
