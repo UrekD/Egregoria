@@ -1406,6 +1406,21 @@ fn record_development(map: &Map, parcels: &mut [Parcel]) {
         parcel.building = developed.iter().find_map(|&(id, center)| {
             (center.distance2(parcel.footprint.center()) < 0.01).then_some(id)
         });
+        if parcel.building.is_some() || map.get(parcel.lot).is_some() {
+            continue;
+        }
+        // A collapsed growable can restore the same parcel under a new lot ID.
+        if let Some(restored) = map.lots().values().find(|lot| {
+            lot.parent == parcel.road
+                && lot
+                    .shape
+                    .corners
+                    .iter()
+                    .zip(parcel.footprint.corners)
+                    .all(|(actual, expected)| actual.is_close(expected, 0.001))
+        }) {
+            parcel.lot = restored.id;
+        }
     }
 }
 
@@ -3081,6 +3096,46 @@ impl OpeningReport {
 mod tests {
     use super::*;
     use prototypes::TICKS_PER_HOUR;
+
+    #[test]
+    fn cm2_publish_tracks_the_same_parcel_after_demolition() {
+        crate::ensure_repo_root_cwd();
+        simulation::init::init();
+        let sim = Simulation::new_authored_flat(1, 1).unwrap();
+        let mut map = sim.write::<Map>();
+        let (_, road) = map
+            .make_connection(
+                MapProject::ground(Vec3::new(40.0, 80.0, 0.0)),
+                MapProject::ground(Vec3::new(190.0, 80.0, 0.0)),
+                None,
+                &LanePatternBuilder::new().build(),
+            )
+            .unwrap();
+        let lot = map.lots().values().find(|lot| lot.parent == road).unwrap();
+        let mut parcel = Parcel {
+            lot: lot.id,
+            road,
+            district: "south",
+            block: None,
+            footprint: lot.shape,
+            zoning: ZoneCell {
+                kind: ZoneKind::Residential,
+                density: Density::Low,
+            },
+            capacity: 1,
+            workers: 0,
+            building: None,
+        };
+        let original = parcel.lot;
+        let building = map.place_growable(original, BuildingKind::House).unwrap();
+        map.remove_building(building).unwrap();
+        record_development(&map, std::slice::from_mut(&mut parcel));
+        assert_ne!(parcel.lot, original);
+        let restored = map.get(parcel.lot).unwrap();
+        assert_eq!(restored.parent, road);
+        assert_eq!(restored.shape.corners, parcel.footprint.corners);
+        assert!(parcel.building.is_none());
+    }
 
     #[test]
     fn cm2_gate_retail_stock_requires_an_available_shelf_offer() {
