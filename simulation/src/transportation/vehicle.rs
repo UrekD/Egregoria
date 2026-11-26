@@ -335,9 +335,11 @@ mod pathpark_driveway {
     use crate::utils::resources::Resources;
     use crate::world_command::bounded_command_vec;
     use crate::{Simulation, VehicleID, World};
-    use geom::{Intersect, Segment3, Shape, Spline3, Transform, Vec3, AABB, OBB};
+    use common::saveload::{Bincode, Encoder};
+    use flat_spatial::grid::GridHandle;
+    use geom::{Intersect, Segment3, Shape, Spline3, Transform, Vec2, Vec3, AABB, OBB};
     use serde::{Deserialize, Serialize};
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
 
     const MAX_PORTALS: usize = 8;
     const SWEEP_STEPS: usize = 16;
@@ -432,53 +434,130 @@ mod pathpark_driveway {
         }
 
         fn occupied(&self, grid: &TransportGrid, actor: Option<Transporter>) -> bool {
-            self.check_occupancy(grid, actor, || true) != Some(false)
+            let Some(samples) = self.sample_grid(grid, actor, || true) else {
+                return true;
+            };
+            samples
+                .iter()
+                .any(|sample| (0..SWEEP_STEPS).any(|segment| self.hits(segment, sample)))
         }
 
-        // Admission must observe one consistent grid frame. If the full check
-        // cannot fit this slice, keep the sweep ungranted.
-        fn check_occupancy(
+        fn sample_grid(
             &self,
             grid: &TransportGrid,
             actor: Option<Transporter>,
             mut charge: impl FnMut() -> bool,
-        ) -> Option<bool> {
+        ) -> Option<Vec<SweepSample>> {
             let centerline = self.bounds();
             let bounds = centerline.expand(8.0);
-            let mut nearby = grid.query_aabb(bounds.ll, bounds.ur);
+            let mut nearby = grid.query(bounds.ll, bounds.ur);
+            let mut samples = Vec::new();
             for index in 0..=MAX_LOCAL_COLLIDERS {
                 if !charge() {
                     return None;
                 }
                 let Some((id, pos)) = nearby.next() else {
-                    return Some(false);
+                    return Some(samples);
                 };
                 if index == MAX_LOCAL_COLLIDERS {
                     return None;
                 }
-                if actor == Some(Transporter(id)) {
+                if !bounds.contains(pos) || actor == Some(Transporter(id)) {
                     continue;
                 }
                 let Some((_, state)) = grid.get(id) else {
                     continue;
                 };
                 let radius = state.radius + car_extent() + 0.35;
-                if !centerline.expand(radius).contains(pos) {
-                    continue;
-                }
-                for segment in self.segments() {
-                    if !charge() {
-                        return None;
-                    }
-                    let point = segment.project(pos.z(state.height));
-                    if (point.z - state.height).abs() <= SAME_DECK
-                        && point.xy().distance2(pos) < radius * radius
-                    {
-                        return Some(true);
-                    }
+                if centerline.expand(radius).contains(pos) {
+                    samples.push(SweepSample {
+                        id,
+                        pos,
+                        height: state.height,
+                        radius,
+                    });
                 }
             }
             None
+        }
+
+        fn hits(&self, segment: usize, sample: &SweepSample) -> bool {
+            let segment = Segment3::new(self.points[segment], self.points[segment + 1]);
+            let point = segment.project(sample.pos.z(sample.height));
+            (point.z - sample.height).abs() <= SAME_DECK
+                && point.xy().distance2(sample.pos) < sample.radius * sample.radius
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct SweepSample {
+        id: GridHandle,
+        pos: Vec2,
+        height: f32,
+        radius: f32,
+    }
+
+    #[derive(Clone, Debug, Serialize, Deserialize)]
+    struct SweepCheck {
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_LOCAL_COLLIDERS>")]
+        samples: Vec<SweepSample>,
+        candidate: usize,
+        segment: usize,
+    }
+
+    impl SweepCheck {
+        fn advance(&mut self, sweep: &Sweep, mut charge: impl FnMut() -> bool) -> Option<bool> {
+            while let Some(sample) = self.samples.get(self.candidate) {
+                if !charge() {
+                    return None;
+                }
+                if sweep.hits(self.segment, sample) {
+                    return Some(true);
+                }
+                self.segment += 1;
+                if self.segment == SWEEP_STEPS {
+                    self.segment = 0;
+                    self.candidate += 1;
+                }
+            }
+            Some(false)
+        }
+
+        fn refresh(&mut self, samples: Vec<SweepSample>) {
+            if self.samples == samples {
+                return;
+            }
+            // The old view has been fully checked. Reuse unchanged samples
+            // even when the grid has reordered its cell entries.
+            let cleared: BTreeMap<_, _> = self
+                .samples
+                .iter()
+                .map(|sample| (sample.id, sample))
+                .collect();
+            let (mut unchanged, changed): (Vec<_>, Vec<_>) = samples
+                .into_iter()
+                .partition(|sample| cleared.get(&sample.id) == Some(&sample));
+            self.candidate = unchanged.len();
+            unchanged.extend(changed);
+            self.samples = unchanged;
+        }
+
+        fn valid(&self, sweep: &Sweep) -> bool {
+            self.segment < SWEEP_STEPS
+                && (self.candidate < self.samples.len()
+                    || (self.candidate == self.samples.len() && self.segment == 0))
+                && self.samples.iter().enumerate().all(|(candidate, sample)| {
+                    let checked = match candidate.cmp(&self.candidate) {
+                        std::cmp::Ordering::Less => SWEEP_STEPS,
+                        std::cmp::Ordering::Equal => self.segment,
+                        std::cmp::Ordering::Greater => 0,
+                    };
+                    sample.pos.x.is_finite()
+                        && sample.pos.y.is_finite()
+                        && sample.height.is_finite()
+                        && sample.radius.is_finite()
+                        && (0..checked).all(|segment| !sweep.hits(segment, sample))
+                })
         }
     }
 
@@ -613,6 +692,46 @@ mod pathpark_driveway {
         ready: Option<DirectedPlan>,
         cleanup_work: usize,
         deadline: u64,
+        #[serde(skip)] // Stored in the optional driveway snapshot extension.
+        sweep: Option<SweepCheck>,
+    }
+
+    impl ExitRequest {
+        fn check_sweep(
+            &mut self,
+            sweep: &Sweep,
+            grid: &TransportGrid,
+            slice: &mut usize,
+        ) -> Option<bool> {
+            if *slice == 0 {
+                return None;
+            }
+            // Enumerate one bounded local view atomically. Charge all cell records
+            // to the request lifetime, with their own cap alongside the segment slice.
+            let mut local = MAX_LOCAL_COLLIDERS + 1;
+            let fresh = self.sweep.is_none();
+            if fresh {
+                let samples = sweep.sample_grid(grid, None, || self.search.charge(&mut local))?;
+                self.sweep = Some(SweepCheck {
+                    samples,
+                    candidate: 0,
+                    segment: 0,
+                });
+            }
+            let check = self.sweep.as_mut().unwrap();
+            let mut blocked = check.advance(sweep, || self.search.charge(slice))?;
+            if !blocked && !fresh {
+                // Across slices the grid can change. Only grant against a complete
+                // current view, including new arrivals and changes in height or radius.
+                let samples = sweep.sample_grid(grid, None, || self.search.charge(&mut local))?;
+                check.refresh(samples);
+                blocked = check.advance(sweep, || self.search.charge(slice))?;
+            }
+            if blocked {
+                self.sweep = None;
+            }
+            Some(blocked)
+        }
     }
 
     #[derive(Debug, Serialize, Deserialize)]
@@ -668,6 +787,13 @@ mod pathpark_driveway {
         #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_PORTALS>")]
         facilities: Vec<Facility>,
     }
+
+    #[derive(Deserialize)]
+    #[serde(transparent)]
+    struct SavedSweepChecks(
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_PORTALS>")]
+        Vec<(DrivewayPortal, SweepCheck)>,
+    );
 
     impl DrivewayPortal {
         pub fn place(sim: &mut Simulation, anchor: CurbAnchor) -> Result<Self, DrivewayError> {
@@ -808,12 +934,74 @@ mod pathpark_driveway {
                 deadline: crate::map_dynamic::transit::elapsed_ticks(&sim.resources)
                     .0
                     .saturating_add(EXIT_SEARCH_TICKS),
+                sweep: None,
             });
             Ok(())
         }
     }
 
     impl DrivewayTraffic {
+        pub(crate) fn save(
+            &self,
+            revision: Option<(u64, u64)>,
+            output: impl std::io::Write,
+        ) -> std::io::Result<()> {
+            let pending: Vec<_> = self
+                .facilities
+                .iter()
+                .filter_map(|facility| {
+                    let Motion::Stored {
+                        exit: Some(request),
+                        ..
+                    } = &facility.claim.as_ref()?.motion
+                    else {
+                        return None;
+                    };
+                    Some((facility.id, request.sweep.as_ref()?))
+                })
+                .collect();
+            if pending.is_empty() {
+                Bincode::encode_writer(&(self, revision), output)
+            } else {
+                Bincode::encode_writer(&(self, revision, pending), output)
+            }
+        }
+
+        pub(crate) fn load(data: &[u8]) -> std::io::Result<(Self, Option<(u64, u64)>)> {
+            if let Ok(legacy) = Bincode::decode(data) {
+                return Ok(legacy);
+            }
+            let (mut traffic, revision, SavedSweepChecks(checks)): (Self, _, _) =
+                Bincode::decode(data)?;
+            for (portal, check) in checks {
+                let index = traffic
+                    .index(portal)
+                    .map_err(|_| std::io::Error::other("unknown saved driveway sweep"))?;
+                let facility = &mut traffic.facilities[index];
+                let Some(Claim {
+                    motion:
+                        Motion::Stored {
+                            exit: Some(request),
+                            ..
+                        },
+                    ..
+                }) = &mut facility.claim
+                else {
+                    return Err(std::io::Error::other(
+                        "saved driveway sweep has no departure",
+                    ));
+                };
+                if request.sweep.is_some()
+                    || request.ready.is_none()
+                    || !check.valid(&facility.geometry.out)
+                {
+                    return Err(std::io::Error::other("invalid saved driveway sweep"));
+                }
+                request.sweep = Some(check);
+            }
+            Ok((traffic, revision))
+        }
+
         fn index(&self, portal: DrivewayPortal) -> Result<usize, DrivewayError> {
             self.facilities
                 .binary_search_by_key(&portal, |f| f.id)
@@ -900,6 +1088,14 @@ mod pathpark_driveway {
 
         pub(crate) fn is_empty(&self) -> bool {
             self.facilities.is_empty()
+        }
+
+        pub(crate) fn has_crossing(&self) -> bool {
+            self.facilities.iter().any(|facility| {
+                facility.claim.as_ref().is_some_and(|claim| {
+                    matches!(claim.motion, Motion::Entering(_) | Motion::Exiting { .. })
+                })
+            })
         }
 
         pub(crate) fn vehicle_removed(&mut self, vehicle: VehicleID) {
@@ -1179,6 +1375,7 @@ mod pathpark_driveway {
                             request.ready = None;
                             request.cleanup_work = 0;
                         }
+                        request.sweep = None;
                         *blocker = None;
                     }
                     if request.ready.is_none() {
@@ -1197,10 +1394,7 @@ mod pathpark_driveway {
                             DirectedSearchResult::Feasible(plan) => request.ready = Some(plan),
                         }
                     }
-                    match geometry
-                        .out
-                        .check_occupancy(grid, None, || request.search.charge(&mut slice))
-                    {
+                    match request.check_sweep(&geometry.out, grid, &mut slice) {
                         Some(false) => {
                             let route = request.ready.take().unwrap();
                             actor.trans = geometry.out.pose(0);

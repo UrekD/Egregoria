@@ -727,7 +727,7 @@ impl Itinerary {
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
         on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
     ) -> Vec3 {
-        self.update_guarded(
+        self.update_guarded::<false>(
             position,
             dist_to_move,
             time,
@@ -740,7 +740,7 @@ impl Itinerary {
         )
     }
 
-    fn update_guarded(
+    fn update_guarded<const DRIVEWAYS: bool>(
         &mut self,
         mut position: Vec3,
         mut dist_to_move: f32,
@@ -753,7 +753,12 @@ impl Itinerary {
         mut driveway: Option<DrivewayMovement<'_>>,
     ) -> Vec3 {
         if self.is_pedestrian_egress() {
-            return self.advance_egress(map, position, dist_to_move, driveway.as_mut());
+            return self.advance_egress::<DRIVEWAYS>(
+                map,
+                position,
+                dist_to_move,
+                driveway.as_mut(),
+            );
         }
         if on_road_entry.is_some()
             && matches!(self.road_approach, RoadApproach::Unchecked)
@@ -792,9 +797,10 @@ impl Itinerary {
                                 } else {
                                     position
                                 };
-                                if driveway
-                                    .as_mut()
-                                    .is_some_and(|guard| guard.blocks(position, next))
+                                if DRIVEWAYS
+                                    && driveway
+                                        .as_mut()
+                                        .is_some_and(|guard| guard.blocks(position, next))
                                 {
                                     return position;
                                 }
@@ -817,7 +823,7 @@ impl Itinerary {
                     }
                 }
             }
-            if let Some(driveway) = &mut driveway {
+            if let Some(driveway) = driveway.as_mut().filter(|_| DRIVEWAYS) {
                 let next = if dist <= (dist_to_move + snap).max(0.0) {
                     p
                 } else {
@@ -1120,7 +1126,7 @@ impl Itinerary {
         false
     }
 
-    fn advance_egress(
+    fn advance_egress<const DRIVEWAYS: bool>(
         &mut self,
         map: &Map,
         mut position: Vec3,
@@ -1147,9 +1153,10 @@ impl Itinerary {
             } else {
                 next
             };
-            if driveway
-                .as_mut()
-                .is_some_and(|guard| guard.blocks(position, reached))
+            if DRIVEWAYS
+                && driveway
+                    .as_mut()
+                    .is_some_and(|guard| guard.blocks(position, reached))
             {
                 return position;
             }
@@ -1350,6 +1357,19 @@ struct MovementAdmission<'a> {
 
 pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("map_dynamic::itinerary_update");
+    let driveways = resources.read::<crate::transportation::DrivewayTraffic>();
+    if driveways.has_crossing() {
+        update_itineraries::<true>(world, resources, &driveways);
+    } else {
+        update_itineraries::<false>(world, resources, &driveways);
+    }
+}
+
+fn update_itineraries<const DRIVEWAYS: bool>(
+    world: &mut World,
+    resources: &Resources,
+    driveways: &crate::transportation::DrivewayTraffic,
+) {
     let time = &*resources.read::<GameTime>();
     let map = &*resources.read::<Map>();
     let failures = &mut resources.write::<ParkingManagement>().reroute_failures;
@@ -1401,8 +1421,6 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         .begin_traversal_update(map, tick);
 
     let mut freight = resources.write::<crate::economy::cargo::FreightTrace>();
-    let driveway = resources.read::<crate::transportation::DrivewayTraffic>();
-    let have_driveways = !driveway.is_empty();
     let mut update = |it: &mut Itinerary,
                       pos: &mut Vec3,
                       speed: f32,
@@ -1438,18 +1456,16 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             discharged: None,
         });
         let mut driveway_held = false;
-        let driveway = user
-            .filter(|_| have_driveways)
-            .map(|user| DrivewayMovement {
-                traffic: &driveway,
-                actor: match user.owner {
-                    EntryOwner::Vehicle(id) => Some(id),
-                    EntryOwner::Human(_) => None,
-                },
-                half_extent: user.half_extent,
-                held: &mut driveway_held,
-            });
-        *pos = it.update_guarded(
+        let driveway = user.filter(|_| DRIVEWAYS).map(|user| DrivewayMovement {
+            traffic: driveways,
+            actor: match user.owner {
+                EntryOwner::Vehicle(id) => Some(id),
+                EntryOwner::Human(_) => None,
+            },
+            half_extent: user.half_extent,
+            held: &mut driveway_held,
+        });
+        *pos = it.update_guarded::<DRIVEWAYS>(
             *pos,
             speed * DELTA,
             time.seconds,
@@ -1465,7 +1481,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             },
             driveway,
         );
-        if driveway_held {
+        if DRIVEWAYS && driveway_held {
             return (Some(HoldReason::Conflict), None, None);
         }
         admission.map_or((None, None, None), |guard| {
@@ -1595,7 +1611,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         if !freight.may_move(id) {
             train.speed.0 = 0.0;
         } else if train.speed.0 > 0.0 && !train.it.is_inert() {
-            train.trans.pos = train.it.update_guarded(
+            train.trans.pos = train.it.update_guarded::<false>(
                 train.trans.pos,
                 train.speed.0 * DELTA,
                 time.seconds,
@@ -1632,6 +1648,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                     }
                     true
                 },
+                None,
             );
         }
         if let Some(index) = &mut observed {
@@ -2983,7 +3000,7 @@ mod pathpark_sweep_tests {
             half_extent: 0.3,
             held,
         };
-        let reached = walking.update_guarded(
+        let reached = walking.update_guarded::<true>(
             start,
             10.,
             0,
@@ -2991,6 +3008,7 @@ mod pathpark_sweep_tests {
             |_, _, _| None,
             None::<fn(RoadID, PathKind)>,
             None,
+            |_, _, _| true,
             Some(movement(&mut held)),
         );
         assert_eq!(
@@ -3013,7 +3031,7 @@ mod pathpark_sweep_tests {
         let end = approach.pos - approach.dir * 5.5;
         let mut bus = Itinerary::simple(vec![end]);
         let mut held = false;
-        let reached = bus.update_guarded(
+        let reached = bus.update_guarded::<true>(
             start,
             10.,
             0,
@@ -3021,6 +3039,7 @@ mod pathpark_sweep_tests {
             |_, _, _| None,
             None::<fn(RoadID, PathKind)>,
             None,
+            |_, _, _| true,
             Some(DrivewayMovement {
                 traffic: &traffic,
                 actor: Some(crate::VehicleID::default()),

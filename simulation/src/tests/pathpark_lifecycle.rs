@@ -368,6 +368,83 @@ fn pathpark_snapshot_requires_driveway_resource() {
     assert!(Bincode::decode::<Simulation>(&bytes).is_err());
 }
 
+fn pending_clear_departure() -> (TestCtx, DrivewayPortal, Transform) {
+    let (mut ctx, roads, portal) = road_chain(1);
+    let car = store_car(&mut ctx, portal);
+    let release = portal.release(&ctx.g).unwrap();
+    {
+        // Both candidates pass the XY filter and clear every segment vertically.
+        let mut grid = ctx.g.write::<TransportGrid>();
+        for offset in [-0.5, 0.5] {
+            grid.insert(
+                release.pos.xy() + release.dir.xy() * offset,
+                crate::transportation::TransportState {
+                    height: release.pos.z + 10.0,
+                    ..Default::default()
+                },
+            );
+        }
+    }
+    let target = road_target(&ctx.g, roads[0]);
+    portal.depart(&mut ctx.g, car, target).unwrap();
+    ctx.tick_fast();
+    assert_eq!(
+        ctx.g.read::<DrivewayTraffic>().phase(portal),
+        Some(DrivewayPhase::Stored)
+    );
+    (ctx, portal, release)
+}
+
+#[test]
+fn pathpark_clear_departure_sweep_spans_tick_slices() {
+    let (mut ctx, portal, _) = pending_clear_departure();
+    let mut loaded: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+    let mut schedule = Simulation::schedule();
+    for _ in 1..64 {
+        ctx.tick_fast();
+        loaded.tick(&mut schedule, &[]);
+        assert_eq!(
+            ctx.g.hashes()["driveway_traffic"],
+            loaded.hashes()["driveway_traffic"]
+        );
+        let traffic = ctx.g.read::<DrivewayTraffic>();
+        assert_eq!(traffic.blocker(portal), None);
+        if traffic.phase(portal) == Some(DrivewayPhase::Exiting) {
+            return;
+        }
+    }
+    panic!("clear sweep did not grant egress before the deadline");
+}
+
+#[test]
+fn pathpark_departure_resamples_a_new_blocker_before_granting() {
+    let (mut ctx, portal, release) = pending_clear_departure();
+    let collider = ctx.g.write::<TransportGrid>().insert(
+        release.pos.xy(),
+        crate::transportation::TransportState {
+            height: release.pos.z,
+            ..Default::default()
+        },
+    );
+    for _ in 0..8 {
+        ctx.tick_fast();
+        let traffic = ctx.g.read::<DrivewayTraffic>();
+        assert_eq!(traffic.phase(portal), Some(DrivewayPhase::Stored));
+        if traffic.blocker(portal) == Some(DrivewayBlocker::ReceivingSpace) {
+            drop(traffic);
+            ctx.g.write::<TransportGrid>().remove_maintain(collider);
+            for _ in 0..8 {
+                ctx.tick_fast();
+                if ctx.g.read::<DrivewayTraffic>().phase(portal) == Some(DrivewayPhase::Exiting) {
+                    return;
+                }
+            }
+            panic!("sweep did not grant egress after the blocker left");
+        }
+    }
+    panic!("sweep did not detect the newly inserted blocker");
+}
+
 #[test]
 fn pathpark_departure_settles_at_the_64_tick_deadline() {
     let (mut ctx, roads, portal) = road_chain(1);

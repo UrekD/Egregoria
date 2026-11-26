@@ -383,11 +383,10 @@ fn register_driveway_traffic() {
             save: Box::new(|sim, output| {
                 let traffic = sim.read::<DrivewayTraffic>();
                 let revision = (!traffic.is_empty()).then(|| sim.map().directed_route_revision());
-                Bincode::encode_writer(&(&*traffic, revision), output)
+                traffic.save(revision, output)
             }),
             load: Box::new(|sim, data| {
-                let (traffic, revision): (DrivewayTraffic, Option<(u64, u64)>) =
-                    Bincode::decode(data)?;
+                let (traffic, revision) = DrivewayTraffic::load(data)?;
                 match (traffic.is_empty(), revision) {
                     (true, None) => {}
                     (false, Some((topology, policy)))
