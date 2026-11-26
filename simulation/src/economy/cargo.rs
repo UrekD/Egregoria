@@ -7046,6 +7046,15 @@ mod lifecycle_tests {
         let mut sim = Simulation::new_authored_town(AuthoredTownOptions::default()).unwrap();
         let light_road = LanePatternBuilder::new().build();
         let railway = LanePatternBuilder::new().rail(true).build();
+        sim.apply_commands([&WorldCommand::MapMakeConnection {
+            from: MapProject::ground(vec3(350.0, 560.0, 10.0)),
+            to: MapProject::ground(vec3(350.0, 855.0, 10.0)),
+            inter: None,
+            pat: LanePatternBuilder::new().rail(true).one_way(true).build(),
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let crossing = sim.map().lanes().values().next().unwrap().id;
+
         sim.apply_commands([
             &WorldCommand::MapMakeConnection {
                 from: MapProject::ground(vec3(100.0, 625.0, 10.0)),
@@ -7068,7 +7077,7 @@ mod lifecycle_tests {
             pat: railway,
         }]);
         assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
-        let (road, lane, dir, spawn, platform) = {
+        let (road, lane, crossing_offset, gate_offset, gate, dir, platform) = {
             let map = sim.map();
             let road = map
                 .lanes()
@@ -7083,8 +7092,21 @@ mod lifecycle_tests {
                     lane.kind == LaneKind::Rail && lane.points.first().x < lane.points.last().x
                 })
                 .unwrap();
-            let (spawn, dir) = rail.points.point_dir_along(200.0);
-            (road, rail.id, dir, spawn, rail.points.point_along(600.0))
+            let crossing_x = map.get(crossing).unwrap().points.first().x;
+            let mut on_crossing = rail.points.point_along(200.0);
+            on_crossing.x = crossing_x;
+            let crossing_offset = rail.points.length_at_proj(rail.points.project(on_crossing));
+            let gate_offset = crossing_offset + 85.0;
+            let (gate, dir) = rail.points.point_dir_along(gate_offset);
+            (
+                road,
+                rail.id,
+                crossing_offset,
+                gate_offset,
+                gate,
+                dir,
+                rail.points.point_along(600.0),
+            )
         };
         let station_proto = prototypes::FreightStationPrototypeID::new("freight-station");
         let store_proto = GoodsCompanyID::new("commercial-l1");
@@ -7151,9 +7173,9 @@ mod lifecycle_tests {
 
         let topology = sim.map().walking_topology_generation;
         sim.place_authored_rail_market(RailMarketSite {
-            footprint: OBB::new(spawn.xy(), dir.xy(), 100.0, 24.0),
+            footprint: OBB::new(gate.xy(), dir.xy(), 100.0, 24.0),
             service_lane: lane,
-            service_offset: 200.0,
+            service_offset: gate_offset,
             platform_stop: stop,
             consist_length_m: 100.0,
         })
@@ -7184,9 +7206,16 @@ mod lifecycle_tests {
         sim.apply_commands([&WorldCommand::SpawnTrain {
             wagons: vec![prototypes::RollingStockID::new("locomotive")],
             lane,
-            dist: 200.0,
+            dist: crossing_offset,
         }]);
         assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let (serving_train, train) = sim.world().trains.iter().last().unwrap();
+        assert_eq!(train_lane(&sim.map(), train), Some(lane));
+        assert_eq!(
+            sim.map()
+                .nearest_lane(train.trans.pos, LaneKind::Rail, Some(50.0)),
+            Some(crossing)
+        );
 
         let endpoint = Endpoint {
             soul: SoulID::FreightStation(station),
@@ -7228,6 +7257,7 @@ mod lifecycle_tests {
         drop(book);
 
         sim.apply_commands([&policy(1, open)]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
         update(&mut sim, 4 * FREIGHT_MATCH_INTERVAL);
         let book = sim.read::<CargoBook>();
         assert!(matches!(
@@ -7235,6 +7265,20 @@ mod lifecycle_tests {
             Some(ImportStatus::Waiting { .. })
         ));
         assert!(book.freight_demand(&sim, demand).unwrap().ordered > 0);
+        drop(book);
+
+        let mut schedule = Simulation::schedule();
+        assert!(
+            (0..2000).any(|_| {
+                sim.tick(&mut schedule, &[]);
+                sim.world().freight_stations[station]
+                    .f
+                    .trains
+                    .iter()
+                    .any(|&(id, _)| id == serving_train)
+            }),
+            "the train on the service track was never assigned to the admitted import"
+        );
     }
 
     /// Long enough for a station truck to drive across the fixture town. Vehicles
