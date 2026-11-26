@@ -256,6 +256,25 @@ mod inner {
 
 #[cfg(test)]
 #[test]
+fn population_scale_native_protocol_matches_world_snapshot() {
+    use common::saveload::{Bincode, Encoder};
+
+    scenarios::ensure_repo_root_cwd();
+    simulation::init::init();
+    let sim = simulation::Simulation::new_with_options(simulation::SimulationOptions {
+        terrain_size: 1,
+        persons_per_agent: 4,
+        ..simulation::SimulationOptions::LEGACY
+    });
+    let bytes = Bincode::encode(&sim).unwrap();
+    let snapshot_version: String = Bincode::decode_prefix(&bytes).unwrap();
+
+    assert_eq!(crate::game_loop::VERSION, snapshot_version);
+    assert_ne!(snapshot_version, "0.11.0");
+}
+
+#[cfg(test)]
+#[test]
 fn land_receipts_keep_local_command_indices_across_catch_up_frames() {
     use simulation::map::{LandMode, LandTileId};
     use simulation::world_command::Rejection;

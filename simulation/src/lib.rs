@@ -129,13 +129,7 @@ pub struct Simulation {
 const RNG_SEED: u64 = 123;
 const INITIAL_TICK: u64 = 1;
 const PRE_SCALE_VERSION: &str = "0.11.0";
-const RELEASE_VERSION: &str = include_str!("../../VERSION");
-// Stamp private SCALE-P1 snapshots before the spine updates the shared VERSION
-// used by the multiplayer handshake and the release builders.
-const VERSION: &str = match RELEASE_VERSION.as_bytes() {
-    b"0.11.0" => "0.11.1-scale-p1",
-    _ => RELEASE_VERSION,
-};
+const VERSION: &str = include_str!("../../VERSION");
 
 fn compatible_save_version(version: &str) -> bool {
     matches!(version, VERSION | PRE_SCALE_VERSION)
@@ -274,6 +268,9 @@ pub struct SimulationOptions {
 }
 
 impl SimulationOptions {
+    const AUTHORED_TERRAIN_CHUNKS: std::ops::RangeInclusive<u16> =
+        1..=NewGameOptions::MAX_TERRAIN_CHUNKS;
+
     pub const LEGACY: Self = Self {
         terrain_size: 50,
         save_replay: true,
@@ -326,6 +323,20 @@ impl SimulationOptions {
         PopulationScale::try_new(self.persons_per_agent)
     }
 
+    fn valid_for_authored_bootstrap(self) -> bool {
+        let minimum_money = if self.progression == ProgressionMode::Guided {
+            150_000
+        } else {
+            NewGameOptions::MIN_STARTING_MONEY_BUCKS
+        };
+        !self.save_replay
+            && self.preset == MapPreset::Flat
+            && self.population_scale().is_ok()
+            && Self::AUTHORED_TERRAIN_CHUNKS.contains(&self.terrain_size)
+            && (minimum_money..=NewGameOptions::MAX_STARTING_MONEY_BUCKS)
+                .contains(&self.starting_money_bucks)
+    }
+
     fn validate_for_snapshot(self, map: &Map) -> Result<PopulationScale, String> {
         let scale = self.population_scale().map_err(|error| error.to_string())?;
         if self.valid_for_bootstrap() {
@@ -334,28 +345,26 @@ impl SimulationOptions {
 
         // Compact authored worlds bypass the native New Game terrain minimum.
         // Imported worlds use the regular bootstrap options.
-        let authored_minimum = match (self.land_mode, self.land_recipe) {
+        let authored = match (self.land_mode, self.land_recipe) {
             (map::LandMode::Unrestricted, map::LandRecipe::Unrestricted)
                 if self.progression == ProgressionMode::FreeBuild
-                    && map.lot_layout() == LotLayout::Uniform
                     && map.environment().size() == (self.terrain_size, self.terrain_size) =>
             {
-                6
+                // Authored-flat starts use the legacy budget and Realistic scale.
+                // The lot layout can change after construction on unrestricted land.
+                let authored_flat = self.starting_money_bucks == Self::LEGACY.starting_money_bucks
+                    && scale == PopulationScale::REALISTIC;
+                let authored_town =
+                    self.terrain_size >= 6 && map.lot_layout() == LotLayout::Uniform;
+                authored_flat || authored_town
             }
-            (map::LandMode::Tiled, map::LandRecipe::AuthoredV1 { .. }) => 1,
-            _ => return Err("Invalid snapshot new-game options".into()),
+            (map::LandMode::Tiled, map::LandRecipe::AuthoredV1 { .. }) => true,
+            _ => false,
         };
-        let minimum_money = if self.progression == ProgressionMode::Guided {
-            150_000
-        } else {
-            NewGameOptions::MIN_STARTING_MONEY_BUCKS
-        };
-        if !self.save_replay
-            && self.preset == MapPreset::Flat
-            && (authored_minimum..=NewGameOptions::MAX_TERRAIN_CHUNKS).contains(&self.terrain_size)
-            && (minimum_money..=NewGameOptions::MAX_STARTING_MONEY_BUCKS)
-                .contains(&self.starting_money_bucks)
-        {
+        if !authored {
+            return Err("Invalid snapshot new-game options".into());
+        }
+        if self.valid_for_authored_bootstrap() {
             return Ok(scale);
         }
         Err("Invalid snapshot authored options".into())
@@ -437,7 +446,7 @@ impl Simulation {
 
     /// Creates a blank, replay-disabled Flat world for an authored layout.
     pub fn new_authored_flat(terrain_chunks: u16, seed: u64) -> Result<Self, NewGameError> {
-        if !(1..=NewGameOptions::MAX_TERRAIN_CHUNKS).contains(&terrain_chunks) {
+        if !SimulationOptions::AUTHORED_TERRAIN_CHUNKS.contains(&terrain_chunks) {
             return Err(NewGameError::TerrainChunks(terrain_chunks));
         }
         let mut sim = Self::with_initial_resources();

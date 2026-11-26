@@ -2263,13 +2263,7 @@ impl WorldCommand {
                     && options.land_mode == crate::map::LandMode::Unrestricted
                     && options.valid_for_bootstrap()
             }
-            BootstrapKind::AuthoredFlat => {
-                !options.save_replay
-                    && options.preset == MapPreset::Flat
-                    && options.population_scale().is_ok()
-                    && (1..=crate::NewGameOptions::MAX_TERRAIN_CHUNKS)
-                        .contains(&options.terrain_size)
-            }
+            BootstrapKind::AuthoredFlat => options.valid_for_authored_bootstrap(),
         };
         if !valid {
             return Err(Rejection::InvalidInitOptions);

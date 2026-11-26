@@ -113,6 +113,21 @@ fn population_scale_rejects_invalid_values_and_defaults_legacy_omissions() {
 }
 
 #[test]
+fn population_scale_replay_rejects_scaled_pre_scale_recording() {
+    init_test_simulation();
+    let sim = Simulation::new_with_options(small_options(4));
+    let mut replay = sim.read::<Replay>().clone();
+    replay.version = crate::PRE_SCALE_VERSION.into();
+    let recording = ReplayJson::encode(&replay).unwrap();
+    let replay = ReplayJson::decode(&recording).unwrap();
+    assert!(matches!(
+        Simulation::try_from_replay(replay),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData
+            && error.to_string().contains("must use Realistic")
+    ));
+}
+
+#[test]
 fn population_scale_snapshot_rejects_options_the_constructors_reject() {
     init_test_simulation();
     let sim = Simulation::new_with_options(small_options(4));
@@ -183,6 +198,20 @@ fn population_scale_snapshot_accepts_compact_authored_town() {
     let loaded: Simulation = Bincode::decode(&snapshot).unwrap();
     assert_eq!(loaded.hashes(), sim.hashes());
     assert_eq!(loaded.population_scale(), PopulationScale::REALISTIC);
+}
+
+#[test]
+fn population_scale_snapshot_accepts_compact_authored_flat() {
+    init_test_simulation();
+    for chunks in [1, 4, NewGameOptions::MIN_TERRAIN_CHUNKS - 1] {
+        let sim = Simulation::new_authored_flat(chunks, 42).unwrap();
+        let snapshot = Bincode::encode(&sim).unwrap();
+        let loaded: Simulation = Bincode::decode(&snapshot).unwrap();
+        assert_eq!(loaded.hashes(), sim.hashes());
+        assert_eq!(loaded.map().environment().size(), (chunks, chunks));
+        assert_eq!(loaded.map().lot_layout(), crate::map::LotLayout::Varied);
+        assert_eq!(loaded.population_scale(), PopulationScale::REALISTIC);
+    }
 }
 
 #[test]

@@ -75,9 +75,7 @@ impl Replay {
     pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
         match self.commands.first() {
             Some((Tick(INITIAL_TICK), WorldCommand::Init(options))) => {
-                options.population_scale().map_err(|error| {
-                    io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {error}"))
-                })?;
+                self.initial_population_scale(options)?;
                 if !options.valid_for_bootstrap() {
                     return Err(invalid_replay(
                         "Replay Init contains invalid new-game options",
@@ -105,12 +103,23 @@ impl Replay {
 
     fn recorded_population_scale(&self) -> io::Result<Option<PopulationScale>> {
         match self.commands.first() {
-            Some((_, WorldCommand::Init(options))) => options
-                .population_scale()
-                .map(Some)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error)),
+            Some((_, WorldCommand::Init(options))) => {
+                self.initial_population_scale(options).map(Some)
+            }
             _ => Ok(None),
         }
+    }
+
+    fn initial_population_scale(&self, options: &SimulationOptions) -> io::Result<PopulationScale> {
+        let scale = options.population_scale().map_err(|error| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {error}"))
+        })?;
+        if self.version == crate::PRE_SCALE_VERSION && scale != PopulationScale::REALISTIC {
+            return Err(invalid_replay(
+                "pre-SCALE replay must use Realistic population",
+            ));
+        }
+        Ok(scale)
     }
 
     pub(crate) fn bootstrap_end(&self) -> io::Result<usize> {
