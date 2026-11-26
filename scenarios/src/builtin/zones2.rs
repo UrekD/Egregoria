@@ -317,6 +317,7 @@ fn grow_city_with_health(
         if !mixed {
             advance_to(ctx, COMMISSION_END - TICKS_PER_DAY)?;
             paint_pure_control_offices(ctx)?;
+            trim_pure_control_housing(ctx)?;
         }
         advance_to(ctx, COMMISSION_END)?;
     }
@@ -410,6 +411,30 @@ fn paint_pure_control_offices(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
     ctx.submit(&commands);
     ctx.flush();
+    Ok(())
+}
+
+fn trim_pure_control_housing(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    // The waypoint fix left the pure district outside the 5% housing match.
+    // Remove one partially occupied 19-place tower a day before measurement.
+    // This is the smallest tested removal that matched housing, jobs and freight distance.
+    let center = vec2(859.5, 1042.0);
+    let tower = ctx
+        .sim
+        .map()
+        .buildings()
+        .iter()
+        .find_map(|(id, building)| {
+            (building.obb.center().distance2(center) < 1.0
+                && building.development()?.zone == zone(Residential, High))
+                .then_some(id)
+        })
+        .ok_or("pure control tower is missing before housing calibration")?;
+    ctx.submit(&[WorldCommand::MapRemoveBuilding(tower)]);
+    ctx.flush();
+    if ctx.sim.map().get(tower).is_some() {
+        return Err("could not remove the pure control tower".into());
+    }
     Ok(())
 }
 
@@ -1365,6 +1390,23 @@ fn mixed_sellers(sim: &Simulation) -> impl Iterator<Item = SoulID> + '_ {
     })
 }
 
+fn check_control_capacity(mixed: &Observation, pure: &Observation) -> Result<(), String> {
+    let matched = |a: f64, b: f64| a > 0.0 && b > 0.0 && (a - b).abs() <= 0.05 * b;
+    let capacities = format!(
+        "housing {}/{}, available jobs {}/{}, filled jobs {}/{} (MX/pure)",
+        mixed.housing_slots, pure.housing_slots, mixed.available_jobs, pure.available_jobs,
+        mixed.filled_jobs, pure.filled_jobs
+    );
+    if !matched(mixed.housing_slots, pure.housing_slots)
+        || !matched(mixed.available_jobs, pure.available_jobs)
+        || !matched(mixed.filled_jobs, pure.filled_jobs)
+    {
+        return Err(format!("pure control outside 5%: {capacities}"));
+    }
+    println!("pure control within 5%: {capacities}");
+    Ok(())
+}
+
 fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), String> {
     let trips = |data: &Observation| data.external_shops as f64 / data.resident_days.max(1.0);
     let filled = |data: &Observation| data.baskets_filled as f64 / data.baskets_due.max(1) as f64;
@@ -1382,17 +1424,7 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
             "MX road freight needs 90% on-time deliveries, got {on_time}/{due}"
         ));
     }
-    let matched = |a: f64, b: f64| a > 0.0 && b > 0.0 && (a - b).abs() <= 0.05 * b;
-    if !matched(mixed.housing_slots, pure.housing_slots)
-        || !matched(mixed.available_jobs, pure.available_jobs)
-        || !matched(mixed.filled_jobs, pure.filled_jobs)
-    {
-        return Err(format!(
-            "pure control outside 5%: housing {}/{}, available jobs {}/{}, filled jobs {}/{} (MX/pure)",
-            mixed.housing_slots, pure.housing_slots, mixed.available_jobs, pure.available_jobs,
-            mixed.filled_jobs, pure.filled_jobs
-        ));
-    }
+    check_control_capacity(mixed, pure)?;
     if mixed.local_pickups < 4
         || mixed.mixed_receipt_units == 0
         || mixed.productive_recipients == 0
@@ -1406,6 +1438,26 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
         return Err(evidence);
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "simulates multiple city days; run in release mode"]
+fn zones2_pure_control_matches_capacity_and_freight_distance() {
+    let mut mixed = ScenarioCtx::new(OPTIONS);
+    let terminal = grow_city(&mut mixed, true, None).unwrap();
+    let mixed_freight = mean_retail_freight_distance(&mixed.sim, terminal).unwrap();
+    let mixed = observe_days(&mut mixed).unwrap();
+
+    let mut pure = ScenarioCtx::new(OPTIONS);
+    let terminal = grow_city(&mut pure, false, None).unwrap();
+    let pure_freight = mean_retail_freight_distance(&pure.sim, terminal).unwrap();
+    let pure = observe_days(&mut pure).unwrap();
+
+    assert!(
+        (mixed_freight - pure_freight).abs() <= BLOCK,
+        "mean terminal road distance differs by over {BLOCK} m (mixed {mixed_freight:.1} m, pure {pure_freight:.1} m)"
+    );
+    check_control_capacity(&mixed, &pure).unwrap();
 }
 
 #[test]
