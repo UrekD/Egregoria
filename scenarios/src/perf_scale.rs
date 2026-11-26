@@ -783,7 +783,7 @@ mod tests {
             checkpoint["hashes"]["world"],
             14_091_543_823_439_975_702_u64
         );
-        // Procedural roofs serialize faces in coordinate traversal order.
+        // Procedural roofs serialize the completed face boundaries in canonical order.
         assert_eq!(checkpoint["hashes"]["map"], 10_765_074_735_981_337_578_u64);
     }
 
