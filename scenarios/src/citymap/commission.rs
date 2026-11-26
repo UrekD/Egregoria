@@ -618,13 +618,13 @@ fn prepare_opening(
             verify_parking_pair(&map, sites[from], sites[to], Tick(sim.get_tick()))?;
         }
         drop(map);
-        // Give the rail terminal a nearby buyer for a regular imported input.
-        // The stock foundry supplies that recurring iron-ore demand.
+        // Keep the regular iron-ore buyer near the West workforce and verify
+        // its loading route from the rail terminal.
         let foundry = place_company_around_parcels(
             sim,
             "foundry",
-            at(2510.0, 2490.0),
-            Some("employment"),
+            at(1114.0, 2186.0),
+            Some("west"),
         )?;
         verify_parking_pair(&sim.map(), terminal, foundry, Tick(sim.get_tick()))?;
         sites.insert("rail-foundry".into(), foundry);
@@ -4348,6 +4348,10 @@ mod tests {
                     parcel.capacity > 0 && parcel.footprint.center().distance(door) <= 250.0
                 }), "{name} needs a nearby opening housing block");
             }
+            let foundry = &map.buildings()[opening.sites["rail-foundry"]];
+            let west = super::super::layout::design_point(vec2(1114.0, 2186.0), plan.config);
+            assert!(foundry.door_pos.xy().distance(west) <= 150.0,
+                "the rail foundry needs to be near its West workforce, door at {:?}", foundry.door_pos);
             assert_eq!(opening.intake_homes.len(), 12);
             assert!(opening.parcels.iter()
                 .filter(|parcel| opening.intake_homes.contains(&parcel.lot))
