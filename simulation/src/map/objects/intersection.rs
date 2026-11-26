@@ -30,6 +30,9 @@ pub struct Intersection {
     #[serde(skip)]
     legal_turns: Option<BTreeSet<Turn>>,
 
+    #[serde(skip)]
+    crosswalks: Vec<TurnID>,
+
     // sorted by angle
     pub roads: Vec<RoadID>,
 
@@ -45,6 +48,7 @@ impl Intersection {
             radius: 0.0,
             turns: Default::default(),
             legal_turns: None,
+            crosswalks: Vec::new(),
             roads: Default::default(),
             turn_policy: Default::default(),
             light_policy: Default::default(),
@@ -108,6 +112,18 @@ impl Intersection {
                 x
             })
             .collect();
+        self.index_crosswalks();
+    }
+
+    pub(crate) fn index_crosswalks(&mut self) {
+        self.crosswalks = self.turns.iter()
+            .filter(|turn| turn.kind == crate::map::TurnKind::Crosswalk)
+            .map(|turn| turn.id)
+            .collect();
+    }
+
+    pub(crate) fn crosswalks(&self) -> impl Iterator<Item = &Turn> {
+        self.crosswalks.iter().filter_map(|&id| self.find_turn(id))
     }
 
     pub fn update_traffic_control(&self, lanes: &mut Lanes, roads: &Roads) {

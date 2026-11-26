@@ -1,6 +1,6 @@
 use crate::map::{
-    LaneKind, Map, ProjectFilter, ProjectKind, Traversable, TraverseDirection, TraverseKind, Turn,
-    TurnKind,
+    LaneKind, Map, ProjectFilter, ProjectKind, Road, Traversable, TraverseDirection, TraverseKind,
+    Turn, TurnKind,
 };
 use geom::{Vec2, Vec3, AABB};
 use ordered_float::OrderedFloat;
@@ -10,6 +10,7 @@ const SEARCH_RADIUS: f32 = 1.25;
 const DECK_TOLERANCE: f32 = 0.65;
 const PEDESTRIAN_RADIUS: f32 = 0.3;
 const LOCAL_WORK: usize = 1_024;
+const MAX_CURB_EXIT: f32 = 6.0;
 
 pub(super) enum PedestrianClearance {
     Clear,
@@ -18,6 +19,10 @@ pub(super) enum PedestrianClearance {
         traversal: Traversable,
         projection: Vec3,
         sidewalk: Vec3,
+    },
+    Curb {
+        sidewalk: Traversable,
+        exit: Vec3,
     },
 }
 
@@ -39,7 +44,7 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
     spatial.reserve_construction_query(bounds, &mut work).ok()?;
 
     let mut intersections = BTreeSet::new();
-    let mut vehicle_path = false;
+    let mut roads = Vec::new();
     for candidate in spatial.query_around(
         center,
         SEARCH_RADIUS,
@@ -53,22 +58,14 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
             ProjectKind::Road(id) => {
                 let road = map.get(id)?;
                 intersections.extend([road.src, road.dst]);
-                for (lane, kind) in road.lanes_iter() {
-                    work = work.checked_sub(1)?;
-                    if !kind.vehicles() && kind != LaneKind::Rail {
-                        continue;
-                    }
-                    let lane = map.get(lane)?;
-                    work = work.checked_sub(lane.points.len())?;
-                    vehicle_path |= occupies_path(&lane.points, kind.width() * 0.5, position);
-                }
+                roads.push(road);
             }
             _ => {}
         }
     }
 
     let mut best = None;
-    let mut vehicle_turns = Vec::new();
+    let mut nearby_junctions = Vec::new();
     for id in intersections {
         work = work.checked_sub(1)?;
         let junction = map.get(id)?;
@@ -81,15 +78,9 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
         {
             continue;
         }
-        for turn in junction.turns() {
-            work = work.checked_sub(1)?;
-            if turn.kind != TurnKind::Crosswalk {
-                if !vehicle_path && matches!(turn.kind, TurnKind::Driving | TurnKind::Rail) {
-                    vehicle_turns.push(turn);
-                }
-                continue;
-            }
-            work = work.checked_sub(turn.points.len())?;
+        nearby_junctions.push(junction);
+        for turn in junction.crosswalks() {
+            work = work.checked_sub(1 + turn.points.len())?;
             if let Some((projection, sidewalk, dir)) = crosswalk_exit(map, turn, position) {
                 let key = (
                     OrderedFloat(position.distance2(projection)),
@@ -115,16 +106,82 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
     if let Some((_, crossing)) = best {
         return Some(crossing);
     }
-    if vehicle_path {
-        return Some(PedestrianClearance::Hold);
+    // Where a sidewalk borders parking, a walker already in the curb half
+    // of the outer driving lane can leave on that side without crossing
+    // another travel lane. Use a marked crossing first at a junction.
+    if nearby_junctions.is_empty() && roads.len() == 1 {
+        if let Some(exit) = curb_exit(map, roads[0], position, &mut work)? {
+            return Some(exit);
+        }
     }
-    for turn in vehicle_turns {
-        work = work.checked_sub(turn.points.len())?;
-        if occupies_path(&turn.points, 2.0, position) {
-            return Some(PedestrianClearance::Hold);
+    for road in roads {
+        for (lane, kind) in road.lanes_iter() {
+            work = work.checked_sub(1)?;
+            if !kind.vehicles() && kind != LaneKind::Rail {
+                continue;
+            }
+            let lane = map.get(lane)?;
+            work = work.checked_sub(lane.points.len())?;
+            if occupies_path(&lane.points, kind.width() * 0.5, position) {
+                return Some(PedestrianClearance::Hold);
+            }
+        }
+    }
+    for junction in nearby_junctions {
+        for turn in junction.turns() {
+            work = work.checked_sub(1)?;
+            if matches!(turn.kind, TurnKind::Driving | TurnKind::Rail) {
+                work = work.checked_sub(turn.points.len())?;
+                if occupies_path(&turn.points, 2.0, position) {
+                    return Some(PedestrianClearance::Hold);
+                }
+            }
         }
     }
     Some(PedestrianClearance::Clear)
+}
+
+fn curb_exit(
+    map: &Map,
+    road: &Road,
+    position: Vec3,
+    work: &mut usize,
+) -> Option<Option<PedestrianClearance>> {
+    let lanes = road.lanes_iter();
+    let mut best = None;
+    for side in [
+        lanes.clone().take(3).collect::<Vec<_>>(),
+        lanes.rev().take(3).collect(),
+    ] {
+        let &[(walk, LaneKind::Walking), (_, LaneKind::Parking), (drive, LaneKind::Driving)] =
+            side.as_slice()
+        else {
+            continue;
+        };
+        let (sidewalk, driving) = (map.get(walk)?, map.get(drive)?);
+        *work = work.checked_sub(sidewalk.points.len() + driving.points.len())?;
+        let (center, _) = driving.points.project_segment_2d(position.xy());
+        let (exit, segment) = sidewalk.points.project_segment_2d(position.xy());
+        let curb = exit.xy() - center.xy();
+        if segment == 0 && exit == sidewalk.points.first()
+            || exit == sidewalk.points.last()
+            || (center.z - position.z).abs() > DECK_TOLERANCE
+            || (exit.z - position.z).abs() > DECK_TOLERANCE
+            || !position.xy().is_close(center.xy(), LaneKind::Driving.width() * 0.5 + PEDESTRIAN_RADIUS)
+            || !position.is_close(exit, MAX_CURB_EXIT)
+            || (position.xy() - center.xy()).dot(curb) <= PEDESTRIAN_RADIUS * curb.mag()
+        {
+            continue;
+        }
+        let key = (OrderedFloat(position.distance2(exit)), walk);
+        if best.as_ref().is_none_or(|(previous, _)| key < *previous) {
+            best = Some((key, PedestrianClearance::Curb {
+                sidewalk: Traversable::new(TraverseKind::Lane(walk), TraverseDirection::Forward),
+                exit,
+            }));
+        }
+    }
+    Some(best.map(|(_, exit)| exit))
 }
 
 fn occupies_path(points: &geom::PolyLine3, half_width: f32, position: Vec3) -> bool {
@@ -167,14 +224,23 @@ fn crosswalk_exit(
     }
 }
 
-pub(super) fn crosswalk_path_still_valid(
+pub(super) fn exit_path_still_valid(
     map: &Map,
     crossing: Traversable,
     position: Vec3,
     path: &[Vec3],
 ) -> bool {
-    let TraverseKind::Turn(id) = crossing.kind else {
-        return false;
+    let id = match crossing.kind {
+        TraverseKind::Lane(id) => {
+            let [exit] = path else { return false };
+            return map.get(id).is_some_and(|lane| {
+                lane.kind == LaneKind::Walking
+                    && lane.points.len() <= LOCAL_WORK
+                    && lane.points.project_dist2(*exit) < 0.01
+                    && position.is_close(*exit, MAX_CURB_EXIT)
+            });
+        }
+        TraverseKind::Turn(id) => id,
     };
     let Some(turn) = map.get(id.parent).and_then(|inter| inter.find_turn(id)) else {
         return false;
@@ -213,8 +279,8 @@ fn p7_life_dense_junction_can_clear_a_cancelled_walker() {
         )
         .unwrap();
     let id = map.roads()[first].src;
-    for spoke in 1..6 {
-        let angle = spoke as f32 * std::f32::consts::TAU / 6.0;
+    for spoke in 1..12 {
+        let angle = spoke as f32 * std::f32::consts::TAU / 12.0;
         let (sin, cos) = angle.sin_cos();
         map.make_connection(
             MapProject {
@@ -228,8 +294,7 @@ fn p7_life_dense_junction_can_clear_a_cancelled_walker() {
         .unwrap();
     }
     let junction = map.get(id).unwrap();
-    let full_turn_work: usize = junction.turns().map(|turn| 1 + turn.points.len()).sum();
-    assert!(full_turn_work > LOCAL_WORK);
+    assert!(junction.turns().len() > LOCAL_WORK);
     let crosswalk = junction
         .turns()
         .find(|turn| turn.kind == TurnKind::Crosswalk)

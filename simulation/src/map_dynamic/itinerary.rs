@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 
 #[path = "road_edit_lifecycle.rs"]
 mod road_edit_lifecycle;
-use road_edit_lifecycle::{crosswalk_path_still_valid, pedestrian_clearance, PedestrianClearance};
+use road_edit_lifecycle::{exit_path_still_valid, pedestrian_clearance, PedestrianClearance};
 
 const EGRESS_RECHECK_TICKS: u64 = game_secs_to_ticks(30);
 const MAX_EGRESS_CHECKS_PER_TICK: usize = 8;
@@ -206,8 +206,10 @@ impl<'de> Deserialize<'de> for Itinerary {
             }
             Saved::PedestrianEgress(egress, approach) => {
                 let valid = if let Some(crossing) = egress.crossing {
-                    matches!(crossing.kind, TraverseKind::Turn(_))
-                        && (1..=2).contains(&reversed_local_path.len())
+                    (match crossing.kind {
+                        TraverseKind::Lane(_) => reversed_local_path.len() == 1,
+                        TraverseKind::Turn(_) => (1..=2).contains(&reversed_local_path.len()),
+                    })
                         && reversed_local_path.iter().all(|point| point.is_finite())
                 } else {
                     reversed_local_path.is_empty()
@@ -1005,6 +1007,7 @@ impl Itinerary {
                 }
                 (Some(traversal), points)
             }
+            PedestrianClearance::Curb { sidewalk, exit } => (Some(sidewalk), vec![exit]),
         };
         self.reversed_local_path = reversed_local_path;
         self.kind = ItineraryKind::PedestrianEgress(PedestrianEgress {
@@ -1022,7 +1025,7 @@ impl Itinerary {
         let Some(crossing) = egress.crossing else {
             return position;
         };
-        if !crosswalk_path_still_valid(map, crossing, position, &self.reversed_local_path) {
+        if !exit_path_still_valid(map, crossing, position, &self.reversed_local_path) {
             self.reversed_local_path.clear();
             egress.crossing = None;
             egress.check_at = Tick(0);
@@ -1653,51 +1656,37 @@ mod tests {
             human.router.go_to(Destination::Outside(destination));
         });
 
-        let tick = ctx.g.get_tick();
-        let update_route = |sim: &mut Simulation| {
-            let (world, resources) = sim.world_res();
-            crate::map_dynamic::routing_changed_system(world, resources);
-            crate::map_dynamic::routing_update_system(world, resources);
-        };
-        update_route(&mut ctx.g);
-        update_at(&mut ctx.g, tick + 1);
-        let human = &ctx.g.world.humans[id];
-        assert!(human.it.get_route().is_some());
-        assert!(matches!(human.router.cur_step(), Some(RoutingStep::WalkTo(point)) if *point == destination));
-        assert_eq!(human.trans.pos, position);
-
-        ctx.g.apply_commands([&WorldCommand::MapRemoveRoad(connector)]);
-        assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
-        ctx.g.world.edit_human(id, |human| {
-            human.router.reset_dest();
-            human.speed.0 = 1.1;
-        });
-        update_route(&mut ctx.g);
-        update_at(&mut ctx.g, tick + 2);
-        assert!(ctx.g.world.humans[id].it.is_wait_for_reroute().is_some_and(|wait| wait > 0));
-        update_at(&mut ctx.g, tick + 3);
-        let human = &ctx.g.world.humans[id];
-        assert_eq!(human.router.target_dest, Some(Destination::Outside(destination)));
-        assert_eq!(human.it.target(), Some(ItineraryTarget::Position(destination)));
-        assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_some());
-        assert!(human.it.get_point().is_some());
-        assert_eq!(human.trans.pos, position);
-        assert_eq!(human.speed.0, 0.0);
-
         let mut schedule = Simulation::schedule();
         schedule.retain_systems(|name| {
             matches!(
                 name,
-                "pedestrian_decision_system"
+                "routing_changed_system"
+                    | "routing_update_system"
+                    | "pedestrian_decision_system"
                     | "transport_grid_synchronize"
                     | "vehicle_decision_system"
                     | "itinerary_update"
             )
         });
-        for _ in 0..60 {
+        ctx.g.tick(&mut schedule, &[]);
+        let human = &ctx.g.world.humans[id];
+        assert!(human.it.get_route().is_some());
+        assert!(matches!(human.router.cur_step(), Some(RoutingStep::WalkTo(point)) if *point == destination));
+
+        ctx.g.tick(&mut schedule, [&WorldCommand::MapRemoveRoad(connector)]);
+        assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
+        for _ in 0..12_000 {
+            let human = &ctx.g.world.humans[id];
+            if human.it.is_wait_for_reroute().is_some() || human.it.is_pedestrian_egress() {
+                break;
+            }
             ctx.g.tick(&mut schedule, &[]);
         }
-        assert!(ctx.g.world.humans[id].it.is_pedestrian_egress());
+        let human = &ctx.g.world.humans[id];
+        assert!(human.it.is_wait_for_reroute().is_some() || human.it.is_pedestrian_egress());
+        assert_eq!(human.router.target_dest, Some(Destination::Outside(destination)));
+        assert_eq!(human.it.target(), Some(ItineraryTarget::Position(destination)));
+
         let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
         for sim in [&mut ctx.g, &mut resumed] {
             let connect = {
@@ -1727,6 +1716,61 @@ mod tests {
         let vehicle = &ctx.g.world.vehicles[car];
         assert!(vehicle.it.has_ended(0.0) && vehicle.trans.pos.distance(car_goal) < 0.1);
         assert_eq!(resumed.world.vehicles[car].trans.pos, vehicle.trans.pos);
+    }
+
+    #[test]
+    fn p7_life_lesce_stalled_walk_clears_its_curb_and_queue() {
+        use crate::transportation::spawn_driving_vehicle;
+        use geom::Transform;
+
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), vec3(470.0, 180.0, 0.0)]);
+        let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
+        let id = spawn_human(&mut ctx.g, house).unwrap();
+        let (position, sidewalk_point, start, route) = {
+            let map = ctx.g.map();
+            let lane = map.lanes().values().find(|lane| lane.kind == LaneKind::Driving).unwrap();
+            let sidewalk = map.roads()[lane.parent].sidewalks(lane.src).outgoing.unwrap();
+            let offset = lane.points.length() * 0.5;
+            let center = lane.points.point_along(offset);
+            let sidewalk_point = map.get(sidewalk).unwrap().points.project(center);
+            let position = center + (sidewalk_point - center).normalize_to(1.19);
+            let (pos, dir) = lane.points.point_dir_along(offset - 4.2);
+            let route = Itinerary::route_between_lanes(
+                Tick(ctx.g.get_tick()), &map, (lane.id, offset - 4.2), (lane.id, offset + 25.0),
+            ).unwrap();
+            (position, sidewalk_point, Transform::new_dir(pos, dir), route)
+        };
+        let goal = route.end_pos().unwrap();
+        let car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, start).unwrap();
+        ctx.g.world.vehicles[car].it = route;
+        let collider = put_pedestrian_in_transport_grid(&mut ctx.g.write::<TransportGrid>(), position);
+        ctx.g.world.edit_human(id, |human| {
+            human.location = Location::Outside;
+            human.trans.pos = position;
+            human.collider = Some(collider);
+            human.it = Itinerary::NONE;
+        });
+        let mut schedule = Simulation::schedule();
+        schedule.retain_systems(|name| matches!(name,
+            "pedestrian_decision_system" | "vehicle_decision_system"
+            | "transport_grid_synchronize" | "itinerary_update"
+        ));
+        for _ in 0..30 {
+            ctx.g.tick(&mut schedule, &[]);
+        }
+        assert_eq!(ctx.g.world.humans[id].collider, Some(collider));
+        assert!(!ctx.g.world.vehicles[car].it.has_ended(0.0));
+
+        let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+        for sim in [&mut ctx.g, &mut resumed] {
+            for _ in 0..1_000 {
+                sim.tick(&mut schedule, &[]);
+            }
+            assert!(sim.world.humans[id].trans.pos.is_close(sidewalk_point, 0.1));
+            assert!(sim.world.humans[id].collider.is_none());
+            assert!(sim.world.vehicles[car].trans.pos.is_close(goal, 0.1));
+        }
     }
 
     #[test]

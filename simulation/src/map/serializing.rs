@@ -298,10 +298,13 @@ impl SerializedMap {
     }
 
     fn into_map(
-        self,
+        mut self,
         lot_origins: BTreeMap<BuildingID, LotOrigin>,
         import_lane_reserve: bool,
     ) -> Map {
+        for junction in self.intersections.values_mut() {
+            junction.index_crosswalks();
+        }
         let spatial_map = mk_spatial_map(&self);
         let mut lots_by_road = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
         for (id, lot) in self.lots.iter() {
