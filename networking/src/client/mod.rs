@@ -27,6 +27,7 @@ pub struct FrameInputs<I> {
 
 #[derive(Debug)]
 pub struct ServerInput<I> {
+    pub sender: u32,
     pub sent_by_me: bool,
     pub inp: I,
 }

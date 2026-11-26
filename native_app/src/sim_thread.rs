@@ -19,6 +19,7 @@ use simulation::world_command::{
 use simulation::{Simulation, SimulationReplayLoader, SlotCapture};
 
 use crate::automation::{FixtureOp, FixtureOutcome};
+use crate::gui::traffic_repair::TrafficEditReceipt;
 use crate::session::{save_coordinator::SavePermit, CityProgress};
 
 pub(crate) const BATCH_BYTES: usize = 256 * 1024;
@@ -101,6 +102,7 @@ pub(crate) struct AppliedBatch {
     pub link_outcomes: Vec<(usize, LinkOutcome)>,
     pub water_edits: Vec<(usize, Result<WaterEditOutcome, WaterEditError>)>,
     pub tile_purchases: Vec<TilePurchaseReceipt>,
+    pub traffic_edits: Vec<TrafficEditReceipt>,
     pub commands: WorldCommands,
 }
 
@@ -1323,6 +1325,10 @@ impl Worker {
                 commands.iter().enumerate(),
             )
             .collect(),
+            traffic_edits: commands.iter().enumerate().filter_map(|(index, command)| {
+                TrafficEditReceipt::from_outcome(id.generation, self.status.boundary.tick, None,
+                    index, true, index, command, &outcomes)
+            }).collect(),
             commands,
         })
     }

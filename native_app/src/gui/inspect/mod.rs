@@ -23,6 +23,15 @@ mod inspect_vehicle;
 
 pub fn new_inspector(uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::inspector");
+    if *uiworld.read::<crate::gui::Tool>() == crate::gui::Tool::RoadEditor {
+        let selected = uiworld.read::<crate::gui::roadeditor::RoadEditorResource>()
+            .inspect.as_ref().map(|selection| selection.id);
+        if let Some(id) = selected {
+            if !crate::gui::traffic_repair::render_junction(uiworld, sim, id) {
+                uiworld.write::<crate::gui::roadeditor::RoadEditorResource>().inspect = None;
+            }
+        }
+    }
     let inspected_building = *uiworld.read::<InspectedBuilding>();
     if let Some(b) = inspected_building.e {
         let is_open = inspect_building(uiworld, sim, b);

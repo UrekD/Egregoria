@@ -2,6 +2,8 @@
 pub use self::inner::*;
 #[cfg(any(feature = "multiplayer", test))]
 use crate::uiworld::TilePurchaseReceipt;
+#[cfg(any(feature = "multiplayer", test))]
+use crate::gui::traffic_repair::TrafficEditReceipt;
 use crate::uiworld::UiWorld;
 use common::timestep::Timestep;
 #[cfg(any(feature = "multiplayer", test))]
@@ -44,6 +46,25 @@ fn local_frame_commands<'a>(
         .flat_map(|(local, commands)| commands.iter().map(move |command| (local, command)))
         .enumerate()
         .filter_map(|(index, (local, command))| local.then_some((index, command)))
+}
+
+#[cfg(any(feature = "multiplayer", test))]
+fn frame_traffic_edits<'a>(
+    generation: u64,
+    frame: u64,
+    outcomes: &'a CommandOutcomes,
+    inputs: impl IntoIterator<Item = (u32, bool, &'a WorldCommands)> + 'a,
+) -> impl Iterator<Item = TrafficEditReceipt> + 'a {
+    inputs.into_iter()
+        .flat_map(|(sender, local, commands)| {
+            commands.iter().enumerate().map(move |(index, command)| (sender, local, index, command))
+        })
+        .enumerate()
+        .filter_map(move |(flattened, (sender, local, index, command))| {
+            TrafficEditReceipt::from_outcome(
+                generation, frame, Some(sender), index, local, flattened, command, outcomes,
+            )
+        })
 }
 
 pub fn is_singleplayer(uiw: &UiWorld) -> bool {
@@ -120,11 +141,13 @@ mod inner {
                         inputs_to_apply = Some(inputs);
                     }
                     PollResult::GameWorld(_, _) => {
+                        discard_traffic_edits(&state.uiw);
                         state.uiw.write::<NetworkConnectionInfo>().error =
                             "The server replaced the active world.".into();
                         return true;
                     }
                     PollResult::Disconnect(reason) => {
+                        discard_traffic_edits(&state.uiw);
                         state.uiw.write::<NetworkConnectionInfo>().error = reason;
                         return true;
                     }
@@ -135,6 +158,7 @@ mod inner {
         if let Some(inputs) = inputs_to_apply {
             let mut merged = WorldCommands::default();
             let mut purchases = Vec::new();
+            let mut traffic_edits = Vec::new();
             let generation = state.uiw.read::<crate::session::SessionState>().generation;
             for frame_commands in inputs {
                 assert_eq!(frame_commands.frame.0, sim.get_tick() + 1);
@@ -160,6 +184,12 @@ mod inner {
                     &outcomes,
                     local(),
                 ));
+                traffic_edits.extend(super::frame_traffic_edits(
+                    generation,
+                    frame_commands.frame.0,
+                    &outcomes,
+                    inputs.iter().map(|input| (input.sender, input.sent_by_me, &input.inp)),
+                ));
                 for (index, command) in local() {
                     if outcomes.accepted.contains(&index) {
                         merged.push(command.clone());
@@ -167,11 +197,18 @@ mod inner {
                 }
             }
             crate::gui::overlays::land_tiles::receive_network(&state.uiw, &purchases);
+            crate::gui::traffic_repair::receive_network(&state.uiw, &traffic_edits);
             let mut received = ReceivedCommands::new(merged);
+            received.traffic_edits = traffic_edits;
             received.tile_purchases = purchases;
             *state.uiw.write::<ReceivedCommands>() = received;
         }
         false
+    }
+
+    fn discard_traffic_edits(uiw: &crate::uiworld::UiWorld) {
+        let generation = uiw.read::<crate::session::SessionState>().generation;
+        crate::gui::traffic_repair::network_reset(uiw, generation);
     }
 
     pub fn start_server(info: &mut NetworkConnectionInfo, tick: u64) -> Option<Server> {
@@ -440,4 +477,39 @@ fn p7_ingress_carries_real_road_commands_and_rejects_oversized_frames() {
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn p7_receipt_keeps_local_rejection_and_remote_success_in_separate_frames() {
+    use crate::gui::traffic_repair::{test_road_upgrade, TrafficEditResult};
+    use common::saveload::{Bincode, Encoder};
+    use simulation::map::road_edit::{RoadEditStatus, RoadQuote};
+    use simulation::world_command::Rejection;
+    use simulation::{MapPreset, NewGameOptions, Simulation};
+
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let mut sim = Simulation::new_game(&NewGameOptions { preset: MapPreset::Flat, ..Default::default() })
+        .unwrap();
+    let (road, repair) = test_road_upgrade(&sim);
+    let WorldCommand::MapUpgradeRoad { expected, change, .. } = repair.clone() else { unreachable!() };
+    let tax = WorldCommand::SetTaxRate { zone: simulation::map::ZoneKind::Residential, rate_permille: 120 };
+    let local = WorldCommands::from(vec![tax.clone(), WorldCommand::MapUpgradeRoad {
+        road, expected, change, quote: Bincode::decode::<RoadQuote>(&Bincode::encode(&0u64).unwrap()).unwrap(),
+    }]);
+    let other = WorldCommands::from(vec![tax]);
+    sim.apply_commands(other.iter().chain(local.iter()));
+    let mut receipts: Vec<_> = frame_traffic_edits(
+        4, 2, &sim.read::<CommandOutcomes>(), [(12, false, &other), (24, true, &local)],
+    ).collect();
+    let remote = WorldCommands::from(vec![repair]);
+    sim.apply_commands(remote.iter());
+    receipts.extend(frame_traffic_edits(4, 3, &sim.read::<CommandOutcomes>(), [(12, false, &remote)]));
+    assert_eq!(receipts.len(), 2);
+    assert_eq!((receipts[0].frame, receipts[0].sender, receipts[0].command_index, receipts[0].local), (2, Some(24), 1, true));
+    assert_eq!(receipts[0].result, Err(Rejection::StaleRoadQuote));
+    assert_eq!((receipts[1].frame, receipts[1].sender, receipts[1].command_index, receipts[1].local), (3, Some(12), 0, false));
+    assert!(matches!(&receipts[1].result, Ok(TrafficEditResult::Road(receipt)) if receipt.road == road && receipt.status == RoadEditStatus::Applied));
+    assert!(receipts[0].sequence < receipts[1].sequence);
 }

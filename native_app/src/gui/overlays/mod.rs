@@ -371,6 +371,7 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             }
         }
     });
+    crate::gui::traffic_repair::draw_selected(sim, uiworld, &mut draw);
 }
 
 fn draw_selected_service_ring(

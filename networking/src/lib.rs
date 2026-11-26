@@ -118,6 +118,7 @@ fn decode_merged<I: DeserializeOwned>(
             .into_iter()
             .flat_map(|(id, x)| {
                 Some(ServerInput {
+                    sender: id.0,
                     sent_by_me: id == me,
                     inp: decode_player_input(&x)?,
                 })

@@ -109,6 +109,15 @@ enum Step {
         round_trip: bool,
     },
     NewWetTiledFixture,
+    PreviewTrafficRoad {
+        anchor: [f32; 2],
+        #[serde(default)]
+        denied: bool,
+    },
+    SelectTrafficJunction,
+    ConfirmTrafficRepair,
+    CompareTrafficCorridor,
+    SaveTrafficRepair,
     ClearBuildingInspector,
     LoadSlot(String),
     Assert(Assertion),
@@ -144,6 +153,7 @@ enum Assertion {
     NoRejections,
     ServicesTab,
     HouseInspector,
+    TrafficRepair(TrafficRepairAssertion),
     LandTiles {
         tick: u64,
         owned: BTreeSet<LandTileId>,
@@ -177,6 +187,15 @@ enum Assertion {
     },
     /// The followed human is still inspected and the camera is on whatever carries them.
     CameraOnFollowed,
+}
+
+#[derive(Deserialize)]
+enum TrafficRepairAssertion {
+    Quote,
+    Applied,
+    Denied,
+    Junction,
+    Compared,
 }
 
 #[derive(Deserialize)]
@@ -269,7 +288,17 @@ enum Wait {
     },
     LoadSlot,
     Screenshot,
+    TrafficReceipt,
+    TrafficComparison,
+    TrafficSave,
     Simulation(BatchId),
+}
+
+#[derive(Clone, Copy, Serialize)]
+struct TrafficPresentation {
+    generation: u64,
+    submitted_frame: u64,
+    first_revised_frame: Option<u64>,
 }
 
 pub(crate) struct Automation {
@@ -283,6 +312,8 @@ pub(crate) struct Automation {
     fixture: Option<FixtureOutcome>,
     load_slot: Option<String>,
     first_rejection: Option<(&'static str, Rejection)>,
+    traffic_presentation: Option<TrafficPresentation>,
+    traffic_batch: Option<BatchId>,
     land_terrain_revision: Cell<Option<(u64, u64, u64)>>,
     _watchdog: mpsc::Sender<()>,
 }
@@ -331,6 +362,8 @@ pub(crate) fn configure() -> Result<(), String> {
         fixture: None,
         load_slot: None,
         first_rejection: None,
+        traffic_presentation: None,
+        traffic_batch: None,
         land_terrain_revision: Cell::new(None),
         _watchdog: watchdog,
     });
@@ -473,6 +506,11 @@ impl Automation {
             {
                 return Ok(true);
             }
+            Some(Wait::Applied(id)) if self.traffic_batch == Some(id) => {
+                if let Some(presentation) = &mut self.traffic_presentation {
+                    presentation.first_revised_frame = Some(ctx.gfx.tick.saturating_sub(1));
+                }
+            }
             Some(Wait::Map { boundary, .. })
                 if boundary.generation != uiw.read::<SessionState>().generation
                     || rebuilt_version != Some(boundary.tick)
@@ -497,6 +535,23 @@ impl Automation {
                     .world_error
                     .clone()
                     .unwrap_or_else(|| "loading the save slot did not enter Playing".into()));
+            }
+            Some(Wait::TrafficReceipt) if uiw.read::<crate::gui::traffic_repair::TrafficRepairUi>()
+                .script_state(sim).pending => return Ok(true),
+            Some(Wait::TrafficComparison) => {
+                let generation = uiw.read::<SessionState>().generation;
+                if !uiw.write::<crate::gui::traffic_repair::TrafficRepairUi>()
+                    .script_comparison_ready(generation)? {
+                    return Ok(true);
+                }
+            }
+            Some(Wait::TrafficSave) => {
+                if uiw.read::<SaveLoadState>().saving() {
+                    return Ok(true);
+                }
+                if !saveload::save_dir().join("p7_repaired.meta.json").is_file() {
+                    return Err("Repaired slot was not saved".into());
+                }
             }
             Some(Wait::Simulation(_)) => return Ok(true),
             Some(Wait::Screenshot) => match ctx.take_screenshot_result() {
@@ -584,6 +639,11 @@ impl Automation {
                     | Step::Builder(_)
                     | Step::FollowHuman { .. }
                     | Step::RunFollowing { .. }
+                    | Step::PreviewTrafficRoad { .. }
+                    | Step::SelectTrafficJunction
+                    | Step::ConfirmTrafficRepair
+                    | Step::CompareTrafficCorridor
+                    | Step::SaveTrafficRepair
                     | Step::InspectCargoRoad { .. }
                     | Step::Camera { .. }
                     | Step::SelectTool(_)
@@ -754,6 +814,33 @@ impl Automation {
                 replace_land_fixture(uiw, new_tiled_fixture(side, progression, round_trip)?)?;
             }
             Step::NewWetTiledFixture => replace_land_fixture(uiw, land_fixture::wet_rectangle()?)?,
+            Step::PreviewTrafficRoad { anchor, denied } => {
+                crate::gui::traffic_repair::script_preview_road(uiw, sim, anchor, denied)?;
+            }
+            Step::SelectTrafficJunction => {
+                crate::gui::traffic_repair::script_select_junction(uiw, sim)?;
+            }
+            Step::ConfirmTrafficRepair => {
+                uiw.write::<crate::gui::traffic_repair::TrafficRepairUi>()
+                    .confirm_script(sim, uiw)?;
+                self.traffic_presentation = Some(TrafficPresentation {
+                    generation: uiw.read::<SessionState>().generation,
+                    submitted_frame: ctx.gfx.tick,
+                    first_revised_frame: None,
+                });
+                self.wait = Some(Wait::TrafficReceipt);
+            }
+            Step::CompareTrafficCorridor => {
+                let generation = uiw.read::<SessionState>().generation;
+                uiw.write::<crate::gui::traffic_repair::TrafficRepairUi>()
+                    .start_script_comparison(generation);
+                self.wait = Some(Wait::TrafficComparison);
+            }
+            Step::SaveTrafficRepair => {
+                let slot = common::saveload::SlotId::new("p7_repaired").unwrap();
+                session::request_save(uiw, Some((slot, "P7 repaired corridor".to_owned())));
+                self.wait = Some(Wait::TrafficSave);
+            }
             Step::ClearBuildingInspector => {
                 uiw.write::<InspectedBuilding>().e = None;
             }
@@ -810,6 +897,9 @@ impl Automation {
                     sim,
                     samples,
                     include_map_hash,
+                    self.traffic_presentation.filter(|presentation| {
+                        presentation.generation == uiw.read::<SessionState>().generation
+                    }),
                 )?;
             }
             Step::Exit => {
@@ -842,6 +932,9 @@ impl Automation {
                 .rejections
                 .first()
                 .map(|&(_, label, reason)| (label, reason));
+        }
+        if batch.traffic_edits.iter().any(|receipt| receipt.local) {
+            self.traffic_batch = Some(batch.id);
         }
         self.wait = Some(Wait::Applied(batch.id));
     }
@@ -897,6 +990,7 @@ impl Automation {
         sim: &Simulation,
         water_samples: &[[f32; 2]],
         include_map_hash: bool,
+        traffic_presentation: Option<TrafficPresentation>,
     ) -> Result<(), String> {
         #[derive(Serialize)]
         struct Snapshot<'a> {
@@ -921,6 +1015,11 @@ impl Automation {
             demand_drivers: BTreeMap<ZoneKind, (&'static str, f32)>,
             tax_rates: [u16; 4],
             rejections: Vec<(&'static str, String)>,
+            traffic_repair: crate::gui::traffic_repair::TrafficRepairScriptState,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            traffic_presentation: Option<TrafficPresentation>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            traffic_comparison: Option<&'a scenarios::traffic_repair::RepairComparison>,
         }
 
         let open_windows = uiw
@@ -942,6 +1041,7 @@ impl Automation {
             None
         };
         let buildings = map.buildings().values();
+        let traffic = uiw.read::<crate::gui::traffic_repair::TrafficRepairUi>();
         let state = Snapshot {
             tick: sim.get_tick(),
             active_tool: *uiw.read::<Tool>(),
@@ -984,6 +1084,9 @@ impl Automation {
                 .filter_map(|&zone| top_demand_driver(sim, zone).map(|driver| (zone, driver)))
                 .collect(),
             tax_rates: ZoneKind::TAXABLE.map(|zone| budget.tax_rate(zone)),
+            traffic_repair: traffic.script_state(sim),
+            traffic_presentation,
+            traffic_comparison: traffic.completed_comparison(),
             rejections: sim
                 .read::<CommandOutcomes>()
                 .last
@@ -1090,6 +1193,20 @@ impl Assertion {
                     || *uiw.read::<BuildingTab>() != BuildingTab::Services
                 {
                     return Err("Services tab is not open".into());
+                }
+            }
+            Self::TrafficRepair(expected) => {
+                let state = uiw.read::<crate::gui::traffic_repair::TrafficRepairUi>().script_state(sim);
+                let observed = match expected {
+                    TrafficRepairAssertion::Quote => state.road.is_some() && state.quote_cost.is_some_and(|cost| cost > 0)
+                        && state.lane.is_some() && state.parked.is_some(),
+                    TrafficRepairAssertion::Applied => state.applied && state.debit.is_some_and(|cost| cost > 0) && !state.pending,
+                    TrafficRepairAssertion::Denied => state.road.is_some() && state.error.is_some() && state.quote_cost.is_none(),
+                    TrafficRepairAssertion::Junction => state.junction.is_some() && state.legal_turns > 0,
+                    TrafficRepairAssertion::Compared => state.comparison_passed.is_some(),
+                };
+                if !observed {
+                    return Err(format!("traffic repair assertion failed: {}", String::from_utf8_lossy(&JSON::encode(&state).unwrap())));
                 }
             }
             Self::HouseInspector => {
@@ -1758,9 +1875,9 @@ mod tests {
         let sim = Simulation::new_authored_flat(1, 0).unwrap();
         let uiw = UiWorld::with_defaults();
         let path = std::env::temp_dir().join(format!("egr-state-dump-{}.json", std::process::id()));
-        Automation::dump_state(&path, &uiw, &sim, &[], false).unwrap();
+        Automation::dump_state(&path, &uiw, &sim, &[], false, None).unwrap();
         let default_state = fs::read(&path).unwrap();
-        Automation::dump_state(&path, &uiw, &sim, &[], true).unwrap();
+        Automation::dump_state(&path, &uiw, &sim, &[], true, None).unwrap();
         let hashed_state = fs::read(&path).unwrap();
         fs::remove_file(path).unwrap();
         let state: BTreeMap<String, serde::de::IgnoredAny> = JSON::decode(&default_state).unwrap();
