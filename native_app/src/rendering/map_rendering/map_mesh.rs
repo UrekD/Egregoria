@@ -46,6 +46,100 @@ fn append_profiled_building(mesh: &mut MeshBuilder<false>, building: &Building) 
     true
 }
 
+fn append_building_face(
+    face: &[Vec3],
+    color: LinearColor,
+    vertices: &mut Vec<MeshVertex>,
+    add_index: &mut dyn FnMut(u32),
+) {
+    let Some((start, &origin)) = face.iter().enumerate().min_by(|(_, a), (_, b)| {
+        a.x.total_cmp(&b.x)
+            .then_with(|| a.y.total_cmp(&b.y))
+            .then_with(|| a.z.total_cmp(&b.z))
+    }) else {
+        return;
+    };
+    let ring = || face[start..].iter().chain(&face[..start]).copied();
+    // Sum from the same vertex for every rotation. Reverse the boundary normal
+    // to preserve the wall winding.
+    let area_normal = ring()
+        .zip(ring().cycle().skip(1))
+        .map(|(a, b)| (b - origin).cross(a - origin))
+        .sum::<Vec3>();
+    let mut normal = unwrap_ret!(area_normal.try_normalize());
+    if normal.z < 0.0 {
+        normal = -normal;
+    }
+    let axis = if normal.x.abs() > 0.8 {
+        Vec3::Y
+    } else {
+        Vec3::X
+    };
+    let u = unwrap_ret!(axis.cross(normal).try_normalize());
+    let v = normal.cross(u);
+
+    // Keep one projected point per mesh vertex so Earcut indices match.
+    let mut projected = Vec::with_capacity(face.len());
+    for &position in face {
+        let offset = position - origin;
+        projected.push(vec2(offset.dot(u), offset.dot(v)));
+
+        vertices.push(MeshVertex {
+            position: position.into(),
+            normal,
+            uv: [0.0; 2],
+            color: color.into(),
+            tangent: [0.0; 4],
+        });
+    }
+
+    earcut(&projected, &[], |a, b, c| {
+        add_index(a as u32);
+        add_index(b as u32);
+        add_index(c as u32);
+    });
+}
+
+#[cfg(test)]
+mod house_mesh_tests {
+    use super::*;
+
+    #[test]
+    fn merged_house_roof_keeps_rendered_area_after_vertex_rotation() {
+        // The merged roof face of the 30 m house at (131, 150), seed 1041579720.
+        let mut face = [
+            vec3(128.31593, 148.32973, 10.643467),
+            vec3(128.31593, 150.95515, 10.643467),
+            vec3(128.31593, 157.91232, 10.643467),
+            vec3(134.558, 157.91232, 4.4014063),
+            vec3(134.558, 151.47673, 4.4014063),
+            vec3(129.86346, 146.7822, 9.095937),
+        ];
+        // This 45-degree roof face covers 57.2582 square metres in plan.
+        let expected_area = 57.2582 * 2.0_f32.sqrt();
+        for shift in 0..face.len() {
+            let mut vertices = Vec::new();
+            let mut indices = Vec::new();
+            append_building_face(&face, LinearColor::WHITE, &mut vertices, &mut |index| {
+                indices.push(index as usize);
+            });
+            let mut area = 0.0;
+            for triangle in indices.chunks(3) {
+                let [a, b, c] = [triangle[0], triangle[1], triangle[2]].map(|i| vertices[i]);
+                let cross = (Vec3::from(b.position) - Vec3::from(a.position))
+                    .cross(Vec3::from(c.position) - Vec3::from(a.position));
+                assert!(a.normal.z > 0.0 && cross.dot(a.normal) >= 0.0);
+                area += cross.mag() * 0.5;
+            }
+            assert!(
+                (area - expected_area).abs() < 1e-3,
+                "rotation {shift} rendered {area} square metres, expected {expected_area}"
+            );
+            face.rotate_left(1);
+        }
+    }
+}
+
 /// This is the main struct that handles the map rendering.
 /// It is responsible for generating the meshes and sprites for the map
 /// That is, the mostly static things (roads, intersections, lights, buildings).
@@ -1785,43 +1879,7 @@ impl MapBuilders {
                 color.b = color.b * 0.65 + tint.b * 0.35;
             }
             self.houses_mesh.extend_with(None, |vertices, add_index| {
-                let o = face[1];
-                let u = unwrap_ret!((face[0] - o).try_normalize());
-                let v = unwrap_ret!((face[2] - o).try_normalize());
-
-                let mut nor = u.cross(v);
-
-                let mut reverse = false;
-
-                if nor.z < 0.0 {
-                    reverse = true;
-                    nor = -nor;
-                }
-
-                let mut projected = Polygon(Vec::with_capacity(face.len()));
-                for &p in face {
-                    let off = p - o;
-                    projected.0.push(vec2(off.dot(u), off.dot(v)));
-
-                    vertices.push(MeshVertex {
-                        position: p.into(),
-                        normal: nor,
-                        uv: [0.0; 2],
-                        color: color.into(),
-                        tangent: [0.0; 4],
-                    })
-                }
-
-                projected.simplify();
-
-                earcut(&projected.0, &[], |mut a, b, mut c| {
-                    if reverse {
-                        std::mem::swap(&mut a, &mut c);
-                    }
-                    add_index(a as u32);
-                    add_index(b as u32);
-                    add_index(c as u32);
-                })
+                append_building_face(face, color, vertices, add_index);
             });
         }
     }
