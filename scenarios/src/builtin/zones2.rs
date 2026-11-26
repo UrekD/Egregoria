@@ -1473,6 +1473,31 @@ fn zones2_staffed_frontage_teardown_replays() {
 }
 
 #[test]
+fn zones2_shopping_gate_accepts_eight_percent_reduction() {
+    let pure = Observation {
+        resident_days: 100.0,
+        external_shops: 100,
+        baskets_due: 10,
+        baskets_filled: 10,
+        housing_slots: 100.0,
+        available_jobs: 100.0,
+        filled_jobs: 100.0,
+        ..Observation::default()
+    };
+    let mut mixed = Observation {
+        external_shops: 92,
+        local_pickups: 4,
+        road_deadlines: RoadDeadlineCounts { due: 10, on_time: 10 },
+        mixed_receipt_units: 10,
+        productive_recipients: 1,
+        ..pure
+    };
+    compare_economies(&mixed, &pure).unwrap();
+    mixed.external_shops = 93;
+    assert!(compare_economies(&mixed, &pure).is_err());
+}
+
+#[test]
 fn zones2_freight_gate_counts_cancelled_loads() {
     let pure = Observation {
         resident_days: 10.0,
