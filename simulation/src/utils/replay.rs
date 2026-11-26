@@ -510,8 +510,8 @@ impl ReplayJson {
             Err(SaveLoadError::IncompatibleReplay { version })
                 if matches!(version.as_str(), "0.11.0+commands.1" | "0.11.0+commands.2") =>
             {
-                // Wave 2 only appends a command variant. JSON recordings
-                // embedded by Wave 1 have the same interpretation here.
+                // The Wave 2 command variant was appended. Both earlier P7
+                // command envelopes can still be read inside a compatible city.
                 let mut replay: Replay = JSON::decode(bytes)?;
                 replay.validate_embedded_registry()?;
                 replay.version = replay_version();
@@ -1010,8 +1010,8 @@ fn p7_replay_rejects_floor_identity_before_decoding_commands() {
     let bytes = ReplayJson::encode_sidecar(&make(&current), revision).unwrap();
     let sidecar = ReplayJson::decode_sidecar(&bytes, Some(revision)).unwrap();
     assert!(matches!(
-        sidecar.commands[0].1,
-        WorldCommand::MapUpgradeRoad { .. }
+        sidecar.commands.get(0).map(|entry| &entry.1),
+        Some(WorldCommand::MapUpgradeRoad { .. })
     ));
     let old_header: ReplayHeader = JSON::decode(&bytes).unwrap();
     assert_ne!(

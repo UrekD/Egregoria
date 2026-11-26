@@ -342,7 +342,9 @@ fn register_junction_policies() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "junction_policies",
             optional: true,
-            save: Box::new(|sim| Bincode::encode(&sim.map().save_junction_policies()).unwrap()),
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&sim.map().save_junction_policies(), output)
+            }),
             load: Box::new(|sim, data| {
                 sim.map_mut().load_junction_policies(Bincode::decode(data)?)
             }),
@@ -358,7 +360,9 @@ fn register_junction_admission() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "junction_admission",
             optional: true,
-            save: Box::new(|sim| Bincode::encode(&*sim.read::<JunctionAdmission>()).unwrap()),
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&*sim.read::<JunctionAdmission>(), output)
+            }),
             load: Box::new(|sim, data| {
                 sim.insert(Bincode::decode::<JunctionAdmission>(data)?);
                 Ok(())
@@ -372,7 +376,9 @@ fn register_lane_scoring() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "lane_scoring",
             optional: true,
-            save: Box::new(|sim| Bincode::encode(&sim.map().lane_scoring_pilot()).unwrap()),
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&sim.map().lane_scoring_pilot(), output)
+            }),
             load: Box::new(|sim, data| {
                 sim.map_mut().load_lane_scoring_pilot(Bincode::decode(data)?)
             }),
@@ -507,7 +513,9 @@ fn register_replay() {
         (*std::ptr::addr_of_mut!(SAVELOAD_FUNCS)).push(SaveLoadFunc {
             name: ReplayJson::RESOURCE_NAME,
             optional: false,
-            save: Box::new(|sim, output| ReplayJson::encode_writer(&*sim.read::<Replay>(), output)),
+            save: Box::new(|sim, output| {
+                ReplayJson::encode_writer(&*sim.read::<Replay>(), output)
+            }),
             load: Box::new(|sim, data| {
                 sim.insert(ReplayJson::decode_snapshot(data)?);
                 Ok(())

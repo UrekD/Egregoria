@@ -726,6 +726,53 @@ fn p7_edit_speed_checks_protected_deck_footprint() {
 }
 
 #[test]
+fn p7_edit_speed_accepts_a_separated_protected_deck() {
+    use crate::map::{
+        GatewayRole, LandOwnership, LandTileId, OwnedTileRect, ProtectedRoot, TileExtent,
+    };
+
+    let (mut sim, _) = road_fixture();
+    let ground = sim.map().environment().height(vec2(550.0, 560.0)).unwrap();
+    let pattern = LanePatternBuilder::new().build();
+    let [road, reserve] = [(550.0, ground), (552.0, ground + 20.0)].map(|(x, height)| {
+        sim.map_mut()
+            .make_connection(
+                MapProject::ground(vec3(x, 560.0, height)),
+                MapProject::ground(vec3(x, 730.0, height)),
+                None,
+                &pattern,
+            )
+            .unwrap()
+            .1
+    });
+    {
+        let map = sim.map();
+        let [lower, upper] = [road, reserve].map(|id| map.roads()[id].interfaced_points());
+        assert!(lower.iter().all(|p| upper.iter().all(|q| q.z - p.z >= 6.5)));
+    }
+    sim.map_mut().install_land_ownership(
+        LandOwnership::tiled(
+            TileExtent { width: 4, height: 4 },
+            OwnedTileRect {
+                origin: LandTileId { x: 1, y: 1 },
+                width: 2,
+                height: 2,
+            },
+            [ProtectedRoot::Road(GatewayRole::Highway, reserve)]
+                .into_iter()
+                .collect(),
+        )
+        .unwrap(),
+    );
+    let (command, preview) = upgrade(&sim, road, 13.0);
+    sim.apply_commands([&command]);
+    let outcomes = sim.read::<CommandOutcomes>();
+    let receipt = outcomes.road_edit(0).unwrap().as_ref().unwrap();
+    assert_eq!(receipt.status, RoadEditStatus::Applied);
+    assert_eq!(receipt.debit, preview.cost);
+}
+
+#[test]
 fn p7_traversal_snapshot_reaches_owners_beyond_the_old_prefix() {
     use crate::transportation::{Speed, Vehicle, VehicleState};
     use crate::world::VehicleEnt;

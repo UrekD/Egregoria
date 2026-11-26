@@ -235,45 +235,6 @@ impl BroadGrid {
         }
     }
 
-    fn remove_many(&mut self, handles: impl Iterator<Item = AABBGridHandle>) {
-        let mut by_cell: BTreeMap<CellIdx, Vec<AABBGridHandle>> = BTreeMap::new();
-        for handle in handles {
-            let object = self.objects.remove(handle).expect("indexed lot");
-            for cell in self.object_cells(object.obj, object.aabb).iter() {
-                by_cell.entry(cell).or_default().push(handle);
-            }
-        }
-        for (cell, handles) in by_cell {
-            if let [handle] = handles.as_slice() {
-                self.remove_cell_entry(cell, *handle);
-                continue;
-            }
-            let cell = self.storage.cell_mut_unchecked(cell);
-
-            // Find the removed entries in one scan, then replay swap-removals
-            // in input order so surviving objects keep their query order.
-            let mut positions: FastMap<_, _> =
-                handles.iter().map(|&handle| (handle, usize::MAX)).collect();
-            #[cfg(test)]
-            {
-                self.removal_scan_entries += cell.objs.len();
-            }
-            for (index, &(handle, _)) in cell.objs.iter().enumerate() {
-                if let Some(position) = positions.get_mut(&handle) {
-                    *position = index;
-                }
-            }
-            for handle in handles {
-                let index = positions[&handle];
-                let moved = cell.objs.last().unwrap().0;
-                cell.objs.swap_remove(index);
-                if let Some(position) = positions.get_mut(&moved) {
-                    *position = index;
-                }
-            }
-        }
-    }
-
     fn set_aabb(&mut self, handle: AABBGridHandle, aabb: AABB) {
         let object = &self.objects[handle];
         let old_cells = self.object_cells(object.obj, object.aabb);

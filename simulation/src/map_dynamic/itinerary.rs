@@ -1452,9 +1452,11 @@ mod tests {
     }
 
     #[test]
-    fn p7_life_alpska_cancelled_walk_physically_clears_crosswalk() {
-        use crate::map_dynamic::Destination;
+    fn p7_life_alpska_demolished_destination_physically_clears_crosswalk() {
+        use crate::map_dynamic::{Destination, RoutingStep};
+        use crate::souls::human::HumanDecisionKind;
         use crate::transportation::spawn_driving_vehicle;
+        use crate::world_command::{CommandOutcomes, WorldCommand};
         use geom::Transform;
 
         let mut ctx = TestCtx::new();
@@ -1462,6 +1464,8 @@ mod tests {
         ctx.build_roads(&[vec3(70.0, 180.0, 0.0), junction, vec3(470.0, 180.0, 0.0)]);
         ctx.build_roads(&[junction, vec3(270.0, 350.0, 0.0)]);
         let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
+        let target_house = ctx.build_house_near(vec3(420.0, 180.0, 0.0).xy());
+        let door = ctx.g.map().get(target_house).unwrap().door_pos;
         let id = spawn_human(&mut ctx.g, house).unwrap();
         let (position, destination, car_start, car_end, car_route) = {
             let map = ctx.g.map();
@@ -1503,19 +1507,33 @@ mod tests {
         let collider = put_pedestrian_in_transport_grid(&mut ctx.g.write::<TransportGrid>(), position);
         ctx.g.write::<TransportGrid>().get_mut(collider.0).unwrap().1.height = position.z;
         let tick = ctx.g.get_tick();
-        let (world, resources) = ctx.g.world_res();
-        world.edit_human(id, |human| {
+        let target = Destination::Building(target_house);
+        ctx.g.world.edit_human(id, |human| {
             human.trans.pos = position;
             human.location = Location::Outside;
-            human.router.go_to(Destination::Outside(destination));
-            human.it = Itinerary::simple(vec![destination]);
+            human.decision.kind = HumanDecisionKind::GoTo(target);
+            human.router.set_test_route(
+                target,
+                vec![RoutingStep::WalkTo(door), RoutingStep::GetInBuilding(target_house)],
+            );
+            human.it = Itinerary::simple(vec![destination, door]);
             human.collider = Some(collider);
             human.speed.0 = 1.4;
         });
-        world.edit_human(id, |human| {
-            human.router.cancel_route(&mut resources.write::<ParkingManagement>());
-            human.it = Itinerary::NONE;
-        });
+        let human = &ctx.g.world.humans[id];
+        assert_eq!(human.router.target_dest, Some(target));
+        assert!(matches!(human.router.cur_step(), Some(RoutingStep::WalkTo(point)) if *point == door));
+        assert!(human.it.get_point().is_some());
+
+        ctx.g.apply_commands([&WorldCommand::MapRemoveBuilding(target_house)]);
+        assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
+        let human = &ctx.g.world.humans[id];
+        assert_eq!(human.location, Location::Outside);
+        assert!(matches!(human.decision.kind, HumanDecisionKind::Yield));
+        assert!(human.router.target_dest.is_none());
+        assert!(!human.router.has_route_step());
+        assert!(human.it.is_missing());
+        assert_eq!(human.collider, Some(collider));
 
         update_at(&mut ctx.g, tick + 1);
         assert!(ctx.g.world.humans[id].collider.is_some());
@@ -1561,17 +1579,21 @@ mod tests {
     }
 
     #[test]
-    fn p7_life_hraska_waiting_walk_keeps_its_original_target() {
+    fn p7_life_hraska_router_retries_disconnected_walk_with_its_original_target() {
+        use crate::map_dynamic::{Destination, Router, RoutingStep};
         use crate::transportation::spawn_driving_vehicle;
+        use crate::world_command::{CommandOutcomes, WorldCommand};
         use geom::Transform;
 
         let mut ctx = TestCtx::new();
         let junction = vec3(270.0, 180.0, 0.0);
         ctx.build_roads(&[vec3(70.0, 180.0, 0.0), junction, vec3(470.0, 180.0, 0.0)]);
-        ctx.build_roads(&[junction, vec3(380.0, 350.0, 0.0)]);
+        let approach = vec3(380.0, 350.0, 0.0);
+        let far = vec3(380.0, 500.0, 0.0);
+        ctx.build_roads(&[junction, approach, far, vec3(545.0, 500.0, 0.0)]);
         let house = ctx.build_house_near(vec3(160.0, 180.0, 0.0).xy());
         let id = spawn_human(&mut ctx.g, house).unwrap();
-        let (position, destination, car_start, car_route) = {
+        let (position, destination, car_start, car_route, connector) = {
             let map = ctx.g.map();
             let crosswalk = map
                 .intersections()
@@ -1588,47 +1610,79 @@ mod tests {
                 .find(|turn| map.get(turn.id.src).unwrap().parent == crossing_road)
                 .unwrap();
             let lane = map.get(turn.id.src).unwrap();
-            let approach = lane.points.length() - 8.0;
-            let (pos, dir) = lane.points.point_dir_along(approach);
+            let approach_offset = lane.points.length() - 8.0;
+            let (pos, dir) = lane.points.point_dir_along(approach_offset);
             let car_route = Itinerary::route_between_lanes(
                 Tick(ctx.g.get_tick()),
                 &map,
-                (turn.id.src, approach),
+                (turn.id.src, approach_offset),
                 (turn.id.dst, 30.0),
             )
             .unwrap();
+            let road_at = |point: Vec3| {
+                map.roads()
+                    .values()
+                    .find(|road| road.points().middle().xy().is_close(point.xy(), 1.0))
+                    .unwrap()
+            };
+            let connector = road_at((approach + far) * 0.5).id;
+            let far_road = road_at(vec3(462.5, 500.0, 0.0));
+            let sidewalk = far_road
+                .lanes_iter()
+                .find(|(_, kind)| *kind == LaneKind::Walking)
+                .unwrap()
+                .0;
             (
                 crosswalk.points.middle(),
-                map.get(crosswalk.id.dst).unwrap().points.point_along(30.0),
+                map.get(sidewalk).unwrap().points.middle(),
                 Transform::new_dir(pos, dir),
                 car_route,
+                connector,
             )
         };
         let car_goal = car_route.end_pos().unwrap();
         let car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, car_start).unwrap();
         ctx.g.world.vehicles[car].it = car_route;
         let collider = put_pedestrian_in_transport_grid(&mut ctx.g.write::<TransportGrid>(), position);
+        ctx.g.write::<TransportGrid>().get_mut(collider.0).unwrap().1.height = position.z;
         ctx.g.world.edit_human(id, |human| {
             human.location = Location::Outside;
             human.trans.pos = position;
             human.collider = Some(collider);
-            human.speed.0 = 1.1;
-            human.it = Itinerary {
-                kind: ItineraryKind::WaitForReroute {
-                    kind: PathKind::Pedestrian,
-                    target: ItineraryTarget::Position(destination),
-                    wait_ticks: 500,
-                },
-                ..Itinerary::default()
-            };
+            human.router = Router::new(None);
+            human.router.go_to(Destination::Outside(destination));
         });
 
         let tick = ctx.g.get_tick();
+        let update_route = |sim: &mut Simulation| {
+            let (world, resources) = sim.world_res();
+            crate::map_dynamic::routing_changed_system(world, resources);
+            crate::map_dynamic::routing_update_system(world, resources);
+        };
+        update_route(&mut ctx.g);
         update_at(&mut ctx.g, tick + 1);
+        let human = &ctx.g.world.humans[id];
+        assert!(human.it.get_route().is_some());
+        assert!(matches!(human.router.cur_step(), Some(RoutingStep::WalkTo(point)) if *point == destination));
+        assert_eq!(human.trans.pos, position);
+
+        ctx.g.apply_commands([&WorldCommand::MapRemoveRoad(connector)]);
+        assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
+        ctx.g.world.edit_human(id, |human| {
+            human.router.reset_dest();
+            human.speed.0 = 1.1;
+        });
+        update_route(&mut ctx.g);
+        update_at(&mut ctx.g, tick + 2);
+        assert!(ctx.g.world.humans[id].it.is_wait_for_reroute().is_some_and(|wait| wait > 0));
+        update_at(&mut ctx.g, tick + 3);
+        let human = &ctx.g.world.humans[id];
+        assert_eq!(human.router.target_dest, Some(Destination::Outside(destination)));
+        assert_eq!(human.it.target(), Some(ItineraryTarget::Position(destination)));
         assert!(ctx.g.read::<TransportGrid>().get(collider.0).is_some());
-        assert!(ctx.g.world.humans[id].it.get_point().is_some());
-        assert_eq!(ctx.g.world.humans[id].trans.pos, position);
-        assert_eq!(ctx.g.world.humans[id].speed.0, 0.0);
+        assert!(human.it.get_point().is_some());
+        assert_eq!(human.trans.pos, position);
+        assert_eq!(human.speed.0, 0.0);
 
         let mut schedule = Simulation::schedule();
         schedule.retain_systems(|name| {
@@ -1645,11 +1699,24 @@ mod tests {
         }
         assert!(ctx.g.world.humans[id].it.is_pedestrian_egress());
         let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
-        for _ in 0..5940 {
+        for sim in [&mut ctx.g, &mut resumed] {
+            let connect = {
+                let map = sim.map();
+                WorldCommand::MapMakeConnection {
+                    from: map.project(approach, 0.0, ProjectFilter::ALL),
+                    to: map.project(far, 0.0, ProjectFilter::ALL),
+                    inter: None,
+                    pat: LanePatternBuilder::default().build(),
+                }
+            };
+            sim.apply_commands([&connect]);
+            assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        }
+        for _ in 0..24000 {
             ctx.g.tick(&mut schedule, &[]);
         }
         let mut resumed_schedule = schedule;
-        for _ in 0..5940 {
+        for _ in 0..24000 {
             resumed.tick(&mut resumed_schedule, &[]);
         }
         let human = &ctx.g.world.humans[id];

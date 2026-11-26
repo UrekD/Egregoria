@@ -940,7 +940,7 @@ fn authorize_road_deck(
             };
             budget.spend_road_work(geometry)?;
         }
-        map.authorize_land_effects(PreparedEffects::Footprint(&points))?;
+        map.authorize_existing_road_triangle(road, triangle)?;
     }
     Ok(())
 }
