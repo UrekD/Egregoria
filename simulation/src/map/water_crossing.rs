@@ -2045,8 +2045,6 @@ pub(in crate::map) fn check_roundabout_rail(
         let point = |p: Vec3| p.xy().z((p.z - ring.center.z) * radius / 3.0);
         Segment3::new(point(segment.src), point(segment.dst))
     };
-    let island = ring.island_radius() + LaneKind::Rail.width() * 0.5;
-    let center = Segment3::new(ring.center.xy().z0(), ring.center.xy().z0());
     for hit in map
         .spatial_map()
         .construction_candidates(bounds, ProjectFilter::ROAD)
@@ -2060,7 +2058,7 @@ pub(in crate::map) fn check_roundabout_rail(
         for (lane, _) in road.lanes_iter().filter(|(_, kind)| kind.is_rail()) {
             for track in map.lanes[lane].points.segments() {
                 work.charge(1)?;
-                if segments_close(center, scale(track, island), island * island) {
+                if ring.track_intersects_island(track, LaneKind::Rail.width() * 0.5) {
                     return Err(ConnectionError::RoundaboutRailConflict);
                 }
                 let track = scale(track, clearance);

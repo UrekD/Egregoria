@@ -1200,13 +1200,53 @@ impl Map {
     ) -> Result<(), ConnectionError> {
         let allowance = (*remaining).min(16_384);
         let mut budget = crate::world_command::PrepareBudget::for_preview(allowance);
-        let result =
-            super::traffic_control::check_new_rail_sweeps(self, deck, pattern.width(), &mut budget);
+        let width = pattern.width();
+        let result = super::traffic_control::check_new_rail_sweeps(self, deck, width, &mut budget)
+            .map_err(|reason| match reason {
+                crate::world_command::Rejection::RoadWorkLimit => ConnectionError::WorkLimit,
+                _ => ConnectionError::InvalidEndpoint,
+            })
+            .and_then(|()| self.authorize_roundabout_islands(deck, width, &mut budget));
         *remaining -= allowance - *budget.road_work_remaining();
-        result.map_err(|reason| match reason {
-            crate::world_command::Rejection::RoadWorkLimit => ConnectionError::WorkLimit,
-            _ => ConnectionError::InvalidEndpoint,
-        })
+        result
+    }
+
+    fn authorize_roundabout_islands(
+        &self,
+        deck: &PolyLine3,
+        width: f32,
+        budget: &mut crate::world_command::PrepareBudget,
+    ) -> Result<(), ConnectionError> {
+        if self.roundabouts.is_empty() {
+            return Ok(());
+        }
+        let mut spend = |work| {
+            budget
+                .spend_road_work(work)
+                .map_err(|_| ConnectionError::WorkLimit)
+        };
+        spend(deck.len())?;
+        let bounds = deck.bbox().flatten();
+        let half_width = width * std::f32::consts::FRAC_1_SQRT_2;
+        for &id in &self.roundabouts {
+            spend(1)?;
+            let Some(ring) = self.intersections[id].roundabout_geometry() else {
+                continue;
+            };
+            if !bounds
+                .expand(ring.island_radius() + half_width)
+                .contains(ring.center.xy())
+            {
+                continue;
+            }
+            for track in deck.segments() {
+                spend(1)?;
+                if ring.track_intersects_island(track, half_width) {
+                    return Err(ConnectionError::RoundaboutRailConflict);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn make_resolved_connection(

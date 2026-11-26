@@ -1,7 +1,7 @@
 use crate::map::{
     Intersection, IntersectionID, LaneID, LaneKind, Lanes, Road, Roads, ROAD_Z_OFFSET,
 };
-use geom::{Intersect, PolyLine3, Polygon, Radians, Segment, Shape, Vec2};
+use geom::{Intersect, PolyLine3, Polygon, Radians, Segment, Segment3, Shape, Vec2};
 use geom::{Spline, Vec3};
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -293,6 +293,18 @@ impl RoundaboutGeometry {
 
     pub fn island_radius(self) -> f32 {
         (self.radius - 3.0).max(self.radius * 0.4)
+    }
+
+    pub(in crate::map) fn track_intersects_island(self, track: Segment3, half_width: f32) -> bool {
+        let radius = self.island_radius() + half_width;
+        let scale = |point: Vec3| {
+            let relative = point - self.center;
+            relative.xy().z(relative.z * radius / 3.0)
+        };
+        Segment3::new(scale(track.src), scale(track.dst))
+            .project(Vec3::ZERO)
+            .mag2()
+            <= radius * radius
     }
 
     /// The boundary from one approach to the next in counter-clockwise order.

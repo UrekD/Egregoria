@@ -1067,6 +1067,26 @@ fn roadtools_roundabout_rejects_same_deck_track_and_allows_overpasses() {
 }
 
 #[test]
+fn roadtools_roundabout_rejects_new_track_entirely_inside_its_island() {
+    use crate::map::{ConnectionError, LanePatternBuilder, MapProject};
+
+    let (ctx, junction, _) = roundabout_fixture(&[0.0, 90.0, 180.0, 270.0], 36.0, false);
+    let mut map = ctx.g.map_mut();
+    let center = map.get(junction).unwrap().pos;
+    let pattern = LanePatternBuilder::new().rail(true).build();
+    let mut connect = |height| {
+        let a = MapProject::ground(center + vec3(0.0, -12.0, height));
+        let b = MapProject::ground(center + vec3(0.0, 12.0, height));
+        map.try_connect(a, b, None, &pattern)
+    };
+    assert!(matches!(
+        connect(0.0),
+        Err(ConnectionError::RoundaboutRailConflict)
+    ));
+    assert!(connect(14.0).is_ok());
+}
+
+#[test]
 fn roadtools_roundabout_has_shared_ring_and_connected_sidewalks() {
     for (directions, radius, slope) in [
         (&[0.0, 180.0][..], 18.0, false),
