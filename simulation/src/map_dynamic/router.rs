@@ -39,6 +39,9 @@ pub struct Router {
     pub last_error: Option<RouterError>,
     pub trip_start: Option<Tick>,
     #[inspect(skip)]
+    #[serde(skip)]
+    trip_origin: Option<Destination>,
+    #[inspect(skip)]
     pub(crate) trip_mode: TripProgress,
     pub(crate) walk_only_pickup: bool,
     replan_at_alight: bool,
@@ -188,6 +191,13 @@ fn routing_changed(
         };
         if router.trip_start.is_none() {
             router.trip_start = Some(elapsed_ticks(resources));
+            router.trip_origin = Some(match h.location {
+                Location::Building(building) => Destination::Building(building),
+                Location::Vehicle(vehicle) => Destination::Outside(
+                    world.vehicles.get(vehicle).map_or(h.trans.pos, |v| v.trans.pos),
+                ),
+                _ => Destination::Outside(h.trans.pos),
+            });
         }
 
         let mut transit_steps = None;
@@ -883,6 +893,7 @@ impl Router {
             cur_dest: None,
             last_error: None,
             trip_start: None,
+            trip_origin: None,
             trip_mode: TripProgress::Walk,
             trip_purpose: TripPurpose::Other,
             trip_employer: None,
@@ -895,6 +906,16 @@ impl Router {
 
     pub fn cur_step(&self) -> Option<&RoutingStep> {
         self.cur_step.as_ref()
+    }
+
+    pub fn trip_origin(&self) -> Option<Destination> {
+        self.trip_start.and(self.trip_origin)
+    }
+
+    pub(crate) fn restore_trip_origin(&mut self, origin: Destination) {
+        if self.trip_start.is_some() {
+            self.trip_origin = Some(origin);
+        }
     }
 
     /// `can_drive` for a car that keeps waiting for a route, evaluated again only when its
@@ -1349,6 +1370,36 @@ mod tests {
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Color};
     use prototypes::{ItemID, Money};
+
+    #[test]
+    fn vehicle_destination_mid_commute_origin_survives_save() {
+        let (mut ctx, human, car, workplace) = traffic1_stranded_driver();
+        let origin = Destination::Outside(vec3(85.0, 100.0, 0.0));
+        ctx.g.world.edit_human(human, |citizen| {
+            citizen.location = Location::Vehicle(car);
+            citizen.router.trip_start = Some(Tick(5));
+            citizen.router.trip_origin = Some(origin);
+            citizen.router.target_dest = Some(Destination::Outside(workplace));
+            citizen.router.trip_purpose = TripPurpose::Work;
+        });
+
+        let bytes = Bincode::encode(&ctx.g).unwrap();
+        let saved: crate::SimulationDeser = Bincode::decode(&bytes).unwrap();
+        let mut legacy: crate::SimulationDeser = Bincode::decode(&bytes).unwrap();
+        legacy.res.remove("trip_origins");
+        let legacy = legacy.into_sim().unwrap();
+        assert_eq!(legacy.get(human).unwrap().router.trip_start, Some(Tick(5)));
+        assert_eq!(legacy.get(human).unwrap().router.trip_origin(), None);
+
+        let restored = saved.into_sim().unwrap();
+        let citizen = restored.get(human).unwrap();
+        assert_eq!(citizen.location, Location::Vehicle(car));
+        assert_eq!(
+            citizen.router.target_dest,
+            Some(Destination::Outside(workplace))
+        );
+        assert_eq!(citizen.router.trip_origin(), Some(origin));
+    }
 
     #[test]
     fn e1_fix_replacing_a_pending_destination_resets_trip_purpose() {

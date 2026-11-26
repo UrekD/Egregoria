@@ -597,7 +597,7 @@ pub(crate) fn render_road(uiw: &UiWorld, sim: &Simulation, map: &Map, road: &Roa
         }
         if let Some(sample) = &state.sample {
             if sample.lane == lane && sample.revision == QueueRevision::current(map) {
-                render_diagnostics(sample);
+                render_diagnostics(uiw, sim, sample);
             }
         }
     });
@@ -851,7 +851,7 @@ pub(crate) fn render_junction(uiw: &UiWorld, sim: &Simulation, id: IntersectionI
     opened
 }
 
-fn render_diagnostics(sample: &DirectedSample) {
+fn render_diagnostics(uiw: &UiWorld, sim: &Simulation, sample: &DirectedSample) {
     let queue = &sample.queue;
     match queue.coverage {
         QueueCoverage::Complete | QueueCoverage::Truncated => {
@@ -868,6 +868,11 @@ fn render_diagnostics(sample: &DirectedSample) {
             on_secondary_container(),
             "Waiting for a directed traffic sample",
         ),
+    }
+    if let Some(&id) = queue.stop_line.first().filter(|&&id| sim.get(id).is_some()) {
+        if button_secondary("Inspect lead vehicle").show().clicked {
+            crate::gui::inspect::focus_entity(uiw, sim, id.into());
+        }
     }
     if let Some(turn) = queue.requested_turn {
         textc(
@@ -969,7 +974,7 @@ fn render_diagnostics(sample: &DirectedSample) {
     }
 }
 
-fn hold_label(reason: QueueHoldReason) -> &'static str {
+pub(crate) fn hold_label(reason: QueueHoldReason) -> &'static str {
     match reason {
         QueueHoldReason::Leader(_) => "Vehicle ahead",
         QueueHoldReason::Pedestrian(_) => "Pedestrian crossing",

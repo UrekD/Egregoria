@@ -150,6 +150,16 @@ pub struct ItemQuantity {
     pub units: u32,
 }
 
+/// The current physical delivery or empty return of a road freight vehicle.
+pub struct TruckLeg<'a> {
+    pub depot: BuildingID,
+    pub origin: Option<BuildingID>,
+    pub destination: BuildingID,
+    pub driver: Option<HumanID>,
+    pub returning: bool,
+    pub items: &'a [ItemQuantity],
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Endpoint {
     pub soul: SoulID,
@@ -520,6 +530,51 @@ impl CargoBook {
 
     pub fn manifest_for(&self, vehicle: VehicleID) -> Option<&TruckLoad> {
         self.loads.values().find(|load| load.vehicle == vehicle)
+    }
+
+    pub fn truck_leg(&self, vehicle: VehicleID) -> Option<TruckLeg<'_>> {
+        if let Some(fleet) = self.station_trucks.get(&vehicle) {
+            let trip = fleet.trip.as_ref()?;
+            let depot = fleet.station.building;
+            let buyer = trip.buyer.building;
+            let (origin, destination) = if trip.returning {
+                (buyer, depot)
+            } else {
+                (depot, buyer)
+            };
+            return Some(TruckLeg {
+                depot,
+                origin: Some(origin),
+                destination,
+                driver: None,
+                returning: trip.returning,
+                items: &trip.items,
+            });
+        }
+        if let Some(returning) = self.returning.get(&vehicle) {
+            let depot = returning.depot.building;
+            return Some(TruckLeg {
+                depot,
+                origin: None,
+                destination: depot,
+                driver: Some(returning.driver),
+                returning: true,
+                items: &[],
+            });
+        }
+        let load = self.manifest_for(vehicle)?;
+        Some(TruckLeg {
+            depot: load.source(),
+            origin: Some(load.source()),
+            destination: load.destination(),
+            driver: Some(load.driver),
+            returning: false,
+            items: &load.items,
+        })
+    }
+
+    pub fn station_depot(&self, vehicle: VehicleID) -> Option<BuildingID> {
+        self.station_trucks.get(&vehicle).map(|truck| truck.station.building)
     }
 
     /// Delivery outcomes and per-recipient receipts for an elapsed budget day.

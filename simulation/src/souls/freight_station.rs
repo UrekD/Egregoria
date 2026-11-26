@@ -1,12 +1,14 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use geom::{Transform, Vec3};
 use prototypes::{
-    FreightStationPrototypeID, GameTime, Tick, TICKS_PER_HOUR, TICKS_PER_REALTIME_SECOND,
+    FreightStationPrototypeID, GameTime, ItemID, Tick, TICKS_PER_HOUR, TICKS_PER_REALTIME_SECOND,
 };
 
 use crate::economy::cargo::{
-    CallManifest, CargoBook, Endpoint, FreightCallKey, FreightFailure, FreightTrace, RailLeg,
+    CallManifest, CargoBook, Endpoint, FreightCallKey, FreightFailure, FreightTrace, ItemQuantity,
+    RailLeg,
 };
 use crate::map::{BuildingID, LaneID, Map};
 use crate::map_dynamic::transit::elapsed_ticks;
@@ -47,11 +49,54 @@ pub struct FreightStation {
     /// Imported units on order by rail. A train call unloads them into the
     /// station's import stock, which its trucks carry to the buyers.
     pub wanted_cargo: u32,
+    #[inspect(skip)]
+    #[serde(skip)]
+    pub(crate) rail_trips: RailTrips,
+}
+
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct RailTrips {
+    // Kept in the save format for older vehicle inspector snapshots. P8 owns
+    // the live export inventory and does not use these waiting quantities.
+    waiting_items: BTreeMap<ItemID, u32>,
+    trains: BTreeMap<TrainID, RailTrip>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RailTrip {
+    pub dispatch_position: Vec3,
+    pub exports: Option<RailLoad>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct RailLoad {
+    pub items: Vec<ItemQuantity>,
+    pub unspecified_units: u32,
 }
 
 impl FreightStation {
     pub(crate) fn accept_export(&mut self, units: u32) {
         self.waiting_cargo = self.waiting_cargo.saturating_add(units);
+    }
+
+    pub fn rail_trip(&self, train: TrainID) -> Option<&RailTrip> {
+        self.rail_trips.trains.get(&train)
+    }
+}
+
+impl RailTrips {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.waiting_items.is_empty() && self.trains.is_empty()
+    }
+
+    pub(crate) fn discard_legacy_waiting_items(&mut self, waiting_cargo: u32) -> bool {
+        let total = self
+            .waiting_items
+            .values()
+            .map(|&units| u64::from(units))
+            .sum::<u64>();
+        self.waiting_items.clear();
+        total <= u64::from(waiting_cargo)
     }
 }
 
@@ -68,6 +113,7 @@ pub fn freight_station_soul(
         trains: Vec::with_capacity(MAX_TRAINS_PER_STATION),
         waiting_cargo: 0,
         wanted_cargo: 0,
+        rail_trips: RailTrips::default(),
     };
     let b = map.buildings.get(building)?;
 
@@ -219,6 +265,10 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
             }
         });
 
+        station
+            .rail_trips
+            .trains
+            .retain(|id, _| assignments.iter().any(|(train, _)| train == id));
         station.trains = assignments;
         if station.trains.len() >= usize::from(policy.max_calls)
             || (trace.unreserved_exports(terminal, station.waiting_cargo) < 10
@@ -293,6 +343,13 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
         train.speed.0 = 0.0;
         trace.calls.insert(id, call);
         station.trains.push((id, FreightTrainState::Arriving));
+        station.rail_trips.trains.insert(
+            id,
+            RailTrip {
+                dispatch_position: train.trans.pos,
+                exports: None,
+            },
+        );
     }
 }
 

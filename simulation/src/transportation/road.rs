@@ -1,7 +1,7 @@
 use crate::map::{Map, TrafficBehavior, Traversable, TraverseKind};
 use crate::map_dynamic::{Itinerary, Transit, OBJECTIVE_OK_DIST};
 use crate::transportation::junction_admission;
-use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason};
+use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason, QueueRevision};
 use crate::transportation::{
     ColliderOwnerLookup, Speed, TransportGrid, TransportState, TransportationGroup, Transporter,
     TraversalOwner,
@@ -19,6 +19,65 @@ use std::collections::BTreeMap;
 
 const STOPPED_SPEED: f32 = 0.2;
 const STOPPED_BLOCK_DISTANCE: f32 = 1.5;
+
+/// Describe the hold on one stopped vehicle, reusing a current traffic-repair
+/// observation when available. The fallback reads only its immediate surroundings.
+pub fn vehicle_hold_reason(
+    sim: &crate::Simulation,
+    map: &Map,
+    id: VehicleID,
+) -> Option<QueueHoldReason> {
+    let vehicle = sim.get(id)?;
+    if vehicle.speed.0.abs() > STOPPED_SPEED {
+        return None;
+    }
+    let traversal = vehicle.it.get_travers().copied();
+    if let Some(traversal) = traversal {
+        let tick = crate::diagnostics::elapsed_tick(sim).0;
+        if let Some(reason) = sim.read::<QueueDiagnostics>().recent_hold(
+            id,
+            traversal,
+            QueueRevision::current(map),
+            tick,
+        ).filter(|reason| *reason != QueueHoldReason::Unknown) {
+            return Some(reason);
+        }
+    }
+
+    vehicle.it.get_point()?;
+    if junction_admission::controls_road_decision(map, &vehicle.it, vehicle.trans.pos) {
+        // Configured admission owns this decision. Nearby vehicles and the lane
+        // sign cannot distinguish a conflict, dwell, or blocked receiving lane.
+        return Some(QueueHoldReason::Unknown);
+    }
+    let grid = sim.read::<TransportGrid>();
+    let collider = vehicle.collider?.0;
+    let (_, own_state) = grid.get(collider)?;
+    let neighbours = grid.query_around(vehicle.trans.pos.xy(), 12.0)
+        .filter(|&(handle, _)| handle != collider)
+        .filter_map(|(handle, pos)| Some((Some(handle), pos, grid.get(handle)?.1)));
+    let (distance, _, reason) = calc_front_dist(
+        &vehicle.vehicle, &vehicle.trans, own_state, &vehicle.it, neighbours, 0.8,
+    );
+    if distance < STOPPED_BLOCK_DISTANCE && reason != QueueHoldReason::Unknown {
+        return Some(reason);
+    }
+    let TraverseKind::Lane(lane) = traversal?.kind else {
+        return None;
+    };
+    let lane = map.get(lane)?;
+    let distance = lane.control_point().distance(vehicle.trans.pos);
+    match lane.control.get_behavior(sim.read::<GameTime>().seconds) {
+        TrafficBehavior::RED | TrafficBehavior::ORANGE
+            if distance <= OBJECTIVE_OK_DIST * 1.05 + 2.0
+                + (vehicle.vehicle.kind.width() * 0.5 - OBJECTIVE_OK_DIST).max(0.0) =>
+        {
+            Some(QueueHoldReason::Signal)
+        }
+        TrafficBehavior::STOP if (1.0..=5.0).contains(&distance) => Some(QueueHoldReason::StopDwell),
+        _ => None,
+    }
+}
 
 /// Finds physical wait cycles among vehicles that are still stopped at the cutoff.
 /// Each cycle is ordered by its blocker links and starts at its lowest vehicle ID.
@@ -736,5 +795,70 @@ fn p7_unruled_panic_keeps_stock_gridlock_recovery() {
         );
         assert_eq!(drive(panic(), &[leader, (crossing_pos, &crossing)]), 9.0);
         assert!(drive(panic(), &[leader, (crossing_pos, &above)]) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod vehicle_destination_tests {
+    use super::*;
+    use crate::map::{ApproachRole, JunctionRules, TrafficControl, TurnKind};
+    use crate::tests::TestCtx;
+    use crate::transportation::{spawn_driving_vehicle, VehicleKind};
+    use geom::vec3;
+
+    #[test]
+    fn vehicle_destination_configured_stop_uses_generic_hold_without_trace() {
+        let mut ctx = TestCtx::new();
+        let center = vec3(270.0, 180.0, 0.0);
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), center, vec3(470.0, 180.0, 0.0)]);
+        ctx.build_roads(&[center, vec3(270.0, 390.0, 0.0)]);
+        let (turn, road, entry, start, itinerary) = {
+            let map = ctx.g.map();
+            let intersection = map
+                .intersections()
+                .values()
+                .find(|intersection| intersection.pos.xy() == center.xy())
+                .unwrap();
+            let turn = intersection
+                .turns()
+                .find(|turn| turn.kind == TurnKind::Driving)
+                .unwrap()
+                .id;
+            let lane = map.get(turn.src).unwrap();
+            let entry = lane.control_point();
+            let start = lane.points.point_along(lane.points.length() - 3.0);
+            let itinerary = Itinerary::route_between_lanes(
+                ctx.g.read::<GameTime>().tick,
+                &map,
+                (turn.src, lane.points.length() - 3.0),
+                (turn.dst, 30.0),
+            )
+            .unwrap();
+            (turn, lane.parent, entry, start, itinerary)
+        };
+        ctx.g.map_mut().lanes[turn.src].control = TrafficControl::StopSign;
+        let vehicle = spawn_driving_vehicle(
+            &mut ctx.g,
+            VehicleKind::Car,
+            Transform::new_dir(start, (entry - start).normalize()),
+        )
+        .unwrap();
+        ctx.g.world.vehicles[vehicle].it = itinerary;
+
+        assert_eq!(
+            vehicle_hold_reason(&ctx.g, &ctx.g.map(), vehicle),
+            Some(QueueHoldReason::StopDwell)
+        );
+        let rules = JunctionRules::new(vec![(road, ApproachRole::Stop)], Vec::new()).unwrap();
+        ctx.g.map_mut().install_junction_rules(turn.parent, rules);
+        let map = ctx.g.map();
+        let itinerary = &ctx.g.get(vehicle).unwrap().it;
+        assert!(junction_admission::controls_road_decision(
+            &map, itinerary, start
+        ));
+        assert_eq!(
+            vehicle_hold_reason(&ctx.g, &map, vehicle),
+            Some(QueueHoldReason::Unknown)
+        );
     }
 }

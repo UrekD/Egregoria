@@ -1,3 +1,4 @@
+use crate::gui::selectable::VehiclePicker;
 use common::FastMap;
 use engine::meshload::load_scaled_mesh;
 use engine::{FrameContext, GfxContext, InstancedMeshBuilder, MeshInstance, SpriteBatchBuilder};
@@ -66,14 +67,23 @@ impl InstancedRender {
         }
     }
 
-    pub fn render(&mut self, sim: &Simulation, fctx: &mut FrameContext<'_>) {
+    pub(crate) fn render(
+        &mut self,
+        sim: &Simulation,
+        fctx: &mut FrameContext<'_>,
+        picker: Option<&mut VehiclePicker>,
+    ) {
         profiling::scope!("entity_render::render");
+        let mut picker = picker.and_then(|picker| picker.start_snapshot(sim).then_some(picker));
         self.cars.instances.clear();
         self.trucks.instances.clear();
         self.buses.instances.clear();
         self.pedestrians.instances.clear();
         let transit = sim.read::<Transit>();
         for (id, v) in sim.world().vehicles.iter() {
+            if let Some(picker) = picker.as_deref_mut() {
+                picker.index_road(id, v);
+            }
             let trans = &v.trans;
             let instance = MeshInstance {
                 pos: trans.pos,
@@ -98,7 +108,7 @@ impl InstancedRender {
         self.rolling_stock.iter_mut().for_each(|(_, m)| {
             m.instances.clear();
         });
-        for wagon in sim.world().wagons.values() {
+        for (id, wagon) in sim.world().wagons.iter() {
             let trans = &wagon.trans;
             let instance = MeshInstance {
                 pos: trans.pos,
@@ -107,6 +117,9 @@ impl InstancedRender {
             };
 
             if let Some(mesh) = self.rolling_stock.get_mut(&wagon.wagon.rolling_stock) {
+                if let Some(picker) = picker.as_deref_mut() {
+                    picker.index_wagon(id, wagon);
+                }
                 mesh.instances.push(instance);
             }
         }

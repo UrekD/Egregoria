@@ -28,11 +28,12 @@ use crate::map_dynamic::transit::{
 use crate::map_dynamic::{
     coverage_update, dispatch_system, electricity_flow_system, env_update, itinerary_update,
     routing_changed_system, routing_update_system, utility_flow_update, BuildingInfos,
-    CoverageGrid, Dispatcher, ElectricityFlow, EnvGrid, ParkingManagement, Transit, UtilityFlow,
+    CoverageGrid, Destination, Dispatcher, ElectricityFlow, EnvGrid, ParkingManagement, Transit,
+    UtilityFlow,
 };
 use crate::multiplayer::MultiplayerState;
 use crate::souls::events::{events_update, Fires};
-use crate::souls::freight_station::freight_station_system;
+use crate::souls::freight_station::{freight_station_system, RailTrips};
 use crate::souls::goods_company::company_system;
 use crate::souls::happiness::{happiness_update, Happiness};
 use crate::souls::household::{household_update, HouseholdClaims};
@@ -47,7 +48,10 @@ use crate::transportation::train::{
 use crate::transportation::{transport_grid_synchronize, TransportGrid, TransportState};
 use crate::utils::replay::ReplayJson;
 use crate::utils::resources::Resources;
-use crate::world::{CompanyEnt, FreightStationEnt, HumanEnt, TrainEnt, VehicleEnt, WagonEnt};
+use crate::world::{
+    CompanyEnt, FreightStationEnt, FreightStationID, HumanEnt, HumanID, TrainEnt, VehicleEnt,
+    WagonEnt,
+};
 use crate::World;
 use crate::{
     add_souls_to_empty_buildings, utils, ParCommandBuffer, RandProvider, Replay, RunnableSystem,
@@ -76,6 +80,48 @@ mod tests {
     use std::path::PathBuf;
     use std::process::Command;
     use std::time::{Duration, SystemTime};
+
+    #[test]
+    fn vehicle_destination_save_checks_rail_waiting_totals() {
+        use crate::souls::freight_station::{FreightStation, RailTrip};
+        use crate::world::{FreightStationEnt, TrainID};
+        use crate::SimulationDeser;
+        use common::saveload::{Bincode, Encoder};
+        use prototypes::{FreightStationPrototypeID, ItemID};
+        use std::collections::BTreeMap;
+
+        let mut ctx = crate::tests::TestCtx::new();
+        let station = ctx.g.world.insert(FreightStationEnt {
+            f: FreightStation {
+                proto: FreightStationPrototypeID::new("freight-station"),
+                building: Default::default(),
+                trains: Vec::new(),
+                waiting_cargo: u32::MAX,
+                wanted_cargo: 0,
+                rail_trips: Default::default(),
+            },
+            trans: geom::Transform::new(geom::Vec3::ZERO),
+        });
+        let with_items = |items| {
+            let bytes = Bincode::encode(&ctx.g).unwrap();
+            let mut saved: SimulationDeser = Bincode::decode(&bytes).unwrap();
+            let rail_trips =
+                BTreeMap::from([(station, (items, BTreeMap::<TrainID, RailTrip>::new()))]);
+            saved.res.insert(
+                "rail_trips".to_owned(),
+                Bincode::encode(&rail_trips).unwrap(),
+            );
+            saved.into_sim()
+        };
+        let first = ItemID::new("goods");
+        let second = ItemID::new("wood");
+        assert!(with_items(BTreeMap::from([(first, u32::MAX - 2), (second, 1)])).is_ok());
+        let bad = with_items(BTreeMap::from([(first, u32::MAX), (second, 1)]));
+        assert!(
+            matches!(bad, Err(crate::SaveLoadError::Corrupt { reason, .. })
+            if reason.contains("rail_trips") && reason.contains("waiting cargo"))
+        );
+    }
 
     #[test]
     fn startup_sweeps_old_staging_files_from_the_configured_save_dir() {
@@ -269,6 +315,8 @@ fn register_systems_and_resources() {
     register_lot_layout();
     register_road_frontage();
     register_cargo_progress();
+    register_rail_trips();
+    register_trip_origins();
 }
 
 fn register_utility_water_sample() {
@@ -538,6 +586,65 @@ fn register_cargo_progress() {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, message)
                     })?;
                     sim.resources.insert(trace);
+                }
+                Ok(())
+            }),
+        });
+    }
+}
+
+// Preserve inspector trip origins and the optional pre-P8 inspector save data.
+fn register_rail_trips() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "rail_trips",
+            optional: true,
+            save: Box::new(|sim, output| {
+                let trips: BTreeMap<_, _> = sim.world().freight_stations.iter()
+                    .filter(|(_, station)| !station.f.rail_trips.is_empty())
+                    .map(|(id, station)| (id, &station.f.rail_trips))
+                    .collect();
+                Bincode::encode_writer(&trips, output)
+            }),
+            load: Box::new(|sim, data| {
+                let trips: BTreeMap<FreightStationID, RailTrips> = Bincode::decode(data)?;
+                for (id, mut trips) in trips {
+                    if let Some(station) = sim.world.freight_stations.get_mut(id) {
+                        if !trips.discard_legacy_waiting_items(station.f.waiting_cargo) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("Itemized waiting cargo exceeds waiting cargo at {id:?}"),
+                            ));
+                        }
+                        station.f.rail_trips = trips;
+                    }
+                }
+                Ok(())
+            }),
+        });
+    }
+}
+
+// Keep the positional Bincode encoding of Router compatible with existing saves.
+fn register_trip_origins() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "trip_origins",
+            optional: true,
+            save: Box::new(|sim, output| {
+                let origins: BTreeMap<_, _> = sim
+                    .world()
+                    .humans
+                    .iter()
+                    .filter_map(|(id, human)| Some((id, human.router.trip_origin()?)))
+                    .collect();
+                Bincode::encode_writer(&origins, output)
+            }),
+            load: Box::new(|sim, data| {
+                let origins: BTreeMap<HumanID, Destination> = Bincode::decode(data)?;
+                for (id, origin) in origins {
+                    sim.world
+                        .edit_human(id, |human| human.router.restore_trip_origin(origin));
                 }
                 Ok(())
             }),
