@@ -1,5 +1,5 @@
 use super::network::{
-    calibrate_storage, clean_network, connect_infill, curve, finish_network, main_components,
+    calibrate_storage, clean_network, connect_infill, curve, finish_network, fit, main_components,
     move_junction, retire_outer_road_fragments, segment_parameters, Graph, JunctionSpec, LinkSpec,
     RoadClass, SourceKey, SpacingLimits,
 };
@@ -1301,6 +1301,17 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
         }
     }
     round_hraska_school_bend(&mut plan.graph);
+    let fuel_frontage = SourceKey::Way { id: 72625754, span: 0 };
+    if plan.graph.links.contains_key(&fuel_frontage) {
+        let turnaround = SourceKey::Authored("coal-turnaround");
+        let south = SourceKey::Authored("coal-loading-frontage");
+        split_wet_road(&mut plan.graph, fuel_frontage, turnaround, south)?;
+        plan.graph.junctions.get_mut(&turnaround).unwrap().turn.back_turns = true;
+        plan.graph.record(
+            "provide a turnaround near the plant on the coal delivery road",
+            &[fuel_frontage, turnaround, south],
+        );
+    }
     let hraska_egress = SourceKey::Node {
         id: 4193639666,
         rail: false,
@@ -1401,39 +1412,59 @@ fn connect_south_walk(graph: &mut Graph) -> Result<(), String> {
         link.points[endpoint] = local.position.xy();
         link.realigned = true;
     }
-    let north = graph.links.get_mut(&avenue).ok_or("missing South Alpska avenue")?;
-    let [start, end] = north.points.as_slice() else {
-        return Err("South Alpska footpath needs the straight avenue alignment".into());
-    };
-    let point = (*start + *end) * 0.5;
-    let direction = *end - *start;
-    let along = |sample: Vec2| (sample - point).dot(direction);
-    let cut = north.samples.partition_point(|&sample| along(sample) < 0.0);
-    let (Some(&before), Some(&after)) = (
-        cut.checked_sub(1).and_then(|i| north.samples.get(i)),
-        north.samples.get(cut),
-    ) else {
-        return Err("South Alpska source samples do not span the new crossing".into());
-    };
-    let seam = before + (after - before) * (along(before) / (along(before) - along(after)));
-    let mut south = north.clone();
-    south.key = SourceKey::Authored("south-alpska-avenue");
-    south.samples = north.samples.split_off(cut);
-    south.samples.insert(0, seam);
-    south.points[0] = point;
-    south.endpoints[0] = crossing;
-    north.samples.push(seam);
-    north.points[1] = point;
-    north.endpoints[1] = crossing;
-    let mut junction = JunctionSpec::new(crossing, point);
-    junction.light = LightPolicy::NoLights;
-    graph.junctions.insert(crossing, junction);
-    graph.links.insert(south.key, south);
+    split_wet_road(graph, avenue, crossing, SourceKey::Authored("south-alpska-avenue"))?;
     add_authored_road(graph, walk, [west, crossing], RoadClass::Walk, None, 0);
     graph.record(
         "connect South homes and shops to the Alpska sidewalks",
         &[west, crossing, avenue, walk],
     );
+    Ok(())
+}
+
+fn split_wet_road(
+    graph: &mut Graph,
+    road: SourceKey,
+    crossing: SourceKey,
+    tail: SourceKey,
+) -> Result<(), String> {
+    let north = graph.links.get_mut(&road).ok_or_else(|| format!("missing wet approach {road:?}"))?;
+    let start = north.points[0];
+    let end = *north.points.last().unwrap();
+    let middle = (start + end) * 0.5;
+    let direction = end - start;
+    let along = |sample: Vec2| (sample - middle).dot(direction);
+    let split = |points: &[Vec2]| {
+        let cut = points.partition_point(|&sample| along(sample) < 0.0);
+        let before = *points.get(cut.checked_sub(1)?)?;
+        let after = *points.get(cut)?;
+        let seam = before + (after - before) * (along(before) / (along(before) - along(after)));
+        Some((cut, seam))
+    };
+    let (cut, point) = split(&north.points).ok_or_else(|| format!("no centreline split on {road:?}"))?;
+    let (source_cut, seam) = split(&north.samples)
+        .ok_or_else(|| format!("source samples for {road:?} do not span the new junction"))?;
+    let mut south = north.clone();
+    south.key = tail;
+    south.samples = north.samples.split_off(source_cut);
+    south.samples.insert(0, seam);
+    south.points = north.points.split_off(cut);
+    south.points.insert(0, point);
+    south.endpoints[0] = crossing;
+    north.samples.push(seam);
+    north.points.push(point);
+    north.endpoints[1] = crossing;
+    for link in [north, &mut south] {
+        let (elbow, points, error) = fit(&link.points, 3.0);
+        if error > 3.0 {
+            return Err(format!("wet junction changed the alignment on {:?} by {error:.1} m", link.key));
+        }
+        link.elbow = elbow;
+        link.points = points;
+    }
+    let mut junction = JunctionSpec::new(crossing, point);
+    junction.light = LightPolicy::NoLights;
+    graph.junctions.insert(crossing, junction);
+    graph.links.insert(south.key, south);
     Ok(())
 }
 

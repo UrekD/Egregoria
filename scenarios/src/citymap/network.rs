@@ -538,7 +538,7 @@ pub(super) fn curve(from: Vec2, to: Vec2, elbow: Vec2) -> Spline {
     }
 }
 
-fn fit(points: &[Vec2], envelope: f32) -> (Option<Vec2>, Vec<Vec2>, f32) {
+pub(super) fn fit(points: &[Vec2], envelope: f32) -> (Option<Vec2>, Vec<Vec2>, f32) {
     let a = points[0];
     let b = *points.last().unwrap();
     let mut best = (None, vec![a, b], deviation(points, &[a, b]));
