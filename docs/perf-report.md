@@ -13,27 +13,28 @@
 3. In the **Frame Profile** window, click **Save JSON report** shortly after the slowdown. Attach the `frame-profile.json` file from the path shown in the window. A standard install writes it under `world` in the game folder. Saving again replaces the previous report.
 4. Close the game when finished. To turn profiling off for future launches from that PowerShell window, run `Remove-Item Env:EGREGORIA_FRAME_PROFILE`.
 
-The report keeps up to 600 presented frames and includes your adapter, graphics settings, resolution, save slot ID, timings, and completed simulation steps. A GPU that lacks timestamp support still produces a CPU report. You can set the variable to `cpu` if you need to collect CPU timings alone.
+The report keeps up to 600 presented frames and includes your adapter, graphics settings, resolution, save slot ID, timings, and completed simulation steps. GPU timing needs a backend with timestamp queries and nonblocking query resolve. The OpenGL backend and adapters without both capabilities produce CPU reports. You can set the variable to `cpu` to collect CPU timings alone.
 
 ## Reading the report
 
 - `cpu_phases` and `gpu_passes` give the column order for each frame's timing arrays. Times are in milliseconds. A missing pass or result is `null`. `gpu_status` explains whole-frame GPU gaps, including busy readback slots and results still pending at export.
-- `present_interval_ms` measures wall time between successful present calls and includes skipped redraws. It measures application pacing. The simulation rate uses completed steps over wall time, with 50 steps/s equal to 1×.
-- The CPU encode span can overlap UI when parallel rendering is enabled. The main GPU pass includes water draws. PBR stages and UI blur each span their constituent subpasses. Yakui needs optional encoder timestamps and may be absent on some adapters.
+- `present_interval_ms` measures wall time between successful present calls and includes skipped redraws. `sim_sample_ms` is the monotonic time when the paired `sim_step` counter was read, relative to the first recorded simulation sample of the session. `sim_steps_per_second` uses changes in those paired samples over intervals of at least 500 ms. A rate of 50 steps/s is 1×.
+- `encode_jobs` sums elapsed times for scene encoding jobs, including encoder setup, deferred work, and finalization. Parallel jobs can overlap each other and `ui_build_encode`, so their summed duration can exceed the frame's wall time. `map_mesh` includes terrain packing and uploads, heightmap regeneration commands, road meshes, and lamp preparation. `world_prep` covers the surrounding update work.
+- `lamp_update`, `heightmap_resample`, and `heightmap_normals` appear when the renderer rebuilds those resources, such as after loading a city or editing roads or terrain. The main GPU pass includes water draws. PBR stages and UI blur each span their constituent subpasses. Yakui needs optional encoder timestamps and may be absent on some adapters.
 
 ## llvmpipe baseline
 
-The release build ran on llvmpipe Vulkan (Mesa 26.0.3, LLVM 21.1.8) in a 1280 × 720 window with VSync enabled. The capture reloads each save for each preset, warms up for 10 frames at MAX, then measures 60 fixed-view frames and 60 frames of panning and zooming. The weak preset disables shadows and SSAO. MSAA is off in both presets. [Capture script](../scripts/shots/rusty_skylines_frame_probe.json)
+The release build ran on llvmpipe Vulkan (Mesa 26.0.3, LLVM 21.1.8) in a 1280 × 720 window with VSync enabled. The capture reloads each save for each preset, warms up for 10 frames at MAX, then measures 60 fixed-view frames and 60 frames of panning and zooming. The weak preset disables shadows and SSAO. MSAA is off in both presets. [Capture script](../scripts/shots/frame_profile_probe.json)
 
 | Save | View | Preset | CPU p95 (ms) | Present p99 (ms) | Main GPU median (ms) | Steps/s |
 | --- | --- | --- | ---: | ---: | ---: | ---: |
-| Lesce OSM | Fixed | Default | 1,064.0 | 1,224.0 | 191.4 | 732.4 |
-| Lesce OSM | Fixed | Weak | 465.5 | 550.4 | 158.5 | 571.8 |
-| Lesce OSM | Pan and zoom | Default | 1,088.7 | 1,180.3 | 202.4 | 658.1 |
-| Lesce OSM | Pan and zoom | Weak | 511.8 | 529.7 | 192.5 | 676.5 |
-| Showcase City | Fixed | Default | 854.7 | 1,139.9 | 186.9 | 2,599.5 |
-| Showcase City | Fixed | Weak | 436.7 | 462.7 | 159.9 | 2,031.5 |
-| Showcase City | Pan and zoom | Default | 937.8 | 1,194.0 | 181.8 | 2,564.5 |
-| Showcase City | Pan and zoom | Weak | 577.8 | 757.3 | 170.7 | 2,229.0 |
+| Lesce OSM | Fixed | Default | 2,809.9 | 5,267.8 | 496.4 | 401.7 |
+| Lesce OSM | Fixed | Weak | 1,647.0 | 2,011.8 | 409.7 | 306.0 |
+| Lesce OSM | Pan and zoom | Default | 2,366.4 | 2,969.0 | 614.9 | 365.6 |
+| Lesce OSM | Pan and zoom | Weak | 1,050.2 | 1,113.0 | 393.1 | 433.1 |
+| Showcase City | Fixed | Default | 2,079.4 | 2,343.7 | 469.9 | 1,646.2 |
+| Showcase City | Fixed | Weak | 1,017.9 | 1,855.0 | 324.9 | 1,460.5 |
+| Showcase City | Pan and zoom | Default | 2,323.4 | 8,495.6 | 428.6 | 1,555.2 |
+| Showcase City | Pan and zoom | Weak | 1,547.6 | 2,716.6 | 334.3 | 1,422.3 |
 
-All 480 frames returned GPU timestamps for the passes enabled in their preset. Steps/s uses the change in completed steps divided by elapsed wall time over each capture. CPU frame time includes time spent in graphics API calls. These are single-run software-renderer measurements on a shared host.
+All 480 frames returned GPU timestamps for the passes enabled in their preset. Steps/s uses the change in `sim_step` divided by the change in `sim_sample_ms`, converted to seconds, between the first and last frames of each capture. CPU frame time includes time spent in graphics API calls. These are single-run software-renderer measurements on a shared host.

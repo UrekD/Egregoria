@@ -1,11 +1,12 @@
+use crate::frame_profile::{FrameProfile, GpuPass};
 use crate::pbuffer::PBuffer;
 use crate::{compile_shader, Texture, TextureBuilder};
 use common::FastMap;
 use geom::Vec3;
 use ordered_float::OrderedFloat;
 use wgpu::{
-    BufferUsages, CommandEncoder, ComputePassDescriptor, Device, Queue, TextureFormat,
-    TextureUsages,
+    BufferUsages, CommandEncoder, ComputePassDescriptor, ComputePassTimestampWrites, Device,
+    Queue, TextureFormat, TextureUsages,
 };
 
 #[derive(Clone, Copy, Debug)]
@@ -219,6 +220,16 @@ impl LampLights {
     }
 
     pub fn apply_changes(&mut self, queue: &Queue, device: &Device, encoder: &mut CommandEncoder) {
+        self.apply_changes_profiled(queue, device, encoder, None);
+    }
+
+    pub(crate) fn apply_changes_profiled(
+        &mut self,
+        queue: &Queue,
+        device: &Device,
+        encoder: &mut CommandEncoder,
+        profile: Option<&FrameProfile>,
+    ) {
         if self.pending_changes.is_empty() {
             return;
         }
@@ -233,7 +244,13 @@ impl LampLights {
 
         let mut compute = encoder.begin_compute_pass(&ComputePassDescriptor {
             label: Some("lamp lights update"),
-            timestamp_writes: None,
+            timestamp_writes: profile
+                .and_then(|profile| profile.timestamp_writes(GpuPass::LampUpdate, true, true))
+                .map(|writes| ComputePassTimestampWrites {
+                    query_set: writes.query_set,
+                    beginning_of_pass_write_index: writes.beginning_of_pass_write_index,
+                    end_of_pass_write_index: writes.end_of_pass_write_index,
+                }),
         });
 
         compute.set_pipeline(&self.texture_write_pipeline);

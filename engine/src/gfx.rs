@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
@@ -264,6 +265,20 @@ impl<'a> FrameContext<'a> {
     }
 }
 
+struct EncodeJobs(Option<AtomicU64>);
+
+impl EncodeJobs {
+    fn measure<T>(&self, job: impl FnOnce() -> T) -> T {
+        let Some(nanos) = &self.0 else {
+            return job();
+        };
+        let start = Instant::now();
+        let result = job();
+        nanos.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        result
+    }
+}
+
 impl GfxContext {
     pub async fn new(window: Arc<Window>) -> Self {
         let mut backends = backend_bits_from_env().unwrap_or_else(Backends::all);
@@ -297,8 +312,13 @@ impl GfxContext {
 
         let limit = wgpu::Limits::default();
         let profile_mode = ProfileMode::from_env();
-        let required_features = if matches!(profile_mode, Some(ProfileMode::CpuAndGpu)) {
-            timestamp_features(true, adapter.features())
+        let required_features = if profile_mode.is_some() {
+            timestamp_features(
+                profile_mode,
+                adapter.features(),
+                adapter.get_info().backend,
+                adapter.get_downlevel_capabilities().flags,
+            )
         } else {
             wgpu::Features::empty()
         };
@@ -746,8 +766,12 @@ impl GfxContext {
         }
 
         self.render_params.upload_to_gpu(&self.queue);
-        self.lamplights
-            .apply_changes(&self.queue, &self.device, &mut before_main);
+        self.lamplights.apply_changes_profiled(
+            &self.queue,
+            &self.device,
+            &mut before_main,
+            self.frame_profile.as_deref(),
+        );
 
         (
             Encoders {
@@ -805,50 +829,61 @@ impl GfxContext {
 
         let mut gui_elapsed = 0.0;
 
+        let encode = EncodeJobs(self.frame_profile.is_some().then(AtomicU64::default));
+        let pbr = || encode.measure(|| self.pbr_prepass());
+        let depth = || encode.measure(|| self.depth_prepass(objsref));
+        let main = || encode.measure(|| self.main_render_pass(target, objsref));
+        let before_main = |encoder: &mut CommandEncoder| {
+            encode.measure(|| {
+                passes::render_ssao(self, encoder);
+                passes::render_fog(self, encoder);
+            });
+        };
+        let after_main = |encoder: &mut CommandEncoder| {
+            encode.measure(|| {
+                passes::render_background(self, encoder, target);
+                passes::gen_ui_blur(self, encoder, target);
+            });
+        };
         let parallel = self.settings.is_some_and(|v| v.parallel_render);
         if parallel {
             rayon::in_place_scope(|scope| {
                 scope.spawn(|_| {
-                    encs.pbr = self.pbr_prepass();
+                    encs.pbr = pbr();
                 });
                 scope.spawn(|_| {
-                    encs.depth_prepass = Some(self.depth_prepass(objsref));
+                    encs.depth_prepass = Some(depth());
                 });
                 scope.spawn(|_| {
                     use rayon::prelude::*;
                     if self.render_params.value().shadow_mapping_resolution != 0 {
-                        encs.smap = self.shadow_map_pass(objsref).par_bridge().collect();
+                        encs.smap = self.shadow_map_pass(objsref, &encode).par_bridge().collect();
                     }
                 });
                 scope.spawn(|_| {
-                    passes::render_ssao(self, &mut encs.before_main);
-                    passes::render_fog(self, &mut encs.before_main);
-
-                    passes::render_background(self, &mut encs.after_main, target);
-                    passes::gen_ui_blur(self, &mut encs.after_main, target);
+                    before_main(&mut encs.before_main);
+                    after_main(&mut encs.after_main);
                 });
 
                 if !defer_main {
                     scope.spawn(|_| {
-                        encs.main = Some(self.main_render_pass(target, objsref));
+                        encs.main = Some(main());
                     });
                 }
 
                 (gui_elapsed, encs.gui) = self.render_gui(target, state, render_gui);
             });
         } else {
-            encs.pbr = self.pbr_prepass();
-            encs.depth_prepass = Some(self.depth_prepass(objsref));
+            encs.pbr = pbr();
+            encs.depth_prepass = Some(depth());
             if self.render_params.value().shadow_mapping_resolution != 0 {
-                encs.smap = self.shadow_map_pass(objsref).collect();
+                encs.smap = self.shadow_map_pass(objsref, &encode).collect();
             }
-            passes::render_ssao(self, &mut encs.before_main);
-            passes::render_fog(self, &mut encs.before_main);
+            before_main(&mut encs.before_main);
             if !defer_main {
-                encs.main = Some(self.main_render_pass(target, objsref));
+                encs.main = Some(main());
             }
-            passes::render_background(self, &mut encs.after_main, target);
-            passes::gen_ui_blur(self, &mut encs.after_main, target);
+            after_main(&mut encs.after_main);
             (gui_elapsed, encs.gui) = self.render_gui(target, state, render_gui);
         }
 
@@ -857,15 +892,9 @@ impl GfxContext {
         }
 
         let render_elapsed = start_time.elapsed();
-        if let Some(profile) = &mut self.frame_profile {
-            let ui = Duration::from_secs_f32(gui_elapsed);
-            let encode = if parallel {
-                render_elapsed
-            } else {
-                render_elapsed.saturating_sub(ui)
-            };
-            profile.record_cpu(CpuPhase::Ui, ui);
-            profile.record_cpu(CpuPhase::Encode, encode);
+        if let (Some(profile), Some(nanos)) = (&mut self.frame_profile, encode.0) {
+            profile.record_cpu(CpuPhase::Ui, Duration::from_secs_f32(gui_elapsed));
+            profile.record_cpu(CpuPhase::Encode, Duration::from_nanos(nanos.into_inner()));
         }
         (render_elapsed.as_secs_f32(), gui_elapsed)
     }
@@ -978,17 +1007,20 @@ impl GfxContext {
     fn shadow_map_pass<'a>(
         &'a self,
         objsref: &'a [Box<dyn Drawable>],
+        encode: &'a EncodeJobs,
     ) -> impl Iterator<Item = CommandBuffer> + 'a {
         self.sun_params.iter().enumerate().map(move |(i, u)| {
-            profiling::scope!(&format!("cascade shadow pass {}", i));
-            let mut smap_enc = self
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("shadow map encoder"),
-                });
-            let sun_view = self.sun_shadowmap.layer_view(i as u32);
-            self.shadow_map_one_pass(i, u, objsref, &sun_view, &mut smap_enc);
-            smap_enc.finish()
+            encode.measure(|| {
+                profiling::scope!(&format!("cascade shadow pass {}", i));
+                let mut smap_enc = self
+                    .device
+                    .create_command_encoder(&CommandEncoderDescriptor {
+                        label: Some("shadow map encoder"),
+                    });
+                let sun_view = self.sun_shadowmap.layer_view(i as u32);
+                self.shadow_map_one_pass(i, u, objsref, &sun_view, &mut smap_enc);
+                smap_enc.finish()
+            })
         })
     }
 

@@ -1,14 +1,14 @@
 use std::collections::VecDeque;
 use std::ops::Range;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use wgpu::{
-    Buffer, BufferAsyncError, BufferDescriptor, BufferUsages, CommandEncoder, Device, Features,
-    MapMode, QuerySet, RenderPassTimestampWrites,
+    Backend, Buffer, BufferAsyncError, BufferDescriptor, BufferUsages, CommandEncoder, Device,
+    DownlevelFlags, Features, MapMode, QuerySet, RenderPassTimestampWrites,
 };
 
 use crate::GfxSettings;
@@ -37,8 +37,17 @@ impl ProfileMode {
     }
 }
 
-pub(crate) fn timestamp_features(enabled: bool, supported: Features) -> Features {
-    if enabled && supported.contains(Features::TIMESTAMP_QUERY) {
+pub(crate) fn timestamp_features(
+    mode: Option<ProfileMode>,
+    supported: Features,
+    backend: Backend,
+    downlevel: DownlevelFlags,
+) -> Features {
+    if matches!(mode, Some(ProfileMode::CpuAndGpu))
+        && backend != Backend::Gl
+        && downlevel.contains(DownlevelFlags::NONBLOCKING_QUERY_RESOLVE)
+        && supported.contains(Features::TIMESTAMP_QUERY)
+    {
         supported & (Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS)
     } else {
         Features::empty()
@@ -67,8 +76,8 @@ impl CpuPhase {
         "map_mesh",
         "instances",
         "water",
-        "ui",
-        "encode",
+        "ui_build_encode",
+        "encode_jobs",
         "submit",
         "present",
     ];
@@ -92,6 +101,9 @@ pub(crate) enum GpuPass {
     #[cfg_attr(not(feature = "yakui"), allow(dead_code))]
     Yakui,
     Egui,
+    LampUpdate,
+    HeightmapResample,
+    HeightmapNormals,
 }
 
 impl GpuPass {
@@ -104,7 +116,7 @@ impl GpuPass {
     }
 }
 
-pub const GPU_PASS_LABELS: [&str; 15] = [
+pub const GPU_PASS_LABELS: [&str; 18] = [
     "depth",
     "pbr_environment",
     "pbr_irradiance",
@@ -120,6 +132,9 @@ pub const GPU_PASS_LABELS: [&str; 15] = [
     "ui_blur",
     "yakui",
     "egui",
+    "lamp_update",
+    "heightmap_resample",
+    "heightmap_normals",
 ];
 
 type GpuTimes = [Option<f64>; GpuPass::COUNT];
@@ -150,9 +165,18 @@ pub struct FrameSample {
     pub surface_present_mode: &'static str,
     pub graphics: GfxSettings,
     pub sim_step: Option<u64>,
+    pub sim_sample_ms: Option<f64>,
     pub requested_warp: Option<u32>,
     pub sim_steps_per_second: Option<f64>,
     pub pending_water_chunks: Option<usize>,
+}
+
+#[derive(Clone, Copy)]
+struct SimObservation {
+    at: Instant,
+    generation: u64,
+    step: u64,
+    warp: u32,
 }
 
 #[derive(Default)]
@@ -188,23 +212,29 @@ pub struct FrameProfile {
     last_present: Option<Instant>,
     first_present: Option<Instant>,
     skipped: u64,
-    sim: Option<(u64, u64, u32)>,
+    sim: Option<SimObservation>,
+    first_sim_sample: Option<Instant>,
     sim_rate: SimRate,
     pub pending_water_chunks: Option<usize>,
 }
 
 impl FrameProfile {
     pub(crate) fn new(mode: ProfileMode, device: &Device, queue: &wgpu::Queue) -> Self {
+        let gpu = device
+            .features()
+            .contains(Features::TIMESTAMP_QUERY)
+            .then(|| GpuProfile::new(device, queue));
+        Self::with_gpu(mode, gpu)
+    }
+
+    fn with_gpu(mode: ProfileMode, gpu: Option<GpuProfile>) -> Self {
         let unavailable = match mode {
             ProfileMode::Cpu => GpuStatus::CpuOnly,
             ProfileMode::CpuAndGpu => GpuStatus::Unsupported,
         };
         Self {
             samples: VecDeque::with_capacity(HISTORY_FRAMES),
-            gpu: device
-                .features()
-                .contains(Features::TIMESTAMP_QUERY)
-                .then(|| GpuProfile::new(device, queue)),
+            gpu,
             unavailable,
             current_gpu: unavailable,
             cpu: [None; CpuPhase::LABELS.len()],
@@ -212,6 +242,7 @@ impl FrameProfile {
             first_present: None,
             skipped: 0,
             sim: None,
+            first_sim_sample: None,
             sim_rate: SimRate::default(),
             pending_water_chunks: None,
         }
@@ -238,6 +269,7 @@ impl FrameProfile {
         self.last_present = None;
         self.first_present = None;
         self.skipped = 0;
+        self.first_sim_sample = None;
         self.sim_rate = SimRate::default();
         self.begin_redraw();
     }
@@ -247,21 +279,27 @@ impl FrameProfile {
         self.sim = None;
         self.pending_water_chunks = None;
         self.current_gpu = self.unavailable;
+        self.start_gpu();
     }
 
     pub(crate) fn skip_redraw(&mut self) {
         self.skipped += 1;
     }
 
-    pub fn record_sim(&mut self, generation: u64, completed_step: u64, warp: u32) {
-        self.sim = Some((generation, completed_step, warp));
+    pub fn record_sim(&mut self, observed_at: Instant, generation: u64, step: u64, warp: u32) {
+        self.sim = Some(SimObservation {
+            at: observed_at,
+            generation,
+            step,
+            warp,
+        });
     }
 
     pub(crate) fn record_cpu(&mut self, phase: CpuPhase, elapsed: Duration) {
         *self.cpu[phase as usize].get_or_insert(0.0) += elapsed.as_secs_f64() * 1000.0;
     }
 
-    pub(crate) fn start_gpu(&mut self) {
+    fn start_gpu(&mut self) {
         if let Some(gpu) = &mut self.gpu {
             self.current_gpu = if gpu.begin() {
                 GpuStatus::Pending
@@ -281,8 +319,9 @@ impl FrameProfile {
         if !begin && !end {
             return None;
         }
-        slot.written.fetch_or(1 << pass.index(), Ordering::Relaxed);
         let index = pass.index() as u32 * 2;
+        let endpoints = u64::from(begin) | (u64::from(end) << 1);
+        slot.written.fetch_or(endpoints << index, Ordering::Relaxed);
         Some(RenderPassTimestampWrites {
             query_set: &slot.queries,
             beginning_of_pass_write_index: begin.then_some(index),
@@ -296,8 +335,9 @@ impl FrameProfile {
             return;
         };
         if let Some(slot) = gpu.active() {
-            slot.written.fetch_or(1 << pass.index(), Ordering::Relaxed);
-            encoder.write_timestamp(&slot.queries, pass.index() as u32 * 2 + u32::from(end));
+            let index = pass.index() as u32 * 2 + u32::from(end);
+            slot.written.fetch_or(1 << index, Ordering::Relaxed);
+            encoder.write_timestamp(&slot.queries, index);
         }
     }
 
@@ -325,9 +365,13 @@ impl FrameProfile {
             .replace(now)
             .map(|last| (now - last).as_secs_f64() * 1000.0);
         let elapsed_ms = (now - *self.first_present.get_or_insert(now)).as_secs_f64() * 1000.0;
+        let sim_sample_ms = self.sim.map(|sim| {
+            let first = *self.first_sim_sample.get_or_insert(sim.at);
+            (sim.at - first).as_secs_f64() * 1000.0
+        });
         let sim_steps_per_second = self
             .sim
-            .and_then(|(generation, step, _)| self.sim_rate.observe(now, generation, step));
+            .and_then(|sim| self.sim_rate.observe(sim.at, sim.generation, sim.step));
         if self.samples.len() == HISTORY_FRAMES {
             self.samples.pop_front();
         }
@@ -343,8 +387,9 @@ impl FrameProfile {
             resolution,
             surface_present_mode,
             graphics,
-            sim_step: self.sim.map(|(_, step, _)| step),
-            requested_warp: self.sim.map(|(_, _, warp)| warp),
+            sim_step: self.sim.map(|sim| sim.step),
+            sim_sample_ms,
+            requested_warp: self.sim.map(|sim| sim.warp),
             sim_steps_per_second,
             pending_water_chunks: self.pending_water_chunks,
         });
@@ -439,7 +484,7 @@ pub(crate) struct GpuSlot {
     queries: QuerySet,
     resolve: Buffer,
     readback: Buffer,
-    written: AtomicU32,
+    written: AtomicU64,
     // Rayon workers share the active slot while recording disjoint passes.
     pending: Option<PendingMap>,
 }
@@ -468,7 +513,7 @@ impl GpuSlot {
                 "frame profile readback",
                 BufferUsages::MAP_READ | BufferUsages::COPY_DST,
             ),
-            written: AtomicU32::new(0),
+            written: AtomicU64::new(0),
             pending: None,
         }
     }
@@ -476,7 +521,7 @@ impl GpuSlot {
     pub(crate) fn resolve(&self, encoder: &mut CommandEncoder) {
         let written = self.written.load(Ordering::Relaxed);
         for index in 0..GpuPass::COUNT {
-            if written & (1 << index) != 0 {
+            if query_pair_written(written, index) {
                 let start = index as u32 * 2;
                 encoder.resolve_query_set(
                     &self.queries,
@@ -511,9 +556,13 @@ impl GpuSlot {
     }
 }
 
-fn decode_gpu(bytes: &[u8], written: u32, period: f32) -> GpuTimes {
+fn query_pair_written(written: u64, index: usize) -> bool {
+    (written >> (index * 2)) & 0b11 == 0b11
+}
+
+fn decode_gpu(bytes: &[u8], written: u64, period: f32) -> GpuTimes {
     std::array::from_fn(|index| {
-        if written & (1 << index) == 0 {
+        if !query_pair_written(written, index) {
             return None;
         }
         let offset = index * QUERY_STRIDE as usize;
@@ -532,22 +581,66 @@ mod tests {
 
     #[test]
     fn frame_profile_requests_only_supported_opt_in_features() {
-        use wgpu::Features;
-        assert_eq!(
-            timestamp_features(false, Features::TIMESTAMP_QUERY),
-            Features::empty()
-        );
-        assert_eq!(
-            timestamp_features(true, Features::empty()),
-            Features::empty()
-        );
+        let downlevel = DownlevelFlags::NONBLOCKING_QUERY_RESOLVE;
+        for mode in [None, Some(ProfileMode::Cpu)] {
+            assert_eq!(
+                timestamp_features(mode, Features::TIMESTAMP_QUERY, Backend::Vulkan, downlevel),
+                Features::empty()
+            );
+        }
+        let mode = Some(ProfileMode::CpuAndGpu);
         assert_eq!(
             timestamp_features(
-                true,
-                Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_PASSES
+                mode,
+                Features::empty(),
+                Backend::Vulkan,
+                downlevel,
             ),
-            Features::TIMESTAMP_QUERY
+            Features::empty()
         );
+        let wanted = Features::TIMESTAMP_QUERY | Features::TIMESTAMP_QUERY_INSIDE_ENCODERS;
+        assert_eq!(
+            timestamp_features(
+                mode,
+                wanted | Features::TIMESTAMP_QUERY_INSIDE_PASSES,
+                Backend::Vulkan,
+                downlevel,
+            ),
+            wanted
+        );
+    }
+
+    #[test]
+    fn frame_profile_rejects_blocking_query_resolve() {
+        for (backend, downlevel) in [
+            (Backend::Vulkan, DownlevelFlags::empty()),
+            (Backend::Gl, DownlevelFlags::empty()),
+            (Backend::Gl, DownlevelFlags::NONBLOCKING_QUERY_RESOLVE),
+        ] {
+            assert_eq!(
+                timestamp_features(
+                    Some(ProfileMode::CpuAndGpu),
+                    Features::TIMESTAMP_QUERY,
+                    backend,
+                    downlevel,
+                ),
+                Features::empty()
+            );
+        }
+    }
+
+    #[test]
+    fn frame_profile_excludes_incomplete_query_pairs() {
+        let bytes = vec![0; READBACK_SIZE as usize];
+        // Depth has only the beginning timestamp. The next pass has only its end.
+        let decoded = decode_gpu(&bytes, 0b1001, 1.0);
+        assert!(decoded.iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn frame_profile_names_encoding_job_and_ui_durations() {
+        assert_eq!(CpuPhase::LABELS[CpuPhase::Encode as usize], "encode_jobs");
+        assert_eq!(CpuPhase::LABELS[CpuPhase::Ui as usize], "ui_build_encode");
     }
 
     #[test]
@@ -556,7 +649,7 @@ mod tests {
         let offset = GpuPass::Main.index() * QUERY_STRIDE as usize;
         bytes[offset..offset + 8].copy_from_slice(&100u64.to_ne_bytes());
         bytes[offset + 8..offset + 16].copy_from_slice(&350u64.to_ne_bytes());
-        let decoded = decode_gpu(&bytes, 1 << GpuPass::Main.index(), 2.0);
+        let decoded = decode_gpu(&bytes, 0b11 << (2 * GpuPass::Main.index()), 2.0);
         assert_eq!(decoded[GpuPass::Main.index()], Some(0.0005));
         assert_eq!(decoded[GpuPass::Depth.index()], None);
     }
@@ -575,5 +668,28 @@ mod tests {
             rate.observe(now + Duration::from_secs(4), 2, 23),
             Some(20.0)
         );
+    }
+
+    #[test]
+    fn frame_profile_sim_rate_uses_observation_time_with_uneven_render_delays() {
+        let mut profile = FrameProfile::with_gpu(ProfileMode::Cpu, None);
+        let now = Instant::now();
+        for (idx, elapsed, render, step) in [(1, 0, 200, 200), (2, 1000, 800, 260)] {
+            let at = now + Duration::from_millis(elapsed);
+            profile.begin_redraw();
+            profile.record_sim(at, 1, step, 10000);
+            profile.record_present(
+                idx,
+                at,
+                at + Duration::from_millis(render),
+                [1280, 720],
+                "fifo",
+                GfxSettings::default(),
+            );
+        }
+        let sample = profile.samples().back().unwrap();
+        assert_eq!(sample.sim_sample_ms, Some(1000.0));
+        assert_eq!(sample.sim_steps_per_second, Some(60.0));
+        assert_eq!(sample.present_interval_ms, Some(1600.0));
     }
 }

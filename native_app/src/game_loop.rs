@@ -58,7 +58,7 @@ pub struct State {
     batch_in_flight: bool,
     staged: Option<WorldCommands>,
     sent_warp: u32,
-    sampled_step: Option<(u64, u64)>,
+    sampled_step: Option<(u64, u64, Option<Instant>)>,
     frame_profile_panel: crate::frame_profile::Panel,
     fence: Fence,
     install: Option<Install>,
@@ -321,7 +321,7 @@ impl engine::framework::State for State {
 
         self.uiw.write::<SessionState>().interaction_blocked = false;
         self.invalidate_placements();
-        self.pump_simulation();
+        self.pump_simulation(ctx.gfx.frame_profile.is_some());
         if !self.step_session(ctx) {
             return;
         }
@@ -331,26 +331,24 @@ impl engine::framework::State for State {
             if scripted && !state.step_automation(ctx, sim) {
                 return;
             }
+            if let Some(profile) = &mut ctx.gfx.frame_profile {
+                let generation = state.uiw.read::<SessionState>().generation;
+                let sampled = if state.driver.is_some() {
+                    state.sampled_step.and_then(|(sample_generation, step, at)| {
+                        at.filter(|_| sample_generation == generation).map(|at| (at, step))
+                    })
+                } else {
+                    Some((Instant::now(), sim.get_tick()))
+                };
+                if let Some((at, step)) = sampled {
+                    profile.record_sim(at, generation, step, state.uiw.read::<Settings>().time_warp);
+                }
+            }
             let prep_start = ctx.gfx.profile_timer();
             let view_input = state.prepare_input(ctx, scripted);
             state.update_warp();
             state.uiw.write::<SaveLoadState>().authoring_blocked = !state.can_collect_commands();
-            let commands_observed = state.update_world(ctx, sim, scripted, view_input);
-            ctx.gfx.profile_elapsed(CpuPhase::WorldPrep, prep_start);
-            if let Some(profile) = &mut ctx.gfx.frame_profile {
-                let generation = state.uiw.read::<SessionState>().generation;
-                let step = if state.driver.is_some() {
-                    state
-                        .sampled_step
-                        .filter(|sample| sample.0 == generation)
-                        .map(|sample| sample.1)
-                } else {
-                    Some(sim.get_tick())
-                };
-                if let Some(step) = step {
-                    profile.record_sim(generation, step, state.uiw.read::<Settings>().time_warp);
-                }
-            }
+            let commands_observed = state.update_world(ctx, sim, scripted, view_input, prep_start);
             let yakui_width =
                 ctx.yakui.yakui.layout_dom().unscaled_viewport().size().x / ctx.yakui.zoom_factor;
             ctx.present_with_gfx(
@@ -486,6 +484,7 @@ impl State {
         sim: &Simulation,
         scripted: bool,
         view_input: bool,
+        mut prep_start: Option<Instant>,
     ) -> bool {
         profiling::scope!("game_loop::update_world");
         let mut commands_observed = false;
@@ -536,7 +535,11 @@ impl State {
             self.manage_io(ctx, Some(sim));
         }
         if let Some(renderer) = &mut self.map_renderer {
+            ctx.gfx.profile_elapsed(CpuPhase::WorldPrep, prep_start);
+            let map_start = ctx.gfx.profile_timer();
             renderer.update(sim, ctx);
+            ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);
+            prep_start = ctx.gfx.profile_timer();
         }
         ctx.gfx.set_time(sim.read::<GameTime>().timestamp as f32);
         for (sound, kind) in self.uiw.write::<ImmediateSound>().orders.drain(..) {
@@ -553,6 +556,7 @@ impl State {
             *self.uiw.write::<Camera>() = self.uiw.read::<OrbitCamera>().camera;
         }
         self.manage_gfx_params(ctx);
+        ctx.gfx.profile_elapsed(CpuPhase::WorldPrep, prep_start);
         commands_observed
     }
 
@@ -899,7 +903,7 @@ impl State {
         }
     }
 
-    fn pump_simulation(&mut self) {
+    fn pump_simulation(&mut self, frame_profiling: bool) {
         let Some(driver) = self.driver.as_mut() else {
             self.uiw.write::<Timings>().per_game_system = self.game_schedule.times();
             return;
@@ -980,6 +984,7 @@ impl State {
             }
         }
         if let Some(status) = driver.status() {
+            let at = frame_profiling.then(Instant::now);
             let mut io = self.uiw.write::<SaveLoadState>();
             io.achieved_warp = status.achieved_warp;
             if let Some(replay) = &mut io.replay_ui {
@@ -993,7 +998,8 @@ impl State {
             let mut timings = self.uiw.write::<Timings>();
             timings.per_game_system = status.schedule_samples.to_vec();
             let step = (status.boundary.generation, status.boundary.completed_step);
-            if self.sampled_step.replace(step) != Some(step) {
+            let previous = self.sampled_step.replace((step.0, step.1, at));
+            if previous.map(|(generation, step, _)| (generation, step)) != Some(step) {
                 timings
                     .world_update
                     .add_value(status.last_tick_duration.as_secs_f32());

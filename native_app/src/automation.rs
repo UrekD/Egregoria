@@ -1904,7 +1904,7 @@ mod tests {
 #[cfg(test)]
 #[test]
 fn frame_profile_probe_decodes() {
-    let source = include_bytes!("../../scripts/shots/rusty_skylines_frame_probe.json");
+    let source = include_bytes!("../../scripts/shots/frame_profile_probe.json");
     let steps: Vec<Step> = JSON::decode(source).expect("decode the native frame profile probe");
     assert_eq!(
         steps.iter().filter(|step| matches!(step, Step::LoadSlot(_))).count(),

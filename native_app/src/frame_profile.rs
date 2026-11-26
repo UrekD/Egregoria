@@ -55,7 +55,7 @@ pub(crate) fn write_report(
     let adapter = gfx.adapter_info();
     let session = uiw.read::<SessionState>();
     let report = Report {
-        schema_version: 1,
+        schema_version: 2,
         game_version: VERSION.trim(),
         os: std::env::consts::OS,
         architecture: std::env::consts::ARCH,

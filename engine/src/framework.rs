@@ -441,9 +441,6 @@ impl Context {
             return;
         }
         let surface = self.next_surface.take().unwrap();
-        if let Some(profile) = &mut self.gfx.frame_profile {
-            profile.start_gpu();
-        }
         let start = self.gfx.profile_timer();
         let (mut enc, view) = self.gfx.start_frame(&surface);
         self.gfx.profile_elapsed(CpuPhase::Encode, start);
