@@ -930,6 +930,45 @@ impl Itinerary {
         &self.reversed_local_path
     }
 
+    /// Read the active waypoints in travel order. The last traversal ends at the
+    /// target on the lane, which can be short of the end of the lane itself.
+    pub fn remaining_path(&self, map: &Map, position: Vec3) -> Option<Vec<Vec3>> {
+        let mut path = vec![position];
+        path.extend(self.local_path().iter().rev().copied());
+        if let ItineraryKind::Route(route, kind) = &self.kind {
+            for (index, leg) in route.reversed_route.iter().enumerate().rev() {
+                let points = leg.raw_points(map)?;
+                if index == 0 {
+                    let start = match leg.dir {
+                        TraverseDirection::Forward => points.first(),
+                        TraverseDirection::Backward => points.last(),
+                    };
+                    match route.target {
+                        ItineraryTarget::Position(_) => {
+                            if let Some(terminal) =
+                                kind.local_route(map, leg.destination_lane(), start, route.end_pos)
+                            {
+                                path.extend(terminal.iter().copied());
+                                continue;
+                            }
+                        }
+                        ItineraryTarget::DirectedLane(lane, offset) => {
+                            let points = driving_lane_points(map, lane, offset)?;
+                            path.extend(directed_local_path(points, start, offset, route.end_pos)?);
+                            continue;
+                        }
+                    }
+                }
+                match leg.dir {
+                    TraverseDirection::Forward => path.extend(points.iter().copied()),
+                    TraverseDirection::Backward => path.extend(points.iter().rev().copied()),
+                }
+            }
+        }
+        path.dedup();
+        (path.len() > 1).then_some(path)
+    }
+
     pub fn prepend_local_path(&mut self, points: impl IntoIterator<Item = Vec3>) {
         self.reversed_local_path.extend(points);
     }

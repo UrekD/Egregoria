@@ -709,6 +709,7 @@ impl State {
         ctx.gfx.profile_elapsed(CpuPhase::Instances, instances_start);
         if !self.uiw.read::<SessionState>().interaction_blocked {
             gui::overlays::draw(&sim, &self.uiw);
+            gui::inspect::draw_vehicle_route(&sim, &self.uiw);
         }
 
         {

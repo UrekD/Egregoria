@@ -194,6 +194,10 @@ pub struct Transit {
 }
 
 impl Transit {
+    pub fn bus_leg_origin(&self, vehicle: VehicleID) -> Option<StopID> {
+        self.legs.get(&vehicle)?.from
+    }
+
     /// Estimated interval between buses, in elapsed ticks.
     pub fn headway(&self, line: LineID) -> Option<u64> {
         let info = self.lines.get(line)?;

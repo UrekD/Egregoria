@@ -1,7 +1,7 @@
 use crate::map::{Map, TrafficBehavior, Traversable, TraverseKind};
 use crate::map_dynamic::{Itinerary, Transit, OBJECTIVE_OK_DIST};
 use crate::transportation::junction_admission;
-use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason};
+use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason, QueueRevision};
 use crate::transportation::{
     ColliderOwnerLookup, Speed, TransportGrid, TransportState, TransportationGroup, Transporter,
     TraversalOwner,
@@ -19,6 +19,60 @@ use std::collections::BTreeMap;
 
 const STOPPED_SPEED: f32 = 0.2;
 const STOPPED_BLOCK_DISTANCE: f32 = 1.5;
+
+/// Describe the hold on one stopped vehicle, reusing a current traffic-repair
+/// observation when available. The fallback reads only its immediate surroundings.
+pub fn vehicle_hold_reason(
+    sim: &crate::Simulation,
+    map: &Map,
+    id: VehicleID,
+) -> Option<QueueHoldReason> {
+    let vehicle = sim.get(id)?;
+    if vehicle.speed.0.abs() > STOPPED_SPEED {
+        return None;
+    }
+    let traversal = vehicle.it.get_travers().copied();
+    if let Some(traversal) = traversal {
+        let tick = crate::diagnostics::elapsed_tick(sim).0;
+        if let Some(reason) = sim.read::<QueueDiagnostics>().recent_hold(
+            id,
+            traversal,
+            QueueRevision::current(map),
+            tick,
+        ).filter(|reason| *reason != QueueHoldReason::Unknown) {
+            return Some(reason);
+        }
+    }
+
+    vehicle.it.get_point()?;
+    let grid = sim.read::<TransportGrid>();
+    let collider = vehicle.collider?.0;
+    let (_, own_state) = grid.get(collider)?;
+    let neighbours = grid.query_around(vehicle.trans.pos.xy(), 12.0)
+        .filter(|&(handle, _)| handle != collider)
+        .filter_map(|(handle, pos)| Some((Some(handle), pos, grid.get(handle)?.1)));
+    let (distance, _, reason) = calc_front_dist(
+        &vehicle.vehicle, &vehicle.trans, own_state, &vehicle.it, neighbours, 0.8,
+    );
+    if distance < STOPPED_BLOCK_DISTANCE && reason != QueueHoldReason::Unknown {
+        return Some(reason);
+    }
+    let TraverseKind::Lane(lane) = traversal?.kind else {
+        return None;
+    };
+    let lane = map.get(lane)?;
+    let distance = lane.control_point().distance(vehicle.trans.pos);
+    match lane.control.get_behavior(sim.read::<GameTime>().seconds) {
+        TrafficBehavior::RED | TrafficBehavior::ORANGE
+            if distance <= OBJECTIVE_OK_DIST * 1.05 + 2.0
+                + (vehicle.vehicle.kind.width() * 0.5 - OBJECTIVE_OK_DIST).max(0.0) =>
+        {
+            Some(QueueHoldReason::Signal)
+        }
+        TrafficBehavior::STOP if (1.0..=5.0).contains(&distance) => Some(QueueHoldReason::StopDwell),
+        _ => None,
+    }
+}
 
 /// Finds physical wait cycles among vehicles that are still stopped at the cutoff.
 /// Each cycle is ordered by its blocker links and starts at its lowest vehicle ID.

@@ -273,6 +273,21 @@ pub struct QueueDiagnostics {
 }
 
 impl QueueDiagnostics {
+    pub(crate) fn recent_hold(
+        &self,
+        vehicle: VehicleID,
+        traversal: Traversable,
+        revision: QueueRevision,
+        tick: u64,
+    ) -> Option<QueueHoldReason> {
+        let hold = self.holds.get(&vehicle)?;
+        (self.revision == Some(revision)
+            && hold.traversal == traversal
+            && hold.tick <= tick
+            && tick - hold.tick <= 1)
+            .then_some(hold.reason)
+    }
+
     pub fn presentation(&self, lane: LaneID) -> Option<&QueueExplanation> {
         self.presentation.get(&lane)
     }

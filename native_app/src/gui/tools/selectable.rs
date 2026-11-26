@@ -6,6 +6,7 @@ use crate::uiworld::UiWorld;
 use engine::Tesselator;
 use geom::{Intersect, LinearColor, Ray3, Segment, Shape, Vec2, Vec3, AABB};
 use simulation::map::{Building, BuildingID, Map, ProjectFilter, ProjectKind, Road, RoadID};
+use simulation::transportation::VehicleKind;
 use simulation::{AnyEntity, Simulation};
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
@@ -33,8 +34,8 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
 
     if clicked && !inspected.dontclear {
         inspected.dist2 = f32::INFINITY;
-        inspected.e = None;
-        if let Some(unproj) = inp.unprojected {
+        inspected.e = pick_vehicle(sim, &inp);
+        if let Some(unproj) = inp.unprojected.filter(|_| inspected.e.is_none()) {
             sim.world()
                 .query_selectable_pos()
                 .for_each(|(id, pos): (AnyEntity, Vec2)| {
@@ -115,6 +116,42 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
                 .color(simulation::colors().gui_primary);
         }
     }
+}
+
+pub(crate) fn pick_vehicle(sim: &Simulation, input: &InputMap) -> Option<AnyEntity> {
+    let ray = input.ray?;
+    let dir = ray.dir.try_normalize()?;
+    let terrain_depth = input
+        .surface_hits(sim.map().environment())
+        .nearest()
+        .map_or(f32::INFINITY, |point| (point - ray.from).dot(dir));
+    let world = sim.world();
+    let vehicles = world.vehicles.iter().map(|(id, vehicle)| {
+        let trans = vehicle.trans;
+        let radius = match vehicle.vehicle.kind {
+            VehicleKind::Car => 2.8,
+            VehicleKind::Truck => 3.5,
+            VehicleKind::Bus => 4.5,
+        };
+        (AnyEntity::VehicleID(id), trans.pos.up(0.8), radius)
+    });
+    let trains = world.trains.iter().map(|(id, train)| {
+        (AnyEntity::TrainID(id), train.trans.pos.up(1.0), 5.0)
+    });
+    let wagons = world.wagons.iter().map(|(id, wagon)| {
+        (AnyEntity::WagonID(id), wagon.trans.pos.up(1.0), 5.0)
+    });
+    vehicles.chain(trains).chain(wagons).filter_map(|(id, center, radius)| {
+        let delta = center - ray.from;
+        let center_depth = delta.dot(dir);
+        let radius2 = radius * radius;
+        let offset2 = delta.cross(dir).mag2();
+        if offset2 > radius2 {
+            return None;
+        }
+        let front = center_depth - (radius2 - offset2).sqrt();
+        (front >= 0.0 && front <= terrain_depth).then_some((id, front))
+    }).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(id, _)| id)
 }
 
 // The orbit camera's maximum normal eye offset is about 1.7 km.

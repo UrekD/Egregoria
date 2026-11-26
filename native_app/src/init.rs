@@ -71,6 +71,7 @@ fn register_ui_resources() {
     register_resource_noserialize::<DebugObjs>();
     register_resource_noserialize::<DebugState>();
     register_world_resource::<ErrorTooltip>();
+    register_world_resource::<crate::debug_gui::VehicleHover>();
     register_world_resource::<ExitState>();
     register_world_resource::<FollowEntity>();
     register_resource_noserialize::<GUIChatState>();
@@ -79,6 +80,7 @@ fn register_ui_resources() {
     register_world_resource::<ImmediateSound>();
     register_resource_noserialize::<InputMap>();
     register_world_resource::<InspectedEntity>();
+    register_world_resource::<crate::gui::inspect::ShowVehicleRoute>();
     register_world_resource::<InspectedBuilding>();
     register_world_resource::<InspectedRoad>();
     register_world_resource::<PlacementPreview>();

@@ -2935,6 +2935,10 @@ impl Map {
     pub fn buildings(&self) -> &Buildings {
         &self.buildings
     }
+
+    pub fn external_train_station(&self) -> Option<BuildingID> {
+        self.external_train_stations.first().copied()
+    }
     pub fn lots(&self) -> &Lots {
         &self.lots
     }

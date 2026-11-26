@@ -6,7 +6,6 @@ use geom::Vec3;
 use goryak::{button_primary, primary_link};
 use inspect_building::inspect_building;
 use inspect_human::inspect_human;
-use inspect_train::inspect_train;
 use inspect_vehicle::inspect_vehicle;
 use simulation::map::BuildingID;
 use simulation::{AnyEntity, Simulation};
@@ -18,8 +17,9 @@ mod inspect_needs;
 mod inspect_road;
 mod inspect_utility;
 mod inspect_warehouse;
-mod inspect_train;
 mod inspect_vehicle;
+
+pub(crate) use inspect_vehicle::{draw_vehicle_route, vehicle_tooltip, ShowVehicleRoute};
 
 pub fn new_inspector(uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::inspector");
@@ -41,6 +41,12 @@ pub fn new_inspector(uiworld: &UiWorld, sim: &Simulation) {
     }
 
     let inspected_entity = uiworld.read::<InspectedEntity>().e;
+    {
+        let mut route = uiworld.write::<ShowVehicleRoute>();
+        if route.0 != inspected_entity {
+            route.0 = None;
+        }
+    }
     let Some(e) = inspected_entity else {
         let road = uiworld.read::<InspectedRoad>().0;
         if inspected_building.e.is_none() {
@@ -63,8 +69,8 @@ pub fn new_inspector(uiworld: &UiWorld, sim: &Simulation) {
         AnyEntity::HumanID(id) if !force_debug_inspect => {
             is_open = inspect_human(uiworld, sim, id);
         }
-        AnyEntity::VehicleID(id) if !force_debug_inspect => {
-            is_open = inspect_vehicle(uiworld, sim, id);
+        AnyEntity::VehicleID(_) | AnyEntity::TrainID(_) => {
+            is_open = inspect_vehicle(uiworld, sim, e);
         }
         AnyEntity::WagonID(id) if !force_debug_inspect => {
             let Some(w) = sim.world().get(id) else {
@@ -72,9 +78,6 @@ pub fn new_inspector(uiworld: &UiWorld, sim: &Simulation) {
             };
             let train_id = w.itfollower.leader;
             uiworld.write::<InspectedEntity>().e = Some(AnyEntity::TrainID(train_id));
-        }
-        AnyEntity::TrainID(id) if !force_debug_inspect => {
-            is_open = inspect_train(uiworld, sim, id);
         }
         _ => {}
     }
@@ -115,10 +118,14 @@ fn entity_link_inner(uiworld: &UiWorld, sim: &Simulation, e: AnyEntity) {
     };
 
     if primary_link(linkname) {
-        uiworld.write::<InspectedEntity>().e = Some(e);
-        if sim.pos_any(e).is_some() {
-            uiworld.write::<FollowEntity>().0 = Some(e);
-        }
+        focus_entity(uiworld, sim, e);
+    }
+}
+
+pub(crate) fn focus_entity(uiworld: &UiWorld, sim: &Simulation, e: AnyEntity) {
+    uiworld.write::<InspectedEntity>().e = Some(e);
+    if sim.pos_any(e).is_some() {
+        uiworld.write::<FollowEntity>().0 = Some(e);
     }
 }
 

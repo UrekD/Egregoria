@@ -32,7 +32,7 @@ use crate::map_dynamic::{
 };
 use crate::multiplayer::MultiplayerState;
 use crate::souls::events::{events_update, Fires};
-use crate::souls::freight_station::freight_station_system;
+use crate::souls::freight_station::{freight_station_system, RailTrips};
 use crate::souls::goods_company::company_system;
 use crate::souls::happiness::{happiness_update, Happiness};
 use crate::souls::household::{household_update, HouseholdClaims};
@@ -47,7 +47,7 @@ use crate::transportation::train::{
 use crate::transportation::{transport_grid_synchronize, TransportGrid, TransportState};
 use crate::utils::replay::ReplayJson;
 use crate::utils::resources::Resources;
-use crate::world::{CompanyEnt, FreightStationEnt, HumanEnt, TrainEnt, VehicleEnt, WagonEnt};
+use crate::world::{CompanyEnt, FreightStationEnt, FreightStationID, HumanEnt, TrainEnt, VehicleEnt, WagonEnt};
 use crate::World;
 use crate::{
     add_souls_to_empty_buildings, utils, ParCommandBuffer, RandProvider, Replay, RunnableSystem,
@@ -269,6 +269,7 @@ fn register_systems_and_resources() {
     register_lot_layout();
     register_road_frontage();
     register_cargo_progress();
+    register_rail_trips();
 }
 
 fn register_utility_water_sample() {
@@ -498,6 +499,32 @@ fn register_cargo_progress() {
             }),
             load: Box::new(|sim, data| {
                 sim.write::<CargoBook>().progress = Bincode::decode(data)?;
+                Ok(())
+            }),
+        });
+    }
+}
+
+// Old freight stations only saved their aggregate waiting units.
+fn register_rail_trips() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "rail_trips",
+            optional: true,
+            save: Box::new(|sim, output| {
+                let trips: BTreeMap<_, _> = sim.world().freight_stations.iter()
+                    .filter(|(_, station)| !station.f.rail_trips.is_empty())
+                    .map(|(id, station)| (id, &station.f.rail_trips))
+                    .collect();
+                Bincode::encode_writer(&trips, output)
+            }),
+            load: Box::new(|sim, data| {
+                let trips: BTreeMap<FreightStationID, RailTrips> = Bincode::decode(data)?;
+                for (id, trips) in trips {
+                    if let Some(station) = sim.world.freight_stations.get_mut(id) {
+                        station.f.rail_trips = trips;
+                    }
+                }
                 Ok(())
             }),
         });

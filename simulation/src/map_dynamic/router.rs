@@ -39,6 +39,9 @@ pub struct Router {
     pub last_error: Option<RouterError>,
     pub trip_start: Option<Tick>,
     #[inspect(skip)]
+    #[serde(skip)]
+    trip_origin: Option<Destination>,
+    #[inspect(skip)]
     pub(crate) trip_mode: TripProgress,
     pub(crate) walk_only_pickup: bool,
     replan_at_alight: bool,
@@ -188,6 +191,13 @@ fn routing_changed(
         };
         if router.trip_start.is_none() {
             router.trip_start = Some(elapsed_ticks(resources));
+            router.trip_origin = Some(match h.location {
+                Location::Building(building) => Destination::Building(building),
+                Location::Vehicle(vehicle) => Destination::Outside(
+                    world.vehicles.get(vehicle).map_or(h.trans.pos, |v| v.trans.pos),
+                ),
+                _ => Destination::Outside(h.trans.pos),
+            });
         }
 
         let mut transit_steps = None;
@@ -883,6 +893,7 @@ impl Router {
             cur_dest: None,
             last_error: None,
             trip_start: None,
+            trip_origin: None,
             trip_mode: TripProgress::Walk,
             trip_purpose: TripPurpose::Other,
             trip_employer: None,
@@ -895,6 +906,10 @@ impl Router {
 
     pub fn cur_step(&self) -> Option<&RoutingStep> {
         self.cur_step.as_ref()
+    }
+
+    pub fn trip_origin(&self) -> Option<Destination> {
+        self.trip_start.and(self.trip_origin)
     }
 
     /// `can_drive` for a car that keeps waiting for a route, evaluated again only when its
