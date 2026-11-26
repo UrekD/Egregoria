@@ -1302,8 +1302,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         let mut added = Vec::new();
         for (&local, &live) in &self.live_roads {
             if !self.roads.contains_key(local) {
-                self.map
-                    .authorize_land_effects(PreparedEffects::Road(live))?;
+                self.map.authorize_existing_road_deck(live)?;
                 let old = &self.map.roads[live];
                 removed.insert(live.into());
                 for &building in &old.connected_buildings {
@@ -1318,18 +1317,21 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         }
         for &id in &self.changed_roads {
             let road = &self.roads[id];
+            let old = self.live_roads.get(&id).map(|&id| &self.map.roads[id]);
             for triangle in land_deck_triangles(road) {
                 self.work.charge(1)?;
-                self.map.authorize_land_effects(PreparedEffects::Footprint(
-                    &triangle.map(|p| p.xy()),
-                ))?;
+                if let Some(old) = old {
+                    self.map.authorize_existing_road_triangle(old, triangle)?;
+                } else {
+                    self.map.authorize_land_effects(PreparedEffects::Footprint(
+                        &triangle.map(Vec3::xy),
+                    ))?;
+                }
             }
-            if let Some(&live) = self.live_roads.get(&id) {
-                self.map
-                    .authorize_land_effects(PreparedEffects::Road(live))?;
-                let old = &self.map.roads[live];
-                if old.points().as_slice() != road.points().as_slice() || old.width != road.width {
-                    removed.insert(live.into());
+            if let Some(old) = old {
+                self.map.authorize_existing_road_deck(old.id)?;
+                if old.points().as_slice() != road.points().as_slice() {
+                    removed.insert(old.id.into());
                     added.push(ConstructionCut::Road(road));
                 }
                 if old.width != road.width {
@@ -1381,6 +1383,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             .authorize_projected_construction_cuts(&removed, &added, self.work.remaining)?;
         Ok(outlines)
     }
+
 
     fn validate(&mut self) -> Result<(BTreeSet<RoadID>, Vec<Vec<Vec3>>), ConnectionError> {
         let env = self.map.environment();

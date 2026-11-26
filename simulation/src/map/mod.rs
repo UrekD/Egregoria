@@ -69,6 +69,7 @@ mod lane_scoring;
 mod light_policy;
 #[allow(clippy::module_inception)]
 mod map;
+mod indexed_astar;
 mod pathfinding;
 mod reachability;
 pub mod road_edit;

@@ -7,7 +7,10 @@ use super::{
 use crate::economy::progression::ProgressionMode;
 use crate::map_dynamic::{BuildingInfos, Dispatcher, Itinerary};
 use crate::world_command::WorldCommand;
-use crate::{MapPreset, NewGameError, NewGameOptions, Replay, Simulation, SimulationOptions};
+use crate::{
+    MapConstructor, MapOrigin, MapPreset, NewGameError, NewGameOptions, Replay, Simulation,
+    SimulationOptions,
+};
 use geom::{Intersect, Polygon, Vec2, Vec3, AABB, OBB};
 use prototypes::{BuildingGen, Tick};
 use std::fmt;
@@ -74,9 +77,13 @@ impl fmt::Display for AuthoredTownError {
 impl std::error::Error for AuthoredTownError {}
 
 impl AuthoredTownOptions {
+    pub(crate) const MIN_TERRAIN_CHUNKS: u16 = 6;
+
     fn validate(self) -> Result<(), AuthoredTownError> {
         let chunk = TerrainChunkID::SIZE_F32;
-        if !(6..=NewGameOptions::MAX_TERRAIN_CHUNKS).contains(&self.terrain_chunks) {
+        if !(Self::MIN_TERRAIN_CHUNKS..=NewGameOptions::MAX_TERRAIN_CHUNKS)
+            .contains(&self.terrain_chunks)
+        {
             return Err(AuthoredTownError::TerrainChunks(self.terrain_chunks));
         }
         let edge = Vec2::splat(f32::from(self.terrain_chunks) * chunk);
@@ -186,9 +193,11 @@ impl Simulation {
                 owned_rect: spec.owned_rect,
                 lot_layout: spec.lot_layout,
             },
+            persons_per_agent: SimulationOptions::LEGACY.persons_per_agent,
         };
         let mut sim = Self::with_initial_resources();
-        WorldCommand::bootstrap_authored(&mut sim, options, spec.lot_layout)
+        let origin = MapOrigin::new(MapConstructor::AuthoredTiled, spec.lot_layout);
+        WorldCommand::bootstrap(&mut sim, options, origin)
             .map_err(|_| LandSetupError::InvalidMode(LandMode::Tiled))?;
         let (result, reserves) = assemble(&mut sim)?;
         if sim.get_tick() != crate::INITIAL_TICK || sim.read::<Replay>().enabled {
@@ -273,7 +282,7 @@ impl Simulation {
     pub fn new_authored_town(options: AuthoredTownOptions) -> Result<Self, AuthoredTownError> {
         options.validate()?;
         let mut sim = Self::with_initial_resources();
-        WorldCommand::bootstrap_authored(
+        WorldCommand::bootstrap(
             &mut sim,
             SimulationOptions {
                 terrain_size: options.terrain_chunks,
@@ -284,8 +293,9 @@ impl Simulation {
                 progression: options.progression,
                 land_mode: crate::map::LandMode::Unrestricted,
                 land_recipe: crate::map::LandRecipe::Unrestricted,
+                persons_per_agent: SimulationOptions::LEGACY.persons_per_agent,
             },
-            options.lot_layout,
+            MapOrigin::new(MapConstructor::AuthoredTown, options.lot_layout),
         )
         .map_err(|reason| AuthoredTownError::NewGame(NewGameError::Bootstrap(reason)))?;
         Ok(sim)

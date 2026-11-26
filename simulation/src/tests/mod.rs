@@ -24,6 +24,7 @@ mod p5_placement;
 mod p5_spine_followups;
 mod p6_water;
 mod p7_road_edit;
+mod population_scale;
 mod test_iso;
 mod vehicles;
 mod zone2_lot_layout;
@@ -1955,7 +1956,12 @@ mod tiles_fix_regressions {
             .unwrap(),
         );
         assert!(map.remove_building(first).is_some());
+        assert_eq!(
+            map.authorize_building_removal(second),
+            Err(crate::map::LandDenial::Unowned(LandTileId { x: 2, y: 1 }))
+        );
         assert!(map.remove_building(second).is_none());
+        assert!(map.get(second).is_some());
     }
 
     #[test]

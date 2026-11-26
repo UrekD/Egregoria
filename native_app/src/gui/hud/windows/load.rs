@@ -1,5 +1,25 @@
 use crate::session;
 use crate::uiworld::{SaveLoadState, UiWorld};
+use common::saveload::SlotMeta;
+use simulation::economy::population::PopulationScale;
+
+fn population_scale(meta: Option<&SlotMeta>) -> PopulationScale {
+    meta.and_then(|meta| PopulationScale::try_new(meta.persons_per_agent).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+#[test]
+fn population_scale_load_label_uses_slot_metadata_with_realistic_fallback() {
+    use common::saveload::{Encoder, JSON};
+    let mut meta: SlotMeta = JSON::decode(
+        br#"{"display_name":"Port","game_tick":8,"population":0,"money_cents":20,"saved_at_unix":42}"#,
+    ).unwrap();
+    assert_eq!(population_scale(None).to_string(), "Realistic (1:1)");
+    assert_eq!(population_scale(Some(&meta)).to_string(), "Realistic (1:1)");
+    meta.persons_per_agent = 8;
+    assert_eq!(population_scale(Some(&meta)).to_string(), "Scaled (1:8)");
+}
 
 #[derive(Default)]
 pub struct LoadState {
@@ -135,6 +155,8 @@ pub(crate) fn render_slots(uiw: &UiWorld) {
                             let short = (revision.get() >> 96) as u32;
                             identity.push_str(&format!("  ·  Rev {short:08x}"));
                         }
+                        identity
+                            .push_str(&format!("  ·  {}", population_scale(entry.meta.as_ref())));
                         textc(on_secondary_container(), identity);
                         let saved_at = entry
                             .meta

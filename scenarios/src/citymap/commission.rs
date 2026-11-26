@@ -1,6 +1,6 @@
 use super::adapters::{
     apply, crosses_reserved_bank, downtown_cells, frontage_roads, place_company,
-    place_scored_company, place_special, site_clear, water_sites,
+    place_scored_company, place_special, site_clear, water_site,
 };
 use super::network::close_pairs;
 use super::{blocks, contains, BuiltNetwork, RoadClass, SourceKey, TownPlan};
@@ -16,8 +16,8 @@ use simulation::economy::{
     TripStats, TICKS_PER_BUDGET_DAY,
 };
 use simulation::map::{
-    water_provider_site, BuildingID, BuildingKind, Density, LaneID, LaneKind, LanePatternBuilder, LotID, Map, MapProject, PathKind, ProjectKind,
-    LightPolicy, RoadID, TrafficBehavior, TraverseKind, TurnID, Zone, ZoneCell, ZoneGrid, ZoneKind,
+    water_provider_site, BuildingID, BuildingKind, Density, IntersectionID, LaneID, LaneKind, LanePatternBuilder, LotID, Map, MapProject, PathKind, ProjectKind,
+    LightPolicy, RoadID, TrafficBehavior, TraverseDirection, TraverseKind, TurnID, Zone, ZoneCell, ZoneGrid, ZoneKind,
 };
 use simulation::map::{RailMarketError, RailMarketSite};
 use simulation::map_dynamic::service_reach_sources;
@@ -30,6 +30,7 @@ use simulation::map_dynamic::{
 use simulation::souls::freight_station::{train_stop, FreightTrainState};
 use simulation::souls::{
     growth::check_growable_lot,
+    human::HumanDecisionKind,
     residence::{is_retail_store, Residences},
 };
 use simulation::transportation::{
@@ -38,8 +39,9 @@ use simulation::transportation::{
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::WorldCommand;
 use simulation::{FreightStationID, HumanID, TrainID, VehicleEnt, VehicleID};
-use simulation::{Simulation, SoulID};
+use simulation::{SavePhase, Simulation, SlotId, SnapshotRevision, SoulID};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 
 const SERVICES: [ServiceKind; 6] = [
     ServiceKind::Fire,
@@ -66,6 +68,14 @@ pub struct OpeningManifest {
     reserves: Vec<Parcel>,
     lines: BTreeMap<&'static str, BusLine>,
     freight: Freight,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cross_bank: Option<CrossBank>,
+}
+
+#[derive(Serialize)]
+struct CrossBank {
+    park: BuildingID,
+    stop: StopID,
 }
 
 #[derive(Clone, Serialize)]
@@ -117,6 +127,7 @@ const SOUTHEAST_DEAD_END: SourceKey = SourceKey::Node {
     id: 11951438144,
     rail: false,
 };
+const WET_BAKERY_WALK_M: f32 = 180.0;
 
 pub(super) fn configure_commissioned_network(plan: &mut TownPlan) {
     let graph = &mut plan.graph;
@@ -194,7 +205,29 @@ pub fn commission(
     plan: &TownPlan,
     built: &BuiltNetwork,
 ) -> Result<OpeningManifest, String> {
+    commission_opening(sim, plan, built, None)
+}
+
+struct OpeningLayout {
+    cohorts: [Cohort; 5],
+    parcels: Vec<Parcel>,
+    reserves: Vec<Parcel>,
+    intake_homes: BTreeSet<LotID>,
+    sites: BTreeMap<String, BuildingID>,
+    depots: Vec<WorldCommand>,
+    freight: FreightSetup,
+    bakery: BuildingID,
+}
+
+fn prepare_opening(
+    sim: &mut Simulation,
+    plan: &TownPlan,
+    built: &BuiltNetwork,
+    freight: Option<FreightSetup>,
+) -> Result<OpeningLayout, String> {
     let roads = frontage_roads(plan, built);
+    let wet = sim.map().environment().has_water_configuration();
+    let profiled_wet = wet && ResidencePrototype::iter().any(|home| home.massing.is_some());
     let at = |x, y| super::layout::design_point(vec2(x, y), plan.config);
     let cohorts = [
         Cohort {
@@ -209,23 +242,25 @@ pub fn commission(
             district: "hraska",
             anchor: at(1950.0, 2200.0),
             houses: 85,
-            infill: 10,
+            infill: if wet { 21 } else { 10 },
             retail: 14,
             industry: 6,
         },
         Cohort {
             district: "south",
             anchor: at(2060.0, 1180.0),
-            houses: 98,
-            infill: 10,
-            retail: 16,
-            industry: 8,
+            // Keep the profiled opening near the developed town centre. Its
+            // denser fringe had the largest clusters of empty pantries.
+            houses: if profiled_wet { 94 } else if wet { 110 } else { 98 },
+            infill: if wet { 14 } else { 10 },
+            retail: if wet { 24 } else { 16 },
+            industry: if wet { 12 } else { 8 },
         },
         Cohort {
             district: "west",
             anchor: at(1415.0, 1690.0),
-            houses: 92,
-            infill: 10,
+            houses: if profiled_wet { 76 } else { 92 },
+            infill: if wet { 20 } else { 10 },
             retail: 14,
             industry: 8,
         },
@@ -239,8 +274,11 @@ pub fn commission(
         },
     ];
     let mut sites = BTreeMap::new();
-    let (terminal, market, train, market_lane, market_offset, platform) =
-        place_freight(sim, plan, built, &roads)?;
+    let freight = match freight {
+        Some(freight) => freight,
+        None => prepare_freight(sim, plan, built)?,
+    };
+    let terminal = freight.terminal;
     let bakery_anchor = sim.map().buildings()[terminal].door_pos.xy();
     let buyer = place_company(sim, plan, &roads, "bakery", bakery_anchor)?.0;
     sites.insert("rail-bakery".into(), buyer);
@@ -248,33 +286,81 @@ pub fn commission(
 
     // Give the utilities access to the same labour pool as the shops.
     // A sixth pair covers the utility margin after the reserves are built.
-    let utility_anchors = cohorts.iter().map(|cohort| cohort.anchor)
-        .chain([at(1735.0, 1050.0)]);
-    for (index, anchor) in utility_anchors.enumerate() {
-        for (name, building) in ["water-pump", "sewage-outlet"].into_iter().zip(water_sites(
+    let wet_intake = at(760.0, 940.0);
+    // This bank frontage fits the outfall foundations clear of the road profile.
+    let wet_outlet = at(1630.0, 510.0);
+    let mut utilities: Vec<_> = cohorts
+        .iter()
+        .map(|cohort| cohort.anchor)
+        .chain([at(1735.0, 1050.0)])
+        .enumerate()
+        .flat_map(|(index, anchor)| {
+            [("water-pump", wet_intake), ("sewage-outlet", wet_outlet)]
+                .map(|(name, shore)| (name, index + 1, if wet { shore } else { anchor }))
+        })
+        .collect();
+    if wet {
+        // Install all upstream intakes before choosing downstream outlets.
+        utilities.sort_by_key(|&(name, _, _)| name != "water-pump");
+    }
+    for (name, index, anchor) in utilities {
+        let building = water_site(sim, plan, &roads, name, anchor)?;
+        sites.insert(format!("{name}-{index}"), building);
+    }
+    if wet {
+        let parkway = plan
+            .riverside_park
+            .as_ref()
+            .ok_or("missing Sava park reservation")?;
+        let road = built.links[&parkway.far_bank_access].road;
+        let anchor = at(1056.0, 650.0);
+        let (park, _) = place_scored_company(
             sim,
             plan,
-            &roads,
-            anchor,
-        )?) {
-            sites.insert(format!("{name}-{}", index + 1), building);
+            &BTreeSet::from([road]),
+            "park",
+            |_, _, footprint| {
+                let center = footprint.center();
+                (center.y < anchor.y).then(|| center.distance2(anchor))
+            },
+        )?
+        .ok_or("no dry park site on the far-bank parkway")?;
+        sites.insert("sava/far-bank-park".into(), park);
+
+        // Reserve the staffed, town-facing employment entrance and the
+        // southern shopping pocket before filling their residential frontage.
+        for (name, key, anchor) in [
+            ("employment/supermarket", "employment", at(2350.0, 1960.0)),
+            ("south/supermarket", "south", at(2514.0, 1033.0)),
+            ("hraska/ridge-supermarket", "hraska", at(1290.0, 2630.0)),
+        ] {
+            let district = plan.districts.iter().find(|district| district.key == key).unwrap();
+            let (store, _) = place_scored_company(sim, plan, &roads, "supermarket", |map, road, footprint| {
+                let center = footprint.center();
+                (contains(&district.polygon, center)
+                    && map.roads()[road].lanes_iter().any(|(_, kind)| kind == LaneKind::Parking))
+                    .then(|| center.distance2(anchor))
+            })?
+            .ok_or_else(|| format!("no supermarket frontage in the {key} district"))?;
+            sites.insert(name.into(), store);
         }
     }
-    // Use the frontage between South and West so mine drivers can reach work
-    // and deliver fuel without competing for the terminal's delivery fleet.
+    // Keep the plant and the first mines on the same delivery road.
     let (plant, plant_road) =
         place_company(sim, plan, &roads, "coal-power-plant", at(1740.0, 1430.0))?;
     sites.insert("coal-power-plant".into(), plant);
     let plant_door = sim.map().buildings()[plant].door_pos.xy();
     let mine_frontage = BTreeSet::from([plant_road]);
-    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)]
-        .into_iter()
-        .enumerate()
-    {
+    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)].into_iter().enumerate() {
         let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
         verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
         sites.insert(format!("coal-mine-{}", index + 1), mine);
     }
+    let intake_parcels = if profiled_wet {
+        commission_intake_frontage(sim, plan, &roads)?
+    } else {
+        Vec::new()
+    };
     // Use parking frontage near both the field clusters and the shops.
     for (i, (x, y)) in [
         (1110.0, 1550.0),
@@ -291,7 +377,13 @@ pub fn commission(
     .into_iter()
     .enumerate()
     {
-        let (building, _) = place_company(sim, plan, &roads, "flour-factory", at(x, y))?;
+        let anchor = at(x, y);
+        let (building, _) = place_scored_company(sim, plan, &roads, "flour-factory", |map, road, footprint| {
+            (map.roads()[road].lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
+                && !intake_parcels.iter().any(|parcel| parcel.footprint.intersects(&footprint)))
+                .then(|| footprint.center().distance2(anchor))
+        })?
+        .ok_or("no clear flour mill site outside Sava intake housing")?;
         sites.insert(format!("flour-mill-{}", i + 1), building);
     }
     let mut farms = Vec::new();
@@ -341,6 +433,12 @@ pub fn commission(
         let (building, _) = place_company(sim, plan, &roads, "bakery", at(x, y))?;
         sites.insert(name.into(), building);
     }
+    if profiled_wet {
+        // Reserve the eastern market bakery before the South housing lots use
+        // all of its immediate frontage.
+        let (building, _) = place_company(sim, plan, &roads, "bakery", at(2580.0, 1098.0))?;
+        sites.insert("south/market-bakery".into(), building);
+    }
     // Leave a park site within the dense blocks before assigning their frontage
     // to housing, in places where fitting a park afterwards would displace a lot.
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
@@ -374,12 +472,32 @@ pub fn commission(
     }
     // These outlying streets had residents short of park coverage after
     // reload. Give their service sites priority over nearby buildable lots.
+    let [ridge, north_frontage] = if wet {
+        [(1250.0, 2600.0), (1330.0, 2700.0)]
+    } else {
+        [(1940.0, 2647.0), (2040.0, 2755.0)]
+    };
+    let [meadow, outer] = if wet {
+        [
+            ("south/east-frontage-park", 2598.0, 1118.0),
+            ("south/east-junction-park", 2628.0, 1238.0),
+        ]
+    } else {
+        [
+            ("south/meadow-park", 1800.0, 685.0),
+            ("south/outer-park", 2055.0, 730.0),
+        ]
+    };
     for (name, x, y) in [
-        ("hraska/ridge-park", 1940.0, 2647.0),
-        ("hraska/north-frontage-park", 2040.0, 2755.0),
+        ("hraska/ridge-park", ridge.0, ridge.1),
+        (
+            "hraska/north-frontage-park",
+            north_frontage.0,
+            north_frontage.1,
+        ),
         ("south/southwest-park", 1695.0, 885.0),
-        ("south/meadow-park", 1800.0, 685.0),
-        ("south/outer-park", 2055.0, 730.0),
+        meadow,
+        outer,
         ("west/walkway-park", 1220.0, 1945.0),
         ("west/frontage-park", 1370.0, 1560.0),
     ] {
@@ -398,7 +516,8 @@ pub fn commission(
         // shop required a walk of almost 2.5 km from the approved housing.
         zoning_roads.remove(&avenue.road);
     }
-    let (mut parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts)?;
+    let intake_homes = intake_parcels.iter().map(|parcel| parcel.lot).collect();
+    let (parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts, &intake_parcels)?;
     place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
 
     // Keep the food facilities clear of approved housing and future infill.
@@ -441,26 +560,168 @@ pub fn commission(
         ("west", 1350.0, 1840.0),
         ("employment", 2530.0, 2400.0),
     ] {
+        if wet && matches!(district, "employment" | "south" | "station") {
+            continue;
+        }
         let store = place_company_around_parcels(sim, "supermarket", at(x, y), Some(district))?;
         sites.insert(format!("{district}/supermarket"), store);
     }
+    if wet {
+        let store =
+            place_company_around_parcels(sim, "supermarket", at(2660.0, 1325.0), Some("south"))?;
+        sites.insert("south/east-supermarket".into(), store);
+    }
+    if profiled_wet {
+        // Add stocked frontage on the streets where the denser opening still
+        // sends shoppers on the longest walks home.
+        for (name, district, x, y) in [
+            ("west/rim-bakery", "west", 570.0, 1788.0),
+            ("west/northwest-bakery", "west", 718.0, 1948.0),
+            ("south/alpska-bakery", "south", 2613.0, 1288.0),
+            ("south/east-rim-bakery", "south", 2670.0, 1270.0),
+            ("station/east-bakery", "station", 2070.0, 1775.0),
+            ("station/north-bakery", "station", 2110.0, 1903.0),
+        ] {
+            let bakery = place_company_around_parcels(sim, "bakery", at(x, y), Some(district))?;
+            sites.insert(name.into(), bakery);
+        }
+        // Use the stock meat and vegetable recipes to supply local shelves
+        // when the freight terminal is also handling industrial imports.
+        for (name, district, x, y) in [
+            ("animal-farm", "south", 2100.0, 885.0),
+            ("slaughterhouse", "south", 1900.0, 1350.0),
+            ("meat-facility", "south", 2250.0, 1370.0),
+            ("vegetable-farm", "west", 1180.0, 1500.0),
+        ] {
+            let supplier = place_company_around_parcels(sim, name, at(x, y), Some(district))?;
+            sites.insert(name.into(), supplier);
+        }
+        let map = sim.map();
+        for (from, to) in [
+            ("animal-farm", "slaughterhouse"),
+            ("slaughterhouse", "meat-facility"),
+            ("meat-facility", "employment/supermarket"),
+            ("vegetable-farm", "employment/supermarket"),
+        ] {
+            verify_parking_pair(&map, sites[from], sites[to], Tick(sim.get_tick()))?;
+        }
+        drop(map);
+        // Keep the regular iron-ore buyer near the West workforce and verify
+        // its loading route from the rail terminal.
+        let foundry = place_company_around_parcels(
+            sim,
+            "foundry",
+            at(1114.0, 2186.0),
+            Some("west"),
+        )?;
+        verify_parking_pair(&sim.map(), terminal, foundry, Tick(sim.get_tick()))?;
+        sites.insert("rail-foundry".into(), foundry);
+    }
     place_walkable_bakeries(sim, plan, &roads, &parcels, &reserves, &mut sites)?;
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
-    // Fit backup fuel supply around the approved opening and infill lots.
-    let backup_mine = place_company_around_parcels(
-        sim,
-        "coal-mine",
-        plant_door + vec2(0.0, -65.0),
-        None,
-    )?;
-    verify_parking_pair(&sim.map(), backup_mine, plant, Tick(sim.get_tick()))?;
-    sites.insert("coal-mine-4".into(), backup_mine);
+    for (name, offset) in [
+        ("coal-mine-4", vec2(0.0, -65.0)),
+        ("coal-mine-5", vec2(-85.0, -40.0)),
+    ]
+    .into_iter()
+    .take(if profiled_wet { 2 } else { 1 })
+    {
+        let mine = place_company_around_parcels(sim, "coal-mine", plant_door + offset, None)?;
+        verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
+        sites.insert(name.into(), mine);
+    }
+    if wet {
+        // The existing stations serve the eastern blocks to capacity before
+        // reaching this South frontage. Give it local fire service.
+        let station = place_company_around_parcels(
+            sim,
+            "fire-station",
+            at(2438.0, 938.0),
+            Some("south"),
+        )?;
+        sites.insert("south/east-fire-station".into(), station);
+    }
+    if profiled_wet {
+        let depot = place_company_around_parcels(
+            sim,
+            "garbage-depot",
+            at(2390.0, 1125.0),
+            Some("south"),
+        )?;
+        sites.insert("south/east-garbage-depot".into(), depot);
+    }
 
-    // Ordinary housing opens before the shops/factories. This gives civic and
-    // utility sites a chance to hire while the first households arrive.
-    let housing = parcels
-        .iter()
-        .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential);
+    Ok(OpeningLayout {
+        cohorts,
+        parcels,
+        reserves,
+        intake_homes,
+        sites,
+        depots,
+        freight,
+        bakery: buyer,
+    })
+}
+
+pub(super) fn commission_opening(
+    sim: &mut Simulation,
+    plan: &TownPlan,
+    built: &BuiltNetwork,
+    freight: Option<FreightSetup>,
+) -> Result<OpeningManifest, String> {
+    let OpeningLayout {
+        cohorts,
+        mut parcels,
+        reserves,
+        intake_homes,
+        sites,
+        depots,
+        freight:
+            FreightSetup {
+                terminal,
+                market,
+                train,
+                market_lane,
+                market_offset,
+                platform,
+            },
+        bakery,
+    } = prepare_opening(sim, plan, built, freight)?;
+
+    let wet = sim.map().environment().has_water_configuration();
+    let near_outfalls = |parcel: &Parcel| outfall_housing(parcel, plan.config.owned_min);
+    let near_east_market = |parcel: &Parcel| {
+        let local = parcel.footprint.center() - plan.config.owned_min;
+        parcel.zoning.kind == ZoneKind::Residential
+            && parcel.district == "south"
+            && local.x >= 2700.0
+            && local.y >= 950.0
+    };
+    let early_retail = |parcel: &Parcel| {
+        parcel.zoning.kind == ZoneKind::Commercial
+            && matches!(parcel.district, "hraska" | "south")
+    };
+    let mut schedule = Simulation::schedule();
+    if wet {
+        // Settle the remaining waterfront housing by the downstream outlets.
+        paint(sim, parcels.iter().filter(|parcel| near_outfalls(parcel)))?;
+        advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
+        // The eastern supermarket also needs a nearby hiring pool before
+        // the town's other workplaces open.
+        paint(
+            sim,
+            parcels.iter().filter(|parcel| near_east_market(parcel)),
+        )?;
+        advance(sim, &mut schedule, 2 * TICKS_PER_HOUR);
+        record_development(&sim.map(), &mut parcels);
+    }
+    // Ordinary housing opens first so civic and utility sites can hire while
+    // the first households arrive.
+    let housing = parcels.iter().filter(|parcel| {
+        parcel.zoning.kind == ZoneKind::Residential
+            && !(wet && (near_outfalls(parcel) || near_east_market(parcel)
+                || intake_homes.contains(&parcel.lot)))
+    });
     paint(sim, housing)?;
     verify_votes(
         sim,
@@ -468,7 +729,11 @@ pub fn commission(
             .iter()
             .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential),
     )?;
-    let mut schedule = Simulation::schedule();
+    if wet {
+        // Open local retail while these districts are settling so shops can
+        // hire from the neighbourhood before the industrial parcels open.
+        paint(sim, parcels.iter().filter(|parcel| early_retail(parcel)))?;
+    }
     advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
     apply(sim, "district depot policies", &depots)?;
     let (station, ent) = sim
@@ -493,12 +758,21 @@ pub fn commission(
         sim,
         parcels
             .iter()
-            .filter(|parcel| parcel.zoning.kind == ZoneKind::Commercial),
+            .filter(|parcel| {
+                parcel.zoning.kind == ZoneKind::Commercial && !(wet && early_retail(parcel))
+            }),
     )?;
     record_development(&sim.map(), &mut parcels);
     verify_votes(sim, parcels.iter())?;
 
-    let lines = install_bus_loops(sim, built, plan, &cohorts, &parcels)?;
+    let park = sites.get("sava/far-bank-park").copied();
+    let (lines, far_stop) = install_bus_loops(sim, built, plan, &cohorts, &parcels, park)?;
+    if park.is_some() && far_stop.is_none() {
+        return Err("Sava park is missing its bus stop".into());
+    }
+    let cross_bank = park
+        .zip(far_stop)
+        .map(|(park, stop)| CrossBank { park, stop });
     let freight = Freight {
         terminal,
         station,
@@ -506,11 +780,12 @@ pub fn commission(
         train,
         market_lane,
         market_offset,
-        bakery: buyer,
+        bakery,
     };
     // Use elapsed time for settling periods. The authored clock starts in the
     // morning, so a whole elapsed day returns to the same commute phase.
-    for day in 1..=4 {
+    let warmup_days = if intake_homes.is_empty() { 4 } else { 5 };
+    for day in 1..=warmup_days {
         let target = day * TICKS_PER_BUDGET_DAY;
         let now = elapsed_tick(sim).0;
         advance(sim, &mut schedule, target - now);
@@ -545,6 +820,7 @@ pub fn commission(
         reserves,
         lines,
         freight,
+        cross_bank,
     })
 }
 
@@ -552,6 +828,14 @@ fn advance(sim: &mut Simulation, schedule: &mut SeqSchedule, ticks: u64) {
     for _ in 0..ticks {
         sim.tick(schedule, []);
     }
+}
+
+fn outfall_housing(parcel: &Parcel, owned_min: Vec2) -> bool {
+    let local = parcel.footprint.center() - owned_min;
+    parcel.zoning.kind == ZoneKind::Residential
+        && parcel.district == "south"
+        && local.x < 1820.0
+        && local.y < 760.0
 }
 
 fn expand_cereal_fields(
@@ -576,20 +860,21 @@ fn expand_cereal_fields(
                     outward.mag() + extra,
                     along.mag(),
                 );
+                let command = WorldCommand::UpdateZone {
+                    building: farm,
+                    zone: Zone::new(Polygon(field.corners.to_vec()), along),
+                };
                 (site_clear(&map, plan, field, Some(farm))
                     && !parcels
                         .iter()
                         .chain(reserves)
-                        .any(|parcel| parcel.footprint.intersects(&field)))
-                .then(|| Zone::new(Polygon(field.corners.to_vec()), along))
+                        .any(|parcel| parcel.footprint.intersects(&field))
+                    && (map.land_ownership().extent().is_none() || command.preview(sim).is_ok()))
+                .then_some(command)
             })
         };
-        if let Some(zone) = field {
-            apply(
-                sim,
-                "enlarge cereal field",
-                &[WorldCommand::UpdateZone { building: farm, zone }],
-            )?;
+        if let Some(command) = field {
+            apply(sim, "enlarge cereal field", &[command])?;
         }
     }
     Ok(())
@@ -635,12 +920,43 @@ fn verify_parking_pair(map: &Map, a: BuildingID, b: BuildingID, tick: Tick) -> R
     ))
 }
 
-fn place_freight(
+#[cfg(test)]
+fn fuel_truck_loop(map: &Map, supplier: Vec3, buyer: Vec3) -> Option<f32> {
+    let curb = |door| ParkingManagement::default().reserve_near(door, map).ok()?.park_pos(map);
+    let buyer_curb = curb(buyer)?;
+    let supplier_curb = curb(supplier)?;
+    let length = |from: Vec3, to: Vec3| {
+        let trip = Itinerary::route(Tick(0), from, to, map, PathKind::Vehicle)?;
+        let local = trip.local_path();
+        let mut distance = local.last().map_or(0.0, |point| from.distance(*point))
+            + local.windows(2).map(|pair| pair[0].distance(pair[1])).sum::<f32>();
+        if let Some((last, earlier)) = trip.get_route()?.reversed_route.split_first() {
+            for segment in earlier {
+                distance += segment.raw_points(map)?.length();
+            }
+            let points = last.raw_points(map)?;
+            distance += points.length_at_proj(points.project(to));
+        }
+        Some(distance)
+    };
+    Some(length(supplier_curb, buyer_curb)? + length(buyer_curb, supplier_curb)?)
+}
+
+pub(super) struct FreightSetup {
+    pub terminal: BuildingID,
+    pub market: BuildingID,
+    train: TrainID,
+    market_lane: LaneID,
+    market_offset: f32,
+    platform: Vec3,
+}
+
+pub(super) fn prepare_freight(
     sim: &mut Simulation,
     plan: &TownPlan,
     built: &BuiltNetwork,
-    roads: &BTreeSet<RoadID>,
-) -> Result<(BuildingID, BuildingID, TrainID, LaneID, f32, Vec3), String> {
+) -> Result<FreightSetup, String> {
+    let roads = frontage_roads(plan, built);
     let wagons = vec![
         RollingStockID::new("locomotive"),
         RollingStockID::new("freight-wagon"),
@@ -666,10 +982,10 @@ fn place_freight(
             .collect();
         let mut platforms = Vec::new();
         let mut markets = Vec::new();
-        for lane in built
+        for (key, lane) in built
             .links
-            .values()
-            .flat_map(|span| span.lanes.iter().copied())
+            .iter()
+            .flat_map(|(&key, span)| span.lanes.iter().map(move |&lane| (key, lane)))
         {
             let live = &map.lanes()[lane];
             if live.kind != LaneKind::Rail {
@@ -690,6 +1006,12 @@ fn place_freight(
                     lane,
                     offset as f32,
                 ));
+                if matches!(
+                    key,
+                    SourceKey::Authored("rail-outer-north" | "rail-outer-south")
+                ) {
+                    continue;
+                }
                 for dir in [dir, -dir] {
                     let across = dir.perpendicular();
                     let center = on_track.xy() - dir * 75.0 + across * 40.0;
@@ -783,7 +1105,14 @@ fn place_freight(
                 .keys()
                 .next()
                 .ok_or("missing freight train")?;
-            return Ok((terminal, market, train, lane, offset, *platform_stop));
+            return Ok(FreightSetup {
+                terminal,
+                market,
+                train,
+                market_lane: lane,
+                market_offset: offset,
+                platform: *platform_stop,
+            });
         }
     }
     Err(format!(
@@ -918,11 +1247,12 @@ fn place_civic_sites(
     reserves: &[Parcel],
     sites: &mut BTreeMap<String, BuildingID>,
 ) -> Result<(), String> {
-    let (street, foot) = {
+    let (street, foot, wet) = {
         let map = sim.map();
         (
             ServiceReach::new(&map, false),
             ServiceReach::new(&map, true),
+            map.environment().has_water_configuration(),
         )
     };
     let protected: Vec<_> = parcels
@@ -1046,6 +1376,28 @@ fn place_civic_sites(
                 sites.insert(format!("{name}-{serial}"), building);
             }
         }
+        if wet && service.service_kind == ServiceKind::School {
+            // The settled South infill strains the schools around its eastern
+            // streets. Use any remaining school allowance near that frontage.
+            for point in [vec2(2363.0, 1168.0), vec2(2488.0, 818.0)]
+                .into_iter()
+                .take(MAX_SCHOOLS - serial)
+            {
+                let anchor = super::layout::design_point(point, plan.config);
+                let school = place_scored_company(sim, plan, roads, name, |_, _, footprint| {
+                    let distance = footprint.center().distance2(anchor);
+                    (distance <= 160.0_f32.powi(2)
+                        && protected
+                            .iter()
+                            .all(|parcel| !parcel.intersects(&footprint)))
+                    .then_some(distance)
+                })?;
+                if let Some((building, _)) = school {
+                    serial += 1;
+                    sites.insert(format!("{name}-{serial}"), building);
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -1058,8 +1410,7 @@ fn place_walkable_bakeries(
     reserves: &[Parcel],
     sites: &mut BTreeMap<String, BuildingID>,
 ) -> Result<(), String> {
-    const NEARBY_BAKERY_M: f32 = 240.0;
-    let (reach, existing) = {
+    let (reach, existing, wet) = {
         let map = sim.map();
         let reach = ServiceReach::new(&map, true);
         let bakery = prototypes::GoodsCompanyID::new("bakery");
@@ -1067,38 +1418,90 @@ fn place_walkable_bakeries(
             .filter(|building| building.kind.as_goods_company() == Some(bakery))
             .filter_map(|building| reach.position(building.connected_road?, building.door_pos.xy()))
             .collect();
-        (reach, existing)
+        (reach, existing, map.environment().has_water_configuration())
     };
+    let (distance_limit, site_limit) = if wet { (WET_BAKERY_WALK_M, 48) } else { (240.0, 4) };
     let mut underserved: Vec<_> = parcels.iter()
         .filter(|parcel| parcel.zoning.kind == ZoneKind::Residential)
         .filter_map(|parcel| {
             let home = reach.position(parcel.road, parcel.footprint.center())?;
-            existing.iter().all(|&shop| reach.distance(shop, home) > NEARBY_BAKERY_M)
+            existing
+                .iter()
+                .all(|&shop| reach.distance(shop, home) > distance_limit)
                 .then_some((home, parcel.capacity))
         })
         .collect();
-    for serial in 1..=4 {
+    for serial in 1..=site_limit {
         let Some((building, road)) = place_scored_company(sim, plan, roads, "bakery", |map, road, footprint| {
-            if !map.roads()[road].lanes_iter().any(|(_, kind)| kind == LaneKind::Parking) {
-                return None;
-            }
             let front = (footprint.corners[0] + footprint.corners[1]) * 0.5;
             let shop = reach.position(road, front)?;
             let score: f32 = underserved.iter().map(|&(home, residents)| {
-                residents as f32 * (NEARBY_BAKERY_M - reach.distance(shop, home)).max(0.0)
+                residents as f32 * (distance_limit - reach.distance(shop, home)).max(0.0)
             }).sum();
-            (score > 0.0 && parcels.iter().chain(reserves)
-                .all(|parcel| !parcel.footprint.intersects(&footprint)))
+            if score <= 0.0 || parcels.iter().chain(reserves)
+                .any(|parcel| parcel.footprint.intersects(&footprint)) {
+                return None;
+            }
+            let curb_parking = map.roads()[road].lanes_iter().any(|(_, kind)| kind == LaneKind::Parking);
+            (curb_parking || wet && ParkingManagement::default()
+                .reserve_near_radius(front.z(10.0), map, 100.0).is_ok())
                 .then_some(-score)
         })? else {
             break;
         };
         let door = sim.map().buildings()[building].door_pos.xy();
         let shop = reach.position(road, door).unwrap();
-        underserved.retain(|&(home, _)| reach.distance(shop, home) > NEARBY_BAKERY_M);
+        underserved.retain(|&(home, _)| reach.distance(shop, home) > distance_limit);
         sites.insert(format!("walkable-bakery-{serial}"), building);
     }
     Ok(())
+}
+
+fn opening_frontage(
+    map: &Map,
+    plan: &TownPlan,
+    roads: &BTreeSet<RoadID>,
+    polygon: &[Vec2],
+    lot: &simulation::map::Lot,
+) -> bool {
+    roads.contains(&lot.parent)
+        && map.electricity.net_id(lot.parent).is_some()
+        && lot.shape.corners.iter().all(|&corner| contains(polygon, corner))
+        && !crosses_reserved_bank(plan, lot.shape)
+        && ParkingManagement::default()
+            .reserve_near(lot.shape.center().z(lot.height), map)
+            .is_ok()
+}
+
+fn commission_intake_frontage(
+    sim: &mut Simulation,
+    plan: &TownPlan,
+    roads: &BTreeSet<RoadID>,
+) -> Result<Vec<Parcel>, String> {
+    // Settle the intake crews before the mills, farms and shops start hiring.
+    let mut housing = {
+        let map = sim.map();
+        let district = plan.districts.iter().find(|area| area.key == "west").unwrap();
+        let anchor = super::layout::design_point(vec2(1156.0, 1245.0), plan.config);
+        let rings = blocks(&plan.graph);
+        let mut candidates: Vec<_> = map.lots().values()
+            .filter(|lot| opening_frontage(&map, plan, roads, &district.polygon, lot))
+            .map(|lot| (lot, rings.iter().position(|ring| contains(ring, lot.shape.center()))))
+            .collect();
+        candidates.sort_by(|(a, _), (b, _)| {
+            a.shape.center().distance2(anchor)
+                .total_cmp(&b.shape.center().distance2(anchor))
+                .then_with(|| a.id.cmp(&b.id))
+        });
+        let mut housing = Vec::new();
+        take_parcels(&map, "west", &mut candidates, downtown_cells().0, 12, &mut housing)?;
+        housing
+    };
+    paint(sim, housing.iter())?;
+    advance(sim, &mut Simulation::schedule(), 4 * TICKS_PER_HOUR);
+    record_development(&sim.map(), &mut housing);
+    verify_votes(sim, housing.iter())?;
+    Ok(housing)
 }
 
 fn plan_parcels(
@@ -1106,15 +1509,27 @@ fn plan_parcels(
     plan: &TownPlan,
     roads: &BTreeSet<RoadID>,
     cohorts: &[Cohort],
+    commissioned: &[Parcel],
 ) -> Result<(Vec<Parcel>, Vec<Parcel>), String> {
     use Density::{High, Low, Medium};
     use ZoneKind::{Commercial, Industrial, Residential};
     let map = sim.map();
+    let wet = map.environment().has_water_configuration();
+    let profiled_housing = wet && ResidencePrototype::iter().any(|home| home.massing.is_some());
     let rings = blocks(&plan.graph);
     let (high_house, high_shop) = downtown_cells();
+    let medium_house = ZoneCell {
+        kind: Residential,
+        density: Medium,
+    };
     let mut painted = Vec::new();
     let mut reserves = Vec::new();
     for cohort in cohorts {
+        // The profiled High residences have substantially more capacity.
+        // Use Medium for ordinary wet neighbourhood frontage, with High
+        // at the centre and the existing blocks that initiate each district.
+        let medium_neighbourhood = profiled_housing && cohort.district != "station";
+        let neighbourhood_house = if medium_neighbourhood { medium_house } else { high_house };
         let district = plan
             .districts
             .iter()
@@ -1124,17 +1539,8 @@ fn plan_parcels(
             .lots()
             .values()
             .filter(|lot| {
-                roads.contains(&lot.parent)
-                    && map.electricity.net_id(lot.parent).is_some()
-                    && lot
-                        .shape
-                        .corners
-                        .iter()
-                        .all(|&corner| contains(&district.polygon, corner))
-                    && !crosses_reserved_bank(plan, lot.shape)
-                    && ParkingManagement::default()
-                        .reserve_near(lot.shape.center().z(lot.height), &map)
-                        .is_ok()
+                !commissioned.iter().any(|parcel| parcel.lot == lot.id)
+                    && opening_frontage(&map, plan, roads, &district.polygon, lot)
             })
             .map(|lot| {
                 (
@@ -1159,7 +1565,7 @@ fn plan_parcels(
         });
         let reserve_count = cohort.infill;
         let reserve_cell = if cohort.houses > 0 {
-            high_house
+            neighbourhood_house
         } else {
             ZoneCell {
                 kind: Industrial,
@@ -1174,6 +1580,22 @@ fn plan_parcels(
             reserve_count,
             &mut reserves,
         )?;
+        let retail_reserve = ZoneCell {
+            kind: Commercial,
+            density: Medium,
+        };
+        if wet && cohort.houses > 0 {
+            // Reserve neighbouring shops before housing uses the remaining
+            // frontage on these narrower wet neighbourhoods.
+            take_parcels(
+                &map,
+                district.key,
+                &mut candidates,
+                retail_reserve,
+                2,
+                &mut reserves,
+            )?;
+        }
         candidates.sort_by(|(a, _), (b, _)| {
             a.shape
                 .center()
@@ -1182,6 +1604,8 @@ fn plan_parcels(
                 .then_with(|| a.id.cmp(&b.id))
         });
         let base = painted.len();
+        painted.extend(commissioned.iter().filter(|parcel| parcel.district == district.key).cloned());
+        let already_open = painted.len() - base;
         let starter_zone = if cohort.houses > 0 {
             high_house
         } else {
@@ -1296,7 +1720,8 @@ fn plan_parcels(
             )?;
         }
         let houses = if cohort.houses > 0 {
-            cohort.houses.min(fitting(&candidates, high_house) + 4)
+            cohort.houses.saturating_sub(already_open)
+                .min(fitting(&candidates, neighbourhood_house) + 4)
         } else {
             0
         };
@@ -1305,7 +1730,7 @@ fn plan_parcels(
         } else {
             houses / 15
         };
-        let medium = if cohort.district == "station" {
+        let medium = if cohort.district == "station" || medium_neighbourhood {
             0
         } else {
             houses / 8
@@ -1314,7 +1739,7 @@ fn plan_parcels(
             &map,
             district.key,
             &mut candidates,
-            high_house,
+            neighbourhood_house,
             houses.saturating_sub(low + medium + 4),
             &mut painted,
         )?;
@@ -1323,10 +1748,7 @@ fn plan_parcels(
             &map,
             district.key,
             &mut candidates,
-            ZoneCell {
-                kind: Residential,
-                density: Medium,
-            },
+            medium_house,
             medium,
             &mut painted,
         )?;
@@ -1375,23 +1797,28 @@ fn plan_parcels(
                     .total_cmp(&b.shape.center().distance2(reserve_anchor))
                     .then_with(|| a.id.cmp(&b.id))
             });
-            let additional = 22.min(fitting(&candidates, high_house));
-            take_parcels(&map, district.key, &mut candidates, high_house, additional, &mut reserves)?;
-            // Put future shops beside the new homes so they can hire from the
-            // same neighbourhood during the infill trial.
-            let retail_reserve = ZoneCell {
-                kind: Commercial,
-                density: Medium,
-            };
-            let shops = 2.min(fitting(&candidates, retail_reserve));
+            let additional = 22.min(fitting(&candidates, neighbourhood_house));
             take_parcels(
                 &map,
                 district.key,
                 &mut candidates,
-                retail_reserve,
-                shops,
+                neighbourhood_house,
+                additional,
                 &mut reserves,
             )?;
+            // Put future shops beside the new homes so they can hire from the
+            // same neighbourhood during the infill trial.
+            if !wet {
+                let shops = 2.min(fitting(&candidates, retail_reserve));
+                take_parcels(
+                    &map,
+                    district.key,
+                    &mut candidates,
+                    retail_reserve,
+                    shops,
+                    &mut reserves,
+                )?;
+            }
         }
         let mut counts = BTreeMap::new();
         for parcel in &painted[base..] {
@@ -1458,7 +1885,10 @@ fn paint<'a>(
             density: parcel.zoning.density,
         })
         .collect();
-    apply(sim, "parcel paint", &commands)
+    for batch in commands.chunks(sim.command_batch_limit()) {
+        apply(sim, "parcel paint", batch)?;
+    }
+    Ok(())
 }
 
 fn verify_votes<'a>(
@@ -1521,7 +1951,10 @@ fn verify_parcel_frontage(map: &Map, zones: &ZoneGrid, parcel: &Parcel) -> Resul
         }
         (&origin.shape, origin.parent_road)
     } else {
-        let lot = map.get(parcel.lot).ok_or_else(|| format!("missing opening lot {:?}", parcel.lot))?;
+        let lot = map.get(parcel.lot).ok_or_else(|| format!(
+            "missing opening lot {:?} in {} on {:?} at {:?}",
+            parcel.lot, parcel.district, parcel.road, parcel.footprint.center(),
+        ))?;
         (&lot.shape, lot.parent)
     };
     if road != parcel.road || !same_footprint(shape, &parcel.footprint)
@@ -1562,7 +1995,7 @@ struct CurbBerth {
     dir: Vec2,
 }
 
-fn loop_distance(map: &Map, stops: &[CurbBerth; 3], tick: Tick) -> Option<f32> {
+fn loop_distance(map: &Map, stops: &[CurbBerth], tick: Tick) -> Option<f32> {
     let mut distance = 0.0;
     for (from, to) in stops.iter().zip(stops.iter().cycle().skip(1)) {
         let route = Itinerary::route_to_lane(tick, from.pos, map, to.lane, to.offset)?;
@@ -1593,29 +2026,48 @@ fn install_bus_loops(
     plan: &TownPlan,
     cohorts: &[Cohort],
     parcels: &[Parcel],
-) -> Result<BTreeMap<&'static str, BusLine>, String> {
-    let anchors = [
+    far_bank_park: Option<BuildingID>,
+) -> Result<(BTreeMap<&'static str, BusLine>, Option<StopID>), String> {
+    let mut anchors = vec![
         cohorts[0].anchor, // Shared civic hub.
         cohorts[2].anchor, // South.
         cohorts[3].anchor, // West.
         super::layout::design_point(vec2(1920.0, 2400.0), plan.config),
         super::layout::design_point(vec2(2390.0, 2540.0), plan.config), // Employment frontage.
     ];
+    let parkway = far_bank_park.map(|park| {
+        let map = sim.map();
+        let park = &map.buildings()[park];
+        anchors.push(park.door_pos.xy());
+        park.connected_road.unwrap()
+    });
+    let park_index = 5;
+    let neighbourhood: &[usize] = if parkway.is_some() {
+        &[0, 1, park_index, 2]
+    } else {
+        &[0, 1, 2]
+    };
     let routes = [
         // South to West has a long detour around the walking-only link.
-        ("neighbourhood", [0, 1, 2], 7),
-        ("employment", [0, 3, 4], 6),
+        (
+            "neighbourhood",
+            neighbourhood,
+            if parkway.is_some() { 8 } else { 7 },
+        ),
+        ("employment", &[0, 3, 4][..], 6),
     ];
     let berths = {
         let map = sim.map();
         let mut options = Vec::new();
         let mut used = BTreeSet::new();
         let walk = ServiceReach::new(&map, true);
-        for (index, anchor) in anchors.into_iter().enumerate() {
-            let district = [0, 2, 3, 1, 4][index];
+        for (index, &anchor) in anchors.iter().enumerate() {
+            let district = [Some(0), Some(2), Some(3), Some(1), Some(4), None][index];
             let destinations: Vec<_> = parcels
                 .iter()
-                .filter(|p| p.district == cohorts[district].district)
+                .filter(|p| {
+                    district.is_some_and(|district| p.district == cohorts[district].district)
+                })
                 .filter_map(|p| {
                     Some((
                         walk.position(p.road, p.footprint.center())?,
@@ -1640,7 +2092,11 @@ fn install_bus_loops(
                 .links
                 .iter()
                 .filter(|(key, span)| {
-                    !used.contains(&span.road)
+                    if index == park_index {
+                        return Some(span.road) == parkway;
+                    }
+                    Some(span.road) != parkway
+                        && !used.contains(&span.road)
                         && matches!(
                             plan.graph.links[key].class,
                             RoadClass::Local | RoadClass::Collector | RoadClass::Avenue
@@ -1677,7 +2133,7 @@ fn install_bus_loops(
                     Some((span.road, berths))
                 })
                 .filter(|(_, berths)| {
-                    let radius = if district == 4 { 350.0 } else { 430.0 };
+                    let radius = if district == Some(4) { 350.0 } else { 430.0 };
                     berths[0].pos.xy().distance(anchor) < radius
                 })
                 .map(|(road, berths)| {
@@ -1707,8 +2163,10 @@ fn install_bus_loops(
                 .map(|(i, berths)| berths[(mask >> i) & 1])
                 .collect();
             let legs = routes.map(|(_, indices, _)| {
-                let a = indices.map(|i| candidate[i]);
-                let b = [a[0], a[2], a[1]];
+                let a: Vec<_> = indices.iter().map(|&i| candidate[i]).collect();
+                let b = std::iter::once(a[0])
+                    .chain(a[1..].iter().rev().copied())
+                    .collect();
                 [a, b]
                     .into_iter()
                     .filter_map(|stops| Some((loop_distance(&map, &stops, tick)?, stops)))
@@ -1727,6 +2185,7 @@ fn install_bus_loops(
 
     let mut lines = BTreeMap::new();
     let mut stops_by_lane = BTreeMap::new();
+    let mut far_stop = None;
     for ((key, _, vehicles), berths) in routes.into_iter().zip(berths) {
         let mut stops = Vec::new();
         let mut lanes = Vec::new();
@@ -1754,6 +2213,9 @@ fn install_bus_loops(
             };
             stops.push(stop);
             lanes.push(berth.lane);
+            if Some(sim.map().lanes()[berth.lane].parent) == parkway {
+                far_stop = Some(stop);
+            }
         }
         let before: BTreeSet<_> = sim.read::<Transit>().lines.keys().collect();
         apply(
@@ -1793,7 +2255,7 @@ fn install_bus_loops(
             },
         );
     }
-    Ok(lines)
+    Ok((lines, far_stop))
 }
 
 fn population_change_ok(earlier: u64, later: u64) -> bool {
@@ -1811,18 +2273,34 @@ fn stable_population(opening: u64, housed: u64, employed: u64, earlier: u64) -> 
 fn needs_met(
     due: u64,
     filled: u64,
-    stockout: u64,
-    resident_ticks: u64,
     work: u64,
     park: u64,
 ) -> bool {
     due >= 100
         && filled <= due
         && u128::from(filled) * 100 >= u128::from(due) * MIN_BASKETS_FILLED_PERCENT
-        && resident_ticks > 0
-        && u128::from(stockout) * 24 <= u128::from(resident_ticks)
         && work > 0
         && park > 0
+}
+
+fn food_stockout_hours(stockout: u64, resident_ticks: u64) -> f64 {
+    24.0 * stockout as f64 / resident_ticks as f64
+}
+
+fn food_stockouts_pass(days: &[(u64, u64)]) -> bool {
+    if days.len() != SOAK_DAYS as usize
+        || days.iter().any(|&(stockout, resident_ticks)| {
+            resident_ticks == 0 || u128::from(stockout) * 20 > u128::from(resident_ticks)
+        })
+    {
+        return false;
+    }
+    let sum: f64 = days
+        .iter()
+        .map(|&(stockout, residents)| food_stockout_hours(stockout, residents))
+        .sum();
+    // Allow rounding at equality, below the resolution of a stockout tick.
+    sum <= SOAK_DAYS as f64 + 2.0 * f64::EPSILON
 }
 
 fn service_covered(served: u64, residents: u64) -> bool {
@@ -2298,7 +2776,6 @@ fn verify_infill(
                 })
                 .collect::<Option<_>>()
                 .ok_or_else(|| format!("{name} bus lost its berth after the infill road edit"))?;
-            let berths = berths.try_into().map_err(|_| "unexpected number of infill stops")?;
             if loop_distance(&map, &berths, Tick(sim.get_tick())).is_none() {
                 return Err(format!("{name} bus lost its directed loop after the infill road edit"));
             }
@@ -2567,7 +3044,7 @@ impl Traffic {
         });
     }
 
-    fn observe(&mut self, sim: &Simulation, tick: u64) {
+    fn observe(&mut self, sim: &Simulation, tick: u64, bridges: &mut BridgeTraffic) {
         let transit = sim.read::<Transit>();
         let world = sim.world();
         let map = sim.map();
@@ -2586,6 +3063,7 @@ impl Traffic {
                 self.observed.remove(&id);
                 continue;
             }
+            bridges.watch_approach(id, car);
             let path = car.it.get_travers().map(|path| path.kind).or_else(|| {
                 let lane = map.nearest_lane(car.trans.pos, LaneKind::Driving, Some(3.0))?;
                 Some(TraverseKind::Lane(lane))
@@ -2744,6 +3222,180 @@ impl Traffic {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BridgeProgress {
+    Approaching,
+    OnDeck,
+    Completed,
+    Abandoned,
+}
+
+impl BridgeProgress {
+    fn observe(&mut self, on_lane: bool, position: Vec3, entry: Vec3, exit: Vec3) {
+        // Positions are the vehicle centre. The lane's trimmed endpoints
+        // are on opposite banks, clear of the water.
+        const END_RADIUS_SQUARED: f32 = 1.5 * 1.5;
+        if *self == Self::Approaching && on_lane && entry.distance2(position) <= END_RADIUS_SQUARED
+        {
+            *self = Self::OnDeck;
+        }
+        if *self == Self::OnDeck {
+            if !on_lane {
+                *self = Self::Abandoned;
+            } else if exit.distance2(position) <= END_RADIUS_SQUARED {
+                *self = Self::Completed;
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct BridgeDirection {
+    lane: LaneID,
+    from: IntersectionID,
+    to: IntersectionID,
+    completed_by_purpose: BTreeMap<String, u64>,
+}
+
+struct BridgeLane {
+    crossing: &'static str,
+    entry: Vec3,
+    exit: Vec3,
+    direction: BridgeDirection,
+}
+
+#[derive(Default)]
+struct BridgeTraffic {
+    lanes: BTreeMap<LaneID, BridgeLane>,
+    probes: BTreeMap<VehicleID, (LaneID, BridgeProgress)>,
+}
+
+impl BridgeTraffic {
+    fn new(map: &Map, plan: &TownPlan, built: &BuiltNetwork) -> Self {
+        let lanes = plan
+            .crossings
+            .iter()
+            .flat_map(|crossing| {
+                built.links[&crossing.bridge]
+                    .lanes
+                    .iter()
+                    .filter_map(|&id| {
+                        let lane = &map.lanes()[id];
+                        (lane.kind == LaneKind::Driving).then(|| {
+                            (
+                                id,
+                                BridgeLane {
+                                    crossing: crossing.key,
+                                    entry: lane.points.first(),
+                                    exit: lane.points.last(),
+                                    direction: BridgeDirection {
+                                        lane: id,
+                                        from: lane.src,
+                                        to: lane.dst,
+                                        completed_by_purpose: BTreeMap::new(),
+                                    },
+                                },
+                            )
+                        })
+                    })
+            })
+            .collect();
+        Self {
+            lanes,
+            ..Self::default()
+        }
+    }
+
+    fn approach(car: &VehicleEnt, mut matches_lane: impl FnMut(LaneID) -> bool) -> Option<LaneID> {
+        let route = car.it.get_route()?;
+        std::iter::once(&route.cur)
+            .chain(route.reversed_route.iter().rev().take(2))
+            .find_map(|step| match step.kind {
+                TraverseKind::Lane(id)
+                    if step.dir == TraverseDirection::Forward && matches_lane(id) =>
+                {
+                    Some(id)
+                }
+                _ => None,
+            })
+    }
+
+    fn watch_approach(&mut self, id: VehicleID, car: &VehicleEnt) {
+        if self.lanes.is_empty() || self.probes.contains_key(&id) {
+            return;
+        }
+        // One sampling interval is one real second. Recruit near the entry
+        // during the traffic scan, then check only recruited vehicles each tick.
+        let lane = Self::approach(car, |id| {
+            self.lanes
+                .get(&id)
+                .is_some_and(|lane| lane.entry.distance2(car.trans.pos) <= 80.0_f32.powi(2))
+        });
+        if let Some(lane) = lane {
+            self.probes.insert(id, (lane, BridgeProgress::Approaching));
+        }
+    }
+
+    fn observe(&mut self, sim: &Simulation) {
+        self.probes.retain(|&id, (lane_id, progress)| {
+            let Some(car) = sim.world().vehicles.get(id) else { return false };
+            if !matches!(car.vehicle.state, VehicleState::Driving) {
+                return false;
+            }
+            let lane = self.lanes.get_mut(lane_id).unwrap();
+            let on_lane = car.it.get_travers().is_some_and(|step| {
+                step.dir == TraverseDirection::Forward && step.kind == TraverseKind::Lane(*lane_id)
+            });
+            progress.observe(on_lane, car.trans.pos, lane.entry, lane.exit);
+            match *progress {
+                BridgeProgress::Approaching => Self::approach(car, |id| id == *lane_id).is_some(),
+                BridgeProgress::OnDeck => true,
+                BridgeProgress::Abandoned => false,
+                BridgeProgress::Completed => {
+                    let purpose = match car.vehicle.kind {
+                        VehicleKind::Bus => "Transit".into(),
+                        VehicleKind::Truck => "Freight".into(),
+                        VehicleKind::Car => format!("{:?}", sim.world().humans.values().find_map(|human| {
+                            (matches!(human.location, Location::Vehicle(vehicle) if vehicle == id)
+                                && matches!(human.router.cur_step(), Some(RoutingStep::DriveTo(_, _))))
+                                .then_some(human.router.trip_purpose)
+                        }).unwrap_or_default()),
+                    };
+                    *lane.direction.completed_by_purpose.entry(purpose).or_default() += 1;
+                    false
+                }
+            }
+        });
+    }
+
+    fn report(
+        self,
+        plan: &TownPlan,
+        failures: &mut Vec<String>,
+    ) -> BTreeMap<&'static str, Vec<BridgeDirection>> {
+        let mut result: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for lane in self.lanes.into_values() {
+            result
+                .entry(lane.crossing)
+                .or_default()
+                .push(lane.direction);
+        }
+        for crossing in &plan.crossings {
+            if !result.get(crossing.key).is_some_and(|directions| {
+                directions
+                    .iter()
+                    .any(|direction| !direction.completed_by_purpose.is_empty())
+            }) {
+                failures.push(format!(
+                    "{}: scored traffic completed 0 vehicle crossings",
+                    crossing.key
+                ));
+            }
+        }
+        result
+    }
+}
+
 #[derive(Default)]
 struct LoopEvidence {
     runs: BTreeMap<VehicleID, (usize, Option<Tick>, usize)>,
@@ -2797,6 +3449,7 @@ struct PassengerEvidence {
     aboard_at_start: BTreeSet<HumanID>,
     completed: BTreeMap<LineID, u64>,
     examples: BTreeMap<LineID, PassengerArrival>,
+    cross_bank_arrival: Option<PassengerArrival>,
 }
 
 struct PassengerJourney {
@@ -2810,7 +3463,7 @@ struct PassengerJourney {
     alighted: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Copy, Serialize)]
 struct PassengerArrival {
     passenger: HumanID,
     board: StopID,
@@ -2831,7 +3484,13 @@ impl PassengerEvidence {
         }
     }
 
-    fn observe(&mut self, sim: &Simulation, transit: &Transit, tick: u64) {
+    fn observe(
+        &mut self,
+        sim: &Simulation,
+        transit: &Transit,
+        tick: u64,
+        controlled: Option<(&CrossBank, LineID, &BTreeSet<HumanID>)>,
+    ) {
         let world = sim.world();
         self.aboard_at_start.retain(|&id| world.humans.get(id)
             .is_some_and(|human| matches!(human.location, Location::Transit(_))));
@@ -2863,15 +3522,25 @@ impl PassengerEvidence {
                 journey.alighted = true;
             }
             if human.location == Location::Building(journey.destination) && router.trip_start.is_none() {
-                *self.completed.entry(journey.line).or_default() += 1;
-                self.examples.entry(journey.line).or_insert(PassengerArrival {
+                let arrival = PassengerArrival {
                     passenger: id,
                     board: journey.board,
                     alight: journey.alight,
                     destination: journey.destination,
                     purpose: journey.purpose,
                     elapsed_tick: tick,
-                });
+                };
+                if controlled.is_some_and(|(bank, line, riders)| {
+                    journey.destination == bank.park
+                        && journey.alight == bank.stop
+                        && journey.line == line
+                        && riders.contains(&id)
+                        && router.personal_car.is_none()
+                }) {
+                    self.cross_bank_arrival = Some(arrival);
+                }
+                *self.completed.entry(journey.line).or_default() += 1;
+                self.examples.entry(journey.line).or_insert(arrival);
                 return false;
             }
             router.trip_start == Some(journey.started)
@@ -2922,6 +3591,91 @@ impl PassengerEvidence {
             }
         }
     }
+}
+
+pub(super) fn verify_cross_bank_trip(
+    mut sim: Simulation,
+    manifest: &OpeningManifest,
+) -> Result<serde_json::Value, String> {
+    let bank = manifest
+        .cross_bank
+        .as_ref()
+        .ok_or("wet opening has no far-bank destination")?;
+    let line = manifest.lines["neighbourhood"].id;
+    let (riders, trip_limit) = {
+        let map = sim.map();
+        let transit = sim.read::<Transit>();
+        let (legs, dwell) = transit
+            .directed_leg_times(line)
+            .ok_or("neighbourhood bus has no directed trip times")?;
+        // Give a rider one scheduled circuit, plus time to walk to and from it.
+        let limit = legs.iter().sum::<u64>() + dwell * legs.len() as u64 + 2 * TICKS_PER_HOUR;
+        let candidates: Vec<_> = sim
+            .world()
+            .humans
+            .iter()
+            .filter_map(|(id, human)| {
+                if human.router.personal_car.is_some()
+                    || human.location != Location::Building(human.home.house)
+                    || human.router.trip_start.is_some()
+                {
+                    return None;
+                }
+                Some((id, human.home.house, map.get(human.home.house)?.door_pos))
+            })
+            .collect();
+        let mut riders = BTreeSet::new();
+        for &stop in transit.lines[line]
+            .stops
+            .iter()
+            .filter(|&&stop| stop != bank.stop)
+        {
+            let walk = transit.stops[stop].walk_pos;
+            let mut nearby: Vec<_> = candidates
+                .iter()
+                .map(|&(id, home, door)| (walk.distance2(door), id, home))
+                .collect();
+            nearby.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+            let mut homes = BTreeSet::new();
+            riders.extend(
+                nearby
+                    .into_iter()
+                    .filter(|&(_, _, home)| homes.insert(home))
+                    .take(8)
+                    .map(|(_, id, _)| id),
+            );
+        }
+        (riders, limit)
+    };
+    if riders.is_empty() {
+        return Err("no carless residents at home for the cross-Sava bus fixture".into());
+    }
+    // Give existing carless residents an ordinary destination in this disposable reload.
+    // The router chooses the mode and the scheduled service must carry them there.
+    {
+        let humans = &mut sim.world_mut_unchecked().humans;
+        for &id in &riders {
+            let human = &mut humans[id];
+            human.router.use_vehicle(None);
+            human.decision.kind = HumanDecisionKind::GoTo(Destination::Building(bank.park));
+            human.decision.wait = 0;
+        }
+    }
+    let mut schedule = Simulation::schedule();
+    let mut passengers = PassengerEvidence::new(&sim);
+    for _ in 0..trip_limit {
+        sim.tick(&mut schedule, []);
+        passengers.observe(
+            &sim,
+            &sim.read::<Transit>(),
+            elapsed_tick(&sim).0,
+            Some((bank, line, &riders)),
+        );
+        if let Some(arrival) = passengers.cross_bank_arrival {
+            return serde_json::to_value(arrival).map_err(|error| error.to_string());
+        }
+    }
+    Err("no carless passenger completed a one-seat trip to the far-bank park".into())
 }
 
 #[derive(Default, Serialize)]
@@ -3045,7 +3799,6 @@ struct StationTruck {
 }
 
 struct FreightMonitor {
-    terminal_door: Vec3,
     market_position: Vec2,
     train_state: Option<FreightTrainState>,
     latest_unload: Option<u64>,
@@ -3060,8 +3813,7 @@ struct FreightMonitor {
 impl FreightMonitor {
     fn new(sim: &Simulation, freight: &Freight) -> Self {
         let map = sim.map();
-        Self {
-            terminal_door: map.buildings()[freight.terminal].door_pos,
+        let mut monitor = Self {
             market_position: map.buildings()[freight.market].obb.center(),
             train_state: Self::train_state(sim, freight),
             latest_unload: None,
@@ -3071,6 +3823,19 @@ impl FreightMonitor {
             deliveries: BTreeMap::new(),
             awaiting_return: None,
             evidence: FreightEvidence::default(),
+        };
+        monitor.observe_fleet(sim, freight.terminal);
+        monitor
+    }
+
+    fn observe_fleet(&mut self, sim: &Simulation, terminal: BuildingID) {
+        for id in sim.read::<CargoBook>().station_fleet(terminal) {
+            if let Some(vehicle) = sim.world().vehicles.get(id) {
+                self.trucks.entry(id).or_insert(StationTruck {
+                    parked: matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot),
+                    target: vehicle.it.target(),
+                });
+            }
         }
     }
 
@@ -3098,19 +3863,12 @@ impl FreightMonitor {
             self.record_train_return(tick);
         }
 
-        // The terminal is the only station and its six trucks spawn and park
-        // at its door. Observe stock draws only with the entire fleet visible.
+        // The terminal can have every truck out on deliveries at handoff.
+        // Use the cargo book's assignments to observe the entire fleet.
         const FLEET_SIZE: usize = 6;
         let vehicles = &sim.world().vehicles;
         if self.trucks.len() < FLEET_SIZE && tick % SAMPLE_TICKS == 0 {
-            for (id, vehicle) in vehicles.iter() {
-                if matches!(vehicle.vehicle.kind, VehicleKind::Truck)
-                    && matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot)
-                    && vehicle.trans.pos == self.terminal_door
-                {
-                    self.trucks.entry(id).or_insert(StationTruck { parked: true, target: None });
-                }
-            }
+            self.observe_fleet(sim, freight.terminal);
         }
 
         let full_fleet = self.trucks.len() == FLEET_SIZE
@@ -3322,12 +4080,144 @@ impl FreightMonitor {
 }
 
 #[derive(Serialize)]
+pub(super) struct ContinuationCheckpoint {
+    tick: u64,
+    verified_ticks: [u64; 3],
+    activity: BTreeMap<&'static str, serde_json::Value>,
+}
+
+fn checkpoint_activity(
+    sim: &Simulation,
+    freight: &Freight,
+) -> BTreeMap<&'static str, serde_json::Value> {
+    let transit = sim.read::<Transit>();
+    let cargo = sim.read::<CargoBook>();
+    let mut activity = BTreeMap::new();
+    for (id, human) in sim.world().humans.iter() {
+        if let Some(seller) = human.household.basket_seller() {
+            activity.entry("household").or_insert_with(|| {
+                serde_json::json!({
+                    "resident": id, "basket": human.household.basket, "seller": seller,
+                })
+            });
+        }
+        if let Location::Transit(bus) = human.location {
+            if let Some(run) = transit.runs.get(&bus) {
+                activity.entry("transit").or_insert_with(|| serde_json::json!({
+                    "passenger": id, "bus": bus, "line": run.line, "next_stop": run.next_stop_idx,
+                }));
+            }
+        }
+        if activity.len() == 2 {
+            break;
+        }
+    }
+    if let Some(station) = sim.get(freight.station) {
+        let train_state = FreightMonitor::train_state(sim, freight);
+        let truck = cargo.station_fleet(freight.terminal).find(|id| {
+            sim.world().vehicles.get(*id).is_some_and(|vehicle| {
+                matches!(vehicle.vehicle.state, VehicleState::Driving)
+                    && vehicle.it.get_route().is_some()
+            })
+        });
+        if train_state.is_some() || truck.is_some() {
+            let wagons: Vec<_> = sim.world().wagons.iter()
+                .filter_map(|(id, wagon)| (wagon.itfollower.leader == freight.train).then_some(id))
+                .collect();
+            activity.insert("freight", serde_json::json!({
+                "terminal": freight.terminal, "station": freight.station, "train": freight.train,
+                "train_state": train_state.map(|state| format!("{state:?}")), "wagons": wagons,
+                "import_units": station.f.wanted_cargo, "export_units": station.f.waiting_cargo,
+                "truck": truck,
+            }));
+        }
+    }
+    activity
+}
+
+fn verify_checkpoint_hashes(baseline: &Simulation, resumed: &Simulation) -> Result<(), String> {
+    let expected = baseline.hashes();
+    let actual = resumed.hashes();
+    if expected != actual {
+        let changed = expected
+            .keys()
+            .chain(actual.keys())
+            .filter(|key| expected.get(*key) != actual.get(*key))
+            .collect::<BTreeSet<_>>();
+        return Err(format!(
+            "CITYMAP continuation diverged at tick {} in {changed:?}",
+            baseline.get_tick()
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_active_continuation(
+    mut baseline: Simulation,
+    mut resumed: Simulation,
+    manifest: &OpeningManifest,
+    root: &Path,
+) -> Result<Vec<ContinuationCheckpoint>, String> {
+    verify_checkpoint_hashes(&baseline, &resumed)?;
+    let mut baseline_schedule = Simulation::schedule();
+    let mut resumed_schedule = Simulation::schedule();
+    let mut pending = BTreeSet::from(["household", "transit", "freight"]);
+    let mut checkpoints = Vec::new();
+    let deadline = baseline.get_tick() + TICKS_PER_BUDGET_DAY;
+    while !pending.is_empty() && baseline.get_tick() < deadline {
+        let mut activity = checkpoint_activity(&baseline, &manifest.freight);
+        activity.retain(|key, _| pending.contains(key));
+        if activity.is_empty() {
+            advance(&mut baseline, &mut baseline_schedule, SAMPLE_TICKS);
+            advance(&mut resumed, &mut resumed_schedule, SAMPLE_TICKS);
+            continue;
+        }
+        let tick = baseline.get_tick();
+        let id = SlotId::new(&format!("continuation-{tick}")).map_err(|error| error.to_string())?;
+        if !matches!(
+            resumed
+                .save_to_slot(root, &id, SnapshotRevision::new(u128::from(tick)))
+                .map_err(|error| error.to_string())?,
+            SavePhase::Complete
+        ) {
+            return Err(format!(
+                "incomplete CITYMAP continuation save at tick {tick}"
+            ));
+        }
+        resumed = Simulation::load_from_slot(root, &id).map_err(|error| error.to_string())?;
+        resumed_schedule = Simulation::schedule();
+        verify_checkpoint_hashes(&baseline, &resumed)?;
+        let verified_ticks = [tick + 1, tick + 250, tick + 2_000];
+        for target in verified_ticks {
+            let steps = target - baseline.get_tick();
+            advance(&mut baseline, &mut baseline_schedule, steps);
+            advance(&mut resumed, &mut resumed_schedule, steps);
+            verify_checkpoint_hashes(&baseline, &resumed)?;
+        }
+        pending.retain(|key| !activity.contains_key(key));
+        eprintln!("CITYMAP continuation at tick {tick}: {:?}", activity.keys());
+        checkpoints.push(ContinuationCheckpoint {
+            tick,
+            verified_ticks,
+            activity,
+        });
+    }
+    if !pending.is_empty() {
+        return Err(format!(
+            "CITYMAP opening had no active {pending:?} checkpoint in its first day"
+        ));
+    }
+    Ok(checkpoints)
+}
+
+#[derive(Serialize)]
 pub struct OpeningReport {
     opening: TownState,
     minimum_treasury_inner: i64,
     infill_housing_capacity: u32,
     days: Vec<DayReport>,
     traffic: Traffic,
+    pub(super) bridge_crossings: BTreeMap<&'static str, Vec<BridgeDirection>>,
     passenger_examples: BTreeMap<&'static str, PassengerArrival>,
     freight: FreightEvidence,
     failures: Vec<String>,
@@ -3400,6 +4290,13 @@ pub fn check_loaded_opening(
     let end = start + SOAK_DAYS * TICKS_PER_BUDGET_DAY;
     let mut schedule = Simulation::schedule();
     let mut traffic = Traffic::default();
+    let mut bridges = if manifest.cross_bank.is_some() {
+        let map = sim.map();
+        let built = super::resolve_network(&map, &plan.graph).map_err(|error| error.to_string())?;
+        BridgeTraffic::new(&map, plan, &built)
+    } else {
+        BridgeTraffic::default()
+    };
     let mut loops = LoopEvidence::default();
     let mut days = Vec::new();
     let mut minimum_cash = sim.read::<Government>().money;
@@ -3438,14 +4335,17 @@ pub fn check_loaded_opening(
             {
                 let transit = sim.read::<Transit>();
                 loops.observe(&transit);
-                passengers.observe(&sim, &transit, tick);
+                passengers.observe(&sim, &transit, tick, None);
             }
             if tick < end {
                 freight.observe(&sim, &manifest.freight, tick);
             }
             traffic.probe_egresses(&sim);
             if dt % SAMPLE_TICKS == 0 {
-                traffic.observe(&sim, tick);
+                traffic.observe(&sim, tick, &mut bridges);
+            }
+            if tick < end {
+                bridges.observe(&sim);
             }
             if dt % (20 * TICKS_PER_MINUTE) == 0 {
                 let state = snapshot(&sim, plan, manifest);
@@ -3496,8 +4396,6 @@ pub fn check_loaded_opening(
         if !needs_met(
             baskets_due,
             baskets_filled,
-            effective_food_stockout_ticks,
-            resident_ticks,
             work_visits,
             park_visits,
         ) {
@@ -3595,6 +4493,26 @@ pub fn check_loaded_opening(
         );
         days.push(record);
     }
+    let food_days: Vec<_> = days.iter().map(|day| {
+        (day.effective_food_stockout_ticks, day.resident_ticks)
+    }).collect();
+    if !food_stockouts_pass(&food_days) {
+        let hours: Vec<_> = food_days.iter().map(|&(stockout, residents)| {
+            format!("{:.6}", food_stockout_hours(stockout, residents))
+        }).collect();
+        let mean = food_days.iter().map(|&(stockout, residents)| {
+            food_stockout_hours(stockout, residents)
+        }).sum::<f64>() / SOAK_DAYS as f64;
+        failures.push(format!(
+            "food stockouts: daily [{}], mean {mean:.6} h per resident-day (limits 1.20 daily, 1.00 mean)",
+            hours.join(", ")
+        ));
+    }
+    let bridge_crossings = if manifest.cross_bank.is_some() {
+        bridges.report(plan, &mut failures)
+    } else {
+        BTreeMap::new()
+    };
     if !stable_population(
         opening.residents,
         opening.residents,
@@ -3635,6 +4553,7 @@ pub fn check_loaded_opening(
         infill_housing_capacity,
         days,
         traffic,
+        bridge_crossings,
         passenger_examples: manifest.lines.iter().filter_map(|(&name, line)| {
             Some((name, passengers.examples.remove(&line.id)?))
         }).collect(),
@@ -3657,6 +4576,203 @@ impl OpeningReport {
 mod tests {
     use super::*;
     use prototypes::TICKS_PER_HOUR;
+
+    #[test]
+    fn citymap_wet_frontage_serves_homes_and_leaves_infill() {
+        use crate::citymap::{
+            build_wet_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,
+            DEFAULT_LESCE, DEFAULT_SAVA,
+        };
+        use std::path::Path;
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let mut plan = plan_town(&inputs, TownConfig::wet(), SpacingLimits::default()).unwrap();
+        configure_commissioned_network(&mut plan);
+        let (mut sim, built, freight) = build_wet_town(&mut plan).unwrap();
+        let opening = prepare_opening(&mut sim, &plan, &built, Some(freight)).unwrap();
+        let map = sim.map();
+        let plant = opening.sites["coal-power-plant"];
+        let turnaround = built.junctions[&SourceKey::Authored("coal-turnaround")];
+        assert!(map.intersections()[turnaround].turn_policy.back_turns);
+        for name in ["coal-mine-1", "coal-mine-2", "coal-mine-3"] {
+            let mine = opening.sites[name];
+            let distance = fuel_truck_loop(&map, map.buildings()[mine].door_pos, map.buildings()[plant].door_pos).unwrap();
+            assert!(distance <= 900.0, "{name} needs a shorter delivery loop, measured {distance:.1} m");
+        }
+        let reach = ServiceReach::new(&map, true);
+        let bakeries: Vec<_> = map
+            .buildings()
+            .values()
+            .filter(|building| {
+                building.kind.as_goods_company() == Some(prototypes::GoodsCompanyID::new("bakery"))
+            })
+            .filter_map(|building| reach.position(building.connected_road?, building.door_pos.xy()))
+            .collect();
+        let mut housing = 0;
+        let mut near_bakeries = 0;
+        let mut by_district = BTreeMap::new();
+        let mut isolated_south = 0;
+        let mut quay_housing = 0;
+        for parcel in opening.parcels.iter().filter(|parcel| parcel.capacity > 0) {
+            let home = reach
+                .position(parcel.road, parcel.footprint.center())
+                .unwrap();
+            housing += parcel.capacity;
+            *by_district.entry(parcel.district).or_insert(0) += parcel.capacity;
+            if parcel.district == "south"
+                && parcel.footprint.center().y < plan.config.owned_min.y + 600.0
+            {
+                isolated_south += parcel.capacity;
+            }
+            if outfall_housing(parcel, plan.config.owned_min) {
+                quay_housing += parcel.capacity;
+            }
+            if bakeries
+                .iter()
+                .any(|&shop| reach.distance(home, shop) <= WET_BAKERY_WALK_M)
+            {
+                near_bakeries += parcel.capacity;
+            }
+        }
+        let reserve: u32 = opening.reserves.iter().map(|parcel| parcel.capacity).sum();
+        let reserve_shops = opening
+            .reserves
+            .iter()
+            .filter(|parcel| parcel.zoning.kind == ZoneKind::Commercial)
+            .count();
+        eprintln!("Wet frontage: {near_bakeries}/{housing} housing places near {} bakeries, {reserve} reserve places, {reserve_shops} reserve shops, housing by district {by_district:?}", bakeries.len());
+        assert!(near_bakeries * 100 >= housing * 95 && reserve >= 260 && reserve_shops >= 3,
+            "{near_bakeries}/{housing} housing places within a 180 m walk of a bakery, {reserve} reserve housing places and {reserve_shops} reserve shops");
+        assert!(
+            housing >= 1020 && isolated_south == 0,
+            "{housing} opening housing places, with {isolated_south} on the remote South fringe"
+        );
+        if ResidencePrototype::iter().any(|home| home.massing.is_some()) {
+            let rim = super::super::layout::design_point(vec2(718.0, 1948.0), plan.config);
+            let bakery = &map.buildings()[opening.sites["west/northwest-bakery"]];
+            assert!(bakery.door_pos.xy().distance(rim) <= 150.0);
+            for (name, x, y) in [
+                ("south/east-rim-bakery", 2670.0, 1270.0),
+                ("south/market-bakery", 2580.0, 1098.0),
+                ("station/north-bakery", 2110.0, 1903.0),
+            ] {
+                let anchor = super::super::layout::design_point(vec2(x, y), plan.config);
+                let building = opening.sites.get(name).unwrap_or_else(|| panic!("missing local bakery {name}"));
+                let door = map.buildings()[*building].door_pos.xy();
+                assert!(door.distance(anchor) <= 125.0,
+                    "{name} should serve its nearby housing and work frontage, door at {door:?}");
+            }
+            let south = super::super::layout::design_point(vec2(2390.0, 1125.0), plan.config);
+            let depot = &map.buildings()[opening.sites["south/east-garbage-depot"]];
+            assert!(depot.door_pos.xy().distance(south) <= 150.0);
+            for name in ["animal-farm", "slaughterhouse", "meat-facility", "vegetable-farm"] {
+                let door = map.buildings()[opening.sites[name]].door_pos.xy();
+                assert!(opening.parcels.iter().any(|parcel| {
+                    parcel.capacity > 0 && parcel.footprint.center().distance(door) <= 250.0
+                }), "{name} needs a nearby opening housing block");
+            }
+            let foundry = &map.buildings()[opening.sites["rail-foundry"]];
+            let west = super::super::layout::design_point(vec2(1114.0, 2186.0), plan.config);
+            assert!(foundry.door_pos.xy().distance(west) <= 150.0,
+                "the rail foundry needs to be near its West workforce, door at {:?}", foundry.door_pos);
+            assert_eq!(opening.intake_homes.len(), 12);
+            assert!(opening.parcels.iter()
+                .filter(|parcel| opening.intake_homes.contains(&parcel.lot))
+                .all(|parcel| parcel.district == "west" && parcel.zoning.density == Density::High));
+            let intake_workers: usize = sim.world().companies.values()
+                .filter(|company| company.comp.proto.prototype().name == "water-pump")
+                .map(|company| company.workers.0.len())
+                .sum();
+            assert!(intake_workers >= 16, "{intake_workers} intake workers at the end of the early hiring phase");
+            let outskirts: Vec<_> = opening.parcels.iter()
+                .filter(|parcel| parcel.capacity > 0 && parcel.district != "station")
+                .collect();
+            let medium = outskirts.iter().filter(|parcel| parcel.zoning.density == Density::Medium).count();
+            assert!(medium * 4 >= outskirts.len() * 3,
+                "{medium}/{} neighbourhood home parcels use Medium density under the profiled stock", outskirts.len());
+            assert!(opening.parcels.iter()
+                .filter(|parcel| parcel.capacity > 0 && parcel.district == "station")
+                .all(|parcel| parcel.zoning.density == Density::High));
+        }
+        assert!(
+            quay_housing >= 16,
+            "{quay_housing} housing places near the outfall jobs"
+        );
+        let employment = plan
+            .districts
+            .iter()
+            .find(|district| district.key == "employment")
+            .unwrap();
+        let store = &map.buildings()[opening.sites["employment/supermarket"]];
+        assert!(contains(&employment.polygon, store.obb.center()));
+        let entry = super::super::layout::design_point(vec2(2350.0, 1960.0), plan.config);
+        assert!(store.obb.center().distance(entry) <= 100.0,
+            "the employment supermarket should fit within 100 m of the staffed town-facing frontage");
+        let east_homes = super::super::layout::design_point(vec2(2438.0, 938.0), plan.config);
+        let fire_station = prototypes::GoodsCompanyID::new("fire-station");
+        let nearest_fire = map.buildings().values()
+            .filter(|building| building.kind.as_goods_company() == Some(fire_station))
+            .map(|building| building.obb.center().distance(east_homes))
+            .fold(f32::INFINITY, f32::min);
+        assert!(nearest_fire <= 140.0,
+            "the nearest fire station is {nearest_fire:.1} m from uncovered South frontage");
+        let local_road = built.links[&SourceKey::Way { id: 1465713103, span: 1 }].road;
+        let avenue = built.links[&SourceKey::Way { id: 64047075, span: 1 }].road;
+        let west = super::super::layout::design_point(vec2(2446.6, 1255.7), plan.config);
+        let east = super::super::layout::design_point(vec2(2569.0, 1282.0), plan.config);
+        let distance = reach.distance(
+            reach.position(local_road, west).unwrap(),
+            reach.position(avenue, east).unwrap(),
+        );
+        eprintln!("South frontage to Alpska walk: {distance:.1} m");
+        assert!(distance <= 170.0,
+            "the walk from South homes to the Alpska shops is {distance:.1} m");
+        let hraska_egress = built.junctions[&SourceKey::Node {
+            id: 4193639666,
+            rail: false,
+        }];
+        let junction = &map.intersections()[hraska_egress];
+        assert_eq!(junction.light_policy, simulation::map::LightPolicy::Lights);
+        assert!(!junction.turn_policy.left_turns);
+        let bend = built.links[&SourceKey::Way { id: 461688158, span: 1 }].road;
+        let road = &map.roads()[bend];
+        assert_eq!(
+            road.lanes_iter().filter(|(_, kind)| *kind == LaneKind::Driving).count(),
+            2,
+        );
+        assert!(
+            road.lanes_iter().all(|(_, kind)| kind != LaneKind::Parking),
+            "the Hraška school bend must keep curb manoeuvres clear of the turn onto the collector",
+        );
+        let exit = built.links[&SourceKey::Way { id: 1426155807, span: 0 }].road;
+        let (_, entering) = road.points().point_dir_along(road.points().length());
+        let (_, leaving) = map.roads()[exit].points().point_dir_along(0.0);
+        assert!(entering.xy().dot(leaving.xy()) > 0.95,
+            "the collector arms at the Hraška school bend need a shared tangent");
+        let ridge = built.links[&SourceKey::Way { id: 419255436, span: 2 }].road;
+        let park = built.links[&SourceKey::Authored("hraska-park-approach")].road;
+        let west = super::super::layout::design_point(vec2(1502.9, 2293.9), plan.config);
+        let east = super::super::layout::design_point(vec2(1636.0, 2398.0), plan.config);
+        let distance = reach.distance(
+            reach.position(ridge, west).unwrap(),
+            reach.position(park, east).unwrap(),
+        );
+        eprintln!("Hraška ridge to jobs and shops across the railway: {distance:.1} m");
+        assert!(distance <= 200.0,
+            "the Hraška walk past the railway is {distance:.1} m");
+        let culdesac = built.links[&SourceKey::Way { id: 419255437, span: 0 }].road;
+        assert!(map.roads()[culdesac].lanes_iter().all(|(_, kind)| kind == LaneKind::Walking));
+        drop(map);
+        paint(&mut sim, opening.parcels.iter()).unwrap();
+        verify_votes(&sim, opening.parcels.iter()).unwrap();
+        let mut updated = (*sim.map()).clone();
+        updated.update();
+        super::super::resolve_network(&updated, &plan.graph).unwrap();
+    }
 
     #[test]
     fn cm2_publish_keeps_the_west_south_shortcut_walkable() {
@@ -3821,13 +4937,61 @@ mod tests {
     }
 
     #[test]
-    fn cm2_gate_needs_use_settled_baskets_and_integrated_population() {
-        assert!(needs_met(100, 94, 10, 240, 1, 1));
-        assert!(!needs_met(0, 0, 0, 240, 1, 1));
-        assert!(!needs_met(100, 93, 0, 240, 1, 1));
-        assert!(!needs_met(100, 100, 11, 240, 1, 1));
-        assert!(!needs_met(100, 100, 0, 0, 1, 1));
-        assert!(!needs_met(100, 100, 0, 240, 1, 0));
+    fn cm2_gate_needs_require_settled_baskets_and_visits() {
+        assert!(needs_met(100, 94, 1, 1));
+        assert!(!needs_met(0, 0, 1, 1));
+        assert!(!needs_met(100, 93, 1, 1));
+        assert!(!needs_met(100, 101, 1, 1));
+        assert!(!needs_met(100, 100, 0, 1));
+        assert!(!needs_met(100, 100, 1, 0));
+    }
+
+    #[test]
+    fn cm2_checkpoint_activity_requires_a_boarded_transit_passenger() {
+        use simulation::map_dynamic::transit::BusRun;
+
+        let (mut sim, _, _) = super::super::spacing::cm0_boundary_fixture();
+        let lot = sim.map().lots().keys().next().unwrap();
+        sim.apply_commands([&WorldCommand::MapBuildHouse(lot)]);
+        let house = sim.map().buildings().iter()
+            .find_map(|(id, site)| (site.kind == BuildingKind::House).then_some(id))
+            .unwrap();
+        crate::builders::seed_households(&mut sim, &[house]).unwrap();
+        let resident = sim.world().humans.keys().next().unwrap();
+        let freight = Freight {
+            terminal: BuildingID::default(),
+            station: FreightStationID::default(),
+            market: BuildingID::default(),
+            train: TrainID::default(),
+            market_lane: LaneID::default(),
+            market_offset: 0.0,
+            bakery: BuildingID::default(),
+        };
+        let bus = VehicleID::default();
+        sim.write::<Transit>().runs.insert(bus, BusRun {
+            line: LineID::default(),
+            next_stop_idx: 1,
+            dwell_until: None,
+            leg_started: Tick(0),
+            failures: 0,
+        });
+        assert!(!checkpoint_activity(&sim, &freight).contains_key("transit"));
+        sim.world_mut_unchecked().humans[resident].location = Location::Transit(bus);
+        assert!(checkpoint_activity(&sim, &freight).contains_key("transit"));
+        sim.world_mut_unchecked().humans[resident].location = Location::Vehicle(bus);
+        assert!(!checkpoint_activity(&sim, &freight).contains_key("transit"));
+    }
+
+    #[test]
+    fn cm2_gate_food_stockouts_average_three_scored_days() {
+        let accepts = |days: [u64; 3]| food_stockouts_pass(&days.map(|stockout| (stockout, 2400)));
+        assert!(accepts([91, 95, 113]));
+        assert!(accepts([90, 90, 120]));
+        assert!(!accepts([89, 90, 121]));
+        assert!(!accepts([91, 90, 120]));
+        assert!(food_stockouts_pass(&[(90, 2400), (90, 2400), (240, 4800)]));
+        assert!(!food_stockouts_pass(&[(0, 2400), (0, 2400), (0, 0)]));
+        assert!(!food_stockouts_pass(&[(0, 2400), (0, 2400)]));
     }
 
     #[test]
@@ -3866,7 +5030,6 @@ mod tests {
         simulation::init::init();
         let item = ItemID::new("goods");
         let mut monitor = FreightMonitor {
-            terminal_door: Vec3::ZERO,
             market_position: Vec2::ZERO,
             train_state: None,
             latest_unload: None,
@@ -4008,6 +5171,33 @@ mod tests {
     }
 
     #[test]
+    fn cm2_bridge_entry_alone_is_not_a_completed_crossing() {
+        let entry = Vec3::ZERO;
+        let middle = Vec3::new(50.0, 0.0, 0.0);
+        let exit = Vec3::new(100.0, 0.0, 0.0);
+        let mut progress = BridgeProgress::Approaching;
+        progress.observe(false, entry, entry, exit);
+        assert!(progress == BridgeProgress::Approaching, "nearby road");
+        progress.observe(true, middle, entry, exit);
+        progress.observe(true, exit, entry, exit);
+        assert!(progress == BridgeProgress::Approaching, "started on the deck");
+
+        progress.observe(true, entry, entry, exit);
+        progress.observe(true, middle, entry, exit);
+        progress.observe(true, middle, entry, exit);
+        assert!(progress == BridgeProgress::OnDeck, "stopped halfway");
+        progress.observe(false, middle, entry, exit);
+        progress.observe(true, exit, entry, exit);
+        assert!(progress == BridgeProgress::Abandoned, "turned back before the exit");
+
+        let mut progress = BridgeProgress::Approaching;
+        progress.observe(true, entry, entry, exit);
+        progress.observe(true, middle, entry, exit);
+        progress.observe(true, exit, entry, exit);
+        assert!(progress == BridgeProgress::Completed);
+    }
+
+    #[test]
     fn cm2_stationary_vehicle_keeps_permissive_time_across_a_red() {
         use simulation::transportation::spawn_driving_vehicle;
 
@@ -4031,7 +5221,7 @@ mod tests {
         let mut traffic = Traffic::default();
         for (sample, seconds) in [green, green, red, green].into_iter().enumerate() {
             sim.write::<GameTime>().seconds = seconds;
-            traffic.observe(&sim, sample as u64 * SAMPLE_TICKS);
+            traffic.observe(&sim, sample as u64 * SAMPLE_TICKS, &mut BridgeTraffic::default());
         }
         assert_eq!(traffic.max_standing_ticks, 2 * SAMPLE_TICKS);
     }
@@ -4090,15 +5280,15 @@ mod tests {
         let second = spawn(&mut sim, approach, Some(13.0));
         let mut traffic = Traffic::default();
         let minute = TICKS_PER_MINUTE;
-        traffic.observe(&sim, 0);
-        traffic.observe(&sim, 10 * minute);
+        traffic.observe(&sim, 0, &mut BridgeTraffic::default());
+        traffic.observe(&sim, 10 * minute, &mut BridgeTraffic::default());
         assert_eq!(traffic.max_blocking_ticks, 10 * minute);
         {
             let vehicles = &mut sim.world_mut_unchecked().vehicles;
             vehicles[first].vehicle.state = VehicleState::ParkedAtDepot;
             vehicles[second].trans.pos = vehicles[first].trans.pos;
         }
-        traffic.observe(&sim, 20 * minute);
+        traffic.observe(&sim, 20 * minute, &mut BridgeTraffic::default());
         assert_eq!(traffic.max_blocking_ticks, 20 * minute);
 
         // One car clears the turn entirely between traffic samples while
@@ -4117,12 +5307,12 @@ mod tests {
         assert!(map.lanes()[egress].points.first().distance2(car.trans.pos) > 30.0_f32.powi(2));
         car.speed.0 = 1.0;
         traffic.probe_egresses(&sim);
-        traffic.observe(&sim, 21 * minute);
+        traffic.observe(&sim, 21 * minute, &mut BridgeTraffic::default());
         assert_eq!(traffic.blocked_egresses[&egress].start, 21 * minute);
 
         sim.world_mut_unchecked().vehicles[blocker].vehicle.state = VehicleState::ParkedAtDepot;
         sim.world_mut_unchecked().vehicles[replacement].vehicle.state = VehicleState::ParkedAtDepot;
-        traffic.observe(&sim, 22 * minute);
+        traffic.observe(&sim, 22 * minute, &mut BridgeTraffic::default());
         assert!(traffic.blocked_egresses.is_empty());
     }
 

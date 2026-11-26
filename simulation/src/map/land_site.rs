@@ -3,7 +3,7 @@ use prototypes::BuildingGen;
 
 use super::{
     base_node_support, Building, BuildingID, IntersectionID, LandDenial, LandTileId, LotID, Map,
-    ProjectFilter, ProjectKind, RoadID, Zone,
+    ProjectFilter, ProjectKind, Road, RoadID, Zone,
 };
 
 pub(crate) enum PreparedEffects<'a> {
@@ -90,6 +90,38 @@ impl Map {
         points: &[Vec2],
         purchased: Option<LandTileId>,
     ) -> Result<(), LandDenial> {
+        self.authorize_land_footprint_with_deck(points, purchased, None)
+    }
+
+    pub(super) fn authorize_existing_road_deck(&self, id: RoadID) -> Result<(), LandDenial> {
+        self.mutable_object(id.into())?;
+        let road = self.get(id).ok_or(LandDenial::RequiresMutableAccess)?;
+        // The existing road already joins these junctions. Its deck and the
+        // shared junction outline can overlap at the trimmed interface.
+        for triangle in super::land_deck_triangles(road) {
+            self.authorize_existing_road_triangle(road, triangle)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn authorize_existing_road_triangle(
+        &self,
+        live: &Road,
+        triangle: [Vec3; 3],
+    ) -> Result<(), LandDenial> {
+        self.authorize_land_footprint_with_deck(
+            &triangle.map(Vec3::xy),
+            None,
+            Some((live, triangle)),
+        )
+    }
+
+    fn authorize_land_footprint_with_deck(
+        &self,
+        points: &[Vec2],
+        purchased: Option<LandTileId>,
+        deck: Option<(&Road, [Vec3; 3])>,
+    ) -> Result<(), LandDenial> {
         self.land_ownership().check_polygon(points, purchased)?;
         let bounds = Polygon::from(points).bbox();
         for object in self.spatial_map.construction_candidates(
@@ -100,9 +132,38 @@ impl Map {
                 continue;
             }
             let overlaps = match object {
-                ProjectKind::Road(id) => super::land_deck_triangles(&self.roads[id])
-                    .any(|triangle| polygons_overlap(points, &triangle.map(|p| p.xy()))),
+                ProjectKind::Road(id) => {
+                    let road = &self.roads[id];
+                    let shared = deck.and_then(|(deck_road, _)| {
+                        [deck_road.src, deck_road.dst]
+                            .into_iter()
+                            .find(|end| [road.src, road.dst].contains(end))
+                            .map(|end| {
+                                let radius =
+                                    road.interface_from(end).max(deck_road.interface_from(end))
+                                        + (road.width + deck_road.width) * 0.5;
+                                (self.intersections[end].pos.xy(), radius * radius)
+                            })
+                    });
+                    let at_interface = |triangle: [Vec3; 3]| {
+                        shared.is_some_and(|(center, radius_squared)| {
+                            triangle
+                                .iter()
+                                .all(|p| p.xy().distance2(center) <= radius_squared)
+                        })
+                    };
+                    super::land_deck_triangles(road).any(|triangle| {
+                        !deck.is_some_and(|(_, existing)| {
+                            at_interface(existing)
+                                || at_interface(triangle)
+                                || decks_separated(height_range(existing), height_range(triangle))
+                        }) && polygons_overlap(points, &triangle.map(Vec3::xy))
+                    })
+                }
                 ProjectKind::Intersection(id) => {
+                    if deck.is_some_and(|(road, _)| id == road.src || id == road.dst) {
+                        continue;
+                    }
                     let outline = self
                         .land_junction_outline(id)
                         .map_err(|_| LandDenial::WorkLimit)?;
@@ -301,6 +362,17 @@ impl Map {
         let footprint = OBB::new(berth.xy(), axis, 30.0, 4.0);
         self.authorize_land_effects(PreparedEffects::Footprint(&footprint.corners))
     }
+}
+
+fn height_range(points: [Vec3; 3]) -> (f32, f32) {
+    let [a, b, c] = points.map(|point| point.z);
+    (a.min(b).min(c), a.max(b).max(c))
+}
+
+fn decks_separated((min_a, max_a): (f32, f32), (min_b, max_b): (f32, f32)) -> bool {
+    // Commissioned corridors may have a grade-separated street beneath them.
+    // Use a conservative clearance over both entire triangles.
+    min_a - max_b >= 6.5 || min_b - max_a >= 6.5
 }
 
 pub(super) fn rect_corners(bounds: AABB) -> [Vec2; 4] {

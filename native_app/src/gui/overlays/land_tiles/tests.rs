@@ -142,10 +142,14 @@ fn land_tiles_confirmation_respects_backpressure_and_waits_for_authority() {
     assert!(state.pending.is_none());
     assert_eq!(state.receipt, Some(receipt));
     assert_eq!(
-        purchase_error(Rejection::InsufficientFunds),
+        purchase_error(Rejection::InsufficientFunds, PopulationScale::REALISTIC),
         "Not enough money"
     );
-    assert!(purchase_error(Rejection::Locked { milestone: 1 }).contains("100 residents"));
+    assert!(purchase_error(
+        Rejection::Locked { milestone: 1 },
+        PopulationScale::try_new(8).unwrap()
+    )
+    .contains("800 residents"));
 }
 
 #[test]

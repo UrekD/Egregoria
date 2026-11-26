@@ -6,7 +6,7 @@ use goryak::{
 };
 use simulation::economy::{DemandDriver, ZoneDemand};
 use simulation::map::ZoneKind;
-use simulation::Simulation;
+use simulation::{PopulationScale, Simulation};
 use yakui::paint::PaintRect;
 use yakui::{reflow, Alignment, Color, Dim2, Pivot, Rect, Vec2};
 
@@ -19,41 +19,51 @@ pub fn render(_: &UiWorld, sim: &Simulation) {
         || {
             blur_bg(secondary_container().with_alpha(0.9), 8.0, || {
                 padxy(10.0, 7.0, || {
-                    minrow(9.0, || {
-                        for zone in ZoneKind::ALL {
-                            let value = demand_value(&demand, zone);
-                            let tint = zone_color(zone);
-                            let color = Color::from_linear(<[f32; 4]>::from(tint).into());
-                            let hovered = is_hovered(|| {
-                                mincolumn(3.0, || {
-                                    monospace(
-                                        color,
-                                        format!("{} {:>4}", zone.abbreviation(), score(value)),
-                                    );
-                                    bar(value.unwrap_or_default(), color);
+                    mincolumn(5.0, || {
+                        minrow(9.0, || {
+                            for zone in ZoneKind::ALL {
+                                let value = demand_value(&demand, zone);
+                                let tint = zone_color(zone);
+                                let color = Color::from_linear(<[f32; 4]>::from(tint).into());
+                                let hovered = is_hovered(|| {
+                                    mincolumn(3.0, || {
+                                        monospace(
+                                            color,
+                                            format!("{} {:>4}", zone.abbreviation(), score(value)),
+                                        );
+                                        bar(value.unwrap_or_default(), color);
+                                    });
                                 });
-                            });
-                            if hovered.hovered {
-                                reflow(
-                                    Alignment::BOTTOM_LEFT,
-                                    Pivot::TOP_LEFT,
-                                    Dim2::pixels(0.0, 9.0),
-                                    || {
-                                        blur_bg(secondary_container(), 7.0, || {
-                                            padxy(10.0, 7.0, || {
-                                                mincolumn(3.0, || {
-                                                    textc(
-                                                        color,
-                                                        format!("{} demand", zone_name(zone)),
-                                                    );
-                                                    demand_details(sim, &demand, zone);
+                                if hovered.hovered {
+                                    reflow(
+                                        Alignment::BOTTOM_LEFT,
+                                        Pivot::TOP_LEFT,
+                                        Dim2::pixels(0.0, 9.0),
+                                        || {
+                                            blur_bg(secondary_container(), 7.0, || {
+                                                padxy(10.0, 7.0, || {
+                                                    mincolumn(3.0, || {
+                                                        textc(
+                                                            color,
+                                                            format!("{} demand", zone_name(zone)),
+                                                        );
+                                                        demand_details(sim, &demand, zone);
+                                                    });
                                                 });
                                             });
-                                        });
-                                    },
-                                );
+                                        },
+                                    );
+                                }
                             }
-                        }
+                        });
+                        let scale = sim.population_scale();
+                        let population = scale.persons(sim.world().humans.len());
+                        let label = if scale == PopulationScale::REALISTIC {
+                            format!("Population {population}")
+                        } else {
+                            format!("Population {population} · {scale}")
+                        };
+                        textc(on_secondary_container(), label);
                     });
                 });
             });

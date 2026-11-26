@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use common::saveload::{self, SlotId};
 
@@ -12,6 +12,10 @@ struct Publication {
     generation: u64,
     next_id: u64,
     request: Option<(SlotId, Weak<AtomicBool>)>,
+}
+
+pub(crate) struct PublicationGuard<'a> {
+    _state: MutexGuard<'a, Publication>,
 }
 
 #[derive(Clone)]
@@ -48,15 +52,19 @@ impl SaveCoordinator {
         })
     }
 
-    pub(crate) fn is_current(&self, permit: &SavePermit) -> bool {
-        self.0.lock().unwrap().allows(permit)
+    /// Enter after capture, encoding and replay staging. Keep the gate
+    /// through snapshot replacement and the sidecar updates.
+    pub(crate) fn begin_publish(&self, permit: &SavePermit) -> Option<PublicationGuard<'_>> {
+        let state = self.0.lock().unwrap();
+        state
+            .allows(permit)
+            .then_some(PublicationGuard { _state: state })
     }
 
-    /// The caller releases the simulation read lock before publishing.
-    /// Hold the gate through the snapshot rename and the sidecar updates.
+    #[cfg(test)]
     pub(crate) fn publish<T>(&self, permit: &SavePermit, publish: impl FnOnce() -> T) -> Option<T> {
-        let state = self.0.lock().unwrap();
-        state.allows(permit).then(publish)
+        let _guard = self.begin_publish(permit)?;
+        Some(publish())
     }
 
     pub(crate) fn delete(&self, generation: u64, root: &Path, id: &SlotId) -> std::io::Result<()> {
@@ -93,8 +101,10 @@ impl SaveCoordinator {
 
 impl Publication {
     fn swap(&mut self, generation: u64) {
-        if let Some((_, request)) = self.request.take() {
-            cancel(&request);
+        // A cancelled worker may still own a capture. Keep its permit reserved
+        // until it releases those buffers, including across a generation swap.
+        if let Some((_, request)) = &self.request {
+            cancel(request);
         }
         self.generation = generation;
     }
@@ -107,5 +117,23 @@ impl Publication {
 fn cancel(request: &Weak<AtomicBool>) {
     if let Some(request) = request.upgrade() {
         request.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_save_reserves_one_capture_across_generation_swap() {
+        let coordinator = SaveCoordinator::default();
+        let slot = SlotId::legacy();
+        let permit = coordinator.request(0, &slot).unwrap();
+        assert!(coordinator.try_swap(1));
+        assert!(permit.cancelled());
+        assert!(coordinator.publish(&permit, || ()).is_none());
+        assert!(coordinator.request(1, &slot).is_none());
+        drop(permit);
+        assert!(coordinator.request(1, &slot).is_some());
     }
 }

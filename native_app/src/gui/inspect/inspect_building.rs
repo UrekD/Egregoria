@@ -18,7 +18,7 @@ use simulation::souls::freight_station::FreightTrainState;
 use simulation::souls::residence::Residences;
 use simulation::transportation::Location;
 use simulation::world_command::WorldCommand;
-use simulation::{Simulation, SoulID};
+use simulation::{PopulationScale, Simulation, SoulID};
 use std::borrow::Cow;
 use yakui::widgets::Pad;
 use yakui::Vec2;
@@ -41,6 +41,7 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
     let Some(diagnostics) = building_diagnostics(sim, id) else {
         return false;
     };
+    let scale = sim.population_scale();
 
     let title: &str = match building.kind {
         BuildingKind::House => "House",
@@ -79,7 +80,8 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                             ));
                             label(format!(
                                 "Jobs  {} / {}",
-                                site.filled_jobs, site.planned_jobs
+                                scale.persons(site.filled_jobs),
+                                scale.persons(site.planned_jobs as usize)
                             ));
                             match site.business {
                                 Some(GrowableBusinessState::AwaitingSpawn) => {
@@ -105,7 +107,10 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                                 density_name(proto.density),
                                 proto.level
                             ));
-                            label(format!("Job capacity  {}", proto.n_workers));
+                            label(format!(
+                                "Job capacity  {}",
+                                scale.persons(proto.n_workers as usize)
+                            ));
                         }
                         render_goodscompany(uiworld, sim, building);
                     }
@@ -181,6 +186,8 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         .iter()
         .filter(|(_, human)| human.work.is_some())
         .count();
+    let scale = sim.population_scale();
+    let population = scale.persons(residents.len());
     if !b.is_mixed_use() {
         label(format!(
             "Residential · {} density · Level {level}",
@@ -188,10 +195,14 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         ));
     }
     if let Some(capacity) = capacity {
-        label(format!("Residents  {} / {capacity}", residents.len()));
+        let capacity = scale.persons(capacity as usize);
+        label(format!("Residents  {population} / {capacity}"));
     }
     if !residents.is_empty() {
-        label(format!("Employment  {employed} / {}", residents.len()));
+        label(format!(
+            "Employment  {} / {population}",
+            scale.persons(employed)
+        ));
     }
 
     if !residents.is_empty() {
@@ -357,13 +368,18 @@ fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     let elec_flow = &*sim.read::<ElectricityFlow>();
 
     let max_workers = goods.max_workers;
+    let scale = sim.population_scale();
     ProgressBar {
-        value: workers.0.len() as f32 / max_workers as f32,
+        value: workers.0.len() as f32 / max_workers.max(1) as f32,
         size: Vec2::new(200.0, 25.0),
         color: primary().adjust(0.7),
     }
     .show_children(|| {
-        label(format!("workers: {}/{}", workers.0.len(), max_workers));
+        label(format!(
+            "Workers  {} / {}",
+            scale.persons(workers.0.len()),
+            scale.persons(max_workers as usize)
+        ));
     });
 
     if let Some(driver) = goods.driver {
@@ -444,17 +460,29 @@ fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
 
     fixed_spacer((0.0, 10.0));
     label("Storage");
+    render_company_storage(uiworld, market, c_id.into(), scale);
+}
 
-    let jobopening = ItemID::new("job-opening");
-    for (&id, m) in market.iter() {
-        let Some(v) = m.capital(c_id.into()) else {
-            continue;
-        };
-        if id == jobopening && v == 0 {
+fn render_company_storage(
+    uiworld: &UiWorld,
+    market: &Market,
+    company: SoulID,
+    scale: PopulationScale,
+) {
+    let jobs = ItemID::new("job-opening");
+    for (&id, item_market) in market.iter() {
+        if id == jobs {
+            if let Some(order) = item_market
+                .sell_order(company)
+                .filter(|order| order.qty > 0)
+            {
+                label(format!("Vacant jobs {}", scale.persons(order.qty as usize)));
+            }
             continue;
         }
-
-        item_icon_yakui(uiworld, id, v);
+        if let Some(quantity) = item_market.capital(company) {
+            item_icon_yakui(uiworld, id, quantity);
+        }
     }
 }
 
@@ -494,6 +522,59 @@ fn render_recipe(uiworld: &UiWorld, recipe: &Recipe) {
 mod tests {
     use super::*;
     use prototypes::{TICKS_PER_HOUR, TICKS_PER_MINUTE};
+    use yakui::widgets::TextWidget;
+
+    #[test]
+    fn population_scale_company_storage_displays_job_vacancies_as_people() {
+        fn collect_labels(ui: &yakui::Yakui, id: yakui::WidgetId, labels: &mut Vec<String>) {
+            let node = ui.dom().get(id).unwrap();
+            if let Some(text) = node.widget.downcast_ref::<TextWidget>() {
+                labels.push(format!("{text:?}"));
+            }
+            for &child in &node.children {
+                collect_labels(ui, child, labels);
+            }
+        }
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let sim = Simulation::new(false);
+        let company = SoulID::GoodsCompany(Default::default());
+        let jobs = ItemID::new("job-opening");
+        let groceries = ItemID::new("groceries");
+        let mut market = sim.write::<Market>();
+        market.produce(company, jobs, 7);
+        market.sell(company, geom::Vec2::ZERO, jobs, 7, 0);
+        market.produce(company, groceries, 3);
+        let mut uiworld = UiWorld::with_defaults();
+        uiworld.insert(crate::gui::textures::UiTextures::default());
+        let mut ui = yakui::Yakui::new();
+        ui.set_surface_size(Vec2::splat(500.0));
+        ui.start();
+        render_company_storage(
+            &uiworld,
+            &market,
+            company,
+            PopulationScale::try_new(8).unwrap(),
+        );
+        ui.finish();
+        let mut labels = Vec::new();
+        collect_labels(&ui, ui.dom().root(), &mut labels);
+        assert!(
+            labels
+                .iter()
+                .any(|text| text.contains("\"Vacant jobs 56\"")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|text| text.contains("\"x3\"")),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|text| text.contains("\"x7\"")),
+            "{labels:?}"
+        );
+    }
 
     #[test]
     fn qw1_import_wait_uses_elapsed_game_time() {

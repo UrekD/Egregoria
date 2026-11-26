@@ -168,7 +168,7 @@ fn p4_replay_recognizes_the_constructor_batch_in_legacy_recordings() {
 }
 
 #[test]
-fn p4_replay_rejects_small_bootstrap_but_legacy_snapshot_loads() {
+fn population_scale_accepts_legacy_small_replay_and_snapshot() {
     drop(TestCtx::new());
     let terrain_size = NewGameOptions::MIN_TERRAIN_CHUNKS - 1;
     assert!(!NewGameOptions {
@@ -196,8 +196,11 @@ fn p4_replay_rejects_small_bootstrap_but_legacy_snapshot_loads() {
             ..SimulationOptions::LEGACY
         })),
     );
-    let err = Simulation::try_from_replay(replay).err().unwrap();
-    assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+    let (replayed, _) = Simulation::try_from_replay(replay).unwrap();
+    assert_eq!(
+        replayed.map().environment().size(),
+        (terrain_size, terrain_size)
+    );
 }
 
 #[test]

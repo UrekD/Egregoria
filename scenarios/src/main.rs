@@ -4,6 +4,7 @@ use scenarios::builtin::{
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
 use serde::Serialize;
+use simulation::economy::population::PopulationScale;
 use simulation::SlotId;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -27,7 +28,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios scaled-showcase --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH] [--dry]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K] [--persons-per-agent N]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
 }
 
 fn main() -> ExitCode {
@@ -87,6 +88,7 @@ fn run_benchmark(name: &str, mut args: impl Iterator<Item = OsString>) -> Result
     let mut warmup = None;
     let mut ticks = None;
     let mut workers = None;
+    let mut scale = None;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--houses") if name == "perf_scale" && agents.is_none() => {
@@ -119,6 +121,10 @@ fn run_benchmark(name: &str, mut args: impl Iterator<Item = OsString>) -> Result
             Some("--sim-threads") if workers.is_none() => {
                 workers = Some(number_arg(&mut args, "--sim-threads")?)
             }
+            Some("--persons-per-agent") if name == "perf-scale" && scale.is_none() => {
+                let n = number_arg(&mut args, "--persons-per-agent")?;
+                scale = Some(PopulationScale::try_new(n).map_err(|error| error.to_string())?);
+            }
             _ => return Err(format!("unexpected {name} argument {arg:?}")),
         }
     }
@@ -147,7 +153,11 @@ fn run_benchmark(name: &str, mut args: impl Iterator<Item = OsString>) -> Result
         if name == "perf_scale" {
             perf_scale::benchmark_paris(case)?
         } else {
-            perf_scale::benchmark_layout(case, layout.ok_or("perf-scale requires --layout")?)?
+            perf_scale::benchmark_layout_with_scale(
+                case,
+                layout.ok_or("perf-scale requires --layout")?,
+                scale.unwrap_or_default(),
+            )?
         }
     };
     println!(
@@ -213,7 +223,10 @@ fn run() -> Result<(), String> {
     if name == "water-perf-fixtures" {
         return water_fixtures::perf_cli(args);
     }
-    if matches!(name.as_str(), "demo-cities" | "water-fixtures") {
+    if matches!(
+        name.as_str(),
+        "demo-cities" | "scaled-showcase" | "water-fixtures"
+    ) {
         if args.next().as_deref() != Some(std::ffi::OsStr::new("--save-root")) {
             return Err(format!("usage: scenarios {name} --save-root <dir>"));
         }
@@ -221,10 +234,10 @@ fn run() -> Result<(), String> {
         if let Some(arg) = args.next() {
             return Err(format!("unexpected {name} argument {arg:?}"));
         }
-        return if name == "water-fixtures" {
-            water_fixtures::generate(&root)
-        } else {
-            demo_cities::generate(&root)
+        return match name.as_str() {
+            "water-fixtures" => water_fixtures::generate(&root),
+            "scaled-showcase" => demo_cities::generate_scaled_showcase(&root),
+            _ => demo_cities::generate(&root),
         };
     }
     let available: Vec<_> = match name.as_str() {

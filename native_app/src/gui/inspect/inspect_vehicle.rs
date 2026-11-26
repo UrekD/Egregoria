@@ -1,6 +1,7 @@
 use crate::gui::inspect::{entity_link, follow_button};
 use crate::uiworld::UiWorld;
 use goryak::{mincolumn, minrow, on_secondary_container, textc, VertScrollSize, Window};
+use simulation::map_dynamic::transit::BUS_CAPACITY;
 use simulation::transportation::{Location, VehicleKind, VehicleState};
 use simulation::{Simulation, VehicleID};
 use yakui::widgets::Pad;
@@ -56,9 +57,14 @@ pub fn inspect_vehicle(uiworld: &UiWorld, sim: &Simulation, id: VehicleID) -> bo
                         .then_some(human_id)
                 })
                 .collect();
+            let scale = sim.population_scale();
             textc(
                 on_secondary_container(),
-                format!("Passengers  {}", passengers.len()),
+                format!(
+                    "Passengers  {} / {}",
+                    scale.persons(passengers.len()),
+                    scale.persons(BUS_CAPACITY)
+                ),
             );
             if !passengers.is_empty() {
                 VertScrollSize::Fixed(210.0).show(|| {

@@ -1,8 +1,8 @@
 use goryak::{
-    button_primary, button_secondary, error, minrow, on_secondary_container,
-    selectable_label_primary, text_edit, textc,
+    button_primary, button_secondary, constrained_viewport, error, mincolumn, minrow,
+    on_secondary_container, selectable_label_primary, text_edit, textc, VertScrollSize,
 };
-use simulation::economy::progression::ProgressionMode;
+use simulation::economy::{population::PopulationScale, progression::ProgressionMode};
 use simulation::map::LotLayout;
 use simulation::{MapPreset, NewGameOptions, Simulation};
 
@@ -18,6 +18,7 @@ pub(super) struct NewGameForm {
     preset: MapPreset,
     progression: ProgressionMode,
     lot_layout: LotLayout,
+    population_scale: PopulationScale,
     advanced: bool,
     record_replay: bool,
     error: Option<&'static str>,
@@ -70,6 +71,7 @@ impl NewGameForm {
             progression: self.progression,
             lot_layout: self.lot_layout,
             land_mode: Default::default(),
+            persons_per_agent: self.population_scale.persons_per_agent(),
         })
     }
 }
@@ -77,76 +79,22 @@ impl NewGameForm {
 pub(super) fn render(uiw: &UiWorld) {
     let mut ui = uiw.write::<SessionUi>();
     let form = &mut ui.new_game;
-    textc(on_secondary_container(), "City name");
-    text_edit(275.0, &mut form.name, "City name");
-
-    textc(on_secondary_container(), "Terrain preset");
-    minrow(8.0, || {
-        for (preset, label) in [
-            (MapPreset::Procedural, "Procedural"),
-            (MapPreset::Flat, "Flat"),
-            (MapPreset::Waters, "Waters"),
-        ] {
-            if selectable_label_primary(form.preset == preset, label).clicked {
-                form.preset = preset;
-            }
-        }
-    });
-
-    textc(on_secondary_container(), "City mode");
-    minrow(8.0, || {
-        for (mode, label) in [
-            (ProgressionMode::Guided, "Guided"),
-            (ProgressionMode::FreeBuild, "Free build"),
-        ] {
-            if selectable_label_primary(form.progression == mode, label).clicked {
-                form.progression = mode;
-            }
-        }
-    });
-
-    textc(on_secondary_container(), "Plots");
-    crate::gui::zoning::lot_layout_picker(form.lot_layout, |layout| {
-        form.lot_layout = layout;
-    });
-
-    textc(on_secondary_container(), "Seed (0 uses legacy generation)");
-    minrow(8.0, || {
-        text_edit(230.0, &mut form.seed, "Seed");
-        if button_secondary("Randomize").show().clicked {
-            form.seed = session::random_seed().to_string();
-        }
-    });
-
-    textc(on_secondary_container(), "Map size (16–80 chunks)");
-    minrow(8.0, || {
-        text_edit(65.0, &mut form.size, "Size");
-        for (size, label) in [("16", "Small"), ("50", "Standard"), ("80", "Large")] {
-            if selectable_label_primary(form.size == size, label).clicked {
-                form.size = size.into();
-            }
-        }
-    });
-
-    textc(on_secondary_container(), "Starting money (bucks)");
-    text_edit(175.0, &mut form.money, "Starting money");
-
-    if button_secondary("Advanced").show().clicked {
-        form.advanced ^= true;
-    }
-    if form.advanced && selectable_label_primary(form.record_replay, "Record debug replay").clicked
-    {
-        form.record_replay ^= true;
-    }
-    if let Some(message) = form.error {
-        textc(error(), message);
-    }
-
     let mut generate = false;
     let mut back = false;
-    minrow(8.0, || {
-        generate = button_primary("Create City").show().clicked;
-        back = button_secondary("Back").show().clicked;
+    constrained_viewport(|| {
+        mincolumn(8.0, || {
+            // Reserve space for window chrome and keep the actions outside the scroll area.
+            VertScrollSize::Percent(0.8).show(|| {
+                mincolumn(8.0, || render_fields(form));
+            });
+            if let Some(message) = form.error {
+                textc(error(), message);
+            }
+            minrow(8.0, || {
+                generate = button_primary("Create City").show().clicked;
+                back = button_secondary("Back").show().clicked;
+            });
+        });
     });
 
     if back {
@@ -184,4 +132,144 @@ pub(super) fn render(uiw: &UiWorld) {
             })
         });
     }
+}
+
+fn render_fields(form: &mut NewGameForm) {
+    textc(on_secondary_container(), "City name");
+    text_edit(275.0, &mut form.name, "City name");
+
+    textc(on_secondary_container(), "Terrain preset");
+    minrow(8.0, || {
+        for (preset, label) in [
+            (MapPreset::Procedural, "Procedural"),
+            (MapPreset::Flat, "Flat"),
+            (MapPreset::Waters, "Waters"),
+        ] {
+            if selectable_label_primary(form.preset == preset, label).clicked {
+                form.preset = preset;
+            }
+        }
+    });
+
+    textc(on_secondary_container(), "City mode");
+    minrow(8.0, || {
+        for (mode, label) in [
+            (ProgressionMode::Guided, "Guided"),
+            (ProgressionMode::FreeBuild, "Free build"),
+        ] {
+            if selectable_label_primary(form.progression == mode, label).clicked {
+                form.progression = mode;
+            }
+        }
+    });
+
+    crate::gui::zoning::lot_layout_picker(form.lot_layout, |layout| {
+        form.lot_layout = layout;
+    });
+
+    population_options(&mut form.population_scale);
+
+    textc(on_secondary_container(), "Seed (0 uses legacy generation)");
+    minrow(8.0, || {
+        text_edit(230.0, &mut form.seed, "Seed");
+        if button_secondary("Randomize").show().clicked {
+            form.seed = session::random_seed().to_string();
+        }
+    });
+
+    textc(on_secondary_container(), "Map size (16–80 chunks)");
+    minrow(8.0, || {
+        text_edit(65.0, &mut form.size, "Size");
+        for (size, label) in [("16", "Small"), ("50", "Standard"), ("80", "Large")] {
+            if selectable_label_primary(form.size == size, label).clicked {
+                form.size = size.into();
+            }
+        }
+    });
+
+    textc(on_secondary_container(), "Starting money (bucks)");
+    text_edit(175.0, &mut form.money, "Starting money");
+
+    if button_secondary("Advanced").show().clicked {
+        form.advanced ^= true;
+    }
+    if form.advanced && selectable_label_primary(form.record_replay, "Record debug replay").clicked
+    {
+        form.record_replay ^= true;
+    }
+}
+
+fn population_options(selected: &mut PopulationScale) {
+    textc(
+        on_secondary_container(),
+        format!("Population scale · {selected}"),
+    );
+    minrow(8.0, || {
+        for n in PopulationScale::PRESETS {
+            let scale = PopulationScale::try_new(n).expect("valid preset");
+            let label = if scale == PopulationScale::REALISTIC {
+                "Realistic".into()
+            } else {
+                format!("1:{n}")
+            };
+            if selectable_label_primary(*selected == scale, &label).clicked {
+                *selected = scale;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+#[test]
+fn population_scale_new_game_picker_passes_the_clicked_preset_to_bootstrap() {
+    use yakui::event::Event;
+    use yakui::input::MouseButton;
+    use yakui::widgets::ButtonWidget;
+    use yakui::{Rect, Vec2, WidgetId, Yakui};
+
+    fn button_rects(ui: &Yakui, id: WidgetId, output: &mut Vec<Rect>) {
+        let node = ui.dom().get(id).unwrap();
+        if node.widget.is::<ButtonWidget>() {
+            output.push(ui.layout_dom().get(id).unwrap().rect);
+        }
+        for &child in &node.children {
+            button_rects(ui, child, output);
+        }
+    }
+
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let mut form = NewGameForm {
+        preset: MapPreset::Flat,
+        size: "16".into(),
+        ..NewGameForm::fresh()
+    };
+    assert_eq!(form.options().unwrap().persons_per_agent, 1);
+    let viewport = Vec2::new(1024.0, 768.0);
+    let mut ui = Yakui::new();
+    ui.set_surface_size(viewport);
+    ui.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, viewport));
+    let render = |ui: &mut Yakui, form: &mut NewGameForm| {
+        ui.start();
+        yakui::column(|| population_options(&mut form.population_scale));
+        ui.finish();
+    };
+    render(&mut ui, &mut form);
+    let mut rects = Vec::new();
+    button_rects(&ui, ui.dom().root(), &mut rects);
+    assert_eq!(rects.len(), PopulationScale::PRESETS.len());
+    assert!(rects.iter().all(|rect| rect.max().x <= viewport.x));
+    let eight = rects[3];
+    ui.handle_event(Event::CursorMoved(Some(eight.pos() + eight.size() * 0.5)));
+    for down in [true, false] {
+        ui.handle_event(Event::MouseButtonChanged {
+            button: MouseButton::One,
+            down,
+        });
+    }
+    render(&mut ui, &mut form);
+    let options = form.options().unwrap();
+    assert_eq!(options.persons_per_agent, 8);
+    let city = Simulation::new_game(&options).unwrap();
+    assert_eq!(city.population_scale().to_string(), "Scaled (1:8)");
 }

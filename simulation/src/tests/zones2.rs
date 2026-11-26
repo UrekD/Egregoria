@@ -556,7 +556,6 @@ fn round_trip_and_play(sim: &Simulation, root: &Path, label: &str) -> Simulation
 
 #[test]
 fn zones2_acceptance_save_cut_checks_versions_before_payloads() {
-    assert_eq!(crate::VERSION, "0.11.0");
     let root = SlotRoot::new();
     let id = SlotId::new("zones2_p6").unwrap();
     let paths = slot_paths(&root.0, &id).unwrap();

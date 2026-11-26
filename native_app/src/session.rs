@@ -1613,28 +1613,30 @@ mod p4_fix_ac_tests {
 
     #[test]
     fn p4_fix_ac_catalog_remembers_a_failed_snapshot_until_it_changes() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
         let root = std::env::temp_dir().join(format!("p4-fix-ac-catalog-{}", random_seed()));
         std::fs::create_dir(&root).unwrap();
-        let path = root.join("city.bc");
-        std::fs::write(
-            &path,
-            [VERSION.len() as u8]
-                .into_iter()
-                .chain(VERSION.bytes())
-                .collect::<Vec<_>>(),
-        )
-        .unwrap();
+        let slot = SlotId::new("city").unwrap();
+        // The normal writer supplies a compatible header, but a world with no
+        // terrain fails when the selected snapshot is decoded.
+        Simulation::new(false)
+            .save_to_slot(&root, &slot, SnapshotRevision::new(1))
+            .unwrap();
         let mut state = SessionState::default();
         let catalog = discover_slots(&root).unwrap();
         let entry = continue_slot(&catalog).unwrap().clone();
-        assert!(Simulation::load_from_slot(&root, &entry.id).is_err());
+        assert!(matches!(
+            Simulation::load_listed_snapshot(&root, &entry),
+            Err(SaveLoadError::Corrupt { .. })
+        ));
         state.update_slot_catalog(Ok(catalog));
         state.mark_unreadable(&entry);
 
         state.update_slot_catalog(discover_slots(&root));
         assert!(continue_slot(&state.slots).is_none());
 
-        std::fs::File::open(path)
+        std::fs::File::open(entry.snapshot_path())
             .unwrap()
             .set_modified(entry.modified + Duration::from_secs(1))
             .unwrap();

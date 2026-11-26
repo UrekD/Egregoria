@@ -19,7 +19,7 @@ mod service;
 
 #[cfg(test)]
 pub(super) use service::tests::recovery_leg_fixture;
-pub use service::{transit_board_update, transit_dispatch_update};
+pub use service::{transit_board_update, transit_dispatch_update, BUS_CAPACITY};
 
 pub(crate) const WAIT_NOT_STARTED: Tick = Tick(u64::MAX);
 /// Waiting for a bus is bounded by bus movement, so real time (12 real minutes,

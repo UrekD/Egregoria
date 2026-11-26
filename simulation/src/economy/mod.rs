@@ -26,6 +26,7 @@ mod demand;
 mod ecostats;
 mod government;
 mod market;
+pub mod population;
 pub mod progression;
 pub mod transit_stats;
 mod trip_stats;

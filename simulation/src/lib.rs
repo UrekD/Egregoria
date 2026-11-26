@@ -26,7 +26,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::ptr::addr_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -66,6 +66,7 @@ pub mod world_command;
 pub use common::saveload::{
     list_slots_with_revisions, save_dir, SlotCamera, SlotId, SnapshotRevision,
 };
+pub use economy::population::PopulationScale;
 pub use map::{AuthoredTownError, AuthoredTownOptions};
 pub use world::*;
 
@@ -127,7 +128,13 @@ pub struct Simulation {
 
 const RNG_SEED: u64 = 123;
 const INITIAL_TICK: u64 = 1;
+const PRE_SCALE_VERSION: &str = "0.11.0";
+const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
 const VERSION: &str = include_str!("../../VERSION");
+
+fn compatible_save_version(version: &str) -> bool {
+    matches!(version, VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION)
+}
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MapPreset {
@@ -146,6 +153,7 @@ pub struct NewGameOptions {
     pub progression: ProgressionMode,
     pub lot_layout: LotLayout,
     pub land_mode: map::LandMode,
+    pub persons_per_agent: u16,
 }
 
 impl NewGameOptions {
@@ -159,6 +167,7 @@ impl NewGameOptions {
     }
 
     fn validate(&self) -> Result<(), NewGameError> {
+        PopulationScale::try_new(self.persons_per_agent)?;
         if !(Self::MIN_TERRAIN_CHUNKS..=Self::MAX_TERRAIN_CHUNKS).contains(&self.terrain_chunks) {
             return Err(NewGameError::TerrainChunks(self.terrain_chunks));
         }
@@ -197,6 +206,7 @@ pub enum NewGameError {
     StartingMoneyBucks(u32),
     Bootstrap(Rejection),
     Land(map::LandSetupError),
+    PersonsPerAgent(u16),
 }
 
 impl Display for NewGameError {
@@ -216,6 +226,12 @@ impl Display for NewGameError {
             ),
             Self::Land(reason) => write!(f, "Could not initialize tiled land ({reason:?})"),
             Self::Bootstrap(reason) => write!(f, "Could not initialize the map ({reason:?})"),
+            Self::PersonsPerAgent(n) => {
+                write!(
+                    f,
+                    "Invalid population ratio 1:{n}. Choose 1, 2, 4, 8 or 16."
+                )
+            }
         }
     }
 }
@@ -233,6 +249,7 @@ impl Default for NewGameOptions {
             progression: legacy.progression,
             lot_layout: LotLayout::Varied,
             land_mode: map::LandMode::Unrestricted,
+            persons_per_agent: legacy.persons_per_agent,
         }
     }
 }
@@ -248,9 +265,13 @@ pub struct SimulationOptions {
     pub progression: ProgressionMode,
     pub land_mode: map::LandMode,
     pub land_recipe: map::LandRecipe,
+    pub persons_per_agent: u16,
 }
 
 impl SimulationOptions {
+    const AUTHORED_TERRAIN_CHUNKS: std::ops::RangeInclusive<u16> =
+        1..=NewGameOptions::MAX_TERRAIN_CHUNKS;
+
     pub const LEGACY: Self = Self {
         terrain_size: 50,
         save_replay: true,
@@ -260,6 +281,7 @@ impl SimulationOptions {
         progression: ProgressionMode::FreeBuild,
         land_mode: map::LandMode::Unrestricted,
         land_recipe: map::LandRecipe::Unrestricted,
+        persons_per_agent: PopulationScale::REALISTIC.persons_per_agent(),
     };
 
     fn new_game_options(self) -> NewGameOptions {
@@ -269,16 +291,24 @@ impl SimulationOptions {
             terrain_chunks: self.terrain_size,
             starting_money_bucks: self.starting_money_bucks,
             progression: self.progression,
-            lot_layout: match self.land_recipe {
-                map::LandRecipe::Unrestricted => LotLayout::Varied,
-                map::LandRecipe::NativeFlatV1 { lot_layout }
-                | map::LandRecipe::AuthoredV1 { lot_layout, .. } => lot_layout,
-            },
+            lot_layout: self.recipe_lot_layout().unwrap_or_default(),
             land_mode: self.land_mode,
+            persons_per_agent: self.persons_per_agent,
+        }
+    }
+
+    fn recipe_lot_layout(self) -> Option<LotLayout> {
+        match self.land_recipe {
+            map::LandRecipe::Unrestricted => None,
+            map::LandRecipe::NativeFlatV1 { lot_layout }
+            | map::LandRecipe::AuthoredV1 { lot_layout, .. } => Some(lot_layout),
         }
     }
 
     fn valid_for_bootstrap(self) -> bool {
+        if self.population_scale().is_err() {
+            return false;
+        }
         // Legacy scenarios and tests can start with a small or empty map.
         match (self.land_mode, self.land_recipe) {
             (map::LandMode::Tiled, map::LandRecipe::NativeFlatV1 { .. }) => {
@@ -293,6 +323,24 @@ impl SimulationOptions {
                 && self.seed == Self::LEGACY.seed
                 && self.starting_money_bucks == Self::LEGACY.starting_money_bucks)
     }
+
+    fn population_scale(self) -> Result<PopulationScale, NewGameError> {
+        PopulationScale::try_new(self.persons_per_agent)
+    }
+
+    fn valid_for_authored_bootstrap(self) -> bool {
+        let minimum_money = if self.progression == ProgressionMode::Guided {
+            150_000
+        } else {
+            NewGameOptions::MIN_STARTING_MONEY_BUCKS
+        };
+        !self.save_replay
+            && self.preset == MapPreset::Flat
+            && self.population_scale().is_ok()
+            && Self::AUTHORED_TERRAIN_CHUNKS.contains(&self.terrain_size)
+            && (minimum_money..=NewGameOptions::MAX_STARTING_MONEY_BUCKS)
+                .contains(&self.starting_money_bucks)
+    }
 }
 
 impl Default for SimulationOptions {
@@ -301,7 +349,132 @@ impl Default for SimulationOptions {
     }
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum MapConstructor {
+    NewGame,
+    Imported,
+    AuthoredFlat,
+    AuthoredTown,
+    AuthoredTiled,
+}
+
+impl MapConstructor {
+    fn is_authored(self) -> bool {
+        matches!(self, Self::AuthoredFlat | Self::AuthoredTown | Self::AuthoredTiled)
+    }
+}
+
+/// Immutable creation metadata paired with the terrain preset, size and seed in
+/// SimulationOptions. An older unrestricted save can lack its original lot layout.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MapOrigin {
+    constructor: MapConstructor,
+    initial_lot_layout: Option<LotLayout>,
+}
+
+impl MapOrigin {
+    fn new(constructor: MapConstructor, lot_layout: LotLayout) -> Self {
+        Self {
+            constructor,
+            initial_lot_layout: Some(lot_layout),
+        }
+    }
+
+    fn matches_options(self, options: SimulationOptions) -> bool {
+        use map::{LandMode, LandRecipe};
+        let unrestricted = (options.land_mode, options.land_recipe)
+            == (LandMode::Unrestricted, LandRecipe::Unrestricted);
+        let authored_free_build = || {
+            unrestricted
+                && options.progression == ProgressionMode::FreeBuild
+                && options.valid_for_authored_bootstrap()
+        };
+        match self.constructor {
+            MapConstructor::NewGame => {
+                options.valid_for_bootstrap()
+                    && (unrestricted || self.initial_lot_layout == options.recipe_lot_layout())
+            }
+            MapConstructor::Imported => {
+                unrestricted
+                    && !options.save_replay
+                    && options.preset != MapPreset::Waters
+                    && options.new_game_options().is_valid()
+            }
+            MapConstructor::AuthoredFlat => {
+                authored_free_build()
+                    && options.starting_money_bucks == SimulationOptions::LEGACY.starting_money_bucks
+                    && self.initial_lot_layout == Some(LotLayout::default())
+            }
+            MapConstructor::AuthoredTown => {
+                authored_free_build()
+                    && options.terrain_size >= AuthoredTownOptions::MIN_TERRAIN_CHUNKS
+                    && self.initial_lot_layout == Some(LotLayout::Uniform)
+            }
+            MapConstructor::AuthoredTiled => {
+                matches!(
+                    (options.land_mode, options.land_recipe),
+                    (LandMode::Tiled, LandRecipe::AuthoredV1 { lot_layout, .. })
+                        if self.initial_lot_layout == Some(lot_layout)
+                ) && options.valid_for_authored_bootstrap()
+            }
+        }
+    }
+
+    fn validate_options(self, options: SimulationOptions) -> Result<PopulationScale, String> {
+        let scale = options.population_scale().map_err(|error| error.to_string())?;
+        if self.constructor.is_authored() && scale != PopulationScale::REALISTIC {
+            return Err("Authored map constructors must use Realistic population".into());
+        }
+        if !self.matches_options(options) {
+            return Err("Invalid options for the snapshot map constructor".into());
+        }
+        Ok(scale)
+    }
+
+    fn from_legacy(options: SimulationOptions, map: &Map) -> Result<Self, String> {
+        // The importer already persisted a dedicated marker for its lane geometry.
+        if map.has_imported_lane_reserves() {
+            return Ok(Self {
+                constructor: MapConstructor::Imported,
+                initial_lot_layout: None,
+            });
+        }
+
+        // Compare constructor contracts against the saved creation options. In
+        // particular, neither a later layout change nor the ratio under validation
+        // can resolve an overlap between constructors.
+        let mut candidates = [
+            Self {
+                constructor: MapConstructor::NewGame,
+                initial_lot_layout: options.recipe_lot_layout(),
+            },
+            Self::new(MapConstructor::AuthoredFlat, LotLayout::default()),
+            Self::new(MapConstructor::AuthoredTown, LotLayout::Uniform),
+            Self {
+                constructor: MapConstructor::AuthoredTiled,
+                initial_lot_layout: options.recipe_lot_layout(),
+            },
+        ]
+        .into_iter()
+        .filter(|origin| origin.matches_options(options));
+        let origin = candidates
+            .next()
+            .ok_or("Invalid legacy snapshot map origin")?;
+        if candidates.next().is_some() {
+            return Err("Ambiguous legacy snapshot map origin".into());
+        }
+        Ok(origin)
+    }
+}
+
 impl Simulation {
+    /// The immutable population ratio selected when this city was created.
+    pub fn population_scale(&self) -> PopulationScale {
+        self.read::<SimulationOptions>()
+            .population_scale()
+            .expect("validated simulation options")
+    }
+
     pub fn schedule() -> SeqSchedule {
         let mut schedule = SeqSchedule::default();
         unsafe {
@@ -351,6 +524,7 @@ impl Simulation {
                         lot_layout: options.lot_layout,
                     },
                 },
+                persons_per_agent: options.persons_per_agent,
             },
             options.lot_layout,
         )
@@ -362,11 +536,11 @@ impl Simulation {
 
     /// Creates a blank, replay-disabled Flat world for an authored layout.
     pub fn new_authored_flat(terrain_chunks: u16, seed: u64) -> Result<Self, NewGameError> {
-        if !(1..=NewGameOptions::MAX_TERRAIN_CHUNKS).contains(&terrain_chunks) {
+        if !SimulationOptions::AUTHORED_TERRAIN_CHUNKS.contains(&terrain_chunks) {
             return Err(NewGameError::TerrainChunks(terrain_chunks));
         }
         let mut sim = Self::with_initial_resources();
-        WorldCommand::bootstrap_authored(
+        WorldCommand::bootstrap(
             &mut sim,
             SimulationOptions {
                 terrain_size: terrain_chunks,
@@ -375,7 +549,7 @@ impl Simulation {
                 seed,
                 ..SimulationOptions::LEGACY
             },
-            LotLayout::default(),
+            MapOrigin::new(MapConstructor::AuthoredFlat, LotLayout::default()),
         )
         .map_err(NewGameError::Bootstrap)?;
         Ok(sim)
@@ -398,7 +572,12 @@ impl Simulation {
         let bootstrap_end = replay.bootstrap_end()?;
         let mut sim = Self::with_initial_resources();
 
-        WorldCommand::bootstrap(&mut sim, options).map_err(|reason| {
+        let lot_layout = match replay.commands(1..bootstrap_end).next() {
+            Some(WorldCommand::SetLotLayout(layout)) => *layout,
+            _ => options.recipe_lot_layout().unwrap_or_default(),
+        };
+        let origin = MapOrigin::new(MapConstructor::NewGame, lot_layout);
+        WorldCommand::bootstrap(&mut sim, options, origin).map_err(|reason| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Replay Init: {reason:?}"),
@@ -450,7 +629,11 @@ impl Simulation {
         lot_layout: LotLayout,
     ) -> Result<Self, Rejection> {
         let mut sim = Self::with_initial_resources();
-        WorldCommand::bootstrap(&mut sim, opts)?;
+        let origin = MapOrigin::new(
+            MapConstructor::NewGame,
+            opts.recipe_lot_layout().unwrap_or(lot_layout),
+        );
+        WorldCommand::bootstrap(&mut sim, opts, origin)?;
         if opts.land_mode == map::LandMode::Tiled {
             sim.record_constructor_end();
             sim.world.reconcile_derived("new tiled world");
@@ -551,8 +734,8 @@ impl Simulation {
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let a = (l.save)(self);
-                let b = (l.save)(other);
+                let a = l.encode(self);
+                let b = l.encode(other);
 
                 if a != b {
                     std::fs::write(format!("{}_a.json", l.name), &*String::from_utf8_lossy(&a))
@@ -790,7 +973,7 @@ impl Simulation {
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let v = (l.save)(self);
+                let v = l.encode(self);
                 hashes.insert(l.name.to_string(), common::hash_u64(&*v));
             }
         }
@@ -881,11 +1064,18 @@ impl Simulation {
         let (header, payload) = snapshot_header(bytes)?;
         header.check_load_compatibility()?;
         let version = header.version;
+        let enveloped = header.revision.is_some();
         let data: SimulationDeser =
             Bincode::decode(payload).map_err(|error| SaveLoadError::Corrupt {
                 version: Some(version.clone()),
                 reason: error.to_string(),
             })?;
+        if enveloped && data._header.version != version {
+            return Err(SaveLoadError::Corrupt {
+                version: Some(version),
+                reason: "snapshot payload version does not match the slot header".into(),
+            });
+        }
         let sim = data.into_sim()?;
         if sim
             .resources
@@ -941,8 +1131,16 @@ impl Simulation {
         self.encode_slot(revision)?.publish(root, id)
     }
 
-    /// Encodes a save under the caller's simulation lock so publication can happen after unlocking.
-    pub fn encode_slot(&self, revision: SnapshotRevision) -> Result<EncodedSlot, SaveLoadError> {
+    /// Captures the current save boundary. The returned data can be encoded off the simulation.
+    pub fn capture_slot(&self, revision: SnapshotRevision) -> Result<SlotCapture, SaveLoadError> {
+        self.capture_slot_with_limit(revision, MAX_SNAPSHOT_BYTES)
+    }
+
+    fn capture_slot_with_limit(
+        &self,
+        revision: SnapshotRevision,
+        limit: usize,
+    ) -> Result<SlotCapture, SaveLoadError> {
         let header = RegistrySlotSnapshotHeader {
             slot: SlotSnapshotHeader {
                 magic: REGISTRY_SLOT_MAGIC,
@@ -951,23 +1149,32 @@ impl Simulation {
             },
             registry: prototypes::prototypes().fingerprint(),
         };
-        let snapshot = CompressedBincode::encode(&(header, self)).map_err(SaveLoadError::Encode)?;
-        let replay = self.read::<Replay>();
-        let replay = replay
-            .enabled
-            .then(|| ReplayJson::encode_sidecar(&replay, revision))
-            .transpose()
-            .map_err(AtomicWriteError::PreCommit);
-        Ok(EncodedSlot {
-            snapshot,
+        // Serialize consecutive wire fields into owned fragments at this boundary.
+        // All fragments draw from the same budget, including their map framing.
+        let (prefix, resources) = (|| {
+            let mut prefix = SlotBuffer::new(limit);
+            Bincode::encode_writer(&(header, SaveHeader::current(), &self.world), &mut prefix)?;
+            let resources = self.snapshot_resources(false, prefix.remaining())?;
+            Ok((prefix.bytes, resources))
+        })()
+        .map_err(|error| slot_encode_error(error, limit))?;
+        let replay = self.read::<Replay>().clone();
+        let scale = self.population_scale();
+        Ok(SlotCapture {
+            prefix,
+            resources,
             replay,
-            display_name: None,
-            camera: None,
             revision,
             game_tick: self.get_tick(),
-            population: self.world.humans.len().try_into().unwrap_or(u32::MAX),
+            population: scale.persons(self.world.humans.len()),
+            persons_per_agent: scale.persons_per_agent(),
             money_cents: self.read::<economy::Government>().money.cents(),
         })
+    }
+
+    /// Synchronously captures and encodes a save.
+    pub fn encode_slot(&self, revision: SnapshotRevision) -> Result<EncodedSlot, SaveLoadError> {
+        self.capture_slot(revision)?.encode()
     }
 
     pub fn save_to_disk(&self, save_name: &str) {
@@ -1007,11 +1214,15 @@ impl Simulation {
 
     fn allows_resource_write<T: Any>(&self) -> bool {
         use std::any::TypeId;
+        if TypeId::of::<T>() == TypeId::of::<SimulationOptions>()
+            || TypeId::of::<T>() == TypeId::of::<MapOrigin>()
+        {
+            return false;
+        }
         let protected = [
             TypeId::of::<Map>(),
             TypeId::of::<map::ZoneGrid>(),
             TypeId::of::<map::Environment>(),
-            TypeId::of::<SimulationOptions>(),
         ];
         !protected.contains(&TypeId::of::<T>())
             || !self.resources.contains::<Map>()
@@ -1024,7 +1235,7 @@ impl Simulation {
     pub fn write_or_default<T: Any + Send + Sync + Default>(&mut self) -> RefMut<T> {
         assert!(
             self.allows_resource_write::<T>(),
-            "live land resources require a checked command"
+            "resource cannot be updated directly"
         );
         self.resources.write_or_default::<T>()
     }
@@ -1039,7 +1250,7 @@ impl Simulation {
     pub fn write<T: Any + Send + Sync>(&self) -> RefMut<T> {
         assert!(
             self.allows_resource_write::<T>(),
-            "live land resources require a checked command"
+            "resource cannot be updated directly"
         );
         self.resources.write()
     }
@@ -1063,9 +1274,58 @@ impl Simulation {
     pub fn insert<T: Any + Send + Sync>(&mut self, res: T) {
         assert!(
             self.allows_resource_write::<T>(),
-            "live land resources require a checked command"
+            "resource cannot be updated directly"
         );
         self.resources.insert(res);
+    }
+}
+
+impl Simulation {
+    fn snapshot_resources(
+        &self,
+        encode_replay: bool,
+        mut remaining: usize,
+    ) -> io::Result<FastMap<String, Vec<u8>>> {
+        let mut resources = FastMap::default();
+        let registry = prototypes::try_prototypes();
+        let registered = unsafe { &*addr_of!(SAVELOAD_FUNCS) };
+        charge_slot_bytes(
+            &mut remaining,
+            Bincode::encoded_size(&(registered.len() + 1 + usize::from(registry.is_some())))?,
+        )?;
+
+        let mut capture = |name: &str, save: &dyn Fn(&mut SlotBuffer) -> io::Result<()>| {
+            // Charge the name and the shortest length field before allocating.
+            charge_slot_bytes(&mut remaining, Bincode::encoded_size(&(name, 0usize))?)?;
+            let mut payload = SlotBuffer::new(slot_payload_limit(remaining)?);
+            save(&mut payload)?;
+            charge_slot_bytes(&mut remaining, payload.bytes.len())?;
+            charge_slot_bytes(
+                &mut remaining,
+                Bincode::encoded_size(&payload.bytes.len())? - 1,
+            )?;
+            resources.insert(name.to_string(), payload.bytes);
+            Ok::<_, io::Error>(())
+        };
+        for resource in registered {
+            // Insert the placeholder at the original position to preserve the
+            // legacy FxHashMap iteration order, including growth on insertion.
+            capture(resource.name, &|output| {
+                if encode_replay || resource.name != ReplayJson::RESOURCE_NAME {
+                    (resource.save)(self, output)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(registry) = registry {
+            capture("prototype_registry", &|output| {
+                Bincode::encode_writer(&registry.fingerprint(), output)
+            })?;
+        }
+        capture("map_origin", &|output| {
+            Bincode::encode_writer(&*self.read::<MapOrigin>(), output)
+        })?;
+        Ok(resources)
     }
 }
 
@@ -1076,28 +1336,15 @@ impl Serialize for Simulation {
     {
         log::info!("serializing sim state");
         let t = Instant::now();
-        let mut m: FastMap<String, Vec<u8>> = FastMap::default();
-
-        unsafe {
-            for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let v: Vec<u8> = (l.save)(self);
-                m.insert(l.name.to_string(), v);
-            }
-        }
-
-        if let Some(registry) = prototypes::try_prototypes() {
-            let fingerprint =
-                Bincode::encode(&registry.fingerprint()).map_err(serde::ser::Error::custom)?;
-            m.insert("prototype_registry".into(), fingerprint);
-        }
+        let res = self
+            .snapshot_resources(true, usize::MAX)
+            .map_err(serde::ser::Error::custom)?;
         log::info!("took {}s to serialize resources", t.elapsed().as_secs_f32());
 
         let v = SimulationSer {
-            header: SaveHeader {
-                version: VERSION.to_owned(),
-            },
+            header: SaveHeader::current(),
             world: &self.world,
-            res: m,
+            res,
         }
         .serialize(serializer);
         log::info!("took {}s to serialize in total", t.elapsed().as_secs_f32());
@@ -1108,6 +1355,14 @@ impl Serialize for Simulation {
 #[derive(Serialize, Deserialize)]
 struct SaveHeader {
     version: String,
+}
+
+impl SaveHeader {
+    fn current() -> Self {
+        Self {
+            version: VERSION.to_owned(),
+        }
+    }
 }
 
 // A legacy Bincode string length cannot start with 0xff. Keep the normal
@@ -1150,7 +1405,7 @@ impl SnapshotHeader {
     }
 
     fn check_version(&self) -> Result<(), SaveLoadError> {
-        if self.version != VERSION {
+        if !compatible_save_version(&self.version) {
             return Err(SaveLoadError::Incompatible {
                 version: self.version.clone(),
             });
@@ -1206,7 +1461,7 @@ fn deserialize_save_header<'de, D: Deserializer<'de>>(
 ) -> Result<SaveHeader, D::Error> {
     let header = SaveHeader::deserialize(deserializer)?;
     let version = &header.version;
-    if version != VERSION {
+    if !compatible_save_version(version) {
         return Err(serde::de::Error::custom(format!(
             "Save has version {version:?}, expected {VERSION:?}"
         )));
@@ -1287,14 +1542,173 @@ pub enum SavePhase {
     },
 }
 
+/// Owned state for a single revision of a city.
+/// Limit Vec growth before writing, including when a serializer emits many small writes.
+struct SlotBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl SlotBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit - self.bytes.len()
+    }
+
+    #[cold]
+    fn grow(&mut self, size: usize) -> io::Result<()> {
+        if size > self.remaining() {
+            return Err(slot_limit_error());
+        }
+        let len = self.bytes.len();
+        let capacity = self.bytes.capacity().saturating_mul(2).max(4096);
+        let capacity = capacity.max(len + size).min(self.limit);
+        self.bytes
+            .try_reserve_exact(capacity - len)
+            .map_err(io::Error::other)
+    }
+}
+
+impl Write for SlotBuffer {
+    #[inline]
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.write_all(input)?;
+        Ok(input.len())
+    }
+
+    #[inline(always)]
+    fn write_all(&mut self, input: &[u8]) -> io::Result<()> {
+        if input.len() > self.bytes.capacity().min(self.limit) - self.bytes.len() {
+            self.grow(input.len())?;
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn slot_limit_error() -> io::Error {
+    io::Error::from(io::ErrorKind::FileTooLarge)
+}
+
+fn charge_slot_bytes(remaining: &mut usize, bytes: usize) -> io::Result<()> {
+    *remaining = remaining.checked_sub(bytes).ok_or_else(slot_limit_error)?;
+    Ok(())
+}
+
+/// Includes the variable-length Bincode length field, whose first byte is already charged.
+fn slot_payload_limit(remaining: usize) -> io::Result<usize> {
+    let mut payload = remaining;
+    while Bincode::encoded_size(&payload)? - 1 > remaining - payload {
+        payload -= 1;
+    }
+    Ok(payload)
+}
+
+fn slot_encode_error(error: io::Error, limit: usize) -> SaveLoadError {
+    if error.kind() == io::ErrorKind::FileTooLarge {
+        SaveLoadError::SnapshotTooLarge { limit }
+    } else {
+        SaveLoadError::Encode(error)
+    }
+}
+
+pub struct SlotCapture {
+    prefix: Vec<u8>,
+    resources: FastMap<String, Vec<u8>>,
+    replay: Replay,
+    revision: SnapshotRevision,
+    game_tick: u64,
+    population: u64,
+    persons_per_agent: u16,
+    money_cents: i64,
+}
+
+impl SlotCapture {
+    pub fn encode(self) -> Result<EncodedSlot, SaveLoadError> {
+        self.encode_with_limit(MAX_SNAPSHOT_BYTES)
+    }
+
+    fn encode_with_limit(self, limit: usize) -> Result<EncodedSlot, SaveLoadError> {
+        let Self {
+            prefix: mut bytes,
+            mut resources,
+            replay,
+            revision,
+            game_tick,
+            population,
+            persons_per_agent,
+            money_cents,
+        } = self;
+        let snapshot = (|| {
+            // Reject the known contribution before writing any embedded JSON.
+            let mut remaining = limit;
+            charge_slot_bytes(&mut remaining, bytes.len())?;
+            charge_slot_bytes(&mut remaining, Bincode::encoded_size(&resources.len())?)?;
+            for (name, payload) in &resources {
+                charge_slot_bytes(
+                    &mut remaining,
+                    Bincode::encoded_size(&(name, payload.len()))?,
+                )?;
+                charge_slot_bytes(&mut remaining, payload.len())?;
+            }
+
+            let mut embedded = SlotBuffer::new(slot_payload_limit(remaining)?);
+            ReplayJson::encode_writer(&replay, &mut embedded)?;
+            charge_slot_bytes(&mut remaining, embedded.bytes.len())?;
+            charge_slot_bytes(
+                &mut remaining,
+                Bincode::encoded_size(&embedded.bytes.len())? - 1,
+            )?;
+            *resources
+                .get_mut(ReplayJson::RESOURCE_NAME)
+                .expect("the replay resource is registered") = embedded.bytes;
+
+            // The final size is known. Preserve wire order and copy payloads directly.
+            bytes
+                .try_reserve_exact(limit - remaining - bytes.len())
+                .map_err(io::Error::other)?;
+            Bincode::encode_writer(&resources.len(), &mut bytes)?;
+            for (name, payload) in resources {
+                Bincode::encode_writer(&(name, payload.len()), &mut bytes)?;
+                bytes.extend_from_slice(&payload);
+            }
+            Ok(CompressedBincode::compress(&bytes))
+        })()
+        .map_err(|error| slot_encode_error(error, limit))?;
+        let replay = replay.enabled.then_some(replay);
+        Ok(EncodedSlot {
+            snapshot,
+            replay,
+            display_name: None,
+            camera: None,
+            revision,
+            game_tick,
+            population,
+            persons_per_agent,
+            money_cents,
+        })
+    }
+}
+
 pub struct EncodedSlot {
     snapshot: Vec<u8>,
-    replay: Result<Option<Vec<u8>>, AtomicWriteError>,
+    replay: Option<Replay>,
     display_name: Option<String>,
     camera: Option<SlotCamera>,
     revision: SnapshotRevision,
     game_tick: u64,
-    population: u32,
+    population: u64,
+    persons_per_agent: u16,
     money_cents: i64,
 }
 
@@ -1312,17 +1726,63 @@ impl EncodedSlot {
     /// Publishes a snapshot followed by its sidecars. The caller coordinates
     /// publication and deletion of the same slot.
     pub fn publish(self, root: &Path, id: &SlotId) -> Result<SavePhase, SaveLoadError> {
-        let paths = saveload::slot_paths(root, id)
-            .map_err(|error| SaveLoadError::SnapshotWrite(AtomicWriteError::PreCommit(error)))?;
-        saveload::write_atomic(&paths.zip, &self.snapshot).map_err(SaveLoadError::SnapshotWrite)?;
-        let replay = self.replay.and_then(|bytes| match bytes {
-            Some(bytes) => saveload::write_atomic(&paths.replay, &bytes),
-            None => remove_replay(&paths.replay).map_err(AtomicWriteError::PreCommit),
+        self.publish_with_gate(root, id, || Some(())).unwrap()
+    }
+
+    /// Stream replay staging before acquiring the publication gate. The gate
+    /// covers snapshot replacement and all sidecar changes.
+    pub fn publish_with_gate<G>(
+        self,
+        root: &Path,
+        id: &SlotId,
+        acquire: impl FnOnce() -> Option<G>,
+    ) -> Option<Result<SavePhase, SaveLoadError>> {
+        let paths = match saveload::slot_paths(root, id) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return Some(Err(SaveLoadError::SnapshotWrite(
+                    AtomicWriteError::PreCommit(error),
+                )))
+            }
+        };
+        let mut acquire = Some(acquire);
+        let mut guard = None;
+        let mut snapshot_result = None;
+        let mut commit_snapshot = || {
+            snapshot_result
+                .get_or_insert_with(|| {
+                    guard = acquire.take().unwrap()();
+                    guard.as_ref()?;
+                    Some(saveload::write_atomic(&paths.zip, &self.snapshot))
+                })
+                .as_ref()
+                .is_some_and(Result::is_ok)
+        };
+
+        // The buffered writer has flushed the full pretty JSON before the
+        // gate is taken. If staging fails, still try to publish the snapshot.
+        let staged_replay = self.replay.as_ref().map(|replay| {
+            saveload::write_atomic_with(&paths.replay, |output| {
+                ReplayJson::write_sidecar(replay, self.revision, &mut *output)?;
+                output.flush()?;
+                if commit_snapshot() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("Snapshot was not published"))
+                }
+            })
         });
+        commit_snapshot();
+        if let Err(error) = snapshot_result.unwrap()? {
+            return Some(Err(SaveLoadError::SnapshotWrite(error)));
+        }
+        let replay = staged_replay
+            .unwrap_or_else(|| remove_replay(&paths.replay).map_err(AtomicWriteError::PreCommit));
         let meta = SlotMeta {
             display_name: self.display_name.unwrap_or_else(|| id.to_string()),
             game_tick: self.game_tick,
             population: self.population,
+            persons_per_agent: self.persons_per_agent,
             money_cents: self.money_cents,
             saved_at_unix: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -1332,13 +1792,13 @@ impl EncodedSlot {
             camera: self.camera,
         };
         let meta = saveload::write_slot_meta(root, id, &meta);
-        match (replay, meta) {
-            (Ok(()), Ok(())) => Ok(SavePhase::Complete),
-            (replay, meta) => Ok(SavePhase::SidecarsFailed {
+        Some(Ok(match (replay, meta) {
+            (Ok(()), Ok(())) => SavePhase::Complete,
+            (replay, meta) => SavePhase::SidecarsFailed {
                 replay: replay.err(),
                 meta: meta.err(),
-            }),
-        }
+            },
+        }))
     }
 }
 
@@ -1377,7 +1837,7 @@ fn open_listed_snapshot(
     }
     let header =
         read_snapshot_header(&mut file, kind).map_err(|_| SaveLoadError::SnapshotChanged)?;
-    if header.version != VERSION || header.revision != entry.revision {
+    if !compatible_save_version(&header.version) || header.revision != entry.revision {
         return Err(SaveLoadError::SnapshotChanged);
     }
     header.check_compatibility()?;
@@ -1403,8 +1863,9 @@ fn read_snapshot_header(
     snapshot_header(&prefix[..len]).map(|(header, _)| header)
 }
 
+const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
 fn read_snapshot(mut file: fs::File, kind: SnapshotKind) -> Result<Vec<u8>, SaveLoadError> {
-    const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(SaveLoadError::Io)?;
     if kind == SnapshotKind::Bc {
@@ -1534,6 +1995,36 @@ impl SimulationDeser {
             }
         }
 
+        let options = *sim.read::<SimulationOptions>();
+        let origin: MapOrigin = match self.res.get("map_origin") {
+            Some(bytes) => Bincode::decode(bytes)
+                .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
+            None if self._header.version == VERSION => {
+                return Err(corrupt("Missing snapshot map origin".into()));
+            }
+            None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
+        };
+        let scale = origin.validate_options(options).map_err(&corrupt)?;
+        if self._header.version == PRE_SCALE_VERSION && scale != PopulationScale::REALISTIC {
+            return Err(corrupt(
+                "pre-SCALE snapshot must use Realistic population".into(),
+            ));
+        }
+        if matches!(origin.constructor, MapConstructor::AuthoredFlat | MapConstructor::AuthoredTown)
+            && sim.map().environment().size() != (options.terrain_size, options.terrain_size)
+        {
+            return Err(corrupt("Snapshot terrain extent does not match the map origin".into()));
+        }
+        sim.resources.insert(origin);
+        {
+            let mut replay = sim.write::<Replay>();
+            replay
+                .validate_population_scale(scale)
+                .map_err(|error| corrupt(error.to_string()))?;
+            if matches!(replay.version.as_str(), PRE_SCALE_VERSION | PRE_ORIGIN_VERSION) {
+                replay.version = VERSION.to_owned();
+            }
+        }
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
         crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
         sim.map()

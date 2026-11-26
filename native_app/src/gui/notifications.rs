@@ -13,7 +13,7 @@ use simulation::map_dynamic::{ElectricityFlow, LineID, SiteUtilityReader, Transi
 use simulation::souls::events::{FireEventKind, Fires};
 use simulation::souls::residence::Residences;
 use simulation::world_command::{CommandOutcomes, Rejection};
-use simulation::Simulation;
+use simulation::{PopulationScale, Simulation};
 use slotmapd::Key;
 
 const CAPACITY: usize = 200;
@@ -293,7 +293,12 @@ impl NotificationSampler {
 
     fn observe_rejections(&mut self, sim: &Simulation, now: SampleTime) {
         let outcomes = sim.read::<CommandOutcomes>();
-        self.record_rejections(outcomes.batch_seq(), outcomes.last.iter().copied(), now);
+        self.record_rejections(
+            outcomes.batch_seq(),
+            outcomes.last.iter().copied(),
+            now,
+            sim.population_scale(),
+        );
     }
 
     pub(super) fn observe_applied(
@@ -310,6 +315,7 @@ impl NotificationSampler {
             sequence,
             rejections.iter().map(|&(_, label, reason)| (label, reason)),
             now,
+            sim.population_scale(),
         );
     }
 
@@ -318,22 +324,25 @@ impl NotificationSampler {
         sequence: u64,
         reasons: impl IntoIterator<Item = (&'static str, Rejection)>,
         now: SampleTime,
+        scale: PopulationScale,
     ) {
         if self.last_batch_seq.replace(sequence) == Some(sequence) {
             return;
         }
         for (command, reason) in reasons {
+            let message = match reason {
+                Rejection::Locked { milestone } => milestone_population(milestone)
+                    .map(|n| format!("Unlocks at {} citizens", scale.persons(n as usize)).into())
+                    .unwrap_or_else(|| command_message(command, reason)),
+                _ => command_message(command, reason),
+            };
             self.emit(
                 NotificationKind::CommandRejected,
                 now.elapsed,
                 now.calendar.daytime,
                 None,
                 AlertTarget::CityWide,
-                format!(
-                    "{}: {}",
-                    command_label(command),
-                    command_message(command, reason)
-                ),
+                format!("{}: {}", command_label(command), message),
             );
         }
     }
@@ -475,6 +484,8 @@ impl NotificationSampler {
         if population >= MIN_DEMAND_POPULATION
             && unemployed * 100 >= population * UNEMPLOYMENT_PERCENT
         {
+            let scale = sim.population_scale();
+            let (unemployed, population) = (scale.persons(unemployed), scale.persons(population));
             self.condition(
                 HighUnemployment,
                 CityWide,
@@ -679,9 +690,7 @@ fn command_label(command: &str) -> &'static str {
 pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::Cow<'static, str> {
     use Rejection::*;
     if let Locked { milestone } = reason {
-        if let Some(population) = milestone_population(milestone) {
-            return format!("Unlocks at {population} citizens").into();
-        }
+        return format!("Unlocks at milestone {milestone}").into();
     }
     let message = match (command, reason) {
         (_, Rejection::InvalidCommandEncoding) => {

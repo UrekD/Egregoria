@@ -10,6 +10,7 @@ use goryak::{
 };
 use prototypes::Money;
 use simulation::economy::{
+    population::PopulationScale,
     progression::{milestone_population, ProgressionMode, ProgressionState},
     Government,
 };
@@ -419,7 +420,7 @@ pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
                             match quote_tile(sim, tile) {
                                 Ok(quote) => tile_details(uiw, sim, &mut state, quote, color),
                                 Err(reason) => {
-                                    textc(error(), purchase_error(reason));
+                                    textc(error(), purchase_error(reason, sim.population_scale()));
                                 }
                             };
                         } else {
@@ -437,9 +438,13 @@ pub(crate) fn render(uiw: &UiWorld, sim: &Simulation, opened: &mut bool) {
                                 Ok(purchase) => {
                                     textc(color, format!("{tile} purchased for {}.", purchase.paid))
                                 }
-                                Err(reason) => {
-                                    textc(error(), format!("{tile} · {}", purchase_error(reason)))
-                                }
+                                Err(reason) => textc(
+                                    error(),
+                                    format!(
+                                        "{tile} · {}",
+                                        purchase_error(reason, sim.population_scale())
+                                    ),
+                                ),
                             };
                         }
                         if state.busy {
@@ -474,7 +479,10 @@ fn tile_details(
         TileStatus::Owned => "Owned".to_owned(),
         TileStatus::NeedsAdjacent => "Buy a neighboring tile first".to_owned(),
         TileStatus::Locked { milestone, agents } => {
-            format!("Locked until {}", milestone_label(milestone, agents))
+            format!(
+                "Locked until {}",
+                milestone_label(milestone, sim.population_scale().persons(agents as usize))
+            )
         }
         TileStatus::InsufficientFunds => "Insufficient funds".to_owned(),
         TileStatus::Buyable => "Available to buy".to_owned(),
@@ -533,14 +541,17 @@ fn tile_name(tile: LandTileId) -> String {
     format!("Tile ({}, {})", tile.x, tile.y)
 }
 
-fn milestone_label(milestone: u8, population: u32) -> String {
+fn milestone_label(milestone: u8, population: u64) -> String {
     format!("Milestone {milestone} · {population} residents")
 }
 
-fn purchase_error(reason: Rejection) -> String {
+fn purchase_error(reason: Rejection, scale: PopulationScale) -> String {
     if let Rejection::Locked { milestone } = reason {
         if let Some(population) = milestone_population(milestone) {
-            return format!("Locked until {}", milestone_label(milestone, population));
+            return format!(
+                "Locked until {}",
+                milestone_label(milestone, scale.persons(population as usize))
+            );
         }
     }
     crate::gui::notifications::command_message("BuyTile", reason).into_owned()

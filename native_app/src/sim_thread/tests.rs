@@ -73,7 +73,7 @@ fn scale_t1_fifo_pause_capture_and_serial_parity() {
             permit: None
         })
         .is_ok());
-    let ReplyKind::Captured(Ok((snapshot, progress))) = receive(&mut driver).kind else {
+    let ReplyKind::Captured(Ok((capture, progress))) = receive(&mut driver).kind else {
         panic!("capture did not return a snapshot");
     };
     assert_eq!(
@@ -82,7 +82,13 @@ fn scale_t1_fifo_pause_capture_and_serial_parity() {
     );
     let root = std::env::temp_dir().join(format!("scale-t1-{:x}", revision.get()));
     let slot = common::saveload::SlotId::legacy();
-    snapshot.publish(&root, &slot).unwrap();
+    assert!(driver.submit(Request::Step { count: 1 }).is_ok());
+    let ReplyKind::Stepped(stepped) = receive(&mut driver).kind else {
+        panic!("the worker did not step while the capture was held");
+    };
+    assert_eq!(stepped.completed_step, boundary.completed_step + 1);
+    assert_ne!(stepped.tick, boundary.tick);
+    capture.encode().unwrap().publish(&root, &slot).unwrap();
     let loaded = Simulation::load_from_slot(&root, &slot).unwrap();
     std::fs::remove_dir_all(root).unwrap();
     assert_eq!(loaded.hashes(), serial.hashes());

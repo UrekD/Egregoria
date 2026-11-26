@@ -1,6 +1,7 @@
 use super::height_override::{ConstructionCut, CutHeights};
 use super::terrain::TERRAIN_CHUNK_RESOLUTION;
 use crate::map::electricity_cache::ElectricityCache;
+use crate::map::pathfinding::WalkingRoutes;
 use crate::map::procgen::gen_exterior_house;
 use crate::map::reachability::DrivingReachability;
 use crate::map::{
@@ -117,6 +118,7 @@ pub struct Map {
     pub(super) lane_scoring: Option<LaneScoringPilot>,
     // Derived from lanes and turns. Map deserialization starts with an empty cache.
     pub(super) driving_reachability: OnceLock<DrivingReachability>,
+    pub(super) walking_routes: OnceLock<WalkingRoutes>,
     // Imported networks reserve usable lane length when rebuilding junction geometry.
     pub(super) import_lane_reserve: bool,
     // Saved as its own `lot_layout` entry so the map's encoding is unchanged.
@@ -218,6 +220,7 @@ impl Map {
             junction_rules: BTreeMap::new(),
             lane_scoring: None,
             driving_reachability: OnceLock::new(),
+            walking_routes: OnceLock::new(),
             import_lane_reserve: false,
             lot_layout: LotLayout::default(),
             no_frontage: BTreeSet::new(),
@@ -344,12 +347,25 @@ impl Map {
             let east = terminals
                 .iter()
                 .any(|point| point.x >= bounds.ur.x - TERMINAL_INSET);
-            let south = terminals.iter().any(|point| point.y <= TERMINAL_INSET);
-            let north = terminals
-                .iter()
-                .any(|point| point.y >= bounds.ur.y - TERMINAL_INSET);
-            if !(west && east || matches!(recipe, LandRecipe::AuthoredV1 { .. }) && south && north)
-            {
+            let commissioned = if matches!(recipe, LandRecipe::AuthoredV1 { .. }) {
+                let faces = |point: &Vec2| {
+                    u8::from(point.x <= TERMINAL_INSET)
+                        | (u8::from(point.x >= bounds.ur.x - TERMINAL_INSET) << 1)
+                        | (u8::from(point.y <= TERMINAL_INSET) << 2)
+                        | (u8::from(point.y >= bounds.ur.y - TERMINAL_INSET) << 3)
+                };
+                terminals.iter().enumerate().any(|(index, first)| {
+                    let first = faces(first);
+                    first != 0
+                        && terminals[index + 1..].iter().any(|second| {
+                            let second = faces(second);
+                            second != 0 && (first | second).count_ones() >= 2
+                        })
+                })
+            } else {
+                west && east
+            };
+            if !commissioned {
                 return Err(invalid);
             }
         }
@@ -576,6 +592,10 @@ impl Map {
 
     pub fn environment(&self) -> &Environment {
         &self.environment
+    }
+
+    pub(crate) fn has_imported_lane_reserves(&self) -> bool {
+        self.import_lane_reserve
     }
 
     #[cfg(test)]
@@ -2121,9 +2141,10 @@ impl Map {
 
     // Private mutating
 
-    fn lane_topology_changed(&mut self) {
+    pub(super) fn lane_topology_changed(&mut self) {
         self.walking_topology_generation += 1;
         self.driving_reachability.take();
+        self.walking_routes.take();
         self.lane_scoring = None;
     }
 

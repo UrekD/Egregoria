@@ -6,6 +6,7 @@ cd "$(dirname "$0")/.."
 out=$1
 export CARGO_TARGET_DIR=$2
 town_generator=${3:-}
+published_town=${EGR_CITYMAP_PUBLISHED:-}
 cache=$CARGO_TARGET_DIR/windows-slots
 current=$cache/current
 mkdir -p -- "$cache"
@@ -30,6 +31,9 @@ if [[ -n $town_generator ]]; then
     town_sava=${EGR_CITYMAP_SAVA:-/var/tmp/egr/osm-cache/lesce-town-sava-20261122.overpass.json}
     slots+=(lesce_town)
     inputs+=("$town_lesce" "$town_sava")
+    if [[ -n $published_town ]]; then
+        inputs+=("$published_town"/lesce_town.{zip,meta.json,build.json})
+    fi
 else
     printf 'Skipping lesce_town: no citymap save generator is configured on this branch.\n'
 fi
@@ -59,6 +63,11 @@ check_slots() {
     done
 }
 
+check_town() {
+    [[ -n $town_generator ]] || return 0
+    cargo run --locked --release -p scenarios -- citymap-build --verify "$1"
+}
+
 generate() {
     if ! cargo run --locked --release -p scenarios -- "$@"; then
         printf 'Windows save generation failed (%s).\n' "$1" >&2
@@ -69,6 +78,7 @@ generate() {
 stamp=$(fingerprint)
 if [[ -f $current/stamp && $(< "$current/stamp") == "$stamp" ]] &&
     check_slots "$current/slots" 2>/dev/null; then
+    check_town "$current/slots"
     printf 'Reusing staged Windows save slots in %s\n' "$current/slots"
 else
     printf 'Generating Windows save slots for %s\n' "$(cat VERSION)"
@@ -78,11 +88,16 @@ else
     generate osm-city --input "$osm_input" --save-root "$pending/slots" "${osm_flags[@]}"
     if [[ -n $town_generator ]]; then
         # The CITYMAP generator requires its output directory to be absent.
-        generate "$town_generator" --out "$pending/town" --input "$town_lesce" --sava-input "$town_sava"
-        cp -a -- "$pending/town"/. "$pending/slots/"
-        rm -rf -- "$pending/town"
+        if [[ -n $published_town ]]; then
+            cp -a -- "$published_town"/lesce_town.{zip,meta.json,build.json} "$pending/slots/"
+        else
+            generate "$town_generator" --out "$pending/town" --input "$town_lesce" --sava-input "$town_sava"
+            cp -a -- "$pending/town"/. "$pending/slots/"
+            rm -rf -- "$pending/town"
+        fi
     fi
     check_slots "$pending/slots"
+    check_town "$pending/slots"
     if [[ $(fingerprint) != "$stamp" ]]; then
         printf 'Save generator inputs changed during the build. Rerun make build.\n' >&2
         exit 1

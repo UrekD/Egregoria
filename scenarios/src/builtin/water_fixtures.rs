@@ -704,39 +704,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "W2a/W2b and CITYMAP own the live wet crossings and wet town publication"]
-    fn p6_water_citymap_published_wet_crossings_link_both_banks() {
-        use crate::citymap::{build_network, resolve_network, route_checks};
-        use prototypes::Tick;
-        use simulation::map::PathKind;
-        use simulation::map_dynamic::Itinerary;
-
-        let root = TempRoot::new();
-        let (mut sim, plan, _) = authored_sava();
-        build_network(&mut sim, &plan.graph, plan.limits).unwrap();
-        publish(&sim, &root.0, "water_citymap", "Wet CITYMAP").unwrap();
-        let city =
-            Simulation::load_from_slot(&root.0, &SlotId::new("water_citymap").unwrap()).unwrap();
-        let map = city.map();
-        let network = resolve_network(&map, &plan.graph).unwrap();
-        assert!(route_checks(&map, &plan.graph, &network)
-            .values()
-            .all(|passes| *passes));
-        for crossing in &plan.crossings {
-            let [a, b] = crossing.approaches.map(|point| point.z(10.0));
-            for (from, to) in [(a, b), (b, a)] {
-                for mode in [PathKind::Vehicle, PathKind::Pedestrian] {
-                    assert!(
-                        Itinerary::route(Tick(city.get_tick()), from, to, &map, mode).is_some(),
-                        "{}",
-                        crossing.key
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
     fn p6_water_fresh_waters_bank_zone_grows_housing() {
         use simulation::{MapPreset, NewGameOptions};
 

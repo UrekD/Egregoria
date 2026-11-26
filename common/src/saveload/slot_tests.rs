@@ -49,6 +49,7 @@ fn meta(saved_at_unix: u64) -> SlotMeta {
         saved_at_unix,
         revision: None,
         camera: None,
+        persons_per_agent: 1,
     }
 }
 
@@ -315,6 +316,8 @@ fn slot_revision_binds_sidecars_to_the_selected_snapshot() {
 
     let sidecar = SlotMeta {
         revision: Some(revision.get()),
+        population: u64::from(u32::MAX) + 17,
+        persons_per_agent: 8,
         ..meta(200)
     };
     write_slot_meta(&root.0, &id, &sidecar).unwrap();
@@ -328,6 +331,20 @@ fn slot_revision_binds_sidecars_to_the_selected_snapshot() {
         200,
     );
     assert!(list(Some(revision)).replay_available);
+}
+
+#[test]
+fn population_scale_slot_metadata_rejects_invalid_ratios() {
+    let root = TestRoot::new();
+    let id = SlotId::new("harbor").unwrap();
+    let mut sidecar = meta(200);
+    sidecar.persons_per_agent = 3;
+    assert!(write_slot_meta(&root.0, &id, &sidecar).is_err());
+    root.file("harbor.meta.json", &JSON::encode(&sidecar).unwrap(), 200);
+    assert_eq!(
+        read_slot_meta(&root.0, &id).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
 }
 
 #[test]

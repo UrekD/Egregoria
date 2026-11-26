@@ -132,9 +132,11 @@ fn save_window(uiw: &UiWorld, sim: &Simulation) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gui::hud::demand_bars;
     use crate::gui::hud::time_controls::time_controls;
+    use simulation::PopulationScale;
     use yakui::font::{Font, FontSettings, Fonts};
-    use yakui::widgets::{ButtonWidget, OpaqueWidget};
+    use yakui::widgets::{ButtonWidget, OpaqueWidget, TextWidget};
     use yakui::{Rect, WidgetId, Yakui};
 
     fn widget_rects<T: yakui::widget::Widget>(ui: &Yakui, id: WidgetId, rects: &mut Vec<Rect>) {
@@ -147,10 +149,32 @@ mod tests {
         }
     }
 
-    fn assert_hud_fits(width: f32, height: f32) {
+    fn population_rect(ui: &Yakui, id: WidgetId, label: &str) -> Option<Rect> {
+        let node = ui.dom().get(id).unwrap();
+        if node
+            .widget
+            .downcast_ref::<TextWidget>()
+            .is_some_and(|text| format!("{text:?}").contains(&format!("{label:?}")))
+        {
+            return Some(ui.layout_dom().get(id).unwrap().rect);
+        }
+        node.children
+            .iter()
+            .find_map(|&child| population_rect(ui, child, label))
+    }
+
+    fn assert_hud_fits(width: f32, height: f32, scale: PopulationScale) {
         scenarios::ensure_repo_root_cwd();
         crate::init::init();
-        let sim = Simulation::new(false);
+        let mut ctx = scenarios::ScenarioCtx::new(simulation::SimulationOptions {
+            terrain_size: 1,
+            persons_per_agent: scale.persons_per_agent(),
+            ..simulation::SimulationOptions::LEGACY
+        });
+        scenarios::builders::grid_city(&mut ctx, geom::vec2(150.0, 150.0), 2, 2, 160.0);
+        let house = scenarios::builders::fill_houses(&mut ctx, 1)[0];
+        assert!(simulation::souls::human::spawn_human(&mut ctx.sim, house).is_some());
+        let sim = ctx.sim;
         sim.write::<Government>().money = prototypes::Money::MAX;
         let uiworld = UiWorld::with_defaults();
         uiworld.write::<session::SessionState>().active_slot =
@@ -180,6 +204,7 @@ mod tests {
         column(|| {
             menu_bar(&uiworld, &sim);
             time_controls(&uiworld, &sim);
+            demand_bars::render(&uiworld, &sim);
         });
         ui.finish();
 
@@ -193,6 +218,28 @@ mod tests {
             "menu {menu:?} overlaps clock {clock:?}"
         );
         assert!(clock.max().x <= width);
+        let label = if scale == PopulationScale::REALISTIC {
+            "Population 1".to_owned()
+        } else {
+            format!("Population 8 · {scale}")
+        };
+        let population = population_rect(&ui, ui.dom().root(), &label)
+            .unwrap_or_else(|| panic!("missing HUD label {label:?}"));
+        let area = Rect::from_pos_size(Vec2::ZERO, viewport);
+        assert!(population.size().x > 0.0 && population.size().y > 0.0);
+        assert!(
+            area.contains_point(population.pos()) && area.contains_point(population.max()),
+            "population {population:?} extends outside viewport {area:?}"
+        );
+        for panel in [menu, clock] {
+            assert!(
+                population.pos().y >= panel.max().y
+                    || population.max().y <= panel.pos().y
+                    || population.max().x <= panel.pos().x
+                    || population.pos().x >= panel.max().x,
+                "population {population:?} overlaps HUD panel {panel:?}"
+            );
+        }
 
         let mut buttons = Vec::new();
         widget_rects::<ButtonWidget>(&ui, ui.dom().root(), &mut buttons);
@@ -212,11 +259,16 @@ mod tests {
 
     #[test]
     fn ui1_hud_fits_at_1024() {
-        assert_hud_fits(1024.0, 768.0);
+        assert_hud_fits(1024.0, 768.0, PopulationScale::REALISTIC);
+    }
+
+    #[test]
+    fn population_scale_hud_fits_at_1024() {
+        assert_hud_fits(1024.0, 768.0, PopulationScale::try_new(8).unwrap());
     }
 
     #[test]
     fn ui1_hud_fits_at_1280() {
-        assert_hud_fits(1280.0, 720.0);
+        assert_hud_fits(1280.0, 720.0, PopulationScale::REALISTIC);
     }
 }

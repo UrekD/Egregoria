@@ -12,6 +12,18 @@ mod slots;
 
 pub use atomic::{sweep_stale_tmp, write_atomic, AtomicWriteError};
 use atomic::{write_staged, Durability};
+
+/// Stream a durable replacement into a buffered file beside the destination.
+pub fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<&mut File>) -> Result<()>,
+) -> std::result::Result<(), AtomicWriteError> {
+    write_staged(path, Durability::Durable, |file| {
+        let mut writer = BufWriter::new(file);
+        write(&mut writer)?;
+        writer.flush()
+    })
+}
 pub use slots::{
     delete_slot, list_slots, list_slots_with_revisions, read_slot_meta, slot_paths,
     write_slot_meta, SlotCamera, SlotEntry, SlotId, SlotIdError, SlotMeta, SlotPaths, SnapshotKind,
@@ -191,6 +203,14 @@ pub struct Bincode;
 use ::bincode::{DefaultOptions, Options};
 
 impl Bincode {
+    pub fn encoded_size(x: &impl Serialize) -> Result<usize> {
+        DefaultOptions::new()
+            .serialized_size(x)
+            .map_err(io::Error::other)?
+            .try_into()
+            .map_err(io::Error::other)
+    }
+
     /// Decode a leading value from a slice, leaving subsequent fields unread.
     pub fn decode_prefix<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         DefaultOptions::new()
@@ -206,7 +226,7 @@ impl Encoder for Bincode {
     fn encode(x: &impl Serialize) -> Result<Vec<u8>> {
         let mut v = Vec::with_capacity(4096);
         DefaultOptions::new()
-            .serialize_into(std::io::Cursor::new(&mut v), x)
+            .serialize_into(&mut v, x)
             .map_err(|x| std::io::Error::new(ErrorKind::Other, x))?;
         Ok(v)
     }
@@ -220,7 +240,10 @@ impl Encoder for Bincode {
     fn encode_writer(x: &impl Serialize, w: impl Write) -> Result<()> {
         DefaultOptions::new()
             .serialize_into(w, x)
-            .map_err(|x| std::io::Error::new(ErrorKind::Other, x))
+            .map_err(|error| match *error {
+                bincode::ErrorKind::Io(error) => error,
+                _ => io::Error::other(error),
+            })
     }
 
     fn decode_reader<T: DeserializeOwned>(r: impl Read) -> Result<T> {
@@ -236,6 +259,12 @@ pub const COMMAND_PROTOCOL_REVISION: &str = "commands.2";
 pub struct CompressedBincode;
 
 impl CompressedBincode {
+    /// Compress an already serialized Bincode payload with the save format's zlib settings.
+    pub fn compress(bytes: &[u8]) -> Vec<u8> {
+        // Higher levels take much longer for only slightly smaller saves.
+        miniz_oxide::deflate::compress_to_vec_zlib(bytes, 1)
+    }
+
     /// Decompress a payload so callers can inspect its Bincode prefix before decoding it.
     pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
         miniz_oxide::inflate::decompress_to_vec_zlib(bytes)
@@ -258,9 +287,7 @@ impl Encoder for CompressedBincode {
     const EXTENSION: &'static str = "zip";
 
     fn encode(x: &impl Serialize) -> Result<Vec<u8>> {
-        let encoded = &*Bincode::encode(x)?;
-        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(encoded, 1); // bigger level values take far too long and only compress a bit better (about 5%)
-        Ok(compressed)
+        Ok(Self::compress(&Bincode::encode(x)?))
     }
 
     fn decode<T: DeserializeOwned>(x: &[u8]) -> Result<T> {

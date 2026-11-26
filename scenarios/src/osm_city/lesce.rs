@@ -22,6 +22,7 @@ pub(super) const OPTIONS: NewGameOptions = NewGameOptions {
     progression: simulation::economy::progression::ProgressionMode::FreeBuild,
     lot_layout: simulation::map::LotLayout::Varied,
     land_mode: simulation::map::LandMode::Unrestricted,
+    persons_per_agent: 1,
 };
 pub(super) const TARGET_OPENING_BEDS: usize = 2_900;
 pub(super) const OPENING_POPULATION: std::ops::RangeInclusive<usize> = 2_500..=3_500;

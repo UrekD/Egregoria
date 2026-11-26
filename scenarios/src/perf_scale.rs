@@ -7,6 +7,7 @@ use prototypes::{
     try_prototype, GameTime, GoodsCompanyID, GoodsCompanyPrototype, Money, Tick, TICKS_PER_MINUTE,
 };
 use serde::Serialize;
+use simulation::economy::population::PopulationScale;
 use simulation::economy::ZoneDemand;
 use simulation::map::{
     BuildingKind, LanePatternBuilder, LotLayout, MapProject, ProjectKind, ZoneKind,
@@ -349,7 +350,6 @@ struct GridFixture {
     grid_spacing_m: f32,
     road_footprint_m2: f64,
     workload_revision: u32,
-    persons_per_agent: u32,
     minimum_employed: usize,
     minimum_peak_active_vehicles: usize,
     activity_floors_checked: bool,
@@ -372,7 +372,6 @@ impl GridFixture {
             grid_spacing_m: GRID_SPACING_M,
             road_footprint_m2: ((grid_side - 1) as f64 * f64::from(GRID_SPACING_M)).powi(2),
             workload_revision: 1,
-            persons_per_agent: 1,
             minimum_employed: case.agents.div_ceil(2),
             minimum_peak_active_vehicles: case.agents.div_ceil(20),
             activity_floors_checked: case.warmup_ticks >= 2_000 && case.measured_ticks >= 10_000,
@@ -382,6 +381,14 @@ impl GridFixture {
 
 /// Build a flat, connected commute fixture with the same setup clock across populations.
 pub fn benchmark_layout(case: PerfCase, layout: PerfLayout) -> Result<BenchmarkReport, String> {
+    benchmark_layout_with_scale(case, layout, PopulationScale::REALISTIC)
+}
+
+pub fn benchmark_layout_with_scale(
+    case: PerfCase,
+    layout: PerfLayout,
+    scale: PopulationScale,
+) -> Result<BenchmarkReport, String> {
     validate_case(case)?;
     if case.agents > MAX_LAYOUT_AGENTS {
         return Err(format!("--agents must be at most {MAX_LAYOUT_AGENTS}"));
@@ -390,6 +397,7 @@ pub fn benchmark_layout(case: PerfCase, layout: PerfLayout) -> Result<BenchmarkR
     let mut ctx = ScenarioCtx::new(SimulationOptions {
         terrain_size: if case.agents <= 64 { 16 } else { 36 },
         preset: MapPreset::Flat,
+        persons_per_agent: scale.persons_per_agent(),
         ..perf::OPTIONS
     });
     setup_grid(&mut ctx, fixture.grid_side, case.agents)?;
@@ -612,6 +620,11 @@ pub struct BenchmarkReport {
     lot_layout: LotLayout,
     initial_agents: usize,
     actual_agents: usize,
+    persons_per_agent: u16,
+    initial_population: u64,
+    peak_population: u64,
+    actual_population: u64,
+    employed_population: u64,
     #[serde(flatten)]
     window: MeasuredWindow,
     tick_duration_ticks_per_sec: f64,
@@ -638,6 +651,14 @@ fn report(
         .try_into()
         .map_err(|_| "missing benchmark samples")?;
     let tick_duration_ticks_per_sec = measured.ticks_per_sec;
+    let scale = ctx.sim.population_scale();
+    let employed = ctx
+        .sim
+        .world()
+        .humans
+        .values()
+        .filter(|human| human.work.is_some())
+        .count();
     measured.ticks_per_sec = if window.measured_wall_seconds > 0.0 {
         window.completed_steps as f64 / window.measured_wall_seconds
     } else {
@@ -649,6 +670,11 @@ fn report(
         lot_layout: ctx.sim.map().lot_layout(),
         initial_agents: setup.humans,
         actual_agents: measured.humans,
+        persons_per_agent: scale.persons_per_agent(),
+        initial_population: scale.persons(setup.humans),
+        peak_population: scale.persons(window.peak_agents),
+        actual_population: scale.persons(measured.humans),
+        employed_population: scale.persons(employed),
         window,
         tick_duration_ticks_per_sec,
         human_entity_bytes: std::mem::size_of::<HumanEnt>(),
@@ -727,7 +753,10 @@ mod tests {
 
     #[test]
     fn scale_m0_reports_options_and_peak_agents() {
-        let mut ctx = ScenarioCtx::new(smoke::OPTIONS);
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            persons_per_agent: 4,
+            ..smoke::OPTIONS
+        });
         grid_city(&mut ctx, vec2(700.0, 700.0), 2, 2, 160.0);
         setup_houses(&mut ctx, 4).unwrap();
         let window = measure_windows(&mut ctx, 1, 1, None, false).unwrap();
@@ -746,6 +775,10 @@ mod tests {
         assert_eq!(report["initial_agents"], 4);
         assert_eq!(report["peak_agents"], 4);
         assert_eq!(report["actual_agents"], 4);
+        assert_eq!(report["persons_per_agent"], 4);
+        assert_eq!(report["initial_population"], 16);
+        assert_eq!(report["peak_population"], 16);
+        assert_eq!(report["actual_population"], 16);
     }
 
     #[test]
@@ -775,15 +808,16 @@ mod tests {
         ctx.run_with_hashes("paris-smoke", &mut hashes, |ctx| run_perf_case(ctx, case))
             .unwrap();
         let checkpoint: serde_json::Value = serde_json::from_slice(&hashes).unwrap();
-        // Keep the M0 gameplay projection. The raw hashes use the current world
-        // and map save formats, which include company departures and terrain water.
+        // Keep the M0 gameplay projection. The 0.11.0 world format also
+        // serializes each resident's education hours.
         assert_eq!(checkpoint["tick"], 5);
         assert_eq!(checkpoint["projection"], 7_202_952_127_034_493_285_u64);
         assert_eq!(
             checkpoint["hashes"]["world"],
-            9_337_612_473_985_617_770_u64
+            14_091_543_823_439_975_702_u64
         );
-        assert_eq!(checkpoint["hashes"]["map"], 7_227_799_503_381_117_479_u64);
+        // Procedural roofs serialize the completed face boundaries in canonical order.
+        assert_eq!(checkpoint["hashes"]["map"], 10_765_074_735_981_337_578_u64);
     }
 
     #[test]
