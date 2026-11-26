@@ -259,7 +259,9 @@ impl Replay {
         let scale = options.population_scale().map_err(|error| {
             io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {error}"))
         })?;
-        if self.version == crate::PRE_SCALE_VERSION && scale != PopulationScale::REALISTIC {
+        if replay_release(&self.version) == crate::PRE_SCALE_VERSION
+            && scale != PopulationScale::REALISTIC
+        {
             return Err(invalid_replay(
                 "pre-SCALE replay must use Realistic population",
             ));
@@ -424,6 +426,10 @@ pub(crate) fn replay_version() -> String {
     format!("{}+{COMMAND_PROTOCOL_REVISION}", crate::VERSION)
 }
 
+fn replay_release(version: &str) -> &str {
+    version.split_once('+').map_or(version, |(release, _)| release)
+}
+
 pub(crate) fn replay_version_error(version: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -470,10 +476,7 @@ impl ReplayHeader {
         let header: Self = JSON::decode(bytes).map_err(replay_corrupt)?;
         if header.version != replay_version() {
             let version = header.version;
-            let release = version
-                .split_once('+')
-                .map_or(version.as_str(), |(release, _)| release);
-            return Err(if crate::compatible_save_version(release) {
+            return Err(if crate::compatible_save_version(replay_release(&version)) {
                 SaveLoadError::IncompatibleReplay { version }
             } else {
                 SaveLoadError::Incompatible { version }
@@ -514,6 +517,7 @@ impl ReplayJson {
                 // command envelopes can still be read inside a compatible city.
                 let mut replay: Replay = JSON::decode(bytes)?;
                 replay.validate_embedded_registry()?;
+                replay.recorded_population_scale()?;
                 replay.version = replay_version();
                 Ok(replay)
             }

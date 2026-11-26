@@ -2016,15 +2016,9 @@ impl SimulationDeser {
             return Err(corrupt("Snapshot terrain extent does not match the map origin".into()));
         }
         sim.resources.insert(origin);
-        {
-            let mut replay = sim.write::<Replay>();
-            replay
-                .validate_population_scale(scale)
-                .map_err(|error| corrupt(error.to_string()))?;
-            if matches!(replay.version.as_str(), PRE_SCALE_VERSION | PRE_ORIGIN_VERSION) {
-                replay.version = VERSION.to_owned();
-            }
-        }
+        sim.read::<Replay>()
+            .validate_population_scale(scale)
+            .map_err(|error| corrupt(error.to_string()))?;
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
         crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
         sim.map()

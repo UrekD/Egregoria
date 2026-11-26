@@ -4,7 +4,7 @@ use crate::economy::progression::{
 use crate::economy::CityStats;
 use crate::map::{AuthoredTownOptions, LotLayout};
 use crate::souls::human::spawn_human;
-use crate::utils::replay::ReplayJson;
+use crate::utils::replay::{replay_version, ReplayJson};
 use crate::{
     MapConstructor, MapOrigin, NewGameError, NewGameOptions, PopulationScale, Replay,
     SaveLoadError, Simulation, SimulationDeser, SimulationOptions, WorldCommand,
@@ -92,10 +92,7 @@ fn population_scale_rejects_invalid_values_and_defaults_legacy_omissions() {
             Err(SaveLoadError::Corrupt { reason, .. }) if reason.contains("population ratio")
         ));
     }
-    let legacy_recording =
-        recording
-            .replacen(ratio, "", 1)
-            .replacen(crate::VERSION, crate::PRE_SCALE_VERSION, 1);
+    let legacy_recording = recording.replacen(ratio, "", 1);
     let (replayed, _) =
         Simulation::try_from_replay(JSON::decode(legacy_recording.as_bytes()).unwrap()).unwrap();
     assert_eq!(replayed.population_scale(), PopulationScale::REALISTIC);
@@ -105,24 +102,22 @@ fn population_scale_rejects_invalid_values_and_defaults_legacy_omissions() {
     let mut old_options = decoded.res.remove("simoptions").unwrap();
     assert_eq!(old_options.pop(), Some(1)); // Bincode encodes this appended u16 in one byte.
     decoded.res.insert("simoptions".into(), old_options);
-    decoded
-        .res
-        .insert("replay".into(), legacy_recording.into_bytes());
+    let embedded_recording = legacy_recording.replacen(crate::VERSION, crate::PRE_SCALE_VERSION, 1);
+    decoded.res.insert("replay".into(), embedded_recording.into_bytes());
     let restored = decoded.into_sim().unwrap();
     assert_eq!(restored.population_scale(), PopulationScale::REALISTIC);
     assert_eq!(restored.hashes(), sim.hashes());
 }
 
 #[test]
-fn population_scale_replay_rejects_scaled_pre_scale_recording() {
+fn population_scale_replay_rejects_scaled_embedded_pre_scale_recording() {
     init_test_simulation();
     let sim = Simulation::new_with_options(small_options(4));
     let mut replay = sim.read::<Replay>().clone();
-    replay.version = crate::PRE_SCALE_VERSION.into();
+    replay.version = format!("{}+commands.2", crate::PRE_SCALE_VERSION);
     let recording = ReplayJson::encode(&replay).unwrap();
-    let replay = ReplayJson::decode(&recording).unwrap();
     assert!(matches!(
-        Simulation::try_from_replay(replay),
+        ReplayJson::decode_snapshot(&recording),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData
             && error.to_string().contains("must use Realistic")
     ));
@@ -178,7 +173,7 @@ fn population_scale_snapshot_uses_a_distinct_compatibility_version() {
     assert_eq!(header.version, crate::VERSION);
     assert!(!header.version.contains('-'));
     assert_ne!(header.version, "0.11.0");
-    assert_eq!(sim.read::<Replay>().version, header.version);
+    assert_eq!(sim.read::<Replay>().version, replay_version());
     assert_eq!(
         Bincode::decode::<Simulation>(&snapshot)
             .unwrap()
