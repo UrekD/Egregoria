@@ -295,6 +295,7 @@ fn p7_create_city_keeps_stock_traffic_after_build_and_reload() {
     assert_eq!(options.land_mode, simulation::map::LandMode::Unrestricted);
     let mut city = Simulation::new_game(&options).unwrap();
     let opening_stock = city.map().uses_stock_traffic();
+    let opening_roads = city.map().roads().len();
     city.apply_commands([&WorldCommand::MapMakeConnection {
         from: MapProject::ground(vec3(100.0, 200.0, 0.0)),
         to: MapProject::ground(vec3(350.0, 200.0, 0.0)),
@@ -309,7 +310,8 @@ fn p7_create_city_keeps_stock_traffic_after_build_and_reload() {
         .unwrap();
     let reopened = Simulation::load_from_slot(&root, &slot).unwrap();
     std::fs::remove_dir_all(root).unwrap();
-    assert_eq!(reopened.map().roads().len(), 1);
+    assert_eq!(city.map().roads().len(), opening_roads + 1);
+    assert_eq!(reopened.map().roads().len(), city.map().roads().len());
     assert!(
         opening_stock && city.map().uses_stock_traffic() && reopened.map().uses_stock_traffic()
     );
