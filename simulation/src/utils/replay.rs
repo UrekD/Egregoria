@@ -298,7 +298,7 @@ impl ReplayHeader {
     fn decode(bytes: &[u8]) -> Result<Self, SaveLoadError> {
         // Read the header before decoding commands, regardless of JSON field order.
         let header: Self = JSON::decode(bytes).map_err(replay_corrupt)?;
-        if header.version != crate::VERSION {
+        if !crate::compatible_save_version(&header.version) {
             return Err(SaveLoadError::Incompatible {
                 version: header.version,
             });

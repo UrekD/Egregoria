@@ -91,12 +91,16 @@ fn population_scale_rejects_invalid_values_and_defaults_legacy_omissions() {
             Err(SaveLoadError::Corrupt { reason, .. }) if reason.contains("population ratio")
         ));
     }
-    let legacy_recording = recording.replacen(ratio, "", 1);
+    let legacy_recording =
+        recording
+            .replacen(ratio, "", 1)
+            .replacen(crate::VERSION, crate::PRE_SCALE_VERSION, 1);
     let (replayed, _) =
         Simulation::try_from_replay(JSON::decode(legacy_recording.as_bytes()).unwrap()).unwrap();
     assert_eq!(replayed.population_scale(), PopulationScale::REALISTIC);
 
     let mut decoded: SimulationDeser = Bincode::decode(&snapshot).unwrap();
+    decoded._header.version = crate::PRE_SCALE_VERSION.into();
     let mut old_options = decoded.res.remove("simoptions").unwrap();
     assert_eq!(old_options.pop(), Some(1)); // Bincode encodes this appended u16 in one byte.
     decoded.res.insert("simoptions".into(), old_options);
@@ -106,6 +110,79 @@ fn population_scale_rejects_invalid_values_and_defaults_legacy_omissions() {
     let restored = decoded.into_sim().unwrap();
     assert_eq!(restored.population_scale(), PopulationScale::REALISTIC);
     assert_eq!(restored.hashes(), sim.hashes());
+}
+
+#[test]
+fn population_scale_snapshot_rejects_options_the_constructors_reject() {
+    init_test_simulation();
+    let sim = Simulation::new_with_options(small_options(4));
+    let snapshot = Bincode::encode(&sim).unwrap();
+    for options in [
+        SimulationOptions {
+            terrain_size: 81,
+            ..small_options(4)
+        },
+        SimulationOptions {
+            terrain_size: 16,
+            starting_money_bucks: 9_999,
+            ..small_options(4)
+        },
+        SimulationOptions {
+            terrain_size: 16,
+            starting_money_bucks: 10_000_001,
+            ..small_options(4)
+        },
+        SimulationOptions {
+            seed: 42,
+            ..small_options(4)
+        },
+        SimulationOptions {
+            preset: crate::MapPreset::Flat,
+            ..small_options(4)
+        },
+    ] {
+        assert!(!options.valid_for_bootstrap());
+        let mut decoded: SimulationDeser = Bincode::decode(&snapshot).unwrap();
+        decoded
+            .res
+            .insert("simoptions".into(), Bincode::encode(&options).unwrap());
+        assert!(
+            matches!(decoded.into_sim(), Err(SaveLoadError::Corrupt { .. })),
+            "{options:?}"
+        );
+    }
+}
+
+#[test]
+fn population_scale_snapshot_uses_a_distinct_compatibility_version() {
+    init_test_simulation();
+    let sim = Simulation::new_with_options(small_options(4));
+    let snapshot = Bincode::encode(&sim).unwrap();
+    let (header, _) = crate::snapshot_header(&snapshot).unwrap();
+    assert_ne!(header.version, "0.11.0");
+    assert_eq!(sim.read::<Replay>().version, header.version);
+    assert_eq!(
+        Bincode::decode::<Simulation>(&snapshot)
+            .unwrap()
+            .population_scale(),
+        sim.population_scale()
+    );
+    let mut mislabeled: SimulationDeser = Bincode::decode(&snapshot).unwrap();
+    mislabeled._header.version = crate::PRE_SCALE_VERSION.into();
+    assert!(matches!(
+        mislabeled.into_sim(),
+        Err(SaveLoadError::Corrupt { reason, .. }) if reason.contains("must use Realistic")
+    ));
+}
+
+#[test]
+fn population_scale_snapshot_accepts_compact_authored_town() {
+    init_test_simulation();
+    let sim = Simulation::new_authored_town(crate::map::AuthoredTownOptions::default()).unwrap();
+    let snapshot = Bincode::encode(&sim).unwrap();
+    let loaded: Simulation = Bincode::decode(&snapshot).unwrap();
+    assert_eq!(loaded.hashes(), sim.hashes());
+    assert_eq!(loaded.population_scale(), PopulationScale::REALISTIC);
 }
 
 #[test]

@@ -140,6 +140,45 @@ fn population_scale_slot_round_trip_advertises_eight_before_opening() {
 }
 
 #[test]
+fn population_scale_populated_slot_reports_represented_population() {
+    let mut ctx = super::TestCtx::new();
+    ctx.g = Simulation::new_with_options(crate::SimulationOptions {
+        terrain_size: 1,
+        save_replay: false,
+        persons_per_agent: 8,
+        ..crate::SimulationOptions::LEGACY
+    });
+    ctx.build_roads(&[geom::vec3(100.0, 100.0, 0.0), geom::vec3(300.0, 100.0, 0.0)]);
+    let house = ctx.build_house_near(geom::vec2(200.0, 100.0));
+    assert!(crate::souls::human::spawn_human(&mut ctx.g, house).is_some());
+
+    let root = TestRoot::new();
+    let id = SlotId::new("populated").unwrap();
+    assert!(matches!(
+        ctx.g
+            .save_to_slot(&root.0, &id, SnapshotRevision::new(92))
+            .unwrap(),
+        SavePhase::Complete
+    ));
+    let listed = list_slots_with_revisions(&root.0, |path, kind| {
+        Simulation::read_slot_snapshot_header(path, kind)
+            .unwrap()
+            .revision
+    })
+    .unwrap();
+    let meta = listed[0].meta.as_ref().unwrap();
+    assert_eq!((meta.persons_per_agent, meta.population), (8, 8));
+    assert_eq!(
+        Simulation::load_listed_snapshot(&root.0, &listed[0])
+            .unwrap()
+            .world()
+            .humans
+            .len(),
+        1
+    );
+}
+
+#[test]
 #[cfg(any(unix, windows))]
 fn p4a_precommit_failure_keeps_slot_bytes() {
     let city = Simulation::new_game_with_replay(&options()).unwrap();

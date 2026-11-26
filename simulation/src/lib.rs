@@ -128,7 +128,18 @@ pub struct Simulation {
 
 const RNG_SEED: u64 = 123;
 const INITIAL_TICK: u64 = 1;
-const VERSION: &str = include_str!("../../VERSION");
+const PRE_SCALE_VERSION: &str = "0.11.0";
+const RELEASE_VERSION: &str = include_str!("../../VERSION");
+// Stamp private SCALE-P1 snapshots before the spine updates the shared VERSION
+// used by the multiplayer handshake and the release builders.
+const VERSION: &str = match RELEASE_VERSION.as_bytes() {
+    b"0.11.0" => "0.11.1-scale-p1",
+    _ => RELEASE_VERSION,
+};
+
+fn compatible_save_version(version: &str) -> bool {
+    matches!(version, VERSION | PRE_SCALE_VERSION)
+}
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MapPreset {
@@ -314,6 +325,41 @@ impl SimulationOptions {
     fn population_scale(self) -> Result<PopulationScale, NewGameError> {
         PopulationScale::try_new(self.persons_per_agent)
     }
+
+    fn validate_for_snapshot(self, map: &Map) -> Result<PopulationScale, String> {
+        let scale = self.population_scale().map_err(|error| error.to_string())?;
+        if self.valid_for_bootstrap() {
+            return Ok(scale);
+        }
+
+        // Compact authored worlds bypass the native New Game terrain minimum.
+        // Imported worlds use the regular bootstrap options.
+        let authored_minimum = match (self.land_mode, self.land_recipe) {
+            (map::LandMode::Unrestricted, map::LandRecipe::Unrestricted)
+                if self.progression == ProgressionMode::FreeBuild
+                    && map.lot_layout() == LotLayout::Uniform
+                    && map.environment().size() == (self.terrain_size, self.terrain_size) =>
+            {
+                6
+            }
+            (map::LandMode::Tiled, map::LandRecipe::AuthoredV1 { .. }) => 1,
+            _ => return Err("Invalid snapshot new-game options".into()),
+        };
+        let minimum_money = if self.progression == ProgressionMode::Guided {
+            150_000
+        } else {
+            NewGameOptions::MIN_STARTING_MONEY_BUCKS
+        };
+        if !self.save_replay
+            && self.preset == MapPreset::Flat
+            && (authored_minimum..=NewGameOptions::MAX_TERRAIN_CHUNKS).contains(&self.terrain_size)
+            && (minimum_money..=NewGameOptions::MAX_STARTING_MONEY_BUCKS)
+                .contains(&self.starting_money_bucks)
+        {
+            return Ok(scale);
+        }
+        Err("Invalid snapshot authored options".into())
+    }
 }
 
 impl Default for SimulationOptions {
@@ -419,7 +465,7 @@ impl Simulation {
     }
 
     pub fn try_from_replay(replay: Replay) -> io::Result<(Simulation, SimulationReplayLoader)> {
-        if replay.version != VERSION {
+        if !compatible_save_version(&replay.version) {
             return Err(replay_version_error(&replay.version));
         }
         replay.check_registry()?;
@@ -905,11 +951,18 @@ impl Simulation {
         let (header, payload) = snapshot_header(bytes)?;
         header.check_load_compatibility()?;
         let version = header.version;
+        let enveloped = header.revision.is_some();
         let data: SimulationDeser =
             Bincode::decode(payload).map_err(|error| SaveLoadError::Corrupt {
                 version: Some(version.clone()),
                 reason: error.to_string(),
             })?;
+        if enveloped && data._header.version != version {
+            return Err(SaveLoadError::Corrupt {
+                version: Some(version),
+                reason: "snapshot payload version does not match the slot header".into(),
+            });
+        }
         let sim = data.into_sim()?;
         if sim
             .resources
@@ -1178,7 +1231,7 @@ impl SnapshotHeader {
     }
 
     fn check_version(&self) -> Result<(), SaveLoadError> {
-        if self.version != VERSION {
+        if !compatible_save_version(&self.version) {
             return Err(SaveLoadError::Incompatible {
                 version: self.version.clone(),
             });
@@ -1234,7 +1287,7 @@ fn deserialize_save_header<'de, D: Deserializer<'de>>(
 ) -> Result<SaveHeader, D::Error> {
     let header = SaveHeader::deserialize(deserializer)?;
     let version = &header.version;
-    if version != VERSION {
+    if !compatible_save_version(version) {
         return Err(serde::de::Error::custom(format!(
             "Save has version {version:?}, expected {VERSION:?}"
         )));
@@ -1401,7 +1454,7 @@ fn open_listed_snapshot(
     }
     let header =
         read_snapshot_header(&mut file, kind).map_err(|_| SaveLoadError::SnapshotChanged)?;
-    if header.version != VERSION || header.revision != entry.revision {
+    if !compatible_save_version(&header.version) || header.revision != entry.revision {
         return Err(SaveLoadError::SnapshotChanged);
     }
     header.check_compatibility()?;
@@ -1560,11 +1613,22 @@ impl SimulationDeser {
 
         let scale = sim
             .read::<SimulationOptions>()
-            .population_scale()
-            .map_err(|error| corrupt(error.to_string()))?;
-        sim.read::<Replay>()
-            .validate_population_scale(scale)
-            .map_err(|error| corrupt(error.to_string()))?;
+            .validate_for_snapshot(&sim.map())
+            .map_err(&corrupt)?;
+        if self._header.version == PRE_SCALE_VERSION && scale != PopulationScale::REALISTIC {
+            return Err(corrupt(
+                "pre-SCALE snapshot must use Realistic population".into(),
+            ));
+        }
+        {
+            let mut replay = sim.write::<Replay>();
+            replay
+                .validate_population_scale(scale)
+                .map_err(|error| corrupt(error.to_string()))?;
+            if replay.version == PRE_SCALE_VERSION {
+                replay.version = VERSION.to_owned();
+            }
+        }
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
         crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
         sim.map_mut()

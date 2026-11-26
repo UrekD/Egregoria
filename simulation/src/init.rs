@@ -305,8 +305,8 @@ fn register_simulation_options() {
                     progression,
                     ..SimulationOptions::LEGACY
                 };
-                // Same-release saves can end after the original six fields or after
-                // the complete TILES suffix. A present ratio must decode in full.
+                // Pre-SCALE 0.11.0 saves can end after the original six fields
+                // or after the TILES suffix. A present ratio must decode in full.
                 if !input.is_empty() {
                     (options.land_mode, options.land_recipe) = Bincode::decode_reader(&mut input)?;
                 }
