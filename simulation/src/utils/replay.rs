@@ -317,6 +317,8 @@ impl ReplayHeader {
 }
 
 impl ReplayJson {
+    pub(crate) const RESOURCE_NAME: &'static str = "replay";
+
     pub(crate) fn encode_sidecar(
         replay: &Replay,
         revision: SnapshotRevision,

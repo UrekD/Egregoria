@@ -43,6 +43,7 @@ use crate::transportation::train::{
     locomotive_system, train_reservations_update, TrainReservations,
 };
 use crate::transportation::{transport_grid_synchronize, TransportGrid, TransportState};
+use crate::utils::replay::ReplayJson;
 use crate::utils::resources::Resources;
 use crate::world::{CompanyEnt, FreightStationEnt, HumanEnt, TrainEnt, VehicleEnt, WagonEnt};
 use crate::World;
@@ -247,7 +248,7 @@ fn register_systems_and_resources() {
     register_transport_grid();
     register_resource_noinit::<RandProvider, Bincode>("randprovider");
     register_resource_default::<Dispatcher, Bincode>("dispatcher");
-    register_resource_default::<Replay, crate::utils::replay::ReplayJson>("replay");
+    register_resource_default::<Replay, ReplayJson>(ReplayJson::RESOURCE_NAME);
     register_resource_default::<Transit, Bincode>("transit");
     register_resource_default::<TripStats, Bincode>("trip_stats");
     register_resource_default::<TransitStats, Bincode>("transit_stats");

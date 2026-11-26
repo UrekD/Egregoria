@@ -16,7 +16,7 @@ use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::{
     CommandOutcomes, LinkOutcome, Rejection, WorldCommand, WorldCommands,
 };
-use simulation::{EncodedSlot, Simulation, SimulationReplayLoader};
+use simulation::{Simulation, SimulationReplayLoader, SlotCapture};
 
 use crate::automation::{FixtureOp, FixtureOutcome};
 use crate::session::{save_coordinator::SavePermit, CityProgress};
@@ -196,7 +196,7 @@ pub(crate) enum ReplyKind {
     Resumed,
     Stepped(Boundary),
     FixtureDone(Result<FixtureOutcome, String>, Boundary),
-    Captured(Result<(EncodedSlot, CityProgress), String>),
+    Captured(Result<(SlotCapture, CityProgress), String>),
     ReplayChanged,
     ReplayStepped(Boundary),
     Interrupted(Boundary),
@@ -1244,7 +1244,7 @@ impl Worker {
                 {
                     Err("The world moved past the requested save boundary.".into())
                 } else {
-                    sim.encode_slot(revision)
+                    sim.capture_slot(revision)
                         .map(|snapshot| (snapshot, CityProgress::capture(sim)))
                         .map_err(|err| err.to_string())
                 })

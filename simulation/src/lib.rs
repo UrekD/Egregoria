@@ -1126,8 +1126,8 @@ impl Simulation {
         self.encode_slot(revision)?.publish(root, id)
     }
 
-    /// Encodes a save under the caller's simulation lock so publication can happen after unlocking.
-    pub fn encode_slot(&self, revision: SnapshotRevision) -> Result<EncodedSlot, SaveLoadError> {
+    /// Captures the current save boundary. The returned data can be encoded off the simulation.
+    pub fn capture_slot(&self, revision: SnapshotRevision) -> Result<SlotCapture, SaveLoadError> {
         let header = RegistrySlotSnapshotHeader {
             slot: SlotSnapshotHeader {
                 magic: REGISTRY_SLOT_MAGIC,
@@ -1136,25 +1136,34 @@ impl Simulation {
             },
             registry: prototypes::prototypes().fingerprint(),
         };
-        let snapshot = CompressedBincode::encode(&(header, self)).map_err(SaveLoadError::Encode)?;
-        let replay = self.read::<Replay>();
-        let replay = replay
-            .enabled
-            .then(|| ReplayJson::encode_sidecar(&replay, revision))
-            .transpose()
-            .map_err(AtomicWriteError::PreCommit);
+        // Bincode emits tuples and structs as consecutive fields. Keep this prefix
+        // to append the resource map on the encoding worker. Capture the independent
+        // fragments in parallel while the caller holds the world at one boundary.
+        let (world, resources) = rayon::join(
+            || {
+                Bincode::encode(&(header, SaveHeader::current(), &self.world))
+                    .map(|prefix| (prefix, self.read::<Replay>().clone()))
+            },
+            || self.snapshot_resources(false),
+        );
+        let (prefix, replay) = world.map_err(SaveLoadError::Encode)?;
+        let resources = resources.map_err(SaveLoadError::Encode)?;
         let scale = self.population_scale();
-        Ok(EncodedSlot {
-            snapshot,
+        Ok(SlotCapture {
+            prefix,
+            resources,
             replay,
-            display_name: None,
-            camera: None,
             revision,
             game_tick: self.get_tick(),
             population: scale.persons(self.world.humans.len()),
             persons_per_agent: scale.persons_per_agent(),
             money_cents: self.read::<economy::Government>().money.cents(),
         })
+    }
+
+    /// Synchronously captures and encodes a save.
+    pub fn encode_slot(&self, revision: SnapshotRevision) -> Result<EncodedSlot, SaveLoadError> {
+        self.capture_slot(revision)?.encode()
     }
 
     pub fn save_to_disk(&self, save_name: &str) {
@@ -1260,6 +1269,35 @@ impl Simulation {
     }
 }
 
+impl Simulation {
+    fn snapshot_resources(&self, encode_replay: bool) -> io::Result<FastMap<String, Vec<u8>>> {
+        let mut resources = FastMap::default();
+        unsafe {
+            for l in &*addr_of!(SAVELOAD_FUNCS) {
+                // Insert replay at its usual position even when encoding it later.
+                // Hash map insertion and growth determine the legacy wire order.
+                let payload = if !encode_replay && l.name == ReplayJson::RESOURCE_NAME {
+                    Vec::new()
+                } else {
+                    (l.save)(self)
+                };
+                resources.insert(l.name.to_string(), payload);
+            }
+        }
+        if let Some(registry) = prototypes::try_prototypes() {
+            resources.insert(
+                "prototype_registry".into(),
+                Bincode::encode(&registry.fingerprint())?,
+            );
+        }
+        resources.insert(
+            "map_origin".into(),
+            Bincode::encode(&*self.read::<MapOrigin>())?,
+        );
+        Ok(resources)
+    }
+}
+
 impl Serialize for Simulation {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -1267,31 +1305,15 @@ impl Serialize for Simulation {
     {
         log::info!("serializing sim state");
         let t = Instant::now();
-        let mut m: FastMap<String, Vec<u8>> = FastMap::default();
-
-        unsafe {
-            for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let v: Vec<u8> = (l.save)(self);
-                m.insert(l.name.to_string(), v);
-            }
-        }
-
-        if let Some(registry) = prototypes::try_prototypes() {
-            let fingerprint =
-                Bincode::encode(&registry.fingerprint()).map_err(serde::ser::Error::custom)?;
-            m.insert("prototype_registry".into(), fingerprint);
-        }
-        let origin =
-            Bincode::encode(&*self.read::<MapOrigin>()).map_err(serde::ser::Error::custom)?;
-        m.insert("map_origin".into(), origin);
+        let res = self
+            .snapshot_resources(true)
+            .map_err(serde::ser::Error::custom)?;
         log::info!("took {}s to serialize resources", t.elapsed().as_secs_f32());
 
         let v = SimulationSer {
-            header: SaveHeader {
-                version: VERSION.to_owned(),
-            },
+            header: SaveHeader::current(),
             world: &self.world,
-            res: m,
+            res,
         }
         .serialize(serializer);
         log::info!("took {}s to serialize in total", t.elapsed().as_secs_f32());
@@ -1302,6 +1324,14 @@ impl Serialize for Simulation {
 #[derive(Serialize, Deserialize)]
 struct SaveHeader {
     version: String,
+}
+
+impl SaveHeader {
+    fn current() -> Self {
+        Self {
+            version: VERSION.to_owned(),
+        }
+    }
 }
 
 // A legacy Bincode string length cannot start with 0xff. Keep the normal
@@ -1475,6 +1505,71 @@ pub enum SavePhase {
     },
 }
 
+/// Owned state for a single revision of a city.
+pub struct SlotCapture {
+    prefix: Vec<u8>,
+    resources: FastMap<String, Vec<u8>>,
+    replay: Replay,
+    revision: SnapshotRevision,
+    game_tick: u64,
+    population: u64,
+    persons_per_agent: u16,
+    money_cents: i64,
+}
+
+impl SlotCapture {
+    pub fn encode(self) -> Result<EncodedSlot, SaveLoadError> {
+        self.encode_with_limit(MAX_SNAPSHOT_BYTES)
+    }
+
+    fn encode_with_limit(self, limit: usize) -> Result<EncodedSlot, SaveLoadError> {
+        let Self {
+            prefix: mut bytes,
+            mut resources,
+            replay,
+            revision,
+            game_tick,
+            population,
+            persons_per_agent,
+            money_cents,
+        } = self;
+        let embedded = ReplayJson::encode(&replay).map_err(SaveLoadError::Encode)?;
+        *resources
+            .get_mut(ReplayJson::RESOURCE_NAME)
+            .expect("the replay resource is registered") = embedded;
+
+        // Match Bincode's map and byte-sequence lengths, then copy each payload
+        // directly instead of serializing its bytes one at a time.
+        Bincode::encode_writer(&resources.len(), &mut bytes).map_err(SaveLoadError::Encode)?;
+        for (name, payload) in resources {
+            Bincode::encode_writer(&(name, payload.len()), &mut bytes)
+                .map_err(SaveLoadError::Encode)?;
+            if bytes.len() > limit || payload.len() > limit - bytes.len() {
+                return Err(SaveLoadError::SnapshotTooLarge { limit });
+            }
+            bytes.extend_from_slice(&payload);
+        }
+        let snapshot = CompressedBincode::compress(&bytes);
+        drop(bytes);
+        let replay = replay
+            .enabled
+            .then(|| ReplayJson::encode_sidecar(&replay, revision))
+            .transpose()
+            .map_err(AtomicWriteError::PreCommit);
+        Ok(EncodedSlot {
+            snapshot,
+            replay,
+            display_name: None,
+            camera: None,
+            revision,
+            game_tick,
+            population,
+            persons_per_agent,
+            money_cents,
+        })
+    }
+}
+
 pub struct EncodedSlot {
     snapshot: Vec<u8>,
     replay: Result<Option<Vec<u8>>, AtomicWriteError>,
@@ -1593,8 +1688,9 @@ fn read_snapshot_header(
     snapshot_header(&prefix[..len]).map(|(header, _)| header)
 }
 
+const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
+
 fn read_snapshot(mut file: fs::File, kind: SnapshotKind) -> Result<Vec<u8>, SaveLoadError> {
-    const MAX_SNAPSHOT_BYTES: usize = 256 * 1024 * 1024;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes).map_err(SaveLoadError::Io)?;
     if kind == SnapshotKind::Bc {

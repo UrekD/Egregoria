@@ -48,11 +48,7 @@ impl SaveCoordinator {
         })
     }
 
-    pub(crate) fn is_current(&self, permit: &SavePermit) -> bool {
-        self.0.lock().unwrap().allows(permit)
-    }
-
-    /// The caller releases the simulation read lock before publishing.
+    /// The caller completes capture and encoding before publishing.
     /// Hold the gate through the snapshot rename and the sidecar updates.
     pub(crate) fn publish<T>(&self, permit: &SavePermit, publish: impl FnOnce() -> T) -> Option<T> {
         let state = self.0.lock().unwrap();
@@ -93,8 +89,10 @@ impl SaveCoordinator {
 
 impl Publication {
     fn swap(&mut self, generation: u64) {
-        if let Some((_, request)) = self.request.take() {
-            cancel(&request);
+        // A cancelled worker may still own a capture. Keep its permit reserved
+        // until it releases those buffers, including across a generation swap.
+        if let Some((_, request)) = &self.request {
+            cancel(request);
         }
         self.generation = generation;
     }
@@ -107,5 +105,23 @@ impl Publication {
 fn cancel(request: &Weak<AtomicBool>) {
     if let Some(request) = request.upgrade() {
         request.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detached_save_reserves_one_capture_across_generation_swap() {
+        let coordinator = SaveCoordinator::default();
+        let slot = SlotId::legacy();
+        let permit = coordinator.request(0, &slot).unwrap();
+        assert!(coordinator.try_swap(1));
+        assert!(permit.cancelled());
+        assert!(coordinator.publish(&permit, || ()).is_none());
+        assert!(coordinator.request(1, &slot).is_none());
+        drop(permit);
+        assert!(coordinator.request(1, &slot).is_some());
     }
 }

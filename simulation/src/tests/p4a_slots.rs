@@ -1,7 +1,10 @@
-use crate::{NewGameOptions, SaveLoadError, SavePhase, Simulation, SnapshotHeader};
+use crate::{
+    NewGameOptions, RegistrySlotSnapshotHeader, Replay, SaveLoadError, SavePhase, Simulation,
+    SlotSnapshotHeader, SnapshotHeader, REGISTRY_SLOT_MAGIC, VERSION,
+};
 use common::saveload::{
-    list_slots_with_revisions, read_slot_meta, slot_paths, AtomicWriteError, Bincode, Encoder,
-    SlotId, SnapshotKind, SnapshotRevision,
+    list_slots_with_revisions, read_slot_meta, slot_paths, AtomicWriteError, Bincode,
+    CompressedBincode, Encoder, SlotId, SnapshotKind, SnapshotRevision,
 };
 use std::fs;
 use std::io::ErrorKind;
@@ -35,6 +38,98 @@ fn options() -> NewGameOptions {
         seed: 77,
         terrain_chunks: 16,
         ..NewGameOptions::default()
+    }
+}
+
+#[test]
+fn p4a_detached_capture_matches_legacy_bytes_after_the_city_advances() {
+    use crate::map::ZoneKind;
+    use crate::utils::replay::ReplayJson;
+    use crate::WorldCommand;
+
+    let root = TestRoot::new();
+    let id = SlotId::new("detached").unwrap();
+    let paths = slot_paths(&root.0, &id).unwrap();
+    let options = NewGameOptions {
+        persons_per_agent: 8,
+        ..options()
+    };
+    let mut city = Simulation::new_game_with_replay(&options).unwrap();
+    let mut schedule = Simulation::schedule();
+    for (index, enabled) in [true, false].into_iter().enumerate() {
+        let tax_edit = |rate_permille| WorldCommand::SetTaxRate {
+            zone: ZoneKind::Residential,
+            rate_permille,
+        };
+        city.tick(&mut schedule, [&tax_edit(120)]);
+        let revision = SnapshotRevision::new(u128::MAX - index as u128);
+        city.write::<Replay>().enabled = enabled;
+        assert!(city.read::<Replay>().command_count() > 1);
+        let registry = prototypes::prototypes().fingerprint();
+        let legacy = CompressedBincode::encode(&(
+            RegistrySlotSnapshotHeader {
+                slot: SlotSnapshotHeader {
+                    magic: REGISTRY_SLOT_MAGIC,
+                    version: VERSION.into(),
+                    revision,
+                },
+                registry,
+            },
+            &city,
+        ))
+        .unwrap();
+        let legacy_replay =
+            enabled.then(|| ReplayJson::encode_sidecar(&city.read::<Replay>(), revision).unwrap());
+        let captured_tick = city.get_tick();
+        let captured_money = city.read::<crate::economy::Government>().money.cents();
+        let capture = city.capture_slot(revision).unwrap();
+        let legacy_plain = CompressedBincode::decompress(&legacy).unwrap();
+        let inflated_len = legacy_plain.len();
+        let legacy_hashes = Simulation::decode_snapshot(&legacy_plain).unwrap().hashes();
+        if index == 1 {
+            let members = [&paths.zip, &paths.replay, &paths.meta];
+            let before = members.map(|path| fs::read(path).unwrap());
+            let limit = inflated_len - 1;
+            assert!(matches!(
+                city.capture_slot(revision)
+                    .unwrap()
+                    .encode_with_limit(limit)
+                    .and_then(|encoded| encoded.publish(&root.0, &id)),
+                Err(SaveLoadError::SnapshotTooLarge { limit: actual }) if actual == limit
+            ));
+            assert_eq!(members.map(|path| fs::read(path).unwrap()), before);
+        }
+        city.tick(&mut schedule, [&tax_edit(130)]);
+        assert_ne!(captured_tick, city.get_tick());
+
+        let phase = std::thread::scope(|worker| {
+            worker
+                .spawn(|| {
+                    capture
+                        .encode_with_limit(inflated_len)
+                        .unwrap()
+                        .publish(&root.0, &id)
+                        .unwrap()
+                })
+                .join()
+                .unwrap()
+        });
+        assert!(matches!(phase, SavePhase::Complete));
+        assert_eq!(fs::read(&paths.zip).unwrap(), legacy);
+        if let Some(replay) = legacy_replay {
+            assert_eq!(fs::read(&paths.replay).unwrap(), replay);
+        } else {
+            assert!(!paths.replay.exists());
+        }
+        let meta = read_slot_meta(&root.0, &id).unwrap();
+        assert_eq!(meta.game_tick, captured_tick);
+        assert_eq!(meta.money_cents, captured_money);
+        assert_eq!(meta.revision, Some(revision.get()));
+        assert_eq!(meta.persons_per_agent, 8);
+        assert_eq!(
+            Simulation::load_from_slot(&root.0, &id).unwrap().hashes(),
+            legacy_hashes
+        );
     }
 }
 

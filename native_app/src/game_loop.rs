@@ -1655,18 +1655,19 @@ impl State {
         } else {
             let sim = self.sim.clone();
             std::thread::spawn(move || {
-                let encoded = (|| {
+                let captured = (|| {
                     let sim = sim
                         .read()
                         .map_err(|_| "The simulation world failed.".to_owned())?;
-                    if !coordinator.is_current(&permit) {
+                    if permit.cancelled() {
                         return Err("The save was cancelled.".into());
                     }
-                    sim.encode_slot(revision)
+                    sim.capture_slot(revision)
                         .map(|snapshot| (snapshot, CityProgress::capture(&sim)))
                         .map_err(|error| error.to_string())
                 })();
-                let saved = publish_slot(&coordinator, &permit, &slot, name, camera, encoded);
+                let saved =
+                    encode_and_publish_slot(&coordinator, &permit, &slot, name, camera, captured);
                 let _ = sender.send(saved);
             });
         }
@@ -1736,6 +1737,8 @@ impl State {
                         _ => "metadata",
                     };
                     notice = Some(format!("City saved. Could not save {sidecars}."));
+                } else if matches!(request.kind, SaveKind::Manual | SaveKind::SaveAs) {
+                    notice = Some("City saved.".into());
                 }
                 destination = departure.map(|departure| departure.destination);
             }
@@ -1901,30 +1904,34 @@ impl State {
 
 fn publish_capture(
     capture: PendingCapture,
-    encoded: Result<(simulation::EncodedSlot, CityProgress), String>,
+    captured: Result<(simulation::SlotCapture, CityProgress), String>,
 ) {
     std::thread::spawn(move || {
-        let saved = publish_slot(
+        let saved = encode_and_publish_slot(
             &capture.coordinator,
             &capture.permit,
             &capture.slot,
             capture.name,
             capture.camera,
-            encoded,
+            captured,
         );
         let _ = capture.sender.send(saved);
     });
 }
 
-fn publish_slot(
+fn encode_and_publish_slot(
     coordinator: &SaveCoordinator,
     permit: &SavePermit,
     slot: &SlotId,
     name: String,
     camera: common::saveload::SlotCamera,
-    encoded: Result<(simulation::EncodedSlot, CityProgress), String>,
+    captured: Result<(simulation::SlotCapture, CityProgress), String>,
 ) -> SaveResult {
-    let (snapshot, progress) = encoded?;
+    let (capture, progress) = captured?;
+    if permit.cancelled() {
+        return Err("The save was cancelled.".into());
+    }
+    let snapshot = capture.encode().map_err(|error| error.to_string())?;
     coordinator
         .publish(permit, || {
             snapshot

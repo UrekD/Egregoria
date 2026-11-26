@@ -206,7 +206,7 @@ impl Encoder for Bincode {
     fn encode(x: &impl Serialize) -> Result<Vec<u8>> {
         let mut v = Vec::with_capacity(4096);
         DefaultOptions::new()
-            .serialize_into(std::io::Cursor::new(&mut v), x)
+            .serialize_into(&mut v, x)
             .map_err(|x| std::io::Error::new(ErrorKind::Other, x))?;
         Ok(v)
     }
@@ -233,6 +233,12 @@ impl Encoder for Bincode {
 pub struct CompressedBincode;
 
 impl CompressedBincode {
+    /// Compress an already serialized Bincode payload with the save format's zlib settings.
+    pub fn compress(bytes: &[u8]) -> Vec<u8> {
+        // Higher levels take much longer for only slightly smaller saves.
+        miniz_oxide::deflate::compress_to_vec_zlib(bytes, 1)
+    }
+
     /// Decompress a payload so callers can inspect its Bincode prefix before decoding it.
     pub fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
         miniz_oxide::inflate::decompress_to_vec_zlib(bytes)
@@ -244,9 +250,7 @@ impl Encoder for CompressedBincode {
     const EXTENSION: &'static str = "zip";
 
     fn encode(x: &impl Serialize) -> Result<Vec<u8>> {
-        let encoded = &*Bincode::encode(x)?;
-        let compressed = miniz_oxide::deflate::compress_to_vec_zlib(encoded, 1); // bigger level values take far too long and only compress a bit better (about 5%)
-        Ok(compressed)
+        Ok(Self::compress(&Bincode::encode(x)?))
     }
 
     fn decode<T: DeserializeOwned>(x: &[u8]) -> Result<T> {
