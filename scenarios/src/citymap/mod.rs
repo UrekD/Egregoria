@@ -76,6 +76,14 @@ pub fn schematic_cli(args: impl Iterator<Item = OsString>) -> Result<(), String>
 }
 
 pub fn build_cli(args: impl Iterator<Item = OsString>) -> Result<(), String> {
+    let mut args = args.peekable();
+    if args.next_if(|arg| arg == "--verify").is_some() {
+        let path = args.next()
+            .filter(|arg| !arg.is_empty() && !arg.as_encoded_bytes().starts_with(b"--"))
+            .filter(|_| args.next().is_none())
+            .ok_or("usage: scenarios citymap-build --verify DIR")?;
+        return verify_delivery(Path::new(&path));
+    }
     let (out, lesce, sava, dry) = cli_paths("citymap-build", args)?;
     let inputs = SourcePaths {
         lesce: &lesce,
@@ -91,7 +99,7 @@ pub fn build_cli(args: impl Iterator<Item = OsString>) -> Result<(), String> {
 }
 
 /// Verifies the commissioned wet bundle using the same catalogue and loader as the game.
-pub fn verify_delivery(root: &Path) -> Result<(), String> {
+fn verify_delivery(root: &Path) -> Result<(), String> {
     let root = std::path::absolute(root).map_err(|error| error.to_string())?;
     crate::ensure_repo_root_cwd();
     simulation::init::init();
@@ -122,9 +130,6 @@ pub fn verify_delivery(root: &Path) -> Result<(), String> {
     }
 
     let entries = simulation::list_slots_with_revisions(&root, |path, kind| {
-        if kind != common::saveload::SnapshotKind::Zip {
-            return None;
-        }
         let header = Simulation::read_slot_snapshot_header(path, kind).ok()?;
         if header.version != SAVE_VERSION.trim() {
             return None;
@@ -136,6 +141,9 @@ pub fn verify_delivery(root: &Path) -> Result<(), String> {
         .iter()
         .find(|entry| entry.id == id)
         .ok_or("lesce_town is absent from the slot catalogue")?;
+    if entry.snapshot_path() != entry.paths.zip.as_path() {
+        return Err("lesce_town requires a ZIP snapshot".into());
+    }
     let revision = entry
         .revision
         .ok_or("lesce_town requires a readable ZIP header for the current VERSION")?;

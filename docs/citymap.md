@@ -10,4 +10,4 @@ The build report records the source pins, snapshot revision and opening checks. 
 
 ## Release checks
 
-Run `cargo run --locked --release -p scenarios -- citymap-verify --root DIR` to load the wet slot and check its report, version, revision, tick and population. Run `EGR_CITYMAP_PUBLISHED=DIR make build` to bundle that publication in the Windows archive. Run `make citymap-shots EGR_CITYMAP_OUT=DIR` to capture the opening camera, Sava bridges and Land Tiles panel. The captures' `captures.json` records the opening tick, revision and PNG hashes.
+Run `cargo run --locked --release -p scenarios -- citymap-build --verify DIR` to load the wet slot and check its report, version, revision, tick and population. Run `EGR_CITYMAP_PUBLISHED=DIR make build` to bundle that publication in the Windows archive. Run `make citymap-shots EGR_CITYMAP_OUT=DIR` to capture the opening camera, Sava bridges and Land Tiles panel. The captures' `captures.json` records the opening tick, revision and PNG hashes.

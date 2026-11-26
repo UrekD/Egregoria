@@ -41,7 +41,7 @@ sysroot=${SYSROOT_LIB:-$HOME/.local/egr-sysroot/usr/lib/x86_64-linux-gnu}
 export PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-$sysroot/pkgconfig}
 export LIBRARY_PATH=${LIBRARY_PATH:-$sysroot}
 mkdir -p -- "$TMPDIR"
-cargo run --locked --release -p scenarios -- citymap-verify --root "$slots"
+cargo run --locked --release -p scenarios -- citymap-build --verify "$slots"
 root=$(mktemp -d "$TMPDIR/citymap-shots.XXXXXX")
 native=${EGR_CITYMAP_NATIVE:-$CARGO_TARGET_DIR/release/native_app}
 if [[ ! -v EGR_CITYMAP_NATIVE ]]; then

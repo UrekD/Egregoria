@@ -65,7 +65,7 @@ check_slots() {
 
 check_town() {
     [[ -n $town_generator ]] || return 0
-    cargo run --locked --release -p scenarios -- citymap-verify --root "$1"
+    cargo run --locked --release -p scenarios -- citymap-build --verify "$1"
 }
 
 generate() {

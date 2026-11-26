@@ -42,10 +42,14 @@ cat > bin/cargo <<'EOF'
 set -euo pipefail
 [[ "$*" == 'run --locked --release -p scenarios -- '* ]]
 shift 6
-printf '%s\n' "$1" >> "$TRACE"
+if [[ $1 == citymap-build && $2 == --verify ]]; then
+    printf 'citymap-verify\n' >> "$TRACE"
+    set -- citymap-verify "$2" "$3"
+else
+    printf '%s\n' "$1" >> "$TRACE"
+fi
 case "$1" in
     citymap-verify)
-        [[ $2 == --root ]]
         python3 - "$3" <<'PY_CHECK'
 import json
 import sys
