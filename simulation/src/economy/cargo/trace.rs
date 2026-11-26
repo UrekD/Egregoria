@@ -19,6 +19,10 @@ use crate::{CompanyID, TrainID, VehicleID};
 const POSITION_TOLERANCE: f32 = 0.04;
 const MAX_HISTORY: usize = 65_536;
 const MAX_ACTIVE: usize = 65_536;
+// Leave room for imports after export admission stops, and for splits and
+// legacy stock fragments after both kinds of admission stop.
+const EXPORT_ADMISSION_LIMIT: usize = MAX_ACTIVE / 2;
+const IMPORT_ADMISSION_LIMIT: usize = 3 * MAX_ACTIVE / 4;
 const RETAIN_TICKS: u64 = 7 * super::TICKS_PER_BUDGET_DAY;
 
 thread_local! {
@@ -469,8 +473,8 @@ enum FreightQuery {
 pub struct FreightCursor {
     session: u64,
     query: FreightQuery,
-    revision: u64,
-    before: u64,
+    first: u64,
+    last: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -603,22 +607,26 @@ impl FreightTrace {
         cursor: Option<FreightCursor>,
     ) -> Result<FreightPage, StaleFreightCursor> {
         const ROWS: usize = 64;
-        let before = match cursor {
+        match cursor {
             Some(cursor)
-                if cursor.session == self.session.0
-                    && cursor.revision == self.revision
-                    && cursor.query == query =>
+                if cursor.session != self.session.0
+                    || cursor.query != query
+                    || cursor.first < self.omitted =>
             {
-                cursor.before
+                return Err(StaleFreightCursor);
             }
-            Some(_) => return Err(StaleFreightCursor),
-            None => u64::MAX,
-        };
+            _ => {}
+        }
         let mut rows = Vec::new();
         let mut next = None;
         if let Some(ids) = self.by_query.get(&query) {
-            let end = ids.partition_point(|id| *id < before);
-            let start = end.saturating_sub(ROWS);
+            let (start, end) = match cursor {
+                Some(cursor) => (
+                    ids.partition_point(|&id| id < cursor.first),
+                    ids.partition_point(|&id| id <= cursor.last),
+                ),
+                None => (ids.len().saturating_sub(ROWS), ids.len()),
+            };
             rows.extend(
                 (start..end)
                     .rev()
@@ -628,8 +636,8 @@ impl FreightTrace {
                 next = Some(FreightCursor {
                     session: self.session.0,
                     query,
-                    revision: self.revision,
-                    before: ids[start],
+                    first: ids[start.saturating_sub(ROWS)],
+                    last: ids[start - 1],
                 });
             }
         }
@@ -817,28 +825,42 @@ impl FreightTrace {
             .filter(|row| row.stage == FreightStage::ExportStaged)
         {
             if row.fragment.ledger != Some(row.fragment.id)
-                || export_ledger.insert(row.fragment.id, row).is_some()
+                || export_ledger.insert(row.fragment.id, (row, 0u64, 0u128)).is_some()
             {
                 return Err("invalid retained export ledger root");
             }
         }
-        let valid_export = |terminal: Endpoint, line: &FreightFragment| match line.item {
+        let mut valid_export = |terminal: Endpoint, line: &FreightFragment| match line.item {
             Some(_) => {
                 line.source.is_some()
-                    && line.ledger.is_some_and(|id| {
-                        id.0 > 0
-                            && id <= line.id
-                            && export_ledger.get(&id).map_or(self.omitted > 0, |root| {
-                                root.terminal == terminal
-                                    && root.fragment.item == line.item
-                                    && root.fragment.source == line.source
-                                    && root.fragment.road_load == line.road_load
-                                    && root.fragment.units >= line.units
-                            })
-                    })
                     && line
                         .road_load
                         .is_none_or(|load| load.0 > 0 && load.0 <= book.next_id)
+                    && line.ledger.is_some_and(|id| {
+                        if id.0 == 0 || id > line.id {
+                            return false;
+                        }
+                        let Some((root, units, booked)) = export_ledger.get_mut(&id) else {
+                            return self.omitted > 0;
+                        };
+                        let root_booked = root.fragment.booked.inner();
+                        let line_booked = line.booked.inner();
+                        if root.terminal != terminal
+                            || root.fragment.item != line.item
+                            || root.fragment.source != line.source
+                            || root.fragment.road_load != line.road_load
+                            || (line_booked != 0 && line_booked.signum() != root_booked.signum())
+                        {
+                            return false;
+                        }
+                        *units += u64::from(line.units);
+                        *booked += u128::from(line_booked.unsigned_abs());
+                        let root_units = u64::from(root.fragment.units);
+                        let root_amount = u128::from(root_booked.unsigned_abs());
+                        *units <= root_units
+                            && *booked <= root_amount
+                            && (*units < root_units || *booked == root_amount)
+                    })
             }
             None => {
                 line.source.is_none()
@@ -985,7 +1007,8 @@ impl FreightTrace {
     }
 
     pub(crate) fn admit_export(&self, endpoint: Endpoint) -> bool {
-        self.terminal_policy(endpoint).policy.admit_exports && self.record_usage() < MAX_ACTIVE / 2
+        self.terminal_policy(endpoint).policy.admit_exports
+            && self.record_usage() < EXPORT_ADMISSION_LIMIT
     }
 
     fn record_usage(&self) -> usize {
@@ -994,6 +1017,10 @@ impl FreightTrace {
 
     fn free_records(&self) -> usize {
         MAX_ACTIVE.saturating_sub(self.record_usage())
+    }
+
+    pub(super) fn import_record_credit(&self) -> usize {
+        IMPORT_ADMISSION_LIMIT.saturating_sub(self.record_usage())
     }
 
     pub(crate) fn export_units_fit(&self, terminal: Endpoint, waiting: u32, units: u64) -> bool {
@@ -1010,7 +1037,7 @@ impl FreightTrace {
     ) -> bool {
         if records == 0
             || units == 0
-            || records > (MAX_ACTIVE / 2).saturating_sub(self.record_usage())
+            || records > EXPORT_ADMISSION_LIMIT.saturating_sub(self.record_usage())
             || !self.export_units_fit(terminal, waiting, units)
         {
             return false;
@@ -1251,7 +1278,7 @@ impl FreightTrace {
             }
         }
         let available = self.available_imports(call.key.terminal, desk);
-        let credit = (MAX_ACTIVE / 2).saturating_sub(self.record_usage());
+        let credit = self.import_record_credit();
         let mut room = TRAIN_CAPACITY.min(credit as u32);
         for (item, unassigned) in available {
             let mut units = bounded_transfer(unassigned, room);
@@ -1843,6 +1870,199 @@ mod tests {
         let cursor = page.next.unwrap();
         assert!(trace.continue_trace(cursor).is_ok());
         assert!(restored.continue_trace(cursor).is_err());
+    }
+
+    fn test_call(terminal: Endpoint, train: TrainID, epoch: u64) -> CallManifest {
+        let anchor = RailAnchor {
+            lane: LaneID::default(),
+            offset: 10.0,
+            position: Vec3::X * 10.0,
+            dir: Vec3::X,
+        };
+        CallManifest {
+            key: FreightCallKey {
+                terminal,
+                train,
+                epoch,
+                outside_gate: BuildingID::default(),
+            },
+            gate: anchor,
+            gate_departure: anchor,
+            berth: anchor,
+            leg: RailLeg::Inbound,
+            departed: false,
+            reached: false,
+            departure_recorded: false,
+            retry_at: 0,
+            last_motion: 0,
+            imports: Vec::new(),
+            exports: Vec::new(),
+            exports_loaded: false,
+        }
+    }
+
+    #[test]
+    fn p8_held_export_backlog_leaves_room_for_an_open_terminal_import() {
+        drop(crate::tests::TestCtx::new_fast());
+        let mut stations = slotmapd::SlotMap::with_key();
+        let held = Endpoint {
+            soul: SoulID::FreightStation(stations.insert(())),
+            building: BuildingID::default(),
+        };
+        let open = Endpoint {
+            soul: SoulID::FreightStation(stations.insert(())),
+            ..held
+        };
+        let trade = super::super::Trade {
+            buyer: super::super::TradeTarget(held.soul),
+            seller: super::super::TradeTarget(SoulID::GoodsCompany(CompanyID::default())),
+            kind: ItemID::new("coal"),
+            qty: 1,
+            money_delta: Money::new_inner(9),
+        };
+        let mut trace = FreightTrace::default();
+        trace.policies.insert(
+            held,
+            super::super::TerminalPolicyView {
+                revision: 1,
+                policy: super::super::FreightTerminalPolicy {
+                    max_calls: 0,
+                    ..Default::default()
+                },
+            },
+        );
+        for waiting in 0..MAX_ACTIVE / 2 {
+            assert!(trace.reserve_export_space(held, waiting as u32, 1, 1));
+            trace.stage_export(held, trade, None, 1);
+        }
+        let desk = ImportDesk {
+            on_rail: BTreeMap::from([(ItemID::new("goods"), u64::from(TRAIN_CAPACITY))]),
+            ..Default::default()
+        };
+        let mut call = test_call(open, TrainID::default(), trace.next_id());
+        trace.reserve_imports(&mut call, &desk, 2);
+        assert_eq!(
+            call.imports.iter().map(|line| line.units).sum::<u32>(),
+            TRAIN_CAPACITY
+        );
+        assert!(trace.free_records() >= TRAIN_CAPACITY as usize);
+        assert_eq!(trace.exports[&held].len(), MAX_ACTIVE / 2);
+    }
+
+    #[test]
+    fn p8_freight_cursor_uses_retained_rows_and_expires_after_eviction() {
+        let mut stations = slotmapd::SlotMap::with_key();
+        let terminal = Endpoint {
+            soul: SoulID::FreightStation(stations.insert(())),
+            building: BuildingID::default(),
+        };
+        let other = Endpoint {
+            soul: SoulID::FreightStation(stations.insert(())),
+            ..terminal
+        };
+        let mut trace = FreightTrace::default();
+        let row = trace.unknown(None, 1);
+        trace.record(other, &row, FreightStage::ExportStaged, None, 1);
+        for index in 0..129 {
+            let row = trace.unknown(None, 1);
+            trace.record(terminal, &row, FreightStage::ExportStaged, None, index + 2);
+        }
+        let cursor = trace.terminal_view(terminal).next.unwrap();
+        let expected = trace.continue_trace(cursor).unwrap();
+        let ids = |page: &FreightPage| -> Vec<ShipmentId> {
+            page.rows.iter().map(|row| row.fragment.id).collect()
+        };
+        trace.record(other, &row, FreightStage::ExportStaged, None, 132);
+        assert_eq!(ids(&trace.continue_trace(cursor).unwrap()), ids(&expected));
+        trace.record(terminal, &row, FreightStage::ExportStaged, None, 133);
+        trace.age(RETAIN_TICKS + 2);
+        let retained = trace.continue_trace(cursor).unwrap();
+        assert_eq!(ids(&retained), ids(&expected));
+        assert!(retained.next.is_none());
+        trace.age(RETAIN_TICKS + 3);
+        assert!(trace.continue_trace(cursor).is_err());
+    }
+
+    #[test]
+    fn p8_snapshot_reconciles_staged_and_assigned_export_fragments() {
+        use crate::souls::freight_station::{freight_station_soul, FreightTrainState};
+        use crate::world_command::{CommandOutcomes, WorldCommand};
+        use crate::BuildingKind;
+        use common::saveload::{Bincode, Encoder};
+
+        let mut sim = crate::tests::TestCtx::new_fast().g;
+        let (building, proto, rail) = {
+            let map = sim.map();
+            let (building, proto) = map
+                .buildings()
+                .values()
+                .find_map(|b| match b.kind {
+                    BuildingKind::RailFreightStation(proto) => Some((b.id, proto)),
+                    _ => None,
+                })
+                .unwrap();
+            let rail = map
+                .lanes()
+                .values()
+                .find(|lane| lane.kind == LaneKind::Rail && lane.points.length() > 200.0)
+                .unwrap()
+                .id;
+            (building, proto, rail)
+        };
+        let station = freight_station_soul(&mut sim, building, proto).unwrap();
+        let terminal = Endpoint {
+            soul: SoulID::FreightStation(station),
+            building,
+        };
+        sim.apply_commands([&WorldCommand::SpawnTrain {
+            wagons: vec![prototypes::RollingStockID::new("locomotive")],
+            lane: rail,
+            dist: 100.0,
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let train = sim.world().trains.keys().next().unwrap();
+        let freight = &mut sim.world_mut_unchecked().freight_stations[station].f;
+        freight.trains.push((train, FreightTrainState::Arriving));
+        freight.waiting_cargo = 110;
+        {
+            let mut trace = sim.write::<FreightTrace>();
+            assert!(trace.reserve_export_space(terminal, 0, 110, 1));
+            trace.stage_export(
+                terminal,
+                super::super::Trade {
+                    buyer: super::super::TradeTarget(terminal.soul),
+                    seller: super::super::TradeTarget(SoulID::GoodsCompany(CompanyID::default())),
+                    kind: ItemID::new("coal"),
+                    qty: 110,
+                    money_delta: Money::new_inner(9),
+                },
+                None,
+                1,
+            );
+            let mut call = test_call(terminal, train, trace.next_id());
+            trace.reserve_exports(&mut call, 110);
+            assert_eq!(call.exports[0].units, 100);
+            assert_eq!(trace.exports[&terminal][0].units, 10);
+            trace.calls.insert(train, call);
+        }
+        let reload = |sim: &crate::Simulation| {
+            Bincode::decode::<crate::Simulation>(&Bincode::encode(sim).unwrap())
+        };
+        assert!(reload(&sim).is_ok(), "a real split must survive reload");
+
+        sim.write::<FreightTrace>().exports.get_mut(&terminal).unwrap()[0].booked =
+            Money::new_inner(2);
+        let overbooked = reload(&sim).err();
+        {
+            let mut trace = sim.write::<FreightTrace>();
+            let staged = &mut trace.exports.get_mut(&terminal).unwrap()[0];
+            staged.booked = Money::new_inner(1);
+            staged.units = 11;
+        }
+        sim.world_mut_unchecked().freight_stations[station].f.waiting_cargo = 111;
+        let excess_units = reload(&sim).err();
+        assert!(overbooked.is_some(), "the split booked more than its root");
+        assert!(excess_units.is_some(), "the split exceeds its root quantity");
     }
 
     #[test]

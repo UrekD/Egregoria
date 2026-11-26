@@ -141,17 +141,17 @@ impl Dispatcher {
         })
     }
 
-    pub(crate) fn query_where(
+    pub(crate) fn query_map<T>(
         &mut self,
         map: &Map,
         kind: DispatchKind,
         target: DispatchQueryTarget,
-        eligible: impl Fn(DispatchID) -> bool,
-    ) -> Option<DispatchID> {
+        plan: impl Fn(DispatchID) -> Option<T>,
+    ) -> Option<(DispatchID, T)> {
         let disp = self.dispatches.get_mut(&kind)?;
-        let best_ent = disp.query_where(map, kind, target, eligible)?;
-        disp.reserve(best_ent);
-        Some(best_ent)
+        let best = disp.query_map(map, kind, target, plan)?;
+        disp.reserve(best.0);
+        Some(best)
     }
 
     /// Reserves an entity that is closest to the target (if it is found) and returns it
@@ -163,7 +163,8 @@ impl Dispatcher {
         kind: DispatchKind,
         target: DispatchQueryTarget,
     ) -> Option<DispatchID> {
-        self.query_where(map, kind, target, |_| true)
+        self.query_map(map, kind, target, |_| Some(()))
+            .map(|(id, ())| id)
     }
 }
 
@@ -253,16 +254,17 @@ impl DispatchOne {
         kind: DispatchKind,
         target: DispatchQueryTarget,
     ) -> Option<DispatchID> {
-        self.query_where(map, kind, target, |_| true)
+        self.query_map(map, kind, target, |_| Some(()))
+            .map(|(id, ())| id)
     }
 
-    fn query_where(
+    fn query_map<T>(
         &self,
         map: &Map,
         kind: DispatchKind,
         target: DispatchQueryTarget,
-        eligible: impl Fn(DispatchID) -> bool,
-    ) -> Option<DispatchID> {
+        plan: impl Fn(DispatchID) -> Option<T>,
+    ) -> Option<(DispatchID, T)> {
         // todo: handle the case where there are few entities in the cache
         // todo: probably some kind of astar on good candidates
 
@@ -306,18 +308,19 @@ impl DispatchOne {
                 continue;
             };
             for ent in ents {
-                if self.reserved_by.contains(ent) || !eligible(*ent) {
+                if self.reserved_by.contains(ent) {
                     continue;
                 }
                 let pos = self.positions.get(ent).unwrap();
                 let dist = -pos.dist_along; // since dist_along is from start to end, a good dist_along is one that is big
-                if !Dispatcher::position_is_eligible(lane, pos.dist_along, target_lane, start_along)
+                if dist >= best_dist
+                    || !Dispatcher::position_is_eligible(lane, pos.dist_along, target_lane, start_along)
                 {
                     continue;
                 }
-                if dist < best_dist {
+                if let Some(plan) = plan(*ent) {
                     best_dist = dist;
-                    best_ent = Some(*ent);
+                    best_ent = Some((*ent, plan));
                 }
             }
             if best_ent.is_some() {

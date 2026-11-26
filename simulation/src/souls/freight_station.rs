@@ -6,8 +6,7 @@ use prototypes::{
 };
 
 use crate::economy::cargo::{
-    CallManifest, CargoBook, Endpoint, FreightCallKey, FreightFailure, FreightTrace, RailAnchor,
-    RailLeg,
+    CallManifest, CargoBook, Endpoint, FreightCallKey, FreightFailure, FreightTrace, RailLeg,
 };
 use crate::map::{BuildingID, LaneID, Map};
 use crate::map_dynamic::transit::elapsed_ticks;
@@ -236,71 +235,46 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
         let stop = train_stop(&entity.trans);
         let (gates, cached) = cargo.rail_dispatch_gates(&map, station.building, stop);
         probes += usize::from(!cached || !gates.is_empty());
-        if gates.is_empty() {
-            continue;
-        }
-        let Some(berth) = RailAnchor::near(&map, stop) else {
+        let Some(first) = gates.first() else {
             continue;
         };
-        let Some(DispatchID::FreightTrain(id)) = dispatch.query_where(
+        let plan = dispatch.query_map(
             &map,
             DispatchKind::FreightTrain,
-            DispatchQueryTarget::Pos(berth.position),
-            |id| match id {
-                DispatchID::FreightTrain(id) => world.trains.get(id).is_some_and(|train| {
-                    gates
-                        .iter()
-                        .any(|gate| gate.for_train(&map, train.locomotive.length).is_some())
-                }),
-                _ => false,
+            DispatchQueryTarget::Lane(first.berth.lane),
+            |id| {
+                let DispatchID::FreightTrain(id) = id else {
+                    return None;
+                };
+                let train = world.trains.get(id)?;
+                let lane = train_lane(&map, train)?;
+                gates.iter().find_map(|gate| {
+                    let (departure, route, leg) = gate.approach(tick, &map, train, lane)?;
+                    Some((*gate, departure, route, leg, lane))
+                })
             },
-        ) else {
+        );
+        let Some((DispatchID::FreightTrain(id), (gate, gate_departure, route, leg, lane))) = plan
+        else {
             trace.defer_dispatch(terminal, now + LOADING_TICKS);
             continue;
         };
-        let Some(train) = world.trains.get_mut(id) else {
-            dispatch.free(id);
-            trace.defer_dispatch(terminal, now + LOADING_TICKS);
-            continue;
-        };
-        let Some(lane) = train_lane(&map, train) else {
-            dispatch.free(id);
-            trace.defer_dispatch(terminal, now + LOADING_TICKS);
-            continue;
-        };
-        let Some((outside, gate, gate_departure, route, leg)) = gates.iter().find_map(|gate| {
-            let (clearance, departure) = gate.for_train(&map, train.locomotive.length)?;
-            let (target, leg) = if lane == gate.gate.lane
-                && train.trans.pos.distance(clearance.position) <= 40.0
-                && departure.before(train.trans.pos)
-                && rear_clear_of_turns(&train.res)
-            {
-                (berth, RailLeg::Inbound)
-            } else {
-                (clearance, RailLeg::Positioning)
-            };
-            let route = target.route(tick, &map, train.trans.pos, lane)?;
-            Some((gate.outside, gate.gate, departure, route, leg))
-        }) else {
-            dispatch.free(id);
-            trace.defer_dispatch(terminal, now + LOADING_TICKS);
-            continue;
-        };
+        let train = &mut world.trains[id];
         let mut call = CallManifest {
             key: FreightCallKey {
                 terminal,
                 train: id,
                 epoch: trace.next_id(),
-                outside_gate: outside,
+                outside_gate: gate.outside,
             },
-            gate,
+            gate: gate.gate,
             gate_departure,
-            berth,
+            berth: gate.berth,
             leg,
             departed: false,
             reached: leg == RailLeg::Positioning
-                && lane == gate.lane
-                && !gate.before(train.trans.pos),
+                && lane == gate.gate.lane
+                && !gate.gate.before(train.trans.pos),
             departure_recorded: false,
             retry_at: now + LOADING_TICKS,
             last_motion: now,
@@ -409,7 +383,7 @@ fn advance_call(
     CallDisposition::Active
 }
 
-fn train_lane(map: &Map, train: &TrainEnt) -> Option<LaneID> {
+pub(crate) fn train_lane(map: &Map, train: &TrainEnt) -> Option<LaneID> {
     crate::transportation::train::occupied_lanes(&train.res)
         .filter_map(|lane| {
             let distance = map.get(lane)?.points.project_dist2(train.trans.pos);

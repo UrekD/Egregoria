@@ -32,19 +32,20 @@ use serde::{Deserialize, Serialize};
 use super::{
     Budget, BudgetCategory, EcoStats, FreightDay, Market, Trade, TradeTarget, TICKS_PER_BUDGET_DAY,
 };
-use crate::map::{BuildingID, LaneKind, Map, PathKind, RoadID, TraverseKind};
+use crate::map::{BuildingID, LaneID, LaneKind, Map, PathKind, RoadID, TraverseKind};
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{
     active_business, ActiveBusiness, BuildingInfos, Destination, Itinerary, ParkingManagement,
 };
 use crate::souls::desire::WorkKind;
-use crate::souls::freight_station::train_stop;
+use crate::souls::freight_station::{train_lane, train_stop};
 use crate::souls::household::household_items;
+use crate::transportation::train::rear_clear_of_turns;
 use crate::transportation::{
     spawn_truck_at_depot, unpark, Location, TransportGrid, VehicleKind, VehicleState,
 };
 use crate::utils::resources::Resources;
-use crate::world::FreightStationEnt;
+use crate::world::{FreightStationEnt, TrainEnt};
 use crate::{
     CompanyID, HumanEnt, HumanID, ParCommandBuffer, Simulation, SoulID, VehicleEnt, VehicleID,
     World,
@@ -626,12 +627,13 @@ impl CargoBook {
     }
 
     pub(crate) fn can_dispatch_import(&self, trace: &FreightTrace, terminal: Endpoint) -> bool {
-        self.imports.get(&terminal).is_some_and(|desk| {
-            trace
-                .available_imports(terminal, desk)
-                .values()
-                .any(|&units| units > 0)
-        })
+        trace.import_record_credit() != 0
+            && self.imports.get(&terminal).is_some_and(|desk| {
+                trace
+                    .available_imports(terminal, desk)
+                    .values()
+                    .any(|&units| units > 0)
+            })
     }
 
     pub(crate) fn rail_dispatch_gates(
@@ -1058,13 +1060,30 @@ struct RouteCache {
 pub(crate) struct RailGate {
     pub outside: BuildingID,
     pub gate: RailAnchor,
+    pub berth: RailAnchor,
 }
 
 impl RailGate {
-    pub fn for_train(self, map: &Map, length: f32) -> Option<(RailAnchor, RailAnchor)> {
-        let clearance = self.gate.clearance(map, length)?;
+    pub fn approach(
+        self,
+        tick: Tick,
+        map: &Map,
+        train: &TrainEnt,
+        lane: LaneID,
+    ) -> Option<(RailAnchor, Itinerary, RailLeg)> {
+        let clearance = self.gate.clearance(map, train.locomotive.length)?;
         let departure = self.gate.departure_point(map, clearance)?;
-        Some((clearance, departure))
+        let (target, leg) = if lane == self.gate.lane
+            && train.trans.pos.distance(clearance.position) <= 40.0
+            && departure.before(train.trans.pos)
+            && rear_clear_of_turns(&train.res)
+        {
+            (self.berth, RailLeg::Inbound)
+        } else {
+            (clearance, RailLeg::Positioning)
+        };
+        let route = target.route(tick, map, train.trans.pos, lane)?;
+        Some((departure, route, leg))
     }
 }
 
@@ -1141,7 +1160,7 @@ impl RouteCache {
                     let departure = gate.departure_point(map, gate)?;
                     berth.route(Tick(0), map, departure.position, gate.lane)?;
                     gate.route(Tick(0), map, berth.position, berth.lane)?;
-                    Some(RailGate { outside, gate })
+                    Some(RailGate { outside, gate, berth })
                 })
                 .collect()
         })
@@ -3199,22 +3218,21 @@ fn stalled(progress: &mut Option<LoadProgress>, pos: geom::Vec3, now: u64) -> bo
     now >= last.since + LOAD_STALL_TICKS
 }
 
-/// Stations that can import: live, with a train and a rail route to the outside.
+/// Live stations with a gate that at least one consist can serve.
 fn import_stations(
     routes: &mut RouteCache,
     world: &World,
     map: &Map,
     infos: &BuildingInfos,
 ) -> Vec<Endpoint> {
-    if world.trains.is_empty() {
-        return Vec::new();
-    }
-    let shortest = world
+    let trains: Vec<_> = world
         .trains
         .values()
-        .map(|train| train.locomotive.length)
-        .min_by(f32::total_cmp)
-        .unwrap();
+        .filter_map(|train| train_lane(map, train).map(|lane| (train, lane)))
+        .collect();
+    if trains.is_empty() {
+        return Vec::new();
+    }
     world
         .freight_stations
         .iter()
@@ -3229,7 +3247,11 @@ fn import_stations(
             routes
                 .rail_gates(map, endpoint.building, train_stop(&station.trans))
                 .iter()
-                .any(|gate| gate.for_train(map, shortest).is_some())
+                .any(|gate| {
+                    trains
+                        .iter()
+                        .any(|&(train, lane)| gate.approach(Tick(0), map, train, lane).is_some())
+                })
                 .then_some(endpoint)
         })
         .collect()
@@ -3271,7 +3293,6 @@ fn order_imports(
     infos: &BuildingInfos,
     now: u64,
 ) {
-    let stations = import_stations(&mut book.routes, world, map, infos);
     let market = resources.read::<Market>();
     for (station, desk) in &mut book.imports {
         if !station.live(world, map, infos) {
@@ -3333,6 +3354,7 @@ fn order_imports(
     for &key in book.import_customers.keys() {
         wants.entry(key).or_insert(None);
     }
+    let mut stations = None;
     for ((buyer, item), ordered) in wants {
         let Some(input) = destination_input(world, map, infos, buyer, item) else {
             continue;
@@ -3355,6 +3377,7 @@ fn order_imports(
         }
         let trace = resources.read::<FreightTrace>();
         let mut reachable: Vec<_> = stations
+            .get_or_insert_with(|| import_stations(&mut book.routes, world, map, infos))
             .iter()
             .copied()
             .filter(|station| book.routes.reaches(map, station.building, buyer.building))
@@ -6827,21 +6850,33 @@ mod lifecycle_tests {
         }]);
     }
 
-    /// A station inside the ring road with a train calling. The ring has no
-    /// room for platform track, so the station counts as rail-served here;
-    /// `imports_need_platform_track_with_a_rail_route_outside` builds real track.
+    /// A station inside the ring road with simulated rail service. Tests using
+    /// this fixture unload orders directly so they can exercise the road leg.
     fn import_station(f: &mut Fixture) -> Endpoint {
         let terminal = station(f, true);
         spawn_train(f);
+        f.ctx.apply(&[WorldCommand::SetFreightTerminalPolicy {
+            terminal,
+            expected_policy_revision: 0,
+            policy: FreightTerminalPolicy {
+                max_calls: 0,
+                ..FreightTerminalPolicy::default()
+            },
+        }]);
         let map = f.ctx.g.map();
         let mut book = f.ctx.g.write::<CargoBook>();
         book.routes.refresh(&map);
         let outside = map.external_train_stations[0];
         let market = map.get(outside).unwrap();
         let gate = RailAnchor::near(&map, market.obb.center().z(market.height)).unwrap();
-        book.routes
-            .rail
-            .insert(terminal.building, vec![RailGate { outside, gate }]);
+        book.routes.rail.insert(
+            terminal.building,
+            vec![RailGate {
+                outside,
+                gate,
+                berth: gate,
+            }],
+        );
         terminal
     }
 
@@ -7002,7 +7037,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn imports_see_an_authored_market_placed_after_matching() {
+    fn p8_imports_see_an_authored_market_and_require_a_serving_train() {
         use crate::map::{LanePatternBuilder, MapProject, RailMarketSite};
         use crate::world_command::CommandOutcomes;
         use crate::AuthoredTownOptions;
@@ -7088,10 +7123,17 @@ mod lifecycle_tests {
         sim.write::<Market>()
             .buy(buyer, store_centre, ItemID::new("goods"), 2);
         let stop = train_stop(&sim.get(station).unwrap().trans);
+        let isolated_lane = sim
+            .map()
+            .lanes()
+            .values()
+            .find(|track| track.kind == LaneKind::Rail && track.points.first().y > 800.0)
+            .unwrap()
+            .id;
         sim.apply_commands([&WorldCommand::SpawnTrain {
             wagons: vec![prototypes::RollingStockID::new("locomotive")],
-            lane,
-            dist: 200.0,
+            lane: isolated_lane,
+            dist: 100.0,
         }]);
         assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
         let update = |sim: &mut Simulation, elapsed| {
@@ -7132,6 +7174,20 @@ mod lifecycle_tests {
         sim.map_mut().external_train_stations.rotate_right(1);
         assert_eq!(sim.map().external_train_stations[0], isolated);
 
+        update(&mut sim, 2 * FREIGHT_MATCH_INTERVAL);
+        {
+            let book = sim.read::<CargoBook>();
+            assert_eq!(book.routes.rail[&terminal].len(), 1);
+            assert_eq!(book.import_status(buyer), Some(ImportStatus::NoRoute));
+            assert!(book.imports.is_empty());
+        }
+        sim.apply_commands([&WorldCommand::SpawnTrain {
+            wagons: vec![prototypes::RollingStockID::new("locomotive")],
+            lane,
+            dist: 200.0,
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+
         let endpoint = Endpoint {
             soul: SoulID::FreightStation(station),
             building: terminal,
@@ -7149,12 +7205,12 @@ mod lifecycle_tests {
                 ..open
             },
         )]);
-        update(&mut sim, 2 * FREIGHT_MATCH_INTERVAL);
+        update(&mut sim, 3 * FREIGHT_MATCH_INTERVAL);
         let book = sim.read::<CargoBook>();
         assert_eq!(book.routes.rail[&terminal].len(), 1);
         assert_eq!(book.import_status(buyer), Some(ImportStatus::Held));
         assert!(book
-            .import_problems(2 * FREIGHT_MATCH_INTERVAL)
+            .import_problems(3 * FREIGHT_MATCH_INTERVAL)
             .no_route
             .is_empty());
         let SoulID::GoodsCompany(owner) = buyer else {
@@ -7172,7 +7228,7 @@ mod lifecycle_tests {
         drop(book);
 
         sim.apply_commands([&policy(1, open)]);
-        update(&mut sim, 3 * FREIGHT_MATCH_INTERVAL);
+        update(&mut sim, 4 * FREIGHT_MATCH_INTERVAL);
         let book = sim.read::<CargoBook>();
         assert!(matches!(
             book.import_status(buyer),
