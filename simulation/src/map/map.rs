@@ -1621,8 +1621,11 @@ impl Map {
         }
         super::validate_water_service_placement(self, kind, obb, connected_road)
             .map_err(Rejection::WaterServiceSite)?;
-        if connected_road.is_some_and(|road| !self.roads.contains_key(road)) {
-            return Err(Rejection::MissingReference);
+        if let Some(road) = connected_road {
+            let road = self.roads.get(road).ok_or(Rejection::MissingReference)?;
+            if road.is_walking_path() {
+                return Err(Rejection::InvalidBuilding);
+            }
         }
         if self.building_overlaps(obb) {
             return Err(Rejection::BuildingOverlap);

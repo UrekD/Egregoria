@@ -272,7 +272,13 @@ impl ElectricityCache {
                 let Some(r) = b.connected_road else {
                     return Left(Left(std::iter::empty()));
                 };
-                Left(Right(Some(NetworkObjectID::Road(r)).into_iter()))
+                Left(Right(
+                    roads
+                        .get(r)
+                        .filter(|road| !road.is_walking_path())
+                        .map(|_| NetworkObjectID::Road(r))
+                        .into_iter(),
+                ))
             }
             NetworkObjectID::Intersection(i) => {
                 let Some(i) = intersections.get(i) else {

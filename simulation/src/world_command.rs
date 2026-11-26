@@ -1154,8 +1154,22 @@ impl WorldCommand {
             let outcome = if water.reject_surface {
                 Err(WaterEditError::Limit)
             } else {
-                sim.map_mut()
-                    .apply_water_edit(edit, &mut sim.zone_grid_mut(), &mut water.remaining)
+                let traffic = sim.read::<crate::transportation::DrivewayTraffic>();
+                let mut map = sim.map_mut();
+                if traffic.is_empty() {
+                    map.apply_water_edit(edit, &mut sim.zone_grid_mut(), &mut water.remaining)
+                } else {
+                    map.environment()
+                        .prepare_water_edit(edit)
+                        .and_then(|prepared| {
+                            traffic.guard_water(&prepared, &mut water.remaining)?;
+                            map.commit_water_edit(
+                                prepared,
+                                &mut sim.zone_grid_mut(),
+                                &mut water.remaining,
+                            )
+                        })
+                }
             };
             let rejection = outcome.as_ref().err().map(Rejection::water_error);
             if let Some(reason) = rejection {
@@ -1187,6 +1201,8 @@ impl WorldCommand {
                     .environment()
                     .prepare_water_terraform(tick, kind, center, radius, amount, level, slope)
                     .and_then(|prepared| {
+                        sim.read::<crate::transportation::DrivewayTraffic>()
+                            .guard_water(&prepared, &mut water.remaining)?;
                         map.commit_water_edit(
                             prepared,
                             &mut sim.zone_grid_mut(),
@@ -1869,6 +1885,9 @@ impl WorldCommand {
                         *slope,
                     )
                     .map_err(Self::terraform_error)?;
+                sim.read::<crate::transportation::DrivewayTraffic>()
+                    .guard_water(&prepared, &mut budget.remaining)
+                    .map_err(Self::terraform_error)?;
                 let water = map
                     .preview_prepared_water(&prepared, &sim.read::<ZoneGrid>())
                     .map_err(Self::terraform_error)?;
@@ -1937,13 +1956,14 @@ impl WorldCommand {
             return Ok(());
         }
         let map = sim.map();
+        let protected = traffic.protected_roads(&map);
         let touches_junction = |id| {
             map.get(id).is_some_and(|joint: &crate::map::Intersection| {
-                joint.roads.iter().any(|&road| traffic.protects(road))
+                joint.roads.iter().any(|&road| protected.contains(&road))
             })
         };
         let touches_road = |id| {
-            traffic.protects(id)
+            protected.contains(&id)
                 || map.get(id).is_some_and(|road: &crate::map::Road| {
                     touches_junction(road.src) || touches_junction(road.dst)
                 })
@@ -1965,9 +1985,13 @@ impl WorldCommand {
         };
         let blocked = match self {
             MapRemoveRoad(road) | MapUpgradeRoad { road, .. } => touches_road(*road),
-            MapRemoveIntersection(joint) | MapUpdateIntersectionPolicy { inter: joint, .. } => {
-                touches_junction(*joint)
+            MapRemoveIntersection(joint) => map
+                .get(*joint)
+                .is_some_and(|intersection| intersection.roads.iter().copied().any(touches_road)),
+            MapSetJunctionRules {
+                junction: joint, ..
             }
+            | MapUpdateIntersectionPolicy { inter: joint, .. } => touches_junction(*joint),
             MapMakeConnection {
                 from,
                 to,
@@ -2015,11 +2039,11 @@ impl WorldCommand {
                 map.get(*lot)
                     .is_some_and(|lot| traffic.overlaps(&lot.shape.bbox()))
             }
-            MapLoadParis | MapLoadTestField { .. } | EditWater(_) => true,
+            MapLoadParis | MapLoadTestField { .. } => true,
             _ => false,
         };
         if blocked {
-            Err(Rejection::InvalidConnection)
+            Err(Rejection::BusyConflict)
         } else {
             Ok(())
         }
@@ -2092,6 +2116,37 @@ impl WorldCommand {
                     map.prepare_walking_path(*from, *to, *control, &admission, &mut work);
                 budget.remaining = work.remaining;
                 let prepared = prepared.map_err(Rejection::water_connection_error)?;
+                let mut split_roads = prepared.split_roads().peekable();
+                if split_roads.peek().is_some() {
+                    use crate::map::TraverseKind;
+                    use crate::map_dynamic::ItineraryTarget;
+
+                    let roads: BTreeSet<_> = split_roads.collect();
+                    let replaced = |lane| {
+                        map.get(lane)
+                            .is_some_and(|lane: &crate::map::Lane| roads.contains(&lane.parent))
+                    };
+                    let world = sim.world();
+                    let itineraries = world
+                        .vehicles
+                        .values()
+                        .map(|actor| &actor.it)
+                        .chain(world.humans.values().map(|actor| &actor.it))
+                        .chain(world.trains.values().map(|actor| &actor.it));
+                    for itinerary in itineraries {
+                        crate::map::spend_water_work(&mut budget.remaining, 1)
+                            .map_err(|error| Rejection::water_error(&error))?;
+                        let loses_target = matches!(itinerary.target(),
+                            Some(ItineraryTarget::DirectedLane(lane, _)) if replaced(lane));
+                        let loses_current = itinerary.get_travers().is_some_and(|t| match t.kind {
+                            TraverseKind::Lane(lane) => replaced(lane),
+                            TraverseKind::Turn(turn) => replaced(turn.src) || replaced(turn.dst),
+                        });
+                        if loses_target || loses_current {
+                            return Err(Rejection::BusyConflict);
+                        }
+                    }
+                }
                 let (a, b) = prepared.positions();
                 let pattern = crate::map::SmallRoadPreset::WalkingPath.lane_pattern();
                 let cost = Self::affordable_cost(sim, Government::connection_cost(a, b, &pattern))?;

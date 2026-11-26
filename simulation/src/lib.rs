@@ -133,11 +133,16 @@ const PRE_SCALE_VERSION: &str = "0.11.0";
 const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
 const PRE_P7_VERSION: &str = "0.11.1";
 const VERSION: &str = include_str!("../../VERSION");
+const PATHPARK_SNAPSHOT_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.1");
 
 fn compatible_save_version(version: &str) -> bool {
     matches!(
         version,
-        VERSION | PRE_P7_VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION
+        PATHPARK_SNAPSHOT_VERSION
+            | VERSION
+            | PRE_P7_VERSION
+            | PRE_SCALE_VERSION
+            | PRE_ORIGIN_VERSION
     )
 }
 
@@ -795,8 +800,16 @@ impl Simulation {
     }
 
     pub fn preview_water_edit(&self, edit: &WaterEdit) -> Result<WaterEditPreview, WaterEditError> {
-        self.map()
-            .preview_water_edit(edit, &self.read::<crate::map::ZoneGrid>())
+        let map = self.map();
+        let zones = self.read::<crate::map::ZoneGrid>();
+        let traffic = self.read::<crate::transportation::DrivewayTraffic>();
+        if traffic.is_empty() {
+            return map.preview_water_edit(edit, &zones);
+        }
+        let prepared = map.environment().prepare_water_edit(edit)?;
+        let mut remaining = crate::map::MAX_WATER_BATCH_WORK;
+        traffic.guard_water(&prepared, &mut remaining)?;
+        map.preview_prepared_water(&prepared, &zones)
     }
 
     pub fn carve_river(
@@ -1100,7 +1113,15 @@ impl Simulation {
                 version: Some(version.clone()),
                 reason: error.to_string(),
             })?;
-        if enveloped && data._header.version != version {
+        let payload_release = if data._header.version == PATHPARK_SNAPSHOT_VERSION {
+            VERSION
+        } else {
+            &data._header.version
+        };
+        if (enveloped && payload_release != version)
+            || (bytes.starts_with(&PATHPARK_SLOT_MAGIC)
+                && data._header.version != PATHPARK_SNAPSHOT_VERSION)
+        {
             return Err(SaveLoadError::Corrupt {
                 version: Some(version),
                 reason: "snapshot payload version does not match the slot header".into(),
@@ -1173,7 +1194,7 @@ impl Simulation {
     ) -> Result<SlotCapture, SaveLoadError> {
         let header = RegistrySlotSnapshotHeader {
             slot: SlotSnapshotHeader {
-                magic: REGISTRY_SLOT_MAGIC,
+                magic: PATHPARK_SLOT_MAGIC,
                 version: VERSION.to_owned(),
                 revision,
             },
@@ -1390,7 +1411,7 @@ struct SaveHeader {
 impl SaveHeader {
     fn current() -> Self {
         Self {
-            version: VERSION.to_owned(),
+            version: PATHPARK_SNAPSHOT_VERSION.to_owned(),
         }
     }
 }
@@ -1399,6 +1420,7 @@ impl SaveHeader {
 // Simulation serialization inside the slot envelope for legacy and network callers.
 const SLOT_SNAPSHOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x01";
 const REGISTRY_SLOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x02";
+const PATHPARK_SLOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x03";
 
 #[derive(Serialize, Deserialize)]
 struct SlotSnapshotHeader {
@@ -1454,7 +1476,8 @@ fn check_prototype_registry(fingerprint: Option<u64>) -> Result<(), SaveLoadErro
 }
 
 fn snapshot_header(mut bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SaveLoadError> {
-    let slot = if bytes.starts_with(&REGISTRY_SLOT_MAGIC) {
+    let slot = if bytes.starts_with(&REGISTRY_SLOT_MAGIC) || bytes.starts_with(&PATHPARK_SLOT_MAGIC)
+    {
         let header: RegistrySlotSnapshotHeader =
             Bincode::decode_reader(&mut bytes).map_err(corrupt_header)?;
         Some((header.slot, Some(header.registry)))
@@ -1478,7 +1501,11 @@ fn snapshot_header(mut bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SaveLoad
     let SaveHeader { version } = Bincode::decode_prefix(bytes).map_err(corrupt_header)?;
     Ok((
         SnapshotHeader {
-            version,
+            version: if version == PATHPARK_SNAPSHOT_VERSION {
+                VERSION.to_owned()
+            } else {
+                version
+            },
             revision: None,
             registry: None,
         },
@@ -2019,14 +2046,30 @@ impl SimulationDeser {
             }
         }
 
+        let requires_driveways = self._header.version == PATHPARK_SNAPSHOT_VERSION;
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
                 let Some(data) = self.res.get(l.name) else {
-                    if l.optional {
+                    if l.optional && !(requires_driveways && l.name == "driveway_traffic") {
                         continue;
                     }
                     return Err(corrupt(format!("Missing resource {}", l.name)));
                 };
+                if l.name == "driveway_traffic" && !requires_driveways {
+                    // Pre-PathPark snapshots omit this entry. The experimental
+                    // proof also wrote an empty u64/count pair on stock maps.
+                    use crate::transportation::DrivewayTraffic;
+                    let empty_legacy =
+                        Bincode::decode::<(u64, usize)>(data).is_ok_and(|(_, count)| count == 0);
+                    let empty_current = Bincode::decode::<(DrivewayTraffic, Option<(u64, u64)>)>(
+                        data,
+                    )
+                    .is_ok_and(|(traffic, revision)| traffic.is_empty() && revision.is_none());
+                    if !empty_legacy && !empty_current {
+                        return Err(corrupt("unsupported legacy driveway records".into()));
+                    }
+                    continue;
+                }
                 (l.load)(&mut sim, data)
                     .map_err(|error| corrupt(format!("Could not decode resource {}: {error}", l.name)))?;
             }
@@ -2034,9 +2077,14 @@ impl SimulationDeser {
 
         let options = *sim.read::<SimulationOptions>();
         let origin: MapOrigin = match self.res.get("map_origin") {
-            Some(bytes) => Bincode::decode(bytes)
-                .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
-            None if matches!(self._header.version.as_str(), VERSION | PRE_P7_VERSION) => {
+            Some(bytes) => Bincode::decode(bytes).map_err(|error| {
+                corrupt(format!("Could not decode snapshot map origin: {error}"))
+            })?,
+            None if matches!(
+                self._header.version.as_str(),
+                PATHPARK_SNAPSHOT_VERSION | VERSION | PRE_P7_VERSION
+            ) =>
+            {
                 return Err(corrupt("Missing snapshot map origin".into()));
             }
             None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
@@ -2079,11 +2127,12 @@ impl SimulationDeser {
                 elapsed,
             )
             .map_err(|reason| corrupt(reason.to_owned()))?;
-        sim.write::<crate::transportation::DrivewayTraffic>()
+        sim.read::<crate::transportation::DrivewayTraffic>()
             .validate_loaded(
                 &sim.map(),
                 sim.world(),
                 &sim.read::<crate::transportation::TransportGrid>(),
+                elapsed,
             )
             .map_err(|reason| corrupt(reason.to_owned()))?;
         if sim

@@ -295,3 +295,118 @@ fn movements(
     result.sort();
     result
 }
+
+#[test]
+fn live_directed_target_survives_or_denies_walking_split() {
+    use crate::map::{MapProject, SmallRoadPreset};
+    use crate::map_dynamic::{
+        DirectedEndpoint, DirectedSearch, DirectedSearchResult, ItineraryTarget,
+    };
+    use crate::transportation::{spawn_driving_vehicle, VehicleKind};
+
+    let mut ctx = TestCtx::new();
+    let road = ctx
+        .g
+        .map_mut()
+        .make_connection(
+            MapProject::ground(vec3(40., 100., 0.)),
+            MapProject::ground(vec3(240., 100., 0.)),
+            None,
+            &SmallRoadPreset::LocalOneWay {
+                curb_parking: false,
+            }
+            .lane_pattern(),
+        )
+        .unwrap()
+        .1;
+    let (cmd, trans, itinerary, destination) = {
+        let map = ctx.g.map();
+        let lane = map.roads()[road]
+            .lanes_iter()
+            .find(|&(_, k)| k == LaneKind::Driving)
+            .unwrap()
+            .0;
+        let from = DirectedEndpoint {
+            lane,
+            offset_cm: 2_000,
+        };
+        let to = DirectedEndpoint {
+            lane,
+            offset_cm: 14_000,
+        };
+        let DirectedSearchResult::Feasible(plan) =
+            DirectedSearch::new(from, to).advance(&map, &mut 128)
+        else {
+            panic!("expected a route on the original lane");
+        };
+        (
+            WorldCommand::MapMakeWalkingPath {
+                from: map.pick_path_sidewalk(road, RoadSide::Left, 8_000).unwrap(),
+                to: map.pick_path_ground(12_000, 16_000).unwrap(),
+                control: None,
+            },
+            from.transform(&map).unwrap(),
+            plan.itinerary(&map).unwrap(),
+            to.transform(&map).unwrap().pos,
+        )
+    };
+    let car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, trans).unwrap();
+    ctx.g.world.vehicles[car].it = itinerary;
+    let before = ctx.g.hashes();
+    let preview = cmd.preview(&ctx.g);
+    ctx.g.apply_commands([&cmd]);
+    if preview.is_err() {
+        assert!(ctx.g.read::<CommandOutcomes>().accepted.is_empty());
+        assert_eq!(ctx.g.hashes(), before);
+    } else {
+        assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
+    }
+    let Some(ItineraryTarget::DirectedLane(lane, offset)) = ctx.g.world.vehicles[car].it.target()
+    else {
+        panic!("the exact destination was lost");
+    };
+    assert!(ctx.g.map().get(lane).is_some_and(|l| l
+        .points
+        .point_along(offset)
+        .distance(destination)
+        < 0.03));
+    ctx.g = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+    for _ in 0..250 {
+        ctx.tick_fast();
+    }
+    assert!(ctx.g.world.vehicles[car].trans.pos.distance(trans.pos) > 1.);
+}
+
+#[test]
+fn special_building_cannot_attach_to_a_walking_path() {
+    use crate::map::BuildingKind;
+    use geom::{vec2, Vec2, OBB};
+    use prototypes::GoodsCompanyID;
+
+    let mut ctx = TestCtx::new();
+    let path = WorldCommand::MapMakeWalkingPath {
+        from: ctx.g.map().pick_path_ground(4_000, 20_000).unwrap(),
+        to: ctx.g.map().pick_path_ground(22_000, 20_000).unwrap(),
+        control: None,
+    };
+    ctx.g.apply_commands([&path]);
+    let road = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .walking_path(0)
+        .unwrap()
+        .unwrap();
+    let school = GoodsCompanyID::new("school").prototype();
+    let place = WorldCommand::MapBuildSpecialBuilding {
+        pos: OBB::new(vec2(135., 217.), Vec2::Y, 20., 20.),
+        kind: BuildingKind::GoodsCompany(school.id),
+        gen: school.bgen,
+        zone: None,
+        connected_road: Some(road),
+    };
+    assert!(place.preview(&ctx.g).is_err());
+    let before = ctx.g.hashes();
+    ctx.g.apply_commands([&place]);
+    assert!(ctx.g.read::<CommandOutcomes>().accepted.is_empty());
+    assert_eq!(ctx.g.hashes(), before);
+}

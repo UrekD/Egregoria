@@ -505,6 +505,18 @@ mod pathpark {
     }
 
     impl PreparedWalkingPath {
+        pub(crate) fn split_roads(&self) -> impl Iterator<Item = RoadID> {
+            [self.from.kind, self.to.kind]
+                .into_iter()
+                .filter_map(|kind| {
+                    if let ProjectKind::Road(road) = kind {
+                        Some(road)
+                    } else {
+                        None
+                    }
+                })
+        }
+
         pub(crate) fn positions(&self) -> (Vec3, Vec3) {
             (self.from.pos, self.to.pos)
         }

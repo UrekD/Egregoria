@@ -325,12 +325,17 @@ mod pathpark_driveway {
     use super::{
         TransportGrid, TransportState, TransportationGroup, Transporter, VehicleKind, VehicleState,
     };
-    use crate::map::{CurbAnchor, LaneKind, Map, ProjectFilter, RoadID, RoadSide};
-    use crate::map_dynamic::{DirectedEndpoint, DirectedPlan, DirectedSearch, DirectedSearchResult};
+    use crate::map::{
+        CurbAnchor, LaneKind, Map, PreparedWaterEdit, ProjectFilter, ProjectKind, RoadID, RoadSide,
+        WaterEditError,
+    };
+    use crate::map_dynamic::{
+        DirectedEndpoint, DirectedPlan, DirectedSearch, DirectedSearchResult, Itinerary,
+    };
     use crate::utils::resources::Resources;
     use crate::world_command::bounded_command_vec;
     use crate::{Simulation, VehicleID, World};
-    use geom::{Intersect, Segment3, Spline3, Transform, Vec3, AABB, OBB};
+    use geom::{Intersect, Segment3, Shape, Spline3, Transform, Vec3, AABB, OBB};
     use serde::{Deserialize, Serialize};
     use std::collections::BTreeSet;
 
@@ -338,7 +343,8 @@ mod pathpark_driveway {
     const SWEEP_STEPS: usize = 16;
     const MAX_LOCAL_COLLIDERS: usize = 128;
     const MOTION_TICKS: u16 = 160;
-    const EXIT_SEARCH_TICKS: u64 = 240;
+    const EXIT_SEARCH_TICKS: u64 = 64;
+    const EXIT_WORK_PER_TICK: usize = 32;
     const SAME_DECK: f32 = 1.25;
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -356,7 +362,7 @@ mod pathpark_driveway {
         pub direction: DrivewayDirection,
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum DrivewayPhase {
         Held,
         Entering,
@@ -368,6 +374,7 @@ mod pathpark_driveway {
     pub enum DrivewayBlocker {
         ReceivingSpace,
         NoRoute,
+        BudgetExhausted,
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -425,10 +432,29 @@ mod pathpark_driveway {
         }
 
         fn occupied(&self, grid: &TransportGrid, actor: Option<Transporter>) -> bool {
-            let bounds = self.bounds().expand(8.0);
-            for (index, (id, pos)) in grid.query_aabb(bounds.ll, bounds.ur).enumerate() {
-                if index >= MAX_LOCAL_COLLIDERS {
-                    return true;
+            self.check_occupancy(grid, actor, || true) != Some(false)
+        }
+
+        // Admission must observe one consistent grid frame. If the full check
+        // cannot fit this slice, keep the sweep ungranted.
+        fn check_occupancy(
+            &self,
+            grid: &TransportGrid,
+            actor: Option<Transporter>,
+            mut charge: impl FnMut() -> bool,
+        ) -> Option<bool> {
+            let centerline = self.bounds();
+            let bounds = centerline.expand(8.0);
+            let mut nearby = grid.query_aabb(bounds.ll, bounds.ur);
+            for index in 0..=MAX_LOCAL_COLLIDERS {
+                if !charge() {
+                    return None;
+                }
+                let Some((id, pos)) = nearby.next() else {
+                    return Some(false);
+                };
+                if index == MAX_LOCAL_COLLIDERS {
+                    return None;
                 }
                 if actor == Some(Transporter(id)) {
                     continue;
@@ -437,15 +463,22 @@ mod pathpark_driveway {
                     continue;
                 };
                 let radius = state.radius + car_extent() + 0.35;
-                if self.segments().any(|segment| {
+                if !centerline.expand(radius).contains(pos) {
+                    continue;
+                }
+                for segment in self.segments() {
+                    if !charge() {
+                        return None;
+                    }
                     let point = segment.project(pos.z(state.height));
-                    (point.z - state.height).abs() <= SAME_DECK
+                    if (point.z - state.height).abs() <= SAME_DECK
                         && point.xy().distance2(pos) < radius * radius
-                }) {
-                    return true;
+                    {
+                        return Some(true);
+                    }
                 }
             }
-            false
+            None
         }
     }
 
@@ -455,6 +488,7 @@ mod pathpark_driveway {
         release: DirectedEndpoint,
         into: Sweep,
         out: Sweep,
+        footprint: AABB,
     }
 
     impl Geometry {
@@ -559,13 +593,24 @@ mod pathpark_driveway {
                 release,
                 into,
                 out,
+                footprint: footprint.bbox(),
             })
+        }
+    }
+
+    impl Geometry {
+        fn conflicts(self, other: Self) -> bool {
+            self.into
+                .bounds()
+                .expand(6.0)
+                .intersects(&other.into.bounds())
         }
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize)]
     struct ExitRequest {
         search: DirectedSearch,
+        ready: Option<DirectedPlan>,
         deadline: u64,
     }
 
@@ -630,13 +675,11 @@ mod pathpark_driveway {
             if traffic.facilities.len() == MAX_PORTALS {
                 return Err(DrivewayError::Full);
             }
-            if traffic.facilities.iter().any(|f| {
-                f.geometry
-                    .into
-                    .bounds()
-                    .expand(6.0)
-                    .intersects(&geometry.into.bounds())
-            }) {
+            if traffic
+                .facilities
+                .iter()
+                .any(|f| f.geometry.conflicts(geometry))
+            {
                 return Err(DrivewayError::InvalidGeometry);
             }
             let next_id = traffic.next_id.checked_add(1).ok_or(DrivewayError::Full)?;
@@ -707,6 +750,8 @@ mod pathpark_driveway {
                 vehicle,
                 motion: Motion::Held,
             });
+            drop(traffic);
+            sim.world.vehicles[vehicle].it = Itinerary::at_driveway(DrivewayPhase::Held);
             Ok(())
         }
 
@@ -726,6 +771,8 @@ mod pathpark_driveway {
                 return Err(DrivewayError::Busy);
             }
             facility.claim = None;
+            drop(traffic);
+            sim.world.vehicles[vehicle].it = Itinerary::NONE;
             Ok(())
         }
 
@@ -755,6 +802,7 @@ mod pathpark_driveway {
             *blocker = None;
             *exit = Some(ExitRequest {
                 search: DirectedSearch::new(facility.geometry.release, target),
+                ready: None,
                 deadline: crate::map_dynamic::transit::elapsed_ticks(&sim.resources)
                     .0
                     .saturating_add(EXIT_SEARCH_TICKS),
@@ -800,19 +848,52 @@ mod pathpark_driveway {
                 .any(|f| f.claim.as_ref().is_some_and(|c| c.vehicle == vehicle))
         }
 
-        pub(crate) fn protects(&self, road: RoadID) -> bool {
-            self.facilities.iter().any(|f| f.anchor.road == road)
+        pub(crate) fn protected_roads(&self, map: &Map) -> BTreeSet<RoadID> {
+            let mut roads = BTreeSet::new();
+            for facility in &self.facilities {
+                roads.insert(facility.anchor.road);
+                if let Some(Claim {
+                    motion: Motion::Exiting { route, .. },
+                    ..
+                }) = &facility.claim
+                {
+                    roads.extend(route.roads(map));
+                }
+            }
+            roads
         }
 
         pub(crate) fn overlaps(&self, bounds: &AABB) -> bool {
-            self.facilities.iter().any(|f| {
-                f.geometry
-                    .into
-                    .bounds()
-                    .union(f.geometry.out.bounds())
-                    .expand(8.0)
-                    .intersects(bounds)
-            })
+            self.facilities
+                .iter()
+                .any(|f| f.geometry.footprint.intersects(bounds))
+        }
+
+        pub(crate) fn guard_water(
+            &self,
+            prepared: &PreparedWaterEdit,
+            remaining: &mut usize,
+        ) -> Result<(), WaterEditError> {
+            if self.is_empty() || !prepared.changed() {
+                return Ok(());
+            }
+            for tile in prepared.affected_tiles() {
+                let ll = tile.corner();
+                let bounds = AABB {
+                    ll,
+                    ur: tile.center() * 2.0 - ll,
+                };
+                for facility in &self.facilities {
+                    crate::map::spend_water_work(remaining, 1)?;
+                    if facility.geometry.footprint.intersects(&bounds) {
+                        return Err(WaterEditError::TopologyConflict {
+                            object: ProjectKind::Road(facility.anchor.road),
+                            tile,
+                        });
+                    }
+                }
+            }
+            Ok(())
         }
 
         pub(crate) fn is_empty(&self) -> bool {
@@ -831,12 +912,14 @@ mod pathpark_driveway {
             }
         }
 
-        pub(crate) fn blocks_step(&self, actor: Option<VehicleID>, from: Vec3, to: Vec3) -> bool {
-            let radius = if actor.is_some() {
-                car_extent() * 2.0
-            } else {
-                car_extent() + 0.3
-            };
+        pub(crate) fn blocks_step(
+            &self,
+            actor: Option<VehicleID>,
+            half_extent: f32,
+            from: Vec3,
+            to: Vec3,
+        ) -> bool {
+            let radius = car_extent() + half_extent + 0.35;
             self.facilities.iter().any(|f| {
                 let Some(claim) = f.claim.as_ref().filter(|c| Some(c.vehicle) != actor) else {
                     return false;
@@ -861,7 +944,27 @@ mod pathpark_driveway {
                             && point.xy().distance2(p.xy()) < radius * radius
                     };
                     // Let an actor already on the edge move out under the retained grant.
-                    !near(from, segment) && (near(to, segment) || near(segment.src, movement))
+                    !near(from, segment)
+                        && (near(to, segment)
+                            || near(segment.src, movement)
+                            || near(segment.dst, movement)
+                            || {
+                                let a = movement.dst - movement.src;
+                                let b = segment.dst - segment.src;
+                                let delta = segment.src - movement.src;
+                                let cross = |u: Vec3, v: Vec3| u.x * v.y - u.y * v.x;
+                                let divisor = cross(a, b);
+                                if divisor.abs() <= f32::EPSILON {
+                                    false
+                                } else {
+                                    let t = cross(delta, b) / divisor;
+                                    let u = cross(delta, a) / divisor;
+                                    (0.0..=1.0).contains(&t)
+                                        && (0.0..=1.0).contains(&u)
+                                        && (from.z + a.z * t - segment.src.z - b.z * u).abs()
+                                            < SAME_DECK
+                                }
+                            })
                 })
             })
         }
@@ -882,79 +985,124 @@ mod pathpark_driveway {
         }
 
         pub(crate) fn validate_loaded(
-            &mut self,
+            &self,
             map: &Map,
             world: &World,
             grid: &TransportGrid,
+            now: u64,
         ) -> Result<(), &'static str> {
             let mut owners = BTreeSet::new();
+            let mut claim_colliders = BTreeSet::new();
             if !self.facilities.windows(2).all(|p| p[0].id < p[1].id) {
                 return Err("unordered driveway identities");
             }
-            for facility in &mut self.facilities {
+            for (index, facility) in self.facilities.iter().enumerate() {
                 if facility.id.0 == 0
                     || facility.id.0 > self.next_id
                     || Geometry::prepare(map, facility.anchor).ok() != Some(facility.geometry)
                 {
                     return Err("invalid saved driveway geometry");
                 }
-                let Some(claim) = &mut facility.claim else {
+                if self.facilities[..index]
+                    .iter()
+                    .any(|other| other.geometry.conflicts(facility.geometry))
+                {
+                    return Err("overlapping saved driveway pads");
+                }
+                let Some(claim) = &facility.claim else {
                     continue;
                 };
                 let actor = world
                     .vehicles
                     .get(claim.vehicle)
                     .ok_or("missing driveway vehicle")?;
-                if !owners.insert(claim.vehicle) || !matches!(actor.vehicle.kind, VehicleKind::Car) {
+                if !owners.insert(claim.vehicle)
+                    || !matches!(actor.vehicle.kind, VehicleKind::Car)
+                    || actor.it.driveway_phase() != Some(claim.motion.phase())
+                {
                     return Err("invalid driveway vehicle");
                 }
-                let collider = actor.collider.and_then(|handle| grid.get(handle.0));
-                let on_road = collider.is_some_and(|(_, c)| c.group == TransportationGroup::Vehicles)
-                    && matches!(actor.vehicle.state, VehicleState::Driving)
-                    && actor.it.is_inert();
-                let valid = match &mut claim.motion {
-                    Motion::Held => {
-                        on_road
-                            && actor.trans.pos.distance2(facility.geometry.into.points[0])
-                                <= 0.15_f32.powi(2)
+
+                let expected = match &claim.motion {
+                    Motion::Held => facility.geometry.approach.transform(map),
+                    Motion::Entering(tick) if *tick < MOTION_TICKS => {
+                        Some(facility.geometry.into.pose(*tick))
                     }
-                    Motion::Entering(tick) => {
-                        on_road
-                            && *tick < MOTION_TICKS
-                            && actor
-                                .trans
-                                .pos
-                                .distance2(facility.geometry.into.pose(*tick).pos)
-                                <= 0.15_f32.powi(2)
-                    }
-                    Motion::Exiting { tick, route } => {
-                        on_road
-                            && *tick < MOTION_TICKS
-                            && actor
-                                .trans
-                                .pos
-                                .distance2(facility.geometry.out.pose(*tick).pos)
-                                <= 0.15_f32.powi(2)
+                    Motion::Exiting { tick, route }
+                        if *tick < MOTION_TICKS
                             && route.origin() == facility.geometry.release
-                            && route.itinerary(map).is_some()
+                            && route.valid(map) =>
+                    {
+                        Some(facility.geometry.out.pose(*tick))
                     }
-                    Motion::Stored { exit, .. } => {
-                        if let Some(request) = exit {
-                            let (from, _) = request.search.endpoints();
-                            if from != facility.geometry.release {
-                                return Err("invalid saved driveway departure");
-                            }
-                            request.search.restart_after_load();
+                    Motion::Stored { exit, blocker } => {
+                        if exit.as_ref().is_some_and(|request| {
+                            request.search.endpoints().0 != facility.geometry.release
+                                || request.deadline <= now
+                                || request.deadline.saturating_sub(now) > EXIT_SEARCH_TICKS
+                                || request.search.exhausted()
+                                || matches!(
+                                    blocker,
+                                    Some(
+                                        DrivewayBlocker::NoRoute | DrivewayBlocker::BudgetExhausted
+                                    )
+                                )
+                                || !request.search.validate_loaded(map, request.ready.as_ref())
+                        }) {
+                            return Err("invalid saved driveway departure");
                         }
-                        actor.collider.is_none()
-                            && matches!(actor.vehicle.state, VehicleState::ParkedAtDepot)
-                            && actor.it.is_inert()
-                            && actor.trans.pos == facility.geometry.out.points[0]
+                        if actor.collider.is_some()
+                            || !matches!(actor.vehicle.state, VehicleState::ParkedAtDepot)
+                            || actor.trans != facility.geometry.into.pose(MOTION_TICKS)
+                            || actor.speed.0.abs() > 0.001
+                        {
+                            return Err("invalid stored driveway vehicle");
+                        }
+                        continue;
                     }
+                    _ => None,
                 };
-                if !valid {
-                    return Err("invalid saved driveway vehicle stage");
+                let expected = expected.ok_or("invalid saved driveway vehicle stage")?;
+                let handle = actor.collider.ok_or("missing driveway collider")?.0;
+                let (pos, collider) = grid.get(handle).ok_or("missing driveway collider")?;
+                if !claim_colliders.insert(handle)
+                    || !matches!(actor.vehicle.state, VehicleState::Driving)
+                    || collider.group != TransportationGroup::Vehicles
+                    || collider.radius != car_extent()
+                    || !actor.speed.0.is_finite()
+                    || actor.speed.0.abs() > 0.2
+                    || !(actor.trans.pos.distance2(expected.pos) <= 0.15_f32.powi(2)
+                        && actor.trans.dir.dot(expected.dir) >= 0.99
+                        && pos.distance2(actor.trans.pos.xy()) <= 0.15_f32.powi(2)
+                        && (collider.height - actor.trans.pos.z).abs() <= 0.15
+                        && collider.dir.dot(actor.trans.dir.xy()) >= 0.99)
+                {
+                    return Err("invalid saved driveway collider pose or owner");
                 }
+            }
+
+            for (id, actor) in &world.vehicles {
+                if owners.contains(&id) {
+                    continue;
+                }
+                if actor.it.driveway_phase().is_some()
+                    || (matches!(actor.vehicle.kind, VehicleKind::Car)
+                        && matches!(actor.vehicle.state, VehicleState::ParkedAtDepot))
+                    || actor
+                        .collider
+                        .is_some_and(|handle| claim_colliders.contains(&handle.0))
+                {
+                    return Err("driveway vehicle or collider has no matching claim");
+                }
+            }
+            if !claim_colliders.is_empty()
+                && world.humans.values().any(|human| {
+                    human
+                        .collider
+                        .is_some_and(|handle| claim_colliders.contains(&handle.0))
+                })
+            {
+                return Err("driveway collider is shared with a pedestrian");
             }
             Ok(())
         }
@@ -979,6 +1127,7 @@ mod pathpark_driveway {
                 Motion::Held => {
                     if !geometry.into.occupied(grid, actor.collider) {
                         actor.trans = geometry.into.pose(0);
+                        actor.it = Itinerary::at_driveway(DrivewayPhase::Entering);
                         claim.motion = Motion::Entering(0);
                     }
                 }
@@ -990,6 +1139,7 @@ mod pathpark_driveway {
                             grid.remove_maintain(collider.0);
                         }
                         actor.vehicle.state = VehicleState::ParkedAtDepot;
+                        actor.it = Itinerary::at_driveway(DrivewayPhase::Stored);
                         claim.motion = Motion::Stored {
                             exit: None,
                             blocker: None,
@@ -1000,28 +1150,38 @@ mod pathpark_driveway {
                     let Some(request) = exit else {
                         return false;
                     };
-                    let occupied = geometry.out.occupied(grid, None);
                     if request.deadline <= now {
                         *exit = None;
-                        *blocker = Some(if occupied {
-                            DrivewayBlocker::ReceivingSpace
-                        } else {
-                            DrivewayBlocker::NoRoute
-                        });
+                        *blocker = Some(DrivewayBlocker::BudgetExhausted);
                         return false;
                     }
-                    if occupied {
-                        *blocker = Some(DrivewayBlocker::ReceivingSpace);
-                        return false;
+                    let mut slice = EXIT_WORK_PER_TICK;
+                    if request.search.stale(map) {
+                        request.ready = None;
+                        *blocker = None;
                     }
-                    *blocker = None;
-                    match request.search.advance(map, &mut 32) {
-                        DirectedSearchResult::Deferred => {}
-                        DirectedSearchResult::Unavailable => {
-                            *exit = None;
-                            *blocker = Some(DrivewayBlocker::NoRoute);
+                    if request.ready.is_none() {
+                        match request.search.advance(map, &mut slice) {
+                            DirectedSearchResult::Deferred => return false,
+                            DirectedSearchResult::Unavailable => {
+                                *exit = None;
+                                *blocker = Some(DrivewayBlocker::NoRoute);
+                                return false;
+                            }
+                            DirectedSearchResult::BudgetExhausted => {
+                                *exit = None;
+                                *blocker = Some(DrivewayBlocker::BudgetExhausted);
+                                return false;
+                            }
+                            DirectedSearchResult::Feasible(plan) => request.ready = Some(plan),
                         }
-                        DirectedSearchResult::Feasible(route) => {
+                    }
+                    match geometry
+                        .out
+                        .check_occupancy(grid, None, || request.search.charge(&mut slice))
+                    {
+                        Some(false) => {
+                            let route = request.ready.take().unwrap();
                             let collider = grid.insert(
                                 actor.trans.pos.xy(),
                                 TransportState {
@@ -1034,15 +1194,27 @@ mod pathpark_driveway {
                             );
                             actor.collider = Some(Transporter(collider));
                             actor.vehicle.state = VehicleState::Driving;
+                            actor.it = Itinerary::at_driveway(DrivewayPhase::Exiting);
                             claim.motion = Motion::Exiting { tick: 0, route };
                         }
+                        _ if request.search.exhausted() => {
+                            *exit = None;
+                            *blocker = Some(DrivewayBlocker::BudgetExhausted);
+                        }
+                        Some(true) => *blocker = Some(DrivewayBlocker::ReceivingSpace),
+                        None => {}
                     }
                 }
-                Motion::Exiting { tick, route } => {
+                Motion::Exiting { tick, .. } => {
                     *tick += 1;
                     actor.trans = geometry.out.pose(*tick);
                     if *tick == MOTION_TICKS {
-                        actor.it = route.itinerary(map).unwrap_or_default();
+                        let Motion::Exiting { route, .. } =
+                            std::mem::replace(&mut claim.motion, Motion::Held)
+                        else {
+                            unreachable!()
+                        };
+                        actor.it = route.into_itinerary();
                         sync_actor(grid, actor);
                         // The receiving point includes a full car extent beyond the merge.
                         return true;
@@ -1064,6 +1236,72 @@ mod pathpark_driveway {
                 state.speed = 0.0;
             }
             grid.maintain_deterministic();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::tests::pathpark_lifecycle::road_chain;
+        use common::saveload::{Bincode, Encoder};
+
+        #[test]
+        fn pathpark_rejects_overlapping_saved_pads() {
+            let (ctx, _, portal) = road_chain(1);
+            let mut traffic = ctx.g.write::<DrivewayTraffic>();
+            let original = &traffic.facilities[traffic.index(portal).unwrap()];
+            let duplicate = Facility {
+                id: DrivewayPortal(2),
+                anchor: original.anchor,
+                geometry: original.geometry,
+                claim: None,
+            };
+            traffic.next_id = 2;
+            traffic.facilities.push(duplicate);
+            drop(traffic);
+            assert!(Bincode::decode::<Simulation>(&Bincode::encode(&ctx.g).unwrap()).is_err());
+        }
+
+        #[test]
+        fn pathpark_rejects_shared_maneuver_collider() {
+            let (mut ctx, _, portal) = road_chain(1);
+            let approach = portal.approach(&ctx.g).unwrap();
+            let car = super::super::spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, approach)
+                .unwrap();
+            let other = super::super::spawn_driving_vehicle(
+                &mut ctx.g,
+                VehicleKind::Car,
+                Transform::new_dir(approach.pos + approach.dir * 30., approach.dir),
+            )
+            .unwrap();
+            portal.hold(&mut ctx.g, car).unwrap();
+            ctx.tick_fast();
+            assert_eq!(
+                ctx.g.read::<DrivewayTraffic>().phase(portal),
+                Some(DrivewayPhase::Entering)
+            );
+            ctx.g.world.vehicles[other].collider = ctx.g.world.vehicles[car].collider;
+            assert!(Bincode::decode::<Simulation>(&Bincode::encode(&ctx.g).unwrap()).is_err());
+        }
+
+        #[test]
+        fn pathpark_rejects_collider_displaced_from_maneuver() {
+            let (mut ctx, _, portal) = road_chain(1);
+            let approach = portal.approach(&ctx.g).unwrap();
+            let car = super::super::spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, approach)
+                .unwrap();
+            portal.hold(&mut ctx.g, car).unwrap();
+            ctx.tick_fast();
+            assert_eq!(
+                ctx.g.read::<DrivewayTraffic>().phase(portal),
+                Some(DrivewayPhase::Entering)
+            );
+            let handle = ctx.g.world.vehicles[car].collider.unwrap();
+            let mut grid = ctx.g.write::<TransportGrid>();
+            grid.set_position(handle.0, (approach.pos - approach.dir * 25.).xy());
+            grid.maintain_deterministic();
+            drop(grid);
+            assert!(Bincode::decode::<Simulation>(&Bincode::encode(&ctx.g).unwrap()).is_err());
         }
     }
 

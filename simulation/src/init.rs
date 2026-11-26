@@ -379,12 +379,31 @@ fn register_driveway_traffic() {
     unsafe {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "driveway_traffic",
-            optional: true,
+            optional: true, // Required by the PathPark snapshot schema in SimulationDeser.
             save: Box::new(|sim, output| {
-                Bincode::encode_writer(&*sim.read::<DrivewayTraffic>(), output)
+                let traffic = sim.read::<DrivewayTraffic>();
+                let revision = (!traffic.is_empty()).then(|| sim.map().directed_route_revision());
+                Bincode::encode_writer(&(&*traffic, revision), output)
             }),
             load: Box::new(|sim, data| {
-                sim.insert(Bincode::decode::<DrivewayTraffic>(data)?);
+                let (traffic, revision): (DrivewayTraffic, Option<(u64, u64)>) =
+                    Bincode::decode(data)?;
+                match (traffic.is_empty(), revision) {
+                    (true, None) => {}
+                    (false, Some((topology, policy)))
+                        if topology < u64::MAX && policy < u64::MAX =>
+                    {
+                        let mut map = sim.map_mut();
+                        map.walking_topology_generation = topology;
+                        map.driving_policy_generation = policy;
+                    }
+                    _ => {
+                        return Err(std::io::Error::other(
+                            "invalid saved driveway graph revision",
+                        ))
+                    }
+                }
+                sim.insert(traffic);
                 Ok(())
             }),
         });

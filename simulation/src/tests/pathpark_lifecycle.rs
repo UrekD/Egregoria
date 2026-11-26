@@ -206,3 +206,209 @@ fn unruled_portal_resumes_route_and_reloads_with_original_car_and_claim() {
         Transform::new(vec3(0., 0., 0.))
     );
 }
+
+pub(crate) fn road_chain(count: usize) -> (TestCtx, Vec<crate::map::RoadID>, DrivewayPortal) {
+    use crate::map::{LanePatternBuilder, MapProject, ProjectKind};
+    let mut ctx = TestCtx::new();
+    let roads = {
+        let mut map = ctx.g.map_mut();
+        let pattern = LanePatternBuilder::default().parking(false).build();
+        let point = |i: usize| vec3(40. + 88. * i as f32, 350. + 12. * (i % 2) as f32, 0.);
+        let mut joint = ProjectKind::Ground;
+        (0..count)
+            .map(|i| {
+                let from = map
+                    .resolve_connection_endpoint(MapProject {
+                        pos: point(i),
+                        kind: joint,
+                    })
+                    .unwrap();
+                let to = map
+                    .resolve_connection_endpoint(MapProject::ground(point(i + 1)))
+                    .unwrap();
+                let made = map.connect_projects(from, to, None, &pattern);
+                joint = ProjectKind::Intersection(made.dst);
+                made.road
+            })
+            .collect::<Vec<_>>()
+    };
+    let anchor = ctx
+        .g
+        .map()
+        .pick_curb(roads[0], RoadSide::Right, 4_500)
+        .unwrap();
+    let portal = DrivewayPortal::place(&mut ctx.g, anchor).unwrap();
+    (ctx, roads, portal)
+}
+
+fn store_car(ctx: &mut TestCtx, portal: DrivewayPortal) -> crate::VehicleID {
+    let approach = portal.approach(&ctx.g).unwrap();
+    let car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, approach).unwrap();
+    portal.hold(&mut ctx.g, car).unwrap();
+    for _ in 0..200 {
+        ctx.tick_fast();
+        if ctx.g.read::<DrivewayTraffic>().phase(portal) == Some(DrivewayPhase::Stored) {
+            return car;
+        }
+    }
+    panic!("car never reached storage");
+}
+
+fn road_target(sim: &Simulation, id: crate::map::RoadID) -> DirectedEndpoint {
+    let map = sim.map();
+    let road = &map.roads()[id];
+    let lane = road
+        .outgoing_lanes_from(road.src)
+        .iter()
+        .find(|(_, k)| *k == LaneKind::Driving)
+        .unwrap()
+        .0;
+    DirectedEndpoint {
+        lane,
+        offset_cm: 6_000,
+    }
+}
+
+#[test]
+fn pathpark_remote_edit_preserves_committed_egress_across_reload() {
+    let (mut ctx, roads, portal) = road_chain(4);
+    let car = store_car(&mut ctx, portal);
+    let target = road_target(&ctx.g, roads[3]);
+    portal.depart(&mut ctx.g, car, target).unwrap();
+    for _ in 0..64 {
+        ctx.tick_fast();
+        if ctx.g.read::<DrivewayTraffic>().phase(portal) == Some(DrivewayPhase::Exiting) {
+            break;
+        }
+    }
+    assert_eq!(
+        ctx.g.read::<DrivewayTraffic>().phase(portal),
+        Some(DrivewayPhase::Exiting)
+    );
+    let cmd = WorldCommand::MapRemoveRoad(roads[3]);
+    ctx.g.apply_commands([&cmd]);
+    let mut loaded: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+    assert_eq!(loaded.hashes(), ctx.g.hashes());
+    assert!(loaded.map().get(roads[3]).is_some());
+    for _ in 0..160 {
+        loaded.tick(&mut Simulation::schedule(), &[]);
+        if loaded.read::<DrivewayTraffic>().phase(portal).is_none() {
+            break;
+        }
+    }
+    assert_eq!(
+        loaded.world.vehicles[car].it.target(),
+        Some(crate::map_dynamic::ItineraryTarget::DirectedLane(
+            target.lane,
+            target.offset()
+        ))
+    );
+}
+
+#[test]
+fn pathpark_reload_keeps_pending_search_progress() {
+    let (mut ctx, roads, portal) = road_chain(5);
+    let car = store_car(&mut ctx, portal);
+    let target = road_target(&ctx.g, roads[4]);
+    portal.depart(&mut ctx.g, car, target).unwrap();
+    ctx.tick_fast();
+    assert_eq!(
+        ctx.g.read::<DrivewayTraffic>().phase(portal),
+        Some(DrivewayPhase::Stored)
+    );
+    let mut loaded: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+    assert_eq!(
+        loaded.hashes()["driveway_traffic"],
+        ctx.g.hashes()["driveway_traffic"]
+    );
+    let mut schedule = Simulation::schedule();
+    for _ in 0..64 {
+        ctx.tick_fast();
+        loaded.tick(&mut schedule, &[]);
+        assert_eq!(
+            loaded.hashes()["driveway_traffic"],
+            ctx.g.hashes()["driveway_traffic"]
+        );
+        if ctx.g.read::<DrivewayTraffic>().phase(portal) == Some(DrivewayPhase::Exiting) {
+            return;
+        }
+    }
+    panic!("search never granted egress");
+}
+
+#[test]
+fn pathpark_snapshot_requires_driveway_resource() {
+    let (mut ctx, _, portal) = road_chain(1);
+    store_car(&mut ctx, portal);
+    let mut res = ctx.g.snapshot_resources(true, usize::MAX).unwrap();
+    res.remove("driveway_traffic").unwrap();
+    let bytes = Bincode::encode(&crate::SimulationSer {
+        header: crate::SaveHeader::current(),
+        world: &ctx.g.world,
+        res,
+    })
+    .unwrap();
+    assert!(Bincode::decode::<Simulation>(&bytes).is_err());
+}
+
+#[test]
+fn pathpark_departure_settles_at_the_64_tick_deadline() {
+    let (mut ctx, roads, portal) = road_chain(1);
+    let car = store_car(&mut ctx, portal);
+    let release = portal.release(&ctx.g).unwrap();
+    let blocker = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, release).unwrap();
+    let target = road_target(&ctx.g, roads[0]);
+    portal.depart(&mut ctx.g, car, target).unwrap();
+    for _ in 0..65 {
+        ctx.tick_fast();
+    }
+    assert_eq!(
+        ctx.g.read::<DrivewayTraffic>().phase(portal),
+        Some(DrivewayPhase::Stored)
+    );
+    assert_eq!(
+        format!(
+            "{:?}",
+            ctx.g.read::<DrivewayTraffic>().blocker(portal).unwrap()
+        ),
+        "BudgetExhausted"
+    );
+    ctx.g.world.vehicles[blocker].trans.pos.x += 100.;
+    assert!(portal.depart(&mut ctx.g, car, target).is_ok());
+}
+
+#[test]
+fn pathpark_empty_portal_only_blocks_water_changes_at_its_footprint() {
+    use crate::map::{WaterBasin, WaterEdit};
+    use geom::{vec2, Polygon};
+    let (mut ctx, _, portal) = road_chain(1);
+    let lake = |center| {
+        WorldCommand::EditWater(WaterEdit::FillLake {
+            basin: WaterBasin::new(&Polygon::centered_rect(center, 16., 16.).0).unwrap(),
+            level_dm: 5,
+            depth_m: 2.,
+        })
+    };
+    let remote = lake(vec2(450., 260.));
+    assert!(
+        remote.preview(&ctx.g).is_ok(),
+        "{:?}",
+        remote.preview(&ctx.g).err()
+    );
+    ctx.g.apply_commands([&remote]);
+    assert!(ctx
+        .g
+        .read::<CommandOutcomes>()
+        .water_edit(0)
+        .unwrap()
+        .is_ok());
+    let local = lake(portal.approach(&ctx.g).unwrap().pos.xy());
+    assert!(local.preview(&ctx.g).is_err());
+    let before = ctx.g.hashes();
+    ctx.g.apply_commands([&local]);
+    assert!(matches!(
+        ctx.g.read::<CommandOutcomes>().water_edit(0).unwrap(),
+        Err(crate::map::WaterEditError::TopologyConflict { .. })
+    ));
+    assert_eq!(ctx.g.hashes(), before);
+}
