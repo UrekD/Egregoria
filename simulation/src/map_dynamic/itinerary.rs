@@ -659,7 +659,9 @@ impl Itinerary {
         }
         while let Some(p) = self.get_point() {
             let dist = position.distance(p);
-            if dist <= dist_to_move + 0.01 {
+            // A tolerance snap can round the remaining budget below -0.01.
+            // Coincident turn/lane waypoints still need to advance the route.
+            if dist <= (dist_to_move + 0.01).max(0.0) {
                 self.observe_road_entry(position, p, map, &mut on_road_entry);
                 dist_to_move -= dist;
                 position = p;
@@ -685,7 +687,7 @@ impl Itinerary {
                 return p;
             }
 
-            let next = position + (p - position).normalize_to(dist_to_move);
+            let next = position + (p - position).normalize_to(dist_to_move.max(0.0));
             self.observe_road_entry(position, next, map, &mut on_road_entry);
             return next;
         }
@@ -1081,6 +1083,20 @@ mod tests {
     fn update_at(sim: &mut Simulation, tick: u64) {
         *sim.write::<GameTime>() = GameTime::new(Tick(tick));
         itinerary_update(&mut sim.world, &mut sim.resources);
+    }
+
+    #[test]
+    fn itinerary_consumes_duplicate_waypoints_after_tolerance_snap() {
+        let movement = 0.024_f32;
+        let seam = Vec3::X * (movement + 0.01);
+        let mut route = Itinerary::simple(vec![seam, seam, Vec3::X]);
+        let map = Map::empty();
+
+        let position = route.update(Vec3::ZERO, movement, Tick(0), 0, &map);
+        assert_eq!(position, seam);
+        assert_eq!(route.get_point(), Some(Vec3::X));
+        let next = route.update(position, movement, Tick(1), 0, &map);
+        assert!((next.x - (seam.x + movement)).abs() < 1e-6);
     }
 
     #[test]

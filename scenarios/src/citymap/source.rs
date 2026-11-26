@@ -53,6 +53,15 @@ impl Default for TownConfig {
 impl TownConfig {
     pub const SCALE: f32 = 2.0;
 
+    pub(super) fn wet() -> Self {
+        Self {
+            map_chunks: 8,
+            owned_min: Vec2::splat(512.0),
+            owned_max: Vec2::splat(3584.0),
+            ..Self::default()
+        }
+    }
+
     pub fn project(self, lat: f64, lon: f64) -> Vec2 {
         let centre = LESCE_BOUNDS.project(self.latitude, self.longitude);
         let point = LESCE_BOUNDS.project(lat, lon);
