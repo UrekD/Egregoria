@@ -576,13 +576,13 @@ fn prepare_opening(
         }
         // Use the stock meat and vegetable recipes to supply local shelves
         // when the freight terminal is also handling industrial imports.
-        for (name, x, y) in [
-            ("animal-farm", 2780.0, 2340.0),
-            ("slaughterhouse", 2660.0, 2330.0),
-            ("meat-facility", 2540.0, 2260.0),
-            ("vegetable-farm", 2440.0, 2440.0),
+        for (name, district, x, y) in [
+            ("animal-farm", "south", 2100.0, 885.0),
+            ("slaughterhouse", "south", 1900.0, 1350.0),
+            ("meat-facility", "south", 2250.0, 1370.0),
+            ("vegetable-farm", "west", 1180.0, 1500.0),
         ] {
-            let supplier = place_company_around_parcels(sim, name, at(x, y), Some("employment"))?;
+            let supplier = place_company_around_parcels(sim, name, at(x, y), Some(district))?;
             sites.insert(name.into(), supplier);
         }
         let map = sim.map();
@@ -4285,6 +4285,12 @@ mod tests {
             let south = super::super::layout::design_point(vec2(2390.0, 1125.0), plan.config);
             let depot = &map.buildings()[opening.sites["south/east-garbage-depot"]];
             assert!(depot.door_pos.xy().distance(south) <= 150.0);
+            for name in ["animal-farm", "slaughterhouse", "meat-facility", "vegetable-farm"] {
+                let door = map.buildings()[opening.sites[name]].door_pos.xy();
+                assert!(opening.parcels.iter().any(|parcel| {
+                    parcel.capacity > 0 && parcel.footprint.center().distance(door) <= 250.0
+                }), "{name} needs a nearby opening housing block");
+            }
             assert_eq!(opening.intake_homes.len(), 12);
             assert!(opening.parcels.iter()
                 .filter(|parcel| opening.intake_homes.contains(&parcel.lot))
