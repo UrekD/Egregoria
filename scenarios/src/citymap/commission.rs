@@ -2288,14 +2288,17 @@ fn food_stockout_hours(stockout: u64, resident_ticks: u64) -> f64 {
 }
 
 fn food_stockouts_pass(days: &[(u64, u64)]) -> bool {
-    if days.len() != SOAK_DAYS as usize || days.iter().any(|&(stockout, resident_ticks)| {
-        resident_ticks == 0 || u128::from(stockout) * 20 > u128::from(resident_ticks)
-    }) {
+    if days.len() != SOAK_DAYS as usize
+        || days.iter().any(|&(stockout, resident_ticks)| {
+            resident_ticks == 0 || u128::from(stockout) * 20 > u128::from(resident_ticks)
+        })
+    {
         return false;
     }
-    let sum: f64 = days.iter().map(|&(stockout, residents)| {
-        food_stockout_hours(stockout, residents)
-    }).sum();
+    let sum: f64 = days
+        .iter()
+        .map(|&(stockout, residents)| food_stockout_hours(stockout, residents))
+        .sum();
     // Allow rounding at equality, below the resolution of a stockout tick.
     sum <= SOAK_DAYS as f64 + 2.0 * f64::EPSILON
 }
@@ -3232,7 +3235,8 @@ impl BridgeProgress {
         // Positions are the vehicle centre. The lane's trimmed endpoints
         // are on opposite banks, clear of the water.
         const END_RADIUS_SQUARED: f32 = 1.5 * 1.5;
-        if *self == Self::Approaching && on_lane && entry.distance2(position) <= END_RADIUS_SQUARED {
+        if *self == Self::Approaching && on_lane && entry.distance2(position) <= END_RADIUS_SQUARED
+        {
             *self = Self::OnDeck;
         }
         if *self == Self::OnDeck {
@@ -3268,30 +3272,50 @@ struct BridgeTraffic {
 
 impl BridgeTraffic {
     fn new(map: &Map, plan: &TownPlan, built: &BuiltNetwork) -> Self {
-        let lanes = plan.crossings.iter().flat_map(|crossing| {
-            built.links[&crossing.bridge].lanes.iter().filter_map(|&id| {
-                let lane = &map.lanes()[id];
-                (lane.kind == LaneKind::Driving).then(|| (id, BridgeLane {
-                    crossing: crossing.key,
-                    entry: lane.points.first(),
-                    exit: lane.points.last(),
-                    direction: BridgeDirection {
-                        lane: id,
-                        from: lane.src,
-                        to: lane.dst,
-                        completed_by_purpose: BTreeMap::new(),
-                    },
-                }))
+        let lanes = plan
+            .crossings
+            .iter()
+            .flat_map(|crossing| {
+                built.links[&crossing.bridge]
+                    .lanes
+                    .iter()
+                    .filter_map(|&id| {
+                        let lane = &map.lanes()[id];
+                        (lane.kind == LaneKind::Driving).then(|| {
+                            (
+                                id,
+                                BridgeLane {
+                                    crossing: crossing.key,
+                                    entry: lane.points.first(),
+                                    exit: lane.points.last(),
+                                    direction: BridgeDirection {
+                                        lane: id,
+                                        from: lane.src,
+                                        to: lane.dst,
+                                        completed_by_purpose: BTreeMap::new(),
+                                    },
+                                },
+                            )
+                        })
+                    })
             })
-        }).collect();
-        Self { lanes, ..Self::default() }
+            .collect();
+        Self {
+            lanes,
+            ..Self::default()
+        }
     }
 
     fn approach(car: &VehicleEnt, mut matches_lane: impl FnMut(LaneID) -> bool) -> Option<LaneID> {
         let route = car.it.get_route()?;
-        std::iter::once(&route.cur).chain(route.reversed_route.iter().rev().take(2))
+        std::iter::once(&route.cur)
+            .chain(route.reversed_route.iter().rev().take(2))
             .find_map(|step| match step.kind {
-                TraverseKind::Lane(id) if step.dir == TraverseDirection::Forward && matches_lane(id) => Some(id),
+                TraverseKind::Lane(id)
+                    if step.dir == TraverseDirection::Forward && matches_lane(id) =>
+                {
+                    Some(id)
+                }
                 _ => None,
             })
     }
@@ -3302,8 +3326,11 @@ impl BridgeTraffic {
         }
         // One sampling interval is one real second. Recruit near the entry
         // during the traffic scan, then check only recruited vehicles each tick.
-        let lane = Self::approach(car, |id| self.lanes.get(&id)
-            .is_some_and(|lane| lane.entry.distance2(car.trans.pos) <= 80.0_f32.powi(2)));
+        let lane = Self::approach(car, |id| {
+            self.lanes
+                .get(&id)
+                .is_some_and(|lane| lane.entry.distance2(car.trans.pos) <= 80.0_f32.powi(2))
+        });
         if let Some(lane) = lane {
             self.probes.insert(id, (lane, BridgeProgress::Approaching));
         }
@@ -3341,18 +3368,28 @@ impl BridgeTraffic {
         });
     }
 
-    fn report(self, plan: &TownPlan, failures: &mut Vec<String>)
-        -> BTreeMap<&'static str, Vec<BridgeDirection>>
-    {
+    fn report(
+        self,
+        plan: &TownPlan,
+        failures: &mut Vec<String>,
+    ) -> BTreeMap<&'static str, Vec<BridgeDirection>> {
         let mut result: BTreeMap<_, Vec<_>> = BTreeMap::new();
         for lane in self.lanes.into_values() {
-            result.entry(lane.crossing).or_default().push(lane.direction);
+            result
+                .entry(lane.crossing)
+                .or_default()
+                .push(lane.direction);
         }
         for crossing in &plan.crossings {
-            if !result.get(crossing.key).is_some_and(|directions| directions.iter()
-                .any(|direction| !direction.completed_by_purpose.is_empty()))
-            {
-                failures.push(format!("{}: scored traffic completed 0 vehicle crossings", crossing.key));
+            if !result.get(crossing.key).is_some_and(|directions| {
+                directions
+                    .iter()
+                    .any(|direction| !direction.completed_by_purpose.is_empty())
+            }) {
+                failures.push(format!(
+                    "{}: scored traffic completed 0 vehicle crossings",
+                    crossing.key
+                ));
             }
         }
         result
@@ -4049,15 +4086,20 @@ pub(super) struct ContinuationCheckpoint {
     activity: BTreeMap<&'static str, serde_json::Value>,
 }
 
-fn checkpoint_activity(sim: &Simulation, freight: &Freight) -> BTreeMap<&'static str, serde_json::Value> {
+fn checkpoint_activity(
+    sim: &Simulation,
+    freight: &Freight,
+) -> BTreeMap<&'static str, serde_json::Value> {
     let transit = sim.read::<Transit>();
     let cargo = sim.read::<CargoBook>();
     let mut activity = BTreeMap::new();
     for (id, human) in sim.world().humans.iter() {
         if let Some(seller) = human.household.basket_seller() {
-            activity.entry("household").or_insert_with(|| serde_json::json!({
-                "resident": id, "basket": human.household.basket, "seller": seller,
-            }));
+            activity.entry("household").or_insert_with(|| {
+                serde_json::json!({
+                    "resident": id, "basket": human.household.basket, "seller": seller,
+                })
+            });
         }
         if let Location::Vehicle(bus) = human.location {
             if let Some(run) = transit.runs.get(&bus) {
@@ -4070,10 +4112,16 @@ fn checkpoint_activity(sim: &Simulation, freight: &Freight) -> BTreeMap<&'static
             break;
         }
     }
-    if let Some(load) = cargo.outgoing_loads(freight.terminal).find(|load| !load.items.is_empty()) {
-        activity.insert("freight", serde_json::json!({
-            "terminal": freight.terminal, "truck": load.vehicle, "buyer": load.destination(),
-        }));
+    if let Some(load) = cargo
+        .outgoing_loads(freight.terminal)
+        .find(|load| !load.items.is_empty())
+    {
+        activity.insert(
+            "freight",
+            serde_json::json!({
+                "terminal": freight.terminal, "truck": load.vehicle, "buyer": load.destination(),
+            }),
+        );
     }
     activity
 }
@@ -4082,11 +4130,14 @@ fn verify_checkpoint_hashes(baseline: &Simulation, resumed: &Simulation) -> Resu
     let expected = baseline.hashes();
     let actual = resumed.hashes();
     if expected != actual {
-        let changed = expected.keys().chain(actual.keys())
+        let changed = expected
+            .keys()
+            .chain(actual.keys())
             .filter(|key| expected.get(*key) != actual.get(*key))
             .collect::<BTreeSet<_>>();
         return Err(format!(
-            "CITYMAP continuation diverged at tick {} in {changed:?}", baseline.get_tick()
+            "CITYMAP continuation diverged at tick {} in {changed:?}",
+            baseline.get_tick()
         ));
     }
     Ok(())
@@ -4114,10 +4165,15 @@ pub(super) fn verify_active_continuation(
         }
         let tick = baseline.get_tick();
         let id = SlotId::new(&format!("continuation-{tick}")).map_err(|error| error.to_string())?;
-        if !matches!(resumed.save_to_slot(root, &id, SnapshotRevision::new(u128::from(tick)))
-            .map_err(|error| error.to_string())?, SavePhase::Complete)
-        {
-            return Err(format!("incomplete CITYMAP continuation save at tick {tick}"));
+        if !matches!(
+            resumed
+                .save_to_slot(root, &id, SnapshotRevision::new(u128::from(tick)))
+                .map_err(|error| error.to_string())?,
+            SavePhase::Complete
+        ) {
+            return Err(format!(
+                "incomplete CITYMAP continuation save at tick {tick}"
+            ));
         }
         resumed = Simulation::load_from_slot(root, &id).map_err(|error| error.to_string())?;
         resumed_schedule = Simulation::schedule();
@@ -4131,10 +4187,16 @@ pub(super) fn verify_active_continuation(
         }
         pending.retain(|key| !activity.contains_key(key));
         eprintln!("CITYMAP continuation at tick {tick}: {:?}", activity.keys());
-        checkpoints.push(ContinuationCheckpoint { tick, verified_ticks, activity });
+        checkpoints.push(ContinuationCheckpoint {
+            tick,
+            verified_ticks,
+            activity,
+        });
     }
     if !pending.is_empty() {
-        return Err(format!("CITYMAP opening had no active {pending:?} checkpoint in its first day"));
+        return Err(format!(
+            "CITYMAP opening had no active {pending:?} checkpoint in its first day"
+        ));
     }
     Ok(checkpoints)
 }
@@ -4270,13 +4332,11 @@ pub fn check_loaded_opening(
                 freight.observe(&sim, &manifest.freight, tick);
             }
             traffic.probe_egresses(&sim);
+            if dt % SAMPLE_TICKS == 0 {
+                traffic.observe(&sim, tick, &mut bridges);
+            }
             if tick < end {
-                if dt % SAMPLE_TICKS == 0 {
-                    traffic.observe(&sim, tick, &mut bridges);
-                }
                 bridges.observe(&sim);
-            } else {
-                traffic.observe(&sim, tick, &mut BridgeTraffic::default());
             }
             if dt % (20 * TICKS_PER_MINUTE) == 0 {
                 let state = snapshot(&sim, plan, manifest);

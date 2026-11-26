@@ -103,34 +103,59 @@ pub fn verify_delivery(root: &Path) -> Result<(), String> {
     {
         return Err(format!("{} is not a regular file", report_path.display()));
     }
-    let report: serde_json::Value = serde_json::from_reader(
-        File::open(&report_path).map_err(|error| error.to_string())?,
-    )
-    .map_err(|error| format!("{}: {error}", report_path.display()))?;
+    let report: serde_json::Value =
+        serde_json::from_reader(File::open(&report_path).map_err(|error| error.to_string())?)
+            .map_err(|error| format!("{}: {error}", report_path.display()))?;
     if report["slot"] != id.as_str()
         || report["variant"] != "wet"
         || report["save_version"] != SAVE_VERSION.trim()
         || report["provenance"]["lesce"]["sha256"] != LESCE_SHA256
         || report["provenance"]["sava"]["sha256"] != SAVA_SHA256
-        || !report["opening"]["failures"].as_array().is_some_and(Vec::is_empty)
+        || !report["opening"]["failures"]
+            .as_array()
+            .is_some_and(Vec::is_empty)
     {
-        return Err("lesce_town has no passing wet build report for the pinned inputs and current VERSION".into());
+        return Err(
+            "lesce_town has no passing wet build report for the pinned inputs and current VERSION"
+                .into(),
+        );
     }
 
     let entries = simulation::list_slots_with_revisions(&root, |path, kind| {
-        Simulation::read_slot_snapshot_header(path, kind).ok()?.revision
-    }).map_err(|error| error.to_string())?;
-    let entry = entries.iter().find(|entry| entry.id == id)
+        if kind != common::saveload::SnapshotKind::Zip {
+            return None;
+        }
+        let header = Simulation::read_slot_snapshot_header(path, kind).ok()?;
+        if header.version != SAVE_VERSION.trim() {
+            return None;
+        }
+        header.revision
+    })
+    .map_err(|error| error.to_string())?;
+    let entry = entries
+        .iter()
+        .find(|entry| entry.id == id)
         .ok_or("lesce_town is absent from the slot catalogue")?;
-    let revision = entry.revision.ok_or("lesce_town is missing a readable snapshot revision")?;
-    let meta = entry.meta.as_ref().filter(|meta| meta.population > 0)
+    let revision = entry
+        .revision
+        .ok_or("lesce_town requires a readable ZIP header for the current VERSION")?;
+    let meta = entry
+        .meta
+        .as_ref()
+        .filter(|meta| meta.population > 0)
         .ok_or("lesce_town requires metadata with a positive commissioned population")?;
+    if meta.display_name != SLOT_NAME || meta.camera.is_none() {
+        return Err("lesce_town metadata is missing its display name or opening camera".into());
+    }
     let population = meta.population;
     if report["snapshot_revision"] != format!("{:032x}", revision.get())
         || meta.revision != Some(revision.get())
         || report["opening"]["opening"]["residents"] != population
     {
-        return Err("lesce_town build report, metadata and snapshot disagree on revision or population".into());
+        return Err(
+            "lesce_town build report, metadata and snapshot disagree on revision or population"
+                .into(),
+        );
     }
     let loaded = Simulation::load_listed_snapshot(&root, entry)
         .map_err(|error| format!("lesce_town load failed: {error}"))?;
@@ -139,11 +164,15 @@ pub fn verify_delivery(root: &Path) -> Result<(), String> {
         || meta.game_tick != loaded.get_tick()
         || report["opening_manifest"]["opening_tick"] != loaded.get_tick()
     {
-        return Err("lesce_town loaded population or tick disagrees with the wet build report".into());
+        return Err(
+            "lesce_town loaded population or tick disagrees with the wet build report".into(),
+        );
     }
     println!(
         "Loaded lesce_town {} revision {:032x}, tick {}, population {population}",
-        SAVE_VERSION.trim(), revision.get(), loaded.get_tick()
+        SAVE_VERSION.trim(),
+        revision.get(),
+        loaded.get_tick()
     );
     Ok(())
 }

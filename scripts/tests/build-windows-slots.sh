@@ -157,6 +157,12 @@ if build > "$root/cached-revision.log" 2>&1; then
     exit 1
 fi
 expect_trace citymap-verify
+printf '0.9.0 commissioned\n' > "$town_zip"
+if build > "$root/cached-version.log" 2>&1; then
+    printf 'Build reused a snapshot from a different save version\n' >&2
+    exit 1
+fi
+expect_trace citymap-verify
 cp -- "$root/good-town.zip" "$town_zip"
 town_report="${meta%.meta.json}.build.json"
 cp -- "$town_report" "$root/good-report.json"

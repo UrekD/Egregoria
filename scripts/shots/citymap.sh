@@ -61,7 +61,11 @@ report = json.loads(Path(sys.argv[2]).read_text())
 captures = {}
 for step in json.loads(Path("scripts/shots/citymap.json").read_text()):
     if isinstance(step, dict) and "Screenshot" in step:
-        path = output / (step["Screenshot"] + ".png")
+        name = step["Screenshot"]
+        state = json.loads((output / (name + ".json")).read_text())
+        if state["tick"] != report["opening_manifest"]["opening_tick"] or state["water_tiles"] == 0:
+            sys.exit(f"{name} did not capture the wet opening tick")
+        path = output / (name + ".png")
         data = path.read_bytes()
         if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 64:
             sys.exit(f"Invalid capture {path}")
