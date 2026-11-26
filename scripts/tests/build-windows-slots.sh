@@ -45,6 +45,8 @@ shift 6
 if [[ $1 == citymap-build && $2 == --verify ]]; then
     printf 'citymap-verify\n' >> "$TRACE"
     set -- citymap-verify "$2" "$3"
+elif [[ $1 == bench-slot ]]; then
+    printf 'load %s\n' "$5" >> "$TRACE"
 else
     printf '%s\n' "$1" >> "$TRACE"
 fi
@@ -65,6 +67,11 @@ if report != {"variant": "wet", "revision": meta["revision"], "save_version": Pa
 if (root / "lesce_town.zip").read_text() != report["save_version"] + " " + meta["revision"] + "\n":
     sys.exit("lesce_town: corrupt snapshot or header mismatch")
 PY_CHECK
+        exit
+        ;;
+    bench-slot)
+        [[ $# == 9 && $2 == --root && $4 == --slot && $6 == --warmup && $7 == 0 && $8 == --ticks && $9 == 1 ]]
+        cmp -- VERSION "$3/$5.zip"
         exit
         ;;
     demo-cities)
@@ -243,12 +250,16 @@ release_slots() {
         scripts/build-windows-with-slots.sh --release-slots "$1" "$CARGO_TARGET_DIR"
 }
 
+release_loads=('load starter_town' 'load showcase_city' 'load lesce_osm' citymap-verify)
+release_generation=(demo-cities osm-city citymap-build "${release_loads[@]}")
+release_copy=(demo-cities osm-city "${release_loads[@]}")
+
 if ! release_slots "$root/release/world" > "$root/release-slots.log" 2>&1; then
     cat "$root/release-slots.log" >&2
     printf 'Could not stage release slots without running the Windows packager\n' >&2
     exit 1
 fi
-expect_trace demo-cities osm-city citymap-build citymap-verify
+expect_trace "${release_generation[@]}"
 for slot in starter_town showcase_city lesce_osm lesce_town; do
     test -s "$root/release/world/$slot.zip"
     test -s "$root/release/world/$slot.meta.json"
@@ -263,9 +274,115 @@ test ! -s "$TRACE"
 test "$(cat world/user.zip)" = 'user save'
 
 release_slots "$root/second-release/world"
-expect_trace citymap-verify
+expect_trace "${release_loads[@]}"
 diff -r "$root/release/world" "$root/second-release/world"
 
 EGR_CITYMAP_PUBLISHED="$root/release/world" release_slots "$root/third-release/world"
-expect_trace demo-cities osm-city citymap-verify
+expect_trace "${release_copy[@]}"
 diff -r "$root/release/world" "$root/third-release/world"
+
+test_corrupt_release_cache() {
+    local slot cache="$CARGO_TARGET_DIR/release-slots/current"
+    for slot in starter_town showcase_city lesce_osm lesce_town; do
+        printf 'corrupted snapshot\n' > "$cache/slots/$slot.zip"
+        release_slots "$root/repaired-$slot/world"
+        expect_trace "${release_copy[@]}"
+        diff -r "$root/release/world" "$root/repaired-$slot/world"
+    done
+
+    # Even with matching checksums, an undecodable snapshot must be regenerated.
+    printf 'corrupted snapshot\n' > "$cache/slots/starter_town.zip"
+    (cd "$cache/slots" && LC_ALL=C sha256sum -- ./*) > "$cache/checksums"
+    release_slots "$root/repaired-after-load/world"
+    expect_trace 'load starter_town' "${release_copy[@]}"
+    diff -r "$root/release/world" "$root/repaired-after-load/world"
+}
+
+test_trailing_slash() {
+    release_slots "$root/trailing slash/world///"
+    expect_trace "${release_loads[@]}"
+    diff -r "$root/release/world" "$root/trailing slash/world"
+}
+
+test_publish_tag() (
+    # Run the publisher's actual shell body against a local Git remote and a fake release CLI.
+    awk '
+        /^      - name: Create release with assets$/ { step = 1 }
+        step && /^        run: [>|]$/ { run = substr($0, length($0)); next }
+        run && /^          / {
+            printf "%s%s", substr($0, 11), (run == ">" ? " " : "\n")
+            next
+        }
+        run && /^$/ { print ""; next }
+        run { exit }
+        END { if (!run) exit 1; print "" }
+    ' "$repo/.github/workflows/release.yml" > "$root/publish-release"
+
+    export GITHUB_SERVER_URL="$root" GITHUB_REPOSITORY=tag-remote
+    export GITHUB_REF_NAME=v1.0.0 GITHUB_REF=refs/tags/v1.0.0
+    export GITHUB_RUN_ID=123 GITHUB_RUN_ATTEMPT=2
+    export TEST_REMOTE="$root/tag-remote.git"
+    git init -q --bare "$TEST_REMOTE"
+    tag_git() {
+        git --git-dir="$TEST_REMOTE" -c user.name=Tester -c user.email=test@example.com "$@"
+    }
+    tree=$(tag_git mktree </dev/null)
+    GITHUB_SHA=$(tag_git commit-tree "$tree" -m built)
+    TEST_OTHER_SHA=$(tag_git commit-tree "$tree" -p "$GITHUB_SHA" -m moved)
+    export GITHUB_SHA TEST_OTHER_SHA
+
+    cat > bin/gh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+[[ $1 == release && $3 == "release-draft-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" ]]
+case "$2" in
+    create) [[ " $* " == *' --draft '* ]] ;;
+    edit)
+        [[ " $* " == *' --draft=false '* && " $* " == *' --verify-tag '* &&
+            " $* " == *" --tag $GITHUB_REF_NAME "* && " $* " == *" --target $GITHUB_SHA "* ]]
+        ;;
+    *) exit 2 ;;
+esac
+printf '%s\n' "$2" >> "$TRACE"
+if [[ $2 == create && ${TEST_MOVE_TAG_ON_UPLOAD:-} == 1 ]]; then
+    git --git-dir="$TEST_REMOTE" update-ref "$GITHUB_REF" "$TEST_OTHER_SHA"
+fi
+EOF
+    chmod +x bin/gh
+    : > "$TRACE"
+
+    tag_git update-ref "$GITHUB_REF" "$TEST_OTHER_SHA"
+    if bash -euo pipefail "$root/publish-release" > "$root/moved-tag.log" 2>&1; then
+        printf 'Publisher accepted a tag pointing to another commit\n' >&2
+        exit 1
+    fi
+    [[ ! -s $TRACE ]]
+
+    tag_git update-ref -d "$GITHUB_REF"
+    if bash -euo pipefail "$root/publish-release" > "$root/missing-tag.log" 2>&1; then
+        printf 'Publisher accepted a deleted tag\n' >&2
+        exit 1
+    fi
+    [[ ! -s $TRACE ]]
+
+    tag_git update-ref "$GITHUB_REF" "$GITHUB_SHA"
+    bash -euo pipefail "$root/publish-release"
+    expect_trace create edit
+
+    tag_git tag -f -a "$GITHUB_REF_NAME" "$GITHUB_SHA" -m release >/dev/null
+    bash -euo pipefail "$root/publish-release"
+    expect_trace create edit
+
+    if TEST_MOVE_TAG_ON_UPLOAD=1 bash -euo pipefail "$root/publish-release" > "$root/tag-moved-on-upload.log" 2>&1; then
+        printf 'Publisher accepted a tag that moved while uploading assets\n' >&2
+        exit 1
+    fi
+    expect_trace create
+)
+
+if (( $# == 0 )); then
+    set -- corrupt_release_cache trailing_slash publish_tag
+fi
+for name in "$@"; do
+    EGR_CITYMAP_PUBLISHED="$root/release/world" "test_$name"
+done

@@ -27,6 +27,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Install Rust
         run: rustup toolchain install stable --profile minimal && rustup default stable
@@ -65,6 +67,7 @@ jobs:
       - name: Checkout github repo (+ download lfs dependencies)
         uses: actions/checkout@v4
         with:
+          ref: ${{ github.sha }}
           lfs: true
 
       - name: Checkout LFS objects
@@ -165,12 +168,37 @@ jobs:
           ls -l
 
       - name: Create release with assets
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: >
-          gh release create "${GITHUB_REF_NAME}"
-          --verify-tag
-          --repo "${GITHUB_REPOSITORY}"
-          --title "Release ${GITHUB_REF_NAME}"
-          artifacts/linux.zip artifacts/windows.zip artifacts/cities.zip
-          artifacts/linux-headless.zip artifacts/windows-headless.zip
+        run: |
+          verify_release_tag() {
+            local refs tag_sha
+            if ! refs=$(git -c credential.helper= -c 'credential.helper=!gh auth git-credential' \
+              ls-remote --exit-code -- "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}.git" \
+              "$GITHUB_REF" "$GITHUB_REF^{}"); then
+              printf 'Could not resolve release tag %s\n' "$GITHUB_REF" >&2
+              return 1
+            fi
+            tag_sha=$(awk -v ref="$GITHUB_REF" '
+              $2 == ref { sha = $1 }
+              $2 == ref "^{}" { peeled = $1 }
+              END { print (peeled ? peeled : sha) }
+            ' <<< "$refs")
+            if [[ $tag_sha != "$GITHUB_SHA" ]]; then
+              printf 'Release tag %s resolves to %s, but the build used %s\n' \
+                "$GITHUB_REF" "${tag_sha:-no commit}" "$GITHUB_SHA" >&2
+              return 1
+            fi
+          }
+
+          # Give each attempt its own draft so publication cannot pick up an older draft's assets.
+          draft_tag="release-draft-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          verify_release_tag
+          gh release create "$draft_tag" \
+            --draft --repo "$GITHUB_REPOSITORY" --title "Release $GITHUB_REF_NAME" \
+            artifacts/linux.zip artifacts/windows.zip artifacts/cities.zip \
+            artifacts/linux-headless.zip artifacts/windows-headless.zip
+          verify_release_tag
+          gh release edit "$draft_tag" --draft=false \
+            --tag "$GITHUB_REF_NAME" --target "$GITHUB_SHA" --verify-tag --repo "$GITHUB_REPOSITORY"

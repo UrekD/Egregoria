@@ -7,7 +7,7 @@ release_slots=false
 if [[ ${1:-} == --release-slots ]]; then
     release_slots=true
     shift
-    if [[ $# != 2 ]]; then
+    if [[ $# != 2 || -z $1 ]]; then
         printf 'Usage: %s --release-slots WORLD_DIR CARGO_TARGET_DIR\n' "$0" >&2
         exit 2
     fi
@@ -27,6 +27,9 @@ exec 9> "$cache/lock"
 flock 9
 
 if $release_slots; then
+    while [[ $out == */ && $out != / ]]; do
+        out=${out%/}
+    done
     if [[ -e $out || -L $out ]]; then
         printf 'Release slot directory already exists: %s\n' "$out" >&2
         exit 1
@@ -95,6 +98,32 @@ check_town() {
     cargo run --locked --release -p scenarios -- citymap-build --verify "$1"
 }
 
+load_release_slots() {
+    local slot
+    for slot in starter_town showcase_city lesce_osm; do
+        # bench-slot opens the snapshot with the game loader before stepping it.
+        cargo run --locked --release -p scenarios -- bench-slot \
+            --root "$1" --slot "$slot" --warmup 0 --ticks 1 >/dev/null || return 1
+    done
+    check_town "$1"
+}
+
+slot_checksums() (
+    cd -- "$1" || exit 1
+    find . -type f -print0 | LC_ALL=C sort -z | xargs -0 -r sha256sum --
+)
+
+check_release_cache() {
+    local checksums
+    if [[ ! -f $current/checksums ]] ||
+        ! checksums=$(slot_checksums "$current/slots") ||
+        [[ $checksums != "$(< "$current/checksums")" ]]; then
+        printf 'Release slot cache checksums failed. Regenerating slots.\n' >&2
+        return 1
+    fi
+    load_release_slots "$current/slots"
+}
+
 generate() {
     if ! cargo run --locked --release -p scenarios -- "$@"; then
         printf 'Save generation failed (%s).\n' "$1" >&2
@@ -104,8 +133,11 @@ generate() {
 
 stamp=$(fingerprint)
 if [[ -f $current/stamp && $(< "$current/stamp") == "$stamp" ]] &&
-    check_slots "$current/slots" 2>/dev/null; then
-    check_town "$current/slots"
+    check_slots "$current/slots" 2>/dev/null &&
+    { ! $release_slots || check_release_cache; }; then
+    if ! $release_slots; then
+        check_town "$current/slots"
+    fi
     printf 'Reusing staged save slots in %s\n' "$current/slots"
 else
     printf 'Generating save slots for %s\n' "$(cat VERSION)"
@@ -124,7 +156,12 @@ else
         fi
     fi
     check_slots "$pending/slots"
-    check_town "$pending/slots"
+    if $release_slots; then
+        load_release_slots "$pending/slots"
+        slot_checksums "$pending/slots" > "$pending/checksums"
+    else
+        check_town "$pending/slots"
+    fi
     if [[ $(fingerprint) != "$stamp" ]]; then
         printf 'Save generator inputs changed during the build. Rerun slot generation.\n' >&2
         exit 1
@@ -136,8 +173,9 @@ else
 fi
 
 if $release_slots; then
-    mkdir -p -- "$(dirname -- "$out")"
-    staging=$(mktemp -d -- "$out.pending.XXXXXX")
+    parent=$(dirname -- "$out")
+    mkdir -p -- "$parent"
+    staging=$(mktemp -d -- "$parent/.$(basename -- "$out").pending.XXXXXX")
     trap 'rm -rf -- "$staging"' EXIT
     cp -a -- "$current/slots/." "$staging/"
     mv -T -n -- "$staging" "$out"

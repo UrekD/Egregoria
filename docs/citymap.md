@@ -20,10 +20,12 @@ Run `cargo run --locked --release -p scenarios -- citymap-build --verify DIR` to
 
 Release CI runs `scripts/build-windows-with-slots.sh --release-slots WORLD_DIR CARGO_TARGET_DIR` once on Linux. Use a new output directory for `WORLD_DIR`. The script decompresses the archived Overpass responses in `scripts/osm/release/`. Their exact bytes match the Lesce and Sava SHA-256 pins checked by `citymap-build`. OpenStreetMap contributors provide the archived data under the Open Database License. [OpenStreetMap attribution and license](https://www.openstreetmap.org/copyright)
 
-For a local packaging run, set `EGR_CITYMAP_PUBLISHED` to reuse a verified wet town for the current save version.
+The release script checks the staged file checksums on cache reuse and loads all four saves before packaging. It regenerates the stage if cache verification fails. For a local packaging run, set `EGR_CITYMAP_PUBLISHED` to reuse a verified wet town for the current save version.
 
 ## Trigger a release
 
 Push one `v*` tag at a time from a commit containing `.github/workflows/release.yml`, for example `git push origin refs/tags/vX.Y.Z`. Push with user credentials or a GitHub App installation token if automated. GitHub suppresses workflow runs for pushes made with the repository's `GITHUB_TOKEN`, and pushes of more than three tags produce no tag events. [GitHub workflow triggers](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow) · [GitHub push events](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#push)
 
 If a tag push produces no workflow run, use `gh workflow run release.yml --ref vX.Y.Z`. The workflow must also exist on the default branch for manual dispatch. Dispatching a branch produces workflow artifacts. Dispatching a tag publishes the GitHub release. [GitHub workflow dispatch](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#workflow_dispatch)
+
+The workflow verifies the tag's commit before uploading assets to a draft and again before publishing. If the tag moves during upload, the release remains a draft. Use a tag ruleset that restricts updates and deletions to protect release tags during the final publication request. [GitHub tag rulesets](https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-rulesets/available-rules-for-rulesets)
