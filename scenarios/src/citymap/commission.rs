@@ -344,42 +344,26 @@ fn prepare_opening(
             sites.insert(name.into(), store);
         }
     }
-    // Use the frontage between South and West so mine drivers can reach work
-    // and deliver fuel without competing for the terminal's delivery fleet.
-    let (plant, plant_road) =
-        place_company(sim, plan, &roads, "coal-power-plant", at(1740.0, 1430.0))?;
+    // Give the wet plant a short run from the rail terminal's multi-truck fleet.
+    let plant_anchor = if wet { bakery_anchor } else { at(1740.0, 1430.0) };
+    let (plant, plant_road) = place_company(sim, plan, &roads, "coal-power-plant", plant_anchor)?;
     sites.insert("coal-power-plant".into(), plant);
     let plant_door = sim.map().buildings()[plant].door_pos.xy();
-    let mine_frontage = BTreeSet::from([plant_road]);
-    let mut mine_offsets = [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)];
-    if profiled_wet {
-        // Freight considers producers in commissioning order. Put the mine
-        // upstream of the plant's loading curb first so loaded trucks can
-        // reach it without a turnaround.
-        mine_offsets.swap(0, 1);
-    }
-    for (index, offset) in mine_offsets.into_iter().enumerate() {
-        let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
-        verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
-        sites.insert(format!("coal-mine-{}", index + 1), mine);
+    if wet {
+        verify_parking_pair(&sim.map(), terminal, plant, Tick(sim.get_tick()))?;
+    } else {
+        let mine_frontage = BTreeSet::from([plant_road]);
+        for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)].into_iter().enumerate() {
+            let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
+            verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
+            sites.insert(format!("coal-mine-{}", index + 1), mine);
+        }
     }
     let intake_parcels = if profiled_wet {
         commission_intake_frontage(sim, plan, &roads)?
     } else {
         Vec::new()
     };
-    let mut depots = Vec::new();
-    if profiled_wet {
-        // A separate local fleet can deliver staged coal while the mine
-        // trucks are out collecting or returning to their depots.
-        let (buffer, _) = place_company(sim, plan, &roads, "large-warehouse", at(1688.0, 1248.0))?;
-        verify_parking_pair(&sim.map(), buffer, plant, Tick(sim.get_tick()))?;
-        depots.push(WorldCommand::SetWarehousePolicy {
-            building: buffer,
-            policy: WarehousePolicy::ReserveLocally,
-        });
-        sites.insert("coal-buffer".into(), buffer);
-    }
     // Use parking frontage near both the field clusters and the shops.
     for (i, (x, y)) in [
         (1110.0, 1550.0),
@@ -396,7 +380,13 @@ fn prepare_opening(
     .into_iter()
     .enumerate()
     {
-        let (building, _) = place_company(sim, plan, &roads, "flour-factory", at(x, y))?;
+        let anchor = at(x, y);
+        let (building, _) = place_scored_company(sim, plan, &roads, "flour-factory", |map, road, footprint| {
+            (map.roads()[road].lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
+                && !intake_parcels.iter().any(|parcel| parcel.footprint.intersects(&footprint)))
+                .then(|| footprint.center().distance2(anchor))
+        })?
+        .ok_or("no clear flour mill site outside Sava intake housing")?;
         sites.insert(format!("flour-mill-{}", i + 1), building);
     }
     let mut farms = Vec::new();
@@ -555,6 +545,7 @@ fn prepare_opening(
         .map(|(building, _)| building)
         .ok_or_else(|| format!("no clear fitting site for {name} outside approved frontage"))
     };
+    let mut depots = Vec::new();
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
         let depot = place_company_around_parcels(sim, "small-depot", cohort.anchor, None)?;
         sites.insert(format!("{}/depot", cohort.district), depot);
@@ -631,17 +622,10 @@ fn prepare_opening(
     }
     place_walkable_bakeries(sim, plan, &roads, &parcels, &reserves, &mut sites)?;
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
-    // Fit backup fuel supply around the approved opening and infill lots.
-    for (name, offset) in [
-        ("coal-mine-4", vec2(0.0, -65.0)),
-        ("coal-mine-5", vec2(-85.0, -40.0)),
-    ]
-    .into_iter()
-    .take(if profiled_wet { 2 } else { 1 })
-    {
-        let mine = place_company_around_parcels(sim, "coal-mine", plant_door + offset, None)?;
+    if !wet {
+        let mine = place_company_around_parcels(sim, "coal-mine", plant_door + vec2(0.0, -65.0), None)?;
         verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
-        sites.insert(name.into(), mine);
+        sites.insert("coal-mine-4".into(), mine);
     }
     if wet {
         // The existing stations serve the eastern blocks to capacity before
@@ -748,7 +732,7 @@ pub(super) fn commission_opening(
         paint(sim, parcels.iter().filter(|parcel| early_retail(parcel)))?;
     }
     advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
-    apply(sim, "opening depot policies", &depots)?;
+    apply(sim, "district depot policies", &depots)?;
     let (station, ent) = sim
         .world()
         .freight_stations
@@ -1942,7 +1926,10 @@ fn verify_parcel_frontage(map: &Map, zones: &ZoneGrid, parcel: &Parcel) -> Resul
         }
         (&origin.shape, origin.parent_road)
     } else {
-        let lot = map.get(parcel.lot).ok_or_else(|| format!("missing opening lot {:?}", parcel.lot))?;
+        let lot = map.get(parcel.lot).ok_or_else(|| format!(
+            "missing opening lot {:?} in {} on {:?} at {:?}",
+            parcel.lot, parcel.district, parcel.road, parcel.footprint.center(),
+        ))?;
         (&lot.shape, lot.parent)
     };
     if road != parcel.road || !same_footprint(shape, &parcel.footprint)
@@ -2635,6 +2622,10 @@ fn verify_opening_ids(sim: &Simulation, manifest: &OpeningManifest) -> Result<u3
         return Err("freight IDs did not survive opening reload".into());
     }
     verify_parking_pair(&map, freight.terminal, freight.bakery, Tick(sim.get_tick()))?;
+    if map.environment().has_water_configuration() {
+        let plant = *manifest.sites.get("coal-power-plant").ok_or("missing wet coal plant")?;
+        verify_parking_pair(&map, freight.terminal, plant, Tick(sim.get_tick()))?;
+    }
     Ok(capacity)
 }
 
@@ -4251,31 +4242,13 @@ mod tests {
         let mut plan = plan_town(&inputs, TownConfig::wet(), SpacingLimits::default()).unwrap();
         configure_commissioned_network(&mut plan);
         let (mut sim, built, freight) = build_wet_town(&mut plan).unwrap();
+        let terminal = freight.terminal;
         let opening = prepare_opening(&mut sim, &plan, &built, Some(freight)).unwrap();
         let map = sim.map();
-        if ResidencePrototype::iter().any(|home| home.massing.is_some()) {
-            let loading_lane = |name: &str| {
-                let door = map.buildings()[opening.sites[name]].door_pos;
-                let parking = ParkingManagement::default().reserve_near(door, &map).unwrap();
-                let position = parking.park_pos(&map).unwrap();
-                let lane = map.nearest_lane(position, LaneKind::Driving, None).unwrap();
-                let points = &map.lanes()[lane].points;
-                (lane, points.length_at_proj(points.project(position)))
-            };
-            let (mine_lane, mine_offset) = loading_lane("coal-mine-1");
-            let (plant_lane, plant_offset) = loading_lane("coal-power-plant");
-            assert!(mine_lane == plant_lane && mine_offset < plant_offset,
-                "the first coal mine needs a direct outbound drive to the plant's loading curb");
-            assert!(opening.sites.contains_key("coal-buffer"),
-                "the plant needs a nearby multi-truck coal buffer");
-            let buffer = opening.sites["coal-buffer"];
-            let plant = opening.sites["coal-power-plant"];
-            let distance = map.buildings()[buffer].door_pos.distance(map.buildings()[plant].door_pos);
-            assert!(distance <= 200.0, "the coal buffer is {distance:.1} m from the plant");
-            let warehouse = map.buildings()[buffer].kind.as_goods_company().unwrap().prototype();
-            assert!(warehouse.n_trucks >= 4);
-            assert!(warehouse.storage.as_ref().unwrap().accepted_items.contains(&ItemID::new("coal")));
-        }
+        let plant = opening.sites["coal-power-plant"];
+        let distance = map.buildings()[terminal].door_pos.distance(map.buildings()[plant].door_pos);
+        assert!(distance <= 230.0, "the rail terminal is {distance:.1} m from the wet plant");
+        verify_parking_pair(&map, terminal, plant, Tick(sim.get_tick())).unwrap();
         let reach = ServiceReach::new(&map, true);
         let bakeries: Vec<_> = map
             .buildings()
