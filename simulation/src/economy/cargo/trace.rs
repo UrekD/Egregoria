@@ -92,10 +92,24 @@ impl RailAnchor {
         from.distance(self.position) < 10.0 && self.before(from) && !self.before(to)
     }
 
-    fn reached(self, from: Vec3, to: Vec3) -> bool {
-        to.distance(self.position) <= POSITION_TOLERANCE
-            && (to - from).dot(self.dir) > 0.0
-            && (self.position - from).dot(self.dir) > 0.0
+    fn reached(self, traversal: TraverseKind, from: Vec3, to: Vec3) -> bool {
+        let remaining = to.distance(self.position);
+        if remaining > POSITION_TOLERANCE {
+            return false;
+        }
+        match traversal {
+            TraverseKind::Lane(lane) if lane == self.lane => {
+                (to - from).dot(self.dir) > 0.0 && self.before(from)
+            }
+            // At offset zero the inbound movement ends on the turn whose exit
+            // is the start of this lane. There may be no nonzero lane segment.
+            TraverseKind::Turn(turn)
+                if turn.dst == self.lane && self.offset <= POSITION_TOLERANCE =>
+            {
+                from.distance(self.position) > remaining
+            }
+            _ => false,
+        }
     }
 }
 
@@ -778,7 +792,7 @@ impl FreightTrace {
             RailLeg::Inbound => call.berth,
             RailLeg::Loading { .. } => return,
         };
-        if traversal == TraverseKind::Lane(anchor.lane) && anchor.reached(from, to) {
+        if anchor.reached(traversal, from, to) {
             call.reached = true;
         }
         if call.leg == RailLeg::Inbound
@@ -1117,6 +1131,44 @@ mod tests {
     use super::*;
     use crate::economy::cargo::{ImportOrder, ItemQuantity};
     use crate::SoulID;
+
+    #[test]
+    fn p8_freight_berth_at_lane_start_uses_the_connecting_turn() {
+        use crate::map::{IntersectionID, TurnID};
+        use slotmapd::SlotMap;
+
+        let mut lanes = SlotMap::with_key();
+        let inbound = lanes.insert(());
+        let outgoing = lanes.insert(());
+        let other = lanes.insert(());
+        let anchor = RailAnchor {
+            lane: outgoing,
+            offset: 0.0,
+            position: Vec3::X,
+            dir: Vec3::X,
+        };
+        let connected = TraverseKind::Turn(TurnID::new(
+            IntersectionID::default(),
+            inbound,
+            outgoing,
+            false,
+        ));
+        let wrong_exit = TraverseKind::Turn(TurnID::new(
+            IntersectionID::default(),
+            inbound,
+            other,
+            false,
+        ));
+        assert!(anchor.reached(connected, Vec3::ZERO, Vec3::X));
+        assert!(!anchor.reached(connected, Vec3::X, Vec3::X));
+        assert!(!anchor.reached(wrong_exit, Vec3::ZERO, Vec3::X));
+        assert!(!anchor.reached(connected, Vec3::Z, Vec3::X + Vec3::Z));
+        let interior = RailAnchor {
+            offset: 5.0,
+            ..anchor
+        };
+        assert!(!interior.reached(connected, Vec3::ZERO, Vec3::X));
+    }
 
     #[test]
     fn p8_freight_two_calls_keep_late_orders_out_and_trace_fragments_to_the_buyer() {
