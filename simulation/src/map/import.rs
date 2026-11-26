@@ -8,7 +8,10 @@ use crate::map::{
 use crate::map_dynamic::BuildingInfos;
 use crate::souls::{growth, residence};
 use crate::world_command::WorldCommand;
-use crate::{MapPreset, NewGameOptions, PlacedGrowable, Simulation, SimulationOptions};
+use crate::{
+    MapConstructor, MapOrigin, MapPreset, NewGameOptions, PlacedGrowable, Simulation,
+    SimulationOptions,
+};
 use geom::{Vec2, Vec3, OBB};
 use prototypes::{try_prototype, BuildingGen, GrowableCompanyID, GrowableZoneKind, Money};
 use std::collections::BTreeMap;
@@ -82,7 +85,7 @@ impl Simulation {
                 (system.f)(&mut sim);
             }
         }
-        WorldCommand::bootstrap_import(
+        WorldCommand::bootstrap(
             &mut sim,
             SimulationOptions {
                 terrain_size: options.terrain_chunks,
@@ -95,6 +98,7 @@ impl Simulation {
                 land_recipe: crate::map::LandRecipe::Unrestricted,
                 persons_per_agent: options.persons_per_agent,
             },
+            MapOrigin::new(MapConstructor::Imported, options.lot_layout),
         )
         .map_err(|error| format!("import bootstrap: {error:?}"))?;
         sim.map_mut().lot_layout = options.lot_layout;
@@ -544,7 +548,7 @@ mod tests {
                     (system.f)(&mut sim);
                 }
             }
-            WorldCommand::bootstrap_import(
+            WorldCommand::bootstrap(
                 &mut sim,
                 SimulationOptions {
                     preset: options.preset,
@@ -552,6 +556,7 @@ mod tests {
                     save_replay: false,
                     ..Default::default()
                 },
+                MapOrigin::new(MapConstructor::Imported, options.lot_layout),
             )
             .unwrap();
             let road = {

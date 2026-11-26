@@ -30,7 +30,9 @@ use crate::transportation::testing_vehicles::RandomVehicles;
 use crate::transportation::train::{spawn_train, RailWagonKind};
 use crate::transportation::{spawn_parked_vehicle_with_spot, unpark, VehicleKind};
 use crate::utils::rand_provider::RandProvider;
-use crate::{CompanyID, MapPreset, Replay, Simulation, SimulationOptions, SoulID};
+use crate::{
+    CompanyID, MapConstructor, MapOrigin, MapPreset, Replay, Simulation, SimulationOptions, SoulID,
+};
 
 pub(crate) const MAX_TILED_COMMANDS: usize = 256;
 pub(crate) const MAX_WIRE_COMMANDS: usize = 65_536;
@@ -2225,47 +2227,13 @@ impl WorldCommand {
     pub(crate) fn bootstrap(
         sim: &mut Simulation,
         options: SimulationOptions,
-    ) -> Result<(), Rejection> {
-        Self::bootstrap_world(sim, options, BootstrapKind::Normal)
-    }
-
-    pub(crate) fn bootstrap_import(
-        sim: &mut Simulation,
-        options: SimulationOptions,
-    ) -> Result<(), Rejection> {
-        Self::bootstrap_world(sim, options, BootstrapKind::Import)
-    }
-
-    pub(crate) fn bootstrap_authored(
-        sim: &mut Simulation,
-        options: SimulationOptions,
-        lot_layout: LotLayout,
-    ) -> Result<(), Rejection> {
-        Self::bootstrap_world(sim, options, BootstrapKind::AuthoredFlat)?;
-        sim.map_mut().set_lot_layout(lot_layout);
-        Ok(())
-    }
-
-    fn bootstrap_world(
-        sim: &mut Simulation,
-        options: SimulationOptions,
-        kind: BootstrapKind,
+        origin: MapOrigin,
     ) -> Result<(), Rejection> {
         let tick = sim.read::<GameTime>().tick;
         if tick.0 != crate::INITIAL_TICK || sim.resources.try_read::<SimulationOptions>().is_ok() {
             return Err(Rejection::UnexpectedInit);
         }
-        let valid = match kind {
-            BootstrapKind::Normal => options.valid_for_bootstrap(),
-            BootstrapKind::Import => {
-                !options.save_replay
-                    && options.preset != MapPreset::Waters
-                    && options.land_mode == crate::map::LandMode::Unrestricted
-                    && options.valid_for_bootstrap()
-            }
-            BootstrapKind::AuthoredFlat => options.valid_for_authored_bootstrap(),
-        };
-        if !valid {
+        if origin.validate_options(options).is_err() {
             return Err(Rejection::InvalidInitOptions);
         }
         info!("Initializing world with {options:?}");
@@ -2277,7 +2245,7 @@ impl WorldCommand {
                 sim.map()
                     .validate_commissioned_reserves(options.land_recipe)
                     .map_err(Rejection::LandSetup)?;
-            } else if kind == BootstrapKind::Normal {
+            } else if origin.constructor == MapConstructor::NewGame {
                 let starter_built = build_starting_external_trading(sim);
                 if options.preset == MapPreset::Waters && !starter_built {
                     return Err(Rejection::MutationFailed);
@@ -2296,16 +2264,14 @@ impl WorldCommand {
                 replay.push(tick, Init(Box::new(options)));
             }
         }
+        if origin.constructor.is_authored() {
+            sim.map_mut()
+                .set_lot_layout(origin.initial_lot_layout.expect("validated authored layout"));
+        }
         sim.resources.insert(options);
+        sim.resources.insert(origin);
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum BootstrapKind {
-    Normal,
-    Import,
-    AuthoredFlat,
 }
 
 fn generate_terrain(sim: &mut Simulation, options: SimulationOptions) -> Result<(), Rejection> {

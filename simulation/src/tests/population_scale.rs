@@ -2,11 +2,12 @@ use crate::economy::progression::{
     can_build, progression_status, BuildCapability, ProgressionMode,
 };
 use crate::economy::CityStats;
+use crate::map::{AuthoredTownOptions, LotLayout};
 use crate::souls::human::spawn_human;
 use crate::utils::replay::ReplayJson;
 use crate::{
-    NewGameError, NewGameOptions, PopulationScale, Replay, SaveLoadError, Simulation,
-    SimulationDeser, SimulationOptions, WorldCommand,
+    MapConstructor, MapOrigin, NewGameError, NewGameOptions, PopulationScale, Replay,
+    SaveLoadError, Simulation, SimulationDeser, SimulationOptions, WorldCommand,
 };
 use common::saveload::{Bincode, Encoder, JSON};
 use geom::{vec2, vec3};
@@ -174,6 +175,8 @@ fn population_scale_snapshot_uses_a_distinct_compatibility_version() {
     let sim = Simulation::new_with_options(small_options(4));
     let snapshot = Bincode::encode(&sim).unwrap();
     let (header, _) = crate::snapshot_header(&snapshot).unwrap();
+    assert_eq!(header.version, crate::VERSION);
+    assert!(!header.version.contains('-'));
     assert_ne!(header.version, "0.11.0");
     assert_eq!(sim.read::<Replay>().version, header.version);
     assert_eq!(
@@ -198,6 +201,79 @@ fn population_scale_snapshot_accepts_compact_authored_town() {
     let loaded: Simulation = Bincode::decode(&snapshot).unwrap();
     assert_eq!(loaded.hashes(), sim.hashes());
     assert_eq!(loaded.population_scale(), PopulationScale::REALISTIC);
+}
+
+#[test]
+fn population_scale_snapshot_rejects_scaled_compact_authored_town() {
+    init_test_simulation();
+    let sim = Simulation::new_authored_town(crate::map::AuthoredTownOptions::default()).unwrap();
+    let mut options = *sim.read::<SimulationOptions>();
+    options.persons_per_agent = 4;
+
+    let snapshot = Bincode::encode(&sim).unwrap();
+    let mut decoded: SimulationDeser = Bincode::decode(&snapshot).unwrap();
+    decoded
+        .res
+        .insert("simoptions".into(), Bincode::encode(&options).unwrap());
+    let error = decoded.into_sim().err();
+    assert!(matches!(
+        error,
+        Some(SaveLoadError::Corrupt { ref reason, .. }) if reason.contains("must use Realistic")
+    ), "{error:?}");
+}
+
+#[test]
+fn population_scale_snapshot_rejects_scaled_authored_flat_at_native_size() {
+    init_test_simulation();
+    let sim = Simulation::new_authored_flat(NewGameOptions::MIN_TERRAIN_CHUNKS, 42).unwrap();
+    let mut options = *sim.read::<SimulationOptions>();
+    options.persons_per_agent = 4;
+    assert!(options.valid_for_bootstrap());
+    let mut decoded: SimulationDeser = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+    decoded
+        .res
+        .insert("simoptions".into(), Bincode::encode(&options).unwrap());
+    assert!(matches!(
+        decoded.into_sim(),
+        Err(SaveLoadError::Corrupt { reason, .. }) if reason.contains("must use Realistic")
+    ));
+}
+
+#[test]
+fn population_scale_snapshot_migrates_unambiguous_legacy_origin() {
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_town(AuthoredTownOptions::default()).unwrap();
+    sim.apply_commands([&WorldCommand::SetLotLayout(LotLayout::Varied)]);
+    let bytes = Bincode::encode(&sim).unwrap();
+    let mut older: SimulationDeser = Bincode::decode(&bytes).unwrap();
+    older.res.remove("map_origin").unwrap();
+    older._header.version = crate::PRE_ORIGIN_VERSION.into();
+    let restored = older.into_sim().unwrap();
+    assert_eq!(restored.map().lot_layout(), LotLayout::Varied);
+    let origin = MapOrigin::new(MapConstructor::AuthoredTown, LotLayout::Uniform);
+    assert_eq!(*restored.read::<MapOrigin>(), origin);
+    let migrated: Simulation = Bincode::decode(&Bincode::encode(&restored).unwrap()).unwrap();
+    assert_eq!(*migrated.read::<MapOrigin>(), origin);
+}
+
+#[test]
+fn population_scale_snapshot_rejects_ambiguous_legacy_origin() {
+    init_test_simulation();
+    let mut sim = Simulation::new_authored_town(AuthoredTownOptions {
+        starting_money_bucks: SimulationOptions::LEGACY.starting_money_bucks,
+        ..AuthoredTownOptions::default()
+    })
+    .unwrap();
+    for layout in [LotLayout::Uniform, LotLayout::Varied] {
+        sim.apply_commands([&WorldCommand::SetLotLayout(layout)]);
+        let mut older: SimulationDeser = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+        older.res.remove("map_origin").unwrap();
+        older._header.version = crate::PRE_ORIGIN_VERSION.into();
+        assert!(matches!(
+            older.into_sim(),
+            Err(SaveLoadError::Corrupt { reason, .. }) if reason.contains("Ambiguous legacy snapshot map origin")
+        ));
+    }
 }
 
 #[test]

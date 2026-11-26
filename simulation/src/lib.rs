@@ -129,10 +129,11 @@ pub struct Simulation {
 const RNG_SEED: u64 = 123;
 const INITIAL_TICK: u64 = 1;
 const PRE_SCALE_VERSION: &str = "0.11.0";
+const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
 const VERSION: &str = include_str!("../../VERSION");
 
 fn compatible_save_version(version: &str) -> bool {
-    matches!(version, VERSION | PRE_SCALE_VERSION)
+    matches!(version, VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION)
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -290,13 +291,17 @@ impl SimulationOptions {
             terrain_chunks: self.terrain_size,
             starting_money_bucks: self.starting_money_bucks,
             progression: self.progression,
-            lot_layout: match self.land_recipe {
-                map::LandRecipe::Unrestricted => LotLayout::Varied,
-                map::LandRecipe::NativeFlatV1 { lot_layout }
-                | map::LandRecipe::AuthoredV1 { lot_layout, .. } => lot_layout,
-            },
+            lot_layout: self.recipe_lot_layout().unwrap_or_default(),
             land_mode: self.land_mode,
             persons_per_agent: self.persons_per_agent,
+        }
+    }
+
+    fn recipe_lot_layout(self) -> Option<LotLayout> {
+        match self.land_recipe {
+            map::LandRecipe::Unrestricted => None,
+            map::LandRecipe::NativeFlatV1 { lot_layout }
+            | map::LandRecipe::AuthoredV1 { lot_layout, .. } => Some(lot_layout),
         }
     }
 
@@ -336,44 +341,129 @@ impl SimulationOptions {
             && (minimum_money..=NewGameOptions::MAX_STARTING_MONEY_BUCKS)
                 .contains(&self.starting_money_bucks)
     }
-
-    fn validate_for_snapshot(self, map: &Map) -> Result<PopulationScale, String> {
-        let scale = self.population_scale().map_err(|error| error.to_string())?;
-        if self.valid_for_bootstrap() {
-            return Ok(scale);
-        }
-
-        // Compact authored worlds bypass the native New Game terrain minimum.
-        // Imported worlds use the regular bootstrap options.
-        let authored = match (self.land_mode, self.land_recipe) {
-            (map::LandMode::Unrestricted, map::LandRecipe::Unrestricted)
-                if self.progression == ProgressionMode::FreeBuild
-                    && map.environment().size() == (self.terrain_size, self.terrain_size) =>
-            {
-                // Authored-flat starts use the legacy budget and Realistic scale.
-                // The lot layout can change after construction on unrestricted land.
-                let authored_flat = self.starting_money_bucks == Self::LEGACY.starting_money_bucks
-                    && scale == PopulationScale::REALISTIC;
-                let authored_town =
-                    self.terrain_size >= 6 && map.lot_layout() == LotLayout::Uniform;
-                authored_flat || authored_town
-            }
-            (map::LandMode::Tiled, map::LandRecipe::AuthoredV1 { .. }) => true,
-            _ => false,
-        };
-        if !authored {
-            return Err("Invalid snapshot new-game options".into());
-        }
-        if self.valid_for_authored_bootstrap() {
-            return Ok(scale);
-        }
-        Err("Invalid snapshot authored options".into())
-    }
 }
 
 impl Default for SimulationOptions {
     fn default() -> Self {
         Self::LEGACY
+    }
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+enum MapConstructor {
+    NewGame,
+    Imported,
+    AuthoredFlat,
+    AuthoredTown,
+    AuthoredTiled,
+}
+
+impl MapConstructor {
+    fn is_authored(self) -> bool {
+        matches!(self, Self::AuthoredFlat | Self::AuthoredTown | Self::AuthoredTiled)
+    }
+}
+
+/// Immutable creation metadata paired with the terrain preset, size and seed in
+/// SimulationOptions. An older unrestricted save can lack its original lot layout.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct MapOrigin {
+    constructor: MapConstructor,
+    initial_lot_layout: Option<LotLayout>,
+}
+
+impl MapOrigin {
+    fn new(constructor: MapConstructor, lot_layout: LotLayout) -> Self {
+        Self {
+            constructor,
+            initial_lot_layout: Some(lot_layout),
+        }
+    }
+
+    fn matches_options(self, options: SimulationOptions) -> bool {
+        use map::{LandMode, LandRecipe};
+        let unrestricted = (options.land_mode, options.land_recipe)
+            == (LandMode::Unrestricted, LandRecipe::Unrestricted);
+        let authored_free_build = || {
+            unrestricted
+                && options.progression == ProgressionMode::FreeBuild
+                && options.valid_for_authored_bootstrap()
+        };
+        match self.constructor {
+            MapConstructor::NewGame => {
+                options.valid_for_bootstrap()
+                    && (unrestricted || self.initial_lot_layout == options.recipe_lot_layout())
+            }
+            MapConstructor::Imported => {
+                unrestricted
+                    && !options.save_replay
+                    && options.preset != MapPreset::Waters
+                    && options.new_game_options().is_valid()
+            }
+            MapConstructor::AuthoredFlat => {
+                authored_free_build()
+                    && options.starting_money_bucks == SimulationOptions::LEGACY.starting_money_bucks
+                    && self.initial_lot_layout == Some(LotLayout::default())
+            }
+            MapConstructor::AuthoredTown => {
+                authored_free_build()
+                    && options.terrain_size >= AuthoredTownOptions::MIN_TERRAIN_CHUNKS
+                    && self.initial_lot_layout == Some(LotLayout::Uniform)
+            }
+            MapConstructor::AuthoredTiled => {
+                matches!(
+                    (options.land_mode, options.land_recipe),
+                    (LandMode::Tiled, LandRecipe::AuthoredV1 { lot_layout, .. })
+                        if self.initial_lot_layout == Some(lot_layout)
+                ) && options.valid_for_authored_bootstrap()
+            }
+        }
+    }
+
+    fn validate_options(self, options: SimulationOptions) -> Result<PopulationScale, String> {
+        let scale = options.population_scale().map_err(|error| error.to_string())?;
+        if self.constructor.is_authored() && scale != PopulationScale::REALISTIC {
+            return Err("Authored map constructors must use Realistic population".into());
+        }
+        if !self.matches_options(options) {
+            return Err("Invalid options for the snapshot map constructor".into());
+        }
+        Ok(scale)
+    }
+
+    fn from_legacy(options: SimulationOptions, map: &Map) -> Result<Self, String> {
+        // The importer already persisted a dedicated marker for its lane geometry.
+        if map.has_imported_lane_reserves() {
+            return Ok(Self {
+                constructor: MapConstructor::Imported,
+                initial_lot_layout: None,
+            });
+        }
+
+        // Compare constructor contracts against the saved creation options. In
+        // particular, neither a later layout change nor the ratio under validation
+        // can resolve an overlap between constructors.
+        let mut candidates = [
+            Self {
+                constructor: MapConstructor::NewGame,
+                initial_lot_layout: options.recipe_lot_layout(),
+            },
+            Self::new(MapConstructor::AuthoredFlat, LotLayout::default()),
+            Self::new(MapConstructor::AuthoredTown, LotLayout::Uniform),
+            Self {
+                constructor: MapConstructor::AuthoredTiled,
+                initial_lot_layout: options.recipe_lot_layout(),
+            },
+        ]
+        .into_iter()
+        .filter(|origin| origin.matches_options(options));
+        let origin = candidates
+            .next()
+            .ok_or("Invalid legacy snapshot map origin")?;
+        if candidates.next().is_some() {
+            return Err("Ambiguous legacy snapshot map origin".into());
+        }
+        Ok(origin)
     }
 }
 
@@ -450,7 +540,7 @@ impl Simulation {
             return Err(NewGameError::TerrainChunks(terrain_chunks));
         }
         let mut sim = Self::with_initial_resources();
-        WorldCommand::bootstrap_authored(
+        WorldCommand::bootstrap(
             &mut sim,
             SimulationOptions {
                 terrain_size: terrain_chunks,
@@ -459,7 +549,7 @@ impl Simulation {
                 seed,
                 ..SimulationOptions::LEGACY
             },
-            LotLayout::default(),
+            MapOrigin::new(MapConstructor::AuthoredFlat, LotLayout::default()),
         )
         .map_err(NewGameError::Bootstrap)?;
         Ok(sim)
@@ -482,7 +572,12 @@ impl Simulation {
         let bootstrap_end = replay.bootstrap_end()?;
         let mut sim = Self::with_initial_resources();
 
-        WorldCommand::bootstrap(&mut sim, options).map_err(|reason| {
+        let lot_layout = match replay.commands(1..bootstrap_end).next() {
+            Some(WorldCommand::SetLotLayout(layout)) => *layout,
+            _ => options.recipe_lot_layout().unwrap_or_default(),
+        };
+        let origin = MapOrigin::new(MapConstructor::NewGame, lot_layout);
+        WorldCommand::bootstrap(&mut sim, options, origin).map_err(|reason| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("Replay Init: {reason:?}"),
@@ -534,7 +629,11 @@ impl Simulation {
         lot_layout: LotLayout,
     ) -> Result<Self, Rejection> {
         let mut sim = Self::with_initial_resources();
-        WorldCommand::bootstrap(&mut sim, opts)?;
+        let origin = MapOrigin::new(
+            MapConstructor::NewGame,
+            opts.recipe_lot_layout().unwrap_or(lot_layout),
+        );
+        WorldCommand::bootstrap(&mut sim, opts, origin)?;
         if opts.land_mode == map::LandMode::Tiled {
             sim.record_constructor_end();
             sim.world.reconcile_derived("new tiled world");
@@ -1095,7 +1194,9 @@ impl Simulation {
 
     fn allows_resource_write<T: Any>(&self) -> bool {
         use std::any::TypeId;
-        if TypeId::of::<T>() == TypeId::of::<SimulationOptions>() {
+        if TypeId::of::<T>() == TypeId::of::<SimulationOptions>()
+            || TypeId::of::<T>() == TypeId::of::<MapOrigin>()
+        {
             return false;
         }
         let protected = [
@@ -1180,6 +1281,9 @@ impl Serialize for Simulation {
                 Bincode::encode(&registry.fingerprint()).map_err(serde::ser::Error::custom)?;
             m.insert("prototype_registry".into(), fingerprint);
         }
+        let origin =
+            Bincode::encode(&*self.read::<MapOrigin>()).map_err(serde::ser::Error::custom)?;
+        m.insert("map_origin".into(), origin);
         log::info!("took {}s to serialize resources", t.elapsed().as_secs_f32());
 
         let v = SimulationSer {
@@ -1620,21 +1724,33 @@ impl SimulationDeser {
             }
         }
 
-        let scale = sim
-            .read::<SimulationOptions>()
-            .validate_for_snapshot(&sim.map())
-            .map_err(&corrupt)?;
+        let options = *sim.read::<SimulationOptions>();
+        let origin: MapOrigin = match self.res.get("map_origin") {
+            Some(bytes) => Bincode::decode(bytes)
+                .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
+            None if self._header.version == VERSION => {
+                return Err(corrupt("Missing snapshot map origin".into()));
+            }
+            None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
+        };
+        let scale = origin.validate_options(options).map_err(&corrupt)?;
         if self._header.version == PRE_SCALE_VERSION && scale != PopulationScale::REALISTIC {
             return Err(corrupt(
                 "pre-SCALE snapshot must use Realistic population".into(),
             ));
         }
+        if matches!(origin.constructor, MapConstructor::AuthoredFlat | MapConstructor::AuthoredTown)
+            && sim.map().environment().size() != (options.terrain_size, options.terrain_size)
+        {
+            return Err(corrupt("Snapshot terrain extent does not match the map origin".into()));
+        }
+        sim.resources.insert(origin);
         {
             let mut replay = sim.write::<Replay>();
             replay
                 .validate_population_scale(scale)
                 .map_err(|error| corrupt(error.to_string()))?;
-            if replay.version == PRE_SCALE_VERSION {
+            if matches!(replay.version.as_str(), PRE_SCALE_VERSION | PRE_ORIGIN_VERSION) {
                 replay.version = VERSION.to_owned();
             }
         }

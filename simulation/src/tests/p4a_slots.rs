@@ -140,6 +140,32 @@ fn population_scale_slot_round_trip_advertises_eight_before_opening() {
 }
 
 #[test]
+fn population_scale_snapshot_reloads_compact_authored_town_after_lot_layout_change() {
+    use crate::map::{AuthoredTownOptions, LotLayout};
+    use crate::WorldCommand;
+
+    crate::tests::init_test_simulation();
+    let mut city = Simulation::new_authored_town(AuthoredTownOptions::default()).unwrap();
+    assert_eq!(city.map().lot_layout(), LotLayout::Uniform);
+    city.apply_commands([&WorldCommand::SetLotLayout(LotLayout::Varied)]);
+    assert_eq!(city.map().lot_layout(), LotLayout::Varied);
+
+    let root = TestRoot::new();
+    let id = SlotId::new("authored-town").unwrap();
+    assert!(matches!(
+        city.save_to_slot(&root.0, &id, SnapshotRevision::new(91)).unwrap(),
+        SavePhase::Complete
+    ));
+    let restored = Simulation::load_from_slot(&root.0, &id).unwrap();
+    assert_eq!(restored.map().lot_layout(), LotLayout::Varied);
+    assert_eq!(
+        *restored.read::<crate::MapOrigin>(),
+        crate::MapOrigin::new(crate::MapConstructor::AuthoredTown, LotLayout::Uniform)
+    );
+    assert_eq!(restored.hashes(), city.hashes());
+}
+
+#[test]
 fn population_scale_populated_slot_reports_represented_population() {
     let mut ctx = super::TestCtx::new();
     ctx.g = Simulation::new_with_options(crate::SimulationOptions {

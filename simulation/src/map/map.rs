@@ -407,6 +407,10 @@ impl Map {
         &self.environment
     }
 
+    pub(crate) fn has_imported_lane_reserves(&self) -> bool {
+        self.import_lane_reserve
+    }
+
     #[cfg(test)]
     pub(crate) fn environment_mut_for_test(&mut self) -> &mut Environment {
         &mut self.environment
