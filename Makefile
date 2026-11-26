@@ -68,6 +68,10 @@ citymap-build:
 	if [ -n "$$EGR_CITYMAP_SAVA" ]; then set -- "$$@" --sava-input "$$EGR_CITYMAP_SAVA"; fi; \
 	cargo run --locked --release -p scenarios -- citymap-build "$$@"
 
+.PHONY: citymap-shots
+citymap-shots:
+	scripts/shots/citymap.sh "$$EGR_CITYMAP_OUT"
+
 # Install the fixture after native accepts the empty directory and before the
 # private Xvfb display allows the script to enter its render loop.
 .PHONY: osm-lesce-shots

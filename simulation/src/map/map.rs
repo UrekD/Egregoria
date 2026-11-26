@@ -330,12 +330,25 @@ impl Map {
             let east = terminals
                 .iter()
                 .any(|point| point.x >= bounds.ur.x - TERMINAL_INSET);
-            let south = terminals.iter().any(|point| point.y <= TERMINAL_INSET);
-            let north = terminals
-                .iter()
-                .any(|point| point.y >= bounds.ur.y - TERMINAL_INSET);
-            if !(west && east || matches!(recipe, LandRecipe::AuthoredV1 { .. }) && south && north)
-            {
+            let commissioned = if matches!(recipe, LandRecipe::AuthoredV1 { .. }) {
+                let faces = |point: &Vec2| {
+                    u8::from(point.x <= TERMINAL_INSET)
+                        | (u8::from(point.x >= bounds.ur.x - TERMINAL_INSET) << 1)
+                        | (u8::from(point.y <= TERMINAL_INSET) << 2)
+                        | (u8::from(point.y >= bounds.ur.y - TERMINAL_INSET) << 3)
+                };
+                terminals.iter().enumerate().any(|(index, first)| {
+                    let first = faces(first);
+                    first != 0
+                        && terminals[index + 1..].iter().any(|second| {
+                            let second = faces(second);
+                            second != 0 && (first | second).count_ones() >= 2
+                        })
+                })
+            } else {
+                west && east
+            };
+            if !commissioned {
                 return Err(invalid);
             }
         }

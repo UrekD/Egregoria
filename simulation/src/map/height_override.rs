@@ -1,6 +1,7 @@
 use geom::{pack_height, BaseNode, Shape, Vec2, AABB, NO_OVERRIDE, OBB};
 use std::collections::BTreeSet;
 
+use super::{base_node_support, land_site::rect_corners, PreparedEffects};
 use crate::map::terrain::CELL_SIZE;
 use crate::map::{
     spend_water_work, Intersection, Map, ProjectKind, Road, SpatialMapObject, TerrainChunkID,
@@ -87,11 +88,33 @@ impl Map {
                 self.project_construction_cuts(chunk, wet, removed, added, &mut Some(remaining))?;
             for (y, row) in after.iter().enumerate() {
                 for (x, &height) in row.iter().enumerate() {
-                    if height != before[y][x] {
-                        self.authorize_land_effects(super::PreparedEffects::BaseNode((
-                            chunk.0 as usize * TERRAIN_CHUNK_RESOLUTION + x,
-                            chunk.1 as usize * TERRAIN_CHUNK_RESOLUTION + y,
-                        )))?;
+                    let previous = before[y][x];
+                    if height == previous {
+                        continue;
+                    }
+                    let node = (
+                        chunk.0 as usize * TERRAIN_CHUNK_RESOLUTION + x,
+                        chunk.1 as usize * TERRAIN_CHUNK_RESOLUTION + y,
+                    );
+                    let base = self
+                        .environment
+                        .heightmap
+                        .packed_base_node(node)
+                        .expect("covered construction chunk contains its base nodes");
+                    let effective = |cut| {
+                        if cut == NO_OVERRIDE {
+                            base
+                        } else {
+                            base.min(cut)
+                        }
+                    };
+                    if effective(height) != effective(previous) {
+                        self.authorize_land_effects(PreparedEffects::BaseNode(node))?;
+                    } else {
+                        // A packed change still needs owned support. An unchanged
+                        // surface can overlap a reserve without altering its terrain.
+                        let support = rect_corners(base_node_support(node, self));
+                        self.land_ownership().check_polygon(&support, None)?;
                     }
                 }
             }

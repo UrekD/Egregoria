@@ -1952,7 +1952,12 @@ mod tiles_fix_regressions {
             .unwrap(),
         );
         assert!(map.remove_building(first).is_some());
+        assert_eq!(
+            map.authorize_building_removal(second),
+            Err(crate::map::LandDenial::Unowned(LandTileId { x: 2, y: 1 }))
+        );
         assert!(map.remove_building(second).is_none());
+        assert!(map.get(second).is_some());
     }
 
     #[test]

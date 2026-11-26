@@ -1,13 +1,14 @@
 use super::network::{
-    calibrate_storage, clean_network, connect_infill, finish_network, main_components,
-    retire_outer_road_fragments, segment_parameters, Graph, JunctionSpec, LinkSpec, RoadClass,
-    SourceKey, SpacingLimits,
+    calibrate_storage, clean_network, connect_infill, curve, finish_network, fit, main_components,
+    move_junction, retire_outer_road_fragments, segment_parameters, Graph, JunctionSpec, LinkSpec,
+    RoadClass, SourceKey, SpacingLimits,
 };
 use super::source::{
     serialize_point, serialize_points, Coordinate, Element, Kind, PinnedInputs, TownConfig,
 };
 use geom::{vec2, Vec2};
 use serde::Serialize;
+use simulation::map::LightPolicy;
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Serialize)]
@@ -746,6 +747,133 @@ fn authored_river(source: &[RiverReach], config: TownConfig) -> Result<RiverReac
     })
 }
 
+pub(super) fn extend_gateways(plan: &mut TownPlan) -> Result<(), String> {
+    plan.graph.wet = true;
+    let extent = f32::from(plan.config.map_chunks) * 512.0;
+    for (class, names) in [
+        (
+            RoadClass::Motorway,
+            ["a2-outer-north", "a2-outer-southeast"],
+        ),
+        (RoadClass::Rail, ["rail-outer-north", "rail-outer-south"]),
+    ] {
+        let mut cuts: Vec<_> = plan
+            .graph
+            .links
+            .values()
+            .filter(|link| link.class == class)
+            .flat_map(|link| link.endpoints)
+            .filter(|key| matches!(key, SourceKey::Cut { .. }))
+            .collect();
+        cuts.sort_by(|a, b| {
+            plan.graph.junctions[b]
+                .position
+                .y
+                .total_cmp(&plan.graph.junctions[a].position.y)
+        });
+        let [north, south] = cuts.as_slice() else {
+            return Err(format!("expected two {class:?} gateways"));
+        };
+        for (&cut, name) in [north, south].into_iter().zip(names) {
+            let start = plan.graph.junctions[&cut].position.xy();
+            let axis = [
+                (start.x - plan.config.owned_min.x, -Vec2::X),
+                (start.y - plan.config.owned_min.y, -Vec2::Y),
+                (plan.config.owned_max.x - start.x, Vec2::X),
+                (plan.config.owned_max.y - start.y, Vec2::Y),
+            ]
+            .into_iter()
+            .min_by(|a, b| a.0.total_cmp(&b.0))
+            .unwrap()
+            .1;
+            let (way, edge, toward) = plan
+                .outer_corridor_traces
+                .iter()
+                .filter(|trace| trace.class == class)
+                .flat_map(|trace| {
+                    let points = &trace.points;
+                    [
+                        (trace.way, points[0], points[1]),
+                        (
+                            trace.way,
+                            points[points.len() - 1],
+                            points[points.len() - 2],
+                        ),
+                    ]
+                })
+                .filter(|&(_, edge, _)| {
+                    let boundary = if axis.x + axis.y > 0.0 { extent } else { 0.0 };
+                    (edge.dot(axis).abs() - boundary).abs() < 0.1
+                })
+                .min_by(|a, b| a.1.distance2(start).total_cmp(&b.1.distance2(start)))
+                .ok_or_else(|| format!("no outer OSM alignment for {name}"))?;
+            // Match the TILES gateway inset while keeping the terminal sweep on the map.
+            let end = edge + (toward - edge) * (8.0 / (edge - toward).dot(axis));
+            let key = SourceKey::Authored(name);
+            let mut terminal = JunctionSpec::new(key, end);
+            terminal.position.z = plan.graph.junctions[&cut].position.z;
+            terminal.turn = plan.graph.junctions[&cut].turn;
+            plan.graph.junctions.insert(key, terminal);
+            add_authored_road(&mut plan.graph, key, [cut, key], class, None, 0);
+            plan.graph.links.get_mut(&key).unwrap().lineage.insert(way);
+            plan.graph.record(
+                "continue the gateway to the terrain edge on the OSM alignment",
+                &[cut, key],
+            );
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn fit_wet_approaches(plan: &mut TownPlan) -> Result<(), String> {
+    let graph = &mut plan.graph;
+    let [rim, town] = plan.crossings.as_mut_slice() else {
+        return Err("wet CITYMAP needs two Sava crossings".into());
+    };
+    let parkway = SourceKey::Authored("sava-far-bank-parkway");
+    let rim_ramp = SourceKey::Authored("sava-rim-park-ramp");
+    let town_ramp = SourceKey::Authored("sava-town-park-ramp");
+    let [park_west, park_east] = [
+        (SourceKey::Authored("sava-park-west"), vec2(953.0, 720.0)),
+        (SourceKey::Authored("sava-park-east"), vec2(1160.0, 607.0)),
+    ]
+    .map(|(key, point)| {
+        let junction = JunctionSpec::new(key, design_point(point, plan.config));
+        graph.junctions.insert(key, junction);
+        key
+    });
+    for (crossing, ramp, bank) in [(rim, rim_ramp, park_west), (town, town_ramp, park_east)] {
+        add_authored_road(
+            graph,
+            ramp,
+            [crossing.approaches_keys[1], bank],
+            RoadClass::Collector,
+            None,
+            0,
+        );
+        crossing.approaches_links[1] = ramp;
+        for link in crossing.approaches_links {
+            for key in graph.links[&link].endpoints {
+                let height = &mut graph.junctions.get_mut(&key).unwrap().position.z;
+                *height = height.max(10.6);
+            }
+        }
+    }
+    add_authored_road(
+        graph,
+        parkway,
+        [park_west, park_east],
+        RoadClass::Collector,
+        Some(design_point(vec2(1056.0, 650.0), plan.config)),
+        0,
+    );
+    graph.record(
+        "return the far-bank parkway to ground level between the bridge ramps",
+        &[rim_ramp, parkway, town_ramp],
+    );
+    Ok(())
+}
+
 fn water_reservations(
     river: &RiverReach,
     graph: &mut Graph,
@@ -1092,6 +1220,252 @@ pub(crate) fn design_point(point: Vec2, config: TownConfig) -> Vec2 {
     let baseline = TownConfig::default();
     let (lat, lon) = (baseline.latitude, baseline.longitude);
     point + (config.project(lat, lon) - baseline.project(lat, lon))
+}
+
+pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
+    // Use existing town-bank frontage for the northern and western reserves.
+    // In South, exchange the isolated river fringe for the streets closer to
+    // the town's jobs and suppliers on the east side.
+    for (district, edge, points) in [
+        (
+            "hraska",
+            0..1,
+            &[(1050., 2840.), (950., 2380.), (1500., 2340.)][..],
+        ),
+        (
+            "west",
+            7..8,
+            &[(690., 2210.), (535., 2090.), (550., 1730.)][..],
+        ),
+        (
+            "south",
+            0..9,
+            &[
+                (1370., 790.),
+                (1540., 690.),
+                (1640., 600.),
+                (1820., 600.),
+                (1990., 660.),
+                (2245., 770.),
+                (2610., 820.),
+                (2960., 1050.),
+                (3040., 1650.),
+                (2660., 1660.),
+                (2340., 1470.),
+                (1840., 1330.),
+                (1480., 1190.),
+            ][..],
+        ),
+        (
+            "employment",
+            0..2,
+            &[(2230., 2070.), (2300., 1940.), (2460., 1890.)][..],
+        ),
+    ] {
+        let area = plan
+            .districts
+            .iter_mut()
+            .find(|area| area.key == district)
+            .unwrap();
+        area.polygon.splice(
+            edge,
+            points
+                .iter()
+                .map(|&(x, y)| design_point(vec2(x, y), plan.config)),
+        );
+    }
+
+    // Keep curb maneuvers off the through links where the wet trace
+    // found a stopped tail and an upstream conflict.
+    for (id, span, reason) in [
+        (
+            350992954,
+            0,
+            "keep the South through link clear of curb parking",
+        ),
+        (
+            1426155807,
+            0,
+            "keep the Hraška through link clear of curb parking",
+        ),
+        (
+            461688158,
+            1,
+            "keep the Hraška school bend clear of curb parking",
+        ),
+    ] {
+        let key = SourceKey::Way { id, span };
+        if let Some(link) = plan.graph.links.get_mut(&key) {
+            link.class = RoadClass::Collector;
+            plan.graph.record(reason, &[key]);
+        }
+    }
+    round_hraska_school_bend(&mut plan.graph);
+    let fuel_frontage = SourceKey::Way { id: 72625754, span: 0 };
+    if plan.graph.links.contains_key(&fuel_frontage) {
+        let turnaround = SourceKey::Authored("coal-turnaround");
+        let south = SourceKey::Authored("coal-loading-frontage");
+        split_wet_road(&mut plan.graph, fuel_frontage, turnaround, south)?;
+        plan.graph.junctions.get_mut(&turnaround).unwrap().turn.back_turns = true;
+        plan.graph.record(
+            "provide a turnaround near the plant on the coal delivery road",
+            &[fuel_frontage, turnaround, south],
+        );
+    }
+    let hraska_egress = SourceKey::Node {
+        id: 4193639666,
+        rail: false,
+    };
+    if let Some(junction) = plan.graph.junctions.get_mut(&hraska_egress) {
+        junction.light = LightPolicy::Lights;
+        junction.turn.left_turns = false;
+        plan.graph.record(
+            "keep Hraška egress turns clear of the opposing green phase",
+            &[hraska_egress],
+        );
+    }
+    let ridge_culdesac = SourceKey::Way {
+        id: 419255437,
+        span: 0,
+    };
+    if let Some(link) = plan.graph.links.get_mut(&ridge_culdesac) {
+        link.class = RoadClass::Walk;
+        plan.graph.record(
+            "keep repeated stationary parking queues off the Hraška cul-de-sac",
+            &[ridge_culdesac],
+        );
+    }
+    connect_south_walk(&mut plan.graph)?;
+    let ridge = SourceKey::Node {
+        id: 4193639670,
+        rail: false,
+    };
+    let park = SourceKey::Authored("hraska-west-park");
+    if plan.graph.junctions.contains_key(&ridge) && plan.graph.junctions.contains_key(&park) {
+        let walk = SourceKey::Authored("hraska-rail-walk");
+        add_authored_road(&mut plan.graph, walk, [ridge, park], RoadClass::Walk, None, 0);
+        plan.graph.record(
+            "link Hraška homes to the eastern shops under the elevated railway",
+            &[ridge, park, walk],
+        );
+    }
+    Ok(())
+}
+
+fn round_hraska_school_bend(graph: &mut Graph) {
+    let approach = SourceKey::Way { id: 461688158, span: 1 };
+    let exit = SourceKey::Way { id: 1426155807, span: 0 };
+    let (Some(incoming), Some(outgoing)) = (graph.links.get(&approach), graph.links.get(&exit)) else {
+        return;
+    };
+    let [from, bend] = incoming.endpoints;
+    let [corner, to] = outgoing.endpoints;
+    if bend != corner {
+        return;
+    }
+    let from = graph.junctions[&from].position.xy();
+    let original = graph.junctions[&bend].position.xy();
+    let to = graph.junctions[&to].position.xy();
+    // Retain the Collector's storage and give both arms one tangent at the bend.
+    let at = original + (original - from).normalize() * 16.0;
+    let tangent = ((at - from).normalize() + (to - at).normalize()).normalize();
+    move_junction(graph, bend, at);
+    for (key, a, b, elbow) in [
+        (approach, from, at, at - tangent * (at.distance(from) * 0.5)),
+        (exit, at, to, at + tangent * (to.distance(at) * 0.5)),
+    ] {
+        let link = graph.links.get_mut(&key).unwrap();
+        link.elbow = Some(elbow);
+        link.points = curve(a, b, elbow).points(25).collect();
+    }
+    graph.record("round the Hraška school bend without a sharp turn between the two collectors", &[approach, bend, exit]);
+}
+
+fn connect_south_walk(graph: &mut Graph) -> Result<(), String> {
+    let west = SourceKey::Node {
+        id: 4193639611,
+        rail: false,
+    };
+    let avenue = SourceKey::Way {
+        id: 64047075,
+        span: 1,
+    };
+    let crossing = SourceKey::Authored("south-alpska-crossing");
+    let walk = SourceKey::Authored("south-alpska-walk");
+    let local = graph
+        .junctions
+        .get_mut(&west)
+        .ok_or("South footpath is missing its local street junction")?;
+    // Allow for the wider junction curb while retaining 65 m of driving lane
+    // on the local street. The source alignment is within the 8 m tolerance.
+    local.position.x += 4.0;
+    for link in graph
+        .links
+        .values_mut()
+        .filter(|link| link.endpoints.contains(&west))
+    {
+        let endpoint = if link.endpoints[0] == west {
+            0
+        } else {
+            link.points.len() - 1
+        };
+        link.points[endpoint] = local.position.xy();
+        link.realigned = true;
+    }
+    split_wet_road(graph, avenue, crossing, SourceKey::Authored("south-alpska-avenue"))?;
+    add_authored_road(graph, walk, [west, crossing], RoadClass::Walk, None, 0);
+    graph.record(
+        "connect South homes and shops to the Alpska sidewalks",
+        &[west, crossing, avenue, walk],
+    );
+    Ok(())
+}
+
+fn split_wet_road(
+    graph: &mut Graph,
+    road: SourceKey,
+    crossing: SourceKey,
+    tail: SourceKey,
+) -> Result<(), String> {
+    let north = graph.links.get_mut(&road).ok_or_else(|| format!("missing wet approach {road:?}"))?;
+    let start = north.points[0];
+    let end = *north.points.last().unwrap();
+    let middle = (start + end) * 0.5;
+    let direction = end - start;
+    let along = |sample: Vec2| (sample - middle).dot(direction);
+    let split = |points: &[Vec2]| {
+        let cut = points.partition_point(|&sample| along(sample) < 0.0);
+        let before = *points.get(cut.checked_sub(1)?)?;
+        let after = *points.get(cut)?;
+        let seam = before + (after - before) * (along(before) / (along(before) - along(after)));
+        Some((cut, seam))
+    };
+    let (cut, point) = split(&north.points).ok_or_else(|| format!("no centreline split on {road:?}"))?;
+    let (source_cut, seam) = split(&north.samples)
+        .ok_or_else(|| format!("source samples for {road:?} do not span the new junction"))?;
+    let mut south = north.clone();
+    south.key = tail;
+    south.samples = north.samples.split_off(source_cut);
+    south.samples.insert(0, seam);
+    south.points = north.points.split_off(cut);
+    south.points.insert(0, point);
+    south.endpoints[0] = crossing;
+    north.samples.push(seam);
+    north.points.push(point);
+    north.endpoints[1] = crossing;
+    for link in [north, &mut south] {
+        let (elbow, points, error) = fit(&link.points, 3.0);
+        if error > 3.0 {
+            return Err(format!("wet junction changed the alignment on {:?} by {error:.1} m", link.key));
+        }
+        link.elbow = elbow;
+        link.points = points;
+    }
+    let mut junction = JunctionSpec::new(crossing, point);
+    junction.light = LightPolicy::NoLights;
+    graph.junctions.insert(crossing, junction);
+    graph.links.insert(south.key, south);
+    Ok(())
 }
 
 fn districts(config: TownConfig) -> Vec<District> {

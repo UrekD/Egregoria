@@ -606,6 +606,13 @@ impl CargoBook {
             .unwrap_or_default()
     }
 
+    /// Live fleet assigned to this station, including trucks out on deliveries.
+    pub fn station_fleet(&self, station: BuildingID) -> impl Iterator<Item = VehicleID> + '_ {
+        self.station_trucks.iter().filter_map(move |(&id, truck)| {
+            (truck.station.building == station).then_some(id)
+        })
+    }
+
     /// Why a company's input is not here yet, if imports are involved.
     pub fn import_status(&self, company: SoulID) -> Option<ImportStatus> {
         let ordered = self
