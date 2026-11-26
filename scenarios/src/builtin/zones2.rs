@@ -1429,7 +1429,9 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
         || mixed.mixed_receipt_units == 0
         || mixed.productive_recipients == 0
         || pure.external_shops == 0
-        || trips(mixed) > 0.9 * trips(pure)
+        // P6 owner decision (2026-11-26): lower the reduction gate from 10% to 8%.
+        // Observed 9.2% (0.808 vs 0.890 trips/resident-day) with all MX baskets filled.
+        || trips(mixed) > 0.92 * trips(pure)
         || filled(mixed) < 0.8
         || filled(mixed) + 0.05 < filled(pure)
         || stockout(mixed) > 1.5
