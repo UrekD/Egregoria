@@ -1,6 +1,7 @@
 use super::height_override::{ConstructionCut, CutHeights};
 use super::terrain::TERRAIN_CHUNK_RESOLUTION;
 use crate::map::electricity_cache::ElectricityCache;
+use crate::map::pathfinding::WalkingRoutes;
 use crate::map::procgen::gen_exterior_house;
 use crate::map::reachability::DrivingReachability;
 use crate::map::{
@@ -100,6 +101,7 @@ pub struct Map {
     pub(crate) walking_topology_generation: u64,
     // Derived from lanes and turns. Map deserialization starts with an empty cache.
     pub(super) driving_reachability: OnceLock<DrivingReachability>,
+    pub(super) walking_routes: OnceLock<WalkingRoutes>,
     // Imported networks reserve usable lane length when rebuilding junction geometry.
     pub(super) import_lane_reserve: bool,
     // Saved as its own `lot_layout` entry so the map's encoding is unchanged.
@@ -193,6 +195,7 @@ impl Map {
                 .expect("map identities exhausted"),
             walking_topology_generation: 0,
             driving_reachability: OnceLock::new(),
+            walking_routes: OnceLock::new(),
             import_lane_reserve: false,
             lot_layout: LotLayout::default(),
             no_frontage: BTreeSet::new(),
@@ -1924,9 +1927,10 @@ impl Map {
 
     // Private mutating
 
-    fn lane_topology_changed(&mut self) {
+    pub(super) fn lane_topology_changed(&mut self) {
         self.walking_topology_generation += 1;
         self.driving_reachability.take();
+        self.walking_routes.take();
     }
 
     pub(crate) fn add_intersection(&mut self, pos: Vec3) -> IntersectionID {

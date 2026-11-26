@@ -133,7 +133,7 @@ pub(super) fn load_parismap(map: &mut Map) {
         intersection.update_turns(&map.lanes, &map.roads);
         map.subscribers.dispatch(UpdateType::Road, intersection);
     }
-    map.driving_reachability.take();
+    map.lane_topology_changed();
     map.electricity.topology_changed();
 
     info!(

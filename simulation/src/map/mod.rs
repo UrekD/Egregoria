@@ -68,6 +68,7 @@ mod land_site;
 mod light_policy;
 #[allow(clippy::module_inception)]
 mod map;
+mod indexed_astar;
 mod pathfinding;
 mod reachability;
 mod serializing;
