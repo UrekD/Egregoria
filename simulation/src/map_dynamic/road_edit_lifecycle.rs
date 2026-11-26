@@ -68,6 +68,7 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
     }
 
     let mut best = None;
+    let mut vehicle_turns = Vec::new();
     for id in intersections {
         work = work.checked_sub(1)?;
         let junction = map.get(id)?;
@@ -81,7 +82,14 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
             continue;
         }
         for turn in junction.turns() {
-            work = work.checked_sub(1 + turn.points.len())?;
+            work = work.checked_sub(1)?;
+            if turn.kind != TurnKind::Crosswalk {
+                if !vehicle_path && matches!(turn.kind, TurnKind::Driving | TurnKind::Rail) {
+                    vehicle_turns.push(turn);
+                }
+                continue;
+            }
+            work = work.checked_sub(turn.points.len())?;
             if let Some((projection, sidewalk, dir)) = crosswalk_exit(map, turn, position) {
                 let key = (
                     OrderedFloat(position.distance2(projection)),
@@ -98,21 +106,25 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
                         },
                     ));
                 }
-            } else if matches!(turn.kind, TurnKind::Driving | TurnKind::Rail) {
-                vehicle_path |= occupies_path(&turn.points, 2.0, position);
             }
         }
     }
-    Some(best.map_or_else(
-        || {
-            if vehicle_path {
-                PedestrianClearance::Hold
-            } else {
-                PedestrianClearance::Clear
-            }
-        },
-        |(_, crossing)| crossing,
-    ))
+    // A verified crossing already gives this walker a physical exit.
+    // Only inspect the vehicle sweeps when deciding whether an unmarked
+    // position can safely release its collider.
+    if let Some((_, crossing)) = best {
+        return Some(crossing);
+    }
+    if vehicle_path {
+        return Some(PedestrianClearance::Hold);
+    }
+    for turn in vehicle_turns {
+        work = work.checked_sub(turn.points.len())?;
+        if occupies_path(&turn.points, 2.0, position) {
+            return Some(PedestrianClearance::Hold);
+        }
+    }
+    Some(PedestrianClearance::Clear)
 }
 
 fn occupies_path(points: &geom::PolyLine3, half_width: f32, position: Vec3) -> bool {
@@ -179,4 +191,53 @@ pub(super) fn crosswalk_path_still_valid(
         && path
             .iter()
             .all(|&point| turn.points.project_dist2(point) < 0.01)
+}
+
+#[cfg(test)]
+#[test]
+fn p7_life_dense_junction_can_clear_a_cancelled_walker() {
+    use crate::map::{LanePatternBuilder, MapProject};
+    use crate::tests::TestCtx;
+    use geom::vec3;
+
+    let ctx = TestCtx::new();
+    let center = vec3(420.0, 420.0, 10.0);
+    let mut map = ctx.g.map_mut();
+    let pattern = LanePatternBuilder::new().n_lanes(3).build();
+    let (_, first) = map
+        .make_connection(
+            MapProject::ground(center),
+            MapProject::ground(center + vec3(275.0, 0.0, 0.0)),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    let id = map.roads()[first].src;
+    for spoke in 1..6 {
+        let angle = spoke as f32 * std::f32::consts::TAU / 6.0;
+        let (sin, cos) = angle.sin_cos();
+        map.make_connection(
+            MapProject {
+                kind: ProjectKind::Intersection(id),
+                pos: center,
+            },
+            MapProject::ground(center + vec3(275.0 * cos, 275.0 * sin, 0.0)),
+            None,
+            &pattern,
+        )
+        .unwrap();
+    }
+    let junction = map.get(id).unwrap();
+    let full_turn_work: usize = junction.turns().map(|turn| 1 + turn.points.len()).sum();
+    assert!(full_turn_work > LOCAL_WORK);
+    let crosswalk = junction
+        .turns()
+        .find(|turn| turn.kind == TurnKind::Crosswalk)
+        .unwrap();
+    let position = crosswalk.points.middle();
+    assert!(matches!(
+        pedestrian_clearance(&map, position),
+        PedestrianClearance::Crosswalk { traversal, .. }
+            if traversal.kind == TraverseKind::Turn(crosswalk.id)
+    ));
 }
