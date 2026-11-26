@@ -912,6 +912,12 @@ impl Router {
         self.trip_start.and(self.trip_origin)
     }
 
+    pub(crate) fn restore_trip_origin(&mut self, origin: Destination) {
+        if self.trip_start.is_some() {
+            self.trip_origin = Some(origin);
+        }
+    }
+
     /// `can_drive` for a car that keeps waiting for a route, evaluated again only when its
     /// inputs change: the nearest lanes and their reachability are fixed between lane edits.
     fn can_drive_cached(&mut self, map: &Map, from: Vec3, to: Vec3) -> bool {
@@ -1364,6 +1370,36 @@ mod tests {
     use common::saveload::{Bincode, Encoder};
     use geom::{vec2, vec3, Color};
     use prototypes::{ItemID, Money};
+
+    #[test]
+    fn vehicle_destination_mid_commute_origin_survives_save() {
+        let (mut ctx, human, car, workplace) = traffic1_stranded_driver();
+        let origin = Destination::Outside(vec3(85.0, 100.0, 0.0));
+        ctx.g.world.edit_human(human, |citizen| {
+            citizen.location = Location::Vehicle(car);
+            citizen.router.trip_start = Some(Tick(5));
+            citizen.router.trip_origin = Some(origin);
+            citizen.router.target_dest = Some(Destination::Outside(workplace));
+            citizen.router.trip_purpose = TripPurpose::Work;
+        });
+
+        let bytes = Bincode::encode(&ctx.g).unwrap();
+        let saved: crate::SimulationDeser = Bincode::decode(&bytes).unwrap();
+        let mut legacy: crate::SimulationDeser = Bincode::decode(&bytes).unwrap();
+        legacy.res.remove("trip_origins");
+        let legacy = legacy.into_sim().unwrap();
+        assert_eq!(legacy.get(human).unwrap().router.trip_start, Some(Tick(5)));
+        assert_eq!(legacy.get(human).unwrap().router.trip_origin(), None);
+
+        let restored = saved.into_sim().unwrap();
+        let citizen = restored.get(human).unwrap();
+        assert_eq!(citizen.location, Location::Vehicle(car));
+        assert_eq!(
+            citizen.router.target_dest,
+            Some(Destination::Outside(workplace))
+        );
+        assert_eq!(citizen.router.trip_origin(), Some(origin));
+    }
 
     #[test]
     fn e1_fix_replacing_a_pending_destination_resets_trip_purpose() {

@@ -87,6 +87,14 @@ impl RailTrips {
         self.waiting_items.is_empty() && self.trains.is_empty()
     }
 
+    pub(crate) fn valid_waiting_cargo(&self, waiting_cargo: u32) -> bool {
+        self.waiting_items
+            .values()
+            .map(|&units| u64::from(units))
+            .sum::<u64>()
+            <= u64::from(waiting_cargo)
+    }
+
     fn load_exports(&mut self, waiting_cargo: &mut u32, train: TrainID, position: Vec3) {
         let units = (*waiting_cargo).min(TRAIN_CAPACITY);
         let tracked: u32 = self.waiting_items.values().copied().sum();

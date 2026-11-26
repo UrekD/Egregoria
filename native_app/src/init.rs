@@ -81,6 +81,10 @@ fn register_ui_resources() {
     register_resource_noserialize::<InputMap>();
     register_world_resource::<InspectedEntity>();
     register_world_resource::<crate::gui::inspect::ShowVehicleRoute>();
+    register_world_resource::<crate::gui::inspect::VehicleOperators>();
+    register_world_resource::<crate::gui::inspect::VehicleRouteFrame>();
+    register_resource_noserialize::<crate::gui::selectable::VehiclePicker>();
+    register_world_reset(crate::gui::selectable::VehiclePicker::reset);
     register_world_resource::<InspectedBuilding>();
     register_world_resource::<InspectedRoad>();
     register_world_resource::<PlacementPreview>();

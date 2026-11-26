@@ -1,5 +1,4 @@
 use egui::{Color32, Context, Id, RichText};
-use geom::{Ray3, Vec2};
 use std::time::{Duration, Instant};
 
 use prototypes::Money;
@@ -14,26 +13,49 @@ use crate::uiworld::UiWorld;
 
 #[derive(Default)]
 pub(crate) struct VehicleHover {
-    sample: Option<(Instant, Vec2, Ray3, Option<String>)>,
+    hit: Option<selectable::VehicleHit>,
+    last_pick: Option<Instant>,
+    text: Option<(Instant, simulation::AnyEntity, String)>,
 }
 
 impl VehicleHover {
-    fn text(&mut self, sim: &Simulation, input: &InputMap) -> Option<&str> {
-        let ray = input.ray?;
-        let now = Instant::now();
-        if self
-            .sample
-            .as_ref()
-            .is_none_or(|(at, _, _, _)| now.duration_since(*at) >= Duration::from_millis(100))
-        {
-            let text = selectable::pick_vehicle(sim, input)
-                .and_then(|id| inspect::vehicle_tooltip(sim, id));
-            self.sample = Some((now, input.screen, ray, text));
+    fn text_at(
+        &mut self,
+        uiworld: &UiWorld,
+        sim: &Simulation,
+        input: &InputMap,
+        now: Instant,
+    ) -> Option<&str> {
+        const REFRESH: Duration = Duration::from_millis(100);
+        if input.ray.is_none() {
+            *self = Self::default();
+            return None;
         }
-        let (_, screen, sampled_ray, text) = self.sample.as_ref()?;
-        (*screen == input.screen && sampled_ray.from == ray.from && sampled_ray.dir == ray.dir)
-            .then_some(text.as_deref())
-            .flatten()
+
+        let mut picker = uiworld.write::<selectable::VehiclePicker>();
+        let previous = self.hit;
+        if !previous.is_some_and(|hit| picker.still_visible(sim, input, hit))
+            && (previous.is_some()
+                || self
+                    .last_pick
+                    .is_none_or(|at| now.duration_since(at) >= REFRESH))
+        {
+            self.last_pick = Some(now);
+            self.hit = picker.pick(sim, input);
+        }
+        drop(picker);
+
+        let Some(hit) = self.hit else {
+            self.text = None;
+            return None;
+        };
+        if self.text.as_ref().is_none_or(|(at, entity, _)| {
+            *entity != hit.entity || now.duration_since(*at) >= REFRESH
+        }) {
+            self.text = inspect::vehicle_tooltip(uiworld, sim, hit.entity)
+                .map(|text| (now, hit.entity, text));
+        }
+        self.text.as_ref().map(|(_, _, text)| text.as_str())
     }
 }
 
@@ -80,7 +102,7 @@ pub fn tooltip(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
         let input = uiworld.read::<InputMap>();
         if !goryak::pointer_over_ui(input.screen.x, input.screen.y) {
             let mut hover = uiworld.write::<VehicleHover>();
-            if let Some(text) = hover.text(sim, &input) {
+            if let Some(text) = hover.text_at(uiworld, sim, &input, Instant::now()) {
                 let pos = egui::pos2(input.screen.x, input.screen.y) / ui.pixels_per_point();
                 egui::Area::new(Id::new("tooltip_vehicle"))
                     .order(egui::Order::Tooltip)
@@ -111,4 +133,51 @@ pub fn tooltip(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
             ui.label(cost.to_string());
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use geom::{vec3, Ray3, Transform, Vec3};
+    use scenarios::ScenarioCtx;
+    use simulation::transportation::{spawn_driving_vehicle, VehicleKind};
+    use simulation::SimulationOptions;
+
+    #[test]
+    fn vehicle_destination_hover_tracks_camera_between_text_samples() {
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        let pos = vec3(100.0, 100.0, 100.0);
+        let id =
+            spawn_driving_vehicle(&mut ctx.sim, VehicleKind::Car, Transform::new(pos)).unwrap();
+        let mut input = InputMap::default();
+        input.ray = Some(Ray3::new(pos.up(24.0), -Vec3::Z));
+        let now = Instant::now();
+        let mut hover = VehicleHover::default();
+        crate::init::init();
+        let ui = UiWorld::with_defaults();
+        let text = hover
+            .text_at(&ui, &ctx.sim, &input, now)
+            .unwrap()
+            .to_owned();
+
+        ctx.sim.world_mut_unchecked().vehicles[id].speed.0 = 10.0;
+        ui.write::<inspect::VehicleRouteFrame>().clear();
+        input.ray = Some(Ray3::new(pos.up(23.0) + Vec3::X, -Vec3::Z));
+        assert_eq!(
+            hover.text_at(&ui, &ctx.sim, &input, now + Duration::from_millis(16)),
+            Some(text.as_str()),
+        );
+        assert_ne!(
+            hover.text_at(&ui, &ctx.sim, &input, now + Duration::from_millis(101)),
+            Some(text.as_str()),
+        );
+
+        input.ray = Some(Ray3::new(pos.up(24.0) + Vec3::X * 20.0, -Vec3::Z));
+        assert!(hover
+            .text_at(&ui, &ctx.sim, &input, now + Duration::from_millis(102))
+            .is_none());
+    }
 }

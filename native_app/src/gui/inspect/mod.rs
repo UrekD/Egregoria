@@ -19,7 +19,9 @@ mod inspect_utility;
 mod inspect_warehouse;
 mod inspect_vehicle;
 
-pub(crate) use inspect_vehicle::{draw_vehicle_route, vehicle_tooltip, ShowVehicleRoute};
+pub(crate) use inspect_vehicle::{
+    draw_vehicle_route, vehicle_tooltip, ShowVehicleRoute, VehicleOperators, VehicleRouteFrame,
+};
 
 pub fn new_inspector(uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("hud::inspector");

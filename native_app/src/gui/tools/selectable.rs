@@ -3,9 +3,19 @@ use crate::gui::{InspectedBuilding, InspectedEntity, InspectedRoad, Tool};
 use crate::inputmap::{InputAction, InputMap, SurfaceHits};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
-use engine::Tesselator;
-use geom::{Intersect, LinearColor, Ray3, Segment, Shape, Vec2, Vec3, AABB};
-use simulation::map::{Building, BuildingID, Map, ProjectFilter, ProjectKind, Road, RoadID};
+use common::{FastMap, FastSet};
+use engine::{GfxContext, Tesselator};
+use flat_spatial::Grid;
+use geom::{
+    vec3, Intersect, LinearColor, Ray3, Segment, Shape, Transform, Vec2, Vec3, AABB, AABB3,
+};
+use prototypes::{
+    try_prototype, FreightStationPrototype, GoodsCompanyPrototype, GrowableCompanyID,
+    GrowableCompanyPrototype, RenderAsset, RollingStockID, ServiceID,
+};
+use simulation::map::{
+    Building, BuildingID, BuildingKind, Map, ProjectFilter, ProjectKind, Road, RoadID,
+};
 use simulation::transportation::VehicleKind;
 use simulation::{AnyEntity, Simulation};
 use std::collections::BTreeSet;
@@ -34,19 +44,19 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
 
     if clicked && !inspected.dontclear {
         inspected.dist2 = f32::INFINITY;
-        inspected.e = pick_vehicle(sim, &inp);
+        inspected.e = uiworld
+            .write::<VehiclePicker>()
+            .pick(sim, &inp)
+            .map(|hit| hit.entity);
         if let Some(unproj) = inp.unprojected.filter(|_| inspected.e.is_none()) {
-            sim.world()
-                .query_selectable_pos()
-                .for_each(|(id, pos): (AnyEntity, Vec2)| {
-                    let dist2 = (pos - unproj.xy()).mag2();
-                    let rad = select_radius(id);
-                    if dist2 >= rad * rad || dist2 >= inspected.dist2 {
-                        return;
-                    }
+            for (id, human) in &sim.world().humans {
+                let dist2 = human.trans.pos.xy().distance2(unproj.xy());
+                let radius = select_radius(id.into());
+                if dist2 < radius * radius && dist2 < inspected.dist2 {
                     inspected.dist2 = dist2;
-                    inspected.e = Some(id);
-                });
+                    inspected.e = Some(id.into());
+                }
+            }
         }
     }
 
@@ -56,7 +66,18 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
             let map = sim.map();
             inspected_b.e = inp
                 .ray
-                .and_then(|ray| pick_growable(&map, ray, inp.surface_hits(map.environment())))
+                .and_then(|ray| {
+                    let picker = uiworld.read::<VehiclePicker>();
+                    let ray = normalize_pick_ray(ray)?;
+                    let (start, end) = visible_pick_depth(
+                        map.environment().bounds(),
+                        ray,
+                        inp.surface_hits(map.environment()),
+                    )?;
+                    picker
+                        .building_before(&map, ray, start, end)
+                        .map(|(_, id)| id)
+                })
                 .or_else(|| {
                     map.spatial_map()
                         .query(inp.unprojected?.xy(), ProjectFilter::BUILDING)
@@ -118,77 +139,403 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
     }
 }
 
-pub(crate) fn pick_vehicle(sim: &Simulation, input: &InputMap) -> Option<AnyEntity> {
-    let ray = input.ray?;
-    let dir = ray.dir.try_normalize()?;
-    let terrain_depth = input
-        .surface_hits(sim.map().environment())
-        .nearest()
-        .map_or(f32::INFINITY, |point| (point - ray.from).dot(dir));
-    let world = sim.world();
-    let vehicles = world.vehicles.iter().map(|(id, vehicle)| {
-        let trans = vehicle.trans;
-        let radius = match vehicle.vehicle.kind {
-            VehicleKind::Car => 2.8,
-            VehicleKind::Truck => 3.5,
-            VehicleKind::Bus => 4.5,
+#[cfg(test)]
+thread_local! {
+    static VEHICLE_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct VehicleHit {
+    pub(crate) entity: AnyEntity,
+    part: AnyEntity,
+}
+
+pub(crate) struct VehiclePicker {
+    snapshot: Option<(u64, usize, usize)>,
+    grid: Grid<AnyEntity, Vec2>,
+    radius: f32,
+    building_meshes: FastMap<BuildingKind, PickBuildingMesh>,
+    road_bounds: [Option<AABB3>; 3],
+}
+
+impl Default for VehiclePicker {
+    fn default() -> Self {
+        Self {
+            snapshot: None,
+            grid: Grid::new(64),
+            radius: 0.0,
+            building_meshes: FastMap::default(),
+            road_bounds: [None; 3],
+        }
+    }
+}
+
+impl VehiclePicker {
+    pub(crate) fn reset(uiworld: &UiWorld, _generation: u64) {
+        let mut picker = uiworld.write::<Self>();
+        picker.snapshot = None;
+        drop(picker.grid.clear());
+        picker.radius = 0.0;
+    }
+
+    pub(crate) fn load_models(&mut self, gfx: &mut GfxContext) {
+        fn bounds(gfx: &mut GfxContext, path: &std::path::Path) -> Option<AABB3> {
+            let mesh = gfx.mesh(path).ok()?;
+            mesh.lods.first().map(|lod| lod.aabb3)
+        }
+
+        let car = bounds(gfx, "simple_car.glb".as_ref());
+        let truck = bounds(gfx, "truck.glb".as_ref());
+        self.road_bounds = [
+            car,
+            truck,
+            truck.map(|b| AABB3::new(b.ll * 1.5, b.ur * 1.5)),
+        ];
+
+        let kinds = GoodsCompanyPrototype::iter()
+            .filter(|proto| legacy_growable(BuildingKind::GoodsCompany(proto.id)).is_none())
+            .map(|proto| (BuildingKind::GoodsCompany(proto.id), &proto.asset))
+            .chain(
+                FreightStationPrototype::iter()
+                    .map(|proto| (BuildingKind::RailFreightStation(proto.id), &proto.asset)),
+            );
+        for (kind, asset) in kinds {
+            if let RenderAsset::Mesh { path } = asset {
+                if let Some(mesh) = PickBuildingMesh::load(gfx, path) {
+                    self.building_meshes.insert(kind, mesh);
+                }
+            }
+        }
+        if let Some(mesh) = PickBuildingMesh::load(gfx, "external_trading.glb".as_ref()) {
+            self.building_meshes
+                .insert(BuildingKind::ExternalTrading, mesh);
+        }
+    }
+
+    fn road_bounds(&self, kind: VehicleKind) -> AABB3 {
+        let (index, length, width, height) = match kind {
+            VehicleKind::Car => (0, 2.8, 1.1, 1.9),
+            VehicleKind::Truck => (1, 4.0, 1.4, 3.7),
+            VehicleKind::Bus => (2, 6.0, 2.1, 5.6),
         };
-        (AnyEntity::VehicleID(id), trans.pos.up(0.8), radius)
-    });
-    let trains = world.trains.iter().map(|(id, train)| {
-        (AnyEntity::TrainID(id), train.trans.pos.up(1.0), 5.0)
-    });
-    let wagons = world.wagons.iter().map(|(id, wagon)| {
-        (AnyEntity::WagonID(id), wagon.trans.pos.up(1.0), 5.0)
-    });
-    vehicles.chain(trains).chain(wagons).filter_map(|(id, center, radius)| {
-        let delta = center - ray.from;
-        let center_depth = delta.dot(dir);
-        let radius2 = radius * radius;
-        let offset2 = delta.cross(dir).mag2();
-        if offset2 > radius2 {
+        self.road_bounds[index]
+            .unwrap_or_else(|| AABB3::new(vec3(-length, -width, 0.0), vec3(length, width, height)))
+    }
+
+    fn rail_bounds(id: RollingStockID) -> Option<AABB3> {
+        let stock = try_prototype(id)?;
+        if !matches!(stock.asset, RenderAsset::Mesh { .. }) {
             return None;
         }
-        let front = center_depth - (radius2 - offset2).sqrt();
-        (front >= 0.0 && front <= terrain_depth).then_some((id, front))
-    }).min_by(|a, b| a.1.total_cmp(&b.1)).map(|(id, _)| id)
+        // Stock longitudinal dimensions match the rendered consist. Using the
+        // mesh LOD's AABB directly would ignore its glTF node transforms.
+        let half = stock.length * 0.5;
+        Some(AABB3::new(vec3(-half, -2.0, 0.0), vec3(half, 2.0, 5.0)))
+    }
+
+    fn index_snapshot(&mut self, sim: &Simulation) {
+        let world = sim.world();
+        let snapshot = (sim.get_tick(), world.vehicles.len(), world.wagons.len());
+        if self.snapshot == Some(snapshot) {
+            return;
+        }
+        #[cfg(test)]
+        VEHICLE_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+        self.snapshot = Some(snapshot);
+        drop(self.grid.clear());
+        self.radius = 0.0;
+        for (id, vehicle) in &world.vehicles {
+            let bounds = self.road_bounds(vehicle.vehicle.kind);
+            self.radius = self.radius.max(pick_radius(bounds, vehicle.trans));
+            self.grid.insert(vehicle.trans.pos.xy(), id.into());
+        }
+        for (id, wagon) in &world.wagons {
+            let Some(bounds) = Self::rail_bounds(wagon.wagon.rolling_stock) else {
+                continue;
+            };
+            self.radius = self.radius.max(pick_radius(bounds, wagon.trans));
+            self.grid.insert(wagon.trans.pos.xy(), id.into());
+        }
+    }
+
+    pub(crate) fn pick(&mut self, sim: &Simulation, input: &InputMap) -> Option<VehicleHit> {
+        let map = sim.map();
+        let (ray, start, end) = vehicle_ray(&map, input)?;
+        self.index_snapshot(sim);
+        let segment = ray_segment(ray, start, end);
+        let mut visited = FastSet::default();
+        let (hit, depth) = pick_query_bounds(segment)
+            .map(|query| query.expand(self.radius))
+            .flat_map(|query| self.grid.query_aabb(query.ll, query.ur))
+            .filter(|(handle, _)| visited.insert(*handle))
+            .filter_map(|(handle, _)| self.grid.get(handle))
+            .filter_map(|(_, &part)| self.part_depth(sim, ray, part))
+            .filter(|(_, depth)| *depth <= end)
+            .min_by(|a, b| a.1.total_cmp(&b.1))?;
+        self.building_before(&map, ray, start, depth)
+            .is_none()
+            .then_some(hit)
+    }
+
+    pub(crate) fn still_visible(
+        &self,
+        sim: &Simulation,
+        input: &InputMap,
+        hit: VehicleHit,
+    ) -> bool {
+        let map = sim.map();
+        let Some((ray, start, end)) = vehicle_ray(&map, input) else {
+            return false;
+        };
+        self.part_depth(sim, ray, hit.part)
+            .is_some_and(|(found, depth)| {
+                found.entity == hit.entity
+                    && depth <= end
+                    && self.building_before(&map, ray, start, depth).is_none()
+            })
+    }
+
+    fn part_depth(
+        &self,
+        sim: &Simulation,
+        ray: Ray3,
+        part: AnyEntity,
+    ) -> Option<(VehicleHit, f32)> {
+        let (entity, depth) = match part {
+            AnyEntity::VehicleID(id) => {
+                let vehicle = sim.get(id)?;
+                let bounds = self.road_bounds(vehicle.vehicle.kind);
+                (part, instance_depth(ray, vehicle.trans, bounds)?)
+            }
+            AnyEntity::WagonID(id) => {
+                let wagon = sim.get(id)?;
+                let leader = wagon.itfollower.leader;
+                sim.get(leader)?;
+                let bounds = Self::rail_bounds(wagon.wagon.rolling_stock)?;
+                (leader.into(), instance_depth(ray, wagon.trans, bounds)?)
+            }
+            _ => return None,
+        };
+        Some((VehicleHit { entity, part }, depth))
+    }
+
+    fn building_before(
+        &self,
+        map: &Map,
+        ray: Ray3,
+        start: f32,
+        end: f32,
+    ) -> Option<(f32, BuildingID)> {
+        if end < start {
+            return None;
+        }
+        let segment = ray_segment(ray, start, end);
+        let candidates: BTreeSet<_> = pick_query_bounds(segment)
+            .flat_map(|bounds| map.spatial_map().query(bounds, ProjectFilter::BUILDING))
+            .filter_map(|project| project.as_building())
+            .collect();
+        candidates
+            .into_iter()
+            .filter_map(|id| {
+                let building = map.get(id)?;
+                if !building.obb.intersects(&segment) {
+                    return None;
+                }
+                let model = self.building_meshes.get(&building.kind);
+                building_depth(building, ray, start..=end, model).map(|depth| (depth, id))
+            })
+            .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
+    }
+}
+
+fn normalize_pick_ray(ray: Ray3) -> Option<Ray3> {
+    let length = ray.dir.mag();
+    (ray.from.is_finite() && length.is_finite() && length > 0.0)
+        .then(|| Ray3::new(ray.from, ray.dir / length))
+}
+
+fn vehicle_ray(map: &Map, input: &InputMap) -> Option<(Ray3, f32, f32)> {
+    let ray = normalize_pick_ray(input.ray?)?;
+    let (start, end) = visible_pick_depth(
+        map.environment().bounds(),
+        ray,
+        input.surface_hits(map.environment()),
+    )?;
+    Some((ray, start, end))
+}
+
+fn ray_segment(ray: Ray3, start: f32, end: f32) -> Segment {
+    Segment::new(
+        (ray.from + ray.dir * start).xy(),
+        (ray.from + ray.dir * end).xy(),
+    )
+}
+
+fn instance_ray(ray: Ray3, transform: Transform) -> Option<Ray3> {
+    // Match the instanced mesh shader's local axes, grade and uniform scale.
+    let scale = transform.dir.mag();
+    let forward = transform.dir.try_normalize()?;
+    let left = (-forward.perp_up()).try_normalize()?;
+    let up = forward.cross(left);
+    let local = |v: Vec3| vec3(v.dot(forward), v.dot(left), v.dot(up)) / scale;
+    Some(Ray3::new(local(ray.from - transform.pos), local(ray.dir)))
+}
+
+fn instance_depth(ray: Ray3, transform: Transform, bounds: AABB3) -> Option<f32> {
+    box_depth(instance_ray(ray, transform)?, bounds)
+}
+
+fn box_depth(ray: Ray3, bounds: AABB3) -> Option<f32> {
+    // Slabs parallel to the ray still admit points lying exactly on the box.
+    let mut start = 0.0_f32;
+    let mut end = f32::INFINITY;
+    for (origin, speed, low, high) in [
+        (ray.from.x, ray.dir.x, bounds.ll.x, bounds.ur.x),
+        (ray.from.y, ray.dir.y, bounds.ll.y, bounds.ur.y),
+        (ray.from.z, ray.dir.z, bounds.ll.z, bounds.ur.z),
+    ] {
+        if speed == 0.0 {
+            if !(low..=high).contains(&origin) {
+                return None;
+            }
+        } else {
+            let a = (low - origin) / speed;
+            let b = (high - origin) / speed;
+            start = start.max(a.min(b));
+            end = end.min(a.max(b));
+        }
+    }
+    (start <= end).then_some(start)
+}
+
+fn pick_radius(bounds: AABB3, transform: Transform) -> f32 {
+    bounds.ll.abs().max(bounds.ur.abs()).mag() * transform.dir.mag()
+}
+
+fn legacy_growable(kind: BuildingKind) -> Option<&'static GrowableCompanyPrototype> {
+    let BuildingKind::GoodsCompany(id) = kind else {
+        return None;
+    };
+    try_prototype(GrowableCompanyID::from(id)).filter(|proto| proto.growable)
+}
+
+struct PickBuildingMesh {
+    bounds: AABB3,
+    triangles: Vec<[Vec3; 3]>,
+}
+
+impl PickBuildingMesh {
+    fn load(gfx: &mut GfxContext, path: &std::path::Path) -> Option<Self> {
+        use engine::meshload::{find_nodes, load_mesh_with_properties};
+        let (_, model) = load_mesh_with_properties(gfx, path, false).ok()?;
+        let document = &model.gltf_doc;
+        let scene = document.default_scene()?;
+        let mut triangles = Vec::with_capacity(model.n_triangles);
+        for (node, lod, _, transform, _) in
+            find_nodes(&scene, |id| document.nodes().nth(id).unwrap())
+        {
+            let Some(mesh) = node.mesh().filter(|_| lod == 0) else {
+                continue;
+            };
+            for primitive in mesh.primitives() {
+                let reader =
+                    primitive.reader(|b| Some(&model.gltf_data.get(b.index())?.0[..b.length()]));
+                let (Some(positions), Some(indices)) =
+                    (reader.read_positions(), reader.read_indices())
+                else {
+                    continue;
+                };
+                let vertices: Vec<_> = positions
+                    .map(|point| {
+                        let point = transform * Vec3::from(point).w(1.0);
+                        point.xyz() / point.w
+                    })
+                    .collect();
+                let indices: Vec<_> = indices.into_u32().collect();
+                triangles.extend(indices.chunks_exact(3).map(|tri| {
+                    [
+                        vertices[tri[0] as usize],
+                        vertices[tri[1] as usize],
+                        vertices[tri[2] as usize],
+                    ]
+                }));
+            }
+        }
+        let first = triangles.first()?[0];
+        let bounds = triangles
+            .iter()
+            .flatten()
+            .copied()
+            .fold(AABB3::new(first, first), AABB3::union_vec);
+        Some(Self { bounds, triangles })
+    }
+
+    fn depth(&self, ray: Ray3, range: RangeInclusive<f32>) -> Option<f32> {
+        if box_depth(ray, self.bounds)? > *range.end() {
+            return None;
+        }
+        self.triangles
+            .iter()
+            .filter_map(|&[a, b, c]| triangle_hit(ray, a, b, c, true))
+            .filter(|depth| range.contains(depth))
+            .min_by(f32::total_cmp)
+    }
+}
+
+fn building_depth(
+    building: &Building,
+    ray: Ray3,
+    range: RangeInclusive<f32>,
+    model: Option<&PickBuildingMesh>,
+) -> Option<f32> {
+    if building.development().is_some() {
+        return PreparedShell::new(building)?.ray_depth(ray, range);
+    }
+    let center = building.obb.center().z(building.height);
+    let transform = Transform::new_dir(center, building.obb.axis()[0].try_normalize()?.z0());
+    if let Some(model) = model {
+        return model.depth(instance_ray(ray, transform)?, range);
+    }
+    let growable = legacy_growable(building.kind);
+    let has_shell = building
+        .mesh
+        .faces
+        .iter()
+        .flat_map(|(face, _)| face)
+        .any(|point| point.z > building.height + 0.2);
+    let flat_sprite = match building.kind {
+        BuildingKind::GoodsCompany(id) => try_prototype(id).is_some_and(|proto| {
+            matches!(proto.asset, RenderAsset::Sprite { .. })
+                && proto.zone.is_none()
+                && proto.storage.is_none()
+                && try_prototype(ServiceID::from(id)).is_none()
+        }),
+        _ => false,
+    };
+    if growable.is_none() && (has_shell || flat_sprite) {
+        return building
+            .mesh
+            .faces
+            .iter()
+            .flat_map(|(face, _)| face_fan(face.len()).map(move |tri| tri.map(|i| face[i])))
+            .filter_map(|[a, b, c]| triangle_hit(ray, a, b, c, true))
+            .filter(|depth| range.contains(depth))
+            .min_by(f32::total_cmp);
+    }
+
+    // The legacy renderer uses this volume for growable and placeholder buildings.
+    let [width, length] = building.obb.axis().map(Vec2::mag);
+    let height = (width.min(length) * 0.45).clamp(3.0, 18.0)
+        * (1.0 + f32::from(growable.map_or(0, |proto| proto.level.saturating_sub(1))) * 0.45);
+    let bounds = AABB3::new(
+        vec3(-width * 0.5, -length * 0.5, 0.0),
+        vec3(width * 0.5, length * 0.5, height),
+    );
+    instance_depth(ray, transform, bounds).filter(|depth| range.contains(depth))
 }
 
 // The orbit camera's maximum normal eye offset is about 1.7 km.
 const GROWABLE_PICK_RANGE_M: f32 = 4096.0;
-
-fn pick_growable(map: &Map, ray: Ray3, hits: SurfaceHits) -> Option<BuildingID> {
-    if !ray.from.is_finite() || !ray.dir.is_finite() {
-        return None;
-    }
-    let length = ray.dir.mag();
-    if !length.is_finite() || length == 0.0 {
-        return None;
-    }
-    let ray = Ray3::new(ray.from, ray.dir / length);
-    let (start, end) = visible_pick_depth(map.environment().bounds(), ray, hits)?;
-
-    let first = (ray.from + start * ray.dir).xy();
-    let last = (ray.from + end * ray.dir).xy();
-    let footprint_ray = Segment::new(first, last);
-    let candidates: BTreeSet<_> = pick_query_bounds(footprint_ray)
-        .flat_map(|bounds| map.spatial_map().query(bounds, ProjectFilter::BUILDING))
-        .filter_map(|project| project.as_building())
-        .collect();
-    candidates
-        .into_iter()
-        .filter_map(|id| {
-            let building = map.get(id)?;
-            if !building.obb.intersects(&footprint_ray) {
-                return None;
-            }
-            PreparedShell::new(building)?
-                .ray_depth(ray, start..=end)
-                .map(|depth| (depth, id))
-        })
-        .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
-        .map(|(_, id)| id)
-}
 
 fn pick_query_bounds(segment: Segment) -> impl Iterator<Item = AABB> {
     // One spatial-grid cell width per query. Each box touches a fixed number
@@ -532,6 +879,126 @@ pub(crate) mod tests {
         selectable(sim, &ui);
         let selected = ui.read::<InspectedBuilding>().e;
         selected
+    }
+
+    #[test]
+    fn vehicle_destination_pick_uses_rendered_rail_stock() {
+        use prototypes::RollingStockID;
+        use simulation::world_command::WorldCommand;
+
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 2,
+            ..SimulationOptions::LEGACY
+        });
+        let lane = {
+            let mut map = ctx.sim.write::<Map>();
+            let endpoint = |x| MapProject {
+                pos: vec3(x, 100.0, 50.0),
+                kind: ProjectKind::Ground,
+            };
+            let (_, road) = map
+                .make_connection(
+                    endpoint(60.0),
+                    endpoint(360.0),
+                    None,
+                    &LanePatternBuilder {
+                        rail: true,
+                        ..Default::default()
+                    }
+                    .build(),
+                )
+                .unwrap();
+            let (lane, _) = map
+                .get(road)
+                .unwrap()
+                .lanes_iter()
+                .find(|&(_, kind)| kind == simulation::map::LaneKind::Rail)
+                .unwrap();
+            lane
+        };
+        let stock =
+            ["locomotive", "freight-wagon", "passenger-emu-middle"].map(RollingStockID::new);
+        WorldCommand::SpawnTrain {
+            wagons: stock.to_vec(),
+            lane,
+            dist: 180.0,
+        }
+        .apply(&mut ctx.sim);
+        let train = ctx.sim.world().trains.keys().next().unwrap();
+        let mut input = InputMap::default();
+        let mut picker = VehiclePicker::default();
+        for (&stock, offset) in stock.iter().skip(1).zip([8.0, 13.5]) {
+            let wagon = ctx
+                .sim
+                .world()
+                .wagons
+                .values()
+                .find(|wagon| wagon.wagon.rolling_stock == stock)
+                .unwrap();
+            let end = wagon.trans.pos + wagon.trans.dir * offset;
+            input.ray = Some(Ray3::new(end.up(18.0), -Vec3::Z));
+            assert_eq!(
+                picker.pick(&ctx.sim, &input).map(|hit| hit.entity),
+                Some(train.into()),
+                "{stock:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn vehicle_destination_building_blocks_hover_and_hand_click() {
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        let mut buildings = Buildings::default();
+        let building = buildings.insert_with_key(|id| tower(id, 50.0, 35.0));
+        ctx.sim
+            .insert(map_with_buildings(dry_environment(), buildings));
+        let position = vec3(95.0, 100.0, -4.0);
+        let car = spawn_driving_vehicle(
+            &mut ctx.sim,
+            VehicleKind::Car,
+            geom::Transform::new(position),
+        )
+        .unwrap();
+        let camera = vec3(15.0, 100.0, 28.0);
+        let ray = Ray3::new(camera, (position.up(1.0) - camera).normalize());
+        let map = ctx.sim.map();
+        let mut input = InputMap::default();
+        let mut picker = VehiclePicker::default();
+        input.set_world_ray(Some(ray), &map, false);
+        assert_eq!(picker.pick(&ctx.sim, &input).map(|hit| hit.entity), None);
+        assert_eq!(click_building(&ctx.sim, ray, &map), Some(building));
+
+        let clear_ray = Ray3::new(position.up(24.0), -Vec3::Z);
+        input.set_world_ray(Some(clear_ray), &map, false);
+        assert_eq!(
+            picker.pick(&ctx.sim, &input).map(|hit| hit.entity),
+            Some(car.into())
+        );
+    }
+
+    #[test]
+    fn vehicle_destination_repeated_empty_queries_reuse_broad_phase() {
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        spawn_driving_vehicle(
+            &mut ctx.sim,
+            VehicleKind::Car,
+            geom::Transform::new(vec3(80.0, 80.0, 100.0)),
+        )
+        .unwrap();
+        VEHICLE_SCAN_COUNT.with(|count| count.set(0));
+        let mut input = InputMap::default();
+        let mut picker = VehiclePicker::default();
+        for x in [130.0, 131.0, 140.0] {
+            input.ray = Some(Ray3::new(vec3(x, 150.0, 150.0), -Vec3::Z));
+            assert_eq!(picker.pick(&ctx.sim, &input).map(|hit| hit.entity), None);
+        }
+        VEHICLE_SCAN_COUNT.with(|count| assert_eq!(count.get(), 1));
     }
 
     #[test]

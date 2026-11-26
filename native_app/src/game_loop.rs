@@ -240,6 +240,9 @@ impl engine::framework::State for State {
         drop(bindings);
 
         uiworld.insert(UiTextures::new(&mut ctx.gfx, &mut ctx.yakui));
+        uiworld
+            .write::<gui::selectable::VehiclePicker>()
+            .load_models(&mut ctx.gfx);
 
         uiworld.insert(camera.camera);
         uiworld.insert(camera);
@@ -351,6 +354,7 @@ impl engine::framework::State for State {
             let commands_observed = state.update_world(ctx, sim, scripted, view_input, prep_start);
             let yakui_width =
                 ctx.yakui.yakui.layout_dom().unscaled_viewport().size().x / ctx.yakui.zoom_factor;
+            state.uiw.write::<gui::inspect::VehicleRouteFrame>().clear();
             ctx.present_with_gfx(
                 state,
                 |state, frame| state.render_world(frame, sim),

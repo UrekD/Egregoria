@@ -45,6 +45,11 @@ pub fn vehicle_hold_reason(
     }
 
     vehicle.it.get_point()?;
+    if junction_admission::controls_road_decision(map, &vehicle.it, vehicle.trans.pos) {
+        // Configured admission owns this decision. Nearby vehicles and the lane
+        // sign cannot distinguish a conflict, dwell, or blocked receiving lane.
+        return Some(QueueHoldReason::Unknown);
+    }
     let grid = sim.read::<TransportGrid>();
     let collider = vehicle.collider?.0;
     let (_, own_state) = grid.get(collider)?;
@@ -790,5 +795,70 @@ fn p7_unruled_panic_keeps_stock_gridlock_recovery() {
         );
         assert_eq!(drive(panic(), &[leader, (crossing_pos, &crossing)]), 9.0);
         assert!(drive(panic(), &[leader, (crossing_pos, &above)]) > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod vehicle_destination_tests {
+    use super::*;
+    use crate::map::{ApproachRole, JunctionRules, TrafficControl, TurnKind};
+    use crate::tests::TestCtx;
+    use crate::transportation::{spawn_driving_vehicle, VehicleKind};
+    use geom::vec3;
+
+    #[test]
+    fn vehicle_destination_configured_stop_uses_generic_hold_without_trace() {
+        let mut ctx = TestCtx::new();
+        let center = vec3(270.0, 180.0, 0.0);
+        ctx.build_roads(&[vec3(70.0, 180.0, 0.0), center, vec3(470.0, 180.0, 0.0)]);
+        ctx.build_roads(&[center, vec3(270.0, 390.0, 0.0)]);
+        let (turn, road, entry, start, itinerary) = {
+            let map = ctx.g.map();
+            let intersection = map
+                .intersections()
+                .values()
+                .find(|intersection| intersection.pos.xy() == center.xy())
+                .unwrap();
+            let turn = intersection
+                .turns()
+                .find(|turn| turn.kind == TurnKind::Driving)
+                .unwrap()
+                .id;
+            let lane = map.get(turn.src).unwrap();
+            let entry = lane.control_point();
+            let start = lane.points.point_along(lane.points.length() - 3.0);
+            let itinerary = Itinerary::route_between_lanes(
+                ctx.g.read::<GameTime>().tick,
+                &map,
+                (turn.src, lane.points.length() - 3.0),
+                (turn.dst, 30.0),
+            )
+            .unwrap();
+            (turn, lane.parent, entry, start, itinerary)
+        };
+        ctx.g.map_mut().lanes[turn.src].control = TrafficControl::StopSign;
+        let vehicle = spawn_driving_vehicle(
+            &mut ctx.g,
+            VehicleKind::Car,
+            Transform::new_dir(start, (entry - start).normalize()),
+        )
+        .unwrap();
+        ctx.g.world.vehicles[vehicle].it = itinerary;
+
+        assert_eq!(
+            vehicle_hold_reason(&ctx.g, &ctx.g.map(), vehicle),
+            Some(QueueHoldReason::StopDwell)
+        );
+        let rules = JunctionRules::new(vec![(road, ApproachRole::Stop)], Vec::new()).unwrap();
+        ctx.g.map_mut().install_junction_rules(turn.parent, rules);
+        let map = ctx.g.map();
+        let itinerary = &ctx.g.get(vehicle).unwrap().it;
+        assert!(junction_admission::controls_road_decision(
+            &map, itinerary, start
+        ));
+        assert_eq!(
+            vehicle_hold_reason(&ctx.g, &map, vehicle),
+            Some(QueueHoldReason::Unknown)
+        );
     }
 }
