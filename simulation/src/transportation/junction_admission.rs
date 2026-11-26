@@ -21,6 +21,9 @@ const MAX_TURN_SEGMENT_PAIRS: usize = 16_384;
 const STOP_DWELL: u64 = game_secs_to_ticks(1);
 const AGE_PRIORITY: u64 = game_secs_to_ticks(60);
 const GAP: f32 = 0.8;
+pub(crate) fn roundabout_exit_storage() -> f32 {
+    super::VehicleKind::Bus.width() + GAP
+}
 const HOLD_TOLERANCE: f32 = 0.04;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]

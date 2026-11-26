@@ -1,11 +1,12 @@
 use crate::map::{
     Intersection, IntersectionID, LaneID, LaneKind, Lanes, Road, Roads, ROAD_Z_OFFSET,
 };
-use geom::{PolyLine3, Radians, Vec2};
+use geom::{Intersect, PolyLine3, Polygon, Radians, Segment, Shape, Vec2};
 use geom::{Spline, Vec3};
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
 use std::cmp::Ordering;
+use std::collections::BTreeSet;
 use std::f32::consts::TAU;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Hash)]
@@ -167,14 +168,18 @@ impl Turn {
 pub struct RoundaboutGeometry {
     pub center: Vec3,
     pub radius: f32,
+    transition_scale: f32,
 }
 
 impl RoundaboutGeometry {
-    pub(super) fn new(intersection: &Intersection, roads: &Roads) -> Option<Self> {
+    pub(in crate::map) fn new(intersection: &Intersection, roads: &Roads) -> Option<Self> {
         let policy = intersection
             .turn_policy
             .roundabout
             .filter(|_| intersection.is_roundabout())?;
+        if intersection.roads.len() > 16 || intersection.has_rail_arm(roads) {
+            return None;
+        }
         let center = intersection.pos.up(ROAD_Z_OFFSET);
         // Short roads may clip the requested setback. Keep the ring inside
         // their mouths so that entries always approach it from outside.
@@ -189,7 +194,97 @@ impl RoundaboutGeometry {
             })
             .fold(f32::INFINITY, f32::min);
         let radius = policy.radius.min(available);
-        (radius >= 4.0).then_some(Self { center, radius })
+        (radius >= 4.0).then_some(Self {
+            center,
+            radius,
+            transition_scale: 1.0,
+        })
+    }
+
+    pub(super) fn tighter_transitions(self) -> Self {
+        Self {
+            transition_scale: 1.0 / 3.0,
+            ..self
+        }
+    }
+
+    pub(super) fn fits(
+        self,
+        junction: &Intersection,
+        roads: &Roads,
+        turns: &BTreeSet<Turn>,
+    ) -> bool {
+        let outline = |sidewalk| {
+            let mut polygon = Polygon::default();
+            for (&from, &to) in junction
+                .roads
+                .iter()
+                .zip(junction.roads.iter().cycle().skip(1))
+            {
+                polygon.extend(
+                    self.road_corner(junction.id, &roads[from], &roads[to], sidewalk)?
+                        .map(Vec3::xy),
+                );
+            }
+            Some(polygon)
+        };
+        let Some(asphalt) = outline(false) else {
+            return false;
+        };
+        let Some(outer) = outline(true) else {
+            return false;
+        };
+        let center = self.center.xy();
+        let asphalt_edges = asphalt.segments().collect::<Vec<_>>();
+        if !asphalt.contains(center)
+            || asphalt_edges
+                .iter()
+                .any(|edge| edge.project(center).distance(center) < self.radius)
+            || !simple_outline(&asphalt_edges)
+            || !simple_outline(&outer.segments().collect::<Vec<_>>())
+        {
+            return false;
+        }
+
+        // Each lane has one fixed transition to or from the common arc.
+        // Check the full straight segments consumed by movement, including
+        // any excursions between tessellation vertices.
+        let mut entries = BTreeSet::new();
+        let mut exits = BTreeSet::new();
+        for turn in turns.iter().filter(|turn| turn.kind == TurnKind::Driving) {
+            let points = turn.points.as_slice();
+            for (unique, transition, mouth) in [
+                (
+                    entries.insert(turn.id.src),
+                    &points[..=TRANSITION_STEPS],
+                    points[0],
+                ),
+                (
+                    exits.insert(turn.id.dst),
+                    &points[points.len() - TRANSITION_STEPS - 1..],
+                    *points.last().unwrap(),
+                ),
+            ] {
+                if !unique {
+                    continue;
+                }
+                for points in transition.windows(2) {
+                    let sweep = Segment::new(points[0].xy(), points[1].xy());
+                    if sweep.project(center).distance(center) <= self.island_radius()
+                        || !asphalt.contains(sweep.center())
+                        || asphalt_edges.iter().any(|edge| {
+                            sweep.bbox().intersects(&edge.bbox())
+                                && sweep
+                                    .intersection_point(edge)
+                                    .is_some_and(|p| !p.is_close(mouth.xy(), 0.001))
+                        })
+                    {
+                        return false;
+                    }
+                }
+            }
+        }
+        true
     }
 
     pub fn curb_radius(self) -> f32 {
@@ -277,17 +372,20 @@ impl RoundaboutGeometry {
         let a = Radians(start).vec2();
         let b = Radians(start + sweep).vec2();
         let center = self.center;
-        let enter = Turn::spline(
+        let mut enter = Turn::spline(
             from.xy(),
             center.xy() + a * radius,
             into,
             -a.perpendicular(),
         );
-        let leave = Turn::spline(center.xy() + b * radius, to.xy(), -b.perpendicular(), out);
+        let mut leave = Turn::spline(center.xy() + b * radius, to.xy(), -b.perpendicular(), out);
+        for transition in [&mut enter, &mut leave] {
+            transition.from_derivative *= self.transition_scale;
+            transition.to_derivative *= self.transition_scale;
+        }
         let steps = (sweep / 0.065).ceil().max(1.0) as usize;
         let mut points = Vec::with_capacity(steps + 32);
         // Fixed tessellation also preserves the tangent on both sides of each arc join.
-        const TRANSITION_STEPS: usize = 16;
         for i in 0..TRANSITION_STEPS {
             let t = i as f32 / TRANSITION_STEPS as f32;
             points.push(enter.get(t).z(from.z + (center.z - from.z) * t));
@@ -303,4 +401,23 @@ impl RoundaboutGeometry {
         points.push(to);
         points.into_iter()
     }
+}
+
+const TRANSITION_STEPS: usize = 16;
+
+fn simple_outline(edges: &[Segment]) -> bool {
+    if edges.len() < 3 {
+        return false;
+    }
+    edges.iter().enumerate().all(|(index, edge)| {
+        edges
+            .iter()
+            .enumerate()
+            .skip(index + 2)
+            .all(|(other_index, other)| {
+                (index == 0 && other_index == edges.len() - 1)
+                    || !edge.bbox().intersects(&other.bbox())
+                    || !edge.intersects(other)
+            })
+    })
 }

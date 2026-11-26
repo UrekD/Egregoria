@@ -7,7 +7,7 @@ use slotmapd::Key;
 
 use crate::map::{
     BuildingID, Buildings, ElectricityCache, Environment, Intersections, Lanes, LotOrigin, Lots,
-    Map, ParkingSpots, Roads, SpatialMap,
+    Map, ParkingSpots, Roads, SpatialMap, TraverseKind,
 };
 
 #[derive(Serialize, Deserialize)]
@@ -123,7 +123,8 @@ impl<'de> Deserialize<'de> for Map {
             .map_err(serde::de::Error::custom)?;
         map.rebuild_growable_shells()
             .map_err(serde::de::Error::custom)?;
-        Ok(map.into_map(lot_origins, import_lane_reserve))
+        map.into_map(lot_origins, import_lane_reserve)
+            .map_err(serde::de::Error::custom)
     }
 }
 
@@ -161,7 +162,11 @@ impl SerializedMap {
     }
 
     fn validate_references(&self) -> Result<(), String> {
+        let mut listed_lanes = BTreeSet::new();
         for (id, road) in self.roads.iter() {
+            if road.id != id || road.src == road.dst {
+                return Err(format!("road {id:?} has an invalid key or endpoints"));
+            }
             for junction in [road.src, road.dst] {
                 if self
                     .intersections
@@ -173,9 +178,23 @@ impl SerializedMap {
                     ));
                 }
             }
-            for (lane, _) in road.lanes_iter() {
-                if !self.lanes.contains_key(lane) {
-                    return Err(format!("road {id:?} has an invalid lane {lane:?}"));
+            let [forward, backward] = road.directed_lanes();
+            for (direction, src, dst) in [
+                (forward, road.src, road.dst),
+                (backward, road.dst, road.src),
+            ] {
+                for &(lane, kind) in direction {
+                    if !listed_lanes.insert(lane)
+                        || self.lanes.get(lane).is_none_or(|record| {
+                            record.id != lane
+                                || record.parent != id
+                                || record.kind != kind
+                                || record.src != src
+                                || record.dst != dst
+                        })
+                    {
+                        return Err(format!("road {id:?} has an invalid lane {lane:?}"));
+                    }
                 }
             }
             for &building in &road.connected_buildings {
@@ -188,14 +207,36 @@ impl SerializedMap {
                 }
             }
         }
+        if listed_lanes.len() != self.lanes.len() {
+            return Err("map has a lane without an owning road".into());
+        }
         for (id, intersection) in self.intersections.iter() {
+            if intersection.id != id {
+                return Err(format!("intersection {id:?} has an invalid key"));
+            }
+            let mut arms = BTreeSet::new();
             for &road in &intersection.roads {
-                if self
-                    .roads
-                    .get(road)
-                    .is_none_or(|r| r.src != id && r.dst != id)
+                if !arms.insert(road)
+                    || self
+                        .roads
+                        .get(road)
+                        .is_none_or(|r| r.src != id && r.dst != id)
                 {
                     return Err(format!("intersection {id:?} has an invalid road {road:?}"));
+                }
+            }
+            for turn in intersection.raw_turns() {
+                if turn.id.parent != id
+                    || ![turn.id.src, turn.id.dst].into_iter().all(|key| {
+                        self.lanes
+                            .get(key)
+                            .is_some_and(|lane| lane.src == id || lane.dst == id)
+                    })
+                    || !valid_path(&turn.points)
+                {
+                    return Err(format!(
+                        "intersection {id:?} has an invalid turn lane or path"
+                    ));
                 }
             }
         }
@@ -259,6 +300,14 @@ impl SerializedMap {
                 return Err(format!("road {id:?} has invalid deck index bounds"));
             }
         }
+        for (id, lane) in self.lanes.iter() {
+            if !valid_path(&lane.points)
+                || !lane.dist_from_bottom.is_finite()
+                || !lane.speed_limit.is_finite()
+            {
+                return Err(format!("lane {id:?} has invalid geometry"));
+            }
+        }
         for (id, intersection) in self.intersections.iter() {
             let bounds = intersection.bcircle();
             let radius = Vec2::splat(bounds.radius);
@@ -301,16 +350,15 @@ impl SerializedMap {
         mut self,
         lot_origins: BTreeMap<BuildingID, LotOrigin>,
         import_lane_reserve: bool,
-    ) -> Map {
-        let mut roundabouts = BTreeSet::new();
+    ) -> Result<Map, String> {
+        let requested_roundabouts: Vec<_> = self
+            .intersections
+            .values()
+            .filter(|junction| junction.is_roundabout())
+            .map(|junction| junction.id)
+            .collect();
         for junction in self.intersections.values_mut() {
-            if junction.is_roundabout() {
-                roundabouts.insert(junction.id);
-                junction.update_traffic_control(&mut self.lanes, &self.roads);
-                junction.update_turns(&self.lanes, &self.roads);
-            } else {
-                junction.index_crosswalks();
-            }
+            junction.index_crosswalks();
         }
         let spatial_map = mk_spatial_map(&self);
         let mut lots_by_road = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
@@ -321,7 +369,6 @@ impl SerializedMap {
             roads: self.roads,
             lanes: self.lanes,
             intersections: self.intersections,
-            roundabouts,
             buildings: self.buildings,
             spatial_map,
             lots: self.lots,
@@ -333,25 +380,63 @@ impl SerializedMap {
             lot_origins,
             ..Map::empty()
         };
-        let legacy_straight: Vec<_> = m
-            .roundabouts
-            .iter()
-            .copied()
-            .filter(|&id| {
-                let junction = &m.intersections[id];
-                junction.roads.len() == 2
-                    && junction.roads.iter().all(|&road| {
-                        let road = &m.roads[road];
-                        road.length() > 20.0 && road.interface_from(id) <= 1.0
-                    })
-            })
-            .collect();
-        for id in legacy_straight {
-            m.invalidate(id);
+        let mut previous_paths = BTreeMap::new();
+        for &id in &requested_roundabouts {
+            remember_turns(&m.intersections[id], &mut previous_paths);
+            let changed = super::roundabout_changed_clips(&m, id)
+                .map_err(|error| format!("could not rebuild roundabout {id:?}: {error}"))?;
+            for road in &changed {
+                let road = &m.roads[*road];
+                for (lane, _) in road.lanes_iter() {
+                    previous_paths
+                        .entry(TraverseKind::Lane(lane))
+                        .or_insert_with(|| m.lanes[lane].points.as_slice().to_vec());
+                }
+                for junction in [road.src, road.dst] {
+                    remember_turns(&m.intersections[junction], &mut previous_paths);
+                }
+            }
+            if !changed.is_empty() {
+                m.invalidate(id);
+            }
         }
+        for id in requested_roundabouts {
+            m.refresh_junction_paths(id, true);
+        }
+        previous_paths.retain(|&traversal, old| {
+            let current = match traversal {
+                TraverseKind::Lane(id) => m.lanes.get(id).map(|lane| lane.points.as_slice()),
+                TraverseKind::Turn(id) => m.intersections[id.parent]
+                    .raw_turn(id)
+                    .map(|turn| turn.points.as_slice()),
+            };
+            current != Some(old)
+        });
+        m.migrated_roundabout_paths = previous_paths;
         m.electricity = ElectricityCache::build(&m);
         m.water_services = super::WaterServiceCache::from_map(&m);
-        m
+        Ok(m)
+    }
+}
+
+fn valid_path(points: &geom::PolyLine3) -> bool {
+    let length: f32 = points.segments().map(|s| s.src.distance(s.dst)).sum();
+    !points.is_empty()
+        && points.length().is_finite()
+        && points.length() >= 0.0
+        && points.iter().all(|p| p.is_finite())
+        && length.is_finite()
+        && (points.length() - length).abs() <= 0.01 + length * 0.001
+}
+
+fn remember_turns(
+    junction: &crate::map::Intersection,
+    paths: &mut BTreeMap<TraverseKind, Vec<geom::Vec3>>,
+) {
+    for turn in junction.raw_turns() {
+        paths
+            .entry(TraverseKind::Turn(turn.id))
+            .or_insert_with(|| turn.points.as_slice().to_vec());
     }
 }
 
@@ -478,6 +563,31 @@ mod tests {
             error.to_string().contains("invalid intersection"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn roadtools_rejects_inconsistent_serialized_lane_records() {
+        for damage in 0..4 {
+            let (mut serialized, road_id) = serialized_map_with_road();
+            let map = &mut serialized.map;
+            let lane_id = map.roads[road_id].lanes_iter().next().unwrap().0;
+            let lane = &mut map.lanes[lane_id];
+            match damage {
+                0 => lane.parent = RoadID::null(),
+                1 => lane.src = super::super::IntersectionID::null(),
+                2 => {
+                    lane.points =
+                        Bincode::decode(&Bincode::encode(&(&[] as &[Vec3], 0.0_f32)).unwrap())
+                            .unwrap()
+                }
+                _ => lane.points = PolyLine3::new(vec![Vec3::ZERO, vec3(f32::NAN, 0.0, 0.0)]),
+            }
+            let bytes = Bincode::encode(&serialized).unwrap();
+            let error = Bincode::decode::<Map>(&bytes)
+                .err()
+                .expect("accepted corrupt lane");
+            assert!(error.to_string().contains("lane"), "{error}");
+        }
     }
 
     #[test]

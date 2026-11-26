@@ -443,20 +443,15 @@ impl DemolitionPreview {
             draw_junction(map, &map.intersections()[id], draw, red);
         }
         let mut lots = 0;
-        if !self.roads.is_empty() {
-            for lot in map
-                .lots()
-                .values()
-                .filter(|lot| self.roads.contains(&lot.parent))
-            {
-                draw.polyline(
-                    lot.shape.corners.map(|p| p.z(lot.height + 0.42)).to_vec(),
-                    0.65,
-                    true,
-                )
-                .color(red);
-                lots += 1;
-            }
+        for id in self.roads.iter().flat_map(|&road| map.road_lots(road)) {
+            let lot = &map.lots()[id];
+            draw.polyline(
+                lot.shape.corners.map(|p| p.z(lot.height + 0.42)).to_vec(),
+                0.65,
+                true,
+            )
+            .color(red);
+            lots += 1;
         }
         let mut zones = 0;
         for &id in &self.buildings {
@@ -535,7 +530,7 @@ fn draw_building(map: &Map, id: BuildingID, draw: &mut ImmediateDraw, color: Lin
 
 fn draw_junction(map: &Map, junction: &Intersection, draw: &mut ImmediateDraw, color: LinearColor) {
     let id = junction.id;
-    let ring = junction.roundabout_geometry(map.roads());
+    let ring = junction.roundabout_geometry();
     let mouth = |road: &Road, side: f32| {
         let points = road.interfaced_points();
         let dir = if road.src == id {
@@ -706,7 +701,12 @@ mod tests {
         else {
             panic!("fixture needs a junction");
         };
-        let roads = map.get(id).unwrap().roads.len();
+        let arms = &map.get(id).unwrap().roads;
+        let roads = arms.len();
+        let indexed_lots = arms.iter().flat_map(|&road| map.road_lots(road)).count();
+        let affected_lots = map.lots().values().filter(|lot| arms.contains(&lot.parent)).count();
+        assert_eq!(indexed_lots, affected_lots);
+        assert!(map.lots().len() > affected_lots);
         drop(map);
 
         bulldozer(&city.sim, &ui);
@@ -718,6 +718,9 @@ mod tests {
             .as_deref()
             .expect("expected a demolition quote");
         assert!(message.contains(&format!("{roads} roads")), "{message}");
+        if affected_lots > 0 {
+            assert!(message.contains(&format!("{affected_lots} lot")), "{message}");
+        }
         assert!(message.contains("Cost 0$"), "{message}");
     }
 

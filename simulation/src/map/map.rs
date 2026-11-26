@@ -115,6 +115,8 @@ pub struct Map {
     pub(crate) driving_policy_generation: u64,
     pub(super) junction_policy_revision: u64,
     pub(super) roundabouts: BTreeSet<IntersectionID>,
+    // Old paths changed during map decoding, consumed at the full snapshot boundary.
+    pub(crate) migrated_roundabout_paths: BTreeMap<super::TraverseKind, Vec<Vec3>>,
     pub(super) junction_rules: BTreeMap<IntersectionID, JunctionRules>,
     pub(super) lane_scoring: Option<LaneScoringPilot>,
     // Derived from lanes and turns. Map deserialization starts with an empty cache.
@@ -220,6 +222,7 @@ impl Map {
             driving_policy_generation: 0,
             junction_policy_revision: 0,
             roundabouts: BTreeSet::new(),
+            migrated_roundabout_paths: BTreeMap::new(),
             junction_rules: BTreeMap::new(),
             lane_scoring: None,
             driving_reachability: OnceLock::new(),
@@ -687,22 +690,23 @@ impl Map {
             .intersections
             .get(id)
             .ok_or(ConnectionError::InvalidEndpoint)?;
-        if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
-            let mut next = inter.clone();
-            f(&mut next);
-            if next.id != id {
-                return Err(ConnectionError::InvalidEndpoint);
-            }
-            super::prepare_junction_update(self, &next, &mut WaterTopologyWork::new().geometry())?;
-            self.intersections[id] = next;
-        } else {
-            queue_construction_cut(
-                &mut self.pending_construction_cuts,
-                &self.environment,
-                inter,
-            );
-            f(&mut self.intersections[id]);
+        let mut next = inter.clone();
+        f(&mut next);
+        if next.id != id || next.pos != inter.pos || next.roads != inter.roads {
+            return Err(ConnectionError::InvalidEndpoint);
         }
+        if self.environment.strict_water_siting()
+            || self.land_ownership.is_tiled()
+            || next.turn_policy.roundabout != inter.turn_policy.roundabout
+        {
+            super::prepare_junction_update(self, &next, &mut WaterTopologyWork::new().geometry())?;
+        }
+        queue_construction_cut(
+            &mut self.pending_construction_cuts,
+            &self.environment,
+            inter,
+        );
+        self.intersections[id] = next;
         self.invalidate(id);
         self.check_invariants();
         Ok(())
@@ -719,9 +723,13 @@ impl Map {
             .get(id)
             .ok_or(ConnectionError::InvalidEndpoint)?
             .clone();
-        if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
-            next.turn_policy = turn;
-            next.light_policy = light;
+        let changed_roundabout = next.turn_policy.roundabout != turn.roundabout;
+        next.turn_policy = turn;
+        next.light_policy = light;
+        if changed_roundabout
+            || self.environment.strict_water_siting()
+            || self.land_ownership.is_tiled()
+        {
             super::prepare_junction_update(self, &next, &mut WaterTopologyWork::new().geometry())?;
         }
         Ok(())
@@ -1998,7 +2006,8 @@ impl Map {
         self.road_lots(road).collect()
     }
 
-    pub(super) fn road_lots(&self, road: RoadID) -> impl Iterator<Item = LotID> + '_ {
+    /// The lots removed with this road, in lot ID order.
+    pub fn road_lots(&self, road: RoadID) -> impl Iterator<Item = LotID> + '_ {
         self.lots_by_road.get(&road).into_iter().flatten().copied()
     }
 
@@ -2184,15 +2193,40 @@ impl Map {
         self.driving_reachability.take();
     }
 
+    pub(super) fn refresh_junction_paths(&mut self, id: IntersectionID, update_signals: bool) {
+        self.intersections[id].update_turns(&self.lanes, &self.roads);
+        if self.intersections[id].roundabout_geometry().is_some() {
+            let mut work = WaterTopologyWork::new();
+            if super::check_roundabout_rail(
+                self,
+                &self.intersections[id],
+                &mut work.geometry(),
+                |_| true,
+            )
+            .is_err()
+            {
+                self.intersections[id].use_stock_turns(&self.lanes, &self.roads);
+            }
+        }
+        let junction = &self.intersections[id];
+        if update_signals || junction.is_roundabout() {
+            junction.update_traffic_control(&mut self.lanes, &self.roads);
+        }
+        if junction.roundabout_geometry().is_some() {
+            self.roundabouts.insert(id);
+        } else {
+            self.roundabouts.remove(&id);
+        }
+    }
+
     pub(crate) fn refresh_driving_road(&mut self, id: RoadID) {
         self.driving_graph_changed();
         self.lane_scoring = None;
         let road = &self.roads[id];
         self.subscribers.dispatch(UpdateType::Road, road);
         for endpoint in [road.src, road.dst] {
+            self.refresh_junction_paths(endpoint, true);
             let junction = &mut self.intersections[endpoint];
-            junction.update_traffic_control(&mut self.lanes, &self.roads);
-            junction.update_turns(&self.lanes, &self.roads);
             junction.apply_turn_mask(self.junction_rules.get(&endpoint));
             self.subscribers.dispatch(UpdateType::Road, junction);
         }
@@ -2226,12 +2260,8 @@ impl Map {
             self.subscribers.dispatch(UpdateType::Road, road);
         }
         for &id in junctions {
-            let junction = &mut self.intersections[id];
-            if junction.is_roundabout() {
-                self.roundabouts.insert(id);
-            }
-            junction.update_traffic_control(&mut self.lanes, &self.roads);
-            junction.update_turns(&self.lanes, &self.roads);
+            self.refresh_junction_paths(id, true);
+            let junction = &self.intersections[id];
             self.spatial_map.update(junction);
             self.spatial_map.set_additional_occupancy(
                 junction.id.into(),
@@ -2254,11 +2284,6 @@ impl Map {
         }
         self.lane_topology_changed();
         let inter = &mut self.intersections[id];
-        if inter.is_roundabout() {
-            self.roundabouts.insert(id);
-        } else {
-            self.roundabouts.remove(&id);
-        }
         queue_construction_cut(
             &mut self.pending_construction_cuts,
             &self.environment,
@@ -2282,7 +2307,8 @@ impl Map {
         let inter = &mut self.intersections[id];
         inter.update_interface_radius(&mut self.roads);
 
-        let mut nearby_roundabouts = BTreeSet::new();
+        let changed_roundabout = inter.is_roundabout() || self.roundabouts.contains(&id);
+        let mut nearby_junctions = BTreeSet::new();
         for x in inter.roads.clone() {
             let road = unwrap_contlog!(
                 self.roads.get(x),
@@ -2309,8 +2335,8 @@ impl Map {
                 other_end,
             );
             self.spatial_map.update_cut_influence(other_end);
-            if other_end.is_roundabout() {
-                nearby_roundabouts.insert(oend_id);
+            if changed_roundabout || other_end.is_roundabout() {
+                nearby_junctions.insert(oend_id);
             }
 
             #[allow(clippy::indexing_slicing)] // borrowed before
@@ -2322,19 +2348,16 @@ impl Map {
             );
         }
 
-        for neighbor in nearby_roundabouts {
+        for neighbor in nearby_junctions {
+            self.refresh_junction_paths(neighbor, false);
             let junction = &mut self.intersections[neighbor];
-            junction.update_turns(&self.lanes, &self.roads);
             junction.apply_turn_mask(self.junction_rules.get(&neighbor));
             self.spatial_map.update(junction);
             self.subscribers.dispatch(UpdateType::Road, junction);
         }
 
-        #[allow(clippy::indexing_slicing)] // borrowed before
-        let inter = &mut self.intersections[id];
-        inter.update_traffic_control(&mut self.lanes, &self.roads);
-        inter.update_turns(&self.lanes, &self.roads);
-
+        self.refresh_junction_paths(id, true);
+        let inter = &self.intersections[id];
         queue_construction_cut(
             &mut self.pending_construction_cuts,
             &self.environment,
@@ -2408,11 +2431,8 @@ impl Map {
             }
         }
         for junction in turns {
-            let inter = &mut self.intersections[junction];
-            if junction == id {
-                inter.update_traffic_control(&mut self.lanes, &self.roads);
-            }
-            inter.update_turns(&self.lanes, &self.roads);
+            self.refresh_junction_paths(junction, junction == id);
+            let inter = &self.intersections[junction];
             self.spatial_map.update(inter);
             self.spatial_map.set_additional_occupancy(
                 inter.id.into(),

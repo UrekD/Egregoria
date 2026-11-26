@@ -264,7 +264,7 @@ fn intersection_overlaps(map: &Map, inter: &Intersection, obb: &OBB) -> bool {
         Some((at.xy() - offset, at.xy() + offset, dir))
     };
     let mut curb = Polygon::default();
-    let roundabout = inter.roundabout_geometry(map.roads());
+    let roundabout = inter.roundabout_geometry();
     for (&road, &next) in inter.roads.iter().zip(inter.roads.iter().cycle().skip(1)) {
         let (Some((left, _, dir)), Some((_, right, next_dir))) = (mouth(road), mouth(next)) else {
             continue;

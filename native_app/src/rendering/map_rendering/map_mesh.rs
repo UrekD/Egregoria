@@ -2220,7 +2220,7 @@ pub(crate) fn intersection_mesh(
     let interpos = inter.pos.up(ROAD_Z_OFFSET);
     let id = inter.id;
 
-    if let Some(ring) = inter.roundabout_geometry(roads) {
+    if let Some(ring) = inter.roundabout_geometry() {
         let mut deck = Vec::new();
         for (&a, &b) in inter.roads.iter().zip(inter.roads.iter().cycle().skip(1)) {
             if let Some(corner) = ring.road_corner(id, &roads[a], &roads[b], false) {

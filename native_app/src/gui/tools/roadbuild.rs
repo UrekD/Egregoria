@@ -470,7 +470,8 @@ impl PrecisionSnap {
                 .and_then(|road| road_axis(road, start.pos.xy()).1),
             _ => None,
         };
-        let nearby_axis = map
+        let quantize = |base: f32, step: f32| base + ((angle - base) / step).round() * step;
+        let nearby = map
             .spatial_map()
             .query_around(pointer.xy(), ALIGNMENT_DISTANCE, ProjectFilter::ROAD)
             .filter_map(|kind| {
@@ -478,26 +479,21 @@ impl PrecisionSnap {
                 let road = map.get(id)?;
                 let (point, direction) = road_axis(road, pointer.xy());
                 let distance = (point.xy().distance(pointer.xy()) - road.width * 0.5).max(0.0);
-                let same_deck = (point.z - pointer.z).abs() < 4.0;
-                (same_deck && distance <= ALIGNMENT_DISTANCE).then_some((
-                    OrderedFloat(distance),
-                    id,
-                    direction?,
-                ))
+                let axis = direction?;
+                let aligned = quantize(axis.angle_cossin().0, std::f32::consts::FRAC_PI_2);
+                ((point.z - pointer.z).abs() < 4.0
+                    && distance <= ALIGNMENT_DISTANCE
+                    && (aligned - angle).abs() <= ALIGNMENT_ANGLE)
+                    .then_some((OrderedFloat(distance), id, axis, aligned))
             })
-            .min_by_key(|&(distance, id, _)| (distance, id))
-            .map(|(_, _, dir)| dir);
-        let reference = start_axis.unwrap_or(Vec2::X).angle_cossin().0;
-        let quantize = |base: f32, step: f32| base + ((angle - base) / step).round() * step;
-        let mut direction = quantize(reference, PRECISION_ANGLE);
-        let mut alignment = start_axis;
-        if let Some(axis) = nearby_axis {
-            let aligned = quantize(axis.angle_cossin().0, std::f32::consts::FRAC_PI_2);
-            if (aligned - angle).abs() <= ALIGNMENT_ANGLE {
-                direction = aligned;
-                alignment = Some(axis);
-            }
-        }
+            .min_by_key(|&(distance, id, _, _)| (distance, id));
+        let (direction, alignment) = nearby.map_or_else(
+            || {
+                let reference = start_axis.unwrap_or(Vec2::X).angle_cossin().0;
+                (quantize(reference, PRECISION_ANGLE), start_axis)
+            },
+            |(_, _, axis, aligned)| (aligned, Some(axis)),
+        );
         let length = (delta.mag() / ZONE_CELL_SIZE).round() * ZONE_CELL_SIZE;
         let point = anchor.xy() + Radians(direction).vec2() * length;
         Self { point, alignment }
@@ -528,7 +524,10 @@ impl PrecisionSnap {
 fn road_axis(road: &simulation::map::Road, xy: Vec2) -> (Vec3, Option<Vec2>) {
     let points = road.points();
     let (point, segment) = points.project_segment_2d(xy);
-    let direction = (points[segment + 1] - points[segment]).xy().try_normalize();
+    let direction = segment
+        .checked_sub(1)
+        .and_then(|start| points.segment_vec(start))
+        .and_then(|segment| segment.xy().try_normalize());
     (point, direction)
 }
 
@@ -1084,6 +1083,64 @@ mod tests {
             let delta = snap.point - start.pos.xy();
             assert!(delta.is_close(axis * 88.0, 0.001), "{delta:?}");
         }
+    }
+
+    #[test]
+    fn roadtools_precision_uses_the_projected_segment_tangent() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        for elbow in [None, Some(vec2(120.0, 150.0))] {
+            let (_, id) = map
+                .make_connection(
+                    MapProject::ground(vec3(45.0, 80.0, 0.0)),
+                    MapProject::ground(vec3(250.0, 80.0, 0.0)),
+                    elbow,
+                    &LanePatternBuilder::new().build(),
+                )
+                .unwrap();
+            let mut road = map.get(id).unwrap().clone();
+            if elbow.is_none() {
+                road.points = PolyLine3::new(vec![road.points().first(), road.points().last()]);
+            }
+            let segments = road.points().segments().collect::<Vec<_>>();
+            for segment in [segments[0], *segments.last().unwrap()] {
+                let midpoint = segment.src.lerp(segment.dst, 0.5);
+                let (projected, tangent) = road_axis(&road, midpoint.xy());
+                assert!(projected.is_close(midpoint, 0.001));
+                assert!(tangent
+                    .unwrap()
+                    .is_close(segment.vec().xy().normalize(), 0.001));
+            }
+            map.remove_road(id);
+        }
+    }
+
+    #[test]
+    fn roadtools_precision_skips_a_closer_unaligned_road() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        let axis = Radians::from_deg(24.0).vec2();
+        let pointer = vec2(225.0, 225.0);
+        let pattern = LanePatternBuilder::new().build();
+        for (dir, midpoint) in [
+            (Vec2::X, pointer),
+            (axis, pointer + axis.perpendicular() * 20.0),
+        ] {
+            map.make_connection(
+                MapProject::ground((midpoint - dir * 100.0).z0()),
+                MapProject::ground((midpoint + dir * 100.0).z0()),
+                None,
+                &pattern,
+            )
+            .unwrap();
+        }
+        let start = MapProject::ground((pointer - axis * 80.0).z0());
+        let snap = PrecisionSnap::at(&map, start, start.pos, pointer.z0());
+        assert!(snap.point.is_close(pointer, 0.001), "{:?}", snap.point);
     }
 
     #[test]
