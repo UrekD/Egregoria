@@ -1232,15 +1232,29 @@ impl SelectedComparison {
         }
         match &self.result {
             Some(Ok(report)) => {
-                textc(on_secondary_container(), format!(
-                    "Driving arrivals · {} to {}",
-                    report.control.journeys_by_mode["car"].completed,
-                    report.treatment.journeys_by_mode["car"].completed,
-                ));
-                textc(on_secondary_container(), format!(
-                    "Peak vehicles stopped for five game minutes · {} to {}",
-                    report.control.peak_stationary, report.treatment.peak_stationary,
-                ));
+                textc(
+                    on_secondary_container(),
+                    format!(
+                        "Driving arrivals · {} to {}",
+                        report.control.journeys_by_mode["car"].completed,
+                        report.treatment.journeys_by_mode["car"].completed,
+                    ),
+                );
+                textc(
+                    on_secondary_container(),
+                    format!(
+                        "Road freight units unloaded · {} to {}",
+                        report.control.road_freight_unloaded_units,
+                        report.treatment.road_freight_unloaded_units,
+                    ),
+                );
+                textc(
+                    on_secondary_container(),
+                    format!(
+                        "Peak vehicles stopped for five game minutes · {} to {}",
+                        report.control.peak_stationary, report.treatment.peak_stationary,
+                    ),
+                );
             }
             Some(Err(err)) => textc(goryak::error(), err.clone()),
             None => {}

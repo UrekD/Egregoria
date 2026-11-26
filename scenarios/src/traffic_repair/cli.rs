@@ -108,6 +108,40 @@ fn compare(mut flags: Args) -> Result<(), String> {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum Verification {
+    IndependentRepeat,
+    CheckpointReload,
+    CommandReplay,
+}
+
+fn verify_staged<T: PartialEq>(
+    id: &str,
+    reference: &T,
+    requested: [bool; 3],
+    mut run: impl FnMut(Verification) -> Result<T, super::ComparisonError>,
+) -> Result<Vec<Verification>, String> {
+    let mut verified = Vec::new();
+    for (mode, enabled) in [
+        Verification::IndependentRepeat,
+        Verification::CheckpointReload,
+        Verification::CommandReplay,
+    ]
+    .into_iter()
+    .zip(requested)
+    {
+        if enabled {
+            let report = run(mode).map_err(|error| format!("{id} {mode:?}: {error}"))?;
+            if *reference != report {
+                return Err(format!("{id} traffic report changed on {mode:?}"));
+            }
+            verified.push(mode);
+        }
+    }
+    Ok(verified)
+}
+
 fn compare_staged(mut flags: Args) -> Result<(), String> {
     let root = path(&mut flags, "--root")?;
     let fixtures = text(&mut flags, "--fixtures")?;
@@ -126,22 +160,22 @@ fn compare_staged(mut flags: Args) -> Result<(), String> {
     for id in fixtures.split(',') {
         let input = StagedTraffic::open(&root, id)?;
         let report = input.compare(&edit, false, &cancelled).map_err(|err| err.to_string())?;
-        if twice || resume {
-            let repeat = input.compare(&edit, resume, &cancelled).map_err(|err| err.to_string())?;
-            if report != repeat {
-                return Err(format!("{id} comparison changed on its verification run"));
-            }
-        }
-        if replay {
-            let replayed = input.compare_replayed(&edit, &cancelled).map_err(|err| err.to_string())?;
-            if report != replayed {
-                return Err(format!("{id} comparison changed with command replay"));
-            }
-        }
-        if reports.insert(id, serde_json::json!({
-            "fingerprint": input.fingerprint,
-            "comparison": report,
-        })).is_some() {
+        let verified = verify_staged(id, &report, [twice, resume, replay], |mode| match mode {
+            Verification::IndependentRepeat => input.compare(&edit, false, &cancelled),
+            Verification::CheckpointReload => input.compare(&edit, true, &cancelled),
+            Verification::CommandReplay => input.compare_replayed(&edit, &cancelled),
+        })?;
+        if reports
+            .insert(
+                id,
+                serde_json::json!({
+                    "fingerprint": input.fingerprint,
+                    "comparison": report,
+                    "verified": verified,
+                }),
+            )
+            .is_some()
+        {
             return Err(format!("duplicate comparison fixture {id}"));
         }
     }
@@ -168,25 +202,23 @@ fn soak(mut flags: Args) -> Result<(), String> {
     for id in fixtures.split(',') {
         let input = StagedTraffic::open(&root, id)?;
         let report = input.soak(days, false, &cancelled).map_err(|err| err.to_string())?;
-        if twice || resume || replay {
-            let repeat = if replay {
-                input.soak_replayed(days, resume, &cancelled)
-            } else {
-                input.soak(days, resume, &cancelled)
-            }.map_err(|err| err.to_string())?;
-            if report != repeat {
-                return Err(format!("{id} soak changed on its verification run"));
-            }
-        }
+        let verified = verify_staged(id, &report, [twice, resume, replay], |mode| match mode {
+            Verification::IndependentRepeat => input.soak(days, false, &cancelled),
+            Verification::CheckpointReload => input.soak(days, true, &cancelled),
+            Verification::CommandReplay => input.soak_replayed(days, &cancelled),
+        })?;
+        let failures = input.soak_failures(&report);
         let row = serde_json::json!({
             "gates": input.gates,
-            "passes_stationary_and_activity_gates": input.gates.passes(&report),
+            "passed": failures.is_empty(),
+            "failures": failures,
             "fingerprint": input.fingerprint,
             "traffic": report,
-            "checkpoint_reload_verified": resume,
-            "replay_verified": replay,
+            "independent_repeat_verified": verified.contains(&Verification::IndependentRepeat),
+            "checkpoint_reload_verified": verified.contains(&Verification::CheckpointReload),
+            "replay_verified": verified.contains(&Verification::CommandReplay),
         });
-        passed &= input.gates.passes(&report);
+        passed &= failures.is_empty();
         if reports.insert(id, row).is_some() {
             return Err(format!("duplicate soak fixture {id}"));
         }
@@ -196,7 +228,7 @@ fn soak(mut flags: Args) -> Result<(), String> {
         "unsupported_workers": unsupported_workers,
     }))?;
     if !passed {
-        return Err("release traffic soak missed a stationary, spillback or activity gate".into());
+        return Err("release traffic soak failed, see the fixture gate results".into());
     }
     Ok(())
 }
@@ -342,4 +374,23 @@ fn path(flags: &mut Args, flag: &str) -> Result<PathBuf, String> {
 
 fn absolute(path: OsString) -> Result<PathBuf, String> {
     std::path::absolute(Path::new(&path)).map_err(|err| err.to_string())
+}
+
+#[cfg(test)]
+#[test]
+fn p7_comparison_verifies_all_requested_modes_independently() {
+    use Verification::*;
+    let mut runs = Vec::new();
+    let verified = verify_staged("fixture", &42, [true; 3], |mode| {
+        runs.push(mode);
+        Ok(42)
+    })
+    .unwrap();
+    assert_eq!(runs, [IndependentRepeat, CheckpointReload, CommandReplay]);
+    assert_eq!(verified, runs);
+
+    let refused = verify_staged("fixture", &42, [true; 3], |mode| {
+        Ok(if mode == CheckpointReload { 21 } else { 42 })
+    });
+    assert!(refused.unwrap_err().contains("CheckpointReload"));
 }

@@ -27,6 +27,34 @@ pub(super) enum PedestrianClearance {
     },
 }
 
+pub(super) fn needs_local_recovery(map: &Map, position: Vec3) -> bool {
+    if !map.has_junction_rules() {
+        return false;
+    }
+    if map.junction_rules_near(position, SEARCH_RADIUS) {
+        return true;
+    }
+    // The road endpoint is the spatial anchor for a crossing clipped
+    // beyond the junction's indexed circle.
+    map.spatial_map()
+        .query_around(position.xy(), SEARCH_RADIUS, ProjectFilter::ROAD)
+        .any(|candidate| {
+            let ProjectKind::Road(id) = candidate else {
+                return false;
+            };
+            map.get(id).is_some_and(|road| {
+                [road.src, road.dst].into_iter().any(|id| {
+                    map.junction_rules(id).is_some()
+                        && map.get(id).is_some_and(|junction| {
+                            junction
+                                .crosswalks()
+                                .any(|turn| crosswalk_exit(map, turn, position).is_some())
+                        })
+                })
+            })
+        })
+}
+
 /// A stranded walker may leave on a crossing they already occupy. Preserve
 /// their obstruction when no bounded, same-deck path can be established.
 pub(super) fn pedestrian_clearance(map: &Map, position: Vec3) -> PedestrianClearance {

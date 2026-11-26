@@ -7,6 +7,7 @@ mod source;
 pub mod spacing;
 pub mod traffic;
 
+pub(crate) use commission::LoopEvidence;
 pub use commission::{check_loaded_opening, commission, OpeningManifest, OpeningReport};
 pub use layout::*;
 pub use network::*;

@@ -25,7 +25,7 @@
         "snapshot_sha256": "72f27e15a7b0e358236fae20a2d9a2bfd3d1ff300ca9d4390df544afed36bf1a",
         "metadata_sha256": "d03e73bf4152a931642bf106f6f90d446296baa7bc4f34ca0f724ace37d86453",
         "replay_sha256": null,
-        "schedule_sha256": "1d5d5783f3501bada7ab6cdc03540cae8462e076ee4c08129ca002ab30973ca9",
+        "schedule_sha256": "8bfbd94a28e7659c2afee1e53a3fe77c26ec288110409b1231c7bd75b4aed568",
         "initial_elapsed_tick": 720000,
         "workers": 1,
         "opening": {

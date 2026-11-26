@@ -5819,19 +5819,52 @@ mod lifecycle_tests {
         f.update(FREIGHT_MATCH_INTERVAL);
         let token = f.token();
         let start = f.ctx.g.world.vehicles[f.truck].trans.pos;
-        let mut underway = false;
+        let mut approach = None;
         for _ in 0..6000 {
             f.ctx.tick_fast();
+            let driver = f.ctx.g.get(f.driver).unwrap();
             let vehicle = &f.ctx.g.world.vehicles[f.truck];
-            if f.ctx.g.get(f.driver).unwrap().location == Location::Vehicle(f.truck)
-                && vehicle.it.get_route().is_some()
-                && vehicle.trans.pos.distance(start) > 25.0
+            let position = vehicle.trans.pos;
+            let Some(crate::map_dynamic::RoutingStep::DriveTo(car, target)) =
+                driver.router.cur_step()
+            else {
+                continue;
+            };
+            if *car != f.truck
+                || driver.location != Location::Vehicle(f.truck)
+                || position.distance(start) <= 25.0
             {
-                underway = true;
+                continue;
+            }
+            let Some(crate::map::TraverseKind::Lane(lane)) =
+                vehicle.it.get_travers().map(|step| step.kind)
+            else {
+                continue;
+            };
+            let map = f.ctx.g.map();
+            let lane = map.get(lane).unwrap();
+            let junction = map.get(lane.dst).unwrap();
+            if (position.z - junction.pos.z).abs() < 1.0
+                && position.xy().is_close(junction.pos.xy(), junction.radius)
+                && Itinerary::route(
+                    Tick(f.ctx.g.get_tick()),
+                    position,
+                    *target,
+                    &map,
+                    PathKind::Vehicle,
+                )
+                .is_some()
+            {
+                approach = Some((junction.id, lane.parent));
                 break;
             }
         }
-        assert!(underway);
+        let (junction, road) = approach.expect("truck approached a junction on its delivery route");
+        f.ctx.g.map_mut().install_junction_rules(
+            junction,
+            crate::map::JunctionRules::new(vec![(road, crate::map::ApproachRole::Stop)], vec![])
+                .unwrap(),
+        );
         f.ctx.g.world.vehicles[f.truck].it = Itinerary::NONE;
         f.ctx.tick_fast();
         assert!(f.ctx.g.world.vehicles[f.truck].it.get_route().is_some());

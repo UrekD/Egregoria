@@ -324,11 +324,12 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
         };
 
         if let Some(RoutingStep::DriveTo(car, obj)) = h.router.cur_step {
-            if h.location == Location::Vehicle(car) && !map.uses_stock_traffic() {
+            if h.location == Location::Vehicle(car) && map.has_junction_rules() {
                 if let Some(vehicle) = world.vehicles.get_mut(car) {
                     if vehicle.it.is_missing()
                         && !vehicle.vehicle.state.is_parked()
                         && !vehicle.trans.pos.is_close(obj, OBJECTIVE_OK_DIST)
+                        && map.junction_rules_near(vehicle.trans.pos, OBJECTIVE_OK_DIST)
                     {
                         // Keep the current step and any cargo manifest until the
                         // original vehicle reaches this drive objective.

@@ -453,10 +453,18 @@ impl Map {
         !self.junction_rules.is_empty()
     }
 
-    /// Published networks with commissioned gateways and bulk-imported cities
-    /// retain their stock traffic policy outside explicitly controlled junctions.
+    /// Whether every junction uses stock traffic. Rules only affect their own junction.
     pub fn uses_stock_traffic(&self) -> bool {
-        self.has_imported_lane_reserves() || self.land_ownership.reserves().next().is_some()
+        !self.has_junction_rules()
+    }
+
+    pub(crate) fn junction_rules_near(&self, position: Vec3, margin: f32) -> bool {
+        self.has_junction_rules()
+            && self.spatial_map
+                .query_around(position.xy(), margin, ProjectFilter::INTER)
+                .any(|candidate| matches!(candidate, ProjectKind::Intersection(id)
+                    if self.junction_rules(id).is_some()
+                        && self.get(id).is_some_and(|junction| (position.z - junction.pos.z).abs() < 1.0)))
     }
 
     pub(crate) fn has_junction_controller(&self) -> bool {

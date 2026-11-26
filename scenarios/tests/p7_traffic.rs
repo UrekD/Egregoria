@@ -816,3 +816,163 @@ fn run_repair_checkpoint(
             .unwrap_or_else(|error| panic!("{name} arm (edited={treatment}): {error}"))
     })
 }
+
+#[test]
+fn p7_unrestricted_new_city_matches_p6_traffic() {
+    use geom::{vec3, Transform};
+    use prototypes::Tick;
+    use simulation::map::{
+        BuildingKind, LandMode, LaneKind, LanePatternBuilder, MapProject, ProjectKind, TurnKind,
+    };
+    use simulation::map_dynamic::Itinerary;
+    use simulation::souls::human::spawn_human;
+    use simulation::transportation::{
+        put_pedestrian_in_transport_grid, spawn_driving_vehicle, Location, TransportGrid,
+        VehicleKind,
+    };
+    use simulation::world_command::{CommandOutcomes, WorldCommand};
+    use simulation::{MapPreset, NewGameOptions, Simulation, SlotId, SnapshotRevision};
+
+    scenarios::ensure_repo_root_cwd();
+    simulation::init::init();
+    let mut city = Simulation::new_game(&NewGameOptions {
+        preset: MapPreset::Flat,
+        terrain_chunks: 16,
+        starting_money_bucks: 150_000,
+        seed: 6042,
+        land_mode: LandMode::Unrestricted,
+        ..NewGameOptions::default()
+    })
+    .unwrap();
+    let at = vec3(350.0, 300.0, 0.0);
+    let mut from = MapProject::ground(vec3(100.0, 300.0, 0.0));
+    for (to, lanes) in [
+        (at, 1),
+        (vec3(600.0, 300.0, 0.0), 2),
+        (vec3(350.0, 500.0, 0.0), 1),
+    ] {
+        city.apply_commands([&WorldCommand::MapMakeConnection {
+            from,
+            to: MapProject::ground(to),
+            inter: None,
+            pat: LanePatternBuilder::new().n_lanes(lanes).build(),
+        }]);
+        assert_eq!(city.read::<CommandOutcomes>().accepted, [0]);
+        let map = city.map();
+        let junction = map
+            .intersections()
+            .values()
+            .find(|junction| junction.pos.xy() == at.xy())
+            .unwrap();
+        from = MapProject {
+            kind: ProjectKind::Intersection(junction.id),
+            pos: junction.pos,
+        };
+    }
+    let (start, direction, target, crossing, lot) = {
+        let map = city.map();
+        let junction = map
+            .intersections()
+            .values()
+            .find(|junction| junction.pos.xy() == at.xy())
+            .unwrap();
+        let inbound = map
+            .lanes()
+            .values()
+            .find(|lane| {
+                lane.kind == LaneKind::Driving
+                    && lane.dst == junction.id
+                    && lane.points.first().x < at.x
+            })
+            .unwrap();
+        let outbound = map
+            .lanes()
+            .values()
+            .find(|lane| {
+                lane.kind == LaneKind::Driving
+                    && lane.src == junction.id
+                    && lane.points.last().x > at.x
+            })
+            .unwrap();
+        let crossing = junction
+            .turns()
+            .find(|turn| {
+                turn.kind == TurnKind::Crosswalk
+                    && map.get(turn.id.src).unwrap().parent == inbound.parent
+            })
+            .unwrap();
+        let (start, direction) = inbound
+            .points
+            .point_dir_along(inbound.points.length() - 22.0);
+        (
+            start,
+            direction,
+            outbound.id,
+            crossing.points.middle(),
+            map.lots().keys().next().unwrap(),
+        )
+    };
+    city.apply_commands([&WorldCommand::MapBuildHouse(lot)]);
+    assert_eq!(city.read::<CommandOutcomes>().accepted, [0]);
+    let house = city
+        .map()
+        .buildings()
+        .values()
+        .find(|site| site.kind == BuildingKind::House)
+        .unwrap()
+        .id;
+    let human = city
+        .world()
+        .humans
+        .keys()
+        .next()
+        .unwrap_or_else(|| spawn_human(&mut city, house).unwrap());
+    let collider = put_pedestrian_in_transport_grid(&mut city.write::<TransportGrid>(), crossing);
+    city.world_mut_unchecked().edit_human(human, |human| {
+        human.trans.pos = crossing;
+        human.collider = Some(collider);
+        human.location = Location::Outside;
+        human.it = Itinerary::NONE;
+    });
+    let car = spawn_driving_vehicle(
+        &mut city,
+        VehicleKind::Car,
+        Transform::new_dir(start, direction),
+    )
+    .unwrap();
+    let it =
+        Itinerary::route_to_lane(Tick(city.get_tick()), start, &city.map(), target, 80.0).unwrap();
+    let terminal = it.end_pos().unwrap();
+    city.world_mut_unchecked().vehicles[car].it = it;
+
+    let root = std::env::temp_dir().join(format!("egregoria-p7-new-city-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let slot = SlotId::new("unrestricted-traffic").unwrap();
+    city.save_to_slot(&root, &slot, SnapshotRevision::new(1))
+        .unwrap();
+    let mut reopened = Simulation::load_from_slot(&root, &slot).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+
+    for city in [&mut city, &mut reopened] {
+        let mut schedule = Simulation::schedule();
+        let mut release = None;
+        let mut arrival = None;
+        let mut stopped_ticks = 0;
+        for step in 1..=1500 {
+            city.tick(&mut schedule, &[]);
+            let walker = &city.world().humans[human];
+            if walker.collider.is_none() && release.is_none() {
+                release = Some(step);
+                assert_eq!(walker.trans.pos, crossing);
+            }
+            let vehicle = &city.world().vehicles[car];
+            if vehicle.trans.pos.is_close(terminal, 0.1) {
+                arrival.get_or_insert(step);
+            } else {
+                stopped_ticks += u32::from(vehicle.speed.0.abs() < 0.1);
+            }
+        }
+        // Reference run at 1c40ecdb, measured through the normal scheduler.
+        assert_eq!((release, arrival, stopped_ticks), (Some(1), Some(841), 1));
+    }
+}

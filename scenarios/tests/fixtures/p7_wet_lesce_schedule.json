@@ -1,8 +1,14 @@
 {
-  "bus_lines": [
-    "employment",
-    "neighbourhood"
-  ],
+  "bus_lines": {
+    "employment": {
+      "idx": 2,
+      "version": 1
+    },
+    "neighbourhood": {
+      "idx": 1,
+      "version": 1
+    }
+  },
   "corridors": [
     {
       "key": "sava-rim",
@@ -140,5 +146,25 @@
     "max_spillback_ticks": 2000,
     "max_unresolved_standstill_ticks": 3000
   },
-  "workers": 1
+  "workers": 1,
+  "freight_receivers": [
+    {
+      "key": "coal-power-plant",
+      "building": {
+        "idx": 20,
+        "version": 1
+      },
+      "item": "coal",
+      "min_road_units": 1
+    }
+  ],
+  "services": [
+    "Fire",
+    "Police",
+    "Health",
+    "School",
+    "Garbage",
+    "Park"
+  ],
+  "check_utilities": true
 }

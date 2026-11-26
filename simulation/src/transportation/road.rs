@@ -350,15 +350,14 @@ fn calc_decision_traced<'a>(
         vehicle.flag = 0;
     }
     let stopping_threshold = 0.8 + stop_dist;
-    let panicking = matches!(vehicle.state, VehicleState::Panicking(_))
-        && !map.uses_stock_traffic();
-    let cutoff = if panicking {
-        stopping_threshold
-    } else {
-        stopping_threshold.min(1.5)
-    };
-    let (front_dist, flag, crossing, blocker) =
-        calc_front_dist(vehicle, trans, self_obj, it, neighs, cutoff, panicking);
+    let (front_dist, flag, blocker) = calc_front_dist(
+        vehicle,
+        trans,
+        self_obj,
+        it,
+        neighs,
+        stopping_threshold.min(1.5),
+    );
 
     let position = trans.pos;
     let dir_to_pos = unwrap_or!(
@@ -370,10 +369,6 @@ fn calc_decision_traced<'a>(
         // Gridlock recovery is agent physics: 20 real seconds.
         if since.elapsed(time).0 .0 > 20 * TICKS_PER_REALTIME_SECOND {
             vehicle.state = VehicleState::Driving;
-        }
-        // Breaking a stationary leader cycle must still yield to a crossing vehicle.
-        if crossing {
-            return ((0.0, dir_to_pos), Some(blocker));
         }
     } else if speed.abs() < 0.2 && front_dist < 1.5 {
         let me_u64: u64 = me.data().as_ffi();
@@ -468,8 +463,7 @@ fn calc_front_dist<'a>(
     it: &Itinerary,
     neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
     cutoff: f32,
-    check_crossing: bool,
-) -> (f32, u64, bool, QueueHoldReason) {
+) -> (f32, u64, QueueHoldReason) {
     let position = trans.pos;
     let direction = trans.dir;
     let pos2 = position.xy();
@@ -537,8 +531,8 @@ fn calc_front_dist<'a>(
                     _ => QueueHoldReason::Unknown,
                 };
             }
-            if min_front_dist < cutoff && !check_crossing {
-                return (min_front_dist, flag, false, blocker);
+            if min_front_dist < cutoff {
+                return (min_front_dist, flag, blocker);
             }
             continue;
         }
@@ -571,26 +565,18 @@ fn calc_front_dist<'a>(
         }
 
         let final_dist = dist - my_radius - nei_physics_obj.radius - 5.0;
-        if check_crossing && final_dist < cutoff {
-            return (
-                final_dist,
-                nei_physics_obj.flag,
-                true,
-                QueueHoldReason::Conflict(handle),
-            );
-        }
         if final_dist < min_front_dist {
             min_front_dist = final_dist;
             flag = nei_physics_obj.flag;
             blocker = QueueHoldReason::Conflict(handle);
         }
     }
-    (min_front_dist, flag, false, blocker)
+    (min_front_dist, flag, blocker)
 }
 
 #[cfg(test)]
 #[test]
-fn p7_panic_yields_within_moving_stopping_distance() {
+fn p7_unruled_panic_keeps_stock_gridlock_recovery() {
     use crate::transportation::{TransportationGroup, VehicleKind};
     use geom::{vec2, vec3, Color};
 
@@ -642,7 +628,7 @@ fn p7_panic_yields_within_moving_stopping_distance() {
             drive(VehicleState::Driving, &[(crossing_pos, &crossing)]),
             0.0
         );
-        assert_eq!(drive(panic(), &[leader, (crossing_pos, &crossing)]), 0.0);
+        assert_eq!(drive(panic(), &[leader, (crossing_pos, &crossing)]), 9.0);
         assert!(drive(panic(), &[leader, (crossing_pos, &above)]) > 0.0);
     }
 }

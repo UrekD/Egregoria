@@ -5,6 +5,8 @@ use crate::runner::{MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use simulation::PopulationScale;
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -50,17 +52,9 @@ pub(super) fn run(
     let root = manifest
         .parent()
         .ok_or("performance manifest has no directory")?;
-    let path = root.join(&pin.parent_binary);
-    let check_parent = || {
-        let bytes = read_rooted(root, &pin.parent_binary, 64 * 1024 * 1024)?;
-        if pin.version != 1 || digest(&bytes)? != pin.parent_sha256 {
-            return Err("parent benchmark executable does not match its pin".to_owned());
-        }
-        Ok(())
-    };
+    let parent = VerifiedParent::copy_from(root, &pin)?;
     let run_baseline = |case: PerfCase| {
-        check_parent()?;
-        let output = Command::new(&path)
+        let output = Command::new(parent.executable())
             .args(["perf-scale", "--layout", layout_name, "--sim-threads", "1"])
             .arg("--agents")
             .arg(case.agents.to_string())
@@ -138,4 +132,74 @@ pub(super) fn run(
         "median_tick_p99_ratio": tail,
         "paired_gate_passed": throughput >= 0.95 && tail <= 1.05,
     }))
+}
+
+struct VerifiedParent {
+    directory: PathBuf,
+}
+
+impl VerifiedParent {
+    fn copy_from(root: &Path, pin: &ParentPin) -> Result<Self, String> {
+        let bytes = read_rooted(root, &pin.parent_binary, 64 * 1024 * 1024)?;
+        if pin.version != 1 || digest(&bytes)? != pin.parent_sha256 {
+            return Err("parent benchmark executable does not match its pin".into());
+        }
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let directory =
+            std::env::temp_dir().join(format!("egregoria-parent-{}-{stamp}", std::process::id()));
+        let mut builder = fs::DirBuilder::new();
+        let mut options = fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            builder.mode(0o700);
+            options.mode(0o500);
+        }
+        builder
+            .create(&directory)
+            .map_err(|error| error.to_string())?;
+        let parent = Self { directory };
+        options
+            .open(parent.executable())
+            .and_then(|mut file| file.write_all(&bytes))
+            .map_err(|error| error.to_string())?;
+        Ok(parent)
+    }
+
+    fn executable(&self) -> PathBuf {
+        self.directory
+            .join(format!("scenarios{}", std::env::consts::EXE_SUFFIX))
+    }
+}
+
+impl Drop for VerifiedParent {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn p7_perf_runs_the_verified_copy_after_source_replacement() {
+    let directory =
+        std::env::temp_dir().join(format!("egregoria-parent-test-{}", std::process::id()));
+    fs::create_dir(&directory).unwrap();
+    let source = VerifiedParent { directory };
+    let original = b"#!/bin/sh\nprintf verified\n";
+    fs::write(source.executable(), original).unwrap();
+    let pin = ParentPin {
+        version: 1,
+        parent_binary: source.executable().file_name().unwrap().into(),
+        parent_sha256: digest(original).unwrap(),
+    };
+    let copy = VerifiedParent::copy_from(&source.directory, &pin).unwrap();
+    fs::write(source.executable(), b"#!/bin/sh\nprintf replaced\n").unwrap();
+    let result = Command::new(copy.executable()).output().unwrap();
+    assert!(result.status.success());
+    assert_eq!(result.stdout, b"verified");
 }
