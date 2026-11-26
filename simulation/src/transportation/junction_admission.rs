@@ -316,6 +316,25 @@ pub(crate) fn configured(map: &Map, junction: IntersectionID) -> Option<LightPol
         .filter(|&mode| mode != LightPolicy::Lights)
 }
 
+pub(super) fn controls_road_decision(map: &Map, it: &Itinerary, position: Vec3) -> bool {
+    if !map.has_junction_rules() {
+        return false;
+    }
+    match it.get_travers().map(|traversal| traversal.kind) {
+        Some(TraverseKind::Turn(turn)) => configured(map, turn.parent).is_some(),
+        Some(TraverseKind::Lane(lane)) => entry_boundary(map, it, position, LOCAL_MARGIN, 0.0)
+            .is_some_and(|boundary| {
+                boundary.controlled
+                    && boundary.valid
+                    && boundary.bounded
+                    && boundary.distance <= LOCAL_MARGIN
+                    // A short lane can lie entirely within the junction search margin.
+                    && map.get(lane).is_some_and(|lane| boundary.distance <= lane.points.length() * 0.5)
+            }),
+        None => false,
+    }
+}
+
 pub(crate) fn entry_boundary(
     map: &Map,
     it: &Itinerary,

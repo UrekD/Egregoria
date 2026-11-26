@@ -750,7 +750,7 @@ pub(crate) fn render_junction(uiw: &UiWorld, sim: &Simulation, id: IntersectionI
 
     let mut opened = true;
     goryak::Window {
-        title: format!("Junction repair {:?}", id.data()).into(),
+        title: format!("Junction rules (Experimental) {:?}", id.data()).into(),
         pad: yakui::widgets::Pad::all(14.0),
         radius: 10.0,
         opened: &mut opened,

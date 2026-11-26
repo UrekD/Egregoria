@@ -73,6 +73,7 @@ fn compare(mut flags: Args) -> Result<(), String> {
     initialize()?;
     let cancelled = AtomicBool::new(false);
     let mut reports = BTreeMap::new();
+    let mut failures = Vec::new();
     for (id, arm) in cases {
         let report = compare_builtin_repair(arm, &cancelled).map_err(|err| err.to_string())?;
         if twice {
@@ -95,6 +96,12 @@ fn compare(mut flags: Args) -> Result<(), String> {
                 return Err(format!("{id} comparison changed with command replay"));
             }
         }
+        if matches!(arm, FixtureArm::Repair) && !report.primary.passes_improvement {
+            failures.push(format!("{id} missed the primary repair improvement gate"));
+        }
+        if !report.tail.preserves_credit {
+            failures.push(format!("{id} lost credit at the tail cutoff"));
+        }
         reports.insert(id, report);
     }
 
@@ -105,6 +112,11 @@ fn compare(mut flags: Args) -> Result<(), String> {
             "cases": reports,
             "unsupported_workers": unsupported_workers,
         }))
+    }?;
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join(". "))
     }
 }
 
@@ -148,6 +160,9 @@ fn compare_staged(mut flags: Args) -> Result<(), String> {
     let edit = path(&mut flags, "--edit")?;
     let edit: WorldCommand = serde_json::from_slice(&read_member(&edit, 64 * 1024)?)
         .map_err(|error| error.to_string())?;
+    if !matches!(edit, WorldCommand::MapUpgradeRoad { .. }) {
+        return Err("a staged release comparison requires a quoted road edit".into());
+    }
     let unsupported_workers = serial_workers(&mut flags)?;
     let json = flags.remove("--json").flatten().map(absolute).transpose()?;
     let twice = flags.remove("--twice").is_some();
@@ -157,6 +172,7 @@ fn compare_staged(mut flags: Args) -> Result<(), String> {
     initialize()?;
     let cancelled = AtomicBool::new(false);
     let mut reports = BTreeMap::new();
+    let mut passed = true;
     for id in fixtures.split(',') {
         let input = StagedTraffic::open(&root, id)?;
         let report = input.compare(&edit, false, &cancelled).map_err(|err| err.to_string())?;
@@ -165,10 +181,15 @@ fn compare_staged(mut flags: Args) -> Result<(), String> {
             Verification::CheckpointReload => input.compare(&edit, true, &cancelled),
             Verification::CommandReplay => input.compare_replayed(&edit, &cancelled),
         })?;
+        let failures = input.release_failures(&report.treatment);
+        passed &= failures.is_empty();
         if reports
             .insert(
                 id,
                 serde_json::json!({
+                    "gates": input.gates,
+                    "passed": failures.is_empty(),
+                    "failures": failures,
                     "fingerprint": input.fingerprint,
                     "comparison": report,
                     "verified": verified,
@@ -179,10 +200,17 @@ fn compare_staged(mut flags: Args) -> Result<(), String> {
             return Err(format!("duplicate comparison fixture {id}"));
         }
     }
-    write_json(json, &serde_json::json!({
-        "cases": reports,
-        "unsupported_workers": unsupported_workers,
-    }))
+    write_json(
+        json,
+        &serde_json::json!({
+            "cases": reports,
+            "unsupported_workers": unsupported_workers,
+        }),
+    )?;
+    if !passed {
+        return Err("release traffic repair failed, see the treatment gate results".into());
+    }
+    Ok(())
 }
 
 fn soak(mut flags: Args) -> Result<(), String> {
@@ -207,7 +235,7 @@ fn soak(mut flags: Args) -> Result<(), String> {
             Verification::CheckpointReload => input.soak(days, true, &cancelled),
             Verification::CommandReplay => input.soak_replayed(days, &cancelled),
         })?;
-        let failures = input.soak_failures(&report);
+        let failures = input.release_failures(&report);
         let row = serde_json::json!({
             "gates": input.gates,
             "passed": failures.is_empty(),

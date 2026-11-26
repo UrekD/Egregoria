@@ -18,7 +18,7 @@ pub fn roadedit_properties(uiw: &UiWorld) {
         padxy(12.0, 8.0, || {
             textc(
                 on_secondary_container(),
-                "Click a junction to inspect its directed turns and edit its controls.",
+                "Click a junction to inspect directed turns and edit junction rules (Experimental).",
             );
         });
         return;

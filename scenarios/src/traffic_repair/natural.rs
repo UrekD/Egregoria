@@ -20,6 +20,7 @@ use simulation::map_dynamic::{
     UtilityStatus,
 };
 use simulation::souls::residence::Residences;
+use simulation::transportation::road::movement_cycles_at_cutoff;
 use simulation::transportation::Location;
 use simulation::world_command::WorldCommand;
 use simulation::{
@@ -138,6 +139,9 @@ impl StagedTraffic {
             );
         }
         let map = sim.map();
+        if !map.uses_stock_traffic() {
+            return Err("release traffic fixtures require stock junction controls".into());
+        }
         let mut observe = Observations {
             bus_lines: schedule.bus_lines,
             services: schedule.services,
@@ -261,7 +265,7 @@ impl StagedTraffic {
         .map(|(report, _)| report)
     }
 
-    pub fn soak_failures(&self, report: &NaturalTrafficReport) -> Vec<String> {
+    pub fn release_failures(&self, report: &NaturalTrafficReport) -> Vec<String> {
         let mut failures = Vec::new();
         for (failed, reason) in [
             (
@@ -275,6 +279,10 @@ impl StagedTraffic {
             (
                 report.cutoff_stationary > 0,
                 "vehicles still stationary at cutoff",
+            ),
+            (
+                !report.unresolved_movement_cycles.is_empty(),
+                "unresolved vehicle movement cycles at cutoff",
             ),
             (
                 !report.stranded_routed_drivers.is_empty(),
@@ -386,6 +394,7 @@ pub struct NaturalTrafficReport {
     pub directed_lane_entries_sampled: BTreeMap<String, u64>,
     pub directed_lane_crossings: BTreeMap<String, u64>,
     pub stranded_routed_drivers: Vec<simulation::HumanID>,
+    pub unresolved_movement_cycles: Vec<Vec<VehicleID>>,
     pub road_freight_unloaded_units: u64,
     pub road_unloads_by_receiver: BTreeMap<String, RoadUnloadMeasurement>,
     pub bus_activity: BTreeMap<String, BusActivity>,
@@ -850,6 +859,11 @@ fn run_arm(
     cancelled: &AtomicBool,
 ) -> Result<(NaturalTrafficReport, Option<ComparisonReceipt>), ComparisonError> {
     check_cancelled(cancelled)?;
+    if resume && window < 2 {
+        return Err(ComparisonError::InvalidSchedule(
+            "checkpoint reload requires at least two scored ticks",
+        ));
+    }
     let mut sim = load_snapshot(bytes)?;
     let mut schedule = Simulation::schedule();
     for _ in 0..lead_in {
@@ -996,6 +1010,7 @@ fn run_arm(
         directed_lane_entries_sampled: entries,
         directed_lane_crossings: corridors.completed,
         stranded_routed_drivers: stranded_routed_drivers(&sim),
+        unresolved_movement_cycles: movement_cycles_at_cutoff(&sim),
         road_freight_unloaded_units: unloaded.saturating_sub(initial_unloaded),
         road_unloads_by_receiver,
         bus_activity,
@@ -1047,6 +1062,35 @@ fn p7_comparison_natural_city_runs_stock_schedule_and_replays() {
         sim.tick(&mut schedule, &[]);
     }
     assert_eq!(stock.control.terminal_hashes, sim.hashes());
+}
+
+#[cfg(test)]
+#[test]
+fn p7_comparison_resume_requires_a_tick_after_checkpoint() {
+    use crate::builtin::traffic_repair::{prepare_repair_fixture, FixtureArm};
+
+    let fixture = prepare_repair_fixture(FixtureArm::NoLoss).unwrap();
+    let bytes = snapshot_bytes(&fixture.simulation).unwrap();
+    let observe = Observations::default();
+    let cancelled = AtomicBool::new(false);
+    let run = |window, resume| {
+        compare(
+            &bytes,
+            0,
+            window,
+            &observe,
+            &fixture.repair,
+            resume,
+            false,
+            &cancelled,
+        )
+    };
+    assert!(run(1, false).is_ok());
+    assert!(matches!(
+        run(1, true),
+        Err(ComparisonError::InvalidSchedule(_))
+    ));
+    assert_eq!(run(2, false).unwrap(), run(2, true).unwrap());
 }
 
 #[cfg(test)]

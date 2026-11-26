@@ -100,6 +100,92 @@ fn forward_lane(id: LaneID) -> Traversable {
     Traversable::new(TraverseKind::Lane(id), TraverseDirection::Forward)
 }
 
+#[test]
+fn p7_junction_rule_preserves_panic_at_the_opposite_end() {
+    check_rule_locality(70.0, false);
+    check_rule_locality(232.0, true);
+}
+
+fn check_rule_locality(origin_x: f32, short_lane: bool) {
+    use crate::map::road_edit::{junction_edit_stamp, preview_junction_edit};
+    use crate::transportation::road::calc_decision;
+    use crate::transportation::{TransportState, TransportationGroup, Vehicle, VehicleState};
+    use crate::world_command::{CommandOutcomes, PrepareBudget};
+    use crate::WorldCommand;
+
+    let mut ctx = TestCtx::new();
+    let a = vec3(origin_x, 200.0, 0.0);
+    let b = vec3(270.0, 200.0, 0.0);
+    let c = vec3(455.0, 345.0, 0.0);
+    ctx.build_roads(&[a, b, c]);
+    let (junction, from, to, road, length) = {
+        let map = ctx.g.map();
+        let from = lane_at(&map, a, b);
+        let lane = map.get(from).unwrap();
+        assert!(map.junction_rules(lane.src).is_none());
+        (
+            lane.dst,
+            from,
+            lane_at(&map, b, c),
+            lane.parent,
+            lane.points.length(),
+        )
+    };
+    assert_eq!(length < 36.0, short_lane, "fixture lane length {length}");
+    let far = staged_vehicle(&mut ctx.g, VehicleKind::Car, from, to, length - 2.0);
+    let time = GameTime::new(Tick(ctx.g.get_tick()));
+    let drive = |sim: &Simulation, id| {
+        let entity = &sim.world().vehicles[id];
+        let mut vehicle = Vehicle {
+            ang_velocity: 0.0,
+            wait_time: 0.0,
+            max_speed_multiplier: 1.0,
+            state: VehicleState::Panicking(time.instant()),
+            kind: VehicleKind::Car,
+            tint: geom::Color::WHITE,
+            flag: 0,
+        };
+        let state = TransportState {
+            dir: entity.trans.dir.xy(),
+            height: entity.trans.pos.z,
+            radius: vehicle.kind.width() * 0.5,
+            group: TransportationGroup::Vehicles,
+            ..TransportState::default()
+        };
+        let leader = entity.trans.pos.xy() + entity.trans.dir.xy() * 1.5;
+        let (speed, _) = calc_decision(
+            id,
+            &mut vehicle,
+            &sim.map(),
+            &time,
+            &entity.trans,
+            &state,
+            &entity.it,
+            [(leader, &state)].into_iter(),
+        );
+        (speed, matches!(vehicle.state, VehicleState::Panicking(_)))
+    };
+    let stock = drive(&ctx.g, far);
+    assert!(stock.0 > 0.0 && stock.1);
+
+    let rules = JunctionRules::new(vec![(road, ApproachRole::Stop)], vec![]).unwrap();
+    let budget = &mut PrepareBudget::for_preview(4_194_304);
+    let expected = junction_edit_stamp(&ctx.g, junction, budget).unwrap();
+    let quote = preview_junction_edit(&ctx.g, junction, expected, &rules, budget)
+        .unwrap()
+        .quote;
+    ctx.g.apply_commands([&WorldCommand::MapSetJunctionRules {
+        junction,
+        expected,
+        rules,
+        quote,
+    }]);
+    assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
+    assert_eq!(drive(&ctx.g, far), stock);
+    let near = staged_vehicle(&mut ctx.g, VehicleKind::Car, from, to, 2.0);
+    assert_eq!(drive(&ctx.g, near), (0.0, false));
+}
+
 fn staged_vehicle(
     sim: &mut Simulation,
     kind: VehicleKind,
