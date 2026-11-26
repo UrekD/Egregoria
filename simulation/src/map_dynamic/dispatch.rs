@@ -1,16 +1,17 @@
-use crate::map::{LaneID, LaneKind, TraverseDirection};
+use crate::map::{Lane, LaneID, LaneKind, TraverseDirection};
+use crate::souls::freight_station::train_lane;
 use crate::utils::resources::Resources;
 use crate::world::{TrainID, VehicleID};
 use crate::{Map, World};
 use derive_more::From;
 use geom::Vec3;
 use serde::{Deserialize, Serialize};
-use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// How precise the dispatcher is. Caches dispatchable entities's positions and relation to map but only in precision circle.
-/// So if a dispatchable entity moves less than the precision, nothing will be updated.
+/// Movement tolerance for registering a position without an occupied lane.
+#[cfg(test)]
 const PRECISION_RADIUS: f32 = 5.0;
+#[cfg(test)]
 const PRECISION_RADIUS_2: f32 = PRECISION_RADIUS * PRECISION_RADIUS;
 
 /// Dispatcher is used to query for the closest networked entity matching a condition
@@ -89,27 +90,21 @@ impl Dispatcher {
         !(lane == target_lane && offset > target_offset)
     }
 
-    /// Updates the dispatcher cache about the dispatachable entities to know where they are relative
-    /// to the map, so that queries can be answered quickly
+    /// Index trains on the same occupied lanes used to plan freight service.
     pub fn update(&mut self, map: &Map, world: &World) {
         let disp_trains = self
             .dispatches
             .entry(DispatchKind::FreightTrain)
             .or_insert_with(|| DispatchOne::new(DispatchKind::FreightTrain.lane_kind()));
 
-        world.trains.iter().for_each(|(ent, train)| {
-            disp_trains.register(DispatchID::FreightTrain(ent), map, train.trans.pos);
-        });
-
-        /*
-        let disp_trucks = self
-            .dispatches
-            .entry(DispatchKind::SmallTruck)
-            .or_insert_with(|| DispatchOne::new(DispatchKind::SmallTruck.lane_kind()));
-
-        world.vehicles.iter().for_each(|(ent, truck)| {
-            disp_trucks.register(DispatchID::Truck(ent), map, truck.trans.position);
-        })*/
+        for (ent, train) in world.trains.iter() {
+            let id = DispatchID::FreightTrain(ent);
+            if let Some(lane) = train_lane(map, train) {
+                disp_trains.register_on_lane(id, &map.lanes[lane], train.trans.pos);
+            } else {
+                disp_trains.remove_position(id);
+            }
+        }
     }
 
     /// Frees the entity as it is no longer used
@@ -132,6 +127,28 @@ impl Dispatcher {
         disp.unregister(id);
     }
 
+    pub(crate) fn has_available(&self, kind: DispatchKind) -> bool {
+        self.dispatches.get(&kind).is_some_and(|dispatch| {
+            dispatch
+                .positions
+                .keys()
+                .any(|id| !dispatch.reserved_by.contains(id))
+        })
+    }
+
+    pub(crate) fn query_map<T>(
+        &mut self,
+        map: &Map,
+        kind: DispatchKind,
+        target: DispatchQueryTarget,
+        plan: impl Fn(DispatchID) -> Option<T>,
+    ) -> Option<(DispatchID, T)> {
+        let disp = self.dispatches.get_mut(&kind)?;
+        let best = disp.query_map(map, kind, target, plan)?;
+        disp.reserve(best.0);
+        Some(best)
+    }
+
     /// Reserves an entity that is closest to the target (if it is found) and returns it
     /// it takes `me` as an argument so that if `me` is killed, the reservation is cancelled
     /// If no entity is found, returns None
@@ -141,10 +158,8 @@ impl Dispatcher {
         kind: DispatchKind,
         target: DispatchQueryTarget,
     ) -> Option<DispatchID> {
-        let disp = self.dispatches.get_mut(&kind)?;
-        let best_ent = disp.query(map, kind, target)?;
-        disp.reserve(best_ent);
-        Some(best_ent)
+        self.query_map(map, kind, target, |_| Some(()))
+            .map(|(id, ())| id)
     }
 }
 
@@ -158,81 +173,85 @@ impl DispatchOne {
         }
     }
 
+    fn register_on_lane(&mut self, id: DispatchID, lane: &Lane, pos: Vec3) {
+        let previous = self.positions.get(&id);
+        if previous.is_some_and(|previous| previous.lane == lane.id && previous.pos == pos) {
+            return;
+        }
+        if previous.is_none_or(|previous| previous.lane != lane.id) {
+            self.remove_position(id);
+            self.lanes.entry(lane.id).or_default().push(id);
+        }
+
+        self.positions.insert(
+            id,
+            DispatchPosition {
+                lane: lane.id,
+                pos,
+                dist_along: lane.points.length_at_proj(lane.points.project(pos)),
+            },
+        );
+    }
+
+    #[cfg(test)]
     fn register(&mut self, id: DispatchID, map: &Map, pos: Vec3) {
-        let ent = self.positions.entry(id);
-
-        let lanekind = self.lanekind;
-        let find_lane = move || map.nearest_lane(pos, lanekind, Some(50.0));
-
-        match ent {
-            Entry::Vacant(v) => {
-                let Some(n) = find_lane() else { return };
-                let newl = &map.lanes[n];
-                let proj = newl.points.project(pos);
-
-                self.lanes.entry(n).or_default().push(id);
-                v.insert(DispatchPosition {
-                    lane: n,
-                    pos,
-                    dist_along: newl.points.length_at_proj(proj),
-                });
+        if let Some(previous) = self.positions.get_mut(&id) {
+            if previous.pos.distance2(pos) < PRECISION_RADIUS_2 {
+                return;
             }
-            Entry::Occupied(mut o) => {
-                let dp = o.get_mut();
-
-                if dp.pos.distance2(pos) < PRECISION_RADIUS_2 {
+            if let Some(lane) = map.lanes().get(previous.lane) {
+                let projected = lane.points.project(pos);
+                if projected.distance2(pos) < PRECISION_RADIUS_2 {
+                    previous.dist_along = lane.points.length_at_proj(projected);
                     return;
                 }
-
-                if let Some(l) = map.lanes().get(dp.lane) {
-                    let projected = l.points.project(pos);
-                    if projected.distance2(pos) < PRECISION_RADIUS_2 {
-                        dp.dist_along = l.points.length_at_proj(projected);
-                        return;
-                    }
-                }
-
-                let Some(n) = find_lane() else { return };
-                self.lanes.get_mut(&dp.lane).unwrap().retain(|e| *e != id);
-                self.lanes.entry(n).or_default().push(id);
-
-                let newl = &map.lanes[n];
-
-                let projected = newl.points.project(pos);
-                *dp = DispatchPosition {
-                    lane: n,
-                    pos,
-                    dist_along: newl.points.length_at_proj(projected),
-                };
             }
         }
+        if let Some(lane) = map.nearest_lane(pos, self.lanekind, Some(50.0)) {
+            self.register_on_lane(id, &map.lanes[lane], pos);
+        }
+    }
+
+    fn remove_position(&mut self, id: DispatchID) -> bool {
+        let Some(pos) = self.positions.remove(&id) else {
+            return false;
+        };
+        self.lanes.get_mut(&pos.lane).unwrap().retain(|e| *e != id);
+        true
     }
 
     fn reserve(&mut self, id: DispatchID) {
         self.reserved_by.insert(id);
-        let Some(pos) = self.positions.remove(&id) else {
+        if !self.remove_position(id) {
             log::error!("Dispatcher: trying to reserve an entity that is not in the cache");
-            return;
-        };
-        self.lanes.get_mut(&pos.lane).unwrap().retain(|e| *e != id);
+        }
     }
 
     pub fn unregister(&mut self, id: DispatchID) {
         self.reserved_by.remove(&id);
-        let Some(pos) = self.positions.remove(&id) else {
-            return;
-        };
-        self.lanes.get_mut(&pos.lane).unwrap().retain(|e| *e != id);
+        self.remove_position(id);
     }
 
     /// Finds an entity that is closest to the target and returns it
     /// If no entity is found, returns None
-    pub fn query(
-        &mut self,
+    #[cfg(test)]
+    fn query(
+        &self,
         map: &Map,
         kind: DispatchKind,
         target: DispatchQueryTarget,
     ) -> Option<DispatchID> {
+        self.query_map(map, kind, target, |_| Some(()))
+            .map(|(id, ())| id)
+    }
+
+    fn query_map<T>(
+        &self,
+        map: &Map,
+        kind: DispatchKind,
+        target: DispatchQueryTarget,
+        plan: impl Fn(DispatchID) -> Option<T>,
+    ) -> Option<(DispatchID, T)> {
         // todo: handle the case where there are few entities in the cache
         // todo: probably some kind of astar on good candidates
 
@@ -281,13 +300,14 @@ impl DispatchOne {
                 }
                 let pos = self.positions.get(ent).unwrap();
                 let dist = -pos.dist_along; // since dist_along is from start to end, a good dist_along is one that is big
-                if !Dispatcher::position_is_eligible(lane, pos.dist_along, target_lane, start_along)
+                if dist >= best_dist
+                    || !Dispatcher::position_is_eligible(lane, pos.dist_along, target_lane, start_along)
                 {
                     continue;
                 }
-                if dist < best_dist {
+                if let Some(plan) = plan(*ent) {
                     best_dist = dist;
-                    best_ent = Some(*ent);
+                    best_ent = Some((*ent, plan));
                 }
             }
             if best_ent.is_some() {

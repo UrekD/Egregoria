@@ -32,25 +32,35 @@ use serde::{Deserialize, Serialize};
 use super::{
     Budget, BudgetCategory, EcoStats, FreightDay, Market, Trade, TradeTarget, TICKS_PER_BUDGET_DAY,
 };
-use crate::map::{BuildingID, LaneKind, Map, PathKind, RoadID};
+use crate::map::{BuildingID, LaneID, LaneKind, Map, PathKind, RoadID, TraverseKind};
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{
     active_business, ActiveBusiness, BuildingInfos, Destination, Itinerary, ParkingManagement,
 };
 use crate::souls::desire::WorkKind;
-use crate::souls::freight_station::train_stop;
+use crate::souls::freight_station::{train_lane, train_stop};
 use crate::souls::household::household_items;
+use crate::transportation::train::rear_clear_of_turns;
 use crate::transportation::{
     spawn_truck_at_depot, unpark, Location, TransportGrid, VehicleKind, VehicleState,
 };
 use crate::utils::resources::Resources;
-use crate::world::FreightStationEnt;
+use crate::world::{FreightStationEnt, TrainEnt};
 use crate::{
     CompanyID, HumanEnt, HumanID, ParCommandBuffer, Simulation, SoulID, VehicleEnt, VehicleID,
     World,
 };
 
 pub use prototypes::WarehousePolicy;
+
+pub(crate) mod terminal;
+mod trace;
+pub use terminal::{DepotRestock, DepotRestockView, FreightTerminalPolicy, TerminalPolicyView};
+pub(crate) use trace::{CallManifest, FreightSnapshotTail, RailAnchor, RailLeg};
+pub use trace::{
+    DemandKey, FreightCallKey, FreightCursor, FreightFailure, FreightFragment, FreightPage,
+    FreightRecord, FreightStage, FreightTrace, StaleFreightCursor,
+};
 
 // Matching runs on game-minute boundaries, where the retry windows land (two real seconds).
 const FREIGHT_MATCH_INTERVAL: u64 = TICKS_PER_MINUTE;
@@ -141,9 +151,9 @@ pub struct ItemQuantity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-struct Endpoint {
-    soul: SoulID,
-    building: BuildingID,
+pub struct Endpoint {
+    pub soul: SoulID,
+    pub building: BuildingID,
 }
 
 impl Endpoint {
@@ -287,6 +297,25 @@ struct ImportOrder {
     ordered_at: u64,
 }
 
+/// Within one terminal, matching opens at most one order per buyer and SKU
+/// per elapsed tick. The tuple remains stable as quantities and vector slots change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct ImportOrderKey {
+    buyer: Endpoint,
+    item: ItemID,
+    opened_at: u64,
+}
+
+impl ImportOrder {
+    fn key(&self) -> ImportOrderKey {
+        ImportOrderKey {
+            buyer: self.buyer,
+            item: self.quantity.item,
+            opened_at: self.ordered_at,
+        }
+    }
+}
+
 /// A truck of a station's own fleet. Stations drive their trucks themselves,
 /// as they do their trains.
 #[derive(Debug, Serialize, Deserialize)]
@@ -315,6 +344,27 @@ pub enum ImportStatus {
     NoRoute,
     /// An import has been on order since this elapsed tick.
     Waiting { since: u64 },
+    /// A terminal with a working route has paused new imports.
+    Held,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImportBlocker {
+    NoRoute,
+    AdmissionHeld(Endpoint),
+    RailDispatchHeld(Endpoint),
+    TruckDispatchHeld(Endpoint),
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct FreightDemand {
+    pub on_hand: u32,
+    pub batch_need: u32,
+    pub target: u32,
+    pub ordered: u64,
+    pub on_trucks: u64,
+    pub terminal_stock: u64,
+    pub blocker: Option<ImportBlocker>,
 }
 
 /// Companies whose imports are failing, for the advisor.
@@ -382,6 +432,8 @@ pub struct CargoBook {
     topology_edited: bool,
     #[serde(skip)]
     no_import_route: BTreeSet<Endpoint>,
+    #[serde(skip)]
+    import_blockers: BTreeMap<(Endpoint, ItemID), ImportBlocker>,
     // Opt-in observation for acceptance scenarios. It does not affect freight or saves.
     #[serde(skip)]
     road_deadlines: Option<RoadDeadlineWindow>,
@@ -410,6 +462,7 @@ impl Default for CargoBook {
             progress: BTreeMap::new(),
             topology_edited: false,
             no_import_route: BTreeSet::new(),
+            import_blockers: BTreeMap::new(),
             road_deadlines: None,
             road_freight_tracking: RoadFreightTracking::default(),
         }
@@ -632,9 +685,60 @@ impl CargoBook {
         units
     }
 
-    /// A train call at the station: units on order by rail join its stock, up
-    /// to `capacity`. Returns the remaining rail backlog capped for dispatch.
-    pub(crate) fn unload_train(&mut self, station: SoulID, capacity: u32) -> u32 {
+    pub(crate) fn can_dispatch_import(&self, trace: &FreightTrace, terminal: Endpoint) -> bool {
+        trace.import_record_credit() != 0
+            && self.imports.get(&terminal).is_some_and(|desk| {
+                trace
+                    .available_imports(terminal, desk)
+                    .values()
+                    .any(|&units| units > 0)
+            })
+    }
+
+    pub(crate) fn rail_dispatch_gates(
+        &mut self,
+        map: &Map,
+        station: BuildingID,
+        stop: geom::Vec3,
+    ) -> (&[RailGate], bool) {
+        self.routes.refresh(map);
+        let cached = self.routes.rail.contains_key(&station);
+        (self.routes.rail_gates(map, station, stop), cached)
+    }
+
+    pub(crate) fn reserve_call(&self, trace: &mut FreightTrace, call: &mut CallManifest, now: u64) {
+        if let Some(desk) = self.imports.get(&call.key.terminal) {
+            trace.reserve_imports(call, desk, now);
+        }
+    }
+
+    pub(crate) fn receive_call(
+        &mut self,
+        trace: &mut FreightTrace,
+        call: &mut CallManifest,
+        now: u64,
+    ) -> u32 {
+        let Some(desk) = self.imports.get_mut(&call.key.terminal) else {
+            return 0;
+        };
+        trace.receive_imports(call, desk, now);
+        desk.wanted_cargo()
+    }
+
+    pub(crate) fn close_call(
+        &mut self,
+        trace: &mut FreightTrace,
+        call: CallManifest,
+        terminal_live: bool,
+        failure: Option<FreightFailure>,
+        now: u64,
+    ) {
+        let desk = self.imports.get_mut(&call.key.terminal);
+        trace.close_call(call, desk, terminal_live, failure, now);
+    }
+
+    #[cfg(test)]
+    fn unload_train(&mut self, station: SoulID, capacity: u32) -> u32 {
         let Some(desk) = self
             .imports
             .iter_mut()
@@ -672,6 +776,13 @@ impl CargoBook {
         })
     }
 
+    pub fn station_truck_runs(&self, endpoint: Endpoint) -> usize {
+        self.station_trucks
+            .values()
+            .filter(|fleet| fleet.station == endpoint && fleet.trip.is_some())
+            .count()
+    }
+
     /// Why a company's input is not here yet, if imports are involved.
     pub fn import_status(&self, company: SoulID) -> Option<ImportStatus> {
         let ordered = self
@@ -689,10 +800,79 @@ impl CargoBook {
         if let Some(since) = ordered.chain(carried).min() {
             return Some(ImportStatus::Waiting { since });
         }
+        if self.import_blockers.iter().any(|(&(end, _), blocker)| {
+            end.soul == company && matches!(blocker, ImportBlocker::AdmissionHeld(_))
+        }) {
+            return Some(ImportStatus::Held);
+        }
         self.no_import_route
             .iter()
             .any(|end| end.soul == company)
             .then_some(ImportStatus::NoRoute)
+    }
+
+    pub fn freight_demand(&self, sim: &Simulation, key: DemandKey) -> Option<FreightDemand> {
+        let buyer = Endpoint {
+            soul: SoulID::GoodsCompany(key.owner),
+            building: key.building,
+        };
+        let map = sim.map();
+        let infos = sim.read::<BuildingInfos>();
+        let input = destination_input(sim.world(), &map, &infos, buyer, key.item)?;
+        let market = sim.read::<Market>();
+        let trace = sim.read::<FreightTrace>();
+        let mut demand = FreightDemand {
+            on_hand: on_hand(&market, buyer, key.item),
+            batch_need: input.amount,
+            target: import_target(input),
+            ordered: 0,
+            on_trucks: 0,
+            terminal_stock: 0,
+            blocker: self.import_blockers.get(&(buyer, key.item)).copied(),
+        };
+        for (&terminal, desk) in &self.imports {
+            let units = desk
+                .orders
+                .iter()
+                .filter(|order| order.buyer == buyer && order.quantity.item == key.item)
+                .map(|order| u64::from(order.quantity.units))
+                .sum::<u64>();
+            if units == 0 {
+                continue;
+            }
+            demand.ordered += units;
+            let stock = desk.stock.get(&key.item).copied().unwrap_or(0);
+            demand.terminal_stock += stock;
+            let policy = trace.terminal_policy(terminal).policy;
+            if stock > 0 && policy.max_truck_runs == 0 {
+                demand.blocker = Some(ImportBlocker::TruckDispatchHeld(terminal));
+            } else if stock == 0 && policy.max_calls == 0 {
+                demand.blocker = Some(ImportBlocker::RailDispatchHeld(terminal));
+            }
+        }
+        for trip in self
+            .station_trucks
+            .values()
+            .filter_map(|fleet| fleet.trip.as_ref())
+        {
+            if trip.buyer == buyer {
+                demand.on_trucks += trip
+                    .items
+                    .iter()
+                    .filter(|line| line.item == key.item)
+                    .map(|line| u64::from(line.units))
+                    .sum::<u64>();
+            }
+        }
+        for load in self.loads.values().filter(|load| load.destination == buyer) {
+            demand.on_trucks += load
+                .items
+                .iter()
+                .filter(|line| line.item == key.item)
+                .map(|line| u64::from(line.units))
+                .sum::<u64>();
+        }
+        Some(demand)
     }
 
     /// Companies with no import route, and those waiting too long for one.
@@ -930,10 +1110,41 @@ struct RouteCache {
     access: BTreeMap<BuildingID, (Option<RoadID>, Option<ParkingAccess>)>,
     distances: BTreeMap<(BuildingID, BuildingID), Option<OrderedFloat<f32>>>,
     // Placing or removing the outside market does not change lane topology.
-    rail_market: Option<BuildingID>,
+    rail_markets: Vec<BuildingID>,
     /// Stations whose platform has a rail route to the outside.
-    rail: BTreeMap<BuildingID, bool>,
+    rail: BTreeMap<BuildingID, Vec<RailGate>>,
     searches: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RailGate {
+    pub outside: BuildingID,
+    pub gate: RailAnchor,
+    pub berth: RailAnchor,
+}
+
+impl RailGate {
+    pub fn approach(
+        self,
+        tick: Tick,
+        map: &Map,
+        train: &TrainEnt,
+        lane: LaneID,
+    ) -> Option<(RailAnchor, Itinerary, RailLeg)> {
+        let clearance = self.gate.clearance(map, train.locomotive.length)?;
+        let departure = self.gate.departure_point(map, clearance)?;
+        let (target, leg) = if lane == self.gate.lane
+            && train.trans.pos.distance(clearance.position) <= 40.0
+            && departure.before(train.trans.pos)
+            && rear_clear_of_turns(&train.res)
+        {
+            (self.berth, RailLeg::Inbound)
+        } else {
+            (clearance, RailLeg::Positioning)
+        };
+        let route = target.route(tick, map, train.trans.pos, lane)?;
+        Some((departure, route, leg))
+    }
 }
 
 impl RouteCache {
@@ -946,15 +1157,15 @@ impl RouteCache {
                 ..Self::default()
             };
         }
-        let rail_market = map.external_train_stations.first().copied();
-        if self.rail_market != rail_market {
-            self.rail_market = rail_market;
+        if self.rail_markets != map.external_train_stations {
+            self.rail_markets.clone_from(&map.external_train_stations);
             self.rail.clear();
         }
     }
 
     fn forget(&mut self, building: BuildingID) {
         self.access.remove(&building);
+        self.rail.remove(&building);
         self.distances
             .retain(|&(from, to), _| from != building && to != building);
     }
@@ -994,31 +1205,24 @@ impl RouteCache {
         access
     }
 
-    /// Whether a train can run from the outside to the station's platform track and back.
-    fn rail_served(&mut self, map: &Map, station: BuildingID, stop: geom::Vec3) -> bool {
+    /// Cache directed eligibility, including misses, for every live outside gate.
+    fn rail_gates(&mut self, map: &Map, station: BuildingID, stop: geom::Vec3) -> &[RailGate] {
         self.refresh(map);
-        *self.rail.entry(station).or_insert_with(|| {
-            let Some(outside) = map
-                .external_train_stations
-                .first()
-                .and_then(|&id| map.get(id))
-            else {
-                return false;
+        self.rail.entry(station).or_insert_with(|| {
+            let Some(berth) = RailAnchor::near(map, stop) else {
+                return Vec::new();
             };
-            // The train dispatcher looks for the platform track this close to the stop.
-            let Some(platform) = map
-                .nearest_lane(stop, LaneKind::Rail, Some(50.0))
-                .and_then(|id| map.get(id))
-            else {
-                return false;
-            };
-            let stop = platform.points.project(stop);
-            let outside = outside.obb.center().z(0.0);
-            [(outside, stop), (stop, outside)]
-                .into_iter()
-                .all(|(from, to)| {
-                    Itinerary::route(Tick(0), from, to, map, PathKind::Rail).is_some()
+            map.external_train_stations
+                .iter()
+                .filter_map(|&outside| {
+                    let market = map.get(outside)?;
+                    let gate = RailAnchor::near(map, market.obb.center().z(market.height))?;
+                    let departure = gate.departure_point(map, gate)?;
+                    berth.route(Tick(0), map, departure.position, gate.lane)?;
+                    gate.route(Tick(0), map, berth.position, berth.lane)?;
+                    Some(RailGate { outside, gate, berth })
                 })
+                .collect()
         })
     }
 
@@ -1216,6 +1420,7 @@ struct Warehouse {
     id: CompanyID,
     endpoint: Endpoint,
     spec: &'static WarehouseSpec,
+    restock: DepotRestock,
     items: BTreeSet<ItemID>,
     policy: WarehousePolicy,
     dispatch: DispatchPolicy,
@@ -1627,8 +1832,8 @@ impl Matching<'_> {
         // local recipes use leave only from above the high watermark.
         if !urgent && warehouse.policy != WarehousePolicy::ReserveLocally {
             let held: u32 = stock.values().sum();
-            let mut above_low = held.saturating_sub(warehouse.spec.low_water_units);
-            let mut above_high = held.saturating_sub(warehouse.spec.high_water_units);
+            let mut above_low = held.saturating_sub(warehouse.restock.low);
+            let mut above_high = held.saturating_sub(warehouse.restock.high);
             let station = (above_low > 0)
                 .then(|| self.nearest_station(source, stations))
                 .flatten();
@@ -1736,7 +1941,7 @@ impl Matching<'_> {
             let limit = if surplus {
                 warehouse.spec.capacity_units
             } else if serves_local && self.book.restocking.contains(&warehouse.id) {
-                warehouse.spec.high_water_units
+                warehouse.restock.high
             } else if serves_local && missing {
                 // Space above the watermark still takes one load of a locally
                 // used item the warehouse holds none of.
@@ -1755,7 +1960,7 @@ impl Matching<'_> {
             *warehouse.staged_items.entry(item).or_default() += units;
             warehouse.committed += units;
             available -= units;
-            if warehouse.staged >= warehouse.spec.high_water_units {
+            if warehouse.staged >= warehouse.restock.high {
                 self.book.restocking.remove(&warehouse.id);
             }
             if available == 0 {
@@ -1937,6 +2142,7 @@ fn match_shipments(
                 .then_some((id, source, policy, recipe))
         })
         .collect();
+    let freight = resources.read::<FreightTrace>();
     let warehouse_sites: Vec<_> = world
         .companies
         .iter()
@@ -1948,11 +2154,16 @@ fn match_shipments(
                 soul: SoulID::GoodsCompany(id),
                 building: company.comp.building,
             };
-            endpoint
-                .live(world, map, infos)
-                .then_some((id, endpoint, spec, dispatch))
+            endpoint.live(world, map, infos).then_some((
+                id,
+                endpoint,
+                spec,
+                dispatch,
+                freight.depot_restock(id, spec).limits,
+            ))
         })
         .collect();
+    drop(freight);
     if sources.is_empty() && warehouse_sites.is_empty() {
         return;
     }
@@ -1963,7 +2174,7 @@ fn match_shipments(
         .chain(
             warehouse_sites
                 .iter()
-                .flat_map(|(_, _, spec, _)| stored_items(spec)),
+                .flat_map(|(_, _, spec, _, _)| stored_items(spec)),
         )
         .collect();
     let mut inputs = BTreeMap::<_, Vec<Input>>::new();
@@ -1999,6 +2210,7 @@ fn match_shipments(
             ));
         }
     }
+    let trace = resources.read::<FreightTrace>();
     let stations: Vec<_> = world
         .freight_stations
         .iter()
@@ -2007,9 +2219,10 @@ fn match_shipments(
                 soul: SoulID::FreightStation(id),
                 building: station.f.building,
             };
-            endpoint.live(world, map, infos).then_some(endpoint)
+            (endpoint.live(world, map, infos) && trace.admit_export(endpoint)).then_some(endpoint)
         })
         .collect();
+    drop(trace);
     let time = resources.read::<GameTime>();
     let mut market = resources.write::<Market>();
     let routes = ordered_shipment_routes(book, world, map, infos, &market);
@@ -2026,7 +2239,7 @@ fn match_shipments(
             .chain(
                 warehouse_sites
                     .iter()
-                    .map(|&(id, source, _, policy)| (id, source, policy)),
+                    .map(|&(id, source, _, policy, _)| (id, source, policy)),
             ),
     );
     let mut matching = Matching {
@@ -2049,7 +2262,7 @@ fn match_shipments(
                 }
             }
         }
-        for (id, endpoint, spec, dispatch) in warehouse_sites {
+        for (id, endpoint, spec, dispatch, restock) in warehouse_sites {
             let items = stored_items(spec);
             let mut on_hand_total = 0;
             let mut staged_items = BTreeMap::new();
@@ -2069,6 +2282,7 @@ fn match_shipments(
                 id,
                 endpoint,
                 spec,
+                restock,
                 items,
                 policy: matching.book.warehouse_policy(id, spec),
                 dispatch,
@@ -2094,9 +2308,9 @@ fn match_shipments(
             }
             if !urgent {
                 // A zero low watermark restocks once the warehouse is empty.
-                if warehouse.staged < warehouse.spec.low_water_units.max(1) {
+                if warehouse.staged < warehouse.restock.low.max(1) {
                     matching.book.restocking.insert(warehouse.id);
-                } else if warehouse.staged >= warehouse.spec.high_water_units {
+                } else if warehouse.staged >= warehouse.restock.high {
                     matching.book.restocking.remove(&warehouse.id);
                 }
             }
@@ -2221,6 +2435,17 @@ fn match_shipments(
                     .min_by_key(|&station| distance(station))
                     .filter(|_| available >= policy.minimum)
                 {
+                    let SoulID::FreightStation(id) = station.soul else {
+                        unreachable!()
+                    };
+                    if !resources.write::<FreightTrace>().reserve_export_space(
+                        station,
+                        world.freight_stations[id].f.waiting_cargo,
+                        u64::from(available),
+                        1,
+                    ) {
+                        continue;
+                    }
                     let trade =
                         matching
                             .market
@@ -2228,7 +2453,7 @@ fn match_shipments(
                     matching
                         .market
                         .produce(source.soul, item, -(available as i32));
-                    post_freight_trade(world, resources, trade);
+                    post_freight_trade(world, resources, trade, None);
                 }
             }
         }
@@ -2330,30 +2555,45 @@ fn dispatch(
             }
 
             let mut items = BTreeMap::<_, u32>::new();
-            let mut observed_portions = Vec::new();
+            let mut planned = Vec::new();
             for id in ids {
-                let shipment = book.shipments.get_mut(id).unwrap();
-                let ItemQuantity { item, units } = shipment.quantity;
+                let ItemQuantity { item, units } = book.shipments[id].quantity;
                 let room = room.get_mut(&item).unwrap();
                 let loaded = units.min(take).min(*room);
                 if loaded == 0 {
                     continue;
                 }
+                planned.push((*id, loaded));
                 *items.entry(item).or_default() += loaded;
-                if !book.road_freight_tracking.shipments.is_empty()
-                    && book.road_freight_tracking.shipments.contains_key(id)
-                {
-                    observed_portions.push((*id, loaded));
-                }
-                *in_transit.entry((destination, item)).or_default() += loaded;
                 take -= loaded;
                 *room -= loaded;
-                shipment.quantity.units -= loaded;
-                if shipment.quantity.units == 0 {
-                    book.shipments.remove(id);
-                }
                 if take == 0 {
                     break;
+                }
+            }
+            if let SoulID::FreightStation(id) = destination.soul {
+                let units = items.values().map(|&units| u64::from(units)).sum();
+                if !resources.write::<FreightTrace>().reserve_export_space(
+                    destination,
+                    world.freight_stations[id].f.waiting_cargo,
+                    units,
+                    items.len(),
+                ) {
+                    break;
+                }
+            }
+            let mut observed_portions = Vec::new();
+            for (id, loaded) in planned {
+                if book.road_freight_tracking.shipments.contains_key(&id) {
+                    observed_portions.push((id, loaded));
+                }
+                let shipment = book.shipments.get_mut(&id).unwrap();
+                *in_transit
+                    .entry((destination, shipment.quantity.item))
+                    .or_default() += loaded;
+                shipment.quantity.units -= loaded;
+                if shipment.quantity.units == 0 {
+                    book.shipments.remove(&id);
                 }
             }
             let from = map.buildings()[source.building].door_pos;
@@ -2485,21 +2725,39 @@ pub fn reserve_road_freight(
 
 /// Records the station side of a virtual export. The ordinary market still
 /// owns its budget, stock and trade history. Imports never match at the market.
-pub fn settle_physical_match(world: &mut World, _resources: &Resources, trade: Trade) -> bool {
-    record_rail_handoff(world, trade);
+pub fn settle_physical_match(world: &mut World, resources: &Resources, trade: Trade) -> bool {
+    record_rail_handoff(world, resources, trade, None);
     false
 }
 
-fn record_rail_handoff(world: &mut World, trade: Trade) {
+fn record_rail_handoff(
+    world: &mut World,
+    resources: &Resources,
+    trade: Trade,
+    load: Option<LoadId>,
+) {
     if let SoulID::FreightStation(id) = trade.buyer.0 {
         if let Some(station) = world.freight_stations.get_mut(id) {
             station.f.accept_export(trade.qty as u32);
+            let terminal = Endpoint {
+                soul: trade.buyer.0,
+                building: station.f.building,
+            };
+            let now = elapsed_ticks(resources).0;
+            resources
+                .write::<FreightTrace>()
+                .stage_export(terminal, trade, load, now);
         }
     }
 }
 
-fn post_freight_trade(world: &mut World, resources: &Resources, trade: Trade) {
-    record_rail_handoff(world, trade);
+fn post_freight_trade(
+    world: &mut World,
+    resources: &Resources,
+    trade: Trade,
+    load: Option<LoadId>,
+) {
+    record_rail_handoff(world, resources, trade, load);
     if trade.money_delta != Money::ZERO {
         Budget::apply(resources, BudgetCategory::TradeExport, trade.money_delta);
     }
@@ -2614,7 +2872,7 @@ pub fn complete_delivery(
                 money_delta: Money::ZERO,
             }
         };
-        post_freight_trade(world, resources, trade);
+        post_freight_trade(world, resources, trade, Some(load));
     }
     book.record_road_deadline(manifest.due_at, !late);
     book.day_mut(now).record_delivery(units, late);
@@ -2722,12 +2980,20 @@ fn cancel_removed_imports(
     endpoint: impl Fn(Endpoint) -> bool,
 ) {
     let mut market = resources.write::<Market>();
+    let mut trace = resources.write::<FreightTrace>();
+    let now = elapsed_ticks(resources).0;
     if let CargoRemoval::Truck(truck) = removal {
         if let Some(StationTruck {
             station,
             trip: Some(trip),
         }) = book.station_trucks.remove(&truck)
         {
+            let stage = if book.imports.contains_key(&station) {
+                FreightStage::Returned
+            } else {
+                FreightStage::WrittenOff
+            };
+            trace.settle_truck(truck, station, trip.buyer, stage, &BTreeMap::new(), now);
             match book.imports.get_mut(&station) {
                 Some(desk) => desk.restock(&trip.items),
                 None => trip
@@ -2759,14 +3025,25 @@ fn cancel_removed_imports(
         if !endpoint(fleet.station) {
             return true;
         }
+        if let Some(trip) = &fleet.trip {
+            trace.settle_truck(
+                truck,
+                fleet.station,
+                trip.buyer,
+                FreightStage::WrittenOff,
+                &BTreeMap::new(),
+                now,
+            );
+        }
         for line in fleet.trip.iter().flat_map(|trip| &trip.items) {
             market.record_freight_loss(line.item, line.units);
         }
         commands.kill(truck);
         false
     });
-    for desk in book.imports.values_mut() {
+    for (&terminal, desk) in &mut book.imports {
         desk.orders.retain(|order| !endpoint(order.buyer));
+        trace.detach_closed_orders(terminal, desk);
     }
 }
 
@@ -2818,6 +3095,13 @@ fn release(
     }
     for id in loads {
         let load = book.loads.remove(&id).unwrap();
+        if matches!(load.destination.soul, SoulID::FreightStation(_)) {
+            resources.write::<FreightTrace>().release_export_space(
+                load.destination,
+                u64::from(load.units()),
+                load.items.len(),
+            );
+        }
         book.road_freight_tracking.finish_load(id, false);
         for &quantity in &load.items {
             restore(load.source, quantity, world);
@@ -3057,14 +3341,19 @@ fn stalled(progress: &mut Option<LoadProgress>, pos: geom::Vec3, now: u64) -> bo
     now >= last.since + LOAD_STALL_TICKS
 }
 
-/// Stations that can import: live, with a train and a rail route to the outside.
+/// Live stations with a gate that at least one consist can serve.
 fn import_stations(
     routes: &mut RouteCache,
     world: &World,
     map: &Map,
     infos: &BuildingInfos,
 ) -> Vec<Endpoint> {
-    if world.trains.is_empty() {
+    let trains: Vec<_> = world
+        .trains
+        .values()
+        .filter_map(|train| train_lane(map, train).map(|lane| (train, lane)))
+        .collect();
+    if trains.is_empty() {
         return Vec::new();
     }
     world
@@ -3075,9 +3364,18 @@ fn import_stations(
                 soul: SoulID::FreightStation(id),
                 building: station.f.building,
             };
-            (endpoint.live(world, map, infos)
-                && routes.rail_served(map, endpoint.building, train_stop(&station.trans)))
-            .then_some(endpoint)
+            if !endpoint.live(world, map, infos) {
+                return None;
+            }
+            routes
+                .rail_gates(map, endpoint.building, train_stop(&station.trans))
+                .iter()
+                .any(|gate| {
+                    trains
+                        .iter()
+                        .any(|&(train, lane)| gate.approach(Tick(0), map, train, lane).is_some())
+                })
+                .then_some(endpoint)
         })
         .collect()
 }
@@ -3118,7 +3416,6 @@ fn order_imports(
     infos: &BuildingInfos,
     now: u64,
 ) {
-    let stations = import_stations(&mut book.routes, world, map, infos);
     let market = resources.read::<Market>();
     for (station, desk) in &mut book.imports {
         if !station.live(world, map, infos) {
@@ -3142,9 +3439,16 @@ fn order_imports(
             })
         });
     }
+    {
+        let mut trace = resources.write::<FreightTrace>();
+        for (&terminal, desk) in &book.imports {
+            trace.detach_closed_orders(terminal, desk);
+        }
+    }
     let mut pending = book.imports_pending();
 
     book.no_import_route.clear();
+    book.import_blockers.clear();
     book.import_customers.retain(|&(buyer, _), &mut last| {
         now < last + TICKS_PER_BUDGET_DAY && buyer.live(world, map, infos)
     });
@@ -3173,6 +3477,7 @@ fn order_imports(
     for &key in book.import_customers.keys() {
         wants.entry(key).or_insert(None);
     }
+    let mut stations = None;
     for ((buyer, item), ordered) in wants {
         let Some(input) = destination_input(world, map, infos, buyer, item) else {
             continue;
@@ -3193,15 +3498,30 @@ fn order_imports(
         if units == 0 {
             continue;
         }
-        let station = stations
+        let trace = resources.read::<FreightTrace>();
+        let mut reachable: Vec<_> = stations
+            .get_or_insert_with(|| import_stations(&mut book.routes, world, map, infos))
             .iter()
             .copied()
             .filter(|station| book.routes.reaches(map, station.building, buyer.building))
-            .min_by_key(|&station| straight_distance(map, buyer, station));
+            .collect();
+        reachable
+            .sort_unstable_by_key(|&station| (straight_distance(map, buyer, station), station));
+        let station = reachable
+            .iter()
+            .copied()
+            .find(|&station| trace.terminal_policy(station).policy.admit_imports);
         let Some(station) = station else {
-            book.no_import_route.insert(buyer);
+            let blocker = if let Some(&held) = reachable.first() {
+                ImportBlocker::AdmissionHeld(held)
+            } else {
+                book.no_import_route.insert(buyer);
+                ImportBlocker::NoRoute
+            };
+            book.import_blockers.insert(key, blocker);
             continue;
         };
+        drop(trace);
         book.imports.entry(station).or_default().place(ImportOrder {
             buyer,
             quantity: ItemQuantity { item, units },
@@ -3264,11 +3584,20 @@ fn dispatch_station_trucks(
         routes,
         ..
     } = book;
+    let mut trace = resources.write::<FreightTrace>();
+    let mut active = BTreeMap::<Endpoint, usize>::new();
+    for fleet in station_trucks.values().filter(|fleet| fleet.trip.is_some()) {
+        *active.entry(fleet.station).or_default() += 1;
+    }
     for (&truck, fleet) in station_trucks.iter_mut() {
         let Some(vehicle) = world.vehicles.get(truck) else {
             continue;
         };
         if fleet.trip.is_some() || !matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot) {
+            continue;
+        }
+        let runs = active.entry(fleet.station).or_default();
+        if *runs >= usize::from(trace.terminal_policy(fleet.station).policy.max_truck_runs) {
             continue;
         }
         let Some(desk) = imports.get_mut(&fleet.station) else {
@@ -3290,7 +3619,7 @@ fn dispatch_station_trucks(
         ranked.sort_unstable();
 
         let mut attempted = BTreeSet::new();
-        let Some((buyer, route)) = ranked.iter().find_map(|&(_, _, index)| {
+        let Some((buyer, route, lane, position)) = ranked.iter().find_map(|&(_, _, index)| {
             let buyer = orders[index].buyer;
             if !attempted.insert(buyer)
                 || !routes.reaches(map, fleet.station.building, buyer.building)
@@ -3305,7 +3634,13 @@ fn dispatch_station_trucks(
                 map,
                 PathKind::Vehicle,
             )?;
-            Some((buyer, route))
+            let plan = route.get_route()?;
+            let last = plan.reversed_route.first().unwrap_or(&plan.cur);
+            let TraverseKind::Lane(lane) = last.kind else {
+                return None;
+            };
+            let position = last.raw_points(map)?.project(access.drive_pos);
+            Some((buyer, route, lane, position))
         }) else {
             continue;
         };
@@ -3313,13 +3648,15 @@ fn dispatch_station_trucks(
         let mut room = STATION_TRUCK_CAPACITY;
         let mut items = BTreeMap::<_, u32>::new();
         let mut ordered_at = now;
+        let mut planned = Vec::new();
         let mut claimed = BTreeMap::<_, u64>::new();
         for (_, _, index) in ranked {
-            let order = &mut orders[index];
+            let order = &orders[index];
             let ItemQuantity { item, units } = order.quantity;
-            let held = stock.get_mut(&item).unwrap();
+            let held = stock[&item];
             let prior = claimed.entry(item).or_default();
-            let available = held.saturating_sub(*prior);
+            let available =
+                held.saturating_sub(*prior + u64::from(items.get(&item).copied().unwrap_or(0)));
             if order.buyer != buyer {
                 // An earlier reachable customer gets first claim on shared
                 // stock even if its order must leave on a different truck.
@@ -3334,8 +3671,7 @@ fn dispatch_station_trucks(
             if loaded == 0 {
                 continue;
             }
-            order.quantity.units -= loaded;
-            *held -= u64::from(loaded);
+            planned.push((index, loaded));
             room -= loaded;
             *items.entry(item).or_default() += loaded;
             ordered_at = ordered_at.min(order.ordered_at);
@@ -3343,8 +3679,28 @@ fn dispatch_station_trucks(
                 break;
             }
         }
+        if items.is_empty() || !trace.can_load_truck(fleet.station, &items, stock) {
+            continue;
+        }
+        for (index, loaded) in planned {
+            let order = &mut orders[index];
+            order.quantity.units -= loaded;
+            *stock.get_mut(&order.quantity.item).unwrap() -= u64::from(loaded);
+        }
         orders.retain(|order| order.quantity.units > 0);
         stock.retain(|_, units| *units > 0);
+        trace.load_truck(
+            truck,
+            fleet.station,
+            buyer,
+            &items,
+            stock,
+            lane,
+            position,
+            now,
+        );
+        trace.detach_closed_orders(fleet.station, desk);
+        *runs += 1;
         fleet.trip = Some(ImportTrip {
             buyer,
             items: items
@@ -3383,6 +3739,8 @@ fn track_station_trucks(
     infos: &BuildingInfos,
     now: u64,
 ) {
+    let routes = &mut book.routes;
+    let trace = resources.read::<FreightTrace>();
     let legs: Vec<_> = book
         .station_trucks
         .iter_mut()
@@ -3410,7 +3768,25 @@ fn track_station_trucks(
                 .is_some_and(|since| now >= since + ROUTING_RETRY_WINDOW)
                 || now >= trip.departed_at + DELIVERY_EXPIRY
                 || stalled;
-            let arrived = moving && vehicle.it.has_ended(0.0);
+            let destination = if trip.returning {
+                fleet.station
+            } else {
+                trip.buyer
+            };
+            let arrived = moving
+                && vehicle.it.has_ended(0.0)
+                && (trip.returning || trace.truck_arrived(truck))
+                && routes
+                    .access(map, destination.building)
+                    .is_some_and(|access| {
+                        vehicle.it.end_pos() == Some(access.drive_pos)
+                            && vehicle.it.get_travers().is_some_and(|traversal| {
+                                traversal.raw_points(map).is_some_and(|points| {
+                                    points.project(access.drive_pos).distance(vehicle.trans.pos)
+                                        < 0.5
+                                })
+                            })
+                    });
             match (trip.returning, arrived, gave_up) {
                 (false, true, _) => Some((truck, StationLeg::Unload)),
                 (false, false, true) => Some((truck, StationLeg::Abort)),
@@ -3419,6 +3795,7 @@ fn track_station_trucks(
             }
         })
         .collect();
+    drop(trace);
     if legs.is_empty() {
         return;
     }
@@ -3431,13 +3808,34 @@ fn track_station_trucks(
         let buyer = trip.buyer;
         let restock = match leg {
             StationLeg::Unload if buyer.live(world, map, infos) => {
-                unload_import(book, resources, station, buyer, &items, now);
+                let booked = unload_import(book, resources, station, buyer, &items, now);
+                resources.write::<FreightTrace>().settle_truck(
+                    truck,
+                    station,
+                    buyer,
+                    FreightStage::Delivered,
+                    &booked,
+                    now,
+                );
                 false
             }
             StationLeg::Park => false,
             StationLeg::Unload | StationLeg::Abort => true,
         };
         if restock {
+            let stage = if book.imports.contains_key(&station) {
+                FreightStage::Returned
+            } else {
+                FreightStage::WrittenOff
+            };
+            resources.write::<FreightTrace>().settle_truck(
+                truck,
+                station,
+                buyer,
+                stage,
+                &BTreeMap::new(),
+                now,
+            );
             match book.imports.get_mut(&station) {
                 Some(desk) => desk.restock(&items),
                 None => {
@@ -3481,7 +3879,8 @@ fn unload_import(
     buyer: Endpoint,
     items: &[ItemQuantity],
     now: u64,
-) {
+) -> BTreeMap<ItemID, Money> {
+    let mut booked = BTreeMap::new();
     for &ItemQuantity { item, units } in items {
         let trade = {
             let mut market = resources.write::<Market>();
@@ -3494,7 +3893,9 @@ fn unload_import(
         book.import_customers.insert((buyer, item), now);
         Budget::apply(resources, BudgetCategory::TradeImport, trade.money_delta);
         resources.write::<EcoStats>().record_trade(&trade);
+        *booked.entry(item).or_default() += trade.money_delta;
     }
+    booked
 }
 
 /// Puts a station truck back in the station's yard, off the road.
@@ -3978,55 +4379,82 @@ mod lifecycle_tests {
     #[test]
     fn e2b_both_warehouses_fill_to_high_and_drain_for_local_shortage() {
         for (name, capacity, fleet) in [("small-depot", 64, 2), ("large-warehouse", 256, 4)] {
-            let mut f = Fixture::new();
-            let depot = warehouse(&mut f, name);
-            let proto = GoodsCompanyID::new(name).prototype();
-            let spec = proto.storage.as_ref().unwrap();
-            assert_eq!((spec.capacity_units, proto.n_trucks), (capacity, fleet));
-            let (driver, truck) = warehouse_driver(&mut f, depot);
-            let input = fixture_input(&f.ctx.g, f.destination, Fixture::coal()).unwrap();
-            let policy =
-                DispatchPolicy::for_prototype(GoodsCompanyID::new("coal-mine").prototype())
-                    .unwrap();
-            f.seed(1000, input.target(policy) as i32);
-            for step in 1..=spec.high_water_units.div_ceil(16) + 1 {
-                f.update(u64::from(step) * FREIGHT_MATCH_INTERVAL);
-                let incoming = f
-                    .ctx
-                    .g
-                    .read::<CargoBook>()
-                    .stock_for(depot.building)
-                    .get(&Fixture::coal())
-                    .map_or(0, |stock| stock.incoming);
-                let staged = ((DEPARTURES_PER_DRIVER + step - 1) * policy.capacity)
-                    .min(spec.high_water_units);
-                assert_eq!(f.hand(depot) as u32 + incoming, staged);
-                if f.manifest_units() > 0 {
-                    let (driver, truck) = (f.driver, f.truck);
-                    unload_fixture(&mut f, driver, truck, depot.building);
-                }
-            }
-            assert_eq!(f.hand(depot), spec.high_water_units as i32);
-            let destination_stock = f.hand(f.destination);
-            let source_stock = f.hand(f.source);
-            {
-                let mut market = f.ctx.g.write::<Market>();
-                market.produce(f.destination.soul, Fixture::coal(), -destination_stock);
-                market.produce(f.source.soul, Fixture::coal(), -source_stock);
-            }
-            f.update(100 * FREIGHT_MATCH_INTERVAL);
-            let at = f.destination.building;
-            unload_fixture(&mut f, driver, truck, at);
-            assert_eq!(f.hand(f.destination), 16);
-            assert!(f.hand(depot) < spec.high_water_units as i32);
-
-            let mut direct = Fixture::new();
-            direct.seed(16, 0);
-            direct.update(FREIGHT_MATCH_INTERVAL);
-            let (driver, truck, at) = (direct.driver, direct.truck, direct.destination.building);
-            unload_fixture(&mut direct, driver, truck, at);
-            assert_eq!(direct.hand(direct.destination), f.hand(f.destination));
+            warehouse_fills_and_drains(name, capacity, fleet, None);
         }
+    }
+
+    #[test]
+    fn p8_depot_new_watermarks_change_stock_and_keep_verified_deliveries() {
+        warehouse_fills_and_drains(
+            "small-depot",
+            64,
+            2,
+            Some(DepotRestock { low: 8, high: 32 }),
+        );
+    }
+
+    fn warehouse_fills_and_drains(
+        name: &str,
+        capacity: u32,
+        fleet: u32,
+        setting: Option<DepotRestock>,
+    ) {
+        let mut f = Fixture::new();
+        let depot = warehouse(&mut f, name);
+        let proto = GoodsCompanyID::new(name).prototype();
+        let spec = proto.storage.as_ref().unwrap();
+        assert_eq!((spec.capacity_units, proto.n_trucks), (capacity, fleet));
+        let high = if let Some(limits) = setting {
+            f.ctx.apply(&[WorldCommand::SetWarehouseRestock {
+                depot,
+                expected_revision: 0,
+                limits,
+            }]);
+            limits.high
+        } else {
+            spec.high_water_units
+        };
+        let (driver, truck) = warehouse_driver(&mut f, depot);
+        let input = fixture_input(&f.ctx.g, f.destination, Fixture::coal()).unwrap();
+        let policy =
+            DispatchPolicy::for_prototype(GoodsCompanyID::new("coal-mine").prototype()).unwrap();
+        f.seed(1000, input.target(policy) as i32);
+        for step in 1..=high.div_ceil(16) + 1 {
+            f.update(u64::from(step) * FREIGHT_MATCH_INTERVAL);
+            let incoming = f
+                .ctx
+                .g
+                .read::<CargoBook>()
+                .stock_for(depot.building)
+                .get(&Fixture::coal())
+                .map_or(0, |stock| stock.incoming);
+            let staged = ((DEPARTURES_PER_DRIVER + step - 1) * policy.capacity).min(high);
+            assert_eq!(f.hand(depot) as u32 + incoming, staged);
+            if f.manifest_units() > 0 {
+                let (driver, truck) = (f.driver, f.truck);
+                unload_fixture(&mut f, driver, truck, depot.building);
+            }
+        }
+        assert_eq!(f.hand(depot), high as i32);
+        let destination_stock = f.hand(f.destination);
+        let source_stock = f.hand(f.source);
+        {
+            let mut market = f.ctx.g.write::<Market>();
+            market.produce(f.destination.soul, Fixture::coal(), -destination_stock);
+            market.produce(f.source.soul, Fixture::coal(), -source_stock);
+        }
+        f.update(100 * FREIGHT_MATCH_INTERVAL);
+        let at = f.destination.building;
+        unload_fixture(&mut f, driver, truck, at);
+        assert_eq!(f.hand(f.destination), 16);
+        assert!(f.hand(depot) < high as i32);
+
+        let mut direct = Fixture::new();
+        direct.seed(16, 0);
+        direct.update(FREIGHT_MATCH_INTERVAL);
+        let (driver, truck, at) = (direct.driver, direct.truck, direct.destination.building);
+        unload_fixture(&mut direct, driver, truck, at);
+        assert_eq!(direct.hand(direct.destination), f.hand(f.destination));
     }
 
     #[test]
@@ -6600,20 +7028,37 @@ mod lifecycle_tests {
         f.ctx.apply(&[WorldCommand::SpawnTrain {
             wagons: vec![prototypes::RollingStockID::new("locomotive")],
             lane: rail,
-            dist: 0.0,
+            dist: 32.0,
         }]);
     }
 
-    /// A station inside the ring road with a train calling. The ring has no
-    /// room for platform track, so the station counts as rail-served here;
-    /// `imports_need_platform_track_with_a_rail_route_outside` builds real track.
+    /// A station inside the ring road with simulated rail service. Tests using
+    /// this fixture unload orders directly so they can exercise the road leg.
     fn import_station(f: &mut Fixture) -> Endpoint {
         let terminal = station(f, true);
         spawn_train(f);
+        f.ctx.apply(&[WorldCommand::SetFreightTerminalPolicy {
+            terminal,
+            expected_policy_revision: 0,
+            policy: FreightTerminalPolicy {
+                max_calls: 0,
+                ..FreightTerminalPolicy::default()
+            },
+        }]);
         let map = f.ctx.g.map();
         let mut book = f.ctx.g.write::<CargoBook>();
         book.routes.refresh(&map);
-        book.routes.rail.insert(terminal.building, true);
+        let outside = map.external_train_stations[0];
+        let market = map.get(outside).unwrap();
+        let gate = RailAnchor::near(&map, market.obb.center().z(market.height)).unwrap();
+        book.routes.rail.insert(
+            terminal.building,
+            vec![RailGate {
+                outside,
+                gate,
+                berth: gate,
+            }],
+        );
         terminal
     }
 
@@ -6744,13 +7189,14 @@ mod lifecycle_tests {
         let stop = train_stop(&f.ctx.g.get(id).unwrap().trans);
         let served = |f: &Fixture| {
             let map = f.ctx.g.map();
-            let served =
-                f.ctx
-                    .g
-                    .write::<CargoBook>()
-                    .routes
-                    .rail_served(&map, terminal.building, stop);
-            served
+            let served = f
+                .ctx
+                .g
+                .write::<CargoBook>()
+                .routes
+                .rail_gates(&map, terminal.building, stop)
+                .is_empty();
+            !served
         };
         assert!(!served(&f), "no platform track");
         {
@@ -6773,7 +7219,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn imports_see_an_authored_market_placed_after_matching() {
+    fn p8_imports_see_an_authored_market_and_require_a_serving_train() {
         use crate::map::{LanePatternBuilder, MapProject, RailMarketSite};
         use crate::world_command::CommandOutcomes;
         use crate::AuthoredTownOptions;
@@ -6782,6 +7228,15 @@ mod lifecycle_tests {
         let mut sim = Simulation::new_authored_town(AuthoredTownOptions::default()).unwrap();
         let light_road = LanePatternBuilder::new().build();
         let railway = LanePatternBuilder::new().rail(true).build();
+        sim.apply_commands([&WorldCommand::MapMakeConnection {
+            from: MapProject::ground(vec3(350.0, 560.0, 10.0)),
+            to: MapProject::ground(vec3(350.0, 855.0, 10.0)),
+            inter: None,
+            pat: LanePatternBuilder::new().rail(true).one_way(true).build(),
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let crossing = sim.map().lanes().values().next().unwrap().id;
+
         sim.apply_commands([
             &WorldCommand::MapMakeConnection {
                 from: MapProject::ground(vec3(100.0, 625.0, 10.0)),
@@ -6793,11 +7248,18 @@ mod lifecycle_tests {
                 from: MapProject::ground(vec3(100.0, 700.0, 10.0)),
                 to: MapProject::ground(vec3(1000.0, 700.0, 10.0)),
                 inter: None,
-                pat: railway,
+                pat: railway.clone(),
             },
         ]);
         assert_eq!(sim.read::<CommandOutcomes>().accepted, [0, 1]);
-        let (road, lane, dir, spawn, platform) = {
+        sim.apply_commands([&WorldCommand::MapMakeConnection {
+            from: MapProject::ground(vec3(150.0, 875.0, 10.0)),
+            to: MapProject::ground(vec3(400.0, 875.0, 10.0)),
+            inter: None,
+            pat: railway,
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let (road, lane, crossing_offset, gate_offset, gate, dir, platform) = {
             let map = sim.map();
             let road = map
                 .lanes()
@@ -6812,8 +7274,21 @@ mod lifecycle_tests {
                     lane.kind == LaneKind::Rail && lane.points.first().x < lane.points.last().x
                 })
                 .unwrap();
-            let (spawn, dir) = rail.points.point_dir_along(200.0);
-            (road, rail.id, dir, spawn, rail.points.point_along(600.0))
+            let crossing_x = map.get(crossing).unwrap().points.first().x;
+            let mut on_crossing = rail.points.point_along(200.0);
+            on_crossing.x = crossing_x;
+            let crossing_offset = rail.points.length_at_proj(rail.points.project(on_crossing));
+            let gate_offset = crossing_offset + 85.0;
+            let (gate, dir) = rail.points.point_dir_along(gate_offset);
+            (
+                road,
+                rail.id,
+                crossing_offset,
+                gate_offset,
+                gate,
+                dir,
+                rail.points.point_along(600.0),
+            )
         };
         let station_proto = prototypes::FreightStationPrototypeID::new("freight-station");
         let store_proto = GoodsCompanyID::new("commercial-l1");
@@ -6852,10 +7327,17 @@ mod lifecycle_tests {
         sim.write::<Market>()
             .buy(buyer, store_centre, ItemID::new("goods"), 2);
         let stop = train_stop(&sim.get(station).unwrap().trans);
+        let isolated_lane = sim
+            .map()
+            .lanes()
+            .values()
+            .find(|track| track.kind == LaneKind::Rail && track.points.first().y > 800.0)
+            .unwrap()
+            .id;
         sim.apply_commands([&WorldCommand::SpawnTrain {
             wagons: vec![prototypes::RollingStockID::new("locomotive")],
-            lane,
-            dist: 200.0,
+            lane: isolated_lane,
+            dist: 100.0,
         }]);
         assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
         let update = |sim: &mut Simulation, elapsed| {
@@ -6864,10 +7346,7 @@ mod lifecycle_tests {
             cargo_update(world, resources);
         };
         update(&mut sim, FREIGHT_MATCH_INTERVAL);
-        assert_eq!(
-            sim.read::<CargoBook>().routes.rail.get(&terminal),
-            Some(&false)
-        );
+        assert_eq!(sim.read::<CargoBook>().routes.rail[&terminal].len(), 0);
         assert!(sim.read::<CargoBook>().imports.is_empty());
         assert!(matches!(
             sim.read::<CargoBook>().import_status(buyer),
@@ -6876,21 +7355,112 @@ mod lifecycle_tests {
 
         let topology = sim.map().walking_topology_generation;
         sim.place_authored_rail_market(RailMarketSite {
-            footprint: OBB::new(spawn.xy(), dir.xy(), 100.0, 24.0),
+            footprint: OBB::new(gate.xy(), dir.xy(), 100.0, 24.0),
             service_lane: lane,
-            service_offset: 200.0,
+            service_offset: gate_offset,
             platform_stop: stop,
             consist_length_m: 100.0,
         })
         .unwrap();
         assert_eq!(sim.map().walking_topology_generation, topology);
+        let isolated = sim
+            .map_mut()
+            .build_special_building(
+                &OBB::new(vec2(250.0, 850.0), Vec2::X, 12.0, 12.0),
+                BuildingKind::ExternalTrading,
+                BuildingGen::CenteredDoor {
+                    vertical_factor: 1.0,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        sim.map_mut().external_train_stations.rotate_right(1);
+        assert_eq!(sim.map().external_train_stations[0], isolated);
+
         update(&mut sim, 2 * FREIGHT_MATCH_INTERVAL);
+        {
+            let book = sim.read::<CargoBook>();
+            assert_eq!(book.routes.rail[&terminal].len(), 1);
+            assert_eq!(book.import_status(buyer), Some(ImportStatus::NoRoute));
+            assert!(book.imports.is_empty());
+        }
+        sim.apply_commands([&WorldCommand::SpawnTrain {
+            wagons: vec![prototypes::RollingStockID::new("locomotive")],
+            lane,
+            dist: crossing_offset,
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let (serving_train, train) = sim.world().trains.iter().last().unwrap();
+        assert_eq!(train_lane(&sim.map(), train), Some(lane));
+        assert_eq!(
+            sim.map()
+                .nearest_lane(train.trans.pos, LaneKind::Rail, Some(50.0)),
+            Some(crossing)
+        );
+
+        let endpoint = Endpoint {
+            soul: SoulID::FreightStation(station),
+            building: terminal,
+        };
+        let open = FreightTerminalPolicy::default();
+        let policy = |revision, policy| WorldCommand::SetFreightTerminalPolicy {
+            terminal: endpoint,
+            expected_policy_revision: revision,
+            policy,
+        };
+        sim.apply_commands([&policy(
+            0,
+            FreightTerminalPolicy {
+                admit_imports: false,
+                ..open
+            },
+        )]);
+        update(&mut sim, 3 * FREIGHT_MATCH_INTERVAL);
         let book = sim.read::<CargoBook>();
-        assert_eq!(book.routes.rail.get(&terminal), Some(&true));
+        assert_eq!(book.routes.rail[&terminal].len(), 1);
+        assert_eq!(book.import_status(buyer), Some(ImportStatus::Held));
+        assert!(book
+            .import_problems(3 * FREIGHT_MATCH_INTERVAL)
+            .no_route
+            .is_empty());
+        let SoulID::GoodsCompany(owner) = buyer else {
+            unreachable!()
+        };
+        let demand = DemandKey {
+            building: store,
+            owner,
+            item: ItemID::new("goods"),
+        };
+        let view = book.freight_demand(&sim, demand).unwrap();
+        assert_eq!(view.on_hand, 0);
+        assert_eq!(view.ordered, 0);
+        assert_eq!(view.blocker, Some(ImportBlocker::AdmissionHeld(endpoint)));
+        drop(book);
+
+        sim.apply_commands([&policy(1, open)]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        update(&mut sim, 4 * FREIGHT_MATCH_INTERVAL);
+        let book = sim.read::<CargoBook>();
         assert!(matches!(
             book.import_status(buyer),
             Some(ImportStatus::Waiting { .. })
         ));
+        assert!(book.freight_demand(&sim, demand).unwrap().ordered > 0);
+        drop(book);
+
+        let mut schedule = Simulation::schedule();
+        assert!(
+            (0..2000).any(|_| {
+                sim.tick(&mut schedule, &[]);
+                sim.world().freight_stations[station]
+                    .f
+                    .trains
+                    .iter()
+                    .any(|&(id, _)| id == serving_train)
+            }),
+            "the train on the service track was never assigned to the admitted import"
+        );
     }
 
     /// Long enough for a station truck to drive across the fixture town. Vehicles

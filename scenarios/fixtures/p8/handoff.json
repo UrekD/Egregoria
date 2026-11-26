@@ -1,0 +1,338 @@
+{
+  "schema": 1,
+  "planning_pin": {
+    "commit": "2f57bb5367ff0ad6c93e97f7ca68c5c8d6c0b253",
+    "version": "0.10.0"
+  },
+  "floor": {
+    "ref": "origin/p6",
+    "commit": "c27db71be91777a5e822f3bd1b07e9b50b67355b",
+    "version": "0.11.1",
+    "trees": {
+      "base_mod": "a4a368bffd8031150d8c0a7084a7c707ad37342d",
+      "prototypes": "3abe8a5e912cb9ca9bb1bf2847f82788bb8984d3",
+      "assets": "ad24a68a1c6daa25efc494b1fe299a2f05c43ee5"
+    }
+  },
+  "p7_branch": {
+    "ref": "origin/p7",
+    "commit": "ea57a02ac6d8bfdd53a311245878a145160bfab0",
+    "merge_base": "6d8c562d14440a776f9394ffa9c52df8f6f2fb75",
+    "tested_as_p8_parent": false
+  },
+  "handoffs": [
+    {
+      "owner": "WATER",
+      "status": "landed",
+      "parents": [
+        {
+          "commit": "8bb08b0e5c735c548bd1270886e72ec57a2d4d3e",
+          "on_floor": true
+        },
+        {
+          "commit": "a4a07bccd8265007aad098df0c10ae4662c4b9db",
+          "on_floor": true
+        },
+        {
+          "commit": "909c51a95ee2609d62c40d22caa1b409ef34929a",
+          "on_floor": true
+        },
+        {
+          "commit": "be4dee4b609d7425c49356588be081805248dcfd",
+          "on_floor": true
+        },
+        {
+          "commit": "541f2e10aac76429e922ee86661dbffd11feabf4",
+          "on_floor": true
+        }
+      ],
+      "interface": "Wet/dry effects, bridge clearance, land frontage and service geometry",
+      "receiving_owner": "S",
+      "merge_window": "before P7 prepared projection",
+      "verification": {
+        "reserved": [
+          "w2b_water_edit_distinguishes_clear_decks_and_ground_links",
+          "w2b_water_shallow_merge_preserves_dry_end_lot",
+          "p2b_utility_supply_is_equal_after_reload"
+        ]
+      }
+    },
+    {
+      "owner": "TILES",
+      "status": "landed floor; prepared P7 integration pending",
+      "parents": [
+        {
+          "commit": "590e04f55bb9a1a9de441bed803f1f9c0be9afb4",
+          "on_floor": true
+        },
+        {
+          "commit": "1ceb45e0b2b16850591fedb9c1ec956dd30dd76f",
+          "on_floor": true
+        },
+        {
+          "commit": "5e5809b98f30ef8dd01b18fd91d0bb2ea4cdd98a",
+          "on_floor": true
+        },
+        {
+          "commit": "4c43731e3953cce59a0e14695f2fadae376d98dc",
+          "on_floor": true
+        },
+        {
+          "commit": "716fee3d47b57fd5987e50b09139ddbdbefb8863",
+          "on_floor": true
+        }
+      ],
+      "interface": "Land authority, indexed outcomes, admitted replay batches",
+      "receiving_owner": "S",
+      "merge_window": "before P8 S",
+      "verification": {
+        "reserved": [
+          "p8_tiles_c1_water_prefix",
+          "p8_authority_atomic_denial"
+        ]
+      }
+    },
+    {
+      "owner": "ZONES2",
+      "status": "landed",
+      "parents": [
+        {
+          "commit": "e58a056bf28c277187f95677639e303e76f872de",
+          "on_floor": true
+        },
+        {
+          "commit": "3a90015c867a5107b3dd501e591e64a78a789528",
+          "on_floor": true
+        },
+        {
+          "commit": "e03d211fc0c64f57daedfa11dd732c29e0875503",
+          "on_floor": true
+        },
+        {
+          "commit": "03f7c1ef1d9b311b39242dd59794d568166ad2de",
+          "on_floor": true
+        },
+        {
+          "commit": "c32f6ea17b081e57b298d338035cca387ddedc49",
+          "on_floor": true
+        },
+        {
+          "commit": "3916f21dbc0ee80ac4308756735a30da3e6b4250",
+          "on_floor": true
+        }
+      ],
+      "interface": "Checked sites, retained frontage, ownership, utility and closure hooks",
+      "receiving_owner": "S/T/F/U",
+      "merge_window": "before P8 runtime registration",
+      "verification": {
+        "reserved": [
+          "zones2_checked_placement_registers_one_home_and_preserves_a_rejected_parcel",
+          "zones2_fix_hiring_does_not_reclassify_a_home_trip",
+          "zones2_fix_closure_survives_a_snapshot_before_the_drain"
+        ]
+      }
+    },
+    {
+      "owner": "Scale",
+      "status": "partial",
+      "parents": [
+        {
+          "commit": "e432a3eacedfa3160baff5ceba10a99faf1ad82e",
+          "on_floor": true
+        },
+        {
+          "commit": "8aac51cc065357af06e11c55495ef0b965b0f894",
+          "on_floor": true
+        },
+        {
+          "commit": "b879eaca491981ed41244ed77794939474649f37",
+          "on_floor": true
+        },
+        {
+          "commit": "bc1fa687945ee0a01f1736777620d27454be27aa",
+          "on_floor": true
+        },
+        {
+          "commit": "8d2e682e03415218dce3d28b22473baa296974fd",
+          "on_floor": true
+        },
+        {
+          "commit": "c0eae1b0b5b565f3d2c5af48e47caa315da1343a",
+          "on_floor": true
+        },
+        {
+          "commit": "7498c6c00e89dfc756e9dcf865c9b18340052bd4",
+          "on_floor": true
+        },
+        {
+          "commit": "5bd3013388e0fed824967a30a15f2d8607e36cda",
+          "on_floor": true
+        },
+        {
+          "commit": "6aecd56ab8e086aea27b5cb253f29830e41b0be8",
+          "on_floor": false
+        }
+      ],
+      "interface": "Activity sets, worker/save fence, audited parallel schedule and effective counts",
+      "receiving_owner": "S/Q/U",
+      "merge_window": "first on scheduler/worker/shared protocol",
+      "verification": {
+        "reserved": [
+          "l1_activity_transit_removal_clock_jumps_and_dirty_mid_wait_resume",
+          "l1_activity_rehome_and_freight_abort_refresh_before_the_next_phase",
+          "actual 1/4/16 worker parity",
+          "native forced tick/session replacement"
+        ]
+      },
+      "outstanding": "Parallel L3 candidate and audited 1/4/16 schedule still need integration evidence."
+    },
+    {
+      "owner": "CITYMAP",
+      "status": "producer code landed; release artifact gate pending",
+      "parents": [
+        {
+          "commit": "57f069817852299e0b30ac770cfa522b5e46b34d",
+          "on_floor": true
+        },
+        {
+          "commit": "838ed50b99859b363bd2ab58c5c9ce990b8e5705",
+          "on_floor": true
+        },
+        {
+          "commit": "10ee5689654d87a092fc27a9f903b83bdd5a7900",
+          "on_floor": true
+        },
+        {
+          "commit": "21e5f3d64e71b8aa287367e45a713d00d13f6b0e",
+          "on_floor": true
+        },
+        {
+          "commit": "88c9e1a08178e7de8ab2fb58f4fdd4837575a9c7",
+          "on_floor": true
+        },
+        {
+          "commit": "603294f024df8ccdf963c5bd9773ef24196f97da",
+          "on_floor": true
+        }
+      ],
+      "interface": "OpeningManifest, publish API, directed anchor mapping and slot/replay metadata",
+      "receiving_owner": "Q/S",
+      "merge_window": "before scored slot runs",
+      "verification": {
+        "reserved": [
+          "cm0_penalizes_unfinished_trips_at_cutoff",
+          "cm0_cutoff_detects_both_queue_transitions_after_the_periodic_sample",
+          "qualified lesce_town opening and three-day slot comparisons"
+        ]
+      },
+      "outstanding": "Commissioned lesce_town and platform derivative are separate from legacy lesce_osm diagnostics."
+    },
+    {
+      "owner": "P7",
+      "status": "pending",
+      "parents": [
+        {
+          "commit": "eeb134773a64005a63c7e26da0d8c3b4c9636b85",
+          "on_floor": false
+        },
+        {
+          "commit": "84295e74c8dfb0d9511e549e205b5c3de52335ec",
+          "on_floor": false
+        },
+        {
+          "commit": "61f6aff5e6dc688560c32bd354dd5691e6977f86",
+          "on_floor": false
+        },
+        {
+          "commit": "ea57a02ac6d8bfdd53a311245878a145160bfab0",
+          "on_floor": false
+        }
+      ],
+      "interface": "Prepared action/journal and typed route/recovery work, C1/C2, shared crossing barrier",
+      "receiving_owner": "S/R/T",
+      "merge_window": "before live P8 passenger routing",
+      "verification": {
+        "reserved": [
+          "p7_life_retained_terminal",
+          "p7_life_berth_leg",
+          "p7_life_deferred",
+          "p7_life_exactly_once",
+          "directed rear clearance",
+          "C1 admitted tape",
+          "C2 matched repairs"
+        ]
+      },
+      "outstanding": "Merge against current P6, run named cases and record merged and tested SHAs."
+    },
+    {
+      "owner": "FREIGHT2",
+      "status": "passed D1 on P6 floor",
+      "parents": [
+        {
+          "commit": "19d4115a6fe2af9a4adc5ba61b9673bb203a78bd",
+          "on_floor": true
+        },
+        {
+          "commit": "b15c54bfa4fc6f729d474f95e2c1b7c3106a8a3f",
+          "on_floor": true
+        },
+        {
+          "commit": "5091188fa9c68817cea174edfe6f972dcb96389b",
+          "on_floor": true
+        },
+        {
+          "commit": "d4b3a96da40df15b0010988fc10f0a19820892da",
+          "on_floor": true
+        },
+        {
+          "commit": "18a52898938acc239788b94380b61fc4fc8caaf0",
+          "on_floor": true
+        },
+        {
+          "commit": "a1fa6d11e6958e9da5a51c5b3a1f7079d308938b",
+          "on_floor": true
+        },
+        {
+          "commit": "198b4e962bd430b6a47c7e3a0e01d3fbc41b8624",
+          "on_floor": true
+        },
+        {
+          "commit": "93d4403ff94261149ef258d9afd1ea7b19aa1d52",
+          "on_floor": true
+        }
+      ],
+      "interface": "Default admissions, settlement, shift and stocked priority fence",
+      "receiving_owner": "F",
+      "merge_window": "before any P8 cargo edit",
+      "verification": {
+        "command": "cargo test --locked -p simulation freight2_",
+        "passed": 11,
+        "failed": 0,
+        "default_parallelism": true,
+        "tests": [
+          "freight2_absent_mill_driver_has_a_first_load_for_each_empty_bakery",
+          "freight2_an_existing_mill_adds_a_truck_and_assigns_a_second_worker",
+          "freight2_configured_fleets_cover_nominal_production",
+          "freight2_empty_return_budgets_the_road_detour",
+          "freight2_replenishment_respects_the_shift_and_departure_limit",
+          "freight2_shift_can_insert_a_short_urgent_trip_before_a_booked_restock",
+          "freight2_shift_does_not_top_up_a_restock_blocked_by_an_urgent_trip",
+          "freight2_station_bundling_protects_older_urgent_orders",
+          "freight2_station_bundling_protects_urgent_shared_stock",
+          "freight2_station_serves_an_empty_plant_before_an_older_restock",
+          "freight2_vegetable_farm_delivers_nominal_output_over_staffed_days"
+        ],
+        "tested_parent": "c27db71be91777a5e822f3bd1b07e9b50b67355b"
+      }
+    }
+  ],
+  "parallel_changes": {
+    "FIX-ROUTEPERF": "await integrated pin and workload receipt",
+    "FIX-WETSAVA2": "await integrated pin and passing wet Lesce publication"
+  },
+  "stock_capabilities": {
+    "schedule": "Simulation::schedule",
+    "verified_effective_workers": null,
+    "slot_scoring": "diagnostic windows only"
+  }
+}

@@ -16,7 +16,7 @@ use simulation::map::ZoneKind::{self, Commercial, Industrial, MixedUse, Office, 
 use simulation::map::{
     BuildingID, BuildingKind, GrowableBusinessState, GrowableSiteState, LaneKind,
     LanePatternBuilder, Map, PathKind, Pathfinder, ProjectFilter, ProjectKind, RoadID,
-    TerraformKind, TraverseDirection, ZoneCell,
+    TerraformKind, TraverseDirection, ZoneCell, ZoneGrid,
 };
 use simulation::map_dynamic::{BuildingInfos, EnvGrid, Itinerary};
 use simulation::souls::{
@@ -38,6 +38,10 @@ const OPTIONS: SimulationOptions = SimulationOptions {
     seed: 625,
     starting_money_bucks: 2_000_000,
     ..SimulationOptions::LEGACY
+};
+const PURE_CONTROL_OPTIONS: SimulationOptions = SimulationOptions {
+    save_replay: false,
+    ..OPTIONS
 };
 
 pub(super) const CITY: (Scenario, SimulationOptions) = (
@@ -217,12 +221,8 @@ fn connect_freight(sim: &mut Simulation, terminal: BuildingID) -> Result<(), Str
     super::demo_cities::spawn_freight_train(sim)
 }
 
-fn grow_city(
-    ctx: &mut ScenarioCtx,
-    mixed: bool,
-    replay_root: Option<&Path>,
-) -> Result<BuildingID, String> {
-    grow_city_with_health(ctx, mixed, replay_root, true, &FOOD_SUPPLY)
+fn grow_city(ctx: &mut ScenarioCtx, replay_root: Option<&Path>) -> Result<BuildingID, String> {
+    grow_city_with_health(ctx, replay_root, true, &FOOD_SUPPLY)
 }
 
 fn paint_commissioning_core(
@@ -283,12 +283,11 @@ fn paint_commissioning_core(
 
 fn grow_city_with_health(
     ctx: &mut ScenarioCtx,
-    mixed: bool,
     replay_root: Option<&Path>,
     with_health: bool,
     extra_sites: &[(&'static str, Vec2)],
 ) -> Result<BuildingID, String> {
-    let freight = paint_commissioning_core(ctx, mixed, replay_root, with_health, extra_sites)?;
+    let freight = paint_commissioning_core(ctx, true, replay_root, with_health, extra_sites)?;
     if let Some(root) = replay_root {
         const EARLY_CORE: u64 = BOOTSTRAP_END + 6 * TICKS_PER_HOUR;
         advance_to(ctx, EARLY_CORE)?;
@@ -314,11 +313,6 @@ fn grow_city_with_health(
         }
         verify_checkpoint(&ctx.sim, root, "zones2_core_l3")?;
     } else {
-        if !mixed {
-            advance_to(ctx, COMMISSION_END - TICKS_PER_DAY)?;
-            paint_pure_control_offices(ctx)?;
-            trim_pure_control_housing(ctx)?;
-        }
         advance_to(ctx, COMMISSION_END)?;
     }
     Ok(freight)
@@ -359,7 +353,7 @@ fn paint_core(ctx: &mut ScenarioCtx, mixed: bool) {
     let infill = if mixed {
         [(2, 3, MixedUse, Medium), (3, 3, MixedUse, High)]
     } else {
-        // Match housing capacity across the districts under the current food supply.
+        // Replace the Mixed Use blocks with pure housing at the same densities.
         [(2, 3, Residential, Medium), (3, 3, Residential, High)]
     };
     paint_zone_blocks(ctx, ORIGIN, BLOCK, infill);
@@ -379,63 +373,158 @@ fn paint_core(ctx: &mut ScenarioCtx, mixed: bool) {
     }
 }
 
-fn paint_pure_control_offices(ctx: &mut ScenarioCtx) -> Result<(), String> {
-    // Add offices during commissioning after the core housing has grown.
-    let office = zone(Office, High);
-    let center = ORIGIN + vec2(2.5, 4.5) * BLOCK;
-    let commands = {
-        let map = ctx.sim.map();
-        let mut lots: Vec<_> = map
-            .lots()
-            .values()
-            .filter(|lot| lot.shape.center().distance2(center) < (BLOCK / 2.0).powi(2))
-            .filter(|lot| check_growable_lot(&map, lot, office).is_ok())
-            .collect();
-        lots.sort_by(|a, b| {
-            let distance = |lot: &simulation::map::Lot| lot.shape.center().distance2(center);
-            distance(a)
-                .total_cmp(&distance(b))
-                .then_with(|| a.id.cmp(&b.id))
-        });
-        lots.into_iter()
-            .take(2)
-            .map(|lot| WorldCommand::ZonePaint {
-                area: lot.shape,
-                kind: Some(office.kind),
-                density: office.density,
-            })
-            .collect::<Vec<_>>()
-    };
-    if commands.len() != 2 {
-        return Err("pure control needs room for two additional offices".into());
+fn grow_pure_control(ctx: &mut ScenarioCtx, target: DistrictCapacity) -> Result<BuildingID, String> {
+    let terminal = paint_commissioning_core(ctx, false, None, true, &FOOD_SUPPLY)?;
+    // Match against the live commissioned Mixed Use district before measuring trips.
+    // The pure district grows normally first. Then choose residential and office
+    // sites from the same district using realized capacity, with room inside the
+    // 5% band for normal development during the observation window. Offices
+    // adjust jobs while retaining the shopping destinations and freight geometry.
+    // Two late commissioning passes leave time for residents to move in and
+    // workers to take jobs, and account for growth after the first adjustment.
+    for hours_left in [18, 6] {
+        advance_to(ctx, COMMISSION_END - hours_left * TICKS_PER_HOUR)?;
+        match_pure_sites(&mut ctx.sim, Residential, target.housing_slots)?;
+        match_pure_sites(&mut ctx.sim, Office, target.available_jobs)?;
     }
-    ctx.submit(&commands);
-    ctx.flush();
+    advance_to(ctx, COMMISSION_END)?;
+    check_control_capacity(target, district_capacity(&ctx.sim))
+        .map_err(|error| format!("at commissioning: {error}"))?;
+    Ok(terminal)
+}
+
+fn match_pure_sites(sim: &mut Simulation, kind: ZoneKind, target: f64) -> Result<(), String> {
+    let slots = |sim: &Simulation| {
+        let capacity = district_capacity(sim);
+        if kind == Residential {
+            capacity.housing_slots
+        } else {
+            capacity.available_jobs
+        }
+    };
+    let margin = 0.02 * target;
+    let mut current = slots(sim);
+    if current < target - margin {
+        while current < target - margin {
+            if !add_pure_site(sim, kind, target - current)? {
+                break;
+            }
+            current = slots(sim);
+        }
+    } else {
+        while current > target + margin {
+            if !remove_pure_site(sim, kind, current - target)? {
+                break;
+            }
+            current = slots(sim);
+        }
+    }
     Ok(())
 }
 
-fn trim_pure_control_housing(ctx: &mut ScenarioCtx) -> Result<(), String> {
-    // The waypoint fix left the pure district outside the 5% housing match.
-    // Remove one partially occupied 19-place tower a day before measurement.
-    // This is the smallest tested removal that matched housing, jobs and freight distance.
-    let center = vec2(859.5, 1042.0);
-    let tower = ctx
-        .sim
-        .map()
-        .buildings()
-        .iter()
-        .find_map(|(id, building)| {
-            (building.obb.center().distance2(center) < 1.0
-                && building.development()?.zone == zone(Residential, High))
-                .then_some(id)
-        })
-        .ok_or("pure control tower is missing before housing calibration")?;
-    ctx.submit(&[WorldCommand::MapRemoveBuilding(tower)]);
-    ctx.flush();
-    if ctx.sim.map().get(tower).is_some() {
-        return Err("could not remove the pure control tower".into());
+fn add_pure_site(sim: &mut Simulation, kind: ZoneKind, missing: f64) -> Result<bool, String> {
+    let focus = if kind == Residential {
+        ORIGIN + vec2(2.5, 3.5) * BLOCK
+    } else {
+        ORIGIN + vec2(2.5, 4.5) * BLOCK
+    };
+    let candidate = {
+        let map = sim.map();
+        let zones = sim.read::<ZoneGrid>();
+        map.lots()
+            .values()
+            .filter_map(|lot| {
+                let offset = lot.shape.center() - ORIGIN;
+                // Limit extra sites to the fixture streets and keep existing zoning.
+                if !(0.0..=5.0 * BLOCK).contains(&offset.x)
+                    || !(0.0..=5.0 * BLOCK).contains(&offset.y)
+                    || zones.lot_zone(&lot.shape).is_some()
+                {
+                    return None;
+                }
+                let distance = lot.shape.center().distance2(focus);
+                [High, Medium, Low]
+                    .into_iter()
+                    .filter_map(|density| {
+                        let site = check_growable_lot(&map, lot, zone(kind, density)).ok()?;
+                        let slots = site.home.map_or_else(
+                            || site.company.map_or(0, |proto| proto.n_workers),
+                            |proto| proto.capacity,
+                        );
+                        let error = (missing - f64::from(slots)).abs();
+                        (error < missing).then_some((site, error, distance))
+                    })
+                    .min_by(|a, b| a.1.total_cmp(&b.1))
+            })
+            .min_by(|a, b| {
+                a.1.total_cmp(&b.1)
+                    .then_with(|| a.2.total_cmp(&b.2))
+                    .then_with(|| a.0.lot.cmp(&b.0.lot))
+            })
+            .map(|(site, _, _)| site)
+    };
+    let Some(site) = candidate else {
+        return Ok(false);
+    };
+    sim.apply_commands([&WorldCommand::ZonePaint {
+        area: site.shape,
+        kind: Some(kind),
+        density: site.zone.density,
+    }]);
+    if !sim.read::<CommandOutcomes>().accepted.contains(&0) {
+        return Err(format!("could not zone pure control parcel {:?}", site.lot));
     }
-    Ok(())
+    let placed = sim
+        .place_zoned_growable(site.lot, site.zone)
+        .map_err(|error| format!("could not place pure control parcel {:?}: {error:?}", site.lot))?;
+    if let Some(company) = site.company {
+        company_soul(sim, placed.building, company.base.id)
+            .ok_or_else(|| format!("could not open pure control office {:?}", placed.building))?;
+    }
+    Ok(true)
+}
+
+fn remove_pure_site(sim: &mut Simulation, kind: ZoneKind, surplus: f64) -> Result<bool, String> {
+    let candidate = {
+        let map = sim.map();
+        map.buildings()
+            .keys()
+            .filter_map(|id| {
+                let site = sim.growable_summary(id)?;
+                if site.zone.kind != kind || site.site != GrowableSiteState::Active {
+                    return None;
+                }
+                let (slots, users) = if kind == Residential {
+                    (site.housing_slots, site.occupants)
+                } else {
+                    (site.active_job_slots, site.filled_jobs)
+                };
+                let error = (surplus - f64::from(slots)).abs();
+                let area = map.lot_origin(id)?.shape;
+                (error < surplus).then_some((id, area, error, users))
+            })
+            .min_by(|a, b| {
+                a.2.total_cmp(&b.2)
+                    .then_with(|| a.3.cmp(&b.3))
+                    .then_with(|| a.0.cmp(&b.0))
+            })
+    };
+    let Some((id, area, _, _)) = candidate else {
+        return Ok(false);
+    };
+    // Clear the parcel's zoning so automatic growth cannot replace the removed site.
+    sim.apply_commands([
+        &WorldCommand::ZonePaint {
+            area,
+            kind: None,
+            density: Low,
+        },
+        &WorldCommand::MapRemoveBuilding(id),
+    ]);
+    if sim.read::<CommandOutcomes>().accepted.as_slice() != [0, 1] {
+        return Err(format!("could not retire pure control site {id:?}"));
+    }
+    Ok(true)
 }
 
 fn run_attainment(ctx: &mut ScenarioCtx) -> Result<(), String> {
@@ -443,7 +532,7 @@ fn run_attainment(ctx: &mut ScenarioCtx) -> Result<(), String> {
     use simulation::souls::development::requirements;
 
     require_profiles()?;
-    grow_city(ctx, true, None)?;
+    grow_city(ctx, None)?;
     check_commissioning(ctx, true)?;
     for kind in [Residential, MixedUse] {
         let count = summaries(&ctx.sim)
@@ -461,7 +550,7 @@ fn run_attainment(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
 
     let mut control = ScenarioCtx::new(OPTIONS);
-    grow_city_with_health(&mut control, true, None, false, &FOOD_SUPPLY)?;
+    grow_city_with_health(&mut control, None, false, &FOOD_SUPPLY)?;
     for kind in [Residential, MixedUse] {
         let ids: Vec<_> = control.sim.map().buildings().keys().collect();
         let mut health_blocked = 0;
@@ -514,15 +603,13 @@ fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
     };
     let deadline_window = COMMISSION_END..COMMISSION_END + OBSERVATION_DAYS * TICKS_PER_DAY;
     ctx.sim.write::<CargoBook>().observe_road_deadlines(deadline_window.clone());
-    let terminal = grow_city(ctx, true, Some(replay_root))?;
+    let terminal = grow_city(ctx, Some(replay_root))?;
     check_commissioning(ctx, true)?;
     let mixed_freight = mean_retail_freight_distance(&ctx.sim, terminal)?;
     ctx.sample("commissioned");
-    let mixed = observe_days(ctx)?;
-
-    let mut control = ScenarioCtx::new(OPTIONS);
+    let mut control = ScenarioCtx::new(PURE_CONTROL_OPTIONS);
     control.sim.write::<CargoBook>().observe_road_deadlines(deadline_window);
-    let terminal = grow_city(&mut control, false, None)?;
+    let terminal = grow_pure_control(&mut control, district_capacity(&ctx.sim))?;
     check_commissioning(&control, false)?;
     let pure_freight = mean_retail_freight_distance(&control.sim, terminal)?;
     // Average per-direction distance may differ by at most one fixture block.
@@ -531,6 +618,7 @@ fn run_city(ctx: &mut ScenarioCtx) -> Result<(), String> {
             "mean terminal road distance differs by over {BLOCK} m (mixed {mixed_freight:.1} m, pure {pure_freight:.1} m)"
         ));
     }
+    let mixed = observe_days(ctx)?;
     let pure = observe_days(&mut control)?;
     ctx.samples
         .extend(control.samples.into_iter().map(|mut sample| {
@@ -1199,6 +1287,11 @@ struct Observation {
     mixed_receipt_units: u64,
     mixed_shelf_peak: i32,
     productive_recipients: usize,
+    capacity: DistrictCapacity,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct DistrictCapacity {
     housing_slots: f64,
     available_jobs: f64,
     filled_jobs: f64,
@@ -1217,7 +1310,11 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
     let mut utility_served = 0.0;
     for day in first_day..first_day + OBSERVATION_DAYS {
         for _ in 0..24 {
-            sample_capacity(&ctx.sim, &mut result);
+            let capacity = district_capacity(&ctx.sim);
+            result.resident_days += ctx.sim.world().humans.len() as f64 / 24.0;
+            result.capacity.housing_slots += capacity.housing_slots;
+            result.capacity.available_jobs += capacity.available_jobs;
+            result.capacity.filled_jobs += capacity.filled_jobs;
             let mut progress: Vec<_> = mixed_sellers(&ctx.sim)
                 .filter_map(|seller| {
                     let SoulID::GoodsCompany(id) = seller else {
@@ -1313,9 +1410,9 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
     result.road_deadlines = ctx.sim.read::<CargoBook>().road_deadline_counts();
     result.productive_recipients = productive_recipients.len();
     let hours = (OBSERVATION_DAYS * 24) as f64;
-    result.housing_slots /= hours;
-    result.available_jobs /= hours;
-    result.filled_jobs /= hours;
+    result.capacity.housing_slots /= hours;
+    result.capacity.available_jobs /= hours;
+    result.capacity.filled_jobs /= hours;
     println!(
         "operating window: {:.2} resident-days, {} filled/{} due baskets, {} external arrivals, {} local pickups, {:.2} food stockout hours, utilities {:.2}/{}",
         result.resident_days, result.baskets_filled, result.baskets_due, result.external_shops,
@@ -1332,9 +1429,9 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
         ("road_late_loads".into(), result.late_road_loads as f64),
         ("road_due_loads".into(), result.road_deadlines.due as f64),
         ("road_on_time_loads".into(), result.road_deadlines.on_time as f64),
-        ("housing_slots_hourly_mean".into(), result.housing_slots),
-        ("available_jobs_hourly_mean".into(), result.available_jobs),
-        ("filled_jobs_hourly_mean".into(), result.filled_jobs),
+        ("housing_slots_hourly_mean".into(), result.capacity.housing_slots),
+        ("available_jobs_hourly_mean".into(), result.capacity.available_jobs),
+        ("filled_jobs_hourly_mean".into(), result.capacity.filled_jobs),
         ("utility_served_demand".into(), utility_served),
         ("utility_total_demand".into(), f64::from(utility_samples)),
         (
@@ -1365,21 +1462,22 @@ fn observe_days(ctx: &mut ScenarioCtx) -> Result<Observation, String> {
     Ok(result)
 }
 
-fn sample_capacity(sim: &Simulation, result: &mut Observation) {
-    result.resident_days += sim.world().humans.len() as f64 / 24.0;
+fn district_capacity(sim: &Simulation) -> DistrictCapacity {
+    let mut capacity = DistrictCapacity::default();
     let homes = sim.read::<Residences>();
     for (&id, home) in &homes.by_building {
         if !homes.is_abandoned(id) {
-            result.housing_slots += f64::from(home.capacity);
+            capacity.housing_slots += f64::from(home.capacity);
         }
     }
     for company in sim.world().companies.values().filter(|company| {
         try_prototype(prototypes::GrowableCompanyID::from(company.comp.proto))
             .is_some_and(|proto| proto.growable)
     }) {
-        result.available_jobs += f64::from(company.comp.max_workers);
-        result.filled_jobs += company.workers.0.len() as f64;
+        capacity.available_jobs += f64::from(company.comp.max_workers);
+        capacity.filled_jobs += company.workers.0.len() as f64;
     }
+    capacity
 }
 
 fn mixed_sellers(sim: &Simulation) -> impl Iterator<Item = SoulID> + '_ {
@@ -1390,7 +1488,7 @@ fn mixed_sellers(sim: &Simulation) -> impl Iterator<Item = SoulID> + '_ {
     })
 }
 
-fn check_control_capacity(mixed: &Observation, pure: &Observation) -> Result<(), String> {
+fn check_control_capacity(mixed: DistrictCapacity, pure: DistrictCapacity) -> Result<(), String> {
     let matched = |a: f64, b: f64| a > 0.0 && b > 0.0 && (a - b).abs() <= 0.05 * b;
     let capacities = format!(
         "housing {}/{}, available jobs {}/{}, filled jobs {}/{} (MX/pure)",
@@ -1424,7 +1522,7 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
             "MX road freight needs 90% on-time deliveries, got {on_time}/{due}"
         ));
     }
-    check_control_capacity(mixed, pure)?;
+    check_control_capacity(mixed.capacity, pure.capacity)?;
     if mixed.local_pickups < 4
         || mixed.mixed_receipt_units == 0
         || mixed.productive_recipients == 0
@@ -1446,20 +1544,20 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
 #[ignore = "simulates multiple city days; run in release mode"]
 fn zones2_pure_control_matches_capacity_and_freight_distance() {
     let mut mixed = ScenarioCtx::new(OPTIONS);
-    let terminal = grow_city(&mut mixed, true, None).unwrap();
+    let terminal = grow_city(&mut mixed, None).unwrap();
     let mixed_freight = mean_retail_freight_distance(&mixed.sim, terminal).unwrap();
-    let mixed = observe_days(&mut mixed).unwrap();
-
-    let mut pure = ScenarioCtx::new(OPTIONS);
-    let terminal = grow_city(&mut pure, false, None).unwrap();
+    let mut pure = ScenarioCtx::new(PURE_CONTROL_OPTIONS);
+    let terminal = grow_pure_control(&mut pure, district_capacity(&mixed.sim)).unwrap();
     let pure_freight = mean_retail_freight_distance(&pure.sim, terminal).unwrap();
+    assert!(!summaries(&pure.sim).any(|site| site.zone.kind == MixedUse));
+    let mixed = observe_days(&mut mixed).unwrap();
     let pure = observe_days(&mut pure).unwrap();
 
+    check_control_capacity(mixed.capacity, pure.capacity).unwrap();
     assert!(
         (mixed_freight - pure_freight).abs() <= BLOCK,
         "mean terminal road distance differs by over {BLOCK} m (mixed {mixed_freight:.1} m, pure {pure_freight:.1} m)"
     );
-    check_control_capacity(&mixed, &pure).unwrap();
 }
 
 #[test]
@@ -1479,9 +1577,11 @@ fn zones2_shopping_gate_accepts_eight_percent_reduction() {
         external_shops: 100,
         baskets_due: 10,
         baskets_filled: 10,
-        housing_slots: 100.0,
-        available_jobs: 100.0,
-        filled_jobs: 100.0,
+        capacity: DistrictCapacity {
+            housing_slots: 100.0,
+            available_jobs: 100.0,
+            filled_jobs: 100.0,
+        },
         ..Observation::default()
     };
     let mut mixed = Observation {
@@ -1504,9 +1604,11 @@ fn zones2_freight_gate_counts_cancelled_loads() {
         external_shops: 10,
         baskets_due: 10,
         baskets_filled: 10,
-        housing_slots: 10.0,
-        available_jobs: 10.0,
-        filled_jobs: 10.0,
+        capacity: DistrictCapacity {
+            housing_slots: 10.0,
+            available_jobs: 10.0,
+            filled_jobs: 10.0,
+        },
         ..Observation::default()
     };
     let mut mixed = Observation {
@@ -1530,9 +1632,11 @@ fn zones2_freight_gate_counts_an_overdue_final_day_load() {
         external_shops: 10,
         baskets_due: 10,
         baskets_filled: 10,
-        housing_slots: 10.0,
-        available_jobs: 10.0,
-        filled_jobs: 10.0,
+        capacity: DistrictCapacity {
+            housing_slots: 10.0,
+            available_jobs: 10.0,
+            filled_jobs: 10.0,
+        },
         ..Observation::default()
     };
     let mixed = Observation {

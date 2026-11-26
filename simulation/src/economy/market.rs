@@ -1151,12 +1151,12 @@ impl Market {
     /// A trade can only be completed if the seller has enough capital.
     /// Please do not keep the trades around much, it needs to be destroyed by the next time you call this function.
     pub fn make_trades(&mut self, find_external: impl Fn(Vec2) -> Option<SoulID>) -> &[Trade] {
-        self.make_trades_filtered(find_external, |_, _| true, &BTreeMap::new())
+        self.make_trades_filtered(|pos, _| find_external(pos), |_, _| true, &BTreeMap::new())
     }
 
     pub(super) fn make_trades_filtered(
         &mut self,
-        find_external: impl Fn(Vec2) -> Option<SoulID>,
+        mut find_external: impl FnMut(Vec2, u32) -> Option<SoulID>,
         mut can_pick_up: impl FnMut(SoulID, SoulID) -> bool,
         job_priorities: &BTreeMap<SoulID, (bool, HiringPriority)>,
     ) -> &[Trade] {
@@ -1285,7 +1285,9 @@ impl Market {
                         log::warn!("{:?} is selling more than it has: {:?}", &seller, qty_sell);
                         continue;
                     }
-                    let Some(ext @ SoulID::FreightStation(_)) = find_external(order.pos) else {
+                    let Some(ext @ SoulID::FreightStation(_)) =
+                        find_external(order.pos, qty_sell as u32)
+                    else {
                         continue;
                     };
                     *capital.get_mut(&seller).unwrap() -= qty_sell;

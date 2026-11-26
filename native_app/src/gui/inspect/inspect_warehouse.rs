@@ -1,10 +1,13 @@
 use goryak::{
-    mincolumn, minrow, on_primary_container, on_secondary_container, primary,
+    dragvalue, mincolumn, minrow, on_primary_container, on_secondary_container, primary,
     selectable_label_primary, textc, ProgressBar,
 };
 use prototypes::try_prototype;
 use simulation::economy::{
-    cargo::{stored_items, CargoBook, TruckLoad, WarehouseActivity, WarehousePolicy},
+    cargo::{
+        stored_items, CargoBook, DepotRestock, Endpoint, FreightTrace, TruckLoad,
+        WarehouseActivity, WarehousePolicy,
+    },
     Market,
 };
 use simulation::map::{BuildingID, BuildingKind, Map};
@@ -69,13 +72,13 @@ pub(crate) fn section(uiw: &UiWorld, sim: &Simulation, building: BuildingID) {
                     format!("{occupied} / {capacity} units committed"),
                 );
             });
-            // The watermarks apply to the space all items share.
+            let restock = sim.read::<FreightTrace>().depot_restock(company, storage);
             textc(
                 on_secondary_container(),
                 format!(
                     "Shared space · restock below {} · fill to {} units · {}",
-                    storage.low_water_units,
-                    storage.high_water_units,
+                    restock.limits.low,
+                    restock.limits.high,
                     if book.is_restocking(company) {
                         "restocking"
                     } else {
@@ -83,6 +86,30 @@ pub(crate) fn section(uiw: &UiWorld, sim: &Simulation, building: BuildingID) {
                     }
                 ),
             );
+            if uiw.can_author() {
+                let mut low = restock.limits.low;
+                let mut high = restock.limits.high;
+                minrow(4.0, || {
+                    textc(on_secondary_container(), "Restock below");
+                    dragvalue().min(0.0).max(f64::from(high - 1)).show(&mut low);
+                    textc(on_secondary_container(), "Fill to");
+                    dragvalue()
+                        .min(f64::from(low + 1))
+                        .max(f64::from(capacity))
+                        .show(&mut high);
+                    let limits = DepotRestock { low, high };
+                    if limits != restock.limits {
+                        uiw.commands().push(WorldCommand::SetWarehouseRestock {
+                            depot: Endpoint {
+                                soul: owner,
+                                building,
+                            },
+                            expected_revision: restock.revision,
+                            limits,
+                        });
+                    }
+                });
+            }
             if let Some(activity) = book.warehouse_activity(company) {
                 textc(
                     on_secondary_container(),
