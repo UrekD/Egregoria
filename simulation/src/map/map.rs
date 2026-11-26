@@ -453,6 +453,12 @@ impl Map {
         !self.junction_rules.is_empty()
     }
 
+    /// Published networks with commissioned gateways and bulk-imported cities
+    /// retain their stock traffic policy outside explicitly controlled junctions.
+    pub fn uses_stock_traffic(&self) -> bool {
+        self.has_imported_lane_reserves() || self.land_ownership.reserves().next().is_some()
+    }
+
     pub(crate) fn has_junction_controller(&self) -> bool {
         self.junction_rules
             .values()

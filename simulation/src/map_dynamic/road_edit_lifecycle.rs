@@ -12,6 +12,7 @@ const PEDESTRIAN_RADIUS: f32 = 0.3;
 const LOCAL_WORK: usize = 1_024;
 const MAX_CURB_EXIT: f32 = 6.0;
 
+#[derive(Debug)]
 pub(super) enum PedestrianClearance {
     Clear,
     Hold,
@@ -69,16 +70,15 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
     for id in intersections {
         work = work.checked_sub(1)?;
         let junction = map.get(id)?;
-        // Adjacent roads supply their endpoints as well, including endpoints
-        // where the crossing lies just outside the junction's spatial circle.
-        if !junction
+        // A clipped road end and its crosswalk can sit outside the spatial
+        // circle at a wide junction. The circle only bounds the sweep scan.
+        if junction
             .pos
             .xy()
             .is_close(center, junction.radius + 2.0 * SEARCH_RADIUS)
         {
-            continue;
+            nearby_junctions.push(junction);
         }
-        nearby_junctions.push(junction);
         for turn in junction.crosswalks() {
             work = work.checked_sub(1 + turn.points.len())?;
             if let Some((projection, sidewalk, dir)) = crosswalk_exit(map, turn, position) {
@@ -300,9 +300,10 @@ fn p7_life_dense_junction_can_clear_a_cancelled_walker() {
         .find(|turn| turn.kind == TurnKind::Crosswalk)
         .unwrap();
     let position = crosswalk.points.middle();
+    let clearance = pedestrian_clearance(&map, position);
     assert!(matches!(
-        pedestrian_clearance(&map, position),
+        clearance,
         PedestrianClearance::Crosswalk { traversal, .. }
             if traversal.kind == TraverseKind::Turn(crosswalk.id)
-    ));
+    ), "{clearance:?}");
 }

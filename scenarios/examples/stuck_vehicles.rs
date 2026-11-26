@@ -286,6 +286,7 @@ fn main() {
         sim.world().trains.len(),
         sim.map().roads().len()
     );
+    println!("TRACE_STOCK_TRAFFIC enabled={}", sim.map().uses_stock_traffic());
 
     let mut done = 0;
     while done < ticks {

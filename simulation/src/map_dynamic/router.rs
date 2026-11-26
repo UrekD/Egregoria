@@ -324,7 +324,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
         };
 
         if let Some(RoutingStep::DriveTo(car, obj)) = h.router.cur_step {
-            if h.location == Location::Vehicle(car) {
+            if h.location == Location::Vehicle(car) && !map.uses_stock_traffic() {
                 if let Some(vehicle) = world.vehicles.get_mut(car) {
                     if vehicle.it.is_missing()
                         && !vehicle.vehicle.state.is_parked()

@@ -350,7 +350,8 @@ fn calc_decision_traced<'a>(
         vehicle.flag = 0;
     }
     let stopping_threshold = 0.8 + stop_dist;
-    let panicking = matches!(vehicle.state, VehicleState::Panicking(_));
+    let panicking = matches!(vehicle.state, VehicleState::Panicking(_))
+        && !map.uses_stock_traffic();
     let cutoff = if panicking {
         stopping_threshold
     } else {

@@ -1,11 +1,11 @@
 use crate::map::{
-    Lane, LaneID, LaneKind, Map, PathKind, Pathfinder, RoadID, Traversable, TraverseDirection,
-    TraverseKind,
+    Lane, LaneID, LaneKind, Map, PathKind, Pathfinder, ProjectFilter, ProjectKind, RoadID,
+    Traversable, TraverseDirection, TraverseKind,
 };
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
 use crate::transportation::junction_admission::{
-    entry_boundary, EntryOwner, HoldReason, JunctionAdmission, JunctionFrame, MovingOwner,
+    configured, entry_boundary, EntryOwner, HoldReason, JunctionAdmission, JunctionFrame, MovingOwner,
 };
 use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason};
 use crate::transportation::traffic_metrics::within_lane;
@@ -1198,6 +1198,14 @@ struct MovementAdmission<'a> {
     discharged: Option<crate::map::TurnID>,
 }
 
+fn local_pedestrian_recovery(map: &Map, stock: bool, position: Vec3) -> bool {
+    !stock || (map.has_junction_rules()
+        && map.spatial_map().query_around(position.xy(), 1.25, ProjectFilter::INTER)
+            .any(|candidate| matches!(candidate, ProjectKind::Intersection(id)
+                if configured(map, id).is_some()
+                    && map.get(id).is_some_and(|junction| (position.z - junction.pos.z).abs() < 1.0))))
+}
+
 pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("map_dynamic::itinerary_update");
     let time = &*resources.read::<GameTime>();
@@ -1209,12 +1217,15 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     throughput.begin_tick(map, tick);
     let mut remaining_egress_checks = MAX_EGRESS_CHECKS_PER_TICK;
     let mut checked_clear = Vec::new();
+    let stock = map.uses_stock_traffic();
     if map.has_junction_controller() {
         world.humans.edit_active(HumanWork::Itinerary, |id, human| {
             if remaining_egress_checks != 0
                 && human.location == Location::Outside
                 && human.collider.is_some()
                 && human.it.needs_clearance_check(tick, human.router.has_route_step())
+                && (human.it.is_pedestrian_egress()
+                    || local_pedestrian_recovery(map, stock, human.trans.pos))
             {
                 remaining_egress_checks -= 1;
                 human.speed.0 = 0.0;
@@ -1295,11 +1306,12 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     world.humans.edit_active(HumanWork::Itinerary, |id, human| {
         let outside = human.location == Location::Outside;
         let has_route_step = human.router.has_route_step();
-        let mut safe_to_remove = checked_clear.contains(&id);
-        if outside
-            && human.collider.is_some()
-            && human.it.needs_clearance_check(tick, has_route_step)
-        {
+        let needs_check = outside && human.collider.is_some()
+            && human.it.needs_clearance_check(tick, has_route_step);
+        let stock_release = needs_check && !human.it.is_pedestrian_egress()
+            && !local_pedestrian_recovery(map, stock, human.trans.pos);
+        let mut safe_to_remove = stock_release || checked_clear.contains(&id);
+        if needs_check && !stock_release {
             human.speed.0 = 0.0;
             if !safe_to_remove {
                 if remaining_egress_checks == 0 {
@@ -1336,6 +1348,11 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         // Route loss and deferred replanning use the physical clearance path.
         safe_to_remove |= !human.it.requires_pedestrian_egress(has_route_step)
             || (clearing && !human.it.is_pedestrian_egress());
+        // A retry can lose its point during this update. Stock networks also
+        // release ordinary route-less colliders on that first tick.
+        if stock && !clearing && human.it.get_point().is_none() {
+            safe_to_remove |= !local_pedestrian_recovery(map, stock, human.trans.pos);
+        }
         match (human.it.get_point(), human.collider) {
             (None, Some(collider)) if safe_to_remove => {
                 resources.write::<TransportGrid>().remove_maintain(collider.0);
