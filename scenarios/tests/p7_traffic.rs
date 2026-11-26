@@ -89,6 +89,38 @@ fn cutoff_and_manifest_credit() {
 }
 
 #[test]
+fn cutoff_enforces_absolute_directed_p95() {
+    let mut offers = offers();
+    let original = offers.clone();
+    offers.extend(original.into_iter().map(|mut offer| {
+        offer.tag += 40;
+        offer
+    }));
+    for offer in &mut offers {
+        let group_index = (offer.tag / 40) * 20 + offer.tag % 20;
+        offer.directed_group = format!("od-{}", u32::from(group_index % 40 >= 19));
+    }
+    let stock = observations(&offers, |tag| {
+        if [0, 1, 2, 20, 21, 22].contains(&tag) {
+            7_500
+        } else {
+            250
+        }
+    });
+    let treatment = |delay| observations(&offers, |tag| if tag == 0 { 150 + delay } else { 240 });
+    let limit = 35 * TICKS_PER_MINUTE;
+    let at_limit = score_matched_offers(&offers, &stock, &treatment(limit), 7_000).unwrap();
+    assert!(at_limit.passes_improvement);
+    let above_limit = score_matched_offers(&offers, &stock, &treatment(limit + 1), 7_000).unwrap();
+    assert_eq!(above_limit.treatment[&Cohort::Person].p95_delay_ticks, 90);
+    assert_eq!(
+        above_limit.treatment[&Cohort::Person].directed_p95_delay_ticks["od-0"],
+        limit + 1,
+    );
+    assert!(!above_limit.passes_improvement);
+}
+
+#[test]
 fn repair_cohort_and_no_loss() {
     let offers = offers();
     let control = observations(&offers, |tag| if tag % 20 >= 18 { 7_500 } else { 250 });
@@ -451,7 +483,12 @@ fn repair_cohort_and_no_loss_fixtures_stage_the_same_offers() {
     assert_eq!(repair.primary_cutoff, repair.checkpoint + 10_600);
     assert_eq!(repair.tail_cutoff, repair.checkpoint + 144_000);
     let manifest = wave0_manifest();
-    let pinned = &manifest["matched_cohort"]["repair_command"];
+    let cohort = &manifest["matched_cohort"];
+    let pinned = &cohort["repair_command"];
+    assert_eq!(
+        Some(repair.checkpoint),
+        cohort["initial_elapsed_tick"].as_u64()
+    );
     for (fixture, start, requested) in [
         (&repair, "opening_speed_m_per_s", "requested_speed_m_per_s"),
         (
@@ -481,6 +518,8 @@ fn repair_cohort_and_no_loss_fixtures_stage_the_same_offers() {
     }
     let mut groups = BTreeMap::new();
     let mut people = BTreeSet::new();
+    let mut curbs = BTreeSet::new();
+    let mut freight_pairs = BTreeSet::new();
     for entry in &repair.schedule {
         *groups.entry(entry.group).or_insert(0) += 1;
         match entry.offer {
@@ -488,14 +527,24 @@ fn repair_cohort_and_no_loss_fixtures_stage_the_same_offers() {
                 human,
                 home,
                 destination,
+                launch,
+                arrival_curb,
             } => {
                 assert!(people.insert(human));
+                assert!(launch.is_some());
+                let curb: [f32; 3] = arrival_curb.expect("a pinned arrival curb").into();
+                assert!(curbs.insert(curb.map(f32::to_bits)));
                 assert!(repair.simulation.world().humans.contains_key(human));
                 assert!(repair.simulation.map().get(home).is_some());
                 assert!(repair.simulation.map().get(destination).is_some());
                 assert_eq!(
                     entry.tick - repair.checkpoint,
                     100 + u64::from(entry.tag - 1) * 50
+                );
+                let index = (entry.tag as usize - 1) % 6;
+                assert_eq!(
+                    Some(entry.group),
+                    cohort["person"]["group_order"][index].as_str()
                 );
             }
             FixtureOffer::Freight {
@@ -505,17 +554,30 @@ fn repair_cohort_and_no_loss_fixtures_stage_the_same_offers() {
                 ..
             } => {
                 assert_ne!(sender, receiver);
-                assert_eq!(units, 1);
+                freight_pairs.insert((sender, receiver));
+                assert_eq!(
+                    units,
+                    manifest["matched_cohort"]["freight"]["units_per_offer"]
+                        .as_u64()
+                        .unwrap()
+                );
                 assert!(repair.simulation.map().get(sender).is_some());
                 assert!(repair.simulation.map().get(receiver).is_some());
                 assert_eq!(
                     entry.tick - repair.checkpoint,
                     100 + u64::from(entry.tag - 121) * 250
                 );
+                let index = (entry.tag as usize - 121) % 2;
+                assert_eq!(
+                    Some(entry.group),
+                    cohort["freight"]["group_order"][index].as_str()
+                );
             }
         }
     }
     assert_eq!(people.len(), 120);
+    assert_eq!(curbs.len(), 120);
+    assert_eq!(freight_pairs.len(), 2);
     assert_eq!(groups.len(), 8);
     assert_eq!(groups.values().filter(|&&offers| offers == 20).count(), 6);
     assert_eq!(groups.values().filter(|&&offers| offers == 12).count(), 2);
@@ -560,21 +622,23 @@ fn repair_cohort_and_no_loss_preserves_physical_arrivals_and_unloads() {
         assert_eq!(edit.tag, offer.tag);
         assert_eq!(stock.admitted_at, Some(offer.tick));
         assert_eq!(edit.admitted_at, stock.admitted_at);
-        let destination = match offer.offer {
+        let (destination, quantity) = match offer.offer {
             FixtureOffer::Person { destination, .. } => {
                 persons += 1;
-                destination
+                (destination, 1)
             }
-            FixtureOffer::Freight { receiver, .. } => {
+            FixtureOffer::Freight {
+                receiver, units, ..
+            } => {
                 freight += 1;
-                receiver
+                (receiver, units)
             }
         };
         let accepted = |row: &Observation| {
             matches!(
                 &row.terminal,
-                Some(Terminal::Completed { tick, units: 1, destination: at })
-                    if (offer.tick..=fixture.tail_cutoff).contains(tick) && at == &format!("{destination:?}")
+                Some(Terminal::Completed { tick, units, destination: at })
+                    if (offer.tick..=fixture.tail_cutoff).contains(tick) && *units == quantity && at == &format!("{destination:?}")
             )
         };
         if !accepted(stock) || !accepted(edit) {
@@ -593,24 +657,57 @@ fn repair_cohort_and_no_loss_preserves_physical_arrivals_and_unloads() {
 }
 
 #[test]
-#[ignore = "runs both full matched repair arms"]
 fn repair_cohort_matched_headless() {
-    use scenarios::traffic_repair::{prepare_repair_fixture, FixtureArm};
+    use scenarios::traffic_repair::{
+        compare_repair, prepare_repair_fixture, AbsoluteSchedule, ComparisonRequest, FixtureArm,
+        VerifiedFixtureSnapshot,
+    };
+    use std::sync::atomic::AtomicBool;
 
     let fixture = prepare_repair_fixture(FixtureArm::Repair).unwrap();
-    let [control, treatment] = run_repair_checkpoint(&fixture, "repair-cohort");
     let manifest = wave0_manifest();
     let pin = &manifest["matched_cohort"];
     let offers = physical_offers(&fixture, pin);
-    let primary =
-        score_matched_offers(&offers, &control, &treatment, fixture.primary_cutoff).unwrap();
-    let tail = score_matched_offers(&offers, &control, &treatment, fixture.tail_cutoff).unwrap();
+    let snapshot = VerifiedFixtureSnapshot::capture(&fixture.simulation).unwrap();
+    let compared = compare_repair(
+        &snapshot,
+        &AbsoluteSchedule {
+            scheduled_offers: &fixture.schedule,
+            scoring_offers: &offers,
+            batches: &[],
+            primary_cutoff: fixture.primary_cutoff,
+            tail_cutoff: fixture.tail_cutoff,
+        },
+        ComparisonRequest {
+            repair_at: fixture.repair_at,
+            repair: &fixture.repair,
+            resume_at: None,
+            cancelled: &AtomicBool::new(false),
+        },
+    )
+    .unwrap();
+    let primary = &compared.primary;
+    let tail = &compared.tail;
 
     eprintln!("primary {primary:?}");
     eprintln!("tail {tail:?}");
+    eprintln!(
+        "tags observed on repaired road: control {:?}, treatment {:?}",
+        compared.control.repaired_road_tags, compared.treatment.repaired_road_tags
+    );
+    assert!(primary.passes_improvement, "the live repair must pass C2");
     assert_eq!(
         primary.passes_improvement,
         pin["expected_primary_improvement"].as_bool().unwrap(),
+    );
+    assert!(
+        compared.treatment.repaired_road_tags.iter().any(|tag| {
+            !compared.control.repaired_road_tags.contains(tag)
+                && compared.treatment.observations.iter().any(|row| {
+                    row.tag == *tag && matches!(row.terminal, Some(Terminal::Completed { .. }))
+                })
+        }),
+        "an original journey or manifest must use the alternate link and complete",
     );
     assert!(
         tail.preserves_credit,
@@ -624,6 +721,45 @@ fn repair_cohort_matched_headless() {
             );
             assert_eq!(arm[&cohort].attrition, 0);
         }
+    }
+}
+
+#[test]
+#[ignore = "isolated free-flow reference calibration"]
+fn repair_cohort_free_flow_references() {
+    use scenarios::traffic_repair::{prepare_repair_fixture, run_no_loss_arm, FixtureArm};
+    use simulation::{Simulation, SnapshotRevision};
+    use std::collections::BTreeSet;
+
+    let mut fixture = prepare_repair_fixture(FixtureArm::NoLoss).unwrap();
+    let mut groups = BTreeSet::new();
+    let references: Vec<_> = fixture
+        .schedule
+        .iter()
+        .copied()
+        .filter(|offer| groups.insert(offer.group))
+        .collect();
+    let bytes = fixture
+        .simulation
+        .capture_slot_with_limit(SnapshotRevision::new(1), 32 * 1024 * 1024)
+        .unwrap()
+        .encode_with_limit(32 * 1024 * 1024)
+        .unwrap()
+        .into_snapshot_bytes();
+    for offer in references {
+        fixture.schedule = vec![offer];
+        let snapshot = Simulation::load_compressed_snapshot(&bytes, 32 * 1024 * 1024).unwrap();
+        let rows = run_no_loss_arm(snapshot, &fixture, false).unwrap();
+        let Some(Terminal::Completed { tick, .. }) = rows[0].terminal else {
+            panic!("{} has no free-flow completion", offer.group);
+        };
+        let duration = tick - offer.tick;
+        eprintln!("{}: {duration}", offer.group);
+        assert_eq!(
+            Some(duration),
+            wave0_manifest()["matched_cohort"]["free_flow_reference"]["ticks"][offer.group]
+                .as_u64()
+        );
     }
 }
 

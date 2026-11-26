@@ -1,0 +1,144 @@
+{
+  "bus_lines": [
+    "employment",
+    "neighbourhood"
+  ],
+  "corridors": [
+    {
+      "key": "sava-rim",
+      "point_xy_m": [
+        1407.0,
+        1400.965576171875
+      ],
+      "approaches": [
+        {
+          "Authored": "sava-rim-town"
+        },
+        {
+          "Authored": "sava-rim-park"
+        }
+      ],
+      "road": {
+        "idx": 199,
+        "version": 1
+      },
+      "directions": [
+        {
+          "from": {
+            "idx": 184,
+            "version": 1
+          },
+          "lane": {
+            "idx": 1054,
+            "version": 1
+          },
+          "to": {
+            "idx": 185,
+            "version": 1
+          }
+        },
+        {
+          "from": {
+            "idx": 185,
+            "version": 1
+          },
+          "lane": {
+            "idx": 1055,
+            "version": 1
+          },
+          "to": {
+            "idx": 184,
+            "version": 1
+          }
+        }
+      ]
+    },
+    {
+      "key": "sava-town",
+      "point_xy_m": [
+        1872.0,
+        1121.847412109375
+      ],
+      "approaches": [
+        {
+          "Authored": "sava-town-north"
+        },
+        {
+          "Authored": "sava-town-park"
+        }
+      ],
+      "road": {
+        "idx": 203,
+        "version": 1
+      },
+      "directions": [
+        {
+          "from": {
+            "idx": 186,
+            "version": 1
+          },
+          "lane": {
+            "idx": 1070,
+            "version": 1
+          },
+          "to": {
+            "idx": 187,
+            "version": 1
+          }
+        },
+        {
+          "from": {
+            "idx": 186,
+            "version": 1
+          },
+          "lane": {
+            "idx": 1071,
+            "version": 1
+          },
+          "to": {
+            "idx": 187,
+            "version": 1
+          }
+        },
+        {
+          "from": {
+            "idx": 187,
+            "version": 1
+          },
+          "lane": {
+            "idx": 1072,
+            "version": 1
+          },
+          "to": {
+            "idx": 186,
+            "version": 1
+          }
+        },
+        {
+          "from": {
+            "idx": 187,
+            "version": 1
+          },
+          "lane": {
+            "idx": 1073,
+            "version": 1
+          },
+          "to": {
+            "idx": 186,
+            "version": 1
+          }
+        }
+      ]
+    }
+  ],
+  "lead_in_ticks": 0,
+  "opening_tick": 720001,
+  "purpose": "Three elapsed days on the commissioned wet Lesce opening",
+  "scored_ticks": 432000,
+  "seed": 20261122,
+  "gates": {
+    "max_spillback_ticks": 2000,
+    "max_unresolved_standstill_ticks": 3000
+  },
+  "workers": 1
+}

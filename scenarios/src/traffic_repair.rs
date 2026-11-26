@@ -10,6 +10,19 @@ pub use crate::builtin::traffic_repair::{
     ScheduledOffer,
 };
 
+mod cli;
+pub use cli::cli;
+pub(crate) mod comparison;
+mod staging;
+pub use comparison::{
+    compare_builtin_repair, compare_repair, AbsoluteSchedule, ComparisonArm,
+    ComparisonBatchOutcome, ComparisonError, ComparisonReceipt, ComparisonRequest,
+    RepairComparison, ScheduledBatch, VerifiedFixtureSnapshot,
+};
+pub use staging::{
+    stage_published_slots, SlotFixture, SlotFixtureFiles, SlotFixturePack, StageOptions,
+};
+
 pub const OD_DELAY_LIMIT_TICKS: u64 = 35 * TICKS_PER_MINUTE;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -140,7 +153,7 @@ pub struct Offer {
     pub units: u64,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Observation {
     pub tag: u32,
@@ -148,7 +161,7 @@ pub struct Observation {
     pub terminal: Option<Terminal>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Terminal {
     Completed {
@@ -251,7 +264,8 @@ pub fn score_matched_offers(
                 .directed_p95_delay_ticks
                 .iter()
                 .all(|(group, &ticks)| {
-                    percentage_at_most(repair.directed_p95_delay_ticks[group], ticks, 102)
+                    let delay = repair.directed_p95_delay_ticks[group];
+                    delay <= OD_DELAY_LIMIT_TICKS && percentage_at_most(delay, ticks, 102)
                 })
     });
     let preserves_credit =

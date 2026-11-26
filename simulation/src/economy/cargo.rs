@@ -490,9 +490,17 @@ impl CargoBook {
     }
 
     pub fn incoming_loads(&self, building: BuildingID) -> impl Iterator<Item = &TruckLoad> {
-        self.loads
-            .values()
-            .filter(move |load| load.destination.building == building)
+        self.incoming_load_manifests(building).map(|(_, load)| load)
+    }
+
+    /// Active road manifests bound for this receiver in dispatch order.
+    pub fn incoming_load_manifests(
+        &self,
+        building: BuildingID,
+    ) -> impl Iterator<Item = (LoadId, &TruckLoad)> {
+        self.loads.iter().filter_map(move |(&id, load)| {
+            (load.destination.building == building).then_some((id, load))
+        })
     }
 
     pub fn warehouse_policy(&self, company: CompanyID, storage: &WarehouseSpec) -> WarehousePolicy {

@@ -13,7 +13,7 @@ use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
 use crate::world_command::{CommandOutcomes, PrepareBudget, Rejection, WorldCommand};
 use common::saveload::{
-    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry, SlotMeta, SnapshotKind,
+    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry,
 };
 use common::FastMap;
 use derive_more::{From, TryInto};
@@ -64,7 +64,8 @@ mod world;
 pub mod world_command;
 
 pub use common::saveload::{
-    list_slots_with_revisions, save_dir, SlotCamera, SlotId, SnapshotRevision,
+    list_slots_with_revisions, save_dir, SlotCamera, SlotId, SlotMeta, SlotPaths, SnapshotKind,
+    SnapshotRevision,
 };
 pub use economy::population::PopulationScale;
 pub use map::{AuthoredTownError, AuthoredTownOptions};
@@ -1028,6 +1029,21 @@ impl Simulation {
         Self::decode_snapshot(&read_snapshot(file, kind)?)
     }
 
+    /// Inspect the bounded prefix of compressed slot bytes.
+    pub fn compressed_snapshot_header(bytes: &[u8]) -> Result<SnapshotHeader, SaveLoadError> {
+        read_snapshot_header(bytes, SnapshotKind::Zip)
+    }
+
+    /// Load compressed slot bytes with the same registry and schema checks as a slot file.
+    pub fn load_compressed_snapshot(bytes: &[u8], limit: usize) -> Result<Self, SaveLoadError> {
+        let limit = limit.min(MAX_SNAPSHOT_BYTES);
+        if bytes.len() > limit {
+            return Err(SaveLoadError::SnapshotTooLarge { limit });
+        }
+        read_snapshot_header(bytes, SnapshotKind::Zip)?.check_load_compatibility()?;
+        Self::decode_snapshot(&decompress_snapshot(bytes, limit)?)
+    }
+
     pub fn validate_listed_snapshot(root: &Path, entry: &SlotEntry) -> Result<(), SaveLoadError> {
         open_listed_snapshot(root, entry).map(|_| ())
     }
@@ -1136,7 +1152,7 @@ impl Simulation {
         self.capture_slot_with_limit(revision, MAX_SNAPSHOT_BYTES)
     }
 
-    fn capture_slot_with_limit(
+    pub fn capture_slot_with_limit(
         &self,
         revision: SnapshotRevision,
         limit: usize,
@@ -1638,7 +1654,7 @@ impl SlotCapture {
         self.encode_with_limit(MAX_SNAPSHOT_BYTES)
     }
 
-    fn encode_with_limit(self, limit: usize) -> Result<EncodedSlot, SaveLoadError> {
+    pub fn encode_with_limit(self, limit: usize) -> Result<EncodedSlot, SaveLoadError> {
         let Self {
             prefix: mut bytes,
             mut resources,
@@ -1713,6 +1729,11 @@ pub struct EncodedSlot {
 }
 
 impl EncodedSlot {
+    /// Returns the complete snapshot for an isolated in-memory restore.
+    pub fn into_snapshot_bytes(self) -> Vec<u8> {
+        self.snapshot
+    }
+
     pub fn with_display_name(mut self, display_name: String) -> Self {
         self.display_name = Some(display_name);
         self
@@ -1871,11 +1892,13 @@ fn read_snapshot(mut file: fs::File, kind: SnapshotKind) -> Result<Vec<u8>, Save
     if kind == SnapshotKind::Bc {
         return Ok(bytes);
     }
-    CompressedBincode::decompress_limited(&bytes, MAX_SNAPSHOT_BYTES).map_err(|error| {
+    decompress_snapshot(&bytes, MAX_SNAPSHOT_BYTES)
+}
+
+fn decompress_snapshot(bytes: &[u8], limit: usize) -> Result<Vec<u8>, SaveLoadError> {
+    CompressedBincode::decompress_limited(bytes, limit).map_err(|error| {
         if error.kind() == io::ErrorKind::FileTooLarge {
-            SaveLoadError::SnapshotTooLarge {
-                limit: MAX_SNAPSHOT_BYTES,
-            }
+            SaveLoadError::SnapshotTooLarge { limit }
         } else {
             corrupt_header(error)
         }

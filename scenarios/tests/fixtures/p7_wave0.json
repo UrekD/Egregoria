@@ -1138,23 +1138,24 @@
       "repair-cohort",
       "repair-no-loss"
     ],
-    "status": "physical comparison at both cutoffs; pinned repair fails the C2 primary gate",
+    "status": "priced live repair scored at both cutoffs from original signed curb arrivals and warehouse receipts",
     "producer": "scenarios::traffic_repair::prepare_repair_fixture",
     "seed": 6042,
-    "initial_elapsed_tick": 23,
+    "initial_elapsed_tick": 21,
     "road_grid": {
       "origin_xy": [400, 520],
-      "columns": 4,
-      "rows": 3,
-      "spacing_m": 260,
-      "repair_link_endpoints_xy": [[660, 780], [920, 780]]
+      "repair_link_endpoints_xy": [[1000, 750], [1260, 750]],
+      "alternate_crossing_y": 595,
+      "approach_length_m": 600,
+      "approach_speed_m_per_s": 38,
+      "lanes_per_direction": 3
     },
     "repair_command": {
       "variant": "MapUpgradeRoad",
       "opening_speed_m_per_s": 4,
-      "no_loss_opening_speed_m_per_s": 13,
-      "requested_speed_m_per_s": 13,
-      "no_loss_requested_speed_m_per_s": 15
+      "no_loss_opening_speed_m_per_s": 38,
+      "requested_speed_m_per_s": 40,
+      "no_loss_requested_speed_m_per_s": 40
     },
     "repair_offset_ticks": 1,
     "primary_offset_ticks": 10600,
@@ -1163,40 +1164,47 @@
       "count": 120,
       "directed_groups": 6,
       "group_order": [
-        "west_to_center",
-        "west_to_east",
-        "center_to_west",
-        "center_to_east",
-        "east_to_west",
-        "east_to_center"
+        "west_to_east_far_curb",
+        "east_to_west_far_curb",
+        "west_to_east_middle_curb",
+        "east_to_west_middle_curb",
+        "west_to_east_near_curb",
+        "east_to_west_near_curb"
       ],
+      "departure": "original resident and car at a directed approach lane, 20 m/s; launches for each lane move back by 5.5 m per offer",
+      "arrival": "original resident outside their parked car at a unique, predeclared curb point by the named small depot",
+      "site_near_middle_far_x": {
+        "east": [1420, 1535, 1615],
+        "west": [840, 725, 645]
+      },
       "first_offset_ticks": 100,
       "interval_ticks": 50
     },
     "freight": {
       "count": 24,
       "directed_groups": 2,
-      "group_order": ["west_mine_to_east_plant", "east_mine_to_west_plant"],
+      "group_order": ["west_warehouse_to_east_warehouse", "east_warehouse_to_west_warehouse"],
       "sku": "coal",
-      "units_per_offer": 1,
+      "dispatch": "12 staged drivers and trucks on each source side, indexed physical manifests and exact warehouse unload receipts",
+      "units_per_offer": 8,
       "first_offset_ticks": 100,
       "interval_ticks": 250
     },
     "free_flow_reference": {
-      "method": "First tag in each group run alone from the 13 m/s no-loss checkpoint, at its original release tick, including normal handling",
+      "method": "First tag in each group run alone from the 38 m/s no-loss checkpoint, at its original release tick, including normal handling",
       "ticks": {
-        "west_to_center": 6093,
-        "west_to_east": 56447,
-        "center_to_west": 8814,
-        "center_to_east": 18570,
-        "east_to_west": 23434,
-        "east_to_center": 5553,
-        "west_mine_to_east_plant": 4815,
-        "east_mine_to_west_plant": 5097
+        "west_to_east_near_curb": 2270,
+        "east_to_west_near_curb": 2188,
+        "west_to_east_middle_curb": 2221,
+        "east_to_west_middle_curb": 2338,
+        "west_to_east_far_curb": 2356,
+        "east_to_west_far_curb": 2424,
+        "west_warehouse_to_east_warehouse": 3625,
+        "east_warehouse_to_west_warehouse": 3577
       }
     },
-    "expected_primary_improvement": false,
-    "expected_tail_credit": {"person": 120, "freight": 24},
+    "expected_primary_improvement": true,
+    "expected_tail_credit": {"person": 120, "freight": 192},
     "od_limit_ticks": 3500,
     "unfinished_ticks": 3501,
     "quantile": "nearest rank, pooled separately for person and freight",
