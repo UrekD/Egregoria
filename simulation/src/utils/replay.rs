@@ -513,7 +513,10 @@ impl ReplayJson {
             Err(SaveLoadError::IncompatibleReplay { version })
                 if matches!(
                     version.as_str(),
-                    "0.11.0+commands.1" | "0.11.0+commands.2" | "0.11.1+commands.2"
+                    "0.11.0+commands.1"
+                        | "0.11.0+commands.2"
+                        | "0.11.1+commands.2"
+                        | "0.12.0+commands.2"
                 ) =>
             {
                 // Earlier P7 command envelopes can still be read inside a compatible city.

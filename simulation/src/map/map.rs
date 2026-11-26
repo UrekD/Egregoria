@@ -62,8 +62,8 @@ pub struct LotOrigin {
 #[derive(Clone, Copy)]
 pub(crate) struct ConnectionEndpoint {
     pub pos: Vec3,
-    kind: ProjectKind,
-    split_point: Option<(Vec3, usize)>,
+    pub(super) kind: ProjectKind,
+    pub(super) split_point: Option<(Vec3, usize)>,
 }
 
 pub(crate) struct RoadSplit {
@@ -508,6 +508,26 @@ impl Map {
         from: ConnectionEndpoint,
         to: ConnectionEndpoint,
     ) -> Result<(), ConnectionError> {
+        for endpoint in [from, to] {
+            let has_path = |id| {
+                self.get(id).is_some_and(|joint: &Intersection| {
+                    joint
+                        .roads
+                        .iter()
+                        .any(|&r| self.get(r).is_some_and(Road::is_walking_path))
+                })
+            };
+            let attached = match endpoint.kind {
+                ProjectKind::Intersection(id) => has_path(id),
+                ProjectKind::Road(id) => self.get(id).is_some_and(|road| {
+                    road.is_walking_path() || has_path(road.src) || has_path(road.dst)
+                }),
+                _ => false,
+            };
+            if attached {
+                return Err(ConnectionError::Stale);
+            }
+        }
         if !self.has_junction_rules() {
             return Ok(());
         }
@@ -1015,6 +1035,9 @@ impl Map {
         ),
         ConnectionError,
     > {
+        if pattern.is_walking_path() {
+            return Err(ConnectionError::InvalidEndpoint);
+        }
         let mut local;
         if work.is_none() && (self.land_ownership.is_tiled() || self.checks_rail_sweeps(pattern)) {
             local = WaterTopologyWork::new();
@@ -1059,7 +1082,7 @@ impl Map {
         self.prepare_resolved_connection_inner(from, to, elbow, pattern, false, work)
     }
 
-    fn prepare_resolved_connection_inner(
+    pub(super) fn prepare_resolved_connection_inner(
         &self,
         from: ConnectionEndpoint,
         to: ConnectionEndpoint,
@@ -1068,7 +1091,9 @@ impl Map {
         stage_merges: bool,
         work: &mut WaterTopologyWork,
     ) -> Result<(usize, Option<PreparedTopologyEdit>), ConnectionError> {
-        self.check_connection_junctions(from, to)?;
+        if !pattern.is_walking_path() {
+            self.check_connection_junctions(from, to)?;
+        }
         let map_bounds = self.environment.bounds();
         let a = from.pos.xy();
         let b = to.pos.xy();
@@ -1276,7 +1301,14 @@ impl Map {
         pattern: &LanePattern,
         prepared: Option<PreparedTopologyEdit>,
     ) -> Result<ConnectedRoad, ConnectionError> {
-        self.check_connection_junctions(from, to)?;
+        if !pattern.is_walking_path() {
+            self.check_connection_junctions(from, to)?;
+        } else if prepared
+            .as_ref()
+            .is_none_or(|edit| edit.walking.is_none())
+        {
+            return Err(ConnectionError::InvalidEndpoint);
+        }
         if prepared.is_none() && self.land_ownership.is_tiled() {
             return Err(ConnectionError::Stale);
         }
@@ -1952,8 +1984,10 @@ impl Map {
 
     pub(crate) fn prepare_remove_road(&self, road_id: RoadID) -> Result<(), ConnectionError> {
         let road = self.get(road_id).ok_or(ConnectionError::InvalidEndpoint)?;
-        self.check_junction_topology_edit(road.src)?;
-        self.check_junction_topology_edit(road.dst)?;
+        if !road.is_walking_path() {
+            self.check_junction_topology_edit(road.src)?;
+            self.check_junction_topology_edit(road.dst)?;
+        }
         if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
             super::prepare_road_removal(self, road_id, &mut WaterTopologyWork::new().geometry())?;
         }
@@ -2155,6 +2189,13 @@ impl Map {
 
     // Private mutating
 
+    pub(crate) fn directed_route_revision(&self) -> (u64, u64) {
+        (
+            self.walking_topology_generation,
+            self.driving_policy_generation,
+        )
+    }
+
     pub(super) fn lane_topology_changed(&mut self) {
         self.walking_topology_generation += 1;
         self.driving_reachability.take();
@@ -2297,6 +2338,7 @@ impl Map {
         let inter = &mut self.intersections[id];
         inter.update_traffic_control(&mut self.lanes, &self.roads);
         inter.update_turns(&self.lanes, &self.roads);
+        inter.apply_turn_mask(self.junction_rules.get(&id));
 
         queue_construction_cut(
             &mut self.pending_construction_cuts,
@@ -2376,6 +2418,7 @@ impl Map {
                 inter.update_traffic_control(&mut self.lanes, &self.roads);
             }
             inter.update_turns(&self.lanes, &self.roads);
+            inter.apply_turn_mask(self.junction_rules.get(&junction));
             self.spatial_map.update(inter);
             self.spatial_map.set_additional_occupancy(
                 inter.id.into(),
@@ -2822,8 +2865,10 @@ impl Map {
         self.lane_topology_changed();
 
         self.electricity.add_object(rid);
-        self.electricity.add_edge(src_id, rid);
-        self.electricity.add_edge(dst_id, rid);
+        if !pattern.is_walking_path() {
+            self.electricity.add_edge(src_id, rid);
+            self.electricity.add_edge(dst_id, rid);
+        }
 
         #[allow(clippy::indexing_slicing)]
         let r = &self.roads[rid];

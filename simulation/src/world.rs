@@ -93,6 +93,8 @@ impl SimDrop for VehicleEnt {
             res.write::<Dispatcher>()
                 .unregister(DispatchID::SmallTruck(id));
         }
+        res.write::<crate::transportation::DrivewayTraffic>()
+            .vehicle_removed(id);
         lifecycle::vehicle_dropped(sim, id, self.trans.pos);
     }
 }

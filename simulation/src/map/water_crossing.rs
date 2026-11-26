@@ -132,9 +132,22 @@ pub(crate) struct PreparedTopologyEdit {
     pub(crate) preview: RoadPreview,
     pub(crate) merges: Option<[bool; 2]>,
     pub(crate) frontage_work: usize,
+    pub(crate) walking: Option<PreparedWalkingTopology>,
     pub(crate) merge_frontage_work: [usize; 2],
     #[cfg(test)]
     merge_lot_allowances: [usize; 2],
+}
+
+pub(crate) struct PreparedWalkingTopology {
+    pub(crate) sides: [Option<crate::map::RoadSide>; 2],
+    pub(crate) approaches: Vec<PreparedApproach>,
+}
+
+pub(crate) struct PreparedApproach {
+    pub(crate) road: RoadID,
+    pub(crate) child: Option<usize>,
+    pub(crate) ordinal: usize,
+    pub(crate) points: PolyLine3,
 }
 
 impl PreparedTopologyEdit {
@@ -383,7 +396,7 @@ pub(crate) fn prepare_topology(
         env,
         elevated,
     );
-    if map.land_ownership().is_tiled() {
+    if map.land_ownership().is_tiled() || pattern.is_walking_path() {
         check_profile_error(error)?;
     }
     if check_water && error == Some(PointGenerateError::OutsideOfMap) {
@@ -429,10 +442,22 @@ fn stage_connection(
     let dst = graph.resolve(to)?;
     let mut id = graph.add_road(src, dst, profile.clone(), pattern, elevated, 0)?;
     let tiled = map.land_ownership().is_tiled();
-    if check_water || tiled {
+    if check_water || tiled || pattern.is_walking_path() {
         graph.invalidate(src)?;
         graph.invalidate(dst)?;
     }
+    let walking = if pattern.is_walking_path() {
+        if elevated {
+            return Err(ConnectionError::Grade);
+        }
+        let road = &graph.roads[id];
+        if road.interfaced_points().length() < 2.0 {
+            return Err(ConnectionError::InvalidEndpoint);
+        }
+        Some(graph.verify_path_correspondence([src, dst], id)?)
+    } else {
+        None
+    };
     let land_outlines = graph.validate_land()?;
     let frontage_work = graph.frontage_work;
     let mut merge_frontage_work = [0; 2];
@@ -502,6 +527,7 @@ fn stage_connection(
         profile_error: None,
         merges,
         frontage_work,
+        walking,
         merge_frontage_work,
         #[cfg(test)]
         merge_lot_allowances,
@@ -755,8 +781,11 @@ struct FrontageGeneration {
 
 impl FrontageGeneration {
     fn bound(road: &Road, pattern: &LanePattern, tiled: bool) -> Option<Self> {
-        if (tiled && road.elevated_span())
-            || !pattern.lanes().any(|(kind, _, _)| kind == crate::map::LaneKind::Walking)
+        if pattern.is_walking_path()
+            || (tiled && road.elevated_span())
+            || !pattern
+                .lanes()
+                .any(|(kind, _, _)| kind == crate::map::LaneKind::Walking)
         {
             return None;
         }
@@ -778,6 +807,58 @@ impl FrontageGeneration {
     }
 }
 
+/// Preserve the live lane port and tangent while joining the freshly clipped
+/// interior. The staged plan publishes this exact polyline after the split.
+fn retain_lane_approach(
+    original: &crate::map::Lane,
+    live: IntersectionID,
+    staged: &mut crate::map::Lane,
+    joint: IntersectionID,
+) -> Result<(), ConnectionError> {
+    let origin = original.get_inter_node_pos(live);
+    let direction = if original.src == live {
+        original.points.first_dir()
+    } else {
+        original.points.last_dir().map(|direction| -direction)
+    }
+    .ok_or(ConnectionError::Stale)?;
+    let backwards = staged.dst == joint;
+    if backwards {
+        staged.points.reverse();
+    }
+    if staged.points.length() < 4.0 {
+        return Err(ConnectionError::Stale);
+    }
+    let interior = staged.points.cut_start(2.0);
+    let next = interior.first();
+    let advance = (next - origin).dot(direction);
+    if advance <= 1.0 || (next - origin - direction * advance).mag() > 0.7 {
+        return Err(ConnectionError::Stale);
+    }
+    let neighbor = if original.src == live {
+        1
+    } else {
+        original.points.len() - 2
+    };
+    let tangent = original
+        .points
+        .get(neighbor)
+        .copied()
+        .filter(|&point| {
+            let distance = origin.distance(point);
+            distance > 0.05 && distance < advance - 0.1
+        })
+        .unwrap_or(origin + direction * 0.5);
+    let mut points = PolyLine3::new(
+        [origin, tangent].into_iter().chain(interior.into_vec()).collect()
+    );
+    if backwards {
+        points.reverse();
+    }
+    staged.points = points;
+    Ok(())
+}
+
 struct LocalTopology<'map, 'work, 'budget> {
     map: &'map Map,
     work: &'work mut CrossingWork<'budget>,
@@ -790,6 +871,7 @@ struct LocalTopology<'map, 'work, 'budget> {
     // Original road lots can survive a split and either staged merge.
     lot_sources: BTreeMap<RoadID, BTreeSet<RoadID>>,
     patterns: BTreeMap<RoadID, LanePattern>,
+    splits: BTreeMap<RoadID, [RoadID; 2]>,
     loaded_junctions: BTreeSet<IntersectionID>,
     changed_roads: BTreeSet<RoadID>,
     changed_junctions: BTreeSet<IntersectionID>,
@@ -812,6 +894,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             live_roads: BTreeMap::new(),
             lot_sources: BTreeMap::new(),
             patterns: BTreeMap::new(),
+            splits: BTreeMap::new(),
             loaded_junctions: BTreeSet::new(),
             changed_roads: BTreeSet::new(),
             changed_junctions: BTreeSet::new(),
@@ -851,6 +934,9 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         let src = self.junction_shell(live.src);
         let dst = self.junction_shell(live.dst);
         let id = live.copy_geometry(&mut self.roads, src, dst);
+        if live.is_walking_path() {
+            self.roads[id].mark_staged_path();
+        }
         self.road_keys.insert(original, id);
         self.live_roads.insert(id, original);
         Ok(id)
@@ -906,6 +992,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                 let after =
                     self.add_road(junction, dst, after, &pattern, road.elevated_span(), 0)?;
                 let live = self.live_roads[&original];
+                self.splits.insert(live, [before, after]);
                 self.lot_sources.insert(before, BTreeSet::from([live]));
                 self.lot_sources.insert(after, BTreeSet::from([live]));
                 self.invalidate(src)?;
@@ -938,6 +1025,9 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             points.len() + self.junctions[src].roads.len() + self.junctions[dst].roads.len(),
         )?;
         let id = Road::insert_profile(&mut self.roads, src, dst, points, pattern.width(), elevated);
+        if pattern.is_walking_path() {
+            self.roads[id].mark_staged_path();
+        }
         self.patterns.insert(id, pattern.clone());
         self.junctions[src].add_road(&self.roads, &self.roads[id]);
         self.junctions[dst].add_road(&self.roads, &self.roads[id]);
@@ -946,6 +1036,202 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         self.update_interfaces(dst)?;
         self.reserve_lot_clearance(id, new_lots)?;
         Ok(id)
+    }
+
+    /// Resolve each old arm to the staged child that still touches that
+    /// junction. Compare lane identities by cross-section order before commit.
+    fn verify_path_correspondence(
+        &mut self,
+        endpoints: [IntersectionID; 2],
+        path: RoadID,
+    ) -> Result<PreparedWalkingTopology, ConnectionError> {
+        use crate::map::{LaneKind, TurnKind};
+
+        let mut sides = [None; 2];
+        let mut approaches = BTreeMap::new();
+        let mut affected = BTreeSet::from(endpoints);
+        let splits: Vec<_> = self.splits.keys().copied().collect();
+        for id in splits {
+            let road = &self.map.roads[id];
+            affected.extend([self.junction_keys[&road.src], self.junction_keys[&road.dst]]);
+        }
+        let mut arms = BTreeSet::new();
+        for &joint in &affected {
+            self.ensure_arms(joint)?;
+            let roads = &self.junctions[joint].roads;
+            self.work
+                .charge(roads.len().saturating_mul(roads.len()).saturating_mul(32))?;
+            arms.extend(roads.iter().copied());
+        }
+
+        let mut lanes = Lanes::default();
+        for arm in arms {
+            let pattern = self.pattern(arm);
+            let road = &mut self.roads[arm];
+            self.work
+                .charge(road.points().len().saturating_mul(pattern.lanes().count()))?;
+            road.clear_staged_lanes();
+            road.make_lanes(&pattern, &mut lanes);
+            for (id, _) in road.lanes_iter() {
+                lanes[id].gen_pos(road);
+            }
+        }
+        for joint in affected {
+            let staged = &self.junctions[joint];
+            let Some(&live) = self.live_junctions.get(&joint) else {
+                let Some(endpoint) = endpoints.iter().position(|&id| id == joint) else {
+                    continue;
+                };
+                let other: Vec<_> = staged
+                    .roads
+                    .iter()
+                    .copied()
+                    .filter(|&id| id != path)
+                    .collect();
+                if other.iter().all(|id| self.roads[*id].is_walking_path()) {
+                    continue;
+                }
+                let [before, after] = other.as_slice() else {
+                    return Err(ConnectionError::InvalidEndpoint);
+                };
+                let turns = staged.turn_policy.generate_turns(staged, &lanes, &self.roads);
+                let dir = self.roads[path].dir_from(joint);
+                let side =
+                    |road| crate::map::turn_policy::facing_side(&self.roads[road], joint, dir);
+                sides[endpoint] = side(*before);
+                if sides[endpoint].is_none() || sides[endpoint] != side(*after) {
+                    return Err(ConnectionError::InvalidEndpoint);
+                }
+                let through = |src: RoadID, dst: RoadID| {
+                    self.roads[src]
+                        .incoming_lanes_to(joint)
+                        .iter()
+                        .filter(|(_, kind)| kind.vehicles())
+                        .zip(
+                            self.roads[dst]
+                                .outgoing_lanes_from(joint)
+                                .iter()
+                                .filter(|(_, kind)| kind.vehicles()),
+                        )
+                        .map(|(&(a, _), &(b, _))| (a, b))
+                        .collect::<BTreeSet<_>>()
+                };
+                let expected: BTreeSet<_> = through(*before, *after)
+                    .into_iter()
+                    .chain(through(*after, *before))
+                    .collect();
+                let driving: BTreeSet<_> = turns
+                    .iter()
+                    .filter(|(_, kind)| *kind == TurnKind::Driving)
+                    .map(|(turn, _)| (turn.src, turn.dst))
+                    .collect();
+                let path_joins = turns
+                    .iter()
+                    .filter(|(turn, kind)| {
+                        *kind == TurnKind::WalkingCorner && lanes[turn.src].parent == path
+                    })
+                    .count();
+                let continuous = turns
+                    .iter()
+                    .filter(|(turn, kind)| {
+                        *kind == TurnKind::WalkingCorner && lanes[turn.src].parent != path
+                    })
+                    .count();
+                if expected != driving
+                    || path_joins != 2
+                    || continuous != 2
+                    || turns.iter().any(|(_, kind)| *kind == TurnKind::Crosswalk)
+                {
+                    return Err(ConnectionError::InvalidEndpoint);
+                }
+                continue;
+            };
+
+            let original = &self.map.intersections[live];
+            let mut mapped_arms = Vec::new();
+            let mut mapped_lanes = BTreeMap::new();
+            for &old in &original.roads {
+                let old_road = &self.map.roads[old];
+                let child = self.splits.get(&old).map(|_| usize::from(old_road.dst == live));
+                let new = child.map_or_else(|| self.road_keys[&old], |child| self.splits[&old][child]);
+                if !staged.roads.contains(&new) {
+                    log::debug!("Walking split changed an arm at {live:?}: {old:?}");
+                    return Err(ConnectionError::Stale);
+                }
+                if old_road
+                    .incoming_lanes_to(live)
+                    .iter()
+                    .any(|(_, k)| k.needs_light())
+                {
+                    mapped_arms.push(new);
+                }
+                for (ordinal, ((old_id, kind), (new_id, new_kind))) in
+                    old_road.lanes_iter().zip(self.roads[new].lanes_iter()).enumerate()
+                {
+                    if kind != new_kind {
+                        log::debug!("Walking split changed a lane on {old:?}: {kind:?} to {new_kind:?}");
+                        return Err(ConnectionError::Stale);
+                    }
+                    if kind.vehicles() || kind == LaneKind::Walking || kind.is_rail() {
+                        let original = &self.map.lanes[old_id];
+                        let replacement = &mut lanes[new_id];
+                        let displacement = original.get_inter_node_pos(live)
+                            .distance(replacement.get_inter_node_pos(joint));
+                        let rotation = original.orientation_from(live)
+                            .distance(replacement.orientation_from(joint));
+                        if displacement > 0.35 || rotation > 0.05 {
+                            log::debug!("Walking split cannot retain approach {old_id:?} at {live:?}");
+                            return Err(ConnectionError::Stale);
+                        }
+                        if displacement > 0.0001 || rotation > 0.0001 {
+                            self.work.charge(
+                                original.points.len().saturating_add(replacement.points.len().saturating_mul(2)),
+                            )?;
+                            if child.is_some() {
+                                retain_lane_approach(original, live, replacement, joint)?;
+                            } else {
+                                replacement.points = original.points.clone();
+                            }
+                            approaches.insert((old, child, ordinal), new_id);
+                        }
+                    }
+                    mapped_lanes.insert(old_id, new_id);
+                }
+            }
+            let signals = staged.roads.iter().copied().filter(|&arm| {
+                self.roads[arm]
+                    .incoming_lanes_to(joint)
+                    .iter()
+                    .any(|(_, k)| k.needs_light())
+            });
+            let expected: Option<BTreeSet<_>> = original
+                .raw_turns()
+                .map(|turn| {
+                    Some((
+                        crate::map::TurnID::new(
+                            joint,
+                            *mapped_lanes.get(&turn.id.src)?,
+                            *mapped_lanes.get(&turn.id.dst)?,
+                            turn.id.bidirectional,
+                        ),
+                        turn.kind,
+                    ))
+                })
+                .collect();
+            if !signals.eq(mapped_arms) {
+                log::debug!("Walking split changed the signal order at {live:?}");
+                return Err(ConnectionError::Stale);
+            }
+            let turns = staged.turn_policy.generate_turns(staged, &lanes, &self.roads);
+            if expected != Some(turns.into_iter().collect()) {
+                log::debug!("Walking split changed the movement set at {live:?}");
+                return Err(ConnectionError::Stale);
+            }
+        }
+        let approaches = approaches.into_iter().map(|((road, child, ordinal), id)| {
+            PreparedApproach { road, child, ordinal, points: lanes[id].points.clone() }
+        }).collect();
+        Ok(PreparedWalkingTopology { sides, approaches })
     }
 
     fn reserve_lot_clearance(
@@ -1213,6 +1499,7 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
             live_roads: self.live_roads.clone(),
             lot_sources: self.lot_sources.clone(),
             patterns: self.patterns.clone(),
+            splits: self.splits.clone(),
             loaded_junctions: self.loaded_junctions.clone(),
             changed_roads: self.changed_roads.clone(),
             changed_junctions: self.changed_junctions.clone(),
@@ -2121,6 +2408,9 @@ fn reassigned_lot_work(points: usize, samples: usize, tile_work: usize) -> usize
 }
 
 pub(crate) fn generated_frontage_work(length: f32, pattern: &LanePattern, wet: bool) -> usize {
+    if pattern.is_walking_path() {
+        return 0;
+    }
     let sides = pattern
         .lanes()
         .filter(|(kind, _, _)| *kind == crate::map::LaneKind::Walking)

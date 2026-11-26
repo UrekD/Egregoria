@@ -1,7 +1,11 @@
-use crate::map::{Intersection, IntersectionID, LaneID, LaneKind, Lanes, Roads, TurnID, TurnKind};
+use crate::map::{
+    Intersection, IntersectionID, LaneID, LaneKind, Lanes, RoadID, RoadSide, Roads, TurnID,
+    TurnKind,
+};
 use egui_inspect::{Inspect, OptionDefault};
 use geom::{vec2, Vec2};
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::iter::{Extend, Iterator};
 
 #[derive(Debug, Copy, Clone, PartialEq, Serialize, Deserialize, Inspect)]
@@ -50,6 +54,44 @@ fn filter_rail(x: &[(LaneID, LaneKind)]) -> Vec<LaneID> {
         .map(|(id, _)| id)
         .copied()
         .collect::<Vec<_>>()
+}
+
+pub(super) fn non_path_arms<'a>(arms: &'a [RoadID], roads: &Roads) -> Cow<'a, [RoadID]> {
+    if arms
+        .iter()
+        .any(|id| roads.get(*id).is_some_and(|r| r.is_walking_path()))
+    {
+        Cow::Owned(
+            arms.iter()
+                .copied()
+                .filter(|id| !roads[*id].is_walking_path())
+                .collect(),
+        )
+    } else {
+        Cow::Borrowed(arms)
+    }
+}
+
+/// Return the curb facing the path, measured in the road's canonical direction.
+pub(super) fn facing_side(
+    road: &crate::map::Road,
+    joint: IntersectionID,
+    path_dir: Vec2,
+) -> Option<RoadSide> {
+    let direction = if road.src == joint {
+        road.src_dir()
+    } else {
+        -road.dst_dir()
+    };
+    let lateral = direction.perpendicular().dot(path_dir);
+    if lateral.abs() < 0.35 {
+        return None;
+    }
+    Some(if lateral > 0.0 {
+        RoadSide::Right
+    } else {
+        RoadSide::Left
+    })
 }
 
 impl TurnPolicy {
@@ -104,7 +146,8 @@ impl TurnPolicy {
         roads: &Roads,
         turns: &mut Vec<(TurnID, TurnKind)>,
     ) {
-        match inter.roads.as_slice() {
+        let arms = non_path_arms(&inter.roads, roads);
+        match arms.as_ref() {
             [road_id] => {
                 let road = unwrap_ret!(roads.get(*road_id));
                 turns.extend(Self::zip_on_same_length(
@@ -160,10 +203,10 @@ impl TurnPolicy {
             _ => {}
         }
 
-        let n_roads = inter.roads.len();
+        let n_roads = arms.len();
 
-        for (i1, road1) in inter.roads.iter().enumerate() {
-            for (i2, road2) in inter.roads.iter().enumerate() {
+        for (i1, road1) in arms.iter().enumerate() {
+            for (i2, road2) in arms.iter().enumerate() {
                 if road1 == road2 && !self.back_turns {
                     continue;
                 }
@@ -203,12 +246,12 @@ impl TurnPolicy {
         roads: &Roads,
         turns: &mut Vec<(TurnID, TurnKind)>,
     ) {
-        let n_roads = inter.roads.len();
+        let arms = non_path_arms(&inter.roads, roads);
+        let n_roads = arms.len();
 
-        for w in inter
-            .roads
+        for w in arms
             .iter()
-            .chain(inter.roads.iter().take(1))
+            .chain(arms.iter().take(1))
             .flat_map(|x| Some(roads.get(*x)?.sidewalks(inter.id)))
             .collect::<Vec<_>>()
             .windows(2)
@@ -231,6 +274,34 @@ impl TurnPolicy {
                 }
             }
         }
+
+        if n_roads == inter.roads.len() {
+            return;
+        }
+        let mut paths = Vec::new();
+        for road in inter.roads.iter().filter_map(|id| roads.get(*id)) {
+            if !road.is_walking_path() {
+                continue;
+            }
+            let lane = road.lanes_iter().next().unwrap().0;
+            let mut join = |other| {
+                turns.push((
+                    TurnID::new(inter.id, lane, other, true),
+                    TurnKind::WalkingCorner,
+                ));
+            };
+            for &other in &paths {
+                join(other);
+            }
+            for &arm in arms.as_ref() {
+                if let Some(other) = facing_side(&roads[arm], inter.id, road.dir_from(inter.id))
+                    .and_then(|side| roads[arm].sidewalk_on(side))
+                {
+                    join(other);
+                }
+            }
+            paths.push(lane);
+        }
     }
 
     pub fn compatible_turn_sharpness_rail(dir1: Vec2, dir2: Vec2) -> bool {
@@ -244,7 +315,8 @@ impl TurnPolicy {
         roads: &Roads,
         turns: &mut Vec<(TurnID, TurnKind)>,
     ) {
-        match inter.roads.as_slice() {
+        let arms = non_path_arms(&inter.roads, roads);
+        match arms.as_ref() {
             [road_id] => {
                 let road = unwrap_ret!(roads.get(*road_id));
                 turns.extend(Self::zip_on_same_length(
@@ -284,8 +356,8 @@ impl TurnPolicy {
             _ => {}
         }
 
-        for road1 in &inter.roads {
-            for road2 in &inter.roads {
+        for road1 in arms.as_ref() {
+            for road2 in arms.as_ref() {
                 if road1 == road2 {
                     continue;
                 }

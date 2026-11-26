@@ -244,6 +244,7 @@ fn register_systems_and_resources() {
     register_resource_default::<Map, Bincode>("map");
     register_junction_policies();
     register_junction_admission();
+    register_driveway_traffic();
     register_lane_scoring();
     register_land_ownership();
     register_pending_construction_cuts();
@@ -365,6 +366,25 @@ fn register_junction_admission() {
             }),
             load: Box::new(|sim, data| {
                 sim.insert(Bincode::decode::<JunctionAdmission>(data)?);
+                Ok(())
+            }),
+        });
+    }
+}
+
+fn register_driveway_traffic() {
+    use crate::transportation::DrivewayTraffic;
+
+    register_resource_noserialize::<DrivewayTraffic>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "driveway_traffic",
+            optional: true,
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&*sim.read::<DrivewayTraffic>(), output)
+            }),
+            load: Box::new(|sim, data| {
+                sim.insert(Bincode::decode::<DrivewayTraffic>(data)?);
                 Ok(())
             }),
         });

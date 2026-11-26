@@ -24,6 +24,8 @@ mod p5_placement;
 mod p5_spine_followups;
 mod p6_water;
 mod p7_road_edit;
+mod pathpark_lifecycle;
+mod pathpark_walk;
 mod population_scale;
 mod test_iso;
 mod vehicles;

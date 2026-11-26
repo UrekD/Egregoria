@@ -563,6 +563,9 @@ pub(crate) fn prepare_upgrade(
     if current != expected {
         return Err(Rejection::StaleRoadEdit);
     }
+    if road.is_walking_path() {
+        return Err(Rejection::InvalidRoadPattern);
+    }
     let mut existing = road.pattern(map.lanes());
     validate_pattern_layout(&existing)?;
     if map.land_ownership().is_tiled() {
@@ -594,6 +597,18 @@ pub(crate) fn prepare_upgrade(
     let [forward, backward] = road.directed_lanes();
     let same_geometry = pattern_matches(forward, &pattern.lanes_forward)
         && pattern_matches(backward, &pattern.lanes_backward);
+    if !same_geometry
+        && [road.src, road.dst].into_iter().any(|id| {
+            map.get(id).is_some_and(|joint| {
+                joint
+                    .roads
+                    .iter()
+                    .any(|&arm| map.get(arm).is_some_and(Road::is_walking_path))
+            })
+        })
+    {
+        return Err(Rejection::StaleRoadEdit);
+    }
     let mut direction_edits = None;
     let (deck, projected_topology, material, retained_lanes, lane_edits) = if same_geometry {
         let retained = road.lanes_iter().map(|(id, _)| id).collect::<Vec<_>>();
@@ -957,7 +972,11 @@ fn reserve_target(road: &Road, budget: &mut PrepareBudget) -> Result<(), Rejecti
     budget.spend_road_work(points * 5 + road.n_lanes() * 5 + 1)
 }
 
-fn stamp(map: &Map, road: &Road, edit: &[(LaneID, f32)]) -> Result<RoadEditStamp, Rejection> {
+pub(super) fn stamp(
+    map: &Map,
+    road: &Road,
+    edit: &[(LaneID, f32)],
+) -> Result<RoadEditStamp, Rejection> {
     let geometry = |points: &PolyLine3| {
         common::hash_iter(
             points
@@ -993,6 +1012,9 @@ fn stamp(map: &Map, road: &Road, edit: &[(LaneID, f32)]) -> Result<RoadEditStamp
 }
 
 fn validate_pattern(pattern: &LanePattern) -> Result<(), Rejection> {
+    if pattern.is_walking_only() {
+        return Err(Rejection::InvalidConnection);
+    }
     let count = pattern
         .lanes_forward
         .len()
