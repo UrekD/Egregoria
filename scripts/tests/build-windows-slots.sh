@@ -44,6 +44,25 @@ set -euo pipefail
 shift 6
 printf '%s\n' "$1" >> "$TRACE"
 case "$1" in
+    citymap-verify)
+        [[ $2 == --root ]]
+        python3 - "$3" <<'PY_CHECK'
+import json
+import sys
+from pathlib import Path
+
+root = Path(sys.argv[1])
+meta = json.loads((root / "lesce_town.meta.json").read_text())
+report = json.loads((root / "lesce_town.build.json").read_text())
+if meta["population"] <= 0:
+    sys.exit("lesce_town: expected positive population")
+if report != {"variant": "wet", "revision": meta["revision"], "save_version": Path("VERSION").read_text().strip()}:
+    sys.exit("lesce_town: report and metadata mismatch")
+if (root / "lesce_town.zip").read_text() != report["save_version"] + " " + meta["revision"] + "\n":
+    sys.exit("lesce_town: corrupt snapshot or header mismatch")
+PY_CHECK
+        exit
+        ;;
     demo-cities)
         [[ $2 == --save-root ]]
         out=$3
@@ -67,8 +86,14 @@ esac
 mkdir -p -- "$out"
 for slot in "${slots[@]}"; do
     [[ ! -e $out/$slot.zip ]]
-    cat VERSION > "$out/$slot.zip"
-    printf '{"population":%s}\n' "${TEST_CITYMAP_POPULATION:-2600}" > "$out/$slot.meta.json"
+    if [[ $slot == lesce_town ]]; then
+        printf '%s commissioned\n' "$(<VERSION)" > "$out/$slot.zip"
+        printf '{"population":%s,"revision":"commissioned"}\n' "${TEST_CITYMAP_POPULATION:-2600}" > "$out/$slot.meta.json"
+        printf '{"variant":"wet","revision":"commissioned","save_version":"%s"}\n' "$(<VERSION)" > "$out/$slot.build.json"
+    else
+        cat VERSION > "$out/$slot.zip"
+        printf '{"population":2600}\n' > "$out/$slot.meta.json"
+    fi
 done
 EOF
 
@@ -91,41 +116,69 @@ expect_trace() {
 }
 
 expect_members() {
-    diff -u <(for slot in "$@"; do printf '%s.meta.json\n%s.zip\n' "$slot" "$slot"; done) \
+    diff -u <(for slot in "$@"; do
+        if [[ $slot == lesce_town ]]; then printf 'lesce_town.build.json\n'; fi
+        printf '%s.meta.json\n%s.zip\n' "$slot" "$slot"
+    done) \
         "$root/output dir/members"
     [[ $(cat world/user.zip) == 'user save' ]]
     [[ $(find world -type f | wc -l) == 1 ]]
 }
 
 build
-expect_trace fetch demo-cities osm-city citymap-build package
+expect_trace fetch demo-cities osm-city citymap-build citymap-verify package
 expect_members lesce_osm lesce_town showcase_city starter_town
 
 build
-expect_trace package
+expect_trace citymap-verify package
 
 meta="$CARGO_TARGET_DIR/windows-slots/current/slots/lesce_town.meta.json"
 cp -- "$meta" "$root/good-meta.json"
-printf '{"population":0}\n' > "$meta"
+printf '{"population":0,"revision":"commissioned"}\n' > "$meta"
 if build > "$root/cached-unpopulated.log" 2>&1; then
     printf 'Build reused an unpopulated Lesce Town slot\n' >&2
     exit 1
 fi
 rg 'lesce_town.*population' "$root/cached-unpopulated.log"
-[[ ! -s $TRACE ]]
+expect_trace citymap-verify
 cp -- "$root/good-meta.json" "$meta"
+
+town_zip="${meta%.meta.json}.zip"
+cp -- "$town_zip" "$root/good-town.zip"
+printf 'corrupted snapshot\n' > "$town_zip"
+if build > "$root/cached-corrupt.log" 2>&1; then
+    printf 'Build reused a corrupt Lesce Town snapshot\n' >&2
+    exit 1
+fi
+expect_trace citymap-verify
+printf '%s wrong-revision\n' "$(<VERSION)" > "$town_zip"
+if build > "$root/cached-revision.log" 2>&1; then
+    printf 'Build reused a snapshot from a different revision\n' >&2
+    exit 1
+fi
+expect_trace citymap-verify
+cp -- "$root/good-town.zip" "$town_zip"
+town_report="${meta%.meta.json}.build.json"
+cp -- "$town_report" "$root/good-report.json"
+printf '{"variant":"dry","revision":"commissioned","save_version":"%s"}\n' "$(<VERSION)" > "$town_report"
+if build > "$root/cached-report.log" 2>&1; then
+    printf 'Build accepted a dry report for the wet slot\n' >&2
+    exit 1
+fi
+expect_trace citymap-verify
+cp -- "$root/good-report.json" "$town_report"
 
 printf '1.0.1\n' > VERSION
 build
-expect_trace demo-cities osm-city citymap-build package
+expect_trace demo-cities osm-city citymap-build citymap-verify package
 
 printf 'edited generator\n' > scenarios/src/generator.rs
 build
-expect_trace demo-cities osm-city citymap-build package
+expect_trace demo-cities osm-city citymap-build citymap-verify package
 
 rm -- "$CARGO_TARGET_DIR/windows-slots/current/slots/starter_town.zip"
 build
-expect_trace demo-cities osm-city citymap-build package
+expect_trace demo-cities osm-city citymap-build citymap-verify package
 
 for result in fail omit; do
     printf '%s\n' "$result" >> "$EGR_OSM_CACHE/lesce-20261122-signals.overpass.json"
@@ -148,7 +201,14 @@ if TEST_CITYMAP_POPULATION=0 build > "$root/unpopulated.log" 2>&1; then
     exit 1
 fi
 rg 'lesce_town.*population' "$root/unpopulated.log"
-expect_trace demo-cities osm-city citymap-build
+expect_trace demo-cities osm-city citymap-build citymap-verify
+expect_members lesce_osm lesce_town showcase_city starter_town
+
+published="$root/published town"
+mkdir -- "$published"
+cp -- "${meta%.meta.json}".{meta.json,zip,build.json} "$published/"
+EGR_CITYMAP_PUBLISHED="$published" build
+expect_trace demo-cities osm-city citymap-verify package
 expect_members lesce_osm lesce_town showcase_city starter_town
 
 build EGR_OSM_INPUT="$root/lesce.json" BUILD_CITYMAP=

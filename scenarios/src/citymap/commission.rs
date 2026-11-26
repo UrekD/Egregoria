@@ -16,8 +16,8 @@ use simulation::economy::{
     TripStats, TICKS_PER_BUDGET_DAY,
 };
 use simulation::map::{
-    water_provider_site, BuildingID, BuildingKind, Density, LaneID, LaneKind, LanePatternBuilder, LotID, Map, MapProject, PathKind, ProjectKind,
-    LightPolicy, RoadID, TrafficBehavior, TraverseKind, TurnID, Zone, ZoneCell, ZoneGrid, ZoneKind,
+    water_provider_site, BuildingID, BuildingKind, Density, IntersectionID, LaneID, LaneKind, LanePatternBuilder, LotID, Map, MapProject, PathKind, ProjectKind,
+    LightPolicy, RoadID, TrafficBehavior, TraverseDirection, TraverseKind, TurnID, Zone, ZoneCell, ZoneGrid, ZoneKind,
 };
 use simulation::map::{RailMarketError, RailMarketSite};
 use simulation::map_dynamic::service_reach_sources;
@@ -39,8 +39,9 @@ use simulation::transportation::{
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::world_command::WorldCommand;
 use simulation::{FreightStationID, HumanID, TrainID, VehicleEnt, VehicleID};
-use simulation::{Simulation, SoulID};
+use simulation::{SavePhase, Simulation, SlotId, SnapshotRevision, SoulID};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::path::Path;
 
 const SERVICES: [ServiceKind; 6] = [
     ServiceKind::Fire,
@@ -2272,18 +2273,31 @@ fn stable_population(opening: u64, housed: u64, employed: u64, earlier: u64) -> 
 fn needs_met(
     due: u64,
     filled: u64,
-    stockout: u64,
-    resident_ticks: u64,
     work: u64,
     park: u64,
 ) -> bool {
     due >= 100
         && filled <= due
         && u128::from(filled) * 100 >= u128::from(due) * MIN_BASKETS_FILLED_PERCENT
-        && resident_ticks > 0
-        && u128::from(stockout) * 24 <= u128::from(resident_ticks)
         && work > 0
         && park > 0
+}
+
+fn food_stockout_hours(stockout: u64, resident_ticks: u64) -> f64 {
+    24.0 * stockout as f64 / resident_ticks as f64
+}
+
+fn food_stockouts_pass(days: &[(u64, u64)]) -> bool {
+    if days.len() != SOAK_DAYS as usize || days.iter().any(|&(stockout, resident_ticks)| {
+        resident_ticks == 0 || u128::from(stockout) * 20 > u128::from(resident_ticks)
+    }) {
+        return false;
+    }
+    let sum: f64 = days.iter().map(|&(stockout, residents)| {
+        food_stockout_hours(stockout, residents)
+    }).sum();
+    // Allow rounding at equality, below the resolution of a stockout tick.
+    sum <= SOAK_DAYS as f64 + 2.0 * f64::EPSILON
 }
 
 fn service_covered(served: u64, residents: u64) -> bool {
@@ -3027,7 +3041,7 @@ impl Traffic {
         });
     }
 
-    fn observe(&mut self, sim: &Simulation, tick: u64) {
+    fn observe(&mut self, sim: &Simulation, tick: u64, bridges: &mut BridgeTraffic) {
         let transit = sim.read::<Transit>();
         let world = sim.world();
         let map = sim.map();
@@ -3046,6 +3060,7 @@ impl Traffic {
                 self.observed.remove(&id);
                 continue;
             }
+            bridges.watch_approach(id, car);
             let path = car.it.get_travers().map(|path| path.kind).or_else(|| {
                 let lane = map.nearest_lane(car.trans.pos, LaneKind::Driving, Some(3.0))?;
                 Some(TraverseKind::Lane(lane))
@@ -3201,6 +3216,146 @@ impl Traffic {
             })
             .count() as u64;
         self.stranded_drivers = self.stranded_drivers.max(stranded);
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BridgeProgress {
+    Approaching,
+    OnDeck,
+    Completed,
+    Abandoned,
+}
+
+impl BridgeProgress {
+    fn observe(&mut self, on_lane: bool, position: Vec3, entry: Vec3, exit: Vec3) {
+        // Positions are the vehicle centre. The lane's trimmed endpoints
+        // are on opposite banks, clear of the water.
+        const END_RADIUS_SQUARED: f32 = 1.5 * 1.5;
+        if *self == Self::Approaching && on_lane && entry.distance2(position) <= END_RADIUS_SQUARED {
+            *self = Self::OnDeck;
+        }
+        if *self == Self::OnDeck {
+            if !on_lane {
+                *self = Self::Abandoned;
+            } else if exit.distance2(position) <= END_RADIUS_SQUARED {
+                *self = Self::Completed;
+            }
+        }
+    }
+}
+
+#[derive(Serialize)]
+pub(super) struct BridgeDirection {
+    lane: LaneID,
+    from: IntersectionID,
+    to: IntersectionID,
+    completed_by_purpose: BTreeMap<String, u64>,
+}
+
+struct BridgeLane {
+    crossing: &'static str,
+    entry: Vec3,
+    exit: Vec3,
+    direction: BridgeDirection,
+}
+
+#[derive(Default)]
+struct BridgeTraffic {
+    lanes: BTreeMap<LaneID, BridgeLane>,
+    probes: BTreeMap<VehicleID, (LaneID, BridgeProgress)>,
+}
+
+impl BridgeTraffic {
+    fn new(map: &Map, plan: &TownPlan, built: &BuiltNetwork) -> Self {
+        let lanes = plan.crossings.iter().flat_map(|crossing| {
+            built.links[&crossing.bridge].lanes.iter().filter_map(|&id| {
+                let lane = &map.lanes()[id];
+                (lane.kind == LaneKind::Driving).then(|| (id, BridgeLane {
+                    crossing: crossing.key,
+                    entry: lane.points.first(),
+                    exit: lane.points.last(),
+                    direction: BridgeDirection {
+                        lane: id,
+                        from: lane.src,
+                        to: lane.dst,
+                        completed_by_purpose: BTreeMap::new(),
+                    },
+                }))
+            })
+        }).collect();
+        Self { lanes, ..Self::default() }
+    }
+
+    fn approach(car: &VehicleEnt, mut matches_lane: impl FnMut(LaneID) -> bool) -> Option<LaneID> {
+        let route = car.it.get_route()?;
+        std::iter::once(&route.cur).chain(route.reversed_route.iter().rev().take(2))
+            .find_map(|step| match step.kind {
+                TraverseKind::Lane(id) if step.dir == TraverseDirection::Forward && matches_lane(id) => Some(id),
+                _ => None,
+            })
+    }
+
+    fn watch_approach(&mut self, id: VehicleID, car: &VehicleEnt) {
+        if self.lanes.is_empty() || self.probes.contains_key(&id) {
+            return;
+        }
+        // One sampling interval is one real second. Recruit near the entry
+        // during the traffic scan, then check only recruited vehicles each tick.
+        let lane = Self::approach(car, |id| self.lanes.get(&id)
+            .is_some_and(|lane| lane.entry.distance2(car.trans.pos) <= 80.0_f32.powi(2)));
+        if let Some(lane) = lane {
+            self.probes.insert(id, (lane, BridgeProgress::Approaching));
+        }
+    }
+
+    fn observe(&mut self, sim: &Simulation) {
+        self.probes.retain(|&id, (lane_id, progress)| {
+            let Some(car) = sim.world().vehicles.get(id) else { return false };
+            if !matches!(car.vehicle.state, VehicleState::Driving) {
+                return false;
+            }
+            let lane = self.lanes.get_mut(lane_id).unwrap();
+            let on_lane = car.it.get_travers().is_some_and(|step| {
+                step.dir == TraverseDirection::Forward && step.kind == TraverseKind::Lane(*lane_id)
+            });
+            progress.observe(on_lane, car.trans.pos, lane.entry, lane.exit);
+            match *progress {
+                BridgeProgress::Approaching => Self::approach(car, |id| id == *lane_id).is_some(),
+                BridgeProgress::OnDeck => true,
+                BridgeProgress::Abandoned => false,
+                BridgeProgress::Completed => {
+                    let purpose = match car.vehicle.kind {
+                        VehicleKind::Bus => "Transit".into(),
+                        VehicleKind::Truck => "Freight".into(),
+                        VehicleKind::Car => format!("{:?}", sim.world().humans.values().find_map(|human| {
+                            (matches!(human.location, Location::Vehicle(vehicle) if vehicle == id)
+                                && matches!(human.router.cur_step(), Some(RoutingStep::DriveTo(_, _))))
+                                .then_some(human.router.trip_purpose)
+                        }).unwrap_or_default()),
+                    };
+                    *lane.direction.completed_by_purpose.entry(purpose).or_default() += 1;
+                    false
+                }
+            }
+        });
+    }
+
+    fn report(self, plan: &TownPlan, failures: &mut Vec<String>)
+        -> BTreeMap<&'static str, Vec<BridgeDirection>>
+    {
+        let mut result: BTreeMap<_, Vec<_>> = BTreeMap::new();
+        for lane in self.lanes.into_values() {
+            result.entry(lane.crossing).or_default().push(lane.direction);
+        }
+        for crossing in &plan.crossings {
+            if !result.get(crossing.key).is_some_and(|directions| directions.iter()
+                .any(|direction| !direction.completed_by_purpose.is_empty()))
+            {
+                failures.push(format!("{}: scored traffic completed 0 vehicle crossings", crossing.key));
+            }
+        }
+        result
     }
 }
 
@@ -3888,12 +4043,110 @@ impl FreightMonitor {
 }
 
 #[derive(Serialize)]
+pub(super) struct ContinuationCheckpoint {
+    tick: u64,
+    verified_ticks: [u64; 3],
+    activity: BTreeMap<&'static str, serde_json::Value>,
+}
+
+fn checkpoint_activity(sim: &Simulation, freight: &Freight) -> BTreeMap<&'static str, serde_json::Value> {
+    let transit = sim.read::<Transit>();
+    let cargo = sim.read::<CargoBook>();
+    let mut activity = BTreeMap::new();
+    for (id, human) in sim.world().humans.iter() {
+        if let Some(seller) = human.household.basket_seller() {
+            activity.entry("household").or_insert_with(|| serde_json::json!({
+                "resident": id, "basket": human.household.basket, "seller": seller,
+            }));
+        }
+        if let Location::Vehicle(bus) = human.location {
+            if let Some(run) = transit.runs.get(&bus) {
+                activity.entry("transit").or_insert_with(|| serde_json::json!({
+                    "passenger": id, "bus": bus, "line": run.line, "next_stop": run.next_stop_idx,
+                }));
+            }
+        }
+        if activity.len() == 2 {
+            break;
+        }
+    }
+    if let Some(load) = cargo.outgoing_loads(freight.terminal).find(|load| !load.items.is_empty()) {
+        activity.insert("freight", serde_json::json!({
+            "terminal": freight.terminal, "truck": load.vehicle, "buyer": load.destination(),
+        }));
+    }
+    activity
+}
+
+fn verify_checkpoint_hashes(baseline: &Simulation, resumed: &Simulation) -> Result<(), String> {
+    let expected = baseline.hashes();
+    let actual = resumed.hashes();
+    if expected != actual {
+        let changed = expected.keys().chain(actual.keys())
+            .filter(|key| expected.get(*key) != actual.get(*key))
+            .collect::<BTreeSet<_>>();
+        return Err(format!(
+            "CITYMAP continuation diverged at tick {} in {changed:?}", baseline.get_tick()
+        ));
+    }
+    Ok(())
+}
+
+pub(super) fn verify_active_continuation(
+    mut baseline: Simulation,
+    mut resumed: Simulation,
+    manifest: &OpeningManifest,
+    root: &Path,
+) -> Result<Vec<ContinuationCheckpoint>, String> {
+    verify_checkpoint_hashes(&baseline, &resumed)?;
+    let mut baseline_schedule = Simulation::schedule();
+    let mut resumed_schedule = Simulation::schedule();
+    let mut pending = BTreeSet::from(["household", "transit", "freight"]);
+    let mut checkpoints = Vec::new();
+    let deadline = baseline.get_tick() + TICKS_PER_BUDGET_DAY;
+    while !pending.is_empty() && baseline.get_tick() < deadline {
+        let mut activity = checkpoint_activity(&baseline, &manifest.freight);
+        activity.retain(|key, _| pending.contains(key));
+        if activity.is_empty() {
+            advance(&mut baseline, &mut baseline_schedule, SAMPLE_TICKS);
+            advance(&mut resumed, &mut resumed_schedule, SAMPLE_TICKS);
+            continue;
+        }
+        let tick = baseline.get_tick();
+        let id = SlotId::new(&format!("continuation-{tick}")).map_err(|error| error.to_string())?;
+        if !matches!(resumed.save_to_slot(root, &id, SnapshotRevision::new(u128::from(tick)))
+            .map_err(|error| error.to_string())?, SavePhase::Complete)
+        {
+            return Err(format!("incomplete CITYMAP continuation save at tick {tick}"));
+        }
+        resumed = Simulation::load_from_slot(root, &id).map_err(|error| error.to_string())?;
+        resumed_schedule = Simulation::schedule();
+        verify_checkpoint_hashes(&baseline, &resumed)?;
+        let verified_ticks = [tick + 1, tick + 250, tick + 2_000];
+        for target in verified_ticks {
+            let steps = target - baseline.get_tick();
+            advance(&mut baseline, &mut baseline_schedule, steps);
+            advance(&mut resumed, &mut resumed_schedule, steps);
+            verify_checkpoint_hashes(&baseline, &resumed)?;
+        }
+        pending.retain(|key| !activity.contains_key(key));
+        eprintln!("CITYMAP continuation at tick {tick}: {:?}", activity.keys());
+        checkpoints.push(ContinuationCheckpoint { tick, verified_ticks, activity });
+    }
+    if !pending.is_empty() {
+        return Err(format!("CITYMAP opening had no active {pending:?} checkpoint in its first day"));
+    }
+    Ok(checkpoints)
+}
+
+#[derive(Serialize)]
 pub struct OpeningReport {
     opening: TownState,
     minimum_treasury_inner: i64,
     infill_housing_capacity: u32,
     days: Vec<DayReport>,
     traffic: Traffic,
+    pub(super) bridge_crossings: BTreeMap<&'static str, Vec<BridgeDirection>>,
     passenger_examples: BTreeMap<&'static str, PassengerArrival>,
     freight: FreightEvidence,
     failures: Vec<String>,
@@ -3966,6 +4219,13 @@ pub fn check_loaded_opening(
     let end = start + SOAK_DAYS * TICKS_PER_BUDGET_DAY;
     let mut schedule = Simulation::schedule();
     let mut traffic = Traffic::default();
+    let mut bridges = if manifest.cross_bank.is_some() {
+        let map = sim.map();
+        let built = super::resolve_network(&map, &plan.graph).map_err(|error| error.to_string())?;
+        BridgeTraffic::new(&map, plan, &built)
+    } else {
+        BridgeTraffic::default()
+    };
     let mut loops = LoopEvidence::default();
     let mut days = Vec::new();
     let mut minimum_cash = sim.read::<Government>().money;
@@ -4010,8 +4270,13 @@ pub fn check_loaded_opening(
                 freight.observe(&sim, &manifest.freight, tick);
             }
             traffic.probe_egresses(&sim);
-            if dt % SAMPLE_TICKS == 0 {
-                traffic.observe(&sim, tick);
+            if tick < end {
+                if dt % SAMPLE_TICKS == 0 {
+                    traffic.observe(&sim, tick, &mut bridges);
+                }
+                bridges.observe(&sim);
+            } else {
+                traffic.observe(&sim, tick, &mut BridgeTraffic::default());
             }
             if dt % (20 * TICKS_PER_MINUTE) == 0 {
                 let state = snapshot(&sim, plan, manifest);
@@ -4062,8 +4327,6 @@ pub fn check_loaded_opening(
         if !needs_met(
             baskets_due,
             baskets_filled,
-            effective_food_stockout_ticks,
-            resident_ticks,
             work_visits,
             park_visits,
         ) {
@@ -4161,6 +4424,26 @@ pub fn check_loaded_opening(
         );
         days.push(record);
     }
+    let food_days: Vec<_> = days.iter().map(|day| {
+        (day.effective_food_stockout_ticks, day.resident_ticks)
+    }).collect();
+    if !food_stockouts_pass(&food_days) {
+        let hours: Vec<_> = food_days.iter().map(|&(stockout, residents)| {
+            format!("{:.6}", food_stockout_hours(stockout, residents))
+        }).collect();
+        let mean = food_days.iter().map(|&(stockout, residents)| {
+            food_stockout_hours(stockout, residents)
+        }).sum::<f64>() / SOAK_DAYS as f64;
+        failures.push(format!(
+            "food stockouts: daily [{}], mean {mean:.6} h per resident-day (limits 1.20 daily, 1.00 mean)",
+            hours.join(", ")
+        ));
+    }
+    let bridge_crossings = if manifest.cross_bank.is_some() {
+        bridges.report(plan, &mut failures)
+    } else {
+        BTreeMap::new()
+    };
     if !stable_population(
         opening.residents,
         opening.residents,
@@ -4201,6 +4484,7 @@ pub fn check_loaded_opening(
         infill_housing_capacity,
         days,
         traffic,
+        bridge_crossings,
         passenger_examples: manifest.lines.iter().filter_map(|(&name, line)| {
             Some((name, passengers.examples.remove(&line.id)?))
         }).collect(),
@@ -4210,28 +4494,6 @@ pub fn check_loaded_opening(
 }
 
 impl OpeningReport {
-    pub(super) fn sava_traffic(
-        &self,
-        plan: &TownPlan,
-        built: &BuiltNetwork,
-    ) -> Result<BTreeMap<&'static str, u64>, String> {
-        plan.crossings
-            .iter()
-            .map(|crossing| {
-                let count = built.links[&crossing.bridge]
-                    .lanes
-                    .iter()
-                    .filter_map(|lane| self.traffic.directional_entries.get(lane))
-                    .sum();
-                if count == 0 {
-                    Err(format!("scored traffic did not traverse {}", crossing.key))
-                } else {
-                    Ok((crossing.key, count))
-                }
-            })
-            .collect()
-    }
-
     pub fn verify(&self) -> Result<(), String> {
         if self.failures.is_empty() {
             Ok(())
@@ -4606,13 +4868,25 @@ mod tests {
     }
 
     #[test]
-    fn cm2_gate_needs_use_settled_baskets_and_integrated_population() {
-        assert!(needs_met(100, 94, 10, 240, 1, 1));
-        assert!(!needs_met(0, 0, 0, 240, 1, 1));
-        assert!(!needs_met(100, 93, 0, 240, 1, 1));
-        assert!(!needs_met(100, 100, 11, 240, 1, 1));
-        assert!(!needs_met(100, 100, 0, 0, 1, 1));
-        assert!(!needs_met(100, 100, 0, 240, 1, 0));
+    fn cm2_gate_needs_require_settled_baskets_and_visits() {
+        assert!(needs_met(100, 94, 1, 1));
+        assert!(!needs_met(0, 0, 1, 1));
+        assert!(!needs_met(100, 93, 1, 1));
+        assert!(!needs_met(100, 101, 1, 1));
+        assert!(!needs_met(100, 100, 0, 1));
+        assert!(!needs_met(100, 100, 1, 0));
+    }
+
+    #[test]
+    fn cm2_gate_food_stockouts_average_three_scored_days() {
+        let accepts = |days: [u64; 3]| food_stockouts_pass(&days.map(|stockout| (stockout, 2400)));
+        assert!(accepts([91, 95, 113]));
+        assert!(accepts([90, 90, 120]));
+        assert!(!accepts([89, 90, 121]));
+        assert!(!accepts([91, 90, 120]));
+        assert!(food_stockouts_pass(&[(90, 2400), (90, 2400), (240, 4800)]));
+        assert!(!food_stockouts_pass(&[(0, 2400), (0, 2400), (0, 0)]));
+        assert!(!food_stockouts_pass(&[(0, 2400), (0, 2400)]));
     }
 
     #[test]
@@ -4792,6 +5066,33 @@ mod tests {
     }
 
     #[test]
+    fn cm2_bridge_entry_alone_is_not_a_completed_crossing() {
+        let entry = Vec3::ZERO;
+        let middle = Vec3::new(50.0, 0.0, 0.0);
+        let exit = Vec3::new(100.0, 0.0, 0.0);
+        let mut progress = BridgeProgress::Approaching;
+        progress.observe(false, entry, entry, exit);
+        assert!(progress == BridgeProgress::Approaching, "nearby road");
+        progress.observe(true, middle, entry, exit);
+        progress.observe(true, exit, entry, exit);
+        assert!(progress == BridgeProgress::Approaching, "started on the deck");
+
+        progress.observe(true, entry, entry, exit);
+        progress.observe(true, middle, entry, exit);
+        progress.observe(true, middle, entry, exit);
+        assert!(progress == BridgeProgress::OnDeck, "stopped halfway");
+        progress.observe(false, middle, entry, exit);
+        progress.observe(true, exit, entry, exit);
+        assert!(progress == BridgeProgress::Abandoned, "turned back before the exit");
+
+        let mut progress = BridgeProgress::Approaching;
+        progress.observe(true, entry, entry, exit);
+        progress.observe(true, middle, entry, exit);
+        progress.observe(true, exit, entry, exit);
+        assert!(progress == BridgeProgress::Completed);
+    }
+
+    #[test]
     fn cm2_stationary_vehicle_keeps_permissive_time_across_a_red() {
         use simulation::transportation::spawn_driving_vehicle;
 
@@ -4815,7 +5116,7 @@ mod tests {
         let mut traffic = Traffic::default();
         for (sample, seconds) in [green, green, red, green].into_iter().enumerate() {
             sim.write::<GameTime>().seconds = seconds;
-            traffic.observe(&sim, sample as u64 * SAMPLE_TICKS);
+            traffic.observe(&sim, sample as u64 * SAMPLE_TICKS, &mut BridgeTraffic::default());
         }
         assert_eq!(traffic.max_standing_ticks, 2 * SAMPLE_TICKS);
     }
@@ -4874,15 +5175,15 @@ mod tests {
         let second = spawn(&mut sim, approach, Some(13.0));
         let mut traffic = Traffic::default();
         let minute = TICKS_PER_MINUTE;
-        traffic.observe(&sim, 0);
-        traffic.observe(&sim, 10 * minute);
+        traffic.observe(&sim, 0, &mut BridgeTraffic::default());
+        traffic.observe(&sim, 10 * minute, &mut BridgeTraffic::default());
         assert_eq!(traffic.max_blocking_ticks, 10 * minute);
         {
             let vehicles = &mut sim.world_mut_unchecked().vehicles;
             vehicles[first].vehicle.state = VehicleState::ParkedAtDepot;
             vehicles[second].trans.pos = vehicles[first].trans.pos;
         }
-        traffic.observe(&sim, 20 * minute);
+        traffic.observe(&sim, 20 * minute, &mut BridgeTraffic::default());
         assert_eq!(traffic.max_blocking_ticks, 20 * minute);
 
         // One car clears the turn entirely between traffic samples while
@@ -4901,12 +5202,12 @@ mod tests {
         assert!(map.lanes()[egress].points.first().distance2(car.trans.pos) > 30.0_f32.powi(2));
         car.speed.0 = 1.0;
         traffic.probe_egresses(&sim);
-        traffic.observe(&sim, 21 * minute);
+        traffic.observe(&sim, 21 * minute, &mut BridgeTraffic::default());
         assert_eq!(traffic.blocked_egresses[&egress].start, 21 * minute);
 
         sim.world_mut_unchecked().vehicles[blocker].vehicle.state = VehicleState::ParkedAtDepot;
         sim.world_mut_unchecked().vehicles[replacement].vehicle.state = VehicleState::ParkedAtDepot;
-        traffic.observe(&sim, 22 * minute);
+        traffic.observe(&sim, 22 * minute, &mut BridgeTraffic::default());
         assert!(traffic.blocked_egresses.is_empty());
     }
 

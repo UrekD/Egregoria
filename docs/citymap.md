@@ -4,6 +4,10 @@ Open **Lesce Town · © OpenStreetMap contributors** from **Load**. The Free Bui
 
 Open **Land Tiles** to expand past the starting 6 × 6 tile rectangle. Select a dry tile that shares an edge with land you own to see its price and confirm the purchase. The A2 and mainline rail continue through protected corridors into the outer tiles.
 
-For a separate slot download, use the game version listed in the build report. Place `lesce_town.meta.json` and then `lesce_town.zip` in your `world/` directory or the save directory you select with `--save-dir`. Use a fresh save directory if you already have a Lesce Town slot.
+The Windows `make build` archive includes the commissioned town in `egregoria/world/`. For a separate download, open `egregoria-<version>-lesce-town.zip` with the game version named in the archive. Copy `lesce_town.meta.json` first and then `lesce_town.zip` into the game's `world/` directory or the save directory you select with `--save-dir`. Use a fresh save directory if you already have a Lesce Town slot.
 
 The build report records the source pins, snapshot revision and opening checks. The street and river layouts use data from OpenStreetMap. [© OpenStreetMap contributors](https://www.openstreetmap.org/copyright)
+
+## Release checks
+
+Run `cargo run --locked --release -p scenarios -- citymap-verify --root DIR` to load the wet slot and check its report, version, revision, tick and population. Run `EGR_CITYMAP_PUBLISHED=DIR make build` to bundle that publication in the Windows archive. Run `make citymap-shots EGR_CITYMAP_OUT=DIR` to capture the opening camera, Sava bridges and Land Tiles panel. The captures' `captures.json` records the opening tick, revision and PNG hashes.

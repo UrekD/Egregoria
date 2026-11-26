@@ -35,25 +35,13 @@ fi
 slots=$(realpath -- "$1")
 cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.."
 
-python3 - "$slots" <<'PY'
-import json
-import sys
-from pathlib import Path
-
-slots = Path(sys.argv[1])
-report = json.loads((slots / "lesce_town.build.json").read_text())
-meta = json.loads((slots / "lesce_town.meta.json").read_text())
-if (report["variant"] != "wet" or report["save_version"] != Path("VERSION").read_text().strip()
-        or int(report["snapshot_revision"], 16) != meta["revision"] or meta["population"] <= 0):
-    sys.exit("Captures require the commissioned wet Lesce Town slot for this VERSION")
-PY
-
 export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-target}
 export TMPDIR=${TMPDIR:-/var/tmp/egr}
 sysroot=${SYSROOT_LIB:-$HOME/.local/egr-sysroot/usr/lib/x86_64-linux-gnu}
 export PKG_CONFIG_PATH=${PKG_CONFIG_PATH:-$sysroot/pkgconfig}
 export LIBRARY_PATH=${LIBRARY_PATH:-$sysroot}
 mkdir -p -- "$TMPDIR"
+cargo run --locked --release -p scenarios -- citymap-verify --root "$slots"
 root=$(mktemp -d "$TMPDIR/citymap-shots.XXXXXX")
 native=${EGR_CITYMAP_NATIVE:-$CARGO_TARGET_DIR/release/native_app}
 if [[ ! -v EGR_CITYMAP_NATIVE ]]; then
@@ -62,17 +50,29 @@ fi
 timeout 900 xvfb-run -a -s '-screen 0 1600x900x24' env \
     WGPU_BACKEND=vulkan VK_ICD_FILENAMES="${VK_ICD_FILENAMES:-/usr/share/vulkan/icd.d/lvp_icd.json}" \
     bash scripts/shots/citymap.sh --native "$native" "$root/shots" "$slots"
-python3 - "$root/shots" <<'PY'
+python3 - "$root/shots" "$slots/lesce_town.build.json" <<'PY'
+import hashlib
 import json
 import sys
 from pathlib import Path
 
 output = Path(sys.argv[1])
+report = json.loads(Path(sys.argv[2]).read_text())
+captures = {}
 for step in json.loads(Path("scripts/shots/citymap.json").read_text()):
     if isinstance(step, dict) and "Screenshot" in step:
         path = output / (step["Screenshot"] + ".png")
-        with path.open("rb") as capture:
-            if capture.read(8) != b"\x89PNG\r\n\x1a\n" or path.stat().st_size < 64:
-                sys.exit(f"Invalid capture {path}")
+        data = path.read_bytes()
+        if not data.startswith(b"\x89PNG\r\n\x1a\n") or len(data) < 64:
+            sys.exit(f"Invalid capture {path}")
+        captures[path.name] = hashlib.sha256(data).hexdigest()
+manifest = {
+    "slot": report["slot"],
+    "save_version": report["save_version"],
+    "snapshot_revision": report["snapshot_revision"],
+    "opening_tick": report["opening_manifest"]["opening_tick"],
+    "capture_sha256": captures,
+}
+(output / "captures.json").write_text(json.dumps(manifest, indent=2) + "\n")
 PY
 printf 'Lesce Town captures in %s/shots\n' "$root"

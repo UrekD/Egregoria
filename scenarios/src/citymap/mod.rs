@@ -90,6 +90,64 @@ pub fn build_cli(args: impl Iterator<Item = OsString>) -> Result<(), String> {
     Ok(())
 }
 
+/// Verifies the commissioned wet bundle using the same catalogue and loader as the game.
+pub fn verify_delivery(root: &Path) -> Result<(), String> {
+    let root = std::path::absolute(root).map_err(|error| error.to_string())?;
+    crate::ensure_repo_root_cwd();
+    simulation::init::init();
+    let id = SlotId::new("lesce_town").map_err(|error| error.to_string())?;
+    let report_path = root.join(BUILD_REPORT);
+    if !fs::symlink_metadata(&report_path)
+        .map_err(|error| format!("{}: {error}", report_path.display()))?
+        .is_file()
+    {
+        return Err(format!("{} is not a regular file", report_path.display()));
+    }
+    let report: serde_json::Value = serde_json::from_reader(
+        File::open(&report_path).map_err(|error| error.to_string())?,
+    )
+    .map_err(|error| format!("{}: {error}", report_path.display()))?;
+    if report["slot"] != id.as_str()
+        || report["variant"] != "wet"
+        || report["save_version"] != SAVE_VERSION.trim()
+        || report["provenance"]["lesce"]["sha256"] != LESCE_SHA256
+        || report["provenance"]["sava"]["sha256"] != SAVA_SHA256
+        || !report["opening"]["failures"].as_array().is_some_and(Vec::is_empty)
+    {
+        return Err("lesce_town has no passing wet build report for the pinned inputs and current VERSION".into());
+    }
+
+    let entries = simulation::list_slots_with_revisions(&root, |path, kind| {
+        Simulation::read_slot_snapshot_header(path, kind).ok()?.revision
+    }).map_err(|error| error.to_string())?;
+    let entry = entries.iter().find(|entry| entry.id == id)
+        .ok_or("lesce_town is absent from the slot catalogue")?;
+    let revision = entry.revision.ok_or("lesce_town is missing a readable snapshot revision")?;
+    let meta = entry.meta.as_ref().filter(|meta| meta.population > 0)
+        .ok_or("lesce_town requires metadata with a positive commissioned population")?;
+    let population = meta.population;
+    if report["snapshot_revision"] != format!("{:032x}", revision.get())
+        || meta.revision != Some(revision.get())
+        || report["opening"]["opening"]["residents"] != population
+    {
+        return Err("lesce_town build report, metadata and snapshot disagree on revision or population".into());
+    }
+    let loaded = Simulation::load_listed_snapshot(&root, entry)
+        .map_err(|error| format!("lesce_town load failed: {error}"))?;
+    if population != loaded.world().humans.len() as u64
+        || loaded.population_scale() != Default::default()
+        || meta.game_tick != loaded.get_tick()
+        || report["opening_manifest"]["opening_tick"] != loaded.get_tick()
+    {
+        return Err("lesce_town loaded population or tick disagrees with the wet build report".into());
+    }
+    println!(
+        "Loaded lesce_town {} revision {:032x}, tick {}, population {population}",
+        SAVE_VERSION.trim(), revision.get(), loaded.get_tick()
+    );
+    Ok(())
+}
+
 fn preview_world(config: TownConfig) -> Result<Simulation, String> {
     crate::ensure_repo_root_cwd();
     simulation::init::init();
@@ -543,6 +601,13 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
         report["wet_acceptance"] = verify_wet_town(&loaded, &plan, &built)?;
     }
     if let Some(opening) = opening {
+        let load_opening = || Simulation::load_listed_snapshot(&stage.path, entry)
+            .map_err(|error| error.to_string());
+        let checkpoint_stage = DeliveryStage::new(parent).map_err(path_error)?;
+        report["continuation"] = serde_json::to_value(commission::verify_active_continuation(
+            load_opening()?, load_opening()?, &opening, &checkpoint_stage.path,
+        )?).map_err(|error| error.to_string())?;
+        drop(checkpoint_stage);
         if delivery == Delivery::WetOpening {
             let fixture = Simulation::load_listed_snapshot(&stage.path, entry)
                 .map_err(|error| error.to_string())?;
@@ -552,8 +617,8 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
         let measured = check_loaded_opening(loaded, &plan, &opening)?;
         measured.verify()?;
         if delivery == Delivery::WetOpening {
-            report["wet_acceptance"]["scored_bridge_lane_entries"] =
-                serde_json::json!(measured.sava_traffic(&plan, &built)?);
+            report["wet_acceptance"]["scored_bridge_crossings"] =
+                serde_json::json!(measured.bridge_crossings);
         }
         report["scope"] = serde_json::json!(if delivery == Delivery::WetOpening {
             "Commissioned Sava river town with a buyable land band and split High downtown zoning."
@@ -1777,7 +1842,8 @@ mod tests {
 
     #[test]
     fn citymap_wet_opening_has_live_water_crossings_and_buyable_land() {
-        use simulation::map::{quote_tile, TileStatus};
+        use simulation::map::{quote_tile, PathKind, TileStatus};
+        use simulation::map_dynamic::Itinerary;
 
         let inputs = pinned_inputs();
         let mut plan = plan_town(&inputs, TownConfig::wet(), SpacingLimits::default()).unwrap();
@@ -1791,6 +1857,19 @@ mod tests {
             .values()
             .all(|pass| *pass));
         for crossing in &plan.crossings {
+            let [a, b] = crossing.approaches_keys.map(|key| {
+                map.intersections()[built.junctions[&key]].pos
+            });
+            for (from, to) in [(a, b), (b, a)] {
+                for mode in [PathKind::Vehicle, PathKind::Pedestrian] {
+                    assert!(
+                        Itinerary::route(prototypes::Tick(loaded.get_tick()), from, to, &map, mode)
+                            .is_some(),
+                        "{} {mode:?} from {from:?}",
+                        crossing.key
+                    );
+                }
+            }
             let mut closed = (*map).clone();
             assert!(closed
                 .remove_road(built.links[&crossing.bridge].road)

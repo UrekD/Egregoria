@@ -28,7 +28,7 @@ fn usage() -> String {
         .chain([PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios scaled-showcase --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH] [--dry]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K] [--persons-per-agent N]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios scaled-showcase --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH] [--dry]\n       scenarios citymap-verify --root DIR\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K] [--persons-per-agent N]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
 }
 
 fn main() -> ExitCode {
@@ -189,6 +189,16 @@ fn run() -> Result<(), String> {
     }
     if name == "citymap-build" {
         return scenarios::citymap::build_cli(args);
+    }
+    if name == "citymap-verify" {
+        if args.next().as_deref() != Some(std::ffi::OsStr::new("--root")) {
+            return Err("usage: scenarios citymap-verify --root DIR".into());
+        }
+        let root = path_arg(&mut args, "--root", "a directory")?;
+        if args.next().is_some() {
+            return Err("usage: scenarios citymap-verify --root DIR".into());
+        }
+        return scenarios::citymap::verify_delivery(&root);
     }
     if name == "osm-city" {
         let mut input = None;
