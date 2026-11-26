@@ -272,6 +272,17 @@ fn road_target(sim: &Simulation, id: crate::map::RoadID) -> DirectedEndpoint {
 #[test]
 fn pathpark_remote_edit_preserves_committed_egress_across_reload() {
     let (mut ctx, roads, portal) = road_chain(4);
+    let unrelated = ctx
+        .g
+        .map_mut()
+        .make_connection(
+            crate::map::MapProject::ground(vec3(210., 260., 0.)),
+            crate::map::MapProject::ground(vec3(380., 260., 0.)),
+            None,
+            &crate::map::LanePatternBuilder::default().build(),
+        )
+        .unwrap()
+        .1;
     let car = store_car(&mut ctx, portal);
     let target = road_target(&ctx.g, roads[3]);
     portal.depart(&mut ctx.g, car, target).unwrap();
@@ -286,12 +297,18 @@ fn pathpark_remote_edit_preserves_committed_egress_across_reload() {
         Some(DrivewayPhase::Exiting)
     );
     let cmd = WorldCommand::MapRemoveRoad(roads[3]);
+    let before = ctx.g.hashes();
     ctx.g.apply_commands([&cmd]);
+    assert_eq!(before, ctx.g.hashes());
+    ctx.g
+        .apply_commands([&WorldCommand::MapRemoveRoad(unrelated)]);
+    assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
     let mut loaded: Simulation = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
     assert_eq!(loaded.hashes(), ctx.g.hashes());
     assert!(loaded.map().get(roads[3]).is_some());
+    let mut schedule = Simulation::schedule();
     for _ in 0..160 {
-        loaded.tick(&mut Simulation::schedule(), &[]);
+        loaded.tick(&mut schedule, &[]);
         if loaded.read::<DrivewayTraffic>().phase(portal).is_none() {
             break;
         }
@@ -411,4 +428,40 @@ fn pathpark_empty_portal_only_blocks_water_changes_at_its_footprint() {
         Err(crate::map::WaterEditError::TopologyConflict { .. })
     ));
     assert_eq!(ctx.g.hashes(), before);
+}
+
+#[test]
+fn pathpark_snapshot_rejects_vehicle_stage_without_matching_claim() {
+    let (mut ctx, _, portal) = road_chain(1);
+    store_car(&mut ctx, portal);
+    let mut res = ctx.g.snapshot_resources(true, usize::MAX).unwrap();
+    res.insert(
+        "driveway_traffic".into(),
+        Bincode::encode(&(DrivewayTraffic::default(), None::<(u64, u64)>)).unwrap(),
+    );
+    let bytes = Bincode::encode(&crate::SimulationSer {
+        header: crate::SaveHeader::current(),
+        world: &ctx.g.world,
+        res,
+    })
+    .unwrap();
+    assert!(Bincode::decode::<Simulation>(&bytes).is_err());
+}
+
+#[test]
+fn pathpark_stock_snapshot_imports_without_driveway_resource() {
+    let ctx = TestCtx::new();
+    let mut res = ctx.g.snapshot_resources(true, usize::MAX).unwrap();
+    res.remove("driveway_traffic").unwrap();
+    let bytes = Bincode::encode(&crate::SimulationSer {
+        header: crate::SaveHeader {
+            version: crate::VERSION.to_owned(),
+        },
+        world: &ctx.g.world,
+        res,
+    })
+    .unwrap();
+    let imported: Simulation = Bincode::decode(&bytes).unwrap();
+    assert!(imported.read::<DrivewayTraffic>().is_empty());
+    assert_eq!(ctx.g.hashes(), imported.hashes());
 }

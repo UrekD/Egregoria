@@ -410,3 +410,54 @@ fn special_building_cannot_attach_to_a_walking_path() {
     assert!(ctx.g.read::<CommandOutcomes>().accepted.is_empty());
     assert_eq!(ctx.g.hashes(), before);
 }
+
+#[test]
+fn saved_building_cannot_smuggle_a_path_attachment() {
+    use crate::map::{BuildingKind, MapProject, SmallRoadPreset};
+    use geom::{vec2, Vec2, OBB};
+    use prototypes::GoodsCompanyID;
+
+    let mut ctx = TestCtx::new();
+    let path = WorldCommand::MapMakeWalkingPath {
+        from: ctx.g.map().pick_path_ground(4_000, 20_000).unwrap(),
+        to: ctx.g.map().pick_path_ground(22_000, 20_000).unwrap(),
+        control: None,
+    };
+    ctx.g.apply_commands([&path]);
+    let path = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .walking_path(0)
+        .unwrap()
+        .unwrap();
+    let school = GoodsCompanyID::new("school").prototype();
+    let mut map = ctx.g.map_mut();
+    let road = map
+        .make_connection(
+            MapProject::ground(vec3(40., 320., 0.)),
+            MapProject::ground(vec3(220., 320., 0.)),
+            None,
+            &SmallRoadPreset::LocalOneWay {
+                curb_parking: false,
+            }
+            .lane_pattern(),
+        )
+        .unwrap()
+        .1;
+    let school = map
+        .build_special_building(
+            &OBB::new(vec2(140., 340.), Vec2::Y, 20., 20.),
+            BuildingKind::GoodsCompany(school.id),
+            school.bgen,
+            None,
+            Some(road),
+        )
+        .unwrap();
+    map.roads[road]
+        .connected_buildings
+        .retain(|&id| id != school);
+    map.roads[path].connected_buildings.push(school);
+    map.buildings[school].connected_road = Some(path);
+    drop(map);
+    assert!(Bincode::decode::<Simulation>(&Bincode::encode(&ctx.g).unwrap()).is_err());
+}
