@@ -416,6 +416,12 @@ impl SpatialMap {
         self.query(Circle { center, radius }, filter)
     }
 
+    /// Find buildings whose zone or physical footprint bounds intersect the query.
+    pub fn building_candidates(&self, bounds: AABB) -> impl Iterator<Item = BuildingID> + '_ {
+        self.construction_candidates(bounds, ProjectFilter::BUILDING)
+            .filter_map(|project| project.as_building())
+    }
+
     pub fn query<'a>(
         &'a self,
         shape: impl Intersect<ShapeEnum> + Intersect<AABB> + Clone + 'a,

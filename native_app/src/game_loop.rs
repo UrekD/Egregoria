@@ -16,7 +16,7 @@ use simulation::Simulation;
 use crate::audio::GameAudio;
 use crate::automation::Automation;
 use crate::debug_gui::debug_window::DebugObjs;
-use crate::debug_gui::render_oldgui;
+use crate::debug_gui::{render_oldgui, VehicleHover};
 use crate::gui;
 use crate::gui::follow::FollowEntity;
 use crate::gui::keybinds::KeybindState;
@@ -709,7 +709,24 @@ impl State {
         );
 
         let instances_start = ctx.gfx.profile_timer();
-        self.instanced_renderer.render(&sim, ctx);
+        {
+            let input = self.uiw.read::<InputMap>();
+            let mut hover = self.uiw.write::<VehicleHover>();
+            if matches!(tool, Tool::Hand | Tool::RoadEditor)
+                && session::world_interaction(&self.uiw)
+                && !self.uiw.read::<GuiState>().hidden
+                && self.uiw.can_author()
+                && !goryak::pointer_over_ui(input.screen.x, input.screen.y)
+            {
+                let mut picker = self.uiw.write::<gui::selectable::VehiclePicker>();
+                hover.update(&mut picker, sim, &input, Instant::now(), |picker| {
+                    self.instanced_renderer.render(sim, ctx, picker);
+                });
+            } else {
+                *hover = VehicleHover::default();
+                self.instanced_renderer.render(sim, ctx, None);
+            }
+        }
         ctx.gfx.profile_elapsed(CpuPhase::Instances, instances_start);
         if !self.uiw.read::<SessionState>().interaction_blocked {
             gui::overlays::draw(&sim, &self.uiw);

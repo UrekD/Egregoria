@@ -11,15 +11,16 @@ use geom::{
 };
 use prototypes::{
     try_prototype, FreightStationPrototype, GoodsCompanyPrototype, GrowableCompanyID,
-    GrowableCompanyPrototype, RenderAsset, RollingStockID, ServiceID,
+    GrowableCompanyPrototype, RenderAsset, RollingStockID, RollingStockPrototype, ServiceID,
 };
 use simulation::map::{
     Building, BuildingID, BuildingKind, Map, ProjectFilter, ProjectKind, Road, RoadID,
 };
 use simulation::transportation::VehicleKind;
-use simulation::{AnyEntity, Simulation};
+use simulation::{AnyEntity, Simulation, VehicleEnt, VehicleID, WagonEnt, WagonID};
 use std::collections::BTreeSet;
 use std::ops::RangeInclusive;
+use std::path::Path;
 
 pub fn select_radius(id: AnyEntity) -> f32 {
     match id {
@@ -141,7 +142,7 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
 
 #[cfg(test)]
 thread_local! {
-    static VEHICLE_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static VEHICLE_SCAN_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone, Copy)]
@@ -154,8 +155,10 @@ pub(crate) struct VehiclePicker {
     snapshot: Option<(u64, usize, usize)>,
     grid: Grid<AnyEntity, Vec2>,
     radius: f32,
-    building_meshes: FastMap<BuildingKind, PickBuildingMesh>,
+    building_meshes: FastMap<BuildingKind, PickMesh>,
+    prefab_radius: f32,
     road_bounds: [Option<AABB3>; 3],
+    rail_bounds: FastMap<RollingStockID, AABB3>,
 }
 
 impl Default for VehiclePicker {
@@ -165,7 +168,9 @@ impl Default for VehiclePicker {
             grid: Grid::new(64),
             radius: 0.0,
             building_meshes: FastMap::default(),
+            prefab_radius: 0.0,
             road_bounds: [None; 3],
+            rail_bounds: FastMap::default(),
         }
     }
 }
@@ -179,7 +184,7 @@ impl VehiclePicker {
     }
 
     pub(crate) fn load_models(&mut self, gfx: &mut GfxContext) {
-        fn bounds(gfx: &mut GfxContext, path: &std::path::Path) -> Option<AABB3> {
+        fn bounds(gfx: &mut GfxContext, path: &Path) -> Option<AABB3> {
             let mesh = gfx.mesh(path).ok()?;
             mesh.lods.first().map(|lod| lod.aabb3)
         }
@@ -191,6 +196,18 @@ impl VehiclePicker {
             truck,
             truck.map(|b| AABB3::new(b.ll * 1.5, b.ur * 1.5)),
         ];
+        self.load_pick_meshes(Path::new("assets"));
+    }
+
+    fn load_pick_meshes(&mut self, assets: &Path) {
+        self.rail_bounds = RollingStockPrototype::iter()
+            .filter_map(|stock| {
+                let RenderAsset::Mesh { path } = &stock.asset else {
+                    return None;
+                };
+                Some((stock.id, PickMesh::load(assets, path)?.bounds))
+            })
+            .collect();
 
         let kinds = GoodsCompanyPrototype::iter()
             .filter(|proto| legacy_growable(BuildingKind::GoodsCompany(proto.id)).is_none())
@@ -199,17 +216,23 @@ impl VehiclePicker {
                 FreightStationPrototype::iter()
                     .map(|proto| (BuildingKind::RailFreightStation(proto.id), &proto.asset)),
             );
-        for (kind, asset) in kinds {
-            if let RenderAsset::Mesh { path } = asset {
-                if let Some(mesh) = PickBuildingMesh::load(gfx, path) {
-                    self.building_meshes.insert(kind, mesh);
-                }
-            }
-        }
-        if let Some(mesh) = PickBuildingMesh::load(gfx, "external_trading.glb".as_ref()) {
+        self.building_meshes = kinds
+            .filter_map(|(kind, asset)| {
+                let RenderAsset::Mesh { path } = asset else {
+                    return None;
+                };
+                Some((kind, PickMesh::load(assets, path)?))
+            })
+            .collect();
+        if let Some(mesh) = PickMesh::load(assets, Path::new("external_trading.glb")) {
             self.building_meshes
                 .insert(BuildingKind::ExternalTrading, mesh);
         }
+        self.prefab_radius = self
+            .building_meshes
+            .values()
+            .map(|mesh| mesh.bounds.ll.abs().max(mesh.bounds.ur.abs()).xy().mag())
+            .fold(0.0, f32::max);
     }
 
     fn road_bounds(&self, kind: VehicleKind) -> AABB3 {
@@ -222,57 +245,73 @@ impl VehiclePicker {
             .unwrap_or_else(|| AABB3::new(vec3(-length, -width, 0.0), vec3(length, width, height)))
     }
 
-    fn rail_bounds(id: RollingStockID) -> Option<AABB3> {
-        let stock = try_prototype(id)?;
-        if !matches!(stock.asset, RenderAsset::Mesh { .. }) {
-            return None;
-        }
-        // Stock longitudinal dimensions match the rendered consist. Using the
-        // mesh LOD's AABB directly would ignore its glTF node transforms.
-        let half = stock.length * 0.5;
-        Some(AABB3::new(vec3(-half, -2.0, 0.0), vec3(half, 2.0, 5.0)))
+    fn snapshot_key(sim: &Simulation) -> (u64, usize, usize) {
+        let world = sim.world();
+        (sim.get_tick(), world.vehicles.len(), world.wagons.len())
     }
 
-    fn index_snapshot(&mut self, sim: &Simulation) {
-        let world = sim.world();
-        let snapshot = (sim.get_tick(), world.vehicles.len(), world.wagons.len());
+    pub(crate) fn start_snapshot(&mut self, sim: &Simulation) -> bool {
+        let snapshot = Self::snapshot_key(sim);
         if self.snapshot == Some(snapshot) {
-            return;
+            return false;
         }
-        #[cfg(test)]
-        VEHICLE_SCAN_COUNT.with(|count| count.set(count.get() + 1));
         self.snapshot = Some(snapshot);
         drop(self.grid.clear());
         self.radius = 0.0;
-        for (id, vehicle) in &world.vehicles {
-            let bounds = self.road_bounds(vehicle.vehicle.kind);
-            self.radius = self.radius.max(pick_radius(bounds, vehicle.trans));
-            self.grid.insert(vehicle.trans.pos.xy(), id.into());
-        }
-        for (id, wagon) in &world.wagons {
-            let Some(bounds) = Self::rail_bounds(wagon.wagon.rolling_stock) else {
-                continue;
-            };
-            self.radius = self.radius.max(pick_radius(bounds, wagon.trans));
-            self.grid.insert(wagon.trans.pos.xy(), id.into());
-        }
+        true
+    }
+
+    pub(crate) fn index_road(&mut self, id: VehicleID, vehicle: &VehicleEnt) {
+        let bounds = self.road_bounds(vehicle.vehicle.kind);
+        self.radius = self.radius.max(pick_radius(bounds, vehicle.trans));
+        self.grid.insert(vehicle.trans.pos.xy(), id.into());
+    }
+
+    pub(crate) fn index_wagon(&mut self, id: WagonID, wagon: &WagonEnt) {
+        let Some(&bounds) = self.rail_bounds.get(&wagon.wagon.rolling_stock) else {
+            return;
+        };
+        self.radius = self.radius.max(pick_radius(bounds, wagon.trans));
+        self.grid.insert(wagon.trans.pos.xy(), id.into());
     }
 
     pub(crate) fn pick(&mut self, sim: &Simulation, input: &InputMap) -> Option<VehicleHit> {
         let map = sim.map();
-        let (ray, start, end) = vehicle_ray(&map, input)?;
-        self.index_snapshot(sim);
+        let ray = PickRay::from_input(&map, input)?;
+        // Hand clicks are handled before rendering and may need the current snapshot.
+        if self.start_snapshot(sim) {
+            #[cfg(test)]
+            VEHICLE_SCAN_COUNT.with(|count| count.set(count.get() + 1));
+            let world = sim.world();
+            for (id, vehicle) in &world.vehicles {
+                self.index_road(id, vehicle);
+            }
+            for (id, wagon) in &world.wagons {
+                self.index_wagon(id, wagon);
+            }
+        }
+        self.pick_indexed(sim, &map, ray)
+    }
+
+    pub(crate) fn pick_indexed(
+        &self,
+        sim: &Simulation,
+        map: &Map,
+        PickRay { ray, start, end }: PickRay,
+    ) -> Option<VehicleHit> {
+        if self.snapshot != Some(Self::snapshot_key(sim)) {
+            return None;
+        }
         let segment = ray_segment(ray, start, end);
         let mut visited = FastSet::default();
-        let (hit, depth) = pick_query_bounds(segment)
-            .map(|query| query.expand(self.radius))
+        let (hit, depth) = pick_query_bounds(segment, self.radius)
             .flat_map(|query| self.grid.query_aabb(query.ll, query.ur))
             .filter(|(handle, _)| visited.insert(*handle))
             .filter_map(|(handle, _)| self.grid.get(handle))
             .filter_map(|(_, &part)| self.part_depth(sim, ray, part))
             .filter(|(_, depth)| *depth <= end)
             .min_by(|a, b| a.1.total_cmp(&b.1))?;
-        self.building_before(&map, ray, start, depth)
+        self.building_before(map, ray, start, depth)
             .is_none()
             .then_some(hit)
     }
@@ -280,18 +319,15 @@ impl VehiclePicker {
     pub(crate) fn still_visible(
         &self,
         sim: &Simulation,
-        input: &InputMap,
+        map: &Map,
+        PickRay { ray, start, end }: PickRay,
         hit: VehicleHit,
     ) -> bool {
-        let map = sim.map();
-        let Some((ray, start, end)) = vehicle_ray(&map, input) else {
-            return false;
-        };
         self.part_depth(sim, ray, hit.part)
             .is_some_and(|(found, depth)| {
                 found.entity == hit.entity
                     && depth <= end
-                    && self.building_before(&map, ray, start, depth).is_none()
+                    && self.building_before(map, ray, start, depth).is_none()
             })
     }
 
@@ -311,7 +347,7 @@ impl VehiclePicker {
                 let wagon = sim.get(id)?;
                 let leader = wagon.itfollower.leader;
                 sim.get(leader)?;
-                let bounds = Self::rail_bounds(wagon.wagon.rolling_stock)?;
+                let bounds = *self.rail_bounds.get(&wagon.wagon.rolling_stock)?;
                 (leader.into(), instance_depth(ray, wagon.trans, bounds)?)
             }
             _ => return None,
@@ -330,18 +366,22 @@ impl VehiclePicker {
             return None;
         }
         let segment = ray_segment(ray, start, end);
-        let candidates: BTreeSet<_> = pick_query_bounds(segment)
-            .flat_map(|bounds| map.spatial_map().query(bounds, ProjectFilter::BUILDING))
-            .filter_map(|project| project.as_building())
+        // A prefab can reach beyond the footprint indexed by the map. Expand
+        // by the largest model radius, then test each prefab in model space.
+        let candidates: BTreeSet<_> = pick_query_bounds(segment, self.prefab_radius)
+            .flat_map(|bounds| map.spatial_map().building_candidates(bounds))
             .collect();
         candidates
             .into_iter()
             .filter_map(|id| {
                 let building = map.get(id)?;
-                if !building.obb.intersects(&segment) {
+                let model = self
+                    .building_meshes
+                    .get(&building.kind)
+                    .filter(|_| building.development().is_none());
+                if model.is_none() && !building.obb.intersects(&segment) {
                     return None;
                 }
-                let model = self.building_meshes.get(&building.kind);
                 building_depth(building, ray, start..=end, model).map(|depth| (depth, id))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)))
@@ -354,14 +394,23 @@ fn normalize_pick_ray(ray: Ray3) -> Option<Ray3> {
         .then(|| Ray3::new(ray.from, ray.dir / length))
 }
 
-fn vehicle_ray(map: &Map, input: &InputMap) -> Option<(Ray3, f32, f32)> {
-    let ray = normalize_pick_ray(input.ray?)?;
-    let (start, end) = visible_pick_depth(
-        map.environment().bounds(),
-        ray,
-        input.surface_hits(map.environment()),
-    )?;
-    Some((ray, start, end))
+#[derive(Clone, Copy)]
+pub(crate) struct PickRay {
+    ray: Ray3,
+    start: f32,
+    end: f32,
+}
+
+impl PickRay {
+    pub(crate) fn from_input(map: &Map, input: &InputMap) -> Option<Self> {
+        let ray = normalize_pick_ray(input.ray?)?;
+        let (start, end) = visible_pick_depth(
+            map.environment().bounds(),
+            ray,
+            input.surface_hits(map.environment()),
+        )?;
+        Some(Self { ray, start, end })
+    }
 }
 
 fn ray_segment(ray: Ray3, start: f32, end: f32) -> Segment {
@@ -419,18 +468,18 @@ fn legacy_growable(kind: BuildingKind) -> Option<&'static GrowableCompanyPrototy
     try_prototype(GrowableCompanyID::from(id)).filter(|proto| proto.growable)
 }
 
-struct PickBuildingMesh {
+struct PickMesh {
     bounds: AABB3,
     triangles: Vec<[Vec3; 3]>,
 }
 
-impl PickBuildingMesh {
-    fn load(gfx: &mut GfxContext, path: &std::path::Path) -> Option<Self> {
-        use engine::meshload::{find_nodes, load_mesh_with_properties};
-        let (_, model) = load_mesh_with_properties(gfx, path, false).ok()?;
-        let document = &model.gltf_doc;
+impl PickMesh {
+    fn load(assets: &Path, path: &Path) -> Option<Self> {
+        use engine::meshload::{find_nodes, load_mesh_geometry};
+        let (document, buffers) = load_mesh_geometry(assets, path).ok()?;
         let scene = document.default_scene()?;
-        let mut triangles = Vec::with_capacity(model.n_triangles);
+        let mut triangles = Vec::new();
+        // Both vehicle and prefab instances draw the first mesh LOD.
         for (node, lod, _, transform, _) in
             find_nodes(&scene, |id| document.nodes().nth(id).unwrap())
         {
@@ -438,26 +487,31 @@ impl PickBuildingMesh {
                 continue;
             };
             for primitive in mesh.primitives() {
-                let reader =
-                    primitive.reader(|b| Some(&model.gltf_data.get(b.index())?.0[..b.length()]));
-                let (Some(positions), Some(indices)) =
-                    (reader.read_positions(), reader.read_indices())
-                else {
+                primitive.material().index()?;
+                let reader = primitive.reader(|b| Some(&buffers.get(b.index())?.0[..b.length()]));
+                let (Some(positions), Some(normals), Some(uv), Some(indices)) = (
+                    reader.read_positions(),
+                    reader.read_normals(),
+                    reader.read_tex_coords(0),
+                    reader.read_indices(),
+                ) else {
                     continue;
                 };
                 let vertices: Vec<_> = positions
-                    .map(|point| {
+                    .zip(normals)
+                    .zip(uv.into_f32())
+                    .map(|((point, _), _)| {
                         let point = transform * Vec3::from(point).w(1.0);
                         point.xyz() / point.w
                     })
                     .collect();
                 let indices: Vec<_> = indices.into_u32().collect();
-                triangles.extend(indices.chunks_exact(3).map(|tri| {
-                    [
-                        vertices[tri[0] as usize],
-                        vertices[tri[1] as usize],
-                        vertices[tri[2] as usize],
-                    ]
+                triangles.extend(indices.chunks_exact(3).filter_map(|tri| {
+                    Some([
+                        *vertices.get(tri[0] as usize)?,
+                        *vertices.get(tri[1] as usize)?,
+                        *vertices.get(tri[2] as usize)?,
+                    ])
                 }));
             }
         }
@@ -486,7 +540,7 @@ fn building_depth(
     building: &Building,
     ray: Ray3,
     range: RangeInclusive<f32>,
-    model: Option<&PickBuildingMesh>,
+    model: Option<&PickMesh>,
 ) -> Option<f32> {
     if building.development().is_some() {
         return PreparedShell::new(building)?.ray_depth(ray, range);
@@ -537,17 +591,17 @@ fn building_depth(
 // The orbit camera's maximum normal eye offset is about 1.7 km.
 const GROWABLE_PICK_RANGE_M: f32 = 4096.0;
 
-fn pick_query_bounds(segment: Segment) -> impl Iterator<Item = AABB> {
-    // One spatial-grid cell width per query. Each box touches a fixed number
-    // of cells, so diagonal work grows with the length of the segment.
-    const STEP_M: f32 = 50.0;
-    let steps = (segment.src.distance(segment.dst) / STEP_M).ceil().max(1.0) as u32;
+fn pick_query_bounds(segment: Segment, padding: f32) -> impl Iterator<Item = AABB> {
+    // Follow the ray in short boxes so diagonal work grows with ray length.
+    // Wider boxes take longer steps to limit overlap between adjacent queries.
+    let step_m = 50.0 + 2.0 * padding;
+    let steps = (segment.src.distance(segment.dst) / step_m).ceil().max(1.0) as u32;
     (0..steps).map(move |step| {
         let first = segment.src.lerp(segment.dst, step as f32 / steps as f32);
         let last = segment
             .src
             .lerp(segment.dst, (step + 1) as f32 / steps as f32);
-        Segment::new(first, last).bbox()
+        Segment::new(first, last).bbox().expand(padding)
     })
 }
 
@@ -881,9 +935,7 @@ pub(crate) mod tests {
         selected
     }
 
-    #[test]
-    fn vehicle_destination_pick_uses_rendered_rail_stock() {
-        use prototypes::RollingStockID;
+    fn rail_pick_fixture(stock: &[RollingStockID]) -> Simulation {
         use simulation::world_command::WorldCommand;
 
         let mut ctx = ScenarioCtx::new(SimulationOptions {
@@ -916,20 +968,30 @@ pub(crate) mod tests {
                 .unwrap();
             lane
         };
-        let stock =
-            ["locomotive", "freight-wagon", "passenger-emu-middle"].map(RollingStockID::new);
         WorldCommand::SpawnTrain {
             wagons: stock.to_vec(),
             lane,
             dist: 180.0,
         }
         .apply(&mut ctx.sim);
-        let train = ctx.sim.world().trains.keys().next().unwrap();
+        ctx.sim
+    }
+
+    fn test_assets() -> &'static Path {
+        Path::new(concat!(env!("CARGO_MANIFEST_DIR"), "/../assets"))
+    }
+
+    #[test]
+    fn vehicle_destination_pick_uses_rendered_rail_stock() {
+        let stock =
+            ["locomotive", "freight-wagon", "passenger-emu-middle"].map(RollingStockID::new);
+        let sim = rail_pick_fixture(&stock);
+        let train = sim.world().trains.keys().next().unwrap();
         let mut input = InputMap::default();
         let mut picker = VehiclePicker::default();
+        picker.load_pick_meshes(test_assets());
         for (&stock, offset) in stock.iter().skip(1).zip([8.0, 13.5]) {
-            let wagon = ctx
-                .sim
+            let wagon = sim
                 .world()
                 .wagons
                 .values()
@@ -938,11 +1000,95 @@ pub(crate) mod tests {
             let end = wagon.trans.pos + wagon.trans.dir * offset;
             input.ray = Some(Ray3::new(end.up(18.0), -Vec3::Z));
             assert_eq!(
-                picker.pick(&ctx.sim, &input).map(|hit| hit.entity),
+                picker.pick(&sim, &input).map(|hit| hit.entity),
                 Some(train.into()),
                 "{stock:?}"
             );
         }
+    }
+
+    fn assert_rail_end_pick(stock: &str, visible_end: Vec3) {
+        let sim = rail_pick_fixture(&[RollingStockID::new(stock)]);
+        let (part, wagon) = sim.world().wagons.iter().next().unwrap();
+        let train = wagon.itfollower.leader;
+        let center = wagon.trans.pos;
+        let forward = wagon.trans.dir;
+        let left = -forward.perp_up().normalize();
+        let up = forward.cross(left);
+        let world_end =
+            center + forward * visible_end.x + left * visible_end.y + up * visible_end.z;
+        let mut input = InputMap::default();
+        input.ray = Some(Ray3::new(world_end + up * 18.0, -up));
+        let mut picker = VehiclePicker::default();
+        picker.load_pick_meshes(test_assets());
+        assert_eq!(
+            picker.pick(&sim, &input).map(|hit| (hit.entity, hit.part)),
+            Some((train.into(), part.into())),
+        );
+    }
+
+    #[test]
+    fn vehicle_destination_round2_picks_the_rendered_locomotive_end() {
+        assert_rail_end_pick("locomotive", vec3(8.6806, 0.4852, 0.5674));
+    }
+
+    #[test]
+    fn vehicle_destination_round2_picks_the_rendered_freight_wagon_end() {
+        assert_rail_end_pick("freight-wagon", vec3(8.6246, -0.4852, 0.5674));
+    }
+
+    #[test]
+    fn vehicle_destination_round2_prefab_overhang_blocks_vehicle_picking() {
+        use prototypes::BuildingGen;
+
+        let mut ctx = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        });
+        let mut map = map_with_buildings(dry_environment(), Buildings::default());
+        let center = vec2(100.0, 120.0);
+        let footprint = OBB::new(center, Vec2::X, 100.0, 38.0);
+        let kind = BuildingKind::ExternalTrading;
+        let building = map
+            .build_special_building(
+                &footprint,
+                kind,
+                BuildingGen::NoWalkway {
+                    door_pos: Vec2::ZERO,
+                },
+                None,
+                None,
+            )
+            .unwrap();
+        let overhang = center + footprint.axis()[0].normalize() * 40.0;
+        assert!(!footprint.contains(overhang));
+        let position = overhang.z(map.get(building).unwrap().height);
+        ctx.sim.insert(map);
+        let car = spawn_driving_vehicle(&mut ctx.sim, VehicleKind::Car, Transform::new(position))
+            .unwrap();
+        crate::init::init();
+        let ui = UiWorld::with_defaults();
+        let mut input = ui.write::<InputMap>();
+        input.just_act.insert(InputAction::Select);
+        let map = ctx.sim.map();
+        input.set_world_ray(Some(Ray3::new(position.up(24.0), -Vec3::Z)), &map, false);
+        let mut picker = ui.write::<VehiclePicker>();
+        assert_eq!(
+            picker.pick(&ctx.sim, &input).map(|hit| hit.entity),
+            Some(car.into())
+        );
+        picker.load_pick_meshes(test_assets());
+        let local_ray = Ray3::new(vec3(40.0, 0.0, 24.0), -Vec3::Z);
+        let roof = picker.building_meshes[&kind]
+            .depth(local_ray, 0.0..=24.0)
+            .unwrap();
+        assert!((24.0 - roof - 4.6521).abs() < 0.01);
+        assert!(picker.pick(&ctx.sim, &input).is_none());
+        drop(picker);
+        drop(input);
+        selectable(&ctx.sim, &ui);
+        assert_eq!(ui.read::<InspectedBuilding>().e, Some(building));
+        assert_eq!(ui.read::<InspectedEntity>().e, None);
     }
 
     #[test]
@@ -1083,7 +1229,7 @@ pub(crate) mod tests {
     #[test]
     fn zones2_native_pick_queries_follow_the_diagonal() {
         let diagonal = Segment::new(Vec2::ZERO, vec2(2896.0, 2896.0));
-        let bounds: Vec<_> = pick_query_bounds(diagonal).collect();
+        let bounds: Vec<_> = pick_query_bounds(diagonal, 0.0).collect();
         assert!(!bounds.iter().any(|aabb| aabb.contains(vec2(30.0, 2800.0))));
         assert!(bounds
             .iter()

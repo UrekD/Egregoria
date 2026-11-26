@@ -329,21 +329,34 @@ pub fn load_scaled_mesh(
     load_mesh_impl(gfx, asset_name, false, scale).map(|(mesh, _)| mesh)
 }
 
+/// Read the model's scene and geometry buffers without decoding textures.
+pub fn load_mesh_geometry(
+    assets: &Path,
+    asset_name: &Path,
+) -> Result<(Document, Vec<gltf::buffer::Data>), LoadMeshError> {
+    let path = mesh_asset_path(assets, asset_name, false);
+    let load_error = |err| LoadMeshError::GltfLoadError(Arc::new(err));
+    let gltf::Gltf { document, blob } = gltf::Gltf::open(&path).map_err(load_error)?;
+    let data = gltf::import_buffers(&document, path.parent(), blob).map_err(load_error)?;
+    Ok((document, data))
+}
+
+fn mesh_asset_path(assets: &Path, asset_name: &Path, force_base_model: bool) -> PathBuf {
+    let optimized = assets.join("models_opt").join(asset_name);
+    if !force_base_model && optimized.exists() {
+        optimized
+    } else {
+        assets.join("models").join(asset_name)
+    }
+}
+
 fn load_mesh_impl(
     gfx: &mut GfxContext,
     asset_name: &Path,
     force_base_model: bool,
     scale: f32,
 ) -> Result<(Mesh, CPUMesh), LoadMeshError> {
-    let mut path = PathBuf::new();
-    path.push("assets/models_opt/");
-    path.push(asset_name);
-
-    if !path.exists() || force_base_model {
-        path.clear();
-        path.push("assets/models/");
-        path.push(asset_name);
-    }
+    let path = mesh_asset_path(Path::new("assets"), asset_name, force_base_model);
 
     let t = Instant::now();
 
