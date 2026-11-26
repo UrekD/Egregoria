@@ -98,13 +98,78 @@ fn scale_t1_fifo_pause_capture_and_serial_parity() {
 fn scale_t1_admission_yields_to_both_roles() {
     let admission = Admission::default();
     let reader = admission.read().unwrap();
-    assert!(admission.write().is_none());
+    assert!(matches!(admission.write(), Err(WorkerWait::Reader)));
     drop(reader);
     assert!(admission.read().is_none());
     let writer = admission.write().unwrap();
     assert!(admission.read().is_none());
     drop(writer);
-    assert!(admission.write().is_none());
+    assert!(matches!(admission.write(), Err(WorkerWait::Timeout(_))));
+    assert!(admission.read().is_some());
+}
+
+#[test]
+fn winperf_writer_release_wakes_a_waiting_redraw_once() {
+    let admission = Admission::default();
+    let (wake, redraw) = mpsc::channel();
+    admission.set_redraw_waker(|| move || wake.send(()).unwrap());
+
+    drop(admission.write().unwrap());
+    assert!(redraw.try_recv().is_err());
+
+    let writer = admission.write().unwrap();
+    assert!(admission.read().is_none());
+    assert!(admission.read().is_none());
+    assert!(redraw.try_recv().is_err());
+    drop(writer);
+
+    redraw
+        .try_recv()
+        .expect("writer release must wake the redraw");
+    assert!(redraw.try_recv().is_err());
+    assert!(admission.read().is_some());
+}
+
+#[test]
+fn winperf_writer_cancellation_wakes_a_waiting_redraw_once() {
+    let admission = Admission::default();
+    let (wake, redraw) = mpsc::channel();
+    admission.set_redraw_waker(|| move || wake.send(()).unwrap());
+
+    let reader = admission.read().unwrap();
+    assert!(matches!(admission.write(), Err(WorkerWait::Reader)));
+    drop(reader);
+    assert!(admission.read().is_none());
+    assert!(admission.read().is_none());
+    assert!(redraw.try_recv().is_err());
+
+    admission.cancel_write();
+    redraw
+        .try_recv()
+        .expect("canceling writer intent must wake the redraw");
+    admission.cancel_write();
+    assert!(redraw.try_recv().is_err());
+    assert!(matches!(admission.write(), Err(WorkerWait::Timeout(_))));
+    assert!(admission.read().is_some());
+}
+
+#[test]
+fn winperf_cancellation_during_a_read_wakes_on_reader_release() {
+    let admission = Admission::default();
+    let (wake, redraw) = mpsc::channel();
+    admission.set_redraw_waker(|| move || wake.send(()).unwrap());
+
+    let reader = admission.read().unwrap();
+    assert!(matches!(admission.write(), Err(WorkerWait::Reader)));
+    assert!(admission.read().is_none());
+    admission.cancel_write();
+    assert!(redraw.try_recv().is_err());
+
+    drop(reader);
+    redraw
+        .try_recv()
+        .expect("reader release after cancellation must wake the redraw");
+    assert!(redraw.try_recv().is_err());
     assert!(admission.read().is_some());
 }
 
@@ -318,7 +383,7 @@ fn scale_t1_frame_can_skip_a_held_tick_and_pause_at_its_boundary() {
 fn scale_t1_pause_can_cancel_writer_intent() {
     let admission = Admission::default();
     let lease = admission.read().unwrap();
-    assert!(admission.write().is_none());
+    assert!(matches!(admission.write(), Err(WorkerWait::Reader)));
     drop(lease);
     assert!(admission.read().is_none());
     admission.cancel_write();

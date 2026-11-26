@@ -5,7 +5,9 @@ use simulation::economy::{Budget, BudgetCategory, Government};
 use simulation::map::BuildingKind;
 use simulation::world_command::WorldCommand;
 use simulation::SimulationOptions;
-use std::process::Command;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
 
 fn final_projection(ctx: &mut ScenarioCtx) -> u64 {
     let mut dump = Vec::new();
@@ -107,6 +109,100 @@ fn perf_10k_cli_is_opt_in() {
     assert!(!output.status.success());
     let error = String::from_utf8(output.stderr).unwrap();
     assert!(error.contains("--gate requires perf_10k"), "{error}");
+}
+
+struct BenchRuntime(PathBuf);
+
+impl BenchRuntime {
+    fn new() -> Self {
+        Self::create_in(&std::env::temp_dir())
+    }
+
+    fn create_in(parent: &Path) -> Self {
+        let mut index = 0;
+        loop {
+            let path = parent.join(format!("winperf-runtime-{}-{index}", std::process::id()));
+            match fs::create_dir(&path) {
+                Ok(()) => return Self(path),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => index += 1,
+                Err(error) => panic!("could not create {}: {error}", path.display()),
+            }
+        }
+    }
+}
+
+impl Drop for BenchRuntime {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+fn write_prototype_marker(root: &Path, marker: &str) {
+    let base_mod = root.join("base_mod");
+    fs::create_dir(&base_mod).unwrap();
+    fs::write(base_mod.join("data.lua"), format!("error('{marker}')")).unwrap();
+}
+
+fn run_bench_slot(executable: &Path, caller: &Path) -> Output {
+    Command::new(executable)
+        .current_dir(caller)
+        .arg("bench-slot")
+        .args(["--root", "world"])
+        .args(["--slot", "lesce_town"])
+        .args(["--warmup", "0", "--ticks", "1"])
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn winperf_bench_slot_ignores_caller_prototypes_and_preserves_relative_save_root() {
+    let caller = BenchRuntime::new();
+    write_prototype_marker(&caller.0, "benchmark caller prototype marker");
+    let output = run_bench_slot(Path::new(env!("CARGO_BIN_EXE_scenarios")), &caller.0);
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        !error.contains("benchmark caller prototype marker"),
+        "{error}"
+    );
+    let save_root = caller.0.join("world");
+    let expected = format!("{} (lesce_town): Save not found", save_root.display());
+    assert!(error.contains(&expected), "{error}");
+}
+
+#[test]
+fn winperf_bench_slot_loads_prototypes_from_the_executable_directory() {
+    let caller = BenchRuntime::new();
+    let runtime = BenchRuntime::create_in(&caller.0);
+    let built_executable = Path::new(env!("CARGO_BIN_EXE_scenarios"));
+    let packaged_executable = runtime.0.join(built_executable.file_name().unwrap());
+    fs::copy(built_executable, &packaged_executable).unwrap();
+    write_prototype_marker(&runtime.0, "benchmark runtime prototype marker");
+
+    let output = run_bench_slot(&packaged_executable, &caller.0);
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        error.contains("benchmark runtime prototype marker"),
+        "{error}"
+    );
+}
+
+#[test]
+fn winperf_benchmark_fixture_skips_and_preserves_existing_directory() {
+    let parent = BenchRuntime::new();
+    let occupied = parent
+        .0
+        .join(format!("winperf-runtime-{}-0", std::process::id()));
+    fs::create_dir(&occupied).unwrap();
+    let marker = occupied.join("keep");
+    fs::write(&marker, "preexisting fixture").unwrap();
+
+    let fixture = BenchRuntime::create_in(&parent.0);
+    let fixture_path = fixture.0.clone();
+    drop(fixture);
+    assert!(marker.is_file(), "cleanup removed the preexisting fixture");
+    assert!(!fixture_path.exists());
 }
 
 #[test]

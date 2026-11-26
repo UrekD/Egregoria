@@ -3,7 +3,7 @@ use std::io::{self, Write};
 use std::ops::Deref;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
-use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
+use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -34,7 +34,7 @@ const BATCH_CREDITS: usize = 8;
 // One extra credit is always available to fence or stop a full batch queue.
 const CONTROL_CREDITS: usize = 1;
 const CREDITS: usize = BATCH_CREDITS + CONTROL_CREDITS;
-const CONTENDED_RETRY: Duration = Duration::from_micros(250);
+const EXTERNAL_LOCK_RETRY: Duration = Duration::from_micros(250);
 const REDRAW_TURN: Duration = Duration::from_millis(16);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -237,6 +237,8 @@ struct Credit {
 struct Admission {
     state: AtomicU8,
     redraw_until: Mutex<Option<Instant>>,
+    redraw_waker: OnceLock<Box<dyn Fn() + Send + Sync>>,
+    worker: OnceLock<thread::Thread>,
 }
 
 const READER: u8 = 1 << 0;
@@ -250,18 +252,20 @@ struct Turn<'a> {
     reader: bool,
 }
 
+#[derive(Debug)]
+enum WorkerWait {
+    Yield,
+    Timeout(Duration),
+    Reader,
+}
+
 impl Admission {
-    fn can_read(state: u8) -> bool {
-        state & (WRITER | READER) == 0 && (state & INTENT == 0 || state & REDRAW != 0)
+    fn set_redraw_waker<F: Fn() + Send + Sync + 'static>(&self, waker: impl FnOnce() -> F) {
+        self.redraw_waker.get_or_init(|| Box::new(waker()));
     }
 
-    fn signal_redraw(&self) -> bool {
-        let blocked = self
-            .state
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                (!Self::can_read(state)).then_some(state | WAITING)
-            });
-        blocked.is_err()
+    fn can_read(state: u8) -> bool {
+        state & (WRITER | READER) == 0 && (state & INTENT == 0 || state & REDRAW != 0)
     }
 
     fn read(&self) -> Option<Turn<'_>> {
@@ -282,27 +286,60 @@ impl Admission {
     }
 
     fn cancel_write(&self) {
-        self.state.fetch_and(!INTENT, Ordering::Release);
+        self.release(INTENT);
     }
 
-    fn write(&self) -> Option<Turn<'_>> {
+    fn release(&self, flags: u8) -> u8 {
+        let redraw_ready = |state| state & WAITING != 0 && Self::can_read(state & !flags);
+        let state = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let next = state & !flags;
+                Some(if redraw_ready(state) {
+                    (next & !WAITING) | REDRAW
+                } else {
+                    next
+                })
+            })
+            .unwrap();
+        if redraw_ready(state) {
+            if let Some(wake) = self.redraw_waker.get() {
+                wake();
+            }
+        }
+        state
+    }
+
+    fn write(&self) -> Result<Turn<'_>, WorkerWait> {
         let mut redraw_until = self.redraw_until.lock().unwrap();
         let state = self.state.fetch_or(INTENT, Ordering::AcqRel);
-        let allow_redraw = if state & REDRAW != 0 {
-            Instant::now() < *redraw_until.get_or_insert_with(|| Instant::now() + REDRAW_TURN)
+        let remaining = if state & REDRAW != 0 {
+            let now = Instant::now();
+            redraw_until
+                .get_or_insert(now + REDRAW_TURN)
+                .saturating_duration_since(now)
         } else {
             *redraw_until = None;
-            false
+            Duration::ZERO
         };
         self.state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
                 let reserved = state & (WRITER | READER) != 0;
-                let redraw = state & REDRAW != 0 && allow_redraw;
+                let redraw = state & REDRAW != 0 && !remaining.is_zero();
                 (!reserved && !redraw).then_some((state | WRITER) & !REDRAW)
             })
-            .ok()?;
+            .map_err(|state| {
+                if state & READER != 0 {
+                    WorkerWait::Reader
+                } else if !remaining.is_zero() {
+                    // A redraw may be dropped while the window is minimized.
+                    WorkerWait::Timeout(remaining)
+                } else {
+                    WorkerWait::Yield
+                }
+            })?;
         *redraw_until = None;
-        Some(Turn {
+        Ok(Turn {
             admission: self,
             reader: false,
         })
@@ -311,16 +348,12 @@ impl Admission {
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
-        if self.reader {
-            self.admission.state.fetch_and(!READER, Ordering::Release);
-        } else {
-            self.admission
-                .state
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                    let redraw = if state & WAITING != 0 { REDRAW } else { 0 };
-                    Some((state & !(WRITER | INTENT | WAITING)) | redraw)
-                })
-                .unwrap();
+        let released = if self.reader { READER } else { WRITER | INTENT };
+        let state = self.admission.release(released);
+        if self.reader && state & INTENT != 0 {
+            if let Some(worker) = self.admission.worker.get() {
+                worker.unpark();
+            }
         }
     }
 }
@@ -363,8 +396,11 @@ impl WorldView {
         self.replaced.swap(false, Ordering::AcqRel)
     }
 
-    pub(crate) fn signal_redraw(&self) -> bool {
-        self.admission.signal_redraw()
+    pub(crate) fn set_redraw_waker<F: Fn() + Send + Sync + 'static>(
+        &self,
+        waker: impl FnOnce() -> F,
+    ) {
+        self.admission.set_redraw_waker(waker);
     }
 
     pub(crate) fn try_read(&self) -> Option<ReadLease<'_>> {
@@ -373,16 +409,16 @@ impl WorldView {
         Some(ReadLease { guard, _turn: turn })
     }
 
-    fn try_write(&self) -> Option<WriteLease<'_>> {
+    fn try_write(&self) -> Result<WriteLease<'_>, WorkerWait> {
         let turn = self.admission.write()?;
         let guard = match self.world.try_write() {
             Ok(guard) => guard,
             // A detached import can still be releasing its shared capture
             // guard after a replay ends or an owner transfer is acknowledged.
-            Err(TryLockError::WouldBlock) => return None,
+            Err(TryLockError::WouldBlock) => return Err(WorkerWait::Timeout(EXTERNAL_LOCK_RETRY)),
             Err(TryLockError::Poisoned(_)) => panic!("simulation world poisoned"),
         };
-        Some(WriteLease { guard, _turn: turn })
+        Ok(WriteLease { guard, _turn: turn })
     }
 }
 
@@ -849,12 +885,12 @@ impl Worker {
         input: Receiver<Envelope>,
         output: SyncSender<Reply>,
     ) -> (SeqSchedule, Boundary) {
+        let _ = view.admission.worker.set(thread::current());
         while !self.exit {
-            let delay = self.run_one(view, status, &input, &output);
-            if delay.is_zero() {
-                thread::yield_now();
-            } else {
-                thread::park_timeout(delay);
+            match self.run_one(view, status, &input, &output) {
+                WorkerWait::Yield => thread::yield_now(),
+                WorkerWait::Timeout(delay) => thread::park_timeout(delay),
+                WorkerWait::Reader => thread::park(),
             }
         }
         (self.schedule, self.status.boundary)
@@ -866,7 +902,7 @@ impl Worker {
         status: &Mutex<SimStatus>,
         input: &Receiver<Envelope>,
         output: &SyncSender<Reply>,
-    ) -> Duration {
+    ) -> WorkerWait {
         let now = Instant::now();
         self.clock.update(now);
         let live_import = self.import.as_ref().and_then(PendingImport::live_id);
@@ -897,7 +933,7 @@ impl Worker {
                         kind: ReplyKind::Interrupted(self.status.boundary),
                     },
                 );
-                return Duration::ZERO;
+                return WorkerWait::Yield;
             }
             if live_import.is_some() {
                 return self.poll_import(view, status, output);
@@ -910,7 +946,7 @@ impl Worker {
                     Err(mpsc::TryRecvError::Empty) => {}
                     Err(mpsc::TryRecvError::Disconnected) => {
                         self.exit = true;
-                        return Duration::ZERO;
+                        return WorkerWait::Yield;
                     }
                 }
             }
@@ -926,13 +962,14 @@ impl Worker {
         {
             view.admission.cancel_write();
             if self.replay.is_some() && !self.paused && self.replay_speed > 0 {
-                return self.replay_due.saturating_duration_since(now);
+                return WorkerWait::Timeout(self.replay_due.saturating_duration_since(now));
             }
-            return if self.paused || self.replay.is_some() {
+            let delay = if self.paused || self.replay.is_some() {
                 Duration::from_millis(20)
             } else {
                 self.clock.wait()
             };
+            return WorkerWait::Timeout(delay);
         }
         if self.replay.is_none()
             && self.pending.as_ref().is_some_and(|pending| {
@@ -947,11 +984,11 @@ impl Worker {
                 commands.clone(),
                 ImportKind::Live { id, commands },
             ));
-            return Duration::ZERO;
+            return WorkerWait::Yield;
         }
         if self.pending.is_none() && replay_ready {
-            if let Some(delay) = self.advance_replay_import(view, status, output) {
-                return delay;
+            if let Some(wait) = self.advance_replay_import(view, status, output) {
+                return wait;
             }
         }
 
@@ -964,8 +1001,9 @@ impl Worker {
             )
         });
         let reply = if world_required {
-            let Some(mut lease) = view.try_write() else {
-                return CONTENDED_RETRY;
+            let mut lease = match view.try_write() {
+                Ok(lease) => lease,
+                Err(wait) => return wait,
             };
             if let Some(envelope) = self.pending.take() {
                 self.handle(envelope, Some(&mut lease.guard))
@@ -990,7 +1028,7 @@ impl Worker {
         for reply in cancelled.into_iter().chain(reply) {
             self.send_reply(output, reply);
         }
-        Duration::ZERO
+        WorkerWait::Yield
     }
 
     fn terminal_waiting(waiting: &mut VecDeque<Envelope>, input: &Receiver<Envelope>) -> bool {
@@ -1005,7 +1043,7 @@ impl Worker {
         view: &WorldView,
         status: &Mutex<SimStatus>,
         output: &SyncSender<Reply>,
-    ) -> Option<Duration> {
+    ) -> Option<WorkerWait> {
         let replay = self.replay.as_ref().unwrap();
         let budget = self
             .replay_budget
@@ -1035,7 +1073,7 @@ impl Worker {
             WorldCommands::from(commands),
             ImportKind::Replay(operation),
         ));
-        Some(Duration::ZERO)
+        Some(WorkerWait::Yield)
     }
 
     fn start_import(view: &WorldView, commands: WorldCommands, kind: ImportKind) -> PendingImport {
@@ -1100,12 +1138,14 @@ impl Worker {
         view: &WorldView,
         status: &Mutex<SimStatus>,
         output: &SyncSender<Reply>,
-    ) -> Duration {
+    ) -> WorkerWait {
         let pending = self.import.as_mut().unwrap();
         if pending.prepared.is_none() {
             let result = match pending.result.try_recv() {
                 Ok(result) => result,
-                Err(mpsc::TryRecvError::Empty) => return Duration::from_millis(2),
+                Err(mpsc::TryRecvError::Empty) => {
+                    return WorkerWait::Timeout(Duration::from_millis(2));
+                }
                 Err(mpsc::TryRecvError::Disconnected) => Err("Map import worker stopped.".into()),
             };
             match result {
@@ -1131,12 +1171,13 @@ impl Worker {
                             },
                         );
                     }
-                    return Duration::ZERO;
+                    return WorkerWait::Yield;
                 }
             }
         }
-        let Some(mut published) = view.try_write() else {
-            return CONTENDED_RETRY;
+        let mut published = match view.try_write() {
+            Ok(lease) => lease,
+            Err(wait) => return wait,
         };
         let mut pending = self.import.take().unwrap();
         let (sim, elapsed) = pending.prepared.take().unwrap();
@@ -1170,7 +1211,7 @@ impl Worker {
             self.send_reply(output, reply);
         }
         drop(old);
-        Duration::ZERO
+        WorkerWait::Yield
     }
 
     fn send_reply(&mut self, output: &SyncSender<Reply>, reply: Reply) {

@@ -47,7 +47,7 @@ export CXX_x86_64_pc_windows_gnu="$MINGW_PREFIX/bin/x86_64-w64-mingw32-g++-posix
 export AR_x86_64_pc_windows_gnu="$MINGW_PREFIX/bin/x86_64-w64-mingw32-ar"
 TARGET_DIR=${CARGO_TARGET_DIR:-target}
 
-cargo build --locked --release -p native_app --target "$TARGET"
+cargo build --locked --release -p native_app -p scenarios --target "$TARGET"
 
 VERSION=$(cat VERSION)
 STAGE=$(mktemp -d "${TMPDIR:-/tmp}/egr-windows.XXXXXX")
@@ -55,6 +55,7 @@ trap 'rm -rf "$STAGE"' EXIT
 PKG=$STAGE/egregoria
 mkdir -p "$PKG"
 cp "$TARGET_DIR/$TARGET/release/native_app.exe" "$PKG/egregoria.exe"
+cp "$TARGET_DIR/$TARGET/release/scenarios.exe" "$PKG/"
 # Runtime DLLs of the posix mingw toolchain; everything else ships with Windows.
 for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
 	path=$("$CC_BIN" -print-file-name="$dll")
@@ -64,7 +65,7 @@ for dll in libstdc++-6.dll libgcc_s_seh-1.dll libwinpthread-1.dll; do
 	fi
 	cp "$path" "$PKG/"
 done
-cp -r assets base_mod README.md LICENSE "$PKG/"
+cp -r assets base_mod README.md LICENSE docs/perf-report.md "$PKG/"
 if [ -n "$SLOTS" ]; then
 	mkdir -p "$PKG/world"
 	cp -r "$SLOTS"/. "$PKG/world/"
