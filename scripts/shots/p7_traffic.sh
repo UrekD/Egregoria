@@ -20,8 +20,8 @@ if [[ ${1:-} == --run-private ]]; then
         sleep 0.05
     done
     cp -- "$slots/$slot.meta.json" "$slots/$slot.zip" "$shots/"
-    if [[ -f $slots/$slot.replay.json ]]; then
-        cp -- "$slots/$slot.replay.json" "$shots/"
+    if [[ -f $slots/${slot}_replay.json ]]; then
+        cp -- "$slots/${slot}_replay.json" "$shots/"
     fi
     kill -CONT "$xpid"
     wait "$pid"

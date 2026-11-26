@@ -9,8 +9,8 @@ use geom::{vec2, Transform, Vec2, Vec3};
 use prototypes::{ItemID, Money, RecTimeInterval};
 use serde::Serialize;
 use simulation::diagnostics::elapsed_tick;
-use simulation::economy::cargo::{reserve_road_freight, CargoBook, ItemQuantity, LoadId};
-use simulation::economy::{Market, TICKS_PER_BUDGET_DAY};
+use simulation::economy::cargo::{reserve_road_freight, CargoBook, ItemQuantity, RoadFreightTracking, ShipmentId};
+use simulation::economy::Market;
 use simulation::map::road_edit::{preview_road_upgrade, road_edit_stamp, RoadUpgrade};
 use simulation::map::{
     BuildingID, LaneID, LaneKind, LanePatternBuilder, LightPolicy, ProjectFilter, RoadID,
@@ -21,8 +21,11 @@ use simulation::souls::desire::{Work, WorkKind};
 use simulation::souls::human::{spawn_human, HumanDecision, HumanDecisionKind};
 use simulation::transportation::{spawn_parked_vehicle, unpark, Location, VehicleKind};
 use simulation::world_command::{CommandOutcomes, PrepareBudget, WorldCommand};
-use simulation::{HumanID, Simulation, SoulID, VehicleID};
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use simulation::{
+    HumanID, ReplayAdvance, ReplayBudget, Simulation, SimulationReplayLoader, SnapshotRevision,
+    SoulID, VehicleID,
+};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::AtomicBool;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,7 +537,7 @@ pub fn run_no_loss_arm(
         resume_at: None,
         cancelled: &AtomicBool::new(false),
     };
-    run_repair_arm(sim, &inputs, request, treatment)
+    run_repair_arm(sim, &inputs, request, treatment, true, false)
         .map(|(arm, _)| arm.observations)
         .map_err(|err| err.to_string())
 }
@@ -544,15 +547,42 @@ pub(crate) fn run_repair_arm(
     inputs: &AbsoluteSchedule<'_>,
     request: ComparisonRequest<'_>,
     treatment: bool,
+    authored: bool,
+    replay: bool,
 ) -> Result<(ComparisonArm, Option<ComparisonReceipt>), ComparisonError> {
     let checkpoint = elapsed_tick(&sim).0;
     let mut schedule = Simulation::schedule();
-    schedule.retain_systems(|name| {
-        !matches!(
-            name,
-            "company_system" | "market_update" | "residence_update" | "growth_update"
-        )
-    });
+    if authored {
+        schedule.retain_systems(|name| {
+            !matches!(
+                name,
+                "company_system" | "market_update" | "residence_update" | "growth_update"
+            )
+        });
+    }
+    let mut playback = replay.then(|| {
+        let mut batches: Vec<_> = inputs.batches.iter()
+            .map(|batch| (batch.tick, batch.advances, batch.commands.to_vec()))
+            .collect();
+        if treatment {
+            if let Some((_, _, commands)) = batches.iter_mut()
+                .find(|(tick, advances, _)| *tick == request.repair_at && *advances)
+            {
+                commands.push(request.repair.clone());
+            } else {
+                let index = batches.partition_point(|(tick, _, _)| *tick <= request.repair_at);
+                batches.insert(index, (request.repair_at, true, vec![request.repair.clone()]));
+            }
+        }
+        SimulationReplayLoader::checkpoint_playback(
+            prototypes::Tick(sim.get_tick()), SnapshotRevision::new(1),
+            inputs.tail_cutoff - checkpoint,
+            batches.iter().map(|(tick, advances, commands)| {
+                (tick - checkpoint - 1, *advances, commands.as_slice())
+            }),
+        ).map_err(|err| ComparisonError::Setup(err.to_string()))
+    }).transpose()?;
+    let mut replay_budget = ReplayBudget::new((inputs.tail_cutoff - checkpoint) as usize);
     let mut reports: Vec<_> = inputs
         .scheduled_offers
         .iter()
@@ -563,13 +593,12 @@ pub(crate) fn run_repair_arm(
         })
         .collect();
     let mut pending_people = BTreeMap::<usize, (HumanID, BuildingID, Option<Vec3>)>::new();
-    let mut freight = BTreeMap::<(BuildingID, ItemID), FreightTags>::new();
+    let mut freight = BTreeMap::<ShipmentId, (usize, BuildingID, u32)>::new();
     let repaired_road = match request.repair {
         WorldCommand::MapUpgradeRoad { road, .. } => Some(*road),
         _ => None,
     };
     let mut repaired_road_tags = BTreeSet::new();
-    let mut receipt_day = checkpoint / TICKS_PER_BUDGET_DAY;
     let mut next_offer = 0;
     let mut batches = inputs.batches.iter().peekable();
     let mut batch_outcomes = Vec::new();
@@ -581,7 +610,15 @@ pub(crate) fn run_repair_arm(
             .is_some_and(|batch| batch.tick == tick && !batch.advances)
         {
             let batch = batches.next().unwrap();
-            sim.apply_commands(batch.commands);
+            if let Some(playback) = &mut playback {
+                if !matches!(playback.advance_one(&mut sim, &mut schedule, &mut replay_budget),
+                    ReplayAdvance::Operation { advanced: false, .. })
+                {
+                    return Err(ComparisonError::InvalidSchedule("expected paused replay batch"));
+                }
+            } else {
+                sim.apply_commands(batch.commands);
+            }
             batch_outcomes.push(ComparisonBatchOutcome::read(
                 tick,
                 false,
@@ -686,40 +723,30 @@ pub(crate) fn run_repair_arm(
                     item,
                     units,
                 } => {
-                    let source = sim
-                        .read::<BuildingInfos>()
-                        .owner(sender)
-                        .ok_or("missing sender")?;
-                    let target = sim
-                        .read::<BuildingInfos>()
-                        .owner(receiver)
-                        .ok_or("missing receiver")?;
-                    let units = i32::try_from(units)
+                    let units = u32::try_from(units)
                         .ok()
-                        .filter(|&units| units > 0)
-                        .ok_or("invalid authored freight quantity")?;
-                    sim.write::<Market>().produce(source, item, units);
-                    if !reserve_road_freight(
+                        .filter(|units| (1..=i32::MAX as u32).contains(units))
+                        .ok_or("invalid freight quantity")?;
+                    if authored {
+                        let source = sim
+                            .read::<BuildingInfos>()
+                            .owner(sender)
+                            .ok_or("missing sender")?;
+                        sim.write::<Market>().produce(source, item, units as i32);
+                    }
+                    let reservation = reserve_road_freight(
                         &mut sim,
                         sender,
                         receiver,
-                        ItemQuantity {
-                            item,
-                            units: units as u32,
-                        },
-                    ) {
-                        return Err(format!("could not reserve freight tag {}", entry.tag).into());
+                        ItemQuantity { item, units },
+                    );
+                    if let Some(id) = reservation {
+                        freight.insert(id, (next_offer, receiver, units));
+                    } else {
+                        reports[next_offer].terminal = Some(Terminal::Rejected { tick });
+                        next_offer += 1;
+                        continue;
                     }
-                    freight
-                        .entry((receiver, item))
-                        .or_insert_with(|| FreightTags {
-                            source: sender,
-                            recipient: target,
-                            pending: VecDeque::new(),
-                            active: BTreeMap::new(),
-                            credited: 0,
-                        })
-                        .offer(sender, units as u64, next_offer)?;
                 }
             }
             reports[next_offer].admitted_at = Some(tick);
@@ -731,7 +758,15 @@ pub(crate) fn run_repair_arm(
             _ => &[],
         };
         let candidate = (treatment && tick == request.repair_at).then_some(request.repair);
-        sim.tick(&mut schedule, commands.iter().chain(candidate));
+        if let Some(playback) = &mut playback {
+            if !matches!(playback.advance_one(&mut sim, &mut schedule, &mut replay_budget),
+                ReplayAdvance::Operation { advanced: true, .. })
+            {
+                return Err(ComparisonError::InvalidSchedule("expected advancing replay step"));
+            }
+        } else {
+            sim.tick(&mut schedule, commands.iter().chain(candidate));
+        }
         if let Some(command) = candidate {
             receipt = Some(ComparisonReceipt::read(&sim, command, commands.len())?);
         }
@@ -774,47 +809,49 @@ pub(crate) fn run_repair_arm(
         });
 
         let book = sim.read::<CargoBook>();
-        let day = tick / TICKS_PER_BUDGET_DAY;
-        if day != receipt_day {
-            receipt_day = day;
-            for tags in freight.values_mut() {
-                tags.credited = 0;
+        freight.retain(|&id, &mut (index, receiver, units)| {
+            let Some(progress) = book.road_shipment_progress(id) else {
+                reports[index].terminal = Some(Terminal::Unreconciled { tick });
+                return false;
+            };
+            if progress.active_loads.values().copied().any(uses_repaired_road) {
+                repaired_road_tags.insert(reports[index].tag);
             }
-        }
-        let receipts = book.freight_day(day);
-        if receipts.is_some_and(|receipts| receipts.cancelled_units > 0) {
-            return Err(format!("shipment cancelled at elapsed tick {tick}").into());
-        }
-        for (&(receiver, item), tags) in &mut freight {
-            let credited = receipts.map_or(0, |receipts| {
-                receipts.receipt(tags.recipient, item).road_units
-            });
-            tags.observe(
-                &book,
-                receiver,
-                item,
-                tick,
-                credited,
-                uses_repaired_road,
-                &mut reports,
-                &mut repaired_road_tags,
-            )?;
-        }
+            if progress.cancelled {
+                reports[index].terminal = Some(Terminal::Cancelled { tick });
+            } else if progress.unloaded_units == units {
+                reports[index].terminal = Some(Terminal::Completed {
+                    tick,
+                    destination: format!("{receiver:?}"),
+                    units: u64::from(units),
+                });
+            }
+            reports[index].terminal.is_none()
+        });
         drop(book);
         if request.resume_at == Some(tick) {
+            let mut tracking = RoadFreightTracking::default();
+            sim.write::<CargoBook>().swap_road_freight_tracking(&mut tracking);
             sim = load_snapshot(&snapshot_bytes(&sim)?)?;
+            sim.write::<CargoBook>().swap_road_freight_tracking(&mut tracking);
         }
-        if next_offer == reports.len()
+        if authored && !replay
+            && next_offer == reports.len()
             && batches.peek().is_none()
             && (!treatment || receipt.is_some())
             && request.resume_at.is_none_or(|resume| resume <= tick)
             && pending_people.is_empty()
-            && freight
-                .values()
-                .all(|tags| tags.pending.is_empty() && tags.active.is_empty())
+            && freight.is_empty()
         {
             // All tagged outcomes are terminal at both this point and the tail.
             break;
+        }
+    }
+    if let Some(playback) = &mut playback {
+        if !matches!(playback.advance_one(&mut sim, &mut schedule, &mut replay_budget),
+            ReplayAdvance::Settled { complete: true })
+        {
+            return Err(ComparisonError::InvalidSchedule("replay did not reach the scored cutoff"));
         }
     }
     Ok((
@@ -825,88 +862,6 @@ pub(crate) fn run_repair_arm(
         },
         receipt,
     ))
-}
-
-struct FreightTags {
-    source: BuildingID,
-    recipient: SoulID,
-    pending: VecDeque<(usize, u64)>,
-    active: BTreeMap<LoadId, Vec<(usize, u64)>>,
-    credited: u64,
-}
-
-impl FreightTags {
-    fn offer(&mut self, sender: BuildingID, units: u64, index: usize) -> Result<(), String> {
-        if sender != self.source {
-            return Err("ambiguous authored freight source".into());
-        }
-        self.pending.push_back((index, units));
-        Ok(())
-    }
-
-    fn observe(
-        &mut self,
-        book: &CargoBook,
-        receiver: BuildingID,
-        item: ItemID,
-        tick: u64,
-        credited: u64,
-        uses_repaired_road: impl Fn(VehicleID) -> bool,
-        reports: &mut [Observation],
-        repaired_road_tags: &mut BTreeSet<u32>,
-    ) -> Result<(), String> {
-        let mut previous = std::mem::take(&mut self.active);
-        for (id, load) in book.incoming_load_manifests(receiver) {
-            let units = load
-                .items
-                .iter()
-                .find(|line| line.item == item)
-                .map_or(0, |line| line.units);
-            if units == 0 {
-                continue;
-            }
-            if load.source() != self.source {
-                return Err("unexpected freight manifest source".into());
-            }
-            let tags = match previous.remove(&id) {
-                Some(tags) => tags,
-                None => {
-                    // The stock dispatch iterates each pair's reserved shipments in order.
-                    let mut remaining = u64::from(units);
-                    let mut tags = Vec::new();
-                    while remaining > 0 {
-                        let (index, quantity) =
-                            self.pending.pop_front().ok_or("unexpected dispatch")?;
-                        remaining = remaining
-                            .checked_sub(quantity)
-                            .ok_or("dispatch split an authored offer")?;
-                        tags.push((index, quantity));
-                    }
-                    tags
-                }
-            };
-            if uses_repaired_road(load.vehicle) {
-                repaired_road_tags.extend(tags.iter().map(|(index, _)| reports[*index].tag));
-            }
-            self.active.insert(id, tags);
-        }
-
-        let shipped: u64 = previous.values().flatten().map(|&(_, units)| units).sum();
-        if credited.checked_sub(self.credited) != Some(shipped) {
-            return Err(format!(
-                "receiver {receiver:?} has a manifest/receipt mismatch at tick {tick}"
-            ));
-        }
-        self.credited = credited;
-        for (index, units) in previous.into_values().flatten() {
-            reports[index].terminal = Some(Terminal::Completed {
-                tick,
-                destination: format!("{receiver:?}"),
-                units,
-            });
-        }
-        Ok(())
-    }
 }
 
 fn vehicle_on_road(sim: &Simulation, id: VehicleID, road: RoadID) -> bool {

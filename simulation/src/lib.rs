@@ -64,7 +64,7 @@ mod world;
 pub mod world_command;
 
 pub use common::saveload::{
-    list_slots_with_revisions, save_dir, SlotCamera, SlotId, SlotMeta, SlotPaths, SnapshotKind,
+    list_slots_with_revisions, save_dir, slot_paths, SlotCamera, SlotId, SlotMeta, SlotPaths, SnapshotKind,
     SnapshotRevision,
 };
 pub use economy::population::PopulationScale;
@@ -1060,6 +1060,14 @@ impl Simulation {
             .map_err(SaveLoadError::Io)?
             .ok_or(SaveLoadError::NotFound)?;
         decode_snapshot_replay(&bytes, &paths.zip, &paths.bc)
+    }
+
+    /// Validate an in-memory sidecar using the same decoder as a slot reopen.
+    pub fn decode_replay_sidecar(
+        bytes: &[u8],
+        revision: Option<SnapshotRevision>,
+    ) -> Result<Replay, SaveLoadError> {
+        ReplayJson::decode_sidecar(bytes, revision)
     }
 
     /// Reads a bounded prefix of the selected snapshot for slot discovery.

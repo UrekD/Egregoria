@@ -148,6 +148,10 @@ pub(crate) enum Request {
         revision: SnapshotRevision,
         permit: Option<SavePermit>,
     },
+    CaptureComparison {
+        revision: SnapshotRevision,
+        limit: usize,
+    },
     ReplayControl(ReplayControl),
     ReleaseOwner,
     Stop,
@@ -956,7 +960,7 @@ impl Worker {
         let world_required = self.pending.as_ref().is_none_or(|envelope| {
             matches!(
                 envelope.request,
-                Request::Batch(_) | Request::Capture { .. }
+                Request::Batch(_) | Request::Capture { .. } | Request::CaptureComparison { .. }
             )
         });
         let reply = if world_required {
@@ -1250,6 +1254,14 @@ impl Worker {
                         .map(|snapshot| (snapshot, CityProgress::capture(sim)))
                         .map_err(|err| err.to_string())
                 })
+            }
+            Request::CaptureComparison { revision, limit } => {
+                let sim = sim.unwrap();
+                ReplyKind::Captured(
+                    sim.capture_slot_with_limit(revision, limit)
+                        .map(|snapshot| (snapshot, CityProgress::capture(sim)))
+                        .map_err(|err| err.to_string()),
+                )
             }
             Request::ReplayControl(control) => {
                 if self.replay.is_none() {

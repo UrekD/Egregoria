@@ -1,27 +1,32 @@
 use super::comparison::compare_builtin_repair_resumed;
+use super::natural::StagedTraffic;
+use super::staging::{read_member, verify_runtime_data};
 use super::{
     compare_builtin_repair, stage_published_slots, FixtureArm, FixtureClass, StageOptions,
 };
 use crate::ScenarioCtx;
+use serde::Serialize;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
+use simulation::world_command::WorldCommand;
 
 type Args = BTreeMap<String, Option<OsString>>;
 
 pub fn cli(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     let operation = args
         .next()
-        .ok_or("traffic-repair requires compare or stage")?;
+        .ok_or("traffic-repair requires compare, stage, soak or perf")?;
     let mut flags = Args::new();
     while let Some(arg) = args.next() {
         let flag = arg.to_str().ok_or("invalid traffic-repair flag")?;
         let value = match flag {
-            "--twice" | "--resume" => None,
+            "--twice" | "--resume" | "--replay" => None,
             "--fixtures" | "--workers" | "--json" | "--manifest" | "--class" | "--out"
-            | "--bundle-root" | "--run-source" => Some(
+            | "--bundle-root" | "--run-source" | "--root" | "--edit" | "--days"
+            | "--agents" | "--layout" | "--warmup" | "--ticks" | "--pairs" | "--modes" => Some(
                 args.next()
                     .filter(|arg| !arg.as_encoded_bytes().starts_with(b"--"))
                     .ok_or_else(|| format!("{flag} requires a value"))?,
@@ -35,22 +40,22 @@ pub fn cli(mut args: impl Iterator<Item = OsString>) -> Result<(), String> {
     match operation.to_str() {
         Some("compare") => compare(flags),
         Some("stage") => stage(flags),
+        Some("soak") => soak(flags),
+        Some("perf") => perf(flags),
         _ => Err(format!("unknown traffic-repair operation {operation:?}")),
     }
 }
 
 fn compare(mut flags: Args) -> Result<(), String> {
-    let fixtures = text(&mut flags, "--fixtures")?;
-    let workers = flags
-        .remove("--workers")
-        .flatten()
-        .unwrap_or_else(|| OsString::from("1"));
-    if workers != "1" {
-        return Err("traffic-repair comparison supports one simulation worker per arm".into());
+    if flags.contains_key("--root") {
+        return compare_staged(flags);
     }
+    let fixtures = text(&mut flags, "--fixtures")?;
+    let unsupported_workers = serial_workers(&mut flags)?;
     let json = flags.remove("--json").flatten().map(absolute).transpose()?;
     let twice = flags.remove("--twice").is_some();
     let resume = flags.remove("--resume").is_some();
+    let replay = flags.remove("--replay").is_some();
     reject_unused(&flags)?;
 
     let mut cases = BTreeMap::new();
@@ -65,7 +70,7 @@ fn compare(mut flags: Args) -> Result<(), String> {
         }
     }
 
-    ScenarioCtx::initialize();
+    initialize()?;
     let cancelled = AtomicBool::new(false);
     let mut reports = BTreeMap::new();
     for (id, arm) in cases {
@@ -83,15 +88,192 @@ fn compare(mut flags: Args) -> Result<(), String> {
                 return Err(format!("{id} comparison changed after checkpoint reload"));
             }
         }
+        if replay {
+            let replayed = super::comparison::compare_builtin_repair_replayed(arm, &cancelled)
+                .map_err(|err| err.to_string())?;
+            if report != replayed {
+                return Err(format!("{id} comparison changed with command replay"));
+            }
+        }
         reports.insert(id, report);
     }
 
+    if unsupported_workers.is_empty() {
+        write_json(json, &reports)
+    } else {
+        write_json(json, &serde_json::json!({
+            "cases": reports,
+            "unsupported_workers": unsupported_workers,
+        }))
+    }
+}
+
+fn compare_staged(mut flags: Args) -> Result<(), String> {
+    let root = path(&mut flags, "--root")?;
+    let fixtures = text(&mut flags, "--fixtures")?;
+    let edit = path(&mut flags, "--edit")?;
+    let edit: WorldCommand = serde_json::from_slice(&read_member(&edit, 64 * 1024)?)
+        .map_err(|error| error.to_string())?;
+    let unsupported_workers = serial_workers(&mut flags)?;
+    let json = flags.remove("--json").flatten().map(absolute).transpose()?;
+    let twice = flags.remove("--twice").is_some();
+    let resume = flags.remove("--resume").is_some();
+    let replay = flags.remove("--replay").is_some();
+    reject_unused(&flags)?;
+    initialize()?;
+    let cancelled = AtomicBool::new(false);
+    let mut reports = BTreeMap::new();
+    for id in fixtures.split(',') {
+        let input = StagedTraffic::open(&root, id)?;
+        let report = input.compare(&edit, false, &cancelled).map_err(|err| err.to_string())?;
+        if twice || resume {
+            let repeat = input.compare(&edit, resume, &cancelled).map_err(|err| err.to_string())?;
+            if report != repeat {
+                return Err(format!("{id} comparison changed on its verification run"));
+            }
+        }
+        if replay {
+            let replayed = input.compare_replayed(&edit, &cancelled).map_err(|err| err.to_string())?;
+            if report != replayed {
+                return Err(format!("{id} comparison changed with command replay"));
+            }
+        }
+        if reports.insert(id, serde_json::json!({
+            "fingerprint": input.fingerprint,
+            "comparison": report,
+        })).is_some() {
+            return Err(format!("duplicate comparison fixture {id}"));
+        }
+    }
+    write_json(json, &serde_json::json!({
+        "cases": reports,
+        "unsupported_workers": unsupported_workers,
+    }))
+}
+
+fn soak(mut flags: Args) -> Result<(), String> {
+    let root = path(&mut flags, "--root")?;
+    let fixtures = text(&mut flags, "--fixtures")?;
+    let days = number(&mut flags, "--days")?;
+    let unsupported_workers = serial_workers(&mut flags)?;
+    let json = flags.remove("--json").flatten().map(absolute).transpose()?;
+    let twice = flags.remove("--twice").is_some();
+    let resume = flags.remove("--resume").is_some();
+    let replay = flags.remove("--replay").is_some();
+    reject_unused(&flags)?;
+    initialize()?;
+    let cancelled = AtomicBool::new(false);
+    let mut reports = BTreeMap::new();
+    let mut passed = true;
+    for id in fixtures.split(',') {
+        let input = StagedTraffic::open(&root, id)?;
+        let report = input.soak(days, false, &cancelled).map_err(|err| err.to_string())?;
+        if twice || resume || replay {
+            let repeat = if replay {
+                input.soak_replayed(days, resume, &cancelled)
+            } else {
+                input.soak(days, resume, &cancelled)
+            }.map_err(|err| err.to_string())?;
+            if report != repeat {
+                return Err(format!("{id} soak changed on its verification run"));
+            }
+        }
+        let row = serde_json::json!({
+            "gates": input.gates,
+            "passes_stationary_and_activity_gates": input.gates.passes(&report),
+            "fingerprint": input.fingerprint,
+            "traffic": report,
+            "checkpoint_reload_verified": resume,
+            "replay_verified": replay,
+        });
+        passed &= input.gates.passes(&report);
+        if reports.insert(id, row).is_some() {
+            return Err(format!("duplicate soak fixture {id}"));
+        }
+    }
+    write_json(json, &serde_json::json!({
+        "cases": reports,
+        "unsupported_workers": unsupported_workers,
+    }))?;
+    if !passed {
+        return Err("release traffic soak missed a stationary, spillback or activity gate".into());
+    }
+    Ok(())
+}
+
+fn perf(mut flags: Args) -> Result<(), String> {
+    use crate::perf_scale::{PerfCase, PerfLayout};
+    let layout_name = text(&mut flags, "--layout")?;
+    let layout = match layout_name.as_str() {
+        "compact" => PerfLayout::Compact,
+        "growing" => PerfLayout::Growing,
+        _ => return Err("--layout requires compact or growing".into()),
+    };
+    let case = PerfCase {
+        agents: number(&mut flags, "--agents")?,
+        warmup_ticks: number(&mut flags, "--warmup")?,
+        measured_ticks: number(&mut flags, "--ticks")?,
+        workers: 1,
+    };
+    let pairs = number(&mut flags, "--pairs")?;
+    let mode_list = text(&mut flags, "--modes")?;
+    let modes: std::collections::BTreeSet<_> = mode_list.split(',').collect();
+    if !modes.contains("default") || modes.iter().any(|mode| {
+        !matches!(*mode, "parent" | "default" | "observer" | "pilot")
+    }) {
+        return Err("--modes requires default and accepts parent, observer and pilot".into());
+    }
+    let unsupported_workers = serial_workers(&mut flags)?;
+    let manifest = flags.remove("--manifest").flatten().map(absolute).transpose()?;
+    let json = flags.remove("--json").flatten().map(absolute).transpose()?;
+    reject_unused(&flags)?;
+    initialize()?;
+    let report = super::perf::run(manifest.as_deref(), case, layout, &layout_name, pairs, modes.contains("parent"))?;
+    let unsupported_modes: Vec<_> = modes.into_iter().filter(|mode| matches!(*mode, "observer" | "pilot")).collect();
+    let passed = report["paired_gate_passed"].as_bool();
+    write_json(json, &serde_json::json!({
+        "report": report,
+        "unsupported_workers": unsupported_workers,
+        "unsupported_modes": unsupported_modes,
+    }))?;
+    if passed == Some(false) {
+        return Err("serial paired performance gate failed".into());
+    }
+    Ok(())
+}
+
+fn number<T: std::str::FromStr>(flags: &mut Args, flag: &str) -> Result<T, String> {
+    text(flags, flag)?.parse().map_err(|_| format!("invalid {flag}"))
+}
+
+fn serial_workers(flags: &mut Args) -> Result<Vec<usize>, String> {
+    let value = if flags.contains_key("--workers") {
+        text(flags, "--workers")?
+    } else {
+        "1".into()
+    };
+    let workers: std::collections::BTreeSet<usize> = value.split(',').map(str::parse)
+        .collect::<Result<_, _>>().map_err(|_| "invalid worker list")?;
+    if !workers.contains(&1) || workers.contains(&0) {
+        return Err("traffic repair requires including the supported worker count of 1".into());
+    }
+    Ok(workers.into_iter().filter(|&workers| workers != 1).collect())
+}
+
+fn initialize() -> Result<(), String> {
+    crate::ensure_repo_root_cwd();
+    verify_runtime_data(&std::env::current_dir().map_err(|error| error.to_string())?)?;
+    ScenarioCtx::initialize();
+    Ok(())
+}
+
+fn write_json(json: Option<PathBuf>, value: &impl Serialize) -> Result<(), String> {
     let output: Box<dyn Write> = match json {
         Some(path) => Box::new(std::fs::File::create(path).map_err(|err| err.to_string())?),
         None => Box::new(std::io::stdout().lock()),
     };
     let mut writer = BufWriter::new(output);
-    serde_json::to_writer_pretty(&mut writer, &reports).map_err(|err| err.to_string())?;
+    serde_json::to_writer_pretty(&mut writer, value).map_err(|err| err.to_string())?;
     writeln!(writer)
         .and_then(|_| writer.flush())
         .map_err(|err| err.to_string())
@@ -116,7 +298,7 @@ fn stage(mut flags: Args) -> Result<(), String> {
         None
     };
     reject_unused(&flags)?;
-    ScenarioCtx::initialize();
+    initialize()?;
     let staged = stage_published_slots(
         &manifest,
         requested,

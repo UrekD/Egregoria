@@ -659,8 +659,7 @@ fn repair_cohort_and_no_loss_preserves_physical_arrivals_and_unloads() {
 #[test]
 fn repair_cohort_matched_headless() {
     use scenarios::traffic_repair::{
-        compare_repair, prepare_repair_fixture, AbsoluteSchedule, ComparisonRequest, FixtureArm,
-        VerifiedFixtureSnapshot,
+        compare_builtin_repair, prepare_repair_fixture, FixtureArm,
     };
     use std::sync::atomic::AtomicBool;
 
@@ -668,24 +667,17 @@ fn repair_cohort_matched_headless() {
     let manifest = wave0_manifest();
     let pin = &manifest["matched_cohort"];
     let offers = physical_offers(&fixture, pin);
-    let snapshot = VerifiedFixtureSnapshot::capture(&fixture.simulation).unwrap();
-    let compared = compare_repair(
-        &snapshot,
-        &AbsoluteSchedule {
-            scheduled_offers: &fixture.schedule,
-            scoring_offers: &offers,
-            batches: &[],
-            primary_cutoff: fixture.primary_cutoff,
-            tail_cutoff: fixture.tail_cutoff,
-        },
-        ComparisonRequest {
-            repair_at: fixture.repair_at,
-            repair: &fixture.repair,
-            resume_at: None,
-            cancelled: &AtomicBool::new(false),
-        },
-    )
-    .unwrap();
+    let compared = compare_builtin_repair(FixtureArm::Repair, &AtomicBool::new(false)).unwrap();
+    // Independently score the built-in ledger against the frozen fixture pins.
+    assert_eq!(
+        compared.primary,
+        score_matched_offers(
+            &offers,
+            &compared.control.observations,
+            &compared.treatment.observations,
+            fixture.primary_cutoff,
+        ).unwrap()
+    );
     let primary = &compared.primary;
     let tail = &compared.tail;
 

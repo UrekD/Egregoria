@@ -94,6 +94,46 @@ pub struct ShipmentId(pub u64);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct LoadId(pub u64);
 
+/// Progress of an explicitly observed road reservation, including split loads.
+#[derive(Default)]
+pub struct RoadShipmentProgress {
+    pub active_loads: BTreeMap<LoadId, VehicleID>,
+    pub unloaded_units: u32,
+    pub cancelled: bool,
+}
+
+/// Optional observation data, carried separately from saves by comparison runs.
+#[derive(Default)]
+pub struct RoadFreightTracking {
+    shipments: BTreeMap<ShipmentId, RoadShipmentProgress>,
+    loads: BTreeMap<LoadId, Vec<(ShipmentId, u32)>>,
+}
+
+impl RoadFreightTracking {
+    fn loaded(&mut self, load: LoadId, vehicle: VehicleID, portions: Vec<(ShipmentId, u32)>) {
+        if !portions.is_empty() {
+            for &(shipment, _) in &portions {
+                self.shipments.get_mut(&shipment).unwrap().active_loads.insert(load, vehicle);
+            }
+            self.loads.insert(load, portions);
+        }
+    }
+
+    fn finish_load(&mut self, load: LoadId, delivered: bool) {
+        if let Some(portions) = self.loads.remove(&load) {
+            for (shipment, units) in portions {
+                let progress = self.shipments.get_mut(&shipment).unwrap();
+                progress.active_loads.remove(&load);
+                if delivered {
+                    progress.unloaded_units += units;
+                } else {
+                    progress.cancelled = true;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ItemQuantity {
     pub item: ItemID,
@@ -345,6 +385,8 @@ pub struct CargoBook {
     // Opt-in observation for acceptance scenarios. It does not affect freight or saves.
     #[serde(skip)]
     road_deadlines: Option<RoadDeadlineWindow>,
+    #[serde(skip)]
+    road_freight_tracking: RoadFreightTracking,
 }
 
 impl Default for CargoBook {
@@ -369,6 +411,7 @@ impl Default for CargoBook {
             topology_edited: false,
             no_import_route: BTreeSet::new(),
             road_deadlines: None,
+            road_freight_tracking: RoadFreightTracking::default(),
         }
     }
 }
@@ -408,6 +451,14 @@ enum Release {
 }
 
 impl CargoBook {
+    pub fn road_shipment_progress(&self, id: ShipmentId) -> Option<&RoadShipmentProgress> {
+        self.road_freight_tracking.shipments.get(&id)
+    }
+
+    pub fn swap_road_freight_tracking(&mut self, tracking: &mut RoadFreightTracking) {
+        std::mem::swap(&mut self.road_freight_tracking, tracking);
+    }
+
     fn next_token(&mut self) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -764,11 +815,12 @@ impl CargoBook {
         units
     }
 
-    fn reserve(&mut self, market: &mut Market, shipment: Shipment) {
+    fn reserve(&mut self, market: &mut Market, shipment: Shipment) -> ShipmentId {
         let id = ShipmentId(self.next_token());
         let ItemQuantity { item, units } = shipment.quantity;
         market.produce(shipment.source.soul, item, -(units as i32));
         self.shipments.insert(id, shipment);
+        id
     }
 
     /// A road route that matching may use: both ends reach the same driving
@@ -2278,6 +2330,7 @@ fn dispatch(
             }
 
             let mut items = BTreeMap::<_, u32>::new();
+            let mut observed_portions = Vec::new();
             for id in ids {
                 let shipment = book.shipments.get_mut(id).unwrap();
                 let ItemQuantity { item, units } = shipment.quantity;
@@ -2287,6 +2340,11 @@ fn dispatch(
                     continue;
                 }
                 *items.entry(item).or_default() += loaded;
+                if !book.road_freight_tracking.shipments.is_empty()
+                    && book.road_freight_tracking.shipments.contains_key(id)
+                {
+                    observed_portions.push((*id, loaded));
+                }
                 *in_transit.entry((destination, item)).or_default() += loaded;
                 take -= loaded;
                 *room -= loaded;
@@ -2304,6 +2362,7 @@ fn dispatch(
             // Allow for loading, parking and delays in addition to travel.
             let due_after = (DELIVERY_LEAD + nominal_travel).min(DELIVERY_EXPIRY);
             let load = LoadId(book.next_token());
+            book.road_freight_tracking.loaded(load, truck, observed_portions);
             book.returning.remove(&truck);
             book.loads.insert(
                 load,
@@ -2378,20 +2437,18 @@ pub fn reserve_road_freight(
     sender: BuildingID,
     receiver: BuildingID,
     quantity: ItemQuantity,
-) -> bool {
+) -> Option<ShipmentId> {
     if sender == receiver
         || !(1..=i32::MAX as u32).contains(&quantity.units)
         || prototypes::try_prototype(quantity.item).is_none()
     {
-        return false;
+        return None;
     }
     let (world, resources) = sim.world_res();
     let map = resources.read::<Map>();
     let infos = resources.read::<BuildingInfos>();
     let now = elapsed_ticks(resources).0;
-    let Some((source, destination)) = infos.owner(sender).zip(infos.owner(receiver)) else {
-        return false;
-    };
+    let (source, destination) = infos.owner(sender).zip(infos.owner(receiver))?;
     let source = Endpoint {
         soul: source,
         building: sender,
@@ -2401,7 +2458,7 @@ pub fn reserve_road_freight(
         building: receiver,
     };
     let SoulID::GoodsCompany(company) = source.soul else {
-        return false;
+        return None;
     };
     let mut book = resources.write::<CargoBook>();
     let mut market = resources.write::<Market>();
@@ -2411,9 +2468,9 @@ pub fn reserve_road_freight(
         || on_hand(&market, source, quantity.item) < quantity.units
         || !book.physical_route(&map, source, destination, now)
     {
-        return false;
+        return None;
     }
-    book.reserve(
+    let id = book.reserve(
         &mut market,
         Shipment {
             source,
@@ -2422,7 +2479,8 @@ pub fn reserve_road_freight(
             reserved_at: now,
         },
     );
-    true
+    book.road_freight_tracking.shipments.insert(id, RoadShipmentProgress::default());
+    Some(id)
 }
 
 /// Records the station side of a virtual export. The ordinary market still
@@ -2526,6 +2584,7 @@ pub fn complete_delivery(
     check_unload(world, resources, manifest, load, driver, truck, at, now)?;
 
     let manifest = book.loads.remove(&load).unwrap();
+    book.road_freight_tracking.finish_load(load, true);
     clear_assignment(world, &manifest, load);
     book.returning.insert(
         truck,
@@ -2752,10 +2811,14 @@ fn release(
     };
     for id in shipments {
         let shipment = book.shipments.remove(&id).unwrap();
+        if let Some(progress) = book.road_freight_tracking.shipments.get_mut(&id) {
+            progress.cancelled = true;
+        }
         restore(shipment.source, shipment.quantity, world);
     }
     for id in loads {
         let load = book.loads.remove(&id).unwrap();
+        book.road_freight_tracking.finish_load(id, false);
         for &quantity in &load.items {
             restore(load.source, quantity, world);
         }

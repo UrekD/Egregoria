@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-const SNAPSHOT_LIMIT: usize = 32 * 1024 * 1024;
+pub(super) const SNAPSHOT_LIMIT: usize = 32 * 1024 * 1024;
 const MAX_OFFERS: usize = 1024;
 const MAX_BATCHES: usize = 256;
 const MAX_BATCH_COMMANDS: usize = 256;
@@ -259,18 +259,28 @@ impl From<&str> for ComparisonError {
     }
 }
 
-/// Run the authored workload from independent loads of an identical checkpoint.
+/// Run a tagged workload on the normal simulation schedule from identical checkpoints.
 /// Callers initialize prototypes and the simulation registry before invoking this.
 pub fn compare_repair(
     snapshot: &VerifiedFixtureSnapshot,
     inputs: &AbsoluteSchedule<'_>,
     request: ComparisonRequest<'_>,
 ) -> Result<RepairComparison, ComparisonError> {
+    compare_scheduled(snapshot, inputs, request, false, false)
+}
+
+fn compare_scheduled(
+    snapshot: &VerifiedFixtureSnapshot,
+    inputs: &AbsoluteSchedule<'_>,
+    request: ComparisonRequest<'_>,
+    authored: bool,
+    replay: bool,
+) -> Result<RepairComparison, ComparisonError> {
     check_cancelled(request.cancelled)?;
     validate_schedule(snapshot.elapsed_tick, inputs, request)?;
-    let (control, _) = run_repair_arm(snapshot.load()?, inputs, request, false)?;
+    let (control, _) = run_repair_arm(snapshot.load()?, inputs, request, false, authored, replay)?;
     check_cancelled(request.cancelled)?;
-    let (treatment, receipt) = run_repair_arm(snapshot.load()?, inputs, request, true)?;
+    let (treatment, receipt) = run_repair_arm(snapshot.load()?, inputs, request, true, authored, replay)?;
     let receipt =
         receipt.ok_or_else(|| ComparisonError::RepairDenied("missing edit receipt".into()))?;
     let score = |cutoff| {
@@ -304,6 +314,22 @@ pub(super) fn compare_builtin_repair_resumed(
     cancelled: &AtomicBool,
     resume: bool,
 ) -> Result<RepairComparison, ComparisonError> {
+    compare_authored(arm, cancelled, resume, false)
+}
+
+pub(super) fn compare_builtin_repair_replayed(
+    arm: FixtureArm,
+    cancelled: &AtomicBool,
+) -> Result<RepairComparison, ComparisonError> {
+    compare_authored(arm, cancelled, false, true)
+}
+
+fn compare_authored(
+    arm: FixtureArm,
+    cancelled: &AtomicBool,
+    resume: bool,
+    replay: bool,
+) -> Result<RepairComparison, ComparisonError> {
     check_cancelled(cancelled)?;
     let fixture = prepare_repair_fixture_initialized(arm).map_err(ComparisonError::Setup)?;
     let snapshot = VerifiedFixtureSnapshot::capture(&fixture.simulation)?;
@@ -322,7 +348,7 @@ pub(super) fn compare_builtin_repair_resumed(
         tail_cutoff: fixture.tail_cutoff,
     };
     drop(fixture.simulation);
-    compare_repair(&snapshot, &inputs, request)
+    compare_scheduled(&snapshot, &inputs, request, true, replay)
 }
 
 pub(crate) fn check_cancelled(cancelled: &AtomicBool) -> Result<(), ComparisonError> {

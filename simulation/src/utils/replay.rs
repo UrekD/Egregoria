@@ -636,6 +636,45 @@ pub struct SimulationReplayLoader {
 }
 
 impl SimulationReplayLoader {
+    /// Build and decode a versioned command sidecar for playback from an existing
+    /// snapshot. Batch steps count completed steps since that snapshot.
+    pub fn checkpoint_playback<'a>(
+        start: Tick,
+        revision: SnapshotRevision,
+        steps: u64,
+        batches: impl IntoIterator<Item = (u64, bool, &'a [WorldCommand])>,
+    ) -> Result<Self, SaveLoadError> {
+        let mut replay = Replay {
+            enabled: true,
+            registry: prototypes::try_prototypes().map(|registry| registry.fingerprint()),
+            ..Replay::default()
+        };
+        replay.record_constructor_end(start);
+        let mut earliest = 0;
+        for (step, advances, commands) in batches {
+            if step < earliest || step > steps || (advances && step == steps) || commands.is_empty()
+            {
+                return Err(replay_corrupt(invalid_replay("Invalid checkpoint replay batch")));
+            }
+            let tick = start.0.checked_add(step)
+                .map(Tick).ok_or_else(|| replay_corrupt(invalid_replay("Replay clock overflow")))?;
+            let first = replay.command_count();
+            for command in commands {
+                replay.push(tick, command.clone());
+            }
+            replay.timeline.as_mut().unwrap().steps = step;
+            replay.record_batch(first, advances, tick);
+            earliest = step + u64::from(advances);
+        }
+        replay.timeline.as_mut().unwrap().steps = steps;
+        replay.last_tick_recorded = start.0.checked_add(steps)
+            .map(Tick).ok_or_else(|| replay_corrupt(invalid_replay("Replay clock overflow")))?;
+        let mut bytes = Vec::new();
+        ReplayJson::write_sidecar(&replay, revision, &mut bytes).map_err(replay_corrupt)?;
+        let replay = ReplayJson::decode_sidecar(&bytes, Some(revision))?;
+        Ok(Self::new(replay, start, 0))
+    }
+
     pub(crate) fn new(mut replay: Replay, pastt: Tick, idx: usize) -> Self {
         replay.commands.make_contiguous();
         let mut legacy_groups = Vec::new();

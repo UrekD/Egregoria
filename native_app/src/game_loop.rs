@@ -865,6 +865,7 @@ impl State {
     }
 
     fn pump_simulation(&mut self) {
+        gui::traffic_repair::submit_comparison_capture(&self.uiw, self.driver.as_mut());
         let Some(driver) = self.driver.as_mut() else {
             self.uiw.write::<Timings>().per_game_system = self.game_schedule.times();
             return;
@@ -908,10 +909,15 @@ impl State {
                     {
                         let capture = self.capture.take().unwrap();
                         publish_capture(capture, result);
+                    } else {
+                        gui::traffic_repair::receive_comparison_capture(
+                            &self.uiw, reply.id, result.map(|(capture, _)| capture),
+                        );
                     }
                 }
                 ReplyKind::Rejected(error) => {
                     gui::traffic_repair::reject_worker_batch(&self.uiw, reply.id, error);
+                    gui::traffic_repair::receive_comparison_capture(&self.uiw, reply.id, Err(error.into()));
                     if Some(reply.id) == self.last_batch {
                         self.batch_in_flight = false;
                         self.last_batch = self.applied_batch;

@@ -14,6 +14,10 @@ mod cli;
 pub use cli::cli;
 pub(crate) mod comparison;
 mod staging;
+mod natural;
+mod perf;
+pub use natural::{compare_captured_city, NaturalRepairComparison, NaturalTrafficReport};
+pub const COMPARISON_CAPTURE_LIMIT: usize = comparison::SNAPSHOT_LIMIT;
 pub use comparison::{
     compare_builtin_repair, compare_repair, AbsoluteSchedule, ComparisonArm,
     ComparisonBatchOutcome, ComparisonError, ComparisonReceipt, ComparisonRequest,

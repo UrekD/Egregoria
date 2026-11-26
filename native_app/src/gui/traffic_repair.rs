@@ -7,7 +7,10 @@ use goryak::{
     button_primary, button_secondary, mincolumn, minrow, on_primary_container,
     on_secondary_container, textc,
 };
-use scenarios::traffic_repair::{compare_builtin_repair, Cohort, FixtureArm, RepairComparison};
+use scenarios::traffic_repair::{
+    compare_builtin_repair, compare_captured_city, Cohort, FixtureArm, NaturalRepairComparison,
+    RepairComparison,
+};
 use simulation::map::road_edit::{
     junction_edit_stamp, preview_road_edit, road_edit_stamp, EditReceipt, JunctionEditReceipt,
     RoadEditPreview, RoadEditRequest, RoadEditStatus, RoadQuote, RoadUpgrade,
@@ -23,13 +26,13 @@ use simulation::transportation::queue_diagnostics::{
 use simulation::world_command::{
     CommandOutcomes, PrepareBudget, Rejection, WorldCommand, WorldCommands,
 };
-use simulation::Simulation;
+use simulation::{Simulation, SlotCapture};
 use slotmapd::Key;
 
 use crate::gui::{notifications::command_message, InspectedRoad};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::session::SessionState;
-use crate::sim_thread::{AppliedBatch, BatchId};
+use crate::sim_thread::{AppliedBatch, BatchId, Request, SimThread};
 use crate::uiworld::UiWorld;
 
 const PREVIEW_WORK: usize = 65_536;
@@ -301,6 +304,7 @@ pub(crate) struct TrafficRepairUi {
     sample: Option<DirectedSample>,
     watch: Option<(RoadID, LaneID)>,
     comparison: Comparison,
+    selected_comparison: SelectedComparison,
 }
 
 impl TrafficRepairUi {
@@ -308,6 +312,7 @@ impl TrafficRepairUi {
         if self.target != target {
             self.target = target;
             self.quote = None;
+            self.selected_comparison.invalidate();
             self.selected_lane = None;
             self.approach = 0;
             self.movement = 0;
@@ -322,6 +327,7 @@ impl TrafficRepairUi {
         request: Result<RoadEditRequest, Rejection>,
     ) {
         self.quote = None;
+        self.selected_comparison.invalidate();
         self.receipt = None;
         self.error = None;
         match request.and_then(|request| Quote::new(sim, request)) {
@@ -461,7 +467,15 @@ impl TrafficRepairUi {
                 }
             }
             let enabled = quote.committable() && uiw.can_author() && self.pending.is_none();
+            let mut compare_clicked = false;
             minrow(8.0, || {
+                if enabled
+                    && self.comparison.current.is_none()
+                    && !self.selected_comparison.is_running()
+                    && button_secondary("Compare quoted edit").show().clicked
+                {
+                    compare_clicked = true;
+                }
                 if enabled && button_primary("Confirm edit").show().clicked {
                     self.confirm(sim, uiw);
                 }
@@ -469,7 +483,12 @@ impl TrafficRepairUi {
                     self.quote = None;
                 }
             });
+            if compare_clicked {
+                self.selected_comparison.result = None;
+                self.selected_comparison.request = self.quote.as_ref().map(|quote| quote.command.clone());
+            }
         }
+        self.selected_comparison.render(uiw.read::<SessionState>().generation);
     }
 }
 
@@ -486,11 +505,16 @@ pub(crate) fn reset(uiw: &UiWorld, _: u64) {
     if let Some(job) = &current {
         job.cancel.store(true, Ordering::Relaxed);
     }
+    let selected = state.selected_comparison.job.take();
+    if let Some(job) = &selected {
+        job.cancel.store(true, Ordering::Relaxed);
+    }
     *state = TrafficRepairUi {
         comparison: Comparison {
             current,
             result: None,
         },
+        selected_comparison: SelectedComparison { job: selected, ..Default::default() },
         ..Default::default()
     };
 }
@@ -622,9 +646,10 @@ pub(crate) fn render_road(uiw: &UiWorld, sim: &Simulation, map: &Map, road: &Roa
             });
         }
         state.show_result(sim, uiw, target);
+        let can_start = !state.selected_comparison.is_running();
         state
             .comparison
-            .render(uiw.read::<SessionState>().generation);
+            .render(uiw.read::<SessionState>().generation, can_start);
     });
 }
 
@@ -818,9 +843,10 @@ pub(crate) fn render_junction(uiw: &UiWorld, sim: &Simulation, id: IntersectionI
             });
         }
         state.show_result(sim, uiw, target);
+        let can_start = !state.selected_comparison.is_running();
         state
             .comparison
-            .render(uiw.read::<SessionState>().generation);
+            .render(uiw.read::<SessionState>().generation, can_start);
     });
     opened
 }
@@ -1108,18 +1134,29 @@ fn draw_path(draw: &mut ImmediateDraw, points: &PolyLine3, width: f32, color: Li
 
 #[derive(Default)]
 struct Comparison {
-    current: Option<ComparisonJob>,
+    current: Option<ComparisonJob<RepairComparison>>,
     result: Option<Result<RepairComparison, String>>,
 }
 
-struct ComparisonJob {
+struct ComparisonJob<R> {
     generation: u64,
     cancel: Arc<AtomicBool>,
-    reply: mpsc::Receiver<Result<RepairComparison, String>>,
+    reply: mpsc::Receiver<Result<R, String>>,
 }
 
-impl ComparisonJob {
+impl ComparisonJob<RepairComparison> {
     fn start(generation: u64) -> std::io::Result<Self> {
+        Self::spawn(generation, |cancelled| {
+            compare_builtin_repair(FixtureArm::Repair, cancelled).map_err(|err| err.to_string())
+        })
+    }
+}
+
+impl<R: Send + 'static> ComparisonJob<R> {
+    fn spawn(
+        generation: u64,
+        evaluate: impl FnOnce(&AtomicBool) -> Result<R, String> + Send + 'static,
+    ) -> std::io::Result<Self> {
         let cancel = Arc::new(AtomicBool::new(false));
         let (sender, reply) = mpsc::sync_channel(1);
         let cancellation = Arc::clone(&cancel);
@@ -1130,10 +1167,7 @@ impl ComparisonJob {
                     .num_threads(1)
                     .build()
                     .map_err(|error| error.to_string())
-                    .and_then(|pool| {
-                        pool.install(|| compare_builtin_repair(FixtureArm::Repair, &cancellation))
-                            .map_err(|error| error.to_string())
-                    });
+                    .and_then(|pool| pool.install(|| evaluate(&cancellation)));
                 let _ = sender.send(result);
             })?;
         Ok(Self {
@@ -1144,9 +1178,112 @@ impl ComparisonJob {
     }
 }
 
-impl Drop for ComparisonJob {
+impl<R> Drop for ComparisonJob<R> {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Default)]
+struct SelectedComparison {
+    request: Option<WorldCommand>,
+    pending: Option<(BatchId, WorldCommand)>,
+    job: Option<ComparisonJob<NaturalRepairComparison>>,
+    result: Option<Result<NaturalRepairComparison, String>>,
+}
+
+impl SelectedComparison {
+    fn invalidate(&mut self) {
+        self.result = None;
+        self.request = None;
+        self.pending = None;
+        if let Some(job) = &self.job {
+            job.cancel.store(true, Ordering::Relaxed);
+        }
+    }
+
+    fn is_running(&self) -> bool {
+        self.request.is_some() || self.pending.is_some() || self.job.is_some()
+    }
+
+    fn render(&mut self, generation: u64) {
+        if let Some(job) = &self.job {
+            let result = match job.reply.try_recv() {
+                Ok(result) => Some(result),
+                Err(mpsc::TryRecvError::Empty) => None,
+                Err(mpsc::TryRecvError::Disconnected) => Some(Err("Comparison worker stopped.".into())),
+            };
+            if let Some(result) = result {
+                if job.generation == generation && !job.cancel.load(Ordering::Relaxed) {
+                    self.result = Some(result);
+                }
+                self.job = None;
+            }
+        }
+        if let Some(job) = &self.job {
+            minrow(8.0, || {
+                textc(on_secondary_container(), "Comparing the quoted edit");
+                if button_secondary("Cancel comparison").show().clicked {
+                    job.cancel.store(true, Ordering::Relaxed);
+                }
+            });
+        } else if self.is_running() {
+            textc(on_secondary_container(), "Waiting for a city snapshot");
+        }
+        match &self.result {
+            Some(Ok(report)) => {
+                textc(on_secondary_container(), format!(
+                    "Driving arrivals · {} to {}",
+                    report.control.journeys_by_mode["car"].completed,
+                    report.treatment.journeys_by_mode["car"].completed,
+                ));
+                textc(on_secondary_container(), format!(
+                    "Peak vehicles stopped for five game minutes · {} to {}",
+                    report.control.peak_stationary, report.treatment.peak_stationary,
+                ));
+            }
+            Some(Err(err)) => textc(goryak::error(), err.clone()),
+            None => {}
+        }
+    }
+}
+
+pub(crate) fn submit_comparison_capture(uiw: &UiWorld, driver: Option<&mut SimThread>) {
+    let mut state = uiw.write::<TrafficRepairUi>();
+    let selected = &mut state.selected_comparison;
+    let Some(edit) = selected.request.take() else { return };
+    let Some(driver) = driver else {
+        selected.result = Some(Err("City comparison is available in local play.".into()));
+        return;
+    };
+    let capture = Request::CaptureComparison {
+        revision: crate::session::snapshot_revision(),
+        limit: scenarios::traffic_repair::COMPARISON_CAPTURE_LIMIT,
+    };
+    match driver.submit(capture) {
+        Ok(id) => selected.pending = Some((id, edit)),
+        Err(_) => selected.result = Some(Err("The simulation could not queue a city snapshot.".into())),
+    }
+}
+
+pub(crate) fn receive_comparison_capture(
+    uiw: &UiWorld, id: BatchId, captured: Result<SlotCapture, String>,
+) {
+    let generation = uiw.read::<SessionState>().generation;
+    let mut state = uiw.write::<TrafficRepairUi>();
+    let selected = &mut state.selected_comparison;
+    if !selected.pending.as_ref().is_some_and(|(request, _)| *request == id) {
+        return;
+    }
+    let (_, edit) = selected.pending.take().unwrap();
+    if id.generation != generation {
+        return;
+    }
+    match captured.and_then(|capture| ComparisonJob::spawn(generation, move |cancelled| {
+        compare_captured_city(capture, &edit, cancelled).map_err(|err| err.to_string())
+    }).map_err(|err| err.to_string())) {
+        Ok(job) => selected.job = Some(job),
+        Err(err) => selected.result = Some(Err(err)),
     }
 }
 
@@ -1175,7 +1312,7 @@ impl Comparison {
         }
     }
 
-    fn render(&mut self, generation: u64) {
+    fn render(&mut self, generation: u64, can_start: bool) {
         self.poll(generation);
         mincolumn(4.0, || {
             textc(on_primary_container(), "Matched corridor comparison");
@@ -1193,7 +1330,7 @@ impl Comparison {
                     }
                 }
                 None => {
-                    if button_secondary("Compare built-in corridor").show().clicked {
+                    if can_start && button_secondary("Compare built-in corridor").show().clicked {
                         self.start(generation);
                     }
                 }
@@ -1292,6 +1429,37 @@ mod tests {
         assert_eq!(native, headless);
         assert!(native.primary.passes_improvement);
         assert!(native.tail.preserves_credit);
+    }
+
+    #[test]
+    fn p7_native_quoted_city_comparison_uses_worker_capture() {
+        use crate::sim_thread::ReplyKind;
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let sim = Simulation::new_authored_flat(1, 6042).unwrap();
+        let (_, edit) = test_road_upgrade(&sim);
+        let expected = sim.capture_slot(crate::session::snapshot_revision()).unwrap();
+        let uiw = UiWorld::with_defaults();
+        uiw.write::<SessionState>().generation = 7;
+        uiw.write::<TrafficRepairUi>().selected_comparison.request = Some(edit.clone());
+        let mut driver = SimThread::start(sim, Simulation::schedule(), 7, None);
+        submit_comparison_capture(&uiw, Some(&mut driver));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if let Some(reply) = driver.poll_reply() {
+                if let ReplyKind::Captured(capture) = reply.kind {
+                    receive_comparison_capture(&uiw, reply.id, capture.map(|(capture, _)| capture));
+                    break;
+                }
+            }
+            assert!(Instant::now() < deadline, "missing comparison capture");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let job = uiw.write::<TrafficRepairUi>().selected_comparison.job.take().unwrap();
+        let native = job.reply.recv_timeout(Duration::from_secs(120)).unwrap().unwrap();
+        let headless = compare_captured_city(expected, &edit, &AtomicBool::new(false)).unwrap();
+        assert_eq!(native, headless);
     }
 
     #[test]
