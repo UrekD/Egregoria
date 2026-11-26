@@ -1,6 +1,6 @@
 use goryak::{
-    dragvalue, error, fixed_spacer, mincolumn, minrow, on_secondary_container, primary,
-    selectable_label_primary, textc, ProgressBar, VertScrollSize, Window,
+    button_secondary, dragvalue, error, fixed_spacer, mincolumn, minrow, on_secondary_container,
+    primary, selectable_label_primary, textc, ProgressBar, VertScrollSize, Window,
 };
 use prototypes::{
     try_prototype, GameDuration, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID, Tick,
@@ -9,7 +9,8 @@ use simulation::diagnostics::{
     building_diagnostics, elapsed_tick, BuildingBlocker, ImportStatus, RecipeBlocker,
 };
 use simulation::economy::cargo::{
-    CargoBook, DemandKey, Endpoint, FreightRecord, FreightStage, FreightTrace,
+    CargoBook, DemandKey, Endpoint, FreightCursor, FreightPage, FreightRecord, FreightStage,
+    FreightTrace, ImportBlocker,
 };
 use simulation::economy::Market;
 use simulation::map::{
@@ -23,7 +24,7 @@ use simulation::world_command::WorldCommand;
 use simulation::{PopulationScale, Simulation, SoulID};
 use std::borrow::Cow;
 use yakui::widgets::Pad;
-use yakui::Vec2;
+use yakui::{use_state, Vec2};
 
 use crate::gui::inspect::{
     building_link, entity_link, inspect_needs, inspect_utility, inspect_warehouse,
@@ -122,7 +123,17 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                         render_freightstation(uiworld, sim, building);
                     }
                     BuildingKind::TrainStation => {}
-                    BuildingKind::ExternalTrading => {}
+                    BuildingKind::ExternalTrading => {
+                        let trace = sim.read::<FreightTrace>();
+                        render_freight_page(
+                            uiworld,
+                            sim,
+                            &trace,
+                            building.id,
+                            building.id,
+                            trace.corridor_report(building.id),
+                        );
+                    }
                 };
 
                 inspect_needs::render(sim, id, &diagnostics);
@@ -300,6 +311,7 @@ fn import_label(status: ImportStatus, now: u64) -> String {
         ImportStatus::NoRoute => {
             "No import route · no freight station with trains reaches it by road".into()
         }
+        ImportStatus::Held => "New imports are paused at the terminal".into(),
     }
 }
 
@@ -401,9 +413,7 @@ fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     let recent = trace.terminal_view(terminal);
     if !recent.rows.is_empty() {
         label("Recent freight");
-        for record in recent.rows.iter().take(6) {
-            render_freight_record(uiworld, sim, record, b.id);
-        }
+        render_freight_page(uiworld, sim, &trace, terminal, b.id, recent);
     }
 
     fixed_spacer((0.0, 10.0));
@@ -413,7 +423,11 @@ fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
             entity_link(uiworld, sim, *tid);
             match state {
                 FreightTrainState::Arriving => {
-                    label("Arriving");
+                    label(if trace.train_dispatch_held(*tid) {
+                        "Dispatch held"
+                    } else {
+                        "Arriving"
+                    });
                 }
                 FreightTrainState::Loading => {
                     label("Loading");
@@ -424,6 +438,39 @@ fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
             }
         });
     }
+}
+
+fn render_freight_page<K: Copy + Eq + 'static>(
+    uiworld: &UiWorld,
+    sim: &Simulation,
+    trace: &FreightTrace,
+    key: K,
+    site: BuildingID,
+    first: FreightPage,
+) {
+    let selection = use_state(|| None::<(K, FreightCursor)>);
+    let older = selection
+        .get()
+        .filter(|(active, _)| *active == key)
+        .and_then(|(_, cursor)| trace.continue_trace(cursor).ok());
+    let browsing = older.is_some();
+    let page = older.unwrap_or(first);
+    if page.rows.is_empty() {
+        return;
+    }
+    for record in &page.rows {
+        render_freight_record(uiworld, sim, record, site);
+    }
+    minrow(5.0, || {
+        if browsing && button_secondary("Latest").show().clicked {
+            selection.set(None);
+        }
+        if let Some(cursor) = page.next {
+            if button_secondary("Older freight").show().clicked {
+                selection.set(Some((key, cursor)));
+            }
+        }
+    });
 }
 
 fn render_freight_record(
@@ -456,6 +503,9 @@ fn render_freight_record(
             building_link(uiworld, sim, record.terminal.building);
         }
         if let Some(call) = record.fragment.call {
+            if call.outside_gate != site {
+                building_link(uiworld, sim, call.outside_gate);
+            }
             entity_link(uiworld, sim, call.train);
         }
         if let Some(truck) = record.truck {
@@ -520,25 +570,56 @@ fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     if let Some(ref r) = proto.recipe {
         render_recipe(uiworld, r);
         let trace = sim.read::<FreightTrace>();
-        let mut rows = r
-            .consumption
-            .iter()
-            .flat_map(|input| {
-                trace
-                    .trace_demand(DemandKey {
-                        owner: c_id,
-                        building: b.id,
-                        item: input.id,
-                    })
-                    .rows
-            })
-            .take(6)
-            .peekable();
-        if rows.peek().is_some() {
-            label("Supply chain");
-            for record in rows {
-                render_freight_record(uiworld, sim, &record, b.id);
+        let cargo = sim.read::<CargoBook>();
+        for input in &r.consumption {
+            let key = DemandKey {
+                owner: c_id,
+                building: b.id,
+                item: input.id,
+            };
+            let Some(demand) = cargo.freight_demand(sim, key) else {
+                continue;
+            };
+            let page = trace.trace_demand(key);
+            if demand.on_hand >= demand.batch_need
+                && demand.ordered == 0
+                && demand.on_trucks == 0
+                && page.rows.is_empty()
+            {
+                continue;
             }
+            label(format!(
+                "{} · {} on hand · {} needed per batch · restock target {}",
+                input.id.prototype().label,
+                demand.on_hand,
+                demand.batch_need,
+                demand.target,
+            ));
+            label(format!(
+                "{} on order · {} on trucks · {} at serving terminals",
+                demand.ordered, demand.on_trucks, demand.terminal_stock,
+            ));
+            if let Some(blocker) = demand.blocker {
+                let (message, terminal) = match blocker {
+                    ImportBlocker::NoRoute => ("No import route", None),
+                    ImportBlocker::AdmissionHeld(terminal) => {
+                        ("New imports paused", Some(terminal))
+                    }
+                    ImportBlocker::RailDispatchHeld(terminal) => {
+                        ("Train dispatch held", Some(terminal))
+                    }
+                    ImportBlocker::TruckDispatchHeld(terminal) => {
+                        ("Truck dispatch held", Some(terminal))
+                    }
+                };
+                minrow(5.0, || {
+                    label(message);
+                    if let Some(terminal) = terminal {
+                        building_link(uiworld, sim, terminal.building);
+                    }
+                });
+            }
+            render_freight_page(uiworld, sim, &trace, key, b.id, page);
         }
     }
 

@@ -132,6 +132,28 @@ impl Dispatcher {
         disp.unregister(id);
     }
 
+    pub(crate) fn has_available(&self, kind: DispatchKind) -> bool {
+        self.dispatches.get(&kind).is_some_and(|dispatch| {
+            dispatch
+                .positions
+                .keys()
+                .any(|id| !dispatch.reserved_by.contains(id))
+        })
+    }
+
+    pub(crate) fn query_where(
+        &mut self,
+        map: &Map,
+        kind: DispatchKind,
+        target: DispatchQueryTarget,
+        eligible: impl Fn(DispatchID) -> bool,
+    ) -> Option<DispatchID> {
+        let disp = self.dispatches.get_mut(&kind)?;
+        let best_ent = disp.query_where(map, kind, target, eligible)?;
+        disp.reserve(best_ent);
+        Some(best_ent)
+    }
+
     /// Reserves an entity that is closest to the target (if it is found) and returns it
     /// it takes `me` as an argument so that if `me` is killed, the reservation is cancelled
     /// If no entity is found, returns None
@@ -141,10 +163,7 @@ impl Dispatcher {
         kind: DispatchKind,
         target: DispatchQueryTarget,
     ) -> Option<DispatchID> {
-        let disp = self.dispatches.get_mut(&kind)?;
-        let best_ent = disp.query(map, kind, target)?;
-        disp.reserve(best_ent);
-        Some(best_ent)
+        self.query_where(map, kind, target, |_| true)
     }
 }
 
@@ -227,11 +246,22 @@ impl DispatchOne {
 
     /// Finds an entity that is closest to the target and returns it
     /// If no entity is found, returns None
-    pub fn query(
-        &mut self,
+    #[cfg(test)]
+    fn query(
+        &self,
         map: &Map,
         kind: DispatchKind,
         target: DispatchQueryTarget,
+    ) -> Option<DispatchID> {
+        self.query_where(map, kind, target, |_| true)
+    }
+
+    fn query_where(
+        &self,
+        map: &Map,
+        kind: DispatchKind,
+        target: DispatchQueryTarget,
+        eligible: impl Fn(DispatchID) -> bool,
     ) -> Option<DispatchID> {
         // todo: handle the case where there are few entities in the cache
         // todo: probably some kind of astar on good candidates
@@ -276,7 +306,7 @@ impl DispatchOne {
                 continue;
             };
             for ent in ents {
-                if self.reserved_by.contains(ent) {
+                if self.reserved_by.contains(ent) || !eligible(*ent) {
                     continue;
                 }
                 let pos = self.positions.get(ent).unwrap();

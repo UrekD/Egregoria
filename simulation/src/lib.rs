@@ -2018,6 +2018,12 @@ impl SimulationDeser {
         sim.read::<economy::cargo::FreightTrace>()
             .validate_ownership(&sim.read::<economy::cargo::CargoBook>(), &sim.world)
             .map_err(|message| corrupt(message.into()))?;
+        sim.write::<economy::cargo::FreightTrace>()
+            .restore_export_space(&sim.read::<economy::cargo::CargoBook>(), &sim.world)
+            .map_err(|message| corrupt(message.into()))?;
+        let measured_rail = sim.read::<economy::cargo::FreightTrace>().measured_rail;
+        transportation::train::restore_train_occupancy(&mut sim, measured_rail)
+            .map_err(|reason| corrupt(reason.into()))?;
         crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
         sim.map_mut()
             .rebuild_land_frontage()

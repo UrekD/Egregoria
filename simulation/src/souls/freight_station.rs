@@ -14,6 +14,7 @@ use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{
     BuildingInfos, DispatchID, DispatchKind, DispatchQueryTarget, Dispatcher, Itinerary,
 };
+use crate::transportation::train::{rear_clear_of_turns, TrainReservations};
 use crate::utils::resources::Resources;
 use crate::world::{FreightStationEnt, FreightStationID, TrainEnt, TrainID};
 use crate::World;
@@ -30,6 +31,7 @@ pub enum FreightTrainState {
 }
 
 const MAX_TRAINS_PER_STATION: usize = 2;
+const MAX_DISPATCH_PROBES_PER_TICK: usize = 8;
 /// Train loading is agent movement: one real second, in game seconds.
 const LOADING_TICKS: u64 = TICKS_PER_REALTIME_SECOND;
 
@@ -100,13 +102,18 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
     let mut dispatch = resources.write::<Dispatcher>();
     let mut cargo = resources.write::<CargoBook>();
     let mut trace = resources.write::<FreightTrace>();
+    let mut reservations = resources.write::<TrainReservations>();
     let map = resources.read::<Map>();
     let time = resources.read::<GameTime>();
     let tick = time.tick;
     let now = elapsed_ticks(resources).0;
     trace.age(now);
 
-    for (me, entity) in world.freight_stations.iter_mut() {
+    let mut terminals: Vec<_> = world.freight_stations.keys().collect();
+    terminals.sort_unstable();
+    let mut probes = 0;
+    for me in terminals {
+        let entity = &mut world.freight_stations[me];
         let station = &mut entity.f;
         if !map.buildings.contains_key(station.building) {
             cbuf.kill(me);
@@ -162,8 +169,23 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
                 call.departure_recorded = true;
             }
 
-            let limited = !call.departed && call.leg == RailLeg::Inbound && !trace.may_start(&call);
-            if !limited && now.saturating_sub(call.last_motion) >= TICKS_PER_HOUR {
+            // A hold belongs at a safe stopping point. Legacy calls may already
+            // have a rear on a turnout when their inbound approach begins.
+            if call.leg == RailLeg::Inbound && !rear_clear_of_turns(&train.res) {
+                call.leg = RailLeg::InboundStarted;
+            }
+            let limited = trace.held(&call);
+            if limited {
+                call.last_motion = now;
+                crate::transportation::train::release_train_grants(
+                    *id,
+                    &mut train.res,
+                    &mut reservations,
+                );
+            }
+            let clearing_exit =
+                call.leg == RailLeg::Outbound && call.reached && !rear_clear_of_turns(&train.res);
+            if !clearing_exit && now.saturating_sub(call.last_motion) >= TICKS_PER_HOUR {
                 cargo.close_call(
                     &mut trace,
                     call,
@@ -181,7 +203,9 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
             match disposition {
                 CallDisposition::Active => {
                     *state = match call.leg {
-                        RailLeg::Positioning | RailLeg::Inbound => FreightTrainState::Arriving,
+                        RailLeg::Positioning | RailLeg::Inbound | RailLeg::InboundStarted => {
+                            FreightTrainState::Arriving
+                        }
                         RailLeg::Loading { .. } => FreightTrainState::Loading,
                         RailLeg::Outbound => FreightTrainState::Moving,
                     };
@@ -203,45 +227,63 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
         {
             continue;
         }
-        let Some(berth) = RailAnchor::near(&map, train_stop(&entity.trans)) else {
+        if probes >= MAX_DISPATCH_PROBES_PER_TICK
+            || !trace.dispatch_retry_due(terminal, now)
+            || !dispatch.has_available(DispatchKind::FreightTrain)
+        {
+            continue;
+        }
+        let stop = train_stop(&entity.trans);
+        let (gates, cached) = cargo.rail_dispatch_gates(&map, station.building, stop);
+        probes += usize::from(!cached || !gates.is_empty());
+        if gates.is_empty() {
+            continue;
+        }
+        let Some(berth) = RailAnchor::near(&map, stop) else {
             continue;
         };
-        let Some((outside, gate, gate_departure)) =
-            map.external_train_stations.iter().find_map(|&id| {
-                let building = map.get(id)?;
-                let anchor = RailAnchor::near(&map, building.obb.center().z(building.height))?;
-                berth.route(tick, &map, anchor.position, anchor.lane)?;
-                anchor.route(tick, &map, berth.position, berth.lane)?;
-                Some((id, anchor, anchor.departure_point(&map)?))
-            })
-        else {
-            continue;
-        };
-        let Some(DispatchID::FreightTrain(id)) = dispatch.query(
+        let Some(DispatchID::FreightTrain(id)) = dispatch.query_where(
             &map,
             DispatchKind::FreightTrain,
             DispatchQueryTarget::Pos(berth.position),
+            |id| match id {
+                DispatchID::FreightTrain(id) => world.trains.get(id).is_some_and(|train| {
+                    gates
+                        .iter()
+                        .any(|gate| gate.for_train(&map, train.locomotive.length).is_some())
+                }),
+                _ => false,
+            },
         ) else {
+            trace.defer_dispatch(terminal, now + LOADING_TICKS);
             continue;
         };
         let Some(train) = world.trains.get_mut(id) else {
             dispatch.free(id);
+            trace.defer_dispatch(terminal, now + LOADING_TICKS);
             continue;
         };
         let Some(lane) = train_lane(&map, train) else {
             dispatch.free(id);
+            trace.defer_dispatch(terminal, now + LOADING_TICKS);
             continue;
         };
-        let (target, leg) = if lane == gate.lane
-            && train.trans.pos.distance(gate.position) <= 40.0
-            && gate_departure.before(train.trans.pos)
-        {
-            (berth, RailLeg::Inbound)
-        } else {
-            (gate, RailLeg::Positioning)
-        };
-        let Some(route) = target.route(tick, &map, train.trans.pos, lane) else {
+        let Some((outside, gate, gate_departure, route, leg)) = gates.iter().find_map(|gate| {
+            let (clearance, departure) = gate.for_train(&map, train.locomotive.length)?;
+            let (target, leg) = if lane == gate.gate.lane
+                && train.trans.pos.distance(clearance.position) <= 40.0
+                && departure.before(train.trans.pos)
+                && rear_clear_of_turns(&train.res)
+            {
+                (berth, RailLeg::Inbound)
+            } else {
+                (clearance, RailLeg::Positioning)
+            };
+            let route = target.route(tick, &map, train.trans.pos, lane)?;
+            Some((gate.outside, gate.gate, departure, route, leg))
+        }) else {
             dispatch.free(id);
+            trace.defer_dispatch(terminal, now + LOADING_TICKS);
             continue;
         };
         let mut call = CallManifest {
@@ -256,7 +298,9 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
             berth,
             leg,
             departed: false,
-            reached: false,
+            reached: leg == RailLeg::Positioning
+                && lane == gate.lane
+                && !gate.before(train.trans.pos),
             departure_recorded: false,
             retry_at: now + LOADING_TICKS,
             last_motion: now,
@@ -268,9 +312,11 @@ pub fn freight_station_system(world: &mut World, resources: &mut Resources) {
         trace.reserve_exports(&mut call, station.waiting_cargo);
         if call.imports.is_empty() && call.exports.is_empty() {
             dispatch.free(id);
+            trace.defer_dispatch(terminal, now + LOADING_TICKS);
             continue;
         }
         train.it = route;
+        train.speed.0 = 0.0;
         trace.calls.insert(id, call);
         station.trains.push((id, FreightTrainState::Arriving));
     }
@@ -294,15 +340,22 @@ fn advance_call(
     limited: bool,
 ) -> CallDisposition {
     let ended = train.it.has_ended(0.0);
+    let clearance = call.gate.clearance(map, train.locomotive.length);
     match call.leg {
-        RailLeg::Positioning if call.reached && ended => {
+        RailLeg::Positioning
+            if call.reached
+                && ended
+                && rear_clear_of_turns(&train.res)
+                && clearance.is_some_and(|anchor| anchor.at(train.trans.pos)) =>
+        {
             if let Some(route) = call.berth.route(tick, map, train.trans.pos, call.gate.lane) {
                 call.leg = RailLeg::Inbound;
                 call.reached = false;
                 train.it = route;
+                train.speed.0 = 0.0;
             }
         }
-        RailLeg::Inbound if call.reached && call.departed && ended => {
+        RailLeg::Inbound | RailLeg::InboundStarted if call.reached && call.departed && ended => {
             station.wanted_cargo = cargo.receive_call(trace, call, now);
             station.waiting_cargo -= trace.load_exports(call, now);
             call.leg = RailLeg::Loading {
@@ -314,7 +367,9 @@ fn advance_call(
         }
         RailLeg::Loading { until } if now >= until && now >= call.retry_at => {
             call.retry_at = now + LOADING_TICKS;
-            if let Some(route) = call.gate.route(tick, map, train.trans.pos, call.berth.lane) {
+            if let Some(route) =
+                clearance.and_then(|end| end.route(tick, map, train.trans.pos, call.berth.lane))
+            {
                 call.leg = RailLeg::Outbound;
                 call.departed = false;
                 call.departure_recorded = false;
@@ -322,16 +377,12 @@ fn advance_call(
             }
         }
         RailLeg::Outbound
-            if call.reached
-                && call.departed
-                && ended
-                && crate::transportation::train::rear_clear_of_turns(&train.res) =>
+            if call.reached && call.departed && ended && rear_clear_of_turns(&train.res) =>
         {
             return CallDisposition::Exited;
         }
-        RailLeg::Positioning | RailLeg::Inbound | RailLeg::Outbound
+        RailLeg::Positioning | RailLeg::Inbound | RailLeg::InboundStarted | RailLeg::Outbound
             if !limited
-                && !call.reached
                 && now >= call.retry_at
                 && (ended
                     || train.it.is_wait_for_reroute().is_some()
@@ -341,14 +392,15 @@ fn advance_call(
                         .is_some_and(|traversal| traversal.raw_points(map).is_none())) =>
         {
             call.retry_at = now + LOADING_TICKS;
-            let target = if call.leg == RailLeg::Inbound {
-                call.berth
+            let target = if call.leg.inbound() {
+                Some(call.berth)
             } else {
-                call.gate
+                clearance
             };
-            if let Some(route) = train_lane(map, train)
-                .and_then(|lane| target.route(tick, map, train.trans.pos, lane))
-            {
+            if let Some(route) = target.and_then(|target| {
+                train_lane(map, train)
+                    .and_then(|lane| target.route(tick, map, train.trans.pos, lane))
+            }) {
                 train.it = route;
             }
         }

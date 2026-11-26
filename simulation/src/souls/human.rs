@@ -224,8 +224,18 @@ impl HumanDecisionKind {
                         return true;
                     };
                     cbuf_freight.exec_ent(fid, move |e| {
-                        if let Some(f) = e.world.freight_stations.get_mut(fid) {
-                            f.f.accept_export(1);
+                        let (world, resources) = e.world_res();
+                        if let Some(f) = world.freight_stations.get_mut(fid) {
+                            let terminal = crate::economy::cargo::Endpoint {
+                                soul: SoulID::FreightStation(fid),
+                                building: bid,
+                            };
+                            if resources
+                                .read::<crate::economy::cargo::FreightTrace>()
+                                .export_units_fit(terminal, f.f.waiting_cargo, 1)
+                            {
+                                f.f.accept_export(1);
+                            }
                         }
                     });
                 }

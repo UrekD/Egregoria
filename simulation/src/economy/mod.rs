@@ -191,25 +191,39 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
         components.labels.clear();
         components.generation = map.walking_topology_generation;
     }
-    let freight_policy = resources.read::<cargo::FreightTrace>();
+    let mut freight_policy = resources.write::<cargo::FreightTrace>();
     let mut buyer_lanes = BTreeMap::new();
     let mut seller_lanes = BTreeMap::new();
     trades.extend_from_slice(m.make_trades_filtered(
-        |pos| {
-            freights
+        |pos, units| {
+            let station = freights
                 .iter()
                 .filter_map(|(id, freight)| {
                     let building = map.get(freight.f.building)?;
+                    let terminal = cargo::Endpoint {
+                        soul: SoulID::FreightStation(id),
+                        building: building.id,
+                    };
                     (matches!(building.kind, BuildingKind::RailFreightStation(_))
-                        && infos.owner(building.id) == Some(SoulID::FreightStation(id))
-                        && freight_policy.admit_export(cargo::Endpoint {
-                            soul: SoulID::FreightStation(id),
-                            building: building.id,
-                        }))
+                        && infos.owner(building.id) == Some(terminal.soul)
+                        && freight_policy.admit_export(terminal)
+                        && freight_policy.export_units_fit(
+                            terminal,
+                            freight.f.waiting_cargo,
+                            u64::from(units),
+                        ))
                     .then_some((OrderedFloat(building.door_pos.xy().distance2(pos)), id))
                 })
                 .min()
-                .map(|(_, id)| SoulID::FreightStation(id))
+                .map(|(_, id)| id)?;
+            let freight = &freights[station].f;
+            let terminal = cargo::Endpoint {
+                soul: SoulID::FreightStation(station),
+                building: freight.building,
+            };
+            freight_policy
+                .reserve_export_space(terminal, freight.waiting_cargo, u64::from(units), 1)
+                .then_some(terminal.soul)
         },
         |buyer, seller| {
             let SoulID::Human(buyer) = buyer else {

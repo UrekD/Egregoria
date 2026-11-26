@@ -89,6 +89,12 @@ enum Interruption {
 }
 
 fn freight_fixture() -> (Simulation, FreightStationID, Vec3, Vec3) {
+    freight_fixture_with_wagons(consist())
+}
+
+fn freight_fixture_with_wagons(
+    wagons: Vec<RollingStockID>,
+) -> (Simulation, FreightStationID, Vec3, Vec3) {
     initialize();
     let mut sim = Simulation::new_with_options(SimulationOptions {
         save_replay: false,
@@ -121,11 +127,7 @@ fn freight_fixture() -> (Simulation, FreightStationID, Vec3, Vec3) {
             .unwrap();
         (outside, lane.id, lane.points.length() / 2.0)
     };
-    sim.apply_commands([&WorldCommand::SpawnTrain {
-        wagons: consist(),
-        lane,
-        dist,
-    }]);
+    sim.apply_commands([&WorldCommand::SpawnTrain { wagons, lane, dist }]);
     assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
 
     // Stage a fixed accepted export backlog and let the stock dispatcher assign
@@ -423,4 +425,380 @@ fn p8_freight_terminal_policy_holds_accepted_exports_across_reload() {
         }
     }
     panic!("reopened terminal did not move the accepted shipment");
+}
+
+#[test]
+fn p8_paused_train_footprint_is_restored_before_spawn() {
+    use common::saveload::{Bincode, Encoder};
+
+    let (sim, _, _, _) = freight_fixture();
+    let train = sim.world().trains.values().next().unwrap();
+    let pos = train.trans.pos;
+    let (lane, offset) = {
+        let map = sim.map();
+        let lane = map.nearest_lane(pos, LaneKind::Rail, None).unwrap();
+        let points = &map.get(lane).unwrap().points;
+        (lane, points.length_at_proj(points.project(pos)))
+    };
+    // P6 did not publish a lane claim until the first movement update.
+    sim.write::<TrainReservations>().localisations.clear();
+    let mut restored: Simulation = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+    restored.apply_commands([&WorldCommand::SpawnTrain {
+        wagons: consist(),
+        lane,
+        dist: offset,
+    }]);
+    assert_eq!(restored.world().trains.len(), 1);
+    assert!(restored.read::<CommandOutcomes>().accepted.is_empty());
+}
+
+#[test]
+fn p8_snapshot_rejects_export_reservation_above_station_stock() {
+    use common::saveload::{Bincode, Encoder};
+
+    let (mut sim, station, _, _) = freight_fixture();
+    sim.tick(&mut Simulation::schedule(), &[]);
+    let terminal = &mut sim.world_mut_unchecked().freight_stations[station].f;
+    assert_eq!(terminal.trains.len(), 1);
+    terminal.waiting_cargo = 19;
+    let error = Bincode::decode::<Simulation>(&Bincode::encode(&sim).unwrap()).err();
+    assert!(
+        error.is_some(),
+        "accepted a reservation exceeding the station balance"
+    );
+}
+
+#[test]
+fn p8_lowering_dispatch_cap_keeps_a_moving_approach_admitted() {
+    use simulation::economy::cargo::{Endpoint, FreightStage, FreightTerminalPolicy, FreightTrace};
+    use simulation::SoulID;
+
+    let (mut sim, station, berth, _) = freight_fixture();
+    let terminal = Endpoint {
+        soul: SoulID::FreightStation(station),
+        building: sim.world().freight_stations[station].f.building,
+    };
+    let id = sim.world().trains.keys().next().unwrap();
+    let mut schedule = Simulation::schedule();
+    for _ in 0..12_000 {
+        sim.tick(&mut schedule, &[]);
+        let train = &sim.world().trains[id];
+        if train.speed.0 > 0.0
+            && train
+                .it
+                .get_route()
+                .is_some_and(|route| route.end_pos.distance(berth) < 15.0)
+            && !sim
+                .read::<FreightTrace>()
+                .terminal_view(terminal)
+                .rows
+                .iter()
+                .any(|row| row.stage == FreightStage::InboundRail)
+        {
+            let before = train.trans.pos;
+            sim.apply_commands([&WorldCommand::SetFreightTerminalPolicy {
+                terminal,
+                expected_policy_revision: 0,
+                policy: FreightTerminalPolicy {
+                    max_calls: 0,
+                    ..FreightTerminalPolicy::default()
+                },
+            }]);
+            sim.tick(&mut schedule, &[]);
+            assert_ne!(
+                sim.world().trains[id].trans.pos,
+                before,
+                "cap froze a moving train"
+            );
+            return;
+        }
+    }
+    panic!("did not find a moving inbound approach");
+}
+
+#[test]
+fn p8_held_assignment_does_not_age_while_waiting_to_move() {
+    use prototypes::{GameTime, TICKS_PER_HOUR};
+    use simulation::economy::cargo::{Endpoint, FreightStage, FreightTerminalPolicy, FreightTrace};
+    use simulation::souls::freight_station::freight_station_system;
+    use simulation::SoulID;
+
+    let (mut sim, station, berth, _) = freight_fixture();
+    let terminal = Endpoint {
+        soul: SoulID::FreightStation(station),
+        building: sim.world().freight_stations[station].f.building,
+    };
+    let id = sim.world().trains.keys().next().unwrap();
+    let mut schedule = Simulation::schedule();
+    for _ in 0..12_000 {
+        sim.tick(&mut schedule, &[]);
+        if sim.world().trains[id]
+            .it
+            .get_route()
+            .is_some_and(|route| route.end_pos.distance(berth) < 15.0)
+        {
+            let open = FreightTerminalPolicy::default();
+            let set_cap = |sim: &mut Simulation, expected_policy_revision, max_calls| {
+                sim.apply_commands([&WorldCommand::SetFreightTerminalPolicy {
+                    terminal,
+                    expected_policy_revision,
+                    policy: FreightTerminalPolicy { max_calls, ..open },
+                }]);
+            };
+            let before = sim.world().trains[id].trans.pos;
+            set_cap(&mut sim, 0, 0);
+            sim.tick(&mut schedule, &[]);
+            assert_eq!(sim.world().trains[id].trans.pos, before);
+            let later = prototypes::Tick(sim.read::<GameTime>().tick.0 + TICKS_PER_HOUR + 5);
+            *sim.write::<GameTime>() = GameTime::new(later);
+            let (world, resources) = sim.unrestricted_world_res().unwrap();
+            train_reservations_update(world, resources);
+            {
+                let claims = resources.read::<TrainReservations>();
+                assert!(
+                    claims.reservations.iter().all(|(&junction, &owner)| {
+                        owner != id
+                            || claims.localisations.iter().any(|(kind, occupants)| {
+                                matches!(kind, TraverseKind::Turn(turn) if turn.parent == junction)
+                                    && occupants.contains_key(&id)
+                            })
+                    }),
+                    "a held train reserved a junction it did not occupy"
+                );
+            }
+            freight_station_system(world, resources);
+            assert_eq!(world.trains[id].trans.pos, before);
+            // Keep the dispatcher from immediately creating a replacement
+            // call if the accepted call is incorrectly expired on reopening.
+            sim.write::<simulation::map_dynamic::Dispatcher>()
+                .unregister(simulation::map_dynamic::DispatchID::FreightTrain(id));
+            set_cap(&mut sim, 1, 1);
+            let (world, resources) = sim.unrestricted_world_res().unwrap();
+            // No movement between opening and the station phase, as when
+            // competing traffic still owns the next junction.
+            freight_station_system(world, resources);
+            assert!(world.freight_stations[station]
+                .f
+                .trains
+                .iter()
+                .any(|&(train, _)| train == id));
+            assert!(
+                world.trains[id]
+                    .it
+                    .get_route()
+                    .is_some_and(|route| route.end_pos.distance(berth) < 15.0),
+                "reopening lost the accepted inbound route"
+            );
+            assert!(resources
+                .read::<FreightTrace>()
+                .terminal_view(terminal)
+                .rows
+                .iter()
+                .all(|row| row.stage != FreightStage::WrittenOff));
+            return;
+        }
+    }
+    panic!("the positioning leg did not reach the gate");
+}
+
+#[test]
+fn p8_freight_long_consist_clears_the_gate_turnout() {
+    use simulation::economy::cargo::{Endpoint, FreightStage, FreightTrace};
+    use simulation::SoulID;
+
+    let wagons = std::iter::once(RollingStockID::new("locomotive"))
+        .chain(std::iter::repeat_n(RollingStockID::new("freight-wagon"), 5))
+        .collect();
+    let (mut sim, station, _, outside) = freight_fixture_with_wagons(wagons);
+    let id = sim.world().trains.keys().next().unwrap();
+    let terminal = Endpoint {
+        soul: SoulID::FreightStation(station),
+        building: sim.world().freight_stations[station].f.building,
+    };
+    let (lane, gate_offset) = {
+        let map = sim.map();
+        let id = map.nearest_lane(outside, LaneKind::Rail, None).unwrap();
+        let track = &map.get(id).unwrap().points;
+        (id, track.length_at_proj(track.project(outside)))
+    };
+    let length = sim.world().trains[id].locomotive.length;
+    assert!(
+        gate_offset < length,
+        "test gate must be too close to the approach turnout"
+    );
+
+    let mut schedule = Simulation::schedule();
+    for _ in 0..24_000 {
+        sim.tick(&mut schedule, &[]);
+        let trace = sim.read::<FreightTrace>();
+        let page = trace.terminal_view(terminal);
+        assert!(
+            page.rows
+                .iter()
+                .all(|row| row.stage != FreightStage::WrittenOff),
+            "the accepted export was written off"
+        );
+        if let Some(exit) = page
+            .rows
+            .iter()
+            .find(|row| row.stage == FreightStage::Exited)
+        {
+            assert_eq!(exit.fragment.units, 20);
+            let pos = sim.world().trains[id].trans.pos;
+            let map = sim.map();
+            let track = &map.get(lane).unwrap().points;
+            assert!(track.length_at_proj(track.project(pos)) >= length);
+            assert!(sim
+                .read::<TrainReservations>()
+                .localisations
+                .iter()
+                .all(|(kind, owners)| kind.is_lane() || !owners.contains_key(&id)));
+            return;
+        }
+    }
+    panic!("the loaded train never cleared the outside gate");
+}
+
+#[test]
+fn p8_default_market_export_fiscal_fence() {
+    use geom::{vec2, OBB};
+    use prototypes::{BuildingGen, GoodsCompanyID, ItemID};
+    use simulation::economy::Market;
+    use simulation::map::Map;
+    use simulation::map_dynamic::BuildingInfos;
+    use simulation::souls::goods_company::company_soul;
+
+    let (mut sim, station, _, _) = freight_fixture();
+    sim.world_mut_unchecked().freight_stations[station]
+        .f
+        .waiting_cargo = 0;
+    let door = vec2(1000.0, 1000.0);
+    let proto = GoodsCompanyID::new("small-depot");
+    let building = sim
+        .write::<Map>()
+        .build_special_building(
+            &OBB::new(door, geom::Vec2::X, 10.0, 10.0),
+            BuildingKind::GoodsCompany(proto),
+            BuildingGen::NoWalkway { door_pos: door },
+            None,
+            None,
+        )
+        .unwrap();
+    sim.write::<BuildingInfos>().insert(building);
+    let seller = company_soul(&mut sim, building, proto).unwrap();
+    let coal = ItemID::new("coal");
+    let mut schedule = Simulation::schedule();
+    let start = sim.get_tick();
+    let initial_budget = sim.read::<Budget>().total(BudgetCategory::TradeExport);
+    let mut evidence = Vec::new();
+    for quantity in [3, 4, 2] {
+        {
+            let mut market = sim.write::<Market>();
+            market.produce(seller, coal, quantity as i32);
+            market.sell(seller, door, coal, quantity, 0);
+        }
+        assert_eq!(sim.read::<Market>().capital(seller, coal), quantity as i32);
+        sim.tick(&mut schedule, &[]);
+        let stock = sim.world().freight_stations[station].f.waiting_cargo;
+        let posted = sim.read::<Budget>().total(BudgetCategory::TradeExport) - initial_budget;
+        evidence.push((sim.get_tick() - start, stock, posted));
+        assert_eq!(sim.read::<Market>().capital(seller, coal), 0);
+        sim.tick(&mut schedule, &[]);
+        assert_eq!(
+            sim.read::<Budget>().total(BudgetCategory::TradeExport) - initial_budget,
+            posted
+        );
+    }
+    eprintln!("default export fence {evidence:?}");
+    assert_eq!(evidence, [(1, 3, 31_311), (3, 7, 73_059), (5, 9, 93_933)]);
+}
+
+#[test]
+fn p8_snapshot_rejects_duplicate_train_assignment() {
+    use common::saveload::{Bincode, Encoder};
+
+    let (mut sim, station, _, _) = freight_fixture();
+    sim.tick(&mut Simulation::schedule(), &[]);
+    let assigned = &mut sim.world_mut_unchecked().freight_stations[station].f.trains;
+    assigned.push(assigned[0]);
+    let error = Bincode::decode::<Simulation>(&Bincode::encode(&sim).unwrap())
+        .err()
+        .unwrap();
+    assert!(error
+        .to_string()
+        .contains("duplicate freight train assignment"));
+}
+
+#[test]
+fn p8_market_batch_preserves_export_capacity_and_reload() {
+    use common::saveload::{Bincode, Encoder};
+    use geom::{vec2, Vec2, OBB};
+    use prototypes::{BuildingGen, FreightStationPrototypeID, ItemID};
+    use simulation::economy::cargo::{Endpoint, FreightTerminalPolicy};
+    use simulation::economy::{market_update, Market};
+    use simulation::map::Map;
+    use simulation::map_dynamic::BuildingInfos;
+    use simulation::SoulID;
+
+    const BATCH: u32 = 65_537;
+    initialize();
+    let mut sim = Simulation::new_authored_flat(8, 0).unwrap();
+    let proto = FreightStationPrototypeID::new("freight-station");
+    let pos = vec2(250.0, 250.0);
+    let building = sim
+        .write::<Map>()
+        .build_special_building(
+            &OBB::new(pos, Vec2::X, 10.0, 10.0),
+            BuildingKind::RailFreightStation(proto),
+            BuildingGen::NoWalkway { door_pos: pos },
+            None,
+            None,
+        )
+        .unwrap();
+    sim.write::<BuildingInfos>().insert(building);
+    let station = freight_station_soul(&mut sim, building, proto).unwrap();
+    sim.apply_commands([&WorldCommand::SetFreightTerminalPolicy {
+        terminal: Endpoint {
+            soul: SoulID::FreightStation(station),
+            building,
+        },
+        expected_policy_revision: 0,
+        policy: FreightTerminalPolicy {
+            max_calls: 0,
+            ..FreightTerminalPolicy::default()
+        },
+    }]);
+
+    // Synthetic sellers isolate one market batch from production and transport.
+    let mut sellers = slotmapd::SlotMap::<simulation::HumanID, ()>::with_key();
+    let item = ItemID::new("coal");
+    {
+        let mut market = sim.write::<Market>();
+        for _ in 0..BATCH {
+            let seller = SoulID::Human(sellers.insert(()));
+            market.produce(seller, item, 1);
+            market.sell(seller, pos, item, 1, 0);
+        }
+    }
+    let (world, resources) = sim.unrestricted_world_res().unwrap();
+    market_update(world, resources);
+
+    let staged = sim.world().freight_stations[station].f.waiting_cargo;
+    assert!(
+        (0..BATCH).contains(&staged) && staged > 0,
+        "accepted {staged} of {BATCH}"
+    );
+    let market = sim.read::<Market>();
+    let unsold: i32 = sellers
+        .keys()
+        .map(|id| market.capital(SoulID::Human(id), item))
+        .sum();
+    assert_eq!(staged + unsold as u32, BATCH);
+    drop(market);
+    let saved = Bincode::encode(&sim).unwrap();
+    let restored: Simulation = Bincode::decode(&saved).unwrap();
+    assert_eq!(
+        restored.world().freight_stations[station].f.waiting_cargo,
+        staged
+    );
 }

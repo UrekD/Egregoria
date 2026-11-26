@@ -7,7 +7,9 @@ use egui_inspect::Inspect;
 use geom::{PolyLine3, Polyline3Queue, Transform, Vec3};
 use prototypes::{RollingStockID, DELTA};
 
-use crate::map::{IntersectionID, LaneID, Map, Traversable, TraverseKind};
+use crate::map::{
+    IntersectionID, LaneID, LaneKind, Map, Traversable, TraverseDirection, TraverseKind,
+};
 use crate::map_dynamic::ItineraryFollower;
 use crate::transportation::Speed;
 use crate::utils::resources::Resources;
@@ -292,21 +294,161 @@ pub(crate) fn cancel_train_route(
     reservations: &mut TrainReservations,
 ) {
     train.it = Itinerary::NONE;
-    for intersection in train.res.upcoming_inters.drain(..) {
-        let occupied =
-            train.res.past_travers.keys().any(
-                |kind| matches!(kind, TraverseKind::Turn(turn) if turn.parent == intersection),
-            );
+    release_train_grants(id, &mut train.res, reservations);
+}
+
+pub(crate) fn release_train_grants(
+    id: TrainID,
+    physical: &mut LocomotiveReservation,
+    reservations: &mut TrainReservations,
+) {
+    for intersection in physical.upcoming_inters.drain(..) {
+        let occupied = physical
+            .past_travers
+            .keys()
+            .any(|kind| matches!(kind, TraverseKind::Turn(turn) if turn.parent == intersection));
         if !occupied && reservations.reservations.get(&intersection) == Some(&id) {
             reservations.reservations.remove(&intersection);
         }
     }
 }
 
+/// Restore claims before any paused commands can inspect a decoded train.
+pub(crate) fn restore_train_occupancy(
+    sim: &mut Simulation,
+    measured: bool,
+) -> Result<(), &'static str> {
+    let (world, resources) = sim.world_res();
+    let map = resources.read::<Map>();
+    let mut reservations = resources.write::<TrainReservations>();
+    if !measured {
+        reservations.localisations.clear();
+        reservations.reservations.clear();
+    }
+    for (id, train) in world.trains.iter_mut() {
+        let length = train.locomotive.length;
+        if !length.is_finite() || length <= 10.0 || !train.trans.pos.is_finite() {
+            return Err("invalid train footprint");
+        }
+        if !measured {
+            train.res.upcoming_inters.clear();
+            train.res.past_travers = recover_legacy_footprint(&map, train)
+                .ok_or("legacy train has no recoverable rail footprint")?;
+        }
+        if train.res.past_travers.is_empty() {
+            return Err("train has no measured rail footprint");
+        }
+        for (&kind, &progress) in &train.res.past_travers {
+            if !progress.is_finite() || progress >= length {
+                return Err("invalid train footprint distance");
+            }
+            reservations
+                .localisations
+                .entry(kind)
+                .or_default()
+                .insert(id, progress);
+            if let TraverseKind::Turn(turn) = kind {
+                // A physical claim always takes priority over a projection
+                // from the pre-movement reservation phase.
+                if reservations
+                    .reservations
+                    .insert(turn.parent, id)
+                    .is_some_and(|owner| owner != id)
+                {
+                    return Err("multiple trains claim an occupied junction");
+                }
+            }
+        }
+    }
+    if !measured {
+        for owners in reservations.localisations.values() {
+            let mut intervals: Vec<_> = owners
+                .iter()
+                .map(|(&id, &lead)| (lead, world.trains[id].locomotive.length - 10.0))
+                .collect();
+            intervals.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+            if intervals
+                .windows(2)
+                .any(|pair| pair[0].0 > pair[1].0 - pair[1].1 + 0.01)
+            {
+                return Err("overlapping legacy train footprints");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn recover_legacy_footprint(map: &Map, train: &TrainEnt) -> Option<BTreeMap<TraverseKind, f32>> {
+    let pos = train.trans.pos;
+    let current = train.it.get_travers().map(|traversal| traversal.kind);
+    let nearest = map
+        .nearest_lane(pos, LaneKind::Rail, Some(4.0))
+        .map(TraverseKind::Lane);
+    let (head, offset, track_length) = train
+        .res
+        .past_travers
+        .keys()
+        .copied()
+        .chain(current)
+        .chain(nearest)
+        .filter_map(|kind| {
+            let points = Traversable::new(kind, TraverseDirection::Forward).raw_points(map)?;
+            let projected = points.project(pos);
+            let distance = projected.distance2(pos);
+            let offset = points.length_at_proj(projected);
+            (distance <= 0.25).then_some((
+                ordered_float::OrderedFloat(distance),
+                Some(kind) != current,
+                kind,
+                offset,
+                points.length(),
+            ))
+        })
+        .min_by_key(|&(distance, other, kind, _, _)| (distance, other, kind))
+        .map(|(_, _, kind, offset, length)| (kind, offset, length))?;
+
+    // P6 could age out a turnout with no movement. Walk the directed
+    // predecessors within the consist length and claim any possible tail.
+    let mut occupied = BTreeMap::from([(head, offset - track_length)]);
+    let mut pending = vec![(head, offset)];
+    while let Some((kind, behind)) = pending.pop() {
+        if behind >= train.locomotive.length {
+            continue;
+        }
+        let mut add = |previous| {
+            let Some(length) = TraverseKind::length(&previous, map.lanes(), map.intersections())
+            else {
+                return;
+            };
+            if occupied.get(&previous).is_none_or(|&known| behind < known) {
+                occupied.insert(previous, behind);
+                pending.push((previous, behind + length));
+            }
+        };
+        match kind {
+            TraverseKind::Lane(lane) => {
+                let intersection = map.get(map.get(lane)?.src)?;
+                for (turn, direction) in intersection.turns_to(lane) {
+                    if direction == TraverseDirection::Forward
+                        && map
+                            .get(turn.src)
+                            .is_some_and(|lane| lane.kind == LaneKind::Rail)
+                    {
+                        add(TraverseKind::Turn(turn));
+                    }
+                }
+            }
+            TraverseKind::Turn(turn) => add(TraverseKind::Lane(turn.src)),
+        }
+    }
+    Some(occupied)
+}
+
 pub fn train_reservations_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("transportation::train_reservations_update");
     let map = &*resources.read::<Map>();
     let reservations = &mut *resources.write::<TrainReservations>();
+    let trace = resources.read::<crate::economy::cargo::FreightTrace>();
     let lanes = map.lanes();
     let inters = map.intersections();
     reservations.reservations.clear();
@@ -330,6 +472,9 @@ pub fn train_reservations_update(world: &mut World, resources: &mut Resources) {
     let mut ids: Vec<_> = world.trains.keys().collect();
     ids.sort_unstable();
     for me in ids {
+        if !trace.may_move(me) {
+            continue;
+        }
         let train = &mut world.trains[me];
         let Some(travers) = train.it.get_travers() else {
             continue;
@@ -585,4 +730,45 @@ pub fn locomotive_desired_speed(
     }
 
     t.locomotive.max_speed
+}
+
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+    use crate::map::{LanePatternBuilder, MapProject};
+    use crate::{SimulationDeser, WorldCommand};
+    use common::saveload::{Bincode, Encoder};
+    use geom::vec3;
+
+    #[test]
+    fn p8_load_p6_paused_spawn_reconstructs_lane_claim() {
+        drop(crate::tests::TestCtx::new_fast());
+        let mut sim = Simulation::new_authored_flat(8, 0).unwrap();
+        sim.apply_commands([&WorldCommand::MapMakeConnection {
+            from: MapProject::ground(vec3(200.0, 200.0, 0.0)),
+            to: MapProject::ground(vec3(600.0, 200.0, 0.0)),
+            inter: None,
+            pat: LanePatternBuilder::new().rail(true).build(),
+        }]);
+        let lane = sim
+            .map()
+            .lanes()
+            .values()
+            .find(|lane| lane.kind == LaneKind::Rail)
+            .unwrap()
+            .id;
+        let spawn = WorldCommand::SpawnTrain {
+            wagons: vec![RollingStockID::new("locomotive")],
+            lane,
+            dist: 100.0,
+        };
+        sim.apply_commands([&spawn]);
+        sim.write::<TrainReservations>().localisations.clear();
+        let mut snapshot: SimulationDeser =
+            Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+        snapshot.res.remove("cargo_progress");
+        let mut restored = snapshot.into_sim().unwrap();
+        restored.apply_commands([&spawn]);
+        assert_eq!(restored.world().trains.len(), 1);
+    }
 }

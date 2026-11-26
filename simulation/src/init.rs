@@ -431,7 +431,7 @@ fn register_road_frontage() {
 // and saves from before it restart the timers at load.
 // Registered after "cargo_book" so loading overrides the decoded book's default.
 fn register_cargo_progress() {
-    use crate::economy::cargo::FreightTrace;
+    use crate::economy::cargo::{FreightSnapshotTail, FreightTrace};
 
     register_resource_noserialize::<FreightTrace>();
     unsafe {
@@ -441,8 +441,17 @@ fn register_cargo_progress() {
             save: Box::new(|sim, output| {
                 Bincode::encode_writer(&sim.read::<CargoBook>().progress, &mut *output)?;
                 let trace = sim.read::<FreightTrace>();
-                if !trace.is_pristine() {
-                    Bincode::encode_writer(&*trace, output)?;
+                let has_trains = !sim.world().trains.is_empty();
+                if !trace.is_pristine() || has_trains {
+                    Bincode::encode_writer(&*trace, &mut *output)?;
+                    Bincode::encode_writer(
+                        &FreightSnapshotTail {
+                            version: 1,
+                            legacy_exports: trace.legacy_export_balances(sim.world()),
+                            dispatch_retries: trace.dispatch_retries.clone(),
+                        },
+                        output,
+                    )?;
                 }
                 Ok(())
             }),
@@ -450,7 +459,23 @@ fn register_cargo_progress() {
                 let mut input = data;
                 sim.write::<CargoBook>().progress = Bincode::decode_reader(&mut input)?;
                 if !input.is_empty() {
-                    let mut trace = Bincode::decode::<FreightTrace>(input)?;
+                    let mut trace = FreightTrace::decode(&mut input)?;
+                    if !input.is_empty() {
+                        let FreightSnapshotTail {
+                            version,
+                            legacy_exports,
+                            dispatch_retries,
+                        } = Bincode::decode(input)?;
+                        if version != 1u8 {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "invalid rail footprint marker",
+                            ));
+                        }
+                        trace.measured_rail = true;
+                        trace.saved_legacy_exports = Some(legacy_exports);
+                        trace.dispatch_retries = dispatch_retries;
+                    }
                     trace.rebuild_indexes().map_err(|message| {
                         std::io::Error::new(std::io::ErrorKind::InvalidData, message)
                     })?;
