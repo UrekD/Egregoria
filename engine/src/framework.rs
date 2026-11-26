@@ -11,6 +11,7 @@ use winit::{
 };
 
 use crate::egui::EguiWrapper;
+use crate::frame_profile::CpuPhase;
 use crate::{get_cursor_icon, AudioContext, FrameContext, GfxContext, InputContext};
 
 #[allow(unused_variables)]
@@ -151,8 +152,16 @@ async fn run<S: State>(el: EventLoop<()>, window: Arc<Window>) {
                         last_update = now;
                         ctx.input.publish_pointer_frame(&ctx.egui);
                         let before = ctx.gfx.tick;
+                        if let Some(profile) = &mut ctx.gfx.frame_profile {
+                            profile.begin_redraw();
+                        }
                         state.frame(&mut ctx);
-                        ctx.finish_present();
+                        ctx.finish_present(now);
+                        if ctx.gfx.tick == before {
+                            if let Some(profile) = &mut ctx.gfx.frame_profile {
+                                profile.skip_redraw();
+                            }
+                        }
                         if ctx.exit_requested {
                             target.exit();
                             return;
@@ -384,7 +393,10 @@ impl Context {
         if self.next_surface.is_some() {
             return true;
         }
-        match self.gfx.surface.get_current_texture() {
+        let start = self.gfx.profile_timer();
+        let surface = self.gfx.surface.get_current_texture();
+        self.gfx.profile_elapsed(CpuPhase::SurfaceAcquire, start);
+        match surface {
             Ok(surface) => {
                 self.next_surface = Some(surface);
                 true
@@ -410,22 +422,43 @@ impl Context {
         render_gui: impl FnOnce(&mut S, &egui::Context),
         render_yakui: impl FnOnce(&mut S),
     ) {
+        self.present_with_gfx(
+            state,
+            render,
+            |state, ui, _| render_gui(state, ui),
+            render_yakui,
+        );
+    }
+
+    pub fn present_with_gfx<S>(
+        &mut self,
+        state: &mut S,
+        render: impl FnOnce(&mut S, &mut FrameContext<'_>),
+        render_gui: impl FnOnce(&mut S, &egui::Context, &GfxContext),
+        render_yakui: impl FnOnce(&mut S),
+    ) {
         if !self.acquire_surface() {
             return;
         }
         let surface = self.next_surface.take().unwrap();
+        if let Some(profile) = &mut self.gfx.frame_profile {
+            profile.start_gpu();
+        }
+        let start = self.gfx.profile_timer();
         let (mut enc, view) = self.gfx.start_frame(&surface);
+        self.gfx.profile_elapsed(CpuPhase::Encode, start);
         (self.times.render_time, self.times.gui_time) =
             self.gfx
                 .render(&mut enc, view, state, render, |state, mut gui| {
                     #[cfg(feature = "yakui")]
                     self.yakui.render(&mut gui, || render_yakui(state));
-                    self.egui.render(gui, |ui| render_gui(state, ui));
+                    let gfx = gui.gfx;
+                    self.egui.render(gui, |ui| render_gui(state, ui, gfx));
                 });
         self.prepared_frame = Some((surface, enc));
     }
 
-    fn finish_present(&mut self) {
+    fn finish_present(&mut self, frame_start: Instant) {
         let Some((surface, mut enc)) = self.prepared_frame.take() else {
             return;
         };
@@ -436,7 +469,10 @@ impl Context {
             .screenshot_request
             .take()
             .map(|path| self.gfx.capture_screenshot(&surface.texture, &path));
+        let start = self.gfx.profile_timer();
         surface.present();
+        self.gfx.profile_elapsed(CpuPhase::Present, start);
+        self.gfx.profile_presented(frame_start);
         if screenshot.is_some() {
             self.screenshot_result = screenshot;
         }

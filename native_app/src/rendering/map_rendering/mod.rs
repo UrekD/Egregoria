@@ -1,3 +1,4 @@
+use engine::frame_profile::CpuPhase;
 use engine::heightmap::{GroundOverlayDisc, GroundOverlayImage};
 use engine::{Context, FrameContext, GfxContext};
 #[cfg(feature = "debug-ground-overlay")]
@@ -143,15 +144,26 @@ impl MapRenderer {
         ctx: &mut FrameContext<'_>,
     ) {
         profiling::scope!("render map renderer");
+        let map_start = ctx.gfx.profile_timer();
         self.terrain.draw(cam, ctx);
+        ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);
 
+        let instances_start = ctx.gfx.profile_timer();
         self.trees.draw(map, cam, ctx);
+        ctx.gfx.profile_elapsed(CpuPhase::Instances, instances_start);
 
+        let map_start = ctx.gfx.profile_timer();
         self.meshb.latest_mesh(map, options, ctx);
 
         Self::signals_render(map, time, cam, &ctx.gfx.frustrum, draw);
+        ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);
 
+        let water_start = ctx.gfx.profile_timer();
         self.water.draw(map.environment(), ctx);
+        ctx.gfx.profile_elapsed(CpuPhase::Water, water_start);
+        if let Some(profile) = &mut ctx.gfx.frame_profile {
+            profile.pending_water_chunks = Some(self.water.pending_chunks());
+        }
     }
 
     fn render_lane_signals(n: &Lane, draw: &mut ImmediateDraw, time: u32) {

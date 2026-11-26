@@ -1,3 +1,4 @@
+use crate::frame_profile::GpuPass;
 use crate::{
     compile_shader, CompiledModule, GfxContext, PipelineKey, Texture, TextureBuilder, Uniform, TL,
 };
@@ -167,7 +168,7 @@ impl Pbr {
                     ops: Default::default(),
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: gfx.group_timestamps(GpuPass::Environment, face == 0, face == 5),
                 occlusion_query_set: None,
             });
             pass.set_pipeline(pipe);
@@ -199,7 +200,7 @@ impl Pbr {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: gfx.group_timestamps(GpuPass::Irradiance, face == 0, face == 5),
                 occlusion_query_set: None,
             });
             pass.set_pipeline(pipe);
@@ -212,7 +213,8 @@ impl Pbr {
     pub fn write_specular_prefilter(&self, gfx: &GfxContext, enc: &mut CommandEncoder) {
         profiling::scope!("gfx::write_specular_prefilter");
         let pipe = gfx.get_pipeline(PbrPipeline::SpecularPrefilter);
-        for mip in 0..self.specular_prefilter_cube.n_mips() {
+        let mip_count = self.specular_prefilter_cube.n_mips();
+        for mip in 0..mip_count {
             let roughness = mip as f32 / (self.specular_prefilter_cube.n_mips() - 1) as f32;
             let uni = &self.specular_uniforms[mip as usize];
             uni.write_direct(
@@ -235,7 +237,11 @@ impl Pbr {
                         },
                     })],
                     depth_stencil_attachment: None,
-                    timestamp_writes: None,
+                    timestamp_writes: gfx.group_timestamps(
+                        GpuPass::Specular,
+                        mip == 0 && face == 0,
+                        mip + 1 == mip_count && face == 5,
+                    ),
                     occlusion_query_set: None,
                 });
                 pass.set_pipeline(pipe);

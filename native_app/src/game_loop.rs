@@ -7,6 +7,7 @@ use std::time::Instant;
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
 use common::history::History;
 use common::saveload::{self, SlotId};
+use engine::frame_profile::CpuPhase;
 use engine::{Context, FrameContext, InputContext, MeshBuilder, Tesselator};
 use geom::{vec2, vec3, Camera, LinearColor, AABB};
 use simulation::economy::Government;
@@ -58,6 +59,7 @@ pub struct State {
     staged: Option<WorldCommands>,
     sent_warp: u32,
     sampled_step: Option<(u64, u64)>,
+    frame_profile_panel: crate::frame_profile::Panel,
     fence: Fence,
     install: Option<Install>,
     release_sent: bool,
@@ -276,6 +278,7 @@ impl engine::framework::State for State {
             staged: None,
             sent_warp: 0,
             sampled_step: None,
+            frame_profile_panel: Default::default(),
             fence: Fence::Open,
             install: None,
             release_sent: false,
@@ -304,6 +307,9 @@ impl engine::framework::State for State {
     }
 
     fn frame(&mut self, ctx: &mut Context) {
+        if ctx.gfx.frame_profile.is_some() {
+            self.frame_profile_panel.export_requested(&ctx.gfx, &self.uiw);
+        }
         self.uiw.write::<TimeAlways>().0 += ctx.delta;
         {
             let mut timings = self.uiw.write::<Timings>();
@@ -325,16 +331,37 @@ impl engine::framework::State for State {
             if scripted && !state.step_automation(ctx, sim) {
                 return;
             }
+            let prep_start = ctx.gfx.profile_timer();
             let view_input = state.prepare_input(ctx, scripted);
             state.update_warp();
             state.uiw.write::<SaveLoadState>().authoring_blocked = !state.can_collect_commands();
             let commands_observed = state.update_world(ctx, sim, scripted, view_input);
+            ctx.gfx.profile_elapsed(CpuPhase::WorldPrep, prep_start);
+            if let Some(profile) = &mut ctx.gfx.frame_profile {
+                let generation = state.uiw.read::<SessionState>().generation;
+                let step = if state.driver.is_some() {
+                    state
+                        .sampled_step
+                        .filter(|sample| sample.0 == generation)
+                        .map(|sample| sample.1)
+                } else {
+                    Some(sim.get_tick())
+                };
+                if let Some(step) = step {
+                    profile.record_sim(generation, step, state.uiw.read::<Settings>().time_warp);
+                }
+            }
             let yakui_width =
                 ctx.yakui.yakui.layout_dom().unscaled_viewport().size().x / ctx.yakui.zoom_factor;
-            ctx.present(
+            ctx.present_with_gfx(
                 state,
                 |state, frame| state.render_world(frame, sim),
-                |state, ui| state.render_world_gui(ui, sim),
+                |state, ui, gfx| {
+                    state.render_world_gui(ui, sim);
+                    if state.automation.is_none() && gfx.frame_profile.is_some() {
+                        state.frame_profile_panel.draw(ui, gfx);
+                    }
+                },
                 |state| state.render_world_yakui(sim, yakui_width),
             );
             state.invalidate_placements();
@@ -349,7 +376,10 @@ impl engine::framework::State for State {
         let mut busy = true;
         if let Some(view) = self.driver.as_ref().map(SimThread::view) {
             if view.signal_redraw() && ctx.acquire_surface() {
-                if let Some(sim) = view.try_read() {
+                let lease_start = ctx.gfx.profile_timer();
+                let sim = view.try_read();
+                ctx.gfx.profile_elapsed(CpuPhase::SimLease, lease_start);
+                if let Some(sim) = sim {
                     if view.take_replaced() {
                         ctx.gfx.lamplights.reset(&ctx.gfx.device, &ctx.gfx.queue);
                         self.map_renderer = Some(MapRenderer::new(&mut ctx.gfx, &sim));
@@ -361,7 +391,10 @@ impl engine::framework::State for State {
             }
         } else if ctx.acquire_surface() {
             let world = self.sim.clone();
-            if let Ok(sim) = world.try_read() {
+            let lease_start = ctx.gfx.profile_timer();
+            let sim = world.try_read();
+            ctx.gfx.profile_elapsed(CpuPhase::SimLease, lease_start);
+            if let Ok(sim) = sim {
                 use_world(self, ctx, &sim);
                 busy = false;
             };
@@ -659,7 +692,9 @@ impl State {
             ctx,
         );
 
+        let instances_start = ctx.gfx.profile_timer();
         self.instanced_renderer.render(&sim, ctx);
+        ctx.gfx.profile_elapsed(CpuPhase::Instances, instances_start);
         if !self.uiw.read::<SessionState>().interaction_blocked {
             gui::overlays::draw(&sim, &self.uiw);
         }
@@ -1530,6 +1565,10 @@ impl State {
         };
         if let Some(capture) = self.capture.take() {
             let _ = capture.sender.send(Err("The save was cancelled.".into()));
+        }
+        if let Some(profile) = &mut ctx.gfx.frame_profile {
+            profile.reset();
+            self.frame_profile_panel = Default::default();
         }
         let sim = session::install_world(&self.uiw, replacement, generation);
         self.all_audio.reset_world();
