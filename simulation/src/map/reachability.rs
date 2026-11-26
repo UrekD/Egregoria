@@ -1,6 +1,7 @@
 use super::pathfinding::lane_turn_successors;
-use super::{LaneID, Map};
+use super::{indexed_astar, LaneID, LanePatternBuilder, Map};
 use common::FastSet;
+use geom::Vec3;
 use slotmapd::SecondaryMap;
 
 const COMPONENT_EDGE_BUDGET: usize = 256;
@@ -8,11 +9,26 @@ const COMPONENT_EDGE_BUDGET: usize = 256;
 pub(super) struct DrivingReachability {
     lanes: SecondaryMap<LaneID, LaneReachability>,
     components: Vec<Component>,
+    routes: DrivingRoutes,
 }
 
 struct LaneReachability {
+    index: usize,
     component: usize,
     has_incoming_turn: bool,
+}
+
+#[derive(Default)]
+struct DrivingRoutes {
+    lanes: Vec<DrivingNode>,
+    successors: Vec<Vec<usize>>,
+}
+
+struct DrivingNode {
+    lane: LaneID,
+    position: Option<Vec3>,
+    travel_time: f32,
+    lateral_bits: u32,
 }
 
 #[derive(Default)]
@@ -40,11 +56,12 @@ impl DrivingReachability {
 
         let (component_of, mut components) = strong_components(&forward, &reverse);
         let mut lanes = SecondaryMap::with_capacity(lane_ids.len());
-        for (src, lane) in lane_ids.into_iter().enumerate() {
+        for (src, &lane) in lane_ids.iter().enumerate() {
             let component = component_of[src];
             lanes.insert(
                 lane,
                 LaneReachability {
+                    index: src,
                     component,
                     has_incoming_turn: !reverse[src].is_empty(),
                 },
@@ -61,7 +78,61 @@ impl DrivingReachability {
             component.successors.dedup();
         }
 
-        Self { lanes, components }
+        let route_lanes = lane_ids
+            .into_iter()
+            .map(|id| {
+                let lane = &map.lanes[id];
+                DrivingNode {
+                    lane: id,
+                    position: map.intersections.get(lane.dst).map(|i| i.pos),
+                    travel_time: lane.points.length() / lane.speed_limit,
+                    lateral_bits: lane.dist_from_bottom.to_bits(),
+                }
+            })
+            .collect();
+        Self {
+            lanes,
+            components,
+            routes: DrivingRoutes {
+                lanes: route_lanes,
+                successors: forward,
+            },
+        }
+    }
+
+    pub(super) fn path(
+        &self,
+        start: LaneID,
+        end: LaneID,
+        base_random: u32,
+    ) -> Option<impl ExactSizeIterator<Item = LaneID> + '_> {
+        let start = self.lanes.get(start)?.index;
+        let end = self.lanes.get(end)?.index;
+        let lanes = &self.routes.lanes;
+        let end_pos = lanes[end].position?;
+        // The dummy root has the origin's successors but cannot satisfy the
+        // goal. A target on the origin lane must be reached through a turn.
+        let dummy = lanes.len();
+        const HEURISTIC_SPEED: f32 = LanePatternBuilder::new().speed_limit;
+        let path = indexed_astar::astar(
+            lanes.len() + 1,
+            dummy,
+            |node| {
+                let node = if node == dummy { start } else { node };
+                self.routes.successors[node].iter().map(|&next| {
+                    let lane = &lanes[next];
+                    let jitter = common::rand::randu(lane.lateral_bits ^ base_random);
+                    (next, lane.travel_time + jitter)
+                })
+            },
+            |node| {
+                lanes[node].position.map_or(f32::INFINITY, |position| {
+                    position.distance(end_pos) * 1.2 / HEURISTIC_SPEED
+                })
+            },
+            |node| node == end,
+        )?;
+        Some(path.into_iter().skip(1).map(|node| lanes[node].lane))
     }
 
     /// The lane's strongly connected component, if a route via one or more
@@ -187,6 +258,7 @@ mod tests {
             lanes.insert(
                 lane,
                 LaneReachability {
+                    index: 0,
                     component,
                     has_incoming_turn: true,
                 },
@@ -197,7 +269,11 @@ mod tests {
             component.successors.push(i + 1);
         }
         components[destination - 1].successors.push(destination);
-        let mut index = DrivingReachability { lanes, components };
+        let mut index = DrivingReachability {
+            lanes,
+            components,
+            routes: DrivingRoutes::default(),
+        };
 
         // A disconnected chain beyond the budget must be left to A*.
         assert!(index.can_reach(start, end));
