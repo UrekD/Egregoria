@@ -841,6 +841,19 @@ impl MipmapGenerator {
         dst: &TextureView,
         label: &str,
     ) {
+        self.mipmap_one_with_timestamps(encoder, device, pipeline, src, dst, label, None);
+    }
+
+    pub(crate) fn mipmap_one_with_timestamps(
+        &self,
+        encoder: &mut CommandEncoder,
+        device: &Device,
+        pipeline: &RenderPipeline,
+        src: &TextureView,
+        dst: &TextureView,
+        label: &str,
+        timestamp_writes: Option<wgpu::RenderPassTimestampWrites<'_>>,
+    ) {
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             layout: &pipeline.get_bind_group_layout(0),
             entries: &[
@@ -867,7 +880,7 @@ impl MipmapGenerator {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes,
             occlusion_query_set: None,
         });
         rpass.set_pipeline(pipeline);

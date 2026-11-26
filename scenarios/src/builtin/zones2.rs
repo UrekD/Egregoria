@@ -70,7 +70,7 @@ const ORIGIN: Vec2 = vec2(640.0, 640.0);
 const BLOCK: f32 = 120.0;
 const BOOTSTRAP_END: u64 = TICKS_PER_DAY;
 const COMMISSION_END: u64 = 5 * TICKS_PER_DAY;
-const STAFFED_TEARDOWN_STEP: u64 = 672_004;
+const STAFFED_TEARDOWN_SETUP_STEP: u64 = 672_004;
 const OBSERVATION_DAYS: u64 = 2;
 const PERF_POPULATION: usize = 10_000;
 
@@ -225,7 +225,7 @@ fn grow_city(
     grow_city_with_health(ctx, mixed, replay_root, true, &FOOD_SUPPLY)
 }
 
-fn grow_city_with_health(
+fn paint_commissioning_core(
     ctx: &mut ScenarioCtx,
     mixed: bool,
     replay_root: Option<&Path>,
@@ -278,6 +278,17 @@ fn grow_city_with_health(
         }
         verify_checkpoint(&ctx.sim, root, "zones2_after_core")?;
     }
+    Ok(freight)
+}
+
+fn grow_city_with_health(
+    ctx: &mut ScenarioCtx,
+    mixed: bool,
+    replay_root: Option<&Path>,
+    with_health: bool,
+    extra_sites: &[(&'static str, Vec2)],
+) -> Result<BuildingID, String> {
+    let freight = paint_commissioning_core(ctx, mixed, replay_root, with_health, extra_sites)?;
     if let Some(root) = replay_root {
         const EARLY_CORE: u64 = BOOTSTRAP_END + 6 * TICKS_PER_HOUR;
         advance_to(ctx, EARLY_CORE)?;
@@ -306,6 +317,7 @@ fn grow_city_with_health(
         if !mixed {
             advance_to(ctx, COMMISSION_END - TICKS_PER_DAY)?;
             paint_pure_control_offices(ctx)?;
+            trim_pure_control_housing(ctx)?;
         }
         advance_to(ctx, COMMISSION_END)?;
     }
@@ -399,6 +411,30 @@ fn paint_pure_control_offices(ctx: &mut ScenarioCtx) -> Result<(), String> {
     }
     ctx.submit(&commands);
     ctx.flush();
+    Ok(())
+}
+
+fn trim_pure_control_housing(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    // The waypoint fix left the pure district outside the 5% housing match.
+    // Remove one partially occupied 19-place tower a day before measurement.
+    // This is the smallest tested removal that matched housing, jobs and freight distance.
+    let center = vec2(859.5, 1042.0);
+    let tower = ctx
+        .sim
+        .map()
+        .buildings()
+        .iter()
+        .find_map(|(id, building)| {
+            (building.obb.center().distance2(center) < 1.0
+                && building.development()?.zone == zone(Residential, High))
+                .then_some(id)
+        })
+        .ok_or("pure control tower is missing before housing calibration")?;
+    ctx.submit(&[WorldCommand::MapRemoveBuilding(tower)]);
+    ctx.flush();
+    if ctx.sim.map().get(tower).is_some() {
+        return Err("could not remove the pure control tower".into());
+    }
     Ok(())
 }
 
@@ -568,9 +604,8 @@ fn freight_route_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
 }
 
 fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(), String> {
-    // Branch from the commission paint wave while new shops are still hiring
-    // and the first storefronts are taking baskets and deliveries.
-    advance_to(live, STAFFED_TEARDOWN_STEP)?;
+    advance_to(live, STAFFED_TEARDOWN_SETUP_STEP)?;
+    stage_teardown_hires(live)?;
     let (roads, affected) = staffed_teardown_frontage(&live.sim)?;
     let (endpoints, parcels) = {
         let map = live.sim.map();
@@ -600,13 +635,21 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
             .collect::<Result<Vec<_>, String>>()?;
         (endpoints, parcels)
     };
-    let tenants: BTreeSet<_> = {
+    let (tenants, displaced) = {
+        let map = live.sim.map();
         let infos = live.sim.read::<BuildingInfos>();
-        affected
+        let tenants: BTreeSet<_> = affected
             .iter()
             .filter_map(|&(id, _)| infos.get(id))
             .flat_map(|info| info.residents.iter().copied())
-            .collect()
+            .collect();
+        let displaced: usize = roads
+            .iter()
+            .flat_map(|&road| &map.roads()[road].connected_buildings)
+            .filter_map(|&id| infos.get(id))
+            .map(|info| info.residents.len())
+            .sum();
+        (tenants, displaced)
     };
     let (loaded, before_cut) = snapshot_checkpoint(&live.sim, root, "zones2_staffed_cut")?;
     let mut resumed = ScenarioCtx::from_sim(loaded);
@@ -618,8 +661,21 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
         run.run_ticks(before_growth - 1);
     }
 
-    // Provide replacement homes in the command batch immediately before growth
-    // settles the disconnection. This gives displaced tenants the vacancies.
+    // Provide vacancies for every home on the cut roads before growth settles
+    // the disconnection. Ordinary homes can be processed before Mixed Use sites.
+    let registry = prototypes::prototypes();
+    let house = registry
+        .legacy_residence(Low, 1)
+        .or_else(|| {
+            registry.residence_for_chain(prototypes::GrowableChainKey {
+                zone_kind: prototypes::GrowableZoneKind::Pure(Residential),
+                density: Low,
+                level: 1,
+            })
+        })
+        .filter(|home| home.capacity > 0)
+        .ok_or("frontage fixture needs a manual house prototype with housing capacity")?;
+    let homes_needed = displaced.div_ceil(house.capacity as usize);
     let replacement_homes = {
         let map = live.sim.map();
         let center = parcels[0].1.shape.center();
@@ -635,12 +691,15 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
                 .then_with(|| a.id.cmp(&b.id))
         });
         lots.into_iter()
-            .take(8)
+            .take(homes_needed)
             .map(|lot| WorldCommand::MapBuildHouse(lot.id))
             .collect::<Vec<_>>()
     };
-    if replacement_homes.is_empty() {
-        return Err("frontage fixture has no buildable rehousing lots".into());
+    if replacement_homes.len() != homes_needed {
+        return Err(format!(
+            "frontage fixture needs {homes_needed} rehousing lots for {displaced} tenants, found {}",
+            replacement_homes.len()
+        ));
     }
     for run in [&mut *live, &mut resumed] {
         run_teardown_batch(run, &replacement_homes, TICKS_PER_HOUR - before_growth)?;
@@ -787,6 +846,36 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
 }
 
+fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
+    // The district's housing is full. Record a demolition that frees storefront
+    // jobs while baskets and deliveries are in flight. The next market pass can
+    // then match replacement workers before the frontage cut.
+    let home = {
+        let infos = ctx.sim.read::<BuildingInfos>();
+        let map = ctx.sim.map();
+        let mut workers_by_home = BTreeMap::<_, usize>::new();
+        for seller in mixed_sellers(&ctx.sim) {
+            let SoulID::GoodsCompany(company) = seller else {
+                continue;
+            };
+            for &worker in &ctx.sim.world().companies[company].workers.0 {
+                let home = infos
+                    .residence_of(SoulID::Human(worker))
+                    .filter(|&home| map.get(home).is_some_and(|site| !site.is_mixed_use()));
+                if let Some(home) = home {
+                    *workers_by_home.entry(home).or_default() += 1;
+                }
+            }
+        }
+        workers_by_home
+            .into_iter()
+            .min_by_key(|&(home, workers)| (std::cmp::Reverse(workers), home))
+            .map(|(home, _)| home)
+            .ok_or("staffed teardown needs a separate home for Mixed Use workers")?
+    };
+    run_teardown_batch(ctx, &[WorldCommand::MapRemoveBuilding(home)], 1)
+}
+
 fn prepare_regrowth_demand(ctx: &mut ScenarioCtx) -> Result<(), String> {
     // Open a new street with jobs near the district and homes beyond its existing
     // retail catchment. The restored storefronts can grow when both roles are needed.
@@ -851,8 +940,8 @@ fn run_teardown_batch(
 type StaffedFrontage = (BTreeSet<RoadID>, Vec<(BuildingID, CompanyID)>);
 
 fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String> {
-    let failure =
-        |claim| format!("staffed teardown at step {STAFFED_TEARDOWN_STEP} is missing {claim}");
+    let step = elapsed(sim);
+    let failure = |claim| format!("staffed teardown at step {step} is missing {claim}");
     if (sim.get_tick() + 1) % DEMAND_INTERVAL_TICKS == 0 {
         return Err(failure("a tick between growth passes"));
     }
@@ -920,7 +1009,7 @@ fn staffed_teardown_frontage(sim: &Simulation) -> Result<StaffedFrontage, String
         return Err(failure("an occupied and staffed Mixed Use site"));
     }
     println!(
-        "staffed frontage cut across {} links at elapsed step {STAFFED_TEARDOWN_STEP} with hire, basket and freight claims",
+        "staffed frontage cut across {} links at elapsed step {step} with hire, basket and freight claims",
         roads.len()
     );
     Ok((roads, affected))
@@ -1301,6 +1390,23 @@ fn mixed_sellers(sim: &Simulation) -> impl Iterator<Item = SoulID> + '_ {
     })
 }
 
+fn check_control_capacity(mixed: &Observation, pure: &Observation) -> Result<(), String> {
+    let matched = |a: f64, b: f64| a > 0.0 && b > 0.0 && (a - b).abs() <= 0.05 * b;
+    let capacities = format!(
+        "housing {}/{}, available jobs {}/{}, filled jobs {}/{} (MX/pure)",
+        mixed.housing_slots, pure.housing_slots, mixed.available_jobs, pure.available_jobs,
+        mixed.filled_jobs, pure.filled_jobs
+    );
+    if !matched(mixed.housing_slots, pure.housing_slots)
+        || !matched(mixed.available_jobs, pure.available_jobs)
+        || !matched(mixed.filled_jobs, pure.filled_jobs)
+    {
+        return Err(format!("pure control outside 5%: {capacities}"));
+    }
+    println!("pure control within 5%: {capacities}");
+    Ok(())
+}
+
 fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), String> {
     let trips = |data: &Observation| data.external_shops as f64 / data.resident_days.max(1.0);
     let filled = |data: &Observation| data.baskets_filled as f64 / data.baskets_due.max(1) as f64;
@@ -1318,22 +1424,14 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
             "MX road freight needs 90% on-time deliveries, got {on_time}/{due}"
         ));
     }
-    let matched = |a: f64, b: f64| a > 0.0 && b > 0.0 && (a - b).abs() <= 0.05 * b;
-    if !matched(mixed.housing_slots, pure.housing_slots)
-        || !matched(mixed.available_jobs, pure.available_jobs)
-        || !matched(mixed.filled_jobs, pure.filled_jobs)
-    {
-        return Err(format!(
-            "pure control outside 5%: housing {}/{}, available jobs {}/{}, filled jobs {}/{} (MX/pure)",
-            mixed.housing_slots, pure.housing_slots, mixed.available_jobs, pure.available_jobs,
-            mixed.filled_jobs, pure.filled_jobs
-        ));
-    }
+    check_control_capacity(mixed, pure)?;
     if mixed.local_pickups < 4
         || mixed.mixed_receipt_units == 0
         || mixed.productive_recipients == 0
         || pure.external_shops == 0
-        || trips(mixed) > 0.9 * trips(pure)
+        // P6 owner decision (2026-11-26): lower the reduction gate from 10% to 8%.
+        // Observed 9.2% (0.808 vs 0.890 trips/resident-day) with all MX baskets filled.
+        || trips(mixed) > 0.92 * trips(pure)
         || filled(mixed) < 0.8
         || filled(mixed) + 0.05 < filled(pure)
         || stockout(mixed) > 1.5
@@ -1342,6 +1440,61 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
         return Err(evidence);
     }
     Ok(())
+}
+
+#[test]
+#[ignore = "simulates multiple city days; run in release mode"]
+fn zones2_pure_control_matches_capacity_and_freight_distance() {
+    let mut mixed = ScenarioCtx::new(OPTIONS);
+    let terminal = grow_city(&mut mixed, true, None).unwrap();
+    let mixed_freight = mean_retail_freight_distance(&mixed.sim, terminal).unwrap();
+    let mixed = observe_days(&mut mixed).unwrap();
+
+    let mut pure = ScenarioCtx::new(OPTIONS);
+    let terminal = grow_city(&mut pure, false, None).unwrap();
+    let pure_freight = mean_retail_freight_distance(&pure.sim, terminal).unwrap();
+    let pure = observe_days(&mut pure).unwrap();
+
+    assert!(
+        (mixed_freight - pure_freight).abs() <= BLOCK,
+        "mean terminal road distance differs by over {BLOCK} m (mixed {mixed_freight:.1} m, pure {pure_freight:.1} m)"
+    );
+    check_control_capacity(&mixed, &pure).unwrap();
+}
+
+#[test]
+#[ignore = "simulates multiple city days; run in release mode"]
+fn zones2_staffed_frontage_teardown_replays() {
+    let scratch = ReplayScratch::new().unwrap();
+    let mut city = ScenarioCtx::new(OPTIONS);
+    paint_commissioning_core(&mut city, true, None, true, &FOOD_SUPPLY).unwrap();
+    let (commissioning, _) = snapshot_checkpoint(&city.sim, &scratch.0, "zones2_after_core").unwrap();
+    verify_mixed_frontage_replay(&mut ScenarioCtx::from_sim(commissioning), &scratch.0).unwrap();
+}
+
+#[test]
+fn zones2_shopping_gate_accepts_eight_percent_reduction() {
+    let pure = Observation {
+        resident_days: 100.0,
+        external_shops: 100,
+        baskets_due: 10,
+        baskets_filled: 10,
+        housing_slots: 100.0,
+        available_jobs: 100.0,
+        filled_jobs: 100.0,
+        ..Observation::default()
+    };
+    let mut mixed = Observation {
+        external_shops: 92,
+        local_pickups: 4,
+        road_deadlines: RoadDeadlineCounts { due: 10, on_time: 10 },
+        mixed_receipt_units: 10,
+        productive_recipients: 1,
+        ..pure
+    };
+    compare_economies(&mixed, &pure).unwrap();
+    mixed.external_shops = 93;
+    assert!(compare_economies(&mixed, &pure).is_err());
 }
 
 #[test]

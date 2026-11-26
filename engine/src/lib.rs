@@ -7,6 +7,7 @@ pub mod u8slice;
 mod audio;
 mod drawables;
 pub mod egui;
+pub mod frame_profile;
 pub mod framework;
 mod geometry;
 mod gfx;
