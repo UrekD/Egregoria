@@ -234,7 +234,7 @@ impl<'de> Deserialize<'de> for Itinerary {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ItineraryTarget {
     Position(Vec3),
-    /// Offset in meters from the start of the driving lane.
+    /// Offset in meters from the start of the directed lane.
     DirectedLane(LaneID, f32),
 }
 
@@ -1004,7 +1004,7 @@ impl Itinerary {
                             }
                         }
                         ItineraryTarget::DirectedLane(lane, offset) => {
-                            let points = driving_lane_points(map, lane, offset)?;
+                            let points = directed_lane_points(map, lane, offset, *kind)?;
                             path.extend(directed_local_path(points, start, offset, route.end_pos)?);
                             continue;
                         }

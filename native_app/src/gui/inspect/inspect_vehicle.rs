@@ -1090,8 +1090,24 @@ mod tests {
         let ui = UiWorld::with_defaults();
         let mut train_tooltip = None;
         let mut truck_tooltip = None;
+        let mut checked_return_route = false;
         for _ in 0..6000 {
             sim.tick(&mut schedule, &[]);
+            let returning = sim
+                .get(station)
+                .unwrap()
+                .f
+                .trains
+                .iter()
+                .any(|&(id, state)| id == train && matches!(state, FreightTrainState::Moving));
+            if returning && !checked_return_route {
+                let itinerary = &sim.get(train).unwrap().it;
+                assert!(!itinerary.get_route().unwrap().reversed_route.is_empty());
+                let path = vehicle_path(&sim, &sim.map(), train.into())
+                    .expect("the cross-track freight return should have a visible route");
+                assert_eq!(path.last().copied(), itinerary.end_pos());
+                checked_return_route = true;
+            }
             let trace = sim.read::<FreightTrace>();
             let page = trace.terminal_view(terminal);
             let Some(record) = page.rows.first() else {
@@ -1102,15 +1118,21 @@ mod tests {
                     train_tooltip = vehicle_tooltip(&ui, &sim, train.into())
                         .map(|text| (text, record.fragment.units));
                 }
-                FreightStage::OutboundTruck => {
+                FreightStage::OutboundTruck if truck_tooltip.is_none() => {
                     assert_eq!(record.receiver.unwrap().building, buyer_building);
                     truck_tooltip = vehicle_tooltip(&ui, &sim, record.truck.unwrap().into())
                         .map(|text| (text, record.fragment.units));
-                    break;
                 }
                 _ => {}
             }
+            if checked_return_route && truck_tooltip.is_some() {
+                break;
+            }
         }
+        assert!(
+            checked_return_route,
+            "fixture should dispatch a returning train"
+        );
         let buyer = format!("Buyer: {}", buyer_proto.prototype().label);
         let tooltips = [
             train_tooltip.expect("fixture should dispatch an inbound train"),
