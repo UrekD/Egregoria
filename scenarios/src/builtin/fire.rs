@@ -110,7 +110,7 @@ fn run_resume(ctx: &mut ScenarioCtx) -> Result<(), String> {
     ctx.run_ticks(steps);
     resumed.run_ticks(steps);
     let mut schedule = Simulation::schedule();
-    while replay.advance_tick(&mut replayed, &mut schedule) {}
+    while !replay.advance_tick(&mut replayed, &mut schedule) {}
     let expected = ctx.sim.hashes();
     if resumed.sim.hashes() != expected || replayed.hashes() != expected {
         return Err(
