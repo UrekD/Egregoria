@@ -34,6 +34,8 @@ const SHOWCASE_ORIGIN: Vec2 = vec2(3070.0, 5520.0);
 const SPACING: f32 = 100.0;
 const FREIGHT_APPROACH: Vec2 = vec2(4190.0, 6320.0);
 const SHOWCASE_DAYS: u64 = 3;
+// The initial day commissions workplaces and the grocery supply chain.
+const SHOWCASE_COMMISSIONING_DAYS: u64 = 1;
 const BUSES_PER_LINE: u8 = 5;
 
 use Density::{High, Low};
@@ -90,7 +92,7 @@ fn check_scaled_showcase_food(
     let mut total_due = 0;
     let mut stockout_ticks = 0;
     let effective_food = ItemID::new("effective-food");
-    for day in 0..SHOWCASE_DAYS {
+    for day in SHOWCASE_COMMISSIONING_DAYS..SHOWCASE_DAYS {
         let data = metrics
             .closed_day(day, SHOWCASE_DAYS * TICKS_PER_BUDGET_DAY)
             .ok_or_else(|| format!("Missing closed Showcase day {}", day + 1))?;
@@ -116,8 +118,9 @@ fn check_scaled_showcase_food(
     }
     let fill_rate = total_filled as f64 / total_due as f64;
     let stockout_hours = stockout_ticks as f64 / TICKS_PER_HOUR as f64 / resident_days;
+    let operating_days = SHOWCASE_DAYS - SHOWCASE_COMMISSIONING_DAYS;
     let summary = format!(
-        "{total_filled}/{total_due} baskets filled, {stockout_hours:.3} effective-food stockout hours/resident-day over {SHOWCASE_DAYS} closed days"
+        "{total_filled}/{total_due} baskets filled, {stockout_hours:.3} effective-food stockout hours/resident-day over {operating_days} closed operating days"
     );
     // Match the Realistic Showcase household targets in economy_loop.
     if fill_rate < 0.8 || stockout_hours > 1.5 {
@@ -240,7 +243,7 @@ fn build_showcase(options: SimulationOptions) -> Result<(ScenarioCtx, usize), St
     paint_zone_blocks(&mut ctx, SHOWCASE_ORIGIN, SPACING, housing);
     check_commands(&ctx.sim)?;
     // Give the existing service sites time to hire before growable workplaces open.
-    run_showcase_ticks(&mut ctx, 3 * TICKS_PER_HOUR, start, &mut resident_hours);
+    ctx.run_ticks(3 * TICKS_PER_HOUR);
     paint_zone_blocks(&mut ctx, SHOWCASE_ORIGIN, SPACING, workplaces);
     check_commands(&ctx.sim)?;
 
@@ -278,7 +281,7 @@ fn build_showcase(options: SimulationOptions) -> Result<(ScenarioCtx, usize), St
         rate_permille: 0,
     }]);
     check_commands(&ctx.sim)?;
-    run_showcase_ticks(&mut ctx, 2 * TICKS_PER_HOUR, start, &mut resident_hours);
+    ctx.run_ticks(2 * TICKS_PER_HOUR);
     ctx.sim.apply_commands([&WorldCommand::SetTaxRate {
         zone: Office,
         rate_permille: DEFAULT_TAX_RATE_PERMILLE,
@@ -286,9 +289,15 @@ fn build_showcase(options: SimulationOptions) -> Result<(ScenarioCtx, usize), St
     check_commands(&ctx.sim)?;
 
     for day in 1..=SHOWCASE_DAYS {
-        let target = start + day * TICKS_PER_BUDGET_DAY;
-        let ticks = target - ctx.sim.get_tick();
-        run_showcase_ticks(&mut ctx, ticks, start, &mut resident_hours);
+        if day <= SHOWCASE_COMMISSIONING_DAYS {
+            let target = start + day * TICKS_PER_BUDGET_DAY;
+            ctx.run_ticks(target - ctx.sim.get_tick());
+        } else {
+            for _ in 0..HOURS_PER_DAY {
+                resident_hours += ctx.sim.world().humans.len();
+                ctx.run_ticks(TICKS_PER_HOUR);
+            }
+        }
         println!(
             "Showcase City: day {day} complete, {} residents, {} completed bus trips",
             ctx.sim
@@ -303,14 +312,6 @@ fn build_showcase(options: SimulationOptions) -> Result<(ScenarioCtx, usize), St
     super::services_basic::check_service_network(&ctx, plant, &sites, "Showcase City")?;
     check_showcase(&ctx.sim, plant, freight, &roads)?;
     Ok((ctx, resident_hours))
-}
-
-fn run_showcase_ticks(ctx: &mut ScenarioCtx, ticks: u64, start: u64, resident_hours: &mut usize) {
-    ctx.run_ticks_observed(ticks, |sim| {
-        if (sim.get_tick() - start) % TICKS_PER_HOUR == 0 {
-            *resident_hours += sim.world().humans.len();
-        }
-    });
 }
 
 fn build_grid(
@@ -647,12 +648,15 @@ mod tests {
     use simulation::economy::EconomyDayMetrics;
     use simulation::map::ZoneGrid;
 
-    fn food_days(filled: [u64; 3], stockout_ticks: u64) -> DailyEconomyMetrics {
+    const RESIDENT_HOURS: usize = 1_350 * 24 * 2;
+
+    fn food_days(filled: [u64; 3], stockout_ticks: [u64; 3]) -> DailyEconomyMetrics {
         DailyEconomyMetrics {
             days: filled
                 .into_iter()
+                .zip(stockout_ticks)
                 .enumerate()
-                .map(|(day, filled)| {
+                .map(|(day, (filled, stockout_ticks))| {
                     (
                         day as u64,
                         EconomyDayMetrics {
@@ -674,25 +678,32 @@ mod tests {
     #[test]
     fn population_scale_showcase_rejects_food_shortages_before_the_final_day() {
         let scale = PopulationScale::try_new(4).unwrap();
-        let hours = 1_350 * 24 * 3;
-        assert!(check_scaled_showcase_food(scale, &food_days([1, 1, 1_373], 0), hours).is_err());
-        assert!(check_scaled_showcase_food(scale, &food_days([1_373; 3], 0), hours).is_ok());
+        let metrics = food_days([1_373, 1, 1_373], [0; 3]);
+        assert!(check_scaled_showcase_food(scale, &metrics, RESIDENT_HOURS).is_err());
     }
 
     #[test]
     fn population_scale_showcase_rejects_food_stockouts_with_full_baskets() {
         let scale = PopulationScale::try_new(4).unwrap();
-        let metrics = food_days([1_373; 3], 1_350 * 2 * TICKS_PER_HOUR);
-        assert!(check_scaled_showcase_food(scale, &metrics, 1_350 * 24 * 3).is_err());
+        let metrics = food_days([1_373; 3], [1_350 * 2 * TICKS_PER_HOUR; 3]);
+        assert!(check_scaled_showcase_food(scale, &metrics, RESIDENT_HOURS).is_err());
     }
 
     #[test]
     fn population_scale_showcase_rejects_realistic_mode() {
-        let metrics = food_days([1_373; 3], 0);
+        let metrics = food_days([1_373; 3], [0; 3]);
         assert!(
-            check_scaled_showcase_food(PopulationScale::REALISTIC, &metrics, 1_350 * 24 * 3)
+            check_scaled_showcase_food(PopulationScale::REALISTIC, &metrics, RESIDENT_HOURS)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn population_scale_showcase_scores_closed_days_after_commissioning() {
+        let scale = PopulationScale::try_new(4).unwrap();
+        // Effective-food stockout ticks from the Realistic Showcase reference slot.
+        let metrics = food_days([1_373; 3], [80_435_293, 16_958_082, 517_074]);
+        assert!(check_scaled_showcase_food(scale, &metrics, RESIDENT_HOURS).is_ok());
     }
 
     #[test]
