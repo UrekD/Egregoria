@@ -417,9 +417,12 @@ pub(super) fn lane_turn_successors(map: &Map, lane: LaneID) -> impl Iterator<Ite
         .flat_map(move |inter| inter.turns_from(lane).map(|(turn, _)| turn.dst))
 }
 
-pub(super) fn driving_lane_cost(lane: &Lane, seed: u32) -> f32 {
-    lane.points.length() / lane.speed_limit
-        + common::rand::randu(lane.dist_from_bottom.to_bits() ^ seed)
+pub(super) fn driving_lane_cost(map: &Map, lane: &Lane, seed: u32) -> f32 {
+    let bias = map
+        .lane_scoring_pilot()
+        .and_then(|pilot| pilot.wait_real_seconds(lane.id))
+        .unwrap_or_else(|| common::rand::randu(lane.dist_from_bottom.to_bits() ^ seed));
+    lane.points.length() / lane.speed_limit + bias
 }
 
 pub(super) fn driving_heuristic(pos: Option<Vec3>, end_pos: Vec3) -> f32 {
@@ -445,7 +448,7 @@ pub(super) fn search_driving(
                 let cost = map
                     .lanes
                     .get(next)
-                    .map_or(f32::INFINITY, |lane| driving_lane_cost(lane, seed));
+                    .map_or(f32::INFINITY, |lane| driving_lane_cost(map, lane, seed));
                 (next, OrderedFloat(cost))
             })
         },

@@ -1,5 +1,5 @@
 {
-  "version": "0.11.0",
+  "version": "0.11.0+commands.2",
   "enabled": true,
   "commands": [
     [

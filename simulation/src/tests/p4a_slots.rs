@@ -66,7 +66,7 @@ fn l8_golden_city() -> Simulation {
 }
 
 #[test]
-fn p4a_detached_snapshot_matches_p6_golden_bytes() {
+fn p4a_integrated_loader_preserves_p6_golden_city() {
     // Produced by the synchronous slot encoder at 4ad53c84 with revision 0x12345678.
     const ZIP_HEX: &str = concat!(
         "7801eddd6f6c1be51d07f0e712254dd2867551a846b755e586f6af21c4699ab651cbdab43414216d2b644344e174393f",
@@ -172,15 +172,29 @@ fn p4a_detached_snapshot_matches_p6_golden_bytes() {
 
     let root = TestRoot::new();
     let id = SlotId::new("golden").unwrap();
-    let revision = SnapshotRevision::new(0x1234_5678);
-    let city = l8_golden_city();
-    assert!(matches!(
-        city.save_to_slot(&root.0, &id, revision).unwrap(),
-        SavePhase::Complete
-    ));
     let paths = slot_paths(&root.0, &id).unwrap();
-    assert_eq!(fs::read(&paths.zip).unwrap(), zip);
-    assert_eq!(fs::read(&paths.replay).unwrap(), REPLAY);
+    fs::write(&paths.zip, &zip).unwrap();
+    fs::write(&paths.replay, REPLAY).unwrap();
+    let city = l8_golden_city();
+    // This serialization fixture deliberately has no terrain. Exercise the
+    // same header and resource decoders used by the slot loader.
+    let raw = CompressedBincode::decompress(&zip).unwrap();
+    let (header, payload) = crate::snapshot_header(&raw).unwrap();
+    header.check_load_compatibility().unwrap();
+    let loaded: Simulation = Bincode::decode(payload).unwrap();
+    let mut expected = city.hashes();
+    let mut actual = loaded.hashes();
+    expected.remove("replay");
+    actual.remove("replay");
+    assert_eq!(actual, expected);
+    assert!(loaded.read::<Replay>().obsolete_recording_discarded());
+    assert!(matches!(
+        Simulation::load_replay_from_slot(&root.0, &id),
+        Err(SaveLoadError::IncompatibleReplay { version }) if version == "0.11.1"
+    ));
+    let saved = loaded.encode_slot(SnapshotRevision::new(0x12345679)).unwrap();
+    let header = Simulation::compressed_snapshot_header(&saved.snapshot).unwrap();
+    assert_ne!(header.version, "0.11.1", "P7 must write a new save version");
 }
 
 #[test]
@@ -363,6 +377,80 @@ fn p4a_detached_capture_matches_legacy_bytes_after_the_city_advances() {
             legacy_hashes
         );
     }
+}
+
+#[test]
+fn p7_snapshot_loads_p6_slot_with_disabled_replay() {
+    if !crate::tests::in_prototype_fixture_process(
+        module_path!(),
+        "p7_snapshot_loads_p6_slot_with_disabled_replay",
+    ) {
+        return;
+    }
+    crate::tests::load_unprofiled_prototypes();
+    let root = TestRoot::new();
+    let id = SlotId::new("floor").unwrap();
+    let paths = slot_paths(&root.0, &id).unwrap();
+    // Published by P6 (c0041a8d) from new_authored_flat(2, 6042), revision 1.
+    fs::write(
+        &paths.zip,
+        include_bytes!("fixtures/p6-disabled-replay.zip"),
+    )
+    .unwrap();
+
+    let city = Simulation::load_from_slot(&root.0, &id).unwrap();
+    assert_eq!(city.get_tick(), 1);
+    let replay = city.read::<crate::Replay>();
+    assert!(!replay.enabled);
+    assert!(!replay.obsolete_recording_discarded());
+    assert_eq!(replay.command_count(), 0);
+    assert_eq!(replay.version, crate::utils::replay::replay_version());
+    assert!(!paths.replay.exists());
+}
+
+#[test]
+fn p7_snapshot_loads_p6_slot_with_recorded_replay() {
+    if !crate::tests::in_prototype_fixture_process(
+        module_path!(),
+        "p7_snapshot_loads_p6_slot_with_recorded_replay",
+    ) {
+        return;
+    }
+    crate::tests::load_unprofiled_prototypes();
+    let root = TestRoot::new();
+    let id = SlotId::new("floor").unwrap();
+    let paths = slot_paths(&root.0, &id).unwrap();
+    // Published by P6 (c0041a8d) with recording enabled, Flat seed 6042,
+    // 16 terrain chunks, and snapshot revision 1.
+    fs::write(
+        &paths.zip,
+        include_bytes!("fixtures/p6-recorded-replay.zip"),
+    )
+    .unwrap();
+    fs::write(
+        &paths.replay,
+        include_bytes!("fixtures/p6-recorded-replay.json"),
+    )
+    .unwrap();
+
+    assert!(matches!(
+        Simulation::load_replay_from_slot(&root.0, &id),
+        Err(crate::SaveLoadError::IncompatibleReplay { version }) if version == "0.11.0"
+    ));
+    let city = Simulation::load_from_slot(&root.0, &id).unwrap();
+    assert_eq!(city.get_tick(), 1);
+    let replay = city.read::<crate::Replay>();
+    assert!(!replay.enabled);
+    assert!(replay.obsolete_recording_discarded());
+    assert_eq!(replay.command_count(), 0);
+    drop(replay);
+    city.save_to_slot(&root.0, &id, SnapshotRevision::new(2))
+        .unwrap();
+    let reopened = Simulation::load_from_slot(&root.0, &id).unwrap();
+    assert_eq!(reopened.hashes(), city.hashes());
+    assert!(!reopened
+        .read::<crate::Replay>()
+        .obsolete_recording_discarded());
 }
 
 #[test]

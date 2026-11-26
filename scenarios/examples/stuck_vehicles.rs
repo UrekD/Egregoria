@@ -13,14 +13,16 @@
 
 use geom::Vec3;
 use prototypes::{game_secs_to_ticks, GameTime, SECONDS_PER_MINUTE, TICKS_PER_HOUR};
+use simulation::diagnostics::elapsed_tick;
 use simulation::economy::TripStats;
 use simulation::map::{
-    LaneKind, Map, PathKind, Pathfinder, ProjectFilter, ProjectKind, Traversable,
-    TraverseDirection, TraverseKind,
+    LaneKind, Map, PathKind, Pathfinder, ProjectFilter, ProjectKind, TrafficBehavior, Traversable,
+    TraverseDirection, TraverseKind, TurnID,
 };
 use simulation::map_dynamic::ItineraryTarget;
 use simulation::map_dynamic::{Itinerary, RoutingStep};
-use simulation::transportation::{Location, VehicleState};
+use simulation::transportation::road::calc_decision;
+use simulation::transportation::{Location, TransportGrid, Vehicle, VehicleState};
 use simulation::utils::scheduler::SeqSchedule;
 use simulation::VehicleID;
 use simulation::{Simulation, SlotId};
@@ -90,6 +92,151 @@ impl StationaryDelay {
     }
 }
 
+#[derive(Default)]
+struct SpillbackProbe {
+    active: BTreeMap<TurnID, (u64, bool)>,
+    longest: u64,
+}
+
+impl SpillbackProbe {
+    fn sample(&mut self, sim: &Simulation, tick: u64) {
+        let map = sim.map();
+        let seconds = sim.read::<GameTime>().seconds;
+        let mut occupied_starts = BTreeMap::new();
+        let mut upstream = Vec::new();
+        for (id, car) in sim.world().vehicles.iter() {
+            if car.collider.is_none() || car.vehicle.state.is_parked() || car.speed.0.abs() > 0.1 {
+                continue;
+            }
+            let Some(path) = car.it.get_travers().map(|traverse| traverse.kind) else {
+                continue;
+            };
+            match path {
+                TraverseKind::Turn(turn) => upstream.push((turn, id)),
+                TraverseKind::Lane(lane) => {
+                    let Some(lane_data) = map.get(lane) else {
+                        continue;
+                    };
+                    let points = &lane_data.points;
+                    let radius = car.vehicle.kind.width() * 0.5;
+                    if points.first().is_close(car.trans.pos, 24.0 + radius) {
+                        occupied_starts.entry(lane).or_insert(id);
+                    }
+                    if points.last().is_close(car.trans.pos, 5.0 + radius) {
+                        let next = car
+                            .it
+                            .get_route()
+                            .and_then(|route| route.reversed_route.last());
+                        if let Some(TraverseKind::Turn(turn)) = next.map(|traverse| traverse.kind) {
+                            upstream.push((turn, id));
+                        }
+                    }
+                }
+            }
+        }
+        let mut next_active = BTreeMap::new();
+        for (turn, vehicle) in upstream {
+            let Some(&blocker) = occupied_starts.get(&turn.dst).filter(|&&id| id != vehicle) else {
+                continue;
+            };
+            let Some(source) = map.get(turn.src) else {
+                continue;
+            };
+            let permissive = matches!(
+                source.control.get_behavior(seconds),
+                TrafficBehavior::GREEN | TrafficBehavior::STOP
+            );
+            let (start, permissive_seen) = next_active
+                .entry(turn)
+                .or_insert_with(|| self.active.get(&turn).copied().unwrap_or((tick, false)));
+            *permissive_seen |= permissive;
+            if *permissive_seen && tick - *start > self.longest {
+                self.longest = tick - *start;
+                if self.longest == SAMPLE_TICKS || self.longest % (SAMPLE_TICKS * 10) == 0 {
+                    println!(
+                        "TRACE_SPILLBACK_CANDIDATE tick={tick} start={start} turn={turn:?} upstream={vehicle:?} egress_blocker={blocker:?}"
+                    );
+                }
+            }
+        }
+        self.active = next_active;
+    }
+}
+
+fn braking_evidence(sim: &Simulation, id: VehicleID) -> Option<(f32, f32, Vec<String>)> {
+    let car = &sim.world().vehicles[id];
+    let grid = sim.read::<TransportGrid>();
+    let (_, own) = grid.get(car.collider.as_ref()?.0)?;
+    let map = sim.map();
+    let time = sim.read::<GameTime>();
+    let radius = 12.0 + (own.speed.powi(2) / (2.0 * car.vehicle.kind.deceleration())).min(100.0);
+    let neighbours: Vec<_> = grid
+        .query_around(car.trans.pos.xy(), radius)
+        .filter_map(|(handle, pos)| Some((handle, pos, grid.get(handle)?.1)))
+        .collect();
+    let decide = |neighbours: &[_]| {
+        // Evaluate a copy of the ordinary braking decision at this tick.
+        let mut vehicle = Vehicle {
+            state: VehicleState::Driving,
+            wait_time: 0.0,
+            ang_velocity: car.vehicle.ang_velocity,
+            kind: car.vehicle.kind,
+            tint: car.vehicle.tint,
+            max_speed_multiplier: car.vehicle.max_speed_multiplier,
+            flag: car.vehicle.flag,
+        };
+        calc_decision(
+            id,
+            &mut vehicle,
+            &map,
+            &time,
+            &car.trans,
+            own,
+            &car.it,
+            neighbours.iter().map(|&(_, pos, state)| (pos, state)),
+        )
+        .0
+    };
+    let with = decide(&neighbours);
+    let without = decide(&[]);
+    let colliders = if with == 0.0 && without > 0.0 {
+        neighbours
+            .iter()
+            .filter(|neighbour| decide(std::slice::from_ref(*neighbour)) == 0.0)
+            .map(|&(handle, pos, state)| {
+                let owner = grid.collider_owner(sim.world(), handle);
+                format!("{owner:?}/{:?}@{pos:?}/z={:.2}", state.group, state.height)
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    Some((with, without, colliders))
+}
+
+fn cycle_evidence(
+    sim: &Simulation,
+    start: VehicleID,
+    blockers: &BTreeMap<VehicleID, VehicleID>,
+) -> Vec<String> {
+    let mut visited = BTreeSet::new();
+    let mut id = start;
+    let mut edges = Vec::new();
+    while visited.insert(id) {
+        let next = blockers[&id];
+        let vehicle = &sim.world().vehicles[id];
+        edges.push(format!(
+            "{id:?}->{next:?} pos={:?} speed={:.2} flag={} movement={:?}",
+            vehicle.trans.pos,
+            vehicle.speed.0,
+            vehicle.vehicle.flag,
+            vehicle.it.get_travers().map(|path| path.kind)
+        ));
+        id = next;
+    }
+    edges
+}
+
 fn advance_sample(sim: &mut Simulation, sched: &mut SeqSchedule, remaining_ticks: u64) -> u64 {
     let batch = remaining_ticks.min(SAMPLE_TICKS);
     for _ in 0..batch {
@@ -118,6 +265,8 @@ fn main() {
 
     let mut still: BTreeMap<VehicleID, Still> = BTreeMap::new();
     let mut stationary_delay = StationaryDelay::default();
+    let mut spillback = SpillbackProbe::default();
+    let mut peak_zero = 0;
     // Vehicles that crossed the threshold, with the class seen at that moment.
     let mut episodes: BTreeMap<VehicleID, (String, u32)> = BTreeMap::new();
     let mut episode_classes: BTreeMap<String, usize> = BTreeMap::new();
@@ -125,11 +274,26 @@ fn main() {
     let mut max_queue: BTreeMap<String, usize> = BTreeMap::new();
     let start = sim.read::<GameTime>().seconds;
     let start_completions = JourneyCompletions::from(&*sim.read::<TripStats>());
+    println!(
+        "TRACE_START version=1 elapsed_tick={} calendar_tick={} sample_ticks={SAMPLE_TICKS} planned_ticks={ticks} workers=1",
+        elapsed_tick(&sim).0, sim.get_tick()
+    );
+    println!(
+        "TRACE_WORKLOAD humans={} vehicles={} companies={} trains={} roads={}",
+        sim.world().humans.len(),
+        sim.world().vehicles.len(),
+        sim.world().companies.len(),
+        sim.world().trains.len(),
+        sim.map().roads().len()
+    );
+    println!("TRACE_STOCK_TRAFFIC enabled={}", sim.map().uses_stock_traffic());
 
     let mut done = 0;
     while done < ticks {
         done += advance_sample(&mut sim, &mut sched, ticks - done);
         let now = sim.read::<GameTime>().seconds;
+        let tick = elapsed_tick(&sim).0;
+        spillback.sample(&sim, tick);
         if let Ok(snap) = std::env::var("PROBE_SNAP") {
             let v: Vec<f32> = snap.split(',').map(|x| x.parse().unwrap()).collect();
             if (now - start) / 60 == v[3] as u32 && (now - start) % 60 < SAMPLE_SECONDS as u32 {
@@ -140,6 +304,12 @@ fn main() {
             watch_vehicle(&sim, &watch, (now - start) / 60);
         }
         let world = sim.world();
+        let zero = world
+            .vehicles
+            .values()
+            .filter(|v| v.collider.is_some() && !v.vehicle.state.is_parked() && v.speed.0 == 0.0)
+            .count();
+        peak_zero = peak_zero.max(zero);
         still.retain(|id, _| world.vehicles.contains_key(*id));
         for (id, v) in world.vehicles.iter() {
             let moving = v.collider.is_none()
@@ -172,7 +342,7 @@ fn main() {
             cells.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             cells.truncate(4);
             println!(
-                "t+{}min stuck={} driving={} cells={cells:?}",
+                "t+{}min elapsed_tick={tick} stuck={} exact_zero={zero} colliders={} cells={cells:?}",
                 (now - start) / 60,
                 stuck.len(),
                 sim.world()
@@ -199,8 +369,9 @@ fn main() {
             let list = examples.entry(class.clone()).or_default();
             if list.len() < 4 {
                 list.push(format!(
-                    "t+{}min {id:?} queue={queue} {detail}",
-                    (now - start) / 60
+                    "t+{}min elapsed_tick={tick} {id:?} queue={queue} {detail} braking={:?}",
+                    (now - start) / 60,
+                    braking_evidence(&sim, id)
                 ));
             }
             if class.contains("wait_reroute") && std::env::var("PROBE_DIAG").is_ok() {
@@ -232,6 +403,10 @@ fn main() {
     let completions = JourneyCompletions::from(&*sim.read::<TripStats>());
     println!("{}", completions.report_since(start_completions));
     let final_stuck: usize = final_classes.values().map(|(count, _)| count).sum();
+    println!(
+        "TRACE_END elapsed_tick={} calendar_tick={} peak_exact_zero={peak_zero} sampled_spillback_candidate_ticks={}",
+        elapsed_tick(&sim).0, sim.get_tick(), spillback.longest
+    );
     let longest_minutes =
         f64::from(stationary_delay.longest_seconds) / f64::from(SECONDS_PER_MINUTE);
     println!(
@@ -437,7 +612,7 @@ fn classify(
     } else {
         format!("{head} {:?} at={at}", v.vehicle.kind)
     };
-    let detail = format!(
+    let mut detail = format!(
         "pos=({:.1},{:.1},{:.1}) dir=({:.2},{:.2}) drive_d={driving:?} park_d={parking:?} it_point={:?} travers={:?} err={:?}",
         pos.x,
         pos.y,
@@ -448,6 +623,12 @@ fn classify(
         v.it.get_travers().map(|t| t.kind),
         driver.and_then(|(_, h)| h.router.last_error),
     );
+    if head == "cycle" {
+        detail.push_str(&format!(
+            " inferred_cycle={:?}",
+            cycle_evidence(sim, head_id, blockers)
+        ));
+    }
     (class, detail)
 }
 

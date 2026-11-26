@@ -22,6 +22,9 @@ use crate::{HumanID, Simulation, SoulID};
 pub use crate::economy::cargo::ImportStatus;
 pub use crate::souls::goods_company::RecipeBlocker;
 pub use crate::souls::residence::PowerStatus;
+pub use crate::transportation::queue_diagnostics::{
+    explain_queue, parking_pressure, QueueExplanation, QueueLimits, QueueRevision,
+};
 
 #[derive(Debug)]
 pub struct BuildingDiagnostics {

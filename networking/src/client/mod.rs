@@ -27,6 +27,7 @@ pub struct FrameInputs<I> {
 
 #[derive(Debug)]
 pub struct ServerInput<I> {
+    pub sender: u32,
     pub sent_by_me: bool,
     pub inp: I,
 }
@@ -97,7 +98,7 @@ impl<W: DeserializeOwned, I: Serialize + DeserializeOwned + Default> Client<W, I
             lag_compensate: conf.frame_buffer_advance,
             step: Timestep::default(),
             _phantom: Default::default(),
-            version: conf.version,
+            version: crate::wire_version(&conf.version),
         })
     }
 
@@ -395,5 +396,58 @@ impl<W: DeserializeOwned, I: Serialize + DeserializeOwned + Default> Client<W, I
             }
             ClientState::Disconnected { ref reason } => reason.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn p7_ingress_rejects_released_p6_handshake() {
+    use crate::{Server, ServerConfiguration, ServerPollResult};
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::time::{Duration, Instant};
+
+    let release = include_str!("../../../VERSION");
+    let floor = "0.11.1";
+    let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let mut server = Server::<u64, Vec<u8>>::start(ServerConfiguration {
+        start_frame: Frame(0),
+        period: Duration::from_millis(20),
+        port: Some(port),
+        virtual_client: None,
+        version: release.into(),
+        always_run: false,
+    })
+    .unwrap();
+    let mut peer = Client::<u64, Vec<u8>>::connect(ConnectConf {
+        name: "floor".into(),
+        addr: Ipv4Addr::LOCALHOST.into(),
+        port: Some(port),
+        frame_buffer_advance: 3,
+        version: floor.into(),
+    })
+    .unwrap();
+    // P6 sends its release string verbatim in the unchanged Connect packet.
+    peer.version = floor.into();
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        assert!(Instant::now() < deadline, "floor peer got no verdict");
+        assert!(matches!(
+            server.poll(&19, Frame(0), None),
+            ServerPollResult::Wait(None)
+        ));
+        match peer.poll(Vec::new()) {
+            PollResult::Disconnect(reason) => {
+                assert!(reason.contains("Incompatible versions"), "{reason}");
+                break;
+            }
+            PollResult::Wait(_) => {}
+            _ => panic!("floor peer passed authentication"),
+        }
+        std::thread::sleep(Duration::from_millis(5));
     }
 }

@@ -2,7 +2,7 @@ use crate::economy::population::PopulationScale;
 use crate::utils::scheduler::SeqSchedule;
 use crate::world_command::{ReplayWorldCommand, WorldCommand};
 use crate::{SaveLoadError, Simulation, SimulationOptions, INITIAL_TICK, START_COMMANDS};
-use common::saveload::{Encoder, JSONPretty, SnapshotRevision, JSON};
+use common::saveload::{Encoder, JSONPretty, SnapshotRevision, COMMAND_PROTOCOL_REVISION, JSON};
 use prototypes::Tick;
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Serialize};
@@ -150,6 +150,8 @@ pub struct Replay {
     pub last_tick_recorded: Tick,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     timeline: Option<ReplayTimeline>,
+    #[serde(skip)]
+    obsolete_recording_discarded: bool,
 }
 
 fn deserialize_replay_commands<'de, D: serde::Deserializer<'de>>(
@@ -187,20 +189,32 @@ struct ReplayBatch {
 impl Default for Replay {
     fn default() -> Self {
         Self {
-            version: crate::VERSION.to_owned(),
+            version: replay_version(),
             enabled: false,
             registry: None,
             commands: ReplayCommands::Recording(ReplayLog::default()),
             last_tick_recorded: Tick::default(),
             timeline: None,
+            obsolete_recording_discarded: false,
         }
     }
 }
 
 impl Replay {
+    /// Whether loading the city discarded an embedded recording from P6.
+    pub fn obsolete_recording_discarded(&self) -> bool {
+        self.obsolete_recording_discarded
+    }
+
+    fn validate_embedded_registry(&self) -> io::Result<()> {
+        if self.enabled || self.registry.is_some() {
+            self.check_registry()?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn check_registry(&self) -> io::Result<()> {
-        crate::check_prototype_registry(self.registry)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+        crate::check_prototype_registry(self.registry).map_err(replay_decode_error)
     }
 
     pub(crate) fn bootstrap_options(&self) -> io::Result<SimulationOptions> {
@@ -245,7 +259,9 @@ impl Replay {
         let scale = options.population_scale().map_err(|error| {
             io::Error::new(io::ErrorKind::InvalidData, format!("Replay Init: {error}"))
         })?;
-        if self.version == crate::PRE_SCALE_VERSION && scale != PopulationScale::REALISTIC {
+        if replay_release(&self.version) == crate::PRE_SCALE_VERSION
+            && scale != PopulationScale::REALISTIC
+        {
             return Err(invalid_replay(
                 "pre-SCALE replay must use Realistic population",
             ));
@@ -406,12 +422,20 @@ fn invalid_replay(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+pub(crate) fn replay_version() -> String {
+    format!("{}+{COMMAND_PROTOCOL_REVISION}", crate::VERSION)
+}
+
+fn replay_release(version: &str) -> &str {
+    version.split_once('+').map_or(version, |(release, _)| release)
+}
+
 pub(crate) fn replay_version_error(version: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
         format!(
             "Replay has version {version:?}, expected {:?}",
-            crate::VERSION
+            replay_version()
         ),
     )
 }
@@ -420,6 +444,15 @@ fn replay_corrupt(error: io::Error) -> SaveLoadError {
     SaveLoadError::Corrupt {
         version: None,
         reason: format!("replay sidecar: {error}"),
+    }
+}
+
+fn replay_decode_error(error: SaveLoadError) -> io::Error {
+    match error {
+        SaveLoadError::Incompatible { version } | SaveLoadError::IncompatibleReplay { version } => {
+            replay_version_error(&version)
+        }
+        error => io::Error::new(io::ErrorKind::InvalidData, error),
     }
 }
 
@@ -441,9 +474,12 @@ impl ReplayHeader {
     fn decode(bytes: &[u8]) -> Result<Self, SaveLoadError> {
         // Read the header before decoding commands, regardless of JSON field order.
         let header: Self = JSON::decode(bytes).map_err(replay_corrupt)?;
-        if !crate::compatible_save_version(&header.version) {
-            return Err(SaveLoadError::Incompatible {
-                version: header.version,
+        if header.version != replay_version() {
+            let version = header.version;
+            return Err(if crate::compatible_save_version(replay_release(&version)) {
+                SaveLoadError::IncompatibleReplay { version }
+            } else {
+                SaveLoadError::Incompatible { version }
             });
         }
         Ok(header)
@@ -452,6 +488,44 @@ impl ReplayHeader {
 
 impl ReplayJson {
     pub(crate) const RESOURCE_NAME: &'static str = "replay";
+
+    pub(crate) fn decode_snapshot(bytes: &[u8]) -> io::Result<Replay> {
+        match ReplayHeader::decode(bytes) {
+            Ok(header) => {
+                if header.enabled || header.registry.is_some() {
+                    crate::check_prototype_registry(header.registry).map_err(replay_decode_error)?;
+                }
+                JSON::decode(bytes)
+            }
+            Err(SaveLoadError::IncompatibleReplay { version }) if crate::compatible_save_version(&version) => {
+                // The city has its own schema and registry checks. Inspect the
+                // recording envelope without decoding obsolete commands.
+                let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
+                let discarded = legacy.enabled || legacy.commands || legacy.timeline.is_some();
+                if discarded || legacy.registry.is_some() {
+                    crate::check_prototype_registry(legacy.registry).map_err(replay_decode_error)?;
+                }
+                Ok(Replay {
+                    obsolete_recording_discarded: discarded,
+                    ..Replay::default()
+                })
+            }
+            Err(SaveLoadError::IncompatibleReplay { version })
+                if matches!(
+                    version.as_str(),
+                    "0.11.0+commands.1" | "0.11.0+commands.2" | "0.11.1+commands.2"
+                ) =>
+            {
+                // Earlier P7 command envelopes can still be read inside a compatible city.
+                let mut replay: Replay = JSON::decode(bytes)?;
+                replay.validate_embedded_registry()?;
+                replay.recorded_population_scale()?;
+                replay.version = replay_version();
+                Ok(replay)
+            }
+            Err(error) => Err(replay_decode_error(error)),
+        }
+    }
 
     #[cfg(test)]
     pub(crate) fn encode_sidecar(
@@ -501,6 +575,37 @@ impl ReplayJson {
     }
 }
 
+#[derive(Deserialize)]
+struct LegacySnapshotReplay {
+    #[serde(default)]
+    registry: Option<u64>,
+    enabled: bool,
+    #[serde(deserialize_with = "contains_legacy_commands")]
+    commands: bool,
+    #[serde(default)]
+    timeline: Option<serde::de::IgnoredAny>,
+}
+
+fn contains_legacy_commands<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<bool, D::Error> {
+    struct Commands;
+    impl<'de> serde::de::Visitor<'de> for Commands {
+        type Value = bool;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a replay command sequence")
+        }
+
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<bool, A::Error> {
+            let found = seq.next_element::<serde::de::IgnoredAny>()?.is_some();
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(found)
+        }
+    }
+    deserializer.deserialize_seq(Commands)
+}
+
 impl Encoder for ReplayJson {
     const EXTENSION: &'static str = JSON::EXTENSION;
 
@@ -513,14 +618,9 @@ impl Encoder for ReplayJson {
     }
 
     fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> io::Result<T> {
-        let header = ReplayHeader::decode(bytes).map_err(|error| match error {
-            SaveLoadError::Incompatible { version } => replay_version_error(&version),
-            error => io::Error::new(io::ErrorKind::InvalidData, error),
-        })?;
-        // Snapshots may embed a disabled replay that was never started.
+        let header = ReplayHeader::decode(bytes).map_err(replay_decode_error)?;
         if header.enabled || header.registry.is_some() {
-            crate::check_prototype_registry(header.registry)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+            crate::check_prototype_registry(header.registry).map_err(replay_decode_error)?;
         }
         JSON::decode(bytes)
     }
@@ -538,6 +638,45 @@ pub struct SimulationReplayLoader {
 }
 
 impl SimulationReplayLoader {
+    /// Build and decode a versioned command sidecar for playback from an existing
+    /// snapshot. Batch steps count completed steps since that snapshot.
+    pub fn checkpoint_playback<'a>(
+        start: Tick,
+        revision: SnapshotRevision,
+        steps: u64,
+        batches: impl IntoIterator<Item = (u64, bool, &'a [WorldCommand])>,
+    ) -> Result<Self, SaveLoadError> {
+        let mut replay = Replay {
+            enabled: true,
+            registry: prototypes::try_prototypes().map(|registry| registry.fingerprint()),
+            ..Replay::default()
+        };
+        replay.record_constructor_end(start);
+        let mut earliest = 0;
+        for (step, advances, commands) in batches {
+            if step < earliest || step > steps || (advances && step == steps) || commands.is_empty()
+            {
+                return Err(replay_corrupt(invalid_replay("Invalid checkpoint replay batch")));
+            }
+            let tick = start.0.checked_add(step)
+                .map(Tick).ok_or_else(|| replay_corrupt(invalid_replay("Replay clock overflow")))?;
+            let first = replay.command_count();
+            for command in commands {
+                replay.push(tick, command.clone());
+            }
+            replay.timeline.as_mut().unwrap().steps = step;
+            replay.record_batch(first, advances, tick);
+            earliest = step + u64::from(advances);
+        }
+        replay.timeline.as_mut().unwrap().steps = steps;
+        replay.last_tick_recorded = start.0.checked_add(steps)
+            .map(Tick).ok_or_else(|| replay_corrupt(invalid_replay("Replay clock overflow")))?;
+        let mut bytes = Vec::new();
+        ReplayJson::write_sidecar(&replay, revision, &mut bytes).map_err(replay_corrupt)?;
+        let replay = ReplayJson::decode_sidecar(&bytes, Some(revision))?;
+        Ok(Self::new(replay, start, 0))
+    }
+
     pub(crate) fn new(mut replay: Replay, pastt: Tick, idx: usize) -> Self {
         replay.commands.make_contiguous();
         let mut legacy_groups = Vec::new();
@@ -816,7 +955,7 @@ fn scale_t1_replay_boundary_keeps_legacy_edit_pending() {
 #[cfg(test)]
 #[test]
 fn scale_t1_fix_rejects_import_in_replay_constructor() {
-    drop(crate::tests::TestCtx::new());
+    crate::tests::init_test_simulation();
     let mut replay = Replay::default();
     let options = SimulationOptions {
         terrain_size: crate::NewGameOptions::MIN_TERRAIN_CHUNKS,
@@ -831,4 +970,109 @@ fn scale_t1_fix_rejects_import_in_replay_constructor() {
         Simulation::try_from_replay(replay),
         Err(err) if err.to_string() == "Invalid replay constructor batch"
     ));
+}
+
+#[cfg(test)]
+#[test]
+fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
+    crate::tests::init_test_simulation();
+    let registry = prototypes::prototypes().fingerprint();
+    let mut replay = Replay {
+        version: crate::PRE_P7_VERSION.to_owned(),
+        enabled: true,
+        registry: Some(registry),
+        ..Replay::default()
+    };
+    let assert_discarded = |replay: &Replay| {
+        let bytes = JSON::encode(replay).unwrap();
+        let restored = ReplayJson::decode_snapshot(&bytes).unwrap();
+        assert!(restored.obsolete_recording_discarded());
+        assert!(!restored.enabled);
+        assert_eq!(restored.command_count(), 0);
+    };
+    assert_discarded(&replay);
+
+    replay.enabled = false;
+    replay.push(Tick(INITIAL_TICK), WorldCommand::MapLoadParis);
+    assert_discarded(&replay);
+
+    let obsolete = format!(
+        r#"{{"version":"0.11.0","enabled":true,"registry":{registry},"commands":[[1,{{"Obsolete":[]}}]]}}"#
+    );
+    let obsolete = obsolete.as_bytes();
+    assert!(ReplayJson::decode_snapshot(obsolete)
+        .unwrap()
+        .obsolete_recording_discarded());
+    assert!(matches!(
+        ReplayJson::decode_sidecar(obsolete, None),
+        Err(crate::SaveLoadError::IncompatibleReplay { .. })
+    ));
+}
+
+#[cfg(test)]
+#[test]
+fn p7_replay_rejects_floor_identity_before_decoding_commands() {
+    use crate::map::road_edit::{RoadEditStamp, RoadQuote, RoadUpgrade};
+    use crate::map::{LanePatternBuilder, RoadID};
+    use common::saveload::Bincode;
+
+    crate::tests::init_test_simulation();
+    let registry = prototypes::prototypes().fingerprint();
+    let zero = Bincode::encode(&0u64).unwrap();
+    let make = |version: &str| {
+        let mut replay = Replay::default();
+        replay.version = version.to_owned();
+        replay.registry = Some(registry);
+        replay.push(
+            Tick(1),
+            WorldCommand::MapUpgradeRoad {
+                road: RoadID::default(),
+                expected: Bincode::decode::<RoadEditStamp>(&zero).unwrap(),
+                change: RoadUpgrade::Replace(LanePatternBuilder::new().build()),
+                quote: Bincode::decode::<RoadQuote>(&zero).unwrap(),
+            },
+        );
+        replay
+    };
+    let floor = crate::PRE_P7_VERSION;
+    #[derive(Serialize)]
+    struct InvalidPayload<'a> {
+        version: &'a str,
+        commands: &'static str,
+    }
+    let bytes = JSON::encode(&InvalidPayload {
+        version: floor,
+        commands: "not a command list",
+    })
+    .unwrap();
+    assert!(matches!(
+        ReplayJson::decode_sidecar(&bytes, None),
+        Err(SaveLoadError::IncompatibleReplay { version }) if version == floor
+    ));
+    let current = Replay::default().version;
+    assert_ne!(current, floor);
+    let revision = SnapshotRevision::new(12);
+    let preview = format!("{floor}+commands.2");
+    let preview_bytes = ReplayJson::encode_sidecar(&make(&preview), revision).unwrap();
+    assert!(matches!(
+        ReplayJson::decode_sidecar(&preview_bytes, Some(revision)),
+        Err(SaveLoadError::IncompatibleReplay { version }) if version == preview
+    ));
+    let embedded = ReplayJson::decode_snapshot(&preview_bytes).unwrap();
+    assert_eq!(embedded.version, current);
+    assert!(matches!(
+        embedded.commands.get(0).map(|entry| &entry.1),
+        Some(WorldCommand::MapUpgradeRoad { .. })
+    ));
+    let bytes = ReplayJson::encode_sidecar(&make(&current), revision).unwrap();
+    let sidecar = ReplayJson::decode_sidecar(&bytes, Some(revision)).unwrap();
+    assert!(matches!(
+        sidecar.commands.get(0).map(|entry| &entry.1),
+        Some(WorldCommand::MapUpgradeRoad { .. })
+    ));
+    let old_header: ReplayHeader = JSON::decode(&bytes).unwrap();
+    assert_ne!(
+        old_header.version, floor,
+        "a floor reader must reject the header"
+    );
 }

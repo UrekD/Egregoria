@@ -3397,13 +3397,24 @@ impl BridgeTraffic {
 }
 
 #[derive(Default)]
-struct LoopEvidence {
+pub(crate) struct LoopEvidence {
     runs: BTreeMap<VehicleID, (usize, Option<Tick>, usize)>,
-    loops: BTreeMap<LineID, u64>,
+    pub(crate) loops: BTreeMap<LineID, u64>,
 }
 
 impl LoopEvidence {
-    fn observe(&mut self, transit: &Transit) {
+    pub(crate) fn at_boundary(transit: &Transit) -> Self {
+        Self {
+            runs: transit
+                .runs
+                .iter()
+                .map(|(&id, run)| (id, (run.next_stop_idx, run.dwell_until, 0)))
+                .collect(),
+            loops: BTreeMap::new(),
+        }
+    }
+
+    pub(crate) fn observe(&mut self, transit: &Transit) {
         self.runs.retain(|id, _| transit.runs.contains_key(id));
         for (&id, run) in &transit.runs {
             let Some(line) = transit.lines.get(run.line).filter(|line| !line.suspended) else {

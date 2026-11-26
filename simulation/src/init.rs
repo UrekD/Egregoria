@@ -173,6 +173,11 @@ fn register_systems_and_resources() {
     register_system("routing_changed_system", routing_changed_system);
     register_system("routing_update_system", routing_update_system);
     register_system("itinerary_update", itinerary_update);
+    register_system("lane_scoring_update", crate::map::lane_scoring_update);
+    register_system(
+        "queue_diagnostics_update",
+        crate::transportation::queue_diagnostics::queue_diagnostics_update,
+    );
     register_system("road_throughput_update", road_throughput_update);
     register_system("market_update", market_update);
     register_system("cargo_update", cargo_update);
@@ -214,6 +219,7 @@ fn register_systems_and_resources() {
     register_resource_noserialize::<crate::economy::WalkingComponents>();
     register_resource_noserialize::<crate::economy::JobRosters>();
     register_resource_noserialize::<RoadThroughput>();
+    register_resource_noserialize::<crate::transportation::queue_diagnostics::QueueDiagnostics>();
     register_resource_noserialize::<crate::souls::growth::GrowthCache>();
     // The registry is populated once before any simulation uses it.
     unsafe {
@@ -236,6 +242,9 @@ fn register_systems_and_resources() {
     register_resource_default::<MultiplayerState, Bincode>("multiplayer_state");
     register_resource_default::<RandomVehicles, Bincode>("random_vehicles");
     register_resource_default::<Map, Bincode>("map");
+    register_junction_policies();
+    register_junction_admission();
+    register_lane_scoring();
     register_land_ownership();
     register_pending_construction_cuts();
     register_resource_default::<TrainReservations, Bincode>("train_reservations");
@@ -250,7 +259,7 @@ fn register_systems_and_resources() {
     register_transport_grid();
     register_resource_noinit::<RandProvider, Bincode>("randprovider");
     register_resource_default::<Dispatcher, Bincode>("dispatcher");
-    register_resource_default::<Replay, ReplayJson>(ReplayJson::RESOURCE_NAME);
+    register_replay();
     register_resource_default::<Transit, Bincode>("transit");
     register_resource_default::<TripStats, Bincode>("trip_stats");
     register_resource_default::<TransitStats, Bincode>("transit_stats");
@@ -323,6 +332,55 @@ fn register_simulation_options() {
                 }
                 sim.resources.insert(options);
                 Ok(())
+            }),
+        });
+    }
+}
+
+fn register_junction_policies() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "junction_policies",
+            optional: true,
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&sim.map().save_junction_policies(), output)
+            }),
+            load: Box::new(|sim, data| {
+                sim.map_mut().load_junction_policies(Bincode::decode(data)?)
+            }),
+        });
+    }
+}
+
+fn register_junction_admission() {
+    use crate::transportation::junction_admission::JunctionAdmission;
+
+    register_resource_noserialize::<JunctionAdmission>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "junction_admission",
+            optional: true,
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&*sim.read::<JunctionAdmission>(), output)
+            }),
+            load: Box::new(|sim, data| {
+                sim.insert(Bincode::decode::<JunctionAdmission>(data)?);
+                Ok(())
+            }),
+        });
+    }
+}
+
+fn register_lane_scoring() {
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "lane_scoring",
+            optional: true,
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&sim.map().lane_scoring_pilot(), output)
+            }),
+            load: Box::new(|sim, data| {
+                sim.map_mut().load_lane_scoring_pilot(Bincode::decode(data)?)
             }),
         });
     }
@@ -481,6 +539,26 @@ fn register_cargo_progress() {
                     })?;
                     sim.resources.insert(trace);
                 }
+                Ok(())
+            }),
+        });
+    }
+}
+
+fn register_replay() {
+    // SAFETY: Resource registration runs once, before any simulation uses it.
+    unsafe {
+        (*std::ptr::addr_of_mut!(INIT_FUNCS)).push(InitFunc {
+            f: Box::new(|sim| sim.insert(Replay::default())),
+        });
+        (*std::ptr::addr_of_mut!(SAVELOAD_FUNCS)).push(SaveLoadFunc {
+            name: ReplayJson::RESOURCE_NAME,
+            optional: false,
+            save: Box::new(|sim, output| {
+                ReplayJson::encode_writer(&*sim.read::<Replay>(), output)
+            }),
+            load: Box::new(|sim, data| {
+                sim.insert(ReplayJson::decode_snapshot(data)?);
                 Ok(())
             }),
         });

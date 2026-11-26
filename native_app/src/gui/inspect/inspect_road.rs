@@ -34,7 +34,7 @@ thread_local! {
     static SAMPLE: RefCell<Option<RoadSample>> = const { RefCell::new(None) };
 }
 
-pub(crate) fn inspect_road(_uiw: &UiWorld, sim: &Simulation, road: RoadID) -> bool {
+pub(crate) fn inspect_road(uiw: &UiWorld, sim: &Simulation, road: RoadID) -> bool {
     let map = sim.map();
     let Some(segment) = map.get(road) else {
         return false;
@@ -82,6 +82,7 @@ pub(crate) fn inspect_road(_uiw: &UiWorld, sim: &Simulation, road: RoadID) -> bo
             VertScrollSize::Fixed(465.0).show(|| {
                 mincolumn(12.0, || {
                     details.render();
+                    crate::gui::traffic_repair::render_road(uiw, sim, &map, segment);
                     if has_traffic {
                         let (entries, duration) = sim.read::<RoadThroughput>().current_window(road);
                         mincolumn(3.0, || {

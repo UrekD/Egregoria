@@ -911,6 +911,13 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                 self.invalidate(src)?;
                 self.invalidate(dst)?;
                 self.invalidate(junction)?;
+                // Commit projects each surviving lot against both raw child profiles.
+                let segments = [before, after]
+                    .into_iter()
+                    .map(|child| self.roads[child].points().len() - 1)
+                    .sum::<usize>();
+                self.work
+                    .charge(self.map.road_lot_count(live).saturating_mul(segments))?;
                 self.reserve_reassigned_lots([live], None, &[])?;
                 Ok(junction)
             }
@@ -977,13 +984,11 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
     ) -> Result<(), ConnectionError> {
         let mut lots = Vec::new();
         for road in originals {
-            if !self.map.land_ownership().is_tiled() {
-                self.work.charge(self.map.lots.len())?;
-            }
-            let ids = self.map.road_lot_ids(road);
+            self.work.charge(self.map.road_lot_count(road))?;
+            let ids = self.map.road_lots(road);
             if let Some(points) = profile_points {
                 let tile_work = frontage_attempt_work(self.map.roads[road].width, true);
-                for &id in &ids {
+                for id in self.map.road_lots(road) {
                     let samples = frontage_samples(&self.map.lots[id].shape);
                     self.work.charge(reassigned_lot_work(points, samples, tile_work))?;
                 }
@@ -1304,8 +1309,8 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                     self.map
                         .authorize_land_effects(PreparedEffects::Building(building))?;
                 }
-                for id in self.map.road_lot_ids(live) {
-                    self.work.charge(1)?;
+                self.work.charge(self.map.road_lot_count(live))?;
+                for id in self.map.road_lots(live) {
                     self.map.authorize_land_effects(PreparedEffects::Lot(id))?;
                 }
             }
@@ -1328,6 +1333,9 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                 if old.points().as_slice() != road.points().as_slice() {
                     removed.insert(old.id.into());
                     added.push(ConstructionCut::Road(road));
+                }
+                if old.width != road.width {
+                    self.map.authorize_displaced_lots(road.boldline())?;
                 }
             } else {
                 added.push(ConstructionCut::Road(road));
@@ -1448,6 +1456,76 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         }
         Ok((wet, outlines))
     }
+}
+
+pub(crate) struct RoadReplacementProjection {
+    pub(crate) preview: RoadPreview,
+    pub(crate) affected_roads: Vec<RoadID>,
+    pub(crate) affected_roads_omitted: usize,
+    pub(crate) material: u64,
+}
+
+/// Projects the replacement through the same junction interfaces and land/cut
+/// authority as construction. The graph and all allocations belong to preparation.
+pub(crate) fn prepare_road_replacement(
+    map: &Map,
+    id: RoadID,
+    pattern: &LanePattern,
+    remaining: &mut usize,
+) -> Result<RoadReplacementProjection, ConnectionError> {
+    const MAX_PREVIEW_ROADS: usize = 16;
+    let road = map.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
+    let mut tile_tests = MAX_DECK_TILE_TESTS;
+    let mut samples = 65_536;
+    let mut work = CrossingWork::new(remaining, &mut tile_tests, &mut samples);
+    let mut graph = LocalTopology::new(map, &mut work);
+    let from = graph.load_junction(road.src)?;
+    let to = graph.load_junction(road.dst)?;
+    let local = graph.road_keys[&id];
+    graph.roads[local].width = pattern.width();
+    graph.patterns.insert(local, pattern.clone());
+    graph.invalidate(from)?;
+    graph.invalidate(to)?;
+    graph.reserve_lot_clearance(local, 0)?;
+    graph.validate_land()?;
+    let (wet, junctions) = graph.validate()?;
+    for id in &graph.changed_roads {
+        graph
+            .work
+            .charge(graph.roads[*id].interfaced_points().len())?;
+    }
+    let material = common::hash_iter(graph.changed_roads.iter().map(|&local| {
+        let road = &graph.roads[local];
+        (
+            graph.live_roads[&local],
+            road.width.to_bits(),
+            common::hash_iter(
+                road.interfaced_points()
+                    .iter()
+                    .map(|p| (p.x.to_bits(), p.y.to_bits(), p.z.to_bits())),
+            ),
+        )
+    }));
+    let deck = graph.roads[local].interfaced_points();
+    graph.work.charge(deck.len())?;
+    let mut affected_roads = graph
+        .changed_roads
+        .iter()
+        .map(|local| graph.live_roads[local])
+        .collect::<Vec<_>>();
+    affected_roads.sort_unstable();
+    let affected_roads_omitted = affected_roads.len().saturating_sub(MAX_PREVIEW_ROADS);
+    affected_roads.truncate(MAX_PREVIEW_ROADS);
+    Ok(RoadReplacementProjection {
+        preview: RoadPreview {
+            deck: deck.clone(),
+            junctions,
+            crosses_water: wet.contains(&local),
+        },
+        affected_roads,
+        affected_roads_omitted,
+        material,
+    })
 }
 
 fn interfaces(road: &Road) -> (f32, f32) {
@@ -2021,16 +2099,19 @@ fn frontage_samples(shape: &geom::OBB) -> usize {
 
 /// Only lots on this road need the split projection and the subsequent
 /// sample-by-sample frontage check.
-pub(crate) fn reassigned_frontage_work(map: &Map, id: RoadID, points: usize) -> usize {
+pub(crate) fn reserve_reassigned_frontage(
+    map: &Map,
+    id: RoadID,
+    points: usize,
+    remaining: &mut usize,
+) -> Result<(), WaterEditError> {
     let tile_work = frontage_attempt_work(map.roads[id].width, true);
-    map.road_lot_ids(id)
-        .into_iter()
-        .map(|id| {
-            let lot = &map.lots[id];
-            let samples = frontage_samples(&lot.shape);
-            reassigned_lot_work(points, samples, tile_work)
-        })
-        .fold(0, usize::saturating_add)
+    spend_water_work(remaining, map.road_lot_count(id))?;
+    for id in map.road_lots(id) {
+        let samples = frontage_samples(&map.lots[id].shape);
+        spend_water_work(remaining, reassigned_lot_work(points, samples, tile_work))?;
+    }
+    Ok(())
 }
 
 fn reassigned_lot_work(points: usize, samples: usize, tile_work: usize) -> usize {
@@ -2197,6 +2278,57 @@ mod harden1_tests {
         let scanned = map.spatial_map.removal_scan_entries() - before;
         assert!(scanned <= 4 * LOTS + 100, "scanned {scanned} entries");
         assert!(map.lots.is_empty());
+    }
+
+    #[test]
+    fn p7_spatial_density_charges_raw_split_projection_without_wet_tiles() {
+        let mut env = Environment::new(1, 1);
+        env.set_sea_level(Some(-10)).unwrap();
+        assert!(!env.strict_water_siting());
+        let mut map = Map::empty();
+        assert!(map.install_environment(env));
+        let pattern = LanePatternBuilder {
+            rail: true,
+            ..Default::default()
+        }
+        .build();
+        let (_, parent) = map
+            .make_connection(ground(70.0, 100.0), ground(370.0, 100.0), None, &pattern)
+            .unwrap();
+        map.roads[parent].points = PolyLine3::new(
+            (0..=512)
+                .map(|i| Vec3::new(70.0 + 300.0 * (i as f32 / 512.0), 100.0, ROAD_Z_OFFSET))
+                .collect(),
+        );
+        use common::saveload::{Bincode, Encoder};
+        let mut map: Map = Bincode::decode(&Bincode::encode(&map).unwrap()).unwrap();
+        let from = MapProject {
+            kind: parent.into(),
+            pos: ground(220.0, 100.0).pos,
+        };
+        let to = ground(220.0, 200.0);
+        let cost = |map: &Map| {
+            let mut work = WaterTopologyWork::new();
+            let initial = work.remaining;
+            map.prepare_connection(from, to, None, &pattern, Some(&mut work))
+                .unwrap();
+            initial - work.remaining
+        };
+        let baseline = cost(&map);
+        let raw_points = map.roads[parent].points().len();
+        let shape = OBB::new(vec2(400.0, 350.0), Vec2::X, 4.0, 4.0);
+        for _ in 0..200 {
+            Lot::insert(&mut map, parent, shape, 0.0);
+        }
+        let required_projection = 200 * raw_points.saturating_sub(1);
+        assert!(cost(&map) >= baseline + required_projection);
+        let mut work = WaterTopologyWork::new();
+        work.remaining = baseline + required_projection - 1;
+        assert!(matches!(
+            map.prepare_connection(from, to, None, &pattern, Some(&mut work)),
+            Err(ConnectionError::WorkLimit)
+        ));
+        assert_eq!(map.lots.len(), 200);
     }
 
     #[test]

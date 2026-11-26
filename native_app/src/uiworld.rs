@@ -167,6 +167,7 @@ pub struct ReceivedCommands {
     commands: WorldCommands,
     placements: Vec<PlacementResult>,
     pub tile_purchases: Vec<TilePurchaseReceipt>,
+    pub(crate) traffic_edits: Vec<crate::gui::traffic_repair::TrafficEditReceipt>,
     pub(crate) rejections: Vec<(u64, Vec<(usize, &'static str, Rejection)>)>,
 }
 
@@ -188,6 +189,7 @@ impl ReceivedCommands {
     pub(crate) fn receive(&mut self, batch: &crate::sim_thread::AppliedBatch) {
         self.commands.merge(&batch.accepted_commands());
         self.tile_purchases.extend_from_slice(&batch.tile_purchases);
+        self.traffic_edits.extend_from_slice(&batch.traffic_edits);
         self.placements
             .extend(
                 batch

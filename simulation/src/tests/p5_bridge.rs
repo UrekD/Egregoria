@@ -1114,8 +1114,13 @@ fn w2a_fix_replacement_lot_work_depends_on_affected_frontage() {
         work.remaining
     };
     let affected = remaining(&map);
-    for lot in map.lots.values_mut().filter(|lot| lot.parent == original) {
-        lot.parent = unrelated;
+    let lots: Vec<_> = map
+        .lots
+        .iter()
+        .filter_map(|(id, lot)| (lot.parent == original).then_some(id))
+        .collect();
+    for id in lots {
+        map.reparent_lot(id, unrelated);
     }
     assert!(affected < remaining(&map));
 }

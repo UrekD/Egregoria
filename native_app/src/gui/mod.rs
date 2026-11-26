@@ -15,6 +15,7 @@ pub mod inspect;
 pub(crate) mod notifications;
 pub(crate) mod overlays;
 mod textures;
+pub(crate) mod traffic_repair;
 mod tools;
 
 pub use hud::*;

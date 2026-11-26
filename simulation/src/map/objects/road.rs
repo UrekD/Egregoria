@@ -245,6 +245,19 @@ impl Road {
         self.lanes_backward.clear();
     }
 
+    pub(crate) fn install_lane_keys(
+        &mut self,
+        slots: impl IntoIterator<Item = (LaneID, LaneKind, LaneDirection)>,
+    ) {
+        self.clear_staged_lanes();
+        for (id, kind, direction) in slots {
+            match direction {
+                LaneDirection::Forward => self.lanes_forward.insert(0, (id, kind)),
+                LaneDirection::Backward => self.lanes_backward.push((id, kind)),
+            }
+        }
+    }
+
     pub(crate) fn merged_profile(&self, next: &Road, joint: IntersectionID) -> PolyLine3 {
         let mut points = self.points.clone();
         if self.src == joint {
@@ -282,6 +295,10 @@ impl Road {
 
     pub fn n_lanes(&self) -> usize {
         self.lanes_backward.len() + self.lanes_forward.len()
+    }
+
+    pub(crate) fn directed_lanes(&self) -> [&[(LaneID, LaneKind)]; 2] {
+        [&self.lanes_forward, &self.lanes_backward]
     }
 
     /// Returns lanes in left to right order from the source

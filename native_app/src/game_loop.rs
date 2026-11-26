@@ -904,6 +904,7 @@ impl State {
     }
 
     fn pump_simulation(&mut self, frame_profiling: bool) {
+        gui::traffic_repair::submit_comparison_capture(&self.uiw, self.driver.as_mut());
         let Some(driver) = self.driver.as_mut() else {
             self.uiw.write::<Timings>().per_game_system = self.game_schedule.times();
             return;
@@ -919,6 +920,7 @@ impl State {
                     self.last_batch = Some(batch.id);
                     self.applied_batch = Some(batch.id);
                     land_tiles::receive_worker_batch(&self.uiw, &batch);
+                    gui::traffic_repair::receive_worker_batch(&self.uiw, &batch);
                     self.uiw.write::<ReceivedCommands>().receive(&batch);
                     for (index, result) in batch.water_edits {
                         if let WorldCommand::EditWater(edit) = &batch.commands.as_ref()[index] {
@@ -946,9 +948,15 @@ impl State {
                     {
                         let capture = self.capture.take().unwrap();
                         publish_capture(capture, result);
+                    } else {
+                        gui::traffic_repair::receive_comparison_capture(
+                            &self.uiw, reply.id, result.map(|(capture, _)| capture),
+                        );
                     }
                 }
                 ReplyKind::Rejected(error) => {
+                    gui::traffic_repair::reject_worker_batch(&self.uiw, reply.id, error);
+                    gui::traffic_repair::receive_comparison_capture(&self.uiw, reply.id, Err(error.into()));
                     if Some(reply.id) == self.last_batch {
                         self.batch_in_flight = false;
                         self.last_batch = self.applied_batch;
@@ -1028,6 +1036,7 @@ impl State {
         } else {
             gui::specialbuilding::reject_local_batch(&self.uiw, &commands);
             land_tiles::reject_local_batch(&self.uiw, &commands);
+            gui::traffic_repair::reject_local_batch(&self.uiw, &commands);
             for command in commands.iter() {
                 if let WorldCommand::EditWater(edit) = command {
                     self.uiw
@@ -1051,10 +1060,14 @@ impl State {
             return;
         };
         let land_purchase = land_tiles::queued_in(&self.uiw, &commands);
+        let traffic_edit = gui::traffic_repair::worker_batch_queued(&self.uiw, &commands);
         match driver.submit(Request::Batch(commands)) {
             Ok(id) => {
                 if land_purchase {
                     land_tiles::bind_worker_batch(&self.uiw, id);
+                }
+                if traffic_edit {
+                    gui::traffic_repair::bind_worker_batch(&self.uiw, id);
                 }
                 self.last_batch = Some(id);
                 self.batch_in_flight = true;
@@ -1190,6 +1203,7 @@ impl State {
             *self.uiw.write::<NetworkState>() = NetworkState::default();
             self.uiw.write::<SessionState>().generation = generation;
             land_tiles::reset(&self.uiw, generation);
+            gui::traffic_repair::network_reset(&self.uiw, generation);
             let mut io = self.uiw.write::<SaveLoadState>();
             io.threaded = true;
             io.save_result = None;
@@ -1289,6 +1303,7 @@ impl State {
                     self.sim = owner.world;
                     self.game_schedule = owner.schedule;
                     self.uiw.write::<SessionState>().generation = generation;
+                    gui::traffic_repair::network_reset(&self.uiw, generation);
                     let mut io = self.uiw.write::<SaveLoadState>();
                     io.threaded = false;
                     io.network_busy = false;

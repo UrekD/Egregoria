@@ -1,0 +1,40 @@
+{
+  "version": 1,
+  "fixtures": [
+    {
+      "id": "lesce-release",
+      "slot": "lesce_town",
+      "class": "release",
+      "original": {
+        "snapshot": "lesce_town.zip",
+        "metadata": "lesce_town.meta.json",
+        "replay": null,
+        "opening_report": "lesce_town.build.json",
+        "schedule": "p7_wet_lesce_schedule.json"
+      },
+      "fingerprint": {
+        "source_commit": "1c40ecdbfe0e6723c24b2413f3ae440ecc586d03",
+        "run_source_commit": "at-staging",
+        "prototype_tree": "3abe8a5e912cb9ca9bb1bf2847f82788bb8984d3",
+        "base_mod_tree": "a4a368bffd8031150d8c0a7084a7c707ad37342d",
+        "asset_tree": "ad24a68a1c6daa25efc494b1fe299a2f05c43ee5",
+        "build_profile": "at-staging",
+        "features": [],
+        "snapshot_schema": "0.11.1",
+        "snapshot_revision": "d9241d9d40d045f0e6a1c1f0797b3431",
+        "snapshot_sha256": "72f27e15a7b0e358236fae20a2d9a2bfd3d1ff300ca9d4390df544afed36bf1a",
+        "metadata_sha256": "d03e73bf4152a931642bf106f6f90d446296baa7bc4f34ca0f724ace37d86453",
+        "replay_sha256": null,
+        "schedule_sha256": "8bfbd94a28e7659c2afee1e53a3fe77c26ec288110409b1231c7bd75b4aed568",
+        "initial_elapsed_tick": 720000,
+        "workers": 1,
+        "opening": {
+          "manifest_sha256": "3749f773920ed1d3dc50e5cb6eb07c246deded135877d0c3127c65a447379faa",
+          "report_sha256": "9305dd3d8ae358669e3f0c91e43b0a90c5495ddafa95ca64267b9334d1305393",
+          "population": 3170,
+          "passed": true
+        }
+      }
+    }
+  ]
+}

@@ -103,6 +103,10 @@ On Linux, `make p5-shots` regenerates the P5 screenshots under Xvfb from freshly
 |---|---|
 | ![Land Tiles panel](docs/screenshots/p6-land-tiles.png) | ![New Game population options](docs/screenshots/p6-population-options.png) |
 
+### Milestone P7 (in progress)
+
+Inspect directed traffic queues and curb parking, preview and confirm road edits, and compare their effects on trips and freight deliveries. Experimental junction rules apply locally when enabled. P7 opens P6 city saves and uses version `0.12.0` for new saves, replays and multiplayer connections.
+
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
 ### Try the demo cities

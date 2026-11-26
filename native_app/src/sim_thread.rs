@@ -19,6 +19,7 @@ use simulation::world_command::{
 use simulation::{Simulation, SimulationReplayLoader, SlotCapture};
 
 use crate::automation::{FixtureOp, FixtureOutcome};
+use crate::gui::traffic_repair::TrafficEditReceipt;
 use crate::session::{save_coordinator::SavePermit, CityProgress};
 
 pub(crate) const BATCH_BYTES: usize = 256 * 1024;
@@ -101,6 +102,7 @@ pub(crate) struct AppliedBatch {
     pub link_outcomes: Vec<(usize, LinkOutcome)>,
     pub water_edits: Vec<(usize, Result<WaterEditOutcome, WaterEditError>)>,
     pub tile_purchases: Vec<TilePurchaseReceipt>,
+    pub traffic_edits: Vec<TrafficEditReceipt>,
     pub commands: WorldCommands,
 }
 
@@ -145,6 +147,10 @@ pub(crate) enum Request {
         boundary: Option<Boundary>,
         revision: SnapshotRevision,
         permit: Option<SavePermit>,
+    },
+    CaptureComparison {
+        revision: SnapshotRevision,
+        limit: usize,
     },
     ReplayControl(ReplayControl),
     ReleaseOwner,
@@ -954,7 +960,7 @@ impl Worker {
         let world_required = self.pending.as_ref().is_none_or(|envelope| {
             matches!(
                 envelope.request,
-                Request::Batch(_) | Request::Capture { .. }
+                Request::Batch(_) | Request::Capture { .. } | Request::CaptureComparison { .. }
             )
         });
         let reply = if world_required {
@@ -1249,6 +1255,14 @@ impl Worker {
                         .map_err(|err| err.to_string())
                 })
             }
+            Request::CaptureComparison { revision, limit } => {
+                let sim = sim.unwrap();
+                ReplyKind::Captured(
+                    sim.capture_slot_with_limit(revision, limit)
+                        .map(|snapshot| (snapshot, CityProgress::capture(sim)))
+                        .map_err(|err| err.to_string()),
+                )
+            }
             Request::ReplayControl(control) => {
                 if self.replay.is_none() {
                     ReplyKind::Rejected("There is no active replay.")
@@ -1323,6 +1337,10 @@ impl Worker {
                 commands.iter().enumerate(),
             )
             .collect(),
+            traffic_edits: commands.iter().enumerate().filter_map(|(index, command)| {
+                TrafficEditReceipt::from_outcome(id.generation, self.status.boundary.tick, None,
+                    index, true, index, command, &outcomes)
+            }).collect(),
             commands,
         })
     }

@@ -115,7 +115,7 @@ impl DrivingReachability {
                 let node = if node == dummy { start } else { node };
                 routes.successors[node].iter().map(|&next| {
                     let lane = &map.lanes[lanes[next]];
-                    (next, driving_lane_cost(lane, base_random))
+                    (next, driving_lane_cost(map, lane, base_random))
                 })
             },
             |node| {

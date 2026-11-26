@@ -273,3 +273,46 @@ fn population_scale_new_game_picker_passes_the_clicked_preset_to_bootstrap() {
     let city = Simulation::new_game(&options).unwrap();
     assert_eq!(city.population_scale().to_string(), "Scaled (1:8)");
 }
+
+#[cfg(test)]
+#[test]
+fn p7_create_city_keeps_stock_traffic_after_build_and_reload() {
+    use geom::vec3;
+    use simulation::map::{LanePatternBuilder, MapProject};
+    use simulation::world_command::{CommandOutcomes, WorldCommand};
+    use simulation::{SlotId, SnapshotRevision};
+
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let form = NewGameForm {
+        size: "16".into(),
+        seed: "6042".into(),
+        money: "150000".into(),
+        preset: MapPreset::Flat,
+        ..NewGameForm::default()
+    };
+    let options = form.options().unwrap();
+    assert_eq!(options.land_mode, simulation::map::LandMode::Unrestricted);
+    let mut city = Simulation::new_game(&options).unwrap();
+    let opening_stock = city.map().uses_stock_traffic();
+    let opening_roads = city.map().roads().len();
+    city.apply_commands([&WorldCommand::MapMakeConnection {
+        from: MapProject::ground(vec3(100.0, 200.0, 0.0)),
+        to: MapProject::ground(vec3(350.0, 200.0, 0.0)),
+        inter: None,
+        pat: LanePatternBuilder::new().build(),
+    }]);
+    assert_eq!(city.read::<CommandOutcomes>().accepted, [0]);
+    let root = std::env::temp_dir().join(format!("egregoria-p7-create-{}", std::process::id()));
+    std::fs::create_dir(&root).unwrap();
+    let slot = SlotId::new("create-city").unwrap();
+    city.save_to_slot(&root, &slot, SnapshotRevision::new(1))
+        .unwrap();
+    let reopened = Simulation::load_from_slot(&root, &slot).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    assert_eq!(city.map().roads().len(), opening_roads + 1);
+    assert_eq!(reopened.map().roads().len(), city.map().roads().len());
+    assert!(
+        opening_stock && city.map().uses_stock_traffic() && reopened.map().uses_stock_traffic()
+    );
+}

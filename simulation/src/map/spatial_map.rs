@@ -5,16 +5,24 @@ use crate::map::{
 use common::{FastMap, FastSet};
 use derive_more::From;
 use flat_spatial::aabbgrid::{AABBGridHandle, AABBGridObjects, StoreObject};
-use flat_spatial::cell::AABBGridCell;
 use flat_spatial::storage::{CellIdx, SparseStorage};
 use flat_spatial::AABBGrid;
 use geom::{Circle, Intersect, Shape, ShapeEnum, Vec2, AABB};
+use itertools::Either;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ops::{BitOr, Neg, Sub};
 
 // A generated lot is at most 40 m square and can span at most 3x3 cells.
 const GENERATED_LOT_CELLS: usize = 9;
+const CELL_SIZE: i32 = 50;
+const MAX_LOT_CELLS: usize = 256;
+pub(super) const MAX_LOT_MEMBERSHIPS: usize = 4_194_304;
+
+pub(super) fn validated_lot_memberships(bounds: AABB) -> Option<usize> {
+    let count = CellRange::checked(bounds)?.len();
+    (count <= MAX_LOT_CELLS).then_some(count)
+}
 
 #[derive(Copy, Clone, Debug, PartialOrd, Ord, PartialEq, Eq, Serialize, Deserialize, From)]
 pub enum ProjectKind {
@@ -101,13 +109,19 @@ pub struct SpatialMap {
     ids: BTreeMap<ProjectKind, AABBGridHandle>,
 }
 
-// The broad grid uses the same storage and handles as AABBGrid, whose public
-// API only supports removing entries one at a time.
 struct BroadGrid {
-    storage: SparseStorage<AABBGridCell>,
+    storage: SparseStorage<BroadCell>,
     objects: AABBGridObjects<ProjectKind, AABB>,
+    positions: FastMap<(AABBGridHandle, CellIdx), usize>,
     #[cfg(test)]
     removal_scan_entries: usize,
+}
+
+#[derive(Default)]
+struct BroadCell {
+    entries: Vec<(AABBGridHandle, bool)>,
+    // The position is the mixed-grid query order, including swap-removals.
+    lots: BTreeMap<usize, AABBGridHandle>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -117,6 +131,21 @@ struct CellRange {
 }
 
 impl CellRange {
+    fn checked(bounds: AABB) -> Option<Self> {
+        // Keep the same boundary convention as SparseStorage::cell_id.
+        const COORD_LIMIT: f32 = 4_194_304.0;
+        let [left, bottom, right, top] = [bounds.ll.x, bounds.ll.y, bounds.ur.x, bounds.ur.y];
+        let valid = |value: f32| value.abs() <= COORD_LIMIT;
+        if ![left, bottom, right, top].into_iter().all(valid) || left > right || bottom > top {
+            return None;
+        }
+        let cell = |value: f32| value as i32 / CELL_SIZE - i32::from(value < 0.0);
+        Some(Self {
+            first: (cell(left), cell(bottom)),
+            last: (cell(right), cell(top)),
+        })
+    }
+
     fn len(self) -> usize {
         let (left, bottom) = self.first;
         let (right, top) = self.last;
@@ -139,30 +168,58 @@ impl BroadGrid {
     }
 
     fn insert(&mut self, aabb: AABB, obj: ProjectKind) -> AABBGridHandle {
+        let cells = self.object_cells(obj, aabb);
         let handle = self.objects.insert(StoreObject { obj, aabb });
-        self.insert_cells(handle, self.cell_range(aabb));
+        self.insert_cells(handle, cells);
         handle
+    }
+
+    fn object_cells(&self, object: ProjectKind, bounds: AABB) -> CellRange {
+        if object.to_lot().is_some() {
+            CellRange::checked(bounds)
+                .filter(|range| range.len() <= MAX_LOT_CELLS)
+                .expect("validated lot footprint")
+        } else {
+            self.cell_range(bounds)
+        }
     }
 
     fn insert_cells(&mut self, handle: AABBGridHandle, cells: CellRange) {
         let single_cell = cells.first == cells.last;
-        for cell in cells.iter() {
-            self.storage
-                .cell_mut_unchecked(cell)
-                .objs
-                .push((handle, single_cell));
+        let is_lot = self.objects[handle].obj.to_lot().is_some();
+        for cell_id in cells.iter() {
+            let cell = self.storage.cell_mut_unchecked(cell_id);
+            let index = cell.entries.len();
+            if is_lot {
+                cell.lots.insert(index, handle);
+            }
+            self.positions.insert((handle, cell_id), index);
+            cell.entries.push((handle, single_cell));
         }
     }
 
-    fn remove_cell_entry(&mut self, cell: CellIdx, handle: AABBGridHandle) {
-        let cell = self.storage.cell_mut_unchecked(cell);
-        let index = cell.objs.iter().position(|&(entry, _)| entry == handle);
+    fn remove_cell_entry(&mut self, cell_id: CellIdx, handle: AABBGridHandle) {
+        let cell = self.storage.cell_mut_unchecked(cell_id);
+        let index = self
+            .positions
+            .remove(&(handle, cell_id))
+            .expect("indexed spatial membership");
         #[cfg(test)]
         {
-            self.removal_scan_entries += index.map_or(cell.objs.len(), |index| index + 1);
+            self.removal_scan_entries += 1;
         }
-        if let Some(index) = index {
-            cell.objs.swap_remove(index);
+        cell.lots.remove(&index);
+        let last = cell.entries.len() - 1;
+        cell.entries.swap_remove(index);
+        if index != last {
+            let moved = cell.entries[index].0;
+            if cell.lots.remove(&last).is_some() {
+                cell.lots.insert(index, moved);
+            }
+            *self
+                .positions
+                .get_mut(&(moved, cell_id))
+                .expect("indexed spatial membership") = index;
         }
     }
 
@@ -174,52 +231,14 @@ impl BroadGrid {
 
     fn remove(&mut self, handle: AABBGridHandle) {
         if let Some(object) = self.objects.remove(handle) {
-            self.remove_cells(handle, self.cell_range(object.aabb));
-        }
-    }
-
-    fn remove_many(&mut self, handles: impl Iterator<Item = AABBGridHandle>) {
-        let mut by_cell: BTreeMap<CellIdx, Vec<AABBGridHandle>> = BTreeMap::new();
-        for handle in handles {
-            let object = self.objects.remove(handle).expect("indexed lot");
-            for cell in self.cell_range(object.aabb).iter() {
-                by_cell.entry(cell).or_default().push(handle);
-            }
-        }
-        for (cell, handles) in by_cell {
-            if let [handle] = handles.as_slice() {
-                self.remove_cell_entry(cell, *handle);
-                continue;
-            }
-            let cell = self.storage.cell_mut_unchecked(cell);
-
-            // Find the removed entries in one scan, then replay swap-removals
-            // in input order so surviving objects keep their query order.
-            let mut positions: FastMap<_, _> =
-                handles.iter().map(|&handle| (handle, usize::MAX)).collect();
-            #[cfg(test)]
-            {
-                self.removal_scan_entries += cell.objs.len();
-            }
-            for (index, &(handle, _)) in cell.objs.iter().enumerate() {
-                if let Some(position) = positions.get_mut(&handle) {
-                    *position = index;
-                }
-            }
-            for handle in handles {
-                let index = positions[&handle];
-                let moved = cell.objs.last().unwrap().0;
-                cell.objs.swap_remove(index);
-                if let Some(position) = positions.get_mut(&moved) {
-                    *position = index;
-                }
-            }
+            self.remove_cells(handle, self.object_cells(object.obj, object.aabb));
         }
     }
 
     fn set_aabb(&mut self, handle: AABBGridHandle, aabb: AABB) {
-        let old_cells = self.cell_range(self.objects[handle].aabb);
-        let new_cells = self.cell_range(aabb);
+        let object = &self.objects[handle];
+        let old_cells = self.object_cells(object.obj, object.aabb);
+        let new_cells = self.object_cells(object.obj, aabb);
         self.objects[handle].aabb = aabb;
         if old_cells != new_cells {
             self.remove_cells(handle, old_cells);
@@ -227,15 +246,33 @@ impl BroadGrid {
         }
     }
 
-    fn query(&self, bounds: AABB) -> impl Iterator<Item = (AABBGridHandle, &AABB, &ProjectKind)> {
-        let cells = self.cell_range(bounds);
+    fn query(
+        &self,
+        bounds: AABB,
+        lots_only: bool,
+    ) -> impl Iterator<Item = (AABBGridHandle, &AABB, &ProjectKind)> {
+        let cells = if lots_only {
+            CellRange::checked(bounds)
+        } else {
+            Some(self.cell_range(bounds))
+        };
         let mut seen = FastSet::default();
         cells
-            .iter()
+            .into_iter()
+            .flat_map(CellRange::iter)
             .filter_map(|cell| self.storage.cell(cell))
-            .flat_map(|cell| cell.objs.iter().copied())
+            .flat_map(move |cell| {
+                if lots_only {
+                    Either::Left(cell.lots.keys().map(|&index| cell.entries[index]))
+                } else {
+                    Either::Right(cell.entries.iter().copied())
+                }
+            })
             .filter_map(move |(handle, single_cell)| {
-                if cells.first != cells.last && !single_cell && !seen.insert(handle) {
+                if cells.is_some_and(|range| range.first != range.last)
+                    && !single_cell
+                    && !seen.insert(handle)
+                {
                     return None;
                 }
                 let object = &self.objects[handle];
@@ -250,8 +287,9 @@ impl Default for SpatialMap {
     fn default() -> Self {
         Self {
             broad: BroadGrid {
-                storage: SparseStorage::new(50),
+                storage: SparseStorage::new(CELL_SIZE),
                 objects: Default::default(),
+                positions: Default::default(),
                 #[cfg(test)]
                 removal_scan_entries: 0,
             },
@@ -302,15 +340,14 @@ impl SpatialMap {
     }
 
     pub(super) fn remove_lots(&mut self, lots: impl IntoIterator<Item = LotID>) {
-        let ids = &mut self.ids;
-        let near = &mut self.near;
         // Lots have no entries in the occupancy or cut influence grids.
-        self.broad.remove_many(lots.into_iter().filter_map(|id| {
+        for id in lots {
             let kind = ProjectKind::Lot(id);
-            let handle = ids.remove(&kind)?;
-            near.remove(&kind);
-            Some(handle)
-        }));
+            if let Some(handle) = self.ids.remove(&kind) {
+                self.broad.remove(handle);
+                self.near.remove(&kind);
+            }
+        }
     }
 
     pub fn update(&mut self, obj: &impl SpatialMapObject) {
@@ -385,7 +422,7 @@ impl SpatialMap {
         filter: ProjectFilter,
     ) -> impl Iterator<Item = ProjectKind> + 'a {
         self.broad
-            .query(shape.bbox())
+            .query(shape.bbox(), filter.0 == ProjectFilter::LOT.0)
             .filter(move |&(_, _, p)| filter.test(p))
             .filter_map(move |(_, _, p)| shape.intersects(self.near.get(p)?).then_some(*p))
     }
@@ -398,14 +435,10 @@ impl SpatialMap {
         new_lots: usize,
         work: &mut usize,
     ) -> Result<(), WaterEditError> {
-        let cells = self.broad.cell_range(bounds);
+        let cells = CellRange::checked(bounds).ok_or(WaterEditError::Limit)?;
         let storage = &self.broad.storage;
-        // Pay for the cell count and both queries, including empty cells and
-        // repeated grid entries.
-        // An added or updated road/junction can contribute one entry per cell.
-        // Generated lots are at most 40 m square and span at most 3x3 cells.
-        // Count each new membership for the live query, removal bookkeeping,
-        // and the removal scan.
+        // Reserve both lot queries, including empty cells and repeated lot
+        // memberships. Generated lots can span at most 3x3 cells.
         spend_water_work(
             work,
             cells
@@ -415,17 +448,16 @@ impl SpatialMap {
         )?;
         for cell in cells.iter() {
             if let Some(cell) = storage.cell(cell) {
-                spend_water_work(work, cell.objs.len().saturating_mul(2))?;
+                spend_water_work(work, cell.lots.len().saturating_mul(2))?;
             }
         }
         let mut removal_cells = FastSet::default();
-        // Lots can straddle cells outside the query. Budget the batch's
-        // bookkeeping per membership and one scan per affected cell.
-        for (_, lot_bounds, object) in self.broad.query(bounds) {
+        // Lots can straddle cells outside the query. Charge every membership.
+        for (_, lot_bounds, object) in self.broad.query(bounds, true) {
             if object.to_lot().is_some() {
                 spend_water_work(work, per_lot)?;
                 self.reserve_lot_removal_cells(
-                    self.broad.cell_range(*lot_bounds),
+                    CellRange::checked(*lot_bounds).expect("indexed lot footprint"),
                     changed_objects,
                     &mut removal_cells,
                     work,
@@ -437,7 +469,7 @@ impl SpatialMap {
             // Allow a rounded-up lot diagonal beyond the query for those lots.
             let possible = bounds.expand(super::MAX_LOT_SIZE * 1.5);
             self.reserve_lot_removal_cells(
-                self.broad.cell_range(possible),
+                CellRange::checked(possible).ok_or(WaterEditError::Limit)?,
                 changed_objects,
                 &mut removal_cells,
                 work,
@@ -455,14 +487,14 @@ impl SpatialMap {
         work: &mut usize,
     ) -> Result<(), WaterEditError> {
         let mut removal_cells = FastSet::default();
-        // Newly inserted handles add memberships to both the removal lists
-        // and the affected cell scans.
+        // Include the memberships that would be created before a staged merge.
         spend_water_work(work, new_lots.saturating_mul(1 + 2 * GENERATED_LOT_CELLS))?;
         for id in ids {
             spend_water_work(work, 1)?;
             if let Some(&handle) = self.ids.get(&ProjectKind::Lot(id)) {
                 self.reserve_lot_removal_cells(
-                    self.broad.cell_range(self.broad.objects[handle].aabb),
+                    CellRange::checked(self.broad.objects[handle].aabb)
+                        .expect("indexed lot footprint"),
                     changed_objects,
                     &mut removal_cells,
                     work,
@@ -471,7 +503,7 @@ impl SpatialMap {
         }
         for bounds in generated_regions {
             self.reserve_lot_removal_cells(
-                self.broad.cell_range(bounds),
+                CellRange::checked(bounds).ok_or(WaterEditError::Limit)?,
                 changed_objects,
                 &mut removal_cells,
                 work,
@@ -490,8 +522,38 @@ impl SpatialMap {
         spend_water_work(work, range.len())?;
         for cell in range.iter() {
             if seen.insert(cell) {
-                let entries = self.broad.storage.cell(cell).map_or(0, |cell| cell.objs.len());
-                spend_water_work(work, entries.saturating_add(changed_objects))?;
+                spend_water_work(work, changed_objects.saturating_add(1))?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn reserve_construction_query(
+        &self,
+        bounds: AABB,
+        work: &mut usize,
+    ) -> Result<(), WaterEditError> {
+        let cells = CellRange::checked(bounds).ok_or(WaterEditError::Limit)?;
+        let occupancy = self.occupancy.storage();
+        let occupied_cells = CellRange {
+            first: occupancy.cell_id(bounds.ll),
+            last: occupancy.cell_id(bounds.ur),
+        };
+        spend_water_work(
+            work,
+            cells
+                .len()
+                .saturating_add(occupied_cells.len())
+                .saturating_mul(3),
+        )?;
+        for key in cells.iter() {
+            if let Some(cell) = self.broad.storage.cell(key) {
+                spend_water_work(work, cell.entries.len().saturating_mul(2))?;
+            }
+        }
+        for key in occupied_cells.iter() {
+            if let Some(cell) = occupancy.cell(key) {
+                spend_water_work(work, cell.objs.len().saturating_mul(2))?;
             }
         }
         Ok(())
@@ -508,7 +570,7 @@ impl SpatialMap {
             !primary.intersects(&bounds)
         });
         self.broad
-            .query(bounds)
+            .query(bounds, filter.0 == ProjectFilter::LOT.0)
             .chain(additional)
             .filter(move |&(_, _, object)| filter.test(object))
             .map(|(_, _, object)| *object)
@@ -655,4 +717,51 @@ impl Neg for ProjectFilter {
     fn neg(self) -> Self::Output {
         Self(!self.0)
     }
+}
+
+#[test]
+fn p7_spatial_projection_order_and_allocator() {
+    use crate::map::{LanePatternBuilder, MapProject};
+    use geom::{vec3, OBB};
+
+    let mut map = Map::empty();
+    let (_, road) = map
+        .make_connection(
+            MapProject::ground(vec3(60.0, 150.0, 0.0)),
+            MapProject::ground(vec3(240.0, 150.0, 0.0)),
+            None,
+            &LanePatternBuilder::new().build(),
+        )
+        .unwrap();
+    let pos = map.roads()[road].points().middle();
+    assert_eq!(
+        map.project(pos, 1.0, ProjectFilter::ALL).kind,
+        ProjectKind::Road(road)
+    );
+    let shape = OBB::new(pos.xy(), Vec2::X, 4.0, 4.0);
+    let [first, middle, last] = [0; 3].map(|_| Lot::insert(&mut map, road, shape, pos.z));
+    assert_eq!(
+        map.project(pos, 1.0, ProjectFilter::ALL).kind,
+        ProjectKind::Lot(first)
+    );
+    map.spatial_map.remove(first);
+    map.remove_lot_record(first).unwrap();
+
+    // The stock mixed grid swapped the last entry into the removed position.
+    let hits = map
+        .spatial_map
+        .query(pos.xy(), ProjectFilter::LOT)
+        .collect::<Vec<_>>();
+    assert_eq!(hits, [ProjectKind::Lot(last), ProjectKind::Lot(middle)]);
+    assert_eq!(
+        map.project(pos, 1.0, ProjectFilter::ALL).kind,
+        ProjectKind::Lot(last)
+    );
+    let reused = Lot::insert(&mut map, road, shape, pos.z);
+    assert_ne!(reused, first);
+    assert!(map.get(first).is_none());
+    assert_eq!(
+        map.project(pos, 1.0, ProjectFilter::ALL).kind,
+        ProjectKind::Lot(last)
+    );
 }

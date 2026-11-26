@@ -23,6 +23,7 @@ mod p5_core_loop;
 mod p5_placement;
 mod p5_spine_followups;
 mod p6_water;
+mod p7_road_edit;
 mod population_scale;
 mod test_iso;
 mod vehicles;
@@ -414,7 +415,7 @@ pub(crate) fn load_unprofiled_prototypes() {
     crate::init::register_simulation();
 }
 
-fn init_test_simulation() {
+pub(crate) fn init_test_simulation() {
     static BASE_PROTOTYPES: Mutex<Option<&'static prototypes::Prototypes>> = Mutex::new(None);
     let mut base = BASE_PROTOTYPES.lock().unwrap();
     let base_is_loaded = base
@@ -1105,7 +1106,10 @@ fn zones2_unprofiled_registry_rejects_inert_mixed_use_paint() {
     let replay_before = sim.read::<crate::Replay>().command_count();
     paint(ZoneKind::MixedUse).apply(&mut sim);
     assert_eq!(sim.read::<ZoneGrid>().cells(), &grid_before);
-    assert_eq!(sim.read::<crate::Replay>().command_count(), replay_before);
+    assert_eq!(
+        sim.read::<crate::Replay>().command_count(),
+        replay_before + 1
+    );
     assert!(sim.read::<CommandOutcomes>().accepted.is_empty());
 }
 

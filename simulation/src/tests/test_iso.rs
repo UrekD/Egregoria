@@ -440,6 +440,7 @@ fn test_world_survives_serde() {
 
     // Use the archived commands as input for this current-registry trajectory.
     let mut replay: Replay = JSON::decode(REPLAY).unwrap();
+    replay.version = crate::utils::replay::replay_version();
     replay.registry = Some(prototypes::prototypes().fingerprint());
     let mut s = SeqSchedule::default();
 

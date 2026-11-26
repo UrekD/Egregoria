@@ -1018,6 +1018,15 @@ pub(crate) fn install_world(
     for reset in hooks {
         reset(uiw, generation);
     }
+    if next
+        .read::<simulation::Replay>()
+        .obsolete_recording_discarded()
+    {
+        notify(
+            uiw,
+            "City loaded. Its older debug replay recording was discarded.",
+        );
+    }
     next
 }
 

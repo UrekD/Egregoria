@@ -945,3 +945,65 @@ fn scale_t1_fix_stop_interrupts_builder_between_flushes() {
     );
     assert_eq!(receive(&mut driver).id, stop);
 }
+
+#[test]
+fn p7_receipt_paused_batch_survives_capture_without_persisting_receipt() {
+    use crate::gui::traffic_repair::{test_road_upgrade, TrafficEditResult};
+    use simulation::map::road_edit::RoadEditStatus;
+    use simulation::map::LaneKind;
+    use simulation::{MapPreset, NewGameOptions};
+
+    scenarios::ensure_repo_root_cwd();
+    crate::init::init();
+    let sim = Simulation::new_game(&NewGameOptions {
+        preset: MapPreset::Flat,
+        ..Default::default()
+    })
+    .unwrap();
+    let (road, command) = test_road_upgrade(&sim);
+    let tick = sim.get_tick();
+    let mut driver = SimThread::start(sim, Simulation::schedule(), 7, None);
+    let id = driver
+        .submit(Request::Batch(WorldCommands::from(vec![command])))
+        .ok()
+        .unwrap();
+    let ReplyKind::Applied(batch) = receive(&mut driver).kind else {
+        panic!("missing edit receipt");
+    };
+    assert_eq!(batch.id, id);
+    assert!(!batch.advanced);
+    let [receipt] = batch.traffic_edits.as_slice() else {
+        panic!("expected one road edit receipt");
+    };
+    assert_eq!((receipt.generation, receipt.frame, receipt.command_index), (7, tick, 0));
+    assert!(matches!(&receipt.result, Ok(TrafficEditResult::Road(edit))
+        if edit.road == road && edit.status == RoadEditStatus::Applied && edit.debit > prototypes::Money::ZERO));
+
+    let fence = driver.submit(Request::PauseFence { through_batch: Some(id) }).ok().unwrap();
+    let reply = receive(&mut driver);
+    assert_eq!(reply.id, fence);
+    let ReplyKind::Paused(boundary) = reply.kind else {
+        panic!("worker did not fence at the edited road");
+    };
+    assert_eq!(boundary, batch.boundary);
+    let revision = crate::session::snapshot_revision();
+    assert!(driver.submit(Request::Capture {
+        boundary: Some(boundary),
+        revision,
+        permit: None,
+    }).is_ok());
+    let ReplyKind::Captured(Ok((capture, _))) = receive(&mut driver).kind else {
+        panic!("missing capture of edited road");
+    };
+    let root = std::env::temp_dir().join(format!("p7-receipt-{:x}", revision.get()));
+    let slot = common::saveload::SlotId::legacy();
+    capture.encode().unwrap().publish(&root, &slot).unwrap();
+    let restored = Simulation::load_from_slot(&root, &slot).unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    let map = restored.map();
+    let speeds: Vec<_> = map.get(road).unwrap().lanes_iter()
+        .filter(|&(_, kind)| kind == LaneKind::Driving)
+        .map(|(lane, _)| map.get(lane).unwrap().speed_limit).collect();
+    assert_eq!(speeds, [11.0, 11.0]);
+    assert!(restored.read::<CommandOutcomes>().road_edit(0).is_none());
+}

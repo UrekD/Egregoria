@@ -314,7 +314,7 @@ pub(crate) fn face_fan(vertices: usize) -> impl Iterator<Item = [usize; 3]> {
     (1..vertices.saturating_sub(1)).map(|i| [0, i, i + 1])
 }
 
-fn pick_road(map: &Map, ray: Ray3, terrain: Option<Vec3>) -> Option<RoadID> {
+pub(crate) fn pick_road(map: &Map, ray: Ray3, terrain: Option<Vec3>) -> Option<RoadID> {
     let limit = terrain.map_or(f32::INFINITY, |pos| {
         (pos - ray.from).dot(ray.dir) / ray.dir.mag2()
     });

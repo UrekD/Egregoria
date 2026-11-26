@@ -280,20 +280,36 @@ impl SerializedMap {
                 return Err(format!("building {id:?} has invalid spatial bounds"));
             }
         }
+        let mut lot_memberships = 0;
         for (id, lot) in self.lots.iter() {
-            if lot.shape.corners.iter().any(|point| !point.is_finite()) {
-                return Err(format!("lot {id:?} has invalid spatial bounds"));
+            let bad_bounds = || format!("lot {id:?} has invalid spatial bounds");
+            if lot.shape.corners.iter().any(|point| {
+                !point.is_finite() || point.x.abs() > index_limit || point.y.abs() > index_limit
+            }) {
+                return Err(bad_bounds());
+            }
+            lot_memberships += super::spatial_map::validated_lot_memberships(lot.shape.bbox())
+                .ok_or_else(bad_bounds)?;
+            if lot_memberships > super::spatial_map::MAX_LOT_MEMBERSHIPS {
+                return Err("lot spatial membership limit exceeded".to_owned());
             }
         }
         Ok(())
     }
 
     fn into_map(
-        self,
+        mut self,
         lot_origins: BTreeMap<BuildingID, LotOrigin>,
         import_lane_reserve: bool,
     ) -> Map {
+        for junction in self.intersections.values_mut() {
+            junction.index_crosswalks();
+        }
         let spatial_map = mk_spatial_map(&self);
+        let mut lots_by_road = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
+        for (id, lot) in self.lots.iter() {
+            lots_by_road.entry(lot.parent).or_default().insert(id);
+        }
         let mut m = Map {
             roads: self.roads,
             lanes: self.lanes,
@@ -301,6 +317,7 @@ impl SerializedMap {
             buildings: self.buildings,
             spatial_map,
             lots: self.lots,
+            lots_by_road,
             parking: self.parking,
             environment: self.environment,
             external_train_stations: self.external_train_stations,
@@ -335,7 +352,7 @@ fn mk_spatial_map(m: &SerializedMap) -> SpatialMap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{LanePatternBuilder, MapProject, RoadID};
+    use crate::map::{LanePatternBuilder, Lot, LotKind, MapProject, RoadID};
     use common::saveload::{Bincode, Encoder, JSON};
     use geom::{vec3, PolyLine3, Vec3};
 
@@ -359,6 +376,21 @@ mod tests {
             },
             road,
         )
+    }
+
+    #[test]
+    fn p7_spatial_load_bounds() {
+        let (mut serialized, road) = serialized_map_with_road();
+        serialized.map.lots.insert_with_key(|id| Lot {
+            id,
+            parent: road,
+            shape: geom::OBB::new(Vec2::ZERO, Vec2::X, 50_000.0, 1.0),
+            height: 0.0,
+            kind: LotKind::Unassigned,
+        });
+        let bytes = Bincode::encode(&serialized).unwrap();
+        let error = Bincode::decode::<Map>(&bytes).err().expect("oversized lot");
+        assert!(error.to_string().contains("lot"), "{error}");
     }
 
     #[test]

@@ -13,7 +13,7 @@ use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
 use crate::world_command::{CommandOutcomes, PrepareBudget, Rejection, WorldCommand};
 use common::saveload::{
-    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry, SlotMeta, SnapshotKind,
+    self, AtomicWriteError, Bincode, CompressedBincode, Encoder, SlotEntry,
 };
 use common::FastMap;
 use derive_more::{From, TryInto};
@@ -32,7 +32,7 @@ use std::ptr::addr_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{fs, io};
 use utils::rand_provider::RandProvider;
-use utils::replay::{replay_version_error, ReplayJson};
+use utils::replay::{replay_version, replay_version_error, ReplayJson};
 use utils::scheduler::SeqSchedule;
 
 #[macro_use]
@@ -64,7 +64,8 @@ mod world;
 pub mod world_command;
 
 pub use common::saveload::{
-    list_slots_with_revisions, save_dir, SlotCamera, SlotId, SnapshotRevision,
+    list_slots_with_revisions, save_dir, slot_paths, SlotCamera, SlotId, SlotMeta, SlotPaths, SnapshotKind,
+    SnapshotRevision,
 };
 pub use economy::population::PopulationScale;
 pub use map::{AuthoredTownError, AuthoredTownOptions};
@@ -130,10 +131,14 @@ const RNG_SEED: u64 = 123;
 const INITIAL_TICK: u64 = 1;
 const PRE_SCALE_VERSION: &str = "0.11.0";
 const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
+const PRE_P7_VERSION: &str = "0.11.1";
 const VERSION: &str = include_str!("../../VERSION");
 
 fn compatible_save_version(version: &str) -> bool {
-    matches!(version, VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION)
+    matches!(
+        version,
+        VERSION | PRE_P7_VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION
+    )
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -564,7 +569,7 @@ impl Simulation {
     }
 
     pub fn try_from_replay(replay: Replay) -> io::Result<(Simulation, SimulationReplayLoader)> {
-        if !compatible_save_version(&replay.version) {
+        if replay.version != replay_version() {
             return Err(replay_version_error(&replay.version));
         }
         replay.check_registry()?;
@@ -849,6 +854,17 @@ impl Simulation {
             self.reject_command_batch(commands, remaining, tiled);
             return;
         }
+        if commands.len() > world_command::MAX_TILED_COMMANDS
+            && commands.iter().any(|command| {
+                matches!(
+                    command,
+                    WorldCommand::MapUpgradeRoad { .. } | WorldCommand::MapSetJunctionRules { .. }
+                )
+            })
+        {
+            self.reject_command_batch(commands, std::iter::empty(), tiled);
+            return;
+        }
         let wire_errors: Vec<_> = commands
             .iter()
             .map(|command| command.wire_error())
@@ -884,22 +900,16 @@ impl Simulation {
             if let Some(error) = wire_error {
                 command.reject_wire(self, error);
             } else {
-                // Paint preparation also validates map bounds and registry availability.
-                let record_paint = record && matches!(command, WorldCommand::ZonePaint { .. });
-                if record && !record_paint {
+                // Preserve admitted positions, including preparation rejections and no-ops.
+                if record {
                     let tick = self.read::<GameTime>().tick;
                     self.write::<Replay>().push(tick, (*command).clone());
                 }
-                let tick = record_paint.then(|| self.read::<GameTime>().tick);
-                let rejection = match command.admitted(tiled, &water) {
-                    Ok(()) => command.apply_in_batch(self, construction, &mut water),
-                    Err(reason) => {
-                        command.reject_unadmitted(self, reason);
-                        Some(reason)
+                match command.admitted(tiled, &water) {
+                    Ok(()) => {
+                        command.apply_in_batch(self, construction, &mut water);
                     }
-                };
-                if let Some(tick) = tick.filter(|_| rejection.is_none()) {
-                    self.write::<Replay>().push(tick, (*command).clone());
+                    Err(reason) => command.reject_unadmitted(self, reason),
                 }
             }
             utils::scheduler::drain_commands(self);
@@ -1023,6 +1033,21 @@ impl Simulation {
         Self::decode_snapshot(&read_snapshot(file, kind)?)
     }
 
+    /// Inspect the bounded prefix of compressed slot bytes.
+    pub fn compressed_snapshot_header(bytes: &[u8]) -> Result<SnapshotHeader, SaveLoadError> {
+        read_snapshot_header(bytes, SnapshotKind::Zip)
+    }
+
+    /// Load compressed slot bytes with the same registry and schema checks as a slot file.
+    pub fn load_compressed_snapshot(bytes: &[u8], limit: usize) -> Result<Self, SaveLoadError> {
+        let limit = limit.min(MAX_SNAPSHOT_BYTES);
+        if bytes.len() > limit {
+            return Err(SaveLoadError::SnapshotTooLarge { limit });
+        }
+        read_snapshot_header(bytes, SnapshotKind::Zip)?.check_load_compatibility()?;
+        Self::decode_snapshot(&decompress_snapshot(bytes, limit)?)
+    }
+
     pub fn validate_listed_snapshot(root: &Path, entry: &SlotEntry) -> Result<(), SaveLoadError> {
         open_listed_snapshot(root, entry).map(|_| ())
     }
@@ -1039,6 +1064,14 @@ impl Simulation {
             .map_err(SaveLoadError::Io)?
             .ok_or(SaveLoadError::NotFound)?;
         decode_snapshot_replay(&bytes, &paths.zip, &paths.bc)
+    }
+
+    /// Validate an in-memory sidecar using the same decoder as a slot reopen.
+    pub fn decode_replay_sidecar(
+        bytes: &[u8],
+        revision: Option<SnapshotRevision>,
+    ) -> Result<Replay, SaveLoadError> {
+        ReplayJson::decode_sidecar(bytes, revision)
     }
 
     /// Reads a bounded prefix of the selected snapshot for slot discovery.
@@ -1131,7 +1164,7 @@ impl Simulation {
         self.capture_slot_with_limit(revision, MAX_SNAPSHOT_BYTES)
     }
 
-    fn capture_slot_with_limit(
+    pub fn capture_slot_with_limit(
         &self,
         revision: SnapshotRevision,
         limit: usize,
@@ -1474,6 +1507,9 @@ pub enum SaveLoadError {
     Incompatible {
         version: String,
     },
+    IncompatibleReplay {
+        version: String,
+    },
     PrototypeRegistry,
     Corrupt {
         version: Option<String>,
@@ -1499,6 +1535,9 @@ impl Display for SaveLoadError {
                     version.trim(),
                     VERSION.trim()
                 )
+            }
+            Self::IncompatibleReplay { version } => {
+                write!(f, "{}", replay_version_error(version))
             }
             Self::PrototypeRegistry => {
                 f.write_str("Save or replay requires a different prototype registry")
@@ -1627,7 +1666,7 @@ impl SlotCapture {
         self.encode_with_limit(MAX_SNAPSHOT_BYTES)
     }
 
-    fn encode_with_limit(self, limit: usize) -> Result<EncodedSlot, SaveLoadError> {
+    pub fn encode_with_limit(self, limit: usize) -> Result<EncodedSlot, SaveLoadError> {
         let Self {
             prefix: mut bytes,
             mut resources,
@@ -1702,6 +1741,11 @@ pub struct EncodedSlot {
 }
 
 impl EncodedSlot {
+    /// Returns the complete snapshot for an isolated in-memory restore.
+    pub fn into_snapshot_bytes(self) -> Vec<u8> {
+        self.snapshot
+    }
+
     pub fn with_display_name(mut self, display_name: String) -> Self {
         self.display_name = Some(display_name);
         self
@@ -1860,11 +1904,13 @@ fn read_snapshot(mut file: fs::File, kind: SnapshotKind) -> Result<Vec<u8>, Save
     if kind == SnapshotKind::Bc {
         return Ok(bytes);
     }
-    CompressedBincode::decompress_limited(&bytes, MAX_SNAPSHOT_BYTES).map_err(|error| {
+    decompress_snapshot(&bytes, MAX_SNAPSHOT_BYTES)
+}
+
+fn decompress_snapshot(bytes: &[u8], limit: usize) -> Result<Vec<u8>, SaveLoadError> {
+    CompressedBincode::decompress_limited(bytes, limit).map_err(|error| {
         if error.kind() == io::ErrorKind::FileTooLarge {
-            SaveLoadError::SnapshotTooLarge {
-                limit: MAX_SNAPSHOT_BYTES,
-            }
+            SaveLoadError::SnapshotTooLarge { limit }
         } else {
             corrupt_header(error)
         }
@@ -1988,7 +2034,7 @@ impl SimulationDeser {
         let origin: MapOrigin = match self.res.get("map_origin") {
             Some(bytes) => Bincode::decode(bytes)
                 .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
-            None if self._header.version == VERSION => {
+            None if matches!(self._header.version.as_str(), VERSION | PRE_P7_VERSION) => {
                 return Err(corrupt("Missing snapshot map origin".into()));
             }
             None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
@@ -2005,15 +2051,9 @@ impl SimulationDeser {
             return Err(corrupt("Snapshot terrain extent does not match the map origin".into()));
         }
         sim.resources.insert(origin);
-        {
-            let mut replay = sim.write::<Replay>();
-            replay
-                .validate_population_scale(scale)
-                .map_err(|error| corrupt(error.to_string()))?;
-            if matches!(replay.version.as_str(), PRE_SCALE_VERSION | PRE_ORIGIN_VERSION) {
-                replay.version = VERSION.to_owned();
-            }
-        }
+        sim.read::<Replay>()
+            .validate_population_scale(scale)
+            .map_err(|error| corrupt(error.to_string()))?;
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
         sim.read::<economy::cargo::FreightTrace>()
             .validate_ownership(&sim.read::<economy::cargo::CargoBook>(), &sim.world)
@@ -2025,6 +2065,26 @@ impl SimulationDeser {
         transportation::train::restore_train_occupancy(&mut sim, measured_rail)
             .map_err(|reason| corrupt(reason.into()))?;
         crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
+        sim.map()
+            .validate_junction_policy_land()
+            .map_err(|reason| corrupt(format!("Invalid junction policy land effect: {reason:?}")))?;
+        let elapsed = transit::elapsed_ticks(&sim.resources).0;
+        sim.write::<crate::transportation::junction_admission::JunctionAdmission>()
+            .validate_loaded(
+                &sim.map(),
+                sim.world(),
+                &sim.read::<crate::transportation::TransportGrid>(),
+                elapsed,
+            )
+            .map_err(|reason| corrupt(reason.to_owned()))?;
+        if sim
+            .map()
+            .lane_scoring_pilot()
+            .and_then(crate::map::LaneScoringPilot::sampled_at)
+            .is_some_and(|sampled| sampled > elapsed)
+        {
+            return Err(corrupt("Lane scoring sample is ahead of the simulation".into()));
+        }
         sim.map_mut()
             .rebuild_land_frontage()
             .map_err(|reason| corrupt(format!("Invalid land frontage: {reason:?}")))?;

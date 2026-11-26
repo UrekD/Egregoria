@@ -1,40 +1,154 @@
 use crate::map::{Map, TrafficBehavior, Traversable, TraverseKind};
-use crate::map_dynamic::{Itinerary, OBJECTIVE_OK_DIST};
+use crate::map_dynamic::{Itinerary, Transit, OBJECTIVE_OK_DIST};
+use crate::transportation::junction_admission;
+use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason};
 use crate::transportation::{
-    Speed, TransportGrid, TransportState, TransportationGroup, Transporter,
+    ColliderOwnerLookup, Speed, TransportGrid, TransportState, TransportationGroup, Transporter,
+    TraversalOwner,
 };
 use crate::transportation::{Vehicle, VehicleState, TIME_TO_PARK};
 use crate::utils::resources::Resources;
 use crate::world::{VehicleEnt, VehicleID};
 use crate::ParCommandBuffer;
 use crate::World;
+use flat_spatial::grid::GridHandle;
 use geom::{angle_lerpxy, Ray, Transform, Vec2, Vec3};
 use prototypes::{GameTime, DELTA, TICKS_PER_REALTIME_SECOND};
 use slotmapd::Key;
+use std::collections::BTreeMap;
+
+const STOPPED_SPEED: f32 = 0.2;
+const STOPPED_BLOCK_DISTANCE: f32 = 1.5;
+
+/// Finds physical wait cycles among vehicles that are still stopped at the cutoff.
+/// Each cycle is ordered by its blocker links and starts at its lowest vehicle ID.
+pub fn movement_cycles_at_cutoff(sim: &crate::Simulation) -> Vec<Vec<VehicleID>> {
+    let world = sim.world();
+    // The simulation grid was last synchronized before itinerary movement.
+    let mut grid = sim.read::<TransportGrid>().clone();
+    grid.refresh_admission_colliders(world);
+    let transit = sim.read::<Transit>();
+    let cutoff = crate::diagnostics::elapsed_tick(sim);
+    let mut blockers = BTreeMap::new();
+    for (id, vehicle) in world.vehicles.iter() {
+        if vehicle.speed.0.abs() >= STOPPED_SPEED
+            || !matches!(
+                vehicle.vehicle.state,
+                VehicleState::Driving
+                    | VehicleState::Panicking(_)
+                    | VehicleState::ReturningToDepot { .. }
+            )
+            || vehicle.it.get_point().is_none()
+            || transit
+                .runs
+                .get(&id)
+                .and_then(|run| run.dwell_until)
+                .is_some_and(|until| until > cutoff)
+        {
+            continue;
+        }
+        let Some(Transporter(collider)) = vehicle.collider else {
+            continue;
+        };
+        let Some((position, state)) = grid.get(collider) else {
+            continue;
+        };
+        let stop_dist = state.speed.powi(2) / (2.0 * vehicle.vehicle.kind.deceleration());
+        let neighbours = grid
+            .query_around(position, 12.0 + stop_dist)
+            .filter(|&(handle, _)| handle != collider)
+            .map(|(handle, pos)| (Some(handle), pos, grid.get(handle).unwrap().1));
+        let (distance, _, reason) = calc_front_dist(
+            &vehicle.vehicle,
+            &vehicle.trans,
+            state,
+            &vehicle.it,
+            neighbours,
+            (0.8 + stop_dist).min(STOPPED_BLOCK_DISTANCE),
+        );
+        if distance >= STOPPED_BLOCK_DISTANCE {
+            continue;
+        }
+        let handle = match reason {
+            QueueHoldReason::Leader(handle) | QueueHoldReason::Conflict(Some(handle)) => handle,
+            _ => continue,
+        };
+        if let ColliderOwnerLookup::Owned(TraversalOwner::Vehicle(blocker)) =
+            grid.collider_owner(world, handle)
+        {
+            blockers.insert(id, blocker);
+        }
+    }
+
+    let mut cycles = Vec::new();
+    while let Some((&start, _)) = blockers.first_key_value() {
+        let mut path = Vec::new();
+        let mut current = start;
+        while let Some(blocker) = blockers.remove(&current) {
+            path.push(current);
+            current = blocker;
+        }
+        if let Some(entry) = path.iter().position(|&id| id == current) {
+            let mut cycle = path.split_off(entry);
+            let (first, _) = cycle.iter().enumerate().min_by_key(|(_, id)| *id).unwrap();
+            cycle.rotate_left(first);
+            cycles.push(cycle);
+        }
+    }
+    cycles.sort_unstable();
+    cycles
+}
 
 pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
     profiling::scope!("transportation::vehicle_decision_system");
-    let ra = &*resources.read();
-    let rb = &*resources.read();
-    let rc = &*resources.read();
+    let map = &*resources.read::<Map>();
+    let time = &*resources.read::<GameTime>();
+    let grid = &*resources.read::<TransportGrid>();
+    let mut diagnostics = resources.write::<QueueDiagnostics>();
+    let observing = diagnostics.observing();
+    let tick = if observing {
+        let tick = crate::map_dynamic::transit::elapsed_ticks(resources).0;
+        diagnostics.begin_step(map, tick);
+        tick
+    } else {
+        0
+    };
 
-    world.vehicles.iter_mut().for_each(|(ent, v)| {
-        let Some(ref coll) = v.collider else {
-            return;
+    for (id, entity) in world.vehicles.iter_mut() {
+        let Some(collider) = entity.collider else {
+            continue;
         };
-
-        vehicle_decision(
-            ra,
-            rb,
-            rc,
-            ent,
-            &mut v.it,
-            &mut v.trans,
-            &mut v.speed,
-            &mut v.vehicle,
-            coll,
-        );
-    });
+        let traversal = observing
+            .then(|| entity.it.get_travers().copied())
+            .flatten();
+        if diagnostics.watches(traversal) {
+            if let Some(reason) = vehicle_decision_traced::<true>(
+                map,
+                time,
+                grid,
+                id,
+                &mut entity.it,
+                &mut entity.trans,
+                &mut entity.speed,
+                &mut entity.vehicle,
+                &collider,
+            ) {
+                diagnostics.record_hold(id, traversal, tick, reason);
+            }
+        } else {
+            vehicle_decision(
+                map,
+                time,
+                grid,
+                id,
+                &mut entity.it,
+                &mut entity.trans,
+                &mut entity.speed,
+                &mut entity.vehicle,
+                &collider,
+            );
+        }
+    }
 }
 
 pub fn vehicle_decision(
@@ -48,34 +162,48 @@ pub fn vehicle_decision(
     vehicle: &mut Vehicle,
     collider: &Transporter,
 ) {
-    let (_, self_obj) = cow.get(collider.0).expect("Handle not in transport grid");
+    vehicle_decision_traced::<false>(map, time, cow, me, it, trans, kin, vehicle, collider);
+}
 
-    let mut desired_speed = 0.0;
-    let mut desired_dir = Vec3::ZERO;
-    if matches!(
+fn vehicle_decision_traced<const OBSERVE: bool>(
+    map: &Map,
+    time: &GameTime,
+    grid: &TransportGrid,
+    id: VehicleID,
+    it: &Itinerary,
+    trans: &mut Transform,
+    speed: &mut Speed,
+    vehicle: &mut Vehicle,
+    collider: &Transporter,
+) -> Option<QueueHoldReason> {
+    let (_, own_state) = grid.get(collider.0).expect("Handle not in transport grid");
+    let ((desired_speed, desired_dir), reason) = if matches!(
         vehicle.state,
         VehicleState::Driving | VehicleState::Panicking(_) | VehicleState::ReturningToDepot { .. }
     ) {
         let danger_length =
-            (self_obj.speed.powi(2) / (2.0 * vehicle.kind.deceleration())).min(100.0);
-        let neighbors = cow.query_around(trans.pos.xy(), 12.0 + danger_length);
-        let objs =
-            neighbors.map(|(id, pos)| (pos, cow.get(id).expect("Handle not in transport grid").1));
-
-        let (s, d) = calc_decision(me, vehicle, map, time, trans, self_obj, it, objs);
-        desired_speed = s;
-        desired_dir = d;
-    }
+            (own_state.speed.powi(2) / (2.0 * vehicle.kind.deceleration())).min(100.0);
+        let neighbours =
+            grid.query_around(trans.pos.xy(), 12.0 + danger_length)
+                .map(|(handle, pos)| {
+                    let state = grid.get(handle).expect("Handle not in transport grid").1;
+                    (OBSERVE.then_some(handle), pos, state)
+                });
+        calc_decision_traced(id, vehicle, map, time, trans, own_state, it, neighbours)
+    } else {
+        ((0.0, Vec3::ZERO), None)
+    };
 
     physics(
         trans,
-        kin,
+        speed,
         vehicle,
-        self_obj,
+        own_state,
         map,
         desired_speed,
         desired_dir,
     );
+    reason
 }
 
 pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources) {
@@ -252,20 +380,61 @@ pub fn calc_decision<'a>(
     it: &Itinerary,
     neighs: impl Iterator<Item = (Vec2, &'a TransportState)>,
 ) -> (f32, Vec3) {
-    let default_return = (0.0, trans.dir);
+    calc_decision_traced(
+        me,
+        vehicle,
+        map,
+        time,
+        trans,
+        self_obj,
+        it,
+        neighs.map(|(pos, state)| (None, pos, state)),
+    )
+    .0
+}
+
+fn calc_decision_traced<'a>(
+    me: VehicleID,
+    vehicle: &mut Vehicle,
+    map: &Map,
+    time: &GameTime,
+    trans: &Transform,
+    self_obj: &TransportState,
+    it: &Itinerary,
+    neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
+) -> ((f32, Vec3), Option<QueueHoldReason>) {
+    let default_return = ((0.0, trans.dir), Some(QueueHoldReason::Unknown));
     if vehicle.wait_time > 0.0 {
         vehicle.wait_time -= DELTA;
         return default_return;
     }
-    let objective: Vec3 = unwrap_or!(it.get_point(), return default_return);
+    let Some(objective) = it.get_point() else {
+        let reason = if it.is_wait_for_reroute().is_some() {
+            QueueHoldReason::NoRoute
+        } else {
+            QueueHoldReason::Unknown
+        };
+        return ((0.0, trans.dir), Some(reason));
+    };
 
     let speed = self_obj.speed;
     let time_to_stop = speed / vehicle.kind.deceleration();
     let stop_dist = time_to_stop * speed * 0.5;
 
-    let cutoff = (0.8 + stop_dist).min(1.5);
-
-    let (front_dist, flag) = calc_front_dist(vehicle, trans, self_obj, it, neighs, cutoff);
+    let controlled = junction_admission::controls_road_decision(map, it, trans.pos);
+    if controlled && matches!(vehicle.state, VehicleState::Panicking(_)) {
+        vehicle.state = VehicleState::Driving;
+        vehicle.flag = 0;
+    }
+    let stopping_threshold = 0.8 + stop_dist;
+    let (front_dist, flag, blocker) = calc_front_dist(
+        vehicle,
+        trans,
+        self_obj,
+        it,
+        neighs,
+        stopping_threshold.min(STOPPED_BLOCK_DISTANCE),
+    );
 
     let position = trans.pos;
     let dir_to_pos = unwrap_or!(
@@ -278,9 +447,9 @@ pub fn calc_decision<'a>(
         if since.elapsed(time).0 .0 > 20 * TICKS_PER_REALTIME_SECOND {
             vehicle.state = VehicleState::Driving;
         }
-    } else if speed.abs() < 0.2 && front_dist < 1.5 {
+    } else if speed.abs() < STOPPED_SPEED && front_dist < STOPPED_BLOCK_DISTANCE {
         let me_u64: u64 = me.data().as_ffi();
-        if me_u64 == flag && matches!(vehicle.state, VehicleState::Driving) {
+        if !controlled && me_u64 == flag && matches!(vehicle.state, VehicleState::Driving) {
             vehicle.state = VehicleState::Panicking(time.instant());
             log::info!("gridlock!")
         }
@@ -290,11 +459,11 @@ pub fn calc_decision<'a>(
             flag
         };
         vehicle.wait_time = (position.x * 1000.0).fract().abs() * 0.5;
-        return default_return;
+        return ((0.0, trans.dir), Some(blocker));
     } else {
         // Stop at 80 cm of object in front
-        if front_dist < 0.8 + stop_dist {
-            return (0.0, dir_to_pos);
+        if front_dist < stopping_threshold {
+            return ((0.0, dir_to_pos), Some(blocker));
         }
     }
 
@@ -302,7 +471,7 @@ pub fn calc_decision<'a>(
 
     if let Some(term_pos) = it.get_terminal() {
         if term_pos.is_close(position, stop_dist) {
-            return (0.0, dir_to_pos);
+            return ((0.0, dir_to_pos), None);
         }
     }
 
@@ -315,30 +484,32 @@ pub fn calc_decision<'a>(
     {
         if let Some(l) = map.lanes().get(*l_id) {
             speed = l.speed_limit;
+            if !controlled {
+                let light = l.control_point();
 
-            let light = l.control_point();
-
-            match l.control.get_behavior(time.seconds) {
-                TrafficBehavior::RED | TrafficBehavior::ORANGE => {
-                    if light.is_close(
-                        position,
-                        OBJECTIVE_OK_DIST * 1.05
-                            + 2.0
-                            + stop_dist
-                            + (vehicle.kind.width() * 0.5 - OBJECTIVE_OK_DIST).max(0.0),
-                    ) {
-                        return (0.0, dir_to_pos);
+                match l.control.get_behavior(time.seconds) {
+                    TrafficBehavior::RED | TrafficBehavior::ORANGE => {
+                        if light.is_close(
+                            position,
+                            OBJECTIVE_OK_DIST * 1.05
+                                + 2.0
+                                + stop_dist
+                                + (vehicle.kind.width() * 0.5 - OBJECTIVE_OK_DIST).max(0.0),
+                        ) {
+                            return ((0.0, dir_to_pos), Some(QueueHoldReason::Signal));
+                        }
                     }
-                }
-                TrafficBehavior::STOP => {
-                    if light.is_close_signed(position, stop_dist) && !light.is_close(position, 1.0)
-                    {
-                        return (0.0, dir_to_pos);
+                    TrafficBehavior::STOP => {
+                        if light.is_close_signed(position, stop_dist)
+                            && !light.is_close(position, 1.0)
+                        {
+                            return ((0.0, dir_to_pos), Some(QueueHoldReason::StopDwell));
+                        }
                     }
-                }
-                TrafficBehavior::GREEN => {
-                    if light.is_close(position, stop_dist * 0.4) {
-                        return (0.0, dir_to_pos);
+                    TrafficBehavior::GREEN => {
+                        if light.is_close(position, stop_dist * 0.4) {
+                            return ((0.0, dir_to_pos), Some(QueueHoldReason::Unknown));
+                        }
                     }
                 }
             }
@@ -347,12 +518,15 @@ pub fn calc_decision<'a>(
 
     // Not facing the objective
     if dir_to_pos.dot(trans.dir) < 0.8 {
-        return (6.0, dir_to_pos);
+        return ((6.0, dir_to_pos), None);
     }
 
     (
-        vehicle.kind.speed_factor() * vehicle.max_speed_multiplier * speed,
-        dir_to_pos,
+        (
+            vehicle.kind.speed_factor() * vehicle.max_speed_multiplier * speed,
+            dir_to_pos,
+        ),
+        None,
     )
 }
 
@@ -360,13 +534,13 @@ pub fn calc_decision<'a>(
 /// It can be another car or a pedestrian, or it can be a potential collision point from a
 /// car coming perpendicularly.
 fn calc_front_dist<'a>(
-    vehicle: &mut Vehicle,
+    vehicle: &Vehicle,
     trans: &Transform,
     self_obj: &TransportState,
     it: &Itinerary,
-    neighs: impl Iterator<Item = (Vec2, &'a TransportState)>,
+    neighs: impl Iterator<Item = (Option<GridHandle>, Vec2, &'a TransportState)>,
     cutoff: f32,
-) -> (f32, u64) {
+) -> (f32, u64, QueueHoldReason) {
     let position = trans.pos;
     let direction = trans.dir;
     let pos2 = position.xy();
@@ -384,8 +558,9 @@ fn calc_front_dist<'a>(
 
     let on_lane = it.get_travers().map_or(false, |t| t.kind.is_lane());
     let mut flag = 0;
+    let mut blocker = QueueHoldReason::Unknown;
     // Collision avoidance
-    for (his_pos, nei_physics_obj) in neighs {
+    for (handle, his_pos, nei_physics_obj) in neighs {
         if (nei_physics_obj.height - position.z).abs() > 5.0 {
             continue;
         }
@@ -423,9 +598,18 @@ fn calc_front_dist<'a>(
             if dist_to_obj < min_front_dist {
                 min_front_dist = dist_to_obj;
                 flag = nei_physics_obj.flag;
+                blocker = match (handle, nei_physics_obj.group) {
+                    (Some(handle), TransportationGroup::Vehicles) => {
+                        QueueHoldReason::Leader(handle)
+                    }
+                    (Some(handle), TransportationGroup::Pedestrians) => {
+                        QueueHoldReason::Pedestrian(handle)
+                    }
+                    _ => QueueHoldReason::Unknown,
+                };
             }
             if min_front_dist < cutoff {
-                return (min_front_dist, flag);
+                return (min_front_dist, flag, blocker);
             }
             continue;
         }
@@ -461,7 +645,96 @@ fn calc_front_dist<'a>(
         if final_dist < min_front_dist {
             min_front_dist = final_dist;
             flag = nei_physics_obj.flag;
+            blocker = QueueHoldReason::Conflict(handle);
         }
     }
-    (min_front_dist, flag)
+    (min_front_dist, flag, blocker)
+}
+
+#[cfg(test)]
+#[test]
+fn p7_cutoff_detects_a_cycle_of_stationary_vehicle_blockers() {
+    use crate::tests::TestCtx;
+    use crate::transportation::{spawn_driving_vehicle, transport_grid_synchronize, VehicleKind};
+
+    let mut ctx = TestCtx::new();
+    let sim = &mut ctx.g;
+    let mut ids = Vec::new();
+    for n in 0..8 {
+        let angle = std::f32::consts::TAU * n as f32 / 8.0;
+        let (y, x) = angle.sin_cos();
+        let pos = Vec3::new(200.0 + 7.0 * x, 200.0 + 7.0 * y, 0.0);
+        let dir = Vec3::new(-y, x, 0.0);
+        let trans = Transform::new_dir(pos, dir);
+        let id = spawn_driving_vehicle(sim, VehicleKind::Car, trans).unwrap();
+        let vehicle = &mut sim.world_mut_unchecked().vehicles[id];
+        vehicle.vehicle.wait_time = 0.4;
+        vehicle.it = Itinerary::simple(vec![pos + dir * 30.0]);
+        ids.push(id);
+    }
+    let (world, resources) = sim.world_res();
+    transport_grid_synchronize(world, resources);
+    assert_eq!(movement_cycles_at_cutoff(sim), [ids.clone()]);
+
+    sim.world_mut_unchecked().vehicles[ids[0]].speed.0 = 2.0;
+    assert!(movement_cycles_at_cutoff(sim).is_empty());
+}
+
+#[cfg(test)]
+#[test]
+fn p7_unruled_panic_keeps_stock_gridlock_recovery() {
+    use crate::transportation::{TransportationGroup, VehicleKind};
+    use geom::{vec2, vec3, Color};
+
+    let time = GameTime::new(prototypes::Tick(1));
+    let map = Map::empty();
+    let approach = Transform::new(vec3(0.0, 0.0, 0.0));
+    let itinerary = Itinerary::simple(vec![vec3(30.0, 0.0, 0.0)]);
+    for (speed, crossing_pos) in [(8.0, vec2(12.0, -3.0)), (9.0, vec2(10.0, -5.0))] {
+        let car = TransportState {
+            speed,
+            radius: VehicleKind::Car.width() * 0.5,
+            group: TransportationGroup::Vehicles,
+            ..TransportState::default()
+        };
+        let crossing = TransportState {
+            dir: Vec2::Y,
+            speed: 1.0,
+            ..car
+        };
+        let above = TransportState {
+            height: 10.0,
+            ..crossing
+        };
+        let drive = |state, neighbors: &[(Vec2, &TransportState)]| {
+            let mut vehicle = Vehicle {
+                ang_velocity: 0.0,
+                wait_time: 0.0,
+                max_speed_multiplier: 1.0,
+                state,
+                kind: VehicleKind::Car,
+                tint: Color::WHITE,
+                flag: 0,
+            };
+            calc_decision(
+                VehicleID::default(),
+                &mut vehicle,
+                &map,
+                &time,
+                &approach,
+                &car,
+                &itinerary,
+                neighbors.iter().copied(),
+            )
+            .0
+        };
+        let panic = || VehicleState::Panicking(time.instant());
+        let leader = (vec2(1.5, 0.0), &car);
+        assert_eq!(
+            drive(VehicleState::Driving, &[(crossing_pos, &crossing)]),
+            0.0
+        );
+        assert_eq!(drive(panic(), &[leader, (crossing_pos, &crossing)]), 9.0);
+        assert!(drive(panic(), &[leader, (crossing_pos, &above)]) > 0.0);
+    }
 }
