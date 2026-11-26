@@ -1930,6 +1930,54 @@ mod tests {
         );
     }
 
+    #[test]
+    fn citymap_wet_bulldoze_respects_rail_underpass_clearance() {
+        use simulation::map::LandDenial;
+        use simulation::world_command::{CommandOutcomes, Rejection};
+
+        let mut plan = plan_town(&pinned_inputs(), TownConfig::wet(), SpacingLimits::default())
+            .unwrap();
+        commission::configure_commissioned_network(&mut plan);
+        let (sim, built, _) = build_wet_town(&mut plan).unwrap();
+        let path = built.links[&SourceKey::Authored("hraska-rail-walk")].road;
+        let mut sim = reload_fixture(&sim);
+        let rail = {
+            let map = sim.map();
+            let path = map.roads()[path].points();
+            let midpoint = path.point_along(path.length() * 0.5).xy();
+            map.roads().iter()
+                .filter(|&(id, road)| map.land_ownership().is_protected(id.into())
+                    && road.lanes_iter().any(|(_, kind)| kind == LaneKind::Rail))
+                .min_by(|(_, a), (_, b)| {
+                    let distance = |road: &simulation::map::Road| {
+                        midpoint.distance2(road.points().project_2d(midpoint).xy())
+                    };
+                    distance(a).total_cmp(&distance(b))
+                })
+                .map(|(id, _)| id)
+                .unwrap()
+        };
+
+        let bulldoze = WorldCommand::MapRemoveRoad(rail);
+        let denied = Rejection::LandDenied(LandDenial::ProtectedGateway);
+        let before = sim.hashes();
+        assert_eq!(bulldoze.preview(&sim).err(), Some(denied));
+        sim.apply_commands([&bulldoze]);
+        assert_eq!(sim.read::<CommandOutcomes>().last, [("MapRemoveRoad", denied)]);
+        assert_eq!(sim.hashes(), before);
+
+        let bulldoze = WorldCommand::MapRemoveRoad(path);
+        let preview = bulldoze.preview(&sim);
+        assert!(preview.is_ok(), "{:?}", preview.err());
+        sim.apply_commands([&bulldoze]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        assert!(sim.map().get(path).is_none());
+        let loaded = reload_fixture(&sim);
+        assert!(loaded.map().get(path).is_none());
+        assert!(loaded.map().get(rail).is_some());
+        assert!(loaded.map().land_ownership().is_protected(rail.into()));
+    }
+
     fn publication_fixture(test: &str, check: impl FnOnce(&Path) + std::panic::UnwindSafe) {
         let scratch = std::env::temp_dir().join(format!("egr-cms-{}-{test}", std::process::id()));
         fs::create_dir(&scratch).unwrap();

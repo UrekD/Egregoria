@@ -93,19 +93,27 @@ impl Map {
         self.authorize_land_footprint_with_deck(points, purchased, None)
     }
 
-    pub(super) fn authorize_authored_road(&self, id: RoadID) -> Result<(), LandDenial> {
+    pub(super) fn authorize_existing_road_deck(&self, id: RoadID) -> Result<(), LandDenial> {
         self.mutable_object(id.into())?;
         let road = self.get(id).ok_or(LandDenial::RequiresMutableAccess)?;
-        // The authored road already joins these junctions. Its deck and the
+        // The existing road already joins these junctions. Its deck and the
         // shared junction outline can overlap at the trimmed interface.
         for triangle in super::land_deck_triangles(road) {
-            self.authorize_land_footprint_with_deck(
-                &triangle.map(Vec3::xy),
-                None,
-                Some((road, triangle)),
-            )?;
+            self.authorize_existing_road_triangle(road, triangle)?;
         }
         Ok(())
+    }
+
+    pub(super) fn authorize_existing_road_triangle(
+        &self,
+        live: &Road,
+        triangle: [Vec3; 3],
+    ) -> Result<(), LandDenial> {
+        self.authorize_land_footprint_with_deck(
+            &triangle.map(Vec3::xy),
+            None,
+            Some((live, triangle)),
+        )
     }
 
     fn authorize_land_footprint_with_deck(

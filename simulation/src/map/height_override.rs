@@ -87,11 +87,27 @@ impl Map {
                 self.project_construction_cuts(chunk, wet, removed, added, &mut Some(remaining))?;
             for (y, row) in after.iter().enumerate() {
                 for (x, &height) in row.iter().enumerate() {
-                    if height != before[y][x] {
-                        self.authorize_land_effects(super::PreparedEffects::BaseNode((
-                            chunk.0 as usize * TERRAIN_CHUNK_RESOLUTION + x,
-                            chunk.1 as usize * TERRAIN_CHUNK_RESOLUTION + y,
-                        )))?;
+                    let previous = before[y][x];
+                    if height == previous {
+                        continue;
+                    }
+                    let node = (
+                        chunk.0 as usize * TERRAIN_CHUNK_RESOLUTION + x,
+                        chunk.1 as usize * TERRAIN_CHUNK_RESOLUTION + y,
+                    );
+                    let base = self.environment.heightmap.packed_base_node(node)
+                        .expect("covered construction chunk contains its base nodes");
+                    // Match the heightmap's effective surface. A cut at or above
+                    // the base and an absent override have the same geometry.
+                    let effective = |cut| {
+                        if cut == NO_OVERRIDE {
+                            base
+                        } else {
+                            base.min(cut)
+                        }
+                    };
+                    if effective(height) != effective(previous) {
+                        self.authorize_land_effects(super::PreparedEffects::BaseNode(node))?;
                     }
                 }
             }

@@ -744,7 +744,7 @@ pub(crate) fn validate_loaded_land(sim: &Simulation) -> Result<(), String> {
         .filter(|id| !land.is_protected((*id).into()))
     {
         if matches!(options.land_recipe, LandRecipe::AuthoredV1 { .. }) {
-            map.authorize_authored_road(id)
+            map.authorize_existing_road_deck(id)
                 .map_err(|error| format!("Invalid authored road {id:?}: {error:?}"))?;
         } else {
             check(PreparedEffects::Road(id))?;
