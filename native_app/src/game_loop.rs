@@ -373,7 +373,15 @@ impl engine::framework::State for State {
         };
         let mut busy = true;
         if let Some(view) = self.driver.as_ref().map(SimThread::view) {
-            if view.signal_redraw() && ctx.acquire_surface() {
+            if ctx.acquire_surface() {
+                view.set_redraw_waker(|| {
+                    let window = Arc::downgrade(&ctx.gfx.window);
+                    move || {
+                        if let Some(window) = window.upgrade() {
+                            window.request_redraw();
+                        }
+                    }
+                });
                 let lease_start = ctx.gfx.profile_timer();
                 let sim = view.try_read();
                 ctx.gfx.profile_elapsed(CpuPhase::SimLease, lease_start);

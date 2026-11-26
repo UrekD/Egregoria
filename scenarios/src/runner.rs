@@ -13,6 +13,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::hash::Hasher;
 use std::io::{ErrorKind, Write};
+use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Once;
 use std::time::Duration;
@@ -155,7 +156,10 @@ impl ScenarioCtx {
     pub(crate) fn initialize() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            ensure_repo_root_cwd();
+            // Packaged benchmarks have their runtime data next to the executable.
+            if !Path::new("base_mod/data.lua").is_file() {
+                ensure_repo_root_cwd();
+            }
             simulation::init::init();
         });
     }

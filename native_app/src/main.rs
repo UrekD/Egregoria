@@ -36,5 +36,40 @@ fn main() {
     engine::framework::init();
     init::init();
 
+    #[cfg(windows)]
+    let _timer_resolution = windows_timer::TimerResolution::request();
     engine::framework::start::<game_loop::State>();
+}
+
+#[cfg(windows)]
+mod windows_timer {
+    const PERIOD_MS: u32 = 1;
+
+    #[link(name = "winmm")]
+    extern "system" {
+        fn timeBeginPeriod(period: u32) -> u32;
+        fn timeEndPeriod(period: u32) -> u32;
+    }
+
+    pub(super) struct TimerResolution;
+
+    impl TimerResolution {
+        pub(super) fn request() -> Option<Self> {
+            // SAFETY: WinMM accepts a period in milliseconds and retains no pointers.
+            let result = unsafe { timeBeginPeriod(PERIOD_MS) };
+            if result == 0 {
+                Some(Self)
+            } else {
+                log::warn!("Could not request a 1 ms Windows timer period ({result})");
+                None
+            }
+        }
+    }
+
+    impl Drop for TimerResolution {
+        fn drop(&mut self) {
+            // SAFETY: This guard exists only after a successful request for the same period.
+            unsafe { timeEndPeriod(PERIOD_MS) };
+        }
+    }
 }

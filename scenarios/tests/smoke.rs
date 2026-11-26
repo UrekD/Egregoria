@@ -110,6 +110,33 @@ fn perf_10k_cli_is_opt_in() {
 }
 
 #[test]
+fn winperf_bench_slot_loads_prototypes_from_the_runtime_directory() {
+    let root = std::env::temp_dir().join(format!("winperf-runtime-{}", std::process::id()));
+    let base_mod = root.join("base_mod");
+    std::fs::create_dir_all(&base_mod).unwrap();
+    std::fs::write(
+        base_mod.join("data.lua"),
+        "error('benchmark runtime prototype marker')",
+    )
+    .unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_scenarios"))
+        .current_dir(&root)
+        .arg("bench-slot")
+        .args(["--root", "world"])
+        .args(["--slot", "lesce_town"])
+        .args(["--warmup", "0", "--ticks", "1"])
+        .output();
+    std::fs::remove_dir_all(root).unwrap();
+    let output = output.unwrap();
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(!output.status.success());
+    assert!(
+        error.contains("benchmark runtime prototype marker"),
+        "{error}"
+    );
+}
+
+#[test]
 fn perf_10k_cli_rejects_option_like_json_paths() {
     let scenarios = env!("CARGO_BIN_EXE_scenarios");
     // The trailing argument keeps the benchmark from running if parsing regresses.
