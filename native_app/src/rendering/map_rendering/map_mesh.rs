@@ -25,6 +25,7 @@ use simulation::map::{
     PylonPosition, Road, Roads, SubscriberChunkID, Turn, TurnKind, UpdateType, ZoneCell, ZoneGrid,
     ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET, ZONE_CELL_SIZE,
 };
+use simulation::map_dynamic::Transit;
 use simulation::souls::growth::{check_growable_lot, GrowableLotError};
 use simulation::Simulation;
 use std::cell::RefCell;
@@ -152,6 +153,9 @@ pub struct MapMeshHandler {
     map_version: Option<u64>,
     rebuilt_version: Option<u64>,
     zoning: ZoningMeshes,
+    bus_stop_builder: SpriteBatchBuilder<false>,
+    bus_stop_batch: Option<SpriteBatch>,
+    bus_stop_revision: Option<u64>,
 }
 
 #[derive(Default)]
@@ -1512,8 +1516,12 @@ impl MapMeshHandler {
             mesh_lots: MeshBuilder::new(gfx.tess_material),
         };
 
+        let bus_stop_texture = ServiceIcon::BusStop.texture(gfx);
         Self {
             builders,
+            bus_stop_builder: SpriteBatchBuilder::new(&bus_stop_texture, gfx),
+            bus_stop_batch: None,
+            bus_stop_revision: None,
             cache: Default::default(),
             road_sub: sim
                 .map()
@@ -1536,6 +1544,26 @@ impl MapMeshHandler {
                 preview_key: None,
                 builder: MeshBuilder::new(gfx.tess_material),
             },
+        }
+    }
+
+    pub(crate) fn draw_transit_stops(&mut self, transit: &Transit, ctx: &mut FrameContext<'_>) {
+        if self.bus_stop_revision != Some(transit.revision) {
+            self.bus_stop_builder.clear();
+            let dir = upright_sprite([Vec2::X, Vec2::Y]).0.z0();
+            for stop in transit.stops.values() {
+                self.bus_stop_builder.push(
+                    stop.walk_pos.up(1.2),
+                    dir,
+                    LinearColor::WHITE,
+                    (12.0, 12.0),
+                );
+            }
+            self.bus_stop_batch = self.bus_stop_builder.build(ctx.gfx);
+            self.bus_stop_revision = Some(transit.revision);
+        }
+        if let Some(batch) = &self.bus_stop_batch {
+            ctx.draw(batch.clone());
         }
     }
 

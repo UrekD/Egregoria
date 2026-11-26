@@ -2,13 +2,14 @@ use geom::Vec3;
 use goryak::{error, mincolumn, minrow, on_secondary_container, textc, tooltip};
 use prototypes::{try_prototype, GoodsCompanyPrototype, Power, ServiceID, ServiceKind};
 use simulation::economy::TripPurpose;
-use simulation::map::{water_provider_site, Building, BuildingID};
+use simulation::map::{water_provider_site, Building, BuildingID, Map};
 use simulation::map_dynamic::{
-    active_business, effective_load, ActiveBusiness, BuildingInfos, CoverageGrid, Destination,
-    ElectricityFlow, RoutingStep, ServiceAllocation,
+    active_business, connected_site_network, effective_load, ActiveBusiness, BuildingInfos,
+    CoverageGrid, Destination, ElectricityFlow, Itinerary, RoutingStep, ServiceAllocation,
 };
+use simulation::souls::human::HumanDecisionKind;
 use simulation::transportation::{Location, VehicleKind};
-use simulation::{HumanEnt, HumanID, PopulationScale, Simulation};
+use simulation::{CompanyID, HumanEnt, HumanID, PopulationScale, Simulation};
 
 use super::entity_link_named;
 use crate::uiworld::UiWorld;
@@ -88,7 +89,16 @@ fn service_staff(sim: &Simulation, building: &Building, slots: u32) -> ServiceSt
         .flat_map(|company| company.workers.0.iter().copied())
         .filter_map(|id| {
             let human = sim.get(id)?;
-            let state = staff_state(human, building.id);
+            let vehicle = match human.location {
+                Location::Vehicle(id) | Location::Transit(id) => sim.get(id),
+                _ => None,
+            };
+            let state = staff_state(
+                human,
+                building.id,
+                business.map(|operator| operator.company),
+                vehicle.map(|vehicle| &vehicle.it),
+            );
             let location = match human.location {
                 Location::Building(at) => map.get(at).map_or_else(
                     || "Building unavailable".to_owned(),
@@ -105,15 +115,14 @@ fn service_staff(sim: &Simulation, building: &Building, slots: u32) -> ServiceSt
                         }
                     },
                 ),
-                Location::Vehicle(vehicle) | Location::Transit(vehicle) => {
-                    let label = sim.get(vehicle).map_or("In a vehicle", |vehicle| {
-                        match vehicle.vehicle.kind {
+                Location::Vehicle(_) | Location::Transit(_) => {
+                    let label =
+                        vehicle.map_or("In a vehicle", |vehicle| match vehicle.vehicle.kind {
                             VehicleKind::Car => "In a car",
                             VehicleKind::Truck => "In a truck",
                             VehicleKind::Bus => "On a bus",
-                        }
-                    });
-                    position_label(label, sim.pos(vehicle).unwrap_or(human.trans.pos))
+                        });
+                    position_label(label, vehicle.map_or(human.trans.pos, |v| v.trans.pos))
                 }
                 Location::Outside => {
                     let label = if matches!(
@@ -142,14 +151,36 @@ fn service_staff(sim: &Simulation, building: &Building, slots: u32) -> ServiceSt
     }
 }
 
-fn staff_state(human: &HumanEnt, workplace: BuildingID) -> StaffState {
+fn staff_state(
+    human: &HumanEnt,
+    workplace: BuildingID,
+    employer: Option<CompanyID>,
+    vehicle_itinerary: Option<&Itinerary>,
+) -> StaffState {
+    let route_stalled = match human.location {
+        Location::Outside => human.it.is_wait_for_reroute().is_some(),
+        Location::Vehicle(_) | Location::Transit(_) => {
+            vehicle_itinerary.is_none_or(|itinerary| itinerary.is_wait_for_reroute().is_some())
+        }
+        Location::Building(_) => false,
+    };
     match human.location {
         Location::Building(at) if at == workplace => StaffState::AtWork,
         Location::Building(at) if at == human.home.house => StaffState::AtHome,
+        _ if route_stalled => StaffState::Other,
         _ if human.router.trip_purpose == TripPurpose::Work
             && human.router.target_dest == Some(Destination::Building(workplace))
             && human.router.trip_start.is_some()
             && human.router.last_error.is_none() =>
+        {
+            StaffState::Commuting
+        }
+        _ if employer.is_some_and(|employer| {
+            matches!(human.decision.kind, HumanDecisionKind::GoHome(_))
+                && human
+                    .router
+                    .is_returning_home_from_work(employer, human.home.house)
+        }) =>
         {
             StaffState::Commuting
         }
@@ -180,13 +211,17 @@ pub(super) fn render(
     let road_connected = building
         .connected_road
         .is_some_and(|road| map.get(road).is_some());
-    let blocker = if !road_connected {
+    let generation = match activity {
+        StaffActivity::Power => power_output(&map, building, staff.business),
+        StaffActivity::Service(_) => None,
+    };
+    let blocker = if matches!(activity, StaffActivity::Service(_)) && !road_connected {
         Some("Disconnected from the road")
     } else if staff.business.is_none() {
         Some("No active operator")
     } else {
         match activity {
-            StaffActivity::Power if network.is_none() => Some("No electricity network"),
+            StaffActivity::Power if generation.is_none() => Some("No electricity network"),
             StaffActivity::Service(ServiceKind::WaterPump | ServiceKind::SewageOutlet)
                 if water_provider_site(&map, building.id).is_some_and(|site| site.is_err()) =>
             {
@@ -227,12 +262,16 @@ pub(super) fn render(
         let inactive = blocker.is_some() || (staff.slots > 0 && staff.rows.is_empty());
         match activity {
             StaffActivity::Power => {
-                let output = if inactive {
-                    Power::ZERO
-                } else {
-                    effective_load(building, None, staff.business).power_production
-                };
+                let output = generation.unwrap_or(Power::ZERO);
                 label(format!("Electricity output · {output}"));
+                if !road_connected {
+                    let connection = if generation.is_some() {
+                        "Road disconnected · Isolated electricity network"
+                    } else {
+                        "Disconnected from the road"
+                    };
+                    textc(on_secondary_container(), connection);
+                }
             }
             StaffActivity::Service(kind @ (ServiceKind::WaterPump | ServiceKind::SewageOutlet)) => {
                 let load = effective_load(building, None, staff.business);
@@ -268,6 +307,15 @@ pub(super) fn render(
     });
 }
 
+fn power_output(map: &Map, building: &Building, business: Option<ActiveBusiness>) -> Option<Power> {
+    let network = if building.development().is_some() {
+        connected_site_network(map, building)
+    } else {
+        map.electricity.net_id(building.id)
+    };
+    network.map(|_| effective_load(building, None, business).power_production)
+}
+
 fn coverage_summary(allocation: ServiceAllocation, scale: PopulationScale) -> String {
     let demand = allocation.people * f32::from(scale.persons_per_agent());
     format!(
@@ -279,15 +327,19 @@ fn coverage_summary(allocation: ServiceAllocation, scale: PopulationScale) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
-    use geom::{vec2, Vec2, OBB};
-    use prototypes::{BuildingGen, GameTime, GoodsCompanyID, Tick, TICKS_PER_MINUTE};
+    use geom::{vec2, Transform, Vec2, OBB};
+    use prototypes::{
+        BuildingGen, GameTime, GoodsCompanyID, Tick, TICKS_PER_HOUR, TICKS_PER_MINUTE,
+    };
     use scenarios::builders::{fill_houses, grid_city};
     use scenarios::ScenarioCtx;
-    use simulation::map::{BuildingKind, ProjectFilter, ProjectKind};
-    use simulation::map_dynamic::{coverage_update, RouterError};
+    use simulation::map::{BuildingKind, PathKind, ProjectFilter, ProjectKind};
+    use simulation::map_dynamic::{coverage_update, Router, RouterError};
+    use simulation::souls::desire::{Work, WorkKind};
     use simulation::souls::goods_company::company_soul;
     use simulation::souls::human::spawn_human;
-    use simulation::souls::human::HumanDecisionKind;
+    use simulation::transportation::spawn_driving_vehicle;
+    use simulation::world_command::WorldCommand;
     use simulation::{SimulationOptions, SoulID};
     use slotmapd::Key;
 
@@ -434,22 +486,22 @@ mod tests {
 
         human.router.trip_purpose = TripPurpose::Leisure;
         human.decision.kind = HumanDecisionKind::VisitLeisure(homes[1]);
-        let leisure = staff_state(human, homes[1]);
+        let leisure = staff_state(human, homes[1], None, None);
 
         human.router.trip_purpose = TripPurpose::Work;
-        let work = staff_state(human, homes[1]);
+        let work = staff_state(human, homes[1], None, None);
         human.router.last_error = Some(RouterError::LocatingVehicle);
-        let failed = staff_state(human, homes[1]);
+        let failed = staff_state(human, homes[1], None, None);
 
         human.router.last_error = None;
         human.router.trip_start = None;
-        let pending = staff_state(human, homes[1]);
+        let pending = staff_state(human, homes[1], None, None);
 
         human.router.trip_start = Some(Tick(2));
         human.router.target_dest = Some(Destination::Building(homes[0]));
         human.router.trip_purpose = TripPurpose::Home;
         human.decision.kind = HumanDecisionKind::DepositAtHome;
-        let groceries = staff_state(human, homes[1]);
+        let groceries = staff_state(human, homes[1], None, None);
 
         assert_eq!(
             [leisure, work, failed, pending, groceries],
@@ -460,6 +512,242 @@ mod tests {
                 StaffState::Other,
                 StaffState::Other
             ],
+        );
+    }
+
+    #[test]
+    fn service_staff_counts_homebound_commutes_only_from_work() {
+        let mut fixture = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        let grid = grid_city(&mut fixture, vec2(700.0, 700.0), 4, 4, 160.0);
+        let proto = GoodsCompanyID::new("park").prototype();
+        let park = fixture
+            .sim
+            .write::<simulation::map::Map>()
+            .build_special_building(
+                &OBB::new(vec2(760.0, 679.5), Vec2::X, 20.0, 20.0),
+                BuildingKind::GoodsCompany(proto.id),
+                proto.bgen,
+                None,
+                Some(grid.roads[0]),
+            )
+            .unwrap();
+        let [home, visited, other_home] = fill_houses(&mut fixture, 3).try_into().unwrap();
+        let sim = &mut fixture.sim;
+        let Some(SoulID::GoodsCompany(company)) = company_soul(sim, park, proto.id) else {
+            panic!("park must have a company");
+        };
+
+        let workers =
+            [(park, home), (home, home), (visited, other_home)].map(|(departure, home)| {
+                let worker = spawn_human(sim, home).unwrap();
+                let door = sim.map().get(departure).unwrap().door_pos;
+                {
+                    let mut infos = sim.write::<BuildingInfos>();
+                    infos.get_out(home, worker.into());
+                    infos.get_in(departure, worker.into());
+                }
+                let human = &mut sim.world_mut_unchecked().humans[worker];
+                human.location = Location::Building(departure);
+                human.trans.pos = door;
+                human.router = Router::new(None);
+                human.work = Some(Work::new(park, WorkKind::Worker, 0.0));
+                if departure != park {
+                    human.decision.wait = u8::MAX;
+                }
+                worker
+            });
+        sim.world_mut_unchecked().companies[company].workers.0 = workers.to_vec();
+        let [on_shift, visitor, _] = workers;
+        *sim.write::<GameTime>() = GameTime::new(Tick(2 * TICKS_PER_HOUR));
+        fixture.run_ticks(1);
+
+        let sim = &mut fixture.sim;
+        *sim.write::<GameTime>() = GameTime::new(Tick(11 * TICKS_PER_HOUR));
+        sim.world_mut_unchecked().edit_human(visitor, |human| {
+            human.decision.wait = u8::MAX;
+            human.router.go_to(Destination::Building(park));
+            human.router.trip_purpose = TripPurpose::Leisure;
+        });
+        for _ in 0..20 {
+            fixture
+                .sim
+                .world_mut_unchecked()
+                .edit_human(visitor, |human| {
+                    // Let the real route enter the park without running unrelated errands.
+                    human.decision.wait = u8::MAX;
+                    if let Some(RoutingStep::WalkTo(door)) = human.router.cur_step() {
+                        human.trans.pos = *door;
+                        human.it = Itinerary::NONE;
+                    }
+                });
+            fixture.run_ticks(1);
+            if fixture.sim.get(visitor).unwrap().location == Location::Building(park) {
+                break;
+            }
+        }
+        assert_eq!(
+            fixture.sim.get(visitor).unwrap().location,
+            Location::Building(park)
+        );
+        assert_eq!(
+            fixture.sim.get(on_shift).unwrap().location,
+            Location::Building(park)
+        );
+        for worker in workers {
+            fixture
+                .sim
+                .world_mut_unchecked()
+                .edit_human(worker, |human| {
+                    human.decision.wait = 0;
+                    human.decision.kind = HumanDecisionKind::GoHome(human.home.house);
+                });
+        }
+        fixture.run_ticks(4);
+
+        let sim = &fixture.sim;
+        assert!(workers.iter().all(|&worker| {
+            let human = sim.get(worker).unwrap();
+            human.location == Location::Outside
+                && human.router.trip_purpose == TripPurpose::Home
+                && human.router.last_error.is_none()
+        }));
+        let states = {
+            let staff = service_staff(sim, sim.map().get(park).unwrap(), proto.n_workers);
+            workers.map(|worker| {
+                staff
+                    .rows
+                    .iter()
+                    .find(|row| row.id == worker)
+                    .unwrap()
+                    .state
+            })
+        };
+        let sim = &mut fixture.sim;
+        let destination = sim.map().get(home).unwrap().door_pos;
+        let car =
+            spawn_driving_vehicle(sim, VehicleKind::Car, Transform::new(destination)).unwrap();
+        let world = sim.world_mut_unchecked();
+        world.vehicles[car].it = Itinerary::wait_for_reroute(PathKind::Vehicle, destination);
+        let human = &mut world.humans[on_shift];
+        human.it = Itinerary::wait_for_reroute(PathKind::Pedestrian, destination);
+        let walking = staff_state(human, park, Some(company), None);
+        human.it = Itinerary::NONE;
+        human.location = Location::Vehicle(car);
+        let driving = staff_state(human, park, Some(company), Some(&world.vehicles[car].it));
+        assert_eq!(
+            (states, [walking, driving]),
+            (
+                [StaffState::Commuting, StaffState::Other, StaffState::Other],
+                [StaffState::Other; 2]
+            ),
+        );
+    }
+
+    #[test]
+    fn service_staff_excludes_stalled_pedestrian_and_vehicle_commutes() {
+        let mut fixture = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        grid_city(&mut fixture, vec2(700.0, 700.0), 4, 4, 160.0);
+        let home = fill_houses(&mut fixture, 1)[0];
+        let grid = grid_city(&mut fixture, vec2(1400.0, 700.0), 2, 1, 160.0);
+        let park = GoodsCompanyID::new("park").prototype();
+        let workplace = fixture
+            .sim
+            .write::<Map>()
+            .build_special_building(
+                &OBB::new(vec2(1460.0, 679.5), Vec2::X, 20.0, 20.0),
+                BuildingKind::GoodsCompany(park.id),
+                park.bgen,
+                None,
+                Some(grid.roads[0]),
+            )
+            .unwrap();
+        let worker = spawn_human(&mut fixture.sim, home).unwrap();
+        fixture
+            .sim
+            .world_mut_unchecked()
+            .edit_human(worker, |human| {
+                human.router = Router::new(None);
+                human.router.go_to(Destination::Building(workplace));
+                human.router.trip_purpose = TripPurpose::Work;
+                human.decision.wait = u8::MAX;
+            });
+        fixture.run_ticks(8);
+        let sim = &mut fixture.sim;
+        let destination = sim.map().get(workplace).unwrap().door_pos;
+        let car =
+            spawn_driving_vehicle(sim, VehicleKind::Car, Transform::new(destination)).unwrap();
+        let world = sim.world_mut_unchecked();
+        world.vehicles[car].it = Itinerary::wait_for_reroute(PathKind::Vehicle, destination);
+        let human = &mut world.humans[worker];
+        assert_eq!(human.location, Location::Outside);
+        assert!(human.router.last_error.is_none());
+        assert!(human
+            .it
+            .is_wait_for_reroute()
+            .is_some_and(|ticks| ticks > 0));
+        let pedestrian = staff_state(human, workplace, None, None);
+        human.it = Itinerary::NONE;
+        human.location = Location::Vehicle(car);
+        let driver = staff_state(human, workplace, None, Some(&world.vehicles[car].it));
+        assert_eq!([pedestrian, driver], [StaffState::Other; 2]);
+    }
+
+    #[test]
+    fn service_staff_power_output_matches_the_isolated_network() {
+        let mut fixture = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        let grid = grid_city(&mut fixture, vec2(700.0, 700.0), 4, 4, 160.0);
+        let proto = GoodsCompanyID::new("coal-power-plant").prototype();
+        let road = grid.roads[0];
+        let plant = fixture
+            .sim
+            .write::<Map>()
+            .build_special_building(
+                &OBB::new(vec2(780.0, 607.0), Vec2::X, proto.size.w, proto.size.h),
+                BuildingKind::GoodsCompany(proto.id),
+                proto.bgen,
+                None,
+                Some(road),
+            )
+            .unwrap();
+        let home = fill_houses(&mut fixture, 1)[0];
+        let sim = &mut fixture.sim;
+        let Some(SoulID::GoodsCompany(company)) = company_soul(sim, plant, proto.id) else {
+            panic!("coal plant must have a company");
+        };
+        let worker = spawn_human(sim, home).unwrap();
+        sim.world_mut_unchecked().companies[company].workers.0 = vec![worker];
+        fixture.submit(&[WorldCommand::MapRemoveRoad(road)]);
+        fixture.run_ticks(1);
+
+        let sim = &fixture.sim;
+        let map = sim.map();
+        let building = map.get(plant).unwrap();
+        assert!(building.connected_road.is_none());
+        let network = map
+            .electricity
+            .net_id(plant)
+            .expect("isolated plant network");
+        let production = sim
+            .read::<ElectricityFlow>()
+            .network_stats(network)
+            .produced_power;
+        assert!(production > Power::ZERO);
+        let staff = service_staff(sim, building, proto.n_workers);
+        assert_eq!(
+            power_output(&map, building, staff.business),
+            Some(production)
         );
     }
 

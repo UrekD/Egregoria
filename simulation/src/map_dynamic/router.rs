@@ -45,6 +45,7 @@ pub struct Router {
     #[serde(default)]
     #[inspect(skip)]
     pub trip_purpose: TripPurpose,
+    // Employer for a commute, or for the current stay after attending work.
     #[inspect(skip)]
     #[serde(default)]
     trip_employer: Option<CompanyID>,
@@ -175,6 +176,7 @@ fn routing_changed(
                 if h.location == Location::Building(build) {
                     router.cur_dest = router.target_dest;
                     router.last_error = None;
+                    router.trip_employer = None;
                     on_cancel(router);
                     return;
                 }
@@ -187,8 +189,13 @@ fn routing_changed(
             }
         };
         if router.trip_start.is_none() {
-            router.trip_start = Some(elapsed_ticks(resources));
+            if router.trip_purpose == TripPurpose::Home {
+                let employer = return_home_employer(h, dest, resources);
+                h.router.trip_employer = employer;
+            }
+            h.router.trip_start = Some(elapsed_ticks(resources));
         }
+        let router = &mut h.router;
 
         let mut transit_steps = None;
         if !transit.runs.is_empty()
@@ -294,6 +301,26 @@ fn routing_changed(
 
         router.steps.reverse();
     });
+}
+
+// Both GoHome and DepositAtHome use the Home purpose.
+fn return_home_employer(
+    human: &HumanEnt,
+    destination: Destination,
+    resources: &Resources,
+) -> Option<CompanyID> {
+    if !matches!(human.decision.kind, HumanDecisionKind::GoHome(home)
+        if destination == Destination::Building(home) && home == human.home.house)
+    {
+        return None;
+    }
+    let work = human.work.as_ref()?;
+    let employer = human.router.trip_employer?;
+    (human.location == Location::Building(work.workplace)
+        && work.employer.is_none_or(|assigned| assigned == employer)
+        && resources.read::<BuildingInfos>().owner(work.workplace)
+            == Some(SoulID::GoodsCompany(employer)))
+    .then_some(employer)
 }
 
 pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
@@ -545,6 +572,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                         .write::<BuildingInfos>()
                         .get_in(build, SoulID::Human(body));
                     walk_inside(body, h, cbuf_human);
+                    h.router.trip_employer = None;
                     match h.router.trip_purpose {
                         TripPurpose::Work => h.attend_work_for(
                             &resources.read::<prototypes::GameTime>(),
@@ -1101,6 +1129,15 @@ impl Router {
         }
     }
 
+    pub fn is_returning_home_from_work(&self, employer: CompanyID, home: BuildingID) -> bool {
+        self.trip_purpose == TripPurpose::Home
+            && self.trip_employer == Some(employer)
+            && self.target_dest == Some(Destination::Building(home))
+            && self.cur_dest == self.target_dest
+            && self.last_error.is_none()
+            && self.has_route_step()
+    }
+
     pub(crate) fn commutes_for(&self, employer: CompanyID) -> bool {
         self.target_dest.is_some()
             && self.trip_purpose == TripPurpose::Work
@@ -1174,8 +1211,32 @@ impl Router {
         workplace: BuildingID,
         employer: Option<CompanyID>,
     ) -> bool {
-        let arrived = self.go_to_for(Destination::Building(workplace), TripPurpose::Work);
+        let dest = Destination::Building(workplace);
+        if self.target_dest == Some(dest)
+            && self.cur_dest == Some(dest)
+            && self.trip_start.is_none()
+        {
+            // Work arrival has already recorded whether this stay includes attendance.
+            return !self.has_route_step();
+        }
+        let arrived = self.go_to_for(dest, TripPurpose::Work);
         self.trip_employer = employer;
+        arrived
+    }
+
+    pub(crate) fn record_work_stay(&mut self, employer: CompanyID) {
+        self.trip_employer = Some(employer);
+    }
+
+    pub(crate) fn go_home(&mut self, home: BuildingID) -> bool {
+        let stay_employer = self.trip_employer.filter(|_| {
+            self.trip_start.is_none()
+                && matches!(self.trip_purpose, TripPurpose::Other | TripPurpose::Work)
+        });
+        let arrived = self.go_to_for(Destination::Building(home), TripPurpose::Home);
+        if stay_employer.is_some() {
+            self.trip_employer = stay_employer;
+        }
         arrived
     }
 

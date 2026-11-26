@@ -704,6 +704,10 @@ impl State {
             ctx,
         );
 
+        map_renderer
+            .meshb
+            .draw_transit_stops(&sim.read::<simulation::map_dynamic::Transit>(), ctx);
+
         let instances_start = ctx.gfx.profile_timer();
         self.instanced_renderer.render(&sim, ctx);
         ctx.gfx.profile_elapsed(CpuPhase::Instances, instances_start);
