@@ -1,0 +1,656 @@
+{
+  "schema": 1,
+  "floor": "c27db71be91777a5e822f3bd1b07e9b50b67355b",
+  "runtime": "Stock Simulation::schedule, debug diagnostic tests; no effective worker claim",
+  "trace_digest": "SHA-256 of the UTF-8 JSON text following the slot_trace prefix, without newline",
+  "slot_runs": [
+    {
+      "slot": "lesce_osm",
+      "producer": "6d8c562d14440a776f9394ffa9c52df8f6f2fb75",
+      "snapshot": {
+        "file": "lesce_osm.zip",
+        "sha256": "5792d3a5d4287274e9413c6cba63b7043e2d160c921d2d51e830206a93c19e28",
+        "schema": "0.11.0",
+        "revision_hex": "3b626678ef6bc7b1b2c5d4d2981841b8",
+        "registry_fingerprint_hex": "3043cb3465531b7d",
+        "metadata_sha256": "f52b98c3aa0895a11c9e161f12c1cfa031ee213e63cac97ebbbe76a24480d6bd",
+        "replay_sha256": null
+      },
+      "opening": {
+        "report_sha256": "81db46d2a38e7727c19a3181512a663c99eb050a971135e9a15a89cd44810dbe",
+        "source_sha256": "3ef52f43b24e6df31fc6bb0915e99af10107995c5aa7336c4283a0d2c2fc9dea",
+        "requested_snapshot": "2026-11-22T12:24:51Z",
+        "route_checks_passed": 11,
+        "route_checks_total": 11,
+        "headless": null,
+        "opening_hours": 0,
+        "qualification": "Legacy OSM diagnostic"
+      },
+      "start_elapsed": 1047,
+      "end_elapsed": 2847,
+      "workload": {
+        "active_buses": 0,
+        "bus_lines": 0,
+        "bus_stops": 0,
+        "companies": 172,
+        "employed": 2903,
+        "external_markets": 1,
+        "freight_terminals": 1,
+        "humans": 2903,
+        "passenger_station_markers": 1,
+        "passenger_wagons": 0,
+        "persons_per_agent": 1,
+        "rail_lanes": 64,
+        "roads": 963,
+        "seed": 46360514160,
+        "simulation_tick": 1048,
+        "target_buses": 0,
+        "trains": 1,
+        "warehouses": 0
+      },
+      "receiver": {
+        "building": {
+          "idx": 1,
+          "version": 1
+        },
+        "soul": {
+          "GoodsCompany": {
+            "idx": 1,
+            "version": 1
+          }
+        },
+        "item": 3166473123439264355,
+        "item_name": "coal",
+        "company_prototype": "coal-power-plant",
+        "recipe_units": 1
+      },
+      "setup_tape": "Stock snapshot, no added infrastructure or offers. One paused terminal-policy probe in its paired arm.",
+      "intent_tape": "Organic stock activity sampled through the fixed diagnostic window.",
+      "expected_floors": {
+        "passenger_rail": "Unprovided by stock",
+        "release_cohorts": "Unqualified diagnostic window"
+      },
+      "control_receipt": {
+        "accepted": [],
+        "building": {
+          "idx": 18,
+          "version": 1
+        },
+        "command": "SetWarehousePolicy",
+        "rejected": "[(\"SetWarehousePolicy\", InvalidWarehouse)]"
+      },
+      "matched_counters": {
+        "boards": 0,
+        "distinct_road_manifests": 0,
+        "import_export_fare_deltas": [
+          "0",
+          "0",
+          "0"
+        ],
+        "observed_cross_line_same_target": 0,
+        "receiver_stockout_ticks": 1800,
+        "terminal_state_changes": 2,
+        "train_moving_ticks": 1776,
+        "walk_car_bus_giveup_deltas": [
+          0,
+          4,
+          0,
+          0
+        ]
+      },
+      "matched_initial_world_hash": 7491516544886546812,
+      "matched_final_world_hash": 1504316007862576188,
+      "event_count_per_arm": 4,
+      "trace_sha256": {
+        "control": "caddec094db35d49acf9e9e5bec1be557694f367a4460128d5d1ef2e63cb2c67",
+        "terminal-policy": "4db6f75acd7d5d829c7ac6f996a871fdb011375650bc21f75ff1f30495aae519"
+      },
+      "control_event_samples": {
+        "Arriving": {
+          "berth": [
+            3722.428955078125,
+            4551.17578125,
+            9.98468017578125
+          ],
+          "calls": [
+            {
+              "direction": [
+                -0.40209051966667175,
+                0.9155999422073364,
+                0.0
+              ],
+              "distance_to_berth_m": 1579.25,
+              "position": [
+                4326.138671875,
+                3091.872802734375,
+                10.284680366516113
+              ],
+              "speed": 126.26611328125,
+              "stage": "Arriving",
+              "train": {
+                "idx": 1,
+                "version": 1
+              },
+              "traversal": "Some(Traversable { kind: Lane(LaneID(3201v1)), dir: Forward })"
+            }
+          ],
+          "import_pool": [],
+          "kind": "terminal_state",
+          "terminal": {
+            "idx": 1,
+            "version": 1
+          },
+          "tick": 1047,
+          "waiting": 0,
+          "wanted": 3024
+        },
+        "receiver_state": {
+          "import_status": "Waiting { since: 100 }",
+          "kind": "receiver_state",
+          "on_hand": 0,
+          "road_units": 0,
+          "station_units": 0,
+          "tick": 1047
+        },
+        "Loading": {
+          "berth": [
+            3722.428955078125,
+            4551.17578125,
+            9.98468017578125
+          ],
+          "calls": [
+            {
+              "direction": [
+                -0.39342424273490906,
+                0.9193570613861084,
+                0.0
+              ],
+              "distance_to_berth_m": 0.3000001907348633,
+              "position": [
+                3722.428955078125,
+                4551.17578125,
+                10.284680366516113
+              ],
+              "speed": 3.318246841430664,
+              "stage": "Loading",
+              "train": {
+                "idx": 1,
+                "version": 1
+              },
+              "traversal": "None"
+            }
+          ],
+          "import_pool": [
+            [
+              3166473123439264355,
+              48
+            ],
+            [
+              7657305291051650051,
+              52
+            ]
+          ],
+          "kind": "terminal_state",
+          "terminal": {
+            "idx": 1,
+            "version": 1
+          },
+          "tick": 2175,
+          "waiting": 0,
+          "wanted": 2924
+        },
+        "Moving": {
+          "berth": [
+            3722.428955078125,
+            4551.17578125,
+            9.98468017578125
+          ],
+          "calls": [
+            {
+              "direction": [
+                -0.39342424273490906,
+                0.9193570613861084,
+                0.0
+              ],
+              "distance_to_berth_m": 0.3000001907348633,
+              "position": [
+                3722.428955078125,
+                4551.17578125,
+                10.284680366516113
+              ],
+              "speed": 0.0,
+              "stage": "Moving",
+              "train": {
+                "idx": 1,
+                "version": 1
+              },
+              "traversal": "Some(Traversable { kind: Lane(LaneID(4581v1)), dir: Forward })"
+            }
+          ],
+          "import_pool": [],
+          "kind": "terminal_state",
+          "terminal": {
+            "idx": 1,
+            "version": 1
+          },
+          "tick": 2226,
+          "waiting": 0,
+          "wanted": 2924
+        }
+      }
+    },
+    {
+      "slot": "showcase_city",
+      "producer": "c27db71be91777a5e822f3bd1b07e9b50b67355b",
+      "snapshot": {
+        "file": "showcase_city.zip",
+        "sha256": "eb9d59576c7b4f3d06174320d329750e4a207e601ef6b46e6fc97943747ec1b2",
+        "schema": "0.11.1",
+        "revision_hex": "1846b481b4ff71e911aedf8fe06dbb2b",
+        "registry_fingerprint_hex": "3043cb3465531b7d",
+        "metadata_sha256": "3fe1ef02d86b2e0d05f56b0e1fb5a29ab18cb58e77af2befc52c61fefc044c3b",
+        "replay_sha256": null
+      },
+      "opening": {
+        "qualification": "Fresh P6 Showcase producer gates passed; P8 release eligibility pending",
+        "producer_log_sha256": "7ced1e57729337ae3146136a2cd01a755487d56a53c56acc28198e22a25e184e",
+        "producer_summary": [
+          "Showcase City: day 1 complete, 1350 residents, 68 completed bus trips",
+          "Showcase City: day 2 complete, 1350 residents, 248 completed bus trips",
+          "Showcase City: day 3 complete, 1350 residents, 370 completed bus trips",
+          "Showcase City: 1350 residents, 12.5% unemployment, 62 L2 and 6 L3 homes, 0 buildings without utilities, 2460000/249400 W power, 4000/2105 water, 4000/2105 sewage, 446 completed bus trips, 10 buses, traffic on 13 roads, treasury 484620.35$, last full day 57803.69$, freight BuildingID(2v3) (imports -25667$, exports 11759.67$)"
+        ]
+      },
+      "start_elapsed": 480000,
+      "end_elapsed": 481800,
+      "workload": {
+        "active_buses": 10,
+        "bus_lines": 2,
+        "bus_stops": 16,
+        "companies": 76,
+        "employed": 1181,
+        "external_markets": 1,
+        "freight_terminals": 1,
+        "humans": 1350,
+        "passenger_station_markers": 0,
+        "passenger_wagons": 0,
+        "persons_per_agent": 1,
+        "rail_lanes": 6,
+        "roads": 150,
+        "seed": 0,
+        "simulation_tick": 480001,
+        "target_buses": 10,
+        "trains": 1,
+        "warehouses": 0
+      },
+      "receiver": {
+        "building": {
+          "idx": 3,
+          "version": 1
+        },
+        "soul": {
+          "GoodsCompany": {
+            "idx": 1,
+            "version": 1
+          }
+        },
+        "item": 3166473123439264355,
+        "item_name": "coal",
+        "company_prototype": "coal-power-plant",
+        "recipe_units": 1
+      },
+      "setup_tape": "Stock snapshot, no added infrastructure or offers. One paused terminal-policy probe in its paired arm.",
+      "intent_tape": "Organic stock activity sampled through the fixed diagnostic window.",
+      "expected_floors": {
+        "passenger_rail": "Unprovided by stock",
+        "release_cohorts": "Unqualified diagnostic window"
+      },
+      "control_receipt": {
+        "accepted": [],
+        "building": {
+          "idx": 2,
+          "version": 3
+        },
+        "command": "SetWarehousePolicy",
+        "rejected": "[(\"SetWarehousePolicy\", InvalidWarehouse)]"
+      },
+      "matched_counters": {
+        "boards": 0,
+        "distinct_road_manifests": 8,
+        "import_export_fare_deltas": [
+          "0",
+          "212908",
+          "0"
+        ],
+        "observed_cross_line_same_target": 0,
+        "receiver_stockout_ticks": 0,
+        "terminal_state_changes": 11,
+        "train_moving_ticks": 1800,
+        "walk_car_bus_giveup_deltas": [
+          7,
+          3,
+          2,
+          0
+        ]
+      },
+      "matched_initial_world_hash": 4295600464562259562,
+      "matched_final_world_hash": 3114531279482694091,
+      "event_count_per_arm": 24,
+      "trace_sha256": {
+        "control": "c758035a997dd949c1f636b8e848e12568680f3b318754549a4dcbe273c83988",
+        "terminal-policy": "517bbc5f9c37dbb658e846f20eb8f0f7689c1ea8aad226cbb36c690de3206046"
+      },
+      "control_event_samples": {
+        "bus_aboard": {
+          "initial": true,
+          "kind": "bus_aboard",
+          "line": {
+            "idx": 2,
+            "version": 1
+          },
+          "person": {
+            "idx": 63,
+            "version": 1
+          },
+          "target": {
+            "Building": {
+              "idx": 12,
+              "version": 1
+            }
+          },
+          "tick": 480000,
+          "vehicle": {
+            "idx": 82,
+            "version": 1
+          }
+        },
+        "Arriving": {
+          "berth": [
+            4212.5166015625,
+            6310.79248046875,
+            0.0
+          ],
+          "calls": [
+            {
+              "direction": [
+                0.08831228315830231,
+                0.9960928559303284,
+                0.0
+              ],
+              "distance_to_berth_m": 5232.0302734375,
+              "position": [
+                2496.9326171875,
+                1368.029052734375,
+                0.30000001192092896
+              ],
+              "speed": 138.41258239746094,
+              "stage": "Arriving",
+              "train": {
+                "idx": 1,
+                "version": 1
+              },
+              "traversal": "Some(Traversable { kind: Lane(LaneID(9v3)), dir: Forward })"
+            }
+          ],
+          "import_pool": [
+            [
+              3166473123439264355,
+              39
+            ]
+          ],
+          "kind": "terminal_state",
+          "terminal": {
+            "idx": 1,
+            "version": 3
+          },
+          "tick": 480000,
+          "waiting": 9010,
+          "wanted": 0
+        },
+        "road_manifest": {
+          "from": {
+            "idx": 64,
+            "version": 1
+          },
+          "items": [
+            {
+              "item": 7657305291051650051,
+              "units": 18
+            }
+          ],
+          "kind": "road_manifest",
+          "tick": 480000,
+          "to": {
+            "idx": 147,
+            "version": 1
+          },
+          "truck": {
+            "idx": 89,
+            "version": 1
+          }
+        },
+        "receiver_state": {
+          "import_status": null,
+          "kind": "receiver_state",
+          "on_hand": 59,
+          "road_units": 78,
+          "station_units": 0,
+          "tick": 480000
+        },
+        "bus_exit": {
+          "kind": "bus_exit",
+          "person": {
+            "idx": 63,
+            "version": 1
+          },
+          "tick": 481087
+        }
+      }
+    }
+  ],
+  "planning_archives": {
+    "lesce_town": {
+      "sha256": "df27a33d93c3f6a84857020972d177d982a646f870e46702c2f8a4ae5f84ea22",
+      "opening_report_sha256": "c287d2bc024d09cef539ca518354ce25c3d022d558049329a27358bb0a4c7e55",
+      "opening_failures": 8
+    },
+    "freight2_showcase_city": {
+      "sha256": "d570f832fe44ff4fd5984c80f4841fcd18c1dd5056047b349f57d1e5e2c11114",
+      "schema": "0.10.0"
+    },
+    "scale_l3_parent_showcase": {
+      "producer": "6d8c562d14440a776f9394ffa9c52df8f6f2fb75",
+      "snapshot": {
+        "file": "showcase_city.zip",
+        "sha256": "59b3163f5b5bfa2a09bc5653b5c3ffca1a10ec69ccf02c2741521b5b3c68ee38",
+        "schema": "0.11.0",
+        "revision_hex": "7c96cb7ebcb506b1ddb0288edf6073ee",
+        "registry_fingerprint_hex": "3043cb3465531b7d",
+        "metadata_sha256": "548d08a871aed1b9e935dd34a2ad171cce0ea600117df3f75ae35f41e2fbee9c",
+        "replay_sha256": null
+      },
+      "opening": {
+        "qualification": "Compatible migrated snapshot and producer pre-Population Showcase check",
+        "producer_log_sha256": "f39475325785af2b8aa91f78f408a8c724a42d000d727035fe7b3b662bc950b6"
+      },
+      "matched_counters": {
+        "boards": 0,
+        "distinct_road_manifests": 8,
+        "import_export_fare_deltas": [
+          "0",
+          "212908",
+          "0"
+        ],
+        "observed_cross_line_same_target": 0,
+        "receiver_stockout_ticks": 0,
+        "terminal_state_changes": 11,
+        "train_moving_ticks": 1800,
+        "walk_car_bus_giveup_deltas": [
+          7,
+          3,
+          2,
+          0
+        ]
+      },
+      "trace_sha256": {
+        "control": "c758035a997dd949c1f636b8e848e12568680f3b318754549a4dcbe273c83988",
+        "terminal-policy": "517bbc5f9c37dbb658e846f20eb8f0f7689c1ea8aad226cbb36c690de3206046"
+      }
+    }
+  },
+  "bus_reducer": {
+    "zero_fleet_walking_control": {
+      "offer_id": "west-to-east",
+      "origin": {
+        "idx": 1,
+        "version": 1
+      },
+      "origin_pos": [
+        657.5021,
+        584.4619,
+        10.084681
+      ],
+      "final_door": {
+        "idx": 2,
+        "version": 1
+      },
+      "final_door_pos": [
+        1018.0,
+        585.1699,
+        10.084681
+      ],
+      "active_buses_at_offer": 0,
+      "offered_tick": 814,
+      "cutoff_tick": 18814,
+      "waits": [],
+      "boardings": [],
+      "alightings": [],
+      "arrived_tick": 15710
+    },
+    "one_line_control": {
+      "offer_id": "west-to-interchange",
+      "origin": {
+        "idx": 1,
+        "version": 1
+      },
+      "origin_pos": [
+        657.5021,
+        584.4619,
+        10.084681
+      ],
+      "final_door": {
+        "idx": 2,
+        "version": 1
+      },
+      "final_door_pos": [
+        857.0848,
+        664.0,
+        10.084681
+      ],
+      "active_buses_at_offer": 6,
+      "offered_tick": 814,
+      "cutoff_tick": 18814,
+      "waits": [
+        [
+          1153,
+          {
+            "idx": 1,
+            "version": 1
+          },
+          {
+            "idx": 1,
+            "version": 1
+          }
+        ]
+      ],
+      "boardings": [
+        [
+          6031,
+          {
+            "idx": 1,
+            "version": 1
+          }
+        ]
+      ],
+      "alightings": [
+        8020
+      ],
+      "arrived_tick": 8564
+    },
+    "cross_line_red": {
+      "offer_id": "west-to-east",
+      "origin": {
+        "idx": 1,
+        "version": 1
+      },
+      "origin_pos": [
+        657.5021,
+        584.4619,
+        10.084681
+      ],
+      "final_door": {
+        "idx": 2,
+        "version": 1
+      },
+      "final_door_pos": [
+        1018.0,
+        585.1699,
+        10.084681
+      ],
+      "active_buses_at_offer": 6,
+      "offered_tick": 814,
+      "cutoff_tick": 18814,
+      "waits": [
+        [
+          10598,
+          {
+            "idx": 2,
+            "version": 1
+          },
+          {
+            "idx": 4,
+            "version": 1
+          }
+        ]
+      ],
+      "boardings": [
+        [
+          12045,
+          {
+            "idx": 2,
+            "version": 1
+          }
+        ]
+      ],
+      "alightings": [
+        14079
+      ],
+      "arrived_tick": 14568
+    }
+  },
+  "rail_freight_reducers": {
+    "verified_freight_control": "freight control: export queue=0, outside distance=2.65 m",
+    "stock_reds": [
+      "freight boundary Some(BeforeBerth): position=V3(3038.75, 114.39564, 0.3)->V3(3038.75, 114.39564, 0.3), berth=V3(4212.5166, 6310.7925, 0.0), outside=V3(3036.1, 101.0, 0.0), queue=20->0, assignments=[(TrainID(1v1), Loading)], ledger=[0, 0]->[0, 0]",
+      "freight boundary Some(BeforeExit): position=V3(4217.71, 6320.9727, 0.3)->V3(4217.71, 6320.9727, 0.3), berth=V3(4212.5166, 6310.7925, 0.0), outside=V3(3036.1, 101.0, 0.0), queue=0->0, assignments=[], ledger=[0, 0]->[0, 0]",
+      "freight boundary Some(WrongDeck): position=V3(4212.5166, 6310.7925, 20.0)->V3(4212.5166, 6310.7925, 20.0), berth=V3(4212.5166, 6310.7925, 0.0), outside=V3(3036.1, 101.0, 0.0), queue=20->0, assignments=[(TrainID(1v1), Loading)], ledger=[0, 0]->[0, 0]",
+      "rail footprint: accepted=[0] rejected=[] wagons=[(TrainID(1v1), V3(283.20752, 197.35, 10.28468)), (TrainID(1v1), V3(266.45752, 197.35, 10.28468)), (TrainID(2v1), V3(433.20752, 197.35, 10.28468)), (TrainID(2v1), V3(416.45752, 197.35, 10.28468)), (TrainID(3v1), V3(283.20752, 197.35, 10.28468)), (TrainID(3v1), V3(266.45752, 197.35, 10.28468))] cash_delta=-12000000",
+      "stopped rail tail: TurnID { parent: IntersectionID(2v1), src: LaneID(1v1), dst: LaneID(9v3), bidirectional: false }, distance=41.724, poses=[V3(3019.5454, 241.14471, 0.3), V3(3031.437, 229.34825, 0.3)], iterations=5000, owner=None"
+    ]
+  },
+  "stock_transit_basic_gate": {
+    "invocation": "transit_basic --twice --json OUT --hashes OUT",
+    "summary": [
+      "transit_basic: bus trips=104 car trips=497/501 carless commute=15900.2/17430.1 ticks (matched=103, matched means=15705.0/17459.2, missing=1/0, pending=0/0, expired=0/0) boardings=118 max wait=8896 give-ups=0/118 upkeep=-748321/-748321 (inner units) resumed from tick 639269",
+      "transit_basic: bus trips=104 car trips=497/501 carless commute=15900.2/17430.1 ticks (matched=103, matched means=15705.0/17459.2, missing=1/0, pending=0/0, expired=0/0) boardings=118 max wait=8896 give-ups=0/118 upkeep=-748321/-748321 (inner units) resumed from tick 639269",
+      "transit_basic: both runs matched at every checkpoint and the final tick"
+    ],
+    "ordered_checkpoint_jsonl_bytes": 218384,
+    "exit_status": 0,
+    "checkpoints_per_run": [
+      76,
+      76
+    ],
+    "checkpoint_sha256": "421c572531dc441d39f6450ebbab4fc28cf48ca88f395b8172760b97205d52c9"
+  }
+}

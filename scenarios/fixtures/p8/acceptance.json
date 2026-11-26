@@ -1,0 +1,186 @@
+{
+  "schema": 1,
+  "scope": "Wave 0 evidence and reserved acceptance contracts",
+  "diagnostic_records": {
+    "bus_offer": ["offer_id", "origin", "origin_pos", "final_door", "final_door_pos", "active_buses_at_offer", "offered_tick", "cutoff_tick", "waits", "boardings", "alightings", "arrived_tick"],
+    "slot_trace": ["schema", "slot", "arm", "start_elapsed", "end_elapsed", "fixture", "fork_hashes", "receiver", "control_receipt", "events", "counters", "final_hashes"],
+    "slot_event_kinds": ["bus_aboard", "bus_exit", "terminal_state", "road_manifest", "receiver_state"],
+    "slot_window_ticks": 1800,
+    "slot_clock": "Monotonic elapsed ticks; start supplies the initial stock and residency, then score exactly start+1 through end inclusive.",
+    "rail_and_ledger": "Stock assignment stages and sampled 3D poses describe observations. A pooled train unload or a ledger posting cannot identify a physical fragment or establish rail-to-truck lineage.",
+    "transfer": "A stock cross-line sighting with the same target is diagnostic; verified transfer requires one immutable offer and ordered physical access, waits, boardings, alightings and final door arrival."
+  },
+  "future_offer_record": {
+    "fields": ["offer_id", "person_or_order_key", "intent_seq", "semantic_origin", "final_door_or_receiver", "earliest_departure_elapsed", "cutoff_elapsed", "quantity_if_freight", "class"],
+    "pairing": "Freeze offers independently of admission and route choice. Check identical fork fingerprint, setup and offer tape through the intervention.",
+    "quantile": "Nearest rank ceil(p*n), no interpolation. Include unfinished, rejected and cancelled offers. Drain legitimate arrivals at cutoff before scoring.",
+    "denominators": ["offered", "admitted", "boarded", "denied", "transferred", "arrived_or_unloaded", "aborted", "cancelled", "unfinished"]
+  },
+  "reserved_runtime_records": {
+    "TraversalAnchor": ["traversal", "offset_m", "stamp", "deck", "mode"],
+    "RouteEndpoint": ["OnTraversal(anchor)", "Connector(door_or_stop, entry, connector_revision)"],
+    "RouteResult": ["Found(value)", "Unreachable(reason)", "Deferred(work_kind)"],
+    "PatternCall": ["line", "pattern_rev", "ordinal", "stop"],
+    "RunKey": ["vehicle", "line", "run_epoch"],
+    "ArrivalKey": ["run", "call_seq"],
+    "BoardingKey": ["journey", "ride_leg", "arrival"],
+    "JourneyPlan": ["id", "purpose", "final_door", "legs"],
+    "JourneyStage": ["Walking(leg, cursor)", "Waiting(board, alight, since, expiry)", "Riding(run, board_occurrence, assigned_alight)", "Held(recovery, deadline)", "Finished(outcome)"],
+    "FareState": ["window_start", "highest_paid", "last_applied_board"],
+    "PhysicalRailEvent": ["train", "assignment", "leg_or_call_seq", "directed_anchor", "geometry_stamp", "elapsed_tick", "kind"],
+    "RailPlatformSpec": ["station", "berth", "usable_interval_m", "walk"],
+    "RailSchedule": ["anchor_elapsed", "headway_ticks", "dwell_ticks", "max_late_ticks"],
+    "DemandKey": ["building", "owner", "item"],
+    "FreightCallKey": ["terminal", "train", "epoch", "outside_gate", "berth"],
+    "CallManifest": ["key", "phase", "assigned_imports", "assigned_exports", "consumed_events", "ledger_refs"],
+    "SetFreightTerminalPolicy": ["terminal", "expected_policy_revision", "policy"],
+    "ownership_and_continuation": "Full generational keys, directed deck/revision proof, monotonic elapsed occurrences, exact units, and generation plus query/revision-bound report cursors.",
+    "compatibility": "Reserved names and field semantics. Rust types, persisted format, numeric berth tolerances, codec and registration await the integrated parent."
+  },
+  "reducers": {
+    "bus_stock": {
+      "selector": "cargo test --locked -p scenarios --test p8_connections p8_bus_stock_reduction",
+      "case": "bus-stock-reduction",
+      "offers_per_arm": 1,
+      "setup": {
+        "seed": 0,
+        "grid_junctions": [5, 2],
+        "origin_m": [600, 600],
+        "spacing_m": 120,
+        "walking_speed_m_s": 1.25,
+        "fleet_per_line": 4,
+        "directed_stop_edges": {
+          "west": [[[0, 0], [1, 0]], [[2, 0], [2, 1]], [[1, 1], [0, 1]]],
+          "east": [[[2, 1], [2, 0]], [[3, 0], [4, 0]], [[4, 1], [3, 1]]]
+        },
+        "anchor_rule": "Midpoint of driving lane between listed ordered junctions",
+        "warmup_ticks": 800,
+        "door_targets_m_from_grid_origin": {
+          "origin": [60, -25],
+          "interchange": [265, 60],
+          "cross_line": [420, -25]
+        },
+        "door_rule": "Nearest available lot center to each target; record actual generated building keys."
+      },
+      "control": "Same cross-line door by walking with zero fleet; a separate one-line offer reaches the interchange door after one physical ride.",
+      "red": "Same cross-line offer with both services fails to board and complete two distinct lines by cutoff."
+    },
+    "rail_shared_footprint": {
+      "selector": "cargo test --locked -p simulation --test p8_transport p8_rail_",
+      "control": "Two independent consist intervals fit one directed rail lane.",
+      "red": "Overlapping starts before a movement step, and synthetic claim release while the train is stopped."
+    },
+    "freight_physical_boundary": {
+      "selector": "cargo test --locked -p simulation --test p8_transport p8_freight_physical_boundary",
+      "control": "One reachable dispatch serves a fixed staged export backlog and physically returns outside.",
+      "red": "Force the itinerary to end short of the berth, at the berth XY on the wrong deck and short of the outside exit. Preserve stock, fiscal postings and dispatch ownership until proof."
+    },
+    "slot_stock": {
+      "selector": "cargo test --locked -p scenarios --test p8_connections p8_slot_stock_traces -- --ignored --nocapture",
+      "arms": ["control", "terminal-policy"],
+      "intervention_at": "Before first advancing tick",
+      "control": "Default policy; identical elapsed start and separate loads of the same slot.",
+      "red": "Stock warehouse policy command cannot change a rail terminal release setting; no authorized passenger rail service or end-to-end freight fragment trace exists on this floor."
+    }
+  },
+  "future_gates": {
+    "c2": {
+      "nonarrival_score_ticks": 3501,
+      "max_repaired_od_p95_ticks": 3500,
+      "min_pooled_p95_improvement_percent_each": 10,
+      "max_guard_p95_regression_percent": 2,
+      "cohorts": ["person", "freight"],
+      "cutoff_probe": {"cohort_size": 20, "repeated_delay": 1000, "repeat_count": 18, "control_p95": 3000, "passing_repaired_p95": 2700, "unfinished_repaired_p95": 3501}
+    },
+    "transfer": {
+      "offers_min": 100,
+      "cutoff_after_offer_ticks": 18000,
+      "unfinished_score_ticks": 18001,
+      "positive_control_admitted_min_percent": 90,
+      "positive_control_completed_min_percent": 90,
+      "candidate_arrived_min_percent": 95,
+      "candidate_two_line_completions_min": 50,
+      "candidate_transfer_wait_failures_max_percent": 5,
+      "candidate_p95_over_control_max_percent": 90
+    },
+    "scheduled_rail": {
+      "offers_per_direction_min": 20,
+      "cutoff_after_offer_ticks": 18000,
+      "admitted_and_arrived_min_percent": 80,
+      "completed_each_interchange_direction_min": 5,
+      "paying_cycles_min": 1,
+      "matched_loaded_freight_runs_min": 1,
+      "platform_calls": [2, 30],
+      "consist_entries": [1, 8],
+      "target_trains_max": 10,
+      "headway_ticks": [300, 6000],
+      "dwell_ticks": [50, 600],
+      "lateness_ticks": [0, 600],
+      "lateness_also_below_headway": true,
+      "starter_headway_dwell_lateness_ticks": [1000, 100, 250],
+      "route_and_fit_calibration": "Pending R1 measured berth and clearance proof, then capacity and round-trip tuning versus tuned bus control."
+    },
+    "sku_restoration": {
+      "offered_lots_min": 10,
+      "positive_terminal_to_receiver_loads_min": 2,
+      "verified_export_exits_min": 1,
+      "restored_target_stockout_ticks_improvement_min_percent": 20
+    },
+    "policy": {
+      "intervention": "Increase one validated cap by one; use the same routes, stock, demand, offers and fork fingerprint as control.",
+      "accepted_backlog_and_control_deliveries_min": 1,
+      "extra_verified_receiver_loads_min": 1,
+      "target_units_improvement_min_percent": 10,
+      "concurrent_calls": [0, 2],
+      "active_truck_runs": [0, 6]
+    },
+    "released_slots": {
+      "slots": ["lesce_town", "showcase_city"],
+      "cases": ["control", "transfer", "cut", "repair", "restored", "policy", "combined"],
+      "closed_scored_days_min": 3,
+      "tagged_passenger_offers_min_each": 30,
+      "two_line_completions_min_each": 10,
+      "tagged_freight_offers_min_each": 2,
+      "physical_train_truck_receiver_chains_min_each": 1,
+      "matched_citywide_commute_arrivals_and_freight_units_min_percent_of_parent": 95,
+      "unrelated_stockout_increase_max_percent": 5,
+      "require_occupied_repair_lesce_and_reload_policy_showcase": true,
+      "rail_derivative": "Separate manifest and directed setup tape when official slot lacks a qualified platform."
+    }
+  },
+  "workload_ceilings_for_calibration": {
+    "passenger_new_requests_per_step": 64,
+    "passenger_pending": 4096,
+    "passenger_routing_nodes_and_successors_per_step": [4096, 16384],
+    "passenger_graph_touches_and_waiter_updates_per_step": [256, 256],
+    "passenger_graph_and_cache_bytes": 16777216,
+    "passenger_pending_deadline_steps": 2000,
+    "maximum_transfers": 1,
+    "fare_window_ticks": 9000,
+    "road_and_rail_directed_gates": 64,
+    "trace_page_depth_rows_candidate_fragment_visits_recipe_edges": [3, 64, 256, 512],
+    "snapshot_slice_bytes_records": [32768, 256],
+    "freight_active_fragments": 65536,
+    "freight_retained_details": 131072,
+    "freight_details_elapsed_days": 7,
+    "freight_incremental_bytes": 33554432,
+    "p7_command_envelope_count_bytes_depth": [256, 524288, 16],
+    "p8_nested_envelopes": "Await merged P7 protocol manifest and canonical schema."
+  },
+  "tests_first": [
+    {"owner": "Q/T", "selector": "p8_bus_stock_reduction", "status": "executable", "oracle": "Walking and one-line controls arrive; require two ordered rides and the same final-door arrival."},
+    {"owner": "R1", "selector": "p8_rail_shared_footprint", "status": "executable", "oracle": "Reject overlapping starts before insertion/debit; accept separated intervals."},
+    {"owner": "R1", "selector": "p8_rail_stopped_tail_retains_junction", "status": "executable", "oracle": "Retain stopped tail claim through stock wait threshold; release on measured rear clearance."},
+    {"owner": "F/R1", "selector": "p8_freight_physical_boundary", "status": "executable", "oracle": "Reachable positive call; require real berth and outside crossing despite itinerary end, including wrong deck."},
+    {"owner": "S", "selector": "p8_tiles_c1_water_prefix", "status": "awaits merged P7", "oracle": "Rejected wet prefix, successful tile/road/legacy action, same-batch consumer, all-rejected and no-op paused tape, replay and asserted indices."},
+    {"owner": "S", "selector": "p8_authority_atomic_denial", "status": "awaits merged P7", "oracle": "Unowned/wet/protected and over-budget edits leave state and debit unchanged; compare after reused key."},
+    {"owner": "S/R/T/F", "selector": "p8_edit_retained_geometry", "status": "awaits P7 and live bindings", "oracle": "Retained-ID geometry trim across stacked deck, protected frontage and utilities, active rider, truck and parking claims."},
+    {"owner": "T", "selector": "p8_journey_", "status": "awaits passenger interfaces", "oracle": "Directed access/egress and transfer deck, revisioned occurrences, capacity/FIFO, skipped alight, legal fallback, fare at first+8999 and first+9000, zero-first-fare and duplicate across load."},
+    {"owner": "R1/R2", "selector": "p8_rail_", "status": "partly executable; scheduled calls await role and platform APIs", "oracle": "Two paused and same-step starts, blocked/missed slot, stopped tail and real clearance, loaded freight competition, fit/loop/deck, physical useful out/return boarding and retirement/egress."},
+    {"owner": "R2", "selector": "p8_rail_passenger_out_and_back", "status": "awaits passenger station, platform and service APIs", "oracle": "Positive peak outbound and return boarding, fare and observed arrival with freight competition; wrong deck or closed platform boards nobody."},
+    {"owner": "F", "selector": "p8_freight_", "status": "partly executable; provenance and policy await R1", "oracle": "Two active calls and late order, duplicate/drop across reload, refusal/return/write-off, pool conservation, unchanged fiscal fence, terminal admission pause/reopen, bounded trace and stale cursor."},
+    {"owner": "S/Q", "selector": "p8_resume_", "status": "awaits runtime and Scale handoff", "oracle": "Real slot fork with legal held riders, deferred routing, retained waypoint and pending freight/command; event/hash parity at effective 1/4/16 workers."},
+    {"owner": "S", "selector": "p8_ingress_", "status": "awaits shared bounded transport DTO", "oracle": "Malformed route/endpoints/consist/prototype/owner, nested bound rejection, rollback, same-version catch-up and previous refusal."},
+    {"owner": "Q", "selector": "p8_connections", "status": "diagnostics executable; release comparison pending", "oracle": "Immutable offer pairing, inclusive cutoff and nearest-rank C2 D2, traffic/stock denominators and policy-only intervention."}
+  ]
+}
