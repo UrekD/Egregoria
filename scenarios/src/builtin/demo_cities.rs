@@ -2,7 +2,8 @@ use crate::builders::{grid_city, paint_zone_blocks, place_grid_power_plant, plac
 use crate::ScenarioCtx;
 use geom::{vec2, Vec2};
 use prototypes::{
-    try_prototype, BuildingGen, GrowableCompanyID, Money, RollingStockID, Tick, TICKS_PER_HOUR,
+    try_prototype, BuildingGen, GrowableCompanyID, ItemID, Money, RollingStockID, Tick,
+    HOURS_PER_DAY, TICKS_PER_HOUR,
 };
 use simulation::economy::{
     Budget, BudgetCategory, DailyEconomyMetrics, Government, TripStats, DEFAULT_TAX_RATE_PERMILLE,
@@ -16,7 +17,9 @@ use simulation::map_dynamic::{ElectricityFlow, Itinerary, Transit, UtilityFlow};
 use simulation::souls::residence::Residences;
 use simulation::transportation::traffic_metrics;
 use simulation::world_command::{CommandOutcomes, WorldCommand};
-use simulation::{SavePhase, Simulation, SimulationOptions, SlotId, SnapshotRevision};
+use simulation::{
+    PopulationScale, SavePhase, Simulation, SimulationOptions, SlotId, SnapshotRevision,
+};
 use std::collections::BTreeSet;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
@@ -43,14 +46,14 @@ pub fn generate(root: &Path) -> Result<(), String> {
     publish(&starter.sim, &root, "starter_town", "Starter Town")?;
     drop(starter);
 
-    let showcase = build_showcase(OPTIONS)?;
+    let (showcase, _) = build_showcase(OPTIONS)?;
     publish(&showcase.sim, &root, "showcase_city", "Showcase City")
 }
 
 /// Commission Showcase with four represented people per agent and check its playtest gates.
 pub fn generate_scaled_showcase(root: &Path) -> Result<(), String> {
     let root = std::path::absolute(root).map_err(|error| error.to_string())?;
-    let ctx = build_showcase(SimulationOptions {
+    let (ctx, resident_hours) = build_showcase(SimulationOptions {
         persons_per_agent: 4,
         ..OPTIONS
     })?;
@@ -63,26 +66,67 @@ pub fn generate_scaled_showcase(root: &Path) -> Result<(), String> {
         .values()
         .filter(|human| human.work.is_some())
         .count();
-    let (filled, due) = {
+    {
         let metrics = ctx.sim.read::<DailyEconomyMetrics>();
-        let last_day = metrics
-            .days
-            .get(&(SHOWCASE_DAYS - 1))
-            .ok_or("Missing closed Showcase day")?;
-        (
-            last_day.baskets_filled.unwrap_or_default(),
-            last_day.baskets_due.unwrap_or_default(),
-        )
-    };
+        check_scaled_showcase_food(scale, &metrics, resident_hours)?;
+    }
     println!(
-        "{scale} · {} residents ({agents} agents), {} employed ({employed} agents), {filled}/{due} household baskets filled on day {SHOWCASE_DAYS}",
+        "{scale} · {} residents ({agents} agents), {} employed ({employed} agents)",
         scale.persons(agents),
         scale.persons(employed),
     );
-    if filled == 0 || filled > due {
-        return Err("Scaled Showcase did not fill a valid set of household baskets".into());
-    }
     publish(&ctx.sim, &root, "scaled_showcase", "Scaled Showcase")
+}
+
+fn check_scaled_showcase_food(
+    scale: PopulationScale,
+    metrics: &DailyEconomyMetrics,
+    resident_hours: usize,
+) -> Result<(), String> {
+    if scale.persons_per_agent() != 4 {
+        return Err(format!("Expected Scaled Showcase at 1:4, got {scale}"));
+    }
+    let mut total_filled = 0;
+    let mut total_due = 0;
+    let mut stockout_ticks = 0;
+    let effective_food = ItemID::new("effective-food");
+    for day in 0..SHOWCASE_DAYS {
+        let data = metrics
+            .closed_day(day, SHOWCASE_DAYS * TICKS_PER_BUDGET_DAY)
+            .ok_or_else(|| format!("Missing closed Showcase day {}", day + 1))?;
+        let filled = data.baskets_filled.unwrap_or_default();
+        let due = data.baskets_due.unwrap_or_default();
+        if filled > due {
+            return Err(format!(
+                "Showcase day {} filled {filled} of {due} baskets",
+                day + 1
+            ));
+        }
+        total_filled += filled;
+        total_due += due;
+        stockout_ticks += data
+            .stockout_ticks_by_sku
+            .get(&effective_food)
+            .copied()
+            .unwrap_or(0);
+    }
+    let resident_days = resident_hours as f64 / f64::from(HOURS_PER_DAY);
+    if total_due == 0 || resident_days == 0.0 {
+        return Err("Scaled Showcase has no measured household food demand".into());
+    }
+    let fill_rate = total_filled as f64 / total_due as f64;
+    let stockout_hours = stockout_ticks as f64 / TICKS_PER_HOUR as f64 / resident_days;
+    let summary = format!(
+        "{total_filled}/{total_due} baskets filled, {stockout_hours:.3} effective-food stockout hours/resident-day over {SHOWCASE_DAYS} closed days"
+    );
+    // Match the Realistic Showcase household targets in economy_loop.
+    if fill_rate < 0.8 || stockout_hours > 1.5 {
+        return Err(format!(
+            "Scaled Showcase missed its household food targets: {summary}"
+        ));
+    }
+    println!("Scaled Showcase food: {summary}");
+    Ok(())
 }
 
 fn publish(sim: &Simulation, root: &Path, id: &str, name: &str) -> Result<(), String> {
@@ -147,9 +191,10 @@ fn build_starter() -> Result<ScenarioCtx, String> {
     Ok(ctx)
 }
 
-fn build_showcase(options: SimulationOptions) -> Result<ScenarioCtx, String> {
+fn build_showcase(options: SimulationOptions) -> Result<(ScenarioCtx, usize), String> {
     let mut ctx = ScenarioCtx::new(options);
     let start = ctx.sim.get_tick();
+    let mut resident_hours = 0;
     let roads = build_grid(&mut ctx, SHOWCASE_ORIGIN, 9)?;
     let freight = connect_freight(&mut ctx, SHOWCASE_ORIGIN + Vec2::splat(800.0))?;
     let plant = place_grid_power_plant(&mut ctx, SHOWCASE_ORIGIN)?;
@@ -195,7 +240,7 @@ fn build_showcase(options: SimulationOptions) -> Result<ScenarioCtx, String> {
     paint_zone_blocks(&mut ctx, SHOWCASE_ORIGIN, SPACING, housing);
     check_commands(&ctx.sim)?;
     // Give the existing service sites time to hire before growable workplaces open.
-    ctx.run_ticks(3 * TICKS_PER_HOUR);
+    run_showcase_ticks(&mut ctx, 3 * TICKS_PER_HOUR, start, &mut resident_hours);
     paint_zone_blocks(&mut ctx, SHOWCASE_ORIGIN, SPACING, workplaces);
     check_commands(&ctx.sim)?;
 
@@ -233,7 +278,7 @@ fn build_showcase(options: SimulationOptions) -> Result<ScenarioCtx, String> {
         rate_permille: 0,
     }]);
     check_commands(&ctx.sim)?;
-    ctx.run_ticks(2 * TICKS_PER_HOUR);
+    run_showcase_ticks(&mut ctx, 2 * TICKS_PER_HOUR, start, &mut resident_hours);
     ctx.sim.apply_commands([&WorldCommand::SetTaxRate {
         zone: Office,
         rate_permille: DEFAULT_TAX_RATE_PERMILLE,
@@ -242,7 +287,8 @@ fn build_showcase(options: SimulationOptions) -> Result<ScenarioCtx, String> {
 
     for day in 1..=SHOWCASE_DAYS {
         let target = start + day * TICKS_PER_BUDGET_DAY;
-        ctx.run_ticks(target - ctx.sim.get_tick());
+        let ticks = target - ctx.sim.get_tick();
+        run_showcase_ticks(&mut ctx, ticks, start, &mut resident_hours);
         println!(
             "Showcase City: day {day} complete, {} residents, {} completed bus trips",
             ctx.sim
@@ -256,7 +302,15 @@ fn build_showcase(options: SimulationOptions) -> Result<ScenarioCtx, String> {
     ctx.run_ticks(8 * TICKS_PER_HOUR);
     super::services_basic::check_service_network(&ctx, plant, &sites, "Showcase City")?;
     check_showcase(&ctx.sim, plant, freight, &roads)?;
-    Ok(ctx)
+    Ok((ctx, resident_hours))
+}
+
+fn run_showcase_ticks(ctx: &mut ScenarioCtx, ticks: u64, start: u64, resident_hours: &mut usize) {
+    ctx.run_ticks_observed(ticks, |sim| {
+        if (sim.get_tick() - start) % TICKS_PER_HOUR == 0 {
+            *resident_hours += sim.world().humans.len();
+        }
+    });
 }
 
 fn build_grid(
@@ -590,7 +644,56 @@ fn check_showcase(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use simulation::economy::EconomyDayMetrics;
     use simulation::map::ZoneGrid;
+
+    fn food_days(filled: [u64; 3], stockout_ticks: u64) -> DailyEconomyMetrics {
+        DailyEconomyMetrics {
+            days: filled
+                .into_iter()
+                .enumerate()
+                .map(|(day, filled)| {
+                    (
+                        day as u64,
+                        EconomyDayMetrics {
+                            baskets_due: Some(1_373),
+                            baskets_filled: Some(filled),
+                            stockout_ticks_by_sku: [(
+                                ItemID::new("effective-food"),
+                                stockout_ticks,
+                            )]
+                            .into(),
+                            ..Default::default()
+                        },
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn population_scale_showcase_rejects_food_shortages_before_the_final_day() {
+        let scale = PopulationScale::try_new(4).unwrap();
+        let hours = 1_350 * 24 * 3;
+        assert!(check_scaled_showcase_food(scale, &food_days([1, 1, 1_373], 0), hours).is_err());
+        assert!(check_scaled_showcase_food(scale, &food_days([1_373; 3], 0), hours).is_ok());
+    }
+
+    #[test]
+    fn population_scale_showcase_rejects_food_stockouts_with_full_baskets() {
+        let scale = PopulationScale::try_new(4).unwrap();
+        let metrics = food_days([1_373; 3], 1_350 * 2 * TICKS_PER_HOUR);
+        assert!(check_scaled_showcase_food(scale, &metrics, 1_350 * 24 * 3).is_err());
+    }
+
+    #[test]
+    fn population_scale_showcase_rejects_realistic_mode() {
+        let metrics = food_days([1_373; 3], 0);
+        assert!(
+            check_scaled_showcase_food(PopulationScale::REALISTIC, &metrics, 1_350 * 24 * 3)
+                .is_err()
+        );
+    }
 
     #[test]
     fn demo_cities_starter_has_zoning_without_advancing_growth() {
