@@ -368,6 +368,18 @@ fn prepare_opening(
     } else {
         Vec::new()
     };
+    let mut depots = Vec::new();
+    if profiled_wet {
+        // A separate local fleet can deliver staged coal while the mine
+        // trucks are out collecting or returning to their depots.
+        let (buffer, _) = place_company(sim, plan, &roads, "large-warehouse", at(1688.0, 1248.0))?;
+        verify_parking_pair(&sim.map(), buffer, plant, Tick(sim.get_tick()))?;
+        depots.push(WorldCommand::SetWarehousePolicy {
+            building: buffer,
+            policy: WarehousePolicy::ReserveLocally,
+        });
+        sites.insert("coal-buffer".into(), buffer);
+    }
     // Use parking frontage near both the field clusters and the shops.
     for (i, (x, y)) in [
         (1110.0, 1550.0),
@@ -543,7 +555,6 @@ fn prepare_opening(
         .map(|(building, _)| building)
         .ok_or_else(|| format!("no clear fitting site for {name} outside approved frontage"))
     };
-    let mut depots = Vec::new();
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
         let depot = place_company_around_parcels(sim, "small-depot", cohort.anchor, None)?;
         sites.insert(format!("{}/depot", cohort.district), depot);
@@ -737,7 +748,7 @@ pub(super) fn commission_opening(
         paint(sim, parcels.iter().filter(|parcel| early_retail(parcel)))?;
     }
     advance(sim, &mut schedule, 3 * TICKS_PER_HOUR);
-    apply(sim, "district depot policies", &depots)?;
+    apply(sim, "opening depot policies", &depots)?;
     let (station, ent) = sim
         .world()
         .freight_stations
@@ -4255,6 +4266,15 @@ mod tests {
             let (plant_lane, plant_offset) = loading_lane("coal-power-plant");
             assert!(mine_lane == plant_lane && mine_offset < plant_offset,
                 "the first coal mine needs a direct outbound drive to the plant's loading curb");
+            assert!(opening.sites.contains_key("coal-buffer"),
+                "the plant needs a nearby multi-truck coal buffer");
+            let buffer = opening.sites["coal-buffer"];
+            let plant = opening.sites["coal-power-plant"];
+            let distance = map.buildings()[buffer].door_pos.distance(map.buildings()[plant].door_pos);
+            assert!(distance <= 200.0, "the coal buffer is {distance:.1} m from the plant");
+            let warehouse = map.buildings()[buffer].kind.as_goods_company().unwrap().prototype();
+            assert!(warehouse.n_trucks >= 4);
+            assert!(warehouse.storage.as_ref().unwrap().accepted_items.contains(&ItemID::new("coal")));
         }
         let reach = ServiceReach::new(&map, true);
         let bakeries: Vec<_> = map
