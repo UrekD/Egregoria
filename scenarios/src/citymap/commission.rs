@@ -4101,7 +4101,7 @@ fn checkpoint_activity(
                 })
             });
         }
-        if let Location::Vehicle(bus) = human.location {
+        if let Location::Transit(bus) = human.location {
             if let Some(run) = transit.runs.get(&bus) {
                 activity.entry("transit").or_insert_with(|| serde_json::json!({
                     "passenger": id, "bus": bus, "line": run.line, "next_stop": run.next_stop_idx,
@@ -4112,16 +4112,25 @@ fn checkpoint_activity(
             break;
         }
     }
-    if let Some(load) = cargo
-        .outgoing_loads(freight.terminal)
-        .find(|load| !load.items.is_empty())
-    {
-        activity.insert(
-            "freight",
-            serde_json::json!({
-                "terminal": freight.terminal, "truck": load.vehicle, "buyer": load.destination(),
-            }),
-        );
+    if let Some(station) = sim.get(freight.station) {
+        let train_state = FreightMonitor::train_state(sim, freight);
+        let truck = cargo.station_fleet(freight.terminal).find(|id| {
+            sim.world().vehicles.get(*id).is_some_and(|vehicle| {
+                matches!(vehicle.vehicle.state, VehicleState::Driving)
+                    && vehicle.it.get_route().is_some()
+            })
+        });
+        if train_state.is_some() || truck.is_some() {
+            let wagons: Vec<_> = sim.world().wagons.iter()
+                .filter_map(|(id, wagon)| (wagon.itfollower.leader == freight.train).then_some(id))
+                .collect();
+            activity.insert("freight", serde_json::json!({
+                "terminal": freight.terminal, "station": freight.station, "train": freight.train,
+                "train_state": train_state.map(|state| format!("{state:?}")), "wagons": wagons,
+                "import_units": station.f.wanted_cargo, "export_units": station.f.waiting_cargo,
+                "truck": truck,
+            }));
+        }
     }
     activity
 }
@@ -4935,6 +4944,42 @@ mod tests {
         assert!(!needs_met(100, 101, 1, 1));
         assert!(!needs_met(100, 100, 0, 1));
         assert!(!needs_met(100, 100, 1, 0));
+    }
+
+    #[test]
+    fn cm2_checkpoint_activity_requires_a_boarded_transit_passenger() {
+        use simulation::map_dynamic::transit::BusRun;
+
+        let (mut sim, _, _) = super::super::spacing::cm0_boundary_fixture();
+        let lot = sim.map().lots().keys().next().unwrap();
+        sim.apply_commands([&WorldCommand::MapBuildHouse(lot)]);
+        let house = sim.map().buildings().iter()
+            .find_map(|(id, site)| (site.kind == BuildingKind::House).then_some(id))
+            .unwrap();
+        crate::builders::seed_households(&mut sim, &[house]).unwrap();
+        let resident = sim.world().humans.keys().next().unwrap();
+        let freight = Freight {
+            terminal: BuildingID::default(),
+            station: FreightStationID::default(),
+            market: BuildingID::default(),
+            train: TrainID::default(),
+            market_lane: LaneID::default(),
+            market_offset: 0.0,
+            bakery: BuildingID::default(),
+        };
+        let bus = VehicleID::default();
+        sim.write::<Transit>().runs.insert(bus, BusRun {
+            line: LineID::default(),
+            next_stop_idx: 1,
+            dwell_until: None,
+            leg_started: Tick(0),
+            failures: 0,
+        });
+        assert!(!checkpoint_activity(&sim, &freight).contains_key("transit"));
+        sim.world_mut_unchecked().humans[resident].location = Location::Transit(bus);
+        assert!(checkpoint_activity(&sim, &freight).contains_key("transit"));
+        sim.world_mut_unchecked().humans[resident].location = Location::Vehicle(bus);
+        assert!(!checkpoint_activity(&sim, &freight).contains_key("transit"));
     }
 
     #[test]
