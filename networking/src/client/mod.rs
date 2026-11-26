@@ -401,12 +401,13 @@ impl<W: DeserializeOwned, I: Serialize + DeserializeOwned + Default> Client<W, I
 
 #[cfg(test)]
 #[test]
-fn p7_ingress_rejects_same_release_floor_handshake() {
+fn p7_ingress_rejects_released_p6_handshake() {
     use crate::{Server, ServerConfiguration, ServerPollResult};
     use std::net::{Ipv4Addr, TcpListener};
     use std::time::{Duration, Instant};
 
-    let floor = include_str!("../../../VERSION");
+    let release = include_str!("../../../VERSION");
+    let floor = "0.11.1";
     let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
         .local_addr()
@@ -417,7 +418,7 @@ fn p7_ingress_rejects_same_release_floor_handshake() {
         period: Duration::from_millis(20),
         port: Some(port),
         virtual_client: None,
-        version: floor.into(),
+        version: release.into(),
         always_run: false,
     })
     .unwrap();
@@ -429,7 +430,7 @@ fn p7_ingress_rejects_same_release_floor_handshake() {
         version: floor.into(),
     })
     .unwrap();
-    // The floor sends the release string verbatim in the unchanged Connect packet.
+    // P6 sends its release string verbatim in the unchanged Connect packet.
     peer.version = floor.into();
 
     let deadline = Instant::now() + Duration::from_secs(10);

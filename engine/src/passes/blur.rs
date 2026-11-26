@@ -1,3 +1,4 @@
+use crate::frame_profile::GpuPass;
 use wgpu::{
     CommandEncoder, Device, FragmentState, PipelineLayoutDescriptor, PrimitiveState,
     RenderPassColorAttachment, RenderPassDescriptor, RenderPipeline, RenderPipelineDescriptor,
@@ -60,13 +61,14 @@ pub fn gen_ui_blur(gfx: &GfxContext, enc: &mut CommandEncoder, frame: &TextureVi
 fn initial_downscale(gfx: &GfxContext, enc: &mut CommandEncoder, frame: &TextureView) {
     gfx.mipmap_gen
         .with_pipeline(&gfx.device, gfx.fbos.format, |pipe| {
-            gfx.mipmap_gen.mipmap_one(
+            gfx.mipmap_gen.mipmap_one_with_timestamps(
                 enc,
                 &gfx.device,
                 pipe,
                 frame,
                 &gfx.fbos.ui_blur.mip_view(0),
                 "ui blur",
+                gfx.group_timestamps(GpuPass::UiBlur, true, false),
             );
         });
 }
@@ -106,7 +108,11 @@ fn do_pass(
             },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes: gfx.group_timestamps(
+            GpuPass::UiBlur,
+            false,
+            matches!(pipeline, UIBlurPipeline::UpscaleDeband),
+        ),
         occlusion_query_set: None,
     });
 

@@ -3,12 +3,14 @@ use std::sync::Arc;
 use wgpu::{
     BindGroup, BindGroupDescriptor, BindGroupLayout, BindGroupLayoutDescriptor, BufferUsages,
     CommandEncoder, CommandEncoderDescriptor, Device, Extent3d, FilterMode, ImageCopyTexture,
-    ImageDataLayout, IndexFormat, Origin3d, RenderPass, RenderPipeline, RenderPipelineDescriptor,
-    ShaderStages, TextureFormat, TextureUsages, TextureView, VertexAttribute, VertexBufferLayout,
+    ImageDataLayout, IndexFormat, Origin3d, RenderPass, RenderPassTimestampWrites, RenderPipeline,
+    RenderPipelineDescriptor, ShaderStages, TextureFormat, TextureUsages, TextureView,
+    VertexAttribute, VertexBufferLayout,
 };
 
 use geom::{vec2, vec3, Camera, HeightmapChunk, Intersect3, LinearColor, Matrix4, Vec2, AABB3};
 
+use crate::frame_profile::GpuPass;
 use crate::{
     bg_layout_litmesh, pbuffer::PBuffer, CompiledModule, Drawable, FrameContext, GfxContext,
     IndexType, PipelineBuilder, PipelineKey, Texture, TextureBuilder, Uniform, TL,
@@ -658,6 +660,7 @@ impl<const CSIZE: u32, const CRESOLUTION: usize> HeightmapRender<CSIZE, CRESOLUT
                 &mut encoder,
                 &self.heightmap_tex,
                 mip,
+                gfx.group_timestamps(GpuPass::HeightmapResample, mip == UPSCALE_LOD as u32, false),
             );
         }
 
@@ -669,6 +672,7 @@ impl<const CSIZE: u32, const CRESOLUTION: usize> HeightmapRender<CSIZE, CRESOLUT
                 &mut encoder,
                 &self.heightmap_tex,
                 mip,
+                gfx.group_timestamps(GpuPass::HeightmapResample, false, mip == 1),
             );
         }
 
@@ -681,6 +685,7 @@ impl<const CSIZE: u32, const CRESOLUTION: usize> HeightmapRender<CSIZE, CRESOLUT
                 &self.heightmap_tex.mip_view(mip),
                 &self.normal_tex.mip_view(mip),
                 &self.normal_unis[mip as usize],
+                gfx.group_timestamps(GpuPass::HeightmapNormals, mip == 0, mip == LOD as u32 - 1),
             );
         }
 
@@ -749,6 +754,7 @@ fn normal_update(
     height_tex: &TextureView,
     normal_view: &TextureView,
     uni: &Uniform<f32>,
+    timestamp_writes: Option<RenderPassTimestampWrites<'_>>,
 ) {
     let bg = gfx.device.create_bind_group(&BindGroupDescriptor {
         layout: &normal_pipeline.get_bind_group_layout(0),
@@ -770,7 +776,7 @@ fn normal_update(
             },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes,
         occlusion_query_set: None,
     });
     rp.set_pipeline(normal_pipeline);
@@ -821,6 +827,7 @@ fn downsample_update(
     encoder: &mut CommandEncoder,
     height_tex: &Texture,
     mip: u32,
+    timestamp_writes: Option<RenderPassTimestampWrites<'_>>,
 ) {
     let bg = gfx.device.create_bind_group(&BindGroupDescriptor {
         layout: &downsample_pipeline.get_bind_group_layout(0),
@@ -843,7 +850,7 @@ fn downsample_update(
             },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes,
         occlusion_query_set: None,
     });
     rp.set_pipeline(downsample_pipeline);
@@ -859,6 +866,7 @@ fn upsample_update(
     encoder: &mut CommandEncoder,
     height_tex: &Texture,
     mip: u32,
+    timestamp_writes: Option<RenderPassTimestampWrites<'_>>,
 ) {
     let bg = gfx.device.create_bind_group(&BindGroupDescriptor {
         layout: &upsample_pipeline.get_bind_group_layout(0),
@@ -881,7 +889,7 @@ fn upsample_update(
             },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes,
         occlusion_query_set: None,
     });
     rp.set_pipeline(upsample_pipeline);

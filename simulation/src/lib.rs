@@ -131,10 +131,14 @@ const RNG_SEED: u64 = 123;
 const INITIAL_TICK: u64 = 1;
 const PRE_SCALE_VERSION: &str = "0.11.0";
 const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
+const PRE_P7_VERSION: &str = "0.11.1";
 const VERSION: &str = include_str!("../../VERSION");
 
 fn compatible_save_version(version: &str) -> bool {
-    matches!(version, VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION)
+    matches!(
+        version,
+        VERSION | PRE_P7_VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION
+    )
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2030,7 +2034,7 @@ impl SimulationDeser {
         let origin: MapOrigin = match self.res.get("map_origin") {
             Some(bytes) => Bincode::decode(bytes)
                 .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
-            None if self._header.version == VERSION => {
+            None if matches!(self._header.version.as_str(), VERSION | PRE_P7_VERSION) => {
                 return Err(corrupt("Missing snapshot map origin".into()));
             }
             None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,

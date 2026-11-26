@@ -1,3 +1,4 @@
+use crate::frame_profile::GpuPass;
 use crate::{
     CompiledModule, GfxContext, PipelineKey, RenderParams, Texture, Uniform, UvVertex, TL,
 };
@@ -40,7 +41,7 @@ pub fn render_background(gfx: &GfxContext, enc: &mut CommandEncoder, frame: &Tex
             }),
             stencil_ops: None,
         }),
-        timestamp_writes: None,
+        timestamp_writes: gfx.timestamps(GpuPass::Background),
         occlusion_query_set: None,
     });
 

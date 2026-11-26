@@ -511,10 +511,12 @@ impl ReplayJson {
                 })
             }
             Err(SaveLoadError::IncompatibleReplay { version })
-                if matches!(version.as_str(), "0.11.0+commands.1" | "0.11.0+commands.2") =>
+                if matches!(
+                    version.as_str(),
+                    "0.11.0+commands.1" | "0.11.0+commands.2" | "0.11.1+commands.2"
+                ) =>
             {
-                // The Wave 2 command variant was appended. Both earlier P7
-                // command envelopes can still be read inside a compatible city.
+                // Earlier P7 command envelopes can still be read inside a compatible city.
                 let mut replay: Replay = JSON::decode(bytes)?;
                 replay.validate_embedded_registry()?;
                 replay.recorded_population_scale()?;
@@ -976,7 +978,7 @@ fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
     crate::tests::init_test_simulation();
     let registry = prototypes::prototypes().fingerprint();
     let mut replay = Replay {
-        version: crate::VERSION.to_owned(),
+        version: crate::PRE_P7_VERSION.to_owned(),
         enabled: true,
         registry: Some(registry),
         ..Replay::default()
@@ -1032,7 +1034,7 @@ fn p7_replay_rejects_floor_identity_before_decoding_commands() {
         );
         replay
     };
-    let floor = crate::VERSION;
+    let floor = crate::PRE_P7_VERSION;
     #[derive(Serialize)]
     struct InvalidPayload<'a> {
         version: &'a str,
@@ -1050,6 +1052,18 @@ fn p7_replay_rejects_floor_identity_before_decoding_commands() {
     let current = Replay::default().version;
     assert_ne!(current, floor);
     let revision = SnapshotRevision::new(12);
+    let preview = format!("{floor}+commands.2");
+    let preview_bytes = ReplayJson::encode_sidecar(&make(&preview), revision).unwrap();
+    assert!(matches!(
+        ReplayJson::decode_sidecar(&preview_bytes, Some(revision)),
+        Err(SaveLoadError::IncompatibleReplay { version }) if version == preview
+    ));
+    let embedded = ReplayJson::decode_snapshot(&preview_bytes).unwrap();
+    assert_eq!(embedded.version, current);
+    assert!(matches!(
+        embedded.commands.get(0).map(|entry| &entry.1),
+        Some(WorldCommand::MapUpgradeRoad { .. })
+    ));
     let bytes = ReplayJson::encode_sidecar(&make(&current), revision).unwrap();
     let sidecar = ReplayJson::decode_sidecar(&bytes, Some(revision)).unwrap();
     assert!(matches!(

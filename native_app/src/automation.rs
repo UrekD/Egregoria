@@ -3,12 +3,14 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::{self, BufWriter, Write};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use common::saveload::{self, Bincode, Encoder, JSONPretty, JSON};
-use engine::{Context, InputContext, Key, MouseButton};
+use engine::frame_profile::HISTORY_FRAMES;
+use engine::{Context, GfxSettings, InputContext, Key, MouseButton, ShadowQuality};
 use geom::{vec2, vec3, Radians, Vec2, Vec3, OBB};
 use prototypes::{BuildingGen, GoodsCompanyID};
 use scenarios::builders::{self, CommandSink};
@@ -26,6 +28,7 @@ use simulation::world_command::{CommandOutcomes, Rejection, WorldCommand, WorldC
 use simulation::{AnyEntity, HumanID, MapPreset, Simulation, SimulationOptions};
 
 use crate::gui::follow::{follow_pos, FollowEntity};
+use crate::gui::windows::settings::Settings;
 use crate::gui::{
     overlays::{current_overlay, OverlayMode},
     toolbox,
@@ -34,6 +37,7 @@ use crate::gui::{
     zoning::ZoningState,
     GuiState, InspectedBuilding, InspectedEntity, InspectedRoad, Tool, ToolSelection,
 };
+use crate::rendering::OrbitCamera;
 use crate::session::{self, SessionScreen, SessionState};
 use crate::sim_thread::{AppliedBatch, BatchId, Boundary, Reply, ReplyKind, Request, SimThread};
 use crate::uiworld::{SaveLoadState, UiWorld};
@@ -41,6 +45,7 @@ use crate::uiworld::{SaveLoadState, UiWorld};
 mod land_fixture;
 
 const WATCHDOG: Duration = Duration::from_secs(15 * 60);
+const GPU_DRAIN_FRAMES: u64 = 8;
 static STARTUP: Mutex<Option<Automation>> = Mutex::new(None);
 
 #[derive(Default)]
@@ -72,13 +77,12 @@ enum Step {
         empty_treasury: bool,
         replace_with: Option<simulation::economy::progression::ProgressionMode>,
     },
-    Camera {
-        x: f32,
-        y: f32,
-        z: f32,
-        yaw: f32,
-        pitch: f32,
-        dist: f32,
+    Camera(CameraPose),
+    FrameProfileGraphics(ProfileGraphics),
+    CaptureFrameProfile {
+        name: String,
+        frames: u64,
+        pan: Option<CameraPose>,
     },
     Builder(Builder),
     /// Tick until a human matches `pick`, then inspect and follow them.
@@ -124,6 +128,87 @@ enum Step {
     Screenshot(String),
     DumpState(StateDump),
     Exit,
+}
+
+#[derive(Deserialize)]
+enum ProfileGraphics {
+    Default,
+    Weak,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+struct CameraPose {
+    x: f32,
+    y: f32,
+    z: f32,
+    yaw: f32,
+    pitch: f32,
+    dist: f32,
+}
+
+impl CameraPose {
+    fn current(orbit: &OrbitCamera) -> Self {
+        let camera = &orbit.camera;
+        Self {
+            x: camera.pos.x,
+            y: camera.pos.y,
+            z: camera.pos.z,
+            yaw: camera.yaw.0,
+            pitch: camera.pitch.0,
+            dist: camera.dist,
+        }
+    }
+
+    fn validate(self) -> Result<(), String> {
+        if !vec3(self.x, self.y, self.z).is_finite()
+            || !self.yaw.is_finite()
+            || !self.pitch.is_finite()
+            || !self.dist.is_finite()
+            || self.dist <= 0.0
+        {
+            return Err("invalid camera position, angles, or distance".into());
+        }
+        Ok(())
+    }
+
+    fn interpolate(self, end: Self, fraction: f32) -> Self {
+        let lerp = |from: f32, to: f32| from + (to - from) * fraction;
+        Self {
+            x: lerp(self.x, end.x),
+            y: lerp(self.y, end.y),
+            z: lerp(self.z, end.z),
+            yaw: lerp(self.yaw, end.yaw),
+            pitch: lerp(self.pitch, end.pitch),
+            dist: lerp(self.dist, end.dist),
+        }
+    }
+
+    fn apply(self, orbit: &mut OrbitCamera) {
+        orbit.targetpos = vec3(self.x, self.y, self.z);
+        orbit.targetyaw = Radians(self.yaw);
+        orbit.targetpitch = Radians(self.pitch);
+        orbit.targetdist = self.dist;
+        orbit.camera.pos = orbit.targetpos;
+        orbit.camera.yaw = orbit.targetyaw;
+        orbit.camera.pitch = orbit.targetpitch;
+        orbit.camera.dist = orbit.targetdist;
+    }
+}
+
+struct ProfileCapture {
+    path: PathBuf,
+    frames: Range<u64>,
+    pan: Option<(CameraPose, CameraPose)>,
+}
+
+impl ProfileCapture {
+    fn position_camera(&self, uiw: &UiWorld, frame: u64) {
+        if let Some((start, end)) = self.pan {
+            let t = (frame - self.frames.start) as f32
+                / (self.frames.end - self.frames.start - 1) as f32;
+            start.interpolate(end, t).apply(&mut uiw.camera_mut());
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -309,6 +394,7 @@ pub(crate) struct Automation {
     dir: PathBuf,
     exit_after_script: bool,
     wait: Option<Wait>,
+    profile_capture: Option<ProfileCapture>,
     fixture: Option<FixtureOutcome>,
     load_slot: Option<String>,
     first_rejection: Option<(&'static str, Rejection)>,
@@ -359,6 +445,7 @@ pub(crate) fn configure() -> Result<(), String> {
         dir,
         exit_after_script: args.exit_after_script,
         wait: None,
+        profile_capture: None,
         fixture: None,
         load_slot: None,
         first_rejection: None,
@@ -500,6 +587,33 @@ impl Automation {
         rebuilt_version: Option<u64>,
         rendered_batch: Option<BatchId>,
     ) -> Result<bool, String> {
+        if let Some(capture) = &self.profile_capture {
+            let next_frame = ctx.gfx.tick + 1;
+            if next_frame < capture.frames.end {
+                capture.position_camera(uiw, next_frame);
+                return Ok(true);
+            }
+            let profile = ctx
+                .gfx
+                .frame_profile
+                .as_ref()
+                .ok_or("frame profiling is disabled")?;
+            if next_frame < capture.frames.end + GPU_DRAIN_FRAMES
+                && profile.has_pending_gpu(capture.frames.clone())
+            {
+                return Ok(true);
+            }
+            crate::frame_profile::write_report(
+                &ctx.gfx,
+                uiw,
+                &capture.path,
+                Some(capture.frames.clone()),
+            )?;
+            eprintln!("automation: wrote {}", capture.path.display());
+            self.profile_capture = None;
+            return Ok(true);
+        }
+
         match self.wait {
             Some(Wait::Applied(id))
                 if !rendered_batch.is_some_and(|rendered| rendered.covers(id)) =>
@@ -645,7 +759,8 @@ impl Automation {
                     | Step::CompareTrafficCorridor
                     | Step::SaveTrafficRepair
                     | Step::InspectCargoRoad { .. }
-                    | Step::Camera { .. }
+                    | Step::Camera(_)
+                    | Step::CaptureFrameProfile { .. }
                     | Step::SelectTool(_)
                     | Step::SelectZone(_)
             )
@@ -670,8 +785,7 @@ impl Automation {
             Step::RunTicks(_) => {}
             Step::SetWarp(warp) => {
                 eprintln!("automation: set warp {warp} at tick {}", sim.get_tick());
-                uiw.write::<crate::gui::windows::settings::Settings>()
-                    .time_warp = warp;
+                uiw.write::<Settings>().time_warp = warp;
             }
             Step::Commands(commands) => {
                 let mut batch = WorldCommands::default();
@@ -736,32 +850,41 @@ impl Automation {
                 driver,
                 Request::PausedFixtureOp(FixtureOp::Builder(builder)),
             )?,
-            Step::Camera {
-                x,
-                y,
-                z,
-                yaw,
-                pitch,
-                dist,
-            } => {
-                let pos = vec3(x, y, z);
-                if !pos.is_finite()
-                    || !yaw.is_finite()
-                    || !pitch.is_finite()
-                    || !dist.is_finite()
-                    || dist <= 0.0
-                {
-                    return Err("invalid camera position, angles, or distance".into());
+            Step::Camera(pose) => {
+                pose.validate()?;
+                pose.apply(&mut uiw.camera_mut());
+            }
+            Step::FrameProfileGraphics(preset) => {
+                let mut graphics = GfxSettings::default();
+                if matches!(preset, ProfileGraphics::Weak) {
+                    graphics.shadows = ShadowQuality::NoShadows;
+                    graphics.ssao = false;
+                    graphics.msaa = false;
                 }
-                let mut orbit = uiw.camera_mut();
-                orbit.targetpos = pos;
-                orbit.targetyaw = Radians(yaw);
-                orbit.targetpitch = Radians(pitch);
-                orbit.targetdist = dist;
-                orbit.camera.pos = pos;
-                orbit.camera.yaw = orbit.targetyaw;
-                orbit.camera.pitch = orbit.targetpitch;
-                orbit.camera.dist = dist;
+                uiw.write::<Settings>().gfx = graphics;
+            }
+            Step::CaptureFrameProfile { name, frames, pan } => {
+                if ctx.gfx.frame_profile.is_none() {
+                    return Err("set EGREGORIA_FRAME_PROFILE=1 (or cpu) to capture a frame profile".into());
+                }
+                let max_frames = HISTORY_FRAMES as u64 - GPU_DRAIN_FRAMES;
+                if !(2..=max_frames).contains(&frames) {
+                    return Err(format!("frame profile capture requires 2 to {max_frames} frames"));
+                }
+                let pan = pan
+                    .map(|end| {
+                        end.validate()?;
+                        Ok::<_, String>((CameraPose::current(&uiw.camera()), end))
+                    })
+                    .transpose()?;
+                let first = ctx.gfx.tick + 1;
+                let capture = ProfileCapture {
+                    path: self.output_path(&name, "json")?,
+                    frames: first..first + frames,
+                    pan,
+                };
+                capture.position_camera(uiw, first);
+                self.profile_capture = Some(capture);
             }
             Step::FollowHuman { pick, max_ticks } => {
                 self.submit(
@@ -1893,4 +2016,19 @@ mod tests {
         let bytes = Bincode::encode(&*sim.map()).unwrap();
         assert_eq!(state.map_hash, common::hash_u64(&bytes[..]));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn frame_profile_probe_decodes() {
+    let source = include_bytes!("../../scripts/shots/frame_profile_probe.json");
+    let steps: Vec<Step> = JSON::decode(source).expect("decode the native frame profile probe");
+    assert_eq!(
+        steps.iter().filter(|step| matches!(step, Step::LoadSlot(_))).count(),
+        4
+    );
+    assert_eq!(
+        steps.iter().filter(|step| matches!(step, Step::CaptureFrameProfile { frames: 60, pan: Some(_), .. })).count(),
+        4
+    );
 }

@@ -192,6 +192,9 @@ fn p4a_integrated_loader_preserves_p6_golden_city() {
         Simulation::load_replay_from_slot(&root.0, &id),
         Err(SaveLoadError::IncompatibleReplay { version }) if version == "0.11.1"
     ));
+    let saved = loaded.encode_slot(SnapshotRevision::new(0x12345679)).unwrap();
+    let header = Simulation::compressed_snapshot_header(&saved.snapshot).unwrap();
+    assert_ne!(header.version, "0.11.1", "P7 must write a new save version");
 }
 
 #[test]

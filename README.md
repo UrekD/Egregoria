@@ -87,17 +87,25 @@ On Linux, `make p5-shots` regenerates the P5 screenshots under Xvfb from freshly
 
 ### Milestone P6 — water, zoning and city expansion
 
-- **Water and bridges.** Rivers, lakes and seas shape where you can build. Use the water brush to edit rivers and lakes, and build road or rail bridges across water. Pumps need a river or lake shore, while sewage outlets need a river bank or coast. On rivers, outlets sit downstream of pumps. Shorelines raise nearby land value.
-- **Zoning and building height.** Profiled zoning gives low-density houses, mid-rise blocks and high-density towers distinct shapes. Housing develops through level 3 when local needs are met. Paint Medium or High Mixed Use to grow homes above working shops at the same address.
-- **Buyable land tiles.** Expand a tiled city Cities: Skylines-style by buying adjacent 512 m × 512 m tiles from the land map. Guided mode ties purchases to population milestones. The first tile costs $10,000 and each purchase raises the next price by $500.
-- **Lesce Town.** The authored map uses an organic street network based on OpenStreetMap at 2× source scale. The dry layout is in place. The playable Sava river-town save, with a target of about 2,600 residents, is pending validation and publication.
-- **Freight and food.** Fairer order matching and better truck haulage help stock reach buyers, with priority for fuel and other inputs that have run out. Food balancing improves shop supply, with about 94–99% of due grocery baskets filled in test towns.
-- **Performance.** Skipping idle citizens improved benchmark throughput by 11%, and the single-player simulation runs on its own thread. Use `perf_scale` for scale benchmarks and `bench-slot` for saved cities. The 10,000-resident benchmark ran at 213 ticks/s, about 4× real time on the test host.
-- **Replays and saves.** Replay checks verify that repeated runs produce identical simulation results. The snapshot and replay format moved to 0.10.0, with the 0.11.0 cut pending.
+- **Water and bridges.** Shape rivers and lakes with the water brush and cross them with road or rail bridges. Pumps draw from river or lake shores, and river sewage outlets go downstream of pumps. Shorelines raise nearby land value.
+- **Mixed Use and towers.** Zoning ranges from detached houses to high-rise towers. Paint Medium or High Mixed Use to grow homes above ground-floor shops. Housing can reach level 3 when local needs are met.
+- **Buyable land tiles.** Expand a tiled city by buying adjacent 512 m × 512 m tiles from the Land Tiles panel. Guided cities unlock purchases at population milestones.
+- **Lesce Town.** The Windows release includes a playable town based on OpenStreetMap with 3,170 residents, local buses, freight rail and two road bridges across the Sava. [Lesce Town guide](docs/citymap.md)
+- **Population and performance.** New Game offers Realistic population at one person per agent and Scaled presets that represent several people per agent. The single-player simulation runs on its own thread, reuses routes and encodes saves off that thread.
+- **Freight, food and transit.** Freight matching gives priority to inputs that have run out, and better truck haulage and food balancing help keep shops stocked. Bus trip planning accounts for sidewalk access and gaps in service.
+- **Saves and replays.** P6 uses save and replay version `0.11.1`. The Windows package includes Starter Town, Showcase City, the Lesce OpenStreetMap import and Lesce Town.
 
-| Water and bridges | Zoning and towers | Land tiles | Lesce Town |
-|---|---|---|---|
-| [TODO: water and bridges screenshot](docs/screenshots/p6-water-bridges.png) | [TODO: zoning and towers screenshot](docs/screenshots/p6-zoning-towers.png) | [TODO: land tiles screenshot](docs/screenshots/p6-land-tiles.png) | [TODO: Lesce Town screenshot](docs/screenshots/p6-lesce-town.png) |
+| Lesce Town and the Sava bridges | Mixed Use towers |
+|---|---|
+| ![Lesce Town and the Sava bridges](docs/screenshots/p6-lesce-town.png) | ![Mixed Use towers](docs/screenshots/p6-zoning-towers.png) |
+
+| Land Tiles panel | New Game population options |
+|---|---|
+| ![Land Tiles panel](docs/screenshots/p6-land-tiles.png) | ![New Game population options](docs/screenshots/p6-population-options.png) |
+
+### Milestone P7 (in progress)
+
+Inspect directed traffic queues and curb parking, preview and confirm road edits, and compare their effects on trips and freight deliveries. Experimental junction rules apply locally when enabled. P7 opens P6 city saves and uses version `0.12.0` for new saves, replays and multiplayer connections.
 
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 

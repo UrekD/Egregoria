@@ -45,7 +45,7 @@ fn p7_recorded_p6_snapshot_warns_when_installed() {
         ..simulation::NewGameOptions::default()
     })
     .unwrap();
-    city.write::<simulation::Replay>().version = include_str!("../../../VERSION").to_owned();
+    city.write::<simulation::Replay>().version = "0.11.1".to_owned();
     city.save_to_slot(&root, &slot, common::saveload::SnapshotRevision::new(1))
         .unwrap();
     let loaded = Simulation::load_from_slot(&root, &slot);

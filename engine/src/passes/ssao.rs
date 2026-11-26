@@ -1,3 +1,4 @@
+use crate::frame_profile::GpuPass;
 use crate::{CompiledModule, GfxContext, PipelineKey, Texture, UvVertex, TL};
 use wgpu::{
     BlendComponent, BlendState, CommandEncoder, FragmentState, IndexFormat,
@@ -25,7 +26,7 @@ pub fn render_ssao(gfx: &GfxContext, enc: &mut CommandEncoder) {
             },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes: gfx.timestamps(GpuPass::Ssao),
         occlusion_query_set: None,
     });
 

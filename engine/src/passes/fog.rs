@@ -1,3 +1,4 @@
+use crate::frame_profile::GpuPass;
 use crate::{
     CompiledModule, GfxContext, PipelineKey, RenderParams, Texture, Uniform, UvVertex, TL,
 };
@@ -33,7 +34,7 @@ pub fn render_fog(gfx: &GfxContext, enc: &mut CommandEncoder) {
             },
         })],
         depth_stencil_attachment: None,
-        timestamp_writes: None,
+        timestamp_writes: gfx.timestamps(GpuPass::Fog),
         occlusion_query_set: None,
     });
 

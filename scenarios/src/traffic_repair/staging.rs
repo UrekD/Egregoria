@@ -239,8 +239,14 @@ fn verify_slot(directory: &Path, bundle_root: &Path, fixture: &SlotFixture) -> R
 
     // Decode and check only after the bounded files and run context match the pins.
     if fixture.class == FixtureClass::Release {
-        if staged.snapshot_schema != include_str!("../../../VERSION").trim() {
-            return Err("release snapshot must use the scoring build's save schema".into());
+        // Keep the published P6 Lesce bytes as the same-slot traffic baseline.
+        let p6_lesce_baseline = staged.snapshot_schema == "0.11.1"
+            && fixture.id == "lesce-release"
+            && fixture.slot == "lesce_town";
+        if !p6_lesce_baseline && staged.snapshot_schema != include_str!("../../../VERSION").trim() {
+            return Err(
+                "release snapshot requires the current save schema or the P6 Lesce baseline".into(),
+            );
         }
         let sim = Simulation::load_compressed_snapshot(&snapshot, MAX_MEMBER_BYTES)
             .map_err(|err| err.to_string())?;
