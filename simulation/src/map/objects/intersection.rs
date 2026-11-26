@@ -1,6 +1,6 @@
 use crate::map::{
-    Intersections, LaneID, LaneKind, Lanes, LightPolicy, Road, RoadID, Roads, SpatialMap,
-    TraverseDirection, Turn, TurnID, TurnPolicy,
+    Intersections, LaneID, LaneKind, Lanes, LightPolicy, Road, RoadID, Roads, RoundaboutGeometry,
+    SpatialMap, TraverseDirection, Turn, TurnID, TurnPolicy,
 };
 use geom::{pseudo_angle, Circle, Ray};
 use geom::{Vec2, Vec3};
@@ -8,6 +8,8 @@ use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
 use slotmapd::new_key_type;
 use std::collections::BTreeSet;
+
+use crate::transportation::junction_admission::roundabout_exit_storage;
 
 new_key_type! {
     pub struct IntersectionID;
@@ -31,6 +33,9 @@ pub struct Intersection {
     legal_turns: Option<BTreeSet<Turn>>,
 
     #[serde(skip)]
+    roundabout_layout: Option<RoundaboutGeometry>,
+
+    #[serde(skip)]
     crosswalks: Vec<TurnID>,
 
     // sorted by angle
@@ -49,6 +54,7 @@ impl Intersection {
             turns: Default::default(),
             legal_turns: None,
             crosswalks: Vec::new(),
+            roundabout_layout: None,
             roads: Default::default(),
             turn_policy: Default::default(),
             light_policy: Default::default(),
@@ -97,21 +103,57 @@ impl Intersection {
     }
 
     pub fn update_turns(&mut self, lanes: &Lanes, roads: &Roads) {
-        self.legal_turns = None;
-        self.turns = self
-            .turn_policy
-            .generate_turns(self, lanes, roads)
-            .into_iter()
-            .map(|(id, kind)| Turn::new(id, kind))
-            .collect();
+        self.rebuild_turns(lanes, roads, true);
+    }
 
-        self.turns = std::mem::take(&mut self.turns)
-            .into_iter()
-            .map(|mut x| {
-                x.make_points(lanes, self);
-                x
-            })
-            .collect();
+    pub(in crate::map) fn use_stock_turns(&mut self, lanes: &Lanes, roads: &Roads) {
+        self.rebuild_turns(lanes, roads, false);
+    }
+
+    fn rebuild_turns(&mut self, lanes: &Lanes, roads: &Roads, allow_roundabout: bool) {
+        self.legal_turns = None;
+        self.roundabout_layout = None;
+        let candidate = allow_roundabout
+            .then(|| RoundaboutGeometry::new(self, roads))
+            .flatten()
+            .filter(|_| {
+                self.roads.iter().all(|&id| {
+                    roads[id]
+                        .outgoing_lanes_from(self.id)
+                        .iter()
+                        .all(|&(lane, kind)| {
+                            !kind.vehicles()
+                                || lanes[lane].points.length() >= roundabout_exit_storage()
+                        })
+                })
+            });
+        let build_paths = |ring: Option<RoundaboutGeometry>| {
+            let mut policy = self.turn_policy;
+            if ring.is_none() {
+                policy.roundabout = None;
+            }
+            policy
+                .generate_turns(self, lanes, roads)
+                .into_iter()
+                .map(|(id, kind)| {
+                    let mut turn = Turn::new(id, kind);
+                    turn.make_points(lanes, roads, self, ring);
+                    turn
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        if let Some(ring) = candidate {
+            for ring in [ring, ring.tighter_transitions()] {
+                let paths = build_paths(Some(ring));
+                if ring.fits(self, roads, &paths) {
+                    self.roundabout_layout = Some(ring);
+                    self.turns = paths;
+                    self.index_crosswalks();
+                    return;
+                }
+            }
+        }
+        self.turns = build_paths(None);
         self.index_crosswalks();
     }
 
@@ -127,13 +169,67 @@ impl Intersection {
     }
 
     pub fn update_traffic_control(&self, lanes: &mut Lanes, roads: &Roads) {
-        self.light_policy.apply(self, lanes, roads);
+        let light = if self.roundabout_layout.is_some() {
+            LightPolicy::NoLights
+        } else {
+            self.light_policy
+        };
+        light.apply(self, lanes, roads);
     }
 
     const MIN_INTERFACE: f32 = 9.0;
     pub fn update_interface_radius(&mut self, roads: &mut Roads) {
-        let id = self.id;
+        let roundabout = self
+            .turn_policy
+            .roundabout
+            .filter(|policy| policy.radius >= 4.0 && !self.has_rail_arm(roads));
+        self.set_interfaces(roads, false);
+        let Some(roundabout) = roundabout.filter(|_| self.roads.len() >= 2) else {
+            return;
+        };
+        // Leave space for the longest vehicle admitted by the junction. A road
+        // that cannot accommodate a ring retains its ordinary junction setback.
+        if self.roads.iter().any(|&id| {
+            let road = &roads[id];
+            road.length()
+                - road.interface_from(road.other_end(self.id).unwrap())
+                - roundabout_exit_storage()
+                < 10.0
+        }) {
+            return;
+        }
+        self.set_interfaces(roads, true);
+        // Give neighboring mouth edges separate angular sectors. The ordinary
+        // junction setback only clears the deck centerlines at shallow angles.
+        for (&a, &b) in self.roads.iter().zip(self.roads.iter().cycle().skip(1)) {
+            let a_road = &roads[a];
+            let b_road = &roads[b];
+            let gap = a_road
+                .dir_from(self.id)
+                .angle(b_road.dir_from(self.id))
+                .abs();
+            if gap > 0.0 && gap < std::f32::consts::FRAC_PI_4 {
+                let setback = ((a_road.width + b_road.width) * 0.25 + 0.75) / (gap * 0.5).tan();
+                roads[a].max_interface(self.id, setback);
+                roads[b].max_interface(self.id, setback);
+            }
+        }
+        for &id in &self.roads {
+            let road = &mut roads[id];
+            let approach = road
+                .interface_from(self.id)
+                .max(roundabout.radius + 10.0 + road.width * 0.2);
+            let other = road.interface_from(road.other_end(self.id).unwrap());
+            road.set_interface(
+                self.id,
+                approach.min(road.length() - other - (roundabout_exit_storage() + 0.05)),
+            );
+        }
+        self.update_radius(roads);
+    }
 
+    fn set_interfaces(&mut self, roads: &mut Roads, roundabout: bool) {
+        let id = self.id;
         match *self.roads {
             [] => return,
             [r1_id] => {
@@ -141,7 +237,7 @@ impl Intersection {
                 r.set_interface(id, Self::empty_interface(r.width));
                 return;
             }
-            [r1_id, r2_id] => {
+            [r1_id, r2_id] if !roundabout => {
                 let (r1, r2) = (&roads[r1_id], &roads[r2_id]);
                 let (dir1, dir2) = (r1.dir_from(id), r2.dir_from(id));
                 let (r1w, r2w) = (r1.width, r2.width);
@@ -186,15 +282,6 @@ impl Intersection {
         for &r in &self.roads {
             let r = &mut roads[r];
             r.set_interface(id, Self::empty_interface(r.width));
-        }
-
-        if self.is_roundabout() {
-            if let Some(rb) = self.turn_policy.roundabout {
-                for &r in &self.roads {
-                    let r = &mut roads[r];
-                    r.max_interface(id, rb.radius * 1.1 + 5.0);
-                }
-            }
         }
 
         for i in 0..self.roads.len() {
@@ -278,6 +365,31 @@ impl Intersection {
 
     pub fn is_roundabout(&self) -> bool {
         self.turn_policy.roundabout.is_some() && self.roads.len() > 1
+    }
+
+    pub fn roundabout_geometry(&self) -> Option<RoundaboutGeometry> {
+        self.roundabout_layout
+    }
+
+    pub(crate) fn has_rail_arm(&self, roads: &Roads) -> bool {
+        self.roads
+            .iter()
+            .any(|&id| roads[id].lanes_iter().any(|(_, kind)| kind.is_rail()))
+    }
+
+    pub(super) fn roundabout_port(&self, roads: &Roads, arm: RoadID, entry: bool) -> f32 {
+        let index = self.roads.iter().position(|&road| road == arm).unwrap();
+        let count = self.roads.len();
+        let dir = roads[arm].dir_from(self.id);
+        let angle = dir.angle_cossin().0;
+        let (neighbor, sign) = if entry {
+            (self.roads[(index + 1) % count], 1.0)
+        } else {
+            (self.roads[(index + count - 1) % count], -1.0)
+        };
+        let gap =
+            (sign * dir.angle(roads[neighbor].dir_from(self.id))).rem_euclid(std::f32::consts::TAU);
+        angle + sign * (gap * 0.25).min(0.40)
     }
 
     pub fn undirected_neighbors<'a>(

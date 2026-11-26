@@ -4,13 +4,17 @@ use common::FastSet;
 
 use crate::gui::specialbuilding::SpecialBuildingResource;
 use crate::gui::windows::settings::Settings;
-use crate::gui::{overlays::land_tiles::preview_edit, Tool};
+use crate::gui::{overlays::land_tiles::show_edit_error, ErrorTooltip, Tool};
 use crate::inputmap::{Bindings, DeckPicker, InputAction, InputMap, SurfaceHits, UnitInput};
 use crate::rendering::immediate::ImmediateDraw;
 use crate::uiworld::UiWorld;
 use engine::MouseButton;
-use geom::{Camera, Ray3, Vec2};
-use simulation::map::{BuildingKind, Map, MapProject, ProjectFilter, ProjectKind};
+use geom::{Camera, LinearColor, Ray3, Vec2};
+use prototypes::Money;
+use simulation::map::{
+    BuildingID, BuildingKind, Intersection, IntersectionID, Map, MapProject, ProjectFilter,
+    ProjectKind, Road, RoadID, Turn, ROAD_Z_OFFSET,
+};
 use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::Simulation;
 
@@ -343,25 +347,245 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
         current
     };
 
-    let accepted = candidates
-        .iter()
-        .filter(|command| preview_edit(sim, uiworld, command));
+    let mut preview = DemolitionPreview::default();
+    let mut quote = |command: &WorldCommand| match command.preview(sim) {
+        Ok(action) => {
+            preview.add(&map, command, action.cost);
+            true
+        }
+        Err(reason) => {
+            show_edit_error(uiworld, command.kind(), reason);
+            false
+        }
+    };
     let mut commands = uiworld.commands();
     let before = commands.as_ref().len();
-    commands.extend(accepted.cloned());
+    if candidates.as_ref().is_empty() {
+        if let Some(command) = projection.and_then(|hit| removal_candidate(&map, hit.kind)) {
+            quote(&command);
+        }
+    } else {
+        commands.extend(candidates.iter().filter(|command| quote(command)).cloned());
+    }
     if commands.as_ref().len() != before {
         uiworld.write::<SpecialBuildingResource>().last_obb = None;
     }
 
-    if let Some(project) = projection {
-        let colors = simulation::colors();
-        let color = match removal_candidate(&map, project.kind) {
-            Some(command) if preview_edit(sim, uiworld, &command) => colors.gui_danger,
-            _ => colors.gui_disabled,
+    let mut draw = uiworld.write::<ImmediateDraw>();
+    if preview.is_empty() {
+        if let Some(project) = projection {
+            draw.circle(project.pos.up(0.5), 2.0)
+                .color(simulation::colors().gui_disabled);
+        }
+    } else {
+        let summary = preview.draw(sim, &map, &mut draw);
+        let tooltip = &mut *uiworld.write::<ErrorTooltip>();
+        tooltip.detail = Some(summary);
+        tooltip.isworld = true;
+    }
+}
+
+#[derive(Default)]
+struct DemolitionPreview {
+    roads: BTreeSet<RoadID>,
+    junctions: BTreeSet<IntersectionID>,
+    buildings: BTreeSet<BuildingID>,
+    cost: Money,
+    road_edits: Vec<ProjectKind>,
+}
+
+impl DemolitionPreview {
+    fn add(&mut self, map: &Map, command: &WorldCommand, cost: Money) {
+        let added = match *command {
+            WorldCommand::MapRemoveRoad(id) => self.roads.insert(id),
+            WorldCommand::MapRemoveIntersection(id) => {
+                self.roads
+                    .extend(map.intersections()[id].roads.iter().copied());
+                self.junctions.insert(id)
+            }
+            WorldCommand::MapRemoveBuilding(id) => self.buildings.insert(id),
+            _ => false,
         };
-        uiworld
-            .write::<ImmediateDraw>()
-            .circle(project.pos.up(0.5), 2.0)
+        if added {
+            match *command {
+                WorldCommand::MapRemoveRoad(road) => self.road_edits.push(ProjectKind::Road(road)),
+                WorldCommand::MapRemoveIntersection(junction) => {
+                    self.road_edits.push(ProjectKind::Intersection(junction));
+                }
+                _ => {}
+            }
+            self.cost = Money::new_inner(self.cost.inner().saturating_add(cost.inner()));
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.roads.is_empty() && self.junctions.is_empty() && self.buildings.is_empty()
+    }
+
+    fn draw(mut self, sim: &Simulation, map: &Map, draw: &mut ImmediateDraw) -> String {
+        let red = LinearColor::from(simulation::colors().gui_danger);
+        let mut disconnected = BTreeSet::new();
+        for &id in &self.roads {
+            let road = &map.roads()[id];
+            draw.polyline(
+                road.interfaced_points()
+                    .iter()
+                    .map(|point| point.up(0.34))
+                    .collect::<Vec<_>>(),
+                road.width,
+                false,
+            )
+            .color(red.a(0.55));
+            for endpoint in [road.src, road.dst] {
+                if map.intersections()[endpoint]
+                    .roads
+                    .iter()
+                    .all(|id| self.roads.contains(id))
+                {
+                    self.junctions.insert(endpoint);
+                }
+            }
+            disconnected.extend(road.connected_buildings.iter().copied());
+        }
+        for &id in &self.junctions {
+            draw_junction(map, &map.intersections()[id], draw, red);
+        }
+        let mut lots = 0;
+        for id in self.roads.iter().flat_map(|&road| map.road_lots(road)) {
+            let lot = &map.lots()[id];
+            draw.polyline(
+                lot.shape.corners.map(|p| p.z(lot.height + 0.42)).to_vec(),
+                0.65,
+                true,
+            )
+            .color(red);
+            lots += 1;
+        }
+        let mut zones = 0;
+        for &id in &self.buildings {
+            let building = &map.buildings()[id];
+            draw_building(map, id, draw, red);
+            if let Some(zone) = &building.zone {
+                let outline = zone
+                    .poly
+                    .iter()
+                    .map(|p| {
+                        let z = map.environment().height(*p).unwrap_or(building.height);
+                        p.z(z + 0.5)
+                    })
+                    .collect::<Vec<_>>();
+                draw.polyline(outline, 0.8, true).color(red);
+                zones += 1;
+            }
+        }
+        disconnected.retain(|id| !self.buildings.contains(id));
+        for &id in &disconnected {
+            draw_building(map, id, draw, LinearColor::new(1.0, 0.60, 0.25, 1.0));
+        }
+
+        let stops =
+            simulation::map_dynamic::transit::stops_removed_by_demolition(sim, &self.road_edits);
+        if let Ok(stops) = &stops {
+            for &(_, pos) in stops {
+                draw.stroke_circle(pos.up(0.7), 3.0, 1.0).color(red);
+            }
+        }
+
+        let mut labels = Vec::new();
+        for (count, singular, plural) in [
+            (self.roads.len(), "road", "roads"),
+            (self.junctions.len(), "junction", "junctions"),
+            (self.buildings.len(), "building", "buildings"),
+            (lots, "lot", "lots"),
+            (zones, "building zone", "building zones"),
+            (stops.as_ref().map_or(0, Vec::len), "bus stop", "bus stops"),
+        ] {
+            if count > 0 {
+                labels.push(format!(
+                    "{count} {}",
+                    if count == 1 { singular } else { plural }
+                ));
+            }
+        }
+        let price = if self.cost < Money::ZERO {
+            let refund = Money::new_inner(self.cost.inner().saturating_neg());
+            format!("Refund {refund}")
+        } else {
+            format!("Cost {}", self.cost)
+        };
+        let mut summary = format!("Remove {}  ·  {price}", labels.join(", "));
+        if !disconnected.is_empty() {
+            let n = disconnected.len();
+            let noun = if n == 1 { "building" } else { "buildings" };
+            summary.push_str(&format!("\nDisconnect {n} {noun} from roads"));
+        }
+        if stops.is_err() {
+            summary.push_str("\nBus stop effects unavailable");
+        }
+        summary
+    }
+}
+
+fn draw_building(map: &Map, id: BuildingID, draw: &mut ImmediateDraw, color: LinearColor) {
+    let building = &map.buildings()[id];
+    let upper = building
+        .mesh
+        .faces
+        .iter()
+        .flat_map(|(face, _)| face)
+        .map(|point| point.z)
+        .fold(building.height + 3.0, f32::max);
+    let corners = building.obb.corners;
+    draw.polyline(
+        corners.map(|point| point.z(upper + 0.45)).to_vec(),
+        0.8,
+        true,
+    )
+    .color(color);
+    for point in corners {
+        draw.line(point.z(building.height + 0.3), point.z(upper + 0.45), 0.55)
+            .color(color);
+    }
+}
+
+fn draw_junction(map: &Map, junction: &Intersection, draw: &mut ImmediateDraw, color: LinearColor) {
+    let id = junction.id;
+    let ring = junction.roundabout_geometry();
+    let mouth = |road: &Road, side: f32| {
+        let points = road.interfaced_points();
+        let dir = if road.src == id {
+            points.first_dir().map(|dir| dir.xy())
+        } else {
+            points.last_dir().map(|dir| -dir.xy())
+        }
+        .and_then(Vec2::try_normalize)?;
+        let width = road.width * 0.5;
+        Some((
+            road.interface_point(id) + (dir.perpendicular() * width * side).z0(),
+            dir,
+        ))
+    };
+    let mut outline = Vec::new();
+    for (&a, &b) in junction
+        .roads
+        .iter()
+        .zip(junction.roads.iter().cycle().skip(1))
+    {
+        let (a, b) = (&map.roads()[a], &map.roads()[b]);
+        if let Some(corner) = ring.and_then(|ring| ring.road_corner(id, a, b, true)) {
+            outline.extend(corner.map(|point| point.up(0.55)));
+        } else if let (Some((start, dir_a)), Some((end, dir_b))) = (mouth(a, -1.0), mouth(b, 1.0)) {
+            outline.extend(
+                Turn::spline(start.xy(), end.xy(), -dir_a, dir_b)
+                    .into_smart_points(0.6, 0.0, 1.0)
+                    .map(|point| point.z(junction.pos.z + ROAD_Z_OFFSET + 0.55)),
+            );
+        }
+    }
+    if outline.len() >= 3 {
+        draw.polyline(outline, 1.0, true).color(color);
+    } else {
+        draw.stroke_circle(junction.pos.up(0.55), 5.0, 0.8)
             .color(color);
     }
 }
@@ -475,6 +699,49 @@ mod tests {
             }),
             targets[..2]
         );
+    }
+
+    #[test]
+    fn roadtools_bulldozer_hover_quotes_the_junction_cascade_without_removing_it() {
+        let city = city();
+        crate::init::init();
+        let ui = UiWorld::with_defaults();
+        *ui.write::<Settings>() = Settings::default();
+        *ui.write::<Tool>() = Tool::Bulldozer;
+        let point = vec2(860.0, 860.0);
+        {
+            let mut input = ui.write::<InputMap>();
+            input.screen = point;
+            input.unprojected = sample(point);
+        }
+        let map = city.sim.map();
+        let count = map.roads().len();
+        let ProjectKind::Intersection(id) =
+            map.project(point.z(0.0), 0.0, ProjectFilter::INTER).kind
+        else {
+            panic!("fixture needs a junction");
+        };
+        let arms = &map.get(id).unwrap().roads;
+        let roads = arms.len();
+        let indexed_lots = arms.iter().flat_map(|&road| map.road_lots(road)).count();
+        let affected_lots = map.lots().values().filter(|lot| arms.contains(&lot.parent)).count();
+        assert_eq!(indexed_lots, affected_lots);
+        assert!(map.lots().len() > affected_lots);
+        drop(map);
+
+        bulldozer(&city.sim, &ui);
+        assert!(ui.commands().as_ref().is_empty());
+        assert_eq!(city.sim.map().roads().len(), count);
+        let tooltip = ui.read::<crate::gui::ErrorTooltip>();
+        let message = tooltip
+            .detail
+            .as_deref()
+            .expect("expected a demolition quote");
+        assert!(message.contains(&format!("{roads} roads")), "{message}");
+        if affected_lots > 0 {
+            assert!(message.contains(&format!("{affected_lots} lot")), "{message}");
+        }
+        assert!(message.contains("Cost 0$"), "{message}");
     }
 
     #[test]
@@ -614,6 +881,83 @@ mod tests {
         state.update_drag(false, false, b, &map, sample_target(&map), &mut commands);
         state.update_drag(true, true, b, &map, sample_target(&map), &mut commands);
         assert_eq!(commands.as_ref().len(), 2);
+    }
+
+    #[test]
+    fn roadtools_bulldozer_previews_a_stop_that_loses_its_berth() {
+        use simulation::map::LaneKind;
+        use simulation::map_dynamic::transit::Transit;
+
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let add_road = |sim: &mut Simulation, y| {
+            let mut map = sim.write::<Map>();
+            let (_, road) = map
+                .make_connection(
+                    MapProject::ground(geom::vec3(50.0, y, 0.0)),
+                    MapProject::ground(geom::vec3(250.0, y, 0.0)),
+                    None,
+                    &simulation::map::LanePatternBuilder::new().build(),
+                )
+                .unwrap();
+            let road = map.get(road).unwrap();
+            let &(lane, _) = road
+                .outgoing_lanes_from(road.src)
+                .iter()
+                .rfind(|(_, kind)| *kind == LaneKind::Driving)
+                .unwrap();
+            let points = &map.get(lane).unwrap().points;
+            let (pos, dir) = points.point_dir_along(points.length() * 0.5);
+            (
+                road.id,
+                road.points().point_along(road.length() * 0.5),
+                pos,
+                dir.xy(),
+            )
+        };
+        let (road, cursor, pos, dir) = add_road(&mut sim, 100.0);
+        let (_, _, other_pos, other_dir) = add_road(&mut sim, 150.0);
+        sim.apply_commands([
+            &WorldCommand::TransitAddStop { pos, dir },
+            &WorldCommand::TransitAddStop {
+                pos: other_pos,
+                dir: other_dir,
+            },
+        ]);
+        assert_eq!(sim.read::<Transit>().stops.len(), 2);
+
+        crate::init::init();
+        let ui = UiWorld::with_defaults();
+        *ui.write::<Settings>() = Settings::default();
+        *ui.write::<Tool>() = Tool::Bulldozer;
+        {
+            let mut input = ui.write::<InputMap>();
+            input.screen = cursor.xy();
+            input.unprojected = Some(cursor);
+        }
+        let assert_preview = |sim: &Simulation| {
+            bulldozer(sim, &ui);
+            let summary = ui
+                .read::<crate::gui::ErrorTooltip>()
+                .detail
+                .clone()
+                .unwrap();
+            assert!(summary.contains("1 bus stop"), "{summary}");
+            assert!(ui.commands().as_ref().is_empty());
+            assert_eq!(sim.read::<Transit>().stops.len(), 2);
+        };
+        assert_preview(&sim);
+        let snapshot = sim
+            .encode_slot(simulation::SnapshotRevision::new(1))
+            .unwrap()
+            .into_snapshot_bytes();
+        let mut sim = Simulation::load_compressed_snapshot(&snapshot, 64 * 1024 * 1024).unwrap();
+        assert_preview(&sim);
+        sim.apply_commands([&WorldCommand::MapRemoveRoad(road)]);
+        let transit = sim.read::<Transit>();
+        assert_eq!(transit.stops.len(), 1);
+        assert_eq!(transit.stops.values().next().unwrap().pos, other_pos);
     }
 
     #[test]

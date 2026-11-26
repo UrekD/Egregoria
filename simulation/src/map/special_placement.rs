@@ -1,4 +1,4 @@
-use geom::{Circle, Intersect, Polygon, Radians, Shape, Vec2, Vec3, OBB};
+use geom::{Circle, Intersect, Polygon, Shape, Vec2, Vec3, OBB};
 use ordered_float::OrderedFloat;
 use prototypes::Size2D;
 use std::collections::BTreeSet;
@@ -264,28 +264,16 @@ fn intersection_overlaps(map: &Map, inter: &Intersection, obb: &OBB) -> bool {
         Some((at.xy() - offset, at.xy() + offset, dir))
     };
     let mut curb = Polygon::default();
-    let center = inter.pos.xy();
-    let roundabout = inter
-        .turn_policy
-        .roundabout
-        .filter(|_| inter.is_roundabout());
+    let roundabout = inter.roundabout_geometry();
     for (&road, &next) in inter.roads.iter().zip(inter.roads.iter().cycle().skip(1)) {
         let (Some((left, _, dir)), Some((_, right, next_dir))) = (mouth(road), mouth(next)) else {
             continue;
         };
-        if let Some(roundabout) = roundabout {
-            let angle = (left - center).angle(right - center).abs();
-            if angle >= Radians::from_deg(21.0).0 {
-                curb.extend(Turn::gen_roundabout(
-                    left.z0(),
-                    right.z0(),
-                    -dir,
-                    next_dir,
-                    roundabout.radius + 3.0,
-                    center,
-                ));
-                continue;
-            }
+        if let Some(points) = roundabout.and_then(|ring| {
+            ring.road_corner(inter.id, &map.roads()[road], &map.roads()[next], true)
+        }) {
+            curb.extend(points.map(Vec3::xy));
+            continue;
         }
         curb.extend(Turn::spline(left, right, -dir, next_dir).smart_points(1.0, 0.0, 1.0));
     }

@@ -343,6 +343,7 @@ enum PointerPosition {
 
 #[derive(Deserialize)]
 enum ScriptKey {
+    Shift,
     Escape,
     LandTiles,
 }
@@ -1631,6 +1632,7 @@ fn move_yakui_pointer(ctx: &mut Context, pos: Vec2) {
 impl ScriptKey {
     fn send(self, ctx: &mut Context, down: bool) {
         let (key, code) = match self {
+            Self::Shift => (Key::Shift, yakui::input::KeyCode::ShiftLeft),
             Self::Escape => (Key::Escape, yakui::input::KeyCode::Escape),
             Self::LandTiles => (Key::c("L"), yakui::input::KeyCode::KeyL),
         };

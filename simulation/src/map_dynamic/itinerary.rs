@@ -21,7 +21,7 @@ use egui_inspect::{Inspect, InspectArgs};
 use geom::{Follower, PolyLine3, Polyline3Queue, Segment3, Vec3};
 use prototypes::{game_secs_to_ticks, GameTime, Tick, DELTA};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[path = "road_edit_lifecycle.rs"]
 mod road_edit_lifecycle;
@@ -877,6 +877,89 @@ impl Itinerary {
         position
     }
 
+    fn reconcile_migrated_path(
+        &mut self,
+        map: &Map,
+        previous: &BTreeMap<TraverseKind, Vec<Vec3>>,
+        transform: &mut geom::Transform,
+        clearance: f32,
+    ) -> bool {
+        if let ItineraryKind::PedestrianEgress(egress) = &mut self.kind {
+            if egress
+                .crossing
+                .is_some_and(|path| previous.contains_key(&path.kind))
+            {
+                egress.crossing = None;
+                egress.check_at = Tick(0);
+                self.reversed_local_path.clear();
+                return true;
+            }
+            return false;
+        }
+        let ItineraryKind::Route(route, path_kind) = &mut self.kind else {
+            return false;
+        };
+        if let ItineraryTarget::DirectedLane(lane, offset) = route.target {
+            if previous.contains_key(&TraverseKind::Lane(lane)) {
+                if let Some(lane_path) = map.get(lane) {
+                    let offset = offset.clamp(0.0, lane_path.points.length());
+                    route.target = ItineraryTarget::DirectedLane(lane, offset);
+                    route.end_pos = lane_path.points.point_along(offset);
+                }
+            }
+        }
+        let Some(old) = previous.get(&route.cur.kind) else {
+            return false;
+        };
+        let Some(points) = route.cur.points(map) else {
+            let destination = route.cur.destination_lane();
+            if let Some(lane) = map.get(destination) {
+                transform.pos = lane.points.project(transform.pos);
+            }
+            *self = Self::retry_after_edit(*path_kind, route.target, self.road_approach);
+            return true;
+        };
+
+        let mut offset = distance_on_path(&points, transform.pos);
+        if matches!(route.cur.kind, TraverseKind::Turn(_)) && old.len() >= 2 {
+            let old_points = PolyLine3::new(match route.cur.dir {
+                TraverseDirection::Forward => old.clone(),
+                TraverseDirection::Backward => old.iter().rev().copied().collect(),
+            });
+            if old_points.length() > 0.0 {
+                offset = distance_on_path(&old_points, transform.pos) / old_points.length()
+                    * points.length();
+            }
+        } else if route.reversed_route.last().is_some_and(|next| {
+            matches!(next.kind, TraverseKind::Turn(id) if map.is_yield_roundabout(id.parent))
+        }) {
+            offset = offset.min((points.length() - clearance).max(0.0));
+        }
+        let (position, direction) = points.point_dir_along(offset);
+        transform.pos = position;
+        transform.dir = direction;
+        let mut end = points.length();
+        if route.reversed_route.is_empty() {
+            end = match route.target {
+                ItineraryTarget::Position(position) => distance_on_path(&points, position),
+                ItineraryTarget::DirectedLane(_, distance) => distance.clamp(0.0, end),
+            };
+            end = end.max(offset);
+            route.end_pos = points.point_along(end);
+            if let ItineraryTarget::DirectedLane(lane, _) = route.target {
+                route.target = ItineraryTarget::DirectedLane(lane, end);
+            }
+        }
+        self.reversed_local_path = if points.len() < 2 {
+            vec![position]
+        } else {
+            directed_local_path(&points, position, end, points.point_along(end))
+                .unwrap_or_else(|| vec![points.point_along(end)])
+        };
+        self.reversed_local_path.reverse();
+        true
+    }
+
     pub fn random_route(
         rng: u64,
         position: Vec3,
@@ -1149,6 +1232,74 @@ impl Itinerary {
             *self = Itinerary::NONE;
         }
     }
+}
+
+pub(crate) fn reconcile_roundabout_snapshot(sim: &mut crate::Simulation) {
+    let (world, resources) = sim.world_res();
+    let map = resources.read::<Map>();
+    let previous = &map.migrated_roundabout_paths;
+    if previous.is_empty() {
+        return;
+    }
+    let mut state = resources.write::<JunctionAdmission>();
+    let mut grid = resources.write::<TransportGrid>();
+    for (id, vehicle) in world.vehicles.iter_mut() {
+        if !vehicle.vehicle.state.is_parked()
+            && vehicle.it.reconcile_migrated_path(
+                &map,
+                previous,
+                &mut vehicle.trans,
+                vehicle.vehicle.kind.width() * 0.5,
+            )
+        {
+            state.restore_migrated_crossing(
+                &map,
+                EntryOwner::Vehicle(id),
+                vehicle.it.get_travers(),
+            );
+            vehicle.speed.0 = 0.0;
+            relocate_migrated_collider(&mut grid, vehicle.collider, &vehicle.trans);
+        }
+    }
+    world.humans.edit_each(|id, human| {
+        if human.location == Location::Outside
+            && human
+                .it
+                .reconcile_migrated_path(&map, previous, &mut human.trans, 0.3)
+        {
+            state.restore_migrated_crossing(&map, EntryOwner::Human(id), human.it.get_travers());
+            human.speed.0 = 0.0;
+            relocate_migrated_collider(&mut grid, human.collider, &human.trans);
+        }
+    });
+    grid.maintain_deterministic();
+}
+
+fn relocate_migrated_collider(
+    grid: &mut TransportGrid,
+    collider: Option<crate::transportation::Transporter>,
+    transform: &geom::Transform,
+) {
+    let Some(collider) = collider else { return };
+    if let Some((_, state)) = grid.get_mut(collider.0) {
+        state.dir = transform.dir.xy();
+        state.height = transform.pos.z;
+        state.speed = 0.0;
+        grid.set_position(collider.0, transform.pos.xy());
+    }
+}
+
+fn distance_on_path(points: &PolyLine3, position: Vec3) -> f32 {
+    let (point, segment) = points.project_segment(position);
+    let Some(start) = segment.checked_sub(1) else {
+        return 0.0;
+    };
+    points
+        .segments()
+        .take(start)
+        .map(|edge| edge.src.distance(edge.dst))
+        .sum::<f32>()
+        + points[start].distance(point)
 }
 
 fn driving_lane_points(map: &Map, lane: LaneID, offset: f32) -> Option<&PolyLine3> {

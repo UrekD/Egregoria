@@ -7,9 +7,9 @@ use geom::{Intersect, PolyLine3, Polygon, Shape, Vec2, Vec3, AABB};
 
 use crate::map::{
     profile_height, spend_water_work, Environment, Intersection, IntersectionID, Intersections,
-    LanePattern, Lanes, Lot, Map, MapProject, PointGenerateError, ProjectKind, Road, RoadID,
-    RoadSegmentKind, Roads, SpatialMap, Turn,
-    WaterEditError, WaterFootprint, WaterTileCoord, WaterTopologyWork, MAX_SLOPE, ROAD_Z_OFFSET,
+    LaneKind, LanePattern, Lanes, Lot, Map, MapProject, PointGenerateError, ProjectFilter,
+    ProjectKind, Road, RoadID, RoadSegmentKind, Roads, SpatialMap, Turn, WaterEditError,
+    WaterFootprint, WaterTileCoord, WaterTopologyWork, MAX_SLOPE, ROAD_Z_OFFSET,
 };
 
 pub const WATER_BRIDGE_CLEARANCE: f32 = 2.5;
@@ -20,6 +20,7 @@ const RAMP_GRADE: f32 = MAX_SLOPE - 0.01;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ConnectionError {
     InvalidEndpoint,
+    RoundaboutRailConflict,
     OutOfBounds,
     Grade,
     WetAnchor(WaterTileCoord),
@@ -38,6 +39,7 @@ impl fmt::Display for ConnectionError {
         }
         f.write_str(match self {
             Self::InvalidEndpoint => "Invalid road or rail endpoint",
+            Self::RoundaboutRailConflict => "A same-level railway conflicts with this roundabout",
             Self::OutOfBounds => "The crossing leaves the map",
             Self::Grade => "The deck or a lane is too steep",
             Self::WetAnchor(_) => "Start or end on dry land or attach to an elevated deck",
@@ -310,7 +312,7 @@ pub(crate) fn connection_is_dry(
             bounds = bounds.union(bounds_of_road);
         }
         if let Some(roundabout) = inter.turn_policy.roundabout {
-            let radius = roundabout.radius + 3.0;
+            let radius = roundabout.radius + 4.0 + LaneKind::Walking.width();
             if !radius.is_finite() || radius < 0.0 {
                 return Ok(false);
             }
@@ -851,6 +853,15 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         let src = self.junction_shell(live.src);
         let dst = self.junction_shell(live.dst);
         let id = live.copy_geometry(&mut self.roads, src, dst);
+        let [forward, backward] = live.directed_lanes();
+        use crate::map::LaneDirection::{Backward, Forward};
+        self.roads[id].install_lane_keys(
+            forward
+                .iter()
+                .rev()
+                .map(|&(id, kind)| (id, kind, Forward))
+                .chain(backward.iter().map(|&(id, kind)| (id, kind, Backward))),
+        );
         self.road_keys.insert(original, id);
         self.live_roads.insert(id, original);
         Ok(id)
@@ -1276,8 +1287,55 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         Ok(())
     }
 
+    fn stage_roundabout_layouts(&mut self) -> Result<(), ConnectionError> {
+        let junctions = self
+            .changed_junctions
+            .iter()
+            .copied()
+            .filter(|&id| self.junctions[id].is_roundabout())
+            .collect::<Vec<_>>();
+        let mut arms = BTreeSet::new();
+        for &id in &junctions {
+            self.ensure_arms(id)?;
+            arms.extend(self.junctions[id].roads.iter().copied());
+        }
+        let mut lanes = Lanes::default();
+        for id in arms {
+            let pattern = self.pattern(id);
+            let road = &mut self.roads[id];
+            self.work.charge(
+                road.interfaced_points()
+                    .len()
+                    .saturating_mul(pattern.lanes().count()),
+            )?;
+            road.clear_staged_lanes();
+            road.make_lanes(&pattern, &mut lanes);
+            for (id, _) in road.lanes_iter() {
+                lanes[id].gen_pos(road);
+            }
+        }
+        for id in junctions {
+            let junction = &mut self.junctions[id];
+            let lane_count: usize = junction
+                .roads
+                .iter()
+                .map(|&id| self.roads[id].n_lanes())
+                .sum();
+            self.work
+                .charge(lane_count.saturating_mul(lane_count).saturating_mul(32))?;
+            junction.update_turns(&lanes, &self.roads);
+            check_roundabout_rail(self.map, junction, self.work, |road| {
+                self.road_keys
+                    .get(&road)
+                    .is_none_or(|id| self.roads.contains_key(*id))
+            })?;
+        }
+        Ok(())
+    }
+
     fn validate_land(&mut self) -> Result<Vec<Vec<Vec3>>, ConnectionError> {
         use crate::map::PreparedEffects;
+        self.stage_roundabout_layouts()?;
         if !self.map.land_ownership().is_tiled() {
             return Ok(Vec::new());
         }
@@ -1423,12 +1481,6 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
         let mut outlines = Vec::new();
         for junction in junctions {
             let inter = &mut self.junctions[junction];
-            let outline = junction_outline(inter, &self.roads, self.work)?;
-            let elevated = self.wet_splits.contains(&junction)
-                || is_elevated_junction(inter, &self.roads, env);
-            wet_tiles(env, &outline.0, self.work, |tile, water| {
-                validate_junction_height(inter, elevated, tile, water)
-            })?;
             let lane_count: usize = inter.roads.iter().map(|&id| self.roads[id].n_lanes()).sum();
             // A spline's adaptive step is inversely proportional to the
             // square root of its second derivative. Reserve before creating turns.
@@ -1441,6 +1493,12 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
                     .saturating_mul(turn_work),
             )?;
             inter.update_turns(&lanes, &self.roads);
+            let outline = junction_outline(inter, &self.roads, self.work)?;
+            let elevated = self.wet_splits.contains(&junction)
+                || is_elevated_junction(inter, &self.roads, env);
+            wet_tiles(env, &outline.0, self.work, |tile, water| {
+                validate_junction_height(inter, elevated, tile, water)
+            })?;
             for turn in inter.turns() {
                 let route = JunctionRoute::new(turn, &lanes, self.work)?;
                 route.validate(env, self.work)?;
@@ -1701,51 +1759,35 @@ fn junction_outline(
     roads: &Roads,
     work: &mut CrossingWork<'_>,
 ) -> Result<Polygon, ConnectionError> {
-    let mut arms = Vec::new();
-    for &id in &junction.roads {
-        work.charge(1)?;
-        let road = &roads[id];
-        let points = road.interfaced_points();
-        let pose = if road.src == junction.id {
-            points.first_dir().map(|dir| (points.first(), dir.xy()))
-        } else {
-            points.last_dir().map(|dir| (points.last(), -dir.xy()))
-        };
-        if let Some((point, dir)) = pose {
-            let normal = dir.perpendicular() * (road.width * 0.5);
-            arms.push((point.xy() - normal, point.xy() + normal, dir));
-        }
-    }
     let mut outline = Polygon::default();
-    let center = junction.pos.xy();
-    for ((left, _, src), (_, right, dst)) in arms.iter().zip(arms.iter().cycle().skip(1)) {
-        if junction.is_roundabout() {
-            if let Some(policy) = junction.turn_policy.roundabout {
-                let a = (*left - center).try_normalize();
-                let b = (*right - center).try_normalize();
-                if a.zip(b)
-                    .is_some_and(|(a, b)| a.angle(b).abs() >= 21.0_f32.to_radians())
-                {
-                    work.charge((policy.radius.abs() / 10.0).ceil() as usize + 1)?;
-                    for point in Turn::gen_roundabout(
-                        left.z0(),
-                        right.z0(),
-                        -*src,
-                        *dst,
-                        policy.radius + 3.0,
-                        center,
-                    ) {
-                        work.charge(1)?;
-                        outline.push(point);
-                    }
-                    continue;
-                }
+    let ring = junction.roundabout_geometry();
+    let mouth = |road: &Road| {
+        let points = road.interfaced_points();
+        let (point, dir) = if road.src == junction.id {
+            (points.first(), points.first_dir()?.xy())
+        } else {
+            (points.last(), -points.last_dir()?.xy())
+        };
+        let normal = dir.perpendicular() * (road.width * 0.5);
+        Some((point.xy() - normal, point.xy() + normal, dir))
+    };
+    for (&id, &next) in junction
+        .roads
+        .iter()
+        .zip(junction.roads.iter().cycle().skip(1))
+    {
+        work.charge(1)?;
+        let (road, next) = (&roads[id], &roads[next]);
+        if let Some(points) = ring.and_then(|ring| ring.road_corner(junction.id, road, next, true))
+        {
+            work.charge(points.len())?;
+            outline.extend(points.map(Vec3::xy));
+        } else if let (Some((left, _, src)), Some((_, right, dst))) = (mouth(road), mouth(next)) {
+            let spline = Turn::spline(left, right, -src, dst);
+            for point in spline.smart_points(1.0, 0.0, 1.0) {
+                work.charge(1)?;
+                outline.push(point);
             }
-        }
-        let spline = Turn::spline(*left, *right, -*src, *dst);
-        for point in spline.smart_points(1.0, 0.0, 1.0) {
-            work.charge(1)?;
-            outline.push(point);
         }
     }
     work.charge(outline.len())?;
@@ -1899,6 +1941,60 @@ pub(crate) fn prepare_direct_road(
     }
 }
 
+/// Preview only roads removed or reclipped by accepted demolition commands.
+pub(crate) fn demolition_road_clips(
+    map: &Map,
+    edits: &[ProjectKind],
+    work: &mut CrossingWork<'_>,
+) -> Result<BTreeMap<RoadID, Option<PolyLine3>>, ConnectionError> {
+    let mut graph = LocalTopology::new(map, work);
+    graph.work.charge(edits.len())?;
+    for &edit in edits {
+        match edit {
+            ProjectKind::Road(id) => {
+                let road = map.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
+                let src = graph.load_junction(road.src)?;
+                let dst = graph.load_junction(road.dst)?;
+                let id = graph.road_keys[&id];
+                if graph.roads.contains_key(id) {
+                    graph.remove_road(id);
+                    graph.invalidate(src)?;
+                    graph.invalidate(dst)?;
+                }
+            }
+            ProjectKind::Intersection(id) => {
+                if map.get(id).is_none() {
+                    return Err(ConnectionError::InvalidEndpoint);
+                }
+                let junction = graph.load_junction(id)?;
+                for id in graph.junctions[junction].roads.clone() {
+                    let other = graph.roads[id].other_end(junction).unwrap();
+                    graph.ensure_arms(other)?;
+                    graph.remove_road(id);
+                    graph.invalidate(other)?;
+                    // Junction removal also invalidates the surviving end after each arm.
+                    graph.invalidate(other)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut clips = BTreeMap::new();
+    for (&local, &live) in &graph.live_roads {
+        match graph.roads.get(local) {
+            Some(road) if graph.changed_roads.contains(&local) => {
+                graph.work.charge(road.interfaced_points().len())?;
+                clips.insert(live, Some(road.interfaced_points().clone()));
+            }
+            None => {
+                clips.insert(live, None);
+            }
+            _ => {}
+        }
+    }
+    Ok(clips)
+}
+
 pub(crate) fn prepare_road_removal(
     map: &Map,
     id: RoadID,
@@ -1953,6 +2049,87 @@ pub(crate) fn prepare_junction_removal(
     Ok(())
 }
 
+pub(in crate::map) fn roundabout_changed_clips(
+    map: &Map,
+    id: IntersectionID,
+) -> Result<Vec<RoadID>, ConnectionError> {
+    let mut work = WaterTopologyWork::new();
+    let mut geometry = work.geometry();
+    let mut graph = LocalTopology::new(map, &mut geometry);
+    let junction = graph.load_junction(id)?;
+    graph.invalidate(junction)?;
+    Ok(graph
+        .changed_roads
+        .iter()
+        .filter_map(|road| {
+            let original = graph.live_roads[road];
+            (graph.roads[*road].interfaced_points().as_slice()
+                != map.roads[original].interfaced_points().as_slice())
+            .then_some(original)
+        })
+        .collect())
+}
+
+pub(in crate::map) fn check_roundabout_rail(
+    map: &Map,
+    junction: &Intersection,
+    work: &mut CrossingWork<'_>,
+    retain_road: impl Fn(RoadID) -> bool,
+) -> Result<(), ConnectionError> {
+    use crate::transportation::{junction_admission::segments_close, VehicleKind};
+    use geom::Segment3;
+
+    let Some(ring) = junction.roundabout_geometry() else {
+        return Ok(());
+    };
+    let clearance = (VehicleKind::Bus.width() + LaneKind::Rail.width()) * 0.5 + 0.8;
+    let mut bounds = AABB::centered(ring.center.xy(), Vec2::splat(ring.island_radius() * 2.0));
+    for turn in junction.raw_turns() {
+        work.charge(turn.points.len())?;
+        for p in turn.points.iter() {
+            bounds.ll = bounds.ll.min(p.xy());
+            bounds.ur = bounds.ur.max(p.xy());
+        }
+    }
+    let bounds = bounds.expand(clearance);
+    map.spatial_map()
+        .reserve_construction_query(bounds, work.remaining)
+        .map_err(|_| ConnectionError::WorkLimit)?;
+    let scale = |segment: Segment3, radius: f32| {
+        let point = |p: Vec3| p.xy().z((p.z - ring.center.z) * radius / 3.0);
+        Segment3::new(point(segment.src), point(segment.dst))
+    };
+    for hit in map
+        .spatial_map()
+        .construction_candidates(bounds, ProjectFilter::ROAD)
+    {
+        let ProjectKind::Road(id) = hit else { continue };
+        if !retain_road(id) {
+            continue;
+        }
+        let road = &map.roads[id];
+        work.charge(road.n_lanes() + 1)?;
+        for (lane, _) in road.lanes_iter().filter(|(_, kind)| kind.is_rail()) {
+            for track in map.lanes[lane].points.segments() {
+                work.charge(1)?;
+                if ring.track_intersects_island(track, LaneKind::Rail.width() * 0.5) {
+                    return Err(ConnectionError::RoundaboutRailConflict);
+                }
+                let track = scale(track, clearance);
+                for turn in junction.raw_turns() {
+                    work.charge(turn.points.len())?;
+                    if turn.points.segments().any(|sweep| {
+                        segments_close(track, scale(sweep, clearance), clearance * clearance)
+                    }) {
+                        return Err(ConnectionError::RoundaboutRailConflict);
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn prepare_junction_update(
     map: &Map,
     next: &Intersection,
@@ -1966,6 +2143,9 @@ pub(crate) fn prepare_junction_update(
     let current = &map.intersections[next.id];
     if current.pos != next.pos || current.roads != next.roads || current.radius != next.radius {
         return Err(ConnectionError::InvalidEndpoint);
+    }
+    if next.is_roundabout() && next.has_rail_arm(&map.roads) {
+        return Err(ConnectionError::RoundaboutRailConflict);
     }
     let mut graph = LocalTopology::new(map, work);
     let id = graph.load_junction(next.id)?;
@@ -2074,7 +2254,7 @@ pub(crate) fn junction_support_bounds(junction: &Intersection, roads: &Roads) ->
     }
     if junction.is_roundabout() {
         if let Some(roundabout) = junction.turn_policy.roundabout {
-            radius = radius.max(roundabout.radius + 3.0);
+            radius = radius.max(roundabout.radius + 4.0 + LaneKind::Walking.width());
         }
     }
     // Turn splines use at most 0.66 times the endpoint chord as a tangent.

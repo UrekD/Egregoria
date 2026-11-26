@@ -1,11 +1,13 @@
 use engine::AudioKind;
-use geom::{BoldLine, BoldSpline, Camera, Line, PolyLine, Ray, ShapeEnum, Spline};
+use geom::{
+    BoldLine, BoldSpline, Camera, Line, LinearColor, PolyLine, Radians, Ray, ShapeEnum, Spline,
+};
 use geom::{PolyLine3, Vec2, Vec3};
 use itertools::Itertools;
 use ordered_float::OrderedFloat;
 use simulation::map::{
     ConnectionError, LanePattern, LanePatternBuilder, Map, MapProject, ProjectFilter, ProjectKind,
-    PylonPosition, RoadPreview, ROAD_Z_OFFSET,
+    PylonPosition, RoadPreview, ROAD_Z_OFFSET, ZONE_CELL_SIZE,
 };
 use simulation::world_command::{Rejection, WorldCommand, WorldCommands};
 use simulation::Simulation;
@@ -63,6 +65,9 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
 
     let grid_size = 20.0;
     let nosnapping = inp.act.contains(&InputAction::NoSnapping);
+    let precision = !nosnapping
+        && inp.act.contains(&InputAction::PrecisionRoad)
+        && !matches!(state.build_state, Hover);
     let attach = !nosnapping && !matches!(state.build_state, CurvedConnection(..));
     let surfaces = inp.surface_hits(map.environment());
     let deck = inp.ray.filter(|_| attach).and_then(|ray| {
@@ -77,7 +82,11 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
     let mut interpolation_points: Vec<Vec3> = Vec::new();
 
     // Prepare mousepos depending on snap to grid or snap to angle
-    let mousepos = match state.snapping {
+    let mousepos = match if precision {
+        Snapping::None
+    } else {
+        state.snapping
+    } {
         Snapping::None => state.mouse_height(map, unproj),
         Snapping::SnapToGrid => state.grid_mouse_height(map, unproj, grid_size),
         Snapping::SnapToAngle => {
@@ -166,11 +175,24 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         }
     }
 
-    if nosnapping {
-        cur_proj = MapProject {
-            pos: mousepos,
-            kind: Ground,
+    let mut measurement = None;
+    if precision {
+        let (start, anchor) = match state.build_state {
+            Start(start) | StartCurved(start) | CurvedConnection(start, _) => (start, start.pos),
+            Curved(control, start) => (start, control.z(start.pos.z)),
+            Hover => unreachable!("precision requires a start point"),
+        };
+        let snap = PrecisionSnap::at(map, start, anchor, unproj);
+        // Existing road and junction attachments keep their exact position.
+        if cur_proj.is_ground() {
+            let env = map.environment();
+            let height = env
+                .water_surface_elevation(snap.point)
+                .or_else(|| env.height(snap.point))
+                .unwrap_or(unproj.z);
+            cur_proj.pos = state.mouse_height(map, snap.point.z(height));
         }
+        measurement = Some((anchor, snap));
     }
 
     let is_rail = state.pattern_builder.rail;
@@ -273,8 +295,8 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
 
     let mut points = None;
 
-    if let Some((src, dst, inter, pat)) = build_args {
-        match state.preview(map, src, dst, inter, &pat) {
+    if let Some((src, dst, inter, ref pat)) = build_args {
+        match state.preview(map, src, dst, inter, pat) {
             Ok(preview) => {
                 points = Some(preview.deck.clone());
                 let color = if is_valid {
@@ -293,7 +315,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
                         from: src,
                         to: dst,
                         inter,
-                        pat,
+                        pat: pat.clone(),
                     });
                 }
             }
@@ -332,6 +354,18 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
             ErrorTooltip::new("Start on dry land or attach to an elevated deck");
     }
 
+    if let Some((anchor, _)) = &measurement {
+        let tooltip = &mut *uiworld.write::<ErrorTooltip>();
+        tooltip.detail = Some(precision_readout(
+            map,
+            *anchor,
+            cur_proj,
+            build_args.as_ref(),
+            points.as_ref(),
+        ));
+        tooltip.isworld = true;
+    }
+
     state.update_drawing(
         map,
         immdraw,
@@ -341,6 +375,10 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
         points,
         interpolation_points,
     );
+
+    if let Some((anchor, snap)) = measurement {
+        snap.draw(immdraw, anchor, cur_proj.pos, patwidth);
+    }
 
     if is_valid && inp.just_act.contains(&InputAction::Select) {
         log::info!(
@@ -361,7 +399,7 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
             }
             (StartCurved(v), Ground) => {
                 // Set interpolation point
-                state.build_state = Curved(mousepos.xy(), v);
+                state.build_state = Curved(cur_proj.pos.xy(), v);
             }
             (StartCurved(p), Road(_) | Intersection(_)) => {
                 // Set interpolation point
@@ -394,6 +432,142 @@ pub fn roadbuild(sim: &Simulation, uiworld: &UiWorld) {
             _ => {}
         }
     }
+}
+
+const PRECISION_ANGLE: f32 = std::f32::consts::PI / 12.0;
+const ALIGNMENT_ANGLE: f32 = std::f32::consts::PI / 36.0;
+const ALIGNMENT_DISTANCE: f32 = 24.0;
+
+struct PrecisionSnap {
+    point: Vec2,
+    alignment: Option<Vec2>,
+}
+
+impl PrecisionSnap {
+    fn at(map: &Map, start: MapProject, anchor: Vec3, pointer: Vec3) -> Self {
+        let delta = pointer.xy() - anchor.xy();
+        let angle = delta.angle_cossin().0;
+        let preferred = |a: Vec2, b: Vec2| {
+            let error = |dir: Vec2| {
+                let angle = dir.angle(delta);
+                (angle
+                    - (angle / std::f32::consts::FRAC_PI_2).round() * std::f32::consts::FRAC_PI_2)
+                    .abs()
+            };
+            error(a).total_cmp(&error(b))
+        };
+        let start_axis = match start.kind {
+            Intersection(id) => map.get(id).and_then(|junction| {
+                junction
+                    .roads
+                    .iter()
+                    .filter_map(|&road| map.get(road))
+                    .map(|road| road.dir_from(id))
+                    .min_by(|&a, &b| preferred(a, b))
+            }),
+            Road(id) => map
+                .get(id)
+                .and_then(|road| road_axis(road, start.pos.xy()).1),
+            _ => None,
+        };
+        let quantize = |base: f32, step: f32| base + ((angle - base) / step).round() * step;
+        let nearby = map
+            .spatial_map()
+            .query_around(pointer.xy(), ALIGNMENT_DISTANCE, ProjectFilter::ROAD)
+            .filter_map(|kind| {
+                let Road(id) = kind else { return None };
+                let road = map.get(id)?;
+                let (point, direction) = road_axis(road, pointer.xy());
+                let distance = (point.xy().distance(pointer.xy()) - road.width * 0.5).max(0.0);
+                let axis = direction?;
+                let aligned = quantize(axis.angle_cossin().0, std::f32::consts::FRAC_PI_2);
+                ((point.z - pointer.z).abs() < 4.0
+                    && distance <= ALIGNMENT_DISTANCE
+                    && (aligned - angle).abs() <= ALIGNMENT_ANGLE)
+                    .then_some((OrderedFloat(distance), id, axis, aligned))
+            })
+            .min_by_key(|&(distance, id, _, _)| (distance, id));
+        let (direction, alignment) = nearby.map_or_else(
+            || {
+                let reference = start_axis.unwrap_or(Vec2::X).angle_cossin().0;
+                (quantize(reference, PRECISION_ANGLE), start_axis)
+            },
+            |(_, _, axis, aligned)| (aligned, Some(axis)),
+        );
+        let length = (delta.mag() / ZONE_CELL_SIZE).round() * ZONE_CELL_SIZE;
+        let point = anchor.xy() + Radians(direction).vec2() * length;
+        Self { point, alignment }
+    }
+
+    fn draw(&self, draw: &mut ImmediateDraw, from: Vec3, to: Vec3, width: f32) {
+        let from = from.up(0.85);
+        let to = to.up(0.85);
+        let guide = LinearColor::new(0.87, 0.97, 1.0, 1.0);
+        let segments = (from.distance(to) / 8.0).ceil().clamp(1.0, 36.0) as usize;
+        if from.xy() != to.xy() {
+            for i in 0..segments {
+                let a = i as f32 / segments as f32;
+                let b = (i as f32 + 0.55) / segments as f32;
+                draw.line(from.lerp(to, a), from.lerp(to, b), 0.65)
+                    .color(guide);
+            }
+        }
+        let axis = self.alignment.unwrap_or(Vec2::X);
+        for axis in [axis, axis.perpendicular()] {
+            let offset = (axis * (width * 0.5 + 4.0)).z0();
+            draw.line(to - offset, to + offset, 0.55).color(guide);
+        }
+        draw.stroke_circle(to, 2.5, 0.45).color(guide);
+    }
+}
+
+fn road_axis(road: &simulation::map::Road, xy: Vec2) -> (Vec3, Option<Vec2>) {
+    let points = road.points();
+    let (point, segment) = points.project_segment_2d(xy);
+    let direction = segment
+        .checked_sub(1)
+        .and_then(|start| points.segment_vec(start))
+        .and_then(|segment| segment.xy().try_normalize());
+    (point, direction)
+}
+
+fn precision_readout(
+    map: &Map,
+    anchor: Vec3,
+    cursor: MapProject,
+    connection: Option<&(MapProject, MapProject, Option<Vec2>, LanePattern)>,
+    deck: Option<&PolyLine3>,
+) -> String {
+    let (from, to) = connection.map_or((anchor, cursor.pos), |(from, to, _, _)| {
+        (
+            from.road_connection_position(map).unwrap_or(from.pos),
+            to.road_connection_position(map).unwrap_or(to.pos),
+        )
+    });
+    let span = deck.map_or_else(
+        || from.xy().distance(to.xy()),
+        |deck| {
+            deck.segments()
+                .map(|segment| segment.src.xy().distance(segment.dst.xy()))
+                .sum()
+        },
+    );
+    let angle = (cursor.pos.xy() - anchor.xy())
+        .angle_cossin()
+        .0
+        .to_degrees()
+        .rem_euclid(360.0);
+    let grade = if span > 0.0 {
+        (to.z - from.z) / span * 100.0
+    } else {
+        0.0
+    };
+    let attachment = match cursor.kind {
+        Intersection(_) => "  ·  Junction",
+        Road(_) => "  ·  Road split",
+        _ => "",
+    };
+    format!("{span:.1} m   ·   {angle:.0}°   ·   {grade:+.1}%{attachment}")
 }
 
 #[derive(Default)]
@@ -837,6 +1011,137 @@ mod tests {
     use super::*;
     use geom::{vec2, vec3};
     use simulation::map::Environment;
+
+    #[test]
+    fn roadtools_precision_applies_the_previewed_straight_endpoint_and_curve_control() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let origin = vec3(120.0, 110.0, 0.0);
+        let pointer = vec3(191.0, 129.0, 0.0);
+        let snapped = origin.xy() + Radians::from_deg(15.0).vec2() * 72.0;
+        for tool in [Tool::RoadbuildStraight, Tool::RoadbuildCurved] {
+            let ui = ui(tool);
+            let start = MapProject::ground(origin);
+            ui.write::<RoadBuildResource>().build_state = if tool == Tool::RoadbuildStraight {
+                Start(start)
+            } else {
+                StartCurved(start)
+            };
+            {
+                let mut input = ui.write::<InputMap>();
+                input.unprojected = Some(pointer);
+                input.act.insert(InputAction::PrecisionRoad);
+                input.just_act.insert(InputAction::Select);
+            }
+            roadbuild(&sim, &ui);
+
+            assert!(ui
+                .read::<ErrorTooltip>()
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("72.0 m"));
+            match tool {
+                Tool::RoadbuildStraight => {
+                    let queued = ui.commands();
+                    let [WorldCommand::MapMakeConnection { to, .. }] = queued.as_ref() else {
+                        panic!("expected one road command");
+                    };
+                    assert!(to.pos.xy().is_close(snapped, 0.001));
+                }
+                _ => assert!(matches!(
+                    ui.read::<RoadBuildResource>().build_state,
+                    Curved(control, _) if control.is_close(snapped, 0.001)
+                )),
+            }
+        }
+    }
+
+    #[test]
+    fn roadtools_precision_aligns_to_a_nearby_road() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        let direction = Radians::from_deg(24.0).vec2();
+        let a = vec2(40.0, 60.0);
+        let b = a + direction * 320.0;
+        map.make_connection(
+            MapProject::ground(a.z0()),
+            MapProject::ground(b.z0()),
+            None,
+            &LanePatternBuilder::new().build(),
+        )
+        .unwrap();
+
+        for axis in [direction, direction.perpendicular()] {
+            let pointer = (a + direction * 160.0).z0();
+            let start =
+                MapProject::ground(pointer - (axis * 90.0 + axis.perpendicular() * 4.0).z0());
+            let snap = PrecisionSnap::at(&map, start, start.pos, pointer);
+            let delta = snap.point - start.pos.xy();
+            assert!(delta.is_close(axis * 88.0, 0.001), "{delta:?}");
+        }
+    }
+
+    #[test]
+    fn roadtools_precision_uses_the_projected_segment_tangent() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        for elbow in [None, Some(vec2(120.0, 150.0))] {
+            let (_, id) = map
+                .make_connection(
+                    MapProject::ground(vec3(45.0, 80.0, 0.0)),
+                    MapProject::ground(vec3(250.0, 80.0, 0.0)),
+                    elbow,
+                    &LanePatternBuilder::new().build(),
+                )
+                .unwrap();
+            let mut road = map.get(id).unwrap().clone();
+            if elbow.is_none() {
+                road.points = PolyLine3::new(vec![road.points().first(), road.points().last()]);
+            }
+            let segments = road.points().segments().collect::<Vec<_>>();
+            for segment in [segments[0], *segments.last().unwrap()] {
+                let midpoint = segment.src.lerp(segment.dst, 0.5);
+                let (projected, tangent) = road_axis(&road, midpoint.xy());
+                assert!(projected.is_close(midpoint, 0.001));
+                assert!(tangent
+                    .unwrap()
+                    .is_close(segment.vec().xy().normalize(), 0.001));
+            }
+            map.remove_road(id);
+        }
+    }
+
+    #[test]
+    fn roadtools_precision_skips_a_closer_unaligned_road() {
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut map = Map::empty();
+        assert!(map.install_environment(Environment::new(1, 1)));
+        let axis = Radians::from_deg(24.0).vec2();
+        let pointer = vec2(225.0, 225.0);
+        let pattern = LanePatternBuilder::new().build();
+        for (dir, midpoint) in [
+            (Vec2::X, pointer),
+            (axis, pointer + axis.perpendicular() * 20.0),
+        ] {
+            map.make_connection(
+                MapProject::ground((midpoint - dir * 100.0).z0()),
+                MapProject::ground((midpoint + dir * 100.0).z0()),
+                None,
+                &pattern,
+            )
+            .unwrap();
+        }
+        let start = MapProject::ground((pointer - axis * 80.0).z0());
+        let snap = PrecisionSnap::at(&map, start, start.pos, pointer.z0());
+        assert!(snap.point.is_close(pointer, 0.001), "{:?}", snap.point);
+    }
 
     #[test]
     fn grid_snap_uses_terrain_at_the_snapped_position() {

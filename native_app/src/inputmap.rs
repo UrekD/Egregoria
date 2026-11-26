@@ -58,6 +58,7 @@ pub enum InputAction {
     Cancel,
     Bulldozer,
     OpenLandTiles,
+    PrecisionRoad,
 }
 
 // All unit inputs need to match
@@ -445,6 +446,7 @@ const DEFAULT_BINDINGS: &[(InputAction, &[&[UnitInput]])] = &[
     (Select,          &[&[Mouse(Left)]]),
     (SecondarySelect, &[&[Key(K::Control), Mouse(Left)]]),
     (NoSnapping,      &[&[Key(K::Control)]]),
+    (PrecisionRoad,   &[&[Key(K::Shift)]]),
     (HideInterface,   &[&[Key(K::c("H"))]]),
     (UpElevation,     &[&[Key(K::Control), WheelUp]]),
     (DownElevation,   &[&[Key(K::Control), WheelDown]]),
@@ -517,7 +519,7 @@ impl Bindings {
 }
 
 fn added_later(action: &InputAction) -> bool {
-    matches!(action, Cancel | Bulldozer | OpenLandTiles)
+    matches!(action, Cancel | Bulldozer | OpenLandTiles | PrecisionRoad)
         || SPEED_DEFAULTS.iter().any(|(speed, _, _)| speed == action)
 }
 
@@ -1101,6 +1103,7 @@ impl Display for InputAction {
                 SecondarySelect => "Secondary Select",
                 HideInterface => "Hide interface",
                 NoSnapping => "No Snapping",
+                PrecisionRoad => "Precision road snapping",
                 UpElevation => "Up Elevation",
                 DownElevation => "Down Elevation",
                 OpenEconomyMenu => "Economy Menu",

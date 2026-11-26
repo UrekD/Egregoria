@@ -92,25 +92,28 @@ pub fn render_oldgui(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
 pub fn tooltip(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("gui::tooltip");
     let tooltip = std::mem::take(&mut *uiworld.write::<ErrorTooltip>());
-    let show_vehicle = tooltip.msg.is_none();
-    if let Some(msg) = tooltip.msg {
-        if !(tooltip.isworld && ui.is_pointer_over_area()) {
-            let pointer = uiworld.read::<InputMap>().screen;
-            let pos = egui::pos2(pointer.x, pointer.y) / ui.pixels_per_point();
-            let anchor = egui::Rect::from_center_size(pos, egui::vec2(30.0, 30.0));
-            egui::show_tooltip_for(ui, Id::new("tooltip_error"), &anchor, |ui| {
+    let has_tooltip = tooltip.msg.is_some() || tooltip.detail.is_some();
+    if has_tooltip && (!tooltip.isworld || !ui.is_pointer_over_area()) {
+        let pointer = uiworld.read::<InputMap>().screen;
+        let pos = egui::pos2(pointer.x, pointer.y) / ui.pixels_per_point();
+        let anchor = egui::Rect::from_center_size(pos, egui::vec2(30.0, 30.0));
+        egui::show_tooltip_for(ui, Id::new("tooltip_error"), &anchor, |ui| {
+            if let Some(detail) = tooltip.detail {
+                ui.add(egui::Label::new(detail).wrap_mode(egui::TextWrapMode::Extend));
+            }
+            if let Some(msg) = tooltip.msg {
                 ui.add(
                     egui::Label::new(RichText::new(msg).color(Color32::from_rgb(255, 100, 100)))
                         .wrap_mode(egui::TextWrapMode::Extend),
                 );
-            });
-        }
+            }
+        });
     }
 
     if ui.is_pointer_over_area() {
         return;
     }
-    if show_vehicle && matches!(*uiworld.read::<Tool>(), Tool::Hand | Tool::RoadEditor) {
+    if !has_tooltip && matches!(*uiworld.read::<Tool>(), Tool::Hand | Tool::RoadEditor) {
         let input = uiworld.read::<InputMap>();
         if !goryak::pointer_over_ui(input.screen.x, input.screen.y) {
             let mut hover = uiworld.write::<VehicleHover>();
@@ -155,6 +158,44 @@ mod tests {
     use scenarios::ScenarioCtx;
     use simulation::transportation::{spawn_driving_vehicle, VehicleKind};
     use simulation::SimulationOptions;
+
+    #[test]
+    fn roadtools_hud_draws_demolition_details_without_an_error() {
+        let sim = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 1,
+            ..SimulationOptions::LEGACY
+        })
+        .sim;
+        crate::init::init();
+        let uiworld = UiWorld::with_defaults();
+        *uiworld.write::<Tool>() = Tool::Bulldozer;
+        uiworld.write::<InputMap>().screen = geom::vec2(100.0, 100.0);
+        let ui = Context::default();
+        let summary = "Demolish 2 roads";
+        let render = || {
+            *uiworld.write::<ErrorTooltip>() = ErrorTooltip {
+                detail: Some(summary.to_owned()),
+                isworld: true,
+                ..Default::default()
+            };
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(640.0, 480.0),
+                )),
+                ..Default::default()
+            };
+            ui.run(input, |ui| tooltip(ui, &uiworld, &sim))
+        };
+        // Egui measures a new popup on its first frame.
+        let _ = render();
+        assert!(
+            render().shapes.iter().any(|shape| {
+                matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == summary)
+            }),
+            "demolition summary was not painted",
+        );
+    }
 
     fn sample_hover<'a>(
         hover: &'a mut VehicleHover,

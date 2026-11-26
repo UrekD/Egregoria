@@ -1,13 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use geom::{Color, Vec2, Vec3};
+use geom::{Color, Vec2, Vec3, AABB};
 use ordered_float::OrderedFloat;
 use prototypes::{Money, Tick};
 use serde::{Deserialize, Serialize};
 use slotmapd::{new_key_type, HopSlotMap, Key};
 
 use crate::economy::{Budget, Government};
-use crate::map::{LaneID, LaneKind, Map, ProjectFilter, ProjectKind};
+use crate::map::{
+    spend_water_work, ConnectionError, LaneID, LaneKind, Map, ProjectFilter, ProjectKind, Road,
+    RoadID, WaterTopologyWork,
+};
 use crate::map_dynamic::itinerary::ItineraryTarget;
 use crate::map_dynamic::{Destination, Itinerary, Router, RoutingStep};
 use crate::transportation::Location;
@@ -26,6 +29,7 @@ pub(crate) const WAIT_NOT_STARTED: Tick = Tick(u64::MAX);
 /// two game hours at the old 10× clock).
 pub const GIVE_UP_TICKS: u64 = 12 * 60 * prototypes::TICKS_PER_REALTIME_SECOND;
 const STOP_RECHECK_TICKS: u64 = 600;
+const BERTH_REACH: f32 = 4.0;
 const SUSPENSION_HISTORY_LIMIT: usize = 256;
 
 new_key_type! {
@@ -186,6 +190,9 @@ pub struct Transit {
     pub revision: u64,
     // Lane IDs are a cache of the geometry anchors and are rebuilt on map edits.
     berths: BTreeMap<StopID, Berth>,
+    // Only stops using a removed or reclipped lane can lose their current berth.
+    #[serde(skip)]
+    stops_by_lane: BTreeMap<LaneID, BTreeSet<StopID>>,
     leg_times: BTreeMap<LineID, LineTimes>,
     legs: BTreeMap<VehicleID, Leg>,
     trip_exclusions: BTreeMap<HumanID, TripExclusions>,
@@ -196,6 +203,16 @@ pub struct Transit {
 impl Transit {
     pub fn bus_leg_origin(&self, vehicle: VehicleID) -> Option<StopID> {
         self.legs.get(&vehicle)?.from
+    }
+
+    pub(crate) fn rebuild_berth_index(&mut self) {
+        self.stops_by_lane.clear();
+        for (&stop, berth) in &self.berths {
+            self.stops_by_lane
+                .entry(berth.lane)
+                .or_default()
+                .insert(stop);
+        }
     }
 
     /// Estimated interval between buses, in elapsed ticks.
@@ -422,17 +439,83 @@ pub fn preview_stop(
     Ok((walk, berth.pos, berth.dir.xy()))
 }
 
+/// Report stops whose berth would disappear after the accepted road edits.
+pub fn stops_removed_by_demolition(
+    sim: &Simulation,
+    edits: &[ProjectKind],
+) -> Result<Vec<(StopID, Vec3)>, ConnectionError> {
+    let transit = sim.read::<Transit>();
+    if edits.is_empty() || transit.stops.is_empty() {
+        return Ok(Vec::new());
+    }
+    let map = sim.map();
+    let mut work = WaterTopologyWork::new();
+    let clips = crate::map::demolition_road_clips(&map, edits, &mut work.geometry())?;
+    let remaining = &mut work.remaining;
+    let mut affected = BTreeSet::new();
+    for &road in clips.keys() {
+        for (lane, _) in map.roads()[road].lanes_iter() {
+            if let Some(stops) = transit.stops_by_lane.get(&lane) {
+                spend_water_work(remaining, stops.len())?;
+                affected.extend(stops.iter().copied());
+            }
+        }
+    }
+
+    let mut removed = Vec::new();
+    let mut roads = Vec::new();
+    for id in affected {
+        let Some(stop) = transit.stops.get(id) else {
+            continue;
+        };
+        let bounds = AABB::centered(stop.pos.xy(), Vec2::splat(BERTH_REACH * 2.0));
+        map.spatial_map()
+            .reserve_construction_query(bounds, remaining)?;
+        for road in stop_roads(&map, stop.pos) {
+            let clip_points = clips
+                .get(&road.id)
+                .and_then(Option::as_ref)
+                .map_or(0, |clip| clip.len());
+            let units = (road.points().len() + clip_points).saturating_mul(road.n_lanes());
+            spend_water_work(remaining, units)?;
+            roads.push(road);
+        }
+        if resolve_stop_on_roads(&map, stop.pos, stop.dir, roads.drain(..), Some(&clips))
+            .ok()
+            .flatten()
+            .is_none()
+        {
+            removed.push((id, stop.pos));
+        }
+    }
+    Ok(removed)
+}
+
 fn resolve_stop_checked(
     map: &Map,
     pos: Vec3,
     dir: Vec2,
 ) -> Result<Option<(Vec3, Berth)>, crate::map::LandDenial> {
+    resolve_stop_on_roads(map, pos, dir, stop_roads(map, pos), None)
+}
+
+fn stop_roads(map: &Map, pos: Vec3) -> impl Iterator<Item = &Road> {
     map.spatial_map()
-        .query_around(pos.xy(), 4.0, ProjectFilter::ROAD)
+        .query_around(pos.xy(), BERTH_REACH, ProjectFilter::ROAD)
         .filter_map(|project| match project {
             ProjectKind::Road(id) => map.get(id),
             _ => None,
         })
+}
+
+fn resolve_stop_on_roads<'a>(
+    map: &Map,
+    pos: Vec3,
+    dir: Vec2,
+    roads: impl Iterator<Item = &'a Road>,
+    clips: Option<&BTreeMap<RoadID, Option<geom::PolyLine3>>>,
+) -> Result<Option<(Vec3, Berth)>, crate::map::LandDenial> {
+    roads
         .flat_map(|road| {
             [road.src, road.dst].into_iter().filter_map(move |src| {
                 // Lane order runs from the center line toward the curb.
@@ -440,17 +523,31 @@ fn resolve_stop_checked(
                     .outgoing_lanes_from(src)
                     .iter()
                     .rfind(|(_, kind)| *kind == LaneKind::Driving)?;
-                Some((lane, road.sidewalks(src).outgoing?))
+                Some((road, lane, road.sidewalks(src).outgoing?))
             })
         })
-        .filter_map(|(id, sidewalk)| {
+        .filter_map(|(road, id, sidewalk)| {
             let lane = map.get(id)?;
-            if lane.points.length() < 30.0 {
+            let sidewalk = map.get(sidewalk)?;
+            let rebased;
+            let (lane, sidewalk) = if let Some(clip) = clips.and_then(|clips| clips.get(&road.id)) {
+                let mut road = road.clone();
+                road.interfaced_points = clip.as_ref()?.clone();
+                rebased = [lane, sidewalk].map(|lane| {
+                    let mut lane = lane.clone();
+                    lane.gen_pos(&road);
+                    lane
+                });
+                (&rebased[0], &rebased[1])
+            } else {
+                (lane, sidewalk)
+            };
+            if lane.points.len() < 2 || lane.points.length() < 30.0 {
                 return None;
             }
             let (projected, segment, lane_dir) = lane.points.project_segment_dir(pos);
             let distance = pos.distance2(projected);
-            if distance > 4.0 * 4.0 || dir.dot(lane_dir.xy()) <= 0.0 {
+            if distance > BERTH_REACH * BERTH_REACH || dir.dot(lane_dir.xy()) <= 0.0 {
                 return None;
             }
             let prefix = lane
@@ -463,7 +560,7 @@ fn resolve_stop_checked(
             if !(15.0..=lane.points.length() - 15.0).contains(&offset) {
                 return None;
             }
-            let walk = map.get(sidewalk)?.points.project_segment(pos).0;
+            let walk = sidewalk.points.project_segment(pos).0;
             if walk.distance2(pos) > 10.0 * 10.0 {
                 return None;
             }
@@ -536,6 +633,11 @@ pub fn apply(sim: &mut Simulation, command: &WorldCommand) -> Result<(), Rejecti
                 berth: berth.pos,
             });
             transit.berths.insert(id, berth);
+            transit
+                .stops_by_lane
+                .entry(berth.lane)
+                .or_default()
+                .insert(id);
         }
         (TransitRemoveStop { stop }, _) => {
             let map = resources.read::<Map>();
@@ -663,7 +765,14 @@ fn remove_stops(
 ) {
     for stop in removed {
         transit.stops.remove(*stop);
-        transit.berths.remove(stop);
+        if let Some(berth) = transit.berths.remove(stop) {
+            if let Some(stops) = transit.stops_by_lane.get_mut(&berth.lane) {
+                stops.remove(stop);
+                if stops.is_empty() {
+                    transit.stops_by_lane.remove(&berth.lane);
+                }
+            }
+        }
     }
     let updates: Vec<_> = transit
         .lines
@@ -858,6 +967,7 @@ fn revalidate_stops(world: &mut World, resources: &Resources, topology_edited: b
     let now = elapsed_ticks(resources);
     let mut moved = BTreeSet::new();
     let mut removed = BTreeSet::new();
+    let mut changed_lanes = false;
     let Transit { stops, berths, .. } = &mut *transit;
     for (id, stop) in stops.iter_mut() {
         let Some((walk, berth)) = resolve_stop(&map, stop.pos, stop.dir) else {
@@ -865,6 +975,7 @@ fn revalidate_stops(world: &mut World, resources: &Resources, topology_edited: b
             continue;
         };
         let previous = berths.insert(id, berth);
+        changed_lanes |= previous.is_none_or(|previous| previous.lane != berth.lane);
         if previous != Some(berth) || stop.walk_pos != walk || stop.berth != berth.pos {
             stop.walk_pos = walk;
             stop.berth = berth.pos;
@@ -873,6 +984,9 @@ fn revalidate_stops(world: &mut World, resources: &Resources, topology_edited: b
     }
     if !removed.is_empty() {
         remove_stops(world, resources, &map, &mut transit, &removed, now);
+    }
+    if changed_lanes {
+        transit.rebuild_berth_index();
     }
     if !moved.is_empty() || !removed.is_empty() {
         transit.revision += 1;

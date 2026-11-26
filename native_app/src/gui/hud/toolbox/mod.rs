@@ -21,7 +21,7 @@ use crate::gui::{
     close_tool, GuiState, PlacementPreview, Tool, ToolCategory, ToolMode, ToolSelection,
     ToolbarMemory,
 };
-use crate::inputmap::Bindings;
+use crate::inputmap::{Bindings, InputAction};
 use crate::service_icon::ServiceIcon;
 use crate::uiworld::UiWorld;
 use building::BuildingTab;
@@ -291,6 +291,19 @@ fn category_icon(category: ToolCategory) -> (Option<&'static str>, &'static str)
 }
 
 fn category_tooltip(uiw: &UiWorld, category: ToolCategory) -> String {
+    if category == ToolCategory::Roads {
+        let bindings = uiw.read::<Bindings>();
+        return bindings
+            .0
+            .get(&InputAction::PrecisionRoad)
+            .filter(|binding| !binding.0.is_empty())
+            .map_or_else(
+                || category.label().to_owned(),
+                |binding| {
+                    format!("Roads\nHold {binding} for 15° / 8 m snapping and road alignment")
+                },
+            );
+    }
     let binding = category.hotkey().and_then(|action| {
         uiw.read::<Bindings>()
             .0
@@ -582,7 +595,6 @@ mod toolbar1_tests {
             label.starts_with("Bulldozer (") && label.ends_with(')'),
             "{label}"
         );
-        assert_eq!(category_tooltip(&uiw, ToolCategory::Roads), "Roads");
     }
 
     fn widget_rects<T: yakui::widget::Widget>(ui: &Yakui, id: WidgetId, rects: &mut Vec<Rect>) {
@@ -702,5 +714,24 @@ mod toolbar1_tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn roadtools_precision_binding_is_documented_in_roads_tooltip() {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let uiw = UiWorld::with_defaults();
+        let tooltip = category_tooltip(&uiw, ToolCategory::Roads);
+        assert!(
+            tooltip.contains("Shift") && tooltip.contains("15°") && tooltip.contains("8 m"),
+            "{tooltip}"
+        );
+        uiw.write::<Bindings>()
+            .0
+            .get_mut(&InputAction::PrecisionRoad)
+            .unwrap()
+            .0
+            .clear();
+        assert_eq!(category_tooltip(&uiw, ToolCategory::Roads), "Roads");
     }
 }

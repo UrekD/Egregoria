@@ -21,6 +21,9 @@ const MAX_TURN_SEGMENT_PAIRS: usize = 16_384;
 const STOP_DWELL: u64 = game_secs_to_ticks(1);
 const AGE_PRIORITY: u64 = game_secs_to_ticks(60);
 const GAP: f32 = 0.8;
+pub(crate) fn roundabout_exit_storage() -> f32 {
+    super::VehicleKind::Bus.width() + GAP
+}
 const HOLD_TOLERANCE: f32 = 0.04;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -151,6 +154,21 @@ impl JunctionAdmission {
         self.crossings.len()
     }
 
+    pub(crate) fn restore_migrated_crossing(
+        &mut self,
+        map: &Map,
+        owner: EntryOwner,
+        traversal: Option<&Traversable>,
+    ) {
+        // An actor on the outgoing lane can still occupy its saved crossing.
+        // Snapshot validation checks that claim against the relocated actor.
+        if let Some(crossing) = traversal.copied().and_then(Crossing::from_traversal) {
+            if configured(map, crossing.turn.parent).is_some() && map.allows_turn(crossing.turn) {
+                self.crossings.insert(owner, crossing);
+            }
+        }
+    }
+
     pub(crate) fn validate_loaded(
         &mut self,
         map: &Map,
@@ -177,6 +195,9 @@ impl JunctionAdmission {
         self.waiting.retain(|&owner, clock| {
             if self.crossings.contains_key(&owner)
                 || !valid_crossing(clock.crossing)
+                || map
+                    .migrated_roundabout_paths
+                    .contains_key(&TraverseKind::Turn(clock.crossing.turn))
                 || tick.saturating_sub(clock.seen) > 1
             {
                 return false;
@@ -307,6 +328,9 @@ pub(crate) struct JunctionFrame {
 }
 
 pub(crate) fn configured(map: &Map, junction: IntersectionID) -> Option<LightPolicy> {
+    if map.is_yield_roundabout(junction) {
+        return Some(LightPolicy::NoLights);
+    }
     let rules = map.junction_rules(junction)?;
     if rules.approaches().is_empty() {
         return None;
@@ -317,7 +341,7 @@ pub(crate) fn configured(map: &Map, junction: IntersectionID) -> Option<LightPol
 }
 
 pub(super) fn controls_road_decision(map: &Map, it: &Itinerary, position: Vec3) -> bool {
-    if !map.has_junction_rules() {
+    if !map.needs_junction_entry_checks() {
         return false;
     }
     match it.get_travers().map(|traversal| traversal.kind) {
@@ -342,15 +366,15 @@ pub(crate) fn entry_boundary(
     travel: f32,
     half_extent: f32,
 ) -> Option<EntryBoundary> {
-    if !map.has_junction_rules() {
+    if !map.needs_junction_entry_checks() {
         return None;
     }
     let route = it.get_route()?;
     let next = *route.reversed_route.last()?;
     let crossing = Crossing::from_traversal(next)?;
-    let rules = map.junction_rules(crossing.turn.parent)?;
+    let rules = map.junction_rules(crossing.turn.parent);
     let controlled = configured(map, crossing.turn.parent).is_some();
-    if !controlled && rules.allows(crossing.turn) {
+    if !controlled && rules.is_none_or(|rules| rules.allows(crossing.turn)) {
         return None;
     }
     // Endpoint proximity is a lower bound even for curved approach paths.
