@@ -3139,17 +3139,17 @@ mod pathpark_route {
             }
 
             let mut expected = Trace::new(None);
-            expected.reversed_route.push(lane_step(self.to.lane));
-            // Only the presence of route steps affects the starting lane's cut.
-            if self.reversed_route.is_empty() {
-                expected.reversed_route.clear();
-            }
-            while !expected.materialize(from, to, self.from, self.to) {}
+            let same_lane = self.reversed_route.is_empty();
+            while !expected.materialize(from, to, self.from, self.to, same_lane) {}
             expected.end_pos == Some(self.end_pos) && expected.local == self.local
         }
 
         pub fn itinerary(&self, map: &Map) -> Option<Itinerary> {
             self.valid(map).then(|| self.clone().into_itinerary())
+        }
+
+        pub(crate) fn retained_work(&self) -> usize {
+            self.local.len() + self.reversed_route.len() + 1
         }
 
         pub(crate) fn into_itinerary(self) -> Itinerary {
@@ -3248,6 +3248,7 @@ mod pathpark_route {
             to_points: &PolyLine3,
             from: DirectedEndpoint,
             to: DirectedEndpoint,
+            same_lane: bool,
         ) -> bool {
             if self.end_pos.is_none() {
                 let (a, b, start, end, last) = self.end.next(to_points);
@@ -3257,7 +3258,7 @@ mod pathpark_route {
                 return false;
             }
             if !self.local_done {
-                let limit = if self.reversed_route.is_empty() {
+                let limit = if same_lane {
                     to.offset()
                 } else {
                     from_points.length()
@@ -3506,7 +3507,8 @@ mod pathpark_route {
                         trace.lane = arrival.previous;
                         continue;
                     }
-                    if trace.materialize(start, end, self.from, self.to) {
+                    let same_lane = trace.reversed_route.is_empty();
+                    if trace.materialize(start, end, self.from, self.to, same_lane) {
                         let trace = self.trace.take().unwrap();
                         return Feasible(DirectedPlan {
                             from: self.from,

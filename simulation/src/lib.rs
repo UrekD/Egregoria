@@ -1118,10 +1118,7 @@ impl Simulation {
         } else {
             &data._header.version
         };
-        if (enveloped && payload_release != version)
-            || (bytes.starts_with(&PATHPARK_SLOT_MAGIC)
-                && data._header.version != PATHPARK_SNAPSHOT_VERSION)
-        {
+        if enveloped && payload_release != version {
             return Err(SaveLoadError::Corrupt {
                 version: Some(version),
                 reason: "snapshot payload version does not match the slot header".into(),
@@ -1194,7 +1191,7 @@ impl Simulation {
     ) -> Result<SlotCapture, SaveLoadError> {
         let header = RegistrySlotSnapshotHeader {
             slot: SlotSnapshotHeader {
-                magic: PATHPARK_SLOT_MAGIC,
+                magic: REGISTRY_SLOT_MAGIC,
                 version: VERSION.to_owned(),
                 revision,
             },
@@ -1420,7 +1417,6 @@ impl SaveHeader {
 // Simulation serialization inside the slot envelope for legacy and network callers.
 const SLOT_SNAPSHOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x01";
 const REGISTRY_SLOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x02";
-const PATHPARK_SLOT_MAGIC: [u8; 12] = *b"\xffEGREGORIA\0\x03";
 
 #[derive(Serialize, Deserialize)]
 struct SlotSnapshotHeader {
@@ -1476,8 +1472,7 @@ fn check_prototype_registry(fingerprint: Option<u64>) -> Result<(), SaveLoadErro
 }
 
 fn snapshot_header(mut bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SaveLoadError> {
-    let slot = if bytes.starts_with(&REGISTRY_SLOT_MAGIC) || bytes.starts_with(&PATHPARK_SLOT_MAGIC)
-    {
+    let slot = if bytes.starts_with(&REGISTRY_SLOT_MAGIC) {
         let header: RegistrySlotSnapshotHeader =
             Bincode::decode_reader(&mut bytes).map_err(corrupt_header)?;
         Some((header.slot, Some(header.registry)))

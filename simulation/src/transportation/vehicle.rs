@@ -611,6 +611,7 @@ mod pathpark_driveway {
     struct ExitRequest {
         search: DirectedSearch,
         ready: Option<DirectedPlan>,
+        cleanup_work: usize,
         deadline: u64,
     }
 
@@ -803,6 +804,7 @@ mod pathpark_driveway {
             *exit = Some(ExitRequest {
                 search: DirectedSearch::new(facility.geometry.release, target),
                 ready: None,
+                cleanup_work: 0,
                 deadline: crate::map_dynamic::transit::elapsed_ticks(&sim.resources)
                     .0
                     .saturating_add(EXIT_SEARCH_TICKS),
@@ -1041,6 +1043,11 @@ mod pathpark_driveway {
                                 || request.deadline <= now
                                 || request.deadline.saturating_sub(now) > EXIT_SEARCH_TICKS
                                 || request.search.exhausted()
+                                || (request.cleanup_work != 0
+                                    && (!request.search.stale(map)
+                                        || request.ready.as_ref().is_none_or(|plan| {
+                                            request.cleanup_work >= plan.retained_work()
+                                        })))
                                 || matches!(
                                     blocker,
                                     Some(
@@ -1054,7 +1061,7 @@ mod pathpark_driveway {
                         if actor.collider.is_some()
                             || !matches!(actor.vehicle.state, VehicleState::ParkedAtDepot)
                             || actor.trans != facility.geometry.into.pose(MOTION_TICKS)
-                            || actor.speed.0.abs() > 0.001
+                            || !(actor.speed.0.abs() <= 0.001)
                         {
                             return Err("invalid stored driveway vehicle");
                         }
@@ -1072,10 +1079,11 @@ mod pathpark_driveway {
                     || !actor.speed.0.is_finite()
                     || actor.speed.0.abs() > 0.2
                     || !(actor.trans.pos.distance2(expected.pos) <= 0.15_f32.powi(2)
-                        && actor.trans.dir.dot(expected.dir) >= 0.99
+                        && actor.trans.dir.distance2(expected.dir) <= 0.02
                         && pos.distance2(actor.trans.pos.xy()) <= 0.15_f32.powi(2)
                         && (collider.height - actor.trans.pos.z).abs() <= 0.15
-                        && collider.dir.dot(actor.trans.dir.xy()) >= 0.99)
+                        && collider.dir.distance2(actor.trans.dir.xy()) <= 0.02
+                        && collider.speed.abs() <= 0.2)
                 {
                     return Err("invalid saved driveway collider pose or owner");
                 }
@@ -1157,7 +1165,20 @@ mod pathpark_driveway {
                     }
                     let mut slice = EXIT_WORK_PER_TICK;
                     if request.search.stale(map) {
-                        request.ready = None;
+                        if let Some(plan) = &request.ready {
+                            while request.cleanup_work < plan.retained_work() {
+                                if !request.search.charge(&mut slice) {
+                                    if request.search.exhausted() {
+                                        *exit = None;
+                                        *blocker = Some(DrivewayBlocker::BudgetExhausted);
+                                    }
+                                    return false;
+                                }
+                                request.cleanup_work += 1;
+                            }
+                            request.ready = None;
+                            request.cleanup_work = 0;
+                        }
                         *blocker = None;
                     }
                     if request.ready.is_none() {
@@ -1182,6 +1203,7 @@ mod pathpark_driveway {
                     {
                         Some(false) => {
                             let route = request.ready.take().unwrap();
+                            actor.trans = geometry.out.pose(0);
                             let collider = grid.insert(
                                 actor.trans.pos.xy(),
                                 TransportState {
