@@ -41,8 +41,11 @@ pub enum RemovalCause {
     Collapse,
 }
 
+/// Tears down a fixture's site and settles its entity command buffers.
 pub fn remove_site(sim: &mut Simulation, building: BuildingID, _cause: RemovalCause) -> bool {
-    lifecycle::remove_site(sim, building)
+    let removed = lifecycle::remove_site(sim, building);
+    crate::utils::scheduler::drain_commands(sim);
+    removed
 }
 
 pub fn close_business(sim: &mut Simulation, company: CompanyID) -> bool {

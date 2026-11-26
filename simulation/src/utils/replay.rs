@@ -152,7 +152,7 @@ pub struct Replay {
     timeline: Option<ReplayTimeline>,
     #[serde(skip)]
     obsolete_recording_discarded: bool,
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    #[serde(default)]
     migrated_city: bool,
     #[serde(skip)]
     migrated_from_legacy_slot: bool,

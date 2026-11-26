@@ -163,7 +163,9 @@ impl SnapshotSchema {
         if self == Self::Current {
             return Ok(installed.fingerprint());
         }
-        if installed.pre_fire_fingerprint() != STOCK_PRE_FIRE_REGISTRY {
+        let projection = installed.pre_fire_fingerprint();
+        let pre_scale_stock = self == Self::PreScale && projection == STOCK_PRE_SCALE_REGISTRY;
+        if projection != STOCK_PRE_FIRE_REGISTRY && !pre_scale_stock {
             return Err(SaveLoadError::PrototypeRegistry);
         }
         Ok(if self == Self::PreScale { STOCK_PRE_SCALE_REGISTRY } else { STOCK_PRE_FIRE_REGISTRY })
