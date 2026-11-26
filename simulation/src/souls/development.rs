@@ -1002,6 +1002,90 @@ mod tests {
     }
 
     #[test]
+    fn zones2_z2_full_downstairs_basket_beats_more_groceries_elsewhere() {
+        use crate::economy::{DailyEconomyMetrics, Market, TripPurpose};
+        use crate::transportation::Location;
+        use prototypes::ItemID;
+
+        with_profiles(
+            concat!(
+                module_path!(),
+                "::zones2_z2_full_downstairs_basket_beats_more_groceries_elsewhere"
+            ),
+            || {
+                let (mut test, _) = street();
+                let mixed = place(&mut test.g, ZoneKind::MixedUse, 280.0);
+                let commercial = place(&mut test.g, ZoneKind::Commercial, 345.0);
+                add_souls_to_empty_buildings(&mut test.g);
+                let shopper = spawn_human(&mut test.g, mixed).unwrap();
+                let groceries = ItemID::new("groceries");
+                let retail = ItemID::new("retail-goods");
+                {
+                    let infos = test.g.read::<BuildingInfos>();
+                    let map = test.g.map();
+                    let mut market = test.g.write::<Market>();
+                    for (store, item, qty) in [
+                        (mixed, groceries, 2),
+                        (mixed, retail, 4),
+                        (commercial, groceries, 4),
+                        (commercial, retail, 2),
+                    ] {
+                        let seller = infos.owner(store).unwrap();
+                        market.produce(seller, item, qty);
+                        market.sell_all(seller, map.get(store).unwrap().door_pos.xy(), item, 0);
+                    }
+                }
+                test.g.world.edit_human(shopper, |human| {
+                    human.household.next_shop = 0;
+                    human.decision.wait = 0;
+                });
+
+                test.tick_fast();
+
+                let human = test.g.get(shopper).unwrap();
+                assert_eq!(human.location, Location::Building(mixed));
+                assert_eq!(human.household.units(groceries), 2);
+                assert_eq!(human.household.units(retail), 4);
+
+                let second_shopper = spawn_human(&mut test.g, mixed).unwrap();
+                let (downstairs, other_seller) = {
+                    let infos = test.g.read::<BuildingInfos>();
+                    (
+                        infos.owner(mixed).unwrap(),
+                        infos.owner(commercial).unwrap(),
+                    )
+                };
+                let door = test.g.map().get(mixed).unwrap().door_pos.xy();
+                {
+                    let mut market = test.g.write::<Market>();
+                    market.produce(downstairs, groceries, 2);
+                    market.sell_all(downstairs, door, groceries, 0);
+                }
+                test.g.world.edit_human(second_shopper, |human| {
+                    human.household.next_shop = 0;
+                    human.decision.wait = 0;
+                });
+                test.tick_fast();
+                assert_eq!(
+                    test.g
+                        .get(second_shopper)
+                        .unwrap()
+                        .household
+                        .basket_seller(),
+                    Some(other_seller),
+                    "a shelf with too little stock still competes on the usual ranking"
+                );
+
+                let metrics = test.g.read::<DailyEconomyMetrics>();
+                let day = &metrics.days[&0];
+                assert_eq!(day.local_pickups, 1);
+                assert_eq!(day.baskets_filled, Some(1));
+                assert!(!day.trips_by_purpose.contains_key(&TripPurpose::Shopping));
+            },
+        );
+    }
+
+    #[test]
     fn zones2_z2_downstairs_deposit_is_local_and_the_closed_shop_leaves_housing() {
         use crate::economy::{DailyEconomyMetrics, Market, TripPurpose};
         use crate::map::GrowableBusinessState;

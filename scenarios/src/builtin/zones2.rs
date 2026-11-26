@@ -1527,9 +1527,7 @@ fn compare_economies(mixed: &Observation, pure: &Observation) -> Result<(), Stri
         || mixed.mixed_receipt_units == 0
         || mixed.productive_recipients == 0
         || pure.external_shops == 0
-        // P6 owner decision (2026-11-26): lower the reduction gate from 10% to 8%.
-        // Observed 9.2% (0.808 vs 0.890 trips/resident-day) with all MX baskets filled.
-        || trips(mixed) > 0.92 * trips(pure)
+        || trips(mixed) > 0.90 * trips(pure)
         || filled(mixed) < 0.8
         || filled(mixed) + 0.05 < filled(pure)
         || stockout(mixed) > 1.5
@@ -1571,7 +1569,7 @@ fn zones2_staffed_frontage_teardown_replays() {
 }
 
 #[test]
-fn zones2_shopping_gate_accepts_eight_percent_reduction() {
+fn zones2_shopping_gate_requires_ten_percent_reduction() {
     let pure = Observation {
         resident_days: 100.0,
         external_shops: 100,
@@ -1585,7 +1583,7 @@ fn zones2_shopping_gate_accepts_eight_percent_reduction() {
         ..Observation::default()
     };
     let mut mixed = Observation {
-        external_shops: 92,
+        external_shops: 90,
         local_pickups: 4,
         road_deadlines: RoadDeadlineCounts { due: 10, on_time: 10 },
         mixed_receipt_units: 10,
@@ -1593,7 +1591,7 @@ fn zones2_shopping_gate_accepts_eight_percent_reduction() {
         ..pure
     };
     compare_economies(&mixed, &pure).unwrap();
-    mixed.external_shops = 93;
+    mixed.external_shops = 91;
     assert!(compare_economies(&mixed, &pure).is_err());
 }
 

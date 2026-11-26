@@ -1330,7 +1330,7 @@ impl Market {
         now: u64,
         reachable: impl FnMut(SoulID) -> Option<BuildingID>,
     ) -> Result<(BasketReservation, [u32; 2]), BasketFailure> {
-        self.reserve_basket_preferred(shopper, origin, radius, request, now, None, reachable)
+        self.reserve_basket_preferred(shopper, origin, radius, request, now, None, false, reachable)
     }
 
     pub(crate) fn reserve_basket_preferred(
@@ -1341,10 +1341,12 @@ impl Market {
         request: BasketRequest,
         now: u64,
         preferred: Option<SoulID>,
+        at_home: bool,
         mut reachable: impl FnMut(SoulID) -> Option<BuildingID>,
     ) -> Result<(BasketReservation, [u32; 2]), BasketFailure> {
         struct Candidate {
             throttled: bool,
+            full_local_basket: bool,
             seller: SoulID,
             pos: Vec2,
             distance: OrderedFloat<f32>,
@@ -1419,6 +1421,10 @@ impl Market {
                 }
                 candidates.push(Candidate {
                     throttled: self.reserved_this_tick.contains(&seller),
+                    // Retail can cover missing groceries after the goods need is met.
+                    full_local_basket: at_home
+                        && preferred == Some(seller)
+                        && goods == goods_target,
                     seller,
                     pos,
                     distance,
@@ -1441,6 +1447,7 @@ impl Market {
         candidates.sort_unstable_by_key(|candidate| {
             (
                 candidate.throttled,
+                !candidate.full_local_basket,
                 Reverse(candidate.food),
                 Reverse(candidate.food + candidate.goods),
                 preferred != Some(candidate.seller),

@@ -821,6 +821,7 @@ fn start_basket(
             request,
             now,
             preferred,
+            h.location == Location::Building(h.home.house),
             reachable,
         )
     } else {
