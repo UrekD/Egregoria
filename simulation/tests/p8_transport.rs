@@ -1,4 +1,4 @@
-//! Stock-seam reductions for P8. Run explicit reds with --ignored --nocapture.
+//! Physical boundary regressions for P8 freight and rail.
 
 use std::sync::Once;
 
@@ -30,7 +30,6 @@ fn consist() -> Vec<RollingStockID> {
 }
 
 #[test]
-#[ignore = "P8 R1: conflicting spawn must reject before publishing or charging"]
 fn p8_rail_shared_footprint() {
     initialize();
     let mut sim = Simulation::new_authored_flat(8, 0).unwrap();
@@ -53,8 +52,8 @@ fn p8_rail_shared_footprint() {
         dist,
     };
 
-    sim.apply_commands([&spawn(100.0), &spawn(250.0)]);
-    assert_eq!(sim.read::<CommandOutcomes>().accepted, [0, 1]);
+    sim.apply_commands([&spawn(100.0), &spawn(100.0), &spawn(250.0)]);
+    assert_eq!(sim.read::<CommandOutcomes>().accepted, [0, 2]);
     assert_eq!(sim.world().trains.len(), 2, "independent starts must fit");
     assert_eq!(sim.world().wagons.len(), 4);
 
@@ -222,25 +221,21 @@ fn p8_freight_physical_boundary_control() {
 }
 
 #[test]
-#[ignore = "P8 R1/F: physical berth proof must survive an itinerary ending early"]
 fn p8_freight_physical_boundary_short_of_berth() {
     freight_call(Some(Interruption::BeforeBerth));
 }
 
 #[test]
-#[ignore = "P8 R1/F: an apparent arrival on the wrong deck must leave cargo untouched"]
 fn p8_freight_physical_boundary_wrong_deck() {
     freight_call(Some(Interruption::WrongDeck));
 }
 
 #[test]
-#[ignore = "P8 R1/F: a train may only be freed after crossing the outside exit"]
 fn p8_freight_physical_boundary_short_of_exit() {
     freight_call(Some(Interruption::BeforeExit));
 }
 
 #[test]
-#[ignore = "P8 R1: retain the junction claim while the rear is stopped"]
 fn p8_rail_stopped_tail_retains_junction() {
     let (mut sim, _, _, _) = freight_fixture();
     let train = sim.world().trains.keys().next().unwrap();
@@ -282,7 +277,7 @@ fn p8_rail_stopped_tail_retains_junction() {
     };
     let before_poses = poses(&sim);
     let lead = &mut sim.world_mut_unchecked().trains[train];
-    lead.it = Itinerary::NONE;
+    let route = std::mem::take(&mut lead.it);
     lead.speed.0 = 0.0;
     let lead_position = lead.trans.pos;
 
@@ -302,6 +297,130 @@ fn p8_rail_stopped_tail_retains_junction() {
     assert_eq!(
         after,
         Some(&train),
-        "stock expired a claim without measured rear clearance"
+        "a held rear still occupies the junction"
     );
+    drop(reservations);
+
+    sim.world_mut_unchecked().trains[train].it = route;
+    for _ in 0..500 {
+        sim.tick(&mut schedule, &[]);
+        let claim = sim.read::<TrainReservations>();
+        if !claim
+            .localisations
+            .get(&TraverseKind::Turn(turn))
+            .is_some_and(|owners| owners.contains_key(&train))
+        {
+            assert_ne!(sim.world().trains[train].trans.pos, lead_position);
+            return;
+        }
+    }
+    panic!("the junction claim was not released after the rear moved clear");
+}
+
+#[test]
+fn p8_freight_terminal_policy_holds_accepted_exports_across_reload() {
+    use common::saveload::{Bincode, Encoder};
+    use simulation::economy::cargo::{Endpoint, FreightStage, FreightTerminalPolicy, FreightTrace};
+    use simulation::world_command::Rejection;
+    use simulation::SoulID;
+
+    let (mut sim, station, _, _) = freight_fixture();
+    let terminal = Endpoint {
+        soul: SoulID::FreightStation(station),
+        building: sim.world().freight_stations[station].f.building,
+    };
+    let command = |revision, policy| WorldCommand::SetFreightTerminalPolicy {
+        terminal,
+        expected_policy_revision: revision,
+        policy,
+    };
+    let open = FreightTerminalPolicy::default();
+    let held = FreightTerminalPolicy {
+        admit_imports: false,
+        admit_exports: false,
+        max_calls: 0,
+        max_truck_runs: 0,
+    };
+    let invalid = FreightTerminalPolicy {
+        max_calls: 3,
+        ..open
+    };
+    sim.apply_commands([&command(0, invalid), &command(0, held), &command(0, open)]);
+    let outcomes = sim.read::<CommandOutcomes>();
+    assert_eq!(outcomes.accepted, [1]);
+    assert_eq!(
+        outcomes.rejections_for(0),
+        [("SetFreightTerminalPolicy", Rejection::InvalidFreightPolicy)]
+    );
+    assert_eq!(
+        outcomes.rejections_for(2),
+        [("SetFreightTerminalPolicy", Rejection::StaleFreightPolicy)]
+    );
+    drop(outcomes);
+
+    let mut schedule = Simulation::schedule();
+    for _ in 0..60 {
+        sim.tick(&mut schedule, &[]);
+    }
+    assert!(sim.world().freight_stations[station].f.trains.is_empty());
+    assert_eq!(sim.world().freight_stations[station].f.waiting_cargo, 20);
+    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
+    assert_eq!(sim.hashes(), resumed.hashes());
+    assert_eq!(
+        resumed
+            .read::<FreightTrace>()
+            .terminal_policy(terminal)
+            .policy,
+        held
+    );
+
+    // Reopening dispatch allows accepted stock to move even while new export
+    // admissions stay paused.
+    resumed.apply_commands([&command(
+        1,
+        FreightTerminalPolicy {
+            max_calls: 1,
+            ..held
+        },
+    )]);
+    let mut checked_active_checkpoint = false;
+    for _ in 0..24_000 {
+        resumed.tick(&mut schedule, &[]);
+        let trains = &resumed.world().freight_stations[station].f.trains;
+        if !checked_active_checkpoint
+            && trains
+                .iter()
+                .any(|(_, state)| matches!(state, FreightTrainState::Moving))
+        {
+            let from_snapshot: Simulation =
+                Bincode::decode(&Bincode::encode(&resumed).unwrap()).unwrap();
+            assert_eq!(resumed.hashes(), from_snapshot.hashes());
+            resumed = from_snapshot;
+            checked_active_checkpoint = true;
+        }
+        let trace = resumed.read::<FreightTrace>();
+        let page = trace.terminal_view(terminal);
+        if let Some(record) = page
+            .rows
+            .iter()
+            .find(|record| record.stage == FreightStage::Exited)
+        {
+            assert!(checked_active_checkpoint);
+            assert_eq!(record.fragment.units, 20);
+            assert!(
+                record.fragment.item.is_none(),
+                "legacy stock has unknown SKU"
+            );
+            assert_eq!(resumed.world().freight_stations[station].f.waiting_cargo, 0);
+            assert_eq!(
+                trace
+                    .corridor_report(record.fragment.call.unwrap().outside_gate)
+                    .rows[0]
+                    .stage,
+                FreightStage::Exited
+            );
+            return;
+        }
+    }
+    panic!("reopened terminal did not move the accepted shipment");
 }

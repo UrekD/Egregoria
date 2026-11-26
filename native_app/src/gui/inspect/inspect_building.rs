@@ -1,6 +1,6 @@
 use goryak::{
-    dragvalue, error, fixed_spacer, mincolumn, minrow, on_secondary_container, primary, textc,
-    ProgressBar, VertScrollSize, Window,
+    dragvalue, error, fixed_spacer, mincolumn, minrow, on_secondary_container, primary,
+    selectable_label_primary, textc, ProgressBar, VertScrollSize, Window,
 };
 use prototypes::{
     try_prototype, GameDuration, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID, Tick,
@@ -8,7 +8,9 @@ use prototypes::{
 use simulation::diagnostics::{
     building_diagnostics, elapsed_tick, BuildingBlocker, ImportStatus, RecipeBlocker,
 };
-use simulation::economy::cargo::CargoBook;
+use simulation::economy::cargo::{
+    CargoBook, DemandKey, Endpoint, FreightRecord, FreightStage, FreightTrace,
+};
 use simulation::economy::Market;
 use simulation::map::{
     Building, BuildingID, BuildingKind, Density, GrowableBusinessState, Zone, MAX_ZONE_AREA,
@@ -23,7 +25,9 @@ use std::borrow::Cow;
 use yakui::widgets::Pad;
 use yakui::Vec2;
 
-use crate::gui::inspect::{entity_link, inspect_needs, inspect_utility, inspect_warehouse};
+use crate::gui::inspect::{
+    building_link, entity_link, inspect_needs, inspect_utility, inspect_warehouse,
+};
 use crate::gui::item_icon_yakui;
 use crate::gui::zoning::zone_name;
 use crate::uiworld::UiWorld;
@@ -333,6 +337,75 @@ fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         label(format!("Imports for delivery: {}", lines.join(", ")));
     }
 
+    let terminal = Endpoint {
+        soul: SoulID::FreightStation(owner),
+        building: b.id,
+    };
+    let trace = sim.read::<FreightTrace>();
+    let setting = trace.terminal_policy(terminal);
+    let runs = sim.read::<CargoBook>().station_truck_runs(terminal);
+    label(format!(
+        "{runs} active truck runs · {} active train calls",
+        freight.f.trains.len()
+    ));
+    let mut policy = setting.policy;
+    if uiworld.can_author() {
+        minrow(6.0, || {
+            if selectable_label_primary(policy.admit_imports, "Accept imports").clicked {
+                policy.admit_imports = !policy.admit_imports;
+            }
+            if selectable_label_primary(policy.admit_exports, "Accept exports").clicked {
+                policy.admit_exports = !policy.admit_exports;
+            }
+        });
+        minrow(6.0, || {
+            label("Concurrent calls");
+            for limit in 0..=2 {
+                if selectable_label_primary(policy.max_calls == limit, &limit.to_string()).clicked {
+                    policy.max_calls = limit;
+                }
+            }
+        });
+        minrow(6.0, || {
+            label("Truck runs");
+            for limit in 0..=6 {
+                if selectable_label_primary(policy.max_truck_runs == limit, &limit.to_string())
+                    .clicked
+                {
+                    policy.max_truck_runs = limit;
+                }
+            }
+        });
+        if policy != setting.policy {
+            uiworld
+                .commands()
+                .push(WorldCommand::SetFreightTerminalPolicy {
+                    terminal,
+                    expected_policy_revision: setting.revision,
+                    policy,
+                });
+        }
+    } else {
+        label(format!(
+            "Up to {} concurrent calls and {} truck runs",
+            policy.max_calls, policy.max_truck_runs
+        ));
+    }
+    if !policy.admit_imports
+        || !policy.admit_exports
+        || policy.max_calls == 0
+        || policy.max_truck_runs == 0
+    {
+        label("Accepted cargo remains queued when a limit is reached.");
+    }
+    let recent = trace.terminal_view(terminal);
+    if !recent.rows.is_empty() {
+        label("Recent freight");
+        for record in recent.rows.iter().take(6) {
+            render_freight_record(uiworld, sim, record, b.id);
+        }
+    }
+
     fixed_spacer((0.0, 10.0));
     label("Trains:");
     for (tid, state) in &freight.f.trains {
@@ -351,6 +424,47 @@ fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
             }
         });
     }
+}
+
+fn render_freight_record(
+    uiworld: &UiWorld,
+    sim: &Simulation,
+    record: &FreightRecord,
+    site: BuildingID,
+) {
+    let item = record
+        .fragment
+        .item
+        .and_then(try_prototype)
+        .map_or("Legacy cargo", |item| item.label.as_str());
+    let stage = match record.stage {
+        FreightStage::Reserved => "Reserved",
+        FreightStage::InboundRail => "Inbound by rail",
+        FreightStage::TerminalStock => "Received by terminal",
+        FreightStage::OutboundTruck => "Loaded onto truck",
+        FreightStage::Delivered => "Delivered",
+        FreightStage::Returned => "Returned",
+        FreightStage::ExportStaged => "Ready for export",
+        FreightStage::ExportLoaded => "Loaded onto train",
+        FreightStage::OutboundRail => "Outbound by rail",
+        FreightStage::Exited => "Exported by rail",
+        FreightStage::WrittenOff => "Written off",
+    };
+    label(format!("{} {item} · {stage}", record.fragment.units));
+    minrow(5.0, || {
+        if record.terminal.building != site {
+            building_link(uiworld, sim, record.terminal.building);
+        }
+        if let Some(call) = record.fragment.call {
+            entity_link(uiworld, sim, call.train);
+        }
+        if let Some(truck) = record.truck {
+            entity_link(uiworld, sim, truck);
+        }
+        if let Some(receiver) = record.receiver.filter(|receiver| receiver.building != site) {
+            building_link(uiworld, sim, receiver.building);
+        }
+    });
 }
 
 fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
@@ -405,6 +519,27 @@ fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
 
     if let Some(ref r) = proto.recipe {
         render_recipe(uiworld, r);
+        let trace = sim.read::<FreightTrace>();
+        let mut rows = r
+            .consumption
+            .iter()
+            .flat_map(|input| {
+                trace
+                    .trace_demand(DemandKey {
+                        owner: c_id,
+                        building: b.id,
+                        item: input.id,
+                    })
+                    .rows
+            })
+            .take(6)
+            .peekable();
+        if rows.peek().is_some() {
+            label("Supply chain");
+            for record in rows {
+                render_freight_record(uiworld, sim, &record, b.id);
+            }
+        }
     }
 
     if let Some(net_id) = map.electricity.net_id(b.id) {

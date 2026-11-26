@@ -1,16 +1,16 @@
 use crate::map::{
-    Lane, LaneID, LaneKind, Map, PathKind, Pathfinder, RoadID, Traversable, TraverseDirection,
-    TraverseKind,
+    Lane, LaneID, Map, PathKind, Pathfinder, RoadID, Traversable, TraverseDirection, TraverseKind,
 };
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
 use crate::transportation::traffic_metrics::within_lane;
+use crate::transportation::train::{can_move_train, record_train_motion, TrainReservations};
 use crate::transportation::{
     put_pedestrian_in_transport_grid, Location, RoadThroughput, RoadUserKind, TransportGrid,
     VehicleKind,
 };
 use crate::utils::resources::Resources;
-use crate::world::TrainID;
+use crate::world::{TrainID, VehicleID};
 use crate::{HumanWork, World};
 use egui_inspect::egui::Ui;
 use egui_inspect::{Inspect, InspectArgs};
@@ -374,6 +374,24 @@ impl Itinerary {
         Self::route_from(tick, start, start_lane, target, map, PathKind::Vehicle)
     }
 
+    pub(crate) fn route_rail(
+        tick: Tick,
+        map: &Map,
+        start: Vec3,
+        start_lane: LaneID,
+        end_lane: LaneID,
+        offset: f32,
+    ) -> Option<Self> {
+        Self::route_from(
+            tick,
+            start,
+            start_lane,
+            ItineraryTarget::DirectedLane(end_lane, offset),
+            map,
+            PathKind::Rail,
+        )
+    }
+
     fn route_to_target(
         tick: Tick,
         start: Vec3,
@@ -400,7 +418,7 @@ impl Itinerary {
             ItineraryTarget::Position(end) => (pathkind.nearest_lane(map, end)?, end),
             ItineraryTarget::DirectedLane(lane, offset) => (
                 lane,
-                driving_lane_points(map, lane, offset)?.point_along(offset),
+                directed_lane_points(map, lane, offset, pathkind)?.point_along(offset),
             ),
         };
 
@@ -411,9 +429,12 @@ impl Itinerary {
                 ItineraryTarget::Position(_) => pathkind
                     .local_route(map, start_lane, start, end)
                     .map(PolyLine3::into_vec),
-                ItineraryTarget::DirectedLane(lane, offset) => {
-                    directed_local_path(driving_lane_points(map, lane, offset)?, start, offset, end)
-                }
+                ItineraryTarget::DirectedLane(lane, offset) => directed_local_path(
+                    directed_lane_points(map, lane, offset, pathkind)?,
+                    start,
+                    offset,
+                    end,
+                ),
             };
             if let Some(mut local_path) = local_path {
                 local_path.reverse();
@@ -504,9 +525,11 @@ impl Itinerary {
                             .unwrap_or(points)
                             .into_vec(),
                         ItineraryTarget::DirectedLane(lane, offset) => {
-                            let path = driving_lane_points(map, lane, offset).and_then(|points| {
-                                directed_local_path(points, points.first(), offset, r.end_pos)
-                            });
+                            let path = directed_lane_points(map, lane, offset, pathkind).and_then(
+                                |points| {
+                                    directed_local_path(points, points.first(), offset, r.end_pos)
+                                },
+                            );
                             let Some(path) = path else {
                                 *self =
                                     Self::retry_after_edit(pathkind, r.target, self.road_approach);
@@ -637,12 +660,33 @@ impl Itinerary {
 
     fn update_with_route(
         &mut self,
+        position: Vec3,
+        dist_to_move: f32,
+        time: u32,
+        map: &Map,
+        route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
+        on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
+    ) -> Vec3 {
+        self.update_observed(
+            position,
+            dist_to_move,
+            time,
+            map,
+            route,
+            on_road_entry,
+            |_, _, _| true,
+        )
+    }
+
+    fn update_observed(
+        &mut self,
         mut position: Vec3,
         mut dist_to_move: f32,
         time: u32,
         map: &Map,
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
         mut on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
+        mut move_on: impl FnMut(Traversable, Vec3, Vec3) -> bool,
     ) -> Vec3 {
         if on_road_entry.is_some()
             && matches!(self.road_approach, RoadApproach::Unchecked)
@@ -662,6 +706,12 @@ impl Itinerary {
             // A tolerance snap can round the remaining budget below -0.01.
             // Coincident turn/lane waypoints still need to advance the route.
             if dist <= (dist_to_move + 0.01).max(0.0) {
+                if self
+                    .get_travers()
+                    .is_some_and(|&traversal| !move_on(traversal, position, p))
+                {
+                    return position;
+                }
                 self.observe_road_entry(position, p, map, &mut on_road_entry);
                 dist_to_move -= dist;
                 position = p;
@@ -688,6 +738,12 @@ impl Itinerary {
             }
 
             let next = position + (p - position).normalize_to(dist_to_move.max(0.0));
+            if self
+                .get_travers()
+                .is_some_and(|&traversal| !move_on(traversal, position, next))
+            {
+                return position;
+            }
             self.observe_road_entry(position, next, map, &mut on_road_entry);
             return next;
         }
@@ -846,8 +902,17 @@ impl Itinerary {
 }
 
 fn driving_lane_points(map: &Map, lane: LaneID, offset: f32) -> Option<&PolyLine3> {
+    directed_lane_points(map, lane, offset, PathKind::Vehicle)
+}
+
+fn directed_lane_points(
+    map: &Map,
+    lane: LaneID,
+    offset: f32,
+    kind: PathKind,
+) -> Option<&PolyLine3> {
     let lane = map.get(lane)?;
-    (lane.kind == LaneKind::Driving && (0.0..=lane.points.length()).contains(&offset))
+    (kind.authorized_lane(lane.kind) && (0.0..=lane.points.length()).contains(&offset))
         .then_some(&lane.points)
 }
 
@@ -981,8 +1046,9 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     let tick = elapsed_ticks(resources).0;
     throughput.begin_tick(map, tick);
 
+    let mut freight = resources.write::<crate::economy::cargo::FreightTrace>();
     let mut update =
-        |it: &mut Itinerary, pos: &mut Vec3, speed: f32, kind: Option<RoadUserKind>| {
+        |it: &mut Itinerary, pos: &mut Vec3, speed: f32, kind: Option<RoadUserKind>, truck: Option<VehicleID>| {
             if it.is_inert() {
                 return;
             }
@@ -998,13 +1064,19 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                     }
                 }
             });
-            *pos = it.update_with_route(
+            *pos = it.update_observed(
                 *pos,
                 speed * DELTA,
                 time.seconds,
                 map,
                 |start, target, kind| failures.route(time.tick, start, target, map, kind),
                 record,
+                |traversal, from, to| {
+                    if let Some(truck) = truck {
+                        freight.observe_truck_motion(truck, traversal.kind, from, to);
+                    }
+                    true
+                },
             );
         };
     world.humans.edit_active(HumanWork::Itinerary, |_, human| {
@@ -1012,7 +1084,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         let kind = outside.then_some(RoadUserKind::Pedestrian);
         let speed = human.speed.0;
         let (itinerary, pos) = human.itinerary_mut();
-        update(itinerary, pos, speed, kind);
+        update(itinerary, pos, speed, kind, None);
         if !outside {
             return;
         }
@@ -1034,10 +1106,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             _ => {}
         }
     });
-    for train in world.trains.values_mut() {
-        update(&mut train.it, &mut train.trans.pos, train.speed.0, None);
-    }
-    for vehicle in world.vehicles.values_mut() {
+    for (id, vehicle) in world.vehicles.iter_mut() {
         let kind = match vehicle.vehicle.kind {
             VehicleKind::Car => RoadUserKind::Car,
             VehicleKind::Truck => RoadUserKind::Truck,
@@ -1048,12 +1117,62 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             &mut vehicle.trans.pos,
             vehicle.speed.0,
             Some(kind),
+            matches!(vehicle.vehicle.kind, VehicleKind::Truck).then_some(id),
         );
     }
 
-    world.trains.values_mut().for_each(|train| {
-        train.leader.past.push(train.trans.pos);
-    });
+    let reservations = resources.read::<TrainReservations>();
+    let lengths = world
+        .trains
+        .iter()
+        .map(|(id, train)| (id, train.locomotive.length - 10.0))
+        .collect();
+    for (id, train) in world.trains.iter_mut() {
+        if !freight.may_move(id) {
+            train.speed.0 = 0.0;
+            continue;
+        }
+        if train.speed.0 <= 0.0 || train.it.is_inert() {
+            continue;
+        }
+        train.trans.pos = train.it.update_observed(
+            train.trans.pos,
+            train.speed.0 * DELTA,
+            time.seconds,
+            map,
+            |_, _, _| None,
+            None::<fn(RoadID, PathKind)>,
+            |traversal, from, to| {
+                let Some(track) = traversal.raw_points(map) else {
+                    return false;
+                };
+                if !can_move_train(
+                    &reservations,
+                    &lengths,
+                    id,
+                    traversal.kind,
+                    track,
+                    &train.res,
+                    to,
+                ) {
+                    return false;
+                }
+                if from != to {
+                    record_train_motion(
+                        &mut train.res,
+                        train.locomotive.length,
+                        map,
+                        traversal,
+                        from,
+                        to,
+                    );
+                    train.leader.past.push(to);
+                    freight.observe_motion(id, traversal.kind, from, to, tick);
+                }
+                true
+            },
+        );
+    }
 
     world.wagons.values_mut().for_each(|wagon| {
         let leader = &unwrap_ret!(world.trains.get(wagon.itfollower.leader)).leader;
@@ -1072,7 +1191,7 @@ thread_local! {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::map::{LanePatternBuilder, ProjectFilter, TurnKind};
+    use crate::map::{LaneKind, LanePatternBuilder, ProjectFilter, TurnKind};
     use crate::souls::human::spawn_human;
     use crate::tests::TestCtx;
     use crate::transportation::{spawn_truck_at_depot, Location};

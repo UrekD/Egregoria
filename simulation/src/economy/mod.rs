@@ -191,6 +191,7 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
         components.labels.clear();
         components.generation = map.walking_topology_generation;
     }
+    let freight_policy = resources.read::<cargo::FreightTrace>();
     let mut buyer_lanes = BTreeMap::new();
     let mut seller_lanes = BTreeMap::new();
     trades.extend_from_slice(m.make_trades_filtered(
@@ -200,7 +201,11 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
                 .filter_map(|(id, freight)| {
                     let building = map.get(freight.f.building)?;
                     (matches!(building.kind, BuildingKind::RailFreightStation(_))
-                        && infos.owner(building.id) == Some(SoulID::FreightStation(id)))
+                        && infos.owner(building.id) == Some(SoulID::FreightStation(id))
+                        && freight_policy.admit_export(cargo::Endpoint {
+                            soul: SoulID::FreightStation(id),
+                            building: building.id,
+                        }))
                     .then_some((OrderedFloat(building.door_pos.xy().distance2(pos)), id))
                 })
                 .min()
@@ -246,7 +251,7 @@ pub fn market_update(world: &mut World, resources: &mut Resources) {
         },
         &BTreeMap::new(),
     ));
-    drop((m, map, infos, components));
+    drop((m, map, infos, components, freight_policy));
 
     let retail = ItemID::new("retail-goods");
     // A hook that returns true owns the whole settlement: budget, stock and the

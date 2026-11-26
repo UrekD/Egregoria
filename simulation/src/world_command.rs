@@ -11,7 +11,9 @@ use prototypes::BuildingGen;
 use prototypes::GameTime;
 use WorldCommand::*;
 
-use crate::economy::cargo::{CargoBook, WarehousePolicy};
+use crate::economy::cargo::{
+    CargoBook, DepotRestock, Endpoint, FreightTerminalPolicy, WarehousePolicy,
+};
 use crate::economy::progression::{can_build, BuildCapability, ProgressionState};
 use crate::economy::{Budget, BudgetCategory, Government};
 use crate::map::procgen::{load_parismap, load_testfield};
@@ -301,6 +303,16 @@ macro_rules! define_world_command {
             BuyTile {
                 tile: LandTileId,
             },
+            SetFreightTerminalPolicy {
+                terminal: Endpoint,
+                expected_policy_revision: u64,
+                policy: FreightTerminalPolicy,
+            },
+            SetWarehouseRestock {
+                depot: Endpoint,
+                expected_revision: u64,
+                limits: DepotRestock,
+            },
         }
     };
 }
@@ -342,6 +354,10 @@ pub enum Rejection {
     InvalidInitOptions,
     Locked { milestone: u8 },
     InvalidWarehouse,
+    InvalidFreightTerminal,
+    InvalidFreightPolicy,
+    StaleFreightPolicy,
+    OccupiedTrack,
     WaterEditFailed,
     WetFootprint,
     TileLocked,
@@ -1008,6 +1024,8 @@ impl WorldCommand {
                 | TransitSetVehicles { .. }
                 | TransitSetFare { .. }
                 | SetWarehousePolicy { .. }
+                | SetFreightTerminalPolicy { .. }
+                | SetWarehouseRestock { .. }
                 | SetLotLayout(_)
                 | EditWater(_)
                 | BuyTile { .. }
@@ -1259,6 +1277,8 @@ impl WorldCommand {
             | TransitSetVehicles { .. }
             | TransitSetFare { .. }
             | SetWarehousePolicy { .. }
+            | SetFreightTerminalPolicy { .. }
+            | SetWarehouseRestock { .. }
             | SetLotLayout(_)
             | BuyTile { .. } => true,
             EditWater(_) => unreachable!(),
@@ -1386,6 +1406,8 @@ impl WorldCommand {
             TransitSetVehicles { .. } => "TransitSetVehicles",
             TransitSetFare { .. } => "TransitSetFare",
             SetWarehousePolicy { .. } => "SetWarehousePolicy",
+            SetFreightTerminalPolicy { .. } => "SetFreightTerminalPolicy",
+            SetWarehouseRestock { .. } => "SetWarehouseRestock",
             SetLotLayout(_) => "SetLotLayout",
             EditWater(_) => "EditWater",
             BuyTile { .. } => "BuyTile",
@@ -1464,7 +1486,15 @@ impl WorldCommand {
             {
                 return Err(LandDenial::ForbiddenOperation.into());
             }
-            SetWarehousePolicy { building, .. } => {
+            SetWarehousePolicy { building, .. }
+            | SetFreightTerminalPolicy {
+                terminal: Endpoint { building, .. },
+                ..
+            }
+            | SetWarehouseRestock {
+                depot: Endpoint { building, .. },
+                ..
+            } => {
                 if map.get(*building).is_none() {
                     return Err(Rejection::MissingReference);
                 }
@@ -1806,6 +1836,49 @@ impl WorldCommand {
         }
         let map = sim.map();
         self.validate(&map)?;
+        match self {
+            SpawnTrain { wagons, lane, dist } => {
+                if *dist < crate::transportation::train::train_length(wagons) {
+                    return Err(Rejection::InvalidTrain);
+                }
+                let reservations = sim.read::<crate::transportation::train::TrainReservations>();
+                if !crate::transportation::train::can_start_train(
+                    &map,
+                    sim.world(),
+                    &reservations,
+                    wagons,
+                    *lane,
+                    *dist,
+                ) {
+                    return Err(Rejection::OccupiedTrack);
+                }
+            }
+            SetFreightTerminalPolicy {
+                terminal,
+                expected_policy_revision,
+                policy,
+            } => {
+                crate::economy::cargo::terminal::validate_policy(
+                    sim,
+                    *terminal,
+                    *expected_policy_revision,
+                    *policy,
+                )?;
+            }
+            SetWarehouseRestock {
+                depot,
+                expected_revision,
+                limits,
+            } => {
+                crate::economy::cargo::terminal::validate_restock(
+                    sim,
+                    *depot,
+                    *expected_revision,
+                    *limits,
+                )?;
+            }
+            _ => {}
+        }
         if let MapBuildSpecialBuilding {
             pos,
             kind,
@@ -2155,6 +2228,30 @@ impl WorldCommand {
             MapLoadTestField { pos, size, spacing } => {
                 load_testfield(&mut sim.map_mut(), pos, size, spacing)
                     .map_err(|_| Rejection::WaterConfigured)?;
+            }
+            SetFreightTerminalPolicy {
+                terminal,
+                expected_policy_revision,
+                policy,
+            } => {
+                crate::economy::cargo::terminal::set_policy(
+                    sim,
+                    terminal,
+                    expected_policy_revision,
+                    policy,
+                )?;
+            }
+            SetWarehouseRestock {
+                depot,
+                expected_revision,
+                limits,
+            } => {
+                crate::economy::cargo::terminal::set_restock(
+                    sim,
+                    depot,
+                    expected_revision,
+                    limits,
+                )?;
             }
             SetWarehousePolicy { building, policy } => {
                 let company = Self::warehouse_company(sim, building)?;

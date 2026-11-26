@@ -2015,6 +2015,9 @@ impl SimulationDeser {
             }
         }
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
+        sim.read::<economy::cargo::FreightTrace>()
+            .validate_ownership(&sim.read::<economy::cargo::CargoBook>(), &sim.world)
+            .map_err(|message| corrupt(message.into()))?;
         crate::map::validate_loaded_land(&sim).map_err(&corrupt)?;
         sim.map_mut()
             .rebuild_land_frontage()

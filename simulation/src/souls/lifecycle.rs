@@ -1,4 +1,7 @@
-use crate::economy::cargo::{cancel_removed, stored_items, CargoBook, CargoRemoval, LoadId};
+use crate::economy::cargo::{
+    cancel_removed, stored_items, CargoBook, CargoRemoval, Endpoint, FreightFailure, FreightTrace,
+    LoadId,
+};
 use geom::Vec3;
 use itertools::Itertools;
 use prototypes::{GameTime, GoodsCompanyID, ItemID, TICKS_PER_HOUR};
@@ -7,6 +10,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::economy::{BasketFailure, Market, Trade};
 use crate::map::{Building, BuildingID, BuildingKind, GrowableBusinessState, Map, PathKind};
+use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{
     BuildingInfos, DispatchID, Dispatcher, Itinerary, ParkingManagement, SpotReservation,
     NEAR_PARKING_RADIUS, OBJECTIVE_OK_DIST,
@@ -187,9 +191,25 @@ fn remove_building(
             let (world, resources) = sim.world_res();
             let mut dispatcher = resources.write::<Dispatcher>();
             let mut reservations = resources.write::<TrainReservations>();
+            let mut trace = resources.write::<FreightTrace>();
+            let mut book = resources.write::<CargoBook>();
+            let now = elapsed_ticks(resources).0;
             for station in world.freight_stations.values_mut() {
                 station.f.trains.retain(|&(id, state)| {
-                    if no_external_target || matches!(state, FreightTrainState::Moving) {
+                    let assigned_gate = trace.calls.get(&id).map(|call| call.key.outside_gate);
+                    if assigned_gate.map_or(
+                        no_external_target || matches!(state, FreightTrainState::Moving),
+                        |gate| gate == building.id,
+                    ) {
+                        if let Some(call) = trace.calls.remove(&id) {
+                            book.close_call(
+                                &mut trace,
+                                call,
+                                true,
+                                Some(FreightFailure::OutsideGateRemoved),
+                                now,
+                            );
+                        }
                         dispatcher.free(id);
                         if let Some(train) = world.trains.get_mut(id) {
                             cancel_train_route(id, train, &mut reservations);
@@ -355,6 +375,7 @@ pub(crate) fn company_dropped(sim: &mut Simulation, id: CompanyID, company: Comp
     }
     cancel_removed(sim, CargoRemoval::Soul(SoulID::GoodsCompany(id)));
     sim.write::<CargoBook>().forget_company(id);
+    sim.write::<FreightTrace>().depots.remove(&id);
     write_off_physical_stock(sim, SoulID::GoodsCompany(id), company.comp.proto);
     sim.read::<ParCommandBuffer<VehicleEnt>>()
         .kill_all(&company.comp.trucks);
@@ -459,7 +480,26 @@ pub(crate) fn freight_station_dropped(
     let (world, resources) = sim.world_res();
     let mut dispatcher = resources.write::<Dispatcher>();
     let mut reservations = resources.write::<TrainReservations>();
+    let mut book = resources.write::<CargoBook>();
+    let mut trace = resources.write::<FreightTrace>();
+    let now = elapsed_ticks(resources).0;
+    trace.remove_terminal(
+        Endpoint {
+            soul: SoulID::FreightStation(id),
+            building: station.f.building,
+        },
+        now,
+    );
     for (id, _) in station.f.trains {
+        if let Some(call) = trace.calls.remove(&id) {
+            book.close_call(
+                &mut trace,
+                call,
+                false,
+                Some(FreightFailure::TerminalRemoved),
+                now,
+            );
+        }
         dispatcher.free(id);
         if let Some(train) = world.trains.get_mut(id) {
             cancel_train_route(id, train, &mut reservations);
@@ -558,6 +598,17 @@ pub(crate) fn train_dropped(sim: &mut Simulation, id: TrainID) {
         trains.remove(&id);
         !trains.is_empty()
     });
+    let mut trace = resources.write::<FreightTrace>();
+    if let Some(call) = trace.calls.remove(&id) {
+        let now = elapsed_ticks(resources).0;
+        resources.write::<CargoBook>().close_call(
+            &mut trace,
+            call,
+            true,
+            Some(FreightFailure::TrainRemoved),
+            now,
+        );
+    }
     let wagons = resources.read::<ParCommandBuffer<WagonEnt>>();
     for (wagon, entity) in world.wagons.iter() {
         if entity.itfollower.leader == id {

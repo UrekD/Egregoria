@@ -431,15 +431,31 @@ fn register_road_frontage() {
 // and saves from before it restart the timers at load.
 // Registered after "cargo_book" so loading overrides the decoded book's default.
 fn register_cargo_progress() {
+    use crate::economy::cargo::FreightTrace;
+
+    register_resource_noserialize::<FreightTrace>();
     unsafe {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "cargo_progress",
             optional: true,
             save: Box::new(|sim, output| {
-                Bincode::encode_writer(&sim.read::<CargoBook>().progress, output)
+                Bincode::encode_writer(&sim.read::<CargoBook>().progress, &mut *output)?;
+                let trace = sim.read::<FreightTrace>();
+                if !trace.is_pristine() {
+                    Bincode::encode_writer(&*trace, output)?;
+                }
+                Ok(())
             }),
             load: Box::new(|sim, data| {
-                sim.write::<CargoBook>().progress = Bincode::decode(data)?;
+                let mut input = data;
+                sim.write::<CargoBook>().progress = Bincode::decode_reader(&mut input)?;
+                if !input.is_empty() {
+                    let mut trace = Bincode::decode::<FreightTrace>(input)?;
+                    trace.rebuild_indexes().map_err(|message| {
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, message)
+                    })?;
+                    sim.resources.insert(trace);
+                }
                 Ok(())
             }),
         });

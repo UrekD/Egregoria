@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 use super::{
     Budget, BudgetCategory, EcoStats, FreightDay, Market, Trade, TradeTarget, TICKS_PER_BUDGET_DAY,
 };
-use crate::map::{BuildingID, LaneKind, Map, PathKind, RoadID};
+use crate::map::{BuildingID, LaneKind, Map, PathKind, RoadID, TraverseKind};
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::{
     active_business, ActiveBusiness, BuildingInfos, Destination, Itinerary, ParkingManagement,
@@ -51,6 +51,15 @@ use crate::{
 };
 
 pub use prototypes::WarehousePolicy;
+
+pub(crate) mod terminal;
+mod trace;
+pub use terminal::{DepotRestock, DepotRestockView, FreightTerminalPolicy, TerminalPolicyView};
+pub(crate) use trace::{CallManifest, RailAnchor, RailLeg};
+pub use trace::{
+    DemandKey, FreightCallKey, FreightCursor, FreightFailure, FreightFragment, FreightPage,
+    FreightRecord, FreightStage, FreightTrace, StaleFreightCursor,
+};
 
 // Matching runs on game-minute boundaries, where the retry windows land (two real seconds).
 const FREIGHT_MATCH_INTERVAL: u64 = TICKS_PER_MINUTE;
@@ -101,9 +110,9 @@ pub struct ItemQuantity {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-struct Endpoint {
-    soul: SoulID,
-    building: BuildingID,
+pub struct Endpoint {
+    pub soul: SoulID,
+    pub building: BuildingID,
 }
 
 impl Endpoint {
@@ -573,9 +582,48 @@ impl CargoBook {
         units
     }
 
-    /// A train call at the station: units on order by rail join its stock, up
-    /// to `capacity`. Returns the remaining rail backlog capped for dispatch.
-    pub(crate) fn unload_train(&mut self, station: SoulID, capacity: u32) -> u32 {
+    pub(crate) fn can_dispatch_import(&self, trace: &FreightTrace, terminal: Endpoint) -> bool {
+        self.imports.get(&terminal).is_some_and(|desk| {
+            trace
+                .available_imports(terminal, desk)
+                .values()
+                .any(|&units| units > 0)
+        })
+    }
+
+    pub(crate) fn reserve_call(&self, trace: &mut FreightTrace, call: &mut CallManifest, now: u64) {
+        if let Some(desk) = self.imports.get(&call.key.terminal) {
+            trace.reserve_imports(call, desk, now);
+        }
+    }
+
+    pub(crate) fn receive_call(
+        &mut self,
+        trace: &mut FreightTrace,
+        call: &mut CallManifest,
+        now: u64,
+    ) -> u32 {
+        let Some(desk) = self.imports.get_mut(&call.key.terminal) else {
+            return 0;
+        };
+        trace.receive_imports(call, desk, now);
+        desk.wanted_cargo()
+    }
+
+    pub(crate) fn close_call(
+        &mut self,
+        trace: &mut FreightTrace,
+        call: CallManifest,
+        terminal_live: bool,
+        failure: Option<FreightFailure>,
+        now: u64,
+    ) {
+        let desk = self.imports.get_mut(&call.key.terminal);
+        trace.close_call(call, desk, terminal_live, failure, now);
+    }
+
+    #[cfg(test)]
+    fn unload_train(&mut self, station: SoulID, capacity: u32) -> u32 {
         let Some(desk) = self
             .imports
             .iter_mut()
@@ -611,6 +659,13 @@ impl CargoBook {
         self.station_trucks.iter().filter_map(move |(&id, truck)| {
             (truck.station.building == station).then_some(id)
         })
+    }
+
+    pub fn station_truck_runs(&self, endpoint: Endpoint) -> usize {
+        self.station_trucks
+            .values()
+            .filter(|fleet| fleet.station == endpoint && fleet.trip.is_some())
+            .count()
     }
 
     /// Why a company's input is not here yet, if imports are involved.
@@ -1156,6 +1211,7 @@ struct Warehouse {
     id: CompanyID,
     endpoint: Endpoint,
     spec: &'static WarehouseSpec,
+    restock: DepotRestock,
     items: BTreeSet<ItemID>,
     policy: WarehousePolicy,
     dispatch: DispatchPolicy,
@@ -1567,8 +1623,8 @@ impl Matching<'_> {
         // local recipes use leave only from above the high watermark.
         if !urgent && warehouse.policy != WarehousePolicy::ReserveLocally {
             let held: u32 = stock.values().sum();
-            let mut above_low = held.saturating_sub(warehouse.spec.low_water_units);
-            let mut above_high = held.saturating_sub(warehouse.spec.high_water_units);
+            let mut above_low = held.saturating_sub(warehouse.restock.low);
+            let mut above_high = held.saturating_sub(warehouse.restock.high);
             let station = (above_low > 0)
                 .then(|| self.nearest_station(source, stations))
                 .flatten();
@@ -1676,7 +1732,7 @@ impl Matching<'_> {
             let limit = if surplus {
                 warehouse.spec.capacity_units
             } else if serves_local && self.book.restocking.contains(&warehouse.id) {
-                warehouse.spec.high_water_units
+                warehouse.restock.high
             } else if serves_local && missing {
                 // Space above the watermark still takes one load of a locally
                 // used item the warehouse holds none of.
@@ -1695,7 +1751,7 @@ impl Matching<'_> {
             *warehouse.staged_items.entry(item).or_default() += units;
             warehouse.committed += units;
             available -= units;
-            if warehouse.staged >= warehouse.spec.high_water_units {
+            if warehouse.staged >= warehouse.restock.high {
                 self.book.restocking.remove(&warehouse.id);
             }
             if available == 0 {
@@ -1877,6 +1933,7 @@ fn match_shipments(
                 .then_some((id, source, policy, recipe))
         })
         .collect();
+    let freight = resources.read::<FreightTrace>();
     let warehouse_sites: Vec<_> = world
         .companies
         .iter()
@@ -1888,11 +1945,16 @@ fn match_shipments(
                 soul: SoulID::GoodsCompany(id),
                 building: company.comp.building,
             };
-            endpoint
-                .live(world, map, infos)
-                .then_some((id, endpoint, spec, dispatch))
+            endpoint.live(world, map, infos).then_some((
+                id,
+                endpoint,
+                spec,
+                dispatch,
+                freight.depot_restock(id, spec).limits,
+            ))
         })
         .collect();
+    drop(freight);
     if sources.is_empty() && warehouse_sites.is_empty() {
         return;
     }
@@ -1903,7 +1965,7 @@ fn match_shipments(
         .chain(
             warehouse_sites
                 .iter()
-                .flat_map(|(_, _, spec, _)| stored_items(spec)),
+                .flat_map(|(_, _, spec, _, _)| stored_items(spec)),
         )
         .collect();
     let mut inputs = BTreeMap::<_, Vec<Input>>::new();
@@ -1939,6 +2001,7 @@ fn match_shipments(
             ));
         }
     }
+    let trace = resources.read::<FreightTrace>();
     let stations: Vec<_> = world
         .freight_stations
         .iter()
@@ -1947,9 +2010,10 @@ fn match_shipments(
                 soul: SoulID::FreightStation(id),
                 building: station.f.building,
             };
-            endpoint.live(world, map, infos).then_some(endpoint)
+            (endpoint.live(world, map, infos) && trace.admit_export(endpoint)).then_some(endpoint)
         })
         .collect();
+    drop(trace);
     let time = resources.read::<GameTime>();
     let mut market = resources.write::<Market>();
     let routes = ordered_shipment_routes(book, world, map, infos, &market);
@@ -1966,7 +2030,7 @@ fn match_shipments(
             .chain(
                 warehouse_sites
                     .iter()
-                    .map(|&(id, source, _, policy)| (id, source, policy)),
+                    .map(|&(id, source, _, policy, _)| (id, source, policy)),
             ),
     );
     let mut matching = Matching {
@@ -1989,7 +2053,7 @@ fn match_shipments(
                 }
             }
         }
-        for (id, endpoint, spec, dispatch) in warehouse_sites {
+        for (id, endpoint, spec, dispatch, restock) in warehouse_sites {
             let items = stored_items(spec);
             let mut on_hand_total = 0;
             let mut staged_items = BTreeMap::new();
@@ -2009,6 +2073,7 @@ fn match_shipments(
                 id,
                 endpoint,
                 spec,
+                restock,
                 items,
                 policy: matching.book.warehouse_policy(id, spec),
                 dispatch,
@@ -2034,9 +2099,9 @@ fn match_shipments(
             }
             if !urgent {
                 // A zero low watermark restocks once the warehouse is empty.
-                if warehouse.staged < warehouse.spec.low_water_units.max(1) {
+                if warehouse.staged < warehouse.restock.low.max(1) {
                     matching.book.restocking.insert(warehouse.id);
-                } else if warehouse.staged >= warehouse.spec.high_water_units {
+                } else if warehouse.staged >= warehouse.restock.high {
                     matching.book.restocking.remove(&warehouse.id);
                 }
             }
@@ -2168,7 +2233,7 @@ fn match_shipments(
                     matching
                         .market
                         .produce(source.soul, item, -(available as i32));
-                    post_freight_trade(world, resources, trade);
+                    post_freight_trade(world, resources, trade, None);
                 }
             }
         }
@@ -2365,21 +2430,39 @@ fn destination_input(
 
 /// Records the station side of a virtual export. The ordinary market still
 /// owns its budget, stock and trade history. Imports never match at the market.
-pub fn settle_physical_match(world: &mut World, _resources: &Resources, trade: Trade) -> bool {
-    record_rail_handoff(world, trade);
+pub fn settle_physical_match(world: &mut World, resources: &Resources, trade: Trade) -> bool {
+    record_rail_handoff(world, resources, trade, None);
     false
 }
 
-fn record_rail_handoff(world: &mut World, trade: Trade) {
+fn record_rail_handoff(
+    world: &mut World,
+    resources: &Resources,
+    trade: Trade,
+    load: Option<LoadId>,
+) {
     if let SoulID::FreightStation(id) = trade.buyer.0 {
         if let Some(station) = world.freight_stations.get_mut(id) {
             station.f.accept_export(trade.qty as u32);
+            let terminal = Endpoint {
+                soul: trade.buyer.0,
+                building: station.f.building,
+            };
+            let now = elapsed_ticks(resources).0;
+            resources
+                .write::<FreightTrace>()
+                .stage_export(terminal, trade, load, now);
         }
     }
 }
 
-fn post_freight_trade(world: &mut World, resources: &Resources, trade: Trade) {
-    record_rail_handoff(world, trade);
+fn post_freight_trade(
+    world: &mut World,
+    resources: &Resources,
+    trade: Trade,
+    load: Option<LoadId>,
+) {
+    record_rail_handoff(world, resources, trade, load);
     if trade.money_delta != Money::ZERO {
         Budget::apply(resources, BudgetCategory::TradeExport, trade.money_delta);
     }
@@ -2493,7 +2576,7 @@ pub fn complete_delivery(
                 money_delta: Money::ZERO,
             }
         };
-        post_freight_trade(world, resources, trade);
+        post_freight_trade(world, resources, trade, Some(load));
     }
     book.record_road_deadline(manifest.due_at, !late);
     book.day_mut(now).record_delivery(units, late);
@@ -2601,12 +2684,20 @@ fn cancel_removed_imports(
     endpoint: impl Fn(Endpoint) -> bool,
 ) {
     let mut market = resources.write::<Market>();
+    let mut trace = resources.write::<FreightTrace>();
+    let now = elapsed_ticks(resources).0;
     if let CargoRemoval::Truck(truck) = removal {
         if let Some(StationTruck {
             station,
             trip: Some(trip),
         }) = book.station_trucks.remove(&truck)
         {
+            let stage = if book.imports.contains_key(&station) {
+                FreightStage::Returned
+            } else {
+                FreightStage::WrittenOff
+            };
+            trace.settle_truck(truck, station, trip.buyer, stage, &BTreeMap::new(), now);
             match book.imports.get_mut(&station) {
                 Some(desk) => desk.restock(&trip.items),
                 None => trip
@@ -2637,6 +2728,16 @@ fn cancel_removed_imports(
     book.station_trucks.retain(|&truck, fleet| {
         if !endpoint(fleet.station) {
             return true;
+        }
+        if let Some(trip) = &fleet.trip {
+            trace.settle_truck(
+                truck,
+                fleet.station,
+                trip.buyer,
+                FreightStage::WrittenOff,
+                &BTreeMap::new(),
+                now,
+            );
         }
         for line in fleet.trip.iter().flat_map(|trip| &trip.items) {
             market.record_freight_loss(line.item, line.units);
@@ -2993,7 +3094,12 @@ fn order_imports(
     infos: &BuildingInfos,
     now: u64,
 ) {
-    let stations = import_stations(&mut book.routes, world, map, infos);
+    let trace = resources.read::<FreightTrace>();
+    let stations: Vec<_> = import_stations(&mut book.routes, world, map, infos)
+        .into_iter()
+        .filter(|&station| trace.terminal_policy(station).policy.admit_imports)
+        .collect();
+    drop(trace);
     let market = resources.read::<Market>();
     for (station, desk) in &mut book.imports {
         if !station.live(world, map, infos) {
@@ -3139,11 +3245,20 @@ fn dispatch_station_trucks(
         routes,
         ..
     } = book;
+    let mut trace = resources.write::<FreightTrace>();
+    let mut active = BTreeMap::<Endpoint, usize>::new();
+    for fleet in station_trucks.values().filter(|fleet| fleet.trip.is_some()) {
+        *active.entry(fleet.station).or_default() += 1;
+    }
     for (&truck, fleet) in station_trucks.iter_mut() {
         let Some(vehicle) = world.vehicles.get(truck) else {
             continue;
         };
         if fleet.trip.is_some() || !matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot) {
+            continue;
+        }
+        let runs = active.entry(fleet.station).or_default();
+        if *runs >= usize::from(trace.terminal_policy(fleet.station).policy.max_truck_runs) {
             continue;
         }
         let Some(desk) = imports.get_mut(&fleet.station) else {
@@ -3165,7 +3280,7 @@ fn dispatch_station_trucks(
         ranked.sort_unstable();
 
         let mut attempted = BTreeSet::new();
-        let Some((buyer, route)) = ranked.iter().find_map(|&(_, _, index)| {
+        let Some((buyer, route, lane, position)) = ranked.iter().find_map(|&(_, _, index)| {
             let buyer = orders[index].buyer;
             if !attempted.insert(buyer)
                 || !routes.reaches(map, fleet.station.building, buyer.building)
@@ -3180,7 +3295,13 @@ fn dispatch_station_trucks(
                 map,
                 PathKind::Vehicle,
             )?;
-            Some((buyer, route))
+            let plan = route.get_route()?;
+            let last = plan.reversed_route.first().unwrap_or(&plan.cur);
+            let TraverseKind::Lane(lane) = last.kind else {
+                return None;
+            };
+            let position = last.raw_points(map)?.project(access.drive_pos);
+            Some((buyer, route, lane, position))
         }) else {
             continue;
         };
@@ -3220,6 +3341,17 @@ fn dispatch_station_trucks(
         }
         orders.retain(|order| order.quantity.units > 0);
         stock.retain(|_, units| *units > 0);
+        trace.load_truck(
+            truck,
+            fleet.station,
+            buyer,
+            &items,
+            stock,
+            lane,
+            position,
+            now,
+        );
+        *runs += 1;
         fleet.trip = Some(ImportTrip {
             buyer,
             items: items
@@ -3258,6 +3390,8 @@ fn track_station_trucks(
     infos: &BuildingInfos,
     now: u64,
 ) {
+    let routes = &mut book.routes;
+    let trace = resources.read::<FreightTrace>();
     let legs: Vec<_> = book
         .station_trucks
         .iter_mut()
@@ -3285,7 +3419,25 @@ fn track_station_trucks(
                 .is_some_and(|since| now >= since + ROUTING_RETRY_WINDOW)
                 || now >= trip.departed_at + DELIVERY_EXPIRY
                 || stalled;
-            let arrived = moving && vehicle.it.has_ended(0.0);
+            let destination = if trip.returning {
+                fleet.station
+            } else {
+                trip.buyer
+            };
+            let arrived = moving
+                && vehicle.it.has_ended(0.0)
+                && (trip.returning || trace.truck_arrived(truck))
+                && routes
+                    .access(map, destination.building)
+                    .is_some_and(|access| {
+                        vehicle.it.end_pos() == Some(access.drive_pos)
+                            && vehicle.it.get_travers().is_some_and(|traversal| {
+                                traversal.raw_points(map).is_some_and(|points| {
+                                    points.project(access.drive_pos).distance(vehicle.trans.pos)
+                                        < 0.5
+                                })
+                            })
+                    });
             match (trip.returning, arrived, gave_up) {
                 (false, true, _) => Some((truck, StationLeg::Unload)),
                 (false, false, true) => Some((truck, StationLeg::Abort)),
@@ -3294,6 +3446,7 @@ fn track_station_trucks(
             }
         })
         .collect();
+    drop(trace);
     if legs.is_empty() {
         return;
     }
@@ -3306,13 +3459,34 @@ fn track_station_trucks(
         let buyer = trip.buyer;
         let restock = match leg {
             StationLeg::Unload if buyer.live(world, map, infos) => {
-                unload_import(book, resources, station, buyer, &items, now);
+                let booked = unload_import(book, resources, station, buyer, &items, now);
+                resources.write::<FreightTrace>().settle_truck(
+                    truck,
+                    station,
+                    buyer,
+                    FreightStage::Delivered,
+                    &booked,
+                    now,
+                );
                 false
             }
             StationLeg::Park => false,
             StationLeg::Unload | StationLeg::Abort => true,
         };
         if restock {
+            let stage = if book.imports.contains_key(&station) {
+                FreightStage::Returned
+            } else {
+                FreightStage::WrittenOff
+            };
+            resources.write::<FreightTrace>().settle_truck(
+                truck,
+                station,
+                buyer,
+                stage,
+                &BTreeMap::new(),
+                now,
+            );
             match book.imports.get_mut(&station) {
                 Some(desk) => desk.restock(&items),
                 None => {
@@ -3356,7 +3530,8 @@ fn unload_import(
     buyer: Endpoint,
     items: &[ItemQuantity],
     now: u64,
-) {
+) -> BTreeMap<ItemID, Money> {
+    let mut booked = BTreeMap::new();
     for &ItemQuantity { item, units } in items {
         let trade = {
             let mut market = resources.write::<Market>();
@@ -3369,7 +3544,9 @@ fn unload_import(
         book.import_customers.insert((buyer, item), now);
         Budget::apply(resources, BudgetCategory::TradeImport, trade.money_delta);
         resources.write::<EcoStats>().record_trade(&trade);
+        *booked.entry(item).or_default() += trade.money_delta;
     }
+    booked
 }
 
 /// Puts a station truck back in the station's yard, off the road.
@@ -6416,7 +6593,7 @@ mod lifecycle_tests {
         f.ctx.apply(&[WorldCommand::SpawnTrain {
             wagons: vec![prototypes::RollingStockID::new("locomotive")],
             lane: rail,
-            dist: 0.0,
+            dist: 32.0,
         }]);
     }
 

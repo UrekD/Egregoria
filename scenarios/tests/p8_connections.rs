@@ -251,6 +251,8 @@ fn p8_bus_stock_reduction() {
 #[test]
 fn p8_stock_warehouse_policy_control() {
     use prototypes::{try_prototype, WarehousePolicy};
+    use simulation::economy::cargo::{DepotRestock, Endpoint, FreightTrace};
+    use simulation::world_command::Rejection;
     let mut ctx = ScenarioCtx::new(SimulationOptions {
         save_replay: false,
         terrain_size: 0,
@@ -283,4 +285,28 @@ fn p8_stock_warehouse_policy_control() {
         }],
     );
     assert_eq!(configured(&ctx.sim), WarehousePolicy::ReserveLocally);
+    let depot = Endpoint {
+        soul: simulation::SoulID::GoodsCompany(company),
+        building,
+    };
+    let limits = DepotRestock { low: 1, high: 2 };
+    let command = |expected_revision, limits| WorldCommand::SetWarehouseRestock {
+        depot,
+        expected_revision,
+        limits,
+    };
+    assert_eq!(
+        command(0, DepotRestock { low: 2, high: 1 })
+            .preview(&ctx.sim)
+            .unwrap_err(),
+        Rejection::InvalidFreightPolicy
+    );
+    apply(&mut ctx.sim, &[command(0, limits)]);
+    let setting = ctx.sim.read::<FreightTrace>().depot_restock(company, spec);
+    assert_eq!(setting.revision, 1);
+    assert_eq!(setting.limits, limits);
+    assert_eq!(
+        command(0, limits).preview(&ctx.sim).unwrap_err(),
+        Rejection::StaleFreightPolicy
+    );
 }
