@@ -12,6 +12,18 @@ mod slots;
 
 pub use atomic::{sweep_stale_tmp, write_atomic, AtomicWriteError};
 use atomic::{write_staged, Durability};
+
+/// Stream a durable replacement into a buffered file beside the destination.
+pub fn write_atomic_with(
+    path: &Path,
+    write: impl FnOnce(&mut BufWriter<&mut File>) -> Result<()>,
+) -> std::result::Result<(), AtomicWriteError> {
+    write_staged(path, Durability::Durable, |file| {
+        let mut writer = BufWriter::new(file);
+        write(&mut writer)?;
+        writer.flush()
+    })
+}
 pub use slots::{
     delete_slot, list_slots, list_slots_with_revisions, read_slot_meta, slot_paths,
     write_slot_meta, SlotCamera, SlotEntry, SlotId, SlotIdError, SlotMeta, SlotPaths, SnapshotKind,
@@ -191,6 +203,14 @@ pub struct Bincode;
 use ::bincode::{DefaultOptions, Options};
 
 impl Bincode {
+    pub fn encoded_size(x: &impl Serialize) -> Result<usize> {
+        DefaultOptions::new()
+            .serialized_size(x)
+            .map_err(io::Error::other)?
+            .try_into()
+            .map_err(io::Error::other)
+    }
+
     /// Decode a leading value from a slice, leaving subsequent fields unread.
     pub fn decode_prefix<T: DeserializeOwned>(bytes: &[u8]) -> Result<T> {
         DefaultOptions::new()
@@ -220,7 +240,10 @@ impl Encoder for Bincode {
     fn encode_writer(x: &impl Serialize, w: impl Write) -> Result<()> {
         DefaultOptions::new()
             .serialize_into(w, x)
-            .map_err(|x| std::io::Error::new(ErrorKind::Other, x))
+            .map_err(|error| match *error {
+                bincode::ErrorKind::Io(error) => error,
+                _ => io::Error::other(error),
+            })
     }
 
     fn decode_reader<T: DeserializeOwned>(r: impl Read) -> Result<T> {

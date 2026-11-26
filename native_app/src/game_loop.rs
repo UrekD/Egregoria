@@ -62,11 +62,14 @@ pub struct State {
     install: Option<Install>,
     release_sent: bool,
     capture: Option<PendingCapture>,
+    retiring_save: Option<(u64, SaveInFlight)>,
+    deleted_save: Option<u64>,
+    save_notice_until: Option<Instant>,
     departure_target: Option<DepartureTarget>,
     lot_brush_dirty: bool,
     lot_brush_save: Option<Receiver<()>>,
 
-    delete: Option<(SlotId, Receiver<std::io::Result<()>>)>,
+    delete: Option<PendingDelete>,
     camera_bounds: AABB,
     deferred_input: VecDeque<WorldInputSample>,
     bulldozer_view: Option<DragView>,
@@ -121,6 +124,19 @@ enum NetworkReady {
 enum DepartureTarget {
     Pending(Receiver<std::io::Result<SaveRequest>>),
     Ready(SaveRequest),
+}
+
+struct PendingDelete {
+    slot: SlotId,
+    generation: u64,
+    result: Receiver<std::io::Result<()>>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SaveDisposition {
+    Current,
+    Deleted,
+    Retired { deleted: bool },
 }
 
 type SaveResult = Result<(CityProgress, simulation::SavePhase), String>;
@@ -264,6 +280,9 @@ impl engine::framework::State for State {
             install: None,
             release_sent: false,
             capture: None,
+            retiring_save: None,
+            deleted_save: None,
+            save_notice_until: None,
             departure_target: None,
             lot_brush_dirty: false,
             lot_brush_save: None,
@@ -694,9 +713,9 @@ impl State {
     }
 
     fn step_session(&mut self, ctx: &mut Context) -> bool {
+        self.delete_slot();
         self.poll_save();
         self.poll_lot_brush_save();
-        self.delete_slot();
 
         #[cfg(feature = "multiplayer")]
         if self.close_requested {
@@ -724,6 +743,7 @@ impl State {
                     let _ = driver.take_owner();
                 }
                 if ready_to_exit(&self.uiw)
+                    && self.retiring_save.is_none()
                     && self.delete.is_none()
                     && self.lot_brush_save.is_none()
                     && self.uiw.camera_mut().poll_save_on_exit(Instant::now())
@@ -1121,6 +1141,7 @@ impl State {
         if self.network_disconnecting {
             let generation = self.uiw.read::<SessionState>().generation + 1;
             if self.uiw.read::<SaveLoadState>().save_result.is_some()
+                || self.delete.is_some()
                 || !self.uiw.read::<SaveCoordinator>().try_swap(generation)
             {
                 return;
@@ -1216,6 +1237,7 @@ impl State {
                     .as_ref()
                     .is_some_and(|driver| !driver.is_finished())
                     || self.uiw.read::<SaveLoadState>().save_result.is_some()
+                    || self.delete.is_some()
                     || !self.uiw.read::<SaveCoordinator>().try_swap(generation)
                 {
                     Some(NetworkTransition::Hosting(server))
@@ -1494,6 +1516,21 @@ impl State {
                 .expect("the old world was released before replacement");
             self.assert_dormant_script_state(&old);
         }
+        // Move the old receiver out before the UI is reset. Publication that
+        // won the generation gate can still have a result in flight.
+        let old_generation = self.uiw.read::<SessionState>().generation;
+        let save_notice = {
+            let mut io = self.uiw.write::<SaveLoadState>();
+            if let Some(save) = io.save_result.take() {
+                debug_assert!(self.retiring_save.is_none());
+                self.retiring_save = Some((old_generation, save));
+            }
+            io.notice
+                .take_if(|(until, _)| Some(*until) == self.save_notice_until)
+        };
+        if let Some(capture) = self.capture.take() {
+            let _ = capture.sender.send(Err("The save was cancelled.".into()));
+        }
         let sim = session::install_world(&self.uiw, replacement, generation);
         self.all_audio.reset_world();
         self.immediate_renderer.clear();
@@ -1505,6 +1542,7 @@ impl State {
         self.sim = Arc::new(RwLock::new(sim));
         let threaded = crate::network::is_singleplayer(&self.uiw);
         let mut io = self.uiw.write::<SaveLoadState>();
+        io.notice = save_notice;
         io.threaded = threaded;
         if threaded {
             let replay = io.replay.take();
@@ -1537,7 +1575,6 @@ impl State {
         self.rendered_batch = None;
         self.batch_in_flight = false;
         self.staged = None;
-        self.capture = None;
         self.departure_target = None;
         self.deferred_input.clear();
         self.bulldozer_view = None;
@@ -1545,7 +1582,7 @@ impl State {
 
     fn start_save(&mut self) {
         session::poll_named_save(&self.uiw);
-        if !session::can_save(&self.uiw) {
+        if !session::can_save(&self.uiw) || self.retiring_save.is_some() || self.delete.is_some() {
             return;
         }
         let departure_save = self
@@ -1693,72 +1730,58 @@ impl State {
         });
     }
 
+    fn waiting_for_delete(&self, generation: u64, save: &SaveInFlight) -> bool {
+        self.delete.as_ref().is_some_and(|delete| {
+            delete.generation == generation && delete.slot == save.request.slot
+        })
+    }
+
     fn poll_save(&mut self) {
-        let mut io = self.uiw.write::<SaveLoadState>();
-        let Some(in_flight) = &io.save_result else {
-            return;
-        };
-        let saved = match in_flight.result.try_recv() {
-            Ok(saved) => saved,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err("The save worker stopped unexpectedly.".into()),
-        };
-        let SaveInFlight {
-            id,
-            request,
-            revision,
-            ..
-        } = io.save_result.take().unwrap();
-        let mut session = self.uiw.write::<SessionState>();
-        // Refresh even after errors: the snapshot may have been renamed before fsync failed.
-        session.refresh_slots = true;
-        let departure = session
-            .departure
-            .filter(|departure| departure.phase == DeparturePhase::Saving(id));
-        let mut notice = None;
-        let mut destination = None;
-        match saved {
-            Ok((progress, phase)) => {
-                if matches!(request.kind, SaveKind::SaveAs | SaveKind::Departure) {
-                    session.set_snapshot_slot(Some(request.slot));
-                    session.city_name = request.name;
-                }
-                if !matches!(request.kind, SaveKind::Autosave) {
-                    io.saved_progress = Some(progress);
-                    session.remember_published_snapshot(revision);
-                }
-                if let simulation::SavePhase::SidecarsFailed { replay, meta } = phase {
-                    log::warn!(
-                        "Saved snapshot; sidecar errors: replay={replay:?}, metadata={meta:?}"
-                    );
-                    let sidecars = match (replay.is_some(), meta.is_some()) {
-                        (true, true) => "replay and metadata",
-                        (true, false) => "replay",
-                        _ => "metadata",
-                    };
-                    notice = Some(format!("City saved. Could not save {sidecars}."));
-                } else if matches!(request.kind, SaveKind::Manual | SaveKind::SaveAs) {
-                    notice = Some("City saved.".into());
-                }
-                destination = departure.map(|departure| departure.destination);
-            }
-            Err(error) => {
-                log::error!("Could not save {}: {error}", request.slot);
-                notice = Some(format!("Could not save {}. {error}", request.slot));
-                if departure.is_some() {
-                    session.departure.as_mut().unwrap().phase = DeparturePhase::SaveFailed;
+        if let Some((generation, save)) = &self.retiring_save {
+            if !self.waiting_for_delete(*generation, save) {
+                if let Some(result) = try_save_result(save) {
+                    let (_, save) = self.retiring_save.take().unwrap();
+                    let deleted = self.deleted_save.take() == Some(save.id);
+                    self.report_save(save, result, SaveDisposition::Retired { deleted });
                 }
             }
         }
-        drop(session);
-        drop(io);
-        self.uiw.write::<GuiState>().last_save = Instant::now();
-        self.lot_brush_dirty = true;
-        if let Some(notice) = notice {
-            session::notify(&self.uiw, notice);
+        let generation = self.uiw.read::<SessionState>().generation;
+        let completion = {
+            let mut io = self.uiw.write::<SaveLoadState>();
+            if io
+                .save_result
+                .as_ref()
+                .is_some_and(|save| self.waiting_for_delete(generation, save))
+            {
+                return;
+            }
+            take_save_result(&mut io.save_result)
+        };
+        if let Some((save, result)) = completion {
+            let disposition = if self.deleted_save.take() == Some(save.id) {
+                SaveDisposition::Deleted
+            } else {
+                SaveDisposition::Current
+            };
+            self.report_save(save, result, disposition);
+            self.lot_brush_dirty = true;
         }
-        if let Some(destination) = destination {
-            session::finish_departure(&self.uiw, destination);
+    }
+
+    fn report_save(
+        &mut self,
+        save: SaveInFlight,
+        result: SaveResult,
+        disposition: SaveDisposition,
+    ) {
+        if apply_save_result(&self.uiw, save, result, disposition) {
+            self.save_notice_until = self
+                .uiw
+                .read::<SaveLoadState>()
+                .notice
+                .as_ref()
+                .map(|(until, _)| *until);
         }
     }
 
@@ -1775,8 +1798,8 @@ impl State {
     }
 
     fn delete_slot(&mut self) {
-        if let Some((slot, receiver)) = &self.delete {
-            let result = match receiver.try_recv() {
+        if let Some(delete) = &self.delete {
+            let result = match delete.result.try_recv() {
                 Ok(result) => result,
                 Err(TryRecvError::Empty) => return,
                 Err(TryRecvError::Disconnected) => {
@@ -1784,9 +1807,17 @@ impl State {
                 }
             };
             if let Err(error) = result {
-                session::notify(&self.uiw, format!("Could not delete {slot}. {error}"));
-            } else if self.uiw.read::<SessionState>().snapshot_slot() == Some(slot) {
-                self.uiw.write::<SaveLoadState>().saved_progress = None;
+                session::notify(
+                    &self.uiw,
+                    format!("Could not delete {}. {error}", delete.slot),
+                );
+            } else if let Some(id) = apply_delete_success(
+                &self.uiw,
+                delete.generation,
+                &delete.slot,
+                self.retiring_save.as_ref(),
+            ) {
+                self.deleted_save = Some(id);
             }
             self.uiw.write::<SessionState>().refresh_slots = true;
             self.delete = None;
@@ -1796,7 +1827,11 @@ impl State {
             let coordinator = self.uiw.read::<SaveCoordinator>().clone();
             let target = slot.clone();
             let generation = self.uiw.read::<SessionState>().generation;
-            self.delete = Some((slot, receiver));
+            self.delete = Some(PendingDelete {
+                slot,
+                generation,
+                result: receiver,
+            });
             std::thread::spawn(move || {
                 let _ = sender.send(coordinator.delete(generation, saveload::save_dir(), &target));
             });
@@ -1902,6 +1937,119 @@ impl State {
     }
 }
 
+fn try_save_result(save: &SaveInFlight) -> Option<SaveResult> {
+    match save.result.try_recv() {
+        Ok(result) => Some(result),
+        Err(TryRecvError::Empty) => None,
+        Err(TryRecvError::Disconnected) => {
+            Some(Err("The save worker stopped unexpectedly.".into()))
+        }
+    }
+}
+
+fn take_save_result(in_flight: &mut Option<SaveInFlight>) -> Option<(SaveInFlight, SaveResult)> {
+    let result = try_save_result(in_flight.as_ref()?)?;
+    Some((in_flight.take().unwrap(), result))
+}
+
+fn apply_delete_success(
+    uiw: &UiWorld,
+    generation: u64,
+    slot: &SlotId,
+    retiring: Option<&(u64, SaveInFlight)>,
+) -> Option<u64> {
+    let retired = retiring
+        .filter(|(old_generation, save)| {
+            *old_generation == generation && save.request.slot == *slot
+        })
+        .map(|(_, save)| save.id);
+    let mut session = uiw.write::<SessionState>();
+    if session.generation != generation {
+        return retired;
+    }
+    let mut io = uiw.write::<SaveLoadState>();
+    if session.snapshot_slot() == Some(slot) {
+        session.set_snapshot_slot(Some(slot.clone()));
+        io.saved_progress = None;
+    }
+    io.save_result
+        .as_ref()
+        .filter(|save| save.request.slot == *slot)
+        .map(|save| save.id)
+        .or(retired)
+}
+
+fn apply_save_result(
+    uiw: &UiWorld,
+    save: SaveInFlight,
+    result: SaveResult,
+    disposition: SaveDisposition,
+) -> bool {
+    let mut session = uiw.write::<SessionState>();
+    let mut io = uiw.write::<SaveLoadState>();
+    // Refresh even on failure if the snapshot changed before a durability error.
+    session.refresh_slots = true;
+    let current_generation = !matches!(disposition, SaveDisposition::Retired { .. });
+    let deleted = matches!(
+        disposition,
+        SaveDisposition::Deleted | SaveDisposition::Retired { deleted: true }
+    );
+    let departure = session.departure.filter(|departure| {
+        current_generation && departure.phase == DeparturePhase::Saving(save.id)
+    });
+    let mut destination = None;
+    let notice = match result {
+        Ok(_) if deleted => departure.map(|_| "The save was deleted.".into()),
+        Ok((progress, phase)) => {
+            if disposition == SaveDisposition::Current {
+                if matches!(save.request.kind, SaveKind::SaveAs | SaveKind::Departure) {
+                    session.set_snapshot_slot(Some(save.request.slot.clone()));
+                    session.city_name = save.request.name;
+                }
+                if !matches!(save.request.kind, SaveKind::Autosave) {
+                    io.saved_progress = Some(progress);
+                    session.remember_published_snapshot(save.revision);
+                }
+            }
+            destination = departure.map(|departure| departure.destination);
+            if let simulation::SavePhase::SidecarsFailed { replay, meta } = phase {
+                log::warn!("Saved snapshot; sidecar errors: replay={replay:?}, metadata={meta:?}");
+                let sidecars = match (replay.is_some(), meta.is_some()) {
+                    (true, true) => "replay and metadata",
+                    (true, false) => "replay",
+                    _ => "metadata",
+                };
+                Some(format!("City saved. Could not save {sidecars}."))
+            } else if matches!(save.request.kind, SaveKind::Manual | SaveKind::SaveAs) {
+                Some("City saved.".into())
+            } else {
+                None
+            }
+        }
+        Err(error) => {
+            log::error!("Could not save {}: {error}", save.request.slot);
+            Some(format!("Could not save {}. {error}", save.request.slot))
+        }
+    };
+    if departure.is_some() && destination.is_none() {
+        session.departure.as_mut().unwrap().phase = DeparturePhase::SaveFailed;
+    }
+    drop(io);
+    drop(session);
+
+    if current_generation {
+        uiw.write::<GuiState>().last_save = Instant::now();
+    }
+    let notified = notice.is_some();
+    if let Some(notice) = notice {
+        session::notify(uiw, notice);
+    }
+    if let Some(destination) = destination {
+        session::finish_departure(uiw, destination);
+    }
+    notified
+}
+
 fn publish_capture(
     capture: PendingCapture,
     captured: Result<(simulation::SlotCapture, CityProgress), String>,
@@ -1932,12 +2080,11 @@ fn encode_and_publish_slot(
         return Err("The save was cancelled.".into());
     }
     let snapshot = capture.encode().map_err(|error| error.to_string())?;
-    coordinator
-        .publish(permit, || {
-            snapshot
-                .with_display_name(name)
-                .with_camera(camera)
-                .publish(saveload::save_dir(), slot)
+    snapshot
+        .with_display_name(name)
+        .with_camera(camera)
+        .publish_with_gate(saveload::save_dir(), slot, || {
+            coordinator.begin_publish(permit)
         })
         .ok_or_else(|| "The save was cancelled.".to_owned())?
         .map(|phase| (progress, phase))
@@ -2141,6 +2288,168 @@ mod p4_fix_esc_tests {
         input.keyboard.pressed.insert(key);
         route_close_input(&uiw, &input, false, false);
         assert!(!uiw.read::<SessionState>().paused);
+    }
+
+    fn save_ack_fixture() -> (UiWorld, SaveInFlight, CityProgress) {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let progress = CityProgress::capture(&Simulation::new(false));
+        let uiw = playing_ui();
+        let (_, result) = mpsc::channel();
+        let slot = SlotId::new("test-save").unwrap();
+        uiw.write::<SessionState>()
+            .set_snapshot_slot(Some(slot.clone()));
+        let save = SaveInFlight {
+            id: 7,
+            revision: session::snapshot_revision(),
+            request: SaveRequest {
+                slot,
+                name: "Saved city".into(),
+                kind: SaveKind::Manual,
+            },
+            result,
+        };
+        (uiw, save, progress)
+    }
+
+    #[test]
+    fn detached_save_delete_wins_in_either_reply_order() {
+        for delete_first in [true, false] {
+            let (uiw, save, progress) = save_ack_fixture();
+            let slot = save.request.slot.clone();
+            let generation = uiw.read::<SessionState>().generation;
+            let mut deleted = None;
+            uiw.write::<SaveLoadState>().saved_progress = Some(progress);
+            uiw.write::<SaveLoadState>().save_result = Some(save);
+            if delete_first {
+                deleted = apply_delete_success(&uiw, generation, &slot, None);
+            }
+            let save = uiw.write::<SaveLoadState>().save_result.take().unwrap();
+            let disposition = if deleted == Some(save.id) {
+                SaveDisposition::Deleted
+            } else {
+                SaveDisposition::Current
+            };
+            apply_save_result(
+                &uiw,
+                save,
+                Ok((progress, simulation::SavePhase::Complete)),
+                disposition,
+            );
+            if !delete_first {
+                apply_delete_success(&uiw, generation, &slot, None);
+            } else {
+                assert!(uiw.read::<SaveLoadState>().notice.is_none());
+            }
+            assert!(uiw.read::<SaveLoadState>().saved_progress.is_none());
+        }
+    }
+
+    #[test]
+    fn detached_save_old_generation_delete_cannot_clear_new_city_progress() {
+        let (uiw, save, progress) = save_ack_fixture();
+        uiw.write::<SessionState>().generation = 1;
+        uiw.write::<SaveLoadState>().saved_progress = Some(progress);
+        assert_eq!(
+            apply_delete_success(&uiw, 0, &save.request.slot, None),
+            None
+        );
+        assert_eq!(uiw.read::<SaveLoadState>().saved_progress, Some(progress));
+    }
+
+    #[test]
+    fn detached_save_success_after_delete_and_replacement_has_no_toast() {
+        let (uiw, save, progress) = save_ack_fixture();
+        uiw.write::<SessionState>().generation = 1;
+        let retired = (0, save);
+        let deleted = apply_delete_success(&uiw, 0, &retired.1.request.slot, Some(&retired));
+        assert_eq!(deleted, Some(retired.1.id));
+        apply_save_result(
+            &uiw,
+            retired.1,
+            Ok((progress, simulation::SavePhase::Complete)),
+            SaveDisposition::Retired {
+                deleted: deleted.is_some(),
+            },
+        );
+        assert!(uiw.read::<SaveLoadState>().notice.is_none());
+        assert!(uiw.read::<SaveLoadState>().saved_progress.is_none());
+    }
+
+    #[test]
+    fn detached_save_retiring_generation_reports_late_manual_results() {
+        let (uiw, mut save, _) = save_ack_fixture();
+        let coordinator = SaveCoordinator::default();
+        let permit = coordinator.request(0, &save.request.slot).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        save.result = receiver;
+        uiw.write::<SaveLoadState>().save_result = Some(save);
+        assert!(coordinator.try_swap(1)); // Replacement wins while encoding.
+        assert!(coordinator.publish(&permit, || ()).is_none());
+        let mut retiring = uiw.write::<SaveLoadState>().save_result.take();
+        uiw.write::<SessionState>().generation = 1;
+        assert!(take_save_result(&mut retiring).is_none());
+        sender.send(Err("The save was cancelled.".into())).unwrap();
+        let (save, result) = take_save_result(&mut retiring).unwrap();
+        apply_save_result(
+            &uiw,
+            save,
+            result,
+            SaveDisposition::Retired { deleted: false },
+        );
+        assert!(uiw
+            .read::<SaveLoadState>()
+            .notice
+            .as_ref()
+            .unwrap()
+            .1
+            .contains("cancelled"));
+
+        let (uiw, mut save, progress) = save_ack_fixture();
+        let coordinator = SaveCoordinator::default();
+        let permit = coordinator.request(0, &save.request.slot).unwrap();
+        let (sender, receiver) = mpsc::channel();
+        save.result = receiver;
+        uiw.write::<SaveLoadState>().save_result = Some(save);
+        assert!(coordinator.publish(&permit, || ()).is_some()); // Publication wins.
+        assert!(coordinator.try_swap(1));
+        let mut retiring = uiw.write::<SaveLoadState>().save_result.take();
+        let new_slot = SlotId::new("new-city").unwrap();
+        uiw.write::<SessionState>().generation = 1;
+        uiw.write::<SessionState>()
+            .set_snapshot_slot(Some(new_slot.clone()));
+        let mut new_city = Simulation::new(false);
+        new_city.tick(&mut Simulation::schedule(), std::iter::empty());
+        let new_progress = CityProgress::capture(&new_city);
+        assert_ne!(progress, new_progress);
+        uiw.write::<SaveLoadState>().saved_progress = Some(new_progress);
+        sender
+            .send(Ok((
+                progress,
+                simulation::SavePhase::SidecarsFailed {
+                    replay: Some(common::saveload::AtomicWriteError::PreCommit(
+                        std::io::Error::other("fixture"),
+                    )),
+                    meta: None,
+                },
+            )))
+            .unwrap();
+        let (save, result) = take_save_result(&mut retiring).unwrap();
+        apply_save_result(
+            &uiw,
+            save,
+            result,
+            SaveDisposition::Retired { deleted: false },
+        );
+        assert_eq!(
+            uiw.read::<SaveLoadState>().saved_progress,
+            Some(new_progress)
+        );
+        assert_eq!(uiw.read::<SessionState>().snapshot_slot(), Some(&new_slot));
+        assert_eq!(
+            uiw.read::<SaveLoadState>().notice.as_ref().unwrap().1,
+            "City saved. Could not save replay."
+        );
     }
 
     #[test]

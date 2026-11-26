@@ -1,3 +1,5 @@
+use std::io::{self, Write};
+
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -265,10 +267,13 @@ fn register_utility_water_sample() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "utility_water_sample",
             optional: true,
-            save: Box::new(|sim| {
+            save: Box::new(|sim, output| {
                 let flow = sim.read::<UtilityFlow>();
                 // The live reader validates membership after reload on dry maps as well.
-                Bincode::encode(&(flow.sampled_water_revision, &flow.sampled_members)).unwrap()
+                Bincode::encode_writer(
+                    &(flow.sampled_water_revision, &flow.sampled_members),
+                    output,
+                )
             }),
             load: Box::new(|sim, data| {
                 let mut input = data;
@@ -292,7 +297,9 @@ fn register_simulation_options() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "simoptions",
             optional: false,
-            save: Box::new(|sim| Bincode::encode(&*sim.read::<SimulationOptions>()).unwrap()),
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&*sim.read::<SimulationOptions>(), output)
+            }),
             load: Box::new(|sim, data| {
                 let mut input = data;
                 let (terrain_size, save_replay, preset, seed, starting_money_bucks, progression) =
@@ -328,7 +335,9 @@ fn register_land_ownership() {
             // A legacy world defaults to unrestricted. Tiled provenance still
             // requires a matching mask in the post-load validator.
             optional: true,
-            save: Box::new(|sim| crate::map::encode_land(sim.map().land_ownership()).unwrap()),
+            save: Box::new(|sim, output| {
+                output.write_all(&crate::map::encode_land(sim.map().land_ownership())?)
+            }),
             load: Box::new(|sim, data| {
                 sim.map_mut()
                     .install_land_ownership(crate::map::decode_land(data)?);
@@ -343,7 +352,9 @@ fn register_pending_construction_cuts() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "pending_construction_cuts",
             optional: true,
-            save: Box::new(|sim| Bincode::encode(&sim.map().pending_construction_cuts).unwrap()),
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&sim.map().pending_construction_cuts, output)
+            }),
             load: Box::new(|sim, data| {
                 let mut map = sim.map_mut();
                 map.pending_construction_cuts =
@@ -390,7 +401,7 @@ fn register_lot_layout() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "lot_layout",
             optional: true,
-            save: Box::new(|sim| Bincode::encode(&sim.map().lot_layout).unwrap()),
+            save: Box::new(|sim, output| Bincode::encode_writer(&sim.map().lot_layout, output)),
             load: Box::new(|sim, data| {
                 sim.map_mut().lot_layout = Bincode::decode(data)?;
                 Ok(())
@@ -407,7 +418,7 @@ fn register_road_frontage() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "road_frontage",
             optional: true,
-            save: Box::new(|sim| Bincode::encode(&sim.map().no_frontage).unwrap()),
+            save: Box::new(|sim, output| Bincode::encode_writer(&sim.map().no_frontage, output)),
             load: Box::new(|sim, data| {
                 sim.map_mut().no_frontage = Bincode::decode(data)?;
                 Ok(())
@@ -424,7 +435,9 @@ fn register_cargo_progress() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "cargo_progress",
             optional: true,
-            save: Box::new(|sim| Bincode::encode(&sim.read::<CargoBook>().progress).unwrap()),
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&sim.read::<CargoBook>().progress, output)
+            }),
             load: Box::new(|sim, data| {
                 sim.write::<CargoBook>().progress = Bincode::decode(data)?;
                 Ok(())
@@ -457,10 +470,12 @@ fn register_transport_grid() {
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name: "transport_grid",
             optional: false,
-            save: Box::new(|sim| {
-                let data = Bincode::encode(&*sim.read::<TransportGrid>()).unwrap();
-                let sorted: SavedTransportGrid = Bincode::decode(&data).unwrap();
-                Bincode::encode(&sorted).unwrap()
+            save: Box::new(|sim, output| {
+                let mut data = crate::SlotBuffer::new(output.remaining());
+                Bincode::encode_writer(&*sim.read::<TransportGrid>(), &mut data)?;
+                let sorted: SavedTransportGrid = Bincode::decode(&data.bytes)?;
+                drop(data);
+                Bincode::encode_writer(&sorted, output)
             }),
             load: Box::new(|sim, data| {
                 sim.insert(Bincode::decode::<TransportGrid>(data)?);
@@ -478,8 +493,16 @@ pub(crate) struct SaveLoadFunc {
     pub name: &'static str,
     /// Saves without this entry keep the value set by the init functions.
     pub optional: bool,
-    pub save: Box<dyn Fn(&Simulation) -> Vec<u8> + 'static>,
+    pub save: Box<dyn Fn(&Simulation, &mut crate::SlotBuffer) -> io::Result<()> + 'static>,
     pub load: Box<dyn Fn(&mut Simulation, &[u8]) -> std::io::Result<()> + 'static>,
+}
+
+impl SaveLoadFunc {
+    pub fn encode(&self, sim: &Simulation) -> Vec<u8> {
+        let mut output = crate::SlotBuffer::new(usize::MAX);
+        (self.save)(sim, &mut output).unwrap();
+        output.bytes
+    }
 }
 
 pub(crate) struct GSystem {
@@ -555,7 +578,7 @@ fn register_resource_noinit<T: 'static + Send + Sync + Serialize + DeserializeOw
         SAVELOAD_FUNCS.push(SaveLoadFunc {
             name,
             optional: false,
-            save: Box::new(move |uiworld| E::encode(&*uiworld.read::<T>()).unwrap()),
+            save: Box::new(move |sim, output| E::encode_writer(&*sim.read::<T>(), output)),
             load: Box::new(move |sim, data| {
                 sim.resources.insert(E::decode::<T>(data)?);
                 Ok(())

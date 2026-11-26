@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use common::saveload::{self, SlotId};
 
@@ -12,6 +12,10 @@ struct Publication {
     generation: u64,
     next_id: u64,
     request: Option<(SlotId, Weak<AtomicBool>)>,
+}
+
+pub(crate) struct PublicationGuard<'a> {
+    _state: MutexGuard<'a, Publication>,
 }
 
 #[derive(Clone)]
@@ -48,11 +52,19 @@ impl SaveCoordinator {
         })
     }
 
-    /// The caller completes capture and encoding before publishing.
-    /// Hold the gate through the snapshot rename and the sidecar updates.
-    pub(crate) fn publish<T>(&self, permit: &SavePermit, publish: impl FnOnce() -> T) -> Option<T> {
+    /// Enter after capture, encoding and replay staging. Keep the gate
+    /// through snapshot replacement and the sidecar updates.
+    pub(crate) fn begin_publish(&self, permit: &SavePermit) -> Option<PublicationGuard<'_>> {
         let state = self.0.lock().unwrap();
-        state.allows(permit).then(publish)
+        state
+            .allows(permit)
+            .then_some(PublicationGuard { _state: state })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn publish<T>(&self, permit: &SavePermit, publish: impl FnOnce() -> T) -> Option<T> {
+        let _guard = self.begin_publish(permit)?;
+        Some(publish())
     }
 
     pub(crate) fn delete(&self, generation: u64, root: &Path, id: &SlotId) -> std::io::Result<()> {

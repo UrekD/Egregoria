@@ -26,7 +26,7 @@ use std::any::Any;
 use std::collections::BTreeMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
-use std::io::{Read, Seek};
+use std::io::{Read, Seek, Write};
 use std::path::Path;
 use std::ptr::addr_of;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -734,8 +734,8 @@ impl Simulation {
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let a = (l.save)(self);
-                let b = (l.save)(other);
+                let a = l.encode(self);
+                let b = l.encode(other);
 
                 if a != b {
                     std::fs::write(format!("{}_a.json", l.name), &*String::from_utf8_lossy(&a))
@@ -968,7 +968,7 @@ impl Simulation {
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
-                let v = (l.save)(self);
+                let v = l.encode(self);
                 hashes.insert(l.name.to_string(), common::hash_u64(&*v));
             }
         }
@@ -1128,6 +1128,14 @@ impl Simulation {
 
     /// Captures the current save boundary. The returned data can be encoded off the simulation.
     pub fn capture_slot(&self, revision: SnapshotRevision) -> Result<SlotCapture, SaveLoadError> {
+        self.capture_slot_with_limit(revision, MAX_SNAPSHOT_BYTES)
+    }
+
+    fn capture_slot_with_limit(
+        &self,
+        revision: SnapshotRevision,
+        limit: usize,
+    ) -> Result<SlotCapture, SaveLoadError> {
         let header = RegistrySlotSnapshotHeader {
             slot: SlotSnapshotHeader {
                 magic: REGISTRY_SLOT_MAGIC,
@@ -1136,18 +1144,16 @@ impl Simulation {
             },
             registry: prototypes::prototypes().fingerprint(),
         };
-        // Bincode emits tuples and structs as consecutive fields. Keep this prefix
-        // to append the resource map on the encoding worker. Capture the independent
-        // fragments in parallel while the caller holds the world at one boundary.
-        let (world, resources) = rayon::join(
-            || {
-                Bincode::encode(&(header, SaveHeader::current(), &self.world))
-                    .map(|prefix| (prefix, self.read::<Replay>().clone()))
-            },
-            || self.snapshot_resources(false),
-        );
-        let (prefix, replay) = world.map_err(SaveLoadError::Encode)?;
-        let resources = resources.map_err(SaveLoadError::Encode)?;
+        // Serialize consecutive wire fields into owned fragments at this boundary.
+        // All fragments draw from the same budget, including their map framing.
+        let (prefix, resources) = (|| {
+            let mut prefix = SlotBuffer::new(limit);
+            Bincode::encode_writer(&(header, SaveHeader::current(), &self.world), &mut prefix)?;
+            let resources = self.snapshot_resources(false, prefix.remaining())?;
+            Ok((prefix.bytes, resources))
+        })()
+        .map_err(|error| slot_encode_error(error, limit))?;
+        let replay = self.read::<Replay>().clone();
         let scale = self.population_scale();
         Ok(SlotCapture {
             prefix,
@@ -1270,30 +1276,50 @@ impl Simulation {
 }
 
 impl Simulation {
-    fn snapshot_resources(&self, encode_replay: bool) -> io::Result<FastMap<String, Vec<u8>>> {
+    fn snapshot_resources(
+        &self,
+        encode_replay: bool,
+        mut remaining: usize,
+    ) -> io::Result<FastMap<String, Vec<u8>>> {
         let mut resources = FastMap::default();
-        unsafe {
-            for l in &*addr_of!(SAVELOAD_FUNCS) {
-                // Insert replay at its usual position even when encoding it later.
-                // Hash map insertion and growth determine the legacy wire order.
-                let payload = if !encode_replay && l.name == ReplayJson::RESOURCE_NAME {
-                    Vec::new()
-                } else {
-                    (l.save)(self)
-                };
-                resources.insert(l.name.to_string(), payload);
-            }
+        let registry = prototypes::try_prototypes();
+        let registered = unsafe { &*addr_of!(SAVELOAD_FUNCS) };
+        charge_slot_bytes(
+            &mut remaining,
+            Bincode::encoded_size(&(registered.len() + 1 + usize::from(registry.is_some())))?,
+        )?;
+
+        let mut capture = |name: &str, save: &dyn Fn(&mut SlotBuffer) -> io::Result<()>| {
+            // Charge the name and the shortest length field before allocating.
+            charge_slot_bytes(&mut remaining, Bincode::encoded_size(&(name, 0usize))?)?;
+            let mut payload = SlotBuffer::new(slot_payload_limit(remaining)?);
+            save(&mut payload)?;
+            charge_slot_bytes(&mut remaining, payload.bytes.len())?;
+            charge_slot_bytes(
+                &mut remaining,
+                Bincode::encoded_size(&payload.bytes.len())? - 1,
+            )?;
+            resources.insert(name.to_string(), payload.bytes);
+            Ok::<_, io::Error>(())
+        };
+        for resource in registered {
+            // Insert the placeholder at the original position to preserve the
+            // legacy FxHashMap iteration order, including growth on insertion.
+            capture(resource.name, &|output| {
+                if encode_replay || resource.name != ReplayJson::RESOURCE_NAME {
+                    (resource.save)(self, output)?;
+                }
+                Ok(())
+            })?;
         }
-        if let Some(registry) = prototypes::try_prototypes() {
-            resources.insert(
-                "prototype_registry".into(),
-                Bincode::encode(&registry.fingerprint())?,
-            );
+        if let Some(registry) = registry {
+            capture("prototype_registry", &|output| {
+                Bincode::encode_writer(&registry.fingerprint(), output)
+            })?;
         }
-        resources.insert(
-            "map_origin".into(),
-            Bincode::encode(&*self.read::<MapOrigin>())?,
-        );
+        capture("map_origin", &|output| {
+            Bincode::encode_writer(&*self.read::<MapOrigin>(), output)
+        })?;
         Ok(resources)
     }
 }
@@ -1306,7 +1332,7 @@ impl Serialize for Simulation {
         log::info!("serializing sim state");
         let t = Instant::now();
         let res = self
-            .snapshot_resources(true)
+            .snapshot_resources(true, usize::MAX)
             .map_err(serde::ser::Error::custom)?;
         log::info!("took {}s to serialize resources", t.elapsed().as_secs_f32());
 
@@ -1506,6 +1532,85 @@ pub enum SavePhase {
 }
 
 /// Owned state for a single revision of a city.
+/// Limit Vec growth before writing, including when a serializer emits many small writes.
+struct SlotBuffer {
+    bytes: Vec<u8>,
+    limit: usize,
+}
+
+impl SlotBuffer {
+    fn new(limit: usize) -> Self {
+        Self {
+            bytes: Vec::new(),
+            limit,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit - self.bytes.len()
+    }
+
+    #[cold]
+    fn grow(&mut self, size: usize) -> io::Result<()> {
+        if size > self.remaining() {
+            return Err(slot_limit_error());
+        }
+        let len = self.bytes.len();
+        let capacity = self.bytes.capacity().saturating_mul(2).max(4096);
+        let capacity = capacity.max(len + size).min(self.limit);
+        self.bytes
+            .try_reserve_exact(capacity - len)
+            .map_err(io::Error::other)
+    }
+}
+
+impl Write for SlotBuffer {
+    #[inline]
+    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+        self.write_all(input)?;
+        Ok(input.len())
+    }
+
+    #[inline(always)]
+    fn write_all(&mut self, input: &[u8]) -> io::Result<()> {
+        if input.len() > self.bytes.capacity().min(self.limit) - self.bytes.len() {
+            self.grow(input.len())?;
+        }
+        self.bytes.extend_from_slice(input);
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn slot_limit_error() -> io::Error {
+    io::Error::from(io::ErrorKind::FileTooLarge)
+}
+
+fn charge_slot_bytes(remaining: &mut usize, bytes: usize) -> io::Result<()> {
+    *remaining = remaining.checked_sub(bytes).ok_or_else(slot_limit_error)?;
+    Ok(())
+}
+
+/// Includes the variable-length Bincode length field, whose first byte is already charged.
+fn slot_payload_limit(remaining: usize) -> io::Result<usize> {
+    let mut payload = remaining;
+    while Bincode::encoded_size(&payload)? - 1 > remaining - payload {
+        payload -= 1;
+    }
+    Ok(payload)
+}
+
+fn slot_encode_error(error: io::Error, limit: usize) -> SaveLoadError {
+    if error.kind() == io::ErrorKind::FileTooLarge {
+        SaveLoadError::SnapshotTooLarge { limit }
+    } else {
+        SaveLoadError::Encode(error)
+    }
+}
+
 pub struct SlotCapture {
     prefix: Vec<u8>,
     resources: FastMap<String, Vec<u8>>,
@@ -1533,29 +1638,43 @@ impl SlotCapture {
             persons_per_agent,
             money_cents,
         } = self;
-        let embedded = ReplayJson::encode(&replay).map_err(SaveLoadError::Encode)?;
-        *resources
-            .get_mut(ReplayJson::RESOURCE_NAME)
-            .expect("the replay resource is registered") = embedded;
-
-        // Match Bincode's map and byte-sequence lengths, then copy each payload
-        // directly instead of serializing its bytes one at a time.
-        Bincode::encode_writer(&resources.len(), &mut bytes).map_err(SaveLoadError::Encode)?;
-        for (name, payload) in resources {
-            Bincode::encode_writer(&(name, payload.len()), &mut bytes)
-                .map_err(SaveLoadError::Encode)?;
-            if bytes.len() > limit || payload.len() > limit - bytes.len() {
-                return Err(SaveLoadError::SnapshotTooLarge { limit });
+        let snapshot = (|| {
+            // Reject the known contribution before writing any embedded JSON.
+            let mut remaining = limit;
+            charge_slot_bytes(&mut remaining, bytes.len())?;
+            charge_slot_bytes(&mut remaining, Bincode::encoded_size(&resources.len())?)?;
+            for (name, payload) in &resources {
+                charge_slot_bytes(
+                    &mut remaining,
+                    Bincode::encoded_size(&(name, payload.len()))?,
+                )?;
+                charge_slot_bytes(&mut remaining, payload.len())?;
             }
-            bytes.extend_from_slice(&payload);
-        }
-        let snapshot = CompressedBincode::compress(&bytes);
-        drop(bytes);
-        let replay = replay
-            .enabled
-            .then(|| ReplayJson::encode_sidecar(&replay, revision))
-            .transpose()
-            .map_err(AtomicWriteError::PreCommit);
+
+            let mut embedded = SlotBuffer::new(slot_payload_limit(remaining)?);
+            ReplayJson::encode_writer(&replay, &mut embedded)?;
+            charge_slot_bytes(&mut remaining, embedded.bytes.len())?;
+            charge_slot_bytes(
+                &mut remaining,
+                Bincode::encoded_size(&embedded.bytes.len())? - 1,
+            )?;
+            *resources
+                .get_mut(ReplayJson::RESOURCE_NAME)
+                .expect("the replay resource is registered") = embedded.bytes;
+
+            // The final size is known. Preserve wire order and copy payloads directly.
+            bytes
+                .try_reserve_exact(limit - remaining - bytes.len())
+                .map_err(io::Error::other)?;
+            Bincode::encode_writer(&resources.len(), &mut bytes)?;
+            for (name, payload) in resources {
+                Bincode::encode_writer(&(name, payload.len()), &mut bytes)?;
+                bytes.extend_from_slice(&payload);
+            }
+            Ok(CompressedBincode::compress(&bytes))
+        })()
+        .map_err(|error| slot_encode_error(error, limit))?;
+        let replay = replay.enabled.then_some(replay);
         Ok(EncodedSlot {
             snapshot,
             replay,
@@ -1572,7 +1691,7 @@ impl SlotCapture {
 
 pub struct EncodedSlot {
     snapshot: Vec<u8>,
-    replay: Result<Option<Vec<u8>>, AtomicWriteError>,
+    replay: Option<Replay>,
     display_name: Option<String>,
     camera: Option<SlotCamera>,
     revision: SnapshotRevision,
@@ -1596,13 +1715,58 @@ impl EncodedSlot {
     /// Publishes a snapshot followed by its sidecars. The caller coordinates
     /// publication and deletion of the same slot.
     pub fn publish(self, root: &Path, id: &SlotId) -> Result<SavePhase, SaveLoadError> {
-        let paths = saveload::slot_paths(root, id)
-            .map_err(|error| SaveLoadError::SnapshotWrite(AtomicWriteError::PreCommit(error)))?;
-        saveload::write_atomic(&paths.zip, &self.snapshot).map_err(SaveLoadError::SnapshotWrite)?;
-        let replay = self.replay.and_then(|bytes| match bytes {
-            Some(bytes) => saveload::write_atomic(&paths.replay, &bytes),
-            None => remove_replay(&paths.replay).map_err(AtomicWriteError::PreCommit),
+        self.publish_with_gate(root, id, || Some(())).unwrap()
+    }
+
+    /// Stream replay staging before acquiring the publication gate. The gate
+    /// covers snapshot replacement and all sidecar changes.
+    pub fn publish_with_gate<G>(
+        self,
+        root: &Path,
+        id: &SlotId,
+        acquire: impl FnOnce() -> Option<G>,
+    ) -> Option<Result<SavePhase, SaveLoadError>> {
+        let paths = match saveload::slot_paths(root, id) {
+            Ok(paths) => paths,
+            Err(error) => {
+                return Some(Err(SaveLoadError::SnapshotWrite(
+                    AtomicWriteError::PreCommit(error),
+                )))
+            }
+        };
+        let mut acquire = Some(acquire);
+        let mut guard = None;
+        let mut snapshot_result = None;
+        let mut commit_snapshot = || {
+            snapshot_result
+                .get_or_insert_with(|| {
+                    guard = acquire.take().unwrap()();
+                    guard.as_ref()?;
+                    Some(saveload::write_atomic(&paths.zip, &self.snapshot))
+                })
+                .as_ref()
+                .is_some_and(Result::is_ok)
+        };
+
+        // The buffered writer has flushed the full pretty JSON before the
+        // gate is taken. If staging fails, still try to publish the snapshot.
+        let staged_replay = self.replay.as_ref().map(|replay| {
+            saveload::write_atomic_with(&paths.replay, |output| {
+                ReplayJson::write_sidecar(replay, self.revision, &mut *output)?;
+                output.flush()?;
+                if commit_snapshot() {
+                    Ok(())
+                } else {
+                    Err(io::Error::other("Snapshot was not published"))
+                }
+            })
         });
+        commit_snapshot();
+        if let Err(error) = snapshot_result.unwrap()? {
+            return Some(Err(SaveLoadError::SnapshotWrite(error)));
+        }
+        let replay = staged_replay
+            .unwrap_or_else(|| remove_replay(&paths.replay).map_err(AtomicWriteError::PreCommit));
         let meta = SlotMeta {
             display_name: self.display_name.unwrap_or_else(|| id.to_string()),
             game_tick: self.game_tick,
@@ -1617,13 +1781,13 @@ impl EncodedSlot {
             camera: self.camera,
         };
         let meta = saveload::write_slot_meta(root, id, &meta);
-        match (replay, meta) {
-            (Ok(()), Ok(())) => Ok(SavePhase::Complete),
-            (replay, meta) => Ok(SavePhase::SidecarsFailed {
+        Some(Ok(match (replay, meta) {
+            (Ok(()), Ok(())) => SavePhase::Complete,
+            (replay, meta) => SavePhase::SidecarsFailed {
                 replay: replay.err(),
                 meta: meta.err(),
-            }),
-        }
+            },
+        }))
     }
 }
 
