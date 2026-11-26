@@ -524,7 +524,7 @@ fn deviation(a: &[Vec2], b: &[Vec2]) -> f32 {
     directed(a, b).max(directed(b, a))
 }
 
-fn curve(from: Vec2, to: Vec2, elbow: Vec2) -> Spline {
+pub(super) fn curve(from: Vec2, to: Vec2, elbow: Vec2) -> Spline {
     let RoadSegmentKind::Curved((from_derivative, to_derivative)) =
         RoadSegmentKind::from_elbow(from, to, elbow)
     else {

@@ -434,6 +434,12 @@ fn prepare_opening(
         let (building, _) = place_company(sim, plan, &roads, "bakery", at(x, y))?;
         sites.insert(name.into(), building);
     }
+    if profiled_wet {
+        // Reserve the eastern market bakery before the South housing lots use
+        // all of its immediate frontage.
+        let (building, _) = place_company(sim, plan, &roads, "bakery", at(2580.0, 1098.0))?;
+        sites.insert("south/market-bakery".into(), building);
+    }
     // Leave a park site within the dense blocks before assigning their frontage
     // to housing, in places where fitting a park afterwards would displace a lot.
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
@@ -573,7 +579,9 @@ fn prepare_opening(
             ("west/rim-bakery", "west", 570.0, 1788.0),
             ("west/northwest-bakery", "west", 718.0, 1948.0),
             ("south/alpska-bakery", "south", 2613.0, 1288.0),
+            ("south/east-rim-bakery", "south", 2670.0, 1270.0),
             ("station/east-bakery", "station", 2070.0, 1775.0),
+            ("station/north-bakery", "station", 2110.0, 1903.0),
         ] {
             let bakery = place_company_around_parcels(sim, "bakery", at(x, y), Some(district))?;
             sites.insert(name.into(), bakery);
@@ -4300,6 +4308,17 @@ mod tests {
             let rim = super::super::layout::design_point(vec2(718.0, 1948.0), plan.config);
             let bakery = &map.buildings()[opening.sites["west/northwest-bakery"]];
             assert!(bakery.door_pos.xy().distance(rim) <= 150.0);
+            for (name, x, y) in [
+                ("south/east-rim-bakery", 2670.0, 1270.0),
+                ("south/market-bakery", 2580.0, 1098.0),
+                ("station/north-bakery", 2110.0, 1903.0),
+            ] {
+                let anchor = super::super::layout::design_point(vec2(x, y), plan.config);
+                let building = opening.sites.get(name).unwrap_or_else(|| panic!("missing local bakery {name}"));
+                let door = map.buildings()[*building].door_pos.xy();
+                assert!(door.distance(anchor) <= 125.0,
+                    "{name} should serve its nearby housing and work frontage, door at {door:?}");
+            }
             let south = super::super::layout::design_point(vec2(2390.0, 1125.0), plan.config);
             let depot = &map.buildings()[opening.sites["south/east-garbage-depot"]];
             assert!(depot.door_pos.xy().distance(south) <= 150.0);
@@ -4378,6 +4397,11 @@ mod tests {
             road.lanes_iter().all(|(_, kind)| kind != LaneKind::Parking),
             "the Hraška school bend must keep curb manoeuvres clear of the turn onto the collector",
         );
+        let exit = built.links[&SourceKey::Way { id: 1426155807, span: 0 }].road;
+        let (_, entering) = road.points().point_dir_along(road.points().length());
+        let (_, leaving) = map.roads()[exit].points().point_dir_along(0.0);
+        assert!(entering.xy().dot(leaving.xy()) > 0.95,
+            "the collector arms at the Hraška school bend need a shared tangent");
         let ridge = built.links[&SourceKey::Way { id: 419255436, span: 2 }].road;
         let park = built.links[&SourceKey::Authored("hraska-park-approach")].road;
         let west = super::super::layout::design_point(vec2(1502.9, 2293.9), plan.config);

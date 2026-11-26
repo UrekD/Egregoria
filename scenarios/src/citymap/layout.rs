@@ -1,7 +1,7 @@
 use super::network::{
-    calibrate_storage, clean_network, connect_infill, finish_network, main_components, move_junction,
-    retire_outer_road_fragments, segment_parameters, Graph, JunctionSpec, LinkSpec, RoadClass,
-    SourceKey, SpacingLimits,
+    calibrate_storage, clean_network, connect_infill, curve, finish_network, main_components,
+    move_junction, retire_outer_road_fragments, segment_parameters, Graph, JunctionSpec, LinkSpec,
+    RoadClass, SourceKey, SpacingLimits,
 };
 use super::source::{
     serialize_point, serialize_points, Coordinate, Element, Kind, PinnedInputs, TownConfig,
@@ -1300,15 +1300,7 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
             plan.graph.record(reason, &[key]);
         }
     }
-    let school_approach = SourceKey::Way { id: 461688158, span: 1 };
-    if let Some(link) = plan.graph.links.get(&school_approach) {
-        // Extend the approach to fit the Collector's 90 m of usable lane storage.
-        let [approach, bend] = link.endpoints;
-        let from = plan.graph.junctions[&approach].position.xy();
-        let at = plan.graph.junctions[&bend].position.xy();
-        move_junction(&mut plan.graph, bend, at + (at - from).normalize() * 16.0);
-        plan.graph.record("lengthen the Hraška school approach for collector storage", &[school_approach, bend]);
-    }
+    round_hraska_school_bend(&mut plan.graph);
     let hraska_egress = SourceKey::Node {
         id: 4193639666,
         rail: false,
@@ -1347,6 +1339,35 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn round_hraska_school_bend(graph: &mut Graph) {
+    let approach = SourceKey::Way { id: 461688158, span: 1 };
+    let exit = SourceKey::Way { id: 1426155807, span: 0 };
+    let (Some(incoming), Some(outgoing)) = (graph.links.get(&approach), graph.links.get(&exit)) else {
+        return;
+    };
+    let [from, bend] = incoming.endpoints;
+    let [corner, to] = outgoing.endpoints;
+    if bend != corner {
+        return;
+    }
+    let from = graph.junctions[&from].position.xy();
+    let original = graph.junctions[&bend].position.xy();
+    let to = graph.junctions[&to].position.xy();
+    // Retain the Collector's storage and give both arms one tangent at the bend.
+    let at = original + (original - from).normalize() * 16.0;
+    let tangent = ((at - from).normalize() + (to - at).normalize()).normalize();
+    move_junction(graph, bend, at);
+    for (key, a, b, elbow) in [
+        (approach, from, at, at - tangent * (at.distance(from) * 0.5)),
+        (exit, at, to, at + tangent * (to.distance(at) * 0.5)),
+    ] {
+        let link = graph.links.get_mut(&key).unwrap();
+        link.elbow = Some(elbow);
+        link.points = curve(a, b, elbow).points(25).collect();
+    }
+    graph.record("round the Hraška school bend without a sharp turn between the two collectors", &[approach, bend, exit]);
 }
 
 fn connect_south_walk(graph: &mut Graph) -> Result<(), String> {
