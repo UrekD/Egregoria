@@ -286,7 +286,28 @@ impl Admission {
     }
 
     fn cancel_write(&self) {
-        self.state.fetch_and(!INTENT, Ordering::Release);
+        self.release(INTENT);
+    }
+
+    fn release(&self, flags: u8) -> u8 {
+        let redraw_ready = |state| state & WAITING != 0 && Self::can_read(state & !flags);
+        let state = self
+            .state
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                let next = state & !flags;
+                Some(if redraw_ready(state) {
+                    (next & !WAITING) | REDRAW
+                } else {
+                    next
+                })
+            })
+            .unwrap();
+        if redraw_ready(state) {
+            if let Some(wake) = self.redraw_waker.get() {
+                wake();
+            }
+        }
+        state
     }
 
     fn write(&self) -> Result<Turn<'_>, WorkerWait> {
@@ -327,26 +348,11 @@ impl Admission {
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
-        if self.reader {
-            let state = self.admission.state.fetch_and(!READER, Ordering::Release);
-            if state & INTENT != 0 {
-                if let Some(worker) = self.admission.worker.get() {
-                    worker.unpark();
-                }
-            }
-        } else {
-            let state = self
-                .admission
-                .state
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                    let redraw = if state & WAITING != 0 { REDRAW } else { 0 };
-                    Some((state & !(WRITER | INTENT | WAITING)) | redraw)
-                })
-                .unwrap();
-            if state & WAITING != 0 {
-                if let Some(wake) = self.admission.redraw_waker.get() {
-                    wake();
-                }
+        let released = if self.reader { READER } else { WRITER | INTENT };
+        let state = self.admission.release(released);
+        if self.reader && state & INTENT != 0 {
+            if let Some(worker) = self.admission.worker.get() {
+                worker.unpark();
             }
         }
     }

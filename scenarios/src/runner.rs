@@ -156,8 +156,15 @@ impl ScenarioCtx {
     pub(crate) fn initialize() {
         static INIT: Once = Once::new();
         INIT.call_once(|| {
-            // Packaged benchmarks have their runtime data next to the executable.
-            if !Path::new("base_mod/data.lua").is_file() {
+            let executable = std::env::current_exe().ok();
+            let runtime = executable
+                .as_deref()
+                .and_then(Path::parent)
+                .filter(|dir| dir.join("base_mod/data.lua").is_file());
+            if let Some(runtime) = runtime {
+                std::env::set_current_dir(runtime)
+                    .expect("could not set the working directory to the executable directory");
+            } else {
                 ensure_repo_root_cwd();
             }
             simulation::init::init();

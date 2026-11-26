@@ -23,6 +23,8 @@ Close the game and run this from the extracted `egregoria` folder in PowerShell.
 .\scenarios.exe bench-slot --root .\world --slot lesce_town --warmup 500 --ticks 3000 > lesce-town-bench.json
 ```
 
+The benchmark loads prototypes from `base_mod` beside the executable, with the source checkout as a fallback for development builds. Relative `--root` paths resolve from the directory where you launch the command.
+
 The top-level `ticks_per_sec` field reports completed simulation steps per wall-clock second during the 3,000 measured ticks. Divide it by 50 to compare with the game's MAX readout. Use `--slot lesce_osm` if you reproduced the slowdown in the Lesce OpenStreetMap import. The benchmark loads the selected save and runs it in memory. Share the benchmark JSON alongside the frame report for the same city.
 
 ## Reading the report
