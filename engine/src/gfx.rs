@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use wgpu::util::{backend_bits_from_env, BufferInitDescriptor, DeviceExt};
@@ -19,6 +20,7 @@ use winit::window::{Fullscreen, Window};
 use common::FastMap;
 use geom::{vec2, Camera, InfiniteFrustrum, LinearColor, Matrix4, Plane, Vec2, Vec3};
 
+use crate::frame_profile::{timestamp_features, CpuPhase, FrameProfile, GpuPass, ProfileMode};
 use crate::meshload::{load_mesh, LoadMeshError};
 use crate::passes::{BackgroundPipeline, Pbr};
 use crate::perf_counters::PerfCounters;
@@ -84,6 +86,7 @@ pub struct GfxContext {
     pub(crate) adapter: Adapter,
 
     pub perf: PerfCounters,
+    pub frame_profile: Option<Box<FrameProfile>>,
 }
 
 #[derive(Serialize, Deserialize, Copy, Clone, Eq, PartialEq)]
@@ -262,6 +265,20 @@ impl<'a> FrameContext<'a> {
     }
 }
 
+struct EncodeJobs(Option<AtomicU64>);
+
+impl EncodeJobs {
+    fn measure<T>(&self, job: impl FnOnce() -> T) -> T {
+        let Some(nanos) = &self.0 else {
+            return job();
+        };
+        let start = Instant::now();
+        let result = job();
+        nanos.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        result
+    }
+}
+
 impl GfxContext {
     pub async fn new(window: Arc<Window>) -> Self {
         let mut backends = backend_bits_from_env().unwrap_or_else(Backends::all);
@@ -294,12 +311,23 @@ impl GfxContext {
             .expect("failed to find a suitable adapter");
 
         let limit = wgpu::Limits::default();
+        let profile_mode = ProfileMode::from_env();
+        let required_features = if profile_mode.is_some() {
+            timestamp_features(
+                profile_mode,
+                adapter.features(),
+                adapter.get_info().backend,
+                adapter.get_downlevel_capabilities().flags,
+            )
+        } else {
+            wgpu::Features::empty()
+        };
 
         let (device, queue) = adapter
             .request_device(
                 &wgpu::DeviceDescriptor {
                     label: None,
-                    required_features: wgpu::Features::empty(),
+                    required_features,
                     required_limits: limit,
                 },
                 None,
@@ -414,6 +442,8 @@ impl GfxContext {
         );
         let tess_material_id = materials.insert(tess_material);
 
+        let frame_profile =
+            profile_mode.map(|mode| Box::new(FrameProfile::new(mode, &device, &queue)));
         let mut me = Self {
             window,
             size: (win_width, win_height, win_scale_factor),
@@ -452,6 +482,7 @@ impl GfxContext {
             defines_changed: false,
             settings: None,
             perf: Default::default(),
+            frame_profile,
             mipmap_gen,
         };
 
@@ -465,6 +496,54 @@ impl GfxContext {
         me.set_texture("assets/sprites/palette.png", palette);
 
         me
+    }
+
+    pub fn adapter_info(&self) -> wgpu::AdapterInfo {
+        self.adapter.get_info()
+    }
+
+    #[inline]
+    pub fn profile_timer(&self) -> Option<Instant> {
+        self.frame_profile.as_ref().map(|_| Instant::now())
+    }
+
+    #[inline]
+    pub fn profile_elapsed(&mut self, phase: CpuPhase, start: Option<Instant>) {
+        if let (Some(profile), Some(start)) = (&mut self.frame_profile, start) {
+            profile.record_cpu(phase, start.elapsed());
+        }
+    }
+
+    pub(crate) fn profile_presented(&mut self, frame_start: Instant) {
+        if let Some(profile) = &mut self.frame_profile {
+            profile.record_present(
+                self.tick,
+                frame_start,
+                Instant::now(),
+                [self.size.0, self.size.1],
+                match self.sc_desc.present_mode {
+                    wgpu::PresentMode::Fifo => "fifo",
+                    wgpu::PresentMode::AutoVsync => "auto_vsync",
+                    wgpu::PresentMode::AutoNoVsync => "auto_no_vsync",
+                    _ => "other",
+                },
+                self.settings.unwrap_or_default(),
+            );
+            profile.collect_ready(&self.device);
+        }
+    }
+
+    pub(crate) fn timestamps(&self, pass: GpuPass) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.group_timestamps(pass, true, true)
+    }
+
+    pub(crate) fn group_timestamps(
+        &self,
+        pass: GpuPass,
+        begin: bool,
+        end: bool,
+    ) -> Option<wgpu::RenderPassTimestampWrites<'_>> {
+        self.frame_profile.as_ref()?.timestamp_writes(pass, begin, end)
     }
 
     pub fn register_material(&mut self, material: Material) -> MaterialID {
@@ -687,8 +766,12 @@ impl GfxContext {
         }
 
         self.render_params.upload_to_gpu(&self.queue);
-        self.lamplights
-            .apply_changes(&self.queue, &self.device, &mut before_main);
+        self.lamplights.apply_changes_profiled(
+            &self.queue,
+            &self.device,
+            &mut before_main,
+            self.frame_profile.as_deref(),
+        );
 
         (
             Encoders {
@@ -746,49 +829,61 @@ impl GfxContext {
 
         let mut gui_elapsed = 0.0;
 
-        if self.settings.map(|v| v.parallel_render).unwrap_or(false) {
+        let encode = EncodeJobs(self.frame_profile.is_some().then(AtomicU64::default));
+        let pbr = || encode.measure(|| self.pbr_prepass());
+        let depth = || encode.measure(|| self.depth_prepass(objsref));
+        let main = || encode.measure(|| self.main_render_pass(target, objsref));
+        let before_main = |encoder: &mut CommandEncoder| {
+            encode.measure(|| {
+                passes::render_ssao(self, encoder);
+                passes::render_fog(self, encoder);
+            });
+        };
+        let after_main = |encoder: &mut CommandEncoder| {
+            encode.measure(|| {
+                passes::render_background(self, encoder, target);
+                passes::gen_ui_blur(self, encoder, target);
+            });
+        };
+        let parallel = self.settings.is_some_and(|v| v.parallel_render);
+        if parallel {
             rayon::in_place_scope(|scope| {
                 scope.spawn(|_| {
-                    encs.pbr = self.pbr_prepass();
+                    encs.pbr = pbr();
                 });
                 scope.spawn(|_| {
-                    encs.depth_prepass = Some(self.depth_prepass(objsref));
+                    encs.depth_prepass = Some(depth());
                 });
                 scope.spawn(|_| {
                     use rayon::prelude::*;
                     if self.render_params.value().shadow_mapping_resolution != 0 {
-                        encs.smap = self.shadow_map_pass(objsref).par_bridge().collect();
+                        encs.smap = self.shadow_map_pass(objsref, &encode).par_bridge().collect();
                     }
                 });
                 scope.spawn(|_| {
-                    passes::render_ssao(self, &mut encs.before_main);
-                    passes::render_fog(self, &mut encs.before_main);
-
-                    passes::render_background(self, &mut encs.after_main, target);
-                    passes::gen_ui_blur(self, &mut encs.after_main, target);
+                    before_main(&mut encs.before_main);
+                    after_main(&mut encs.after_main);
                 });
 
                 if !defer_main {
                     scope.spawn(|_| {
-                        encs.main = Some(self.main_render_pass(target, objsref));
+                        encs.main = Some(main());
                     });
                 }
 
                 (gui_elapsed, encs.gui) = self.render_gui(target, state, render_gui);
             });
         } else {
-            encs.pbr = self.pbr_prepass();
-            encs.depth_prepass = Some(self.depth_prepass(objsref));
+            encs.pbr = pbr();
+            encs.depth_prepass = Some(depth());
             if self.render_params.value().shadow_mapping_resolution != 0 {
-                encs.smap = self.shadow_map_pass(objsref).collect();
+                encs.smap = self.shadow_map_pass(objsref, &encode).collect();
             }
-            passes::render_ssao(self, &mut encs.before_main);
-            passes::render_fog(self, &mut encs.before_main);
+            before_main(&mut encs.before_main);
             if !defer_main {
-                encs.main = Some(self.main_render_pass(target, objsref));
+                encs.main = Some(main());
             }
-            passes::render_background(self, &mut encs.after_main, target);
-            passes::gen_ui_blur(self, &mut encs.after_main, target);
+            after_main(&mut encs.after_main);
             (gui_elapsed, encs.gui) = self.render_gui(target, state, render_gui);
         }
 
@@ -796,16 +891,25 @@ impl GfxContext {
             encs.deferred_main = Some((frame, objs));
         }
 
-        (start_time.elapsed().as_secs_f32(), gui_elapsed)
+        let render_elapsed = start_time.elapsed();
+        if let (Some(profile), Some(nanos)) = (&mut self.frame_profile, encode.0) {
+            profile.record_cpu(CpuPhase::Ui, Duration::from_secs_f32(gui_elapsed));
+            profile.record_cpu(CpuPhase::Encode, Duration::from_nanos(nanos.into_inner()));
+        }
+        (render_elapsed.as_secs_f32(), gui_elapsed)
     }
 
-    pub(crate) fn record_deferred_main(&self, encs: &mut Encoders) -> f32 {
+    pub(crate) fn record_deferred_main(&mut self, encs: &mut Encoders) -> f32 {
         let Some((frame, drawables)) = encs.deferred_main.take() else {
             return 0.0;
         };
         let start = Instant::now();
         encs.main = Some(self.main_render_pass(&frame, &drawables));
-        start.elapsed().as_secs_f32()
+        let elapsed = start.elapsed();
+        if let Some(profile) = &mut self.frame_profile {
+            profile.record_cpu(CpuPhase::Encode, elapsed);
+        }
+        elapsed.as_secs_f32()
     }
 
     fn render_gui<S>(
@@ -872,7 +976,7 @@ impl GfxContext {
                 depth_ops: None,
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: self.timestamps(GpuPass::Main),
             occlusion_query_set: None,
         });
         render_pass.set_bind_group(0, &self.render_params.bg, &[]);
@@ -903,22 +1007,26 @@ impl GfxContext {
     fn shadow_map_pass<'a>(
         &'a self,
         objsref: &'a [Box<dyn Drawable>],
+        encode: &'a EncodeJobs,
     ) -> impl Iterator<Item = CommandBuffer> + 'a {
         self.sun_params.iter().enumerate().map(move |(i, u)| {
-            profiling::scope!(&format!("cascade shadow pass {}", i));
-            let mut smap_enc = self
-                .device
-                .create_command_encoder(&CommandEncoderDescriptor {
-                    label: Some("shadow map encoder"),
-                });
-            let sun_view = self.sun_shadowmap.layer_view(i as u32);
-            self.shadow_map_one_pass(u, objsref, &sun_view, &mut smap_enc);
-            smap_enc.finish()
+            encode.measure(|| {
+                profiling::scope!(&format!("cascade shadow pass {}", i));
+                let mut smap_enc = self
+                    .device
+                    .create_command_encoder(&CommandEncoderDescriptor {
+                        label: Some("shadow map encoder"),
+                    });
+                let sun_view = self.sun_shadowmap.layer_view(i as u32);
+                self.shadow_map_one_pass(i, u, objsref, &sun_view, &mut smap_enc);
+                smap_enc.finish()
+            })
         })
     }
 
     fn shadow_map_one_pass<'a>(
         &'a self,
+        cascade: usize,
         u: &Uniform<RenderParams>,
         objsref: &[Box<dyn Drawable>],
         shadowmap_view: &'a TextureView,
@@ -936,7 +1044,7 @@ impl GfxContext {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: self.timestamps(GpuPass::SHADOWS[cascade]),
             occlusion_query_set: None,
         });
 
@@ -965,7 +1073,7 @@ impl GfxContext {
                 }),
                 stencil_ops: None,
             }),
-            timestamp_writes: None,
+            timestamp_writes: self.timestamps(GpuPass::Depth),
             occlusion_query_set: None,
         });
 
@@ -979,17 +1087,35 @@ impl GfxContext {
     }
 
     pub fn finish_frame(&mut self, encoder: Encoders) {
+        let encode_start = self.profile_timer();
+        let resolve = self.frame_profile.as_ref().and_then(|profile| {
+            let slot = profile.active_gpu()?;
+            let mut resolve = self.device.create_command_encoder(&CommandEncoderDescriptor {
+                label: Some("frame profile resolve"),
+            });
+            slot.resolve(&mut resolve);
+            Some(resolve.finish())
+        });
+        let before_main = encoder.before_main.finish();
+        let after_main = encoder.after_main.finish();
+        self.profile_elapsed(CpuPhase::Encode, encode_start);
+        let submit_start = self.profile_timer();
         self.queue.submit(
             encoder
                 .depth_prepass
                 .into_iter()
                 .chain(encoder.pbr)
                 .chain(encoder.smap)
-                .chain(Some(encoder.before_main.finish()))
+                .chain(Some(before_main))
                 .chain(encoder.main)
-                .chain(Some(encoder.after_main.finish()))
-                .chain(encoder.gui),
+                .chain(Some(after_main))
+                .chain(encoder.gui)
+                .chain(resolve),
         );
+        self.profile_elapsed(CpuPhase::Submit, submit_start);
+        if let Some(profile) = &mut self.frame_profile {
+            profile.map_gpu(self.tick + 1);
+        }
         if self.defines_changed {
             self.defines_changed = false;
             self.pipelines.write().unwrap().invalidate_all();

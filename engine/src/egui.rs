@@ -1,3 +1,4 @@
+use crate::frame_profile::GpuPass;
 use crate::{GfxContext, GuiRenderContext};
 use egui::TextureId;
 use egui_wgpu::{Renderer, ScreenDescriptor};
@@ -83,7 +84,7 @@ impl EguiWrapper {
                 },
             })],
             depth_stencil_attachment: None,
-            timestamp_writes: None,
+            timestamp_writes: gfx.gfx.timestamps(GpuPass::Egui),
             occlusion_query_set: None,
         });
 

@@ -1,3 +1,4 @@
+use crate::frame_profile::GpuPass;
 use crate::{GfxContext, GuiRenderContext, Texture};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -98,6 +99,9 @@ impl YakuiWrapper {
             }
         };
 
+        if let Some(profile) = &gfx.gfx.frame_profile {
+            profile.encoder_timestamp(gfx.encoder, GpuPass::Yakui, false);
+        }
         self.renderer.paint_with_encoder(
             &mut self.yakui,
             &gfx.gfx.device,
@@ -105,6 +109,9 @@ impl YakuiWrapper {
             gfx.encoder,
             surface_info,
         );
+        if let Some(profile) = &gfx.gfx.frame_profile {
+            profile.encoder_timestamp(gfx.encoder, GpuPass::Yakui, true);
+        }
     }
 
     pub fn handle_event(&mut self, e: &winit::event::Event<()>) -> bool {

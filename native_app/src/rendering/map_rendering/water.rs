@@ -146,6 +146,10 @@ impl WaterRender {
         }
     }
 
+    pub(super) fn pending_chunks(&self) -> usize {
+        self.pending.len()
+    }
+
     fn reset(&mut self, env: &Environment) {
         self.meshes.clear();
         self.pending.clear();

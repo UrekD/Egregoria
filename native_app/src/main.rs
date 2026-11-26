@@ -15,6 +15,7 @@ mod uiworld;
 mod audio;
 mod automation;
 mod debug_gui;
+mod frame_profile;
 mod game_loop;
 mod gui;
 mod init;
