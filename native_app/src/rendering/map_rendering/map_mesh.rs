@@ -172,6 +172,8 @@ impl CachedObj {
 }
 
 struct MapBuilders {
+    power_markers: SpriteBatchBuilder<false>,
+    power_marker_heights: FastMap<BuildingKind, f32>,
     buildsprites: FastMap<BuildingKind, SpriteBatchBuilder<false>>,
     buildmeshes: FastMap<BuildingKind, InstancedMeshBuilder<false>>,
     houses_mesh: MeshBuilder<false>,
@@ -1303,6 +1305,80 @@ fn growable_company(id: GoodsCompanyID) -> Option<&'static GrowableCompanyProtot
     try_prototype(GrowableCompanyID::from(id)).filter(|proto| proto.growable)
 }
 
+fn mesh_height(mesh: &Mesh) -> f32 {
+    mesh.lods.iter().map(|lod| lod.aabb3.ur.z).fold(0.0, f32::max)
+}
+
+fn zone_exclusion_hull(building: &Building) -> Option<Polygon> {
+    let mut hull = building
+        .mesh
+        .faces
+        .iter()
+        .flat_map(|x| x.0.iter())
+        .map(|x| x.xy())
+        .collect::<Polygon>()
+        .convex_hull();
+    hull.simplify();
+    if hull.len() < 3 {
+        return None;
+    }
+    hull.scale_from(hull.barycenter(), 1.8);
+    Some(hull)
+}
+
+fn building_badge(descr: &GoodsCompanyPrototype) -> Option<ServiceIcon> {
+    if growable_company(descr.id).is_some() {
+        return None;
+    }
+    if descr.power_production.is_some() {
+        return Some(ServiceIcon::Power);
+    }
+    if descr.zone.is_some() || !matches!(descr.asset, RenderAsset::Sprite { .. }) {
+        return None;
+    }
+    ServiceIcon::for_company(descr).filter(|_| placeholder_color(descr.id).is_some())
+}
+
+#[cfg(test)]
+mod service_badge_tests {
+    use super::*;
+
+    #[test]
+    fn svcvis_zone_without_solid_mesh_does_not_exclude_filler() {
+        use scenarios::builders::{fill_houses, grid_city};
+        use scenarios::ScenarioCtx;
+        use simulation::SimulationOptions;
+
+        let mut fixture = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        grid_city(&mut fixture, vec2(700.0, 700.0), 3, 3, 160.0);
+        let home = fill_houses(&mut fixture, 1)[0];
+        let mut building = fixture.sim.map().get(home).unwrap().clone();
+        building.mesh.faces.clear();
+        assert!(zone_exclusion_hull(&building).is_none());
+    }
+
+    #[test]
+    fn svcvis_world_badges_include_mesh_and_zoned_power_sites() {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        for (name, expected) in [
+            ("fire-station", Some(ServiceIcon::Fire)),
+            ("coal-power-plant", Some(ServiceIcon::Power)),
+            ("solar-panel", Some(ServiceIcon::Power)),
+            ("cereal-farm", None),
+        ] {
+            assert!(
+                building_badge(GoodsCompanyID::new(name).prototype()) == expected,
+                "wrong world badge for {name}",
+            );
+        }
+    }
+}
+
 impl MapMeshHandler {
     pub fn new(gfx: &mut GfxContext, sim: &Simulation) -> Self {
         let arrow_builder = SpriteBatchBuilder::from_path(gfx, "assets/sprites/arrow_one_way.png");
@@ -1312,7 +1388,13 @@ impl MapMeshHandler {
         let mut zonemeshes = FastMap::default();
 
         let mut roof_icons = FastMap::default();
+        let mut power_marker_heights = FastMap::default();
         for descr in GoodsCompanyPrototype::iter() {
+            let badge = building_badge(descr);
+            let kind = BuildingKind::GoodsCompany(descr.id);
+            if badge == Some(ServiceIcon::Power) {
+                power_marker_heights.insert(kind, 0.0_f32);
+            }
             if descr.zone.is_some() || growable_company(descr.id).is_some() {
                 continue;
             }
@@ -1320,15 +1402,13 @@ impl MapMeshHandler {
                 continue;
             };
 
-            let sprite = if let Some(icon) =
-                ServiceIcon::for_company(descr).filter(|_| placeholder_color(descr.id).is_some())
-            {
+            let sprite = if let Some(icon) = badge.filter(|icon| *icon != ServiceIcon::Power) {
                 let texture = roof_icons.entry(icon).or_insert_with(|| icon.texture(gfx));
                 SpriteBatchBuilder::new(texture, gfx)
             } else {
                 SpriteBatchBuilder::new(&gfx.texture(path, "goods_company_tex"), gfx)
             };
-            buildsprites.insert(BuildingKind::GoodsCompany(descr.id), sprite);
+            buildsprites.insert(kind, sprite);
         }
 
         for (asset, bkind) in GoodsCompanyPrototype::iter()
@@ -1356,6 +1436,9 @@ impl MapMeshHandler {
                 }
             };
 
+            if let Some(height) = power_marker_heights.get_mut(&bkind) {
+                *height = mesh_height(&m);
+            }
             buildmeshes.insert(bkind, InstancedMeshBuilder::new_ref(&m));
         }
 
@@ -1387,10 +1470,11 @@ impl MapMeshHandler {
 
             let filler_mesh = InstancedMeshBuilder::new_ref(&m);
 
-            zonemeshes.insert(
-                BuildingKind::GoodsCompany(descr.id),
-                (floor_mesh, filler_mesh, z.randomize_filler),
-            );
+            let kind = BuildingKind::GoodsCompany(descr.id);
+            if let Some(height) = power_marker_heights.get_mut(&kind) {
+                *height = height.max(mesh_height(&m));
+            }
+            zonemeshes.insert(kind, (floor_mesh, filler_mesh, z.randomize_filler));
         }
 
         let crosswalk_tex = gfx.texture("assets/sprites/crosswalk.png", "crosswalk");
@@ -1414,7 +1498,10 @@ impl MapMeshHandler {
             },
             None,
         ));
+        let power_texture = ServiceIcon::Power.texture(gfx);
         let builders = MapBuilders {
+            power_markers: SpriteBatchBuilder::new(&power_texture, gfx),
+            power_marker_heights,
             arrow_builder,
             buildsprites,
             crosswalk_builder: MeshBuilder::new(crosswalk_mat),
@@ -1518,17 +1605,6 @@ impl MapMeshHandler {
                 cached.build.push(Arc::new(mesh));
             }
 
-            // Sprites don't write depth, so they go after the placeholder boxes they sit on.
-            let sprites = b
-                .buildsprites
-                .values_mut()
-                .flat_map(|x| x.build(ctx.gfx))
-                .collect::<Vec<_>>();
-
-            if !sprites.is_empty() {
-                cached.build.push(Arc::new(sprites));
-            }
-
             let zonemeshes = b
                 .zonemeshes
                 .values_mut()
@@ -1536,6 +1612,18 @@ impl MapMeshHandler {
                 .collect::<Vec<_>>();
             if !zonemeshes.is_empty() {
                 cached.build.push(Arc::new(zonemeshes));
+            }
+
+            // Sprites don't write depth, so they go after the placeholder boxes they sit on.
+            let sprites = b
+                .buildsprites
+                .values_mut()
+                .filter_map(|x| x.build(ctx.gfx))
+                .chain(b.power_markers.build(ctx.gfx))
+                .collect::<Vec<_>>();
+
+            if !sprites.is_empty() {
+                cached.build.push(Arc::new(sprites));
             }
 
             if cached.is_empty() {
@@ -1656,6 +1744,7 @@ impl MapBuilders {
     }
 
     fn buildings_mesh(&mut self, map: &Map, chunk: SubscriberChunkID) {
+        self.power_markers.clear();
         for v in self.buildsprites.values_mut() {
             v.clear();
         }
@@ -1687,6 +1776,10 @@ impl MapBuilders {
             if append_profiled_building(&mut self.houses_mesh, building) {
                 continue;
             }
+            let model_height = self.power_marker_heights.get(&building.kind).copied();
+            let power_zone = model_height.is_some()
+                && building.zone.is_some()
+                && self.zonemeshes.contains_key(&building.kind);
             let mut sprite_z = building.height;
             let mut placeholder = false;
             if let BuildingKind::GoodsCompany(id) = building.kind {
@@ -1729,14 +1822,35 @@ impl MapBuilders {
                     dir,
                     tint: LinearColor::WHITE,
                 });
-            } else if !building
-                .mesh
-                .faces
-                .iter()
-                .flat_map(|(face, _)| face)
-                .any(|point| point.z > building.height + 0.2)
+            } else if !power_zone
+                && !building
+                    .mesh
+                    .faces
+                    .iter()
+                    .flat_map(|(face, _)| face)
+                    .any(|point| point.z > building.height + 0.2)
             {
-                self.building_box(building, LinearColor::new(0.55, 0.48, 0.40, 1.0), 1);
+                sprite_z = self.building_box(building, LinearColor::new(0.55, 0.48, 0.40, 1.0), 1);
+            }
+
+            if let Some(model_height) = model_height {
+                let top = building
+                    .mesh
+                    .faces
+                    .iter()
+                    .flat_map(|(face, _)| face)
+                    .map(|point| point.z)
+                    .fold(sprite_z.max(building.height + model_height), f32::max);
+                let (dir, (width, depth)) = upright_sprite(building.obb.axis());
+                let size = (width.min(depth) * 0.5).min(40.0);
+                // Zoned fillers can extend above their model-space mesh bounds.
+                let lift = if power_zone { 3.0 } else { 0.4 };
+                self.power_markers.push(
+                    building.obb.center().z(top + lift),
+                    dir.z0(),
+                    LinearColor::WHITE,
+                    (size, size),
+                );
             }
         }
     }
@@ -1795,16 +1909,7 @@ impl MapBuilders {
         let zone = &bzone.poly;
         let randomize = *randomize;
 
-        let mut hull = building
-            .mesh
-            .faces
-            .iter()
-            .flat_map(|x| x.0.iter())
-            .map(|x| x.xy())
-            .collect::<Polygon>()
-            .convex_hull();
-        hull.simplify();
-        hull.scale_from(hull.barycenter(), 1.8);
+        let hull = zone_exclusion_hull(building);
 
         let Some(filldir) = bzone.unit_fill_direction() else {
             return;
@@ -1844,7 +1949,7 @@ impl MapBuilders {
                 if zone.distance(pos) < 3.0 {
                     continue;
                 }
-                if hull.contains(pos) {
+                if hull.as_ref().is_some_and(|hull| hull.contains(pos)) {
                     continue;
                 }
 

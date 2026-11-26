@@ -1,17 +1,34 @@
 use geom::Vec3;
 use goryak::{error, mincolumn, minrow, on_secondary_container, textc, tooltip};
-use prototypes::{ServiceKind, ServicePrototype};
+use prototypes::{try_prototype, GoodsCompanyPrototype, Power, ServiceID, ServiceKind};
 use simulation::economy::TripPurpose;
-use simulation::map::{water_provider_site, Building};
+use simulation::map::{water_provider_site, Building, BuildingID};
 use simulation::map_dynamic::{
     active_business, effective_load, ActiveBusiness, BuildingInfos, CoverageGrid, Destination,
-    ElectricityFlow, RoutingStep,
+    ElectricityFlow, RoutingStep, ServiceAllocation,
 };
 use simulation::transportation::{Location, VehicleKind};
-use simulation::{HumanID, PopulationScale, Simulation};
+use simulation::{HumanEnt, HumanID, PopulationScale, Simulation};
 
 use super::entity_link_named;
 use crate::uiworld::UiWorld;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum StaffActivity {
+    Service(ServiceKind),
+    Power,
+}
+
+impl StaffActivity {
+    pub(super) fn for_company(company: &GoodsCompanyPrototype) -> Option<Self> {
+        if let Some(service) = try_prototype(ServiceID::from(company.id)) {
+            Some(Self::Service(service.service_kind))
+        } else {
+            (company.n_workers > 0 && company.power_production > Some(Power::ZERO))
+                .then_some(Self::Power)
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StaffState {
@@ -61,35 +78,17 @@ impl ServiceStaff {
     }
 }
 
-fn service_staff(
-    sim: &Simulation,
-    building: &Building,
-    service: &ServicePrototype,
-) -> ServiceStaff {
+fn service_staff(sim: &Simulation, building: &Building, slots: u32) -> ServiceStaff {
     let map = sim.map();
     let business = active_business(building, &sim.read::<BuildingInfos>(), sim.world());
-    let slots = business.map_or(service.n_workers, |business| business.slots) as usize;
+    let slots = business.map_or(slots, |business| business.slots) as usize;
     let rows = business
         .and_then(|business| sim.get(business.company))
         .into_iter()
         .flat_map(|company| company.workers.0.iter().copied())
         .filter_map(|id| {
             let human = sim.get(id)?;
-            let state = match human.location {
-                Location::Building(at) if at == building.id => StaffState::AtWork,
-                Location::Building(at) if at == human.home.house => StaffState::AtHome,
-                _ if human.router.target_dest == Some(Destination::Building(building.id)) => {
-                    StaffState::Commuting
-                }
-                Location::Outside | Location::Vehicle(_) | Location::Transit(_)
-                    if human.router.trip_purpose == TripPurpose::Home
-                        && human.router.target_dest
-                            == Some(Destination::Building(human.home.house)) =>
-                {
-                    StaffState::Commuting
-                }
-                _ => StaffState::Other,
-            };
+            let state = staff_state(human, building.id);
             let location = match human.location {
                 Location::Building(at) => map.get(at).map_or_else(
                     || "Building unavailable".to_owned(),
@@ -143,6 +142,21 @@ fn service_staff(
     }
 }
 
+fn staff_state(human: &HumanEnt, workplace: BuildingID) -> StaffState {
+    match human.location {
+        Location::Building(at) if at == workplace => StaffState::AtWork,
+        Location::Building(at) if at == human.home.house => StaffState::AtHome,
+        _ if human.router.trip_purpose == TripPurpose::Work
+            && human.router.target_dest == Some(Destination::Building(workplace))
+            && human.router.trip_start.is_some()
+            && human.router.last_error.is_none() =>
+        {
+            StaffState::Commuting
+        }
+        _ => StaffState::Other,
+    }
+}
+
 fn position_label(label: &str, pos: Vec3) -> String {
     format!("{label} ({:.0}, {:.0})", pos.x, pos.y)
 }
@@ -151,41 +165,51 @@ pub(super) fn render(
     uiworld: &UiWorld,
     sim: &Simulation,
     building: &Building,
-    service: &ServicePrototype,
+    company: &GoodsCompanyPrototype,
+    activity: StaffActivity,
 ) {
     let map = sim.map();
-    let staff = service_staff(sim, building, service);
+    let staff = service_staff(sim, building, company.n_workers);
     let scale = sim.population_scale();
     let at_work = staff
         .rows
         .iter()
         .filter(|row| row.state == StaffState::AtWork)
         .count();
-    let blackout = map
-        .electricity
-        .net_id(building.id)
-        .is_some_and(|net| sim.read::<ElectricityFlow>().blackout(net));
-    let kind = service.service_kind;
-    let utility = matches!(kind, ServiceKind::WaterPump | ServiceKind::SewageOutlet);
-    let blocker = if building
+    let network = map.electricity.net_id(building.id);
+    let road_connected = building
         .connected_road
-        .is_none_or(|road| map.get(road).is_none())
-    {
+        .is_some_and(|road| map.get(road).is_some());
+    let blocker = if !road_connected {
         Some("Disconnected from the road")
     } else if staff.business.is_none() {
         Some("No active operator")
-    } else if utility && water_provider_site(&map, building.id).is_some_and(|site| site.is_err()) {
-        Some("Invalid utility site")
-    } else if blackout && kind != ServiceKind::SewageOutlet {
-        Some("Power blackout")
     } else {
-        None
+        match activity {
+            StaffActivity::Power if network.is_none() => Some("No electricity network"),
+            StaffActivity::Service(ServiceKind::WaterPump | ServiceKind::SewageOutlet)
+                if water_provider_site(&map, building.id).is_some_and(|site| site.is_err()) =>
+            {
+                Some("Invalid utility site")
+            }
+            StaffActivity::Service(kind)
+                if kind != ServiceKind::SewageOutlet
+                    && network.is_some_and(|net| sim.read::<ElectricityFlow>().blackout(net)) =>
+            {
+                Some("Power blackout")
+            }
+            _ => None,
+        }
     };
 
     let label = |text: String| textc(on_secondary_container(), text);
     mincolumn(4.0, || {
-        textc(on_secondary_container(), "Service staff");
-        tooltip("Assigned workers determine service capacity", || {
+        let title = match activity {
+            StaffActivity::Service(_) => "Service staff",
+            StaffActivity::Power => "Power plant staff",
+        };
+        textc(on_secondary_container(), title);
+        tooltip("Assigned workers determine operating capacity", || {
             label(format!(
                 "Staffed {} / {} · {} at work",
                 scale.persons(staff.rows.len()),
@@ -201,27 +225,38 @@ pub(super) fn render(
         textc(color, staff.summary(scale, blocker));
 
         let inactive = blocker.is_some() || (staff.slots > 0 && staff.rows.is_empty());
-        if utility {
-            let load = effective_load(building, None, staff.business);
-            let (metric, output) = match kind {
-                ServiceKind::WaterPump => ("water output", load.water_production),
-                _ => ("sewage capacity", load.sewage_capacity),
-            };
-            let actual = if inactive { 0.0 } else { output };
-            label(format!("Network-wide · {actual:.0} {metric}"));
-        } else if inactive {
-            textc(on_secondary_container(), "Coverage inactive");
-        } else if let Some(allocation) = sim
-            .read::<CoverageGrid>()
-            .service_allocation(building.id, kind)
-        {
-            let people = allocation.people * f32::from(scale.persons_per_agent());
-            label(format!(
-                "Last coverage pass · {people:.1} people served · {:.0} m reach",
-                allocation.distance_m,
-            ));
-        } else {
-            textc(on_secondary_container(), "Coverage awaiting the next pass");
+        match activity {
+            StaffActivity::Power => {
+                let output = if inactive {
+                    Power::ZERO
+                } else {
+                    effective_load(building, None, staff.business).power_production
+                };
+                label(format!("Electricity output · {output}"));
+            }
+            StaffActivity::Service(kind @ (ServiceKind::WaterPump | ServiceKind::SewageOutlet)) => {
+                let load = effective_load(building, None, staff.business);
+                let (metric, output) = match kind {
+                    ServiceKind::WaterPump => ("water output", load.water_production),
+                    _ => ("sewage capacity", load.sewage_capacity),
+                };
+                let actual = if inactive { 0.0 } else { output };
+                label(format!("Network-wide · {actual:.0} {metric}"));
+            }
+            StaffActivity::Service(_) if inactive => {
+                textc(on_secondary_container(), "Coverage inactive");
+            }
+            StaffActivity::Service(kind) => {
+                let coverage = sim.read::<CoverageGrid>();
+                if let Some(allocation) = coverage.service_allocation(building.id, kind) {
+                    tooltip(
+                        "Demand includes residents and workers at each address. A person can count at home and at a separate workplace.",
+                        || label(coverage_summary(allocation, scale)),
+                    );
+                } else {
+                    textc(on_secondary_container(), "Coverage awaiting the next pass");
+                }
+            }
         }
 
         for row in staff.rows {
@@ -233,17 +268,26 @@ pub(super) fn render(
     });
 }
 
+fn coverage_summary(allocation: ServiceAllocation, scale: PopulationScale) -> String {
+    let demand = allocation.people * f32::from(scale.persons_per_agent());
+    format!(
+        "Last coverage pass · {demand:.1} demand units served · {:.0} m reach",
+        allocation.distance_m,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use geom::{vec2, Vec2, OBB};
-    use prototypes::{BuildingGen, GameTime, GoodsCompanyID, ServiceID, Tick, TICKS_PER_MINUTE};
+    use prototypes::{BuildingGen, GameTime, GoodsCompanyID, Tick, TICKS_PER_MINUTE};
     use scenarios::builders::{fill_houses, grid_city};
     use scenarios::ScenarioCtx;
-    use simulation::map::BuildingKind;
-    use simulation::map_dynamic::coverage_update;
+    use simulation::map::{BuildingKind, ProjectFilter, ProjectKind};
+    use simulation::map_dynamic::{coverage_update, RouterError};
     use simulation::souls::goods_company::company_soul;
     use simulation::souls::human::spawn_human;
+    use simulation::souls::human::HumanDecisionKind;
     use simulation::{SimulationOptions, SoulID};
     use slotmapd::Key;
 
@@ -254,7 +298,15 @@ mod tests {
             save_replay: false,
             ..SimulationOptions::LEGACY
         });
-        let grid = grid_city(&mut fixture, vec2(700.0, 700.0), 4, 4, 160.0);
+        grid_city(&mut fixture, vec2(700.0, 700.0), 4, 4, 160.0);
+        let ProjectKind::Road(road) = fixture
+            .sim
+            .map()
+            .project(geom::vec3(780.0, 700.0, 0.0), 0.0, ProjectFilter::ROAD)
+            .kind
+        else {
+            panic!("expected a road next to both sites");
+        };
         let proto = GoodsCompanyID::new("fire-station");
         let station = fixture
             .sim
@@ -266,7 +318,19 @@ mod tests {
                     vertical_factor: 1.0,
                 },
                 None,
-                Some(grid.roads[0]),
+                Some(road),
+            )
+            .unwrap();
+        let shop_proto = GoodsCompanyID::new("commercial-l1");
+        let shop = fixture
+            .sim
+            .write::<simulation::map::Map>()
+            .build_special_building(
+                &OBB::new(vec2(800.0, 679.5), Vec2::X, 20.0, 20.0),
+                BuildingKind::GoodsCompany(shop_proto),
+                shop_proto.prototype().bgen,
+                None,
+                Some(road),
             )
             .unwrap();
         let homes = fill_houses(&mut fixture, 4);
@@ -277,20 +341,28 @@ mod tests {
             panic!("fire station must have a company");
         };
 
+        let Some(SoulID::GoodsCompany(shop_company)) = company_soul(sim, shop, shop_proto) else {
+            panic!("shop must have a company");
+        };
         let workers = std::array::from_fn(|index| spawn_human(sim, homes[index]).unwrap());
         let [at_work, commuting, at_home, visiting] = workers;
         {
             let world = sim.world_mut_unchecked();
+            world.companies[shop_company].workers.0 = vec![at_home];
             world.companies[company].workers.0 = [workers.as_slice(), &[HumanID::null()]].concat();
             world.humans[at_work].location = Location::Building(station);
             world.humans[commuting].location = Location::Outside;
             world.humans[commuting].router.target_dest = Some(Destination::Building(station));
             world.humans[commuting].router.trip_purpose = TripPurpose::Work;
+            world.humans[commuting].router.trip_start = Some(Tick(1));
             world.humans[at_home].location = Location::Building(homes[2]);
             world.humans[visiting].location = Location::Building(homes[0]);
         }
-        let service = ServiceID::from(proto).prototype();
-        let staff = service_staff(sim, sim.map().get(station).unwrap(), service);
+        let staff = service_staff(
+            sim,
+            sim.map().get(station).unwrap(),
+            proto.prototype().n_workers,
+        );
         assert_eq!(staff.slots, 8);
         assert_eq!(
             staff.rows.iter().map(|row| row.id).collect::<Vec<_>>(),
@@ -332,9 +404,73 @@ mod tests {
             .read::<CoverageGrid>()
             .service_allocation(station, ServiceKind::Fire)
             .unwrap();
-        assert!(allocation.people > 0.0);
-        assert!(allocation.people < 400.0);
+        // Four residents plus the same citizen's separate workplace demand.
+        assert_eq!(allocation.people, 5.0);
+        assert!(sim.read::<CoverageGrid>().coverage(shop, ServiceKind::Fire) > 0.0);
+        assert_eq!(
+            coverage_summary(allocation, PopulationScale::REALISTIC),
+            format!(
+                "Last coverage pass · 5.0 demand units served · {:.0} m reach",
+                allocation.distance_m
+            ),
+        );
         assert!(allocation.distance_m > 0.0);
+    }
+
+    #[test]
+    fn service_staff_classifies_trips_by_purpose_and_route_status() {
+        let mut fixture = ScenarioCtx::new(SimulationOptions {
+            terrain_size: 4,
+            save_replay: false,
+            ..SimulationOptions::LEGACY
+        });
+        grid_city(&mut fixture, vec2(700.0, 700.0), 4, 4, 160.0);
+        let homes = fill_houses(&mut fixture, 2);
+        let worker = spawn_human(&mut fixture.sim, homes[0]).unwrap();
+        let human = &mut fixture.sim.world_mut_unchecked().humans[worker];
+        human.location = Location::Outside;
+        human.router.trip_start = Some(Tick(1));
+        human.router.target_dest = Some(Destination::Building(homes[1]));
+
+        human.router.trip_purpose = TripPurpose::Leisure;
+        human.decision.kind = HumanDecisionKind::VisitLeisure(homes[1]);
+        let leisure = staff_state(human, homes[1]);
+
+        human.router.trip_purpose = TripPurpose::Work;
+        let work = staff_state(human, homes[1]);
+        human.router.last_error = Some(RouterError::LocatingVehicle);
+        let failed = staff_state(human, homes[1]);
+
+        human.router.last_error = None;
+        human.router.trip_start = None;
+        let pending = staff_state(human, homes[1]);
+
+        human.router.trip_start = Some(Tick(2));
+        human.router.target_dest = Some(Destination::Building(homes[0]));
+        human.router.trip_purpose = TripPurpose::Home;
+        human.decision.kind = HumanDecisionKind::DepositAtHome;
+        let groceries = staff_state(human, homes[1]);
+
+        assert_eq!(
+            [leisure, work, failed, pending, groceries],
+            [
+                StaffState::Other,
+                StaffState::Commuting,
+                StaffState::Other,
+                StaffState::Other,
+                StaffState::Other
+            ],
+        );
+    }
+
+    #[test]
+    fn service_staff_panel_includes_staffed_electricity_producers() {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let coal = GoodsCompanyID::new("coal-power-plant").prototype();
+        let solar = GoodsCompanyID::new("solar-panel").prototype();
+        assert_eq!(StaffActivity::for_company(coal), Some(StaffActivity::Power));
+        assert_eq!(StaffActivity::for_company(solar), None);
     }
 
     #[test]
