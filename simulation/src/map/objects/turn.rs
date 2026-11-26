@@ -1,5 +1,7 @@
-use crate::map::{Intersection, IntersectionID, LaneID, Lanes};
-use geom::{Degrees, PolyLine3, Radians, Vec2};
+use crate::map::{
+    Intersection, IntersectionID, LaneID, LaneKind, Lanes, Road, Roads, ROAD_Z_OFFSET,
+};
+use geom::{PolyLine3, Radians, Vec2};
 use geom::{Spline, Vec3};
 use serde::{Deserialize, Serialize};
 use std::borrow::Borrow;
@@ -86,17 +88,19 @@ impl Turn {
         }
     }
 
-    pub fn make_points(&mut self, lanes: &Lanes, parent: &Intersection) {
-        let Some(src_lane) = lanes.get(self.id.src) else {
+    pub(crate) fn make_points(
+        &mut self,
+        lanes: &Lanes,
+        roads: &Roads,
+        parent: &Intersection,
+        roundabout: Option<RoundaboutGeometry>,
+    ) {
+        let (Some(src_lane), Some(dst_lane)) = (lanes.get(self.id.src), lanes.get(self.id.dst))
+        else {
             return;
         };
-        let Some(dst_lane) = lanes.get(self.id.dst) else {
-            return;
-        };
-
         let pos_src = src_lane.get_inter_node_pos(self.id.parent);
         let pos_dst = dst_lane.get_inter_node_pos(self.id.parent);
-
         self.points.clear_push(pos_src);
 
         if self.kind.is_crosswalk() {
@@ -107,126 +111,37 @@ impl Turn {
         let src_dir = -src_lane.orientation_from(self.id.parent);
         let dst_dir = dst_lane.orientation_from(self.id.parent);
 
-        if matches!(self.kind, TurnKind::Driving | TurnKind::WalkingCorner)
-            && parent.is_roundabout()
-        {
-            if let Some(rp) = parent.turn_policy.roundabout {
-                let center = parent.pos.xy();
-
-                let center_dir_src = (pos_src.xy() - center).normalize();
-                let center_dir_dst = (pos_dst.xy() - center).normalize();
-
-                let ang = center_dir_dst.angle(center_dir_src).abs();
-                if ang >= Radians::from(Degrees(21.0)).0 {
-                    let a = center_dir_src.rotated_by_angle(Radians::from_deg(10.0));
-                    let mut ang_a = a.angle_cossin();
-
-                    let b = center_dir_dst.rotated_by_angle(Radians::from_deg(-10.0));
-                    let ang_b = b.angle_cossin();
-
-                    if ang_a > ang_b {
-                        ang_a -= Radians::TAU;
-                    }
-
-                    let mut turn_radius = rp.radius * (1.0 - 0.5 * (ang_b.0 - ang_a.0) / TAU);
-
-                    if matches!(self.kind, TurnKind::WalkingCorner) {
-                        turn_radius = rp.radius + 3.0;
-                    }
-
-                    self.points.extend(
-                        Self::gen_roundabout(
-                            pos_src,
-                            pos_dst,
-                            src_dir,
-                            dst_dir,
-                            turn_radius,
-                            center,
-                        )
-                        .skip(1)
-                        .map(|x| x.z(pos_src.z)),
-                    );
-                    return;
-                }
+        if let Some(ring) = roundabout {
+            let src_road = &roads[src_lane.parent];
+            let dst_road = &roads[dst_lane.parent];
+            let pose = (pos_src, pos_dst, src_dir, dst_dir);
+            let points = match self.kind {
+                TurnKind::Driving => Some(ring.driving(
+                    pose,
+                    parent.roundabout_port(roads, src_road.id, true),
+                    parent.roundabout_port(roads, dst_road.id, false),
+                )),
+                TurnKind::WalkingCorner => Some(ring.corner(
+                    pose,
+                    src_road.dir_from(parent.id),
+                    dst_road.dir_from(parent.id),
+                    ring.curb_radius() + LaneKind::Walking.width() * 0.5,
+                )),
+                _ => None,
+            };
+            if let Some(points) = points {
+                self.points.extend(points.skip(1));
+                return;
             }
         }
 
         let spline = Self::spline(pos_src.xy(), pos_dst.xy(), src_dir, dst_dir);
-
         self.points.extend(
             spline
                 .smart_points(0.3, 0.0, 1.0)
                 .skip(1)
                 .map(|x| x.z(pos_src.z)),
         );
-    }
-
-    pub fn gen_roundabout(
-        pos_src: Vec3,
-        pos_dst: Vec3,
-        src_dir: Vec2,
-        dst_dir: Vec2,
-        radius: f32,
-        center: Vec2,
-    ) -> impl Iterator<Item = Vec2> {
-        let a = (pos_src.xy() - center)
-            .normalize()
-            .rotated_by_angle(Radians::from_deg(10.0));
-        let mut ang_a = a.angle_cossin();
-
-        let b = (pos_dst.xy() - center)
-            .normalize()
-            .rotated_by_angle(Radians::from_deg(-10.0));
-        let mut ang_b = b.angle_cossin();
-
-        if ang_a > ang_b {
-            ang_a -= Radians::TAU;
-        }
-
-        let diff = (ang_b - ang_a).min(Radians::from_deg(80.0));
-
-        ang_a += diff * 0.4;
-        ang_b -= diff * 0.4;
-
-        let a = ang_a.vec2();
-        let b = ang_b.vec2();
-
-        let sp1 = Self::spline(
-            pos_src.xy(),
-            center + a * radius,
-            src_dir,
-            -a.perpendicular(),
-        );
-        let sp2 = Self::circular_arc(center, ang_a, ang_b, radius);
-        let sp3 = Self::spline(
-            center + b * radius,
-            pos_dst.xy(),
-            -b.perpendicular(),
-            dst_dir,
-        );
-
-        sp1.into_smart_points(0.3, 0.0, 1.0)
-            .chain(sp2.skip(1))
-            .chain(sp3.into_smart_points(0.3, 0.0, 1.0).skip(1))
-    }
-
-    /// Return points of a circular arc in counter-clockwise order from ang_a to ang_b, assuming ang_a < ang_b
-    pub fn circular_arc(
-        center: Vec2,
-        ang_a: Radians,
-        ang_b: Radians,
-        radius: f32,
-    ) -> impl Iterator<Item = Vec2> {
-        const PRECISION: f32 = 1.0 / 0.1; // denominator is angular step in radians
-
-        let ang = ang_b - ang_a;
-        let n = (ang.0.abs() * PRECISION).ceil() as usize;
-        let ang_step = Radians(ang.0 / n as f32);
-
-        (0..=n).map(move |i| {
-            let ang = ang_a + Radians(ang_step.0 * i as f32);
-            center + ang.vec2() * radius
-        })
     }
 
     /// Return points of a nice spline from `from` to `to` with derivatives `from_dir` and `to_dir`
@@ -244,5 +159,148 @@ impl Turn {
             from_derivative: derivative_src,
             to_derivative: derivative_dst,
         }
+    }
+}
+
+/// Geometry shared by lane routing, the mesh and placement footprints.
+#[derive(Clone, Copy)]
+pub struct RoundaboutGeometry {
+    pub center: Vec3,
+    pub radius: f32,
+}
+
+impl RoundaboutGeometry {
+    pub(super) fn new(intersection: &Intersection, roads: &Roads) -> Option<Self> {
+        let policy = intersection
+            .turn_policy
+            .roundabout
+            .filter(|_| intersection.is_roundabout())?;
+        let center = intersection.pos.up(ROAD_Z_OFFSET);
+        // Short roads may clip the requested setback. Keep the ring inside
+        // their mouths so that entries always approach it from outside.
+        let available = intersection
+            .roads
+            .iter()
+            .map(|&id| {
+                center
+                    .xy()
+                    .distance(roads[id].interface_point(intersection.id).xy())
+                    - 6.0
+            })
+            .fold(f32::INFINITY, f32::min);
+        let radius = policy.radius.min(available);
+        (radius >= 4.0).then_some(Self { center, radius })
+    }
+
+    pub fn curb_radius(self) -> f32 {
+        self.radius + 4.0
+    }
+
+    pub fn island_radius(self) -> f32 {
+        (self.radius - 3.0).max(self.radius * 0.4)
+    }
+
+    /// The boundary from one approach to the next in counter-clockwise order.
+    pub fn road_corner(
+        self,
+        junction: IntersectionID,
+        from: &Road,
+        to: &Road,
+        include_sidewalk: bool,
+    ) -> Option<impl ExactSizeIterator<Item = Vec3>> {
+        let mouth = |road: &Road, left: bool| {
+            let points = road.interfaced_points();
+            let (point, dir) = if road.src == junction {
+                (points.first(), points.first_dir()?.xy().try_normalize()?)
+            } else {
+                (points.last(), -points.last_dir()?.xy().try_normalize()?)
+            };
+            let walks = road.sidewalks(junction);
+            let sidewalk = if left { walks.incoming } else { walks.outgoing }.is_some();
+            let width = road.width * 0.5
+                - if sidewalk && !include_sidewalk {
+                    LaneKind::Walking.width()
+                } else {
+                    0.0
+                };
+            let sign = if left { -1.0 } else { 1.0 };
+            Some((
+                point + (dir.perpendicular() * (width * sign)).z0(),
+                dir,
+                sidewalk,
+            ))
+        };
+        let (a, from_dir, a_walk) = mouth(from, true)?;
+        let (b, to_dir, b_walk) = mouth(to, false)?;
+        let sidewalk = if include_sidewalk && a_walk && b_walk {
+            LaneKind::Walking.width()
+        } else {
+            0.0
+        };
+        Some(self.corner(
+            (a, b, -from_dir, to_dir),
+            from.dir_from(junction),
+            to.dir_from(junction),
+            self.curb_radius() + sidewalk,
+        ))
+    }
+
+    fn corner(
+        self,
+        pose: (Vec3, Vec3, Vec2, Vec2),
+        from_arm: Vec2,
+        to_arm: Vec2,
+        radius: f32,
+    ) -> std::vec::IntoIter<Vec3> {
+        let from = from_arm.angle_cossin().0;
+        let sweep = from_arm.angle(to_arm).rem_euclid(TAU);
+        let trim = (sweep * 0.28).min(0.62);
+        self.connect(pose, from + trim, sweep - 2.0 * trim, radius)
+    }
+
+    fn driving(
+        self,
+        pose: (Vec3, Vec3, Vec2, Vec2),
+        entry: f32,
+        exit: f32,
+    ) -> std::vec::IntoIter<Vec3> {
+        self.connect(pose, entry, (exit - entry).rem_euclid(TAU), self.radius)
+    }
+
+    fn connect(
+        self,
+        (from, to, into, out): (Vec3, Vec3, Vec2, Vec2),
+        start: f32,
+        sweep: f32,
+        radius: f32,
+    ) -> std::vec::IntoIter<Vec3> {
+        let a = Radians(start).vec2();
+        let b = Radians(start + sweep).vec2();
+        let center = self.center;
+        let enter = Turn::spline(
+            from.xy(),
+            center.xy() + a * radius,
+            into,
+            -a.perpendicular(),
+        );
+        let leave = Turn::spline(center.xy() + b * radius, to.xy(), -b.perpendicular(), out);
+        let steps = (sweep / 0.065).ceil().max(1.0) as usize;
+        let mut points = Vec::with_capacity(steps + 32);
+        // Fixed tessellation also preserves the tangent on both sides of each arc join.
+        const TRANSITION_STEPS: usize = 16;
+        for i in 0..TRANSITION_STEPS {
+            let t = i as f32 / TRANSITION_STEPS as f32;
+            points.push(enter.get(t).z(from.z + (center.z - from.z) * t));
+        }
+        for i in 0..=steps {
+            let angle = start + sweep * i as f32 / steps as f32;
+            points.push(center + (Radians(angle).vec2() * radius).z0());
+        }
+        for i in 1..TRANSITION_STEPS {
+            let t = i as f32 / TRANSITION_STEPS as f32;
+            points.push(leave.get(t).z(center.z + (to.z - center.z) * t));
+        }
+        points.push(to);
+        points.into_iter()
     }
 }

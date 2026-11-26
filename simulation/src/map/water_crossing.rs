@@ -7,9 +7,9 @@ use geom::{Intersect, PolyLine3, Polygon, Shape, Vec2, Vec3, AABB};
 
 use crate::map::{
     profile_height, spend_water_work, Environment, Intersection, IntersectionID, Intersections,
-    LanePattern, Lanes, Lot, Map, MapProject, PointGenerateError, ProjectKind, Road, RoadID,
-    RoadSegmentKind, Roads, SpatialMap, Turn,
-    WaterEditError, WaterFootprint, WaterTileCoord, WaterTopologyWork, MAX_SLOPE, ROAD_Z_OFFSET,
+    LaneKind, LanePattern, Lanes, Lot, Map, MapProject, PointGenerateError, ProjectKind, Road,
+    RoadID, RoadSegmentKind, Roads, SpatialMap, Turn, WaterEditError, WaterFootprint,
+    WaterTileCoord, WaterTopologyWork, MAX_SLOPE, ROAD_Z_OFFSET,
 };
 
 pub const WATER_BRIDGE_CLEARANCE: f32 = 2.5;
@@ -310,7 +310,7 @@ pub(crate) fn connection_is_dry(
             bounds = bounds.union(bounds_of_road);
         }
         if let Some(roundabout) = inter.turn_policy.roundabout {
-            let radius = roundabout.radius + 3.0;
+            let radius = roundabout.radius + 4.0 + LaneKind::Walking.width();
             if !radius.is_finite() || radius < 0.0 {
                 return Ok(false);
             }
@@ -1701,51 +1701,35 @@ fn junction_outline(
     roads: &Roads,
     work: &mut CrossingWork<'_>,
 ) -> Result<Polygon, ConnectionError> {
-    let mut arms = Vec::new();
-    for &id in &junction.roads {
-        work.charge(1)?;
-        let road = &roads[id];
-        let points = road.interfaced_points();
-        let pose = if road.src == junction.id {
-            points.first_dir().map(|dir| (points.first(), dir.xy()))
-        } else {
-            points.last_dir().map(|dir| (points.last(), -dir.xy()))
-        };
-        if let Some((point, dir)) = pose {
-            let normal = dir.perpendicular() * (road.width * 0.5);
-            arms.push((point.xy() - normal, point.xy() + normal, dir));
-        }
-    }
     let mut outline = Polygon::default();
-    let center = junction.pos.xy();
-    for ((left, _, src), (_, right, dst)) in arms.iter().zip(arms.iter().cycle().skip(1)) {
-        if junction.is_roundabout() {
-            if let Some(policy) = junction.turn_policy.roundabout {
-                let a = (*left - center).try_normalize();
-                let b = (*right - center).try_normalize();
-                if a.zip(b)
-                    .is_some_and(|(a, b)| a.angle(b).abs() >= 21.0_f32.to_radians())
-                {
-                    work.charge((policy.radius.abs() / 10.0).ceil() as usize + 1)?;
-                    for point in Turn::gen_roundabout(
-                        left.z0(),
-                        right.z0(),
-                        -*src,
-                        *dst,
-                        policy.radius + 3.0,
-                        center,
-                    ) {
-                        work.charge(1)?;
-                        outline.push(point);
-                    }
-                    continue;
-                }
+    let ring = junction.roundabout_geometry(roads);
+    let mouth = |road: &Road| {
+        let points = road.interfaced_points();
+        let (point, dir) = if road.src == junction.id {
+            (points.first(), points.first_dir()?.xy())
+        } else {
+            (points.last(), -points.last_dir()?.xy())
+        };
+        let normal = dir.perpendicular() * (road.width * 0.5);
+        Some((point.xy() - normal, point.xy() + normal, dir))
+    };
+    for (&id, &next) in junction
+        .roads
+        .iter()
+        .zip(junction.roads.iter().cycle().skip(1))
+    {
+        work.charge(1)?;
+        let (road, next) = (&roads[id], &roads[next]);
+        if let Some(points) = ring.and_then(|ring| ring.road_corner(junction.id, road, next, true))
+        {
+            work.charge(points.len())?;
+            outline.extend(points.map(Vec3::xy));
+        } else if let (Some((left, _, src)), Some((_, right, dst))) = (mouth(road), mouth(next)) {
+            let spline = Turn::spline(left, right, -src, dst);
+            for point in spline.smart_points(1.0, 0.0, 1.0) {
+                work.charge(1)?;
+                outline.push(point);
             }
-        }
-        let spline = Turn::spline(*left, *right, -*src, *dst);
-        for point in spline.smart_points(1.0, 0.0, 1.0) {
-            work.charge(1)?;
-            outline.push(point);
         }
     }
     work.charge(outline.len())?;
@@ -2074,7 +2058,7 @@ pub(crate) fn junction_support_bounds(junction: &Intersection, roads: &Roads) ->
     }
     if junction.is_roundabout() {
         if let Some(roundabout) = junction.turn_policy.roundabout {
-            radius = radius.max(roundabout.radius + 3.0);
+            radius = radius.max(roundabout.radius + 4.0 + LaneKind::Walking.width());
         }
     }
     // Turn splines use at most 0.66 times the endpoint chord as a tangent.

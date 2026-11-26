@@ -823,3 +823,210 @@ fn p7_junction_fix_loaded_hold_line_claim_cannot_skip_dwell() {
     update_at(&mut loaded, tick + 1);
     assert_eq!(loaded.world.vehicles[vehicle].trans.pos, hold);
 }
+
+fn roundabout_fixture(
+    directions: &[f32],
+    radius: f32,
+    slope: bool,
+) -> (TestCtx, IntersectionID, Vec<Vec3>) {
+    use crate::map::{LanePatternBuilder, MapProject, ProjectFilter, RoundaboutPolicy};
+    use geom::Radians;
+
+    let ctx = TestCtx::new();
+    let center = vec3(260.0, 260.0, if slope { 16.0 } else { 0.0 });
+    let mut ends = Vec::new();
+    let mut map = ctx.g.map_mut();
+    for (i, &angle) in directions.iter().enumerate() {
+        let dir = Radians::from_deg(angle).vec2();
+        let end = (center.xy() + dir * 155.0).z(if slope { 12.0 + dir.x * 8.0 } else { 0.0 });
+        let start = map.project(center, 0.0, ProjectFilter::INTER);
+        map.make_connection(
+            start,
+            MapProject::ground(end),
+            None,
+            &LanePatternBuilder::new()
+                .n_lanes(1 + (i % 3) as u32)
+                .build(),
+        )
+        .unwrap();
+        ends.push(end);
+    }
+    let junction = junction_at(&map, center);
+    map.update_intersection(junction, |intersection| {
+        intersection.turn_policy.roundabout = Some(RoundaboutPolicy { radius });
+    });
+    drop(map);
+    (ctx, junction, ends)
+}
+
+#[test]
+fn roadtools_roundabout_has_shared_ring_and_connected_sidewalks() {
+    for (directions, radius, slope) in [
+        (&[0.0, 180.0][..], 18.0, false),
+        (&[0.0, 107.0, 218.0][..], 24.0, true),
+        (&[0.0, 90.0, 180.0, 270.0][..], 36.0, false),
+        (&[0.0, 38.0, 119.0, 194.0, 279.0][..], 28.0, true),
+    ] {
+        let (ctx, junction, _) = roundabout_fixture(directions, radius, slope);
+        let map = ctx.g.map();
+        let inter = map.get(junction).unwrap();
+        let turns = inter.turns().collect::<Vec<_>>();
+        for &id in &inter.roads {
+            let road = map.get(id).unwrap();
+            assert!(
+                road.interface_from(junction) > radius,
+                "short interface at {directions:?}"
+            );
+            for &(lane, kind) in road.incoming_lanes_to(junction) {
+                if kind.vehicles() {
+                    for &other in inter.roads.iter().filter(|&&other| other != id) {
+                        assert!(turns.iter().any(|turn| turn.id.src == lane
+                            && map.get(turn.id.dst).unwrap().parent == other));
+                    }
+                }
+            }
+        }
+
+        for turn in &turns {
+            let start = map.get(turn.id.src).unwrap().get_inter_node_pos(junction);
+            let end = map.get(turn.id.dst).unwrap().get_inter_node_pos(junction);
+            assert_eq!(turn.points.first(), start);
+            assert_eq!(turn.points.last(), end);
+            if matches!(turn.kind, TurnKind::Driving | TurnKind::WalkingCorner) {
+                let expected = if turn.kind == TurnKind::Driving {
+                    radius
+                } else {
+                    radius + 4.0 + LaneKind::Walking.width() * 0.5
+                };
+                let on_ring =
+                    |point: &Vec3| (point.xy().distance(inter.pos.xy()) - expected).abs() < 0.02;
+                assert!(
+                    turn.points
+                        .as_slice()
+                        .windows(3)
+                        .any(|points| points.iter().all(on_ring)),
+                    "turn {:?} misses its shared ring at {directions:?}",
+                    turn.id
+                );
+                for points in turn.points.as_slice().windows(3) {
+                    let a = (points[1] - points[0]).xy();
+                    let b = (points[2] - points[1]).xy();
+                    assert!(
+                        a.angle(b).abs() < 0.95,
+                        "sharp turn in {:?} at {directions:?}",
+                        turn.id
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|turn| turn.kind == TurnKind::WalkingCorner)
+                .count(),
+            directions.len()
+        );
+        assert_eq!(
+            turns
+                .iter()
+                .filter(|turn| turn.kind == TurnKind::Crosswalk)
+                .count(),
+            directions.len()
+        );
+    }
+}
+
+#[test]
+fn roadtools_roundabout_yields_to_circulating_traffic_and_clears_the_queue() {
+    let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 90.0, 180.0, 270.0], 28.0, false);
+    let (from, to, contender, exits) = {
+        let map = ctx.g.map();
+        let center = map.get(junction).unwrap().pos;
+        let from = lane_at(&map, ends[0], center);
+        let to = lane_at(&map, center, ends[3]);
+        let contender = lane_at(&map, ends[1], center);
+        let exits = ends
+            .iter()
+            .map(|end| lane_at(&map, center, *end))
+            .collect::<Vec<_>>();
+        (from, to, contender, exits)
+    };
+    let lead = staged_vehicle(&mut ctx.g, VehicleKind::Car, from, to, 5.0);
+    ctx.g.world.vehicles[lead].speed.0 = 350.0;
+    let tick = ctx.g.get_tick();
+    update_at(&mut ctx.g, tick + 1);
+    let lead_turn = TurnID::new(junction, from, to, false);
+    assert!(ctx.g.read::<JunctionAdmission>().crossing_turn(lead_turn));
+    let queued = staged_vehicle(&mut ctx.g, VehicleKind::Car, contender, to, 5.0);
+    ctx.g.world.vehicles[queued].speed.0 = 350.0;
+    update_at(&mut ctx.g, tick + 2);
+    assert_eq!(ctx.g.world.vehicles[queued].speed.0, 0.0);
+
+    let more = {
+        let map = ctx.g.map();
+        let center = map.get(junction).unwrap().pos;
+        [
+            lane_at(&map, ends[2], center),
+            lane_at(&map, ends[3], center),
+        ]
+    };
+    let west = staged_vehicle(&mut ctx.g, VehicleKind::Car, more[0], exits[0], 15.0);
+    let south = staged_vehicle(&mut ctx.g, VehicleKind::Car, more[1], exits[1], 15.0);
+    let routes = [
+        (lead, to),
+        (queued, to),
+        (west, exits[0]),
+        (south, exits[1]),
+    ];
+    let mut discharged = std::collections::BTreeSet::new();
+    for _ in 0..3200 {
+        ctx.tick_fast();
+        for &(id, lane) in &routes {
+            let car = &ctx.g.world.vehicles[id];
+            if car
+                .it
+                .get_travers()
+                .is_some_and(|path| path.kind == TraverseKind::Lane(lane))
+            {
+                discharged.insert(id);
+            }
+        }
+        if discharged.len() == routes.len() {
+            break;
+        }
+    }
+    assert_eq!(
+        discharged.len(),
+        routes.len(),
+        "roundabout queue failed to discharge"
+    );
+}
+
+#[test]
+fn roadtools_roundabout_recovers_a_saved_straight_junction() {
+    let (ctx, junction, _) = roundabout_fixture(&[0.0, 180.0], 18.0, false);
+    let legacy_bytes = {
+        let mut map = ctx.g.map_mut();
+        let policy = map.get(junction).unwrap().turn_policy;
+        map.update_intersection(junction, |inter| inter.turn_policy.roundabout = None);
+        assert!(map
+            .get(junction)
+            .unwrap()
+            .roads
+            .iter()
+            .all(|&id| { map.get(id).unwrap().interface_from(junction) == 1.0 }));
+        map.intersections[junction].turn_policy = policy;
+        Bincode::encode(&*map).unwrap()
+    };
+    let loaded: Map = Bincode::decode(&legacy_bytes).unwrap();
+    let ring = loaded
+        .get(junction)
+        .unwrap()
+        .roundabout_geometry(loaded.roads())
+        .unwrap();
+    assert_eq!(ring.radius, 18.0);
+    assert!(loaded.is_yield_roundabout(junction));
+    let saved = Bincode::encode(&loaded).unwrap();
+    let reloaded: Map = Bincode::decode(&saved).unwrap();
+    assert_eq!(Bincode::encode(&reloaded).unwrap(), saved);
+}

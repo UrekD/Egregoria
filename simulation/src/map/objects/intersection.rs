@@ -1,6 +1,6 @@
 use crate::map::{
-    Intersections, LaneID, LaneKind, Lanes, LightPolicy, Road, RoadID, Roads, SpatialMap,
-    TraverseDirection, Turn, TurnID, TurnPolicy,
+    Intersections, LaneID, LaneKind, Lanes, LightPolicy, Road, RoadID, Roads, RoundaboutGeometry,
+    SpatialMap, TraverseDirection, Turn, TurnID, TurnPolicy,
 };
 use geom::{pseudo_angle, Circle, Ray};
 use geom::{Vec2, Vec3};
@@ -105,10 +105,11 @@ impl Intersection {
             .map(|(id, kind)| Turn::new(id, kind))
             .collect();
 
+        let roundabout = self.roundabout_geometry(roads);
         self.turns = std::mem::take(&mut self.turns)
             .into_iter()
             .map(|mut x| {
-                x.make_points(lanes, self);
+                x.make_points(lanes, roads, self, roundabout);
                 x
             })
             .collect();
@@ -127,7 +128,12 @@ impl Intersection {
     }
 
     pub fn update_traffic_control(&self, lanes: &mut Lanes, roads: &Roads) {
-        self.light_policy.apply(self, lanes, roads);
+        let light = if self.is_roundabout() {
+            LightPolicy::NoLights
+        } else {
+            self.light_policy
+        };
+        light.apply(self, lanes, roads);
     }
 
     const MIN_INTERFACE: f32 = 9.0;
@@ -141,7 +147,7 @@ impl Intersection {
                 r.set_interface(id, Self::empty_interface(r.width));
                 return;
             }
-            [r1_id, r2_id] => {
+            [r1_id, r2_id] if !self.is_roundabout() => {
                 let (r1, r2) = (&roads[r1_id], &roads[r2_id]);
                 let (dir1, dir2) = (r1.dir_from(id), r2.dir_from(id));
                 let (r1w, r2w) = (r1.width, r2.width);
@@ -192,7 +198,7 @@ impl Intersection {
             if let Some(rb) = self.turn_policy.roundabout {
                 for &r in &self.roads {
                     let r = &mut roads[r];
-                    r.max_interface(id, rb.radius * 1.1 + 5.0);
+                    r.max_interface(id, rb.radius + 10.0 + r.width * 0.2);
                 }
             }
         }
@@ -278,6 +284,25 @@ impl Intersection {
 
     pub fn is_roundabout(&self) -> bool {
         self.turn_policy.roundabout.is_some() && self.roads.len() > 1
+    }
+
+    pub fn roundabout_geometry(&self, roads: &Roads) -> Option<RoundaboutGeometry> {
+        RoundaboutGeometry::new(self, roads)
+    }
+
+    pub(super) fn roundabout_port(&self, roads: &Roads, arm: RoadID, entry: bool) -> f32 {
+        let index = self.roads.iter().position(|&road| road == arm).unwrap();
+        let count = self.roads.len();
+        let dir = roads[arm].dir_from(self.id);
+        let angle = dir.angle_cossin().0;
+        let (neighbor, sign) = if entry {
+            (self.roads[(index + 1) % count], 1.0)
+        } else {
+            (self.roads[(index + count - 1) % count], -1.0)
+        };
+        let gap =
+            (sign * dir.angle(roads[neighbor].dir_from(self.id))).rem_euclid(std::f32::consts::TAU);
+        angle + sign * (gap * 0.25).min(0.40)
     }
 
     pub fn undirected_neighbors<'a>(

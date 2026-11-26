@@ -114,6 +114,7 @@ pub struct Map {
     pub(crate) walking_topology_generation: u64,
     pub(crate) driving_policy_generation: u64,
     pub(super) junction_policy_revision: u64,
+    pub(super) roundabouts: BTreeSet<IntersectionID>,
     pub(super) junction_rules: BTreeMap<IntersectionID, JunctionRules>,
     pub(super) lane_scoring: Option<LaneScoringPilot>,
     // Derived from lanes and turns. Map deserialization starts with an empty cache.
@@ -178,6 +179,7 @@ impl Clone for Map {
             walking_topology_generation: self.walking_topology_generation,
             driving_policy_generation: self.driving_policy_generation,
             junction_policy_revision: self.junction_policy_revision,
+            roundabouts: self.roundabouts.clone(),
             junction_rules: self.junction_rules.clone(),
             lane_scoring: self.lane_scoring.clone(),
             import_lane_reserve: self.import_lane_reserve,
@@ -217,6 +219,7 @@ impl Map {
             walking_topology_generation: 0,
             driving_policy_generation: 0,
             junction_policy_revision: 0,
+            roundabouts: BTreeSet::new(),
             junction_rules: BTreeMap::new(),
             lane_scoring: None,
             driving_reachability: OnceLock::new(),
@@ -458,6 +461,10 @@ impl Map {
         !self.has_junction_rules()
     }
 
+    pub(crate) fn needs_junction_entry_checks(&self) -> bool {
+        self.has_junction_rules() || !self.roundabouts.is_empty()
+    }
+
     pub(crate) fn junction_rules_near(&self, position: Vec3, margin: f32) -> bool {
         self.has_junction_rules()
             && self.spatial_map
@@ -468,15 +475,24 @@ impl Map {
     }
 
     pub(crate) fn has_junction_controller(&self) -> bool {
-        self.junction_rules
-            .values()
-            .any(|rules| !rules.approaches().is_empty())
+        !self.roundabouts.is_empty()
+            || self
+                .junction_rules
+                .values()
+                .any(|rules| !rules.approaches().is_empty())
+    }
+
+    pub(crate) fn is_yield_roundabout(&self, junction: IntersectionID) -> bool {
+        self.roundabouts.contains(&junction)
     }
 
     pub(crate) fn configured_junctions(&self) -> impl Iterator<Item = IntersectionID> + '_ {
-        self.junction_rules
+        self.roundabouts
             .iter()
-            .filter_map(|(&id, rules)| (!rules.approaches().is_empty()).then_some(id))
+            .copied()
+            .chain(self.junction_rules.iter().filter_map(|(&id, rules)| {
+                (!rules.approaches().is_empty() && !self.roundabouts.contains(&id)).then_some(id)
+            }))
     }
 
     pub(crate) fn junction_rule_count(&self) -> usize {
@@ -748,6 +764,7 @@ impl Map {
 
     fn remove_intersection_inner(&mut self, src: IntersectionID) {
         let inter = unwrap_ret!(self.intersections.remove(src));
+        self.roundabouts.remove(&src);
         self.lane_topology_changed();
         queue_construction_cut(
             &mut self.pending_construction_cuts,
@@ -2210,6 +2227,9 @@ impl Map {
         }
         for &id in junctions {
             let junction = &mut self.intersections[id];
+            if junction.is_roundabout() {
+                self.roundabouts.insert(id);
+            }
             junction.update_traffic_control(&mut self.lanes, &self.roads);
             junction.update_turns(&self.lanes, &self.roads);
             self.spatial_map.update(junction);
@@ -2226,7 +2246,7 @@ impl Map {
         }
     }
 
-    fn invalidate(&mut self, id: IntersectionID) {
+    pub(super) fn invalidate(&mut self, id: IntersectionID) {
         info!("invalidate {:?}", id);
 
         if !self.intersections.contains_key(id) {
@@ -2234,6 +2254,11 @@ impl Map {
         }
         self.lane_topology_changed();
         let inter = &mut self.intersections[id];
+        if inter.is_roundabout() {
+            self.roundabouts.insert(id);
+        } else {
+            self.roundabouts.remove(&id);
+        }
         queue_construction_cut(
             &mut self.pending_construction_cuts,
             &self.environment,
@@ -2257,6 +2282,7 @@ impl Map {
         let inter = &mut self.intersections[id];
         inter.update_interface_radius(&mut self.roads);
 
+        let mut nearby_roundabouts = BTreeSet::new();
         for x in inter.roads.clone() {
             let road = unwrap_contlog!(
                 self.roads.get(x),
@@ -2283,6 +2309,9 @@ impl Map {
                 other_end,
             );
             self.spatial_map.update_cut_influence(other_end);
+            if other_end.is_roundabout() {
+                nearby_roundabouts.insert(oend_id);
+            }
 
             #[allow(clippy::indexing_slicing)] // borrowed before
             self.roads[x].update_lanes(&mut self.lanes, &mut self.parking, &self.environment);
@@ -2291,6 +2320,14 @@ impl Map {
                 oend_id.into(),
                 super::junction_support_bounds(other_end, &self.roads),
             );
+        }
+
+        for neighbor in nearby_roundabouts {
+            let junction = &mut self.intersections[neighbor];
+            junction.update_turns(&self.lanes, &self.roads);
+            junction.apply_turn_mask(self.junction_rules.get(&neighbor));
+            self.spatial_map.update(junction);
+            self.subscribers.dispatch(UpdateType::Road, junction);
         }
 
         #[allow(clippy::indexing_slicing)] // borrowed before

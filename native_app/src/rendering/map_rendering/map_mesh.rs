@@ -2220,6 +2220,55 @@ pub(crate) fn intersection_mesh(
     let interpos = inter.pos.up(ROAD_Z_OFFSET);
     let id = inter.id;
 
+    if let Some(ring) = inter.roundabout_geometry(roads) {
+        let mut deck = Vec::new();
+        for (&a, &b) in inter.roads.iter().zip(inter.roads.iter().cycle().skip(1)) {
+            if let Some(corner) = ring.road_corner(id, &roads[a], &roads[b], false) {
+                deck.extend(corner);
+            }
+        }
+        if deck.len() < 3 {
+            return;
+        }
+        let island = deck.len();
+        for i in 0..96 {
+            let angle = Radians::TAU * (i as f32 / 96.0);
+            deck.push(ring.center + (angle.vec2() * ring.island_radius()).z0());
+        }
+        let polygon: Vec<_> = deck.iter().map(|p| p.xy()).collect();
+        let colors = simulation::colors();
+        let asphalt: [f32; 4] = LinearColor::from(colors.road_mid_col).into();
+        let curb: [f32; 4] = (*center_col).into();
+        tess.extend_with(move |vertices, add_idx| {
+            vertices.extend(deck.iter().map(|&pos| MeshVertex {
+                position: pos.into(),
+                normal: Vec3::Z,
+                uv: [0.0; 2],
+                color: asphalt,
+                tangent: [0.0; 4],
+            }));
+            earcut(&polygon, &[island], |a, b, c| {
+                for index in [a, b, c, c, b, a] {
+                    add_idx(index as u32);
+                }
+            });
+            // Fill the island with a separate surface at the inner curb.
+            vertices.extend(deck[island..].iter().map(|&pos| MeshVertex {
+                position: pos.into(),
+                normal: Vec3::Z,
+                uv: [0.0; 2],
+                color: curb,
+                tangent: [0.0; 4],
+            }));
+            for i in 1..deck.len() - island - 1 {
+                for index in [deck.len(), deck.len() + i, deck.len() + i + 1] {
+                    add_idx(index as u32);
+                }
+            }
+        });
+        return;
+    }
+
     let getw = |road: &Road| {
         if road.sidewalks(id).outgoing.is_some() {
             road.width * 0.5 - LaneKind::Walking.width()
@@ -2267,32 +2316,6 @@ pub(crate) fn intersection_mesh(
 
         let dst_orient = unwrap_cont!(firstdir).xy();
         let next_right = firstp.xy() + dst_orient.perpendicular() * getw(next_road);
-
-        if inter.is_roundabout() {
-            if let Some(rp) = inter.turn_policy.roundabout {
-                let center = interpos.xy();
-
-                let ang = (left - center)
-                    .normalize()
-                    .angle((next_right - center).normalize())
-                    .abs();
-                if ang >= Radians::from_deg(21.0).0 {
-                    polygon.extend(Turn::gen_roundabout(
-                        left.z(0.0),
-                        next_right.z(0.0),
-                        src_orient,
-                        dst_orient,
-                        rp.radius + 3.0,
-                        center,
-                    ));
-
-                    tess.set_color(center_col);
-                    tess.draw_circle(center.z(interpos.z + 0.01), rp.radius * 0.5);
-
-                    continue;
-                }
-            }
-        }
 
         let spline = Turn::spline(left, next_right, src_orient, dst_orient);
 

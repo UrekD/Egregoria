@@ -74,6 +74,7 @@ pub fn run_ui_systems(sim: &Simulation, uiworld: &UiWorld) {
 #[derive(Default, Clone, Debug)]
 pub struct ErrorTooltip {
     pub msg: Option<Cow<'static, str>>,
+    pub detail: Option<String>,
     // Whether this tooltip is about something happening in the game world
     // Avoid showing tooltip when the UI is hovered
     pub isworld: bool,
@@ -83,6 +84,7 @@ impl ErrorTooltip {
     pub fn new(msg: impl Into<Cow<'static, str>>) -> Self {
         Self {
             msg: Some(msg.into()),
+            detail: None,
             isworld: true,
         }
     }
@@ -91,6 +93,7 @@ impl ErrorTooltip {
     pub fn new_ui(msg: impl Into<Cow<'static, str>>) -> Self {
         Self {
             msg: Some(msg.into()),
+            detail: None,
             isworld: false,
         }
     }

@@ -31,18 +31,23 @@ pub fn render_oldgui(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
 pub fn tooltip(ui: &Context, uiworld: &UiWorld, sim: &Simulation) {
     profiling::scope!("gui::tooltip");
     let tooltip = std::mem::take(&mut *uiworld.write::<ErrorTooltip>());
-    if let Some(msg) = tooltip.msg {
-        if !(tooltip.isworld && ui.is_pointer_over_area()) {
-            let pointer = uiworld.read::<InputMap>().screen;
-            let pos = egui::pos2(pointer.x, pointer.y) / ui.pixels_per_point();
-            let anchor = egui::Rect::from_center_size(pos, egui::vec2(30.0, 30.0));
-            egui::show_tooltip_for(ui, Id::new("tooltip_error"), &anchor, |ui| {
+    if (tooltip.msg.is_some() || tooltip.detail.is_some())
+        && (!tooltip.isworld || !ui.is_pointer_over_area())
+    {
+        let pointer = uiworld.read::<InputMap>().screen;
+        let pos = egui::pos2(pointer.x, pointer.y) / ui.pixels_per_point();
+        let anchor = egui::Rect::from_center_size(pos, egui::vec2(30.0, 30.0));
+        egui::show_tooltip_for(ui, Id::new("tooltip_error"), &anchor, |ui| {
+            if let Some(detail) = tooltip.detail {
+                ui.add(egui::Label::new(detail).wrap_mode(egui::TextWrapMode::Extend));
+            }
+            if let Some(msg) = tooltip.msg {
                 ui.add(
                     egui::Label::new(RichText::new(msg).color(Color32::from_rgb(255, 100, 100)))
                         .wrap_mode(egui::TextWrapMode::Extend),
                 );
-            });
-        }
+            }
+        });
     }
 
     if ui.is_pointer_over_area() {

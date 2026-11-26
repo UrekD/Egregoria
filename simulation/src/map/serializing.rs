@@ -1,5 +1,5 @@
 use std::borrow::Cow;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use geom::{Shape, Vec2};
 use serde::{Deserialize, Serialize};
@@ -302,8 +302,15 @@ impl SerializedMap {
         lot_origins: BTreeMap<BuildingID, LotOrigin>,
         import_lane_reserve: bool,
     ) -> Map {
+        let mut roundabouts = BTreeSet::new();
         for junction in self.intersections.values_mut() {
-            junction.index_crosswalks();
+            if junction.is_roundabout() {
+                roundabouts.insert(junction.id);
+                junction.update_traffic_control(&mut self.lanes, &self.roads);
+                junction.update_turns(&self.lanes, &self.roads);
+            } else {
+                junction.index_crosswalks();
+            }
         }
         let spatial_map = mk_spatial_map(&self);
         let mut lots_by_road = BTreeMap::<_, std::collections::BTreeSet<_>>::new();
@@ -314,6 +321,7 @@ impl SerializedMap {
             roads: self.roads,
             lanes: self.lanes,
             intersections: self.intersections,
+            roundabouts,
             buildings: self.buildings,
             spatial_map,
             lots: self.lots,
@@ -325,6 +333,22 @@ impl SerializedMap {
             lot_origins,
             ..Map::empty()
         };
+        let legacy_straight: Vec<_> = m
+            .roundabouts
+            .iter()
+            .copied()
+            .filter(|&id| {
+                let junction = &m.intersections[id];
+                junction.roads.len() == 2
+                    && junction.roads.iter().all(|&road| {
+                        let road = &m.roads[road];
+                        road.length() > 20.0 && road.interface_from(id) <= 1.0
+                    })
+            })
+            .collect();
+        for id in legacy_straight {
+            m.invalidate(id);
+        }
         m.electricity = ElectricityCache::build(&m);
         m.water_services = super::WaterServiceCache::from_map(&m);
         m

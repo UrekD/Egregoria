@@ -307,6 +307,9 @@ pub(crate) struct JunctionFrame {
 }
 
 pub(crate) fn configured(map: &Map, junction: IntersectionID) -> Option<LightPolicy> {
+    if map.is_yield_roundabout(junction) {
+        return Some(LightPolicy::NoLights);
+    }
     let rules = map.junction_rules(junction)?;
     if rules.approaches().is_empty() {
         return None;
@@ -317,7 +320,7 @@ pub(crate) fn configured(map: &Map, junction: IntersectionID) -> Option<LightPol
 }
 
 pub(super) fn controls_road_decision(map: &Map, it: &Itinerary, position: Vec3) -> bool {
-    if !map.has_junction_rules() {
+    if !map.needs_junction_entry_checks() {
         return false;
     }
     match it.get_travers().map(|traversal| traversal.kind) {
@@ -342,15 +345,15 @@ pub(crate) fn entry_boundary(
     travel: f32,
     half_extent: f32,
 ) -> Option<EntryBoundary> {
-    if !map.has_junction_rules() {
+    if !map.needs_junction_entry_checks() {
         return None;
     }
     let route = it.get_route()?;
     let next = *route.reversed_route.last()?;
     let crossing = Crossing::from_traversal(next)?;
-    let rules = map.junction_rules(crossing.turn.parent)?;
+    let rules = map.junction_rules(crossing.turn.parent);
     let controlled = configured(map, crossing.turn.parent).is_some();
-    if !controlled && rules.allows(crossing.turn) {
+    if !controlled && rules.is_none_or(|rules| rules.allows(crossing.turn)) {
         return None;
     }
     // Endpoint proximity is a lower bound even for curved approach paths.
