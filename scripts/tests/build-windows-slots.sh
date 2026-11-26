@@ -74,14 +74,23 @@ PY_CHECK
         ;;
     osm-city)
         [[ $2 == --input && -s $3 && $4 == --save-root ]]
+        if [[ $3 == */release-slots/* ]]; then
+            cmp -- lesce.json "$3"
+            [[ $# == 5 ]]
+        fi
         [[ ${TEST_OSM_RESULT:-} != fail ]] || exit 17
         [[ ${TEST_OSM_RESULT:-} != omit ]] || exit 0
         out=$5
         slots=(lesce_osm)
         ;;
     citymap-build)
-        [[ $2 == --out && ! -e $3 && $4 == --input && $5 == "$EGR_CITYMAP_LESCE" ]]
-        [[ $6 == --sava-input && $7 == "$EGR_CITYMAP_SAVA" ]]
+        [[ $2 == --out && ! -e $3 && $4 == --input && $6 == --sava-input ]]
+        if [[ $5 == */release-slots/* ]]; then
+            cmp -- lesce.json "$5"
+            cmp -- sava.json "$7"
+        else
+            [[ $5 == "$EGR_CITYMAP_LESCE" && $7 == "$EGR_CITYMAP_SAVA" ]]
+        fi
         out=$3
         slots=(lesce_town)
         ;;
@@ -224,3 +233,39 @@ expect_members lesce_osm lesce_town showcase_city starter_town
 build EGR_OSM_INPUT="$root/lesce.json" BUILD_CITYMAP=
 expect_trace demo-cities osm-city package
 expect_members lesce_osm showcase_city starter_town
+
+mkdir -p scripts/osm/release
+gzip -n -c lesce.json > scripts/osm/release/lesce.json.gz
+gzip -n -c sava.json > scripts/osm/release/sava.json.gz
+
+release_slots() {
+    EGR_OSM_INPUT=/missing EGR_OSM_FLAGS=--replace \
+        scripts/build-windows-with-slots.sh --release-slots "$1" "$CARGO_TARGET_DIR"
+}
+
+if ! release_slots "$root/release/world" > "$root/release-slots.log" 2>&1; then
+    cat "$root/release-slots.log" >&2
+    printf 'Could not stage release slots without running the Windows packager\n' >&2
+    exit 1
+fi
+expect_trace demo-cities osm-city citymap-build citymap-verify
+for slot in starter_town showcase_city lesce_osm lesce_town; do
+    test -s "$root/release/world/$slot.zip"
+    test -s "$root/release/world/$slot.meta.json"
+done
+test -s "$root/release/world/lesce_town.build.json"
+
+if release_slots world > "$root/existing-world.log" 2>&1; then
+    printf 'Release slot generation accepted an existing save directory\n' >&2
+    exit 1
+fi
+test ! -s "$TRACE"
+test "$(cat world/user.zip)" = 'user save'
+
+release_slots "$root/second-release/world"
+expect_trace citymap-verify
+diff -r "$root/release/world" "$root/second-release/world"
+
+EGR_CITYMAP_PUBLISHED="$root/release/world" release_slots "$root/third-release/world"
+expect_trace demo-cities osm-city citymap-verify
+diff -r "$root/release/world" "$root/third-release/world"

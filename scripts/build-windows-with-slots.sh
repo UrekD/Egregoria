@@ -1,19 +1,46 @@
 #!/usr/bin/env bash
-# Generate and cache the playable slots for make build.
+# Generate and cache playable slots for make build and release CI.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+release_slots=false
+if [[ ${1:-} == --release-slots ]]; then
+    release_slots=true
+    shift
+    if [[ $# != 2 ]]; then
+        printf 'Usage: %s --release-slots WORLD_DIR CARGO_TARGET_DIR\n' "$0" >&2
+        exit 2
+    fi
+fi
 out=$1
 export CARGO_TARGET_DIR=$2
 town_generator=${3:-}
-published_town=${EGR_CITYMAP_PUBLISHED:-}
 cache=$CARGO_TARGET_DIR/windows-slots
+if $release_slots; then
+    town_generator=citymap-build
+    cache=$CARGO_TARGET_DIR/release-slots
+fi
 current=$cache/current
 mkdir -p -- "$cache"
 # Keep the selected stage in place until the packager has copied it.
 exec 9> "$cache/lock"
 flock 9
 
+if $release_slots; then
+    if [[ -e $out || -L $out ]]; then
+        printf 'Release slot directory already exists: %s\n' "$out" >&2
+        exit 1
+    fi
+    # Use the original historical responses. Overpass can return different bytes
+    # for the same dated query, and the wet generator checks both SHA-256 pins.
+    EGR_OSM_INPUT=$cache/lesce.json
+    EGR_CITYMAP_LESCE=$EGR_OSM_INPUT
+    EGR_CITYMAP_SAVA=$cache/sava.json
+    EGR_OSM_FLAGS=
+    gzip -dc -- scripts/osm/release/lesce.json.gz > "$EGR_OSM_INPUT"
+    gzip -dc -- scripts/osm/release/sava.json.gz > "$EGR_CITYMAP_SAVA"
+fi
+published_town=${EGR_CITYMAP_PUBLISHED:-}
 osm_input=${EGR_OSM_INPUT-${EGR_OSM_CACHE:-target/osm-cache}/lesce-20261122-signals.overpass.json}
 if [[ ! -v EGR_OSM_INPUT && ! -e $osm_input ]]; then
     scripts/osm/fetch.sh "$osm_input"
@@ -70,7 +97,7 @@ check_town() {
 
 generate() {
     if ! cargo run --locked --release -p scenarios -- "$@"; then
-        printf 'Windows save generation failed (%s).\n' "$1" >&2
+        printf 'Save generation failed (%s).\n' "$1" >&2
         exit 1
     fi
 }
@@ -79,9 +106,9 @@ stamp=$(fingerprint)
 if [[ -f $current/stamp && $(< "$current/stamp") == "$stamp" ]] &&
     check_slots "$current/slots" 2>/dev/null; then
     check_town "$current/slots"
-    printf 'Reusing staged Windows save slots in %s\n' "$current/slots"
+    printf 'Reusing staged save slots in %s\n' "$current/slots"
 else
-    printf 'Generating Windows save slots for %s\n' "$(cat VERSION)"
+    printf 'Generating save slots for %s\n' "$(cat VERSION)"
     pending=$(mktemp -d "$cache/.pending.XXXXXX")
     trap 'rm -rf -- "$pending"' EXIT
     generate demo-cities --save-root "$pending/slots"
@@ -99,12 +126,25 @@ else
     check_slots "$pending/slots"
     check_town "$pending/slots"
     if [[ $(fingerprint) != "$stamp" ]]; then
-        printf 'Save generator inputs changed during the build. Rerun make build.\n' >&2
+        printf 'Save generator inputs changed during the build. Rerun slot generation.\n' >&2
         exit 1
     fi
     printf '%s\n' "$stamp" > "$pending/stamp"
     rm -rf -- "$current"
     mv -T -- "$pending" "$current"
+    trap - EXIT
 fi
 
-scripts/build-windows.sh "$out" "$current/slots"
+if $release_slots; then
+    mkdir -p -- "$(dirname -- "$out")"
+    staging=$(mktemp -d -- "$out.pending.XXXXXX")
+    trap 'rm -rf -- "$staging"' EXIT
+    cp -a -- "$current/slots/." "$staging/"
+    mv -T -n -- "$staging" "$out"
+    if [[ -d $staging ]]; then
+        printf 'Release slot directory already exists: %s\n' "$out" >&2
+        exit 1
+    fi
+else
+    scripts/build-windows.sh "$out" "$current/slots"
+fi

@@ -1,10 +1,8 @@
 on:
   push:
-    # Sequence of patterns matched against refs/tags
     tags:
-      - 'v*' # Push events to matching v*, i.e. v1.0, v20.15.10
-  # Manual runs build and upload the archives as workflow artifacts only;
-  # a GitHub release is created for tag pushes.
+      - 'v*'
+  # Tag dispatches publish a release. Branch dispatches build workflow artifacts.
   workflow_dispatch:
 
 name: Create Release
@@ -19,12 +17,38 @@ env:
   # Start relative paths with a dot if you don't want
   # paths to be preserved. Use "/" as a delimiter.
   # base_mod holds the Lua prototypes both binaries load at startup.
-  RELEASE_ADDS: README.md LICENSE assets base_mod
+  RELEASE_ADDS: README.md LICENSE assets base_mod world
   HEADLESS_ADDS: README.md LICENSE assets/paris_54000.txt base_mod
 
 jobs:
+  cities:
+    name: Generate release cities
+    if: github.event_name != 'push' || !github.event.deleted
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal && rustup default stable
+
+      - name: Generate playable save slots
+        shell: bash
+        timeout-minutes: 60
+        run: scripts/build-windows-with-slots.sh --release-slots world "${CARGO_TARGET_DIR:-target}"
+
+      - name: Create cities archive
+        run: 7z a -tzip cities.zip world
+
+      - uses: actions/upload-artifact@v4
+        name: Upload cities archive
+        with:
+          name: egregoria-cities
+          path: cities.zip
+          if-no-files-found: error
+
   build:
     name: Build and upload release
+    needs: cities
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
@@ -62,10 +86,15 @@ jobs:
       - name: Create artifact directory
         run: mkdir -p artifacts
 
-      - name: Install p7zip
-        # 7Zip not available on MacOS, install p7zip via homebrew.
-        run: brew install p7zip
-        if: matrix.os == 'macos-latest'
+      - uses: actions/download-artifact@v4
+        name: Download cities archive
+        with:
+          name: egregoria-cities
+          path: release-cities/
+
+      - name: Extract playable save slots
+        shell: bash
+        run: 7z x release-cities/cities.zip
 
       - name: Create app archive
         shell: bash
@@ -87,6 +116,23 @@ jobs:
             fi
           done
 
+      - name: Check desktop archive contains the save slots
+        shell: bash
+        run: |
+          archive=artifacts/egregoria-${{ matrix.os }}.zip
+          listing=$(7z l -slt "$archive")
+          listing=${listing//$'\r'/}
+          listing=${listing//\\//}
+          for slot in starter_town showcase_city lesce_osm lesce_town; do
+            for suffix in zip meta.json; do
+              entry="world/$slot.$suffix"
+              if ! grep -Fxq "Path = $entry" <<< "$listing"; then
+                printf '%s is missing %s\n' "$archive" "$entry" >&2
+                exit 1
+              fi
+            done
+          done
+
       # Artifact names must be unique per run.
       - uses: actions/upload-artifact@v4
         name: Upload archives
@@ -97,7 +143,7 @@ jobs:
 
   create-release:
     name: Create release
-    needs: build
+    needs: [cities, build]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
@@ -126,5 +172,5 @@ jobs:
           --verify-tag
           --repo "${GITHUB_REPOSITORY}"
           --title "Release ${GITHUB_REF_NAME}"
-          artifacts/linux.zip artifacts/windows.zip
+          artifacts/linux.zip artifacts/windows.zip artifacts/cities.zip
           artifacts/linux-headless.zip artifacts/windows-headless.zip
