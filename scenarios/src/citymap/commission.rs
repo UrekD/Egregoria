@@ -351,10 +351,14 @@ fn prepare_opening(
     sites.insert("coal-power-plant".into(), plant);
     let plant_door = sim.map().buildings()[plant].door_pos.xy();
     let mine_frontage = BTreeSet::from([plant_road]);
-    for (index, offset) in [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)]
-        .into_iter()
-        .enumerate()
-    {
+    let mut mine_offsets = [vec2(-70.0, 0.0), vec2(70.0, 0.0), vec2(0.0, 60.0)];
+    if profiled_wet {
+        // Freight considers producers in commissioning order. Put the mine
+        // upstream of the plant's loading curb first so loaded trucks can
+        // reach it without a turnaround.
+        mine_offsets.swap(0, 1);
+    }
+    for (index, offset) in mine_offsets.into_iter().enumerate() {
         let (mine, _) = place_company(sim, plan, &mine_frontage, "coal-mine", plant_door + offset)?;
         verify_parking_pair(&sim.map(), mine, plant, Tick(sim.get_tick()))?;
         sites.insert(format!("coal-mine-{}", index + 1), mine);
@@ -4230,6 +4234,20 @@ mod tests {
         let (mut sim, built, freight) = build_wet_town(&mut plan).unwrap();
         let opening = prepare_opening(&mut sim, &plan, &built, Some(freight)).unwrap();
         let map = sim.map();
+        if ResidencePrototype::iter().any(|home| home.massing.is_some()) {
+            let loading_lane = |name: &str| {
+                let door = map.buildings()[opening.sites[name]].door_pos;
+                let parking = ParkingManagement::default().reserve_near(door, &map).unwrap();
+                let position = parking.park_pos(&map).unwrap();
+                let lane = map.nearest_lane(position, LaneKind::Driving, None).unwrap();
+                let points = &map.lanes()[lane].points;
+                (lane, points.length_at_proj(points.project(position)))
+            };
+            let (mine_lane, mine_offset) = loading_lane("coal-mine-1");
+            let (plant_lane, plant_offset) = loading_lane("coal-power-plant");
+            assert!(mine_lane == plant_lane && mine_offset < plant_offset,
+                "the first coal mine needs a direct outbound drive to the plant's loading curb");
+        }
         let reach = ServiceReach::new(&map, true);
         let bakeries: Vec<_> = map
             .buildings()
