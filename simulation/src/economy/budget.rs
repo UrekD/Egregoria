@@ -295,7 +295,7 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
         .filter(|building| match building.kind {
             BuildingKind::GoodsCompany(id) => !id.is_service() && !id.is_growable(),
             BuildingKind::RailFreightStation(_) | BuildingKind::TrainStation => true,
-            BuildingKind::House | BuildingKind::ExternalTrading => false,
+            BuildingKind::House | BuildingKind::ExternalTrading | BuildingKind::SiteRemnant => false,
         })
         .filter_map(|building| Government::special_building_price(building.kind))
         .map(|price| i128::from(price.inner()))

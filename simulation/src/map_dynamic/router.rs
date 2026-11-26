@@ -142,7 +142,7 @@ fn routing_changed(
             }
             router.reset_dest();
             match router.target_dest {
-                Some(Destination::Building(build)) if map.get(build).is_none() => {
+                Some(Destination::Building(build)) if map.get(build).is_none_or(|building| building.kind == crate::map::BuildingKind::SiteRemnant) => {
                     router.cancel_route(parking);
                     h.decision = Default::default();
                 }
@@ -184,7 +184,7 @@ fn routing_changed(
                     return;
                 }
 
-                let Some(building) = map.get(build) else {
+                let Some(building) = map.get(build).filter(|b| b.kind != crate::map::BuildingKind::SiteRemnant) else {
                     router.cur_dest = router.target_dest;
                     return;
                 };
@@ -573,7 +573,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                     walk_outside(body, pos, cbuf_human, &mut h.location);
                 }
                 RoutingStep::GetInBuilding(build) => {
-                    if !map.buildings().contains_key(build) {
+                    if map.get(build).is_none_or(|b| b.kind == crate::map::BuildingKind::SiteRemnant) {
                         h.router.reset_dest();
                         return;
                     }

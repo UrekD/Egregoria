@@ -25,9 +25,18 @@ local outlet = service("sewage-outlet", "Sewage Outlet", "sewage_outlet", "asset
 outlet.power_consumption = nil
 outlet.sewage_capacity = 2000
 
+local fire = service("fire-station", "Fire Station", "fire", "assets/sprites/fire_station.png", 900, 400, 8, 45)
+fire.fleet = {
+    bays = 1,
+    crew_per_trip = 2,
+    shift_count = 3,
+    max_response_m = 1500,
+    ignition_hourly_denominator = 10000,
+}
+
 data:extend {
     service("clinic", "Clinic", "health", "assets/sprites/clinic.png", 800, 400, 8, 45),
-    service("fire-station", "Fire Station", "fire", "assets/sprites/fire_station.png", 900, 400, 8, 45),
+    fire,
     service("police-station", "Police Station", "police", "assets/sprites/police_station.png", 800, 400, 8, 45),
     service("school", "School", "school", "assets/sprites/school.png", 600, 360, 6, 45),
     service("garbage-depot", "Garbage Depot", "garbage", "assets/sprites/garbage_depot.png", 1200, 400, 6, 35),

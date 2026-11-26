@@ -364,7 +364,10 @@ fn land_ownership_protected_roads_buildings_and_transit_are_immutable() {
     let edits = [
         WorldCommand::MapRemoveRoad(id),
         WorldCommand::MapRemoveIntersection(src),
-        WorldCommand::MapRemoveBuilding(building),
+        WorldCommand::MapStartDemolition {
+            site: building,
+            quote: crate::souls::demolition::demolition_quote(&sim, building).unwrap().quote,
+        },
         WorldCommand::MapMakeConnection {
             from: MapProject {
                 pos: point,

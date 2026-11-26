@@ -11,6 +11,7 @@ use crate::uiworld::UiWorld;
 use engine::MouseButton;
 use geom::{Camera, Ray3, Vec2};
 use simulation::map::{BuildingKind, Map, MapProject, ProjectFilter, ProjectKind};
+use simulation::souls::demolition::{demolition_quote, demolition_status};
 use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::Simulation;
 
@@ -20,6 +21,7 @@ pub struct BulldozerState {
     initiating_button: Option<MouseButton>,
     previous_buttons: FastSet<MouseButton>,
     press_order: Vec<MouseButton>,
+    pending_demolitions: Vec<WorldCommand>,
 }
 
 #[derive(Default)]
@@ -61,6 +63,11 @@ impl BulldozerState {
     }
 
     pub fn reset_gesture(&mut self) {
+        self.reset_stroke();
+        self.pending_demolitions.clear();
+    }
+
+    fn reset_stroke(&mut self) {
         self.gesture = Gesture::Idle;
         self.initiating_button = None;
         self.previous_buttons.clear();
@@ -71,7 +78,7 @@ impl BulldozerState {
         if held {
             self.gesture = Gesture::Cancelled;
         } else {
-            self.reset_gesture();
+            self.reset_stroke();
         }
     }
 
@@ -126,12 +133,12 @@ impl BulldozerState {
         held: bool,
         pressed: bool,
         current: Vec2,
-        map: &Map,
+        sim: &Simulation,
         mut project: impl FnMut(Vec2) -> Option<MapProject>,
         commands: &mut WorldCommands,
     ) {
         if !held {
-            self.reset_gesture();
+            self.reset_stroke();
             return;
         }
 
@@ -156,7 +163,7 @@ impl BulldozerState {
             // Road removal already removes both endpoints if they have no roads left.
             // Queuing an intersection too would cascade into duplicate removals.
             if removed.insert(target) {
-                queue_target(map, target, commands);
+                queue_target(sim, target, commands);
             }
         }
         if interrupted {
@@ -240,25 +247,52 @@ fn project_target(
     ))
 }
 
-fn removal_candidate(map: &Map, target: ProjectKind) -> Option<WorldCommand> {
+fn removal_candidate(sim: &Simulation, target: ProjectKind) -> Option<WorldCommand> {
     Some(match target {
         ProjectKind::Intersection(id) => WorldCommand::MapRemoveIntersection(id),
         ProjectKind::Road(id) => WorldCommand::MapRemoveRoad(id),
-        ProjectKind::Building(id)
-            if map.get(id).is_some_and(|building| {
-                !matches!(building.kind, BuildingKind::ExternalTrading)
-            }) =>
-        {
-            WorldCommand::MapRemoveBuilding(id)
+        ProjectKind::Building(site) => {
+            let preview = demolition_quote(sim, site).ok()?;
+            if preview.original_kind == BuildingKind::ExternalTrading
+                || demolition_status(sim, site).is_some_and(|status| status.quote.is_some())
+            {
+                return None;
+            }
+            WorldCommand::MapStartDemolition { site, quote: preview.quote }
         }
         _ => return None,
     })
 }
 
-fn queue_target(map: &Map, target: ProjectKind, commands: &mut WorldCommands) {
-    if let Some(command) = removal_candidate(map, target) {
+fn queue_target(sim: &Simulation, target: ProjectKind, commands: &mut WorldCommands) {
+    if let Some(command) = removal_candidate(sim, target) {
         commands.push(command);
     }
+}
+
+pub(crate) fn demolition_controls(uiworld: &UiWorld) {
+    let mut state = uiworld.write::<BulldozerState>();
+    if state.pending_demolitions.is_empty() {
+        return;
+    }
+    let count = state.pending_demolitions.len();
+    let total: prototypes::Money = state.pending_demolitions.iter().filter_map(|command| {
+        match command {
+            WorldCommand::MapStartDemolition { quote, .. } => Some(quote.price),
+            _ => None,
+        }
+    }).fold(prototypes::Money::ZERO, |total, price| {
+        prototypes::Money::new_inner(total.inner().saturating_add(price.inner()))
+    });
+    goryak::minrow(8.0, || {
+        goryak::textc(goryak::on_secondary_container(), format!("{count} sites · {total}"));
+        if goryak::button_secondary("Confirm demolition").show().clicked {
+            uiworld.commands().extend(state.pending_demolitions.drain(..));
+        }
+        if goryak::button_secondary("Cancel").show().clicked {
+            state.pending_demolitions.clear();
+        }
+    });
 }
 
 fn is_select_button(bindings: &Bindings, button: MouseButton) -> bool {
@@ -321,14 +355,14 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
                 selecting,
                 pressed,
                 input.screen,
-                &map,
+                sim,
                 project,
                 &mut candidates,
             );
         }
         current
     } else {
-        state.reset_gesture();
+        state.reset_stroke();
         let current = match input.ray {
             Some(ray) => project_target(&map, &mut picker, ray, ProjectFilter::ALL),
             None => input
@@ -337,25 +371,34 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
         };
         if pressed && !pointer.interrupted {
             if let Some(current) = current {
-                queue_target(&map, current.kind, &mut candidates);
+                queue_target(sim, current.kind, &mut candidates);
             }
         }
         current
     };
 
-    let accepted = candidates
-        .iter()
-        .filter(|command| preview_edit(sim, uiworld, command));
     let mut commands = uiworld.commands();
     let before = commands.as_ref().len();
-    commands.extend(accepted.cloned());
+    for command in candidates.iter().filter(|command| preview_edit(sim, uiworld, command)) {
+        if let WorldCommand::MapStartDemolition { site, .. } = command {
+            if state.pending_demolitions.len() < 32
+                && !state.pending_demolitions.iter().any(|pending| {
+                    matches!(pending, WorldCommand::MapStartDemolition { site: id, .. } if id == site)
+                })
+            {
+                state.pending_demolitions.push(command.clone());
+            }
+        } else {
+            commands.push(command.clone());
+        }
+    }
     if commands.as_ref().len() != before {
         uiworld.write::<SpecialBuildingResource>().last_obb = None;
     }
 
     if let Some(project) = projection {
         let colors = simulation::colors();
-        let color = match removal_candidate(&map, project.kind) {
+        let color = match removal_candidate(sim, project.kind) {
             Some(command) if preview_edit(sim, uiworld, &command) => colors.gui_danger,
             _ => colors.gui_disabled,
         };
@@ -523,9 +566,9 @@ mod tests {
         let mut commands = WorldCommands::default();
         let a = vec2(700.0, 780.0);
         let b = vec2(1180.0, 780.0);
-        state.update_drag(true, true, a, &map, sample_target(&map), &mut commands);
-        state.update_drag(true, false, b, &map, sample_target(&map), &mut commands);
-        state.update_drag(true, false, a, &map, sample_target(&map), &mut commands);
+        state.update_drag(true, true, a, &city.sim, sample_target(&map), &mut commands);
+        state.update_drag(true, false, b, &city.sim, sample_target(&map), &mut commands);
+        state.update_drag(true, false, a, &city.sim, sample_target(&map), &mut commands);
         assert_eq!(commands.as_ref().len(), 4);
         assert!(commands
             .iter()
@@ -548,7 +591,7 @@ mod tests {
             true,
             false,
             vec2(860.0, 780.0),
-            &map,
+            &city.sim,
             sample_target(&map),
             &mut commands,
         );
@@ -556,7 +599,7 @@ mod tests {
             true,
             false,
             vec2(860.0, 940.0),
-            &map,
+            &city.sim,
             sample_target(&map),
             &mut commands,
         );
@@ -564,7 +607,7 @@ mod tests {
             true,
             false,
             vec2(780.0, 860.0),
-            &map,
+            &city.sim,
             sample_target(&map),
             &mut commands,
         );
@@ -572,7 +615,7 @@ mod tests {
             true,
             false,
             vec2(940.0, 860.0),
-            &map,
+            &city.sim,
             sample_target(&map),
             &mut commands,
         );
@@ -600,19 +643,19 @@ mod tests {
         let mut commands = WorldCommands::default();
         let a = vec2(700.0, 780.0);
         let b = vec2(1180.0, 780.0);
-        state.update_drag(true, true, a, &map, sample_target(&map), &mut commands);
+        state.update_drag(true, true, a, &city.sim, sample_target(&map), &mut commands);
         state.update_drag(
             true,
             false,
             vec2(900.0, 780.0),
-            &map,
+            &city.sim,
             |_| None,
             &mut commands,
         );
-        state.update_drag(true, true, b, &map, sample_target(&map), &mut commands);
+        state.update_drag(true, true, b, &city.sim, sample_target(&map), &mut commands);
         assert_eq!(commands.as_ref().len(), 1);
-        state.update_drag(false, false, b, &map, sample_target(&map), &mut commands);
-        state.update_drag(true, true, b, &map, sample_target(&map), &mut commands);
+        state.update_drag(false, false, b, &city.sim, sample_target(&map), &mut commands);
+        state.update_drag(true, true, b, &city.sim, sample_target(&map), &mut commands);
         assert_eq!(commands.as_ref().len(), 2);
     }
 

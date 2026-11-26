@@ -819,6 +819,11 @@ pub fn can_save(uiw: &UiWorld) -> bool {
 }
 
 pub(crate) fn request_departure(uiw: &UiWorld, sim: &Simulation, destination: Departure) {
+    if matches!(destination, Departure::ReplayDebug) && sim.read::<simulation::Replay>().migrated_city() {
+        notify(uiw, "Replay is unavailable for this migrated city.");
+        return;
+    }
+
     if !playing(uiw) || uiw.read::<SessionState>().departure.is_some() {
         return;
     }
@@ -975,7 +980,7 @@ pub(crate) fn install_world(
     replacement: WorldReplacement,
     generation: u64,
 ) -> Simulation {
-    let (next, slot, replay, is_saved, camera) = match replacement {
+    let (next, mut slot, replay, is_saved, camera) = match replacement {
         WorldReplacement::Snapshot(sim, slot) => (sim, Some(slot), None, true, None),
         WorldReplacement::SnapshotWithCamera(sim, slot, camera) => {
             (sim, Some(slot), None, true, Some(camera))
@@ -986,10 +991,15 @@ pub(crate) fn install_world(
         WorldReplacement::Network(sim) => (sim, None, None, false, None),
     };
 
+    let city_name = slot.as_ref().map(ToString::to_string).unwrap_or_default();
+    let migrated = next.read::<simulation::Replay>().migrated_from_legacy_slot();
+    if migrated {
+        slot = None;
+    }
     {
         let mut session = uiw.write::<SessionState>();
         session.generation = generation;
-        session.city_name = slot.as_ref().map(ToString::to_string).unwrap_or_default();
+        session.city_name = city_name;
         session.set_snapshot_slot(slot);
         session.replay_requested = false;
         session.interaction_blocked = true;
@@ -1018,14 +1028,8 @@ pub(crate) fn install_world(
     for reset in hooks {
         reset(uiw, generation);
     }
-    if next
-        .read::<simulation::Replay>()
-        .obsolete_recording_discarded()
-    {
-        notify(
-            uiw,
-            "City loaded. Its older debug replay recording was discarded.",
-        );
+    if migrated {
+        notify(uiw, "City migrated. Save to a new slot. Replay is unavailable for this city.");
     }
     next
 }

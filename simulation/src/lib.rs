@@ -132,13 +132,64 @@ const INITIAL_TICK: u64 = 1;
 const PRE_SCALE_VERSION: &str = "0.11.0";
 const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
 const PRE_P7_VERSION: &str = "0.11.1";
+const PRE_FIRE_VERSION: &str = "0.12.0";
+const STOCK_PRE_FIRE_REGISTRY: u64 = 0x3043_cb34_6553_1b7d;
+const STOCK_PRE_SCALE_REGISTRY: u64 = 0x72b8_f131_c320_71d4;
 const VERSION: &str = include_str!("../../VERSION");
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SnapshotSchema {
+    Current,
+    P7P8,
+    P6,
+    PreOrigin,
+    PreScale,
+}
+
+impl SnapshotSchema {
+    fn for_version(version: &str) -> Option<Self> {
+        Some(match version {
+            VERSION => Self::Current,
+            PRE_FIRE_VERSION => Self::P7P8,
+            PRE_P7_VERSION => Self::P6,
+            PRE_ORIGIN_VERSION => Self::PreOrigin,
+            PRE_SCALE_VERSION => Self::PreScale,
+            _ => return None,
+        })
+    }
+
+    fn registry(self) -> Result<u64, SaveLoadError> {
+        let installed = prototypes::try_prototypes().ok_or(SaveLoadError::PrototypeRegistry)?;
+        if self == Self::Current {
+            return Ok(installed.fingerprint());
+        }
+        if installed.pre_fire_fingerprint() != STOCK_PRE_FIRE_REGISTRY {
+            return Err(SaveLoadError::PrototypeRegistry);
+        }
+        Ok(if self == Self::PreScale { STOCK_PRE_SCALE_REGISTRY } else { STOCK_PRE_FIRE_REGISTRY })
+    }
+
+    fn check_registry(self, fingerprint: Option<u64>) -> Result<(), SaveLoadError> {
+        if fingerprint == Some(self.registry()?) {
+            Ok(())
+        } else {
+            Err(SaveLoadError::PrototypeRegistry)
+        }
+    }
+
+    fn accepts_legacy_replay(self, version: &str) -> bool {
+        match self {
+            Self::Current => false,
+            Self::P7P8 => version == "0.12.0+commands.2",
+            Self::P6 => matches!(version, "0.11.1" | "0.11.1+commands.2"),
+            Self::PreOrigin => matches!(version, "0.11.1" | "0.11.1-scale-p1"),
+            Self::PreScale => matches!(version, "0.11.0" | "0.11.0+commands.1" | "0.11.0+commands.2"),
+        }
+    }
+}
+
 fn compatible_save_version(version: &str) -> bool {
-    matches!(
-        version,
-        VERSION | PRE_P7_VERSION | PRE_SCALE_VERSION | PRE_ORIGIN_VERSION
-    )
+    SnapshotSchema::for_version(version).is_some()
 }
 
 #[derive(Debug, Copy, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -894,7 +945,10 @@ impl Simulation {
         let topology_generation = self.map().walking_topology_generation;
         let recording_start = self.read::<Replay>().command_count();
         let parent = self.write::<CommandOutcomes>().begin_batch();
-        let record = parent.is_none() && self.read::<Replay>().enabled;
+        let record = parent.is_none() && {
+            let replay = self.read::<Replay>();
+            replay.enabled && !replay.migrated_city()
+        };
         for (index, (command, wire_error)) in commands.iter().zip(wire_errors).enumerate() {
             let start = self.read::<CommandOutcomes>().command_start();
             if let Some(error) = wire_error {
@@ -1211,6 +1265,18 @@ impl Simulation {
 
     /// Saves through the usual snapshot and replay paths and reports snapshot success.
     pub fn save_snapshot_and_replay(&self, save_name: &str) -> bool {
+        if self.read::<Replay>().migrated_city() {
+            let zip = CompressedBincode::filename(save_name);
+            let bc = Bincode::filename(save_name);
+            match open_snapshot(&zip, &bc) {
+                Ok((file, kind, _)) if read_snapshot_header(&file, kind).is_ok_and(|header| header.version == VERSION) => {}
+                Err(SaveLoadError::NotFound) => {}
+                _ => {
+                    log::error!("Save the migrated city to a new slot to preserve the original");
+                    return false;
+                }
+            }
+        }
         if CompressedBincode::save(self, save_name).is_none() {
             return false;
         }
@@ -1420,8 +1486,10 @@ pub struct SnapshotHeader {
 
 impl SnapshotHeader {
     pub fn check_compatibility(&self) -> Result<(), SaveLoadError> {
-        self.check_version()?;
-        check_prototype_registry(self.registry)
+        let schema = SnapshotSchema::for_version(&self.version).ok_or_else(|| SaveLoadError::Incompatible {
+            version: self.version.clone(),
+        })?;
+        schema.check_registry(self.registry)
     }
 
     fn check_load_compatibility(&self) -> Result<(), SaveLoadError> {
@@ -1713,10 +1781,12 @@ impl SlotCapture {
             Ok(CompressedBincode::compress(&bytes))
         })()
         .map_err(|error| slot_encode_error(error, limit))?;
-        let replay = replay.enabled.then_some(replay);
+        let migrated_city = replay.migrated_city();
+        let replay = (replay.enabled && !migrated_city).then_some(replay);
         Ok(EncodedSlot {
             snapshot,
             replay,
+            migrated_city,
             display_name: None,
             camera: None,
             revision,
@@ -1731,6 +1801,7 @@ impl SlotCapture {
 pub struct EncodedSlot {
     snapshot: Vec<u8>,
     replay: Option<Replay>,
+    migrated_city: bool,
     display_name: Option<String>,
     camera: Option<SlotCamera>,
     revision: SnapshotRevision,
@@ -1786,7 +1857,25 @@ impl EncodedSlot {
                 .get_or_insert_with(|| {
                     guard = acquire.take().unwrap()();
                     guard.as_ref()?;
-                    Some(saveload::write_atomic(&paths.zip, &self.snapshot))
+                    let preserve_source = || -> io::Result<()> {
+                        if !self.migrated_city {
+                            return Ok(());
+                        }
+                        match open_snapshot(&paths.zip, &paths.bc) {
+                            Ok((file, kind, _)) => {
+                                let header = read_snapshot_header(file, kind).map_err(io::Error::other)?;
+                                if header.version != VERSION {
+                                    return Err(io::Error::new(io::ErrorKind::AlreadyExists,
+                                        "Save the migrated city to a new slot to preserve the original"));
+                                }
+                            }
+                            Err(SaveLoadError::NotFound) => {}
+                            Err(error) => return Err(io::Error::other(error)),
+                        }
+                        Ok(())
+                    };
+                    Some(preserve_source().map_err(AtomicWriteError::PreCommit)
+                        .and_then(|_| saveload::write_atomic(&paths.zip, &self.snapshot)))
                 })
                 .as_ref()
                 .is_some_and(Result::is_ok)
@@ -1985,14 +2074,19 @@ impl<'de> Deserialize<'de> for Simulation {
     where
         D: Deserializer<'de>,
     {
-        SimulationDeser::deserialize(deserializer)?
-            .into_sim()
-            .map_err(serde::de::Error::custom)
+        let snapshot = SimulationDeser::deserialize(deserializer)?;
+        if snapshot._header.version != VERSION {
+            return Err(serde::de::Error::custom("current simulation schema required"));
+        }
+        snapshot.into_sim().map_err(serde::de::Error::custom)
     }
 }
 
 impl SimulationDeser {
     fn into_sim(self) -> Result<Simulation, SaveLoadError> {
+        let schema = SnapshotSchema::for_version(&self._header.version).ok_or_else(|| SaveLoadError::Incompatible {
+            version: self._header.version.clone(),
+        })?;
         let t = Instant::now();
         let corrupt = |reason| SaveLoadError::Corrupt {
             version: Some(self._header.version.clone()),
@@ -2004,7 +2098,12 @@ impl SimulationDeser {
             .map(|bytes| Bincode::decode(bytes))
             .transpose()
             .map_err(|error| corrupt(error.to_string()))?;
-        check_prototype_registry(registry)?;
+        schema.check_registry(registry)?;
+        for resource in ["service_incidents", "site_remnants"] {
+            if self.res.contains_key(resource) != (schema == SnapshotSchema::Current) {
+                return Err(corrupt(format!("Unexpected presence or absence of resource {resource}")));
+            }
+        }
         let mut sim = Simulation {
             // Resource initializers can rebuild derived indexes from the loaded world.
             world: self.world,
@@ -2019,6 +2118,19 @@ impl SimulationDeser {
 
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
+                if schema != SnapshotSchema::Current {
+                    match l.name {
+                        "service_incidents" | "site_remnants" => continue,
+                        ReplayJson::RESOURCE_NAME => {
+                            let data = self.res.get(l.name)
+                                .ok_or_else(|| corrupt("Missing resource replay".into()))?;
+                            let replay = ReplayJson::decode_legacy_snapshot(data, schema)?;
+                            sim.insert(replay);
+                            continue;
+                        }
+                        _ => {}
+                    }
+                }
                 let Some(data) = self.res.get(l.name) else {
                     if l.optional {
                         continue;
@@ -2034,7 +2146,7 @@ impl SimulationDeser {
         let origin: MapOrigin = match self.res.get("map_origin") {
             Some(bytes) => Bincode::decode(bytes)
                 .map_err(|error| corrupt(format!("Could not decode snapshot map origin: {error}")))?,
-            None if matches!(self._header.version.as_str(), VERSION | PRE_P7_VERSION) => {
+            None if matches!(schema, SnapshotSchema::Current | SnapshotSchema::P7P8 | SnapshotSchema::P6) => {
                 return Err(corrupt("Missing snapshot map origin".into()));
             }
             None => MapOrigin::from_legacy(options, &sim.map()).map_err(&corrupt)?,
@@ -2055,6 +2167,9 @@ impl SimulationDeser {
             .validate_population_scale(scale)
             .map_err(|error| corrupt(error.to_string()))?;
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
+        crate::souls::demolition::restore_remnants(&mut sim).map_err(|reason| corrupt(reason.into()))?;
+        crate::souls::events::restore_incidents(&sim, schema != SnapshotSchema::Current)
+            .map_err(|reason| corrupt(reason.into()))?;
         sim.read::<economy::cargo::FreightTrace>()
             .validate_ownership(&sim.read::<economy::cargo::CargoBook>(), &sim.world)
             .map_err(|message| corrupt(message.into()))?;

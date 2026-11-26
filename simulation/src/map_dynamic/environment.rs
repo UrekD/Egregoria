@@ -76,7 +76,8 @@ impl EnvGrid {
     fn value_at(&self, map: &Map, center: Vec2, coverage_bonus: f32, utilities_bonus: f32) -> u8 {
         let value =
             BASE_LAND_VALUE + coverage_bonus + utilities_bonus + shoreline_value_bonus(map, center)
-                - self.pollution_at(center) / 2.0;
+                - self.pollution_at(center) / 2.0
+                - map.ruin_land_value_penalty(center);
         value.clamp(0.0, 100.0) as u8
     }
 

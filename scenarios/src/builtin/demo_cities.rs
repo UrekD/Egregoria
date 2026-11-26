@@ -366,8 +366,8 @@ fn connect_freight(ctx: &mut ScenarioCtx, grid_point: Vec2) -> Result<BuildingID
     // Preserve the terminal's original platform and rail access when replacing
     // its roadless bootstrap building with a driveway-connected one.
     let (old_id, pos, kind) = station;
+    ctx.remove_fixture_site(old_id)?;
     ctx.sim.apply_commands([
-        &WorldCommand::MapRemoveBuilding(old_id),
         &WorldCommand::MapBuildSpecialBuilding {
             pos,
             kind,

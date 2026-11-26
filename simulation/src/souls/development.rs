@@ -10,7 +10,7 @@ use prototypes::{
 use crate::economy::Market;
 use crate::map::import::growable_shell::{housing_slots, job_slots, realized_floors};
 use crate::map::{
-    Building, BuildingID, ElectricityNetworkID, GrowableBusinessState, GrowableSiteState, Map,
+    Building, BuildingID, BuildingKind, ElectricityNetworkID, GrowableBusinessState, GrowableSiteState, Map,
     PreparedGrowableAppearance,
 };
 use crate::map_dynamic::{
@@ -521,7 +521,7 @@ fn update_with_limits(
         for building in map
             .buildings()
             .values()
-            .filter(|building| building.development().is_some())
+            .filter(|building| building.kind != BuildingKind::SiteRemnant && building.development().is_some())
         {
             let id = building.id;
             let site = building.development().unwrap();
@@ -647,7 +647,7 @@ fn update_with_limits(
         let mut streaks = Vec::new();
         let mut ready = Vec::new();
         for building in map.buildings().values().filter(|building| {
-            building.development().is_some() && !building.is_abandoned_growable()
+            building.kind != BuildingKind::SiteRemnant && building.development().is_some() && !building.is_abandoned_growable()
         }) {
             let id = building.id;
             let level = building.development().unwrap().level;
@@ -1227,12 +1227,13 @@ mod tests {
                 run_hour(&mut test.g, 23);
                 assert!(test.g.map().get(id).is_some());
                 run_hour(&mut test.g, 24);
+                assert!(test.g.map().is_ruined(id));
+                assert!(!test.g.map().lots().values().any(|lot| lot.shape.corners == parcel.corners));
+                let quote = super::super::demolition::demolition_quote(&test.g, id).unwrap().quote;
+                test.apply(&[crate::WorldCommand::MapStartDemolition { site: id, quote }]);
+                test.g.write::<GameTime>().tick.0 += u64::from(quote.minutes) * prototypes::TICKS_PER_MINUTE;
+                super::super::demolition::demolition_update(&mut test.g);
                 assert!(test.g.map().get(id).is_none());
-                assert!(!super::remove_site(
-                    &mut test.g,
-                    id,
-                    super::RemovalCause::Collapse
-                ));
                 assert_eq!(
                     test.g
                         .map()
@@ -1803,7 +1804,7 @@ mod tests {
                         assert!(ids.iter().all(|&id| test.g.map().get(id).is_some()));
                     }
                 }
-                assert!(ids.iter().all(|&id| test.g.map().get(id).is_none()));
+                assert!(ids.iter().all(|&id| test.g.map().is_ruined(id)));
                 assert!(ids
                     .iter()
                     .all(|&id| test.g.read::<BuildingInfos>().get(id).is_none()));

@@ -104,6 +104,9 @@ pub struct Map {
     pub(crate) lanes: Lanes,
     pub(crate) intersections: Intersections,
     pub(crate) buildings: Buildings,
+    pub(crate) fire_cohorts: BTreeSet<(u8, BuildingID)>,
+    pub(super) ruins: BTreeSet<BuildingID>,
+    pub(super) ruin_land_value: BTreeMap<(i32, i32), u32>,
     pub(crate) lots: Lots,
     pub(super) lots_by_road: BTreeMap<RoadID, BTreeSet<LotID>>,
     pub(crate) spatial_map: SpatialMap,
@@ -171,6 +174,9 @@ impl Clone for Map {
             lanes: self.lanes.clone(),
             intersections: self.intersections.clone(),
             buildings: self.buildings.clone(),
+            fire_cohorts: self.fire_cohorts.clone(),
+            ruins: self.ruins.clone(),
+            ruin_land_value: self.ruin_land_value.clone(),
             lots: self.lots.clone(),
             spatial_map,
             external_train_stations: self.external_train_stations.clone(),
@@ -206,6 +212,9 @@ impl Map {
             intersections: Intersections::default(),
             parking: ParkingSpots::default(),
             buildings: Buildings::default(),
+            fire_cohorts: BTreeSet::new(),
+            ruins: BTreeSet::new(),
+            ruin_land_value: BTreeMap::new(),
             lots: Lots::default(),
             environment: Environment::default(),
             spatial_map: SpatialMap::default(),
@@ -776,12 +785,23 @@ impl Map {
         &self,
         id: BuildingID,
     ) -> Result<(), super::LandDenial> {
-        self.authorize_land_effects(super::PreparedEffects::Building(id))?;
         let mut remaining = super::MAX_WATER_BATCH_WORK;
+        self.authorize_building_removal_budgeted(id, &mut remaining)
+    }
+
+    pub(crate) fn authorize_building_removal_budgeted(
+        &self,
+        id: BuildingID,
+        remaining: &mut usize,
+    ) -> Result<(), super::LandDenial> {
+        let building = self.get(id).ok_or(super::LandDenial::ForbiddenOperation)?;
+        super::spend_water_work(remaining, 1 + building.zone.as_ref().map_or(0, |zone| zone.poly.len()))
+            .map_err(|_| super::LandDenial::WorkLimit)?;
+        self.authorize_land_effects(super::PreparedEffects::Building(id))?;
         self.authorize_projected_construction_cuts(
             &BTreeSet::from([id.into()]),
             &[],
-            &mut remaining,
+            remaining,
         )
         .map_err(|error| match error {
             WaterEditError::LandDenied(reason) => reason,
@@ -806,11 +826,32 @@ impl Map {
         })
     }
 
-    pub fn remove_building(&mut self, b: BuildingID) -> Option<Building> {
-        info!("remove_building {:?}", b);
+    pub(crate) fn close_building(&mut self, id: BuildingID) -> Option<Building> {
+        let building = self.buildings.get_mut(id)?;
+        if building.kind == BuildingKind::SiteRemnant {
+            return None;
+        }
+        let original = building.clone();
+        building.kind = BuildingKind::SiteRemnant;
+        self.fire_cohorts.remove(&crate::souls::events::cohort_key(id));
+        self.water_services.building_removed(&self.environment, id);
+        self.electricity.remove_object(id);
+        self.external_train_stations.retain(|target| *target != id);
+        self.subscribers.dispatch(UpdateType::Building, building);
+        Some(original)
+    }
 
+    pub fn remove_building(&mut self, b: BuildingID) -> Option<Building> {
         self.authorize_building_removal(b).ok()?;
-        let b = self.buildings.remove(b)?;
+        self.clear_prepared_building(b)
+    }
+
+    pub(crate) fn clear_prepared_building(&mut self, id: BuildingID) -> Option<Building> {
+        let b = self.buildings.remove(id)?;
+        if self.ruins.remove(&id) {
+            self.update_ruin_land_value(b.obb.center(), false);
+        }
+        self.fire_cohorts.remove(&crate::souls::events::cohort_key(id));
         self.water_services.building_removed(&self.environment, b.id);
         queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &b);
         self.subscribers.dispatch(UpdateType::Building, &b);
@@ -1535,7 +1576,7 @@ impl Map {
     pub fn update_zone(&mut self, id: BuildingID, zone: Zone) -> Option<()> {
         let zone = zone.normalized()?;
         self.authorize_zone_change(id, &zone).ok()?;
-        let b = self.buildings.get_mut(id)?;
+        let b = self.buildings.get_mut(id).filter(|building| building.kind != BuildingKind::SiteRemnant)?;
         if !Building::dry_footprint(&self.environment, &b.obb, Some(&zone)) {
             return None;
         }
@@ -1628,6 +1669,7 @@ impl Map {
             &mut self.electricity,
             &mut self.roads,
         );
+        self.index_fire_candidate(id);
         self.clean_lots_inner(self.spatial_map.query(shape, ProjectFilter::LOT).collect());
         self.clear_construction_trees(shape.expand(10.0));
         queue_construction_cut(
@@ -1919,6 +1961,7 @@ impl Map {
     }
 
     fn consume_building_lot(&mut self, lot_id: LotID, id: BuildingID, growable: bool) {
+        self.index_fire_candidate(id);
         let lot = self
             .remove_lot_record(lot_id)
             .expect("building lot still exists");
@@ -2517,7 +2560,9 @@ impl Map {
             let road_id = b.connected_road.unwrap();
             self.roads[road_id].connected_buildings.push(b.id);
 
-            self.electricity.add_edge(b.id, road_id);
+            if b.kind != BuildingKind::SiteRemnant {
+                self.electricity.add_edge(b.id, road_id);
+            }
         }
 
         Some(RoadSplit {
@@ -2673,7 +2718,9 @@ impl Map {
             }
             new_r.connected_buildings.push(b.id);
 
-            self.electricity.add_edge(b.id, new_r.id);
+            if b.kind != BuildingKind::SiteRemnant {
+                self.electricity.add_edge(b.id, new_r.id);
+            }
         }
 
         let new_id = new_r.id;
@@ -2932,6 +2979,61 @@ impl Map {
     pub fn intersections(&self) -> &Intersections {
         &self.intersections
     }
+    pub fn is_ruined(&self, id: BuildingID) -> bool {
+        self.ruins.contains(&id)
+    }
+
+    pub(crate) fn mark_ruined(&mut self, id: BuildingID) {
+        if self.ruins.insert(id) {
+            let building = &self.buildings[id];
+            let center = building.obb.center();
+            self.subscribers.dispatch(UpdateType::Building, building);
+            self.update_ruin_land_value(center, true);
+        }
+    }
+
+    pub fn ruin_land_value_penalty(&self, at: Vec2) -> f32 {
+        if self.ruin_land_value.is_empty() {
+            return 0.0;
+        }
+        let cell = Self::ruin_cell(at);
+        self.ruin_land_value.get(&cell).copied().unwrap_or(0).min(1600) as f32 / 100.0
+    }
+
+    fn ruin_cell(at: Vec2) -> (i32, i32) {
+        let sample = (at / 16.0).round();
+        (sample.x as i32, sample.y as i32)
+    }
+
+    fn update_ruin_land_value(&mut self, center: Vec2, add: bool) {
+        let (column, row) = Self::ruin_cell(center);
+        for y in row - 6..=row + 6 {
+            for x in column - 6..=column + 6 {
+                let sample = Vec2::new(x as f32 * 16.0, y as f32 * 16.0);
+                let contribution = (800.0 * (1.0 - sample.distance(center) / 96.0)).max(0.0) as u32;
+                if contribution == 0 {
+                    continue;
+                }
+                let cell = (x, y);
+                if add {
+                    *self.ruin_land_value.entry(cell).or_default() += contribution;
+                } else {
+                    let value = self.ruin_land_value.get_mut(&cell).expect("existing ruin contribution");
+                    *value -= contribution;
+                    if *value == 0 {
+                        self.ruin_land_value.remove(&cell);
+                    }
+                }
+            }
+        }
+    }
+
+    fn index_fire_candidate(&mut self, id: BuildingID) {
+        if crate::souls::events::can_burn(self.buildings[id].kind) {
+            self.fire_cohorts.insert(crate::souls::events::cohort_key(id));
+        }
+    }
+
     pub fn buildings(&self) -> &Buildings {
         &self.buildings
     }
@@ -2999,6 +3101,10 @@ impl Map {
             .filter(|(_, x)| x.kind == kind)
             .min_by_key(|(id, lane)| (OrderedFloat(lane.points.project_dist2(p)), *id))
             .map(|(id, _)| id)
+    }
+
+    pub(crate) fn apron_spots(&self, lane: LaneID) -> impl Iterator<Item = ParkingSpotID> + '_ {
+        self.parking.lane_spots.get(lane).into_iter().flatten().copied()
     }
 
     pub fn parking_to_drive(&self, spot: ParkingSpotID) -> Option<LaneID> {

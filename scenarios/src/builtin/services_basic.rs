@@ -9,7 +9,6 @@ use simulation::economy::ZoneDemand;
 use simulation::map::{BuildingID, BuildingKind, Density, ZoneKind};
 use simulation::map_dynamic::{BuildingInfos, ElectricityFlow, UtilityFlow};
 use simulation::souls::{happiness::Happiness, residence::Residences};
-use simulation::world_command::WorldCommand;
 use simulation::{SimulationOptions, SoulID};
 use std::sync::OnceLock;
 
@@ -89,9 +88,11 @@ fn run_to(ctx: &mut ScenarioCtx, coverage_services: bool, resume: bool) -> Resul
         .filter(|building| {
             matches!(building.kind, BuildingKind::RailFreightStation(_)) && building.is_orphaned()
         })
-        .map(|building| WorldCommand::MapRemoveBuilding(building.id))
+        .map(|building| building.id)
         .collect();
-    ctx.sim.apply_commands(&orphaned_terminals);
+    for site in orphaned_terminals {
+        ctx.remove_fixture_site(site)?;
+    }
     let grid = grid_city(ctx, ORIGIN, 7, 7, SPACING);
     if grid.roads.len() != 84 {
         return Err(format!("built {} of 84 grid roads", grid.roads.len()));

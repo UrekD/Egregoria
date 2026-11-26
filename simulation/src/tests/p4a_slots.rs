@@ -181,7 +181,11 @@ fn p4a_integrated_loader_preserves_p6_golden_city() {
     let raw = CompressedBincode::decompress(&zip).unwrap();
     let (header, payload) = crate::snapshot_header(&raw).unwrap();
     header.check_load_compatibility().unwrap();
-    let loaded: Simulation = Bincode::decode(payload).unwrap();
+    assert!(Bincode::decode::<Simulation>(payload).is_err());
+    let loaded = Bincode::decode::<crate::SimulationDeser>(payload)
+        .unwrap()
+        .into_sim()
+        .unwrap();
     let mut expected = city.hashes();
     let mut actual = loaded.hashes();
     expected.remove("replay");
@@ -194,7 +198,7 @@ fn p4a_integrated_loader_preserves_p6_golden_city() {
     ));
     let saved = loaded.encode_slot(SnapshotRevision::new(0x12345679)).unwrap();
     let header = Simulation::compressed_snapshot_header(&saved.snapshot).unwrap();
-    assert_ne!(header.version, "0.11.1", "P7 must write a new save version");
+    assert_eq!(header.version, crate::VERSION);
 }
 
 #[test]
@@ -805,7 +809,7 @@ fn s5b_deliver_load_survives_slot_round_trip() {
             if *saved_destination == destination && *saved_load == load
     )));
 
-    crate::WorldCommand::MapRemoveBuilding(destination).apply(&mut restored);
+    assert!(crate::souls::lifecycle::remove_site(&mut restored, destination));
     assert!(matches!(
         restored.get(driver).unwrap().decision.kind,
         HumanDecisionKind::Yield

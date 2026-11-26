@@ -512,7 +512,7 @@ mod tests {
             })
             .collect();
         for station in starter_stations {
-            test.apply(&[WorldCommand::MapRemoveBuilding(station)]);
+            test.remove_fixture_building(station);
         }
         let (_, store) = company(&mut test, 160.0, "commercial-l1");
         let (_, office) = company(&mut test, 230.0, "office-l1");

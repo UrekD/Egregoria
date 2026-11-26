@@ -298,6 +298,24 @@ pub(super) fn render(
             }
         }
 
+        if activity == StaffActivity::Service(ServiceKind::Fire) {
+            use simulation::souls::service_access::{preview_fire_apron, AccessError};
+            label(match preview_fire_apron(sim, building.id) {
+                Ok(apron) => format!(
+                    "Apron fit · {} curb spaces affected",
+                    apron.parking_displacements.len()
+                ),
+                Err(reason) => match reason {
+                    AccessError::MissingStation | AccessError::MissingFrontage => "No connected frontage",
+                    AccessError::MissingSidewalk => "No same-deck sidewalk access",
+                    AccessError::NoTruckFit => "No clear space for a truck apron",
+                    AccessError::NoReturnLoop => "No legal driving loop to the station",
+                    AccessError::OccupiedCurb => "The approach is occupied",
+                    AccessError::WorkLimit => "The frontage check reached its work limit",
+                }.into(),
+            });
+        }
+
         for row in staff.rows {
             minrow(8.0, || {
                 entity_link_named(uiworld, sim, row.id.into(), row.name);

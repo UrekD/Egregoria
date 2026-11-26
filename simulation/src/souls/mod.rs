@@ -10,6 +10,7 @@ use crate::Simulation;
 #[macro_use]
 pub mod desire;
 
+pub mod demolition;
 pub mod development;
 pub mod events;
 pub mod freight_station;
@@ -20,6 +21,7 @@ pub mod household;
 pub mod human;
 pub mod lifecycle;
 pub mod residence;
+pub mod service_access;
 
 /// Adds souls to empty buildings
 pub(crate) fn add_souls_to_empty_buildings(sim: &mut Simulation) {

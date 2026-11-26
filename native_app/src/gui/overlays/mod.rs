@@ -347,6 +347,12 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             _ => {}
         }
 
+        if mode == OverlayMode::Coverage(ServiceKind::Fire) {
+            for incident in sim.read::<simulation::souls::events::ServiceIncidents>().active() {
+                draw.circle(incident.position.up(0.4), 4.0).color(simulation::colors().gui_danger);
+            }
+        }
+
         if let OverlayMode::Coverage(kind) = mode {
             draw_selected_service_ring(uiworld, &map, kind, &mut draw);
         }
@@ -566,7 +572,7 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
         (Sewage, "Sewage"),
         (WaterBodies, "Water Bodies"),
         (Coverage(ServiceKind::Health), "Health coverage"),
-        (Coverage(ServiceKind::Fire), "Fire coverage"),
+        (Coverage(ServiceKind::Fire), "Fire prevention reach"),
         (Coverage(ServiceKind::Police), "Police coverage"),
         (Coverage(ServiceKind::School), "School coverage"),
         (Coverage(ServiceKind::Garbage), "Garbage coverage"),

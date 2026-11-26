@@ -17,6 +17,8 @@ use simulation::map::{
     Building, BuildingID, BuildingKind, Density, GrowableBusinessState, Zone, MAX_ZONE_AREA,
 };
 use simulation::map_dynamic::{active_business, BuildingInfos, ElectricityFlow, UtilityStatus};
+use simulation::souls::demolition::{demolition_quote, demolition_status, DemolitionPhase, SiteRemnantCause};
+use simulation::souls::events::fire_incident;
 use simulation::souls::freight_station::FreightTrainState;
 use simulation::souls::residence::Residences;
 use simulation::transportation::Location;
@@ -58,6 +60,7 @@ pub(super) fn building_title(building: &Building) -> &'static str {
         BuildingKind::RailFreightStation(id) => &id.prototype().name,
         BuildingKind::TrainStation => "Train Station",
         BuildingKind::ExternalTrading => "External Trading",
+        BuildingKind::SiteRemnant => "Closed site",
     }
 }
 
@@ -106,7 +109,13 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                 if staff_activity.is_none() || !diagnostics.blockers.is_empty() {
                     render_why(sim, &diagnostics.blockers);
                 }
+                if let Some(incident) = fire_incident(sim, id) {
+                    let age = elapsed_tick(sim).0.saturating_sub(incident.alarm_tick.0) / prototypes::TICKS_PER_MINUTE;
+                    textc(error(), format!("Fire intensity {} · {} min since alarm", incident.intensity, age));
+                    label(format!("Structural damage  {}%", u16::from(incident.damage) * 100 / 85));
+                }
                 match building.kind {
+                    BuildingKind::SiteRemnant => render_remnant(uiworld, sim, id),
                     BuildingKind::House => render_house(uiworld, sim, building),
                     BuildingKind::GoodsCompany(id) => {
                         if let Some(site) = sim.growable_summary(building.id) {
@@ -214,6 +223,32 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
     });
 
     is_open
+}
+
+fn render_remnant(uiworld: &UiWorld, sim: &Simulation, site: BuildingID) {
+    let Some(status) = demolition_status(sim, site) else {
+        return;
+    };
+    label(match status.cause {
+        SiteRemnantCause::Fire => "Fire ruins",
+        SiteRemnantCause::Decline => "Decline ruins",
+        SiteRemnantCause::PlayerDemolition => "Closed for demolition",
+    });
+    match status.phase {
+        Some(DemolitionPhase::WaitingForFire) => label("Clearance paid · Waiting for fire to resolve"),
+        Some(DemolitionPhase::Working) => label(format!("Clearance paid · {}% complete", status.progress_percent)),
+        Some(DemolitionPhase::ClearanceBlocked) => {
+            label(format!("Clearance complete · Blocked by {:?}", status.blocker.unwrap()));
+        }
+        None => {
+            if let Ok(preview) = demolition_quote(sim, site) {
+                let quote = preview.quote;
+                if button_secondary(format!("Clear for {} · {} min", quote.price, quote.minutes)).show().clicked {
+                    uiworld.commands().push(WorldCommand::MapStartDemolition { site, quote });
+                }
+            }
+        }
+    }
 }
 
 fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {

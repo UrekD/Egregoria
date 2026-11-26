@@ -461,10 +461,17 @@ fn zones2_acceptance_replay_reconstructs_growth_and_bulldozing() {
         kind: None,
         density: Density::Low,
     };
-    let demolish = WorldCommand::MapRemoveBuilding(building);
+    let quote = crate::souls::demolition::demolition_quote(&sim, building).unwrap().quote;
+    let demolish = WorldCommand::MapStartDemolition { site: building, quote };
     sim.tick(&mut sched, [&erase, &demolish]);
     resumed.tick(&mut resumed_sched, [&erase, &demolish]);
     assert_eq!(resumed.hashes(), sim.hashes(), "first step after resume");
+    assert_eq!(sim.map().get(building).unwrap().kind, crate::map::BuildingKind::SiteRemnant);
+    for _ in 1..(u64::from(quote.minutes) * prototypes::TICKS_PER_MINUTE) {
+        sim.tick(&mut sched, []);
+        resumed.tick(&mut resumed_sched, []);
+    }
+    assert_eq!(resumed.hashes(), sim.hashes(), "after clearance");
     assert!(sim.map().get(building).is_none());
     assert!(sim.read::<ZoneGrid>().cells().is_empty());
     {

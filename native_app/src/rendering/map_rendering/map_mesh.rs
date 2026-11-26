@@ -1801,6 +1801,14 @@ impl MapBuilders {
             if SubscriberChunkID::new(building.canonical_position()) != chunk {
                 continue;
             }
+            if building.kind == BuildingKind::SiteRemnant {
+                if map.is_ruined(building.id) {
+                    self.building_prism(building, Color::from_hex(0x64594d).into(), 0.65);
+                } else if !append_profiled_building(&mut self.houses_mesh, building) {
+                    self.building_box(building, Color::from_hex(0x866748).into(), 1);
+                }
+                continue;
+            }
             if append_profiled_building(&mut self.houses_mesh, building) {
                 continue;
             }
@@ -1888,6 +1896,10 @@ impl MapBuilders {
         let [width, depth] = building.obb.axis().map(Vec2::mag);
         let height = (width.min(depth) * 0.45).clamp(3.0, 18.0)
             * (1.0 + f32::from(level.saturating_sub(1)) * 0.45);
+        self.building_prism(building, tint, height)
+    }
+
+    fn building_prism(&mut self, building: &Building, tint: LinearColor, height: f32) -> f32 {
         let mut corners = building.obb.corners;
         if (corners[1] - corners[0])
             .z0()

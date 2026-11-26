@@ -66,11 +66,11 @@ fn tick_at(test: &mut TestCtx, tick: u64) {
 #[test]
 fn p2abc_periodic_passes_keep_distinct_phases() {
     use crate::economy::ZoneDemand;
-    use crate::souls::{events, growth, happiness, residence};
+    use crate::souls::{growth, happiness, residence};
     use prototypes::TICKS_PER_HOUR;
 
     let mut test = TestCtx::new_fast();
-    let mut counts = [0; 8];
+    let mut counts = [0; 7];
     for tick in TICKS_PER_HOUR..(2 * TICKS_PER_HOUR) {
         test.g.write::<GameTime>().tick.0 = tick;
         crate::map_dynamic::coverage_update(&mut test.g);
@@ -84,7 +84,6 @@ fn p2abc_periodic_passes_keep_distinct_phases() {
             EnvGrid::due(tick),
             residence::due(tick),
             happiness::due(tick),
-            events::due(tick),
             coverage_ran,
         ];
         assert!(
@@ -107,11 +106,8 @@ fn p2abc_periodic_passes_keep_distinct_phases() {
         if happiness::due(tick) {
             assert!(EnvGrid::due(tick - 1));
         }
-        if events::due(tick) {
-            assert!(happiness::due(tick - 1));
-        }
     }
-    assert_eq!(counts, [6, 6, 6, 6, 1, 1, 1, 18]);
+    assert_eq!(counts, [6, 6, 6, 6, 1, 1, 18]);
 }
 
 #[test]

@@ -1730,7 +1730,7 @@ mod tests {
         use crate::map_dynamic::{Destination, RoutingStep};
         use crate::souls::human::HumanDecisionKind;
         use crate::transportation::spawn_driving_vehicle;
-        use crate::world_command::{CommandOutcomes, WorldCommand};
+        use crate::world_command::CommandOutcomes;
         use geom::Transform;
 
         let mut ctx = TestCtx::new();
@@ -1809,7 +1809,7 @@ mod tests {
         assert!(matches!(human.router.cur_step(), Some(RoutingStep::WalkTo(point)) if *point == door));
         assert!(human.it.get_point().is_some());
 
-        ctx.g.apply_commands([&WorldCommand::MapRemoveBuilding(target_house)]);
+        ctx.remove_fixture_building(target_house);
         assert_eq!(ctx.g.read::<CommandOutcomes>().accepted, [0]);
         let human = &ctx.g.world.humans[id];
         assert_eq!(human.location, Location::Outside);

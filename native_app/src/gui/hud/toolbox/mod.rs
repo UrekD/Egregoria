@@ -95,6 +95,8 @@ fn tool_properties(uiw: &UiWorld, sim: &Simulation, yakui_width: f32) -> bool {
                 settings.save();
                 uiw.write::<BulldozerState>().reset_gesture();
             }
+            drop(settings);
+            crate::gui::bulldozer::demolition_controls(uiw);
         }
         Tool::LotBrush => return false,
         Tool::TransitStop | Tool::TransitLine | Tool::Train => {
