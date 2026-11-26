@@ -22,6 +22,7 @@ mod init;
 mod inputmap;
 mod network;
 mod rendering;
+mod service_icon;
 mod session;
 mod sim_thread;
 

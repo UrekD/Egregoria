@@ -3,7 +3,8 @@ use goryak::{
     ProgressBar, VertScrollSize, Window,
 };
 use prototypes::{
-    try_prototype, GameDuration, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID, Tick,
+    try_prototype, GameDuration, GrowableCompanyID, ItemID, Recipe, ResidencePrototypeID, ServiceID,
+    Tick,
 };
 use simulation::diagnostics::{
     building_diagnostics, elapsed_tick, BuildingBlocker, ImportStatus, RecipeBlocker,
@@ -23,13 +24,27 @@ use std::borrow::Cow;
 use yakui::widgets::Pad;
 use yakui::Vec2;
 
-use crate::gui::inspect::{entity_link, inspect_needs, inspect_utility, inspect_warehouse};
+use crate::gui::inspect::{
+    entity_link, inspect_needs, inspect_service, inspect_utility, inspect_warehouse,
+};
 use crate::gui::item_icon_yakui;
+use crate::gui::toolbox::building::BuildingIcons;
 use crate::gui::zoning::zone_name;
+use crate::service_icon::ServiceIcon;
 use crate::uiworld::UiWorld;
 
 fn label(x: impl Into<Cow<'static, str>>) {
     textc(on_secondary_container(), x);
+}
+
+pub(super) fn building_title(building: &Building) -> &'static str {
+    match building.kind {
+        BuildingKind::House => "House",
+        BuildingKind::GoodsCompany(id) => &id.prototype().label,
+        BuildingKind::RailFreightStation(id) => &id.prototype().name,
+        BuildingKind::TrainStation => "Train Station",
+        BuildingKind::ExternalTrading => "External Trading",
+    }
 }
 
 /// Inspect a specific building, showing useful information about it
@@ -43,30 +58,33 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
     };
     let scale = sim.population_scale();
 
-    let title: &str = match building.kind {
-        BuildingKind::House => "House",
-        BuildingKind::GoodsCompany(id) => &id.prototype().label,
-        BuildingKind::RailFreightStation(id) => &id.prototype().name,
-        BuildingKind::TrainStation => "Train Station",
-        BuildingKind::ExternalTrading => "External Trading",
-    };
+    let company = building.kind.as_goods_company();
+    let service = company.and_then(|id| try_prototype(ServiceID::from(id)));
+    let icon = company.and_then(|id| {
+        ServiceIcon::for_company(id.prototype())?;
+        uiworld.read::<BuildingIcons>().get(id.into())
+    });
 
     let mut is_open = true;
     Window {
-        title: title.into(),
+        title: building_title(building).into(),
         pad: Pad::all(10.0),
         radius: 10.0,
         opened: &mut is_open,
         child_spacing: 5.0,
     }
-    .show(|| {
+    .show_with_icon(icon, || {
         VertScrollSize::Fixed(610.0).show(|| {
             mincolumn(5.0, || {
-                if cfg!(debug_assertions) {
+                if let Some(service) = service {
+                    inspect_service::render(uiworld, sim, building, service);
+                } else if cfg!(debug_assertions) {
                     label(format!("{:?}", building.id));
                 }
 
-                render_why(sim, &diagnostics.blockers);
+                if service.is_none() || !diagnostics.blockers.is_empty() {
+                    render_why(sim, &diagnostics.blockers);
+                }
                 match building.kind {
                     BuildingKind::House => render_house(uiworld, sim, building),
                     BuildingKind::GoodsCompany(id) => {
@@ -112,7 +130,7 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                                 scale.persons(proto.n_workers as usize)
                             ));
                         }
-                        render_goodscompany(uiworld, sim, building);
+                        render_goodscompany(uiworld, sim, building, service.is_some());
                     }
                     BuildingKind::RailFreightStation(_) => {
                         render_freightstation(uiworld, sim, building);
@@ -353,7 +371,7 @@ fn render_freightstation(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     }
 }
 
-fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
+fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building, is_service: bool) {
     let Some(business) = active_business(b, &sim.read::<BuildingInfos>(), sim.world()) else {
         return;
     };
@@ -369,18 +387,20 @@ fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
 
     let max_workers = goods.max_workers;
     let scale = sim.population_scale();
-    ProgressBar {
-        value: workers.0.len() as f32 / max_workers.max(1) as f32,
-        size: Vec2::new(200.0, 25.0),
-        color: primary().adjust(0.7),
+    if !is_service {
+        ProgressBar {
+            value: workers.0.len() as f32 / max_workers.max(1) as f32,
+            size: Vec2::new(200.0, 25.0),
+            color: primary().adjust(0.7),
+        }
+        .show_children(|| {
+            label(format!(
+                "Workers  {} / {}",
+                scale.persons(workers.0.len()),
+                scale.persons(max_workers as usize)
+            ));
+        });
     }
-    .show_children(|| {
-        label(format!(
-            "Workers  {} / {}",
-            scale.persons(workers.0.len()),
-            scale.persons(max_workers as usize)
-        ));
-    });
 
     if let Some(driver) = goods.driver {
         minrow(5.0, || {
@@ -449,6 +469,9 @@ fn render_goodscompany(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
         }
     }
 
+    if is_service && proto.recipe.is_none() && proto.storage.is_none() {
+        return;
+    }
     ProgressBar {
         value: goods.progress,
         size: Vec2::new(200.0, 25.0),

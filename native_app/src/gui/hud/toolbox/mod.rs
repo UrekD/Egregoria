@@ -7,7 +7,8 @@ use yakui::{
 use goryak::{
     blur_bg, button_primary, button_secondary, checkbox_value, constrained_viewport, fixed_spacer,
     icon_button, image_button, mincolumn, minrow, monospace, on_primary, on_secondary_container,
-    outline, padxy, primary, primary_container, round_rect, secondary_container, tooltip,
+    outline, padxy, primary, primary_container, primary_link, round_rect, secondary_container,
+    tooltip,
 };
 use simulation::economy::progression::{can_build, BuildCapability, LockedUntil};
 use simulation::Simulation;
@@ -21,6 +22,7 @@ use crate::gui::{
     ToolbarMemory,
 };
 use crate::inputmap::Bindings;
+use crate::service_icon::ServiceIcon;
 use crate::uiworld::UiWorld;
 use building::BuildingTab;
 use transit::TransitTools;
@@ -121,7 +123,7 @@ fn transport_properties(uiw: &UiWorld, sim: &Simulation, tool: Tool) {
         padxy(12.0, 8.0, || {
             minrow(6.0, || {
                 for &mode in ToolCategory::Transport.modes() {
-                    if mode_button(sim, mode, tool == mode.tool()) {
+                    if mode_button(uiw, sim, mode, tool == mode.tool()) {
                         select_mode(uiw, mode);
                     }
                 }
@@ -155,8 +157,8 @@ fn toggle_lines_panel(uiw: &UiWorld) -> bool {
     true
 }
 
-/// A text button for a mode inside a shelf. Locked modes show when they unlock instead.
-pub(crate) fn mode_button(sim: &Simulation, mode: ToolMode, active: bool) -> bool {
+/// A mode button inside a shelf. Locked modes show when they unlock.
+fn mode_button(uiw: &UiWorld, sim: &Simulation, mode: ToolMode, active: bool) -> bool {
     let label = mode.label();
     if let Some(lock) = mode_lock(sim, mode) {
         tooltip(format!("Unlocks at {} citizens", lock.population), || {
@@ -168,6 +170,25 @@ pub(crate) fn mode_button(sim: &Simulation, mode: ToolMode, active: bool) -> boo
             button.show();
         });
         return false;
+    }
+    if mode == ToolMode::BusStop {
+        if let Some(texture) = uiw.read::<UiTextures>().service_icon(ServiceIcon::BusStop) {
+            let color = if active { primary() } else { Color::WHITE };
+            let mut clicked = false;
+            mincolumn(2.0, || {
+                let icon_clicked = image_button(
+                    texture,
+                    Vec2::splat(32.0),
+                    color,
+                    color.with_alpha(0.8),
+                    primary(),
+                    label,
+                )
+                .clicked;
+                clicked = primary_link(label) || icon_clicked;
+            });
+            return clicked;
+        }
     }
     tooltip(label, || {
         if active {
@@ -290,7 +311,12 @@ fn categories_list(uiworld: &UiWorld, sim: &Simulation) {
             let active = current == Some(category);
             let label = category_tooltip(uiworld, category);
             let (texture, glyph) = category_icon(category);
-            let texture = texture.and_then(|name| uiworld.read::<UiTextures>().try_get(name));
+            let textures = uiworld.read::<UiTextures>();
+            let texture = match category {
+                ToolCategory::Utilities => textures.service_icon(ServiceIcon::Power),
+                ToolCategory::Services => textures.service_icon(ServiceIcon::Services),
+                _ => texture.and_then(|name| textures.try_get(name)),
+            };
             let clicked = match texture {
                 Some(texture) => {
                     let (default_col, hover_col) = if active {

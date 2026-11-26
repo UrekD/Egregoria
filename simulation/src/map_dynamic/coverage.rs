@@ -21,7 +21,13 @@ pub struct CoverageGrid {
     revisions: BTreeMap<ServiceKind, u64>,
     // Presentation data is rebuilt by coverage passes after loading.
     #[serde(skip)]
-    served_distances: BTreeMap<ServiceKind, BTreeMap<BuildingID, f32>>,
+    allocations: BTreeMap<ServiceKind, BTreeMap<BuildingID, ServiceAllocation>>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ServiceAllocation {
+    pub people: f32,
+    pub distance_m: f32,
 }
 
 impl CoverageGrid {
@@ -35,7 +41,17 @@ impl CoverageGrid {
 
     /// Farthest network distance at which this provider allocated any service in the last pass.
     pub fn served_distance(&self, building: BuildingID, kind: ServiceKind) -> Option<f32> {
-        self.served_distances.get(&kind)?.get(&building).copied()
+        let allocation = self.service_allocation(building, kind)?;
+        (allocation.people > 0.0).then_some(allocation.distance_m)
+    }
+
+    /// Allocation by this provider in the last pass, in simulated people before population scaling.
+    pub fn service_allocation(
+        &self,
+        building: BuildingID,
+        kind: ServiceKind,
+    ) -> Option<ServiceAllocation> {
+        self.allocations.get(&kind)?.get(&building).copied()
     }
 
     pub fn revision(&self, kind: ServiceKind) -> u64 {
@@ -139,7 +155,7 @@ struct Provider {
     door: Vec3,
     radius: f32,
     capacity: f32,
-    served_distance: Option<f32>,
+    allocation: ServiceAllocation,
 }
 
 struct Receiver {
@@ -245,11 +261,11 @@ pub fn coverage_update(sim: &mut Simulation) {
     grid.started_providers
         .extend(providers.iter().map(|provider| provider.building));
     grid.by_kind.insert(kind, coverage);
-    grid.served_distances.insert(
+    grid.allocations.insert(
         kind,
         providers
             .iter()
-            .filter_map(|provider| Some((provider.building, provider.served_distance?)))
+            .map(|provider| (provider.building, provider.allocation))
             .collect(),
     );
     let revision = grid.revisions.entry(kind).or_default();
@@ -291,7 +307,7 @@ fn active_providers(sim: &Simulation, kind: ServiceKind) -> Vec<Provider> {
                 door: building.door_pos,
                 radius: proto.radius_m,
                 capacity,
-                served_distance: None,
+                allocation: ServiceAllocation::default(),
             })
         })
         .collect()
@@ -372,8 +388,7 @@ fn recompute(
 
     let mut search = RoadSearch::default();
     for (index, provider) in providers.iter_mut().enumerate() {
-        provider.served_distance =
-            search.serve(&map, &mut roads, provider, index + 1, &mut coverage);
+        provider.allocation = search.serve(&map, &mut roads, provider, index + 1, &mut coverage);
     }
     coverage
 }
@@ -405,7 +420,7 @@ fn z3_accounting_coverage_counts_the_union_at_a_mixed_address() {
                 .project_2d(building.door_pos.xy()),
             radius: 1_000.0,
             capacity: 1.0,
-            served_distance: None,
+            allocation: ServiceAllocation::default(),
         }
     };
     let score = |sim: &Simulation, provider: &mut Provider| {
@@ -433,8 +448,10 @@ impl RoadSearch {
         provider: &Provider,
         pass: usize,
         coverage: &mut BTreeMap<BuildingID, f32>,
-    ) -> Option<f32> {
-        let origin = roads.get(provider.road)?;
+    ) -> ServiceAllocation {
+        let Some(origin) = roads.get(provider.road) else {
+            return ServiceAllocation::default();
+        };
         self.queue.clear();
         self.candidates.clear();
 
@@ -462,7 +479,7 @@ impl RoadSearch {
         }
 
         let mut remaining = provider.capacity;
-        let mut farthest_served = None;
+        let mut allocation = ServiceAllocation::default();
         while remaining > 0.0 {
             if let Some(&Reverse(candidate)) = self.candidates.peek() {
                 // Finish all graph nodes at this distance before breaking receiver ties by ID.
@@ -477,7 +494,8 @@ impl RoadSearch {
                     let served = remaining.min(receiver.unserved);
                     if served > 0.0 {
                         // Candidates are handled in ascending network distance.
-                        farthest_served = Some(candidate.distance.0);
+                        allocation.distance_m = candidate.distance.0;
+                        allocation.people += served;
                         remaining -= served;
                         receiver.unserved -= served;
                         let falloff = 1.0 - candidate.distance.0 / provider.radius;
@@ -533,7 +551,7 @@ impl RoadSearch {
                 }
             }
         }
-        farthest_served
+        allocation
     }
 
     fn add_candidate(

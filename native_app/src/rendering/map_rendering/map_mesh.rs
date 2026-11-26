@@ -2,6 +2,7 @@ use crate::gui::zoning::{density_name, zone_cell_color, zone_color, zone_name, Z
 use crate::rendering::immediate::ImmediateDraw;
 use crate::rendering::map_rendering::placeholder_color::placeholder_color;
 use crate::rendering::MapRenderOptions;
+use crate::service_icon::ServiceIcon;
 use common::{ChunkID_32, FastMap, FastSet};
 use engine::earcut::earcut;
 use engine::MeshBuilder;
@@ -1310,6 +1311,7 @@ impl MapMeshHandler {
         let mut buildmeshes = FastMap::default();
         let mut zonemeshes = FastMap::default();
 
+        let mut roof_icons = FastMap::default();
         for descr in GoodsCompanyPrototype::iter() {
             if descr.zone.is_some() || growable_company(descr.id).is_some() {
                 continue;
@@ -1318,10 +1320,15 @@ impl MapMeshHandler {
                 continue;
             };
 
-            buildsprites.insert(
-                BuildingKind::GoodsCompany(descr.id),
-                SpriteBatchBuilder::new(&gfx.texture(path, "goods_company_tex"), gfx),
-            );
+            let sprite = if let Some(icon) =
+                ServiceIcon::for_company(descr).filter(|_| placeholder_color(descr.id).is_some())
+            {
+                let texture = roof_icons.entry(icon).or_insert_with(|| icon.texture(gfx));
+                SpriteBatchBuilder::new(texture, gfx)
+            } else {
+                SpriteBatchBuilder::new(&gfx.texture(path, "goods_company_tex"), gfx)
+            };
+            buildsprites.insert(BuildingKind::GoodsCompany(descr.id), sprite);
         }
 
         for (asset, bkind) in GoodsCompanyPrototype::iter()
@@ -1688,7 +1695,7 @@ impl MapBuilders {
                     self.building_box(building, tint, proto.level);
                     continue;
                 }
-                // Lettered placeholders: a solid box with the sprite on its roof.
+                // Service and warehouse shells carry their icon on the roof.
                 if self.buildsprites.contains_key(&building.kind) {
                     if let Some(color) = placeholder_color(id) {
                         sprite_z = self.building_box(building, color, 1);
@@ -1705,7 +1712,9 @@ impl MapBuilders {
                 let axis = building.obb.axis();
                 let c = building.obb.center();
                 let (dir, scale) = if placeholder {
-                    upright_sprite(axis)
+                    let (dir, (width, height)) = upright_sprite(axis);
+                    let size = width.min(height);
+                    (dir, (size, size))
                 } else {
                     let w = axis[0].mag();
                     (axis[0] / w, (w, axis[1].mag()))

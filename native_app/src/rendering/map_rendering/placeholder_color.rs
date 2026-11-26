@@ -7,8 +7,7 @@ const CIVIC: u64 = 0xFAF6EE;
 const UTILITY: u64 = 0x42464E;
 const WAREHOUSE: u64 = 0x202226;
 
-/// Box colour for services and warehouses, which render as a solid box with their
-/// lettered sprite on the roof. Other companies keep their own asset.
+/// Box colour for the service and warehouse shells, which carry a roof icon.
 pub fn placeholder_color(id: GoodsCompanyID) -> Option<LinearColor> {
     let hex = if let Some(service) = try_prototype(ServiceID::from(id)) {
         service_hex(service.service_kind)
