@@ -1,15 +1,18 @@
-use super::pathfinding::lane_turn_successors;
-use super::{indexed_astar, LaneID, LanePatternBuilder, Map};
+use super::pathfinding::{
+    driving_heuristic, driving_lane_cost, lane_turn_successors, search_driving,
+};
+use super::{indexed_astar, LaneID, Map};
 use common::FastSet;
-use geom::Vec3;
 use slotmapd::SecondaryMap;
 
 const COMPONENT_EDGE_BUDGET: usize = 256;
+const MAX_INDEXED_LANES: usize = 128 * 1024;
+const MAX_INDEXED_TURNS: usize = 512 * 1024;
 
 pub(super) struct DrivingReachability {
     lanes: SecondaryMap<LaneID, LaneReachability>,
     components: Vec<Component>,
-    routes: DrivingRoutes,
+    routes: Option<DrivingRoutes>,
 }
 
 struct LaneReachability {
@@ -18,17 +21,9 @@ struct LaneReachability {
     has_incoming_turn: bool,
 }
 
-#[derive(Default)]
 struct DrivingRoutes {
-    lanes: Vec<DrivingNode>,
+    lanes: Vec<LaneID>,
     successors: Vec<Vec<usize>>,
-}
-
-struct DrivingNode {
-    lane: LaneID,
-    position: Option<Vec3>,
-    travel_time: f32,
-    lateral_bits: u32,
 }
 
 #[derive(Default)]
@@ -47,10 +42,19 @@ impl DrivingReachability {
 
         let mut forward = vec![Vec::new(); lane_ids.len()];
         let mut reverse = vec![Vec::new(); lane_ids.len()];
+        let mut index_routes = lane_ids.len() <= MAX_INDEXED_LANES;
+        let mut edge_count = 0;
         for (src, &lane) in lane_ids.iter().enumerate() {
-            for dst in lane_turn_successors(map, lane).filter_map(|dst| index.get(dst).copied()) {
+            for dst in lane_turn_successors(map, lane) {
+                let Some(&dst) = index.get(dst) else {
+                    // The live search queues missing lanes at infinite cost.
+                    // Omitting one changes the heap layout for finite ties.
+                    index_routes = false;
+                    continue;
+                };
                 forward[src].push(dst);
                 reverse[dst].push(src);
+                edge_count += 1;
             }
         }
 
@@ -78,61 +82,50 @@ impl DrivingReachability {
             component.successors.dedup();
         }
 
-        let route_lanes = lane_ids
-            .into_iter()
-            .map(|id| {
-                let lane = &map.lanes[id];
-                DrivingNode {
-                    lane: id,
-                    position: map.intersections.get(lane.dst).map(|i| i.pos),
-                    travel_time: lane.points.length() / lane.speed_limit,
-                    lateral_bits: lane.dist_from_bottom.to_bits(),
-                }
-            })
-            .collect();
         Self {
             lanes,
             components,
-            routes: DrivingRoutes {
-                lanes: route_lanes,
+            routes: (index_routes && edge_count <= MAX_INDEXED_TURNS).then_some(DrivingRoutes {
+                lanes: lane_ids,
                 successors: forward,
-            },
+            }),
         }
     }
 
     pub(super) fn path(
         &self,
+        map: &Map,
         start: LaneID,
         end: LaneID,
         base_random: u32,
-    ) -> Option<impl ExactSizeIterator<Item = LaneID> + '_> {
+    ) -> Option<Vec<LaneID>> {
+        let Some(routes) = &self.routes else {
+            return search_driving(map, start, end, base_random);
+        };
+        let end_pos = map.intersections.get(map.lanes.get(end)?.dst)?.pos;
         let start = self.lanes.get(start)?.index;
         let end = self.lanes.get(end)?.index;
-        let lanes = &self.routes.lanes;
-        let end_pos = lanes[end].position?;
-        // The dummy root has the origin's successors but cannot satisfy the
-        // goal. A target on the origin lane must be reached through a turn.
+        let lanes = &routes.lanes;
+        // The dummy root can only reach its own lane by cycling through a turn.
         let dummy = lanes.len();
-        const HEURISTIC_SPEED: f32 = LanePatternBuilder::new().speed_limit;
         let path = indexed_astar::astar(
             lanes.len() + 1,
             dummy,
             |node| {
                 let node = if node == dummy { start } else { node };
-                self.routes.successors[node].iter().map(|&next| {
-                    let lane = &lanes[next];
-                    let jitter = common::rand::randu(lane.lateral_bits ^ base_random);
-                    (next, lane.travel_time + jitter)
+                routes.successors[node].iter().map(|&next| {
+                    let lane = &map.lanes[lanes[next]];
+                    (next, driving_lane_cost(lane, base_random))
                 })
             },
             |node| {
-                lanes[node].position.map_or(f32::INFINITY, |position| {
-                    position.distance(end_pos) * 1.2 / HEURISTIC_SPEED
-                })
+                let lane = &map.lanes[lanes[node]];
+                let pos = map.intersections.get(lane.dst).map(|junction| junction.pos);
+                driving_heuristic(pos, end_pos)
             },
             |node| node == end,
         )?;
-        Some(path.into_iter().skip(1).map(|node| lanes[node].lane))
+        Some(path.into_iter().skip(1).map(|node| lanes[node]).collect())
     }
 
     /// The lane's strongly connected component, if a route via one or more
@@ -272,7 +265,7 @@ mod tests {
         let mut index = DrivingReachability {
             lanes,
             components,
-            routes: DrivingRoutes::default(),
+            routes: None,
         };
 
         // A disconnected chain beyond the budget must be left to A*.

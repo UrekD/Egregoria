@@ -3,6 +3,8 @@ use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 
+const MAX_RETAINED_SCRATCH_BYTES: usize = 4 * 1024 * 1024;
+
 thread_local! {
     static SEARCH: RefCell<Search> = RefCell::default();
 }
@@ -86,7 +88,10 @@ where
             estimate: OrderedFloat(0.0),
         });
 
-        while let Some(Pending { node, cost, .. }) = search.pending.pop() {
+        let path = loop {
+            let Some(Pending { node, cost, .. }) = search.pending.pop() else {
+                break None;
+            };
             if arrived(node) {
                 let mut path = vec![node];
                 let mut parent = search.visited[node].parent;
@@ -95,7 +100,7 @@ where
                     parent = search.visited[parent].parent;
                 }
                 path.reverse();
-                return Some(path);
+                break Some(path);
             }
             if cost > search.visited[node].cost {
                 continue;
@@ -117,7 +122,37 @@ where
                     estimate: OrderedFloat(next_cost.0 + heuristic(next)),
                 });
             }
+        };
+        let retained_bytes = search.visited.capacity() * std::mem::size_of::<Visit>()
+            + search.pending.capacity() * std::mem::size_of::<Pending>();
+        if retained_bytes > MAX_RETAINED_SCRATCH_BYTES {
+            *search = Search::default();
         }
-        None
+        path
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn route_perf_releases_oversized_scratch() {
+        let count = 256 * 1024;
+        assert_eq!(
+            astar(
+                count,
+                0,
+                |_| (1..count).map(|i| (i, 1.0)),
+                |_| 0.0,
+                |i| i != 0
+            ),
+            Some(vec![0, 1]),
+        );
+        SEARCH.with_borrow(|search| {
+            let bytes = search.visited.capacity() * std::mem::size_of::<Visit>()
+                + search.pending.capacity() * std::mem::size_of::<Pending>();
+            assert!(bytes <= 4 * 1024 * 1024, "retained {bytes} scratch bytes");
+        });
+    }
 }
