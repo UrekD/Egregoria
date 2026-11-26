@@ -186,6 +186,14 @@ impl ScenarioCtx {
         }
     }
 
+    pub(crate) fn remove_fixture_site(&mut self, site: simulation::map::BuildingID) -> Result<(), String> {
+        use simulation::souls::development::{remove_site, RemovalCause};
+        if !remove_site(&mut self.sim, site, RemovalCause::Bulldoze) {
+            return Err(format!("could not tear down fixture site {site:?}"));
+        }
+        Ok(())
+    }
+
     /// Queue commands in order for the next tick.
     pub fn submit(&mut self, cmds: &[WorldCommand]) {
         self.queued.extend_from_slice(cmds);

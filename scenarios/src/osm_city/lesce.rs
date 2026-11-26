@@ -424,7 +424,7 @@ pub(super) fn place_facilities(
                 .or_default() += 1;
         } else {
             if let Some(id) = placed.filter(|id| !before.contains(id)) {
-                apply_checked(ctx, &[WorldCommand::MapRemoveBuilding(id)])?;
+                ctx.remove_fixture_site(id)?;
             }
             report.skipped.push((
                 site.source.clone(),

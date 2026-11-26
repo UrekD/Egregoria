@@ -39,7 +39,7 @@ fn p1_fix2_player_house_restores_lot_after_reload() {
     let after = Bincode::encode(&*test.g.read::<residence::Residences>()).unwrap();
     assert_ne!(after, before, "the hourly checks should record residence state");
     assert!(!test.g.read::<residence::Residences>().is_abandoned(house));
-    test.apply(&[WorldCommand::MapRemoveBuilding(house)]);
+    test.remove_fixture_building(house);
     let map = test.g.map();
     assert!(map.get(house).is_none());
     assert!(

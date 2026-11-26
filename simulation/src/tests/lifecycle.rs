@@ -257,7 +257,7 @@ fn removing_a_house_drains_the_resident_and_driving_car() {
     }
     test.g.write::<RandomVehicles>().vehicles.insert(car);
 
-    test.apply(&[WorldCommand::MapRemoveBuilding(house)]);
+    test.remove_fixture_building(house);
 
     assert!(test.g.get(human).is_none(), "resident survives the command");
     assert!(
@@ -349,7 +349,7 @@ fn removing_a_company_frees_trucks_and_workers_and_discards_pending_trades() {
         HumanDecisionKind::GoTo(Destination::Building(building)),
     ]);
 
-    test.apply(&[WorldCommand::MapRemoveBuilding(building)]);
+    test.remove_fixture_building(building);
 
     assert!(
         test.g.get(company).is_none(),
@@ -1099,7 +1099,7 @@ fn removing_freight_buildings_releases_assigned_trains() {
             .trains
             .push((train, state));
         world.trains.get_mut(train).unwrap().it = Itinerary::wait_until(f64::MAX);
-        test.apply(&[WorldCommand::MapRemoveBuilding(building)]);
+        test.remove_fixture_building(building);
 
         assert!(test.g.read::<BuildingInfos>().get(building).is_none());
         assert!(test.g.get(train).unwrap().it.has_ended(0.0));
@@ -2044,7 +2044,7 @@ fn l1_activity_rehome_and_freight_abort_refresh_before_the_next_phase() {
     assert!(indexed.get(driver).unwrap().collider.is_none());
 
     for sim in [&mut indexed, &mut full_scan] {
-        sim.apply_commands([&WorldCommand::MapRemoveBuilding(old_home)]);
+        assert!(crate::souls::lifecycle::remove_site(sim, old_home));
         assert_eq!(sim.get(driver).unwrap().home.house, new_home);
     }
     l1_assert_phase_hashes(&mut indexed, &mut full_scan);

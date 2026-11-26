@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use prototypes::{DayTime, GameTime, ItemID, Money, Tick};
 use simulation::diagnostics::elapsed_tick;
@@ -31,6 +31,7 @@ pub(crate) enum NotificationKind {
     NoSewage,
     Fire,
     FireCollapse,
+    ClearanceBlocked,
     SuspendedLine,
     HighUnemployment,
     StalledDemand,
@@ -50,6 +51,7 @@ impl NotificationKind {
             Self::NoSewage => "Sewage shortage",
             Self::Fire => "Fire",
             Self::FireCollapse => "Fire damage",
+            Self::ClearanceBlocked => "Clearance blocked",
             Self::SuspendedLine => "Suspended line",
             Self::HighUnemployment => "High unemployment",
             Self::StalledDemand => "Stalled demand",
@@ -190,6 +192,7 @@ pub(super) struct NotificationSampler {
     pending: VecDeque<Notification>,
     last_batch_seq: Option<u64>,
     fire_cursor: Option<u64>,
+    blocked_clearance: Option<BTreeSet<BuildingID>>,
     last_milestone: Option<u8>,
     last_sampled_tick: Option<Tick>,
     active: BTreeMap<AlertKey, ActiveAlert>,
@@ -228,6 +231,7 @@ impl NotificationSampler {
         {
             self.last_sampled_tick = Some(tick);
             self.sample(sim, now);
+            self.observe_clearance(sim, now);
             // The sampling interval gives recovered conditions a cooldown before
             // they can recur. Resolved or deleted sources keep no state.
             self.active.retain(|_, active| active.last_seen == tick);
@@ -260,6 +264,7 @@ impl NotificationSampler {
         self.pending.is_empty()
             && self.last_batch_seq.is_none()
             && self.fire_cursor.is_none()
+            && self.blocked_clearance.is_none()
             && self.last_milestone.is_none()
             && self.last_sampled_tick.is_none()
             && self.active.is_empty()
@@ -372,27 +377,6 @@ impl NotificationSampler {
                     text.into(),
                 );
             }
-        } else if let Some((&building, _)) = fires.by_building.first_key_value() {
-            let count = fires.by_building.len();
-            let (target, text) = if count == 1 {
-                (
-                    AlertTarget::Building(building),
-                    "A building was on fire".into(),
-                )
-            } else {
-                (
-                    AlertTarget::CityWide,
-                    format!("{count} buildings were on fire"),
-                )
-            };
-            self.emit(
-                NotificationKind::Fire,
-                now.elapsed,
-                now.calendar.daytime,
-                None,
-                target,
-                text,
-            );
         }
     }
 
@@ -429,6 +413,25 @@ impl NotificationSampler {
             target,
             history_text(),
         );
+    }
+
+    fn observe_clearance(&mut self, sim: &Simulation, now: SampleTime) {
+        use simulation::souls::demolition::SiteRemnants;
+        let blocked = sim.read::<SiteRemnants>().blocked_jobs().collect();
+        let Some(previous) = self.blocked_clearance.replace(blocked) else {
+            return;
+        };
+        let mut changed = self.blocked_clearance.as_ref().unwrap().difference(&previous);
+        let Some(&first) = changed.next() else {
+            return;
+        };
+        let others = changed.count();
+        let (target, text) = if others == 0 {
+            (AlertTarget::Building(first), "Paid work is complete. The site is blocked.".into())
+        } else {
+            (AlertTarget::CityWide, format!("{} paid clearance jobs are blocked", others + 1))
+        };
+        self.emit(NotificationKind::ClearanceBlocked, now.elapsed, now.calendar.daytime, None, target, text);
     }
 
     fn sample(&mut self, sim: &Simulation, now: SampleTime) {
@@ -658,7 +661,7 @@ fn command_label(command: &str) -> &'static str {
         "Init" => "Create city",
         "MapRemoveIntersection" => "Demolish intersection",
         "MapRemoveRoad" => "Demolish road",
-        "MapRemoveBuilding" => "Demolish building",
+        "MapStartDemolition" => "Start demolition",
         "MapBuildHouse" => "Build house",
         "Terraform" => "Edit terrain",
         "EditWater" => "Edit water",
@@ -714,6 +717,9 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         }
         (_, RoadTopologyUnavailable) => "This road topology change is unavailable in this session",
         (_, BusyConflict) => "Traffic or a service route still needs this movement",
+        (_, LegacyBuildingRemoval) => "Get a demolition quote for this site",
+        (_, StaleDemolitionQuote) => "The demolition quote changed. Review the site again.",
+        (_, DemolitionWorkLimit) => "The clearance queue or the batch reached its work limit",
         (_, InvalidJunctionRules(JunctionRuleError::Signalized)) => {
             "Approach priorities require an unsignalized junction"
         }
@@ -823,7 +829,7 @@ mod tests {
         let (mut test, _) = city();
         let mut sampler = NotificationSampler::default();
         let mut center = NotificationCenter::default();
-        let rejected = [WorldCommand::MapRemoveBuilding(BuildingID::default())];
+        let rejected = [WorldCommand::MapBuildHouse(Default::default())];
         sampler.observe(&test.sim);
         for _ in 0..2 {
             test.sim.apply_commands(&rejected);
@@ -849,7 +855,7 @@ mod tests {
             ..SimulationOptions::LEGACY
         });
         test.sim
-            .apply_commands(&[WorldCommand::MapRemoveBuilding(BuildingID::default())]);
+            .apply_commands(&[WorldCommand::MapBuildHouse(Default::default())]);
         let mut sampler = NotificationSampler::default();
         sampler.observe(&test.sim);
         sampler.observe(&test.sim);
@@ -858,7 +864,7 @@ mod tests {
         assert_eq!(notices[0].kind, NotificationKind::CommandRejected);
         assert_eq!(
             notices[0].text,
-            "Demolish building: Object no longer exists"
+            "Build house: Object no longer exists"
         );
     }
 
@@ -951,8 +957,8 @@ mod tests {
         };
         let mut sampler = NotificationSampler::default();
         let first = sample(&mut test, &mut sampler, SAMPLE_INTERVAL + 1);
-        test.sim
-            .apply_commands(&[WorldCommand::MapRemoveBuilding(first_house)]);
+        let quote = simulation::souls::demolition::demolition_quote(&test.sim, first_house).unwrap().quote;
+        test.sim.apply_commands([&WorldCommand::MapStartDemolition { site: first_house, quote }]);
         assert_ne!(
             test.sim.map().electricity.net_id(other_house),
             Some(network)
@@ -991,22 +997,14 @@ mod tests {
     }
 
     #[test]
-    fn p4g_initial_fires_are_coalesced() {
+    fn p9_fire_alarms_from_a_loaded_city_do_not_replay() {
         let (mut test, house) = city();
-        let other_house = fill_houses(&mut test, 1)[0];
-        test.sim
-            .write::<Fires>()
-            .by_building
-            .extend([(house, Tick(1)), (other_house, Tick(1))]);
+        assert!(simulation::souls::events::offer_fixture_fire(&test.sim, house));
+        simulation::souls::events::events_update(&mut test.sim);
         let mut sampler = NotificationSampler::default();
         sampler.observe(&test.sim);
         sampler.observe(&test.sim);
-        let fires = sampler
-            .drain()
-            .filter(|notice| notice.kind == NotificationKind::Fire)
-            .collect::<Vec<_>>();
-        assert_eq!(fires.len(), 1);
-        assert_eq!(fires[0].target, AlertTarget::CityWide);
+        assert_eq!(sampler.drain().filter(|notice| notice.kind == NotificationKind::Fire).count(), 0);
     }
 
     #[test]

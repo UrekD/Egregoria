@@ -3,7 +3,7 @@ use goryak::{minrow, padxy, pass_pointer, round_rect, secondary_container};
 use ordered_float::OrderedFloat;
 use simulation::map::{BuildingID, ProjectFilter};
 use simulation::map_dynamic::{ElectricityFlow, SiteUtilityReader, UtilityStatus};
-use simulation::souls::events::Fires;
+use simulation::souls::events::ServiceIncidents;
 use simulation::Simulation;
 use yakui::event::{EventInterest, EventResponse, WidgetEvent};
 use yakui::input::MouseButton;
@@ -103,7 +103,7 @@ struct PlacedBadge {
 pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
     let map = sim.map();
     let mut utilities = SiteUtilityReader::for_display(sim);
-    let fires = sim.read::<Fires>();
+    let fires = sim.read::<ServiceIncidents>();
     let power = sim.read::<ElectricityFlow>();
     let camera = uiworld.camera().camera;
     let Some(bounds) = view::bounds(&camera, &map) else {
@@ -126,7 +126,7 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
             continue;
         }
 
-        if fires.by_building.contains_key(&id) {
+        if fires.incident(id).is_some() {
             visible.push(Badge {
                 point,
                 depth,

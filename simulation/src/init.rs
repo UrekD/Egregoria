@@ -32,7 +32,8 @@ use crate::map_dynamic::{
     UtilityFlow,
 };
 use crate::multiplayer::MultiplayerState;
-use crate::souls::events::{events_update, Fires};
+use crate::souls::demolition::{demolition_update, SiteRemnants};
+use crate::souls::events::{events_update, Fires, ServiceIncidents};
 use crate::souls::freight_station::{freight_station_system, RailTrips};
 use crate::souls::goods_company::company_system;
 use crate::souls::happiness::{happiness_update, Happiness};
@@ -236,7 +237,9 @@ fn register_systems_and_resources() {
         "residence_update",
         crate::souls::residence::residence_update,
     );
+    register_system_sim("events_update", events_update);
     register_system_sim("growth_update", crate::souls::growth::growth_update);
+    register_system_sim("demolition_update", demolition_update);
     register_system(
         "refresh_electricity_flow_system",
         crate::map_dynamic::refresh_electricity_flow_system,
@@ -245,7 +248,6 @@ fn register_systems_and_resources() {
     register_system_sim("coverage_update", coverage_update);
     register_system_sim("env_update", env_update);
     register_system_sim("happiness_update", happiness_update);
-    register_system_sim("events_update", events_update);
     register_system("train_reservations_update", train_reservations_update);
     register_system("freight_station", freight_station_system);
     register_system("random_vehicles", random_vehicles_update);
@@ -282,6 +284,8 @@ fn register_systems_and_resources() {
     register_resource_default::<EnvGrid, Bincode>("env_grid");
     register_resource_default::<Happiness, Bincode>("happiness");
     register_resource_default::<Fires, Bincode>("fires");
+    register_resource_default::<ServiceIncidents, Bincode>("service_incidents");
+    register_resource_default::<SiteRemnants, Bincode>("site_remnants");
     register_resource_default::<Market, Bincode>("market");
     register_resource_default::<EcoStats, Bincode>("ecostats");
     register_resource_default::<CityStats, Bincode>("citystats");

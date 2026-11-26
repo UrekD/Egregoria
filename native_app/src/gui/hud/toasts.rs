@@ -200,7 +200,7 @@ fn toast(notice: &Notification) -> bool {
 mod tests {
     use super::*;
     use geom::vec2;
-    use prototypes::{Tick, TICKS_PER_HOUR};
+    use prototypes::Tick;
     use scenarios::{
         builders::{fill_houses, grid_city},
         ScenarioCtx,
@@ -212,7 +212,7 @@ mod tests {
     use simulation::SimulationOptions;
 
     #[test]
-    fn p2_ui_wire_demolition_after_fire_is_not_a_collapse() {
+    fn p9_player_demolition_without_fire_emits_no_collapse() {
         let mut test = ScenarioCtx::new(SimulationOptions {
             terrain_size: 1,
             save_replay: false,
@@ -221,18 +221,13 @@ mod tests {
         grid_city(&mut test, vec2(150.0, 150.0), 2, 2, 160.0);
         let house = fill_houses(&mut test, 1)[0];
         let mut events = NotificationSampler::default();
-        test.sim.write::<Fires>().by_building.insert(house, Tick(0));
         events.observe(&test.sim);
-        test.sim.write::<Fires>().by_building.remove(&house);
-        test.sim.write::<prototypes::GameTime>().tick = Tick(3 * TICKS_PER_HOUR + 1);
-        events.observe(&test.sim);
-        test.submit(&[WorldCommand::MapRemoveBuilding(house)]);
+        let quote = simulation::souls::demolition::demolition_quote(&test.sim, house).unwrap().quote;
+        test.submit(&[WorldCommand::MapStartDemolition { site: house, quote }]);
         test.run_ticks(1);
-        assert!(test.sim.map().get(house).is_none());
+        assert_eq!(test.sim.map().get(house).unwrap().kind, simulation::map::BuildingKind::SiteRemnant);
         events.observe(&test.sim);
-        assert!(!events
-            .drain()
-            .any(|item| item.kind == NotificationKind::FireCollapse));
+        assert!(!events.drain().any(|item| item.kind == NotificationKind::FireCollapse));
     }
 
     #[test]

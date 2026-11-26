@@ -519,9 +519,12 @@ fn remove_pure_site(sim: &mut Simulation, kind: ZoneKind, surplus: f64) -> Resul
             kind: None,
             density: Low,
         },
-        &WorldCommand::MapRemoveBuilding(id),
     ]);
-    if sim.read::<CommandOutcomes>().accepted.as_slice() != [0, 1] {
+    if sim.read::<CommandOutcomes>().accepted.as_slice() != [0]
+        || !simulation::souls::development::remove_site(
+            sim, id, simulation::souls::development::RemovalCause::Bulldoze,
+        )
+    {
         return Err(format!("could not retire pure control site {id:?}"));
     }
     Ok(true)
@@ -961,7 +964,9 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
             .map(|(home, _)| home)
             .ok_or("staffed teardown needs a separate home for Mixed Use workers")?
     };
-    run_teardown_batch(ctx, &[WorldCommand::MapRemoveBuilding(home)], 1)
+    ctx.remove_fixture_site(home)?;
+    ctx.run_ticks(1);
+    Ok(())
 }
 
 fn prepare_regrowth_demand(ctx: &mut ScenarioCtx) -> Result<(), String> {
@@ -1827,8 +1832,8 @@ fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {
             "ZONES2 abandoned storefront",
         )?;
         collapsed.run_ticks(13 * TICKS_PER_HOUR);
-        if collapsed.sim.map().get(storefront).is_some() {
-            return Err("abandoned storefront did not collapse".into());
+        if !collapsed.sim.map().is_ruined(storefront) {
+            return Err("abandoned storefront did not become a ruin".into());
         }
         publish(
             &collapsed.sim,
@@ -1837,8 +1842,10 @@ fn run_controlled(ctx: &mut ScenarioCtx) -> Result<(), String> {
             "ZONES2 timed collapse",
         )?;
     }
-    ctx.sim
-        .apply_commands([&WorldCommand::MapRemoveBuilding(storefront)]);
+    let quote = simulation::souls::demolition::demolition_quote(&ctx.sim, storefront)
+        .map_err(|e| format!("storefront demolition quote failed: {e:?}"))?.quote;
+    ctx.sim.apply_commands([&WorldCommand::MapStartDemolition { site: storefront, quote }]);
+    ctx.run_ticks(u64::from(quote.minutes) * prototypes::TICKS_PER_MINUTE);
     let map = ctx.sim.map();
     if map.get(storefront).is_some() {
         return Err("ordinary bulldoze did not remove the shuttered storefront".into());

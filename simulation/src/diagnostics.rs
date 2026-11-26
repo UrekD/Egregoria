@@ -11,7 +11,7 @@ use crate::map_dynamic::{
     RouterError, SiteLoad, UtilityFlow, UtilityStatus,
 };
 use crate::souls::development::{self, UpgradeStatus};
-use crate::souls::events::Fires;
+use crate::souls::events::fire_incident;
 use crate::souls::goods_company::recipe_blockers;
 use crate::souls::happiness::Happiness;
 use crate::souls::human::HumanDecisionKind;
@@ -81,7 +81,7 @@ pub fn building_diagnostics(sim: &Simulation, id: BuildingID) -> Option<Building
     if building.is_orphaned() {
         blockers.push(BuildingBlocker::RoadDisconnected);
     }
-    if sim.read::<Fires>().by_building.contains_key(&id) {
+    if fire_incident(sim, id).is_some() {
         blockers.push(BuildingBlocker::OnFire);
     }
     if building.is_abandoned_growable() || residences.is_abandoned(id) {

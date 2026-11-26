@@ -123,10 +123,24 @@ pub(crate) fn remove_site(sim: &mut Simulation, id: BuildingID) -> bool {
     remove_site_inner(sim, id, false)
 }
 
+/// Close ordinary uses while retaining the site's physical map record.
+pub(crate) fn close_site(sim: &mut Simulation, id: BuildingID) -> bool {
+    let was_external_target = sim.map().external_train_stations.first() == Some(&id);
+    let original = sim.map_mut().close_building(id);
+    let Some(original) = original else {
+        return false;
+    };
+    residence::on_building_removed(sim, id);
+    remove_building(sim, original, was_external_target, true);
+    true
+}
+
 /// Remove timed collapses in stable ID order and defer their shared address scrub.
 pub(crate) fn remove_collapsed_sites(sim: &mut Simulation, ids: Vec<BuildingID>) {
     for id in ids {
-        remove_site_inner(sim, id, true);
+        if super::events::fire_incident(sim, id).is_none() {
+            super::demolition::ruin_site(sim, id, super::demolition::SiteRemnantCause::Decline).ok();
+        }
     }
 }
 
@@ -136,6 +150,8 @@ fn remove_site_inner(sim: &mut Simulation, id: BuildingID, defer_references: boo
     let Some(building) = removed else {
         return false;
     };
+    super::events::remove_incident(sim, id);
+    super::demolition::forget_site(sim, id);
     residence::on_building_removed(sim, id);
     remove_building(sim, building, was_external_target, defer_references);
     true

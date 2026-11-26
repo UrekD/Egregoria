@@ -150,7 +150,7 @@ pub enum ProtectedRoot {
     Building(GatewayRole, BuildingID),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LandDenial {
     OutsideMap,
     Unowned(LandTileId),

@@ -2,6 +2,7 @@ mod budget_day;
 pub mod demo_cities;
 pub mod determinism;
 mod economy_loop;
+mod fire;
 pub mod growth_basic;
 pub mod perf;
 pub mod services_basic;
@@ -37,6 +38,8 @@ pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
         budget_day::SCENARIO.1,
     ),
     economy_loop::SCENARIO,
+    fire::RUINS,
+    fire::RESUME,
     growth_basic::SCENARIO,
     services_basic::SCENARIO,
     services_neglect::SCENARIO,

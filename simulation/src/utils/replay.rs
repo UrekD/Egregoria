@@ -152,6 +152,10 @@ pub struct Replay {
     timeline: Option<ReplayTimeline>,
     #[serde(skip)]
     obsolete_recording_discarded: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    migrated_city: bool,
+    #[serde(skip)]
+    migrated_from_legacy_slot: bool,
 }
 
 fn deserialize_replay_commands<'de, D: serde::Deserializer<'de>>(
@@ -196,6 +200,8 @@ impl Default for Replay {
             last_tick_recorded: Tick::default(),
             timeline: None,
             obsolete_recording_discarded: false,
+            migrated_city: false,
+            migrated_from_legacy_slot: false,
         }
     }
 }
@@ -206,11 +212,12 @@ impl Replay {
         self.obsolete_recording_discarded
     }
 
-    fn validate_embedded_registry(&self) -> io::Result<()> {
-        if self.enabled || self.registry.is_some() {
-            self.check_registry()?;
-        }
-        Ok(())
+    pub fn migrated_city(&self) -> bool {
+        self.migrated_city
+    }
+
+    pub fn migrated_from_legacy_slot(&self) -> bool {
+        self.migrated_from_legacy_slot
     }
 
     pub(crate) fn check_registry(&self) -> io::Result<()> {
@@ -490,41 +497,33 @@ impl ReplayJson {
     pub(crate) const RESOURCE_NAME: &'static str = "replay";
 
     pub(crate) fn decode_snapshot(bytes: &[u8]) -> io::Result<Replay> {
-        match ReplayHeader::decode(bytes) {
-            Ok(header) => {
-                if header.enabled || header.registry.is_some() {
-                    crate::check_prototype_registry(header.registry).map_err(replay_decode_error)?;
-                }
-                JSON::decode(bytes)
-            }
-            Err(SaveLoadError::IncompatibleReplay { version }) if crate::compatible_save_version(&version) => {
-                // The city has its own schema and registry checks. Inspect the
-                // recording envelope without decoding obsolete commands.
-                let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
-                let discarded = legacy.enabled || legacy.commands || legacy.timeline.is_some();
-                if discarded || legacy.registry.is_some() {
-                    crate::check_prototype_registry(legacy.registry).map_err(replay_decode_error)?;
-                }
-                Ok(Replay {
-                    obsolete_recording_discarded: discarded,
-                    ..Replay::default()
-                })
-            }
-            Err(SaveLoadError::IncompatibleReplay { version })
-                if matches!(
-                    version.as_str(),
-                    "0.11.0+commands.1" | "0.11.0+commands.2" | "0.11.1+commands.2"
-                ) =>
-            {
-                // Earlier P7 command envelopes can still be read inside a compatible city.
-                let mut replay: Replay = JSON::decode(bytes)?;
-                replay.validate_embedded_registry()?;
-                replay.recorded_population_scale()?;
-                replay.version = replay_version();
-                Ok(replay)
-            }
-            Err(error) => Err(replay_decode_error(error)),
+        let header = ReplayHeader::decode(bytes).map_err(replay_decode_error)?;
+        if header.enabled || header.registry.is_some() {
+            crate::check_prototype_registry(header.registry).map_err(replay_decode_error)?;
         }
+        let replay: Replay = JSON::decode(bytes)?;
+        if replay.migrated_city && (replay.enabled || replay.command_count() != 0 || replay.timeline.is_some()) {
+            return Err(invalid_replay("migrated city contains an active recording"));
+        }
+        Ok(replay)
+    }
+
+    pub(crate) fn decode_legacy_snapshot(bytes: &[u8], schema: crate::SnapshotSchema) -> Result<Replay, SaveLoadError> {
+        let header: ReplayHeader = JSON::decode(bytes).map_err(replay_corrupt)?;
+        if !schema.accepts_legacy_replay(&header.version) {
+            return Err(SaveLoadError::IncompatibleReplay { version: header.version });
+        }
+        let legacy: LegacySnapshotReplay = JSON::decode(bytes).map_err(replay_corrupt)?;
+        let discarded = legacy.enabled || legacy.commands || legacy.timeline.is_some();
+        if discarded || header.registry.is_some() {
+            schema.check_registry(header.registry)?;
+        }
+        Ok(Replay {
+            obsolete_recording_discarded: discarded,
+            migrated_city: true,
+            migrated_from_legacy_slot: true,
+            ..Replay::default()
+        })
     }
 
     #[cfg(test)]
@@ -577,8 +576,6 @@ impl ReplayJson {
 
 #[derive(Deserialize)]
 struct LegacySnapshotReplay {
-    #[serde(default)]
-    registry: Option<u64>,
     enabled: bool,
     #[serde(deserialize_with = "contains_legacy_commands")]
     commands: bool,
@@ -976,7 +973,7 @@ fn scale_t1_fix_rejects_import_in_replay_constructor() {
 #[test]
 fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
     crate::tests::init_test_simulation();
-    let registry = prototypes::prototypes().fingerprint();
+    let registry = crate::STOCK_PRE_FIRE_REGISTRY;
     let mut replay = Replay {
         version: crate::PRE_P7_VERSION.to_owned(),
         enabled: true,
@@ -985,7 +982,7 @@ fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
     };
     let assert_discarded = |replay: &Replay| {
         let bytes = JSON::encode(replay).unwrap();
-        let restored = ReplayJson::decode_snapshot(&bytes).unwrap();
+        let restored = ReplayJson::decode_legacy_snapshot(&bytes, crate::SnapshotSchema::P6).unwrap();
         assert!(restored.obsolete_recording_discarded());
         assert!(!restored.enabled);
         assert_eq!(restored.command_count(), 0);
@@ -996,11 +993,12 @@ fn p7_snapshot_discards_active_or_nonempty_p6_replay() {
     replay.push(Tick(INITIAL_TICK), WorldCommand::MapLoadParis);
     assert_discarded(&replay);
 
+    let registry = crate::STOCK_PRE_SCALE_REGISTRY;
     let obsolete = format!(
         r#"{{"version":"0.11.0","enabled":true,"registry":{registry},"commands":[[1,{{"Obsolete":[]}}]]}}"#
     );
     let obsolete = obsolete.as_bytes();
-    assert!(ReplayJson::decode_snapshot(obsolete)
+    assert!(ReplayJson::decode_legacy_snapshot(obsolete, crate::SnapshotSchema::PreScale)
         .unwrap()
         .obsolete_recording_discarded());
     assert!(matches!(
@@ -1058,12 +1056,7 @@ fn p7_replay_rejects_floor_identity_before_decoding_commands() {
         ReplayJson::decode_sidecar(&preview_bytes, Some(revision)),
         Err(SaveLoadError::IncompatibleReplay { version }) if version == preview
     ));
-    let embedded = ReplayJson::decode_snapshot(&preview_bytes).unwrap();
-    assert_eq!(embedded.version, current);
-    assert!(matches!(
-        embedded.commands.get(0).map(|entry| &entry.1),
-        Some(WorldCommand::MapUpgradeRoad { .. })
-    ));
+    assert!(ReplayJson::decode_snapshot(&preview_bytes).is_err());
     let bytes = ReplayJson::encode_sidecar(&make(&current), revision).unwrap();
     let sidecar = ReplayJson::decode_sidecar(&bytes, Some(revision)).unwrap();
     assert!(matches!(

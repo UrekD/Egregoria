@@ -288,11 +288,9 @@ fn p4g_advisor_resolves_removed_targets_safely() {
     assert!(
         matches!(resolve(&test.sim, target), TargetLink::Building(id, pos) if id == house && pos == door)
     );
-    test.sim.apply_commands(
-        &[simulation::world_command::WorldCommand::MapRemoveBuilding(
-            house,
-        )],
-    );
+    let quote = simulation::souls::demolition::demolition_quote(&test.sim, house).unwrap().quote;
+    test.sim.apply_commands([&simulation::world_command::WorldCommand::MapStartDemolition { site: house, quote }]);
+    test.run_ticks(u64::from(quote.minutes) * prototypes::TICKS_PER_MINUTE);
     assert!(matches!(resolve(&test.sim, target), TargetLink::Removed));
     assert!(matches!(
         resolve(&test.sim, AlertTarget::Line(Default::default())),

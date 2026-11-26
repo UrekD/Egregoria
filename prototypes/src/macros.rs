@@ -39,6 +39,7 @@ macro_rules! gen_prototypes {
             )+
             pub(crate) orderings: Orderings,
             pub(crate) fingerprint: u64,
+            pub(crate) pre_fire_fingerprint: u64,
             declared_types: std::collections::BTreeMap<String, &'static str>,
             conflicting_declarations: std::collections::BTreeSet<String>,
         }
@@ -86,7 +87,7 @@ macro_rules! gen_prototypes {
                 )+
             }
 
-            pub(crate) fn compute_fingerprint(&self) -> std::io::Result<u64> {
+            pub(crate) fn compute_fingerprint(&mut self) -> std::io::Result<u64> {
                 use common::saveload::{Bincode, Encoder};
                 use std::hash::Hasher;
 
@@ -101,7 +102,17 @@ macro_rules! gen_prototypes {
                 #[allow(deprecated)] // Fixed SipHash-2-4 keys and byte-oriented input.
                 let mut hash = std::hash::SipHasher::new_with_keys(0, 0);
                 hash.write(&encoded);
+                self.pre_fire_fingerprint = hash.finish();
+                let fire = self.service.iter()
+                    .filter_map(|(id, service)| service.fire.map(|spec| (*id, spec)))
+                    .collect::<std::collections::BTreeMap<_, _>>();
+                hash.write(&Bincode::encode(&fire)?);
                 Ok(hash.finish())
+            }
+
+            /// Identifies the pre-P9 effective prototype encoding for stock city imports.
+            pub fn pre_fire_fingerprint(&self) -> u64 {
+                self.pre_fire_fingerprint
             }
 
             pub(crate) fn compute_orderings(&mut self) {
