@@ -592,6 +592,13 @@ fn write_routing_step(hash: &mut impl Hasher, step: Option<&RoutingStep>) {
             hash.write_u8(1);
             write_route_position(hash, *pos);
         }
+        Some(RoutingStep::DriveProperty(id, _, _)) => {
+            write_tagged_id(hash, 11, entity_ffi(*id));
+        }
+        Some(RoutingStep::ParkProperty(id, building, _)) => {
+            write_tagged_id(hash, 12, entity_ffi(*id));
+            write_u64_le(hash, slot_ffi(building));
+        }
         Some(RoutingStep::DriveTo(id, pos)) => {
             write_tagged_id(hash, 2, entity_ffi(*id));
             write_route_position(hash, *pos);

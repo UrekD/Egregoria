@@ -2,6 +2,7 @@ pub mod addtrain;
 pub mod bulldozer;
 pub mod inspected_aura;
 pub mod lotbrush;
+pub(crate) mod parkinglot;
 pub mod roadbuild;
 pub mod roadeditor;
 pub mod selectable;
@@ -74,6 +75,7 @@ pub(crate) fn close_tool(uiw: &UiWorld) {
         Tool::SpecialBuilding => uiw.write::<SpecialBuildingResource>().opt = None,
         Tool::Terraforming => uiw.write::<TerraformingResource>().cancel_gesture(),
         Tool::Zoning => uiw.write::<ZoningState>().cancel_gesture(),
+        Tool::ParkingGarage => uiw.write::<parkinglot::ParkingGarageTool>().clear(),
         _ => {}
     }
     *tool = Tool::Hand;
@@ -107,6 +109,7 @@ pub enum ToolMode {
     BusStop,
     BusLine,
     Trains,
+    ParkingGarage,
     Bulldoze,
     Landscaping,
 }
@@ -133,7 +136,12 @@ impl ToolCategory {
             ToolCategory::Utilities => &[ToolMode::Utilities],
             ToolCategory::Services => &[ToolMode::Services],
             ToolCategory::Industry => &[ToolMode::Industry],
-            ToolCategory::Transport => &[ToolMode::BusStop, ToolMode::BusLine, ToolMode::Trains],
+            ToolCategory::Transport => &[
+                ToolMode::BusStop,
+                ToolMode::BusLine,
+                ToolMode::Trains,
+                ToolMode::ParkingGarage,
+            ],
             ToolCategory::Bulldoze => &[ToolMode::Bulldoze],
             ToolCategory::Landscaping => &[ToolMode::Landscaping],
         }
@@ -190,7 +198,9 @@ impl ToolMode {
             ToolMode::Utilities => ToolCategory::Utilities,
             ToolMode::Services => ToolCategory::Services,
             ToolMode::Industry => ToolCategory::Industry,
-            ToolMode::BusStop | ToolMode::BusLine | ToolMode::Trains => ToolCategory::Transport,
+            ToolMode::BusStop | ToolMode::BusLine | ToolMode::Trains | ToolMode::ParkingGarage => {
+                ToolCategory::Transport
+            }
             ToolMode::Bulldoze => ToolCategory::Bulldoze,
             ToolMode::Landscaping => ToolCategory::Landscaping,
         }
@@ -206,6 +216,7 @@ impl ToolMode {
             ToolMode::BusStop => Tool::TransitStop,
             ToolMode::BusLine => Tool::TransitLine,
             ToolMode::Trains => Tool::Train,
+            ToolMode::ParkingGarage => Tool::ParkingGarage,
             ToolMode::Bulldoze => Tool::Bulldozer,
             ToolMode::Landscaping => Tool::Terraforming,
         }
@@ -236,6 +247,7 @@ impl ToolMode {
             Tool::TransitStop => ToolMode::BusStop,
             Tool::TransitLine => ToolMode::BusLine,
             Tool::Train => ToolMode::Trains,
+            Tool::ParkingGarage => ToolMode::ParkingGarage,
             Tool::Bulldozer => ToolMode::Bulldoze,
             Tool::Terraforming => ToolMode::Landscaping,
         })
@@ -249,6 +261,7 @@ impl ToolMode {
             ToolMode::BusStop => "Bus stop",
             ToolMode::BusLine => "Bus line",
             ToolMode::Trains => "Trains",
+            ToolMode::ParkingGarage => "Parking garages",
             _ => self.category().label(),
         }
     }
@@ -261,6 +274,7 @@ impl ToolMode {
             ToolMode::BusStop => "transport/bus-stop",
             ToolMode::BusLine => "transport/bus-line",
             ToolMode::Trains => "transport/trains",
+            ToolMode::ParkingGarage => "transport/parking-garages",
             _ => self.category().path(),
         }
     }

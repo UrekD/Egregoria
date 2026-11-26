@@ -92,6 +92,10 @@ impl InstancedRender {
             };
 
             match v.vehicle.kind {
+                VehicleKind::Car
+                    if v.vehicle.state.is_parked()
+                        && v.it.is_property_stored()
+                        && sim.car_stored_inside_garage(id) => {}
                 VehicleKind::Car => self.cars.instances.push(instance),
                 VehicleKind::Truck => self.trucks.instances.push(instance),
                 VehicleKind::Bus => {

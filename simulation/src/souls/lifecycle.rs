@@ -131,11 +131,24 @@ pub(crate) fn remove_collapsed_sites(sim: &mut Simulation, ids: Vec<BuildingID>)
 }
 
 fn remove_site_inner(sim: &mut Simulation, id: BuildingID, defer_references: bool) -> bool {
+    if sim
+        .read::<crate::transportation::DrivewayTraffic>()
+        .properties
+        .busy(id)
+    {
+        sim.write::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .set_open(id, false);
+        return false;
+    }
     let was_external_target = sim.map().external_train_stations.first() == Some(&id);
     let removed = sim.map_mut().remove_building(id);
     let Some(building) = removed else {
         return false;
     };
+    sim.write::<crate::transportation::DrivewayTraffic>()
+        .properties
+        .remove_empty(id, &mut sim.write::<ParkingManagement>());
     residence::on_building_removed(sim, id);
     remove_building(sim, building, was_external_target, defer_references);
     true

@@ -103,6 +103,7 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                     label(format!("{:?}", building.id));
                 }
 
+                render_parking(uiworld, sim, building);
                 if staff_activity.is_none() || !diagnostics.blockers.is_empty() {
                     render_why(sim, &diagnostics.blockers);
                 }
@@ -162,7 +163,7 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                     BuildingKind::RailFreightStation(_) => {
                         render_freightstation(uiworld, sim, building, &freight_page);
                     }
-                    BuildingKind::TrainStation => {}
+                    BuildingKind::TrainStation | BuildingKind::ParkingGarage(_) => {}
                     BuildingKind::ExternalTrading => {
                         let trace = sim.read::<FreightTrace>();
                         render_freight_page(
@@ -884,5 +885,49 @@ mod tests {
             import_label(ImportStatus::NoRoute, since),
             "No import route · no freight station with trains reaches it by road"
         );
+    }
+}
+
+fn render_parking(uiw: &UiWorld, sim: &Simulation, building: &Building) {
+    if let Some(parking) = sim.building_parking(building.id) {
+        label(format!(
+            "{} · {} / {} occupied",
+            parking.kind.label(),
+            parking.occupied,
+            parking.capacity
+        ));
+        if parking.held > 0 {
+            label(format!("{} reserved", parking.held));
+        }
+        label(format!(
+            "Entrance · {} m along the {:?} curb",
+            parking.entrance.station_cm / 100,
+            parking.entrance.side
+        ));
+        if parking.daily_upkeep != prototypes::Money::ZERO {
+            label(format!("Upkeep · ${} per day", parking.daily_upkeep));
+        }
+        if !parking.open {
+            label("Closed to arrivals");
+        }
+        if uiw.can_author()
+            && button_secondary(if parking.open {
+                "Close parking"
+            } else {
+                "Reopen parking"
+            })
+            .show()
+            .clicked
+        {
+            uiw.commands().push(WorldCommand::SetBuildingParkingOpen {
+                building: building.id,
+                open: !parking.open,
+            });
+        }
+    } else if let Some((capacity, occupied)) = sim.building_curb_parking(building.id) {
+        label(format!(
+            "Curb bays nearby · {} / {} unavailable",
+            occupied, capacity
+        ));
     }
 }

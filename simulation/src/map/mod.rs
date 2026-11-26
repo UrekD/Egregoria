@@ -75,6 +75,7 @@ mod reachability;
 pub mod road_edit;
 mod serializing;
 mod spatial_map;
+pub mod building_parking;
 pub mod special_placement;
 pub mod terrain;
 mod traffic_control;

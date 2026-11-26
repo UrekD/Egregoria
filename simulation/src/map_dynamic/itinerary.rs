@@ -1059,6 +1059,10 @@ impl Itinerary {
         }
     }
 
+    pub fn is_property_stored(&self) -> bool {
+        self.driveway_phase() == Some(crate::transportation::DrivewayPhase::Stored)
+    }
+
     pub(crate) fn driveway_phase(&self) -> Option<crate::transportation::DrivewayPhase> {
         match self.kind {
             ItineraryKind::Driveway(phase) => Some(phase),

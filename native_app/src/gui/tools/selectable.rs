@@ -48,7 +48,8 @@ pub fn selectable(sim: &Simulation, uiworld: &UiWorld) {
         inspected.e = uiworld
             .write::<VehiclePicker>()
             .pick(sim, &inp)
-            .map(|hit| hit.entity);
+            .map(|hit| hit.entity)
+            .filter(|entity| !matches!(entity, AnyEntity::VehicleID(car) if sim.car_stored_inside_garage(*car)));
         if let Some(unproj) = inp.unprojected.filter(|_| inspected.e.is_none()) {
             for (id, human) in &sim.world().humans {
                 let dist2 = human.trans.pos.xy().distance2(unproj.xy());

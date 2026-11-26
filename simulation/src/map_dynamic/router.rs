@@ -1,8 +1,9 @@
 use crate::economy::{on_arrival, on_cancel, on_start, TripMode, TripProgress, TripPurpose};
+use crate::map::building_parking::BuildingParking;
 use crate::map::{BuildingID, Map, PathKind, Pathfinder, TraverseDirection};
 use crate::map_dynamic::transit::{elapsed_ticks, WAIT_NOT_STARTED};
 use crate::map_dynamic::{
-    BuildingInfos, Itinerary, LineID, ParkingManagement, ParkingReserveError, SpotReservation,
+    BuildingInfos, DirectedEndpoint, DirectedPlan, DirectedSearch, DirectedSearchResult, Itinerary, LineID, ParkingManagement, ParkingReserveError, SpotReservation,
     StopID, Transit, NEAR_PARKING_RADIUS, OBJECTIVE_OK_DIST,
 };
 use crate::souls::desire::WorkKind;
@@ -10,7 +11,7 @@ use crate::souls::household::HouseholdStock;
 use crate::souls::human::HumanDecisionKind;
 use crate::transportation::TransportGrid;
 use crate::transportation::{
-    put_pedestrian_in_transport_grid, unpark, Location, VehicleKind, VehicleState,
+    put_pedestrian_in_transport_grid, unpark, DrivewayTraffic, Location, VehicleKind, VehicleState,
 };
 use crate::utils::resources::Resources;
 use crate::world::{CompanyID, HumanEnt, HumanID, VehicleEnt, VehicleID};
@@ -74,6 +75,7 @@ pub enum RouterError {
     ReservingParkingSpot(ParkingReserveError),
     TranslatingParkingSpotToDrivePos,
     LocatingVehicle,
+    PropertyParkingBlocked,
 }
 
 debug_inspect_impl!(RouterError);
@@ -106,13 +108,42 @@ pub enum RoutingStep {
         line: LineID,
         alight: StopID,
     },
+    DriveProperty(VehicleID, Option<Box<DirectedPlan>>, Tick),
+    ParkProperty(VehicleID, BuildingID, Tick),
 }
 
 debug_inspect_impl!(RoutingStep);
 
 pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
-    if elapsed_ticks(resources).0 % ABANDONED_CAR_SWEEP == 0 {
+    let now = elapsed_ticks(resources).0;
+    if now % ABANDONED_CAR_SWEEP == 0 {
         recover_abandoned_cars(world, resources);
+    }
+    if now % 32 == 0 {
+        let traffic = resources.read::<DrivewayTraffic>();
+        for (id, car, site, door) in traffic.properties.closing_owners(now / 32).take(32) {
+            world.edit_human(id, |human| {
+                let router = &mut human.router;
+                if router.personal_car == Some(car)
+                    && router.selected_vehicle() == Some(car)
+                    && router.cur_step.is_none()
+                    && router.steps.is_empty()
+                    && router.target_dest == router.cur_dest
+                    && !matches!(human.location, Location::Transit(_) | Location::Vehicle(_))
+                {
+                    let goal = if human.home.house != site
+                        && human.location != Location::Building(human.home.house)
+                    {
+                        Destination::Building(human.home.house)
+                    } else {
+                        Destination::Outside(door)
+                    };
+                    router.reset_dest();
+                    router.go_to(goal);
+                    human.decision.wait = u8::MAX;
+                }
+            });
+        }
     }
     routing_changed(world, resources, Transit::headway);
 }
@@ -129,6 +160,8 @@ fn routing_changed(
     let cbuf_vehicle = resources.read::<ParCommandBuffer<VehicleEnt>>();
     let transit = resources.read::<Transit>();
     let mut transit_paths = None;
+    let mut driveways = resources.write::<DrivewayTraffic>();
+    let has_properties = !driveways.properties.is_empty();
 
     world.humans.edit_active(HumanWork::RouteChanged, |id, h| {
         let h: &mut HumanEnt = h;
@@ -166,6 +199,17 @@ fn routing_changed(
             return;
         }
         let dest = unwrap_ret!(router.target_dest);
+        if has_properties {
+            if router
+                .personal_car
+                .is_some_and(|car| driveways.properties.is_moving(car))
+            {
+                return;
+            }
+            if let Some(car) = router.personal_car {
+                driveways.properties.release_arrival(car);
+            }
+        }
 
         let replacing_wait = matches!(router.cur_step, Some(RoutingStep::WaitAtStop { .. }));
         router.clear_steps(parking);
@@ -254,8 +298,65 @@ fn routing_changed(
             router.transit_walks = Some(Box::new(paths.map(Some)));
             Ok(steps)
         } else {
-            router.steps_to(pos, parking, map, &h.location, &world.vehicles)
+            let property_route = if has_properties {
+                let eligible = building.filter(|&id| {
+                    let Some(site) = map.get(id) else {
+                        return false;
+                    };
+                    if site.is_abandoned_growable() {
+                        return false;
+                    }
+                    if id == h.home.house
+                        || matches!(site.kind, crate::map::BuildingKind::ParkingGarage(_))
+                    {
+                        return true;
+                    }
+                    if site.development().is_some_and(|site| {
+                        matches!(
+                            site.business,
+                            Some(crate::map::GrowableBusinessState::ClosedUntil { .. })
+                        )
+                    }) {
+                        return false;
+                    }
+                    (router.trip_purpose == TripPurpose::Work
+                        && h.work.as_ref().is_some_and(|work| work.workplace == id))
+                        || (router.trip_purpose == TripPurpose::Shopping
+                            && crate::souls::residence::is_retail_store(site.kind))
+                });
+                router.property_steps(
+                    id, pos, eligible, parking, map, &h.location, &world.vehicles,
+                    &mut driveways.properties,
+                )
+            } else {
+                None
+            };
+            if let Some(steps) = property_route {
+                Ok(steps)
+            } else {
+                router.steps_to(pos, parking, map, &h.location, &world.vehicles)
+            }
         };
+        if matches!(route, Err(RouterError::ReservingParkingSpot(_)))
+            && !matches!(router.last_error, Some(RouterError::PropertyParkingBlocked))
+            && driveways.properties.has_public_garages()
+        {
+            for garage in driveways.properties.nearby_public_garages(map, pos) {
+                if let Some(steps) = router.property_steps(
+                    id,
+                    pos,
+                    Some(garage),
+                    parking,
+                    map,
+                    &h.location,
+                    &world.vehicles,
+                    &mut driveways.properties,
+                ) {
+                    route = Ok(steps);
+                    break;
+                }
+            }
+        }
         if matches!(route, Err(RouterError::ReservingParkingSpot(_))) {
             if let Some(car) = router
                 .personal_car
@@ -292,11 +393,12 @@ fn routing_changed(
             .any(|step| matches!(step, RoutingStep::RideTransit { .. }))
         {
             TripMode::Transit
-        } else if router
-            .steps
-            .iter()
-            .any(|step| matches!(step, RoutingStep::DriveTo(..)))
-        {
+        } else if router.steps.iter().any(|step| {
+            matches!(
+                step,
+                RoutingStep::DriveTo(..) | RoutingStep::DriveProperty(..)
+            )
+        }) {
             TripMode::Car
         } else {
             TripMode::Walk
@@ -401,6 +503,74 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
         if let Some(ref step) = h.router.cur_step {
             cur_step_over = match *step {
                 RoutingStep::WalkTo(_) => itin.has_ended(0.0),
+                RoutingStep::DriveProperty(car, ref plan, started) => {
+                    let Some(actor) = world.vehicles.get_mut(car) else {
+                        h.router.reset_dest();
+                        return;
+                    };
+                    let mut traffic = resources.write::<DrivewayTraffic>();
+                    let properties = &mut traffic.properties;
+                    if plan.is_some() {
+                        let now = elapsed_ticks(resources);
+                        if now.0.saturating_sub(started.0) > 240 {
+                            h.router.last_error = Some(RouterError::PropertyParkingBlocked);
+                            h.router.reset_dest();
+                            return;
+                        }
+                        let Some(RoutingStep::DriveProperty(_, plan, _)) = &mut h.router.cur_step
+                        else {
+                            unreachable!()
+                        };
+                        let route = plan.as_ref().unwrap();
+                        if !route.valid(map) {
+                            h.router.last_error = Some(RouterError::PropertyParkingBlocked);
+                            h.router.reset_dest();
+                            return;
+                        }
+                        if properties.parked_at(car).is_some() {
+                            if !properties.start_departure(
+                                &mut resources.write::<TransportGrid>(),
+                                car,
+                                actor,
+                                route.as_ref().clone(),
+                            ) {
+                                return;
+                            }
+                        } else {
+                            actor.it = route.as_ref().clone().into_itinerary();
+                        }
+                        *plan = None;
+                        h.router.trip_mode.drove();
+                        return;
+                    }
+                    !properties.is_moving(car) && actor.it.has_ended(0.0)
+                }
+                RoutingStep::ParkProperty(car, site, deadline) => {
+                    let Some(actor) = world.vehicles.get_mut(car) else {
+                        h.router.reset_dest();
+                        return;
+                    };
+                    let mut traffic = resources.write::<DrivewayTraffic>();
+                    let properties = &mut traffic.properties;
+                    if properties.parked_at(car) == Some(site) {
+                        true
+                    } else if properties.is_moving(car) {
+                        false
+                    } else if elapsed_ticks(resources) >= deadline {
+                        properties.release_arrival(car);
+                        h.router.last_error = Some(RouterError::PropertyParkingBlocked);
+                        h.router.reset_dest();
+                        return;
+                    } else {
+                        properties.start_arrival(
+                            map,
+                            &mut resources.write::<TransportGrid>(),
+                            car,
+                            actor,
+                        );
+                        false
+                    }
+                }
                 RoutingStep::DriveTo(vehicle, _) => world
                     .vehicles
                     .get(vehicle)
@@ -427,7 +597,9 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
         if let Some(step) = h.router.steps.last() {
             next_step_ready = match *step {
                 RoutingStep::WalkTo(_) => true,
-                RoutingStep::DriveTo(_, _) => true,
+                RoutingStep::DriveTo(_, _)
+                | RoutingStep::DriveProperty(..)
+                | RoutingStep::ParkProperty(..) => true,
                 RoutingStep::Park(_, _) => true,
                 // A parking manoeuvre finishes before the car can leave its spot.
                 RoutingStep::Unpark(vehicle) => world
@@ -510,6 +682,12 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                     }
                     h.it = route
                         .unwrap_or_else(|| Itinerary::wait_for_reroute(PathKind::Pedestrian, obj));
+                }
+                RoutingStep::DriveProperty(_, _, ref mut started) => {
+                    *started = elapsed_ticks(resources);
+                }
+                RoutingStep::ParkProperty(_, _, ref mut deadline) => {
+                    *deadline = Tick(elapsed_ticks(resources).0.saturating_add(240));
                 }
                 RoutingStep::DriveTo(vehicle, obj) => {
                     let route = Itinerary::wait_for_reroute(PathKind::Vehicle, obj);
@@ -652,6 +830,7 @@ pub(crate) fn abandoned_cars(world: &World) -> Vec<(VehicleID, HumanID)> {
             let vehicle = world.vehicles.get(car)?;
             (on_road(vehicle).is_some()
                 && vehicle.it.is_terminal()
+                && vehicle.it.driveway_phase().is_none()
                 && !riding.contains(&car)
                 && !h.router.plans_with(car))
             .then_some((car, owner))
@@ -856,6 +1035,7 @@ fn exit_beside(map: &Map, car: &VehicleEnt) -> Vec3 {
 /// Position of a car that is on a driving lane, as opposed to parked or parking.
 fn on_road(vehicle: &VehicleEnt) -> Option<Vec3> {
     (matches!(vehicle.vehicle.kind, VehicleKind::Car)
+        && vehicle.it.driveway_phase().is_none()
         && matches!(
             vehicle.vehicle.state,
             VehicleState::Driving | VehicleState::Panicking(_)
@@ -879,6 +1059,30 @@ fn can_drive(map: &Map, from: Vec3, to: Vec3) -> bool {
         // Same-lane trips may only need a local path.
         (Some(start), Some(end)) => start == end || map.can_drive_between(start, end),
         _ => false,
+    }
+}
+
+fn directed_at(map: &Map, pos: Vec3) -> Option<DirectedEndpoint> {
+    let lane = PathKind::Vehicle.nearest_lane(map, pos)?;
+    let points = &map.get(lane)?.points;
+    let (projection, end) = points.project_segment_2d(pos.xy());
+    let start = end.checked_sub(1)?;
+    let offset = points
+        .segments()
+        .take(start)
+        .map(|segment| segment.src.distance(segment.dst))
+        .sum::<f32>()
+        + points[start].distance(projection);
+    Some(DirectedEndpoint {
+        lane,
+        offset_cm: (offset * 100.0).floor() as u32,
+    })
+}
+
+fn directed_plan(map: &Map, from: DirectedEndpoint, to: DirectedEndpoint) -> Option<DirectedPlan> {
+    match DirectedSearch::new(from, to).advance(map, &mut 512) {
+        DirectedSearchResult::Feasible(plan) => Some(plan),
+        _ => None,
     }
 }
 
@@ -1185,6 +1389,8 @@ impl Router {
             .chain(self.cur_step.iter())
             .any(|step| match *step {
                 RoutingStep::DriveTo(vehicle, _)
+                | RoutingStep::DriveProperty(vehicle, ..)
+                | RoutingStep::ParkProperty(vehicle, ..)
                 | RoutingStep::Park(vehicle, _)
                 | RoutingStep::Unpark(vehicle)
                 | RoutingStep::GetInVehicle(vehicle)
@@ -1279,6 +1485,131 @@ impl Router {
         self.trip_employer = None;
         on_start(self);
         false
+    }
+
+    pub(crate) fn has_property_arrival(&self, car: VehicleID, site: BuildingID) -> bool {
+        self.steps.iter().chain(self.cur_step.iter()).any(
+            |step| matches!(step, RoutingStep::ParkProperty(v, b, _) if *v == car && *b == site),
+        )
+    }
+
+    fn property_steps(
+        &self,
+        driver: HumanID,
+        destination: Vec3,
+        building: Option<BuildingID>,
+        parking: &mut ParkingManagement,
+        map: &Map,
+        location: &Location,
+        cars: &HopSlotMap<VehicleID, VehicleEnt>,
+        properties: &mut BuildingParking,
+    ) -> Option<Vec<RoutingStep>> {
+        let car = self
+            .personal_car
+            .filter(|car| self.vehicle == Some(*car) && !self.walk_only_pickup)?;
+        let actor = cars.get(car)?;
+        let source = properties.parked_at(car);
+        let target = building
+            .filter(|building| Some(*building) != source)
+            .and_then(|building| {
+                properties
+                    .arrival_target(building, car)
+                    .map(|target| (building, target))
+            });
+        if target.is_none() && source.is_none() {
+            return None;
+        }
+        let walk = || {
+            let mut steps = Vec::new();
+            if let Location::Building(id) = *location {
+                steps.push(RoutingStep::GetOutBuilding(id));
+            } else if *location == Location::Vehicle(car) {
+                steps.push(RoutingStep::GetOutVehicle(car));
+            }
+            steps.push(RoutingStep::WalkTo(destination));
+            steps
+        };
+        if matches!(self.last_error, Some(RouterError::PropertyParkingBlocked)) {
+            return source.map(|_| walk());
+        }
+        let origin_pos = match &actor.vehicle.state {
+            VehicleState::Parked(spot) | VehicleState::RoadToPark(_, _, spot) => {
+                spot.park_pos(map)?
+            }
+            _ => actor.trans.pos,
+        };
+        let Some(origin) = properties
+            .release(car)
+            .or_else(|| directed_at(map, origin_pos))
+        else {
+            return source.map(|_| walk());
+        };
+        let mut held = None;
+        let mut curb = None;
+        let plan = if let Some((id, (target, door))) = target {
+            if walking_route_distance(map, door, destination).is_some() {
+                directed_plan(map, origin, target)
+                    .filter(|_| properties.hold(id, driver, car))
+                    .inspect(|_| held = Some(id))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let plan = match plan {
+            Some(plan) => plan,
+            None if source.is_some() => {
+                let Ok(spot) = parking
+                    .reserve_near_radius(destination, map, NEAR_PARKING_RADIUS)
+                    .or_else(|_| {
+                        parking.reserve_near_radius(destination, map, PERSONAL_CAR_ACCESS_RADIUS)
+                    })
+                else {
+                    return Some(walk());
+                };
+                let plan = spot
+                    .park_pos(map)
+                    .and_then(|pos| directed_at(map, pos))
+                    .and_then(|target| directed_plan(map, origin, target));
+                let Some(plan) = plan else {
+                    parking.free(spot);
+                    return Some(walk());
+                };
+                curb = Some(spot);
+                plan
+            }
+            None => return None,
+        };
+        let mut steps = Vec::new();
+        if let Location::Building(id) = *location {
+            steps.push(RoutingStep::GetOutBuilding(id));
+        }
+        if *location != Location::Vehicle(car) {
+            steps.push(RoutingStep::WalkTo(actor.trans.pos));
+            steps.push(RoutingStep::GetInVehicle(car));
+        }
+        if source.is_none()
+            && matches!(
+                actor.vehicle.state,
+                VehicleState::Parked(_) | VehicleState::RoadToPark(..)
+            )
+        {
+            steps.push(RoutingStep::Unpark(car));
+        }
+        steps.push(RoutingStep::DriveProperty(
+            car,
+            Some(Box::new(plan)),
+            Tick(0),
+        ));
+        if let Some(site) = held {
+            steps.push(RoutingStep::ParkProperty(car, site, Tick(0)));
+        } else {
+            steps.push(RoutingStep::Park(car, curb));
+        }
+        steps.push(RoutingStep::GetOutVehicle(car));
+        steps.push(RoutingStep::WalkTo(destination));
+        Some(steps)
     }
 
     fn steps_to(

@@ -626,7 +626,9 @@ pub(crate) fn plan_imported_growable(
         site
     };
     let site = with_initial_form(&map, check_site_footprint(&map, lot, site)?)?;
-    sample_and_prepare(sim, &map, lot, site)
+    let mut plan = sample_and_prepare(sim, &map, lot, site)?;
+    plan.parking = None;
+    Ok(plan)
 }
 
 fn sample_and_prepare(

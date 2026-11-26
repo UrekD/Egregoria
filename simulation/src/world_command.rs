@@ -1,3 +1,4 @@
+use crate::map::building_parking::{GarageKind, ParkingLayout};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -337,6 +338,8 @@ macro_rules! define_world_command {
                 to: PathEndpoint,
                 control: Option<[i32; 2]>,
             },
+            MapPlaceParkingGarage { kind: GarageKind, entrance: crate::map::CurbAnchor },
+            SetBuildingParkingOpen { building: BuildingID, open: bool },
         }
     };
 }
@@ -621,6 +624,7 @@ pub(crate) enum PreparedAction<'a> {
     },
     WalkingPath(crate::map::PreparedWalkingPath, Money),
     SpecialBuilding(crate::map::PreparedSpecialBuilding, Money),
+    ParkingGarage(crate::map::PreparedSpecialBuilding, ParkingLayout, Money),
     RoadEdit(PreparedRoadEdit),
     JunctionEdit(PreparedJunctionEdit),
     Command(&'a WorldCommand, Money),
@@ -664,6 +668,21 @@ impl PreparedAction<'_> {
                 let id = sim.map_mut().commit_special_building(prepared);
                 sim.write::<BuildingInfos>().insert(id);
                 WorldCommand::charge_construction(sim, cost, construction);
+            }
+            Self::ParkingGarage(prepared, layout, cost) => {
+                let id = sim.map_mut().commit_special_building(prepared);
+                sim.write::<BuildingInfos>().insert(id);
+                sim.write::<crate::transportation::DrivewayTraffic>()
+                    .properties
+                    .install(
+                        id,
+                        layout,
+                        &mut sim.write::<crate::map_dynamic::ParkingManagement>(),
+                    );
+                WorldCommand::charge_construction(sim, cost, construction);
+                let mut outcomes = sim.write::<CommandOutcomes>();
+                let index = outcomes.command_ranges.len();
+                outcomes.parking_garages.insert(index, Ok(id));
             }
             Self::RoadEdit(prepared) => {
                 let receipt = prepared.commit(sim)?;
@@ -718,6 +737,7 @@ pub struct CommandOutcomes {
     road_edits: BTreeMap<usize, Result<EditReceipt, Rejection>>,
     junction_edits: BTreeMap<usize, Result<JunctionEditReceipt, Rejection>>,
     walking_paths: BTreeMap<usize, Result<RoadID, Rejection>>,
+    parking_garages: BTreeMap<usize, Result<BuildingID, Rejection>>,
 }
 
 impl CommandOutcomes {
@@ -769,6 +789,10 @@ impl CommandOutcomes {
         self.tile_purchases.get(&index).copied()
     }
 
+    pub fn parking_garage(&self, index: usize) -> Option<Result<BuildingID, Rejection>> {
+        self.parking_garages.get(&index).copied()
+    }
+
     pub fn road_edit(&self, index: usize) -> Option<&Result<EditReceipt, Rejection>> {
         self.road_edits.get(&index)
     }
@@ -794,6 +818,7 @@ impl CommandOutcomes {
         self.road_edits.clear();
         self.junction_edits.clear();
         self.walking_paths.clear();
+        self.parking_garages.clear();
     }
 
     pub(crate) fn begin_batch(&mut self) -> Option<Self> {
@@ -1133,6 +1158,8 @@ impl WorldCommand {
                 | MapUpgradeRoad { .. }
                 | MapSetJunctionRules { .. }
                 | MapMakeWalkingPath { .. }
+                | MapPlaceParkingGarage { .. }
+                | SetBuildingParkingOpen { .. }
         )
     }
 
@@ -1425,6 +1452,8 @@ impl WorldCommand {
                 ..
             }
             | MapMakeWalkingPath { .. }
+            | MapPlaceParkingGarage { .. }
+            | SetBuildingParkingOpen { .. }
             | BuyTile { .. } => true,
             EditWater(_) => unreachable!(),
         };
@@ -1516,6 +1545,11 @@ impl WorldCommand {
             let index = outcomes.command_ranges.len();
             outcomes.junction_edits.insert(index, Err(reason));
         }
+        if matches!(self, MapPlaceParkingGarage { .. }) {
+            let mut outcomes = sim.write::<CommandOutcomes>();
+            let index = outcomes.command_ranges.len();
+            outcomes.parking_garages.insert(index, Err(reason));
+        }
         if matches!(self, MapMakeWalkingPath { .. }) {
             let mut outcomes = sim.write::<CommandOutcomes>();
             let index = outcomes.command_ranges.len();
@@ -1550,6 +1584,8 @@ impl WorldCommand {
             SpawnTrain { .. } => "SpawnTrain",
             MapMakeConnection { .. } => "MapMakeConnection",
             MapMakeWalkingPath { .. } => "MapMakeWalkingPath",
+            MapPlaceParkingGarage { .. } => "MapPlaceParkingGarage",
+            SetBuildingParkingOpen { .. } => "SetBuildingParkingOpen",
             MapMakeMultipleConnections(..) => "MapMakeMultipleConnections",
             MapUpdateIntersectionPolicy { .. } => "MapUpdateIntersectionPolicy",
             MapBuildSpecialBuilding { .. } => "MapBuildSpecialBuilding",
@@ -1767,7 +1803,8 @@ impl WorldCommand {
                     }
                     BuildingKind::House
                     | BuildingKind::ExternalTrading
-                    | BuildingKind::TrainStation => {
+                    | BuildingKind::TrainStation
+                    | BuildingKind::ParkingGarage(_) => {
                         return Err(Rejection::InvalidBuilding);
                     }
                 };
@@ -1816,6 +1853,8 @@ impl WorldCommand {
             | BuyTile { .. }
             | MapMakeConnection { .. }
             | MapMakeWalkingPath { .. }
+            | MapPlaceParkingGarage { .. }
+            | SetBuildingParkingOpen { .. }
             | MapMakeMultipleConnections(..)
             | EditWater(_)
             | SendMessage { .. }
@@ -1940,9 +1979,9 @@ impl WorldCommand {
                 PreparedAction::JunctionEdit(prepared) => {
                     Ok(ActionPreview::priced(prepared.preview.cost))
                 }
-                PreparedAction::SpecialBuilding(_, cost) | PreparedAction::Command(_, cost) => {
-                    Ok(ActionPreview::priced(cost))
-                }
+                PreparedAction::SpecialBuilding(_, cost)
+                | PreparedAction::ParkingGarage(_, _, cost)
+                | PreparedAction::Command(_, cost) => Ok(ActionPreview::priced(cost)),
             },
         }
     }
@@ -1984,6 +2023,7 @@ impl WorldCommand {
             )
         };
         let blocked = match self {
+            MapRemoveBuilding(id) => traffic.properties.busy(*id),
             MapRemoveRoad(road) | MapUpgradeRoad { road, .. } => touches_road(*road),
             MapRemoveIntersection(joint) => map
                 .get(*joint)
@@ -2105,6 +2145,26 @@ impl WorldCommand {
             } => {
                 let cells = ZoneGrid::eligible_paint_cells(&sim.map(), area, *kind, *density)?;
                 return Ok(PreparedAction::Paint(cells));
+            }
+            MapPlaceParkingGarage { kind, entrance } => {
+                let map = sim.map();
+                let (building, layout) = map.prepare_parking_garage(*kind, *entrance)?;
+                let traffic = sim.read::<crate::transportation::DrivewayTraffic>();
+                let parking = sim.read::<crate::map_dynamic::ParkingManagement>();
+                if traffic.overlaps_proof_pad(&layout.bounds())
+                    || !traffic.properties.fits(&parking, &layout, None)
+                {
+                    return Err(Rejection::BusyConflict);
+                }
+                let cost = Self::affordable_cost(sim, Some(kind.cost()))?;
+                return Ok(PreparedAction::ParkingGarage(building, layout, cost));
+            }
+            SetBuildingParkingOpen { building, .. } => {
+                let map = sim.map();
+                map.authorize_land_effects(PreparedEffects::Building(*building))?;
+                if sim.building_parking(*building).is_none() {
+                    return Err(Rejection::MissingReference);
+                }
             }
             MapMakeWalkingPath { from, to, control } => {
                 let map = sim.map();
@@ -2563,7 +2623,16 @@ impl WorldCommand {
                     i.turn_policy = tp;
                 })
                 .map_err(Rejection::water_connection_error)?,
-            MapBuildSpecialBuilding { .. } => unreachable!(),
+            MapBuildSpecialBuilding { .. } | MapPlaceParkingGarage { .. } => unreachable!(),
+            SetBuildingParkingOpen { building, open } => {
+                if !sim
+                    .write::<crate::transportation::DrivewayTraffic>()
+                    .properties
+                    .set_open(building, open)
+                {
+                    return Err(Rejection::MissingReference);
+                }
+            }
             SetGameTime(gt) => {
                 let mut time = sim.write::<GameTime>();
                 sim.write::<Budget>().shift_clock(time.tick, gt.tick);

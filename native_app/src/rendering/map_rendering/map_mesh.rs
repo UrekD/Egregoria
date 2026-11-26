@@ -1579,6 +1579,7 @@ impl MapMeshHandler {
     pub fn latest_mesh(
         &mut self,
         map: &Map,
+        sim: &Simulation,
         options: MapRenderOptions,
         ctx: &mut FrameContext<'_>,
     ) {
@@ -1612,7 +1613,7 @@ impl MapMeshHandler {
             profiling::scope!("build building chunk");
 
             let b = &mut self.builders;
-            b.buildings_mesh(map, chunk);
+            b.buildings_mesh(map, sim, chunk);
 
             let cached = self.cache.entry(chunk).or_default();
 
@@ -1771,7 +1772,7 @@ impl MapBuilders {
         }
     }
 
-    fn buildings_mesh(&mut self, map: &Map, chunk: SubscriberChunkID) {
+    fn buildings_mesh(&mut self, map: &Map, sim: &Simulation, chunk: SubscriberChunkID) {
         self.power_markers.clear();
         for v in self.buildsprites.values_mut() {
             v.clear();
@@ -1800,6 +1801,18 @@ impl MapBuilders {
             let building = &buildings[building];
             if SubscriberChunkID::new(building.canonical_position()) != chunk {
                 continue;
+            }
+            for [from, to] in sim.parking_pavement(building.id) {
+                let Some(dir) = (to - from).xy().try_normalize() else {
+                    continue;
+                };
+                let offset = dir.perpendicular().z0() * 1.6;
+                let a = from.up(0.035);
+                let b = to.up(0.035);
+                let face = [a + offset, a - offset, b - offset, b + offset];
+                self.houses_mesh.extend_with(None, |vertices, indices| {
+                    append_building_face(&face, LinearColor::gray(0.24), vertices, indices);
+                });
             }
             if append_profiled_building(&mut self.houses_mesh, building) {
                 continue;
@@ -1851,6 +1864,7 @@ impl MapBuilders {
                     tint: LinearColor::WHITE,
                 });
             } else if !power_zone
+                && !matches!(building.kind, BuildingKind::ParkingGarage(_))
                 && !building
                     .mesh
                     .faces

@@ -534,6 +534,8 @@ fn classify(
         .and_then(|(_, h)| h.router.cur_step())
         .map(|step| match step {
             RoutingStep::DriveTo(..) => "DriveTo",
+            RoutingStep::DriveProperty(..) => "DriveProperty",
+            RoutingStep::ParkProperty(..) => "ParkProperty",
             RoutingStep::Park(..) => "Park",
             RoutingStep::Unpark(..) => "Unpark",
             RoutingStep::GetInVehicle(..) => "GetInVehicle",

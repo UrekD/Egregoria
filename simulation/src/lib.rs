@@ -7,7 +7,7 @@ use crate::map::{
     BuildingKind, LotLayout, Map, WaterBasin, WaterBodyId, WaterEdit, WaterEditError,
     WaterEditOutcome, WaterEditPreview, WaterStroke,
 };
-use crate::map_dynamic::{transit, Itinerary, ItineraryLeader};
+use crate::map_dynamic::{transit, Itinerary, ItineraryLeader, ParkingManagement};
 use crate::souls::add_souls_to_empty_buildings;
 use crate::utils::resources::{Ref, RefMut, Resources};
 use crate::utils::scheduler::RunnableSystem;
@@ -133,12 +133,21 @@ const PRE_SCALE_VERSION: &str = "0.11.0";
 const PRE_ORIGIN_VERSION: &str = "0.11.1-scale-p1";
 const PRE_P7_VERSION: &str = "0.11.1";
 const VERSION: &str = include_str!("../../VERSION");
-const PATHPARK_SNAPSHOT_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.1");
+const PRE_PROPERTY_PARKING_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.1");
+const PATHPARK_SNAPSHOT_VERSION: &str = concat!(include_str!("../../VERSION"), "+pathpark.2");
+
+fn pathpark_snapshot(version: &str) -> bool {
+    matches!(
+        version,
+        PRE_PROPERTY_PARKING_VERSION | PATHPARK_SNAPSHOT_VERSION
+    )
+}
 
 fn compatible_save_version(version: &str) -> bool {
     matches!(
         version,
         PATHPARK_SNAPSHOT_VERSION
+            | PRE_PROPERTY_PARKING_VERSION
             | VERSION
             | PRE_P7_VERSION
             | PRE_SCALE_VERSION
@@ -1113,7 +1122,7 @@ impl Simulation {
                 version: Some(version.clone()),
                 reason: error.to_string(),
             })?;
-        let payload_release = if data._header.version == PATHPARK_SNAPSHOT_VERSION {
+        let payload_release = if pathpark_snapshot(&data._header.version) {
             VERSION
         } else {
             &data._header.version
@@ -1441,7 +1450,7 @@ pub struct SnapshotHeader {
 impl SnapshotHeader {
     pub fn check_compatibility(&self) -> Result<(), SaveLoadError> {
         self.check_version()?;
-        check_prototype_registry(self.registry)
+        check_snapshot_registry(self.registry, &self.version)
     }
 
     fn check_load_compatibility(&self) -> Result<(), SaveLoadError> {
@@ -1471,6 +1480,19 @@ fn check_prototype_registry(fingerprint: Option<u64>) -> Result<(), SaveLoadErro
     Ok(())
 }
 
+fn check_snapshot_registry(fingerprint: Option<u64>, version: &str) -> Result<(), SaveLoadError> {
+    check_prototype_registry(fingerprint).or_else(|error| {
+        if version != PATHPARK_SNAPSHOT_VERSION
+            && prototypes::try_prototypes()
+                .is_some_and(|current| fingerprint == Some(current.pre_parking_fingerprint()))
+        {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })
+}
+
 fn snapshot_header(mut bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SaveLoadError> {
     let slot = if bytes.starts_with(&REGISTRY_SLOT_MAGIC) {
         let header: RegistrySlotSnapshotHeader =
@@ -1496,7 +1518,7 @@ fn snapshot_header(mut bytes: &[u8]) -> Result<(SnapshotHeader, &[u8]), SaveLoad
     let SaveHeader { version } = Bincode::decode_prefix(bytes).map_err(corrupt_header)?;
     Ok((
         SnapshotHeader {
-            version: if version == PATHPARK_SNAPSHOT_VERSION {
+            version: if pathpark_snapshot(&version) {
                 VERSION.to_owned()
             } else {
                 version
@@ -2028,7 +2050,7 @@ impl SimulationDeser {
             .map(|bytes| Bincode::decode(bytes))
             .transpose()
             .map_err(|error| corrupt(error.to_string()))?;
-        check_prototype_registry(registry)?;
+        check_snapshot_registry(registry, &self._header.version)?;
         let mut sim = Simulation {
             // Resource initializers can rebuild derived indexes from the loaded world.
             world: self.world,
@@ -2041,15 +2063,27 @@ impl SimulationDeser {
             }
         }
 
-        let requires_driveways = self._header.version == PATHPARK_SNAPSHOT_VERSION;
+        let requires_driveways = pathpark_snapshot(&self._header.version);
         unsafe {
             for l in &*addr_of!(SAVELOAD_FUNCS) {
                 let Some(data) = self.res.get(l.name) else {
-                    if l.optional && !(requires_driveways && l.name == "driveway_traffic") {
+                    let required = (requires_driveways && l.name == "driveway_traffic")
+                        || (self._header.version == PATHPARK_SNAPSHOT_VERSION
+                            && l.name == "property_parking");
+                    if l.optional && !required {
                         continue;
                     }
                     return Err(corrupt(format!("Missing resource {}", l.name)));
                 };
+                if l.name == "property_parking" && self._header.version != PATHPARK_SNAPSHOT_VERSION {
+                    use crate::map::building_parking::BuildingParking;
+                    let empty = Bincode::encode(&BuildingParking::default())
+                        .map_err(|error| corrupt(error.to_string()))?;
+                    if data != &empty {
+                        return Err(corrupt("unexpected property parking resource".into()));
+                    }
+                    continue;
+                }
                 if l.name == "driveway_traffic" && !requires_driveways {
                     // Pre-PathPark snapshots omit this entry. The experimental
                     // proof also wrote an empty u64/count pair on stock maps.
@@ -2077,7 +2111,7 @@ impl SimulationDeser {
             })?,
             None if matches!(
                 self._header.version.as_str(),
-                PATHPARK_SNAPSHOT_VERSION | VERSION | PRE_P7_VERSION
+                PATHPARK_SNAPSHOT_VERSION | PRE_PROPERTY_PARKING_VERSION | VERSION | PRE_P7_VERSION
             ) =>
             {
                 return Err(corrupt("Missing snapshot map origin".into()));
@@ -2125,6 +2159,15 @@ impl SimulationDeser {
             .map_err(|reason| corrupt(reason.to_owned()))?;
         sim.map_mut().migrated_roundabout_paths.clear();
         sim.write::<transit::Transit>().rebuild_berth_index();
+        sim.write::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .restore(
+                &sim.map(),
+                sim.world(),
+                &sim.read::<crate::transportation::TransportGrid>(),
+                &mut sim.write::<ParkingManagement>(),
+            )
+            .map_err(|reason| corrupt(reason.to_owned()))?;
         sim.read::<crate::transportation::DrivewayTraffic>()
             .validate_loaded(
                 &sim.map(),

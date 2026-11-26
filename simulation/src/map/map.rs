@@ -1713,6 +1713,47 @@ impl Map {
         })
     }
 
+    pub(crate) fn prepare_parking_garage(
+        &self,
+        kind: super::building_parking::GarageKind,
+        entrance: super::CurbAnchor,
+    ) -> Result<
+        (
+            PreparedSpecialBuilding,
+            super::building_parking::ParkingLayout,
+        ),
+        crate::world_command::Rejection,
+    > {
+        use super::building_parking::{garage_footprint, prepare_public_garage};
+        use crate::world_command::Rejection;
+        let (shape, mouth) =
+            garage_footprint(self, kind, entrance).ok_or(Rejection::InvalidBuilding)?;
+        let road = self.get(entrance.road).ok_or(Rejection::MissingReference)?;
+        if super::special_placement::placement_overlap(self, road, shape).is_some() {
+            return Err(Rejection::BuildingOverlap);
+        }
+        let gen = BuildingGen::NoWalkway {
+            door_pos: Vec2::ZERO,
+        };
+        let mut prepared = self.prepare_special_building(
+            shape,
+            BuildingKind::ParkingGarage(kind),
+            gen,
+            None,
+            Some(entrance.road),
+        )?;
+        let outward = (shape.center() - mouth.xy()).normalize();
+        let gate = mouth.xy() + outward * 1.0 + outward.perpendicular() * 4.0;
+        let door = gate.z(self
+            .environment
+            .height(gate)
+            .ok_or(Rejection::InvalidBuilding)?);
+        prepared.building.set_garage_appearance(kind, door);
+        let parking = prepare_public_garage(self, kind, entrance, shape, door)
+            .ok_or(Rejection::InvalidBuilding)?;
+        Ok((prepared, parking))
+    }
+
     pub(crate) fn commit_special_building(
         &mut self,
         prepared: PreparedSpecialBuilding,

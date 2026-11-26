@@ -211,7 +211,7 @@ fn snap_to_road(
     })
 }
 
-fn placement_overlap(map: &Map, selected: &Road, obb: OBB) -> Option<PlacementError> {
+pub(super) fn placement_overlap(map: &Map, selected: &Road, obb: OBB) -> Option<PlacementError> {
     let footprint = Polygon::from(obb.corners.as_slice());
     let mut junctions = BTreeSet::from([selected.src, selected.dst]);
     let mut road_overlap = false;

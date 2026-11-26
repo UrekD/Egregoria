@@ -698,6 +698,15 @@ pub(crate) fn command_message(command: &str, reason: Rejection) -> std::borrow::
         (_, Rejection::InvalidCommandEncoding) => {
             "This action contains invalid or oversized input."
         }
+        ("MapPlaceParkingGarage", InvalidBuilding) => {
+            "The selected curb needs a clear driveway and a dry, level footprint"
+        }
+        ("MapPlaceParkingGarage", BusyConflict) => {
+            "A driveway or occupied curb bay blocks the entrance"
+        }
+        ("MapRemoveBuilding", BusyConflict) => {
+            "Close parking and wait for the remaining cars to leave"
+        }
         (_, Rejection::BuildingOverlap) => "Another building already occupies this site.",
         ("TransitAddStop", MissingReference | InvalidConnection) => {
             "Choose a driving lane beside a sidewalk and away from junctions"

@@ -3,6 +3,7 @@ pub mod demo_cities;
 pub mod determinism;
 mod economy_loop;
 pub mod growth_basic;
+pub mod pathpark;
 pub mod perf;
 pub mod services_basic;
 pub mod services_neglect;
@@ -38,6 +39,7 @@ pub const SCENARIOS: &[(Scenario, SimulationOptions)] = &[
     ),
     economy_loop::SCENARIO,
     growth_basic::SCENARIO,
+    pathpark::GROWABLES,
     services_basic::SCENARIO,
     services_neglect::SCENARIO,
     transit_basic::SCENARIO,

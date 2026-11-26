@@ -206,13 +206,6 @@ impl Replay {
         self.obsolete_recording_discarded
     }
 
-    fn validate_embedded_registry(&self) -> io::Result<()> {
-        if self.enabled || self.registry.is_some() {
-            self.check_registry()?;
-        }
-        Ok(())
-    }
-
     pub(crate) fn check_registry(&self) -> io::Result<()> {
         crate::check_prototype_registry(self.registry).map_err(replay_decode_error)
     }
@@ -497,7 +490,27 @@ impl ReplayJson {
                 }
                 JSON::decode(bytes)
             }
-            Err(SaveLoadError::IncompatibleReplay { version }) if crate::compatible_save_version(&version) => {
+            Err(SaveLoadError::IncompatibleReplay { version })
+                if version == "0.12.0+commands.3" =>
+            {
+                // Pre-property recordings have a different growth and routing model.
+                let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
+                let discarded = legacy.enabled || legacy.commands || legacy.timeline.is_some();
+                if discarded || legacy.registry.is_some() {
+                    crate::check_snapshot_registry(
+                        legacy.registry,
+                        crate::PRE_PROPERTY_PARKING_VERSION,
+                    )
+                    .map_err(replay_decode_error)?;
+                }
+                Ok(Replay {
+                    obsolete_recording_discarded: discarded,
+                    ..Replay::default()
+                })
+            }
+            Err(SaveLoadError::IncompatibleReplay { version })
+                if crate::compatible_save_version(&version) =>
+            {
                 // The city has its own schema and registry checks. Inspect the
                 // recording envelope without decoding obsolete commands.
                 let legacy: LegacySnapshotReplay = JSON::decode(bytes)?;
@@ -521,7 +534,16 @@ impl ReplayJson {
             {
                 // Earlier P7 command envelopes can still be read inside a compatible city.
                 let mut replay: Replay = JSON::decode(bytes)?;
-                replay.validate_embedded_registry()?;
+                if replay.enabled || replay.registry.is_some() {
+                    crate::check_snapshot_registry(replay.registry, &version)
+                        .map_err(replay_decode_error)?;
+                    if crate::check_prototype_registry(replay.registry).is_err() {
+                        return Ok(Replay {
+                            obsolete_recording_discarded: true,
+                            ..Replay::default()
+                        });
+                    }
+                }
                 replay.recorded_population_scale()?;
                 replay.version = replay_version();
                 Ok(replay)

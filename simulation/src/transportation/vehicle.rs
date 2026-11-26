@@ -303,7 +303,7 @@ impl Vehicle {
         Self::with_state(kind, VehicleState::Parked(spot), tint, rng)
     }
 
-    fn with_state(
+    pub(crate) fn with_state(
         kind: VehicleKind,
         state: VehicleState,
         tint: Color,
@@ -344,7 +344,7 @@ mod pathpark_driveway {
     const MAX_PORTALS: usize = 8;
     const SWEEP_STEPS: usize = 16;
     const MAX_LOCAL_COLLIDERS: usize = 128;
-    const MOTION_TICKS: u16 = 160;
+    pub(crate) const MOTION_TICKS: u16 = 160;
     const EXIT_SEARCH_TICKS: u64 = 64;
     const EXIT_WORK_PER_TICK: usize = 32;
     const SAME_DECK: f32 = 1.25;
@@ -390,13 +390,13 @@ mod pathpark_driveway {
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
-    struct Sweep {
-        points: [Vec3; SWEEP_STEPS + 1],
+    pub(crate) struct Sweep {
+        pub(crate) points: [Vec3; SWEEP_STEPS + 1],
         end_dir: Vec3,
     }
 
     impl Sweep {
-        fn between(from: Transform, to: Transform) -> Self {
+        pub(crate) fn between(from: Transform, to: Transform) -> Self {
             let radius = from.pos.distance(to.pos) * 0.9;
             let curve = Spline3 {
                 from: from.pos,
@@ -410,7 +410,7 @@ mod pathpark_driveway {
             }
         }
 
-        fn pose(self, tick: u16) -> Transform {
+        pub(crate) fn pose(self, tick: u16) -> Transform {
             let step = tick as usize * SWEEP_STEPS;
             let index = step / MOTION_TICKS as usize;
             if index == SWEEP_STEPS {
@@ -421,11 +421,11 @@ mod pathpark_driveway {
             Transform::new_dir(a + (b - a) * t, (b - a).normalize())
         }
 
-        fn segments(&self) -> impl Iterator<Item = Segment3> + '_ {
+        pub(crate) fn segments(&self) -> impl Iterator<Item = Segment3> + '_ {
             self.points.windows(2).map(|p| Segment3::new(p[0], p[1]))
         }
 
-        fn bounds(&self) -> AABB {
+        pub(crate) fn bounds(&self) -> AABB {
             let (ll, ur) = self.points.iter().fold(
                 (self.points[0].xy(), self.points[0].xy()),
                 |(ll, ur), &p| (ll.min(p.xy()), ur.max(p.xy())),
@@ -433,7 +433,7 @@ mod pathpark_driveway {
             AABB { ll, ur }
         }
 
-        fn occupied(&self, grid: &TransportGrid, actor: Option<Transporter>) -> bool {
+        pub(crate) fn occupied(&self, grid: &TransportGrid, actor: Option<Transporter>) -> bool {
             let Some(samples) = self.sample_grid(grid, actor, || true) else {
                 return true;
             };
@@ -570,6 +570,76 @@ mod pathpark_driveway {
         footprint: AABB,
     }
 
+    pub(crate) fn prepare_driveway_mouth(
+        map: &Map,
+        anchor: CurbAnchor,
+    ) -> Result<
+        (
+            Vec3,
+            DirectedEndpoint,
+            DirectedEndpoint,
+            Transform,
+            Transform,
+            Vec2,
+        ),
+        DrivewayError,
+    > {
+        use DrivewayError::*;
+        let road = map.get(anchor.road).ok_or(Stale)?;
+        if map.pick_curb(anchor.road, anchor.side, anchor.station_cm) != Some(anchor)
+            || road.lanes_iter().any(|(_, kind)| kind.is_rail())
+        {
+            return Err(InvalidGeometry);
+        }
+        let (center, _) = map
+            .path_station(road, anchor.station_cm)
+            .ok_or(InvalidGeometry)?;
+        let endpoint = match anchor.side {
+            RoadSide::Right => road.dst,
+            RoadSide::Left => road.src,
+        };
+        let lane = road
+            .incoming_lanes_to(endpoint)
+            .iter()
+            .rev()
+            .find(|(_, kind)| *kind == LaneKind::Driving)
+            .and_then(|(lane, _)| map.get(*lane))
+            .ok_or(InvalidGeometry)?;
+        let (projection, index) = lane.points.project_segment_2d(center.xy());
+        let segment_start = index.checked_sub(1).ok_or(InvalidGeometry)?;
+        let offset = lane
+            .points
+            .segments()
+            .take(segment_start)
+            .map(|p| p.src.distance(p.dst))
+            .sum::<f32>()
+            + lane.points[segment_start].distance(projection);
+        let along = (offset * 100.0).round() as u32;
+        let before = along.checked_sub(550).ok_or(InvalidGeometry)?;
+        let after = along.checked_add(850).ok_or(InvalidGeometry)?;
+        let approach = DirectedEndpoint {
+            lane: lane.id,
+            offset_cm: before,
+        };
+        let release = DirectedEndpoint {
+            lane: lane.id,
+            offset_cm: after,
+        };
+        let a = approach.transform(map).ok_or(InvalidGeometry)?;
+        let b = release.transform(map).ok_or(InvalidGeometry)?;
+        let direction = (b.pos - a.pos)
+            .xy()
+            .try_normalize()
+            .ok_or(InvalidGeometry)?;
+        if a.dir.xy().dot(direction) < 0.99
+            || b.dir.xy().dot(direction) < 0.99
+            || (a.pos.z - b.pos.z).abs() > 0.35
+        {
+            return Err(InvalidGeometry);
+        }
+        Ok((center, approach, release, a, b, direction))
+    }
+
     impl Geometry {
         fn prepare(map: &Map, anchor: CurbAnchor) -> Result<Self, DrivewayError> {
             use DrivewayError::*;
@@ -584,52 +654,7 @@ mod pathpark_driveway {
             {
                 return Err(InvalidGeometry);
             }
-            let (center, _) = map
-                .path_station(road, anchor.station_cm)
-                .ok_or(InvalidGeometry)?;
-            let endpoint = match anchor.side {
-                RoadSide::Right => road.dst,
-                RoadSide::Left => road.src,
-            };
-            let lane = road
-                .incoming_lanes_to(endpoint)
-                .iter()
-                .rev()
-                .find(|(_, kind)| *kind == LaneKind::Driving)
-                .and_then(|(lane, _)| map.get(*lane))
-                .ok_or(InvalidGeometry)?;
-            let (projection, index) = lane.points.project_segment_2d(center.xy());
-            let segment_start = index.checked_sub(1).ok_or(InvalidGeometry)?;
-            let offset = lane
-                .points
-                .segments()
-                .take(segment_start)
-                .map(|p| p.src.distance(p.dst))
-                .sum::<f32>()
-                + lane.points[segment_start].distance(projection);
-            let along = (offset * 100.0).round() as u32;
-            let before = along.checked_sub(550).ok_or(InvalidGeometry)?;
-            let after = along.checked_add(850).ok_or(InvalidGeometry)?;
-            let approach = DirectedEndpoint {
-                lane: lane.id,
-                offset_cm: before,
-            };
-            let release = DirectedEndpoint {
-                lane: lane.id,
-                offset_cm: after,
-            };
-            let a = approach.transform(map).ok_or(InvalidGeometry)?;
-            let b = release.transform(map).ok_or(InvalidGeometry)?;
-            let direction = (b.pos - a.pos)
-                .xy()
-                .try_normalize()
-                .ok_or(InvalidGeometry)?;
-            if a.dir.xy().dot(direction) < 0.99
-                || b.dir.xy().dot(direction) < 0.99
-                || (a.pos.z - b.pos.z).abs() > 0.35
-            {
-                return Err(InvalidGeometry);
-            }
+            let (center, approach, release, a, b, direction) = prepare_driveway_mouth(map, anchor)?;
             let outward = direction.perpendicular();
             let storage = center + (outward * (road.width * 0.5 + 8.0)).z0();
             let park = Transform::new_dir(storage, direction.z0());
@@ -786,6 +811,8 @@ mod pathpark_driveway {
         next_id: u64,
         #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_PORTALS>")]
         facilities: Vec<Facility>,
+        #[serde(skip)]
+        pub(crate) properties: crate::map::building_parking::BuildingParking,
     }
 
     #[derive(Deserialize)]
@@ -799,6 +826,13 @@ mod pathpark_driveway {
         pub fn place(sim: &mut Simulation, anchor: CurbAnchor) -> Result<Self, DrivewayError> {
             let geometry = Geometry::prepare(&sim.map(), anchor)?;
             let mut traffic = sim.write::<DrivewayTraffic>();
+            if traffic
+                .properties
+                .overlapping_road(&geometry.footprint)
+                .is_some()
+            {
+                return Err(DrivewayError::InvalidGeometry);
+            }
             if traffic.facilities.len() == MAX_PORTALS {
                 return Err(DrivewayError::Full);
             }
@@ -865,7 +899,7 @@ mod pathpark_driveway {
                 return Err(DrivewayError::InvalidVehicle);
             }
             let mut traffic = sim.write::<DrivewayTraffic>();
-            if traffic.owns(vehicle) {
+            if traffic.owns(vehicle) || traffic.properties.parked_at(vehicle).is_some() {
                 return Err(DrivewayError::Busy);
             }
             let index = traffic.index(self)?;
@@ -1050,10 +1084,15 @@ mod pathpark_driveway {
                     roads.extend(route.roads(map));
                 }
             }
+            self.properties.protected_roads(map, &mut roads);
             roads
         }
 
         pub(crate) fn overlaps(&self, bounds: &AABB) -> bool {
+            self.properties.overlapping_road(bounds).is_some() || self.overlaps_proof_pad(bounds)
+        }
+
+        pub(crate) fn overlaps_proof_pad(&self, bounds: &AABB) -> bool {
             self.facilities
                 .iter()
                 .any(|f| f.geometry.footprint.intersects(bounds))
@@ -1073,6 +1112,13 @@ mod pathpark_driveway {
                     ll,
                     ur: tile.center() * 2.0 - ll,
                 };
+                crate::map::spend_water_work(remaining, self.properties.site_count())?;
+                if let Some(road) = self.properties.overlapping_road(&bounds) {
+                    return Err(WaterEditError::TopologyConflict {
+                        object: ProjectKind::Road(road),
+                        tile,
+                    });
+                }
                 for facility in &self.facilities {
                     crate::map::spend_water_work(remaining, 1)?;
                     if facility.geometry.footprint.intersects(&bounds) {
@@ -1086,19 +1132,25 @@ mod pathpark_driveway {
             Ok(())
         }
 
-        pub(crate) fn is_empty(&self) -> bool {
+        pub(crate) fn proof_is_empty(&self) -> bool {
             self.facilities.is_empty()
         }
 
+        pub(crate) fn is_empty(&self) -> bool {
+            self.proof_is_empty() && self.properties.is_empty()
+        }
+
         pub(crate) fn has_crossing(&self) -> bool {
-            self.facilities.iter().any(|facility| {
-                facility.claim.as_ref().is_some_and(|claim| {
-                    matches!(claim.motion, Motion::Entering(_) | Motion::Exiting { .. })
+            self.properties.has_crossing()
+                || self.facilities.iter().any(|facility| {
+                    facility.claim.as_ref().is_some_and(|claim| {
+                        matches!(claim.motion, Motion::Entering(_) | Motion::Exiting { .. })
+                    })
                 })
-            })
         }
 
         pub(crate) fn vehicle_removed(&mut self, vehicle: VehicleID) {
+            self.properties.vehicle_removed(vehicle);
             for facility in &mut self.facilities {
                 if facility
                     .claim
@@ -1118,13 +1170,7 @@ mod pathpark_driveway {
             to: Vec3,
         ) -> bool {
             let radius = car_extent() + half_extent + 0.35;
-            self.facilities.iter().any(|f| {
-                let Some(claim) = f.claim.as_ref().filter(|c| Some(c.vehicle) != actor) else {
-                    return false;
-                };
-                let Some((_, sweep)) = claim.motion.sweep(&f.geometry) else {
-                    return false;
-                };
+            let blocked = |sweep: &Sweep| {
                 let min = from.xy().min(to.xy());
                 let max = from.xy().max(to.xy());
                 if !sweep
@@ -1164,17 +1210,28 @@ mod pathpark_driveway {
                                 }
                             })
                 })
-            })
+            };
+            self.facilities.iter().any(|f| {
+                f.claim
+                    .as_ref()
+                    .filter(|c| Some(c.vehicle) != actor)
+                    .and_then(|c| c.motion.sweep(&f.geometry))
+                    .is_some_and(|(_, sweep)| blocked(sweep))
+            }) || self
+                .properties
+                .active_sweeps()
+                .any(|(car, sweep)| Some(car) != actor && blocked(&sweep))
         }
 
         pub(crate) fn update(world: &mut World, resources: &mut Resources) {
             let mut traffic = resources.write::<Self>();
-            if traffic.is_empty() {
+            if traffic.proof_is_empty() && !traffic.properties.has_runtime_work() {
                 return;
             }
             let map = resources.read::<Map>();
             let now = crate::map_dynamic::transit::elapsed_ticks(resources).0;
             let mut grid = resources.write::<TransportGrid>();
+            traffic.properties.update(world, &mut grid);
             for facility in &mut traffic.facilities {
                 if facility.advance(world, &map, &mut grid, now) {
                     facility.claim = None;
@@ -1198,6 +1255,10 @@ mod pathpark_driveway {
                 if facility.id.0 == 0
                     || facility.id.0 > self.next_id
                     || Geometry::prepare(map, facility.anchor).ok() != Some(facility.geometry)
+                    || self
+                        .properties
+                        .overlapping_road(&facility.geometry.footprint)
+                        .is_some()
                 {
                     return Err("invalid saved driveway geometry");
                 }
@@ -1286,7 +1347,8 @@ mod pathpark_driveway {
             }
 
             for (id, actor) in &world.vehicles {
-                if owners.contains(&id) {
+                if owners.contains(&id) || self.properties.owns_stage(id, actor.it.driveway_phase())
+                {
                     continue;
                 }
                 if actor.it.driveway_phase().is_some()
@@ -1442,7 +1504,7 @@ mod pathpark_driveway {
         }
     }
 
-    fn sync_actor(grid: &mut TransportGrid, car: &mut crate::world::VehicleEnt) {
+    pub(crate) fn sync_actor(grid: &mut TransportGrid, car: &mut crate::world::VehicleEnt) {
         car.speed.0 = 0.0;
         if let Some(handle) = car.collider {
             grid.set_position(handle.0, car.trans.pos.xy());

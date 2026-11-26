@@ -109,6 +109,12 @@ Inspect directed traffic queues and curb parking, preview and confirm road edits
 
 Developer commands (see `Makefile`): `make check`, `make test`, `make scenarios`, `make determinism`, `make perf`, `make shots`.
 
+#### PathPark property parking
+
+New zoned houses can grow with driveways, shops with rear lots, and higher-density developments with integrated garages. A building's available space and road approach determine how much parking it can provide. The building inspector shows the entrance, capacity, reservations and occupancy.
+
+Open **Public transport → Parking garages** to build a multi-storey garage or an underground garage with a plaza. Click a curb to select the entrance, then click again to build. The inspector shows daily upkeep and lets you close the garage to new arrivals before demolition.
+
 ### Try the demo cities
 
 Run `make demo-cities` from the repository root. The generator writes **Starter Town** and **Showcase City** to `world/`, replacing any saves with the same slot IDs. Open either city from **Load**, or use **Continue** for the most recent one.

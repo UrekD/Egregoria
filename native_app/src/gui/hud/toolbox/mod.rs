@@ -97,7 +97,7 @@ fn tool_properties(uiw: &UiWorld, sim: &Simulation, yakui_width: f32) -> bool {
             }
         }
         Tool::LotBrush => return false,
-        Tool::TransitStop | Tool::TransitLine | Tool::Train => {
+        Tool::TransitStop | Tool::TransitLine | Tool::Train | Tool::ParkingGarage => {
             transport_properties(uiw, sim, tool);
         }
         Tool::Zoning => crate::gui::zoning::properties(uiw, yakui_width),
@@ -138,6 +138,7 @@ fn transport_properties(uiw: &UiWorld, sim: &Simulation, tool: Tool) {
         });
         match tool {
             Tool::Train => train::train_properties(uiw),
+            Tool::ParkingGarage => crate::gui::parkinglot::properties(uiw),
             _ => transit::properties(uiw, tool),
         }
     });

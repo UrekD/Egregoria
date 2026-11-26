@@ -404,12 +404,32 @@ impl Upgrade {
     fn commit(self, sim: &mut Simulation, id: BuildingID) {
         let door = self.appearance.door;
         let slots = self.appearance.development.planned_jobs;
+        let residential = self.home.is_some();
+        let level = self.appearance.development.level;
+        let parking = self
+            .home
+            .as_ref()
+            .and_then(|home| try_prototype(home.prototype)?.parking)
+            .or_else(|| {
+                let map = sim.map();
+                let id = map.get(id)?.kind.as_goods_company()?;
+                let current = try_prototype(GrowableCompanyID::from(id))?;
+                let mut chain = current.chain_key();
+                chain.level = level;
+                prototypes::prototypes()
+                    .growable_company_for_chain(chain)
+                    .map_or_else(
+                        || current.parking_at_level(level),
+                        |prototype| prototype.parking,
+                    )
+            });
         if !sim
             .map_mut()
             .update_growable_appearance(id, self.appearance)
         {
             return;
         }
+        crate::map::building_parking::refresh_property(sim, id, parking, residential);
         if let Some(home) = self.home {
             sim.write::<Residences>().replace(id, home);
             sim.write::<BuildingInfos>().mark_vacancy_changed(id);

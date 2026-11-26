@@ -291,6 +291,7 @@ fn register_systems_and_resources() {
     register_junction_policies();
     register_junction_admission();
     register_driveway_traffic();
+    register_property_parking();
     register_lane_scoring();
     register_land_ownership();
     register_pending_construction_cuts();
@@ -420,6 +421,23 @@ fn register_junction_admission() {
     }
 }
 
+fn register_property_parking() {
+    use crate::transportation::DrivewayTraffic;
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "property_parking",
+            optional: true,
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&sim.read::<DrivewayTraffic>().properties, output)
+            }),
+            load: Box::new(|sim, data| {
+                sim.write::<DrivewayTraffic>().properties = Bincode::decode(data)?;
+                Ok(())
+            }),
+        });
+    }
+}
+
 fn register_driveway_traffic() {
     use crate::transportation::DrivewayTraffic;
 
@@ -430,7 +448,8 @@ fn register_driveway_traffic() {
             optional: true, // Required by the PathPark snapshot schema in SimulationDeser.
             save: Box::new(|sim, output| {
                 let traffic = sim.read::<DrivewayTraffic>();
-                let revision = (!traffic.is_empty()).then(|| sim.map().directed_route_revision());
+                let revision =
+                    (!traffic.proof_is_empty()).then(|| sim.map().directed_route_revision());
                 traffic.save(revision, output)
             }),
             load: Box::new(|sim, data| {

@@ -16,6 +16,8 @@ pub struct SpotReservation(ParkingSpotID);
 pub struct ParkingManagement {
     reserved_spots: BTreeSet<ParkingSpotID>,
     #[serde(skip)]
+    masked_spots: BTreeMap<ParkingSpotID, u32>,
+    #[serde(skip)]
     pub(crate) reroute_failures: RerouteFailures,
     #[serde(skip)]
     search_observations: ParkingSearchObservations,
@@ -82,7 +84,26 @@ impl ParkingManagement {
     }
 
     pub fn is_spot_free(&self, spot: ParkingSpotID) -> bool {
+        self.is_unreserved(spot) && !self.masked_spots.contains_key(&spot)
+    }
+
+    pub(crate) fn is_unreserved(&self, spot: ParkingSpotID) -> bool {
         !self.reserved_spots.contains(&spot)
+    }
+
+    pub(crate) fn mask(&mut self, spot: ParkingSpotID) {
+        *self.masked_spots.entry(spot).or_default() += 1;
+    }
+
+    pub(crate) fn unmask(&mut self, spot: ParkingSpotID) {
+        if let std::collections::btree_map::Entry::Occupied(mut count) =
+            self.masked_spots.entry(spot)
+        {
+            *count.get_mut() -= 1;
+            if *count.get() == 0 {
+                count.remove();
+            }
+        }
     }
 
     pub fn reserve_random_free_spot(
@@ -94,7 +115,7 @@ impl ParkingManagement {
             let Some(spot) = spots.random_spot(rng.wrapping_add(i_try)) else {
                 continue;
             };
-            if self.reserved_spots.insert(spot) {
+            if !self.masked_spots.contains_key(&spot) && self.reserved_spots.insert(spot) {
                 return Some(SpotReservation(spot));
             }
         }
@@ -187,7 +208,8 @@ impl ParkingManagement {
                             map.parking
                                 .get(spot)
                                 .is_some_and(|data| data.trans.pos.xy().distance2(near.xy()) <= max)
-                        }) && self.reserved_spots.insert(spot)
+                        }) && !self.masked_spots.contains_key(&spot)
+                            && self.reserved_spots.insert(spot)
                         {
                             if let Some(stats) = observation {
                                 if lane.parent != start_road {
