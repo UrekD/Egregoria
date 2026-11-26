@@ -4350,6 +4350,16 @@ mod tests {
         let junction = &map.intersections()[hraska_egress];
         assert_eq!(junction.light_policy, simulation::map::LightPolicy::Lights);
         assert!(!junction.turn_policy.left_turns);
+        let bend = built.links[&SourceKey::Way { id: 461688158, span: 1 }].road;
+        let road = &map.roads()[bend];
+        assert_eq!(
+            road.lanes_iter().filter(|(_, kind)| *kind == LaneKind::Driving).count(),
+            2,
+        );
+        assert!(
+            road.lanes_iter().all(|(_, kind)| kind != LaneKind::Parking),
+            "the Hraška school bend must keep curb manoeuvres clear of the turn onto the collector",
+        );
         let ridge = built.links[&SourceKey::Way { id: 419255436, span: 2 }].road;
         let park = built.links[&SourceKey::Authored("hraska-park-approach")].road;
         let west = super::super::layout::design_point(vec2(1502.9, 2293.9), plan.config);

@@ -837,7 +837,7 @@ fn storage_margin(graph: &Graph, link: &LinkSpec, limits: SpacingLimits) -> f32 
     arc(&link.points) - trim - floor - 2.5
 }
 
-fn move_junction(graph: &mut Graph, key: SourceKey, at: Vec2) {
+pub(super) fn move_junction(graph: &mut Graph, key: SourceKey, at: Vec2) {
     graph.junctions.get_mut(&key).unwrap().position = at.z(graph.junctions[&key].position.z);
     for link in graph
         .links

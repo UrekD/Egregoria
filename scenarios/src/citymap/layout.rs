@@ -1,5 +1,5 @@
 use super::network::{
-    calibrate_storage, clean_network, connect_infill, finish_network, main_components,
+    calibrate_storage, clean_network, connect_infill, finish_network, main_components, move_junction,
     retire_outer_road_fragments, segment_parameters, Graph, JunctionSpec, LinkSpec, RoadClass,
     SourceKey, SpacingLimits,
 };
@@ -1275,23 +1275,39 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
         );
     }
 
-    // Keep curb maneuvers off the two through links where the wet trace
+    // Keep curb maneuvers off the through links where the wet trace
     // found a stopped tail and an upstream conflict.
-    for (id, reason) in [
+    for (id, span, reason) in [
         (
             350992954,
+            0,
             "keep the South through link clear of curb parking",
         ),
         (
             1426155807,
+            0,
             "keep the Hraška through link clear of curb parking",
         ),
+        (
+            461688158,
+            1,
+            "keep the Hraška school bend clear of curb parking",
+        ),
     ] {
-        let key = SourceKey::Way { id, span: 0 };
+        let key = SourceKey::Way { id, span };
         if let Some(link) = plan.graph.links.get_mut(&key) {
             link.class = RoadClass::Collector;
             plan.graph.record(reason, &[key]);
         }
+    }
+    let school_approach = SourceKey::Way { id: 461688158, span: 1 };
+    if let Some(link) = plan.graph.links.get(&school_approach) {
+        // Extend the approach to fit the Collector's 90 m of usable lane storage.
+        let [approach, bend] = link.endpoints;
+        let from = plan.graph.junctions[&approach].position.xy();
+        let at = plan.graph.junctions[&bend].position.xy();
+        move_junction(&mut plan.graph, bend, at + (at - from).normalize() * 16.0);
+        plan.graph.record("lengthen the Hraška school approach for collector storage", &[school_approach, bend]);
     }
     let hraska_egress = SourceKey::Node {
         id: 4193639666,
