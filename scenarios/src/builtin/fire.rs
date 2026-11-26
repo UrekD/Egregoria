@@ -112,10 +112,15 @@ fn run_resume(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mut schedule = Simulation::schedule();
     while !replay.advance_tick(&mut replayed, &mut schedule) {}
     let expected = ctx.sim.hashes();
-    if resumed.sim.hashes() != expected || replayed.hashes() != expected {
-        return Err(
-            "current checkpoint replay or resume changed the fire and clearance result".into(),
-        );
+    for (arm, city) in [("resume", &resumed.sim), ("replay", &replayed)] {
+        let actual = city.hashes();
+        if let Some(resource) = expected.keys().find(|&name| expected[name] != actual[name]) {
+            return Err(format!(
+                "{arm} changed {resource} at tick {} (expected tick {})",
+                city.get_tick(),
+                ctx.sim.get_tick()
+            ));
+        }
     }
     if ctx.sim.map().get(site).is_some() {
         return Err("clearance never finished".into());

@@ -44,6 +44,15 @@ def metric(value, name):
     return value
 
 
+def validate_workload(workload, label):
+    require(WORKLOAD <= workload.keys(), f"{label} is missing workload measurements")
+    require(type(workload["tick"]) is int and workload["tick"] >= 0, f"{label} has an invalid tick")
+    for key in ("topology", "traffic_demand"):
+        require(hex_digest(workload[key], 64), f"{label} has an invalid {key} hash")
+    for key in WORKLOAD - {"topology", "traffic_demand"}:
+        require(type(workload[key]) is int and workload[key] >= 0, f"{label} has an invalid {key} count")
+
+
 def read_report(path, expected_hash):
     data = path.read_bytes()
     require(hashlib.sha256(data).hexdigest() == expected_hash, f"{path.name} hash mismatch")
@@ -114,9 +123,13 @@ def compare(manifest, artifacts):
         require(run["binary_sha256"] == manifest["binary_sha256"][build], f"{key} executable hash mismatch")
         start = run["opening"]
         checks = run["windows"]
-        require(WORKLOAD <= start.keys() and type(start["tick"]) is int
-                and checks and all(WORKLOAD <= window.keys() for window in checks),
-                f"{key} is missing workload measurements")
+        validate_workload(start, f"{key} opening")
+        require(isinstance(checks, list) and checks, f"{key} is missing window measurements")
+        previous_tick = start["tick"]
+        for window in checks:
+            validate_workload(window, f"{key} window")
+            require(window["tick"] > previous_tick, f"{key} window ticks are not increasing")
+            previous_tick = window["tick"]
         require(start == opening.setdefault(fixture, start), f"{key} opening workload mismatch")
         require(checks == windows.setdefault(fixture, checks), f"{key} window workload mismatch")
         if fixture == "lesce_osm":

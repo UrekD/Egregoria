@@ -31,6 +31,7 @@ pub(crate) enum NotificationKind {
     NoSewage,
     Fire,
     FireCollapse,
+    FireUnserved,
     ClearanceBlocked,
     SuspendedLine,
     HighUnemployment,
@@ -51,6 +52,7 @@ impl NotificationKind {
             Self::NoSewage => "Sewage shortage",
             Self::Fire => "Fire",
             Self::FireCollapse => "Fire damage",
+            Self::FireUnserved => "Fire awaiting response",
             Self::ClearanceBlocked => "Clearance blocked",
             Self::SuspendedLine => "Suspended line",
             Self::HighUnemployment => "High unemployment",
@@ -192,6 +194,7 @@ pub(super) struct NotificationSampler {
     pending: VecDeque<Notification>,
     last_batch_seq: Option<u64>,
     fire_cursor: Option<u64>,
+    unserved_fires: Option<BTreeSet<u64>>,
     blocked_clearance: Option<BTreeSet<BuildingID>>,
     last_milestone: Option<u8>,
     last_sampled_tick: Option<Tick>,
@@ -231,6 +234,7 @@ impl NotificationSampler {
         {
             self.last_sampled_tick = Some(tick);
             self.sample(sim, now);
+            self.observe_unserved_fires(sim, now);
             self.observe_clearance(sim, now);
             // The sampling interval gives recovered conditions a cooldown before
             // they can recur. Resolved or deleted sources keep no state.
@@ -264,6 +268,7 @@ impl NotificationSampler {
         self.pending.is_empty()
             && self.last_batch_seq.is_none()
             && self.fire_cursor.is_none()
+            && self.unserved_fires.is_none()
             && self.blocked_clearance.is_none()
             && self.last_milestone.is_none()
             && self.last_sampled_tick.is_none()
@@ -413,6 +418,32 @@ impl NotificationSampler {
             target,
             history_text(),
         );
+    }
+
+    fn observe_unserved_fires(&mut self, sim: &Simulation, now: SampleTime) {
+        use simulation::souls::events::ServiceIncidents;
+        const RESPONSE_WINDOW: u64 = 25 * prototypes::TICKS_PER_MINUTE;
+        let incidents = sim.read::<ServiceIncidents>();
+        let overdue: BTreeMap<_, _> = incidents.active()
+            .filter(|incident| now.elapsed.0.saturating_sub(incident.alarm_tick.0) >= RESPONSE_WINDOW)
+            .map(|incident| (incident.id, incident.site))
+            .collect();
+        let Some(previous) = self.unserved_fires.replace(overdue.keys().copied().collect()) else {
+            return;
+        };
+        let mut newly_overdue = overdue.into_iter()
+            .filter(|(id, _)| !previous.contains(id))
+            .map(|(_, site)| site);
+        let Some(site) = newly_overdue.next() else {
+            return;
+        };
+        let others = newly_overdue.count();
+        let (target, text) = if others == 0 {
+            (AlertTarget::Building(site), "Fire awaiting response for at least 25 min".into())
+        } else {
+            (AlertTarget::CityWide, format!("{} fires awaiting response for at least 25 min", others + 1))
+        };
+        self.emit(NotificationKind::FireUnserved, now.elapsed, now.calendar.daytime, None, target, text);
     }
 
     fn observe_clearance(&mut self, sim: &Simulation, now: SampleTime) {
@@ -1005,6 +1036,24 @@ mod tests {
         sampler.observe(&test.sim);
         sampler.observe(&test.sim);
         assert_eq!(sampler.drain().filter(|notice| notice.kind == NotificationKind::Fire).count(), 0);
+    }
+
+    #[test]
+    fn p9_overdue_fire_alerts_once() {
+        let (mut test, site) = city();
+        let mut sampler = NotificationSampler::default();
+        sampler.observe(&test.sim);
+        assert!(simulation::souls::events::offer_fixture_fire(&test.sim, site));
+        simulation::souls::events::events_update(&mut test.sim);
+        let start = test.sim.get_tick();
+        for (minutes, expected) in [(14, 0), (25, 1), (36, 0)] {
+            test.sim.write::<GameTime>().tick.0 = start + minutes * prototypes::TICKS_PER_MINUTE;
+            sampler.observe(&test.sim);
+            assert_eq!(
+                sampler.drain().filter(|notice| notice.kind == NotificationKind::FireUnserved).count(),
+                expected
+            );
+        }
     }
 
     #[test]

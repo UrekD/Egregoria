@@ -854,6 +854,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     let mut disconnected = reload_abandoned()?;
     for run in [&mut disconnected, &mut resumed] {
         run_teardown_batch(run, &erasures, 13 * TICKS_PER_HOUR)?;
+        clear_decline_ruins(run, parcels.iter().map(|&(site, _, _)| site))?;
         let map = run.sim.map();
         for &(id, origin, _) in &parcels {
             if map.get(id).is_some()
@@ -863,7 +864,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
                     .any(|lot| lot.shape.center().distance2(origin.shape.center()) < 0.01)
             {
                 return Err(format!(
-                    "collapse without frontage retained the shell or restored a parcel for {id:?}"
+                    "clearance without frontage retained the shell or restored a parcel for {id:?}"
                 ));
             }
         }
@@ -892,6 +893,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     }
     for run in [&mut *live, &mut resumed] {
         run_teardown_batch(run, &repairs, 13 * TICKS_PER_HOUR)?;
+        clear_decline_ruins(run, parcels.iter().map(|&(site, _, _)| site))?;
         let map = run.sim.map();
         for &(id, origin, zone) in &parcels {
             if map.get(id).is_some()
@@ -902,7 +904,7 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
                 })
             {
                 return Err(format!(
-                    "timed collapse did not restore usable frontage for {id:?}"
+                    "paid clearance did not restore usable frontage for {id:?}"
                 ));
             }
         }
@@ -937,6 +939,29 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
 }
 
+fn clear_decline_ruins(
+    ctx: &mut ScenarioCtx,
+    sites: impl IntoIterator<Item = BuildingID>,
+) -> Result<(), String> {
+    let mut commands = Vec::new();
+    let mut longest = 0;
+    for site in sites {
+        if !ctx.sim.map().is_ruined(site) {
+            return Err(format!("site {site:?} did not become a ruin"));
+        }
+        let quote = simulation::souls::demolition::demolition_quote(&ctx.sim, site)
+            .map_err(|error| format!("clearance quote for {site:?} failed: {error:?}"))?
+            .quote;
+        longest = longest.max(u64::from(quote.minutes));
+        commands.push(WorldCommand::MapStartDemolition { site, quote });
+    }
+    for batch in commands.chunks(32) {
+        run_teardown_batch(ctx, batch, 1)?;
+    }
+    ctx.run_ticks(longest * prototypes::TICKS_PER_MINUTE);
+    Ok(())
+}
+
 fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
     // The district's housing is full. Record a demolition that frees storefront
     // jobs while baskets and deliveries are in flight. The next market pass can
@@ -964,9 +989,10 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<(), String> {
             .map(|(home, _)| home)
             .ok_or("staffed teardown needs a separate home for Mixed Use workers")?
     };
-    ctx.remove_fixture_site(home)?;
-    ctx.run_ticks(1);
-    Ok(())
+    let quote = simulation::souls::demolition::demolition_quote(&ctx.sim, home)
+        .map_err(|error| format!("worker housing demolition quote failed: {error:?}"))?
+        .quote;
+    run_teardown_batch(ctx, &[WorldCommand::MapStartDemolition { site: home, quote }], 1)
 }
 
 fn prepare_regrowth_demand(ctx: &mut ScenarioCtx) -> Result<(), String> {
