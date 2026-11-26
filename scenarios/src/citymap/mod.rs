@@ -90,11 +90,18 @@ pub fn build_cli(args: impl Iterator<Item = OsString>) -> Result<(), String> {
         sava: Some(&sava),
     };
     if dry {
-        export_slot(inputs, &out, Delivery::DryOpening)?;
+        export_dry_slot(inputs, &out)?;
+        println!(
+            "Wrote layout-only dry lesce_town and layout report to {} (operating gates skipped)",
+            out.display()
+        );
     } else {
         export_commissioned_slot(inputs, &out)?;
+        println!(
+            "Wrote commissioned lesce_town and opening report to {}",
+            out.display()
+        );
     }
-    println!("Wrote commissioned lesce_town and opening report to {}", out.display());
     Ok(())
 }
 
@@ -499,7 +506,6 @@ const BUILD_REPORT: &str = "lesce_town.build.json";
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Delivery {
     DryLayout,
-    DryOpening,
     WetOpening,
 }
 
@@ -524,47 +530,36 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
     require_absent_delivery(&out).map_err(path_error)?;
 
     let inputs = read_inputs(paths)?;
-    let config = if delivery == Delivery::WetOpening {
+    let wet = delivery == Delivery::WetOpening;
+    let config = if wet {
         TownConfig::wet()
     } else {
         TownConfig::default()
     };
     let mut plan = plan_town(&inputs, config, SpacingLimits::default())?;
-    if delivery != Delivery::DryLayout {
+    let (sim, opening) = if wet {
         commission::configure_commissioned_network(&mut plan);
-    }
-    let (mut sim, built, freight) = if delivery == Delivery::WetOpening {
-        let (sim, built, freight) = build_wet_town(&mut plan)?;
+        let (mut sim, built, freight) = build_wet_town(&mut plan)?;
         verify_wet_town(&sim, &plan, &built)?;
-        (sim, built, Some(freight))
+        let opening = commission::commission_opening(&mut sim, &plan, &built, Some(freight))?;
+        (sim, Some(opening))
     } else {
-        let (sim, built) = build_dry_town(&plan)?;
-        (sim, built, None)
+        let (sim, _) = build_dry_town(&plan)?;
+        (sim, None)
     };
-    let opening = (delivery != Delivery::DryLayout)
-        .then(|| commission::commission_opening(&mut sim, &plan, &built, freight))
-        .transpose()?;
-    let variant = match delivery {
-        Delivery::DryLayout => DRY_VARIANT,
-        Delivery::DryOpening => "dry-split-high",
-        Delivery::WetOpening => "wet",
-    };
+    let variant = if wet { "wet" } else { DRY_VARIANT };
     let id = SlotId::new("lesce_town").map_err(|error| error.to_string())?;
     let (revision, blueprint_sha256) =
         snapshot_revision(&id, &sim, &inputs, &plan, variant, SAVE_VERSION)?;
     let camera = SlotCamera {
-        position: if delivery == Delivery::WetOpening {
+        position: if wet {
             [2110.0, 1850.0, 10.0]
         } else {
             [plan.station.x, plan.station.y, 10.0]
         },
         yaw: -0.35,
         pitch: 1.22,
-        distance: if delivery == Delivery::WetOpening {
-            2250.0
-        } else {
-            1490.0
-        },
+        distance: if wet { 2250.0 } else { 1490.0 },
     };
     let slot = sim
         .encode_slot(revision)
@@ -608,7 +603,7 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
 
     let loaded =
         Simulation::load_listed_snapshot(&stage.path, entry).map_err(|error| error.to_string())?;
-    if delivery != Delivery::DryLayout
+    if wet
         && !entry.meta.as_ref().is_some_and(|meta| {
             meta.population > 0 && meta.population as usize == loaded.world().humans.len()
         })
@@ -634,10 +629,8 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
     report["scope"] =
         serde_json::json!("Dry authored network with reserved Sava crossings and facility sites.");
     drop(map);
-    if delivery == Delivery::WetOpening {
-        report["wet_acceptance"] = verify_wet_town(&loaded, &plan, &built)?;
-    }
     if let Some(opening) = opening {
+        report["wet_acceptance"] = verify_wet_town(&loaded, &plan, &built)?;
         let load_opening = || Simulation::load_listed_snapshot(&stage.path, entry)
             .map_err(|error| error.to_string());
         let checkpoint_stage = DeliveryStage::new(parent).map_err(path_error)?;
@@ -645,23 +638,17 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
             load_opening()?, load_opening()?, &opening, &checkpoint_stage.path,
         )?).map_err(|error| error.to_string())?;
         drop(checkpoint_stage);
-        if delivery == Delivery::WetOpening {
-            let fixture = Simulation::load_listed_snapshot(&stage.path, entry)
-                .map_err(|error| error.to_string())?;
-            report["wet_acceptance"]["carless_cross_bank_trip"] =
-                commission::verify_cross_bank_trip(fixture, &opening)?;
-        }
+        let fixture = Simulation::load_listed_snapshot(&stage.path, entry)
+            .map_err(|error| error.to_string())?;
+        report["wet_acceptance"]["carless_cross_bank_trip"] =
+            commission::verify_cross_bank_trip(fixture, &opening)?;
         let measured = check_loaded_opening(loaded, &plan, &opening)?;
         measured.verify()?;
-        if delivery == Delivery::WetOpening {
-            report["wet_acceptance"]["scored_bridge_crossings"] =
-                serde_json::json!(measured.bridge_crossings);
-        }
-        report["scope"] = serde_json::json!(if delivery == Delivery::WetOpening {
+        report["wet_acceptance"]["scored_bridge_crossings"] =
+            serde_json::json!(measured.bridge_crossings);
+        report["scope"] = serde_json::json!(
             "Commissioned Sava river town with a buyable land band and split High downtown zoning."
-        } else {
-            "Commissioned dry opening with split High downtown zoning."
-        });
+        );
         report["opening_manifest"] = serde_json::to_value(opening).map_err(|error| error.to_string())?;
         report["opening"] = serde_json::to_value(measured).map_err(|error| error.to_string())?;
     }
@@ -2061,7 +2048,15 @@ mod tests {
         publication_fixture("complete", |scratch| {
             let out = scratch.join("town");
             let duplicate = scratch.join("other town");
-            export_dry_slot(pinned_paths(), &out).unwrap();
+            build_cli(
+                [
+                    OsString::from("--dry"),
+                    OsString::from("--out"),
+                    OsString::from(&out),
+                ]
+                .into_iter(),
+            )
+            .unwrap();
             export_dry_slot(pinned_paths(), &duplicate).unwrap();
             assert_eq!(fs::read_dir(&out).unwrap().count(), 3);
             assert_eq!(fs::read_dir(scratch).unwrap().count(), 2);
@@ -2074,6 +2069,13 @@ mod tests {
             let report: serde_json::Value =
                 serde_json::from_slice(&fs::read(out.join("lesce_town.build.json")).unwrap())
                     .unwrap();
+            assert_eq!(report["variant"], DRY_VARIANT);
+            for key in ["opening", "opening_manifest", "continuation", "wet_acceptance"] {
+                assert!(
+                    report.get(key).is_none(),
+                    "unexpected {key} in dry layout report"
+                );
+            }
             assert_eq!(report["blueprint_sha256"].as_str().map(str::len), Some(64));
             assert_eq!(
                 report["save_version"],
