@@ -1001,20 +1001,12 @@ pub fn faces_from_skeleton(
         }
     }
 
-    // The caller stores the generated faces in the building mesh.
-    // Visit vertices in coordinate order so graph insertion order cannot change the mesh.
-    let mut nodes: Vec<_> = graph.keys().copied().collect();
-    nodes.sort_unstable_by_key(|node| (OrderedFloat(node.x), OrderedFloat(node.y)));
-    for &node in &nodes {
-        let edges = graph.get_mut(&node).unwrap();
-        edges.sort_unstable_by_key(|&edge| {
-            (
-                OrderedFloat((node - edge).angle(Vec2::X)),
-                OrderedFloat(edge.x),
-                OrderedFloat(edge.y),
-            )
-        });
-        if edges.len() <= 1 {
+    // Keep the original angular tie order and FNV walk for overlapping ridges.
+    // Changing the starting edge of a walk can change how it splits at revisited vertices.
+    #[allow(clippy::iter_over_hash_type)]
+    for (&r, l) in &mut graph {
+        l.sort_unstable_by_key(|&p| OrderedFloat((r - p).angle(Vec2::X)));
+        if l.len() <= 1 {
             return None;
         }
     }
@@ -1053,8 +1045,9 @@ pub fn faces_from_skeleton(
 
     let mut contour = None;
 
-    for node in nodes {
-        for &edge in &graph[&node] {
+    #[allow(clippy::iter_over_hash_type)]
+    for (&node, l) in &graph {
+        for &edge in l {
             if !visited.contains(&(node, edge)) {
                 let face = explore(&graph, &mut visited, &heights, node, edge);
 
@@ -1078,7 +1071,40 @@ pub fn faces_from_skeleton(
         return None;
     }
 
-    Some(faces).zip(contour)
+    // Canonicalize only finished rings so serialization order cannot affect the walk.
+    let mut contour = contour?;
+    canonicalize_ring(&mut contour, false);
+    for face in &mut faces {
+        canonicalize_ring(face, true);
+    }
+    faces.sort_unstable_by(|a, b| a.iter().map(vertex_key).cmp(b.iter().map(vertex_key)));
+    Some((faces, contour))
+}
+
+fn vertex_key(v: &Vec3) -> (OrderedFloat<f32>, OrderedFloat<f32>, OrderedFloat<f32>) {
+    (OrderedFloat(v.x), OrderedFloat(v.y), OrderedFloat(v.z))
+}
+
+fn canonicalize_ring(ring: &mut [Vec3], is_roof: bool) {
+    let vertices = |start: usize| ring[start..].iter().chain(&ring[..start]).map(vertex_key);
+    let can_project = |start: usize| {
+        let middle = ring[(start + 1) % ring.len()];
+        let next = ring[(start + 2) % ring.len()];
+        (ring[start] - middle)
+            .try_normalize()
+            .zip((next - middle).try_normalize())
+            .is_some_and(|(u, v)| u.cross(v).mag2() > 1e-10)
+    };
+    // The native mesh projection uses the first three vertices of each roof face.
+    let (start, _) = (0..ring.len())
+        .map(|start| (start, is_roof && can_project(start)))
+        .min_by(|&(a, a_has_basis), &(b, b_has_basis)| {
+            b_has_basis
+                .cmp(&a_has_basis)
+                .then_with(|| vertices(a).cmp(vertices(b)))
+        })
+        .unwrap();
+    ring.rotate_left(start);
 }
 
 #[cfg(test)]
@@ -1135,6 +1161,77 @@ mod tests {
         skeleton.reverse();
         let reordered = faces_from_skeleton(&poly, &skeleton, false).unwrap();
         assert_eq!(reordered, expected);
+    }
+
+    #[test]
+    fn house_roof_keeps_separate_faces_at_an_overlapping_ridge() {
+        // Footprint of the 30 m house at (101, 150), seed 1064894988.
+        let mut poly = [
+            vec2(-6.0806627, -9.8620205),
+            vec2(7.291275, -9.8620205),
+            vec2(7.291275, 5.378315),
+            vec2(3.0666075, 5.378315),
+            vec2(3.0666075, 9.8620205),
+            vec2(-6.0806627, 9.8620205),
+            vec2(-6.0806627, 1.0569401),
+            vec2(-7.2912755, 1.0569401),
+            vec2(-7.2912755, -6.855057),
+            vec2(-6.0806627, -6.855057),
+        ];
+        let mut subtrees = skeleton(&poly, &[]);
+        let expected = faces_from_skeleton(&poly, &subtrees, false).unwrap();
+        let mut face_lengths: Vec<_> = expected.0.iter().map(Vec::len).collect();
+        face_lengths.sort_unstable();
+        assert_eq!(face_lengths, [3, 3, 4, 4, 4, 4, 4, 4, 5, 7]);
+        for face in &expected.0 {
+            for (i, v) in face.iter().enumerate() {
+                assert!(!face[..i].contains(v), "repeated vertex in {face:?}");
+            }
+        }
+
+        subtrees.reverse();
+        for _ in 0..poly.len() {
+            poly.rotate_left(1);
+            let reordered = faces_from_skeleton(&poly, &subtrees, false).unwrap();
+            assert_eq!(reordered, expected);
+        }
+    }
+
+    #[test]
+    fn rotated_merged_house_roof_keeps_a_projection_basis() {
+        // Footprint of the 30 m house at (131, 150), seed 1041579720.
+        let poly = [
+            vec2(-8.926127, -7.912329),
+            vec2(7.647176, -7.912329),
+            vec2(7.647176, -5.2901745),
+            vec2(12.36518, -5.2901745),
+            vec2(12.36518, 1.2069125),
+            vec2(7.647176, 1.2069125),
+            vec2(7.647176, 1.4767318),
+            vec2(3.557994, 1.4767318),
+            vec2(3.557994, 7.912329),
+            vec2(-8.926127, 7.912329),
+            vec2(-8.926127, 7.1972136),
+            vec2(-12.36518, 7.1972136),
+            vec2(-12.36518, 0.684669),
+            vec2(-8.926127, 0.684669),
+        ];
+        let subtrees = skeleton(&poly, &[]);
+        let (faces, _) = faces_from_skeleton(&poly, &subtrees, true).unwrap();
+        for face in &faces {
+            let u = (face[0] - face[1]).normalize();
+            let v = (face[2] - face[1]).normalize();
+            assert!(
+                u.cross(v).mag() > 1e-5,
+                "degenerate projection for {face:?}"
+            );
+            for shift in 1..face.len() {
+                let mut rotated = face.clone();
+                rotated.rotate_left(shift);
+                canonicalize_ring(&mut rotated, true);
+                assert_eq!(&rotated, face);
+            }
+        }
     }
 
     #[test]
