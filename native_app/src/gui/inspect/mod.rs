@@ -15,6 +15,7 @@ mod inspect_building;
 mod inspect_human;
 mod inspect_needs;
 mod inspect_road;
+mod inspect_service;
 mod inspect_utility;
 mod inspect_warehouse;
 mod inspect_vehicle;
@@ -119,7 +120,11 @@ fn entity_link_inner(uiworld: &UiWorld, sim: &Simulation, e: AnyEntity) {
         _ => format!("{}", e),
     };
 
-    if primary_link(linkname) {
+    entity_link_named(uiworld, sim, e, linkname);
+}
+
+fn entity_link_named(uiworld: &UiWorld, sim: &Simulation, e: AnyEntity, name: String) {
+    if primary_link(name) {
         focus_entity(uiworld, sim, e);
     }
 }

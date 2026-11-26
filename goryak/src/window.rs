@@ -5,11 +5,13 @@ use std::rc::Rc;
 use yakui_core::event::{EventInterest, EventResponse, WidgetEvent};
 use yakui_core::geometry::{Color, Constraints, Dim2, Vec2};
 use yakui_core::widget::{EventContext, LayoutContext, Widget};
-use yakui_core::{context, Alignment, Flow, Pivot};
+use yakui_core::{context, Alignment, Flow, Pivot, TextureId};
 use yakui_widgets::widgets::{Button, Pad, Text};
-use yakui_widgets::{center, constrained, divider, draggable, offset, reflow};
+use yakui_widgets::{center, constrained, divider, draggable, image, offset, reflow};
 
-use crate::{blur_bg, icon_button, mincolumn, on_primary_container, outline, primary_container};
+use crate::{
+    blur_bg, icon_button, mincolumn, minrow, on_primary_container, outline, primary_container,
+};
 
 pub struct Window<'a> {
     pub title: Cow<'static, str>,
@@ -21,6 +23,10 @@ pub struct Window<'a> {
 
 impl<'a> Window<'a> {
     pub fn show(self, children: impl FnOnce()) {
+        self.show_with_icon(None, children);
+    }
+
+    pub fn show_with_icon(self, icon: Option<TextureId>, children: impl FnOnce()) {
         let dom = context::dom();
         let response = dom.begin_widget::<WindowBase>(());
 
@@ -62,14 +68,21 @@ impl<'a> Window<'a> {
                                 });
                             });
 
-                            {
-                                // title
+                            let title = || {
                                 let mut t = Text::label(self.title);
                                 t.style.color = on_primary_container();
                                 t.style.font_size = crate::DEFAULT_FONT_SIZE;
                                 t.padding = Pad::ZERO;
                                 t.padding.right = 15.0;
                                 t.show();
+                            };
+                            if let Some(icon) = icon {
+                                minrow(7.0, || {
+                                    image(icon, Vec2::splat(32.0));
+                                    title();
+                                });
+                            } else {
+                                title();
                             }
 
                             divider(outline(), 10.0, 1.0);

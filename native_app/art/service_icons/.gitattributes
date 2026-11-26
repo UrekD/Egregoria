@@ -1,0 +1,2 @@
+# Keep the small embedded textures available in checkouts that skip Git LFS.
+*.png -filter -diff -merge -text

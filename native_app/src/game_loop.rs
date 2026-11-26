@@ -708,6 +708,10 @@ impl State {
             ctx,
         );
 
+        map_renderer
+            .meshb
+            .draw_transit_stops(&sim.read::<simulation::map_dynamic::Transit>(), ctx);
+
         let instances_start = ctx.gfx.profile_timer();
         {
             let input = self.uiw.read::<InputMap>();

@@ -28,10 +28,14 @@ use yakui::widgets::{Pad, StateResponse};
 use yakui::{use_state, Vec2};
 
 use crate::gui::inspect::{
-    building_link, entity_link, inspect_needs, inspect_utility, inspect_warehouse,
+    building_link, entity_link, inspect_needs,
+    inspect_service::{self, StaffActivity},
+    inspect_utility, inspect_warehouse,
 };
 use crate::gui::item_icon_yakui;
+use crate::gui::toolbox::building::BuildingIcons;
 use crate::gui::zoning::zone_name;
+use crate::service_icon::ServiceIcon;
 use crate::uiworld::UiWorld;
 
 fn label(x: impl Into<Cow<'static, str>>) {
@@ -47,6 +51,16 @@ enum FreightHistory {
 
 type FreightPageSelection = StateResponse<(BuildingID, BTreeMap<FreightHistory, FreightCursor>)>;
 
+pub(super) fn building_title(building: &Building) -> &'static str {
+    match building.kind {
+        BuildingKind::House => "House",
+        BuildingKind::GoodsCompany(id) => &id.prototype().label,
+        BuildingKind::RailFreightStation(id) => &id.prototype().name,
+        BuildingKind::TrainStation => "Train Station",
+        BuildingKind::ExternalTrading => "External Trading",
+    }
+}
+
 /// Inspect a specific building, showing useful information about it
 pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> bool {
     let map = sim.map();
@@ -58,34 +72,40 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
     };
     let scale = sim.population_scale();
 
-    let title: &str = match building.kind {
-        BuildingKind::House => "House",
-        BuildingKind::GoodsCompany(id) => &id.prototype().label,
-        BuildingKind::RailFreightStation(id) => &id.prototype().name,
-        BuildingKind::TrainStation => "Train Station",
-        BuildingKind::ExternalTrading => "External Trading",
-    };
+    let company = building.kind.as_goods_company();
+    let staff_activity = company.and_then(|id| {
+        let proto = id.prototype();
+        StaffActivity::for_company(proto).map(|activity| (proto, activity))
+    });
+    let icon = company.and_then(|id| {
+        ServiceIcon::for_company(id.prototype())?;
+        uiworld.read::<BuildingIcons>().get(id.into())
+    });
 
     let mut is_open = true;
     Window {
-        title: title.into(),
+        title: building_title(building).into(),
         pad: Pad::all(10.0),
         radius: 10.0,
         opened: &mut is_open,
         child_spacing: 5.0,
     }
-    .show(|| {
+    .show_with_icon(icon, || {
         VertScrollSize::Fixed(610.0).show(|| {
             mincolumn(5.0, || {
                 let freight_page = use_state(move || (id, BTreeMap::new()));
                 if freight_page.borrow().0 != id {
                     freight_page.set((id, BTreeMap::new()));
                 }
-                if cfg!(debug_assertions) {
+                if let Some((proto, activity)) = staff_activity {
+                    inspect_service::render(uiworld, sim, building, proto, activity);
+                } else if cfg!(debug_assertions) {
                     label(format!("{:?}", building.id));
                 }
 
-                render_why(sim, &diagnostics.blockers);
+                if staff_activity.is_none() || !diagnostics.blockers.is_empty() {
+                    render_why(sim, &diagnostics.blockers);
+                }
                 match building.kind {
                     BuildingKind::House => render_house(uiworld, sim, building),
                     BuildingKind::GoodsCompany(id) => {
@@ -131,7 +151,13 @@ pub fn inspect_building(uiworld: &UiWorld, sim: &Simulation, id: BuildingID) -> 
                                 scale.persons(proto.n_workers as usize)
                             ));
                         }
-                        render_goodscompany(uiworld, sim, building, &freight_page);
+                        render_goodscompany(
+                            uiworld,
+                            sim,
+                            building,
+                            &freight_page,
+                            staff_activity.map(|(_, activity)| activity),
+                        );
                     }
                     BuildingKind::RailFreightStation(_) => {
                         render_freightstation(uiworld, sim, building, &freight_page);
@@ -557,6 +583,7 @@ fn render_goodscompany(
     sim: &Simulation,
     b: &Building,
     selection: &FreightPageSelection,
+    staff_activity: Option<StaffActivity>,
 ) {
     let Some(business) = active_business(b, &sim.read::<BuildingInfos>(), sim.world()) else {
         return;
@@ -573,18 +600,20 @@ fn render_goodscompany(
 
     let max_workers = goods.max_workers;
     let scale = sim.population_scale();
-    ProgressBar {
-        value: workers.0.len() as f32 / max_workers.max(1) as f32,
-        size: Vec2::new(200.0, 25.0),
-        color: primary().adjust(0.7),
+    if staff_activity.is_none() {
+        ProgressBar {
+            value: workers.0.len() as f32 / max_workers.max(1) as f32,
+            size: Vec2::new(200.0, 25.0),
+            color: primary().adjust(0.7),
+        }
+        .show_children(|| {
+            label(format!(
+                "Workers  {} / {}",
+                scale.persons(workers.0.len()),
+                scale.persons(max_workers as usize)
+            ));
+        });
     }
-    .show_children(|| {
-        label(format!(
-            "Workers  {} / {}",
-            scale.persons(workers.0.len()),
-            scale.persons(max_workers as usize)
-        ));
-    });
 
     if let Some(driver) = goods.driver {
         minrow(5.0, || {
@@ -684,10 +713,12 @@ fn render_goodscompany(
         }
 
         if let Some(power_prod) = proto.power_production {
-            label(format!(
-                "producing power: {}",
-                power_prod * productivity as f64
-            ));
+            if staff_activity != Some(StaffActivity::Power) {
+                label(format!(
+                    "producing power: {}",
+                    power_prod * productivity as f64
+                ));
+            }
 
             let stats = elec_flow.network_stats(net_id);
 
@@ -707,6 +738,9 @@ fn render_goodscompany(
         }
     }
 
+    if staff_activity.is_some() && proto.recipe.is_none() && proto.storage.is_none() {
+        return;
+    }
     ProgressBar {
         value: goods.progress,
         size: Vec2::new(200.0, 25.0),

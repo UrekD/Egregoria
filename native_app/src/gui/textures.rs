@@ -3,9 +3,12 @@ use engine::yakui::YakuiWrapper;
 use engine::GfxContext;
 use std::path::Path;
 
+use crate::service_icon::ServiceIcon;
+
 #[derive(Default)]
 pub struct UiTextures {
     yakui_textures: FastMap<String, yakui::TextureId>,
+    service_icons: FastMap<ServiceIcon, yakui::TextureId>,
 }
 
 impl UiTextures {
@@ -21,7 +24,14 @@ impl UiTextures {
 
             yakui_textures.insert(name, yakui.load_texture(gfx, &path));
         }
-        Self { yakui_textures }
+        let service_icons = ServiceIcon::ALL
+            .into_iter()
+            .map(|icon| (icon, yakui.add_texture(&icon.texture(gfx))))
+            .collect();
+        Self {
+            yakui_textures,
+            service_icons,
+        }
     }
 
     pub fn get(&self, name: &str) -> yakui::TextureId {
@@ -33,5 +43,9 @@ impl UiTextures {
 
     pub fn try_get(&self, name: &str) -> Option<yakui::TextureId> {
         self.yakui_textures.get(name).copied()
+    }
+
+    pub(crate) fn service_icon(&self, icon: ServiceIcon) -> Option<yakui::TextureId> {
+        self.service_icons.get(&icon).copied()
     }
 }

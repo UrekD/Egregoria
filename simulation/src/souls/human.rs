@@ -169,9 +169,7 @@ impl HumanDecisionKind {
                 let purpose = trip_purpose(dest, work.as_deref(), router);
                 router.go_to_for(dest, purpose)
             }
-            HumanDecisionKind::GoHome(home) => {
-                router.go_to_for(Destination::Building(home), TripPurpose::Home)
-            }
+            HumanDecisionKind::GoHome(home) => router.go_home(home),
             HumanDecisionKind::GoWork {
                 workplace,
                 employer,
@@ -303,11 +301,15 @@ impl HumanEnt {
         let Some(work) = self.work.as_mut().filter(|work| work.workplace == building) else {
             return;
         };
-        if work.employer.is_some() {
-            if let Some(SoulID::GoodsCompany(employer)) = infos.owner(building) {
-                work.record_attendance(time, employer);
+        if let Some(SoulID::GoodsCompany(employer)) = infos.owner(building) {
+            work.record_attendance(time, employer);
+            if work.work_inter.is_active(&time.daytime)
+                && work.employer.is_none_or(|assigned| assigned == employer)
+            {
+                self.router.record_work_stay(employer);
             }
-        } else {
+        }
+        if work.employer.is_none() {
             self.attend_work(time, building);
         }
     }

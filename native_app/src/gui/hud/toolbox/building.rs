@@ -20,7 +20,9 @@ use simulation::world_command::WorldCommand;
 use simulation::{PopulationScale, Simulation};
 
 use crate::gui::specialbuilding::{SpecialBuildKind, SpecialBuildingResource};
+use crate::gui::textures::UiTextures;
 use crate::gui::{InspectedBuilding, InspectedEntity, PlacementPreview};
+use crate::service_icon::ServiceIcon;
 use crate::uiworld::UiWorld;
 
 /// Which hand-placed buildings the shelf lists; each is its own toolbar category.
@@ -187,7 +189,9 @@ fn building_choices(uiw: &UiWorld, sim: &Simulation, tab: BuildingTab) {
                                     textc(color, &descr.label);
                                     textc(color, power_production_text(descr, power));
                                 }
-                                _ if lock.is_some() => textc(color, &descr.label),
+                                _ if lock.is_some() || descr.storage.is_some() => {
+                                    textc(color, &descr.label)
+                                }
                                 _ => {}
                             }
                         }
@@ -328,8 +332,15 @@ pub struct BuildingIcons {
     ids: FastMap<BuildingPrototypeID, TextureId>,
 }
 
+impl BuildingIcons {
+    pub(crate) fn get(&self, id: BuildingPrototypeID) -> Option<TextureId> {
+        self.ids.get(&id).copied()
+    }
+}
+
 pub fn do_icons(ctx: &mut Context, uiw: &UiWorld) {
     let mut state = uiw.write::<BuildingIcons>();
+    let textures = uiw.read::<UiTextures>();
 
     let mut cam = Camera::new(Vec3::new(0.0, 0.0, 0.0), 256.0, 256.0);
 
@@ -343,6 +354,13 @@ pub fn do_icons(ctx: &mut Context, uiw: &UiWorld) {
 
     for building in prototypes::BuildingPrototype::iter() {
         if state.ids.contains_key(&building.id) {
+            continue;
+        }
+        let service_icon = try_prototype(prototypes::GoodsCompanyID::from(building.id))
+            .and_then(ServiceIcon::for_company)
+            .and_then(|icon| textures.service_icon(icon));
+        if let Some(tex_id) = service_icon {
+            state.ids.insert(building.id, tex_id);
             continue;
         }
         if let RenderAsset::Sprite { ref path } = building.asset {
