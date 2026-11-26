@@ -9,8 +9,8 @@ use goryak::{
     button_secondary, mincolumn, minrow, on_secondary_container, primary_link, textc,
     VertScrollSize, Window,
 };
-use prototypes::try_prototype;
-use simulation::economy::cargo::{CargoBook, ItemQuantity};
+use prototypes::{try_prototype, ItemID};
+use simulation::economy::cargo::{CargoBook, FreightFragment, FreightTrace, ItemQuantity};
 use simulation::economy::TripPurpose;
 use simulation::map::{BuildingID, BuildingKind, LaneKind, Map, RoadID};
 use simulation::map_dynamic::transit::{StopID, Transit, BUS_CAPACITY};
@@ -22,6 +22,7 @@ use simulation::transportation::road::vehicle_hold_reason;
 use simulation::transportation::{Location, VehicleKind, VehicleState};
 use simulation::{AnyEntity, HumanID, Simulation, TrainID, VehicleID};
 use slotmapd::Key;
+use std::collections::{BTreeMap, BTreeSet};
 use yakui::widgets::Pad;
 
 #[derive(Default)]
@@ -37,6 +38,8 @@ struct TripView {
     remaining: Option<f32>,
     origin: Option<String>,
     cargo: Option<String>,
+    reserved_cargo: bool,
+    buyer_line: Option<String>,
     passengers: Option<(String, Vec<HumanID>)>,
 }
 
@@ -68,12 +71,27 @@ impl TripView {
     fn detail_lines(&self) -> impl Iterator<Item = String> + '_ {
         let origin = self.origin.as_deref().unwrap_or("Unavailable");
         std::iter::once(format!("Origin: {origin}"))
-            .chain(self.cargo.as_ref().map(|cargo| format!("Cargo: {cargo}")))
+            .chain(self.shipment_lines())
             .chain(
                 self.passengers
                     .as_ref()
                     .map(|(count, _)| format!("Passengers: {count}")),
             )
+    }
+
+    fn shipment_lines(&self) -> impl Iterator<Item = String> + '_ {
+        self.cargo
+            .as_ref()
+            .map(|cargo| {
+                let label = if self.reserved_cargo {
+                    "Reserved cargo"
+                } else {
+                    "Cargo"
+                };
+                format!("{label}: {cargo}")
+            })
+            .into_iter()
+            .chain(self.buyer_line.iter().cloned())
     }
 }
 
@@ -171,6 +189,7 @@ pub(crate) fn vehicle_tooltip(
     let view = vehicle_trip_view(uiworld, sim, id, false)?;
     let mut lines = view.summary_lines();
     lines.insert(0, view.kind.into());
+    lines.extend(view.shipment_lines());
     Some(lines.join("\n"))
 }
 
@@ -338,6 +357,8 @@ fn road_trip(
         remaining: None,
         origin: None,
         cargo: None,
+        reserved_cargo: false,
+        buyer_line: None,
         passengers: None,
     };
     match vehicle.vehicle.kind {
@@ -407,7 +428,16 @@ fn truck_trip(
                     .and_then(|driver| driver.router.trip_origin())
                     .and_then(|origin| destination_label(map, origin));
             }
-            view.cargo = Some(cargo_label(leg.items, 0));
+        }
+        let trace = sim.read::<FreightTrace>();
+        if let Some((buyer, fragments)) = trace.truck_shipment(&cargo, id) {
+            view.cargo = Some(traced_cargo_label(fragments));
+            view.buyer_line = buyer_line(map, [buyer.building]);
+        } else if !leg.returning && !leg.items.is_empty() {
+            view.cargo = Some(cargo_label(leg.items.iter().copied(), 0));
+            view.buyer_line = buyer_line(map, [leg.destination]);
+        } else if details {
+            view.cargo = Some("Empty".into());
         }
         return;
     }
@@ -498,12 +528,9 @@ fn set_freight_purpose(view: &mut TripView, returning: bool) {
     );
 }
 
-fn cargo_label(items: &[ItemQuantity], unspecified_units: u32) -> String {
-    if items.is_empty() && unspecified_units == 0 {
-        return "Empty".into();
-    }
+fn cargo_label(items: impl IntoIterator<Item = ItemQuantity>, unspecified_units: u32) -> String {
     let mut lines: Vec<_> = items
-        .iter()
+        .into_iter()
         .map(|line| {
             let name = try_prototype(line.item).map_or("Unknown item", |item| &item.label);
             format!("{name} × {}", line.units)
@@ -512,7 +539,47 @@ fn cargo_label(items: &[ItemQuantity], unspecified_units: u32) -> String {
     if unspecified_units != 0 {
         lines.push(format!("Unspecified goods × {unspecified_units}"));
     }
-    lines.join(", ")
+    if lines.is_empty() {
+        "Empty".into()
+    } else {
+        lines.join(", ")
+    }
+}
+
+fn traced_cargo_label(fragments: &[FreightFragment]) -> String {
+    let mut units: BTreeMap<ItemID, u32> = BTreeMap::new();
+    let mut unspecified_units = 0;
+    for fragment in fragments {
+        if let Some(item) = fragment.item {
+            *units.entry(item).or_default() += fragment.units;
+        } else {
+            unspecified_units += fragment.units;
+        }
+    }
+    cargo_label(
+        units
+            .into_iter()
+            .map(|(item, units)| ItemQuantity { item, units }),
+        unspecified_units,
+    )
+}
+
+fn buyer_line(map: &Map, buyers: impl IntoIterator<Item = BuildingID>) -> Option<String> {
+    let buyers: BTreeSet<_> = buyers.into_iter().collect();
+    let mut names = buyers
+        .into_iter()
+        .filter_map(|buyer| building_place(map, buyer));
+    let first = names.next()?;
+    let Some(second) = names.next() else {
+        return Some(format!("Buyer: {first}"));
+    };
+    let mut labels = vec![first, second];
+    labels.extend(names.by_ref().take(1));
+    let more = names.count();
+    if more > 0 {
+        labels.push(format!("+{more} more"));
+    }
+    Some(format!("Buyers: {}", labels.join(", ")))
 }
 
 fn bus_trip(sim: &Simulation, map: &Map, id: VehicleID, details: bool, view: &mut TripView) {
@@ -575,6 +642,8 @@ fn rail_trip(sim: &Simulation, map: &Map, id: TrainID, details: bool) -> Option<
             .iter()
             .find_map(|&(train, state)| (train == id).then_some((&station.f, state)))
     });
+    let trace = sim.read::<FreightTrace>();
+    let shipment = trace.rail_shipment(id);
     let external = map.external_train_station();
     let (operator, origin, destination) = match assignment {
         Some((station, FreightTrainState::Arriving)) => {
@@ -600,6 +669,17 @@ fn rail_trip(sim: &Simulation, map: &Map, id: TrainID, details: bool) -> Option<
     };
 
     let rail_trip = assignment.and_then(|(station, _)| station.rail_trip(id));
+    let fragments = shipment.as_ref().map(|shipment| shipment.fragments);
+    let cargo = if let Some(fragments) = fragments {
+        (details || !fragments.is_empty()).then(|| traced_cargo_label(fragments))
+    } else if let Some(load) = rail_trip.and_then(|trip| trip.exports.as_ref()) {
+        Some(cargo_label(
+            load.items.iter().copied(),
+            load.unspecified_units,
+        ))
+    } else {
+        details.then(|| "Manifest unavailable".into())
+    };
     Some(TripView {
         kind: "Train",
         operator: operator
@@ -607,21 +687,34 @@ fn rail_trip(sim: &Simulation, map: &Map, id: TrainID, details: bool) -> Option<
             .map(|name| format!("Operator: {name}")),
         operator_link: None,
         purpose: Some("Rail freight".into()),
-        destination: destination
+        destination: shipment
+            .as_ref()
+            .map(|shipment| shipment.destination)
+            .or(destination)
             .and_then(|id| building_place(map, id))
             .or_else(|| itinerary_destination(map, &train.it, LaneKind::Rail)),
         state,
         remaining: None,
-        origin: origin.and_then(|id| building_place(map, id)).or_else(|| {
-            rail_trip.map(|trip| position_label(map, trip.dispatch_position, LaneKind::Rail))
-        }),
-        cargo: details.then(|| {
-            rail_trip
-                .and_then(|trip| trip.exports.as_ref())
-                .map_or_else(
-                    || "Manifest unavailable".into(),
-                    |load| cargo_label(&load.items, load.unspecified_units),
-                )
+        origin: origin
+            .and_then(|id| building_place(map, id))
+            .or_else(|| {
+                rail_trip.map(|trip| position_label(map, trip.dispatch_position, LaneKind::Rail))
+            })
+            .or_else(|| {
+                shipment
+                    .as_ref()
+                    .filter(|shipment| shipment.destination != shipment.outside_gate)
+                    .and_then(|shipment| building_place(map, shipment.outside_gate))
+            }),
+        cargo,
+        reserved_cargo: shipment.is_some_and(|shipment| shipment.reserved),
+        buyer_line: fragments.and_then(|fragments| {
+            buyer_line(
+                map,
+                fragments
+                    .iter()
+                    .filter_map(|fragment| fragment.ordered_for.map(|buyer| buyer.building)),
+            )
         }),
         passengers: None,
     })
@@ -894,6 +987,140 @@ mod tests {
         assert!(tooltip.contains("Destination: House"), "{tooltip}");
         assert!(inspector.contains("Origin: House"), "{inspector}");
         assert!(inspector.contains("Cargo: Unavailable"), "{inspector}");
+    }
+
+    #[test]
+    fn vehicle_destination_shipment_follows_import_from_train_to_truck() {
+        use geom::{Vec2, OBB};
+        use prototypes::{BuildingGen, FreightStationPrototypeID, GoodsCompanyID, RollingStockID};
+        use simulation::economy::cargo::{Endpoint, FreightStage};
+        use simulation::economy::Market;
+        use simulation::map::{LanePatternBuilder, MapProject, RailMarketSite};
+        use simulation::map_dynamic::BuildingInfos;
+        use simulation::souls::freight_station::{freight_station_soul, train_stop};
+        use simulation::souls::goods_company::company_soul;
+        use simulation::world_command::{CommandOutcomes, WorldCommand};
+        use simulation::{AuthoredTownOptions, SoulID};
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let mut sim = Simulation::new_authored_town(AuthoredTownOptions::default()).unwrap();
+        let connection = |y, rail| WorldCommand::MapMakeConnection {
+            from: MapProject::ground(vec3(100.0, y, 10.0)),
+            to: MapProject::ground(vec3(1000.0, y, 10.0)),
+            inter: None,
+            pat: LanePatternBuilder::new().rail(rail).build(),
+        };
+        sim.apply_commands([&connection(625.0, false), &connection(700.0, true)]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0, 1]);
+        let (road, lane, gate, platform, direction) = {
+            let map = sim.map();
+            let road = map
+                .lanes()
+                .values()
+                .find(|lane| lane.kind == LaneKind::Driving)
+                .unwrap()
+                .parent;
+            let lane = map
+                .lanes()
+                .values()
+                .find(|lane| {
+                    lane.kind == LaneKind::Rail && lane.points.first().x < lane.points.last().x
+                })
+                .unwrap();
+            let (gate, direction) = lane.points.point_dir_along(300.0);
+            (
+                road,
+                lane.id,
+                gate,
+                lane.points.point_along(600.0),
+                direction,
+            )
+        };
+        let mut build = |centre, direction, kind| {
+            let building = sim
+                .write::<Map>()
+                .build_special_building(
+                    &OBB::new(centre, direction, 12.0, 12.0),
+                    kind,
+                    BuildingGen::CenteredDoor {
+                        vertical_factor: 1.0,
+                    },
+                    None,
+                    Some(road),
+                )
+                .unwrap();
+            sim.write::<BuildingInfos>().insert(building);
+            building
+        };
+        let station_proto = FreightStationPrototypeID::new("freight-station");
+        let station_building = build(
+            (platform - direction * 75.0 + direction.perp_up() * 40.0).xy(),
+            direction.xy(),
+            BuildingKind::RailFreightStation(station_proto),
+        );
+        let buyer_proto = GoodsCompanyID::new("commercial-l1");
+        let buyer_pos = vec2(350.0, 660.0);
+        let buyer_building = build(buyer_pos, Vec2::X, BuildingKind::GoodsCompany(buyer_proto));
+        let station = freight_station_soul(&mut sim, station_building, station_proto).unwrap();
+        let buyer = company_soul(&mut sim, buyer_building, buyer_proto).unwrap();
+        let platform_stop = train_stop(&sim.get(station).unwrap().trans);
+        sim.place_authored_rail_market(RailMarketSite {
+            footprint: OBB::new(gate.xy(), direction.xy(), 100.0, 24.0),
+            service_lane: lane,
+            service_offset: 300.0,
+            platform_stop,
+            consist_length_m: 100.0,
+        })
+        .unwrap();
+        sim.apply_commands([&WorldCommand::SpawnTrain {
+            wagons: vec![RollingStockID::new("locomotive")],
+            lane,
+            dist: 300.0,
+        }]);
+        assert_eq!(sim.read::<CommandOutcomes>().accepted, [0]);
+        let train = sim.world().trains.keys().next().unwrap();
+        let goods = ItemID::new("goods");
+        sim.write::<Market>().buy(buyer, buyer_pos, goods, 2);
+        let terminal = Endpoint {
+            soul: SoulID::FreightStation(station),
+            building: station_building,
+        };
+        let mut schedule = Simulation::schedule();
+        let ui = UiWorld::with_defaults();
+        let mut train_tooltip = None;
+        let mut truck_tooltip = None;
+        for _ in 0..6000 {
+            sim.tick(&mut schedule, &[]);
+            let trace = sim.read::<FreightTrace>();
+            let page = trace.terminal_view(terminal);
+            let Some(record) = page.rows.first() else {
+                continue;
+            };
+            match record.stage {
+                FreightStage::InboundRail if train_tooltip.is_none() => {
+                    train_tooltip = vehicle_tooltip(&ui, &sim, train.into())
+                        .map(|text| (text, record.fragment.units));
+                }
+                FreightStage::OutboundTruck => {
+                    assert_eq!(record.receiver.unwrap().building, buyer_building);
+                    truck_tooltip = vehicle_tooltip(&ui, &sim, record.truck.unwrap().into())
+                        .map(|text| (text, record.fragment.units));
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let buyer = format!("Buyer: {}", buyer_proto.prototype().label);
+        let tooltips = [
+            train_tooltip.expect("fixture should dispatch an inbound train"),
+            truck_tooltip.expect("fixture should dispatch a station truck"),
+        ];
+        for (text, units) in tooltips {
+            let cargo = format!("Cargo: {} × {units}", goods.prototype().label);
+            assert!(text.lines().any(|line| line == cargo), "{text}");
+            assert!(text.contains(&buyer), "{text}");
+        }
     }
 
     #[test]

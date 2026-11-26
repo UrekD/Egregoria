@@ -59,7 +59,7 @@ pub use terminal::{DepotRestock, DepotRestockView, FreightTerminalPolicy, Termin
 pub(crate) use trace::{CallManifest, FreightSnapshotTail, RailAnchor, RailLeg};
 pub use trace::{
     DemandKey, FreightCallKey, FreightCursor, FreightFailure, FreightFragment, FreightPage,
-    FreightRecord, FreightStage, FreightTrace, StaleFreightCursor,
+    FreightRecord, FreightStage, FreightTrace, RailShipment, StaleFreightCursor,
 };
 
 // Matching runs on game-minute boundaries, where the retry windows land (two real seconds).

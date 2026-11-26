@@ -340,6 +340,14 @@ pub struct FreightFragment {
     pub road_load: Option<LoadId>,
 }
 
+/// The current leg and shipment of an assigned freight train.
+pub struct RailShipment<'a> {
+    pub outside_gate: BuildingID,
+    pub destination: BuildingID,
+    pub fragments: &'a [FreightFragment],
+    pub reserved: bool,
+}
+
 impl FreightFragment {
     fn order_key(&self) -> Option<ImportOrderKey> {
         Some(ImportOrderKey {
@@ -1106,6 +1114,37 @@ impl FreightTrace {
 
     pub fn train_dispatch_held(&self, train: TrainID) -> bool {
         self.calls.get(&train).is_some_and(|call| self.held(call))
+    }
+
+    pub fn rail_shipment(&self, train: TrainID) -> Option<RailShipment<'_>> {
+        let call = self.calls.get(&train)?;
+        let outside_gate = call.key.outside_gate;
+        Some(RailShipment {
+            outside_gate,
+            destination: if call.leg.inbound() {
+                call.key.terminal.building
+            } else {
+                outside_gate
+            },
+            fragments: if call.exports_loaded {
+                &call.exports
+            } else {
+                &call.imports
+            },
+            reserved: !call.exports_loaded && !call.departed && !call.imports.is_empty(),
+        })
+    }
+
+    /// Use the current receiver because pooled imports can go to a different
+    /// buyer than the one that originally ordered the rail shipment.
+    pub fn truck_shipment(
+        &self,
+        cargo: &CargoBook,
+        truck: VehicleID,
+    ) -> Option<(Endpoint, &[FreightFragment])> {
+        let manifest = self.trucks.get(&truck)?;
+        let trip = cargo.station_trucks.get(&truck)?.trip.as_ref()?;
+        (!trip.returning).then_some((trip.buyer, &manifest.fragments))
     }
 
     pub(crate) fn may_move(&self, train: TrainID) -> bool {
