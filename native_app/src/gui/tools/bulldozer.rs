@@ -378,7 +378,7 @@ pub fn bulldozer(sim: &Simulation, uiworld: &UiWorld) {
                 .color(simulation::colors().gui_disabled);
         }
     } else {
-        let summary = preview.draw(&map, &mut draw);
+        let summary = preview.draw(sim, &map, &mut draw);
         let tooltip = &mut *uiworld.write::<ErrorTooltip>();
         tooltip.detail = Some(summary);
         tooltip.isworld = true;
@@ -391,6 +391,7 @@ struct DemolitionPreview {
     junctions: BTreeSet<IntersectionID>,
     buildings: BTreeSet<BuildingID>,
     cost: Money,
+    road_edits: Vec<ProjectKind>,
 }
 
 impl DemolitionPreview {
@@ -406,6 +407,13 @@ impl DemolitionPreview {
             _ => false,
         };
         if added {
+            match *command {
+                WorldCommand::MapRemoveRoad(road) => self.road_edits.push(ProjectKind::Road(road)),
+                WorldCommand::MapRemoveIntersection(junction) => {
+                    self.road_edits.push(ProjectKind::Intersection(junction));
+                }
+                _ => {}
+            }
             self.cost = Money::new_inner(self.cost.inner().saturating_add(cost.inner()));
         }
     }
@@ -414,7 +422,7 @@ impl DemolitionPreview {
         self.roads.is_empty() && self.junctions.is_empty() && self.buildings.is_empty()
     }
 
-    fn draw(mut self, map: &Map, draw: &mut ImmediateDraw) -> String {
+    fn draw(mut self, sim: &Simulation, map: &Map, draw: &mut ImmediateDraw) -> String {
         let red = LinearColor::from(simulation::colors().gui_danger);
         let mut disconnected = BTreeSet::new();
         for &id in &self.roads {
@@ -475,6 +483,14 @@ impl DemolitionPreview {
             draw_building(map, id, draw, LinearColor::new(1.0, 0.60, 0.25, 1.0));
         }
 
+        let stops =
+            simulation::map_dynamic::transit::stops_removed_by_demolition(sim, &self.road_edits);
+        if let Ok(stops) = &stops {
+            for &(_, pos) in stops {
+                draw.stroke_circle(pos.up(0.7), 3.0, 1.0).color(red);
+            }
+        }
+
         let mut labels = Vec::new();
         for (count, singular, plural) in [
             (self.roads.len(), "road", "roads"),
@@ -482,6 +498,7 @@ impl DemolitionPreview {
             (self.buildings.len(), "building", "buildings"),
             (lots, "lot", "lots"),
             (zones, "building zone", "building zones"),
+            (stops.as_ref().map_or(0, Vec::len), "bus stop", "bus stops"),
         ] {
             if count > 0 {
                 labels.push(format!(
@@ -501,6 +518,9 @@ impl DemolitionPreview {
             let n = disconnected.len();
             let noun = if n == 1 { "building" } else { "buildings" };
             summary.push_str(&format!("\nDisconnect {n} {noun} from roads"));
+        }
+        if stops.is_err() {
+            summary.push_str("\nBus stop effects unavailable");
         }
         summary
     }
@@ -861,6 +881,83 @@ mod tests {
         state.update_drag(false, false, b, &map, sample_target(&map), &mut commands);
         state.update_drag(true, true, b, &map, sample_target(&map), &mut commands);
         assert_eq!(commands.as_ref().len(), 2);
+    }
+
+    #[test]
+    fn roadtools_bulldozer_previews_a_stop_that_loses_its_berth() {
+        use simulation::map::LaneKind;
+        use simulation::map_dynamic::transit::Transit;
+
+        scenarios::ensure_repo_root_cwd();
+        simulation::init::init();
+        let mut sim = Simulation::new_authored_flat(1, 0).unwrap();
+        let add_road = |sim: &mut Simulation, y| {
+            let mut map = sim.write::<Map>();
+            let (_, road) = map
+                .make_connection(
+                    MapProject::ground(geom::vec3(50.0, y, 0.0)),
+                    MapProject::ground(geom::vec3(250.0, y, 0.0)),
+                    None,
+                    &simulation::map::LanePatternBuilder::new().build(),
+                )
+                .unwrap();
+            let road = map.get(road).unwrap();
+            let &(lane, _) = road
+                .outgoing_lanes_from(road.src)
+                .iter()
+                .rfind(|(_, kind)| *kind == LaneKind::Driving)
+                .unwrap();
+            let points = &map.get(lane).unwrap().points;
+            let (pos, dir) = points.point_dir_along(points.length() * 0.5);
+            (
+                road.id,
+                road.points().point_along(road.length() * 0.5),
+                pos,
+                dir.xy(),
+            )
+        };
+        let (road, cursor, pos, dir) = add_road(&mut sim, 100.0);
+        let (_, _, other_pos, other_dir) = add_road(&mut sim, 150.0);
+        sim.apply_commands([
+            &WorldCommand::TransitAddStop { pos, dir },
+            &WorldCommand::TransitAddStop {
+                pos: other_pos,
+                dir: other_dir,
+            },
+        ]);
+        assert_eq!(sim.read::<Transit>().stops.len(), 2);
+
+        crate::init::init();
+        let ui = UiWorld::with_defaults();
+        *ui.write::<Settings>() = Settings::default();
+        *ui.write::<Tool>() = Tool::Bulldozer;
+        {
+            let mut input = ui.write::<InputMap>();
+            input.screen = cursor.xy();
+            input.unprojected = Some(cursor);
+        }
+        let assert_preview = |sim: &Simulation| {
+            bulldozer(sim, &ui);
+            let summary = ui
+                .read::<crate::gui::ErrorTooltip>()
+                .detail
+                .clone()
+                .unwrap();
+            assert!(summary.contains("1 bus stop"), "{summary}");
+            assert!(ui.commands().as_ref().is_empty());
+            assert_eq!(sim.read::<Transit>().stops.len(), 2);
+        };
+        assert_preview(&sim);
+        let snapshot = sim
+            .encode_slot(simulation::SnapshotRevision::new(1))
+            .unwrap()
+            .into_snapshot_bytes();
+        let mut sim = Simulation::load_compressed_snapshot(&snapshot, 64 * 1024 * 1024).unwrap();
+        assert_preview(&sim);
+        sim.apply_commands([&WorldCommand::MapRemoveRoad(road)]);
+        let transit = sim.read::<Transit>();
+        assert_eq!(transit.stops.len(), 1);
+        assert_eq!(transit.stops.values().next().unwrap().pos, other_pos);
     }
 
     #[test]

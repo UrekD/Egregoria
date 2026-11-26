@@ -154,6 +154,21 @@ impl JunctionAdmission {
         self.crossings.len()
     }
 
+    pub(crate) fn restore_migrated_crossing(
+        &mut self,
+        map: &Map,
+        owner: EntryOwner,
+        traversal: Option<&Traversable>,
+    ) {
+        // An actor on the outgoing lane can still occupy its saved crossing.
+        // Snapshot validation checks that claim against the relocated actor.
+        if let Some(crossing) = traversal.copied().and_then(Crossing::from_traversal) {
+            if configured(map, crossing.turn.parent).is_some() && map.allows_turn(crossing.turn) {
+                self.crossings.insert(owner, crossing);
+            }
+        }
+    }
+
     pub(crate) fn validate_loaded(
         &mut self,
         map: &Map,
@@ -180,6 +195,9 @@ impl JunctionAdmission {
         self.waiting.retain(|&owner, clock| {
             if self.crossings.contains_key(&owner)
                 || !valid_crossing(clock.crossing)
+                || map
+                    .migrated_roundabout_paths
+                    .contains_key(&TraverseKind::Turn(clock.crossing.turn))
                 || tick.saturating_sub(clock.seen) > 1
             {
                 return false;

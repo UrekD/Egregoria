@@ -1941,6 +1941,60 @@ pub(crate) fn prepare_direct_road(
     }
 }
 
+/// Preview only roads removed or reclipped by accepted demolition commands.
+pub(crate) fn demolition_road_clips(
+    map: &Map,
+    edits: &[ProjectKind],
+    work: &mut CrossingWork<'_>,
+) -> Result<BTreeMap<RoadID, Option<PolyLine3>>, ConnectionError> {
+    let mut graph = LocalTopology::new(map, work);
+    graph.work.charge(edits.len())?;
+    for &edit in edits {
+        match edit {
+            ProjectKind::Road(id) => {
+                let road = map.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
+                let src = graph.load_junction(road.src)?;
+                let dst = graph.load_junction(road.dst)?;
+                let id = graph.road_keys[&id];
+                if graph.roads.contains_key(id) {
+                    graph.remove_road(id);
+                    graph.invalidate(src)?;
+                    graph.invalidate(dst)?;
+                }
+            }
+            ProjectKind::Intersection(id) => {
+                if map.get(id).is_none() {
+                    return Err(ConnectionError::InvalidEndpoint);
+                }
+                let junction = graph.load_junction(id)?;
+                for id in graph.junctions[junction].roads.clone() {
+                    let other = graph.roads[id].other_end(junction).unwrap();
+                    graph.ensure_arms(other)?;
+                    graph.remove_road(id);
+                    graph.invalidate(other)?;
+                    // Junction removal also invalidates the surviving end after each arm.
+                    graph.invalidate(other)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut clips = BTreeMap::new();
+    for (&local, &live) in &graph.live_roads {
+        match graph.roads.get(local) {
+            Some(road) if graph.changed_roads.contains(&local) => {
+                graph.work.charge(road.interfaced_points().len())?;
+                clips.insert(live, Some(road.interfaced_points().clone()));
+            }
+            None => {
+                clips.insert(live, None);
+            }
+            _ => {}
+        }
+    }
+    Ok(clips)
+}
+
 pub(crate) fn prepare_road_removal(
     map: &Map,
     id: RoadID,

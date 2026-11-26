@@ -2068,6 +2068,7 @@ impl SimulationDeser {
         sim.map()
             .validate_junction_policy_land()
             .map_err(|reason| corrupt(format!("Invalid junction policy land effect: {reason:?}")))?;
+        crate::map_dynamic::reconcile_roundabout_snapshot(&mut sim);
         let elapsed = transit::elapsed_ticks(&sim.resources).0;
         sim.write::<crate::transportation::junction_admission::JunctionAdmission>()
             .validate_loaded(
@@ -2077,6 +2078,8 @@ impl SimulationDeser {
                 elapsed,
             )
             .map_err(|reason| corrupt(reason.to_owned()))?;
+        sim.map_mut().migrated_roundabout_paths.clear();
+        sim.write::<transit::Transit>().rebuild_berth_index();
         if sim
             .map()
             .lane_scoring_pilot()

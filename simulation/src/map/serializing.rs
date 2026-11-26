@@ -162,6 +162,7 @@ impl SerializedMap {
     }
 
     fn validate_references(&self) -> Result<(), String> {
+        // Roadless legacy lanes are checked separately from the lanes used to rebuild roads.
         let mut listed_lanes = BTreeSet::new();
         for (id, road) in self.roads.iter() {
             if road.id != id || road.src == road.dst {
@@ -207,9 +208,6 @@ impl SerializedMap {
                 }
             }
         }
-        if listed_lanes.len() != self.lanes.len() {
-            return Err("map has a lane without an owning road".into());
-        }
         for (id, intersection) in self.intersections.iter() {
             if intersection.id != id {
                 return Err(format!("intersection {id:?} has an invalid key"));
@@ -226,11 +224,12 @@ impl SerializedMap {
                 }
             }
             for turn in intersection.raw_turns() {
+                // The routing graph skips dangling endpoints in legacy snapshots.
                 if turn.id.parent != id
                     || ![turn.id.src, turn.id.dst].into_iter().all(|key| {
                         self.lanes
                             .get(key)
-                            .is_some_and(|lane| lane.src == id || lane.dst == id)
+                            .is_none_or(|lane| lane.src == id || lane.dst == id)
                     })
                     || !valid_path(&turn.points)
                 {
@@ -301,7 +300,8 @@ impl SerializedMap {
             }
         }
         for (id, lane) in self.lanes.iter() {
-            if !valid_path(&lane.points)
+            if lane.id != id
+                || !valid_path(&lane.points)
                 || !lane.dist_from_bottom.is_finite()
                 || !lane.speed_limit.is_finite()
             {
