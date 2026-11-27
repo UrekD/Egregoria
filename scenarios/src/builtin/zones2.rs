@@ -976,7 +976,7 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
     let home = {
         let infos = ctx.sim.read::<BuildingInfos>();
         let map = ctx.sim.map();
-        let mut workers_by_home = BTreeMap::<_, (usize, usize)>::new();
+        let mut workers_by_home = BTreeMap::<_, (usize, usize, BTreeSet<CompanyID>)>::new();
         let mut removable = BTreeMap::new();
         for seller in mixed_sellers(&ctx.sim) {
             let SoulID::GoodsCompany(company) = seller else {
@@ -999,24 +999,30 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
                     .residence_of(SoulID::Human(worker))
                     .filter(|&home| map.get(home).is_some_and(|site| !site.is_mixed_use()));
                 if let Some(home) = home {
-                    let (frontage, total) = workers_by_home.entry(home).or_default();
-                    *frontage += usize::from(removable_frontage);
+                    let (frontage, total, employers) = workers_by_home.entry(home).or_default();
+                    if removable_frontage {
+                        *frontage += 1;
+                        employers.insert(company);
+                    }
                     *total += 1;
                 }
             }
         }
         workers_by_home
             .into_iter()
-            .filter(|&(home, _)| {
-                map.lot_origin(home).is_some()
-                    && WorldCommand::MapRemoveBuilding(home)
-                    .validate_and_price(&ctx.sim)
-                    .is_ok()
+            .filter(|(home, _)| {
+                map.lot_origin(*home).is_some()
+                    && WorldCommand::MapRemoveBuilding(*home)
+                        .validate_and_price(&ctx.sim)
+                        .is_ok()
             })
-            .min_by_key(|&(home, workers)| (std::cmp::Reverse(workers), home))
-            .map(|(home, _)| home)
+            .min_by_key(|&(home, (frontage, workers, _))| {
+                (std::cmp::Reverse((frontage, workers)), home)
+            })
     };
-    let Some(home) = home else { return Ok(false) };
+    let Some((home, (frontage, workers, employers))) = home else {
+        return Ok(false);
+    };
     let parcel = *ctx
         .sim
         .map()
@@ -1027,15 +1033,24 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
         return Ok(true);
     }
 
-    // Refill the cleared parcel via the checked housing flow. Its new residents
-    // submit ordinary job applications near the vacancy just advertised.
+    // Build a legal house near a vacancy so its residents can apply through
+    // the ordinary employment market.
     let lot = {
         let map = ctx.sim.map();
+        let near = employers
+            .iter()
+            .filter_map(|&employer| {
+                let company = ctx.sim.world().companies.get(employer)?;
+                let vacancies =
+                    (company.comp.max_workers as usize).saturating_sub(company.workers.0.len());
+                (vacancies != 0).then_some((std::cmp::Reverse(vacancies), company.comp.building))
+            })
+            .min()
+            .and_then(|(_, id)| map.get(id))
+            .map_or(parcel.shape.center(), |site| site.door_pos.xy());
         let mut lots: Vec<_> = map.lots().values().collect();
         lots.sort_unstable_by(|a, b| {
-            let distance = |lot: &simulation::map::Lot| {
-                lot.shape.center().distance2(parcel.shape.center())
-            };
+            let distance = |lot: &simulation::map::Lot| lot.shape.center().distance2(near);
             distance(a).total_cmp(&distance(b)).then(a.id.cmp(&b.id))
         });
         lots.into_iter()
@@ -1047,6 +1062,9 @@ fn stage_teardown_hires(ctx: &mut ScenarioCtx) -> Result<bool, String> {
             .ok_or("no legal replacement lot near the demolished worker home")?
             .id
     };
+    println!(
+        "staged replacement home from {workers} Mixed Use workers ({frontage} on removable frontage)"
+    );
     run_teardown_batch(ctx, &[WorldCommand::MapBuildHouse(lot)], 1)?;
     Ok(true)
 }
