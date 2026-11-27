@@ -245,14 +245,31 @@ fn render_house(uiworld: &UiWorld, sim: &Simulation, b: &Building) {
     let scale = sim.population_scale();
     let population = scale.persons(residents.len());
     if !b.is_mixed_use() {
+        let floors = b
+            .development()
+            .map(|site| match site.floors {
+                1 => " · 1 floor".to_owned(),
+                floors => format!(" · {floors} floors"),
+            })
+            .unwrap_or_default();
         label(format!(
-            "Residential · {} density · Level {level}",
+            "Residential · {} density · Level {level}{floors}",
             density_name(density)
         ));
     }
-    if let Some(capacity) = capacity {
-        let capacity = scale.persons(capacity as usize);
-        label(format!("Residents  {population} / {capacity}"));
+    if let Some(slots) = capacity {
+        label(format!(
+            "Residents  {population} / {}",
+            scale.persons(slots as usize)
+        ));
+        if scale == PopulationScale::REALISTIC {
+            label(format!("Population scale · {scale}"));
+        } else {
+            label(format!(
+                "Simulated residents  {} / {slots} · {scale}",
+                residents.len()
+            ));
+        }
     }
     if !residents.is_empty() {
         label(format!(
@@ -816,18 +833,98 @@ mod tests {
     use prototypes::{TICKS_PER_HOUR, TICKS_PER_MINUTE};
     use yakui::widgets::TextWidget;
 
+    fn collect_labels(ui: &yakui::Yakui, id: yakui::WidgetId, labels: &mut Vec<String>) {
+        let node = ui.dom().get(id).unwrap();
+        if let Some(text) = node.widget.downcast_ref::<TextWidget>() {
+            labels.push(format!("{text:?}"));
+        }
+        for &child in &node.children {
+            collect_labels(ui, child, labels);
+        }
+    }
+
     #[test]
-    fn population_scale_company_storage_displays_job_vacancies_as_people() {
-        fn collect_labels(ui: &yakui::Yakui, id: yakui::WidgetId, labels: &mut Vec<String>) {
-            let node = ui.dom().get(id).unwrap();
-            if let Some(text) = node.widget.downcast_ref::<TextWidget>() {
-                labels.push(format!("{text:?}"));
-            }
-            for &child in &node.children {
-                collect_labels(ui, child, labels);
+    fn population_scale_residence_displays_people_and_explains_agent_slots() {
+        use geom::vec3;
+        use simulation::economy::progression::ProgressionMode;
+        use simulation::map::{LanePatternBuilder, LotLayout, MapProject, ZoneCell, ZoneKind};
+        use simulation::souls::human::spawn_human;
+        use simulation::{MapPreset, NewGameOptions};
+
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        for persons_per_agent in [1, 8] {
+            let mut sim = Simulation::new_game_with_replay(&NewGameOptions {
+                preset: MapPreset::Flat,
+                terrain_chunks: NewGameOptions::MIN_TERRAIN_CHUNKS,
+                lot_layout: LotLayout::Uniform,
+                progression: ProgressionMode::FreeBuild,
+                persons_per_agent,
+                ..NewGameOptions::default()
+            })
+            .unwrap();
+            sim.apply_commands([&WorldCommand::MapMakeConnection {
+                from: MapProject::ground(vec3(100.0, 260.0, 0.0)),
+                to: MapProject::ground(vec3(680.0, 260.0, 0.0)),
+                inter: None,
+                pat: LanePatternBuilder::new().build(),
+            }]);
+            let lots: Vec<_> = sim.map().lots().keys().collect();
+            for (kind, density) in [
+                (ZoneKind::Residential, Density::Low),
+                (ZoneKind::Residential, Density::High),
+                (ZoneKind::MixedUse, Density::High),
+            ] {
+                let zone = ZoneCell { kind, density };
+                let home = lots
+                    .iter()
+                    .find_map(|&lot| sim.place_zoned_growable(lot, zone).ok())
+                    .expect("residence fits the road frontage");
+                spawn_human(&mut sim, home.building).unwrap();
+                let uiworld = UiWorld::with_defaults();
+                let mut ui = yakui::Yakui::new();
+                ui.set_surface_size(Vec2::splat(500.0));
+                ui.start();
+                let map = sim.map();
+                let building = map.buildings().get(home.building).unwrap();
+                render_house(&uiworld, &sim, building);
+                ui.finish();
+                let mut labels = Vec::new();
+                collect_labels(&ui, ui.dom().root(), &mut labels);
+
+                let slots = home.housing_slots;
+                let people = slots * u32::from(persons_per_agent);
+                let has_label = |phrase: &str| labels.iter().any(|text| text.contains(phrase));
+                assert!(
+                    has_label(&format!("\"Residents  {persons_per_agent} / {people}\"")),
+                    "{labels:?}"
+                );
+                let detail = if persons_per_agent == 1 {
+                    "Population scale · Realistic (1:1)".into()
+                } else {
+                    format!("Simulated residents  1 / {slots} · Scaled (1:8)")
+                };
+                assert!(has_label(&detail), "{labels:?}");
+                if kind == ZoneKind::Residential {
+                    let (density, floors) = if density == Density::Low {
+                        ("Low", "1 floor".into())
+                    } else {
+                        let floors = building.development().unwrap().floors;
+                        ("High", format!("{floors} floors"))
+                    };
+                    assert!(
+                        has_label(&format!(
+                            "\"Residential · {density} density · Level 1 · {floors}\""
+                        )),
+                        "{labels:?}"
+                    );
+                }
             }
         }
+    }
 
+    #[test]
+    fn population_scale_company_storage_displays_job_vacancies_as_people() {
         scenarios::ensure_repo_root_cwd();
         crate::init::init();
         let sim = Simulation::new(false);
