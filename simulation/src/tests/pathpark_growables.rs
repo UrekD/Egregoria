@@ -475,6 +475,64 @@ fn pathpark_property_departure_uses_shared_garage_when_curbs_are_full() {
 }
 
 #[test]
+fn pathpark_property_departure_uses_distant_street_bays_when_nearby_supply_is_closed() {
+    use crate::map_dynamic::{Destination, ParkingManagement, RoutingStep, NEAR_PARKING_RADIUS};
+    use crate::transportation::{Location, VehicleState};
+    use crate::world_command::WorldCommand;
+
+    let (mut ctx, home, human, car, garage) = property_trip();
+    let door = ctx.g.map().get(garage).unwrap().door_pos;
+    ctx.g
+        .apply_commands([&WorldCommand::SetBuildingParkingOpen {
+            building: garage,
+            open: false,
+        }]);
+    {
+        let map = ctx.g.map();
+        let mut parking = ctx.g.write::<ParkingManagement>();
+        for (spot, data) in map.parking.all_spots() {
+            if data.trans.pos.distance(door) <= NEAR_PARKING_RADIUS {
+                parking.mask(spot);
+            }
+        }
+        assert!(!parking.property_curb_candidates(&map, door).1.is_empty());
+    }
+    ctx.g.world.edit_human(human, |h| {
+        h.router.go_to(Destination::Outside(door));
+    });
+
+    let parked = (0..7_000).any(|_| {
+        ctx.g.world.edit_human(human, |h| h.decision.wait = u8::MAX);
+        ctx.tick_fast();
+        let driver = &ctx.g.world.humans[human];
+        let vehicle = &ctx.g.world.vehicles[car];
+        let walking_to_destination = matches!(
+            driver.router.cur_step(),
+            Some(RoutingStep::WalkProperty(target, _)) if *target == door
+        );
+        driver.location == Location::Outside
+            && walking_to_destination
+            && matches!(vehicle.vehicle.state, VehicleState::Parked(_))
+            && vehicle.trans.pos.distance(door) > NEAR_PARKING_RADIUS
+    });
+    let driver = &ctx.g.world.humans[human];
+    let vehicle = &ctx.g.world.vehicles[car];
+    assert!(
+        parked,
+        "driver at {:?} ({:?}) with step {:?}, error {:?}; car at {:?} with state {:?}",
+        driver.trans.pos,
+        driver.location,
+        driver.router.cur_step(),
+        driver.router.last_error,
+        vehicle.trans.pos,
+        vehicle.vehicle.state,
+    );
+    assert_eq!(ctx.g.world.humans[human].router.personal_car, Some(car));
+    assert_eq!(ctx.g.building_parking(home).unwrap().occupied, 0);
+    assert_eq!(ctx.g.building_parking(garage).unwrap().occupied, 0);
+}
+
+#[test]
 fn pathpark_oversized_garage_batch_has_no_side_effects() {
     use crate::map::building_parking::GarageKind;
     use crate::world_command::{
