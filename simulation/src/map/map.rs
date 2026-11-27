@@ -1773,6 +1773,104 @@ impl Map {
         Ok((prepared, parking))
     }
 
+    pub(crate) fn prepare_surface_lot(
+        &self,
+        draft: super::building_parking::SurfaceLotDraft,
+        remaining: &mut usize,
+    ) -> Result<
+        (
+            PreparedSpecialBuilding,
+            super::building_parking::ParkingLayout,
+            u64,
+        ),
+        crate::world_command::Rejection,
+    > {
+        use super::building_parking::{
+            lot_footprint, prepare_surface_layout, LotFrame, MAX_WIDTH_BLOCKS,
+        };
+        use crate::world_command::Rejection;
+        use common::saveload::{Bincode, Encoder};
+        use geom::Shape;
+        let charge = |remaining: &mut usize, work| {
+            spend_water_work(remaining, work).map_err(|_| Rejection::WaterWorkLimit)
+        };
+        if !(2..=MAX_WIDTH_BLOCKS).contains(&draft.width_blocks) {
+            return Err(Rejection::InvalidBuilding);
+        }
+        let primary = draft
+            .mouths
+            .iter()
+            .flatten()
+            .next()
+            .ok_or(Rejection::InvalidBuilding)?
+            .at;
+        let road = self.get(primary.road).ok_or(Rejection::MissingReference)?;
+        let frame_road = match draft.frame {
+            LotFrame::Curb(anchor) => Some(anchor.road),
+            LotFrame::Ground { .. } => None,
+        };
+        let refs = draft
+            .mouths
+            .iter()
+            .flatten()
+            .map(|mouth| mouth.at.road)
+            .chain(frame_road)
+            .chain(draft.foot_gate.and_then(super::PathEndpoint::road));
+        for id in refs {
+            let data = self.get(id).ok_or(Rejection::MissingReference)?;
+            charge(remaining, 48 * data.points().len())?;
+        }
+        charge(remaining, 2_048 * usize::from(draft.width_blocks))?;
+        let pad = lot_footprint(self, draft.frame, draft.width_blocks)
+            .ok_or(Rejection::InvalidBuilding)?;
+        let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
+        for object in self.spatial_map.query(pad.shape.bbox(), filter) {
+            let work = match object {
+                ProjectKind::Road(id) => self.get(id).map_or(1, |road| road.points().len()),
+                ProjectKind::Intersection(id) => {
+                    self.get(id).map_or(1, |joint| 128 * joint.roads.len())
+                }
+                ProjectKind::Building(id) => {
+                    if self.get(id).is_some_and(|building| {
+                        matches!(building.kind, BuildingKind::ParkingLot { .. })
+                            && building.obb.corners == pad.shape.corners
+                    }) {
+                        return Err(Rejection::StaleRoadQuote);
+                    }
+                    2
+                }
+                _ => 1,
+            };
+            charge(remaining, work)?;
+        }
+        // Avoid treating contact at the curb seam as an overlap.
+        if super::special_placement::placement_overlap(self, road, pad.shape.expand(-0.025))
+            .is_some()
+        {
+            return Err(Rejection::BuildingOverlap);
+        }
+        let layout = prepare_surface_layout(self, draft, pad)?;
+        let mut prepared = self.prepare_special_building(
+            pad.shape,
+            BuildingKind::ParkingLot {
+                width_blocks: draft.width_blocks,
+            },
+            BuildingGen::NoWalkway {
+                door_pos: Vec2::ZERO,
+            },
+            None,
+            Some(primary.road),
+        )?;
+        prepared.building.set_lot_appearance(pad, layout.door());
+        let material = Bincode::encode(&layout).map_err(|_| Rejection::InvalidBuilding)?;
+        let quote = common::hash_u64((
+            material,
+            draft.cost().inner(),
+            self.environment.water_revision(),
+        ));
+        Ok((prepared, layout, quote))
+    }
+
     pub(crate) fn commit_special_building(
         &mut self,
         prepared: PreparedSpecialBuilding,

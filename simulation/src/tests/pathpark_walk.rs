@@ -461,3 +461,72 @@ fn saved_building_cannot_smuggle_a_path_attachment() {
     drop(map);
     assert!(Bincode::decode::<Simulation>(&Bincode::encode(&ctx.g).unwrap()).is_err());
 }
+
+#[test]
+fn pathpark_wave3_picks_a_side_builds_a_curve_and_continues_from_its_tip() {
+    use crate::map::ProjectKind;
+
+    let mut ctx = TestCtx::new();
+    ctx.build_roads(&[vec3(75., 100., 0.), vec3(450., 100., 0.)]);
+    let command = {
+        let map = ctx.g.map();
+        let road = map
+            .roads()
+            .values()
+            .find(|road| road.points().first().xy() == geom::vec2(75., 100.))
+            .unwrap();
+        let north = map
+            .pick_path_attachment(ProjectKind::Road(road.id), vec3(210., 108., 0.))
+            .unwrap();
+        let south = map
+            .pick_path_attachment(ProjectKind::Road(road.id), vec3(210., 92., 0.))
+            .unwrap();
+        assert!(
+            matches!((north, south), (PathEndpoint::Sidewalk(a), PathEndpoint::Sidewalk(b)) if a.side != b.side)
+        );
+        WorldCommand::MapMakeWalkingPath {
+            from: north,
+            to: map.pick_path_ground(25_000, 18_000).unwrap(),
+            control: Some([21_000, 16_000]),
+        }
+    };
+    assert!(command.validate_and_price(&ctx.g).is_ok());
+    ctx.g.apply_commands([&command]);
+    let path = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .walking_path(0)
+        .unwrap()
+        .unwrap();
+    let command = {
+        let map = ctx.g.map();
+        let road = map.get(path).unwrap();
+        let from = map
+            .pick_path_attachment(ProjectKind::Intersection(road.dst), road.points().last())
+            .unwrap();
+        assert!(matches!(from, PathEndpoint::PathEnd { .. }));
+        WorldCommand::MapMakeWalkingPath {
+            from,
+            to: map.pick_path_ground(32_000, 20_000).unwrap(),
+            control: None,
+        }
+    };
+    ctx.g.apply_commands([&command]);
+    let extension = ctx
+        .g
+        .read::<CommandOutcomes>()
+        .walking_path(0)
+        .unwrap()
+        .unwrap();
+    {
+        let map = ctx.g.map();
+        let path = map.get(path).unwrap();
+        assert!(path.is_walking_path());
+        assert!(path.points().len() > 2);
+        assert_eq!(path.dst, map.get(extension).unwrap().src);
+        assert!(map.get(path.dst).unwrap().turns().next().is_some());
+    }
+    ctx.g
+        .apply_commands([&WorldCommand::MapRemoveRoad(extension)]);
+    assert!(ctx.g.map().get(extension).is_none());
+}

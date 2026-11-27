@@ -187,13 +187,20 @@ mod pathpark {
             expected: RoadEditStamp,
         },
         Sidewalk(CurbAnchor),
+        PathEnd {
+            road: RoadID,
+            joint: IntersectionID,
+            expected: RoadEditStamp,
+        },
     }
 
     impl PathEndpoint {
-        pub(crate) fn road(self) -> Option<RoadID> {
+        pub fn road(self) -> Option<RoadID> {
             match self {
                 Self::Ground { .. } => None,
-                Self::Path { road, .. } | Self::Sidewalk(CurbAnchor { road, .. }) => Some(road),
+                Self::Path { road, .. }
+                | Self::PathEnd { road, .. }
+                | Self::Sidewalk(CurbAnchor { road, .. }) => Some(road),
             }
         }
     }
@@ -303,7 +310,77 @@ mod pathpark {
             None
         }
 
-        pub(crate) fn path_endpoint_position(&self, endpoint: PathEndpoint) -> Option<Vec3> {
+        pub fn pick_path_attachment(
+            &self,
+            kind: ProjectKind,
+            pointer: Vec3,
+        ) -> Option<PathEndpoint> {
+            match kind {
+                ProjectKind::Road(id) => {
+                    let road = self.get(id)?;
+                    let points = road.points();
+                    let (center, end) = points.project_segment_2d(pointer.xy());
+                    let start = end.checked_sub(1)?;
+                    let forward = (points[end] - points[start]).xy().try_normalize()?;
+                    let station = points
+                        .segments()
+                        .take(start)
+                        .map(|s| s.src.distance(s.dst))
+                        .sum::<f32>()
+                        + points[start].distance(center);
+                    let station = (station * 100.0).round() as u32;
+                    if road.is_walking_path() {
+                        self.pick_path_road(id, station).or_else(|| {
+                            let joint = if center.distance2(points.first())
+                                < center.distance2(points.last())
+                            {
+                                road.src
+                            } else {
+                                road.dst
+                            };
+                            self.pick_path_end(id, joint)
+                        })
+                    } else if road.allows_motor_access() {
+                        let side = if forward.perpendicular().dot(pointer.xy() - center.xy()) > 0.0
+                        {
+                            RoadSide::Right
+                        } else {
+                            RoadSide::Left
+                        };
+                        self.pick_path_sidewalk(id, side, station)
+                    } else {
+                        None
+                    }
+                }
+                ProjectKind::Intersection(joint) => {
+                    let id = self.get(joint)?.roads.first().copied()?;
+                    self.pick_path_end(id, joint)
+                }
+                _ => None,
+            }
+        }
+
+        fn pick_path_end(&self, road: RoadID, joint: IntersectionID) -> Option<PathEndpoint> {
+            let segment = self.get(road)?;
+            let end = self.get(joint)?;
+            if ![segment.src, segment.dst].contains(&joint)
+                || segment.elevated_span()
+                || !segment.is_walking_path()
+                || !end
+                    .roads
+                    .iter()
+                    .all(|&id| self.roads()[id].is_walking_path())
+            {
+                return None;
+            }
+            Some(PathEndpoint::PathEnd {
+                road,
+                joint,
+                expected: stamp(self, segment, &[]).ok()?,
+            })
+        }
+
+        pub fn path_endpoint_position(&self, endpoint: PathEndpoint) -> Option<Vec3> {
             Some(self.resolve_path_endpoint(endpoint).ok()?.pos)
         }
 
@@ -331,6 +408,16 @@ mod pathpark {
                     expected,
                 } => (road, station_cm, expected, None),
                 PathEndpoint::Sidewalk(at) => (at.road, at.station_cm, at.expected, Some(at.side)),
+                PathEndpoint::PathEnd { road, joint, .. } => {
+                    if self.pick_path_end(road, joint) != Some(endpoint) {
+                        return Err(ConnectionError::Stale);
+                    }
+                    return Ok(ConnectionEndpoint {
+                        pos: self.get(joint).ok_or(ConnectionError::Stale)?.pos,
+                        kind: ProjectKind::Intersection(joint),
+                        split_point: None,
+                    });
+                }
             };
             let road = self.get(id).ok_or(ConnectionError::Stale)?;
             let (mut point, segment) = self

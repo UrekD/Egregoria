@@ -413,6 +413,37 @@ mod pathpark_driveway {
             }
         }
 
+        pub(crate) fn through(poses: &[Transform], end_dir: Vec3) -> Self {
+            let lengths: Vec<_> = poses
+                .windows(2)
+                .map(|pair| pair[0].pos.distance(pair[1].pos))
+                .collect();
+            let total: f32 = lengths.iter().sum();
+            let mut segment = 0;
+            let mut passed = 0.0;
+            let points = std::array::from_fn(|index| {
+                if index == SWEEP_STEPS {
+                    return poses.last().unwrap().pos;
+                }
+                let distance = total * index as f32 / SWEEP_STEPS as f32;
+                while segment + 1 < lengths.len() && passed + lengths[segment] <= distance {
+                    passed += lengths[segment];
+                    segment += 1;
+                }
+                let a = poses[segment];
+                let b = poses[segment + 1];
+                let length = lengths[segment];
+                let curve = Spline3 {
+                    from: a.pos,
+                    to: b.pos,
+                    from_derivative: a.dir * (length * 0.8),
+                    to_derivative: b.dir * (length * 0.8),
+                };
+                curve.get((distance - passed) / length)
+            });
+            Self { points, end_dir }
+        }
+
         pub(crate) fn pose(self, tick: u16) -> Transform {
             let step = tick as usize * SWEEP_STEPS;
             let index = step / MOTION_TICKS as usize;

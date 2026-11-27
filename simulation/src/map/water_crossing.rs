@@ -1160,6 +1160,14 @@ impl<'map, 'work, 'budget> LocalTopology<'map, 'work, 'budget> {
 
             let original = &self.map.intersections[live];
             let mut mapped_arms = Vec::new();
+            if endpoints.contains(&joint)
+                && self.map.intersections[live]
+                    .roads
+                    .iter()
+                    .all(|&id| self.map.roads[id].is_walking_path())
+            {
+                continue;
+            }
             let mut mapped_lanes = BTreeMap::new();
             for &old in &original.roads {
                 let old_road = &self.map.roads[old];

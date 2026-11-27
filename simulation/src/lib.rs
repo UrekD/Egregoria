@@ -884,6 +884,7 @@ impl Simulation {
                         | WorldCommand::MapSetJunctionRules { .. }
                         | WorldCommand::MapMakeWalkingPath { .. }
                         | WorldCommand::MapPlaceParkingGarage { .. }
+                        | WorldCommand::MapPlaceParkingLot { .. }
                 )
             })
         {

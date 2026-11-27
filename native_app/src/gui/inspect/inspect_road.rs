@@ -279,6 +279,7 @@ fn truck_cargo(map: &Map, users: &RoadUsers) {
                         BuildingKind::TrainStation => "Train station",
                         BuildingKind::ExternalTrading => "External trading",
                         BuildingKind::ParkingGarage(kind) => kind.label(),
+                        BuildingKind::ParkingLot { .. } => "Surface parking lot",
                     });
             let truck = format!("Truck {:?}", row.truck.data());
             match &row.cargo {

@@ -106,11 +106,9 @@ impl SmallRoadPreset {
                 lanes_forward: vec![(LaneKind::Walking, 1.4)],
                 lanes_backward: Vec::new(),
             },
-            Self::LocalOneWay { curb_parking } => LanePatternBuilder::default()
-                .one_way(true)
-                .parking(curb_parking)
-                .speed_limit(7.0)
-                .build(),
+            Self::LocalOneWay { curb_parking } => {
+                LanePatternBuilder::local_one_way(curb_parking).build()
+            }
         }
     }
 }
@@ -171,6 +169,13 @@ impl LanePatternBuilder {
             one_way: false,
             rail: false,
         }
+    }
+
+    pub const fn local_one_way(curb_parking: bool) -> Self {
+        Self::new()
+            .one_way(true)
+            .parking(curb_parking)
+            .speed_limit(7.0)
     }
 
     pub const fn n_lanes(mut self, n_lanes: u32) -> Self {

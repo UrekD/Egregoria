@@ -807,6 +807,7 @@ fn building_label(map: &Map, id: BuildingID) -> Option<String> {
             BuildingKind::TrainStation => "Train station",
             BuildingKind::ExternalTrading => "External trading",
             BuildingKind::ParkingGarage(kind) => kind.label(),
+            BuildingKind::ParkingLot { .. } => "Surface parking lot",
         }
         .into(),
     )

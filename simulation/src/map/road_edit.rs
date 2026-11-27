@@ -473,8 +473,11 @@ enum LanePlacement {
 
 impl DirectionEdits {
     fn commit(self, map: &mut Map, road: RoadID) {
-        for lane in self.remove {
-            map.lanes.remove(lane);
+        for id in self.remove {
+            if map.lanes[id].kind == LaneKind::Parking {
+                map.parking.remove_spots(id);
+            }
+            map.lanes.remove(id);
         }
         let lanes = self.lanes.into_iter().map(|(direction, placement)| {
             let (id, kind) = match placement {
@@ -485,6 +488,9 @@ impl DirectionEdits {
                         lane.id = id;
                         lane
                     });
+                    if kind == LaneKind::Parking {
+                        map.parking.generate_spots(&map.lanes[id]);
+                    }
                     (id, kind)
                 }
             };
@@ -610,6 +616,15 @@ pub(crate) fn prepare_upgrade(
         return Err(Rejection::StaleRoadEdit);
     }
     let mut direction_edits = None;
+    let local_reversal = matches!(change, RoadUpgrade::ReverseOneWay) && {
+        let curb_parking = pattern
+            .lanes()
+            .any(|(kind, _, _)| kind == LaneKind::Parking);
+        let local = super::SmallRoadPreset::LocalOneWay { curb_parking }.lane_pattern();
+        *pattern == local
+            || (pattern.lanes_forward == local.lanes_backward
+                && pattern.lanes_backward == local.lanes_forward)
+    };
     let (deck, projected_topology, material, retained_lanes, lane_edits) = if same_geometry {
         let retained = road.lanes_iter().map(|(id, _)| id).collect::<Vec<_>>();
         let edits = forward
@@ -622,7 +637,7 @@ pub(crate) fn prepare_upgrade(
             .collect::<Vec<_>>();
         (road.interfaced_points().clone(), None, 0, retained, edits)
     } else if let Some((plan, retained, edits)) =
-        prepare_same_width_directions(sim, &map, road, pattern, budget)?
+        prepare_same_width_directions(sim, &map, road, pattern, local_reversal, budget)?
     {
         let material = common::hash_iter(
             pattern
@@ -715,22 +730,26 @@ fn prepare_same_width_directions(
     map: &Map,
     road: &Road,
     pattern: &LanePattern,
+    local_reversal: bool,
     budget: &mut PrepareBudget,
 ) -> Result<Option<(DirectionEdits, Vec<LaneID>, Vec<(LaneID, f32)>)>, Rejection> {
-    // The deck, sidewalk geometry, and curb claims must already remain compatible.
-    // Parking and attached access require their own staged handoff.
+    // Local reversing keeps the deck and sidewalk lanes. Its curb lane can
+    // move to the opposite side once all bays are clear.
     if road.width != pattern.width()
         || !road.connected_buildings.is_empty()
-        || road.lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
-        || pattern
-            .lanes()
-            .any(|(kind, _, _)| kind == LaneKind::Parking)
         || !sim.read::<crate::map_dynamic::Transit>().lines.is_empty()
-        || !sim.world().companies.is_empty()
-        || !sim.world().freight_stations.is_empty()
+        || (!local_reversal
+            && (road.lanes_iter().any(|(_, kind)| kind == LaneKind::Parking)
+                || pattern
+                    .lanes()
+                    .any(|(kind, _, _)| kind == LaneKind::Parking)
+                || !sim.world().companies.is_empty()
+                || !sim.world().freight_stations.is_empty()))
     {
         return Ok(None);
     }
+    let replaceable =
+        |kind| kind == LaneKind::Driving || (local_reversal && kind == LaneKind::Parking);
     for id in [road.src, road.dst] {
         if map.junction_rules(id).is_some() {
             return Ok(None);
@@ -780,7 +799,7 @@ fn prepare_same_width_directions(
                 kind,
             }
         } else {
-            if kind != LaneKind::Driving {
+            if !replaceable(kind) {
                 return Ok(None);
             }
             budget.spend_road_work(road.interfaced_points().len() * 2)?;
@@ -796,6 +815,11 @@ fn prepare_same_width_directions(
                 dist_from_bottom: offset,
             };
             lane.gen_pos(road);
+            if kind == LaneKind::Parking {
+                budget.spend_road_work(
+                    (lane.points.length() / super::PARKING_SPOT_LENGTH).ceil() as usize,
+                )?;
+            }
             LanePlacement::Add(lane)
         };
         offset += kind.width();
@@ -803,8 +827,17 @@ fn prepare_same_width_directions(
     }
     let mut remove = Vec::new();
     for (id, kind) in road.lanes_iter().filter(|(id, _)| !retained.contains(id)) {
-        if kind != LaneKind::Driving {
+        if !replaceable(kind) {
             return Ok(None);
+        }
+        if kind == LaneKind::Parking {
+            let parking = sim.read::<crate::map_dynamic::ParkingManagement>();
+            if let Some(spots) = map.parking.lane_spots.get(id) {
+                budget.spend_road_work(spots.len())?;
+                if spots.iter().any(|&spot| !parking.is_spot_free(spot)) {
+                    return Err(Rejection::BusyConflict);
+                }
+            }
         }
         remove.push(id);
     }
