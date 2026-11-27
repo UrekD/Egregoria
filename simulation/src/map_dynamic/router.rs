@@ -290,6 +290,7 @@ pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
                 let router = &mut human.router;
                 if router.personal_car == Some(car)
                     && router.selected_vehicle() == Some(car)
+                    && !human.household.on_errand()
                     && router.cur_step.is_none()
                     && router.steps.is_empty()
                     && router.target_dest == router.cur_dest
@@ -302,6 +303,7 @@ pub fn routing_changed_system(world: &mut World, resources: &mut Resources) {
                     } else {
                         Destination::Outside(door)
                     };
+                    router.walk_only_pickup = false;
                     router.reset_dest();
                     router.go_to(goal);
                     human.decision.wait = u8::MAX;

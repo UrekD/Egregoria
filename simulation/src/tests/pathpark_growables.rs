@@ -307,6 +307,29 @@ fn pathpark_despawn_preserves_the_original_stored_car() {
 }
 
 #[test]
+fn pathpark_closing_retrieves_a_car_after_an_idle_walk_only_trip() {
+    use crate::world_command::WorldCommand;
+
+    let (mut ctx, home, human, car, _) = property_trip();
+    ctx.g.world.edit_human(human, |h| {
+        h.router.walk_only_pickup = true;
+        h.decision.wait = u8::MAX;
+    });
+    ctx.g
+        .apply_commands([&WorldCommand::SetBuildingParkingOpen {
+            building: home,
+            open: false,
+        }]);
+
+    assert!((0..4_000).any(|_| {
+        ctx.g.world.edit_human(human, |h| h.decision.wait = u8::MAX);
+        ctx.tick_fast();
+        ctx.g.building_parking(home).unwrap().occupied == 0
+    }));
+    assert_eq!(ctx.g.world.humans[human].router.personal_car, Some(car));
+}
+
+#[test]
 fn pathpark_owner_despawn_does_not_interrupt_committed_ingress() {
     use crate::map_dynamic::Destination;
     use crate::transportation::DrivewayPhase;
