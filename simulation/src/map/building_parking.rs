@@ -268,7 +268,7 @@ pub(crate) fn prepare_property_parking(
                     depth: setback,
                     capacity: u16::from(capacity),
                 };
-                if let Some(layout) = parking.prepare(map).filter(&clear) {
+                if let Some(layout) = parking.prepare(map).ok().filter(&clear) {
                     return Some(layout);
                 }
             }
@@ -294,6 +294,7 @@ pub(crate) fn prepare_property_parking(
                     capacity: spaces,
                 }
                 .prepare(map)
+                .ok()
                 .filter(&clear)
             });
             garage.or_else(|| surface(fallback_surface_spaces))
@@ -338,6 +339,7 @@ pub(crate) fn prepare_public_garage(
         capacity: kind.spaces(),
     }
     .prepare(map)
+    .ok()
 }
 
 struct LayoutDraft {
@@ -351,10 +353,10 @@ struct LayoutDraft {
 }
 
 impl LayoutDraft {
-    fn prepare(self, map: &Map) -> Option<ParkingLayout> {
+    fn prepare(self, map: &Map) -> Result<ParkingLayout, &'static str> {
         let (center, approach, release, from, to, direction) =
-            prepare_driveway_mouth(map, self.anchor).ok()?;
-        let road = map.get(self.anchor.road)?;
+            prepare_driveway_mouth(map, self.anchor).map_err(|_| "invalid curb anchor")?;
+        let road = map.get(self.anchor.road).ok_or("missing frontage road")?;
         let outward = direction.perpendicular();
         let edge = road.width * 0.5;
         let entrance = center + outward.z0() * edge;
@@ -373,7 +375,7 @@ impl LayoutDraft {
             if !stall.corners.iter().all(|&p| self.parcel.contains(p))
                 || self.solid.is_some_and(|body| body.intersects(&stall))
             {
-                return None;
+                return Err("stall lies outside the usable parcel");
             }
             let parked = Transform::new_dir(pos, direction.z0());
             let sweep = |a: Transform, b: Transform| {
@@ -398,7 +400,7 @@ impl LayoutDraft {
                     || reaches(&out, other_stall)
                     || reaches(&into, other_stall)
             }) {
-                return None;
+                return Err("parking sweeps overlap another stall");
             }
             for point in into.points.iter().chain(&out.points) {
                 let xy = point.xy();
@@ -406,24 +408,33 @@ impl LayoutDraft {
                     || environment
                         .height(xy)
                         .is_none_or(|z| (z + crate::map::ROAD_Z_OFFSET - point.z).abs() > 0.6)
-                    || !map.authorize_driveway_pad(&OBB::new(xy, direction, 2.5, 2.5).corners)
-                    || self
-                        .solid
-                        .is_some_and(|body| body.expand(1.25).contains(xy))
+                {
+                    return Err("parking sweep crosses water or uneven ground");
+                }
+                if !map.authorize_driveway_pad(&OBB::new(xy, direction, 2.5, 2.5).corners) {
+                    return Err("parking sweep lacks land access");
+                }
+                if self
+                    .solid
+                    .is_some_and(|body| body.expand(1.25).contains(xy))
                     || (outward.dot(xy - entrance.xy()) > 1.5
                         && !self.parcel.expand(-0.5).contains(xy))
                 {
-                    return None;
+                    return Err("parking sweep leaves the usable parcel");
                 }
             }
             for sweep in [&into, &out] {
                 bounds.ll = bounds.ll.min(sweep.bounds().ll);
                 bounds.ur = bounds.ur.max(sweep.bounds().ur);
             }
-            let near_lane = map.get(approach.lane)?;
+            let near_lane = map.get(approach.lane).ok_or("missing approach lane")?;
             if let Some(curb) = road.parking_next_to(near_lane) {
-                for id in map.parking.closest_spots(curb, entrance)?.take(12) {
-                    let spot = map.parking.get(id)?;
+                let bays = map
+                    .parking
+                    .closest_spots(curb, entrance)
+                    .ok_or("missing curb bays")?;
+                for id in bays.take(12) {
+                    let spot = map.parking.get(id).ok_or("missing curb bay")?;
                     let conflicts = |sweep: &Sweep| {
                         sweep.segments().any(|segment| {
                             let projection = segment.project(spot.trans.pos);
@@ -438,7 +449,7 @@ impl LayoutDraft {
             paths.push(StallPath { into, out });
         }
 
-        Some(ParkingLayout {
+        Ok(ParkingLayout {
             kind: self.kind,
             anchor: self.anchor,
             entrance,
@@ -1313,28 +1324,13 @@ impl BuildingParking {
                 depth: layout.depth,
                 capacity: layout.capacity,
             }
-            .prepare(map);
-            let Some(expected) = expected else {
-                let CurbAnchor {
-                    road,
-                    side,
-                    station_cm,
-                    ..
-                } = layout.anchor;
-                let current_anchor = map.pick_curb(road, side, station_cm);
-                let reason = if current_anchor != Some(layout.anchor) {
-                    "the curb anchor changed"
-                } else {
-                    "the parking layout no longer fits the site"
-                };
-                return Err(
-                    format!(
-                        "could not rebuild {:?} parking for {id:?} on {road:?}: {reason}",
-                        layout.kind,
-                    )
-                    .into(),
-                );
-            };
+            .prepare(map)
+            .map_err(|reason| {
+                format!(
+                    "could not rebuild {:?} parking for {id:?} on {:?}: {reason}",
+                    layout.kind, layout.anchor.road
+                )
+            })?;
             if &expected != layout {
                 return Err(
                     format!(
