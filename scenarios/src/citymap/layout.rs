@@ -1324,6 +1324,12 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
             &[hraska_egress],
         );
     }
+    if plan.graph.links.contains_key(&HRASKA_SIGNAL_APPROACH) {
+        plan.graph.record(
+            "keep the short Hraška signal approach clear of curb parking",
+            &[HRASKA_SIGNAL_APPROACH],
+        );
+    }
     let ridge_culdesac = SourceKey::Way {
         id: 419255437,
         span: 0,
@@ -1353,6 +1359,7 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
 }
 
 pub(super) const HRASKA_SCHOOL_BEND: SourceKey = SourceKey::Way { id: 461688158, span: 1 };
+pub(super) const HRASKA_SIGNAL_APPROACH: SourceKey = SourceKey::Way { id: 419255436, span: 0 };
 
 fn round_hraska_school_bend(graph: &mut Graph) {
     let approach = HRASKA_SCHOOL_BEND;

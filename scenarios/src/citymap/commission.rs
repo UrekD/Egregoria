@@ -4788,6 +4788,11 @@ mod tests {
         let junction = &map.intersections()[hraska_egress];
         assert_eq!(junction.light_policy, simulation::map::LightPolicy::Lights);
         assert!(!junction.turn_policy.left_turns);
+        let short_approach = built.links[&super::super::layout::HRASKA_SIGNAL_APPROACH].road;
+        assert!(
+            map.roads()[short_approach].lanes_iter().all(|(_, kind)| kind != LaneKind::Parking),
+            "the short Hraška signal approach must keep curb manoeuvres out of the queue",
+        );
         let bend = built.links[&super::super::layout::HRASKA_SCHOOL_BEND].road;
         let road = &map.roads()[bend];
         assert_eq!(
