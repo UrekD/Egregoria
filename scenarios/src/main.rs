@@ -320,6 +320,7 @@ fn run() -> Result<(), String> {
         })
         .transpose()?;
     let mut results = BTreeMap::new();
+    let mut scale_error = None;
     for (scenario, options) in available {
         let expected = match &baseline {
             Some(baseline) => Some(baseline.get(scenario.name).map(Vec::as_slice).ok_or_else(
@@ -359,9 +360,15 @@ fn run() -> Result<(), String> {
         } else {
             run(&mut ctx)
         };
-        result.map_err(|err| format!("{}: {err}", scenario.name))?;
+        if let Err(error) = result {
+            let error = format!("{}: {error}", scenario.name);
+            if scenario.name != P9_SCALE.0.name {
+                return Err(error);
+            }
+            scale_error = Some(error);
+        }
 
-        if twice || scenario.name == "determinism" {
+        if scale_error.is_none() && (twice || scenario.name == "determinism") {
             println!(
                 "{}: both runs matched at every checkpoint and the final tick",
                 scenario.name
@@ -408,6 +415,10 @@ fn run() -> Result<(), String> {
         let file = File::create(&path).map_err(|err| format!("{}: {err}", path.display()))?;
         serde_json::to_writer_pretty(file, &results)
             .map_err(|err| format!("{}: {err}", path.display()))?;
+    }
+
+    if let Some(error) = scale_error {
+        return Err(error);
     }
 
     if gate {
