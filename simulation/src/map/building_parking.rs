@@ -1310,8 +1310,26 @@ impl BuildingParking {
                 capacity: layout.capacity,
             }
             .prepare(map);
-            if expected.as_ref() != Some(layout) || !self.fits(parking, layout, Some(id)) {
-                return Err("invalid property parking geometry");
+            let Some(expected) = expected else {
+                log::warn!(
+                    "saved property parking geometry for {id:?} on {:?} could not be rebuilt",
+                    layout.anchor.road,
+                );
+                return Err("could not rebuild property parking geometry");
+            };
+            if &expected != layout {
+                log::warn!(
+                    "saved property parking geometry for {id:?} on {:?} differs from the current map",
+                    layout.anchor.road,
+                );
+                return Err("property parking geometry changed");
+            }
+            if !self.fits(parking, layout, Some(id)) {
+                log::warn!(
+                    "saved property parking for {id:?} on {:?} conflicts with curb claims or another entrance",
+                    layout.anchor.road,
+                );
+                return Err("conflicting property parking geometry");
             }
             self.mouths
                 .entry(layout.anchor.road)
