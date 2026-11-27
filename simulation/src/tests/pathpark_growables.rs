@@ -291,6 +291,7 @@ fn pathpark_despawn_preserves_the_original_stored_car() {
     use common::saveload::{Bincode, Encoder};
 
     let (mut ctx, home, human, car, _) = property_trip();
+    ctx.build_roads(&[vec3(450.0, 280.0, 0.0), vec3(450.0, 360.0, 0.0)]);
     ctx.g.read::<ParCommandBuffer<HumanEnt>>().kill(human);
     ctx.g
         .apply_commands([&WorldCommand::SetBuildingParkingOpen {
@@ -398,6 +399,57 @@ fn pathpark_owner_despawn_during_egress_recovers_the_car_after_reload() {
         "an ownerless car stayed on the road after rear clearance"
     );
     assert_eq!(ctx.g.building_parking(home).unwrap().occupied, 0);
+}
+
+#[test]
+fn pathpark_property_departure_finds_reachable_curb_for_opposite_sidewalk() {
+    use crate::map::{LaneKind, LanePatternBuilder, ProjectFilter};
+    use crate::map_dynamic::{Destination, RoutingStep};
+    use crate::transportation::Location;
+    use crate::world_command::{CommandOutcomes, WorldCommand};
+
+    let (mut ctx, home, human, car, _) = property_trip();
+    let [from, to] = {
+        let map = ctx.g.map();
+        [vec3(450.0, 280.0, 0.0), vec3(450.0, 360.0, 0.0)]
+            .map(|pos| map.project(pos, 0.0, ProjectFilter::ALL))
+    };
+    // Add a marked crossing without giving the car a turnaround to the
+    // opposite lane. The driver must park on a reachable approach and walk.
+    ctx.g.apply_commands([&WorldCommand::MapMakeConnection {
+        from,
+        to,
+        inter: None,
+        pat: LanePatternBuilder::default().one_way(true).build(),
+    }]);
+    assert_eq!(ctx.g.read::<CommandOutcomes>().accepted.as_slice(), [0]);
+    let destination = {
+        let map = ctx.g.map();
+        let door = map.get(home).unwrap().door_pos;
+        let opposite = vec3(door.x + 10.0, 92.0, door.z);
+        let lane = map
+            .nearest_lane(opposite, LaneKind::Walking, Some(24.0))
+            .unwrap();
+        map.get(lane).unwrap().points.project(opposite)
+    };
+    ctx.g.world.edit_human(human, |person| {
+        person.router.go_to(Destination::Outside(destination));
+    });
+    assert!(
+        (0..7_000).any(|_| {
+            ctx.g.world.edit_human(human, |person| person.decision.wait = u8::MAX);
+            ctx.tick_fast();
+            let person = &ctx.g.world.humans[human];
+            person.location == Location::Outside
+                && matches!(person.router.cur_step(),
+                    Some(RoutingStep::WalkProperty(target, _)) if *target == destination)
+                && matches!(ctx.g.world.vehicles[car].vehicle.state, VehicleState::Parked(_))
+        }),
+        "driver at {:?}, car {:?}, parking error {:?}",
+        ctx.g.world.humans[human].trans.pos,
+        ctx.g.world.vehicles[car].vehicle.state,
+        ctx.g.world.humans[human].router.last_error,
+    );
 }
 
 #[test]

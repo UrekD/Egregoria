@@ -138,10 +138,10 @@ impl ParkingManagement {
                     return false;
                 };
                 inspections -= 1;
-                let point = map.parking.get(spot).unwrap().trans.pos;
-                let distance = point.distance2(near);
+                let bay = map.parking.get(spot).unwrap();
+                let distance = bay.trans.pos.distance2(near);
                 if distance <= radius.powi(2)
-                    && (point.z - near.z).abs() < 4.0
+                    && (bay.trans.pos.z - near.z).abs() < 4.0
                     && self.is_spot_free(spot)
                 {
                     let candidates = if distance <= NEAR_PARKING_RADIUS.powi(2) {
@@ -149,18 +149,32 @@ impl ParkingManagement {
                     } else {
                         &mut street
                     };
-                    candidates.push((OrderedFloat(distance), spot));
+                    candidates.push((OrderedFloat(distance), spot, bay.parent));
                 }
                 true
             });
         }
         let ranked = |mut candidates: Vec<_>| {
+            const LIMIT: usize = 8;
             candidates.sort_unstable();
-            candidates
-                .into_iter()
-                .take(8)
-                .map(|(_, spot)| spot)
-                .collect()
+            candidates.dedup();
+            let mut lanes = BTreeSet::new();
+            let mut first = Vec::new();
+            let mut rest = Vec::new();
+            for (_, spot, lane) in candidates {
+                // A run of bays on an unreachable approach must not crowd out
+                // the other direction before the feasibility checks begin.
+                if lanes.insert(lane) {
+                    first.push(spot);
+                    if first.len() == LIMIT {
+                        break;
+                    }
+                } else {
+                    rest.push(spot);
+                }
+            }
+            first.extend(rest.into_iter().take(LIMIT - first.len()));
+            first
         };
         (ranked(curb), ranked(street))
     }

@@ -47,13 +47,14 @@ fn setup_at(
     offset: Vec2,
 ) -> Result<Vec<BuildingID>, String> {
     let point = |x, y| (offset + vec2(x, y)).z(0.0);
-    let corners = {
+    let [west, east, far_east, far_west, spur] = {
         let map = sim.map();
         let mut corners = [
             point(75.0, 100.0),
             point(450.0, 100.0),
             point(450.0, 280.0),
             point(75.0, 280.0),
+            point(450.0, 360.0),
         ];
         for corner in &mut corners {
             corner.z = map
@@ -64,14 +65,20 @@ fn setup_at(
         corners
     };
     sim.apply_commands([&WorldCommand::MapMakeConnection {
-        from: MapProject::ground(corners[0]),
-        to: MapProject::ground(corners[1]),
+        from: MapProject::ground(west),
+        to: MapProject::ground(east),
         inter: None,
         pat: LanePatternBuilder::default().build(),
     }]);
     if round_trip {
-        let path = [corners[1], corners[2], corners[3], corners[0]];
-        for pair in path.windows(2) {
+        // A loop of two-arm corners has neither a crosswalk between its
+        // sidewalks nor a connection between its opposing driving directions.
+        for pair in [
+            [east, far_east],
+            [far_east, far_west],
+            [far_west, west],
+            [far_east, spur],
+        ] {
             let [from, to] = {
                 let map = sim.map();
                 std::array::from_fn(|index| map.project(pair[index], 0.0, ProjectFilter::ALL))
