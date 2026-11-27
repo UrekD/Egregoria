@@ -105,19 +105,17 @@ impl ParkingManagement {
         map: &Map,
         near: Vec3,
     ) -> (Vec<ParkingSpotID>, Vec<ParkingSpotID>) {
-        use crate::map::{ProjectFilter, ProjectKind};
         use ordered_float::OrderedFloat;
         let radius = 400.0_f32;
         let mut lanes = Vec::new();
         let mut inspections = 48;
         for hit in map
             .spatial_map()
-            .query_around(near.xy(), radius, ProjectFilter::ROAD)
+            .parking_roads(near.xy(), radius)
             .take(16)
         {
             inspections -= 1;
-            let ProjectKind::Road(id) = hit else { continue };
-            let Some(road) = map.get(id) else { continue };
+            let Some(road) = map.get(hit) else { continue };
             for (lane, kind) in road.lanes_iter() {
                 if kind != LaneKind::Parking {
                     continue;

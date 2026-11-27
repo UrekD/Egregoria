@@ -122,6 +122,7 @@ struct BroadCell {
     entries: Vec<(AABBGridHandle, bool)>,
     // The position is the mixed-grid query order, including swap-removals.
     lots: BTreeMap<usize, AABBGridHandle>,
+    roads: BTreeMap<RoadID, AABBGridHandle>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -186,19 +187,25 @@ impl BroadGrid {
 
     fn insert_cells(&mut self, handle: AABBGridHandle, cells: CellRange) {
         let single_cell = cells.first == cells.last;
-        let is_lot = self.objects[handle].obj.to_lot().is_some();
+        let kind = self.objects[handle].obj;
         for cell_id in cells.iter() {
             let cell = self.storage.cell_mut_unchecked(cell_id);
             let index = cell.entries.len();
-            if is_lot {
-                cell.lots.insert(index, handle);
+            match kind {
+                ProjectKind::Lot(_) => {
+                    cell.lots.insert(index, handle);
+                }
+                ProjectKind::Road(road) => {
+                    cell.roads.insert(road, handle);
+                }
+                _ => {}
             }
             self.positions.insert((handle, cell_id), index);
             cell.entries.push((handle, single_cell));
         }
     }
 
-    fn remove_cell_entry(&mut self, cell_id: CellIdx, handle: AABBGridHandle) {
+    fn remove_cell_entry(&mut self, cell_id: CellIdx, handle: AABBGridHandle, kind: ProjectKind) {
         let cell = self.storage.cell_mut_unchecked(cell_id);
         let index = self
             .positions
@@ -209,6 +216,11 @@ impl BroadGrid {
             self.removal_scan_entries += 1;
         }
         cell.lots.remove(&index);
+        if let ProjectKind::Road(road) = kind {
+            if cell.roads.get(&road) == Some(&handle) {
+                cell.roads.remove(&road);
+            }
+        }
         let last = cell.entries.len() - 1;
         cell.entries.swap_remove(index);
         if index != last {
@@ -223,25 +235,26 @@ impl BroadGrid {
         }
     }
 
-    fn remove_cells(&mut self, handle: AABBGridHandle, cells: CellRange) {
+    fn remove_cells(&mut self, handle: AABBGridHandle, cells: CellRange, kind: ProjectKind) {
         for cell in cells.iter() {
-            self.remove_cell_entry(cell, handle);
+            self.remove_cell_entry(cell, handle, kind);
         }
     }
 
     fn remove(&mut self, handle: AABBGridHandle) {
         if let Some(object) = self.objects.remove(handle) {
-            self.remove_cells(handle, self.object_cells(object.obj, object.aabb));
+            self.remove_cells(handle, self.object_cells(object.obj, object.aabb), object.obj);
         }
     }
 
     fn set_aabb(&mut self, handle: AABBGridHandle, aabb: AABB) {
         let object = &self.objects[handle];
-        let old_cells = self.object_cells(object.obj, object.aabb);
-        let new_cells = self.object_cells(object.obj, aabb);
+        let kind = object.obj;
+        let old_cells = self.object_cells(kind, object.aabb);
+        let new_cells = self.object_cells(kind, aabb);
         self.objects[handle].aabb = aabb;
         if old_cells != new_cells {
-            self.remove_cells(handle, old_cells);
+            self.remove_cells(handle, old_cells, kind);
             self.insert_cells(handle, new_cells);
         }
     }
@@ -307,6 +320,28 @@ impl SpatialMap {
     #[cfg(test)]
     pub(super) fn removal_scan_entries(&self) -> usize {
         self.broad.removal_scan_entries
+    }
+
+    /// Visit nearby road cells in a stable order, including after rebuilding the index.
+    /// Limit raw entries so duplicate memberships cannot lengthen a parking request.
+    pub(crate) fn parking_roads(&self, center: Vec2, radius: f32) -> impl Iterator<Item = RoadID> + '_ {
+        let bounds = Circle { center, radius }.bbox();
+        let mut cells: Vec<_> = CellRange::checked(bounds)
+            .into_iter()
+            .flat_map(CellRange::iter)
+            .collect();
+        let (cx, cy) = self.broad.storage.cell_id(center);
+        cells.sort_unstable_by_key(|&(x, y)| (x.abs_diff(cx).max(y.abs_diff(cy)), x, y));
+        let mut seen = FastSet::default();
+        cells
+            .into_iter()
+            .filter_map(|cell| self.broad.storage.cell(cell))
+            .flat_map(|cell| cell.roads.iter())
+            .take(128)
+            .filter_map(move |(&road, handle)| {
+                (seen.insert(road) && bounds.intersects(&self.broad.objects[*handle].aabb))
+                    .then_some(road)
+            })
     }
 
     pub fn insert(&mut self, obj: &impl SpatialMapObject) {
