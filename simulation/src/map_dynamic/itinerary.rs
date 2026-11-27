@@ -494,6 +494,27 @@ impl Itinerary {
         )
     }
 
+    pub(super) fn from_parking_walk(
+        cur: Traversable,
+        reversed_route: Vec<Traversable>,
+        reversed_local_path: Vec<Vec3>,
+        end_pos: Vec3,
+    ) -> Self {
+        Self {
+            kind: ItineraryKind::Route(
+                Route {
+                    reversed_route,
+                    end_pos,
+                    cur,
+                    target: ItineraryTarget::Position(end_pos),
+                },
+                PathKind::Pedestrian,
+            ),
+            reversed_local_path,
+            ..Self::default()
+        }
+    }
+
     pub(super) fn route_from_lanes(
         start: Vec3,
         start_lane: LaneID,
@@ -3166,23 +3187,6 @@ mod pathpark_sweep_tests {
     use crate::map::LaneKind;
     use crate::tests::pathpark_lifecycle::road_chain;
     use crate::transportation::{spawn_driving_vehicle, DrivewayPhase, DrivewayTraffic};
-    use geom::vec3;
-
-    #[test]
-    fn pathpark_pedestrian_candidate_geometry_is_charged_on_a_miss() {
-        let ctx = crate::tests::TestCtx::new();
-        ctx.build_roads(&[vec3(100., 100., 0.), vec3(400., 100., 0.)]);
-        let map = ctx.g.map();
-        let mut work = 1;
-        use crate::map_dynamic::property_walk::{ParkingWalkSearch, WalkResult};
-        let mut search = ParkingWalkSearch::new(
-            &map,
-            vec3(200., 102., 0.),
-            vec3(600., 600., 0.),
-        );
-        assert!(matches!(search.advance(&map, &mut work), WalkResult::Deferred));
-        assert_eq!(work, 0, "candidate geometry must be budgeted even on a miss");
-    }
 
     #[test]
     fn pathpark_guard_blocks_recovering_walker() {

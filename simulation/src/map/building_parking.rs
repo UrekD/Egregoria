@@ -576,8 +576,16 @@ struct LegacyParkingRuntime {
     searches: BTreeMap<HumanID, crate::map_dynamic::LegacyPendingPropertySearch>,
 }
 
-// The legacy runtime starts with the drain cursor's option tag (0 or 1).
-const STAGED_SEARCH_RUNTIME: u8 = 0xff;
+#[derive(Deserialize)]
+struct LegacyStagedParkingRuntime {
+    drain_cursor: Option<VehicleID>,
+    #[serde(deserialize_with = "bounded_parking_map::<_, _, _, 32>")]
+    searches: BTreeMap<HumanID, crate::map_dynamic::LegacyStagedPropertySearch>,
+}
+
+// The untagged runtime starts with the drain cursor's option tag (0 or 1).
+const LEGACY_STAGED_SEARCH_RUNTIME: u8 = 0xff;
+const STAGED_SEARCH_RUNTIME: u8 = 0xfe;
 
 impl BuildingParking {
     pub(crate) fn save(&self, output: impl std::io::Write) -> std::io::Result<()> {
@@ -606,6 +614,17 @@ impl BuildingParking {
         {
             parking.drain_cursor = runtime.drain_cursor;
             parking.searches = runtime.searches;
+            return Ok(parking);
+        }
+        if let Ok((mut parking, LEGACY_STAGED_SEARCH_RUNTIME, runtime)) =
+            Bincode::decode::<(Self, u8, LegacyStagedParkingRuntime)>(data)
+        {
+            parking.drain_cursor = runtime.drain_cursor;
+            parking.searches = runtime
+                .searches
+                .into_iter()
+                .map(|(driver, search)| (driver, search.into()))
+                .collect();
             return Ok(parking);
         }
         let (mut parking, runtime): (Self, LegacyParkingRuntime) = Bincode::decode(data)?;
@@ -1278,7 +1297,11 @@ impl BuildingParking {
         if self.parked.len() + self.arrivals.len() > MAX_LIVE_CLAIMS {
             return Err("too many live property parking claims".into());
         }
-        if self.searches.values().any(|search| !search.validate(map)) {
+        if self
+            .searches
+            .values_mut()
+            .any(|search| !search.validate(map))
+        {
             return Err("invalid property parking search cursor".into());
         }
         for building in map.buildings().values() {
