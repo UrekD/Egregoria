@@ -1,8 +1,8 @@
 use crate::map::{
-    LaneKind, Map, ProjectFilter, ProjectKind, Road, Traversable, TraverseDirection, TraverseKind,
-    Turn, TurnKind,
+    LaneKind, Map, ProjectFilter, ProjectKind, Road, RoundaboutGeometry, Traversable,
+    TraverseDirection, TraverseKind, Turn, TurnKind,
 };
-use geom::{Vec2, Vec3, AABB};
+use geom::{Segment3, Vec2, Vec3, AABB};
 use ordered_float::OrderedFloat;
 use std::collections::BTreeSet;
 
@@ -11,6 +11,7 @@ const DECK_TOLERANCE: f32 = 0.65;
 const PEDESTRIAN_RADIUS: f32 = 0.3;
 const LOCAL_WORK: usize = 1_024;
 const MAX_CURB_EXIT: f32 = 6.0;
+const MAX_RING_EXIT: f32 = 24.0;
 
 #[derive(Debug)]
 pub(super) enum PedestrianClearance {
@@ -32,11 +33,15 @@ pub(super) fn needs_local_recovery(map: &Map, position: Vec3) -> bool {
         return false;
     }
     let controlled = |id| map.junction_rules(id).is_some() || map.is_yield_roundabout(id);
-    if map.spatial_map()
-        .query_around(position.xy(), SEARCH_RADIUS, ProjectFilter::INTER)
-        .any(|candidate| matches!(candidate, ProjectKind::Intersection(id)
-            if controlled(id)
-                && map.get(id).is_some_and(|junction| (position.z - junction.pos.z).abs() < 1.0)))
+    if map.junction_rules_near(position, SEARCH_RADIUS)
+        || map
+            .spatial_map()
+            .query_around(position.xy(), SEARCH_RADIUS, ProjectFilter::INTER)
+            .any(|candidate| {
+                matches!(candidate, ProjectKind::Intersection(id)
+            if map.is_yield_roundabout(id)
+                && map.get(id).is_some_and(|junction| (position.z - junction.pos.z).abs() < 1.0))
+            })
     {
         return true;
     }
@@ -167,12 +172,56 @@ fn find_clearance(map: &Map, position: Vec3) -> Option<PedestrianClearance> {
             if matches!(turn.kind, TurnKind::Driving | TurnKind::Rail) {
                 work = work.checked_sub(turn.points.len())?;
                 if occupies_path(&turn.points, 2.0, position) {
+                    if let Some(ring) = junction.roundabout_geometry() {
+                        return ring_exit(junction, ring, position, &mut work);
+                    }
                     return Some(PedestrianClearance::Hold);
                 }
             }
         }
     }
     Some(PedestrianClearance::Clear)
+}
+
+fn ring_exit(
+    junction: &crate::map::Intersection,
+    ring: RoundaboutGeometry,
+    position: Vec3,
+    work: &mut usize,
+) -> Option<PedestrianClearance> {
+    let mut best = None;
+    for turn in junction.turns() {
+        *work = work.checked_sub(1)?;
+        if turn.kind != TurnKind::WalkingCorner {
+            continue;
+        }
+        *work = work.checked_sub(turn.points.len())?;
+        let (exit, _) = turn.points.project_segment_2d(position.xy());
+        if safe_ring_exit(ring, position, exit) {
+            let key = (OrderedFloat(position.distance2(exit)), turn.id);
+            if best.as_ref().is_none_or(|(current, _)| key < *current) {
+                best = Some((
+                    key,
+                    PedestrianClearance::Curb {
+                        sidewalk: Traversable::new(
+                            TraverseKind::Turn(turn.id),
+                            TraverseDirection::Forward,
+                        ),
+                        exit,
+                    },
+                ));
+            }
+        }
+    }
+    Some(best.map_or(PedestrianClearance::Hold, |(_, exit)| exit))
+}
+
+fn safe_ring_exit(ring: RoundaboutGeometry, position: Vec3, exit: Vec3) -> bool {
+    let path = Segment3::new(position, exit).flatten();
+    let island_clearance = ring.island_radius() + PEDESTRIAN_RADIUS;
+    (position.z - exit.z).abs() <= DECK_TOLERANCE
+        && position.is_close(exit, MAX_RING_EXIT)
+        && path.project(ring.center.xy()).distance2(ring.center.xy()) >= island_clearance.powi(2)
 }
 
 fn curb_exit(
@@ -251,11 +300,16 @@ fn crosswalk_exit(
     {
         return None;
     }
-    if first.distance2(projection) < last.distance2(projection) {
-        Some((projection, first, TraverseDirection::Backward))
+    let (sidewalk, direction) = if first.distance2(projection) < last.distance2(projection) {
+        (first, TraverseDirection::Backward)
     } else {
-        Some((projection, last, TraverseDirection::Forward))
-    }
+        (last, TraverseDirection::Forward)
+    };
+    // Join the marked path diagonally so an offset walker can clear the
+    // nose of a vehicle already stopped at the crossing.
+    let offset = position.xy().distance(projection.xy());
+    let projection = projection + (sidewalk - projection).cap_magnitude(2.0 * offset);
+    Some((projection, sidewalk, direction))
 }
 
 pub(super) fn exit_path_still_valid(
@@ -276,9 +330,20 @@ pub(super) fn exit_path_still_valid(
         }
         TraverseKind::Turn(id) => id,
     };
-    let Some(turn) = map.get(id.parent).and_then(|inter| inter.find_turn(id)) else {
+    let Some(junction) = map.get(id.parent) else {
         return false;
     };
+    let Some(turn) = junction.find_turn(id) else {
+        return false;
+    };
+    if turn.kind == TurnKind::WalkingCorner {
+        let [exit] = path else { return false };
+        return turn.points.len() <= LOCAL_WORK
+            && turn.points.project_dist2(*exit) < 0.01
+            && junction
+                .roundabout_geometry()
+                .is_some_and(|ring| safe_ring_exit(ring, position, *exit));
+    }
     if turn.kind != TurnKind::Crosswalk || turn.points.len() != 2 || !id.bidirectional {
         return false;
     }
@@ -287,7 +352,11 @@ pub(super) fn exit_path_still_valid(
         TraverseDirection::Backward => turn.points.first(),
     };
     path.first() == Some(&exit)
-        && occupies_path(&turn.points, SEARCH_RADIUS, position)
+        && {
+            let (projection, _) = turn.points.project_segment_2d(position.xy());
+            (position.z - projection.z).abs() <= DECK_TOLERANCE
+                && position.xy().is_close(projection.xy(), SEARCH_RADIUS)
+        }
         && path
             .iter()
             .all(|&point| turn.points.project_dist2(point) < 0.01)

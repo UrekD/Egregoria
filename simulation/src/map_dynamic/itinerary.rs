@@ -1,5 +1,6 @@
 use crate::map::{
-    Lane, LaneID, Map, PathKind, Pathfinder, RoadID, Traversable, TraverseDirection, TraverseKind,
+    IntersectionID, Lane, LaneID, Map, PathKind, Pathfinder, RoadID, Traversable,
+    TraverseDirection, TraverseKind,
 };
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
@@ -740,6 +741,17 @@ impl Itinerary {
         mut move_on: impl FnMut(Traversable, Vec3, Vec3) -> bool,
     ) -> Vec3 {
         if self.is_pedestrian_egress() {
+            if let Some(admission) = admission {
+                if self.egress_junction(map).is_some_and(|junction| {
+                    !admission
+                        .frame
+                        .permits_recovery(admission.user.owner, junction)
+                        && self.recovery_path(map, position).is_some()
+                }) {
+                    admission.hold = Some(HoldReason::Conflict);
+                    return position;
+                }
+            }
             return self.advance_egress(map, position, dist_to_move);
         }
         if on_road_entry.is_some()
@@ -1137,6 +1149,23 @@ impl Itinerary {
         matches!(self.kind, ItineraryKind::PedestrianEgress(_))
     }
 
+    pub(crate) fn egress_junction(&self, map: &Map) -> Option<IntersectionID> {
+        if !self.is_pedestrian_egress() {
+            return None;
+        }
+        let TraverseKind::Turn(turn) = self.get_travers()?.kind else {
+            return None;
+        };
+        crate::transportation::junction_admission::configured(map, turn.parent)?;
+        Some(turn.parent)
+    }
+
+    pub(crate) fn recovery_path(&self, map: &Map, position: Vec3) -> Option<&[Vec3]> {
+        let crossing = *self.get_travers()?;
+        let path = self.local_path();
+        exit_path_still_valid(map, crossing, position, path).then_some(path)
+    }
+
     fn requires_pedestrian_egress(&self, has_route_step: bool) -> bool {
         match self.kind {
             ItineraryKind::None => !has_route_step,
@@ -1364,7 +1393,11 @@ impl Inspect<ItineraryKind> for ItineraryKind {
                 ui.label(format!("wait for reroute: {wait_ticks}"));
             }
             ItineraryKind::PedestrianEgress(egress) => {
-                ui.label(if egress.crossing.is_some() { "Clearing crosswalk" } else { "Waiting for a safe exit" });
+                ui.label(if egress.crossing.is_some() {
+                    "Walking to a safe exit"
+                } else {
+                    "Waiting for a safe exit"
+                });
             }
         };
     }

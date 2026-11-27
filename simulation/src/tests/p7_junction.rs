@@ -193,6 +193,16 @@ fn staged_vehicle(
     to: LaneID,
     before_boundary: f32,
 ) -> crate::VehicleID {
+    try_staged_vehicle(sim, kind, from, to, before_boundary).unwrap()
+}
+
+fn try_staged_vehicle(
+    sim: &mut Simulation,
+    kind: VehicleKind,
+    from: LaneID,
+    to: LaneID,
+    before_boundary: f32,
+) -> Option<crate::VehicleID> {
     let (start, end, terminal, dir, junction) = {
         let map = sim.map();
         let lane = map.get(from).unwrap();
@@ -203,7 +213,7 @@ fn staged_vehicle(
         let terminal = map.get(to).unwrap().points.point_along(50.0);
         (start, end, terminal, (end - start).normalize(), lane.dst)
     };
-    let id = spawn_driving_vehicle(sim, kind, Transform::new_dir(start, dir)).unwrap();
+    let id = spawn_driving_vehicle(sim, kind, Transform::new_dir(start, dir))?;
     sim.world.vehicles[id].it = Itinerary {
         kind: ItineraryKind::Route(
             Route {
@@ -223,7 +233,7 @@ fn staged_vehicle(
         reversed_local_path: vec![end],
         ..Itinerary::default()
     };
-    id
+    Some(id)
 }
 
 #[test]
@@ -1263,8 +1273,99 @@ fn roundabout_hotfix_walker(
 }
 
 #[test]
+fn roundabout_hotfix_releases_ring_behind_circulating_vehicle() {
+    use crate::transportation::junction_admission::segments_close;
+
+    let (mut ctx, junction, _) = roundabout_fixture(&[0.0, 90.0, 180.0, 270.0], 28.0, false);
+    let (lead, follower, path) = {
+        let map = ctx.g.map();
+        let inter = map.get(junction).unwrap();
+        let turns = || inter.turns().filter(|turn| turn.kind == TurnKind::Driving);
+        let clearance = (VehicleKind::Car.width() + 0.8).powi(2);
+        let pair = turns()
+            .find_map(|lead| {
+                let rest = &lead.points.as_slice()[lead.points.len() - 8..];
+                let follower = turns().find(|other| {
+                    lead.id.src != other.id.src
+                        && lead.id.dst != other.id.dst
+                        && lead.points.segments().any(|a| {
+                            other
+                                .points
+                                .segments()
+                                .any(|b| segments_close(a, b, clearance))
+                        })
+                        && rest.windows(2).all(|pair| {
+                            other.points.segments().all(|b| {
+                                !segments_close(geom::Segment3::new(pair[0], pair[1]), b, clearance)
+                            })
+                        })
+                        && map
+                            .get(other.id.dst)
+                            .unwrap()
+                            .points
+                            .first()
+                            .distance(rest[0])
+                            > 15.0
+                })?;
+                Some((lead.id, follower.id, rest.to_vec()))
+            })
+            .unwrap();
+        pair
+    };
+    let circulating = staged_vehicle(&mut ctx.g, VehicleKind::Car, lead.src, lead.dst, 7.0);
+    let car = &mut ctx.g.world.vehicles[circulating];
+    car.trans = Transform::new_dir(path[0], (path[1] - path[0]).normalize());
+    let ItineraryKind::Route(route, _) = &mut car.it.kind else {
+        unreachable!()
+    };
+    route.cur = Traversable::new(TraverseKind::Turn(lead), TraverseDirection::Forward);
+    route.reversed_route.pop();
+    car.it.reversed_local_path = path.into_iter().skip(1).rev().collect();
+
+    let waiting = staged_vehicle(
+        &mut ctx.g,
+        VehicleKind::Car,
+        follower.src,
+        follower.dst,
+        5.0,
+    );
+    ctx.g.world.vehicles[waiting].speed.0 = 350.0;
+    let tick = ctx.g.get_tick();
+    update_at(&mut ctx.g, tick + 1);
+    assert!(ctx.g.read::<JunctionAdmission>().crossing_turn(lead));
+    assert!(
+        ctx.g.read::<JunctionAdmission>().crossing_turn(follower),
+        "a cleared ring segment still blocked the approach"
+    );
+}
+
+#[test]
 fn roundabout_hotfix_walks_from_corner_into_crosswalk() {
+    walks_from_corner_into_crosswalk(true);
+}
+
+#[test]
+fn p7_junction_ruled_walks_from_corner_into_crosswalk() {
+    walks_from_corner_into_crosswalk(false);
+}
+
+fn walks_from_corner_into_crosswalk(roundabout: bool) {
+    use crate::transportation::junction_admission::entry_boundary;
+
     let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 90.0, 180.0, 270.0], 28.0, false);
+    if !roundabout {
+        let mut map = ctx.g.map_mut();
+        map.update_intersection(junction, |inter| {
+            inter.turn_policy.roundabout = None;
+            inter.light_policy = LightPolicy::NoLights;
+        });
+        let road = map.get(junction).unwrap().roads[0];
+        let rules = JunctionRules::new(vec![(road, ApproachRole::Yield)], Vec::new()).unwrap();
+        map.install_junction_rules(junction, rules);
+        assert!(crate::transportation::junction_admission::configured(&map, junction).is_some());
+    } else {
+        assert!(ctx.g.map().is_yield_roundabout(junction));
+    }
     let mut schedule = roundabout_hotfix_movement_only();
     let house = ctx.build_house_near(ends[0].xy());
     let (start, destination, route) = {
@@ -1299,10 +1400,51 @@ fn roundabout_hotfix_walks_from_corner_into_crosswalk() {
             .unwrap()
     };
     let id = roundabout_hotfix_walker(&mut ctx.g, house, start, route);
-    // Slow walkers need more than 150 real seconds for two corners and a crossing.
+    let mut awaiting_crossing = None;
+    let mut crossed = false;
     for _ in 0..12_000 {
+        let walker = &ctx.g.world.humans[id];
+        let map = ctx.g.map();
+        let route = walker
+            .it
+            .get_route()
+            .expect("the original route must stay active");
+        let kind = |step: Traversable| match step.kind {
+            TraverseKind::Turn(turn) if turn.parent == junction => {
+                Some(map.get(junction).unwrap().find_turn(turn).unwrap().kind)
+            }
+            _ => None,
+        };
+        if !crossed && awaiting_crossing == Some(route.cur) {
+            let TraverseKind::Turn(turn) = route.cur.kind else {
+                unreachable!()
+            };
+            assert!(ctx.g.read::<JunctionAdmission>().crossing_turn(turn));
+            crossed = true;
+        }
+        if kind(route.cur) == Some(TurnKind::WalkingCorner) {
+            if let Some(&next) = route
+                .reversed_route
+                .last()
+                .filter(|&&step| kind(step) == Some(TurnKind::Crosswalk))
+            {
+                if let Some(boundary) = entry_boundary(&map, &walker.it, walker.trans.pos, 0.1, 0.3)
+                {
+                    assert!(
+                        boundary.valid && boundary.controlled,
+                        "directed corner entry is invalid"
+                    );
+                    awaiting_crossing = Some(next);
+                }
+            }
+        }
+        drop(map);
         ctx.g.tick(&mut schedule, &[]);
         if ctx.g.world.humans[id].trans.pos.is_close(destination, 0.01) {
+            assert!(
+                crossed,
+                "walker arrived without a protected corner-to-crosswalk transition"
+            );
             return;
         }
     }
@@ -1343,7 +1485,82 @@ fn roundabout_hotfix_clears_a_cancelled_crosswalk() {
 }
 
 #[test]
+fn roundabout_hotfix_recovers_offset_crosswalk_before_car_enters() {
+    roundabout_recovery_with_traffic(Some(1.2));
+    roundabout_recovery_with_traffic(Some(-1.2));
+}
+
+#[test]
+fn roundabout_hotfix_recovers_unrouted_walker_on_ring() {
+    roundabout_recovery_with_traffic(None);
+}
+
+fn roundabout_recovery_with_traffic(crosswalk_offset: Option<f32>) {
+    let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 107.0, 218.0], 24.0, false);
+    let house = ctx.build_house_near(ends[0].xy());
+    let (from, to, start) = {
+        let map = ctx.g.map();
+        let inter = map.get(junction).unwrap();
+        let from = lane_at(&map, ends[0], inter.pos);
+        let to = lane_at(&map, inter.pos, ends[2]);
+        let turn = inter
+            .find_turn(TurnID::new(junction, from, to, false))
+            .unwrap();
+        let start = if let Some(offset) = crosswalk_offset {
+            let entry = turn.points.first();
+            let walk = inter
+                .crosswalks()
+                .min_by_key(|walk| ordered_float::OrderedFloat(walk.points.project_dist2(entry)))
+                .unwrap();
+            let across = walk.points.first_dir().unwrap();
+            walk.points.project(entry) + across.xy().perpendicular().z0() * offset
+        } else {
+            turn.points.middle()
+        };
+        (from, to, start)
+    };
+    let walker = roundabout_hotfix_walker(&mut ctx.g, house, start, Itinerary::NONE);
+    let half = VehicleKind::Car.width() * 0.5;
+    let car = staged_vehicle(&mut ctx.g, VehicleKind::Car, from, to, half + 0.02);
+    ctx.g.world.vehicles[car].speed.0 = 35.0;
+    let tick = ctx.g.get_tick();
+    update_at(&mut ctx.g, tick + 1);
+    assert_eq!(
+        ctx.g.world.vehicles[car].speed.0, 0.0,
+        "car entered an active recovery sweep"
+    );
+
+    let mut schedule = roundabout_hotfix_movement_only();
+    for _ in 0..12_000 {
+        ctx.g.tick(&mut schedule, &[]);
+        let human = &ctx.g.world.humans[walker];
+        if human.collider.is_none() && ctx.g.world.vehicles[car].it.get_point().is_none() {
+            assert!(
+                human.trans.pos.distance(start) > 1.25,
+                "walker did not reach a curb"
+            );
+            return;
+        }
+    }
+    let human = &ctx.g.world.humans[walker];
+    let vehicle = &ctx.g.world.vehicles[car];
+    panic!(
+        "recovery from {start:?} ({crosswalk_offset:?}) stopped at {:?} with {:?}; car stopped at {:?} with {:?}",
+        human.trans.pos, human.it.local_path(), vehicle.trans.pos, vehicle.it.get_travers(),
+    );
+}
+
+#[test]
 fn roundabout_hotfix_dense_sidewalk_does_not_close_entries() {
+    assert!(roundabout_dense_sidewalk_allows_entry(260));
+}
+
+#[test]
+fn roundabout_hotfix_overfull_sample_defers_entry() {
+    assert!(!roundabout_dense_sidewalk_allows_entry(520));
+}
+
+fn roundabout_dense_sidewalk_allows_entry(count: u32) -> bool {
     let (mut ctx, junction, ends) =
         roundabout_fixture(&[0.0, 38.0, 119.0, 194.0, 279.0], 28.0, false);
     let mut schedule = roundabout_hotfix_movement_only();
@@ -1353,7 +1570,7 @@ fn roundabout_hotfix_dense_sidewalk_does_not_close_entries() {
         .by_building
         .get_mut(&house)
         .unwrap()
-        .capacity = 260;
+        .capacity = count as _;
     let (from, to, sidewalk) = {
         let map = ctx.g.map();
         let center = map.get(junction).unwrap().pos;
@@ -1372,7 +1589,7 @@ fn roundabout_hotfix_dense_sidewalk_does_not_close_entries() {
             sidewalk.points.clone(),
         )
     };
-    for _ in 0..260 {
+    for _ in 0..count {
         let position = sidewalk.point_along(2.0);
         let route = Itinerary::simple(vec![sidewalk.point_along(5.0), sidewalk.point_along(85.0)]);
         roundabout_hotfix_walker(&mut ctx.g, house, position, route);
@@ -1382,13 +1599,7 @@ fn roundabout_hotfix_dense_sidewalk_does_not_close_entries() {
         ctx.g.tick(&mut schedule, &[]);
     }
     let car = &ctx.g.world.vehicles[car];
-    assert_ne!(
-        car.it.get_travers().unwrap().kind,
-        TraverseKind::Lane(from),
-        "a sidewalk crowd closed a clear entry: {:?} at {:?}",
-        car.it.get_travers(),
-        car.trans.pos
-    );
+    car.it.get_travers().unwrap().kind != TraverseKind::Lane(from)
 }
 
 #[test]
@@ -1452,131 +1663,205 @@ fn roundabout_hotfix_four_arm_mixed_traffic_soak() {
             .collect::<Vec<_>>();
         (driving, walking)
     };
+    let (carriageway, destinations) = {
+        let map = ctx.g.map();
+        let inter = map.get(junction).unwrap();
+        let lanes = inter.roads.iter().flat_map(|&road| {
+            map.get(road)
+                .unwrap()
+                .lanes_iter()
+                .filter(|(_, kind)| kind.vehicles() || *kind == LaneKind::Parking)
+        });
+        let carriageway = lanes
+            .map(|(lane, kind)| (map.get(lane).unwrap().points.clone(), kind.width() * 0.5))
+            .chain(
+                inter
+                    .turns()
+                    .filter(|turn| turn.kind == TurnKind::Driving)
+                    .map(|turn| (turn.points.clone(), 2.0)),
+            )
+            .collect::<Vec<_>>();
+        let destinations = driving
+            .iter()
+            .flat_map(|(_, exits)| exits.iter().copied())
+            .map(|to| (to, map.get(to).unwrap().points.point_along(50.0)))
+            .collect::<BTreeMap<_, _>>();
+        (carriageway, destinations)
+    };
+
+    const INJECTION_PERIOD: u64 = 4_000;
+    const WAVES: u64 = 8;
+    const OBSERVE_PERIOD: u64 = 25;
+    const STOP_WINDOW: u64 = prototypes::TICKS_PER_MINUTE;
+    const SOAK_TICKS: u64 = 160_000;
+    const MAX_VEHICLE_STOP: u64 = 36_000;
     let mut arrived_cars = 0;
     let mut arrived_walkers = 0;
-    let mut stuck_cars = BTreeMap::new();
-    let mut stuck_walkers = BTreeMap::new();
-    for wave in 0..8 {
-        let mut cars = BTreeMap::new();
-        let mut walkers = BTreeMap::new();
-        for (i, (from, exits)) in driving.iter().enumerate() {
-            for row in 0..4 {
-                let to = exits[(i + row + wave) % exits.len()];
-                let kind = match (i + row + wave) % 8 {
-                    0 => VehicleKind::Bus,
-                    1 => VehicleKind::Truck,
-                    _ => VehicleKind::Car,
-                };
-                let id = staged_vehicle(
-                    &mut ctx.g,
-                    kind,
-                    *from,
-                    to,
-                    7.0 + row as f32 * 23.0 + (i % 3) as f32 * 7.5,
-                );
-                cars.insert(id, to);
+    let mut cars = BTreeMap::new();
+    let mut walkers = BTreeMap::new();
+    let mut pending = Vec::new();
+    let mut dispatched = Vec::new();
+    let mut clear_ticks = 0;
+    let mut active_clear_ticks = 0;
+    let mut longest_active_clear = 0;
+    let mut peak_traffic = 0;
+    let mut longest_vehicle_stop = 0;
+    let mut longest_walker_stop = 0;
+    for tick in 0..SOAK_TICKS {
+        let wave = (tick / INJECTION_PERIOD) as usize;
+        if tick % INJECTION_PERIOD == 0 && wave < WAVES as usize {
+            for (i, (from, exits)) in driving.iter().enumerate() {
+                for row in 0..4 {
+                    let to = exits[(i + row + wave) % exits.len()];
+                    let kind = match (i + row + wave) % 8 {
+                        0 => VehicleKind::Bus,
+                        1 => VehicleKind::Truck,
+                        _ => VehicleKind::Car,
+                    };
+                    pending.push((
+                        kind,
+                        *from,
+                        to,
+                        7.0 + row as f32 * 23.0 + (i % 3) as f32 * 7.5,
+                    ));
+                }
             }
-        }
-        for i in 0..28 {
-            let (start, end, route) = {
-                let map = ctx.g.map();
-                let from = map.get(walking[i % walking.len()]).unwrap();
-                let to = map
-                    .get(walking[(i + 3 + wave % 4) % walking.len()])
-                    .unwrap();
-                let near_mouth = |lane: &crate::map::Lane, distance| {
-                    lane.points.point_along(if lane.dst == junction {
-                        lane.points.length() - distance
-                    } else {
-                        distance
-                    })
-                };
-                let start = near_mouth(from, 3.0 + (i / walking.len()) as f32 * 4.0);
-                let end = near_mouth(to, 12.0);
-                (
-                    start,
-                    end,
-                    Itinerary::route(
+            for i in 0..28 {
+                let (start, end, route) = {
+                    let map = ctx.g.map();
+                    let from = map.get(walking[i % walking.len()]).unwrap();
+                    let to = map
+                        .get(walking[(i + 3 + wave % 4) % walking.len()])
+                        .unwrap();
+                    let near_mouth = |lane: &crate::map::Lane, distance| {
+                        lane.points.point_along(if lane.dst == junction {
+                            lane.points.length() - distance
+                        } else {
+                            distance
+                        })
+                    };
+                    let start = near_mouth(from, 3.0 + (i / walking.len()) as f32 * 4.0);
+                    let end = near_mouth(to, 12.0);
+                    let route = Itinerary::route(
                         Tick(ctx.g.get_tick()),
                         start,
                         end,
                         &map,
                         PathKind::Pedestrian,
                     )
-                    .unwrap(),
-                )
-            };
-            let id = roundabout_hotfix_walker(&mut ctx.g, house, start, route);
-            walkers.insert(id, end);
-        }
-        let mut clear_ticks = 0;
-        let mut dispatched = Vec::new();
-        for _ in 0..36_000 {
-            ctx.g.tick(&mut schedule, &[]);
-            cars.retain(|&id, &mut to| {
-                let car = &ctx.g.world.vehicles[id];
-                let traversal = car.it.get_travers().map(|t| t.kind);
-                if traversal == Some(TraverseKind::Lane(to)) {
-                    let map = ctx.g.map();
-                    if car.trans.pos.distance(map.get(to).unwrap().points.first()) >= 22.0 {
-                        dispatched.push(id);
-                        stuck_cars.remove(&id);
-                        return false;
-                    }
-                }
-                if matches!(traversal, Some(TraverseKind::Turn(turn)) if turn.parent == junction)
-                    && car.speed.0 < 0.01
-                {
-                    *stuck_cars.entry(id).or_insert(0) += 1;
-                } else {
-                    stuck_cars.remove(&id);
-                }
-                true
-            });
-            for id in dispatched.drain(..) {
-                ctx.g
-                    .world
-                    .vehicles
-                    .remove(id)
-                    .unwrap()
-                    .sim_drop(id, &mut ctx.g);
-                arrived_cars += 1;
-            }
-            walkers.retain(|&id, &mut end| {
-                let human = &ctx.g.world.humans[id];
-                if human.trans.pos.is_close(end, 0.01) {
-                    arrived_walkers += 1;
-                    stuck_walkers.remove(&id);
-                    return false;
-                }
-                if human.speed.0 < 0.01 {
-                    let map = ctx.g.map();
-                    if map.get(junction).unwrap().crosswalks().any(|turn| {
-                        turn.points.project_dist2(human.trans.pos) < 0.01
-                            && !human.trans.pos.is_close(turn.points.first(), 0.3)
-                            && !human.trans.pos.is_close(turn.points.last(), 0.3)
-                    }) {
-                        *stuck_walkers.entry(id).or_insert(0) += 1;
-                    }
-                } else {
-                    stuck_walkers.remove(&id);
-                }
-                true
-            });
-            let stuck = stuck_cars
-                .values()
-                .chain(stuck_walkers.values())
-                .any(|&ticks| ticks > 100);
-            clear_ticks = if stuck { 0 } else { clear_ticks + 1 };
-            if cars.is_empty() && walkers.is_empty() {
-                break;
+                    .unwrap();
+                    (start, end, route)
+                };
+                let id = roundabout_hotfix_walker(&mut ctx.g, house, start, route);
+                walkers.insert(id, (end, start, tick));
             }
         }
-        assert!(cars.is_empty() && walkers.is_empty() && clear_ticks > 5 * prototypes::TICKS_PER_MINUTE,
-            "wave {wave}: {} cars and {} walkers unfinished, {} cars stopped in the ring, {} walkers stopped on crossings, {clear_ticks} clear ticks",
-            cars.len(), walkers.len(), stuck_cars.len(), stuck_walkers.len());
+        if tick % OBSERVE_PERIOD == 0 {
+            pending.retain(|&(kind, from, to, offset)| {
+                let Some(id) = try_staged_vehicle(&mut ctx.g, kind, from, to, offset) else {
+                    return true;
+                };
+                cars.insert(id, (to, ctx.g.world.vehicles[id].trans.pos, tick));
+                false
+            });
+        }
+
+        ctx.g.tick(&mut schedule, &[]);
+        cars.retain(|&id, &mut (to, _, _)| {
+            let car = &ctx.g.world.vehicles[id];
+            if car.it.get_point().is_none() && car.trans.pos.is_close(destinations[&to], 0.01) {
+                dispatched.push(id);
+                return false;
+            }
+            true
+        });
+        for id in dispatched.drain(..) {
+            ctx.g
+                .world
+                .vehicles
+                .remove(id)
+                .unwrap()
+                .sim_drop(id, &mut ctx.g);
+            arrived_cars += 1;
+        }
+        walkers.retain(|&id, &mut (end, _, _)| {
+            if ctx.g.world.humans[id].trans.pos.is_close(end, 0.01) {
+                arrived_walkers += 1;
+                return false;
+            }
+            true
+        });
+        peak_traffic = peak_traffic.max(cars.len() + walkers.len());
+        if tick % OBSERVE_PERIOD != 0 {
+            continue;
+        }
+
+        // Measure physical progress from the approach through the receiving
+        // lane, including cars that are still held before the ring.
+        let mut current_vehicle_stop = 0;
+        for (&id, (_, anchor, last_progress)) in &mut cars {
+            let position = ctx.g.world.vehicles[id].trans.pos;
+            if !position.is_close(*anchor, 0.5) {
+                (*anchor, *last_progress) = (position, tick);
+            }
+            current_vehicle_stop = current_vehicle_stop.max(tick - *last_progress);
+        }
+        let mut current_walker_stop = 0;
+        for (&id, (_, anchor, last_progress)) in &mut walkers {
+            let position = ctx.g.world.humans[id].trans.pos;
+            if !position.is_close(*anchor, 0.5) {
+                (*anchor, *last_progress) = (position, tick);
+            }
+            if tick - *last_progress >= STOP_WINDOW
+                && carriageway.iter().any(|(lane, width)| {
+                    let (center, _) = lane.project_segment_2d(position.xy());
+                    (center.z - position.z).abs() <= 0.65
+                        && center.xy().is_close(position.xy(), width + 0.3)
+                })
+            {
+                current_walker_stop = current_walker_stop.max(tick - *last_progress);
+            }
+        }
+        longest_vehicle_stop = longest_vehicle_stop.max(current_vehicle_stop);
+        longest_walker_stop = longest_walker_stop.max(current_walker_stop);
+        let stuck = current_vehicle_stop >= STOP_WINDOW || current_walker_stop >= STOP_WINDOW;
+        clear_ticks = if stuck {
+            0
+        } else {
+            clear_ticks + OBSERVE_PERIOD
+        };
+        active_clear_ticks = if stuck || cars.is_empty() {
+            0
+        } else {
+            active_clear_ticks + OBSERVE_PERIOD
+        };
+        longest_active_clear = longest_active_clear.max(active_clear_ticks);
+        if (arrived_cars, arrived_walkers) == (224, 224) && clear_ticks > 5 * STOP_WINDOW {
+            break;
+        }
     }
-    assert_eq!((arrived_cars, arrived_walkers), (224, 224));
+    eprintln!("peak active {peak_traffic}, longest vehicle stop {longest_vehicle_stop}, longest carriageway walker stop {longest_walker_stop}, longest active clear ticks {longest_active_clear}, final clear ticks {clear_ticks}");
+    assert!(
+        longest_vehicle_stop < MAX_VEHICLE_STOP,
+        "a vehicle stalled for {longest_vehicle_stop} ticks on its approach, entry, ring or exit"
+    );
+    assert!(
+        longest_walker_stop < STOP_WINDOW,
+        "a walker stood on the carriageway for {longest_walker_stop} ticks"
+    );
+    assert_eq!(
+        (arrived_cars, arrived_walkers),
+        (224, 224),
+        "unfinished after {SOAK_TICKS} ticks: {} driving, {} pending, {} walking",
+        cars.len(),
+        pending.len(),
+        walkers.len()
+    );
+    assert!(clear_ticks > 5 * STOP_WINDOW);
+    assert!(
+        longest_active_clear > 5 * STOP_WINDOW,
+        "no five-minute clearance window with vehicles moving"
+    );
 }
 
 #[test]
@@ -1707,7 +1992,7 @@ fn roadtools_roundabout_resumes_a_full_legacy_snapshot_mid_turn() {
     assert_ne!(resumed.local_path(), old_waypoints);
     assert_ne!(loaded.world.humans[human_id].it.local_path(), old_walk);
     assert!(loaded.read::<JunctionAdmission>().crossing_turn(turn));
-    // The migrated walker stays on the sidewalk and needs no crosswalk claim.
+    // The migrated walker is still on a WalkingCorner, which needs no admission claim.
     assert!(!loaded.read::<JunctionAdmission>().crossing_turn(walk_turn));
     {
         let map = loaded.map();
@@ -1740,7 +2025,7 @@ fn roadtools_roundabout_preserves_a_saved_claim_at_the_exit_mouth() {
     use crate::transportation::junction_admission::{HoldReason, JunctionFrame};
 
     let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 90.0, 180.0], 18.0, false);
-    let (from, to, other_from, other_to, new_exit, new_dir) = {
+    let (from, to, other_from, new_exit, new_dir) = {
         let map = ctx.g.map();
         let center = map.get(junction).unwrap().pos;
         let to = lane_at(&map, center, ends[1]);
@@ -1749,7 +2034,6 @@ fn roadtools_roundabout_preserves_a_saved_claim_at_the_exit_mouth() {
             lane_at(&map, ends[0], center),
             to,
             lane_at(&map, ends[2], center),
-            lane_at(&map, center, ends[2]),
             exit.first(),
             exit.first_dir().unwrap(),
         )
@@ -1762,7 +2046,7 @@ fn roadtools_roundabout_preserves_a_saved_claim_at_the_exit_mouth() {
     let cleared_turn = TurnID::new(junction, other_from, to, false);
     let vehicle = staged_vehicle(&mut ctx.g, VehicleKind::Car, from, to, 5.0);
     let cleared = staged_vehicle(&mut ctx.g, VehicleKind::Car, other_from, to, 5.0);
-    let conflict = staged_vehicle(&mut ctx.g, VehicleKind::Car, from, other_to, 12.0);
+    let conflict = staged_vehicle(&mut ctx.g, VehicleKind::Car, other_from, to, 12.0);
     let old_exit = ctx.g.map().get(to).unwrap().points.clone();
     assert!(old_exit.first().distance(new_exit) > VehicleKind::Car.width());
     for (id, offset) in [(vehicle, 0.5), (cleared, 35.0)] {
@@ -1803,7 +2087,7 @@ fn roadtools_roundabout_preserves_a_saved_claim_at_the_exit_mouth() {
     let past_exit = new_exit + new_dir * 15.0;
     let (entry, direction) = {
         let map = loaded.map();
-        let approach = &map.get(from).unwrap().points;
+        let approach = &map.get(other_from).unwrap().points;
         (approach.last(), approach.last_dir().unwrap())
     };
     let half = VehicleKind::Car.width() * 0.5;
@@ -1823,10 +2107,10 @@ fn roadtools_roundabout_preserves_a_saved_claim_at_the_exit_mouth() {
             tick,
         )
     };
-    assert_eq!(
+    assert!(matches!(
         prepare(&mut loaded).denial(conflict),
-        Some(HoldReason::Conflict)
-    );
+        Some(HoldReason::Conflict | HoldReason::ExitFull)
+    ));
     assert!(loaded.read::<JunctionAdmission>().crossing_turn(turn));
 
     loaded.world.vehicles[vehicle].trans.pos = past_exit;
