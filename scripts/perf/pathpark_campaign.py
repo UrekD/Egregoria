@@ -69,6 +69,15 @@ def opening_identity(raw):
     }
 
 
+def host_cpu(cpu):
+    name = f"cpu{cpu}"
+    for line in Path("/proc/stat").read_text().splitlines():
+        key, *values = line.split()
+        if key == name:
+            return [int(value) for value in values]
+    raise ValueError(f"could not read host CPU {cpu}")
+
+
 def run(args, fixture, run_id, build, pins, campaign_id, sequence):
     runtime = getattr(args, f"{build}_runtime")
     slots = getattr(args, f"{build}_slots")
@@ -89,12 +98,17 @@ def run(args, fixture, run_id, build, pins, campaign_id, sequence):
     else:
         command += ["bench-slot", "--root", str(slots), "--slot", fixture,
                     "--warmup", str(warmup), "--ticks", str(ticks), "--sim-threads", "1"]
+    while int(next(line for line in Path("/proc/meminfo").read_text().splitlines()
+                   if line.startswith("MemAvailable:")).split()[1]) < 4_194_304:
+        time.sleep(5)
     print(f"{stem.name}", flush=True)
+    cpu_before = host_cpu(args.cpu)
     start = time.monotonic_ns()
     output = stem.with_suffix(".stdout.log") if fixture == "perf_10k" else report
     with output.open("wb") as stdout, stem.with_suffix(".stderr.log").open("wb") as stderr:
         status = subprocess.run(command, cwd=runtime, env=env, stdout=stdout, stderr=stderr).returncode
     end = time.monotonic_ns()
+    cpu_after = host_cpu(args.cpu)
     stem.with_suffix(".status").write_text(f"{status}\n")
     if status:
         raise ValueError(f"{stem} failed with status {status}")
@@ -111,6 +125,7 @@ def run(args, fixture, run_id, build, pins, campaign_id, sequence):
         "fixture": fixture, "run": run_id, "build": build, "workers": 1, "cpu": args.cpu,
         "campaign_id": campaign_id, "sequence": sequence, "start_ns": start, "end_ns": end,
         "warmup_ticks": warmup, "measured_ticks": ticks, "report_sha256": sha256(report),
+        "host_cpu_before": cpu_before, "host_cpu_after": cpu_after,
     } | after
     write(stem.with_suffix(".workload.json"), workload)
     payload = read(report)
