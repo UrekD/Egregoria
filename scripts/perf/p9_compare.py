@@ -96,11 +96,11 @@ def timings(sample, fixture):
     }
 
 
-def compare(manifest, artifacts):
+def compare(manifest, artifacts, parent=PARENT):
     require(manifest["version"] == 1 and manifest["profile"] == "background",
             "expected a version 1 background manifest")
-    require(manifest["parent_sha"] == PARENT and hex_digest(manifest["candidate_sha"], 40)
-            and manifest["candidate_sha"] != PARENT, "invalid parent or candidate source pin")
+    require(hex_digest(parent, 40) and manifest["parent_sha"] == parent
+            and hex_digest(manifest["candidate_sha"], 40) and manifest["candidate_sha"] != parent, "invalid parent or candidate source pin")
     require(manifest["lesce_sha256"] == LESCE_SHA256
             and manifest["lesce_revision"] == LESCE_REVISION, "invalid Lesce source pin")
     for build in ("parent", "candidate"):
@@ -161,9 +161,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--parent", default=PARENT, help="expected comparison base Git SHA")
     args = parser.parse_args()
     try:
-        result = compare(json.loads(args.manifest.read_text(encoding="utf-8")), args.artifacts)
+        result = compare(json.loads(args.manifest.read_text(encoding="utf-8")), args.artifacts, args.parent)
     except (OSError, ValueError, TypeError, KeyError, AttributeError, OverflowError) as error:
         print(f"P9 performance comparison failed: {error}", file=sys.stderr)
         return 1

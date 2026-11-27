@@ -239,6 +239,7 @@ fn render_remnant(uiworld: &UiWorld, sim: &Simulation, site: BuildingID) {
     });
     match status.phase {
         Some(DemolitionPhase::WaitingForFire) => label("Clearance paid · Waiting for fire to resolve"),
+        Some(DemolitionPhase::DrainingResponders) => label("Clearance paid · Waiting for responders to return"),
         Some(DemolitionPhase::Working) => label(format!("Clearance paid · {}% complete", status.progress_percent)),
         Some(DemolitionPhase::ClearanceBlocked) => {
             label(format!("Clearance complete · Blocked by {:?}", status.blocker.unwrap()));

@@ -14,6 +14,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use common::{ChunkID_256, FastMap};
 use geom::{InfiniteFrustrum, Intersect3, LinearColor, Radians, Shape, AABB, AABB3, OBB};
 use goryak::{combo_box, tooltip};
+use simulation::souls::events::{fire_incident, ServiceIncidents};
+use simulation::souls::service_dispatch::{service_station, FireFleet, FireResponseEventKind};
 use prototypes::{try_prototype, GoodsCompanyID, Power, ServiceID, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer, Serialize};
 use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
@@ -111,6 +113,7 @@ struct OverlayCache {
     tick: u64,
     data_version: u64,
     profiled_power_sites: Vec<BuildingID>,
+    fire_summary: String,
     projection: [f32; 16],
     tiles: TileIndex,
 }
@@ -350,15 +353,9 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
         let camera = uiworld.camera().camera;
         if mode == OverlayMode::Coverage(ServiceKind::Fire) {
             if let Some(bounds) = view::bounds(&camera, &map) {
-                for incident in sim.read::<simulation::souls::events::ServiceIncidents>().active() {
-                    if bounds.contains(incident.position.xy()) {
-                        draw.circle(incident.position.up(0.4), 4.0)
-                            .color(simulation::colors().gui_danger);
-                    }
-                }
+                cache.fire_summary = draw_fire_response(sim, uiworld, &map, bounds, &mut draw);
             }
         }
-
         if let OverlayMode::Coverage(kind) = mode {
             draw_selected_service_ring(uiworld, &map, kind, &mut draw);
         }
@@ -383,6 +380,87 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
         }
     });
     crate::gui::traffic_repair::draw_selected(sim, uiworld, &mut draw);
+}
+
+fn draw_fire_response(
+    sim: &Simulation,
+    uiworld: &UiWorld,
+    map: &Map,
+    bounds: AABB,
+    draw: &mut ImmediateDraw,
+) -> String {
+    let incidents = sim.read::<ServiceIncidents>();
+    let fleet = sim.read::<FireFleet>();
+    let selected = uiworld.read::<InspectedBuilding>().e;
+    let colors = simulation::colors();
+    let mut arrived = 0;
+    let mut active = 0;
+    for incident in incidents.active() {
+        active += 1;
+        let response = fleet.response(incident.site, incident.id);
+        let working = response.is_some_and(|response| response.arrived);
+        arrived += usize::from(working);
+        if bounds.contains(incident.position.xy()) {
+            let color = if working { colors.gui_success } else { colors.gui_danger };
+            draw.stroke_circle(incident.position.up(0.4), 4.0, 1.0).color(color);
+        }
+    }
+    let mut selected_truck = selected.and_then(|site| {
+        let incident = fire_incident(sim, site)?;
+        fleet.response(site, incident.id).map(|response| response.truck)
+    });
+    for site in fleet.station_ids() {
+        let Some(building) = map.get(site) else { continue };
+        let Some(station) = service_station(sim, site) else { continue };
+        if selected == Some(site) {
+            selected_truck = Some(station.truck);
+        }
+        if bounds.contains(building.door_pos.xy()) {
+            let color = if station.blocker.is_some() {
+                colors.gui_danger.into()
+            } else if station.phase.is_some() {
+                LinearColor::new(1.0, 0.70, 0.20, 1.0)
+            } else {
+                colors.gui_success.into()
+            };
+            draw.stroke_circle(building.door_pos.up(0.5), 2.5, 0.7).color(color);
+        }
+    }
+    if let Some(truck) = selected_truck.and_then(|id| sim.get(id)) {
+        let color = LinearColor::new(1.0, 0.70, 0.20, 1.0);
+        if let Some(point) = truck.it.get_point() {
+            draw.line(truck.trans.pos.up(0.5), point.up(0.5), 0.7).color(color);
+        }
+        if let Some(route) = truck.it.get_route() {
+            for traversal in route.reversed_route.iter().rev() {
+                if let Some(points) = traversal.raw_points(map) {
+                    draw.polyline(points.iter().map(|point| point.up(0.5)).collect(), 0.7, false)
+                        .color(color);
+                }
+            }
+        }
+    }
+    let mut assigned = std::collections::BTreeMap::new();
+    let mut durations = Vec::new();
+    for event in fleet.events() {
+        match event.kind {
+            FireResponseEventKind::Assigned => { assigned.insert(event.incident, event.tick); }
+            FireResponseEventKind::Arrived => {
+                if let Some(start) = assigned.remove(&event.incident) {
+                    durations.push(event.tick.0.saturating_sub(start.0));
+                }
+            }
+            _ => {}
+        }
+    }
+    durations.sort_unstable();
+    let mut summary = format!("{active} active fires · {arrived} crews on scene");
+    if !durations.is_empty() {
+        let p95 = durations[(durations.len() * 95).div_ceil(100) - 1];
+        let minutes = p95 as f64 / prototypes::TICKS_PER_MINUTE as f64;
+        summary.push_str(&format!(" · Dispatch to arrival p95 {minutes:.1} min"));
+    }
+    summary
 }
 
 fn draw_selected_service_ring(
@@ -577,7 +655,7 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
         (Sewage, "Sewage"),
         (WaterBodies, "Water Bodies"),
         (Coverage(ServiceKind::Health), "Health coverage"),
-        (Coverage(ServiceKind::Fire), "Fire prevention reach"),
+        (Coverage(ServiceKind::Fire), "Fire prevention and response"),
         (Coverage(ServiceKind::Police), "Police coverage"),
         (Coverage(ServiceKind::School), "School coverage"),
         (Coverage(ServiceKind::Garbage), "Garbage coverage"),
@@ -619,6 +697,13 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
                 .find_map(|&(option, label)| (option == mode).then_some(label))
                 .unwrap_or(labels[selected]);
             legend::render(mode, label, empty, uiworld);
+            if mode == OverlayMode::Coverage(ServiceKind::Fire) {
+                CACHE.with_borrow(|cache| {
+                    if !cache.fire_summary.is_empty() {
+                        goryak::textc(goryak::on_secondary_container(), cache.fire_summary.clone());
+                    }
+                });
+            }
         }
     }
 }

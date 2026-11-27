@@ -15,7 +15,7 @@ use crate::map::{
     MAX_DECK_TILE_TESTS, ROAD_Z_OFFSET,
 };
 use geom::OBB;
-use geom::{Intersect, PolyLine3, Vec2, Vec3, AABB};
+use geom::{Intersect, PolyLine3, Shape, Vec2, Vec3, AABB};
 use ordered_float::OrderedFloat;
 use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
@@ -105,6 +105,7 @@ impl PreparedSpecialBuilding {
 
 pub struct Map {
     pub(crate) service_frontages: BTreeMap<RoadID, Vec<(BuildingID, OBB)>>,
+    pub(crate) active_service_frontages: BTreeSet<(RoadID, BuildingID)>,
     pub(super) land_ownership: super::LandOwnership,
     pub(super) land_frontage: super::land_frontage::LandFrontage,
     pub(crate) roads: Roads,
@@ -193,6 +194,7 @@ impl Clone for Map {
             lot_origins: self.lot_origins.clone(),
             walking_topology_generation: self.walking_topology_generation,
             service_frontages: self.service_frontages.clone(),
+            active_service_frontages: self.active_service_frontages.clone(),
             driving_policy_generation: self.driving_policy_generation,
             junction_policy_revision: self.junction_policy_revision,
             roundabouts: self.roundabouts.clone(),
@@ -237,6 +239,7 @@ impl Map {
                 .expect("map identities exhausted"),
             walking_topology_generation: 0,
             service_frontages: BTreeMap::new(),
+            active_service_frontages: BTreeSet::new(),
             driving_policy_generation: 0,
             junction_policy_revision: 0,
             roundabouts: BTreeSet::new(),
@@ -520,15 +523,15 @@ impl Map {
         self.junction_rules.len()
     }
 
-    fn check_junction_topology_edit(&self, id: IntersectionID) -> Result<(), ConnectionError> {
-        if !self.has_junction_rules() && self.service_frontages.is_empty() {
+    fn check_junction_edit(&self, id: IntersectionID, changes_geometry: bool) -> Result<(), ConnectionError> {
+        if !self.has_junction_rules() && self.active_service_frontages.is_empty() {
             return Ok(());
         }
         let junction = self.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
         if junction.roads.len() > 128 {
             return Err(ConnectionError::WorkLimit);
         }
-        if junction.roads.iter().any(|road| self.service_frontages.contains_key(road)) {
+        if changes_geometry && junction.roads.iter().any(|&road| self.active_service_road(road)) {
             return Err(ConnectionError::OccupiedServiceAccess);
         }
         if self.junction_rules(id).is_some()
@@ -543,12 +546,23 @@ impl Map {
         Ok(())
     }
 
+    fn check_junction_topology_edit(&self, id: IntersectionID) -> Result<(), ConnectionError> {
+        self.check_junction_edit(id, true)
+    }
+
+    pub(crate) fn active_service_road(&self, road: RoadID) -> bool {
+        self.active_service_frontages
+            .range((road, BuildingID::from(slotmapd::KeyData::from_ffi(0)))..)
+            .next()
+            .is_some_and(|&(found, _)| found == road)
+    }
+
     fn check_connection_junctions(
         &self,
         from: ConnectionEndpoint,
         to: ConnectionEndpoint,
     ) -> Result<(), ConnectionError> {
-        if !self.has_junction_rules() && self.service_frontages.is_empty() {
+        if !self.has_junction_rules() && self.active_service_frontages.is_empty() {
             return Ok(());
         }
         for endpoint in [from, to] {
@@ -706,7 +720,6 @@ impl Map {
         id: IntersectionID,
         f: impl FnOnce(&mut Intersection),
     ) -> Result<(), ConnectionError> {
-        self.check_junction_topology_edit(id)?;
         let inter = self
             .intersections
             .get(id)
@@ -716,9 +729,19 @@ impl Map {
         if next.id != id || next.pos != inter.pos || next.roads != inter.roads {
             return Err(ConnectionError::InvalidEndpoint);
         }
+        let changes_geometry = next.turn_policy.roundabout != inter.turn_policy.roundabout;
+        self.check_junction_edit(id, changes_geometry)?;
+        if !changes_geometry && inter.roads.iter().any(|road| self.service_frontages.contains_key(road)) {
+            self.intersections[id] = next;
+            self.refresh_junction_paths(id, true);
+            self.driving_graph_changed();
+            self.subscribers.dispatch(UpdateType::Road, &self.intersections[id]);
+            self.check_invariants();
+            return Ok(());
+        }
         if self.environment.strict_water_siting()
             || self.land_ownership.is_tiled()
-            || next.turn_policy.roundabout != inter.turn_policy.roundabout
+            || changes_geometry
         {
             super::prepare_junction_update(self, &next, &mut WaterTopologyWork::new().geometry())?;
         }
@@ -739,12 +762,12 @@ impl Map {
         turn: super::TurnPolicy,
         light: super::LightPolicy,
     ) -> Result<(), ConnectionError> {
-        self.check_junction_topology_edit(id)?;
         let mut next = self
             .get(id)
             .ok_or(ConnectionError::InvalidEndpoint)?
             .clone();
         let changed_roundabout = next.turn_policy.roundabout != turn.roundabout;
+        self.check_junction_edit(id, changed_roundabout)?;
         next.turn_policy = turn;
         next.light_policy = light;
         if changed_roundabout
@@ -1116,7 +1139,11 @@ impl Map {
         ConnectionError,
     > {
         let mut local;
-        if work.is_none() && (self.land_ownership.is_tiled() || self.checks_rail_sweeps(pattern)) {
+        if work.is_none()
+            && (self.land_ownership.is_tiled()
+                || self.checks_rail_sweeps(pattern)
+                || !self.active_service_frontages.is_empty())
+        {
             local = WaterTopologyWork::new();
             let (from, to, prepared) =
                 self.prepare_connection(from, to, elbow, pattern, Some(&mut local))?;
@@ -1260,7 +1287,40 @@ impl Map {
         if self.checks_rail_sweeps(pattern) {
             self.authorize_rail_deck(&prepared.preview.deck, pattern, &mut work.remaining)?;
         }
+        self.authorize_service_frontage(&prepared.preview.deck, pattern.width(), &mut work.remaining)?;
         Ok((profile_samples, Some(prepared)))
+    }
+
+    fn authorize_service_frontage(
+        &self,
+        deck: &PolyLine3,
+        width: f32,
+        work: &mut usize,
+    ) -> Result<(), ConnectionError> {
+        for &(road, site) in &self.active_service_frontages {
+            let Some(building) = self.get(site) else { continue };
+            let Some(frontages) = self.service_frontages.get(&road) else { continue };
+            for &(owner, shape) in frontages {
+                if site != owner {
+                    continue;
+                }
+                spend_water_work(work, 1)?;
+                let envelope = shape.expand(width * 0.5);
+                if !envelope.bbox().intersects(&deck.bbox().flatten()) {
+                    continue;
+                }
+                spend_water_work(work, deck.len())?;
+                if deck.as_slice().windows(2).any(|pair| {
+                    let low = pair[0].z.min(pair[1].z) - 1.25;
+                    let high = pair[0].z.max(pair[1].z) + 1.25;
+                    (low..=high).contains(&building.door_pos.z)
+                        && envelope.intersects(&geom::Segment::new(pair[0].xy(), pair[1].xy()))
+                }) {
+                    return Err(ConnectionError::OccupiedServiceAccess);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn checks_rail_sweeps(&self, pattern: &LanePattern) -> bool {
@@ -1428,7 +1488,9 @@ impl Map {
         }
         // Unrestricted bulk connection callers can arrive without a topology
         // projection. Still authorize track geometry before the first map write.
-        let prepared = if prepared.is_none() && self.checks_rail_sweeps(pattern) {
+        let prepared = if prepared.is_none()
+            && (self.checks_rail_sweeps(pattern) || !self.active_service_frontages.is_empty())
+        {
             self.prepare_resolved_connection_inner(
                 from,
                 to,

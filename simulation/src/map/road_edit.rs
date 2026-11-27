@@ -594,7 +594,7 @@ pub(crate) fn prepare_upgrade(
     let [forward, backward] = road.directed_lanes();
     let same_geometry = pattern_matches(forward, &pattern.lanes_forward)
         && pattern_matches(backward, &pattern.lanes_backward);
-    if !same_geometry && map.service_frontages.contains_key(&id) {
+    if !same_geometry && map.active_service_road(id) {
         return Err(Rejection::BusyConflict);
     }
     let mut direction_edits = None;

@@ -288,8 +288,35 @@ fn register_systems_and_resources() {
     register_resource_default::<Happiness, Bincode>("happiness");
     register_resource_default::<Fires, Bincode>("fires");
     register_resource_default::<ServiceIncidents, Bincode>("service_incidents");
+    use crate::souls::events::FireScenarioRules;
+    register_resource_noserialize::<FireScenarioRules>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "fire_scenario_rules",
+            optional: true,
+            save: Box::new(|sim, output| {
+                Bincode::encode_writer(&*sim.read::<FireScenarioRules>(), output)
+            }),
+            load: Box::new(|sim, data| {
+                sim.insert(Bincode::decode::<FireScenarioRules>(data)?);
+                Ok(())
+            }),
+        });
+    }
     register_resource_default::<SiteRemnants, Bincode>("site_remnants");
-    register_resource_default::<FireFleet, Bincode>("fire_fleet");
+    register_resource_noserialize::<FireFleet>();
+    register_resource_noserialize::<crate::souls::service_dispatch::FireWorkTiming>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "fire_fleet",
+            optional: false,
+            save: Box::new(|sim, output| FireFleet::save(sim, output)),
+            load: Box::new(|sim, data| {
+                sim.insert(FireFleet::load(data)?);
+                Ok(())
+            }),
+        });
+    }
     register_resource_default::<Market, Bincode>("market");
     register_resource_default::<EcoStats, Bincode>("ecostats");
     register_resource_default::<CityStats, Bincode>("citystats");
@@ -307,7 +334,18 @@ fn register_systems_and_resources() {
     register_resource_default::<crate::souls::residence::Residences, Bincode>("residences");
     register_resource_default::<crate::economy::ZoneDemand, Bincode>("zone_demand");
     register_resource_default::<crate::economy::Budget, Bincode>("budget");
-    register_resource_default::<ParkingManagement, Bincode>("pmanagement");
+    register_resource_noserialize::<ParkingManagement>();
+    unsafe {
+        SAVELOAD_FUNCS.push(SaveLoadFunc {
+            name: "pmanagement",
+            optional: false,
+            save: Box::new(|sim, output| sim.read::<ParkingManagement>().save(output)),
+            load: Box::new(|sim, data| {
+                sim.insert(ParkingManagement::load(data)?);
+                Ok(())
+            }),
+        });
+    }
     register_resource_default::<BuildingInfos, Bincode>("binfos");
     register_resource::<GameTime, Bincode>("game_time", || GameTime::new(Tick(INITIAL_TICK)));
     register_transport_grid();

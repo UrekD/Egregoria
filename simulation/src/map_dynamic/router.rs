@@ -1204,6 +1204,12 @@ impl Router {
         selected || self.plans_with(id)
     }
 
+    pub(crate) fn has_reserved_spot(&self, mut matches: impl FnMut(crate::map::ParkingSpotID) -> bool) -> bool {
+        self.cur_step.iter().chain(&self.steps).any(|step| {
+            matches!(step, RoutingStep::Park(_, Some(spot)) if matches(spot.id()))
+        })
+    }
+
     pub fn cancel_route(&mut self, parking: &mut ParkingManagement) {
         if matches!(self.cur_step, Some(RoutingStep::RideTransit { .. })) {
             self.defer_replan();

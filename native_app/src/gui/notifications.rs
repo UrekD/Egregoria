@@ -424,8 +424,10 @@ impl NotificationSampler {
         use simulation::souls::events::ServiceIncidents;
         const RESPONSE_WINDOW: u64 = 25 * prototypes::TICKS_PER_MINUTE;
         let incidents = sim.read::<ServiceIncidents>();
+        let fleet = sim.read::<simulation::souls::service_dispatch::FireFleet>();
         let overdue: BTreeMap<_, _> = incidents.active()
-            .filter(|incident| now.elapsed.0.saturating_sub(incident.alarm_tick.0) >= RESPONSE_WINDOW)
+            .filter(|incident| now.elapsed.0.saturating_sub(incident.alarm_tick.0) >= RESPONSE_WINDOW
+                && fleet.response(incident.site, incident.id).is_none_or(|response| !response.arrived))
             .map(|incident| (incident.id, incident.site))
             .collect();
         let Some(previous) = self.unserved_fires.replace(overdue.keys().copied().collect()) else {

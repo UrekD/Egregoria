@@ -780,10 +780,10 @@ impl Itinerary {
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
         mut on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
         mut admission: Option<&mut MovementAdmission<'_>>,
-        mut move_on: impl FnMut(Traversable, Vec3, Vec3) -> bool,
+        mut move_on: impl FnMut(Option<Traversable>, Vec3, Vec3) -> bool,
     ) -> Vec3 {
         if self.is_pedestrian_egress() {
-            return self.advance_egress(map, position, dist_to_move);
+            return self.advance_egress(map, position, dist_to_move, |from, to| move_on(None, from, to));
         }
         if on_road_entry.is_some()
             && matches!(self.road_approach, RoadApproach::Unchecked)
@@ -822,9 +822,7 @@ impl Itinerary {
                                 } else {
                                     position
                                 };
-                                if self
-                                    .get_travers()
-                                    .is_some_and(|&traversal| !move_on(traversal, position, next))
+                                if !move_on(self.get_travers().copied(), position, next)
                                 {
                                     return position;
                                 }
@@ -843,9 +841,7 @@ impl Itinerary {
             }
             // Coincident waypoints still advance after a tolerance snap.
             if dist <= (dist_to_move + snap).max(0.0) {
-                if self
-                    .get_travers()
-                    .is_some_and(|&traversal| !move_on(traversal, position, p))
+                if !move_on(self.get_travers().copied(), position, p)
                 {
                     return position;
                 }
@@ -883,9 +879,7 @@ impl Itinerary {
             }
 
             let next = position + (p - position).normalize_to(dist_to_move.max(0.0));
-            if self
-                .get_travers()
-                .is_some_and(|&traversal| !move_on(traversal, position, next))
+            if !move_on(self.get_travers().copied(), position, next)
             {
                 return position;
             }
@@ -1236,7 +1230,13 @@ impl Itinerary {
         false
     }
 
-    fn advance_egress(&mut self, map: &Map, mut position: Vec3, mut distance: f32) -> Vec3 {
+    fn advance_egress(
+        &mut self,
+        map: &Map,
+        mut position: Vec3,
+        mut distance: f32,
+        mut move_on: impl FnMut(Vec3, Vec3) -> bool,
+    ) -> Vec3 {
         let ItineraryKind::PedestrianEgress(ref mut egress) = self.kind else {
             unreachable!();
         };
@@ -1253,7 +1253,11 @@ impl Itinerary {
             let segment = next - position;
             let length = segment.mag();
             if length > distance {
-                return position + segment * (distance / length);
+                let next = position + segment * (distance / length);
+                return if move_on(position, next) { next } else { position };
+            }
+            if !move_on(position, next) {
+                return position;
             }
             self.reversed_local_path.pop();
             position = next;
@@ -1527,12 +1531,19 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     // before any user's final itinerary movement.
     let mut junction_state = resources.write::<JunctionAdmission>();
     let fleet = resources.read::<crate::souls::service_dispatch::FireFleet>();
+    let sweeps = fleet.has_sweeps();
+    use crate::souls::service_dispatch::FireWorkTiming;
+    let timing = sweeps && resources.read::<FireWorkTiming>().enabled;
+    let mut sweep_elapsed = std::time::Duration::ZERO;
     let mut junction_frame = if map.has_junction_controller() {
         let mut grid = resources.write::<TransportGrid>();
         grid.refresh_admission_colliders(world);
+        let preference = resources
+            .read::<crate::souls::events::FireScenarioRules>()
+            .emergency_junction_preference;
         let incidents = resources.read::<crate::souls::events::ServiceIncidents>();
         JunctionFrame::prepare(world, map, &grid, &mut junction_state, tick, &|truck| {
-            fleet.is_live_outbound(world, &incidents, truck)
+            preference && fleet.is_live_outbound(world, &incidents, truck)
         })
     } else {
         junction_state.clear();
@@ -1598,7 +1609,19 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             record,
             admission.as_mut(),
             |traversal, from, to| {
-                if let Some(truck) = truck {
+                if sweeps {
+                    if let Some(user) = user {
+                        let start = timing.then(std::time::Instant::now);
+                        let clear = fleet.sweep_allows(user.owner, from, to, user.half_extent);
+                        if let Some(start) = start {
+                            sweep_elapsed += start.elapsed();
+                        }
+                        if !clear {
+                            return false;
+                        }
+                    }
+                }
+                if let (Some(truck), Some(traversal)) = (truck, traversal) {
                     freight.observe_truck_motion(truck, traversal.kind, from, to);
                 }
                 true
@@ -1722,6 +1745,9 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     }
 
     let reservations = resources.read::<TrainReservations>();
+    if timing {
+        resources.write::<FireWorkTiming>().movement += sweep_elapsed;
+    }
     let lengths = world
         .trains
         .iter()
@@ -1740,6 +1766,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                 None::<fn(RoadID, PathKind)>,
                 None,
                 |traversal, from, to| {
+                    let Some(traversal) = traversal else { return true; };
                     let Some(track) = traversal.raw_points(map) else {
                         return false;
                     };

@@ -133,6 +133,23 @@ struct Offer {
     site: BuildingID,
 }
 
+/// Settings for an unrecorded scenario or benchmark. Ordinary cities use the defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FireScenarioRules {
+    pub suppress_incidental_offers: bool,
+    pub emergency_junction_preference: bool,
+}
+
+impl FireScenarioRules {
+    pub fn apply(self, sim: &mut Simulation) -> Result<(), &'static str> {
+        if sim.read::<crate::utils::replay::Replay>().enabled {
+            return Err("fire scenario rules require an unrecorded simulation");
+        }
+        *sim.write::<Self>() = self;
+        Ok(())
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct ServiceIncidents {
     #[serde(deserialize_with = "deserialize_active")]
@@ -292,7 +309,7 @@ pub fn events_update(sim: &mut Simulation) {
             let incident = incidents.active.get_mut(&id).expect("scheduled incident");
             let minutes = tick.0.saturating_sub(incident.last_update.0) / TICKS_PER_MINUTE;
             let working = sim.read::<super::service_dispatch::FireFleet>()
-                .suppression_started(id, incident.id);
+                .suppression_started(sim, id, incident.id);
             let working_minutes = working.map_or(0, |start| tick.0.saturating_sub(start.0) / TICKS_PER_MINUTE);
             if working_minutes >= super::service_dispatch::SUPPRESSION_MINUTES {
                 incidents.active.remove(&id);
@@ -359,6 +376,7 @@ fn sample_risk(sim: &Simulation, map: &crate::map::Map, incidents: &mut ServiceI
     let coverage = sim.read::<CoverageGrid>();
     let environment = sim.read::<EnvGrid>();
     let seed = sim.read::<SimulationOptions>().seed;
+    let suppress_offers = sim.read::<FireScenarioRules>().suppress_incidental_offers;
     let denominator = prototypes::try_prototype(prototypes::ServiceID::new("fire-station"))
         .and_then(|service| service.fire)
         .map_or(10_000, |fire| fire.ignition_hourly_denominator);
@@ -382,7 +400,7 @@ fn sample_risk(sim: &Simulation, map: &crate::map::Map, incidents: &mut ServiceI
             .fold(0, |state, field| splitmix64(state ^ field));
         if u128::from(roll) < threshold {
             incidents.counters.spontaneous += 1;
-            if benchmark_suppresses_fire_offers() {
+            if suppress_offers {
                 continue;
             }
             incidents.offer(Offer {
@@ -395,14 +413,6 @@ fn sample_risk(sim: &Simulation, map: &crate::map::Map, incidents: &mut ServiceI
         incidents.next_risk_minute += 1;
         incidents.cohort_after = None;
     }
-}
-
-// Only the source-pinned background benchmark sets this process option.
-fn benchmark_suppresses_fire_offers() -> bool {
-    static BACKGROUND: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *BACKGROUND.get_or_init(|| {
-        std::env::var_os("EGR_P9_BENCH_PROFILE").is_some_and(|value| value == "background")
-    })
 }
 
 fn eligible(building: &Building) -> bool {

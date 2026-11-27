@@ -215,18 +215,17 @@ fn fire_station_on_parking_loop() -> (TestCtx, crate::map::BuildingID) {
     (test, site)
 }
 
-#[test]
-fn p9_staffed_truck_suppresses_and_returns_after_saved_boarding() {
+fn staffed_fire_at_boarding() -> (TestCtx, crate::map::BuildingID, crate::map::BuildingID, Vec<crate::HumanID>) {
     use crate::souls::desire::{Work, WorkKind};
-    use crate::souls::events::{offer_fixture_fire, FireEventKind};
+    use crate::souls::events::offer_fixture_fire;
     use crate::souls::goods_company::company_soul;
     use crate::souls::human::spawn_human;
     use crate::souls::service_dispatch::{
-        service_station, FireFleet, FireResponseEventKind, ServiceTripPhase,
+        service_station, ServiceTripPhase,
     };
     use crate::transportation::Location;
     use crate::{BuildingKind, SoulID};
-    use geom::{vec3, Vec2, OBB};
+    use geom::{Vec2, OBB};
     use prototypes::{BuildingGen, GoodsCompanyID};
 
     let (mut test, station) = fire_station_on_parking_loop();
@@ -304,6 +303,77 @@ fn p9_staffed_truck_suppresses_and_returns_after_saved_boarding() {
         crate::souls::service_dispatch::fire_response_blocker(&test.g, target)
     );
 
+    (test, station, target, crew)
+}
+
+#[test]
+fn p9_station_closure_waits_for_the_crew_to_return_to_the_door() {
+    use crate::souls::demolition::{demolition_quote, demolition_status, start_demolition};
+    use crate::souls::service_dispatch::{service_station, ServiceTripPhase};
+
+    for phase in [ServiceTripPhase::WalkingToTruck, ServiceTripPhase::LeavingTruck] {
+        let (mut test, station, _, _) = staffed_fire_at_boarding();
+        for _ in 0..28_000 {
+            if service_station(&test.g, station).unwrap().phase == Some(phase) {
+                break;
+            }
+            test.tick_fast();
+        }
+        assert_eq!(service_station(&test.g, station).unwrap().phase, Some(phase));
+        let quote = demolition_quote(&test.g, station).unwrap().quote;
+        let mut work = crate::map::MAX_WATER_BATCH_WORK;
+        start_demolition(&mut test.g, station, quote, &mut work).unwrap();
+        let mut restored: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        let mut schedule = Simulation::schedule();
+        for _ in 0..28_000 {
+            if let Some(view) = service_station(&test.g, station) {
+                if view.phase.is_some() {
+                    assert_eq!(demolition_status(&test.g, station).unwrap().progress_percent, 0);
+                }
+            } else {
+                break;
+            }
+            test.tick_fast();
+            restored.tick(&mut schedule, []);
+        }
+        assert!(test.g.map().get(station).is_none(), "clearance stuck in {phase:?}");
+        assert_eq!(test.g.hashes(), restored.hashes());
+    }
+}
+
+#[test]
+fn p9_working_requires_both_responders_at_the_door() {
+    use crate::souls::service_dispatch::{service_station, ServiceTripPhase};
+
+    let (mut test, station, target, crew) = staffed_fire_at_boarding();
+    for _ in 0..15_000 {
+        if service_station(&test.g, station).unwrap().phase == Some(ServiceTripPhase::Working) {
+            break;
+        }
+        test.tick_fast();
+    }
+    assert_eq!(service_station(&test.g, station).unwrap().phase, Some(ServiceTripPhase::Working));
+    test.g.world.edit_human(crew[0], |human| human.trans.pos.y += 5.0);
+    assert!(Bincode::decode::<Simulation>(&Bincode::encode(&test.g).unwrap()).is_err());
+    for _ in 0..(7 * TICKS_PER_MINUTE) {
+        test.tick_fast();
+    }
+    assert!(!test.g.read::<Fires>().events_since(0).any(|event|
+        event.building == target && event.kind == crate::souls::events::FireEventKind::Extinguished
+    ));
+}
+
+#[test]
+fn p9_staffed_truck_suppresses_and_returns_after_saved_boarding() {
+    use crate::souls::events::FireEventKind;
+    use crate::souls::service_dispatch::{
+        service_station, FireFleet, FireResponseEventKind, ServiceTripPhase,
+    };
+    use crate::transportation::Location;
+    use geom::vec3;
+
+    let (mut test, station, target, crew) = staffed_fire_at_boarding();
+    let road = test.g.map().get(station).unwrap().connected_road.unwrap();
     let bytes = Bincode::encode(&test.g).unwrap();
     let mut restored: Simulation = Bincode::decode(&bytes).unwrap();
     assert_eq!(test.g.hashes(), restored.hashes());
@@ -493,4 +563,91 @@ fn p9_retrofit_rejects_a_changed_quote_before_reserving_the_curb() {
     assert_eq!(test.g.read::<Government>().money, balance - valid.price);
     assert!(service_station(&test.g, retrofit).is_some());
     assert_eq!(test.g.world.vehicles.len(), 2);
+}
+
+#[test]
+fn p9_paused_junction_edit_invalidates_a_boarding_route_across_reload() {
+    use crate::souls::service_dispatch::cached_route_is_current;
+
+    let (test, station, _, _) = staffed_fire_at_boarding();
+    let junction = {
+        let map = test.g.map();
+        let road = map.get(station).unwrap().connected_road.unwrap();
+        map.get(road).unwrap().src
+    };
+    assert!(cached_route_is_current(&test.g, station));
+    test.g.map_mut().update_intersection(junction, |inter| {
+        inter.turn_policy.left_turns = false;
+    });
+    assert!(!test.g.map().get(junction).unwrap().turn_policy.left_turns);
+    assert!(!cached_route_is_current(&test.g, station));
+    let mut expected = test.g;
+    let mut restored: Simulation = Bincode::decode(&Bincode::encode(&expected).unwrap()).unwrap();
+    assert!(!cached_route_is_current(&restored, station));
+    let mut a = Simulation::schedule();
+    let mut b = Simulation::schedule();
+    for _ in 0..5000 {
+        expected.tick(&mut a, []);
+        restored.tick(&mut b, []);
+    }
+    assert_eq!(expected.hashes(), restored.hashes());
+}
+
+#[test]
+fn p9_idle_station_does_not_lock_a_frontage_removal() {
+    use crate::souls::service_dispatch::service_station;
+    use crate::world_command::WorldCommand;
+
+    let (mut test, station) = fire_station_on_parking_loop();
+    let road = test.g.map().get(station).unwrap().connected_road.unwrap();
+    let truck = service_station(&test.g, station).unwrap().truck;
+    test.g.apply_commands([&WorldCommand::MapRemoveRoad(road)]);
+    assert!(test.g.map().get(road).is_none());
+    assert!(test.g.map().get(station).is_some());
+    assert!(service_station(&test.g, station).is_none());
+    assert!(test.g.get(truck).is_none());
+    assert!(Bincode::decode::<Simulation>(&Bincode::encode(&test.g).unwrap()).is_ok());
+}
+
+#[test]
+fn p9_route_search_resumes_a_metered_frontier_across_save() {
+    use crate::souls::service_access::{drive_route, preview_fire_apron, AccessBudget, AccessError, DriveSearch};
+
+    let (test, station) = fire_station_on_parking_loop();
+    let apron = preview_fire_apron(&test.g, station).unwrap();
+    let map = test.g.map();
+    let expected = drive_route(&map, apron.departure, apron.arrival, &mut AccessBudget(4096)).unwrap();
+    let mut search = DriveSearch::new(apron.departure, apron.arrival);
+    assert_eq!(search.advance(&map, &mut AccessBudget(1)), Err(AccessError::WorkLimit));
+    let mut search: DriveSearch = Bincode::decode(&Bincode::encode(&search).unwrap()).unwrap();
+    for _ in 0..1024 {
+        match search.advance(&map, &mut AccessBudget(1)) {
+            Ok(result) => {
+                assert_eq!(result, expected);
+                return;
+            }
+            Err(AccessError::WorkLimit) => {}
+            Err(error) => panic!("route lost after yielding: {error:?}"),
+        }
+    }
+    panic!("route search stalled");
+}
+
+#[test]
+fn p9_scenario_fire_rules_are_local_and_survive_reload() {
+    use crate::souls::events::FireScenarioRules;
+    let ordinary = TestCtx::new_fast();
+    let mut benchmark = Simulation::new_with_options(crate::SimulationOptions {
+        terrain_size: 1,
+        save_replay: false,
+        ..crate::SimulationOptions::LEGACY
+    });
+    let rules = FireScenarioRules {
+        suppress_incidental_offers: true,
+        emergency_junction_preference: true,
+    };
+    rules.apply(&mut benchmark).unwrap();
+    let restored: Simulation = Bincode::decode(&Bincode::encode(&benchmark).unwrap()).unwrap();
+    assert_eq!(*restored.read::<FireScenarioRules>(), rules);
+    assert_eq!(*ordinary.g.read::<FireScenarioRules>(), FireScenarioRules::default());
 }

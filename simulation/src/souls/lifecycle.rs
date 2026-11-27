@@ -933,6 +933,7 @@ fn finish_human_departures(sim: &mut Simulation) {
 fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Option<Vec3>>) {
     let (world, resources) = sim.world_res();
     let mut parking = resources.write::<ParkingManagement>();
+    let fleet = resources.read::<super::service_dispatch::FireFleet>();
     let mut returning_trucks = BTreeSet::new();
     let mut idle_drivers = BTreeSet::new();
     world.humans.edit_each(|human_id, human| {
@@ -991,7 +992,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
         cancel = cancel
             || human.router.references_any_building(includes)
             || human.decision.kind.references_any_building(includes);
-        if cancel {
+        if cancel && !fleet.deployed(human_id) {
             if let Location::Vehicle(vehicle) = human.location {
                 if let Some(body) = world.vehicles.get_mut(vehicle) {
                     if matches!(body.vehicle.kind, VehicleKind::Truck) {
@@ -1005,6 +1006,7 @@ fn clear_references(sim: &mut Simulation, buildings: &BTreeMap<BuildingID, Optio
         }
     });
     drop(parking);
+    drop(fleet);
     {
         let mut infos = resources.write::<BuildingInfos>();
         for (&id, door) in buildings {

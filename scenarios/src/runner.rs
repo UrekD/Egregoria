@@ -238,6 +238,8 @@ impl ScenarioCtx {
     }
 
     pub(crate) fn measure_fire_window(&mut self, label: &str, ticks: u64) -> (f64, f64) {
+        use simulation::souls::service_dispatch::FireWorkTiming;
+        self.sim.write::<FireWorkTiming>().enabled = true;
         let mut samples = Vec::new();
         let mut phases = BTreeMap::new();
         for _ in 0..ticks {
@@ -250,6 +252,17 @@ impl ScenarioCtx {
                 let (sum, max) = phases.entry(name).or_insert((0.0, 0.0_f64));
                 *sum += f64::from(ms);
                 *max = max.max(f64::from(ms));
+            }
+            let mut shared = self.sim.write::<FireWorkTiming>();
+            for (name, time) in [
+                ("fire_sweep_movement", std::mem::take(&mut shared.movement)),
+                ("fire_apron_edits", std::mem::take(&mut shared.access_edits)),
+            ] {
+                let ms = time.as_secs_f64() * 1000.0;
+                total += ms;
+                let (sum, max) = phases.entry(name).or_insert((0.0, 0.0_f64));
+                *sum += ms;
+                *max = max.max(ms);
             }
             samples.push(total);
         }

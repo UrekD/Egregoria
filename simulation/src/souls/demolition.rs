@@ -27,6 +27,7 @@ pub enum SiteRemnantCause {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DemolitionPhase {
     WaitingForFire,
+    DrainingResponders,
     Working,
     ClearanceBlocked,
 }
@@ -248,8 +249,10 @@ pub fn demolition_status(sim: &Simulation, site: BuildingID) -> Option<Demolitio
             let work = now.0.saturating_sub(start.0).min(duration(job.quote));
             let percent = (work * 100 / duration(job.quote)) as u8;
             (Some(DemolitionPhase::Working), percent)
-        } else {
+        } else if fire_incident(sim, site).is_some() {
             (Some(DemolitionPhase::WaitingForFire), 0)
+        } else {
+            (Some(DemolitionPhase::DrainingResponders), 0)
         }
     } else {
         (None, 0)
@@ -327,16 +330,16 @@ pub(crate) fn start_demolition(
         return Ok(receipt);
     }
     let now = elapsed_tick(sim);
-    let burning = fire_incident(sim, site).is_some();
+    let draining = waiting_to_start(sim, site);
     if demolition_status(sim, site).is_none() {
         ruin_site(sim, site, SiteRemnantCause::PlayerDemolition)?;
     }
     let mut remnants = sim.write::<SiteRemnants>();
     let job = DemolitionJob {
         quote: submitted,
-        work_started: (!burning).then_some(now),
+        work_started: (!draining).then_some(now),
         accepted_at: now,
-        next_update: Tick(now.0.saturating_add(if burning {
+        next_update: Tick(now.0.saturating_add(if draining {
             TICKS_PER_MINUTE
         } else {
             duration(submitted)
@@ -401,6 +404,10 @@ pub(crate) fn forget_site(sim: &Simulation, site: BuildingID) {
     }
 }
 
+fn waiting_to_start(sim: &Simulation, site: BuildingID) -> bool {
+    fire_incident(sim, site).is_some() || super::service_dispatch::clearance_blocked(sim, site)
+}
+
 pub(crate) fn demolition_update(sim: &mut Simulation) {
     if sim.read::<SiteRemnants>().due.is_empty() {
         return;
@@ -418,7 +425,7 @@ pub(crate) fn demolition_update(sim: &mut Simulation) {
             .job
             .expect("scheduled clearance");
         if job.work_started.is_none() {
-            if fire_incident(sim, site).is_some() {
+            if waiting_to_start(sim, site) {
                 job.next_update = Tick(now.0.saturating_add(TICKS_PER_MINUTE));
             } else {
                 job.work_started = Some(now);

@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use common::saveload::Encoder;
-use geom::{Transform, Vec3};
+use common::saveload::{Bincode, Encoder};
+use geom::{Intersect, Segment, Segment3, Shape, Transform, Vec3, AABB};
 use prototypes::{GameTime, Money, RecTimeInterval, ServiceID, Tick, TICKS_PER_MINUTE};
 use serde::{Deserialize, Serialize};
 
 use super::events::{elapsed_tick, fire_incident, ServiceIncidents};
 use super::service_access::{
-    check_apron, current_anchor, drive_route, is_fire_station, AccessBudget, AccessError,
-    DirectedLaneAnchor, FireApronPreview, APRON_WORK,
+    check_apron, check_scene_apron, corridor_clear, current_anchor, is_fire_station, walking_corridor, AccessBudget, AccessError,
+    DirectedLaneAnchor, DriveSearch, FireApronPreview, APRON_WORK, MAX_FIRE_ROUTE,
 };
 use crate::map::{BuildingID, Map, RoadID, Traversable, TraverseKind};
 use crate::map_dynamic::{
@@ -22,7 +22,9 @@ use crate::world_command::Rejection;
 use crate::{HumanID, Simulation, VehicleID};
 
 const STATION_LIMIT: usize = 128;
-const SEARCH_WORK: usize = 8192;
+const DISPATCH_ROUTE_WORK: usize = 768;
+const RECOVERY_ROUTE_WORK: usize = 768;
+const CANDIDATE_ROUTE_WORK: usize = 192;
 const WATCHDOG: u64 = 15 * TICKS_PER_MINUTE;
 const HOLD_DEADLINE: u64 = 30 * TICKS_PER_MINUTE;
 const RETRY_TICKS: u64 = TICKS_PER_MINUTE;
@@ -122,11 +124,69 @@ struct Trip {
     #[serde(deserialize_with = "decode_route")]
     inbound: Option<Vec<Traversable>>,
     #[serde(skip)]
-    graph: (u64, u64),
+    graph: Option<(u64, u64)>,
     failed: bool,
     suppressed: bool,
     hold_reported: bool,
     retry_at: Tick,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ServiceCurbOwner {
+    Station(BuildingID),
+    Scene(BuildingID),
+}
+
+// A capsule around the whole truck (including front and rear) bounds its body
+// throughout the sweep, independent of heading between waypoints.
+const SWEEP_RADIUS: f32 = 3.0;
+const TRUCK_OVERHANG: f32 = 3.0;
+const SWEEP_DECK: f32 = 1.25;
+
+struct SweepClaim {
+    path: [Vec3; 17],
+    bounds: AABB,
+    pocket: Option<Vec3>,
+}
+
+impl SweepClaim {
+    fn new(mut path: [Vec3; 17], pocket: Option<Vec3>) -> Self {
+        path[0] -= (path[1] - path[0]).normalize() * TRUCK_OVERHANG;
+        path[16] += (path[16] - path[15]).normalize() * TRUCK_OVERHANG;
+        let mut bounds = Segment::new(path[0].xy(), path[16].xy()).bbox();
+        for point in path.iter().chain(pocket.iter()) {
+            bounds = bounds.union(AABB::new_ll_ur(point.xy(), point.xy()));
+        }
+        Self { path, bounds: bounds.expand(SWEEP_RADIUS), pocket }
+    }
+
+    fn blocks(&self, from: Vec3, to: Vec3, radius: f32) -> bool {
+        if !(self.bounds.expand(radius)).intersects(&Segment::new(from.xy(), to.xy())) {
+            return false;
+        }
+        let movement = Segment::new(from.xy(), to.xy());
+        let same_deck = |z: f32| (from.z - z).abs().min((to.z - z).abs()) <= SWEEP_DECK;
+        let hits = |segment: Segment, clearance: f32| {
+            movement.distance(&segment) < clearance
+                && (segment.project(from.xy()).distance2(from.xy()) >= clearance * clearance
+                    || segment.project(to.xy()).distance2(to.xy())
+                        <= segment.project(from.xy()).distance2(from.xy()))
+        };
+        self.path.windows(2).any(|pair| {
+            same_deck(pair[0].z) &&
+                hits(Segment::new(pair[0].xy(), pair[1].xy()), SWEEP_RADIUS + radius)
+        }) || self.pocket.is_some_and(|pocket| {
+            same_deck(pocket.z) && hits(Segment::new(pocket.xy(), pocket.xy()), 1.1 + radius)
+        })
+    }
+}
+
+/// Opt-in wall-time samples for the scenario runner. These never affect simulation state.
+#[derive(Default)]
+pub struct FireWorkTiming {
+    pub enabled: bool,
+    pub movement: std::time::Duration,
+    pub access_edits: std::time::Duration,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -149,6 +209,40 @@ pub struct FireFleet {
     alarms: BTreeMap<(Tick, BuildingID, u64), Alarm>,
     dispatch_at: Tick,
     roster_at: Tick,
+    #[serde(skip)]
+    routes: RouteWork,
+    #[serde(skip)]
+    sweeps: BTreeMap<VehicleID, SweepClaim>,
+}
+
+type AlarmKey = (Tick, BuildingID, u64);
+
+#[derive(Default, Serialize, Deserialize)]
+struct RouteWork {
+    #[serde(skip)]
+    graph: Option<(u64, u64)>,
+    current: BTreeSet<BuildingID>,
+    #[serde(deserialize_with = "decode_dispatch_searches")]
+    dispatch: BTreeMap<AlarmKey, DispatchSearch>,
+    #[serde(deserialize_with = "decode_recovery_searches")]
+    recoveries: BTreeMap<VehicleID, DriveSearch>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct DispatchSearch {
+    scene: FireApronPreview,
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, STATION_LIMIT>")]
+    stations: Vec<BuildingID>,
+    search: Option<DriveSearch>,
+    outgoing: Option<(u64, Vec<Traversable>)>,
+    best: Option<RouteOffer>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct RouteOffer {
+    rank: (u64, BuildingID),
+    outbound: Vec<Traversable>,
+    inbound: Vec<Traversable>,
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize)]
@@ -167,6 +261,18 @@ fn decode_alarms<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<BTreeMap<(Tick, BuildingID, u64), Alarm>, D::Error> {
     decode_map(d, 4096)
+}
+
+fn decode_dispatch_searches<'de, D: serde::Deserializer<'de>>(d: D)
+    -> Result<BTreeMap<AlarmKey, DispatchSearch>, D::Error>
+{
+    decode_map(d, 4096)
+}
+
+fn decode_recovery_searches<'de, D: serde::Deserializer<'de>>(d: D)
+    -> Result<BTreeMap<VehicleID, DriveSearch>, D::Error>
+{
+    decode_map(d, STATION_LIMIT)
 }
 
 fn decode_map<'de, D, K, V>(d: D, limit: usize) -> Result<BTreeMap<K, V>, D::Error>
@@ -210,7 +316,7 @@ fn decode_route<'de, D: serde::Deserializer<'de>>(
     #[derive(Deserialize)]
     struct Route(
         #[serde(
-            deserialize_with = "crate::world_command::bounded_command_vec::<_, _, SEARCH_WORK>"
+            deserialize_with = "crate::world_command::bounded_command_vec::<_, _, MAX_FIRE_ROUTE>"
         )]
         Vec<Traversable>,
     );
@@ -246,6 +352,52 @@ fn decode_history<'de, D: serde::Deserializer<'de>>(
 }
 
 impl FireFleet {
+    pub(crate) fn save(sim: &Simulation, mut output: &mut dyn std::io::Write) -> std::io::Result<()> {
+        let fleet = sim.read::<Self>();
+        let revision = access_revision(&sim.map());
+        Bincode::encode_writer(&*fleet, &mut output)?;
+        let current: BTreeSet<_> = fleet.stations.iter().filter_map(|(&site, station)| {
+            (station.trip.as_ref()?.graph == Some(revision)).then_some(site)
+        }).collect();
+        let empty = RouteWork::default();
+        let routes = if fleet.routes.graph == Some(revision) { &fleet.routes } else { &empty };
+        Bincode::encode_writer(&(&current, &routes.dispatch, &routes.recoveries), output)
+    }
+
+    pub(crate) fn load(mut input: &[u8]) -> std::io::Result<Self> {
+        let mut fleet: Self = Bincode::decode_reader(&mut input)?;
+        if !input.is_empty() {
+            fleet.routes = Bincode::decode(input)?;
+        }
+        Ok(fleet)
+    }
+
+    fn sync_routes(&mut self, revision: (u64, u64)) {
+        if self.routes.graph != Some(revision) {
+            self.routes = RouteWork {
+                graph: Some(revision),
+                ..RouteWork::default()
+            };
+        }
+    }
+
+    pub(crate) fn has_sweeps(&self) -> bool {
+        !self.sweeps.is_empty()
+    }
+
+    pub(crate) fn sweep_allows(
+        &self,
+        owner: crate::transportation::junction_admission::EntryOwner,
+        from: Vec3,
+        to: Vec3,
+        radius: f32,
+    ) -> bool {
+        self.sweeps.iter().all(|(&truck, claim)| {
+            owner == crate::transportation::junction_admission::EntryOwner::Vehicle(truck)
+                || !claim.blocks(from, to, radius)
+        })
+    }
+
     pub fn events(&self) -> impl Iterator<Item = &FireResponseEvent> {
         self.history.iter()
     }
@@ -279,13 +431,19 @@ impl FireFleet {
             })
     }
 
-    pub(crate) fn suppression_started(&self, site: BuildingID, incident: u64) -> Option<Tick> {
+    pub(crate) fn suppression_started(
+        &self,
+        sim: &Simulation,
+        site: BuildingID,
+        incident: u64,
+    ) -> Option<Tick> {
         let station = self.stations.get(self.assignments.get(&incident)?)?;
         let trip = station.trip.as_ref()?;
         (trip.site == site
             && trip.incident == incident
             && trip.phase == ServiceTripPhase::Working
-            && !trip.failed)
+            && !trip.failed
+            && crew_at_scene(sim, trip))
             .then_some(trip.phase_since)
     }
 
@@ -302,6 +460,38 @@ impl FireFleet {
             kind,
         });
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FireResponseView {
+    pub station: BuildingID,
+    pub truck: VehicleID,
+    pub phase: ServiceTripPhase,
+    pub arrived: bool,
+}
+
+impl FireFleet {
+    pub fn response(&self, site: BuildingID, incident: u64) -> Option<FireResponseView> {
+        let &id = self.assignments.get(&incident)?;
+        let station = self.stations.get(&id)?;
+        let trip = station.trip.as_ref()?;
+        (trip.site == site && trip.incident == incident && !trip.failed).then_some(FireResponseView {
+            station: id,
+            truck: station.truck,
+            phase: trip.phase,
+            arrived: trip.phase == ServiceTripPhase::Working || trip.suppressed,
+        })
+    }
+
+    pub fn station_ids(&self) -> impl Iterator<Item = BuildingID> + '_ {
+        self.stations.keys().copied()
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn cached_route_is_current(sim: &Simulation, station: BuildingID) -> bool {
+    let fleet = sim.read::<FireFleet>();
+    fleet.stations[&station].trip.as_ref().unwrap().graph == Some(access_revision(&sim.map()))
 }
 
 pub fn service_station(sim: &Simulation, site: BuildingID) -> Option<FireStationView> {
@@ -430,31 +620,81 @@ fn prepare_apron(
 }
 
 fn guard_frontage(sim: &Simulation, site: BuildingID, apron: &FireApronPreview) {
-    sim.map_mut()
-        .service_frontages
-        .entry(apron.road)
-        .or_default()
-        .push((site, apron.envelope));
+    sim.map_mut().service_frontages.entry(apron.road).or_default().extend([
+        (site, apron.envelope),
+        (site, walking_corridor(apron.bay, apron.pocket, apron.door)),
+    ]);
 }
 
 fn release_frontage(sim: &Simulation, site: BuildingID, apron: &FireApronPreview) {
-    let road = apron.road;
     let mut map = sim.map_mut();
-    let frontages = map
-        .service_frontages
-        .get_mut(&road)
-        .expect("occupied service frontage");
-    frontages.retain(|(owner, shape)| *owner != site || shape.corners != apron.envelope.corners);
+    map.active_service_frontages.remove(&(apron.road, site));
+    let Some(frontages) = map.service_frontages.get_mut(&apron.road) else {
+        return;
+    };
+    frontages.retain(|(id, _)| *id != site);
     if frontages.is_empty() {
-        map.service_frontages.remove(&road);
+        map.service_frontages.remove(&apron.road);
     }
 }
 
+/// Reanchor unaffected bays after an admitted edit and decommission idle bays whose physical
+/// access was removed. The station building can commission again through the retrofit command.
+pub(crate) fn reconcile_idle_aprons(sim: &mut Simulation) {
+    if sim.read::<FireFleet>().stations.is_empty() {
+        return;
+    }
+    let timer = sim.read::<FireWorkTiming>().enabled.then(std::time::Instant::now);
+    let retire = {
+        let map = sim.map();
+        let mut fleet = sim.write::<FireFleet>();
+        fleet.stations.iter_mut().filter_map(|(&site, station)| {
+            if station.trip.is_some() {
+                return None;
+            }
+            let apron = &mut station.apron;
+            let valid = map.get(site).is_some_and(|site| site.connected_road == Some(apron.road))
+                && apron.parking_displacements.iter().all(|&spot| map.parking.get(spot).is_some())
+                && !map.spatial_map().query(apron.envelope, crate::map::ProjectFilter::ALL)
+                    .any(|object| matches!(object,
+                        crate::map::ProjectKind::Road(id) if id != apron.road)
+                        || matches!(object, crate::map::ProjectKind::Intersection(_)
+                            | crate::map::ProjectKind::Building(_)))
+                && corridor_clear(&map, Some(site), walking_corridor(apron.bay, apron.pocket, apron.door));
+            let reanchor = |lane, point| {
+                let anchor = current_anchor(&map, lane, point)?;
+                let lane = map.get(lane)?;
+                (lane.kind == crate::map::LaneKind::Driving && lane.parent == apron.road
+                    && lane.points.point_along(anchor.offset_cm as f32 / 100.0).is_close(point, 0.04))
+                    .then_some(anchor)
+            };
+            if valid {
+                if let (Some(arrival), Some(departure)) = (
+                    reanchor(apron.arrival.lane, apron.arrival_sweep[0]),
+                    reanchor(apron.departure.lane, *apron.departure_sweep.last().unwrap()),
+                ) {
+                    if arrival.offset_cm < departure.offset_cm {
+                        apron.arrival = arrival;
+                        apron.departure = departure;
+                        return None;
+                    }
+                }
+            }
+            Some(site)
+        }).collect::<Vec<_>>()
+    };
+    for site in retire {
+        release_station(sim, site);
+    }
+    if let Some(start) = timer {
+        sim.write::<FireWorkTiming>().access_edits += start.elapsed();
+    }
+}
 pub(crate) fn commission(sim: &mut Simulation, site: BuildingID, apron: FireApronPreview) {
     assert!(sim
         .resources
         .write::<ParkingManagement>()
-        .reserve_service_curb(&apron.parking_displacements));
+        .reserve_service_curb(ServiceCurbOwner::Station(site), &apron.parking_displacements));
     guard_frontage(sim, site, &apron);
     let truck = crate::transportation::spawn_fire_truck(sim, apron.bay);
     let mut fleet = sim.resources.write::<FireFleet>();
@@ -500,7 +740,7 @@ pub(crate) fn release_station(sim: &mut Simulation, site: BuildingID) {
         release_frontage(sim, site, &station.apron);
         sim.resources
             .write::<ParkingManagement>()
-            .release_service_curb(&station.apron.parking_displacements);
+            .release_service_curb(ServiceCurbOwner::Station(site), &station.apron.parking_displacements);
         sim.world.vehicles.remove(station.truck);
     }
 }
@@ -629,9 +869,11 @@ pub(crate) fn dispatch_fire(sim: &mut Simulation) {
         return;
     }
     update_rosters(sim, now);
+    let revision = access_revision(&sim.map());
     let next = {
         let incidents = sim.resources.read::<ServiceIncidents>();
         let mut fleet = sim.resources.write::<FireFleet>();
+        fleet.sync_routes(revision);
         fleet.alarms.retain(|&(_, site, id), _| {
             incidents
                 .incident(site)
@@ -650,10 +892,11 @@ pub(crate) fn dispatch_fire(sim: &mut Simulation) {
                 fleet.alarms.remove(&(fire.alarm_tick, fire.site, fire.id));
             }
         }
-        let next = fleet
-            .alarms
-            .iter()
-            .find(|(_, alarm)| alarm.due <= now)
+        let FireFleet { alarms, routes, .. } = &mut *fleet;
+        routes.dispatch.retain(|key, _| alarms.contains_key(key));
+        let next = alarms.iter()
+            .filter(|(_, alarm)| alarm.due <= now)
+            .min_by_key(|(&key, alarm)| (alarm.due, key))
             .map(|(&key, _)| key);
         fleet.dispatch_at = if next.is_some() {
             Tick(now.0 + 1)
@@ -665,14 +908,18 @@ pub(crate) fn dispatch_fire(sim: &mut Simulation) {
     let Some(key @ (_, site, incident)) = next else {
         return;
     };
-    let result = prepare_trip(sim, site);
+    let result = prepare_trip(sim, key);
     let (station_id, crew, scene, outbound, inbound) = match result {
         Ok(result) => result,
         Err(reason) => {
             sim.resources.write::<FireFleet>().alarms.insert(
                 key,
                 Alarm {
-                    due: Tick(now.0 + RETRY_TICKS),
+                    due: Tick(now.0 + if reason == FireResponseBlocker::Route(AccessError::WorkLimit) {
+                        1
+                    } else {
+                        RETRY_TICKS
+                    }),
                     blocker: Some(reason),
                 },
             );
@@ -682,16 +929,17 @@ pub(crate) fn dispatch_fire(sim: &mut Simulation) {
     if !sim
         .resources
         .write::<ParkingManagement>()
-        .reserve_service_curb(&scene.parking_displacements)
+        .reserve_service_curb(ServiceCurbOwner::Scene(site), &scene.parking_displacements)
     {
         return;
     }
     guard_frontage(sim, site, &scene);
-    let graph = access_revision(&sim.map());
+    let station_apron = commissioned_apron(sim, station_id).expect("selected station");
+    sim.map_mut().active_service_frontages.extend([(scene.road, site), (station_apron.road, station_id)]);
+    let graph = Some(revision);
     let position = fire_incident(sim, site)
         .expect("active dispatch incident")
         .position;
-    let station_apron = commissioned_apron(sim, station_id).expect("selected station");
     for (seat, &id) in crew.iter().enumerate() {
         walk_to_pocket(sim, id, &station_apron, seat);
     }
@@ -731,74 +979,148 @@ type Assignment = (
     Vec<Traversable>,
 );
 
-fn prepare_trip(sim: &Simulation, site: BuildingID) -> Result<Assignment, FireResponseBlocker> {
+fn prepare_trip(sim: &Simulation, key: AlarmKey) -> Result<Assignment, FireResponseBlocker> {
+    let (_, site, _) = key;
     let map = sim.map();
     let target = map.get(site).ok_or(FireResponseBlocker::SceneAccess(
         AccessError::MissingFrontage,
     ))?;
-    let fleet = sim.resources.read::<FireFleet>();
-    let mut options = Vec::new();
-    let mut blocker = FireResponseBlocker::Staffing;
-    for (&station_id, station) in &fleet.stations {
-        if station.trip.is_some() || sim.get(station.truck).is_none() {
-            continue;
+    let pending = sim.write::<FireFleet>().routes.dispatch.remove(&key);
+    let mut search = match pending {
+        Some(search) => search,
+        None => {
+            let fleet = sim.read::<FireFleet>();
+            let mut stations = Vec::new();
+            let mut blocker = FireResponseBlocker::Staffing;
+            for (&id, station) in &fleet.stations {
+                let Some(spec) = map
+                    .get(id)
+                    .and_then(|building| building.kind.as_goods_company())
+                    .and_then(|id| prototypes::try_prototype(ServiceID::from(id)))
+                    .and_then(|proto| proto.fire)
+                else {
+                    continue;
+                };
+                if !station.apron.door.is_close(target.door_pos, f32::from(spec.max_response_m)) {
+                    continue;
+                }
+                match dispatch_crew(sim, &fleet, id, station) {
+                    Ok(_) => stations.push(id),
+                    Err(FireResponseBlocker::Power) => blocker = FireResponseBlocker::Power,
+                    Err(_) => {}
+                }
+            }
+            if stations.is_empty() {
+                return Err(blocker);
+            }
+            drop(fleet);
+            let scene = check_scene_apron(
+                sim,
+                target.connected_road,
+                target.door_pos,
+                &mut AccessBudget(APRON_WORK),
+            ).map_err(FireResponseBlocker::SceneAccess)?;
+            stations.reverse();
+            DispatchSearch { scene, stations, best: None, search: None, outgoing: None }
         }
-        let Some(spec) = map
-            .get(station_id)
-            .and_then(|building| building.kind.as_goods_company())
-            .and_then(|id| prototypes::try_prototype(ServiceID::from(id)))
-            .and_then(|proto| proto.fire)
-        else {
-            continue;
-        };
-        if !station
-            .apron
-            .door
-            .is_close(target.door_pos, f32::from(spec.max_response_m))
-        {
-            continue;
-        }
-        match available_crew(sim, station_id, station) {
-            Ok(crew) => options.push((station_id, crew, station)),
-            Err(FireResponseBlocker::Power) => blocker = FireResponseBlocker::Power,
-            Err(_) => {}
-        }
+    };
+
+    let fleet = sim.read::<FireFleet>();
+    let result = search.advance(sim, &map, &fleet, &mut AccessBudget(DISPATCH_ROUTE_WORK));
+    drop(fleet);
+    if result == Err(AccessError::WorkLimit) {
+        sim.write::<FireFleet>().routes.dispatch.insert(key, search);
+        return Err(FireResponseBlocker::Route(AccessError::WorkLimit));
     }
-    if options.is_empty() {
-        return Err(blocker);
+    result.map_err(FireResponseBlocker::Route)?;
+    let best = search.best.ok_or(FireResponseBlocker::Route(AccessError::NoReturnLoop))?;
+    let id = best.rank.1;
+    let fleet = sim.read::<FireFleet>();
+    let station = fleet.stations.get(&id).ok_or(FireResponseBlocker::Staffing)?;
+    let crew = dispatch_crew(sim, &fleet, id, station)?;
+    if map.service_apron_overlaps(&search.scene.envelope) {
+        return Err(FireResponseBlocker::SceneAccess(AccessError::OccupiedCurb));
     }
-    let mut work = AccessBudget(SEARCH_WORK);
-    let scene = check_apron(sim, target.connected_road, target.door_pos, None, &mut work)
-        .map_err(FireResponseBlocker::SceneAccess)?;
-    let mut best: Option<(
-        (u64, BuildingID),
-        [HumanID; 2],
-        Vec<Traversable>,
-        Vec<Traversable>,
-    )> = None;
-    for (station_id, crew, station) in options {
-        if crew.iter().any(|id| fleet.deployed.contains(id)) {
-            continue;
-        }
-        let (ms, out) = match drive_route(&map, station.apron.departure, scene.arrival, &mut work) {
-            Ok(result) => result,
-            Err(AccessError::NoReturnLoop) => continue,
-            Err(reason) => return Err(FireResponseBlocker::Route(reason)),
-        };
-        let rank = (ms, station_id);
-        if best.as_ref().is_some_and(|(current, ..)| rank >= *current) {
-            continue;
-        }
-        let (_, back) = match drive_route(&map, scene.departure, station.apron.arrival, &mut work) {
-            Ok(result) => result,
-            Err(AccessError::NoReturnLoop) => continue,
-            Err(reason) => return Err(FireResponseBlocker::Route(reason)),
-        };
-        best = Some((rank, crew, out, back));
+    Ok((id, crew, search.scene, best.outbound, best.inbound))
+}
+
+fn dispatch_crew(
+    sim: &Simulation,
+    fleet: &FireFleet,
+    id: BuildingID,
+    station: &Station,
+) -> Result<[HumanID; 2], FireResponseBlocker> {
+    if station.trip.is_some() || sim.get(station.truck).is_none() {
+        return Err(FireResponseBlocker::Staffing);
     }
-    let ((_, station), crew, outbound, inbound) =
-        best.ok_or(FireResponseBlocker::Route(AccessError::NoReturnLoop))?;
-    Ok((station, crew, scene, outbound, inbound))
+    let crew = available_crew(sim, id, station)?;
+    if crew.iter().any(|id| fleet.deployed.contains(id)) {
+        return Err(FireResponseBlocker::Staffing);
+    }
+    Ok(crew)
+}
+
+impl DispatchSearch {
+    fn advance(
+        &mut self,
+        sim: &Simulation,
+        map: &Map,
+        fleet: &FireFleet,
+        work: &mut AccessBudget,
+    ) -> Result<(), AccessError> {
+        if self.best.as_ref().is_some_and(|best| {
+            let id = best.rank.1;
+            fleet.stations.get(&id).is_none_or(|s| dispatch_crew(sim, fleet, id, s).is_err())
+        }) {
+            // Reconsider candidates pruned against the old winner on the next alarm attempt.
+            return Err(AccessError::NoReturnLoop);
+        }
+        while let Some(&id) = self.stations.last() {
+            if work.0 == 0 {
+                return Err(AccessError::WorkLimit);
+            }
+            work.0 -= 1;
+            let result = match fleet.stations.get(&id) {
+                Some(station) if dispatch_crew(sim, fleet, id, station).is_ok() =>
+                    self.advance_candidate(map, id, station, work),
+                _ => Err(AccessError::NoReturnLoop),
+            };
+            if result == Err(AccessError::WorkLimit) {
+                return result;
+            }
+            self.stations.pop();
+            self.search = None;
+            self.outgoing = None;
+        }
+        Ok(())
+    }
+
+    fn advance_candidate(
+        &mut self,
+        map: &Map,
+        id: BuildingID,
+        station: &Station,
+        work: &mut AccessBudget,
+    ) -> Result<(), AccessError> {
+        if self.outgoing.is_none() {
+            let search = self.search.get_or_insert_with(|| {
+                DriveSearch::new(station.apron.departure, self.scene.arrival)
+            });
+            let (ms, path) = search.advance(map, work)?;
+            if self.best.as_ref().is_some_and(|best| best.rank <= (ms, id)) {
+                return Ok(());
+            }
+            self.outgoing = Some((ms, path));
+            self.search = None;
+        }
+        let search = self.search.get_or_insert_with(|| {
+            DriveSearch::new(self.scene.departure, station.apron.arrival)
+        });
+        let (_, inbound) = search.advance(map, work)?;
+        let (ms, outbound) = self.outgoing.take().expect("outbound route checked");
+        self.best = Some(RouteOffer { rank: (ms, id), outbound, inbound });
+        Ok(())
+    }
 }
 
 fn pocket(apron: &FireApronPreview, seat: usize) -> Vec3 {
@@ -809,6 +1131,10 @@ fn at(sim: &Simulation, id: HumanID, position: Vec3) -> bool {
     sim.get(id).is_some_and(|human| {
         human.location == Location::Outside && human.trans.pos.is_close(position, 0.15)
     })
+}
+
+fn crew_at_scene(sim: &Simulation, trip: &Trip) -> bool {
+    trip.crew.iter().all(|id| id.is_some_and(|id| at(sim, id, trip.scene.door)))
 }
 
 fn walk_to_pocket(sim: &mut Simulation, id: HumanID, apron: &FireApronPreview, seat: usize) {
@@ -883,48 +1209,61 @@ fn park_at(sim: &mut Simulation, truck: VehicleID, pose: Transform) {
     }
 }
 
-fn sweep_clear(sim: &Simulation, truck: VehicleID, path: &[Vec3]) -> bool {
-    let radius = VehicleKind::Truck.width() * 0.5;
-    let own = sim
-        .get(truck)
-        .and_then(|vehicle| vehicle.collider)
-        .map(|collider| collider.0);
-    let grid = sim.resources.read::<TransportGrid>();
-    let mut work = 256;
-    for &point in path {
-        for (handle, position) in grid.query_around(point.xy(), radius + 4.5) {
-            if work == 0 {
-                return false;
-            }
-            work -= 1;
-            if Some(handle) != own
-                && grid.get(handle).is_some_and(|(_, state)| {
-                    (state.height - point.z).abs() <= 1.25
-                        && position.is_close(point.xy(), radius + state.radius)
-                })
-            {
-                return false;
-            }
-        }
-    }
-    true
-}
-
-fn await_clear_sweep(
+fn claim_sweep(
     sim: &Simulation,
     truck: VehicleID,
-    path: &[Vec3],
+    path: [Vec3; 17],
+    pocket: Option<Vec3>,
     trip: &mut Trip,
     now: Tick,
 ) -> bool {
     if now < trip.retry_at {
         return false;
     }
-    let clear = sweep_clear(sim, truck, path);
-    if !clear {
+    let claim = SweepClaim::new(path, pocket);
+    if sweep_clear(sim, truck, &claim, trip.crew) {
+        sim.write::<FireFleet>().sweeps.insert(truck, claim);
+        true
+    } else {
         trip.retry_at = Tick(now.0 + 10);
+        false
     }
-    clear
+}
+
+fn sweep_clear(sim: &Simulation, truck: VehicleID, claim: &SweepClaim, crew: [Option<HumanID>; 2]) -> bool {
+    let own = sim.get(truck).and_then(|vehicle| vehicle.collider).map(|c| c.0);
+    let responders = crew.map(|id| id.and_then(|id| sim.get(id)?.collider).map(|c| c.0));
+    let fleet = sim.read::<FireFleet>();
+    if fleet.sweeps.values().any(|active| {
+        claim.bounds.intersects(&active.bounds)
+            && claim.path.windows(2).any(|pair| active.blocks(pair[0], pair[1], SWEEP_RADIUS))
+    }) {
+        return false;
+    }
+    let grid = sim.read::<TransportGrid>();
+    let bounds = claim.bounds.expand(VehicleKind::Bus.width() * 0.5);
+    for (work, (handle, position)) in grid.query_aabb(bounds.ll, bounds.ur).enumerate() {
+        if work >= 256 {
+            return false;
+        }
+        if Some(handle) == own || responders.contains(&Some(handle)) {
+            continue;
+        }
+        if grid.get(handle).is_some_and(|(_, actor)| {
+            let pos = position.z(actor.height);
+            claim.path.windows(2).any(|pair| {
+                let nearest = Segment3::new(pair[0], pair[1]).project(pos);
+                (nearest.z - pos.z).abs() <= SWEEP_DECK
+                    && nearest.xy().is_close(position, SWEEP_RADIUS + actor.radius)
+            }) || claim.pocket.is_some_and(|pocket| {
+                (pocket.z - pos.z).abs() <= SWEEP_DECK
+                    && pocket.xy().is_close(position, 1.1 + actor.radius)
+            })
+        }) {
+            return false;
+        }
+    }
+    true
 }
 
 fn transition(trip: &mut Trip, now: Tick, phase: ServiceTripPhase) {
@@ -953,27 +1292,36 @@ pub(crate) fn advance_fire_trips(sim: &mut Simulation) {
     }
     let now = elapsed_tick(sim);
     let daytime = sim.resources.read::<GameTime>().daytime;
-    let stations: Vec<_> = sim
-        .resources
-        .read::<FireFleet>()
-        .active_stations
-        .iter()
-        .copied()
-        .collect();
+    let revision = access_revision(&sim.map());
+    let (mut stations, mut recoveries) = {
+        let mut fleet = sim.write::<FireFleet>();
+        fleet.sync_routes(revision);
+        (fleet.active_stations.iter().copied().collect::<Vec<_>>(),
+            std::mem::take(&mut fleet.routes.recoveries))
+    };
+    let offset = (now.0 % stations.len() as u64) as usize;
+    stations.rotate_left(offset);
+    let mut work = AccessBudget(RECOVERY_ROUTE_WORK);
     for site in stations {
-        let mut station = sim
-            .resources
-            .write::<FireFleet>()
-            .stations
-            .remove(&site)
-            .expect("active station");
+        let mut station = sim.write::<FireFleet>().stations.remove(&site).expect("active station");
         let mut trip = station.trip.take().expect("active response");
-        let finished = step_trip(sim, site, station.truck, &station.apron, &mut trip, now);
+        let mut recovery = recoveries.remove(&station.truck);
+        let allowance = work.0.min(CANDIDATE_ROUTE_WORK);
+        let mut slice = AccessBudget(allowance);
+        let finished = step_trip(sim, site, station.truck, &station.apron, &mut trip, now,
+            &mut recovery, &mut slice);
+        work.0 -= allowance - slice.0;
+        if !finished {
+            if let Some(recovery) = recovery {
+                recoveries.insert(station.truck, recovery);
+            }
+        }
         let mut fleet = sim.resources.write::<FireFleet>();
         if (finished || trip.failed) && fleet.assignments.get(&trip.incident) == Some(&site) {
             fleet.assignments.remove(&trip.incident);
         }
         if finished {
+            sim.map_mut().active_service_frontages.remove(&(station.apron.road, site));
             fleet.active_stations.remove(&site);
             fleet.outbound.remove(&station.truck);
             for id in trip.crew.into_iter().flatten() {
@@ -1008,6 +1356,7 @@ pub(crate) fn advance_fire_trips(sim: &mut Simulation) {
         }
         fleet.stations.insert(site, station);
     }
+    sim.write::<FireFleet>().routes.recoveries = recoveries;
 }
 
 fn step_trip(
@@ -1017,6 +1366,8 @@ fn step_trip(
     apron: &FireApronPreview,
     trip: &mut Trip,
     now: Tick,
+    recovery: &mut Option<DriveSearch>,
+    work: &mut AccessBudget,
 ) -> bool {
     use ServiceTripPhase::*;
 
@@ -1080,7 +1431,7 @@ fn step_trip(
                 .all(|(seat, id)| id.is_some_and(|id| at(sim, id, pocket(apron, seat))))
             {
                 // Leave the current crew on the pocket until a swept merge is clear.
-                if !await_clear_sweep(sim, truck, &apron.departure_sweep, trip, now) {
+                if !claim_sweep(sim, truck, apron.departure_sweep, None, trip, now) {
                     return false;
                 }
                 for id in crew.into_iter().flatten() {
@@ -1105,13 +1456,15 @@ fn step_trip(
                 };
                 (from, apron.arrival, false)
             };
-            if !outbound {
-                if trip.phase == Merging {
-                    trip.inbound = None;
-                }
+            if !outbound && trip.phase == Merging {
+                trip.inbound = None;
                 release_scene(sim, trip);
             }
-            if route_from(sim, truck, trip, from, to, outbound, now) {
+            if route_from(sim, truck, trip, from, to, outbound, now, recovery, work) {
+                sim.write::<FireFleet>().sweeps.remove(&truck);
+                if !outbound {
+                    release_scene(sim, trip);
+                }
                 transition(trip, now, if outbound { Outbound } else { Returning });
                 if outbound {
                     if let [Some(first), Some(second)] = crew {
@@ -1126,18 +1479,18 @@ fn step_trip(
         Outbound | Returning => {
             let outbound = trip.phase == Outbound && active && !trip.failed;
             let target = if outbound { &trip.scene } else { apron };
-            let edit = trip.graph != access_revision(&sim.map());
+            let edit = trip.graph != Some(access_revision(&sim.map()));
             let needs_route = vehicle.it.is_wait_for_reroute().is_some()
                 || (trip.phase == Outbound && !outbound)
                 || edit;
             if needs_route {
-                let current = vehicle
-                    .it
+                let current = recovery.as_ref().map(DriveSearch::departure)
+                    .or_else(|| vehicle.it
                     .get_travers()
                     .and_then(|traversal| match traversal.kind {
                         TraverseKind::Lane(lane) => current_anchor(&sim.map(), lane, positions[0]),
                         TraverseKind::Turn(_) => None,
-                    })
+                    }))
                     .or_else(|| {
                         vehicle.it.is_wait_for_reroute().and_then(|_| {
                             let map = sim.map();
@@ -1156,7 +1509,7 @@ fn step_trip(
                 if let Some(from) = current {
                     trip.outbound = None;
                     trip.inbound = None;
-                    if route_from(sim, truck, trip, from, to, outbound, now) {
+                    if route_from(sim, truck, trip, from, to, outbound, now, recovery, work) {
                         if !outbound {
                             release_scene(sim, trip);
                             transition(trip, now, Returning);
@@ -1177,7 +1530,7 @@ fn step_trip(
                 && vehicle.trans.pos.is_close(target.arrival_sweep[0], 0.35)
             {
                 let sweep = target.arrival_sweep;
-                if !await_clear_sweep(sim, truck, &sweep, trip, now) {
+                if !claim_sweep(sim, truck, sweep, Some(target.pocket), trip, now) {
                     return false;
                 }
                 sim.resources.write::<FireFleet>().outbound.remove(&truck);
@@ -1198,6 +1551,7 @@ fn step_trip(
                 return false;
             }
             park_at(sim, truck, target.bay);
+            sim.write::<FireFleet>().sweeps.remove(&truck);
             for (seat, id) in crew.into_iter().enumerate() {
                 if let Some(id) = id {
                     exit_truck(sim, id, target, seat);
@@ -1216,16 +1570,13 @@ fn step_trip(
         WalkingToSite => {
             if !active || trip.failed {
                 walk_back(sim, trip, now);
-            } else if crew
-                .into_iter()
-                .flatten()
-                .all(|id| at(sim, id, trip.scene.door))
-            {
+            } else if crew_at_scene(sim, trip) {
                 transition(trip, now, Working);
                 event(sim, station, trip, now, FireResponseEventKind::Arrived);
             }
         }
         Working => {
+            trip.failed |= !crew_at_scene(sim, trip);
             if !active || trip.failed {
                 if !active
                     && !trip.failed
@@ -1245,7 +1596,7 @@ fn step_trip(
                 .all(|(seat, id)| id.is_none_or(|id| at(sim, id, pocket(&trip.scene, seat))))
             {
                 let sweep = trip.scene.departure_sweep;
-                if !await_clear_sweep(sim, truck, &sweep, trip, now) {
+                if !claim_sweep(sim, truck, sweep, None, trip, now) {
                     return false;
                 }
                 for id in crew.into_iter().flatten() {
@@ -1295,7 +1646,7 @@ fn release_scene(sim: &Simulation, trip: &mut Trip) {
         release_frontage(sim, trip.site, &trip.scene);
         sim.resources
             .write::<ParkingManagement>()
-            .release_service_curb(&trip.scene.parking_displacements);
+            .release_service_curb(ServiceCurbOwner::Scene(trip.site), &trip.scene.parking_displacements);
     }
 }
 
@@ -1307,52 +1658,94 @@ fn route_from(
     to: DirectedLaneAnchor,
     outbound: bool,
     now: Tick,
+    recovery: &mut Option<DriveSearch>,
+    work: &mut AccessBudget,
 ) -> bool {
     if now < trip.retry_at {
         return false;
     }
     let map = sim.map();
     let revision = access_revision(&map);
-    let stored = if outbound {
-        trip.outbound.take()
-    } else {
-        trip.inbound.take()
+    if trip.graph != Some(revision) {
+        trip.outbound = None;
+        trip.inbound = None;
+    }
+    let stored = if outbound { trip.outbound.take() } else { trip.inbound.take() };
+    let plan = match stored {
+        Some(route) => Ok(route),
+        None => {
+            if recovery.as_ref().is_none_or(|search| !search.matches(from, to)) {
+                *recovery = Some(DriveSearch::new(from, to));
+            }
+            recovery.as_mut().unwrap().advance(&map, work).map(|(_, path)| path)
+        }
     };
-    let plan = stored.filter(|_| trip.graph == revision).or_else(|| {
-        drive_route(&map, from, to, &mut AccessBudget(APRON_WORK))
-            .ok()
-            .map(|(_, route)| route)
-    });
-    let itinerary = plan.and_then(|route| Itinerary::service_drive(&map, from, to, route));
+    let incomplete = plan.as_ref().err() == Some(&AccessError::WorkLimit);
+    let itinerary = plan.ok().and_then(|route| Itinerary::service_drive(&map, from, to, route));
     drop(map);
     let vehicle = &mut sim.world.vehicles[truck];
+    if !incomplete {
+        *recovery = None;
+    }
     if let Some(itinerary) = itinerary {
         vehicle.it = itinerary;
-        trip.graph = revision;
+        trip.graph = Some(revision);
         true
     } else {
-        // Keep the current directed traversal for the next metered retry.
+        if matches!(trip.phase, ServiceTripPhase::Outbound | ServiceTripPhase::Returning) {
+            vehicle.it = Itinerary::wait_for_reroute_to_lane(from.lane, from.offset_cm as f32 / 100.0);
+        }
         vehicle.speed.0 = 0.0;
-        trip.retry_at = Tick(now.0 + RETRY_TICKS);
+        trip.retry_at = Tick(now.0 + if incomplete { 1 } else { RETRY_TICKS });
         false
     }
+}
+
+fn valid_saved_route(
+    map: &Map,
+    from: DirectedLaneAnchor,
+    to: DirectedLaneAnchor,
+    path: &[Traversable],
+) -> bool {
+    if path.is_empty() {
+        return from.lane == to.lane && from.offset_cm <= to.offset_cm;
+    }
+    let mut lane = from.lane;
+    let mut chunks = path.rchunks_exact(2);
+    for pair in &mut chunks {
+        let (TraverseKind::Lane(dst), TraverseKind::Turn(turn)) = (pair[0].kind, pair[1].kind) else {
+            return false;
+        };
+        if turn.src != lane || turn.dst != dst || turn.bidirectional
+            || pair.iter().any(|step| step.dir != crate::map::TraverseDirection::Forward || step.raw_points(map).is_none())
+            || map.get(dst).is_none_or(|lane| lane.kind != crate::map::LaneKind::Driving)
+        {
+            return false;
+        }
+        lane = dst;
+    }
+    chunks.remainder().is_empty() && lane == to.lane
 }
 
 /// Rebuild transient movement indexes from the saved claims and verify their live counterparts.
 pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
     let mut frontages = BTreeMap::new();
+    let mut active_frontages = BTreeSet::new();
     let now = elapsed_tick(sim);
     let map = sim.map();
-    let parking = sim.resources.read::<ParkingManagement>();
     let revision = access_revision(&map);
     let mut fleet = sim.resources.write::<FireFleet>();
+    let current = std::mem::take(&mut fleet.routes.current);
+    fleet.routes.graph = Some(revision);
     let mut trucks = BTreeSet::new();
-    let mut parking_claims = BTreeSet::new();
+    let mut parking_claims = BTreeMap::new();
     let mut crew = BTreeSet::new();
     let mut active = BTreeSet::new();
     let mut outbound = BTreeMap::new();
+    let mut sweeps = BTreeMap::new();
     let mut assignments = BTreeMap::new();
-    let mut check_apron = |site, apron: &FireApronPreview| {
+    let mut scenes = BTreeSet::new();
+    let mut check_apron = |site, owner, apron: &FireApronPreview| {
         if map.get(apron.road).is_none()
             || [apron.arrival, apron.departure].into_iter().any(|anchor| {
                 map.get(anchor.lane).is_none_or(|lane| {
@@ -1381,8 +1774,7 @@ pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
                 map.parking.get(spot).is_none_or(|p| {
                     map.get(p.parent)
                         .is_none_or(|lane| lane.parent != apron.road)
-                }) || parking.is_spot_free(spot)
-                    || !parking_claims.insert(spot)
+                }) || parking_claims.insert(spot, owner).is_some()
             })
         {
             return Err("invalid persisted fire apron");
@@ -1390,7 +1782,10 @@ pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
         frontages
             .entry(apron.road)
             .or_insert_with(Vec::new)
-            .push((site, apron.envelope));
+            .extend([
+                (site, apron.envelope),
+                (site, walking_corridor(apron.bay, apron.pocket, apron.door)),
+            ]);
         Ok(())
     };
     for (&site, station) in &mut fleet.stations {
@@ -1411,7 +1806,10 @@ pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
         {
             return Err("invalid persisted fire station");
         }
-        check_apron(site, &station.apron)?;
+        check_apron(site, ServiceCurbOwner::Station(site), &station.apron)?;
+        if building.door_pos != station.apron.door {
+            return Err("fire apron does not reach the station door");
+        }
         let Some(trip) = &mut station.trip else {
             if !matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot)
                 || vehicle.trans != station.apron.bay
@@ -1422,12 +1820,18 @@ pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
             continue;
         };
         active.insert(site);
+        active_frontages.insert((station.apron.road, site));
         if trip.incident == 0
             || trip.phase_since > now
             || trip.last_progress > now
             || !trip.position.is_finite()
             || trip.last_positions.iter().any(|pos| !pos.is_finite())
-            || trip.scene_reserved && map.get(trip.site).is_none()
+            || trip.scene_reserved && map.get(trip.site).is_none_or(|scene| {
+                scene.door_pos != trip.scene.door || scene.connected_road != Some(trip.scene.road)
+            })
+            || (!trip.failed && trip.crew.contains(&None))
+            || (!trip.failed && trip.phase == ServiceTripPhase::Working && !crew_at_scene(sim, trip))
+            || (trip.scene_reserved && !scenes.insert(trip.site))
             || !trip.failed && assignments.insert(trip.incident, site).is_some()
             || trip.crew.iter().flatten().any(|&id| {
                 !crew.insert(id)
@@ -1446,8 +1850,28 @@ pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
         {
             return Err("invalid persisted fire response");
         }
+        let parked = match trip.phase {
+            ServiceTripPhase::Boarding | ServiceTripPhase::LeavingTruck => Some(station.apron.bay),
+            ServiceTripPhase::WalkingToSite | ServiceTripPhase::Working
+                | ServiceTripPhase::WalkingToTruck => Some(trip.scene.bay),
+            _ => None,
+        };
+        if let Some(bay) = parked {
+            if vehicle.trans != bay || vehicle.collider.is_some()
+                || !matches!(vehicle.vehicle.state, VehicleState::ParkedAtDepot)
+            {
+                return Err("fire truck does not reciprocate the crew phase");
+            }
+        }
+        if current.contains(&site) && (
+            trip.outbound.as_ref().is_some_and(|route| !valid_saved_route(&map, station.apron.departure, trip.scene.arrival, route))
+                || trip.inbound.as_ref().is_some_and(|route| !valid_saved_route(&map, trip.scene.departure, station.apron.arrival, route))
+        ) {
+            return Err("invalid cached fire route");
+        }
         if trip.scene_reserved {
-            check_apron(trip.site, &trip.scene)?;
+            active_frontages.insert((trip.scene.road, trip.site));
+            check_apron(trip.site, ServiceCurbOwner::Scene(trip.site), &trip.scene)?;
         }
         if trip.phase == ServiceTripPhase::Outbound && !trip.failed {
             let [Some(first), Some(second)] = trip.crew else {
@@ -1457,14 +1881,40 @@ pub(crate) fn restore_fire_fleet(sim: &Simulation) -> Result<(), &'static str> {
                 outbound.insert(station.truck, (trip.site, trip.incident, [first, second]));
             }
         }
-        trip.graph = revision;
+        let sweep = match trip.phase {
+            ServiceTripPhase::Merging => Some(SweepClaim::new(station.apron.departure_sweep, None)),
+            ServiceTripPhase::Parking => Some(SweepClaim::new(trip.scene.arrival_sweep, Some(trip.scene.pocket))),
+            ServiceTripPhase::LeavingScene => Some(SweepClaim::new(trip.scene.departure_sweep, None)),
+            ServiceTripPhase::Docking => Some(SweepClaim::new(station.apron.arrival_sweep, Some(station.apron.pocket))),
+            _ => None,
+        };
+        if let Some(sweep) = sweep {
+            sweeps.insert(station.truck, sweep);
+        }
+        trip.graph = current.contains(&site).then_some(revision);
     }
+    if !current.is_subset(&active)
+        || fleet.routes.dispatch.keys().any(|key| !fleet.alarms.contains_key(key))
+        || fleet.routes.recoveries.keys().any(|truck| !trucks.contains(truck))
+    {
+        return Err("orphaned fire route work");
+    }
+    if !trucks.is_empty() && sim.world().humans.iter().any(|(human, actor)| {
+        let Location::Vehicle(vehicle) = actor.location else { return false };
+        trucks.contains(&vehicle) && !crew.contains(&human)
+    }) {
+        return Err("fire truck has an unassigned occupant");
+    }
+    sim.write::<ParkingManagement>().restore_service_curb(parking_claims, sim.world())?;
+    fleet.sweeps = sweeps;
     fleet.deployed = crew;
     fleet.outbound = outbound;
     fleet.active_stations = active;
     fleet.trucks = trucks;
     fleet.assignments = assignments;
     drop(map);
-    sim.map_mut().service_frontages = frontages;
+    let mut map = sim.map_mut();
+    map.service_frontages = frontages;
+    map.active_service_frontages = active_frontages;
     Ok(())
 }

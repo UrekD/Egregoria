@@ -955,6 +955,7 @@ impl Simulation {
             let replay = self.read::<Replay>();
             replay.enabled && !replay.migrated_city()
         };
+        let mut apron_revision = topology_generation;
         for (index, (command, wire_error)) in commands.iter().zip(wire_errors).enumerate() {
             let start = self.read::<CommandOutcomes>().command_start();
             if let Some(error) = wire_error {
@@ -971,6 +972,11 @@ impl Simulation {
                     }
                     Err(reason) => command.reject_unadmitted(self, reason),
                 }
+            }
+            let generation = self.map().walking_topology_generation;
+            if generation != apron_revision {
+                souls::service_dispatch::reconcile_idle_aprons(self);
+                apron_revision = generation;
             }
             utils::scheduler::drain_commands(self);
             self.write::<CommandOutcomes>().record_command(index, start);
@@ -2184,6 +2190,11 @@ impl SimulationDeser {
         sim.read::<Replay>()
             .validate_population_scale(scale)
             .map_err(|error| corrupt(error.to_string()))?;
+        if sim.read::<Replay>().enabled
+            && *sim.read::<souls::events::FireScenarioRules>() != Default::default()
+        {
+            return Err(corrupt("Recorded city contains fire scenario overrides".into()));
+        }
         validate_loaded_prototypes(&sim).map_err(&corrupt)?;
         crate::souls::demolition::restore_remnants(&mut sim).map_err(|reason| corrupt(reason.into()))?;
         crate::souls::events::restore_incidents(&sim, !has_incidents)
