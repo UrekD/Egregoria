@@ -423,35 +423,6 @@ impl Itinerary {
         )
     }
 
-    pub(crate) fn property_walk(
-        start: Vec3,
-        end: Vec3,
-        map: &Map,
-        remaining: &mut usize,
-    ) -> Option<Self> {
-        let local_sidewalk = |position: Vec3| {
-            let lane = map.nearest_lane(position, crate::map::LaneKind::Walking, Some(24.0))?;
-            (map.get(lane)?.points.project_dist2(position) <= 24.0_f32.powi(2)).then_some(lane)
-        };
-        let start_lane = local_sidewalk(start)?;
-        let end_lane = local_sidewalk(end)?;
-        let geometry_work = map.get(start_lane)?.points.len() + map.get(end_lane)?.points.len();
-        *remaining = remaining.saturating_sub(geometry_work);
-        if *remaining == 0 {
-            return None;
-        }
-        Self::route_from_lanes(
-            start,
-            start_lane,
-            end_lane,
-            end,
-            ItineraryTarget::Position(end),
-            map,
-            PathKind::Pedestrian,
-            |start| PathKind::bounded_parking_walk(map, start, end_lane, remaining),
-        )
-    }
-
     pub(crate) fn route_between_lanes(
         tick: Tick,
         map: &Map,
@@ -523,7 +494,7 @@ impl Itinerary {
         )
     }
 
-    fn route_from_lanes(
+    pub(super) fn route_from_lanes(
         start: Vec3,
         start_lane: LaneID,
         end_lane: LaneID,
@@ -1805,6 +1776,12 @@ fn update_itineraries<const DRIVEWAYS: bool>(
         }
     });
     for (id, vehicle) in world.vehicles.iter_mut() {
+        if vehicle.it.is_inert() {
+            if let Some(index) = &mut observed {
+                index.record(map, TraversalOwner::Vehicle(id), &vehicle.it);
+            }
+            continue;
+        }
         let kind = match vehicle.vehicle.kind {
             VehicleKind::Car => RoadUserKind::Car,
             VehicleKind::Truck => RoadUserKind::Truck,
@@ -3189,6 +3166,23 @@ mod pathpark_sweep_tests {
     use crate::map::LaneKind;
     use crate::tests::pathpark_lifecycle::road_chain;
     use crate::transportation::{spawn_driving_vehicle, DrivewayPhase, DrivewayTraffic};
+    use geom::vec3;
+
+    #[test]
+    fn pathpark_pedestrian_candidate_geometry_is_charged_on_a_miss() {
+        let ctx = crate::tests::TestCtx::new();
+        ctx.build_roads(&[vec3(100., 100., 0.), vec3(400., 100., 0.)]);
+        let map = ctx.g.map();
+        let mut work = 1;
+        use crate::map_dynamic::property_walk::{ParkingWalkSearch, WalkResult};
+        let mut search = ParkingWalkSearch::new(
+            &map,
+            vec3(200., 102., 0.),
+            vec3(600., 600., 0.),
+        );
+        assert!(matches!(search.advance(&map, &mut work), WalkResult::Deferred));
+        assert_eq!(work, 0, "candidate geometry must be budgeted even on a miss");
+    }
 
     #[test]
     fn pathpark_guard_blocks_recovering_walker() {

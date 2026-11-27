@@ -5,6 +5,7 @@ mod electricity;
 mod environment;
 mod itinerary;
 mod parking;
+mod property_walk;
 mod router;
 pub mod transit;
 mod utilities;

@@ -19,7 +19,7 @@ const MAX_SITES: usize = 65_536;
 const MAX_LIVE_CLAIMS: usize = 262_144;
 const MOUTH_SPACING_CM: u32 = 1_500;
 
-fn bounded_parking_map<'de, D, K, V, const LIMIT: usize>(
+pub(crate) fn bounded_parking_map<'de, D, K, V, const LIMIT: usize>(
     deserializer: D,
 ) -> Result<BTreeMap<K, V>, D::Error>
 where
@@ -569,10 +569,23 @@ struct ParkingRuntime {
     searches: BTreeMap<HumanID, crate::map_dynamic::PendingPropertySearch>,
 }
 
+#[derive(Deserialize)]
+struct LegacyParkingRuntime {
+    drain_cursor: Option<VehicleID>,
+    #[serde(deserialize_with = "bounded_parking_map::<_, _, _, 32>")]
+    searches: BTreeMap<HumanID, crate::map_dynamic::LegacyPendingPropertySearch>,
+}
+
+// The legacy runtime starts with the drain cursor's option tag (0 or 1).
+const STAGED_SEARCH_RUNTIME: u8 = 0xff;
+
 impl BuildingParking {
     pub(crate) fn save(&self, output: impl std::io::Write) -> std::io::Result<()> {
         if !self.searches.is_empty() {
-            Bincode::encode_writer(&(self, (self.drain_cursor, &self.searches)), output)
+            Bincode::encode_writer(
+                &(self, STAGED_SEARCH_RUNTIME, (self.drain_cursor, &self.searches)),
+                output,
+            )
         } else if let Some(cursor) = self.drain_cursor {
             Bincode::encode_writer(&(self, cursor), output)
         } else {
@@ -588,9 +601,20 @@ impl BuildingParking {
             parking.drain_cursor = Some(cursor);
             return Ok(parking);
         }
-        let (mut parking, runtime): (Self, ParkingRuntime) = Bincode::decode(data)?;
+        if let Ok((mut parking, STAGED_SEARCH_RUNTIME, runtime)) =
+            Bincode::decode::<(Self, u8, ParkingRuntime)>(data)
+        {
+            parking.drain_cursor = runtime.drain_cursor;
+            parking.searches = runtime.searches;
+            return Ok(parking);
+        }
+        let (mut parking, runtime): (Self, LegacyParkingRuntime) = Bincode::decode(data)?;
         parking.drain_cursor = runtime.drain_cursor;
-        parking.searches = runtime.searches;
+        parking.searches = runtime
+            .searches
+            .into_iter()
+            .map(|(driver, search)| (driver, search.into()))
+            .collect();
         Ok(parking)
     }
 
