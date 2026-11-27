@@ -1,7 +1,8 @@
 use crate::ScenarioCtx;
 use geom::{vec2, Polygon, Vec2, OBB};
 use prototypes::{
-    try_prototype, BuildingGen, FreightStationPrototypeID, GoodsCompanyID, Money, Size2D,
+    try_prototype, BuildingGen, FreightStationPrototypeID, GoodsCompanyID, Money, ServiceID,
+    ServiceKind, Size2D,
 };
 use simulation::economy::Government;
 use simulation::map::{
@@ -152,7 +153,7 @@ pub fn place_freight_station(
     if ctx.has_pending_commands() {
         ctx.flush();
     }
-    let (road, obb) = roadside_site(&ctx.sim().map(), near, size)?;
+    let (road, obb) = roadside_site(&ctx.sim().map(), near, size, false, |_, _| true)?;
     let kind = BuildingKind::RailFreightStation(proto.id);
     ctx.submit(&[WorldCommand::MapBuildSpecialBuilding {
         pos: obb,
@@ -231,6 +232,24 @@ pub fn place_company(
     proto_name: &str,
     near: Vec2,
 ) -> Option<BuildingID> {
+    place_company_at_frontage(ctx, proto_name, near, None)
+}
+
+pub(crate) fn place_company_on_network(
+    ctx: &mut dyn CommandSink,
+    proto_name: &str,
+    near: Vec2,
+    utility_site: BuildingID,
+) -> Option<BuildingID> {
+    place_company_at_frontage(ctx, proto_name, near, Some(utility_site))
+}
+
+fn place_company_at_frontage(
+    ctx: &mut dyn CommandSink,
+    proto_name: &str,
+    near: Vec2,
+    utility_site: Option<BuildingID>,
+) -> Option<BuildingID> {
     let proto = try_prototype(GoodsCompanyID::new(proto_name))?;
     if !near.is_finite() {
         return None;
@@ -239,9 +258,10 @@ pub fn place_company(
     if ctx.has_pending_commands() {
         ctx.flush();
     }
-    let (road, obb) = roadside_site(&ctx.sim().map(), near, proto.size)?;
     let kind = BuildingKind::GoodsCompany(proto.id);
-    ctx.submit(&[WorldCommand::MapBuildSpecialBuilding {
+    let fire_station = try_prototype(ServiceID::from(proto.id))
+        .is_some_and(|service| service.service_kind == ServiceKind::Fire);
+    let command = |road, obb: OBB| WorldCommand::MapBuildSpecialBuilding {
         pos: obb,
         kind,
         gen: proto.bgen,
@@ -250,7 +270,20 @@ pub fn place_company(
             .as_ref()
             .map(|_| Zone::new(Polygon::from(obb.corners.as_slice()), Vec2::X)),
         connected_road: Some(road),
-    }]);
+    };
+    let (road, obb) = {
+        let sim = ctx.sim();
+        let map = sim.map();
+        let network = match utility_site {
+            Some(site) => Some(map.electricity.net_id(site)?),
+            None => None,
+        };
+        roadside_site(&map, near, proto.size, fire_station, |road, obb| {
+            network.is_none_or(|net| map.electricity.net_id(road) == Some(net))
+                && (!fire_station || command(road, obb).preview(sim).is_ok())
+        })?
+    };
+    ctx.submit(&[command(road, obb)]);
     ctx.flush();
 
     let map = ctx.sim().map();
@@ -295,7 +328,13 @@ pub(crate) const UTILITY_SITES: [(&str, Vec2); 2] = [
 ];
 pub(crate) const SCHOOL_SITE: (&str, Vec2) = ("school", vec2(-30.0, 250.0));
 
-fn roadside_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
+fn roadside_site(
+    map: &Map,
+    near: Vec2,
+    size: Size2D,
+    fire_station: bool,
+    mut suitable: impl FnMut(RoadID, OBB) -> bool,
+) -> Option<(RoadID, OBB)> {
     let mut best: Option<(f32, RoadID, OBB)> = None;
     let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
     for project in map
@@ -316,13 +355,17 @@ fn roadside_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
             continue;
         };
         let midpoint = points.point_dir_along(points.length() * 0.5);
-        for (pos, dir) in [(closest, tangent), midpoint] {
+        let end = if fire_station { (points.length() as usize).saturating_sub(24) } else { 24 };
+        let samples = (24..end).step_by(5).map(|offset| points.point_dir_along(offset as f32));
+        let setbacks: &[f32] = if fire_station { &[1.0, 12.5] } else { &[1.0] };
+        for (pos, dir) in [(closest, tangent), midpoint].into_iter().chain(samples) {
             let Some(dir) = dir.xy().try_normalize() else {
                 continue;
             };
             let side = dir.perpendicular();
-            for outward in [side, -side] {
-                let center = pos.xy() + outward * ((road.width + size.w) * 0.5 + 1.0);
+            let positions = setbacks.iter().flat_map(|&setback| [(side, setback), (-side, setback)]);
+            for (outward, setback) in positions {
+                let center = pos.xy() + outward * ((road.width + size.w) * 0.5 + setback);
                 let distance = center.distance2(near);
                 if best
                     .as_ref()
@@ -334,6 +377,7 @@ fn roadside_site(map: &Map, near: Vec2, size: Size2D) -> Option<(RoadID, OBB)> {
                 let obb = OBB::new(center, outward, size.w, size.h);
                 if map.environment().height(center).is_none()
                     || map.spatial_map().query(obb, filter).any(|p| p != project)
+                    || !suitable(id, obb)
                 {
                     continue;
                 }

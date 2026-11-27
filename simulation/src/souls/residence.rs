@@ -190,8 +190,13 @@ pub fn on_building_removed(sim: &mut Simulation, building: BuildingID) {
     sim.write::<Happiness>().by_building.remove(&building);
 }
 
-pub(crate) fn evict_residents(sim: &mut Simulation, building: BuildingID, door: Vec3) {
-    evict_from_homes(sim, &[(building, door)]);
+pub(crate) fn evict_residents(
+    sim: &mut Simulation,
+    building: BuildingID,
+    door: Vec3,
+    use_vacancy_index: bool,
+) -> Vec<crate::HumanID> {
+    evict_from_homes(sim, &[(building, door)], use_vacancy_index)
 }
 
 pub(crate) fn abandon_orphaned_growables(sim: &mut Simulation, mut homes: Vec<(BuildingID, Vec3)>) {
@@ -220,12 +225,16 @@ pub(super) fn settle_abandonment(
     legacy.extend(profiled.iter().copied());
     legacy.sort_unstable_by_key(|&(id, _)| id);
     if !legacy.is_empty() {
-        evict_from_homes(sim, &legacy);
+        evict_from_homes(sim, &legacy, false);
         lifecycle::clear_abandoned_home_references(sim, &legacy);
     }
 }
 
-fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
+fn evict_from_homes(
+    sim: &mut Simulation,
+    homes: &[(BuildingID, Vec3)],
+    use_vacancy_index: bool,
+) -> Vec<crate::HumanID> {
     let displaced = {
         let mut infos = sim.write::<BuildingInfos>();
         let mut displaced = Vec::new();
@@ -238,15 +247,25 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
         displaced
     };
     if displaced.is_empty() {
-        return;
+        return Vec::new();
     }
 
     let mut vacancies = {
         let residences = sim.read::<Residences>();
         let map = sim.map();
-        let infos = sim.read::<BuildingInfos>();
+        let mut infos = sim.write::<BuildingInfos>();
+        let candidates = if use_vacancy_index {
+            let cached = infos.vacant_homes(&map, &residences).collect::<Vec<_>>();
+            itertools::Either::Left(
+                cached.into_iter().filter_map(|id| {
+                    residences.by_building.get(&id).map(|residence| (id, residence))
+                }),
+            )
+        } else {
+            itertools::Either::Right(residences.by_building.iter().map(|(&id, residence)| (id, residence)))
+        };
         let mut vacancies = BTreeMap::new();
-        for (&id, residence) in &residences.by_building {
+        for (id, residence) in candidates {
             if residences.is_abandoned(id) || homes.binary_search_by_key(&id, |&(id, _)| id).is_ok()
             {
                 continue;
@@ -272,6 +291,7 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
     let (world, resources) = sim.world_res();
     let mut infos = resources.write::<BuildingInfos>();
     let departures = resources.read::<crate::ParCommandBuffer<crate::HumanEnt>>();
+    let mut departing = Vec::new();
     for (door, residents) in displaced {
         // Source homes and their residents arrive in ID order. Rank currently
         // vacant homes by distance, breaking ties by building ID.
@@ -302,9 +322,11 @@ fn evict_from_homes(sim: &mut Simulation, homes: &[(BuildingID, Vec3)]) {
                 }
             } else {
                 departures.kill(id);
+                departing.push(id);
             }
         }
     }
+    departing
 }
 
 pub fn is_retail_store(kind: BuildingKind) -> bool {

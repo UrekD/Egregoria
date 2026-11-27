@@ -2105,6 +2105,7 @@ fn roadtools_roundabout_preserves_a_saved_claim_at_the_exit_mouth() {
             &resources.read::<TransportGrid>(),
             &mut resources.write::<JunctionAdmission>(),
             tick,
+            &|_| false,
         )
     };
     assert!(matches!(

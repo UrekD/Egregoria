@@ -15,6 +15,21 @@ use prototypes::TICKS_PER_MINUTE;
 
 use super::{init_test_simulation, TestCtx};
 
+fn mark_legacy(snapshot: &mut SimulationDeser, schema: crate::SnapshotSchema, version: &str) {
+    snapshot._header.version = version.to_owned();
+    snapshot.res.remove("service_incidents");
+    snapshot.res.remove("site_remnants");
+    snapshot.res.remove("fire_fleet");
+    snapshot.res.insert(
+        "prototype_registry".into(),
+        Bincode::encode(&schema.registry().unwrap()).unwrap(),
+    );
+    snapshot.res.insert(
+        "replay".into(),
+        format!(r#"{{"version":"{version}","enabled":false,"commands":[]}}"#).into_bytes(),
+    );
+}
+
 fn small_options(persons_per_agent: u16) -> SimulationOptions {
     SimulationOptions {
         terrain_size: 1,
@@ -98,19 +113,17 @@ fn population_scale_rejects_invalid_values_and_defaults_legacy_omissions() {
     assert_eq!(replayed.population_scale(), PopulationScale::REALISTIC);
 
     let mut decoded: SimulationDeser = Bincode::decode(&snapshot).unwrap();
-    decoded._header.version = crate::PRE_SCALE_VERSION.into();
+    mark_legacy(&mut decoded, crate::SnapshotSchema::PreScale, crate::PRE_SCALE_VERSION);
     let mut old_options = decoded.res.remove("simoptions").unwrap();
     assert_eq!(old_options.pop(), Some(1)); // Bincode encodes this appended u16 in one byte.
     decoded.res.insert("simoptions".into(), old_options);
-    let embedded_recording = legacy_recording.replacen(crate::VERSION, crate::PRE_SCALE_VERSION, 1);
-    decoded.res.insert("replay".into(), embedded_recording.into_bytes());
     let restored = decoded.into_sim().unwrap();
     assert_eq!(restored.population_scale(), PopulationScale::REALISTIC);
-    assert_eq!(restored.hashes(), sim.hashes());
+    assert!(restored.read::<Replay>().migrated_city());
 }
 
 #[test]
-fn population_scale_replay_rejects_scaled_embedded_pre_scale_recording() {
+fn population_scale_replay_rejects_legacy_protocol_in_current_snapshots() {
     init_test_simulation();
     let sim = Simulation::new_with_options(small_options(4));
     let mut replay = sim.read::<Replay>().clone();
@@ -119,7 +132,7 @@ fn population_scale_replay_rejects_scaled_embedded_pre_scale_recording() {
     assert!(matches!(
         ReplayJson::decode_snapshot(&recording),
         Err(error) if error.kind() == std::io::ErrorKind::InvalidData
-            && error.to_string().contains("must use Realistic")
+            && error.to_string().contains("expected")
     ));
 }
 
@@ -181,7 +194,7 @@ fn population_scale_snapshot_uses_a_distinct_compatibility_version() {
         sim.population_scale()
     );
     let mut mislabeled: SimulationDeser = Bincode::decode(&snapshot).unwrap();
-    mislabeled._header.version = crate::PRE_SCALE_VERSION.into();
+    mark_legacy(&mut mislabeled, crate::SnapshotSchema::PreScale, crate::PRE_SCALE_VERSION);
     assert!(matches!(
         mislabeled.into_sim(),
         Err(SaveLoadError::Corrupt { reason, .. }) if reason.contains("must use Realistic")
@@ -242,7 +255,7 @@ fn population_scale_snapshot_migrates_unambiguous_legacy_origin() {
     let bytes = Bincode::encode(&sim).unwrap();
     let mut older: SimulationDeser = Bincode::decode(&bytes).unwrap();
     older.res.remove("map_origin").unwrap();
-    older._header.version = crate::PRE_ORIGIN_VERSION.into();
+    mark_legacy(&mut older, crate::SnapshotSchema::PreOrigin, crate::PRE_ORIGIN_VERSION);
     let restored = older.into_sim().unwrap();
     assert_eq!(restored.map().lot_layout(), LotLayout::Varied);
     let origin = MapOrigin::new(MapConstructor::AuthoredTown, LotLayout::Uniform);
@@ -263,7 +276,7 @@ fn population_scale_snapshot_rejects_ambiguous_legacy_origin() {
         sim.apply_commands([&WorldCommand::SetLotLayout(layout)]);
         let mut older: SimulationDeser = Bincode::decode(&Bincode::encode(&sim).unwrap()).unwrap();
         older.res.remove("map_origin").unwrap();
-        older._header.version = crate::PRE_ORIGIN_VERSION.into();
+        mark_legacy(&mut older, crate::SnapshotSchema::PreOrigin, crate::PRE_ORIGIN_VERSION);
         assert!(matches!(
             older.into_sim(),
             Err(SaveLoadError::Corrupt { reason, .. }) if reason.contains("Ambiguous legacy snapshot map origin")

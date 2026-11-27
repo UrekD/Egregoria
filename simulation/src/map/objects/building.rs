@@ -26,6 +26,7 @@ pub enum BuildingKind {
     RailFreightStation(FreightStationPrototypeID),
     TrainStation,
     ExternalTrading,
+    SiteRemnant,
 }
 
 impl BuildingKind {
@@ -46,7 +47,7 @@ impl BuildingKind {
     }
 
     fn allows_raw_placement(self) -> bool {
-        self.as_goods_company().is_none_or(|company| {
+        self != Self::SiteRemnant && self.as_goods_company().is_none_or(|company| {
             prototypes::try_prototypes().is_some()
                 && prototypes::try_prototype(company).is_some()
                 && !self.is_mixed_growable()
@@ -223,6 +224,14 @@ impl PreparedGrowableAppearance {
 pub(in crate::map) struct PreparedBuilding(Building);
 
 impl PreparedBuilding {
+    pub(in crate::map) fn connected_road(&self) -> Option<RoadID> {
+        self.0.connected_road
+    }
+
+    pub(in crate::map) fn door(&self) -> Vec3 {
+        self.0.door_pos
+    }
+
     pub(in crate::map) fn base_height(&self) -> f32 {
         self.0.height
     }
@@ -297,8 +306,9 @@ impl Building {
     }
 
     pub fn has_residential_use(&self) -> bool {
-        self.kind == BuildingKind::House
-            || self.development().is_some_and(|site| site.home.is_some())
+        self.kind != BuildingKind::SiteRemnant
+            && (self.kind == BuildingKind::House
+                || self.development().is_some_and(|site| site.home.is_some()))
     }
 
     pub fn is_mixed_use(&self) -> bool {

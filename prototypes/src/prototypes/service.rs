@@ -42,6 +42,53 @@ impl<'lua> FromLua<'lua> for ServiceKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct FireServiceSpec {
+    pub ignition_hourly_denominator: u32,
+    pub bays: u8,
+    pub crew_per_trip: u8,
+    pub shift_count: u8,
+    pub max_response_m: u16,
+}
+
+impl FireServiceSpec {
+    fn from_lua(table: Option<Table>) -> mlua::Result<Self> {
+        let mut spec = Self {
+            ignition_hourly_denominator: 10_000,
+            bays: 1,
+            crew_per_trip: 2,
+            shift_count: 3,
+            max_response_m: 1500,
+        };
+        if let Some(table) = table {
+            spec.ignition_hourly_denominator = table
+                .get::<_, Option<u32>>("ignition_hourly_denominator")?
+                .unwrap_or(spec.ignition_hourly_denominator);
+            spec.bays = table.get::<_, Option<u8>>("bays")?.unwrap_or(spec.bays);
+            spec.crew_per_trip = table
+                .get::<_, Option<u8>>("crew_per_trip")?
+                .unwrap_or(spec.crew_per_trip);
+            spec.shift_count = table
+                .get::<_, Option<u8>>("shift_count")?
+                .unwrap_or(spec.shift_count);
+            spec.max_response_m = table
+                .get::<_, Option<u16>>("max_response_m")?
+                .unwrap_or(spec.max_response_m);
+        }
+        if spec.bays != 1
+            || spec.crew_per_trip != 2
+            || spec.shift_count != 3
+            || !(1..=1500).contains(&spec.max_response_m)
+            || !(3..=1_000_000).contains(&spec.ignition_hourly_denominator)
+        {
+            return Err(mlua::Error::external(
+                "invalid fire station fleet or ignition settings",
+            ));
+        }
+        Ok(spec)
+    }
+}
+
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct ServicePrototype {
     pub base: GoodsCompanyPrototype,
@@ -51,6 +98,9 @@ pub struct ServicePrototype {
     pub capacity: u32,
     pub upkeep_per_day: Money,
     pub max_water_distance_m: Option<f32>,
+    // The registry hashes this separately to preserve the pre-P9 stock projection.
+    #[serde(skip)]
+    pub fire: Option<FireServiceSpec>,
 }
 
 impl GoodsCompanyID {
@@ -89,6 +139,16 @@ impl Prototype for ServicePrototype {
                 Ok(reach)
             })
             .transpose()?;
+        let fire_options = get_lua_opt::<Table>(table, "fleet")?;
+        let fire = match service_kind {
+            ServiceKind::Fire => Some(FireServiceSpec::from_lua(fire_options)?),
+            _ if fire_options.is_some() => {
+                return Err(mlua::Error::external(
+                    "field fleet: only fire stations can set this field",
+                ));
+            }
+            _ => None,
+        };
         Ok(Self {
             id: Self::ID::new(&base.name),
             base,
@@ -97,6 +157,7 @@ impl Prototype for ServicePrototype {
             capacity: capacity as u32,
             upkeep_per_day: get_lua(table, "upkeep_per_day")?,
             max_water_distance_m,
+            fire,
         })
     }
 

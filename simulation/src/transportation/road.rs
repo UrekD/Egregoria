@@ -1,5 +1,6 @@
 use crate::map::{Map, TrafficBehavior, Traversable, TraverseKind};
 use crate::map_dynamic::{Itinerary, Transit, OBJECTIVE_OK_DIST};
+use crate::souls::service_dispatch::{FireFleet, FireWorkTiming};
 use crate::transportation::junction_admission;
 use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason, QueueRevision};
 use crate::transportation::{
@@ -16,6 +17,7 @@ use geom::{angle_lerpxy, Ray, Transform, Vec2, Vec3};
 use prototypes::{GameTime, DELTA, TICKS_PER_REALTIME_SECOND};
 use slotmapd::Key;
 use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 const STOPPED_SPEED: f32 = 0.2;
 const STOPPED_BLOCK_DISTANCE: f32 = 1.5;
@@ -163,6 +165,10 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
     let map = &*resources.read::<Map>();
     let time = &*resources.read::<GameTime>();
     let grid = &*resources.read::<TransportGrid>();
+    let fleet = resources.read::<FireFleet>();
+    let sweeps = fleet.has_sweeps();
+    let timing = sweeps && resources.read::<FireWorkTiming>().enabled;
+    let mut elapsed = Duration::ZERO;
     let mut diagnostics = resources.write::<QueueDiagnostics>();
     let observing = diagnostics.observing();
     let tick = if observing {
@@ -177,6 +183,10 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
         let Some(collider) = entity.collider else {
             continue;
         };
+        if sweeps && !parking_step_clear(&fleet, map, id, entity, 0.0, timing.then_some(&mut elapsed)) {
+            entity.speed.0 = 0.0;
+            continue;
+        }
         let traversal = observing
             .then(|| entity.it.get_travers().copied())
             .flatten();
@@ -207,6 +217,9 @@ pub fn vehicle_decision_system(world: &mut World, resources: &mut Resources) {
                 &collider,
             );
         }
+    }
+    if timing {
+        resources.write::<FireWorkTiming>().movement += elapsed;
     }
 }
 
@@ -269,6 +282,10 @@ pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources)
     profiling::scope!("transportation::vehicle_state_update_system");
     let buffer = &*resources.read::<ParCommandBuffer<VehicleEnt>>();
     let map = &*resources.read::<Map>();
+    let fleet = resources.read::<FireFleet>();
+    let sweeps = fleet.has_sweeps();
+    let timing = sweeps && resources.read::<FireWorkTiming>().enabled;
+    let mut elapsed = Duration::ZERO;
     let validation = &mut world.parking_validation;
     let revision = (map.identity(), map.parking.revision());
     let changed = validation.revision.replace(revision) != Some(revision);
@@ -321,6 +338,11 @@ pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources)
             return;
         }
         let was_parking = matches!(v.vehicle.state, VehicleState::RoadToPark(..));
+        if sweeps && was_parking
+            && !parking_step_clear(&fleet, map, ent, v, DELTA / TIME_TO_PARK, timing.then_some(&mut elapsed))
+        {
+            return;
+        }
         vehicle_state_update(
             buffer,
             map,
@@ -334,6 +356,39 @@ pub fn vehicle_state_update_system(world: &mut World, resources: &mut Resources)
             recently_parked.push(ent);
         }
     });
+    if timing {
+        resources.write::<FireWorkTiming>().movement += elapsed;
+    }
+}
+
+fn parking_step_clear(
+    fleet: &FireFleet,
+    map: &Map,
+    id: VehicleID,
+    entity: &VehicleEnt,
+    advance: f32,
+    elapsed: Option<&mut Duration>,
+) -> bool {
+    let VehicleState::RoadToPark(spline, progress, spot) = &entity.vehicle.state else {
+        return true;
+    };
+    let start = elapsed.as_ref().map(|_| Instant::now());
+    let progress = *progress + advance;
+    let next = if progress >= 1.0 {
+        spot.get(&map.parking).map_or(spline.to, |spot| spot.trans.pos)
+    } else {
+        spline.get(progress)
+    };
+    let clear = fleet.sweep_allows(
+        junction_admission::EntryOwner::Vehicle(id),
+        entity.trans.pos,
+        next,
+        entity.vehicle.kind.width() * 0.5,
+    );
+    if let Some((elapsed, start)) = elapsed.zip(start) {
+        *elapsed += start.elapsed();
+    }
+    clear
 }
 
 #[derive(Default)]

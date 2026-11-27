@@ -561,8 +561,10 @@ pub fn update_decision_system(world: &mut World, resources: &mut Resources) {
         walk_distances: Default::default(),
     };
 
+    let fleet = resources.read::<super::service_dispatch::FireFleet>();
+    let deployed = fleet.has_deployed();
     world.humans.edit_each_split(|id, h| {
-        if h.it.is_pedestrian_egress() {
+        if h.it.is_pedestrian_egress() || (deployed && fleet.deployed(id)) {
             return;
         }
         if h.goods.has_pickup() {

@@ -14,6 +14,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use common::{ChunkID_256, FastMap};
 use geom::{InfiniteFrustrum, Intersect3, LinearColor, Radians, Shape, AABB, AABB3, OBB};
 use goryak::{combo_box, tooltip};
+use simulation::souls::events::{fire_incident, FireEventKind, Fires, ServiceIncidents};
+use simulation::souls::service_dispatch::{service_station, FireFleet, FireResponseEventKind};
 use prototypes::{try_prototype, GoodsCompanyID, Power, ServiceID, ServiceKind, TICKS_PER_HOUR};
 use serde::{Deserialize, Deserializer, Serialize};
 use simulation::economy::balance::DEMAND_INTERVAL_TICKS;
@@ -111,6 +113,7 @@ struct OverlayCache {
     tick: u64,
     data_version: u64,
     profiled_power_sites: Vec<BuildingID>,
+    fire_summary: String,
     projection: [f32; 16],
     tiles: TileIndex,
 }
@@ -347,11 +350,16 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
             _ => {}
         }
 
+        let camera = uiworld.camera().camera;
+        if mode == OverlayMode::Coverage(ServiceKind::Fire) {
+            if let Some(bounds) = view::bounds(&camera, &map) {
+                cache.fire_summary = draw_fire_response(sim, uiworld, &map, bounds, &mut draw);
+            }
+        }
         if let OverlayMode::Coverage(kind) = mode {
             draw_selected_service_ring(uiworld, &map, kind, &mut draw);
         }
 
-        let camera = uiworld.camera().camera;
         let projection = *camera.proj_cache.as_ref();
         if rebuild || cache.projection != projection {
             cache.projection = projection;
@@ -372,6 +380,113 @@ pub(crate) fn draw(sim: &Simulation, uiworld: &UiWorld) {
         }
     });
     crate::gui::traffic_repair::draw_selected(sim, uiworld, &mut draw);
+}
+
+fn draw_fire_response(
+    sim: &Simulation,
+    uiworld: &UiWorld,
+    map: &Map,
+    bounds: AABB,
+    draw: &mut ImmediateDraw,
+) -> String {
+    let incidents = sim.read::<ServiceIncidents>();
+    let fleet = sim.read::<FireFleet>();
+    let selected = uiworld.read::<InspectedBuilding>().e;
+    let colors = simulation::colors();
+    let now = simulation::diagnostics::elapsed_tick(sim);
+    let since = now.0.saturating_sub(24 * TICKS_PER_HOUR);
+    let mut on_scene = 0;
+    let mut unresolved = 0;
+    let mut oldest_pending = 0;
+    let mut active = 0;
+    for incident in incidents.active() {
+        active += 1;
+        let response = fleet.response(incident.site, incident.id);
+        let working = response.is_some_and(|response| response.arrived);
+        on_scene += usize::from(working);
+        unresolved += usize::from(!working);
+        if !working {
+            oldest_pending = oldest_pending.max(now.0.saturating_sub(incident.alarm_tick.0));
+        }
+        if bounds.contains(incident.position.xy()) {
+            let color = if working { colors.gui_success } else { colors.gui_danger };
+            draw.stroke_circle(incident.position.up(0.4), 4.0, 1.0).color(color);
+        }
+    }
+    let mut selected_truck = selected.and_then(|site| {
+        let incident = fire_incident(sim, site)?;
+        fleet.response(site, incident.id).map(|response| response.truck)
+    });
+    for site in fleet.station_ids() {
+        let Some(building) = map.get(site) else { continue };
+        let Some(station) = service_station(sim, site) else { continue };
+        if selected == Some(site) {
+            selected_truck = Some(station.truck);
+        }
+        if bounds.contains(building.door_pos.xy()) {
+            let color = if station.blocker.is_some() {
+                colors.gui_danger.into()
+            } else if station.phase.is_some() {
+                LinearColor::new(1.0, 0.70, 0.20, 1.0)
+            } else {
+                colors.gui_success.into()
+            };
+            draw.stroke_circle(building.door_pos.up(0.5), 2.5, 0.7).color(color);
+        }
+    }
+    if let Some(truck) = selected_truck.and_then(|id| sim.get(id)) {
+        let color = LinearColor::new(1.0, 0.70, 0.20, 1.0);
+        if let Some(point) = truck.it.get_point() {
+            draw.line(truck.trans.pos.up(0.5), point.up(0.5), 0.7).color(color);
+        }
+        if let Some(route) = truck.it.get_route() {
+            for traversal in route.reversed_route.iter().rev() {
+                if let Some(points) = traversal.raw_points(map) {
+                    draw.polyline(points.iter().map(|point| point.up(0.5)).collect::<Vec<_>>(), 0.7, false)
+                        .color(color);
+                }
+            }
+        }
+    }
+    let fires = sim.read::<Fires>();
+    let mut alarms = std::collections::BTreeMap::<_, Vec<_>>::new();
+    let mut failed = 0;
+    for event in fires.events_since(0) {
+        match event.kind {
+            FireEventKind::Ignited => alarms.entry(event.building).or_default().push(event.tick),
+            FireEventKind::Collapsed if event.tick.0 >= since => failed += 1,
+            _ => {}
+        }
+    }
+    let mut durations = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for event in fleet.events() {
+        if event.tick.0 < since || event.kind != FireResponseEventKind::Arrived
+            || !seen.insert(event.incident)
+        {
+            continue;
+        }
+        let Some(alarms) = alarms.get(&event.site) else { continue };
+        let after = alarms.partition_point(|&tick| tick <= event.tick);
+        if let Some(start) = after.checked_sub(1).and_then(|index| alarms.get(index)) {
+            durations.push(event.tick.0.saturating_sub(start.0));
+        }
+    }
+    durations.sort_unstable();
+    let minutes = |ticks| ticks as f64 / prototypes::TICKS_PER_MINUTE as f64;
+    let mut summary = format!("{active} active fires · {on_scene} crews on scene · {unresolved} awaiting arrival");
+    if unresolved != 0 {
+        summary.push_str(&format!(" · Oldest wait {:.1} min", minutes(oldest_pending)));
+    }
+    summary.push_str(&format!("\nLast 24 game hours in history · {failed} fire losses"));
+    if !durations.is_empty() {
+        let percentile = |percent: usize| minutes(durations[(durations.len() * percent).div_ceil(100) - 1]);
+        summary.push_str(&format!(
+            " · First arrival p50 {:.1} / p95 {:.1} min ({} arrivals)",
+            percentile(50), percentile(95), durations.len()
+        ));
+    }
+    summary
 }
 
 fn draw_selected_service_ring(
@@ -566,7 +681,7 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
         (Sewage, "Sewage"),
         (WaterBodies, "Water Bodies"),
         (Coverage(ServiceKind::Health), "Health coverage"),
-        (Coverage(ServiceKind::Fire), "Fire coverage"),
+        (Coverage(ServiceKind::Fire), "Fire prevention reach"),
         (Coverage(ServiceKind::Police), "Police coverage"),
         (Coverage(ServiceKind::School), "School coverage"),
         (Coverage(ServiceKind::Garbage), "Garbage coverage"),
@@ -608,6 +723,13 @@ pub(crate) fn selector(uiworld: &UiWorld, show_unfinished_ui: bool) {
                 .find_map(|&(option, label)| (option == mode).then_some(label))
                 .unwrap_or(labels[selected]);
             legend::render(mode, label, empty, uiworld);
+            if mode == OverlayMode::Coverage(ServiceKind::Fire) {
+                CACHE.with_borrow(|cache| {
+                    if !cache.fire_summary.is_empty() {
+                        goryak::textc(goryak::on_secondary_container(), cache.fire_summary.clone());
+                    }
+                });
+            }
         }
     }
 }

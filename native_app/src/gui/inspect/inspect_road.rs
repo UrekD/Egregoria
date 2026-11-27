@@ -278,6 +278,7 @@ fn truck_cargo(map: &Map, users: &RoadUsers) {
                         BuildingKind::House => "House",
                         BuildingKind::TrainStation => "Train station",
                         BuildingKind::ExternalTrading => "External trading",
+                        BuildingKind::SiteRemnant => "Closed site",
                     });
             let truck = format!("Truck {:?}", row.truck.data());
             match &row.cargo {

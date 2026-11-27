@@ -555,7 +555,7 @@ fn publish(sim: &Simulation, root: &Path, stem: &str, display_name: &str) -> Res
 mod tests {
     use super::*;
     use crate::citymap::{
-        plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig, DEFAULT_LESCE, DEFAULT_SAVA,
+        pinned_test_paths, plan_town, read_inputs, SpacingLimits, TownConfig,
     };
     use simulation::map::{RiverBank, TerrainChunkID, WaterKind, ZoneGrid};
     use simulation::world_command::Rejection;
@@ -733,11 +733,7 @@ mod tests {
     }
 
     fn authored_sava() -> (Simulation, crate::citymap::TownPlan, WaterBodyId) {
-        let inputs = read_inputs(SourcePaths {
-            lesce: Path::new(DEFAULT_LESCE),
-            sava: Some(Path::new(DEFAULT_SAVA)),
-        })
-        .unwrap();
+        let inputs = read_inputs(pinned_test_paths()).unwrap();
         let plan = plan_town(&inputs, TownConfig::default(), SpacingLimits::default()).unwrap();
         let [reach] = plan.river.as_slice() else {
             panic!("CITYMAP needs exactly one authored Sava reach");

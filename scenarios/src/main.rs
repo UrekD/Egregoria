@@ -1,5 +1,5 @@
 use scenarios::builtin::{
-    demo_cities, growth_basic, perf, water_fixtures, zones2_scenarios, PERF_10K, SCENARIOS,
+    demo_cities, growth_basic, perf, water_fixtures, zones2_scenarios, P9_SCALE, P9_SOAK, PERF_10K, SCENARIOS,
 };
 use scenarios::runner::{PerfTimings, ProjectionCheckpoint, MEDIAN_TICKS_PER_SEC, P99_MS_PER_TICK};
 use scenarios::{perf_scale, MetricSample, ScenarioCtx};
@@ -25,10 +25,10 @@ fn usage() -> String {
     let names = SCENARIOS
         .iter()
         .map(|(scenario, _)| scenario.name)
-        .chain([PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
+        .chain([P9_SCALE.0.name, P9_SOAK.0.name, PERF_10K.0.name, "all", "all_staged", "zones2_staged"])
         .collect::<Vec<_>>()
         .join("|");
-    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios scaled-showcase --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH] [--dry]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K] [--persons-per-agent N]\n       scenarios traffic-repair compare --fixtures repair-cohort,repair-no-loss [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair compare --root DIR --fixtures ID --edit QUOTE.json [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair soak --root DIR --fixtures ID --days N [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair perf --agents N --layout compact|growing --warmup W --ticks T --pairs N --modes LIST [--manifest PATH] [--json PATH]\n       scenarios traffic-repair stage --manifest PATH --class release|diagnostic --out DIR [--bundle-root DIR] [--run-source SHA]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K]")
+    format!("Usage: scenarios <{names}> [--json out.json] [--hashes out.jsonl] [--check-projection baseline.json] [--twice | --gate (perf_10k only)] [--background-fire (perf_10k only)]\n       scenarios demo-cities --save-root <dir>\n       scenarios scaled-showcase --save-root <dir>\n       scenarios water-fixtures --save-root <new-dir>\n       scenarios water-perf-fixtures --save-root <new-dir> [--allow-missing-bridge]\n       scenarios osm-city --input <overpass.json> --save-root <dir> [--replace] [--check]\n       scenarios citymap-schematic --out DIR [--input PATH] [--sava-input PATH]\n       scenarios citymap-spacing --json PATH [--jobs N] [--timing PATH]\n       scenarios citymap-build --out DIR [--input PATH] [--sava-input PATH] [--dry]\n       scenarios perf_scale --houses H --warmup W --ticks T [--sim-threads K]\n       scenarios perf-scale --agents N --layout compact|growing --warmup W --ticks T [--sim-threads K] [--persons-per-agent N]\n       scenarios traffic-repair compare --fixtures repair-cohort,repair-no-loss [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair compare --root DIR --fixtures ID --edit QUOTE.json [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair soak --root DIR --fixtures ID --days N [--twice] [--resume] [--replay] [--json PATH]\n       scenarios traffic-repair perf --agents N --layout compact|growing --warmup W --ticks T --pairs N --modes LIST [--manifest PATH] [--json PATH]\n       scenarios traffic-repair stage --manifest PATH --class release|diagnostic --out DIR [--bundle-root DIR] [--run-source SHA]\n       scenarios bench-slot --root DIR --slot ID --warmup W --ticks T [--sim-threads K] [--background-fire]")
 }
 
 fn main() -> ExitCode {
@@ -89,8 +89,10 @@ fn run_benchmark(name: &str, mut args: impl Iterator<Item = OsString>) -> Result
     let mut ticks = None;
     let mut workers = None;
     let mut scale = None;
+    let mut background_fire = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
+            Some("--background-fire") if name == "bench-slot" && !background_fire => background_fire = true,
             Some("--houses") if name == "perf_scale" && agents.is_none() => {
                 agents = Some(number_arg(&mut args, "--houses")?);
             }
@@ -132,12 +134,13 @@ fn run_benchmark(name: &str, mut args: impl Iterator<Item = OsString>) -> Result
     let measured_ticks = ticks.ok_or_else(|| format!("{name} requires --ticks"))?;
     let workers = workers.unwrap_or(1);
     let report = if name == "bench-slot" {
-        perf_scale::bench_slot_with_workers(
+        perf_scale::bench_slot_with_fire_profile(
             &root.ok_or("bench-slot requires --root")?,
             &slot.ok_or("bench-slot requires --slot")?,
             warmup_ticks,
             measured_ticks,
             workers,
+            background_fire,
         )?
     } else {
         let case = perf_scale::PerfCase {
@@ -248,7 +251,7 @@ fn run() -> Result<(), String> {
         "zones2_staged" => zones2_scenarios().collect(),
         _ => SCENARIOS
             .iter()
-            .chain(std::iter::once(&PERF_10K))
+            .chain([&P9_SCALE, &P9_SOAK, &PERF_10K])
             .filter(|(scenario, _)| scenario.name == name)
             .collect(),
     };
@@ -261,10 +264,14 @@ fn run() -> Result<(), String> {
     let mut projection = None;
     let mut twice = false;
     let mut gate = false;
+    let mut background_fire = false;
     while let Some(arg) = args.next() {
         match arg.to_str() {
             Some("--twice") if !twice => twice = true,
             Some("--gate") if !gate => gate = true,
+            Some("--background-fire") if name == PERF_10K.0.name && !background_fire => {
+                background_fire = true;
+            }
             Some("--json") if json.is_none() => {
                 json = Some(path_arg(&mut args, "--json", "an output path")?)
             }
@@ -313,6 +320,7 @@ fn run() -> Result<(), String> {
         })
         .transpose()?;
     let mut results = BTreeMap::new();
+    let mut scale_error = None;
     for (scenario, options) in available {
         let expected = match &baseline {
             Some(baseline) => Some(baseline.get(scenario.name).map(Vec::as_slice).ok_or_else(
@@ -330,10 +338,18 @@ fn run() -> Result<(), String> {
             ctx.enable_perf_timings();
         }
         let run = |ctx: &mut ScenarioCtx| {
+            if background_fire {
+                perf_scale::configure_background_fire(&mut ctx.sim)?;
+            }
             if twice && scenario.name == growth_basic::SCENARIO.0.name {
                 growth_basic::verify_twice(ctx)
             } else if twice && scenario.name != "determinism" {
-                ctx.verify_twice(scenario.run)
+                ctx.verify_twice(|ctx| {
+                    if background_fire {
+                        perf_scale::configure_background_fire(&mut ctx.sim)?;
+                    }
+                    (scenario.run)(ctx)
+                })
             } else {
                 (scenario.run)(ctx)
             }
@@ -344,9 +360,15 @@ fn run() -> Result<(), String> {
         } else {
             run(&mut ctx)
         };
-        result.map_err(|err| format!("{}: {err}", scenario.name))?;
+        if let Err(error) = result {
+            let error = format!("{}: {error}", scenario.name);
+            if scenario.name != P9_SCALE.0.name {
+                return Err(error);
+            }
+            scale_error = Some(error);
+        }
 
-        if twice || scenario.name == "determinism" {
+        if scale_error.is_none() && (twice || scenario.name == "determinism") {
             println!(
                 "{}: both runs matched at every checkpoint and the final tick",
                 scenario.name
@@ -393,6 +415,10 @@ fn run() -> Result<(), String> {
         let file = File::create(&path).map_err(|err| format!("{}: {err}", path.display()))?;
         serde_json::to_writer_pretty(file, &results)
             .map_err(|err| format!("{}: {err}", path.display()))?;
+    }
+
+    if let Some(error) = scale_error {
+        return Err(error);
     }
 
     if gate {

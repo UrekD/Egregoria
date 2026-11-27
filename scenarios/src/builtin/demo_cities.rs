@@ -14,6 +14,7 @@ use simulation::map::{
     ProjectKind, RoadID, ZoneKind,
 };
 use simulation::map_dynamic::{ElectricityFlow, Itinerary, Transit, UtilityFlow};
+use simulation::souls::events::FireScenarioRules;
 use simulation::souls::residence::Residences;
 use simulation::transportation::traffic_metrics;
 use simulation::world_command::{CommandOutcomes, WorldCommand};
@@ -196,12 +197,18 @@ fn build_starter() -> Result<ScenarioCtx, String> {
 
 fn build_showcase(options: SimulationOptions) -> Result<(ScenarioCtx, usize), String> {
     let mut ctx = ScenarioCtx::new(options);
+    // Keep the commissioning and utility checks independent of incidental fire losses.
+    FireScenarioRules {
+        suppress_incidental_offers: true,
+        ..Default::default()
+    }
+    .apply(&mut ctx.sim)?;
     let start = ctx.sim.get_tick();
     let mut resident_hours = 0;
     let roads = build_grid(&mut ctx, SHOWCASE_ORIGIN, 9)?;
     let freight = connect_freight(&mut ctx, SHOWCASE_ORIGIN + Vec2::splat(800.0))?;
     let plant = place_grid_power_plant(&mut ctx, SHOWCASE_ORIGIN)?;
-    let sites = place_service_sites(
+    let sites = super::services_basic::place_prevention_fixture_services(
         &mut ctx,
         SHOWCASE_ORIGIN,
         [
@@ -311,6 +318,7 @@ fn build_showcase(options: SimulationOptions) -> Result<(ScenarioCtx, usize), St
     ctx.run_ticks(8 * TICKS_PER_HOUR);
     super::services_basic::check_service_network(&ctx, plant, &sites, "Showcase City")?;
     check_showcase(&ctx.sim, plant, freight, &roads)?;
+    FireScenarioRules::default().apply(&mut ctx.sim)?;
     Ok((ctx, resident_hours))
 }
 
@@ -366,8 +374,8 @@ fn connect_freight(ctx: &mut ScenarioCtx, grid_point: Vec2) -> Result<BuildingID
     // Preserve the terminal's original platform and rail access when replacing
     // its roadless bootstrap building with a driveway-connected one.
     let (old_id, pos, kind) = station;
+    ctx.remove_fixture_site(old_id)?;
     ctx.sim.apply_commands([
-        &WorldCommand::MapRemoveBuilding(old_id),
         &WorldCommand::MapBuildSpecialBuilding {
             pos,
             kind,

@@ -203,8 +203,8 @@ fn p2_spine_power_cut_stops_batch_about_to_finish() {
     let goods = ItemID::new("goods");
     assert_eq!(test.g.read::<Market>().capital(soul, goods), 0);
 
-    test.g
-        .tick(&mut test.sched, &[WorldCommand::MapRemoveBuilding(plant)]);
+    test.remove_fixture_building(plant);
+    test.g.tick(&mut test.sched, []);
     assert!(test.g.map().get(plant).is_none());
     let network = test.g.map().electricity.net_id(factory).unwrap();
     assert!(test.g.read::<ElectricityFlow>().blackout(network));
@@ -368,7 +368,7 @@ fn p2b_pump_in_blackout_cannot_supply_water() {
     assert!(!test.g.read::<ElectricityFlow>().blackout(network));
     assert!(test.g.read::<UtilityFlow>().has_water(house));
 
-    test.apply(&[WorldCommand::MapRemoveBuilding(power)]);
+    test.remove_fixture_building(power);
     p2b_update(&mut test.g, 6_000);
     assert!(test.g.read::<ElectricityFlow>().blackout(network));
     assert!(!test.g.read::<UtilityFlow>().has_water(house));
@@ -518,7 +518,7 @@ fn p2c_pollution_decays_to_zero_after_emitter_removal() {
     let initial = test.g.read::<EnvGrid>().pollution_at(center);
     assert!(initial > 1.0, "the emitter must pollute before removal");
 
-    test.apply(&[WorldCommand::MapRemoveBuilding(emitter)]);
+    test.remove_fixture_building(emitter);
     assert!(test.g.map().get(emitter).is_none());
     p2c_update_at(&mut test.g, 6000);
     assert_eq!(test.g.read::<EnvGrid>().pollution_at(center), initial * 0.9);
@@ -763,8 +763,7 @@ fn p2d_l2_requires_power_water_sewage_and_school() {
         }
         if unmet == "retail" {
             fixture
-                .test
-                .apply(&[WorldCommand::MapRemoveBuilding(fixture.retailer)]);
+                .test.remove_fixture_building(fixture.retailer);
             let workplace = fixture.test.g.world.companies[fixture.plant].comp.building;
             for human in fixture.test.g.world.humans.values_mut() {
                 human.work = Some(Work::new(workplace, WorkKind::Worker, 0.0));
@@ -859,136 +858,20 @@ fn p2d_abandonment_requires_twelve_consecutive_unserved_checks() {
     }
 }
 
-fn p2d_force_ignite(sim: &Simulation, building: BuildingID) {
+fn p2d_force_ignite(sim: &mut Simulation, building: BuildingID) {
     *sim.write::<GameTime>() = GameTime::new(Tick(TICKS_PER_HOUR + events::UPDATE_OFFSET));
     events::force_ignite(sim, building);
 }
 
 fn p2d_fire_at(sim: &mut Simulation, hour: u64) {
     let tick = hour * TICKS_PER_HOUR + events::UPDATE_OFFSET;
-    assert!(events::due(tick));
     *sim.write::<GameTime>() = GameTime::new(Tick(tick));
     events::events_update(sim);
 }
 
 #[test]
-fn p2d_covered_forced_fire_is_extinguished() {
-    use crate::souls::events::Fires;
-
-    for hour in [2, 4] {
-        let (mut test, house, _) = p2d_house();
-        test.g
-            .write::<CoverageGrid>()
-            .by_kind
-            .entry(ServiceKind::Fire)
-            .or_default()
-            .insert(house, 1.0);
-        p2d_force_ignite(&test.g, house);
-        p2d_fire_at(&mut test.g, hour);
-        assert!(!test.g.read::<Fires>().by_building.contains_key(&house));
-        assert!(test.g.map().get(house).is_some());
-    }
-}
-
-#[test]
-fn p2d_uncovered_forced_fire_collapses_building_and_restores_lot() {
-    use crate::souls::events::{FireEventKind, Fires};
-
-    let (mut test, house, _) = p2d_house();
-    let replacement = test.build_house_near(vec2(310.0, 125.0));
-    let resident = spawn_human(&mut test.g, house).unwrap();
-    let origin = test.g.map().get(house).unwrap().obb.center();
-    let lots_before = test.g.map().lots().len();
-    p2d_force_ignite(&test.g, house);
-    p2d_fire_at(&mut test.g, 3);
-    assert!(test.g.map().get(house).is_some());
-    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
-    for sim in [&mut test.g, &mut resumed] {
-        p2d_fire_at(sim, 4);
-        assert!(sim.map().get(house).is_none());
-        assert!(!sim.read::<Fires>().by_building.contains_key(&house));
-        assert!(!sim
-            .read::<residence::Residences>()
-            .by_building
-            .contains_key(&house));
-        assert_eq!(sim.map().lots().len(), lots_before + 1);
-        assert!(sim
-            .map()
-            .lots()
-            .values()
-            .any(|lot| lot.shape.contains(origin)));
-        assert_eq!(sim.world.humans[resident].home.house, replacement);
-        let fires = sim.read::<Fires>();
-        let events: Vec<_> = fires
-            .events_since(0)
-            .filter(|e| e.building == house)
-            .collect();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].kind, FireEventKind::Ignited);
-        assert_eq!(events[1].kind, FireEventKind::Collapsed);
-        assert_eq!(events[1].tick.0 - events[0].tick.0, 3 * TICKS_PER_HOUR);
-    }
-}
-
-#[test]
-fn p2d_removing_a_building_mid_fire_is_safe() {
-    use crate::souls::events::Fires;
-
-    let (mut test, house, _) = p2d_house();
-    p2d_force_ignite(&test.g, house);
-    test.apply(&[WorldCommand::MapRemoveBuilding(house)]);
-    p2d_fire_at(&mut test.g, 2);
-    assert!(test.g.map().get(house).is_none());
-    assert!(!test.g.read::<Fires>().by_building.contains_key(&house));
-}
-
-#[test]
-fn pfc_fire_lifetime_ignores_game_time_jumps() {
-    use events::{FireEventKind, Fires};
-
-    let mut failures = Vec::new();
-    let mut lifetimes = Vec::new();
-    for destination in [None, Some(0), Some(20 * TICKS_PER_HOUR + 1)] {
-        let (mut test, house, _) = p2d_house();
-        p2d_force_ignite(&test.g, house);
-        if let Some(destination) = destination {
-            test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(destination)))]);
-        }
-
-        let mut schedule = crate::utils::scheduler::SeqSchedule::default();
-        schedule.add_system(Box::new(crate::utils::scheduler::RunnableFn {
-            f: crate::souls::events::events_update,
-            name: "events_update",
-        }));
-        let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
-        for _ in 1..3 * TICKS_PER_HOUR {
-            resumed.tick(&mut schedule, []);
-        }
-        if resumed.map().get(house).is_none() {
-            failures.push(format!("destination {destination:?} shortened the fire"));
-        }
-        resumed.tick(&mut schedule, []);
-        if resumed.map().get(house).is_some() {
-            failures.push(format!("destination {destination:?} prolonged the fire"));
-        }
-        let fires = resumed.read::<Fires>();
-        let events: Vec<_> = fires
-            .events_since(0)
-            .filter(|event| event.building == house)
-            .collect();
-        if let [ignition, collapse] = events.as_slice() {
-            assert_eq!(ignition.kind, FireEventKind::Ignited);
-            assert_eq!(collapse.kind, FireEventKind::Collapsed);
-            lifetimes.push(collapse.tick.0 - ignition.tick.0);
-        }
-    }
-    assert!(failures.is_empty(), "{}", failures.join(", "));
-    assert_eq!(lifetimes, [3 * TICKS_PER_HOUR; 3]);
-}
-
-#[test]
-fn pfc_fire_dispatch_runs_once_in_an_elapsed_hour() {
-    use events::{FireEventKind, Fires};
+fn p9_coverage_does_not_suppress_an_active_fire() {
+    use crate::souls::events::{fire_incident, FireEventKind, Fires};
 
     let (mut test, house, _) = p2d_house();
     test.g
@@ -997,36 +880,152 @@ fn pfc_fire_dispatch_runs_once_in_an_elapsed_hour() {
         .entry(ServiceKind::Fire)
         .or_default()
         .insert(house, 100.0);
-    p2d_force_ignite(&test.g, house);
+    p2d_force_ignite(&mut test.g, house);
     p2d_fire_at(&mut test.g, 2);
-    assert!(!test.g.read::<Fires>().by_building.contains_key(&house));
+    assert_eq!(fire_incident(&test.g, house).unwrap().damage, 60);
+    let fires = test.g.read::<Fires>();
+    assert!(fires.events_since(0)
+        .filter(|event| event.building == house)
+        .all(|event| event.kind == FireEventKind::Ignited));
+}
 
-    let shifted_dispatch = 20 * TICKS_PER_HOUR + events::UPDATE_OFFSET;
-    test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(
-        shifted_dispatch - 1,
-    )))]);
-    events::force_ignite(&test.g, house);
+#[test]
+fn p9_an_unattended_fire_leaves_an_occupied_site() {
+    use crate::souls::demolition::{demolition_status, SiteRemnantCause};
+
+    let (mut test, house, _) = p2d_house();
+    let resident = spawn_human(&mut test.g, house).unwrap();
+    let replacement = test.build_house_near(vec2(310.0, 125.0));
+    let before = test.g.map().get(house).unwrap().obb.corners;
+    let lots = test.g.map().lots().len();
+    p2d_force_ignite(&mut test.g, house);
+    p2d_fire_at(&mut test.g, 2);
+    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    for sim in [&mut test.g, &mut resumed] {
+        p2d_fire_at(sim, 3);
+        crate::utils::scheduler::drain_commands(sim);
+        let map = sim.map();
+        assert_eq!(map.get(house).unwrap().kind, BuildingKind::SiteRemnant);
+        assert_eq!(map.get(house).unwrap().obb.corners, before);
+        assert_eq!(map.lots().len(), lots);
+        assert!(events::fire_incident(sim, house).is_none());
+        assert_eq!(demolition_status(sim, house).unwrap().cause, SiteRemnantCause::Fire);
+        assert_eq!(sim.world.humans[resident].home.house, replacement);
+    }
+}
+
+#[test]
+fn p9_paid_demolition_waits_for_fire_and_only_charges_once() {
+    use crate::souls::demolition::{demolition_quote, demolition_status, demolition_update, DemolitionPhase};
+
+    let (mut test, house, _) = p2d_house();
+    p2d_force_ignite(&mut test.g, house);
+    let now = test.g.get_tick();
+    let quote = demolition_quote(&test.g, house).unwrap().quote;
+    let start = WorldCommand::MapStartDemolition { site: house, quote };
+    let original_balance = test.g.read::<Government>().money;
+    test.g.apply_commands([&start, &start]);
+    {
+        let outcomes = test.g.read::<crate::world_command::CommandOutcomes>();
+        assert_eq!(outcomes.demolition(0).unwrap().unwrap().charged, quote.price);
+        assert_eq!(outcomes.demolition(1).unwrap().unwrap().charged, prototypes::Money::ZERO);
+    }
+    assert_eq!(test.g.read::<Government>().money, original_balance - quote.price);
+    assert_eq!(demolition_status(&test.g, house).unwrap().phase, Some(DemolitionPhase::WaitingForFire));
+    assert!(events::fire_incident(&test.g, house).is_some());
+
+    p2d_fire_at(&mut test.g, 3);
+    demolition_update(&mut test.g);
+    let work_start = test.g.get_tick();
+    assert!(work_start > now);
+    let mut city: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+    assert_eq!(demolition_status(&city, house).unwrap().phase, Some(DemolitionPhase::Working));
+    city.write::<GameTime>().tick.0 = work_start + u64::from(quote.minutes) * prototypes::TICKS_PER_MINUTE - 1;
+    demolition_update(&mut city);
+    assert!(city.map().get(house).is_some());
+    city.write::<GameTime>().tick.0 += 1;
+    demolition_update(&mut city);
+    assert!(city.map().get(house).is_none());
+    assert_eq!(city.read::<Government>().money, original_balance - quote.price);
+}
+
+#[test]
+fn p9_demolition_rejects_stale_quotes_and_legacy_removal() {
+    use crate::souls::demolition::demolition_quote;
+    use crate::world_command::{CommandOutcomes, Rejection};
+
+    let (mut test, house, _) = p2d_house();
+    let mut quote = demolition_quote(&test.g, house).unwrap().quote;
+    quote.signature ^= 1;
+    let initial = test.g.read::<Government>().money;
+    test.g.apply_commands([
+        &WorldCommand::MapStartDemolition { site: house, quote },
+        &WorldCommand::MapRemoveBuilding(house),
+    ]);
+    assert!(test.g.map().get(house).unwrap().has_residential_use());
+    assert_eq!(test.g.read::<Government>().money, initial);
+    let outcomes = test.g.read::<CommandOutcomes>();
+    assert_eq!(outcomes.last, [
+        ("MapStartDemolition", Rejection::StaleDemolitionQuote),
+        ("MapRemoveBuilding", Rejection::LegacyBuildingRemoval),
+    ]);
+}
+
+#[test]
+fn pfc_fire_lifetime_ignores_game_time_jumps() {
+    use events::{fire_incident, FireEventKind, Fires};
+    let lifetime = 85 * prototypes::TICKS_PER_MINUTE;
+
+    for destination in [None, Some(0), Some(20 * TICKS_PER_HOUR + 1)] {
+        let (mut test, house, _) = p2d_house();
+        events::force_ignite(&mut test.g, house);
+        if let Some(destination) = destination {
+            test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(destination)))]);
+        }
+
+        let mut schedule = crate::utils::scheduler::SeqSchedule::default();
+        schedule.add_system(Box::new(crate::utils::scheduler::RunnableFn {
+            f: events::events_update,
+            name: "events_update",
+        }));
+        let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
+        for _ in 1..lifetime {
+            resumed.tick(&mut schedule, []);
+        }
+        assert!(fire_incident(&resumed, house).is_some());
+        resumed.tick(&mut schedule, []);
+        assert!(fire_incident(&resumed, house).is_none());
+        assert_eq!(resumed.map().get(house).unwrap().kind, BuildingKind::SiteRemnant);
+        let fires = resumed.read::<Fires>();
+        let history: Vec<_> = fires.events_since(0).filter(|event| event.building == house).collect();
+        assert_eq!(history[0].kind, FireEventKind::Ignited);
+        assert_eq!(history[1].kind, FireEventKind::Collapsed);
+        assert_eq!(history[1].tick.0 - history[0].tick.0, lifetime);
+    }
+}
+
+#[test]
+fn pfc_fire_dispatch_runs_once_in_an_elapsed_hour() {
+    use events::ServiceIncidents;
+    let (mut test, house, _) = p2d_house();
+    let (cohort, _) = events::cohort_key(house);
     let mut schedule = crate::utils::scheduler::SeqSchedule::default();
     schedule.add_system(Box::new(crate::utils::scheduler::RunnableFn {
         f: events::events_update,
         name: "events_update",
     }));
+    // Calendar jumps do not advance the cohort.
+    test.apply(&[WorldCommand::SetGameTime(GameTime::new(Tick(20 * TICKS_PER_HOUR)))]);
+    for _ in 0..TICKS_PER_HOUR + u64::from(cohort) * prototypes::TICKS_PER_MINUTE {
+        test.g.tick(&mut schedule, []);
+    }
+    assert_eq!(test.g.read::<ServiceIncidents>().counters.site_hours, 1);
     for _ in 1..TICKS_PER_HOUR {
         test.g.tick(&mut schedule, []);
     }
-    assert!(test.g.read::<Fires>().by_building.contains_key(&house));
+    assert_eq!(test.g.read::<ServiceIncidents>().counters.site_hours, 1);
     test.g.tick(&mut schedule, []);
-    let fires = test.g.read::<Fires>();
-    assert!(!fires.by_building.contains_key(&house));
-    let extinguished: Vec<_> = fires
-        .events_since(0)
-        .filter(|event| event.building == house && event.kind == FireEventKind::Extinguished)
-        .collect();
-    assert_eq!(extinguished.len(), 2);
-    assert_eq!(
-        extinguished[1].tick.0 - extinguished[0].tick.0,
-        TICKS_PER_HOUR
-    );
+    assert_eq!(test.g.read::<ServiceIncidents>().counters.site_hours, 2);
 }
 
 #[test]
@@ -1035,50 +1034,13 @@ fn p2d_forced_fire_never_collapses_a_service_or_special_building() {
     let (school, _) = p2b_place_company(&mut test, "school", vec2(200.0, 70.0), road);
     let (plant, _) = p2b_place_company(&mut test, "coal-power-plant", vec2(280.0, 70.0), road);
     for building in [school, plant] {
-        p2d_force_ignite(&test.g, building);
+        assert!(!events::offer_fixture_fire(&test.g, building));
     }
     p2d_fire_at(&mut test.g, 4);
     for building in [school, plant] {
         assert!(test.g.map().get(building).is_some());
-        assert!(!test
-            .g
-            .read::<crate::souls::events::Fires>()
-            .by_building
-            .contains_key(&building));
+        assert!(events::fire_incident(&test.g, building).is_none());
     }
-}
-
-#[test]
-fn p2d_fire_events_keep_the_latest_256_across_save_and_resume() {
-    use crate::souls::events::{FireEventKind, Fires};
-
-    let (mut test, house, _) = p2d_house();
-    test.g
-        .write::<CoverageGrid>()
-        .by_kind
-        .entry(ServiceKind::Fire)
-        .or_default()
-        .insert(house, 100.0);
-    for hour in 1..=130 {
-        *test.g.write::<GameTime>() = GameTime::new(Tick(hour * TICKS_PER_HOUR + events::UPDATE_OFFSET));
-        events::force_ignite(&test.g, house);
-        p2d_fire_at(&mut test.g, hour + 1);
-    }
-    let mut resumed: Simulation = Bincode::decode(&Bincode::encode(&test.g).unwrap()).unwrap();
-    {
-        let fires = resumed.read::<Fires>();
-        assert_eq!(fires.events.len(), 256);
-        assert!(fires.events_since(0).map(|event| event.seq).eq(5..=260));
-        let last: Vec<_> = fires.events_since(258).map(|event| event.kind).collect();
-        assert_eq!(last, [FireEventKind::Ignited, FireEventKind::Extinguished]);
-    }
-    crate::souls::events::force_ignite(&resumed, house);
-    p2d_fire_at(&mut resumed, 132);
-    assert!(resumed
-        .read::<Fires>()
-        .events_since(260)
-        .map(|event| event.seq)
-        .eq(261..=262));
 }
 
 #[test]
@@ -1270,7 +1232,7 @@ fn p2d_happiness_demand_is_weighted_by_residents_and_reported_separately() {
 
 #[test]
 fn p2d_fire_rng_is_independent_of_unrelated_spawns_and_calendar_time() {
-    use crate::souls::events::Fires;
+    use crate::souls::events::{remove_incident, ServiceIncidents};
     use crate::utils::rand_provider::RandProvider;
 
     let (mut original, house, _) = p2d_house();
@@ -1281,24 +1243,26 @@ fn p2d_fire_rng_is_independent_of_unrelated_spawns_and_calendar_time() {
     spawn_human(&mut expanded, extra_house).unwrap();
     let shift = 20 * TICKS_PER_HOUR + 1;
     let shifted_start = expanded.get_tick() + shift;
-    expanded.apply_commands([&WorldCommand::SetGameTime(GameTime::new(Tick(
-        shifted_start,
-    )))]);
+    expanded.apply_commands([&WorldCommand::SetGameTime(GameTime::new(Tick(shifted_start)))]);
 
     let mut ignitions = 0;
-    for hour in 1..=4096 {
+    for minute in 60..600_060 {
         expanded.write::<RandProvider>().next_u32();
-        let tick = hour * TICKS_PER_HOUR + events::UPDATE_OFFSET;
+        let tick = minute * prototypes::TICKS_PER_MINUTE + 1;
         expanded.write::<GameTime>().tick.0 = tick + shift;
+        original.g.write::<GameTime>().tick.0 = tick;
         events::events_update(&mut expanded);
-        p2d_fire_at(&mut original.g, hour);
-        let ignited = original.g.write::<Fires>().by_building.remove(&house);
-        assert_eq!(
-            expanded.write::<Fires>().by_building.remove(&house),
-            ignited
-        );
-        ignitions += usize::from(ignited.is_some());
+        events::events_update(&mut original.g);
+        let ignited = events::fire_incident(&original.g, house).map(|incident| incident.offered_tick);
+        assert_eq!(events::fire_incident(&expanded, house).map(|incident| incident.offered_tick), ignited);
+        if ignited.is_some() {
+            remove_incident(&original.g, house);
+            remove_incident(&expanded, house);
+            ignitions += 1;
+        }
+        remove_incident(&expanded, extra_house);
     }
+    assert_eq!(original.g.read::<ServiceIncidents>().counters.site_hours, 10_000);
     assert!(ignitions > 0, "test must exercise a natural ignition");
 }
 

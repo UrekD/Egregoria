@@ -112,9 +112,14 @@ impl ElectricityCache {
         // Even though we remove edges in "random order", it doesn't matter because
         // the network ids are defined by the smallest object in the network (which is deterministic)
         // We don't remove the edges directly so we can remove edge by edge to maintain coherency
-        let Some(edges) = self.graph.get(&object_id).cloned() else {
+        let Some(edges) = self.graph.get(&object_id) else {
             return;
         };
+        if let [neighbor] = edges.as_slice() {
+            self.remove_leaf(object_id, *neighbor);
+            return;
+        }
+        let edges = edges.clone();
         for edge in edges.iter() {
             self.remove_edge_inner(&object_id, edge);
         }
@@ -125,6 +130,31 @@ impl ElectricityCache {
         self.topology_changed();
 
         debug_assert!(network.objects.len() == 1, "{:?}", object_id);
+    }
+
+    fn remove_leaf(&mut self, object: NetworkObjectID, neighbor: NetworkObjectID) {
+        // A leaf cannot separate any of the other objects. Keep the existing
+        // component and update its key only if this was its smallest member.
+        self.graph
+            .get_mut(&neighbor)
+            .unwrap()
+            .retain(|edge| *edge != object);
+        self.graph.remove(&object);
+        let network_id = self.ids.remove(&object).unwrap();
+        let network = self.networks.get_mut(&network_id).unwrap();
+        network.objects.remove(&object);
+        if let NetworkObjectID::Building(building) = object {
+            network.buildings.remove(&building);
+        }
+        if network_id.0 == object {
+            let mut network = self.networks.remove(&network_id).unwrap();
+            network.id = ElectricityNetworkID(*network.objects.first().unwrap());
+            for object in &network.objects {
+                *self.ids.get_mut(object).unwrap() = network.id;
+            }
+            self.networks.insert(network.id, network);
+        }
+        self.topology_changed();
     }
 
     /// Add an edge between two network objects (symmetric)
@@ -437,12 +467,43 @@ pub fn check_electricity_coherency(map: &Map) {
 
 #[cfg(test)]
 mod tests {
-    use crate::map::{check_electricity_coherency, ElectricityCache};
+    use crate::map::{check_electricity_coherency, BuildingID, ElectricityCache};
     use crate::map::{BuildingKind, LanePatternBuilder, Map, MapProject, NetworkObjectID, RoadID};
     use common::logger::MyLog;
     use geom::{vec3, Vec2, OBB};
     use prototypes::BuildingGen;
     use slotmapd::KeyData;
+
+    #[test]
+    fn p9_fire_closure_removes_electrical_leaves_and_preserves_the_network() {
+        let mut cache = ElectricityCache::default();
+        let home = NetworkObjectID::Building(BuildingID::from(KeyData::from_ffi(1)));
+        let other_home = NetworkObjectID::Building(BuildingID::from(KeyData::from_ffi(2)));
+        let first_road = NetworkObjectID::Road(RoadID::from(KeyData::from_ffi(1)));
+        let second_road = NetworkObjectID::Road(RoadID::from(KeyData::from_ffi(2)));
+        for object in [home, other_home, first_road, second_road] {
+            cache.add_object(object);
+        }
+        cache.add_edge(home, first_road);
+        cache.add_edge(first_road, second_road);
+        cache.add_edge(second_road, other_home);
+        let original_id = cache.net_id(home).unwrap();
+
+        cache.remove_object(other_home);
+        assert_eq!(cache.net_id(second_road), Some(original_id));
+        assert!(cache.net_id(other_home).is_none());
+
+        cache.remove_object(home);
+        let new_id = cache.net_id(first_road).unwrap();
+        assert_ne!(new_id, original_id);
+        assert_eq!(cache.net_id(second_road), Some(new_id));
+        let network = cache.networks().next().unwrap();
+        assert_eq!(cache.networks().count(), 1);
+        assert_eq!(network.objects.len(), 2);
+        assert!(network.buildings.is_empty());
+        assert_eq!(cache.graph()[&first_road], [second_road]);
+        assert_eq!(cache.graph()[&second_road], [first_road]);
+    }
 
     #[test]
     fn test_loop_removal() {

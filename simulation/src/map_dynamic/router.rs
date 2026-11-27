@@ -142,7 +142,7 @@ fn routing_changed(
             }
             router.reset_dest();
             match router.target_dest {
-                Some(Destination::Building(build)) if map.get(build).is_none() => {
+                Some(Destination::Building(build)) if map.get(build).is_none_or(|building| building.kind == crate::map::BuildingKind::SiteRemnant) => {
                     router.cancel_route(parking);
                     h.decision = Default::default();
                 }
@@ -184,7 +184,7 @@ fn routing_changed(
                     return;
                 }
 
-                let Some(building) = map.get(build) else {
+                let Some(building) = map.get(build).filter(|b| b.kind != crate::map::BuildingKind::SiteRemnant) else {
                     router.cur_dest = router.target_dest;
                     return;
                 };
@@ -573,7 +573,7 @@ pub fn routing_update_system(world: &mut World, resources: &mut Resources) {
                     walk_outside(body, pos, cbuf_human, &mut h.location);
                 }
                 RoutingStep::GetInBuilding(build) => {
-                    if !map.buildings().contains_key(build) {
+                    if map.get(build).is_none_or(|b| b.kind == crate::map::BuildingKind::SiteRemnant) {
                         h.router.reset_dest();
                         return;
                     }
@@ -1180,17 +1180,25 @@ impl Router {
 
     /// Whether a planned or current step uses the vehicle.
     fn plans_with(&self, id: VehicleID) -> bool {
+        self.step_vehicles().any(|vehicle| vehicle == id)
+    }
+
+    pub(crate) fn step_vehicles(&self) -> impl Iterator<Item = VehicleID> + '_ {
         self.steps
             .iter()
             .chain(self.cur_step.iter())
-            .any(|step| match *step {
+            .filter_map(|step| match *step {
                 RoutingStep::DriveTo(vehicle, _)
                 | RoutingStep::Park(vehicle, _)
                 | RoutingStep::Unpark(vehicle)
                 | RoutingStep::GetInVehicle(vehicle)
-                | RoutingStep::GetOutVehicle(vehicle) => vehicle == id,
-                _ => false,
+                | RoutingStep::GetOutVehicle(vehicle) => Some(vehicle),
+                _ => None,
             })
+    }
+
+    pub(crate) fn references_vehicle(&self, id: VehicleID) -> bool {
+        self.personal_car == Some(id) || self.vehicle == Some(id) || self.plans_with(id)
     }
 
     pub(crate) fn forget_vehicle(&mut self, id: VehicleID) -> bool {
@@ -1204,7 +1212,13 @@ impl Router {
         selected || self.plans_with(id)
     }
 
-    pub(crate) fn cancel_route(&mut self, parking: &mut ParkingManagement) {
+    pub(crate) fn has_reserved_spot(&self, mut matches: impl FnMut(crate::map::ParkingSpotID) -> bool) -> bool {
+        self.cur_step.iter().chain(&self.steps).any(|step| {
+            matches!(step, RoutingStep::Park(_, Some(spot)) if matches(spot.id()))
+        })
+    }
+
+    pub fn cancel_route(&mut self, parking: &mut ParkingManagement) {
         if matches!(self.cur_step, Some(RoutingStep::RideTransit { .. })) {
             self.defer_replan();
             return;

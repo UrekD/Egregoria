@@ -15,7 +15,7 @@ use crate::map::{
     MAX_DECK_TILE_TESTS, ROAD_Z_OFFSET,
 };
 use geom::OBB;
-use geom::{PolyLine3, Vec2, Vec3, AABB};
+use geom::{Intersect, PolyLine3, Shape, Vec2, Vec3, AABB};
 use ordered_float::OrderedFloat;
 use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
@@ -97,13 +97,24 @@ pub(crate) struct PreparedGrowable {
     building: PreparedBuilding,
 }
 
+impl PreparedSpecialBuilding {
+    pub(crate) fn fire_frontage(&self) -> (Option<RoadID>, Vec3, OBB) {
+        (self.building.connected_road(), self.building.door(), self.shape)
+    }
+}
+
 pub struct Map {
+    pub(crate) service_frontages: BTreeMap<RoadID, Vec<(BuildingID, OBB)>>,
+    pub(crate) active_service_frontages: BTreeSet<(RoadID, BuildingID)>,
     pub(super) land_ownership: super::LandOwnership,
     pub(super) land_frontage: super::land_frontage::LandFrontage,
     pub(crate) roads: Roads,
     pub(crate) lanes: Lanes,
     pub(crate) intersections: Intersections,
     pub(crate) buildings: Buildings,
+    pub(crate) fire_cohorts: BTreeSet<(u8, BuildingID)>,
+    pub(super) ruins: BTreeSet<BuildingID>,
+    pub(super) ruin_land_value: BTreeMap<(i32, i32), u32>,
     pub(crate) lots: Lots,
     pub(super) lots_by_road: BTreeMap<RoadID, BTreeSet<LotID>>,
     pub(crate) spatial_map: SpatialMap,
@@ -174,11 +185,16 @@ impl Clone for Map {
             lanes: self.lanes.clone(),
             intersections: self.intersections.clone(),
             buildings: self.buildings.clone(),
+            fire_cohorts: self.fire_cohorts.clone(),
+            ruins: self.ruins.clone(),
+            ruin_land_value: self.ruin_land_value.clone(),
             lots: self.lots.clone(),
             spatial_map,
             external_train_stations: self.external_train_stations.clone(),
             lot_origins: self.lot_origins.clone(),
             walking_topology_generation: self.walking_topology_generation,
+            service_frontages: self.service_frontages.clone(),
+            active_service_frontages: self.active_service_frontages.clone(),
             driving_policy_generation: self.driving_policy_generation,
             junction_policy_revision: self.junction_policy_revision,
             roundabouts: self.roundabouts.clone(),
@@ -210,6 +226,9 @@ impl Map {
             intersections: Intersections::default(),
             parking: ParkingSpots::default(),
             buildings: Buildings::default(),
+            fire_cohorts: BTreeSet::new(),
+            ruins: BTreeSet::new(),
+            ruin_land_value: BTreeMap::new(),
             lots: Lots::default(),
             environment: Environment::default(),
             spatial_map: SpatialMap::default(),
@@ -219,6 +238,8 @@ impl Map {
                 .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
                 .expect("map identities exhausted"),
             walking_topology_generation: 0,
+            service_frontages: BTreeMap::new(),
+            active_service_frontages: BTreeSet::new(),
             driving_policy_generation: 0,
             junction_policy_revision: 0,
             roundabouts: BTreeSet::new(),
@@ -502,13 +523,16 @@ impl Map {
         self.junction_rules.len()
     }
 
-    fn check_junction_topology_edit(&self, id: IntersectionID) -> Result<(), ConnectionError> {
-        if !self.has_junction_rules() {
+    fn check_junction_edit(&self, id: IntersectionID, changes_geometry: bool) -> Result<(), ConnectionError> {
+        if !self.has_junction_rules() && self.active_service_frontages.is_empty() {
             return Ok(());
         }
         let junction = self.get(id).ok_or(ConnectionError::InvalidEndpoint)?;
         if junction.roads.len() > 128 {
             return Err(ConnectionError::WorkLimit);
+        }
+        if changes_geometry && junction.roads.iter().any(|&road| self.active_service_road(road)) {
+            return Err(ConnectionError::OccupiedServiceAccess);
         }
         if self.junction_rules(id).is_some()
             || junction.roads.iter().any(|&road| {
@@ -522,12 +546,23 @@ impl Map {
         Ok(())
     }
 
+    fn check_junction_topology_edit(&self, id: IntersectionID) -> Result<(), ConnectionError> {
+        self.check_junction_edit(id, true)
+    }
+
+    pub(crate) fn active_service_road(&self, road: RoadID) -> bool {
+        self.active_service_frontages
+            .range((road, BuildingID::from(slotmapd::KeyData::from_ffi(0)))..)
+            .next()
+            .is_some_and(|&(found, _)| found == road)
+    }
+
     fn check_connection_junctions(
         &self,
         from: ConnectionEndpoint,
         to: ConnectionEndpoint,
     ) -> Result<(), ConnectionError> {
-        if !self.has_junction_rules() {
+        if !self.has_junction_rules() && self.active_service_frontages.is_empty() {
             return Ok(());
         }
         for endpoint in [from, to] {
@@ -685,7 +720,6 @@ impl Map {
         id: IntersectionID,
         f: impl FnOnce(&mut Intersection),
     ) -> Result<(), ConnectionError> {
-        self.check_junction_topology_edit(id)?;
         let inter = self
             .intersections
             .get(id)
@@ -695,9 +729,19 @@ impl Map {
         if next.id != id || next.pos != inter.pos || next.roads != inter.roads {
             return Err(ConnectionError::InvalidEndpoint);
         }
+        let changes_geometry = next.turn_policy.roundabout != inter.turn_policy.roundabout;
+        self.check_junction_edit(id, changes_geometry)?;
+        if !changes_geometry && inter.roads.iter().any(|road| self.service_frontages.contains_key(road)) {
+            self.intersections[id] = next;
+            self.refresh_junction_paths(id, true);
+            self.driving_graph_changed();
+            self.subscribers.dispatch(UpdateType::Road, &self.intersections[id]);
+            self.check_invariants();
+            return Ok(());
+        }
         if self.environment.strict_water_siting()
             || self.land_ownership.is_tiled()
-            || next.turn_policy.roundabout != inter.turn_policy.roundabout
+            || changes_geometry
         {
             super::prepare_junction_update(self, &next, &mut WaterTopologyWork::new().geometry())?;
         }
@@ -718,12 +762,12 @@ impl Map {
         turn: super::TurnPolicy,
         light: super::LightPolicy,
     ) -> Result<(), ConnectionError> {
-        self.check_junction_topology_edit(id)?;
         let mut next = self
             .get(id)
             .ok_or(ConnectionError::InvalidEndpoint)?
             .clone();
         let changed_roundabout = next.turn_policy.roundabout != turn.roundabout;
+        self.check_junction_edit(id, changed_roundabout)?;
         next.turn_policy = turn;
         next.light_policy = light;
         if changed_roundabout
@@ -801,17 +845,50 @@ impl Map {
         &self,
         id: BuildingID,
     ) -> Result<(), super::LandDenial> {
-        self.authorize_land_effects(super::PreparedEffects::Building(id))?;
         let mut remaining = super::MAX_WATER_BATCH_WORK;
+        self.authorize_building_removal_budgeted(id, &mut remaining)
+    }
+
+    pub(crate) fn authorize_building_removal_budgeted(
+        &self,
+        id: BuildingID,
+        remaining: &mut usize,
+    ) -> Result<(), super::LandDenial> {
+        let building = self.get(id).ok_or(super::LandDenial::ForbiddenOperation)?;
+        super::spend_water_work(remaining, 1 + building.zone.as_ref().map_or(0, |zone| zone.poly.len()))
+            .map_err(|_| super::LandDenial::WorkLimit)?;
+        self.authorize_land_effects(super::PreparedEffects::Building(id))?;
         self.authorize_projected_construction_cuts(
             &BTreeSet::from([id.into()]),
             &[],
-            &mut remaining,
+            remaining,
         )
         .map_err(|error| match error {
             WaterEditError::LandDenied(reason) => reason,
             _ => super::LandDenial::WorkLimit,
         })
+    }
+
+    pub(crate) fn prepare_demolition_clearance(
+        &self,
+        id: BuildingID,
+        remaining: &mut usize,
+    ) -> Result<(), crate::souls::demolition::ClearanceBlocker> {
+        use crate::souls::demolition::ClearanceBlocker;
+        let building = self.get(id).ok_or(ClearanceBlocker::Land(super::LandDenial::ForbiddenOperation))?;
+        super::spend_water_work(remaining, 1 + building.zone.as_ref().map_or(0, |zone| zone.poly.len()))
+            .map_err(|_| ClearanceBlocker::WorkLimit)?;
+        self.authorize_land_effects(super::PreparedEffects::Building(id))
+            .map_err(ClearanceBlocker::Land)?;
+        if !Building::dry_footprint(&self.environment, &building.obb, building.zone.as_ref()) {
+            return Err(ClearanceBlocker::Water);
+        }
+        self.authorize_projected_construction_cuts(&BTreeSet::from([id.into()]), &[], remaining)
+            .map_err(|error| match error {
+                WaterEditError::LandDenied(reason) => ClearanceBlocker::Land(reason),
+                WaterEditError::Limit => ClearanceBlocker::WorkLimit,
+                _ => ClearanceBlocker::Water,
+            })
     }
 
     pub(crate) fn authorize_building_grade(
@@ -831,11 +908,32 @@ impl Map {
         })
     }
 
-    pub fn remove_building(&mut self, b: BuildingID) -> Option<Building> {
-        info!("remove_building {:?}", b);
+    pub(crate) fn close_building(&mut self, id: BuildingID) -> Option<Building> {
+        let building = self.buildings.get_mut(id)?;
+        if building.kind == BuildingKind::SiteRemnant {
+            return None;
+        }
+        let original = building.clone();
+        building.kind = BuildingKind::SiteRemnant;
+        self.fire_cohorts.remove(&crate::souls::events::cohort_key(id));
+        self.water_services.building_removed(&self.environment, id);
+        self.electricity.remove_object(id);
+        self.external_train_stations.retain(|target| *target != id);
+        self.subscribers.dispatch(UpdateType::Building, building);
+        Some(original)
+    }
 
+    pub fn remove_building(&mut self, b: BuildingID) -> Option<Building> {
         self.authorize_building_removal(b).ok()?;
-        let b = self.buildings.remove(b)?;
+        self.clear_prepared_building(b)
+    }
+
+    pub(crate) fn clear_prepared_building(&mut self, id: BuildingID) -> Option<Building> {
+        let b = self.buildings.remove(id)?;
+        if self.ruins.remove(&id) {
+            self.update_ruin_land_value(b.obb.center(), false);
+        }
+        self.fire_cohorts.remove(&crate::souls::events::cohort_key(id));
         self.water_services.building_removed(&self.environment, b.id);
         queue_construction_cut(&mut self.pending_construction_cuts, &self.environment, &b);
         self.subscribers.dispatch(UpdateType::Building, &b);
@@ -1041,7 +1139,11 @@ impl Map {
         ConnectionError,
     > {
         let mut local;
-        if work.is_none() && (self.land_ownership.is_tiled() || self.checks_rail_sweeps(pattern)) {
+        if work.is_none()
+            && (self.land_ownership.is_tiled()
+                || self.checks_rail_sweeps(pattern)
+                || !self.active_service_frontages.is_empty())
+        {
             local = WaterTopologyWork::new();
             let (from, to, prepared) =
                 self.prepare_connection(from, to, elbow, pattern, Some(&mut local))?;
@@ -1185,7 +1287,40 @@ impl Map {
         if self.checks_rail_sweeps(pattern) {
             self.authorize_rail_deck(&prepared.preview.deck, pattern, &mut work.remaining)?;
         }
+        self.authorize_service_frontage(&prepared.preview.deck, pattern.width(), &mut work.remaining)?;
         Ok((profile_samples, Some(prepared)))
+    }
+
+    fn authorize_service_frontage(
+        &self,
+        deck: &PolyLine3,
+        width: f32,
+        work: &mut usize,
+    ) -> Result<(), ConnectionError> {
+        for &(road, site) in &self.active_service_frontages {
+            let Some(building) = self.get(site) else { continue };
+            let Some(frontages) = self.service_frontages.get(&road) else { continue };
+            for &(owner, shape) in frontages {
+                if site != owner {
+                    continue;
+                }
+                spend_water_work(work, 1)?;
+                let envelope = shape.expand(width * 0.5);
+                if !envelope.bbox().intersects(&deck.bbox().flatten()) {
+                    continue;
+                }
+                spend_water_work(work, deck.len())?;
+                if deck.as_slice().windows(2).any(|pair| {
+                    let low = pair[0].z.min(pair[1].z) - 1.25;
+                    let high = pair[0].z.max(pair[1].z) + 1.25;
+                    (low..=high).contains(&building.door_pos.z)
+                        && envelope.intersects(&geom::Segment::new(pair[0].xy(), pair[1].xy()))
+                }) {
+                    return Err(ConnectionError::OccupiedServiceAccess);
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn checks_rail_sweeps(&self, pattern: &LanePattern) -> bool {
@@ -1353,7 +1488,9 @@ impl Map {
         }
         // Unrestricted bulk connection callers can arrive without a topology
         // projection. Still authorize track geometry before the first map write.
-        let prepared = if prepared.is_none() && self.checks_rail_sweeps(pattern) {
+        let prepared = if prepared.is_none()
+            && (self.checks_rail_sweeps(pattern) || !self.active_service_frontages.is_empty())
+        {
             self.prepare_resolved_connection_inner(
                 from,
                 to,
@@ -1600,7 +1737,7 @@ impl Map {
     pub fn update_zone(&mut self, id: BuildingID, zone: Zone) -> Option<()> {
         let zone = zone.normalized()?;
         self.authorize_zone_change(id, &zone).ok()?;
-        let b = self.buildings.get_mut(id)?;
+        let b = self.buildings.get_mut(id).filter(|building| building.kind != BuildingKind::SiteRemnant)?;
         if !Building::dry_footprint(&self.environment, &b.obb, Some(&zone)) {
             return None;
         }
@@ -1693,6 +1830,7 @@ impl Map {
             &mut self.electricity,
             &mut self.roads,
         );
+        self.index_fire_candidate(id);
         self.clean_lots_inner(self.spatial_map.query(shape, ProjectFilter::LOT).collect());
         self.clear_construction_trees(shape.expand(10.0));
         queue_construction_cut(
@@ -1948,6 +2086,9 @@ impl Map {
         growable: bool,
     ) -> Option<BuildingID> {
         let lot = self.lots.get(lot_id)?;
+        if self.service_apron_overlaps(&lot.shape) {
+            return None;
+        }
         self.authorize_new_building(&lot.shape, gen, None, Some(lot.parent))
             .ok()?;
         let road = self.roads.get(lot.parent)?;
@@ -1984,6 +2125,7 @@ impl Map {
     }
 
     fn consume_building_lot(&mut self, lot_id: LotID, id: BuildingID, growable: bool) {
+        self.index_fire_candidate(id);
         let lot = self
             .remove_lot_record(lot_id)
             .expect("building lot still exists");
@@ -2614,7 +2756,9 @@ impl Map {
             let road_id = b.connected_road.unwrap();
             self.roads[road_id].connected_buildings.push(b.id);
 
-            self.electricity.add_edge(b.id, road_id);
+            if b.kind != BuildingKind::SiteRemnant {
+                self.electricity.add_edge(b.id, road_id);
+            }
         }
 
         Some(RoadSplit {
@@ -2770,7 +2914,9 @@ impl Map {
             }
             new_r.connected_buildings.push(b.id);
 
-            self.electricity.add_edge(b.id, new_r.id);
+            if b.kind != BuildingKind::SiteRemnant {
+                self.electricity.add_edge(b.id, new_r.id);
+            }
         }
 
         let new_id = new_r.id;
@@ -3029,6 +3175,61 @@ impl Map {
     pub fn intersections(&self) -> &Intersections {
         &self.intersections
     }
+    pub fn is_ruined(&self, id: BuildingID) -> bool {
+        self.ruins.contains(&id)
+    }
+
+    pub(crate) fn mark_ruined(&mut self, id: BuildingID) {
+        if self.ruins.insert(id) {
+            let building = &self.buildings[id];
+            let center = building.obb.center();
+            self.subscribers.dispatch(UpdateType::Building, building);
+            self.update_ruin_land_value(center, true);
+        }
+    }
+
+    pub fn ruin_land_value_penalty(&self, at: Vec2) -> f32 {
+        if self.ruin_land_value.is_empty() {
+            return 0.0;
+        }
+        let cell = Self::ruin_cell(at);
+        self.ruin_land_value.get(&cell).copied().unwrap_or(0).min(1600) as f32 / 100.0
+    }
+
+    fn ruin_cell(at: Vec2) -> (i32, i32) {
+        let sample = (at / 16.0).round();
+        (sample.x as i32, sample.y as i32)
+    }
+
+    fn update_ruin_land_value(&mut self, center: Vec2, add: bool) {
+        let (column, row) = Self::ruin_cell(center);
+        for y in row - 6..=row + 6 {
+            for x in column - 6..=column + 6 {
+                let sample = Vec2::new(x as f32 * 16.0, y as f32 * 16.0);
+                let contribution = (800.0 * (1.0 - sample.distance(center) / 96.0)).max(0.0) as u32;
+                if contribution == 0 {
+                    continue;
+                }
+                let cell = (x, y);
+                if add {
+                    *self.ruin_land_value.entry(cell).or_default() += contribution;
+                } else {
+                    let value = self.ruin_land_value.get_mut(&cell).expect("existing ruin contribution");
+                    *value -= contribution;
+                    if *value == 0 {
+                        self.ruin_land_value.remove(&cell);
+                    }
+                }
+            }
+        }
+    }
+
+    fn index_fire_candidate(&mut self, id: BuildingID) {
+        if crate::souls::events::can_burn(self.buildings[id].kind) {
+            self.fire_cohorts.insert(crate::souls::events::cohort_key(id));
+        }
+    }
+
     pub fn buildings(&self) -> &Buildings {
         &self.buildings
     }
@@ -3048,6 +3249,11 @@ impl Map {
             .query(obb, ProjectFilter::BUILDING)
             .next()
             .is_some()
+            || self.service_apron_overlaps(&obb)
+    }
+
+    pub(crate) fn service_apron_overlaps(&self, shape: &OBB) -> bool {
+        self.service_frontages.values().flatten().any(|(_, apron)| apron.intersects(shape))
     }
 
     pub fn find_road(&self, src: IntersectionID, dst: IntersectionID) -> Option<RoadID> {
@@ -3096,6 +3302,10 @@ impl Map {
             .filter(|(_, x)| x.kind == kind)
             .min_by_key(|(id, lane)| (OrderedFloat(lane.points.project_dist2(p)), *id))
             .map(|(id, _)| id)
+    }
+
+    pub(crate) fn apron_spots(&self, lane: LaneID) -> impl Iterator<Item = ParkingSpotID> + '_ {
+        self.parking.lane_spots.get(lane).into_iter().flatten().copied()
     }
 
     pub fn parking_to_drive(&self, spot: ParkingSpotID) -> Option<LaneID> {
@@ -3184,7 +3394,21 @@ impl Map {
             }
         }
 
-        crate::map::electricity_cache::check_electricity_coherency(self);
+        // A retained site remains a road-frontage object, but closing it
+        // removes its electrical node. Compare the live network projection.
+        let mut expected = ElectricityCache::build(self);
+        for (site, building) in &self.buildings {
+            if building.kind == BuildingKind::SiteRemnant {
+                expected.remove_object(site);
+            }
+        }
+        assert_eq!(self.electricity.ids, expected.ids);
+        assert_eq!(self.electricity.networks, expected.networks);
+        let mut live_edges = self.electricity.graph.clone();
+        for edges in live_edges.values_mut().chain(expected.graph.values_mut()) {
+            edges.sort_unstable();
+        }
+        assert_eq!(live_edges, expected.graph);
 
         for b in self.external_train_stations.iter() {
             assert!(self.buildings.contains_key(*b));

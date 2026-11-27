@@ -33,7 +33,9 @@ use simulation::world_command::{WorldCommand, WorldCommands};
 use simulation::{AnyEntity, Simulation, SimulationOptions, VehicleID};
 
 #[test]
-fn p7_recorded_p6_snapshot_warns_when_installed() {
+fn p9_recorded_p6_snapshot_warns_and_requires_new_slot() {
+    use common::saveload::{Bincode, Encoder};
+
     scenarios::ensure_repo_root_cwd();
     crate::init::init();
     let root = std::env::temp_dir().join(format!("egregoria-p7-recorded-{}", std::process::id()));
@@ -45,9 +47,24 @@ fn p7_recorded_p6_snapshot_warns_when_installed() {
         ..simulation::NewGameOptions::default()
     })
     .unwrap();
-    city.write::<simulation::Replay>().version = "0.11.1".to_owned();
-    city.save_to_slot(&root, &slot, common::saveload::SnapshotRevision::new(1))
-        .unwrap();
+    // The unwrapped snapshot encodes its version, world and resource payloads in that order.
+    let (_, world, mut resources): (String, simulation::World, BTreeMap<String, Vec<u8>>) =
+        Bincode::decode(&Bincode::encode(&city).unwrap()).unwrap();
+    for name in ["service_incidents", "site_remnants", "fire_fleet"] {
+        assert!(resources.remove(name).is_some());
+    }
+    let registry = prototypes::prototypes().pre_fire_fingerprint();
+    resources.insert("prototype_registry".into(), Bincode::encode(&registry).unwrap());
+    resources.insert(
+        "replay".into(),
+        format!(r#"{{"version":"0.11.1","enabled":true,"registry":{registry},"commands":[]}}"#)
+            .into_bytes(),
+    );
+    std::fs::write(
+        root.join("old-recording.bc"),
+        Bincode::encode(&("0.11.1", world, resources)).unwrap(),
+    )
+    .unwrap();
     let loaded = Simulation::load_from_slot(&root, &slot);
     std::fs::remove_dir_all(root).unwrap();
     let mut uiw = UiWorld::with_defaults();
@@ -56,12 +73,15 @@ fn p7_recorded_p6_snapshot_warns_when_installed() {
     uiw.insert(OrbitCamera::from_camera(camera));
     let city = install_world(&uiw, WorldReplacement::Snapshot(loaded.unwrap(), slot), 1);
     assert_eq!(city.get_tick(), 1);
+    assert!(city.read::<simulation::Replay>().migrated_from_legacy_slot());
+    assert_eq!(uiw.read::<SessionState>().city_name, "old-recording");
+    assert!(uiw.read::<SessionState>().snapshot_slot().is_none());
     assert!(uiw
         .read::<SaveLoadState>()
         .notice
         .as_ref()
         .is_some_and(|(_, message)| {
-            message.contains("older debug replay recording was discarded")
+            message.contains("Save to a new slot") && message.contains("Replay is unavailable")
         }));
 }
 
@@ -134,7 +154,8 @@ fn p4_world_replacement_clears_world_identity_and_requires_fresh_input() {
         dontclear: true,
     };
     uiw.write::<FollowEntity>().0 = Some(entity);
-    let cmd = WorldCommand::MapRemoveBuilding(building);
+    let quote = simulation::souls::demolition::demolition_quote(&sim, building).unwrap().quote;
+    let cmd = WorldCommand::MapStartDemolition { site: building, quote };
     uiw.commands().push(cmd.clone());
     *uiw.write::<ReceivedCommands>() =
         ReceivedCommands::new(WorldCommands::from(vec![cmd.clone()]));

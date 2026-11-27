@@ -433,6 +433,16 @@ impl SpatialMap {
             .filter_map(move |(_, _, p)| shape.intersects(self.near.get(p)?).then_some(*p))
     }
 
+    pub(crate) fn reserve_apron_query(&self, bounds: AABB, work: &mut usize) -> Result<(), WaterEditError> {
+        let cells = CellRange::checked(bounds).ok_or(WaterEditError::Limit)?;
+        spend_water_work(work, cells.len())?;
+        for cell in cells.iter().filter_map(|id| self.broad.storage.cell(id)) {
+            // Charge raw memberships before deduplication or exact testing.
+            spend_water_work(work, cell.entries.len().saturating_mul(2))?;
+        }
+        Ok(())
+    }
+
     pub(super) fn reserve_lot_query(
         &self,
         bounds: AABB,

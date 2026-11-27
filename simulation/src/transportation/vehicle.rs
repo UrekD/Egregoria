@@ -230,6 +230,19 @@ pub fn spawn_driving_vehicle(
     Some(id)
 }
 
+pub(crate) fn spawn_fire_truck(sim: &mut Simulation, bay: Transform) -> VehicleID {
+    let vehicle = Vehicle {
+        ang_velocity: 0.0,
+        wait_time: 0.0,
+        max_speed_multiplier: 1.0,
+        state: VehicleState::ParkedAtDepot,
+        kind: VehicleKind::Truck,
+        tint: Color::from_hex(0xb7_20_20),
+        flag: 0,
+    };
+    make_vehicle_entity(sim, bay, vehicle, Itinerary::NONE, false)
+}
+
 pub(crate) fn spawn_truck_at_depot(sim: &mut Simulation, door: Vec3) -> VehicleID {
     let vehicle = Vehicle::with_state(
         VehicleKind::Truck,

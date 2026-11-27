@@ -18,6 +18,7 @@ use simulation::map::{
     AuthoredTilesSpec, GatewayRole, LandMode, LandSetupError, LandTileId, LotLayout, MapProject,
     OwnedTileRect, ProtectedRoot, TileExtent, WaterBodyId,
 };
+use simulation::souls::events::FireScenarioRules;
 use simulation::{
     AuthoredTownOptions, SavePhase, Simulation, SlotCamera, SlotId, SnapshotRevision,
 };
@@ -538,11 +539,19 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
         TownConfig::default()
     };
     let mut plan = plan_town(&inputs, config, SpacingLimits::default())?;
+    // Commissioning and its acceptance runs exercise the authored opening under
+    // the same fire-offer policy. The delivered snapshot uses gameplay defaults.
+    let commissioning_rules = FireScenarioRules {
+        suppress_incidental_offers: true,
+        ..Default::default()
+    };
     let (sim, opening) = if wet {
         commission::configure_commissioned_network(&mut plan);
         let (mut sim, built, freight) = build_wet_town(&mut plan)?;
         verify_wet_town(&sim, &plan, &built)?;
+        commissioning_rules.apply(&mut sim)?;
         let opening = commission::commission_opening(&mut sim, &plan, &built, Some(freight))?;
+        FireScenarioRules::default().apply(&mut sim)?;
         (sim, Some(opening))
     } else {
         let (sim, _) = build_dry_town(&plan)?;
@@ -602,7 +611,7 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
         return Err("staged CITYMAP slot has invalid revision, metadata or replay".into());
     }
 
-    let loaded =
+    let mut loaded =
         Simulation::load_listed_snapshot(&stage.path, entry).map_err(|error| error.to_string())?;
     if wet
         && !entry.meta.as_ref().is_some_and(|meta| {
@@ -632,17 +641,20 @@ fn export_slot(paths: SourcePaths<'_>, out: &Path, delivery: Delivery) -> Result
     drop(map);
     if let Some(opening) = opening {
         report["wet_acceptance"] = verify_wet_town(&loaded, &plan, &built)?;
-        let load_opening = || Simulation::load_listed_snapshot(&stage.path, entry)
-            .map_err(|error| error.to_string());
+        let load_opening = || -> Result<Simulation, String> {
+            let mut fixture = Simulation::load_listed_snapshot(&stage.path, entry)
+                .map_err(|error| error.to_string())?;
+            commissioning_rules.apply(&mut fixture)?;
+            Ok(fixture)
+        };
         let checkpoint_stage = DeliveryStage::new(parent).map_err(path_error)?;
         report["continuation"] = serde_json::to_value(commission::verify_active_continuation(
             load_opening()?, load_opening()?, &opening, &checkpoint_stage.path,
         )?).map_err(|error| error.to_string())?;
         drop(checkpoint_stage);
-        let fixture = Simulation::load_listed_snapshot(&stage.path, entry)
-            .map_err(|error| error.to_string())?;
         report["wet_acceptance"]["carless_cross_bank_trip"] =
-            commission::verify_cross_bank_trip(fixture, &opening)?;
+            commission::verify_cross_bank_trip(load_opening()?, &opening)?;
+        commissioning_rules.apply(&mut loaded)?;
         let measured = check_loaded_opening(loaded, &plan, &opening)?;
         measured.verify()?;
         report["wet_acceptance"]["scored_bridge_crossings"] =

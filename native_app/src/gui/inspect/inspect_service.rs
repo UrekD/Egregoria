@@ -1,5 +1,5 @@
 use geom::Vec3;
-use goryak::{error, mincolumn, minrow, on_secondary_container, textc, tooltip};
+use goryak::{button_secondary,error, mincolumn, minrow, on_secondary_container, textc, tooltip};
 use prototypes::{try_prototype, GoodsCompanyPrototype, Power, ServiceID, ServiceKind};
 use simulation::economy::TripPurpose;
 use simulation::map::{water_provider_site, Building, BuildingID, Map};
@@ -188,6 +188,47 @@ fn staff_state(
     }
 }
 
+pub(super) fn access_label(reason: simulation::souls::service_access::AccessError) -> &'static str {
+    use simulation::souls::service_access::AccessError::*;
+    match reason {
+        MissingStation | MissingFrontage => "No connected frontage",
+        MissingSidewalk => "No same-deck sidewalk access",
+        NoTruckFit => "No clear space for a truck apron",
+        NoReturnLoop => "No legal truck route there and back",
+        OccupiedCurb => "The approach is occupied",
+        WorkLimit => "The frontage check reached its work limit",
+        AlreadyCommissioned => "A truck apron is already installed",
+    }
+}
+
+pub(super) fn fire_blocker_label(reason: simulation::souls::service_dispatch::FireResponseBlocker) -> &'static str {
+    use simulation::souls::service_dispatch::FireResponseBlocker::*;
+    match reason {
+        Staffing => "Waiting for two on-duty crew at a station",
+        Power => "The station has no power",
+        SceneAccess(reason) | Route(reason) => access_label(reason),
+        CrewLost => "Crew member unavailable · Returning",
+        Held => "Truck held · Waiting for a safe route",
+    }
+}
+
+fn trip_phase_label(phase: simulation::souls::service_dispatch::ServiceTripPhase) -> &'static str {
+    use simulation::souls::service_dispatch::ServiceTripPhase::*;
+    match phase {
+        Boarding => "Crew boarding",
+        Merging => "Leaving station",
+        Outbound => "Driving to fire",
+        Parking => "Parking at scene",
+        WalkingToSite => "Crew approaching fire",
+        Working => "Crew suppressing fire",
+        WalkingToTruck => "Crew returning to truck",
+        LeavingScene => "Leaving scene",
+        Returning => "Returning to station",
+        Docking => "Docking at station",
+        LeavingTruck => "Crew leaving truck",
+    }
+}
+
 fn position_label(label: &str, pos: Vec3) -> String {
     format!("{label} ({:.0}, {:.0})", pos.x, pos.y)
 }
@@ -298,9 +339,52 @@ pub(super) fn render(
             }
         }
 
+        let station = if activity == StaffActivity::Service(ServiceKind::Fire) {
+            use simulation::souls::service_dispatch::{fire_apron_quote, service_station};
+            let station = service_station(sim, building.id);
+            if let Some(station) = station {
+                entity_link_named(uiworld, sim, station.truck.into(), "Fire truck".to_owned());
+                if let Some(phase) = station.phase {
+                    label(format!("Response · {}", trip_phase_label(phase)));
+                }
+                if let Some(reason) = station.blocker {
+                    label(fire_blocker_label(reason).to_owned());
+                }
+            } else {
+                match fire_apron_quote(sim, building.id) {
+                    Ok(quote) => {
+                        if button_secondary(format!(
+                            "Install truck apron for {} · {} curb spaces",
+                            quote.price, quote.curb_spaces
+                        )).show().clicked {
+                            uiworld.commands().push(
+                                simulation::world_command::WorldCommand::MapRetrofitFireApron {
+                                    site: building.id, quote,
+                                }
+                            );
+                        }
+                    }
+                    Err(reason) => label(access_label(reason).to_owned()),
+                }
+            }
+            station
+        } else {
+            None
+        };
+
         for row in staff.rows {
             minrow(8.0, || {
                 entity_link_named(uiworld, sim, row.id.into(), row.name);
+                if let Some(seat) = station.and_then(|station| {
+                    station.crew.iter().position(|&worker| worker == Some(row.id))
+                }) {
+                    textc(on_secondary_container(), match seat {
+                        0..=1 => "00:00–08:00",
+                        2..=3 => "08:00–16:00",
+                        4..=5 => "16:00–00:00",
+                        _ => "Shift relief",
+                    });
+                }
                 label(format!("{} · {}", row.state.label(), row.location));
             });
         }
@@ -344,7 +428,20 @@ mod tests {
     use slotmapd::Key;
 
     #[test]
-    fn service_staff_lists_live_workers_with_states_locations_and_served_coverage() {
+    fn p9_response_labels_explain_holds_and_swept_access() {
+        use simulation::souls::service_access::AccessError;
+        use simulation::souls::service_dispatch::{FireResponseBlocker, ServiceTripPhase};
+
+        assert_eq!(trip_phase_label(ServiceTripPhase::Working), "Crew suppressing fire");
+        assert_eq!(fire_blocker_label(FireResponseBlocker::Held), "Truck held · Waiting for a safe route");
+        assert_eq!(
+            fire_blocker_label(FireResponseBlocker::SceneAccess(AccessError::OccupiedCurb)),
+            "The approach is occupied"
+        );
+    }
+
+    #[test]
+    fn p9_service_staff_lists_live_workers_with_states_locations_and_served_coverage() {
         let mut fixture = ScenarioCtx::new(SimulationOptions {
             terrain_size: 4,
             save_replay: false,

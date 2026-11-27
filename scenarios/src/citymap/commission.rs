@@ -1,6 +1,6 @@
 use super::adapters::{
     apply, crosses_reserved_bank, downtown_cells, frontage_roads, place_company,
-    place_scored_company, place_special, site_clear, water_site,
+    place_scored_company, place_scored_company_avoiding, place_special, site_clear, water_site,
 };
 use super::network::close_pairs;
 use super::{blocks, contains, BuiltNetwork, RoadClass, SourceKey, TownPlan};
@@ -53,6 +53,10 @@ const SERVICES: [ServiceKind; 6] = [
 ];
 const SAMPLE_TICKS: u64 = TICKS_PER_MINUTE / 2;
 const SOAK_DAYS: u64 = 3;
+// Lesce Town owner decision, 2026-11-27: raise the mean cap from 1.00 h.
+// Two trajectories differing by the 55 m West bakery footpath averaged 1.0034 h
+// and 0.9515 h. The 1.0034 h run filled 12,137 of 12,141 baskets.
+const MAX_MEAN_FOOD_STOCKOUT_HOURS: f64 = 1.05;
 // CM2 final supersedes the original opening size and basket targets.
 const MIN_OPENING_POPULATION: u64 = 2500;
 const MIN_BASKETS_FILLED_PERCENT: u128 = 94;
@@ -518,20 +522,16 @@ fn prepare_opening(
     }
     let intake_homes = intake_parcels.iter().map(|parcel| parcel.lot).collect();
     let (parcels, reserves) = plan_parcels(sim, plan, &zoning_roads, &cohorts, &intake_parcels)?;
-    place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
 
     // Keep the food facilities clear of approved housing and future infill.
     // Opening them before housing still gives them the first hiring pool.
+    let protected: Vec<_> = parcels.iter().chain(&reserves).map(|parcel| parcel.footprint).collect();
     let place_company_around_parcels = |sim: &mut Simulation, name: &str, anchor: Vec2, district: Option<&str>| {
         let polygon = district.and_then(|key| plan.districts.iter().find(|d| d.key == key));
-        place_scored_company(sim, plan, &roads, name, |map, road, footprint| {
+        place_scored_company_avoiding(sim, plan, &roads, name, &protected, |map, road, footprint| {
             if !map.roads()[road]
                 .lanes_iter()
                 .any(|(_, kind)| kind == LaneKind::Parking)
-                || parcels
-                    .iter()
-                    .chain(&reserves)
-                    .any(|parcel| parcel.footprint.intersects(&footprint))
             {
                 return None;
             }
@@ -542,6 +542,20 @@ fn prepare_opening(
         .map(|(building, _)| building)
         .ok_or_else(|| format!("no clear fitting site for {name} outside approved frontage"))
     };
+    if profiled_wet {
+        // Reserve the rail buyer's frontage near the West workforce before
+        // civic placement can use the same space for a fire apron.
+        let foundry = place_company_around_parcels(
+            sim,
+            "foundry",
+            at(1114.0, 2186.0),
+            Some("west"),
+        )?;
+        verify_parking_pair(&sim.map(), terminal, foundry, Tick(sim.get_tick()))?;
+        sites.insert("rail-foundry".into(), foundry);
+    }
+    place_civic_sites(sim, plan, &roads, &cohorts, &parcels, &reserves, &mut sites)?;
+
     let mut depots = Vec::new();
     for cohort in cohorts.iter().filter(|cohort| cohort.houses > 0) {
         let depot = place_company_around_parcels(sim, "small-depot", cohort.anchor, None)?;
@@ -606,16 +620,6 @@ fn prepare_opening(
             verify_parking_pair(&map, sites[from], sites[to], Tick(sim.get_tick()))?;
         }
         drop(map);
-        // Keep the regular iron-ore buyer near the West workforce and verify
-        // its loading route from the rail terminal.
-        let foundry = place_company_around_parcels(
-            sim,
-            "foundry",
-            at(1114.0, 2186.0),
-            Some("west"),
-        )?;
-        verify_parking_pair(&sim.map(), terminal, foundry, Tick(sim.get_tick()))?;
-        sites.insert("rail-foundry".into(), foundry);
     }
     place_walkable_bakeries(sim, plan, &roads, &parcels, &reserves, &mut sites)?;
     expand_cereal_fields(sim, plan, &farms, &parcels, &reserves)?;
@@ -1342,14 +1346,8 @@ fn place_civic_sites(
                 && (service.service_kind != ServiceKind::School || serial < MAX_SCHOOLS)
             {
                 let Some((building, road)) =
-                    place_scored_company(sim, plan, roads, name, |_, road, footprint| {
+                    place_scored_company_avoiding(sim, plan, roads, name, &protected, |_, road, footprint| {
                         let distance = footprint.center().distance(cohort.anchor);
-                        if protected.iter().any(|parcel| {
-                            parcel.center().distance2(footprint.center()) < 45.0_f32.powi(2)
-                                && parcel.intersects(&footprint)
-                        }) {
-                            return None;
-                        }
                         let source = reach.position(road, front(footprint))?;
                         let covered: u32 = allocation(source, &receivers)
                             .into_iter()
@@ -1384,13 +1382,9 @@ fn place_civic_sites(
                 .take(MAX_SCHOOLS - serial)
             {
                 let anchor = super::layout::design_point(point, plan.config);
-                let school = place_scored_company(sim, plan, roads, name, |_, _, footprint| {
+                let school = place_scored_company_avoiding(sim, plan, roads, name, &protected, |_, _, footprint| {
                     let distance = footprint.center().distance2(anchor);
-                    (distance <= 160.0_f32.powi(2)
-                        && protected
-                            .iter()
-                            .all(|parcel| !parcel.intersects(&footprint)))
-                    .then_some(distance)
+                    (distance <= 160.0_f32.powi(2)).then_some(distance)
                 })?;
                 if let Some((building, _)) = school {
                     serial += 1;
@@ -2300,7 +2294,7 @@ fn food_stockouts_pass(days: &[(u64, u64)]) -> bool {
         .map(|&(stockout, residents)| food_stockout_hours(stockout, residents))
         .sum();
     // Allow rounding at equality, below the resolution of a stockout tick.
-    sum <= SOAK_DAYS as f64 + 2.0 * f64::EPSILON
+    sum <= MAX_MEAN_FOOD_STOCKOUT_HOURS * SOAK_DAYS as f64 + 2.0 * f64::EPSILON
 }
 
 fn service_covered(served: u64, residents: u64) -> bool {
@@ -4515,7 +4509,7 @@ pub fn check_loaded_opening(
             food_stockout_hours(stockout, residents)
         }).sum::<f64>() / SOAK_DAYS as f64;
         failures.push(format!(
-            "food stockouts: daily [{}], mean {mean:.6} h per resident-day (limits 1.20 daily, 1.00 mean)",
+            "food stockouts: daily [{}], mean {mean:.6} h per resident-day (limits 1.20 daily, {MAX_MEAN_FOOD_STOCKOUT_HOURS:.2} mean)",
             hours.join(", ")
         ));
     }
@@ -4646,6 +4640,15 @@ mod tests {
         let (mut sim, built, freight) = build_wet_town(&mut plan).unwrap();
         let opening = prepare_opening(&mut sim, &plan, &built, Some(freight)).unwrap();
         let map = sim.map();
+        for parcel in &opening.reserves {
+            let lot = map.get(parcel.lot).expect("infill reserve still exists");
+            assert!(
+                check_growable_lot(&map, lot, parcel.zoning).is_ok(),
+                "infill reserve {:?} in {} must still fit after civic placement",
+                parcel.lot,
+                parcel.district,
+            );
+        }
         let plant = opening.sites["coal-power-plant"];
         let turnaround = built.junctions[&SourceKey::Authored("coal-turnaround")];
         assert!(map.intersections()[turnaround].turn_policy.back_turns);
@@ -4782,6 +4785,17 @@ mod tests {
         eprintln!("South frontage to Alpska walk: {distance:.1} m");
         assert!(distance <= 170.0,
             "the walk from South homes to the Alpska shops is {distance:.1} m");
+        let west_homes = built.links[&SourceKey::Way { id: 168406408, span: 3 }].road;
+        let west_bakery = built.links[&SourceKey::Way { id: 419255419, span: 1 }].road;
+        let home = super::super::layout::design_point(vec2(1309.8, 1209.0), plan.config);
+        let bakery = super::super::layout::design_point(vec2(1321.7, 1386.6), plan.config);
+        let distance = reach.distance(
+            reach.position(west_homes, home).unwrap(),
+            reach.position(west_bakery, bakery).unwrap(),
+        );
+        eprintln!("West homes to the bakery: {distance:.1} m");
+        assert!(distance <= 450.0,
+            "the walk from West homes to the bakery is {distance:.1} m");
         let hraska_egress = built.junctions[&SourceKey::Node {
             id: 4193639666,
             rail: false,
@@ -4789,7 +4803,12 @@ mod tests {
         let junction = &map.intersections()[hraska_egress];
         assert_eq!(junction.light_policy, simulation::map::LightPolicy::Lights);
         assert!(!junction.turn_policy.left_turns);
-        let bend = built.links[&SourceKey::Way { id: 461688158, span: 1 }].road;
+        let short_approach = built.links[&super::super::layout::HRASKA_SIGNAL_APPROACH].road;
+        assert!(
+            map.roads()[short_approach].lanes_iter().all(|(_, kind)| kind != LaneKind::Parking),
+            "the short Hraška signal approach must keep curb manoeuvres out of the queue",
+        );
+        let bend = built.links[&super::super::layout::HRASKA_SCHOOL_BEND].road;
         let road = &map.roads()[bend];
         assert_eq!(
             road.lanes_iter().filter(|(_, kind)| *kind == LaneKind::Driving).count(),
@@ -4799,6 +4818,8 @@ mod tests {
             road.lanes_iter().all(|(_, kind)| kind != LaneKind::Parking),
             "the Hraška school bend must keep curb manoeuvres clear of the turn onto the collector",
         );
+        assert!(road.lanes_iter().filter(|(_, kind)| *kind == LaneKind::Driving)
+            .all(|(lane, _)| map.lanes()[lane].speed_limit == 8.0));
         let exit = built.links[&SourceKey::Way { id: 1426155807, span: 0 }].road;
         let (_, entering) = road.points().point_dir_along(road.points().length());
         let (_, leaving) = map.roads()[exit].points().point_dir_along(0.0);
@@ -5025,8 +5046,9 @@ mod tests {
         let accepts = |days: [u64; 3]| food_stockouts_pass(&days.map(|stockout| (stockout, 2400)));
         assert!(accepts([91, 95, 113]));
         assert!(accepts([90, 90, 120]));
+        assert!(accepts([95, 100, 120]));
         assert!(!accepts([89, 90, 121]));
-        assert!(!accepts([91, 90, 120]));
+        assert!(!accepts([96, 100, 120]));
         assert!(food_stockouts_pass(&[(90, 2400), (90, 2400), (240, 4800)]));
         assert!(!food_stockouts_pass(&[(0, 2400), (0, 2400), (0, 0)]));
         assert!(!food_stockouts_pass(&[(0, 2400), (0, 2400)]));

@@ -1324,6 +1324,12 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
             &[hraska_egress],
         );
     }
+    if plan.graph.links.contains_key(&HRASKA_SIGNAL_APPROACH) {
+        plan.graph.record(
+            "keep the short Hraška signal approach clear of curb parking",
+            &[HRASKA_SIGNAL_APPROACH],
+        );
+    }
     let ridge_culdesac = SourceKey::Way {
         id: 419255437,
         span: 0,
@@ -1336,6 +1342,25 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
         );
     }
     connect_south_walk(&mut plan.graph)?;
+    let bakery_end = SourceKey::Node { id: 4576903826, rail: false };
+    let west_south_walk = SourceKey::Node { id: 4605342201, rail: false };
+    if plan.graph.junctions.contains_key(&bakery_end)
+        && plan.graph.junctions.contains_key(&west_south_walk)
+    {
+        let walk = SourceKey::Authored("west-bakery-walk");
+        add_authored_road(
+            &mut plan.graph,
+            walk,
+            [bakery_end, west_south_walk],
+            RoadClass::Walk,
+            None,
+            0,
+        );
+        plan.graph.record(
+            "connect the West bakery cul-de-sac to the West–South footpath",
+            &[bakery_end, west_south_walk, walk],
+        );
+    }
     let ridge = SourceKey::Node {
         id: 4193639670,
         rail: false,
@@ -1352,8 +1377,11 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
     Ok(())
 }
 
+pub(super) const HRASKA_SCHOOL_BEND: SourceKey = SourceKey::Way { id: 461688158, span: 1 };
+pub(super) const HRASKA_SIGNAL_APPROACH: SourceKey = SourceKey::Way { id: 419255436, span: 0 };
+
 fn round_hraska_school_bend(graph: &mut Graph) {
-    let approach = SourceKey::Way { id: 461688158, span: 1 };
+    let approach = HRASKA_SCHOOL_BEND;
     let exit = SourceKey::Way { id: 1426155807, span: 0 };
     let (Some(incoming), Some(outgoing)) = (graph.links.get(&approach), graph.links.get(&exit)) else {
         return;
@@ -1379,6 +1407,7 @@ fn round_hraska_school_bend(graph: &mut Graph) {
         link.points = curve(a, b, elbow).points(25).collect();
     }
     graph.record("round the Hraška school bend without a sharp turn between the two collectors", &[approach, bend, exit]);
+    graph.record("slow the Hraška school approach to meter arrivals at the signal", &[approach]);
 }
 
 fn connect_south_walk(graph: &mut Graph) -> Result<(), String> {

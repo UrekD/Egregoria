@@ -4233,10 +4233,12 @@ mod lifecycle_tests {
                 .iter()
                 .filter_map(|(id, b)| {
                     matches!(b.kind, BuildingKind::RailFreightStation(_))
-                        .then_some(WorldCommand::MapRemoveBuilding(id))
+                        .then_some(id)
                 })
                 .collect();
-            ctx.apply(&stations);
+            for station in stations {
+                ctx.remove_fixture_building(station);
+            }
             ctx.build_roads(&[
                 vec3(100.0, 100.0, 0.0),
                 vec3(500.0, 100.0, 0.0),
@@ -4545,8 +4547,7 @@ mod lifecycle_tests {
             let SoulID::FreightStation(station) = terminal.soul else {
                 unreachable!()
             };
-            f.ctx
-                .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+            f.ctx.remove_fixture_building(f.destination.building);
             f.ctx.g.write::<Market>().produce(
                 depot.soul,
                 Fixture::coal(),
@@ -4581,8 +4582,7 @@ mod lifecycle_tests {
                 .produce(depot.soul, Fixture::coal(), 16);
             f.update(4 * FREIGHT_MATCH_INTERVAL);
             assert!(f.ctx.g.read::<CargoBook>().manifest_for(truck).is_some());
-            f.ctx
-                .apply(&[WorldCommand::MapRemoveBuilding(depot.building)]);
+            f.ctx.remove_fixture_building(depot.building);
             f.ctx.tick_fast();
             assert!(f.ctx.g.get(truck).is_none());
             assert!(f.ctx.g.read::<CargoBook>().manifest_for(truck).is_none());
@@ -4625,8 +4625,7 @@ mod lifecycle_tests {
             assert!(book.outgoing_loads(depot.building).next().is_none());
         }
         let before = f.hand(f.source);
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(depot.building)]);
+        f.ctx.remove_fixture_building(depot.building);
         assert_eq!(f.hand(f.source), before + 16);
         assert!(f
             .ctx
@@ -4667,7 +4666,7 @@ mod lifecycle_tests {
             (warehouse.building, f.destination.building)
         );
         let before = f.hand(warehouse);
-        f.ctx.apply(&[WorldCommand::MapRemoveBuilding(destination)]);
+        f.ctx.remove_fixture_building(destination);
         assert_eq!(f.hand(warehouse), 224);
         assert!(before < 224);
         assert!(f
@@ -4695,8 +4694,7 @@ mod lifecycle_tests {
             f.ctx.g.read::<Market>().capital(f.destination.soul, item),
             16
         );
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(f.source.building)]);
+        f.ctx.remove_fixture_building(f.source.building);
         f.ctx.tick_fast();
         assert!(f.ctx.g.get(truck).is_none());
     }
@@ -4862,8 +4860,7 @@ mod lifecycle_tests {
             let mut f = Fixture::new();
             f.seed(count, 1);
             f.update(FREIGHT_MATCH_INTERVAL);
-            f.ctx
-                .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+            f.ctx.remove_fixture_building(f.destination.building);
             assert_eq!(
                 (f.manifest_units(), f.reserved(), f.hand(f.source)),
                 (0, 0, count)
@@ -4875,8 +4872,7 @@ mod lifecycle_tests {
         let mut f = Fixture::new();
         f.seed(16, 1);
         f.update(FREIGHT_MATCH_INTERVAL);
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(f.source.building)]);
+        f.ctx.remove_fixture_building(f.source.building);
         f.ctx.tick_fast();
         assert_eq!(f.hand(f.destination), 1);
         assert_eq!(
@@ -4995,8 +4991,7 @@ mod lifecycle_tests {
         for remove in [false, true] {
             let mut f = Fixture::new();
             let terminal = station(&mut f, true);
-            f.ctx
-                .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+            f.ctx.remove_fixture_building(f.destination.building);
             let SoulID::FreightStation(station) = terminal.soul else {
                 unreachable!()
             };
@@ -5009,8 +5004,7 @@ mod lifecycle_tests {
             assert_eq!(f.ctx.g.get(station).unwrap().f.waiting_cargo, 0);
             assert_eq!(export(&f), before);
             if remove {
-                f.ctx
-                    .apply(&[WorldCommand::MapRemoveBuilding(terminal.building)]);
+                f.ctx.remove_fixture_building(terminal.building);
                 assert_eq!(f.manifest_units(), 0);
                 assert_eq!(f.hand(f.source), 16);
                 assert_eq!(export(&f), before);
@@ -5221,7 +5215,7 @@ mod lifecycle_tests {
         let near = place_warehouse_on(&mut f, bakery, vec2(245.0, 157.0), Some(north));
         let far = place_warehouse_on(&mut f, bakery, vec2(350.0, 467.0), Some(south));
         let unused = f.destination.building;
-        f.ctx.apply(&[WorldCommand::MapRemoveBuilding(unused)]);
+        f.ctx.remove_fixture_building(unused);
         assert!(near < far, "the short route sorts first by destination ID");
         let (short, long) = {
             let map = f.ctx.g.map();
@@ -5837,7 +5831,7 @@ mod lifecycle_tests {
                 std::mem::swap(&mut first, &mut second);
             }
             for building in [first, second] {
-                f.ctx.apply(&[WorldCommand::MapRemoveBuilding(building)]);
+                f.ctx.remove_fixture_building(building);
                 f.ctx.tick_fast();
             }
             f.ctx.tick_fast();
@@ -5859,8 +5853,7 @@ mod lifecycle_tests {
     #[test]
     fn e2fix_exports_skip_a_closer_station_without_road_access() {
         let mut f = Fixture::new();
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+        f.ctx.remove_fixture_building(f.destination.building);
         let far = station(&mut f, true);
         let near = station_at(&mut f, vec2(330.0, 200.0), None);
         let SoulID::FreightStation(near_id) = near.soul else {
@@ -6016,8 +6009,7 @@ mod lifecycle_tests {
         let depot = warehouse(&mut f, "small-depot");
         let (_, truck) = warehouse_driver(&mut f, depot);
         station(&mut f, true);
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+        f.ctx.remove_fixture_building(f.destination.building);
         f.ctx
             .g
             .write::<Market>()
@@ -6068,8 +6060,7 @@ mod lifecycle_tests {
     fn e2fix_an_empty_export_depot_stages_a_terminal_only_route() {
         let mut f = Fixture::new();
         let west = road_along(&f, Some(100.0), None);
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(f.destination.building)]);
+        f.ctx.remove_fixture_building(f.destination.building);
         station(&mut f, true);
         let depot = place_warehouse_on(
             &mut f,
@@ -6495,8 +6486,7 @@ mod lifecycle_tests {
             .g
             .write::<Market>()
             .produce(depot.soul, Fixture::coal(), -48);
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(f.source.building)]);
+        f.ctx.remove_fixture_building(f.source.building);
         f.ctx.tick_fast();
         f.update(2 * FREIGHT_MATCH_INTERVAL);
         assert_eq!(activity(&f, id), Some(WarehouseActivity::NoSupplierInReach));
@@ -6532,8 +6522,7 @@ mod lifecycle_tests {
         drop(market);
 
         // Without the truck, the store orders an import and waits for it.
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(f.source.building)]);
+        f.ctx.remove_fixture_building(f.source.building);
         for _ in 0..=FREIGHT_MATCH_INTERVAL {
             f.ctx.tick_fast();
         }
@@ -7802,8 +7791,7 @@ mod lifecycle_tests {
             .write::<CargoBook>()
             .unload_train(terminal.soul, TRAIN_CAPACITY);
         f.ctx.tick_fast();
-        f.ctx
-            .apply(&[WorldCommand::MapRemoveBuilding(terminal.building)]);
+        f.ctx.remove_fixture_building(terminal.building);
         for _ in 0..=2 * FREIGHT_MATCH_INTERVAL {
             f.ctx.tick_fast();
         }

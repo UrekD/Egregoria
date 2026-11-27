@@ -264,7 +264,7 @@ fn p3_spine_onboard_destination_demolition_defers_cancellation() {
     rider.router.trip_start = Some(Tick(1));
     assert!(Router::board(rider, bus, resources));
 
-    ctx.apply(&[WorldCommand::MapRemoveBuilding(building)]);
+    ctx.remove_fixture_building(building);
 
     let rider = &ctx.g.world.humans[id];
     assert_eq!(rider.location, Location::Transit(bus));

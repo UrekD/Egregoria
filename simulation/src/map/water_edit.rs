@@ -150,6 +150,21 @@ impl Map {
                 ))?;
             }
         }
+        if !self.service_frontages.is_empty() {
+            for &(site, shape) in self.service_frontages.values().flatten() {
+                spend_water_work(remaining, 1)?;
+                let footprint = WaterFootprint::new(&shape.corners)
+                    .expect("commissioned service geometry has a footprint");
+                for tile in prepared.affected_tiles() {
+                    spend_water_work(remaining, 1)?;
+                    if footprint.overlaps_tile(tile)
+                        && prepared.water_at_tile(&self.environment, tile).is_some()
+                    {
+                        return Err(WaterEditError::OccupiedFootprint { object: site.into(), tile });
+                    }
+                }
+            }
+        }
         let mut effects = WaterEditEffects::default();
         let mut terrain = BTreeSet::new();
         let mut road_support = BTreeSet::new();

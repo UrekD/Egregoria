@@ -20,7 +20,7 @@ use simulation::{Simulation, SimulationOptions, SlotId, SnapshotRevision, SoulID
 
 use crate::builders::{
     fill_houses, grid_city, paint_zone_blocks, place_company, place_freight_station,
-    place_grid_power_plant, place_service_sites, CommandSink, UTILITY_SITES,
+    place_grid_power_plant, place_service_sites, UTILITY_SITES,
 };
 use crate::{Scenario, ScenarioCtx};
 
@@ -467,11 +467,12 @@ fn coal_supply_shock(ctx: &mut ScenarioCtx, buffered: bool) -> Result<Recovery, 
         .iter()
         .filter_map(|(id, building)| {
             matches!(building.kind, BuildingKind::RailFreightStation(_))
-                .then_some(WorldCommand::MapRemoveBuilding(id))
+                .then_some(id)
         })
         .collect();
-    ctx.submit(&stations);
-    ctx.flush();
+    for station in stations {
+        ctx.remove_fixture_site(station)?;
+    }
 
     let origin = vec2(704.0, 704.0);
     grid_city(ctx, origin, 5, 2, 200.0);
