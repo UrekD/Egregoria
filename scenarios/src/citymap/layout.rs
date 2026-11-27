@@ -1317,10 +1317,10 @@ pub(super) fn fit_wet_frontage(plan: &mut TownPlan) -> Result<(), String> {
         rail: false,
     };
     if let Some(junction) = plan.graph.junctions.get_mut(&hraska_egress) {
-        junction.light = LightPolicy::StopSigns;
+        junction.light = LightPolicy::Lights;
         junction.turn.left_turns = false;
         plan.graph.record(
-            "use an all-way stop to drain the Hraška collector queue",
+            "keep Hraška egress turns clear of the opposing green phase",
             &[hraska_egress],
         );
     }

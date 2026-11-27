@@ -4786,7 +4786,7 @@ mod tests {
             rail: false,
         }];
         let junction = &map.intersections()[hraska_egress];
-        assert_eq!(junction.light_policy, LightPolicy::StopSigns);
+        assert_eq!(junction.light_policy, simulation::map::LightPolicy::Lights);
         assert!(!junction.turn_policy.left_turns);
         let bend = built.links[&SourceKey::Way { id: 461688158, span: 1 }].road;
         let road = &map.roads()[bend];
