@@ -368,6 +368,15 @@ fn rail_fixture(schedule: RailSchedule) -> (ScenarioCtx, LineID) {
     passenger_rail_fixture(schedule, false).unwrap()
 }
 
+fn offer_carless_trip(sim: &mut Simulation, rider: simulation::HumanID, to: BuildingID) {
+    let human = sim.world_mut_unchecked().humans.get_mut(rider).unwrap();
+    let destination = Destination::Building(to);
+    human.pedestrian.walking_speed = 1.25;
+    human.router = Router::new(None);
+    human.router.go_to(destination);
+    human.decision.kind = HumanDecisionKind::GoTo(destination);
+}
+
 fn rail_project(
     sim: &Simulation,
     point: Vec2,
@@ -615,12 +624,7 @@ fn p8_rail_bus_connections_in_both_directions() {
         let mut trips = Vec::new();
         for &(id, home) in &cohort {
             let building = if outward { destination } else { home };
-            let dest = Destination::Building(building);
-            let h = ctx.sim.world_mut_unchecked().humans.get_mut(id).unwrap();
-            h.pedestrian.walking_speed = 1.25;
-            h.router = Router::new(None);
-            h.router.go_to(dest);
-            h.decision.kind = HumanDecisionKind::GoTo(dest);
+            offer_carless_trip(&mut ctx.sim, id, building);
             trips.push((id, building, Vec::new(), 0, false));
         }
         for _ in 0..COHORT_CUTOFF {
@@ -666,14 +670,6 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
     let from = house(&mut ctx.sim, vec2(750.0, 625.0));
     let to = house(&mut ctx.sim, vec2(930.0, 980.0));
     let human = spawn_human(&mut ctx.sim, from).unwrap();
-    let offer = |sim: &mut Simulation, to| {
-        let h = sim.world_mut_unchecked().humans.get_mut(human).unwrap();
-        h.pedestrian.walking_speed = 1.25;
-        h.router = Router::new(None);
-        let destination = Destination::Building(to);
-        h.router.go_to(destination);
-        h.decision.kind = HumanDecisionKind::GoTo(destination);
-    };
     for _ in 0..2_000 {
         ctx.run_ticks(1);
         if !ctx.sim.read::<RailTransit>().runs.is_empty() {
@@ -681,7 +677,7 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
         }
     }
     assert_eq!(ctx.sim.read::<RailTransit>().runs.len(), 1);
-    offer(&mut ctx.sim, to);
+    offer_carless_trip(&mut ctx.sim, human, to);
     for _ in 0..CUTOFF {
         ctx.run_ticks(1);
         if matches!(
@@ -785,7 +781,7 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
     assert_eq!(ctx.sim.get(human).unwrap().location, Location::Building(to));
     assert_eq!(ctx.sim.hashes(), resumed.hashes());
     // The return is a new door-to-door offer with a fresh trip state.
-    offer(&mut ctx.sim, from);
+    offer_carless_trip(&mut ctx.sim, human, from);
     for _ in 0..CUTOFF {
         ctx.run_ticks(1);
         if ctx.sim.get(human).unwrap().location == Location::Building(from) {
@@ -811,12 +807,7 @@ fn p8_rail_removal_drains_a_rider_at_the_next_platform() {
     let to = house(&mut ctx.sim, vec2(930.0, 980.0));
     let rider = spawn_human(&mut ctx.sim, from).unwrap();
     ctx.run_ticks(950);
-    let human = ctx.sim.world_mut_unchecked().humans.get_mut(rider).unwrap();
-    human.pedestrian.walking_speed = 1.25;
-    human.router = Router::new(None);
-    let destination = Destination::Building(to);
-    human.router.go_to(destination);
-    human.decision.kind = HumanDecisionKind::GoTo(destination);
+    offer_carless_trip(&mut ctx.sim, rider, to);
     for _ in 0..CUTOFF {
         ctx.run_ticks(1);
         if let Location::RailTransit(train) = ctx.sim.get(rider).unwrap().location {
@@ -848,4 +839,229 @@ fn p8_rail_removal_drains_a_rider_at_the_next_platform() {
         .runs
         .values()
         .all(|run| run.line != line));
+}
+
+fn shared_freight_rail_arrival(with_exports: bool) -> u64 {
+    use geom::OBB;
+    use prototypes::{BuildingGen, FreightStationPrototypeID, RollingStockID};
+    use simulation::map::{BuildingKind, LanePatternBuilder, Map, ProjectFilter};
+    use simulation::map_dynamic::BuildingInfos;
+    use simulation::souls::freight_station::{freight_station_soul, FreightTrainState};
+
+    let (mut ctx, _) = rail_fixture(RailSchedule::default());
+    // Park the freight consist on a passing track when it finishes its call.
+    let rail_pattern = LanePatternBuilder::new().rail(true).one_way(true).build();
+    let junction = vec2(1230.0, 800.0);
+    for (start, start_filter, end, end_filter) in [
+        (
+            vec2(1150.0, 700.0),
+            ProjectFilter::ROAD,
+            junction,
+            ProjectFilter::INTER,
+        ),
+        (
+            junction,
+            ProjectFilter::INTER,
+            vec2(1150.0, 900.0),
+            ProjectFilter::ROAD,
+        ),
+    ] {
+        let from = rail_project(&ctx.sim, start, 5.0, start_filter);
+        let to = rail_project(&ctx.sim, end, 5.0, end_filter);
+        apply(
+            &mut ctx.sim,
+            &[WorldCommand::MapMakeConnection {
+                from,
+                to,
+                inter: None,
+                pat: rail_pattern.clone(),
+            }],
+        );
+    }
+    let (gate_lane, gate_offset, gate_pos, gate_dir) = {
+        let map = ctx.sim.map();
+        let lane = map
+            .nearest_lane(vec2(1190.0, 750.0).z0(), LaneKind::Rail, Some(25.0))
+            .unwrap();
+        let points = &map.get(lane).unwrap().points;
+        let offset = points.length() * 0.6;
+        let (pos, dir) = points.point_dir_along(offset);
+        (lane, offset, pos.xy(), dir.xy().normalize())
+    };
+    let terminal_pos = vec2(510.0, 875.0);
+    let prototype = FreightStationPrototypeID::new("freight-station");
+    let [_, site] = [
+        (gate_pos, gate_dir, BuildingKind::ExternalTrading, 60.0),
+        (
+            terminal_pos,
+            -Vec2::Y,
+            BuildingKind::RailFreightStation(prototype),
+            20.0,
+        ),
+    ]
+    .map(|(point, dir, kind, width)| {
+        let building = ctx
+            .sim
+            .write::<Map>()
+            .build_special_building(
+                &OBB::new(point, dir, width, 16.0),
+                kind,
+                BuildingGen::NoWalkway { door_pos: point },
+                None,
+                None,
+            )
+            .unwrap();
+        ctx.sim.write::<BuildingInfos>().insert(building);
+        building
+    });
+    let station = freight_station_soul(&mut ctx.sim, site, prototype).unwrap();
+    apply(
+        &mut ctx.sim,
+        &[WorldCommand::SpawnTrain {
+            wagons: ["locomotive", "freight-wagon"]
+                .map(RollingStockID::new)
+                .to_vec(),
+            lane: gate_lane,
+            dist: gate_offset,
+        }],
+    );
+    let from = house(&mut ctx.sim, vec2(750.0, 625.0));
+    let to = house(&mut ctx.sim, vec2(930.0, 980.0));
+    let rider = spawn_human(&mut ctx.sim, from).unwrap();
+    ctx.run_ticks(950);
+    offer_carless_trip(&mut ctx.sim, rider, to);
+    let mut shared_route = false;
+    let mut arrival = None;
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        let tick = simulation::map_dynamic::transit::simulation_elapsed_ticks(&ctx.sim).0;
+        if with_exports && tick == 5_600 {
+            // Stage the accepted backlog at the terminal, as in D1's freight fixtures.
+            ctx.sim.world_mut_unchecked().freight_stations[station]
+                .f
+                .waiting_cargo = 20;
+        }
+        let terminal = &ctx.sim.world().freight_stations[station].f;
+        let human = ctx.sim.get(rider).unwrap();
+        if human.location == Location::Building(to) {
+            arrival.get_or_insert(tick);
+        }
+        if terminal.waiting_cargo == 0 {
+            if let (Location::RailTransit(passenger), Some(&(freight, FreightTrainState::Moving))) =
+                (&human.location, terminal.trains.first())
+            {
+                let passenger = ctx.sim.get(*passenger).unwrap().it.get_route();
+                let freight = ctx.sim.get(freight).unwrap().it.get_route();
+                shared_route |= passenger.zip(freight).is_some_and(|(passenger, freight)| {
+                    std::iter::once(&passenger.cur)
+                        .chain(&passenger.reversed_route)
+                        .any(|path| freight.cur == *path || freight.reversed_route.contains(path))
+                });
+            }
+        }
+        if let Some(arrival) = arrival {
+            if !with_exports
+                || (shared_route && terminal.trains.is_empty() && terminal.waiting_cargo == 0)
+            {
+                return arrival;
+            }
+        }
+    }
+    panic!("passenger arrival {arrival:?}, shared loaded rail route {shared_route}");
+}
+
+#[test]
+fn p8_passenger_rides_with_loaded_freight_on_the_same_corridor() {
+    let control = shared_freight_rail_arrival(false);
+    let with_freight = shared_freight_rail_arrival(true);
+    println!("shared corridor passenger arrival ticks: control={control} freight={with_freight}");
+    assert!(
+        with_freight.saturating_sub(control) <= scenarios::traffic_repair::OD_DELAY_LIMIT_TICKS
+    );
+}
+
+#[test]
+fn p8_rail_track_repair_preserves_the_exit() {
+    use simulation::map::{LanePatternBuilder, MapProject, ProjectFilter, ProjectKind};
+
+    let (mut ctx, line) = rail_fixture(RailSchedule::default());
+    let pattern = LanePatternBuilder::new().rail(true).one_way(true).build();
+    for (y, spur_y) in [(860.0, 820.0), (745.0, 705.0)] {
+        let from = rail_project(&ctx.sim, vec2(550.0, y), 5.0, ProjectFilter::ROAD);
+        let to = rail_project(&ctx.sim, vec2(490.0, spur_y), 1.0, ProjectFilter::INTER);
+        apply(
+            &mut ctx.sim,
+            &[WorldCommand::MapMakeConnection {
+                from,
+                to,
+                inter: None,
+                pat: pattern.clone(),
+            }],
+        );
+    }
+    let (return_track, restore) = {
+        let map = ctx.sim.map();
+        let lane = map
+            .nearest_lane(vec2(550.0, 800.0).z0(), LaneKind::Rail, Some(5.0))
+            .unwrap();
+        let road_id = map.get(lane).unwrap().parent;
+        let road = map.get(road_id).unwrap();
+        let project = |id: simulation::map::IntersectionID| MapProject {
+            pos: map.get(id).unwrap().pos,
+            kind: ProjectKind::Intersection(id),
+        };
+        (
+            road_id,
+            WorldCommand::MapMakeConnection {
+                from: project(road.src),
+                to: project(road.dst),
+                inter: None,
+                pat: pattern,
+            },
+        )
+    };
+    let from = house(&mut ctx.sim, vec2(750.0, 625.0));
+    let to = house(&mut ctx.sim, vec2(930.0, 980.0));
+    let rider = spawn_human(&mut ctx.sim, from).unwrap();
+    ctx.run_ticks(950);
+    offer_carless_trip(&mut ctx.sim, rider, to);
+    let mut moving = false;
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        if let Location::RailTransit(id) = ctx.sim.get(rider).unwrap().location {
+            let rail = ctx.sim.read::<RailTransit>();
+            let run = &rail.runs[&id];
+            if run.next_platform_index() == 1 && run.dwell_until().is_none() {
+                moving = true;
+                break;
+            }
+        }
+    }
+    assert!(moving, "passenger never left the origin platform");
+    apply(&mut ctx.sim, &[WorldCommand::MapRemoveRoad(return_track)]);
+    assert!(ctx.sim.read::<Transit>().lines[line].suspended);
+
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        if ctx.sim.get(rider).unwrap().location == Location::Building(to) {
+            break;
+        }
+    }
+    assert_eq!(ctx.sim.get(rider).unwrap().location, Location::Building(to));
+
+    apply(&mut ctx.sim, &[restore]);
+    ctx.run_ticks(1);
+    assert!(!ctx.sim.read::<Transit>().lines[line].suspended);
+    offer_carless_trip(&mut ctx.sim, rider, from);
+    for _ in 0..CUTOFF {
+        ctx.run_ticks(1);
+        if ctx.sim.get(rider).unwrap().location == Location::Building(from) {
+            break;
+        }
+    }
+    assert_eq!(
+        ctx.sim.get(rider).unwrap().location,
+        Location::Building(from)
+    );
+    assert_eq!(ctx.sim.read::<JourneyStats>().line(line).boardings, 2);
 }
