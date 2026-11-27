@@ -257,9 +257,15 @@ fn run_edits(ctx: &mut ScenarioCtx) -> Result<(), String> {
 }
 
 fn run_surface_trip(ctx: &mut ScenarioCtx, edits: bool) -> Result<(), String> {
-    let sites = setup(&mut ctx.sim, true)?;
+    let sites = setup_at(&mut ctx.sim, true, Vec2::ZERO, edits, false)?;
     ctx.sim
         .apply_commands([&WorldCommand::MapRemoveBuilding(sites[4])]);
+    if !edits {
+        ctx.sim.apply_commands([&WorldCommand::SetBuildingParkingOpen {
+            building: sites[5],
+            open: false,
+        }]);
+    }
     let (lot, placement) = place_surface_lot(&mut ctx.sim, Vec2::ZERO)?;
     let (driver, home, car) = ctx
         .sim
@@ -282,7 +288,27 @@ fn run_surface_trip(ctx: &mut ScenarioCtx, edits: bool) -> Result<(), String> {
             person.decision.wait = u8::MAX;
         });
     };
-    issue(ctx, Destination::Building(lot));
+    let gate = ctx
+        .sim
+        .map()
+        .get(lot)
+        .ok_or("public lot has no gate")?
+        .door_pos;
+    let destination = if edits {
+        Destination::Building(lot)
+    } else {
+        Destination::Outside(gate)
+    };
+    let arrived = |sim: &Simulation| {
+        let person = &sim.world().humans[driver];
+        match destination {
+            Destination::Building(building) => person.location == Location::Building(building),
+            Destination::Outside(point) => {
+                person.location == Location::Outside && person.trans.pos.distance2(point) < 4.0
+            }
+        }
+    };
+    issue(ctx, destination);
     let mut cut = false;
     for _ in 0..10_000 {
         ctx.sim
@@ -314,14 +340,11 @@ fn run_surface_trip(ctx: &mut ScenarioCtx, edits: bool) -> Result<(), String> {
             }
             ctx.sample("public_held");
         }
-        if ctx.sim.world().humans[driver].location == Location::Building(lot) {
+        if arrived(&ctx.sim) {
             break;
         }
     }
-    if !cut
-        || ctx.sim.car_property_parking(car).1 != Some(lot)
-        || ctx.sim.world().humans[driver].location != Location::Building(lot)
-    {
+    if !cut || ctx.sim.car_property_parking(car).1 != Some(lot) || !arrived(&ctx.sim) {
         return Err("tagged driver did not park in the public lot and reach the gate".into());
     }
     ctx.sample("public_occupied");
@@ -338,6 +361,20 @@ fn run_surface_trip(ctx: &mut ScenarioCtx, edits: bool) -> Result<(), String> {
         ]);
         if ctx.sim.read::<CommandOutcomes>().accepted != [0, 1] {
             return Err("public lot did not close and reopen".into());
+        }
+    } else {
+        ctx.sim.apply_commands([
+            &WorldCommand::SetBuildingParkingOpen {
+                building: sites[5],
+                open: true,
+            },
+            &WorldCommand::SetBuildingParkingOpen {
+                building: lot,
+                open: false,
+            },
+        ]);
+        if ctx.sim.read::<CommandOutcomes>().accepted != [0, 1] {
+            return Err("public parking could not transition to the drain configuration".into());
         }
     }
     issue(ctx, Destination::Building(home));
@@ -357,23 +394,40 @@ fn run_surface_trip(ctx: &mut ScenarioCtx, edits: bool) -> Result<(), String> {
     {
         return Err("tagged public-lot driver never cleared the apron and returned home".into());
     }
+    if !edits {
+        for _ in 0..80 {
+            if ctx
+                .sim
+                .building_parking(lot)
+                .is_some_and(|parking| parking.held + parking.occupied == 0)
+            {
+                break;
+            }
+            ctx.run_ticks(200);
+        }
+    }
     ctx.sim
         .apply_commands([&WorldCommand::MapRemoveBuilding(lot)]);
     if ctx.sim.map().get(lot).is_some() {
-        return Err("cleared public lot could not be removed".into());
+        return Err(format!(
+            "public lot could not be removed after drain: {:?}",
+            ctx.sim.building_parking(lot)
+        ));
     }
     ctx.sample("public_rear_clear");
     Ok(())
 }
 
 fn setup(sim: &mut Simulation, round_trip: bool) -> Result<Vec<BuildingID>, String> {
-    setup_at(sim, round_trip, Vec2::ZERO)
+    setup_at(sim, round_trip, Vec2::ZERO, true, false)
 }
 
 fn setup_at(
     sim: &mut Simulation,
     round_trip: bool,
     offset: Vec2,
+    curb_parking: bool,
+    west_crossing: bool,
 ) -> Result<Vec<BuildingID>, String> {
     let point = |x, y| (offset + vec2(x, y)).z(0.0);
     let [west, east, far_east, far_west, spur] = {
@@ -397,17 +451,19 @@ fn setup_at(
         from: MapProject::ground(west),
         to: MapProject::ground(east),
         inter: None,
-        pat: LanePatternBuilder::default().build(),
+        pat: LanePatternBuilder::default().parking(curb_parking).build(),
     }]);
     if round_trip {
         // A loop of two-arm corners has neither a crosswalk between its
         // sidewalks nor a connection between its opposing driving directions.
-        for pair in [
+        let links = [
             [east, far_east],
             [far_east, far_west],
             [far_west, west],
             [far_east, spur],
-        ] {
+        ];
+        let crossing = west_crossing.then_some([west, point(75.0, 42.0)]);
+        for pair in links.into_iter().chain(crossing) {
             let [from, to] = {
                 let map = sim.map();
                 std::array::from_fn(|index| map.project(pair[index], 0.0, ProjectFilter::ALL))
@@ -416,7 +472,7 @@ fn setup_at(
                 from,
                 to,
                 inter: None,
-                pat: LanePatternBuilder::default().build(),
+                pat: LanePatternBuilder::default().parking(curb_parking).build(),
             }]);
             let outcomes = sim.read::<CommandOutcomes>();
             if outcomes.accepted.len() != 1 {
@@ -719,7 +775,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     let mut districts = Vec::new();
     for index in 0..DISTRICTS {
         let offset = vec2((index % 16) as f32 * 550.0, (index / 16) as f32 * 400.0);
-        let mut sites = setup_at(&mut ctx.sim, true, offset)
+        let mut sites = setup_at(&mut ctx.sim, true, offset, true, true)
             .map_err(|error| format!("parking district {index}: {error}"))?;
         if index % 4 == 0 {
             ctx.sim
@@ -770,7 +826,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
         "PathPark scale opening: {POPULATION} residents, {} tagged drivers in {DISTRICTS} districts",
         offers.len()
     );
-    let garages: Vec<_> = districts
+    let public_facilities: Vec<_> = districts
         .iter()
         .flat_map(|sites| [sites[4], sites[5]])
         .collect();
@@ -785,6 +841,9 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
             });
     }
     let sample_supply = |sim: &Simulation, supply: &mut [TaggedSupply]| {
+        if sim.get_tick() % 4 != 0 {
+            return;
+        }
         for (trip, supply) in offers.iter().zip(supply) {
             supply.sample(sim, trip.car);
         }
@@ -800,13 +859,15 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
         });
     };
     advance(ctx, 8, &mut workload, &mut supply);
-    let holds = garages
+    let holds = public_facilities
         .iter()
         .filter_map(|&garage| ctx.sim.building_parking(garage))
         .map(|parking| usize::from(parking.held))
         .sum::<usize>();
     if holds < 2 {
-        return Err("mixed-supply save cut did not contain simultaneous garage holds".into());
+        return Err(
+            "mixed-supply save cut did not contain simultaneous public parking holds".into(),
+        );
     }
     let mut extra = workload.finish(&ctx.sim);
     let mut resumed = ScenarioCtx::from_sim(ctx.round_tripped()?);
@@ -863,15 +924,19 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
         *extra.entry(key).or_default() += value;
     }
     extra.extend(BTreeMap::from([
-        ("tagged_offers".to_owned(), offers.len() as f64),
+        ("tagged_outbound_offers".to_owned(), offers.len() as f64),
         ("tagged_garage_arrivals".to_owned(), f64::from(garage)),
         ("tagged_curb_arrivals".to_owned(), f64::from(curb)),
         (
             "tagged_public_lot_arrivals".to_owned(),
             f64::from(public_lot),
         ),
-        ("simultaneous_garage_holds".to_owned(), holds as f64),
+        ("simultaneous_public_holds".to_owned(), holds as f64),
     ]));
+    println!(
+        "PathPark scale outbound: {curb} curb, {garage} garage and {public_lot} public-lot arrivals among {} offers",
+        offers.len()
+    );
     ctx.sample_perf_with_extra("measured", POPULATION, extra, true);
     if curb == 0
         || garage == 0
@@ -886,7 +951,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     // Drain existing routes while holding the authored housing and cohort in
     // place. The test districts have no permanent utilities.
     ctx.retain_systems(|name| !matches!(name, "residence_update" | "update_decision_system"));
-    let close: Vec<_> = garages
+    let close: Vec<_> = public_facilities
         .iter()
         .map(|&building| WorldCommand::SetBuildingParkingOpen {
             building,
@@ -909,15 +974,13 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
                     .is_some_and(|car| car.vehicle.state.is_parked())
         })
     };
-    let garages_empty = |sim: &Simulation| {
-        garages.iter().all(|&garage| {
+    let public_facilities_empty = |sim: &Simulation| {
+        public_facilities.iter().all(|&garage| {
             sim.building_parking(garage)
                 .is_some_and(|parking| parking.occupied + parking.held == 0)
         })
     };
-    // A curb return on the opposite sidewalk can require walking around
-    // most of a 1,110 m block. At the slowest 0.8 m/s walking speed that
-    // is nearly 70,000 ticks, before parking and door approach.
+    // Both ends of each district provide a legal crossing for the return walk.
     const DRAIN_LIMIT: usize = 80_000;
     const DRAIN_BATCH: usize = 200;
     let mut drain_ticks = 0;
@@ -925,7 +988,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     loop {
         ctx.run_ticks_observed(DRAIN_BATCH as u64, |sim| sample_supply(sim, &mut supply));
         drain_ticks += DRAIN_BATCH;
-        if garages_empty(&ctx.sim) {
+        if public_facilities_empty(&ctx.sim) {
             if offers.iter().all(|trip| returned(&ctx.sim, trip)) {
                 break;
             }
@@ -957,15 +1020,22 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
                 .map(|trip| {
                     let world = ctx.sim.world();
                     let driver = world.humans.get(trip.driver).map(|human| {
-                        (&human.location, human.router.target_dest, human.router.personal_car)
+                        (
+                            &human.location,
+                            human.trans.pos,
+                            human.router.target_dest,
+                            human.router.personal_car,
+                            human.router.last_error,
+                            format!("{:?}", human.router.cur_step()),
+                        )
                     });
                     let car = world.vehicles.get(trip.car).map(|car| &car.vehicle.state);
                     (trip.driver, trip.car, driver, car)
                 })
                 .collect();
             return Err(format!(
-                "drain timed out at {drain_ticks} ticks, missing {missing:?}, garages empty = {}",
-                garages_empty(&ctx.sim)
+                "drain timed out at {drain_ticks} ticks, missing {missing:?}, public parking empty = {}",
+                public_facilities_empty(&ctx.sim)
             ));
         }
     }
@@ -976,6 +1046,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
         ));
     }
     let mut drain = BTreeMap::from([
+        ("tagged_offers".to_owned(), (offers.len() * 2) as f64),
         ("tagged_returns".to_owned(), offers.len() as f64),
         ("drain_ticks".to_owned(), drain_ticks as f64),
         ("home_followups".to_owned(), home_followups as f64),
@@ -1000,6 +1071,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
             ));
         }
     }
+    println!("PathPark scale drain: {drain_ticks} ticks, {home_followups} follow-up requests, supply {drain:?}");
     ctx.sample_perf_with_extra("drained", POPULATION, drain, true);
     if !misses.is_empty() {
         return Err(format!("mixed-supply floors missed: {}", misses.join(", ")));
