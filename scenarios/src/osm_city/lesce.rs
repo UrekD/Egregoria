@@ -1,5 +1,5 @@
 use super::{ImportReport, LinkClass, NormalizedCity, LESCE_BOUNDS};
-use crate::builders::{place_company, CommandSink};
+use crate::builders::{place_company, place_company_on_network, CommandSink};
 use crate::ScenarioCtx;
 use geom::{vec2, Vec2, OBB};
 use prototypes::{BuildingGen, FreightStationPrototypeID, RollingStockID, Tick};
@@ -408,7 +408,11 @@ pub(super) fn place_facilities(
         .filter(|site| site.kind != "passenger station")
     {
         let before: BTreeSet<_> = ctx.sim.map().buildings().keys().collect();
-        let placed = place_company(ctx, site.kind, site.position);
+        let placed = if site.kind == "fire-station" {
+            place_company_on_network(ctx, site.kind, site.position, plant)
+        } else {
+            place_company(ctx, site.kind, site.position)
+        };
         let connected = placed.is_some_and(|id| {
             let map = ctx.sim.map();
             let building = &map.buildings()[id];
@@ -436,11 +440,7 @@ pub(super) fn place_facilities(
         .feature_counts
         .insert("placed_mapped_services".into(), service_count);
     // The mapped stations are about 2 km apart before accounting for road travel.
-    let fire = place_company(ctx, "fire-station", SUPPLEMENTAL_FIRE_SITE)
-        .filter(|&id| {
-            let map = ctx.sim.map();
-            map.electricity.net_id(id) == map.electricity.net_id(plant)
-        })
+    let fire = place_company_on_network(ctx, "fire-station", SUPPLEMENTAL_FIRE_SITE, plant)
         .ok_or("could not place the supplemental fire station on the utility network")?;
     let center = ctx.sim.map().buildings()[fire].obb.center();
     report.synthetic.push(format!(
