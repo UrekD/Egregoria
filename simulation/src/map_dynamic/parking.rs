@@ -22,6 +22,7 @@ pub struct ParkingManagement {
     service_spots: BTreeMap<ParkingSpotID, ServiceCurbOwner>,
     #[serde(skip)]
     tagged: bool,
+    #[serde(skip)]
     masked_spots: BTreeMap<ParkingSpotID, u32>,
     #[serde(skip)]
     pub(crate) reroute_failures: RerouteFailures,
@@ -391,7 +392,9 @@ impl ParkingManagement {
                             map.parking
                                 .get(spot)
                                 .is_some_and(|data| data.trans.pos.xy().distance2(near.xy()) <= max)
-                        }) && self.is_spot_free(spot) && self.reserved_spots.insert(spot)
+                        }) && !self.masked_spots.contains_key(&spot)
+                            && !self.service_spots.contains_key(&spot)
+                            && self.reserved_spots.insert(spot)
                         {
                             if let Some(stats) = observation {
                                 if lane.parent != start_road {

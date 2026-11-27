@@ -2105,7 +2105,6 @@ mod tiles_fix_regressions {
         let bytes = Bincode::encode(&sim).unwrap();
         let mut legacy: SimulationDeser = Bincode::decode(&bytes).unwrap();
         legacy._header.version = crate::VERSION.into();
-        legacy.res.remove("driveway_traffic").unwrap();
         legacy.res.remove("land_ownership").unwrap();
         let opts = *sim.read::<crate::SimulationOptions>();
         legacy.res.insert(

@@ -131,13 +131,23 @@ pub(crate) fn remove_site(sim: &mut Simulation, id: BuildingID) -> bool {
     remove_site_inner(sim, id)
 }
 
+/// Stop accepting parking arrivals and report whether clearance must wait.
+pub(crate) fn drain_site_parking(sim: &Simulation, id: BuildingID) -> bool {
+    let mut traffic = sim.write::<crate::transportation::DrivewayTraffic>();
+    if !traffic.properties.busy(id) {
+        return false;
+    }
+    traffic.properties.set_open(id, false);
+    traffic.properties.busy(id)
+}
+
 /// Close ordinary uses while retaining the site's physical map record.
 pub(crate) fn close_site(
     sim: &mut Simulation,
     id: BuildingID,
     cause: super::demolition::SiteRemnantCause,
 ) -> bool {
-    if sim.read::<crate::transportation::DrivewayTraffic>().properties.busy(id) {
+    if drain_site_parking(sim, id) {
         return false;
     }
     let was_external_target = sim.map().external_train_stations.first() == Some(&id);

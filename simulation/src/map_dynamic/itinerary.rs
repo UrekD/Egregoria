@@ -850,9 +850,15 @@ impl Itinerary {
                     return position;
                 }
             }
-            return self.advance_egress::<DRIVEWAYS>(map, position, dist_to_move, driveway.as_mut(), |from, to| {
-                !guard_local || move_on.as_mut().is_none_or(|guard| guard(None, from, to))
-            });
+            return self.advance_egress::<DRIVEWAYS>(
+                map,
+                position,
+                dist_to_move,
+                |from, to| {
+                    !guard_local || move_on.as_mut().is_none_or(|guard| guard(None, from, to))
+                },
+                driveway.as_mut(),
+            );
         }
         let mut segment_clear = |it: &Self, from, to| {
             move_on.as_mut().is_none_or(|guard| {

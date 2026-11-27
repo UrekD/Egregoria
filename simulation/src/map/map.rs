@@ -4078,7 +4078,7 @@ impl Map {
         // A retained site remains a road-frontage object, but closing it
         // removes its electrical node. Compare the live network projection.
         let mut expected = ElectricityCache::build(self);
-        for (site, building) in &self.buildings {
+        for (site, building) in self.buildings.iter() {
             if building.kind == BuildingKind::SiteRemnant {
                 expected.remove_object(site);
             }

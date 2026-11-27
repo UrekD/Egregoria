@@ -237,7 +237,6 @@ impl MapRenderer {
         ctx: &mut FrameContext<'_>,
     ) {
         profiling::scope!("render map renderer");
-        let map = &sim.map();
         let map_start = ctx.gfx.profile_timer();
         self.terrain.draw(cam, ctx);
         ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);

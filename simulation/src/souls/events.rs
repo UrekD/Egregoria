@@ -328,6 +328,12 @@ pub fn events_update(sim: &mut Simulation) {
                 start.0.saturating_sub(incident.last_update.0) / TICKS_PER_MINUTE
             }).min(minutes);
             incident.damage = (u64::from(incident.damage) + exposed_minutes).min(LOSS_MINUTES) as u8;
+            if incident.damage == LOSS_MINUTES as u8
+                && super::lifecycle::drain_site_parking(sim, id)
+            {
+                // Keep the incident scheduled while a committed driveway motion drains.
+                incident.damage -= 1;
+            }
             if incident.damage == LOSS_MINUTES as u8 {
                 incidents.active.remove(&id);
                 history.record(tick, id, FireEventKind::Collapsed);
