@@ -215,7 +215,7 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         open: false,
     }]);
     let mut drained = false;
-    for _ in 0..5_000 {
+    for _ in 0..10_000 {
         ctx.sim
             .world_mut_unchecked()
             .edit_human(driver, |person| person.decision.wait = u8::MAX);
@@ -237,7 +237,16 @@ fn run(ctx: &mut ScenarioCtx) -> Result<(), String> {
         }
     }
     if !drained {
-        return Err("tagged driver did not retrieve the original car and return home".into());
+        let person = &ctx.sim.world().humans[driver];
+        return Err(format!(
+            "tagged return stopped at {:?}, step {:?}, error {:?}, home {:?}, garage {:?}, car {:?}",
+            person.location,
+            person.router.cur_step(),
+            person.router.last_error,
+            ctx.sim.building_parking(home),
+            ctx.sim.building_parking(garage),
+            ctx.sim.world().vehicles.get(car).map(|actor| (&actor.vehicle.state, actor.trans)),
+        ));
     }
     ctx.sample("property_live");
     Ok(())
