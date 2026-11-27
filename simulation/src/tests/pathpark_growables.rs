@@ -307,6 +307,42 @@ fn pathpark_despawn_preserves_the_original_stored_car() {
 }
 
 #[test]
+fn pathpark_owner_despawn_does_not_interrupt_committed_ingress() {
+    use crate::map_dynamic::Destination;
+    use crate::transportation::DrivewayPhase;
+    use crate::utils::par_command_buffer::ParCommandBuffer;
+    use crate::world::HumanEnt;
+    use common::saveload::{Bincode, Encoder};
+
+    let (mut ctx, _, human, car, garage) = property_trip();
+    ctx.g.world.edit_human(human, |h| {
+        h.router.go_to(Destination::Building(garage));
+    });
+    assert!((0..4_000).any(|_| {
+        ctx.g.world.edit_human(human, |h| h.decision.wait = u8::MAX);
+        ctx.tick_fast();
+        ctx.g.world.vehicles[car].it.driveway_phase() == Some(DrivewayPhase::Entering)
+    }));
+
+    ctx.g.read::<ParCommandBuffer<HumanEnt>>().kill(human);
+    ctx.g.apply_commands([]);
+    assert!(!ctx.g.world.humans.contains_key(human));
+    assert_eq!(ctx.g.building_parking(garage).unwrap().held, 1);
+    assert!(ctx.g.world.vehicles[car].collider.is_some());
+    ctx.g = Bincode::decode(&Bincode::encode(&ctx.g).unwrap()).unwrap();
+
+    assert!((0..240).any(|_| {
+        ctx.tick_fast();
+        ctx.g.car_stored_inside_garage(car)
+    }));
+    let parking = ctx.g.building_parking(garage).unwrap();
+    assert_eq!(
+        (parking.held, parking.occupied, parking.missing_owners),
+        (0, 1, 1)
+    );
+}
+
+#[test]
 fn pathpark_property_departure_uses_shared_garage_when_curbs_are_full() {
     use crate::map_dynamic::{Destination, ParkingManagement};
 
