@@ -25,7 +25,7 @@ mod service;
 pub(crate) use journey::validate_journey_snapshot;
 pub use journey::{JourneyStats, LineJourneyStats};
 pub(crate) use rail::{
-    forget_rail_rider, rail_train_dropped, validate_rail_snapshot, MAX_PASSENGER_STOCK,
+    forget_rail_rider, rail_train_dropped, validate_rail_snapshot, RailRefresh, MAX_PASSENGER_STOCK,
 };
 pub use rail::{
     rail_service_update, PassengerRailLine, PassengerRailRun, RailPlatformSpec, RailSchedule,

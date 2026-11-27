@@ -1,25 +1,25 @@
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::Bound::{Excluded, Unbounded};
 
-use flat_spatial::Grid;
 use geom::{Vec2, Vec3};
 use ordered_float::OrderedFloat;
 use prototypes::{Money, Tick, TICKS_PER_HOUR, TICKS_PER_REALTIME_SECOND};
 use serde::{Deserialize, Serialize};
 
 use super::{LineID, RoutingStep, StopID, Transit};
-use crate::map::{Map, PathKind, Pathfinder, TraverseDirection};
+use crate::map::{Map, PathKind, Pathfinder, RouteSearch, TraverseDirection};
 use crate::map_dynamic::transit::{
     RailSchedule, RailTransit, TransitLine, TransitStop, GIVE_UP_TICKS, WAIT_NOT_STARTED,
 };
-use crate::map_dynamic::{BusRun, Itinerary};
+use crate::map_dynamic::{BusRun, Itinerary, ItineraryTarget};
 use crate::transportation::Location;
 
 const NEAREST_STOPS: usize = 3;
 const TRANSFER_STOPS: usize = 8;
 const TRANSFER_RADIUS: f32 = 250.0;
 const MAX_TRANSFER_LABELS: usize = 256;
-const ROUTE_WALKS_PER_SLICE: usize = 32;
+const ROUTE_EXPANSIONS_PER_SLICE: usize = 512;
 const ROUTE_CANDIDATES_PER_SLICE: usize = 64;
 const MAX_CACHED_TRANSFERS: usize = 1_024;
 const STOP_ACCESS_RADIUS: f32 = 600.0;
@@ -49,6 +49,8 @@ pub(in crate::map_dynamic) struct PendingSearch {
     transfer_graph: u64,
     transfer: TransferProgress,
     best_transfer: Option<StoredTransfer>,
+    #[serde(skip)]
+    work: SearchWork,
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -86,6 +88,7 @@ impl PendingSearch {
             transfer_graph: 0,
             transfer: TransferProgress::default(),
             best_transfer: None,
+            work: SearchWork::default(),
         }
     }
 
@@ -117,44 +120,138 @@ impl PendingSearch {
                         .into_iter().all(|ordinal| ordinal < 30)
             })
     }
+
+    pub fn prove_walks(&self, transit: &Transit, map: &Map) -> bool {
+        let valid_stop_walks = self.endpoints.iter().enumerate().all(|(end, progress)| {
+            progress.walks.iter().all(|(id, _, walk)| {
+                transit.stops.get(*id).is_some_and(|stop| {
+                    let (from, to) = if end == 0 {
+                        (self.origin, stop.walk_pos)
+                    } else {
+                        (stop.walk_pos, self.destination)
+                    };
+                    walk.proves(from, to, map)
+                })
+            })
+        });
+        valid_stop_walks
+            && self.best_transfer.as_ref().is_none_or(|best| {
+                let stops = transit
+                    .stops
+                    .get(best.first.alight)
+                    .zip(transit.stops.get(best.second.board));
+                stops.is_some_and(|(from, to)| best.walk.proves(from.walk_pos, to.walk_pos, map))
+            })
+    }
+}
+
+#[derive(Default)]
+struct SearchWork {
+    endpoints: [Neighborhood; 2],
+    interchange: Option<(TransferPosition, Neighborhood)>,
+    route: Option<((Vec3, Vec3, PathKind), Option<RouteSearch>)>,
+    transfer_complete: bool,
+    comparisons: Option<(Option<Vec3>, [Option<f64>; 3])>,
+}
+
+#[derive(Default)]
+struct Neighborhood {
+    cell: usize,
+    after: Option<StopID>,
+    ranked: BTreeSet<(OrderedFloat<f32>, StopID)>,
+    ordered: Vec<StopID>,
 }
 
 pub(super) struct SearchSlice<'a> {
     pending: &'a mut PendingSearch,
-    shared_walks: &'a mut usize,
-    walks: usize,
+    shared_work: &'a mut usize,
+    route_work: usize,
     candidates: usize,
     pub deferred: bool,
 }
 
 impl<'a> SearchSlice<'a> {
-    pub fn new(pending: &'a mut PendingSearch, shared_walks: &'a mut usize) -> Self {
+    pub fn new(pending: &'a mut PendingSearch, shared_work: &'a mut usize) -> Self {
         Self {
             pending,
-            shared_walks,
-            walks: ROUTE_WALKS_PER_SLICE,
+            shared_work,
+            route_work: ROUTE_EXPANSIONS_PER_SLICE,
             candidates: ROUTE_CANDIDATES_PER_SLICE,
             deferred: false,
         }
     }
 
     fn visit_candidate(&mut self) -> bool {
-        if self.candidates == 0 {
+        if self.candidates == 0 || *self.shared_work == 0 {
             self.deferred = true;
             return false;
         }
         self.candidates -= 1;
+        *self.shared_work -= 1;
         true
     }
 
-    fn allow_walk(&mut self) -> bool {
-        if self.walks == 0 || *self.shared_walks == 0 {
-            self.deferred = true;
-            return false;
+    fn route(&mut self, from: Vec3, to: Vec3, map: &Map, kind: PathKind) -> Option<Itinerary> {
+        let key = (from, to, kind);
+        let (old_key, search) = self.pending.work.route.get_or_insert((key, None));
+        if *old_key != key {
+            *old_key = key;
+            *search = None;
         }
-        self.walks -= 1;
-        *self.shared_walks -= 1;
-        true
+        let allowance = self.route_work.min(*self.shared_work);
+        let mut remaining = allowance;
+        let result = Itinerary::route_with_work(
+            self.pending.born,
+            from,
+            None,
+            ItineraryTarget::Position(to),
+            map,
+            kind,
+            search,
+            &mut remaining,
+        );
+        let spent = allowance - remaining;
+        self.route_work -= spent;
+        *self.shared_work -= spent;
+        match result {
+            std::task::Poll::Pending => {
+                self.deferred = true;
+                None
+            }
+            std::task::Poll::Ready(route) => route,
+        }
+    }
+
+    fn compare_distance(
+        &mut self,
+        index: usize,
+        car: Option<Vec3>,
+        from: Vec3,
+        to: Vec3,
+        map: &Map,
+        kind: PathKind,
+    ) -> Option<f64> {
+        let (old_car, distances) = self
+            .pending
+            .work
+            .comparisons
+            .get_or_insert((car, [None; 3]));
+        if *old_car != car {
+            *old_car = car;
+            distances[1..].fill(None);
+        }
+        if let Some(distance) = distances[index] {
+            return Some(distance);
+        }
+        let distance = self
+            .route(from, to, map, kind)
+            .and_then(|it| itinerary_distance(&it, from, to, map, kind))
+            .map_or(f64::INFINITY, f64::from);
+        if self.deferred {
+            return None;
+        }
+        self.pending.work.comparisons.as_mut().unwrap().1[index] = Some(distance);
+        Some(distance)
     }
 }
 
@@ -203,7 +300,7 @@ fn fare_ticks(fare: Money) -> f64 {
 pub(super) struct TransitPaths<'a> {
     lines: BTreeMap<LineID, ServiceLine<'a>>,
     stop_lines: BTreeMap<StopID, Vec<(LineID, usize)>>,
-    stops: Grid<&'a TransitStop, Vec2>,
+    stops: BTreeMap<(i32, i32), BTreeMap<StopID, &'a TransitStop>>,
     transfer_walks: RefCell<TransferWalks>,
     stops_by_id: BTreeMap<StopID, &'a TransitStop>,
     platform_walks: BTreeMap<StopID, f32>,
@@ -228,7 +325,7 @@ impl<'a> TransitPaths<'a> {
         let mut paths = Self {
             lines: BTreeMap::new(),
             stop_lines: BTreeMap::new(),
-            stops: Grid::new(STOP_ACCESS_RADIUS as i32),
+            stops: BTreeMap::new(),
             transfer_walks: RefCell::new(BTreeMap::new()),
             stops_by_id: BTreeMap::new(),
             platform_walks: BTreeMap::new(),
@@ -242,8 +339,8 @@ impl<'a> TransitPaths<'a> {
                 continue;
             }
             let rail_line = rail.and_then(|rail| rail.lines.get(&id).map(|line| (rail, line)));
-            let headway = if let Some((_, config)) = rail_line {
-                if line.target_vehicles == 0 || config.is_retiring() {
+            let headway = if let Some((rail, config)) = rail_line {
+                if rail.topology_dirty || line.target_vehicles == 0 || config.is_retiring() {
                     continue;
                 }
                 let cycle = config.leg_ticks.iter().sum::<u64>()
@@ -335,7 +432,11 @@ impl<'a> TransitPaths<'a> {
             for (index, stop) in stops.into_iter().enumerate() {
                 let lines = paths.stop_lines.entry(stop.id).or_default();
                 if lines.is_empty() {
-                    paths.stops.insert(stop.walk_pos.xy(), stop);
+                    paths
+                        .stops
+                        .entry(Self::cell(stop.walk_pos.xy()))
+                        .or_default()
+                        .insert(stop.id, stop);
                     paths.stops_by_id.insert(stop.id, stop);
                     if let Some((rail, _)) = rail_line {
                         paths.platform_walks.insert(stop.id, rail.platform_walk_metres(stop.id));
@@ -389,10 +490,11 @@ impl<'a> TransitPaths<'a> {
                 search.pending.endpoints = Default::default();
                 search.pending.transfer = TransferProgress::default();
                 search.pending.best_transfer = None;
+                search.pending.work = SearchWork::default();
             }
         }
         let credit = FareQuote::from_credit(now, credit);
-        let (mut access, mut egress) = if !self.needs_search_budget() {
+        let (mut access, mut egress) = if search.is_none() && !self.needs_search_budget() {
             self.route_stop_walks(
                 self.nearest(origin, &allows_line),
                 self.nearest(destination, &allows_line),
@@ -447,31 +549,61 @@ impl<'a> TransitPaths<'a> {
             .as_ref()
             .map(|trip| trip.ticks)
             .or_else(|| direct.as_ref().map(|ride| ride.ticks))?;
-        let walk_ticks = ValidatedWalk::route(now, origin, destination, map, walk_speed)
-            .map_or_else(
-                || if self.platform_walks.is_empty() && !self.has_interchanges() {
-                    travel_ticks(origin.distance(destination), walk_speed)
-                } else {
-                    f64::INFINITY
-                },
-                |(ticks, _)| ticks,
-            );
-        if ticks >= walk_ticks * (1.0 - MIN_WALK_SAVINGS)
-            || car_pos.is_some_and(|car| {
-                let car_access = walk_cost(now, origin, car, map, walk_speed);
-                let drive_distance =
-                    Itinerary::route(now, car, destination, map, PathKind::Vehicle)
-                        .and_then(|it| {
-                            itinerary_distance(&it, car, destination, map, PathKind::Vehicle)
-                        })
-                        .unwrap_or_else(|| car.distance(destination));
-                let car_ticks = car_access
-                    + travel_ticks(drive_distance, CAR_SPEED)
-                    + PARKING_SECONDS * TICKS_PER_REALTIME_SECOND as f64;
-                ticks + COST_EPSILON >= car_ticks
-            })
+        let distance = |search: Option<&mut SearchSlice<'_>>, index, from, to, kind| {
+            if let Some(search) = search {
+                search.compare_distance(index, car_pos, from, to, map, kind)
+            } else {
+                Some(
+                    Itinerary::route(now, from, to, map, kind)
+                        .and_then(|it| itinerary_distance(&it, from, to, map, kind))
+                        .map_or(f64::INFINITY, f64::from),
+                )
+            }
+        };
+        let walk_distance = distance(
+            search.as_deref_mut(),
+            0,
+            origin,
+            destination,
+            PathKind::Pedestrian,
+        )?;
+        let seconds = |metres: f64, speed: f64| metres / speed * TICKS_PER_REALTIME_SECOND as f64;
+        let walk_ticks = if walk_distance.is_infinite()
+            && self.platform_walks.is_empty()
+            && !self.has_interchanges()
         {
+            travel_ticks(origin.distance(destination), walk_speed)
+        } else {
+            seconds(walk_distance, walk_speed)
+        };
+        if ticks >= walk_ticks * (1.0 - MIN_WALK_SAVINGS) {
             return None;
+        }
+        if let Some(car) = car_pos {
+            let access = distance(search.as_deref_mut(), 1, origin, car, PathKind::Pedestrian)?;
+            let drive = distance(
+                search.as_deref_mut(),
+                2,
+                car,
+                destination,
+                PathKind::Vehicle,
+            )?;
+            let access = if access.is_finite() {
+                access
+            } else {
+                f64::from(origin.distance(car))
+            };
+            let drive = if drive.is_finite() {
+                drive
+            } else {
+                f64::from(car.distance(destination))
+            };
+            let car_ticks = seconds(access, walk_speed)
+                + seconds(drive, CAR_SPEED)
+                + PARKING_SECONDS * TICKS_PER_REALTIME_SECOND as f64;
+            if ticks + COST_EPSILON >= car_ticks {
+                return None;
+            }
         }
         let (first, second) = match transfer {
             Some(trip) => (trip.first, Some((trip.second, trip.walk))),
@@ -526,6 +658,12 @@ impl<'a> TransitPaths<'a> {
                 .best_transfer
                 .as_ref()
                 .and_then(|saved| saved.resolve(&self.stops_by_id, map));
+        }
+        if search
+            .as_ref()
+            .is_some_and(|slice| slice.pending.work.transfer_complete)
+        {
+            return best;
         }
         let mut paths = self.transfer_walks.borrow_mut();
         let mut labels = 0;
@@ -584,14 +722,80 @@ impl<'a> TransitPaths<'a> {
                         continue;
                     };
                     let first_arrival = access_ticks + wait.unwrap_or(0.0) + first_ride;
-                    let neighbors =
-                        self.nearby(alight.walk_pos, TRANSFER_RADIUS, usize::MAX, |stop| {
-                            self.stop_lines[&stop.id]
-                                .iter()
-                                .any(|&(id, _)| id != first_id && destination_lines.contains(&id))
-                        });
+                    let filter = |stop: &TransitStop| {
+                        self.stop_lines[&stop.id]
+                            .iter()
+                            .any(|&(id, _)| id != first_id && destination_lines.contains(&id))
+                    };
+                    let mut unmetered = Vec::new();
+                    if let Some(slice) = search.as_deref_mut() {
+                        let mut neighborhood = slice
+                            .pending
+                            .work
+                            .interchange
+                            .take()
+                            .filter(|(key, _)| *key == prefix)
+                            .map_or_else(Neighborhood::default, |(_, progress)| progress);
+                        if prefix
+                            > (TransferPosition {
+                                neighbor: 0,
+                                ..resume
+                            })
+                        {
+                            slice.pending.transfer = TransferProgress {
+                                position: prefix,
+                                ..Default::default()
+                            };
+                        }
+                        self.collect_nearby(
+                            alight.walk_pos,
+                            TRANSFER_RADIUS,
+                            &filter,
+                            &mut neighborhood,
+                            slice,
+                        );
+                        slice.pending.work.interchange = Some((prefix, neighborhood));
+                        if slice.deferred {
+                            return None;
+                        }
+                    } else {
+                        unmetered.extend(
+                            self.nearby(alight.walk_pos, TRANSFER_RADIUS, usize::MAX, filter)
+                                .into_iter()
+                                .map(|(_, stop)| stop.id),
+                        );
+                    }
+                    let neighbors = |slice: Option<&SearchSlice<'_>>, index| {
+                        slice
+                            .map_or(unmetered.as_slice(), |slice| {
+                                slice
+                                    .pending
+                                    .work
+                                    .interchange
+                                    .as_ref()
+                                    .unwrap()
+                                    .1
+                                    .ordered
+                                    .as_slice()
+                            })
+                            .get(index)
+                            .copied()
+                    };
                     let mut reachable = 0;
-                    for (neighbor, (_, interchange)) in neighbors.into_iter().enumerate() {
+                    let first_neighbor = if prefix
+                        == (TransferPosition {
+                            neighbor: 0,
+                            ..resume
+                        }) {
+                        resume.neighbor
+                    } else {
+                        0
+                    };
+                    for neighbor in first_neighbor.. {
+                        let Some(id) = neighbors(search.as_deref(), neighbor) else {
+                            break;
+                        };
+                        let interchange = self.stops_by_id[&id];
                         let position = TransferPosition { neighbor, ..prefix };
                         if position < resume {
                             continue;
@@ -617,20 +821,21 @@ impl<'a> TransitPaths<'a> {
                         let walk = if let Some(walk) = paths.get(&walk_key) {
                             walk.as_ref()
                         } else {
-                            if search.as_mut().is_some_and(|search| !search.allow_walk()) {
-                                return None;
-                            }
-                            let walk = ValidatedWalk::route(
+                            let walk = ValidatedWalk::route_with_slice(
                                 now,
                                 alight.walk_pos,
                                 interchange.walk_pos,
                                 map,
                                 1.0,
+                                search.as_deref_mut(),
                             )
                             .map(|(ticks, walk)| {
                                 ((ticks / TICKS_PER_REALTIME_SECOND as f64) as f32, walk)
                             })
                             .filter(|(distance, _)| *distance <= TRANSFER_RADIUS);
+                            if search.as_ref().is_some_and(|slice| slice.deferred) {
+                                return None;
+                            }
                             if paths.len() < MAX_CACHED_TRANSFERS {
                                 paths.entry(walk_key).or_insert(walk).as_ref()
                             } else {
@@ -732,6 +937,9 @@ impl<'a> TransitPaths<'a> {
                     }
                 }
             }
+        }
+        if let Some(search) = search {
+            search.pending.work.transfer_complete = true;
         }
         best
     }
@@ -840,11 +1048,26 @@ impl<'a> TransitPaths<'a> {
         } else {
             NEAREST_STOPS
         };
-        let candidates = self.nearby(pos, STOP_ACCESS_RADIUS, usize::MAX, |stop| {
+        let filter = |stop: &TransitStop| {
             self.stop_lines[&stop.id]
                 .iter()
                 .any(|&(line, _)| allows_line(line))
-        });
+        };
+        let mut unmetered = Vec::new();
+        if let Some(slice) = search.as_deref_mut() {
+            let mut neighborhood = std::mem::take(&mut slice.pending.work.endpoints[end]);
+            self.collect_nearby(pos, STOP_ACCESS_RADIUS, &filter, &mut neighborhood, slice);
+            slice.pending.work.endpoints[end] = neighborhood;
+            if slice.deferred {
+                return None;
+            }
+        } else {
+            unmetered.extend(
+                self.nearby(pos, STOP_ACCESS_RADIUS, usize::MAX, filter)
+                    .into_iter()
+                    .map(|(_, stop)| stop.id),
+            );
+        }
         let (checked, cached) = search.as_ref().map_or((0, &[][..]), |search| {
             let endpoint = &search.pending.endpoints[end];
             (endpoint.checked, endpoint.walks.as_slice())
@@ -858,22 +1081,38 @@ impl<'a> TransitPaths<'a> {
                 Some((*ticks, stop, walk))
             })
             .collect::<Vec<_>>();
-        for (index, (_, stop)) in candidates.into_iter().enumerate().skip(checked) {
+        let candidate_at = |search: Option<&SearchSlice<'_>>, index| {
+            search
+                .map_or(unmetered.as_slice(), |slice| {
+                    &slice.pending.work.endpoints[end].ordered
+                })
+                .get(index)
+                .copied()
+        };
+        for index in checked.. {
+            let Some(id) = candidate_at(search.as_deref(), index) else {
+                break;
+            };
             if reachable.len() == limit {
                 break;
             }
             if search
                 .as_mut()
-                .is_some_and(|search| !search.visit_candidate() || !search.allow_walk())
+                .is_some_and(|search| !search.visit_candidate())
             {
                 return None;
             }
+            let stop = self.stops_by_id[&id];
             let (from, to) = if end == 0 {
                 (origin, stop.walk_pos)
             } else {
                 (stop.walk_pos, destination)
             };
-            let walk = ValidatedWalk::route(now, from, to, map, speed);
+            let walk =
+                ValidatedWalk::route_with_slice(now, from, to, map, speed, search.as_deref_mut());
+            if search.as_ref().is_some_and(|search| search.deferred) {
+                return None;
+            }
             if let Some(search) = search.as_mut() {
                 let endpoint = &mut search.pending.endpoints[end];
                 endpoint.checked = index + 1;
@@ -921,6 +1160,50 @@ impl<'a> TransitPaths<'a> {
         self.platform_walks.get(&stop).map_or(0.0, |&metres| travel_ticks(metres, walk_speed))
     }
 
+    fn cell(pos: Vec2) -> (i32, i32) {
+        (
+            (pos.x / STOP_ACCESS_RADIUS).floor() as i32,
+            (pos.y / STOP_ACCESS_RADIUS).floor() as i32,
+        )
+    }
+
+    fn collect_nearby(
+        &self,
+        pos: Vec3,
+        radius: f32,
+        filter: &impl Fn(&TransitStop) -> bool,
+        progress: &mut Neighborhood,
+        search: &mut SearchSlice<'_>,
+    ) {
+        let (left, bottom) = Self::cell(pos.xy() - Vec2::splat(radius));
+        let (right, top) = Self::cell(pos.xy() + Vec2::splat(radius));
+        let columns = (left..=right).flat_map(|x| (bottom..=top).map(move |y| (x, y)));
+        for cell in columns.skip(progress.cell) {
+            if let Some(stops) = self.stops.get(&cell) {
+                let lower = progress.after.map_or(Unbounded, Excluded);
+                for (&id, &stop) in stops.range((lower, Unbounded)) {
+                    if !search.visit_candidate() {
+                        return;
+                    }
+                    progress.after = Some(id);
+                    let distance = pos.distance2(stop.walk_pos);
+                    if distance <= radius * radius && filter(stop) {
+                        progress.ranked.insert((OrderedFloat(distance), id));
+                    }
+                }
+            }
+            progress.cell += 1;
+            progress.after = None;
+        }
+        while !progress.ranked.is_empty() {
+            if !search.visit_candidate() {
+                return;
+            }
+            let (_, id) = progress.ranked.pop_first().unwrap();
+            progress.ordered.push(id);
+        }
+    }
+
     fn nearby(
         &self,
         pos: Vec3,
@@ -930,8 +1213,13 @@ impl<'a> TransitPaths<'a> {
     ) -> Vec<(OrderedFloat<f32>, &'a TransitStop)> {
         let mut stops = Vec::with_capacity(limit.min(TRANSFER_STOPS));
         let bound = Vec2::splat(radius);
-        for (handle, _) in self.stops.query_aabb(pos.xy() - bound, pos.xy() + bound) {
-            let &stop = self.stops.get(handle).unwrap().1;
+        let (left, bottom) = Self::cell(pos.xy() - bound);
+        let (right, top) = Self::cell(pos.xy() + bound);
+        let cells = (left..=right).flat_map(|x| (bottom..=top).map(move |y| (x, y)));
+        for &stop in cells
+            .filter_map(|cell| self.stops.get(&cell))
+            .flat_map(|stops| stops.values())
+        {
             let distance = OrderedFloat(pos.distance2(stop.walk_pos));
             if distance.0 > radius * radius || !filter(stop) {
                 continue;
@@ -1111,6 +1399,53 @@ impl Departures {
         })
     }
 
+    fn rail_wait(
+        &self,
+        now: Tick,
+        schedule: RailSchedule,
+        mut next_slot: u64,
+        mut ready: u64,
+        offset: u64,
+        access_ticks: f64,
+    ) -> f64 {
+        if !access_ticks.is_finite() {
+            return f64::INFINITY;
+        }
+        let mut departures_by_lateness = BTreeMap::new();
+        loop {
+            let slot = schedule.service_slot(next_slot, ready);
+            let Some(Tick(departure)) = schedule.departure_in_slot(slot, ready) else {
+                return f64::INFINITY;
+            };
+            let wait = departure.saturating_sub(now.0).saturating_add(offset) as f64 - access_ticks;
+            if wait >= 0.0 || departure == u64::MAX {
+                return wait.max(0.0);
+            }
+            // Once the lateness repeats, the slot rule repeats with the same
+            // period. Skip whole cycles while keeping the first catchable call.
+            if let Some(previous) = departures_by_lateness.insert(departure - slot, departure) {
+                let period = departure - previous;
+                if period != 0 {
+                    let remainder = wait.rem_euclid(period as f64);
+                    if remainder == 0.0 {
+                        return 0.0;
+                    }
+                    let skip = ((-wait / period as f64).floor() as u64).saturating_mul(period);
+                    next_slot = slot
+                        .saturating_add(skip)
+                        .saturating_add(schedule.headway_ticks);
+                    ready = departure
+                        .saturating_add(skip)
+                        .saturating_add(self.loop_ticks);
+                    departures_by_lateness.clear();
+                    continue;
+                }
+            }
+            next_slot = slot.saturating_add(schedule.headway_ticks);
+            ready = departure.saturating_add(self.loop_ticks);
+        }
+    }
+
     fn wait_ticks(&self, stop_index: usize, access_ticks: f64) -> f64 {
         let offset = self.stop_offsets[stop_index];
         self.first_departures
@@ -1129,25 +1464,24 @@ impl Departures {
                                 return wait;
                             }
                         }
-                        let return_ready = now
-                            .0
-                            .saturating_add(until_departure)
-                            .saturating_add(self.loop_ticks - target_offset);
-                        let slot = next_slot.max(schedule.slot_at_or_after(
-                            return_ready.saturating_sub(schedule.max_late_ticks),
-                        ));
-                        let next = slot
-                            .max(return_ready)
-                            .saturating_sub(now.0)
-                            .saturating_add(offset) as f64
-                            - access_ticks;
-                        let cycle = self.loop_ticks.div_ceil(schedule.headway_ticks)
-                            * schedule.headway_ticks;
-                        return if next < 0.0 {
-                            next.rem_euclid(cycle as f64)
+                        let departure = now.0.saturating_add(until_departure);
+                        let return_ready =
+                            departure.saturating_add(self.loop_ticks - target_offset);
+                        let next_slot = if target_offset == 0 && departure >= next_slot {
+                            schedule
+                                .service_slot(next_slot, departure)
+                                .saturating_add(schedule.headway_ticks)
                         } else {
-                            next
+                            next_slot
                         };
+                        return self.rail_wait(
+                            now,
+                            schedule,
+                            next_slot,
+                            return_ready,
+                            offset,
+                            access_ticks,
+                        );
                     }
                     let after_target = if offset >= target_offset {
                         offset - target_offset
@@ -1306,13 +1640,6 @@ impl Ride<'_> {
     }
 }
 
-fn walk_cost(now: Tick, start: Vec3, end: Vec3, map: &Map, speed: f64) -> f64 {
-    ValidatedWalk::route(now, start, end, map, speed).map_or_else(
-        || travel_ticks(start.distance(end), speed),
-        |(ticks, _)| ticks,
-    )
-}
-
 #[derive(Clone, Serialize, Deserialize)]
 pub(super) struct ValidatedWalk {
     start: Vec3,
@@ -1323,7 +1650,22 @@ pub(super) struct ValidatedWalk {
 
 impl ValidatedWalk {
     fn route(now: Tick, start: Vec3, end: Vec3, map: &Map, speed: f64) -> Option<(f64, Self)> {
-        let itinerary = Itinerary::route(now, start, end, map, PathKind::Pedestrian)?;
+        Self::route_with_slice(now, start, end, map, speed, None)
+    }
+
+    fn route_with_slice(
+        now: Tick,
+        start: Vec3,
+        end: Vec3,
+        map: &Map,
+        speed: f64,
+        search: Option<&mut SearchSlice<'_>>,
+    ) -> Option<(f64, Self)> {
+        let itinerary = if let Some(search) = search {
+            search.route(start, end, map, PathKind::Pedestrian)
+        } else {
+            Itinerary::route(now, start, end, map, PathKind::Pedestrian)
+        }?;
         let ticks = travel_ticks(walking_distance(&itinerary, start, end, map)?, speed);
         Some((
             ticks,
@@ -1334,6 +1676,14 @@ impl ValidatedWalk {
                 itinerary,
             },
         ))
+    }
+
+    fn proves(&self, start: Vec3, end: Vec3, map: &Map) -> bool {
+        self.start == start
+            && self.end == end
+            && start.is_finite()
+            && end.is_finite()
+            && self.itinerary.proves_pedestrian_route(start, end, map)
     }
 
     pub(super) fn matches(&self, start: Vec3, end: Vec3, map: &Map) -> bool {
@@ -1443,6 +1793,134 @@ mod tests {
     }
 
     #[test]
+    fn p8_w2_r3_recurring_forecast_keeps_legal_late_departures() {
+        let departures = Departures {
+            loop_ticks: 1_050,
+            stop_offsets: vec![0, 450],
+            first_departures: vec![Departure {
+                stop_offset: 0,
+                until_departure: 1_000,
+                dwelling: false,
+            }],
+            mean_wait_ticks: 0.0,
+            rail_calendar: Some((Tick(0), RailSchedule::default(), 2_000)),
+        };
+        assert_eq!(departures.wait_ticks(0, 3_000.0), 100.0);
+        assert_eq!(departures.wait_ticks(1, 3_500.0), 50.0);
+        assert_eq!(departures.wait_ticks(0, 6_000.0), 250.0);
+        assert_eq!(departures.wait_ticks(0, 6_251.0), 1749.0);
+    }
+
+    #[test]
+    fn p8_w2_r3_pending_walk_cannot_load_an_unrelated_itinerary() {
+        use crate::map_dynamic::transit::JourneyStats;
+        use crate::souls::human::spawn_human;
+
+        let mut ctx = TestCtx::new_fast();
+        ctx.build_roads(&[vec3(100.0, 500.0, 0.0), vec3(900.0, 500.0, 0.0)]);
+        let home = ctx.build_house_near(Vec2::new(300.0, 500.0));
+        let human = spawn_human(&mut ctx.g, home).unwrap();
+        let origin = vec3(250.0, 510.0, 0.0);
+        let destination = vec3(650.0, 510.0, 0.0);
+        let stop = ctx
+            .g
+            .write::<Transit>()
+            .stops
+            .insert_with_key(|id| TransitStop {
+                id,
+                pos: destination,
+                walk_pos: destination,
+                berth: destination,
+                dir: Vec2::X,
+            });
+        let mut pending = PendingSearch::new(Tick(0), (0, 0), origin, destination);
+        let (ticks, mut walk) =
+            ValidatedWalk::route(Tick(0), origin, destination, &ctx.g.map(), 1.0).unwrap();
+        pending.endpoints[0].checked = 1;
+        pending.endpoints[0].walks.push((stop, ticks, walk.clone()));
+        ctx.g.write::<JourneyStats>().defer_search(human, pending);
+        let snapshot = |sim: &crate::Simulation| {
+            sim.encode_slot(crate::SnapshotRevision::new(1))
+                .unwrap()
+                .into_snapshot_bytes()
+        };
+        assert!(crate::Simulation::load_compressed_snapshot(&snapshot(&ctx.g), 32 << 20).is_ok());
+
+        let (mut pending, _) =
+            ctx.g
+                .write::<JourneyStats>()
+                .take_search(human, Tick(0), 0, origin, destination);
+        walk.itinerary = Itinerary::simple(vec![origin + Vec3::Y * 500.0]);
+        pending.endpoints[0].walks[0].2 = walk;
+        ctx.g.write::<JourneyStats>().defer_search(human, pending);
+        assert!(crate::Simulation::load_compressed_snapshot(&snapshot(&ctx.g), 32 << 20).is_err());
+    }
+
+    #[test]
+    fn p8_w2_r3_endpoint_collection_spends_its_own_work() {
+        let ctx = TestCtx::new_fast();
+        let transit = wait_limit_line([Vec3::X * 20.0, Vec3::X * 30.0]);
+        let paths = TransitPaths::new(&transit, Tick(0), |_, _| Some(400));
+        let mut pending = PendingSearch::new(Tick(0), (0, 0), Vec3::ZERO, Vec3::X);
+        let mut allowance = 1;
+        let mut slice = SearchSlice::new(&mut pending, &mut allowance);
+        assert!(paths
+            .route_endpoint(
+                Vec3::ZERO,
+                Vec3::X,
+                &ctx.g.map(),
+                Tick(0),
+                1.0,
+                0,
+                Some(&mut slice),
+                &|_| true
+            )
+            .is_none());
+        assert!(slice.deferred);
+        assert_eq!(pending.endpoints[0].checked, 0);
+    }
+
+    #[test]
+    fn p8_w2_r3_walking_comparator_resumes_graph_expansions() {
+        use crate::map::{LaneKind, LanePatternBuilder, RoadSegmentKind};
+
+        let mut map = Map::empty();
+        let intersections = [100.0, 400.0, 700.0, 1_000.0]
+            .map(|x| map.add_intersection(vec3(x, 500.0, 0.3)));
+        let pattern = LanePatternBuilder::new().build();
+        for [from, to] in intersections.windows(2).map(|pair| [pair[0], pair[1]]) {
+            map.connect(from, to, &pattern, RoadSegmentKind::Straight).unwrap();
+        }
+        for id in intersections {
+            map.update_intersection(id, |_| {});
+        }
+        let origin = vec3(250.0, 510.0, 0.3);
+        let destination = vec3(850.0, 510.0, 0.3);
+        assert_ne!(
+            map.nearest_lane(origin, LaneKind::Walking, None).unwrap(),
+            map.nearest_lane(destination, LaneKind::Walking, None).unwrap(),
+        );
+        let mut pending = PendingSearch::new(Tick(0), (0, 0), origin, destination);
+        let successful =
+            Itinerary::route(Tick(0), origin, destination, &map, PathKind::Pedestrian).unwrap();
+        let distance = f64::from(walking_distance(&successful, origin, destination, &map).unwrap());
+        for pass in 0..20 {
+            let mut work = 1;
+            let mut slice = SearchSlice::new(&mut pending, &mut work);
+            let result =
+                slice.compare_distance(0, None, origin, destination, &map, PathKind::Pedestrian);
+            if let Some(result) = result {
+                assert!(pass > 1);
+                assert_eq!(result, distance);
+                return;
+            }
+            assert!(slice.deferred);
+            assert_eq!(work, 0);
+        }
+        panic!("the walking graph search did not advance");
+    }
+
+    #[test]
     fn p8_w2_saved_endpoint_search_resumes_with_a_fresh_work_slice() {
         use common::saveload::{Bincode, Encoder};
 
@@ -1473,7 +1951,7 @@ mod tests {
         }
         let index = TransitPaths::new(&transit, Tick(0), |_, _| Some(400));
         let mut pending = PendingSearch::new(Tick(0), (0, 0), origin, destination);
-        let mut allowance = 1;
+        let mut allowance = 10;
         let mut slice = SearchSlice::new(&mut pending, &mut allowance);
         assert!(index
             .route_endpoint(
@@ -1492,7 +1970,7 @@ mod tests {
             Bincode::decode(&Bincode::encode(&pending).unwrap()).unwrap();
         assert!(pending.valid());
 
-        let mut allowance = 2;
+        let mut allowance = 12;
         let mut slice = SearchSlice::new(&mut pending, &mut allowance);
         let stops = index
             .route_endpoint(

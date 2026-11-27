@@ -386,9 +386,19 @@ pub(crate) fn validate_journey_snapshot(sim: &crate::Simulation) -> Result<(), &
             return Err("Missing saved passenger rail boarding occurrence");
         }
     }
-    for (&id, pending) in &stats.pending {
-        if !world.humans.contains_key(id) || pending.born > now || !pending.valid() {
-            return Err("Invalid saved pending passenger journey");
+    if !stats.pending.is_empty() {
+        let map = sim.map();
+        for (&id, pending) in &stats.pending {
+            if !world.humans.contains_key(id) || pending.born > now || !pending.valid() {
+                return Err("Invalid saved pending passenger journey");
+            }
+            // A changed topology or service revision already discards this
+            // frontier before any of its walks can be installed.
+            if pending.revision == (stats.topology_revision, transit.revision)
+                && !pending.prove_walks(&transit, &map)
+            {
+                return Err("Unproved saved pending passenger walk");
+            }
         }
     }
     Ok(())

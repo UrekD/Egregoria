@@ -134,7 +134,12 @@ fn routing_changed(
     let active_service = !transit.runs.is_empty()
         || rail.as_ref().is_some_and(|rail| !rail.runs.is_empty());
     let mut transit_paths = None;
-    let mut pending_walks = 128;
+    let mut passenger_work = 8192;
+    if rail.as_ref().is_some_and(|rail| !rail.platforms.is_empty()) {
+        passenger_work -= resources
+            .read::<crate::map_dynamic::transit::RailRefresh>()
+            .spent;
+    }
     let mut new_requests = 24;
     let mut resumed_requests = 40;
 
@@ -260,40 +265,35 @@ fn routing_changed(
                             |line| transit.allows_line_for_trip(id, router, line),
                         )
                     };
-                    if paths.needs_search_budget() {
-                        let mut stats =
-                            resources.write::<crate::map_dynamic::transit::JourneyStats>();
-                        let (mut pending, resuming) =
-                            stats.take_search(id, now, transit.revision, origin, pos);
-                        let requests = if resuming {
-                            &mut resumed_requests
-                        } else {
-                            &mut new_requests
-                        };
-                        let deferred = if *requests == 0 || pending_walks == 0 {
-                            true
-                        } else {
-                            *requests -= 1;
-                            let mut slice = SearchSlice::new(&mut pending, &mut pending_walks);
-                            transit_steps = plan(Some(&mut slice));
-                            slice.deferred
-                        };
-                        if deferred {
-                            stats.defer_search(id, pending);
-                            stats.discard_plan(id);
-                            router.clear_steps(parking);
-                            if h.location == Location::Outside {
-                                // Keep the start position stable while the saved search advances.
-                                if h.collider.is_none() {
-                                    Router::restore_walking(h, origin, resources);
-                                }
-                                h.it = Itinerary::NONE;
-                                h.speed.0 = 0.0;
-                            }
-                            return;
-                        }
+                    let mut stats = resources.write::<crate::map_dynamic::transit::JourneyStats>();
+                    let (mut pending, resuming) =
+                        stats.take_search(id, now, transit.revision, origin, pos);
+                    let requests = if resuming {
+                        &mut resumed_requests
                     } else {
-                        transit_steps = plan(None);
+                        &mut new_requests
+                    };
+                    let deferred = if *requests == 0 || passenger_work == 0 {
+                        true
+                    } else {
+                        *requests -= 1;
+                        let mut slice = SearchSlice::new(&mut pending, &mut passenger_work);
+                        transit_steps = plan(Some(&mut slice));
+                        slice.deferred
+                    };
+                    if deferred {
+                        stats.defer_search(id, pending);
+                        stats.discard_plan(id);
+                        router.clear_steps(parking);
+                        if h.location == Location::Outside {
+                            // Keep the start position stable while the saved search advances.
+                            if h.collider.is_none() {
+                                Router::restore_walking(h, origin, resources);
+                            }
+                            h.it = Itinerary::NONE;
+                            h.speed.0 = 0.0;
+                        }
+                        return;
                     }
                 }
             }

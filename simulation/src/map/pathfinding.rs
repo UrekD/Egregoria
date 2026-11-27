@@ -465,6 +465,196 @@ pub(super) fn search_driving(
     .map(|(path, _)| path.into_iter().skip(1).collect())
 }
 
+/// The same directed successor and cost rules as ordinary routing, with an
+/// owned frontier so passenger work can yield between graph expansions.
+pub(crate) struct RouteSearch {
+    kind: PathKind,
+    start: Traversable,
+    end: LaneID,
+    end_pos: Vec3,
+    seed: u32,
+    open: std::collections::BinaryHeap<SearchCandidate>,
+    visits: std::collections::BTreeMap<(TraverseKind, bool), (f32, Option<Traversable>)>,
+}
+
+struct SearchCandidate {
+    step: Traversable,
+    cost: OrderedFloat<f32>,
+    estimate: OrderedFloat<f32>,
+}
+
+impl PartialEq for SearchCandidate {
+    fn eq(&self, other: &Self) -> bool {
+        (self.estimate, self.cost) == (other.estimate, other.cost)
+    }
+}
+
+impl Eq for SearchCandidate {}
+
+impl PartialOrd for SearchCandidate {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SearchCandidate {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .estimate
+            .cmp(&self.estimate)
+            .then_with(|| self.cost.cmp(&other.cost))
+    }
+}
+
+impl RouteSearch {
+    pub(crate) fn new(
+        map: &Map,
+        tick: Tick,
+        kind: PathKind,
+        start: Traversable,
+        end: LaneID,
+    ) -> Option<Self> {
+        let end_pos = map.intersections.get(map.lanes.get(end)?.dst)?.pos;
+        let root = if kind == PathKind::Pedestrian {
+            start
+        } else {
+            Traversable::new(
+                TraverseKind::Lane(LaneID::null()),
+                TraverseDirection::Forward,
+            )
+        };
+        let key = walk_state(root);
+        Some(Self {
+            kind,
+            start,
+            end,
+            end_pos,
+            seed: hash_u64((start.destination_lane().data().as_ffi(), tick.0)) as u32,
+            open: std::collections::BinaryHeap::from([SearchCandidate {
+                step: root,
+                cost: OrderedFloat(0.0),
+                estimate: OrderedFloat(0.0),
+            }]),
+            visits: std::collections::BTreeMap::from([(key, (0.0, None))]),
+        })
+    }
+
+    pub(crate) fn advance(
+        &mut self,
+        map: &Map,
+        remaining: &mut usize,
+    ) -> std::task::Poll<Option<Vec<Traversable>>> {
+        use std::task::Poll;
+
+        while !self.open.is_empty() {
+            if *remaining == 0 {
+                return Poll::Pending;
+            }
+            *remaining -= 1;
+            let SearchCandidate { step, cost, .. } = self.open.pop().unwrap();
+            if step.kind == TraverseKind::Lane(self.end) {
+                return Poll::Ready(self.finish(map, step));
+            }
+            if cost.0 > self.visits[&walk_state(step)].0 {
+                continue;
+            }
+            if self.kind == PathKind::Pedestrian {
+                for (next, length) in walk_successors(map, step) {
+                    let estimate = walk_heuristic(walk_position(map, next), self.end_pos);
+                    self.visit(step, next, cost.0 + length, estimate);
+                }
+            } else {
+                let lane = step.destination_lane();
+                let lane = if lane.is_null() {
+                    self.start.destination_lane()
+                } else {
+                    lane
+                };
+                for next in lane_turn_successors(map, lane).filter_map(|id| map.lanes.get(id)) {
+                    let next_step =
+                        Traversable::new(TraverseKind::Lane(next.id), TraverseDirection::Forward);
+                    let pos = map.intersections.get(next.dst).map(|junction| junction.pos);
+                    let estimate = driving_heuristic(pos, self.end_pos);
+                    self.visit(
+                        step,
+                        next_step,
+                        cost.0 + driving_lane_cost(map, next, self.seed),
+                        estimate,
+                    );
+                }
+            }
+        }
+        Poll::Ready(None)
+    }
+
+    fn visit(&mut self, step: Traversable, next: Traversable, cost: f32, estimate: f32) {
+        let key = walk_state(next);
+        if self
+            .visits
+            .get(&key)
+            .is_some_and(|&(previous, _)| previous <= cost)
+        {
+            return;
+        }
+        self.visits.insert(key, (cost, Some(step)));
+        self.open.push(SearchCandidate {
+            step: next,
+            cost: OrderedFloat(cost),
+            estimate: OrderedFloat(cost + estimate),
+        });
+    }
+
+    fn finish(&self, map: &Map, mut step: Traversable) -> Option<Vec<Traversable>> {
+        let mut path = vec![step];
+        while let Some(parent) = self.visits[&walk_state(step)].1 {
+            step = parent;
+            path.push(step);
+        }
+        path.reverse();
+        if self.kind == PathKind::Pedestrian {
+            return Some(path);
+        }
+        build_driving_traversals(
+            map,
+            self.start,
+            path.into_iter().skip(1).map(|step| step.destination_lane()),
+        )
+    }
+}
+
+pub(crate) fn live_pedestrian_step(map: &Map, from: Traversable, to: Traversable) -> bool {
+    map.get(to.destination_lane())
+        .is_some_and(|lane| lane.kind == LaneKind::Walking)
+        && to
+            .raw_points(map)
+            .is_some_and(|points| points.iter().all(|p| p.is_finite()))
+        && walk_successors(map, from).any(|(step, _)| step == to)
+}
+
+fn build_driving_traversals(
+    map: &Map,
+    start: Traversable,
+    lanes: impl ExactSizeIterator<Item = LaneID>,
+) -> Option<Vec<Traversable>> {
+    let mut path = Vec::with_capacity(lanes.len() * 2 + 1);
+    path.push(start);
+    let mut last_id = start.destination_lane();
+    for lane in lanes {
+        let inter_end = map.intersections.get(map.lanes.get(lane)?.src)?;
+        let id = TurnID::new(inter_end.id, last_id, lane, false);
+        path.push(Traversable::new(
+            TraverseKind::Turn(id),
+            TraverseDirection::Forward,
+        ));
+        path.push(Traversable::new(
+            TraverseKind::Lane(lane),
+            TraverseDirection::Forward,
+        ));
+        last_id = lane;
+    }
+    Some(path)
+}
+
 impl Pathfinder for CarPath {
     fn path(
         &self,
@@ -501,27 +691,7 @@ impl Pathfinder for CarPath {
                 "reachability rejected a route from {start_lane:?} to {end:?}",
             );
         }
-        let route = route?;
-        let mut path = Vec::with_capacity(route.len() * 2 + 1);
-        path.push(start);
-
-        let mut last_id = start_lane;
-
-        for lane in route {
-            let inter_end = &inters.get(lanes.get(lane)?.src)?;
-            let id = TurnID::new(inter_end.id, last_id, lane, false);
-            path.push(Traversable::new(
-                TraverseKind::Turn(id),
-                TraverseDirection::Forward,
-            ));
-            path.push(Traversable::new(
-                TraverseKind::Lane(lane),
-                TraverseDirection::Forward,
-            ));
-
-            last_id = lane;
-        }
-        Some(path)
+        build_driving_traversals(map, start, route?.into_iter())
     }
 
     fn nearest_lane(&self, map: &Map, pos: Vec3) -> Option<LaneID> {

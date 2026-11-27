@@ -667,6 +667,55 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
             fare: Money::new_bucks(2),
         }],
     );
+    use simulation::map::road_edit::{preview_road_upgrade, road_edit_stamp, RoadUpgrade};
+    use simulation::map::{LanePatternBuilder, MapProject, ProjectKind};
+    use simulation::world_command::PrepareBudget;
+
+    let (narrow, expected, change) = {
+        let stop = ctx.sim.read::<Transit>().lines[line].stops[1];
+        let platform = ctx.sim.read::<RailTransit>().platforms[&stop];
+        let station = ctx.sim.map().get(platform.station).unwrap().door_pos;
+        let berth = ctx.sim.read::<Transit>().stops[stop].berth;
+        let middle = (station + berth) * 0.5;
+        let endpoint = |dx, dy| MapProject {
+            pos: middle + Vec3::X * dx + Vec3::Y * dy,
+            kind: ProjectKind::Ground,
+        };
+        apply(
+            &mut ctx.sim,
+            &[WorldCommand::MapMakeConnection {
+                from: endpoint(12.0, -12.0),
+                to: endpoint(12.0, 12.0),
+                inter: None,
+                pat: LanePatternBuilder::new()
+                    .one_way(true)
+                    .parking(false)
+                    .sidewalks(false)
+                    .build(),
+            }],
+        );
+        let narrow = ctx.sim.map().roads().keys().last().unwrap();
+        let change = RoadUpgrade::Replace(LanePatternBuilder::new().n_lanes(3).build());
+        let expected =
+            road_edit_stamp(&ctx.sim, narrow, &mut PrepareBudget::for_preview(100_000)).unwrap();
+        (narrow, expected, change)
+    };
+    let quote = preview_road_upgrade(
+        &ctx.sim,
+        narrow,
+        expected,
+        &change,
+        &mut PrepareBudget::for_preview(100_000),
+    )
+    .unwrap()
+    .quote;
+    let widen = WorldCommand::MapUpgradeRoad {
+        road: narrow,
+        expected,
+        change,
+        quote,
+    };
+
     let from = house(&mut ctx.sim, vec2(750.0, 625.0));
     let to = house(&mut ctx.sim, vec2(930.0, 980.0));
     let human = spawn_human(&mut ctx.sim, from).unwrap();
@@ -710,6 +759,19 @@ fn p8_rail_out_and_back_with_deterministic_resume() {
     let platform = ctx.sim.read::<RailTransit>().platforms[&destination_stop];
     let road = ctx.sim.map().get(platform.lane).unwrap().parent;
     let before = ctx.sim.hashes();
+    assert_eq!(
+        widen.preview(&ctx.sim).unwrap_err(),
+        simulation::world_command::Rejection::OccupiedTrack,
+    );
+    ctx.sim.apply_commands([&widen]);
+    assert_eq!(
+        ctx.sim.read::<CommandOutcomes>().last.as_slice(),
+        &[(
+            "MapUpgradeRoad",
+            simulation::world_command::Rejection::OccupiedTrack
+        ),]
+    );
+    assert_eq!(before, ctx.sim.hashes());
     assert_eq!(
         WorldCommand::MapRemoveRoad(road).preview(&ctx.sim).unwrap_err(),
         simulation::world_command::Rejection::OccupiedTrack,
@@ -1039,6 +1101,11 @@ fn p8_rail_track_repair_preserves_the_exit() {
     }
     assert!(moving, "passenger never left the origin platform");
     apply(&mut ctx.sim, &[WorldCommand::MapRemoveRoad(return_track)]);
+    assert!(
+        !ctx.sim.read::<Transit>().lines[line].suspended,
+        "the command should queue refresh work"
+    );
+    ctx.run_ticks(1);
     assert!(ctx.sim.read::<Transit>().lines[line].suspended);
 
     for _ in 0..CUTOFF {

@@ -325,6 +325,9 @@ fn register_systems_and_resources() {
         "passenger_journey_stats",
     );
     register_optional_resource::<crate::map_dynamic::transit::RailTransit>("passenger_rail");
+    register_optional_resource::<crate::map_dynamic::transit::RailRefresh>(
+        "passenger_rail_refresh",
+    );
 }
 
 fn register_utility_water_sample() {

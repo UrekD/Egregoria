@@ -75,8 +75,12 @@ impl RailSchedule {
             .saturating_add(n.saturating_mul(self.headway_ticks))
     }
 
+    pub(crate) fn service_slot(self, next_slot: u64, ready: u64) -> u64 {
+        next_slot.max(self.slot_at_or_after(ready.saturating_sub(self.max_late_ticks)))
+    }
+
     /// Earliest legal departure after a train can finish boarding.
-    fn departure_in_slot(self, slot: u64, ready: u64) -> Option<Tick> {
+    pub(crate) fn departure_in_slot(self, slot: u64, ready: u64) -> Option<Tick> {
         let departure = slot.max(ready);
         (departure <= slot.saturating_add(self.max_late_ticks)).then_some(Tick(departure))
     }
@@ -165,6 +169,8 @@ pub struct RailTransit {
     riders: BTreeMap<TrainID, BTreeSet<HumanID>>,
     #[serde(skip)]
     pub(super) poses: BTreeMap<StopID, PlatformPose>,
+    #[serde(skip)]
+    pub(crate) topology_dirty: bool,
     upkeep_pending: i128,
     #[serde(deserialize_with = "bounded_map::<_, _, _, MAX_RAIL_LINES>")]
     pub(super) pending_lines: BTreeMap<LineID, ()>,
@@ -441,25 +447,31 @@ pub(super) fn validate_loop(
                     paths.push((step, stamp));
                 }
             }
-            let metres = if from.lane == to.lane {
-                to.offset - from.offset
-            } else {
-                let track = map.get(from.lane).ok_or(Rejection::MissingReference)?;
-                let path = route.get_route().ok_or(Rejection::InvalidConnection)?;
-                let mut distance = track.points.length() - from.offset + to.offset;
-                for step in path.reversed_route.iter().skip(1) {
-                    distance += step
-                        .raw_points(map)
-                        .ok_or(Rejection::InvalidConnection)?
-                        .length();
-                }
-                distance
-            };
-            // Include acceleration and braking in the initial timetable estimate.
-            Ok((metres / (16.0 * prototypes::DELTA)).ceil() as u64 + 80)
+            rail_leg_time(map, **from, **to, &route).ok_or(Rejection::InvalidConnection)
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(RailLoop { times, paths })
+}
+
+fn rail_leg_time(
+    map: &Map,
+    from: RailPlatformSpec,
+    to: RailPlatformSpec,
+    route: &Itinerary,
+) -> Option<u64> {
+    let metres = if from.lane == to.lane {
+        to.offset - from.offset
+    } else {
+        let track = map.get(from.lane)?;
+        let path = route.get_route()?;
+        let mut distance = track.points.length() - from.offset + to.offset;
+        for step in path.reversed_route.iter().skip(1) {
+            distance += step.raw_points(map)?.length();
+        }
+        distance
+    };
+    // Include acceleration and braking in the initial timetable estimate.
+    Some((metres / (16.0 * prototypes::DELTA)).ceil() as u64 + 80)
 }
 
 pub(super) fn new_line(
@@ -493,10 +505,7 @@ impl PassengerRailLine {
     }
 
     fn next_service_slot(&self, ready: u64) -> u64 {
-        self.next_slot.max(
-            self.schedule
-                .slot_at_or_after(ready.saturating_sub(self.schedule.max_late_ticks)),
-        )
+        self.schedule.service_slot(self.next_slot, ready)
     }
 
     pub(super) fn install_loop(&mut self, route: RailLoop) {
@@ -542,7 +551,7 @@ pub(super) fn can_serve(
 pub fn rail_service_update(sim: &mut Simulation) {
     {
         let rail = sim.read::<RailTransit>();
-        if rail.lines.is_empty() && rail.held.is_empty() {
+        if rail.lines.is_empty() && rail.held.is_empty() && !rail.topology_dirty {
             return;
         }
     }
@@ -550,7 +559,7 @@ pub fn rail_service_update(sim: &mut Simulation) {
     let starts = {
         let (world, resources) = sim.world_res();
         let map = resources.read::<Map>();
-        refresh_one_rail_line(world, resources, &map, now);
+        refresh_rail(world, resources, &map, now);
         let mut transit = resources.write::<Transit>();
         let mut rail = resources.write::<RailTransit>();
         let RailTransit {
@@ -562,6 +571,7 @@ pub fn rail_service_update(sim: &mut Simulation) {
             held,
             upkeep_pending,
             pending_lines,
+            topology_dirty,
             ..
         } = &mut *rail;
         let trains = resources.read::<ParCommandBuffer<TrainEnt>>();
@@ -650,7 +660,7 @@ pub fn rail_service_update(sim: &mut Simulation) {
                 trains.kill(id);
                 continue;
             }
-            if line.suspended {
+            if *topology_dirty || line.suspended {
                 continue;
             }
             let next_call = (run.next_call + 1) % line.stops.len();
@@ -688,7 +698,7 @@ pub fn rail_service_update(sim: &mut Simulation) {
             let Some(line) = transit.lines.get(id) else {
                 continue;
             };
-            if config.removing || line.suspended || line.target_vehicles == 0 {
+            if *topology_dirty || config.removing || line.suspended || line.target_vehicles == 0 {
                 continue;
             }
             let schedule = config.schedule;
@@ -855,116 +865,357 @@ impl PassengerRailRun {
     }
 }
 
+const RAIL_REFRESH_WORK_PER_TICK: usize = 2048;
+const PLATFORM_REFRESH_WORK: usize = 32;
+
+#[derive(Default, Serialize, Deserialize)]
+pub(crate) struct RailRefresh {
+    dirty: bool,
+    #[serde(deserialize_with = "bounded_map::<_, _, _, MAX_RAIL_PLATFORMS>")]
+    changed: BTreeMap<StopID, ()>,
+    #[serde(skip)]
+    scan: DependencyScan,
+    #[serde(skip)]
+    build: Option<(LineID, LoopRefresh)>,
+    #[serde(skip)]
+    pub(crate) spent: usize,
+}
+
+#[derive(Default)]
+struct DependencyScan {
+    platform: Option<StopID>,
+    platforms_done: bool,
+    line: Option<LineID>,
+    scanning: Option<LineID>,
+    traversal: usize,
+}
+
+#[derive(Default)]
+struct LoopRefresh {
+    times: Vec<u64>,
+    paths: Vec<(Traversable, u64)>,
+    search: Option<crate::map::RouteSearch>,
+    leg: Option<Itinerary>,
+    stamp_index: usize,
+    train: Option<TrainID>,
+    recovering: Option<TrainID>,
+    recovered: Vec<(TrainID, Itinerary)>,
+}
+
 pub(super) fn revalidate_rail(resources: &crate::utils::resources::Resources) {
     let mut rail = resources.write::<RailTransit>();
     if rail.platforms.is_empty() {
         return;
     }
-    let map = resources.read::<Map>();
-    let now = elapsed_ticks(resources);
-    let mut transit = resources.write::<Transit>();
-    let mut changed = BTreeSet::new();
-    let mut poses = BTreeMap::new();
-    let mut remapped = Vec::new();
-    for (&id, &platform) in &rail.platforms {
-        let binding = platform_pose(&map, platform).ok().map(|pose| (platform, pose))
-            .or_else(|| {
-                // Reconnect a retired track ID only to its same physical directed berth.
-                let stop = transit.stops.get(id)?;
-                let lane = map.nearest_lane(stop.berth, LaneKind::Rail, Some(BERTH_TOLERANCE))?;
-                let track = map.get(lane)?;
-                let offset = track.points.length_at_proj(track.points.project(stop.berth));
-                let spec = RailPlatformSpec { lane, offset, ..platform };
-                let pose = platform_pose(&map, spec).ok()?;
-                (pose.berth.is_close(stop.berth, BERTH_TOLERANCE)
-                    && pose.direction.xy().dot(stop.dir) >= 0.99)
-                    .then_some((spec, pose))
-            });
-        if let Some((binding, pose)) = binding {
-            if binding != platform {
-                remapped.push((id, binding));
-                changed.insert(id);
+    rail.topology_dirty = true;
+    let mut refresh = resources.write::<RailRefresh>();
+    // Keep bindings already changed by an interrupted scan until the lines
+    // which use those bindings have been checked.
+    refresh.dirty = true;
+    refresh.scan = DependencyScan::default();
+    refresh.build = None;
+}
+
+fn refresh_platform(
+    rail: &mut RailTransit,
+    transit: &mut Transit,
+    map: &Map,
+    id: StopID,
+    platform: RailPlatformSpec,
+) -> bool {
+    let Some(stop) = transit.stops.get_mut(id) else {
+        return false;
+    };
+    let binding = platform_pose(map, platform)
+        .ok()
+        .map(|pose| (platform, pose))
+        .or_else(|| {
+            // Reconnect a retired track ID only to its same physical directed berth.
+            let lane = map.nearest_lane(stop.berth, LaneKind::Rail, Some(BERTH_TOLERANCE))?;
+            let track = map.get(lane)?;
+            let offset = track
+                .points
+                .length_at_proj(track.points.project(stop.berth));
+            let spec = RailPlatformSpec {
+                lane,
+                offset,
+                ..platform
+            };
+            let pose = platform_pose(map, spec).ok()?;
+            (pose.berth.is_close(stop.berth, BERTH_TOLERANCE)
+                && pose.direction.xy().dot(stop.dir) >= 0.99)
+                .then_some((spec, pose))
+        });
+    let Some((binding, pose)) = binding else {
+        rail.poses.remove(&id);
+        return true;
+    };
+    rail.platforms.insert(id, binding);
+    let had_pose = rail.poses.insert(id, pose).is_some();
+    let changed =
+        (stop.berth, stop.walk_pos, stop.dir) != (pose.berth, pose.sidewalk, pose.direction.xy());
+    if changed {
+        stop.pos = pose.berth;
+        stop.berth = pose.berth;
+        stop.walk_pos = pose.sidewalk;
+        stop.dir = pose.direction.xy();
+    }
+    changed || binding != platform || !had_pose
+}
+
+fn refresh_dependencies(
+    refresh: &mut RailRefresh,
+    rail: &mut RailTransit,
+    transit: &mut Transit,
+    map: &Map,
+    now: Tick,
+    remaining: &mut usize,
+) {
+    use std::ops::Bound::{Excluded, Unbounded};
+
+    let scan = &mut refresh.scan;
+    if !scan.platforms_done {
+        loop {
+            let lower = scan.platform.map_or(Unbounded, Excluded);
+            let Some((&id, &spec)) = rail.platforms.range((lower, Unbounded)).next() else {
+                scan.platforms_done = true;
+                break;
+            };
+            if *remaining < PLATFORM_REFRESH_WORK {
+                return;
             }
-            poses.insert(id, pose);
-            let stop = &mut transit.stops[id];
-            if (stop.berth, stop.walk_pos, stop.dir) != (pose.berth, pose.sidewalk, pose.direction.xy())
-            {
-                stop.pos = pose.berth;
-                stop.berth = pose.berth;
-                stop.walk_pos = pose.sidewalk;
-                stop.dir = pose.direction.xy();
-                changed.insert(id);
+            *remaining -= PLATFORM_REFRESH_WORK;
+            scan.platform = Some(id);
+            if refresh_platform(rail, transit, map, id, spec) {
+                refresh.changed.insert(id, ());
             }
-        } else if rail.poses.contains_key(&id) {
-            changed.insert(id);
         }
     }
-    rail.platforms.extend(remapped);
-    rail.poses = poses;
-    let affected: Vec<_> = rail.lines.iter().filter_map(|(&id, line)| {
-        let rebound = transit.lines[id].stops.iter().any(|stop| changed.contains(stop));
-        let stale = line.paths.iter().any(|&(traversal, stamp)| {
-            traversal_stamp(&map, traversal) != Some(stamp)
-        });
-        (rebound || stale).then_some(id)
-    }).collect();
-    for id in affected {
-        rail.pending_lines.insert(id, ());
-        transit.suspend(id, now);
+
+    while *remaining != 0 {
+        let lower = scan.line.map_or(Unbounded, Excluded);
+        let Some((&id, line)) = rail.lines.range((lower, Unbounded)).next() else {
+            refresh.dirty = false;
+            refresh.changed.clear();
+            rail.topology_dirty = false;
+            break;
+        };
+        let rebound = if scan.scanning != Some(id) {
+            scan.scanning = Some(id);
+            scan.traversal = 0;
+            *remaining -= 1;
+            transit.lines[id]
+                .stops
+                .iter()
+                .any(|stop| refresh.changed.contains_key(stop))
+        } else {
+            false
+        };
+        let mut stale = false;
+        if !rebound {
+            for &(traversal, stamp) in &line.paths[scan.traversal..] {
+                if *remaining == 0 {
+                    return;
+                }
+                *remaining -= 1;
+                scan.traversal += 1;
+                if traversal_stamp(map, traversal) != Some(stamp) {
+                    stale = true;
+                    break;
+                }
+            }
+        }
+        if rebound || stale {
+            rail.pending_lines.insert(id, ());
+            transit.suspend(id, now);
+        }
+        scan.line = Some(id);
+        scan.scanning = None;
     }
 }
 
-fn refresh_one_rail_line(
+impl LoopRefresh {
+    fn advance(
+        &mut self,
+        world: &crate::World,
+        map: &Map,
+        rail: &RailTransit,
+        line: &super::TransitLine,
+        now: Tick,
+        remaining: &mut usize,
+    ) -> std::task::Poll<Result<(), Rejection>> {
+        use std::ops::Bound::{Excluded, Unbounded};
+        use std::task::Poll;
+
+        let config = &rail.lines[&line.id];
+        while self.times.len() < line.stops.len() {
+            let index = self.times.len();
+            let from = line.stops[index];
+            let to = line.stops[(index + 1) % line.stops.len()];
+            let (Some(pose), Some(_)) = (rail.poses.get(&from), rail.poses.get(&to)) else {
+                return Poll::Ready(Err(Rejection::InvalidConnection));
+            };
+            let (from, to) = (rail.platforms[&from], rail.platforms[&to]);
+            if from.length < train_length(&config.consist)
+                || (from.lane == to.lane && from.offset >= to.offset)
+            {
+                return Poll::Ready(Err(Rejection::InvalidConnection));
+            }
+            if self.leg.is_none() {
+                let target = crate::map_dynamic::ItineraryTarget::DirectedLane(to.lane, to.offset);
+                match Itinerary::route_with_work(
+                    Tick(0),
+                    pose.berth,
+                    Some(from.lane),
+                    target,
+                    map,
+                    crate::map::PathKind::Rail,
+                    &mut self.search,
+                    remaining,
+                ) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(None) => return Poll::Ready(Err(Rejection::InvalidConnection)),
+                    Poll::Ready(Some(route)) => self.leg = Some(route),
+                }
+            }
+            let path = self.leg.as_ref().and_then(Itinerary::get_route).unwrap();
+            let steps = std::iter::once(&path.cur)
+                .chain(&path.reversed_route)
+                .skip(self.stamp_index);
+            for &step in steps {
+                if *remaining == 0 {
+                    return Poll::Pending;
+                }
+                *remaining -= 1;
+                if self.paths.len() == MAX_LOOP_TRAVERSALS {
+                    return Poll::Ready(Err(Rejection::RoadWorkLimit));
+                }
+                let Some(stamp) = traversal_stamp(map, step) else {
+                    return Poll::Ready(Err(Rejection::InvalidConnection));
+                };
+                self.paths.push((step, stamp));
+                self.stamp_index += 1;
+            }
+            let Some(time) = rail_leg_time(map, from, to, self.leg.as_ref().unwrap()) else {
+                return Poll::Ready(Err(Rejection::InvalidConnection));
+            };
+            self.times.push(time);
+            self.leg = None;
+            self.stamp_index = 0;
+        }
+
+        let lower = self.train.map_or(Unbounded, Excluded);
+        for (&id, run) in rail.runs.range((lower, Unbounded)) {
+            if *remaining == 0 {
+                return Poll::Pending;
+            }
+            if self.recovering != Some(id) {
+                self.search = None;
+                self.recovering = Some(id);
+            }
+            if run.line == line.id && run.close_at.is_none() && !run.braking_at_berth {
+                if let Some(train) = world.trains.get(id).filter(|train| train.it.is_missing()) {
+                    if let Some(from) = crate::souls::freight_station::train_lane(map, train) {
+                        let platform = rail.platforms[&line.stops[run.next_call]];
+                        let target = crate::map_dynamic::ItineraryTarget::DirectedLane(
+                            platform.lane,
+                            platform.offset,
+                        );
+                        match Itinerary::route_with_work(
+                            now,
+                            train.trans.pos,
+                            Some(from),
+                            target,
+                            map,
+                            crate::map::PathKind::Rail,
+                            &mut self.search,
+                            remaining,
+                        ) {
+                            Poll::Pending => return Poll::Pending,
+                            Poll::Ready(Some(route)) => self.recovered.push((id, route)),
+                            Poll::Ready(None) => {}
+                        }
+                    }
+                }
+            }
+            *remaining = remaining.saturating_sub(1);
+            self.train = Some(id);
+        }
+        Poll::Ready(Ok(()))
+    }
+}
+
+fn refresh_rail(
     world: &mut crate::World,
     resources: &crate::utils::resources::Resources,
     map: &Map,
     now: Tick,
 ) {
+    let mut refresh = resources.write::<RailRefresh>();
+    refresh.spent = 0;
     let mut rail = resources.write::<RailTransit>();
-    let Some((id, ())) = rail.pending_lines.pop_first() else {
+    if !refresh.dirty && rail.pending_lines.is_empty() {
+        refresh.build = None;
         return;
-    };
+    }
     let mut transit = resources.write::<Transit>();
-    let (Some(line), Some(config)) = (transit.lines.get(id), rail.lines.get(&id)) else {
-        return;
-    };
-    let Ok(route) = validate_loop(map, &rail.platforms, &line.stops, &config.consist) else {
-        return;
-    };
-    let config = rail.lines.get_mut(&id).unwrap();
-    config.pattern_revision += 1;
-    config.install_loop(route);
-    resources.write::<super::JourneyStats>().pattern_changed(id);
-    transit.lines[id].suspended = false;
-    transit.revision += 1;
-
-    // A rail itinerary can be invalidated while the train remains on a retained lane.
-    // Resume from measured live track when the directed path is available again.
-    let RailTransit {
-        runs, platforms, ..
-    } = &mut *rail;
-    for (&train_id, run) in runs {
-        let line = &transit.lines[run.line];
-        if run.line != id || line.suspended {
-            continue;
-        }
-        let Some(train) = world.trains.get_mut(train_id) else {
-            continue;
-        };
-        let stop = line.stops[run.next_call];
-        let platform = platforms[&stop];
-        let (lane, offset) = (platform.lane, platform.offset);
-        if run.close_at.is_none() && !run.braking_at_berth && train.it.is_missing() {
-            if let Some(from) = crate::souls::freight_station::train_lane(&map, train) {
-                if let Some(route) =
-                    Itinerary::route_rail(now, &map, train.trans.pos, from, lane, offset)
-                {
-                    train.it = route;
+    let mut remaining = RAIL_REFRESH_WORK_PER_TICK;
+    if refresh.dirty {
+        refresh_dependencies(
+            &mut refresh,
+            &mut rail,
+            &mut transit,
+            map,
+            now,
+            &mut remaining,
+        );
+    }
+    if !refresh.dirty {
+        while remaining != 0 {
+            let Some((&id, ())) = rail.pending_lines.first_key_value() else {
+                break;
+            };
+            let (_, mut build) = refresh
+                .build
+                .take()
+                .filter(|(previous, _)| *previous == id)
+                .unwrap_or_else(|| (id, LoopRefresh::default()));
+            match build.advance(world, map, &rail, &transit.lines[id], now, &mut remaining) {
+                std::task::Poll::Pending => {
+                    refresh.build = Some((id, build));
+                    break;
+                }
+                std::task::Poll::Ready(result) => {
+                    rail.pending_lines.remove(&id);
+                    if result.is_err() {
+                        continue;
+                    }
+                }
+            }
+            let config = rail.lines.get_mut(&id).unwrap();
+            config.pattern_revision += 1;
+            config.install_loop(RailLoop {
+                times: build.times,
+                paths: build.paths,
+            });
+            resources.write::<super::JourneyStats>().pattern_changed(id);
+            transit.lines[id].suspended = false;
+            transit.revision += 1;
+            for (train, itinerary) in build.recovered {
+                if let (Some(run), Some(entity)) = (
+                    rail.runs.get_mut(&train),
+                    world
+                        .trains
+                        .get_mut(train)
+                        .filter(|train| train.it.is_missing()),
+                ) {
+                    entity.it = itinerary;
                     run.leg_started = now;
                 }
             }
         }
     }
+    refresh.spent = RAIL_REFRESH_WORK_PER_TICK - remaining;
 }
 
 impl RailTransit {
@@ -996,7 +1247,7 @@ impl RailTransit {
                     if segment.src.z.min(segment.dst.z) <= max_z
                         && segment.src.z.max(segment.dst.z) >= min_z
                         && connector.distance(&Segment::new(segment.src.xy(), segment.dst.xy()))
-                            <= width * 0.5
+                            <= width * 0.5 + 0.25
                     {
                         return Err(Rejection::OccupiedTrack);
                     }
@@ -1146,6 +1397,7 @@ pub(crate) fn validate_rail_snapshot(sim: &Simulation) -> Result<(), &'static st
     }) {
         return Err("Invalid saved passenger rail refresh");
     }
+    rail.topology_dirty = sim.read::<RailRefresh>().dirty;
     let mut poses = BTreeMap::new();
     for (&stop, platform) in &rail.platforms {
         let site = transit.stops.get(stop).ok_or("Missing saved passenger rail stop")?;
@@ -1165,7 +1417,7 @@ pub(crate) fn validate_rail_snapshot(sim: &Simulation) -> Result<(), &'static st
             {
                 poses.insert(stop, pose);
             }
-            _ if rail.lines.keys().any(|&id| {
+            _ if !rail.topology_dirty && rail.lines.keys().any(|&id| {
                 transit.lines.get(id).is_some_and(|line| !line.suspended && line.stops.contains(&stop))
             }) => return Err("Invalid or unauthorized active passenger platform"),
             _ => {}

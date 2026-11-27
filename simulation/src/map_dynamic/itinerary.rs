@@ -1,5 +1,6 @@
 use crate::map::{
-    Lane, LaneID, Map, PathKind, Pathfinder, RoadID, Traversable, TraverseDirection, TraverseKind,
+    Lane, LaneID, Map, PathKind, Pathfinder, RoadID, RouteSearch, Traversable, TraverseDirection,
+    TraverseKind,
 };
 use crate::map_dynamic::transit::elapsed_ticks;
 use crate::map_dynamic::ParkingManagement;
@@ -463,6 +464,19 @@ impl Itinerary {
         map: &Map,
         pathkind: PathKind,
     ) -> Option<Itinerary> {
+        Self::route_from_using(start, start_lane, target, map, pathkind, |cur, end_lane| {
+            pathkind.path(map, tick, cur, end_lane)
+        })
+    }
+
+    fn route_from_using(
+        start: Vec3,
+        start_lane: LaneID,
+        target: ItineraryTarget,
+        map: &Map,
+        pathkind: PathKind,
+        path: impl FnOnce(Traversable, LaneID) -> Option<Vec<Traversable>>,
+    ) -> Option<Itinerary> {
         let (end_lane, end) = match target {
             ItineraryTarget::Position(end) => (pathkind.nearest_lane(map, end)?, end),
             ItineraryTarget::DirectedLane(lane, offset) => (
@@ -503,8 +517,7 @@ impl Itinerary {
             }
         }
 
-        let mut reversed_route: Vec<Traversable> = pathkind
-            .path(map, tick, cur, end_lane)?
+        let mut reversed_route: Vec<Traversable> = path(cur, end_lane)?
             .into_iter()
             .rev()
             .collect();
@@ -550,6 +563,85 @@ impl Itinerary {
 
         it.prepend_local_path([proj + dir * 3.5].iter().copied());
         Some(it)
+    }
+
+    pub(crate) fn route_with_work(
+        tick: Tick,
+        start: Vec3,
+        start_lane: Option<LaneID>,
+        target: ItineraryTarget,
+        map: &Map,
+        kind: PathKind,
+        search: &mut Option<RouteSearch>,
+        remaining: &mut usize,
+    ) -> std::task::Poll<Option<Self>> {
+        use std::task::Poll;
+
+        if search.is_none() {
+            if *remaining == 0 {
+                return Poll::Pending;
+            }
+            *remaining -= 1;
+        }
+        let Some(start_lane) = start_lane.or_else(|| kind.nearest_lane(map, start)) else {
+            return Poll::Ready(None);
+        };
+        let mut deferred = false;
+        let route =
+            Self::route_from_using(start, start_lane, target, map, kind, |cur, end_lane| {
+                if search.is_none() {
+                    *search = RouteSearch::new(map, tick, kind, cur, end_lane);
+                }
+                match search.as_mut()?.advance(map, remaining) {
+                    Poll::Pending => {
+                        deferred = true;
+                        None
+                    }
+                    Poll::Ready(path) => path,
+                }
+            });
+        if deferred {
+            Poll::Pending
+        } else {
+            *search = None;
+            Poll::Ready(route)
+        }
+    }
+
+    pub(super) fn proves_pedestrian_route(&self, start: Vec3, end: Vec3, map: &Map) -> bool {
+        let ItineraryKind::Route(saved, PathKind::Pedestrian) = &self.kind else {
+            return false;
+        };
+        let kind = PathKind::Pedestrian;
+        let Some(start_lane) = kind.nearest_lane(map, start) else {
+            return false;
+        };
+        let target = ItineraryTarget::Position(end);
+        let proved =
+            Self::route_from_using(start, start_lane, target, map, kind, |cur, end_lane| {
+                if saved.cur.kind != cur.kind
+                    || saved.reversed_route.first()?.kind != TraverseKind::Lane(end_lane)
+                {
+                    return None;
+                }
+                let mut path = vec![cur];
+                if saved.cur != cur {
+                    path.push(saved.cur);
+                }
+                path.extend(saved.reversed_route.iter().rev().copied());
+                path.windows(2)
+                    .all(|pair| crate::map::live_pedestrian_step(map, pair[0], pair[1]))
+                    .then_some(path)
+            });
+        let Some(proved) = proved else {
+            return false;
+        };
+        let route = proved.get_route().unwrap();
+        route.cur == saved.cur
+            && route.target == saved.target
+            && route.end_pos == saved.end_pos
+            && route.reversed_route == saved.reversed_route
+            && proved.reversed_local_path == self.reversed_local_path
     }
 
     fn advance(&mut self, map: &Map, position: Vec3, track_road_entries: bool) -> Option<Vec3> {

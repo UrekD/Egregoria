@@ -649,6 +649,17 @@ pub(crate) fn prepare_upgrade(
             Vec::new(),
         )
     };
+    if projected_topology.is_some() {
+        let rail = sim.read::<crate::map_dynamic::transit::RailTransit>();
+        if rail.has_occupied_runs() {
+            rail.check_egress_crossing(
+                &sim.read::<crate::map_dynamic::Transit>(),
+                &deck,
+                pattern.width(),
+                budget,
+            )?;
+        }
+    }
     let cost = if same_geometry && lane_edits.is_empty() {
         Money::ZERO
     } else {

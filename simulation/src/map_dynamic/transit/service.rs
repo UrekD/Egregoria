@@ -424,7 +424,7 @@ pub fn transit_board_update(world: &mut World, resources: &mut Resources) {
         }
     }
 
-    for (&id, run) in &rail.runs {
+    for (&id, run) in rail.runs.iter().filter(|_| !rail.topology_dirty) {
         let (Some(line), Some(config), Some(train)) = (
             transit.lines.get(run.line),
             rail.lines.get(&run.line),
