@@ -1180,16 +1180,20 @@ impl Router {
 
     /// Whether a planned or current step uses the vehicle.
     fn plans_with(&self, id: VehicleID) -> bool {
+        self.step_vehicles().any(|vehicle| vehicle == id)
+    }
+
+    pub(crate) fn step_vehicles(&self) -> impl Iterator<Item = VehicleID> + '_ {
         self.steps
             .iter()
             .chain(self.cur_step.iter())
-            .any(|step| match *step {
+            .filter_map(|step| match *step {
                 RoutingStep::DriveTo(vehicle, _)
                 | RoutingStep::Park(vehicle, _)
                 | RoutingStep::Unpark(vehicle)
                 | RoutingStep::GetInVehicle(vehicle)
-                | RoutingStep::GetOutVehicle(vehicle) => vehicle == id,
-                _ => false,
+                | RoutingStep::GetOutVehicle(vehicle) => Some(vehicle),
+                _ => None,
             })
     }
 
