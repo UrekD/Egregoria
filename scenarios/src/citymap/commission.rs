@@ -4589,6 +4589,57 @@ mod tests {
     use prototypes::TICKS_PER_HOUR;
 
     #[test]
+    fn citymap_wet_freight_dispatches_from_its_authored_market() {
+        use crate::citymap::{
+            build_wet_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,
+            DEFAULT_LESCE, DEFAULT_SAVA,
+        };
+        use simulation::economy::cargo::{FreightStage, FreightTrace};
+
+        let inputs = read_inputs(SourcePaths {
+            lesce: Path::new(DEFAULT_LESCE),
+            sava: Some(Path::new(DEFAULT_SAVA)),
+        })
+        .unwrap();
+        let mut plan = plan_town(&inputs, TownConfig::wet(), SpacingLimits::default()).unwrap();
+        configure_commissioned_network(&mut plan);
+        let (mut sim, _, freight) = build_wet_town(&mut plan).unwrap();
+        let mut schedule = Simulation::schedule();
+        sim.tick(&mut schedule, []);
+        let station = sim.world().freight_stations.keys().next().unwrap();
+        // Isolate dispatch geometry from the time needed to grow and staff the town.
+        sim.world_mut_unchecked().freight_stations[station].f.waiting_cargo = 10;
+        advance(&mut sim, &mut schedule, SAMPLE_TICKS);
+        {
+            let station = sim.get(station).unwrap();
+            let train = sim.get(freight.train).unwrap();
+            let map = sim.map();
+            let market = &map.buildings()[freight.market];
+            let stop = train_stop(&station.trans);
+            let berth = map.nearest_lane(stop, LaneKind::Rail, Some(50.0))
+                .map(|lane| map.lanes()[lane].points.project(stop));
+            assert!(
+                station.f.trains.iter().any(|&(train, _)| train == freight.train),
+                "no call for train at {:?} from market {:?} to platform {stop:?} on rail {berth:?}",
+                train.trans.pos,
+                market.obb.center().z(market.height),
+            );
+        }
+
+        advance(&mut sim, &mut schedule, 2 * TICKS_PER_HOUR);
+        let report = sim.read::<FreightTrace>().corridor_report(freight.market);
+        assert!(
+            report.rows.iter().any(|record| {
+                record.stage == FreightStage::Exited
+                    && record.fragment.units == 10
+                    && record.fragment.call.is_some_and(|call| call.train == freight.train)
+            }),
+            "the wet freight train did not return to its market: {:?}",
+            report.rows,
+        );
+    }
+
+    #[test]
     fn citymap_wet_frontage_serves_homes_and_leaves_infill() {
         use crate::citymap::{
             build_wet_town, plan_town, read_inputs, SourcePaths, SpacingLimits, TownConfig,

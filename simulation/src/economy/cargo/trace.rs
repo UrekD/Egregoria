@@ -171,18 +171,19 @@ pub(crate) struct RailAnchor {
 
 impl RailAnchor {
     pub fn near(map: &Map, hint: Vec3) -> Option<Self> {
-        let lane = map.nearest_lane(hint, LaneKind::Rail, Some(50.0))?;
+        const SNAP_RADIUS: f32 = 50.0;
+        let lane = map.nearest_lane(hint, LaneKind::Rail, Some(SNAP_RADIUS))?;
         let track = &map.get(lane)?.points;
         let offset = track.length_at_proj(track.project(hint));
         let (position, dir) = track.point_dir_along(offset);
-        (position.xy().distance(hint.xy()) <= 50.0 && (position.z - hint.z).abs() < 4.0).then_some(
-            Self {
-                lane,
-                offset,
-                position,
-                dir,
-            },
-        )
+        // Terminals and outside markets are sited on the ground beside or
+        // below the rails. Measure reach to the actual track in three dimensions.
+        (position.distance2(hint) <= SNAP_RADIUS * SNAP_RADIUS).then_some(Self {
+            lane,
+            offset,
+            position,
+            dir,
+        })
     }
 
     fn well_formed(self) -> bool {

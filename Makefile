@@ -19,6 +19,14 @@ test-sim:
 
 scenarios:
 	cargo run --locked -p scenarios --release -- all
+	$(MAKE) citymap-gate
+
+.PHONY: citymap-gate
+citymap-gate:
+	@set -eu; \
+	root=$$(mktemp -d "$${TMPDIR:-/tmp}/egr-citymap-gate.XXXXXX"); \
+	trap 'rm -rf -- "$$root"' EXIT; \
+	EGR_CITYMAP_PUBLISHED= scripts/build-windows-with-slots.sh --release-slots "$$root/world" "$(CARGO_TARGET_DIR)"
 
 # Windows zip (cross-compiled; see scripts/build-windows.sh for prerequisites).
 # WINDOWS_SLOTS=<dir> bundles save slots, e.g. WINDOWS_SLOTS=world after make demo-cities osm-lesce.
