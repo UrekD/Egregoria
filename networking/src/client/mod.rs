@@ -402,12 +402,22 @@ impl<W: DeserializeOwned, I: Serialize + DeserializeOwned + Default> Client<W, I
 #[cfg(test)]
 #[test]
 fn p7_ingress_rejects_released_p6_handshake() {
+    assert_legacy_handshake_rejected("0.11.1");
+}
+
+#[cfg(test)]
+#[test]
+fn pathpark_w3_rejects_commands_4_handshake() {
+    assert_legacy_handshake_rejected("0.12.0+commands.4");
+}
+
+#[cfg(test)]
+fn assert_legacy_handshake_rejected(floor: &str) {
     use crate::{Server, ServerConfiguration, ServerPollResult};
     use std::net::{Ipv4Addr, TcpListener};
     use std::time::{Duration, Instant};
 
     let release = include_str!("../../../VERSION");
-    let floor = "0.11.1";
     let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
         .unwrap()
         .local_addr()
@@ -430,7 +440,7 @@ fn p7_ingress_rejects_released_p6_handshake() {
         version: floor.into(),
     })
     .unwrap();
-    // P6 sends its release string verbatim in the unchanged Connect packet.
+    // Reproduce the older value sent verbatim in the Connect packet.
     peer.version = floor.into();
 
     let deadline = Instant::now() + Duration::from_secs(10);

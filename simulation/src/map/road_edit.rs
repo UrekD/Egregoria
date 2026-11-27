@@ -858,6 +858,47 @@ fn prepare_same_width_directions(
     )))
 }
 
+fn service_path_survives(
+    map: &Map,
+    from: (LaneID, f32),
+    to: (LaneID, f32),
+    removed: &[LaneID],
+    budget: &mut PrepareBudget,
+) -> Result<bool, Rejection> {
+    use std::collections::{BTreeSet, VecDeque};
+
+    if removed.contains(&from.0) || removed.contains(&to.0) {
+        return Ok(false);
+    }
+    if from.0 == to.0 && from.1 <= to.1 {
+        return Ok(true);
+    }
+    let mut visited = BTreeSet::from([from.0]);
+    let mut frontier = VecDeque::from([from.0]);
+    while let Some(lane) = frontier.pop_front() {
+        budget.spend_road_work(1)?;
+        let joint = map.get(map.get(lane).ok_or(Rejection::MissingReference)?.dst)
+            .ok_or(Rejection::MissingReference)?;
+        for turn in joint.raw_turns() {
+            budget.spend_road_work(1)?;
+            if turn.id.src != lane
+                || turn.kind != super::TurnKind::Driving
+                || removed.contains(&turn.id.dst)
+                || !map.allows_turn(turn.id)
+            {
+                continue;
+            }
+            if turn.id.dst == to.0 {
+                return Ok(true);
+            }
+            if visited.insert(turn.id.dst) {
+                frontier.push_back(turn.id.dst);
+            }
+        }
+    }
+    Ok(false)
+}
+
 fn verify_direction_handoff(
     sim: &Simulation,
     road: &Road,
@@ -875,13 +916,26 @@ fn verify_direction_handoff(
             return Err(Rejection::BusyConflict);
         }
     }
+    let map = sim.map();
+    for line in transit.lines.values().filter(|line| !line.suspended) {
+        budget.spend_road_work(line.stops.len())?;
+        for (&from, &to) in line.stops.iter().zip(line.stops.iter().cycle().skip(1)) {
+            let Some((from, to)) = transit.stored_stop_lane(from).zip(transit.stored_stop_lane(to)) else {
+                continue;
+            };
+            if !service_path_survives(&map, from, to, removed, budget)?
+                && service_path_survives(&map, from, to, &[], budget)?
+            {
+                return Err(Rejection::BusyConflict);
+            }
+        }
+    }
     let vehicles = &sim.world().vehicles;
     budget.spend_road_work(vehicles.len())?;
     let affected = |kind| match kind {
         TraverseKind::Lane(id) => removed.contains(&id),
         TraverseKind::Turn(turn) => turn.parent == road.src || turn.parent == road.dst,
     };
-    let map = sim.map();
     for (_, vehicle) in vehicles.iter() {
         if matches!(
             vehicle.it.target(),
