@@ -1422,9 +1422,10 @@ impl Market {
                 candidates.push(Candidate {
                     throttled: self.reserved_this_tick.contains(&seller),
                     // Retail can cover missing groceries after the goods need is met.
+                    // Pantry stock can shrink the fallback order below a full fill.
                     full_local_basket: at_home
                         && preferred == Some(seller)
-                        && goods == goods_target,
+                        && food + goods >= request.staples + request.goods,
                     seller,
                     pos,
                     distance,
