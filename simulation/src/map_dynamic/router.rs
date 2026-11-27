@@ -1,4 +1,6 @@
-use super::property_walk::{ParkingWalkPlan, ParkingWalkSearch, WalkResult};
+use super::property_walk::{
+    LegacyWalkPlan, LegacyWalkSearch, ParkingWalkPlan, ParkingWalkSearch, WalkResult,
+};
 use crate::economy::{on_arrival, on_cancel, on_start, TripMode, TripProgress, TripPurpose};
 use crate::map::building_parking::BuildingParking;
 use crate::map::{BuildingID, Map, ParkingSpotID, PathKind, Pathfinder, TraverseDirection};
@@ -53,6 +55,7 @@ pub(crate) struct PendingPropertySearch {
     )]
     checked: Vec<ParkingCandidate>,
     pickup: Option<ParkingWalkPlan>,
+    selection: ParkingSelection,
     stage: ParkingSearchStage,
 }
 
@@ -79,7 +82,52 @@ impl From<LegacyPendingPropertySearch> for PendingPropertySearch {
             work_left: old.work_left,
             checked: old.checked,
             pickup: None,
+            selection: ParkingSelection::default(),
             stage: ParkingSearchStage::Drive(old.candidate, old.drive, None),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct LegacyStagedPropertySearch {
+    target: Destination,
+    car: VehicleID,
+    expires: Tick,
+    work_left: usize,
+    #[serde(
+        deserialize_with = "crate::world_command::bounded_command_vec::<_, _, PROPERTY_FEASIBILITY_CHECKS>"
+    )]
+    checked: Vec<ParkingCandidate>,
+    #[serde(rename = "pickup")]
+    _pickup: Option<LegacyWalkPlan>,
+    stage: LegacySearchStage,
+}
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+enum LegacySearchStage {
+    Pickup(LegacyWalkSearch),
+    Egress(ParkingCandidate, LegacyWalkSearch),
+    Drive(ParkingCandidate, DirectedSearch, Option<LegacyWalkPlan>),
+}
+
+impl From<LegacyStagedPropertySearch> for PendingPropertySearch {
+    fn from(old: LegacyStagedPropertySearch) -> Self {
+        Self {
+            target: old.target,
+            car: old.car,
+            expires: old.expires,
+            work_left: old.work_left,
+            checked: old.checked,
+            pickup: None,
+            selection: ParkingSelection::default(),
+            stage: match old.stage {
+                LegacySearchStage::Pickup(_) => ParkingSearchStage::Selection,
+                LegacySearchStage::Egress(candidate, _) => ParkingSearchStage::Retry(candidate),
+                LegacySearchStage::Drive(candidate, drive, _) => {
+                    ParkingSearchStage::Drive(candidate, drive, None)
+                }
+            },
         }
     }
 }
@@ -89,13 +137,60 @@ enum ParkingSearchStage {
     Pickup(ParkingWalkSearch),
     Egress(ParkingCandidate, ParkingWalkSearch),
     Drive(ParkingCandidate, DirectedSearch, Option<ParkingWalkPlan>),
+    Selection,
+    Retry(ParkingCandidate),
+}
+
+#[derive(Default, Serialize, Deserialize)]
+struct ParkingSelection {
+    allow_shared: Option<bool>,
+    source: ParkingSource,
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 3>")]
+    nearby: Vec<ParkingCandidate>,
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, 8>")]
+    street: Vec<ParkingSpotID>,
+}
+
+impl ParkingSelection {
+    fn valid(&self) -> bool {
+        let shared = self.allow_shared == Some(true);
+        (shared || self.street.is_empty())
+            && match self.source {
+                ParkingSource::Curb => {
+                    shared
+                        && self
+                            .nearby
+                            .iter()
+                            .all(|candidate| matches!(candidate, ParkingCandidate::Bay(_)))
+                }
+                ParkingSource::Garages => self
+                    .nearby
+                    .iter()
+                    .all(|candidate| matches!(candidate, ParkingCandidate::Facility(_))),
+                _ => self.nearby.is_empty(),
+            }
+    }
+}
+
+#[derive(Default, Serialize, Deserialize)]
+enum ParkingSource {
+    #[default]
+    Property,
+    DiscoverCurb,
+    Curb,
+    DiscoverGarages,
+    Garages,
+    Street,
+    Done,
 }
 
 impl ParkingSearchStage {
     fn candidate(&self) -> Option<ParkingCandidate> {
         match *self {
-            Self::Pickup(_) => None,
-            Self::Egress(candidate, _) | Self::Drive(candidate, ..) => Some(candidate),
+            Self::Pickup(_) | Self::Selection => None,
+            Self::Egress(candidate, _) | Self::Drive(candidate, ..) | Self::Retry(candidate) => {
+                Some(candidate)
+            }
         }
     }
 }
@@ -109,27 +204,69 @@ impl PendingPropertySearch {
             && !router.walk_only_pickup
     }
 
-    pub(crate) fn validate(&self, map: &Map) -> bool {
-        self.work_left <= PROPERTY_WORK_PER_INTENT - PROPERTY_WORK_PER_SLICE
-            && self.stage.candidate().is_none_or(|candidate| self.checked.contains(&candidate))
-            && self
+    pub(crate) fn validate(&mut self, map: &Map) -> bool {
+        let pickup_work = self.pickup.as_ref().map_or(0, ParkingWalkPlan::spent);
+        let stage_work = match &self.stage {
+            ParkingSearchStage::Pickup(walk) | ParkingSearchStage::Egress(_, walk) => walk.spent(),
+            ParkingSearchStage::Drive(_, _, egress) => {
+                egress.as_ref().map_or(0, ParkingWalkPlan::spent)
+            }
+            ParkingSearchStage::Selection | ParkingSearchStage::Retry(_) => 0,
+        };
+        if self.work_left > PROPERTY_WORK_PER_INTENT
+            || !self.selection.valid()
+            || pickup_work.saturating_add(stage_work) > PROPERTY_WORK_PER_INTENT - self.work_left
+            || self
+                .stage
+                .candidate()
+                .is_some_and(|candidate| !self.checked.contains(&candidate))
+            || self
                 .checked
                 .iter()
                 .enumerate()
-                .all(|(i, candidate)| !self.checked[..i].contains(candidate))
-            && self.pickup.as_ref().is_none_or(|plan| plan.validate_loaded(map))
-            && match &self.stage {
-                ParkingSearchStage::Pickup(walk) => self.pickup.is_none() && walk.validate_loaded(map),
-                ParkingSearchStage::Egress(_, walk) => walk.validate_loaded(map),
-                ParkingSearchStage::Drive(_, drive, egress) => {
-                    drive.validate_loaded(map, None)
-                        && egress.as_ref().is_none_or(|plan| plan.validate_loaded(map))
+                .any(|(i, candidate)| self.checked[..i].contains(candidate))
+            || (matches!(self.stage, ParkingSearchStage::Pickup(_)) && self.pickup.is_some())
+        {
+            return false;
+        }
+
+        if self
+            .pickup
+            .as_mut()
+            .is_some_and(|plan| !plan.validate_loaded(map))
+        {
+            self.pickup = None;
+        }
+        match &mut self.stage {
+            ParkingSearchStage::Pickup(walk) => {
+                if !walk.validate_loaded(map) {
+                    self.stage = ParkingSearchStage::Selection;
                 }
             }
+            ParkingSearchStage::Egress(candidate, walk) => {
+                if !walk.validate_loaded(map) {
+                    self.stage = ParkingSearchStage::Retry(*candidate);
+                }
+            }
+            ParkingSearchStage::Drive(_, drive, egress) => {
+                if !drive.validate_loaded(map, None) {
+                    return false;
+                }
+                if egress
+                    .as_mut()
+                    .is_some_and(|plan| !plan.validate_loaded(map))
+                {
+                    *egress = None;
+                }
+            }
+            _ => {}
+        }
+        true
     }
 }
 
 struct PropertyBudget {
+    selection: ParkingSelection,
     checked: Vec<ParkingCandidate>,
     pickup: Option<ParkingWalkPlan>,
     work_left: usize,
@@ -146,6 +283,7 @@ impl PropertyBudget {
         let expires = Tick(now.0.saturating_add(PROPERTY_SEARCH_DEADLINE));
         let Some(pending) = pending else {
             return Self {
+                selection: ParkingSelection::default(),
                 checked: Vec::new(),
                 pickup: None,
                 work_left: PROPERTY_WORK_PER_INTENT,
@@ -160,6 +298,7 @@ impl PropertyBudget {
         let expired = now >= pending.expires;
         let slice = pending.work_left.min(PROPERTY_WORK_PER_SLICE);
         Self {
+            selection: pending.selection,
             checked: pending.checked,
             pickup: pending.pickup,
             work_left: pending.work_left,
@@ -182,8 +321,12 @@ impl PropertyBudget {
         if self.checked.contains(&candidate) {
             return None;
         }
-        if self.checked.len() == PROPERTY_FEASIBILITY_CHECKS || self.work == 0 {
+        if self.checked.len() == PROPERTY_FEASIBILITY_CHECKS {
             self.exhausted = true;
+            return None;
+        }
+        if self.work == 0 {
+            self.defer(ParkingSearchStage::Selection);
             return None;
         }
         self.checked.push(candidate);
@@ -234,7 +377,7 @@ impl PropertyBudget {
     }
 
     fn defer(&mut self, stage: ParkingSearchStage) {
-        if self.work_left > self.slice {
+        if !self.exhausted && self.work_left > self.slice {
             self.deferred = Some(stage);
         } else {
             self.exhausted = true;
@@ -299,6 +442,7 @@ impl PropertyBudget {
             work_left: self.work_left - (self.slice - self.work),
             checked: std::mem::take(&mut self.checked),
             pickup: self.pickup.take(),
+            selection: std::mem::take(&mut self.selection),
             stage,
         })
     }
@@ -735,7 +879,7 @@ fn routing_changed(
             .as_mut()
             .and_then(|budget| budget.suspend(dest, router.personal_car))
         {
-            driveways.properties.suspend_search(id, pending);
+            suspend_property_route(id, h, &mut driveways.properties, pending);
             return;
         }
         if matches!(route, Err(RouterError::ReservingParkingSpot(_))) {
@@ -811,6 +955,21 @@ fn routing_changed(
 
         router.steps.reverse();
     });
+}
+
+fn suspend_property_route(
+    id: HumanID,
+    human: &mut HumanEnt,
+    properties: &mut BuildingParking,
+    pending: PendingPropertySearch,
+) {
+    if human.location == Location::Outside {
+        // The itinerary phase follows routing. Stop the discarded route
+        // before it can move the origin of the admitted pickup search.
+        human.it = Itinerary::NONE;
+        human.speed.0 = 0.0;
+    }
+    properties.suspend_search(id, pending);
 }
 
 // Both GoHome and DepositAtHome use the Home purpose.
@@ -1938,6 +2097,7 @@ impl Router {
             .filter(|car| self.vehicle == Some(*car) && !self.walk_only_pickup)?;
         let actor = cars.get(car)?;
         let source = properties.parked_at(car);
+        let allow_shared = *budget.selection.allow_shared.get_or_insert(allow_shared);
         let mut steps = Vec::new();
         let pedestrian = if let Location::Building(id) = *location {
             steps.push(RoutingStep::GetOutBuilding(id));
@@ -2033,35 +2193,80 @@ impl Router {
             _ => None,
         };
         budget.previous = None;
-        if selected.is_none() && budget.deferred.is_none() {
-            selected = building
-                .filter(|_| !retry)
-                .and_then(|site| garage(site, properties, budget));
-        }
-        let mut street = Vec::new();
-        if selected.is_none() && budget.deferred.is_none() && allow_shared {
-            // Check reachability before taking the curb reservation, using the lane
-            // alongside the bay so a parallel road cannot supply the approach.
-            let (curb, other_streets) =
-                parking.property_curb_candidates(map, destination, &mut budget.work);
-            street = other_streets;
-            selected = curb
-                .into_iter()
-                .take(3)
-                .find_map(|spot| bay(spot, parking, budget));
-        }
-        if selected.is_none() && budget.deferred.is_none() {
-            selected = properties
-                .nearby_public_garages(destination, if allow_shared { 16 } else { 64 })
-                .into_iter()
-                .filter(|&site| Some(site) != building)
-                .take(3)
-                .find_map(|site| garage(site, properties, budget));
-        }
-        if selected.is_none() {
-            selected = street
-                .into_iter()
-                .find_map(|spot| bay(spot, parking, budget));
+        while selected.is_none() && budget.deferred.is_none() && !budget.exhausted {
+            if budget.work == 0 {
+                budget.defer(ParkingSearchStage::Selection);
+                break;
+            }
+            match budget.selection.source {
+                ParkingSource::Property => {
+                    budget.selection.source = if allow_shared {
+                        ParkingSource::DiscoverCurb
+                    } else {
+                        ParkingSource::DiscoverGarages
+                    };
+                    selected = building
+                        .filter(|_| !retry)
+                        .and_then(|site| garage(site, properties, budget));
+                }
+                ParkingSource::DiscoverCurb => {
+                    // The bounded curb scan uses up to 192 projection and 48
+                    // bay units. Keep its ranking whole when another slice exists.
+                    if budget.work < 240 && budget.work_left > budget.slice {
+                        budget.defer(ParkingSearchStage::Selection);
+                        break;
+                    }
+                    let (curb, street) =
+                        parking.property_curb_candidates(map, destination, &mut budget.work);
+                    budget.selection.nearby = curb
+                        .into_iter()
+                        .take(3)
+                        .map(ParkingCandidate::Bay)
+                        .collect();
+                    budget.selection.nearby.reverse();
+                    budget.selection.street = street;
+                    budget.selection.street.reverse();
+                    budget.selection.source = ParkingSource::Curb;
+                }
+                ParkingSource::Curb | ParkingSource::Garages => {
+                    match budget.selection.nearby.pop() {
+                        Some(ParkingCandidate::Bay(spot)) => selected = bay(spot, parking, budget),
+                        Some(ParkingCandidate::Facility(site)) => {
+                            if properties.is_public_garage(site) {
+                                selected = garage(site, properties, budget);
+                            }
+                        }
+                        None => {
+                            budget.selection.source =
+                                if matches!(budget.selection.source, ParkingSource::Curb) {
+                                    ParkingSource::DiscoverGarages
+                                } else {
+                                    ParkingSource::Street
+                                };
+                        }
+                    }
+                }
+                ParkingSource::DiscoverGarages => {
+                    let limit = if allow_shared { 16 } else { 64 };
+                    budget.selection.nearby = properties
+                        .nearby_public_garages(destination, limit)
+                        .into_iter()
+                        .filter(|&site| Some(site) != building)
+                        .take(3)
+                        .map(ParkingCandidate::Facility)
+                        .collect();
+                    budget.selection.nearby.reverse();
+                    budget.selection.source = ParkingSource::Garages;
+                }
+                ParkingSource::Street => {
+                    if let Some(spot) = budget.selection.street.pop() {
+                        selected = bay(spot, parking, budget);
+                    } else {
+                        budget.selection.source = ParkingSource::Done;
+                    }
+                }
+                ParkingSource::Done => break,
+            }
         }
         let Some((plan, park, egress)) = selected else {
             return fallback();
@@ -2254,6 +2459,192 @@ mod tests {
     use prototypes::{ItemID, Money};
 
     #[test]
+    fn pathpark_fix_candidate_boundary_preserves_lifetime_budget() {
+        let (ctx, roads, _) = crate::tests::pathpark_lifecycle::road_chain(1);
+        let map = ctx.g.map();
+        let sidewalk = map.roads()[roads[0]]
+            .lanes_iter()
+            .find(|&(_, kind)| kind == LaneKind::Walking)
+            .unwrap()
+            .0;
+        let door = map.lanes()[sidewalk].points.middle();
+        let unreachable = door + Vec3::Y * 1_000.0;
+        let lane = map.roads()[roads[0]]
+            .lanes_iter()
+            .find(|&(_, kind)| kind == LaneKind::Driving)
+            .unwrap()
+            .0;
+        let from = DirectedEndpoint {
+            lane,
+            offset_cm: 100,
+        };
+        let to = DirectedEndpoint {
+            lane,
+            offset_cm: 200,
+        };
+        let target = Destination::Outside(door);
+        let first = ParkingCandidate::Facility(BuildingID::default());
+        let second = ParkingCandidate::Bay(ParkingSpotID::default());
+        let mut budget = PropertyBudget::new(Tick(20), None);
+        let mut work = PROPERTY_WORK_PER_SLICE;
+        assert!(matches!(
+            ParkingWalkSearch::new(&map, door, unreachable).advance(&map, &mut work),
+            WalkResult::Unavailable
+        ));
+        budget.slice = PROPERTY_WORK_PER_SLICE - work + 1;
+        budget.work = budget.slice;
+        budget.check(first).unwrap();
+        assert!(budget
+            .candidate_route(&map, from, to, first, door, unreachable)
+            .is_none());
+        assert_eq!(budget.work, 0);
+        assert!(budget.check(second).is_none());
+        let pending = budget
+            .suspend(target, Some(VehicleID::default()))
+            .expect("the next candidate must survive the slice boundary");
+        let mut pending: PendingPropertySearch =
+            Bincode::decode(&Bincode::encode(&pending).unwrap()).unwrap();
+        assert!(pending.validate(&map));
+        assert_eq!(pending.expires, Tick(84));
+        let mut resumed = PropertyBudget::new(Tick(21), Some(pending));
+        assert!(resumed.check(first).is_none());
+        resumed.check(second).unwrap();
+        assert!(resumed
+            .candidate_route(&map, from, to, second, door, door)
+            .is_some());
+    }
+
+    #[test]
+    fn pathpark_fix_moving_pickup_resumes_across_itinerary_phase() {
+        let mut ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(100., 100., 0.), vec3(350., 100., 0.)]);
+        let house = ctx.build_house_near(vec2(220., 120.));
+        let id = spawn_human(&mut ctx.g, house).unwrap();
+        let (start, gate, full_cost) = {
+            let map = ctx.g.map();
+            let points = &map
+                .lanes()
+                .values()
+                .find(|lane| lane.kind == LaneKind::Walking)
+                .unwrap()
+                .points;
+            let start = points.middle();
+            let gate = start + Vec3::X;
+            let mut budget = PropertyBudget::new(Tick(20), None);
+            budget.prepare_pickup(&map, start, gate).unwrap();
+            (start, gate, PROPERTY_WORK_PER_SLICE - budget.work)
+        };
+
+        let mut first = PropertyBudget::new(Tick(20), None);
+        // Yield while assembling the pickup, after both ends are known.
+        first.slice = full_cost - 1;
+        first.work = first.slice;
+        assert!(first.prepare_pickup(&ctx.g.map(), start, gate).is_none());
+        assert_eq!(first.work, 0);
+        let pending = first
+            .suspend(Destination::Outside(gate), Some(VehicleID::default()))
+            .unwrap();
+        let (world, resources) = ctx.g.world_res();
+        world.edit_human(id, |human| {
+            human.location = Location::Outside;
+            human.trans.pos = start;
+            human.trans.dir = Vec3::X;
+            human.speed.0 = 1.0;
+            human.it = Itinerary::simple(vec![start + Vec3::X * 30.0]);
+            let mut traffic = resources.write::<DrivewayTraffic>();
+            suspend_property_route(id, human, &mut traffic.properties, pending);
+        });
+        crate::map_dynamic::itinerary_update(world, resources);
+        let position = world.humans[id].trans.pos;
+        assert_eq!(position, start, "the old itinerary moved the pickup origin");
+
+        let pending = ctx
+            .g
+            .write::<DrivewayTraffic>()
+            .properties
+            .take_search(id)
+            .unwrap();
+        let mut resumed = PropertyBudget::new(Tick(21), Some(pending));
+        let before = resumed.work;
+        assert!(resumed
+            .prepare_pickup(&ctx.g.map(), position, gate)
+            .is_some());
+        assert_eq!(
+            before - resumed.work,
+            1,
+            "the second slice must reuse the paid pickup work"
+        );
+    }
+
+    #[test]
+    fn pathpark_fix_legacy_directed_cursor_migration() {
+        use std::collections::BTreeMap;
+        let (ctx, roads, _) = crate::tests::pathpark_lifecycle::road_chain(1);
+        let map = ctx.g.map();
+        let lane = map.roads()[roads[0]]
+            .lanes_iter()
+            .find(|&(_, kind)| kind == LaneKind::Driving)
+            .unwrap()
+            .0;
+        let from = DirectedEndpoint {
+            lane,
+            offset_cm: 100,
+        };
+        let to = DirectedEndpoint {
+            lane,
+            offset_cm: 200,
+        };
+        let mut drive = DirectedSearch::new(from, to);
+        assert!(matches!(
+            drive.advance(&map, &mut 1),
+            DirectedSearchResult::Deferred
+        ));
+        let driver = HumanID::default();
+        let car = VehicleID::default();
+        let candidate = ParkingCandidate::Bay(ParkingSpotID::default());
+        let target = Destination::Outside(Vec3::X);
+        // Binary layout of the untagged Wave 2 extension.
+        let legacy = Bincode::encode(&(
+            BuildingParking::default(),
+            (
+                Some(car),
+                BTreeMap::from([(
+                    driver,
+                    (
+                        target,
+                        car,
+                        Tick(84),
+                        73usize,
+                        vec![candidate],
+                        candidate,
+                        drive,
+                    ),
+                )]),
+            ),
+        ))
+        .unwrap();
+        let mut parking = BuildingParking::load(&legacy).unwrap();
+        let mut pending = parking.take_search(driver).unwrap();
+        assert!(pending.validate(&map));
+        assert_eq!(pending.expires, Tick(84));
+        assert_eq!(pending.work_left, 73);
+        let ParkingSearchStage::Drive(_, mut drive, None) = pending.stage else {
+            panic!("the migration must retain directed progress");
+        };
+        let mut work = 73;
+        assert!(matches!(
+            drive.advance(&map, &mut work),
+            DirectedSearchResult::Feasible(_)
+        ));
+        let mut fresh_work = 73;
+        let _ = DirectedSearch::new(from, to).advance(&map, &mut fresh_work);
+        assert!(
+            work > fresh_work,
+            "the migrated search must use its existing progress"
+        );
+    }
+
+    #[test]
     fn pathpark_directed_parking_search_resumes_saved_work_and_expires() {
         let ctx = TestCtx::new();
         ctx.build_roads(&[vec3(100., 100., 0.), vec3(400., 100., 0.)]);
@@ -2317,7 +2708,7 @@ mod tests {
                 .unwrap();
             pending
         };
-        let pending = load_search();
+        let mut pending = load_search();
         assert!(pending.validate(&restored_map));
         assert_eq!(pending.work_left, PROPERTY_WORK_PER_SLICE);
 

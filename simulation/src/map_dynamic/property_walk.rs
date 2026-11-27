@@ -1,13 +1,14 @@
-use super::{Itinerary, ItineraryTarget};
-use crate::map::building_parking::bounded_parking_map;
+use super::Itinerary;
 use crate::map::{
-    LaneID, LaneKind, Map, PathKind, Traversable, TraverseDirection, TraverseKind, TurnID,
+    LaneID, LaneKind, Map, ProjectFilter, ProjectKind, RoadID, Traversable, TraverseDirection,
+    TraverseKind, TurnID,
 };
-use geom::Vec3;
+use geom::{Circle, PolyLine3, Segment3, Shape, Vec3};
 use ordered_float::OrderedFloat;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{btree_set, BTreeMap, BTreeSet};
 
+const WALK_ALGORITHM: u8 = 1;
 const MAX_WALK_WORK: usize = 2_048;
 const SIDEWALK_RADIUS: f32 = 24.0;
 type Revision = (u64, u64);
@@ -19,136 +20,129 @@ pub(super) enum WalkResult {
     Unavailable,
 }
 
-#[derive(Serialize, Deserialize)]
-pub(super) struct ParkingWalkSearch {
+// Save the input and its debit. Restoring a cursor replays that debit against
+// the current map, so a save cannot supply its own anchor or frontier.
+#[derive(Clone, Copy, Serialize, Deserialize)]
+struct WalkProof {
     start: Vec3,
     end: Vec3,
     revision: Revision,
-    start_lane: Option<LaneID>,
-    sidewalk: SidewalkSearch,
-    end_lane: Option<LaneID>,
-    path: Option<WalkFrontier>,
+    algorithm: u8,
+    spent: usize,
+}
+
+impl WalkProof {
+    fn matches(self, map: &Map, start: Vec3, end: Vec3) -> bool {
+        self.current(map) && self.start == start && self.end == end
+    }
+
+    fn current(self, map: &Map) -> bool {
+        self.algorithm == WALK_ALGORITHM && self.revision == map.directed_route_revision()
+    }
+
+    fn valid(self) -> bool {
+        self.start.is_finite() && self.end.is_finite() && self.spent <= MAX_WALK_WORK
+    }
+
+    fn replay(self, map: &Map) -> Option<(ParkingWalkSearch, WalkResult)> {
+        let mut work = self.spent;
+        let mut search = ParkingWalkSearch::new(map, self.start, self.end);
+        let result = search.advance(map, &mut work);
+        (work == 0).then_some((search, result))
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub(super) struct ParkingWalkSearch {
+    proof: WalkProof,
+    #[serde(skip)]
+    progress: WalkProgress,
 }
 
 #[derive(Serialize, Deserialize)]
 pub(super) struct ParkingWalkPlan {
-    start: Vec3,
-    end: Vec3,
-    revision: Revision,
-    start_lane: LaneID,
-    end_lane: LaneID,
-    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, MAX_WALK_WORK>")]
-    path: Vec<Traversable>,
+    proof: WalkProof,
+    #[serde(skip)]
+    itinerary: Option<Itinerary>,
 }
 
 impl ParkingWalkPlan {
-    pub(super) fn matches(&self, map: &Map, start: Vec3, end: Vec3) -> bool {
-        self.revision == map.directed_route_revision() && self.start == start && self.end == end
+    pub(super) fn spent(&self) -> usize {
+        self.proof.spent
     }
 
-    pub(super) fn validate_loaded(&self, map: &Map) -> bool {
-        self.start.is_finite()
-            && self.end.is_finite()
-            && (self.revision != map.directed_route_revision()
-                || (walk_lane(map, self.start_lane)
-                    && walk_lane(map, self.end_lane)
-                    && self.path.first() == Some(&start_on(self.start_lane))
-                    && self
-                        .path
-                        .last()
-                        .is_some_and(|last| last.kind == TraverseKind::Lane(self.end_lane))
-                    && self
-                        .path
-                        .windows(2)
-                        .all(|pair| valid_step(map, pair[0], pair[1]))))
+    pub(super) fn matches(&self, map: &Map, start: Vec3, end: Vec3) -> bool {
+        self.proof.matches(map, start, end)
+    }
+
+    pub(super) fn validate_loaded(&mut self, map: &Map) -> bool {
+        if !self.proof.valid() {
+            return false;
+        }
+        if !self.proof.current(map) {
+            return true;
+        }
+        let Some((_, WalkResult::Ready(plan))) = self.proof.replay(map) else {
+            return false;
+        };
+        self.itinerary = plan.itinerary;
+        true
     }
 
     pub(super) fn into_itinerary(self, map: &Map) -> Option<Itinerary> {
-        Itinerary::route_from_lanes(
-            self.start,
-            self.start_lane,
-            self.end_lane,
-            self.end,
-            ItineraryTarget::Position(self.end),
-            map,
-            PathKind::Pedestrian,
-            |_| Some(self.path),
-        )
+        self.proof.current(map).then_some(self.itinerary).flatten()
     }
 }
 
 impl ParkingWalkSearch {
+    pub(super) fn spent(&self) -> usize {
+        self.proof.spent
+    }
+
     pub(super) fn new(map: &Map, start: Vec3, end: Vec3) -> Self {
         Self {
-            start,
-            end,
-            revision: map.directed_route_revision(),
-            start_lane: None,
-            sidewalk: SidewalkSearch::default(),
-            end_lane: None,
-            path: None,
+            proof: WalkProof {
+                start,
+                end,
+                revision: map.directed_route_revision(),
+                algorithm: WALK_ALGORITHM,
+                spent: 0,
+            },
+            progress: WalkProgress::default(),
         }
     }
 
     pub(super) fn matches(&self, map: &Map, start: Vec3, end: Vec3) -> bool {
-        self.revision == map.directed_route_revision() && self.start == start && self.end == end
+        self.proof.matches(map, start, end)
     }
 
-    pub(super) fn validate_loaded(&self, map: &Map) -> bool {
-        self.start.is_finite()
-            && self.end.is_finite()
-            && (self.revision != map.directed_route_revision()
-                || (self.start_lane.is_none_or(|id| walk_lane(map, id))
-                    && self
-                        .end_lane
-                        .is_none_or(|id| self.start_lane.is_some() && walk_lane(map, id))
-                    && self.sidewalk.validate_loaded(map)
-                    && self.path.as_ref().is_none_or(|path| {
-                        self.start_lane
-                            .zip(self.end_lane)
-                            .is_some_and(|(start, _)| path.validate_loaded(map, start_on(start)))
-                    })))
+    pub(super) fn validate_loaded(&mut self, map: &Map) -> bool {
+        if !self.proof.valid() {
+            return false;
+        }
+        if !self.proof.current(map) {
+            return true;
+        }
+        let Some((search, WalkResult::Deferred)) = self.proof.replay(map) else {
+            return false;
+        };
+        self.progress = search.progress;
+        true
     }
 
     pub(super) fn advance(&mut self, map: &Map, work: &mut usize) -> WalkResult {
-        if *work == 0 {
-            return WalkResult::Deferred;
+        if !self.proof.valid() {
+            return WalkResult::Unavailable;
         }
-        if self.start_lane.is_none() {
-            match self.sidewalk.advance(map, self.start, work) {
-                Ok(Some(lane)) => {
-                    self.start_lane = Some(lane);
-                    self.sidewalk = SidewalkSearch::default();
-                }
-                Ok(None) => return WalkResult::Unavailable,
-                Err(()) => return WalkResult::Deferred,
-            }
-        }
-        if self.end_lane.is_none() {
-            match self.sidewalk.advance(map, self.end, work) {
-                Ok(Some(lane)) => {
-                    self.end_lane = Some(lane);
-                    self.sidewalk = SidewalkSearch::default();
-                }
-                Ok(None) => return WalkResult::Unavailable,
-                Err(()) => return WalkResult::Deferred,
-            }
-        }
-        let start_lane = self.start_lane.unwrap();
-        let end_lane = self.end_lane.unwrap();
-        let path = self
-            .path
-            .get_or_insert_with(|| WalkFrontier::new(start_on(start_lane)));
-        // Reserve the endpoint geometry before the caller constructs the itinerary.
-        let geometry = map.lanes()[start_lane].points.len() + map.lanes()[end_lane].points.len();
-        match path.advance(map, end_lane, geometry, work) {
-            Ok(Some(path)) => WalkResult::Ready(ParkingWalkPlan {
-                start: self.start,
-                end: self.end,
-                revision: self.revision,
-                start_lane,
-                end_lane,
-                path,
+        let before = *work;
+        let result = self
+            .progress
+            .advance(map, self.proof.start, self.proof.end, work);
+        self.proof.spent += before - *work;
+        match result {
+            Ok(Some(itinerary)) => WalkResult::Ready(ParkingWalkPlan {
+                proof: self.proof,
+                itinerary: Some(itinerary),
             }),
             Ok(None) => WalkResult::Unavailable,
             Err(()) => WalkResult::Deferred,
@@ -156,70 +150,223 @@ impl ParkingWalkSearch {
     }
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default)]
+struct WalkProgress {
+    start_anchor: Option<Anchor>,
+    sidewalk: SidewalkSearch,
+    end_anchor: Option<Anchor>,
+    frontier: Option<WalkFrontier>,
+    assembly: Option<WalkAssembly>,
+}
+
+impl WalkProgress {
+    fn advance(
+        &mut self,
+        map: &Map,
+        start: Vec3,
+        end: Vec3,
+        work: &mut usize,
+    ) -> Result<Option<Itinerary>, ()> {
+        if self.start_anchor.is_none() {
+            let Some(anchor) = self.sidewalk.advance(map, start, work)? else {
+                return Ok(None);
+            };
+            self.start_anchor = Some(anchor);
+            self.sidewalk = SidewalkSearch::default();
+        }
+        let start_anchor = self.start_anchor.unwrap();
+        if self.end_anchor.is_none() {
+            let Some(anchor) = self.sidewalk.advance(map, end, work)? else {
+                return Ok(None);
+            };
+            self.end_anchor = Some(anchor);
+            self.sidewalk = SidewalkSearch::default();
+        }
+        let end_anchor = self.end_anchor.unwrap();
+        if self.assembly.is_none() {
+            let frontier = self
+                .frontier
+                .get_or_insert_with(|| WalkFrontier::new(start_on(start_anchor.lane)));
+            let Some(route) = frontier.advance(map, end_anchor.lane, work)? else {
+                return Ok(None);
+            };
+            self.assembly = Some(WalkAssembly::new(route, start_anchor, end_anchor));
+        }
+        let assembly = self.assembly.as_mut().unwrap();
+        Ok(Some(assembly.advance(
+            map,
+            start,
+            end,
+            start_anchor,
+            end_anchor,
+            work,
+        )?))
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Anchor {
+    lane: LaneID,
+    projection: Projection,
+    distance: f32,
+}
+
+#[derive(Clone, Copy)]
+struct Projection {
+    position: Vec3,
+    segment_end: usize,
+}
+
+#[derive(Default)]
+struct ProjectLine {
+    index: usize,
+    closest: Option<Projection>,
+}
+
+impl ProjectLine {
+    fn advance(
+        &mut self,
+        points: &PolyLine3,
+        reverse: bool,
+        position: Vec3,
+        work: &mut usize,
+    ) -> Result<Projection, ()> {
+        let len = points.len();
+        if len == 1 {
+            spend(work, 1)?;
+            return Ok(Projection {
+                position: points[0],
+                segment_end: 0,
+            });
+        }
+        while self.index < len - 1 {
+            spend(work, 1)?;
+            let segment = Segment3 {
+                src: line_point(points, reverse, self.index),
+                dst: line_point(points, reverse, self.index + 1),
+            };
+            // Match PolyLine3::project_segment, including its two-point and tie behavior.
+            let projected = if len == 2 {
+                segment.project(position)
+            } else {
+                segment.src
+                    + (segment.dst - segment.src) * segment.flatten().project_t(position.xy())
+            };
+            self.index += 1;
+            let distance = |p: Vec3| OrderedFloat((position - p).xy().mag());
+            if self
+                .closest
+                .is_none_or(|best| distance(projected) < distance(best.position))
+            {
+                self.closest = Some(Projection {
+                    position: projected,
+                    segment_end: self.index,
+                });
+            }
+        }
+        Ok(self.closest.unwrap())
+    }
+}
+
+fn line_point(points: &PolyLine3, reverse: bool, index: usize) -> Vec3 {
+    points[if reverse {
+        points.len() - 1 - index
+    } else {
+        index
+    }]
+}
+
+#[derive(Default)]
+struct WalkRoads {
+    roads: Option<btree_set::IntoIter<RoadID>>,
+}
+
+impl WalkRoads {
+    fn next(&mut self, map: &Map, position: Vec3, work: &mut usize) -> Result<Option<RoadID>, ()> {
+        if self.roads.is_none() {
+            let bounds = Circle {
+                center: position.xy(),
+                radius: SIDEWALK_RADIUS,
+            }
+            .bbox();
+            let spatial = map.spatial_map();
+            let mut remaining = *work;
+            // The shared broad-phase API reserves the full local scan. Keep
+            // the result in ID order across resumption and index rebuilds.
+            spatial
+                .reserve_construction_query(bounds, &mut remaining)
+                .map_err(|_| ())?;
+            let roads: BTreeSet<_> = spatial
+                .construction_candidates(bounds, ProjectFilter::ROAD)
+                .filter_map(|project| match project {
+                    ProjectKind::Road(id) => Some(id),
+                    _ => None,
+                })
+                .collect();
+            self.roads = Some(roads.into_iter());
+            *work = remaining;
+        }
+        Ok(self.roads.as_mut().unwrap().next())
+    }
+}
+
+#[derive(Default)]
 struct SidewalkSearch {
-    road: usize,
-    road_entered: bool,
+    roads: WalkRoads,
+    road: Option<RoadID>,
     lane: usize,
-    lane_credit: usize,
-    best: Option<(f32, LaneID)>,
+    project: Option<ProjectLine>,
+    best: Option<Anchor>,
 }
 
 impl SidewalkSearch {
-    fn validate_loaded(&self, map: &Map) -> bool {
-        self.road <= 128
-            && self.lane <= MAX_WALK_WORK
-            && self.lane_credit <= MAX_WALK_WORK
-            && self.best.is_none_or(|(distance, lane)| {
-                (0.0..=SIDEWALK_RADIUS.powi(2)).contains(&distance) && walk_lane(map, lane)
-            })
-    }
-
     fn advance(
         &mut self,
         map: &Map,
         position: Vec3,
         work: &mut usize,
-    ) -> Result<Option<LaneID>, ()> {
-        if !position.is_finite() {
-            return Ok(None);
-        }
-        let roads = map
-            .spatial_map()
-            .parking_roads(position.xy(), SIDEWALK_RADIUS);
-        for road in roads.skip(self.road) {
-            if !self.road_entered {
+    ) -> Result<Option<Anchor>, ()> {
+        loop {
+            if self.road.is_none() {
+                self.road = self.roads.next(map, position, work)?;
+            }
+            let Some(road) = self.road else {
+                return Ok(self.best);
+            };
+            let Some((lane, kind)) = map.roads()[road].lanes_iter().nth(self.lane) else {
+                self.road = None;
+                self.lane = 0;
+                continue;
+            };
+            if self.project.is_none() {
                 spend(work, 1)?;
-                self.road_entered = true;
-            }
-            for (lane, kind) in map.roads()[road].lanes_iter().skip(self.lane) {
-                // Reserve the full geometry before projection. The debit can span
-                // slices, including for candidates that lose the distance comparison.
-                let points = &map.lanes()[lane].points;
-                let geometry = if kind == LaneKind::Walking {
-                    points.len()
-                } else {
-                    0
-                };
-                accrue(work, &mut self.lane_credit, 1 + geometry)?;
-                self.lane_credit = 0;
-                self.lane += 1;
-                if kind == LaneKind::Walking {
-                    let distance = points.project_dist2(position);
-                    if distance <= SIDEWALK_RADIUS.powi(2)
-                        && self.best.is_none_or(|(best, id)| {
-                            (OrderedFloat(distance), lane) < (OrderedFloat(best), id)
-                        })
-                    {
-                        self.best = Some((distance, lane));
-                    }
+                if kind != LaneKind::Walking {
+                    self.lane += 1;
+                    continue;
                 }
+                self.project = Some(ProjectLine::default());
             }
-            self.lane = 0;
-            self.road_entered = false;
-            self.road += 1;
+            let projection = self.project.as_mut().unwrap().advance(
+                &map.lanes()[lane].points,
+                false,
+                position,
+                work,
+            )?;
+            let distance = projection.position.distance2(position);
+            if distance <= SIDEWALK_RADIUS.powi(2)
+                && self.best.is_none_or(|best| {
+                    (OrderedFloat(distance), lane) < (OrderedFloat(best.distance), best.lane)
+                })
+            {
+                self.best = Some(Anchor {
+                    lane,
+                    projection,
+                    distance,
+                });
+            }
+            self.lane += 1;
+            self.project = None;
         }
-        Ok(self.best.map(|(_, lane)| lane))
     }
 }
 
@@ -228,24 +375,12 @@ fn spend(work: &mut usize, amount: usize) -> Result<(), ()> {
     Ok(())
 }
 
-fn accrue(work: &mut usize, credit: &mut usize, amount: usize) -> Result<(), ()> {
-    let debit = amount.saturating_sub(*credit).min(*work);
-    *work -= debit;
-    *credit += debit;
-    (*credit == amount).then_some(()).ok_or(())
-}
-
 fn start_on(lane: LaneID) -> Traversable {
     Traversable::new(TraverseKind::Lane(lane), TraverseDirection::Forward)
 }
 
 fn key(traversal: Traversable) -> WalkKey {
     (traversal.kind, traversal.dir == TraverseDirection::Forward)
-}
-
-fn walk_lane(map: &Map, id: LaneID) -> bool {
-    map.get(id)
-        .is_some_and(|lane| lane.kind == LaneKind::Walking)
 }
 
 fn turn_from(turn: TurnID, lane: LaneID) -> Option<Traversable> {
@@ -259,40 +394,15 @@ fn turn_from(turn: TurnID, lane: LaneID) -> Option<Traversable> {
     Some(Traversable::new(TraverseKind::Turn(turn), direction))
 }
 
-fn valid_step(map: &Map, previous: Traversable, next: Traversable) -> bool {
-    let Some(junction) = previous
-        .destination_intersection(map.lanes())
-        .and_then(|id| map.get(id))
-    else {
-        return false;
-    };
-    let lane = previous.destination_lane();
-    if !walk_lane(map, next.destination_lane()) {
-        return false;
-    }
-    match next.kind {
-        TraverseKind::Turn(turn) => {
-            turn.parent == junction.id
-                && junction.find_turn(turn).is_some()
-                && turn_from(turn, lane) == Some(next)
-        }
-        TraverseKind::Lane(id) => id == lane && map.lanes()[id].dir_from(junction.id) == next.dir,
-    }
-}
-
-#[derive(Serialize, Deserialize)]
 struct WalkFrontier {
-    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, MAX_WALK_WORK>")]
     nodes: Vec<WalkNode>,
-    #[serde(deserialize_with = "bounded_parking_map::<_, _, _, MAX_WALK_WORK>")]
     visited: BTreeMap<WalkKey, usize>,
     head: usize,
-    // The last inspected turn at the head, including unrelated turns.
     after: Option<TurnID>,
-    goal_credit: usize,
+    backtrack: Option<usize>,
+    route: Vec<Traversable>,
 }
 
-#[derive(Serialize, Deserialize)]
 struct WalkNode {
     traversal: Traversable,
     parent: Option<usize>,
@@ -310,55 +420,31 @@ impl WalkFrontier {
             visited: BTreeMap::from([(key(start), 0)]),
             head: 0,
             after: None,
-            goal_credit: 0,
+            backtrack: None,
+            route: Vec::new(),
         }
-    }
-
-    fn validate_loaded(&self, map: &Map, start: Traversable) -> bool {
-        self.head < self.nodes.len()
-            && self.goal_credit <= MAX_WALK_WORK
-            && self.visited.len() == self.nodes.len()
-            && self.nodes.iter().enumerate().all(|(index, node)| {
-                self.visited.get(&key(node.traversal)) == Some(&index)
-                    && match node.parent {
-                        Some(parent) if parent < index => {
-                            node.depth == self.nodes[parent].depth + 1
-                                && valid_step(map, self.nodes[parent].traversal, node.traversal)
-                        }
-                        None => index == 0 && node.traversal == start && node.depth == 0,
-                        _ => false,
-                    }
-            })
-            && self.after.is_none_or(|turn| {
-                self.nodes[self.head]
-                    .traversal
-                    .destination_intersection(map.lanes())
-                    == Some(turn.parent)
-                    && map
-                        .get(turn.parent)
-                        .is_some_and(|junction| junction.find_turn(turn).is_some())
-            })
     }
 
     fn advance(
         &mut self,
         map: &Map,
         end: LaneID,
-        geometry: usize,
         work: &mut usize,
     ) -> Result<Option<Vec<Traversable>>, ()> {
         while let Some(node) = self.nodes.get(self.head) {
             let current = node.traversal;
             if current.kind == TraverseKind::Lane(end) {
-                accrue(work, &mut self.goal_credit, node.depth + 1 + geometry)?;
-                let mut path = Vec::with_capacity(node.depth + 1);
-                let mut index = Some(self.head);
-                while let Some(at) = index {
-                    path.push(self.nodes[at].traversal);
-                    index = self.nodes[at].parent;
+                if self.route.capacity() == 0 {
+                    self.backtrack = Some(self.head);
+                    self.route = Vec::with_capacity(node.depth + 1);
                 }
-                path.reverse();
-                return Ok(Some(path));
+                while let Some(index) = self.backtrack {
+                    spend(work, 1)?;
+                    let node = &self.nodes[index];
+                    self.route.push(node.traversal);
+                    self.backtrack = node.parent;
+                }
+                return Ok(Some(std::mem::take(&mut self.route)));
             }
 
             spend(work, 1)?;
@@ -400,11 +486,219 @@ impl WalkFrontier {
     }
 }
 
+struct WalkAssembly {
+    current: Traversable,
+    route: Vec<Traversable>,
+    project: ProjectLine,
+    local: Option<LocalWalk>,
+}
+
+struct LocalWalk {
+    points: Vec<Vec3>,
+    next: usize,
+    stop: usize,
+    first: Vec3,
+}
+
+impl WalkAssembly {
+    fn new(mut route: Vec<Traversable>, start: Anchor, end: Anchor) -> Self {
+        let mut current = route.pop().unwrap();
+        if let Some(&next) = route.last() {
+            if next.kind == current.kind {
+                current = route.pop().unwrap();
+            }
+        }
+        let local = (start.lane == end.lane).then(|| {
+            let next = start.projection.segment_end.max(end.projection.segment_end);
+            let stop = start.projection.segment_end.min(end.projection.segment_end);
+            LocalWalk {
+                points: Vec::with_capacity(next - stop + 3),
+                next,
+                stop,
+                first: start.projection.position,
+            }
+        });
+        Self {
+            current,
+            route,
+            project: ProjectLine::default(),
+            local,
+        }
+    }
+
+    fn advance(
+        &mut self,
+        map: &Map,
+        start: Vec3,
+        end: Vec3,
+        start_anchor: Anchor,
+        end_anchor: Anchor,
+        work: &mut usize,
+    ) -> Result<Itinerary, ()> {
+        let points = &map.lanes()[start_anchor.lane].points;
+        let reverse = self.current.dir == TraverseDirection::Backward;
+        if self.local.is_none() {
+            let projection = if reverse {
+                self.project.advance(points, true, start, work)?
+            } else {
+                start_anchor.projection
+            };
+            let index = projection.segment_end.saturating_sub(1);
+            let direction = if points.len() >= 2 {
+                (line_point(points, reverse, index + 1) - line_point(points, reverse, index))
+                    .try_normalize()
+                    .unwrap_or(Vec3::X)
+            } else {
+                Vec3::X
+            };
+            self.local = Some(LocalWalk {
+                points: Vec::with_capacity(points.len() - projection.segment_end + 1),
+                next: points.len(),
+                stop: projection.segment_end,
+                first: projection.position + direction * 3.5,
+            });
+        }
+        let local = self.local.as_mut().unwrap();
+        if start_anchor.lane == end_anchor.lane {
+            if local.points.is_empty() {
+                spend(work, 1)?;
+                local.points.push(end);
+            }
+            if local.points.len() == 1 {
+                spend(work, 1)?;
+                local.points.push(end_anchor.projection.position);
+            }
+        }
+        while local.next > local.stop {
+            spend(work, 1)?;
+            local.next -= 1;
+            local.points.push(line_point(points, reverse, local.next));
+        }
+        spend(work, 1)?;
+        local.points.push(local.first);
+        Ok(Itinerary::from_parking_walk(
+            self.current,
+            std::mem::take(&mut self.route),
+            std::mem::take(&mut local.points),
+            end,
+        ))
+    }
+}
+
+// The first tagged save stored unchecked walking state. Decode it within
+// the original wire limits so the parking runtime can migrate its other fields.
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub(super) struct LegacyWalkSearch(
+    Vec3,
+    Vec3,
+    Revision,
+    Option<LaneID>,
+    LegacySidewalk,
+    Option<LaneID>,
+    Option<LegacyFrontier>,
+);
+
+type LegacySidewalk = (usize, bool, usize, usize, Option<(f32, LaneID)>);
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+struct LegacyFrontier(
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, MAX_WALK_WORK>")]
+    Vec<(Traversable, Option<usize>, usize)>,
+    #[serde(
+        deserialize_with = "crate::map::building_parking::bounded_parking_map::<_, _, _, MAX_WALK_WORK>"
+    )]
+    BTreeMap<WalkKey, usize>,
+    usize,
+    Option<TurnID>,
+    usize,
+);
+
+#[derive(Deserialize)]
+#[allow(dead_code)]
+pub(super) struct LegacyWalkPlan(
+    Vec3,
+    Vec3,
+    Revision,
+    LaneID,
+    LaneID,
+    #[serde(deserialize_with = "crate::world_command::bounded_command_vec::<_, _, MAX_WALK_WORK>")]
+    Vec<Traversable>,
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::map::PathKind;
+    use crate::map_dynamic::ItineraryTarget;
     use crate::tests::pathpark_lifecycle::road_chain;
     use common::saveload::{Bincode, Encoder};
+
+    #[test]
+    fn pathpark_fix_imported_walk_requires_local_anchors() {
+        let (ctx, roads, _) = road_chain(1);
+        let map = ctx.g.map();
+        let lane = map.roads()[roads[0]]
+            .lanes_iter()
+            .find(|&(_, kind)| kind == LaneKind::Walking)
+            .unwrap()
+            .0;
+        let endpoint = map.lanes()[lane].points.middle() + Vec3::Y * 1_000.0;
+        let plan = ParkingWalkPlan {
+            proof: WalkProof {
+                start: endpoint,
+                end: endpoint,
+                revision: map.directed_route_revision(),
+                algorithm: WALK_ALGORITHM,
+                spent: 300,
+            },
+            itinerary: None,
+        };
+        let mut restored: ParkingWalkPlan =
+            Bincode::decode(&Bincode::encode(&plan).unwrap()).unwrap();
+        assert!(
+            !restored.validate_loaded(&map),
+            "a live sidewalk can still be remote"
+        );
+    }
+
+    #[test]
+    fn pathpark_fix_imported_walk_checks_staged_sidewalk_progress() {
+        let (ctx, _, _) = road_chain(1);
+        let map = ctx.g.map();
+        let endpoint = Vec3::new(800., 800., 0.);
+        let mut search = ParkingWalkSearch::new(&map, endpoint, endpoint);
+        search.proof.spent = MAX_WALK_WORK;
+        let mut restored: ParkingWalkSearch =
+            Bincode::decode(&Bincode::encode(&search).unwrap()).unwrap();
+        assert!(
+            !restored.validate_loaded(&map),
+            "replay must account for the claimed work and stage"
+        );
+    }
+
+    #[test]
+    fn pathpark_pedestrian_candidate_geometry_is_charged_on_a_miss() {
+        let points = PolyLine3::new((0..401).map(|i| Vec3::new(i as f32, 100., 0.)).collect());
+        let endpoint = Vec3::new(180.5, 0., 0.);
+        let mut project = ProjectLine::default();
+        for segments in [1, 127, 271] {
+            let mut work = segments;
+            assert!(project
+                .advance(&points, false, endpoint, &mut work)
+                .is_err());
+            assert_eq!(work, 0);
+        }
+        assert_eq!(project.index, 399);
+        let mut final_segment = 1;
+        let projected = project
+            .advance(&points, false, endpoint, &mut final_segment)
+            .unwrap();
+        assert_eq!(final_segment, 0);
+        assert_eq!(projected.position, points.project(endpoint));
+        assert!(projected.position.distance2(endpoint) > SIDEWALK_RADIUS.powi(2));
+    }
 
     #[test]
     fn pathpark_pedestrian_frontier_resumes_after_save() {
@@ -431,33 +725,67 @@ mod tests {
             .expect("the connected roads must share a sidewalk route");
 
         let mut work = MAX_WALK_WORK;
-        SidewalkSearch::default()
+        let start_anchor = SidewalkSearch::default()
             .advance(&map, start, &mut work)
             .unwrap()
             .unwrap();
-        SidewalkSearch::default()
+        let end_anchor = SidewalkSearch::default()
             .advance(&map, end, &mut work)
             .unwrap()
             .unwrap();
-        let geometry = MAX_WALK_WORK - work;
+
+        let mut frontier = WalkFrontier::new(start_on(start_anchor.lane));
+        let mut route_work = MAX_WALK_WORK;
+        let route = frontier
+            .advance(&map, end_anchor.lane, &mut route_work)
+            .unwrap()
+            .unwrap();
+        let stock = Itinerary::route_from_lanes(
+            start,
+            start_anchor.lane,
+            end_anchor.lane,
+            end,
+            ItineraryTarget::Position(end),
+            &map,
+            PathKind::Pedestrian,
+            |_| Some(route.into_iter().rev().collect()),
+        )
+        .unwrap();
+        assert_eq!(
+            Bincode::encode(&stock).unwrap(),
+            Bincode::encode(expected.itinerary.as_ref().unwrap()).unwrap()
+        );
+
         let mut search = ParkingWalkSearch::new(&map, start, end);
-        let mut first_slice = geometry + 3;
+        let mut first_slice = MAX_WALK_WORK - work + 3;
         assert!(matches!(
             search.advance(&map, &mut first_slice),
             WalkResult::Deferred
         ));
         assert_eq!(first_slice, 0);
-        assert!(search.path.is_some());
+        assert!(search.progress.frontier.is_some());
         let snapshot = Bincode::encode(&search).unwrap();
         let mut restored: ParkingWalkSearch = Bincode::decode(&snapshot).unwrap();
         assert!(restored.validate_loaded(&map));
-        let WalkResult::Ready(plan) = restored.advance(&map, &mut work) else {
-            panic!("the restored walking cursor must reach the goal");
+        // Run the frontier, backtrack and itinerary assembly one item at a time.
+        let plan = loop {
+            let mut one = 1;
+            match restored.advance(&map, &mut one) {
+                WalkResult::Deferred => assert_eq!(one, 0),
+                WalkResult::Ready(plan) => break plan,
+                WalkResult::Unavailable => panic!("the restored walk must reach the goal"),
+            }
         };
         assert_eq!(
             Bincode::encode(&plan).unwrap(),
             Bincode::encode(&expected).unwrap()
         );
-        assert!(plan.validate_loaded(&map));
+        let mut loaded: ParkingWalkPlan =
+            Bincode::decode(&Bincode::encode(&plan).unwrap()).unwrap();
+        assert!(loaded.validate_loaded(&map));
+        assert_eq!(
+            Bincode::encode(&plan.itinerary).unwrap(),
+            Bincode::encode(&loaded.itinerary).unwrap()
+        );
     }
 }
