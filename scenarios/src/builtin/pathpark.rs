@@ -301,6 +301,7 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
     ctx.submit(&[WorldCommand::MapLoadParis]);
     ctx.run_ticks(1);
     super::perf::setup_employers(ctx, POPULATION, 50)?;
+    super::perf::setup_houses(ctx, POPULATION - DISTRICTS * 3)?;
     let garage_funds = (GarageKind::MultiStorey.cost() + GarageKind::Underground.cost())
         * DISTRICTS as i64;
     crate::builders::grant_money(ctx, garage_funds + prototypes::Money::new_bucks(1_000_000));
@@ -341,8 +342,6 @@ fn run_scale(ctx: &mut ScenarioCtx) -> Result<(), String> {
             offers.len()
         ));
     }
-    let initial_residents = ctx.sim.world().humans.len();
-    super::perf::setup_houses(ctx, POPULATION - initial_residents)?;
     if ctx.sim.world().humans.len() != POPULATION {
         return Err("mixed-supply opening did not commission 10,000 residents".into());
     }

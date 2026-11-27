@@ -54,8 +54,6 @@ def run_order(pairs):
 
 def score(artifacts, fixture, run, build, pinned, cpu, identity):
     stem = artifacts / f"{fixture}-{run}-{build}"
-    if int(stem.with_suffix(".status").read_text()) != 0:
-        raise ValueError(f"{stem} benchmark failed")
     payload = json.loads(stem.with_suffix(".json").read_text())
     if (identity["fixture"], identity["run"], identity["build"]) != (fixture, run, build):
         raise ValueError(f"{stem} has the wrong run identity")
@@ -137,6 +135,8 @@ def compare(manifest, artifacts):
     for sequence, key in enumerate(run_order(pairs), 1):
         fixture, run, build = key
         stem = artifacts / f"{fixture}-{run}-{build}"
+        if int(stem.with_suffix(".status").read_text()) != 0:
+            raise ValueError(f"{stem} benchmark failed")
         identity = json.loads(stem.with_suffix(".workload.json").read_text())
         if identity["campaign_id"] != campaign:
             raise ValueError(f"{stem} belongs to another campaign")
