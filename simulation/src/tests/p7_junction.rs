@@ -839,6 +839,15 @@ fn roundabout_fixture(
     radius: f32,
     slope: bool,
 ) -> (TestCtx, IntersectionID, Vec<Vec3>) {
+    roundabout_fixture_with_parking(directions, radius, slope, true)
+}
+
+fn roundabout_fixture_with_parking(
+    directions: &[f32],
+    radius: f32,
+    slope: bool,
+    parking: bool,
+) -> (TestCtx, IntersectionID, Vec<Vec3>) {
     use crate::map::{LanePatternBuilder, MapProject, ProjectFilter, RoundaboutPolicy};
     use geom::Radians;
 
@@ -856,6 +865,7 @@ fn roundabout_fixture(
             None,
             &LanePatternBuilder::new()
                 .n_lanes(1 + (i % 3) as u32)
+                .parking(parking)
                 .build(),
         )
         .unwrap();
@@ -1270,6 +1280,292 @@ fn roundabout_hotfix_walker(
         human.collider = Some(collider);
     });
     id
+}
+
+#[test]
+fn roundabout_hotfix_empty_exit_crosswalk_ignores_sidewalk_traffic() {
+    use crate::transportation::queue_diagnostics::{
+        watch_queue, QueueDiagnostics, QueueHoldReason, QueueRevision,
+    };
+
+    let mut waits = 0;
+    let mut brakes = 0;
+    let mut arrival_delays = Vec::new();
+    for directions in [
+        &[0.0, 107.0, 218.0][..],
+        &[0.0, 90.0, 180.0, 270.0],
+        &[0.0, 38.0, 119.0, 194.0, 279.0],
+    ] {
+        let mut no_walkers_arrival = 0;
+        for count in [0, 1, 20] {
+            let (mut ctx, junction, ends) =
+                roundabout_fixture_with_parking(directions, 24.0, false, false);
+            let house = ctx.build_house_near(ends[0].xy());
+            ctx.g
+                .write::<crate::souls::residence::Residences>()
+                .by_building
+                .get_mut(&house)
+                .unwrap()
+                .capacity = 20;
+            let mut schedule = roundabout_hotfix_movement_only();
+            let (from, to, sidewalk, start, direction, destination, crossing) = {
+                let map = ctx.g.map();
+                let inter = map.get(junction).unwrap();
+                let street = inter
+                    .roads
+                    .iter()
+                    .map(|&id| &map.roads()[id])
+                    .find(|road| road.other_end(junction) == Some(junction_at(&map, ends[0])))
+                    .unwrap();
+                let sidewalk = street.sidewalks(junction).outgoing.unwrap();
+                let to = street
+                    .outgoing_lanes_from(junction)
+                    .iter()
+                    .rev()
+                    .find(|(_, kind)| kind.vehicles())
+                    .unwrap()
+                    .0;
+                let lane = &map.lanes()[to];
+                let from = inter
+                    .turns()
+                    .find(|turn| turn.id.dst == to && turn.kind == TurnKind::Driving)
+                    .unwrap()
+                    .id
+                    .src;
+                let crossing = inter
+                    .crosswalks()
+                    .find(|turn| turn.id.dst == sidewalk || turn.id.src == sidewalk)
+                    .unwrap()
+                    .points
+                    .clone();
+                (
+                    from,
+                    to,
+                    sidewalk,
+                    lane.points.point_along(0.5),
+                    lane.points.first_dir().unwrap(),
+                    lane.points.point_along(50.0),
+                    crossing,
+                )
+            };
+            let car = staged_vehicle(&mut ctx.g, VehicleKind::Bus, from, to, 8.0);
+            {
+                let car = &mut ctx.g.world.vehicles[car];
+                car.trans = Transform::new_dir(start, direction);
+                let ItineraryKind::Route(route, _) = &mut car.it.kind else {
+                    unreachable!()
+                };
+                route.cur = forward_lane(to);
+                route.reversed_route.clear();
+                car.it.reversed_local_path = vec![destination];
+            }
+            let mut walkers = Vec::new();
+            for i in 0..count {
+                let (start, route) = {
+                    let map = ctx.g.map();
+                    let lane = &map.lanes()[sidewalk];
+                    // Walk near the road-facing edge of the sidewalk, outside the zebra.
+                    let roadward =
+                        (map.lanes()[to].points.first() - lane.points.first()).normalize();
+                    let start = lane.points.point_along(6.7 + i as f32 * 0.4) + roadward * 0.7;
+                    let end = lane.points.point_along(35.0);
+                    let route =
+                        Itinerary::route(Tick(0), start, end, &map, PathKind::Pedestrian).unwrap();
+                    assert!(route.get_route().unwrap().reversed_route.is_empty());
+                    (start, route)
+                };
+                walkers.push(roundabout_hotfix_walker(&mut ctx.g, house, start, route));
+            }
+            assert!(watch_queue(&ctx.g, to));
+            let mut case_waits = 0;
+            let mut case_brakes = 0;
+            let mut arrived_at = None;
+            for tick in 1..=2_000 {
+                ctx.g.tick(&mut schedule, &[]);
+                let bus = &ctx.g.world.vehicles[car];
+                if bus.trans.pos.is_close(destination, 0.01) {
+                    arrived_at = Some(tick);
+                    break;
+                }
+                if !bus.trans.pos.is_close(start, 15.0) {
+                    continue;
+                }
+                assert!(walkers.iter().all(|&id| crossing
+                    .project_dist2(ctx.g.world.humans[id].trans.pos)
+                    > 2.0f32.powi(2)));
+                let reason = ctx.g.read::<QueueDiagnostics>().recent_hold(
+                    car,
+                    forward_lane(to),
+                    QueueRevision::current(&ctx.g.map()),
+                    crate::diagnostics::elapsed_tick(&ctx.g).0,
+                );
+                if matches!(reason, Some(QueueHoldReason::Pedestrian(_))) {
+                    case_brakes += 1;
+                    case_waits += usize::from(bus.speed.0 <= 0.2);
+                }
+            }
+            let arrived_at = arrived_at.expect("vehicle should reach its destination");
+            eprintln!("arms={} sidewalk_walkers={count} empty_crosswalk_brake_ticks={case_brakes} empty_crosswalk_wait_ticks={case_waits} arrival_tick={arrived_at}", directions.len());
+            if count == 0 {
+                no_walkers_arrival = arrived_at;
+            } else {
+                arrival_delays.push(arrived_at as i32 - no_walkers_arrival as i32);
+            }
+            waits += case_waits;
+            brakes += case_brakes;
+        }
+    }
+    assert_eq!(
+        waits, 0,
+        "vehicles yielded to walkers leaving an empty exit crossing"
+    );
+    assert_eq!(
+        brakes, 0,
+        "vehicles braked for pedestrians outside the crossing"
+    );
+    assert_eq!(arrival_delays, [0; 6], "sidewalk traffic slowed vehicles");
+}
+
+#[test]
+fn roundabout_hotfix_approach_yields_to_routed_crosswalk_walker() {
+    let (mut ctx, junction, ends) =
+        roundabout_fixture_with_parking(&[0.0, 107.0, 218.0], 24.0, false, false);
+    let mut schedule = roundabout_hotfix_movement_only();
+    let house = ctx.build_house_near(ends[0].xy());
+    let (turn, crossing, start, destination, route, car_destination) = {
+        let map = ctx.g.map();
+        let inter = map.get(junction).unwrap();
+        let turn = inter
+            .turns()
+            .find(|turn| turn.kind == TurnKind::Driving)
+            .unwrap()
+            .id;
+        let road = &map.roads()[map.lanes()[turn.src].parent];
+        let sidewalk = road.sidewalks(junction).incoming.unwrap();
+        let crossing = inter
+            .crosswalks()
+            .find(|turn| turn.id.src == sidewalk || turn.id.dst == sidewalk)
+            .unwrap()
+            .id;
+        let at_curb = |lane: LaneID, distance: f32| {
+            let lane = &map.lanes()[lane];
+            let offset = if lane.src == junction {
+                distance
+            } else {
+                lane.points.length() - distance
+            };
+            lane.points.point_along(offset)
+        };
+        let start = at_curb(crossing.src, 0.5);
+        let destination = at_curb(crossing.dst, 5.0);
+        let route =
+            Itinerary::route(Tick(0), start, destination, &map, PathKind::Pedestrian).unwrap();
+        assert!(route
+            .get_route()
+            .unwrap()
+            .reversed_route
+            .iter()
+            .any(|step| step.kind == TraverseKind::Turn(crossing)));
+        (
+            turn,
+            crossing,
+            start,
+            destination,
+            route,
+            map.lanes()[turn.dst].points.point_along(50.0),
+        )
+    };
+    let walker = roundabout_hotfix_walker(&mut ctx.g, house, start, route);
+    for _ in 0..4_000 {
+        ctx.g.tick(&mut schedule, &[]);
+        if ctx.g.read::<JunctionAdmission>().crossing_turn(crossing) {
+            break;
+        }
+    }
+    assert!(ctx.g.read::<JunctionAdmission>().crossing_turn(crossing));
+    let bus = staged_vehicle(&mut ctx.g, VehicleKind::Bus, turn.src, turn.dst, 14.0);
+    let entry = ctx.g.map().lanes()[turn.src].points.last();
+    let clearance = VehicleKind::Bus.width() * 0.5 + 1.1;
+    let mut yielded = false;
+    for _ in 0..4_000 {
+        ctx.g.tick(&mut schedule, &[]);
+        let vehicle = &ctx.g.world.vehicles[bus];
+        let pedestrian = ctx.g.world.humans[walker].trans.pos;
+        if pedestrian.is_close(entry, clearance)
+            && ctx.g.read::<JunctionAdmission>().crossing_turn(crossing)
+        {
+            assert_eq!(
+                vehicle.it.get_travers(),
+                Some(&forward_lane(turn.src)),
+                "bus at {:?}, walker at {:?}",
+                vehicle.trans.pos,
+                ctx.g.world.humans[walker].trans.pos
+            );
+            yielded |= vehicle.speed.0 <= 0.2 && vehicle.trans.pos.is_close(entry, clearance);
+        }
+        if vehicle.trans.pos.is_close(car_destination, 0.01)
+            && ctx.g.world.humans[walker]
+                .trans
+                .pos
+                .is_close(destination, 0.01)
+        {
+            assert!(yielded, "the bus never yielded to the routed pedestrian");
+            return;
+        }
+    }
+    panic!("the bus or pedestrian failed to clear the crossing");
+}
+
+#[test]
+fn roundabout_hotfix_releases_the_cleared_half_of_a_crosswalk() {
+    let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 107.0, 218.0], 24.0, false);
+    let house = ctx.build_house_near(ends[0].xy());
+    let (turn, crossing, position, itinerary) = {
+        let map = ctx.g.map();
+        let inter = &map.intersections()[junction];
+        let from = lane_at(&map, ends[0], inter.pos);
+        let to = lane_at(&map, inter.pos, ends[1]);
+        let turn = TurnID::new(junction, from, to, false);
+        let entry = inter.find_turn(turn).unwrap().points.first();
+        let crossing = inter
+            .crosswalks()
+            .min_by_key(|walk| ordered_float::OrderedFloat(walk.points.project_dist2(entry)))
+            .unwrap();
+        let first = crossing.points.first();
+        let last = crossing.points.last();
+        let (direction, curb) = if first.distance2(entry) < last.distance2(entry) {
+            (TraverseDirection::Forward, last)
+        } else {
+            (TraverseDirection::Backward, first)
+        };
+        let position = curb + (crossing.points.middle() - curb).normalize() * 0.5;
+        let active = Traversable::new(TraverseKind::Turn(crossing.id), direction);
+        let itinerary = Itinerary {
+            kind: ItineraryKind::Route(
+                Route {
+                    reversed_route: Vec::new(),
+                    end_pos: curb,
+                    cur: active,
+                    target: ItineraryTarget::Position(curb),
+                },
+                PathKind::Pedestrian,
+            ),
+            reversed_local_path: vec![curb],
+            ..Itinerary::default()
+        };
+        (turn, crossing.id, position, itinerary)
+    };
+    roundabout_hotfix_walker(&mut ctx.g, house, position, itinerary);
+    let car = staged_vehicle(&mut ctx.g, VehicleKind::Car, turn.src, turn.dst, 2.3);
+    ctx.g.world.vehicles[car].speed.0 = 5.0;
+    let tick = ctx.g.get_tick();
+    update_at(&mut ctx.g, tick + 1);
+    let admission = ctx.g.read::<JunctionAdmission>();
+    assert!(admission.crossing_turn(crossing));
+    assert!(
+        admission.crossing_turn(turn),
+        "the walker has cleared the vehicle's half of the crossing"
+    );
 }
 
 #[test]
@@ -1707,6 +2003,8 @@ fn roundabout_hotfix_four_arm_mixed_traffic_soak() {
     let mut peak_traffic = 0;
     let mut longest_vehicle_stop = 0;
     let mut longest_walker_stop = 0;
+    let mut last_car_arrival = 0;
+    let mut stuck_cars = std::collections::BTreeSet::new();
     for tick in 0..SOAK_TICKS {
         let wave = (tick / INJECTION_PERIOD) as usize;
         if tick % INJECTION_PERIOD == 0 && wave < WAVES as usize {
@@ -1783,6 +2081,7 @@ fn roundabout_hotfix_four_arm_mixed_traffic_soak() {
                 .unwrap()
                 .sim_drop(id, &mut ctx.g);
             arrived_cars += 1;
+            last_car_arrival = tick + 1;
         }
         walkers.retain(|&id, &mut (end, _, _)| {
             if ctx.g.world.humans[id].trans.pos.is_close(end, 0.01) {
@@ -1805,6 +2104,9 @@ fn roundabout_hotfix_four_arm_mixed_traffic_soak() {
                 (*anchor, *last_progress) = (position, tick);
             }
             current_vehicle_stop = current_vehicle_stop.max(tick - *last_progress);
+            if tick - *last_progress > 5 * STOP_WINDOW {
+                stuck_cars.insert(id);
+            }
         }
         let mut current_walker_stop = 0;
         for (&id, (_, anchor, last_progress)) in &mut walkers {
@@ -1841,6 +2143,8 @@ fn roundabout_hotfix_four_arm_mixed_traffic_soak() {
         }
     }
     eprintln!("peak active {peak_traffic}, longest vehicle stop {longest_vehicle_stop}, longest carriageway walker stop {longest_walker_stop}, longest active clear ticks {longest_active_clear}, final clear ticks {clear_ticks}");
+    eprintln!("arrived_cars={arrived_cars} arrived_walkers={arrived_walkers} last_car_arrival_tick={last_car_arrival} cars_per_game_hour={:.2} cars_stopped_over_five_minutes={}",
+        arrived_cars as f64 * prototypes::TICKS_PER_HOUR as f64 / last_car_arrival as f64, stuck_cars.len());
     assert!(
         longest_vehicle_stop < MAX_VEHICLE_STOP,
         "a vehicle stalled for {longest_vehicle_stop} ticks on its approach, entry, ring or exit"

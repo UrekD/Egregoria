@@ -274,11 +274,10 @@ struct Sweep<'a> {
 
 impl<'a> Sweep<'a> {
     fn occupied(map: &Map, crossing: Crossing, actor: &Actor<'a>) -> Self {
-        // For an established ring user the portion already driven no longer
-        // reserves space. Keep the full footprint at the current position.
-        let remaining = if matches!(actor.owner.owner, EntryOwner::Vehicle(_))
-            && map.is_yield_roundabout(crossing.turn.parent)
-        {
+        let remaining = if !map.is_yield_roundabout(crossing.turn.parent) {
+            None
+        } else if matches!(actor.owner.owner, EntryOwner::Vehicle(_)) {
+            // A circulating vehicle protects the path ahead and its current footprint.
             match actor.itinerary.get_travers() {
                 Some(step)
                     if Some(crossing) == Crossing::from_traversal(*step)
@@ -293,7 +292,7 @@ impl<'a> Sweep<'a> {
                 _ => None,
             }
         } else {
-            None
+            walking_suffix(map, crossing, actor)
         };
         Self {
             owner: actor.owner,
@@ -303,18 +302,66 @@ impl<'a> Sweep<'a> {
     }
 }
 
+fn walking_suffix<'a>(
+    map: &Map,
+    crossing: Crossing,
+    actor: &Actor<'a>,
+) -> Option<(Vec3, &'a [Vec3])> {
+    let current = *actor.itinerary.get_travers()?;
+    if Crossing::from_traversal(current) != Some(crossing) {
+        return (current.kind == TraverseKind::Lane(crossing.to_lane()))
+            .then_some((actor.position, &[][..]));
+    }
+    let turn = map.get(crossing.turn.parent)?.raw_turn(crossing.turn)?;
+    let path = actor.itinerary.local_path();
+    let [terminal] = path else {
+        return None;
+    };
+    let exit = if crossing.backwards {
+        turn.points.first()
+    } else {
+        turn.points.last()
+    };
+    // Merge only straight, directed routes whose remaining spans are nested.
+    (turn.points.len() == 2
+        && *terminal == exit
+        && turn.points.project_dist2(actor.position) <= 0.01f32.powi(2))
+    .then_some((actor.position, path))
+}
+
 #[derive(Default)]
 struct Sweeps<'a> {
     vehicles: Vec<Sweep<'a>>,
     walkers: Vec<Sweep<'a>>,
-    walking_turns: BTreeSet<TurnID>,
+    walking_turns: BTreeMap<TurnID, usize>,
 }
 
 impl<'a> Sweeps<'a> {
     fn insert(&mut self, sweep: Sweep<'a>, roundabout: bool) {
         if matches!(sweep.owner.owner, EntryOwner::Vehicle(_)) {
             self.vehicles.push(sweep);
-        } else if !roundabout || self.walking_turns.insert(sweep.crossing.turn) {
+        } else if !roundabout {
+            self.walkers.push(sweep);
+        } else if let Some(&index) = self.walking_turns.get(&sweep.crossing.turn) {
+            let existing = &mut self.walkers[index];
+            if existing.remaining.is_none() {
+                return;
+            }
+            match (existing.remaining, sweep.remaining) {
+                (Some((previous, [exit])), Some((position, [end])))
+                    if existing.crossing == sweep.crossing && exit == end =>
+                {
+                    if position.distance2(*exit) > previous.distance2(*exit) {
+                        *existing = sweep;
+                    }
+                }
+                // Opposing directions, curb tails and pending grants conservatively
+                // share one full sweep, keeping the comparison count bounded.
+                _ => existing.remaining = None,
+            }
+        } else {
+            self.walking_turns
+                .insert(sweep.crossing.turn, self.walkers.len());
             self.walkers.push(sweep);
         }
     }

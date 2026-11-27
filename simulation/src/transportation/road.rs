@@ -1,4 +1,4 @@
-use crate::map::{Map, TrafficBehavior, Traversable, TraverseKind};
+use crate::map::{Map, TrafficBehavior, Traversable, TraverseDirection, TraverseKind};
 use crate::map_dynamic::{Itinerary, Transit, OBJECTIVE_OK_DIST};
 use crate::transportation::junction_admission;
 use crate::transportation::queue_diagnostics::{QueueDiagnostics, QueueHoldReason, QueueRevision};
@@ -12,7 +12,7 @@ use crate::world::{VehicleEnt, VehicleID};
 use crate::ParCommandBuffer;
 use crate::World;
 use flat_spatial::grid::GridHandle;
-use geom::{angle_lerpxy, Ray, Transform, Vec2, Vec3};
+use geom::{angle_lerpxy, Ray, Segment3, Transform, Vec2, Vec3};
 use prototypes::{GameTime, DELTA, TICKS_PER_REALTIME_SECOND};
 use slotmapd::Key;
 use std::collections::BTreeMap;
@@ -57,7 +57,13 @@ pub fn vehicle_hold_reason(
         .filter(|&(handle, _)| handle != collider)
         .filter_map(|(handle, pos)| Some((Some(handle), pos, grid.get(handle)?.1)));
     let (distance, _, reason) = calc_front_dist(
-        &vehicle.vehicle, &vehicle.trans, own_state, &vehicle.it, neighbours, 0.8,
+        &vehicle.vehicle,
+        map,
+        &vehicle.trans,
+        own_state,
+        &vehicle.it,
+        neighbours,
+        0.8,
     );
     if distance < STOPPED_BLOCK_DISTANCE && reason != QueueHoldReason::Unknown {
         return Some(reason);
@@ -83,6 +89,7 @@ pub fn vehicle_hold_reason(
 /// Each cycle is ordered by its blocker links and starts at its lowest vehicle ID.
 pub fn movement_cycles_at_cutoff(sim: &crate::Simulation) -> Vec<Vec<VehicleID>> {
     let world = sim.world();
+    let map = sim.map();
     // The simulation grid was last synchronized before itinerary movement.
     let mut grid = sim.read::<TransportGrid>().clone();
     grid.refresh_admission_colliders(world);
@@ -119,6 +126,7 @@ pub fn movement_cycles_at_cutoff(sim: &crate::Simulation) -> Vec<Vec<VehicleID>>
             .map(|(handle, pos)| (Some(handle), pos, grid.get(handle).unwrap().1));
         let (distance, _, reason) = calc_front_dist(
             &vehicle.vehicle,
+            &map,
             &vehicle.trans,
             state,
             &vehicle.it,
@@ -488,6 +496,7 @@ fn calc_decision_traced<'a>(
     let stopping_threshold = 0.8 + stop_dist;
     let (front_dist, flag, blocker) = calc_front_dist(
         vehicle,
+        map,
         trans,
         self_obj,
         it,
@@ -589,11 +598,106 @@ fn calc_decision_traced<'a>(
     )
 }
 
+// Keep ordinary junctions at the far end of short roundabout arms on the
+// existing collision-avoidance path.
+fn on_roundabout_arm(map: &Map, it: &Itinerary, position: Vec3) -> bool {
+    const ARM_REACH: f32 = 24.0;
+    const TURN_MOUTH_REACH: f32 = 12.0;
+    if !map.needs_junction_entry_checks() {
+        return false;
+    }
+    match it.get_travers().map(|step| step.kind) {
+        Some(TraverseKind::Turn(turn)) => {
+            map.is_yield_roundabout(turn.parent)
+                && map
+                    .get(turn.parent)
+                    .and_then(|junction| junction.raw_turn(turn))
+                    .is_some_and(|turn| {
+                        position.is_close(turn.points.first(), TURN_MOUTH_REACH)
+                            || position.is_close(turn.points.last(), TURN_MOUTH_REACH)
+                    })
+        }
+        Some(TraverseKind::Lane(id)) => map.get(id).is_some_and(|lane| {
+            let from_start = position.distance2(lane.points.first());
+            let from_end = position.distance2(lane.points.last());
+            let (distance, junction) = if from_start < from_end {
+                (from_start, lane.src)
+            } else {
+                (from_end, lane.dst)
+            };
+            distance <= ARM_REACH.powi(2) && map.is_yield_roundabout(junction)
+        }),
+        None => false,
+    }
+}
+
+fn pedestrian_in_braking_path(
+    map: &Map,
+    it: &Itinerary,
+    trans: &Transform,
+    half_length: f32,
+    braking_distance: f32,
+    pedestrian: Vec3,
+    pedestrian_radius: f32,
+) -> bool {
+    // Use the same oriented vehicle footprint as junction exit checks.
+    const BODY_RADIUS: f32 = 1.0;
+    const GAP: f32 = 0.8;
+    const DECK_TOLERANCE: f32 = 0.65;
+    const MAX_LOOKAHEAD_POINTS: usize = 256;
+    let bumper = half_length - BODY_RADIUS;
+    let clearance = BODY_RADIUS + pedestrian_radius + GAP;
+    let conflicts = |from, to| {
+        let closest = Segment3::new(from, to).project(pedestrian);
+        (closest.z - pedestrian.z).abs() <= DECK_TOLERANCE
+            && closest.xy().is_close(pedestrian.xy(), clearance)
+    };
+    let mut from = trans.pos;
+    if conflicts(from, from + trans.dir * bumper) {
+        return true;
+    }
+
+    let next = it
+        .get_route()
+        .and_then(|route| route.reversed_route.last())
+        .and_then(|leg| Some((leg.dir, leg.raw_points(map)?.as_slice())));
+    let next = next.into_iter().flat_map(|(direction, points)| {
+        (0..points.len()).map(move |i| match direction {
+            TraverseDirection::Forward => points[i],
+            TraverseDirection::Backward => points[points.len() - 1 - i],
+        })
+    });
+    let mut reach = braking_distance + bumper + GAP;
+    for (i, to) in it
+        .local_path()
+        .iter()
+        .rev()
+        .copied()
+        .chain(next)
+        .enumerate()
+    {
+        if i == MAX_LOOKAHEAD_POINTS {
+            return true;
+        }
+        let offset = to - from;
+        if conflicts(from, from + offset.cap_magnitude(reach)) {
+            return true;
+        }
+        reach -= offset.mag();
+        if reach <= 0.0 {
+            break;
+        }
+        from = to;
+    }
+    false
+}
+
 /// Calculates the distance to the closest problematic object in front of the car.
 /// It can be another car or a pedestrian, or it can be a potential collision point from a
 /// car coming perpendicularly.
 fn calc_front_dist<'a>(
     vehicle: &Vehicle,
+    map: &Map,
     trans: &Transform,
     self_obj: &TransportState,
     it: &Itinerary,
@@ -618,6 +722,7 @@ fn calc_front_dist<'a>(
     let on_lane = it.get_travers().map_or(false, |t| t.kind.is_lane());
     let mut flag = 0;
     let mut blocker = QueueHoldReason::Unknown;
+    let mut near_roundabout = None;
     // Collision avoidance
     for (handle, his_pos, nei_physics_obj) in neighs {
         if (nei_physics_obj.height - position.z).abs() > 5.0 {
@@ -655,6 +760,20 @@ fn calc_front_dist<'a>(
                 dist_to_obj -= 1.0;
             }
             if dist_to_obj < min_front_dist {
+                if nei_physics_obj.group == TransportationGroup::Pedestrians
+                    && *near_roundabout.get_or_insert_with(|| on_roundabout_arm(map, it, position))
+                    && !pedestrian_in_braking_path(
+                        map,
+                        it,
+                        trans,
+                        my_radius,
+                        speed.powi(2) / (2.0 * vehicle.kind.deceleration()),
+                        his_pos.z(nei_physics_obj.height),
+                        nei_physics_obj.radius,
+                    )
+                {
+                    continue;
+                }
                 min_front_dist = dist_to_obj;
                 flag = nei_physics_obj.flag;
                 blocker = match (handle, nei_physics_obj.group) {
