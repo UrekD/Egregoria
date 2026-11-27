@@ -1229,6 +1229,356 @@ fn roadtools_roundabout_yields_to_circulating_traffic_and_clears_the_queue() {
     );
 }
 
+fn roundabout_hotfix_movement_only() -> crate::utils::scheduler::SeqSchedule {
+    let mut schedule = Simulation::schedule();
+    schedule.retain_systems(|name| {
+        matches!(
+            name,
+            "pedestrian_decision_system"
+                | "transport_grid_synchronize"
+                | "vehicle_decision_system"
+                | "itinerary_update"
+        )
+    });
+    schedule
+}
+
+fn roundabout_hotfix_walker(
+    sim: &mut Simulation,
+    house: crate::map::BuildingID,
+    position: Vec3,
+    itinerary: Itinerary,
+) -> crate::HumanID {
+    use crate::transportation::{put_pedestrian_in_transport_grid, Location};
+
+    let id = crate::souls::human::spawn_human(sim, house).unwrap();
+    let collider = put_pedestrian_in_transport_grid(&mut sim.write::<TransportGrid>(), position);
+    sim.world.edit_human(id, |human| {
+        human.location = Location::Outside;
+        human.trans.pos = position;
+        human.it = itinerary;
+        human.collider = Some(collider);
+    });
+    id
+}
+
+#[test]
+fn roundabout_hotfix_walks_from_corner_into_crosswalk() {
+    let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 90.0, 180.0, 270.0], 28.0, false);
+    let mut schedule = roundabout_hotfix_movement_only();
+    let house = ctx.build_house_near(ends[0].xy());
+    let (start, destination, route) = {
+        let map = ctx.g.map();
+        let sidewalks = |arm| {
+            let end = junction_at(&map, ends[arm]);
+            map.lanes().values().filter(move |lane| {
+                lane.kind == LaneKind::Walking && (lane.src == end || lane.dst == end)
+            })
+        };
+        sidewalks(0)
+            .flat_map(|from| sidewalks(2).map(move |to| (from, to)))
+            .find_map(|(from, to)| {
+                let near_mouth = |lane: &crate::map::Lane| {
+                    let offset = if lane.dst == junction {
+                        lane.points.length() - 5.0
+                    } else {
+                        5.0
+                    };
+                    lane.points.point_along(offset)
+                };
+                let start = near_mouth(from);
+                let end = near_mouth(to);
+                let route = Itinerary::route(Tick(0), start, end, &map, PathKind::Pedestrian)?;
+                route.get_route()?.reversed_route.windows(2).any(|pair| {
+                    matches!(pair[0].kind, TraverseKind::Turn(id)
+                        if map.get(junction).unwrap().find_turn(id).unwrap().kind == TurnKind::Crosswalk)
+                        && matches!(pair[1].kind, TraverseKind::Turn(id)
+                            if map.get(junction).unwrap().find_turn(id).unwrap().kind == TurnKind::WalkingCorner)
+                }).then_some((start, end, route))
+            })
+            .unwrap()
+    };
+    let id = roundabout_hotfix_walker(&mut ctx.g, house, start, route);
+    // Slow walkers need more than 150 real seconds for two corners and a crossing.
+    for _ in 0..12_000 {
+        ctx.g.tick(&mut schedule, &[]);
+        if ctx.g.world.humans[id].trans.pos.is_close(destination, 0.01) {
+            return;
+        }
+    }
+    let walker = &ctx.g.world.humans[id];
+    panic!(
+        "walker stopped at {:?}, traversal {:?}, intended destination {destination:?}",
+        walker.trans.pos,
+        walker.it.get_travers()
+    );
+}
+
+#[test]
+fn roundabout_hotfix_clears_a_cancelled_crosswalk() {
+    let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 107.0, 218.0], 24.0, false);
+    let mut schedule = roundabout_hotfix_movement_only();
+    let house = ctx.build_house_near(ends[0].xy());
+    let (start, curbs) = {
+        let map = ctx.g.map();
+        let crossing = map.get(junction).unwrap().crosswalks().next().unwrap();
+        (
+            crossing.points.middle(),
+            [crossing.points.first(), crossing.points.last()],
+        )
+    };
+    let id = roundabout_hotfix_walker(&mut ctx.g, house, start, Itinerary::NONE);
+    for _ in 0..2_000 {
+        ctx.g.tick(&mut schedule, &[]);
+    }
+    let walker = &ctx.g.world.humans[id];
+    assert!(
+        curbs
+            .iter()
+            .any(|&curb| walker.trans.pos.is_close(curb, 0.01)),
+        "walker stopped at {:?}",
+        walker.trans.pos
+    );
+    assert!(walker.collider.is_none());
+}
+
+#[test]
+fn roundabout_hotfix_dense_sidewalk_does_not_close_entries() {
+    let (mut ctx, junction, ends) =
+        roundabout_fixture(&[0.0, 38.0, 119.0, 194.0, 279.0], 28.0, false);
+    let mut schedule = roundabout_hotfix_movement_only();
+    let house = ctx.build_house_near(ends[0].xy());
+    ctx.g
+        .write::<crate::souls::residence::Residences>()
+        .by_building
+        .get_mut(&house)
+        .unwrap()
+        .capacity = 260;
+    let (from, to, sidewalk) = {
+        let map = ctx.g.map();
+        let center = map.get(junction).unwrap().pos;
+        let sidewalk = map
+            .lanes()
+            .values()
+            .find(|lane| {
+                lane.kind == LaneKind::Walking
+                    && lane.src == junction
+                    && lane.dst == junction_at(&map, ends[2])
+            })
+            .unwrap();
+        (
+            lane_at(&map, ends[0], center),
+            lane_at(&map, center, ends[1]),
+            sidewalk.points.clone(),
+        )
+    };
+    for _ in 0..260 {
+        let position = sidewalk.point_along(2.0);
+        let route = Itinerary::simple(vec![sidewalk.point_along(5.0), sidewalk.point_along(85.0)]);
+        roundabout_hotfix_walker(&mut ctx.g, house, position, route);
+    }
+    let car = staged_vehicle(&mut ctx.g, VehicleKind::Car, from, to, 8.0);
+    for _ in 0..350 {
+        ctx.g.tick(&mut schedule, &[]);
+    }
+    let car = &ctx.g.world.vehicles[car];
+    assert_ne!(
+        car.it.get_travers().unwrap().kind,
+        TraverseKind::Lane(from),
+        "a sidewalk crowd closed a clear entry: {:?} at {:?}",
+        car.it.get_travers(),
+        car.trans.pos
+    );
+}
+
+#[test]
+fn roundabout_hotfix_four_arm_mixed_traffic_soak() {
+    use crate::utils::par_command_buffer::SimDrop;
+    use std::collections::BTreeMap;
+
+    let (mut ctx, junction, ends) = roundabout_fixture(&[0.0, 90.0, 180.0, 270.0], 20.0, false);
+    let mut schedule = roundabout_hotfix_movement_only();
+    let house = ctx.build_house_near(ends[0].xy());
+    ctx.g
+        .write::<crate::souls::residence::Residences>()
+        .by_building
+        .get_mut(&house)
+        .unwrap()
+        .capacity = 224;
+    let (driving, walking) = {
+        let map = ctx.g.map();
+        let inter = map.get(junction).unwrap();
+        let roads = ends
+            .iter()
+            .map(|&end| {
+                let other = junction_at(&map, end);
+                inter
+                    .roads
+                    .iter()
+                    .map(|&id| map.get(id).unwrap())
+                    .find(|road| road.other_end(junction) == Some(other))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        let driving = roads
+            .iter()
+            .enumerate()
+            .flat_map(|(arm, &road)| {
+                road.incoming_lanes_to(junction)
+                    .iter()
+                    .filter(|(_, kind)| kind.vehicles())
+                    .map(move |&(lane, _)| (arm, lane))
+            })
+            .map(|(arm, from)| {
+                let exits = (1..4)
+                    .map(|delta| {
+                        roads[(arm + delta) % 4]
+                            .outgoing_lanes_from(junction)
+                            .iter()
+                            .find(|(_, kind)| kind.vehicles())
+                            .unwrap()
+                            .0
+                    })
+                    .collect::<Vec<_>>();
+                (from, exits)
+            })
+            .collect::<Vec<_>>();
+        let walking = roads
+            .iter()
+            .flat_map(|road| {
+                let sidewalks = road.sidewalks(junction);
+                [sidewalks.incoming.unwrap(), sidewalks.outgoing.unwrap()]
+            })
+            .collect::<Vec<_>>();
+        (driving, walking)
+    };
+    let mut arrived_cars = 0;
+    let mut arrived_walkers = 0;
+    let mut stuck_cars = BTreeMap::new();
+    let mut stuck_walkers = BTreeMap::new();
+    for wave in 0..8 {
+        let mut cars = BTreeMap::new();
+        let mut walkers = BTreeMap::new();
+        for (i, (from, exits)) in driving.iter().enumerate() {
+            for row in 0..4 {
+                let to = exits[(i + row + wave) % exits.len()];
+                let kind = match (i + row + wave) % 8 {
+                    0 => VehicleKind::Bus,
+                    1 => VehicleKind::Truck,
+                    _ => VehicleKind::Car,
+                };
+                let id = staged_vehicle(
+                    &mut ctx.g,
+                    kind,
+                    *from,
+                    to,
+                    7.0 + row as f32 * 23.0 + (i % 3) as f32 * 7.5,
+                );
+                cars.insert(id, to);
+            }
+        }
+        for i in 0..28 {
+            let (start, end, route) = {
+                let map = ctx.g.map();
+                let from = map.get(walking[i % walking.len()]).unwrap();
+                let to = map
+                    .get(walking[(i + 3 + wave % 4) % walking.len()])
+                    .unwrap();
+                let near_mouth = |lane: &crate::map::Lane, distance| {
+                    lane.points.point_along(if lane.dst == junction {
+                        lane.points.length() - distance
+                    } else {
+                        distance
+                    })
+                };
+                let start = near_mouth(from, 3.0 + (i / walking.len()) as f32 * 4.0);
+                let end = near_mouth(to, 12.0);
+                (
+                    start,
+                    end,
+                    Itinerary::route(
+                        Tick(ctx.g.get_tick()),
+                        start,
+                        end,
+                        &map,
+                        PathKind::Pedestrian,
+                    )
+                    .unwrap(),
+                )
+            };
+            let id = roundabout_hotfix_walker(&mut ctx.g, house, start, route);
+            walkers.insert(id, end);
+        }
+        let mut clear_ticks = 0;
+        let mut dispatched = Vec::new();
+        for _ in 0..36_000 {
+            ctx.g.tick(&mut schedule, &[]);
+            cars.retain(|&id, &mut to| {
+                let car = &ctx.g.world.vehicles[id];
+                let traversal = car.it.get_travers().map(|t| t.kind);
+                if traversal == Some(TraverseKind::Lane(to)) {
+                    let map = ctx.g.map();
+                    if car.trans.pos.distance(map.get(to).unwrap().points.first()) >= 22.0 {
+                        dispatched.push(id);
+                        stuck_cars.remove(&id);
+                        return false;
+                    }
+                }
+                if matches!(traversal, Some(TraverseKind::Turn(turn)) if turn.parent == junction)
+                    && car.speed.0 < 0.01
+                {
+                    *stuck_cars.entry(id).or_insert(0) += 1;
+                } else {
+                    stuck_cars.remove(&id);
+                }
+                true
+            });
+            for id in dispatched.drain(..) {
+                ctx.g
+                    .world
+                    .vehicles
+                    .remove(id)
+                    .unwrap()
+                    .sim_drop(id, &mut ctx.g);
+                arrived_cars += 1;
+            }
+            walkers.retain(|&id, &mut end| {
+                let human = &ctx.g.world.humans[id];
+                if human.trans.pos.is_close(end, 0.01) {
+                    arrived_walkers += 1;
+                    stuck_walkers.remove(&id);
+                    return false;
+                }
+                if human.speed.0 < 0.01 {
+                    let map = ctx.g.map();
+                    if map.get(junction).unwrap().crosswalks().any(|turn| {
+                        turn.points.project_dist2(human.trans.pos) < 0.01
+                            && !human.trans.pos.is_close(turn.points.first(), 0.3)
+                            && !human.trans.pos.is_close(turn.points.last(), 0.3)
+                    }) {
+                        *stuck_walkers.entry(id).or_insert(0) += 1;
+                    }
+                } else {
+                    stuck_walkers.remove(&id);
+                }
+                true
+            });
+            let stuck = stuck_cars
+                .values()
+                .chain(stuck_walkers.values())
+                .any(|&ticks| ticks > 100);
+            clear_ticks = if stuck { 0 } else { clear_ticks + 1 };
+            if cars.is_empty() && walkers.is_empty() {
+                break;
+            }
+        }
+        assert!(cars.is_empty() && walkers.is_empty() && clear_ticks > 5 * prototypes::TICKS_PER_MINUTE,
+            "wave {wave}: {} cars and {} walkers unfinished, {} cars stopped in the ring, {} walkers stopped on crossings, {clear_ticks} clear ticks",
+            cars.len(), walkers.len(), stuck_cars.len(), stuck_walkers.len());
+    }
+    assert_eq!((arrived_cars, arrived_walkers), (224, 224));
+}
+
 #[test]
 fn roadtools_roundabout_recovers_saved_two_arm_junctions() {
     for directions in [&[0.0, 180.0][..], &[0.0, 90.0][..]] {
@@ -1357,7 +1707,8 @@ fn roadtools_roundabout_resumes_a_full_legacy_snapshot_mid_turn() {
     assert_ne!(resumed.local_path(), old_waypoints);
     assert_ne!(loaded.world.humans[human_id].it.local_path(), old_walk);
     assert!(loaded.read::<JunctionAdmission>().crossing_turn(turn));
-    assert!(loaded.read::<JunctionAdmission>().crossing_turn(walk_turn));
+    // The migrated walker stays on the sidewalk and needs no crosswalk claim.
+    assert!(!loaded.read::<JunctionAdmission>().crossing_turn(walk_turn));
     {
         let map = loaded.map();
         let ring = map.get(junction).unwrap().roundabout_geometry().unwrap();

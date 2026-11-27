@@ -373,7 +373,9 @@ pub(crate) fn entry_boundary(
     let next = *route.reversed_route.last()?;
     let crossing = Crossing::from_traversal(next)?;
     let rules = map.junction_rules(crossing.turn.parent);
-    let controlled = configured(map, crossing.turn.parent).is_some();
+    let roundabout = map.is_yield_roundabout(crossing.turn.parent);
+    let controlled = configured(map, crossing.turn.parent).is_some()
+        && !(roundabout && turn_kind(map, crossing.turn) == Some(TurnKind::WalkingCorner));
     if !controlled && rules.is_none_or(|rules| rules.allows(crossing.turn)) {
         return None;
     }
@@ -383,7 +385,7 @@ pub(crate) fn entry_boundary(
         return None;
     }
     let valid = map.allows_turn(crossing.turn)
-        && matches!(route.cur.kind, TraverseKind::Lane(_))
+        && (route.cur.kind.is_lane() || follows_sidewalk_corner(map, route.cur, crossing))
         && route.cur.destination_lane() == crossing.from_lane()
         && route.cur.destination_intersection(map.lanes()) == Some(crossing.turn.parent)
         && (!crossing.backwards || crossing.turn.bidirectional);
@@ -396,6 +398,18 @@ pub(crate) fn entry_boundary(
         bounded: distance.is_some(),
         overlaps: distance.is_some_and(|distance| distance < -0.0001),
     })
+}
+
+fn turn_kind(map: &Map, turn: TurnID) -> Option<TurnKind> {
+    Some(map.get(turn.parent)?.raw_turn(turn)?.kind)
+}
+
+fn follows_sidewalk_corner(map: &Map, current: Traversable, crossing: Crossing) -> bool {
+    matches!(current.kind, TraverseKind::Turn(turn)
+        if map.is_yield_roundabout(crossing.turn.parent)
+            && turn.parent == crossing.turn.parent
+            && turn_kind(map, turn) == Some(TurnKind::WalkingCorner)
+            && turn_kind(map, crossing.turn) == Some(TurnKind::Crosswalk))
 }
 
 fn remaining_distance(it: &Itinerary, position: Vec3) -> Option<f32> {
@@ -446,13 +460,16 @@ impl JunctionFrame {
                 continue;
             };
             let inter = &map.intersections()[junction];
+            let roundabout = map.is_yield_roundabout(junction);
             let reach = Vec2::splat(inter.radius + LOCAL_MARGIN);
             let center = inter.pos.xy();
             let mut owners = BTreeSet::new();
             let candidates = grid.query(center - reach, center + reach);
             let mut complete = true;
             for (i, (handle, _)) in candidates.enumerate() {
-                if i == MAX_LOCAL_OWNERS {
+                // A roundabout's wider search can include whole sidewalks.
+                // An incomplete sample would close every entry until the crowd moves.
+                if !roundabout && i == MAX_LOCAL_OWNERS {
                     complete = false;
                     break;
                 }
@@ -500,6 +517,9 @@ impl JunctionFrame {
                             .as_ref()
                             .filter(|boundary| {
                                 boundary.overlaps
+                                    // Roundabout pedestrians at either sidewalk mouth
+                                    // can safely wait for a grant, even on the last point.
+                                    && (!roundabout || matches!(actor.owner.owner, EntryOwner::Vehicle(_)))
                                     && at_directed_approach(map, boundary.crossing, actor)
                             })
                             .map(|b| b.crossing)
@@ -631,6 +651,14 @@ impl JunctionFrame {
         }
         eligible
             .sort_unstable_by_key(|&(unaged, role, since, owner, _)| (unaged, role, since, owner));
+        let mut occupied_crosswalks = BTreeSet::new();
+        let mut new_sweep = |sweep: &Sweep| {
+            !matches!(sweep.owner.owner, EntryOwner::Human(_))
+                || !map.is_yield_roundabout(sweep.crossing.turn.parent)
+                || occupied_crosswalks.insert(sweep.crossing.turn)
+        };
+        // Keep each walker's claim, but only compare the shared crossing path once.
+        occupied.retain(&mut new_sweep);
         let mut work = MAX_TURN_SEGMENT_PAIRS;
         let mut aged_holds = Vec::new();
         for (unaged, _, _, owner, request) in eligible {
@@ -670,7 +698,9 @@ impl JunctionFrame {
                     aged_holds.push(sweep);
                 }
             } else {
-                occupied.push(sweep);
+                if new_sweep(&sweep) {
+                    occupied.push(sweep);
+                }
                 self.grants.insert(owner, sweep.crossing);
             }
         }
@@ -729,7 +759,11 @@ fn receiving_room(
         return Some(false);
     }
     let start = lane.points.first();
+    let roundabout = map.is_yield_roundabout(request.crossing.turn.parent);
     for actor in actors {
+        if roundabout && matches!(actor.owner.owner, EntryOwner::Human(_)) {
+            continue;
+        }
         *work = work.checked_sub(1)?;
         if actor.owner.owner == request.user.owner
             || !matches!(actor.owner.owner, EntryOwner::Vehicle(_))
@@ -787,15 +821,18 @@ fn at_directed_approach(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> boo
         TraverseDirection::Forward => lane.points.last(),
         TraverseDirection::Backward => lane.points.first(),
     };
-    actor
-        .itinerary
-        .local_path()
-        .first()
-        .is_some_and(|p| p.is_close(endpoint, 0.05))
-        && lane
-            .points
-            .project(actor.position)
-            .is_close(actor.position, 0.8)
+    let Some(terminal) = actor.itinerary.local_path().first() else {
+        return false;
+    };
+    if follows_sidewalk_corner(map, *current, crossing) {
+        let entry = lane.get_inter_node_pos(crossing.turn.parent);
+        return terminal.is_close(entry, 0.05)
+            && current.raw_points(map)
+                .is_some_and(|points| points.project_dist2(actor.position) <= 0.8f32.powi(2));
+    }
+    current.kind.is_lane()
+        && terminal.is_close(endpoint, 0.05)
+        && lane.points.project(actor.position).is_close(actor.position, 0.8)
 }
 
 fn still_occupies(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> bool {
@@ -806,7 +843,11 @@ fn still_occupies(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> bool {
         return false;
     };
     let proper_mode = match actor.owner.owner {
-        EntryOwner::Human(_) => matches!(turn.kind, TurnKind::Crosswalk | TurnKind::WalkingCorner),
+        EntryOwner::Human(_) => {
+            turn.kind == TurnKind::Crosswalk
+                || (turn.kind == TurnKind::WalkingCorner
+                    && !map.is_yield_roundabout(crossing.turn.parent))
+        }
         EntryOwner::Vehicle(_) => turn.kind == TurnKind::Driving,
     };
     if !proper_mode || turn.points.len() > MAX_PATH_POINTS {
@@ -817,9 +858,11 @@ fn still_occupies(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> bool {
     };
     let position = actor.position;
     let half_extent = actor.owner.half_extent;
-    if let Some(active) = Crossing::from_traversal(current) {
-        return crossing == active
-            && turn.points.project(position).distance(position) <= half_extent + GAP;
+    if Crossing::from_traversal(current) == Some(crossing) {
+        return turn.points.project(position).distance(position) <= half_extent + GAP;
+    }
+    if !current.kind.is_lane() && !follows_sidewalk_corner(map, current, crossing) {
+        return false;
     }
     if current.destination_lane() == crossing.from_lane() {
         let entry = if crossing.backwards {
@@ -848,6 +891,16 @@ fn still_occupies(map: &Map, crossing: Crossing, actor: &Actor<'_>) -> bool {
 
 fn conflicts(map: &Map, first: Sweep, second: Sweep, work: &mut usize) -> bool {
     if first.owner.owner == second.owner.owner {
+        return false;
+    }
+    // Walkers can share a roundabout crosswalk. Each of them still protects
+    // the crossing from vehicles until they reach the far curb.
+    if map.is_yield_roundabout(first.crossing.turn.parent)
+        && matches!(
+            (first.owner.owner, second.owner.owner),
+            (EntryOwner::Human(_), EntryOwner::Human(_))
+        )
+    {
         return false;
     }
     if *work == 0 {

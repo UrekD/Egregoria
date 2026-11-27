@@ -1461,7 +1461,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     throughput.begin_tick(map, tick);
     let mut remaining_egress_checks = MAX_EGRESS_CHECKS_PER_TICK;
     let mut checked_clear = Vec::new();
-    if map.has_junction_rules() {
+    if map.needs_junction_entry_checks() {
         world.humans.edit_active(HumanWork::Itinerary, |id, human| {
             if remaining_egress_checks != 0
                 && human.location == Location::Outside

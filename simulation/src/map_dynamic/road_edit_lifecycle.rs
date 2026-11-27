@@ -28,10 +28,16 @@ pub(super) enum PedestrianClearance {
 }
 
 pub(super) fn needs_local_recovery(map: &Map, position: Vec3) -> bool {
-    if !map.has_junction_rules() {
+    if !map.needs_junction_entry_checks() {
         return false;
     }
-    if map.junction_rules_near(position, SEARCH_RADIUS) {
+    let controlled = |id| map.junction_rules(id).is_some() || map.is_yield_roundabout(id);
+    if map.spatial_map()
+        .query_around(position.xy(), SEARCH_RADIUS, ProjectFilter::INTER)
+        .any(|candidate| matches!(candidate, ProjectKind::Intersection(id)
+            if controlled(id)
+                && map.get(id).is_some_and(|junction| (position.z - junction.pos.z).abs() < 1.0)))
+    {
         return true;
     }
     // The road endpoint is the spatial anchor for a crossing clipped
@@ -44,7 +50,7 @@ pub(super) fn needs_local_recovery(map: &Map, position: Vec3) -> bool {
             };
             map.get(id).is_some_and(|road| {
                 [road.src, road.dst].into_iter().any(|id| {
-                    map.junction_rules(id).is_some()
+                    controlled(id)
                         && map.get(id).is_some_and(|junction| {
                             junction
                                 .crosswalks()
