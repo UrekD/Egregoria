@@ -108,16 +108,20 @@ pub(crate) struct ParkingWalkRoadCursor {
     seen: FastSet<RoadID>,
 }
 
+#[derive(Clone)]
 pub struct SpatialMap {
     broad: BroadGrid,
     occupancy: AABBGrid<ProjectKind, AABB>,
     occupancy_ids: BTreeMap<ProjectKind, AABBGridHandle>,
     cuts: AABBGrid<ProjectKind, AABB>,
     cut_ids: BTreeMap<ProjectKind, AABBGridHandle>,
-    near: BTreeMap<ProjectKind, ShapeEnum>,
+    near: BTreeMap<ProjectKind, std::sync::Arc<ShapeEnum>>,
     ids: BTreeMap<ProjectKind, AABBGridHandle>,
 }
 
+// The broad grid uses the same storage and handles as AABBGrid, whose public
+// API only supports removing entries one at a time.
+#[derive(Clone)]
 struct BroadGrid {
     storage: SparseStorage<BroadCell>,
     objects: AABBGridObjects<ProjectKind, AABB>,
@@ -126,7 +130,7 @@ struct BroadGrid {
     removal_scan_entries: usize,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct BroadCell {
     entries: Vec<(AABBGridHandle, bool)>,
     // The position is the mixed-grid query order, including swap-removals.
@@ -404,7 +408,7 @@ impl SpatialMap {
             self.broad.remove(old_handle);
         }
         self.update_auxiliary(obj);
-        self.near.insert(kind, shape);
+        self.near.insert(kind, shape.into());
     }
 
     pub fn remove(&mut self, kind: impl Into<ProjectKind>) {
@@ -443,7 +447,7 @@ impl SpatialMap {
         if let Some(id) = self.ids.get(&kind) {
             self.broad.set_aabb(*id, shape.bbox());
             self.update_auxiliary(obj);
-            self.near.insert(kind, shape);
+            self.near.insert(kind, shape.into());
         } else {
             warn!(
                 "trying to update shape {:?} from spatial map but it wasn't present",
@@ -517,7 +521,7 @@ impl SpatialMap {
         self.broad
             .query(shape.bbox(), filter.0 == ProjectFilter::LOT.0)
             .filter(move |&(_, _, p)| filter.test(p))
-            .filter_map(move |(_, _, p)| shape.intersects(self.near.get(p)?).then_some(*p))
+            .filter_map(move |(_, _, p)| shape.intersects(self.near.get(p)?.as_ref()).then_some(*p))
     }
 
     pub(crate) fn reserve_apron_query(&self, bounds: AABB, work: &mut usize) -> Result<(), WaterEditError> {

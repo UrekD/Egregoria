@@ -7,7 +7,6 @@ use yakui::{center, reflow, Alignment, Dim2, Pivot};
 use common::saveload::{write_atomic, AtomicWriteError, Encoder, JSONPretty, JSON};
 use engine::InputContext;
 use goryak::{blur_bg, constrained_viewport, mincolumn, on_secondary, primary, textc, titlec};
-use simulation::Simulation;
 
 use crate::inputmap::{Bindings, InputAction, InputCombination, InputMap, UnitInput};
 use crate::uiworld::UiWorld;
@@ -31,7 +30,7 @@ pub struct KeybindStateInner {
     pub cur: InputCombination,
 }
 
-pub fn keybind_modal(uiw: &UiWorld, _: &Simulation) {
+pub fn keybind_modal(uiw: &UiWorld) {
     profiling::scope!("hud::keybind_modal");
 
     let mut state = uiw.write::<KeybindState>();

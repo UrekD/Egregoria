@@ -708,7 +708,7 @@ mod tests {
         use std::time::Instant;
 
         let mut map = Map::empty();
-        map.environment = Environment::new(13, 13);
+        map.environment = Environment::new(13, 13).into();
         let stroke = |i: usize| {
             let x = 288.0 + (i % 11) as f32 * 576.0;
             let y = 288.0 + (i / 11) as f32 * 576.0;

@@ -2003,6 +2003,18 @@ impl Simulation {
         self.resources.insert(CurbOnlyBenchmark);
     }
 
+    pub fn parking_pavement_snapshot(&self) -> BTreeMap<BuildingID, Vec<[Vec3; 2]>> {
+        self.read::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .sites
+            .iter()
+            .filter_map(|(&id, site)| {
+                let pavement = site.layout.pavement();
+                (!pavement.is_empty()).then_some((id, pavement))
+            })
+            .collect()
+    }
+
     pub fn parking_pavement(&self, id: BuildingID) -> Vec<[Vec3; 2]> {
         self.read::<crate::transportation::DrivewayTraffic>()
             .properties

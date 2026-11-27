@@ -24,6 +24,7 @@ bitflags::bitflags! {
         const Terrain = 1 << 2;
         const Water = 1 << 3;
         const RoadSupport = 1 << 4;
+        const Land = 1 << 5;
     }
 }
 
@@ -32,7 +33,16 @@ pub struct MapSubscribers(Mutex<Vec<MapSubscriber>>);
 
 impl MapSubscribers {
     pub fn subscribe(&self, filter: UpdateType) -> MapSubscriber {
-        let sub = MapSubscriber::new(filter);
+        self.add(MapSubscriber::new(filter))
+    }
+
+    pub fn subscribe_limited(&self, filter: UpdateType, limit: usize) -> MapSubscriber {
+        let mut sub = MapSubscriber::new(filter);
+        sub.limit = Some(limit);
+        self.add(sub)
+    }
+
+    fn add(&self, sub: MapSubscriber) -> MapSubscriber {
         self.0.lock().unwrap().push(sub.clone());
         sub
     }
@@ -52,7 +62,9 @@ impl MapSubscribers {
         for sub in self.0.lock().unwrap().iter() {
             let mut inner = sub.inner.lock().unwrap();
             inner.cleared = true;
-            if sub.filter.intersects(UpdateType::all()) {
+            if sub.limit.is_some() {
+                inner.updated_chunks.clear();
+            } else if sub.filter.intersects(UpdateType::all()) {
                 inner.updated_chunks.clone_from(&buckets);
             }
         }
@@ -117,6 +129,7 @@ pub struct MapSubscriberInner {
 #[derive(Clone)]
 pub struct MapSubscriber {
     filter: UpdateType,
+    limit: Option<usize>,
     inner: Arc<Mutex<MapSubscriberInner>>,
 }
 
@@ -124,7 +137,21 @@ impl MapSubscriber {
     pub fn new(update_type: UpdateType) -> Self {
         Self {
             filter: update_type,
+            limit: None,
             inner: Default::default(),
+        }
+    }
+
+    /// Drain a render journal as one boundary. A subscriber that has fallen
+    /// behind can use the full source instead of carrying an unbounded delta.
+    pub fn take_changes(&mut self, limit: usize) -> (bool, BTreeSet<SubscriberChunkID>) {
+        let mut inner = self.inner.lock().unwrap();
+        let cleared = std::mem::take(&mut inner.cleared);
+        let chunks = std::mem::take(&mut inner.updated_chunks);
+        if cleared || chunks.len() > limit {
+            (true, BTreeSet::new())
+        } else {
+            (false, chunks)
         }
     }
 
@@ -148,7 +175,17 @@ impl MapSubscriber {
             return;
         }
         let mut inner = self.inner.lock().unwrap();
+        if self.limit.is_some() && inner.cleared {
+            return;
+        }
         inner.updated_chunks.insert(chunk_id);
+        if self
+            .limit
+            .is_some_and(|limit| inner.updated_chunks.len() > limit)
+        {
+            inner.updated_chunks.clear();
+            inner.cleared = true;
+        }
     }
 }
 

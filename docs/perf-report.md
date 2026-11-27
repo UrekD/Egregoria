@@ -27,10 +27,29 @@ The benchmark loads prototypes from `base_mod` beside the executable, with the s
 
 The top-level `ticks_per_sec` field reports completed simulation steps per wall-clock second during the 3,000 measured ticks. Divide it by 50 to compare with the game's MAX readout. Use `--slot lesce_osm` if you reproduced the slowdown in the Lesce OpenStreetMap import. The benchmark loads the selected save and runs it in memory. Share the benchmark JSON alongside the frame report for the same city.
 
+## Compare MAX with headless throughput
+
+Let the city run at **MAX** for several seconds before saving the frame report. In PowerShell, load that report and the benchmark output from the same starting save.
+
+```powershell
+$report = Get-Content .\world\frame-profile.json -Raw | ConvertFrom-Json
+$headless = Get-Content .\lesce-town-bench.json -Raw | ConvertFrom-Json
+$max = @($report.frames | Where-Object { $_.requested_warp -eq 10000 -and $null -ne $_.sim_step })
+$first = $max[0]
+$last = $max[-1]
+$seconds = ($last.sim_sample_ms - $first.sim_sample_ms) / 1000
+$stepsPerSecond = ($last.sim_step - $first.sim_step) / $seconds
+"In-game {0:N0} steps/s, headless {1:N0} steps/s, ratio {2:P1}" -f $stepsPerSecond, $headless.ticks_per_sec, ($stepsPerSecond / $headless.ticks_per_sec)
+```
+
+Use a report with one uninterrupted MAX interval and at least two MAX samples. Pauses and city reloads interrupt the measurement. For repeat runs, reload the same save and use the same camera and graphics settings. If you made no city edits, you can benchmark the exact interval by passing the first MAX sample’s `sim_step` to `--warmup` and the difference between the last and first samples to `--ticks`.
+
 ## Reading the report
 
 - `cpu_phases` and `gpu_passes` give the column order for each frame's timing arrays. Times are in milliseconds. A missing pass or result is `null`. `gpu_status` explains whole-frame GPU gaps, including busy readback slots and results still pending at export.
 - `present_interval_ms` measures wall time between successful present calls and includes skipped redraws. `sim_sample_ms` is the monotonic time when the paired `sim_step` counter was read, relative to the first recorded simulation sample of the session. `sim_steps_per_second` uses changes in those paired samples over intervals of at least 500 ms. A rate of 50 steps/s is 1×.
+- `sim_steps` counts the completed steps between presented samples. `sim_read_lease_ms` measures time the client holds an authoritative read lease. Worker wait fields measure time spent waiting for a held read (`sim_worker_read_wait_ms`) or a reserved redraw turn (`sim_worker_redraw_wait_ms`). `sim_worker_max_idle_ms` includes both when the worker is at MAX, plus other worker waits at MAX.
+- `sim_worker_snapshot_ms` and `sim_client_snapshot_ms` time active snapshot capture on the worker and client, respectively. These elapsed times exclude admission waits. `sim_actor_scans` counts actor captures, `sim_actor_buffer_grows` counts buffers whose capacity increased during capture, and `sim_actor_pool_bytes` reports the retained actor and reroute vector capacity in bytes.
 - `encode_jobs` sums elapsed times for scene encoding jobs, including encoder setup, deferred work, and finalization. Parallel jobs can overlap each other and `ui_build_encode`, so their summed duration can exceed the frame's wall time. `map_mesh` includes terrain packing and uploads, heightmap regeneration commands, road meshes, and lamp preparation. `world_prep` covers the surrounding update work.
 - `lamp_update`, `heightmap_resample`, and `heightmap_normals` appear when the renderer rebuilds those resources, such as after loading a city or editing roads or terrain. The main GPU pass includes water draws. PBR stages and UI blur each span their constituent subpasses. Yakui needs optional encoder timestamps and may be absent on some adapters.
 

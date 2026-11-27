@@ -8,6 +8,7 @@ use goryak::{
     background, blur_bg, button_primary, button_secondary, constrained_viewport, mincolumn, minrow,
     on_primary_container, on_secondary_container, padxy, secondary_container, textc, tooltip,
 };
+#[cfg(test)]
 use simulation::economy::Government;
 use simulation::Simulation;
 
@@ -15,7 +16,13 @@ use crate::gui::GuiState;
 use crate::session::{self, Departure};
 use crate::uiworld::{SaveLoadState, UiWorld};
 
+#[cfg(test)]
 pub fn menu_bar(uiworld: &UiWorld, sim: &Simulation) {
+    let money = sim.read::<Government>().money;
+    menu_bar_view(uiworld, Some(sim), money);
+}
+
+pub(super) fn menu_bar_view(uiworld: &UiWorld, sim: Option<&Simulation>, money: prototypes::Money) {
     profiling::scope!("hud::menu_bar");
 
     reflow(Alignment::TOP_LEFT, Pivot::TOP_LEFT, Dim2::ZERO, || {
@@ -31,10 +38,7 @@ pub fn menu_bar(uiworld: &UiWorld, sim: &Simulation) {
                                     return;
                                 }
                                 save_window(uiworld, sim);
-                                textc(
-                                    on_primary_container(),
-                                    format!("Money: {}", sim.read::<Government>().money),
-                                );
+                                textc(on_primary_container(), format!("Money: {money}"));
                                 crate::gui::overlays::selector(uiworld, gui.show_unfinished_ui);
                             });
                         });
@@ -46,7 +50,7 @@ pub fn menu_bar(uiworld: &UiWorld, sim: &Simulation) {
     });
 }
 
-fn windows_dropdown(uiworld: &UiWorld, sim: &Simulation, gui: &mut GuiState) {
+fn windows_dropdown(uiworld: &UiWorld, sim: Option<&Simulation>, gui: &mut GuiState) {
     mincolumn(0.0, || {
         let open = use_state(|| false);
         let toggle = tooltip("City windows and settings", || {
@@ -112,7 +116,7 @@ pub(super) fn render_departure(uiw: &UiWorld) {
     }
 }
 
-fn save_window(uiw: &UiWorld, sim: &Simulation) {
+fn save_window(uiw: &UiWorld, sim: Option<&Simulation>) {
     if session::can_save(uiw) {
         let busy = {
             let io = uiw.read::<SaveLoadState>();
@@ -125,7 +129,7 @@ fn save_window(uiw: &UiWorld, sim: &Simulation) {
         }
     }
     if tooltip("Exit the game", || button_secondary("Exit").show()).clicked {
-        session::request_departure(uiw, sim, Departure::Exit);
+        session::request_departure_when_ready(uiw, sim, Departure::Exit);
     }
 }
 
@@ -204,7 +208,7 @@ mod tests {
         column(|| {
             menu_bar(&uiworld, &sim);
             time_controls(&uiworld, &sim);
-            demand_bars::render(&uiworld, &sim);
+            demand_bars::render(&demand_bars::DemandSnapshot::capture(&sim));
         });
         ui.finish();
 

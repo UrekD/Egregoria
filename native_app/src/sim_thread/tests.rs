@@ -104,8 +104,61 @@ fn scale_t1_admission_yields_to_both_roles() {
     let writer = admission.write().unwrap();
     assert!(admission.read().is_none());
     drop(writer);
-    assert!(matches!(admission.write(), Err(WorkerWait::Timeout(_))));
+    assert!(matches!(admission.write(), Err(WorkerWait::Redraw(_))));
     assert!(admission.read().is_some());
+}
+
+#[test]
+fn client_max_optional_frame_read_does_not_reserve_a_redraw() {
+    let admission = Admission::default();
+    let writer = admission.write().unwrap();
+    assert!(admission.read_for_frame(false).is_none());
+    drop(writer);
+
+    assert!(
+        admission.write().is_ok(),
+        "a missed optional read must not stall the worker"
+    );
+    assert!(admission.read_for_frame(false).is_some());
+}
+
+#[test]
+fn client_max_worker_publishes_owned_views_without_waiting_for_redraw() {
+    let (sim, schedule) = world();
+    let mut driver = SimThread::start(sim, schedule, 17, None);
+    let view = driver.view();
+    view.enable_wait_profile();
+    assert!(driver.submit(Request::SetWarp(MAX_WARP)).is_ok());
+    assert!(matches!(receive(&mut driver).kind, ReplyKind::WarpSet));
+
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut request = Some(ViewRequest { camera: None });
+    let first = loop {
+        if let Some(update) = view.poll_render(request.take()) {
+            break update;
+        }
+        // A poll can miss while the worker is publishing. Requests coalesce.
+        request = Some(ViewRequest { camera: None });
+        assert!(Instant::now() < deadline, "no render snapshot");
+        thread::sleep(Duration::from_millis(1));
+    };
+    assert_eq!(first.view.stamp.generation, 17);
+    let map = first
+        .map
+        .expect("the first publication includes map geometry");
+    assert_eq!(map.target_epoch, first.view.stamp.map_epoch);
+    let first_step = first.view.stamp.completed_step;
+
+    while view.completed_step() < first_step + 4 {
+        assert!(
+            Instant::now() < deadline,
+            "holding a render snapshot stopped the worker"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(first.view.stamp.completed_step, first_step);
+    assert_eq!(view.work_totals().read_lease_ns, 0);
+    assert_eq!(view.work_totals().redraw_turn_ns, 0);
 }
 
 #[test]
@@ -149,7 +202,7 @@ fn winperf_writer_cancellation_wakes_a_waiting_redraw_once() {
         .expect("canceling writer intent must wake the redraw");
     admission.cancel_write();
     assert!(redraw.try_recv().is_err());
-    assert!(matches!(admission.write(), Err(WorkerWait::Timeout(_))));
+    assert!(matches!(admission.write(), Err(WorkerWait::Redraw(_))));
     assert!(admission.read().is_some());
 }
 

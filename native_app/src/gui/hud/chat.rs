@@ -1,15 +1,12 @@
-use egui::TextBuffer;
 use yakui::{constrained, reflow, Alignment, Color, Constraints, Dim2, Pivot, Vec2};
 
 use goryak::{
     blur_bg, fixed_spacer, mincolumn, padxy, secondary_container, text_edit, textc, VertScroll,
     VertScrollSize,
 };
-use prototypes::{GameDuration, GameTime};
+use prototypes::GameTime;
 use simulation::multiplayer::chat::{Message, MessageKind};
-use simulation::multiplayer::MultiplayerState;
 use simulation::world_command::WorldCommand;
-use simulation::Simulation;
 
 use crate::inputmap::{InputAction, InputMap};
 use crate::uiworld::UiWorld;
@@ -18,6 +15,7 @@ use crate::uiworld::UiWorld;
 pub struct GUIChatState {
     cur_msg: String,
     chat_bar_showed: bool,
+    pending: Option<String>,
 }
 
 pub(crate) fn close(uiw: &UiWorld) -> bool {
@@ -29,28 +27,41 @@ pub(crate) fn close(uiw: &UiWorld) -> bool {
     true
 }
 
-pub fn chat(uiw: &UiWorld, sim: &Simulation) {
-    const MAX_MESSAGES: usize = 30;
-    let mut state = uiw.write::<GUIChatState>();
-    let five_minute_ago = sim.read::<GameTime>().instant() - GameDuration::from_minutes(5);
-
-    let mstate = sim.read::<MultiplayerState>();
-
-    let just_opened = uiw
-        .read::<InputMap>()
-        .just_act
-        .contains(&InputAction::OpenChat);
-
-    if just_opened {
-        state.chat_bar_showed = true;
+pub(crate) fn open_from_input(uiw: &UiWorld) {
+    if crate::session::world_interaction(uiw)
+        && !uiw.read::<crate::gui::GuiState>().hidden
+        && uiw
+            .read::<InputMap>()
+            .just_act
+            .contains(&InputAction::OpenChat)
+    {
+        uiw.write::<GUIChatState>().chat_bar_showed = true;
     }
+}
 
-    let msgs: Vec<_> = mstate
-        .chat
-        .messages_since(five_minute_ago)
-        .take(MAX_MESSAGES)
-        .collect();
+pub(crate) fn pending(uiw: &UiWorld) -> bool {
+    uiw.read::<GUIChatState>().pending.is_some()
+}
 
+pub(crate) fn submit_pending(uiw: &UiWorld, time: GameTime) {
+    if !uiw.can_author() || !crate::session::world_interaction(uiw) {
+        return;
+    }
+    if let Some(text) = uiw.write::<GUIChatState>().pending.take() {
+        uiw.commands().push(WorldCommand::SendMessage {
+            message: Message {
+                name: "player".to_string(),
+                text,
+                sent_at: time.instant(),
+                color: geom::Color::WHITE,
+                kind: MessageKind::PlayerChat,
+            },
+        });
+    }
+}
+
+pub(super) fn render(uiw: &UiWorld, msgs: &[Message]) {
+    let mut state = uiw.write::<GUIChatState>();
     if !state.chat_bar_showed && msgs.is_empty() {
         return;
     }
@@ -98,17 +109,9 @@ pub fn chat(uiw: &UiWorld, sim: &Simulation) {
                     if state.chat_bar_showed {
                         if text_edit(250.0, &mut state.cur_msg, "")
                             && !state.cur_msg.is_empty()
-                            && uiw.can_author()
+                            && state.pending.is_none()
                         {
-                            uiw.commands().push(WorldCommand::SendMessage {
-                                message: Message {
-                                    name: "player".to_string(),
-                                    text: state.cur_msg.take(),
-                                    sent_at: sim.read::<GameTime>().instant(),
-                                    color: geom::Color::WHITE,
-                                    kind: MessageKind::PlayerChat,
-                                },
-                            });
+                            state.pending = Some(std::mem::take(&mut state.cur_msg));
                             state.chat_bar_showed = false;
                         }
                     } else {
@@ -118,4 +121,88 @@ pub fn chat(uiw: &UiWorld, sim: &Simulation) {
             });
         },
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use yakui::event::Event;
+    use yakui::input::{KeyCode, MouseButton};
+    use yakui::{Rect, WidgetId, Yakui};
+
+    fn textbox(ui: &Yakui, id: WidgetId) -> Option<WidgetId> {
+        let node = ui.dom().get(id)?;
+        if node.widget.is::<yakui::widgets::TextBoxWidget>() {
+            return Some(id);
+        }
+        node.children.iter().find_map(|&id| textbox(ui, id))
+    }
+
+    #[test]
+    fn client_max_chat_composer_keeps_focus_through_owned_redraw() {
+        scenarios::ensure_repo_root_cwd();
+        crate::init::init();
+        let uiw = UiWorld::with_defaults();
+        *uiw.write::<crate::session::SessionScreen>() = crate::session::SessionScreen::Playing;
+        uiw.write::<InputMap>()
+            .just_act
+            .insert(InputAction::OpenChat);
+        open_from_input(&uiw);
+        uiw.write::<InputMap>().just_act.clear();
+        let mut yak = Yakui::new();
+        let viewport = Vec2::new(800.0, 700.0);
+        yak.set_surface_size(viewport);
+        yak.set_unscaled_viewport(Rect::from_pos_size(Vec2::ZERO, viewport));
+        let frame = |yak: &mut Yakui| {
+            yak.start();
+            render(&uiw, &[]);
+            yak.finish();
+        };
+        frame(&mut yak);
+        let id = textbox(&yak, yak.dom().root()).unwrap();
+        let bounds = yak.layout_dom().get(id).unwrap().rect;
+        yak.handle_event(Event::CursorMoved(Some(bounds.pos() + bounds.size() * 0.5)));
+        frame(&mut yak);
+        yak.handle_event(Event::MouseButtonChanged {
+            button: MouseButton::One,
+            down: true,
+        });
+        yak.handle_event(Event::MouseButtonChanged {
+            button: MouseButton::One,
+            down: false,
+        });
+        frame(&mut yak);
+        yak.handle_event(Event::TextInput('a'));
+        frame(&mut yak);
+        assert_eq!(textbox(&yak, yak.dom().root()), Some(id));
+        assert_eq!(uiw.read::<GUIChatState>().cur_msg, "a");
+        // Yakui applies the updated controlled text as widget props on the next draw.
+        frame(&mut yak);
+        yak.handle_event(Event::TextInput('b'));
+        frame(&mut yak);
+        assert_eq!(uiw.read::<GUIChatState>().cur_msg, "ab");
+        yak.handle_event(Event::KeyChanged {
+            key: KeyCode::Enter,
+            down: true,
+        });
+        frame(&mut yak);
+        assert!(uiw.read::<GUIChatState>().cur_msg.is_empty());
+        assert!(uiw.commands().is_empty());
+        let time = GameTime::new(prototypes::Tick(123));
+        uiw.write::<crate::uiworld::SaveLoadState>()
+            .authoring_blocked = true;
+        submit_pending(&uiw, time);
+        assert!(pending(&uiw));
+        assert!(uiw.commands().is_empty());
+
+        uiw.write::<crate::uiworld::SaveLoadState>()
+            .authoring_blocked = false;
+        submit_pending(&uiw, time);
+        submit_pending(&uiw, time);
+        assert!(
+            matches!(uiw.commands().as_ref(), [WorldCommand::SendMessage { message }]
+            if message.text == "ab" && message.sent_at == time.instant())
+        );
+        assert!(!pending(&uiw));
+    }
 }

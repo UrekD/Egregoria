@@ -1,9 +1,8 @@
-use crate::uiworld::UiWorld;
 use engine::{AudioContext, AudioKind, Gain, GainControl};
 use flat_spatial::grid::GridHandle;
-use geom::{Camera, Vec2, AABB};
+use geom::{Vec2, Vec3, AABB};
 use oddio::{Cycle, Mixed, Seek, Speed, SpeedControl};
-use simulation::transportation::TransportGrid;
+use simulation::transportation::{TransportGrid, TransportationGroup};
 use simulation::Simulation;
 use slotmapd::SecondaryMap;
 
@@ -19,6 +18,19 @@ impl CarSound {
             mixed.stop();
         }
     }
+}
+
+const HEAR_RADIUS: f32 = 200.0;
+
+#[cfg(not(debug_assertions))]
+const MAX_SOUNDS: usize = 30;
+#[cfg(debug_assertions)]
+const MAX_SOUNDS: usize = 1;
+
+pub(super) struct CarAudio {
+    camera: Vec3,
+    cars: Vec<(GridHandle, Vec2, Vec2, f32)>,
+    nearby_count: usize,
 }
 
 /// CarSounds are sounds that are played when cars are near the player
@@ -51,54 +63,64 @@ impl CarSounds {
         }
     }
 
-    pub fn update(&mut self, sim: &Simulation, uiworld: &UiWorld, ctx: &mut AudioContext) {
-        let transport_grid = sim.read::<TransportGrid>();
-        let campos = uiworld.read::<Camera>().eye();
-        let cambox = AABB::centered(campos.xy(), Vec2::splat(200.0));
+    pub(super) fn capture(&self, sim: &Simulation, camera: Vec3) -> CarAudio {
+        let grid = sim.read::<TransportGrid>();
+        let mut cars = Vec::with_capacity(MAX_SOUNDS);
 
-        const HEAR_RADIUS: f32 = 200.0;
-
-        #[cfg(not(debug_assertions))]
-        const MAX_SOUNDS: usize = 30;
-        #[cfg(debug_assertions)]
-        const MAX_SOUNDS: usize = 1;
-
-        let mut to_remove = vec![];
-
-        for (h, _) in &self.sounds {
-            if let Some((pos, _)) = transport_grid.get(h) {
-                if pos.z0().is_close(campos, HEAR_RADIUS) {
-                    continue;
+        for (handle, _) in &self.sounds {
+            if let Some((pos, car)) = grid.get(handle) {
+                if pos.z0().is_close(camera, HEAR_RADIUS) {
+                    cars.push((handle, pos, car.dir, car.speed));
                 }
             }
-
-            to_remove.push(h);
         }
-
-        for h in to_remove {
-            self.sounds.remove(h).unwrap().stop();
-        }
-
-        // Gather
-        for (h, _) in transport_grid.query_around(
-            campos.xy(),
-            (HEAR_RADIUS * HEAR_RADIUS - campos.z * campos.z)
-                .max(0.0)
-                .sqrt(),
-        ) {
-            let (pos, obj) = transport_grid.get(h).unwrap();
-            if !matches!(
-                obj.group,
-                simulation::transportation::TransportationGroup::Vehicles
-            ) {
-                continue;
-            }
-
-            if self.sounds.len() >= MAX_SOUNDS {
+        let search = (HEAR_RADIUS * HEAR_RADIUS - camera.z * camera.z)
+            .max(0.0)
+            .sqrt();
+        for (handle, _) in grid.query_around(camera.xy(), search) {
+            if cars.len() == MAX_SOUNDS {
                 break;
             }
+            if self.sounds.contains_key(handle) {
+                continue;
+            }
+            if let Some((pos, car)) = grid.get(handle) {
+                if matches!(car.group, TransportationGroup::Vehicles) {
+                    cars.push((handle, pos, car.dir, car.speed));
+                }
+            }
+        }
+        let nearby_count = if camera.z < 1000.0 {
+            let bounds = AABB::centered(camera.xy(), Vec2::splat(200.0));
+            grid.query_aabb(bounds.ll, bounds.ur)
+                .filter_map(|(handle, _)| grid.get(handle))
+                .filter(|(_, car)| matches!(car.group, TransportationGroup::Vehicles))
+                .take(100)
+                .count()
+        } else {
+            0
+        };
+        CarAudio {
+            camera,
+            cars,
+            nearby_count,
+        }
+    }
 
-            if !self.sounds.contains_key(h) {
+    pub(super) fn update(&mut self, input: CarAudio, ctx: &mut AudioContext) {
+        self.sounds.retain(|handle, sound| {
+            if input.cars.iter().any(|&(id, ..)| id == handle) {
+                return true;
+            }
+            for (_, _, mixed) in [&mut sound.road, &mut sound.engine].into_iter().flatten() {
+                mixed.stop();
+            }
+            false
+        });
+
+        let campos = input.camera;
+        for (handle, pos, heading, velocity) in input.cars {
+            if !self.sounds.contains_key(handle) {
                 let engine = ctx
                     .play_with_control(
                         "car_engine",
@@ -127,50 +149,27 @@ impl CarSounds {
                     )
                     .map(|((a, b), c)| (a, b, c));
 
-                self.sounds.insert(h, CarSound { road, engine });
+                self.sounds.insert(handle, CarSound { road, engine });
             }
-        }
-
-        // Update
-        for (h, cs) in &mut self.sounds {
-            let (pos, obj) = transport_grid.get(h).unwrap(); // Unwrap ok: checked it existed before
-
-            let his_speed = (obj.speed * obj.dir).z0();
+            let cs = &mut self.sounds[handle];
+            let his_speed = (velocity * heading).z0();
             let dir_to_me = (campos - pos.z(campos.z * 0.5)).normalize();
-
             let speed_to_me = his_speed.dot(dir_to_me);
             let boost = 300.0 / (300.0 - speed_to_me);
 
             if let Some((ref mut speed, ref mut gain, _)) = cs.road {
-                gain.set_amplitude_ratio(obj.speed.sqrt() * 3.0 / pos.z0().distance(campos));
+                gain.set_amplitude_ratio(velocity.sqrt() * 3.0 / pos.z0().distance(campos));
                 speed.set_speed(boost)
             }
-
             if let Some((ref mut speed, ref mut gain, _)) = cs.engine {
-                gain.set_amplitude_ratio(obj.speed.sqrt() / pos.z0().distance(campos));
+                gain.set_amplitude_ratio(velocity.sqrt() / pos.z0().distance(campos));
                 speed.set_speed(boost)
             }
         }
 
-        if campos.z < 1000.0 {
-            let cars_on_screen = transport_grid
-                .query_aabb(cambox.ll, cambox.ur)
-                .filter_map(|(h, _)| transport_grid.get(h))
-                .filter(|(_, obj)| {
-                    matches!(
-                        obj.group,
-                        simulation::transportation::TransportationGroup::Vehicles
-                    )
-                })
-                .count();
-            if let Some(ref mut s) = self.generic_car_sound {
-                s.set_amplitude_ratio(
-                    ((cars_on_screen as f32).min(100.0) / 100.0 * (1.0 - campos.z / 1000.0))
-                        .min(0.03),
-                );
-            }
-        } else if let Some(ref mut s) = self.generic_car_sound {
-            s.set_amplitude_ratio(0.0);
+        if let Some(ref mut sound) = self.generic_car_sound {
+            let gain = input.nearby_count as f32 / 100.0 * (1.0 - campos.z / 1000.0);
+            sound.set_amplitude_ratio(gain.clamp(0.0, 0.03));
         }
     }
 }

@@ -1,7 +1,7 @@
 mod ground;
 pub(crate) mod land_tiles;
 mod legend;
-pub(crate) use ground::prepare_ground;
+pub(crate) use ground::{invalidate_ground_epoch, prepare_ground, GroundPrep};
 pub(crate) use legend::UTILITY_EXPLANATION;
 mod traffic;
 mod transit;

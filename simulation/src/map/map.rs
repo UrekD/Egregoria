@@ -11,7 +11,7 @@ use crate::map::{
     LaneScoringPilot, Lot, LotID, LotKind, LotLayout, MapSubscriber, MapSubscribers, ParkingSpotID,
     ParkingSpots, PreparedBuilding, PreparedEffects, PreparedGrowableAppearance,
     PreparedTopologyEdit, ProjectFilter, ProjectKind, Road, RoadID, RoadSegmentKind, SpatialMap,
-    SpatialMapObject, TerraformKind, TerrainChunkID, UpdateType, WaterEditError, Zone,
+    SpatialMapObject, TerraformKind, TerrainChunkID, UpdateType, WaterEditError, Zone, ZoneCell,
     MAX_DECK_TILE_TESTS, ROAD_Z_OFFSET,
 };
 use geom::OBB;
@@ -21,8 +21,9 @@ use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
 use slotmapd::{new_key_type, HopSlotMap, Key, SlotMap};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[path = "water_edit.rs"]
 mod water_edit;
@@ -155,21 +156,52 @@ impl PreparedSpecialBuilding {
     }
 }
 
+// Geometry is shared with the native renderer. A write detaches only the
+// affected store, so a published source can outlive the simulation boundary.
+#[derive(Clone, Default)]
+pub(crate) struct SharedGeometry<T>(Arc<T>);
+
+impl<T> From<T> for SharedGeometry<T> {
+    fn from(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl<T: Serialize> Serialize for SharedGeometry<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<T> Deref for SharedGeometry<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> DerefMut for SharedGeometry<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 pub struct Map {
     pub(crate) service_frontages: BTreeMap<RoadID, Vec<(BuildingID, OBB)>>,
     pub(crate) active_service_frontages: BTreeSet<(RoadID, BuildingID)>,
     pub(super) land_ownership: super::LandOwnership,
     pub(super) land_frontage: super::land_frontage::LandFrontage,
-    pub(crate) roads: Roads,
-    pub(crate) lanes: Lanes,
-    pub(crate) intersections: Intersections,
-    pub(crate) buildings: Buildings,
+    pub(crate) roads: SharedGeometry<Roads>,
+    pub(crate) lanes: SharedGeometry<Lanes>,
+    pub(crate) intersections: SharedGeometry<Intersections>,
+    pub(crate) buildings: SharedGeometry<Buildings>,
+    pub(crate) lots: SharedGeometry<Lots>,
     pub(crate) fire_cohorts: BTreeSet<(u8, BuildingID)>,
     pub(super) ruins: BTreeSet<BuildingID>,
     pub(super) ruin_land_value: BTreeMap<(i32, i32), u32>,
-    pub(crate) lots: Lots,
     pub(super) lots_by_road: BTreeMap<RoadID, BTreeSet<LotID>>,
-    pub(crate) spatial_map: SpatialMap,
+    pub(crate) spatial_map: SharedGeometry<SpatialMap>,
     pub(crate) external_train_stations: Vec<BuildingID>,
     pub(crate) lot_origins: BTreeMap<BuildingID, LotOrigin>,
     pub(crate) surface_lot_count: usize,
@@ -196,12 +228,67 @@ pub struct Map {
     pub(crate) no_frontage: BTreeSet<RoadID>,
 
     pub electricity: ElectricityCache,
-    pub(super) environment: Environment,
+    pub(super) environment: SharedGeometry<Environment>,
     pub parking: ParkingSpots,
     pub subscribers: MapSubscribers,
     pub(crate) pending_construction_cuts: BTreeSet<TerrainChunkID>,
     pub(super) construction_cut_revision: u64,
     pub(super) water_services: super::WaterServiceCache,
+}
+
+/// A detached, read-only source for presentation geometry.
+pub struct RenderMap(Map, BTreeMap<BuildingID, Vec<[Vec3; 2]>>);
+
+impl RenderMap {
+    pub fn with_parking_pavement(mut self, pavement: BTreeMap<BuildingID, Vec<[Vec3; 2]>>) -> Self {
+        self.1 = pavement;
+        self
+    }
+
+    pub fn parking_pavement(&self, building: BuildingID) -> &[[Vec3; 2]] {
+        self.1.get(&building).map_or(&[], Vec::as_slice)
+    }
+
+    pub fn is_ruined(&self, id: BuildingID) -> bool {
+        self.0.is_ruined(id)
+    }
+
+    pub fn environment(&self) -> &Environment {
+        self.0.environment()
+    }
+
+    pub fn spatial_map(&self) -> &SpatialMap {
+        self.0.spatial_map()
+    }
+
+    pub fn roads(&self) -> &Roads {
+        self.0.roads()
+    }
+
+    pub fn lanes(&self) -> &Lanes {
+        self.0.lanes()
+    }
+
+    pub fn intersections(&self) -> &Intersections {
+        self.0.intersections()
+    }
+
+    pub fn buildings(&self) -> &Buildings {
+        self.0.buildings()
+    }
+
+    pub fn lots(&self) -> &Lots {
+        self.0.lots()
+    }
+
+    pub fn canonical_position(&self, object: ProjectKind) -> Vec2 {
+        object.canonical_position(&self.0)
+    }
+
+    pub fn check_growable_lot(&self, lot: &Lot, zone: ZoneCell) -> Result<(), GrowableLotError> {
+        // The footprint and initial form use only pinned map geometry.
+        crate::souls::growth::check_growable_lot(&self.0, lot, zone).map(|_| ())
+    }
 }
 
 impl Default for Map {
@@ -243,7 +330,7 @@ impl Clone for Map {
             ruins: self.ruins.clone(),
             ruin_land_value: self.ruin_land_value.clone(),
             lots: self.lots.clone(),
-            spatial_map,
+            spatial_map: spatial_map.into(),
             external_train_stations: self.external_train_stations.clone(),
             lot_origins: self.lot_origins.clone(),
             surface_lot_count: self.surface_lot_count,
@@ -277,17 +364,17 @@ impl Map {
             land_ownership: super::LandOwnership::Unrestricted,
             land_frontage: Default::default(),
             lots_by_road: BTreeMap::new(),
-            roads: Roads::default(),
-            lanes: Lanes::default(),
-            intersections: Intersections::default(),
+            roads: SharedGeometry::default(),
+            lanes: SharedGeometry::default(),
+            intersections: SharedGeometry::default(),
             parking: ParkingSpots::default(),
-            buildings: Buildings::default(),
+            buildings: SharedGeometry::default(),
+            lots: SharedGeometry::default(),
+            environment: SharedGeometry::default(),
+            spatial_map: SharedGeometry::default(),
             fire_cohorts: BTreeSet::new(),
             ruins: BTreeSet::new(),
             ruin_land_value: BTreeMap::new(),
-            lots: Lots::default(),
-            environment: Environment::default(),
-            spatial_map: SpatialMap::default(),
             external_train_stations: Default::default(),
             lot_origins: BTreeMap::new(),
             surface_lot_count: 0,
@@ -315,6 +402,24 @@ impl Map {
             water_services: super::WaterServiceCache::default(),
             subscribers: MapSubscribers::default(),
         }
+    }
+
+    /// Pin the immutable inputs used by terrain and map mesh preparation.
+    /// The source has independent subscribers for the renderer's dirty chunks.
+    pub fn render_snapshot(&self) -> RenderMap {
+        RenderMap(Self {
+            land_ownership: self.land_ownership.clone(),
+            no_frontage: self.no_frontage.clone(),
+            roads: self.roads.clone(),
+            lanes: self.lanes.clone(),
+            intersections: self.intersections.clone(),
+            buildings: self.buildings.clone(),
+            lots: self.lots.clone(),
+            spatial_map: self.spatial_map.clone(),
+            environment: self.environment.clone(),
+            ruins: self.ruins.clone(),
+            ..Self::empty()
+        }, BTreeMap::new())
     }
 
     pub(crate) fn identity(&self) -> u64 {
@@ -515,6 +620,10 @@ impl Map {
 
     pub(crate) fn buy_prepared_tile(&mut self, tile: super::LandTileId) {
         self.land_ownership.purchase(tile);
+        self.subscribers.dispatch_chunk(
+            UpdateType::Land,
+            super::SubscriberChunkID::new(super::tile_bounds(tile).center()),
+        );
     }
 
     pub(crate) fn needs_topology_preparation(&self) -> bool {
@@ -762,7 +871,7 @@ impl Map {
         {
             return false;
         }
-        self.environment = environment;
+        self.environment = environment.into();
         true
     }
 

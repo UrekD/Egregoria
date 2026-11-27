@@ -168,7 +168,29 @@ pub struct FrameSample {
     pub sim_sample_ms: Option<f64>,
     pub requested_warp: Option<u32>,
     pub sim_steps_per_second: Option<f64>,
+    pub sim_steps: Option<u64>,
+    pub sim_read_lease_ms: Option<f64>,
+    pub sim_worker_read_wait_ms: Option<f64>,
+    pub sim_worker_redraw_wait_ms: Option<f64>,
+    pub sim_worker_max_idle_ms: Option<f64>,
+    pub sim_worker_snapshot_ms: Option<f64>,
+    pub sim_client_snapshot_ms: Option<f64>,
+    pub sim_actor_scans: Option<u64>,
+    pub sim_actor_buffer_grows: Option<u64>,
+    pub sim_actor_pool_bytes: Option<u64>,
     pub pending_water_chunks: Option<usize>,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SimWorkTotals {
+    pub read_lease_ns: u64,
+    pub redraw_turn_ns: u64,
+    pub max_idle_ns: u64,
+    pub worker_snapshot_ns: u64,
+    pub client_snapshot_ns: u64,
+    pub actor_scans: u64,
+    pub actor_buffer_grows: u64,
+    pub actor_pool_bytes: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -177,6 +199,7 @@ struct SimObservation {
     generation: u64,
     step: u64,
     warp: u32,
+    work: Option<SimWorkTotals>,
 }
 
 #[derive(Default)]
@@ -213,6 +236,8 @@ pub struct FrameProfile {
     first_present: Option<Instant>,
     skipped: u64,
     sim: Option<SimObservation>,
+    previous_sim: Option<SimObservation>,
+    read_lease: Option<Duration>,
     first_sim_sample: Option<Instant>,
     sim_rate: SimRate,
     pub pending_water_chunks: Option<usize>,
@@ -242,6 +267,8 @@ impl FrameProfile {
             first_present: None,
             skipped: 0,
             sim: None,
+            previous_sim: None,
+            read_lease: None,
             first_sim_sample: None,
             sim_rate: SimRate::default(),
             pending_water_chunks: None,
@@ -270,6 +297,8 @@ impl FrameProfile {
         self.first_present = None;
         self.skipped = 0;
         self.first_sim_sample = None;
+        self.previous_sim = None;
+        self.read_lease = None;
         self.sim_rate = SimRate::default();
         self.begin_redraw();
     }
@@ -292,7 +321,18 @@ impl FrameProfile {
             generation,
             step,
             warp,
+            work: None,
         });
+    }
+
+    pub fn record_sim_work(&mut self, work: SimWorkTotals) {
+        if let Some(sim) = &mut self.sim {
+            sim.work = Some(work);
+        }
+    }
+
+    pub fn record_sim_read_lease(&mut self, elapsed: Duration) {
+        *self.read_lease.get_or_insert(Duration::ZERO) += elapsed;
     }
 
     pub(crate) fn record_cpu(&mut self, phase: CpuPhase, elapsed: Duration) {
@@ -372,6 +412,15 @@ impl FrameProfile {
         let sim_steps_per_second = self
             .sim
             .and_then(|sim| self.sim_rate.observe(sim.at, sim.generation, sim.step));
+        let interval = self.sim.zip(self.previous_sim).filter(|(sim, previous)| {
+            sim.generation == previous.generation && sim.step >= previous.step
+        });
+        let work = interval.and_then(|(sim, previous)| sim.work.zip(previous.work));
+        let delta = |field: fn(SimWorkTotals) -> u64| {
+            work.map(|(current, previous)| field(current).saturating_sub(field(previous)))
+        };
+        let millis = |field| delta(field).map(|ns| ns as f64 / 1_000_000.0);
+        self.previous_sim = self.sim;
         if self.samples.len() == HISTORY_FRAMES {
             self.samples.pop_front();
         }
@@ -391,6 +440,22 @@ impl FrameProfile {
             sim_sample_ms,
             requested_warp: self.sim.map(|sim| sim.warp),
             sim_steps_per_second,
+            sim_steps: interval.map(|(sim, previous)| sim.step - previous.step),
+            sim_read_lease_ms: self
+                .read_lease
+                .take()
+                .map(|held| held.as_secs_f64() * 1000.0),
+            sim_worker_read_wait_ms: millis(|totals| totals.read_lease_ns),
+            sim_worker_redraw_wait_ms: millis(|totals| totals.redraw_turn_ns),
+            sim_worker_max_idle_ms: millis(|totals| totals.max_idle_ns),
+            sim_worker_snapshot_ms: millis(|totals| totals.worker_snapshot_ns),
+            sim_client_snapshot_ms: millis(|totals| totals.client_snapshot_ns),
+            sim_actor_scans: delta(|totals| totals.actor_scans),
+            sim_actor_buffer_grows: delta(|totals| totals.actor_buffer_grows),
+            sim_actor_pool_bytes: self
+                .sim
+                .and_then(|sim| sim.work)
+                .map(|work| work.actor_pool_bytes),
             pending_water_chunks: self.pending_water_chunks,
         });
     }
@@ -668,6 +733,44 @@ mod tests {
             rate.observe(now + Duration::from_secs(4), 2, 23),
             Some(20.0)
         );
+    }
+
+    #[test]
+    fn frame_profile_records_lease_and_worker_wait_deltas() {
+        let mut profile = FrameProfile::with_gpu(ProfileMode::Cpu, None);
+        let now = Instant::now();
+        for (frame, generation, step) in [(1, 1, 5), (2, 1, 8), (3, 2, 2)] {
+            let at = now + Duration::from_millis(frame * 10);
+            profile.begin_redraw();
+            profile.record_sim(at, generation, step, 10_000);
+            profile.record_sim_read_lease(Duration::from_micros(frame * 100));
+            profile.record_sim_work(SimWorkTotals {
+                read_lease_ns: frame * 100_000,
+                redraw_turn_ns: frame * 200_000,
+                max_idle_ns: frame * 350_000,
+                worker_snapshot_ns: frame * 900_000,
+                client_snapshot_ns: frame * 500_000,
+                actor_scans: frame * 3,
+                actor_buffer_grows: frame,
+                actor_pool_bytes: frame * 1024,
+            });
+            profile.record_present(frame, at, at, [640, 480], "fifo", GfxSettings::default());
+        }
+        let sample = &profile.samples()[1];
+        assert_eq!(sample.sim_steps, Some(3));
+        assert_eq!(sample.sim_read_lease_ms, Some(0.2));
+        assert_eq!(sample.sim_worker_read_wait_ms, Some(0.1));
+        assert_eq!(sample.sim_worker_redraw_wait_ms, Some(0.2));
+        assert_eq!(sample.sim_worker_max_idle_ms, Some(0.35));
+        assert_eq!(sample.sim_worker_snapshot_ms, Some(0.9));
+        assert_eq!(sample.sim_client_snapshot_ms, Some(0.5));
+        assert_eq!(sample.sim_actor_scans, Some(3));
+        assert_eq!(sample.sim_actor_buffer_grows, Some(1));
+        assert_eq!(sample.sim_actor_pool_bytes, Some(2048));
+        assert_eq!(profile.samples()[2].sim_steps, None);
+        assert_eq!(profile.samples()[2].sim_worker_max_idle_ms, None);
+        assert_eq!(profile.samples()[2].sim_worker_snapshot_ms, None);
+        assert_eq!(profile.samples()[2].sim_actor_scans, None);
     }
 
     #[test]

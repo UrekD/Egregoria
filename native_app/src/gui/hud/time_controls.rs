@@ -9,7 +9,9 @@ use goryak::{
     blur_bg, button_primary, button_secondary, constrained_viewport, icon_button, monospace,
     on_secondary_container, padx, padxy, secondary_container, tooltip,
 };
+#[cfg(test)]
 use prototypes::GameTime;
+#[cfg(test)]
 use simulation::Simulation;
 
 use crate::gui::windows::settings::Settings;
@@ -92,9 +94,13 @@ impl GuiState {
     }
 }
 
+#[cfg(test)]
 pub fn time_controls(uiworld: &UiWorld, sim: &Simulation) {
+    time_controls_at(uiworld, sim.read::<GameTime>().daytime);
+}
+
+pub(super) fn time_controls_at(uiworld: &UiWorld, time: prototypes::DayTime) {
     profiling::scope!("hud::time_controls");
-    let time = sim.read::<GameTime>().daytime;
     let warp = &mut uiworld.write::<Settings>().time_warp;
     let mut gui = uiworld.write::<GuiState>();
     let depause_warp = &mut gui.depause_warp;
@@ -271,6 +277,7 @@ mod tests {
 
     #[test]
     fn uxfix_speed_row_with_max_keeps_its_padding_and_gaps() {
+        #[cfg(test)]
         use simulation::Simulation;
         use yakui::font::{Font, FontSettings, Fonts};
         use yakui::widgets::{ButtonWidget, OpaqueWidget};

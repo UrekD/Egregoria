@@ -446,7 +446,7 @@ mod tests {
     #[test]
     fn p1a_zone_paint_validation() {
         let mut ctx = TestCtx::new_fast();
-        ctx.g.map_mut().environment = Environment::new(2, 2);
+        ctx.g.map_mut().environment = Environment::new(2, 2).into();
         let original_money = ctx.g.read::<Government>().money;
         let mut paint = |area| {
             ctx.apply(&[WorldCommand::ZonePaint {

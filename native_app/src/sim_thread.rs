@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 use std::io::{self, Write};
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{self, Receiver, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard, TryLockError};
 use std::thread::{self, JoinHandle};
@@ -20,7 +20,9 @@ use simulation::{Simulation, SimulationReplayLoader, SlotCapture};
 
 use crate::automation::{FixtureOp, FixtureOutcome};
 use crate::gui::traffic_repair::TrafficEditReceipt;
+use crate::rendering::world_snapshot::{CaptureWork, SnapshotSource, ViewRequest, WorldUpdate};
 use crate::session::{save_coordinator::SavePermit, CityProgress};
+use engine::frame_profile::SimWorkTotals;
 
 pub(crate) const BATCH_BYTES: usize = 256 * 1024;
 const BATCH_COMMANDS: usize = 256;
@@ -254,8 +256,10 @@ struct Turn<'a> {
 
 #[derive(Debug)]
 enum WorkerWait {
+    Continue,
     Yield,
     Timeout(Duration),
+    Redraw(Duration),
     Reader,
 }
 
@@ -268,21 +272,26 @@ impl Admission {
         state & (WRITER | READER) == 0 && (state & INTENT == 0 || state & REDRAW != 0)
     }
 
+    #[cfg(test)]
     fn read(&self) -> Option<Turn<'_>> {
-        let state = self
-            .state
+        self.read_for_frame(true)
+    }
+
+    fn read_for_frame(&self, reserve: bool) -> Option<Turn<'_>> {
+        self.state
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
-                Some(if Self::can_read(state) {
-                    (state | READER) & !(WAITING | REDRAW)
+                if Self::can_read(state) {
+                    Some((state | READER) & !(WAITING | REDRAW))
                 } else {
-                    state | WAITING
-                })
+                    reserve.then_some(state | WAITING)
+                }
             })
-            .unwrap();
-        Self::can_read(state).then(|| Turn {
-            admission: self,
-            reader: true,
-        })
+            .ok()
+            .filter(|&state| Self::can_read(state))
+            .map(|_| Turn {
+                admission: self,
+                reader: true,
+            })
     }
 
     fn cancel_write(&self) {
@@ -333,7 +342,7 @@ impl Admission {
                     WorkerWait::Reader
                 } else if !remaining.is_zero() {
                     // A redraw may be dropped while the window is minimized.
-                    WorkerWait::Timeout(remaining)
+                    WorkerWait::Redraw(remaining)
                 } else {
                     WorkerWait::Yield
                 }
@@ -362,6 +371,25 @@ pub(crate) struct WorldView {
     pub world: Arc<RwLock<Simulation>>,
     admission: Admission,
     replaced: AtomicBool,
+    render_replaced: AtomicBool,
+    completed_step: AtomicU64,
+    snapshots: Mutex<RenderMailbox>,
+    sample_requested: AtomicBool,
+    profile_waits: AtomicBool,
+    reader_wait_ns: AtomicU64,
+    redraw_wait_ns: AtomicU64,
+    max_idle_ns: AtomicU64,
+    worker_snapshot_ns: AtomicU64,
+    client_snapshot_ns: AtomicU64,
+    actor_scans: AtomicU64,
+    actor_buffer_grows: AtomicU64,
+    actor_pool_bytes: AtomicU64,
+}
+
+#[derive(Default)]
+struct RenderMailbox {
+    source: SnapshotSource,
+    request: Option<ViewRequest>,
 }
 
 pub(crate) struct ReadLease<'a> {
@@ -388,7 +416,120 @@ impl WorldView {
             world,
             admission: Admission::default(),
             replaced: AtomicBool::new(false),
+            render_replaced: AtomicBool::new(false),
+            completed_step: AtomicU64::new(0),
+            snapshots: Mutex::default(),
+            sample_requested: AtomicBool::new(false),
+            profile_waits: AtomicBool::new(false),
+            reader_wait_ns: AtomicU64::new(0),
+            redraw_wait_ns: AtomicU64::new(0),
+            max_idle_ns: AtomicU64::new(0),
+            worker_snapshot_ns: AtomicU64::new(0),
+            client_snapshot_ns: AtomicU64::new(0),
+            actor_scans: AtomicU64::new(0),
+            actor_buffer_grows: AtomicU64::new(0),
+            actor_pool_bytes: AtomicU64::new(0),
         }
+    }
+
+    // The worker updates this within its write turn, alongside the sampled world.
+    pub(crate) fn completed_step(&self) -> u64 {
+        self.completed_step.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn enable_wait_profile(&self) {
+        self.profile_waits.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn work_totals(&self) -> SimWorkTotals {
+        SimWorkTotals {
+            read_lease_ns: self.reader_wait_ns.load(Ordering::Relaxed),
+            redraw_turn_ns: self.redraw_wait_ns.load(Ordering::Relaxed),
+            max_idle_ns: self.max_idle_ns.load(Ordering::Relaxed),
+            worker_snapshot_ns: self.worker_snapshot_ns.load(Ordering::Relaxed),
+            client_snapshot_ns: self.client_snapshot_ns.load(Ordering::Relaxed),
+            actor_scans: self.actor_scans.load(Ordering::Relaxed),
+            actor_buffer_grows: self.actor_buffer_grows.load(Ordering::Relaxed),
+            actor_pool_bytes: self.actor_pool_bytes.load(Ordering::Relaxed),
+        }
+    }
+
+    pub(crate) fn poll_render(&self, request: Option<ViewRequest>) -> Option<WorldUpdate> {
+        let mut mailbox = self.snapshots.try_lock().ok()?;
+        if let Some(request) = request {
+            mailbox.request = Some(request);
+            self.sample_requested.store(true, Ordering::Relaxed);
+        }
+        mailbox.source.take()
+    }
+
+    fn snapshot_timer(&self) -> Option<Instant> {
+        self.profile_waits
+            .load(Ordering::Relaxed)
+            .then(Instant::now)
+    }
+
+    fn record_capture(&self, start: Option<Instant>, counter: &AtomicU64, work: CaptureWork) {
+        if let Some(start) = start {
+            counter.fetch_add(start.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            if work.actor_scan {
+                self.actor_scans.fetch_add(1, Ordering::Relaxed);
+                self.actor_buffer_grows
+                    .fetch_add(work.buffer_grows, Ordering::Relaxed);
+                self.actor_pool_bytes
+                    .store(work.actor_pool_bytes as u64, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub(crate) fn capture_map(&self, sim: &Simulation, generation: u64) -> u64 {
+        let replaced = self.render_replaced.swap(false, Ordering::Relaxed);
+        let mut mailbox = self.snapshots.lock().unwrap();
+        let start = self.snapshot_timer();
+        let epoch = mailbox.source.capture_map(sim, generation, replaced);
+        self.record_capture(start, &self.client_snapshot_ns, CaptureWork::default());
+        epoch
+    }
+
+    pub(crate) fn capture_render(
+        &self,
+        sim: &Simulation,
+        boundary: Boundary,
+        request: ViewRequest,
+        paused: bool,
+        force: bool,
+    ) -> Option<WorldUpdate> {
+        let mut mailbox = self.snapshots.lock().unwrap();
+        mailbox.request = None;
+        self.sample_requested.store(false, Ordering::Relaxed);
+        let start = self.snapshot_timer();
+        let work = mailbox
+            .source
+            .capture_view(sim, boundary, request, paused, force);
+        self.record_capture(start, &self.client_snapshot_ns, work);
+        mailbox.source.take()
+    }
+
+    fn sample_render(&self, sim: &Simulation, boundary: Boundary) {
+        if !self.sample_requested.load(Ordering::Relaxed) {
+            return;
+        }
+        let Ok(mut mailbox) = self.snapshots.try_lock() else {
+            return;
+        };
+        let Some(request) = mailbox.request.take() else {
+            return;
+        };
+        self.sample_requested.store(false, Ordering::Relaxed);
+        let replaced = self.render_replaced.swap(false, Ordering::Relaxed);
+        let start = self.snapshot_timer();
+        mailbox
+            .source
+            .capture_map(sim, boundary.generation, replaced);
+        let work = mailbox
+            .source
+            .capture_view(sim, boundary, request, false, false);
+        self.record_capture(start, &self.worker_snapshot_ns, work);
     }
 
     /// Call with the frame's read lease to observe a replacement before drawing.
@@ -404,7 +545,11 @@ impl WorldView {
     }
 
     pub(crate) fn try_read(&self) -> Option<ReadLease<'_>> {
-        let turn = self.admission.read()?;
+        self.try_read_for_frame(true)
+    }
+
+    pub(crate) fn try_read_for_frame(&self, reserve: bool) -> Option<ReadLease<'_>> {
+        let turn = self.admission.read_for_frame(reserve)?;
         let guard = self.world.try_read().ok()?;
         Some(ReadLease { guard, _turn: turn })
     }
@@ -509,6 +654,8 @@ impl SimThread {
 
     fn start_worker(view: Arc<WorldView>, worker: Worker, sequence: u64) -> Self {
         let generation = worker.status.boundary.generation;
+        view.completed_step
+            .store(worker.status.boundary.completed_step, Ordering::Relaxed);
         let status = Arc::new(Mutex::new(worker.status.clone()));
         let (requests, input) = mpsc::sync_channel(CREDITS);
         let (output, replies) = mpsc::sync_channel(CREDITS);
@@ -887,13 +1034,41 @@ impl Worker {
     ) -> (SeqSchedule, Boundary) {
         let _ = view.admission.worker.set(thread::current());
         while !self.exit {
-            match self.run_one(view, status, &input, &output) {
+            let wait = self.run_one(view, status, &input, &output);
+            if matches!(wait, WorkerWait::Continue) {
+                continue;
+            }
+            let max = self.live_max();
+            let counter = match wait {
+                WorkerWait::Reader => Some(&view.reader_wait_ns),
+                WorkerWait::Redraw(_) => Some(&view.redraw_wait_ns),
+                _ if max => Some(&view.max_idle_ns),
+                _ => None,
+            };
+            let started = counter
+                .filter(|_| view.profile_waits.load(Ordering::Relaxed))
+                .map(|counter| (counter, Instant::now()));
+            match wait {
                 WorkerWait::Yield => thread::yield_now(),
-                WorkerWait::Timeout(delay) => thread::park_timeout(delay),
+                WorkerWait::Timeout(delay) | WorkerWait::Redraw(delay) => {
+                    thread::park_timeout(delay)
+                }
                 WorkerWait::Reader => thread::park(),
+                WorkerWait::Continue => unreachable!(),
+            }
+            if let Some((counter, started)) = started {
+                let nanos = started.elapsed().as_nanos() as u64;
+                counter.fetch_add(nanos, Ordering::Relaxed);
+                if max && matches!(wait, WorkerWait::Reader | WorkerWait::Redraw(_)) {
+                    view.max_idle_ns.fetch_add(nanos, Ordering::Relaxed);
+                }
             }
         }
         (self.schedule, self.status.boundary)
+    }
+
+    fn live_max(&self) -> bool {
+        !self.paused && self.replay.is_none() && self.clock.warp == MAX_WARP
     }
 
     fn run_one(
@@ -1005,11 +1180,17 @@ impl Worker {
                 Ok(lease) => lease,
                 Err(wait) => return wait,
             };
-            if let Some(envelope) = self.pending.take() {
+            let reply = if let Some(envelope) = self.pending.take() {
                 self.handle(envelope, Some(&mut lease.guard))
             } else {
                 self.advance(&mut lease.guard, now, input)
+            };
+            view.completed_step
+                .store(self.status.boundary.completed_step, Ordering::Relaxed);
+            if self.live_max() {
+                view.sample_render(&lease.guard, self.status.boundary);
             }
+            reply
         } else {
             view.admission.cancel_write();
             let envelope = self.pending.take().unwrap();
@@ -1028,7 +1209,11 @@ impl Worker {
         for reply in cancelled.into_iter().chain(reply) {
             self.send_reply(output, reply);
         }
-        WorkerWait::Yield
+        if cfg!(not(target_arch = "wasm32")) && self.live_max() && !self.exit {
+            WorkerWait::Continue
+        } else {
+            WorkerWait::Yield
+        }
     }
 
     fn terminal_waiting(waiting: &mut VecDeque<Envelope>, input: &Receiver<Envelope>) -> bool {
@@ -1204,7 +1389,10 @@ impl Worker {
             }
         };
         let old = std::mem::replace(&mut *published.guard, sim);
+        view.completed_step
+            .store(self.status.boundary.completed_step, Ordering::Relaxed);
         view.replaced.store(true, Ordering::Release);
+        view.render_replaced.store(true, Ordering::Relaxed);
         drop(published);
         *status.lock().unwrap() = self.status.clone();
         if let Some(reply) = reply {

@@ -253,8 +253,8 @@ pub(crate) fn open(uiw: &UiWorld) {
     uiw.write::<InputMap>().reset_world_input();
 }
 
-pub(crate) fn toolbar(uiw: &UiWorld, sim: &Simulation) {
-    if sim.map().land_ownership().extent().is_none() {
+pub(crate) fn toolbar(uiw: &UiWorld, has_tiles: bool) {
+    if !has_tiles {
         return;
     }
     let label = uiw
@@ -274,6 +274,10 @@ pub(crate) fn toolbar(uiw: &UiWorld, sim: &Simulation) {
 pub(crate) fn latch_shortcut(uiw: &UiWorld, enabled: bool, pressed: bool) {
     let mut state = uiw.write::<LandTilesUi>();
     state.shortcut_pending = enabled && (state.shortcut_pending ^ pressed);
+}
+
+pub(crate) fn shortcut_pending(uiw: &UiWorld) -> bool {
+    uiw.read::<LandTilesUi>().shortcut_pending
 }
 
 pub(crate) fn shortcut(uiw: &UiWorld, sim: &Simulation) -> bool {

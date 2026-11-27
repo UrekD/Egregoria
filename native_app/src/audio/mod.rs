@@ -3,6 +3,8 @@ use crate::audio::car_sounds::CarSounds;
 use crate::audio::music::Music;
 use crate::uiworld::UiWorld;
 use engine::AudioContext;
+use geom::Camera;
+use simulation::map::RenderMap;
 use simulation::Simulation;
 
 mod ambient;
@@ -10,6 +12,8 @@ mod car_sounds;
 mod music;
 
 pub static SOUNDS_LIST: include_dir::Dir = include_dir::include_dir!("assets/sounds");
+
+pub(crate) struct AudioInputs(car_sounds::CarAudio);
 
 pub struct GameAudio {
     music: Music,
@@ -40,9 +44,21 @@ impl GameAudio {
         self.carsounds.reset_world();
     }
 
-    pub fn update(&mut self, sim: &Simulation, uiworld: &UiWorld, ctx: &mut AudioContext) {
+    pub(crate) fn capture(&self, sim: &Simulation, uiworld: &UiWorld) -> AudioInputs {
+        AudioInputs(self.carsounds.capture(sim, uiworld.read::<Camera>().eye()))
+    }
+
+    pub(crate) fn update(
+        &mut self,
+        input: Option<AudioInputs>,
+        map: &RenderMap,
+        uiworld: &UiWorld,
+        ctx: &mut AudioContext,
+    ) {
         self.music.update(ctx);
-        self.ambiant.update(sim, uiworld);
-        self.carsounds.update(sim, uiworld, ctx);
+        self.ambiant.update(map, uiworld);
+        if let Some(AudioInputs(cars)) = input {
+            self.carsounds.update(cars, ctx);
+        }
     }
 }

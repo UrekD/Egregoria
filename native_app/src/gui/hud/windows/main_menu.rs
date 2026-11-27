@@ -36,7 +36,7 @@ pub(crate) fn main_menu_buttons(uiw: &UiWorld, sim: Option<&Simulation>, setting
     }
 }
 
-pub(crate) fn render_session(uiw: &UiWorld, sim: &Simulation) {
+pub(crate) fn render_session(uiw: &UiWorld, sim: Option<&Simulation>) {
     if render_loading(uiw) {
         return;
     }
@@ -60,8 +60,8 @@ pub(crate) fn render_session(uiw: &UiWorld, sim: &Simulation) {
     }
     let settings_open = uiw.read::<SessionUi>().settings_open;
     if settings_open {
-        settings::settings(uiw, sim, &mut uiw.write::<SessionUi>().settings_open);
-        crate::gui::keybinds::keybind_modal(uiw, sim);
+        settings::settings(uiw, &mut uiw.write::<SessionUi>().settings_open);
+        crate::gui::keybinds::keybind_modal(uiw);
         return;
     }
     if screen == SessionScreen::LoadGame && load::render_delete(uiw) {
@@ -89,7 +89,7 @@ pub(crate) fn render_session(uiw: &UiWorld, sim: &Simulation) {
                 textc(on_primary_container(), "Egregoria");
                 yakui::divider(outline(), 6.0, 1.0);
                 let mut settings_open = false;
-                main_menu_buttons(uiw, Some(sim), &mut settings_open);
+                main_menu_buttons(uiw, sim, &mut settings_open);
                 if settings_open {
                     uiw.write::<SessionUi>().settings_open = true;
                 }
