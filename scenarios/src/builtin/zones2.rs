@@ -698,10 +698,27 @@ fn freight_route_distance(map: &Map, start: Vec3, end: Vec3) -> Option<f32> {
 fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(), String> {
     // Give property users time to drive out before the staffed frontage cut.
     advance_to(live, STAFFED_TEARDOWN_SETUP_STEP - 6 * TICKS_PER_HOUR)?;
-    let close: Vec<_> = live.sim.map().buildings().keys()
-        .filter(|&id| live.sim.building_parking(id).is_some_and(|parking| parking.open))
-        .map(|building| WorldCommand::SetBuildingParkingOpen { building, open: false })
-        .collect();
+    let close = {
+        let map = live.sim.map();
+        let frontage = map
+            .buildings()
+            .values()
+            .filter(|building| building.is_mixed_use())
+            .filter_map(|building| building.connected_road);
+        let adjacent = frontage_and_adjacent(&map, frontage);
+        map.buildings()
+            .keys()
+            .filter(|&id| {
+                live.sim.building_parking(id).is_some_and(|parking| {
+                    parking.open && adjacent.contains(&parking.entrance.road)
+                })
+            })
+            .map(|building| WorldCommand::SetBuildingParkingOpen {
+                building,
+                open: false,
+            })
+            .collect::<Vec<_>>()
+    };
     if !close.is_empty() {
         prepare_draining_parking(live)?;
         run_teardown_batch(live, &close, 1)?;
@@ -738,8 +755,31 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
                         .map(|error| (road, error))
                 })
                 .collect();
+            let adjacent_roads: BTreeSet<_> = {
+                let map = live.sim.map();
+                frontage_and_adjacent(&map, blocked.iter().map(|&(road, _)| road))
+            };
+            let claims: Vec<_> = live
+                .sim
+                .map()
+                .buildings()
+                .keys()
+                .filter_map(|id| {
+                    let parking = live.sim.building_parking(id)?;
+                    (adjacent_roads.contains(&parking.entrance.road)
+                        && (parking.held != 0 || parking.occupied != 0))
+                        .then_some((
+                            id,
+                            parking.entrance.road,
+                            parking.open,
+                            parking.occupied,
+                            parking.held,
+                            parking.missing_owners,
+                        ))
+                })
+                .collect();
             return Err(format!(
-                "{missing} after {staged} worker housing changes with {}/{} frontage roads removable; blocked roads {blocked:?}",
+                "{missing} after {staged} worker housing changes with {}/{} frontage roads removable; blocked roads {blocked:?}; adjacent claims (building, road, open, occupied, held, missing owners) {claims:?}",
                 roads.len() - blocked.len(),
                 roads.len(),
             ));
@@ -993,6 +1033,14 @@ fn verify_mixed_frontage_replay(live: &mut ScenarioCtx, root: &Path) -> Result<(
     }
     let regrown = resumed_checkpoint(live, &resumed, root, "zones2_staffed_regrown")?;
     verify_decoded(root, &[before_cut, abandoned, collapsed, regrown])
+}
+
+fn frontage_and_adjacent(map: &Map, frontage: impl Iterator<Item = RoadID>) -> BTreeSet<RoadID> {
+    frontage
+        .filter_map(|road| map.get(road))
+        .flat_map(|road| [road.src, road.dst])
+        .flat_map(|joint| map.intersections()[joint].roads.iter().copied())
+        .collect()
 }
 
 fn prepare_draining_parking(ctx: &mut ScenarioCtx) -> Result<(), String> {
