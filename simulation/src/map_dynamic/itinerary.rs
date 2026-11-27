@@ -29,6 +29,8 @@ use road_edit_lifecycle::{
     exit_path_still_valid, needs_local_recovery, pedestrian_clearance, PedestrianClearance,
 };
 
+pub use pathpark_route::{DirectedEndpoint, DirectedPlan, DirectedSearch, DirectedSearchResult};
+
 const EGRESS_RECHECK_TICKS: u64 = game_secs_to_ticks(30);
 const MAX_EGRESS_CHECKS_PER_TICK: usize = 8;
 
@@ -88,6 +90,7 @@ pub enum ItineraryKind {
         wait_ticks: u16,
     },
     PedestrianEgress(PedestrianEgress),
+    Driveway(crate::transportation::DrivewayPhase),
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -125,6 +128,7 @@ enum SavedItineraryKind<R> {
         previous: RoadID,
     },
     PedestrianEgress(PedestrianEgress, RoadApproach),
+    Driveway(crate::transportation::DrivewayPhase),
 }
 
 impl Serialize for Itinerary {
@@ -155,6 +159,7 @@ impl Serialize for Itinerary {
                     wait_ticks,
                 },
             },
+            ItineraryKind::Driveway(phase) => Saved::Driveway(phase),
             ItineraryKind::PedestrianEgress(egress) => {
                 Saved::PedestrianEgress(egress, self.road_approach)
             }
@@ -205,6 +210,12 @@ impl<'de> Deserialize<'de> for Itinerary {
                     target,
                     wait_ticks,
                 }
+            }
+            Saved::Driveway(phase) => {
+                if !reversed_local_path.is_empty() {
+                    return Err(serde::de::Error::custom("invalid driveway itinerary"));
+                }
+                ItineraryKind::Driveway(phase)
             }
             Saved::PedestrianEgress(egress, approach) => {
                 let valid = if let Some(crossing) = egress.crossing {
@@ -716,7 +727,7 @@ impl Itinerary {
         route: impl FnOnce(Vec3, ItineraryTarget, PathKind) -> Option<Self>,
         on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
     ) -> Vec3 {
-        self.update_guarded(
+        self.update_guarded::<false>(
             position,
             dist_to_move,
             time,
@@ -725,10 +736,11 @@ impl Itinerary {
             on_road_entry,
             None,
             |_, _, _| true,
+            None,
         )
     }
 
-    fn update_guarded(
+    fn update_guarded<const DRIVEWAYS: bool>(
         &mut self,
         mut position: Vec3,
         mut dist_to_move: f32,
@@ -738,9 +750,15 @@ impl Itinerary {
         mut on_road_entry: Option<impl FnMut(RoadID, PathKind)>,
         mut admission: Option<&mut MovementAdmission<'_>>,
         mut move_on: impl FnMut(Traversable, Vec3, Vec3) -> bool,
+        mut driveway: Option<DrivewayMovement<'_>>,
     ) -> Vec3 {
         if self.is_pedestrian_egress() {
-            return self.advance_egress(map, position, dist_to_move);
+            return self.advance_egress::<DRIVEWAYS>(
+                map,
+                position,
+                dist_to_move,
+                driveway.as_mut(),
+            );
         }
         if on_road_entry.is_some()
             && matches!(self.road_approach, RoadApproach::Unchecked)
@@ -779,6 +797,13 @@ impl Itinerary {
                                 } else {
                                     position
                                 };
+                                if DRIVEWAYS
+                                    && driveway
+                                        .as_mut()
+                                        .is_some_and(|guard| guard.blocks(position, next))
+                                {
+                                    return position;
+                                }
                                 if self
                                     .get_travers()
                                     .is_some_and(|&traversal| !move_on(traversal, position, next))
@@ -796,6 +821,16 @@ impl Itinerary {
                             }
                         }
                     }
+                }
+            }
+            if let Some(driveway) = driveway.as_mut().filter(|_| DRIVEWAYS) {
+                let next = if dist <= (dist_to_move + snap).max(0.0) {
+                    p
+                } else {
+                    position + (p - position) * (dist_to_move.max(0.0) / dist)
+                };
+                if driveway.blocks(position, next) {
+                    return position;
                 }
             }
             // Coincident waypoints still advance after a tolerance snap.
@@ -986,7 +1021,8 @@ impl Itinerary {
             ItineraryKind::None => None,
             ItineraryKind::WaitUntil(_)
             | ItineraryKind::WaitForReroute { .. }
-            | ItineraryKind::PedestrianEgress(_) => None,
+            | ItineraryKind::PedestrianEgress(_)
+            | ItineraryKind::Driveway(_) => None,
             ItineraryKind::Simple(e) => Some(e),
             ItineraryKind::Route(ref r, _) => Some(r.end_pos),
         }
@@ -1010,12 +1046,29 @@ impl Itinerary {
     /// boundary. Only the inert itinerary kinds can skip movement.
     pub(crate) fn is_inert(&self) -> bool {
         self.reversed_local_path.is_empty()
-            && matches!(self.kind, ItineraryKind::None | ItineraryKind::WaitUntil(_))
+            && matches!(
+                self.kind,
+                ItineraryKind::None | ItineraryKind::WaitUntil(_) | ItineraryKind::Driveway(_)
+            )
+    }
+
+    pub(crate) fn at_driveway(phase: crate::transportation::DrivewayPhase) -> Self {
+        Self {
+            kind: ItineraryKind::Driveway(phase),
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn driveway_phase(&self) -> Option<crate::transportation::DrivewayPhase> {
+        match self.kind {
+            ItineraryKind::Driveway(phase) => Some(phase),
+            _ => None,
+        }
     }
 
     pub fn is_terminal(&self) -> bool {
         match &self.kind {
-            ItineraryKind::None | ItineraryKind::WaitUntil(_) => true,
+            ItineraryKind::None | ItineraryKind::WaitUntil(_) | ItineraryKind::Driveway(_) => true,
             ItineraryKind::WaitForReroute { .. } | ItineraryKind::PedestrianEgress(_) => false,
             ItineraryKind::Simple(_) => self.remaining_points() <= 1,
             ItineraryKind::Route(Route { reversed_route, .. }, _) => {
@@ -1036,7 +1089,8 @@ impl Itinerary {
             ItineraryKind::None
             | ItineraryKind::WaitUntil(_)
             | ItineraryKind::WaitForReroute { .. }
-            | ItineraryKind::PedestrianEgress(_) => None,
+            | ItineraryKind::PedestrianEgress(_)
+            | ItineraryKind::Driveway(_) => None,
             ItineraryKind::Simple(e) => Some(e),
             ItineraryKind::Route(Route { end_pos, .. }, _) => Some(end_pos),
         }
@@ -1047,7 +1101,8 @@ impl Itinerary {
             ItineraryKind::None
             | ItineraryKind::WaitUntil(_)
             | ItineraryKind::Simple(_)
-            | ItineraryKind::WaitForReroute { .. } => None,
+            | ItineraryKind::WaitForReroute { .. }
+            | ItineraryKind::Driveway(_) => None,
             ItineraryKind::Route(Route { cur, .. }, _) => Some(cur),
             ItineraryKind::PedestrianEgress(egress) => egress.crossing.as_ref(),
         }
@@ -1193,7 +1248,13 @@ impl Itinerary {
         false
     }
 
-    fn advance_egress(&mut self, map: &Map, mut position: Vec3, mut distance: f32) -> Vec3 {
+    fn advance_egress<const DRIVEWAYS: bool>(
+        &mut self,
+        map: &Map,
+        mut position: Vec3,
+        mut distance: f32,
+        mut driveway: Option<&mut DrivewayMovement<'_>>,
+    ) -> Vec3 {
         let ItineraryKind::PedestrianEgress(ref mut egress) = self.kind else {
             unreachable!();
         };
@@ -1209,8 +1270,20 @@ impl Itinerary {
         while let Some(&next) = self.reversed_local_path.last() {
             let segment = next - position;
             let length = segment.mag();
+            let reached = if length > distance {
+                position + segment * (distance / length)
+            } else {
+                next
+            };
+            if DRIVEWAYS
+                && driveway
+                    .as_mut()
+                    .is_some_and(|guard| guard.blocks(position, reached))
+            {
+                return position;
+            }
             if length > distance {
-                return position + segment * (distance / length);
+                return reached;
             }
             self.reversed_local_path.pop();
             position = next;
@@ -1363,6 +1436,9 @@ impl Inspect<ItineraryKind> for ItineraryKind {
             ItineraryKind::WaitForReroute { wait_ticks, .. } => {
                 ui.label(format!("wait for reroute: {wait_ticks}"));
             }
+            ItineraryKind::Driveway(phase) => {
+                ui.label(format!("{phase:?}"));
+            }
             ItineraryKind::PedestrianEgress(egress) => {
                 ui.label(if egress.crossing.is_some() { "Clearing crosswalk" } else { "Waiting for a safe exit" });
             }
@@ -1391,7 +1467,9 @@ impl Inspect<ItineraryKind> for ItineraryKind {
             ItineraryKind::WaitForReroute { wait_ticks, .. } => {
                 ui.label(format!("wait for reroute: {wait_ticks}"));
             }
-            ItineraryKind::PedestrianEgress(_) => Self::render(d, label, ui, args),
+            ItineraryKind::PedestrianEgress(_) | ItineraryKind::Driveway(_) => {
+                Self::render(d, label, ui, args)
+            }
         };
         false
     }
@@ -1441,6 +1519,23 @@ fn movement_reaches_lane(lane: &Lane, from: Vec3, to: Vec3) -> bool {
     })
 }
 
+struct DrivewayMovement<'a> {
+    traffic: &'a crate::transportation::DrivewayTraffic,
+    actor: Option<crate::VehicleID>,
+    half_extent: f32,
+    held: &'a mut bool,
+}
+
+impl DrivewayMovement<'_> {
+    fn blocks(&mut self, from: Vec3, to: Vec3) -> bool {
+        let blocked = self
+            .traffic
+            .blocks_step(self.actor, self.half_extent, from, to);
+        *self.held |= blocked;
+        blocked
+    }
+}
+
 struct MovementAdmission<'a> {
     frame: &'a mut JunctionFrame,
     state: &'a mut JunctionAdmission,
@@ -1452,6 +1547,19 @@ struct MovementAdmission<'a> {
 
 pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
     profiling::scope!("map_dynamic::itinerary_update");
+    let driveways = resources.read::<crate::transportation::DrivewayTraffic>();
+    if driveways.has_crossing() {
+        update_itineraries::<true>(world, resources, &driveways);
+    } else {
+        update_itineraries::<false>(world, resources, &driveways);
+    }
+}
+
+fn update_itineraries<const DRIVEWAYS: bool>(
+    world: &mut World,
+    resources: &Resources,
+    driveways: &crate::transportation::DrivewayTraffic,
+) {
     let time = &*resources.read::<GameTime>();
     let map = &*resources.read::<Map>();
     let failures = &mut resources.write::<ParkingManagement>().reroute_failures;
@@ -1537,7 +1645,17 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
             observe_discharge: observing && matches!(user.owner, EntryOwner::Vehicle(_)),
             discharged: None,
         });
-        *pos = it.update_guarded(
+        let mut driveway_held = false;
+        let driveway = user.filter(|_| DRIVEWAYS).map(|user| DrivewayMovement {
+            traffic: driveways,
+            actor: match user.owner {
+                EntryOwner::Vehicle(id) => Some(id),
+                EntryOwner::Human(_) => None,
+            },
+            half_extent: user.half_extent,
+            held: &mut driveway_held,
+        });
+        *pos = it.update_guarded::<DRIVEWAYS>(
             *pos,
             speed * DELTA,
             time.seconds,
@@ -1551,7 +1669,11 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                 }
                 true
             },
+            driveway,
         );
+        if DRIVEWAYS && driveway_held {
+            return (Some(HoldReason::Conflict), None, None);
+        }
         admission.map_or((None, None, None), |guard| {
             let observed_hold = match guard.user.owner {
                 EntryOwner::Vehicle(id) if observing => guard.frame.denial(id),
@@ -1679,7 +1801,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
         if !freight.may_move(id) {
             train.speed.0 = 0.0;
         } else if train.speed.0 > 0.0 && !train.it.is_inert() {
-            train.trans.pos = train.it.update_guarded(
+            train.trans.pos = train.it.update_guarded::<false>(
                 train.trans.pos,
                 train.speed.0 * DELTA,
                 time.seconds,
@@ -1716,6 +1838,7 @@ pub fn itinerary_update(world: &mut World, resources: &mut Resources) {
                     }
                     true
                 },
+                None,
             );
         }
         if let Some(index) = &mut observed {
@@ -3005,5 +3128,670 @@ mod tests {
             assert_eq!(branch.g.world.vehicles[car].it.end_pos(), Some(end));
         }
         assert_eq!(sim.g.hashes(), resumed.g.hashes());
+    }
+}
+
+#[cfg(test)]
+mod pathpark_sweep_tests {
+    use super::*;
+    use crate::map::LaneKind;
+    use crate::tests::pathpark_lifecycle::road_chain;
+    use crate::transportation::{spawn_driving_vehicle, DrivewayPhase, DrivewayTraffic};
+
+    #[test]
+    fn pathpark_guard_blocks_recovering_walker() {
+        let (mut ctx, roads, portal) = road_chain(1);
+        let approach = portal.approach(&ctx.g).unwrap();
+        let car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, approach).unwrap();
+        portal.hold(&mut ctx.g, car).unwrap();
+        ctx.tick_fast();
+        let traffic = ctx.g.read::<DrivewayTraffic>();
+        assert_eq!(traffic.phase(portal), Some(DrivewayPhase::Entering));
+        let map = ctx.g.map();
+        let road = &map.roads()[roads[0]];
+        let sidewalks = road.sidewalks(road.src);
+        let (curb, exit, start) = [sidewalks.incoming, sidewalks.outgoing]
+            .into_iter()
+            .flatten()
+            .find_map(|curb| {
+                let lane = &map.lanes()[curb];
+                assert_eq!(lane.kind, LaneKind::Walking);
+                (0..180).find_map(|i| {
+                    let exit = lane.points.point_along(i as f32 * 0.5);
+                    let along = approach.dir;
+                    let across = along.xy().perpendicular().z0();
+                    [along, -along, across, -across]
+                        .into_iter()
+                        .find_map(|dir| {
+                            let start = exit + dir * 5.;
+                            traffic
+                                .blocks_step(None, 0.3, start, exit)
+                                .then_some((curb, exit, start))
+                        })
+                })
+            })
+            .expect("recovery intersects the committed ingress");
+        let mut walking = Itinerary {
+            kind: ItineraryKind::PedestrianEgress(PedestrianEgress {
+                crossing: Some(Traversable::new(
+                    TraverseKind::Lane(curb),
+                    TraverseDirection::Forward,
+                )),
+                retry: None,
+                check_at: Tick(0),
+            }),
+            reversed_local_path: vec![exit],
+            ..Itinerary::default()
+        };
+        let mut held = false;
+        let movement = |held| DrivewayMovement {
+            traffic: &traffic,
+            actor: None,
+            half_extent: 0.3,
+            held,
+        };
+        let reached = walking.update_guarded::<true>(
+            start,
+            10.,
+            0,
+            &map,
+            |_, _, _| None,
+            None::<fn(RoadID, PathKind)>,
+            None,
+            |_, _, _| true,
+            Some(movement(&mut held)),
+        );
+        assert_eq!(
+            reached, start,
+            "pedestrian recovery enters the committed sweep"
+        );
+        assert!(held);
+    }
+
+    #[test]
+    fn pathpark_guard_uses_bus_extent() {
+        let (mut ctx, _, portal) = road_chain(1);
+        let approach = portal.approach(&ctx.g).unwrap();
+        let car = spawn_driving_vehicle(&mut ctx.g, VehicleKind::Car, approach).unwrap();
+        portal.hold(&mut ctx.g, car).unwrap();
+        ctx.tick_fast();
+        let traffic = ctx.g.read::<DrivewayTraffic>();
+        assert_eq!(traffic.phase(portal), Some(DrivewayPhase::Entering));
+        let start = approach.pos - approach.dir * 8.;
+        let end = approach.pos - approach.dir * 5.5;
+        let mut bus = Itinerary::simple(vec![end]);
+        let mut held = false;
+        let reached = bus.update_guarded::<true>(
+            start,
+            10.,
+            0,
+            &ctx.g.map(),
+            |_, _, _| None,
+            None::<fn(RoadID, PathKind)>,
+            None,
+            |_, _, _| true,
+            Some(DrivewayMovement {
+                traffic: &traffic,
+                actor: Some(crate::VehicleID::default()),
+                half_extent: VehicleKind::Bus.width() * 0.5,
+                held: &mut held,
+            }),
+        );
+        assert_eq!(reached, start, "the bus body reaches the committed sweep");
+        assert!(held);
+    }
+}
+
+mod pathpark_route {
+    use super::{driving_lane_points, Itinerary, ItineraryKind, ItineraryTarget, Route};
+    use crate::map::{
+        LaneID, Map, PathKind, RoadID, Traversable, TraverseDirection, TraverseKind, TurnID,
+        TurnKind,
+    };
+    use crate::world_command::bounded_command_vec;
+    use geom::{PolyLine3, Transform, Vec3};
+    use serde::{Deserialize, Serialize};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    const MAX_NODES: usize = 256;
+    const MAX_WORK: usize = 2_048;
+    const MAX_ROUTE_STEPS: usize = MAX_NODES * 2;
+    const MAX_ENDPOINT_POINTS: usize = 512;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct DirectedEndpoint {
+        pub lane: LaneID,
+        pub offset_cm: u32,
+    }
+
+    impl DirectedEndpoint {
+        pub fn offset(self) -> f32 {
+            self.offset_cm as f32 * 0.01
+        }
+
+        pub fn transform(self, map: &Map) -> Option<Transform> {
+            let (pos, dir) = self.points(map)?.point_dir_along(self.offset());
+            Some(Transform::new_dir(pos, dir))
+        }
+
+        fn points(self, map: &Map) -> Option<&PolyLine3> {
+            driving_lane_points(map, self.lane, self.offset())
+                .filter(|points| points.len() <= MAX_ENDPOINT_POINTS)
+        }
+    }
+
+    pub enum DirectedSearchResult {
+        Deferred,
+        Unavailable,
+        BudgetExhausted,
+        Feasible(DirectedPlan),
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    pub struct DirectedPlan {
+        from: DirectedEndpoint,
+        to: DirectedEndpoint,
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_ROUTE_STEPS>")]
+        reversed_route: Vec<Traversable>,
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_ENDPOINT_POINTS>")]
+        local: Vec<Vec3>,
+        end_pos: Vec3,
+    }
+
+    impl DirectedPlan {
+        pub(crate) fn origin(&self) -> DirectedEndpoint {
+            self.from
+        }
+
+        pub(crate) fn roads<'a>(&'a self, map: &'a Map) -> impl Iterator<Item = RoadID> + 'a {
+            std::iter::once(self.from.lane)
+                .chain(
+                    self.reversed_route
+                        .iter()
+                        .filter_map(|step| match step.kind {
+                            TraverseKind::Lane(lane) => Some(lane),
+                            TraverseKind::Turn(_) => None,
+                        }),
+                )
+                .filter_map(|lane| map.get(lane).map(|lane| lane.parent))
+        }
+
+        pub(crate) fn valid(&self, map: &Map) -> bool {
+            let (Some(from), Some(to)) = (self.from.points(map), self.to.points(map)) else {
+                return false;
+            };
+            if !self.reversed_route.len().is_multiple_of(2) {
+                return false;
+            }
+            let mut lane = self.from.lane;
+            for pair in self.reversed_route.rchunks_exact(2) {
+                let TraverseKind::Turn(turn) = pair[1].kind else {
+                    return false;
+                };
+                if pair[0] != lane_step(turn.dst)
+                    || pair[1].dir != TraverseDirection::Forward
+                    || turn.src != lane
+                    || turn.bidirectional
+                    || map
+                        .get(turn.parent)
+                        .and_then(|joint| joint.find_turn(turn))
+                        .is_none_or(|turn| turn.kind != TurnKind::Driving)
+                {
+                    return false;
+                }
+                lane = turn.dst;
+            }
+            if lane != self.to.lane
+                || (self.reversed_route.is_empty() && self.from.offset_cm > self.to.offset_cm)
+            {
+                return false;
+            }
+
+            let mut expected = Trace::new(None);
+            let same_lane = self.reversed_route.is_empty();
+            while !expected.materialize(from, to, self.from, self.to, same_lane) {}
+            expected.end_pos == Some(self.end_pos) && expected.local == self.local
+        }
+
+        pub fn itinerary(&self, map: &Map) -> Option<Itinerary> {
+            self.valid(map).then(|| self.clone().into_itinerary())
+        }
+
+        pub(crate) fn retained_work(&self) -> usize {
+            self.local.len() + self.reversed_route.len() + 1
+        }
+
+        pub(crate) fn into_itinerary(self) -> Itinerary {
+            Itinerary {
+                kind: ItineraryKind::Route(
+                    Route {
+                        reversed_route: self.reversed_route,
+                        end_pos: self.end_pos,
+                        cur: lane_step(self.from.lane),
+                        target: ItineraryTarget::DirectedLane(self.to.lane, self.to.offset()),
+                    },
+                    PathKind::Vehicle,
+                ),
+                reversed_local_path: self.local,
+                ..Itinerary::default()
+            }
+        }
+    }
+
+    fn lane_step(id: LaneID) -> Traversable {
+        Traversable::new(TraverseKind::Lane(id), TraverseDirection::Forward)
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+    struct Arrival {
+        cost: u64,
+        previous: Option<LaneID>,
+        through: TurnID,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+    struct Edges {
+        lane: Option<LaneID>,
+        after: Option<TurnID>,
+    }
+
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+    struct Sampling {
+        index: usize,
+        distance: f32,
+    }
+
+    impl Sampling {
+        fn next(&mut self, points: &PolyLine3) -> (Vec3, Vec3, f32, f32, bool) {
+            let a = points[self.index];
+            let b = points.get(self.index + 1).copied().unwrap_or(a);
+            let start = self.distance;
+            self.distance += a.distance(b);
+            self.index += 1;
+            (a, b, start, self.distance, self.index + 1 >= points.len())
+        }
+    }
+
+    fn interpolate(a: Vec3, b: Vec3, start: f32, end: f32, offset: f32) -> Vec3 {
+        if offset <= start {
+            a
+        } else if offset >= end {
+            b
+        } else {
+            a + (b - a) * ((offset - start) / (end - start))
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    struct Trace {
+        lane: Option<LaneID>,
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_ROUTE_STEPS>")]
+        reversed_route: Vec<Traversable>,
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_ENDPOINT_POINTS>")]
+        local: Vec<Vec3>,
+        end_pos: Option<Vec3>,
+        end: Sampling,
+        start: Sampling,
+        local_done: bool,
+        swaps: usize,
+    }
+
+    impl Trace {
+        fn new(lane: Option<LaneID>) -> Self {
+            Self {
+                lane,
+                reversed_route: Vec::new(),
+                local: Vec::new(),
+                end_pos: None,
+                end: Sampling::default(),
+                start: Sampling::default(),
+                local_done: false,
+                swaps: 0,
+            }
+        }
+
+        // One destination sample, one clipped origin segment or one swap per call.
+        fn materialize(
+            &mut self,
+            from_points: &PolyLine3,
+            to_points: &PolyLine3,
+            from: DirectedEndpoint,
+            to: DirectedEndpoint,
+            same_lane: bool,
+        ) -> bool {
+            if self.end_pos.is_none() {
+                let (a, b, start, end, last) = self.end.next(to_points);
+                if to.offset() <= end || last {
+                    self.end_pos = Some(interpolate(a, b, start, end, to.offset()));
+                }
+                return false;
+            }
+            if !self.local_done {
+                let limit = if same_lane {
+                    to.offset()
+                } else {
+                    from_points.length()
+                };
+                let (a, b, start, end, last) = self.start.next(from_points);
+                if from.offset() <= end || last {
+                    if self.local.is_empty() {
+                        self.local
+                            .push(interpolate(a, b, start, end, from.offset()));
+                    }
+                    if limit > from.offset() && limit > start {
+                        self.local.push(interpolate(a, b, start, end, limit));
+                    }
+                }
+                self.local_done = limit <= end || last;
+                return false;
+            }
+            if self.swaps < self.local.len() / 2 {
+                let opposite = self.local.len() - 1 - self.swaps;
+                self.local.swap(self.swaps, opposite);
+                self.swaps += 1;
+                return false;
+            }
+            true
+        }
+    }
+
+    #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+    #[serde(try_from = "SavedSearch", into = "SavedSearch")]
+    pub struct DirectedSearch {
+        from: DirectedEndpoint,
+        to: DirectedEndpoint,
+        revision: Option<(u64, u64)>,
+        frontier: BTreeSet<(u64, LaneID)>,
+        arrivals: BTreeMap<LaneID, Arrival>,
+        edges: Option<Edges>,
+        trace: Option<Trace>,
+        spent: usize,
+        revision_work: usize,
+        cleanup_work: usize,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    struct SavedSearch {
+        from: DirectedEndpoint,
+        to: DirectedEndpoint,
+        revision: Option<(u64, u64)>,
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_NODES>")]
+        frontier: Vec<(u64, LaneID)>,
+        #[serde(deserialize_with = "bounded_command_vec::<_, _, MAX_NODES>")]
+        arrivals: Vec<(LaneID, Arrival)>,
+        edges: Option<Edges>,
+        trace: Option<Trace>,
+        spent: usize,
+        revision_work: usize,
+        cleanup_work: usize,
+    }
+
+    impl From<DirectedSearch> for SavedSearch {
+        fn from(s: DirectedSearch) -> Self {
+            Self {
+                from: s.from,
+                to: s.to,
+                revision: s.revision,
+                frontier: s.frontier.into_iter().collect(),
+                arrivals: s.arrivals.into_iter().collect(),
+                edges: s.edges,
+                trace: s.trace,
+                spent: s.spent,
+                revision_work: s.revision_work,
+                cleanup_work: s.cleanup_work,
+            }
+        }
+    }
+
+    impl TryFrom<SavedSearch> for DirectedSearch {
+        type Error = &'static str;
+
+        fn try_from(s: SavedSearch) -> Result<Self, Self::Error> {
+            if s.spent > MAX_WORK
+                || !s.frontier.windows(2).all(|p| p[0] < p[1])
+                || !s.arrivals.windows(2).all(|p| p[0].0 < p[1].0)
+                || s.revision_work.saturating_add(s.cleanup_work) > s.spent
+                || s.trace.as_ref().is_some_and(|trace| {
+                    trace.start.index > MAX_ENDPOINT_POINTS
+                        || trace.end.index > MAX_ENDPOINT_POINTS
+                        || trace.swaps > trace.local.len() / 2
+                        || trace.end_pos.is_some_and(|p| !p.is_finite())
+                        || trace.local.iter().any(|p| !p.is_finite())
+                })
+            {
+                return Err("invalid directed route cursor");
+            }
+            let arrivals: BTreeMap<_, _> = s.arrivals.into_iter().collect();
+            let known = |lane: Option<LaneID>| lane.is_none_or(|id| arrivals.contains_key(&id));
+            if s.frontier
+                .iter()
+                .any(|&(cost, id)| !arrivals.get(&id).is_some_and(|a| a.cost == cost))
+                || s.edges.is_some_and(|edges| !known(edges.lane))
+                || s.trace.as_ref().is_some_and(|trace| !known(trace.lane))
+                || arrivals.iter().any(|(&id, a)| {
+                    a.through.dst != id
+                        || a.through.bidirectional
+                        || a.previous.map_or(a.through.src != s.from.lane, |prev| {
+                            a.through.src != prev
+                                || !arrivals.get(&prev).is_some_and(|p| p.cost < a.cost)
+                        })
+                })
+            {
+                return Err("inconsistent directed route cursor");
+            }
+            Ok(Self {
+                from: s.from,
+                to: s.to,
+                revision: s.revision,
+                frontier: s.frontier.into_iter().collect(),
+                arrivals,
+                edges: s.edges,
+                trace: s.trace,
+                spent: s.spent,
+                revision_work: s.revision_work,
+                cleanup_work: s.cleanup_work,
+            })
+        }
+    }
+
+    impl DirectedSearch {
+        pub fn new(from: DirectedEndpoint, to: DirectedEndpoint) -> Self {
+            Self {
+                from,
+                to,
+                revision: None,
+                frontier: BTreeSet::new(),
+                arrivals: BTreeMap::new(),
+                edges: Some(Edges {
+                    lane: None,
+                    after: None,
+                }),
+                trace: None,
+                spent: 0,
+                revision_work: 0,
+                cleanup_work: 0,
+            }
+        }
+
+        pub(crate) fn endpoints(&self) -> (DirectedEndpoint, DirectedEndpoint) {
+            (self.from, self.to)
+        }
+
+        pub(crate) fn stale(&self, map: &Map) -> bool {
+            self.revision
+                .is_some_and(|previous| previous != map.directed_route_revision())
+        }
+
+        pub(crate) fn validate_loaded(&self, map: &Map, ready: Option<&DirectedPlan>) -> bool {
+            if self.stale(map) {
+                return true; // Advance discards an obsolete graph cursor within the same lifetime.
+            }
+            let mut rebuilt = Self::new(self.from, self.to);
+            let mut work = self.revision_work;
+            let rebuilt_plan = match rebuilt.advance(map, &mut work) {
+                DirectedSearchResult::Feasible(plan) => Some(plan),
+                _ => None,
+            };
+            rebuilt.spent = self.spent;
+            rebuilt == *self && rebuilt_plan.as_ref() == ready
+        }
+
+        pub(crate) fn charge(&mut self, budget: &mut usize) -> bool {
+            if *budget == 0 || self.spent == MAX_WORK {
+                return false;
+            }
+            *budget -= 1;
+            self.spent += 1;
+            true
+        }
+
+        pub(crate) fn exhausted(&self) -> bool {
+            self.spent == MAX_WORK
+        }
+
+        pub fn advance(&mut self, map: &Map, budget: &mut usize) -> DirectedSearchResult {
+            use DirectedSearchResult::*;
+            if self.exhausted() {
+                return BudgetExhausted;
+            }
+            if *budget == 0 {
+                return Deferred;
+            }
+            if self.stale(map) {
+                let cleanup = self.frontier.len()
+                    + self.arrivals.len()
+                    + self
+                        .trace
+                        .as_ref()
+                        .map_or(0, |trace| trace.local.len() + trace.reversed_route.len());
+                // Debit retained records across slices before releasing the stale cursor.
+                while self.cleanup_work < cleanup {
+                    if !self.charge(budget) {
+                        return if self.exhausted() {
+                            BudgetExhausted
+                        } else {
+                            Deferred
+                        };
+                    }
+                    self.cleanup_work += 1;
+                }
+                *self = Self {
+                    spent: self.spent,
+                    ..Self::new(self.from, self.to)
+                };
+            }
+            let Some(start) = self.from.points(map) else {
+                return Unavailable;
+            };
+            let Some(end) = self.to.points(map) else {
+                return Unavailable;
+            };
+            if self.revision.is_none() {
+                if !self.charge(budget) {
+                    return if self.exhausted() {
+                        BudgetExhausted
+                    } else {
+                        Deferred
+                    };
+                }
+                self.revision_work += 1;
+                self.revision = Some(map.directed_route_revision());
+                if self.from.lane == self.to.lane && self.from.offset_cm <= self.to.offset_cm {
+                    self.trace = Some(Trace::new(None));
+                }
+            }
+            while self.charge(budget) {
+                self.revision_work += 1;
+                if let Some(trace) = &mut self.trace {
+                    if let Some(lane) = trace.lane {
+                        if trace.reversed_route.len() == MAX_ROUTE_STEPS {
+                            return BudgetExhausted;
+                        }
+                        let arrival = self.arrivals[&lane];
+                        trace.reversed_route.push(lane_step(lane));
+                        trace.reversed_route.push(Traversable::new(
+                            TraverseKind::Turn(arrival.through),
+                            TraverseDirection::Forward,
+                        ));
+                        trace.lane = arrival.previous;
+                        continue;
+                    }
+                    let same_lane = trace.reversed_route.is_empty();
+                    if trace.materialize(start, end, self.from, self.to, same_lane) {
+                        let trace = self.trace.take().unwrap();
+                        return Feasible(DirectedPlan {
+                            from: self.from,
+                            to: self.to,
+                            reversed_route: trace.reversed_route,
+                            local: trace.local,
+                            end_pos: trace.end_pos.unwrap(),
+                        });
+                    }
+                    continue;
+                }
+                if let Some(edges) = &mut self.edges {
+                    let lane_id = edges.lane.unwrap_or(self.from.lane);
+                    let Some(lane) = map.get(lane_id) else {
+                        return Unavailable;
+                    };
+                    let Some(turn) = map
+                        .get(lane.dst)
+                        .and_then(|joint| joint.next_turn(edges.after))
+                    else {
+                        self.edges = None;
+                        continue;
+                    };
+                    edges.after = Some(turn.id);
+                    if turn.kind != TurnKind::Driving || turn.id.src != lane_id {
+                        continue;
+                    }
+                    let Some(next) = map
+                        .get(turn.id.dst)
+                        .filter(|l| l.kind == crate::map::LaneKind::Driving)
+                    else {
+                        continue;
+                    };
+                    let previous_cost = edges.lane.map_or(0, |id| self.arrivals[&id].cost);
+                    let distance =
+                        lane.points.length() - edges.lane.map_or(self.from.offset(), |_| 0.0);
+                    let seconds = (distance + turn.points.length()) / lane.speed_limit;
+                    let cost = previous_cost + ((seconds * 1_000.0).ceil() as u64).max(1);
+                    if let Some(old) = self.arrivals.get(&next.id) {
+                        if old.cost <= cost {
+                            continue;
+                        }
+                        self.frontier.remove(&(old.cost, next.id));
+                    } else if self.arrivals.len() == MAX_NODES {
+                        return BudgetExhausted;
+                    }
+                    self.arrivals.insert(
+                        next.id,
+                        Arrival {
+                            cost,
+                            previous: edges.lane,
+                            through: turn.id,
+                        },
+                    );
+                    self.frontier.insert((cost, next.id));
+                } else {
+                    let Some((_, lane)) = self.frontier.pop_first() else {
+                        return Unavailable;
+                    };
+                    if lane == self.to.lane {
+                        self.trace = Some(Trace::new(Some(lane)));
+                    } else {
+                        self.edges = Some(Edges {
+                            lane: Some(lane),
+                            after: None,
+                        });
+                    }
+                }
+            }
+            if self.exhausted() {
+                BudgetExhausted
+            } else {
+                Deferred
+            }
+        }
     }
 }

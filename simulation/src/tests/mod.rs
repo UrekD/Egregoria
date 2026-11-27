@@ -24,6 +24,8 @@ mod p5_placement;
 mod p5_spine_followups;
 mod p6_water;
 mod p7_road_edit;
+pub(crate) mod pathpark_lifecycle;
+mod pathpark_walk;
 mod population_scale;
 mod test_iso;
 mod vehicles;
@@ -2090,6 +2092,8 @@ mod tiles_fix_regressions {
         }
         let bytes = Bincode::encode(&sim).unwrap();
         let mut legacy: SimulationDeser = Bincode::decode(&bytes).unwrap();
+        legacy._header.version = crate::VERSION.into();
+        legacy.res.remove("driveway_traffic").unwrap();
         legacy.res.remove("land_ownership").unwrap();
         let opts = *sim.read::<crate::SimulationOptions>();
         legacy.res.insert(

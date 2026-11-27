@@ -102,7 +102,11 @@ fn population_scale_rejects_invalid_values_and_defaults_legacy_omissions() {
     let mut old_options = decoded.res.remove("simoptions").unwrap();
     assert_eq!(old_options.pop(), Some(1)); // Bincode encodes this appended u16 in one byte.
     decoded.res.insert("simoptions".into(), old_options);
-    let embedded_recording = legacy_recording.replacen(crate::VERSION, crate::PRE_SCALE_VERSION, 1);
+    let embedded_recording = legacy_recording.replacen(
+        &replay_version(),
+        &format!("{}+commands.2", crate::PRE_SCALE_VERSION),
+        1,
+    );
     decoded.res.insert("replay".into(), embedded_recording.into_bytes());
     let restored = decoded.into_sim().unwrap();
     assert_eq!(restored.population_scale(), PopulationScale::REALISTIC);

@@ -83,6 +83,7 @@ pub fn snap_special_building<T>(
             ProjectKind::Road(id) => map.get(id),
             _ => None,
         })
+        .filter(|road| !road.is_walking_path())
         .filter_map(|road| {
             let distance = road.points().project_2d(cursor).xy().distance(cursor);
             let max_distance = reach + road.width * 0.5;

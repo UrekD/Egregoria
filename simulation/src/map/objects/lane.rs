@@ -93,7 +93,39 @@ fn decode_lane_pattern_side<'de, D: serde::Deserializer<'de>>(
     crate::world_command::bounded_command_vec::<_, _, 32>(deserializer)
 }
 
+#[derive(Clone, Copy, Debug)]
+pub enum SmallRoadPreset {
+    WalkingPath,
+    LocalOneWay { curb_parking: bool },
+}
+
+impl SmallRoadPreset {
+    pub fn lane_pattern(self) -> LanePattern {
+        match self {
+            Self::WalkingPath => LanePattern {
+                lanes_forward: vec![(LaneKind::Walking, 1.4)],
+                lanes_backward: Vec::new(),
+            },
+            Self::LocalOneWay { curb_parking } => LanePatternBuilder::default()
+                .one_way(true)
+                .parking(curb_parking)
+                .speed_limit(7.0)
+                .build(),
+        }
+    }
+}
+
 impl LanePattern {
+    pub(crate) fn is_walking_only(&self) -> bool {
+        let mut lanes = self.lanes().peekable();
+        lanes.peek().is_some() && lanes.all(|(kind, _, _)| kind == LaneKind::Walking)
+    }
+
+    pub(crate) fn is_walking_path(&self) -> bool {
+        matches!(self.lanes_forward.as_slice(), [(LaneKind::Walking, _)])
+            && self.lanes_backward.is_empty()
+    }
+
     pub fn lanes(&self) -> impl Iterator<Item = (LaneKind, LaneDirection, f32)> + '_ {
         self.lanes_forward
             .iter()
