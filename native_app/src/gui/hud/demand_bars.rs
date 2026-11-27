@@ -1,5 +1,4 @@
 use crate::gui::zoning::{zone_color, zone_name};
-use crate::uiworld::UiWorld;
 use goryak::{
     blur_bg, is_hovered, mincolumn, minrow, monospace, on_secondary_container, padxy,
     secondary_container, sized_canvas, textc,
@@ -10,8 +9,30 @@ use simulation::{PopulationScale, Simulation};
 use yakui::paint::PaintRect;
 use yakui::{reflow, Alignment, Color, Dim2, Pivot, Rect, Vec2};
 
-pub fn render(_: &UiWorld, sim: &Simulation) {
-    let demand = sim.read::<ZoneDemand>();
+pub(crate) struct DemandSnapshot {
+    values: [Option<f32>; ZoneKind::ALL.len()],
+    population: u64,
+    scale: PopulationScale,
+    drivers: [Option<(&'static str, f32)>; ZoneKind::ALL.len()],
+}
+
+impl DemandSnapshot {
+    pub fn capture(sim: &Simulation) -> Self {
+        let demand = sim.read::<ZoneDemand>();
+        Self {
+            population: sim.population_scale().persons(sim.world().humans.len()),
+            scale: sim.population_scale(),
+            values: ZoneKind::ALL.map(|zone| demand_value(&demand, zone)),
+            drivers: ZoneKind::ALL.map(|zone| driver(&demand, zone)),
+        }
+    }
+
+    fn value(&self, zone: ZoneKind) -> Option<f32> {
+        self.values[usize::from(zone.ordinal())]
+    }
+}
+
+pub(super) fn render(demand: &DemandSnapshot) {
     reflow(
         Alignment::TOP_LEFT,
         Pivot::TOP_LEFT,
@@ -22,7 +43,7 @@ pub fn render(_: &UiWorld, sim: &Simulation) {
                     mincolumn(5.0, || {
                         minrow(9.0, || {
                             for zone in ZoneKind::ALL {
-                                let value = demand_value(&demand, zone);
+                                let value = demand.value(zone);
                                 let tint = zone_color(zone);
                                 let color = Color::from_linear(<[f32; 4]>::from(tint).into());
                                 let hovered = is_hovered(|| {
@@ -47,7 +68,7 @@ pub fn render(_: &UiWorld, sim: &Simulation) {
                                                             color,
                                                             format!("{} demand", zone_name(zone)),
                                                         );
-                                                        demand_details(sim, &demand, zone);
+                                                        demand_details(demand, zone);
                                                     });
                                                 });
                                             });
@@ -56,8 +77,8 @@ pub fn render(_: &UiWorld, sim: &Simulation) {
                                 }
                             }
                         });
-                        let scale = sim.population_scale();
-                        let population = scale.persons(sim.world().humans.len());
+                        let scale = demand.scale;
+                        let population = demand.population;
                         let label = if scale == PopulationScale::REALISTIC {
                             format!("Population {population}")
                         } else {
@@ -85,11 +106,11 @@ fn demand_value(demand: &ZoneDemand, zone: ZoneKind) -> Option<f32> {
     }
 }
 
-fn demand_details(sim: &Simulation, demand: &ZoneDemand, zone: ZoneKind) {
+fn demand_details(demand: &DemandSnapshot, zone: ZoneKind) {
     let color = on_secondary_container();
     if zone == ZoneKind::MixedUse {
-        let residential = demand_value(demand, ZoneKind::Residential);
-        let commercial = demand_value(demand, ZoneKind::Commercial);
+        let residential = demand.value(ZoneKind::Residential);
+        let commercial = demand.value(ZoneKind::Commercial);
         textc(
             color,
             format!(
@@ -105,9 +126,9 @@ fn demand_details(sim: &Simulation, demand: &ZoneDemand, zone: ZoneKind) {
             textc(color, "Growth requires both sources above +5");
         }
     } else {
-        let driver = match demand_value(demand, zone) {
+        let driver = match demand.value(zone) {
             None => "Waiting for the first demand update".to_owned(),
-            Some(_) => top_driver(sim, zone).map_or_else(
+            Some(_) => demand.drivers[usize::from(zone.ordinal())].map_or_else(
                 || "No active demand drivers".to_owned(),
                 |(name, points)| format!("{name} ({points:+.1} points)"),
             ),
@@ -162,7 +183,11 @@ fn bar(value: f32, color: Color) {
 }
 
 pub(crate) fn top_driver(sim: &Simulation, zone: ZoneKind) -> Option<(&'static str, f32)> {
-    let (driver, points) = sim.read::<ZoneDemand>().top_driver(zone)?;
+    driver(&sim.read::<ZoneDemand>(), zone)
+}
+
+fn driver(demand: &ZoneDemand, zone: ZoneKind) -> Option<(&'static str, f32)> {
+    let (driver, points) = demand.top_driver(zone)?;
     let label = match driver {
         DemandDriver::Base => match zone {
             ZoneKind::Residential => "Early residential growth",

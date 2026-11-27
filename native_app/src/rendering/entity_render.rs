@@ -1,14 +1,12 @@
-use crate::gui::selectable::VehiclePicker;
 use common::FastMap;
 use engine::meshload::load_scaled_mesh;
-use engine::{FrameContext, GfxContext, InstancedMeshBuilder, MeshInstance, SpriteBatchBuilder};
+use engine::{FrameContext, GfxContext, InstancedMeshBuilder, SpriteBatchBuilder};
 use geom::{LinearColor, Vec3, V3};
 use prototypes::{RenderAsset, RollingStockID, RollingStockPrototype};
-use simulation::map_dynamic::Transit;
-use simulation::transportation::{Location, VehicleKind};
-use simulation::Simulation;
+use std::time::Instant;
 
-/// Render all entities using instanced rendering for performance
+use super::world_snapshot::{ActorKind, SelectionView, WorldView};
+
 pub struct InstancedRender {
     pub path_not_found: SpriteBatchBuilder<true>,
     pub rolling_stock: FastMap<RollingStockID, InstancedMeshBuilder<true>>,
@@ -67,88 +65,77 @@ impl InstancedRender {
         }
     }
 
-    pub(crate) fn render(
+    pub fn render(
         &mut self,
-        sim: &Simulation,
+        view: &WorldView,
+        previous: Option<&WorldView>,
+        selection: SelectionView,
         fctx: &mut FrameContext<'_>,
-        picker: Option<&mut VehiclePicker>,
     ) {
         profiling::scope!("entity_render::render");
-        let mut picker = picker.and_then(|picker| picker.start_snapshot(sim).then_some(picker));
         self.cars.instances.clear();
         self.trucks.instances.clear();
         self.buses.instances.clear();
         self.pedestrians.instances.clear();
-        let transit = sim.read::<Transit>();
-        for (id, v) in sim.world().vehicles.iter() {
-            if let Some(picker) = picker.as_deref_mut() {
-                picker.index_road(id, v);
-            }
-            let trans = &v.trans;
-            let instance = MeshInstance {
-                pos: trans.pos,
-                dir: trans.dir,
-                tint: v.vehicle.tint.into(),
-            };
-
-            match v.vehicle.kind {
-                VehicleKind::Car => self.cars.instances.push(instance),
-                VehicleKind::Truck => self.trucks.instances.push(instance),
-                VehicleKind::Bus => {
-                    let tint = transit
-                        .runs
-                        .get(&id)
-                        .and_then(|run| transit.lines.get(run.line))
-                        .map_or(instance.tint, |line| line.color.into());
-                    self.buses.instances.push(MeshInstance { tint, ..instance });
-                }
-            }
-        }
-
-        self.rolling_stock.iter_mut().for_each(|(_, m)| {
-            m.instances.clear();
+        self.rolling_stock
+            .values_mut()
+            .for_each(|builder| builder.instances.clear());
+        let pair = previous.and_then(|previous| {
+            let fraction = view.stamp.interpolation_from(
+                previous.stamp,
+                Instant::now(),
+                view.paused || previous.paused,
+            );
+            (fraction < 1.0).then_some((previous, fraction))
         });
-        for (id, wagon) in sim.world().wagons.iter() {
-            let trans = &wagon.trans;
-            let instance = MeshInstance {
-                pos: trans.pos,
-                dir: trans.dir,
-                tint: LinearColor::WHITE,
+        let previous_actors: FastMap<_, _> = pair
+            .into_iter()
+            .flat_map(|(previous, _)| {
+                previous
+                    .entities
+                    .actors
+                    .iter()
+                    .map(|actor| (actor.id, actor))
+            })
+            .collect();
+        let (elapsed_steps, fraction) = pair.map_or((0, 1.0), |(previous, fraction)| {
+            (
+                view.stamp.completed_step - previous.stamp.completed_step,
+                fraction,
+            )
+        });
+
+        for actor in &view.entities.actors {
+            let instance = if selection.contains(actor.id) {
+                actor.pose
+            } else {
+                previous_actors
+                    .get(&actor.id)
+                    .map_or(actor.pose, |previous| {
+                        actor.pose_from(previous, elapsed_steps, fraction)
+                    })
             };
-
-            if let Some(mesh) = self.rolling_stock.get_mut(&wagon.wagon.rolling_stock) {
-                if let Some(picker) = picker.as_deref_mut() {
-                    picker.index_wagon(id, wagon);
+            match actor.kind {
+                ActorKind::Car => self.cars.instances.push(instance),
+                ActorKind::Truck => self.trucks.instances.push(instance),
+                ActorKind::Bus => self.buses.instances.push(instance),
+                ActorKind::Pedestrian => self.pedestrians.instances.push(instance),
+                ActorKind::RollingStock(id) => {
+                    if let Some(builder) = self.rolling_stock.get_mut(&id) {
+                        builder.instances.push(instance);
+                    }
                 }
-                mesh.instances.push(instance);
-            }
-        }
-
-        for p in sim.world().humans.values() {
-            if matches!(p.location, Location::Outside) {
-                self.pedestrians.instances.push(MeshInstance {
-                    pos: p.trans.pos.up(0.5 + 0.4 * p.pedestrian.walk_anim.cos()),
-                    dir: p.trans.dir.xy().z0(),
-                    tint: LinearColor::WHITE,
-                });
             }
         }
 
         self.path_not_found.clear();
-        for (_, (trans, itin)) in sim.world().query_trans_itin() {
-            let Some(wait) = itin.is_wait_for_reroute() else {
-                continue;
-            };
-            if wait == 0 {
-                continue;
-            }
-
+        for &(_, pos, wait) in &view.entities.reroutes {
             let r = wait as f32 / 200.0;
             let off = 1.0 - r;
 
             let s = 7.0;
             self.path_not_found.push(
-                trans.pos + off * 3.0 * V3::Y + 3.0 * V3::Z,
+                pos + off * 3.0 * V3::Y + 3.0 * V3::Z,
                 Vec3::X,
                 LinearColor::RED.a(r),
                 (s, s),

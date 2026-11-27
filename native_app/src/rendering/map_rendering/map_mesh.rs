@@ -21,13 +21,11 @@ use prototypes::{
 };
 use simulation::map::{
     Building, BuildingKind, CanonicalPosition, Density, EligiblePaintCells, Environment,
-    Intersection, LaneKind, Lanes, LotID, LotKind, Map, MapSubscriber, ProjectFilter, ProjectKind,
-    PylonPosition, Road, Roads, SubscriberChunkID, Turn, TurnKind, UpdateType, ZoneCell, ZoneGrid,
-    ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET, ZONE_CELL_SIZE,
+    Intersection, LaneKind, Lanes, LotID, LotKind, Map, MapSubscriber, MapSubscribers,
+    ProjectFilter, ProjectKind, PylonPosition, Road, Roads, SubscriberChunkID, Turn, TurnKind,
+    UpdateType, ZoneCell, ZoneGrid, ZoneKind, CROSSWALK_WIDTH, ROAD_Z_OFFSET, ZONE_CELL_SIZE,
 };
-use simulation::map_dynamic::Transit;
 use simulation::souls::growth::{check_growable_lot, GrowableLotError};
-use simulation::Simulation;
 use std::cell::RefCell;
 use std::collections::hash_map::Entry;
 use std::ops::{Mul, Neg, Range};
@@ -148,9 +146,7 @@ mod house_mesh_tests {
 pub struct MapMeshHandler {
     builders: MapBuilders,
     cache: FastMap<SubscriberChunkID, CachedObj>,
-    road_sub: MapSubscriber,
-    building_sub: MapSubscriber,
-    map_version: Option<u64>,
+    staged: FastMap<SubscriberChunkID, CachedObj>,
     rebuilt_version: Option<u64>,
     zoning: ZoningMeshes,
     bus_stop_builder: SpriteBatchBuilder<false>,
@@ -158,7 +154,7 @@ pub struct MapMeshHandler {
     bus_stop_revision: Option<u64>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct CachedObj {
     road: Vec<Arc<Mesh>>,
     build: Vec<Arc<dyn Drawable>>,
@@ -638,6 +634,10 @@ fn build_zoning_mesh(builder: &mut MeshBuilder<false>, gfx: &GfxContext) -> Opti
 }
 
 impl super::MapRenderer {
+    pub(crate) fn discard_zoning_preview() {
+        ZONING_FRAME.take();
+    }
+
     pub(crate) fn queue_zoning_overlay(
         map: &Map,
         grid: Arc<ZoneGrid>,
@@ -1384,7 +1384,7 @@ mod service_badge_tests {
 }
 
 impl MapMeshHandler {
-    pub fn new(gfx: &mut GfxContext, sim: &Simulation) -> Self {
+    pub fn new(gfx: &mut GfxContext, changes: &MapSubscribers) -> Self {
         let arrow_builder = SpriteBatchBuilder::from_path(gfx, "assets/sprites/arrow_one_way.png");
 
         let mut buildsprites = FastMap::default();
@@ -1523,16 +1523,15 @@ impl MapMeshHandler {
             bus_stop_batch: None,
             bus_stop_revision: None,
             cache: Default::default(),
-            road_sub: sim
-                .map()
-                .subscribe(UpdateType::Road | UpdateType::RoadSupport),
-            building_sub: sim.map().subscribe(UpdateType::Building),
-            map_version: None,
+            staged: Default::default(),
             rebuilt_version: None,
             zoning: ZoningMeshes {
-                updates: sim
-                    .map()
-                    .subscribe(UpdateType::Road | UpdateType::Building | UpdateType::Terrain),
+                updates: changes.subscribe(
+                    UpdateType::Road
+                        | UpdateType::Building
+                        | UpdateType::Terrain
+                        | UpdateType::Land,
+                ),
                 world: None,
                 grid: None,
                 chunk_states: Default::default(),
@@ -1547,20 +1546,21 @@ impl MapMeshHandler {
         }
     }
 
-    pub(crate) fn draw_transit_stops(&mut self, transit: &Transit, ctx: &mut FrameContext<'_>) {
-        if self.bus_stop_revision != Some(transit.revision) {
+    pub(crate) fn draw_transit_stops(
+        &mut self,
+        positions: &[Vec3],
+        revision: u64,
+        ctx: &mut FrameContext<'_>,
+    ) {
+        if self.bus_stop_revision != Some(revision) {
             self.bus_stop_builder.clear();
             let dir = upright_sprite([Vec2::X, Vec2::Y]).0.z0();
-            for stop in transit.stops.values() {
-                self.bus_stop_builder.push(
-                    stop.walk_pos.up(1.2),
-                    dir,
-                    LinearColor::WHITE,
-                    (12.0, 12.0),
-                );
+            for position in positions {
+                self.bus_stop_builder
+                    .push(position.up(1.2), dir, LinearColor::WHITE, (12.0, 12.0));
             }
             self.bus_stop_batch = self.bus_stop_builder.build(ctx.gfx);
-            self.bus_stop_revision = Some(transit.revision);
+            self.bus_stop_revision = Some(revision);
         }
         if let Some(batch) = &self.bus_stop_batch {
             ctx.draw(batch.clone());
@@ -1569,52 +1569,48 @@ impl MapMeshHandler {
 
     /// Tag this frame's map snapshot for the automation barrier.
     pub fn set_map_version(&mut self, tick: u64) {
-        self.map_version = Some(tick);
+        self.rebuilt_version = Some(tick);
     }
 
     pub fn rebuilt_version(&self) -> Option<u64> {
         self.rebuilt_version
     }
 
-    pub fn latest_mesh(
+    pub(super) fn stage_chunk(
         &mut self,
         map: &Map,
-        options: MapRenderOptions,
-        ctx: &mut FrameContext<'_>,
+        chunk: SubscriberChunkID,
+        kinds: UpdateType,
+        gfx: &mut GfxContext,
     ) {
-        profiling::scope!("draw map mesh");
-        for chunk in self.road_sub.take_updated_chunks() {
+        let cached = self
+            .staged
+            .entry(chunk)
+            .or_insert_with(|| self.cache.get(&chunk).cloned().unwrap_or_default());
+        if kinds.intersects(UpdateType::Road | UpdateType::RoadSupport) {
             profiling::scope!("build road chunk");
             let b = &mut self.builders;
             b.map_mesh(map, chunk);
 
-            let cached = self.cache.entry(chunk).or_default();
-
             cached.road.clear();
             cached.road.reserve(2);
 
-            if let Some(mesh) = b.mesh_map.build(ctx.gfx) {
+            if let Some(mesh) = b.mesh_map.build(gfx) {
                 cached.road.push(Arc::new(mesh));
             }
-            if let Some(mesh) = b.crosswalk_builder.build(ctx.gfx) {
+            if let Some(mesh) = b.crosswalk_builder.build(gfx) {
                 cached.road.push(Arc::new(mesh));
             }
 
-            cached.lots = b.mesh_lots.build(ctx.gfx);
-            cached.arrows = b.arrow_builder.build(ctx.gfx);
-
-            if cached.is_empty() {
-                self.cache.remove(&chunk);
-            }
+            cached.lots = b.mesh_lots.build(gfx);
+            cached.arrows = b.arrow_builder.build(gfx);
         }
 
-        for chunk in self.building_sub.take_updated_chunks() {
+        if kinds.contains(UpdateType::Building) {
             profiling::scope!("build building chunk");
 
             let b = &mut self.builders;
             b.buildings_mesh(map, chunk);
-
-            let cached = self.cache.entry(chunk).or_default();
 
             cached.build.clear();
             cached.build.reserve(4);
@@ -1622,44 +1618,51 @@ impl MapMeshHandler {
             let buildmeshes = b
                 .buildmeshes
                 .values_mut()
-                .flat_map(|x| x.build(ctx.gfx))
+                .flat_map(|x| x.build(gfx))
                 .collect::<Vec<_>>();
 
             if !buildmeshes.is_empty() {
                 cached.build.push(Arc::new(buildmeshes));
             }
 
-            if let Some(mesh) = b.houses_mesh.build(ctx.gfx) {
+            if let Some(mesh) = b.houses_mesh.build(gfx) {
                 cached.build.push(Arc::new(mesh));
-            }
-
-            let zonemeshes = b
-                .zonemeshes
-                .values_mut()
-                .flat_map(|(a, b, _)| a.build(ctx.gfx).zip(b.build(ctx.gfx)))
-                .collect::<Vec<_>>();
-            if !zonemeshes.is_empty() {
-                cached.build.push(Arc::new(zonemeshes));
             }
 
             // Sprites don't write depth, so they go after the placeholder boxes they sit on.
             let sprites = b
                 .buildsprites
                 .values_mut()
-                .filter_map(|x| x.build(ctx.gfx))
-                .chain(b.power_markers.build(ctx.gfx))
+                .filter_map(|x| x.build(gfx))
+                .chain(b.power_markers.build(gfx))
                 .collect::<Vec<_>>();
 
             if !sprites.is_empty() {
                 cached.build.push(Arc::new(sprites));
             }
 
-            if cached.is_empty() {
-                self.cache.remove(&chunk);
+            let zonemeshes = b
+                .zonemeshes
+                .values_mut()
+                .flat_map(|(a, b, _)| a.build(gfx).zip(b.build(gfx)))
+                .collect::<Vec<_>>();
+            if !zonemeshes.is_empty() {
+                cached.build.push(Arc::new(zonemeshes));
             }
         }
-        self.rebuilt_version = self.map_version.take();
+    }
 
+    pub(super) fn promote(&mut self) {
+        for (chunk, cached) in self.staged.drain() {
+            if cached.is_empty() {
+                self.cache.remove(&chunk);
+            } else {
+                self.cache.insert(chunk, cached);
+            }
+        }
+    }
+
+    pub fn draw(&mut self, map: &Map, options: MapRenderOptions, ctx: &mut FrameContext<'_>) {
         profiling::scope!("prepare map mesh");
         for v in self.cache.values() {
             ctx.draw(v.build.clone());

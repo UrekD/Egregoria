@@ -1,12 +1,17 @@
 use engine::frame_profile::CpuPhase;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
 use engine::heightmap::{GroundOverlayDisc, GroundOverlayImage};
 use engine::{Context, FrameContext, GfxContext};
 #[cfg(feature = "debug-ground-overlay")]
 use geom::{vec2, LinearColor, AABB};
 use geom::{Camera, Circle, InfiniteFrustrum, Intersect3};
 use map_mesh::MapMeshHandler;
-use simulation::map::{Lane, LaneID, LaneKind, Map, ProjectFilter, ProjectKind, TrafficBehavior};
-use simulation::Simulation;
+use simulation::map::{
+    Lane, LaneID, LaneKind, Map, MapSubscribers, ProjectFilter, ProjectKind, SubscriberChunkID,
+    TrafficBehavior, UpdateType,
+};
 use terrain::TerrainRender;
 
 use crate::rendering::immediate::ImmediateDraw;
@@ -31,6 +36,7 @@ pub struct MapRenderer {
     pub trees: TreesRender,
     water: WaterRender,
     pub lamps: LampsRender,
+    changes: MapSubscribers,
 }
 
 pub struct MapRenderOptions {
@@ -39,29 +45,81 @@ pub struct MapRenderOptions {
 }
 
 impl MapRenderer {
-    pub fn new(gfx: &mut GfxContext, sim: &Simulation) -> Self {
+    pub fn new(gfx: &mut GfxContext, map: &Map) -> Self {
         defer!(log::info!("finished init of road render"));
+        let changes = MapSubscribers::default();
         let renderer = MapRenderer {
-            meshb: MapMeshHandler::new(gfx, sim),
-            trees: TreesRender::new(gfx, &sim.map()),
-            terrain: TerrainRender::new(gfx, sim),
-            water: WaterRender::new(&sim.map()),
-            lamps: LampsRender::new(&sim.map()),
+            meshb: MapMeshHandler::new(gfx, &changes),
+            trees: TreesRender::new(gfx),
+            terrain: TerrainRender::new(gfx, map),
+            water: WaterRender::new(&changes),
+            lamps: LampsRender::new(),
+            changes,
         };
         #[cfg(feature = "debug-ground-overlay")]
         if std::env::var("EGR_DEBUG_GROUND_OVERLAY").as_deref() == Ok("1") {
             let mut renderer = renderer;
-            renderer.set_debug_ground_overlay(gfx, sim.map().environment().bounds());
+            renderer.set_debug_ground_overlay(gfx, map.environment().bounds());
             return renderer;
         }
         renderer
     }
 
-    pub fn update(&mut self, sim: &Simulation, ctx: &mut Context) {
-        profiling::scope!("update map renderer");
-        let map = sim.map();
-        self.lamps.update(&map, ctx);
-        self.terrain.update(ctx, &map);
+    pub(crate) fn stage(
+        &mut self,
+        map: &Map,
+        remaining: &mut BTreeMap<SubscriberChunkID, UpdateType>,
+        gfx: &mut GfxContext,
+        full_refresh: bool,
+    ) {
+        let deadline = Instant::now() + Duration::from_millis(4);
+        while let Some((chunk, kinds)) = remaining.pop_first() {
+            if kinds.intersects(UpdateType::Road | UpdateType::RoadSupport | UpdateType::Building) {
+                self.meshb.stage_chunk(map, chunk, kinds, gfx);
+            }
+            if kinds.contains(UpdateType::Terrain) {
+                self.trees.stage_chunk(map, chunk, gfx);
+                if full_refresh {
+                    self.terrain.upload_bucket(gfx, map, chunk);
+                }
+            }
+            if kinds.contains(UpdateType::Road) {
+                self.lamps.stage_chunk(map, chunk);
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+        }
+    }
+
+    pub(crate) fn promote(
+        &mut self,
+        map: &Map,
+        chunks: &BTreeMap<SubscriberChunkID, UpdateType>,
+        ctx: &mut Context,
+        full_refresh: bool,
+    ) {
+        self.meshb.promote();
+        self.trees.promote();
+        if full_refresh {
+            ctx.gfx.lamplights.reset(&ctx.gfx.device, &ctx.gfx.queue);
+            self.changes
+                .dispatch_all_terrain(map.environment().chunks().map(|(chunk, _)| chunk));
+        }
+        let mut terrain_changed = false;
+        for (&chunk, &kinds) in chunks {
+            self.changes.dispatch_chunk(kinds, chunk);
+            if kinds.contains(UpdateType::Terrain) {
+                if !full_refresh {
+                    self.terrain.upload_bucket(&mut ctx.gfx, map, chunk);
+                }
+                terrain_changed = true;
+            }
+        }
+        if terrain_changed {
+            self.terrain.invalidate_normals(&ctx.gfx);
+        }
+        self.lamps.promote(ctx);
     }
 
     /// Submit the atlas from the pre-terrain preparation hook, or clear it with `None`.
@@ -153,7 +211,7 @@ impl MapRenderer {
         ctx.gfx.profile_elapsed(CpuPhase::Instances, instances_start);
 
         let map_start = ctx.gfx.profile_timer();
-        self.meshb.latest_mesh(map, options, ctx);
+        self.meshb.draw(map, options, ctx);
 
         Self::signals_render(map, time, cam, &ctx.gfx.frustrum, draw);
         ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);

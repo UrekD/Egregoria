@@ -36,7 +36,7 @@ pub struct GUIWindows {
 }
 
 impl GUIWindows {
-    pub fn menu(&mut self, uiw: &UiWorld, sim: &Simulation) {
+    pub fn menu(&mut self, uiw: &UiWorld, sim: Option<&Simulation>) {
         if button_primary("Economy").show().clicked {
             self.economy_open ^= true;
         }
@@ -62,7 +62,11 @@ impl GUIWindows {
         }
 
         if crate::network::is_singleplayer(uiw) && button_primary("Exit to menu").show().clicked {
-            session::request_departure(uiw, sim, Departure::Screen(SessionScreen::MainMenu));
+            session::request_departure_when_ready(
+                uiw,
+                sim,
+                Departure::Screen(SessionScreen::MainMenu),
+            );
         }
 
         #[cfg(feature = "multiplayer")]
@@ -87,7 +91,7 @@ impl GUIWindows {
         transit_lines::transit_lines(uiworld, &mut self.transit_lines_open);
         progression::render(uiworld, sim, &mut self.progression_open);
         crate::gui::overlays::land_tiles::render(uiworld, sim, &mut self.land_tiles_open);
-        settings::settings(uiworld, sim, &mut self.settings_open);
+        settings::settings(uiworld, &mut self.settings_open);
         if show_unfinished_ui {
             stub_window("Save As", &mut self.save_as_open);
         }
@@ -108,7 +112,7 @@ impl GUIWindows {
         }
     }
 
-    pub fn render_session(&mut self, uiw: &UiWorld, sim: &Simulation, show_unfinished_ui: bool) {
+    pub fn render_session(&mut self, uiw: &UiWorld, show_unfinished_ui: bool) {
         let screen = *uiw.read::<SessionScreen>();
         let (title, opened) = match screen {
             SessionScreen::MainMenu => ("Egregoria", &mut self.main_menu_open),
@@ -134,7 +138,7 @@ impl GUIWindows {
         if !*opened && screen != SessionScreen::MainMenu {
             session::set_screen(uiw, SessionScreen::MainMenu);
         }
-        settings::settings(uiw, sim, &mut self.settings_open);
+        settings::settings(uiw, &mut self.settings_open);
     }
 
     pub(crate) fn close_open_window(&mut self) -> bool {

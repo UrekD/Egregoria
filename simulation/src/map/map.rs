@@ -21,8 +21,9 @@ use prototypes::{BuildingGen, GrowableCompanyID, Tick};
 use serde::{Deserialize, Serialize};
 use slotmapd::{HopSlotMap, Key};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 #[path = "water_edit.rs"]
 mod water_edit;
@@ -97,16 +98,47 @@ pub(crate) struct PreparedGrowable {
     building: PreparedBuilding,
 }
 
+// Geometry is shared with the native renderer. A write detaches only the
+// affected store, so a published source can outlive the simulation boundary.
+#[derive(Clone, Default)]
+pub(crate) struct SharedGeometry<T>(Arc<T>);
+
+impl<T> From<T> for SharedGeometry<T> {
+    fn from(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+}
+
+impl<T: Serialize> Serialize for SharedGeometry<T> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0.as_ref().serialize(serializer)
+    }
+}
+
+impl<T> Deref for SharedGeometry<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> DerefMut for SharedGeometry<T> {
+    fn deref_mut(&mut self) -> &mut T {
+        Arc::make_mut(&mut self.0)
+    }
+}
+
 pub struct Map {
     pub(super) land_ownership: super::LandOwnership,
     pub(super) land_frontage: super::land_frontage::LandFrontage,
-    pub(crate) roads: Roads,
-    pub(crate) lanes: Lanes,
-    pub(crate) intersections: Intersections,
-    pub(crate) buildings: Buildings,
-    pub(crate) lots: Lots,
+    pub(crate) roads: SharedGeometry<Roads>,
+    pub(crate) lanes: SharedGeometry<Lanes>,
+    pub(crate) intersections: SharedGeometry<Intersections>,
+    pub(crate) buildings: SharedGeometry<Buildings>,
+    pub(crate) lots: SharedGeometry<Lots>,
     pub(super) lots_by_road: BTreeMap<RoadID, BTreeSet<LotID>>,
-    pub(crate) spatial_map: SpatialMap,
+    pub(crate) spatial_map: SharedGeometry<SpatialMap>,
     pub(crate) external_train_stations: Vec<BuildingID>,
     pub(crate) lot_origins: BTreeMap<BuildingID, LotOrigin>,
     // Derived identity for caches whose lifetime can exceed this map's.
@@ -131,12 +163,23 @@ pub struct Map {
     pub(crate) no_frontage: BTreeSet<RoadID>,
 
     pub electricity: ElectricityCache,
-    pub(super) environment: Environment,
+    pub(super) environment: SharedGeometry<Environment>,
     pub parking: ParkingSpots,
     pub subscribers: MapSubscribers,
     pub(crate) pending_construction_cuts: BTreeSet<TerrainChunkID>,
     pub(super) construction_cut_revision: u64,
     pub(super) water_services: super::WaterServiceCache,
+}
+
+/// A detached, read-only source for presentation geometry.
+pub struct RenderMap(Map);
+
+impl Deref for RenderMap {
+    type Target = Map;
+
+    fn deref(&self) -> &Map {
+        &self.0
+    }
 }
 
 impl Default for Map {
@@ -175,7 +218,7 @@ impl Clone for Map {
             intersections: self.intersections.clone(),
             buildings: self.buildings.clone(),
             lots: self.lots.clone(),
-            spatial_map,
+            spatial_map: spatial_map.into(),
             external_train_stations: self.external_train_stations.clone(),
             lot_origins: self.lot_origins.clone(),
             walking_topology_generation: self.walking_topology_generation,
@@ -205,14 +248,14 @@ impl Map {
             land_ownership: super::LandOwnership::Unrestricted,
             land_frontage: Default::default(),
             lots_by_road: BTreeMap::new(),
-            roads: Roads::default(),
-            lanes: Lanes::default(),
-            intersections: Intersections::default(),
+            roads: SharedGeometry::default(),
+            lanes: SharedGeometry::default(),
+            intersections: SharedGeometry::default(),
             parking: ParkingSpots::default(),
-            buildings: Buildings::default(),
-            lots: Lots::default(),
-            environment: Environment::default(),
-            spatial_map: SpatialMap::default(),
+            buildings: SharedGeometry::default(),
+            lots: SharedGeometry::default(),
+            environment: SharedGeometry::default(),
+            spatial_map: SharedGeometry::default(),
             external_train_stations: Default::default(),
             lot_origins: BTreeMap::new(),
             identity: NEXT_IDENTITY
@@ -236,6 +279,23 @@ impl Map {
             water_services: super::WaterServiceCache::default(),
             subscribers: MapSubscribers::default(),
         }
+    }
+
+    /// Pin the immutable inputs used by terrain and map mesh preparation.
+    /// The source has independent subscribers for the renderer's dirty chunks.
+    pub fn render_snapshot(&self) -> RenderMap {
+        RenderMap(Self {
+            land_ownership: self.land_ownership.clone(),
+            no_frontage: self.no_frontage.clone(),
+            roads: self.roads.clone(),
+            lanes: self.lanes.clone(),
+            intersections: self.intersections.clone(),
+            buildings: self.buildings.clone(),
+            lots: self.lots.clone(),
+            spatial_map: self.spatial_map.clone(),
+            environment: self.environment.clone(),
+            ..Self::empty()
+        })
     }
 
     pub(crate) fn identity(&self) -> u64 {
@@ -436,6 +496,10 @@ impl Map {
 
     pub(crate) fn buy_prepared_tile(&mut self, tile: super::LandTileId) {
         self.land_ownership.purchase(tile);
+        self.subscribers.dispatch_chunk(
+            UpdateType::Land,
+            super::SubscriberChunkID::new(super::tile_bounds(tile).center()),
+        );
     }
 
     pub(crate) fn needs_topology_preparation(&self) -> bool {
@@ -649,7 +713,7 @@ impl Map {
         {
             return false;
         }
-        self.environment = environment;
+        self.environment = environment.into();
         true
     }
 

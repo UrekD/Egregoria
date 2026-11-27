@@ -2,45 +2,25 @@ use common::{FastMap, FastSet};
 use engine::{Context, LampLights, LightChunkID};
 use flat_spatial::AABBGrid;
 use geom::{Vec3, AABB3, V3};
-use simulation::map::{
-    Map, MapSubscriber, ProjectFilter, ProjectKind, SubscriberChunkID, UpdateType,
-};
+use simulation::map::{Map, ProjectFilter, ProjectKind, SubscriberChunkID};
 
 pub struct LampsRender {
     lamp_memory: FastMap<LightChunkID, Vec<Vec3>>,
     lamp_road_memory: FastMap<SubscriberChunkID, Vec<(LightChunkID, Vec3)>>,
-    lamp_sub: MapSubscriber,
+    staged: std::collections::BTreeMap<SubscriberChunkID, Vec<(LightChunkID, Vec3)>>,
 }
 
 impl LampsRender {
-    pub fn new(map: &Map) -> Self {
-        let lamp_sub = map.subscribe(UpdateType::Road);
+    pub fn new() -> Self {
         Self {
             lamp_memory: FastMap::default(),
             lamp_road_memory: FastMap::default(),
-            lamp_sub,
+            staged: Default::default(),
         }
     }
 
-    pub fn update(&mut self, map: &Map, ctx: &mut Context) {
-        profiling::scope!("lampposts");
-
-        let mut to_reupload: FastSet<LightChunkID> = Default::default();
-        for chunk in self.lamp_sub.take_updated_chunks() {
-            let lamp_chunk_memory = self.lamp_road_memory.entry(chunk).or_default();
-            for (chunk_id, lamp) in lamp_chunk_memory.drain(..) {
-                let Some(lamps) = self.lamp_memory.get_mut(&chunk_id) else {
-                    continue;
-                };
-                let Some(idx) = lamps.iter().position(|x| *x == lamp) else {
-                    continue;
-                };
-                to_reupload.insert(chunk_id);
-                lamps.swap_remove(idx);
-            }
-
-            let mut by_chunk: AABBGrid<(), AABB3> =
-                AABBGrid::new(LampLights::LIGHTCHUNK_SIZE as i32);
+    pub(super) fn stage_chunk(&mut self, map: &Map, chunk: SubscriberChunkID) {
+        let mut by_chunk: AABBGrid<(), AABB3> = AABBGrid::new(LampLights::LIGHTCHUNK_SIZE as i32);
 
             let mut add_light = |p: Vec3| {
                 by_chunk.insert(AABB3::centered(p, Vec3::splat(64.0)), ());
@@ -87,28 +67,43 @@ impl LampsRender {
                 add_light(i.pos + 8.0 * V3::Z);
             }
 
-            for (cell_idx, cell) in by_chunk.storage().cells.iter() {
-                if cell.objs.is_empty() {
-                    continue;
-                }
-                if cell_idx.0 < 0 || cell_idx.1 < 0 {
-                    continue;
-                }
-
-                let lamp_poss = cell
-                    .objs
+        let mut lights = Vec::new();
+        for (&(x, y), cell) in &by_chunk.storage().cells {
+            if x < 0 || y < 0 {
+                continue;
+            }
+            let key = (x as u16, y as u16);
+            lights.extend(
+                cell.objs
                     .iter()
-                    .filter_map(|x| by_chunk.get(x.0))
-                    .map(|x| x.aabb.center());
+                    .filter_map(|&(handle, _)| by_chunk.get(handle))
+                    .map(|light| (key, light.aabb.center())),
+            );
+        }
+        self.staged.insert(chunk, lights);
+    }
 
-                let lchunk_id = (cell_idx.0 as u16, cell_idx.1 as u16);
-                let lamp_light_memory = self.lamp_memory.entry(lchunk_id).or_default();
+    pub fn promote(&mut self, ctx: &mut Context) {
+        profiling::scope!("lampposts");
 
-                for v in lamp_poss {
-                    lamp_light_memory.push(v);
-                    lamp_chunk_memory.push((lchunk_id, v));
-                }
-                to_reupload.insert(lchunk_id);
+        let mut to_reupload: FastSet<LightChunkID> = Default::default();
+        for (chunk, staged) in std::mem::take(&mut self.staged) {
+            let lamp_chunk_memory = self.lamp_road_memory.entry(chunk).or_default();
+            for (chunk_id, lamp) in lamp_chunk_memory.drain(..) {
+                let Some(lamps) = self.lamp_memory.get_mut(&chunk_id) else {
+                    continue;
+                };
+                let Some(idx) = lamps.iter().position(|x| *x == lamp) else {
+                    continue;
+                };
+                to_reupload.insert(chunk_id);
+                lamps.swap_remove(idx);
+            }
+
+            for (key, lamp) in staged {
+                self.lamp_memory.entry(key).or_default().push(lamp);
+                lamp_chunk_memory.push((key, lamp));
+                to_reupload.insert(key);
             }
         }
 

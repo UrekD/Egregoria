@@ -4,7 +4,8 @@ use std::sync::Arc;
 use engine::{FrameContext, MeshBuilder, MeshVertex, Water, WaterOverviewAtlas};
 use geom::{vec2, Intersect3, LinearColor, AABB3};
 use simulation::map::{
-    Environment, Heightmap, Map, MapSubscriber, TerrainChunkID, UpdateType, WaterKind, WaterTile,
+    Environment, Heightmap, MapSubscriber, MapSubscribers, TerrainChunkID, UpdateType, WaterKind,
+    WaterTile,
 };
 
 const RES: usize = Heightmap::RESOLUTION;
@@ -30,9 +31,9 @@ pub(super) struct WaterRender {
 }
 
 impl WaterRender {
-    pub(super) fn new(map: &Map) -> Self {
+    pub(super) fn new(changes: &MapSubscribers) -> Self {
         Self {
-            updates: map.subscribe(UpdateType::Water),
+            updates: changes.subscribe(UpdateType::Water),
             revision: None,
             level_range: None,
             pending: BTreeSet::new(),

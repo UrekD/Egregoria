@@ -35,23 +35,24 @@ impl EguiWrapper {
         }
     }
 
-    pub fn render(
+    pub(crate) fn prepare(
         &mut self,
-        gfx: GuiRenderContext<'_>,
+        window: &Window,
         ui_render: impl for<'ui> FnOnce(&'ui egui::Context),
-    ) {
+    ) -> egui::FullOutput {
+        let input = self.platform.take_egui_input(window);
+        let egui = self.platform.egui_ctx();
+        egui.set_zoom_factor(self.zoom_factor);
+        egui.run(input, ui_render)
+    }
+
+    pub(crate) fn paint(&mut self, gfx: GuiRenderContext<'_>, output: egui::FullOutput) {
         for id in self.to_remove.drain(..) {
             self.renderer.free_texture(&id);
         }
 
-        let rinput = self.platform.take_egui_input(&gfx.gfx.window);
         let egui = self.platform.egui_ctx();
-        egui.set_zoom_factor(self.zoom_factor);
-
-        let output = egui.run(rinput, |ctx| {
-            ui_render(ctx);
-        });
-        let clipped_primitives = egui.tessellate(output.shapes, egui.pixels_per_point());
+        let clipped_primitives = egui.tessellate(output.shapes, output.pixels_per_point);
 
         //let mut rpass = gfx.rpass.take().unwrap();
         for (id, delta) in output.textures_delta.set {
@@ -60,7 +61,7 @@ impl EguiWrapper {
         }
         let desc = ScreenDescriptor {
             size_in_pixels: [gfx.size.0, gfx.size.1],
-            pixels_per_point: egui.pixels_per_point(),
+            pixels_per_point: output.pixels_per_point,
         };
         self.renderer.update_buffers(
             &gfx.gfx.device,

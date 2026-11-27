@@ -19,8 +19,6 @@ use crate::game_loop::VERSION;
 use crate::gui::{ExitState, GuiState};
 use crate::inputmap::InputMap;
 use crate::network::NetworkState;
-#[cfg(test)]
-use crate::uiworld::ReceivedCommands;
 use crate::uiworld::{SaveLoadState, UiWorld};
 
 #[path = "save_coordinator.rs"]
@@ -819,6 +817,14 @@ pub fn can_save(uiw: &UiWorld) -> bool {
 }
 
 pub(crate) fn request_departure(uiw: &UiWorld, sim: &Simulation, destination: Departure) {
+    request_departure_when_ready(uiw, Some(sim), destination);
+}
+
+pub(crate) fn request_departure_when_ready(
+    uiw: &UiWorld,
+    sim: Option<&Simulation>,
+    destination: Departure,
+) {
     if !playing(uiw) || uiw.read::<SessionState>().departure.is_some() {
         return;
     }
@@ -827,7 +833,7 @@ pub(crate) fn request_departure(uiw: &UiWorld, sim: &Simulation, destination: De
     }
     if uiw.read::<SaveLoadState>().threaded {
         uiw.write::<SaveLoadState>().departure_intent = Some(destination);
-    } else {
+    } else if let Some(sim) = sim {
         decide_departure(uiw, CityProgress::capture(sim), destination);
     }
 }

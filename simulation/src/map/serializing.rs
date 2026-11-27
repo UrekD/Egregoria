@@ -366,15 +366,15 @@ impl SerializedMap {
             lots_by_road.entry(lot.parent).or_default().insert(id);
         }
         let mut m = Map {
-            roads: self.roads,
-            lanes: self.lanes,
-            intersections: self.intersections,
-            buildings: self.buildings,
-            spatial_map,
-            lots: self.lots,
+            roads: self.roads.into(),
+            lanes: self.lanes.into(),
+            intersections: self.intersections.into(),
+            buildings: self.buildings.into(),
+            spatial_map: spatial_map.into(),
+            lots: self.lots.into(),
             lots_by_road,
             parking: self.parking,
-            environment: self.environment,
+            environment: self.environment.into(),
             external_train_stations: self.external_train_stations,
             import_lane_reserve,
             lot_origins,

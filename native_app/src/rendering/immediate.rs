@@ -199,9 +199,12 @@ impl ImmediateDraw {
         self.persistent_orders.clear();
     }
 
-    pub fn apply(&mut self, tess: &mut Tesselator, ctx: &mut FrameContext<'_>) {
-        for ImmediateOrder { kind, color } in
-            self.persistent_orders.iter().chain(self.orders.iter())
+    pub fn apply(&mut self, tess: &mut Tesselator, ctx: &mut FrameContext<'_>, persistent: bool) {
+        for ImmediateOrder { kind, color } in self
+            .persistent_orders
+            .iter()
+            .filter(|_| persistent)
+            .chain(self.orders.iter())
         {
             tess.set_color(*color);
             match *kind {

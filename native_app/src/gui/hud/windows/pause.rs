@@ -8,7 +8,7 @@ use super::{self as session, Departure, DeparturePhase, SessionScreen, SessionSt
 use crate::gui::windows::settings;
 use crate::uiworld::{SaveLoadState, UiWorld};
 
-pub(crate) fn render_modal(uiw: &UiWorld, sim: &Simulation) {
+pub(crate) fn render_modal(uiw: &UiWorld, sim: Option<&Simulation>) {
     let departure = uiw.read::<SessionState>().departure;
     if let Some(departure) = departure {
         render_departure(uiw, departure);
@@ -47,8 +47,8 @@ pub(crate) fn render_modal(uiw: &UiWorld, sim: &Simulation) {
         return;
     }
     if settings_open {
-        settings::settings(uiw, sim, &mut uiw.write::<SessionUi>().settings_open);
-        crate::gui::keybinds::keybind_modal(uiw, sim);
+        settings::settings(uiw, &mut uiw.write::<SessionUi>().settings_open);
+        crate::gui::keybinds::keybind_modal(uiw);
         return;
     }
     if !uiw.read::<SessionState>().paused {
@@ -84,16 +84,24 @@ pub(crate) fn render_modal(uiw: &UiWorld, sim: &Simulation) {
         }
         let singleplayer = crate::network::is_singleplayer(uiw);
         if singleplayer && button_primary("Load").show().clicked {
-            session::request_departure(uiw, sim, Departure::Screen(SessionScreen::LoadGame));
+            session::request_departure_when_ready(
+                uiw,
+                sim,
+                Departure::Screen(SessionScreen::LoadGame),
+            );
         }
         if button_primary("Settings").show().clicked {
             uiw.write::<SessionUi>().settings_open = true;
         }
         if singleplayer && button_primary("Exit to menu").show().clicked {
-            session::request_departure(uiw, sim, Departure::Screen(SessionScreen::MainMenu));
+            session::request_departure_when_ready(
+                uiw,
+                sim,
+                Departure::Screen(SessionScreen::MainMenu),
+            );
         }
         if button_secondary("Quit").show().clicked {
-            session::request_departure(uiw, sim, Departure::Exit);
+            session::request_departure_when_ready(uiw, sim, Departure::Exit);
         }
     });
     if !opened {

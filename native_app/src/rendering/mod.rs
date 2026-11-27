@@ -6,3 +6,5 @@ mod entity_render;
 pub mod immediate;
 mod map_rendering;
 mod orbit_camera;
+
+pub(crate) mod world_snapshot;

@@ -13,7 +13,6 @@ use goryak::{
     on_secondary_container, outline, padx, padxy, textc, VertScrollSize, Window,
 };
 use serde::{Deserialize, Serialize};
-use simulation::Simulation;
 
 use crate::game_loop::Timings;
 use crate::gui::keybinds::{BindingSaveFailure, KeybindState, KeybindStateInner};
@@ -128,7 +127,7 @@ impl Default for SettingsState {
 
 /// Settings window
 /// This window is used to change the settings of the game
-pub fn settings(uiw: &UiWorld, _: &Simulation, opened: &mut bool) {
+pub fn settings(uiw: &UiWorld, opened: &mut bool) {
     Window {
         title: "Settings".into(),
         pad: Pad::all(10.0),

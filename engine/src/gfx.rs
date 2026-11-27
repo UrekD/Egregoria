@@ -173,7 +173,6 @@ pub struct Encoders {
     pub smap: Vec<CommandBuffer>,
     pub depth_prepass: Option<CommandBuffer>,
     pub main: Option<CommandBuffer>,
-    deferred_main: Option<(TextureView, Vec<Box<dyn Drawable>>)>,
     pub before_main: CommandEncoder,
     pub after_main: CommandEncoder,
     pub gui: Option<CommandBuffer>,
@@ -251,17 +250,24 @@ pub struct GuiRenderContext<'a> {
 pub struct FrameContext<'a> {
     pub gfx: &'a mut GfxContext,
     pub objs: &'a mut Vec<Box<dyn Drawable>>,
-    defer_main: bool,
+    pub(crate) defer_main: bool,
 }
 
 impl<'a> FrameContext<'a> {
-    pub fn draw(&mut self, v: impl Drawable + 'static) {
-        self.objs.push(Box::new(v))
+    pub(crate) fn new(gfx: &'a mut GfxContext, objs: &'a mut Vec<Box<dyn Drawable>>) -> Self {
+        Self {
+            gfx,
+            objs,
+            defer_main: false,
+        }
     }
 
-    /// Record the color pass after the game frame returns and releases its world view.
     pub fn defer_main_pass(&mut self) {
         self.defer_main = true;
+    }
+
+    pub fn draw(&mut self, v: impl Drawable + 'static) {
+        self.objs.push(Box::new(v))
     }
 }
 
@@ -779,7 +785,6 @@ impl GfxContext {
                 smap: Default::default(),
                 depth_prepass: None,
                 main: None,
-                deferred_main: None,
                 before_main,
                 after_main,
                 gui: None,
@@ -801,31 +806,16 @@ impl GfxContext {
         )
     }
 
-    pub fn render<S>(
+    pub(crate) fn encode_frame(
         &mut self,
         encs: &mut Encoders,
-        frame: TextureView,
-        state: &mut S,
-        render: impl FnOnce(&mut S, &mut FrameContext<'_>),
-        render_gui: impl FnOnce(&mut S, GuiRenderContext<'_>),
+        target: &TextureView,
+        objsref: &[Box<dyn Drawable>],
+        defer_main: bool,
+        paint_gui: impl FnOnce(GuiRenderContext<'_>),
     ) -> (f32, f32) {
         profiling::scope!("gfx::render_objs");
-        self.perf.clear();
-
-        let mut objs = vec![];
-        let mut fc = FrameContext {
-            objs: &mut objs,
-            gfx: self,
-            defer_main: false,
-        };
-
-        render(state, &mut fc);
-        let defer_main = fc.defer_main;
-
         let start_time = Instant::now();
-        let target = &frame;
-
-        let objsref = &*objs;
 
         let mut gui_elapsed = 0.0;
 
@@ -871,7 +861,7 @@ impl GfxContext {
                     });
                 }
 
-                (gui_elapsed, encs.gui) = self.render_gui(target, state, render_gui);
+                (gui_elapsed, encs.gui) = self.encode_gui(target, paint_gui);
             });
         } else {
             encs.pbr = pbr();
@@ -884,11 +874,11 @@ impl GfxContext {
                 encs.main = Some(main());
             }
             after_main(&mut encs.after_main);
-            (gui_elapsed, encs.gui) = self.render_gui(target, state, render_gui);
+            (gui_elapsed, encs.gui) = self.encode_gui(target, paint_gui);
         }
 
         if defer_main {
-            encs.deferred_main = Some((frame, objs));
+            encs.main = Some(main());
         }
 
         let render_elapsed = start_time.elapsed();
@@ -899,24 +889,10 @@ impl GfxContext {
         (render_elapsed.as_secs_f32(), gui_elapsed)
     }
 
-    pub(crate) fn record_deferred_main(&mut self, encs: &mut Encoders) -> f32 {
-        let Some((frame, drawables)) = encs.deferred_main.take() else {
-            return 0.0;
-        };
-        let start = Instant::now();
-        encs.main = Some(self.main_render_pass(&frame, &drawables));
-        let elapsed = start.elapsed();
-        if let Some(profile) = &mut self.frame_profile {
-            profile.record_cpu(CpuPhase::Encode, elapsed);
-        }
-        elapsed.as_secs_f32()
-    }
-
-    fn render_gui<S>(
+    fn encode_gui(
         &self,
         frame: &TextureView,
-        state: &mut S,
-        render_gui: impl FnOnce(&mut S, GuiRenderContext) + Sized,
+        paint_gui: impl FnOnce(GuiRenderContext<'_>),
     ) -> (f32, Option<CommandBuffer>) {
         profiling::scope!("gfx::render_gui");
         let gui_start = Instant::now();
@@ -925,15 +901,12 @@ impl GfxContext {
             .create_command_encoder(&CommandEncoderDescriptor {
                 label: Some("GUI encoder"),
             });
-        render_gui(
-            state,
-            GuiRenderContext {
-                size: self.size,
-                gfx: self,
-                encoder: &mut gui_enc,
-                view: frame,
-            },
-        );
+        paint_gui(GuiRenderContext {
+            size: self.size,
+            gfx: self,
+            encoder: &mut gui_enc,
+            view: frame,
+        });
         (gui_start.elapsed().as_secs_f32(), Some(gui_enc.finish()))
     }
 

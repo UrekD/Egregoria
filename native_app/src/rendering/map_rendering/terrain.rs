@@ -1,10 +1,9 @@
 use std::time::{Duration, Instant};
 
 use engine::heightmap::{GroundOverlayDisc, GroundOverlayImage, HeightmapRender};
-use engine::{Context, FrameContext, GfxContext};
+use engine::{FrameContext, GfxContext};
 use geom::Camera;
-use simulation::map::{Map, MapSubscriber, UpdateType};
-use simulation::Simulation;
+use simulation::map::{Map, SubscriberChunkID};
 
 const CSIZE: u32 = simulation::map::Heightmap::SIZE;
 const CRESO: usize = simulation::map::Heightmap::RESOLUTION;
@@ -53,20 +52,17 @@ impl GroundOverlayUpload {
 
 pub struct TerrainRender {
     heightmap: HeightmapRender<CSIZE, CRESO>,
-    terrain_sub: MapSubscriber,
     last_overlay_upload: Option<GroundOverlayUpload>,
 }
 
 impl TerrainRender {
-    pub fn new(gfx: &mut GfxContext, sim: &Simulation) -> Self {
-        crate::inputmap::reset_deck_picker_cache();
-        let (w, h) = sim.map().environment().size();
+    pub fn new(gfx: &mut GfxContext, map: &Map) -> Self {
+        let (w, h) = map.environment().size();
 
         let terrain = HeightmapRender::new(gfx, w as u32, h as u32);
 
         Self {
             heightmap: terrain,
-            terrain_sub: sim.map().subscribe(UpdateType::Terrain),
             last_overlay_upload: None,
         }
     }
@@ -102,40 +98,22 @@ impl TerrainRender {
         self.heightmap.draw_heightmap(cam, fctx);
     }
 
-    pub fn update(&mut self, ctx: &mut Context, map: &Map) {
-        let ter = map.environment();
-
-        if self.terrain_sub.take_cleared() {
-            for (chunk_id, chunk) in ter.chunks() {
-                self.heightmap.update_chunk(
-                    &mut ctx.gfx,
-                    (chunk_id.0 as u32, chunk_id.1 as u32),
-                    chunk,
-                );
-            }
-
-            self.heightmap.invalidate_height_normals(&ctx.gfx);
-            return;
-        }
-
-        let mut changed = false;
-        for cell in self.terrain_sub.take_updated_chunks() {
-            for chunkid in cell.convert() {
-                let Some(chunk) = ter.get_chunk(chunkid) else {
-                    continue;
-                };
-                changed = true;
-                self.heightmap.update_chunk(
-                    &mut ctx.gfx,
-                    (chunkid.0 as u32, chunkid.1 as u32),
-                    chunk,
-                );
+    pub(super) fn upload_bucket(
+        &mut self,
+        gfx: &mut GfxContext,
+        map: &Map,
+        bucket: SubscriberChunkID,
+    ) {
+        for id in bucket.convert() {
+            if let Some(chunk) = map.environment().get_chunk(id) {
+                self.heightmap
+                    .update_chunk(gfx, (id.0 as u32, id.1 as u32), chunk);
             }
         }
+    }
 
-        if changed {
-            self.heightmap.invalidate_height_normals(&ctx.gfx);
-        }
+    pub(super) fn invalidate_normals(&mut self, gfx: &GfxContext) {
+        self.heightmap.invalidate_height_normals(gfx);
     }
 }
 

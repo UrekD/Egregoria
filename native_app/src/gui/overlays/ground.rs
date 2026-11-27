@@ -1,9 +1,10 @@
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use engine::heightmap::{GroundOverlayDisc, GroundOverlayImage};
-use engine::GfxContext;
+use engine::{GfxContext, WaterOverviewAtlas};
 use geom::{vec2, LinearColor, Vec2};
 use prototypes::{try_prototype, ServiceID};
 use simulation::map::{ElectricityNetworkID, Map, MapSubscriber, UpdateType};
@@ -50,6 +51,15 @@ pub(super) fn reset_world_cache() {
     CACHE.with_borrow_mut(|cache| *cache = GroundCache::default());
 }
 
+/// An atlas computed against the previous geometry cannot accompany a new map.
+pub(crate) fn invalidate_ground_epoch() -> bool {
+    CACHE.with_borrow_mut(|cache| {
+        cache.key = None;
+        cache.last_upload = None;
+        cache.mode.scale().is_some()
+    })
+}
+
 #[cfg(test)]
 pub(super) fn world_cache_is_clear() -> bool {
     CACHE.with_borrow(|cache| cache.world.is_none() && cache.key.is_none())
@@ -63,23 +73,45 @@ pub(super) fn placement_network() -> Option<UtilityNetworkReadout> {
     CACHE.with_borrow(|cache| cache.placement_network.clone())
 }
 
-pub(crate) fn prepare_ground(
-    uiw: &UiWorld,
-    sim: &Simulation,
-    renderer: &mut MapRenderer,
-    gfx: &mut GfxContext,
-    world_generation: u64,
-) {
+#[derive(Default)]
+pub(crate) struct GroundPrep {
+    water: Option<Arc<WaterOverviewAtlas>>,
+    preview: Option<GroundOverlayDisc>,
+    clear: bool,
+    upload: Option<(Atlas, FieldKey, u64, bool)>,
+}
+
+impl GroundPrep {
+    pub(crate) fn apply(self, renderer: &mut MapRenderer, gfx: &mut GfxContext) {
+        renderer.set_water_overview(self.water);
+        renderer.set_overlay_preview(gfx, self.preview);
+        if self.clear {
+            renderer.set_ground_overlay(gfx, None, true);
+        }
+        if let Some((atlas, key, revision, mode_changed)) = self.upload {
+            if renderer.set_ground_overlay(gfx, Some(atlas.image(revision)), mode_changed) {
+                CACHE.with_borrow_mut(|cache| {
+                    cache.key = Some(key);
+                    cache.last_upload = Some(Instant::now());
+                    cache.empty = atlas.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0);
+                });
+            }
+        }
+    }
+}
+
+pub(crate) fn prepare_ground(uiw: &UiWorld, sim: &Simulation, world_generation: u64) -> GroundPrep {
     let mode = current_overlay(*uiw.read::<OverlayMode>(), uiw);
-    renderer.set_water_overview(if mode == OverlayMode::WaterBodies {
-        super::water_bodies::prepare(&sim.map(), world_generation)
-    } else {
-        None
-    });
+    let mut prep = GroundPrep {
+        water: (mode == OverlayMode::WaterBodies)
+            .then(|| super::water_bodies::prepare(&sim.map(), world_generation))
+            .flatten(),
+        ..GroundPrep::default()
+    };
     let preview = (*uiw.read::<Tool>() == Tool::SpecialBuilding && !crate::session::modal(uiw))
         .then(|| uiw.read::<PlacementPreview>());
     let preview = preview.as_deref();
-    renderer.set_overlay_preview(gfx, preview.and_then(preview_disc));
+    prep.preview = preview.and_then(preview_disc);
     let placement_network = preview
         .filter(|_| mode.is_utility())
         .and_then(|preview| preview.ghost.map(|(_, road)| road))
@@ -100,7 +132,7 @@ pub(crate) fn prepare_ground(
         cache.placement_network = placement_network;
         let Some(scale) = mode.scale() else {
             if mode_changed {
-                renderer.set_ground_overlay(gfx, None, true);
+                prep.clear = true;
             }
             cache.mode = mode;
             cache.key = None;
@@ -132,14 +164,14 @@ pub(crate) fn prepare_ground(
             return;
         }
         if new_world {
-            renderer.set_ground_overlay(gfx, None, true);
+            prep.clear = true;
         }
 
         let bounds = map.environment().bounds();
         let mut atlas = Atlas::new(bounds.ll, bounds.ur - bounds.ll);
         cache.mode = mode;
         if atlas.len() == 0 {
-            renderer.set_ground_overlay(gfx, None, true);
+            prep.clear = true;
             cache.key = Some(key);
             cache.empty = true;
             return;
@@ -196,12 +228,9 @@ pub(crate) fn prepare_ground(
             | OverlayMode::WaterBodies => unreachable!(),
         }
         cache.revision = cache.revision.wrapping_add(1);
-        if renderer.set_ground_overlay(gfx, Some(atlas.image(cache.revision)), mode_changed) {
-            cache.key = Some(key);
-            cache.last_upload = Some(Instant::now());
-            cache.empty = atlas.rgba.chunks_exact(4).all(|pixel| pixel[3] == 0);
-        }
+        prep.upload = Some((atlas, key, cache.revision, mode_changed));
     });
+    prep
 }
 
 pub(super) fn preview_disc(preview: &PlacementPreview) -> Option<GroundOverlayDisc> {

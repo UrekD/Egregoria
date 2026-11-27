@@ -338,12 +338,30 @@ pub struct EngineTimes {
     pub total_cpu_time: f32,
 }
 
+pub struct PreparedGui {
+    egui: egui::FullOutput,
+    build_time: f32,
+}
+
+struct PreparedScene {
+    surface: wgpu::SurfaceTexture,
+    view: wgpu::TextureView,
+    encoders: crate::gfx::Encoders,
+    drawables: Vec<Box<dyn crate::Drawable>>,
+    defer_main: bool,
+}
+
+struct PreparedFrame {
+    scene: PreparedScene,
+    gui: PreparedGui,
+}
+
 /// Context is the main struct that contains all the context of the game.
 /// It holds the necessary state for graphics, input, audio, and the window.
 pub struct Context {
     // Drop acquired textures before the graphics context that owns the surface.
     next_surface: Option<wgpu::SurfaceTexture>,
-    prepared_frame: Option<(wgpu::SurfaceTexture, crate::gfx::Encoders)>,
+    prepared_frame: Option<PreparedFrame>,
     pub gfx: GfxContext,
     pub input: InputContext,
     pub audio: AudioContext,
@@ -414,7 +432,77 @@ impl Context {
         }
     }
 
-    /// Record scene and GUI rendering while the caller's view is borrowed.
+    /// Build the UI while the caller has access to its current data.
+    pub fn prepare_gui<S>(
+        &mut self,
+        state: &mut S,
+        render_gui: impl FnOnce(&mut S, &egui::Context, &GfxContext),
+        render_yakui: impl FnOnce(&mut S),
+    ) -> PreparedGui {
+        let start = Instant::now();
+        #[cfg(feature = "yakui")]
+        self.yakui.prepare(|| render_yakui(state));
+        let egui = self
+            .egui
+            .prepare(&self.gfx.window, |ui| render_gui(state, ui, &self.gfx));
+        PreparedGui {
+            egui,
+            build_time: start.elapsed().as_secs_f32(),
+        }
+    }
+
+    fn finish_gui(&mut self, gui: PreparedGui) -> PreparedGui {
+        #[cfg(feature = "yakui")]
+        {
+            let start = Instant::now();
+            self.yakui.finish();
+            PreparedGui {
+                build_time: gui.build_time + start.elapsed().as_secs_f32(),
+                ..gui
+            }
+        }
+        #[cfg(not(feature = "yakui"))]
+        gui
+    }
+
+    fn prepare_scene(
+        &mut self,
+        render: impl FnOnce(&mut FrameContext<'_>),
+    ) -> Option<PreparedScene> {
+        if !self.acquire_surface() {
+            return None;
+        }
+        let surface = self.next_surface.take().unwrap();
+        let start = self.gfx.profile_timer();
+        let (encoders, view) = self.gfx.start_frame(&surface);
+        self.gfx.profile_elapsed(CpuPhase::Encode, start);
+        self.gfx.perf.clear();
+        let mut drawables = Vec::new();
+        let mut frame = FrameContext::new(&mut self.gfx, &mut drawables);
+        render(&mut frame);
+        let defer_main = frame.defer_main;
+        Some(PreparedScene {
+            surface,
+            view,
+            encoders,
+            drawables,
+            defer_main,
+        })
+    }
+
+    /// Complete UI layout and prepare the draw list. The engine encodes,
+    /// submits and presents after State::frame returns.
+    pub fn present_prepared(
+        &mut self,
+        gui: PreparedGui,
+        render: impl FnOnce(&mut FrameContext<'_>),
+    ) {
+        let gui = self.finish_gui(gui);
+        if let Some(scene) = self.prepare_scene(render) {
+            self.prepared_frame = Some(PreparedFrame { scene, gui });
+        }
+    }
+
     pub fn present<S>(
         &mut self,
         state: &mut S,
@@ -422,46 +510,44 @@ impl Context {
         render_gui: impl FnOnce(&mut S, &egui::Context),
         render_yakui: impl FnOnce(&mut S),
     ) {
-        self.present_with_gfx(
-            state,
-            render,
-            |state, ui, _| render_gui(state, ui),
-            render_yakui,
-        );
-    }
-
-    pub fn present_with_gfx<S>(
-        &mut self,
-        state: &mut S,
-        render: impl FnOnce(&mut S, &mut FrameContext<'_>),
-        render_gui: impl FnOnce(&mut S, &egui::Context, &GfxContext),
-        render_yakui: impl FnOnce(&mut S),
-    ) {
-        if !self.acquire_surface() {
-            return;
+        if let Some(scene) = self.prepare_scene(|frame| render(state, frame)) {
+            let gui = self.prepare_gui(state, |state, ui, _| render_gui(state, ui), render_yakui);
+            let gui = self.finish_gui(gui);
+            self.prepared_frame = Some(PreparedFrame { scene, gui });
         }
-        let surface = self.next_surface.take().unwrap();
-        let start = self.gfx.profile_timer();
-        let (mut enc, view) = self.gfx.start_frame(&surface);
-        self.gfx.profile_elapsed(CpuPhase::Encode, start);
-        (self.times.render_time, self.times.gui_time) =
-            self.gfx
-                .render(&mut enc, view, state, render, |state, mut gui| {
-                    #[cfg(feature = "yakui")]
-                    self.yakui.render(&mut gui, || render_yakui(state));
-                    let gfx = gui.gfx;
-                    self.egui.render(gui, |ui| render_gui(state, ui, gfx));
-                });
-        self.prepared_frame = Some((surface, enc));
     }
 
     fn finish_present(&mut self, frame_start: Instant) {
-        let Some((surface, mut enc)) = self.prepared_frame.take() else {
+        let Some(PreparedFrame {
+            scene:
+                PreparedScene {
+                    surface,
+                    view,
+                    mut encoders,
+                    drawables,
+                    defer_main,
+                },
+            gui,
+        }) = self.prepared_frame.take()
+        else {
             return;
         };
-        // State::frame has returned and released any borrowed world view.
-        self.times.render_time += self.gfx.record_deferred_main(&mut enc);
-        self.gfx.finish_frame(enc);
+        let (render_time, paint_time) =
+            self.gfx
+                .encode_frame(&mut encoders, &view, &drawables, defer_main, |mut ctx| {
+                    #[cfg(feature = "yakui")]
+                    self.yakui.paint(&mut ctx);
+                    self.egui.paint(ctx, gui.egui);
+                });
+        if let Some(profile) = &mut self.gfx.frame_profile {
+            profile.record_cpu(
+                CpuPhase::Ui,
+                std::time::Duration::from_secs_f32(gui.build_time),
+            );
+        }
+        self.times.render_time = render_time + gui.build_time;
+        self.times.gui_time = paint_time + gui.build_time;
+        self.gfx.finish_frame(encoders);
         let screenshot = self
             .screenshot_request
             .take()

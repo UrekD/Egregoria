@@ -2,18 +2,27 @@ use std::collections::{BTreeMap, VecDeque};
 use std::ptr::addr_of;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::sync::{Arc, RwLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
+
+use common::timestep::MAX_WARP;
 
 use crate::rendering::immediate::{ImmediateDraw, ImmediateSound};
+use crate::rendering::world_snapshot::{
+    HudSnapshot, LatestViews, MapPrepInput, SelectionView, SnapshotSource, ViewRequest,
+    WorldUpdate, WorldView,
+};
 use common::history::History;
 use common::saveload::{self, SlotId};
 use engine::frame_profile::CpuPhase;
-use engine::{Context, FrameContext, InputContext, MeshBuilder, Tesselator};
+use engine::{
+    framework::PreparedGui, Context, FrameContext, InputContext, MeshBuilder, Tesselator,
+};
 use geom::{vec2, vec3, Camera, LinearColor, AABB};
 use simulation::economy::Government;
+use simulation::map::{RenderMap, SubscriberChunkID, UpdateType};
 use simulation::Simulation;
 
-use crate::audio::GameAudio;
+use crate::audio::{AudioInputs, GameAudio};
 use crate::automation::Automation;
 use crate::debug_gui::debug_window::DebugObjs;
 use crate::debug_gui::{render_oldgui, VehicleHover};
@@ -83,12 +92,38 @@ pub struct State {
 
     instanced_renderer: InstancedRender,
     map_renderer: Option<MapRenderer>,
+    local_snapshot: SnapshotSource,
+    last_live_ui: Option<Instant>,
+    pending_map: Option<MapPrepInput>,
+    staged_map: Option<StagedMap>,
+    views: LatestViews,
+    prepared: Option<PreparedFrame>,
+    report_frame_times: bool,
     immediate_renderer: MeshBuilder<true>,
     automation: Option<Automation>,
     startup: Option<Receiver<Result<StartupWorld, String>>>,
     dormant_script_state: Option<(u64, BTreeMap<String, u64>)>,
 
     all_audio: GameAudio,
+}
+
+struct StagedMap {
+    input: MapPrepInput,
+    remaining: BTreeMap<SubscriberChunkID, UpdateType>,
+    view: Arc<WorldView>,
+    replacement: Option<MapRenderer>,
+}
+
+struct PreparedFrame {
+    map: Arc<RenderMap>,
+    view: Arc<WorldView>,
+}
+
+struct CapturedFrame {
+    gui: Option<PreparedGui>,
+    ground: Option<gui::overlays::GroundPrep>,
+    audio: Option<AudioInputs>,
+    world_draw: bool,
 }
 
 #[derive(Default)]
@@ -268,9 +303,14 @@ impl engine::framework::State for State {
             uiw: uiworld,
             game_schedule,
             instanced_renderer: InstancedRender::new(&mut ctx.gfx),
-            map_renderer: startup
-                .is_none()
-                .then(|| MapRenderer::new(&mut ctx.gfx, &world.try_read().unwrap())),
+            map_renderer: None,
+            local_snapshot: SnapshotSource::default(),
+            last_live_ui: None,
+            pending_map: None,
+            staged_map: None,
+            views: LatestViews::default(),
+            prepared: None,
+            report_frame_times: std::env::var_os("EGREGORIA_FRAME_TIMINGS").is_some(),
             all_audio: GameAudio::new(&mut ctx.audio),
             sim: world,
             driver,
@@ -329,98 +369,133 @@ impl engine::framework::State for State {
             return;
         }
         manage_settings(ctx, &self.uiw.read::<Settings>());
-        let use_world = |state: &mut Self, ctx: &mut Context, sim: &Simulation| {
-            let scripted = state.automation.is_some();
-            if scripted && !state.step_automation(ctx, sim) {
-                return;
-            }
-            if let Some(profile) = &mut ctx.gfx.frame_profile {
-                let generation = state.uiw.read::<SessionState>().generation;
-                let sampled = if state.driver.is_some() {
-                    state.sampled_step.and_then(|(sample_generation, step, at)| {
-                        at.filter(|_| sample_generation == generation).map(|at| (at, step))
-                    })
-                } else {
-                    Some((Instant::now(), sim.get_tick()))
-                };
-                if let Some((at, step)) = sampled {
-                    profile.record_sim(at, generation, step, state.uiw.read::<Settings>().time_warp);
+        let driver_view = self.driver.as_ref().map(SimThread::view);
+        if let Some(view) = &driver_view {
+            view.set_redraw_waker(|| {
+                let window = Arc::downgrade(&ctx.gfx.window);
+                move || {
+                    if let Some(window) = window.upgrade() {
+                        window.request_redraw();
+                    }
                 }
+            });
+            if ctx.gfx.frame_profile.is_some() {
+                view.enable_wait_profile();
             }
-            let prep_start = ctx.gfx.profile_timer();
-            let view_input = state.prepare_input(ctx, scripted);
-            state.update_warp();
-            state.uiw.write::<SaveLoadState>().authoring_blocked = !state.can_collect_commands();
-            let commands_observed = state.update_world(ctx, sim, scripted, view_input, prep_start);
-            let yakui_width =
-                ctx.yakui.yakui.layout_dom().unscaled_viewport().size().x / ctx.yakui.zoom_factor;
-            state.uiw.write::<gui::inspect::VehicleRouteFrame>().clear();
-            ctx.present_with_gfx(
-                state,
-                |state, frame| state.render_world(frame, sim),
-                |state, ui, gfx| {
-                    state.render_world_gui(ui, sim);
-                    if state.automation.is_none() && gfx.frame_profile.is_some() {
-                        state.frame_profile_panel.draw(ui, gfx);
-                    }
-                },
-                |state| state.render_world_yakui(sim, yakui_width),
-            );
-            state.invalidate_placements();
-            if state.driver.is_some() {
-                state.seal_frame_commands();
-                state.update_warp();
-            }
-            if commands_observed {
-                *state.uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
-            }
-        };
-        let mut busy = true;
-        if let Some(view) = self.driver.as_ref().map(SimThread::view) {
-            if ctx.acquire_surface() {
-                view.set_redraw_waker(|| {
-                    let window = Arc::downgrade(&ctx.gfx.window);
-                    move || {
-                        if let Some(window) = window.upgrade() {
-                            window.request_redraw();
-                        }
-                    }
-                });
-                let lease_start = ctx.gfx.profile_timer();
-                let sim = view.try_read();
-                ctx.gfx.profile_elapsed(CpuPhase::SimLease, lease_start);
-                if let Some(sim) = sim {
-                    if view.take_replaced() {
-                        ctx.gfx.lamplights.reset(&ctx.gfx.device, &ctx.gfx.queue);
-                        self.map_renderer = Some(MapRenderer::new(&mut ctx.gfx, &sim));
-                        sim.map().dispatch_all();
-                    }
-                    use_world(self, ctx, &sim);
-                    busy = false;
-                }
-            }
-        } else if ctx.acquire_surface() {
-            let world = self.sim.clone();
-            let lease_start = ctx.gfx.profile_timer();
-            let sim = world.try_read();
-            ctx.gfx.profile_elapsed(CpuPhase::SimLease, lease_start);
-            if let Ok(sim) = sim {
-                use_world(self, ctx, &sim);
-                busy = false;
-            };
         }
-        if busy {
-            let scripted = self.automation.is_some();
-            if !scripted && self.prepare_input(ctx, false) {
+
+        let surface_ready = ctx.acquire_surface();
+        let scripted = self.automation.is_some();
+        let view_input = !scripted && self.prepare_input(ctx, false);
+        self.update_warp();
+        let at_max = driver_view.is_some() && self.sent_warp == MAX_WARP;
+        let mut frame_only = false;
+        let mut reserve_read = true;
+        if surface_ready && at_max {
+            if let Some(automation) = &mut self.automation {
+                frame_only = automation
+                    .advance_frame_wait(ctx, &self.uiw)
+                    .unwrap_or_else(|error| crate::automation::fail(&error));
+            } else if !self.needs_live_world_at_max(ctx) {
+                // Audio and hover still get a periodic live sample. A missed
+                // opportunistic sample leaves ordinary MAX redraws independent.
+                let age = self.last_live_ui.map(|at| at.elapsed());
+                frame_only = age.is_some_and(|age| age < Duration::from_millis(250));
+                reserve_read = age.is_none_or(|age| age >= Duration::from_secs(1));
+            }
+        }
+        if let Some(view) = &driver_view {
+            let request = (surface_ready && at_max && (frame_only || !reserve_read))
+                .then(|| self.view_request());
+            if let Some(update) = view.poll_render(request) {
+                self.accept_render_update(update);
+            }
+        }
+        let prep_start = ctx.gfx.profile_timer();
+        let mut acquired = false;
+        let mut captured = None;
+        if surface_ready && !frame_only {
+            let lease_start = ctx.gfx.profile_timer();
+            if let Some(view) = &driver_view {
+                let lease = view.try_read_for_frame(reserve_read);
+                ctx.gfx.profile_elapsed(CpuPhase::SimLease, lease_start);
+                if let Some(sim) = lease {
+                    let hold = ctx.gfx.profile_timer();
+                    acquired = true;
+                    if !scripted {
+                        self.last_live_ui = Some(Instant::now());
+                    }
+                    captured = self.capture_frame(ctx, &sim, Some(view), view_input);
+                    drop(sim);
+                    if let (Some(profile), Some(hold)) = (&mut ctx.gfx.frame_profile, hold) {
+                        profile.record_sim_read_lease(hold.elapsed());
+                    }
+                }
+            } else {
+                let world = self.sim.clone();
+                if let Ok(sim) = world.try_read() {
+                    ctx.gfx.profile_elapsed(CpuPhase::SimLease, lease_start);
+                    acquired = true;
+                    self.sampled_step = Some((
+                        self.uiw.read::<SessionState>().generation,
+                        sim.get_tick(),
+                        ctx.gfx.profile_timer(),
+                    ));
+                    captured = self.capture_frame(ctx, &sim, None, view_input);
+                };
+            }
+        }
+        if driver_view.is_some() && !acquired {
+            if let Some(profile) = &mut ctx.gfx.frame_profile {
+                profile.record_sim_read_lease(Duration::ZERO);
+            }
+        }
+        ctx.gfx.profile_elapsed(CpuPhase::WorldPrep, prep_start);
+
+        if let Some(profile) = &mut ctx.gfx.frame_profile {
+            let generation = self.uiw.read::<SessionState>().generation;
+            if let Some((_, step, Some(at))) = self.sampled_step.filter(|s| s.0 == generation) {
+                profile.record_sim(at, generation, step, self.uiw.read::<Settings>().time_warp);
+                if let Some(view) = &driver_view {
+                    profile.record_sim_waits(view.wait_totals());
+                }
+            }
+        }
+
+        if !acquired {
+            self.uiw.write::<SaveLoadState>().authoring_blocked = true;
+            if view_input {
                 if session::world_interaction(&self.uiw) {
                     let sample = self.sample_world_input(ctx);
                     self.defer_world_input(sample);
                 }
                 self.manage_io(ctx, None);
             }
-            self.update_warp();
             self.uiw.camera_mut().update(ctx);
-            self.manage_gfx_params(ctx);
+            if frame_only && scripted {
+                *self.uiw.write::<Camera>() = self.uiw.read::<OrbitCamera>().camera;
+            }
+        }
+        if surface_ready {
+            let map_start = ctx.gfx.profile_timer();
+            self.prepare_map(ctx);
+            ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);
+            if let Some(frame) = captured {
+                self.present_captured(ctx, frame);
+            } else if frame_only
+                || !reserve_read
+                || (!at_max && !acquired && !scripted && self.prepared.is_some())
+            {
+                self.present_captured(
+                    ctx,
+                    CapturedFrame {
+                        gui: None,
+                        ground: None,
+                        audio: None,
+                        world_draw: false,
+                    },
+                );
+            }
         }
     }
 
@@ -437,6 +512,334 @@ impl engine::framework::State for State {
 }
 
 impl State {
+    fn view_request(&self) -> ViewRequest {
+        ViewRequest {
+            camera: (session::playing(&self.uiw) && !self.uiw.read::<GuiState>().hidden)
+                .then(|| self.uiw.camera().camera),
+        }
+    }
+
+    fn needs_live_world_at_max(&self, ctx: &Context) -> bool {
+        let pointer = ctx.input.pointer_frame(ctx.egui.last_mouse_captured);
+        !self.deferred_input.is_empty()
+            || pointer.interrupted
+            || pointer.held_buttons.contains(&engine::MouseButton::Left)
+            || pointer
+                .released_buttons
+                .contains(&engine::MouseButton::Left)
+            || !self.uiw.read::<InputMap>().just_act.is_empty()
+            || land_tiles::shortcut_pending(&self.uiw)
+            || self.uiw.read::<FollowEntity>().0.is_some()
+            || self.uiw.read::<VehicleHover>().has_hit()
+            || *self.uiw.read::<gui::overlays::OverlayMode>() != gui::overlays::OverlayMode::Off
+            || self.uiw.read::<DebugObjs>().has_unselected_overlay()
+            || gui::needs_live_world(&self.uiw)
+    }
+
+    fn accept_render_update(&mut self, update: WorldUpdate) {
+        if let Some(input) = update.map {
+            if let Some(pending) = &mut self.pending_map {
+                pending.merge(input);
+            } else {
+                self.pending_map = Some(input);
+            }
+        }
+        self.views.publish(update.view);
+    }
+
+    fn capture_frame(
+        &mut self,
+        ctx: &mut Context,
+        sim: &Simulation,
+        driver_view: Option<&sim_thread::WorldView>,
+        mut view_input: bool,
+    ) -> Option<CapturedFrame> {
+        let generation = self.uiw.read::<SessionState>().generation;
+        let replaced = driver_view.is_some_and(sim_thread::WorldView::take_replaced);
+        if replaced {
+            crate::inputmap::reset_deck_picker_cache();
+            gui::overlays::reset_world_cache();
+            gui::selectable::VehiclePicker::reset(&self.uiw, generation);
+            self.all_audio.reset_world();
+        }
+        let epoch = if let Some(view) = driver_view {
+            view.capture_map(sim, generation)
+        } else {
+            self.local_snapshot.capture_map(sim, generation, false)
+        };
+        let world_draw = self.prepared.as_ref().is_some_and(|frame| {
+            frame.view.stamp.generation == generation && frame.view.stamp.map_epoch == epoch
+        });
+        let scripted = self.automation.is_some();
+        if scripted {
+            if !self.step_automation(ctx, sim, world_draw) {
+                return None;
+            }
+            view_input = self.prepare_input(ctx, true);
+        }
+        self.update_warp();
+        let can_author = world_draw && self.can_collect_commands();
+        self.uiw.write::<SaveLoadState>().authoring_blocked = !can_author;
+        self.uiw.write::<gui::inspect::VehicleRouteFrame>().clear();
+        let commands_observed = self.update_world(ctx, sim, scripted, view_input, world_draw);
+
+        let paused = self.uiw.read::<Settings>().time_warp == 0
+            || session::modal(&self.uiw)
+            || self.uiw.read::<SaveLoadState>().is_replaying();
+        let boundary = Boundary {
+            generation,
+            completed_step: driver_view
+                .map_or_else(|| sim.get_tick(), |view| view.completed_step()),
+            last_batch: self.applied_batch,
+            tick: sim.get_tick(),
+        };
+        let request = self.view_request();
+        let update = if let Some(view) = driver_view {
+            view.capture_render(sim, boundary, request, paused, scripted)
+        } else {
+            self.local_snapshot
+                .capture_view(sim, boundary, request, paused, true);
+            self.local_snapshot.take()
+        };
+        if let Some(update) = update {
+            self.accept_render_update(update);
+        }
+
+        self.immediate_renderer.clear();
+        let ground = world_draw.then(|| {
+            let ground = gui::overlays::prepare_ground(&self.uiw, sim, generation);
+            if !self.uiw.read::<SessionState>().interaction_blocked {
+                gui::overlays::draw(sim, &self.uiw);
+                gui::inspect::draw_vehicle_route(sim, &self.uiw);
+            }
+            let mut tess = self.immediate_renderer.mk_tess();
+            self.uiw.camera().cull_tess(&mut tess);
+            Self::prepare_debug_draw(&self.uiw, sim, &mut tess);
+            ground
+        });
+        let audio = (self.startup.is_none()
+            && !self.uiw.read::<SessionState>().interaction_blocked)
+            .then(|| self.all_audio.capture(sim, &self.uiw));
+        gui::observe_hud(&self.uiw, sim);
+        let hover = self.update_vehicle_hover(sim);
+        let gui = (hover || self.driver.is_none() || gui::needs_world_widgets(&self.uiw, sim))
+            .then(|| {
+                let view = self.views.latest().unwrap().clone();
+                let width = Self::yakui_width(ctx);
+                ctx.prepare_gui(
+                    self,
+                    |state, ui, gfx| {
+                        state.render_world_gui(ui, sim);
+                        state.draw_profile_panel(ui, gfx);
+                    },
+                    |state| state.render_world_yakui(Some(sim), Some(&view.hud), world_draw, width),
+                )
+            });
+        if commands_observed {
+            *self.uiw.write::<ReceivedCommands>() = ReceivedCommands::default();
+        }
+        Some(CapturedFrame {
+            gui,
+            ground,
+            audio,
+            world_draw,
+        })
+    }
+
+    fn update_vehicle_hover(&self, sim: &Simulation) -> bool {
+        let input = self.uiw.read::<InputMap>();
+        let mut hover = self.uiw.write::<VehicleHover>();
+        if matches!(*self.uiw.read::<Tool>(), Tool::Hand | Tool::RoadEditor)
+            && session::world_interaction(&self.uiw)
+            && !self.uiw.read::<GuiState>().hidden
+            && self.uiw.can_author()
+            && !goryak::pointer_over_ui(input.screen.x, input.screen.y)
+        {
+            let mut picker = self.uiw.write::<gui::selectable::VehiclePicker>();
+            hover.update(&mut picker, sim, &input, Instant::now(), |picker| {
+                if let Some(picker) = picker {
+                    if !picker.start_snapshot(sim) {
+                        return;
+                    }
+                    for (id, vehicle) in &sim.world().vehicles {
+                        picker.index_road(id, vehicle);
+                    }
+                    for (id, wagon) in &sim.world().wagons {
+                        picker.index_wagon(id, wagon);
+                    }
+                }
+            });
+            hover.has_hit()
+        } else {
+            *hover = VehicleHover::default();
+            false
+        }
+    }
+
+    fn yakui_width(ctx: &Context) -> f32 {
+        ctx.yakui.yakui.layout_dom().unscaled_viewport().size().x / ctx.yakui.zoom_factor
+    }
+
+    fn draw_profile_panel(&mut self, ui: &egui::Context, gfx: &engine::GfxContext) {
+        if self.automation.is_none() && gfx.frame_profile.is_some() {
+            self.frame_profile_panel.draw(ui, gfx);
+        }
+    }
+
+    fn reset_render_source(&mut self) {
+        self.local_snapshot = SnapshotSource::default();
+        self.pending_map = None;
+        self.staged_map = None;
+        self.views.clear();
+        self.prepared = None;
+        self.map_renderer = None;
+        self.last_live_ui = None;
+        self.sampled_step = None;
+    }
+
+    fn prepare_map(&mut self, ctx: &mut Context) {
+        if self.staged_map.is_none() {
+            let ready = self
+                .pending_map
+                .as_ref()
+                .zip(self.views.latest())
+                .is_some_and(|(input, view)| {
+                    input.generation == view.stamp.generation
+                        && input.target_epoch == view.stamp.map_epoch
+                });
+            if ready {
+                let input = self.pending_map.take().unwrap();
+                let view = self.views.latest().unwrap().clone();
+                let terrain_buckets = input
+                    .affected_chunks
+                    .values()
+                    .filter(|kind| kind.contains(UpdateType::Terrain))
+                    .count();
+                let full_refresh = input.full_refresh
+                    || terrain_buckets > 8
+                    || self.prepared.as_ref().is_none_or(|frame| {
+                        frame.view.stamp.generation != input.generation
+                            || frame.view.stamp.map_epoch != input.base_epoch
+                    });
+                let mut input = input;
+                input.full_refresh = full_refresh;
+                if full_refresh {
+                    input.affected_chunks = input
+                        .source
+                        .environment()
+                        .chunks()
+                        .map(|(chunk, _)| (chunk.convert_up(), UpdateType::all()))
+                        .collect();
+                    for &object in input.source.spatial_map().objects() {
+                        let chunk =
+                            SubscriberChunkID::new(object.canonical_position(&input.source));
+                        input.affected_chunks.insert(chunk, UpdateType::all());
+                    }
+                }
+                self.staged_map = Some(StagedMap {
+                    remaining: input.affected_chunks.clone(),
+                    replacement: full_refresh
+                        .then(|| MapRenderer::new(&mut ctx.gfx, &input.source)),
+                    input,
+                    view,
+                });
+            }
+        }
+        if let Some(staged) = &mut self.staged_map {
+            let renderer = staged
+                .replacement
+                .as_mut()
+                .or(self.map_renderer.as_mut())
+                .unwrap();
+            renderer.stage(
+                &staged.input.source,
+                &mut staged.remaining,
+                &mut ctx.gfx,
+                staged.input.full_refresh,
+            );
+            if staged.remaining.is_empty() {
+                let staged = self.staged_map.take().unwrap();
+                if let Some(replacement) = staged.replacement {
+                    self.map_renderer = Some(replacement);
+                }
+                let renderer = self.map_renderer.as_mut().unwrap();
+                if gui::overlays::invalidate_ground_epoch() {
+                    renderer.set_ground_overlay(&mut ctx.gfx, None, true);
+                }
+                renderer.set_water_overview(None);
+                renderer.promote(
+                    &staged.input.source,
+                    &staged.input.affected_chunks,
+                    ctx,
+                    staged.input.full_refresh,
+                );
+                if self.report_frame_times {
+                    eprintln!(
+                        "map_ms {} {} {:.3}",
+                        staged.input.generation,
+                        staged.input.target_epoch,
+                        staged.input.captured_at.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                self.prepared = Some(PreparedFrame {
+                    map: staged.input.source,
+                    view: staged.view,
+                });
+            }
+        }
+        if let Some((frame, view)) = self.prepared.as_mut().zip(self.views.latest()) {
+            if frame.view.stamp.generation == view.stamp.generation
+                && frame.view.stamp.map_epoch == view.stamp.map_epoch
+            {
+                frame.view = view.clone();
+            }
+        }
+    }
+
+    fn present_captured(&mut self, ctx: &mut Context, frame: CapturedFrame) {
+        let renderers = self.prepared.as_ref().zip(self.map_renderer.as_mut());
+        if let Some((prepared, renderer)) = renderers {
+            renderer.set_overlay_preview(&mut ctx.gfx, None);
+            if let Some(ground) = frame.ground {
+                ground.apply(renderer, &mut ctx.gfx);
+            }
+            ctx.gfx.set_time(prepared.view.hud.time.timestamp as f32);
+            if self.startup.is_none() && !self.uiw.read::<SessionState>().interaction_blocked {
+                self.all_audio
+                    .update(frame.audio, &prepared.map, &self.uiw, &mut ctx.audio);
+            }
+        }
+        for (sound, kind) in self.uiw.write::<ImmediateSound>().orders.drain(..) {
+            ctx.audio.play(sound, kind);
+        }
+        if !frame.world_draw {
+            self.uiw.write::<ImmediateDraw>().orders.clear();
+            self.immediate_renderer.clear();
+            MapRenderer::discard_zoning_preview();
+        }
+        self.manage_gfx_params(ctx);
+        let gui = frame.gui.unwrap_or_else(|| {
+            let view = self.prepared.as_ref().map(|frame| frame.view.clone());
+            let current = view
+                .as_deref()
+                .filter(|view| view.stamp.generation == self.uiw.read::<SessionState>().generation);
+            let hud = current.map(|view| &view.hud);
+            let badges_interactive = current
+                .zip(self.views.latest())
+                .is_some_and(|(drawn, latest)| drawn.stamp.map_epoch == latest.stamp.map_epoch);
+            let width = Self::yakui_width(ctx);
+            ctx.prepare_gui(self, Self::draw_profile_panel, |state| {
+                state.render_world_yakui(None, hud, badges_interactive, width)
+            })
+        });
+        self.invalidate_placements();
+        if self.driver.is_some() {
+            self.seal_frame_commands();
+            self.update_warp();
+        }
+        ctx.present_prepared(gui, |ctx| self.draw_prepared(ctx, frame.world_draw));
+    }
+
     fn prepare_input(&mut self, ctx: &mut Context, scripted: bool) -> bool {
         self.uiw
             .write::<InputMap>()
@@ -496,7 +899,7 @@ impl State {
         sim: &Simulation,
         scripted: bool,
         view_input: bool,
-        mut prep_start: Option<Instant>,
+        world_draw: bool,
     ) -> bool {
         profiling::scope!("game_loop::update_world");
         let mut commands_observed = false;
@@ -508,7 +911,7 @@ impl State {
         }
         self.camera_bounds = sim.map().environment().bounds();
         let interaction = view_input && session::world_interaction(&self.uiw);
-        if interaction && land_tiles::shortcut(&self.uiw, sim) {
+        if interaction && world_draw && land_tiles::shortcut(&self.uiw, sim) {
             self.deferred_input.clear();
             self.bulldozer_view = None;
         }
@@ -546,20 +949,6 @@ impl State {
         if !scripted && view_input {
             self.manage_io(ctx, Some(sim));
         }
-        if let Some(renderer) = &mut self.map_renderer {
-            ctx.gfx.profile_elapsed(CpuPhase::WorldPrep, prep_start);
-            let map_start = ctx.gfx.profile_timer();
-            renderer.update(sim, ctx);
-            ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);
-            prep_start = ctx.gfx.profile_timer();
-        }
-        ctx.gfx.set_time(sim.read::<GameTime>().timestamp as f32);
-        for (sound, kind) in self.uiw.write::<ImmediateSound>().orders.drain(..) {
-            ctx.audio.play(sound, kind);
-        }
-        if self.startup.is_none() && !self.uiw.read::<SessionState>().interaction_blocked {
-            self.all_audio.update(sim, &self.uiw, &mut ctx.audio);
-        }
         if !scripted && interaction {
             FollowEntity::update_camera(&self.uiw, sim);
         }
@@ -567,8 +956,6 @@ impl State {
         if scripted {
             *self.uiw.write::<Camera>() = self.uiw.read::<OrbitCamera>().camera;
         }
-        self.manage_gfx_params(ctx);
-        ctx.gfx.profile_elapsed(CpuPhase::WorldPrep, prep_start);
         commands_observed
     }
 
@@ -679,26 +1066,26 @@ impl State {
         gui::run_ui_systems(sim, &self.uiw);
     }
 
-    fn render_world(&mut self, ctx: &mut FrameContext<'_>, sim: &Simulation) {
+    fn draw_prepared(&mut self, ctx: &mut FrameContext<'_>, world_draw: bool) {
         profiling::scope!("game_loop::render");
-        let Some(map_renderer) = &mut self.map_renderer else {
+        let Some((map_renderer, prepared)) = self.map_renderer.as_mut().zip(self.prepared.as_ref())
+        else {
             return;
         };
         let start = Instant::now();
         let camera = self.uiw.camera().camera;
-        let time = render_time(&sim);
+        let view = &prepared.view;
 
-        if self.automation.is_some() {
-            // Scripted map changes are applied through ticks, so the tick identifies the snapshot.
-            map_renderer.meshb.set_map_version(sim.get_tick());
-            self.rendered_batch = self.applied_batch;
+        if self.automation.is_some()
+            && view.stamp.generation == self.uiw.read::<SessionState>().generation
+        {
+            map_renderer.meshb.set_map_version(view.hud.time.tick.0);
+            self.rendered_batch = view.applied_batch;
         }
-        let generation = self.uiw.read::<SessionState>().generation;
-        gui::overlays::prepare_ground(&self.uiw, &sim, map_renderer, &mut ctx.gfx, generation);
         let tool = *self.uiw.read::<Tool>();
         map_renderer.render(
-            &sim.map(),
-            time.seconds,
+            &prepared.map,
+            view.hud.time.seconds,
             &camera,
             MapRenderOptions {
                 show_arrows: tool.show_arrows(),
@@ -710,43 +1097,24 @@ impl State {
 
         map_renderer
             .meshb
-            .draw_transit_stops(&sim.read::<simulation::map_dynamic::Transit>(), ctx);
+            .draw_transit_stops(&view.transit_stops, view.transit_revision, ctx);
 
         let instances_start = ctx.gfx.profile_timer();
-        {
-            let input = self.uiw.read::<InputMap>();
-            let mut hover = self.uiw.write::<VehicleHover>();
-            if matches!(tool, Tool::Hand | Tool::RoadEditor)
-                && session::world_interaction(&self.uiw)
-                && !self.uiw.read::<GuiState>().hidden
-                && self.uiw.can_author()
-                && !goryak::pointer_over_ui(input.screen.x, input.screen.y)
-            {
-                let mut picker = self.uiw.write::<gui::selectable::VehiclePicker>();
-                hover.update(&mut picker, sim, &input, Instant::now(), |picker| {
-                    self.instanced_renderer.render(sim, ctx, picker);
-                });
-            } else {
-                *hover = VehicleHover::default();
-                self.instanced_renderer.render(sim, ctx, None);
-            }
-        }
-        ctx.gfx.profile_elapsed(CpuPhase::Instances, instances_start);
-        if !self.uiw.read::<SessionState>().interaction_blocked {
-            gui::overlays::draw(&sim, &self.uiw);
-            gui::inspect::draw_vehicle_route(&sim, &self.uiw);
-        }
-
+        let selection = SelectionView {
+            selected: self.uiw.read::<gui::InspectedEntity>().e,
+            followed: self.uiw.read::<FollowEntity>().0,
+        };
+        self.instanced_renderer
+            .render(view, self.views.previous_for(view), selection, ctx);
+        ctx.gfx
+            .profile_elapsed(CpuPhase::Instances, instances_start);
         {
             profiling::scope!("immediate_draw");
-            self.immediate_renderer.clear();
             let mut tess = self.immediate_renderer.mk_tess();
             self.uiw.camera().cull_tess(&mut tess);
-            Self::prepare_debug_draw(&self.uiw, &sim, &mut tess);
-
             {
                 let mut immediate = self.uiw.write::<ImmediateDraw>();
-                immediate.apply(&mut tess, ctx);
+                immediate.apply(&mut tess, ctx, world_draw);
                 immediate.orders.clear();
             }
             if let Some(mut mesh) = self.immediate_renderer.build(ctx.gfx) {
@@ -771,14 +1139,20 @@ impl State {
         }
     }
 
-    fn render_world_yakui(&mut self, sim: &Simulation, yakui_width: f32) {
+    fn render_world_yakui(
+        &mut self,
+        sim: Option<&Simulation>,
+        hud: Option<&HudSnapshot>,
+        badges_interactive: bool,
+        yakui_width: f32,
+    ) {
         if !self.uiw.read::<SessionState>().interaction_blocked {
             if !session::playing(&self.uiw) {
                 session::render_session(&self.uiw, sim);
             } else if session::modal(&self.uiw) {
                 session::render_modal(&self.uiw, sim);
-            } else {
-                render_newgui(&self.uiw, sim, yakui_width);
+            } else if let Some(hud) = hud {
+                render_newgui(&self.uiw, sim, hud, badges_interactive, yakui_width);
             }
             yakui::widgets::List::row().show(|| session::render_status(&self.uiw));
         }
@@ -871,7 +1245,7 @@ impl State {
         true
     }
 
-    fn step_automation(&mut self, ctx: &mut Context, sim: &Simulation) -> bool {
+    fn step_automation(&mut self, ctx: &mut Context, sim: &Simulation, map_ready: bool) -> bool {
         if self.startup.is_some()
             || self.install.is_some()
             || session::world_job_active(&self.uiw)
@@ -896,7 +1270,8 @@ impl State {
             driver,
             self.map_renderer
                 .as_ref()
-                .and_then(|renderer| renderer.meshb.rebuilt_version()),
+                .and_then(|renderer| renderer.meshb.rebuilt_version())
+                .filter(|_| map_ready),
             self.rendered_batch,
         ) {
             Ok(true) => {}
@@ -1533,6 +1908,7 @@ impl State {
             {
                 Some(Ok((driver, boundary))) => {
                     self.driver = Some(driver);
+                    self.reset_render_source();
                     self.fence = Fence::Paused(boundary);
                     self.sent_warp = 0;
                     self.release_sent = false;
@@ -1626,11 +2002,11 @@ impl State {
             self.frame_profile_panel = Default::default();
         }
         let sim = session::install_world(&self.uiw, replacement, generation);
-        self.all_audio.reset_world();
-        self.immediate_renderer.clear();
-        ctx.gfx.lamplights.reset(&ctx.gfx.device, &ctx.gfx.queue);
-        self.map_renderer = Some(MapRenderer::new(&mut ctx.gfx, &sim));
         sim.map().dispatch_all();
+        self.all_audio.reset_world();
+        self.reset_render_source();
+        self.immediate_renderer.clear();
+        crate::inputmap::reset_deck_picker_cache();
         ctx.gfx.update_simplelit_bg();
         let schedule = Simulation::schedule();
         self.sim = Arc::new(RwLock::new(sim));
@@ -1981,7 +2357,10 @@ impl State {
             &self.uiw.read::<InputMap>(),
             &self.uiw.read::<Settings>(),
             self.camera_bounds,
-            |p| map.as_ref().and_then(|map| map.environment().height(p)),
+            |p| match &map {
+                Some(map) => map.environment().height(p),
+                None => self.prepared.as_ref()?.map.environment().height(p),
+            },
         );
         *self.uiw.write::<Camera>() = self.uiw.read::<OrbitCamera>().camera;
     }
@@ -2185,10 +2564,6 @@ fn encode_and_publish_slot(
         .map_err(|error| error.to_string())
 }
 
-fn render_time(sim: &Simulation) -> GameTime {
-    *sim.read::<GameTime>()
-}
-
 fn take_world_job_result(
     uiw: &UiWorld,
     pointer: &engine::PointerFrame,
@@ -2263,7 +2638,7 @@ fn scale_t0_render_read_with_writer_pending() {
             let guard = sim.read().unwrap();
             guard_held.send(()).unwrap();
             prepare_frame.recv().unwrap();
-            let time = render_time(&guard);
+            let time = *guard.read::<GameTime>();
             drop(guard);
             frame_prepared.send(time.tick.0).unwrap();
         }

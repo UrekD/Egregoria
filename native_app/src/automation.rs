@@ -579,14 +579,11 @@ impl Automation {
         result.map_err(|e| format!("script step {}: {e}", self.step_number))
     }
 
-    fn advance(
+    /// Progress a presented-frame barrier without taking a simulation lease.
+    pub(crate) fn advance_frame_wait(
         &mut self,
         ctx: &mut Context,
         uiw: &UiWorld,
-        sim: &Simulation,
-        driver: &mut SimThread,
-        rebuilt_version: Option<u64>,
-        rendered_batch: Option<BatchId>,
     ) -> Result<bool, String> {
         if let Some(capture) = &self.profile_capture {
             let next_frame = ctx.gfx.tick + 1;
@@ -615,6 +612,22 @@ impl Automation {
             return Ok(true);
         }
 
+        Ok(matches!(self.wait, Some(Wait::Frames { start, count }) if ctx.gfx.tick - start < count))
+    }
+
+    fn advance(
+        &mut self,
+        ctx: &mut Context,
+        uiw: &UiWorld,
+        sim: &Simulation,
+        driver: &mut SimThread,
+        rebuilt_version: Option<u64>,
+        rendered_batch: Option<BatchId>,
+    ) -> Result<bool, String> {
+        if self.advance_frame_wait(ctx, uiw)? {
+            return Ok(true);
+        }
+
         match self.wait {
             Some(Wait::Applied(id))
                 if !rendered_batch.is_some_and(|rendered| rendered.covers(id)) =>
@@ -638,9 +651,6 @@ impl Automation {
                     start: ctx.gfx.tick,
                     count: settle_frames,
                 });
-                return Ok(true);
-            }
-            Some(Wait::Frames { start, count }) if ctx.gfx.tick - start < count => {
                 return Ok(true);
             }
             // The game loop resumes automation after the session's world job finishes.
@@ -668,6 +678,9 @@ impl Automation {
                     return Err("Repaired slot was not saved".into());
                 }
             }
+            // A loaded slot can reuse the previous slot's tick while its map
+            // is still staging. The game loop only reports a compatible view.
+            Some(Wait::LoadSlot) if rebuilt_version.is_none() => return Ok(true),
             Some(Wait::Simulation(_)) => return Ok(true),
             Some(Wait::Screenshot) => match ctx.take_screenshot_result() {
                 Some(result) => result?,
@@ -728,6 +741,17 @@ impl Automation {
                 }
                 FixtureOutcome::EmptyTreasury => {}
             }
+        }
+
+        if session::playing(uiw)
+            && rebuilt_version.is_none()
+            && (!self.pointer_events.is_empty()
+                || matches!(
+                    self.steps.front(),
+                    Some(Step::Pointer { .. } | Step::Screenshot(_))
+                ))
+        {
+            return Ok(true);
         }
 
         // Each event gets its own update and layout pass before the next event.

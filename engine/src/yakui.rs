@@ -70,18 +70,21 @@ impl YakuiWrapper {
         )
     }
 
-    pub fn render(&mut self, gfx: &mut GuiRenderContext<'_>, ui_render: impl for<'ui> FnOnce()) {
-        self.renderer
-            .update_texture(self.blur_bg_texture, gfx.gfx.fbos.ui_blur.mip_view(0));
-
+    pub(crate) fn prepare(&mut self, ui_render: impl FnOnce()) {
         self.yakui.set_scale_factor(self.zoom_factor);
 
         self.yakui.start();
         ui_render();
-        {
-            profiling::scope!("yakui::finish");
-            self.yakui.finish();
-        }
+    }
+
+    pub(crate) fn finish(&mut self) {
+        profiling::scope!("yakui::finish");
+        self.yakui.finish();
+    }
+
+    pub(crate) fn paint(&mut self, gfx: &mut GuiRenderContext<'_>) {
+        self.renderer
+            .update_texture(self.blur_bg_texture, gfx.gfx.fbos.ui_blur.mip_view(0));
 
         let surface_info = if gfx.gfx.samples > 1 {
             yakui_wgpu::SurfaceInfo {

@@ -35,10 +35,22 @@ pub struct DebugObjs(
     )>,
 );
 
+const PATHFINDER_OVERLAY: &str = "Debug pathfinder";
+
+impl DebugObjs {
+    pub(crate) fn has_unselected_overlay(&self) -> bool {
+        // The pathfinder overlay is enabled by default and runs only with a
+        // selected entity. Selection already requests a live view.
+        self.0
+            .iter()
+            .any(|(enabled, name, _)| *enabled && *name != PATHFINDER_OVERLAY)
+    }
+}
+
 impl Default for DebugObjs {
     fn default() -> Self {
         DebugObjs(vec![
-            (true, "Debug pathfinder", debug_pathfinder),
+            (true, PATHFINDER_OVERLAY, debug_pathfinder),
             (false, "Debug train reservations", debug_trainreservations),
             (false, "Debug connectivity", debug_connectivity),
             (false, "Debug electricity", debug_electricity),
@@ -692,4 +704,12 @@ pub fn debug_spatialmap(tess: &mut Tesselator, sim: &Simulation, _: &UiWorld) ->
     }
 
     Some(())
+}
+
+#[test]
+fn client_max_default_debug_overlays_allow_owned_rendering() {
+    let mut overlays = DebugObjs::default();
+    assert!(!overlays.has_unselected_overlay());
+    overlays.0[1].0 = true;
+    assert!(overlays.has_unselected_overlay());
 }

@@ -43,6 +43,10 @@ impl ToastState {
         self.advisor_request = Some(focus);
     }
 
+    pub(super) fn advisor_requested(&self) -> bool {
+        self.advisor_request.is_some()
+    }
+
     /// Moves a pending request into the focus. Returns whether the advisor should open.
     pub(super) fn take_advisor_request(&mut self) -> bool {
         let Some(focus) = self.advisor_request.take() else {
@@ -137,10 +141,15 @@ pub(super) fn publish(uiworld: &UiWorld) {
     }
 }
 
-pub(super) fn render(_sim: &Simulation, uiworld: &UiWorld) {
+pub(super) fn render(uiworld: &UiWorld) {
     publish(uiworld);
     let state = uiworld.read::<ToastState>();
-    let notices = &state.notices;
+    let now = Instant::now();
+    let notices: Vec<_> = state
+        .notices
+        .iter()
+        .filter(|(_, shown)| now.duration_since(*shown) < LIFETIME)
+        .collect();
     if notices.is_empty() {
         return;
     }

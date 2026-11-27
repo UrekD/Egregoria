@@ -1,7 +1,10 @@
-use geom::{vec2, Intersect, Vec2, AABB};
+use std::cell::RefCell;
+
+use geom::{vec2, Camera, Intersect, Vec2, Vec3, AABB};
 use goryak::{minrow, padxy, pass_pointer, round_rect, secondary_container};
+use itertools::Either;
 use ordered_float::OrderedFloat;
-use simulation::map::{BuildingID, ProjectFilter};
+use simulation::map::{BuildingID, Map, ProjectFilter};
 use simulation::map_dynamic::{ElectricityFlow, SiteUtilityReader, UtilityStatus};
 use simulation::souls::events::Fires;
 use simulation::Simulation;
@@ -100,51 +103,117 @@ struct PlacedBadge {
     count: usize,
 }
 
-pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
+const MAX_PROBLEM_MARKERS: usize = 4096;
+
+pub(crate) struct ProblemMarker {
+    pos: Vec3,
+    kind: BadgeKind,
+    building: BuildingID,
+}
+
+const MAX_PROBLEM_CANDIDATES: usize = 16_384;
+
+#[derive(PartialEq)]
+struct CandidateKey {
+    world: u64,
+    map_epoch: u64,
+    projection: [f32; 16],
+    viewport: Vec2,
+}
+
+type Candidates = Vec<(BuildingID, Vec3)>;
+
+thread_local! {
+    static CANDIDATES: RefCell<Option<(CandidateKey, Candidates)>> = const { RefCell::new(None) };
+}
+
+fn candidates(map: &Map, camera: &Camera, viewport: Vec2) -> Candidates {
+    let Some(bounds) = view::bounds(camera, map) else {
+        return Vec::new();
+    };
+    let screen = AABB::new_ll_ur(Vec2::ZERO, viewport);
+    let buildings = map.buildings();
+    // For a wide view of a compact city, walk building storage directly.
+    // The broad spatial query also traverses roads, intersections and lots.
+    let candidates = if bounds.area() >= 1_000_000.0 && buildings.len() <= MAX_PROBLEM_CANDIDATES {
+        Either::Left(buildings.values().filter(|building| {
+            building.zone.as_ref().map_or_else(
+                || bounds.intersects(&building.obb),
+                |zone| bounds.intersects(&zone.poly),
+            )
+        }))
+    } else {
+        Either::Right(
+            map.spatial_map()
+                .query(bounds, ProjectFilter::BUILDING)
+                .filter_map(|project| buildings.get(project.as_building()?)),
+        )
+    };
+    candidates
+        .filter_map(|building| {
+            let pos = building.obb.center().z(building.height + 27.0);
+            let (point, depth) = camera.project(pos);
+            (depth.is_finite() && depth > 0.0 && point.is_finite() && screen.contains(point))
+                .then_some((building.id, pos))
+        })
+        .take(MAX_PROBLEM_CANDIDATES)
+        .collect()
+}
+
+pub(super) fn capture(
+    sim: &Simulation,
+    camera: &Camera,
+    generation: u64,
+    map_epoch: u64,
+) -> Vec<ProblemMarker> {
     let map = sim.map();
+    let key = CandidateKey {
+        world: generation,
+        map_epoch,
+        projection: *camera.proj_cache.as_ref(),
+        viewport: vec2(camera.viewport_w, camera.viewport_h),
+    };
+    CANDIDATES.with_borrow_mut(|cache| {
+        if cache.as_ref().is_none_or(|(previous, _)| *previous != key) {
+            let candidates = candidates(&map, camera, key.viewport);
+            *cache = Some((key, candidates));
+        }
+        capture_status(sim, &map, &cache.as_ref().unwrap().1)
+    })
+}
+
+fn capture_status(
+    sim: &Simulation,
+    map: &Map,
+    candidates: &[(BuildingID, Vec3)],
+) -> Vec<ProblemMarker> {
     let mut utilities = SiteUtilityReader::for_display(sim);
     let fires = sim.read::<Fires>();
     let power = sim.read::<ElectricityFlow>();
-    let camera = uiworld.camera().camera;
-    let Some(bounds) = view::bounds(&camera, &map) else {
-        return;
-    };
-    let screen = AABB::new_ll_ur(Vec2::ZERO, vec2(camera.viewport_w, camera.viewport_h));
-    let mut visible = Vec::new();
-
-    for id in map
-        .spatial_map()
-        .query(bounds, ProjectFilter::BUILDING)
-        .filter_map(|project| project.as_building())
-    {
-        let Some(building) = map.get(id) else {
-            continue;
-        };
-        let center = building.obb.center();
-        let (point, depth) = camera.project(center.z(building.height + 27.0));
-        if !depth.is_finite() || depth <= 0.0 || !point.is_finite() || !screen.contains(point) {
-            continue;
+    let mut markers = Vec::new();
+    for &(id, pos) in candidates {
+        if markers.len() == MAX_PROBLEM_MARKERS {
+            break;
         }
+        let mut push = |kind| {
+            if markers.len() < MAX_PROBLEM_MARKERS {
+                markers.push(ProblemMarker {
+                    pos,
+                    kind,
+                    building: id,
+                });
+            }
+        };
 
         if fires.by_building.contains_key(&id) {
-            visible.push(Badge {
-                point,
-                depth,
-                kind: BadgeKind::Fire,
-                building: id,
-            });
+            push(BadgeKind::Fire);
         }
         if map
             .electricity
             .net_id(id)
             .is_some_and(|net| power.blackout(net))
         {
-            visible.push(Badge {
-                point,
-                depth,
-                kind: BadgeKind::Blackout,
-                building: id,
-            });
+            push(BadgeKind::Blackout);
         }
 
         let Some(status) = utilities.status(id) else {
@@ -156,17 +225,30 @@ pub(super) fn render(uiworld: &UiWorld, sim: &Simulation) {
             (_, UtilityStatus::Shortage) => BadgeKind::NoSewage,
             _ => continue,
         };
-        visible.push(Badge {
-            point,
-            depth,
-            kind,
-            building: id,
-        });
+        push(kind);
     }
+    markers
+}
 
+pub(super) fn render(uiworld: &UiWorld, markers: &[ProblemMarker], interactive: bool) {
+    let camera = uiworld.camera().camera;
+    let screen = AABB::new_ll_ur(Vec2::ZERO, vec2(camera.viewport_w, camera.viewport_h));
+    let visible = markers
+        .iter()
+        .filter_map(|marker| {
+            let (point, depth) = camera.project(marker.pos);
+            (depth.is_finite() && depth > 0.0 && point.is_finite() && screen.contains(point))
+                .then_some(Badge {
+                    point,
+                    depth,
+                    kind: marker.kind,
+                    building: marker.building,
+                })
+        })
+        .collect();
     let no_power_img = uiworld.read::<UiTextures>().get("no_power");
     // Other tools drag from a press on the world, so only the hand takes badge clicks.
-    let hand = *uiworld.read::<Tool>() == Tool::Hand;
+    let hand = interactive && *uiworld.read::<Tool>() == Tool::Hand;
     let mut clicked = None;
     for PlacedBadge {
         badge,

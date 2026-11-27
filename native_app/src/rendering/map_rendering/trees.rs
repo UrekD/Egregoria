@@ -6,55 +6,57 @@ use engine::{
     Drawable, FrameContext, GfxContext, InstancedMesh, InstancedMeshBuilder, MeshInstance,
 };
 use geom::{vec3, vec4, Camera, HeightmapChunk, Intersect3, LinearColor, Matrix4, Vec3, AABB3};
-use simulation::map::{Map, MapSubscriber, SubscriberChunkID, UpdateType};
+use simulation::map::{Map, SubscriberChunkID};
 
 pub struct TreesRender {
     tree_builder: InstancedMeshBuilder<false>,
     trees_cache: FastMap<SubscriberChunkID, InstancedMesh>,
-    tree_sub: MapSubscriber,
+    staged: FastMap<SubscriberChunkID, Option<InstancedMesh>>,
 }
 
 impl TreesRender {
-    pub fn new(gfx: &mut GfxContext, map: &Map) -> Self {
+    pub fn new(gfx: &mut GfxContext) -> Self {
         let mesh = gfx.mesh("pine.glb".as_ref()).expect("could not load pine");
 
-        let tree_sub = map.subscribe(UpdateType::Terrain);
         Self {
             tree_builder: InstancedMeshBuilder::new_ref(&mesh),
             trees_cache: FastMap::default(),
-            tree_sub,
+            staged: FastMap::default(),
         }
     }
 
-    fn build(&mut self, map: &Map, ctx: &mut FrameContext<'_>) {
-        for chunkid in self.tree_sub.take_updated_chunks() {
-            self.tree_builder.instances.clear();
+    pub(super) fn stage_chunk(&mut self, map: &Map, chunkid: SubscriberChunkID, gfx: &GfxContext) {
+        self.tree_builder.instances.clear();
 
-            let aabb = chunkid.bbox();
-            map.environment()
-                .trees
-                .query_aabb_visitor(aabb.ll, aabb.ur, |obj| {
-                    let Some((_, t)) = map.environment().trees.get(obj.0) else {
-                        return;
-                    };
-                    self.tree_builder.instances.push(MeshInstance {
-                        pos: t.pos.z(map.environment().height(t.pos).unwrap_or_default()),
-                        dir: t.dir.z0() * t.size * 0.2,
-                        tint: ((1.0 - t.size * 0.05) * t.col * LinearColor::WHITE).a(1.0),
-                    });
+        let aabb = chunkid.bbox();
+        let environment = map.environment();
+        environment
+            .trees
+            .query_aabb_visitor(aabb.ll, aabb.ur, |obj| {
+                let Some((_, tree)) = environment.trees.get(obj.0) else {
+                    return;
+                };
+                self.tree_builder.instances.push(MeshInstance {
+                    pos: tree.pos.z(environment.height(tree.pos).unwrap_or_default()),
+                    dir: tree.dir.z0() * tree.size * 0.2,
+                    tint: ((1.0 - tree.size * 0.05) * tree.col * LinearColor::WHITE).a(1.0),
                 });
+            });
+        self.staged.insert(chunkid, self.tree_builder.build(gfx));
+    }
 
-            if let Some(m) = self.tree_builder.build(ctx.gfx) {
-                self.trees_cache.insert(chunkid, m);
+    pub(super) fn promote(&mut self) {
+        for (chunk, mesh) in self.staged.drain() {
+            if let Some(mesh) = mesh {
+                self.trees_cache.insert(chunk, mesh);
             } else {
-                self.trees_cache.remove(&chunkid);
+                self.trees_cache.remove(&chunk);
             }
         }
     }
 
     pub fn draw(&mut self, map: &Map, cam: &Camera, ctx: &mut FrameContext<'_>) {
         profiling::scope!("draw trees");
-        self.build(map, ctx);
 
         let camcenter = cam.pos.xy();
 

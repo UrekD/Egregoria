@@ -34,8 +34,42 @@ pub mod terraforming;
 pub mod train;
 pub(crate) mod transit;
 
+#[derive(Clone, Copy)]
+pub(crate) struct ToolboxSnapshot {
+    bus_lock: Option<LockedUntil>,
+    has_land_tiles: bool,
+}
+
+impl ToolboxSnapshot {
+    pub fn capture(sim: &Simulation) -> Self {
+        Self {
+            bus_lock: mode_lock(sim, ToolMode::BusLine),
+            has_land_tiles: sim.map().land_ownership().extent().is_some(),
+        }
+    }
+}
+
+#[cfg(test)]
 pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation, yakui_width: f32) {
+    update_transit_tools(uiworld, sim);
+    render(
+        uiworld,
+        Some(sim),
+        ToolboxSnapshot::capture(sim),
+        yakui_width,
+    );
+}
+
+pub(super) fn update_transit_tools(uiworld: &UiWorld, sim: &Simulation) {
     transit::update_lines(uiworld, sim);
+}
+
+pub(super) fn render(
+    uiworld: &UiWorld,
+    sim: Option<&Simulation>,
+    toolbox: ToolboxSnapshot,
+    yakui_width: f32,
+) {
     remember_current_mode(uiworld);
     reflow(Alignment::TOP_LEFT, Pivot::TOP_LEFT, Dim2::ZERO, || {
         constrained_viewport(|| {
@@ -49,7 +83,8 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation, yakui_width: f32) {
                     l.show(|| {
                         let mut needs_outline = false;
                         blur_bg(primary_container().with_alpha(0.3), 0.0, || {
-                            needs_outline = tool_properties(uiworld, sim, yakui_width);
+                            needs_outline =
+                                sim.is_some_and(|sim| tool_properties(uiworld, sim, yakui_width));
                         });
                         if needs_outline {
                             colored_box_container(outline().with_alpha(0.5), || {
@@ -62,7 +97,7 @@ pub fn new_toolbox(uiworld: &UiWorld, sim: &Simulation, yakui_width: f32) {
                                 toolbar.cross_axis_alignment = CrossAxisAlignment::Center;
                                 toolbar.show(|| {
                                     spacer(1);
-                                    minrow(10.0, || categories_list(uiworld, sim));
+                                    minrow(10.0, || categories_list(uiworld, toolbox));
                                     spacer(1);
                                 });
                             });
@@ -243,12 +278,23 @@ pub(crate) fn select_mode(uiw: &UiWorld, mode: ToolMode) {
 }
 
 /// Toolbar click: open the category on its last unlocked mode, or close it when already open.
+#[cfg(test)]
 pub(crate) fn toggle_category(uiw: &UiWorld, sim: &Simulation, category: ToolCategory) {
+    toggle_category_at(uiw, ToolboxSnapshot::capture(sim), category);
+}
+
+fn toggle_category_at(uiw: &UiWorld, toolbox: ToolboxSnapshot, category: ToolCategory) {
     if current_mode(uiw).map(ToolMode::category) == Some(category) {
         close_tool(uiw);
         return;
     }
-    open_category(uiw, sim, category);
+    let remembered = uiw.read::<ToolbarMemory>().last_mode(category);
+    let mode = if remembered == ToolMode::BusLine && toolbox.bus_lock.is_some() {
+        category.modes()[0]
+    } else {
+        remembered
+    };
+    select_mode(uiw, mode);
 }
 
 fn open_category(uiw: &UiWorld, sim: &Simulation, category: ToolCategory) {
@@ -317,7 +363,7 @@ fn category_tooltip(uiw: &UiWorld, category: ToolCategory) -> String {
     }
 }
 
-fn categories_list(uiworld: &UiWorld, sim: &Simulation) {
+fn categories_list(uiworld: &UiWorld, toolbox: ToolboxSnapshot) {
     let current = current_mode(uiworld).map(ToolMode::category);
     for category in ToolCategory::ALL {
         column(|| {
@@ -351,7 +397,7 @@ fn categories_list(uiworld: &UiWorld, sim: &Simulation) {
                 None => glyph_tile(glyph, active, label),
             };
             if clicked {
-                toggle_category(uiworld, sim, category);
+                toggle_category_at(uiworld, toolbox, category);
             }
 
             if active {
@@ -359,7 +405,7 @@ fn categories_list(uiworld: &UiWorld, sim: &Simulation) {
             }
         });
     }
-    crate::gui::overlays::land_tiles::toolbar(uiworld, sim);
+    crate::gui::overlays::land_tiles::toolbar(uiworld, toolbox.has_land_tiles);
 }
 
 /// A 64 px round toolbar tile drawn from an icon font glyph, for categories without artwork.

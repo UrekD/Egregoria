@@ -21,6 +21,10 @@ pub(crate) struct VehicleHover {
 }
 
 impl VehicleHover {
+    pub(crate) fn has_hit(&self) -> bool {
+        self.hit.is_some()
+    }
+
     pub(crate) fn update(
         &mut self,
         picker: &mut selectable::VehiclePicker,

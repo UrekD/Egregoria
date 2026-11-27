@@ -29,6 +29,23 @@ pub(crate) fn close(uiw: &UiWorld) -> bool {
     true
 }
 
+pub(super) fn needs_world(uiw: &UiWorld, sim: &Simulation) -> bool {
+    if uiw.read::<GUIChatState>().chat_bar_showed
+        || uiw
+            .read::<InputMap>()
+            .just_act
+            .contains(&InputAction::OpenChat)
+    {
+        return true;
+    }
+    let since = sim.read::<GameTime>().instant() - GameDuration::from_minutes(5);
+    sim.read::<MultiplayerState>()
+        .chat
+        .messages_since(since)
+        .next()
+        .is_some()
+}
+
 pub fn chat(uiw: &UiWorld, sim: &Simulation) {
     const MAX_MESSAGES: usize = 30;
     let mut state = uiw.write::<GUIChatState>();
