@@ -447,15 +447,15 @@ fn register_driveway_traffic() {
             optional: true, // Required by the PathPark snapshot schema in SimulationDeser.
             save: Box::new(|sim, output| {
                 let traffic = sim.read::<DrivewayTraffic>();
-                let revision =
-                    (!traffic.proof_is_empty()).then(|| sim.map().directed_route_revision());
+                let revision = (!traffic.proof_is_empty() || traffic.properties.has_searches())
+                    .then(|| sim.map().directed_route_revision());
                 traffic.save(revision, output)
             }),
             load: Box::new(|sim, data| {
                 let (traffic, revision) = DrivewayTraffic::load(data)?;
                 match (traffic.is_empty(), revision) {
                     (true, None) => {}
-                    (false, Some((topology, policy)))
+                    (_, Some((topology, policy)))
                         if topology < u64::MAX && policy < u64::MAX =>
                     {
                         let mut map = sim.map_mut();

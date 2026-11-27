@@ -597,6 +597,10 @@ impl BuildingParking {
         self.searches.contains_key(&driver)
     }
 
+    pub(crate) fn has_searches(&self) -> bool {
+        !self.searches.is_empty()
+    }
+
     pub(crate) fn take_search(
         &mut self,
         driver: HumanID,
@@ -1235,18 +1239,18 @@ impl BuildingParking {
         world: &World,
         grid: &TransportGrid,
         parking: &mut ParkingManagement,
-    ) -> Result<(), &'static str> {
+    ) -> Result<(), std::borrow::Cow<'static, str>> {
         if self.parked.len() + self.arrivals.len() > MAX_LIVE_CLAIMS {
-            return Err("too many live property parking claims");
+            return Err("too many live property parking claims".into());
         }
         if self.searches.values().any(|search| !search.validate(map)) {
-            return Err("invalid property parking search cursor");
+            return Err("invalid property parking search cursor".into());
         }
         for building in map.buildings().values() {
             if matches!(building.kind, crate::map::BuildingKind::ParkingGarage(_))
                 && !self.sites.contains_key(&building.id)
             {
-                return Err("parking garage has no parking facility");
+                return Err("parking garage has no parking facility".into());
             }
         }
 
@@ -1265,13 +1269,13 @@ impl BuildingParking {
                     if garage_footprint(map, kind, layout.anchor)
                         .is_none_or(|(parcel, _)| parcel.corners != building.obb.corners)
                     {
-                        return Err("invalid parking garage footprint");
+                        return Err("invalid parking garage footprint".into());
                     }
                     None
                 }
                 (BuildingParkingKind::PublicGarage(_), _)
                 | (_, crate::map::BuildingKind::ParkingGarage(_)) => {
-                    return Err("invalid property parking building kind");
+                    return Err("invalid property parking building kind".into());
                 }
                 _ => {
                     let shell = building
@@ -1298,7 +1302,7 @@ impl BuildingParking {
                         != cars
                 })
             {
-                return Err("invalid property parking facility");
+                return Err("invalid property parking facility".into());
             }
             let expected = LayoutDraft {
                 kind: layout.kind,
@@ -1311,25 +1315,40 @@ impl BuildingParking {
             }
             .prepare(map);
             let Some(expected) = expected else {
-                log::warn!(
-                    "saved property parking geometry for {id:?} on {:?} could not be rebuilt",
-                    layout.anchor.road,
+                let CurbAnchor {
+                    road,
+                    side,
+                    station_cm,
+                    ..
+                } = layout.anchor;
+                let current_anchor = map.pick_curb(road, side, station_cm);
+                let reason = if current_anchor != Some(layout.anchor) {
+                    "the curb anchor changed"
+                } else {
+                    "the parking layout no longer fits the site"
+                };
+                return Err(
+                    format!(
+                        "could not rebuild {:?} parking for {id:?} on {road:?}: {reason}",
+                        layout.kind,
+                    )
+                    .into(),
                 );
-                return Err("could not rebuild property parking geometry");
             };
             if &expected != layout {
-                log::warn!(
-                    "saved property parking geometry for {id:?} on {:?} differs from the current map",
-                    layout.anchor.road,
+                return Err(
+                    format!(
+                        "property parking geometry for {id:?} on {:?} changed",
+                        layout.anchor.road,
+                    )
+                    .into(),
                 );
-                return Err("property parking geometry changed");
             }
             if !self.fits(parking, layout, Some(id)) {
-                log::warn!(
-                    "saved property parking for {id:?} on {:?} conflicts with curb claims or another entrance",
+                return Err(format!(
+                    "property parking for {id:?} on {:?} conflicts with curb claims or another entrance",
                     layout.anchor.road,
-                );
-                return Err("conflicting property parking geometry");
+                ).into());
             }
             self.mouths
                 .entry(layout.anchor.road)
@@ -1346,7 +1365,7 @@ impl BuildingParking {
             }
             for &mask in &layout.masks {
                 if !map.parking.contains(mask) || !parking.is_unreserved(mask) {
-                    return Err("invalid property parking curb mask");
+                    return Err("invalid property parking curb mask".into());
                 }
                 parking.mask(mask);
             }
@@ -1355,7 +1374,7 @@ impl BuildingParking {
                     self.closing_cars.insert(car);
                 }
                 let Some(actor) = world.vehicles.get(car) else {
-                    return Err("missing property parking vehicle");
+                    return Err("missing property parking vehicle".into());
                 };
                 let exiting = self
                     .motions
@@ -1376,12 +1395,12 @@ impl BuildingParking {
                             || actor.speed.0 != 0.0
                             || actor.trans != layout.path(slot).into.pose(MOTION_TICKS)))
                 {
-                    return Err("invalid property parking occupancy");
+                    return Err("invalid property parking occupancy".into());
                 }
             }
             for (&car, &slot) in &site.held {
                 let Some(arrival) = self.arrivals.get(&car) else {
-                    return Err("missing property parking hold");
+                    return Err("missing property parking hold".into());
                 };
                 let entering = self
                     .motions
@@ -1400,7 +1419,7 @@ impl BuildingParking {
                                 || !human.router.has_property_arrival(car, id)
                         }))
                 {
-                    return Err("invalid property parking hold");
+                    return Err("invalid property parking hold".into());
                 }
                 if site.closing && !entering {
                     closed_holds.push(car);
@@ -1409,10 +1428,10 @@ impl BuildingParking {
         }
         for (&id, motion) in &self.motions {
             let Some(site) = self.sites.get(&id) else {
-                return Err("unknown parking motion site");
+                return Err("unknown parking motion site".into());
             };
             if motion.tick >= MOTION_TICKS {
-                return Err("invalid property parking maneuver");
+                return Err("invalid property parking maneuver".into());
             }
             let (expected, phase) = match &motion.departure {
                 Some(route) if route.valid(map) && route.origin() == site.layout.release => {
@@ -1435,7 +1454,7 @@ impl BuildingParking {
                         DrivewayPhase::Entering,
                     )
                 }
-                _ => return Err("invalid property parking route"),
+                _ => return Err("invalid property parking route".into()),
             };
             let actor = world
                 .vehicles
@@ -1453,7 +1472,7 @@ impl BuildingParking {
                 || pos.distance2(expected.pos.xy()) > 0.15_f32.powi(2)
                 || (collider.height - expected.pos.z).abs() > 0.15
             {
-                return Err("invalid property parking maneuver pose");
+                return Err("invalid property parking maneuver pose".into());
             }
         }
         if self.parked.iter().any(|(car, occupant)| {
@@ -1465,7 +1484,7 @@ impl BuildingParking {
                 .get(&arrival.site)
                 .is_none_or(|site| !site.held.contains_key(car))
         }) {
-            return Err("orphaned property parking claim");
+            return Err("orphaned property parking claim".into());
         }
         // Older Wave 2 saves could keep an uncommitted hold after closure.
         for car in closed_holds {

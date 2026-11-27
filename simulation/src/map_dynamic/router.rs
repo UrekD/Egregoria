@@ -2140,18 +2140,33 @@ mod tests {
         assert!(budget.drive(&map, from, to, candidate).is_none());
         let pending = budget.suspend(target, Some(car)).unwrap();
         let driver = HumanID::default();
-        let mut properties = BuildingParking::default();
-        properties.suspend_search(driver, pending);
-        let mut bytes = Vec::new();
-        properties.save(&mut bytes).unwrap();
-        let load_search = || BuildingParking::load(&bytes).unwrap().take_search(driver).unwrap();
+        ctx.g
+            .write::<DrivewayTraffic>()
+            .properties
+            .suspend_search(driver, pending);
+        let bytes = Bincode::encode(&ctx.g).unwrap();
+        let reload: crate::Simulation = Bincode::decode(&bytes).unwrap();
+        let restored_map = reload.map();
+        assert_eq!(
+            restored_map.directed_route_revision(),
+            map.directed_route_revision()
+        );
+        let load_search = || {
+            let reload: crate::Simulation = Bincode::decode(&bytes).unwrap();
+            let pending = reload
+                .write::<DrivewayTraffic>()
+                .properties
+                .take_search(driver)
+                .unwrap();
+            pending
+        };
         let pending = load_search();
-        assert!(pending.validate(&map));
+        assert!(pending.validate(&restored_map));
         assert_eq!(pending.work_left, PROPERTY_WORK_PER_SLICE);
 
         let mut resumed = PropertyBudget::new(Tick(21), Some(pending));
         resumed.check(candidate).unwrap();
-        assert!(resumed.drive(&map, from, to, candidate).is_some());
+        assert!(resumed.drive(&restored_map, from, to, candidate).is_some());
         assert_eq!(resumed.checked.len(), 1);
 
         let mut expired = PropertyBudget::new(Tick(84), Some(load_search()));

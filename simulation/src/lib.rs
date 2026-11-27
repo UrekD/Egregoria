@@ -2168,7 +2168,7 @@ impl SimulationDeser {
                 &sim.read::<crate::transportation::TransportGrid>(),
                 &mut sim.write::<ParkingManagement>(),
             )
-            .map_err(|reason| corrupt(reason.to_owned()))?;
+            .map_err(|reason| corrupt(reason.into_owned()))?;
         sim.read::<crate::transportation::DrivewayTraffic>()
             .validate_loaded(
                 &sim.map(),
