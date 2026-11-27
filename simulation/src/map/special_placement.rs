@@ -83,6 +83,7 @@ pub fn snap_special_building<T>(
             ProjectKind::Road(id) => map.get(id),
             _ => None,
         })
+        .filter(|road| !road.is_walking_path())
         .filter_map(|road| {
             let distance = road.points().project_2d(cursor).xy().distance(cursor);
             let max_distance = reach + road.width * 0.5;
@@ -210,7 +211,7 @@ fn snap_to_road(
     })
 }
 
-fn placement_overlap(map: &Map, selected: &Road, obb: OBB) -> Option<PlacementError> {
+pub(super) fn placement_overlap(map: &Map, selected: &Road, obb: OBB) -> Option<PlacementError> {
     let footprint = Polygon::from(obb.corners.as_slice());
     let mut junctions = BTreeSet::from([selected.src, selected.dst]);
     let mut road_overlap = false;

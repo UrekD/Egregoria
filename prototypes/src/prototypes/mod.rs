@@ -21,3 +21,6 @@ mod base;
 mod growable_massing;
 pub use base::*;
 pub use growable_massing::*;
+
+mod growable_parking;
+pub use growable_parking::GrowableParking;

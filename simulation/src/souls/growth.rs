@@ -1677,6 +1677,7 @@ mod tests {
     #[test]
     fn af2_orphaned_growable_house_is_abandoned_on_the_next_growth_pass() {
         let mut test = street();
+        test.g.use_curb_only_benchmark_parking();
         let lot = front_lot(&test.g);
         let home = grow_house(&mut test.g, lot);
         let road = test.g.map().get(home).unwrap().connected_road.unwrap();

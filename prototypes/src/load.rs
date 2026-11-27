@@ -59,6 +59,28 @@ unsafe fn load_prototypes_str(l: Lua, main: &str) -> Result<(), PrototypeLoadErr
     p.fingerprint = p
         .compute_fingerprint()
         .map_err(PrototypeLoadError::Fingerprint)?;
+    // Match the layout used before parking was authored, for snapshot imports.
+    let residences: Vec<_> = p
+        .residence
+        .values_mut()
+        .map(|p| (p.id, p.parking.take()))
+        .collect();
+    let companies: Vec<_> = p
+        .growable_company
+        .values_mut()
+        .map(|p| (p.id, p.parking.take(), p.parking_by_level.take()))
+        .collect();
+    p.pre_parking_fingerprint = p
+        .compute_fingerprint()
+        .map_err(PrototypeLoadError::Fingerprint)?;
+    for (id, parking) in residences {
+        p.residence.get_mut(&id).unwrap().parking = parking;
+    }
+    for (id, parking, by_level) in companies {
+        let company = p.growable_company.get_mut(&id).unwrap();
+        company.parking = parking;
+        company.parking_by_level = by_level;
+    }
     p.compute_orderings();
     p.print_stats();
 
@@ -69,6 +91,10 @@ unsafe fn load_prototypes_str(l: Lua, main: &str) -> Result<(), PrototypeLoadErr
 
 impl Prototypes {
     /// Identifies the effective prototype data in this registry.
+    pub fn pre_parking_fingerprint(&self) -> u64 {
+        self.pre_parking_fingerprint
+    }
+
     pub fn fingerprint(&self) -> u64 {
         self.fingerprint
     }

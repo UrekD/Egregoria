@@ -752,7 +752,7 @@ impl ShoreIndex {
     ) -> Result<SiteResult, WaterEditError> {
         let Some(road) = request
             .connected_road
-            .filter(|&road| roads.contains_key(road))
+            .filter(|&road| roads.get(road).is_some_and(|road| !road.is_walking_path()))
         else {
             return Ok(Err(WaterSiteError::MissingRoad));
         };

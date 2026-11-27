@@ -697,7 +697,7 @@ impl State {
         gui::overlays::prepare_ground(&self.uiw, &sim, map_renderer, &mut ctx.gfx, generation);
         let tool = *self.uiw.read::<Tool>();
         map_renderer.render(
-            &sim.map(),
+            sim,
             time.seconds,
             &camera,
             MapRenderOptions {

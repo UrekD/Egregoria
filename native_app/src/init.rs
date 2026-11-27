@@ -101,6 +101,7 @@ fn register_ui_resources() {
     register_resource_noserialize::<crate::gui::traffic_repair::TrafficRepairUi>();
     register_world_reset(crate::gui::traffic_repair::reset);
     register_world_resource::<SpecialBuildingResource>();
+    register_world_resource::<crate::gui::parkinglot::ParkingGarageTool>();
     register_world_resource::<TrainSpawnResource>();
     register_resource_noserialize::<Timings>();
     register_world_resource::<Tool>();

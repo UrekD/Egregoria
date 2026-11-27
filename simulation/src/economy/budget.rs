@@ -292,13 +292,20 @@ pub fn budget_update(world: &mut World, resources: &mut Resources) {
     let special_building_value: i128 = map
         .buildings()
         .values()
-        .filter(|building| match building.kind {
-            BuildingKind::GoodsCompany(id) => !id.is_service() && !id.is_growable(),
-            BuildingKind::RailFreightStation(_) | BuildingKind::TrainStation => true,
-            BuildingKind::House | BuildingKind::ExternalTrading => false,
+        .filter_map(|building| match building.kind {
+            BuildingKind::ParkingGarage(kind) => {
+                Some(i128::from(kind.daily_upkeep().inner()) * SPECIAL_BUILDING_UPKEEP_DIVISOR)
+            }
+            BuildingKind::GoodsCompany(id) if !id.is_service() && !id.is_growable() => {
+                Government::special_building_price(building.kind)
+                    .map(|price| i128::from(price.inner()))
+            }
+            BuildingKind::RailFreightStation(_) | BuildingKind::TrainStation => {
+                Government::special_building_price(building.kind)
+                    .map(|price| i128::from(price.inner()))
+            }
+            _ => None,
         })
-        .filter_map(|building| Government::special_building_price(building.kind))
-        .map(|price| i128::from(price.inner()))
         .sum();
     let service_upkeep: i128 = map
         .buildings()

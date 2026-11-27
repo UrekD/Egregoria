@@ -1,5 +1,5 @@
 use crate::{
-    get_lua, BuildingPrototype, GrowableChainKey, GrowableMassing, GrowableZoneKind, Prototype,
+    get_lua, BuildingPrototype, GrowableChainKey, GrowableMassing, GrowableParking, GrowableZoneKind, Prototype,
     ResidencePrototypeID, MAX_PROFILED_SLOTS,
 };
 use mlua::{FromLua, Lua, Table, Value};
@@ -62,6 +62,8 @@ pub struct ResidencePrototype {
     pub capacity: u32,
     pub lot_size_min: f32,
     pub massing: Option<GrowableMassing>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parking: Option<GrowableParking>,
 }
 
 impl ResidencePrototype {
@@ -92,6 +94,7 @@ impl Prototype for ResidencePrototype {
         } else {
             (get_lua(table, "level")?, get_lua(table, "capacity")?)
         };
+        let parking = get_lua::<Option<GrowableParking>>(table, "parking")?;
         let base = BuildingPrototype::from_lua(table)?;
         Ok(Self {
             id: Self::ID::new(&base.name),
@@ -102,6 +105,7 @@ impl Prototype for ResidencePrototype {
             capacity,
             lot_size_min: get_lua(table, "lot_size_min")?,
             massing,
+            parking,
         })
     }
 

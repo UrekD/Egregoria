@@ -12,6 +12,11 @@ new_key_type! {
 
 pub const PARKING_SPOT_LENGTH: f32 = 6.0;
 
+#[cfg(test)]
+thread_local! {
+    static CLOSEST_SPOT_INSPECTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 #[derive(Debug, Copy, Clone, Serialize, Deserialize)]
 pub struct ParkingSpot {
     pub parent: LaneID,
@@ -167,6 +172,42 @@ impl ParkingSpots {
         self.spots.iter()
     }
 
+    pub(crate) fn curb_spots_near(
+        &self,
+        lane: &Lane,
+        near: Vec3,
+        remaining: &mut usize,
+    ) -> Option<impl Iterator<Item = ParkingSpotID> + '_> {
+        let spots = self.lane_spots.get(lane.id)?;
+        let last = spots.len().checked_sub(1)?;
+        let points = &lane.points;
+        let segments = points.len().checked_sub(1)?;
+        // Project to the lane and recover its station before indexing the evenly
+        // spaced bays. Charge both geometry passes before reading the segments.
+        *remaining = remaining.checked_sub(segments.saturating_mul(2))?;
+        let (projected, end) = points.project_segment_2d(near.xy());
+        let start = end.checked_sub(1)?;
+        let station = points
+            .segments()
+            .take(start)
+            .map(|segment| segment.src.distance(segment.dst))
+            .sum::<f32>()
+            + points[start].distance(projected);
+        let gap = CROSSWALK_WIDTH + 1.0;
+        let spacing = (points.length() - gap * 2.0) / spots.len() as f32;
+        let closest = (((station - gap) / spacing - 0.5).round() as usize).min(last);
+        let furthest = closest.max(last - closest);
+        Some((0..=furthest * 2).filter_map(move |step| {
+            let distance = step.div_ceil(2);
+            let index = if step % 2 == 0 {
+                closest.checked_sub(distance)?
+            } else {
+                closest + distance
+            };
+            spots.get(index).copied()
+        }))
+    }
+
     /// Iterate in spiral around the projected `near`
     pub fn closest_spots(
         &self,
@@ -176,6 +217,8 @@ impl ParkingSpots {
         let spots = &self.spots;
         let lspots = self.lane_spots.get(lane)?;
         let (closest, _) = lspots.iter().copied().enumerate().min_by_key(|&(_, x)| {
+            #[cfg(test)]
+            CLOSEST_SPOT_INSPECTIONS.with(|count| count.set(count.get() + 1));
             let p = unwrap_ret!(spots.get(x), OrderedFloat(f32::INFINITY));
             OrderedFloat(p.trans.pos.distance2(near))
         })?;
@@ -191,5 +234,33 @@ impl ParkingSpots {
                 })
                 .copied(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::map_dynamic::ParkingManagement;
+    use crate::tests::TestCtx;
+    use geom::vec3;
+
+    #[test]
+    fn pathpark_curb_discovery_does_not_scan_entire_lanes() {
+        let ctx = TestCtx::new();
+        ctx.build_roads(&[vec3(80.0, 100.0, 0.0), vec3(900.0, 100.0, 0.0)]);
+        let parking = ctx.g.read::<ParkingManagement>();
+        let map = ctx.g.map();
+        CLOSEST_SPOT_INSPECTIONS.set(0);
+        let point = vec3(500.0, 100.0, 0.3);
+        let mut work = 1_024;
+        let (near, _) = parking.property_curb_candidates(&map, point, &mut work);
+        assert!(!near.is_empty());
+        assert_eq!(CLOSEST_SPOT_INSPECTIONS.get(), 0, "unbudgeted curb scan");
+        assert!(work < 1_024);
+
+        let mut work = 1;
+        let (near, street) = parking.property_curb_candidates(&map, point, &mut work);
+        assert!(near.is_empty() && street.is_empty());
+        assert_eq!(work, 0);
     }
 }

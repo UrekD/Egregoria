@@ -4,6 +4,17 @@ local function residences(density, capacities, lot_size_min, massing, mixed, leg
         or "residence-"
     local label = mixed and "Mixed-use residence" or "Residence"
     for level, capacity in ipairs(capacities) do
+        local parking
+        if massing then
+            if density == "high" then
+                parking = {kind = "garage", spaces = 8 + 4 * (level - 1)}
+            elseif level >= 4 then
+                parking = {kind = "garage", spaces = 4 * (level - 3)}
+                if density == "low" then parking.fallback_surface_spaces = 1 end
+            elseif density == "low" then
+                parking = {kind = "surface", spaces = 1}
+            end
+        end
         data:extend {
             type = "residence",
             name = prefix .. density .. "-l" .. level,
@@ -17,6 +28,7 @@ local function residences(density, capacities, lot_size_min, massing, mixed, leg
             water_consumption = capacity,
             lot_size_min = lot_size_min,
             massing = massing,
+            parking = parking,
             bgen = "house",
             size = 20,
             asset = "assets/ui/housebrush.png",

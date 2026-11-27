@@ -131,11 +131,24 @@ pub(crate) fn remove_collapsed_sites(sim: &mut Simulation, ids: Vec<BuildingID>)
 }
 
 fn remove_site_inner(sim: &mut Simulation, id: BuildingID, defer_references: bool) -> bool {
+    if sim
+        .read::<crate::transportation::DrivewayTraffic>()
+        .properties
+        .busy(id)
+    {
+        sim.write::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .set_open(id, false);
+        return false;
+    }
     let was_external_target = sim.map().external_train_stations.first() == Some(&id);
     let removed = sim.map_mut().remove_building(id);
     let Some(building) = removed else {
         return false;
     };
+    sim.write::<crate::transportation::DrivewayTraffic>()
+        .properties
+        .remove_empty(id, &mut sim.write::<ParkingManagement>());
     residence::on_building_removed(sim, id);
     remove_building(sim, building, was_external_target, defer_references);
     true
@@ -245,7 +258,12 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
             market.forget_human_buyer(trade.seller.0, id);
         }
     }
-    if let Some(car) = human.router.personal_car {
+    let removed_car = human.router.personal_car.filter(|&car| {
+        !sim.write::<crate::transportation::DrivewayTraffic>()
+            .properties
+            .owner_dropped(car)
+    });
+    if let Some(car) = removed_car {
         sim.read::<ParCommandBuffer<VehicleEnt>>().kill(car);
     }
     human
@@ -264,11 +282,7 @@ pub(crate) fn human_dropped(sim: &mut Simulation, id: HumanID, human: &mut Human
         }
     }
     let employers = clear_soul_references(sim, SoulID::Human(id));
-    if let (Some(_), Some(car), Some(batch)) = (
-        &employers,
-        human.router.personal_car,
-        &mut sim.world.departing,
-    ) {
+    if let (Some(_), Some(car), Some(batch)) = (&employers, removed_car, &mut sim.world.departing) {
         batch.removed_cars.insert(car);
     }
 

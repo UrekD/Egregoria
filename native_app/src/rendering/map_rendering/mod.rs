@@ -136,7 +136,7 @@ impl MapRenderer {
 
     pub fn render(
         &mut self,
-        map: &Map,
+        sim: &Simulation,
         time: u32,
         cam: &Camera,
         options: MapRenderOptions,
@@ -144,6 +144,7 @@ impl MapRenderer {
         ctx: &mut FrameContext<'_>,
     ) {
         profiling::scope!("render map renderer");
+        let map = &sim.map();
         let map_start = ctx.gfx.profile_timer();
         self.terrain.draw(cam, ctx);
         ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);
@@ -153,7 +154,7 @@ impl MapRenderer {
         ctx.gfx.profile_elapsed(CpuPhase::Instances, instances_start);
 
         let map_start = ctx.gfx.profile_timer();
-        self.meshb.latest_mesh(map, options, ctx);
+        self.meshb.latest_mesh(map, sim, options, ctx);
 
         Self::signals_render(map, time, cam, &ctx.gfx.frustrum, draw);
         ctx.gfx.profile_elapsed(CpuPhase::MapMesh, map_start);

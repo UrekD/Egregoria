@@ -2,6 +2,7 @@ use crate::builders::CommandSink;
 use crate::MetricSample;
 use geom::Vec3;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde_json::{json, Value};
 use simulation::economy::Government;
 use simulation::map_dynamic::{Destination, ParkingManagement, RoutingStep};
 use simulation::transportation::{Location, VehicleKind, VehicleState};
@@ -22,6 +23,183 @@ pub const MEDIAN_TICKS_PER_SEC: &str = "median_ticks_per_sec";
 pub const P99_MS_PER_TICK: &str = "p99_ms_per_tick";
 pub(crate) const P50_MS_PER_TICK: &str = "p50_ms_per_tick";
 pub(crate) const P95_MS_PER_TICK: &str = "p95_ms_per_tick";
+
+/// Record the original cohort and curb assignments before warm-up changes them.
+pub(crate) struct ParkingOpening {
+    cohort: Value,
+    topology: Value,
+    personal_cars: usize,
+    curb_occupied: usize,
+    population: usize,
+}
+
+impl ParkingOpening {
+    pub(crate) fn capture(sim: &Simulation) -> Option<Self> {
+        std::env::var_os("EGR_PATHPARK_OPENING")?;
+        let world = sim.world();
+        let map = sim.map();
+        let mut personal_cars = 0;
+        let mut curb_occupied = 0;
+        let mut cohort: Vec<_> = world
+            .humans
+            .iter()
+            .map(|(id, human)| {
+                let car = human.router.personal_car.map(|car| {
+                    personal_cars += 1;
+                    let actor = &world.vehicles[car];
+                    let curb = match &actor.vehicle.state {
+                        VehicleState::Parked(spot) => {
+                            curb_occupied += 1;
+                            Some(spot)
+                        }
+                        _ => None,
+                    };
+                    json!([car, curb, actor.trans.pos])
+                });
+                (id, json!([id, human.home.house, car]))
+            })
+            .collect();
+        cohort.sort_unstable_by_key(|(id, _)| *id);
+        let topology = json!({
+            "roads": map.roads().values().map(|road| {
+                json!([road.id, road.src, road.dst, road.points, road.lanes_iter().collect::<Vec<_>>()])
+            }).collect::<Vec<_>>(),
+            "lanes": map.lanes().values().map(|lane| {
+                json!([lane.id, lane.src, lane.dst, lane.kind, lane.control, lane.points])
+            }).collect::<Vec<_>>(),
+            "buildings": map.buildings().values().map(|building| {
+                json!([building.id, building.kind, building.connected_road, building.door_pos])
+            }).collect::<Vec<_>>(),
+            "curb": map.parking.all_spots().map(|(id, spot)| {
+                json!([id, spot.parent, spot.trans.pos])
+            }).collect::<Vec<_>>(),
+        });
+        Some(Self {
+            population: cohort.len(),
+            cohort: Value::Array(cohort.into_iter().map(|(_, data)| data).collect()),
+            topology,
+            personal_cars,
+            curb_occupied,
+        })
+    }
+
+    pub(crate) fn write(
+        self,
+        sim: &Simulation,
+        slot_revision: Option<u128>,
+        warmup_ticks: u64,
+        measured_ticks: u64,
+    ) -> Result<(), String> {
+        let mut jobs: Vec<_> = sim
+            .world()
+            .humans
+            .iter()
+            .filter_map(|(id, human)| Some((id, human.work.as_ref()?.workplace)))
+            .collect();
+        jobs.sort_unstable();
+        let record = json!({
+            "counts": {
+                "population": self.population,
+                "personal_cars": self.personal_cars,
+                "curb_occupied": self.curb_occupied,
+                "assigned_work": jobs.len(),
+            },
+            "cohort": self.cohort,
+            "topology": self.topology,
+            "assignments_after_warmup": jobs,
+            "slot_revision": slot_revision.map(|revision| format!("{revision:032x}")),
+            "warmup_ticks": warmup_ticks,
+            "measured_ticks": measured_ticks,
+            "workers": 1,
+        });
+        let path = std::env::var_os("EGR_PATHPARK_OPENING").ok_or("missing opening report path")?;
+        let file = fs::File::create(&path).map_err(|error| format!("{path:?}: {error}"))?;
+        serde_json::to_writer(std::io::BufWriter::new(file), &record)
+            .map_err(|error| error.to_string())
+    }
+}
+
+pub(crate) struct ParkingWorkload {
+    initial_completed: u64,
+    initial_freight_completed: u64,
+    active_car_ticks: u64,
+}
+
+impl ParkingWorkload {
+    pub(crate) fn new(sim: &Simulation) -> Self {
+        simulation::diagnostics::begin_benchmark_work();
+        Self {
+            initial_completed: Self::completed(sim),
+            initial_freight_completed: Self::freight_completed(sim),
+            active_car_ticks: 0,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, sim: &Simulation) {
+        for human in sim.world().humans.values() {
+            if human
+                .router
+                .personal_car
+                .and_then(|car| sim.world().vehicles.get(car))
+                .is_some_and(|vehicle| !vehicle.vehicle.state.is_parked())
+            {
+                self.active_car_ticks += 1;
+            }
+        }
+    }
+
+    pub(crate) fn finish(self, sim: &Simulation) -> BTreeMap<String, f64> {
+        let work = simulation::diagnostics::end_benchmark_work();
+        [
+            ("active_personal_vehicle_ticks", self.active_car_ticks),
+            ("offered_person_trips", work.person_offers),
+            (
+                "completed_person_trips",
+                Self::completed(sim).saturating_sub(self.initial_completed),
+            ),
+            ("offered_freight_work", work.freight_offers),
+            (
+                "completed_freight_work",
+                Self::freight_completed(sim).saturating_sub(self.initial_freight_completed)
+                    + work.rail_completions,
+            ),
+            ("offered_service_work", work.service_offers),
+            ("completed_service_work", work.service_completions),
+        ]
+        .into_iter()
+        .map(|(key, count)| (key.to_owned(), count as f64))
+        .collect()
+    }
+
+    fn completed(sim: &Simulation) -> u64 {
+        use simulation::economy::{DailyEconomyMetrics, TripPurpose, TripStats};
+        let trips = sim.read::<TripStats>();
+        let freight_trips: u64 = sim
+            .read::<DailyEconomyMetrics>()
+            .days
+            .values()
+            .map(|day| {
+                [TripPurpose::FreightOutbound, TripPurpose::FreightReturn]
+                    .into_iter()
+                    .filter_map(|purpose| day.trips_by_purpose.get(&purpose))
+                    .map(|stats| stats.completed)
+                    .sum::<u64>()
+            })
+            .sum();
+        (trips.car.completed + trips.walk.completed + trips.transit.completed)
+            .saturating_sub(freight_trips)
+    }
+
+    fn freight_completed(sim: &Simulation) -> u64 {
+        use simulation::economy::{cargo::CargoBook, TICKS_PER_BUDGET_DAY};
+        let day = simulation::diagnostics::elapsed_tick(sim).0 / TICKS_PER_BUDGET_DAY;
+        let freight = sim.read::<CargoBook>();
+        (day.saturating_sub(2)..=day)
+            .filter_map(|day| freight.freight_day(day))
+            .map(|day| day.delivered_loads)
+            .sum()
+    }
+}
 
 const CHECKPOINT_INTERVAL: u64 = 10_000;
 
@@ -243,10 +421,6 @@ impl ScenarioCtx {
         self.sample_with_extra(label, BTreeMap::new())
     }
 
-    pub(crate) fn sample_perf(&mut self, label: &str, houses: usize) -> MetricSample {
-        self.sample_perf_with_extra(label, houses, BTreeMap::new(), false)
-    }
-
     pub(crate) fn sample_perf_with_extra(
         &mut self,
         label: &str,
@@ -437,7 +611,7 @@ impl ScenarioCtx {
         Ok(())
     }
 
-    fn round_tripped(&self) -> Result<Simulation, String> {
+    pub(crate) fn round_tripped(&self) -> Result<Simulation, String> {
         // Reserve a private directory so concurrent runs cannot share a midpoint save.
         static NEXT_SAVE: AtomicUsize = AtomicUsize::new(0);
         let save_dir = simulation::save_dir();
@@ -588,9 +762,16 @@ fn write_route_position(hash: &mut impl Hasher, pos: Vec3) {
 fn write_routing_step(hash: &mut impl Hasher, step: Option<&RoutingStep>) {
     match step {
         None => hash.write_u8(0),
-        Some(RoutingStep::WalkTo(pos)) => {
+        Some(RoutingStep::WalkTo(pos) | RoutingStep::WalkProperty(pos, _)) => {
             hash.write_u8(1);
             write_route_position(hash, *pos);
+        }
+        Some(RoutingStep::DriveProperty(id, _, _)) => {
+            write_tagged_id(hash, 11, entity_ffi(*id));
+        }
+        Some(RoutingStep::ParkProperty(id, building, _)) => {
+            write_tagged_id(hash, 12, entity_ffi(*id));
+            write_u64_le(hash, slot_ffi(building));
         }
         Some(RoutingStep::DriveTo(id, pos)) => {
             write_tagged_id(hash, 2, entity_ffi(*id));

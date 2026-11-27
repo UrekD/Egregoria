@@ -252,6 +252,23 @@ if zones2_profiles_enabled == true then
         if company.zone_kind == "industrial" then
             style = "industrial"
         end
+        if density == "high" then
+            company.parking = {kind = "garage", spaces = 8}
+            company.parking_by_level = {}
+            for level = 2, 5 do
+                company.parking_by_level[level] = {kind = "garage", spaces = 8 + 4 * (level - 1)}
+            end
+        else
+            local fallback
+            if density == "low" and company.zone_kind == "commercial" then
+                fallback = 2
+                company.parking = {kind = "surface", spaces = 2}
+            end
+            company.parking_by_level = {
+                [4] = {kind = "garage", spaces = 4, fallback_surface_spaces = fallback},
+                [5] = {kind = "garage", spaces = 8, fallback_surface_spaces = fallback},
+            }
+        end
         company.massing = {
             style = style,
             floors_by_level = floors[density],

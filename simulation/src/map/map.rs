@@ -62,8 +62,8 @@ pub struct LotOrigin {
 #[derive(Clone, Copy)]
 pub(crate) struct ConnectionEndpoint {
     pub pos: Vec3,
-    kind: ProjectKind,
-    split_point: Option<(Vec3, usize)>,
+    pub(super) kind: ProjectKind,
+    pub(super) split_point: Option<(Vec3, usize)>,
 }
 
 pub(crate) struct RoadSplit {
@@ -527,6 +527,26 @@ impl Map {
         from: ConnectionEndpoint,
         to: ConnectionEndpoint,
     ) -> Result<(), ConnectionError> {
+        for endpoint in [from, to] {
+            let has_path = |id| {
+                self.get(id).is_some_and(|joint: &Intersection| {
+                    joint
+                        .roads
+                        .iter()
+                        .any(|&r| self.get(r).is_some_and(Road::is_walking_path))
+                })
+            };
+            let attached = match endpoint.kind {
+                ProjectKind::Intersection(id) => has_path(id),
+                ProjectKind::Road(id) => self.get(id).is_some_and(|road| {
+                    road.is_walking_path() || has_path(road.src) || has_path(road.dst)
+                }),
+                _ => false,
+            };
+            if attached {
+                return Err(ConnectionError::Stale);
+            }
+        }
         if !self.has_junction_rules() {
             return Ok(());
         }
@@ -1040,6 +1060,9 @@ impl Map {
         ),
         ConnectionError,
     > {
+        if pattern.is_walking_path() {
+            return Err(ConnectionError::InvalidEndpoint);
+        }
         let mut local;
         if work.is_none() && (self.land_ownership.is_tiled() || self.checks_rail_sweeps(pattern)) {
             local = WaterTopologyWork::new();
@@ -1084,7 +1107,7 @@ impl Map {
         self.prepare_resolved_connection_inner(from, to, elbow, pattern, false, work)
     }
 
-    fn prepare_resolved_connection_inner(
+    pub(super) fn prepare_resolved_connection_inner(
         &self,
         from: ConnectionEndpoint,
         to: ConnectionEndpoint,
@@ -1093,7 +1116,9 @@ impl Map {
         stage_merges: bool,
         work: &mut WaterTopologyWork,
     ) -> Result<(usize, Option<PreparedTopologyEdit>), ConnectionError> {
-        self.check_connection_junctions(from, to)?;
+        if !pattern.is_walking_path() {
+            self.check_connection_junctions(from, to)?;
+        }
         let map_bounds = self.environment.bounds();
         let a = from.pos.xy();
         let b = to.pos.xy();
@@ -1341,7 +1366,14 @@ impl Map {
         pattern: &LanePattern,
         prepared: Option<PreparedTopologyEdit>,
     ) -> Result<ConnectedRoad, ConnectionError> {
-        self.check_connection_junctions(from, to)?;
+        if !pattern.is_walking_path() {
+            self.check_connection_junctions(from, to)?;
+        } else if prepared
+            .as_ref()
+            .is_none_or(|edit| edit.walking.is_none())
+        {
+            return Err(ConnectionError::InvalidEndpoint);
+        }
         if prepared.is_none() && self.land_ownership.is_tiled() {
             return Err(ConnectionError::Stale);
         }
@@ -1654,8 +1686,11 @@ impl Map {
         }
         super::validate_water_service_placement(self, kind, obb, connected_road)
             .map_err(Rejection::WaterServiceSite)?;
-        if connected_road.is_some_and(|road| !self.roads.contains_key(road)) {
-            return Err(Rejection::MissingReference);
+        if let Some(road) = connected_road {
+            let road = self.roads.get(road).ok_or(Rejection::MissingReference)?;
+            if road.is_walking_path() {
+                return Err(Rejection::InvalidBuilding);
+            }
         }
         if self.building_overlaps(obb) {
             return Err(Rejection::BuildingOverlap);
@@ -1676,6 +1711,66 @@ impl Map {
             shape: obb,
             kind,
         })
+    }
+
+    pub(crate) fn prepare_parking_garage(
+        &self,
+        kind: super::building_parking::GarageKind,
+        entrance: super::CurbAnchor,
+        remaining: &mut usize,
+    ) -> Result<
+        (
+            PreparedSpecialBuilding,
+            super::building_parking::ParkingLayout,
+        ),
+        crate::world_command::Rejection,
+    > {
+        use super::building_parking::{garage_footprint, prepare_public_garage};
+        use crate::world_command::Rejection;
+        use geom::Shape;
+        let charge = |remaining: &mut usize, work| {
+            spend_water_work(remaining, work).map_err(|_| Rejection::WaterWorkLimit)
+        };
+        let road = self.get(entrance.road).ok_or(Rejection::MissingReference)?;
+        // The garage forms have fixed pad, sweep and land-sampling dimensions.
+        // Charge their fixed work and the variable road and overlap queries.
+        charge(remaining, 4_096 + 8 * road.interfaced_points().len())?;
+        let (shape, mouth) =
+            garage_footprint(self, kind, entrance).ok_or(Rejection::InvalidBuilding)?;
+        let filter = ProjectFilter::ROAD | ProjectFilter::INTER | ProjectFilter::BUILDING;
+        for object in self.spatial_map.query(shape.bbox(), filter) {
+            let work = match object {
+                ProjectKind::Road(id) => self.roads.get(id).map_or(1, |road| road.points().len()),
+                ProjectKind::Intersection(id) => self.intersections.get(id).map_or(1, |joint| {
+                    128_usize.saturating_mul(joint.roads.len()).max(1)
+                }),
+                _ => 2,
+            };
+            charge(remaining, work)?;
+        }
+        if super::special_placement::placement_overlap(self, road, shape).is_some() {
+            return Err(Rejection::BuildingOverlap);
+        }
+        let gen = BuildingGen::NoWalkway {
+            door_pos: Vec2::ZERO,
+        };
+        let mut prepared = self.prepare_special_building(
+            shape,
+            BuildingKind::ParkingGarage(kind),
+            gen,
+            None,
+            Some(entrance.road),
+        )?;
+        let outward = (shape.center() - mouth.xy()).normalize();
+        let gate = mouth.xy() + outward * 1.0 + outward.perpendicular() * 4.0;
+        let door = gate.z(self
+            .environment
+            .height(gate)
+            .ok_or(Rejection::InvalidBuilding)?);
+        prepared.building.set_garage_appearance(kind, door);
+        let parking = prepare_public_garage(self, kind, entrance, shape, door)
+            .ok_or(Rejection::InvalidBuilding)?;
+        Ok((prepared, parking))
     }
 
     pub(crate) fn commit_special_building(
@@ -2017,8 +2112,10 @@ impl Map {
 
     pub(crate) fn prepare_remove_road(&self, road_id: RoadID) -> Result<(), ConnectionError> {
         let road = self.get(road_id).ok_or(ConnectionError::InvalidEndpoint)?;
-        self.check_junction_topology_edit(road.src)?;
-        self.check_junction_topology_edit(road.dst)?;
+        if !road.is_walking_path() {
+            self.check_junction_topology_edit(road.src)?;
+            self.check_junction_topology_edit(road.dst)?;
+        }
         if self.environment.strict_water_siting() || self.land_ownership.is_tiled() {
             super::prepare_road_removal(self, road_id, &mut WaterTopologyWork::new().geometry())?;
         }
@@ -2220,6 +2317,13 @@ impl Map {
     }
 
     // Private mutating
+
+    pub(crate) fn directed_route_revision(&self) -> (u64, u64) {
+        (
+            self.walking_topology_generation,
+            self.driving_policy_generation,
+        )
+    }
 
     pub(super) fn lane_topology_changed(&mut self) {
         self.walking_topology_generation += 1;
@@ -2919,8 +3023,10 @@ impl Map {
         self.lane_topology_changed();
 
         self.electricity.add_object(rid);
-        self.electricity.add_edge(src_id, rid);
-        self.electricity.add_edge(dst_id, rid);
+        if !pattern.is_walking_path() {
+            self.electricity.add_edge(src_id, rid);
+            self.electricity.add_edge(dst_id, rid);
+        }
 
         #[allow(clippy::indexing_slicing)]
         let r = &self.roads[rid];

@@ -93,6 +93,8 @@ impl SimDrop for VehicleEnt {
             res.write::<Dispatcher>()
                 .unregister(DispatchID::SmallTruck(id));
         }
+        res.write::<crate::transportation::DrivewayTraffic>()
+            .vehicle_removed(id);
         lifecycle::vehicle_dropped(sim, id, self.trans.pos);
     }
 }
@@ -743,6 +745,7 @@ pub(crate) struct GrowablePlan {
     placement: PreparedGrowable,
     home: Option<Residence>,
     job_slots: u32,
+    pub(crate) parking: Option<prototypes::GrowableParking>,
 }
 
 impl GrowablePlan {
@@ -782,6 +785,10 @@ impl GrowablePlan {
             placement,
             home,
             job_slots,
+            parking: site
+                .home
+                .and_then(|p| p.parking)
+                .or_else(|| site.company.and_then(|p| p.parking)),
         })
     }
 }
@@ -828,6 +835,7 @@ impl Simulation {
             placement,
             home,
             job_slots,
+            parking,
         } = plan;
         let building = self.map_mut().commit_prepared_growable(placement)?;
         let mixed = self
@@ -841,9 +849,20 @@ impl Simulation {
                 infos.mark_business_address(building);
             }
         }
+        let home_parking = home.is_some();
         let housing_slots = home.as_ref().map_or(0, |home| home.capacity);
         if let Some(home) = home {
             self.write::<Residences>().insert(building, home);
+        }
+        if let Some(spec) = parking {
+            if let Ok(Some(layout)) = crate::map::building_parking::prepare_property_upgrade(
+                self,
+                building,
+                Some(spec),
+                home_parking,
+            ) {
+                crate::map::building_parking::commit_property_upgrade(self, building, Some(layout));
+            }
         }
         Ok(PlacedGrowable {
             building,

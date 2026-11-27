@@ -101,6 +101,10 @@ pub fn generate_with_options(
         .collect();
     report.junction_policies = junction_policy_changes(&sim.map(), &city, &network);
     let mut ctx = ScenarioCtx::from_sim(sim);
+    let curb_only = std::env::var_os("EGR_PATHPARK_CURB_ONLY").is_some();
+    if curb_only {
+        ctx.sim.use_curb_only_benchmark_parking();
+    }
     let facilities = lesce::place_facilities(&mut ctx, &city, &network, &layout, &mut report)?;
     lesce::check_routes(&ctx.sim, &city, &network, &layout, &facilities, &mut report)?;
     super::zoning::zone_and_seed(&mut ctx.sim, &city, &network, &facilities, &mut report)?;
@@ -167,9 +171,12 @@ pub fn generate_with_options(
     report.snapshot_bytes = fs::metadata(stage.path.join(format!("{SLOT}.zip")))
         .map_err(|e| e.to_string())?
         .len();
-    let loaded =
+    let mut loaded =
         Simulation::load_from_slot(&stage.path, &id).map_err(|e| format!("staged slot: {e}"))?;
     check::validate_opening(&loaded, &facilities)?;
+    if curb_only {
+        loaded.use_curb_only_benchmark_parking();
+    }
     report.generation_seconds = start.elapsed().as_secs_f64();
     if check {
         report.headless = Some(check::check_days(loaded, facilities)?);
